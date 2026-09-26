@@ -4171,39 +4171,18 @@ pub fn funccall_valuestack(
     }
 
     // function.py:194-199 — PASSTHROUGHARGS1 dispatch.
-    // PyPy's BuiltinCodePassThroughArguments1.funcrun_obj receives w_obj
-    // separately from an Arguments rest, then concatenates them as
-    // `args_w = [w_obj] + _args_w` before calling the unwrapped fn. Pyre's
-    // single BuiltinCodeFn signature already takes a flat slice, so the
-    // peek/Arguments split is structural — the final closure invocation
-    // sees `[w_obj, ...rest]` exactly as PyPy's post-merge args_w.
     if !natural_arity_call
         && fast_natural_arity == crate::BuiltinCodeFlags::PASSTHROUGHARGS1.bits() as usize
         && nargs >= 1
     {
         let w_obj = frame.peekvalue(nargs - 1);
-        let rest = frame.make_arguments(nargs - 1, false, func);
-        // Same live-variable set as the fixed-arity arm above, for the same
-        // two reasons: `dropvalues()` retires the frame slots that root these
-        // values, and `args_w` is a native Vec no root walker updates.
-        // `builtin_code_call` roots nothing of its own, so the whole
-        // `[code, w_obj, ...rest]` set has to be published here and read back
-        // for the call.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let mut live = Vec::with_capacity(2 + rest.len());
-        live.push(code as PyObjectRef);
-        live.push(w_obj);
-        live.extend_from_slice(&rest);
-        let root_base = _roots.pin_roots(&live);
+        let args = frame.make_arguments(nargs - 1, false, func);
         frame.dropvalues(dropvalues);
-        let args_w: Vec<PyObjectRef> = (0..nargs).map(|i| _roots.get(root_base + 1 + i)).collect();
-        return match unsafe { crate::builtin_code_call(_roots.get(root_base), &args_w) } {
-            Ok(v) => v,
-            Err(e) => {
-                crate::call::set_call_error(e);
-                pyre_object::PY_NULL
-            }
-        };
+        return crate::gateway::BuiltinCodePassThroughArguments1::funcrun_obj(
+            code as PyObjectRef,
+            w_obj,
+            args,
+        );
     }
 
     // function.py:201-203 — fallback: build Arguments via make_arguments
