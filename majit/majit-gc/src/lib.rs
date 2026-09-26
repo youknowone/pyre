@@ -1401,6 +1401,14 @@ pub trait GcAllocator: Send {
         false
     }
 
+    /// Fixed-size nursery objects are raw bumps: vtable at offset 0, no
+    /// `GcHeader`. `rewrite.py gen_malloc_nursery` then emits
+    /// `CALL_MALLOC_NURSERY` as `CallMallocNurseryHeaderless`. Default
+    /// false is `GcLLDescr_framework`, whose objects carry a header.
+    fn headerless_fixedsize(&self) -> bool {
+        false
+    }
+
     /// llsupport/gc.py `check_is_object` parity. Reads the
     /// typeid for `gcref` (gc.py `get_actual_typeid`) and
     /// returns whether that type has `rclass.OBJECT` layout — i.e.

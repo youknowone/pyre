@@ -2320,6 +2320,7 @@ pub fn gc_rewriter() -> majit_gc::rewrite::GcRewriterImpl {
         malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
         standard_array_basesize: std::mem::size_of::<usize>(),
         standard_array_length_ofs: 0,
+        headerless_fixedsize: false,
     }
 }
 

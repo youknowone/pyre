@@ -9564,6 +9564,7 @@ impl CraneliftBackend {
             malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
             standard_array_basesize: std::mem::size_of::<usize>(),
             standard_array_length_ofs: 0,
+            headerless_fixedsize: false,
             // rewrite.py:673 — read compiled_loop_token._ll_initial_locs and
             // rewrite.py:669 — ptr2int(compiled_loop_token.frame_info),
             // both sourced directly from the CLT Arc on the target

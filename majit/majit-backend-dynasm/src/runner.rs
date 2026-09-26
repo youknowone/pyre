@@ -2180,6 +2180,7 @@ impl DynasmBackend {
                 gc.nursery_top_addr(),
                 gc.max_nursery_object_size(),
                 gc.get_write_barrier_descr(),
+                gc.headerless_fixedsize(),
             )
         });
         // gc.py `get_ll_description(gcdescr)`: `gcdescr is None`
@@ -2191,8 +2192,8 @@ impl DynasmBackend {
         // `max_nursery_size: 0`; `write_barrier_descr = None`, gc.py:156);
         // this flag carries the other two, below.
         let is_boehm = collector.is_none();
-        let (nursery_free_addr, nursery_top_addr, max_nursery_size, wb_descr) =
-            collector.unwrap_or((0, 0, 0, None));
+        let (nursery_free_addr, nursery_top_addr, max_nursery_size, wb_descr, headerless_fixedsize) =
+            collector.unwrap_or((0, 0, 0, None, false));
         majit_gc::rewrite::GcRewriterImpl {
             nursery_free_addr,
             nursery_top_addr,
@@ -2282,6 +2283,7 @@ impl DynasmBackend {
             malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
             standard_array_basesize: std::mem::size_of::<usize>(),
             standard_array_length_ofs: 0,
+            headerless_fixedsize,
         }
     }
 
