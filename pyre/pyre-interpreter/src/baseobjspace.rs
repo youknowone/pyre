@@ -9446,7 +9446,7 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                     "__code__" | "__globals__" | "__closure__" | "__defaults__" | "__kwdefaults__"
                 )
             {
-                return Err(raiseattrerror(obj, name, None, false));
+                return Err(raiseattrerror(obj, name, None, AttrErrorSite::Get));
             }
             match name {
                 "__code__" => {
@@ -14505,7 +14505,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     if setdictvalue(obj, name, value)? {
         return Ok(w_none());
     }
-    Err(raiseattrerror(obj, name, w_descr, true))
+    Err(raiseattrerror(obj, name, w_descr, AttrErrorSite::Set))
 }
 
 /// A direct `W_BaseException` reference slot whose hard-coded getattr/setattr
@@ -14919,6 +14919,25 @@ pub fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> Result<
     Ok(true)
 }
 
+/// Which generic slot is reporting an attribute miss.
+///
+/// `_PyObject_GenericSetAttrWithDict` raises three different shapes out of one
+/// function and the module and type namespace removals reuse its wording
+/// without sharing its rules, so a caller names its own site rather than
+/// passing a bare store flag.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttrErrorSite {
+    /// A read, through `descr__getattribute__`.
+    Get,
+    /// `descr__setattr__`, once `setdictvalue` has failed.
+    Set,
+    /// `descr__delattr__`, once `deldictvalue` has failed.
+    Delete,
+    /// The module and type namespace removals, which report the generic
+    /// wording but keep the error context.
+    Namespace,
+}
+
 /// descroperation.py raiseattrerror.
 ///
 /// ```python
@@ -14931,24 +14950,41 @@ pub fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> Result<
 ///                     "'%T' object attribute '%s' is read-only", w_obj, name)
 /// ```
 ///
-/// `store` marks the `__setattr__` / `__delattr__` terminals.  A store that
+/// `site` names the terminal that is reporting.  A store or a removal that
 /// misses on a receiver with no instance dict cannot ever succeed, so
 /// `Objects/object.c _PyObject_GenericSetAttrWithDict` names that reason in the
-/// message; a read miss on the same receiver does not.
+/// message; a read miss on the same receiver does not.  The same function is
+/// also where a removal that reached an existing dictionary raises without an
+/// error context, which is why the removal terminal is distinguished from the
+/// namespace ones that share its wording.
 // dont_look_inside: attribute-miss / read-only AttributeError construction; slow path.
 #[majit_macros::dont_look_inside]
 pub(crate) fn raiseattrerror(
     obj: PyObjectRef,
     name: &str,
     w_descr: Option<PyObjectRef>,
-    store: bool,
+    site: AttrErrorSite,
 ) -> PyError {
+    // PyPy's `raiseattrerror` branches on `w_descr` alone.  The store and delete
+    // terminals need one thing more -- `_PyObject_GenericSetAttrWithDict` decides
+    // the wording, the suffix and the error context from whether the receiver
+    // owns a dict *slot* as well -- while `_PyObject_GenericGetAttrWithDict`
+    // builds its message without consulting it.  So the slot is read once, and
+    // only for the sites whose answer can depend on it; `descr__getattribute__`
+    // is the hot one and reaches none of them, passing no descriptor either.  A
+    // raising `getdict` says nothing about whether the object could hold a dict,
+    // so only a plainly absent one counts.
+    let no_dict_slot =
+        site != AttrErrorSite::Get && getdict_backing(obj).is_ok_and(|dict| dict.is_null());
     // descroperation.py:58-67 — with a descriptor in hand, the attribute
-    // exists on the type but has no reachable `__set__`/`__delete__` and the
-    // receiver has no dict to store into: it is read-only.  Otherwise this is
-    // a genuine miss: a type receiver reports through the `type object '%N'`
-    // form, every other object through the `'%T' object` form.
-    if w_descr.is_some() {
+    // exists on the type but has no reachable `__set__`/`__delete__`.  That is
+    // read-only only for a receiver with no dict slot to store into: with a
+    // dictionary in hand the name is reported absent instead, which is the
+    // state a class attribute shadowing a getset leaves behind once
+    // `deldictvalue` finds no entry for it.  Otherwise this is a genuine miss:
+    // a type receiver reports through the `type object '%N'` form, every other
+    // object through the `'%T' object` form.
+    if w_descr.is_some() && no_dict_slot {
         let tp_name = unsafe {
             match crate::typedef::r#type(obj) {
                 // CPython 3.14's generic set-attribute error uses
@@ -14967,20 +15003,24 @@ pub(crate) fn raiseattrerror(
         ));
     }
     let subject = missing_attribute_subject(obj);
-    // `object.c _PyObject_GenericSetAttrWithDict` appends the suffix when the
-    // receiver has no dict *slot*.  A raising `getdict` says nothing about
-    // whether the object could hold a dict, so the suffix is only added on a
-    // plainly absent one.
-    let no_dict_suffix = if store && getdict_backing(obj).is_ok_and(|dict| dict.is_null()) {
+    // `_PyObject_GenericSetAttrWithDict` appends the suffix on the store and
+    // delete paths, where a receiver with no dict slot could not have held the
+    // name; a read reports the plain form.
+    let no_dict_suffix = if site != AttrErrorSite::Get && no_dict_slot {
         " and no __dict__ for setting new attributes"
     } else {
         ""
     };
-    PyError::attribute_error_with_context(
-        format!("{subject} has no attribute '{name}'{no_dict_suffix}"),
-        obj,
-        name,
-    )
+    let message = format!("{subject} has no attribute '{name}'{no_dict_suffix}");
+    if site == AttrErrorSite::Delete && !no_dict_slot {
+        // The removal reached an existing dictionary and found no entry, which
+        // `PyDict_Pop` reports through a bare
+        // `PyErr_SetObject(PyExc_AttributeError, name)`.  That leaves
+        // `name`/`obj` unset, unlike every shape that goes on to
+        // `set_attribute_error_context`.
+        return PyError::attribute_error(message);
+    }
+    PyError::attribute_error_with_context(message, obj, name)
 }
 
 fn missing_attribute_subject(obj: PyObjectRef) -> String {
@@ -15207,7 +15247,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
                     Err(err) if err.kind == crate::PyErrorKind::KeyError => {
                         // descroperation.py descr__delattr__: deldictvalue
                         // returning False raises AttributeError immediately.
-                        return Err(raiseattrerror(obj, name, None, true));
+                        return Err(raiseattrerror(obj, name, None, AttrErrorSite::Namespace));
                     }
                     Err(err) => return Err(err),
                 }
@@ -15261,7 +15301,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
                     mutated(obj, Some(name));
                     return Ok(w_none());
                 }
-                return Err(raiseattrerror(obj, name, None, true));
+                return Err(raiseattrerror(obj, name, None, AttrErrorSite::Namespace));
             }
         }
     }
@@ -15304,7 +15344,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     // `w_descr` carries a found-but-non-data descriptor so the miss is read-only.
     // `raiseattrerror` resolves the type name via the tag-safe `typedef::type`,
     // so a tagged immediate never reaches a raw `ob_type` deref here.
-    Err(raiseattrerror(obj, name, w_descr, true))
+    Err(raiseattrerror(obj, name, w_descr, AttrErrorSite::Delete))
 }
 
 /// PyPy: baseobjspace.py `call`.

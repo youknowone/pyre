@@ -17771,7 +17771,10 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                     // attributes" suffix: `_PyObject_GenericSetAttrWithDict`
                     // adds that on the store path only.
                     None => Err(crate::baseobjspace::raiseattrerror(
-                        obj, slot_name, None, false,
+                        obj,
+                        slot_name,
+                        None,
+                        crate::baseobjspace::AttrErrorSite::Get,
                     )),
                 }
             }),
