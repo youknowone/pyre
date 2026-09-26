@@ -75,6 +75,8 @@ pub trait SharedOpcodeHandler {
     fn store_attr(&mut self, obj: Self::Value, name: &str, value: Self::Value) -> OpcodeResult<()>;
 }
 
+/// pyframe.py `popvalues` — `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
 fn pop_n<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     count: usize,
