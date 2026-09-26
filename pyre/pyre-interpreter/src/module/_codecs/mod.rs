@@ -430,9 +430,14 @@ fn namereplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             replacement.push_str(&raw_unicode_escape(code));
         }
     }
+    // `PyCodec_NameReplaceErrors` reports the index its own scan stopped at --
+    // `imax`, which starts at `start` and advances while `imax < end` -- rather
+    // than the span's end.  The two agree for every ordinary span and part
+    // company on an inverted one, where the scan never advances and the handler
+    // asks to resume at `start`.  Every other handler reports the end.
     Ok(codec_result(
         w_str_new_managed(&replacement),
-        exc.end as i64,
+        exc.start.max(exc.end) as i64,
     ))
 }
 
