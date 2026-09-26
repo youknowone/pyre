@@ -1,6 +1,6 @@
 //! Port of `rpython/translator/goal/query.py` — 116-LOC sanity-check
 //! generators consumed by `TranslationDriver.sanity_check_annotation`
-//! (`driver.py:330-337`).
+//! (`driver.py`).
 //!
 //! Upstream provides four generators / helpers:
 //!
@@ -45,9 +45,7 @@ use crate::annotator::model::{DescKind, KnownType, SomeObjectTrait, SomeValue};
 use crate::flowspace::model::{ConstValue, GraphRef, Hlvalue};
 use crate::translator::translator::TranslationContext;
 
-// ---------------------------------------------------------------------
 // Upstream `:9-17`: `short_binding(annotator, var)`.
-// ---------------------------------------------------------------------
 
 /// Port of upstream `short_binding(annotator, var)` at `:9-17`.
 ///
@@ -129,9 +127,7 @@ fn some_value_class_name(s: &SomeValue) -> String {
     .to_string()
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:19-24`: `graph_sig(t, g)`.
-// ---------------------------------------------------------------------
 
 /// Port of upstream `graph_sig(t, g)` at `:19-24`.
 ///
@@ -152,18 +148,14 @@ pub fn graph_sig(t: &TranslationContext, g: &GraphRef) -> Option<String> {
     Some(format!("{} -> {}", arg_str.join(", "), ret_str))
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:26-27`: `class Found(Exception): pass`.
-// ---------------------------------------------------------------------
 
 // `Found` is upstream's local control-flow signal — see the module
 // docstring, item 2. The Rust port doesn't materialise the exception
 // type because the iterator produced by `polluted_qgen` performs the
 // equivalent control flow inline.
 
-// ---------------------------------------------------------------------
 // Upstream `:29-41`: `polluted_qgen(translator)`.
-// ---------------------------------------------------------------------
 
 /// Port of upstream `polluted_qgen(translator)` at `:29-41`.
 ///
@@ -232,9 +224,7 @@ pub fn polluted_qgen(t: &TranslationContext) -> Vec<String> {
     out
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:43-57`: `check_exceptblocks_qgen(translator)`.
-// ---------------------------------------------------------------------
 
 /// Port of upstream `check_exceptblocks_qgen(translator)` at `:43-57`.
 ///
@@ -318,9 +308,7 @@ pub fn check_exceptblocks_qgen(t: &TranslationContext) -> Vec<String> {
     out
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:59-98`: `check_methods_qgen(translator)`.
-// ---------------------------------------------------------------------
 
 /// Port of upstream `check_methods_qgen(translator)` at `:59-98`.
 ///
@@ -513,9 +501,7 @@ pub fn check_methods_qgen(t: &TranslationContext) -> Vec<String> {
     out
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:100-108`: `qoutput(queryg, write=None)`.
-// ---------------------------------------------------------------------
 
 /// Port of upstream `qoutput(queryg, write=None)` at `:100-108`.
 ///
@@ -549,9 +535,7 @@ pub fn qoutput(
     c
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:110-112`: `polluted(translator)`.
-// ---------------------------------------------------------------------
 
 /// Port of upstream `polluted(translator)` at `:110-112`.
 ///
@@ -565,9 +549,7 @@ pub fn polluted(t: &TranslationContext) {
     println!("{c}");
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:114-116`: `sanity_check_methods(translator)`.
-// ---------------------------------------------------------------------
 
 /// Port of upstream `sanity_check_methods(translator)` at `:114-116`.
 ///

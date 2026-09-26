@@ -87,7 +87,7 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
         }
     };
 
-    // --- Structural validation passed; mutate the graph. ---
+    // Structural validation passed; mutate the graph.
     let new_ops = if site.niche {
         let null = graph.alloc_value_var();
         let mut ops = vec![SpaceOperation {

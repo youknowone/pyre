@@ -154,7 +154,7 @@ pyre_interpreter::py_module! {
                 let unix_entries: &[(&str, i32)] = &[
                     // Declared in the same list, and supplied by `libc` here.
                     // Windows reaches the first six through `win_errors`
-                    // (`interp_errno.py:91-101`), which registers the `WSA`
+                    // (`interp_errno.py`), which registers the `WSA`
                     // spelling and adds the stripped name as a second binding
                     // -- the windows block below stores them in that order, so
                     // the reverse mapping names the `WSA` one there.

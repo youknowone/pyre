@@ -14,7 +14,7 @@
 # (`DictStrategy::nth_item`); the default answers by materialising the whole
 # `items()` and taking `.nth(index)`.  `IdentityDictStrategy` -- what a dict
 # switches to when its keys compare by identity, i.e. any ordinary instance
-# (`identitydict.py:12-83`, selected at `dictmultiobject.py:725-730`) -- had no
+# (`identitydict.py`, selected at `dictmultiobject.py`) -- had no
 # override, so one walk of an `n`-entry dict built and threw away `n` vectors of
 # `n` pairs.
 #
@@ -77,7 +77,7 @@ def best_walk_time(mapping):
 def main():
     failures = []
 
-    # --- timing half, on dicts nothing has touched yet ---
+    # timing half, on dicts nothing has touched yet
     identity = {Key(): i for i in range(N)}
     text = {"k%06d" % i: i for i in range(N)}
     t_text = best_walk_time(text)
@@ -89,7 +89,7 @@ def main():
             "(limit %.1fx, n=%d)" % (ratio, RATIO_LIMIT, N)
         )
 
-    # --- correctness half, on its own dict ---
+    # correctness half, on its own dict
     # An O(1) cursor that indexes the storage directly must still walk every
     # entry exactly once, in insertion order, and agree across the three views.
     fresh = {Key(): i for i in range(N)}

@@ -24,8 +24,8 @@
 # after k > 7000 the generator switches to a different recursive mix
 # (post-warm-up branch divergence).
 #
-# `decay` (rlib/jit.py:588, default 40) scales every JitCounter entry down, and
-# counter.py:104-121 applies that scaling once per 32 minor collections. How far
+# `decay` (rlib/jit.py, default 40) scales every JitCounter entry down, and
+# counter.py applies that scaling once per 32 minor collections. How far
 # a guard's counter has advanced by the time the workload reaches it therefore
 # depends on how much the process has allocated so far, which is why the pin
 # exists: anything that shifts allocation volume shifts every counter. Both

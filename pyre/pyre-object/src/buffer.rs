@@ -33,7 +33,7 @@ pub enum Buffer {
         readonly: bool,
     },
     /// A `[offset, offset+size)` window over another `Buffer` (`SubBuffer`,
-    /// `rpython/rlib/buffer.py:389`).  Sub-buffers never nest — see [`sub`].
+    /// `rpython/rlib/buffer.py`).  Sub-buffers never nest — see [`sub`].
     ///
     /// `size` is signed: a negative value (canonically `-1`) means "up to the
     /// end of the parent" (`buffer.py:398`), so it cannot be a `usize`.
@@ -187,7 +187,7 @@ impl Buffer {
     }
 
     /// Whether the exporter's storage is read-only (`Buffer.readonly`,
-    /// `rpython/rlib/buffer.py:53`).  `bytes` is immutable; `bytearray` /
+    /// `rpython/rlib/buffer.py`).  `bytes` is immutable; `bytearray` /
     /// `array` are writable; a `Sub` inherits its parent's mutability.
     #[inline]
     pub fn readonly(&self) -> bool {

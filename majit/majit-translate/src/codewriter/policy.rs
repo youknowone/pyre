@@ -344,7 +344,7 @@ fn jit_look_inside_hint(hints: &[String]) -> Option<bool> {
     None
 }
 
-/// `policy.py:88-108 contains_unsupported_variable_type(graph, ...)`.
+/// `policy.py contains_unsupported_variable_type(graph, ...)`.
 ///
 /// ```python
 /// def contains_unsupported_variable_type(graph, supports_floats,
@@ -398,7 +398,7 @@ pub fn contains_unsupported_variable_type(
     _supports_longlong: bool,
     supports_singlefloats: bool,
 ) -> bool {
-    // `iterblocks()` parity (`rpython/flowspace/model.py:66`): the
+    // `iterblocks()` parity (`rpython/flowspace/model.py`): the
     // startblock-reachable closure over `Block.exits`, id-keyed because
     // block ids need not be index-aligned with `blocks` storage order.
     let by_id: std::collections::HashMap<BlockId, &Block> =
@@ -437,7 +437,7 @@ pub fn contains_unsupported_variable_type(
     false
 }
 
-/// Whether `history.py:56-69 getkind(TYPE, ...)` has a register kind for
+/// Whether `history.py getkind(TYPE, ...)` has a register kind for
 /// `ty`, or raises `NotImplementedError` on it.
 ///
 /// `getkind` refuses three families.
@@ -466,7 +466,7 @@ pub fn contains_unsupported_variable_type(
 /// refusing a graph for a float here would refuse one the codewriter goes
 /// on to lower.
 ///
-/// The third is `history.py:60-63`, `"type %s is too large"`, for a
+/// The third is `history.py`, `"type %s is too large"`, for a
 /// primitive wider than `Signed`.  [`ValueType::Int128`] /
 /// [`ValueType::UInt128`] (RPython `SignedLongLongLong` /
 /// `UnsignedLongLongLong`) are 16 bytes, twice a word; upstream's
@@ -780,7 +780,7 @@ mod tests {
         }));
     }
 
-    /// `policy.py:88-108`: a graph holding a value `history.getkind`
+    /// `policy.py`: a graph holding a value `history.getkind`
     /// refuses is refused here, not carried to the codewriter — where
     /// `value_type_to_kind` panics rather than declining.
     #[test]
@@ -834,7 +834,7 @@ mod tests {
     /// `False` (`backend/model.py:20`) because `warmspot.py:250` has no
     /// port. The flag is honoured rather than hardcoded, so both answers
     /// are asserted here — the `true` leg is what upstream's x86 gets
-    /// (`backend/x86/runner.py:21`), and reaching it in pyre would need
+    /// (`backend/x86/runner.py`), and reaching it in pyre would need
     /// the singlefloat casts first.
     #[test]
     fn a_singlefloat_is_unsupported_unless_the_cpu_supports_one() {

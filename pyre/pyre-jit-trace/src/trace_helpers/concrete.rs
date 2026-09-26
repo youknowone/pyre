@@ -151,7 +151,7 @@ pub fn concrete_int_binop(op: BinaryOperator, lhs: i64, rhs: i64) -> Option<i64>
         BinaryOperator::Or | BinaryOperator::InplaceOr => Some(lhs | rhs),
         BinaryOperator::Xor | BinaryOperator::InplaceXor => Some(lhs ^ rhs),
         BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
-            // intobject.py:205: negative shift → ValueError
+            // intobject.py descr_get_imag: negative shift → ValueError
             if rhs < 0 {
                 return None;
             }
@@ -167,7 +167,7 @@ pub fn concrete_int_binop(op: BinaryOperator, lhs: i64, rhs: i64) -> Option<i64>
             }
         }
         BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
-            // intobject.py:224: negative shift → ValueError("negative shift count")
+            // intobject.py _abstract_unaryop: negative shift → ValueError("negative shift count")
             if rhs < 0 {
                 return None;
             }

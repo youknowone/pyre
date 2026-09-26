@@ -1309,7 +1309,7 @@ pub fn str_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             if sep.as_bytes().is_empty() {
                 return Err(crate::PyError::value_error("empty separator"));
             }
-            // Each piece is a `value[start:end]` cut (rstring.py:52-140
+            // Each piece is a `value[start:end]` cut (rstring.py split
             // `split`), so a separator-free receiver yields itself back — see
             // [`pyre_object::w_str_cut`].
             if maxsplit < 0 {
@@ -1723,7 +1723,7 @@ pub fn __majit_wrap_str_descr_endswith(
 }
 
 /// Apply `startswith`/`endswith`'s optional `start`/`end` bounds to `s`,
-/// returning the code-point window as WTF-8. `stringmethods.py:23
+/// returning the code-point window as WTF-8. `stringmethods.py _convert_idx_params
 /// _convert_idx_params` → `unwrap_start_stop`: each bound runs through
 /// `adapt_lower_bound(_eval_slice_index(...))`, so a non-index bound raises a
 /// TypeError and a bound is coerced via `__index__`.
@@ -3624,7 +3624,7 @@ pub(crate) fn call_format_dispatch_w(
                 arg_type_name(result)
             )));
         }
-        // Returned as it came back: `format` (descroperation.py:399) checks
+        // Returned as it came back: `format` (descroperation.py) checks
         // `isinstance_w(w_res, w_unicode)` and hands `w_res` itself on, so a
         // `str` subclass keeps its type and the result keeps its identity.
         Ok(result)
@@ -3741,7 +3741,7 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, c
     }
 }
 
-/// `space.format(w_obj, w_format_spec)` (descroperation.py:399) — `PyObject_Format`
+/// `space.format(w_obj, w_format_spec)` (descroperation.py) — `PyObject_Format`
 /// returning the formatted object rather than its bytes.
 ///
 /// Upstream threads the spec from the caller to `__format__` and returns
@@ -4993,7 +4993,7 @@ pub enum EncodeErrorOwner {
 
 /// Replacement returned by a custom encode error handler: either a str
 /// (its code points, re-encoded by the codec) or raw bytes (copied
-/// verbatim). interp_codecs.py:69-72 rettype 'u' vs 'b'.
+/// verbatim). interp_codecs.py rettype 'u' vs 'b'.
 pub enum EncodeReplacement {
     Str(Vec<u32>),
     Bytes(Vec<u8>),
@@ -5984,7 +5984,7 @@ pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// refusing it.
 ///
 /// `decode_object` reports a failed conversion as `"decoding to str: %S"` over
-/// the buffer error (unicodeobject.py:1727-1739). apptest_unicode.py:1247-1252
+/// the buffer error (unicodeobject.py:1727-1739). apptest_unicode.py  allow-line-citation
 /// pins that in either of two wordings; the arm below is the one pypy prints,
 /// down to `None` rendering unquoted where a type name is quoted.
 ///
@@ -7285,7 +7285,7 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                 );
             } else {
                 // PyPy `create_iterator_classes.rev_update1_dict_dict`
-                // (`dictmultiobject.py:991`) supplies the live
+                // (`dictmultiobject.py`) supplies the live
                 // `getiteritems_with_hash` walk.  Python 3.14 adds
                 // `dict_dict_merge`'s `orig_size` check after every
                 // destination insertion (`Objects/dictobject.c:3947-3985`):

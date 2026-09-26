@@ -6,8 +6,8 @@
 //! `pairmro()` / `DoubleDispatchRegistry` / `extendabletype` metaclass)
 //! is ported at [`crate::tool::pairtype`]. This file instead centralises
 //! the `class __extend__(pairtype(R_A, R_B))` extension blocks that
-//! upstream scatters across every `r*.py` file (rnone.py:46-64,
-//! rbool.py:49-84, rfloat.py:75-135, rint.py:200-665, rptr.py, ...).
+//! upstream scatters across every `r*.py` file (rnone.py,
+//! rbool.py, rfloat.py:75-135, rint.py, rptr.py, ...).  allow-line-citation
 //! Python's metaclass machinery makes that distribution invisible —
 //! each `class __extend__` block silently binds to the pair class
 //! produced by `pairtype(R_A, R_B)`. Rust has no metaclass, so the
@@ -21,7 +21,7 @@
 //!    `type(repr)` identity. The [`Repr::repr_class_id`] default
 //!    returns [`ReprClassId::Repr`] (the wildcard base used by
 //!    `pairtype(Repr, X)` / `pairtype(X, Repr)` extension blocks —
-//!    e.g. rnone.py:46,56 or rmodel.py); every concrete `Repr`
+//!    e.g. rnone.py or rmodel.py); every concrete `Repr`
 //!    overrides to return its specific variant.
 //!
 //! 2. [`ReprClassId::mro`] + [`pair_mro`] — per-class MRO and its
@@ -309,9 +309,9 @@ fn dispatch_convert_from_to(
 ) -> Result<Option<Hlvalue>, TyperError> {
     use ReprClassId::*;
     match (b1, b2) {
-        // rptr.py:120-124 — same pointer low-level type is identity.
+        // rptr.py __extend__ — same pointer low-level type is identity.
         (PtrRepr, PtrRepr) => same_lowleveltype_convert_from_to(r_from, r_to, v),
-        // rptr.py:213-218 and rptr.py:331-336 — matching pointer /
+        // rptr.py __extend__ and rptr.py __extend__ — matching pointer /
         // interior-pointer ADT-method low-level surfaces are identity
         // conversions.
         (PtrRepr, LLADTMethRepr) | (InteriorPtrRepr, LLADTMethRepr) => {
@@ -329,7 +329,7 @@ fn dispatch_convert_from_to(
         (InstanceRepr, InstanceRepr) => {
             super::rclass::pair_instance_instance_convert_from_to(r_from, r_to, v, llops)
         }
-        // rbool.py:49-84 — bool participates in IntegerRepr's MRO but
+        // rbool.py __extend__ — bool participates in IntegerRepr's MRO but
         // carries explicit primitive casts for the common Bool edges.
         (BoolRepr, FloatRepr) => {
             super::rbool::pair_bool_float_convert_from_to(r_from, r_to, v, llops)
@@ -343,7 +343,7 @@ fn dispatch_convert_from_to(
         (IntegerRepr, BoolRepr) => {
             super::rbool::pair_integer_bool_convert_from_to(r_from, r_to, v, llops)
         }
-        // rint.py:202-213,645-675 — primitive numeric casts.
+        // rint.py convert_from_to — primitive numeric casts.
         (IntegerRepr, IntegerRepr) => {
             super::rint::pair_integer_integer_convert_from_to(r_from, r_to, v, llops)
         }
@@ -471,7 +471,7 @@ fn dispatch_convert_from_to(
         (TupleRepr, TupleRepr) => {
             super::rtuple::pair_tuple_tuple_convert_from_to(r_from, r_to, v, llops)
         }
-        // rgcref.py:52-63 — conversions to/from the generic GCREF
+        // rgcref.py ll_hash_func — conversions to/from the generic GCREF
         // wrapper use `cast_opaque_ptr`, optionally converting through
         // the wrapped base repr first.
         (GCRefRepr, Repr) => {
@@ -570,7 +570,7 @@ fn dispatch_rtype_op(
 ) -> PairRTypeDispatch {
     use ReprClassId::*;
     match (b1, b2, opname) {
-        // rptr.py:126-159 / 301-329 — array and interior-array indexing.
+        // rptr.py __extend__ / 301-329 — array and interior-array indexing.
         (PtrRepr, IntegerRepr, "getitem") | (InteriorPtrRepr, IntegerRepr, "getitem") => {
             committed(r1.rtype_getitem(hop))
         }
@@ -725,7 +725,7 @@ fn dispatch_rtype_op(
         // (`r_key` is never read, only `r_dict.key_repr`).
         (OrderedDictRepr, _, "setitem") => committed(r1.rtype_setitem(hop)),
 
-        // rptr.py:165-184 — pointer comparison accepts any repr on the
+        // rptr.py __extend__ — pointer comparison accepts any repr on the
         // other side and coerces both args to the pointer repr.
         (PtrRepr, Repr, "eq") => committed(r1.rtype_eq(hop)),
         (PtrRepr, Repr, "ne") => committed(r1.rtype_ne(hop)),
@@ -1008,7 +1008,7 @@ fn dispatch_rtype_op(
     }
 }
 
-/// raddress.py:74-80
+/// raddress.py rtype_getitem
 fn pair_typed_address_access_int_rtype_getitem(r_acc: &dyn Repr, hop: &HighLevelOp) -> RTypeResult {
     use super::rmodel::TypedAddressAccessRepr;
     use crate::translator::rtyper::lltypesystem::llmemory::sizeof;
@@ -1043,7 +1043,7 @@ fn pair_typed_address_access_int_rtype_getitem(r_acc: &dyn Repr, hop: &HighLevel
     ))
 }
 
-/// raddress.py:82-87
+/// raddress.py rtype_setitem
 fn pair_typed_address_access_int_rtype_setitem(r_acc: &dyn Repr, hop: &HighLevelOp) -> RTypeResult {
     use super::rmodel::TypedAddressAccessRepr;
     use crate::translator::rtyper::lltypesystem::llmemory::sizeof;
@@ -1242,7 +1242,7 @@ fn dispatch_rtype_is_(
         // rnone.py — `pairtype(NoneRepr, Repr).rtype_is_` calls
         // `rtype_is_None(robj2, rnone1, hop, pos=1)`.
         (NoneRepr, Repr) => super::rnone::pair_none_any_rtype_is_(r1, r2, hop),
-        // rpbc.py:713-725 — the one upstream block registers
+        // rpbc.py __extend__ — the one upstream block registers
         // `rtype_is_` on `pairtype(MU, MU)`, `pairtype(MU, Single)`,
         // and `pairtype(Single, MU)`. All three emit adr_eq after
         // converting both operands to the MU repr; a Single operand is
@@ -1283,7 +1283,7 @@ fn dispatch_rtype_is_(
         (InstanceRepr, InstanceRepr) => {
             super::rclass::pair_instance_instance_rtype_is_(r1, r2, hop)
         }
-        // rmodel.py:300-318 — generic identity comparison for pointer
+        // rmodel.py rtype_is_ — generic identity comparison for pointer
         // low-level values, with Void adopting the opposite repr.
         (Repr, Repr) => pair_repr_repr_rtype_is_(r1, r2, hop).map(Some),
         _ => Ok(None),
@@ -1363,7 +1363,7 @@ mod tests {
 
     #[test]
     fn pair_mro_order_matches_upstream_python() {
-        // pairtype.py:65-73 — outer loop over cls2.__mro__, inner over
+        // pairtype.py — outer loop over cls2.__mro__, inner over
         // cls1.__mro__. For (BoolRepr, FloatRepr):
         //  mro1 = [BoolRepr, IntegerRepr, FloatRepr, Repr]
         //  mro2 = [FloatRepr, Repr]
@@ -1462,7 +1462,7 @@ mod tests {
 
     #[test]
     fn convert_from_to_integer_integer_emits_rint_cast() {
-        // rint.py:202-213 — Signed -> Unsigned emits
+        // rint.py convert_from_to — Signed -> Unsigned emits
         // `cast_int_to_uint` through pairtype(IntegerRepr, IntegerRepr).
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::flowspace::model::{ConstValue, Constant};
@@ -1531,7 +1531,7 @@ mod tests {
 
     #[test]
     fn convert_from_to_interiorptr_interiorptr_requires_dict_equality_like_rptr() {
-        // rptr.py:338-343 — lowleveltype equality is not enough here;
+        // rptr.py __extend__ — lowleveltype equality is not enough here;
         // upstream checks `r_from.__dict__ == r_to.__dict__`.
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::flowspace::model::{ConstValue, Constant};
@@ -1583,7 +1583,7 @@ mod tests {
 
     #[test]
     fn pair_rtype_add_integer_integer_emits_int_add() {
-        // rint.py:217-218 + rint.py:314-341.
+        // rint.py rtype_add + rint.py _rtype_template.
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::annotator::model::{SomeInteger, SomeValue};
         use crate::flowspace::model::{ConstValue, Constant, SpaceOperation, Variable};
@@ -1641,7 +1641,7 @@ mod tests {
 
     #[test]
     fn pair_rtype_add_ovf_integer_integer_emits_int_add_ovf() {
-        // rint.py:221-230 + rint.py:330-335 — overflow add goes through
+        // rint.py rtype_add_ovf + rint.py — overflow add goes through
         // `_rtype_template`, marks the llop as the raising point, and
         // emits `int_add_ovf` when neither argument is proven non-negative.
         use crate::annotator::annrpython::RPythonAnnotator;
@@ -1763,7 +1763,7 @@ mod tests {
 
     #[test]
     fn pair_rtype_div_integer_integer_emits_ll_int_py_div_direct_call() {
-        // rint.py:246-256 + rint.py:344-387 — integer `div` is an alias
+        // rint.py rtype_floordiv + rint.py _rtype_call_helper — integer `div` is an alias
         // for floordiv and must lower through `_rtype_call_helper`, not
         // through FloatRepr's `float_truediv` MRO fallback.
         use crate::annotator::annrpython::RPythonAnnotator;

@@ -315,7 +315,7 @@ pub struct W_TypeObject {
     /// path via `pyre_object::weakref::Weakref` — each slot is a
     /// `*mut Weakref` whose `weakptr` is invalidated by the GC
     /// when the target subclass becomes unreachable
-    /// (gctypelayout.py:587, incminimark.py:3058-3126).  The outer
+    /// (gctypelayout.py:587, incminimark.py invalidate_young_weakrefs).  The outer  allow-line-citation
     /// `Vec` is heap-allocated (`Box::into_raw`); the GC's
     /// custom-trace hook registered for `W_TYPE_GC_TYPE_ID` keeps
     /// each `Weakref` struct alive across collections (`pyre-jit
@@ -350,9 +350,9 @@ pub struct W_TypeObject {
     pub uses_object_setattr: std::sync::atomic::AtomicBool,
     /// typeobject.py:197 `flag_method_descriptor` (default `False`), set
     /// from `typedef.method_descriptor` at `__init__`
-    /// (typeobject.py:256; typedef.py:22/61) — `True` only for the
-    /// `function` typedef (typedef.py:807).  Gates the LOAD_METHOD
-    /// unbound `[w_descr, w_obj]` fast path (callmethod.py:66). Pyre's
+    /// (typeobject.py:256; typedef.py/61) — `True` only for the  allow-line-citation
+    /// `function` typedef (typedef.py).  Gates the LOAD_METHOD
+    /// unbound `[w_descr, w_obj]` fast path (callmethod.py). Pyre's
     /// TypeDef owns the declaration; installing the Layout copies it as in
     /// W_TypeObject.__init__, including for a reused/overridden TypeDef.
     pub flag_method_descriptor: bool,
@@ -388,7 +388,7 @@ pub struct W_TypeObject {
     /// _immutable_fields_ = ['_version_tag?']` — see [`QuasiImmut`].
     ///
     /// Allocated on the first registration (`get_current_qmut_instance`,
-    /// quasiimmut.py:17-27), null until then, and unlinked + freed on
+    /// quasiimmut.py), null until then, and unlinked + freed on
     /// invalidation (`_invalidate_now`, quasiimmut.py), so a type nobody
     /// has mutated since its last compile is the only one holding a box. Holds
     /// no GC pointers, so the `W_TYPE_GC_TYPE_ID` custom trace has nothing to
@@ -808,7 +808,7 @@ pub const COMPARES_BY_IDENTITY_UNKNOWN: u8 = 0;
 /// object-default `__eq__`/`__hash__`; identity comparison is
 /// observable-equivalent.
 pub const COMPARES_BY_IDENTITY_YES: u8 = 1;
-/// `dictmultiobject.py:155 OVERRIDES_EQ_CMP_OR_HASH` — type defines a
+/// `dictmultiobject.py descr_iter OVERRIDES_EQ_CMP_OR_HASH` — type defines a
 /// custom `__eq__` or `__hash__`; identity comparison is not safe.
 pub const COMPARES_BY_IDENTITY_NO: u8 = 2;
 
@@ -1240,7 +1240,7 @@ pub unsafe fn w_type_get_uses_object_getattribute(obj: PyObjectRef) -> bool {
 /// Mutates the per-type `uses_object_getattribute` atomic — a side effect on
 /// runtime type state the tracer cannot model, so the JIT residualises
 /// the call rather than tracing into it (`@dont_look_inside`,
-/// `rlib/jit.py:139`), the [`w_type_set_uses_object_setattr`] twin.
+/// `rlib/jit.py`), the [`w_type_set_uses_object_setattr`] twin.
 #[majit_macros::dont_look_inside]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -1273,7 +1273,7 @@ pub unsafe fn w_type_get_uses_object_setattr(obj: PyObjectRef) -> bool {
 /// Mutates the per-type `uses_object_setattr` atomic — a side effect on
 /// runtime type state the tracer cannot model, so the JIT residualises
 /// the call rather than tracing into it (`@dont_look_inside`,
-/// `rlib/jit.py:139`).
+/// `rlib/jit.py`).
 #[majit_macros::dont_look_inside]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime

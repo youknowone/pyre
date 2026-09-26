@@ -214,7 +214,7 @@ impl LowLevelDatabase {
     }
 
     /// Port of `LowLevelDatabase.getcontainernode(obj)`'s observable
-    /// registration surface at `database.py:157-179`, without node
+    /// registration surface at `database.py`, without node
     /// factory rendering.
     pub fn getcontainernode(&self, obj: Rc<dyn Any>) -> Rc<dyn Any> {
         let key = Rc::as_ptr(&obj) as *const () as usize;

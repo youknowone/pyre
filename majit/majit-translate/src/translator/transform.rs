@@ -1,6 +1,6 @@
 //! RPython `rpython/translator/transform.py` — annotation-driven
 //! graph transformations invoked from `RPythonAnnotator.simplify()`
-//! (annrpython.py:357-373).
+//! (annrpython.py).
 //!
 //! Module header reproduced verbatim from upstream (transform.py:1-6):
 //!
@@ -163,7 +163,7 @@ pub(crate) const DEFAULT_EXTRA_PASSES: &[TransformPass] = &[
 ///
 /// The `ann.translator` guard collapses to an unconditional invocation
 /// because the Rust port always owns a `TranslationContext`
-/// (annrpython.py:30-35 default-constructs one when absent).
+/// (annrpython.py default-constructs one when absent).
 pub fn transform_graph(
     ann: &RPythonAnnotator,
     extra_passes: Option<&[TransformPass]>,

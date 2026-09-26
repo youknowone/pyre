@@ -154,7 +154,7 @@ print(mixed_int_operand_hot(N))
 print(int_control_hot(N))
 
 
-# --- warm on the exact builtin, then swap in the subclass -------------------
+# warm on the exact builtin, then swap in the subclass
 # The list has no branch on the element, so the compiled trace can only reject
 # the tail element through a type guard. Each function prints what the override
 # says; a fold missing its `w_class` pin prints the raw builtin answer instead.

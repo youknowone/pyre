@@ -234,13 +234,13 @@ impl Guard {
         // #175: GuardStrengthenOpt carries `Op` VALUES, not `OpRc` —
         // `operations_as_ops` (vector.rs) deep-clones each producer and
         // `emit_varops` returns a flat `OpRef`, so no real producer `Rc` is
-        // reachable here to carry the way guard.py:86 threads `box_rhs`.
+        // reachable here to carry the way guard.py threads `box_rhs`.
         // `bound_from_opref` mints a synthetic producer whose `to_opref()` is
         // byte-identical (`majit-ir/src/operand.rs`); every reader in this pass keys by
         // `OpRef` (renamer/strongest_guards/rename_op), so the synthetic is
         // positionally equivalent. Carrying the live producer is deferred to
         // #175 (bind dormant vectorizer guard args to producers).
-        // guard.py:86-87: compare = ResOperation(opnum, [box_rhs, other_rhs])
+        // guard.py: compare = ResOperation(opnum, [box_rhs, other_rhs])
         let compare = Op::new(
             opnum,
             &[
@@ -460,7 +460,7 @@ pub struct GuardStrengthenOpt {
 }
 
 impl GuardStrengthenOpt {
-    /// guard.py:167
+    /// guard.py __init__
     pub fn new(index_vars: indexmap::IndexMap<OpRef, IndexVar>) -> Self {
         GuardStrengthenOpt {
             index_vars,

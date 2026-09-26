@@ -2,7 +2,7 @@
 # `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
 # rather than any generated code, and reads whatever the host's process
 # spawn cost happens to be that run. The jitstats baselines gate it.
-# descroperation.py:234 — when a descriptor reached through a type attribute
+# descroperation.py _handle_getattribute — when a descriptor reached through a type attribute
 # lookup raises AttributeError from its __get__, the metaclass __getattr__ gets
 # the final say (the whole getattribute slot is wrapped in try/except and an
 # AttributeError consults __getattr__).

@@ -24,10 +24,10 @@ pub trait VirtualVisitor {
     /// Return type of visit_* dispatch (see trait doc).
     type VInfo;
 
-    /// walkvirtual.py:5
+    /// walkvirtual.py visit_not_virtual
     fn visit_not_virtual(&mut self, value: OpRef) -> Self::VInfo;
 
-    /// walkvirtual.py:8; info.py:331-334.
+    /// walkvirtual.py visit_virtual; info.py visitor_dispatch_virtual_type.
     ///
     /// `fielddescr_indices` is a remaining Rust-side compatibility shim for
     /// call sites that still thread slot numbers explicitly. The canonical
@@ -50,7 +50,7 @@ pub trait VirtualVisitor {
         fielddescrs: &[DescrRef],
     ) -> Self::VInfo;
 
-    /// walkvirtual.py:14; info.py:597-599
+    /// walkvirtual.py visit_varray; info.py:597-599  allow-line-citation
     fn visit_varray(&mut self, arraydescr: &DescrRef, clear: bool) -> Self::VInfo;
 
     /// walkvirtual.py; info.py. See `visit_virtual` for the
@@ -63,7 +63,7 @@ pub trait VirtualVisitor {
         fielddescrs: &[DescrRef],
     ) -> Self::VInfo;
 
-    /// walkvirtual.py:20; info.py:444-450
+    /// walkvirtual.py visit_vrawbuffer; info.py:444-450  allow-line-citation
     fn visit_vrawbuffer(
         &mut self,
         func: i64,
@@ -72,21 +72,21 @@ pub trait VirtualVisitor {
         descrs: &[DescrRef],
     ) -> Self::VInfo;
 
-    /// walkvirtual.py:23; info.py:484-486
+    /// walkvirtual.py visit_vrawslice; info.py:484-486  allow-line-citation
     fn visit_vrawslice(&mut self, offset: i64) -> Self::VInfo;
 
-    /// walkvirtual.py:26; vstring.py:210-212
+    /// walkvirtual.py visit_vstrplain; vstring.py:210-212  allow-line-citation
     fn visit_vstrplain(&mut self, is_unicode: bool) -> Self::VInfo;
 
-    /// walkvirtual.py:29; vstring.py:332-334
+    /// walkvirtual.py visit_vstrconcat; vstring.py:332-334  allow-line-citation
     fn visit_vstrconcat(&mut self, is_unicode: bool) -> Self::VInfo;
 
-    /// walkvirtual.py:32; vstring.py:262-264
+    /// walkvirtual.py visit_vstrslice; vstring.py:262-264  allow-line-citation
     fn visit_vstrslice(&mut self, is_unicode: bool) -> Self::VInfo;
 
-    /// walkvirtual.py:35; info.py _visitor_walk_recursive
+    /// walkvirtual.py register_virtual_fields; info.py _visitor_walk_recursive
     fn register_virtual_fields(&mut self, virtualbox: OpRef, fieldboxes: &[OpRef]);
 
-    /// walkvirtual.py:38
+    /// walkvirtual.py already_seen_virtual
     fn already_seen_virtual(&mut self, virtualbox: OpRef) -> bool;
 }

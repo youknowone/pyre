@@ -290,7 +290,7 @@ fn signed_const(n: i64) -> Hlvalue {
 }
 
 /// Synthesize `LLHelpers.ll_str2bytearray` from
-/// `lltypesystem/rstr.py:385-391`.
+/// `lltypesystem/rstr.py`.
 pub(crate) fn build_ll_str2bytearray_helper_graph(name: &str) -> Result<PyGraph, TyperError> {
     let src_chars_ptr_lltype = chars_array_ptr_lltype_from_strptr(&STRPTR)?;
     let dst_chars_ptr_lltype = chars_array_ptr_lltype_from_bytearrayptr()?;

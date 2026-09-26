@@ -214,16 +214,16 @@ pub struct MergePoint {
     /// (warmstate.py `def get_uhash(*greenargs)`).
     ///
     /// `green_key` alone names a BUCKET, not a cell: `_get_index` truncates it
-    /// (counter.py:128-135), so several cells share one chain and
+    /// (counter.py), so several cells share one chain and
     /// `JitCell.comparekey` is what picks this one out of it
     /// (warmstate.py `def comparekey(self, *greenargs2)`). A consumer
     /// that reaches a cell through the hash alone installs one carrying no
     /// comparekey, which no later typed lookup can match — so the same loop
     /// header ends up owning a second cell with its own token and flags.
     /// Upstream never creates a cell from a hash: `_ensure_jit_cell_at_key`
-    /// (warmstate.py:631-641) is handed the greens themselves, and the one
+    /// (warmstate.py) is handed the greens themselves, and the one
     /// bare-hash entry point, `trace_next_iteration_hash`
-    /// (warmstate.py:622-623), only moves a counter.
+    /// (warmstate.py), only moves a counter.
     ///
     /// `None` only where a fixture builds a merge point from a bare number;
     /// every production producer has the key it hashed.
@@ -463,9 +463,9 @@ pub struct TraceCtx {
     /// walker has no dispatcher struct of its own, so the per-trace flag
     /// lives here; majit's own `pyjitpl::dispatch` keeps an equivalent
     /// field on the dispatcher).  Stamped by a `loop_header` op
-    /// (pyjitpl.py:1527-1528, the lowered `can_enter_jit` at a backward
+    /// (pyjitpl.py, the lowered `can_enter_jit` at a backward
     /// jump), consumed and reset by the following `jit_merge_point`
-    /// (pyjitpl.py:1559-1562).  `-1` = not seen.
+    /// (pyjitpl.py).  `-1` = not seen.
     pub seen_loop_header_for_jdindex: i32,
     /// JitCode coordinate of the explicit `loop_header` that set
     /// [`Self::seen_loop_header_for_jdindex`].  The codewriter emits that op in
@@ -647,7 +647,7 @@ pub struct TraceCtx {
     /// 2834) to set the `FORCE_BRIDGE_SEGMENTING` bit on the loop
     /// token when bridge tracing aborts without an inlinable function.
     pub(crate) resumekey_original_loop_token: Option<std::sync::Arc<JitCellToken>>,
-    /// pyjitpl.py:929-947 `self.metainterp.cpu` analog.
+    /// pyjitpl.py _opimpl_getfield_gc_any_pureornot `self.metainterp.cpu` analog.
     ///
     /// RPython's `_opimpl_getfield_gc_any_pureornot` runs
     /// `executor.execute(self.metainterp.cpu, self.metainterp, opnum,
@@ -680,14 +680,14 @@ pub struct TraceCtx {
     /// raising_exception=True)` — RPython surfaces the abort reason and
     /// the `raising_exception` flag as a real Python exception that
     /// propagates out of `interpret()` to `_compile_and_run_once`
-    /// (`pyjitpl.py:2907-2916`), where the catch site invokes
+    /// (`pyjitpl.py`), where the catch site invokes
     /// `run_blackhole_interp_to_cancel_tracing(stb)` (`pyjitpl.py`).
     /// That helper does TWO things: (1) `aborted_tracing(stb.reason)`
     /// accounting, (2) `convert_and_run_from_pyjitpl(self,
     /// stb.raising_exception)` — converting the framestack into
     /// blackhole interpreters and running them with the
     /// `raising_exception` flag so the eventual exception is preserved
-    /// (`pyjitpl.py:3391-3393` comment).
+    /// (`pyjitpl.py` comment).
     ///
     /// TODO: pyre's `TraceAction::Abort` carries no
     /// payload, so the dispatch site (`finalize_standard_virtualizable_may_force`)
@@ -696,11 +696,11 @@ pub struct TraceCtx {
     /// the consumer mirrors only `pyjitpl.py` `aborted_tracing(reason)`
     /// accounting.  `stb.raising_exception` is preserved on this struct
     /// but the `convert_and_run_from_pyjitpl` invocation
-    /// (in `blackhole.rs`, ported from `blackhole.py:1799`) is NOT yet
+    /// (in `blackhole.rs`, ported from `blackhole.py`) is NOT yet
     /// wired through this path; the helper-side exception raised during
     /// the residual call is therefore silently dropped at the abort
     /// boundary rather than re-raised via blackhole as RPython does.
-    /// Full `pyjitpl.py:2907 / 2949` cancel-tracing semantics needs
+    /// Full `pyjitpl.py / 2949` cancel-tracing semantics needs
     /// `BlackholeInterpBuilder` + `last_exc_value` plumbed to the
     /// `TraceAction::Abort` consumer and a JitException return surface
     /// on the back-edge runner — followup.
@@ -748,7 +748,7 @@ pub struct TraceCtx {
     /// thread-local: a fresh `TraceCtx` is built per bridge and dropped on
     /// every abort path (`abort_trace_live`), so the carrier is reborn
     /// `None` for each bridge exactly as RPython resets `self.framestack =
-    /// []` before `rebuild_from_resumedata` (pyjitpl.py:3427). This makes a
+    /// []` before `rebuild_from_resumedata` (pyjitpl.py). This makes a
     /// stale carrier leaking across bridges structurally impossible.
     pub(crate) bridge_inline_carrier: Option<BridgeInlineCarrier>,
     /// resume.py consume_boxes parity: per-bank live register indices
@@ -784,7 +784,7 @@ pub struct TraceCtx {
 /// then assembles each recipe into a `PyFrame` + `PyreSym` and pushes it via
 /// `push_inline_frame` — RIGHT before `interpret()`, with the root concrete
 /// frame's EC available and immediate GC-rooting (`rebuild_from_resumedata`
-/// resume.py:1042-1057 rebuilds frames and immediately interprets; pyre
+/// resume.py rebuilds frames and immediately interprets; pyre
 /// defers the build to the drain so the reconstructed locals are never held
 /// unrooted across an arbitrary collection — the #1 SIGSEGV subsystem).
 ///
@@ -974,7 +974,7 @@ impl TraceCtx {
     /// resolves to a `BhDescr::Field`; `None` otherwise (sanity check
     /// skipped — RPython `translate_support_code=True` analog).
     /// Mismatch handling is the caller's responsibility (`assert
-    /// resvalue == upd.currfieldbox.*` at pyjitpl.py:937/939/944).
+    /// resvalue == upd.currfieldbox.*` at pyjitpl.py/939/944).
     pub fn field_sanity_load(
         &self,
         struct_ptr: i64,
@@ -1015,7 +1015,7 @@ impl TraceCtx {
     /// `executor.py do_setfield_gc(cpu, _, structbox, itembox,
     /// fielddescr)` analog — the store half of [`Self::field_sanity_load`].
     /// `_opimpl_setfield_gc_any` reaches it through `execute_and_record`
-    /// (`pyjitpl.py:979`), so upstream really performs the field store while
+    /// (`pyjitpl.py`), so upstream really performs the field store while
     /// recording the `SETFIELD_GC`; a tracer that only records leaves the
     /// concrete object disagreeing with the value the heapcache now carries.
     ///
@@ -1259,7 +1259,7 @@ impl TraceCtx {
     /// heapcache.py `getarrayitem(box, indexbox, descr)` parity.
     /// Extracts the index ConstInt's `getint()` value (returns `None`
     /// on non-ConstInt operands, matching the upstream early-out at
-    /// `heapcache.py:543`) and routes the lookup through the indexcache
+    /// `heapcache.py`) and routes the lookup through the indexcache
     /// (`heap_array_cache[descr][index_value]`).  Inside the indexcache,
     /// `array` is canonicalised by `_unique_const_heuristic` against
     /// the per-CacheEntry `last_const_box` (heapcache.py) so two
@@ -1379,8 +1379,8 @@ impl TraceCtx {
     ///
     /// The `const_value` closure resolves `srcstart` / `dststart` /
     /// `length` boxes to their `ConstInt.getint()` values
-    /// (heapcache.py:393 `isinstance(_, ConstInt) and ...getint()`).
-    /// Without it the per-index copy branch at heapcache.py:412-432
+    /// (heapcache.py `isinstance(_, ConstInt) and ...getint()`).
+    /// Without it the per-index copy branch at heapcache.py
     /// is unreachable and arraycopy/arraymove fall back to whole-descr
     /// clearing.
     pub fn heapcache_invalidate_caches_varargs(
@@ -1659,7 +1659,7 @@ impl TraceCtx {
 
     /// `pyjitpl.py opimpl_virtual_ref_finish(box)` —
     /// `ExecutionContext.leave`'s `jit.virtual_ref_finish`
-    /// (`executioncontext.py:107`).  The vrefbox is reconstituted by popping,
+    /// (`executioncontext.py`).  The vrefbox is reconstituted by popping,
     /// not passed in, so the stack discipline is checked rather than assumed.
     ///
     /// Returns whether a pair was popped: the walker brackets a callee level
@@ -1826,7 +1826,7 @@ impl TraceCtx {
     /// Create a standalone TraceCtx for testing or external use.
     ///
     /// Internally synthesizes a fresh `Arc<MetaInterpStaticData>` —
-    /// test-only parity with `RPython test_opencoder.py:24` `class
+    /// test-only parity with `RPython test_opencoder.py metainterp_sd` `class
     /// metainterp_sd: all_descrs = []` which similarly stubs a
     /// MetaInterpStaticData fixture for unit tests. Production callers
     /// (`MetaInterp::force_start_tracing` / `setup_tracing` /
@@ -2372,7 +2372,7 @@ impl TraceCtx {
             Type::Float => JitArgKind::Float,
             Type::Void => return None,
         };
-        // resoperation.py:719/727/739 InputArg{Int,Float,Ref}: the
+        // resoperation.py InputArgInt/727/739 InputArg{Int,Float,Ref}: the
         // inputarg Box carries `box.type` directly. Mint the typed
         // variant here so callers see the same {Int,Float,Ref} discrimination
         // RPython's original_boxes[index] would produce.
@@ -2434,7 +2434,7 @@ impl TraceCtx {
     /// green key already has compiled code, so the metainterp should pop
     /// the inline frame and record a CALL_ASSEMBLER into the loop token
     /// from the parent frame (opimpl_jit_merge_point
-    /// portal_call_depth>0, pyjitpl.py:1579-1602). Drained via
+    /// portal_call_depth>0, pyjitpl.py). Drained via
     /// [`Self::take_recursive_call_assembler`].
     pub fn request_recursive_call_assembler(&mut self, green_key: u64, target_pc: usize) {
         self.recursive_call_assembler_pending = Some((green_key, target_pc));
@@ -2798,7 +2798,7 @@ impl TraceCtx {
     /// ```
     ///
     /// `reached_loop_header` runs this over the reds and, sharing ONE
-    /// `duplicates` set, over `virtualizable_boxes[:-1]` (pyjitpl.py:2978-2987)
+    /// `duplicates` set, over `virtualizable_boxes[:-1]` (pyjitpl.py)
     /// — i.e. over exactly what the loop-carried list is about to become — so
     /// no entry of that list is a constant and none appears twice. Both
     /// properties are assumed downstream and neither is checked:
@@ -3484,7 +3484,7 @@ impl TraceCtx {
 
     /// Update both halves of a standard virtualizable slot (OpRef + concrete).
     ///
-    /// pyjitpl.py:1237 parity:
+    /// pyjitpl.py _opimpl_setarrayitem_vable parity:
     ///
     /// ```text
     ///     self.metainterp.virtualizable_boxes[index] = valuebox
@@ -3675,7 +3675,7 @@ impl TraceCtx {
     /// cannot carry the concrete ptr through the tracer.  Used by
     /// `is_nonstandard_virtualizable` Step 4 to realize the runtime
     /// `isstandard = concrete_eq(box, standard_box)` compare that upstream
-    /// pyjitpl.py:1135-1138 performs via `rop.PTR_EQ` +
+    /// pyjitpl.py performs via `rop.PTR_EQ` +
     /// `implement_guard_value`.
     pub fn standard_virtualizable_concrete(&self) -> Option<Value> {
         self.virtualizable_values
@@ -4068,7 +4068,7 @@ impl TraceCtx {
         };
 
         // pyjitpl.py:3469 vbox = self.virtualizable_boxes[-1]
-        // pyjitpl.py:3470-3473 if vbox is not box: return  (ignore nonstandard)
+        // pyjitpl.py synchronize_virtualizable if vbox is not box: return  (ignore nonstandard)
         if boxes.last().copied() != Some(vable_opref) {
             return;
         }
@@ -4857,7 +4857,7 @@ impl TraceCtx {
     /// shape. Cache hit short-circuits and bumps
     /// `HEAPCACHED_OPS`; miss records `RecordExactClass` and stamps
     /// both `class_now_known` and `nullity_now_known(true)` per
-    /// pyjitpl.py:401-402.  Panics if `cls_const` resolves to a non-Int
+    /// pyjitpl.py.  Panics if `cls_const` resolves to a non-Int
     /// constant — the dispatcher invariant guarantees int-kind here.
     pub fn trace_record_exact_class(&mut self, opref: OpRef, cls_const: OpRef) {
         if self.heap_cache.is_class_known(opref) {
@@ -4922,7 +4922,7 @@ impl TraceCtx {
         let vable_concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, vable_concrete) {
             // self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
-            // (pyjitpl.py:973-988).
+            // (pyjitpl.py).
             //
             // The codewriter emits the vinfo's `static_field_descrs[idx]`
             // for `setfield_vable`. On the STANDARD virtualizable
@@ -5480,7 +5480,7 @@ impl TraceCtx {
 
     /// `executor.execute` for a recorded virtualizable element read.
     ///
-    /// pyjitpl.py:1223-1227 reaches the element with `opimpl_getarrayitem_gc_*`,
+    /// pyjitpl.py reaches the element with `opimpl_getarrayitem_gc_*`,
     /// which executes the load and attaches the result to the box it returns
     /// (`history.py *FrontendOp(pos, value)`). The fallback legs below
     /// record the op directly and must execute it the same way: an element box
@@ -5787,7 +5787,7 @@ impl TraceCtx {
     ///
     /// The three `MetaInterp::opimpl_setarrayitem_vable_*` wrappers deliberately
     /// assert `Stored`: `_get_arrayitem_vable_index` in
-    /// `rpython/jit/metainterp/pyjitpl.py:1215` asserts that the index is within
+    /// `rpython/jit/metainterp/pyjitpl.py` asserts that the index is within
     /// the virtualizable array, making `OutOfVable` an invariant violation on
     /// that path. Graceful handling belongs to dispatcher/walker callers that
     /// have a trace to abort.
@@ -7051,7 +7051,7 @@ mod tests {
             .collect()
     }
 
-    // --- virtualizable_boxes tests ---
+    // virtualizable_boxes tests
 
     fn make_test_vable_info() -> crate::virtualizable::VirtualizableInfo {
         let mut info = crate::virtualizable::VirtualizableInfo::new(0);

@@ -197,7 +197,7 @@ pub unsafe fn w_weakref_object_slot_del(obj: PyObjectRef, index: usize) -> bool 
 pub const WEAKREF_GC_TYPE_ID: u32 = 51;
 
 /// `WEAKREF = lltype.GcStruct("weakref", ("weakptr", llmemory.Address))`
-/// (gctypelayout.py:587). Single `weakptr` slot at offset 0 — the
+/// (gctypelayout.py). Single `weakptr` slot at offset 0 — the
 /// majit-gc collector reads / writes this slot during
 /// `invalidate_young_weakrefs` / `invalidate_old_weakrefs`.
 #[repr(C)]

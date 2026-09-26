@@ -162,7 +162,7 @@ fn shrink_array_width(buf: i64) -> (usize, usize) {
 
 /// Width-parametric `rgc.ll_shrink_array(buf, new_len)` core.
 ///
-/// `rgc.py:475-476` asks the GC first — `if llop.shrink_array(Bool, p,
+/// `rgc.py` asks the GC first — `if llop.shrink_array(Bool, p,
 /// smallerlength): return p` — and only allocates when the answer is no. The
 /// GC says yes for a nursery object, where the shrink is the length word alone
 /// and the buffer keeps its address.

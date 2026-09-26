@@ -146,7 +146,7 @@ impl X86CpuExt {
     /// old descr pointer) referencing a now-orphaned descr.  PyPy
     /// attaches `propagate_exception_descr` once before
     /// `cpu.setup_once()` and never replaces it
-    /// (`pyjitpl.py:2273-2283` precedes `pyjitpl.py:2292-2303`); pyre
+    /// (`pyjitpl.py` precedes `pyjitpl.py _setup_once`); pyre
     /// upholds the same invariant by panicking instead of dropping
     /// the buffer.
     pub(crate) fn has_propagate_dependent_caches(&self) -> bool {

@@ -64,7 +64,7 @@ impl crate::lltype::GcType for Module {
 /// for `space.builtin`, freshly-imported modules, REPL `__main__`, and
 /// other Modules whose authoritative namespace is their dict object.
 ///
-/// `module.py:24` — `if w_name is not None: setitem(w_dict, '__name__',
+/// `module.py` — `if w_name is not None: setitem(w_dict, '__name__',
 /// w_name)`. Pyre seeds `__name__` through `w_dict_setitem_str`.
 ///
 /// `name` — the module name (e.g. "math", "os.path"); empty string is
@@ -74,7 +74,7 @@ impl crate::lltype::GcType for Module {
 ///
 fn module_value(name: &str) -> Module {
     // `pypy/interpreter/module.py Module.__init__` opens
-    // `w_dict = space.newdict(module=True)` per `dictmultiobject.py:440-451
+    // `w_dict = space.newdict(module=True)` per `dictmultiobject.py
     // _newdict(module=True)`, which lands on `W_ModuleDictObject`
     // (ModuleDictStrategy + cell-cache). Pyre routes through
     // `w_module_dict_new`; `pypy/objspace/std/celldict.py` strategy semantics
@@ -120,7 +120,7 @@ pub fn w_module_new_managed(name: &str) -> PyObjectRef {
 }
 
 /// Allocate a `Module` aliasing a user-supplied `W_DictObject`.
-/// Mirrors `pypy/module/__builtin__/moduledef.py:102-103
+/// Mirrors `pypy/module/__builtin__/moduledef.py
 /// module.Module(space, None, w_builtin)`: the Module's dict identity
 /// IS the user dict (PyPy `module.w_dict = w_builtin`).
 ///
@@ -128,7 +128,7 @@ pub fn w_module_new_managed(name: &str) -> PyObjectRef {
 /// `LOAD_GLOBAL` falls through to `space.finditem_str(module.w_dict,
 /// name)` so subclass `__getitem__` overrides are not bypassed.
 ///
-/// `name` seeding (`pypy/interpreter/module.py:24`): when `name` is a
+/// `name` seeding (`pypy/interpreter/module.py`): when `name` is a
 /// non-empty string, set `w_dict["__name__"] = name` so
 /// `module.__name__` resolves and `from module import *`,
 /// `import_from` submodule fallback work.  PyPy's

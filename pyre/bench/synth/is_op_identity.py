@@ -8,11 +8,11 @@
 # The codewriter routes `is` / `is_not` through the same `compare_fn` residual
 # as the six ordinary comparisons (tags 8 and 9), so before the walker fold
 # every identity test in a loop cost a `CALL_MAY_FORCE` plus its
-# `GUARD_NOT_FORCED`.  `space.is_w` (baseobjspace.py:833) is pointer identity
+# `GUARD_NOT_FORCED`.  `space.is_w` (baseobjspace.py) is pointer identity
 # for every class that does not override `is_w`, so those tests lower to a bare
 # `ptr_eq` / `ptr_ne` — and a self-compare (`a is a`) answers at `is_w`'s
 # opening `ptr::eq` whatever the class, so it folds to a constant with no op
-# and no guard at all (FASTPATHS_SAME_BOXES, pyjitpl.py:326-336).
+# and no guard at all (FASTPATHS_SAME_BOXES, pyjitpl.py).
 #
 # `hot` holds only the shapes the fold accepts; each never-taken arm adds a
 # huge sentinel, so a wrong predicate balloons the checksum.  `semantics` runs

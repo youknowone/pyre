@@ -554,7 +554,7 @@ fn make_fget(name: &'static str) -> PyObjectRef {
             pyre_interpreter::make_builtin_function_with_arity(
                 name,
                 |args| {
-                    // `typedef.py:361 self.fget(self, space, w_obj)`.
+                    // `typedef.py self.fget(self, space, w_obj)`.
                     let w_self = args
                         .get(1)
                         .copied()

@@ -58,7 +58,7 @@ pub trait VirtualizableInfoHandle: std::fmt::Debug + Send + Sync {
 /// TODO: same crate-boundary reasoning as
 /// `VirtualizableInfoHandle`.  Hosts implement this on their rich
 /// `GreenFieldInfo` so `CallControl.could_be_green_field`
-/// (call.py:387-393) can walk `jd.greenfield_info` without depending on
+/// (call.py) can walk `jd.greenfield_info` without depending on
 /// metainterp.
 pub trait GreenFieldInfoHandle: std::fmt::Debug + Send + Sync {
     /// `(GTYPE, fieldname) in self.green_fields`.

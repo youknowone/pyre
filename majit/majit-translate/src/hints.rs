@@ -7,7 +7,7 @@
 /// dispatch-by-name helper (`hint_access_directly`, `hint_promote`, …)
 /// and the variant tag below mirrors the RPython kwarg key.
 ///
-/// RPython equivalents (`rlib/jit.py:81-98`):
+/// RPython equivalents (`rlib/jit.py`):
 ///   * `hint(x, access_directly=True)`     → [`AccessDirectly`]
 ///   * `hint(x, fresh_virtualizable=True)` → [`FreshVirtualizable`]
 ///   * `hint(x, force_virtualizable=True)` → [`ForceVirtualizable`]
@@ -33,7 +33,7 @@ pub enum HintKind {
     /// promote_string=True)`.  Upstream emits the 3-input
     /// `str_guard_value/rid>r` op (`codewriter/jtransform.py:
     /// 615-631`) calling `_ll_2_str_eq_nonnull`
-    /// (`rpython/jit/codewriter/support.py:526-538`) on a
+    /// (`rpython/jit/codewriter/support.py`) on a
     /// `Ptr(rstr.STR)` arg.  Pyre's `jtransform::rewrite_op_hint`
     /// panics in this arm because pyre-object has no `rstr.STR`-
     /// equivalent GC layout (`rpython/rtyper/lltypesystem/rstr.py:
@@ -44,7 +44,7 @@ pub enum HintKind {
     /// `PromoteString` but on `Ptr(rstr.UNICODE)` arg
     /// (`codewriter/jtransform.py:632-648`).  Pyre panics for
     /// the same reason: no `rstr.UNICODE`-equivalent GC layout
-    /// (`rpython/rtyper/lltypesystem/rstr.py:1238-1246
+    /// (`rpython/rtyper/lltypesystem/rstr.py
     /// UNICODE.become({hash, chars: Array(UniChar)})`).
     PromoteUnicode,
     /// `rlib/jit.py` — `hint(arg, promote=True,
@@ -56,7 +56,7 @@ pub enum HintKind {
     /// emits the combined hint through a dedicated
     /// `hint_promote_or_string` helper; this variant carries the
     /// dual-hint shape into `rewrite_op_hint`.  Per
-    /// `codewriter/jtransform.py:601-606` the disambiguator picks
+    /// `codewriter/jtransform.py` the disambiguator picks
     /// `PromoteString` when `op.args[0].concretetype ==
     /// lltype.Ptr(rstr.STR)` and `Promote` otherwise.  Pyre has no
     /// `Ptr(rstr.STR)` GC layout (`rpython/rtyper/lltypesystem/

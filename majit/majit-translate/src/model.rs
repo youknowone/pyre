@@ -30,7 +30,7 @@ pub enum ValueType {
     /// `simple_call(rarithmetic.r_uint, v)` lives in `front::mir`'s
     /// `Cast` lowering per
     /// `rbuiltin.py:178-189` / `rbuiltin.py:220-225` /
-    /// `rarithmetic.py:600`.
+    /// `rarithmetic.py`.
     Unsigned,
     /// RPython `lltype.SingleFloat` — `rffi.r_singlefloat`, a Rust `f32`.
     ///
@@ -182,7 +182,7 @@ pub enum UnsupportedExprKind {
     Yield,
     /// Rust `!x` whose operand has no statically-known bool/int type.
     /// RPython distinguishes UNARY_NOT (`flowcontext.py`) from
-    /// UNARY_INVERT (`flowcontext.py:188-191`) at the bytecode token,
+    /// UNARY_INVERT (`flowcontext.py`) at the bytecode token,
     /// so an Unknown operand cannot pick the parity-correct flowspace
     /// op without guessing.
     UnaryNotUnknownOperand,
@@ -582,7 +582,7 @@ pub enum CallFuncPtr {
     Value(crate::flowspace::model::Variable),
 }
 
-/// RPython `flatten.py:53-57`:
+/// RPython `flatten.py IndirectCallTargets`:
 ///
 /// ```python
 /// class IndirectCallTargets(object):
@@ -591,10 +591,10 @@ pub enum CallFuncPtr {
 /// ```
 ///
 /// Sidecar attached to `OpKind::CallResidual` when the residual call is the
-/// tail of a regular-indirect lowering (`jtransform.py:547`).  The assembler
+/// tail of a regular-indirect lowering (`jtransform.py`).  The assembler
 /// merges the JitCode handles into `Assembler.indirectcalltargets` so the
 /// metainterp can later look up jitcodes by function-pointer address during
-/// runtime dispatch (`pyjitpl.py:2325-2343`).
+/// runtime dispatch (`pyjitpl.py`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndirectCallTargets {
     /// `Arc<JitCode>` shells (identity-keyed via `JitCodeHandle`) for
@@ -639,7 +639,7 @@ pub struct FieldDescriptor {
     /// frame, not an object the JIT is tracking — which is what
     /// `jtransform.py:990-993 fresh_virtualizable` suppresses upstream.
     /// Upstream obtains that by annotating `Frame.__init__`
-    /// (`pypy/interpreter/pyframe.py:99`); the equivalent annotation is
+    /// (`pypy/interpreter/pyframe.py`); the equivalent annotation is
     /// unreachable here because the constructor is shredded into ~65
     /// blocks by its call terminators while `vable_flags` is per-block,
     /// so the fact is recovered structurally instead.  Only `Some(false)`
@@ -801,7 +801,7 @@ pub enum OpKind {
         /// Optional class identity for `Ref`-typed parameters carried
         /// from the front-end's `syn::Type` projection.  Mirrors how
         /// PyPy's annotator routes typed `&Foo` through
-        /// `bookkeeper.getuniqueclassdef` (`description.py:283-305
+        /// `bookkeeper.getuniqueclassdef` (`description.py pycall
         /// FunctionDesc.pycall`) so the rtyper's `find_attribute`
         /// (`rclass.py:556`) lands on the actual `ClassDef`.  The
         /// `front::mir` param lowering currently leaves this `None` for
@@ -831,7 +831,7 @@ pub enum OpKind {
     /// `ConstInt`. Distinct from `ConstInt(0/1)` at the annotator /
     /// rtyper layer: lifts to `SomeBool` (`annotator/model.py`)
     /// instead of `SomeInteger`, and selects `BoolRepr`
-    /// (`rpython/rtyper/rbool.py:10`) instead of `IntegerRepr`.
+    /// (`rpython/rtyper/rbool.py`) instead of `IntegerRepr`.
     ConstBool(bool),
     /// RPython `flowmodel.py:Constant(rfloat)` — a float constant whose
     /// `concretetype` is `lltype.Float`.  Stored as the f64 bit pattern
@@ -902,7 +902,7 @@ pub enum OpKind {
     ///
     /// RPython's rtyper `specialize_call` rewrites the `direct_call`
     /// in-place to `inputconst(Signed, _we_are_jitted)`
-    /// (`rpython/rlib/jit.py:403-406`), so the symbolic `Constant`
+    /// (`rpython/rlib/jit.py`), so the symbolic `Constant`
     /// flows through the single graph that both the backend and
     /// `codewriter/jtransform.py` consume.  Pyre's rtyper is a
     /// type oracle on an ephemeral graph that never rewrites the
@@ -995,7 +995,7 @@ pub enum OpKind {
     /// distinguishes `new_array_clear` from the uninitialised `new_array`.
     ///
     /// `length` is the item count (`_get_initial_newlist_length`,
-    /// `jtransform.py:1835-1842`).  `item_ty` / `array_type_id` resolve the
+    /// `jtransform.py`).  `item_ty` / `array_type_id` resolve the
     /// `arraydescr` at assembly exactly like `ArrayRead`/`ArrayWrite`; a
     /// cleared list holds GC pointers (`Ptr(GcArray(OBJECTPTR))`), so
     /// `item_ty` is `Ref`.  The allocator zero-fills every slot
@@ -1010,7 +1010,7 @@ pub enum OpKind {
         array_type_id: Option<String>,
     },
     /// The compound resizable-list allocation `opimpl_newlist_clear`
-    /// records (`pyjitpl.py:792-798`) — the resized-layout counterpart to
+    /// records (`pyjitpl.py`) — the resized-layout counterpart to
     /// `do_resizable_newlist_clear` (`jtransform.py`).  Allocates
     /// the resizable-list `GcStruct` header (the struct named `"list"`),
     /// zero-clears a fresh items array of `length` slots, and wires the two
@@ -1056,7 +1056,7 @@ pub enum OpKind {
         /// listdef.listitem.mutated` (rlist.py:256-258), and the
         /// `FixedSizeListRepr` iterator next is `ll_listnext_foldable`
         /// when `not r_list.listitem.mutated`
-        /// (lltypesystem/rlist.py:462-466).  `true` only for such a
+        /// (lltypesystem/rlist.py).  `true` only for such a
         /// foldable/unmutated selection or an immutable container —
         /// NEVER for a mutable list element.
         pure: bool,
@@ -1091,7 +1091,7 @@ pub enum OpKind {
         nolength: bool,
     },
     /// `raw_load_{i,f}` — one element read out of raw (non-GC) memory at a
-    /// byte offset (`jtransform.py:1165-1171 rewrite_op_raw_load`).  The
+    /// byte offset (`jtransform.py rewrite_op_raw_load`).  The
     /// descr is `arraydescrof(rffi.CArray(T))`: no length header, item
     /// width and signedness from `T` — carried here explicitly because
     /// [`ValueType`] collapses widths.
@@ -1102,7 +1102,7 @@ pub enum OpKind {
         itemsize: usize,
         is_item_signed: bool,
     },
-    /// `raw_store_{i,f}` (`jtransform.py:1156-1163 rewrite_op_raw_store`).
+    /// `raw_store_{i,f}` (`jtransform.py rewrite_op_raw_store`).
     /// See [`OpKind::RawLoad`] for the descr shape.
     RawStore {
         base: crate::flowspace::model::Variable,
@@ -1113,7 +1113,7 @@ pub enum OpKind {
         is_item_signed: bool,
     },
     /// RPython: getinteriorfield_gc_i/r/f — read a field of an array-of-structs element.
-    /// effectinfo.py:313-325: generates "readinteriorfield" effect.
+    /// effectinfo.py add_interiorfield: generates "readinteriorfield" effect.
     /// effectinfo.py:327-340: also implicitly generates "readarray" effect.
     InteriorFieldRead {
         base: crate::flowspace::model::Variable,
@@ -1210,10 +1210,10 @@ pub enum OpKind {
     /// produced by the rtyper layer (e.g. from `VtableMethodPtr` for
     /// `dyn Trait` dispatch). `args` are the full call arguments,
     /// including the receiver. `graphs` mirrors the trailing `c_graphs`
-    /// constant from `rpbc.py:216`: `Some(full_family)` when known,
+    /// constant from `rpbc.py`: `Some(full_family)` when known,
     /// `None` otherwise.
     ///
-    /// RPython: `rpython/rtyper/rpbc.py:216-217`
+    /// RPython: `rpython/rtyper/rpbc.py`
     /// ```python
     /// vlist.append(hop.inputconst(Void, row_of_graphs.values()))
     /// v = hop.genop('indirect_call', vlist, resulttype=rresult)
@@ -1244,7 +1244,7 @@ pub enum OpKind {
     /// `value` is a [`LinkArg`] (register or inline constant) like
     /// [`OpKind::FieldWrite`]: `rewrite_op_setfield` passes the setfield
     /// `v_value` straight to `setfield_vable_%s`
-    /// (`jtransform.py:921-927`), which may be a `Constant`
+    /// (`jtransform.py`), which may be a `Constant`
     /// (`flatten.py:360-371`).  `setfield_vable_i` is not in `USE_C_FORM`
     /// (`assembler.py:312-345`), so a constant value always takes the
     /// pool `i` slot (`setfield_vable_i/rid`), never the short `c` byte.
@@ -1331,7 +1331,7 @@ pub enum OpKind {
     ///
     /// RPython models a single `hint` operator
     /// (`rpython/flowspace/operation.py add_operator('hint', None,
-    /// dispatch=1)`) whose kwarg dict selects the behaviour; `rlib/jit.py:101
+    /// dispatch=1)`) whose kwarg dict selects the behaviour; `rlib/jit.py
     /// promote(x)` and `#[elidable_promote]`'s per-arg wrapper both lower to
     /// it.  Pyre carries the kwarg key as the structured [`kind`] field
     /// instead of a `Void`-constant dict (which `OpKind::Call` cannot hold),
@@ -1340,7 +1340,7 @@ pub enum OpKind {
     /// synthesised marker name.  Outside the JIT the op is an identity on
     /// `value` (the flowspace oracle lowers it to `same_as`); the JIT
     /// codewriter rewrites it to the `<kind>_guard_value` family
-    /// (`codewriter/jtransform.py:608-614`).
+    /// (`codewriter/jtransform.py`).
     Hint {
         value: crate::flowspace::model::Variable,
         kind: crate::hints::HintKind,
@@ -1403,7 +1403,7 @@ pub enum OpKind {
     // `result_kind`: 'i', 'r', 'f', or 'v' (RPython `getkind(result.concretetype)`)
     /// Inline call — callee is a regular candidate graph.
     /// RPython: `inline_call_{kinds}_{reskind}(jitcode, [i_args], [r_args], [f_args])`
-    /// RPython jtransform.py:473-482.
+    /// RPython jtransform.py.
     InlineCall {
         /// RPython: `callcontrol.get_jitcode(targetgraph)` returns the
         /// callee JitCode object itself, not its final `index`.
@@ -1421,7 +1421,7 @@ pub enum OpKind {
     },
     /// Recursive call — back to the portal entry point.
     /// RPython: `recursive_call_{reskind}(jd_index, [green_i], [green_r], [green_f], [red_i], [red_r], [red_f])`
-    /// RPython jtransform.py:522-534.
+    /// RPython jtransform.py handle_recursive_call.
     RecursiveCall {
         /// RPython: `jitdriver_sd.index`
         jd_index: usize,
@@ -1441,7 +1441,7 @@ pub enum OpKind {
     // These correspond to RPython's `_handle_jit_call()` in jtransform.py.
     // The codewriter converts calls to `jit.*` oopspec functions into
     // dedicated opcodes instead of residual calls.
-    /// jtransform.py:1731 — `jit_debug(string, arg1, arg2, arg3, arg4)`.
+    /// jtransform.py — `jit_debug(string, arg1, arg2, arg3, arg4)`.
     /// Emits debug info into the trace (like debug_merge_point).
     JitDebug {
         args: Vec<crate::flowspace::model::Variable>,
@@ -1485,11 +1485,11 @@ pub enum OpKind {
         result_ty: ValueType,
     },
 
-    // ── Conditional call ops (jtransform.py:1665-1688) ──────
+    // ── Conditional call ops (jtransform.py _rewrite_op_cond_call) ──────
     //
     // RPython: `jit_conditional_call` / `jit_conditional_call_value` llops
     // are rewritten to `conditional_call_{kinds}_{reskind}`.
-    /// jtransform.py:1685 — `conditional_call_{ir}_{v}`.
+    /// jtransform.py rewrite_op_jit_conditional_call — `conditional_call_{ir}_{v}`.
     /// If condition is true, call the function. Always produces void.
     /// RPython: `COND_CALL(condition, funcptr, calldescr, args...)`
     ConditionalCall {
@@ -1500,7 +1500,7 @@ pub enum OpKind {
         args_r: Vec<crate::flowspace::model::Variable>,
         args_f: Vec<crate::flowspace::model::Variable>,
     },
-    /// jtransform.py:1687 — `conditional_call_value_{ir}_{reskind}`.
+    /// jtransform.py rewrite_op_jit_conditional_call_value — `conditional_call_value_{ir}_{reskind}`.
     /// If value is falsy (0/NULL/None), call the function and return its result.
     /// RPython: `COND_CALL_VALUE(value, funcptr, calldescr, args...)`
     ConditionalCallValue {
@@ -1513,7 +1513,7 @@ pub enum OpKind {
         result_kind: char,
     },
 
-    /// jtransform.py:292-313 — `record_known_result_{i|r}_ir_v`.
+    /// jtransform.py rewrite_op_jit_record_known_result — `record_known_result_{i|r}_ir_v`.
     /// Produced by `rewrite_op_jit_record_known_result`; pairs an elidable call
     /// with its known result for constant folding by OptPure.
     /// RPython layout: `record_known_result_{reskind}(result, funcptr, calldescr, [i], [r])`
@@ -1539,7 +1539,7 @@ pub enum OpKind {
     ///
     /// TODO: RPython derives `mutate_field` via
     /// `quasiimmut.get_mutate_field_name(name)` which expects the lltype
-    /// `inst_` prefix (`quasiimmut.py:11-15`).  Rust structs have no such
+    /// `inst_` prefix (`quasiimmut.py`).  Rust structs have no such
     /// prefix, so we use the literal `mutate_<fieldname>` convention.
     RecordQuasiImmutField {
         base: crate::flowspace::model::Variable,
@@ -1573,7 +1573,7 @@ pub enum OpKind {
     /// JitDriver loop-header marker — RPython `loop_header` opname.
     /// Emitted by `handle_jit_marker__loop_header` (jtransform.py)
     /// with the jitdriver's index as its single Constant arg.
-    /// `can_enter_jit` markers alias to this (jtransform.py:1723).
+    /// `can_enter_jit` markers alias to this (jtransform.py).
     LoopHeader {
         jitdriver_index: usize,
     },
@@ -1653,7 +1653,7 @@ pub enum OpKind {
     ///
     /// RPython parity: `flowspace/flowcontext.py:LOAD_GLOBAL` lifts a
     /// module-scope name lookup to a `Constant(value)` whose payload
-    /// is the resolved object (`flowspace/flowcontext.py:1098`); the
+    /// is the resolved object (`flowspace/flowcontext.py`); the
     /// annotator binds the result via `unionof(s_Constant)` without
     /// emitting a SpaceOperation (the bound `Variable` *is* the
     /// graph-level definition).  Pyre's adapter emits a placeholder
@@ -1723,7 +1723,7 @@ pub enum ExitSwitch {
 /// Upstream stores the concrete switch value itself here: `False` /
 /// `True` for boolean branches, the Python `Exception` class object for
 /// catch-all exception links, or a specific exception class object for
-/// typed handlers (`flowspace/model.py:114-120`,
+/// typed handlers (`flowspace/model.py`,
 /// `flowspace/flowcontext.py:127-143`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitCase {
@@ -1755,7 +1755,7 @@ impl Link {
     /// `Link(args=[Hlvalue], target=Block, exitcase=...)` where each
     /// `Hlvalue` is the upstream `Variable` instance pulled from an
     /// `op.result` / `Block.inputargs` slot.  Mirrors the upstream
-    /// `flowspace/model.py:114-116` arity assert via `graph` lookup
+    /// `flowspace/model.py` arity assert via `graph` lookup
     /// for `target.inputargs`.
     pub fn from_variables(
         graph: &FunctionGraph,
@@ -1854,7 +1854,7 @@ impl LinkArg {
     ///
     /// RPython parity: `Link.args` upstream is `List[Hlvalue]` where
     /// each `Hlvalue::Variable` carries the operand identity inline
-    /// (`flowspace/model.py:140`).
+    /// (`flowspace/model.py`).
     pub fn as_variable(&self) -> Option<&crate::flowspace::model::Variable> {
         match self {
             Self::Value(var) => Some(var),
@@ -2095,7 +2095,7 @@ pub struct Block {
     /// predecessor when its outgoing link fired.  Build-time only —
     /// downstream rtyper/jtransform passes ignore this field; it is
     /// neither serialised nor required to remain populated past the
-    /// front end.  RPython parity: `flowspace/flowcontext.py:38
+    /// front end.  RPython parity: `flowspace/flowcontext.py SpamBlock
     /// SpamBlock.__init__ self.framestate = framestate` attaches a
     /// framestate to the block representing the locals state visible at
     /// that block boundary; pyre stores the analogous "exit-time"
@@ -2135,7 +2135,7 @@ pub struct Block {
 pub struct FrameState {
     /// Slot `i` ↔ graph-wide first-bind name at index `i`; `None` if
     /// unbound at this snapshot point.  RPython parity:
-    /// `framestate.py:19 self.locals_w` — list of `Variable | Constant
+    /// `framestate.py __init__ self.locals_w` — list of `Variable | Constant
     /// | None` indexed by `co_varnames` slot.  Carries upstream
     /// `Variable` identity directly; the parallel `locals_w`
     /// `Vec<Option<Hlvalue>>` carrier (next field) still distinguishes
@@ -2143,7 +2143,7 @@ pub struct FrameState {
     /// collapses to `None`.
     pub entries: Vec<Option<crate::flowspace::model::Variable>>,
     /// Parallel `Hlvalue` carrier matching upstream
-    /// `framestate.py:19 self.locals_w` shape — list of
+    /// `framestate.py __init__ self.locals_w` shape — list of
     /// `Variable | Constant | None` indexed by `co_varnames` slot.
     /// Populated by `getstate` / `union` alongside `entries`; the
     /// long-term plan is to promote this to the single source of truth
@@ -2198,7 +2198,7 @@ impl FrameState {
         self.entries.get(slot).cloned().flatten()
     }
 
-    /// Authoritative locals view — upstream `framestate.py:19 self.locals_w`
+    /// Authoritative locals view — upstream `framestate.py __init__ self.locals_w`
     /// IS the locals source-of-truth.  Pyre's `union` / `getstate`
     /// constructors populate `self.locals_w` in lockstep with
     /// `self.entries` so production callers consult the `Hlvalue` carrier
@@ -2241,11 +2241,11 @@ impl FrameState {
     ///   - `(None, _) | (_, None)` → None-kill (`framestate.py:
     ///     110-111`); merged slot is `None`.
     ///   - `(Some(s), Some(o))` with matching Variable identity →
-    ///     carry through that Variable (`framestate.py:108 if w1 == w2:
+    ///     carry through that Variable (`framestate.py if w1 == w2:
     ///     return w1`).
     ///   - `(Some(s), Some(o))` with disagreeing Variables →
     ///     `graph.alloc_value_var()` for a fresh slot at this
-    ///     position (`framestate.py:113-114 return Variable()`
+    ///     position (`framestate.py return Variable()`
     ///     analogue).
     ///
     /// Type unification is NOT performed here — upstream's per-slot
@@ -2298,7 +2298,7 @@ impl FrameState {
         // carries `self.{blocklist,next_offset}` and lets `matches`
         // catch the mismatch downstream.
         //
-        // Body order (`framestate.py:79-87`): locals → stack →
+        // Body order (`framestate.py`): locals → stack →
         // exception, all inside the try/except envelope.  Pyre
         // **reorders** to (stack → exception → locals): the locals
         // fold is total (Variable domain has no UnionError analogue)
@@ -2316,7 +2316,7 @@ impl FrameState {
         // `flowspace::framestate::union_stack` returns `Err(UnionError)`
         // on stack length disagreement, SpecTag mismatch, or
         // FlowSignal-type mismatch — propagate as `None` per upstream's
-        // try/except envelope (`framestate.py:78,88-89`).
+        // try/except envelope (`framestate.py`).
         let stack = crate::flowspace::framestate::union_stack(&self.stack, &other.stack).ok()?;
         // `framestate.py:81-87`: both `last_exception` None → None;
         // otherwise FSException carries `union(args1[i], args2[i])` for
@@ -2354,7 +2354,7 @@ impl FrameState {
         // so we extend to `max(len, len)` and treat the trailing
         // unpadded slot as `None` (per-cell `union` returns
         // `Ok(None)` when either side is `None`, matching upstream
-        // `framestate.py:110-111` undefined-local kill).
+        // `framestate.py` undefined-local kill).
         let self_view = self.locals_w_view(graph);
         let other_view = other.locals_w_view(graph);
         let len = std::cmp::max(self_view.len(), other_view.len());
@@ -2376,7 +2376,7 @@ impl FrameState {
         drop(self_view);
         drop(other_view);
         // Derive `entries` from `locals_w` — `locals_w` is now the
-        // primary carrier matching `framestate.py:19 self.locals_w`,
+        // primary carrier matching `framestate.py __init__ self.locals_w`,
         // and `entries` is a backward-compatibility view for callers
         // that have not yet migrated.  `Hlvalue::Variable(v)` is
         // cloned directly into the entry, carrying the merged value's
@@ -2472,7 +2472,7 @@ impl FrameState {
         // stack→exception boundary.
         //
         // Locals projection consults `locals_w` (the `Hlvalue` carrier
-        // matching `framestate.py:19 self.locals_w`) for both the
+        // matching `framestate.py self.locals_w`) for both the
         // target's Variable predicate and self's cell contribution —
         // same shape as the stack and exception projections below.
         // `locals_w_view` returns the populated `Hlvalue` slice for
@@ -2608,7 +2608,7 @@ impl FrameState {
             nv.rename_from(v);
             nv
         };
-        // `locals_w` is the authoritative carrier (framestate.py:19).
+        // `locals_w` is the authoritative carrier (framestate.py __init__).
         // When `locals_w` is empty (pre-Z4.A.6 fixtures), fall back
         // to `entries` as the seed.
         let locals_w: Vec<Option<Hlvalue>> = if self.locals_w.len() == self.entries.len() {
@@ -2632,7 +2632,7 @@ impl FrameState {
             })
             .collect();
         // `map(_copy, self.stack)` — each stack element independently copied.
-        // framestate.py:8-10: FlowSignal → rebuild with recursively
+        // framestate.py: FlowSignal → rebuild with recursively
         // copied args.
         let stack: Vec<crate::flowspace::framestate::StackElem> =
             self.stack
@@ -2683,7 +2683,7 @@ impl FrameState {
     /// ```
     ///
     /// blocklist and next_offset must agree (asserted) — `matches` is a
-    /// post-`union` comparison invoked from `flowcontext.py:438` and the
+    /// post-`union` comparison invoked from `flowcontext.py` and the
     /// candidate-list precondition is that all candidates share the
     /// same join-point coordinates.
     ///
@@ -2784,7 +2784,7 @@ fn exc_args(
 }
 
 /// RPython `eliminate_empty_blocks(graph)`
-/// (`rpython/translator/simplify.py:52-69`).
+/// (`rpython/translator/simplify.py`).
 ///
 /// ```python
 /// def eliminate_empty_blocks(graph):
@@ -3004,7 +3004,7 @@ pub fn retarget_assert_raise_blocks(graph: &mut FunctionGraph) -> usize {
 /// already has `exitcase = None`, so the one code path covers both.
 ///
 /// Returns the number of removed exits so the caller can gate the
-/// follow-up dead-condition sweep (`removeassert.py:35-37` — "now melt
+/// follow-up dead-condition sweep (`removeassert.py` — "now melt
 /// away the (hopefully) dead operation that compute the condition").
 ///
 /// The predicate here is upstream's literal `exit.target is
@@ -3067,7 +3067,7 @@ pub fn remove_assertion_errors(graph: &mut FunctionGraph) -> usize {
                 // Promote the survivor to an unconditional link —
                 // upstream's canraise arm (`simplify.py:333-335`) plus
                 // the `kill_assertion_link` normalisation for value
-                // switches (`removeassert.py:84-89`, see above).  Clear
+                // switches (`removeassert.py`, see above).  Clear
                 // the low-level case too so no branch metadata lingers on
                 // a now-unconditional edge, matching `fold_constant_exitswitch`.
                 block.exitswitch = None;
@@ -3911,7 +3911,7 @@ pub fn lower_struct_ptr_writes(
             if !same_owner {
                 continue;
             }
-            // `checkgraph` (`flowspace/model.py:598-608`) permits an operation
+            // `checkgraph` (`flowspace/model.py`) permits an operation
             // to use only constants, its block's inputargs, or variables
             // defined earlier in that block.  A FieldWrite found on another
             // aggregate path may carry a predecessor-local Variable; splicing
@@ -5326,7 +5326,7 @@ fn sink_fused_boxing_aggregates_at_raw_writes(
 /// An operand is threaded only when it is available on every predecessor path
 /// into the use block.  This is the same condition `SSA_to_SSI` enforces while
 /// adding one inputarg to every block and one argument to every incoming link
-/// (`rpython/translator/backendopt/ssa.py:171-190`).  Diamond joins are valid
+/// (`rpython/translator/backendopt/ssa.py`).  Diamond joins are valid
 /// when the definition dominates the split; a value defined in only one arm,
 /// or one with no upstream definition, is left untouched so the adapter can
 /// Skip the malformed graph.  Back edges provisionally satisfy the recursive
@@ -6655,7 +6655,7 @@ where
 /// the rtyper ran.
 ///
 /// The variants line up 1:1 with [`getkind`]'s output strings
-/// (`rpython/jit/metainterp/history.py:45-71`):
+/// (`rpython/jit/metainterp/history.py`):
 ///
 /// - [`Self::Signed`] = `"int"`
 /// - [`Self::GcRef`]  = `"ref"`
@@ -6903,7 +6903,7 @@ pub struct FuncEffects {
     /// `canmallocgc=True` — and answers the two analyzers differently for it:
     /// `CollectAnalyzer.analyze_simple_operation` returns True while
     /// `RandomEffectsAnalyzer.analyze_simple_operation` returns False
-    /// (effectinfo.py:417-418). A crate that is not lowered to LLBC spells
+    /// (effectinfo.py). A crate that is not lowered to LLBC spells
     /// that same operation as a call to a graph-less callee, so it needs the
     /// same split: this flag answers can-collect only, leaving random-effects
     /// alone. `random_effects_on_gcobjs` cannot stand in — it answers both,
@@ -7426,7 +7426,7 @@ impl FunctionGraph {
 
     /// `Variable.concretetype` getter — reads the `Variable.concretetype`
     /// cell directly.  RPython's resolver iterates `Variable` instances
-    /// directly (`rtyper.py:258 v.concretetype = ...`); use this when
+    /// directly (`rtyper.py setconcretetype v.concretetype = ...`); use this when
     /// the caller already holds a `&Variable` (e.g.
     /// `OpKind::BinOp.lhs / .rhs`, `block.inputargs[i]`).
     pub fn concretetype_of(var: &crate::flowspace::model::Variable) -> ConcreteType {
@@ -7453,7 +7453,7 @@ impl FunctionGraph {
     }
 
     /// Walk the startblock-reachable block closure (`iterblocks()`
-    /// parity, `rpython/flowspace/model.py:66`) and collect every distinct
+    /// parity, `rpython/flowspace/model.py`) and collect every distinct
     /// [`crate::flowspace::model::Variable`] it references: block
     /// `inputargs`, operation operands
     /// ([`crate::inline::op_variable_refs`]) and results, link `args` /
@@ -7531,7 +7531,7 @@ impl FunctionGraph {
     }
 
     /// Walk the startblock-reachable block closure in `iterblocks()`
-    /// order (`rpython/flowspace/model.py:66`) and return the visited
+    /// order (`rpython/flowspace/model.py`) and return the visited
     /// [`BlockId`]s.  The startblock is yielded first, then each block's
     /// exits are pushed reversed so the first exit is visited first —
     /// the canonical DFS order RPython passes consume.  Block ids need
@@ -7639,7 +7639,7 @@ impl FunctionGraph {
     /// Shorthand for the single-exit fall-through shape — one Link to
     /// `target` carrying `args`, `exitswitch = None`.  Upstream
     /// equivalent: `block.closeblock(Link(args, target))`
-    /// (`flowspace/model.py:304`).
+    /// (`flowspace/model.py`).
     pub fn set_goto(
         &mut self,
         block: BlockId,
@@ -7695,7 +7695,7 @@ impl FunctionGraph {
 
     /// Close `block` with a single-exit Link into `target_block` whose
     /// `args` are derived from `pred_state.getoutputargs(target_state,
-    /// self)`.  Direct port of `flowcontext.py:438`:
+    /// self)`.  Direct port of `flowcontext.py`:
     ///
     /// ```python
     /// outputargs = currentstate.getoutputargs(newstate)
@@ -7978,12 +7978,12 @@ impl FunctionGraph {
     /// `block.exitswitch = cond;
     ///  block.closeblock(Link(false_args, if_false, False),
     ///                   Link(true_args,  if_true,  True))`
-    /// (`flowspace/model.py:175-180` + `:304`).
+    /// (`flowspace/model.py` + `:304`).
     ///
-    /// RPython `flowcontext.py:744-779` unconditionally evaluates
+    /// RPython `flowcontext.py JUMP_IF_FALSE` unconditionally evaluates
     /// `op.bool(w_value).eval(self)` before `guessbool`, so every
     /// `block.exitswitch` Variable is the result of a `bool` HighLevelOp.
-    /// The rtyper then specialises `bool` per repr (`rmodel.py:251-260
+    /// The rtyper then specialises `bool` per repr (`rmodel.py CanBeNull
     /// CanBeNull → ptr_nonzero`; `rint.py IntegerRepr → identity`;
     /// `rstr.py → str_nonzero`; etc.).  Pyre's flatten consumer asserts
     /// `block.exitswitch.concretetype == lltype.Bool`
@@ -8104,7 +8104,7 @@ impl FunctionGraph {
     /// Emits an unconditional Link to `graph.exceptblock` carrying the
     /// `RaiseImplicit` `(w_type, w_value)` pair: the `AssertionError`
     /// *class* Constant and a separate `AssertionError(msg)` *instance*
-    /// Constant (`flowcontext.py:1280-1282`).  The two slots are never
+    /// Constant (`flowcontext.py`).  The two slots are never
     /// the same value — `w_value` is an exception instance, not the
     /// class.  A bare raise with no concrete payload — a Rust
     /// `UnwindResume` / `Abort` — has no source exception class, so
@@ -8144,7 +8144,7 @@ impl FunctionGraph {
 
     /// Terminate `block` with the implicit-exception raise shape of
     /// RPython `RaiseImplicit.nomoreblocks`
-    /// (`flowspace/flowcontext.py:1271-1284`):
+    /// (`flowspace/flowcontext.py`):
     ///
     /// ```python
     /// msg = "implicit %s shouldn't occur" % exc_cls.__name__
@@ -8266,7 +8266,7 @@ impl FunctionGraph {
     /// `Variable.rename(name)` — alias of [`Self::name_value_var`].
     /// Both honour the first-wins idempotency of `rename`; used by
     /// `FrameState::copy` (name-prefix carry-over) and the `mergeblock`
-    /// generalize arm (`flowcontext.py:444-447`).
+    /// generalize arm (`flowcontext.py`).
     pub fn rename_value_var(
         &mut self,
         var: &crate::flowspace::model::Variable,
@@ -8597,7 +8597,7 @@ mod tests {
         let next = graph.create_block();
         graph.set_branch(entry, cond_var, next, vec![], next, vec![]);
         assert_eq!(graph.blocks.len(), 4);
-        // `set_branch` mirrors RPython `flowcontext.py:744-779`
+        // `set_branch` mirrors RPython `flowcontext.py JUMP_IF_FALSE`
         // `op.bool(w_value).eval(self)` — every exitswitch is the result
         // of an appended `bool` HighLevelOp, so a branching block carries
         // the original Input op plus the bool wrap (2 ops total).
@@ -8684,7 +8684,7 @@ mod tests {
             )
             .unwrap();
         graph.set_return(entry, Some(value_var.clone()));
-        // Upstream `flowspace/model.py:171-180` identifies the routed
+        // Upstream `flowspace/model.py Block` identifies the routed
         // return by Block.exits carrying a single Link(value, returnblock)
         // with exitswitch=None.
         let entry_block = graph.block(entry);
@@ -13098,7 +13098,7 @@ mod tests {
 
     /// `FrameState::union` walks the merged stack.  The disagreement at
     /// stack slot 0 (Variable vs Variable with distinct identities)
-    /// yields a fresh phi Variable per `framestate.py:113-114 return
+    /// yields a fresh phi Variable per `framestate.py return
     /// Variable()`; that fresh identity is distinct from both
     /// predecessors.
     #[test]
@@ -13223,7 +13223,7 @@ mod tests {
     }
 
     /// `FrameState::union` derives the parallel
-    /// `locals_w` (`Hlvalue` carrier matching `framestate.py:19
+    /// `locals_w` (`Hlvalue` carrier matching `framestate.py
     /// self.locals_w`) from the unioned `entries` (Variable carrier).
     /// Each defined slot's Variable carries through directly via
     /// clone; None-killed slots stay None.
@@ -13433,7 +13433,7 @@ mod tests {
     /// `ensure_variable_at_block` threads a Variable defined in a
     /// predecessor through one intermediate block: appends to the
     /// predecessor's exit args + adds to the block's inputargs.
-    /// Mirrors the carry-through case in `flowspace/flowcontext.py:407
+    /// Mirrors the carry-through case in `flowspace/flowcontext.py
     /// setstate(block.framestate)` at block entry.
     #[test]
     fn ensure_variable_at_block_threads_one_level_through_predecessor() {

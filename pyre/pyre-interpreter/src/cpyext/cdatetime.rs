@@ -117,7 +117,7 @@ pub static mut PyDateTimeAPI: *mut CPyDateTimeCAPI = std::ptr::null_mut();
 /// singleton an extension keeps a pointer to for as long as it is loaded.
 static API_TABLE: super::ForkMutex<usize> = super::ForkMutex::new(0);
 
-/// `cdatetime.py:22-105 _PyDateTime_Import`.
+/// `cdatetime.py _PyDateTime_Import`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyDateTime_Import() -> *mut CPyDateTimeCAPI {
     let existing = *API_TABLE.lock();
@@ -245,7 +245,7 @@ fn construct(
     super::object::result(called)
 }
 
-/// `cdatetime.py:218-229 _PyDate_FromDate`.
+/// `cdatetime.py _PyDate_FromDate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyDate_FromDate(
     year: c_int,
@@ -261,7 +261,7 @@ pub unsafe extern "C" fn _PyDate_FromDate(
     )
 }
 
-/// `cdatetime.py:230-243 _PyTime_FromTime`.
+/// `cdatetime.py _PyTime_FromTime`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyTime_FromTime(
     hour: c_int,
@@ -279,7 +279,7 @@ pub unsafe extern "C" fn _PyTime_FromTime(
     )
 }
 
-/// `cdatetime.py:293-312 _PyTime_FromTimeAndFold`.
+/// `cdatetime.py _PyTime_FromTimeAndFold`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyTime_FromTimeAndFold(
     hour: c_int,
@@ -298,7 +298,7 @@ pub unsafe extern "C" fn _PyTime_FromTimeAndFold(
     )
 }
 
-/// `cdatetime.py:244-264 _PyDateTime_FromDateAndTime`.
+/// `cdatetime.py _PyDateTime_FromDateAndTime`.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyDateTime_FromDateAndTime(
@@ -328,7 +328,7 @@ pub unsafe extern "C" fn _PyDateTime_FromDateAndTime(
     )
 }
 
-/// `cdatetime.py:266-291 _PyDateTime_FromDateAndTimeAndFold`.
+/// `cdatetime.py _PyDateTime_FromDateAndTimeAndFold`.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyDateTime_FromDateAndTimeAndFold(
@@ -359,7 +359,7 @@ pub unsafe extern "C" fn _PyDateTime_FromDateAndTimeAndFold(
     )
 }
 
-/// `cdatetime.py:348-362 _PyDelta_FromDelta`.
+/// `cdatetime.py _PyDelta_FromDelta`.
 ///
 /// `normalize` is not passed on: `timedelta` normalizes what it is given, so
 /// there is nothing the argument could select between.
@@ -379,7 +379,7 @@ pub unsafe extern "C" fn _PyDelta_FromDelta(
     )
 }
 
-/// `cdatetime.py:365-377 _PyTimeZone_FromTimeZone`.
+/// `cdatetime.py _PyTimeZone_FromTimeZone`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyTimeZone_FromTimeZone(
     offset: *mut CPyObject,
@@ -438,7 +438,7 @@ fn from_timestamp(
     made
 }
 
-/// `cdatetime.py:323-330 _PyDateTime_FromTimestamp`.
+/// `cdatetime.py _PyDateTime_FromTimestamp`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyDateTime_FromTimestamp(
     type_: *mut CPyObject,
@@ -448,7 +448,7 @@ pub unsafe extern "C" fn _PyDateTime_FromTimestamp(
     from_timestamp(type_, "fromtimestamp", args, kwds)
 }
 
-/// `cdatetime.py:341-346 _PyDate_FromTimestamp`.
+/// `cdatetime.py _PyDate_FromTimestamp`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyDate_FromTimestamp(
     type_: *mut CPyObject,
@@ -457,7 +457,7 @@ pub unsafe extern "C" fn _PyDate_FromTimestamp(
     from_timestamp(type_, "fromtimestamp", args, std::ptr::null_mut())
 }
 
-/// `cdatetime.py:314-321 PyDateTime_FromTimestamp`.
+/// `cdatetime.py PyDateTime_FromTimestamp`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDateTime_FromTimestamp(args: *mut CPyObject) -> *mut CPyObject {
     let class = pyobject::make_ref(datetime_class_or_import("datetime"));
@@ -466,7 +466,7 @@ pub unsafe extern "C" fn PyDateTime_FromTimestamp(args: *mut CPyObject) -> *mut 
     made
 }
 
-/// `cdatetime.py:332-339 PyDate_FromTimestamp`.
+/// `cdatetime.py PyDate_FromTimestamp`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDate_FromTimestamp(args: *mut CPyObject) -> *mut CPyObject {
     let class = pyobject::make_ref(datetime_class_or_import("date"));
@@ -484,7 +484,7 @@ fn datetime_class_or_import(name: &str) -> PyObjectRef {
 
 // ── the check functions ─────────────────────────────────────────────────
 
-/// `cdatetime.py:107-121 make_check_function`'s `check`.
+/// `cdatetime.py make_check_function`'s `check`.
 fn check(object: *mut CPyObject, name: &str) -> c_int {
     let object = unsafe { pyobject::from_ref(object) };
     let class = datetime_class(name);
@@ -727,7 +727,7 @@ pub unsafe extern "C" fn PyDateTime_TIME_GET_TZINFO(object: *mut c_void) -> *mut
 // ── the fields a block carries ──────────────────────────────────────────
 
 /// Which of the two blocks with fields a class of the `datetime` module takes
-/// — `cdatetime.py:143-160 init_datetime`'s three `basestruct`s, of which
+/// — `cdatetime.py init_datetime`'s three `basestruct`s, of which
 /// `date` gets one it does not use and `_PyDateTime_Import` sizes back down.
 #[derive(Clone, Copy)]
 enum Shape {
@@ -848,7 +848,7 @@ fn block_shape(tp: *mut CPyTypeObject) -> Option<Shape> {
     None
 }
 
-/// Fill a freshly allocated mirror — `cdatetime.py:162-189 type_attach` and
+/// Fill a freshly allocated mirror — `cdatetime.py type_attach` and
 /// `206-216 timedeltatype_attach`.
 pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
     let tp = unsafe { (*raw).ob_type };
@@ -887,7 +887,7 @@ pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
 }
 
 /// Release the reference a `time` or `datetime` mirror owns —
-/// `cdatetime.py:191-204 type_dealloc`.
+/// `cdatetime.py type_dealloc`.
 ///
 /// The block says so itself: `hastzinfo` is the word [`attach`] set beside the
 /// reference, and `type_dealloc`'s `if py_datetime.c_hastzinfo` reads exactly

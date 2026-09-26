@@ -92,7 +92,7 @@ pub fn monitoring_free_tool_id(tool_id: usize) {
 /// pre-header, but exposes the 3.14 logical size required by `sys.getsizeof`.
 ///
 /// Answering with a size is a deliberate divergence from this module's
-/// counterpart. `pypy/module/sys/vm.py:355-358` returns `w_default` unchanged
+/// counterpart. `pypy/module/sys/vm.py` returns `w_default` unchanged
 /// and raises `TypeError` when no default was supplied, for the reason its own
 /// `getsizeof_missing` text gives: maps are shared across instances, equal
 /// strings may share their data, and some sequences materialise their items as
@@ -899,7 +899,7 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(pyre_object::gc_roots::shadow_stack_get(result_slot))
 }
 
-/// `pypy/module/sys/vm.py:217 space.getexecutioncontext()` access for
+/// `pypy/module/sys/vm.py settrace space.getexecutioncontext()` access for
 /// `sys.gettrace`/`settrace`/`getprofile`/`setprofile`.
 ///
 /// Pyre's `crate::call::getexecutioncontext` returns the TLS-cached
@@ -1829,7 +1829,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(ns, "winver", w_str_new("3.14t"));
     // sys.dllhandle — the handle of the DLL exporting the Python C API,
     // published beside `winver` because both come from the same `MS_COREDLL`
-    // block.  `ctypes/__init__.py:562` builds `pythonapi` out of it with no
+    // block.  `ctypes/__init__.py` builds `pythonapi` out of it with no
     // import guard, so a missing attribute is an AttributeError out of `import
     // ctypes`.  `vm.py get_dllhandle` answers 0 for a build without
     // `cpyext`, and there is no cpyext here, so 0 is the whole answer: the
@@ -3636,7 +3636,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 /// Python objects are handed to the collector by [`walk_audit_hooks_gc`].
 pub struct AuditHolder {
     /// `vm.py AuditHolder.__init__ self.hooks_w = None` projected onto a byte at a fixed offset:
-    /// false while upstream's list is None, which is exactly the `vm.py:481`
+    /// false while upstream's list is None, which is exactly the `vm.py`
     /// early-out.  The projection exists because the JIT reads this field
     /// through a descriptor, and `Box<[T]>` has no target-stable null spelling
     /// — a wasm32 fat pointer is two 4-byte halves, not one 8-byte word.

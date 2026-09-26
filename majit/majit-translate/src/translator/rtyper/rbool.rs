@@ -21,7 +21,7 @@
 //!   carry an explicit field, but `BoolRepr` routes integer coercions
 //!   through the same `Signed` repr that upstream stores there.
 //! * pairtype conversions `BoolRepr ↔ FloatRepr` / `BoolRepr ↔ IntegerRepr`
-//!   (`rbool.py:49-84`) — covered by the pairtype dispatcher port (see
+//!   (`rbool.py`) — covered by the pairtype dispatcher port (see
 //!   [`super::rnone`] deferral note for the shared plan).
 
 use std::sync::Arc;
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn setup_on_bool_repr_reaches_finished_state() {
-        // rmodel.py:35-59 state machine — BoolRepr inherits the default
+        // rmodel.py setup state machine — BoolRepr inherits the default
         // `_setup_repr` (no-op).
         let r = BoolRepr::new();
         assert_eq!(r.state().get(), setupstate::NotInitialized);

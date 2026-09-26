@@ -259,7 +259,7 @@ pub enum CallEffectKind {
     MayForce,
     /// A callee whose effects row is stated by the override table rather than
     /// derived from a graph (callee census) — upstream's `analyze_external_call` answer
-    /// (`graphanalyze.py:104-108`).
+    /// (`graphanalyze.py`).
     ///
     /// The three variants above are shorthands for three particular rows;
     /// this one carries the row.
@@ -748,7 +748,7 @@ struct ResolvedCallResult {
 
 /// RPython: the `key` value stored as `op.args[0]` of a
 /// `SpaceOperation('jit_marker', [key, jitdriver, *args])` operation
-/// (`jtransform.py:1658-1663`). pyre's front-end does not carry the
+/// (`jtransform.py rewrite_op_jit_marker`). pyre's front-end does not carry the
 /// `jit_marker` opname explicitly — the markers reach the codewriter as
 /// `direct_call` s to `PyPyJitDriver::{jit_merge_point, can_enter_jit,
 /// loop_header}`. This enum keeps the upstream key distinction inside
@@ -757,7 +757,7 @@ struct ResolvedCallResult {
 pub(crate) enum JitMarkerKey {
     JitMergePoint,
     /// `can_enter_jit` aliases to `handle_jit_marker__loop_header`
-    /// (jtransform.py:1723).
+    /// (jtransform.py).
     CanEnterJit,
     LoopHeader,
 }
@@ -850,8 +850,8 @@ fn can_enter_jit_false_result(result: &crate::flowspace::model::Variable) -> Spa
 /// `make_three_lists` (`jtransform.py`). Void values are
 /// dropped, matching the upstream filter; Unknown defaults to `Ref`.
 /// Reads kinds via `FunctionGraph::concretetype_of(var)` — the same
-/// `getkind(v.concretetype)` source as RPython's `flatten.py:382
-/// getcolor` and `rtyper.py:258 v.concretetype = ...`.
+/// `getkind(v.concretetype)` source as RPython's `flatten.py getcolor
+/// getcolor` and `rtyper.py setconcretetype v.concretetype = ...`.
 fn split_args_by_kind(
     args: &[crate::flowspace::model::Variable],
 ) -> (
@@ -1619,7 +1619,7 @@ impl<'a> Transformer<'a> {
     }
 
     /// RPython: `Transformer.__init__(cpu=None, callcontrol=None, portal_jd=None)`
-    /// (`jtransform.py:62-66`). Pyre keeps `cpu` / `callcontrol` behind
+    /// (`jtransform.py`). Pyre keeps `cpu` / `callcontrol` behind
     /// builder setters because the borrow checker demands a late binding
     /// against the enclosing `CallControl`; `portal_jd` follows the same
     /// pattern. All three fields start `None`, matching upstream class
@@ -1666,7 +1666,7 @@ impl<'a> Transformer<'a> {
     /// index into `CallControl::jitdrivers_sd` rather than a direct
     /// reference so the builder does not force a second borrow of
     /// `CallControl`. `handle_jit_marker__jit_merge_point`
-    /// (`jtransform.py:1690-1712`) uses this for both identity checks
+    /// (`jtransform.py`) uses this for both identity checks
     /// and `Constant(portal_jd.index, lltype.Signed)` synthesis.
     pub fn with_portal_jd(mut self, jd_index: Option<usize>) -> Self {
         self.portal_jd_index = jd_index;
@@ -1712,8 +1712,8 @@ impl<'a> Transformer<'a> {
 
         // RPython rtyper `specialize_call` rewrites a `we_are_jitted()`
         // `direct_call` to the `_we_are_jitted` symbolic constant
-        // (`rpython/rlib/jit.py:403-406`); `rewrite_op_int_is_true` then
-        // folds it by symbolic identity (`jtransform.py:1638`).  pyre's
+        // (`rpython/rlib/jit.py`); `rewrite_op_int_is_true` then
+        // folds it by symbolic identity (`jtransform.py`).  pyre's
         // rtyper types an ephemeral oracle and never rewrites the
         // surviving model graph, so the symbolic injection runs here —
         // post-annotation, pre-rewrite — keeping the un-annotatable
@@ -1759,7 +1759,7 @@ impl<'a> Transformer<'a> {
         exceptblock: crate::model::BlockId,
     ) {
         // `jtransform.py:74-75 if block.operations == (): return`.  The
-        // predicate is the empty *tuple* — `flowspace/model.py:196-197
+        // predicate is the empty *tuple* — `flowspace/model.py is_final_block
         // is_final_block` — which only the graph's returnblock and
         // exceptblock carry.  An ordinary block whose operations happen to
         // be empty holds a *list*, and `[] == ()` is false, so it is not
@@ -2134,7 +2134,7 @@ impl<'a> Transformer<'a> {
     ///
     /// The four call sites are the fused-exitswitch and link-args pair in
     /// `optimize_block` (`jtransform.py`),
-    /// `rewrite_call_three_lists` (`jtransform.py:421`), and
+    /// `rewrite_call_three_lists` (`jtransform.py`), and
     /// `rewrite_op_setfield` (`jtransform.py`).  All four stood
     /// commented out for a while, because the check was correct and what
     /// it rejected was not.
@@ -2182,7 +2182,7 @@ impl<'a> Transformer<'a> {
     ///
     /// Four of the routes name a specific operand position, each passing
     /// its own literal: `"link argument"`, `"fused exitswitch operand"`,
-    /// `"call argument"`, `"setfield operand"` (`jtransform.py:912`, the
+    /// `"call argument"`, `"setfield operand"` (`jtransform.py`, the
     /// base or the stored value of a `setfield`; there is no
     /// `setarrayitem` site, because that one is the array access the
     /// protocol exists to allow).
@@ -2550,7 +2550,7 @@ impl<'a> Transformer<'a> {
             // ── fold of the `_we_are_jitted` symbolic ──
             //
             // Inside the tracer / blackhole interpreter `we_are_jitted()`
-            // is always true (`rlib/jit.py:355`).  RPython folds this at
+            // is always true (`rlib/jit.py`).  RPython folds this at
             // `rewrite_op_int_is_true` (`jtransform.py`) keyed on the
             // symbolic value identity (`value is _we_are_jitted`).  pyre's
             // `we_are_jitted() -> bool` carries the symbolic as
@@ -2571,7 +2571,7 @@ impl<'a> Transformer<'a> {
             // Unlike the setfield/getarrayitem dispatch this runs whether or
             // not `lower_virtualizable` is enabled: the quasi-immutable
             // `-live-` + `record_quasiimmut_field` pair from
-            // `rpython/jit/codewriter/jtransform.py:895-903` is independent
+            // `rpython/jit/codewriter/jtransform.py` is independent
             // of virtualizable lowering.  `rewrite_op_getfield` internally
             // falls through to `RewriteResult::Keep` for mutable fields and
             // plain immutables (their purity is carried on the descriptor).
@@ -2628,7 +2628,7 @@ impl<'a> Transformer<'a> {
                 self.rewrite_op_direct_call(op, target, &args, result_ty, graph_name, graph)
             }
             // ── rewrite_op_indirect_call ──
-            // RPython jtransform.py:410-412. Pyre's rtyper-equivalent
+            // RPython jtransform.py. Pyre's rtyper-equivalent
             // (`translator/rtyper/rpbc.rs`) lowers
             // `OpKind::Call { target: CallTarget::Indirect, .. }` into
             // `OpKind::IndirectCall { funcptr, args, graphs, .. }`
@@ -2738,12 +2738,12 @@ impl<'a> Transformer<'a> {
                 //
                 // `rewrite_op_same_as` returns `None` implicitly.  In
                 // `optimize_block` that means "remove the op and rename
-                // the result to args[0]" (`jtransform.py:106-111`).
+                // the result to args[0]" (`jtransform.py`).
                 //
                 // `cast_bool_to_int` / `cast_bool_to_uint` /
                 // `cast_int_to_uint` / `cast_uint_to_int` follow the
                 // same drop-and-alias shape — RPython
-                // `jtransform.py:330,331,336,337`:
+                // `jtransform.py`:
                 //
                 //     def rewrite_op_cast_bool_to_int(self, op): pass
                 //     def rewrite_op_cast_bool_to_uint(self, op): pass
@@ -3020,7 +3020,7 @@ impl<'a> Transformer<'a> {
             // jtransform.py `_rewrite_cmp_ptrs`: non-GC ptr
             // equality becomes int_eq/int_ne.  Mixed i+r operands from
             // Pyre's unified BinOp need cast_ptr_to_int on the Ref side
-            // (blackhole.py:603-606 `cast_ptr_to_int/r>i` is wired).
+            // (blackhole.py bhimpl_cast_ptr_to_int `cast_ptr_to_int/r>i` is wired).
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
@@ -3332,7 +3332,7 @@ impl<'a> Transformer<'a> {
             //   (a) the bare-op `rewrite_op_int_floordiv =
             //       _do_builtin_call` / `rewrite_op_int_mod =
             //       _do_builtin_call` rewrite at
-            //       `jtransform.py:576-577`, which replaces the
+            //       `jtransform.py`, which replaces the
             //       SpaceOperation with `direct_call(_ll_2_int_floordiv,
             //       ...)` / `direct_call(_ll_2_int_mod, ...)` BEFORE
             //       jitcode emission.  `_do_builtin_call` resolves the
@@ -3347,7 +3347,7 @@ impl<'a> Transformer<'a> {
             //       the BinOp callsite.
             //
             //   (b) the OS_INT_PY_MOD / OS_INT_PY_DIV oopspec at
-            //       `jtransform.py:2043`, reached when the rtyper
+            //       `jtransform.py`, reached when the rtyper
             //       directly emits `int_py_mod` / `int_py_div` ops
             //       (typically via `objspace/std/intobject.py` Python-
             //       semantic `%` / `//`).  This route stamps
@@ -3380,7 +3380,7 @@ impl<'a> Transformer<'a> {
             // effect family is inherited from the function's actual
             // RPython annotation, not synthesised by `_do_builtin_call`.
             // `support.py _ll_2_int_floordiv` / `_ll_2_int_mod`
-            // carry no such decorator (compare `rint.py:496
+            // carry no such decorator (compare `rint.py
             // @jit.oopspec("int.py_mod")` which DOES decorate the
             // Python-floor sibling).  Pyre therefore stamps
             // `CannotRaise`, not `ElidableCannotRaise`: the C-trunc
@@ -3436,7 +3436,7 @@ impl<'a> Transformer<'a> {
                 // `_rtype_call_helper(hop, 'py_mod'/'py_div', [...])`
                 // which invokes the *Python-floor* helpers
                 // `ll_int_py_mod` / `ll_int_py_div`
-                // (`rint.py:399-500`).  Pyre is NOT porting that
+                // (`rint.py`).  Pyre is NOT porting that
                 // path — it is mapping Rust's C-trunc primitives to
                 // the RPython C-trunc primitives.
                 //
@@ -3485,7 +3485,7 @@ impl<'a> Transformer<'a> {
                 RewriteResult::Replace(ops)
             }
             // RPython `Transformer.rewrite_op_float_is_true(self, op)`
-            // (`jtransform.py:1627-1631`):
+            // (`jtransform.py`):
             //
             //     def rewrite_op_float_is_true(self, op):
             //         op1 = SpaceOperation('float_ne',
@@ -3506,7 +3506,7 @@ impl<'a> Transformer<'a> {
             // Both shapes must be rewritten here.  If neither is
             // caught the assembler emits a literal `float_is_true`
             // opname, but downstream backends only register
-            // `float_ne` — RPython jtransform.py:1627 collapses both
+            // `float_ne` — RPython jtransform.py collapses both
             // surfaces to the same canonical shape.  Pyre's rewriter
             // does not chain back into `rewrite_operation` the way
             // upstream does (the per-op loop in `optimize_block`
@@ -3598,7 +3598,7 @@ impl<'a> Transformer<'a> {
             //   rewrite_op_cast_uint_to_float  = _do_builtin_call
             // `_do_builtin_call` (`jtransform.py`) re-routes
             // through support helpers
-            // (`rpython/jit/codewriter/support.py:274 _ll_1_cast_*`)
+            // (`rpython/jit/codewriter/support.py _ll_1_cast_uint_to_float _ll_1_cast_*`)
             // so blackhole never sees a bare `cast_*_to_uint*` opname
             // — instead a `direct_call(<helper-funcptr>)` residual
             // call carries unsigned-domain semantics (e.g.
@@ -3625,12 +3625,12 @@ impl<'a> Transformer<'a> {
             //     `majit_metainterp::blackhole::cast_*_to_*`).
             //   - `OpKind::CallResidual` mirrors
             //     `residual_call_irf_<f|i>` (`handle_residual_call` at
-            //     `jtransform.py:439-470` for the integer / float
+            //     `jtransform.py` for the integer / float
             //     register classes).
             //   - `ElidableCannotRaise` + `OopSpecIndex::None` keeps
             //     the call out of the `may_call_jitcodes` /
             //     `calldescr_canraise` set, so no `-live-` is
-            //     appended (`test_flatten.py:1007-1023`).
+            //     appended (`test_flatten.py`).
             // Const-fold path lives in `opimpl.rs::op_cast_*`; the
             // runtime helpers reproduce the same IEEE-754 mantissa
             // decomposition so runtime and const-fold agree.
@@ -3657,7 +3657,7 @@ impl<'a> Transformer<'a> {
                 // `ElidableCannotRaise` with `OopSpecIndex::None` so the
                 // flatten is `residual_call_irf_f ... -> %f0` /
                 // `float_return %f0` with no intervening `-live-`
-                // (`test_flatten.py:1021-1023`).
+                // (`test_flatten.py f`).
                 let target = CallTarget::function_path(["cast_uint_to_float"]);
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 self.stamp_value_kind(
@@ -3699,7 +3699,7 @@ impl<'a> Transformer<'a> {
                 // mirrors `opimpl.rs::op_cast_float_to_uint` (mod 2^64
                 // wrap via mantissa/exponent decomposition).
                 // `ElidableCannotRaise`+`OopSpecIndex::None` → no
-                // `-live-` (`test_flatten.py:1007-1009`).
+                // `-live-` (`test_flatten.py f`).
                 let target = CallTarget::function_path(["cast_float_to_uint"]);
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 self.stamp_value_kind(
@@ -3781,7 +3781,7 @@ impl<'a> Transformer<'a> {
             // — those route the *Python-level* `%=` / `/=` through
             // `_rtype_call_helper(hop, 'py_mod'/'py_div', ...)` to the
             // Python-floor `ll_int_py_mod` / `ll_int_py_div` helpers
-            // (`rint.py:399-500`).  Pyre carries no Python-level
+            // (`rint.py`).  Pyre carries no Python-level
             // `%=` / `/=` at this layer.
             OpKind::BinOp {
                 op: binop_name,
@@ -3889,7 +3889,7 @@ impl<'a> Transformer<'a> {
     /// such call site.
     ///
     /// Reads the Variable's `.concretetype` cell directly per RPython
-    /// `rtyper.py:258 v.concretetype = ...` parity, falling back to
+    /// `rtyper.py v.concretetype = ...` parity, falling back to
     /// `'r'` when the cell is `Unknown`.
     fn get_value_kind_var(&self, var: &crate::flowspace::model::Variable) -> char {
         match FunctionGraph::concretetype_of(var) {
@@ -3979,7 +3979,7 @@ impl<'a> Transformer<'a> {
     /// `may_call_jitcodes or calldescr_canraise`; this residual is
     /// neither (the helper is an `extern "C"` C-truncating arithmetic
     /// primitive flagged `LLOp(canfold=True)` upstream —
-    /// `lloperation.py:203-204`), so no `OpKind::Live` follows.
+    /// `lloperation.py`), so no `OpKind::Live` follows.
     fn emit_int_mod_or_floordiv_residual(
         &mut self,
         graph: &mut FunctionGraph,
@@ -4419,7 +4419,7 @@ impl<'a> Transformer<'a> {
                 // hint takes the `else` branch
                 // (`del hints['promote_string']`) and falls through
                 // to the plain `promote` arm, emitting
-                // `<kind>_guard_value` per `jit.py:608-614` +
+                // `<kind>_guard_value` per `jit.py` +
                 // `getkind(Ptr) == "ref"` (`rpython/jit/metainterp/
                 // history.py:64`).
                 self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
@@ -4463,7 +4463,7 @@ impl<'a> Transformer<'a> {
         }
         // jtransform.py:609 `assert op.args[0].concretetype !=
         // lltype.Ptr(rstr.STR)` — pyre has no `Ptr(rstr.STR)` GC
-        // layout (`rpython/rtyper/lltypesystem/rstr.py:1226-1237`), so the
+        // layout (`rpython/rtyper/lltypesystem/rstr.py`), so the
         // upstream assertion is structurally satisfied by absence: no
         // pyre value can carry that concretetype, hence no `Ptr(STR)`
         // operand can reach this arm.  Re-introduce the assertion
@@ -4498,9 +4498,9 @@ impl<'a> Transformer<'a> {
     /// drives the emit shape:
     ///
     /// * `IR_IMMUTABLE`           → rewrite the read to
-    ///   `getfield_*_pure` (`jtransform.py:875-877`).
+    ///   `getfield_*_pure` (`jtransform.py`).
     /// * `IR_QUASIIMMUTABLE[_ARRAY]` → emit `[-live-, record_quasiimmut_field,
-    ///   getfield_*_pure]` — `jtransform.py:895-903`.
+    ///   getfield_*_pure]` — `jtransform.py`.
     /// * mutable                  → keep as-is.
     ///
     /// Three upstream branches of `rewrite_op_getfield` are absent because
@@ -4701,7 +4701,7 @@ impl<'a> Transformer<'a> {
             if rank.is_quasi_immutable() {
                 // TODO: RPython
                 // `quasiimmut.get_mutate_field_name(fieldname)` —
-                // `rpython/jit/metainterp/quasiimmut.py:11-15` — strips the
+                // `rpython/jit/metainterp/quasiimmut.py` — strips the
                 // lltype `inst_` prefix before prepending `mutate_`.  Rust
                 // structs carry no such prefix, so we prepend `mutate_`
                 // directly.
@@ -5110,7 +5110,7 @@ impl<'a> Transformer<'a> {
 
     /// RPython: `Transformer.rewrite_op_direct_call(op)`.
     ///
-    /// RPython jtransform.py:406-410:
+    /// RPython jtransform.py:
     /// ```python
     /// def rewrite_op_direct_call(self, op):
     ///     kind = self.callcontrol.guess_call_kind(op)
@@ -5125,7 +5125,7 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
-        // RPython `jtransform.py:406-408`:
+        // RPython `jtransform.py rewrite_op_direct_call`:
         //   def rewrite_op_direct_call(op): ... handle_%s_call
         //
         // The indirect path (`jtransform.py rewrite_op_indirect_call`)
@@ -5923,7 +5923,7 @@ impl<'a> Transformer<'a> {
             }]);
         }
         // `rewrite_op_cast_pointer` → `rewrite_op_same_as`
-        // (jtransform.py:254-257): the JIT does not distinguish a
+        // (jtransform.py): the JIT does not distinguish a
         // down-cast pointer from its source, so the
         // `__cast_pointer/<Root>` marker (front::mir's carrier for the
         // upstream `cast_pointer` op, see `cast_pointer_marker_op`)
@@ -6003,7 +6003,7 @@ impl<'a> Transformer<'a> {
         // `core::ptr::eq(a, b)` — raw-pointer identity comparison.  Like
         // `is_null` above, `front::mir` leaves it as a `FunctionPath` residual
         // because the charon front-end skips the rtyper lowering that turns a
-        // pointer `eq` into `ptr_eq` (`jtransform.py:1243-1255` routes `eq`
+        // pointer `eq` into `ptr_eq` (`jtransform.py rewrite_op_ptr_eq` routes `eq`
         // over two Ref operands to `ptr_eq`).  Finish that lowering here: emit
         // a `BinOp("eq")` over the two pointer operands — the assembler maps
         // the `rr` operand shape to `ptr_eq` — instead of residualising the
@@ -6064,14 +6064,14 @@ impl<'a> Transformer<'a> {
                     )
                 }
                 crate::call::CallKind::Residual => {
-                    // RPython jtransform.py:456-471:
+                    // RPython jtransform.py handle_residual_call:
                     //   calldescr = self.callcontrol.getcalldescr(op, ...)
                     //   op1 = self.rewrite_call(op, 'residual_call', ...)
                     //
                     // RPython ALWAYS produces residual_call_* for residual
                     // calls — the effect is only in the calldescr, NOT in
                     // the opcode name. No dispatch_by_effect.
-                    // RPython call.py:220-222: NON_VOID_ARGS + RESULT. Even
+                    // RPython call.py: NON_VOID_ARGS + RESULT. Even
                     // for a configured effect override, keep the signature from
                     // getcalldescr() instead of accepting an effect-only descr.
                     let call_args = self
@@ -6154,7 +6154,7 @@ impl<'a> Transformer<'a> {
     /// Builtin operations with oopspec semantics — dispatched to
     /// specific lowering based on the oopspec name.
     ///
-    /// RPython jtransform.py:484-520.
+    /// RPython jtransform.py.
     ///
     /// Currently: look up effect from describe_call / call_effects
     /// and produce the matching typed call op. Future: oopspec-specific
@@ -6168,7 +6168,7 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
-        // RPython `jtransform.py:484-485`:
+        // RPython `jtransform.py handle_builtin_call`:
         //   oopspec_name, args = support.decode_builtin_call(op)
         //
         // Run the strict-parity decode here so the per-prefix dispatch
@@ -6266,7 +6266,7 @@ impl<'a> Transformer<'a> {
             {
                 return prepend_const_prefix(&mut const_prefix_ops, result);
             }
-            // jtransform.py:489-490 — int.* oopspecs → _handle_int_special.
+            // jtransform.py — int.* oopspecs → _handle_int_special.
             // Unhandled spellings return `None` and fall through to the
             // residual-call path.
             if base.starts_with("int.")
@@ -6317,7 +6317,7 @@ impl<'a> Transformer<'a> {
             // The per-width raw accessors and `rffi.ptradd`: upstream the
             // rtyper lowers these to `raw_load` / `raw_store` / pointer
             // arithmetic before the codewriter runs
-            // (`jtransform.py:1156-1171`); a leaf on this spine declares
+            // (`jtransform.py rewrite_op_raw_store`); a leaf on this spine declares
             // the same lowering through its oopspec name.
             if let Some(result) = self._handle_raw_access_call(base, op, args, graph) {
                 return prepend_const_prefix(&mut const_prefix_ops, result);
@@ -6394,7 +6394,7 @@ impl<'a> Transformer<'a> {
         //   self.callcontrol.callinfocollection.add(oopspecindex, calldescr, func)
         //
         // RPython reuses the SAME calldescr returned by getcalldescr() —
-        // it carries the real NON_VOID_ARGS and RESULT types from call.py:334.
+        // it carries the real NON_VOID_ARGS and RESULT types from call.py.
         if oopspecindex != OopSpecIndex::None
             && let Some(cc) = self.callcontrol.as_mut()
         {
@@ -6418,7 +6418,7 @@ impl<'a> Transformer<'a> {
     /// pointer arithmetic (`int_add` — the shape `optimize_INT_ADD` follows
     /// into a raw-slice info), and `raw_read_<width>` / `raw_write_<width>`
     /// lower to `raw_load` / `raw_store` on the already-offset pointer with
-    /// a zero byte offset (`jtransform.py:1156-1171 rewrite_op_raw_store` /
+    /// a zero byte offset (`jtransform.py rewrite_op_raw_store` /
     /// `rewrite_op_raw_load`, descr `arraydescrof(rffi.CArray(T))`).  The
     /// single-float width stays a residual call — `jit_libffi.py types`
     /// special-cases the `'S'` kind the same way.
@@ -6631,20 +6631,20 @@ impl<'a> Transformer<'a> {
     /// `Ptr(UNICODE)` / `Ptr(BYTEARRAY)` (jtransform.py); pyre reads
     /// it from the flowspace `Variable::concretetype()` via
     /// [`stroruni_first_arg_kind`]. `Ptr(BYTEARRAY)` is `raise NotSupported`
-    /// (jtransform.py:2074) — pyre returns `None`, falling through to the
+    /// (jtransform.py) — pyre returns `None`, falling through to the
     /// residual-call path — and any other shape is `else: assert 0`
-    /// (jtransform.py:2077).
+    /// (jtransform.py).
     ///
     /// - `copy_contents` (jtransform.py) lowers to a
     ///   `copystrcontent` / `copyunicodecontent` [`OpKind::LoweredBlackholeOp`],
     ///   the same representation the Spine-B string transducer produces, so
     ///   flatten / assembly already lower it to the matching jitcode bytecode.
     /// - `concat` / `slice` / `cmp` / `copy_string_to_raw`
-    ///   (jtransform.py:2059-2072, 2124-2128) map to the `OS_STR_*` / `OS_UNI_*`
+    ///   (jtransform.py, 2124-2128) map to the `OS_STR_*` / `OS_UNI_*`
     ///   oopspecindex and lower to a residual call. `concat` / `slice` can
     ///   raise `MemoryError` (`EF_ELIDABLE_OR_MEMORYERROR`), `cmp` /
     ///   `copy_string_to_raw` cannot (`EF_ELIDABLE_CANNOT_RAISE`).
-    /// - `equal` (jtransform.py:2087-2122) additionally registers the
+    /// - `equal` (jtransform.py) additionally registers the
     ///   `OS_STREQ_*` / `OS_UNIEQ_*` slice-comparison helper variants via
     ///   `_register_extra_helper`, which pyre has not ported; that spelling
     ///   returns `None` and falls through to the residual-call path until the
@@ -6713,7 +6713,7 @@ impl<'a> Transformer<'a> {
 
         // jtransform.py:2059-2072 — the OS_STR_* / OS_UNI_* index selected by
         // the STR vs UNICODE operand. BYTEARRAY → NotSupported (None); any
-        // other shape → assert 0 (jtransform.py:2074-2077).
+        // other shape → assert 0 (jtransform.py).
         let oopspecindex = match (oopspec_name, kind) {
             ("stroruni.concat", StrOrUniKind::Str) => OopSpecIndex::StrConcat,
             ("stroruni.concat", StrOrUniKind::Unicode) => OopSpecIndex::UniConcat,
@@ -6770,7 +6770,7 @@ impl<'a> Transformer<'a> {
     /// oopspecindex and the `CanRaise` effect, so `handle_residual_call`
     /// appends the trailing `-live-`.
     ///
-    /// jtransform.py:2197 `raise NotImplementedError(oopspec_name)` for any
+    /// jtransform.py `raise NotImplementedError(oopspec_name)` for any
     /// other `rgc.*` spelling. Pyre instead returns `None` so the call falls
     /// through to the residual-call path — the same "unported oopspec →
     /// residual" convention the `list.*` / `stroruni.*` sibling handlers use,
@@ -7154,7 +7154,7 @@ impl<'a> Transformer<'a> {
             }
             "list.int_capacity" => {
                 // Capacity is `len(l.items)` — `_ll_list_resize_hint`
-                // (rpython/rtyper/lltypesystem/rlist.py:251 `allocated =
+                // (rpython/rtyper/lltypesystem/rlist.py `allocated =
                 // len(l.items)`) and `_ll_list_resize_ge`
                 // (rlist.py `cond = len(l.items) < newsize`) both read the
                 // length of `l.items: Ptr(GcArray(ITEM))`.  The rtyper lowers
@@ -7475,7 +7475,7 @@ impl<'a> Transformer<'a> {
             // callsite always supplies `args[0]`.  The cleared list holds GC
             // pointers, so the arraydescr's item type is `Ref` — the exact
             // shape that makes `do_fixed_newlist` select `new_array_clear`
-            // over `new_array` (jtransform.py:1851-1855).
+            // over `new_array` (jtransform.py).
             "newlist_clear" => {
                 let length = args.first()?.clone();
                 // Fork on the result's list layout, mirroring upstream's
@@ -7616,7 +7616,7 @@ impl<'a> Transformer<'a> {
     /// the callee's JitCode. The meta-interpreter will descend into
     /// the callee JitCode at runtime.
     ///
-    /// RPython jtransform.py:473-482.
+    /// RPython jtransform.py.
     #[expect(
         clippy::arc_with_non_send_sync,
         reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
@@ -7683,7 +7683,7 @@ impl<'a> Transformer<'a> {
     /// RPython: `Transformer.handle_recursive_call(op)`.
     /// Recursive call back to the portal — emit `recursive_call_*`.
     ///
-    /// RPython jtransform.py:522-534.
+    /// RPython jtransform.py.
     fn handle_recursive_call(
         &mut self,
         op: &SpaceOperation,
@@ -7693,7 +7693,7 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
-        // RPython jtransform.py:522-534:
+        // RPython jtransform.py handle_recursive_call:
         //   jitdriver_sd = callcontrol.jitdriver_sd_from_portal_runner_ptr(funcptr)
         //   num_green_args = len(jitdriver_sd.jitdriver.greens)
         //   greens = args[1:1+num_green_args]
@@ -7943,7 +7943,7 @@ impl<'a> Transformer<'a> {
     }
 
     /// RPython: `Transformer.__handle_oopspec_call(op, args, oopspecindex, extraeffect)`
-    /// (jtransform.py:1988-2008).
+    /// (jtransform.py).
     /// Produces a residual_call with the given oopspecindex embedded in the calldescr,
     /// and registers the function in the callinfocollection.
     #[expect(
@@ -8004,7 +8004,7 @@ impl<'a> Transformer<'a> {
     // `jtransform.py rewrite_op_jit_conditional_call`.
 
     /// RPython: `Transformer._rewrite_op_cond_call(op, rewritten_opname)`
-    /// (jtransform.py:1665-1683).
+    /// (jtransform.py).
     ///
     /// `rewrite_call(op, name, op.args[:2], args=op.args[2:])`: args[0] is
     /// the condition (or elidable value), args[1] is the callee, args[2:]
@@ -8472,7 +8472,7 @@ impl<'a> Transformer<'a> {
 
     /// RPython: `Transformer.handle_jit_marker__loop_header(op, jitdriver)`
     /// (jtransform.py). `handle_jit_marker__can_enter_jit` aliases
-    /// to the same function (jtransform.py:1723); pyre keeps the alias at the
+    /// to the same function (jtransform.py); pyre keeps the alias at the
     /// `try_handle_jit_marker` dispatch layer rather than inside this method.
     fn handle_jit_marker__loop_header(&mut self, jitdriver_index: usize) -> Vec<SpaceOperation> {
         vec![SpaceOperation {
@@ -8482,7 +8482,7 @@ impl<'a> Transformer<'a> {
     }
 
     /// RPython: `Transformer.rewrite_op_jit_record_known_result(op)`
-    /// (jtransform.py:292-313).
+    /// (jtransform.py).
     #[allow(dead_code)]
     fn rewrite_op_jit_record_known_result(
         &mut self,
@@ -8573,7 +8573,7 @@ impl<'a> Transformer<'a> {
     /// Call that the JIT should NOT look inside — emit residual_call_*.
     /// Args are split by kind via `rewrite_call()` → `make_three_lists()`.
     /// `target` is the funcptr identity (mirrors `op.args[0]` upstream),
-    /// kept separate from `descriptor` per jtransform.py:457.
+    /// kept separate from `descriptor` per jtransform.py.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -8593,7 +8593,7 @@ impl<'a> Transformer<'a> {
         )
     }
 
-    /// RPython `jtransform.py:456-471` + `jtransform.py:547` sidecar:
+    /// RPython `jtransform.py handle_residual_call` + `jtransform.py` sidecar:
     /// the `IndirectCallTargets(lst)` passed via `extraargs` rides along
     /// with the residual_call opcode.  This variant exposes the
     /// `indirect_targets` parameter so `handle_regular_indirect_call`
@@ -10423,7 +10423,7 @@ fn rewrite_as_unary_llop(
 /// constant (`OpKind::ConstSymbolic`) on the model graph — the
 /// JIT-codewriter counterpart of RPython's rtyper `specialize_call`
 /// rewrite of the `direct_call` to `inputconst(Signed, _we_are_jitted)`
-/// (`rpython/rlib/jit.py:403-406`).
+/// (`rpython/rlib/jit.py`).
 ///
 /// pyre's rtyper types an ephemeral oracle and never rewrites the
 /// surviving model graph, so the symbolic is injected here, by
@@ -10578,7 +10578,7 @@ enum StrOrUniKind {
 /// Classify a `stroruni.*` oopspec call's first argument by its pointee
 /// struct, mirroring `_handle_stroruni_call`'s
 /// `SoU.TO == rstr.STR / rstr.UNICODE / rbytearray.BYTEARRAY` chain
-/// (`jtransform.py:2058-2076`). `STR` and `BYTEARRAY` both carry a `chars`
+/// (`jtransform.py`). `STR` and `BYTEARRAY` both carry a `chars`
 /// array of `Char`, so the struct name (`rpy_string` / `rpy_unicode` /
 /// `rpy_bytearray`) is the discriminant, matching upstream's `SoU.TO`
 /// identity comparison against the module-global structs.
@@ -10614,7 +10614,7 @@ fn stroruni_first_arg_kind(var: &crate::flowspace::model::Variable) -> StrOrUniK
 /// The result-layout fork `_handle_list_call`'s `"newlist_clear"` arm
 /// selects between, mirroring upstream's `LIST = op.result.concretetype.TO;
 /// resizable = isinstance(LIST, lltype.GcStruct)` split
-/// (`jtransform.py:1762-1785`).  `item_ty` / `array_type_id` are recovered
+/// (`jtransform.py`).  `item_ty` / `array_type_id` are recovered
 /// from the result element lltype in the `Resized` / `Fixed` cases (C1: the
 /// pre-fork arm hardcoded `Ref(None)` / `None`, so a non-pointer element
 /// list was GC-traced as a pointer array and a resized result emitted a
@@ -10723,7 +10723,7 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
         // `_handle_virtual_ref_call` arm beside it — upstream gives those two
         // no `oopspecindex`, because it turns them into operations rather than
         // calls. Remaining oopspecs map to OS_* indices.
-        // jtransform.py:677-681 `_rewrite_raw_malloc`: a char varsize raw
+        // jtransform.py `_rewrite_raw_malloc`: a char varsize raw
         // malloc is the one raw allocation the optimizer can virtualise
         // (`virtualize.py do_RAW_MALLOC_VARSIZE_CHAR`).
         "raw_malloc_varsize_char" => OopSpecIndex::RawMallocVarsizeChar,
@@ -11956,7 +11956,7 @@ mod tests {
     /// the GotoIfNotOp lowering Stage 1: `int_lt(a, b); exitswitch = t` fuses into a
     /// `Fused { opname: "int_lt", args: [a, b] }` switch, the `int_lt`
     /// op is removed, and the `t` riding a link's args is replaced by
-    /// that link's bool constant (`jtransform.py:196-234`).
+    /// that link's bool constant (`jtransform.py optimize_goto_if_not`).
     #[test]
     fn optimize_goto_if_not_fuses_int_lt_compare() {
         use crate::flowspace::model::ConstValue;
@@ -12181,7 +12181,7 @@ mod tests {
 
     /// the GotoIfNotOp lowering Stage 1: a non-supported result op (`int_add`) is NOT
     /// fusable — `optimize_goto_if_not` returns false and leaves the
-    /// block untouched (`jtransform.py:206-209` opname gate).
+    /// block untouched (`jtransform.py` opname gate).
     #[test]
     fn optimize_goto_if_not_rejects_unsupported_result_op() {
         use crate::model::{ExitCase, ExitSwitch, Link};
@@ -16657,7 +16657,7 @@ mod tests {
 
     #[test]
     fn promote_greens_emits_live_guard_value_pair_per_green() {
-        // jtransform.py:1646-1656. One `-live-` + `{kind}_guard_value` pair
+        // jtransform.py promote_greens. One `-live-` + `{kind}_guard_value` pair
         // per green, in input order. Without a type_state every green falls
         // back to kind 'r'.
         let config = GraphTransformConfig::default();
@@ -17166,7 +17166,7 @@ mod tests {
 
     /// `__cast_pointer/<Root>` marker folds to the operand alias —
     /// `rewrite_op_cast_pointer` → `rewrite_op_same_as`
-    /// (jtransform.py:254-257) emits no jitcode op.
+    /// (jtransform.py) emits no jitcode op.
     #[test]
     fn cast_pointer_marker_elides_to_operand_alias() {
         let config = GraphTransformConfig::default();
@@ -18140,7 +18140,7 @@ mod tests {
     /// `fold_we_are_jitted_calls` rewrites the `we_are_jitted()`
     /// `direct_call` to the `_we_are_jitted` symbolic constant — the
     /// model-graph counterpart of RPython's rtyper `specialize_call`
-    /// (`rpython/rlib/jit.py:403-406`).
+    /// (`rpython/rlib/jit.py`).
     #[test]
     fn we_are_jitted_specializes_to_symbolic() {
         let mut graph = FunctionGraph::new("we_are_jitted_specialize");
@@ -18211,8 +18211,8 @@ mod tests {
     /// jitcode (`fold_we_are_jitted_calls` → symbolic →
     /// `rewrite_operation` `SpecTag`-identity fold, mirroring
     /// `rewrite_op_int_is_true` of `_we_are_jitted`,
-    /// jtransform.py:1636-1639) — the jitcode runs during tracing and
-    /// blackholing where the JIT-mode flag is true (rlib/jit.py:355).
+    /// jtransform.py) — the jitcode runs during tracing and
+    /// blackholing where the JIT-mode flag is true (rlib/jit.py).
     #[test]
     fn we_are_jitted_folds_to_const_true() {
         let config = GraphTransformConfig::default();
@@ -19872,7 +19872,7 @@ mod tests {
     }
 
     //
-    // RPython upstream: `jtransform.py:538-553 handle_regular_indirect_
+    // RPython upstream: `jtransform.py handle_regular_indirect_call handle_regular_indirect_
     // call` emits `[-live-, int_guard_value, residual_call +
     // IndirectCallTargets, -live-]`; `assembler.py:208-209` collects
     // the candidate jitcodes into `indirectcalltargets`.  These two
@@ -19884,7 +19884,7 @@ mod tests {
     /// Build an impl-method graph with a single `Input { ty: Ref }`
     /// representing the receiver `self` — mirrors the one-arg signature
     /// `fn run(&self)` that `FunctionReprBase.call` feeds into
-    /// `indirect_call(funcptr, self, c_graphs)` (`rpbc.py:207-217`).
+    /// `indirect_call(funcptr, self, c_graphs)` (`rpbc.py`).
     fn build_handler_run_impl_graph(name: &str) -> FunctionGraph {
         let mut graph = FunctionGraph::new(name);
         graph
@@ -20018,7 +20018,7 @@ mod tests {
     /// and assert the post-jtransform sequence is exactly
     /// `[VtableMethodPtr, Live, GuardValue{kind='i'},
     ///   CallResidual{funcptr=Value(_), indirect_targets=Some}, Live]`.
-    /// RPython `jtransform.py:410-412 + 538-553` orthodox port parity.
+    /// RPython `jtransform.py + 538-553` orthodox port parity.
     #[test]
     fn lower_indirect_call_op_emit_order() {
         use crate::call::CallControl;
@@ -20192,7 +20192,7 @@ mod tests {
 
     // ── Kind matrix: `indirect_regular_call_{r,ir,irf}_{i,r,f,v}` ────
     //
-    // RPython upstream: `test_jtransform.py:340-367` parameterization +
+    // RPython upstream: `test_jtransform.py` parameterization +
     // `test_jtransform.py indirect_regular_call_test`.  Each
     // test builds a `receiver.m(extras...)` site where `extras` covers
     // the arg kind signature (`r`, `ir`, `irf`) and `result_ty` covers
@@ -20506,7 +20506,7 @@ mod tests {
         cc.register_trait_method("m", Some("T"), "B", build_witness("B::m"));
         // NOTE: intentionally *no* `find_all_graphs_for_tests` — that keeps
         // `candidate_graphs` empty so `guess_call_kind(op)` classifies
-        // this call as `CallKind::Residual` via the call.py:137-139
+        // this call as `CallKind::Residual` via the call.py
         // `graphs_from(op) is None` fall-through.
 
         let mut graph = FunctionGraph::new("outer");
@@ -20876,7 +20876,7 @@ mod tests {
     /// C1 fork, resized layout: a result typed
     /// `Ptr(GcStruct("list", {length, items: Ptr(GcArray(Signed))}))` — the
     /// resized `ListRepr` shape (`do_resizable_newlist_clear`,
-    /// jtransform.py:1938) — lowers to `NewListClear` (the struct-header
+    /// jtransform.py) — lowers to `NewListClear` (the struct-header
     /// compound op) with `item_ty` recovered from the items array element
     /// (`Signed` → `Int`), NOT the pre-fork bare `new_array_clear`.
     #[test]
@@ -20944,7 +20944,7 @@ mod tests {
 
     /// C1 fork, fixed layout: a result typed `Ptr(GcArray(Signed))` — the
     /// fixed `FixedSizeListRepr` shape (`do_fixed_newlist_clear`,
-    /// jtransform.py:1858) — lowers to `NewArrayClear` with `item_ty`
+    /// jtransform.py) — lowers to `NewArrayClear` with `item_ty`
     /// recovered from the array element (`Signed` → `Int`), proving the C1
     /// element-type recovery: the pre-fork arm hardcoded `Ref(None)`, which
     /// would GC-trace int slots as pointers.

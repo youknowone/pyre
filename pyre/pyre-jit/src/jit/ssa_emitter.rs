@@ -10,7 +10,7 @@
 //! values are gone — the dual emitter was collapsed into the
 //! single walker-local `SSARepr`.
 //!
-//! Reference: `rpython/jit/codewriter/codewriter.py:33-73`.
+//! Reference: `rpython/jit/codewriter/codewriter.py`.
 //!
 //! Portal `jit_merge_point` emission now runs through the graph layer:
 //! `codewriter.rs::portal_jit_merge_point_graph_args` builds the
@@ -50,7 +50,7 @@ impl SSAReprEmitter {
         }
     }
 
-    // ---- setup passthrough (mirrors JitCodeBuilder setup API) ----
+    // setup passthrough (mirrors JitCodeBuilder setup API)
 
     pub fn set_name(&mut self, name: impl Into<String>) {
         self.builder.set_name(name);
@@ -65,9 +65,9 @@ impl SSAReprEmitter {
     }
 
     /// Stage `(fnaddr, calldescr)` from `CallControl::get_jitcode_calldescr`
-    /// (`call.py:167`) so the values land on the constructed `JitCode`
+    /// (`call.py`) so the values land on the constructed `JitCode`
     /// **before** `Assembler::assemble` runs `set_body`.  RPython
-    /// `call.py:167-169` builds `JitCode(name, fnaddr, calldescr)` ahead of
+    /// `call.py` builds `JitCode(name, fnaddr, calldescr)` ahead of
     /// `assembler.assemble(...)`; pyre stages on the builder so
     /// `JitCodeBuilder::finish()` can stamp the body atomically.
     pub fn set_fnaddr_and_calldescr(
@@ -119,7 +119,7 @@ impl SSAReprEmitter {
         self.builder.has_abort_flag()
     }
 
-    // ---- label id allocation ----
+    // label id allocation
 
     /// Allocate the next u16 label id. The walker formats the id into
     /// a TLabel name (`catch_landing_{id}`) that `Assembler::assemble`
@@ -134,9 +134,9 @@ impl SSAReprEmitter {
         id
     }
 
-    // ---- portal jit_merge_point ----
+    // portal jit_merge_point
 
-    // ---- finalization ----
+    // finalization
 
     /// Translate an insn-index position into the corresponding JitCode
     /// byte offset using the `ssarepr.insns_pos` table that

@@ -24,7 +24,7 @@ pub(super) struct AddressHasher(u64);
 impl AddressHasher {
     /// A block address is aligned, so its trailing bits are zero and a table
     /// indexing on those alone would pile every key into one bucket;
-    /// `rpython/memory/support.py:10-14 mangle_hash` folds the high bits down
+    /// `rpython/memory/support.py mangle_hash` folds the high bits down
     /// over them.  `HashMap` reads the hash a second way -- the top 7 bits
     /// become the entry's control byte -- and a heap address leaves those
     /// zero, so the multiply carries the mangled value back over the whole

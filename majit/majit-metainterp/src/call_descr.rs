@@ -179,10 +179,10 @@ impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
 ///   → `top_result()`;
 /// * `:117-122 indirect_call` with `graphs is None` → `top_result()`.
 ///
-/// `effectinfo.py:285-292` then turns a `top_set` result into
+/// `effectinfo.py` then turns a `top_set` result into
 /// `EF_RANDOM_EFFECTS` with all six raw sets and all six bitstrings set
 /// to `None`, which is exactly `EffectInfo.MOST_GENERAL`
-/// (`effectinfo.py:271-273`). `call.py get_jitcode_calldescr`
+/// (`effectinfo.py`). `call.py get_jitcode_calldescr`
 /// uses the same constant for the calldescr it attaches to a JitCode.
 ///
 /// A pyre residual callee reaching this function is the second case,
@@ -205,15 +205,15 @@ pub fn default_effect_info() -> EffectInfo {
 ///
 /// Shape: `extraeffect=CanRaise`, every `_*_descrs_*` raw set =
 /// `Some(Vec::new())`, every `*_descrs_*` bitstring = `Some(Vec::new())`,
-/// `can_collect=true` (`effectinfo.py:283` default).
-/// `effectinfo.py:293-299`'s else-branch starts the raw sets at `[]` and
+/// `can_collect=true` (`effectinfo.py` default).
+/// `effectinfo.py`'s else-branch starts the raw sets at `[]` and
 /// grows them with the analyzer's actual effects, so an analyzer that
 /// reported nothing leaves them `[]` — distinct from `MOST_GENERAL`,
-/// which the `effectinfo.py:149-162` invariant ties to raw = `None`.
+/// which the `effectinfo.py` invariant ties to raw = `None`.
 ///
 /// This is the row for a callee the producer classified by hand: an
 /// opaque leaf helper the author marked `#[dont_look_inside]`
-/// (`rlib/jit.py:132`), whose upstream counterpart still has a graph for
+/// (`rlib/jit.py`), whose upstream counterpart still has a graph for
 /// the write analyzer to walk. It asserts "writes no field of any object
 /// the trace already cached", which
 /// [`default_effect_info`] deliberately does not.
@@ -223,7 +223,7 @@ pub fn can_raise_effect_info() -> EffectInfo {
 
 /// Nursery-alloc residual: `EF_CAN_RAISE` with empty write sets —
 /// an allocation publishes a fresh object and writes no field of any
-/// object the trace already cached, so `graphanalyze.py:60
+/// object the trace already cached, so `graphanalyze.py analyze_external_call
 /// analyze_external_call`'s `bottom_result()` is the honest answer.
 /// Stamped with [`RuntimeHelperKind::NurseryAlloc`] so the dynasm CallR
 /// genop emits an inline nursery bump; the tag does not change effect
@@ -244,8 +244,8 @@ pub fn nursery_alloc_effect_info() -> EffectInfo {
 /// Shape: `extraeffect=CannotRaise`, every `_*_descrs_*` raw set =
 /// `Some(Vec::new())`, every `*_descrs_*` bitstring = `Some(Vec::new())`,
 /// `can_collect=true` (the writeanalyzer's
-/// `effectinfo.py:283 can_collect=True` default).
-/// `effectinfo.py:293-299` else-branch builds empty raw sets when
+/// `effectinfo.py can_collect=True` default).
+/// `effectinfo.py` else-branch builds empty raw sets when
 /// the analyzer returns non-`top_set` effects.
 ///
 /// Distinct from [`CANNOT_RAISE_NO_HEAP_EFFECT_INFO`] only by
@@ -270,7 +270,7 @@ pub fn cannot_raise_effect_info() -> EffectInfo {
 /// Shape: `extraeffect=ForcesVirtualOrVirtualizable`, every
 /// `_*_descrs_*` raw set = `Some(Vec::new())`, every `*_descrs_*`
 /// bitstring = `Some(Vec::new())`, `can_collect=true` (PyPy
-/// `effectinfo.py:364-365` `if extraeffect >= EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE:
+/// `effectinfo.py` `if extraeffect >= EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE:
 /// can_collect = True`).
 ///
 /// **Distinct from `MOST_GENERAL`**: `EF_RANDOM_EFFECTS` is reserved
@@ -278,7 +278,7 @@ pub fn cannot_raise_effect_info() -> EffectInfo {
 /// random_effects_on_gcobjs`) branch. `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
 /// is the dedicated virtualizable-forcing slot — both pass
 /// `check_forces_virtual_or_virtualizable()` via the `>=` test at
-/// `effectinfo.py:249-250`, but only `RandomEffects` trips
+/// `effectinfo.py`, but only `RandomEffects` trips
 /// `has_random_effects()` (`effectinfo.py`) and routes
 /// `OptHeap` through `clean_caches`. Collapsing MayForce to
 /// `MOST_GENERAL` over-invalidates the heap cache PyPy keeps live
@@ -562,16 +562,16 @@ pub enum EffectInfoSlot {
     CanRaise,
     /// `EF_RANDOM_EFFECTS` / [`EffectInfo::MOST_GENERAL`] — the
     /// `graphanalyze.py:109-112` "callee has no analyzable graph" →
-    /// `top_result()` outcome, promoted by `effectinfo.py:285-292`.
+    /// `top_result()` outcome, promoted by `effectinfo.py`.
     /// Resolved through [`default_effect_info()`].
     ///
     /// Picked by producers that classified nothing: a helper binding
     /// arbitrary interpreter execution, with no graph for a write
     /// analyzer to walk. `check_forces_virtual_or_virtualizable()` holds
-    /// for this row (`effectinfo.py:249-250`, `7 >= 6`), so a callee
+    /// for this row (`effectinfo.py`, `7 >= 6`), so a callee
     /// registered with it must not be dispatched through `cond_call` /
     /// `record_known_result` (`jtransform.py:1677`,
-    /// `pyjitpl.py:2128-2132` assert the opposite).
+    /// `pyjitpl.py do_conditional_call` assert the opposite).
     Unanalyzed,
     /// `EF_CANNOT_RAISE` — `call.py` `else` branch.
     CannotRaise,
@@ -618,8 +618,8 @@ pub fn effect_info_for_slot(slot: EffectInfoSlot) -> EffectInfo {
 ///
 /// `CALL_MAY_FORCE` maps to [`default_effect_info()`]: the opcode alone
 /// only proves `check_forces_virtual_or_virtualizable()` held
-/// (`pyjitpl.py:2007-2008`), which `EF_RANDOM_EFFECTS` satisfies via the
-/// `>=` at `effectinfo.py:249-250`. It does NOT prove the write analyzer
+/// (`pyjitpl.py`), which `EF_RANDOM_EFFECTS` satisfies via the
+/// `>=` at `effectinfo.py`. It does NOT prove the write analyzer
 /// ran, so the reconstruction cannot invent an empty write set.
 /// `CALL_RELEASE_GIL` cannot be reconstructed from the opcode alone —
 /// upstream `effectinfo.py MOST_GENERAL` pairs `EF_RANDOM_EFFECTS`
@@ -1134,7 +1134,7 @@ mod set_effect_bitstrings_tests {
     /// constructed all_descrs vector, calling
     /// `Descr::set_effect_bitstrings` for each call descr publishes
     /// bitstrings keyed by `descr.get_ei_index()`. Mirrors
-    /// `effectinfo.py:528-538` write-back loop.
+    /// `effectinfo.py` write-back loop.
     #[test]
     fn compute_bitstrings_then_set_publishes_eiindex_keyed_bitstrings() {
         use majit_ir::descr::SimpleFieldDescr;
@@ -1313,7 +1313,7 @@ mod set_effect_bitstrings_tests {
     /// A slot resolving `CanRaise` to `MOST_GENERAL` would make every
     /// `cond_call` / `record_known_result` target force the
     /// virtualizable, which `jtransform.py:1677` and
-    /// `pyjitpl.py:2128-2132` assert can never happen.
+    /// `pyjitpl.py do_conditional_call` assert can never happen.
     #[test]
     fn can_raise_slot_is_the_analyzed_row_and_unanalyzed_is_most_general() {
         let can_raise = effect_info_for_slot(EffectInfoSlot::CanRaise);
@@ -1337,7 +1337,7 @@ mod translated_result_class_tests {
     use majit_ir::EffectInfo;
 
     /// `descr.py get_result_type()` returns the raw result char, and
-    /// `descr.py:665` keys the call-descr cache on it.  A descr rehydrated
+    /// `descr.py` keys the call-descr cache on it.  A descr rehydrated
     /// from the translated image goes through
     /// `make_call_descr_sized_with_translated_effect`, which normalises `'S'`
     /// to `Type::Int` for the IR; the raw char has to survive alongside it,

@@ -37,7 +37,7 @@ use super::*;
 ///
 /// A self-recursive callee is bounded instead by
 /// [`fbw_inline_recursion_count`] against `max_unroll_recursion`, mirroring
-/// `opimpl_recursive_call` (`pyjitpl.py:1390-1416`) folding the recursive call
+/// `opimpl_recursive_call` (`pyjitpl.py`) folding the recursive call
 /// straight to `CALL_ASSEMBLER` past the bound rather than continuing to unroll
 /// the call tree.
 /// (The depth-≥2 blackhole-resume crash that previously blocked this path was a
@@ -60,9 +60,9 @@ pub(crate) fn fbw_max_multiframe_depth() -> usize {
 /// already on `MetaInterp.framestack` before comparing against
 /// `max_unroll_recursion`.
 ///
-/// Upstream compares the whole greenkey element-wise (`pyjitpl.py:1396-1401`
+/// Upstream compares the whole greenkey element-wise (`pyjitpl.py`
 /// `gk[i].same_constant(greenboxes[i])`) over `(next_instr, is_being_profiled,
-/// bytecode)` (`interp_jit.py:34`); matching `w_code` alone is that comparison,
+/// bytecode)` (`interp_jit.py get_printable_location`); matching `w_code` alone is that comparison,
 /// because every entry this scan can see carries `next_instr == 0`:
 ///
 /// * `MIFrame.setup` (`pyjitpl.py`) assigns `greenkey` once and never
@@ -2439,7 +2439,7 @@ pub(crate) fn fbw_bump_executed_effect(site: &'static str) {
 /// Does not displace an already-latched `MidBody` carrier — it is stored inside
 /// it as [`MidBodyPayload::entry_fallback`] instead.  Rebuilding the callee at
 /// its own pc and resuming the caller past its call is what upstream does
-/// (`blackhole.py:1799-1821`, `:1653-1662`); rewinding the caller TO the call
+/// (`blackhole.py convert_and_run_from_pyjitpl`, `:1653-1662`); rewinding the caller TO the call
 /// has no upstream counterpart, so it stands in only for a callee the rebuild
 /// could not describe or could not flush.  Both sites are `is_top_inline` on an
 /// aborting sub-walk, which ends the walk, so at most one of each is latched
@@ -2533,8 +2533,8 @@ thread_local! {
     ///
     /// Keying on the `CodeObject` alone is the full key for this decision, not
     /// a truncation of one.  The flag is consumed by `can_inline_callable`
-    /// (`warmstate.py:669-677`), whose only caller is `_opimpl_recursive_call`
-    /// (`pyjitpl.py:1376-1382`) — it passes the CALLEE's green args, and a
+    /// (`warmstate.py`), whose only caller is `_opimpl_recursive_call`
+    /// (`pyjitpl.py`) — it passes the CALLEE's green args, and a
     /// callee reached through a CALL is always entered at its own entry, so the
     /// `next_instr` component is constant and `pycode` carries the whole
     /// decision.  The same holds here: the deny is recorded and queried for an
@@ -2547,7 +2547,7 @@ thread_local! {
     /// the tracing thread's framestack.  Sharing one memo while its siblings
     /// stay per-thread would be the inconsistency.
     ///
-    /// NOT yet ported: `warmstate.py:485-495` also treats the flag as "please
+    /// NOT yet ported: `warmstate.py` also treats the flag as "please
     /// trace from here as soon as possible" — a denied cell that never had a
     /// procedure token reaches `bound_reached` immediately, so the callee gets
     /// its own trace instead of staying a plain residual forever.  Since
@@ -3244,8 +3244,8 @@ pub(crate) enum CalleeReplaySafety {
     /// so `EffectInfo::check_can_raise` is not the predicate for this decision.
     ///
     /// There is no upstream counterpart to defer against: `look_inside_graph`
-    /// (`codewriter/policy.py:48`) and `can_inline_callable`
-    /// (`warmstate.py:669`) decide statically before tracing and turn a "no"
+    /// (`codewriter/policy.py`) and `can_inline_callable`
+    /// (`warmstate.py`) decide statically before tracing and turn a "no"
     /// into a residual call.
     DeferredCall,
     /// Carries a live-heap effect a replay would double.

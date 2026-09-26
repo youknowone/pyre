@@ -129,12 +129,12 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     // Truncate the original block to before-call ops only
     graph.blocks[block_id.0].operations.truncate(op_index);
 
-    // --- Remap callee values and blocks ---
+    // Remap callee values and blocks
     let value_map = remap_callee_values(graph, &callee);
     let block_map = remap_callee_blocks(graph, &callee);
 
-    // --- Create merge block for after-call ops ---
-    // Upstream `backendopt/inline.py:253-264` copies caller-block-after
+    // Create merge block for after-call ops
+    // Upstream `backendopt/inline.py copy_block` copies caller-block-after
     // ops + exits into a fresh afterblock whenever there is something
     // to preserve.  Pyre creates the merge block when (a) after-call
     // ops exist, (b) the caller block was already closed with exits or
@@ -185,7 +185,7 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
         None
     };
 
-    // --- Copy callee blocks into the graph ---
+    // Copy callee blocks into the graph
     let callee_entry = *block_map.get(&callee.startblock).unwrap();
 
     for callee_block in &callee.blocks {
@@ -249,7 +249,7 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
             // goto, can-raise, typed-exception, bool-branch) with
             // renamed values and blocks.  `set_control_flow_metadata`
             // stamps `prevblock` on every link per
-            // `flowspace/model.py:120`.
+            // `flowspace/model.py`.
             let (exitswitch, exits) = remap_control_flow_metadata_var(
                 &callee_block.exitswitch,
                 &callee_block.exits,
@@ -260,7 +260,7 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
         }
     }
 
-    // --- Connect caller's before-block to callee entry ---
+    // Connect caller's before-block to callee entry
     // Map call arguments to callee's Input ops.
     // Callee's Input ops correspond to its entry block's first N ops.
     let callee_entry_block = &callee.blocks[callee.startblock.0];
@@ -956,7 +956,7 @@ pub(crate) fn remap_op_kind(
 ///
 /// RPython parity — upstream `SpaceOperation.args` is already a
 /// `Vec<Hlvalue>` where each `Hlvalue::Variable` carries the
-/// authoritative operand identity (`flowspace/model.py:140`).  Pyre's
+/// authoritative operand identity (`flowspace/model.py`).  Pyre's
 /// `OpKind` already stores `flowspace::model::Variable` per operand,
 /// so this walker needs no graph round-trip.
 pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable> {
@@ -1961,7 +1961,7 @@ mod tests {
     /// Post-inline regression: every block whose terminator is a
     /// control-flow op (Goto/Branch) must carry matching `Block.exits`
     /// metadata, and every resulting Link must stamp `prevblock` with
-    /// the block it exits.  RPython `flowspace/model.py:174` keeps
+    /// the block it exits.  RPython `flowspace/model.py` keeps
     /// `exitswitch`/`exits` as the single CFG source of truth, so pyre
     /// must not let the inline rewrite produce terminator/exits drift
     /// or `prevblock = None` links.
@@ -2001,7 +2001,7 @@ mod tests {
         assert!(count >= 1, "callee should inline at least once");
 
         for block in &caller.blocks {
-            // Upstream `flowspace/model.py:171-180` — a closed block (one
+            // Upstream `flowspace/model.py Block` — a closed block (one
             // with `exitswitch.is_some()` or at least one exit) always
             // carries both: the exitswitch names the branch condition,
             // the exits hold every outgoing `Link`.  An unclosed block

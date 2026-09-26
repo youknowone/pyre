@@ -9,7 +9,7 @@
 //!   needs both directions — so the sort driver itself has to be the one that
 //!   only ever asks "is a < b".
 //! * The merge steps hold elements in a scratch copy and reinstate them in a
-//!   `finally` (`listsort.py:388`, `:495`), so a comparison that raises still
+//!   `finally` (`listsort.py`, `:495`), so a comparison that raises still
 //!   leaves a permutation of the input behind rather than duplicates.
 //!
 //! `make_timsort_class`'s `getitem`/`setitem`/`length`/`lt` parameters become

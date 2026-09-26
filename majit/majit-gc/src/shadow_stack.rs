@@ -38,7 +38,7 @@ const WORD: usize = std::mem::size_of::<usize>();
 // RPython's ShadowStackPool starts with `DEFAULT_ROOT_STACK_DEPTH`
 // entries and grows via `increase_root_stack_depth` which
 // `raw_malloc`s a larger buffer and copies the used portion
-// (rpython/memory/gctransform/shadowstack.py:351). Pyre mirrors this
+// (rpython/memory/gctransform/shadowstack.py). Pyre mirrors this
 // with one heap-allocated `Box<[usize]>` per OS thread. Compiled JIT code
 // reads/writes that thread's `root_stack_top` cell (a stable TLS address)
 // and dereferences it just like RPython.
@@ -89,7 +89,7 @@ impl JitFrameShadowStack {
         }
     }
 
-    /// rpython/memory/gctransform/shadowstack.py:351
+    /// rpython/memory/gctransform/shadowstack.py increase_root_stack_depth
     /// `increase_root_stack_depth` parity: allocate new, copy used
     /// portion, update pointers, free old. RPython also handles all live
     /// thread shadow stacks; this Rust port keeps the same shape by giving
@@ -1004,7 +1004,7 @@ pub fn depth() -> usize {
         .unwrap_or(0)
 }
 
-/// rpython/memory/gctransform/shadowstack.py:351
+/// rpython/memory/gctransform/shadowstack.py increase_root_stack_depth
 /// `increase_root_stack_depth` parity. Grows BOTH:
 ///   * the per-thread safety cap for the generic GcRef shadow stack
 ///     (`ShadowStack::max_depth`); and
@@ -1151,7 +1151,7 @@ pub fn jf_depth() -> usize {
 /// traces the gcmap-indicated ref slots during Phase 2.
 ///
 /// The marker word is stepped over, not consumed. `walk_stack_root`
-/// (`shadowstack.py:44-70`) treats an odd slot as a skip bitmask: on a minor
+/// (`shadowstack.py`) treats an odd slot as a skip bitmask: on a minor
 /// collection it negates an unmarked one and *returns* at an already-marked
 /// one, so the walk stops instead of descending further. Porting that loop
 /// here would be porting a no-op. Upstream keeps one root stack per thread, so
@@ -1163,7 +1163,7 @@ pub fn jf_depth() -> usize {
 ///
 /// It would also be unsound on its own: upstream disables the optimization for
 /// the first minor collection after a thread switch
-/// (`can_look_at_partial_stack`, `shadowstack.py:112-126`) and whenever the
+/// (`can_look_at_partial_stack`, `shadowstack.py`) and whenever the
 /// nursery holds objects pinned before the previous minor collection
 /// (`IncrementalMiniMarkGC.collect_roots_in_nursery`'s
 /// `any_pinned_object_from_earlier`). The collector now keeps that state with
@@ -2371,7 +2371,7 @@ mod tests {
         pop_jf_to(0);
     }
 
-    /// rpython/memory/gctransform/shadowstack.py:351 parity:
+    /// rpython/memory/gctransform/shadowstack.py increase_root_stack_depth parity:
     /// sys.setrecursionlimit(>1000) must resize the jitframe
     /// shadow-stack backing buffer, not just raise a limit.
     #[test]

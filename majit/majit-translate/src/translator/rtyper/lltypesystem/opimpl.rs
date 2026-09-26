@@ -136,10 +136,10 @@ pub fn op_same_as(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-// ---- int_* ---------------------------------------------------------
+// int_*
 
 /// RPython `opimpl.op_int_is_true` derived from
-/// `flowspace.operation.op.is_true.pyfunc` (`opimpl.py:47-94
+/// `flowspace.operation.op.is_true.pyfunc` (`opimpl.py get_primitive_op_src
 /// get_primitive_op_src`). For Python `int` the truth test is
 /// `value != 0`.
 pub fn op_int_is_true(args: &[ConstValue]) -> Option<ConstValue> {
@@ -149,7 +149,7 @@ pub fn op_int_is_true(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// `op_int_neg` — `intmask(-x)` (`opimpl.py:47-94`).
+/// `op_int_neg` — `intmask(-x)` (`opimpl.py get_primitive_op_src`).
 pub fn op_int_neg(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::Int(n)] => Some(ConstValue::Int(n.wrapping_neg())),
@@ -355,7 +355,7 @@ pub fn op_int_force_ge_zero(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-// ---- float_* ------------------------------------------------------
+// float_*
 
 /// `op_float_*` are derived via `get_primitive_op_src` (`opimpl.py`)
 /// for `argtype = float`. RPython folds them as direct IEEE 754
@@ -445,9 +445,9 @@ pub fn op_float_ge(args: &[ConstValue]) -> Option<ConstValue> {
     Some(ConstValue::Bool(a >= b))
 }
 
-// ---- llong_* ------------------------------------------------------
+// llong_*
 //
-// Upstream `op_llong_*` (`opimpl.py:298-358`) operates on `r_longlong_arg`,
+// Upstream `op_llong_*` (`opimpl.py op_llong_floordiv`) operates on `r_longlong_arg`,
 // which on 64-bit hosts aliases the regular Python int (see
 // `opimpl.py:23-28`: `if r_longlong is r_int: r_longlong_arg =
 // (r_longlong, int, long)`). The Rust port keeps the
@@ -458,7 +458,7 @@ pub fn op_float_ge(args: &[ConstValue]) -> Option<ConstValue> {
 // `lltype.rs` carries `r_longlong` distinctly.
 
 /// RPython `op_llong_is_true` (derived via `get_primitive_op_src`,
-/// `opimpl.py:47-94`).
+/// `opimpl.py`).
 pub fn op_llong_is_true(args: &[ConstValue]) -> Option<ConstValue> {
     op_int_is_true(args)
 }
@@ -544,9 +544,9 @@ pub fn op_llong_ge(args: &[ConstValue]) -> Option<ConstValue> {
     op_int_ge(args)
 }
 
-// ---- uint_* and ullong_* ------------------------------------------
+// uint_* and ullong_*
 //
-// Upstream `op_uint_*` (`opimpl.py:330-378`) operates on `r_uint` —
+// Upstream `op_uint_*` (`opimpl.py op_uint_lshift`) operates on `r_uint` —
 // `unsigned long` in C, `u64` on 64-bit hosts. The Rust port carries
 // `LowLevelType::Unsigned` and `LowLevelType::UnsignedLongLong` values
 // in [`ConstValue::Int(i64)`] (per `lltype.rs`) using bit-
@@ -787,7 +787,7 @@ pub fn op_ullong_ge(args: &[ConstValue]) -> Option<ConstValue> {
     op_uint_ge(args)
 }
 
-// ---- ptr_* ---------------------------------------------------------
+// ptr_*
 
 /// RPython `op_ptr_eq` (`opimpl.py`).
 ///
@@ -924,7 +924,7 @@ pub fn op_adr_add(args: &[ConstValue]) -> Option<ConstValue> {
                 .map(|p| ConstValue::LLAddress(_address::Fake(Box::new(p))))
         }
         // `fakeaddress.__add__`: a plain `0` offset returns the address
-        // unchanged (llmemory.py:474-475). The `offset` is typed `Signed`,
+        // unchanged (llmemory.py). The `offset` is typed `Signed`,
         // which admits an `Int` carrier as well as `AddressOffset`
         // (`Signed::contains_value`).
         [ConstValue::LLAddress(addr), ConstValue::Int(0)] => {
@@ -948,7 +948,7 @@ pub fn op_adr_sub(args: &[ConstValue]) -> Option<ConstValue> {
             ])
         }
         // `fakeaddress.__sub__`: a plain `0` offset returns self
-        // (llmemory.py:486-487).
+        // (llmemory.py).
         [ConstValue::LLAddress(addr), ConstValue::Int(0)] => {
             Some(ConstValue::LLAddress(addr.clone()))
         }
@@ -986,7 +986,7 @@ pub fn op_cast_adr_to_ptr(restype: &LowLevelType, args: &[ConstValue]) -> Option
         .map(|p| ConstValue::LLPtr(Box::new(p)))
 }
 
-// ---- cast_*_to_* (primitive-only carriers) ------------------------
+// cast_*_to_* (primitive-only carriers)
 
 /// RPython `op_cast_int_to_float` (`opimpl.py`).
 pub fn op_cast_int_to_float(args: &[ConstValue]) -> Option<ConstValue> {
@@ -1121,7 +1121,7 @@ pub fn op_cast_unichar_to_int(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-// ---- wide-int casts (i64 / u64 carrier preserves bit pattern) -----
+// wide-int casts (i64 / u64 carrier preserves bit pattern)
 //
 // On 64-bit hosts every signed/unsigned long-long type collapses onto
 // the single [`ConstValue::Int(i64)`] carrier (per `lltype.rs`).
@@ -1229,7 +1229,7 @@ pub fn op_cast_float_to_uint(args: &[ConstValue]) -> Option<ConstValue> {
 
 /// Compute `trunc(f) mod 2^64` for any finite `f64`, matching
 /// upstream `r_uint(long(f))` / `r_ulonglong(long(f))` wrap
-/// (`opimpl.py:432-446`). The exact wrap is recoverable from the
+/// (`opimpl.py op_cast_float_to_uint`). The exact wrap is recoverable from the
 /// IEEE-754 representation alone because:
 ///
 /// * For `|f| < 1`: `trunc(f) == 0`.
@@ -1354,7 +1354,7 @@ pub fn op_convert_longlong_bytes_to_float(args: &[ConstValue]) -> Option<ConstVa
     }
 }
 
-// ---- char_* / unichar_* comparisons ------------------------------
+// char_* / unichar_* comparisons
 
 /// RPython `char_lt`/`char_le`/`char_eq`/`char_ne`/`char_gt`/`char_ge`
 /// derived via `get_primitive_op_src` (`opimpl.py`). The
@@ -1424,7 +1424,7 @@ pub fn op_unichar_ne(args: &[ConstValue]) -> Option<ConstValue> {
     Some(ConstValue::Bool(a != b))
 }
 
-// ---- likely / unlikely --------------------------------------------
+// likely / unlikely
 
 /// RPython `op_likely` / `op_unlikely` (`opimpl.py`) —
 /// identity on `bool`. The annotation is a JIT hint; constant folding
@@ -1443,7 +1443,7 @@ pub fn op_unlikely(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-// ---- registry -----------------------------------------------------
+// registry
 
 // TODO: opimpl missing-ops audit.
 //
@@ -1476,7 +1476,7 @@ pub fn op_unlikely(args: &[ConstValue]) -> Option<ConstValue> {
 //
 // 4. llmemory address carrier — all landed (adr_lt/le/eq/ne/gt/ge/
 //    delta/add/sub + cast_int_to_adr + cast_adr_to_ptr). `cast_adr_to_ptr`
-//    (`opimpl.py:482-485`, `need_result_type`) folds through the
+//    (`opimpl.py`, `need_result_type`) folds through the
 //    RESTYPE threaded by `constfold.rs::eval_llop`.
 //
 // 5. lltype.cast_primitive / cast_pointer with TYPE arg (2 ops):
@@ -1777,7 +1777,7 @@ mod tests {
     #[test]
     fn int_floordiv_truncates_toward_zero() {
         // Upstream `op_int_floordiv` is C-style truncating division
-        // (the `+1` adjustment in `opimpl.py:286-287` converts Python
+        // (the `+1` adjustment in `opimpl.py` converts Python
         // floor div back to truncation), matching `i64::checked_div`.
         assert_eq!(op_int_floordiv(&[i(-7), i(2)]), Some(i(-3)));
         assert_eq!(op_int_floordiv(&[i(7), i(-2)]), Some(i(-3)));
@@ -1791,7 +1791,7 @@ mod tests {
     #[test]
     fn int_mod_truncates_toward_zero() {
         // Upstream `op_int_mod` is C-style truncating mod (the
-        // `r -= y` adjustment in `opimpl.py:294-295` converts Python
+        // `r -= y` adjustment in `opimpl.py` converts Python
         // floor mod back to truncation), matching `i64::wrapping_rem`.
         // Sign of the result tracks the dividend.
         assert_eq!(op_int_mod(&[i(-7), i(2)]), Some(i(-1)));
@@ -2236,7 +2236,7 @@ mod tests {
         };
 
         // `fakeaddress.__add__/__sub__`: a plain `0` offset returns the address
-        // unchanged (llmemory.py:474-475, 486-487). The `Int(0)` carrier is a
+        // unchanged (llmemory.py, 486-487). The `Int(0)` carrier is a
         // valid `Signed` offset alongside `AddressOffset`.
         let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
         let arrayptr = malloc(array_ty, Some(1), MallocFlavor::Gc, true).unwrap();

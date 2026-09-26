@@ -12,17 +12,17 @@
 //!
 //! Upstream `frame` is an ordinary traced field of an ordinary movable
 //! instance: `pytraceback.py self.frame = frame` on a
-//! `baseobjspace.W_Root`, pointing at `pyframe.py:52 class
+//! `baseobjspace.W_Root`, pointing at `pyframe.py class
 //! PyFrame(W_Root)`, which declares no `_alloc_flavor_` and is never
 //! pinned — `rpython/rlib/rgc.py` documents `pin` as a
 //! short-lived-buffer facility that does not extend lifetime, and
 //! nothing under `pypy/interpreter/` calls it.  A minor collection
-//! copies the frame (`rpython/memory/gc/incminimark.py:2237`) and
+//! copies the frame (`rpython/memory/gc/incminimark.py`) and
 //! rewrites every referring slot in place (`:2252`), because roots
 //! reach the collector as slot addresses
-//! (`rpython/memory/gctransform/shadowstack.py:43-46`) and compiled
+//! (`rpython/memory/gctransform/shadowstack.py`) and compiled
 //! code re-reads the frame after each collecting call
-//! (`rpython/jit/backend/x86/assembler.py:1369-1377`).
+//! (`rpython/jit/backend/x86/assembler.py`).
 //!
 //! Pyre's `PyFrame` does carry the `PyObject` prefix (its `ob_header`
 //! field), so `tb_frame` returns a Python-visible object.  What
@@ -36,7 +36,7 @@
 //! is reached through a live Rust `&mut PyFrame` that spans every
 //! allocation the running opcode performs, and RPython's translator
 //! rewrites exactly those live references in their shadow-stack slots
-//! (`rpython/memory/gctransform/shadowstack.py:43-46`) where Rust has
+//! (`rpython/memory/gctransform/shadowstack.py`) where Rust has
 //! no equivalent pass.  `FrameBox::new` allocating non-moving stands
 //! in for that rewrite, and this file's conditional frame edge and
 //! `w_code` snapshot are downstream of it.

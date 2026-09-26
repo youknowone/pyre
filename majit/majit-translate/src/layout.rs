@@ -95,7 +95,7 @@ pub struct HeuristicLayoutProvider {
     known_struct_aligns: HashMap<String, usize>,
     fields_by_struct: HashMap<String, Vec<(String, String)>>,
     /// RPython: per-class `_immutable_fields_` declarations paired with
-    /// `ImmutableRank` (see `rpython/rtyper/rclass.py:644-678`).  Empty
+    /// `ImmutableRank` (see `rpython/rtyper/rclass.py _parse_field_list`).  Empty
     /// when the source did not declare any immutable fields for that
     /// struct.
     immutable_fields_by_struct: HashMap<String, HashMap<String, ImmutableRank>>,

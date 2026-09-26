@@ -163,10 +163,10 @@ pub struct CallFamily {
     /// RPython `self.total_calltable_size = 0` (description.py).
     pub(crate) total_calltable_size: usize,
     /// RPython `CallFamily.normalized = False` class-level default
-    /// (description.py:17).
+    /// (description.py).
     pub(crate) normalized: bool,
     /// RPython `CallFamily.modified = True` class-level default
-    /// (description.py:18).
+    /// (description.py).
     pub(crate) modified: bool,
 }
 
@@ -209,7 +209,7 @@ impl CallFamily {
     }
 
     /// RPython `CallFamily.calltable_lookup_row(callshape, row)`
-    /// (description.py:34-43).
+    /// (description.py).
     ///
     /// Upstream raises `LookupError` on miss; Rust returns
     /// `Option<usize>` so the miss is lossless.
@@ -230,7 +230,7 @@ impl CallFamily {
     }
 
     /// RPython `CallFamily.calltable_add_row(callshape, row)`
-    /// (description.py:45-52).
+    /// (description.py).
     pub(crate) fn calltable_add_row(&mut self, callshape: CallShape, row: CallTableRow) {
         if self.calltable_lookup_row(&callshape, &row).is_none() {
             self.modified = true;
@@ -241,7 +241,7 @@ impl CallFamily {
     }
 
     /// RPython `CallFamily.find_row(bookkeeper, descs, args, op)`
-    /// (description.py:54-59).
+    /// (description.py).
     pub(crate) fn find_row(
         &self,
         bookkeeper: &Rc<Bookkeeper>,
@@ -310,7 +310,7 @@ impl FrozenAttrFamily {
     }
 
     /// RPython `FrozenAttrFamily.get_s_value(attrname)`
-    /// (description.py:89-93).
+    /// (description.py).
     pub fn get_s_value(&self, attrname: &str) -> SomeValue {
         match self.attrs.get(attrname) {
             Some(v) => v.clone(),
@@ -319,7 +319,7 @@ impl FrozenAttrFamily {
     }
 
     /// RPython `FrozenAttrFamily.set_s_value(attrname, s_value)`
-    /// (description.py:95-96).
+    /// (description.py).
     pub fn set_s_value(&mut self, attrname: impl Into<String>, s_value: SomeValue) {
         self.attrs.insert(attrname.into(), s_value);
     }
@@ -347,7 +347,7 @@ pub struct ClassAttrFamily {
     pub(crate) s_value: SomeValue,
     /// Upstream sets this dynamically in
     /// `rpython.rtyper.normalizecalls.merge_classpbc_getattr_into_classdef`
-    /// (normalizecalls.py:232) — Python attaches it to the live family
+    /// (normalizecalls.py) — Python attaches it to the live family
     /// instance after computing the common base of `descs`. The Rust
     /// port stores it as a real field that defaults to `None` and is
     /// populated by [`crate::translator::rtyper::normalizecalls::
@@ -393,7 +393,7 @@ impl ClassAttrFamily {
     }
 
     /// RPython `ClassAttrFamily.get_s_value(attrname)`
-    /// (description.py:124-125). `attrname` is carried explicitly by
+    /// (description.py). `attrname` is carried explicitly by
     /// upstream for interface symmetry with `FrozenAttrFamily`, though
     /// it is ignored in favour of the single-attribute
     /// `self.s_value`.
@@ -402,7 +402,7 @@ impl ClassAttrFamily {
     }
 
     /// RPython `ClassAttrFamily.set_s_value(attrname, s_value)`
-    /// (description.py:127-128).
+    /// (description.py).
     pub fn set_s_value(&mut self, _attrname: &str, s_value: SomeValue) {
         self.s_value = s_value;
     }
@@ -419,9 +419,7 @@ impl SharedUnionFindInfo for ClassAttrFamily {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Desc + FunctionDesc (description.py).
-// ---------------------------------------------------------------------------
 
 /// RPython `class Desc(object)` (description.py).
 ///
@@ -449,7 +447,7 @@ pub struct Desc {
 
 impl Desc {
     /// RPython `Desc.__init__(bookkeeper, pyobj=None)`
-    /// (description.py:135-138).
+    /// (description.py).
     pub fn new(bookkeeper: Rc<Bookkeeper>, pyobj: Option<HostObject>) -> Self {
         Desc {
             identity: alloc_desc_key(),
@@ -583,7 +581,7 @@ pub enum DescEntry {
 ///     pass the mix check it has to fail. `kind()` (→ `DescKind::Memo`)
 ///     is that exact-class projection.
 ///   * `rtyper_makerepr` dispatches on `issubclass(kind, FunctionDesc)`
-///     (rpbc.py:38), true for MemoDesc. `func()` / `as_function()` are
+///     (rpbc.py), true for MemoDesc. `func()` / `as_function()` are
 ///     that subtype view — both cases resolve to a FunctionDesc.
 ///
 /// `consider_call_site` / `simplify_desc_set` are @staticmethods invoked
@@ -627,7 +625,7 @@ impl FuncDescEntry {
     /// the methoddesc cache key, the call family and the call table all
     /// key on the FunctionDesc's single stable identity — matching
     /// upstream where the MemoDesc *is* the FunctionDesc (`rowkey()`
-    /// returns `self`, description.py:365).  No slaving needed.
+    /// returns `self`, description.py).  No slaving needed.
     pub(crate) fn memo(rc: Rc<RefCell<MemoDesc>>) -> Self {
         FuncDescEntry {
             inner: FuncDescInner::Memo(rc),
@@ -803,7 +801,7 @@ impl DescEntry {
     }
 
     /// RPython `desc.get_call_parameters(args_s)` polymorphism as used
-    /// by `annrpython.py:96`. Upstream calls the method directly on the
+    /// by `annrpython.py`. Upstream calls the method directly on the
     /// descriptor object; only `FunctionDesc` implements it, so reaching
     /// any other variant is the Python-level "missing attribute"
     /// condition rather than a Rust-specific type assertion.
@@ -827,7 +825,7 @@ impl DescEntry {
 
     /// RPython `desc.create_new_attribute(name, value)` polymorphism as
     /// used by `MemoTable.finish` (specialize.py). Both `FrozenDesc`
-    /// (description.py:568) and `ClassDesc` (classdesc.py) define it;
+    /// (description.py) and `ClassDesc` (classdesc.py) define it;
     /// every other desc kind raising at the Python level is surfaced as
     /// an [`AnnotatorError`] (a memo argument set must be frozen PBCs or
     /// classes).
@@ -914,12 +912,12 @@ impl DescEntry {
         match self {
             // rowkey is a FunctionDesc-level key by design: upstream
             // "call families and call tables ... always contain
-            // FunctionDescs, not MethodDescs" (description.py:467-469), so
+            // FunctionDescs, not MethodDescs" (description.py), so
             // MethodDesc / MethodOfFrozenDesc rowkey() return their
-            // funcdesc (description.py:467,636). For a plain function
+            // funcdesc (description.py). For a plain function
             // rowkey is the FunctionDesc itself; for a memo it is the
             // MemoDesc (it *is* a FunctionDesc and inherits `rowkey()`
-            // returns `self`, description.py:365). `func()` reads the
+            // returns `self`, description.py). `func()` reads the
             // inner base, whose `identity` is slaved to the MemoDesc in
             // `FuncDescEntry::memo`, so this returns the MemoDesc identity
             // for a memo — the same identity `desc_key()` reports.
@@ -962,7 +960,7 @@ pub struct FunctionDesc {
     /// `Vec<Constant>` so `parse_arguments` can call `bookkeeper.
     /// immutablevalue` at use time (matching upstream's deferred
     /// conversion) and `getuniquegraph` can compare against
-    /// `PyGraph.defaults` structurally (description.py:223-225).
+    /// `PyGraph.defaults` structurally (description.py).
     pub defaults: Vec<Constant>,
     /// RPython `self.specializer` (description.py:202).
     pub specializer: Option<Specializer>,
@@ -977,7 +975,7 @@ pub struct FunctionDesc {
     /// `buildgraph` / `translator.buildflowgraph` produces
     /// `PyGraph` instances; this is what lets `getuniquegraph`
     /// access `graph.signature` / `graph.defaults` for the
-    /// description.py:223-225 comparison.
+    /// description.py comparison.
     pub(crate) cache: RefCell<HashMap<GraphCacheKey, Rc<PyGraph>>>,
     /// Pyre-only lazy-failure record for registry-prefilled callable
     /// graphs.  RPython builds these graphs lazily inside
@@ -1037,7 +1035,7 @@ pub fn build_calltable_row(
 
 impl FunctionDesc {
     /// RPython `FunctionDesc.__init__(bookkeeper, pyobj, name,
-    /// signature, defaults, specializer=None)` (description.py:193-203).
+    /// signature, defaults, specializer=None)` (description.py).
     pub fn new(
         bookkeeper: Rc<Bookkeeper>,
         pyobj: Option<HostObject>,
@@ -1226,7 +1224,7 @@ impl FunctionDesc {
     }
 
     /// RPython `FunctionDesc.cachedgraph(key, alt_name=None, builder=None)`
-    /// (description.py:228-248).
+    /// (description.py).
     pub(crate) fn cachedgraph(
         &self,
         key: GraphCacheKey,
@@ -1332,7 +1330,7 @@ fn clone_lifted_graph(template: &PyGraph, alt_name: Option<&str>) -> Rc<PyGraph>
 ///
 /// Upstream `specialize` returns either a `FunctionGraph` (the common
 /// graph-producing specializers) or a `SomeXxx` annotation (the `memo`
-/// specializer, specialize.py:275). Python lets the single method return
+/// specializer, specialize.py). Python lets the single method return
 /// either; the typed Rust port makes the union explicit. `pycall` /
 /// `get_graph` / `get_call_parameters` recover the graph via
 /// [`SpecializeResult::expect_graph`] (their upstream `assert
@@ -1362,7 +1360,7 @@ impl SpecializeResult {
 
 impl FunctionDesc {
     /// RPython `FunctionDesc.parse_arguments(args, graph=None)`
-    /// (description.py:251-270).
+    /// (description.py).
     ///
     /// Functional port. Defaults are walked through
     /// [`Bookkeeper::immutablevalue`]; `args.match_signature` does
@@ -1419,7 +1417,7 @@ impl FunctionDesc {
     }
 
     /// RPython `FunctionDesc.normalize_args(inputs_s)`
-    /// (description.py:307-326).
+    /// (description.py).
     ///
     /// Honours `@enforceargs` and `@signature(...)` decorators carried
     /// via [`Self::annenforceargs`] / [`Self::annsignature`]. Upstream
@@ -1487,7 +1485,7 @@ impl FunctionDesc {
     }
 
     /// RPython `FunctionDesc.buildgraph(alt_name=None, builder=None)`
-    /// (description.py:205-213).
+    /// (description.py).
     pub fn buildgraph(
         &self,
         alt_name: Option<&str>,
@@ -1588,7 +1586,7 @@ impl FunctionDesc {
     }
 
     /// RPython `flatten_star_args(funcdesc, args_s)`
-    /// (specialize.py:14-58).
+    /// (specialize.py).
     ///
     /// Flattens the trailing `SomeTuple` for a `*arg` signature into
     /// individual argument annotations, returning the new args_s and
@@ -1697,7 +1695,7 @@ impl FunctionDesc {
         inputcells: &mut Vec<Option<SomeValue>>,
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
         // upstream `default_specialize(funcdesc, args_s)`
-        // (specialize.py:60-85).  RPython iterates `args_s` and only
+        // (specialize.py).  RPython iterates `args_s` and only
         // touches entries that are `SomeInstance`; unbound (None)
         // cells naturally fall through the `isinstance(s_obj,
         // SomeInstance)` check.  Pyre mirrors that by skipping `None`
@@ -1767,7 +1765,7 @@ impl FunctionDesc {
                 ))
             })?;
             // upstream `specialize_argvalue(funcdesc, args_s, *parms)`
-            // (specialize.py:122-130) reaches `args_s[i].is_constant()`
+            // (specialize.py) reaches `args_s[i].is_constant()`
             // / `args_s[i].const`; an unbound cell raises AttributeError
             // there.  Mirror with fail-loud at access.
             let s = s_slot.as_ref().ok_or_else(|| {
@@ -1796,7 +1794,7 @@ impl FunctionDesc {
     }
 
     /// RPython `specialize_arg_or_var(funcdesc, args_s, *argindices)`
-    /// (specialize.py:346-354).
+    /// (specialize.py).
     pub(crate) fn specialize_arg_or_var(
         &self,
         args_s: &[Option<SomeValue>],
@@ -1827,7 +1825,7 @@ impl FunctionDesc {
     }
 
     /// RPython `specialize_argtype(funcdesc, args_s, *argindices)`
-    /// (specialize.py:356-358).
+    /// (specialize.py).
     pub(crate) fn specialize_argtype(
         &self,
         args_s: &[Option<SomeValue>],
@@ -1857,7 +1855,7 @@ impl FunctionDesc {
     }
 
     /// RPython `specialize_arglistitemtype(funcdesc, args_s, i)`
-    /// (specialize.py:360-366).
+    /// (specialize.py).
     pub(crate) fn specialize_arglistitemtype(
         &self,
         args_s: &[Option<SomeValue>],
@@ -1901,7 +1899,7 @@ impl FunctionDesc {
     }
 
     /// RPython `specialize_call_location(funcdesc, args_s, op)`
-    /// (specialize.py:368-370).
+    /// (specialize.py).
     pub(crate) fn specialize_call_location(
         &self,
         args_s: &[Option<SomeValue>],
@@ -1915,7 +1913,7 @@ impl FunctionDesc {
     }
 
     /// Mutation step inside the upstream `builder(translator, func)`
-    /// closure from `specialize.py:29-52`.
+    /// closure from `specialize.py`.
     fn apply_star_args_builder(
         pygraph: &PyGraph,
         nb_extra_args: usize,
@@ -2010,11 +2008,11 @@ impl FunctionDesc {
     }
 
     /// RPython `FunctionDesc.specialize(inputcells, op=None)`
-    /// (description.py:272-281).
+    /// (description.py).
     ///
     /// The optional `op_key` parameter threads the call-site position
     /// from the flow-space operation through the annotator driver. As
-    /// in upstream `description.py:272-281`, a missing explicit
+    /// in upstream `description.py`, a missing explicit
     /// `op_key` first reuses `bookkeeper.position_key` before
     /// dispatching to the specializer.
     pub(crate) fn specialize(
@@ -2162,7 +2160,7 @@ impl FunctionDesc {
     }
 
     /// RPython `FunctionDesc.pycall(whence, args, s_previous_result, op=None)`
-    /// (description.py:283-305).
+    /// (description.py).
     ///
     /// ```python
     /// def pycall(self, whence, args, s_previous_result, op=None):
@@ -2205,7 +2203,7 @@ impl FunctionDesc {
         }
         // upstream: `inputcells = self.parse_arguments(args)`.
         // Option-aware inputcells thread directly through specialize /
-        // unmatch_signature / recursivecall, matching `description.py:283-298`
+        // unmatch_signature / recursivecall, matching `description.py`
         // pycall's "pass inputcells through" propagation.
         let mut inputcells = self.parse_arguments(args, None)?;
         // upstream: `graph = self.specialize(inputcells, op)`.
@@ -2253,7 +2251,7 @@ impl FunctionDesc {
     }
 
     /// RPython `MemoDesc.pycall(whence, args, s_previous_result, op=None)`
-    /// (description.py:395-404).
+    /// (description.py).
     ///
     /// ```python
     /// def pycall(self, whence, args, s_previous_result, op=None):
@@ -2316,7 +2314,7 @@ impl FunctionDesc {
     }
 
     /// RPython `FunctionDesc.get_call_parameters(args_s)`
-    /// (description.py:332-348).
+    /// (description.py).
     ///
     /// ```python
     /// def get_call_parameters(self, args_s):
@@ -2389,7 +2387,7 @@ impl FunctionDesc {
     }
 
     /// RPython `FunctionDesc.bind_under(classdef, name)`
-    /// (description.py:350-355).
+    /// (description.py).
     ///
     /// ```python
     /// def bind_under(self, classdef, name):
@@ -2418,7 +2416,7 @@ impl FunctionDesc {
     }
 
     /// RPython `FunctionDesc.consider_call_site(descs, args, s_result, op)`
-    /// (description.py:357-363).
+    /// (description.py).
     ///
     pub(crate) fn consider_call_site(
         descs: &[Rc<RefCell<FunctionDesc>>],
@@ -2441,7 +2439,7 @@ impl FunctionDesc {
     }
 
     /// RPython `FunctionDesc.get_s_signatures(shape)`
-    /// (description.py:368-393).
+    /// (description.py).
     ///
     /// ```python
     /// def get_s_signatures(self, shape):
@@ -2540,7 +2538,7 @@ impl MemoDesc {
     }
 
     /// RPython `MemoDesc.pycall(whence, args, s_previous_result, op=None)`
-    /// (description.py:395-404).
+    /// (description.py).
     ///
     /// ```python
     /// def pycall(self, whence, args, s_previous_result, op=None):
@@ -2577,9 +2575,7 @@ impl MemoDesc {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MethodDesc + FrozenDesc + MethodOfFrozenDesc (description.py).
-// ---------------------------------------------------------------------------
 
 /// Opaque handle for `ClassDef` references used by
 /// [`MethodDesc::originclassdef`] / `selfclassdef`. Upstream carries
@@ -2629,7 +2625,7 @@ pub struct MethodDesc {
 impl MethodDesc {
     /// RPython `MethodDesc.__init__(bookkeeper, funcdesc,
     /// originclassdef, selfclassdef, name, flags={})`
-    /// (description.py:410-417).
+    /// (description.py).
     pub(crate) fn new(
         bookkeeper: Rc<Bookkeeper>,
         funcdesc: FuncDescEntry,
@@ -2698,7 +2694,7 @@ impl MethodDesc {
     }
 
     /// RPython `MethodDesc.pycall(whence, args, s_previous_result, op)`
-    /// (description.py:439-441).
+    /// (description.py).
     ///
     /// ```python
     /// def pycall(self, whence, args, s_previous_result, op=None):
@@ -2753,7 +2749,7 @@ impl MethodDesc {
     }
 
     /// RPython `MethodDesc.bind_self(newselfclassdef, flags={})`
-    /// (description.py:451-456).
+    /// (description.py).
     pub(crate) fn bind_self(
         &self,
         newselfclassdef: ClassDefKey,
@@ -2783,7 +2779,7 @@ impl MethodDesc {
     }
 
     /// RPython `MethodDesc.consider_call_site(descs, args, s_result, op)`
-    /// (description.py:458-465).
+    /// (description.py).
     ///
     /// ```python
     /// @staticmethod
@@ -3000,7 +2996,7 @@ impl FrozenDesc {
     }
 
     /// RPython `FrozenDesc.__init__(..., read_attribute=callback)` —
-    /// the non-default branch (description.py:530-534). Callers that
+    /// the non-default branch (description.py). Callers that
     /// need a custom attribute source hand a closure in directly;
     /// matches upstream's factory pattern.
     pub fn new_with_read_attribute(
@@ -3129,7 +3125,7 @@ impl FrozenDesc {
     }
 
     /// RPython `FrozenDesc.create_new_attribute(name, value)`
-    /// (description.py:568-575).
+    /// (description.py).
     pub fn create_new_attribute(
         &self,
         name: impl Into<String>,
@@ -3144,7 +3140,7 @@ impl FrozenDesc {
     }
 
     /// RPython `FrozenDesc.getattrfamily(attrname=None)`
-    /// (description.py:577-581).
+    /// (description.py).
     ///
     pub fn getattrfamily(&self) -> Result<Rc<RefCell<FrozenAttrFamily>>, AnnotatorError> {
         let mut families = self.base.bookkeeper.frozenpbc_attr_families.borrow_mut();
@@ -3166,7 +3162,7 @@ impl FrozenDesc {
     }
 
     /// RPython `FrozenDesc.mergeattrfamilies(others, attrname=None)`
-    /// (description.py:592-599).
+    /// (description.py).
     pub fn mergeattrfamilies(&self, others: &[&FrozenDesc]) -> Result<bool, AnnotatorError> {
         if others.is_empty() {
             return Ok(false);
@@ -3196,7 +3192,7 @@ pub struct MethodOfFrozenDesc {
 
 impl MethodOfFrozenDesc {
     /// RPython `MethodOfFrozenDesc.__init__(bookkeeper, funcdesc,
-    /// frozendesc)` (description.py:605-608).
+    /// frozendesc)` (description.py).
     pub(crate) fn new(
         bookkeeper: Rc<Bookkeeper>,
         funcdesc: FuncDescEntry,
@@ -3229,7 +3225,7 @@ impl MethodOfFrozenDesc {
     }
 
     /// RPython `MethodOfFrozenDesc.pycall(whence, args,
-    /// s_previous_result, op)` (description.py:619-621).
+    /// s_previous_result, op)` (description.py).
     ///
     /// ```python
     /// def pycall(self, whence, args, s_previous_result, op=None):
@@ -3270,7 +3266,7 @@ impl MethodOfFrozenDesc {
     }
 
     /// RPython `MethodOfFrozenDesc.consider_call_site(descs, args,
-    /// s_result, op)` (description.py:627-634).
+    /// s_result, op)` (description.py).
     ///
     /// Identical structure to [`MethodDesc::consider_call_site`] —
     /// `shape.shape_cnt += 1` for the bound frozen instance that
@@ -3287,7 +3283,7 @@ impl MethodOfFrozenDesc {
         // Route through the funcdesc so the call family is keyed by
         // `rowkey()` (the funcdesc) rather than the methoddesc's own
         // identity — see `MethodDesc::consider_call_site` for the
-        // rationale (description.py:467-471, :636-637).
+        // rationale (description.py, :636-637).
         let head_funcdesc = descs[0].borrow().funcdesc.func();
         let family = head_funcdesc.borrow().base.getcallfamily()?;
         let mut shape = args.rawshape();
@@ -3441,7 +3437,7 @@ mod tests {
         assert!(a.commonbase.is_none(), "update must not touch commonbase");
     }
 
-    // ---- Desc + FunctionDesc (commit 2) ----
+    // Desc + FunctionDesc (commit 2)
 
     fn bk() -> Rc<Bookkeeper> {
         Rc::new(Bookkeeper::new())
@@ -3598,7 +3594,7 @@ mod tests {
 
     /// Build a memo-specialised FunctionDesc whose `host_call` maps a
     /// bool argument to an int, then drive `specialize` and assert it
-    /// returns the union-of-results annotation (specialize.py:275-312).
+    /// returns the union-of-results annotation (specialize.py).
     #[test]
     fn specialize_memo_returns_union_of_host_call_results() {
         use crate::flowspace::model::HostCall;
@@ -3638,7 +3634,7 @@ mod tests {
     }
 
     /// A memo function with no `host_call` hook cannot be evaluated at
-    /// annotation time and must report it (specialize.py:287-290 — the
+    /// annotation time and must report it (specialize.py — the
     /// `func is None` analogue).
     #[test]
     fn specialize_memo_without_host_call_errors() {
@@ -3691,7 +3687,7 @@ mod tests {
     /// [`DescEntry::Memo`] (upstream `newfuncdesc` `if specializer is
     /// memo`), and its `pycall` projects the union-of-results annotation
     /// — the path a plain `FunctionDesc::pycall` would break on with
-    /// `expect_graph()` (specialize.py:275-312, description.py).
+    /// `expect_graph()` (specialize.py, description.py).
     #[test]
     fn getdesc_routes_memo_function_to_memodesc_pycall() {
         use crate::flowspace::model::HostCall;
@@ -3803,7 +3799,7 @@ mod tests {
 
     #[test]
     fn function_desc_getuniquegraph_returns_single_cached_graph() {
-        // upstream description.py:218-226 — a cache of exactly one
+        // upstream description.py getuniquegraph — a cache of exactly one
         // graph whose signature/defaults match returns that graph.
         let sig = int_sig(&["x"]);
         let fd = FunctionDesc::new(bk(), None, "f", sig.clone(), None, None);
@@ -3839,7 +3835,7 @@ mod tests {
     fn function_desc_getuniquegraph_errors_on_defaults_mismatch() {
         let sig = int_sig(&["x"]);
         // FunctionDesc declares no defaults; graph claims `defaults =
-        // (10,)`. Upstream description.py:223-225 flags this.
+        // (10,)`. Upstream description.py flags this.
         let fd = FunctionDesc::new(bk(), None, "f", sig.clone(), None, None);
         fd.cache.borrow_mut().insert(
             GraphCacheKey::String("key".to_string()),
@@ -4242,7 +4238,7 @@ mod tests {
         );
     }
 
-    // ---- MethodDesc + FrozenDesc + MethodOfFrozenDesc (commit 3) ----
+    // MethodDesc + FrozenDesc + MethodOfFrozenDesc (commit 3)
 
     fn wrap_fd(bk: &Rc<Bookkeeper>, name: &str) -> Rc<RefCell<FunctionDesc>> {
         Rc::new(RefCell::new(FunctionDesc::new(
@@ -4564,12 +4560,12 @@ mod tests {
 
     #[test]
     fn frozen_desc_custom_read_attribute_callback_is_invoked() {
-        // upstream description.py:530-534 — when the caller passes a
+        // upstream description.py __init__ — when the caller passes a
         // `read_attribute` closure, it becomes the attribute source
         // (bypassing the default `getattr(pyobj, attr)`). The Rust
         // port exposes this via `new_with_read_attribute`. Verify the
         // custom callback is what `read_attribute` consults, and that
-        // the attrcache memoises its result (description.py:553-558).
+        // the attrcache memoises its result (description.py).
         let bk = bk();
         let pyobj = HostObject::new_module("mod");
         let calls = Rc::new(std::cell::Cell::new(0usize));

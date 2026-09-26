@@ -71,7 +71,7 @@ fn pwd_uid_converter(
 /// layout.  `struct_passwd` / `struct_pwent` are exposed as the same
 /// builtin type so `isinstance(pwd.struct_passwd, type)` succeeds and
 /// `pwd.struct_passwd` is identity-equal to `pwd.struct_pwent`
-/// (`app_pwd.py:1-21`).  Full structseq instance materialisation
+/// (`app_pwd.py`).  Full structseq instance materialisation
 /// (so `pw_entry.pw_name` returns a string) is a framework prereq
 /// tracked separately.
 ///

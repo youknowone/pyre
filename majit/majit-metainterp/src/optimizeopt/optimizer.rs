@@ -328,7 +328,7 @@ impl LoopInfo for BasicLoopInfo {
     }
 }
 
-/// bridgeopt.py:124 parity: data needed to call
+/// bridgeopt.py deserialize_optimizer_knowledge parity: data needed to call
 /// deserialize_optimizer_knowledge after optimizer setup.
 pub(crate) struct PendingBridgeRd {
     /// compile.py `ResumeGuardDescr` storage handle. The bridge
@@ -457,7 +457,7 @@ pub struct Optimizer {
     recycled_ctx: Option<Box<OptContext>>,
     /// RPython Box identity: generation epoch for Phase 2 ops.
     /// Phase 1 JUMP arg OpRef indices to pre-tag as gen=0.
-    /// bridgeopt.py:124-185: pending bridge resume data for deserialization
+    /// bridgeopt.py deserialize_optimizer_knowledge: pending bridge resume data for deserialization
     /// after setup(). RPython calls deserialize_optimizer_knowledge after the
     /// optimizer is constructed.
     pending_bridge_rd: Option<PendingBridgeRd>,
@@ -485,7 +485,7 @@ pub struct Optimizer {
     pub simple_compile: bool,
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     /// Taken from MIStaticData at optimizer construction, returned after.
-    /// descr.py:25-47: descriptors get descr_index assigned inline during
+    /// descr.py setup_descrs: descriptors get descr_index assigned inline during
     /// collect_optimizer_knowledge_for_resume().
     pub all_descrs: Arc<Vec<DescrRef>>,
     /// optimizer.py: constant_fold allocator for compile-time object creation.
@@ -506,7 +506,7 @@ pub struct Optimizer {
     /// RPython metainterp_sd.callinfocollection parity.
     /// Propagated to OptContext for generate_modified_call (vstring.py).
     pub callinfocollection: Option<std::sync::Arc<majit_ir::CallInfoCollection>>,
-    /// optimizer.py:732 — resume.ResumeDataLoopMemo.
+    /// optimizer.py is_call_pure_pure_canraise — resume.ResumeDataLoopMemo.
     /// Shared constant pool + box numbering cache across all guards in a loop.
     pub resumedata_memo: std::rc::Rc<std::cell::RefCell<crate::resume::ResumeDataLoopMemo>>,
     /// resume.py parity: per-guard snapshots from tracing time.
@@ -522,7 +522,7 @@ pub struct Optimizer {
     /// OptContext for the `memo.number()` call in
     /// `store_final_boxes_in_guard`.
     ///
-    /// `-1` disables the check (`resume.py:236-239`); a non-negative value
+    /// `-1` disables the check (`resume.py`); a non-negative value
     /// arms it. `virtualizable.py minimum_size()` is
     /// `num_static_fields`, and the comparison is `>` rather than `>=`
     /// because the virtualizable identity occupies one array entry of its
@@ -576,7 +576,7 @@ pub struct Optimizer {
     /// - `emit_operation` after `ctx.emit` (optimizer.py
     ///   `self._emittedoperations[op] = None` inside _emit_operation).
     /// - `replace_guard_op` after swapping the new op into
-    ///   `new_operations` (optimizer.py:747).
+    ///   `new_operations` (optimizer.py).
     ///
     /// Read by `as_operation(opref, required_opnum)` (optimizer.py)
     /// which returns the opref iff it has been emitted *and* its opcode
@@ -951,7 +951,7 @@ impl Optimizer {
                                             Self::import_virtual_state_value(field_info, ctx);
                                         ctx.materialize_operand_at(field_ref)
                                     }
-                                    // virtualstate.py:328-354: retain the
+                                    // virtualstate.py _enum: retain the
                                     // dense unwritten element-field slot.
                                     None => Operand::None,
                                 };
@@ -984,7 +984,7 @@ impl Optimizer {
             }
             VirtualStateInfo::IntBounded(bound) => {
                 // RPython parity: imported preamble bounds become the box's
-                // forwarded IntBound directly (optimizer.py:115-125
+                // forwarded IntBound directly (optimizer.py setintbound
                 // setintbound). No separate "imported" or "lower-only" maps.
                 let widened = bound.widen();
                 ctx.setintbound(box_, &widened);
@@ -1094,12 +1094,12 @@ impl Optimizer {
                 // the shift is a no-op and the legacy raw-position path
                 // still works.
                 //
-                // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: mint a
+                // resoperation.py InputArgInt/727/739 InputArg{Int,Ref,Float}: mint a
                 // typed variant from `inputarg_types` so the OpRef carries
                 // RPython `box.type` (history.py:220) and matches the
                 // typed `OpRef::input_arg_typed` minted at trace start
                 // (pyre/pyre-jit-trace/src/trace.rs) under variant-aware Eq.
-                // opencoder.py:259 inputarg_from_tp(arg.type) parity:
+                // opencoder.py inputarg_from_tp(arg.type) parity:
                 // every inputarg always carries `box.type` (history.py:220);
                 // RPython has no InputArgVoid class. Strict accessor
                 // panics on missing/Void → exposes structural bookkeeping
@@ -1478,7 +1478,7 @@ impl Optimizer {
                                             );
                                         ctx.materialize_operand_at(field_ref)
                                     }
-                                    // virtualstate.py:328-354: retain the
+                                    // virtualstate.py _enum: retain the
                                     // dense unwritten element-field slot.
                                     None => Operand::None,
                                 };
@@ -1678,7 +1678,7 @@ impl Optimizer {
     }
 
     /// bridgeopt.py: deserialize_optimizer_knowledge
-    /// bridgeopt.py:170-171 optimizer.optheap.deserialize_optheap(result_struct, result_array)
+    /// bridgeopt.py optimizer.optheap.deserialize_optheap(result_struct, result_array)
     pub fn import_heap_knowledge(
         &mut self,
         result_struct: &[(OpRef, majit_ir::DescrRef, OpRef)],
@@ -2259,7 +2259,7 @@ impl Optimizer {
     ///
     /// Also folds OPT_OPS / OPT_GUARDS / OPT_GUARDS_SHARED accumulated
     /// inside `_emit_operation` / `emit_guard_operation`
-    /// (optimizer.py:626/629/673-674).  RPython publishes these
+    /// (optimizer.py/629/673-674).  RPython publishes these
     /// directly via `self.metainterp_sd.profiler.count(...)`; pyre's
     /// `Optimizer` carries no `metainterp_sd` reference and therefore
     /// piggybacks on the same deferred-fold pattern as the resumedata
@@ -2350,7 +2350,7 @@ impl Optimizer {
     }
 
     /// optimizer.py: force_box — force a virtual to be materialized.
-    /// Also pops from potential_extra_ops (optimizer.py:351-359).
+    /// Also pops from potential_extra_ops (optimizer.py).
     ///
     /// Body refs route through the preamble source directly, so the prior
     /// reverse-lookup (`imported_short_source`) 3rd key is no longer needed.
@@ -2527,7 +2527,7 @@ impl Optimizer {
         // RPython gates every dispatch on `self.is_virtual()`.  pyre's
         // variant-tag match below would otherwise re-force a non-virtual
         // `VirtualRawSlice` (post-`_force_elements`, `parent = OpRef::NONE`)
-        // every time this method is re-entered — matching info.py:464-465
+        // every time this method is re-entered — matching info.py
         // `return self.parent is not None` requires the same is_virtual
         // gate here as in the RPython base.
         if !info.is_virtual() {
@@ -2572,7 +2572,7 @@ impl Optimizer {
         // base.  `VirtualStateConstructor` has no `visit_vstr*`
         // (`walkvirtual.py` raises `NotImplementedError`), so a
         // virtual string that reaches export is a missed force.
-        // optimizer.py:311-312 routes through `optforce = self.optearlyforce`.
+        // optimizer.py routes through `optforce = self.optearlyforce`.
         if matches!(
             info,
             crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)
@@ -2673,10 +2673,10 @@ impl Optimizer {
     /// upstream `op.type == 'r' or is_raw_ptr(op)` dispatch and the
     /// `getintbound(op).getnullness()` fallback for `'i'`-typed Boxes.
     /// Returns one of `INFO_NULL` / `INFO_NONNULL` / `INFO_UNKNOWN`
-    /// (info.py:13-15).
+    /// (info.py).
     ///
     /// Takes `&mut OptContext` to mirror the upstream `getintbound`
-    /// lazy-install side effect (optimizer.py:102-112).
+    /// lazy-install side effect (optimizer.py).
     pub fn getnullness(ctx: &mut OptContext, opref: OpRef) -> i8 {
         // optimizer.py `getnullness` reads `getptrinfo` /
         // `getintbound` of an existing box; the `'r'` arm uses
@@ -2700,11 +2700,11 @@ impl Optimizer {
     /// opportunities for subsequent GUARD_CLASS ops.
     ///
     /// PyPy `InstancePtrInfo(descr, known_class, is_virtual)` is one class
-    /// (info.py:313) that covers both virtual and non-virtual instances via
+    /// (info.py) that covers both virtual and non-virtual instances via
     /// the `is_virtual` flag. The Rust port splits that into two PtrInfo
     /// enum variants — `Instance` (is_virtual=False) and `Virtual`
     /// (is_virtual=True) — for ergonomic dispatch. `isinstance(opinfo,
-    /// InstancePtrInfo)` at optimizer.py:140 is therefore true for *either*
+    /// InstancePtrInfo)` at optimizer.py is therefore true for *either*
     /// Rust variant, so both must update `_known_class` in place rather
     /// than being overwritten by a fresh known-class info (which would
     /// drop the `Virtual` fields / descr / cached_vinfo state).
@@ -2944,7 +2944,7 @@ impl Optimizer {
         #[cfg(test)]
         if self.trace_inputargs.is_empty() && num_inputs > 0 {
             // RPython InputArg variants are Int/Ref/Float only
-            // (resoperation.py:719/727/739) — Void inputargs do not exist.
+            // (resoperation.py InputArgInt/727/739) — Void inputargs do not exist.
             // VoidOp args at inputarg slots leave the slot at the Ref
             // fallback because the actual inputarg-side Box would have
             // been Int/Ref/Float per producer-side typing.
@@ -3119,7 +3119,7 @@ impl Optimizer {
         let next_after = max_input.max(max_snapshot).saturating_add(1);
         ctx.next_pos = ctx.next_pos.max(next_after);
 
-        // optimizer.py:293 patchguardop parity: propagate to Phase 2
+        // optimizer.py force_op_from_preamble patchguardop parity: propagate to Phase 2
         // OptContext so copy_and_change guards (unroll.py:409) can get
         // rd_resume_position before GUARD_FUTURE_CONDITION is re-encountered.
         if ctx.patchguardop.is_none() {
@@ -3174,7 +3174,7 @@ impl Optimizer {
             }
         }
 
-        // bridgeopt.py:124-185: apply pending bridge knowledge AFTER setup.
+        // bridgeopt.py deserialize_optimizer_knowledge: apply pending bridge knowledge AFTER setup.
         // RPython calls deserialize_optimizer_knowledge before propagate_all_forward
         // but after the optimizer is constructed (setup already done at __init__).
         if let Some(prd) = self.pending_bridge_rd.take() {
@@ -3208,7 +3208,7 @@ impl Optimizer {
             // `OpRef::input_arg_typed` /
             // `op_typed`, so its variant tag carries Box.type and the
             // side-table refresh is dead.
-            // opencoder.py:259 + unroll.py:479-504 parity: RPython's
+            // opencoder.py + unroll.py:479-504 parity: RPython's  allow-line-citation
             // TraceIterator allocates fresh InputArg Box objects for
             // each iteration, and `import_state` asserts
             // `source is not target` (unroll.py) because the fresh
@@ -3258,7 +3258,7 @@ impl Optimizer {
                      cross-loop cut over a forced heap virtual)",
                 ));
             }
-            // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: mint typed
+            // resoperation.py InputArgInt/727/739 InputArg{Int,Ref,Float}: mint typed
             // variants for each Phase 2 source slot from `inputarg_types`
             // (history.py:220 box.type). Variant-aware Eq requires the
             // OpRef minted here to match the typed `OpRef::input_arg_typed`
@@ -3362,7 +3362,7 @@ impl Optimizer {
             }
         }
 
-        // RPython optimizer.py:536-538: JUMP/FINISH always breaks the main
+        // RPython optimizer.py new_const_item: JUMP/FINISH always breaks the main
         // loop. flush() is called before JUMP is processed.
         let mut last_op = None;
         for op in ops {
@@ -3559,7 +3559,7 @@ impl Optimizer {
             }
         }
         // PyPy parity: a folded `ResOperation` keeps its Python identity
-        // through `_forwarded` links (resoperation.py:233-242); the
+        // through `_forwarded` links (resoperation.py); the
         // `optimize_peeled_loop` (compile.py) chain walk reaches it
         // via `partial_trace.operations`.
         //
@@ -3789,7 +3789,7 @@ impl Optimizer {
                         .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
                         .collect(),
                 );
-                // unroll.py:193-236: `optimize_bridge` calls `export_state`
+                // unroll.py: `optimize_bridge` calls `export_state`
                 // only in its retrace arm, after `jump_to_existing_trace`
                 // found no match. Steps (1) and (2) stay eager so that arm
                 // can read `ctx.preamble_end_args`; step (3) is published
@@ -3814,7 +3814,7 @@ impl Optimizer {
                 // the iteration into a disjoint range.  Use `num_inputs` (the
                 // external loop-entry contract count) rather than `ctx.num_inputs`
                 // (which may be widened by virtualizable expansion).
-                // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: each
+                // resoperation.py InputArgInt/727/739 InputArg{Int,Ref,Float}: each
                 // renamed inputarg's Box carries `.type` intrinsically
                 // (history.py:220). Mint typed variants from `inputarg_types`
                 // so the exported state's OpRefs match what Phase 2 will see
@@ -3890,7 +3890,7 @@ impl Optimizer {
         //   1. `propagate_from_pass_range` — incoming op args
         //      resolved via `ctx.get_box_replacement` BEFORE pass dispatch.
         //   2. `Optimizer::emit_operation` — `force_box` on every
-        //      arg unconditionally (PyPy `optimizer.py:623-625` parity).
+        //      arg unconditionally (PyPy `optimizer.py` parity).
         // After emit, args are frozen on the op. Postprocess setting
         // `box._forwarded = Const` (e.g., `make_constant` from
         // `optimize_GUARD_FALSE`) must NOT retroactively rewrite already-
@@ -3937,7 +3937,7 @@ impl Optimizer {
         //   `[start_label] + preamble_ops + extra_same_as +
         //    extra_before_label + [label_op] + loop_ops`.
         // The SameAs aliases emitted in the JUMP-arg dedup loop above
-        // (`shortpreamble.py:432-440 extra_same_as`) and any `flush()` /
+        // (`shortpreamble.py add_preamble_op extra_same_as`) and any `flush()` /
         // `drain_extra_operations_from` ops that followed are structurally
         // part of `extra_same_as`; upstream splices that list BETWEEN
         // `preamble_ops` and the label, so in pyre's single-phase flow
@@ -4355,7 +4355,7 @@ impl Optimizer {
         retrace_limit: u32,
         pending_bridge_rd: Option<PendingBridgeRd>,
         _loop_num_inputs: Option<usize>,
-        // Disjoint OpRef namespace for bridge inputargs. RPython `opencoder.py:249-273
+        // Disjoint OpRef namespace for bridge inputargs. RPython `opencoder.py TraceIterator
         // TraceIterator.__init__` allocates fresh `InputArg` Python
         // objects per iteration so bridges carry Python `is` identity
         // distinct from the parent loop's boxes. Pyre's flat
@@ -5080,7 +5080,7 @@ impl Optimizer {
             // producer is neither emitted nor in `resop_refs` —
             // `resolve_box_box_opt` returns None. `materialize_operand_at`
             // then mints and registers the canonical `_forwarded` host (the
-            // "Box always exists" invariant, resoperation.py:233) and we walk
+            // "Box always exists" invariant, resoperation.py AbstractResOpOrInputArg) and we walk
             // it to its terminal, so the stored arg is BOUND on every dispatch
             // path. A sentinel operand keeps its unbound arg box (const
             // operands resolve through the `Some` arm above).
@@ -5507,7 +5507,7 @@ impl Optimizer {
         //           op.set_forwarded(ConstInt(opinfo.get_constant_int()))
         if op_result_type == majit_ir::Type::Int {
             let replaced = ctx.get_replacement_opref(emitted);
-            // operand shim — peek_intbound_box takes an operand per optimizer.py:99-113.
+            // operand shim — peek_intbound_box takes an operand per optimizer.py getintbound.
             let bound = ctx
                 .get_box_replacement_operand_opt(emitted)
                 .as_ref()
@@ -5556,12 +5556,12 @@ impl Optimizer {
             // helper preserves existing `Instance` / `Virtual` PtrInfo
             // (fields, descr, cached_vinfo, virtual state) and only
             // refreshes `_known_class`, matching upstream
-            // `optimizer.py:137-151` where `isinstance(opinfo,
+            // `optimizer.py` where `isinstance(opinfo,
             // InstancePtrInfo)` mutates in place.
             // optimizer.py `make_constant_class` always updates
             // `_forwarded` — `materialize_operand_at` materializes the Box so the
             // write is never silently skipped. Same materializer feeds
-            // the `last_guard_pos` read; `info.py:91-103
+            // the `last_guard_pos` read; `info.py
             // get_last_guard_pos` reads the PtrInfo field (None if no
             // PtrInfo, mapped to -1 = "no guard recorded").
             let pp_obj_box = ctx.get_box_replacement_operand_opt(pp.obj);
@@ -5738,7 +5738,7 @@ impl Optimizer {
                 Vec::new()
             };
 
-            // resume.py _add_optimizer_sections + bridgeopt.py:63-122:
+            // resume.py _add_optimizer_sections + bridgeopt.py serialize_optimizer_knowledge:
             // RPython collects optimizer knowledge INSIDE
             // store_final_boxes_in_guard → finish() → serialize_optimizer_knowledge.
             // Rust adaptation: collect BEFORE the call (borrow checker) and pass
@@ -5897,7 +5897,7 @@ impl Optimizer {
         knowledge: Option<crate::resume::OptimizerKnowledgeForResume>,
         pending_setfields: Vec<majit_ir::GuardPendingFieldEntry>,
     ) {
-        // optimizer.py:732-748 + resume.py:389-452:
+        // optimizer.py is_call_pure_pure_canraise + resume.py finish:
         // RPython finish() handles virtuals without forcing.
         // _number_boxes tags virtual fail_args as TAGVIRTUAL,
         // _number_virtuals builds rd_virtuals from PtrInfo.
@@ -7866,7 +7866,7 @@ mod tests {
     /// optimizer.py `getnullness(op)` parity test.
     ///
     /// Returns the upstream INFO_NULL / INFO_NONNULL / INFO_UNKNOWN
-    /// integer constants (info.py:13-15).
+    /// integer constants (info.py).
     #[test]
     fn test_getnullness() {
         use crate::optimizeopt::{INFO_NONNULL, INFO_NULL, INFO_UNKNOWN};

@@ -573,11 +573,11 @@ pub(crate) use crate::majit_log_enabled;
 ///
 /// Two variants mirror upstream's two return paths:
 ///   - `Const(PtrInfo)` — fresh `ConstPtrInfo(op)` synthesis
-///     (info.py:870-871 / 888-889).  Upstream allocates a brand-new
+///     (info.py / 888-889).  Upstream allocates a brand-new
 ///     `ConstPtrInfo` per call; pyre carries the freshly built
 ///     `PtrInfo::Constant(_)` inline.
 ///   - `Live(Rc<RefCell<PtrInfo>>)` — the `return fw` arm
-///     (info.py:875-877 / 890-893).  Carries the live `Rc` handle
+///     (info.py / 890-893).  Carries the live `Rc` handle
 ///     into the chain terminal's `_forwarded` cell so RPython object
 ///     identity is preserved: two `Live` handles cloned from the
 ///     same cell observe each other's in-place mutations
@@ -618,7 +618,7 @@ impl PtrInfoHandle {
     /// RPython `PtrInfo.same_info(other)` parity.
     ///
     /// Base `PtrInfo.same_info` is object identity (`self is other`,
-    /// info.py:71-72), so non-constant live infos must share the same
+    /// info.py), so non-constant live infos must share the same
     /// `_forwarded` cell. `ConstPtrInfo` overrides this and compares
     /// the wrapped constant value (`_const.same_constant`, info.py),
     /// so two independently synthesized ConstPtrInfo handles for the
@@ -863,7 +863,7 @@ pub fn make_resume_at_position_descr() -> DescrRef {
     crate::compile::make_resume_at_position_descr()
 }
 
-/// optimizer.py:47-54: deferred postprocess for GUARD_CLASS/GUARD_NONNULL_CLASS.
+/// optimizer.py OptimizationResult: deferred postprocess for GUARD_CLASS/GUARD_NONNULL_CLASS.
 /// RPython's postprocess_GUARD_CLASS runs after the guard is emitted to
 /// _newoperations. In majit, recorded here by rewrite and executed by
 /// emit_operation.
@@ -895,7 +895,7 @@ impl ImportedShortPureOp {
     /// Construct with auto-generated PreambleOp from fields.
     ///
     /// `ctx` binds the replay op's operands to their canonical producers
-    /// (`materialize_operand_at`) — shortpreamble.py:425 seeds the replay
+    /// (`materialize_operand_at`) — shortpreamble.py seeds the replay
     /// `preamble_op` with the SAME Box objects the body sees, so the
     /// operands must carry producer identity, not a position-only echo.
     #[expect(
@@ -1129,7 +1129,7 @@ pub struct OptContext {
     /// innermost last. The drain moves `extra_operations_after` aside before it
     /// starts so that a nested drain only sees what was queued after it began —
     /// that is what keeps `emit_extra`'d ops ahead of the op being propagated
-    /// (`optimizer.py:594-596`) instead of ahead of everything still parked.
+    /// (`optimizer.py`) instead of ahead of everything still parked.
     ///
     /// Parked here rather than in a local so `flush_queued_producer` can still
     /// reach one entry: `info.py force_box` clears the virtual flag and
@@ -1137,7 +1137,7 @@ pub struct OptContext {
     /// allocation when the force runs from a pass, so a store can be emitted
     /// while the `NEW_WITH_VTABLE` that defines it is still parked.
     pub(crate) extra_pending: Vec<ExtraQueue>,
-    /// optimizer.py:47-54: deferred postprocess for GUARD_CLASS.
+    /// optimizer.py OptimizationResult: deferred postprocess for GUARD_CLASS.
     /// Set by rewrite pass, executed by emit_operation after the guard
     /// is added to new_operations (matching RPython's callback pattern).
     pub(crate) pending_guard_class_postprocess: Option<PendingGuardClassPostprocess>,
@@ -1320,9 +1320,9 @@ pub struct OptContext {
     pub in_final_emission: bool,
     /// effectinfo.py: CallInfoCollection — maps oopspec indices to
     /// (calldescr, func_ptr) pairs. Used by generate_modified_call
-    /// (vstring.py:853) to emit specialized string comparison calls.
+    /// (vstring.py) to emit specialized string comparison calls.
     pub callinfocollection: Option<std::sync::Arc<majit_ir::CallInfoCollection>>,
-    /// optimizer.py:732 `self.resumedata_memo`.
+    /// optimizer.py is_call_pure_pure_canraise `self.resumedata_memo`.
     ///
     /// RPython allocates one ResumeDataLoopMemo in `Optimizer.__init__` and
     /// every guard emitted by that optimizer numbers through the same object.
@@ -1342,13 +1342,13 @@ pub struct OptContext {
     pub snapshot_vable_boxes: SnapshotBoxes,
     /// resume.py:399-402 `minimum_virtualizable_size`, handed to
     /// `memo.number()` in `store_final_boxes_in_guard`. `-1` disables the
-    /// `resume.py:236-239` length check; a non-negative value arms it.
+    /// `resume.py` length check; a non-negative value arms it.
     /// Copied from `Optimizer::minimum_virtualizable_size`, which
     /// `default_pipeline_with_virtualizable` derives from the vable config.
     pub minimum_virtualizable_size: i64,
     /// Per-guard virtualref boxes from tracing-time snapshots.
     /// resume.py _number_boxes consumes vref_array as a section
-    /// after vable_array. opencoder.py:767 records vref_boxes here.
+    /// after vable_array. opencoder.py create_top_snapshot records vref_boxes here.
     pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
@@ -1364,7 +1364,7 @@ pub struct OptContext {
     /// fresh `InputArgRc`s here so the canonical host each InputArg OpRef
     /// resolves to is the same object across the run. `make_equal_to`
     /// then routes the chain step through `Forwarded::InputArg(_)`
-    /// (`optimizer.py:394 op.set_forwarded(newop)`) instead of the
+    /// (`optimizer.py op.set_forwarded(newop)`) instead of the
     /// retired orphan-box forwarding fallback.
     /// Keyed by position rather than indexed by it. A bridge's fresh label
     /// inputargs are allocated at `inputarg_base = parent_high_water`, so the
@@ -1576,7 +1576,7 @@ pub(crate) fn is_typeptr_field(
         .unwrap_or(false)
 }
 
-/// resume.py:192-226 parity — BoxEnv for optimizer context.
+/// resume.py _number_boxes parity — BoxEnv for optimizer context.
 ///
 /// Wraps an immutable reference to OptContext, implementing the BoxEnv
 /// trait so that ResumeDataLoopMemo.number() can tag boxes during
@@ -1672,7 +1672,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // type judgement). It is the non-`Option` adapter over
         // `OptContext::opref_type`, the single 5-layer `box.type`
         // resolver that mirrors upstream `AbstractValue.type`
-        // (resoperation.py:29). A VoidOp (`Some(Void)`) or a type-less
+        // (resoperation.py). A VoidOp (`Some(Void)`) or a type-less
         // OpRef (`None`) maps to the `Int` default the resume encoder
         // expects for non-typed slots.
         match self.ctx.opref_type(opref) {
@@ -1717,7 +1717,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 // full `_fields` list in descriptor order, leaving unfilled
                 // slots as `None`. Preserve that shape so `fieldnums` aligns
                 // 1:1 with `descr.get_all_fielddescrs()` for `_cached_vinfo`
-                // reuse at resume.py:307-315.
+                // reuse at resume.py make_virtual_info.
                 field_oprefs: fielddescrs
                     .iter()
                     .enumerate()
@@ -1822,7 +1822,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             PtrInfo::Str(sinfo) if sinfo.is_virtual() => {
                 use crate::optimizeopt::info::VStringVariant;
                 let field_oprefs: Vec<OpRef> = match &sinfo.variant {
-                    // vstring.py:207-208: self._chars. `None` slots represent
+                    // vstring.py _visitor_walk_recursive: self._chars. `None` slots represent
                     // unfilled positions — the resume encoder later tags those
                     // with UNINITIALIZED (matching how RPython treats missing
                     // char boxes, since STRSETITEM may not have run for every
@@ -1836,13 +1836,13 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                                 .unwrap_or(OpRef::NONE)
                         })
                         .collect(),
-                    // vstring.py:255-257: [self.s, self.start, self.lgtop].
+                    // vstring.py _visitor_walk_recursive: [self.s, self.start, self.lgtop].
                     VStringVariant::Slice(s) => vec![
                         self.ctx.get_replacement_opref(s.s.to_opref()),
                         self.ctx.get_replacement_opref(s.start.to_opref()),
                         self.ctx.get_replacement_opref(s.lgtop.to_opref()),
                     ],
-                    // vstring.py:319-324: [self.vleft, self.vright].
+                    // vstring.py _visitor_walk_recursive: [self.vleft, self.vright].
                     VStringVariant::Concat(c) => vec![
                         self.ctx.get_replacement_opref(c.vleft.to_opref()),
                         self.ctx.get_replacement_opref(c.vright.to_opref()),
@@ -2162,7 +2162,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
 
     // resume.py visit_vstrconcat → VStrConcatInfo / VUniConcatInfo
     fn visit_vstrconcat(&mut self, is_unicode: bool) -> Self::VInfo {
-        // resume.py:347-351 — visitor constructs the shell variant with
+        // resume.py visit_vstrconcat — visitor constructs the shell variant with
         // no funcptr; the decoder looks up OS_STR_CONCAT / OS_UNI_CONCAT
         // via `callinfocollection.funcptr_for_oopspec(...)` at
         // materialization time (resume.py:1467-1468 / 1494-1495).
@@ -2191,7 +2191,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
     }
 
     fn register_virtual_fields(&mut self, _virtualbox: OpRef, _fieldboxes: &[OpRef]) {
-        // resume.py:359-368 — field registration happens elsewhere in pyre
+        // resume.py register_virtual_fields — field registration happens elsewhere in pyre
         // (via resume.rs worklist + get_virtual_fields), not through the
         // visitor. This adapter is only a builder for RdVirtualInfo.
     }
@@ -2359,7 +2359,7 @@ impl OptContext {
     /// `InputArg::from_type(tp, i)` per entry of `inputarg_types`.
     ///
     /// Mirrors `TraceIterator::new` (`opencoder.rs`, parity with
-    /// `opencoder.py:259-262` `inputarg_from_tp(arg.type)`). Test fixtures
+    /// `opencoder.py` `inputarg_from_tp(arg.type)`). Test fixtures
     /// that construct via this helper exercise the optimizer's operand-direct
     /// routing — the production path.
     ///
@@ -2372,7 +2372,7 @@ impl OptContext {
             Self::with_num_inputs_and_start_pos(estimated_ops, num_inputs, 0, num_inputs as u32);
         // Seed a fresh canonical `InputArgRc` per slot so the optimizer's
         // `make_equal_to` routes an InputArg-targeted chain step through
-        // `Forwarded::InputArg(_)` (`optimizer.py:394 op.set_forwarded(newop)`).
+        // `Forwarded::InputArg(_)` (`optimizer.py op.set_forwarded(newop)`).
         // The `InputArgRc`s are stashed in `ctx.inputarg_refs` so every
         // reader of a slot resolves to the same host for the OptContext's
         // lifetime. Production traces own these via
@@ -2391,7 +2391,7 @@ impl OptContext {
         // Seed `ctx.inputargs` so strict accessors like
         // `inputarg_type_at_strict` return `Some(tp)` matching slot i. Each
         // entry is `OpRef::input_arg_typed(i, tp)` so the variant tag IS the
-        // type (resoperation.py:719/727/739).
+        // type (resoperation.py InputArgInt/727/739).
         ctx.inputargs = majit_ir::OpRef::inputarg_refs(inputarg_types);
         ctx
     }
@@ -2442,7 +2442,7 @@ impl OptContext {
         // misses. Both loops no-op when `self.inputargs` is empty
         // (`seed_boxes_canonical` fixtures populate `inputarg_refs` directly).
         // Void slots are skipped: `InputArg{Int,Ref,Float}` has no Void
-        // encoding (resoperation.py:719/727/739), so a Void sentinel in
+        // encoding (resoperation.py InputArgInt/727/739), so a Void sentinel in
         // `inputargs` is not a real input-arg host and carries no binding.
         for op in self.inputargs.clone() {
             match op.ty() {
@@ -2726,7 +2726,7 @@ impl OptContext {
     /// host (`op.forwarded` / `inputarg.forwarded`). Mirrors
     /// `resoperation.py get_forwarded` semantics
     /// but bypasses the wrapper allocation. Returns `Forwarded::None`
-    /// for constants (`resoperation.py:50` `Const._forwarded` is
+    /// for constants (`resoperation.py` `Const._forwarded` is
     /// permanently `None`), `None` for sentinel `OpRef::none()` and
     /// for ResOp positions whose producer is not in any canonical
     /// store (`new_operations` / `phase1_emit_ops` / `resop_refs`).
@@ -3163,7 +3163,7 @@ impl OptContext {
     }
 
     /// Dispatch on a `Value`'s type tag and produce a typed `*Op` OpRef
-    /// at the given position (resoperation.py:564-638
+    /// at the given position (resoperation.py IntOp
     /// IntOp/FloatOp/RefOp/VoidOp mixins).
     pub(crate) fn op_ref_for_value(pos: u32, value: &Value) -> OpRef {
         OpRef::op_typed(pos, value.get_type())
@@ -3254,7 +3254,7 @@ impl OptContext {
         }
     }
 
-    /// vstring.py:110-119 / 171-175 / 251-253 / 281-295
+    /// vstring.py getstrlen / 171-175 / 251-253 / 281-295
     /// Per-subclass getstrlen() dispatch — returns a cached lgtop OpRef if
     /// available, or computes/emits the length and caches in StrPtrInfo.lgtop.
     /// Always returns a box (OpRef), never an i64 summary.
@@ -3338,7 +3338,7 @@ impl OptContext {
         // vstring.py: lengthop.set_forwarded(self.getlenbound(mode))
         // `set_forwarded` writes the bound unconditionally; route through
         // `materialize_operand_at` so the new STRLEN/UNICODELEN box materializes for
-        // the IntBound install ("Box always exists" per resoperation.py:233-248).
+        // the IntBound install ("Box always exists" per resoperation.py).
         // operand shim for `get_str_lenbound(&Operand)`; lazy-install of
         // lenbound on the StrPtrInfo is a PtrInfo-internal mutation that
         // RPython performs on the StrPtrInfo instance directly. Route
@@ -3361,7 +3361,7 @@ impl OptContext {
 
     /// `vstring.py:117/174/293 self.lgtop = lengthop` — cache the length
     /// box in `StrPtrInfo.lgtop`. Direct PtrInfo field write,
-    /// unconditional per `info.py:432`.
+    /// unconditional per `info.py`.
     ///
     /// `op: &Operand` is the StrPtrInfo-bearing box; `lgtop: OpRef` is the
     /// length op's position, materialized to its bound producer before the
@@ -3439,7 +3439,7 @@ impl OptContext {
         // instead — a bare position read mints a fresh position-only box per
         // resolution (bind-at-alloc).
         // PyPy/RPython has no Box for positions that no `ResOperation()` /
-        // `InputArg()` call produced (`resoperation.py:233-248`).
+        // `InputArg()` call produced (`resoperation.py`).
         OpRef::op_typed(raw, tp)
     }
 
@@ -3458,7 +3458,7 @@ impl OptContext {
         // cannot be reused for a fresh op. Reads the canonical `_forwarded`
         // host for the position (`resop_refs[pos]` / `inputarg_refs[pos]`):
         // `make_constant` writes `Forwarded::Const` to that host
-        // (resoperation.py:233).
+        // (resoperation.py AbstractResOpOrInputArg).
         while self.position_is_const_forwarded(self.next_pos) {
             self.next_pos += 1;
         }
@@ -3608,7 +3608,7 @@ impl OptContext {
     /// wrap; making it the producer collapses the two-Op-per-position
     /// duplication that the `live_synthetics` catch-up otherwise bridges by
     /// copying `_forwarded` and linking input -> clone. One box per value, the
-    /// op IS the box (resoperation.py:233). Falls back to the clone path when
+    /// op IS the box (resoperation.py AbstractResOpOrInputArg). Falls back to the clone path when
     /// no structurally-matching input op is live at this position.
     pub(crate) fn emit_reusing(&mut self, op: Op) -> OpRef {
         self.emit_impl(op, true)
@@ -3700,7 +3700,7 @@ impl OptContext {
         // OptContext path remains the sole guard handler for the
         // standalone test entry point.
         //
-        // optimizer.py:639-644: side-effectful non-guard ops clear the
+        // optimizer.py: side-effectful non-guard ops clear the
         // sharing chain.  Only relevant for the OptContext-managed
         // `last_guard_idx`; in_final_emission runs use
         // `Optimizer::last_guard_op_idx` instead.
@@ -3740,7 +3740,7 @@ impl OptContext {
         // ops' operands already wrap, and the passes already wrote its
         // `_forwarded` host via `find_producer_op`, so overwriting its args with
         // the resolved operands and copying the descr makes it the single box per
-        // value (resoperation.py:233 the op IS the box). This is the structural
+        // value (resoperation.py AbstractResOpOrInputArg the op IS the box). This is the structural
         // collapse the clone path's catch-up only approximates by copying
         // `_forwarded` onto a fresh clone and redirecting input -> clone.
         // Guards used to be excluded because emit_guard_operation mutates
@@ -3797,13 +3797,13 @@ impl OptContext {
         let op_rc = OpRc::new(op);
         // Catch up any operand placeholder that `materialize_operand_at` created for
         // `op_pos` ahead of this emit (forward-reference path).
-        // `resoperation.py:233 _forwarded` lives on the operation
+        // `resoperation.py AbstractResOpOrInputArg _forwarded` lives on the operation
         // object; late binding establishes that connection so
         // subsequent `box.set_forwarded` reaches `op.forwarded`.
         //
         // The synthetic stand-in registered for `op_pos` by `materialize_operand_at` /
         // `bind_input_resops` is the `live_synthetics` entry at this position.
-        // Migrate its `_forwarded` onto the real producer (resoperation.py:233
+        // Migrate its `_forwarded` onto the real producer (resoperation.py
         // `_forwarded` lives on the op) and drop it from `live_synthetics` so
         // the superseded stand-in is not drained into `phase1_emit_ops`. Each
         // `op_pos` has at most one live stand-in, so the position match is
@@ -3836,12 +3836,12 @@ impl OptContext {
     /// mirroring `bind_input_resops`. `find_producer_op(pos)` then resolves
     /// box lookups for this position — `materialize_operand_at(pos)` and operand
     /// resolution alike — to this `OpRc`'s `_forwarded` host
-    /// (resoperation.py:233) instead of a freshly-minted stand-in, keeping a
+    /// (resoperation.py AbstractResOpOrInputArg) instead of a freshly-minted stand-in, keeping a
     /// single box identity per position. Without this, a pass that folds the
     /// dispatched op via `make_equal_to(from_bound_op(op_rc), ..)` writes the
     /// forwarding onto a private `Rc<Op>` that `find_producer_op` cannot
     /// reach, so the replacement is silently dropped (RPython needs no analog:
-    /// the op IS its box, resoperation.py:233-248).
+    /// the op IS its box, resoperation.py AbstractResOpOrInputArg).
     ///
     /// `emit`'s `live_synthetics` catch-up upgrades the binding to the real
     /// producer once the op is emitted; a folded op stays as the chain host.
@@ -3859,7 +3859,7 @@ impl OptContext {
     ///
     /// `OptUnroll.import_state` forwards a Phase-2 source to the literal carried Box,
     /// and RPython needs no analog because the op IS its box
-    /// (`resoperation.py:233-248`). pyre resolves an `OpRef` through a producer
+    /// (`resoperation.py AbstractResOpOrInputArg`). pyre resolves an `OpRef` through a producer
     /// registry instead, so a Box that reaches a rebuilt context only as a
     /// private `Rc` is invisible to `find_producer_op`; a forwarding chain
     /// ending on it leaves guard resume numbering with no producer to bind.
@@ -4896,7 +4896,7 @@ impl OptContext {
             return;
         }
 
-        // --- Sequential checks (RPython: NOT elif, all accumulate) ---
+        // Sequential checks (RPython: NOT elif, all accumulate)
 
         // unroll.py:69-74: Struct/Instance with descr → set_forwarded
         if preamble_info.get_descr().is_some() {
@@ -5391,7 +5391,7 @@ impl OptContext {
         // this rebuilt Phase-2 OptContext (`find_producer_op` miss, the
         // cross-phase resolution gap; e.g. `import_state`'s next-iteration
         // target, a heap/virtual cache entry) — is materialized to its
-        // canonical `SameAs*` stand-in (`resoperation.py:233-248` "the box
+        // canonical `SameAs*` stand-in (`resoperation.py` "the box
         // always exists"). The forward then targets a bound `Op`/`InputArg`
         // and never a position-only unbound-box redirect. An unbound
         // `newop` has no producer at its position, so it cannot alias the
@@ -5623,7 +5623,7 @@ impl OptContext {
         Operand::bound_from_opref(opref)
     }
 
-    /// "Box always exists" materializer (`resoperation.py:233-248
+    /// "Box always exists" materializer (`resoperation.py AbstractResOpOrInputArg
     /// AbstractResOpOrInputArg._forwarded`). Returns the canonical bound
     /// `_forwarded` host for `opref` as an [`Operand`] (`Op` / `InputArg`),
     /// minting a `SameAs*` synthetic into `resop_refs` when no producer is
@@ -5691,7 +5691,7 @@ impl OptContext {
                 // OpRef variant tag can disagree across a phase boundary (a
                 // Phase-2 OpRef referencing a Phase-1 low slot), so it is a
                 // fallback only when no canonical type is recorded
-                // (`resoperation.py:719/727/739` + `:233` the `_forwarded`
+                // (`resoperation.py InputArgInt/727/739` + `:233` the `_forwarded`
                 // host).
                 let idx = opref.raw();
                 let tp = self
@@ -5740,7 +5740,7 @@ impl OptContext {
     ///   but `find_producer_op` does not consult that table.
     /// - `a-producerless`: no producer Op for this position is reachable in any
     ///   OptContext-local registry — correct-as-is (an unforwarded box returns
-    ///   itself, `resoperation.py:57-68`).
+    ///   itself, `resoperation.py`).
     fn classify_s9_fallback(&self, opref: OpRef) -> &'static str {
         match opref {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
@@ -6229,7 +6229,7 @@ impl OptContext {
     /// queries `ptr_info().is_some()`.
     pub fn has_ptr_info(&self, op: &Operand) -> bool {
         // Mirror `getptrinfo(op).is_some()` so the gate behaves
-        // identically. info.py:881-885 dispatches by `op.type`: only
+        // identically. info.py dispatches by `op.type`: only
         // Int and Ref boxes can carry PtrInfo (raw-ptr Int via
         // `getrawptrinfo`, regular Ref via `getptrinfo`). Float and
         // Void return None / are rejected upstream — short-circuit
@@ -6259,7 +6259,7 @@ impl OptContext {
     /// has any forwarding entry (Op, Info, IntBound, Const).
     ///
     /// `Const.get_forwarded()` returns `None` in RPython
-    /// (`resoperation.py:1162`); short-circuit on the const-namespace
+    /// (`resoperation.py`); short-circuit on the const-namespace
     /// `OpRef` so the caller doesn't index a raw-keyed store with a
     /// CONST_BIT `raw()` — which would either miss (large-index) or
     /// alias an unrelated slot.
@@ -6283,7 +6283,7 @@ impl OptContext {
     /// redirect case used by `import_state`.
     ///
     /// `Const.get_forwarded()` returns `None` upstream
-    /// (`resoperation.py:1162`); short-circuit on the const-namespace
+    /// (`resoperation.py`); short-circuit on the const-namespace
     /// `OpRef` so the caller doesn't index a raw-keyed store with a
     /// CONST_BIT `raw()`.
     pub fn has_op_forwarding(&self, op: &Operand) -> bool {
@@ -6298,7 +6298,7 @@ impl OptContext {
 
     /// Bulk-seed entry for the recorder / backend constant import. NOT a
     /// substitute for the RPython `make_constant(box, constbox)`
-    /// (`optimizer.py:413`); production optimizer-time const promotions
+    /// (`optimizer.py`); production optimizer-time const promotions
     /// must go through `OptContext::make_constant_box`, which overwrites any
     /// existing forwarding per upstream.
     ///
@@ -6348,7 +6348,7 @@ impl OptContext {
         &self,
         opref: OpRef,
     ) -> Option<crate::optimizeopt::intutils::IntBound> {
-        // optimizer.py:99-100: assert op.type == 'i'
+        // optimizer.py getintbound: assert op.type == 'i'
         // None is allowed for test fixtures that don't seed value_types.
         assert!(
             matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
@@ -6385,7 +6385,7 @@ impl OptContext {
     ///     terminal (line 102-103).
     ///   - `IntBoundHandle::Const(unbounded)` when the terminal carries
     ///     a non-IntBound `_forwarded` slot (raw-pointer Int with
-    ///     PtrInfo etc.; `optimizer.py:106` non-IntBound `fw` branch).
+    ///     PtrInfo etc.; `optimizer.py` non-IntBound `fw` branch).
     ///   - `IntBoundHandle::Live(rc)` for an existing
     ///     `OpInfo::IntBound(rc)` slot, **or** a freshly installed
     ///     `unbounded` cell when the slot was `Forwarded::None` —
@@ -6516,7 +6516,7 @@ impl OptContext {
     {
         use crate::optimizeopt::info::OpInfo;
         use majit_ir::forwarding::Forwarded;
-        // optimizer.py:99-100: assert op.type == 'i'. Active in release
+        // optimizer.py getintbound: assert op.type == 'i'. Active in release
         // builds per upstream. Void-typed phantoms (`materialize_operand_at` lazy-alloc)
         // are accepted because they are placeholder boxes pending recorder
         // typing — their chain walk may still terminate at an int-typed
@@ -6566,7 +6566,7 @@ impl OptContext {
         f(&mut tmp)
     }
 
-    /// `Operand` form of [`OptContext::make_constant_box`]. optimizer.py:413
+    /// `Operand` form of [`OptContext::make_constant_box`]. optimizer.py make_constant
     /// `make_constant(box, constbox)` does `box = get_box_replacement(box)` then
     /// forwards the constant; this takes that first resolve operand-native via
     /// `resolve_operand_operand_opt` instead of collapsing the operand to an `OpRef`.
@@ -7183,7 +7183,7 @@ impl OptContext {
         //                                  [op.getarg(0)], descr)
         // — produce a fresh op with new opcode and trimmed args, descr
         // unchanged.  copy_and_change preserves fail_args / rd_resume_position
-        // / fail_arg_types for guard ops (resoperation.py:498-503).
+        // / fail_arg_types for guard ops (resoperation.py).
         Some(op.copy_and_change(new_opcode, Some(&[arg0]), None))
     }
 
@@ -7548,7 +7548,7 @@ impl OptContext {
         }
 
         // resume.py: delegate to ResumeDataVirtualAdder.finish()
-        // resume.py:403-405 passes `minimum_virtualizable_size` here, which
+        // resume.py passes `minimum_virtualizable_size` here, which
         // arms the `resume.py` length check inside `number()`. This
         // call site used to hardcode `-1`, so the check — ported faithfully in
         // `resume.rs::number` — was disabled for every guard ever numbered,
@@ -7830,9 +7830,9 @@ impl OptContext {
     /// `loop_arg - 1` into `preamble_entry - 2`), a box the loop header
     /// does not carry per-iteration.
     pub fn get_producing_op(&self, op: &Operand) -> Option<Op> {
-        // resoperation.py:233 `_forwarded` host: a box's producing op is its
+        // resoperation.py AbstractResOpOrInputArg `_forwarded` host: a box's producing op is its
         // bound op (set at emit, mod.rs bind_op before new_operations.push).
-        // Walk the forwarding chain first (resoperation.py:58) so the
+        // Walk the forwarding chain first (resoperation.py get_box_replacement) so the
         // replacement box's producer is read.
         let producer = op.get_box_replacement(false).bound_op()?;
         // optimizer.py `op in self._emittedoperations` — keyed by the
@@ -8026,7 +8026,7 @@ impl OptContext {
     /// only caller), matching upstream's architectural invariant:
     /// *"if cpu.supports_guard_gc_type is false, we can't really do
     /// this check at all, but then we don't unroll in that case"*
-    /// (optimizer.py:822-825).
+    /// (optimizer.py).
     ///
     /// Caller-invariant violations (missing box, descr, wrong Value
     /// variant) panic — upstream would `AttributeError`.
@@ -8252,7 +8252,7 @@ impl OptContext {
     pub fn opref_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
         let resolved = self.get_replacement_opref(opref);
         // 0. Inputarg slot (recorder-side `InputArg{Int,Ref,Float}.tp`,
-        //    history.py:220 parity per resoperation.py:719/727/739).
+        //    history.py:220 parity per resoperation.py InputArgInt/727/739).  allow-line-citation
         //    `inputarg_types[idx]` is the canonical Box.type source
         //    for slot positions — a cross-phase caller that minted the
         //    OpRef with `input_arg_int(idx)` for a Ref-typed slot would
@@ -8341,7 +8341,7 @@ impl OptContext {
     /// Const at construction time only.  Retiring this helper requires
     /// stamping the type onto the InputArg producer so an `Operand::type_()`
     /// read on an existing producer is sufficient.  Until then this lookup
-    /// is the read-only counterpart of `resoperation.py:719/727/739
+    /// is the read-only counterpart of `resoperation.py/727/739
     /// InputArg{Int,Ref,Float}.type` — it must not materialize a fresh
     /// operand, because the materialization path (`materialize_operand_at`)
     /// keys the new operand's type off the OpRef variant tag and a Phase 2
@@ -8528,7 +8528,7 @@ impl OptContext {
     /// ```
     /// The Int arm delegates to `getrawptrinfo` per `info.py`.
     /// The Float arm short-circuits to `None`. The Void arm panics —
-    /// `info.py:885 assert op.type == 'r'` rejects Void boxes outright;
+    /// `info.py assert op.type == 'r'` rejects Void boxes outright;
     /// no synthetic Void filler box exists that would smuggle a
     /// type-erased pointer through this helper.
     pub fn getptrinfo(&self, op: &Operand) -> Option<PtrInfo> {
@@ -8632,7 +8632,7 @@ impl OptContext {
         runtime_box: OpRef,
         descr: &majit_ir::descr::DescrRef,
     ) -> Option<OpRef> {
-        // virtualstate.py:48-55 `cpu.bh_getfield_gc_*(struct, descr)` reads the
+        // virtualstate.py get_runtime_field `cpu.bh_getfield_gc_*(struct, descr)` reads the
         // field off the *struct* the runtime box points at. RPython's runtime
         // box is always an eagerly allocated object, so `getref_base()` yields
         // a concrete pointer. Under pyre's lazy boxing the runtime box can be
@@ -8646,7 +8646,7 @@ impl OptContext {
         if let Some(opref) = self.get_virtual_runtime_field(runtime_box, descr) {
             return Some(opref);
         }
-        // virtualstate.py:39 `box.getref_base()` — concrete Ref read.
+        // virtualstate.py get_runtime_item `box.getref_base()` — concrete Ref read.
         // `runtime_value_of` cascades const_pool → stamped operand value
         // (RPython `InputArg*.value` analog).
         let raw = match self.runtime_value_of(runtime_box)? {
@@ -8690,7 +8690,7 @@ impl OptContext {
 
     /// Lazy-boxing companion to `get_runtime_field` / `get_runtime_interiorfield`.
     ///
-    /// virtualstate.py:48-55 reads `cpu.bh_getfield_gc_*(struct, descr)` off the
+    /// virtualstate.py reads `cpu.bh_getfield_gc_*(struct, descr)` off the
     /// eagerly allocated struct the runtime box points at. When `runtime_box`
     /// resolves to an unmaterialized `PtrInfo::Virtual` / `VirtualStruct`
     /// instead of a concrete pointer (pyre keeps W_IntObject counters as
@@ -8729,7 +8729,7 @@ impl OptContext {
             }
             _ => return None,
         };
-        // virtualstate.py:48-55: the read produces a fresh InputArg* carrying
+        // virtualstate.py get_runtime_field: the read produces a fresh InputArg* carrying
         // the concrete field value. `runtime_value_of` reads the field box's
         // own observed value (the setfield_gc source's stamped value); wrap it
         // in the matching const OpRef.
@@ -8771,7 +8771,7 @@ impl OptContext {
         self.const_opref_from_runtime_value(field_opref)
     }
 
-    /// virtualstate.py:48-55 tail: wrap the field box's observed runtime value
+    /// virtualstate.py get_runtime_field tail: wrap the field box's observed runtime value
     /// (`runtime_value_of`, the `InputArg*.value` analog) in a fresh const OpRef
     /// matching the `InputArg{Int,Float,Ref}` the concrete `bh_getfield_gc_*`
     /// read would produce. Returns `None` for an unobserved or void slot.
@@ -8813,7 +8813,7 @@ impl OptContext {
         descr: &majit_ir::descr::DescrRef,
         i: usize,
     ) -> Option<OpRef> {
-        // virtualstate.py:39 `box.getref_base()` — concrete Ref read.
+        // virtualstate.py get_runtime_item `box.getref_base()` — concrete Ref read.
         // `runtime_value_of` cascades const_pool → stamped operand value
         // (RPython `InputArg*.value` analog).
         let raw = match self.runtime_value_of(runtime_box)? {
@@ -8888,7 +8888,7 @@ impl OptContext {
         if let Some(opref) = self.get_virtual_runtime_interiorfield(runtime_box, descr, i) {
             return Some(opref);
         }
-        // virtualstate.py:39 `box.getref_base()` — concrete Ref read.
+        // virtualstate.py get_runtime_item `box.getref_base()` — concrete Ref read.
         // `runtime_value_of` cascades const_pool → stamped operand value
         // (RPython `InputArg*.value` analog).
         let raw = match self.runtime_value_of(runtime_box)? {
@@ -8942,7 +8942,7 @@ impl OptContext {
     /// (`box.getref_base()` parity) and dispatches `cpu.cls_of_box(raw)`
     /// through the `Cpu` trait object stored at `self.cpu`.  Falls back
     /// to the resolved box's per-type mixin slot (`RefOp._resref`,
-    /// resoperation.py:612) when the forwarding chain has no terminal Const
+    /// resoperation.py) when the forwarding chain has no terminal Const
     /// — live `InputArgRef` boxes with a tracer-recorded concrete value
     /// reach the typeptr deref through a synthetic Const wrapper.
     /// Returns `None` when neither path produces a non-null gcref
@@ -9009,7 +9009,7 @@ impl OptContext {
     /// ```
     ///
     /// Returns one of `INFO_NULL` / `INFO_NONNULL` / `INFO_UNKNOWN`
-    /// (info.py:13-15) so callers can compare directly against the
+    /// (info.py) so callers can compare directly against the
     /// upstream constants.
     ///
     /// The `Type::Int` arm inlines `getintbound` (optimizer.py)
@@ -9033,7 +9033,7 @@ impl OptContext {
         if matches!(tp, majit_ir::Type::Ref) || self.is_raw_ptr(op) {
             // optimizer.py:129-132 with info.py `getptrinfo` inlined.
             //
-            // info.py:886-893: `r`-typed: walk the chain, synthesize
+            // info.py: `r`-typed: walk the chain, synthesize
             // `ConstPtrInfo` for `ConstPtr`, else return the forwarded slot.
             // For `Type::Int` raw-pointer entries (this branch when
             // `is_raw_ptr(op)` returned true), the forwarded slot is a
@@ -9061,7 +9061,7 @@ impl OptContext {
             // optimizer.py `getintbound` inlined operand-direct.
             // optimizer.py: op = get_box_replacement(op) — already
             // walked above (`resolved` shadows here for parity).
-            // optimizer.py:102-103: if isinstance(op, ConstInt): from_constant
+            // optimizer.py: if isinstance(op, ConstInt): from_constant
             if let Some(Value::Int(v)) = resolved.const_value() {
                 return crate::optimizeopt::intutils::IntBound::from_constant(v).getnullness();
             }
@@ -9184,7 +9184,7 @@ impl OptContext {
     /// boxes — there's no `_get_info` to call), and also when a constant
     /// pointer resolves to a null `gcref`. In the null case it additionally
     /// records a deferred `InvalidLoop` signal on the context, mirroring
-    /// `info.py:720-721`:
+    /// `info.py`:
     ///
     /// ```python
     /// def _get_info(self, descr, optheap):
@@ -9254,10 +9254,10 @@ impl OptContext {
         self.const_infos.get_mut(&gcref.0)
     }
 
-    /// Box-native form of `get_const_info_mut` (info.py:715-726
+    /// Box-native form of `get_const_info_mut` (info.py make_guards
     /// `ConstPtrInfo._get_info`): the caller holds the (canonical) struct
     /// box. Creates a `StructPtrInfo(parent_descr)` on miss; raises
-    /// `InvalidLoop` on a null constant base (info.py:720-721).
+    /// `InvalidLoop` on a null constant base (info.py).
     pub fn get_const_info_mut_box(
         &mut self,
         op: &Operand,
@@ -9321,11 +9321,11 @@ impl OptContext {
         self.get_const_info_array_mut_box(&op, descr)
     }
 
-    /// Box-native form of `get_const_info_array_mut` (info.py:728-735
+    /// Box-native form of `get_const_info_array_mut` (info.py _get_array_info
     /// `ConstPtrInfo._get_array_info`): the caller holds the (canonical)
     /// array box, so `getptrinfo` chain-walks it directly. Creates an
     /// `ArrayPtrInfo(descr)` with a `nonnegative` lenbound on miss; raises
-    /// `InvalidLoop` on a null constant base (info.py:730-731).
+    /// `InvalidLoop` on a null constant base (info.py).
     pub fn get_const_info_array_mut_box(
         &mut self,
         op: &Operand,
@@ -9827,7 +9827,7 @@ impl OptContext {
 
     /// rewrite.py:434-435: isinstance(old_guard_op.getdescr(),
     /// compile.ResumeAtPositionDescr).
-    /// guard_pos is a _newoperations index (info.py:100-103).
+    /// guard_pos is a _newoperations index (info.py get_last_guard).
     pub fn is_resume_at_position_guard(&self, guard_pos: i32) -> bool {
         if self.new_operations_drained || guard_pos < 0 {
             return false;
@@ -10059,9 +10059,9 @@ mod boxref_forwarding_tests {
     }
 
     /// `make_equal_to(old, new)` plants an `InputArg`-target chain step on
-    /// `old`'s `_forwarded` slot (`optimizer.py:394 op.set_forwarded(newop)`
+    /// `old`'s `_forwarded` slot (`optimizer.py op.set_forwarded(newop)`
     /// — `newop` is an `AbstractInputArg` here), and `get_box_replacement`
-    /// (`resoperation.py:57-68`) walks to an operand bound to `new`'s
+    /// (`resoperation.py`) walks to an operand bound to `new`'s
     /// `AbstractInputArg` identity. The walker materialises a transient
     /// operand wrapping the same `InputArgRc`, so identity is checked via
     /// the bound handle, not outer `Rc<Box>` pointer equality.
@@ -10252,7 +10252,7 @@ mod boxref_forwarding_tests {
     /// a `Forwarded::Const(constval)` target, `is_constant()` on the
     /// terminal box reports True. Covers both encodings of "this slot is
     /// a known constant": (a) Const-namespace OpRef terminus, and (b)
-    /// `Forwarded::Const(constval)` produced by `optimizer.py:432
+    /// `Forwarded::Const(constval)` produced by `optimizer.py
     /// set_forwarded(constbox)` — equivalent to RPython's single
     /// `is_constant()` predicate after `get_box_replacement`.
     #[test]
@@ -10341,7 +10341,7 @@ mod boxref_forwarding_tests {
     }
 
     /// `make_equal_to(old, ConstX)` mirrors onto `old_box.set_forwarded_const(
-    /// const_value)`. Per RPython parity (`optimizer.py:393`,
+    /// const_value)`. Per RPython parity (`optimizer.py`,
     /// `history.py` ConstInt construction), the const target is built
     /// fresh from `const_pool[const_index]` per call site — no dedup, value
     /// equality via `same_constant`. The mirror must record the same Value
@@ -10538,7 +10538,7 @@ mod boxref_forwarding_tests {
 
     /// With a forwarding chain installed via `make_equal_to`, the
     /// operand walker reaches the terminal Box (`b1`). RPython parity:
-    /// `optimizer.py:393 box.set_forwarded(newop)` → reader walks until
+    /// `optimizer.py box.set_forwarded(newop)` → reader walks until
     /// `Forwarded::None` and returns the last Box. The walker materialises
     /// a transient operand wrapping `b1`'s bound `InputArgRc`, so terminal
     /// identity is checked via the shared `InputArg` handle rather than
@@ -11412,7 +11412,7 @@ mod constant_ptr_info_tests {
     }
 
     /// `Value::Int(0)` reaches `getrawptrinfo` as `ConstPtrInfo(NULL)`
-    /// per `info.py:870-871`, then trips the null-constant InvalidLoop
+    /// per `info.py`, then trips the null-constant InvalidLoop
     /// protection at `get_const_info_mut`. Mirrors the `Value::Ref(0)`
     /// case — null-pointer protection is uniform regardless of the
     /// underlying constant tag.
@@ -11632,7 +11632,7 @@ mod ensure_ptr_info_arg0_tests {
     /// returns `info.ConstPtrInfo(arg0)` regardless of the box's exact type.
     /// majit's port mirrors that by returning `Constant(GcRef(bits))`; null
     /// or unsafe pointers are filtered downstream by `_get_info`'s null
-    /// protection (info.py:719-720).
+    /// protection (info.py).
     #[test]
     fn ensure_ptr_info_arg0_returns_constant_for_value_int() {
         // optimizer.py:465-466 PyPy parity: even Value::Int seeded at the

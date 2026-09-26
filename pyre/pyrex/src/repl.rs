@@ -624,7 +624,7 @@ fn compile_repl_input(
     continuing_block: bool,
 ) -> ShellCompileAction {
     // `generate_tokens` normalizes every line it takes, on every platform and
-    // for a lone `\r` as well (`pytokenizer.py:654-662`), so the shell hands the
+    // for a lone `\r` as well (`pytokenizer.py`), so the shell hands the
     // compiler the same shape a script would rather than a windows-only
     // `\r\n` rewrite.
     let source = &*pyre_interpreter::universal_newline(source);

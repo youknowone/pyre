@@ -23,7 +23,7 @@
 
 use std::fmt;
 
-/// RPython `TyperError(Exception)` hierarchy (error.py + rmodel.py:397).
+/// RPython `TyperError(Exception)` hierarchy (error.py + rmodel.py BrokenReprTyperError).
 ///
 /// The three upstream subclasses correspond to enum variants. `where`
 /// is a structured annotation upstream stores on the exception via

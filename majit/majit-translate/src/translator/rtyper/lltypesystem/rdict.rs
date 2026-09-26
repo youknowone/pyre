@@ -300,7 +300,7 @@ fn get_ll_dictiter(dictptr: LowLevelType) -> LowLevelType {
 }
 
 /// RPython `class DictIteratorRepr(AbstractDictIteratorRepr)`
-/// (`lltypesystem/rdict.py:693`).
+/// (`lltypesystem/rdict.py`).
 #[derive(Debug)]
 pub struct DictIteratorRepr {
     pub base: AbstractDictIteratorRepr,

@@ -1,8 +1,8 @@
 //! Float/complex `repr` residual-call retargets.
 //!
 //! The two arms mirror `float2string` / `float_repr`
-//! (`pypy/objspace/std/floatobject.py:36-50`) and `repr_format` /
-//! `format_float` (`pypy/objspace/std/complexobject.py:120-133`).  Neither
+//! (`pypy/objspace/std/floatobject.py`) and `repr_format` /
+//! `format_float` (`pypy/objspace/std/complexobject.py`).  Neither
 //! ports `rpython.rlib.rfloat.formatd` itself: upstream reaches it only
 //! indirectly (`float_repr` -> `float2string` -> `formatd`, and only on the
 //! `isfinite` branch), while these arms retarget RustPython/pyre formatters.

@@ -1,7 +1,7 @@
 /// JIT-enabled TLA interpreter via `#[jit_interp]` with `state_fields`.
 ///
 /// RPython parity: tla.py Frame `_virtualizable_ = ['stackpos', 'stack[*]']`
-/// (tla.py:98). Integer-only trace — strings cause trace abort.
+/// (tla.py). Integer-only trace — strings cause trace abort.
 ///
 /// Greens: [pc, bytecode]
 /// Reds:   [stackpos, stack]  (tracked via state_fields)

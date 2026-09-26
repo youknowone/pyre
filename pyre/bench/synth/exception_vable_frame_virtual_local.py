@@ -13,7 +13,7 @@
 # trace's virtualizable and its locals live in registers. The raise exits the
 # trace, and the exit emits `gen_store_back_in_vable` — a `SETFIELD_GC` per
 # static field plus a `SETARRAYITEM_GC` per slot of `locals_cells_stack_w`
-# (`rpython/jit/metainterp/pyjitpl.py:3489-3520`). `marker` holds a virtual
+# (`rpython/jit/metainterp/pyjitpl.py`). `marker` holds a virtual
 # `W_IntObject`, so its slot store was the one dropped at the heap optimizer's
 # flush; `i` and `odd_only` came from input args and survived. The traceback
 # node then names a frame whose only bound slot is the parameter.

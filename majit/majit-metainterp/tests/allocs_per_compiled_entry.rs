@@ -70,9 +70,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use majit_metainterp::JitDriver;
 
-// ---------------------------------------------------------------------------
 // the meter
-// ---------------------------------------------------------------------------
 
 std::thread_local! {
     /// Allocations made by THIS thread. `const`-initialised and holding a
@@ -238,9 +236,7 @@ fn local_allocs() -> u64 {
     LOCAL_ALLOCS.with(Cell::get)
 }
 
-// ---------------------------------------------------------------------------
 // what the entry hook records
-// ---------------------------------------------------------------------------
 
 /// Entries seen since the last [`reset_entries`].
 static ENTRIES: AtomicU64 = AtomicU64::new(0);
@@ -275,9 +271,7 @@ fn window() -> (u64, u64) {
     (entries, spanned)
 }
 
-// ---------------------------------------------------------------------------
 // the GC
-// ---------------------------------------------------------------------------
 
 /// Install the process GC, because WHERE the jitframe comes from is part of
 /// the configuration this file measures.
@@ -326,9 +320,7 @@ fn install_gc() {
     majit_backend_dynasm::runner::install_gc_standalone();
 }
 
-// ---------------------------------------------------------------------------
 // the fixture: one machine, one persistent driver
-// ---------------------------------------------------------------------------
 
 pub type Bytecode = [u8];
 
@@ -423,9 +415,7 @@ fn expected() -> i64 {
     N * (N + 1) / 2
 }
 
-// ---------------------------------------------------------------------------
 // report
-// ---------------------------------------------------------------------------
 
 fn backend() -> &'static str {
     if cfg!(feature = "cranelift") {
@@ -484,7 +474,7 @@ fn main() {
          reported from here would be about neither."
     );
 
-    // ---- the counted window -------------------------------------------
+    // the counted window
     const CALLS: usize = 256;
     reset_entries();
     let before_local = local_allocs();
@@ -497,7 +487,7 @@ fn main() {
         (GLOBAL_ALLOCS.load(Ordering::Relaxed) - before_global).saturating_sub(call_allocs);
     let (entries, spanned) = window();
 
-    // ---- the attribution window ---------------------------------------
+    // the attribution window
     // Separate and short: symbolizing a backtrace per allocation costs far
     // more than the entry it describes, so a counted window run this way
     // would be measuring the profiler.
@@ -626,13 +616,13 @@ fn main() {
 /// - `majit_backend::jitframe::alloc_off_gc_jitframe`, the JITFRAME itself.
 ///   `malloc_jitframe` allocates under the descr's JITFRAME type id, and this
 ///   fixture registers the shape ([`install_gc`]), so the frame is a
-///   `nursery_free` bump (`jitframe.py:48-52`) and costs the process
+///   `nursery_free` bump (`jitframe.py`) and costs the process
 ///   allocator nothing — the same row cranelift lost when its frame moved to
 ///   the nursery.
 ///
 /// - `raw_values`, a copy of every jitframe slot taken because
 ///   `DynasmBackend::execute_token` freed the frame before returning.
-///   `llmodel.py:240-250` reads those slots out of the frame itself, so the
+///   `llmodel.py` reads those slots out of the frame itself, so the
 ///   copy had no upstream counterpart; the frame now lives as long as the
 ///   deadframe does and the accessors read it in place.
 /// - the `Box` inside `DeadFrame::Boxed` holding the deadframe
@@ -641,7 +631,7 @@ fn main() {
 ///   boundary: `majit-backend` could not name a type declared in
 ///   `majit-backend-dynasm`. That constraint has no upstream counterpart —
 ///   `llsupport/jitframe.py` sits below every machine backend and
-///   `llmodel.py:271` names `jitframe.JITFRAMEPTR` directly — so the deadframe
+///   `llmodel.py` names `jitframe.JITFRAMEPTR` directly — so the deadframe
 ///   type moved down into `majit-backend` and `DeadFrame` holds it by value in
 ///   a variant of its own.
 ///
@@ -651,23 +641,23 @@ fn main() {
 /// It used to add four. The four that went:
 ///
 /// - `deadframe_from_jitframe` — the `Box<JitFrameDeadFrame>` inside
-///   `DeadFrame`. The box was not the `llmodel.py:240` `cast_opaque_ptr` it was
+///   `DeadFrame`. The box was not the `llmodel.py` `cast_opaque_ptr` it was
 ///   annotated as; it was a PIN. The deadframe's frame pointer was rooted by
 ///   registering the address of the field holding it, and a field address is
 ///   only a valid root while its owner stays put, so the owner had to be given
 ///   a fixed address before it could be returned. The pointer now lives in a
-///   root slot addressed by POSITION (`shadowstack.py:100-106`), which the
+///   root slot addressed by POSITION (`shadowstack.py push_stack`), which the
 ///   collector rewrites in place, so the holder may move and `DeadFrame` holds
 ///   the frame by value.
 /// - `CraneliftBackend::execute_token_with_dispatch_key` unwrapped the
 ///   metainterp's `&[Value]` into an owned `Vec<i64>` before the frame
-///   existed. `llmodel.py:306-315` unwraps each argument *at* the store into
+///   existed. `llmodel.py` unwraps each argument *at* the store into
 ///   its frame slot, so upstream never holds a second list; the arguments are
 ///   now handed down as `FrameInputs::Values` and unwrapped against the frame.
 /// - `JitExecResult::extract_outputs` copied every exit slot out of the frame
 ///   on every exit, and the only two consumers are branches — the
 ///   CALL_ASSEMBLER sentinel, which reads slot 0, and external-JUMP re-entry.
-///   `llmodel.py:240-250` reads slots out of the frame through the accessors,
+///   `llmodel.py` reads slots out of the frame through the accessors,
 ///   so the copy is now taken only where it is consumed. This is the same
 ///   removal `raw_values` got on dynasm.
 /// - `<i64 as SpecFromElem>::from_elem`, the `Vec<i64>` behind

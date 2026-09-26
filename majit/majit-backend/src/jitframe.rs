@@ -31,7 +31,7 @@ pub const NULLGCMAP: *const u8 = std::ptr::null();
 
 /// RPython JITFRAMEINFO — per-compiled-loop metadata.
 ///
-/// jitframe.py:30-40
+/// jitframe.py
 /// ```python
 /// JITFRAMEINFO = lltype.Struct('JITFRAMEINFO',
 ///     ('jfi_frame_depth', lltype.Signed),
@@ -121,7 +121,7 @@ impl JitFrameInfo {
             .fetch_max(new_depth, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// jitframe.py:24-26 — `jitframeinfo_clear` assigns both words.
+    /// jitframe.py — `jitframeinfo_clear` assigns both words.
     pub fn clear(&self) {
         self.jfi_frame_size
             .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -138,7 +138,7 @@ pub type JitFrameInfoPtr = *const JitFrameInfo;
 
 /// RPython JITFRAME — the GC-managed frame for compiled code.
 ///
-/// jitframe.py:61-91
+/// jitframe.py
 /// ```python
 /// JITFRAME = GcStruct('JITFRAME',
 ///     ('jf_frame_info', Ptr(JITFRAMEINFO)),
@@ -253,12 +253,12 @@ fn off_gc_layout(total: usize) -> Option<std::alloc::Layout> {
 
 /// Allocate a JITFRAME outside the GC, with the header word in front of it.
 ///
-/// `jitframe.py:48` allocates every frame through the GC, so upstream's
+/// `jitframe.py` allocates every frame through the GC, so upstream's
 /// compiled code always holds a frame that has a header behind it. Pyre also
 /// builds frames off the GC — [`malloc_jitframe`] under a descr with no
 /// `JITFRAME` type id, the class `shadow_stack::register_libc_jitframe`
 /// tracks — and compiled code cannot tell the two apart.
-/// `_reload_frame_if_necessary` (`aarch64/assembler.py:967-980`) re-applies
+/// `_reload_frame_if_necessary` (`aarch64/assembler.py`) re-applies
 /// the non-array write-barrier fast path to the current frame after every
 /// collecting call, and that fast path loads the flag byte at
 /// `jit_wb_if_flag_byteofs`, which is *negative* (`gc.py:285-293` measures it
@@ -420,9 +420,9 @@ pub fn malloc_entry_jitframe(
     }
 }
 
-/// `llmodel.py:298` `frame = self.gc_ll_descr.malloc_jitframe(frame_info)`,
-/// reached through `GcLLDescription.malloc_jitframe` (gc.py:132) and
-/// `jitframe_allocate` (`jitframe.py:48`).
+/// `llmodel.py` `frame = self.gc_ll_descr.malloc_jitframe(frame_info)`,
+/// reached through `GcLLDescription.malloc_jitframe` (gc.py) and
+/// `jitframe_allocate` (`jitframe.py`).
 ///
 /// The descr decides where the frame lives: under its `JITFRAME` type id it
 /// is a collector object [`jitframe_prefer_oldgen`] places — nursery, like
@@ -568,7 +568,7 @@ pub fn jitframe_write_barrier(gc: &mut dyn majit_gc::GcAllocator, frame: *mut Ji
 /// have the collector copy frames under the wrong layout. A collector without
 /// a table is exempt: it has no shape to name, and its frames are host
 /// blocks. Registering here instead would mint an id in a table the frontend
-/// may already have frozen (`gctypelayout.py:393-398`).
+/// may already have frozen (`gctypelayout.py encode_type_shapes_now`).
 pub fn check_jitframe_descr(gc: &dyn majit_gc::GcAllocator) {
     if !gc.has_type_registry() {
         return;
@@ -588,7 +588,7 @@ pub fn check_jitframe_descr(gc: &dyn majit_gc::GcAllocator) {
 }
 
 /// The descr in force when no collector is installed: `GcLLDescr_boehm`
-/// (gc.py:151), which `get_ll_description(None)` (gc.py:653) selects.
+/// (gc.py), which `get_ll_description(None)` (gc.py) selects.
 ///
 /// Non-moving, no type table, `supports_guard_gc_type = False`. Its only
 /// job is [`malloc_jitframe`]'s host arm; compiled code under it allocates
@@ -749,7 +749,7 @@ impl JitFrame {
 
 /// GC trace callback for JitFrame.
 ///
-/// jitframe.py:104-136 — traces fixed GCREF fields then walks
+/// jitframe.py jitframe_trace — traces fixed GCREF fields then walks
 /// the gcmap bitmap to find Ref-typed jf_frame slots.
 ///
 /// `trace_callback` is called for each GCREF slot address that the
@@ -894,18 +894,18 @@ pub fn jitframe_prefer_oldgen() -> bool {
 /// llmodel.py realloc_frame`.
 ///
 /// The assembler-emitted `_frame_realloc_slowpath`
-/// (`aarch64/assembler.py:434-493`) calls this helper after
+/// (`aarch64/assembler.py build_frame_realloc_slowpath`) calls this helper after
 /// `_check_frame_depth` (`aarch64/assembler.py`) detects
 /// `jf_frame.length < expected_depth`.
 ///
 /// `alloc` is a raw allocator: given `size_bytes` it must return a
 /// zero-filled `*mut JitFrame` payload whose GC header is registered
 /// with the jitframe custom-trace hook. `write_barrier` covers `new_jf`
-/// (`llmodel.py:150`) — the generational barrier for the copied
+/// (`llmodel.py`) — the generational barrier for the copied
 /// `jf_frame` / `jf_savedata` / `jf_guard_exc` stores.
 ///
 /// It does **not** cover `old_jf`. `frame.jf_forward = new_frame`
-/// (`llmodel.py:141`) is an ordinary GC-struct field assignment, so upstream's
+/// (`llmodel.py`) is an ordinary GC-struct field assignment, so upstream's
 /// framework transform emits a barrier for it too; this helper writes it raw.
 /// The one caller today (`dynasm_realloc_frame`) allocates frames off the GC
 /// heap through `alloc_off_gc_jitframe` and passes a shadow-stack registration

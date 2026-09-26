@@ -906,7 +906,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
     }
 
     // An `OpRef::None` register is an ABSENT BOX, not an unresolved one: the
-    // walk never defined this color.  `blackhole.py:1711-1730
+    // walk never defined this color.  `blackhole.py _copy_data_from_miframe
     // _copy_data_from_miframe` copies a register only `if box`, so upstream
     // leaves the blackhole's slot exactly as unset as the MIFrame's, and the
     // drive cannot read it — every path that reaches this coordinate with the
@@ -1902,7 +1902,7 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 discard_escape_flush_undo();
             }
             // A declined full flush still escaped the virtualizable, so the
-            // locals region is written anyway (`virtualizable.py:101-138
+            // locals region is written anyway (`virtualizable.py write_boxes
             // write_boxes` has no decline) — otherwise the callee reads an
             // array of nulls.  That write claims no resume pc.  The capture
             // stays armed and `mark_escape_flush_undo_pending` asks the
@@ -1915,8 +1915,8 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
             // independent of any resume-image write.  See
             // `virtualizable.py` (`tracing_after_residual_call` /
             // `force_now`), `virtualizable.py` (token states),
-            // `virtualref.py:157-167` (vref'd inlined callee), and
-            // `pyjitpl.py:3373-3390` (unconditional ABORT_ESCAPE).  Runtime
+            // `virtualref.py` (vref'd inlined callee), and
+            // `pyjitpl.py vable_after_residual_call` (unconditional ABORT_ESCAPE).  Runtime
             // forcing also resets the token before writing fields
             // (`resume.py:1405-1408`).  Therefore a matched guard reports the
             // escape even when the flush declined.
@@ -2404,7 +2404,7 @@ pub(crate) fn escape_opcode_window_reset() {
 /// to concrete refs and flush the walk-end state with the mid-expression
 /// stack the vable shadow cannot provide (its stack region is only valid at
 /// merge points).  The `_run_forever` continue-forward analog
-/// (`blackhole.py:1752`) for the escape abort: the resume state is the exact
+/// (`blackhole.py`) for the escape abort: the resume state is the exact
 /// abort-point frame, so the walk's applied effects stand and nothing
 /// replays.  Returns false (no frame mutation) when no stack was latched or
 /// any slot lacks a concrete non-null Ref — the caller then falls back to the
@@ -2514,7 +2514,7 @@ fn flush_with_latched_stack_inner(
         // than a stale or absent value: exactly what `popvalue_maybe_none`
         // writes (`pyframe.py` →
         // `setarrayitem_vable_r(locals_cells_stack_w, depth, ConstPtr.NULL)`
-        // via `jtransform.py:1898`).  The opcode had already popped the slot
+        // via `jtransform.py do_fixed_list_setitem`).  The opcode had already popped the slot
         // before its residual forced.
         //
         // So the array is correct and upstream agrees — RPython's `popvalue`
@@ -4092,7 +4092,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         };
     // `abstract_isinstance_w` handles a real type through
     // `p_recursive_isinstance_type_w`: first the side-effect-free MRO test,
-    // then (only on a miss) `w_inst.__class__` (`abstractinst.py:74-86`).  A
+    // then (only on a miss) `w_inst.__class__` (`abstractinst.py`).  A
     // hit is replay-safe directly.  A miss is replay-safe only when the
     // instance type has already proven and memoized that it inherits
     // `object.__getattribute__` AND its MRO resolves `__class__` to the
@@ -4211,7 +4211,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // user `__add__` / `__eq__` still mutate, so keep the exact-int gate.
     let opcode_binop_or_compare = opcode_binop_or_compare_fnaddr && exact_int_binop_operands;
     // `BUILD_TUPLE` / `BUILD_LIST` create a fresh container from their fresh
-    // backing array (`pyopcode.py:1012-1020`).  Re-executing either allocation
+    // backing array (`pyopcode.py`).  Re-executing either allocation
     // cannot mutate an object visible before the call.  Upstream records list
     // construction directly as `opimpl_newlist` (`pyjitpl.py`) and
     // allows residual calls at every `MIFrame` depth (`pyjitpl.py`);
@@ -4334,7 +4334,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // the OS_NOT_IN_TRACE / force-virtual short-circuits. RPython mirror:
     // `pyjitpl.py`.
     // `vrefinfo.tracing_before_residual_call(vref)` for every live vref
-    // (`pyjitpl.py:3341-3348`), which upstream runs first inside the same
+    // (`pyjitpl.py`), which upstream runs first inside the same
     // `vable_and_vrefs_before_residual_call` the vable half below mirrors.
     // Stamps TOKEN_TRACING_RESCALL so the post-call check can tell "forced by
     // this callee" from "untouched".  Armed here, past every decline gate, for
@@ -4344,7 +4344,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // Gated on `is_may_force` — the walker's `check_forces_virtual_or_
     // virtualizable()` — because `do_residual_call` runs the whole preparation
     // block only for `assembler_call or effectinfo.check_forces_...`
-    // (`pyjitpl.py:2007`).  A call that cannot force needs no stamp, and
+    // (`pyjitpl.py`).  A call that cannot force needs no stamp, and
     // stamping one would leave `tracing_after_residual_call` reading a token
     // nobody will clear.
     if is_may_force {
@@ -4412,9 +4412,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 let last_instr = ctx.trace_ctx.const_int(py_pc as i64);
                 // Scope the box half to the residual just as
                 // `LiveLastInstrGuard` scopes the heap half.  `_opimpl_setfield_vable`
-                // leaves both halves equal (`pyjitpl.py:1188-1199`), and
+                // leaves both halves equal (`pyjitpl.py`), and
                 // `check_synchronized_virtualizable` asserts that invariant
-                // (`pyjitpl.py:3463-3468`).
+                // (`pyjitpl.py`).
                 if let Some(idx) = info.static_field_index_by_name("last_instr")
                     && let Some((prev_op, prev_val)) = ctx.trace_ctx.virtualizable_entry_at(idx)
                 {
@@ -4561,7 +4561,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // mid-expression stack image, which is exactly the precondition for
         // building the blackhole resume PAST the residual.  Forcing is NOT
         // limited to frame-introspection reads (`hook_access_field`,
-        // rvirtualizable.py:49-53, forces on every redirected-field access,
+        // rvirtualizable.py, forces on every redirected-field access,
         // reads AND writes), and every Python-visible frame MUTATOR (the
         // `f_lineno`/`f_trace` setters, `sys.settrace`, `_warnings.warn`,
         // which forces the caller frame for `__name__` and then mutates
@@ -4580,7 +4580,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // empty on this path.  `check_is_elidable()`/`EF_LOOPINVARIANT` is
         // disjoint from forcing by construction — `pyjitpl.py:2007` takes the
         // forcing arm iff `check_forces_virtual_or_virtualizable()`
-        // (`extraeffect >= EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`, effectinfo.py:250)
+        // (`extraeffect >= EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`, effectinfo.py)
         // and routes elidable/loop-invariant down the `else` arm at `:2084`.
         // An empty declared write set is unavailable too: every residual that
         // reaches this gate carries `EF_RANDOM_EFFECTS`, whose write-descr sets
@@ -4745,7 +4745,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // residual.  A force is excluded because the callee made the heap
         // authoritative and its escape walk reloads the shadow; restoring a
         // pre-force value would violate `_opimpl_setfield_vable`'s equality
-        // (`pyjitpl.py:1188-1199`) checked by
+        // (`pyjitpl.py`) checked by
         // `check_synchronized_virtualizable` (`pyjitpl.py`).
         if !forced && let Some((prev_op, prev_val)) = saved_last_instr_shadow.take() {
             crate::trace_opcode::mirror_vable_static_to_boxes(
@@ -4858,7 +4858,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // non-idempotent store ahead of the escaping call — on the replay
             // path.  Upstream has no counterpart to either gate: ABORT_ESCAPE
             // goes straight to `run_blackhole_interp_to_cancel_tracing`
-            // (`pyjitpl.py:2949` → `blackhole.py convert_and_run_from_pyjitpl`),
+            // (`pyjitpl.py` → `blackhole.py convert_and_run_from_pyjitpl`),
             // which converts the framestack and runs FORWARD, never replays.
             //
             // An already-committed escape pc does not gate it either.  The
@@ -4942,7 +4942,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 // where legacy escape/replay discarded it. A `sys._getframe`
                 // executed later, inside the blackhole, was always correct.
                 // `walker_ec_enter` / `walker_ec_leave` (the port of
-                // `executioncontext.py:85-107`) publish the callee frame at
+                // `executioncontext.py enter`) publish the callee frame at
                 // the inlined-call push, which closed the gap.
                 // `synth/getframe_while_escaping_read_frame_identity` is the
                 // regression guard.
@@ -7045,7 +7045,7 @@ fn walker_foldable_runtime_helper<Sym: WalkSym>(
 ///   - `vrefs_before_residual_call` / `vrefs_after_residual_call` ARE called
 ///     by the walker, under the `is_may_force` gate that mirrors
 ///     `do_residual_call`'s `assembler_call or effectinfo.check_forces_...`
-///     (`pyjitpl.py:2007`). Their loops are NOT empty: [`walker_ec_enter`]
+///     (`pyjitpl.py`). Their loops are NOT empty: [`walker_ec_enter`]
 ///     takes a vref of every seeded callee frame via
 ///     `TraceCtx::opimpl_virtual_ref` — `ExecutionContext.enter`'s vref — and
 ///     pairs it with `opimpl_virtual_ref_finish` when the frame leaves, so

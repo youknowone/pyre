@@ -50,7 +50,7 @@ mod tests {
         let _intval = crate::trace_unbox_int(&mut ctx, obj, FAKE_INT_TYPE, intval_descr());
         let ops = get_ops(ctx);
         // GUARD_CLASS(box, cls): backend loads typeptr from obj at offset 0
-        // (llgraph/runner.py:1245), no explicit pre-read. Followed by the
+        // (llgraph/runner.py execute_guard_class), no explicit pre-read. Followed by the
         // intval field read.
         assert_eq!(ops, vec![OpCode::GuardClass, OpCode::GetfieldGcI]);
         eprintln!("✓ trace_unbox_int: {:?}", ops);

@@ -30,7 +30,6 @@ INF = float("inf")
 NAN = float("nan")
 
 
-#############################################################################
 # module tests
 
 # class TestModule(unittest.TestCase):
@@ -63,7 +62,6 @@ if hasattr(datetime_module, "_divide_and_round"):
     assert_equal(dar(6, -4), -2)
     assert_equal(dar(-6, -4), 2)
 
-#############################################################################
 # tzinfo tests
 
 
@@ -286,7 +284,6 @@ class TestTimeZone(unittest.TestCase):
         self.assertIs(tz_copy, tz)
 """
 
-#############################################################################
 # Base class for testing a particular aspect of timedelta, time, date and
 # datetime comparisons.
 
@@ -322,7 +319,6 @@ for theclass in timedelta, date, time:
     assert_raises(TypeError, lambda: () >= me)
 
 '''
-#############################################################################
 # timedelta tests
 class TestTimeDelta(HarmlessMixedComparison, unittest.TestCase):
 
@@ -771,7 +767,6 @@ class TestTimeDelta(HarmlessMixedComparison, unittest.TestCase):
         assert_raises(TypeError, divmod, t, 10)
 
 
-#############################################################################
 # date tests
 
 class TestDateOnly(unittest.TestCase):
@@ -1443,7 +1438,6 @@ class TestDate(HarmlessMixedComparison, unittest.TestCase):
             # blow up because other fields are insane.
             self.theclass(base[:2] + bytes([ord_byte]) + base[3:])
 
-#############################################################################
 # datetime tests
 
 class SubclassDatetime(datetime):
@@ -3749,7 +3743,6 @@ class TestTimezoneConversions(unittest.TestCase):
             fstart += HOUR
 
 
-#############################################################################
 # oddballs
 
 # class Oddballs(unittest.TestCase):

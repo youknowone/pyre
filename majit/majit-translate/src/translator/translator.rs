@@ -26,7 +26,7 @@ use crate::translator::simplify;
 /// manifest. The full upstream `OptionDescription` tree is ported in
 /// [`crate::config::translationoption`] (with
 /// [`crate::config::translationoption::translation_optiondescription`]
-/// mirroring `translationoption.py:44-282`); this struct stays the
+/// mirroring `translationoption.py`); this struct stays the
 /// flat bool-shaped subset until consumers route through the option
 /// tree.
 #[derive(Clone, Debug)]
@@ -47,7 +47,7 @@ pub struct TranslationOptions {
     pub check_str_without_nul: bool,
     /// RPython `config.translation.taggedpointers` (upstream default
     /// `False`). Consumed by `rclass.buildinstancerepr`
-    /// (`rpython/rtyper/rclass.py:103`) to gate the
+    /// (`rpython/rtyper/rclass.py`) to gate the
     /// `TaggedInstanceRepr` path for `UnboxedValue` subclasses.
     pub taggedpointers: bool,
     /// RPython `config.translation.withsmallfuncsets` (upstream
@@ -84,7 +84,7 @@ impl Default for TranslationOptions {
 pub struct TranslationConfig {
     /// RPython root-level `config.translating` BoolOption installed by
     /// `get_combined_translation_config(translating=...)` at
-    /// `rpython/config/translationoption.py:284-293`. Upstream's
+    /// `rpython/config/translationoption.py`. Upstream's
     /// `TranslationContext.__init__` (translator.py) passes
     /// `translating=True`, so every `TranslationContext` created
     /// without an explicit config observes
@@ -100,7 +100,7 @@ impl TranslationConfig {
     /// `TranslationDriver.config`. Mirrors the read path upstream's
     /// `TranslationContext.__init__` takes when handed
     /// `config=self.driver.config` at `interactive.py:19` /
-    /// `driver.py:194`: each `config.translation.<name>` access is a
+    /// `driver.py`: each `config.translation.<name>` access is a
     /// `__getattr__` dispatch into the same `_cfgimpl_values` dict the
     /// driver's overrides write into.
     ///
@@ -176,7 +176,7 @@ pub struct Platform;
 // placeholder surface.
 
 /// RPython `get_combined_translation_config(translating=True)`
-/// (translationoption.py:284-293). The Rust port exposes the
+/// (translationoption.py). The Rust port exposes the
 /// `translating=True` call that `TranslationContext.__init__` uses
 /// when `config is None`; upstream callers that need
 /// `translating=False` pre-construct a [`TranslationConfig`] and pass
@@ -194,7 +194,7 @@ fn get_platform(_config: &TranslationConfig) -> Platform {
 
 /// Key for [`TranslationContext::callgraph`]. Matches upstream's
 /// Python dict key `(caller_graph, callee_graph, position_tag)` at
-/// translator.py:66, where `position_tag = (parent_block, parent_index)`.
+/// translator.py, where `position_tag = (parent_block, parent_index)`.
 /// All three components carry pointer-identity semantics; Rust uses
 /// `GraphKey` / `BlockKey` for the object handles.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -206,7 +206,7 @@ pub struct CallGraphKey {
 }
 
 /// Value for [`TranslationContext::callgraph`]. Upstream stores
-/// `(caller_graph, callee_graph)` (translator.py:67), preserving the
+/// `(caller_graph, callee_graph)` (translator.py), preserving the
 /// GraphRef handles that outlive individual call-site traversals.
 #[derive(Clone)]
 pub struct CallGraphEdge {
@@ -260,7 +260,7 @@ pub struct TranslationContext {
     /// generic "missing code object" message.  Preserves the
     /// producer-side failure point analogous to upstream's lazy
     /// `getdesc → newfuncdesc → buildgraph` chain
-    /// (`rpython/annotator/bookkeeper.py:353-409`) where the
+    /// (`rpython/annotator/bookkeeper.py`) where the
     /// original exception propagates.
     pub _lift_errors: RefCell<HashMap<HostObject, String>>,
     /// RPython `self.entry_point_graph`. Set by
@@ -274,7 +274,7 @@ impl TranslationContext {
     }
 
     /// RPython `TranslationContext.__init__(self, config=None,
-    /// **flowing_flags)` (translator.py:27-40).
+    /// **flowing_flags)` (translator.py).
     pub fn with_config_and_flowing_flags(
         config: Option<TranslationConfig>,
         flowing_flags: FlowingFlags,
@@ -353,7 +353,7 @@ impl TranslationContext {
         // upstream `bookkeeper.getdesc → newfuncdesc → buildgraph`
         // where the original construction error propagates from the
         // lazy `cachedgraph` consumer
-        // (`rpython/annotator/description.py:228`).
+        // (`rpython/annotator/description.py`).
         if let Some(lift_err) = self._lift_errors.borrow().get(&func).cloned() {
             return Err(format!(
                 "buildflowgraph({}): source lift failed during \
@@ -374,7 +374,7 @@ impl TranslationContext {
         // registered a metadata-only carrier for a host whose body it could
         // not lower. Surface the failure here — `buildflowgraph(callee)` is
         // exactly the call site upstream raises FlowingError when a
-        // function's analysis cannot proceed (`flowcontext.py:847`).
+        // function's analysis cannot proceed (`flowcontext.py`).
         if code.co_code.is_empty() {
             return Err(format!(
                 "buildflowgraph({}): `HostCode.co_code` is empty — the MIR \
@@ -444,7 +444,7 @@ impl TranslationContext {
     }
 
     /// RPython `translator.getexceptiontransformer()` at
-    /// `rpython/translator/translator.py:86-93`.
+    /// `rpython/translator/translator.py`.
     ///
     /// Upstream:
     /// ```python
@@ -507,7 +507,7 @@ impl TranslationContext {
     }
 
     /// RPython `TranslationContext.update_call_graph(caller_graph,
-    /// callee_graph, position_tag)` (translator.py:64-67).
+    /// callee_graph, position_tag)` (translator.py).
     ///
     /// ```python
     /// def update_call_graph(self, caller_graph, callee_graph, position_tag):

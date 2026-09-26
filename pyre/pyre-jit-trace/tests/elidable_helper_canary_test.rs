@@ -10,7 +10,7 @@
 //!
 //! Every trace function pointer routes through the macro-emitted
 //! `extern "C" fn(_, _) -> i64` ABI trampoline (`__majit_call_target_*`).
-//! PyPy `getfunctionptr` (`call.py:174-187`) parity — the function
+//! PyPy `getfunctionptr` (`call.py get_jitcode_calldescr`) parity — the function
 //! pointer the trace records must match (down to ABI) the function the
 //! JIT actually calls.
 //!
@@ -540,7 +540,7 @@ fn real_lookup_wrapper_all_const_folds_to_const_ptr() {
 //
 // `jit_instance_getdictvalue` (helpers.rs) wraps `instance_node_getdictvalue`
 // (mapdict.rs, `getdictvalue` mapdict.py).  The LOAD_METHOD fast
-// path (callmethod.py:66) reads it after the type lookup to confirm no
+// path (callmethod.py) reads it after the type lookup to confirm no
 // instance attribute shadows the class method.  Unlike the type lookup, it is
 // NOT pure — the instance dict mutates — so it is recorded as a normal
 // residual `CallR` (emit_trace_call_ref_typed, default_effect_info), guarded

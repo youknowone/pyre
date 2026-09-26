@@ -1,4 +1,4 @@
-# `app_abc.py:15-44 SimpleWeakSet`.  The registry and both caches are
+# `app_abc.py SimpleWeakSet`.  The registry and both caches are
 # instances of this, so `_get_dump` can hand out the `data` sets and a
 # collected entry drops itself through the callback the set installs.
 #

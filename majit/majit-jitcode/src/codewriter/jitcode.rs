@@ -29,7 +29,7 @@ pub trait SsaReprDump: std::fmt::Debug {
 
 /// Assembled JitCode — the output of the assembler.
 ///
-/// RPython parity (`rpython/jit/codewriter/jitcode.py:9-43`):
+/// RPython parity (`rpython/jit/codewriter/jitcode.py`):
 ///
 /// ```python
 /// class JitCode(AbstractDescr):
@@ -620,7 +620,7 @@ impl JitCode {
     /// cycle a JitCode through several portal/non-portal states without
     /// allocating a fresh `JitCodeBuilder`. `set_jitdriver_sd` (single
     /// shot, `&self`) remains the only supported path in production
-    /// because it matches RPython's `call.py:148` "set once at portal
+    /// because it matches RPython's `call.py` "set once at portal
     /// grab time" pattern.
     pub fn replace_jitdriver_sd(&mut self, value: Option<usize>) {
         self.jitdriver_sd = OnceLock::new();
@@ -763,7 +763,7 @@ impl JitCode {
     ///
     /// `op_live` is the runtime opcode byte for `live/` (assigned by the
     /// blackhole interpreter at `setup_insns` time, RPython
-    /// `blackhole.py:72`). The result is the offset into the metainterp's
+    /// `blackhole.py`). The result is the offset into the metainterp's
     /// `all_liveness` table.
     pub fn get_live_vars_info(&self, pc: usize, op_live: u8) -> usize {
         // RPython `jitcode.py:85-90`: `if not we_are_translated(): assert
@@ -1115,7 +1115,7 @@ impl SwitchDictDescr {
 }
 
 impl std::fmt::Display for SwitchDictDescr {
-    /// RPython `jitcode.py:138-140`:
+    /// RPython `jitcode.py __repr__`:
     ///
     /// ```python
     /// def __repr__(self):
@@ -1126,7 +1126,7 @@ impl std::fmt::Display for SwitchDictDescr {
     /// `attach` populates `as_dict` in `_labels` insertion order
     /// (`assembler.py:258-263`), and `_labels` itself is the
     /// post-`switches.sort(key=lambda link: link.llexitcase)` order
-    /// from `flatten.py:274`. Iterate `const_keys_in_order` so the
+    /// from `flatten.py`. Iterate `const_keys_in_order` so the
     /// rendered dict matches Python's repr in sorted-key order.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if !self.attached {
@@ -1157,7 +1157,7 @@ impl std::fmt::Display for SwitchDictDescr {
 /// `JitCode(AbstractDescr)`, `SwitchDictDescr`). pyre uses an enum to
 /// represent the same heterogeneous list, shared between the codewriter
 /// assembler and the metainterp blackhole.
-/// RPython `descr.py:665` `RESULT_ERASED` component of the call-descr cache
+/// RPython `descr.py` `RESULT_ERASED` component of the call-descr cache
 /// key. The Rust port still collapses most low-level pointer shapes to
 /// `Type::Ref`, but the field is kept explicit so the descriptor table has the
 /// same structural slot as upstream.
@@ -1354,7 +1354,7 @@ pub struct BhCallDescr {
     #[serde(default)]
     pub void_word_abi: bool,
     /// RPython `CallDescr.extrainfo` (`descr.py`,
-    /// `effectinfo.py:13-263`).
+    /// `effectinfo.py EffectInfo`).
     pub extra_info: majit_ir::descr::EffectInfo,
     /// Object identity assigned by translation after all EffectInfos are
     /// known. RPython preserves this directly in the translated image; pyre
@@ -1642,7 +1642,7 @@ impl BhFieldSpec {
     /// Mirror an `Arc<dyn FieldDescr>` into the serializable
     /// `BhFieldSpec` shape so producers outside the codewriter
     /// (e.g. blackhole-allocator dispatch in `pyre-jit`) can build
-    /// `BhDescr::Size.all_fielddescrs` matching `descr.py:188
+    /// `BhDescr::Size.all_fielddescrs` matching `descr.py
     /// init_size_descr` parity.
     pub fn from_field_descr(fd: &dyn majit_ir::descr::FieldDescr) -> Self {
         // descr.py `get_type_flag`: a `Ptr` to a GC struct is
@@ -1652,7 +1652,7 @@ impl BhFieldSpec {
         // codewriter's own `value_type_to_field_flag` and
         // `bh_field_flag_from_descr` already use.  Emitting `Unsigned` here
         // made the round trip lossy: `SimpleFieldDescr::is_pointer_field()` is
-        // `flag == Pointer` (descr.py:173), so the rebuilt descr denied being
+        // `flag == Pointer` (descr.py), so the rebuilt descr denied being
         // a pointer field and `handle_write_barrier_setfield` dropped the
         // store's write barrier.
         let field_flag = if fd.is_pointer_field() {
@@ -1874,7 +1874,7 @@ pub enum BhDescr {
         /// nolength/raw array descriptors; `bh_arraylen_gc` requires
         /// `Some` just like llmodel.py asserts an ArrayDescr with lendescr.
         len_offset: Option<usize>,
-        /// `descr.py:348-360 cache[ARRAY_OR_STRUCT]` cache-key
+        /// `descr.py get_array_descr cache[ARRAY_OR_STRUCT]` cache-key
         /// surrogate.  u64 `path_hash(array_type_id)` matching the
         /// runtime macro emission; see `BhSizeSpec.type_id` for the
         /// full identity rationale.
@@ -1908,7 +1908,7 @@ pub enum BhDescr {
         /// (`pyjitpl::DispatchArrayDescrKey`) so two BhDescr::Array
         /// entries that disagree on `array_type_id` never collapse to
         /// the same registry slot — mirroring upstream
-        /// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py:348-360`)
+        /// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py get_array_descr`)
         /// keying on lltype object identity.
         ///
         /// `None` for descrs minted without an `array_type_id`
@@ -1929,12 +1929,12 @@ pub enum BhDescr {
         is_gc_managed: bool,
     },
     /// Interior-field descriptor: for getinteriorfield/setinteriorfield
-    /// on arrays of inline structs.  `descr.py:388
+    /// on arrays of inline structs.  `descr.py __init__
     /// InteriorFieldDescr(arraydescr, fielddescr)` composes the
     /// containing `ArrayDescr` with the `FieldDescr` of the targeted
     /// struct field.  The blackhole resolves the interior address as
     /// `array_base + arraydescr.basesize + fielddescr.offset + index *
-    /// arraydescr.itemsize` (`llmodel.py:648-649`).
+    /// arraydescr.itemsize` (`llmodel.py bh_setinteriorfield_gc_i`).
     InteriorField {
         array: Box<BhDescr>,
         field: Box<BhDescr>,
@@ -2273,7 +2273,7 @@ pub fn descr_pool_content(descrs: &[BhDescr]) -> DescrPoolContent {
 
 /// Shared assembler descriptor table installed on every blackhole frame.
 ///
-/// `blackhole.py:102-103` stores the assembler's own list, and :154 only
+/// `blackhole.py setup_descrs` stores the assembler's own list, and :154 only
 /// indexes it. The translated runtime can therefore preserve that interface
 /// while choosing whether an entry already exists or must be reconstituted
 /// from the build artefact on first access.
@@ -2334,7 +2334,7 @@ impl BhDescr {
     /// field_size, is_field_signed)`.  Backend `bh_getfield_gc_i` /
     /// `bh_setfield_gc_i` thread the tuple to `read_int_at_mem` /
     /// `write_int_at_mem` so the per-field byte width and signedness
-    /// reach the load/store, matching `llmodel.py:693-696,718-721`.
+    /// reach the load/store, matching `llmodel.py`.
     /// Panics on non-`Field` variants — vable scalars synthesize a
     /// fixed-size 8-byte signed-zero placeholder via
     /// `read_descr_vable_field` (in `blackhole.rs`) and still go
@@ -2393,7 +2393,7 @@ impl BhDescr {
     /// the identity this descr carries in [`get_type_id`].  Producers are
     /// mixed: `allocate_with_vtable` and the walker struct path widen the
     /// real `descr.tid` into the slot, while `bh_new`, `from_array_descr`,
-    /// and every array path serialize the `cache_key` (`descr.py:108-118` /
+    /// and every array path serialize the `cache_key` (`descr.py` /
     /// `:348-378` structural identity).  A `_cache_size`/`_cache_array` hit
     /// maps a `cache_key` back to the allocated tid (`gc.py:536-542`); a
     /// miss means the value was already the dense tid (a real tid never keys
@@ -2491,7 +2491,7 @@ impl BhDescr {
     /// `bh_getarrayitem_gc_i` / `bh_setarrayitem_gc_i` thread the tuple
     /// to `read_int_at_mem` / `write_int_at_mem` so the per-array
     /// itemsize and signedness reach the load/store, matching
-    /// `llmodel.py:592-594, 612-614`.  Panics on non-`Array` variants.
+    /// `llmodel.py, 612-614`.  Panics on non-`Array` variants.
     pub fn unpack_arraydescr_size(&self) -> (usize, usize, bool) {
         match self {
             BhDescr::Array {
@@ -2506,7 +2506,7 @@ impl BhDescr {
 
     /// `llmodel.py unpack_arraydescr`: return `base_size`.  Used by
     /// the ref- and float-typed `bh_getarrayitem_gc_*` /
-    /// `bh_setarrayitem_gc_*` paths (`llmodel.py:597-600, 603-606`)
+    /// `bh_setarrayitem_gc_*` paths (`llmodel.py, 603-606`)
     /// where the item width is fixed (`WORD` for ref,
     /// `sizeof(FLOATSTORAGE)` for float).
     pub fn array_base_size(&self) -> usize {
@@ -2564,7 +2564,7 @@ impl BhDescr {
             is_array_of_structs: false,
             is_item_signed: info.is_signed,
             // ArrayDescrInfo currently lacks the codewriter ei_index
-            // (`effectinfo.py:307-311`); resume/materialize paths do
+            // (`effectinfo.py add_array`); resume/materialize paths do
             // not consult heap.rs EffectInfo bitstrings, so the sentinel
             // is correct here.
             ei_index: u32::MAX,
@@ -2586,7 +2586,7 @@ impl BhDescr {
     /// must not replace it with a kind-only side channel.
     pub fn from_array_descr(array_descr: &dyn majit_ir::descr::ArrayDescr) -> Self {
         // Round-trip ei_index from the live descr so a downstream
-        // make_descr_from_bh republishes it (`effectinfo.py:465`).
+        // make_descr_from_bh republishes it (`effectinfo.py compute_bitstrings`).
         let ei_index = (array_descr as &dyn majit_ir::descr::Descr).get_ei_index();
         BhDescr::Array {
             base_size: array_descr.base_size(),

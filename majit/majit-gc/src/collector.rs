@@ -736,7 +736,7 @@ fn get_total_memory_linux(filename: &str) -> f64 {
 /// env.py `get_total_memory`. Total physical memory in bytes.
 /// Linux reads `/proc/meminfo`; macOS reads `hw.memsize`; FreeBSD reads
 /// `hw.usermem`; every other platform returns the addressable size
-/// (env.py:113-127).
+/// (env.py).
 #[cfg(target_os = "linux")]
 fn get_total_memory() -> f64 {
     get_total_memory_linux("/proc/meminfo")
@@ -843,7 +843,7 @@ impl Default for RootSet {
 /// Default card page shift: each card covers 2^7 = 128 array elements.
 pub const DEFAULT_CARD_PAGE_SHIFT: u32 = 7;
 
-/// incminimark.py:2390-2634 major-collection state machine.
+/// incminimark.py major_collection_step major-collection state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GcState {
     Scanning,
@@ -983,14 +983,14 @@ pub struct MiniMarkGC {
     /// when the requested type's `TypeInfo.is_weakref` is set
     /// (incminimark.py `if contains_weakptr:`). Drained at end of
     /// minor cycle by `invalidate_young_weakrefs`
-    /// (incminimark.py:1866-1867, :3058-3105).
+    /// (incminimark.py, :3058-3105).
     young_objects_with_weakrefs: Vec<usize>,
     /// incminimark.py:415 `self.old_objects_with_weakrefs =
     /// self.AddressStack()`. Old-gen WEAKREF objects whose target is
     /// also in old-gen. Populated by `invalidate_young_weakrefs` for
     /// survivors and by direct old-gen weakref allocation. Drained by
     /// `invalidate_old_weakrefs` during the sweep phase of a major
-    /// collection (incminimark.py:3107-3133); the major-side
+    /// collection (incminimark.py); the major-side
     /// consumer lands in the major-collection sweep phase.
     old_objects_with_weakrefs: Vec<usize>,
     /// incminimark.py:407 `self.young_objects_with_destructors =
@@ -1006,7 +1006,7 @@ pub struct MiniMarkGC {
     /// self.AddressStack()`. Old-gen objects with a destructor, populated
     /// by promotion from the young list and by direct old-gen allocation.
     /// Drained by `deal_with_old_objects_with_destructors`
-    /// (incminimark.py:2510-2511, :2897-2912) before the major sweep:
+    /// (incminimark.py, :2897-2912) before the major sweep:
     /// a VISITED object survives, a dying one's destructor runs.
     old_objects_with_destructors: Vec<usize>,
     /// incminimark.py:388-390.  Registrations first enter the probably-young
@@ -1079,7 +1079,7 @@ pub struct MiniMarkGC {
     stat_rawmalloced_total_size: usize,
     /// incminimark.py:387 `total_gc_time`, in seconds.
     total_gc_time: f64,
-    /// incminimark.py:2390-2634 `gc_state`.
+    /// incminimark.py major_collection_step `gc_state`.
     gc_state: GcState,
     /// State for incremental major collection.
     incr_state: IncrementalMarkState,
@@ -1203,7 +1203,7 @@ pub struct MiniMarkGC {
     /// shadow instead of a fresh allocation.  Cleared after each
     /// minor collection.
     nursery_objects_shadows: AddressMap<usize>,
-    /// llsupport/gc.py:563 vtable→typeid mapping. RPython derives this
+    /// llsupport/gc.py get_typeid_from_classptr_if_gcremovetypeptr vtable→typeid mapping. RPython derives this
     /// arithmetically from the GC `type_info_group` base; pyre's GC
     /// keeps an explicit table because frontends register vtables
     /// independently of any translator pipeline. This has RPython
@@ -1389,9 +1389,9 @@ impl MiniMarkGC {
             .store(self.nursery.top_ptr() as usize, Ordering::Release);
     }
 
-    // ── incminimark.py:1292-1308 card marking geometry ──
+    // ── incminimark.py card_marking_words_for_length card marking geometry ──
 
-    /// incminimark.py:1292-1299: number of machine words needed for card bits.
+    /// incminimark.py card_marking_words_for_length: number of machine words needed for card bits.
     fn card_marking_words_for_length(&self, length: usize) -> usize {
         const LONG_BIT: usize = usize::BITS as usize;
         const LONG_BIT_SHIFT: usize = usize::BITS.trailing_zeros() as usize;
@@ -1399,12 +1399,12 @@ impl MiniMarkGC {
             >> (self.card_page_shift as usize + LONG_BIT_SHIFT)
     }
 
-    /// incminimark.py:1301-1308: number of bytes needed for card bits.
+    /// incminimark.py card_marking_bytes_for_length: number of bytes needed for card bits.
     fn card_marking_bytes_for_length(&self, length: usize) -> usize {
         (length + (8 << self.card_page_shift) - 1) >> (self.card_page_shift as usize + 3)
     }
 
-    /// incminimark.py:1622-1625: address of card byte at `byteindex`.
+    /// incminimark.py get_card: address of card byte at `byteindex`.
     /// Card bytes are stored in reverse order before the GcHeader.
     /// `obj` is the payload address (after GcHeader).
     #[inline]
@@ -1414,7 +1414,7 @@ impl MiniMarkGC {
         (obj - GcHeader::SIZE - 1 - byteindex) as *mut u8
     }
 
-    /// incminimark.py:955-1088: allocate a large object with optional card
+    /// incminimark.py external_malloc: allocate a large object with optional card
     /// marker bits prepended before the GcHeader.
     ///
     /// `has_gc_ptrs_in_var` should be true for arrays containing GC pointers
@@ -1467,7 +1467,7 @@ impl MiniMarkGC {
         obj
     }
 
-    /// incminimark.py:1017-1030, the card question `external_malloc` asks once
+    /// incminimark.py, the card question `external_malloc` asks once
     /// for both of its arms. Returns `(cardheadersize, extra_flags)`.
     ///
     /// Three clauses deny cards, and the third is a *size* test: upstream
@@ -1690,7 +1690,7 @@ impl MiniMarkGC {
     #[cold]
     #[inline(never)]
     fn alloc_with_type_slow(&mut self, type_id: u32, total_size: usize) -> GcRef {
-        // incminimark.py:719,767 `malloc_varsize` and :665 `malloc_fixedsize`:
+        // incminimark.py `malloc_varsize` and :665 `malloc_fixedsize`:
         // an oversized object skips the nursery through
         // `external_malloc(..., alloc_young=True)`, so it is non-moving and
         // still YOUNG — the next minor frees it if nothing reached it. This
@@ -2031,7 +2031,7 @@ impl MiniMarkGC {
     }
 
     /// The tail a successful nursery bump runs: `init_gc_object`, then
-    /// incminimark.py:687-693's two registrations.
+    /// incminimark.py's two registrations.
     ///
     /// `FAST` is `malloc_fast` (`framework.py:361-382`), the copy of
     /// `malloc_fixedsize` annotated `s_False, s_False, s_False` — under that
@@ -2069,7 +2069,7 @@ impl MiniMarkGC {
     }
 
     /// The tail every non-`malloc_fast` nursery bump shares: `init_gc_object`
-    /// plus the weakref and destructor registration of incminimark.py:687-693.
+    /// plus the weakref and destructor registration of incminimark.py.
     #[inline]
     fn finish_nursery_object(&mut self, ptr: *mut u8, type_id: u32) -> GcRef {
         Self::init_nursery_object(ptr, type_id);
@@ -2083,7 +2083,7 @@ impl MiniMarkGC {
     ///
     /// A WEAKREF (`T_IS_WEAKREF` in its TYPE_INFO) joins the young-weakref list
     /// so the next minor collection can invalidate the single `weakptr` slot at
-    /// `weakref::WEAKPTR_OFFSET` inside the payload (gctypelayout.py:592) if its
+    /// `weakref::WEAKPTR_OFFSET` inside the payload (gctypelayout.py) if its
     /// target dies. A type carrying a lightweight `TypeInfo.destructor` joins
     /// the young-destructor list, so that collection either runs the destructor
     /// or promotes the entry to `old_objects_with_destructors`.
@@ -2200,7 +2200,7 @@ impl MiniMarkGC {
         // The oversized arm is born OLD here, unlike `alloc_with_type_slow`'s
         // and `alloc_nursery_collecting_typed_rooted`'s, which take
         // `try_alloc_young_nonmoving_clear` — `external_malloc(...,
-        // alloc_young=True)`, incminimark.py:719,767. The young birth does not
+        // alloc_young=True)`, incminimark.py. The young birth does not
         // collect, so the no-collect contract is not what withholds it.
         //
         // What withholds it is the root set. Born old, an unrooted block is
@@ -2396,9 +2396,9 @@ impl MiniMarkGC {
             return;
         }
         // `register_finalizer` is contracted to run at most once per object
-        // (`rgc.py:648-649`). A second deque entry survives the first
+        // (`rgc.py`). A second deque entry survives the first
         // `deal_with_objects_with_finalizers` pass through `new_with_finalizer`
-        // (incminimark.py:2944-2946) and delivers the object a second time on
+        // (incminimark.py) and delivers the object a second time on
         // the next major collection, so honour the contract here rather than
         // leaving it to every caller.
         let hdr = unsafe { header_of(obj.0) };
@@ -2441,7 +2441,7 @@ impl MiniMarkGC {
     /// large object or nursery-full fallback) enters the still-active page/raw
     /// lists that will be frozen at the MARKING->SWEEPING seam. The root scan has
     /// already happened, so allocate it black; allocations during SWEEPING need
-    /// no VISITED workaround because incminimark.py:2513-2514 and :2688-2694's
+    /// no VISITED workaround because incminimark.py and :2688-2694's
     /// list swaps keep them outside this cycle's candidates. Any young pointer
     /// later stored into a born-black object re-enters marking through the write
     /// barrier's remembered-set rescan.
@@ -2776,7 +2776,7 @@ impl MiniMarkGC {
     /// fallback).
     ///
     /// The block comes back uninitialized, as `external_malloc`'s "fully
-    /// initialized, but not zero-filled" (incminimark.py:955-960) does: with
+    /// initialized, but not zero-filled" (incminimark.py) does: with
     /// `malloc_zero_filled = False` (incminimark.py) no allocation tier
     /// clears, and a site that needs zeroed memory appends the clear itself —
     /// see [`alloc_in_oldgen_clear`](Self::alloc_in_oldgen_clear).
@@ -2830,7 +2830,7 @@ impl MiniMarkGC {
     /// [`alloc_in_oldgen`](Self::alloc_in_oldgen) directly. On the clearing
     /// axis only: `gct_do_malloc_fixedsize` appends no memclear, which is what
     /// those two want. They part from it on the collection axis, where its
-    /// nursery overflow collects (incminimark.py:676-680) and they spill.
+    /// nursery overflow collects (incminimark.py) and they spill.
     fn alloc_in_oldgen_clear(&mut self, type_id: u32, total_size: usize) -> GcRef {
         let obj = self.alloc_in_oldgen(type_id, total_size);
         Self::raw_memclear(obj, total_size);
@@ -3195,7 +3195,7 @@ impl MiniMarkGC {
         GcRef(obj_addr)
     }
 
-    /// incminimark.py:1213-1221 `is_young_object`, second half.
+    /// incminimark.py `is_young_object`, second half.
     ///
     /// [`is_nursery_object_start`](Self::is_nursery_object_start) is the
     /// nursery bound alone, and it is the right question wherever the real
@@ -3206,7 +3206,7 @@ impl MiniMarkGC {
         self.oldgen.young_rawmalloced_contains(addr)
     }
 
-    /// incminimark.py:2267-2298 `_visit_young_rawmalloced_object`.
+    /// incminimark.py `_visit_young_rawmalloced_object`.
     ///
     /// The minor reached a young rawmalloced object. Stamp
     /// `GCFLAG_VISITED_RMY` so `free_young_rawmalloced_objects` promotes it
@@ -3425,7 +3425,7 @@ impl MiniMarkGC {
         // reaches this walk exactly when it has left the shadow stack — the
         // compiled epilogue pops it before returning — and has not yet been
         // freed, which is the window in which the frontend reads its slots.
-        // `llmodel.py:240-250` reads those slots straight out of the frame, so
+        // `llmodel.py grab_exc_value` reads those slots straight out of the frame, so
         // the interior refs are live for the whole window and nothing else in
         // this phase can see them. See `ActiveGcDeadFrameHooks`.
         crate::walk_active_live_deadframes(&mut |addr| {
@@ -3453,7 +3453,7 @@ impl MiniMarkGC {
             crate::shadow_stack::walk_bh_regs(&mut visit_bh_root);
         }
 
-        // blackhole resume construction roots (`resume.py:1312`): the
+        // blackhole resume construction roots (`resume.py blackhole_from_resumedata`): the
         // virtuals_cache + each frame's registers_r are filled by lazily
         // materializing virtuals before `run()` re-roots them via
         // `push_bh_regs`; forward any already-materialized nursery refs so a
@@ -3776,7 +3776,7 @@ impl MiniMarkGC {
     ///     `old_objects_with_weakrefs` for the next major cycle.
     ///
     /// The young raw-malloced target is the second branch
-    /// (incminimark.py:3083-3090): it survives without moving, so the slot
+    /// (incminimark.py): it survives without moving, so the slot
     /// needs no update and only its death has to be written. RPython's
     /// PyPy deliberately does not support weakrefs to pinned targets (the XXX
     /// immediately above this routine says so). Its prebuilt-target branch is
@@ -3795,7 +3795,7 @@ impl MiniMarkGC {
             // incminimark.py:3069-3070: pointing_to = (obj + offset)
             //                                            .address[0]
             // pyre's WEAKREF struct keeps `weakptr` at offset 0
-            // (gctypelayout.py:592, weakref.rs:WEAKPTR_OFFSET).
+            // (gctypelayout.py, weakref.rs:WEAKPTR_OFFSET).
             let weakptr_slot = (new_obj + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef;
             let pointing_to = unsafe { (*weakptr_slot).0 };
 
@@ -3873,7 +3873,6 @@ impl MiniMarkGC {
         }
     }
 
-    // ----------
     // RawRefCount — incminimark.py:3157-3409
 
     /// incminimark.py `rawrefcount_init`.
@@ -4957,7 +4956,7 @@ impl MiniMarkGC {
             .filter(|&size| size <= isize::MAX as usize - GcHeader::SIZE)
     }
 
-    /// incminimark.py:1160-1182 `shrink_array`.
+    /// incminimark.py `shrink_array`.
     ///
     /// Records that a varsize object is shorter than it was, so that when it
     /// leaves the nursery it consumes less memory. The object keeps its
@@ -4966,7 +4965,7 @@ impl MiniMarkGC {
     ///
     /// Writing the length field is the whole of the operation. Upstream also
     /// calls `llarena.arena_shrink_obj`, but that is `pass` in a translated
-    /// build (`llarena.py:557 llimpl_arena_shrink_obj`) — it exists for the
+    /// build (`llarena.py llimpl_arena_shrink_obj`) — it exists for the
     /// fake arena's own reservation bookkeeping, which pyre's bump-pointer
     /// nursery has no counterpart to. Nothing walks the nursery linearly, so
     /// no reader has to be told about the gap.
@@ -4979,7 +4978,7 @@ impl MiniMarkGC {
     ///
     /// `false` means the caller must allocate a smaller object and copy, which
     /// is exactly what `rgc.ll_shrink_array` does with that answer
-    /// (`rgc.py:475-478`).
+    /// (`rgc.py`).
     pub fn shrink_array(&mut self, obj_addr: usize, smaller_length: usize) -> bool {
         if !self.is_in_nursery(obj_addr) {
             return false;
@@ -5368,7 +5367,7 @@ impl MiniMarkGC {
             *gcref =
                 self.copy_nursery_object(gcref.0, "minor_root_target", "minor_root", 0, slot_addr);
         } else if self.is_young_rawmalloced(gcref.0) {
-            // incminimark.py:2149-2159 `_trace_drag_out`: an object outside the
+            // incminimark.py `_trace_drag_out`: an object outside the
             // nursery needs nothing changed, *except* that a young rawmalloced
             // one must be flagged so the end of this collection promotes rather
             // than frees it.
@@ -5610,7 +5609,7 @@ impl MiniMarkGC {
         //
         // An object outside both generations reaches a major only through
         // `prebuilt_root_objects`, which `collect_nonstack_roots`
-        // (`incminimark.py:2705-2707`) walks separately. `incminimark.py:2782`
+        // (`incminimark.py`) walks separately. `incminimark.py`
         // states the invariant that makes any other admission unsound: such an
         // object "should be in 'prebuilt_root_objects', and the GCFLAG_VISITED
         // will be reset at the end of the collection" — and the only reset pass
@@ -5889,7 +5888,7 @@ impl MiniMarkGC {
         // root sets as minor collection, but mark old objects instead of
         // copying nursery objects.
         // `prebuilt_root_objects.foreach(self._collect_obj, None)`
-        // (incminimark.py:2707) walks the stack in place.  Index rather than
+        // (incminimark.py) walks the stack in place.  Index rather than
         // clone: `seed_prebuilt_root` only sets header flags and pushes onto
         // the gray stack, so the list cannot move under the loop, and the
         // clone was a full copy of every prebuilt root per major cycle.
@@ -6232,7 +6231,7 @@ impl MiniMarkGC {
 
     /// `incminimark.py raw_malloc_memory_pressure`, including the
     /// framework transform's object-owned field store
-    /// (`gctransform/framework.py:861-878`). A negative size releases
+    /// (`gctransform/framework.py`). A negative size releases
     /// previously reported pressure just as upstream does.
     pub fn do_add_memory_pressure(&mut self, size: isize, object: GcRef) {
         // The forced-top store below rewrites the same published free/top words
@@ -6422,7 +6421,7 @@ impl MiniMarkGC {
         // A host-side raw local can still hold a just-forwarded nursery
         // address, whose header word is a forwarding pointer rather than
         // flags — toggling GCFLAG_EXTRA on it would write through that word.
-        // Reject exactly that, not every young object: `referents.py:53-78`
+        // Reject exactly that, not every young object: `referents.py _list_w_obj_referents`
         // does not require an empty nursery, and a live nursery object is an
         // ordinary app-level referent source.
         if self.is_in_nursery(obj.0) && unsafe { (*header_of(obj.0)).is_forwarded() } {
@@ -7094,7 +7093,7 @@ impl MiniMarkGC {
         GcHeader::SIZE + self.size_for_typeid(obj_addr, type_id, "object_total_size")
     }
 
-    /// `base.py get_size` / `inspector.py:76-77
+    /// `base.py get_size` / `inspector.py get_rpy_memory_usage
     /// get_rpy_memory_usage`.  The inspector reports the translated object
     /// size, not the collector header.  Fixed-size rows are already rounded by
     /// `gctypelayout.encode_type_shape`; variable-size rows are rounded after
@@ -7328,7 +7327,7 @@ impl MiniMarkGC {
     /// `W_TupleObject.wrappeditems` → `std::alloc`'d ItemsBlock). In that
     /// window calling `header_of` on the field would dereference memory before
     /// the std::alloc'd block. Upstream RPython `_collect_obj`
-    /// (incminimark.py:2739-2752) does not need this guard because RPython's
+    /// (incminimark.py) does not need this guard because RPython's
     /// type system guarantees every `Ptr(GcStruct)` is GC-managed; it converges
     /// away once every `gc_ptr_offsets` target is a real GC allocation.
     fn grey_child(&mut self, addr: usize, holder_addr: usize, slot_addr: usize, site: &str) {
@@ -7745,7 +7744,7 @@ impl MiniMarkGC {
         // raw_malloc_might_sweep. Promotions between sweep steps therefore
         // allocate into fresh lists and are not candidates in this cycle.
         //
-        // incminimark.py:1312-1313 `debug_check_consistency` asserts the young
+        // incminimark.py `debug_check_consistency` asserts the young
         // raw-malloc list is empty by now, which holds for every major that ran
         // a minor first. `do_collect_oldgen_nonmoving` runs no minor — the
         // interpreter has no shadow-stack pass, so a minor there would relocate
@@ -7962,7 +7961,7 @@ impl MiniMarkGC {
     ///     bit. Live target → keep the weakref in a fresh list.
     ///     Dying target → null the slot and drop the weakref.
     ///
-    /// incminimark.py:3120-3121 also treats FINALIZATION_ORDERING targets as
+    /// incminimark.py also treats FINALIZATION_ORDERING targets as
     /// dying for weakref purposes even though finalizer-queue reachability has
     /// marked them VISITED; the check below preserves that ordering.
     fn invalidate_old_weakrefs(&mut self) {
@@ -8346,7 +8345,7 @@ impl MiniMarkGC {
 
         // The rest of that same `gc_step_until(STATE_MARKING)` iteration.
         // Reaching MARKING through `major_collection_step` is what runs the
-        // STATE_SCANNING arm (incminimark.py:2438-2447), which resets
+        // STATE_SCANNING arm (incminimark.py), which resets
         // `size_objects_made_old` / `threshold_objects_made_old` before
         // `collect_roots`; calling `start_incremental_cycle` directly opened
         // the cycle with the finishing cycle's counters still in place.
@@ -8595,7 +8594,7 @@ impl MiniMarkGC {
     /// (`framework.py:538-544`), the unguarded entry the array barrier already
     /// reaches through `jit_remember_young_pointer_from_array`.
     /// `_reload_frame_if_necessary`
-    /// (aarch64/assembler.py:967-980) re-applies the non-array barrier fast
+    /// (aarch64/assembler.py) re-applies the non-array barrier fast
     /// path to the *current jitframe* after every collecting helper call.
     /// Not every jitframe is nursery-allocated: the runner's entry frame, the
     /// realloc slowpath, and the JITFRAME nursery slowpath's fallback build
@@ -9871,7 +9870,7 @@ impl GcAllocator for MiniMarkGC {
     }
 
     fn gc_memory_stats(&self) -> crate::GcMemoryStats {
-        // incminimark.py:3128-3154. The nursery contribution is its reserved
+        // incminimark.py get_stats. The nursery contribution is its reserved
         // capacity, not its current bump-pointer fill.
         let nursery_size = self.config.nursery_size;
         crate::GcMemoryStats {
@@ -10020,7 +10019,7 @@ impl GcAllocator for MiniMarkGC {
     /// base address of the materialized `type_info_group` table, the
     /// SIB-style scale `genop_guard_guard_is_object` /
     /// `genop_guard_guard_subclass` apply to the typeid register
-    /// (x86/assembler.py:1934, 1967), and `rffi.sizeof(TYPE_INFO)`.
+    /// (x86/assembler.py, 1967), and `rffi.sizeof(TYPE_INFO)`.
     ///
     /// RPython's 64-bit port sets `shift_by = 0` because its typeid
     /// is already `GROUP_MEMBER_OFFSET`, i.e. the raw byte offset of
@@ -10034,7 +10033,7 @@ impl GcAllocator for MiniMarkGC {
     /// `rffi.sizeof(TYPE_INFO)` because that is the distance to the
     /// paired `CLASSTYPE` entry the `genop_guard_guard_subclass`
     /// formula needs (`+ sizeof_ti + offset2`
-    /// x86/assembler.py:1968-1969, gctypelayout.py:359-374
+    /// x86/assembler.py, gctypelayout.py add_vtable_after_typeinfo
     /// `add_vtable_after_typeinfo`).
     fn get_translated_info_for_typeinfo(&self) -> (usize, u8, usize) {
         let table = self.types.type_info_table();
@@ -10062,7 +10061,7 @@ impl GcAllocator for MiniMarkGC {
     /// Byte offset of `subclassrange_min` inside `ClassTypeLayout`,
     /// the paired `rclass.CLASSTYPE` member that immediately follows
     /// the `TYPE_INFO` entry in the type_info_group
-    /// (gctypelayout.py:359-374).
+    /// (gctypelayout.py add_vtable_after_typeinfo).
     fn subclassrange_min_offset(&self) -> usize {
         ClassTypeLayout::SUBCLASSRANGE_MIN_OFFSET
     }
@@ -10120,7 +10119,7 @@ impl GcAllocator for MiniMarkGC {
 
     /// Companion to `check_is_object` keyed by typeid. Reads the
     /// `T_IS_RPYTHON_INSTANCE` bit directly from the materialized
-    /// TYPE_INFO entry (gctypelayout.py:642).
+    /// TYPE_INFO entry (gctypelayout.py).
     fn typeid_is_object(&self, typeid: u32) -> Option<bool> {
         if (typeid as usize) >= self.types.len() {
             return None;
@@ -10279,7 +10278,7 @@ mod tests {
         assert_eq!(gc.nursery.start_ptr() as usize, before);
     }
 
-    /// incminimark.py:1890-1893 `free_young_rawmalloced_objects`: an
+    /// incminimark.py `free_young_rawmalloced_objects`: an
     /// oversized object nothing reached is freed by the minor, not carried to
     /// the next major.
     #[test]
@@ -10447,7 +10446,7 @@ mod tests {
         );
     }
 
-    /// incminimark.py:1755-1760 `register_finalizer` appends to
+    /// incminimark.py `register_finalizer` appends to
     /// `probably_young_objects_with_finalizers` unconditionally, and that deque
     /// is what makes the registration a root for the next minor.
     /// `deal_with_young_objects_with_finalizers` is already written for a
@@ -11434,7 +11433,7 @@ mod tests {
             (result_tid, pinned)
         }
 
-        // incminimark.py:865-930 walks back to the free gap before a pinned
+        // incminimark.py collect_and_reserve walks back to the free gap before a pinned
         // object. The old fallback returned an old-gen object here, violating
         // the fresh nursery allocation contract used by the GC rewrite.
         let mut gc = test_gc(1024);
@@ -12057,7 +12056,9 @@ mod tests {
         assert!(gc.is_young_rawmalloced(at_boundary.0));
     }
 
-    // --- Lightweight destructor tests (incminimark.py:2884-2912 parity) ---
+    // Lightweight destructor tests (incminimark.py
+    // deal_with_young_objects_with_destructors /
+    // deal_with_old_objects_with_destructors)
     //
     // The counting destructor below deliberately does NOT `drop_in_place`
     // the dummy payload (the test allocations are raw bytes, not a real
@@ -12291,7 +12292,7 @@ mod tests {
         assert!(unsafe { (*header_of(obj.0)).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS) });
     }
 
-    /// incminimark.py:1160-1182 `shrink_array` on the object it accepts: the
+    /// incminimark.py `shrink_array` on the object it accepts: the
     /// nursery array keeps its address and reports the smaller length, which
     /// is what a caller returning `p` unchanged relies on.
     #[test]
@@ -12329,7 +12330,7 @@ mod tests {
         assert_eq!(unsafe { *((obj.0 + 8) as *const usize) }, 12);
     }
 
-    /// incminimark.py:1171-1172: a nursery object with GCFLAG_HAS_SHADOW is
+    /// incminimark.py: a nursery object with GCFLAG_HAS_SHADOW is
     /// not resized either, "as this would potentially loose part of the memory
     /// in the already-allocated shadow".
     #[test]
@@ -12609,7 +12610,7 @@ mod tests {
     #[test]
     fn write_barrier_ignores_unmanaged_jitframe_with_flag_byte_set() {
         // `_reload_frame_if_necessary` (aarch64/assembler.py,
-        // x86/assembler.py:1369) re-applies the NON-array write-barrier fast
+        // x86/assembler.py) re-applies the NON-array write-barrier fast
         // path to the current jitframe after a collecting helper call, so a
         // plain COND_CALL_GC_WB on the frame reaches the generic barrier at
         // runtime.
@@ -15214,12 +15215,12 @@ cache size\t: 8192 kB\n";
         let mut gc = test_gc(4096);
         gc.register_type(TypeInfo::simple(16));
 
-        // rgc.py:229 — a young nursery object can still move.
+        // rgc.py can_move — a young nursery object can still move.
         let obj = gc.alloc_with_type(0, 16);
         assert!(gc.is_in_nursery(obj.0));
         assert!(gc.can_move(obj));
 
-        // incminimark.py:1117-1119 answers by nursery membership even while
+        // incminimark.py can_move answers by nursery membership even while
         // the object's PINNED flag temporarily prevents an actual move.
         assert!(gc.pin(obj));
         assert!(gc.can_move(obj));
@@ -16320,7 +16321,7 @@ cache size\t: 8192 kB\n";
     /// `rgc.py` contracts `register_finalizer` to run at most once per
     /// object. Registering twice used to leave two deque entries: the first
     /// major delivers the object and re-appends the survivor through
-    /// `new_with_finalizer` (incminimark.py:2944-2946), so the next major
+    /// `new_with_finalizer` (incminimark.py), so the next major
     /// delivers it again and the app-level `__del__` runs a second time.
     #[test]
     fn register_finalizer_delivers_an_object_once_however_often_it_is_registered() {
@@ -16783,7 +16784,7 @@ cache size\t: 8192 kB\n";
         gc
     }
 
-    /// incminimark.py:3259-3270 and :3284-3318: a count above the link share is
+    /// incminimark.py _rrc_minor_trace and :3284-3318: a count above the link share is
     /// a reference the C side holds, and it keeps the linked object alive
     /// across a minor with no interpreter root at all.  The link then follows
     /// the object to its new address, and the identity table is re-keyed there.
@@ -17007,7 +17008,7 @@ cache size\t: 8192 kB\n";
         gc.roots.remove(&mut object);
     }
 
-    /// incminimark.py:3223-3227: the deallocating marker replaces the link, so
+    /// incminimark.py rawrefcount_mark_deallocating: the deallocating marker replaces the link, so
     /// a re-entrant lookup during a deallocator cannot hand back an address the
     /// collector has already reclaimed.
     #[test]

@@ -7,7 +7,7 @@
 //!
 //! Pure data only. The `Rc<RefCell<…>>` wrappers around `IntBound` /
 //! `PtrInfo` provide shared-identity semantics matching PyPy's
-//! `_forwarded` slot — see `info.py:865-894 get*ptrinfo` "return fw".
+//! `_forwarded` slot — see `info.py get*ptrinfo` "return fw".
 
 use crate::intbound::{IntBound, IntBoundRc};
 use crate::ptr_info::PtrInfo;
@@ -46,7 +46,7 @@ impl EmptyInfo {
 /// the same object-identity semantics as RPython's `_forwarded` slot:
 /// when two `_forwarded` slots are set to the same `Ptr(rc.clone())`,
 /// in-place mutations through one handle are observable through the
-/// other. `IntBound` is similarly wrapped so `optimizer.py:99-113
+/// other. `IntBound` is similarly wrapped so `optimizer.py getintbound
 /// getintbound` mutations propagate.
 #[derive(Clone)]
 pub enum OpInfo {

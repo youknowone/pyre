@@ -291,7 +291,7 @@ impl FrameState {
     /// RPython `FrameState.getoutputargs` — "Return the output
     /// arguments needed to link self to targetstate."
     ///
-    /// Upstream (`framestate.py:92-99`) iterates over
+    /// Upstream (`framestate.py`) iterates over
     /// `targetstate.mergeable`, and for every cell that is a
     /// `Variable` on the target side, appends `self.mergeable[i]`
     /// — whatever it is — to the result list. `self.mergeable[i]`
@@ -314,7 +314,7 @@ impl FrameState {
     }
 }
 
-// ---- free functions --------------------------------------------------------
+// free functions
 
 /// RPython `framestate.py:_copy` — deep-copy a cell so every Variable
 /// becomes a fresh one.

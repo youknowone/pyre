@@ -217,7 +217,7 @@ pyre_interpreter::py_module! {
             Ok(w_bytes_from_bytes(&transforms::b2a_qp(&data, quotetabs, istext, header)))
         }
         // `a2b_base64(data, /, *, strict_mode=False)` — `data` positional-only,
-        // `strict_mode` keyword-only.  interp_base64.py:39
+        // `strict_mode` keyword-only.  interp_base64.py
         // `a2b_base64(ascii, strict_mode=0)` marks no `__kwonly__`, so upstream
         // keeps `strict_mode` positional-or-keyword; the keyword-only form here
         // predates this change and matches the 3.11+ accelerator signature.
@@ -262,7 +262,7 @@ pyre_interpreter::py_module! {
         }
     },
     functions: {
-        // interp_hexlify.py `unhexlify(hexstr)` / interp_uu.py:25
+        // interp_hexlify.py `unhexlify(hexstr)` / interp_uu.py a2b_uu
         // `a2b_uu(ascii)` — a single positional argument, no keyword surface.
         "a2b_hex" / 1 = |args| {
             let data = as_bytes(args.first().copied().unwrap_or(w_none()))?;
@@ -281,7 +281,7 @@ pyre_interpreter::py_module! {
         },
     },
     extra_init: |ns| {
-        // interp_crc32.py `crc32(data, oldcrc=0)` and interp_hqx.py:254
+        // interp_crc32.py `crc32(data, oldcrc=0)` and interp_hqx.py crc_hqx
         // `crc_hqx(data, w_oldcrc)`.  Both are all-positional-only, a shape the
         // `#[pyre_function]` `#[posonly]` marker cannot express (there is no
         // trailing parameter to mark the boundary before), so their

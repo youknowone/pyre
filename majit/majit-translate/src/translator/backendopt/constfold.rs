@@ -13,7 +13,7 @@ use crate::translator::simplify;
 use crate::translator::unsimplify::{insert_empty_block, split_block};
 
 /// Heterogeneous map used by the link-level constant-fold pass.
-/// Upstream `constfold.py:156-256` carries values that may be either
+/// Upstream `constfold.py complete_constants` carries values that may be either
 /// fold-result Constants (added by `fold_op_list`), link-arg Hlvalues
 /// (added by `complete_constants`), or fresh Variables (added by
 /// `prepare_constant_fold_link`'s indirect-call rewrite). Python's
@@ -37,7 +37,7 @@ struct LinkSplit {
 type SplitBlocks = HashMap<BlockKey, (BlockRef, Vec<LinkSplit>)>;
 
 /// RPython `fold_op_list(block, constants, exit_early=False,
-/// exc_catch=False)` at `constfold.py:10-100`.
+/// exc_catch=False)` at `constfold.py`.
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
@@ -227,7 +227,7 @@ fn fold_op_list(
 /// `exit_early=True` and `newops` (list) otherwise. The Rust enum fuses
 /// both shapes; `Count(usize)` carries the upstream `folded_count`
 /// value verbatim because upstream `prepare_constant_fold_link`
-/// (`constfold.py:205-231`) reads it to decide how many ops to skip
+/// (`constfold.py`) reads it to decide how many ops to skip
 /// when splitting the target block — making the count load-bearing
 /// rather than ornamental observability.
 enum FoldOpListResult {
@@ -331,7 +331,7 @@ pub fn constant_fold_block(block: &BlockRef) {
 /// because they flow into different storage. Upstream then special-
 /// cases `lltype.Ptr` GC pointers (compares by `value` only) and
 /// otherwise compares Constant equality (`c1 == c2` — `Hashable.__eq__`
-/// at `rpython/tool/uid.py:41`, which is `same class + same key`, where
+/// at `rpython/tool/uid.py`, which is `same class + same key`, where
 /// `key = (type(value), value)` for hashable immutable values; falls
 /// back to `id(self.value)` for unhashable values like `list` / `dict`).
 ///
@@ -385,7 +385,7 @@ fn linkarg_is(a: &LinkArg, b: &LinkArg) -> bool {
 }
 
 /// RPython `complete_constants(link, constants)` at
-/// `constfold.py:156-165`.
+/// `constfold.py`.
 ///
 /// Walks `zip(link.args, link.target.inputargs)` and, for each
 /// target inputarg `v2` not yet present in `constants`, records the
@@ -430,7 +430,7 @@ pub(crate) fn complete_constants(link: &LinkRef, constants: &mut LinkConstants) 
 }
 
 /// RPython `rewire_link_for_known_exitswitch(link1, llexitvalue)` at
-/// `constfold.py:167-193`.
+/// `constfold.py`.
 ///
 /// When `link1.target` is an op-less block whose only role is to
 /// switch on a constant value, rewire `link1` directly to the chosen
@@ -518,7 +518,7 @@ pub(crate) fn rewire_link_for_known_exitswitch(link1: &LinkRef, llexitvalue: &Co
 }
 
 /// RPython `prepare_constant_fold_link(link, constants, splitblocks)`
-/// at `constfold.py:195-231`.
+/// at `constfold.py`.
 ///
 /// Tries to fold the prefix of the link's target block under the
 /// constants known on this link. If folding succeeds, records a split
@@ -1068,7 +1068,7 @@ pub fn constant_fold_graph(graph: &FunctionGraph) {
 }
 
 /// RPython `replace_symbolic(graph, symbolic, value)` at
-/// `constfold.py:372-383`.
+/// `constfold.py`.
 ///
 /// Upstream's `arg.value is symbolic` (Python `is`) compares object
 /// identity — only literally the same object passed in by the caller

@@ -10,7 +10,7 @@
 use crate::{make_builtin_function, make_builtin_function_with_arity};
 use pyre_object::*;
 
-/// `_ATTR_EXCEPTIONS` (`_pypy_generic_alias.py:1`) — attribute names that
+/// `_ATTR_EXCEPTIONS` (`_pypy_generic_alias.py`) — attribute names that
 /// resolve on the alias itself; every other name delegates to the
 /// `__origin__` through `__getattribute__`.
 pub(crate) const ATTR_EXCEPTIONS: &[&str] = &[
@@ -73,7 +73,7 @@ pub fn generic_alias_class_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     make_generic_alias(args[0], args[1])
 }
 
-/// `GenericAlias.__new__` (`_pypy_generic_alias.py:19`) — wrap a bare item
+/// `GenericAlias.__new__` (`_pypy_generic_alias.py`) — wrap a bare item
 /// into a 1-tuple, collect the free parameters, allocate.
 pub fn make_generic_alias(origin: PyObjectRef, item: PyObjectRef) -> crate::PyResult {
     // `collect_parameters` runs Python at every turn of its walk, and the
@@ -98,7 +98,7 @@ pub fn make_generic_alias(origin: PyObjectRef, item: PyObjectRef) -> crate::PyRe
     Ok(w_generic_alias_new(origin(), args(), parameters))
 }
 
-/// `_collect_parameters(args)` (`_pypy_generic_alias.py:150`) — gather the
+/// `_collect_parameters(args)` (`_pypy_generic_alias.py`) — gather the
 /// free type variables in order of first appearance.
 pub(crate) fn collect_parameters(args: PyObjectRef) -> crate::PyResult {
     // Every turn of this walk runs Python — the `__typing_subst__` and
@@ -258,7 +258,7 @@ fn self_alias(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(self_)
 }
 
-/// `GenericAlias.__repr__` (`_pypy_generic_alias.py:57`).
+/// `GenericAlias.__repr__` (`_pypy_generic_alias.py`).
 fn ga_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
     Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
@@ -266,13 +266,13 @@ fn ga_repr(args: &[PyObjectRef]) -> crate::PyResult {
     }))
 }
 
-/// `GenericAlias.__hash__` (`_pypy_generic_alias.py:82`).
+/// `GenericAlias.__hash__` (`_pypy_generic_alias.py`).
 fn ga_hash(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
     Ok(w_int_new(crate::builtins::try_hash_value(self_)?))
 }
 
-/// `GenericAlias.__call__` (`_pypy_generic_alias.py:41-46`).
+/// `GenericAlias.__call__` (`_pypy_generic_alias.py`).
 fn ga_call(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
     let origin = unsafe { w_generic_alias_get_origin(self_) };
@@ -292,7 +292,7 @@ fn ga_call(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(unsafe { pyre_object::gc_roots::shadow_stack_get(root_base + 2) })
 }
 
-/// `GenericAlias.__getattribute__` (`_pypy_generic_alias.py:52-55`).
+/// `GenericAlias.__getattribute__` (`_pypy_generic_alias.py`).
 fn ga_getattribute(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
     let name_obj = args.get(1).copied().unwrap_or_else(w_none);
@@ -305,7 +305,7 @@ fn ga_getattribute(args: &[PyObjectRef]) -> crate::PyResult {
     }
 }
 
-/// `GenericAlias.__iter__` (`_pypy_generic_alias.py:108-109`).
+/// `GenericAlias.__iter__` (`_pypy_generic_alias.py`).
 fn ga_iter(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
     let _roots = pyre_object::gc_roots::push_roots();
@@ -321,12 +321,12 @@ fn ga_iter(args: &[PyObjectRef]) -> crate::PyResult {
     crate::baseobjspace::iter(unsafe { pyre_object::gc_roots::shadow_stack_get(singleton_slot) })
 }
 
-/// `GenericAlias.__dir__` (`_pypy_generic_alias.py:85-88`).
+/// `GenericAlias.__dir__` (`_pypy_generic_alias.py`).
 fn ga_dir(args: &[PyObjectRef]) -> crate::PyResult {
     dir_list(self_alias(args)?)
 }
 
-/// `GenericAlias.__eq__` (`_pypy_generic_alias.py:64`).
+/// `GenericAlias.__eq__` (`_pypy_generic_alias.py`).
 fn ga_eq(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = args.first().copied().unwrap_or_else(w_none);
     let other = args.get(1).copied().unwrap_or_else(w_none);
@@ -361,7 +361,7 @@ fn ga_ordering(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_not_implemented())
 }
 
-/// `GenericAlias.__mro_entries__` (`_pypy_generic_alias.py:49`) —
+/// `GenericAlias.__mro_entries__` (`_pypy_generic_alias.py`) —
 /// `(self.__origin__,)`, so `class C(list[int])` resolves to `list`.
 fn ga_mro_entries(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
@@ -369,7 +369,7 @@ fn ga_mro_entries(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_tuple_new(vec![origin]))
 }
 
-/// `GenericAlias.__getitem__` (`_pypy_generic_alias.py:71`) — substitute the
+/// `GenericAlias.__getitem__` (`_pypy_generic_alias.py`) — substitute the
 /// free parameters with `items` and build the resulting alias.
 fn ga_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
@@ -514,7 +514,7 @@ fn is_unpacked_typevartuple(x: PyObjectRef) -> Result<bool, crate::PyError> {
 }
 
 /// `isinstance(param, TypeVarTuple)` — mirrors `_is_typevar`'s bootstrapping
-/// shortcut (`_pypy_generic_alias.py:146`): match the parameter's type by
+/// shortcut (`_pypy_generic_alias.py`): match the parameter's type by
 /// `__name__` + `__module__` rather than importing `typing`.
 fn is_typevartuple(param: PyObjectRef) -> bool {
     let Some(t) = crate::typedef::r#type(param) else {
@@ -531,7 +531,7 @@ fn is_typevartuple(param: PyObjectRef) -> bool {
     )
 }
 
-/// `subs_parameters(self, args, params, items)` (`_pypy_generic_alias.py:207`)
+/// `subs_parameters(self, args, params, items)` (`_pypy_generic_alias.py`)
 /// — produce the substituted `__args__` for `self[items]`.  Shared by
 /// `GenericAlias.__getitem__` and `UnionType.__getitem__`.
 pub(crate) fn subs_parameters(
@@ -801,7 +801,7 @@ pub(crate) fn subs_parameters(
     Ok(newargs)
 }
 
-/// `subs_tvars(obj, params, argitems)` (`_pypy_generic_alias.py:183`) —
+/// `subs_tvars(obj, params, argitems)` (`_pypy_generic_alias.py`) —
 /// substitute the parameters of a nested generic and re-subscript it.
 fn subs_tvars(
     obj: PyObjectRef,
@@ -872,7 +872,7 @@ fn subs_tvars(
     crate::baseobjspace::getitem(obj(), subs)
 }
 
-/// `_make_starred(ga)` (`_pypy_generic_alias.py:118`) — a copy of the alias
+/// `_make_starred(ga)` (`_pypy_generic_alias.py`) — a copy of the alias
 /// flagged unpacked, so it renders `*X[...]` and `iter()` yields it.
 pub(crate) fn make_starred(ga: PyObjectRef) -> crate::PyResult {
     let origin = unsafe { w_generic_alias_get_origin(ga) };
@@ -941,7 +941,7 @@ fn ga_get_unpacked(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 /// `GenericAlias.__typing_unpacked_tuple_args__` getset
-/// (`_pypy_generic_alias.py:111`) — `args` when the alias is an unpacked
+/// (`_pypy_generic_alias.py`) — `args` when the alias is an unpacked
 /// `tuple[...]`, else `None`.
 fn ga_get_typing_unpacked_tuple_args(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = args.get(1).copied().unwrap_or_else(w_none);
@@ -958,7 +958,7 @@ fn ga_get_typing_unpacked_tuple_args(args: &[PyObjectRef]) -> crate::PyResult {
     }
 }
 
-/// `GenericAlias.__dir__` (`_pypy_generic_alias.py:85`) —
+/// `GenericAlias.__dir__` (`_pypy_generic_alias.py`) —
 /// `sorted(_ATTR_EXCEPTIONS | set(dir(origin)))`.  Invoked from
 /// `builtins::builtin_dir` for a GenericAlias receiver.
 pub(crate) fn dir_list(ga: PyObjectRef) -> crate::PyResult {
@@ -983,7 +983,7 @@ pub(crate) fn dir_list(ga: PyObjectRef) -> crate::PyResult {
     Ok(w_list_new(items.take()))
 }
 
-/// `add_recurse` (`_pypy_generic_alias.py:253-255`) maps a bare `None`
+/// `add_recurse` (`_pypy_generic_alias.py`) maps a bare `None`
 /// operand to `type(None)` before it lands in `__args__`, so
 /// `(int | None).__args__` is `(int, NoneType)`.
 fn normalize_none(x: PyObjectRef) -> PyObjectRef {
@@ -994,7 +994,7 @@ fn normalize_none(x: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// `_create_union(x, y)` (`_pypy_generic_alias.py:328`) — both operands
+/// `_create_union(x, y)` (`_pypy_generic_alias.py`) — both operands
 /// must be unionable, else `NotImplemented`; identical operands collapse.
 pub fn create_union(x: PyObjectRef, y: PyObjectRef) -> crate::PyResult {
     use crate::objspace::descroperation::unionable;
@@ -1364,35 +1364,35 @@ pub(crate) fn union_hash_value(union: PyObjectRef) -> Result<i64, crate::PyError
     }
 }
 
-/// `GenericAlias.__or__` (`_pypy_generic_alias.py:102`) — `X[...] | Y`.
+/// `GenericAlias.__or__` (`_pypy_generic_alias.py`) — `X[...] | Y`.
 fn ga_or(args: &[PyObjectRef]) -> crate::PyResult {
     let a = args.first().copied().unwrap_or_else(w_none);
     let b = args.get(1).copied().unwrap_or_else(w_none);
     create_union(a, b)
 }
 
-/// `GenericAlias.__ror__` (`_pypy_generic_alias.py:105`) — `Y | X[...]`.
+/// `GenericAlias.__ror__` (`_pypy_generic_alias.py`) — `Y | X[...]`.
 fn ga_ror(args: &[PyObjectRef]) -> crate::PyResult {
     let a = args.first().copied().unwrap_or_else(w_none);
     let b = args.get(1).copied().unwrap_or_else(w_none);
     create_union(b, a)
 }
 
-/// `GenericAlias.__instancecheck__` (`_pypy_generic_alias.py:93`).
+/// `GenericAlias.__instancecheck__` (`_pypy_generic_alias.py`).
 fn ga_instancecheck(_args: &[PyObjectRef]) -> crate::PyResult {
     Err(crate::PyError::type_error(
         "isinstance() argument 2 cannot be a parameterized generic",
     ))
 }
 
-/// `GenericAlias.__subclasscheck__` (`_pypy_generic_alias.py:90`).
+/// `GenericAlias.__subclasscheck__` (`_pypy_generic_alias.py`).
 fn ga_subclasscheck(_args: &[PyObjectRef]) -> crate::PyResult {
     Err(crate::PyError::type_error(
         "issubclass() argument 2 cannot be a parameterized generic",
     ))
 }
 
-/// `GenericAlias.__new__(cls, origin, args)` (`_pypy_generic_alias.py:19`)
+/// `GenericAlias.__new__(cls, origin, args)` (`_pypy_generic_alias.py`)
 /// — the public `types.GenericAlias(list, int)` constructor.
 fn ga_new(args: &[PyObjectRef]) -> crate::PyResult {
     if args.len() != 3 {
@@ -1577,7 +1577,7 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
 }
 
 /// Render a GenericAlias for `repr()` (`GenericAlias.__repr__`,
-/// `_pypy_generic_alias.py:57`).  Implemented here (not as a typedef
+/// `_pypy_generic_alias.py`).  Implemented here (not as a typedef
 /// `__repr__`) so it matches the builtin-W_Root repr architecture, where
 /// `display::py_repr` owns the rendering and explicit `.__repr__` access
 /// still delegates to `__origin__`.
@@ -1692,7 +1692,7 @@ unsafe fn repr_items_list(list: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf,
     ))
 }
 
-/// `_repr_item(it)` (`_pypy_generic_alias.py:124`) — a class renders as its
+/// `_repr_item(it)` (`_pypy_generic_alias.py`) — a class renders as its
 /// qualname (prefixed with the module when it is not `builtins`); anything
 /// else falls back to `repr`.
 pub(crate) unsafe fn repr_item(

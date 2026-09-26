@@ -160,7 +160,7 @@ fn mapped_rbigint_methods_and_helpers_follow_upstream_source_order() {
         .expect("compatibility RBigInt impl");
     let core = &source[core_start..compatibility_start];
 
-    // rpython/rlib/rbigint.py:99-114.  Each suffix is one concrete graph
+    // rpython/rlib/rbigint.py.  Each suffix is one concrete graph
     // emitted by the corresponding `@specialize.argtype(0)` decorator.
     assert_source_order(
         &source[..core_start],
@@ -179,7 +179,7 @@ fn mapped_rbigint_methods_and_helpers_follow_upstream_source_order() {
         ],
     );
 
-    // rpython/rlib/rbigint.py:168-1631. Rust-only allocation and storage
+    // rpython/rlib/rbigint.py. Rust-only allocation and storage
     // helpers may appear between these methods, but every translated upstream
     // method must retain the original relative order. Python special methods
     // represented by Rust traits are deliberately outside this inherent impl.
@@ -301,7 +301,7 @@ fn mapped_rbigint_methods_and_helpers_follow_upstream_source_order() {
         );
     }
 
-    // rpython/rlib/rbigint.py:1671-3814. Owner structs and Rust GC hooks are
+    // rpython/rlib/rbigint.py. Owner structs and Rust GC hooks are
     // allowed between mapped helpers; the upstream algorithm sequence is not.
     let helpers = &source[compatibility_start..];
     assert_source_order(

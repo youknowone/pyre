@@ -9,7 +9,7 @@ use super::*;
 /// emits the runtime `TypeId`-based identity helper. The same id keys the
 /// builder's `struct_size_specs` cache so each
 /// `setfield_gc_*` resolves its field's parent SizeDescr + `index_in_parent`
-/// (`descr.py:238`).  Distinct struct paths collide only at `DefaultHasher`'s
+/// (`descr.py`).  Distinct struct paths collide only at `DefaultHasher`'s
 /// 64-bit range, matching the runtime `LLType::Struct(type_id)` cache-key
 /// identity.
 ///
@@ -187,11 +187,11 @@ impl<'c> Lowerer<'c> {
         if let Some(binding) = self.lower_vable_hint_identity_call(expr) {
             return Some(binding);
         }
-        // RPython jtransform.py:1687 — conditional_call_elidable!(value, func, args...)
+        // RPython jtransform.py rewrite_op_jit_conditional_call_value — conditional_call_elidable!(value, func, args...)
         if let Some(binding) = self.lower_conditional_call_elidable(expr) {
             return Some(binding);
         }
-        // RPython jtransform.py:522 — recursive_portal_call!(driver, greens...)
+        // RPython jtransform.py handle_recursive_call — recursive_portal_call!(driver, greens...)
         if let Some(binding) = self.lower_recursive_portal_call(expr) {
             return Some(binding);
         }
@@ -1035,7 +1035,7 @@ impl<'c> Lowerer<'c> {
         }
         let value_reg = value_binding.reg;
         let cls_reg = cls_binding.reg;
-        // jtransform.py:289 emits a single SpaceOperation with no
+        // jtransform.py rewrite_op_jit_record_exact_class emits a single SpaceOperation with no
         // preceding `-live-` annotation (-live- is only attached to
         // promote, jtransform.py:611).
         self.emit_op(
@@ -1087,7 +1087,7 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         let reg = binding.reg;
-        // jtransform.py:324-328 emits a single SpaceOperation with no
+        // jtransform.py rewrite_op_debug_assert_not_none emits a single SpaceOperation with no
         // preceding `-live-` annotation (-live- is only attached to
         // promote, jtransform.py:611).
         self.emit_op(
@@ -1915,7 +1915,7 @@ impl<'c> Lowerer<'c> {
                     // jtransform.py:467/480-482 — `inline_call_*` is always
                     // followed by `-live-`; a residual call (`call_*`)
                     // appends `-live-` only when `calldescr_canraise(calldescr)`
-                    // (`call.py:295-300`).  In inferred mode the policy
+                    // (`call.py`).  In inferred mode the policy
                     // byte selects the calldescr at runtime, so emit the
                     // marker conditional on the can-raise codes plus the
                     // inline byte (4u8) which forces emit per

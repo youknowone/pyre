@@ -152,9 +152,7 @@ fn register_transform(
     reg.entry(op).or_default().insert(tag, tx);
 }
 
-// =====================================================================
 // unaryop.py:31-33 — @op.type.register(SomeObject)
-// =====================================================================
 //
 //     @op.type.register(SomeObject)
 //     def type_SomeObject(annotator, v_arg):
@@ -201,9 +199,7 @@ fn init_type_register(
     );
 }
 
-// =====================================================================
 // unaryop.py:91-111 — @op.contains.register(SomeObject|SomeNone|…)
-// =====================================================================
 
 #[allow(non_snake_case)]
 pub fn contains_SomeObject(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
@@ -266,9 +262,7 @@ fn init_contains_register(
     }
 }
 
-// =====================================================================
 // unaryop.py, 147-153, 1023-1027 — isinstance / issubtype
-// =====================================================================
 
 enum TypeDesc {
     Builtin(BuiltinTypeDesc),
@@ -502,9 +496,7 @@ fn issubtype_SomeTypeOf(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     s_isinstance(ann, &s_obj, &s_cls, type_of.is_type_of.to_vec())
 }
 
-// =====================================================================
 // unaryop.py — class __extend__(SomeObject) simple-return defaults
-// =====================================================================
 //
 // `class __extend__(SomeObject)` upstream defines the defaults fetched by
 // `SingleDispatchMixin.get_specialization` when `getattr(s_arg, opname)`
@@ -578,9 +570,9 @@ pub fn simple_call_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> Optio
     //     return s_func.call(argspec)
     //
     // `annotator.annotation(arg)` returns `None` when the variable is
-    // not yet bound (`annrpython.py:273-280`); pyre's
+    // not yet bound (`annrpython.py`); pyre's
     // `arguments_w: Vec<Option<SomeValue>>` carries the None through
-    // to consumers, matching `bookkeeper.py:152` parity. When
+    // to consumers, matching `bookkeeper.py consider_call_site` parity. When
     // `s_func` itself is unbound, the call is deferred (return
     // Impossible so the fixpoint propagates Bottom upward; the next
     // round re-fires once the callable's annotation populates).
@@ -772,7 +764,7 @@ fn init_someobject_defaults(
                 if let Some(s_method) = s_self.find_method(&attr) {
                     return s_method;
                 }
-                // upstream unaryop.py:215-229 constant receiver path
+                // upstream unaryop.py getattr constant receiver path
                 // shares the `getattr(obj, name)` call with
                 // `flowspace::operation::GetAttr.constfold`; both
                 // route through `const_runtime_getattr` and only
@@ -914,7 +906,7 @@ fn init_someobject_defaults(
     // `.call(argspec)` then routes to the type-specific handler:
     // `SomePBC.call → Bookkeeper.pbc_call → FunctionDesc.pycall →
     // annotator.recursivecall → addpendingblock`
-    // (`description.py:283-305`, `annrpython.py:315-336`).
+    // (`description.py`, `annrpython.py`).
     register(
         reg,
         OpKind::SimpleCall,
@@ -986,9 +978,7 @@ fn init_someobject_defaults(
     }
 }
 
-// =====================================================================
 // unaryop.py — class __extend__(SomeFloat)
-// =====================================================================
 
 fn init_somefloat_overrides(
     reg: &mut std::collections::HashMap<
@@ -1053,9 +1043,7 @@ fn init_somefloat_overrides(
     );
 }
 
-// =====================================================================
 // unaryop.py — class __extend__(SomeInteger)
-// =====================================================================
 
 fn init_someinteger_overrides(
     reg: &mut std::collections::HashMap<
@@ -1143,9 +1131,7 @@ fn init_someinteger_overrides(
     );
 }
 
-// =====================================================================
 // unaryop.py — class __extend__(SomeBool)
-// =====================================================================
 
 fn init_somebool_overrides(
     reg: &mut std::collections::HashMap<
@@ -1238,9 +1224,7 @@ fn init_somebool_overrides(
     );
 }
 
-// =====================================================================
 // unaryop.py — class __extend__(SomeTuple)
-// =====================================================================
 
 fn init_sometuple_overrides(
     reg: &mut std::collections::HashMap<
@@ -1341,9 +1325,7 @@ fn init_sometuple_overrides(
     );
 }
 
-// =====================================================================
 // unaryop.py — @op.contains.register(SomeList) + class __extend__(SomeList)
-// =====================================================================
 
 #[allow(non_snake_case)]
 pub fn contains_SomeList(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
@@ -1511,7 +1493,7 @@ fn init_somelist_overrides(
 }
 
 /// RPython `check_negative_slice(s_start, s_stop, error="slicing")`
-/// (unaryop.py:437-443). Helper shared by list and string slice paths.
+/// (unaryop.py). Helper shared by list and string slice paths.
 pub fn check_negative_slice(s_start: &SomeValue, s_stop: &SomeValue, error: &str) {
     if let SomeValue::Integer(i) = s_start
         && !i.nonneg
@@ -1534,9 +1516,7 @@ pub fn check_negative_slice(s_start: &SomeValue, s_stop: &SomeValue, error: &str
     }
 }
 
-// =====================================================================
-// unaryop.py:357-418 — SomeList.method_* free functions
-// =====================================================================
+// unaryop.py __extend__ — SomeList.method_* free functions
 //
 // Upstream these are class methods on `class __extend__(SomeList)`. They
 // are NOT directly `@op.X.register` targets; instead `SomeObject.getattr`
@@ -1627,7 +1607,7 @@ fn list_method_pop(
     s_self: &super::model::SomeList,
     _s_index: Option<&SomeValue>,
 ) -> SomeValue {
-    // unaryop.py:381-385 — resize + read_item(position). can_only_throw=[IndexError].
+    // unaryop.py method_pop — resize + read_item(position). can_only_throw=[IndexError].
     s_self.listdef.resize().expect("resize");
     let position = ann.bookkeeper.current_position_key();
     s_self.listdef.read_item(position)
@@ -1639,14 +1619,12 @@ fn list_method_index(
     s_self: &super::model::SomeList,
     s_value: &SomeValue,
 ) -> SomeValue {
-    // unaryop.py:387-389 — generalize + SomeInteger(nonneg=True).
+    // unaryop.py method_index — generalize + SomeInteger(nonneg=True).
     s_self.listdef.generalize(s_value).expect("generalize");
     SomeValue::Integer(SomeInteger::new(true, false))
 }
 
-// =====================================================================
 // unaryop.py — @op.contains.register(SomeDict) + dict_contains helper
-// =====================================================================
 
 #[allow(non_snake_case)]
 pub fn contains_SomeDict(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
@@ -1765,9 +1743,7 @@ fn init_somedict_overrides(
     );
 }
 
-// =====================================================================
-// unaryop.py:462-591 — SomeDict.method_* free functions
-// =====================================================================
+// unaryop.py __extend__ — SomeDict.method_* free functions
 
 #[allow(dead_code)]
 fn dict_method_get(
@@ -1776,7 +1752,7 @@ fn dict_method_get(
     s_key: &SomeValue,
     s_dfl: &SomeValue,
 ) -> SomeValue {
-    // unaryop.py:502-506
+    // unaryop.py method_get
     let position = ann.bookkeeper.current_position_key();
     s_self
         .dictdef
@@ -1791,7 +1767,7 @@ fn dict_method_get(
 
 #[allow(dead_code)]
 fn dict_method_copy(_ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
-    // unaryop.py:510-511 — SomeDict(self.dictdef).
+    // unaryop.py method_copy — SomeDict(self.dictdef).
     SomeValue::Dict(super::model::SomeDict::new(s_self.dictdef.clone()))
 }
 
@@ -1832,7 +1808,7 @@ fn dict_method_prepare_dict_update(
 
 #[allow(dead_code)]
 fn dict_method_keys(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
-    // unaryop.py:521-523 — bk.newlist(self.dictdef.read_key(bk.position_key)).
+    // unaryop.py method_keys — bk.newlist(self.dictdef.read_key(bk.position_key)).
     let position = ann.bookkeeper.current_position_key();
     let s_key = s_self.dictdef.read_key(position);
     let s_list = ann
@@ -1844,7 +1820,7 @@ fn dict_method_keys(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> 
 
 #[allow(dead_code)]
 fn dict_method_values(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
-    // unaryop.py:525-527
+    // unaryop.py method_values
     let position = ann.bookkeeper.current_position_key();
     let s_value = s_self.dictdef.read_value(position);
     let s_list = ann
@@ -1868,7 +1844,7 @@ fn dict_method_items(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) ->
 
 #[allow(dead_code)]
 fn dict_method_iterkeys(_ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
-    // unaryop.py:533-534 — SomeIterator(self, 'keys').
+    // unaryop.py method_iterkeys — SomeIterator(self, 'keys').
     SomeValue::Iterator(SomeIterator::new(
         SomeValue::Dict(s_self.clone()),
         vec!["keys".into()],
@@ -1936,7 +1912,7 @@ fn dict_method_pop(
     s_key: &SomeValue,
     s_dfl: Option<&SomeValue>,
 ) -> SomeValue {
-    // unaryop.py:555-560
+    // unaryop.py method_pop
     s_self
         .dictdef
         .generalize_key(s_key)
@@ -1958,7 +1934,7 @@ fn dict_method_contains_with_hash(
     s_key: &SomeValue,
     _s_hash: &SomeValue,
 ) -> SomeValue {
-    // unaryop.py:562-565.
+    // unaryop.py method_contains_with_hash.
     let position = ann.bookkeeper.current_position_key();
     dict_contains(s_self, s_key, position)
 }
@@ -2023,7 +1999,7 @@ fn dict_method_delitem_if_value_is(
     s_key: &SomeValue,
     s_value: &SomeValue,
 ) -> Option<SomeValue> {
-    // unaryop.py:578-580 — setitem + delitem, falls off the end (void op).
+    // unaryop.py method_delitem_with_hash — setitem + delitem, falls off the end (void op).
     let _ = dict_method_setitem_with_hash(ann, s_self, s_key, &s_impossible_value(), s_value);
     dict_method_delitem_with_hash(ann, s_self, s_key, &s_impossible_value())
 }
@@ -2045,10 +2021,8 @@ fn dict_method_move_to_end(
     dict_method_delitem_with_hash(ann, s_self, s_key, &s_impossible_value())
 }
 
-// =====================================================================
 // unaryop.py:593-690 — @op.contains.register(SomeString|SomeUnicodeString)
 // + class __extend__(SomeString, SomeUnicodeString) shared overrides
-// =====================================================================
 
 #[allow(non_snake_case)]
 pub fn contains_String(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
@@ -2241,9 +2215,7 @@ fn init_somebytearray_overrides(
     );
 }
 
-// =====================================================================
 // unaryop.py — class __extend__(SomeChar, SomeUnicodeCodePoint) / SomeChar
-// =====================================================================
 
 fn init_somechar_overrides(
     reg: &mut std::collections::HashMap<
@@ -2309,9 +2281,7 @@ fn init_someunicodecp_overrides(
     );
 }
 
-// =====================================================================
-// unaryop.py:608-690 / 720-748 / 776-797 — method_* free fns (String/Char)
-// =====================================================================
+// unaryop.py __extend__ / 720-748 / 776-797 — method_* free fns (String/Char)
 
 /// RPython "basestringclass" picks SomeString vs SomeUnicodeString based
 /// on the actual class of the SomeValue. SomeChar → SomeString,
@@ -2334,7 +2304,7 @@ fn str_method_startswith(
     s_self: &SomeValue,
     s_frag: &SomeValue,
 ) -> SomeValue {
-    // unaryop.py:611-614 — const+const → immutablevalue(self.const.startswith(frag.const))
+    // unaryop.py method_startswith — const+const → immutablevalue(self.const.startswith(frag.const))
     //                       else s_Bool.
     if let (Some(a), Some(b)) = (const_str_of(s_self), const_str_of(s_frag)) {
         let mut r = SomeBool::new();
@@ -2440,7 +2410,7 @@ fn str_method_count(
 }
 
 fn str_method_strip_like(s_self: &SomeValue, s_chr: Option<&SomeValue>, opname: &str) -> SomeValue {
-    // unaryop.py:633-644 — strip/lstrip/rstrip share the same shape.
+    // unaryop.py method_strip — strip/lstrip/rstrip share the same shape.
     if s_chr.is_none() && matches!(s_self, SomeValue::UnicodeString(_)) {
         panic!("AnnotatorError: unicode.{opname}() with no arg is not RPython");
     }
@@ -2476,7 +2446,7 @@ fn str_method_rstrip(
 
 #[allow(dead_code)]
 fn str_method_join(ann: &RPythonAnnotator, s_self: &SomeValue, s_list: &SomeValue) -> SomeValue {
-    // unaryop.py:648-658.
+    // unaryop.py method_join.
     if s_none().contains(s_list) {
         return SomeValue::Impossible;
     }
@@ -2520,7 +2490,7 @@ fn str_method_split(
     s_patt: &SomeValue,
     s_max: Option<&SomeValue>,
 ) -> SomeValue {
-    // unaryop.py:667-675.
+    // unaryop.py method_split.
     let max_value = s_max.and_then(const_int_of).unwrap_or(-1);
     let no_nul = if max_value == -1
         && const_str_of(s_patt)
@@ -2546,7 +2516,7 @@ fn str_method_rsplit(
     _s_patt: &SomeValue,
     _s_max: Option<&SomeValue>,
 ) -> SomeValue {
-    // unaryop.py:677-679.
+    // unaryop.py method_rsplit.
     let s_item = basestring_of(s_self, stringish_no_nul(s_self));
     let s_list = ann
         .bookkeeper
@@ -2557,7 +2527,7 @@ fn str_method_rsplit(
 
 #[allow(dead_code)]
 fn str_method_upper(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
-    // unaryop.py:736-737 / 793-797 — SomeChar.upper returns self;
+    // unaryop.py method_upper / 793-797 — SomeChar.upper returns self;
     // SomeString/SomeUnicodeString inherit basestringclass().
     match _s_self {
         SomeValue::Char(_) => _s_self.clone(),
@@ -2595,7 +2565,7 @@ fn str_method_replace(
     _s1: &SomeValue,
     s2: &SomeValue,
 ) -> SomeValue {
-    // unaryop.py:681-682 — basestringclass(no_nul=self.no_nul and s2.no_nul).
+    // unaryop.py method_replace — basestringclass(no_nul=self.no_nul and s2.no_nul).
     let self_no_nul = match s_self {
         SomeValue::String(s) => s.inner.no_nul,
         SomeValue::UnicodeString(s) => s.inner.no_nul,
@@ -2629,7 +2599,7 @@ fn str_method_format(
     _s_self: &SomeValue,
     _args: &[SomeValue],
 ) -> SomeValue {
-    // unaryop.py:689-690 — always raises.
+    // unaryop.py method_format — always raises.
     panic!("AnnotatorError: Method format() is not RPython")
 }
 
@@ -2853,7 +2823,7 @@ fn builtin_method_arg_error(method: &SomeBuiltinMethod) -> AnnotatorError {
 }
 
 /// Model upstream `SomeBuiltinMethod.call(self, args)` argument
-/// binding (unaryop.py:961-967):
+/// binding (unaryop.py):
 ///
 /// ```python
 /// def call(self, args, implicit_init=False):
@@ -2898,7 +2868,7 @@ fn bind_builtin_method_args(
         .into_iter()
         .map(|(key, value)| (format!("s_{key}"), value))
         .collect();
-    // upstream `unaryop.py:961-967` passes `args_s` straight through —
+    // upstream `unaryop.py call` passes `args_s` straight through —
     // an unbound caller cell would AttributeError on first attribute
     // touch in the analyser body.  Thread `Vec<Option<SomeValue>>`
     // through `match_signature` (the binding layer is Option-aware),
@@ -2926,7 +2896,7 @@ fn bind_builtin_method_args(
 }
 
 /// RPython `SomeBuiltinMethod.call(self, args, implicit_init=False)`
-/// dispatch helper (unaryop.py:961-967).
+/// dispatch helper (unaryop.py).
 pub(crate) fn call_builtin_method(
     ann: &RPythonAnnotator,
     method: &SomeBuiltinMethod,
@@ -3707,9 +3677,7 @@ pub(crate) fn call_builtin_method(
     Ok(Some(result))
 }
 
-// =====================================================================
 // unaryop.py — class __extend__(SomeIterator)
-// =====================================================================
 
 fn init_someiterator_overrides(
     reg: &mut std::collections::HashMap<
@@ -3768,7 +3736,7 @@ fn init_someiterator_overrides(
 }
 
 /// RPython `SomeIterator.next(self)` (unaryop.py). Extracted
-/// into a free function so `list_method_extend` (unaryop.py:363-369)
+/// into a free function so `list_method_extend` (unaryop.py)
 /// can call `s_iterable.iter().next()` directly without going through
 /// the HLOperation dispatch framework — upstream also calls it as a
 /// plain method invocation on a SomeIterator value.
@@ -3802,8 +3770,8 @@ fn someiterator_next(ann: &RPythonAnnotator, it: &SomeIterator) -> SomeValue {
 ///
 /// Upstream definitions:
 /// * SomeTuple (unaryop.py): `unionof(*self.items)`.
-/// * SomeList (unaryop.py:402-403):  `self.listdef.read_item(position)`.
-/// * SomeDict (unaryop.py:480-500):  variant-dispatched.
+/// * SomeList (unaryop.py):  `self.listdef.read_item(position)`.
+/// * SomeDict (unaryop.py):  variant-dispatched.
 /// * SomeStringOrUnicode (unaryop.py): `self.basecharclass()`.
 pub(crate) fn container_getanyitem(
     s_container: &SomeValue,
@@ -3822,7 +3790,7 @@ pub(crate) fn container_getanyitem(
         }
         SomeValue::List(l) => l.listdef.read_item(position),
         SomeValue::Dict(d) => {
-            // unaryop.py:480-500 — per-variant dispatch.
+            // unaryop.py getanyitem — per-variant dispatch.
             match variant.unwrap_or("keys") {
                 "keys" => d.dictdef.read_key(position),
                 "values" => d.dictdef.read_value(position),
@@ -3943,9 +3911,7 @@ fn shaped_array_getanyitem(inst: &super::model::SomeInstance) -> SomeValue {
     super::model::unionof(items.iter()).unwrap_or_else(|_| s_impossible_value())
 }
 
-// =====================================================================
 // unaryop.py — class __extend__(SomePBC)
-// =====================================================================
 
 fn init_somepbc_overrides(
     reg: &mut std::collections::HashMap<
@@ -3977,9 +3943,7 @@ fn init_somepbc_overrides(
     );
 }
 
-// =====================================================================
 // lltype.py — SomePtr.bool
-// =====================================================================
 
 fn init_someptr_overrides(
     reg: &mut std::collections::HashMap<
@@ -4119,9 +4083,7 @@ fn init_someptr_overrides(
     );
 }
 
-// =====================================================================
 // unaryop.py — class __extend__(SomeNone)
-// =====================================================================
 
 fn init_somenone_overrides(
     reg: &mut std::collections::HashMap<
@@ -4173,9 +4135,7 @@ fn init_somenone_overrides(
     );
 }
 
-// =====================================================================
 // unaryop.py — class __extend__(SomeInstance)
-// =====================================================================
 
 fn init_someinstance_overrides(
     reg: &mut std::collections::HashMap<
@@ -4253,7 +4213,7 @@ fn init_someinstance_overrides(
                 // would seat a non-callable in the simple_call callee
                 // slot.  Upstream keeps this on `SomePtr.getattr`
                 // (lltype.py) and `SomeInstance.getattr`
-                // (unaryop.py:833) never sees it; pyre carries both
+                // (unaryop.py) never sees it; pyre carries both
                 // erased pointers (classdef-less) and `cast_pointer`-
                 // typed receivers (`SomeInstance(cd)` from `obj as
                 // *const W_Foo`) as `SomeInstance`, so the ptr method
@@ -4344,7 +4304,7 @@ fn init_someinstance_overrides(
                         // short-circuit out of
                         // the classdef-bearing path mirrors RPython
                         // `SomeInstance.getattr`, which special-cases only
-                        // `__class__` (unaryop.py:838-839).
+                        // `__class__` (unaryop.py).
                         if attr == "__discriminant" {
                             return SomeValue::Integer(super::model::SomeInteger::new(true, false));
                         }
@@ -4558,7 +4518,7 @@ fn init_someinstance_overrides(
                         });
                     }
                 }
-                // unaryop.py:844-861 — success path returns None (void).
+                // unaryop.py setattr — success path returns None (void).
                 None
             }),
             can_only_throw: CanOnlyThrow::Absent,
@@ -4566,9 +4526,7 @@ fn init_someinstance_overrides(
     );
 }
 
-// =====================================================================
 // unaryop.py — class __extend__(SomeWeakRef)
-// =====================================================================
 
 fn init_someweakref_overrides(
     reg: &mut std::collections::HashMap<
@@ -4612,9 +4570,7 @@ fn _keep_imports_live() {
     let _: Option<Rc<()>> = None;
 }
 
-// =====================================================================
 // unaryop.py — @op.call_args.register_transform(SomeObject)
-// =====================================================================
 //
 // Upstream rewrites `op.call_args(v_func, v_shape, *data_v)` when the
 // vararg tail is a `SomeTuple`, unpacking the tuple elements to turn
@@ -4764,9 +4720,7 @@ fn encode_call_shape(shape: &super::super::flowspace::argument::CallShape) -> Co
     ])
 }
 
-// =====================================================================
 // unaryop.py — @op.{len,iter,next,getslice,setslice}.register_transform(SomeInstance)
-// =====================================================================
 
 /// Helper — build a new [`HLOperation`] with a fresh result variable,
 /// matching upstream `HLOperation.__init__` (operation.py:73-75).
@@ -4975,12 +4929,10 @@ fn init_instance_single_transform(
     );
 }
 
-// =====================================================================
 // unaryop.py — @op.{getattr,setattr}.register_transform(SomeInstance)
-// =====================================================================
 
 /// RPython `getattr_SomeInstance` / `setattr_SomeInstance`
-/// (unaryop.py:909-936) — property descriptor dispatch.
+/// (unaryop.py) — property descriptor dispatch.
 ///
 /// Upstream rewrites `getattr(v_obj, 'prop')` into
 /// `[getattr(v_obj, 'prop__getter__'), simple_call(getter.result)]`

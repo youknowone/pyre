@@ -1,4 +1,4 @@
-# `StdObjSpace.getattr` (`objspace/std/objspace.py:711-716`) wraps the
+# `StdObjSpace.getattr` (`objspace/std/objspace.py`) wraps the
 # `__getattr__` fallback call in `enrich_attribute_error` (`error.py:725-738`),
 # which fills an AttributeError's `name` and `obj` in with the attribute that
 # was looked up and the object it was looked up on -- and only when the

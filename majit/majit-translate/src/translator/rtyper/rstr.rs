@@ -508,7 +508,7 @@ impl UnicodeRepr {
     }
 
     /// RPython `UnicodeRepr.char_repr = unichar_repr`
-    /// (`lltypesystem/rstr.py:1266`).
+    /// (`lltypesystem/rstr.py`).
     pub fn char_repr(&self) -> Arc<UniCharRepr> {
         unichar_repr()
     }
@@ -820,7 +820,7 @@ fn rtype_abstract_string_len(
 /// ```
 ///
 /// The `super().rtype_bool` fallback is the `Repr.rtype_bool` default
-/// at `rmodel.py:199-207` — `int_is_true(self.rtype_len(hop))`. Rust
+/// at `rmodel.py` — `int_is_true(self.rtype_len(hop))`. Rust
 /// trait defaults can't be invoked from an override, so the fallback
 /// is replicated inline. The non-None path emits the
 /// `ll_str_is_true`/`ll_unicode_is_true` helper graph.
@@ -1155,7 +1155,7 @@ impl CharRepr {
     }
 
     /// RPython `CharRepr.char_repr = char_repr`
-    /// (`lltypesystem/rstr.py:1267`) class-level attribute — char-side
+    /// (`lltypesystem/rstr.py`) class-level attribute — char-side
     /// backlink so the shared `BaseCharReprMixin._rtype_method_isxxx`
     /// helper (`rstr.py`) can read `hop.args_r[0].char_repr`.
     pub fn char_repr(&self) -> Arc<CharRepr> {
@@ -1396,7 +1396,7 @@ impl UniCharRepr {
     /// RPython `UniCharRepr.char_repr = unichar_repr`
     /// (`lltypesystem/rstr.py`) — UniCharRepr's char-side backlink
     /// is itself; mirrors `CharRepr.char_repr = char_repr`
-    /// (`lltypesystem/rstr.py:1267`).
+    /// (`lltypesystem/rstr.py`).
     pub fn char_repr(&self) -> Arc<UniCharRepr> {
         unichar_repr()
     }
@@ -3182,7 +3182,7 @@ fn build_ll_charlike_predicate_inrange_helper_graph(
     let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
     let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
 
-    // ---- start block: cast then compare against `lo`.
+    // start block: cast then compare against `lo`.
     let c = variable_with_lltype("c", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         cast_op,
@@ -3210,7 +3210,7 @@ fn build_ll_charlike_predicate_inrange_helper_graph(
     .into_ref();
     startblock.closeblock(vec![start_true_link, start_false_link]);
 
-    // ---- block_check_hi: compare against `hi`, return result.
+    // block_check_hi: compare against `hi`, return result.
     let le = variable_with_lltype("le", LowLevelType::Bool);
     block_check_hi
         .borrow_mut()
@@ -3290,7 +3290,7 @@ fn build_ll_char_case_fold_helper_graph(
     let c_for_offset = variable_with_lltype("c", LowLevelType::Signed);
     let block_offset = Block::shared(vec![Hlvalue::Variable(c_for_offset.clone())]);
 
-    // ---- start: cast + range-lo check.
+    // start: cast + range-lo check.
     let c = variable_with_lltype("c", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "cast_char_to_int",
@@ -3318,7 +3318,7 @@ fn build_ll_char_case_fold_helper_graph(
     .into_ref();
     startblock.closeblock(vec![start_true_link, start_false_link]);
 
-    // ---- block_check_hi: range-hi check.
+    // block_check_hi: range-hi check.
     let le = variable_with_lltype("le", LowLevelType::Bool);
     block_check_hi
         .borrow_mut()
@@ -3343,7 +3343,7 @@ fn build_ll_char_case_fold_helper_graph(
     .into_ref();
     block_check_hi.closeblock(vec![hi_true_link, hi_false_link]);
 
-    // ---- block_offset: int_add(c, offset); cast_int_to_char.
+    // block_offset: int_add(c, offset); cast_int_to_char.
     let c2 = variable_with_lltype("c2", LowLevelType::Signed);
     block_offset
         .borrow_mut()
@@ -6086,7 +6086,7 @@ mod tests {
         );
     }
 
-    /// rstr.py:124-132 + rmodel.py:199-207 — when `can_be_None ==
+    /// rstr.py + rmodel.py rtype_bool — when `can_be_None ==
     /// False`, `rtype_bool` falls through to the `Repr.rtype_bool`
     /// default which calls `self.rtype_len(hop)` and wraps the result
     /// with `int_is_true`. Two llops emitted: `direct_call(ll_strlen)`
@@ -6135,7 +6135,7 @@ mod tests {
         );
     }
 
-    /// rstr.py + rmodel.py:199-207 mirror for UnicodeRepr —
+    /// rstr.py + rmodel.py rtype_bool mirror for UnicodeRepr —
     /// same shape but the underlying length helper is `ll_unilen`.
     #[test]
     fn unicode_repr_rtype_bool_when_not_can_be_none_falls_back_to_int_is_true_of_length() {

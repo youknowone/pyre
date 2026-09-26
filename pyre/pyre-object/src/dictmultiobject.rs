@@ -5,7 +5,7 @@
 //! Hosts the `W_DictMultiObject` Rust trait + concrete subclasses
 //! `W_DictObject` (regular dict, `:313-325`) and `W_ModuleDictObject`
 //! (module / globals dict backed by `ModuleDictStrategy` per
-//! `pypy/objspace/std/celldict.py:28`).  The cutover lifted
+//! `pypy/objspace/std/celldict.py`).  The cutover lifted
 //! pyre's `DictStorage`-based module-dict path out of
 //! `pyre-interpreter/executioncontext.rs` and into a sibling
 //! `celldict.rs` so the upstream strategy-per-W_Root model holds.
@@ -20,7 +20,7 @@
 //! `w_dict_get_strategy(obj).method(obj, ...)` polymorphic dispatch
 //! (PyPy's `w_dict.get_strategy().method(w_dict, ...)` shape):
 //!
-//! - `w_dict_setitem_str` → `dictmultiobject.py:111-112`
+//! - `w_dict_setitem_str` → `dictmultiobject.py`
 //! - `w_dict_getitem_str` → `:103-105`
 //! - `w_dict_clear` → `:148-152` (`descr_clear`)
 //! - `w_dict_items` → `:117-121`
@@ -82,7 +82,7 @@ impl PartialEq for ObjectKey {
         // `IndexMap` compares `probe == stored`, so `self` is the incoming key
         // and `other` the one already in the bucket.  `ll_dict_lookup` runs
         // `keyeq(checkingkey, key)` with the *stored* key on the left
-        // (`rordereddict.py:1055`), which is what decides whose `__eq__` the
+        // (`rordereddict.py`), which is what decides whose `__eq__` the
         // comparison protocol tries first; hand them over in that order.
         unsafe { dict_keys_equal(other.obj, self.obj) }
     }
@@ -95,7 +95,7 @@ impl Eq for ObjectKey {}
 /// `rordereddict` feeds that cached integer directly into its table, and so
 /// does this: the digest is already `space.hash_w(obj)`, and a second hash of
 /// it would be pure cost.  Clustering on keys that share low bits is what
-/// `ll_dict_lookup`'s perturb loop handles (`rordereddict.py:1104-1106`).
+/// `ll_dict_lookup`'s perturb loop handles (`rordereddict.py`).
 #[derive(Default)]
 pub struct ObjectKeyHasher(u64);
 
@@ -200,7 +200,7 @@ unsafe fn key_as_utf8(key: PyObjectRef) -> Option<&'static str> {
     }
 }
 
-/// `dictmultiobject.py:1209-1212 r_dict(_, hash_w, ...)` —
+/// `dictmultiobject.py get_empty_storage r_dict(_, hash_w, ...)` —
 /// `space.hash_w(obj)` precomputed for bucket placement.  There is a
 /// single hashing path: the `dict_eq_hook::HASH_W_HOOK` trampoline,
 /// installed at boot before any dict is built (production) or per test
@@ -240,7 +240,7 @@ pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
 /// would, and compares against a stored [`ObjectKey`] without materializing
 /// a throwaway `W_UnicodeObject` — the per-lookup allocation that otherwise
 /// leaks at every `getitem_str`.  PyPy's string-strategy `getitem_str`
-/// (`dictmultiobject.py:1216-1218`) likewise probes from the raw str.
+/// (`dictmultiobject.py`) likewise probes from the raw str.
 struct StrLookupKey<'a> {
     hash: i64,
     key: &'a str,
@@ -343,7 +343,7 @@ pub unsafe fn dict_entries_probe_object(
     entries.get(&object_key_for(key)).copied()
 }
 
-/// The object-keyed remove side of the same table — `dictmultiobject.py:1081
+/// The object-keyed remove side of the same table — `dictmultiobject.py delitem
 /// delitem`'s `del self.unerase(w_dict.dstorage)[self.unwrap(w_key)]`.
 ///
 /// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(i))` on
@@ -548,7 +548,7 @@ pub unsafe fn dict_entries_key_is_at(
 }
 
 /// The table's identity, as `ll_dict_lookup`'s paranoia restart reads it
-/// (`rordereddict.py:1058 entries != d.entries`): a stale slot number can no
+/// (`rordereddict.py entries != d.entries`): a stale slot number can no
 /// longer be trusted once the entries have been renumbered.
 ///
 /// A compaction is what renumbers them (`ll_dict_remove_deleted_items`,
@@ -617,7 +617,7 @@ fn memoized_or_hashed(key: &str, hash: i64) -> Option<i64> {
 /// `setitem_str`: a re-store to an existing name updates in place and reuses
 /// the stored key, so only a genuinely new key allocates a persistent
 /// `W_UnicodeObject` (PyPy `setitem_str` keeps `newtext(key)` only for the
-/// inserted key, not an overwrite — `dictmultiobject.py:1220-1221`).  Falls
+/// inserted key, not an overwrite — `dictmultiobject.py`).  Falls
 /// back to the allocating `object_key_for(w_str_new(key))` probe when no str
 /// hash hook is installed.
 ///
@@ -829,7 +829,7 @@ pub(crate) unsafe fn take_dict_key_error() -> bool {
 /// path without reaching into `pyre-interpreter`'s `space.hash_w` (which
 /// lives in a crate above this one).  Installed via `register_hash_w_hook`
 /// by the test harness; never a production code path — production hashes
-/// exclusively through `space.hash_w` (`baseobjspace.py:840-845`).
+/// exclusively through `space.hash_w` (`baseobjspace.py is_none`).
 /// Shared str-key digest for the test hooks: the WTF-8 byte sequence hashed
 /// with `DefaultHasher`.  Used by both [`builtin_structural_hash`]'s str arm
 /// (object-keyed) and the str-keyed `hash_str` test hook so a key stored via
@@ -931,7 +931,7 @@ pub trait W_DictMultiObject {
     /// a `&'static DictStrategyRef` (the singleton dispatch surface);
     /// W_ModuleDictObject strategy promotion to ObjectDictStrategy
     /// continues to go through `w_module_dict_switch_to_object_strategy`
-    /// per `celldict.py:173-186`.
+    /// per `celldict.py switch_to_object_strategy`.
     fn set_strategy(&mut self, strategy: &'static DictStrategyRef);
 }
 
@@ -988,7 +988,7 @@ pub struct W_DictObject {
     pub keys_version: usize,
     /// Generation bumped whenever `clear` empties an object dict in place.
     /// `ll_dict_clear` reallocates `d.entries` to a fresh empty array
-    /// (`rordereddict.py:1360`), so a probe that cleared the dict through an
+    /// (`rordereddict.py`), so a probe that cleared the dict through an
     /// `__eq__` callback must restart on the `entries != d.entries` arm
     /// (`:1058`).  `IndexMap::clear` retains its buffer, leaving the capacity
     /// and every stale index unchanged, so the reentrant scan watches this
@@ -1101,7 +1101,7 @@ pub const W_DICT_GC_TYPE_ID: u32 = 29;
 // at the registry tail and don't perturb the fixed-const tid chain.
 
 /// `ObjectDictStrategy` / `UnicodeDictStrategy` backing — erased
-/// `r_dict(dict_keys_equal, hash_w)` (`dictmultiobject.py:1209`). Also the
+/// `r_dict(dict_keys_equal, hash_w)` (`dictmultiobject.py`). Also the
 /// universal `switch_to_object_strategy` sink and the identity-dict
 /// promotion target.
 pub type ObjectDictStorage =
@@ -1122,7 +1122,7 @@ pub fn object_dict_storage_with_capacity(capacity: usize) -> ObjectDictStorage {
 ///
 /// The clustering an identity hash invites on keys that share low bits is what
 /// `ll_dict_lookup`'s perturb loop exists for: it folds the high bits back in
-/// after the first probe (`rordereddict.py:1104-1106`).  A digest here would
+/// after the first probe (`rordereddict.py`).  A digest here would
 /// only be paying for the mixing twice.
 #[derive(Default)]
 pub struct IntKeyHasher(u64);
@@ -1147,13 +1147,13 @@ impl std::hash::Hasher for IntKeyHasher {
 }
 
 /// `IntDictStrategy` backing — erased `Dict[int, W_Root]`
-/// (`dictmultiobject.py:1339`).
+/// (`dictmultiobject.py`).
 pub type IntKeyHash = std::hash::BuildHasherDefault<IntKeyHasher>;
 /// See [`BytesDictStorage`].
 pub type BytesKeyHash = std::hash::BuildHasherDefault<crate::unicodeobject::Fnv1aHasher>;
 pub type IntDictStorage = crate::rordereddict::RDict<i64, PyObjectRef, IntKeyHash>;
 /// `BytesDictStrategy` backing — erased `Dict[str, W_Root]`
-/// (`dictmultiobject.py:1244`).
+/// (`dictmultiobject.py`).
 ///
 /// Digested with FNV-1a rather than `RandomState`, for the reason
 /// [`crate::celldict::ModuleDictEntries`] gives: a translated `str` key carries
@@ -1624,7 +1624,7 @@ pub unsafe fn w_dict_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(&mut
 /// `try_gc_alloc_stable`) the tracer cannot model, falling back to
 /// `lltype::malloc_typed` (`NewWithVtable`); the JIT residualises the
 /// call instead of tracing into it (`@dont_look_inside`,
-/// `rlib/jit.py:139`), the `box_str_constant` / `try_gc_add_root` twin.
+/// `rlib/jit.py`), the `box_str_constant` / `try_gc_add_root` twin.
 ///
 /// `stable` selects old-gen. Only callers that need a fixed address ask for
 /// it: forcing it for every dict strands a compiled frame's ref slot across a
@@ -1700,7 +1700,7 @@ pub fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
 /// Static `PyType` tag for `W_ModuleDictObject`.  Distinct from
 /// `DICT_TYPE` so `py_type_check` can tell module dicts apart from
 /// regular dicts inside the Rust runtime — but PyPy presents both as
-/// `space.w_dict` to user code (`dictmultiobject.py:67
+/// `space.w_dict` to user code (`dictmultiobject.py
 /// allocate_instance(W_ModuleDictObject, space.w_dict)`).  The
 /// `TYPEOBJECT_CACHE` registration at
 /// `pyre-interpreter/typedef.rs` maps `MODULE_DICT_TYPE` to
@@ -2250,7 +2250,7 @@ pub unsafe fn w_dict_lookup_str_keyed(
 /// Key-set mutation state captured by dict iterators.
 ///
 /// PyPy's `BaseIteratorImplementation` owns a live iterator over the
-/// strategy storage (`dictmultiobject.py:807-845`).  That native iterator
+/// strategy storage (`dictmultiobject.py`).  That native iterator
 /// retains deletion/tombstone state even when the dictionary returns to the
 /// same length.  Pyre's `IndexMap::shift_remove` compacts immediately, so the
 /// equivalent state lives on the dictionary object itself.
@@ -2316,7 +2316,7 @@ unsafe fn w_module_dict_setitem_str_internal(obj: PyObjectRef, key: &str, w_valu
     crate::gc_roots::mark_prebuilt_roots_dirty();
     if w_module_dict_is_object_strategy(obj) {
         // Post-switch: ObjectDictStrategy storage = r_dict(space.eq_w,
-        // space.hash_w) per `dictmultiobject.py:1210`; pyre's
+        // space.hash_w) per `dictmultiobject.py`; pyre's
         // `dict_keys_equal` enforces the same bucket invariant
         // (Item 1.2).  An overwrite reuses the stored key and updates the
         // value in place; only a genuinely new key wraps a W_UnicodeObject
@@ -2642,7 +2642,7 @@ pub unsafe fn w_dict_lookup(obj: PyObjectRef, key: PyObjectRef) -> Option<PyObje
 /// True when a regular dict is still on EmptyDictStrategy or
 /// EmptyKwargsDictStrategy.  PyPy's `EmptyDictStrategy.pop` does not
 /// hash the key: it returns the provided default, or raises KeyError
-/// when no default was passed (`dictmultiobject.py:783-787`).
+/// when no default was passed (`dictmultiobject.py`).
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -2751,7 +2751,7 @@ pub unsafe fn w_dict_lookup_checked(
 /// puts an `FnOnce::call_once` in front of every probe and closures have no
 /// lifted counterpart, so each dict graph that probes stops there.  Upstream
 /// writes the attempt out at the call site (`ll_dict_lookup`'s fast pass
-/// before the paranoia restart, `rordereddict.py:1057`) rather than passing
+/// before the paranoia restart, `rordereddict.py`) rather than passing
 /// it as a callable.
 macro_rules! callback_free_dict_op {
     ($body:block) => {{
@@ -2771,7 +2771,7 @@ macro_rules! callback_free_dict_op {
 /// regular `W_DictObject` in object strategy (`dstorage`) or a module dict
 /// switched to object strategy (`object_storage`).  Both hold the same
 /// `IndexMap<ObjectKey, PyObjectRef>` — celldict devolves to
-/// `ObjectDictStrategy` (`celldict.py:173`), whose lookup is `ll_dict_lookup`
+/// `ObjectDictStrategy` (`celldict.py switch_to_object_strategy`), whose lookup is `ll_dict_lookup`
 /// like the regular object strategy.
 ///
 /// # Safety
@@ -2791,7 +2791,7 @@ unsafe fn scan_object_entries<'a>(obj: PyObjectRef) -> &'a ObjectDictStorage {
 }
 
 /// The disturbance generation `ll_dict_lookup` compares to detect a callback
-/// that reallocated or reset the table in place (`rordereddict.py:1058`):
+/// that reallocated or reset the table in place (`rordereddict.py`):
 /// `clear_gen` for a regular dict (bumped by an in-place `clear`),
 /// `keys_version` for a module dict (bumped by every key-set mutation, so a
 /// superset — a spurious restart on an unrelated mutation only re-scans).
@@ -2831,7 +2831,7 @@ unsafe fn scan_dict_key_reentrant(
         // each callback (`w_dict_new` allocates through the movable
         // `try_gc_alloc` hook).  Snapshot the table generation: `ll_dict_lookup`
         // retries on `entries != d.entries` even when the candidate entry is
-        // untouched (`rordereddict.py:1058`); a compaction renumbers every
+        // untouched (`rordereddict.py`); a compaction renumbers every
         // entry, so a stale slot would compare the wrong key.
         let _attempt = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
@@ -2876,7 +2876,7 @@ unsafe fn scan_dict_key_reentrant(
                 // `ll_dict_lookup` restarts even when the comparison answered
                 // `true`, because a callback that reallocated the table or moved
                 // the candidate leaves the matched index stale
-                // (`rordereddict.py:1058`).
+                // (`rordereddict.py`).
                 let disturbed = {
                     let entries = scan_object_entries(obj);
                     // `entries != d.entries`: a compaction renumbered the
@@ -2944,7 +2944,7 @@ pub unsafe fn w_dict_lookup_object_strategy_checked(
 }
 
 /// Internal helper: `ModuleDictStrategy::getitem` body for pyre's
-/// W_ModuleDictObject — `celldict.py:131-141`:
+/// W_ModuleDictObject — `celldict.py`:
 ///   * post-`switch_to_object_strategy` path: walk unified entries
 ///     Vec via `dict_keys_equal`.
 ///   * str fast path on fresh ModuleDictStrategy: route to
@@ -3332,7 +3332,7 @@ pub unsafe fn w_dict_setdefault_checked(
 /// `:783-787 EmptyDictStrategy.pop` +
 /// Whether popping `key` moves the dictionary to the object strategy first —
 /// the third arm of `AbstractTypedStrategy.pop`
-/// (`dictmultiobject.py:1136-1138`), and the one that hashes the key.
+/// (`dictmultiobject.py`), and the one that hashes the key.
 ///
 /// # Safety
 /// `key` must be a valid PyObjectRef.
@@ -3611,7 +3611,7 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
 }
 
 /// Internal helper: `ModuleDictStrategy::setitem` body for pyre's
-/// W_ModuleDictObject — `celldict.py:41-67`:
+/// W_ModuleDictObject — `celldict.py`:
 ///   * str keys on a fresh ModuleDictStrategy → `setitem_str`
 ///   * non-str keys OR already-promoted → `switch_to_object_strategy`
 ///     and write into the unified dstorage Vec.
@@ -3885,7 +3885,7 @@ pub unsafe fn w_dict_getitem_str_object_strategy_hashed(
 /// via `ObjectDictStrategy::setitem_str`.
 ///
 /// Residualise the setitem_str leaf (`@dont_look_inside`,
-/// `rlib/jit.py:139`): the strategy dispatch it wraps mutates
+/// `rlib/jit.py`): the strategy dispatch it wraps mutates
 /// runtime-mutable dict storage the tracer cannot model.
 #[majit_macros::dont_look_inside]
 /// # Safety
@@ -4568,7 +4568,7 @@ pub unsafe fn w_dict_delitem_object_strategy_checked(
 }
 
 /// Internal helper: `ModuleDictStrategy::delitem` body for pyre's
-/// W_ModuleDictObject — `celldict.py:106-126`:
+/// W_ModuleDictObject — `celldict.py`:
 ///   * post-`switch_to_object_strategy`: walk unified storage,
 ///     remove, and call mutated().
 ///   * str fast path on fresh ModuleDictStrategy → delitem_str.
@@ -4713,7 +4713,7 @@ pub unsafe fn w_module_dict_clear_inner(obj: PyObjectRef) {
 /// the polymorphic strategy slot.
 ///
 /// Residualise the length leaf (`@dont_look_inside`,
-/// `rlib/jit.py:139`): the strategy dispatch it wraps reads
+/// `rlib/jit.py`): the strategy dispatch it wraps reads
 /// runtime-mutable dict storage the tracer cannot model.
 #[majit_macros::dont_look_inside]
 /// # Safety
@@ -4778,7 +4778,7 @@ pub unsafe fn w_dict_nth_item(
 }
 
 /// The next `(slot, key, value)` at or after `from`, and the slot to resume
-/// from — `_ll_dictnext` (`rordereddict.py:1373`).
+/// from — `_ll_dictnext` (`rordereddict.py`).
 ///
 /// A dict view iterator holds this slot rather than a count of the pairs it
 /// has seen, because a delete leaves a tombstone and the two stop agreeing.
@@ -4798,7 +4798,7 @@ pub unsafe fn w_dict_next_item(
 
 /// The first live entry slot at or after `from`, for a walk that reads the
 /// entry through some other accessor — `_ll_dictnext`'s scan alone
-/// (`rordereddict.py:1373`).
+/// (`rordereddict.py`).
 ///
 /// # Safety
 /// `obj` must be a valid `W_DictObject` PyObjectRef.
@@ -4808,7 +4808,7 @@ pub unsafe fn w_dict_next_slot(obj: PyObjectRef, from: usize) -> Option<usize> {
 }
 
 /// [`w_dict_next_item`] descending, for `reversed(d)` —
-/// `objectmodel.reversed_dict` (`dictmultiobject.py:1168`).  `before` is
+/// `objectmodel.reversed_dict` (`dictmultiobject.py`).  `before` is
 /// exclusive, so a fresh walk starts at `usize::MAX`.
 ///
 /// # Safety
@@ -4987,7 +4987,7 @@ pub unsafe fn w_dict_lookup_or_null_int_strategy(
 
 /// Return the insertion-order index selected by a Unicode-strategy lookup.
 ///
-/// `dictmultiobject.py:1315-1318` routes exact-str keys through the raw
+/// `dictmultiobject.py getitem_str` routes exact-str keys through the raw
 /// string probe.  The trace-time caller declines when `w_str_get_value_opt`
 /// or the raw hash hook is unavailable, so this helper has no allocating
 /// object-key fallback.
@@ -5057,7 +5057,7 @@ unsafe fn w_str_memoized_hash(key: PyObjectRef, key_str: &str) -> Option<i64> {
 
 /// Return the live value selected by a Unicode-strategy lookup.
 ///
-/// `dictmultiobject.py:1315-1318` routes exact-str keys through the raw
+/// `dictmultiobject.py getitem_str` routes exact-str keys through the raw
 /// string probe. The index lookup and value read share one dict lock so the
 /// insertion-order index cannot be invalidated between the two operations —
 /// this guard is that lock, and both steps run under it directly rather than
@@ -5272,7 +5272,7 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
 }
 
 /// Internal helper: `BytesDictStrategy::setitem` body —
-/// `dictmultiobject.py:1061-1064` direct typed-storage write.  Caller
+/// `dictmultiobject.py` direct typed-storage write.  Caller
 /// must have already verified `is_correct_type(w_key)`.
 ///
 /// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
@@ -5304,7 +5304,7 @@ pub unsafe fn w_dict_store_bytes_strategy(obj: PyObjectRef, key: PyObjectRef, va
 }
 
 /// Internal helper: `BytesDictStrategy::getitem` body —
-/// `dictmultiobject.py:1098`.  Caller must have already verified
+/// `dictmultiobject.py`.  Caller must have already verified
 /// `is_correct_type(w_key)`.
 ///
 /// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
@@ -5329,7 +5329,7 @@ pub unsafe fn w_dict_lookup_bytes_strategy(
 }
 
 /// Internal helper: `BytesDictStrategy::delitem` body —
-/// `dictmultiobject.py:1083`.  Returns `true` if a key was removed.
+/// `dictmultiobject.py`.  Returns `true` if a key was removed.
 ///
 /// # Safety
 /// Same as [`w_dict_store_bytes_strategy`].
@@ -5796,7 +5796,7 @@ pub unsafe fn w_dict_str_entries_wtf8(
 }
 
 // ____________________________________________________________
-// Iteration and views (`dictmultiobject.py:1449+`, `:1603+`).
+// Iteration and views (`dictmultiobject.py W_BaseDictMultiIterObject+`, `:1603+`).
 
 /// `dictmultiobject.py` — three sibling view classes share the
 /// `W_DictViewObject` base. Pyre folds them into one struct + tag
@@ -5870,7 +5870,7 @@ pub struct W_BaseDictMultiIterObject {
     /// Separate from [`Self::index`] because the two stop agreeing the moment
     /// a delete leaves a tombstone: `index` counts pairs, this names a slot.
     /// It stands in for the live RPython dict iterator PyPy's
-    /// `BaseIteratorImplementation` owns (`dictmultiobject.py:807-845`), which
+    /// `BaseIteratorImplementation` owns (`dictmultiobject.py`), which
     /// a GC object layout here cannot hold.  A reverse walk starts one past
     /// the end, at `usize::MAX`.
     pub slot: usize,
@@ -5935,7 +5935,7 @@ pub fn dict_view_iterator_type_for_kind(kind: DictViewKind, reverse: bool) -> &'
 }
 
 /// Allocate a fresh dict iterator capturing `w_dict`'s current length
-/// and active strategy. Mirrors `dictmultiobject.py:807-808
+/// and active strategy. Mirrors `dictmultiobject.py
 /// W_BaseIteratorImplementation.__init__`:
 ///
 /// ```python
@@ -6243,7 +6243,7 @@ pub unsafe fn w_dict_view_get_dict(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_DictViewObject)).w_dict }
 }
 
-// -- DictStrategy family -----------------------------------------------------
+// -- DictStrategy family
 // PyPy keeps DictStrategy and the built-in concrete strategies in
 // pypy/objspace/std/dictmultiobject.py.  Keep them in this Rust module too so
 // paths and generated JIT symbol names line up with the source port.
@@ -6439,7 +6439,7 @@ pub trait DictStrategy {
     /// `index` is a slot, not the n-th live pair; [`Self::next_slot`] is what
     /// walks from one to the next.  Stands in for PyPy's `next_*_entry`
     /// pulling one entry from the strategy cursor
-    /// (`dictmultiobject.py:904-937`); the dict view iterator's integer field
+    /// (`dictmultiobject.py`); the dict view iterator's integer field
     /// replaces the live iterator the GC-object layout cannot hold.  The
     /// default materialises the full list (fine for the tiny empty
     /// strategies); typed strategies override for O(1).
@@ -6466,7 +6466,7 @@ pub trait DictStrategy {
 
     /// The first live slot at or after `from` — `_ll_dictnext`'s scan,
     /// "while i < num_ever_used_items: if entries.valid(i)"
-    /// (`rordereddict.py:1373`).
+    /// (`rordereddict.py`).
     ///
     /// A delete leaves a tombstone rather than closing the hole, so a slot
     /// number is not an iteration position and a walk has to skip.  The
@@ -6481,7 +6481,7 @@ pub trait DictStrategy {
 
     /// [`Self::next_slot`] descending, for `reversed(d)`: PyPy's
     /// `getiterreversed` is `objectmodel.reversed_dict`
-    /// (`dictmultiobject.py:1168`), itself a descending slot walk with the
+    /// (`dictmultiobject.py`), itself a descending slot walk with the
     /// same `valid()` skip.  `before` is exclusive, so a fresh reverse walk
     /// starts at `usize::MAX`.
     ///
@@ -6504,7 +6504,7 @@ pub trait DictStrategy {
         w_key: PyObjectRef,
         w_default: Option<PyObjectRef>,
     ) -> Result<PyObjectRef, DictPopError> {
-        // dictmultiobject.py:624-634
+        // dictmultiobject.py pop
         // `getitem` hashes the key and `delitem` allocates, so the receiver,
         // the key, the default and the fetched value are each stale at their
         // next use.  A `None` default slots a null word, which the root stack
@@ -6528,7 +6528,7 @@ pub trait DictStrategy {
 
     /// `dictmultiobject.py popitem` — remove and return the
     /// most recently inserted (key, value) pair.  Python 3.7+ `popitem`
-    /// is LIFO (`pypy/objspace/std/dictmultiobject.py:1395
+    /// is LIFO (`pypy/objspace/std/dictmultiobject.py
     /// descr_popitem`); the default routes through the strategy's
     /// `items()` and pops the tail.  Concrete strategies override for
     /// O(1) backings (e.g. `ModuleDictStrategy` uses
@@ -6551,7 +6551,7 @@ pub trait DictStrategy {
 
     /// `dictmultiobject.py getiterreversed` — iterate
     /// (key, value) pairs in reverse insertion order (used by
-    /// `reversed(dict)` per `pypy/objspace/std/dictmultiobject.py:1494
+    /// `reversed(dict)` per `pypy/objspace/std/dictmultiobject.py
     /// W_DictMultiObject.descr_reversed`).  Default reverses the
     /// strategy's materialised `items()`; ordered backings override
     /// for streaming reverse iteration.
@@ -6645,8 +6645,8 @@ pub trait DictStrategy {
     /// override and the upstream default `(None, None)` for non-
     /// kwarg/non-unicode strategies (`:568-569`).  Concrete strategies
     /// override: KwargsDictStrategy returns the parallel arrays
-    /// (`kwargsdict.py:154-156`), UnicodeDictStrategy mints arrays
-    /// from its r_dict storage (`dictmultiobject.py:1323-1334`).
+    /// (`kwargsdict.py`), UnicodeDictStrategy mints arrays
+    /// from its r_dict storage (`dictmultiobject.py`).
     ///
     /// # Safety
     /// `w_dict` must be a valid PyObjectRef.
@@ -7005,7 +7005,7 @@ impl EmptyKwargsDictStrategy {
 
     /// `dictmultiobject.py switch_to_correct_strategy`
     /// duplicated with the unicode branch redirected per PyPy's
-    /// subclass MRO dispatch (kwargsdict.py:14-18).
+    /// subclass MRO dispatch (kwargsdict.py switch_to_unicode_strategy).
     ///
     /// # Safety
     /// `w_dict` and `w_key` must be valid PyObjectRef.
@@ -7033,7 +7033,7 @@ impl EmptyKwargsDictStrategy {
             EMPTY_DICT_STRATEGY.switch_to_identity_strategy(w_dict);
             return;
         }
-        // `kwargsdict.py:13-22` inherits the parent's
+        // `kwargsdict.py EmptyKwargsDictStrategy` inherits the parent's
         // `switch_to_object_strategy` (`dictmultiobject.py`),
         // which allocates ObjectDictStrategy's empty Vec. Routing
         // through the parent avoids leaving `w_dict_new_kwargs`'s
@@ -7072,7 +7072,7 @@ impl DictStrategy for EmptyKwargsDictStrategy {
     }
 
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
-        // `dictmultiobject.py:755-757` — promote via the subclass's
+        // `dictmultiobject.py setitem` — promote via the subclass's
         // `switch_to_correct_strategy`, then setitem on the new
         // strategy.  The kwargs override redirects the unicode
         // branch to KwargsDictStrategy.
@@ -7123,7 +7123,7 @@ impl DictStrategy for EmptyKwargsDictStrategy {
         EMPTY_DICT_STRATEGY.view_as_kwargs(w_dict)
     }
 
-    /// `kwargsdict.py:13-22` inherits the parent's
+    /// `kwargsdict.py EmptyKwargsDictStrategy` inherits the parent's
     /// `switch_to_object_strategy` (`dictmultiobject.py`).
     /// Delegate to `EMPTY_DICT_STRATEGY` so the null `dstorage` from
     /// `w_dict_new_kwargs` is replaced by ObjectDictStrategy's empty
@@ -7133,7 +7133,7 @@ impl DictStrategy for EmptyKwargsDictStrategy {
         EMPTY_DICT_STRATEGY.switch_to_object_strategy(w_dict);
     }
 
-    /// `kwargsdict.py:13-22` inherits empty-dict behavior: copying an
+    /// `kwargsdict.py EmptyKwargsDictStrategy` inherits empty-dict behavior: copying an
     /// empty kwargs dict returns a fresh empty kwargs dict on the
     /// EmptyKwargsDictStrategy so the first unicode setitem still
     /// promotes directly to KwargsDictStrategy (skipping the regular
@@ -7187,7 +7187,7 @@ impl DictStrategy for EmptyDictStrategy {
         None
     }
 
-    // dictmultiobject.py:749-753
+    // dictmultiobject.py setdefault
     unsafe fn setdefault(
         &self,
         w_dict: PyObjectRef,
@@ -7199,7 +7199,7 @@ impl DictStrategy for EmptyDictStrategy {
         w_value
     }
 
-    // dictmultiobject.py:783-787
+    // dictmultiobject.py pop
     unsafe fn pop(
         &self,
         _w_dict: PyObjectRef,
@@ -7265,7 +7265,7 @@ impl DictStrategy for EmptyDictStrategy {
     }
 
     unsafe fn popitem(&self, _w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
-        // `dictmultiobject.py:774-775` — KeyError.
+        // `dictmultiobject.py popitem` — KeyError.
         None
     }
 
@@ -7332,7 +7332,7 @@ impl DictStrategy for ObjectDictStrategy {
     }
 
     fn get_empty_storage(&self) -> *mut u8 {
-        // `dictmultiobject.py:1209-1212`: erased `r_dict(dict_keys_equal,
+        // `dictmultiobject.py get_empty_storage`: erased `r_dict(dict_keys_equal,
         // hash_w)`.  Pyre's typed map is
         // `IndexMap<ObjectKey, PyObjectRef>` — hash bucket for O(1)
         // lookup that also preserves insertion order (CPython 3.7+ /
@@ -7505,7 +7505,7 @@ impl DictStrategy for ObjectDictStrategy {
 ///
 /// Bytes-keyed dict storage — `is_correct_type` returns true only for
 /// W_BytesObject keys; mixed keys force `switch_to_object_strategy`
-/// per `dictmultiobject.py:1066`.  Native `Vec<(Vec<u8>, PyObjectRef)>`
+/// per `dictmultiobject.py`.  Native `Vec<(Vec<u8>, PyObjectRef)>`
 /// backing (Slice D4) — the unified-shape adaptation has been
 /// retired.
 pub struct BytesDictStrategy;
@@ -7735,7 +7735,7 @@ impl DictStrategy for UnicodeDictStrategy {
         // returns an empty `r_dict(unicode_eq, unicode_hash)`.  Pyre
         // shares ObjectDictStrategy's `IndexMap<ObjectKey, PyObjectRef>`
         // backing — str-keyed `dict_keys_equal` matches `unicode_eq`
-        // for the str fast-path callers (`dictmultiobject.py:1311-1318`).
+        // for the str fast-path callers (`dictmultiobject.py`).
         // GC-managed box (`setfield_gc` on reassign).
         crate::gc_storage::gc_alloc_storage_box(
             crate::dictmultiobject::object_dict_storage_new(),
@@ -7926,7 +7926,7 @@ impl DictStrategy for UnicodeDictStrategy {
     /// the IndexMap backing and wrap with the same UnicodeDictStrategy
     /// (shares Object's `IndexMap<ObjectKey, _>` shape — str fast-path
     /// helpers route through the Object backing per
-    /// `dictmultiobject.py:1311-1318`).  Proxy-attached W_DictObjects
+    /// `dictmultiobject.py`).  Proxy-attached W_DictObjects
     /// route through `w_dict_copy`'s union-walk fallback.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);

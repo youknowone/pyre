@@ -16,7 +16,7 @@ def _absent(tp, name):
     assert name not in tp.__dict__, (tp, name)
 
 
-# --- members that CPython 3.14 and PyPy both publish, exercised here ---
+# members that CPython 3.14 and PyPy both publish, exercised here
 
 assert (1.5).real == 1.5
 assert (1.5).imag == 0.0
@@ -103,7 +103,7 @@ assert wrapper_descriptor.__name__ == "wrapper_descriptor"
 assert "__repr__" in wrapper_descriptor.__dict__
 assert wrapper_descriptor.__dict__["__repr__"](object.__str__) == repr(object.__str__)
 
-# --- SPEC-omit: PyPy TypeDef key, CPython 3.14 type dict has no such key ---
+# SPEC-omit: PyPy TypeDef key, CPython 3.14 type dict has no such key
 
 _absent(bool, "__str__")
 _absent(bool, "__bool__")

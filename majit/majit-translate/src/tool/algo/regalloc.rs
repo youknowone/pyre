@@ -464,7 +464,7 @@ impl RegAllocatorState {
 /// `coloring` is keyed on the backing
 /// [`crate::flowspace::model::Variable`] —
 /// matching upstream RPython's `coloring: dict[Variable, int]`
-/// (`tool/algo/regalloc.py:31`).  Consumers hold `&Variable` directly
+/// (`tool/algo/regalloc.py`).  Consumers hold `&Variable` directly
 /// (`flatten.rs:GraphFlattener::getcolor(&Variable)`,
 /// `liveness::variable_to_register(&Variable, regallocs)`) and call
 /// [`Self::color_for_variable`] / [`Self::contains_variable`].

@@ -244,7 +244,7 @@ pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval
 pub use majit_jitcode::codewriter::assembler::Assembler;
 pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_trace};
 /// The walker's own `getfield_gc` / `setfield_gc` descr resolution
-/// (`blackhole.py:1432-1483` reads the descr straight out of the constant
+/// (`blackhole.py bhimpl_getfield_gc_i` reads the descr straight out of the constant
 /// pool).  Exported so the descr-identity census can compare it against the
 /// pool-side resolution without re-deriving a second copy of the logic.
 pub use pyjitpl::dispatch::{
@@ -287,7 +287,7 @@ pub use trace_ctx::VableEntryWrite;
 /// Compute green key from code pointer and PC.
 /// Must use the same hash as the front-end's make_green_key — the full
 /// `JitCell.get_uhash` over the pypyjit green tuple, `is_being_profiled`
-/// folded to 0 (warmstate.py:584-593).
+/// folded to 0 (warmstate.py).
 pub fn green_key_from_code_ptr(code_ptr: usize, pc: usize) -> u64 {
     majit_ir::pypyjit_greenkey_uhash(pc, false, code_ptr as u64)
 }
@@ -1366,7 +1366,7 @@ pub enum TraceAction {
     AbortPermanent,
     /// A loop back-edge was reached inside an inline callee frame whose
     /// loop already has compiled code (opimpl_jit_merge_point
-    /// portal_call_depth>0, pyjitpl.py:1579-1602). The metainterp must
+    /// portal_call_depth>0, pyjitpl.py). The metainterp must
     /// pop the inline frame (finishframe(None)) and record a
     /// CALL_ASSEMBLER into the loop token from the parent frame
     /// (do_recursive_call assembler_call=True), then continue tracing
@@ -1497,7 +1497,7 @@ pub fn green_key_hash(values: &[i64]) -> u64 {
 
 /// Hash a green key from `(i64 bits, GreenType)` slices.
 ///
-/// `warmstate.py:575 _green_args_spec` keys per-type
+/// `warmstate.py comparekey _green_args_spec` keys per-type
 /// `equal_whatever`/`hash_whatever` off the green's lltype, so a Float
 /// green hashes as `f64::from_bits(bits)`-aware and a Ref green hashes
 /// as identity over the pointer bits.  Mirrors the typed schema that
@@ -1558,7 +1558,7 @@ pub fn register_criticalcode_hooks(start: fn(), stop: fn()) {
 /// implements against its `PYRE_STACKTOOBIG` budget. Called once at
 /// JIT install time. When no hook is registered, [`stack_almost_full`]
 /// returns `false` — matching RPython's untranslated fallback in
-/// `rpython/rlib/rstack.py:76-77`.
+/// `rpython/rlib/rstack.py`.
 pub fn register_stack_almost_full_hook(f: fn() -> bool) {
     let _ = STACK_ALMOST_FULL_FN.set(f);
 }
@@ -1652,7 +1652,7 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 /// `pyjitpl.py same_greenkey(original_boxes, live_arg_boxes,
 /// num_green_args)` always compares the actual closing boxes. 55 and 56 are
 /// gated behind a non-zero `retrace_limit` (default 0, `warmstate.rs`
-/// DEFAULT_RETRACE_LIMIT / `rpython/rlib/jit.py:595`), so a default-parameter
+/// DEFAULT_RETRACE_LIMIT / `rpython/rlib/jit.py`), so a default-parameter
 /// run reading 0 on them proves nothing.
 ///
 /// 57 = the unroll pass abandoned a retrace because `jump_to_preamble` would
@@ -2172,7 +2172,7 @@ pub fn mc_diag_bump(i: usize) {
 /// the stack is more than 15/16ths full against the recursion-limit
 /// budget. Dispatches to the interpreter-registered hook; in tests or
 /// standalone binaries without the interpreter's stack-check layer,
-/// returns `false` (rstack.py:76-77 `if not we_are_translated: return
+/// returns `false` (rstack.py `if not we_are_translated: return
 /// False`).
 #[inline]
 pub fn stack_almost_full() -> bool {
@@ -2270,7 +2270,7 @@ mod tests {
         let untyped = green_key_hash(&[bits]);
         let typed = green_key_hash_typed(&[bits], &[majit_ir::GreenType::Float]);
         // hash_whatever(Float, bits) vs hash_whatever(Int, bits) — distinct
-        // per `warmstate.py:566 _green_args_spec` per-type lookup.
+        // per `warmstate.py _green_args_spec` per-type lookup.
         assert_ne!(
             untyped, typed,
             "Float-typed hash must not collide with Int-typed hash on the same bits",

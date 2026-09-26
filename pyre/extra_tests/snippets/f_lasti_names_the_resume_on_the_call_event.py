@@ -1,7 +1,7 @@
 # pyre-check: gate=1
 # pyre-check: pypy-diverges: `pyframe.py:78` declares `last_instr = -1` and
 # `pyframe.py:335-341` states "Execution starts just after the last_instr.
-# Initially, last_instr is -1", so `fget_f_lasti` (`pyframe.py:771`) hands out
+# Initially, last_instr is -1", so `fget_f_lasti` (`pyframe.py`) hands out
 # `-1` for a frame that has not run an instruction.  3.11 also has no `RESUME`
 # for the coordinate below to name.
 #

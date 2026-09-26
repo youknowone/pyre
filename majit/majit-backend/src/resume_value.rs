@@ -21,7 +21,7 @@ use crate::ExitValueSourceLayout;
 /// This is the majit equivalent of the tagged numbering used by
 /// `rpython/jit/metainterp/resume.py`. Each `Constant` entry carries a
 /// full `majit_ir::Const` (Int/Float/Ref) so the encoder's `getconst`
-/// dispatch (resume.py:157-188) can route through the shared pool
+/// dispatch (resume.py) can route through the shared pool
 /// (`ResumeDataLoopMemo.consts`) without losing type information.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResumeValueSource {
@@ -291,12 +291,12 @@ pub enum VirtualInfo {
     },
     /// resume.py VRawBufferInfo(func, size, offsets, descrs).
     VRawBuffer {
-        /// resume.py:694: self.func — raw malloc function pointer.
+        /// resume.py __init__: self.func — raw malloc function pointer.
         func: i64,
         /// Size of the buffer in bytes.
         size: usize,
         /// resume.py:695: self.offsets — byte offsets for each stored
-        /// value. Signed to match rawbuffer.py:14.
+        /// value. Signed to match rawbuffer.py __init__.
         offsets: Vec<i64>,
         /// resume.py:697: self.descrs — per-entry ArrayDescr snapshots.
         descrs: Vec<ArrayDescrInfo>,
@@ -318,14 +318,14 @@ pub enum VirtualInfo {
     /// resume.py VStrConcatInfo — virtual string concat (left + right).
     /// OS_STR_CONCAT funcptr is resolved at materialization via
     /// `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT)`
-    /// (resume.py:1467-1468); the layout carries no funcptr.
+    /// (resume.py); the layout carries no funcptr.
     VStrConcat {
         left: Box<VirtualFieldSource>,
         right: Box<VirtualFieldSource>,
     },
     /// resume.py VStrSliceInfo — virtual string slice. OS_STR_SLICE
     /// funcptr resolved via callinfocollection at materialization
-    /// (resume.py:1477-1478).
+    /// (resume.py).
     VStrSlice {
         source: Box<VirtualFieldSource>,
         start: Box<VirtualFieldSource>,
@@ -335,14 +335,14 @@ pub enum VirtualInfo {
     VUniPlain { chars: Vec<VirtualFieldSource> },
     /// resume.py VUniConcatInfo — virtual unicode concat.
     /// OS_UNI_CONCAT funcptr resolved via callinfocollection
-    /// (resume.py:1494-1495).
+    /// (resume.py).
     VUniConcat {
         left: Box<VirtualFieldSource>,
         right: Box<VirtualFieldSource>,
     },
     /// resume.py VUniSliceInfo — virtual unicode slice.
     /// OS_UNI_SLICE funcptr resolved via callinfocollection
-    /// (resume.py:1504-1505).
+    /// (resume.py).
     VUniSlice {
         source: Box<VirtualFieldSource>,
         start: Box<VirtualFieldSource>,

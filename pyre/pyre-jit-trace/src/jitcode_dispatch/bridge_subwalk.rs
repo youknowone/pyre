@@ -312,7 +312,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // `catch_exception` and jumps to the handler with no further condition on
     // where the handler leads.  A handler that RETURNS out of the frame instead
     // of rejoining a loop is the ordinary `finishframe` case
-    // (`pyjitpl.py:2503-2525`): the frame is popped and the result either lands
+    // (`pyjitpl.py`): the frame is popped and the result either lands
     // in the caller's last op or, with the framestack empty, becomes
     // `DoneWithThisFrame`.  Route on the catch alone.
     let exc_edge_catch_target = if exc_edge_precondition {
@@ -453,7 +453,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         // skipped entirely.
         let mut carrier_raise_escapes = false;
         let walk_position = if let Some(catch_target) = exc_edge_catch_target {
-            // RPython `pyjitpl.py:3125-3173` exception-guard resumption, emitted
+            // RPython `pyjitpl.py _prepare_exception_resumption` exception-guard resumption, emitted
             // at the bridge-entry frame state so the GUARD_EXCEPTION captures a
             // fresh resume snapshot (the call-site prologue cannot — no frame is
             // reconstructed there):
@@ -464,12 +464,12 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             //
             // RPython splits this across two calls because resume-data replay
             // runs between them: `_prepare_exception_resumption` records the
-            // two SAVEs at the trace start (`pyjitpl.py:3148` asserts the trace
+            // two SAVEs at the trace start (`pyjitpl.py` asserts the trace
             // is still empty), and `prepare_resume_from_failure` records
             // RESTORE_EXCEPTION only after the resume operations. That gap is
             // the whole point of the SAVE/RESTORE pair — a bare
             // GUARD_NO_EXCEPTION at the bridge start is removable by the
-            // optimizer (`pyjitpl.py:3132-3138`). pyre emits nothing between
+            // optimizer (`pyjitpl.py`). pyre emits nothing between
             // them today, so `remove_bridge_exception`
             // (`majit-gc/src/rewrite.rs`, rewrite.py) strips the
             // consecutive triple and leaves the guard. Once pyre replays
@@ -497,7 +497,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             wc.trace_ctx
                 .record_guard(OpCode::GuardException, &[exc_class_const], 0);
             // `handle_possible_exception` captures resume data at the MIFrame's
-            // CURRENT pc — already past the residual call (`pyjitpl.py:2610
+            // CURRENT pc — already past the residual call (`pyjitpl.py
             // capture_resumedata`, default `resumepc`).  `position` here IS
             // that post-call resume coordinate (decoded from the failing
             // guard), so capture WITHOUT the after-residual advance and carry
@@ -686,7 +686,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         {
             // `MIFrame.registers_r` is the authoritative source upstream when
             // an abort converts the metainterp framestack to blackholes
-            // (`blackhole.py:1711-1727`).  Preserve pyre's equivalent mirror
+            // (`blackhole.py _copy_data_from_miframe`).  Preserve pyre's equivalent mirror
             // before `wc` drops; the epilogue checks this coordinate against
             // the decoded abort resume pc before it mutates the live frame.
             fbw_branch_abort_stack_latch(
@@ -1553,7 +1553,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // in `except SwitchToBlackhole as stb:
         // self.run_blackhole_interp_to_cancel_tracing(stb)` (:2930-2931), which
         // converts the frames `interpret()` reached and runs them forward
-        // (`blackhole.py:1799`); `_handle_guard_failure` itself ends
+        // (`blackhole.py convert_and_run_from_pyjitpl`); `_handle_guard_failure` itself ends
         // `assert False, "should always raise"` (:2956).  An aborted bridge is
         // never rewound to its guard upstream.  This sub-walk has already
         // concrete-executed the reconstructed callee's residual calls (the

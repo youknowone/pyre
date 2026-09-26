@@ -7,7 +7,7 @@
 //!
 //! `str` and `unicode` parse but are refused. Their codegen ABI
 //! (a `*const &'static str` slot mirroring `rstr.STR` / `rstr.UNICODE`,
-//! warmstate.py:108-128) is implemented and kept in `mod.rs`, but the slot is
+//! warmstate.py equal_whatever) is implemented and kept in `mod.rs`, but the slot is
 //! `Box::leak`ed per merge-point hit rather than once per JitCell, so the
 //! refusal stands until the backing storage is owned by the cell. The refusal
 //! lives in `GreenSpec::parse` because that is the sole construction site for

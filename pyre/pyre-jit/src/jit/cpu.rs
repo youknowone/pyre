@@ -402,7 +402,7 @@ pub struct Cpu {
     /// `rpython/jit/backend/llgraph/runner.py:LLGraphCPU.rtyper` —
     /// upstream `flatten_graph` reaches `cpu.rtyper.exceptiondata.
     /// get_standard_ll_exc_instance_by_class(OverflowError)` at
-    /// `flatten.py:166-170` (the `handling_ovf=True` arm of
+    /// `flatten.py` (the `handling_ovf=True` arm of
     /// `make_exception_link`).  Pyre's rtyper shim
     /// ([`super::exceptiondata::Rtyper`]) exposes only that attribute
     /// chain; other rtyper machinery is intentionally absent because
@@ -435,7 +435,7 @@ impl Cpu {
         // pointers — RPython's `RPythonTyper.specialize` ->
         // `ExceptionData.finish` invokes `get_standard_ll_exc_instance(
         // rtyper, clsdef)` at rtyper construction time
-        // (`rpython/rtyper/exceptiondata.py:34-38`), which calls
+        // (`rpython/rtyper/exceptiondata.py`), which calls
         // `r_inst.get_reusable_prebuilt_instance()` and returns the
         // **prebuilt INSTANCE** pointer (not the class pointer).
         // Downstream `get_standard_ll_exc_instance_by_class` wraps

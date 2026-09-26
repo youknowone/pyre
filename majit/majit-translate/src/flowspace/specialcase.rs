@@ -166,7 +166,7 @@ pub(crate) fn lookup_special_case(w_callable: &Hlvalue) -> Option<SpecialCaseDis
 }
 
 /// RPython `@register_flow_sc(__import__) def sc_import(ctx, *args_w)`
-/// (`specialcase.py:27-31`).
+/// (`specialcase.py`).
 ///
 /// Upstream asserts each arg is a Constant, unwraps the values, and
 /// delegates to `ctx.import_name(*args)`.
@@ -186,7 +186,7 @@ pub fn sc_import(ctx: &mut FlowContext, args_w: &[Hlvalue]) -> Result<Hlvalue, F
 }
 
 /// RPython `@register_flow_sc(locals) def sc_locals(_, *args)`
-/// (`specialcase.py:33-41`).
+/// (`specialcase.py`).
 pub fn sc_locals(_ctx: &mut FlowContext, _args_w: &[Hlvalue]) -> Result<Hlvalue, FlowContextError> {
     Err(FlowContextError::Flowing(FlowingError::new(
         "A function calling locals() is not RPython.  \
@@ -199,7 +199,7 @@ pub fn sc_locals(_ctx: &mut FlowContext, _args_w: &[Hlvalue]) -> Result<Hlvalue,
 }
 
 /// RPython `@register_flow_sc(getattr) def sc_getattr(ctx, w_obj,
-/// w_index, w_default=None)` (`specialcase.py:43-49`).
+/// w_index, w_default=None)` (`specialcase.py`).
 ///
 /// With `w_default` absent → `op.getattr(w_obj, w_index).eval(ctx)`;
 /// present → `ctx.appcall(getattr, w_obj, w_index, w_default)`.

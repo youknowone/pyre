@@ -3,7 +3,7 @@
 //!
 //! Pyre-side shim for the only attribute chain `flatten_graph` reads
 //! from `cpu`: `cpu.rtyper.exceptiondata.get_standard_ll_exc_instance_by_class(...)`
-//! at `rpython/jit/codewriter/flatten.py:166-170`.  Other RPython
+//! at `rpython/jit/codewriter/flatten.py`.  Other RPython
 //! `ExceptionData` methods (`make_helpers`, `make_exception_matcher`,
 //! `make_type_of_exc_inst`, …) are intentionally absent; they get added
 //! one method at a time when a future port reads them.
@@ -140,7 +140,7 @@ impl ExceptionData {
     /// pointer reachable through `resolve`, matching upstream's
     /// `get_standard_ll_exc_instance(rtyper, clsdef)` which materialises
     /// the LL instance pointer at rtyper construction time
-    /// (`exceptiondata.py:34-42`).  Pyre's lazy-resolver path
+    /// (`exceptiondata.py`).  Pyre's lazy-resolver path
     /// (`set_lazy_resolver`) is the production analog; this eager
     /// variant exists for tests that want to control the pointer
     /// values directly without going through the live interpreter.
@@ -222,7 +222,7 @@ impl ExceptionData {
 /// Pyre-jit operates on the flowspace graph directly without a typed
 /// low-level rewrite; the rtyper shim exists only to satisfy the
 /// `cpu.rtyper.exceptiondata` attribute chain that `flatten_graph` reads
-/// from at `flatten.py:166`.  Future attributes are added one at a time
+/// from at `flatten.py`.  Future attributes are added one at a time
 /// when a flatten / codewriter consumer materializes them.
 #[derive(Debug, Default)]
 pub struct Rtyper {

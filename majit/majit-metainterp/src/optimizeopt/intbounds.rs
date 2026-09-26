@@ -116,7 +116,7 @@ impl OptIntBounds {
         ctx.getintbound_handle(b).borrow().clone()
     }
 
-    /// operand variant of [`getintbound_box`]. optimizer.py:99
+    /// operand variant of [`getintbound_box`]. optimizer.py getintbound
     /// `getintbound(self, op)` does `op = get_box_replacement(op)` then reads
     /// the bound; this takes that resolve box-native via `resolve_operand_operand`,
     /// without collapsing the operand to an `OpRef` first.
@@ -127,7 +127,7 @@ impl OptIntBounds {
 
     /// Resolve an operand to its forwarded terminal, the `op =
     /// get_box_replacement(op)` step shared by every `optimize_INT_*` body
-    /// (intbounds.py / optimizer.py:343). The dispatch-entry rebind
+    /// (intbounds.py / optimizer.py). The dispatch-entry rebind
     /// registers a canonical host for every operand, so `get_box_replacement`
     /// is total and resolves to a bound terminal. The returned box is the
     /// operand the bound and the `arg0 is arg1` identity check both read, so
@@ -178,7 +178,7 @@ impl OptIntBounds {
     /// cache and returned `OpRef::int_op(idx)` on hit,
     /// which mints the wrong Box family when the original Box at slot
     /// `idx` was an `InputArgInt(idx)` constant-folded via
-    /// `optimizer.py:410`. Under variant-aware OpRef Eq
+    /// `optimizer.py`. Under variant-aware OpRef Eq
     /// (`impl PartialEq for OpRef` in `majit-ir/src/resoperation.rs`)
     /// `IntOp(idx) == InputArgInt(idx)` is false,
     /// so cache keys silently key-mismatch.
@@ -562,7 +562,7 @@ impl OptIntBounds {
     }
 
     fn postprocess_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) {
-        // intbounds.py:503-505
+        // intbounds.py postprocess_ARRAYLEN_GC
         //     array = self.ensure_ptr_info_arg0(op)
         //     self.optimizer.setintbound(op, array.getlenbound(None))
         // `getlenbound` lazily fills `ArrayPtrInfo.lenbound` (`info.py`).
@@ -580,7 +580,7 @@ impl OptIntBounds {
     }
 
     fn postprocess_strlen(&mut self, op: &Op, ctx: &mut OptContext) {
-        // intbounds.py:507-510
+        // intbounds.py postprocess_STRLEN
         //     self.make_nonnull_str(op.getarg(0), vstring.mode_string)
         //     array = getptrinfo(op.getarg(0))
         //     self.optimizer.setintbound(op, array.getlenbound(vstring.mode_string))
@@ -589,12 +589,12 @@ impl OptIntBounds {
         // because make_nonnull_str installs the StrPtrInfo on box._forwarded
         // and getptrinfo reads it back. The Rust port reaches the same state
         // by calling ensure_ptr_info_arg0 (which constructs StrPtrInfo for
-        // STRLEN per optimizer.py:490-491) and then invoking getlenbound on
+        // STRLEN per optimizer.py) and then invoking getlenbound on
         // the returned handle.
         let arg0_box = ctx.resolve_operand_operand(&op.arg(0));
         ctx.make_nonnull_str(&arg0_box, 0);
         // `getlenbound` is a lazy-fill mutator on `StrPtrInfo.lenbound`
-        // (`vstring.py:62`). Route through `with_ensured_ptr_info_arg0`
+        // (`vstring.py`). Route through `with_ensured_ptr_info_arg0`
         // so the operand-held StrPtrInfo is updated in place.
         let bound = ctx.with_ensured_ptr_info_arg0(op, |mut info| info.getlenbound(Some(0)));
         if let Some(bound) = bound {
@@ -604,7 +604,7 @@ impl OptIntBounds {
     }
 
     fn postprocess_unicodelen(&mut self, op: &Op, ctx: &mut OptContext) {
-        // intbounds.py:512-515
+        // intbounds.py postprocess_UNICODELEN
         //     self.make_nonnull_str(op.getarg(0), vstring.mode_unicode)
         //     array = getptrinfo(op.getarg(0))
         //     self.optimizer.setintbound(op, array.getlenbound(vstring.mode_unicode))
@@ -814,7 +814,7 @@ impl OptIntBounds {
     /// Guards are NOT handled in optimize (propagate_forward).
     /// The guard is emitted via the default emit path, and
     /// propagate_bounds_backward runs in postprocess_GUARD_TRUE
-    /// (intbounds.py:56).
+    /// (intbounds.py).
     ///
     /// The constant/bound checks for guard removal are handled by
     /// the default dispatch in RPython. In majit, we do them here
@@ -873,7 +873,7 @@ impl OptIntBounds {
     ///
     /// The lookup goes through `new_operations_index`, the O(1) mirror of
     /// `new_operations` keyed by result position. `op in
-    /// self._emittedoperations` (optimizer.py:375) is a dict membership test,
+    /// self._emittedoperations` (optimizer.py) is a dict membership test,
     /// so a hash lookup is the shape upstream has; scanning instead put an
     /// O(len(new_operations)) walk on `propagate_bounds_backward`, which runs
     /// once per emitted int op and recurses, making bound propagation
@@ -1901,7 +1901,7 @@ impl Optimization for OptIntBounds {
 ///
 /// Debug-only logging helper for integer-bound analysis.
 ///
-/// Diagnostic-only adaptations vs `intbounds.py:815-850`: output is buffered
+/// Diagnostic-only adaptations vs `intbounds.py`: output is buffered
 /// in-memory (`lines`) instead of `debug_print`; `optimizer` is held as a debug
 /// string rather than the live optimizer + `LogOperations`; and boxes/ops are
 /// formatted with Rust `Debug` instead of `repr_of_arg` / `repr_of_resop`. The
@@ -3342,7 +3342,7 @@ mod tests {
     /// IntAddOvf(i, 1) is converted to IntAdd. This is the nbody inner
     /// loop pattern and relies on rewrite postprocess first fixing the
     /// comparison result to 1, then intbounds driving
-    /// propagate_bounds_backward_op() / intbounds.py:608-651.
+    /// propagate_bounds_backward_op() / intbounds.py propagate_bounds_INT_LT.
     #[test]
     fn test_guard_true_int_lt_enables_add_ovf_removal() {
         use crate::optimizeopt::optimizer::Optimizer;
@@ -3431,7 +3431,7 @@ mod tests {
     }
 
     /// The `jit-intbounds-stats` debug dump must open/close its section
-    /// balanced regardless of whether logging is enabled (intbounds.py:862-870).
+    /// balanced regardless of whether logging is enabled (intbounds.py print_rewrite_rule_statistics).
     #[test]
     fn print_rewrite_rule_statistics_runs_without_panicking() {
         print_rewrite_rule_statistics();

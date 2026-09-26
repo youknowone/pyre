@@ -421,7 +421,7 @@ impl AddressOffset {
                 TYPE: offset.TYPE,
                 repeat: -offset.repeat,
             })),
-            // llmemory.py:250-253 `ofs = [-item for item in self.offsets];
+            // llmemory.py __neg__ `ofs = [-item for item in self.offsets];
             // ofs.reverse(); return CompositeOffset(*ofs)`. The list
             // comprehension negates every element — if any `-item` raises
             // (FieldOffset/ArrayItemsOffset/ArrayLengthOffset have no
@@ -601,7 +601,7 @@ fn item_offset_ref(ty: &LowLevelType, repeat: i64, firstitemptr: &_ptr) -> Resul
             ));
         };
         // `_end_markers` is a `WeakKeyDictionary` keyed by the parent array
-        // (llmemory.py:167). The keyed `Arc::as_ptr` address can be reused
+        // (llmemory.py). The keyed `Arc::as_ptr` address can be reused
         // after the array is dropped, so a cache hit is accepted only when the
         // stored end marker's weak `_wrparent` still upgrades to *this* array
         // (`parent_is`); a stale hit on a reused address recomputes, emulating
@@ -618,9 +618,9 @@ fn item_offset_ref(ty: &LowLevelType, repeat: i64, firstitemptr: &_ptr) -> Resul
         return Ok(endmarker._as_ptr(true));
     }
     // `parent.getitem(index)` (llmemory.py). A varsize `_array.getitem`
-    // (lltype.py:1927) is Python list indexing, so a negative index addresses
+    // (lltype.py) is Python list indexing, so a negative index addresses
     // from the end; a fixed-size array `_fixedsizearray.getitem`
-    // (lltype.py:1839) asserts `0 <= index < length`, so a negative index is
+    // (lltype.py) asserts `0 <= index < length`, so a negative index is
     // rejected. Out-of-range declines either way.
     let actual = match &arr.TYPE {
         ArrayContainer::Array(_) if index < 0 => len + index,
@@ -640,7 +640,7 @@ fn item_offset_ref(ty: &LowLevelType, repeat: i64, firstitemptr: &_ptr) -> Resul
 /// `substruct = struct._obj._getattr(fldname); substruct._as_ptr()`.
 fn field_offset_ref(ty: &LowLevelType, fldname: &str, struct_ptr: &_ptr) -> Result<_ptr, String> {
     // `if lltype.typeOf(struct).TO != self.TYPE: struct = cast_pointer(
-    //  Ptr(self.TYPE), struct)` (llmemory.py:199-200) — up-cast to the
+    //  Ptr(self.TYPE), struct)` (llmemory.py) — up-cast to the
     // offset's struct type when the pointer is to an inner sub-struct.
     let cur: LowLevelType = struct_ptr._TYPE.TO.clone().into();
     let casted;
@@ -679,7 +679,7 @@ fn field_offset_ref(ty: &LowLevelType, fldname: &str, struct_ptr: &_ptr) -> Resu
 /// arm: `arrayptr._obj.getitem(0)._as_ptr()`.
 fn array_items_offset_ref(ty: &LowLevelType, arrayptr: &_ptr) -> Result<_ptr, String> {
     // `assert array_type_match(lltype.typeOf(arrayptr).TO, self.TYPE)`
-    // (llmemory.py:290) — the pointer's array type must match the offset's,
+    // (llmemory.py) — the pointer's array type must match the offset's,
     // otherwise the navigation is invalid and the fold declines.
     let a1: LowLevelType = arrayptr._TYPE.TO.clone().into();
     if !array_type_match(&a1, ty) {
@@ -712,7 +712,7 @@ fn array_items_offset_ref(ty: &LowLevelType, arrayptr: &_ptr) -> Result<_ptr, St
 /// `Ptr(FixedSizeArray(Signed, 1))` whose `getitem(0)` reads the array length.
 fn array_length_offset_ref(ty: &LowLevelType, arrayptr: &_ptr) -> Result<_ptr, String> {
     // `assert array_type_match(lltype.typeOf(arrayptr).TO, self.TYPE)`
-    // (llmemory.py:337).
+    // (llmemory.py).
     let a1: LowLevelType = arrayptr._TYPE.TO.clone().into();
     if !array_type_match(&a1, ty) {
         return Err(format!(
@@ -1019,7 +1019,7 @@ pub fn sizeof(ty: &LowLevelType, n: Option<i64>) -> Result<ConstValue, String> {
 ///
 /// A process-wide singleton, matching upstream's module-level `dead_wref`
 /// variable: `_ptr` equality respects container identity
-/// (lltype.py:1185-1201), so every reference resolves to the same `_wref`
+/// (lltype.py), so every reference resolves to the same `_wref`
 /// container and compares equal. `_ptr` is `Send + Sync`, so the value
 /// lives in a `LazyLock` rather than a per-thread cell.
 pub fn dead_wref() -> _ptr {
@@ -1183,7 +1183,7 @@ pub fn cast_adr_to_int(adr: &_address, mode: Option<&str>) -> Result<i64, String
 /// - odd `int`: `cast_int_to_ptr` builds a tagged-integer `_NONGCREF` `_ptr`,
 ///   wrapped as the `fakeaddress` (`_address::Fake`).
 /// - even non-zero `int`: `cast_int_to_ptr` raises `ValueError`
-///   (lltype.py:2375-2376); upstream then resolves it through the runtime
+///   (lltype.py); upstream then resolves it through the runtime
 ///   `ll2ctypes._int2obj` table (llmemory.py), which has no
 ///   translation-time value — the fold declines.
 pub fn cast_int_to_adr(int: i64) -> Option<_address> {
@@ -1456,7 +1456,7 @@ mod tests {
 
     #[test]
     fn composite_known_nonneg_requires_all_parts() {
-        // llmemory.py:255-259.
+        // llmemory.py known_nonneg.
         assert!(
             composite(vec![
                 item(LowLevelType::Signed, 1),
@@ -1730,7 +1730,7 @@ mod tests {
     fn array_items_offset_ref_rejects_mismatched_array_type() {
         use crate::translator::rtyper::lltypesystem::lltype::{Array, MallocFlavor, malloc};
         // `ArrayItemsOffset(A2).ref(arrayptr)` asserts `array_type_match(A1, A2)`
-        // (llmemory.py:286-290) where `A1 = typeOf(arrayptr).TO`. A matching
+        // (llmemory.py) where `A1 = typeOf(arrayptr).TO`. A matching
         // element type folds; a mismatched one fails the assert (the over-fold
         // guard), so the fold declines instead of producing a wrong pointer.
         let signed_arr = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));

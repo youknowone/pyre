@@ -192,7 +192,7 @@ public_copy = type(public_stats)(raw_stats)
 # `total_gc_memory` is a formatted size, so comparing the two asserts that no
 # collection ran in between rather than that the constructor converts -- which
 # is false whenever the nursery is small enough to collect there.
-# `app_referents.py:72-76 _format` is the conversion under test.
+# `app_referents.py _format` is the conversion under test.
 raw_total = raw_stats.total_gc_memory
 assert public_copy.total_gc_memory == (
     "%.1fkB" % (raw_total / 1024.0)

@@ -36,7 +36,7 @@
 //! [`Vec<Holder>`] and re-implements `_match_signature` against the
 //! `Holder`-typed storage. Both implementations stay
 //! synchronised with upstream `argument.py:_match_signature`
-//! (`annotator/argument.py:43-120`).
+//! (`annotator/argument.py`).
 //!
 //! Convergence path: when the [`crate::annotator::argument::ArgumentsForTranslation`]
 //! is generalised to a trait-parameterised storage, the duplicated
@@ -72,12 +72,10 @@ use crate::translator::rtyper::rmodel::{Repr, inputconst, inputconst_from_lltype
 use crate::translator::rtyper::rtuple::TupleRepr;
 use crate::translator::rtyper::rtyper::{HighLevelOp, RPythonTyper};
 
-// ---------------------------------------------------------------------
 // callparse.py — class ArgumentsForRtype(ArgumentsForTranslation):
-// ---------------------------------------------------------------------
 
 /// RPython `class ArgumentsForRtype(ArgumentsForTranslation)`
-/// (callparse.py:7-14).
+/// (callparse.py).
 ///
 /// Storage mirrors `ArgumentsForTranslation` over [`Holder`] (see the
 /// TODO note in the module doc).
@@ -93,7 +91,7 @@ pub struct ArgumentsForRtype {
 
 impl ArgumentsForRtype {
     /// RPython `CallSpec.__init__(args_w, keywords=None, w_stararg=None)`
-    /// (flowspace/argument.py:80-84).
+    /// (flowspace/argument.py).
     pub fn new(arguments_w: Vec<Holder>) -> Self {
         ArgumentsForRtype {
             arguments_w,
@@ -116,7 +114,7 @@ impl ArgumentsForRtype {
     }
 
     /// RPython `CallSpec.fromshape(cls, (shape_cnt, shape_keys,
-    /// shape_star), data_w)` (flowspace/argument.py:115-125).
+    /// shape_star), data_w)` (flowspace/argument.py).
     pub fn fromshape(shape: &CallShape, data_w: Vec<Holder>) -> Self {
         let shape_cnt = shape.shape_cnt;
         let end_keys = shape_cnt + shape.shape_keys.len();
@@ -149,7 +147,7 @@ impl ArgumentsForRtype {
     }
 
     /// RPython `ArgumentsForRtype.unpackiterable(self, it)`
-    /// (callparse.py:11-14):
+    /// (callparse.py):
     /// ```python
     /// assert it.is_tuple()
     /// items = it.items()
@@ -164,7 +162,7 @@ impl ArgumentsForRtype {
     }
 
     /// RPython `ArgumentsForTranslation.positional_args` property
-    /// (annotator/argument.py:8-14):
+    /// (annotator/argument.py):
     /// ```python
     /// if self.w_stararg is not None:
     ///     args_w = self.unpackiterable(self.w_stararg)
@@ -184,7 +182,7 @@ impl ArgumentsForRtype {
     }
 
     /// RPython `_match_signature(scope_w, signature, defaults_w=None)`
-    /// (annotator/argument.py:43-120) — Holder-typed storage variant.
+    /// (annotator/argument.py) — Holder-typed storage variant.
     /// Body mirrors the [`crate::annotator::argument::ArgumentsForTranslation::match_signature_into`]
     /// port; only the item type differs.
     fn match_signature_into(
@@ -320,7 +318,7 @@ impl ArgumentsForRtype {
     }
 
     /// RPython `match_signature(self, signature, defaults_w)`
-    /// (annotator/argument.py:126-133).
+    /// (annotator/argument.py).
     pub fn match_signature(
         &self,
         signature: &Signature,
@@ -343,18 +341,16 @@ impl ArgumentsForRtype {
     }
 }
 
-// ---------------------------------------------------------------------
 // callparse.py — Holder hierarchy.
-// ---------------------------------------------------------------------
 
 /// RPython `class Holder(object)` + four direct subclasses
-/// (callparse.py:73-164). Rust collapses the inheritance into a single
+/// (callparse.py). Rust collapses the inheritance into a single
 /// `enum` because Holder leaves are dispatched via concrete-class
 /// branches (no virtual override beyond the four listed variants).
 ///
 /// Each variant carries a per-instance `_cache` that mirrors upstream
 /// `Holder.emit`'s `cache = self._cache = {}` lazy-init pattern
-/// (callparse.py:78-88). Key is the data-pointer identity of the
+/// (callparse.py). Key is the data-pointer identity of the
 /// requested target [`Repr`] (Python's `dict[repr]` defaults to
 /// `id(repr)` because `Repr` doesn't override `__hash__`/`__eq__`),
 /// matching pyre's singleton-Arc Repr layout where the same logical
@@ -445,7 +441,7 @@ impl Holder {
         }
     }
 
-    /// Per-instance `_cache` accessor (callparse.py:78-82).
+    /// Per-instance `_cache` accessor (callparse.py).
     fn cache(&self) -> &RefCell<HashMap<usize, Hlvalue>> {
         match self {
             Holder::Var { cache, .. }
@@ -525,7 +521,7 @@ impl Holder {
     }
 
     /// RPython `_emit(self, repr, hop)` per-subclass body
-    /// (callparse.py:105-106, :123-124, :145-152, :160-164).
+    /// (callparse.py, :123-124, :145-152, :160-164).
     fn _emit(&self, repr: &Arc<dyn Repr>, hop: &HighLevelOp) -> Result<Hlvalue, TyperError> {
         match self {
             // upstream callparse.py — `VarHolder._emit`:
@@ -603,9 +599,7 @@ impl Holder {
     }
 }
 
-// ---------------------------------------------------------------------
 // callparse.py — getrinputs / getrresult / getsig.
-// ---------------------------------------------------------------------
 
 /// RPython `getrinputs(rtyper, graph)` (callparse.py):
 /// ```python
@@ -622,7 +616,7 @@ pub fn getrinputs(
 /// Result of [`getrresult`].
 ///
 /// Upstream returns either an `Repr` instance or `lltype.Void` directly
-/// (callparse.py:20-25). Pyre keeps the two cases distinct so callers
+/// (callparse.py). Pyre keeps the two cases distinct so callers
 /// can branch without inventing a synthetic VoidRepr clone.
 pub enum RResult {
     /// RPython `rtyper.bindingrepr(graph.getreturnvar())` — the
@@ -693,12 +687,10 @@ pub fn getsig(
     ))
 }
 
-// ---------------------------------------------------------------------
 // callparse.py — `def callparse(rtyper, graph, hop, r_self=None)`.
-// ---------------------------------------------------------------------
 
 /// RPython `callparse(rtyper, graph, hop, r_self=None)`
-/// (callparse.py:34-70):
+/// (callparse.py):
 ///
 /// ```python
 /// def callparse(rtyper, graph, hop, r_self=None):
@@ -822,11 +814,9 @@ pub fn callparse(
     Ok(vlist)
 }
 
-// ---------------------------------------------------------------------
 // Local helper — decode the `(shape_cnt, shape_keys, shape_star)` tuple
 // constant that `call_args` ops carry as their first argument. Mirrors
 // `bookkeeper::call_shape_from_const` (which is annotator-level only).
-// ---------------------------------------------------------------------
 
 /// Decode a `(shape_cnt, shape_keys, shape_star)` Constant into the
 /// corresponding [`CallShape`]. Mirrors the shape encoding produced by
@@ -931,7 +921,7 @@ mod tests {
         )
     }
 
-    // ---- Holder structural ----
+    // Holder structural
 
     #[test]
     fn var_holder_is_tuple_returns_true_for_some_tuple_annotation() {
@@ -1000,7 +990,7 @@ mod tests {
         }
     }
 
-    // ---- ArgumentsForRtype.match_signature ----
+    // ArgumentsForRtype.match_signature
 
     #[test]
     fn match_signature_simple_positional_pass_through() {
@@ -1150,7 +1140,7 @@ mod tests {
         }
     }
 
-    // ---- Shape decoder ----
+    // Shape decoder
 
     #[test]
     fn call_shape_from_const_decodes_simple_positional_only() {

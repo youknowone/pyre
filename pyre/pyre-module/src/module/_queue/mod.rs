@@ -41,7 +41,7 @@ const _: () = assert!(
 /// while the guard is held stay look-inside.  This is the same split as
 /// `pyre_object::listobject::w_list_lock` and PyPy's `rthread.Lock`: the
 /// wrapper remains RPython while `c_thread_acquirelock{,_timed}` is an
-/// `llexternal` (`rpython/rlib/rthread.py:60-90,160-200`).  Rust's
+/// `llexternal` (`rpython/rlib/rthread.py`).  Rust's
 /// `Result<Guard, PoisonError<Guard>>` is consequently an implementation ABI
 /// inside the residual native-lock leaf, not a trace-visible value shape.
 #[majit_macros::dont_look_inside]

@@ -57,7 +57,7 @@ fn elidable_ref_canary_macro_advertises_ref_policy_byte_21() {
     // helper (`HelperCallKind::Ref`), and plain `#[elidable]` is the
     // can-raise variant (`call.py:297`).  Also confirms the 6-tuple's
     // trace_target slot points at the macro-emitted `extern "C"` wrapper
-    // — `getfunctionptr` (`call.py:174`) parity.
+    // — `getfunctionptr` (`call.py get_jitcode_calldescr`) parity.
     let (policy, _, trace_target, concrete_target, _, _) =
         __majit_call_policy_elidable_ref_canary();
     assert_eq!(
@@ -92,7 +92,7 @@ fn elidable_ref_canary_traces_to_call_pure_r_when_args_not_all_const() {
     // `MIFrame.execute_varargs(pure=True)` is reached only for that policy.
     let effect = EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None);
 
-    // inputarg slot 0 = first live value, Ref-typed (resoperation.py:739
+    // inputarg slot 0 = first live value, Ref-typed (resoperation.py InputArgRef
     // InputArgRef).
     let live_arg = OpRef::input_arg_ref(0);
 
@@ -125,7 +125,7 @@ fn elidable_ref_canary_traces_to_call_pure_r_when_args_not_all_const() {
     let ops = ctx.ops();
     let opcodes: Vec<_> = ops.iter().map(|op| op.opcode).collect();
 
-    // pyjitpl.py:3577-3579 — original CallR cut, CallPureR re-recorded.
+    // pyjitpl.py record_result_of_call_pure — original CallR cut, CallPureR re-recorded.
     assert!(
         ops.iter().any(|op| op.opcode == OpCode::CallPureR),
         "trace must contain CallPureR after record_result_of_call_pure patch; got opcodes {opcodes:?}",

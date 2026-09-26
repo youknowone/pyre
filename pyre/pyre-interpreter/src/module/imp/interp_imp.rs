@@ -183,7 +183,7 @@ static FROZEN_OVERRIDE: AtomicI64 = AtomicI64::new(0);
 
 /// `importing.py ImportRLock` — the interpreter's reentrant import lock.
 ///
-/// Upstream mutates the three fields with the GIL held (`importing.py:175`
+/// Upstream mutates the three fields with the GIL held (`importing.py`
 /// "this function runs with the GIL acquired so there is no race condition in
 /// the creation of the lock"); pyre has no GIL, so `lock` is published with a
 /// compare-exchange and `lockowner` is stored only after the real lock has
@@ -210,7 +210,7 @@ struct ImportRLock {
 /// reads.  Taking the execution context instead would not survive the trip —
 /// `space.getexecutioncontext()` returns the per-thread context
 /// `threadlocals.get_ec()` creates once and caches for the thread's whole life
-/// (`baseobjspace.py:741`), whereas pyre's accessor reads a slot the launcher
+/// (`baseobjspace.py`), whereas pyre's accessor reads a slot the launcher
 /// re-seeds with a fresh context per phase, so a lock taken while running a
 /// script would be owned by a stranger once the REPL starts.
 fn thread_ident() -> i64 {
@@ -301,7 +301,7 @@ impl ImportRLock {
             // `importing.py importhook` brackets its own, after which the
             // lock is allocated before user code runs and the branch stops
             // being observable either way.
-            // importing.py:201-203
+            // importing.py
             return Err(crate::PyError::runtime_error("not holding the import lock"));
         }
         debug_assert!(self.lockcounter.load(Ordering::Relaxed) > 0);
@@ -321,7 +321,7 @@ impl ImportRLock {
     ///
     /// Registered upstream as the `child` fork hook
     /// (`pypy/module/imp/moduledef.py:45`, driven by
-    /// `pypy/module/posix/interp_posix.py:1560`) and never exposed to Python.
+    /// `pypy/module/posix/interp_posix.py`) and never exposed to Python.
     #[cfg(not(target_arch = "wasm32"))]
     fn reinit_lock(&self) {
         if self.lockcounter.load(Ordering::Relaxed) > 1 {

@@ -4,7 +4,7 @@
 # No `max-pypy-ratio`: this fixture exists to pin what the emit BUILDS.
 # `call_loop_local_function` carries the fold's perf gate.
 #
-# `pyopcode.py:1457 MAKE_FUNCTION` runs `function.py:47-57 Function.__init__`
+# `pyopcode.py MAKE_FUNCTION` runs `function.py:47-57 Function.__init__`  allow-line-citation
 # per execution, so a `def` in a loop body allocates a function per iteration.
 # Emitting that construction inline lets the optimizer drop it when the
 # function never escapes; when it DOES escape, the materialized object must be

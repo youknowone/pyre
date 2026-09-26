@@ -222,7 +222,7 @@ fn walker_capture_inline_nonstandard_vable_guard_inner<Sym: WalkSym>(
         // The walk's own root frame reached the non-standard path: it is
         // writing a `vable` field of a frame that is not
         // `virtualizable_boxes[-1]`.  `_nonstandard_virtualizable`
-        // (pyjitpl.py:1120) has no special case for this — it runs
+        // (pyjitpl.py) has no special case for this — it runs
         // `implement_guard_value(eqbox, pc)` (:1916) whatever frame the walk
         // sits in, and that is `generate_guard(GUARD_VALUE, resumepc=orgpc)`
         // (:2582) -> `capture_resumedata(resumepc)` (:2610).  With no paused
@@ -267,7 +267,7 @@ fn walker_capture_inline_nonstandard_vable_guard_inner<Sym: WalkSym>(
     // `implement_guard_value(eqbox, pc)` (pyjitpl.py),
     // `generate_guard(GUARD_VALUE, resumepc=orgpc)` (pyjitpl.py),
     // and `capture_resumedata(resumepc)` (pyjitpl.py) walking the full MIFrame chain
-    // (opencoder.py:819). Publish the callee's own coordinate when the inline
+    // (opencoder.py). Publish the callee's own coordinate when the inline
     // chain is fully covered by paused callers.  `resume.py`
     // `rebuild_from_resumedata` rebuilds every encoded jitcode header and
     // `pyjitpl.py capture_resumedata` starts from the portal MIFrame; a lone
@@ -1562,7 +1562,7 @@ pub(crate) fn decline_inline_caller_frame_for_catch_marker(
     //
     // The rejoin test is a TRACEBACK constraint here, not a bridgeability one:
     // the exc-edge router itself no longer needs it (`bridge_subwalk.rs` routes
-    // on the catch alone, as `pyjitpl.py:2530-2546` does).  Inlining a caller
+    // on the catch alone, as `pyjitpl.py` does).  Inlining a caller
     // whose handler returns out of the frame instead makes
     // `exception_traceback_frame_lineno` report the raising frame twice, once at
     // the wrong lineno — the catching frame's traceback node is dropped when the
@@ -2154,7 +2154,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
                     // of them, so the color can be live at the coordinate and
                     // undefined on the path actually walked.  Leave it unset,
                     // exactly as `_copy_data_from_miframe`
-                    // (`blackhole.py:1711-1730`) leaves a `None` box unset —
+                    // (`blackhole.py`) leaves a `None` box unset —
                     // refusing here discards the whole image over a register
                     // nothing on this path will read.
                     Some(o) if o.is_none() => continue,

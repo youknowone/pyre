@@ -198,7 +198,7 @@ pub struct BlockedInference {
 
 impl BlockedInference {
     /// RPython `BlockedInference.__init__(self, annotator, op, opindex)`
-    /// (annrpython.py:677-684).
+    /// (annrpython.py).
     pub fn new(
         ann: &RPythonAnnotator,
         op: super::super::flowspace::operation::HLOperation,
@@ -312,7 +312,7 @@ impl From<crate::annotator::model::AnnotatorException> for FlowinError {
 }
 
 /// RPython `gather_error(annotator, graph, block, operindex)`
-/// (tool/error.py:67-82) — thin wrapper that binds the
+/// (tool/error.py) — thin wrapper that binds the
 /// [`crate::tool::error::gather_error`] port into annrpython's legacy
 /// call shape. The operindex is `Option<usize>` upstream (`None`
 /// means "no op, block-level"); callers passing a concrete index wrap
@@ -526,7 +526,7 @@ impl<'a> Drop for AddedBlocksGuard<'a> {
 impl RPythonAnnotator {
     /// RPython `RPythonAnnotator.__init__(self, translator=None,
     /// policy=None, bookkeeper=None, keepgoing=False)`
-    /// (annrpython.py:26-57).
+    /// (annrpython.py).
     ///
     /// Follows upstream: if `bookkeeper` is `None`, construct a fresh
     /// `Bookkeeper(self)`; if `policy` is `None`, install a default
@@ -719,18 +719,14 @@ impl RPythonAnnotator {
         TLS.with(|state| state.borrow_mut().bookkeeper = Some(Rc::clone(&self.bookkeeper)));
     }
 
-    // ======================================================================
     // RPython `convenience high-level interface` — diagnostics + validation
     // helpers used by the driver/caller side.
-    // ======================================================================
 
-    // ======================================================================
     // RPython `convenience high-level interface` (annrpython.py) —
     // build_types / build_graph_types / annotate_helper entrypoints.
-    // ======================================================================
 
     /// RPython `build_types(self, function, input_arg_types,
-    /// complete_now=True, main_entry_point=False)` (annrpython.py:73-92).
+    /// complete_now=True, main_entry_point=False)` (annrpython.py).
     ///
     /// ```python
     /// def build_types(self, function, input_arg_types, complete_now=True,
@@ -809,7 +805,7 @@ impl RPythonAnnotator {
     }
 
     /// RPython `get_call_parameters(self, function, args_s)`
-    /// (annrpython.py:94-97).
+    /// (annrpython.py).
     ///
     /// ```python
     /// def get_call_parameters(self, function, args_s):
@@ -837,7 +833,7 @@ impl RPythonAnnotator {
     }
 
     /// RPython `annotate_helper(self, function, args_s, policy=None)`
-    /// (annrpython.py:99-110).
+    /// (annrpython.py).
     ///
     /// ```python
     /// def annotate_helper(self, function, args_s, policy=None):
@@ -889,7 +885,7 @@ impl RPythonAnnotator {
     }
 
     /// RPython `build_graph_types(self, flowgraph, inputcells,
-    /// complete_now=True)` (annrpython.py:130-141).
+    /// complete_now=True)` (annrpython.py).
     ///
     /// ```python
     /// def build_graph_types(self, flowgraph, inputcells, complete_now=True):
@@ -994,12 +990,10 @@ impl RPythonAnnotator {
         }
     }
 
-    // ======================================================================
     // RPython `interface for annotator.bookkeeper` (annrpython.py).
-    // ======================================================================
 
     /// RPython `recursivecall(self, graph, whence, inputcells)`
-    /// (annrpython.py:315-336).
+    /// (annrpython.py).
     ///
     /// Used by `bookkeeper.pbc_call` to bring a callee graph into the
     /// pending queue, wire the call site into `self.notify`, and
@@ -1177,7 +1171,7 @@ impl RPythonAnnotator {
     }
 
     /// RPython `simplify(self, block_subset=None, extra_passes=None)`
-    /// (annrpython.py:357-373).
+    /// (annrpython.py).
     ///
     /// Upstream body:
     ///
@@ -1264,7 +1258,7 @@ impl RPythonAnnotator {
     }
 
     /// RPython `apply_renaming(self, s_out, renaming)`
-    /// (annrpython.py:448-473).
+    /// (annrpython.py).
     ///
     /// Rewrites the `is_type_of` list of a `SomeTypeOf` and the
     /// `knowntypedata` table of a `SomeBool` under the provided
@@ -1487,7 +1481,7 @@ impl RPythonAnnotator {
     }
 
     /// Run the return-var seeding tail of `complete()`
-    /// (annrpython.py:258-261) over every annotated graph.
+    /// (annrpython.py) over every annotated graph.
     ///
     /// The two-phase rtyper prepass drives annotation per subject and
     /// defers the once-at-end `complete()`; that deferral drops the
@@ -1513,7 +1507,7 @@ impl RPythonAnnotator {
     }
 
     /// Construct the orthodox `complete()` blocked-annotation error
-    /// (annrpython.py:248-255): flip every blocked graph's flag and
+    /// (annrpython.py): flip every blocked graph's flag and
     /// render the multi-line "Blocked block" report through
     /// `format_blocked_annotation_error`.
     fn blocked_annotation_error(&self) -> crate::annotator::model::AnnotatorError {
@@ -1531,7 +1525,7 @@ impl RPythonAnnotator {
     /// the pending queue, returning the RAII guard that restores the
     /// previous tracker on drop. Mirrors the `saved = self.added_blocks;
     /// self.added_blocks = {}` prologue of `complete_helpers`
-    /// (annrpython.py:113-114) for callers — e.g. the dual-gate
+    /// (annrpython.py) for callers — e.g. the dual-gate
     /// per-subject driver — that drain via `complete_pending_blocks`
     /// directly rather than through `complete()`.
     fn snapshot_block_if_tracking(&self, bkey: &BlockKey, block: &BlockRef) {
@@ -1595,7 +1589,7 @@ impl RPythonAnnotator {
     }
 
     /// Replicate `complete()`'s blocked-annotation guard
-    /// (annrpython.py:243-255) for callers that drain the pending queue
+    /// (annrpython.py) for callers that drain the pending queue
     /// via `complete_pending_blocks` instead of `complete()`. When any
     /// block added in the current `added_blocks` scope stayed in the
     /// `None` (False) sentinel state — a permanently `BlockedInference`
@@ -1671,13 +1665,11 @@ impl RPythonAnnotator {
         Err(err)
     }
 
-    // ======================================================================
     // RPython `medium-level interface` (annrpython.py) — block
     // scheduling and pending-blocks queue.
-    // ======================================================================
 
     /// RPython `addpendinggraph(self, flowgraph, inputcells)`
-    /// (annrpython.py:164-165).
+    /// (annrpython.py).
     ///
     /// ```python
     /// def addpendinggraph(self, flowgraph, inputcells):
@@ -1689,7 +1681,7 @@ impl RPythonAnnotator {
     }
 
     /// RPython `addpendingblock(self, graph, block, cells)`
-    /// (annrpython.py:167-191).
+    /// (annrpython.py).
     ///
     /// Registers an entry point into `block` with the given input
     /// cells. If `graph` is in `fixed_graphs`, the pass is a
@@ -1779,7 +1771,7 @@ impl RPythonAnnotator {
     }
 
     /// RPython `schedulependingblock(self, graph, block)`
-    /// (annrpython.py:193-201).
+    /// (annrpython.py).
     ///
     /// ```python
     /// def schedulependingblock(self, graph, block):
@@ -1843,7 +1835,7 @@ impl RPythonAnnotator {
     }
 
     /// RPython `reflowpendingblock(self, graph, block)`
-    /// (annrpython.py:414-420).
+    /// (annrpython.py).
     ///
     /// Re-queues an already-annotated block for a fresh flowin pass.
     /// Used when a dependency tracked in `notify` fires.
@@ -1876,7 +1868,7 @@ impl RPythonAnnotator {
     }
 
     /// RPython `follow_link(self, graph, link, constraints)`
-    /// (annrpython.py:579-603).
+    /// (annrpython.py).
     ///
     /// ```python
     /// def follow_link(self, graph, link, constraints):
@@ -1999,7 +1991,7 @@ impl RPythonAnnotator {
     }
 
     /// RPython `follow_raise_link(self, graph, link, s_last_exc_value)`
-    /// (annrpython.py:605-639).
+    /// (annrpython.py).
     ///
     /// ```python
     /// def follow_raise_link(self, graph, link, s_last_exc_value):
@@ -2198,7 +2190,7 @@ impl RPythonAnnotator {
     }
 
     /// RPython `reflowfromposition(self, position_key)`
-    /// (annrpython.py:338-340).
+    /// (annrpython.py).
     ///
     /// ```python
     /// def reflowfromposition(self, position_key):
@@ -2237,7 +2229,7 @@ impl RPythonAnnotator {
     }
 
     /// RPython `bindinputargs(self, graph, block, inputcells)`
-    /// (annrpython.py:422-428).
+    /// (annrpython.py).
     ///
     /// Creates the initial bindings for the input args of a block:
     /// every `block.inputargs[i]` gets `setbinding(..., inputcells[i])`.
@@ -2295,7 +2287,7 @@ impl RPythonAnnotator {
     }
 
     /// RPython `mergeinputargs(self, graph, block, inputcells)`
-    /// (annrpython.py:430-446).
+    /// (annrpython.py).
     ///
     /// Widens each of the block's existing input annotations via
     /// `unionof(old, new)`. If any merged cell differs from its old
@@ -2413,9 +2405,7 @@ impl RPythonAnnotator {
         }
     }
 
-    // ======================================================================
     // RPython `flowing annotations in blocks` (annrpython.py).
-    // ======================================================================
 
     /// RPython `consider_op(self, op)` (annrpython.py).
     ///
@@ -2799,12 +2789,12 @@ impl RPythonAnnotator {
     /// Port structure:
     /// 1. Run the op loop via [`flowin_op_loop`]. Its outcome decides
     ///    which `exits` list the exits-side dispatch uses.
-    /// 2. Exits-side dispatch (annrpython.py:539-572):
+    /// 2. Exits-side dispatch (annrpython.py):
     ///    - `block.canraise` → `get_exception` + per-link intersection /
     ///      difference with `follow_raise_link` for matches and the
     ///      `None` exitcase routed through `follow_link`.
     ///    - Otherwise → knowntypedata-driven `follow_link` per exit.
-    /// 3. Notify reflow (annrpython.py:574-576): any position subscribed
+    /// 3. Notify reflow (annrpython.py): any position subscribed
     ///    to this block's updates is re-queued.
     #[expect(
         clippy::mutable_key_type,
@@ -2947,7 +2937,7 @@ impl RPythonAnnotator {
             // upstream: knowntypedata-driven constraints per exit.
             let exitswitch = block.borrow().exitswitch.clone();
             // `getattr(block.exitswitch.annotation, "knowntypedata", {})`
-            // (annrpython.py:566) — read generically off the exitswitch
+            // (annrpython.py) — read generically off the exitswitch
             // binding; SomeBool and an integer-discriminant SomeInteger
             // both carry it, every other annotation defaults to `{}`.
             // The binding's TYPE also fixes the exitcase-key flavour: a
@@ -3698,9 +3688,7 @@ mod tests {
         assert!(!ann.blocked_blocks.borrow().contains_key(&bkey));
     }
 
-    // ------------------------------------------------------------------
     // Dispatch::None consider() — upstream operation.py.
-    // ------------------------------------------------------------------
 
     #[test]
     fn consider_newtuple_builds_sometuple_from_args() {
@@ -3781,9 +3769,7 @@ mod tests {
         assert!(err.msg.unwrap_or_default().contains("extended slicing"));
     }
 
-    // ------------------------------------------------------------------
     // gather_error / keepgoing — upstream annrpython.py:531-537.
-    // ------------------------------------------------------------------
 
     #[test]
     fn gather_error_returns_location_string() {

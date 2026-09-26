@@ -829,7 +829,7 @@ fn make_fget(name: &'static str, attrchar: char) -> PyObjectRef {
             pyre_interpreter::make_builtin_function_with_arity(
                 name,
                 |args| {
-                    // `typedef.py:361 self.fget(self, space, w_obj)` — the
+                    // `typedef.py self.fget(self, space, w_obj)` — the
                     // descriptor comes first and the instance second.
                     let w_self = args
                         .get(1)

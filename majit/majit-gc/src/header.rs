@@ -196,7 +196,7 @@ pub unsafe fn header_of(obj_addr: usize) -> *mut GcHeader {
 /// `NO_HEAP_PTRS | TRACK_YOUNG_PTRS` (`init_gc_object_immortal`). Upstream's
 /// prebuilt objects are translation-time constants whose fields name other
 /// prebuilt objects, which is what makes "an untouched prebuilt object is a
-/// leaf" (incminimark.py:2782-2800) true. These blocks are allocated at
+/// leaf" (incminimark.py) true. These blocks are allocated at
 /// runtime and their reference fields are written directly at construction,
 /// with no write barrier — so an untouched one DOES hold heap pointers, and
 /// the targets are ordinary collectable objects that nothing else roots.

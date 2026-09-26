@@ -53,7 +53,7 @@ use crate::flowspace::model::FunctionGraph;
 ///   - assignment aliases (`rewrite_op_int_add = _rewrite_symmetric`,
 ///     `rewrite_op_int_abs = _do_builtin_call`, …);
 ///   - the `exec`-generated long-long / unsigned-long-long handlers
-///     (`jtransform.py:1493-1554`): the `llong_*` / `ullong_*` ops and the
+///     (`jtransform.py`): the `llong_*` / `ullong_*` ops and the
 ///     `cast_*_to_(u)longlong` / `(cast|truncate)_longlong_*` family;
 ///   - the `exec`-generated renames (`jtransform.py`): `bool_not`,
 ///     `keepalive`, `char_*`, `unichar_*`, `uint_*`, `adr_add`, ….
@@ -235,7 +235,7 @@ const REWRITE_OP_OPNAMES: &[&str] = &[
 /// Every opname the blackhole interpreter carries a `bhimpl_<opname>`
 /// handler for, i.e. the opnames `_add_default_ops` folds into
 /// `_rewrite_ops` by scanning `BlackholeInterpreter.__dict__`
-/// (`jtransform.py:2279-2287`).  Mirrors the *upstream* universe in
+/// (`jtransform.py`).  Mirrors the *upstream* universe in
 /// `rpython/jit/metainterp/blackhole.py` — every `def bhimpl_<name>` plus
 /// the `bhimpl_<name> = bhimpl_<other>` aliases — with the `bhimpl_` prefix
 /// stripped (`key[len('bhimpl_'):]`), exactly as upstream derives the

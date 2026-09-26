@@ -35,7 +35,7 @@ def run_symdiff(a, b):
     return a ^ b
 
 
-# --- baseline: no raise, plain-int fast path stays bit-exact ---------------
+# baseline: no raise, plain-int fast path stays bit-exact
 for _ in range(1000):
     assert {1, 2, 3} ^ {2, 3, 4} == {1, 4}
     assert {1, 2, 3}.symmetric_difference({2, 3, 4}) == {1, 4}
@@ -43,7 +43,7 @@ for _ in range(1000):
     assert {1} ^ set() == {1}
 
 
-# --- object elements, no raise: hash collision forces __eq__ but succeeds ---
+# object elements, no raise: hash collision forces __eq__ but succeeds
 for _ in range(1000):
     left = {Boom(1), Boom(2), Boom(3)}
     right = {Boom(3), Boom(4)}
@@ -52,7 +52,7 @@ for _ in range(1000):
     assert keys == [1, 2, 4], keys
 
 
-# --- raising __eq__ mid-probe: the ValueError must propagate identically ----
+# raising __eq__ mid-probe: the ValueError must propagate identically
 for _ in range(1000):
     left = {Boom(1), Boom(2)}
     right = {Boom(1, explode=True)}
@@ -65,7 +65,7 @@ for _ in range(1000):
     assert raised, "symmetric_difference swallowed a raising __eq__"
 
 
-# --- raising __eq__ on the second pass (walk this side) ---------------------
+# raising __eq__ on the second pass (walk this side)
 for _ in range(1000):
     left = {Boom(9, explode=True)}
     right = {Boom(5)}
@@ -78,7 +78,7 @@ for _ in range(1000):
     assert raised, "symmetric_difference swallowed a raising __eq__ on the second pass"
 
 
-# --- raising __hash__: the ValueError must propagate before any probe -------
+# raising __hash__: the ValueError must propagate before any probe
 for _ in range(1000):
     left = {1, 2, 3}
     raised = False
@@ -90,7 +90,7 @@ for _ in range(1000):
     assert raised, "symmetric_difference swallowed a raising __hash__"
 
 
-# --- collecting __eq__: the in-progress result set must stay rooted ---------
+# collecting __eq__: the in-progress result set must stay rooted
 # Each probe runs a full collection; the fresh result set is reachable only
 # from the merge's Rust frame, so it must be pinned or a major collection
 # sweeps it mid-merge and the next insert / the return touches freed storage.

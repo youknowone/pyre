@@ -32,7 +32,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
 
     // ── dlopen flags ──
     //
-    // `ctypes/__init__.py:14` imports `RTLD_LOCAL`/`RTLD_GLOBAL` before it
+    // `ctypes/__init__.py` imports `RTLD_LOCAL`/`RTLD_GLOBAL` before it
     // branches on `os.name`, so both names have to exist wherever the module
     // is real; where there is no `dlfcn.h` they are 0, which is the value
     // `host_env`'s own pair carries.  `RTLD_LAZY`/`RTLD_NOW` have no such

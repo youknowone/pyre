@@ -19,7 +19,7 @@ use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;
 
 /// RPython `removeassert.remove_asserts(translator, graphs)` at
-/// `removeassert.py:8-53`.
+/// `removeassert.py`.
 pub fn remove_asserts(
     translator: &TranslationContext,
     graphs: &[GraphRef],
@@ -174,7 +174,7 @@ fn assertion_link_matches(
 }
 
 /// RPython `removeassert.kill_assertion_link(graph, link)` at
-/// `removeassert.py:38-62`.
+/// `removeassert.py`.
 fn kill_assertion_link(graph: &FunctionGraph, link: &LinkRef) -> Result<bool, TaskError> {
     let block = link
         .borrow()

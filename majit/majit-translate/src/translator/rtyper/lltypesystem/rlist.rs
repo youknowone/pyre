@@ -13,7 +13,7 @@ pub use crate::translator::rtyper::rmodel::Repr;
 pub const INITIAL_EMPTY_LIST_ALLOCATION: i64 = 0;
 
 /// RPython `class BaseListRepr(AbstractBaseListRepr)`
-/// (`lltypesystem/rlist.py:52`).
+/// (`lltypesystem/rlist.py`).
 ///
 /// The concrete list repr fields live in [`ListRepr`] and
 /// [`FixedSizeListRepr`]. This placeholder keeps the lltypesystem-specific
@@ -22,12 +22,12 @@ pub const INITIAL_EMPTY_LIST_ALLOCATION: i64 = 0;
 pub struct BaseListRepr;
 
 /// RPython `class ListIteratorRepr(AbstractListIteratorRepr)`
-/// (`lltypesystem/rlist.py:453`).
+/// (`lltypesystem/rlist.py`).
 #[derive(Debug, Default)]
 pub struct ListIteratorRepr;
 
 /// RPython `class ReversedListIteratorRepr(AbstractListIteratorRepr)`
-/// (`lltypesystem/rlist.py:497`).
+/// (`lltypesystem/rlist.py`).
 #[derive(Debug, Default)]
 pub struct ReversedListIteratorRepr;
 

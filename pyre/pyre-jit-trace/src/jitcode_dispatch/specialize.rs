@@ -575,7 +575,7 @@ pub(crate) fn specialised_pair_kind(
 /// unrolls over `_immutable_fields_` value slots, so upstream traces the whole
 /// unpack inline and the optimizer virtualizes the pair away. Both arity-2
 /// layouts are covered here because `makespecialisedtuple2`
-/// (`specialisedtupleobject.py:169-179`) never falls back to a plain tuple:
+/// (`specialisedtupleobject.py`) never falls back to a plain tuple:
 ///   * `ii` — `value0`/`value1` are inline machine ints, so the read is
 ///     `getfield_gc_pure_i` + `wrapint` and the items stay unboxed through the
 ///     downstream BINARY_OP int fold (the walker analogue of the retired
@@ -583,7 +583,7 @@ pub(crate) fn specialised_pair_kind(
 ///   * `ff` — the same shape with `getfield_gc_pure_f` + `wrapfloat`; this is
 ///     the representation `zip` produces for a pair of exact floats;
 ///   * `oo` — `wraps[i]` for an object slot is the identity
-///     (`specialisedtupleobject.py:26-27`), so the `getfield_gc_r` result is
+///     (`specialisedtupleobject.py`), so the `getfield_gc_r` result is
 ///     already the item. This is the layout a `divmod(long, long)` result pair
 ///     takes, since neither half satisfies `is_plain_int1`.
 ///
@@ -2529,9 +2529,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     // A user attribute on an exception instance. `mapdict.py:1483-1490
     // LOAD_ATTR_caching` declines this receiver upstream too — an exception is
     // not a `MapdictStorageMixin` and `_get_mapdict_map` answers None
-    // (`baseobjspace.py:204-205`) — and it reaches its speed by inlining
+    // (`baseobjspace.py`) — and it reaches its speed by inlining
     // `getdictvalue -> MapDictStrategy.getitem_str -> AbstractAttribute.read`
-    // (`mapdict.py:55-66`, `:442-444`) instead. The attribute lives in the
+    // (`mapdict.py`, `:442-444`) instead. The attribute lives in the
     // `newdict(instance=True)` dictionary, two hops out: `w_dict` ->
     // `W_DictObject.dstorage` -> the fake carrier that holds the map.
     //
@@ -3615,7 +3615,7 @@ pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
 /// *through* that `getattr` — it is ordinary RPython — so the type lookup folds
 /// to a constant under `guard_class` + the version pin and the `Method` itself
 /// virtualizes away: its optimized LOAD_METHOD emits no ops at all in a
-/// steady-state loop (`pypy/objspace/std/callmethod.py:25-80`). pyre's `getattr`
+/// steady-state loop (`pypy/objspace/std/callmethod.py`). pyre's `getattr`
 /// is an opaque `CALL_MAY_FORCE` residual, which additionally drags a
 /// `GUARD_NOT_FORCED` (forcing the virtualizable frame) and a `GUARD_NO_EXCEPTION`
 /// through every iteration. This fold reproduces PyPy's shape directly:
@@ -5671,7 +5671,7 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // --- emit the virtualizable decomposed newlist (walker-native) ---
+    // emit the virtualizable decomposed newlist (walker-native)
     let list_op = match emit {
         Emit::Int(vals) => {
             let int_type_addr = int_ty as i64;
@@ -5943,7 +5943,7 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
         unsafe { pyre_object::w_int_get_value(c1) }
     };
 
-    // --- emit the virtual spec_ii walker-native ---
+    // emit the virtual spec_ii walker-native
     // Paired `w_class` guard per element so a runtime int subclass sharing
     // the public `int` `w_class` side-exits, then the plain-int payload unbox.
     // A fits-int `W_LongObject` also carries the public `int` `w_class`
@@ -6248,7 +6248,7 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
     // classes. Inlined here.
     let matched = pyre_interpreter::eval::check_exc_match_against(exc, match_type);
 
-    // --- commit to the fold: emit IR (no further declines) ---
+    // commit to the fold: emit IR (no further declines)
     // Pin `match_type` so a runtime divergence (a reassigned handler global)
     // side-exits rather than running the wrong handler.
     //
@@ -6349,20 +6349,20 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
 }
 
 /// Trace `space.newbool` as its directional truth guard and prebuilt result.
-/// `baseobjspace.py:896-900` chooses `w_True` or `w_False`, the prebuilt
-/// singletons from `boolobject.py:79-80`; `pyjitpl.py:511-534` records the
+/// `baseobjspace.py` chooses `w_True` or `w_False`, the prebuilt
+/// singletons from `boolobject.py:79-80`; `pyjitpl.py opimpl_goto_if_not` records the  allow-line-citation
 /// matching `GUARD_TRUE` / `GUARD_FALSE`, and `pyjitpl.py:525-526` replaces
 /// the truth box with the promoted constant.
 ///
 /// The guard is unconditional, because `newbool`'s `if b:` is: it is plain
-/// RPython carrying no `@jit` hint (`baseobjspace.py:895` is only
+/// RPython carrying no `@jit` hint (`baseobjspace.py` is only
 /// `@signature`, and `boolobject.py` has none), so the tracer resolves it the
 /// one way it observed and pins that with a guard no matter who consumes the
 /// result.  This used to be restricted to a box that "decides one branch and
 /// nothing else", on the reasoning that guarding an escaping bool pins a value
 /// the trace would otherwise carry unconstrained.  Upstream grants no such
 /// exemption, and the transform that does read like one —
-/// `jtransform.py:196 optimize_goto_if_not` — is a different thing: it fuses a
+/// `jtransform.py optimize_goto_if_not` — is a different thing: it fuses a
 /// compare into a block's exitswitch, and `:205-211` makes it *refuse* when the
 /// boolean has any other consumer.  It never decides whether `newbool` guards.
 ///
@@ -6372,7 +6372,7 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
 /// storing the same value.
 ///
 /// A constant truth takes the singleton with no guard and no resume image, the
-/// way `generate_guard` (`pyjitpl.py:2583`) returns early for a `Const` box.
+/// way `generate_guard` (`pyjitpl.py`) returns early for a `Const` box.
 pub(crate) fn walker_newbool_guarded<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -6459,11 +6459,11 @@ pub(crate) fn try_walker_fold_newbool_call<Sym: WalkSym>(
 /// Does `tp` name a layout whose class overrides `is_w` with a value
 /// comparison?  `baseobjspace::is_w` gates one branch per overriding class,
 /// each demanding both operands be that exact type: `int`
-/// (`intobject.py:44`), `float` (`floatobject.py:196`), `complex`
+/// (`intobject.py`), `float` (`floatobject.py:196`), `complex`  allow-line-citation
 /// (`complexobject.py:287`), `tuple` (`tupleobject.py:47`), `bytes`
 /// (`bytesobject.py:25`), `str` (`unicodeobject.py:101`) and `frozenset`
 /// (`setobject.py:592`).  Every other class keeps the default pointer
-/// identity (`baseobjspace.py:246`).
+/// identity (`baseobjspace.py`).
 ///
 /// Those gates read `w_class`, this list reads `ob_type`, and the two do not
 /// stand in one-to-one correspondence, so a class costs one row per layout
@@ -6495,10 +6495,10 @@ fn is_w_compares_by_value(tp: *const pyre_object::pyobject::PyType) -> bool {
 /// `compare_op_tag_for_opname` assigns those two opnames.
 ///
 /// `IS_OP` is `space.is_w(w_1, w_2)` plus a `newbool`
-/// (`pyopcode.py:1078-1092`), and `is_w` (`baseobjspace.py`) dispatches
+/// (`pyopcode.py`), and `is_w` (`baseobjspace.py`) dispatches
 /// to `w_two.is_w(space, w_one)`, whose default is pointer identity.  Two
 /// tiers, mirroring `FASTPATHS_SAME_BOXES`' `ptr_eq`/`ptr_ne` entries
-/// (`pyjitpl.py:326-336`):
+/// (`pyjitpl.py`):
 ///
 ///   * Same box — `baseobjspace::is_w` answers at its opening `ptr::eq`
 ///     whatever the class, so the result is the constant `True`/`False`.
@@ -6570,7 +6570,7 @@ pub(crate) fn try_walker_fold_is_op<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // --- commit to the fold: emit IR (no further declines) ---
+    // commit to the fold: emit IR (no further declines)
     for (operand, operand_type) in [(lhs, lhs_type), (rhs, rhs_type)] {
         if operand.is_constant() || ctx.trace_ctx.heap_cache().is_class_known(operand) {
             continue;
@@ -6732,7 +6732,7 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
         }
     }
 
-    // --- commit to the fold: emit IR (no further declines) ---
+    // commit to the fold: emit IR (no further declines)
     // The only mutable input: `globals['__builtins__']` may be rebound after
     // this function is built, and a later iteration must then see the new
     // mapping.  Pinning the namespace `version?` revokes the loop instead.
@@ -6924,7 +6924,7 @@ pub(crate) fn try_walker_specialize_set_function_attribute<Sym: WalkSym>(
         (w_attr, w_func)
     };
 
-    // --- commit to the fold: emit IR (no further declines) ---
+    // commit to the fold: emit IR (no further declines)
     // The rebuild is a residual because it allocates — but it takes only the
     // mapping.  `func_op` is not an argument and stays unescaped, which is what
     // keeps the `defaults` store emitted behind this one foldable.  Rebuilding
@@ -7315,7 +7315,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     // Exact `w_class` first: it implies the LIST vtable, so the GuardClass
     // below is skipped. A list subclass shares `ob_type == &LIST_TYPE` but
     // retags `w_class` and may override `__getitem__`.
@@ -7623,7 +7623,7 @@ pub(crate) fn try_walker_specialize_subscr_tuple_slice2<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // --- commit: exact tuple guards, fixed length, immutable item reads ---
+    // commit: exact tuple guards, fixed length, immutable item reads
     let tuple_type_addr = &pyre_object::TUPLE_TYPE as *const _ as i64;
     walker_guard_exact_w_class(
         ctx,
@@ -7720,7 +7720,7 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     let tuple_type_addr = &pyre_object::pyobject::TUPLE_TYPE as *const _ as i64;
     walker_guard_exact_w_class(
         ctx,
@@ -10357,7 +10357,7 @@ fn try_walker_specialize_subscr_str<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
     let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
     walker_guard_class(ctx, op_pc, seq_op, str_type_addr)?;
@@ -10829,8 +10829,8 @@ fn walker_emit_exact_dict_key_error<Sym: WalkSym>(
 
 /// `dict.get` on an exact dictionary and an Int/Unicode strategy hit.
 ///
-/// `dictmultiobject.py:1095-1098` probes an Int strategy with the unboxed key
-/// value, and `dictmultiobject.py:1315-1318` probes a Unicode strategy with
+/// `dictmultiobject.py getitem` probes an Int strategy with the unboxed key
+/// value, and `dictmultiobject.py getitem_str` probes a Unicode strategy with
 /// exact-str bytes. The trace guards the exact dict, strategy vtable, and exact
 /// key type, then performs a live strategy-specific lookup and guards that it
 /// hit. Misses and object/identity strategy keys remain residual so their
@@ -11025,7 +11025,7 @@ pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     let callable_op = r_args[0];
     if !callable_op.is_constant() {
         let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
@@ -11849,7 +11849,7 @@ fn portal_slot_binder(
 /// `contains_loop` for unroll_safe graphs, so upstream LOOKS INSIDE it: each
 /// `self.locals_cells_stack_w[i]` lowers to `getarrayitem_vable_r`
 /// (`jtransform.py do_fixed_list_getitem`), answered from
-/// `metainterp.virtualizable_boxes`, and `jtransform.py:2164-2172
+/// `metainterp.virtualizable_boxes`, and `jtransform.py
 /// rewrite_op_jit_force_virtualizable` returns `[]` for a read the tracer is
 /// inside.  There is no residual and no virtualizable force anywhere on the
 /// upstream locals-read path.
@@ -11860,19 +11860,19 @@ fn portal_slot_binder(
 /// `force_frame_before_locals_read` then clears `TOKEN_TRACING_RESCALL` and
 /// `tracing_after_residual_call` reads that clear as an escape
 /// (`VableEscapedDuringResidualCall`), losing the loop.  The deviation is the
-/// residual BOUNDARY, not the barrier — `rvirtualizable.py:49-53` injects the
-/// same hook on reads upstream and `pyjitpl.py:3373-3390` aborts
+/// residual BOUNDARY, not the barrier — `rvirtualizable.py hook_access_field` injects the
+/// same hook on reads upstream and `pyjitpl.py vable_after_residual_call` aborts
 /// unconditionally on a detected force — so this removes the boundary and
 /// leaves the barrier live for every shape it declines.
 ///
-/// Emitted shape, mirroring `pyframe.py:555-574`: `guard_value(callable)`;
+/// Emitted shape, mirroring `pyframe.py`: `guard_value(callable)`;
 /// `getorcreatedebug()` (the `debugdata` virtualizable field, answered from
 /// `virtualizable_boxes`) followed by `getfield_gc_r(w_locals)` under the
 /// guard that pins which of the two mapping arms this is; one
 /// `getarrayitem_vable_r(frame, ConstInt(i))` per localsplus slot (the same
 /// lowering `emit_load_fast_ref!` already emits for LOAD_FAST); for a cell
 /// slot a `guard_class(Cell)` and one `getfield_gc_r(contents)` on top of it,
-/// which is the whole of `fast2locals`' cell half (pyframe.py:576-598); a
+/// which is the whole of `fast2locals`' cell half (pyframe.py); a
 /// `guard_isnull` / `guard_nonnull` pinning the bound-ness of whichever of the
 /// two the key takes; THEN the mapping itself, under its exact-dict guard on
 /// the frame-owned arm; and a plain non-forcing `Call` per slot —
@@ -11886,7 +11886,7 @@ fn portal_slot_binder(
 /// `f_locals` write put there (PEP 667) — survives every call, and an
 /// expansion that always started from an empty dict would drop it for as long
 /// as the loop stayed compiled.  A frame that carries none keeps the empty
-/// `newdict` (pyframe.py:557) the residual would have materialised, under a
+/// `newdict` (pyframe.py) the residual would have materialised, under a
 /// `guard_isnull` that side-exits if one appears mid-loop; nothing else
 /// references that dict, so it is already the independent copy
 /// `frame_locals_snapshot` hands back and its `delitem` arm is a no-op.
@@ -11992,7 +11992,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         decline!("no-standard-virtualizable");
     };
     // The frame `locals()` reports on is `ec.gettopframe_nohidden()`
-    // (`interp_inspect.py:7-11`).  Resolve it the same way and require it to BE
+    // (`interp_inspect.py`).  Resolve it the same way and require it to BE
     // the standard virtualizable: a hidden portal frame, or any deeper frame
     // handed out through the backref chain, resolves elsewhere and declines.
     let ec = pyre_interpreter::call::getexecutioncontext();
@@ -12128,7 +12128,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     //   an `f_locals` write left in it survives, as it does across the
     //   residual's `fast2locals`;
     // * the frame carries none — `fast2locals` would materialise an empty dict
-    //   (pyframe.py:556-557 `d.w_locals = space.newdict()`) and fill it from
+    //   (pyframe.py `d.w_locals = space.newdict()`) and fill it from
     //   the fastlocals, and the expansion builds exactly that dict instead of
     //   modelling the store.  Nothing else references it, so it is already the
     //   independent copy `frame_locals_snapshot` would hand back, and a
@@ -12313,7 +12313,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     }
     let concrete_locals_value = majit_ir::Value::Ref(majit_ir::GcRef(concrete_locals as usize));
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     // Pin the callable identity (LOAD_GLOBAL `locals` is usually already a
     // constant via the namespace cell fold).
     let callable_op = r_args[0];
@@ -12392,7 +12392,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     let mut index_consts: Vec<OpRef> = Vec::with_capacity(slots.len());
     for (i, modelled) in slots.iter().enumerate() {
         locals_expansion_cut_if_too_long(ctx, op.pc)?;
-        // `self.locals_cells_stack_w[i]` — `jtransform.py:1877
+        // `self.locals_cells_stack_w[i]` — `jtransform.py do_fixed_list_getitem
         // do_fixed_list_getitem`, the identical lowering `emit_load_fast_ref!`
         // emits for LOAD_FAST.  On the standard virtualizable this resolves to
         // `virtualizable_boxes[index]` and records no op.
@@ -13068,7 +13068,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     }
     let concrete_locals_value = majit_ir::Value::Ref(majit_ir::GcRef(concrete_locals as usize));
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     let callable_op = r_args[0];
     if !callable_op.is_constant() {
         let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
@@ -13207,7 +13207,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
 /// portal virtualizable itself instead of residualizing `vm.py getframe`.
 ///
 /// `getframe` is `@jit.look_inside_iff(lambda space, depth:
-/// jit.isconstant(depth))` (`pypy/module/sys/vm.py:41`), so a constant depth is
+/// jit.isconstant(depth))` (`pypy/module/sys/vm.py`), so a constant depth is
 /// traced THROUGH: at the portal, `ec.gettopframe_nohidden()` is a vref read
 /// that `pyjitpl.py _do_jit_force_virtual` answers with
 /// `virtualizable_boxes[-1]` under a `ptr_eq` + `implement_guard_value`; in an
@@ -13279,7 +13279,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
 /// `CallMayForceR(jit_force_vref, raw)` bracketed by FORCE_TOKEN/SETFIELD_GC and
 /// `GuardNotForced`, `GuardNonnull` for the "call stack is not deep enough"
 /// arm, then `frame.hide()` as `frame.pycode.hidden_applevel` with a
-/// `GuardFalse`.  The residual force stays in the trace: `pyjitpl.py:2153-2172
+/// `GuardFalse`.  The residual force stays in the trace: `pyjitpl.py
 /// _do_jit_force_virtual` returns `None` for a known non-standard
 /// virtualizable, and that `None` result is precisely the caller's signal to
 /// emit the residual `jit_force_virtual` call.  `optimize_jit_force_virtual`
@@ -13498,7 +13498,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
         }
     }
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
 
     // `sys` is an ordinary mutable module, so nothing else keeps the name bound
@@ -14010,7 +14010,7 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
             )
         };
 
-    // --- commit: no declines below this point ---
+    // commit: no declines below this point
     let callable_op = r_args[0];
     if !callable_op.is_constant() {
         let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
@@ -15971,7 +15971,7 @@ pub(crate) fn try_walker_specialize_float_call<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     let callable_op = r_args[0];
     if !callable_op.is_constant() {
         let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
@@ -17308,7 +17308,7 @@ pub(crate) fn try_walker_specialize_builtin_divmod<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     walker_guard_builtin_callable_identity(ctx, op.pc, r_args[0], concrete_callable)?;
     let (lhs_op, rhs_op) = (r_args[2], r_args[3]);
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
@@ -17476,7 +17476,7 @@ fn try_walker_specialize_builtin_divmod_long_int<Sym: WalkSym>(
         return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op.pc });
     }
 
-    // --- emit ---
+    // emit
     walker_guard_builtin_callable_identity(ctx, op.pc, r_args[0], concrete_callable)?;
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op.pc, long_op, long_type_addr)?;
@@ -19214,7 +19214,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
             }
         }
     }
-    // --- commit to the specialization: emit IR (no further declines) ---
+    // commit to the specialization: emit IR (no further declines)
     // Pin the callable identity so the trace-time kind / vtable stay
     // valid across iterations (`implement_guard_value`).
     let callable_op = r_args[0];
@@ -19660,7 +19660,7 @@ pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
         pyre_object::interp_exceptions::w_exception_get_kind(exc)
     };
 
-    // --- commit: emit the `__context__` chaining, skip the publish ---
+    // commit: emit the `__context__` chaining, skip the publish
     // active = GETFIELD_GC_R(ec, sys_exc_value).
     //
     // Route the EC through `walker_ensure_execution_context` so the
@@ -19832,7 +19832,7 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // --- commit: pin the class identity, emit the construction + raise ---
+    // commit: pin the class identity, emit the construction + raise
     // Guard the class operand so the trace-time kind / vtable stay valid
     // across iterations (`implement_guard_value`).
     if !class_op.is_constant() {
@@ -20006,7 +20006,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // --- commit: pin the receiver, run the authentic raise, emit inline ---
+    // commit: pin the receiver, run the authentic raise, emit inline
     // The stability predicate makes the raise a pure function of `(obj,
     // name)`; `GuardValue` pins the one live input (`name` is a co_names
     // constant).
@@ -20157,7 +20157,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
 
 /// Walker-native fold for the read-only-data-descriptor STORE_ATTR raise.
 ///
-/// `objspace.py:723-739` and `descroperation.py:114-126` raise
+/// `objspace.py:723-739` and `descroperation.py descr__setattr__` raise  allow-line-citation
 /// AttributeError after resolving a descriptor with no `__set__` and a
 /// reachable `__delete__`.  The interpreter predicate excludes every shortcut
 /// and user-code branch; class-version guards pin the two MRO lookups, while
@@ -20214,7 +20214,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // --- commit: pin both MRO decisions, run the authentic raise, emit inline ---
+    // commit: pin both MRO decisions, run the authentic raise, emit inline
     // GuardClass pins the receiver payload without pinning its identity.
     let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
     let physical_type_const = ctx.trace_ctx.const_int(physical_type);
@@ -20407,7 +20407,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
 ///     (`[]→void`, dst_bank `'v'`): apply the clear to the authoritative
 ///     recording walk, but emit no IR.  PyPy keeps the propagating exception
 ///     in the local `OperationError` and PUSH_EXC_INFO transfers it directly
-///     to `ExecutionContext.sys_exc_operror` (`pyopcode.py:123-185, 836-863`),
+///     to `ExecutionContext.sys_exc_operror` (`pyopcode.py, 836-863`),
 ///     so there is no equivalent residual clear in its compiled trace.  Pyre's
 ///     extra TLS carrier only exposes the Rust `PyError`'s GC children while
 ///     the interpreter unwinds.  The walk's inline traceback construction
@@ -20995,7 +20995,7 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     // Exact `w_class` first: it implies the LIST vtable, so GuardClass skips.
     let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
     walker_guard_exact_w_class(
@@ -22606,7 +22606,7 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
         (start, slice_len)
     };
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     // For BOTH target (`list_op`) and source (`value_op`): guard_class LIST +
     // exact `w_class` (a list subclass sharing `ob_type == &LIST_TYPE` but with
     // an overridden `__setitem__` / `__iter__` side-exits to the generic
@@ -22812,7 +22812,7 @@ pub(crate) fn try_walker_specialize_compare_op_str<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     walker_guard_exact_str(ctx, op_pc, lhs)?;
     walker_guard_exact_str(ctx, op_pc, rhs)?;
     let helper = pyre_object::unicodeobject::jit_str_compare as *const ();

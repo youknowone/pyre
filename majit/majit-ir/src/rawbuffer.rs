@@ -9,7 +9,7 @@ use crate::{DescrRef, GcRef, OpRef};
 /// Sorted by offset. Invariant: offsets[i]+lengths[i] <= offsets[i+1].
 #[derive(Clone, Debug)]
 pub struct RawBuffer {
-    /// rawbuffer.py:14: self.offsets — signed because RPython's
+    /// rawbuffer.py __init__: self.offsets — signed because RPython's
     /// unbounded int allows `basesize + itemsize*index` to be negative
     /// when `index < 0`. `write_value` keeps the list sorted using
     /// signed comparison (rawbuffer.py `self.offsets[i] > offset`).
@@ -154,7 +154,7 @@ impl RawBuffer {
     /// rawbuffer.py: write_value(offset, length, descr, value).
     ///
     /// Maintains sorted order by offset. Same-offset update only
-    /// replaces value (rawbuffer.py:102), never descr.
+    /// replaces value (rawbuffer.py), never descr.
     pub fn write_value(
         &mut self,
         offset: i64,

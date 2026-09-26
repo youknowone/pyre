@@ -5,7 +5,7 @@
 #
 # A guard-failure resume inside an inlined callee must close that callee's
 # execution-context scope before its blackhole advances to the caller
-# (`executioncontext.py:91-107` leave). The blackhole run loop transfers the
+# (`executioncontext.py` leave). The blackhole run loop transfers the
 # callee's return value and releases its interpreter, but releasing a
 # BlackholeInterpreter does not restore `topframeref` on its own, so without
 # the leave transition the completed callee stays the current frame.

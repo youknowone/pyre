@@ -261,7 +261,7 @@ impl ListItem {
     /// ```
     ///
     /// `self.bookkeeper` is optional on the Rust port (matches upstream's
-    /// `bookkeeper=None` path at listdef.py:34 which sets
+    /// `bookkeeper=None` path at listdef.py which sets
     /// `dont_change_any_more=True`). When the bookkeeper / annotator
     /// backlink is absent, the loop is structurally preserved but no
     /// reflow fires — the only way to reach notify_update from that
@@ -372,7 +372,7 @@ impl ListItem {
 
         // upstream: `if other.dont_change_any_more: if
         // self.dont_change_any_more: raise TooLateForChange;
-        // else: self, other = other, self` (listdef.py:63-71).
+        // else: self, other = other, self` (listdef.py).
         let (driver_li, folded_li) = {
             let self_b = self_li.borrow();
             let other_b = other_li.borrow();
@@ -521,7 +521,7 @@ impl ListItem {
 }
 
 /// RPython `ListItem._step_map[type(self.range_step),
-/// type(other.range_step)]` (listdef.py:23-27). Upstream keys the dict
+/// type(other.range_step)]` (listdef.py). Upstream keys the dict
 /// on `(type(None), int)` / `(int, type(None))` / `(int, int)`.
 fn merge_range_step(self_step: Option<i64>, other_step: Option<i64>) -> Option<i64> {
     match (self_step, other_step) {
@@ -580,7 +580,7 @@ impl fmt::Debug for ListDef {
 
 impl ListDef {
     /// RPython `ListDef.__init__(bookkeeper, s_item=s_ImpossibleValue,
-    /// mutated=False, resized=False)` (listdef.py:125-130).
+    /// mutated=False, resized=False)` (listdef.py).
     pub fn new(
         bookkeeper: Option<Rc<Bookkeeper>>,
         s_item: SomeValue,
@@ -662,7 +662,7 @@ impl ListDef {
     /// `Option` because some callers (list builtins) have no reflow
     /// position and pass `None`. Dropping that `None` is faithful, not a
     /// divergence: `read_locations` is consumed by `reflowfromposition`
-    /// (annrpython.py:338-340), which unpacks `graph, block, index =
+    /// (annrpython.py), which unpacks `graph, block, index =
     /// position_key` — a `None` member would crash the reflow loop, so
     /// upstream's set only ever holds real positions. The Rust port's
     /// `HashSet<PositionKey>` encodes that invariant in the type.
@@ -768,7 +768,7 @@ impl ListDef {
     }
 
     /// RPython `ListDef.generalize_range_step(range_step)`
-    /// (listdef.py:170-173).
+    /// (listdef.py).
     ///
     /// Creates a fresh ListItem carrying the candidate `range_step`,
     /// then merges it into `self.listitem` so `_step_map` collapses
@@ -835,7 +835,7 @@ impl std::hash::Hash for ListDef {
 }
 
 /// RPython `s_list_of_strings = SomeList(ListDef(None,
-/// SomeString(no_nul=True), resized=True))` (listdef.py:206-207).
+/// SomeString(no_nul=True), resized=True))` (listdef.py).
 pub(crate) fn s_list_of_strings() -> super::model::SomeList {
     super::model::SomeList::new(ListDef::new(
         None,

@@ -80,7 +80,7 @@ impl CannotInline {
 }
 
 /// `class CanRaise(object): def __init__(self, can_raise)` at
-/// `inline.py:18-20`. Upstream stores a single `bool` and uses the
+/// `inline.py`. Upstream stores a single `bool` and uses the
 /// instance as a sentinel returned by `collect_called_graphs` when
 /// the callee is opaque (e.g. `op.args[0]` of a `direct_call` whose
 /// `_obj` lookup failed).
@@ -132,7 +132,7 @@ impl PartialEq for CalledThing {
 }
 
 /// Predicate matcher passed to `iter_callsites(graph, calling_what)`
-/// at `inline.py:42-55`. Upstream accepts:
+/// at `inline.py`. Upstream accepts:
 ///
 /// * `None` — match every direct_call.
 /// * a `FunctionGraph` — match calls whose resolved callee
@@ -355,7 +355,7 @@ fn callable_name_matches(op: &SpaceOperation, name: &str) -> bool {
 }
 
 /// `does_raise_directly(graph, raise_analyzer)` at
-/// `inline.py:109-122`.
+/// `inline.py`.
 ///
 /// > this function checks, whether graph contains operations which
 /// > can raise and which are not exception guarded
@@ -390,7 +390,7 @@ pub fn does_raise_directly(graph: &GraphRef, raise_analyzer: &mut RaiseAnalyzer<
 }
 
 /// `any_call_to_raising_graphs(from_graph, translator,
-/// raise_analyzer)` at `inline.py:124-142`.
+/// raise_analyzer)` at `inline.py`.
 pub fn any_call_to_raising_graphs(
     from_graph: &GraphRef,
     translator: &TranslationContext,
@@ -434,13 +434,11 @@ pub fn any_call_to_raising_graphs(
     false
 }
 
-// ============================================================
 // Auto-inlining heuristics — pure read-only graph cost model.
 // `OP_WEIGHTS` / `block_weight` / `static_instruction_count` /
 // `inlinable_static_callers` / `always_inline`. The
 // `_dont_inline_` / `_always_inline_` flag reads default to upstream's
 // `getattr(..., default)` fallback.
-// ============================================================
 
 /// `OP_WEIGHTS` at `inline.py`. Per-opname weight table
 /// consumed by `block_weight`. Opnames absent from the map default
@@ -473,7 +471,7 @@ fn op_weight(opname: &str) -> i64 {
 }
 
 /// `block_weight(block, weights=OP_WEIGHTS)` at
-/// `inline.py:478-488`.
+/// `inline.py`.
 ///
 /// ```python
 /// def block_weight(block, weights=OP_WEIGHTS):
@@ -582,7 +580,7 @@ pub enum InlinableCallerEntry {
 }
 
 /// `inlinable_static_callers(graphs, store_calls=False,
-/// ok_to_call=None)` at `inline.py:546-567`.
+/// ok_to_call=None)` at `inline.py`.
 ///
 /// ```python
 /// def inlinable_static_callers(graphs, store_calls=False, ok_to_call=None):
@@ -696,11 +694,9 @@ fn callable_dont_inline(callee: &GraphRef) -> bool {
     g.func.as_ref().is_some_and(|f| f._dont_inline_)
 }
 
-// ============================================================
 // Median-execution-cost solver + inlining_heuristic.
 // Depends on `tool::algo::sparsemat::SparseMatrix` and
 // `super::support::find_loop_blocks`.
-// ============================================================
 
 /// `measure_median_execution_cost(graph)` at `inline.py`.
 ///
@@ -890,12 +886,10 @@ pub fn inlining_heuristic(graph: &GraphRef) -> (f64, bool) {
     (0.9999 * median + count, true)
 }
 
-// ============================================================
 // BaseInliner foundation — fields, constructor, and the read-only
 // / pure helpers (get_new_name, passon_vars, copy_operation,
 // copy_link, copy_block, search_for_calls,
 // find_args_in_exceptional_case).
-// ============================================================
 
 /// Sub-inliner kind selector — controls
 /// [`BaseInliner::search_for_calls`]'s behaviour.
@@ -930,7 +924,7 @@ pub enum InlineFuncTarget {
 }
 
 /// Cache key for upstream `BaseInliner._passon_vars` at
-/// `inline.py:241-246`. The dict is keyed by either a `Block`
+/// `inline.py`. The dict is keyed by either a `Block`
 /// (the common case) or an `int` (fallback used inside
 /// `generic_exception_matching` at `:362`).
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -952,7 +946,7 @@ pub enum PassonCacheKey {
 /// `inline_once` / `do_inline` and the rewire mutators follow;
 /// the public entry points are at the bottom.
 pub struct BaseInliner<'t> {
-    // ----- upstream `__init__` parameters -----
+    // upstream `__init__` parameters
     /// Upstream `self.translator`.
     pub translator: &'t TranslationContext,
     /// Upstream `self.graph` — the host graph being mutated.
@@ -983,11 +977,11 @@ pub struct BaseInliner<'t> {
     /// invocation; pyre Arcshares the closure cell to mirror that.
     pub call_count_pred: Option<CallCountPred>,
 
-    // ----- upstream `Inliner.__init__` extension -----
+    // upstream `Inliner.__init__` extension
     /// Upstream `self.inline_func` and the kind discriminator.
     pub kind: InlinerKind,
 
-    // ----- upstream "inline-all" queue -----
+    // upstream "inline-all" queue
     /// Upstream `self.block_to_index`. Maps each pending block
     /// to a per-op-index callee dict.
     ///
@@ -1007,7 +1001,7 @@ pub struct BaseInliner<'t> {
         ),
     >,
 
-    // ----- upstream "per-inline-call" state -----
+    // upstream "per-inline-call" state
     /// Upstream `self.varmap` (`:194`).
     pub varmap: std::collections::HashMap<
         crate::flowspace::model::Variable,
@@ -1448,7 +1442,7 @@ impl<'t> BaseInliner<'t> {
         linkargs
     }
 
-    // ----- orchestrator + rewire mutators + drivers -----
+    // orchestrator + rewire mutators + drivers
 
     /// `inline_all(self)` at `inline.py`.
     ///
@@ -1541,7 +1535,7 @@ impl<'t> BaseInliner<'t> {
     }
 
     /// `inline_once(self, block, index_operation)` at
-    /// `inline.py:193-210`.
+    /// `inline.py`.
     ///
     /// Resets per-call state, captures the call op + callee graph,
     /// performs the exception-guarded check, and dispatches to
@@ -1667,7 +1661,7 @@ impl<'t> BaseInliner<'t> {
     }
 
     /// `do_inline(self, block, index_operation)` at
-    /// `inline.py:392-430`.
+    /// `inline.py`.
     ///
     /// Splits the host block at `index_operation`, copies the
     /// callee's start block, threads call args through the
@@ -1871,7 +1865,7 @@ impl<'t> BaseInliner<'t> {
     }
 
     /// `rewire_exceptblock(self, afterblock)` at
-    /// `inline.py:298-308`. Dispatcher between guarded and
+    /// `inline.py`. Dispatcher between guarded and
     /// non-guarded variants.
     fn rewire_exceptblock(&mut self, afterblock: &crate::flowspace::model::BlockRef) {
         let graph_to_inline = self
@@ -1899,7 +1893,7 @@ impl<'t> BaseInliner<'t> {
     }
 
     /// `rewire_exceptblock_no_guard(self, afterblock,
-    /// copiedexceptblock)` at `inline.py:310-324`.
+    /// copiedexceptblock)` at `inline.py`.
     ///
     /// For each entry-link of the inlined exceptblock, rewire the
     /// corresponding link in the *copied* graph to bypass
@@ -2001,7 +1995,7 @@ impl<'t> BaseInliner<'t> {
     }
 
     /// `Inliner.__init__(translator, graph, inline_func,
-    /// lltype_to_classdef, ...)` at `inline.py:439-459`.
+    /// lltype_to_classdef, ...)` at `inline.py`.
     ///
     /// ```python
     /// class Inliner(BaseInliner):
@@ -2141,7 +2135,7 @@ pub fn inline_function<'t>(
 }
 
 /// `simple_inline_function(translator, inline_func, graph)` at
-/// `inline.py:82-86`.
+/// `inline.py`.
 ///
 /// ```python
 /// def simple_inline_function(translator, inline_func, graph):
@@ -2175,16 +2169,14 @@ pub fn simple_inline_function(
     )
 }
 
-// ============================================================
 // Automatic inlining driver.
 //
 // `instrument_inline_candidates` (`:569-602`),
 // `auto_inlining` (`:608-713`),
 // `auto_inline_graphs` (`:715-731`).
-// ============================================================
 
 /// `instrument_inline_candidates(graphs, threshold)` at
-/// `inline.py:569-602`.
+/// `inline.py`.
 ///
 /// ```python
 /// def instrument_inline_candidates(graphs, threshold):
@@ -2336,7 +2328,7 @@ pub fn instrument_inline_candidates(
 }
 
 /// Heap entry for [`auto_inlining`] mirroring upstream's
-/// `(weight, -len(callers), graph)` tuple at `inline.py:624` /
+/// `(weight, -len(callers), graph)` tuple at `inline.py` /
 /// `:647` / `:700`. Upstream's `heapq` is a min-heap; pyre uses
 /// `BinaryHeap` (max-heap) wrapped in `Reverse` to recover min-first
 /// ordering. The third tie-breaker is graph identity — pyre orders
@@ -2375,7 +2367,7 @@ impl Ord for AutoInliningHeapEntry {
 
 /// `auto_inlining(translator, threshold, callgraph=None,
 /// call_count_pred=None, heuristic=inlining_heuristic)` at
-/// `inline.py:608-713`.
+/// `inline.py`.
 ///
 /// Heap-driven driver that repeatedly picks the lowest-weight graph
 /// from the call graph and inlines it into every parent that still
@@ -2687,7 +2679,7 @@ pub fn auto_inlining(
 
 /// `auto_inline_graphs(translator, graphs, threshold,
 /// call_count_pred=None, heuristic=inlining_heuristic,
-/// inline_graph_from_anywhere=False)` at `inline.py:715-731`.
+/// inline_graph_from_anywhere=False)` at `inline.py`.
 ///
 /// ```python
 /// def auto_inline_graphs(translator, graphs, threshold, call_count_pred=None,
@@ -2979,7 +2971,7 @@ mod tests {
         assert!(!contains_call(&g, CalleeMatcher::Any, &translator));
     }
 
-    // ----- auto-inlining heuristics -----
+    // auto-inlining heuristics
 
     #[test]
     fn op_weight_table_matches_upstream_six_overrides() {
@@ -3113,7 +3105,7 @@ mod tests {
         assert_eq!(result_with_ops.len(), 0);
     }
 
-    // ----- median-execution cost + inlining_heuristic -----
+    // median-execution cost + inlining_heuristic
 
     #[test]
     fn measure_median_execution_cost_int_add_graph_returns_block_weight() {
@@ -3163,7 +3155,7 @@ mod tests {
         assert_eq!(weight, 200.0);
     }
 
-    // ----- BaseInliner construction + simple helpers -----
+    // BaseInliner construction + simple helpers
 
     fn fixture_inliner<'t>(
         translator: &'t TranslationContext,
@@ -3312,7 +3304,7 @@ mod tests {
         assert!(Rc::ptr_eq(&target, &copied));
     }
 
-    // ----- orchestrator + drivers -----
+    // orchestrator + drivers
 
     #[test]
     fn inline_all_empty_queue_returns_zero() {
@@ -3403,7 +3395,7 @@ mod tests {
         use crate::flowspace::model::{ConstValue, Constant};
         let translator = fixture_translator();
 
-        // ---- Callee ----
+        // Callee
         let x = Variable::named("x");
         let f_start = Block::shared(vec![Hlvalue::Variable(x.clone())]);
         let f_graph = FunctionGraph::new("f", f_start.clone());
@@ -3431,7 +3423,7 @@ mod tests {
         // Build the funcobj Constant pointing at f.
         let f_funcobj_const = make_func_constant(&f, "f");
 
-        // ---- Host ----
+        // Host
         let g_start = Block::shared(vec![]);
         let g_graph = FunctionGraph::new("g", g_start.clone());
         let g_r = Variable::named("g_r");
@@ -3482,7 +3474,7 @@ mod tests {
         assert!(!any_direct_call, "direct_call should have been inlined out");
     }
 
-    // ----- public entry points -----
+    // public entry points
 
     /// Helper: build the trivial host graph `g(): r = f(...); return r`
     /// where the call's funcobj points at `callee`. Returns the host
@@ -3645,7 +3637,7 @@ mod tests {
         Hlvalue::Constant(Constant::new(ConstValue::LLPtr(Box::new(ptr))))
     }
 
-    // ----- instrument_inline_candidates -----
+    // instrument_inline_candidates
 
     #[test]
     fn instrument_inline_candidates_empty_graphs_returns_zero() {
@@ -3734,7 +3726,7 @@ mod tests {
         assert_eq!(labels, [0, 1]);
     }
 
-    // ----- auto_inlining -----
+    // auto_inlining
 
     /// Test heuristic that always reports a low fixed weight so the
     /// `weight >= threshold` early-exit doesn't fire. Returns
@@ -3852,7 +3844,7 @@ mod tests {
         );
     }
 
-    // ----- auto_inline_graphs -----
+    // auto_inline_graphs
 
     #[test]
     fn auto_inline_graphs_empty_returns_zero() {

@@ -49,7 +49,7 @@ def _stable(fn, args):
     return want
 
 
-# --- hash -------------------------------------------------------------------
+# hash
 # The exact scalar types the raw helper answers for, plus the operands that
 # send it back to the builtin.
 class _Hashable:
@@ -83,7 +83,7 @@ assert _stable(hash, (_IntSub(9),)) == hash(9)
 assert _stable(hash, (1,)) == _stable(hash, (1.0,)) == _stable(hash, (True,))
 _stable(hash, ([1, 2],))  # unhashable: the raising direction
 
-# --- ord --------------------------------------------------------------------
+# ord
 for _v in ["a", "é", "中", "\U0001f600", chr(0xD800), b"\x00", b"\xff"]:
     _stable(ord, (_v,))
 
@@ -92,7 +92,7 @@ _stable(ord, ("",))
 _stable(ord, (65,))         # not a string at all
 assert _stable(ord, (_StrSub("z"),)) == ord("z")
 
-# --- abs --------------------------------------------------------------------
+# abs
 for _v in [0, 1, -1, 7, -7, 2**62, -(2**62), -(2**63), 2**63, -(2**70),
            True, False, 0.0, -0.0, 1.5, -1.5,
            float("inf"), float("-inf"), float("nan")]:
@@ -114,7 +114,7 @@ class _Abs:
 
 assert _stable(abs, (_Abs(),)) == "custom"
 
-# --- min / max --------------------------------------------------------------
+# min / max
 for _pair in [(1, 2), (2, 1), (1, 1), (-3, 3), (2**62, 2**62 + 1),
               (1.5, 2.5), (2.5, 1.5), (1.5, 1.5), (-0.0, 0.0),
               (float("inf"), 1.0), (float("nan"), 1.0), (1.0, float("nan")),
@@ -188,7 +188,7 @@ for _a, _b in _varying:
         _wrong += 1
 assert _wrong == 0
 
-# --- rebound names ----------------------------------------------------------
+# rebound names
 # The fold keys on the wrapped builtin code, not the name it is reachable
 # under, so a shadowing definition must win.
 _real_abs, _real_hash, _real_min = abs, hash, min

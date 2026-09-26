@@ -36,7 +36,7 @@ fn shape_of(llbc: &Llbc, name: &str) -> Shape {
                     // `None`, not `Some([])`, is load-bearing and asserted
                     // here rather than left to `is_some()`: `graphs is None`
                     // is upstream's "cannot follow the indirect call"
-                    // (`call.py:105`/`137`, `jtransform.py:410-412`) and the
+                    // (`call.py:105`/`137`, `jtransform.py rewrite_op_indirect_call`) and the  allow-line-citation
                     // one value that keeps every family analyzer on its top
                     // result.  `Some([])` reads as an *empty* family and
                     // collapses canraise / can_invalidate /

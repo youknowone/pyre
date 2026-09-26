@@ -274,7 +274,7 @@ fn count_of(object: PyObjectRef, value: PyObjectRef) -> Result<isize, crate::PyE
 
 /// `PySequence_Fast(o, message)` — `o` itself when it is already a list or a
 /// tuple, and a list of its items otherwise, with `message` replacing the
-/// `TypeError` a non-iterable raises (`sequence.py:44-66`).
+/// `TypeError` a non-iterable raises (`sequence.py`).
 ///
 /// The fallback builds a list rather than upstream's tuple, which is what 3.14
 /// documents; `PySequence_Fast_GET_ITEM` reads either.

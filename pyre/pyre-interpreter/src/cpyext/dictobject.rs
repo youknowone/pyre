@@ -279,7 +279,7 @@ pub unsafe extern "C" fn PyDict_DelItemString(object: *mut CPyObject, key: *cons
 }
 
 /// `PyDict_GetItemWithError(dict, key)` — a borrowed reference, or NULL with
-/// no exception set when the key is simply absent (`dictobject.py:106-118`).
+/// no exception set when the key is simply absent (`dictobject.py`).
 ///
 /// # Safety
 /// Both arguments must be null or live references.
@@ -812,7 +812,7 @@ pub unsafe extern "C" fn PyDict_MergeFromSeq2(
 ///
 /// Upstream keeps it in the mirror's own `_tmpkeys` field, holding a strong
 /// reference so the keys stay alive and the collector keeps forwarding them
-/// (`dictobject.py:301-311`).  Pyre's mirror has no such field, so the
+/// (`dictobject.py`).  Pyre's mirror has no such field, so the
 /// reference is held here instead, keyed by the mirror's address; it is the
 /// reference, not this table, that roots the list.
 type SnapshotMap = super::address_table::HeldMap<usize>;
@@ -831,7 +831,7 @@ pub(super) unsafe fn after_fork_child() {
 
 /// `PyDict_Next(dict, &pos, &key, &value)` — 1 for each pair, 0 once they are
 /// all reported.  `pos` starts at 0 and is only ever handed back
-/// (`dictobject.py:255-329`).
+/// (`dictobject.py`).
 ///
 /// The keys are snapshotted on the first call, so a value reassigned during
 /// the walk is seen but a new key is not -- which is the documented contract.

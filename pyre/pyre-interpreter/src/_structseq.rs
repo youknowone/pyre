@@ -9,20 +9,20 @@
 //!
 //! PyPy reference:
 //!
-//! * `lib_pypy/_structseq.py:9-37 structseqfield` — per-field descriptor
+//! * `lib_pypy/_structseq.py structseqfield` — per-field descriptor
 //!   exposing `__get__` that returns `obj[self.index]` (positional) or
 //!   `obj.__dict__[self.__name__]` (extra).  Pyre matches the positional
 //!   half via [`structseq_field_get`] reading the GetSetProperty's
 //!   `name` slot and dispatching through `STRUCTSEQ_REGISTRY`.
-//! * `lib_pypy/_structseq.py:43-87 structseqtype` — metaclass.  Pyre
+//! * `lib_pypy/_structseq.py structseqtype` — metaclass.  Pyre
 //!   replaces the metaclass machinery with a direct
 //!   `make_builtin_type_with_base(name, init, tuple_type)` call inside
 //!   [`make_struct_seq`].
-//! * `lib_pypy/_structseq.py:95-144 structseq_new` — the
+//! * `lib_pypy/_structseq.py structseq_new` — the
 //!   `cls(sequence[, dict])` constructor, including the surplus-positional
 //!   / dict / `None`-default fill of the named-only extra fields and the
 //!   single-field scalar-wrap path.
-//! * `lib_pypy/_structseq.py:156-163 structseq_repr` — `"name(f0=v0,
+//! * `lib_pypy/_structseq.py structseq_repr` — `"name(f0=v0,
 //!   f1=v1, ...)"` rendering.
 
 use indexmap::IndexMap;
@@ -33,7 +33,7 @@ use pyre_object::PyObjectRef;
 
 use crate::PyError;
 
-/// `lib_pypy/_structseq.py:43-87` — metaclass-installed class-level
+/// `lib_pypy/_structseq.py structseqtype` — metaclass-installed class-level
 /// metadata.  Pyre stores the name + positional field list keyed by the
 /// subclass W_TypeObject pointer so the generic field getter resolves
 /// indices without a per-field closure.
@@ -43,7 +43,7 @@ struct StructSeqDescr {
     /// unnamed placeholders (`_structseq.py:67-69`).
     fields: Vec<String>,
     /// Named-only fields stored in the instance `__dict__` rather than the
-    /// tuple body (`_structseq.py:31-37` — the `obj.__dict__[name]` arm).
+    /// tuple body (`_structseq.py __get__` — the `obj.__dict__[name]` arm).
     /// `os.stat_result` uses these for the float `st_atime`/`st_mtime`/
     /// `st_ctime` (which shadow the integer sequence slots 7..10) and the
     /// `st_*_ns` / `st_blksize` / `st_blocks` / `st_rdev` extras.  A name
@@ -71,7 +71,7 @@ pub(crate) fn is_structseq_type(obj: PyObjectRef) -> bool {
     structseq_registry().lock().contains_key(&(obj as usize))
 }
 
-/// `lib_pypy/_structseq.py:31-37 structseqfield.__get__` —
+/// `lib_pypy/_structseq.py structseqfield.__get__` —
 /// resolves the descriptor's name to a positional index via the
 /// per-type registry and returns `obj[index]`.
 ///
@@ -84,7 +84,7 @@ fn structseq_field_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     }
     let desc = args[0];
     let inst = args[1];
-    // `_structseq.py:31` — `structseqfield.__get__` returns the descriptor
+    // `_structseq.py` — `structseqfield.__get__` returns the descriptor
     // itself for class-level access (`if obj is None: return self`).
     if inst.is_null() || unsafe { pyre_object::pyobject::is_none(inst) } {
         return Ok(desc);
@@ -107,7 +107,7 @@ fn structseq_field_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         Positional(usize),
         Missing,
     }
-    // `_structseq.py:31-37` — an extra (dict-backed) field shadows a
+    // `_structseq.py __get__` — an extra (dict-backed) field shadows a
     // same-named positional slot, so resolve those first.
     let resolved = {
         let map = structseq_registry().lock();
@@ -147,7 +147,7 @@ fn structseq_field_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     }
 }
 
-/// `lib_pypy/_structseq.py:156-163 structseq_repr`.
+/// `lib_pypy/_structseq.py structseq_repr`.
 fn structseq_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let inst = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     if inst.is_null() {
@@ -367,7 +367,7 @@ fn structseq_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     Err(PyError::attribute_error("readonly attribute"))
 }
 
-/// `lib_pypy/_structseq.py:95-144 structseq_new` — the `cls(sequence[,
+/// `lib_pypy/_structseq.py structseq_new` — the `cls(sequence[,
 /// dict])` constructor.  The first `n_sequence_fields` items fill the
 /// tuple body; any surplus positional items, then the optional dict, then
 /// `None` defaults, fill the named-only extra fields.
@@ -390,7 +390,7 @@ pub(crate) fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, P
             .unwrap_or_else(|| ("structseq".to_string(), Vec::new()))
     };
 
-    // `_structseq.py:95-101` — the optional second arg is a dict supplying
+    // `_structseq.py structseq_new` — the optional second arg is a dict supplying
     // values for the named-only extra fields.
     if args.len() > 3 {
         return Err(PyError::type_error(format!(
@@ -557,7 +557,7 @@ pub fn new_instance_with_extra(
     let rooted_cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
     let obj = if unsafe { pyre_object::w_type_get_hasdict(rooted_cls) } {
         // `_getusercls` gives a has-dict tuple subclass the generated tuple
-        // payload plus MapdictStorageMixin (`typedef.py:174-227`). Structseq
+        // payload plus MapdictStorageMixin (`typedef.py`). Structseq
         // extras therefore live on their owner rather than in the native
         // address-keyed fallback table.
         pyre_object::w_tuple_subclass_new_array_backed(rooted_items, rooted_cls)
@@ -599,7 +599,7 @@ pub fn new_instance_with_extra(
     pyre_object::gc_roots::shadow_stack_get(obj_slot)
 }
 
-/// `lib_pypy/_structseq.py:43-87 structseqtype.__new__` —
+/// `lib_pypy/_structseq.py structseqtype.__new__` —
 /// build a new tuple subclass with the supplied positional field names.
 /// The returned type is the value module callers stash so future
 /// allocations route through [`new_instance`].
@@ -608,7 +608,7 @@ pub fn make_struct_seq(name: &'static str, field_names: &[&'static str]) -> PyOb
 }
 
 /// Like [`make_struct_seq`] but adds named-only fields beyond the tuple
-/// sequence (`_structseq.py:31-37` extra-field arm).  `extra_field_names`
+/// sequence (`_structseq.py __get__` extra-field arm).  `extra_field_names`
 /// resolve through the instance `__dict__`, shadowing any same-named
 /// positional slot, and the type is marked `hasdict` so [`new_instance_with_extra`]
 /// can store them.  `os.stat_result` is the canonical user.
@@ -660,7 +660,7 @@ fn make_struct_seq_impl(
     let cls = make_heap_structseq_type(
         name,
         move |ns| {
-            // `_structseq.py:79-80` — `__new__` / `__reduce__` /
+            // `_structseq.py` — `__new__` / `__reduce__` /
             // `__setattr__` / `__repr__` / `__str__` are wired by the
             // metaclass.
             unsafe {
@@ -737,7 +737,7 @@ fn make_struct_seq_impl(
                 )
             };
 
-            // Per-field GetSetProperty descriptors.  `_structseq.py:31-37`
+            // Per-field GetSetProperty descriptors.  `_structseq.py __get__`
             // implements `structseqfield.__get__` — pyre fans out to the
             // generic `structseq_field_get` keyed by descriptor name.
             for fname in &descriptor_names {
@@ -818,7 +818,7 @@ fn root_structseq_type(cls: PyObjectRef) {
     STRUCTSEQ_TYPE_ROOTS.lock().push(slot);
 }
 
-/// `lib_pypy/_structseq.py:43-87 structseqtype.__new__` creates an ordinary
+/// `lib_pypy/_structseq.py structseqtype.__new__` creates an ordinary
 /// heap type through `type.__new__`, even though its instances use tuple
 /// storage.  Keep that ownership shape: structseq classes have mutable class
 /// dictionaries (and can therefore participate in cycles with instances),

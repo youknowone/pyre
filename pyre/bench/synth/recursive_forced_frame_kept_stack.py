@@ -4,7 +4,7 @@
 # `locals()` forces the callee PyFrame, so a guard fired inside the callee
 # rebuilds it through the materialized-frame recipe arm rather than the virtual
 # one. The `f(n - 1) +` result sits on the operand stack across the
-# comprehension, and `pyframe.py:396-403 popvalue_maybe_none` clears every slot
+# comprehension, and `pyframe.py popvalue_maybe_none` clears every slot
 # the compare pops -- so the frame image at that guard is already past the
 # clears while the published `valuestackdepth` is still the opcode-start depth.
 # Reconstructing the operands from that image seeds NULL and the re-executed

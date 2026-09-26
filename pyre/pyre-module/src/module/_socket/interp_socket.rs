@@ -1336,7 +1336,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         );
 
         // gethostbyaddr(addr) → (name, aliases, addresses)
-        // `interp_func.py:67-79` — reverse lookup; `addr` is an
+        // `interp_func.py` — reverse lookup; `addr` is an
         // IPv4/IPv6 string we resolve through inet_pton, then feed
         // to gethostbyaddr.
         pyre_interpreter::module_ns_store(
@@ -1550,7 +1550,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     );
 
     // ── module-level getdefaulttimeout / setdefaulttimeout ──
-    // `interp_func.py:378-397` — None means "blocking", float means
+    // `interp_func.py` — None means "blocking", float means
     // "timeout in seconds".  Stored as a process-wide cell.
     pyre_interpreter::module_ns_store(
         ns,
@@ -1625,7 +1625,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     );
 
     // ── getprotobyname(name) ──
-    // `interp_func.py:125-134` — returns the IPPROTO_* number for a
+    // `interp_func.py` — returns the IPPROTO_* number for a
     // protocol name.  libc getprotobyname returns NULL on lookup
     // failure; we surface that as OSError to match `converted_error`.
     #[cfg(any(unix, windows))]
@@ -1858,7 +1858,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     }
 
     // ── CMSG_SPACE / CMSG_LEN ──
-    // `interp_func.py:341-376` — POSIX macros, exposed only when the
+    // `interp_func.py` — POSIX macros, exposed only when the
     // host libc has them.  rust's `libc` crate provides both on every
     // unix target we ship, so we register them under the same cfg.
     #[cfg(unix)]
@@ -2255,7 +2255,7 @@ fn set_default_socket_timeout(v: Option<f64>) {
 
 // ── getaddrinfo / getnameinfo wiring ──
 //
-// PyPy's `interp_func.py:294-339` walks libc's `addrinfo` linked
+// PyPy's `interp_func.py` walks libc's `addrinfo` linked
 // list and packs each entry into a 5-tuple `(family, socktype,
 // proto, canonname, sockaddr)`.  `getnameinfo` is the symmetric
 // path used by stdlib socket.getnameinfo.
@@ -2448,7 +2448,7 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 let flags = unsafe { pyre_object::w_int_get_value(args[1]) } as libc::c_int;
                 // Resolve sockaddr via getaddrinfo(AF_UNSPEC, SOCK_DGRAM,
                 // AI_NUMERICHOST) so we get a real sockaddr_storage,
-                // matching `interp_func.py:142-152`.
+                // matching `interp_func.py`.
                 //
                 // The tuple is parsed with `"si|II"` and a `;`-suffixed custom
                 // message, so every shape it rejects — a length outside two to
@@ -4511,7 +4511,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     ) };
 
     // `interp_socket.py socketmethodnames _accept` — primitive
-    // returning `(fd, addr)`.  CPython's app-level `socket.py:262 def
+    // returning `(fd, addr)`.  CPython's app-level `socket.py def
     // accept` wraps this to construct the new socket object;
     // pyre's `accept` above bundles both steps for callers that
     // bypass the stdlib wrapper.
@@ -5102,7 +5102,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // cmsg_data:bytes) triples walked through CMSG_FIRSTHDR /
     // CMSG_NXTHDR / CMSG_DATA.
     // The scatter/gather calls and their ancillary data are POSIX-only;
-    // `socket.py:557,569` test for each before reaching for it.
+    // `socket.py` test for each before reaching for it.
     #[cfg(unix)]
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
@@ -5274,7 +5274,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // a list/tuple of writable buffers; each `writebuf_w` slice
     // contributes one iovec entry.
     // The scatter/gather calls and their ancillary data are POSIX-only;
-    // `socket.py:557,569` test for each before reaching for it.
+    // `socket.py` test for each before reaching for it.
     #[cfg(unix)]
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
@@ -5445,7 +5445,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // a (cmsg_level, cmsg_type, cmsg_data) 3-tuple; we lay them out
     // into a single control buffer via CMSG_SPACE / CMSG_NXTHDR.
     // The scatter/gather calls and their ancillary data are POSIX-only;
-    // `socket.py:557,569` test for each before reaching for it.
+    // `socket.py` test for each before reaching for it.
     #[cfg(unix)]
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,

@@ -7,7 +7,7 @@
 # state, and every executor of the portal reads that one state: compiled
 # `CALL_ASSEMBLER` through `pos_exception()` / `pos_exc_value()`
 # (`llmodel.py`), `bhimpl_recursive_call_*` through the propagated RPython
-# exception (`blackhole.py:1110-1116`), and the trace-time execution that
+# exception (`blackhole.py bhimpl_recursive_call_r`), and the trace-time execution that
 # `do_recursive_call` performs through `metainterp.execute_raised`
 # (`executor.py:52-78`).
 #

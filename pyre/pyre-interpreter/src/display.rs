@@ -901,14 +901,14 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
         } else if pyre_object::is_tuple(obj) {
             // `pyre_object::is_tuple` covers `TUPLE_TYPE` plus the
             // arity-2 specialisations (`SPECIALISED_TUPLE_{II,FF,OO}_TYPE`,
-            // `pypy/objspace/std/specialisedtupleobject.py:161-167`).
+            // `pypy/objspace/std/specialisedtupleobject.py makespecialisedtuple`).
             // Without this union dispatch the specialised variants
             // (returned by `w_tuple_new(items)` whenever `items.len() == 2`)
             // would fall through to the generic `<{name} object at ...>`
             // fallback — visible as `<tuple object at 0x...>` on
             // `print(e.args)` for two-arg exception constructors.
             //
-            // structseq instances (`_structseq.py:43-87 structseqtype`)
+            // structseq instances (`_structseq.py structseqtype`)
             // are tuple subclasses with `w_class` pointing at a custom
             // type that installs its own `__repr__`.  Route them
             // through the subclass dunder before the generic tuple
@@ -1037,7 +1037,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
             }
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            // `pypy/module/exceptions/interp_exceptions.py:135-147
+            // `pypy/module/exceptions/interp_exceptions.py descr_repr
             // W_BaseException.descr_repr` →
             //   lgt = len(self.args_w)
             //   if lgt == 0: args_repr = "()"
@@ -1101,7 +1101,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 } else {
                     for i in 0..n {
                         if let Some(item) = pyre_object::w_tuple_getitem(args_obj(), i as i64) {
-                            // `interp_exceptions.py:135-147` spells the args
+                            // `interp_exceptions.py descr_repr` spells the args
                             // with `repr(tuple(args))`, which separates by
                             // position — an argument whose `__repr__` answers
                             // `""` still takes a slot.
@@ -1129,7 +1129,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             let mut parts = Vec::with_capacity(n);
             for i in 0..n {
                 if let Some(item) = pyre_object::w_tuple_getitem(args, i as i64) {
-                    // `_repr_item_union` (`_pypy_generic_alias.py:141`) —
+                    // `_repr_item_union` (`_pypy_generic_alias.py`) —
                     // `type(None)` renders as `None`; a bare `None` may
                     // still reach here from direct construction paths.
                     if pyre_object::is_none(item)
@@ -1155,7 +1155,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             }
             return Ok(joined);
         } else if std::ptr::eq(tp, &pyre_object::GENERIC_ALIAS_TYPE as *const PyType) {
-            // GenericAlias.__repr__ (`_pypy_generic_alias.py:57`).
+            // GenericAlias.__repr__ (`_pypy_generic_alias.py`).
             return crate::_pypy_generic_alias::repr(obj);
         } else if std::ptr::eq(tp, &MODULE_TYPE as *const PyType) {
             // A `types.ModuleType` subclass carries its class in `w_class`; a
@@ -1445,7 +1445,7 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     }
 }
 
-/// `pypy/module/exceptions/interp_exceptions.py:126-133
+/// `pypy/module/exceptions/interp_exceptions.py descr_str
 /// W_BaseException.descr_str`:
 ///
 /// ```python
@@ -1510,7 +1510,7 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
     obj: PyObjectRef,
 ) -> Result<Option<Wtf8Buf>, crate::PyError> {
     unsafe {
-        // `pypy/module/exceptions/interp_exceptions.py:447-459`
+        // `pypy/module/exceptions/interp_exceptions.py descr_str`
         // `W_UnicodeTranslateError.descr_str`,
         // `:1061-1071` `W_UnicodeDecodeError.descr_str`,
         // `:1175-1191` `W_UnicodeEncodeError.descr_str` — each
@@ -1982,7 +1982,7 @@ fn unicode_err_end_minus_one_repr(slot: &Result<i64, Wtf8Buf>) -> Wtf8Buf {
     }
 }
 
-/// `pypy/module/exceptions/interp_exceptions.py:447-459
+/// `pypy/module/exceptions/interp_exceptions.py descr_str
 /// W_UnicodeTranslateError.descr_str`:
 ///
 /// ```python
@@ -2098,7 +2098,7 @@ unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate
     }
 }
 
-/// `pypy/module/exceptions/interp_exceptions.py:1061-1071
+/// `pypy/module/exceptions/interp_exceptions.py descr_str
 /// W_UnicodeDecodeError.descr_str`:
 ///
 /// ```python
@@ -2189,7 +2189,7 @@ unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate::P
     }
 }
 
-/// `pypy/module/exceptions/interp_exceptions.py:1175-1191
+/// `pypy/module/exceptions/interp_exceptions.py descr_str
 /// W_UnicodeEncodeError.descr_str` — same single/range split as
 /// `W_UnicodeTranslateError` but prefixed with the encoding name.
 /// Non-int / non-str / OOR mutations match the parity rules in

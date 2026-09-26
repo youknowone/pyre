@@ -705,7 +705,7 @@ fn try_generate_jitcode_body_inner(
     // with_liveness` materialises the per-marker fixed-point alive set
     // onto each `LiveMarker.reads` so the repeated-live pass and the
     // emit-time triple rewrite both consume the same ssarepr-mutated
-    // shape `liveness.py:33-79` produces.
+    // shape `liveness.py` produces.
     annotate_live_markers_with_liveness(&mut lowerer.op_metadata);
     remove_repeated_live(&mut lowerer.op_metadata, &mut lowerer.statements);
     rewrite_live_marker_statements_with_triples(&lowerer.op_metadata, &mut lowerer.statements);

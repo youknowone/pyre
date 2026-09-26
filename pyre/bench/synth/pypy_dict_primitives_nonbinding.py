@@ -9,7 +9,7 @@ output.
 
 from collections import OrderedDict
 
-# --- OrderedDict behavior (CPython 3.14, PyPy, pyre) ---
+# OrderedDict behavior (CPython 3.14, PyPy, pyre)
 od = OrderedDict([("a", 1), ("b", 2), ("c", 3)])
 
 # reversed() -> reversed_dict
@@ -35,7 +35,7 @@ d["self"] = d
 assert "..." in repr(d)
 d.clear()
 
-# --- __pypy__ direct + non-binding (pyre / PyPy only; asserts only) ---
+# __pypy__ direct + non-binding (pyre / PyPy only; asserts only)
 try:
     import __pypy__
 except ImportError:

@@ -10,7 +10,7 @@
 # lost, and a membership test answers as if the clear never happened.
 #
 # An object dict clears in place — `ll_dict_clear` reallocates `d.entries`
-# (rordereddict.py:1360) on the same table — so the `entries != d.entries`
+# (rordereddict.py) on the same table — so the `entries != d.entries`
 # paranoia arm of `ll_dict_lookup` (:1058) fires and the probe restarts against
 # the refilled dict, landing on whatever the callback re-inserted.
 N = 4000

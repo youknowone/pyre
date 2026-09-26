@@ -297,7 +297,7 @@ pub unsafe extern "C" fn PyObject_GenericGetAttr(
 }
 
 /// `PyObject_GenericSetAttr(object, name, value)` — a NULL `value` is the
-/// deletion spelling, which is `object.__delattr__` (`object.py:305-311`).
+/// deletion spelling, which is `object.__delattr__` (`object.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_GenericSetAttr(
     object: *mut CPyObject,
@@ -347,7 +347,7 @@ pub unsafe extern "C" fn PyObject_GenericGetDict(
 
 /// `PyObject_GenericSetDict(object, value, context)` — `typedef.py:549-550
 /// descr_set_dict`.  A NULL `value` asks for a deletion this descriptor does
-/// not offer (`object.py:470-471`).
+/// not offer (`object.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_GenericSetDict(
     object: *mut CPyObject,
@@ -396,7 +396,7 @@ pub unsafe extern "C" fn PyObject_ASCII(object: *mut CPyObject) -> *mut CPyObjec
 
 /// `PyObject_Bytes(object)` — `bytes(object)` through `__bytes__` and, failing
 /// that, the buffer/iterable conversion; `b"<NULL>"` for a NULL one
-/// (`object.py:193-202`).
+/// (`object.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_Bytes(object: *mut CPyObject) -> *mut CPyObject {
     let object = unsafe { pyobject::from_ref(object) };
@@ -432,7 +432,7 @@ fn bytes_of_object(object: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `PyObject_Format(object, spec)` — `format(object, spec)`, with a NULL spec
-/// standing for the empty one (`object.py:215-221`).
+/// standing for the empty one (`object.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_Format(
     object: *mut CPyObject,
@@ -452,7 +452,7 @@ pub unsafe extern "C" fn PyObject_Format(
 }
 
 /// `PyObject_Dir(object)` — `dir(object)`, and the caller's own scope for a
-/// NULL one (`object.py:395-401`).
+/// NULL one (`object.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_Dir(object: *mut CPyObject) -> *mut CPyObject {
     let object = unsafe { pyobject::from_ref(object) };
@@ -499,7 +499,7 @@ pub unsafe extern "C" fn PyObject_RichCompare(
 
 /// `PyObject_RichCompareBool(left, right, opid)` — the truth of the comparison,
 /// with the identity shortcut that makes an object equal to itself without
-/// calling `__eq__` (`object.py:268-275`).
+/// calling `__eq__` (`object.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_RichCompareBool(
     left: *mut CPyObject,
@@ -526,7 +526,7 @@ pub unsafe extern "C" fn PyObject_RichCompareBool(
 }
 
 /// `PyObject_Hash(object)` — `hash(object)`, or -1 with a `TypeError` for an
-/// unhashable one (`object.py:367-375`).
+/// unhashable one (`object.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_Hash(object: *mut CPyObject) -> isize {
     let Some(object) = argument(object) else {
@@ -542,7 +542,7 @@ pub unsafe extern "C" fn PyObject_Hash(object: *mut CPyObject) -> isize {
 }
 
 /// `PyObject_HashNotImplemented(object)` — what a type puts in `tp_hash` to say
-/// it has none (`object.py:386-392`).
+/// it has none (`object.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_HashNotImplemented(object: *mut CPyObject) -> isize {
     let object = unsafe { pyobject::from_ref(object) };
@@ -812,7 +812,7 @@ pub unsafe extern "C" fn PyObject_HasAttrStringWithError(
 }
 
 /// `PyObject_HasAttr(object, name)` — the error-swallowing spelling
-/// (`object.py:105-110`).
+/// (`object.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_HasAttr(object: *mut CPyObject, name: *mut CPyObject) -> c_int {
     let found = unsafe { PyObject_HasAttrWithError(object, name) };
@@ -950,7 +950,7 @@ pub unsafe extern "C" fn PyObject_IsInstance(
 }
 
 /// `PyObject_IsSubclass(derived, class)` — `issubclass(derived, class)`
-/// (`object.py:330-338`).
+/// (`object.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_IsSubclass(
     derived: *mut CPyObject,
@@ -967,7 +967,7 @@ pub unsafe extern "C" fn PyObject_IsSubclass(
 }
 
 /// `PyObject_AsFileDescriptor(object)` — the object's own `int` value, or what
-/// its `fileno()` reports (`object.py:341-363`).
+/// its `fileno()` reports (`object.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_AsFileDescriptor(object: *mut CPyObject) -> c_int {
     let Some(object) = argument(object) else {
@@ -1025,14 +1025,14 @@ pub unsafe extern "C" fn PyObject_InitVar(
 }
 
 /// `PyObject_GC_IsTracked(object)` — every object pyre holds is reachable by
-/// its collector, so this is the constant 1 (`object.py:495-498`).
+/// its collector, so this is the constant 1 (`object.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_GC_IsTracked(_object: *mut CPyObject) -> c_int {
     1
 }
 
 /// `PyObject_GC_IsFinalized(object)` — whether `tp_finalize` has already run
-/// for this object (`object.py:501-504`).
+/// for this object (`object.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_GC_IsFinalized(object: *mut CPyObject) -> c_int {
     (!object.is_null() && super::gc::is_finalized(object as usize)) as c_int
@@ -1207,7 +1207,7 @@ pub extern "C" fn PyObject_Malloc(size: usize) -> *mut c_void {
 }
 
 /// `PyObject_Calloc(count, element)` — `count * element` zeroed bytes,
-/// refusing a product that would wrap (`object.py:25-31`).
+/// refusing a product that would wrap (`object.py`).
 #[unsafe(no_mangle)]
 pub extern "C" fn PyObject_Calloc(count: usize, element: usize) -> *mut c_void {
     if element != 0 && count > (isize::MAX as usize) / element {
@@ -1217,7 +1217,7 @@ pub extern "C" fn PyObject_Calloc(count: usize, element: usize) -> *mut c_void {
 }
 
 /// `PyObject_Realloc(block, size)` — a NULL block is an allocation
-/// (`object.py:35-42`).
+/// (`object.py`).
 ///
 /// # Safety
 /// `block` must be NULL or a live block from [`PyObject_Malloc`],

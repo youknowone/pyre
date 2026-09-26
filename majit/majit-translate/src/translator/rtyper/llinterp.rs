@@ -3,7 +3,7 @@
 //! Upstream is 1477 LOC of two top-level types — `LLException` /
 //! `LLFatalError` exceptions, plus the `LLInterpreter` and its
 //! `LLFrame` opcode-dispatch loop. Driver task `task_llinterpret_lltype`
-//! (`driver.py:543-555`) is the only consumer of `LLInterpreter` and
+//! (`driver.py`) is the only consumer of `LLInterpreter` and
 //! uses only:
 //!
 //! * Constructor: `LLInterpreter(translator.rtyper)` (`:67-82`).
@@ -368,7 +368,7 @@ impl LLInterpreter {
     }
 
     /// Upstream `eval_graph(self, graph, args=(), recursive=False)` at
-    /// `llinterp.py:84-126`.
+    /// `llinterp.py`.
     ///
     /// Mirrors upstream `:99` `LLInterpreter.current_interpreter = self`
     /// unconditionally — every public entry installs the thread-local
@@ -428,7 +428,7 @@ pub struct LLFrame {
     pub alloca_objects: Vec<Rc<dyn Any>>,
     /// Upstream catches `LLException as e` at `:323` after an op
     /// raised; `e.args[0]` is the exception class and `e.args[1]` the
-    /// instance (`llinterp.py:373-374`). The Rust port captures the
+    /// instance (`llinterp.py`). The Rust port captures the
     /// same `(etype, evalue)` pair here as typed `LLValue`s; the next
     /// `eval_block` step consumes it via the `canraise` dispatch.
     pending_exception: Option<(LLValue, LLValue)>,
@@ -436,7 +436,7 @@ pub struct LLFrame {
 
 impl LLFrame {
     /// Upstream `LLFrame.__init__(graph, args, llinterpreter)` at
-    /// `llinterp.py:215-224`.
+    /// `llinterp.py`.
     fn new(graph: GraphRef, args: Vec<LLValue>) -> Self {
         Self {
             graph,
@@ -723,7 +723,7 @@ impl LLFrame {
     }
 
     /// Upstream `op_direct_call(exdata.fn_exception_match, cls,
-    /// link.llexitcase)` at `llinterp.py:377`. The full port routes
+    /// link.llexitcase)` at `llinterp.py`. The full port routes
     /// through the typer's `exceptiondata.fn_exception_match` runtime
     /// function — that helper is itself a generated graph and is not
     /// yet ported. Until then the local implementation matches by

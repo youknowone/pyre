@@ -63,7 +63,7 @@ pub(super) struct Lowerer<'c> {
     /// `program.get_op(<idx>)`).  `lower_dispatch_chain` uses this name
     /// to look up the opcode reg in `bindings` so the dispatch chain
     /// emits regardless of the consumer's chosen variable name.
-    /// Falls back to the literal `"opcode"` (PyPy `pyopcode.py:171`
+    /// Falls back to the literal `"opcode"` (PyPy `pyopcode.py`
     /// canonical name) when unset, preserving existing fixtures.
     pub(super) opcode_var_name: Option<String>,
     /// `true` when this Lowerer is producing the arm body sub-JitCode

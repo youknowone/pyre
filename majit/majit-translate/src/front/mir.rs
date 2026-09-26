@@ -13,7 +13,7 @@
 //!
 //! ## Reference
 //!
-//! `rpython/flowspace/flowcontext.py:399-465`
+//! `rpython/flowspace/flowcontext.py build_flow`
 //! ([`FlowContext.build_flow`], [`FlowContext.record_block`],
 //! [`FlowContext.mergeblock`]).
 //!
@@ -735,7 +735,7 @@ fn is_inline_array_or_slice_type(s: &str) -> bool {
 /// `getuniqueclassdef_for_enum_variant` projects through.  A tuple payload is
 /// a GC reference in the translated program, even though Rust stores it
 /// inline: RPython's `TupleRepr` uses
-/// `Ptr(GcStruct('tupleN', ...))` (`rpython/rtyper/rtuple.py:119-126`), and
+/// `Ptr(GcStruct('tupleN', ...))` (`rpython/rtyper/rtuple.py`), and
 /// pyre's synthetic aggregate constructor follows that representation.
 /// Consequently its textual field descr must use the ordinary one-word
 /// `Ref` fallback, not reject the row based on the source Rust width.  A
@@ -1415,7 +1415,7 @@ fn should_lower_function(
 /// RPython creates one distinct `GcStruct('tupleN', item0, item1, ...)` per
 /// [`SomeTuple`] representation (`rtyper/rtuple.py`), then
 /// `TupleRepr.newtuple` allocates that struct and writes its fields
-/// (`rtuple.py:153-169`). Charon has no `TypeDecl` row for Rust's built-in
+/// (`rtuple.py`). Charon has no `TypeDecl` row for Rust's built-in
 /// tuple/array aggregate, so [`derive_program_metadata`] cannot discover
 /// these layouts from the declaration table. The graph is the authoritative
 /// rtyper input here: `front::mir` has already attached the complete
@@ -2541,7 +2541,7 @@ pub(crate) fn tombstoned_leaves_of(llbc: &Llbc) -> std::collections::HashSet<Str
 /// could denote one struct while `canonical_struct_name` names another.
 /// RPython cannot express this state at all: every classdef and
 /// `FORCE_ATTRIBUTES_INTO_CLASSES` key is a live class OBJECT
-/// (bookkeeper.py:361, classdesc.py:957), so a name is never an
+/// (bookkeeper.py:361, classdesc.py), so a name is never an  allow-line-citation
 /// identity.  The string-carrier stand-in therefore keeps leaf
 /// resolution only while it is injective:
 ///
@@ -3901,7 +3901,7 @@ fn simplify_lowered_graph(
     // read in the predecessor from a read in the target; it removed
     // little, so running it only after another pass had already changed
     // something looked free.  Now that the entry framestate is copied
-    // (`flowcontext.py:466`) the sweep does real work on graphs no other
+    // (`flowcontext.py`) the sweep does real work on graphs no other
     // pass touches — `_check_stack_index` threads the virtualizable array
     // into a successor that never reads it, and nothing else in this
     // sequence reports a removal for that graph.
@@ -4647,9 +4647,7 @@ impl std::fmt::Display for LowerError {
 
 impl std::error::Error for LowerError {}
 
-// ---------------------------------------------------------------------------
 // Lowering state
-// ---------------------------------------------------------------------------
 
 pub use majit_jitcode::codewriter::jtransform::OBJECT_REF_GCARRAY_TYPE_ID;
 /// PyPy `BytesListStrategy` / `AsciiListStrategy` expose `SomeString`
@@ -4877,7 +4875,7 @@ struct Lowering<'a> {
     /// The pair exists because the fold drops the fat slice's second word.
     /// That word is `l.length`, which upstream keeps strictly apart from the
     /// array header's `ll_fixed_length` / `arraylen_gc`
-    /// (`rlist.py:365-375, 395-397`: `ll_length` reads `l.length` while
+    /// (`rlist.py, 395-397`: `ll_length` reads `l.length` while
     /// `ll_getitem_fast` asserts against it).  A `Rvalue::Len` over one of
     /// these locals answers with the recorded length, never with `__len` of
     /// the header, which is the CAPACITY.
@@ -5514,9 +5512,7 @@ impl<'a> Lowering<'a> {
         order
     }
 
-    // -----------------------------------------------------------------------
     // Framestate-threaded lowering (acyclic GAP-B path)
-    // -----------------------------------------------------------------------
 
     /// Snapshot the current `local_var` table as a [`FrameState`].  Only
     /// the locals projection is populated — MIR has no value stack /
@@ -5926,7 +5922,7 @@ impl<'a> Lowering<'a> {
                     // make_next_block`, whose whole body is `newstate =
                     // state.copy()` before `SpamBlock(newstate)`.
                     // `FrameState.copy` is "make a copy of this state in
-                    // which all Variables are fresh" (framestate.py:42), and
+                    // which all Variables are fresh" (framestate.py), and
                     // the freshness is what the flowspace shape rests on: a
                     // block's inputargs are Variables *distinct* from the
                     // link args feeding them, so per-Variable liveness can
@@ -6179,9 +6175,7 @@ impl<'a> Lowering<'a> {
         self.lower_terminator(mir_bb, term)
     }
 
-    // -----------------------------------------------------------------------
     // Statements
-    // -----------------------------------------------------------------------
 
     fn lower_statement(
         &mut self,
@@ -7045,7 +7039,7 @@ impl<'a> Lowering<'a> {
                     // Signedness-flipping int cast (`w_tuple_len(obj) as i64`)
                     // — aliasing keeps the source `r_uint` annotation on the
                     // signed destination, tripping the SomeInteger signedness
-                    // `UnionError` (`binaryop.py:178-202`) when the length
+                    // `UnionError` (`binaryop.py union`) when the length
                     // meets a signed index.  Route the unsigned→signed flip
                     // through `rarithmetic.intmask` (the RPython spelling of
                     // this re-type): `rtype_intmask` coerces to `lltype.Signed`
@@ -7336,7 +7330,7 @@ impl<'a> Lowering<'a> {
                 // reinterprets to is load-bearing for the annotator, in both
                 // directions ([`Lowering::ptr_cast_marker`]).  Gate on the
                 // raw-pointer cast kind: `lltype.cast_pointer`
-                // (`lltype.py:964-975`) is pointer-to-pointer only, and
+                // (`lltype.py`) is pointer-to-pointer only, and
                 // int-to-pointer is the separate `cast_int_to_ptr`
                 // analyzer.
                 if cast_kind_is_raw_ptr(&kind)
@@ -7606,7 +7600,7 @@ impl<'a> Lowering<'a> {
                 // Emit the transparent ctor with empty args so the
                 // annotator's `ClassDesc::pycall` `args.fixedunpack(0)`
                 // check (`classdesc.rs`, mirroring upstream
-                // `classdesc.py:705`) succeeds for classes whose
+                // `classdesc.py`) succeeds for classes whose
                 // `__init__` is not registered with the bookkeeper —
                 // the operand values flow through the FieldWrite chain
                 // below instead.  A named struct's constructor is the
@@ -7705,7 +7699,7 @@ impl<'a> Lowering<'a> {
                         .map(|(name, field_ty, _)| (name.clone(), field_ty.clone()))
                         .unwrap_or_else(|| (format!("__pos_{i}"), String::new()));
                     let declared_ty = field_rows.get(i).and_then(|(_, _, ty)| ty.as_ref());
-                    // `_names_without_voids()` (`lltype.py:333`) /
+                    // `_names_without_voids()` (`lltype.py`) /
                     // `heaptracker.py:100-101`: a
                     // zero-sized field occupies no storage and gets no slot,
                     // so no write is generated for it.
@@ -10150,9 +10144,7 @@ impl<'a> Lowering<'a> {
         i64::try_from(primitive_size_align(want_align, body.get("Literal")?)?).ok()
     }
 
-    // -----------------------------------------------------------------------
     // Terminators
-    // -----------------------------------------------------------------------
 
     fn lower_terminator(&mut self, mir_bb: usize, term: TermKind) -> Result<(), LowerError> {
         let bb_id = self.block_id[mir_bb];
@@ -10185,7 +10177,7 @@ impl<'a> Lowering<'a> {
                 // an Abort marks a "shouldn't occur at run-time"
                 // path, exactly the implicit-exception raise of
                 // `RaiseImplicit.nomoreblocks`
-                // (`flowcontext.py:1271-1284`).  Closing the block
+                // (`flowcontext.py`).  Closing the block
                 // with `[Constant(AssertionError),
                 // Constant(AssertionError(msg))]` lets
                 // `remove_assertion_errors` (simplify.py)
@@ -10843,9 +10835,9 @@ impl<'a> Lowering<'a> {
                     }
                 }
                 // `we_are_jitted()` is true during tracing and blackholing
-                // (rlib/jit.py:355-358); the rtyper folds the surviving
+                // (rlib/jit.py); the rtyper folds the surviving
                 // `_we_are_jitted` symbolic to a constant True
-                // (rlib/jit.py:403-406, jtransform.py:1636-1639).  Folding it
+                // (rlib/jit.py, jtransform.py:1636-1639).  Folding it  allow-line-citation
                 // to `ConstBool(true)` here — at the front, before annotation —
                 // lets `simplify_lowered_graph`'s `fold_constant_exitswitch`
                 // drop each JIT-dead `if not we_are_jitted()` interpreter arm
@@ -12131,7 +12123,7 @@ impl<'a> Lowering<'a> {
                     // `len(initial)`.  That is the size RPython source with
                     // this shape gets: `b = StringBuilder(); b.append(s)`
                     // reaches `rtyper_new` with `len(hop.args_v) == 0`
-                    // (`rtyper/rbuilder.py:8-14`).  `convert_const`'s
+                    // (`rtyper/rbuilder.py`).  `convert_const`'s
                     // `ll_new(len(s))` (`:57-63`) is the PREBUILT-constant
                     // path — a builder already built at translation time —
                     // and is not this callsite.
@@ -13747,7 +13739,7 @@ impl<'a> Lowering<'a> {
                     // `hint_promote*` marker so the residual `OpKind::Call`
                     // reaches `jtransform::rewrite_op_hint`, which emits
                     // `[-live-, <kind>_guard_value(x)]`
-                    // (`codewriter/jtransform.py:608-614`).  The rtyper
+                    // (`codewriter/jtransform.py`).  The rtyper
                     // lowers the marker to `same_as` for the dual-gate type
                     // projection (`flowspace_adapter`), and jtransform aliases
                     // the result back to `x`.  Same single-segment marker
@@ -17430,7 +17422,7 @@ impl<'a> Lowering<'a> {
     /// wrappers (`{UnsafeCell<T>}`).  For these the caller lowers the
     /// deref to the `cast_pointer(T, p)` downcast marker
     /// (`cast_pointer_marker_op`), which yields `SomeInstance(T)`
-    /// (lltype.py:964-974) independent of the receiver's (classdef-less)
+    /// (lltype.py) independent of the receiver's (classdef-less)
     /// annotation — the same shape pyre emits for `obj as *const W_Foo`.
     ///
     /// `Rc<T>` / `Arc<T>` are the exception: their word points at a
@@ -18356,7 +18348,7 @@ impl<'a> Lowering<'a> {
 
     /// The logical `l.length` of a string-list storage record — the second
     /// word the `from_raw_parts` view fold drops.  Upstream reads it as the
-    /// list's own field (`ll_length`, `rlist.py:365-366`), strictly apart
+    /// list's own field (`ll_length`, `rlist.py`), strictly apart
     /// from the array header's `ll_fixed_length` / `arraylen_gc`.
     fn emit_string_array_len_read(
         &mut self,
@@ -18514,7 +18506,7 @@ impl<'a> Lowering<'a> {
     /// integer-kinded (`core::convert::num::<Impl>::from`) — `u32::from(u16)`
     /// and its family.
     ///
-    /// `jtransform.py:330-337` deletes every one of these outright:
+    /// `jtransform.py rewrite_op_cast_bool_to_int` deletes every one of these outright:
     /// `rewrite_op_cast_char_to_int`, `cast_int_to_uint`, `cast_uint_to_int`
     /// and the rest are each `pass`, because a cast between two integer
     /// primitives is a no-op once both live in the same `Int` register kind.
@@ -19417,7 +19409,7 @@ impl<'a> Lowering<'a> {
     /// source class recorded on the closure-rewrite site until the synthesized
     /// writer can emit the ordinary instance-narrowing cast.  This preserves
     /// the concrete field annotation that RPython's `InstanceRepr._setup_repr`
-    /// consumes (`rpython/rtyper/rclass.py:501-509`).
+    /// consumes (`rpython/rtyper/rclass.py`).
     fn option_payload_instance_class_root(&self, option_ty: &TyRef) -> Option<String> {
         let payload = strip_ty_indirections(
             tyref_node(option_ty, self.llbc)?
@@ -21295,7 +21287,7 @@ impl<'a> Lowering<'a> {
     /// Lower `{i64,u64}::wrapping_{add,sub,mul}`
     /// (`core::num::<Impl>::wrapping_*`, Opaque in the LLBC like every
     /// core fn) to the native `BinOp("add"/"sub"/"mul")`.  `Signed`
-    /// arithmetic is modular machine arithmetic — `rint.py:217
+    /// arithmetic is modular machine arithmetic — `rint.py rtype_add
     /// rtype_add` emits `int_add` with no overflow check, and `int_add`
     /// wraps (`rarithmetic.py intmask` semantics) — so the wrapping
     /// method IS the plain llop.  Restricted to word-sized receivers; a
@@ -21314,7 +21306,7 @@ impl<'a> Lowering<'a> {
     ///
     /// The result carries the receiver's signedness rather than a flat
     /// `Int`.  `union_type` widens `Int ∪ Unsigned` to `Unknown`
-    /// (`binaryop.py:191` UnionError), so annotating a `usize` sum as
+    /// (`binaryop.py` UnionError), so annotating a `usize` sum as
     /// `Int` would poison the merge where it meets the unsigned field
     /// read it came from.
     /// Normalize Opaque `core::cmp::{min,max}` (free function or
@@ -21972,7 +21964,7 @@ impl<'a> Lowering<'a> {
     /// [`Self::try_lower_bigint_i64_try_from`].
     ///
     /// RPython's `rbigint.toint` is an elidable, overflow-raising scalar
-    /// operation (`rpython/rlib/rbigint.py:465-485`). Rust carries that
+    /// operation (`rpython/rlib/rbigint.py`). Rust carries that
     /// exceptional edge as `Result`; a dependent LLBC cannot translate into
     /// the pyre-object method body and otherwise leaves a classdef-less
     /// residual Result. Its subsequent discriminant/`Ok.__pos_0` reads then
@@ -22261,7 +22253,7 @@ impl<'a> Lowering<'a> {
     /// `i64` in a 64-bit LLBC corpus) is fallible only for negative values.
     /// Preserve Rust's observable `Result` branch as a runtime tag and cast
     /// its success payload with RPython's `cast_int_to_uint` spelling
-    /// (`rint.py:200-205`).  The cast is total and may run eagerly on the Err
+    /// (`rint.py __extend__`).  The cast is total and may run eagerly on the Err
     /// arm because that payload is dead there.  Fixed-width `i64` is admitted
     /// only when Charon's target metadata proves an eight-byte pointer; wider
     /// signed sources on a narrower target remain fail-closed.
@@ -22433,7 +22425,7 @@ impl<'a> Lowering<'a> {
 
     /// Lower the fallible `i32::try_from(i64)` core shell to the checked
     /// narrowing shape PyPy writes directly in
-    /// `ObjSpace.c_int_w` (`baseobjspace.py:2062-2068`): the value succeeds
+    /// `ObjSpace.c_int_w` (`baseobjspace.py`): the value succeeds
     /// exactly when `INT_MIN <= value <= INT_MAX`. Rust carries the two
     /// branches in a `Result<i32, TryFromIntError>`, so preserve that source
     /// CFG by materializing `Ok=0` / `Err=1` and leaving the caller's match
@@ -22530,7 +22522,7 @@ impl<'a> Lowering<'a> {
             },
         );
         // `c_int_w` joins the two bound tests with `or`
-        // (`baseobjspace.py:2066`), so join them with the registered `or_`
+        // (`baseobjspace.py`), so join them with the registered `or_`
         // operator (`operation.py:486`) rather than with arithmetic: the
         // result is the Result discriminant, 0 in range (Ok), 1 out of range
         // (Err).
@@ -22609,7 +22601,7 @@ impl<'a> Lowering<'a> {
         // identity in the word carrier (the same gate
         // `try_lower_usize_try_from` uses). Bool is the RPython BoolRepr
         // sibling: converting it to Unsigned emits `cast_bool_to_uint`
-        // through the ordinary `r_uint` builtin (`rbool.py:63-74`).
+        // through the ordinary `r_uint` builtin (`rbool.py`).
         let src_is_bool =
             tyref_to_value_type_with(src, self.llbc, self.tombstoned_leaves) == ValueType::Bool;
         let src_is_small_uint = matches!(
@@ -22624,7 +22616,7 @@ impl<'a> Lowering<'a> {
         // path applies (the `Rvalue::Cast` unsigned→signed arm): aliasing
         // a `uN` source straight into an `iN` carrier preserves the source
         // `r_uint` annotation and trips the SomeInteger signedness
-        // `UnionError` (binaryop.py:178-202) when the value later meets a
+        // `UnionError` (binaryop.py union) when the value later meets a
         // signed operand.  Route signed destinations through
         // `rarithmetic.intmask` (identity on the i64 carrier, re-types
         // Signed); alias unsigned destinations directly, as upstream
@@ -23257,7 +23249,7 @@ impl<'a> Lowering<'a> {
         match targets {
             SwitchTargets::If(then_bb, else_bb) => {
                 // Constant-bool discriminant: take the known arm
-                // unconditionally.  `flowcontext.py:364-367
+                // unconditionally.  `flowcontext.py guessbool
                 // FlowContext.guessbool` returns a Constant condition's
                 // value directly instead of forking the recorder, so a
                 // translation-time `const` gate like
@@ -23288,7 +23280,7 @@ impl<'a> Lowering<'a> {
                 }
                 // Route through `set_branch` so the cond gets the
                 // upstream `bool` UnaryOp wrap before becoming the
-                // exitswitch (flowcontext.py:756
+                // exitswitch (flowcontext.py POP_JUMP_IF_FALSE
                 // `Variable.bool().eval(self)`).  Necessary because the
                 // MIR discriminant for an `If` target can be a Ref
                 // (e.g. a SyntheticTransparentCtor result) whereas
@@ -23522,7 +23514,7 @@ impl<'a> Lowering<'a> {
 
 /// Which PBC family an `OpKind::IndirectCall` through a bare function
 /// pointer carries — the `c_graphs` argument `FunctionReprBase.call`
-/// appends at `rpbc.py:216`.
+/// appends at `rpbc.py`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FnPtrFamily {
     /// The generated builtin-wrapper family.  `Some([])` is the
@@ -23537,7 +23529,7 @@ enum FnPtrFamily {
     /// `graphs_from` then answers `None` (`call.py`) and
     /// `guess_call_kind` answers `residual` (`call.py`), so
     /// `rewrite_op_indirect_call` emits `handle_residual_call`
-    /// (`jtransform.py:410-412`).  `None` is also what keeps the family
+    /// (`jtransform.py`).  `None` is also what keeps the family
     /// analyzers conservative: `Some([])` reads as "empty family" and
     /// collapses canraise / can_invalidate / forces_virtualizable to their
     /// bottom result, which is unsound for a callee this side cannot see.
@@ -23622,9 +23614,7 @@ fn fn_ptr_signature_is_builtin_code_fn(
         && output.contains("PyError")
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 /// Collect the MIR locals bound by a scalar [`Rvalue::BinaryOp`]
 /// anywhere in `body`.  See [`Lowering::binop_result_locals`] for why a
@@ -25018,7 +25008,7 @@ fn unit_tyref() -> TyRef {
 /// Root-stack operations whose PyObjectRef return is the physical spelling
 /// of `llmemory.GCREF`, not a W_Root instance.  Upstream's GC transformer
 /// gives such a helper call a GCREF result and casts it back to the concrete
-/// repr at the use site — `gct_weakref_create` (`framework.py:1151-1154`)
+/// repr at the use site — `gct_weakref_create` (`framework.py`)
 /// does `genop("direct_call", ..., resulttype=llmemory.GCREF)` followed by
 /// `genop("cast_opaque_ptr", [v_result], resulttype=WEAKREFPTR)`.
 ///
@@ -25536,10 +25526,10 @@ fn deref_write_base_local(place: &Place) -> Option<usize> {
 ///
 /// Upstream never puts one there.  `gc_push_roots` / `gc_pop_roots` are
 /// genop'd by the shadow-stack transformer (`memory/gctransform/
-/// shadowstack.py:31-38`, reached from `framework.py:789-792`), and that
+/// shadowstack.py push_roots`, reached from `framework.py`), and that
 /// transformer runs out of the C backend's database (`translator/c/
-/// database.py:64`, per graph from `translator/c/funcgen.py:52-59`), long
-/// after `warmspot.py:281 make_jitcodes` has already read the graphs.  A
+/// database.py:64`, per graph from `translator/c/funcgen.py make_funcgen`), long  allow-line-citation
+/// after `warmspot.py make_jitcodes` has already read the graphs.  A
 /// jitcode therefore never carries a bracket, and `rg 'gc_push_roots'
 /// rpython/jit/` finds nothing.
 ///
@@ -27459,7 +27449,7 @@ fn resolve_tyexpr_to_adt_def_id_free(llbc: &Llbc, ty: &serde_json::Value) -> Opt
 ///     `lshift`/`rshift` (RPython treats them identically because
 ///     shifts cannot overflow into a different repr).
 ///   - `BitAnd` / `BitOr` / `BitXor` → `and`/`or`/`xor` to match
-///     `blackhole.py:500` canonical bitwise opnames.
+///     `blackhole.py` canonical bitwise opnames.
 ///   - Comparisons `Eq` / `Ne` / `Lt` / `Le` / `Gt` / `Ge` pass through
 ///     as lowercase; the assembler later branches on operand kind
 ///     (`ii` → `int_eq`, `rr` → `ptr_eq`, …).
@@ -27485,7 +27475,7 @@ fn binop_label(v: &serde_json::Value) -> Result<String, LowerError> {
 /// atoms (`"Neg"`, `"Not"`) share `binop_label`'s mapping; tagged
 /// `{"Cast": {...}}` payloads encode the source/dest scalar shape and
 /// project onto `cast_int_to_float` / `cast_float_to_int` /
-/// `cast_int_to_ptr` / `cast_ptr_to_int` per `blackhole.py:603-816`.
+/// `cast_int_to_ptr` / `cast_ptr_to_int` per `blackhole.py bhimpl_cast_ptr_to_int`.
 /// Cast shapes the JIT models as identity (RawPtr→RawPtr,
 /// Scalar Int↔UInt of the same width, Unsize) collapse to `same_as`
 /// so the assembler emits the per-kind copy op instead of an unwired
@@ -31999,7 +31989,7 @@ fn render_adt_type_args(
 ///
 /// `graphs is None` is upstream's own spelling for "cannot follow the
 /// indirect call": `call.py:105` skips the candidate filter, `call.py:137`
-/// answers `residual`, and `jtransform.py:410-412` emits
+/// answers `residual`, and `jtransform.py rewrite_op_indirect_call` emits
 /// `handle_residual_call`.  `__dyn_call` has no such continuation — it is an
 /// unregistered synthetic path that stops the graph reaching it. Before this
 /// arm existed only the
@@ -32034,10 +32024,10 @@ fn render_adt_type_args(
 /// *external* call and took its bottom result; a `graphs: None`
 /// `IndirectCall` is the top result instead
 /// (`analyze_random_effects` → `BoolGraphAnalyzer.top_result()`,
-/// `graphanalyze.py:117`).  Turning the arm on therefore propagates
+/// `graphanalyze.py`).  Turning the arm on therefore propagates
 /// `EF_RANDOM_EFFECTS` up through every caller that transitively reaches
 /// one of pyre's hook pointers, and `getcalldescr`'s elidable
-/// post-condition (`call.py:326-332`) then rejects the first
+/// post-condition (`call.py`) then rejects the first
 /// `#[elidable_cannot_raise]` helper that does:
 ///
 /// ```text
@@ -32598,7 +32588,7 @@ fn trait_method_owner(fd: &FunDecl) -> Option<(String, String)> {
 /// Only the first is a dispatch; each of the others stands for exactly one
 /// implementation, and a family of one has nothing to select.
 ///
-/// `rpbc.py:212-217` splits the same two cases on whether the row's function
+/// `rpbc.py` splits the same two cases on whether the row's function
 /// came out constant — `if isinstance(vlist[0], Constant): v =
 /// hop.genop('direct_call', vlist, ...)`, and only the `else` arm appends the
 /// row of graphs and emits `indirect_call`.
@@ -32664,7 +32654,7 @@ fn abstract_trait_call_target(reg: &RegularCall, llbc: &Llbc) -> Option<(String,
 /// This covers both `#[repr(transparent)]` wrappers and payload-free enums.
 /// The latter are represented by their integer discriminant in the translated
 /// graph.  PyPy's corresponding buffer requests are integer `BUF_*` flags
-/// (`pypy/interpreter/baseobjspace.py:1650-1683`); Rust packages the same
+/// (`pypy/interpreter/baseobjspace.py`); Rust packages the same
 /// decisions as inherent helpers on a scalar tag.  Those helpers remain
 /// ordinary statically selected functions, not Python method lookups on the
 /// integer.
@@ -33097,7 +33087,7 @@ fn float_consts_value(name: &str) -> Option<f64> {
 /// Rust's `offset_of!(TypedItemsBlock, items)` initializer opaque, but the
 /// translated lltype fixes the same layout structurally: a length header
 /// followed inline by the `GcArray(Signed|Float)` items
-/// (`get_itemarray_lowleveltype`, `rlist.py:84`).
+/// (`get_itemarray_lowleveltype`, `rlist.py`).
 ///
 /// The derivation is `align_of::<u64>()` padding of that header, not "one
 /// target word": the Rust body is `#[repr(C)] { capacity: usize, items:
@@ -36756,7 +36746,7 @@ fn emit_fmt_expansion_ops(
 }
 
 /// Expand a byte-only `{:02x}` placeholder to the nibble lookup PyPy uses in
-/// `bytearrayobject.py::descr_repr` (`bytearrayobject.py:286-290`):
+/// `bytearrayobject.py::descr_repr` (`bytearrayobject.py`):
 ///
 /// ```python
 ///             elif not '\x20' <= c < '\x7f':
@@ -38375,7 +38365,7 @@ fn rewrite_debug_enum_fmt_site(graph: &mut FunctionGraph, site: &DebugEnumFmtCol
         }
     }
 
-    // --- All structural checks passed; mutate the graph. ---
+    // All structural checks passed; mutate the graph.
 
     // Drop the residual `alloc::fmt::format` op (its block tail).  A
     // fieldless enum is `Int`-valued (`tyref_to_value_type`), so its value
@@ -43191,7 +43181,7 @@ mod tests {
                 "{fname}: checked narrowing must not remain an opaque core call"
             );
             // `or`, not a sum: `c_int_w` writes
-            // `value < INT_MIN or value > INT_MAX` (`baseobjspace.py:2066`).
+            // `value < INT_MIN or value > INT_MAX` (`baseobjspace.py`).
             for expected in ["lt", "gt", "or"] {
                 assert!(
                     graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {

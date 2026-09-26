@@ -1025,7 +1025,7 @@ fn init_iobase_type(ns: PyObjectRef) {
 ///
 /// `typedef.py generic_new_descr` allocates the instance and then runs
 /// the interp-level `W_IOBase.__init__`, whose only effects are
-/// `interp_iobase.py:61-64` — hand the stream to the autoflusher, and put it on
+/// `interp_iobase.py` — hand the stream to the autoflusher, and put it on
 /// the finalizer queue so an unclosed one still flushes and closes once it
 /// becomes unreachable. Because
 /// it sits in `__new__` rather than in the app-level `__init__`, a subclass

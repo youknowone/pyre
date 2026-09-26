@@ -522,7 +522,7 @@ unsafe fn callback_free_set_op<T>(
 /// keeps an orphaned box alive across the callbacks.  The table borrow ends
 /// before equality can call user code; a callback that grows or reorders the
 /// captured box restarts the scan (`ll_dict_lookup` paranoia,
-/// `rordereddict.py:1058`).  The generation counter is exact here, not a
+/// `rordereddict.py`).  The generation counter is exact here, not a
 /// proxy: it is bumped by every compaction and reindex, the only two things
 /// that move an entry out from under a slot number.
 unsafe fn scan_set_key_reentrant(
@@ -558,7 +558,7 @@ unsafe fn scan_set_key_reentrant(
                 // `ll_dict_lookup` restarts even when the comparison answered
                 // `true`, because a callback that reallocated the buffer or moved
                 // the candidate leaves the matched index stale
-                // (`rordereddict.py:1058`).
+                // (`rordereddict.py`).
                 let disturbed = (*items).generation() != generation
                     // `entries.valid(index) && entries[index].key == checkingkey`.
                     || !(*items).get_slot(slot).is_some_and(|(stored, _)| {

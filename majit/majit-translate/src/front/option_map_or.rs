@@ -85,7 +85,7 @@ pub(crate) struct MapOrSite {
     /// The concrete RPython instance class carried by a reference payload.
     /// The synthesized tuple writer uses it to retain the field annotation
     /// that `InstanceRepr._setup_repr` consumes
-    /// (`rpython/rtyper/rclass.py:501-509`).
+    /// (`rpython/rtyper/rclass.py`).
     pub payload_class_root: Option<String>,
     /// The `map_or` result `U` projected to a [`ValueType`] — the `call_once`
     /// result kind and the select result kind.
@@ -214,7 +214,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
         }
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     // `then_bb` (`Some`) carries `carried` plus `opt` (the base for the
     // `__pos_0` read) and `env` (the `call_once` receiver); `else_bb` (`None`)
@@ -282,7 +282,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
     // Preserve the source instance annotation at the producing write.  This
     // is the same ordinary narrowing used for pointer-valued call results;
     // weakening the shared Tuple field would diverge from RPython's concrete
-    // `InstanceRepr` field setup (`rclass.py:501-509`).
+    // `InstanceRepr` field setup (`rclass.py`).
     let payload = emit_narrow(graph, then_bb, payload, &site.payload_class_root);
     graph.block_mut(then_bb).operations.push(SpaceOperation {
         result: None,

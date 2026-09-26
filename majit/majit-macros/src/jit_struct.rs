@@ -96,7 +96,7 @@ pub(crate) fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
             /// def_path` def-paths and the macro-emitted runtime
             /// registration share a single `path_hash` namespace.  PyPy
             /// has no crate boundary in its `lltype.Struct` identity
-            /// (`descr.py:105 cache[STRUCT]`); the strip aligns pyre
+            /// (`descr.py cache[STRUCT]`); the strip aligns pyre
             /// with that convention.
             pub fn __majit_type_id() -> u64 {
                 ::majit_ir::descr::path_hash_stripped_crate(
@@ -110,7 +110,7 @@ pub(crate) fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 #( #field_names ),*
             ];
 
-            /// descr.py:105-127 + :218-239 auto-discovery.
+            /// descr.py get_size_descr + :218-239 auto-discovery.
             ///
             /// Registers this struct's SizeDescr plus one FieldDescr per named
             /// field into `gc_cache`. Idempotent via the `_cache_size` /

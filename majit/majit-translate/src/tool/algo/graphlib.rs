@@ -814,7 +814,7 @@ mod tests {
         edges
     }
 
-    // ---- existing edge-level unit tests, on the shared Rc edges ----
+    // existing edge-level unit tests, on the shared Rc edges
 
     #[test]
     fn make_edge_dict_files_sources_and_seeds_targets() {
@@ -867,7 +867,7 @@ mod tests {
         all_cycles(&1, &vertices, &edges);
     }
 
-    // ---- TestSimple ports (test_graphlib.py) ----
+    // TestSimple ports (test_graphlib.py)
 
     #[test]
     fn test_depth_first_search() {

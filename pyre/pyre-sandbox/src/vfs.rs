@@ -93,7 +93,7 @@ pub struct FSObjectState {
     st_ino: Cell<Option<u64>>,
 }
 
-// vfs.py:10
+// vfs.py FSObject
 pub trait FSObject {
     // Rust support for vfs.py:15
     fn state(&self) -> &FSObjectState;
@@ -106,7 +106,7 @@ pub trait FSObject {
         true
     }
 
-    // vfs.py:13
+    // vfs.py stat
     fn stat(&self) -> VfsResult<StatResult> {
         let st_ino = match self.state().st_ino.get() {
             Some(st_ino) => st_ino,
@@ -142,7 +142,7 @@ pub trait FSObject {
         })
     }
 
-    // vfs.py:40
+    // vfs.py access
     fn access(&self, mode: Mode) -> VfsResult<bool> {
         let s = self.stat()?;
         let mut e_mode = s.st_mode & ModeBits::IRWXO.bits();
@@ -155,7 +155,7 @@ pub trait FSObject {
         Ok((e_mode & mode) == mode)
     }
 
-    // vfs.py:49
+    // vfs.py keys
     fn keys(&self) -> VfsResult<Vec<String>> {
         Err(VfsError {
             errno: ENOTDIR,
@@ -173,7 +173,7 @@ pub trait FSObject {
         })
     }
 
-    // vfs.py:52
+    // vfs.py open
     fn open(&self) -> VfsResult<Box<dyn ReadSeek>> {
         Err(VfsError {
             errno: EACCES,
@@ -181,13 +181,13 @@ pub trait FSObject {
         })
     }
 
-    // vfs.py:55
+    // vfs.py getsize
     fn getsize(&self) -> VfsResult<u64> {
         Ok(0)
     }
 }
 
-// vfs.py:59
+// vfs.py Dir
 #[derive(Default)]
 pub struct Dir {
     state: FSObjectState,
@@ -195,7 +195,7 @@ pub struct Dir {
 }
 
 impl Dir {
-    // vfs.py:61
+    // vfs.py __init__
     pub fn new(entries: IndexMap<String, FsNode>) -> Self {
         Self {
             state: FSObjectState::default(),
@@ -215,12 +215,12 @@ impl FSObject for Dir {
         ModeBits::IFDIR.bits()
     }
 
-    // vfs.py:63
+    // vfs.py keys
     fn keys(&self) -> VfsResult<Vec<String>> {
         Ok(self.entries.keys().cloned().collect())
     }
 
-    // vfs.py:65
+    // vfs.py join
     fn join(&self, name: &str) -> VfsResult<FsNode> {
         self.entries.get(name).cloned().ok_or_else(|| VfsError {
             errno: ENOENT,
@@ -229,7 +229,7 @@ impl FSObject for Dir {
     }
 }
 
-// vfs.py:71
+// vfs.py RealDir
 pub struct RealDir {
     state: FSObjectState,
     pub path: PathBuf,
@@ -239,7 +239,7 @@ pub struct RealDir {
 }
 
 impl RealDir {
-    // vfs.py:79
+    // vfs.py __init__
     pub fn new(
         path: impl Into<PathBuf>,
         show_dotfiles: bool,
@@ -258,7 +258,7 @@ impl RealDir {
         }
     }
 
-    // vfs.py:85
+    // vfs.py __repr__
     pub fn repr(&self) -> String {
         format!("<RealDir {}>", self.path.display())
     }
@@ -275,7 +275,7 @@ impl FSObject for RealDir {
         ModeBits::IFDIR.bits()
     }
 
-    // vfs.py:87
+    // vfs.py keys
     fn keys(&self) -> VfsResult<Vec<String>> {
         let mut names = Vec::new();
         for entry in fs::read_dir(&self.path)
@@ -297,10 +297,10 @@ impl FSObject for RealDir {
         Ok(names)
     }
 
-    // vfs.py:94
+    // vfs.py join
     //
     // Sandbox-hardening deviation from RPython upstream
-    // `rpython/translator/sandbox/vfs.py:94`, which does a bare
+    // `rpython/translator/sandbox/vfs.py join`, which does a bare
     // `os.path.join(self.path, name)`.  RPython's sandbox is a separate
     // trusted parent process that intercepts every syscall; pyre's VFS
     // runs in-process so we must reject any `name` that would escape the
@@ -369,14 +369,14 @@ impl FSObject for RealDir {
     }
 }
 
-// vfs.py:115
+// vfs.py File
 pub struct File {
     state: FSObjectState,
     pub data: Vec<u8>,
 }
 
 impl File {
-    // vfs.py:117
+    // vfs.py __init__
     pub fn new(data: impl AsRef<[u8]>) -> Self {
         Self {
             state: FSObjectState::default(),
@@ -396,18 +396,18 @@ impl FSObject for File {
         ModeBits::IFREG.bits()
     }
 
-    // vfs.py:119
+    // vfs.py getsize
     fn getsize(&self) -> VfsResult<u64> {
         Ok(self.data.len() as u64)
     }
 
-    // vfs.py:121
+    // vfs.py open
     fn open(&self) -> VfsResult<Box<dyn ReadSeek>> {
         Ok(Box::new(Cursor::new(self.data.clone())))
     }
 }
 
-// vfs.py:125
+// vfs.py RealFile
 pub struct RealFile {
     state: FSObjectState,
     pub path: PathBuf,
@@ -415,7 +415,7 @@ pub struct RealFile {
 }
 
 impl RealFile {
-    // vfs.py:126
+    // vfs.py __init__
     pub fn new(path: impl Into<PathBuf>, mode: Mode) -> Self {
         Self {
             state: FSObjectState::default(),
@@ -424,7 +424,7 @@ impl RealFile {
         }
     }
 
-    // vfs.py:129
+    // vfs.py __repr__
     pub fn repr(&self) -> String {
         format!("<RealFile {}>", self.path.display())
     }
@@ -441,14 +441,14 @@ impl FSObject for RealFile {
         self.kind
     }
 
-    // vfs.py:131
+    // vfs.py getsize
     fn getsize(&self) -> VfsResult<u64> {
         fs::metadata(&self.path)
             .map(|st| st.len())
             .map_err(|err| io_error(err, self.path.display().to_string()))
     }
 
-    // vfs.py:133
+    // vfs.py open
     fn open(&self) -> VfsResult<Box<dyn ReadSeek>> {
         fs::File::open(&self.path)
             .map(|file| Box::new(file) as Box<dyn ReadSeek>)
@@ -543,7 +543,7 @@ mod tests {
         assert!(!f.access(W_OK).unwrap());
     }
 
-    // test_vfs.py:51 — RealDir/RealFile keys + join + read.
+    // test_vfs.py test_realdir_realfile — RealDir/RealFile keys + join + read.
     #[test]
     fn test_realdir_realfile() {
         let tmp = tempfile::tempdir().unwrap();

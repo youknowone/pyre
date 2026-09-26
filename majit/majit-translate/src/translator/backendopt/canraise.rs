@@ -22,7 +22,7 @@ use crate::translator::rtyper::lltypesystem::lltype::_func;
 use crate::translator::translator::TranslationContext;
 
 /// `class RaiseAnalyzer(graphanalyze.BoolGraphAnalyzer)` at
-/// `canraise.py:8-46`.
+/// `canraise.py`.
 pub struct RaiseAnalyzer<'t> {
     translator: &'t TranslationContext,
     /// Upstream `RaiseAnalyzer.ignore_exact_class = None` at
@@ -50,7 +50,7 @@ impl<'t> RaiseAnalyzer<'t> {
     }
 
     /// `can_raise(self, op, seen=None)` — backward-compatible
-    /// interface at `canraise.py:43-45`.
+    /// interface at `canraise.py`.
     pub fn can_raise(
         &mut self,
         op: &SpaceOperation,
@@ -305,7 +305,7 @@ mod tests {
     }
 
     /// `analyze_exceptblock_in_graph` reraise-of-caught suppression
-    /// (`canraise.py:27-41`) exercised directly on a flowspace graph.
+    /// (`canraise.py`) exercised directly on a flowspace graph.
     ///
     /// Exercises the suppression on a graph built directly in the flowspace
     /// model, depending on neither the flat `crate::model` graph nor the
@@ -379,7 +379,7 @@ mod tests {
         );
 
         // do_ignore_memory_error: the re-raise of the caught exception is
-        // suppressed (canraise.py:33-40), so the graph no longer raises.
+        // suppressed (canraise.py), so the graph no longer raises.
         let mut ignore = RaiseAnalyzer::new(&translator);
         ignore.do_ignore_memory_error();
         assert!(

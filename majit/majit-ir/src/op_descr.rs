@@ -340,7 +340,7 @@ impl Op {
     /// `resoperation.py AbstractResOp.initarglist` parity — bulk
     /// store the operand list.  In RPython this is "supposed to be
     /// called only just after the ResOp has been created"
-    /// (resoperation.py:278); pyre matches both the name and intent.
+    /// (resoperation.py); pyre matches both the name and intent.
     ///
     /// One existing post-creation caller in upstream:
     /// `unroll.py:301 label_op.initarglist(label_op.getarglist() +

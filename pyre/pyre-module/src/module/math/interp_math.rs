@@ -1734,7 +1734,7 @@ pub fn isqrt(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn fsum(args: &[PyObjectRef]) -> PyResult {
-    // interp_math.py:572-633: consume the iterator once while maintaining the
+    // interp_math.py fsum: consume the iterator once while maintaining the
     // partials array.  The old port first materialized every boxed element and
     // then built a second Vec<f64>; besides diverging from upstream, that kept
     // one shadow-stack root per input alive until the entire iterable had been

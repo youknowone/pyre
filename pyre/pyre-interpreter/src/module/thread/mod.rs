@@ -272,7 +272,7 @@ pub fn runtime_thread_entered() -> bool {
 /// the saved `errno`, meaningful exactly when the call reports failure.
 ///
 /// The read belongs inside the released window because `_errno_after` runs
-/// ahead of `rgil.acquire()` (rffi.py:207-210).  Taking the GIL back can enter
+/// ahead of `rgil.acquire()` (rffi.py).  Taking the GIL back can enter
 /// the stealer loop, whose mutex and condvar waits overwrite `errno`, so a
 /// caller reading it after the guard drops can see the wrong value.
 ///
@@ -1337,7 +1337,7 @@ mod rlock_class {
             let owner = unsafe { w_int_get_value(items[1]) };
             // os_lock.py `self.lock.acquire(True)` reaches
             // `RPyThreadAcquireLockTimed` with `intr_flag=0`
-            // (rthread.py:169-174), so an interrupted wait is retried rather
+            // (rthread.py), so an interrupted wait is retried rather
             // than reported: restoring a saved state is not a place where a
             // signal may be delivered.
             while self.acquire_timed(-1, owner) != RPY_LOCK_ACQUIRED {}
@@ -1579,7 +1579,7 @@ mod local_class {
     /// the current OS-thread ExecutionContext.
     ///
     /// `initargs` and `initkwargs` are `Local.__init__`'s `self.initargs`
-    /// (os_local.py:25).  Upstream keeps one `Arguments`; pyre's call surface
+    /// (os_local.py).  Upstream keeps one `Arguments`; pyre's call surface
     /// takes the positional and keyword halves separately, so they are stored as
     /// the positional tuple and the construction call's keyword mapping (null
     /// when it had none), and `create_new_dict` replays the call from both.
@@ -1760,7 +1760,7 @@ mod local_class {
                 // `create_new_dict` replays that call on every further thread.
                 // os_local.py runs this ahead of `allocate_instance`, so a
                 // refused construction never reaches `_register_in_ec`
-                // (os_local.py:40).
+                // (os_local.py).
                 let w_parent_init = unsafe { crate::baseobjspace::lookup_where(cls, "__init__") }
                     .map(|(w_where, _)| w_where);
                 if w_parent_init == Some(crate::typedef::w_object()) {

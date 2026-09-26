@@ -604,7 +604,7 @@ pub struct ExecutionContext {
     // EC construction time — runtime mutations to `__builtins__`
     // weren't visible to new frames.  Reading the live storage from
     // `builtins_module` each call removes the double-storage gap.
-    /// Cached dict wrapper over `self.builtins` — pyframe.py:200-204
+    /// Cached dict wrapper over `self.builtins` — pyframe.py
     /// `space.builtin` returns the same object every call.
     builtin_dict_cache: std::cell::Cell<PyObjectRef>,
     /// `pypy/interpreter/baseobjspace.py` `space.check_signal_action` —
@@ -721,7 +721,7 @@ pub const EC_CURRENT_GEN_OR_COROUTINE_OFFSET: usize =
 /// Byte offset of `topframeref` within `ExecutionContext`, for the JIT's
 /// GETFIELD_GC/SETFIELD_GC lowering of [`ExecutionContext::enter`] /
 /// [`ExecutionContext::leave`] at an inlined call.  The traced sequence is
-/// `executioncontext.py:88-89` — read the slot into the callee's `f_backref`,
+/// `executioncontext.py` — read the slot into the callee's `f_backref`,
 /// then store the callee's `jit.virtual_ref` back into it.
 pub const EC_TOPFRAMEREF_OFFSET: usize = std::mem::offset_of!(ExecutionContext, topframeref);
 
@@ -975,7 +975,7 @@ impl ExecutionContext {
 
     /// `self.topframeref()` without the virtualizable force that
     /// [`Self::gettopframe`] adds — "raw" is about `force_frame`, not about the
-    /// vref.  The vref force is not optional: `executioncontext.py:68/72/446/451`
+    /// vref.  The vref force is not optional: `executioncontext.py/72/446/451`
     /// all read the slot *with* the parens, and the only unforced reads upstream
     /// are `:88`/`:96`, which move the vref along rather than dereference it.
     /// A `JitVirtualRef` handed out here would be dereferenced at `PyFrame`
@@ -1579,7 +1579,7 @@ impl ExecutionContext {
         self.sys_exc_value = pyre_object::PY_NULL;
     }
 
-    /// `executioncontext.py:254-259` — exchange the caller's active handler
+    /// `executioncontext.py push_gen_or_coroutine` — exchange the caller's active handler
     /// exception with the exception suspended on `gen`, then link `gen` as
     /// the current generator/coroutine.
     pub fn push_gen_or_coroutine(&mut self, generator: PyObjectRef) {
@@ -1597,7 +1597,7 @@ impl ExecutionContext {
         self.current_gen_or_coroutine = generator;
     }
 
-    /// `executioncontext.py:261-267` — unlink `gen`, park the exception state
+    /// `executioncontext.py pop_gen_or_coroutine` — unlink `gen`, park the exception state
     /// produced by its frame on the generator, and restore its caller's state.
     pub fn pop_gen_or_coroutine(&mut self, generator: PyObjectRef) {
         debug_assert_eq!(self.current_gen_or_coroutine, generator);
@@ -2064,7 +2064,7 @@ impl ExecutionContext {
         // `pypy/interpreter/module.py:Module.__init__` — `space.builtin`
         // is a `Module` whose `w_dict` is the `W_ModuleDictObject`
         // allocated by `allocate_and_init_instance(module=True)`
-        // (`dictmultiobject.py:60-69`).  Pyre's
+        // (`dictmultiobject.py`).  Pyre's
         // `new_builtin_module_dict` already populated the
         // W_ModuleDictObject in `self.builtins_module`; wrap it
         // through `w_module_new_aliasing_dict` without a raw storage
@@ -2436,7 +2436,7 @@ pub trait ActionFlagOps {
         }
         // executioncontext.py:543-556 — nonperiodic bit-mask scan.
         // Clear each bit before perform() so a fire() during perform()
-        // re-arms cleanly (NB at executioncontext.py:544-549).
+        // re-arms cleanly (NB at executioncontext.py).
         if self.abstract_flag()._fired_bitmask != 0 {
             let nactions = self.abstract_flag()._nonperiodic_actions.len();
             for i in 0..nactions {
@@ -2618,7 +2618,7 @@ impl ActionFlagOps for ActionFlag {
 /// Stable reference to the process-owned `space.actionflag`.
 ///
 /// PyPy stores one `ActionFlag` on `ObjSpace` and every execution context
-/// reaches it through `self.space.actionflag` (`executioncontext.py:163-165`).
+/// reaches it through `self.space.actionflag` (`executioncontext.py`).
 /// Pyre's opaque `PyObjectRef` space has no typed Rust fields yet, so the
 /// process runtime owns the equivalent allocation and each EC carries this
 /// thin reference.  The GIL serializes interpreter access just as it does for
@@ -2736,7 +2736,7 @@ pub struct AsyncAction {
     /// pypy/interpreter/executioncontext.py `AsyncAction.fire`
     /// uses `self.space.actionflag` — a constant lookup once the action
     /// is constructed because PyPy's `space.actionflag` is set once at
-    /// `pypy/interpreter/baseobjspace.py:447` and never replaced.
+    /// `pypy/interpreter/baseobjspace.py` and never replaced.
     /// Pyre's EC stores a thin reference to the process-owned flag, so we cache
     /// the registering reference here (`AsyncAction::new` /
     /// `UserDelAction::new` / `AsyncActionOps::register_periodic_action`).
@@ -2937,7 +2937,7 @@ pub trait AsyncActionOps {
         let action_ptr: *mut dyn AsyncActionOps = self;
         // executioncontext.py — `self.space.actionflag.fire(self)`.
         // The trait dispatch reaches the `ActionFlagOps::fire` default
-        // body at line 1454 (which encodes executioncontext.py:482-490
+        // body at line 1454 (which encodes executioncontext.py
         // `AbstractActionFlag.fire`).
         unsafe { (*actionflag).fire(action_ptr) };
     }
@@ -2971,10 +2971,10 @@ impl AsyncActionOps for AsyncAction {
 /// PyPy's class hierarchy) can be registered as periodic.  PyPy
 /// guards the same constraint at runtime with
 /// `assert isinstance(action, PeriodicAsyncAction)` in
-/// `executioncontext.py:502`; pyre lifts the assertion to the type
+/// `executioncontext.py`; pyre lifts the assertion to the type
 /// system.
 pub trait PeriodicAsyncActionOps: AsyncActionOps {
-    /// pypy/interpreter/executioncontext.py:594-600 `else` branch
+    /// pypy/interpreter/executioncontext.py AsyncAction `else` branch
     /// helper: subclasses of `PeriodicAsyncAction` call
     /// `space.actionflag.register_periodic_action(self, ...)` after
     /// `__init__`.  Lifted into this subtrait so the
@@ -2992,7 +2992,7 @@ pub trait PeriodicAsyncActionOps: AsyncActionOps {
         // on the base AsyncAction so `fire()` can reach it without a
         // TLS lookup.  PyPy's `self.space.actionflag` is a constant
         // lookup once `space.actionflag` is set at
-        // `pypy/interpreter/baseobjspace.py:447` and never replaced;
+        // `pypy/interpreter/baseobjspace.py` and never replaced;
         // storing the resolved pointer here is the same caching the
         // PyPy implementation does implicitly.
         self.async_action_mut().actionflag = actionflag as *mut dyn ActionFlagOps;
@@ -3027,7 +3027,7 @@ impl PeriodicAsyncAction {
     // — it must be reached through the concrete subclass's vtable so
     // the registered fat pointer's `perform` slot points to the
     // override, not `PeriodicAsyncAction::perform` (which is a no-op
-    // per `executioncontext.py:612-615`).  Never call
+    // per `executioncontext.py`).  Never call
     // `PeriodicAsyncAction(...).register_periodic_action(...)`
     // directly without a concrete subclass.
 }
@@ -3235,7 +3235,7 @@ impl UserDelAction {
         if pyre_object::generator::AsyncGenASend::from_obj(current()).is_some()
             || pyre_object::generator::AsyncGenAThrow::from_obj(current()).is_some()
         {
-            // executioncontext.py:651-661 — a finalizer that would call a
+            // executioncontext.py gc_disabled — a finalizer that would call a
             // user-defined app-level function defers under `gc.disable()`.
             // This one emits a RuntimeWarning, so it reaches the overridable
             // `warnings` machinery, exactly like the generator branch below.
@@ -3325,7 +3325,7 @@ impl UserDelAction {
     }
 }
 
-/// pypy/interpreter/executioncontext.py:618-633 — `class
+/// pypy/interpreter/executioncontext.py PeriodicAsyncAction — `class
 /// UserDelAction(AsyncAction)`.  `perform` (line 632-633) calls
 /// `self._run_finalizers()`.
 impl AsyncActionOps for UserDelAction {
@@ -3356,7 +3356,7 @@ impl AsyncActionOps for UserDelAction {
 ///
 /// Separate from [`UserDelAction`] because it is a different queue with a
 /// different trigger: the collector fires this one from
-/// `incminimark.py:3248-3250` when a raw-refcount link has died, and the
+/// `incminimark.py rrc_invoke_callback` when a raw-refcount link has died, and the
 /// deallocator it runs is a C function rather than an app-level `__del__`.
 #[cfg(all(
     feature = "cpyext",

@@ -446,7 +446,7 @@ const WAIT_TIMEOUT: u32 = 258;
 /// `#[cfg(unix)]` body and its Windows twin declines — so there is no SIGINT
 /// flag for an event to stand beside, the slot stays empty, and a wait runs to
 /// its timeout instead of ending in `InterruptedError`.  Wiring one in belongs
-/// with Windows signal delivery, not here; `lib_pypy/_winapi.py:379` leaves
+/// with Windows signal delivery, not here; `lib_pypy/_winapi.py` leaves
 /// the same gap.
 #[pyre_interpreter::pyre_function]
 pub fn WaitForMultipleObjects(

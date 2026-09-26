@@ -1,9 +1,9 @@
 //! Dormant jd1 (`unpackiterable_driver`) symbolic + `JitState` scaffolding.
 //!
-//! `baseobjspace.py:29`
+//! `baseobjspace.py`
 //! `unpackiterable_driver = JitDriver(greens=['greenkey'], reds='auto', ...)`
 //! drives the unknown-length unpack loop `unpackiterable_portal`
-//! (`baseobjspace.py:1003-1024`, merge at `:1012`). This module supplies the
+//! (`baseobjspace.py`, merge at `:1012`). This module supplies the
 //! *dormant* second-driver types for the generic LLBC meta-tracer, via
 //! [`UnpackJitState`]'s [`JitState`] implementation, without touching jd0's
 //! `state.rs`:
@@ -63,7 +63,7 @@ impl JitCodeSym for UnpackSym {
         // The `jit_merge_point` byte offset shifts with the extracted drain
         // body's op layout (e.g. how the `unpackiterable_driver` receiver read
         // lowers), so discover it rather than hardcode.  The drain loop carries
-        // exactly one merge point (`baseobjspace.py:1012`, no `can_enter_jit`).
+        // exactly one merge point (`baseobjspace.py`, no `can_enter_jit`).
         let canonical =
             crate::jitcode_runtime::portal_jitcode_for_key("baseobjspace::unpackiterable_portal")
                 .expect("jd1 portal jitcode must be registered");
@@ -117,9 +117,9 @@ impl UnpackJitState {
         sd.name = "unpackiterable".into();
         // baseobjspace.py `unpackiterable_driver` = reds='auto', only a
         // `jit_merge_point` in the `while True` drain (no `can_enter_jit`, no
-        // `loop_header`). warmspot.py:762-790 leaves `no_loop_header` at its
+        // `loop_header`). warmspot.py rewrite_can_enter_jits leaves `no_loop_header` at its
         // `True` default for such a driver, so `opimpl_jit_merge_point`
-        // (pyjitpl.py:1550) auto-adds the loop header unconditionally — the
+        // (pyjitpl.py) auto-adds the loop header unconditionally — the
         // first trace closes the loop on the `goto` back-edge instead of
         // unrolling the whole drain to the StopIteration finish.
         sd.no_loop_header = true;

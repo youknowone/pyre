@@ -191,7 +191,7 @@ fn rewire_one_unwrap_site(
         }
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     // `payload_bb` carries `carried` plus `recv` (the base for the `__pos_0`
     // read); `failure_bb` has no inputs — it raises. The source-var list also

@@ -53,7 +53,7 @@ bitflags::bitflags! {
 ///
 /// `JC_DONT_TRACE_HERE` is deliberately NOT one of them.  It is orthogonal to
 /// the lifecycle: a denied cell keeps tracing, compiles, and is invalidated
-/// like any other, and `warmstate.py:485-496` retraces it once its procedure
+/// like any other, and `warmstate.py` retraces it once its procedure
 /// token dies.  Modelling it as a state made the flag and the state answer the
 /// same question differently — a cell denied while `JC_TRACING` was set kept
 /// the flag but never took the state, so every reader that asked the state
@@ -85,7 +85,7 @@ pub struct BaseJitCell {
     /// Upstream has no such field. It is a diagnostics mirror only: the
     /// question "did this cell ever have a procedure token" is answered by the
     /// weakref slot itself ([`Self::has_seen_a_procedure_token`],
-    /// warmstate.py:198-199), not from here — a number cannot stop being set
+    /// warmstate.py), not from here — a number cannot stop being set
     /// when the token it names dies, which is the state
     /// `should_remove_jitcell` has to be able to see (warmstate.py).
     pub token: Option<u64>,
@@ -100,10 +100,10 @@ pub struct BaseJitCell {
     /// [`Self::has_seen_a_procedure_token`] distinguishes; `Some` holding a
     /// weak that no longer upgrades is upstream's *dead weakref*, which is
     /// what makes `should_remove_jitcell`'s `JC_DONT_TRACE_HERE` arm
-    /// (`warmstate.py:217-221`) able to expire a cell at all.
+    /// (`warmstate.py`) able to expire a cell at all.
     ///
     /// `MemoryManager::alive_loops` is therefore the sole long-lived strong
-    /// owner (`memmgr.py:9-14`), matching `memmgr.rs`'s own header; the other
+    /// owner (`memmgr.py`), matching `memmgr.rs`'s own header; the other
     /// weak handle on the same token is `CompiledEntry::token`.  Every writer
     /// of this field must have registered its token with the memory manager
     /// first, or the token dies before first entry and this cell answers
@@ -135,7 +135,7 @@ pub struct BaseJitCell {
     /// (warmstate.py) resolves greens + `comparekey` + `get_uhash`
     /// *together* into a cell object and then carries **that object** to the
     /// executor (`raise EnterJitAssembler(procedure_token, ...)`,
-    /// warmstate.py:483/:511), so nothing downstream re-derives which cell was
+    /// warmstate.py/:511), so nothing downstream re-derives which cell was
     /// meant. Pyre carries a `u64` instead, and a green-key hash does not name
     /// a cell when two cells answer to it — two cells, one number. The cell key
     /// restores the missing half of the identity: it is
@@ -148,7 +148,7 @@ pub struct BaseJitCell {
     ///
     /// Either way [`WarmEnterState::bucket_of`] maps it back to the raw hash,
     /// which is what lets a reader holding only a number tell this cell from
-    /// the neighbours the table's index truncation (counter.py:128-135) put in
+    /// the neighbours the table's index truncation (counter.py _get_index) put in
     /// the same chain.
     ///
     /// `None` only between [`BaseJitCell::new`] and the
@@ -169,7 +169,7 @@ pub struct BaseJitCell {
     ///
     /// Meaningless while `cell_key` is `None`, and read only beside it.
     pub cell_bucket: u64,
-    /// warmstate.py:568-582 — typed green-key carried per-cell so
+    /// warmstate.py JitCell — typed green-key carried per-cell so
     /// `JitCell.comparekey(*greenargs2)` can do per-green typed
     /// equality across hash collisions:
     ///
@@ -194,7 +194,7 @@ pub struct BaseJitCell {
     pub comparekey: Option<GreenKey>,
     /// Owns the `Ref`-typed referents named by `comparekey`, for exactly this
     /// cell's lifetime — the `setattr` half of `JitCell.__init__`
-    /// (warmstate.py:568-573), which pyre stored as a bare `i64` and so never
+    /// (warmstate.py), which pyre stored as a bare `i64` and so never
     /// owned. Without it a referent can be freed and its address reused by a
     /// different object, whose green key is then byte-identical to the dead
     /// one's; `comparekey_matches` returns `true` and the new object silently
@@ -337,7 +337,7 @@ impl BaseJitCell {
     /// **Precondition every caller owes**: `loop_token` is a WEAK handle
     /// (`warmstate.py:188`), so this method takes NO ownership of `loop_token`.
     /// The token must already be registered with `MemoryManager`
-    /// (`memmgr.py:9-14`) — upstream's producers do it at
+    /// (`memmgr.py`) — upstream's producers do it at
     /// `compile.py:566-567` and `compile.py:1148-1149`, and pyre's are
     /// `compile_loop_body` / `compile_retrace` / `finish_and_compile` /
     /// `compile_simple_loop` / `compile_entry_bridge` (each calls
@@ -636,7 +636,7 @@ pub struct JitStats {
 /// The distinction exists because pyre carries a `u64` where upstream carries
 /// the cell object. `maybe_compile_and_run` (warmstate.py) resolves
 /// greens + `comparekey` + `get_uhash` together into a cell and then hands
-/// *that cell's* procedure token to the executor (warmstate.py:483/:511:
+/// *that cell's* procedure token to the executor (warmstate.py/:511:
 /// `raise EnterJitAssembler(procedure_token, *execute_args)`) rather than
 /// handing on a key for a second lookup — which is why upstream has no second
 /// reader that can disagree with the first. Pyre restores that property by
@@ -646,7 +646,7 @@ pub struct JitStats {
 /// `compiled_loops`, `JitCellToken::green_key` and `rd_loop_token` alike.
 ///
 /// The counter is the deliberate exception: `jitcounter.tick(hash, ...)`
-/// (warmstate.py:467) is indexed by the raw hash upstream, so colliding keys
+/// (warmstate.py) is indexed by the raw hash upstream, so colliding keys
 /// share one back-edge counter. Every counter call here therefore goes through
 /// [`WarmEnterState::bucket_of`] first.
 pub struct WarmEnterState {
@@ -663,11 +663,11 @@ pub struct WarmEnterState {
     ///
     /// The slot is `JitCounter::_get_index(hash)`, which "truncates the hash to
     /// 32 bits, and then keep the *highest* remaining bits"
-    /// (counter.py:128-135) — the same call the timetable is indexed with
+    /// (counter.py) — the same call the timetable is indexed with
     /// (counter.py), which is why the derivation lives on `JitCounter` and
     /// not here. Truncation means one slot collects every green key whose hash
     /// agrees in those bits, not only the keys whose hashes are equal, so a
-    /// chain mixes unrelated green keys by design; `counter.py:27-29` calls the
+    /// chain mixes unrelated green keys by design; `counter.py` calls the
     /// result "non-lossy" because nothing is evicted to make room, not because
     /// a slot belongs to one key.
     ///
@@ -723,7 +723,7 @@ pub struct WarmEnterState {
     // below (warmstate.py — maybe_compile_and_run's tick + reset
     // goes through the common timetable, not a separate HashMap).
 
-    // warmstate.py:299-320 — retrace_limit / max_retrace_guards /
+    // warmstate.py set_param_retrace_limit — retrace_limit / max_retrace_guards /
     // max_unroll_loops / max_unroll_recursion live on
     // warmrunnerdesc.memory_manager, not on WarmEnterState itself. See
     // `MemoryManager` in memmgr.rs.
@@ -758,11 +758,11 @@ pub struct WarmEnterState {
     /// returns `NotHot` above `decay_all_counters`, deliberately — so a cache
     /// keyed on this counter changes nothing but the work spent reaching it.
     cell_generation: u64,
-    /// `warmstate.py:783` `self.jitdriver_sd._confirm_enter_jit_ptr` — the
+    /// `warmstate.py` `self.jitdriver_sd._confirm_enter_jit_ptr` — the
     /// driver's `confirm_enter_jit` callback, or `None` when the declaration
     /// omitted the kwarg (`rlib/jit.py:626,688`).
     ///
-    /// `warmstate.py:784-786` reads the pointer once and substitutes a
+    /// `warmstate.py` reads the pointer once and substitutes a
     /// `return True` closure when it is absent, which is what `None` means
     /// here; [`Self::confirm_enter_jit`] is that substitution.
     ///
@@ -784,7 +784,7 @@ pub enum HotResult {
     /// Threshold reached; start tracing. The caller (MetaInterp) builds
     /// the Trace itself — RPython parity: `MetaInterp.create_empty_history`
     /// / `MetaInterp.create_history` live on `MetaInterp`, not on the
-    /// warmstate (pyjitpl.py:2604-2610). Pyre's prior signal-and-factory
+    /// warmstate (pyjitpl.py). Pyre's prior signal-and-factory
     /// pattern (`HotResult::StartTracing(Trace::new())`) forced warmstate
     /// to depend on the `recorder::Trace` type; the `TraceRecordBuffer`
     /// migration removes
@@ -851,7 +851,7 @@ impl WarmEnterState {
         }
     }
 
-    /// `warmstate.py:425-441` `bound_reached` — the veto, then the mark.
+    /// `warmstate.py` `bound_reached` — the veto, then the mark.
     ///
     /// Every tracing start in this module funnels through here or through its
     /// typed twin: `maybe_compile` and `maybe_compile_with_key` reach it from
@@ -1021,7 +1021,7 @@ impl WarmEnterState {
             }
             // A JC_DONT_TRACE_HERE cell declines here, except when the
             // procedure token it once saw has since been invalidated: that
-            // dead entry must fall through to cleanup_chain (warmstate.py:483-491)
+            // dead entry must fall through to cleanup_chain (warmstate.py)
             // instead of returning early and lingering in the chain.
             if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE)
                 && cell.has_seen_a_procedure_token()
@@ -1181,7 +1181,7 @@ impl WarmEnterState {
             // cell that can never trace again would otherwise decay every
             // OTHER loop's counter once per back edge and hold them below
             // threshold.  Deciding above the decay is upstream's own shape,
-            // not a departure from it — `warmstate.py:427-428` returns on a
+            // not a departure from it — `warmstate.py` returns on a
             // `confirm_enter_jit` veto before reaching `:429`, and this
             // ceiling is the veto in that position.  The answer for this cell
             // is unchanged — `force_start_tracing*` returns `NotHot` for the
@@ -1261,7 +1261,7 @@ impl WarmEnterState {
     /// transitions.
     ///
     /// The bucket-shared counter ticks via `key.get_uhash()` — upstream
-    /// counter is per-bucket too (`warmstate.py:496`), so colliding
+    /// counter is per-bucket too (`warmstate.py`), so colliding
     /// typed greens share the back-edge counter while keeping
     /// independent cell state.
     ///
@@ -1329,7 +1329,7 @@ impl WarmEnterState {
             // cell that can never trace again would otherwise decay every
             // OTHER loop's counter once per back edge and hold them below
             // threshold.  Deciding above the decay is upstream's own shape,
-            // not a departure from it — `warmstate.py:427-428` returns on a
+            // not a departure from it — `warmstate.py` returns on a
             // `confirm_enter_jit` veto before reaching `:429`, and this
             // ceiling is the veto in that position.  The answer for this cell
             // is unchanged — `force_start_tracing*` returns `NotHot` for the
@@ -1785,7 +1785,7 @@ impl WarmEnterState {
     /// surface.
     ///
     /// Returns an OWNED handle, not a borrow out of the celltable: the cell
-    /// holds only a `Weak` now (`warmstate.py:188`), so there is no
+    /// holds only a `Weak` now (`warmstate.py`), so there is no
     /// `Arc<JitCellToken>` inside the table to lend out. The `Arc` this hands
     /// back is what keeps the token alive for the caller's use of it.
     pub fn get_compiled(&self, cell_key: u64) -> Option<Arc<JitCellToken>> {
@@ -1881,7 +1881,7 @@ impl WarmEnterState {
     /// Counting through [`Self::cell_keys_at`] also keeps this reader and
     /// [`Self::sole_cell_key`] on ONE route. Upstream cannot split them: every
     /// reader enters at `jitcounter.lookup_chain(hash)`
-    /// (warmstate.py:459-460, :597-598, :632-633), and `lookup_chain`
+    /// (warmstate.py, :597-598, :632-633), and `lookup_chain`
     /// (counter.py) is a bare `celltable[self._get_index(hash)]`. See
     /// `a_raw_hash_equal_to_a_minted_key_resolves_through_one_bucket`.
     #[inline]
@@ -2011,7 +2011,7 @@ impl WarmEnterState {
     ///
     /// The closure is handed `&mut MemoryManager` because upstream reads it
     /// off `self.warmrunnerdesc.memory_manager` at the same point
-    /// (`warmstate.py:719-721`) and passes it into `compile_tmp_callback`,
+    /// (`warmstate.py`) and passes it into `compile_tmp_callback`,
     /// which registers the fresh token in `alive_loops` (`compile.py:1148`).
     /// Pyre keeps the manager on `WarmEnterState` itself, so the caller cannot
     /// reach it while this method holds `&mut self`; passing it in is what
@@ -2046,7 +2046,7 @@ impl WarmEnterState {
     ///
     /// Equivalent to `get_assembler_token` modulo lookup discipline:
     /// upstream `JitCell.ensure_jit_cell_at_key(greenkey)` walks the
-    /// chain (`warmstate.py:626-641`) and inserts at head on miss.
+    /// chain (`warmstate.py`) and inserts at head on miss.
     /// Pyre's hash-only [`Self::get_assembler_token`] aliases distinct
     /// typed keys that share a hash bucket; this variant disambiguates.
     pub fn get_assembler_token_with_key<E, F>(
@@ -2135,7 +2135,7 @@ impl WarmEnterState {
     /// adaptation).
     ///
     /// TODO: PyPy owns one `JitLogger` on
-    /// `MetaInterpStaticData` (`rlib/rjitlog/rjitlog.py:347-354`) and
+    /// `MetaInterpStaticData` (`rlib/rjitlog/rjitlog.py`) and
     /// `setup_once` re-reads `PYPYLOG` and writes a header.  Pyre's
     /// `Logger` is owned per-`WarmEnterState` instead, so the global
     /// jitlog hook is decomposed into a per-warmstate call that the
@@ -2271,7 +2271,7 @@ impl WarmEnterState {
     /// warmstate.py set_param_loop_longevity — delegates to the
     /// memory manager's max_age.
     pub fn set_param_loop_longevity(&mut self, value: u32) {
-        // memmgr.py:42 default check_frequency=0 → derives sqrt(max_age).
+        // memmgr.py set_max_age default check_frequency=0 → derives sqrt(max_age).
         self.memory_manager.set_max_age(value as i64, 0);
     }
 
@@ -2444,7 +2444,7 @@ impl WarmEnterState {
 
     /// warmstate.py:467 jitcounter.tick(hash, increment_threshold) parity.
     ///
-    /// warmstate.py:256-257: jitcounter.tick(hash, increment_function_threshold).
+    /// warmstate.py set_param_function_threshold: jitcounter.tick(hash, increment_function_threshold).
     ///
     /// The bool half of [`Self::function_entry_step`], kept as its own name
     /// because the mc_diag legend and the tests below are written about it.
@@ -2898,7 +2898,7 @@ impl WarmEnterState {
             "max_unroll_loops" => self.memory_manager.max_unroll_loops = as_u32,
             "max_unroll_recursion" => self.memory_manager.max_unroll_recursion = as_u32,
             "loop_longevity" => self.memory_manager.set_max_age(as_u32 as i64, 0),
-            // warmstate.py:322-329 — vec, vec_all, vec_cost are separate fields
+            // warmstate.py set_param_vec — vec, vec_all, vec_cost are separate fields
             "vec" | "vectorize" => self.vectorize = value != 0,
             "vec_all" => self.vec_all = value != 0,
             "vec_cost" => self.vec_cost = as_u32,
@@ -2937,16 +2937,16 @@ impl WarmEnterState {
         &self.enable_opts
     }
 
-    /// `warmstate.py:783-793` `make_jitdriver_callbacks` —
+    /// `warmstate.py` `make_jitdriver_callbacks` —
     /// `self.confirm_enter_jit`, the callable every veto position calls.
     ///
     /// The driver's own hook when one was declared, and upstream's
     /// `def confirm_enter_jit(*args): return True` substitution
-    /// (`warmstate.py:785-786`) when it was not.
+    /// (`warmstate.py`) when it was not.
     ///
-    /// Called at both of upstream's veto positions: `warmstate.py:427` at the
+    /// Called at both of upstream's veto positions: `warmstate.py` at the
     /// head of `bound_reached`, which is [`Self::start_tracing_cell`] /
-    /// [`Self::start_tracing_cell_for_key`] here, and `warmstate.py:501`
+    /// [`Self::start_tracing_cell_for_key`] here, and `warmstate.py`
     /// before entering already-compiled machine code.
     #[inline]
     pub fn confirm_enter_jit(&self, green_key: &GreenKey) -> bool {
@@ -2996,7 +2996,7 @@ impl WarmEnterState {
         self.confirm_enter_jit_if_available(green_key)
     }
 
-    /// `warmspot.py:596-598` `make_driverhook_graphs` —
+    /// `warmspot.py` `make_driverhook_graphs` —
     /// `jd._confirm_enter_jit_ptr = self._make_hook_graph(...)`.
     ///
     /// Upstream builds the pointer from the `JitDriver` declaration; nothing
@@ -3253,7 +3253,7 @@ impl WarmEnterState {
     ///
     /// This is what every hash-form entry point resolves through. Upstream's
     /// equivalent is not a lookup at all: `maybe_compile_and_run` already
-    /// holds the cell object it matched (warmstate.py:458-464). Pyre's u64 is
+    /// holds the cell object it matched (warmstate.py). Pyre's u64 is
     /// carried across crate boundaries (`compiled_loops`,
     /// `JitCellToken::green_key`, `rd_loop_token`), so it resolves back to the
     /// cell here — and it resolves to exactly one, which is the property that
@@ -3309,11 +3309,11 @@ impl WarmEnterState {
     /// Resolve greens to the cell key their cell is named by, WITHOUT
     /// installing anything.
     ///
-    /// This is the "resolve once" step. `warmstate.py:596-604
+    /// This is the "resolve once" step. `warmstate.py get_jitcell
     /// JitCell.get_jitcell` takes greens + `comparekey` + `get_uhash`
     /// together and yields a cell; pyre yields that cell's key, and every
     /// consumer downstream carries the key instead of re-deriving it from the
-    /// bucket hash (warmstate.py:483/:511 carries the resolved
+    /// bucket hash (warmstate.py/:511 carries the resolved
     /// `procedure_token` for the same reason).
     ///
     /// `None` means this key owns no cell AND its bucket's raw hash is already
@@ -3350,10 +3350,10 @@ impl WarmEnterState {
     /// miss, not a guess.
     ///
     /// Cells belonging to other hashes that share the table slot
-    /// (counter.py:128-135 truncates the index) are not candidates and do not
+    /// (counter.py _get_index truncates the index) are not candidates and do not
     /// force a `GreenKey`: [`Self::cell_keys_at`] has already excluded them by
     /// the full hash, which is the same exclusion `comparekey` makes upstream
-    /// (warmstate.py:461-464).
+    /// (warmstate.py).
     ///
     /// See [`WarmEnterState`]'s type doc for why the resolve happens at the
     /// producer and the result is carried, rather than each consumer
@@ -3480,10 +3480,10 @@ impl WarmEnterState {
     /// itself; it differs only when the cell that held the raw hash has been
     /// evicted out from under a minted sibling.
     ///
-    /// **Which comparator is consulted.** `warmstate.py:458-464` accepts a cell
+    /// **Which comparator is consulted.** `warmstate.py` accepts a cell
     /// only after `comparekey` matches, because a slot is indexed by a
-    /// truncation of the hash (`counter.py:128-135`, read by
-    /// `counter.py:239-240`) and genuinely mixes unrelated green keys. A caller
+    /// truncation of the hash (`counter.py _get_index`, read by
+    /// `counter.py lookup_chain`) and genuinely mixes unrelated green keys. A caller
     /// here holds no greens, so it cannot run that comparator — but it does not
     /// need the full one to exclude the neighbours: [`Self::cell_keys_at`]
     /// compares FULL hashes, which the cell key preserves, and two green keys
@@ -3507,7 +3507,7 @@ impl WarmEnterState {
     /// How many live cells `hash` owns, and the key of the first one found.
     ///
     /// The `u64`-only stand-in for the `comparekey(*greenargs)` filter every
-    /// upstream chain walk applies (warmstate.py:461-464, :599-603, :634-638).
+    /// upstream chain walk applies (warmstate.py, :599-603, :634-638).
     /// `_get_index` (counter.py) keeps eleven bits, so a slot's
     /// occupants are mostly other green keys' cells; a reader that took the
     /// slot's population for this hash's would count strangers.
@@ -3621,7 +3621,7 @@ impl WarmEnterState {
     /// is free, a minted key when it is not. Filing is the moment the cell
     /// acquires an identity because it is the moment it becomes reachable;
     /// upstream needs no equivalent because it hands the cell object itself
-    /// on (warmstate.py:483/:511) and never re-derives it from a number.
+    /// on (warmstate.py/:511) and never re-derives it from a number.
     pub fn install_new_cell(&mut self, hash: u64, newcell: Option<BaseJitCell>) {
         self.bump_cell_generation();
         let mut keep = newcell.map(Box::new);
@@ -3791,7 +3791,7 @@ mod tests {
     /// Upstream never has that shape: `send_loop_to_backend`
     /// (`compile.py`) and `compile_tmp_callback` (`compile.py`)
     /// both register with `MemoryManager` before any cell sees the token, and
-    /// `alive_loops` is the sole long-lived strong owner (`memmgr.py:9-14`).
+    /// `alive_loops` is the sole long-lived strong owner (`memmgr.py`).
     ///
     /// Returns the strong handle so a caller that wants to keep asserting on
     /// the token object can.
@@ -3861,7 +3861,7 @@ mod tests {
              (warmstate.py:482-483)",
         );
 
-        // `memmgr.py:63-83` — age it out. `max_age = 1` makes
+        // `memmgr.py _kill_old_loops_now` — age it out. `max_age = 1` makes
         // `max_generation == current_generation`, so the token's generation
         // (stamped by `keep_loop_alive` one generation ago) is below it.
         ws.memory_manager.set_max_age(1, 1);
@@ -3901,9 +3901,9 @@ mod tests {
     }
 
     /// `compile.py:1148-1149` — the token `get_assembler_token`
-    /// (`warmstate.py:714-723`) installs is minted by `compile_tmp_callback`,
+    /// (`warmstate.py`) installs is minted by `compile_tmp_callback`,
     /// and `compile_tmp_callback`'s registration with `MemoryManager` is its
-    /// ONLY strong owner: the cell takes a weak handle (`warmstate.py:188`)
+    /// ONLY strong owner: the cell takes a weak handle (`warmstate.py`)
     /// and the caller drops its own as soon as the CALL_ASSEMBLER descr is
     /// built.
     ///
@@ -4352,7 +4352,7 @@ mod tests {
         assert!(ws.can_inline_callable(42));
 
         // dont_trace_here → JC_DONT_TRACE_HERE flag, can_inline_callable
-        // returns false (warmstate.py:669-676 parity).
+        // returns false (warmstate.py parity).
         ws.disable_noninlinable_function(42);
         assert!(!ws.can_inline_callable(42));
     }
@@ -4503,7 +4503,7 @@ mod tests {
     // Ported from rpython/jit/metainterp/test/test_memmgr.py.  Each
     // test creates real `Arc<JitCellToken>` instances since
     // `MemoryManager.alive_loops` keys on token identity per
-    // memmgr.py:9-12 (the looptoken Python object is the dict key
+    // memmgr.py (the looptoken Python object is the dict key
     // upstream).
 
     fn make_token(number: u64) -> Arc<JitCellToken> {
@@ -5363,7 +5363,7 @@ mod tests {
         // procedure token and no longer has one is removable ("i.e. dead
         // weakref"). The state is built by letting the token die, not by
         // stamping a number: `has_seen_a_procedure_token` reads the weakref
-        // slot (warmstate.py:198-199), which is what the arm below is a
+        // slot (warmstate.py), which is what the arm below is a
         // reading of.
         let mut cell = BaseJitCell::new();
         cell.flags |= JcFlags::JC_DONT_TRACE_HERE;
@@ -5690,7 +5690,7 @@ mod tests {
         let mut ws = WarmEnterState::new(100);
         for name in WarmEnterState::param_names() {
             let original = ws.get_param(name);
-            // "decay" is write-only (warmstate.py:269-270 delegates to
+            // "decay" is write-only (warmstate.py set_param_decay delegates to
             // jitcounter.set_decay which stores decay_by_mult, not the raw int).
             if *name != "decay" {
                 assert!(original.is_some(), "param {name} should be gettable");
@@ -5719,7 +5719,7 @@ mod tests {
         );
     }
 
-    /// warmstate.py:575-582 — `comparekey_matches` returns true only
+    /// warmstate.py comparekey — `comparekey_matches` returns true only
     /// when the cell carries a stored GreenKey equal to the probe.
     /// Cells without a comparekey (legacy hash-only path) always fail.
     #[test]
@@ -5773,7 +5773,7 @@ mod tests {
         RELEASE_LOG.lock().push(handle as i64);
     }
 
-    /// warmstate.py:568-573 — a cell's stored green key OWNS its `Ref`
+    /// warmstate.py JitCell — a cell's stored green key OWNS its `Ref`
     /// referents, so the address it names cannot be freed and recycled by a
     /// different object while the cell is alive.
     ///
@@ -5857,7 +5857,7 @@ mod tests {
         );
     }
 
-    /// warmstate.py:626-641 + 596-604 — `ensure_cell_for_key` allocates
+    /// warmstate.py ensure_jit_cell_at_key + 596-604 — `ensure_cell_for_key` allocates
     /// a fresh cell on miss and `lookup_chain_with_key` returns it on a
     /// repeat probe with the same typed greens.
     #[test]
@@ -5936,11 +5936,11 @@ mod tests {
         );
     }
 
-    /// warmstate.py:596-604 — chain walk distinguishes hash collisions:
+    /// warmstate.py get_jitcell — chain walk distinguishes hash collisions:
     /// two distinct GreenKeys sharing one bucket must each resolve to
     /// their own cell via `comparekey` rather than aliasing. The test
     /// exploits `install_new_cell`'s `should_remove_jitcell` gate
-    /// (`BaseJitCell::should_remove_jitcell`, counter.py:246-256 parity): a cell with
+    /// (`BaseJitCell::should_remove_jitcell`, counter.py parity): a cell with
     /// no `loop_token` / no flags is treated as dead and dropped on
     /// the next install. Setting `JC_TRACING` on the first-installed
     /// cell keeps it alive across the second install so both end up
@@ -6194,7 +6194,7 @@ mod tests {
         );
     }
 
-    /// `warmstate.py:714-723` + `626-641` — typed variant must
+    /// `warmstate.py get_assembler_token` + `626-641` — typed variant must
     /// disambiguate hash collisions: two `GreenKey`s that share a hash
     /// but compare unequal under `equal_whatever` get distinct tokens.
     #[test]
@@ -6272,7 +6272,7 @@ mod tests {
     /// hash-marked key reaches `StartTracing` on the THRESHOLD tick by the
     /// ordinary counter route, because the typed decision never saw the mark;
     /// the typed-marked key reaches it on the FIRST tick by
-    /// `should_start_dont_trace_here_trace` (warmstate.py:483-491), which is
+    /// `should_start_dont_trace_here_trace` (warmstate.py), which is
     /// the rule upstream intends to apply. Both trace in the end, so this is
     /// NOT demonstrated to be a user-visible wrong answer — it is a lost
     /// decision input. Whether a production key reaches both entry points, and
@@ -6297,7 +6297,7 @@ mod tests {
         assert_eq!(ws.get_stats().num_cells, 2, "but two cells");
 
         // `install_new_cell` folds the SURVIVOR in front of the newcomer
-        // (counter.py:253-254 `cell.next = keep; keep = cell`), so the
+        // (counter.py `cell.next = keep; keep = cell`), so the
         // HASH-written cell stays the head and the TYPED cell is chained
         // behind it. This is the direction that matters: every bare-head
         // reader — `self.lookup_chain(hash)`, ~26 of them in this file — reads
@@ -6485,7 +6485,7 @@ mod tests {
     /// The hook fires once per tracing start, not once per decision.
     ///
     /// Upstream has a single `bound_reached` and calls it there
-    /// (`warmstate.py:427`). Here the decision and the start are two calls —
+    /// (`warmstate.py`). Here the decision and the start are two calls —
     /// `maybe_compile_decision` answers, and `MetaInterp::bound_reached`
     /// reaches the cell through `force_start_tracing_for_key` — so a veto
     /// placed in both would consult a user callback twice for one entry.
@@ -6525,7 +6525,7 @@ mod tests {
     }
 
     /// The default is upstream's own substitution: no hook declared means
-    /// `def confirm_enter_jit(*args): return True` (`warmstate.py:785-786`).
+    /// `def confirm_enter_jit(*args): return True` (`warmstate.py`).
     #[test]
     fn no_declared_hook_confirms_every_entry() {
         let ws = WarmEnterState::new(3);
@@ -6535,7 +6535,7 @@ mod tests {
 
     /// warmstate.py — typed variant of `maybe_compile_and_run`.
     /// Upstream installs the JitCell lazily at `bound_reached`
-    /// (warmstate.py:425-444): each tick under threshold returns
+    /// (warmstate.py): each tick under threshold returns
     /// without writing to the celltable; on the threshold tick, the
     /// cell is created with `comparekey` and installed via
     /// `jitcounter.install_new_cell`. The typed entry point preserves
@@ -6548,7 +6548,7 @@ mod tests {
 
         // Tick 1, 2: not hot. Cell is NOT yet installed — upstream
         // `maybe_compile_and_run` only allocates at `bound_reached`
-        // (warmstate.py:438-440).
+        // (warmstate.py).
         assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
         assert!(
             ws.lookup_chain_with_key(&key).is_none(),
@@ -6603,7 +6603,7 @@ mod tests {
         let bucket = key_tail.get_uhash();
 
         // TRACING keeps the head non-removable so the second install chains
-        // behind it rather than replacing it (counter.py:246-256).
+        // behind it rather than replacing it (counter.py install_new_cell).
         let mut head = BaseJitCell::new();
         head.flags |= JcFlags::JC_TRACING;
         head.comparekey = Some(key_head.clone());
@@ -6694,7 +6694,7 @@ mod tests {
         let bucket = key_b.get_uhash();
 
         // Pre-install A at B's bucket. JC_TRACING keeps A non-removable
-        // (counter.py:246-256 should_remove gate) so the next install
+        // (counter.py install_new_cell should_remove gate) so the next install
         // chains B behind A.
         let mut cell_a = BaseJitCell::new();
         cell_a.flags |= JcFlags::JC_TRACING;
@@ -6960,7 +6960,7 @@ mod tests {
     /// arbitrary number, which is what turns "every `u64` is a hash some green
     /// key can produce" ([`WarmEnterState::mint_cell_key`]) from an assertion
     /// into a fixture. `get_uhash` folds `x = (x ^ v) * GREEN_UHASH_MULT` over
-    /// `Int` greens (warmstate.py:584-593) and the multiplier is odd, hence
+    /// `Int` greens (warmstate.py) and the multiplier is odd, hence
     /// invertible mod 2^64, so the last green is `prefix ^ target * mult^-1`.
     fn green_key_hashing_to(target: u64, first: i64) -> GreenKey {
         use majit_ir::{GREEN_UHASH_MULT, GREEN_UHASH_SEED, GreenType, green_uhash_step};
@@ -7004,9 +7004,9 @@ mod tests {
     /// between two warm keys has, and then nothing declines: the decision is
     /// about the chained cell's artifact and the execution is the head cell's.
     ///
-    /// `warmstate.py:568-593` reaches a token only through the cell it has
+    /// `warmstate.py` reaches a token only through the cell it has
     /// already matched on greens + comparekey + `get_uhash` together, so the
-    /// two can never name different objects upstream. `warmstate.py:483/511`
+    /// two can never name different objects upstream. `warmstate.py/511`
     /// then carries that resolved `procedure_token` to the executor
     /// (`raise EnterJitAssembler(procedure_token, *execute_args)`) rather than
     /// handing on the key for a second lookup — which is why upstream has no
@@ -7178,7 +7178,7 @@ mod tests {
     /// `ensure_cell_for_key` instead and stores its comparator. A cell with no
     /// comparator cannot be told from a colliding neighbour by any mechanism —
     /// upstream cannot even express the state, since `JitCell.__init__`
-    /// (warmstate.py:610-616) always stores the greens.
+    /// (warmstate.py) always stores the greens.
     ///
     /// So the resolve does not try. With no greens it answers the raw bucket
     /// hash, which names the bucket's ORIGINAL occupant — the cell that took
@@ -7194,7 +7194,7 @@ mod tests {
         let bucket = first.get_uhash();
 
         // A procedure token keeps the first cell non-removable, so the second
-        // install chains it rather than pruning it (counter.py:246-256's
+        // install chains it rather than pruning it (counter.py install_new_cell's
         // `should_remove_jitcell` gate — a cold, tokenless cell is dropped).
         let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
         attach_alive_for_key(&mut ws, &first, token);
@@ -7305,7 +7305,7 @@ mod tests {
     /// counter.py `self.celltable = [None] * size` sizes the table once,
     /// and counter.py reads it at `self._get_index(hash)`, which
     /// "truncates the hash to 32 bits, and then keep the *highest* remaining
-    /// bits" (counter.py:128-135). Both halves of that truncation are pinned
+    /// bits" (counter.py). Both halves of that truncation are pinned
     /// here: one sibling differs from the subject only BELOW the shift, the
     /// other only ABOVE bit 31, so all three hashes are pairwise distinct and
     /// `_get_index` still maps them to one slot.
@@ -7319,7 +7319,7 @@ mod tests {
     /// The second half is the property the truncation must NOT cost: sharing a
     /// chain with strangers must not make any of the three hashes ambiguous.
     /// Upstream separates them with `cell.comparekey(*greenargs)`
-    /// (warmstate.py:461-464); a caller holding no greens separates them by the
+    /// (warmstate.py); a caller holding no greens separates them by the
     /// full hash the cell key preserves ([`WarmEnterState::cell_keys_at`]).
     #[test]
     fn three_distinct_hashes_sharing_a_truncated_index_share_one_chain() {
@@ -7348,7 +7348,7 @@ mod tests {
 
         // A procedure token each, so `should_remove_jitcell` keeps every cell
         // and the slot really chains rather than pruning back to one
-        // (counter.py:246-256).
+        // (counter.py install_new_cell).
         let mut tokens = Vec::new();
         for key in keys {
             let token = token_with_compiled_code(&mut ws);
@@ -7397,7 +7397,7 @@ mod tests {
     /// truncation neighbour that happens to share its slot.**
     ///
     /// This is the hazard the fixed-size table introduces and the reason the
-    /// greens-less readers count by full hash. `counter.py:239-240` hands back
+    /// greens-less readers count by full hash. `counter.py lookup_chain` hands back
     /// `celltable[self._get_index(hash)]` and every upstream walk over it is
     /// gated on `cell.comparekey(*greenargs)` (warmstate.py, :599-603,
     /// :634-638), so a slot occupant belonging to another green key is passed
@@ -7537,7 +7537,7 @@ mod tests {
     /// at `jitcounter.lookup_chain(hash)` with `hash = JitCell.get_uhash(...)`
     /// — `maybe_compile_and_run` (warmstate.py), `get_jitcell`
     /// (warmstate.py) and `_ensure_jit_cell_at_key`
-    /// (warmstate.py:635-641) all spell it that way — and `lookup_chain`
+    /// (warmstate.py) all spell it that way — and `lookup_chain`
     /// (counter.py) is a bare `celltable[self._get_index(hash)]` with
     /// nothing in front of it.
     ///
@@ -7553,7 +7553,7 @@ mod tests {
         // comparator-less cell, so the typed writer behind it cannot match it
         // and installs a second cell, which has to be minted a key. The squatter
         // is cold and tokenless, so `install_new_cell`'s `should_remove_jitcell`
-        // gate (counter.py:246-256) drops it within that same call — leaving the
+        // gate (counter.py) drops it within that same call — leaving the
         // minted cell alone in its bucket.
         let parked = GreenKey::new(vec![7100, 7200]);
         let parked_bucket = parked.get_uhash();
@@ -7782,7 +7782,7 @@ mod tests {
         let bucket = key_head.get_uhash();
 
         // TRACING keeps the tail non-removable so the second install chains
-        // it rather than dropping it (counter.py:246-256 should_remove gate).
+        // it rather than dropping it (counter.py install_new_cell should_remove gate).
         let mut tail = BaseJitCell::new();
         tail.state = BaseJitCellState::Tracing;
         tail.flags |= JcFlags::JC_TRACING;
@@ -7815,7 +7815,7 @@ mod tests {
         );
     }
 
-    /// warmstate.py:425-444 + 596-604 — typed-key transition writes
+    /// warmstate.py bound_reached + 596-604 — typed-key transition writes
     /// land on the matching chained cell, not the bucket head. A
     /// collision-shaped chain `head=A → tail=B` followed by enough
     /// `maybe_compile_with_key(&key_b)` ticks to exhaust the counter

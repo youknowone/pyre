@@ -64,12 +64,12 @@ pub enum Specializer {
     /// fallback used when `directive` is `None`.
     Default,
     /// RPython `LowLevelAnnotatorPolicy.default_specialize`
-    /// (annlowlevel.py:78-80) reached when the active policy is
+    /// (annlowlevel.py) reached when the active policy is
     /// `LowLevelAnnotatorPolicy` and the callee has no explicit
     /// `_annspecialcase_` tag.
     LowLevelDefault,
     /// RPython `MixLevelAnnotatorPolicy.default_specialize`
-    /// (annlowlevel.py:105-111) reached when the active policy is
+    /// (annlowlevel.py) reached when the active policy is
     /// `MixLevelAnnotatorPolicy` and the callee has no explicit
     /// `_annspecialcase_` tag.
     MixLevelDefault,

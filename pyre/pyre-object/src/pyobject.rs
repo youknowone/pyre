@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
 
 /// Type descriptor for Python objects — corresponds to RPython's OBJECT_VTABLE
-/// (rclass.py:167-174).
+/// (rclass.py).
 ///
 /// Each built-in type has a single static `PyType` instance.
 /// The JIT uses `GuardClass` on the `ob_type` pointer to specialize code paths,
@@ -45,7 +45,7 @@ pub struct PyType {
     /// rclass.py `('instantiate', Ptr(FuncType([], OBJECTPTR)))`.
     ///
     /// RPython stores an instantiate function pointer; pyre caches
-    /// the W_TypeObject pointer here instead. rclass.py:739-743
+    /// the W_TypeObject pointer here instead. rclass.py
     /// `new_instance` sets `__class__` at allocation — pyre reads
     /// this cached pointer to set `w_class` at allocation time.
     /// Null until `init_typeobjects()` runs.
@@ -1148,7 +1148,7 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
             &crate::interp_exceptions::EXC_UNICODE_ENCODE_ERROR_TYPE,
             &crate::interp_exceptions::EXC_UNICODE_ERROR_TYPE,
         ),
-        // `pypy/module/exceptions/interp_exceptions.py:426
+        // `pypy/module/exceptions/interp_exceptions.py W_UnicodeTranslateError
         // W_UnicodeTranslateError = _new_exception('UnicodeTranslateError',
         // W_UnicodeError, ...)`.
         (

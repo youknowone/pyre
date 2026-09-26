@@ -351,7 +351,7 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
         }
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     // `then_bb` (`Some`) carries `carried` plus `slice` and `index` (the base
     // and subscript of the element read); `else_bb` (`None`) carries only

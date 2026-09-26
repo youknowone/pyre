@@ -36,7 +36,7 @@ use crate::translator::rtyper::lltypesystem::lltype::_func;
 use crate::translator::translator::TranslationContext;
 
 /// `class CollectAnalyzer(graphanalyze.BoolGraphAnalyzer)` at
-/// `collectanalyze.py:7-33`.
+/// `collectanalyze.py`.
 pub struct CollectAnalyzer<'t> {
     translator: &'t TranslationContext,
     /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py`).

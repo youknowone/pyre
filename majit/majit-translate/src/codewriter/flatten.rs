@@ -180,7 +180,7 @@ pub enum FlatOp {
     ///
     /// RPython `flatten.py` `self.emitline('%s_copy' % kind, v, "->", w)`.
     /// Upstream `getcolor(v)` returns `v` as-is for `Constant`
-    /// (flatten.py:382-384), so `src` can be either a `Variable`-backed
+    /// (flatten.py), so `src` can be either a `Variable`-backed
     /// [`Register`] or a [`ConstValue`] literal — carried here as
     /// [`RegOrConst::Reg`] / [`RegOrConst::Const`] respectively.
     /// The `kind` prefix (`int_copy`/`ref_copy`/`float_copy`) is
@@ -213,7 +213,7 @@ pub enum FlatOp {
     /// Liveness marker — expanded by `compute_liveness()` to include
     /// all values alive at this point.
     ///
-    /// RPython `liveness.py:44-52` — the `-live-` op's argument list is
+    /// RPython `liveness.py` — the `-live-` op's argument list is
     /// the set of [`Register`]s alive at this point.  Jtransform may
     /// pre-seed it with explicit forced registers; the liveness pass
     /// then unions the backward-flow alive set into the same vector.
@@ -280,7 +280,7 @@ pub const KINDS: [RegKind; 3] = [RegKind::Int, RegKind::Ref, RegKind::Float];
 
 /// Result of the flatten pass.
 ///
-/// `flatten.py:6-10`:
+/// `flatten.py SSARepr`:
 /// ```py
 /// class SSARepr(object):
 ///     def __init__(self, name):
@@ -383,7 +383,7 @@ fn switch_llexitcase_key(link: &Link) -> Option<i64> {
 
 /// Flatten a FunctionGraph into a linear instruction sequence.
 ///
-/// RPython `flatten.py:63-70`:
+/// RPython `flatten.py flatten_graph`:
 /// ```py
 /// def flatten_graph(graph, regallocs, _include_all_exc_links=False,
 ///                   cpu=None):
@@ -401,7 +401,7 @@ pub fn flatten_graph(
     graph: &FunctionGraph,
     regallocs: &mut HashMap<RegKind, RegAllocator>,
 ) -> SSARepr {
-    // Direct line-by-line port of `flatten.py:63-66`:
+    // Direct line-by-line port of `flatten.py flatten_graph`:
     //   flattener = GraphFlattener(graph, regallocs, ...)
     //   flattener.enforce_input_args()
     //   flattener.generate_ssa_form()
@@ -434,7 +434,7 @@ pub fn flatten_graph(
 /// kind, kind-color, etc.).  Splitting the mutation out into a free
 /// function that runs **before** the GraphFlattener is constructed
 /// preserves the upstream method-body shape (the function body below
-/// is identical to flatten.py:88-100) while honoring Rust's
+/// is identical to flatten.py) while honoring Rust's
 /// aliasing rules.  Call this from the codewriter immediately after
 /// `perform_all_register_allocations`, before [`flatten_graph`].
 fn enforce_input_args(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind, RegAllocator>) {
@@ -772,7 +772,7 @@ impl<'a> GraphFlattener<'a> {
     /// doc for the Rust-language adaptation rationale.
     /// [`flatten_graph`] runs the free function unconditionally
     /// immediately before constructing the GraphFlattener (matching
-    /// upstream `flatten.py:63-66` invocation order), so by the
+    /// upstream `flatten.py` invocation order), so by the
     /// time this method runs the rotation is complete and the
     /// invariant below holds; the assertion catches direct callers
     /// that constructed a GraphFlattener without going through
@@ -2060,7 +2060,7 @@ mod tests {
     #[test]
     fn flatten_phi_produces_move_ops() {
         // When a Goto carries Link args to a target with inputargs and
-        // the target is NOT a final block (so the RPython `flatten.py:148-155`
+        // the target is NOT a final block (so the RPython `flatten.py make_link`
         // make_return-inline optimization does not fire), flatten must
         // emit a `{kind}_copy` Move op for Phi resolution.
         let mut graph = FunctionGraph::new("phi");
@@ -2477,7 +2477,7 @@ mod tests {
     // `rpython/jit/codewriter/test/test_flatten.py` exercises
     // `insert_renamings` indirectly via whole-graph tests; majit covers
     // the standalone helper below.  Each case constructs a minimal
-    // `Link` with no `extravars` so the `flatten.py:310-311` exception
+    // `Link` with no `extravars` so the `flatten.py` exception
     // filter doesn't fire.  After Phase 3 `insert_renamings` is a
     // method on [`GraphFlattener`] that emits `Register`-typed
     // operands; `run_insert_renamings` provides a parameterised harness
@@ -2752,7 +2752,7 @@ mod tests {
         format_assembler(&ssa)
     }
 
-    /// `flatten.py:106-128` — a back-edge re-enters an already-emitted
+    /// `flatten.py make_bytecode_block` — a back-edge re-enters an already-emitted
     /// block, which must produce `goto L1\n---` (the `seen_blocks`
     /// branch).  RPython `test_flatten.py:test_loop` exercises the
     /// same shape.

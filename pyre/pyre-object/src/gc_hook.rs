@@ -612,7 +612,7 @@ pub extern "C" fn maybe_register_finalizer(obj: PyObjectRef) {
 }
 
 /// Signature of the host-side `threshold_reached` callback
-/// (incminimark.py:1288-1290).
+/// (incminimark.py).
 pub type GcMajorThresholdReachedHookFn = fn() -> bool;
 
 majit_gc::global_hook!(static GC_MAJOR_THRESHOLD_REACHED_HOOK: GcMajorThresholdReachedHookFn);
@@ -686,7 +686,7 @@ pub fn clear_gc_root_hooks() {
 /// called with the same pointer.
 // `dont_look_inside`: host hook dispatch (a process-global
 // atomic fn-pointer cell) stays opaque to the JIT — the `try_gc_write_barrier`
-// twin; calls residualize via the registered fnaddr (`rlib/jit.py:139`).
+// twin; calls residualize via the registered fnaddr (`rlib/jit.py`).
 #[majit_macros::dont_look_inside]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -702,7 +702,7 @@ pub unsafe fn try_gc_add_root(slot: *mut *mut u8) -> bool {
 /// Returns `true` when the callback was invoked.
 // `dont_look_inside`: host hook dispatch (a process-global
 // atomic fn-pointer cell) stays opaque to the JIT — the `try_gc_add_root` twin;
-// calls residualize via the registered fnaddr (`rlib/jit.py:139`).
+// calls residualize via the registered fnaddr (`rlib/jit.py`).
 #[majit_macros::dont_look_inside]
 pub fn try_gc_remove_root(slot: *mut *mut u8) -> bool {
     match GC_REMOVE_ROOT_HOOK.get() {

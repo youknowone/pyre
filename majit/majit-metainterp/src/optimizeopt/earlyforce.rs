@@ -5,7 +5,7 @@
 /// SETFIELD_GC, SETARRAYITEM_GC, SETARRAYITEM_RAW, QUASIIMMUT_FIELD,
 /// SAME_AS_*, raw_free calls.
 ///
-/// earlyforce.py:32: self.optimizer.optearlyforce = self
+/// earlyforce.py: self.optimizer.optearlyforce = self
 /// The pass registers itself so force_at_the_end_of_preamble can route
 /// forced operations starting from earlyforce.next (= heap).
 use majit_ir::{Op, OpCode};
@@ -36,7 +36,7 @@ impl OptEarlyForce {
         OptEarlyForce
     }
 
-    /// earlyforce.py:15-29: should we force args for this op?
+    /// earlyforce.py propagate_forward: should we force args for this op?
     /// RPython exempt set: SETFIELD_GC, SETARRAYITEM_GC, SETARRAYITEM_RAW,
     /// QUASIIMMUT_FIELD, SAME_AS_I/R/F, and raw_free. Note that
     /// SETFIELD_RAW is NOT exempt in RPython.

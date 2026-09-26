@@ -109,9 +109,9 @@ pub fn register_interior_field(descr: DescrRef) {
 /// Mirrors `descr.py::get_interiorfield_descr` cache-miss
 /// `cache[(ARRAY, name, arrayfieldname)] = interiorfielddescr`.
 /// `arrayfieldname == ""` denotes PyPy `arrayfieldname=None`
-/// (the GcArray-of-Structs case, `descr.py:431-432`); a non-empty
+/// (the GcArray-of-Structs case, `descr.py`); a non-empty
 /// string denotes the GcStruct-containing-inlined-GcArray case
-/// (`descr.py:433-434`).
+/// (`descr.py`).
 pub fn register_keyed_interior_field(
     array_key: crate::descr::LLType,
     name: String,
@@ -147,7 +147,7 @@ pub fn snapshot_all() -> Vec<DescrRef> {
 }
 
 /// `pyjitpl.py self.all_descrs = self.cpu.setup_descrs()` — the dense
-/// list `descr_index` indexes into (`descr.py:28 v.descr_index =
+/// list `descr_index` indexes into (`descr.py v.descr_index =
 /// len(all_descrs)`), and the list `bridgeopt.py:155
 /// metainterp_sd.all_descrs[descr_index]` reads back.
 ///

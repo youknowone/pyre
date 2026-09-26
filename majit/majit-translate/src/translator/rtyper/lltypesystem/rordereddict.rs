@@ -83,7 +83,7 @@ pub const FLAG_STORE: i64 = 1;
 pub const DICT_INITSIZE: i64 = 16;
 
 /// RPython `class OrderedDictRepr(AbstractDictRepr)`
-/// (`lltypesystem/rordereddict.py:173`).
+/// (`lltypesystem/rordereddict.py`).
 #[derive(Debug)]
 #[allow(non_snake_case)]
 pub struct OrderedDictRepr {
@@ -177,7 +177,7 @@ impl OrderedDictRepr {
     }
 
     /// RPython `OrderedDictRepr.ll_newdict = staticmethod(ll_newdict)`
-    /// (`rordereddict.py:1169`), reached from `rdict.rtype_newdict`
+    /// (`rordereddict.py`), reached from `rdict.rtype_newdict`
     /// (`rdict.py:60-65`):
     ///
     /// ```python
@@ -228,7 +228,7 @@ impl OrderedDictRepr {
     /// `return ll_dict_lookup(d, key, hash, store_flag, T)`) is genuinely
     /// live for that case and unported here. Plain (`not custom_eq_hash`)
     /// dicts route entirely through `self.base.key_repr.get_ll_eq_function`
-    /// instead (`rordereddict.py:220-222`) — see
+    /// instead (`rordereddict.py`) — see
     /// [`build_ll_dict_lookup_helper_graph`]'s doc comment for how that
     /// `d.keyeq` value (e.g. `StringRepr::ll_streq` for str keys, `None` for
     /// identity keys) is wired into the direct-compare fallback.
@@ -630,7 +630,7 @@ impl OrderedDictRepr {
         let grow_const = sub_helper_funcptr_constant(rtyper, &grow_fn)?;
 
         // _ll_dict_setitem_lookup_done(d, key, value, hash, i)
-        // (rordereddict.py:675-711).
+        // (rordereddict.py).
         let lookup_done_fn = {
             let dict_ptr = dict_ptr.clone();
             let entries_ptr = entries_ptr.clone();
@@ -725,7 +725,7 @@ impl OrderedDictRepr {
         let write_indexes_const = sub_helper_funcptr_constant(rtyper, &write_indexes_fn)?;
 
         // ll_dict_delete_by_entry_index(d, hash, locate_index, replace_with, T)
-        // (rordereddict.py:1123-1144).
+        // (rordereddict.py).
         let delete_by_entry_fn = {
             let dict_ptr = dict_ptr.clone();
             let write_indexes_const = write_indexes_const.clone();
@@ -750,7 +750,7 @@ impl OrderedDictRepr {
         let delete_by_entry_const = sub_helper_funcptr_constant(rtyper, &delete_by_entry_fn)?;
 
         // ll_call_delete_by_entry_index(d, hash, i, replace_with)
-        // (rordereddict.py:582-597) — FUNC_* dispatch collapses to a single
+        // (rordereddict.py) — FUNC_* dispatch collapses to a single
         // delete helper call for the same width-collapse reason as
         // ll_call_insert_clean_function.
         let call_delete_fn = {
@@ -1059,7 +1059,7 @@ impl Repr for OrderedDictRepr {
     /// `ll_dict_bool(d)` (`rordereddict.py`) is `bool(d) and
     /// d.num_live_items != 0` — the explicit `bool(d)` guard lets a None-typed
     /// dict read False without dereferencing, so this overrides the
-    /// `int_is_true(len)` default (`rmodel.py:199-207`) which would deref the
+    /// `int_is_true(len)` default (`rmodel.py`) which would deref the
     /// possibly-null receiver.
     fn rtype_bool(&self, hop: &HighLevelOp) -> RTypeResult {
         let v_dict = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
@@ -1077,7 +1077,7 @@ impl Repr for OrderedDictRepr {
     }
 
     /// RPython `OrderedDictRepr.make_iterator_repr(self, *variant)`
-    /// (`rordereddict.py:282-283`):
+    /// (`rordereddict.py`):
     ///
     /// ```python
     /// def make_iterator_repr(self, *variant):
@@ -1108,7 +1108,7 @@ impl Repr for OrderedDictRepr {
     }
 
     /// RPython `pairtype(OrderedDictRepr, rmodel.Repr).rtype_getitem`
-    /// (`rordereddict.py:441-447`):
+    /// (`rordereddict.py`):
     ///
     /// ```python
     /// def rtype_getitem((r_dict, r_key), hop):
@@ -1170,7 +1170,7 @@ impl Repr for OrderedDictRepr {
     }
 
     /// RPython `pairtype(OrderedDictRepr, rmodel.Repr).rtype_setitem`
-    /// (`rordereddict.py:448-455`):
+    /// (`rordereddict.py`):
     ///
     /// ```python
     /// def rtype_setitem((r_dict, r_key), hop):
@@ -1204,7 +1204,7 @@ impl Repr for OrderedDictRepr {
     }
 
     /// RPython `pairtype(OrderedDictRepr, rmodel.Repr).rtype_delitem`
-    /// (`rordereddict.py:449-454`):
+    /// (`rordereddict.py`):
     ///
     /// ```python
     /// def rtype_delitem((r_dict, r_key), hop):
@@ -1230,7 +1230,7 @@ impl Repr for OrderedDictRepr {
     }
 
     /// RPython `OrderedDictRepr.rtype_method_get` / `rtype_method_setdefault`
-    /// (`rordereddict.py:285-301`).
+    /// (`rordereddict.py`).
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
         match method_name {
             // `is_null` is the lltype `_ptr` nullity probe on the dict
@@ -1302,7 +1302,7 @@ impl Repr for OrderedDictRepr {
             }
             // RPython `OrderedDictRepr.rtype_method_iterkeys`/
             // `rtype_method_itervalues`/`rtype_method_iteritems`
-            // (`rordereddict.py:342-352`):
+            // (`rordereddict.py`):
             //
             // ```python
             // def rtype_method_iterkeys(self, hop):
@@ -1414,7 +1414,7 @@ pub(crate) fn build_ll_dict_bool_helper_graph(
     let d_for_len = variable_with_lltype("d", ptr_lltype);
     let block_check_len = Block::shared(vec![Hlvalue::Variable(d_for_len.clone())]);
 
-    // ---- start: ptr_nonzero(d); branch on the result.
+    // start: ptr_nonzero(d); branch on the result.
     let v_nz = variable_with_lltype("v_nz", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "ptr_nonzero",
@@ -1436,7 +1436,7 @@ pub(crate) fn build_ll_dict_bool_helper_graph(
     .into_ref();
     startblock.closeblock(vec![start_true_link, start_false_link]);
 
-    // ---- check_len: getfield(num_live_items); int_ne(n, 0).
+    // check_len: getfield(num_live_items); int_ne(n, 0).
     let v_count = variable_with_lltype("num_live_items", LowLevelType::Signed);
     block_check_len
         .borrow_mut()
@@ -1480,7 +1480,7 @@ pub(crate) fn build_ll_dict_bool_helper_graph(
 }
 
 /// Synthesise `ll_newdict(DICT) -> Ptr(DICT)`
-/// (`rordereddict.py:1160-1169` + `:509-518`):
+/// (`rordereddict.py` + `:509-518`):
 ///
 /// ```python
 /// def ll_newdict(DICT):
@@ -1504,7 +1504,7 @@ pub(crate) fn build_ll_dict_bool_helper_graph(
 /// rather than threading a `Void` const through `gendirectcall`).
 ///
 /// `_ll_empty_array` is a `@specialize.memo()` prebuilt zero-length array
-/// upstream (`rordereddict.py:1155-1158`), shared across every empty dict of
+/// upstream (`rordereddict.py`), shared across every empty dict of
 /// a given specialization. This port allocates a fresh `malloc_varsize(...,
 /// 0)` entries array per call instead of sharing one prebuilt instance — the
 /// memo-sharing is deferred (no local prebuilt-const cache mechanism exists
@@ -1766,7 +1766,7 @@ fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
 }
 
 /// Synthesise `ll_dict_lookup(d, key, hash, store_flag, T) -> Signed`
-/// (`rordereddict.py:1038-1106`), the open-addressing perturb-probe that
+/// (`rordereddict.py`), the open-addressing perturb-probe that
 /// every dict access routes through.
 ///
 /// ```python
@@ -1823,7 +1823,7 @@ fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
 /// not — see `rint.py:627`/`_rweakkeydict.py:107` for the two upstream cases
 /// that do, both out of scope). `d.keyeq` is `eq_fn_const` — `None` for
 /// identity keys (int/bool/char/unichar/instance-without-`__eq__`, matching
-/// `get_ll_eq_function() -> None`, `rordereddict.py:150-157`), or the key
+/// `get_ll_eq_function() -> None`, `rordereddict.py`), or the key
 /// repr's `get_ll_eq_function()` result for keys with real structural
 /// equality (`Some(ll_streq)` for str). When `eq_fn_const` is `Some`, a
 /// direct-compare miss falls through to `direct_call(eq_fn_const,
@@ -1899,7 +1899,7 @@ pub fn build_ll_dict_lookup_helper_graph(
     let uns = || LowLevelType::Unsigned;
     let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
 
-    // ---- startblock inputargs: (d, key, hash, store_flag).
+    // startblock inputargs: (d, key, hash, store_flag).
     let d = new_var("d", dict_ptr_lltype.clone());
     let key = new_var("key", key_lltype.clone());
     let hash = new_var("hash", sig());
@@ -2100,7 +2100,7 @@ pub fn build_ll_dict_lookup_helper_graph(
     let block_free_choose_slot =
         Block::shared(vec![var(&fc_d), var(&fc_indexes), var(&fc_i), var(&fc_ds)]);
 
-    // ===== startblock =====
+    // startblock
     let entries = new_var("entries", entries_ptr_lltype.clone());
     push(
         &startblock,
@@ -2177,7 +2177,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_first_valid: checkingkey == key on the first probe. =====
+    // block_first_valid: checkingkey == key on the first probe.
     let fv_slot = new_var("slot", sig());
     push(
         &block_first_valid,
@@ -2312,7 +2312,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         ]);
     }
 
-    // ===== block_first_notvalid: DELETED vs pristine FREE. =====
+    // block_first_notvalid: DELETED vs pristine FREE.
     let nv_i_s = new_var("i_s", sig());
     push(
         &block_first_notvalid,
@@ -2353,7 +2353,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_first_pristine_store: store at i iff FLAG_STORE, else -1. =====
+    // block_first_pristine_store: store at i iff FLAG_STORE, else -1.
     let ps_i_s = new_var("i_s", sig());
     push(
         &block_first_pristine_store,
@@ -2384,7 +2384,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_store_at: indexes[slot] = num_ever_used + VALID_OFFSET; return -1. =====
+    // block_store_at: indexes[slot] = num_ever_used + VALID_OFFSET; return -1.
     let st_neu = new_var("num_ever_used_items", sig());
     push(
         &block_store_at,
@@ -2417,7 +2417,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         Link::new(vec![signed(-1)], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
-    // ===== block_loop_init: perturb = r_uint(hash); enter loop. =====
+    // block_loop_init: perturb = r_uint(hash); enter loop.
     let li_perturb = new_var("perturb", uns());
     push(
         &block_loop_init,
@@ -2444,7 +2444,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_loop_body: i = ((i<<2)+i+perturb+1)&mask; read slot; branch FREE. =====
+    // block_loop_body: i = ((i<<2)+i+perturb+1)&mask; read slot; branch FREE.
     let lb_ish = new_var("ish", uns());
     push(
         &block_loop_body,
@@ -2541,7 +2541,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_loop_notfree: index >= VALID_OFFSET vs DELETED. =====
+    // block_loop_notfree: index >= VALID_OFFSET vs DELETED.
     let nf_ge = new_var("ge", LowLevelType::Bool);
     push(
         &block_loop_notfree,
@@ -2578,7 +2578,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_loop_valid: checkingkey == key on a probed slot. =====
+    // block_loop_valid: checkingkey == key on a probed slot.
     let lv_slot = new_var("slot", sig());
     push(
         &block_loop_valid,
@@ -2715,7 +2715,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         ]);
     }
 
-    // ===== block_loop_deleted: record first deleted slot (deletedslot == -1). =====
+    // block_loop_deleted: record first deleted slot (deletedslot == -1).
     let ld_i_s = new_var("i_s", sig());
     push(
         &block_loop_deleted,
@@ -2760,7 +2760,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_perturb_shift: perturb >>= PERTURB_SHIFT; back-edge to loop body. =====
+    // block_perturb_shift: perturb >>= PERTURB_SHIFT; back-edge to loop body.
     let sh_perturb_new = new_var("perturb", uns());
     push(
         &block_perturb_shift,
@@ -2787,7 +2787,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_loop_free: store at deletedslot iff FLAG_STORE, else -1. =====
+    // block_loop_free: store at deletedslot iff FLAG_STORE, else -1.
     let lf_is_store = new_var("is_store", LowLevelType::Bool);
     push(
         &block_loop_free,
@@ -2811,7 +2811,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_free_choose_slot: deletedslot==-1 ? i : deletedslot, then store. =====
+    // block_free_choose_slot: deletedslot==-1 ? i : deletedslot, then store.
     let fc_i_s = new_var("i_s", sig());
     push(
         &block_free_choose_slot,
@@ -3214,7 +3214,7 @@ pub(crate) fn build_ll_ensure_indexes_helper_graph(
 }
 
 /// Synthesise `ll_call_lookup_function(d, key, hash, flag) -> Signed`
-/// (`rordereddict.py:46-65`):
+/// (`rordereddict.py`):
 ///
 /// ```python
 /// def ll_call_lookup_function(d, key, hash, flag):
@@ -3539,7 +3539,7 @@ pub(crate) fn build_ll_dict_contains_helper_graph(
 }
 
 /// RPython `pairtype(OrderedDictRepr, rmodel.Repr).rtype_contains`
-/// (`rordereddict.py:464-467`):
+/// (`rordereddict.py`):
 ///
 /// ```python
 /// def rtype_contains((r_dict, r_key), hop):
@@ -3720,7 +3720,7 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
         var(&ad_perturb),
     ]);
 
-    // ---- block_cond body: read indexes[i]; branch on == FREE.
+    // block_cond body: read indexes[i]; branch on == FREE.
     let cd_i_s = new_var("i_s", sig());
     push(&block_cond, "cast_uint_to_int", vec![var(&cd_i)], &cd_i_s);
     let cd_elem = new_var("elem", uns());
@@ -3767,7 +3767,7 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_advance body: i = ((i<<2)+i+perturb+1)&mask_u; perturb >>= PERTURB_SHIFT.
+    // block_advance body: i = ((i<<2)+i+perturb+1)&mask_u; perturb >>= PERTURB_SHIFT.
     let ad_ish = new_var("ish", uns());
     push(
         &block_advance,
@@ -3829,7 +3829,7 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_write body: _ll_write_indexes(d, i_s, index + VALID_OFFSET).
+    // block_write body: _ll_write_indexes(d, i_s, index + VALID_OFFSET).
     let wr_value = new_var("value", sig());
     push(
         &block_write,
@@ -3873,7 +3873,7 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
 }
 
 /// Synthesise `ll_call_insert_clean_function(d, hash, i)`
-/// (`rordereddict.py:565-580`):
+/// (`rordereddict.py`):
 ///
 /// ```python
 /// def ll_call_insert_clean_function(d, hash, i):
@@ -3941,7 +3941,7 @@ pub(crate) fn build_ll_call_insert_clean_function_helper_graph(
 }
 
 /// Synthesise `ll_call_delete_by_entry_index(d, hash, i, replace_with)`
-/// (`rordereddict.py:582-597`):
+/// (`rordereddict.py`):
 ///
 /// ```python
 /// def ll_call_delete_by_entry_index(d, hash, i, replace_with):
@@ -3952,7 +3952,7 @@ pub(crate) fn build_ll_call_insert_clean_function_helper_graph(
 ///     elif fun == FUNC_LONG: ll_dict_delete_by_entry_index(..., TYPE_LONG)
 /// ```
 ///
-/// rordereddict.py:586-593 — the `FUNC_*` dispatch collapses to one
+/// rordereddict.py — the `FUNC_*` dispatch collapses to one
 /// `ll_dict_delete_by_entry_index` call because all `DICTINDEX_*` aliases are
 /// currently `Ptr(GcArray(Unsigned))`; same #148-width deviation as
 /// [`build_ll_call_insert_clean_function_helper_graph`].
@@ -4015,7 +4015,7 @@ pub(crate) fn build_ll_call_delete_by_entry_index_helper_graph(
 }
 
 /// Synthesise `ll_dict_delete_by_entry_index(d, hash, locate_index,
-/// replace_with, T)` (`rordereddict.py:1123-1144`):
+/// replace_with, T)` (`rordereddict.py`):
 ///
 /// ```python
 /// locate_value = locate_index + VALID_OFFSET
@@ -6634,7 +6634,7 @@ pub(crate) fn build_ll_dict_get_helper_graph(
 }
 
 /// Synthesise `ll_dict_setdefault(dict, key, default)`
-/// (`rordereddict.py:1291-1298`).
+/// (`rordereddict.py`).
 #[expect(
     clippy::too_many_arguments,
     reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -6770,7 +6770,7 @@ pub(crate) fn build_ll_dict_setdefault_helper_graph(
 }
 
 /// Synthesise `_ll_dict_setitem_lookup_done(d, key, value, hash, i)`
-/// (`rordereddict.py:675-711`):
+/// (`rordereddict.py`):
 ///
 /// ```python
 /// def _ll_dict_setitem_lookup_done(d, key, value, hash, i):
@@ -6860,13 +6860,13 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
     let mut graph =
         FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
 
-    // ===== overwrite path (i >= 0): entries[i].value = value. =====
+    // overwrite path (i >= 0): entries[i].value = value.
     let ow_d = new_var("d", dict_ptr_lltype.clone());
     let ow_i = new_var("i", sig());
     let ow_value = new_var("value", value_lltype.clone());
     let block_overwrite = Block::shared(vec![var(&ow_d), var(&ow_i), var(&ow_value)]);
 
-    // ===== insert path (i < 0). =====
+    // insert path (i < 0).
     let ins_d = new_var("d", dict_ptr_lltype.clone());
     let ins_key = new_var("key", key_lltype.clone());
     let ins_value = new_var("value", value_lltype.clone());
@@ -6896,7 +6896,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_overwrite body.
+    // block_overwrite body.
     let ow_entries = new_var("entries", entries_ptr_lltype.clone());
     push(
         &block_overwrite,
@@ -6919,7 +6919,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
-    // ---- block_insert_entry body: len(entries) == num_ever_used_items?
+    // block_insert_entry body: len(entries) == num_ever_used_items?
     let orig_entries = new_var("orig_entries", entries_ptr_lltype.clone());
     push(
         &block_insert_entry,
@@ -6997,7 +6997,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_do_grow body.
+    // block_do_grow body.
     let reindexed_grow = new_var("reindexed_grow", LowLevelType::Bool);
     push(
         &block_do_grow,
@@ -7020,7 +7020,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_after_grow body: rc = resize_counter - 3; branch rc <= 0.
+    // block_after_grow body: rc = resize_counter - 3; branch rc <= 0.
     let rc0 = new_var("rc0", sig());
     push(
         &block_after_grow,
@@ -7094,7 +7094,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_do_resize body: ll_dict_resize(d); reindexed=True; rc = resize_counter - 3.
+    // block_do_resize body: ll_dict_resize(d); reindexed=True; rc = resize_counter - 3.
     push(
         &block_do_resize,
         "direct_call",
@@ -7131,7 +7131,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_after_resize body: branch on reindexed.
+    // block_after_resize body: branch on reindexed.
     block_after_resize.borrow_mut().exitswitch = Some(var(&ar_reindexed));
 
     // block_do_insert_clean(d, key, value, hash, rc).
@@ -7189,7 +7189,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_do_insert_clean body.
+    // block_do_insert_clean body.
     let num_ever_ic = new_var("num_ever_ic", sig());
     push(
         &block_do_insert_clean,
@@ -7223,7 +7223,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_write_entry body: write the fresh entry, bump counters.
+    // block_write_entry body: write the fresh entry, bump counters.
     push(
         &block_write_entry,
         "setfield",
@@ -7508,7 +7508,7 @@ pub fn build_ll_dictnext_helper_graph(
 
     let exc_args = exception_args("StopIteration")?;
 
-    // ---- startblock inputargs: (iter).
+    // startblock inputargs: (iter).
     let iter = new_var("iter", iter_ptr_lltype.clone());
     let startblock = Block::shared(vec![var(&iter)]);
     let return_var = new_var("result", sig());
@@ -7591,7 +7591,7 @@ pub fn build_ll_dictnext_helper_graph(
     let cl_iter = new_var("iter", iter_ptr_lltype.clone());
     let block_clear = Block::shared(vec![var(&cl_iter)]);
 
-    // ===== startblock: dict = iter.dict; if dict raise-guard. =====
+    // startblock: dict = iter.dict; if dict raise-guard.
     let dict0 = new_var("dict", dict_ptr_lltype.clone());
     push(
         &startblock,
@@ -7623,7 +7623,7 @@ pub fn build_ll_dictnext_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_setup: read entries, index, entries_len; enter loop. =====
+    // block_setup: read entries, index, entries_len; enter loop.
     let su_entries = new_var("entries", entries_ptr_lltype.clone());
     push(
         &block_setup,
@@ -7660,7 +7660,7 @@ pub fn build_ll_dictnext_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_loop_cond: while index < entries_len. =====
+    // block_loop_cond: while index < entries_len.
     let lt = new_var("lt", LowLevelType::Bool);
     push(
         &block_loop_cond,
@@ -7696,7 +7696,7 @@ pub fn build_ll_dictnext_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_loop_body: nextindex = index + 1; branch on entries.valid. =====
+    // block_loop_body: nextindex = index + 1; branch on entries.valid.
     let lb_next = new_var("nextindex", sig());
     push(
         &block_loop_body,
@@ -7744,7 +7744,7 @@ pub fn build_ll_dictnext_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_return_valid: iter.index = nextindex; return index. =====
+    // block_return_valid: iter.index = nextindex; return index.
     let rv_void = new_var("v", LowLevelType::Void);
     push(
         &block_return_valid,
@@ -7756,7 +7756,7 @@ pub fn build_ll_dictnext_helper_graph(
         Link::new(vec![var(&rv_index)], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
-    // ===== block_invalid: popitem(last=False) fast-forward hack. =====
+    // block_invalid: popitem(last=False) fast-forward hack.
     let iv_lfn = new_var("lfn", sig());
     push(
         &block_invalid,
@@ -7813,7 +7813,7 @@ pub fn build_ll_dictnext_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_bump: lookup_function_no += (1 << FUNC_SHIFT); loop back. =====
+    // block_bump: lookup_function_no += (1 << FUNC_SHIFT); loop back.
     let bp_new_lfn = new_var("lfn", sig());
     push(
         &block_bump,
@@ -7847,7 +7847,7 @@ pub fn build_ll_dictnext_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_clear: iter.dict = nullptr; raise StopIteration. =====
+    // block_clear: iter.dict = nullptr; raise StopIteration.
     let cl_void = new_var("v", LowLevelType::Void);
     push(
         &block_clear,
@@ -8232,7 +8232,7 @@ pub fn get_ll_dictiter(DICTPTR: LowLevelType) -> LowLevelType {
 }
 
 /// RPython `class DictIteratorRepr(AbstractDictIteratorRepr)`
-/// (`lltypesystem/rordereddict.py:1192`).
+/// (`lltypesystem/rordereddict.py`).
 ///
 /// Upstream stores the whole `r_dict` (`DictIteratorRepr.__init__`,
 /// `:1206-1215`) and reaches `r_dict.recast_key`/`recast_value` through it.
@@ -8703,7 +8703,7 @@ mod tests {
 
     /// `ll_dictiter` mints a fresh `dictiter{dict, index}`: `iter.dict = d`
     /// and `iter.index = d.lookup_function_no >> FUNC_SHIFT`
-    /// (`rordereddict.py:1218-1223`) — no constant-zero index (unlike
+    /// (`rordereddict.py`) — no constant-zero index (unlike
     /// `ll_listiter`), since `_ll_dictnext`'s popitem(last=False)
     /// fast-forward hack stashes a resume offset in `lookup_function_no`.
     #[test]
@@ -10570,7 +10570,7 @@ mod tests {
     /// `_ll_dict_setitem_lookup_done` chain fused into a single
     /// `ll_dict_setitem` `direct_call`, and threads
     /// `hop.exception_cannot_occur()` (the non-`custom_eq_hash` branch,
-    /// `rordereddict.py:448-455`).
+    /// `rordereddict.py`).
     #[test]
     fn ordereddictrepr_rtype_setitem_int_key_emits_direct_call_chain() {
         use crate::translator::rtyper::rtyper::LowLevelOpList;

@@ -266,7 +266,7 @@ pub static INLINE_CALLS_TO: &[(&str, &[Type], Type)] = &[
 /// `parse_oopspec` raises `AttributeError` at `ll_func.oopspec` when
 /// the wrapper carries no `oopspec` attribute.  Callers must only
 /// invoke `decode_builtin_call` after the call has been classified
-/// as a builtin (mirroring `jtransform.py:484` gating through
+/// as a builtin (mirroring `jtransform.py` gating through
 /// `handle_builtin_call`), at which point the oopspec attribute is
 /// guaranteed by the `@oopspec` decorator that promoted the helper
 /// to a builtin in the first place.

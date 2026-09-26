@@ -325,7 +325,7 @@ pub(super) fn clear_garbage() {
 }
 
 // `PyObject_GC_IsTracked` deliberately stays where it is, answering the
-// constant 1 (`object.py:495-498`): this set holds the blocks of C-defined
+// constant 1 (`object.py`): this set holds the blocks of C-defined
 // `Py_TPFLAGS_HAVE_GC` types, and every other object pyre holds is reachable by
 // its collector too. Answering from this set would report 0 for a module or a
 // list, which are tracked.

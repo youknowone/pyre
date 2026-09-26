@@ -106,7 +106,7 @@ raises(TypeError, "must be str", lambda: codecs.encode(b"x", "utf-8"),
        "bytes to a text encoder")
 
 
-# --- `errors=None` names the strict handler at every entry point ------------
+# `errors=None` names the strict handler at every entry point
 NONE_CASES = [
     ("unicode_escape_decode", codecs.unicode_escape_decode, (b"a",), ("a", 1)),
     ("raw_unicode_escape_decode", codecs.raw_unicode_escape_decode, (b"a",), ("a", 1)),

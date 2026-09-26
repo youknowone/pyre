@@ -13,7 +13,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 
 /// RPython `llheap.free = lltype.free` (`llheap.py:3`).
 ///
-/// Mirrors the raw-container checks from `lltype.py:2246-2254`.  The
+/// Mirrors the raw-container checks from `lltype.py`.  The
 /// `track_allocation` flag is accepted for signature parity; pyre has no
 /// leakfinder side-channel here, so freeing is just the container `_free`.
 pub fn free(p: &_ptr, flavor: MallocFlavor, _track_allocation: bool) -> Result<(), String> {

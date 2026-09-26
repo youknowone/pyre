@@ -2,7 +2,7 @@
 # `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
 # rather than any generated code, and reads whatever the host's process
 # spawn cost happens to be that run. The jitstats baselines gate it.
-# util.py:80 _objectdir / objectobject.py:324 — dir() of a dict instance lists
+# util.py:80 _objectdir / objectobject.py descr__dir__ — dir() of a dict instance lists  allow-line-citation
 # the dict type's attributes (object.__dir__), NOT the dict's own keys.
 
 

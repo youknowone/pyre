@@ -1,6 +1,6 @@
 use majit_ir::Type;
 
-/// pypy/module/pypyjit/interp_jit.py:66-69 — jd0 portal driver layout.
+/// pypy/module/pypyjit/interp_jit.py PyPyJitDriver — jd0 portal driver layout.
 pub const PYPYJIT_GREEN_VARS: [(&str, Type); 3] = [
     ("next_instr", Type::Int),
     ("is_being_profiled", Type::Int),

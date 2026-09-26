@@ -2,7 +2,7 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-/// `lib_pypy/resource.py:15-37 class struct_rusage(
+/// `lib_pypy/resource.py class struct_rusage(
 /// metaclass=structseqtype)` — process-wide cached subclass-of-tuple
 /// type.
 static STRUCT_RUSAGE_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -41,7 +41,7 @@ fn struct_rusage_type() -> pyre_object::PyObjectRef {
 /// and RLIMIT_* constants, the `struct_rusage` type attribute, and the
 /// `error = OSError` alias.  Backed by `rustpython_host_env::resource`.
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    // `lib_pypy/resource.py:13 error = OSError` and
+    // `lib_pypy/resource.py error = OSError` and
     // `:15-37 class struct_rusage`.
     let w_os_error = pyre_interpreter::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before init_resource");

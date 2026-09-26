@@ -303,7 +303,7 @@ mod test {
         assert_eq!(sig.tuple_view().2, Some("kw"));
     }
 
-    // ---- CallSpec ----
+    // CallSpec
 
     // Line-by-line port of `test_argument.py:test_flatten_CallSpec`.
     // Upstream uses plain Python ints (e.g. `CallSpec([1, 2, 3])`).

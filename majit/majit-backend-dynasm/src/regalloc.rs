@@ -535,7 +535,7 @@ pub struct FrameManager {
 }
 
 impl FrameManager {
-    /// regalloc.py:68 + x86/regalloc.py:133
+    /// regalloc.py:68 + x86/regalloc.py __init__  allow-line-citation
     pub fn new(base_ofs: i32) -> Self {
         FrameManager {
             current_frame_depth: 0,
@@ -725,7 +725,7 @@ impl FrameManager {
 /// RPython: rbp points past the frame header, slots grow downward:
 ///   -(position+1)*WORD + base_ofs
 ///
-/// aarch64/locations.py:157 / arm/locations.py:184
+/// aarch64/locations.py get_fp_offset / arm/locations.py get_fp_offset
 /// get_fp_offset(base_ofs, position) = base_ofs + WORD * (position + JITFRAME_FIXED_SIZE)
 ///
 /// Here `JITFRAME_FIXED_SIZE` is the arch-specific managed-register area
@@ -1786,7 +1786,7 @@ pub struct RegAlloc<'a> {
     /// Per-trace counter feeding `OpRef::fresh_temp_var()` — RPython
     /// `TempVar()` / `TempInt()` allocate a fresh Python object per
     /// call (`x86/regalloc.py:470,514,521,605`,
-    /// `aarch64/regalloc.py:990`); pyre's flat-OpRef encoding needs a
+    /// `aarch64/regalloc.py`); pyre's flat-OpRef encoding needs a
     /// counter to feed the unique raw payload reservation.
     temp_var_counter: u32,
     /// Failarg locations for every guard in this walk. `locs_for_fail`
@@ -1850,7 +1850,7 @@ impl<'a> RegAlloc<'a> {
         OpRef::fresh_temp_var(counter)
     }
 
-    /// rpython/jit/metainterp/history.py:220 `box.type` parity.
+    /// rpython/jit/metainterp/history.py is_constant `box.type` parity.
     /// Single source of truth: `op.type_` for ops, `inputarg.tp` for
     /// inputargs, and the variant tag for constant OpRefs.  During the
     /// regalloc walk, flat-OpRef collisions are resolved at the current
@@ -1864,7 +1864,7 @@ impl<'a> RegAlloc<'a> {
 
     #[inline]
     fn opref_type_at(&self, opref: OpRef, at_op_index: Option<usize>) -> Option<Type> {
-        // history.py:182 / resoperation.py:29: `box.type` lives on the
+        // history.py:182 / resoperation.py AbstractValue: `box.type` lives on the  allow-line-citation
         // Box object itself; pyre's typed `OpRef` variants carry the
         // matching type tag (ConstInt/InputArgInt/IntOp …) so the
         // variant tag IS Box class identity. Delegate to the shared
@@ -3431,7 +3431,7 @@ impl<'a> RegAlloc<'a> {
             // `prepare_op_cast_int_to_float` (:502-503): the argument is read
             // through the manager owning the ARGUMENT's type and the result is
             // allocated through the manager owning the OP's type. x86 spells
-            // the same split out at x86/regalloc.py:719-727 / :730-738
+            // the same split out at x86/regalloc.py consider_convert_float_bytes_to_longlong / :730-738
             // (`xrm.make_sure_var_in_reg` + `rm.force_allocate_reg`, and the
             // mirror image). These ops REINTERPRET the bits across the two
             // register files, so `consider_same_as` — which reads the argument
@@ -3462,7 +3462,7 @@ impl<'a> RegAlloc<'a> {
             OpCode::GuardClass | OpCode::GuardNonnullClass | OpCode::GuardGcType => {
                 self.consider_guard_class(op, i, output);
             }
-            // x86/regalloc.py:455,492-494
+            // x86/regalloc.py consider_guard_no_exception
             OpCode::GuardNoException
             | OpCode::GuardNoOverflow
             | OpCode::GuardOverflow
@@ -3472,11 +3472,11 @@ impl<'a> RegAlloc<'a> {
             OpCode::GuardNotForced2 => {
                 self.consider_guard_not_forced_2(op, i, output);
             }
-            // x86/regalloc.py:458
+            // x86/regalloc.py consider_guard_not_invalidated
             OpCode::GuardNotInvalidated => {
                 self.consider_guard_no_args(op, i, output);
             }
-            // x86/regalloc.py:468
+            // x86/regalloc.py consider_guard_exception
             OpCode::GuardException => {
                 self.consider_guard_exception(op, i, output);
             }
@@ -3649,7 +3649,7 @@ impl<'a> RegAlloc<'a> {
             OpCode::SaveException | OpCode::SaveExcClass => {
                 self.consider_no_arg_result(op, i, output);
             }
-            // x86/regalloc.py:486
+            // x86/regalloc.py consider_restore_exception
             OpCode::RestoreException => {
                 self.consider_restore_exception(op, i, output);
             }
@@ -3826,7 +3826,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py consider_int_lshift (shift operations need ecx)
-    /// arm/regalloc.py:493-497 prepare_op_{int,uint}_rshift/int_lshift
+    /// arm/regalloc.py prepare_op_{int,uint}_rshift/int_lshift
     /// use the regular RI path with no fixed register.
     fn consider_int_lshift(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         #[cfg(target_arch = "aarch64")]
@@ -3941,7 +3941,7 @@ impl<'a> RegAlloc<'a> {
     ///
     /// - `Guard{True,False,Nonnull,Isnull}` via `implement_guard`.
     /// - `CondCallN` via `guard_success_cc` (see
-    ///   `genop_discard_cond_call`, mirrors `x86/assembler.py:2526
+    ///   `genop_discard_cond_call`, mirrors `x86/assembler.py
     ///   cond_call`).
     fn next_op_can_accept_cc<T: AsRef<Op>>(&self, ops: &[T], i: usize, result: OpRef) -> bool {
         if i + 1 >= ops.len() {
@@ -5366,7 +5366,7 @@ impl<'a> RegAlloc<'a> {
         // call_assembler frame helpers allocate PyFrames and can collect
         // before the following vable_token materialization reads inputarg 0.
         //
-        // x86/callbuilder.py:93 + aarch64/callbuilder.py:70 exclude the
+        // x86/callbuilder.py push_gcmap + aarch64/callbuilder.py push_gcmap exclude the
         // call_result_gpr from the gcmap so its post-call payload is not
         // mistaken for a live Ref root before the result-extension step
         // narrows it to the declared result type.
@@ -5465,7 +5465,7 @@ impl<'a> RegAlloc<'a> {
         // so a collecting callee must record the live Ref slots that
         // before_call just synced to the jitframe.  call_result_gpr is
         // excluded for the same reason as `consider_call`
-        // (x86/callbuilder.py:93, aarch64/callbuilder.py:70).
+        // (x86/callbuilder.py push_gcmap, aarch64/callbuilder.py push_gcmap).
         let gcmap = if can_collect {
             Some(self.get_gcmap(&[call_result_gpr()], false) as usize)
         } else {
@@ -5745,7 +5745,7 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, arglocs, result_loc, output);
     }
 
-    /// aarch64/regalloc.py:958 / x86/regalloc.py:1013
+    /// aarch64/regalloc.py prepare_op_call_malloc_nursery / x86/regalloc.py consider_call_malloc_nursery
     /// prepare/consider_call_malloc_nursery parity. Move or spill only the
     /// nursery bump registers. The AArch64 emitter uses x0/x1 plus reserved IP
     /// scratch registers; collecting slow paths save/restore the other
@@ -5779,7 +5779,7 @@ impl<'a> RegAlloc<'a> {
         );
         // aarch64/regalloc.py: t = TempInt();
         //   force_allocate_reg(t, selected_reg=r.x1)
-        // x86/regalloc.py:1025-1026: tmp_box = TempVar();
+        // x86/regalloc.py: tmp_box = TempVar();
         //   force_allocate_reg(tmp_box, selected_reg=edx)
         // The nursery bump path needs the second register
         // (`MALLOC_NURSERY_CLOBBER[1]`) reserved before `get_gcmap` so that
@@ -6335,8 +6335,8 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// Select the inline-store or residual-memset ZERO_ARRAY path using the
-    /// same per-backend limits as upstream.  x86/regalloc.py:1436-1503 does
-    /// this split in regalloc; aarch64/opassembler.py:755-839 does it while
+    /// same per-backend limits as upstream.  x86/regalloc.py consider_zero_array does
+    /// this split in regalloc; aarch64/opassembler.py emit_op_zero_array does it while
     /// emitting, but the residual call still needs `before_call` here so only
     /// live caller-saved registers are preserved.
     fn zero_array_uses_memset(&self, op: &Op) -> bool {
@@ -6741,7 +6741,7 @@ mod tests {
 
     #[test]
     fn test_fixed_nursery_malloc_keeps_unrelated_live_register_bound() {
-        // aarch64/regalloc.py:958-970 and x86/regalloc.py:1013-1034 move
+        // aarch64/regalloc.py prepare_op_call_malloc_nursery and x86/regalloc.py consider_call_malloc_nursery move
         // values away from the two malloc-cond registers only.  In
         // particular, a live Ref in any other managed register stays there;
         // the collecting slow path saves and restores it through the

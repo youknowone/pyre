@@ -54,7 +54,7 @@ impl JitMarkerKind {
     /// `annotate_hooks` branch (`rlib/jit.py`) and as the
     /// `methodname` carried on the [`crate::annotator::model::SomeBuiltin`]
     /// returned by the marker's `compute_annotation` (mirroring upstream
-    /// `extregistry.py:62-67` base implementation).
+    /// `extregistry.py` base implementation).
     pub fn upstream_method_name(self) -> &'static str {
         match self {
             JitMarkerKind::JitMergePoint => "jit_merge_point",
@@ -87,7 +87,7 @@ pub const LOOP_HEADER_ANALYSER_NAME: &str = "rlib.jit.ExtLoopHeader.loop_header"
 /// Translator-side mirror of the runtime `PyPyJitDriver` (eval.rs)
 /// fields that `ExtEnterLeaveMarker` / `ExtLoopHeader` consume. RPython
 /// keeps a single `JitDriver` instance reachable from
-/// `ExtRegistryEntry.instance.im_self` (rlib/jit.py:892) — the Rust
+/// `ExtRegistryEntry.instance.im_self` (rlib/jit.py) — the Rust
 /// port stores the same fields here behind an `Arc` so multiple
 /// registry variants for the same driver share the metadata identity.
 ///

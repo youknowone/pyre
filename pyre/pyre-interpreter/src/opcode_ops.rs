@@ -378,7 +378,7 @@ pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
 // run exactly the same code.
 
 /// `MATCH_MAPPING` — push whether the subject is a mapping.
-/// `pyopcode.py:1776` reads `flag_patma_collection` and only falls back to
+/// `pyopcode.py` reads `flag_patma_collection` and only falls back to
 /// `ismapping_w` when the type declares neither marker; every pyre type
 /// carries the marker, so the flag read is the whole test.  This is the raw
 /// mapping marker, not `__getitem__` duck-typing — that is the
@@ -392,7 +392,7 @@ pub fn match_mapping_value(subject: PyObjectRef) -> PyObjectRef {
 }
 
 /// `MATCH_SEQUENCE` — push whether the subject is a sequence.
-/// `pyopcode.py:1759`, mirroring [`match_mapping_value`].
+/// `pyopcode.py`, mirroring [`match_mapping_value`].
 pub fn match_sequence_value(subject: PyObjectRef) -> PyObjectRef {
     let is_sequence = unsafe {
         let ty = crate::typedef::r#type(subject).map_or(std::ptr::null_mut(), |p| p.as_ptr());

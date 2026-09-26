@@ -15,7 +15,7 @@ use super::model::{
 };
 use super::pygraph::PyGraph;
 
-/// RPython `rpython/flowspace/generator.py:14-16` — `class
+/// RPython `rpython/flowspace/generator.py AbstractPosition` — `class
 /// AbstractPosition`. Marker used by generator graphs to tag
 /// `Entry` / `Resume<n>` subclasses.
 pub trait AbstractPosition: core::fmt::Debug {}

@@ -32,7 +32,7 @@ impl CallPath {
     /// free-fn shape and forced macro-side heuristics; this form
     /// restores uniformity (RPython parity: `getfunctionptr(graph)` is
     /// string-free and does not distinguish the two shapes
-    /// `rpython/jit/codewriter/call.py:174-187`).
+    /// `rpython/jit/codewriter/call.py get_jitcode_calldescr`).
     ///
     // Structural adaptation: Rust `::` ↔ PyPy `.` path separator.
     // `impl_type_joined` may arrive in either spelling — Rust extraction

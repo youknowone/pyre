@@ -30,7 +30,7 @@ use majit_ir::{
 // module records the removal): `VirtualizableFieldState.fields` is keyed
 // by `FieldDescr::index_in_parent()` now, matching
 // `info.AbstractStructPtrInfo._fields[fielddescr.get_index()]`
-// (`info.py:203-206`). What the tags still buy is disjoint index ranges,
+// (`info.py`). What the tags still buy is disjoint index ranges,
 // so two descr kinds cannot collide on one `HeapCache` key — a flat
 // counter would have to preserve that much and nothing else.
 /// `symbolic.py WORD` — the target pointer width. Every `Type::Ref`
@@ -181,7 +181,7 @@ pub struct PyreFieldDescr {
     index_in_parent: usize,
     parent_descr: Option<Weak<dyn Descr>>,
     /// `effectinfo.py compute_bitstrings` ei_index. `u32::MAX` until
-    /// the codewriter publishes its `field_index` (`effectinfo.py:307-311`)
+    /// the codewriter publishes its `field_index` (`effectinfo.py`)
     /// onto this descr.
     ei_index: AtomicU32,
 }
@@ -194,7 +194,7 @@ pub struct PyreFieldDescr {
 /// `array_type_id` carries the codewriter lltype-identity proxy
 /// (`majit-translate/src/codewriter/call.rs::DescrIndexRegistry::array_index`
 /// key) so the runtime registry's identity domain matches PyPy's
-/// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py:348-360`) keyed
+/// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py`) keyed
 /// on the actual lltype object: two BhDescr::Array entries that
 /// disagree only on the Rust type spelling
 /// (e.g. `"Vec<Foo>"` vs `"Vec<Bar>"` with both at `type_id == 0`)
@@ -596,7 +596,7 @@ pub struct PyreSizeDescr {
     all_fielddescrs: Vec<Arc<dyn FieldDescr>>,
     /// descr.py `self.gc_fielddescrs = gc_fielddescrs` — precomputed
     /// subset of `all_fielddescrs` via `is_pointer_field()`
-    /// (heaptracker.py:94-95 + :70 filter).
+    /// (heaptracker.py + :70 filter).
     gc_fielddescrs: Vec<Arc<dyn FieldDescr>>,
 }
 
@@ -605,7 +605,7 @@ struct PyreObjectDescrGroup {
     /// This group's own fields, in the order its static table declared them.
     ///
     /// Static accessors index by their table position, so they must read this
-    /// list. `descr.py:218-239` still makes each Arc shared by
+    /// list. `descr.py get_field_descr` still makes each Arc shared by
     /// `(STRUCT, fieldname)`, while each SizeDescr keeps its own frozen
     /// positional field list.
     field_descrs: Vec<Arc<majit_ir::descr::SimpleFieldDescr>>,
@@ -636,7 +636,7 @@ impl<T: FieldDescrGroup> FieldDescrGroup for LazyLock<T> {
 /// GC type id for the `rclass.OBJECT` root — pyre's static `INSTANCE_TYPE`
 /// PyType (`name = "object"`). All `PyObject`-layout subclasses chain
 /// their `parent` field to this id so `assign_inheritance_ids`
-/// (normalizecalls.py:373-389) emits a `subclassrange_{min,max}` covering
+/// (normalizecalls.py) emits a `subclassrange_{min,max}` covering
 /// every descendant. `GUARD_SUBCLASS(obj, &INSTANCE_TYPE)` then succeeds
 /// for any `is_object` instance via `int_between(root.min, obj_typeid.min,
 /// root.max)` (rclass.py `ll_issubclass`).
@@ -2080,7 +2080,7 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// (`virtualize.py:210 fielddescr.get_index()`) and its `PtrInfo._fields` key
 /// in the heap optimizer, so two fields sharing one number makes a read of
 /// either resolve to the other's cached value and a virtual keep only the
-/// later of the two stores.  Two things assign it: `descr.py:218-239` caches a
+/// later of the two stores.  Two things assign it: `descr.py` caches a
 /// FieldDescr per `(STRUCT, fieldname)` and a cache hit reports the analyzer's
 /// number, which counts the struct's own fields past the flattened header;
 /// a miss numbers the field by its position in this list.  Keeping the list in
@@ -2265,7 +2265,7 @@ static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// the two sides that mint its descr disagree on the number.
 ///
 /// `w_function` and `w_self` are marked immutable per
-/// `pypy/interpreter/function.py:567`
+/// `pypy/interpreter/function.py`
 /// `_Method._immutable_fields_ = ['w_function', 'w_instance']`. `w_class`
 /// is not listed there and stays mutable; `w_module` is written after
 /// construction by `w_method_set_module` and is mutable for that reason.
@@ -2791,7 +2791,7 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 });
 
 static SPECIALISED_TUPLE_II_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    // `specialisedtupleobject.py:34` `_immutable_fields_ = ['value0',
+    // `specialisedtupleobject.py cls` `_immutable_fields_ = ['value0',
     // 'value1']` — both fields immutable. Inline-field shape, no array
     // indirection.
     use pyre_object::specialisedtupleobject::*;
@@ -3433,7 +3433,7 @@ pub fn make_array_descr(
 ) -> DescrRef {
     let descr_id = alloc_array_descr_id();
     // No identity carrier — fresh mint per call (cache_key = 0 means "no
-    // cache slot").  Single flag-bearing `SimpleArrayDescr` (descr.py:273-279);
+    // cache slot").  Single flag-bearing `SimpleArrayDescr` (descr.py ArrayDescr);
     // index carries the content-addressed `ARRAY_DESCR_TAG | descr_id`.
     let index = ARRAY_DESCR_TAG | (descr_id & 0x0FFF_FFFF);
     let mut array_descr = majit_ir::descr::SimpleArrayDescr::with_flag(
@@ -3464,7 +3464,7 @@ pub fn make_array_descr_with_type(
 /// key) into `ArrayDescrKey` so two BhDescr::Array entries with
 /// identical structural fields but different lltype spellings receive
 /// distinct registry slots — matching upstream
-/// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py:348-360`).
+/// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py get_array_descr`).
 pub fn make_array_descr_with_full_id(
     base_size: usize,
     item_size: usize,
@@ -3953,7 +3953,7 @@ pub fn w_function_size_descr() -> DescrRef {
 }
 
 /// `W_DictObject.dstorage` — the strategy-erased storage box
-/// (`dictmultiobject.py:47`). Read as a `Ref` only after the trace has pinned
+/// (`dictmultiobject.py`). Read as a `Ref` only after the trace has pinned
 /// the strategy through [`dict_strategy_word_descr`], because what the pointer
 /// addresses is whatever the live strategy erased into it.
 /// Reached by census index rather than by offset: `dstorage_lookup_ns` covers
@@ -4392,7 +4392,7 @@ pub fn holder_typ_descr() -> DescrRef {
 /// The declaration is on the hook list itself; the field watched here is the
 /// byte `AuditHolder` projects it onto, because a `Box<[W_Root]>` has no
 /// target-stable null spelling.  That projection carries the whole datum a
-/// reader needs: `vm.py:481` tests only `hooks_w is None`, and the no-hook
+/// reader needs: `vm.py` tests only `hooks_w is None`, and the no-hook
 /// fold (`try_walker_specialize_sys_getframe`) pins that read. Once a hook
 /// exists the same fold residuals `trigger_audit_events` instead.
 ///
@@ -4591,7 +4591,7 @@ fn build_native_user_mapdict_group(
     );
     // The annotator can publish the shared `(STRUCT, fieldname)` shells before
     // this runtime group is forced. `get_field_descr` correctly reuses those
-    // objects (descr.py:218-239), but their placeholder index is `u32::MAX`.
+    // objects (descr.py), but their placeholder index is `u32::MAX`.
     // Stamp the two shared descriptors after the cache lookup so HeapCache
     // cannot alias map and storage through that placeholder.
     group.field_descrs[0].set_index(tag);
@@ -4641,7 +4641,7 @@ static W_TUPLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
 /// `W_ObjectObject.map` (`objectobject.rs`) — the instance shape word,
 /// `self.map` of PyPy's `MapdictStorageMixin` (`mapdict.py`). Read as an
 /// `Int` word so the LOAD_ATTR fast path can `guard_value` it to a constant map
-/// (`jit.promote(self.map)`, mapdict.py:905), after which the resolved
+/// (`jit.promote(self.map)`, mapdict.py), after which the resolved
 /// `storageindex` is a green constant. The map nodes are interned + immortal,
 /// so the address is a stable identity and the guard need not treat it as a GC
 /// ref — the field is declared `usize` so the translator lowers its reads to
@@ -4801,7 +4801,7 @@ pub fn tuple_hash_descr() -> DescrRef {
 }
 
 /// `W_SpecialisedTupleObject_ii.value0` — inline `i64` per
-/// `specialisedtupleobject.py:34-44`. Immutable.
+/// `specialisedtupleobject.py cls`. Immutable.
 pub fn specialised_tuple_ii_value0_descr() -> DescrRef {
     field_descr_from_group(&SPECIALISED_TUPLE_II_DESCR_GROUP, 0)
 }
@@ -7035,7 +7035,7 @@ mod tests {
         // downstream consumers can distinguish singlefloat from a real
         // int result.  pyre's `result_class()` returns the raw char
         // (matches `descr.py get_result_type()`); the normalized
-        // form per descr.py:527-532 (collapsing 'S' → 'i') is not yet
+        // form per descr.py (collapsing 'S' → 'i') is not yet
         // exposed as a separate method but the underlying `result_type`
         // is already `Type::Int`, which is the normalized view.
         assert_eq!(call.result_class(), 'S');
@@ -7785,11 +7785,11 @@ mod tests {
         assert!(array.is_array_of_structs());
         // `type_id` is the dense sequential GC tid allocated by
         // `GcCache::init_array_descr` (analog of `gc.py
-        // GcLLDescr_framework.init_array_descr` + `gctypelayout.py:301-357
+        // GcLLDescr_framework.init_array_descr` + `gctypelayout.py TypeLayoutBuilder
         // TypeLayoutBuilder.get_type_id`).  Exact value depends on the
         // global allocator state — test-suite ordering is non-deterministic
         // so we only assert it is non-zero (tid 0 reserved per
-        // `gctypelayout.py:328-331`).  The structural identity that
+        // `gctypelayout.py`).  The structural identity that
         // round-trips through `BhDescr::Array.type_id` (path_hash payload)
         // lives in `cache_key` (`ArrayDescr::cache_key`), independent of the
         // GC tid.
@@ -7849,7 +7849,7 @@ pub fn make_jit_w_long_fits_int_calldescr() -> DescrRef {
 
 /// CallDescr for `pyre_object::longobject::jit_w_long_toint(obj) -> i64`.
 /// `W_LongObject.toint()` (longobject.py) → `rbigint.toint()`
-/// (rbigint.py:465) — `EF_ELIDABLE_CANNOT_RAISE` because the caller
+/// (rbigint.py) — `EF_ELIDABLE_CANNOT_RAISE` because the caller
 /// emits a fits_int GUARD_TRUE before invoking; OverflowError is
 /// statically unreachable post-guard.
 pub fn make_jit_w_long_toint_calldescr() -> DescrRef {
@@ -7915,7 +7915,7 @@ fn simple_field_spec_from_bh(
 /// `build_object_descr_group_with_def_path` keys a group as
 /// `path_hash(def_path)`, which is the `GcCache` `(STRUCT, fieldname)`
 /// namespace a serialized `BhDescr` resolves into as well.  The two producers
-/// do not carry the same information: a group spells out `descr.py:229
+/// do not carry the same information: a group spells out `descr.py
 /// STRUCT._immutable_field(fieldname)` for each field, while the codewriter's
 /// `immutable_fields_by_struct` is empty for the whole LLBC pipeline, so every
 /// field a `BhDescr` describes reads as plain mutable.  `GcCache` hands the
@@ -8243,7 +8243,7 @@ fn bh_field_cache_key(owner: &str, name: &str) -> String {
 /// so the freshly-minted `SimpleArrayDescr` lands in
 /// `gc_cache._cache_array[LLType::Array(cache_key)]` in addition to
 /// the snapshot order Vec.  Mirrors PyPy `cpu.arraydescrof(ARRAY)`
-/// per-ARRAY cache identity (`descr.py:348-378`).  `cache_key == 0`
+/// per-ARRAY cache identity (`descr.py get_array_descr`).  `cache_key == 0`
 /// is the no-identity sentinel — registers via the non-keyed path.
 pub fn make_struct_array_descr_full_keyed(
     descr_index: u32,
@@ -8807,7 +8807,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             // RPython `descr.py FieldDescr.get_index()` returns
             // the value `heaptracker.get_fielddescr_index_in(STRUCT,
             // name)` recorded into `FieldDescr.index` at construction
-            // time (`descr.py:200`).  Pyre's `BhDescr::Field` carries
+            // time (`descr.py`).  Pyre's `BhDescr::Field` carries
             // that as `index_in_parent`; thread it through as
             // `BhFieldSpec.index` so the `parent` matching fallback
             // produces a `SimpleFieldDescr` whose `index()` matches the
@@ -8922,7 +8922,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                 );
                 runtime
             } else {
-                // `descr.py:348-360 gccache._cache_array[ARRAY_OR_STRUCT]`
+                // `descr.py get_array_descr gccache._cache_array[ARRAY_OR_STRUCT]`
                 // is keyed on lltype object identity; thread the
                 // codewriter `array_type_id` across the BhDescr
                 // boundary into the runtime `ArrayDescrKey` so two
@@ -8990,7 +8990,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             // shipped a non-empty `all_fielddescrs`, build the parent
             // `SimpleSizeDescr` via the cyclic `make_simple_descr_group`
             // path so `Arc<SimpleFieldDescr>` parents back-reference
-            // the same `SimpleSizeDescr` (`descr.py:200` parent slot).
+            // the same `SimpleSizeDescr` (`descr.py` parent slot).
             // The transient short-lived `BhDescr::Size` constructed in
             // `pyre-jit/src/eval.rs` (`bh_new` / `bh_new_with_vtable`
             // dispatch) carries an empty list and falls through to the
@@ -9048,14 +9048,14 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             // rebuilt `InteriorFieldDescr.arraydescr` shares the
             // `gc_cache._cache_array[LLType::Array(cache_key)]` identity rather
             // than a fresh local mint, and re-attaches `all_interiorfielddescrs`
-            // (`descr.py:372-375`).  `type_id` is the producer-side cache key
+            // (`descr.py`).  `type_id` is the producer-side cache key
             // (`ArrayDescr.cache_key` = `path_hash(array_type_id)`); the u32
             // gc-tid slot is ignored on the cache path (`init_array_descr`
             // stamps the real tid), keeping ARRAY identity cache key separate
             // from GC layout tid.  On a cache MISS the factory requests
             // `ArrayFlag::Struct`, so the minted arraydescr is FLAG_STRUCT; on a
             // cache HIT the existing slot is reused verbatim, so the resolved
-            // arraydescr is re-checked against `descr.py:389`'s
+            // arraydescr is re-checked against `descr.py`'s
             // `assert arraydescr.flag == FLAG_STRUCT` below.
             let array_dyn = make_struct_array_descr_full_keyed(
                 u32::MAX,
@@ -9190,7 +9190,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
 /// slot, so minting through it would publish a parent with an empty field
 /// list, win `_cache_field` by first-write, and leave
 /// `SizeDescr.all_fielddescrs` and `_cache_field` describing different
-/// objects — breaking the positional invariant `heaptracker.py:76-101
+/// objects — breaking the positional invariant `heaptracker.py
 /// get_fielddescr_index_in` establishes and `optimizeopt/info.rs force_box`
 /// asserts.
 ///
@@ -9204,7 +9204,7 @@ enum SetMemberLookup {
     /// **Upstream cannot reach this.** `cpu.*descrof` and `compute_bitstrings`
     /// share one gccache in one process, so `setup_descrs` (`descr.py`)
     /// snapshots the very cache the raw-set descrs were minted into and
-    /// `effectinfo.py:465-499` only ever unions descrs that are already there.
+    /// `effectinfo.py` only ever unions descrs that are already there.
     /// A member that fails to resolve is therefore not a legitimate projection
     /// but a divergence, and its count is a badness counter held at zero
     /// (`descr_set_absent` on the `[jit-stats]` line) — pyre's form of the bare
@@ -9243,7 +9243,7 @@ enum SetMemberLookup {
 /// slot, so minting through it would publish a parent with an empty field
 /// list, win `_cache_field` by first-write, and leave
 /// `SizeDescr.all_fielddescrs` and `_cache_field` describing different
-/// objects — breaking the positional invariant `heaptracker.py:76-101
+/// objects — breaking the positional invariant `heaptracker.py
 /// get_fielddescr_index_in` establishes and `optimizeopt/info.rs force_box`
 /// asserts.
 /// Ledger of every serialized raw-set member that came back
@@ -9294,7 +9294,7 @@ enum SetMemberLookup {
 ///
 /// The slots left empty are the ones no opcode names, which is why
 /// `descrs.bin` — RPython's `opcode_descrs`, not its `all_descrs` — does not
-/// carry them.  Upstream has that population too: `effectinfo.py:300-322`
+/// carry them.  Upstream has that population too: `effectinfo.py`
 /// builds every raw set through `cpu.fielddescrof` / `arraydescrof` /
 /// `interiorfielddescrof`, a cache-or-mint into the gccache that runs whether
 /// or not any operation names the field, and `descr.py setup_descrs`
@@ -9393,7 +9393,7 @@ fn mint_field(
     // Only an empty slot is this function's business: an unresolvable member is
     // by definition one nothing has filled, and a filled slot already belongs
     // to whoever published it. `get_field_descr` would return that owner's
-    // descr anyway (`descr.py:220-221`), so taking the hit through it changes
+    // descr anyway (`descr.py`), so taking the hit through it changes
     // nothing except to offer a second opinion on the layout — and the two
     // producers do not agree on one field of it. `index_in_parent` here is the
     // analyzer's `field_pos`, which counts the header words at offsets 0 and 8
@@ -9654,13 +9654,13 @@ pub(crate) fn stamp_effect_info_descr(
 /// exactly as `effectinfo.py frozenset_or_none` /
 /// `canonicalize_descr_set`.
 ///
-/// All six sets or none of them: `effectinfo.py:149-162` makes them `None`
+/// All six sets or none of them: `effectinfo.py` makes them `None`
 /// **iff** the EI is `EF_RANDOM_EFFECTS`, and `compute_bitstrings`
-/// (`effectinfo.py:484-489`) asserts that biconditional before deciding
+/// (`effectinfo.py`) asserts that biconditional before deciding
 /// whether to clear the bitstrings.  A half-populated EI would clear them
 /// while `extraeffect` still claims concrete effects, and the next
 /// `check_readonly_descr_field` would then read a `None` bitstring.
-/// `effectinfo.py:285-292` wildcard: the shape to fall back to whenever the
+/// `effectinfo.py` wildcard: the shape to fall back to whenever the
 /// concrete sets cannot be rebuilt faithfully.  Conservative in the sound
 /// direction — `has_random_effects()` makes every heap consumer assume the
 /// call touched everything.
@@ -9673,7 +9673,7 @@ pub(crate) fn stamp_effect_info_descr(
 /// the raw set directly (`writes_field_descr_by_identity`, which
 /// `OptHeap::force_from_effectinfo` uses before `compute_bitstrings` has run)
 /// would take the unsound half, and `compute_bitstrings` asserts the
-/// biconditional outright (`effectinfo.py:484-489`).
+/// biconditional outright (`effectinfo.py`).
 fn degrade_to_random_effects(ei: &mut majit_ir::EffectInfo) {
     ei.extraeffect = majit_ir::ExtraEffect::RandomEffects;
     // effectinfo.py:364-365 — the wildcard forces can_collect.
@@ -9807,7 +9807,7 @@ pub fn rehydrate_effect_info(ei: &mut majit_ir::EffectInfo) {
 /// both outputs, resolving every member here is an invariant check, not
 /// runtime state construction. `single_write_descr_array` is the one raw
 /// descriptor reference EffectInfo deliberately keeps after compaction
-/// (`effectinfo.py:201-206`), so that singleton alone remains live.
+/// (`effectinfo.py`), so that singleton alone remains live.
 pub fn prepare_frozen_effect_info(ei: &mut majit_ir::EffectInfo) {
     // Shared with `rehydrate_effect_info` rather than spelled out again: the
     // two had drifted, and this one was clearing only the compacted sets while
@@ -9922,7 +9922,7 @@ pub fn make_call_descr_from_bh(bh: &majit_jitcode::jitcode::BhCallDescr) -> Desc
 
 /// descr.py InteriorFieldDescr for SETINTERIORFIELD_GC.
 /// assert arraydescr.flag == FLAG_STRUCT.
-/// llmodel.py:648-665: bh_setinteriorfield_gc_{i,r,f} computes
+/// llmodel.py bh_setinteriorfield_gc_i: bh_setinteriorfield_gc_{i,r,f} computes
 /// offset = arraydescr.basesize + itemindex * itemsize + fielddescr.offset.
 pub fn make_interior_field_descr(
     array_descr_index: u32,
@@ -10088,7 +10088,7 @@ mod set_member_lookup_tests {
 
     /// The point of carrying the mint arguments across the build/runtime split:
     /// a container this process would never otherwise name resolves anyway,
-    /// because the publish takes the same `descr.py:224-238` miss branch the
+    /// because the publish takes the same `descr.py` miss branch the
     /// analyzer took. Without it the member reads `AbsentContainer` — which is
     /// the pre-state this asserts first, on the same key.
     #[test]

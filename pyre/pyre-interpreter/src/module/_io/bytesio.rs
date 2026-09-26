@@ -44,7 +44,7 @@ impl W_BytesIO {
         if self.buffer.is_null() {
             return Ok(());
         }
-        // interp_bytesio.py:91-94.  `export_count` lives on the bytearray
+        // interp_bytesio.py _check_exports.  `export_count` lives on the bytearray
         // rather than beside `pos`: `getbuffer` hands out a view of that
         // object, so its own exporter lock already counts the live views and
         // releases them, where upstream's `BytesIOView.releasebuffer` has to
@@ -267,7 +267,7 @@ impl W_BytesIO {
             buffer: pyre_object::gc_roots::shadow_stack_get(slot),
             ..W_BytesIO::default()
         });
-        // interp_bytesio.py:197-199: only a subclass needs finalization; line
+        // interp_bytesio.py needs_finalizer: only a subclass needs finalization; line
         // 70 also opts this in-memory stream out of the autoflusher.
         let needs_finalizer = !cls.is_null() && !std::ptr::eq(cls, type_object());
         super::tag_io_instance_without_autoflusher(obj, cls, needs_finalizer)
@@ -293,7 +293,7 @@ impl W_BytesIO {
         &mut self,
         #[default(pyre_object::w_none())] w_size: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
-        // interp_bytesio.py:96-100 plus interp_iobase.py `convert_size`.
+        // interp_bytesio.py read_w plus interp_iobase.py `convert_size`.
         self.check_closed()?;
         let size = super::iobase_convert_size(w_size)?;
         Ok(pyre_object::bytesobject::w_bytes_from_bytes(
@@ -322,7 +322,7 @@ impl W_BytesIO {
     }
 
     fn readinto(&mut self, w_buffer: PyObjectRef) -> Result<i64, crate::PyError> {
-        // interp_bytesio.py:109-116: hold the writable export through copy.
+        // interp_bytesio.py readinto_w: hold the writable export through copy.
         self.check_closed()?;
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = self.pin_self();
@@ -338,7 +338,7 @@ impl W_BytesIO {
     }
 
     fn write(&mut self, w_data: PyObjectRef) -> Result<i64, crate::PyError> {
-        // interp_bytesio.py:118-127: check state before acquiring one
+        // interp_bytesio.py write_w: check state before acquiring one
         // contiguous read-only buffer, then copy its bytes once.
         self.check_closed()?;
         self.check_exports()?;
@@ -358,7 +358,7 @@ impl W_BytesIO {
         &mut self,
         #[default(pyre_object::w_none())] w_size: PyObjectRef,
     ) -> Result<i64, crate::PyError> {
-        // interp_bytesio.py:129-147.
+        // interp_bytesio.py truncate_w.
         self.check_closed()?;
         self.check_exports()?;
         let pos = self.tell_pos();
@@ -385,7 +385,7 @@ impl W_BytesIO {
     }
 
     fn getbuffer(&mut self) -> Result<PyObjectRef, crate::PyError> {
-        // interp_bytesio.py:149-152. The bytearray exporter owns the release
+        // interp_bytesio.py getbuffer_w. The bytearray exporter owns the release
         // accounting, while the BytesIO remains the view's reported owner.
         self.check_closed()?;
         Ok(crate::builtins::w_memoryview_new_simple_with_owner(
@@ -395,7 +395,7 @@ impl W_BytesIO {
     }
 
     fn getvalue(&self) -> Result<PyObjectRef, crate::PyError> {
-        // interp_bytesio.py:154-157.
+        // interp_bytesio.py getvalue_w.
         self.check_closed()?;
         Ok(pyre_object::bytesobject::w_bytes_from_bytes(unsafe {
             pyre_object::bytearrayobject::w_bytearray_data(self.buffer)
@@ -496,7 +496,7 @@ impl W_BytesIO {
     }
 
     fn __getstate__(&self) -> Result<PyObjectRef, crate::PyError> {
-        // interp_bytesio.py:204-210, including the instance dictionary.
+        // interp_bytesio.py getstate_w, including the instance dictionary.
         self.check_closed()?;
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();

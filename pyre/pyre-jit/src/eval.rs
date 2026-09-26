@@ -466,13 +466,13 @@ unsafe fn pyre_object_hash_str_trampoline(ptr: *const u8, len: usize) -> i64 {
     pyre_interpreter::builtins::hash_str_bytes(bytes)
 }
 
-/// `pypy/objspace/std/typeobject.py:353-371
+/// `pypy/objspace/std/typeobject.py compares_by_identity
 /// W_TypeObject.compares_by_identity` trampoline.  Routes through
 /// `pyre_interpreter::baseobjspace::compares_by_identity` which
 /// walks the MRO and caches the result on
 /// `W_TypeObject.compares_by_identity_status`.  Registered at
 /// JIT init so `EmptyDictStrategy::switch_to_correct_strategy`
-/// (`dictmultiobject.py:702-705`) reaches the full
+/// (`dictmultiobject.py`) reaches the full
 /// `__eq__`/`__hash__` resolution.
 unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObjectRef) -> bool {
     unsafe { pyre_interpreter::baseobjspace::compares_by_identity(w_type) }
@@ -494,7 +494,7 @@ unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObj
 ///     `:640-662`).  Each slot is a strong root to the WEAKREF GcStruct
 ///     itself — its `weakptr` payload is invalidated separately by the
 ///     collector's `invalidate_young_weakrefs` / `invalidate_old_weakrefs`
-///     (incminimark.py:3058-3126), so passing the slot to `f` keeps the
+///     (incminimark.py), so passing the slot to `f` keeps the
 ///     WEAKREF alive without forcing the target alive.
 ///   * the managed namespace object for heap types, or the off-GC
 ///     `DictStorage` values for static builtin types.
@@ -563,7 +563,7 @@ unsafe fn type_object_destructor(obj_addr: usize) {
     if !weak_subclasses.is_null() {
         drop(unsafe { Box::from_raw(weak_subclasses) });
     }
-    // The `mutate__version_tag` instance (`quasiimmut.py:17-27
+    // The `mutate__version_tag` instance (`quasiimmut.py get_current_qmut_instance
     // get_current_qmut_instance`) is Rust-owned and off-GC too. A type that was
     // compiled against and never mutated afterwards still holds one, so without
     // this the box outlives the only pointer to it.
@@ -765,7 +765,7 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     // through `DictStrategy::walk_gc_refs` (`dictmultiobject.rs`).  PyPy's
     // counterpart is the per-`rerased`-pair GC trace fn generated from
     // `new_erasing_pair("name")` at translation time
-    // (`rpython/rlib/rerased.py:24-72`); the trait method is pyre's
+    // (`rpython/rlib/rerased.py`); the trait method is pyre's
     // runtime dispatch equivalent.
     let mut adapter = |slot: *mut pyre_object::PyObjectRef| {
         f(slot as *mut majit_ir::GcRef);
@@ -1396,7 +1396,7 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 ///     its items in place.
 ///   - `w_yielding_from`, `w_builtin`, `w_globals` — the ref-bearing statics.
 ///     `f_generator_nowref` is excluded: it is the raw counterpart of PyPy's
-///     translated `f_generator_wref` (pyframe.py:75-76/276-279), hence a
+///     translated `f_generator_wref` (pyframe.py/276-279), hence a
 ///     non-owning back-reference rather than a GC edge.
 ///   - `debugdata` / `lastblock` — managed field slots are forwarded.
 ///   - `debugdata->{w_globals, w_locals, w_extra_locals, w_f_trace,
@@ -1588,7 +1588,7 @@ fn take_pending_loop_exit(ec: *const PyExecutionContext) -> LoopResult {
 enum JitAction {
     Return(PyResult),
     Continue,
-    /// RPython jitexc.py:53: guard-restored → restart portal.
+    /// RPython jitexc.py ContinueRunningNormally: guard-restored → restart portal.
     ContinueRunningNormally,
 }
 
@@ -1913,7 +1913,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // item slots via the jf_gcmap custom trace.
     #[cfg(target_arch = "wasm32")]
     majit_backend_wasm::set_wasm_jitframe_tid(jitframe_tid);
-    // llsupport/gc.py:563 vtable→typeid mapping. RPython derives the
+    // llsupport/gc.py get_typeid_from_classptr_if_gcremovetypeptr vtable→typeid mapping. RPython derives the
     // typeid arithmetically from gc_get_type_info_group; pyre keeps an
     // explicit table because every PyType is a static global
     // unrelated to the GC's internal layout. The OBJECT root and
@@ -2630,7 +2630,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     );
     // `W_DictProxyObject` carries a single GC-traceable
     // `w_mapping: PyObjectRef` slot (the wrapped W_DictObject —
-    // `pypy/objspace/std/dictproxyobject.py:17 self.w_mapping =
+    // `pypy/objspace/std/dictproxyobject.py self.w_mapping =
     // w_mapping`).  Pre-register it here so that
     // `MAPPING_PROXY_TYPE` resolves to a TypeInfo with the
     // correct payload size + gc_ptr offsets (the foreign-pytype
@@ -2722,7 +2722,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // (`rbigint._digits`, the Integer/Float list strategies), so the shape comes
     // from that block's `get_array_token` — all three numbers from the one
     // struct, as `encode_type_shape` reads them from the one ARRAY
-    // (gctypelayout.py:273-291). `state.rs` builds the JIT array descrs for
+    // (gctypelayout.py). `state.rs` builds the JIT array descrs for
     // these tids from the same two tokens.
     let int_token = &pyre_object::TYPED_ITEMS_BLOCK_INT_TOKEN;
     let gc_int_array_tid = gc.register_type(TypeInfo::varsize(
@@ -2821,7 +2821,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // `assign_inheritance_ids` (normalizecalls.py) walks
     // `bk.bookkeeper.classdefs`. Each entry resolves its parent
     // through `pytype_to_tid`, so the resulting hierarchy obeys
-    // `int_between(cls.min, subcls.min, cls.max)` (rclass.py:1133).
+    // `int_between(cls.min, subcls.min, cls.max)` (rclass.py ll_issubclass).
     // `pyre_object::pyobject::all_foreign_pytypes()` covers object
     // module PyTypes; `pyre_interpreter::all_foreign_pytypes()`
     // covers interpreter-level PyTypes (FUNCTION_TYPE /
@@ -2895,7 +2895,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::dictmultiobject::MODULE_DICT_TYPE as *const _ as usize,
         w_module_dict_tid,
     );
-    // `pypy/objspace/std/typeobject.py:22-71` cell layer:
+    // `pypy/objspace/std/typeobject.py MutableCell` cell layer:
     // `MutableCell` subclasses (`ObjectMutableCell`,
     // `IntMutableCell`) live inside `ModuleDictStorage` entries
     // and are unwrapped on the way out of the strategy.  They
@@ -2955,7 +2955,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // WEAKREF GcStruct (gctypelayout.py). TypeInfo::weakref()
     // sets T_IS_WEAKREF so minor / major collections invalidate
     // the single weakptr slot when its target dies
-    // (incminimark.py:3058-3126). pyre-object's
+    // (incminimark.py invalidate_young_weakrefs). pyre-object's
     // `pyre_object::weakref::Weakref` mirrors the layout; the
     // assert below pins the runtime tid to the constant it
     // hardcodes.
@@ -3002,7 +3002,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     );
     // `W_ObjectObject` keeps its attributes in an off-GC
     // `Box<Vec<PyObjectRef>>` `storage` list reachable only via a
-    // custom trace (instance map+storage, `mapdict.py:907-910`).
+    // custom trace (instance map+storage, `mapdict.py _set_mapdict_map`).
     // Register a dedicated GC type id — stamped into the GC header
     // by `w_instance_new` — so a collection traces those value
     // slots (and reclaims dead instances; the storage `Vec` itself
@@ -3051,7 +3051,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         w_complex_tid,
     );
     // `W_ObjectObject.storage` block — the mapdict instance attribute-value
-    // array (`mapdict.py:910`, `Ptr(GcArray(OBJECTPTR))`).  Every slot is a
+    // array (`mapdict.py _mapdict_init_empty`, `Ptr(GcArray(OBJECTPTR))`).  Every slot is a
     // reference: a boxed attribute value, an unboxed attribute's longlong
     // GcArray (`erase_unboxed`, `mapdict.py:601/612`), or NULL — so the block
     // is registered as an ordinary array of pointers, exactly the upstream
@@ -3170,7 +3170,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         (ExcKind::UnicodeError, Some(ExcKind::ValueError)),
         (ExcKind::UnicodeDecodeError, Some(ExcKind::UnicodeError)),
         (ExcKind::UnicodeEncodeError, Some(ExcKind::UnicodeError)),
-        // `pypy/module/exceptions/interp_exceptions.py:426
+        // `pypy/module/exceptions/interp_exceptions.py W_UnicodeTranslateError
         // W_UnicodeTranslateError = _new_exception(...,
         // W_UnicodeError, ...)`.
         (ExcKind::UnicodeTranslateError, Some(ExcKind::UnicodeError)),
@@ -4585,7 +4585,7 @@ fn walk_jit_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     //
     // Either way the carrier cannot be demoted to a plain shadow-stack entry
     // (the direct analogue of the GC transform's rooted local,
-    // `shadowstack.py:31-39`): a generic root reaches an off-GC exception's
+    // `shadowstack.py push_roots`): a generic root reaches an off-GC exception's
     // fields through neither collection, and pushing the children
     // individually does not substitute — forwarding would rewrite the pushed
     // copies, not the slots inside the exception. A walker with mutable
@@ -4626,7 +4626,7 @@ fn walk_bh_last_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 ///
 /// This slot reaches only the *collecting* thread's cell; every other mutator's
 /// cell is reached through the per-mutator `PyFrameRootArea`, which carries the
-/// same TLS address alongside `BH_LAST_EXC_VALUE`. `rthread.py:429-437
+/// same TLS address alongside `BH_LAST_EXC_VALUE`. `rthread.py _trace_tlref
 /// _trace_tlref` enumerates every thread's block rather than resolving the
 /// thread local on whichever thread started the collection.
 fn walk_guard_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
@@ -4652,7 +4652,7 @@ fn walk_guard_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// seeding skips them, leaving the collector no path to the `args_w` /
 /// `w_traceback` a raise attaches. Upstream has no such hole — its
 /// `memory_error` (`compile.py`) and the reusable prebuilt instances
-/// (`exceptiondata.py:34-38`) are ordinary prebuilt GC objects, which
+/// (`exceptiondata.py get_standard_ll_exc_instance`) are ordinary prebuilt GC objects, which
 /// incminimark keeps in `prebuilt_root_objects` (`incminimark.py:355`) and
 /// traces on every major.
 ///
@@ -4717,7 +4717,7 @@ fn walk_parked_exception_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// Every holder here is `malloc_typed` or a plain static, so the marker skips
 /// it and this walk is the only path to its contents. All three are
 /// process-global rather than per-mutator for the same reason: each outlives
-/// the thread that filled it. `w_globals` (`pycode.py:159-165
+/// the thread that filled it. `w_globals` (`pycode.py frame_stores_global
 /// frame_stores_global`) is first-store-wins and `_mapdict_caches[i].w_method`
 /// (mapdict.py:1418) is filled once — as per-mutator areas their slots would
 /// lose their root at that thread's `unregister_mutator` while the holder
@@ -5169,7 +5169,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // PyPy dispatch() returns W_Root → Ref.
     d.set_result_type(majit_ir::Type::Ref);
     // Register the real portal `JitDriverStaticData` so `get_assembler_token` /
-    // `compile_tmp_callback` (warmstate.py:714-723, compile.py) have
+    // `compile_tmp_callback` (warmstate.py, compile.py) have
     // a slot with `portal_runner_adr` + `portal_calldescr` populated.
     // `register_jitdriver_sd` replaces the translation-time empty placeholder
     // at slot 0, preserving the jdindex emitted by the shared codewriter.
@@ -5790,7 +5790,7 @@ pub(crate) fn get_virtualizable_info() -> *const majit_metainterp::virtualizable
 ///
 /// Mirrors RPython JitDriver (`rpython/rlib/jit.py`) field set:
 /// class-level attrs (`virtualizables`, `greens`, `reds`) from
-/// interp_jit.py:67-71 and constructor kwargs from interp_jit.py:72-78
+/// interp_jit.py and constructor kwargs from interp_jit.py
 /// frozen onto a single static instance, matching the upstream
 /// `pypyjitdriver = PyPyJitDriver(...)` module-scope binding.
 #[derive(Clone, Copy)]
@@ -5944,25 +5944,25 @@ impl PyPyJitDriver {
 /// pypy/module/pypyjit/interp_jit.py:72-78 —
 /// `pypyjitdriver = PyPyJitDriver(...)`.
 ///
-/// All four upstream hook kwargs that interp_jit.py:72-76 passes are
+/// All four upstream hook kwargs that interp_jit.py passes are
 /// wired to the per-hook pyre implementations defined later in this
 /// file (`get_printable_location`, `get_location`, `get_unique_id`,
 /// `should_unroll_one_iteration`). `has_unique_id` mirrors
-/// `get_unique_id` per rlib/jit.py:684 so the two cannot drift.
+/// `get_unique_id` per rlib/jit.py so the two cannot drift.
 ///
 /// Field defaults that match `JitDriver.__init__` (rlib/jit.py)
 /// when the corresponding kwarg is not passed:
 ///
-///   - `active = true`               ← rlib/jit.py:617 class attr.
-///   - `inline_jit_merge_point = false` ← rlib/jit.py:670.
+///   - `active = true`               ← rlib/jit.py class attr.
+///   - `inline_jit_merge_point = false` ← rlib/jit.py.
 ///   - `autoreds = false`            ← interp_jit.py passes a list, not 'auto'.
-///   - `check_untranslated = true`   ← rlib/jit.py:674.
-///   - `vec = false`                 ← rlib/jit.py:693.
+///   - `check_untranslated = true`   ← rlib/jit.py.
+///   - `vec = false`                 ← rlib/jit.py.
 ///   - `confirm_enter_jit = None`    ← interp_jit.py omits the kwarg, so
 ///                                     `JitDriver.__init__` (rlib/jit.py)
 ///                                     leaves the slot as the class-level
 ///                                     `confirm_enter_jit = None` default.
-///   - `can_never_inline = None`     ← same path: rlib/jit.py:681 default
+///   - `can_never_inline = None`     ← same path: rlib/jit.py default
 ///                                     because interp_jit.py omits it.
 pub const pypyjitdriver: PyPyJitDriver = PyPyJitDriver {
     active: true,
@@ -6066,7 +6066,7 @@ impl __extend__ {
             frame.set_last_instr_from_next_instr(jumpto);
             if !ec.is_null() {
                 // interp_jit.py — `ec.bytecode_trace(self, decr_by)`.
-                // executioncontext.py:392-395 re-raises callback
+                // executioncontext.py re-raises callback
                 // exceptions; propagate via `?`.
                 unsafe { (*ec).bytecode_trace(frame as *mut PyFrame, decr_by) }?;
             }
@@ -6172,7 +6172,7 @@ fn green_key_from_pycode(
 /// is_being_profiled, pycode]`; `make_green_key` hashes exactly that tuple
 /// and returns only the hash, which is enough to find a warmstate bucket and
 /// not enough to pick a cell out of one (`JitCell.comparekey`,
-/// warmstate.py:575-582). Callers that read a cell take this; callers that
+/// warmstate.py). Callers that read a cell take this; callers that
 /// only tick a counter can keep the hash.
 ///
 /// `is_being_profiled` is the caller's own green, not a re-derivation of it.
@@ -6382,7 +6382,7 @@ pub fn should_unroll_one_iteration(
 /// Returns True if a jitcell exists for this green key, regardless of
 /// whether machine code has been compiled. A cell is created when the
 /// counter first ticks, so this returns True even before compilation.
-/// interp_jit.py:215 — `@dont_look_inside`
+/// interp_jit.py — `@dont_look_inside`
 #[majit_macros::dont_look_inside]
 pub fn get_jitcell_at_key(
     _space: pyre_object::PyObjectRef,
@@ -6501,7 +6501,7 @@ pub fn residual_call(
 /// (`"name=value,…"`, `"off"`, or `"default"`) to the warmstate. Shared by
 /// the Python-level `set_param` positional-string branch and the `PYRE_JIT`
 /// env lever (the translation-time `--jit STR` option's analog) so both
-/// parse identically. `Err(())` signals a malformed string (rlib/jit.py:853
+/// parse identically. `Err(())` signals a malformed string (rlib/jit.py
 /// ValueError).
 fn apply_jit_param_string(
     ws: &mut majit_metainterp::warmstate::WarmEnterState,
@@ -8227,7 +8227,7 @@ pub fn init_jit_hooks() {
     // through `main_entry`; doing it here too makes them live before the
     // first `{}` literal is filled. Otherwise a str-keyed dict built at
     // module level hashes its keys through `object_key_for`'s structural
-    // fallback (dictmultiobject.py:95-101), and once the real hook installs
+    // fallback (dictmultiobject.py __repr__), and once the real hook installs
     // on the first JIT entry every later lookup recomputes the siphash and
     // misses its bucket. The trampolines only call interpreter-side
     // `eq_w`/`try_hash_value`/`compares_by_identity`, so they need neither
@@ -8690,7 +8690,7 @@ fn unsupported_jit_shape_uncached(
     // prevents a cold, disjoint loop from blacklisting an earlier hot loop.
 
     // Single-byte register-or-constant index ceiling (`assembler.py:72`
-    // `chr(reg)`; `assembler.py:265-269 check_result` asserts
+    // `chr(reg)`; `assembler.py check_result` asserts
     // `count_regs[kind] + len(constants) <= 256`, per kind). RPython assembles
     // jitcodes at translation time from the hand-written interpreter, where the
     // ceiling is a bounded invariant; pyre assembles a jitcode per *user*
@@ -9053,7 +9053,7 @@ fn portal_activation_bracketed(
 /// and calls the portal function (eval_with_jit) with those values.
 ///
 /// Returns Ok((return_type, value)) or Err(JitException) if the portal
-/// itself raises a JitException (warmspot.py:979-980 loop back).
+/// itself raises a JitException (warmspot.py loop back).
 pub(crate) fn pyre_portal_runner(
     exc: &majit_metainterp::jitexc::JitException,
 ) -> Result<
@@ -9338,7 +9338,7 @@ pub(crate) fn portal_body_result(frame: &mut PyFrame) -> PyResult {
 /// `setfield_vable_i(valuestackdepth)` and `setarrayitem_vable_r` are
 /// virtualizable operations: they update the trace's own boxes, and the real
 /// `PyFrame` fields are written only where the virtualizable is forced
-/// (`virtualizable.py:282-284`). The `exit_frame_with_exception` edge forces
+/// (`virtualizable.py force_virtualizable_if_necessary`). The `exit_frame_with_exception` edge forces
 /// nothing, so on this path `valuestackdepth` and the operand slots still hold
 /// what the frame carried when it entered the JIT — for a function-entry run,
 /// an empty operand stack.
@@ -9416,7 +9416,7 @@ fn report_exit_frame_delivery(site: &str, frame: &PyFrame, refused: bool) {
 /// clear the `FinishConcrete::Raise` arm can afford.
 ///
 /// Only the compiled-exit deliveries screen.  An ordinary interpreted raise IS
-/// the `pyopcode.py:148` attach, and `raise caught_object` re-raising by name
+/// the `pyopcode.py` attach, and `raise caught_object` re-raising by name
 /// legitimately gives one frame two adjacent nodes through the raises
 /// themselves.
 fn screen_frame_already_recorded(frame: *const PyFrame, err: &mut pyre_interpreter::PyError) {
@@ -9680,7 +9680,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     // above the loop is a second, independent read: the marker's green is then
     // promoted by `ref_guard_value` and never used, while the dispatch runs on
     // an unpromoted copy that no guard makes constant. See the loop body.
-    // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
+    // interp_jit.py — next_instr, pycode are greens (managed by jit_merge_point).
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
     // The one frame binding the whole dispatch loop reads through. Seeded from
@@ -9833,7 +9833,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // hides the no-tracer fast path from the optimizer. Inline
         // the gate here — read `ec.w_tracefunc` directly and skip
         // the trace-only slow path when null. The ticker decrement
-        // (executioncontext.py:163-165) runs unconditionally so
+        // (executioncontext.py) runs unconditionally so
         // signal handlers / async actions fire periodically (matches
         // PyPy's `actionflag.decrement_ticker(decr_by)` invariant);
         // the `action_dispatcher` slow path itself is still a stub
@@ -9986,7 +9986,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 // re-reads the frame; seed a fresh pointer for the compile path.
                 f = FrameView::reload(f);
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
-                // RPython interp_jit.py:114 → warmstate.py:446
+                // RPython interp_jit.py:114 → warmstate.py maybe_compile_and_run  allow-line-citation
                 let marker_ec = pyre_interpreter::call::getexecutioncontext();
                 if marker_ec.is_null() {
                     // No execution context means there is nowhere to publish a
@@ -10089,7 +10089,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
 /// fallthrough).  The `ContinueRunningNormally` re-entry then runs the body
 /// exactly once for that item and continues the loop from the already-
 /// advanced iterator — the `_copy_data_from_miframe` continue-forward analog
-/// (blackhole.py:1711), no drop and no double.
+/// (blackhole.py), no drop and no double.
 ///
 /// The repositioning is the load-bearing effect, encoded in the frame itself
 /// (its value stack and pc), not in the return value: on delivery the frame is
@@ -10349,7 +10349,7 @@ fn maybe_compile_and_run(
     // flags.
     //
     // The decision alone, without the `cell.flags |= JC_TRACING` that
-    // warmstate.py:441 makes with it: upstream marks the cell in the same
+    // warmstate.py makes with it: upstream marks the cell in the same
     // `bound_reached` that runs the trace, and pyre marks it there too —
     // `MetaInterp::bound_reached` reaches the cell through
     // `force_start_tracing_for_key`. Marking it here as well makes that call
@@ -10444,14 +10444,14 @@ impl Drop for GuardCompilingScope {
     }
 }
 
-/// Build the exception result the same way as blackhole.py:1679-1682
+/// Build the exception result the same way as blackhole.py _exit_frame_with_exception
 /// `_exit_frame_with_exception`.
 fn finish_concrete_raise_error(value: pyre_jit_trace::state::ConcreteValue) -> PyError {
     let pyre_jit_trace::state::ConcreteValue::Ref(exc_ref) = value else {
         unreachable!("FinishConcrete::Raise must hold a concrete Ref")
     };
     debug_assert!(!exc_ref.is_null());
-    // blackhole.py:1679-1682 constructs ExitFrameWithExceptionRef directly
+    // blackhole.py _exit_frame_with_exception constructs ExitFrameWithExceptionRef directly
     // from the uncaught exception object and leaves the exception latches as-is.
     unsafe { PyError::from_exc_object(exc_ref) }
 }
@@ -11605,7 +11605,7 @@ fn compile_and_run_once(
 ///
 /// Called when counter threshold fires and no compiled code exists.
 /// Starts tracing via `compile_and_run_once`, the same call
-/// `warmstate.py:442` makes; a key that already has a runnable procedure
+/// `warmstate.py` makes; a key that already has a runnable procedure
 /// token runs through `run_compiled_detailed_with_bridge_keyed` instead.
 /// The `back_edge_*` family on `JitDriver` is not on this path — nothing
 /// under `pyre/` calls any of it.
@@ -11900,7 +11900,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // Same gate as maybe_compile_and_run: only enter compiled code
         // when a runnable compiled loop (frontend meta present, not a bare
         // tmp callback) exists for this green_key.
-        // warmstate.py:503-511: procedure_token → enter unconditionally.
+        // warmstate.py: procedure_token → enter unconditionally.
         //
         // `interp_jit.py jump_absolute` charges the action ticker at
         // every compiled back-edge when `gil_ready` is true.  A recursive
@@ -12367,7 +12367,7 @@ fn materialize_virtual_from_rd(
     // index; a corrupt resume stream (out-of-range vidx) raises IndexError here
     // rather than being swallowed as a NULL ref.
     let entry = &virtuals[vidx];
-    // resume.py:1552-1588 decode_* parity.
+    // resume.py decode_int decode_* parity.
     fn decode_tagged_fieldnum(
         tagged: i16,
         dead_frame: &[Value],
@@ -12406,9 +12406,9 @@ fn materialize_virtual_from_rd(
                 rd_consts[ci].to_value()
             }
             majit_ir::resumedata::TAGVIRTUAL => {
-                // resume.py:278-284 nested virtuals are numbered negatively;
+                // resume.py assign_number_to_virtual nested virtuals are numbered negatively;
                 // getvirtual_ptr resolves them via Python negative list
-                // indexing into rd_virtuals (resume.py:951-954).
+                // indexing into rd_virtuals (resume.py).
                 let vidx = if val < 0 {
                     (rd_virtuals.map_or(0, |v| v.len()) as i32 + val) as usize
                 } else {
@@ -12486,7 +12486,7 @@ fn materialize_virtual_from_rd(
             _ => std::ptr::null_mut(),
         }
     }
-    // resume.py:643-760: dispatch by virtual kind.
+    // resume.py AbstractVArrayInfo: dispatch by virtual kind.
     match entry.as_ref() {
         majit_ir::RdVirtualInfo::VArrayInfoClear {
             arraydescr,
@@ -12638,7 +12638,7 @@ fn materialize_virtual_from_rd(
             //   calldescr, _ = cic.callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR)
             // The calldescr comes from the shared callinfocollection, not a
             // freshly minted MOST_GENERAL descr.  func is NOT read from the
-            // callinfo (resume.py:1453 discards it as `_`; several malloc
+            // callinfo (resume.py discards it as `_`; several malloc
             // variants share the oopspec) — it stays the VRawBufferInfo.func.
             let cic = driver
                 .meta_interp()
@@ -13159,7 +13159,7 @@ fn materialize_virtual_from_rd(
                             };
                             // `resume.py:1512` reaches this store through
                             // `cpu.bh_setfield_gc_r`, whose `write_ref_at_mem`
-                            // (llmodel.py:495) carries the framework GC
+                            // (llmodel.py) carries the framework GC
                             // transformer's barrier. This materializer writes
                             // the field itself, so it owes the same barrier:
                             // `allocate_with_vtable` / `allocate_struct` build
@@ -13227,8 +13227,8 @@ fn decode_tagged_value(
             .to_value(),
         majit_metainterp::resume::TAGVIRTUAL => {
             // resume.py: decode_ref(TAGVIRTUAL) → getvirtual_ptr(num).
-            // resume.py:278-284 nested virtuals are numbered negatively;
-            // resolve via negative indexing into rd_virtuals (resume.py:951-954).
+            // resume.py nested virtuals are numbered negatively;
+            // resolve via negative indexing into rd_virtuals (resume.py).
             let vidx = if val < 0 {
                 (rd_virtuals.map_or(0, |v| v.len()) as i32 + val) as usize
             } else {
@@ -13379,7 +13379,7 @@ pub(crate) fn decode_and_restore_guard_failure(
         )
     };
 
-    // virtualizable.py:126: write fields from resumedata to frame.
+    // virtualizable.py write_from_resume_data_partial: write fields from resumedata to frame.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -13525,7 +13525,7 @@ fn rebuild_typed_from_rd_numb(
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
     let mut virtuals_cache: HashMap<usize, Value> = HashMap::new();
 
-    // resume.py:1083 + pyjitpl.py:3400-3428 parity:
+    // resume.py consume_virtualizable_boxes + pyjitpl.py:3400-3428 parity:  allow-line-citation
     // Decode vable_values into typed prefix [frame_ptr, ni, code, vsd, ns, locals..., stack...].
     // In RPython, virtualizable_boxes are restored first, then synchronize_virtualizable
     // writes them back to the actual frame object.
@@ -13562,7 +13562,7 @@ fn rebuild_typed_from_rd_numb(
     // RPython produces TWO streams:
     //   1. virtualizable_boxes (consume_vref_and_vable → synchronize_virtualizable)
     //   2. frame registers (consume_boxes per frame)
-    // pyjitpl.py:3419-3430: virtualizable_boxes restored, then
+    // pyjitpl.py: virtualizable_boxes restored, then
     // synchronize_virtualizable writes them back to the heap.
     // Frame registers fill frame.registers_i/r/f independently.
 
@@ -13844,7 +13844,7 @@ fn build_resumed_frames(
     // resume.py consume_vref_and_vable: vable header is extracted
     // AFTER _prepare_next_section materializes virtuals. The post-section
     // block below is the authoritative extraction. vable_values is always
-    // non-empty for guards with complete resume data (resume.py:397 asserts
+    // non-empty for guards with complete resume data (resume.py asserts
     // resume_position >= 0). The no-snapshot fallback in store_final_boxes_in_guard
     // now encodes fail_args[0..3] as vable_array to maintain this invariant.
 
@@ -13960,7 +13960,7 @@ fn build_resumed_frames(
     // physical frame so the tracer's subsequent vable reads see the
     // resume-data values, not the pre-guard heap. (The blackhole resume
     // path performs its own consume_vable_info write inside
-    // `blackhole_resume_via_rd_numb` (resume.py:1399-1408).)
+    // `blackhole_resume_via_rd_numb` (resume.py).)
     if !vable_frame_ptr.is_null() {
         let frame_u8 = vable_frame_ptr as *mut u8;
         // resume.py blackhole_from_resumedata parity:
@@ -14016,7 +14016,7 @@ fn build_resumed_frames(
         // innermost (deepest callee).
         let is_outermost = idx == 0;
         let w_code = if is_outermost {
-            // virtualizable.py:86-99: code from resume data, not heap.
+            // virtualizable.py read_boxes: code from resume data, not heap.
             if !vable_pycode.is_null() {
                 vable_pycode
             } else if !vable_frame_ptr.is_null() {
@@ -14054,7 +14054,7 @@ fn build_resumed_frames(
         // Per-frame VSD: outermost uses vable_vsd, inner frames derive
         // from their code's nlocals + snapshot stack depth.
         let vsd = if is_outermost {
-            // resume.py:1399 parity: outermost frame's vsd comes directly
+            // resume.py consume_vable_info parity: outermost frame's vsd comes directly
             // from the virtualizable. RPython does not sentinel-check 0.
             vable_vsd
         } else if !raw_code.is_null() {
@@ -14248,7 +14248,7 @@ fn replay_pending_fields(
         // resume.py setfield: descr.is_pointer_field()
         //   → bh_setfield_gc_r; is_float_field() → bh_setfield_gc_f;
         //   else → bh_setfield_gc_i.
-        // resume.py:1531-1541 setarrayitem_{int,ref,float}: dispatched by
+        // resume.py setarrayitem_{int,ref,float}: dispatched by
         //   resume.py setarrayitem via arraydescr.is_array_of_pointers
         //   / is_array_of_floats.
         let (addr, value_type, value_size) = if pf.is_array_item {
@@ -14336,7 +14336,7 @@ fn extract_interior_field_info(descr: &majit_ir::DescrRef) -> (usize, usize, u8)
     }
 }
 
-/// resume.py:1437-1541 — BlackholeAllocator for pyre's object model.
+/// resume.py allocate_with_vtable — BlackholeAllocator for pyre's object model.
 ///
 /// Used by ResumeDataDirectReader during guard failure blackhole resume
 /// to allocate virtual objects and replay pending field writes.
@@ -14572,7 +14572,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     }
 
     // resume.py: setinteriorfield dispatch by descr
-    // llmodel.py:648-665: bh_setinteriorfield_gc_{i,r,f}
+    // llmodel.py bh_setinteriorfield_gc_i: bh_setinteriorfield_gc_{i,r,f}
     fn bh_setinteriorfield_gc_i(
         &self,
         array: i64,
@@ -16090,7 +16090,7 @@ mod tests {
             // snapshot.  Inspect the snapshot directly (the canonical
             // RPython resume oracle) instead of the raw recorder buffer.
             //
-            // Snapshot layout (opencoder.py:806 / build_framestack_snapshot):
+            // Snapshot layout (opencoder.py / build_framestack_snapshot):
             //  - `vable_boxes` = full virtualizable image
             //    `[frame_ptr, scalar_fields..., array_items...]`
             //    (NUM_SCALAR_INPUTARGS scalars + locals/stack array slots).
@@ -16382,7 +16382,7 @@ mod tests {
     /// PyType must satisfy `int_between(cls.min, subcls.min, cls.max)`
     /// for every (cls, subcls) pair where `subcls` Python-inherits from
     /// `cls`. This test exercises the `assign_inheritance_ids`
-    /// (normalizecalls.py:373-389) preorder walk by verifying:
+    /// (normalizecalls.py) preorder walk by verifying:
     ///   1. `INSTANCE_TYPE` (root `object`) range contains every other
     ///      PyType's range.
     ///   2. `INT_TYPE` range contains `BOOL_TYPE` range

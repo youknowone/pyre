@@ -361,7 +361,7 @@ pub(crate) fn lshift_count_residual_path(segments: &[String]) -> Option<Vec<Stri
     )
 }
 
-/// The `_make_ovf2long` seams (intobject.py:509-514): a machine-int add,
+/// The `_make_ovf2long` seams (intobject.py): a machine-int add,
 /// subtract, or multiply that overflowed recovers the exact result from the
 /// two Signed words in one elidable call.  Both operands are already machine
 /// words at source level, so the target swap only supplies the

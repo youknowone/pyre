@@ -32,7 +32,7 @@ type PyResult = Result<PyObjectRef, pyre_interpreter::PyError>;
 /// `type.__new__(mcls, …)` may allocate — and `type` itself is set up with
 /// `TYPE_TYPE` for exactly that reason.  Upstream never faces the question:
 /// its ctypes metaclasses are app-level (`class _CDataMeta(type)`,
-/// basics.py:48) and inherit `type`'s instance layout from their base.
+/// basics.py) and inherit `type`'s instance layout from their base.
 fn make_ctypes_metatype(name: &str, init: impl FnOnce(PyObjectRef)) -> PyObjectRef {
     let base = ctype_type();
     let layout = unsafe { pyre_object::w_type_get_layout_ptr(base) };

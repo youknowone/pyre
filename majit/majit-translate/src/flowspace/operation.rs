@@ -78,7 +78,7 @@ fn not_really_const_declines(module_qualname: &str, attr: &str) -> bool {
 /// `SpaceOperation.opname`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum OpKind {
-    // ---- add_operator table (operation.py) ----
+    // add_operator table (operation.py)
     // unary/binary operators registered via add_operator(); variant
     // names follow the upstream `opname` argument (UpperCamel'd), with
     // `_ovf` siblings as `*Ovf`.
@@ -167,7 +167,7 @@ pub enum OpKind {
     NewSlice,
     Hint,
 
-    // ---- explicit subclasses (operation.py:523-712) ----
+    // explicit subclasses (operation.py Contains and later HLOperation)
     // These carry custom `eval()` / `consider()` overrides in RPython.
     // Commit 3 lifts the custom logic into the Rust port.
     Contains,
@@ -1192,8 +1192,8 @@ impl HLOperation {
 /// explicit subclasses that have custom `eval()` (Iter, Next, GetAttr,
 /// SimpleCall, CallArgs, Pow).
 pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
-    // --- variadic / ternary ops that fall outside the fixed-arity
-    //     match below ---
+    // variadic / ternary ops that fall outside the fixed-arity
+    // match below
     match (kind, args.len()) {
         // RPython `NewTuple` (operation.py). `PureOperation`
         // whose `pyfunc = lambda *args: args`.
@@ -1278,7 +1278,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
     }
 
     match (kind, args) {
-        // --- unary ---
+        // unary
         (OpKind::Bool, [v]) => v.truthy().map(ConstValue::Bool),
         (OpKind::Neg, [ConstValue::Int(n)]) => n.checked_neg().map(ConstValue::Int),
         (OpKind::NegOvf, [ConstValue::Int(n)]) => n.checked_neg().map(ConstValue::Int),
@@ -1323,7 +1323,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         }
         (OpKind::Len, [ConstValue::Dict(items)]) => Some(ConstValue::Int(items.len() as i64)),
 
-        // --- binary identity ---
+        // binary identity
         // `operator.is_` compares Python identity. For the value set
         // the Rust port carries on `Constant`, structural equality of
         // `ConstValue` is a safe proxy: two `ConstValue::Int(3)` do
@@ -1331,7 +1331,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         // synthesise two distinct wrappers for the same primitive.
         (OpKind::Is, [a, b]) => Some(ConstValue::Bool(a == b)),
 
-        // --- binary concat (str / tuple / list) ---
+        // binary concat (str / tuple / list)
         // These come BEFORE the numeric arithmetic arms because the
         // generic `(OpKind::Add, [a, b])` dispatch via `fold_arith`
         // declines on non-numeric operand pairs, so concat-aware arms
@@ -1356,7 +1356,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
             Some(ConstValue::List(out))
         }
 
-        // --- binary arithmetic (numeric, with Python 3 coercion) ---
+        // binary arithmetic (numeric, with Python 3 coercion)
         // `_ovf` siblings are NOT pure (`OpKind::pure()` rejects them),
         // so the `pure()` gate in `HLOperation::constfold` short-
         // circuits before reaching this dispatch — matching upstream
@@ -1415,7 +1415,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         // returns a remainder with the sign of the divisor (`3 % -2
         // == -1`, not `1`). Float mod delegates to `float_py_mod`
         // matching upstream `descr_mod`
-        // (`pypy/objspace/std/floatobject.py:543`), which uses
+        // (`pypy/objspace/std/floatobject.py`), which uses
         // `math_fmod` plus the sign-of-denominator correction and
         // `copysign(0.0, y)` signed-zero output.
         (OpKind::Mod, [a, b]) => coerce_arith(a, b).and_then(|p| match p {
@@ -1469,7 +1469,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         (OpKind::Or, [a, b]) => coerce_int_pair(a, b).map(|(x, y)| ConstValue::Int(x | y)),
         (OpKind::Xor, [a, b]) => coerce_int_pair(a, b).map(|(x, y)| ConstValue::Int(x ^ y)),
 
-        // --- comparisons (int / float / str / bool) ---
+        // comparisons (int / float / str / bool)
         (OpKind::Lt, [a, b]) => cmp_fold(a, b).map(|o| ConstValue::Bool(o.is_lt())),
         (OpKind::Le, [a, b]) => cmp_fold(a, b).map(|o| ConstValue::Bool(o.is_le())),
         (OpKind::Eq, [a, b]) => Some(ConstValue::Bool(python_eq_const(a, b))),
@@ -1740,7 +1740,7 @@ pub(crate) fn float_py_mod(x: f64, y: f64) -> f64 {
 
 /// Python `float // float` floor-div result. Line-by-line port of the
 /// `floordiv` half of `_divmod_w` at
-/// `pypy/objspace/std/floatobject.py:824-859`, including the snap-to-
+/// `pypy/objspace/std/floatobject.py`, including the snap-to-
 /// nearest-integer pass at `:850-857` that corrects the fp-precision
 /// wobble in `(x - mod) / y` (mathematically integral, but the
 /// approximation may land just below or above the true value).
@@ -2096,9 +2096,7 @@ fn cross_type_ordering(a: &ConstValue, b: &ConstValue) -> bool {
     }
 }
 
-// =====================================================================
-// Dispatcher plumbing (operation.py:66-300 + pairtype.py:75-96).
-// =====================================================================
+// Dispatcher plumbing (operation.py:66-300 + pairtype.py).  allow-line-citation
 //
 // Upstream `class SingleDispatchMixin` / `class DoubleDispatchMixin`
 // store the registration table on the HLOperation subclass itself
@@ -2215,7 +2213,7 @@ pub enum CanOnlyThrow {
     List(Vec<BuiltinException>),
     /// `can_only_throw = lambda *args: [...]` — upstream line 841
     /// `return can_only_throw(*args)` branch. Returns `None` to mirror
-    /// `_dict_can_only_throw_*` helpers (binaryop.py:527-535) that
+    /// `_dict_can_only_throw_*` helpers (binaryop.py _dict_can_only_throw_keyerror) that
     /// defer to `op.canraise` for r_dict's unrestricted throw set.
     #[expect(
         clippy::type_complexity,
@@ -2349,7 +2347,7 @@ impl HLOperation {
         // walks `type(None).__mro__` so unbound args reach a
         // SomeObject-tagged spec.  `simple_call`
         // (`operation.py:663` `simple_call_SomeObject`) and
-        // `unaryop.py:114 immutablevalue` also tolerate None mid-
+        // `unaryop.py immutablevalue` also tolerate None mid-
         // fixpoint.  Pyre's `Vec<SomeValue>` shape forces eager
         // unwrap before dispatch and raises "unbound argument"; this
         // closes off the Option<SomeValue> propagation epic at
@@ -3394,7 +3392,7 @@ mod tests {
 
     #[test]
     fn constfold_int_float_compare_handles_mantissa_boundary() {
-        // Port test for `pypy/objspace/std/floatobject.py:103-148
+        // Port test for `pypy/objspace/std/floatobject.py make_compare_func
         // make_compare_func`'s bigint-aware Int↔Float compare. f64
         // mantissa is 53 bits; `Int(2^53 + 1)` rounds to `2^53` under
         // naive `as f64` cast, which would misclassify `Int(2^53 + 1)
@@ -3873,7 +3871,7 @@ mod tests {
 
     #[test]
     fn constfold_float_mod_signed_zero_matches_pypy() {
-        // Line-by-line port test for `pypy/objspace/std/floatobject.py:543-563
+        // Line-by-line port test for `pypy/objspace/std/floatobject.py descr_mod
         // descr_mod`'s signed-zero handling. The naive `x - y * (x /
         // y).floor()` produces `+0.0` regardless of denominator sign;
         // upstream uses `mod = math.copysign(0.0, y)` so an exact

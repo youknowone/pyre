@@ -437,7 +437,7 @@ fn dispatch_jitcode_contains_loop_back_goto() {
 ///   1. BC_GETARRAYITEM_GC_I_PURE — loads program[pc] into an int register
 ///   2. BC_INT_ADD           — increments pc_reg by 1 (via load_const + int_add)
 ///
-/// pyopcode.py:171 `opcode = ord(co_code[next_instr])` + `next_instr += 1`.
+/// pyopcode.py `opcode = ord(co_code[next_instr])` + `next_instr += 1`.
 #[test]
 fn dispatch_jitcode_lowers_opcode_fetch() {
     let dispatch_jc = build_dispatch_minimal();
@@ -464,7 +464,7 @@ fn dispatch_jitcode_lowers_opcode_fetch() {
 /// The dispatch JitCode body must emit one BC_GOTO_IF_NOT_INT_EQ
 /// per non-default arm (OP_NOP, OP_INC_A → ≥ 2 checks).
 ///
-/// pyopcode.py:183+ if/elif chain over opcode constants.
+/// pyopcode.py+ if/elif chain over opcode constants.
 /// jtransform.py optimize_goto_if_not fuses int_eq + goto_if_not
 /// into goto_if_not_int_eq/iiL (BC_GOTO_IF_NOT_INT_EQ).
 #[test]
@@ -484,7 +484,7 @@ fn dispatch_jitcode_emits_chain_of_int_eq_dispatch() {
 /// dispatch_minimal returns `state.a` (i64 / Int binding) so the JitCode
 /// must end with BC_INT_RETURN.
 ///
-/// interp_jit.py:95-100 return boundary: when no arm matches the loop
+/// interp_jit.py return boundary: when no arm matches the loop
 /// exits; the dispatch JitCode signals this via an int_return insn.
 #[test]
 fn dispatch_jitcode_emits_typed_return_for_default_arm() {
@@ -687,8 +687,8 @@ fn a_trace_entry_takes_the_state_field_store_back_from_a_second_driver() {
 }
 
 /// A.2.1 fixture: minimal `#[jit_interp]` dispatch loop carrying both the
-/// `state.last_instr = pc as i64` store (`pyopcode.py:172`) AND the two-byte
-/// `[opcode][oparg]` fetch with `pc += 2` (`pyopcode.py:179-181`).
+/// `state.last_instr = pc as i64` store (`pyopcode.py`) AND the two-byte
+/// `[opcode][oparg]` fetch with `pc += 2` (`pyopcode.py`).
 ///
 /// A.2.1 only asserts the macro expands and the dispatch JitCode body builds
 /// non-empty. A.2.2-A.2.4 add lower-side recognition for the new surfaces
@@ -713,7 +713,7 @@ mod oparg_minimal {
     /// dispatch JitCode lowerer emits a `BC_LOOP_HEADER` for at least one
     /// arm — `lower_dispatch_chain`'s per-arm gating suppresses
     /// `loop_header` for forward-progress arms (OP_NOP, OP_ADD_I) that have
-    /// no `can_enter_jit!` marker, matching `jtransform.py:1714-1723
+    /// no `can_enter_jit!` marker, matching `jtransform.py handle_jit_marker__loop_header
     /// > handle_jit_marker__loop_header` which only runs at user-placed
     /// `can_enter_jit` source sites.
     const OP_JUMP_BACK: u8 = 2;
@@ -835,7 +835,7 @@ mod oparg_minimal {
 
     /// A.2.2: the dispatch JitCode body must lower BOTH byte fetches in
     /// `let opcode = program[pc]; let oparg = program[pc + 1]; pc += 2;`
-    /// per RPython `pyopcode.py:179-181`:
+    /// per RPython `pyopcode.py`:
     ///     - opcode fetch → `BC_GETARRAYITEM_GC_I_PURE result, program, pc`
     ///     - oparg  fetch → `BC_INT_ADD offset, pc, +1` then
     ///       `BC_GETARRAYITEM_GC_I_PURE result, program, offset`
@@ -880,7 +880,7 @@ mod oparg_minimal {
         // precede the first BC_INT_ADD (which is the pc+1 offset compute
         // for the oparg fetch). The SECOND BC_GETARRAYITEM_GC_I_PURE (oparg
         // fetch) must come after the offset compute. RPython
-        // `pyopcode.py:179-180` orders opcode → oparg.
+        // `pyopcode.py` orders opcode → oparg.
         let first_getarr = post_mp
             .iter()
             .position(|&b| b == BC_GETARRAYITEM_GC_I_PURE)
@@ -1148,7 +1148,7 @@ mod oparg_minimal {
     /// Constant(jd.index, lltype.Signed)` AT THE SOURCE-LEVEL CALL SITE —
     /// in PyPy that is `interp_jit.py pypyjitdriver.can_enter_jit(...)`
     /// inside `jump_absolute()`'s BACKWARD-JUMP BRANCH ONLY (the forward
-    /// path early-returns at `interp_jit.py:104 if jumpto >= next_instr:
+    /// path early-returns at `interp_jit.py if jumpto >= next_instr:
     /// return jumpto`).  Pyre's parity is achieved by recognising
     /// `can_enter_jit!(...)` as a `Stmt::Macro` inside `Lowerer::lower_stmt`
     /// (`jitcode_lower/lower_stmt.rs`) and emitting the LH op at that exact
@@ -1255,7 +1255,7 @@ mod oparg_minimal {
 }
 
 /// A.2.3a fixture: dispatch loop carrying the EXTENDED_ARG inner while
-/// shape per RPython `pyopcode.py:187-193`. The fixture's structural
+/// shape per RPython `pyopcode.py`. The fixture's structural
 /// contents (inner `while opcode == EXTENDED_ARG`, multi-byte oparg
 /// merge, HAVE_ARGUMENT corruption guard) are NOT lowered to dispatch
 /// JitCode IR yet — A.2.3a is recognition-only. The fail-closed install

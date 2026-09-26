@@ -16,10 +16,10 @@
 //! `switchInt` (None = 0, Some = 1).  RPython's `next` op returns the
 //! element directly and raises `StopIteration` at exhaustion
 //! (`Next.canraise = [StopIteration, RuntimeError]`,
-//! `rpython/flowspace/operation.py:594-599`; the annotator narrows that per
+//! `rpython/flowspace/operation.py`; the annotator narrows that per
 //! container — `SomeIterator.next.can_only_throw` is the callable
 //! `_can_only_throw`, which appends `RuntimeError` only for a `SomeDict`
-//! container, `rpython/annotator/unaryop.py:811-829`).  This
+//! container, `rpython/annotator/unaryop.py`).  This
 //! module rewrites the value-encoded Option diamond into that exception
 //! representation — the mirror of [`crate::front::result_exc`]'s
 //! `Result`/`?` rewrite.  The Option diamond is the same shape minus the
@@ -1261,7 +1261,7 @@ fn rewire_one_next_site(
         }
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
     *mutated = true;
 
     if enum_pair.is_some() {

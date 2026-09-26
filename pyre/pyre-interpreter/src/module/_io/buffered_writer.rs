@@ -19,7 +19,7 @@ pub(super) fn make_write_blocking_error(written: usize) -> crate::PyError {
     let Some(blocking) = crate::builtins::lookup_exc_class("BlockingIOError") else {
         return crate::PyError::os_error("write could not complete without blocking");
     };
-    // `interp_bufferedio.py:26-38` reads the saved errno here.  It may be
+    // `interp_bufferedio.py make_write_blocking_error` reads the saved errno here.  It may be
     // nonsense when the raw `write` is a Python method that simply returned
     // None, but a caller that asked for a non-blocking fd needs EAGAIN, and
     // the only place it survives is the errno the failed syscall left.

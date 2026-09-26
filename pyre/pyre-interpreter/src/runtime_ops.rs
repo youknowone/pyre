@@ -467,7 +467,7 @@ pub enum CallableKind {
 /// callable.
 ///
 /// The caller branches on the answer with the two arms written out
-/// (`baseobjspace.py:1243`); handing them in as closures instead puts an
+/// (`baseobjspace.py`); handing them in as closures instead puts an
 /// `FnOnce::call_once` in front of every dispatch, and a closure has no
 /// lifted counterpart — RPython spells this as a plain conditional.
 pub fn classify_callable(callable: PyObjectRef) -> Result<CallableKind, PyError> {
@@ -804,7 +804,7 @@ pub fn convert_value(value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate
 /// (`str(value)`), matching `format_simple`.
 pub fn format_value(value: PyObjectRef, spec: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     // The spec crosses to `__format__` as the object the opcode pushed, the
-    // way `FORMAT_VALUE` hands `w_spec` to `space.format` (pyopcode.py:1712).
+    // way `FORMAT_VALUE` hands `w_spec` to `space.format` (pyopcode.py).
     // Its fill may be any code point, and nothing here reads it, so
     // `f"{x:\ud800>4}"` keeps the lone surrogate it was given.
     crate::type_methods::format_w(value, spec)
@@ -1544,7 +1544,7 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
         return Ok(items);
     }
     // Fallback: iteration protocol (handles type objects with metaclass __iter__, etc.)
-    // baseobjspace.py _unpackiterable_known_length_jitlook.  pyopcode.py:872
+    // baseobjspace.py _unpackiterable_known_length_jitlook.  pyopcode.py STORE_NAME
     // UNPACK_SEQUENCE wraps the whole `fixedview_unroll` (iter + known-length
     // loop) in a TypeError → "cannot unpack non-iterable %T object" remap.
     let non_iterable = || {

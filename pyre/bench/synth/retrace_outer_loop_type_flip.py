@@ -18,7 +18,7 @@
 # `loops_aborted` goes to 0 and `retraces_compiled` to 1 when it does.
 #
 # `pypyjit` is absent on the CPython oracle and present on PyPy and pyre, and
-# `retrace_limit` defaults to 0 (`rpython/rlib/jit.py:595`), so no retrace is
+# `retrace_limit` defaults to 0 (`rpython/rlib/jit.py`), so no retrace is
 # attempted at all without raising it. Guarding the import keeps the printed value
 # identical across all three. `set_param` rather than an environment variable
 # because the wasm guest sees no environment.

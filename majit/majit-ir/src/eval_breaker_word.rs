@@ -130,7 +130,7 @@ pub extern "C" fn load_jit_abi() -> i64 {
     load() as i64
 }
 
-// --- async (bit0): armed by the OS signal handler / action dispatcher ---
+// async (bit0): armed by the OS signal handler / action dispatcher
 // `fetch_or` is a single lock-free atomic RMW → async-signal-safe.
 pub fn set_async() {
     EVAL_BREAKER_WORD.fetch_or(EB_ASYNC, Ordering::Relaxed);
@@ -139,7 +139,7 @@ pub fn clear_async() {
     EVAL_BREAKER_WORD.fetch_and(!EB_ASYNC, Ordering::Relaxed);
 }
 
-// --- stw (bit1): armed/cleared by the collector under the quiesce lock ---
+// stw (bit1): armed/cleared by the collector under the quiesce lock
 pub fn set_stw() {
     EVAL_BREAKER_WORD.fetch_or(EB_STW, Ordering::Release);
 }
@@ -155,7 +155,7 @@ pub fn set_gc_interp() {
     EVAL_BREAKER_WORD.fetch_or(EB_GC_INTERP, Ordering::Release);
 }
 
-// --- gc (bit4): armed by the old-gen allocator, consumed by the safepoint ---
+// gc (bit4): armed by the old-gen allocator, consumed by the safepoint
 
 /// Request a major collection at the next root-complete point.
 ///
@@ -186,7 +186,7 @@ pub fn take_gc() -> bool {
     EVAL_BREAKER_WORD.fetch_and(!EB_GC, Ordering::Relaxed) & EB_GC != 0
 }
 
-// --- memory error (bit5): armed by the collector, raised by the dispatch loop ---
+// memory error (bit5): armed by the collector, raised by the dispatch loop
 
 thread_local! {
     /// Whether *this* thread armed a `MemoryError` its own dispatch loop has

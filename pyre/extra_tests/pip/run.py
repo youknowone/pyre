@@ -252,7 +252,7 @@ def _under(child: Path, parent: Path) -> bool:
     return True
 
 
-# --- the checks, in the order a user meets them -------------------------------
+# the checks, in the order a user meets them
 
 
 def check_hermetic_guard(ctx: Context) -> None:

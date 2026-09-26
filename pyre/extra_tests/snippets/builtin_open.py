@@ -150,7 +150,7 @@ class DescriptorAndPath:
 
 # `_open` never probes `__index__` for a non-int `file` argument: PyPy routes
 # every non-str/bytes/int argument straight to `fspath`
-# (pypy/module/_io/interp_io.py:36), matching the pinned CPython fallback
+# (pypy/module/_io/interp_io.py), matching the pinned CPython fallback
 # (lib-python/3/_pyio.py:194, `if not isinstance(file, int): file =
 # os.fspath(file)`). An object implementing both protocols resolves through
 # __fspath__ only, and the resolved path becomes the public name.

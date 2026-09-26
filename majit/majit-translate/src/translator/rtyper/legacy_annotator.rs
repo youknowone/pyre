@@ -58,7 +58,7 @@ pub fn annotate(graph: &FunctionGraph) {
     // `value.concretetype` to materialise `ConcreteType::Void` on the
     // returnblock inputarg, matching
     // `pairtype(Repr, NoneRepr).convert_from_to → inputconst(Void, None)`
-    // (`rpython/rtyper/rnone.py:48`).  Pre-seeding `Ref` at annotation
+    // (`rpython/rtyper/rnone.py`).  Pre-seeding `Ref` at annotation
     // stage would collapse a real `Float`/`Int` return into
     // `union_type(Ref, Float|Int) == Unknown`.
 
@@ -125,7 +125,7 @@ fn read_binding_some(var: &Variable) -> Option<Rc<SomeValue>> {
 /// `Variable.annotation` cell.
 ///
 /// RPython `RPythonAnnotator.setbinding(arg, s_value)`
-/// (`annrpython.py:289-294`):
+/// (`annrpython.py`):
 ///
 /// ```python
 /// def setbinding(self, arg, s_value):
@@ -226,7 +226,7 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         ConstValue::Float(_) => ValueType::Float,
         ConstValue::Placeholder => ValueType::Unknown,
         // RPython `Constant(None)` is annotated as `SomeNone`
-        // (`rpython/annotator/annrpython.py:273 immutablevalue(None)`
+        // (`rpython/annotator/annrpython.py annotation immutablevalue(None)`
         // → `SomeNone()` per `annotator/model.py`), distinct from
         // `SomeInteger` / `SomeString`.  Pyre's `ValueType` lacks a
         // dedicated `SomeNone` variant, so collapse to `Ref` — the
@@ -389,7 +389,7 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         | OpKind::LoopHeader { .. } => ValueType::Void,
         OpKind::CurrentTraceLength => ValueType::Int,
         // `jit.isconstant` / `jit.isvirtual` are declared at
-        // `rlib/jit.py:269-292` returning `NonConstant(False)` — a
+        // `rlib/jit.py` returning `NonConstant(False)` — a
         // Python `bool`.  RPython annotates them as `SomeBool`, not
         // `SomeInteger`.
         OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => ValueType::Bool,
@@ -484,16 +484,16 @@ fn union_type(a: &ValueType, b: &ValueType) -> ValueType {
         (ValueType::Ref(_), ValueType::Ref(_)) => ValueType::Ref(None),
         // SomeBool ⊂ SomeInteger: `pair(SomeBool, SomeInteger).union`
         // resolves by inheritance to `pair(SomeInteger, SomeInteger).union`
-        // (`binaryop.py:178`; there is no `pairtype(SomeBool, SomeInteger)`
+        // (`binaryop.py`; there is no `pairtype(SomeBool, SomeInteger)`
         // override).  SomeBool is `nonneg=True, unsigned=False,
         // knowntype=bool` (`model.py`); bool→int is normalised at
-        // `binaryop.py:183-184`.  Against signed Int the same-signedness
+        // `binaryop.py`.  Against signed Int the same-signedness
         // branch returns SomeInteger(knowntype=int) = Int.  Against Unsigned
         // (`unsigned=True, nonneg=True, knowntype=r_uint`) the differing-
         // signedness branch reaches `elif t1 is int` with `int1.nonneg ==
         // True`, so NO UnionError fires and `knowntype = r_uint` →
-        // SomeInteger(unsigned) = Unsigned (`binaryop.py:189-201`).  The
-        // UnionError at `binaryop.py:191` is reserved for SIGNED Int
+        // SomeInteger(unsigned) = Unsigned (`binaryop.py`).  The
+        // UnionError at `binaryop.py` is reserved for SIGNED Int
         // (`nonneg=False`) ∪ Unsigned — the `(Int, Unsigned)` case left to
         // the `_` arm below.
         (ValueType::Bool, ValueType::Int) | (ValueType::Int, ValueType::Bool) => ValueType::Int,
@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn synthetic_void_return_carries_void_concretetype() {
         // `set_return(_, None)` wires `LinkArg::Const(Constant(None,
-        // concretetype=Void))` per `flowcontext.py:687-689` +
+        // concretetype=Void))` per `flowcontext.py RETURN_VALUE` +
         // `:1232-1236`.  At the annotation layer, `Constant(None)`
         // projects to `Ref` (pyre's nearest mapping for upstream's
         // `SomeNone` — see `const_value_type`).  The rtyping-layer
@@ -694,7 +694,7 @@ mod tests {
         // then honours the construction-site `concretetype=Void` to
         // materialise `Void` on the returnblock inputarg, matching
         // `pairtype(Repr, NoneRepr).convert_from_to → inputconst(Void, None)`
-        // (`rpython/rtyper/rnone.py:48`).
+        // (`rpython/rtyper/rnone.py`).
         use super::super::legacy_resolve;
         let mut graph = FunctionGraph::new("void_return");
         let entry = graph.startblock;

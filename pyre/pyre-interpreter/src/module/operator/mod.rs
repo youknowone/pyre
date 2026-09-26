@@ -38,7 +38,7 @@ where
     f(args[0], args[1])
 }
 
-/// `interp_operator.py:213-219`:
+/// `interp_operator.py length_hint`:
 /// ```text
 /// @unwrap_spec(default='index')
 /// def length_hint(space, w_iterable, default=0):
@@ -241,7 +241,7 @@ crate::py_module! {
         "concat"    / 2 = op_concat,
         "iconcat"   / 2 = op_iconcat,
         "not_"     / 1 = |args| Ok(w_bool_from(!is_true(args[0])?)),
-        // interp_operator.py:138
+        // interp_operator.py truth
         "truth"    / 1 = |args| Ok(w_bool_from(is_true(args[0])?)),
         "is_"      / 2 = |args| Ok(w_bool_from(std::ptr::eq(args[0], args[1]))),
         "is_not"   / 2 = |args| Ok(w_bool_from(!std::ptr::eq(args[0], args[1]))),

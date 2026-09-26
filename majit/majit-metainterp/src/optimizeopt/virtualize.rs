@@ -246,7 +246,7 @@ impl VirtualizableTracker {
 pub struct OptVirtualize {
     /// Standard-virtualizable identity marker; carries no field-value cache.
     vable: Option<VirtualizableTracker>,
-    /// optimizer.py REMOVED + virtualize.py:67-75,180,247:
+    /// optimizer.py REMOVED + virtualize.py optimize_GUARD_NO_EXCEPTION:
     last_emitted_was_removed: bool,
     /// virtualize.py:48
     last_guard_not_forced_2: Option<Op>,
@@ -439,7 +439,7 @@ impl OptVirtualize {
             .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
             // virtualize.py `if not info.reasonable_array_index(size):`
-            // — defined at info.py:487-492 with upper bound 150000.
+            // — defined at info.py with upper bound 150000.
             if crate::optimizeopt::info::reasonable_array_index(size) {
                 let descr = op.getdescr().expect("NEW_ARRAY needs descr");
                 // virtualize.py:30-32: arraydescr.is_array_of_structs()
@@ -588,7 +588,7 @@ impl OptVirtualize {
                         //   if name == 'typeptr': continue # dealt otherwise
                         // → _fields never contains typeptr. In pyre, typeptr
                         // setfield is filtered at trace recording time
-                        // (jtransform.py:908-911 parity in helpers.rs), so this
+                        // (jtransform.py rewrite_op_setfield parity in helpers.rs), so this
                         // branch should not observe a typeptr op. Defensively
                         // capture known_class if a typeptr setfield still arrives.
                         // `is_typeptr` matches on the field's NAME, and
@@ -670,7 +670,7 @@ impl OptVirtualize {
         // RPython: virtual value is NOT forced in optimize_SETFIELD_GC.
         // It's forced by _emit_operation (optimizer.py) at final emit.
         // In majit, this is handled by emit_operation or force_all_lazy_sets.
-        // virtualize.py:204: self.make_nonnull(op.getarg(0))
+        // virtualize.py: self.make_nonnull(op.getarg(0))
         if !struct_box.as_ref().is_some_and(|b| ctx.has_ptr_info(b))
             && let Some(b) = struct_box.as_ref()
         {
@@ -701,7 +701,7 @@ impl OptVirtualize {
         // info.py `getfield` opens with the same
         // `init_fields(fielddescr.get_parent_descr(), fielddescr.get_index())`
         // that `setfield` does, so upstream's read is what grows `_fields` and
-        // swaps in the more precise descr (info.py:184-188) when the index
+        // swaps in the more precise descr (info.py) when the index
         // belongs to a subclass the allocation's descr does not cover. pyre
         // keys fields by slot instead of indexing an array, so the read needed
         // nothing to answer and the call was dropped; `vinfo.descr` then stayed
@@ -711,7 +711,7 @@ impl OptVirtualize {
         //
         // Only for a virtual: `virtualize.py` reaches `opinfo.getfield`
         // under `opinfo.is_virtual()`, and a non-virtual info's descr is
-        // `OptHeap`'s to move (`optimizer.py:484`). The header reads are
+        // `OptHeap`'s to move (`optimizer.py`). The header reads are
         // excluded by the `is_typeptr` / `is_w_class` guards below -- they do
         // not resolve through the field list at all.
         if !is_raw_op
@@ -809,7 +809,7 @@ impl OptVirtualize {
                 return OptimizationResult::PassOn;
             }
             // Once the allocation is forced the read is NOT resolved — not
-            // here and not in `optimize_getfield`. `virtualize.py:184-195
+            // here and not in `optimize_getfield`. `virtualize.py optimize_GETFIELD_GC_I
             // optimize_GETFIELD_GC_*` folds only under
             // `opinfo.is_virtual()` and otherwise emits; upstream has no
             // counterpart to resolve afterwards because
@@ -974,7 +974,7 @@ impl OptVirtualize {
             }
         }
         // virtualize.py:192: self.make_nonnull(op.getarg(0))
-        // optimizer.py:437-448: only set NonNull if no existing PtrInfo.
+        // optimizer.py: only set NonNull if no existing PtrInfo.
         if !struct_box.as_ref().is_some_and(|b| ctx.has_ptr_info(b))
             && let Some(b) = struct_box.as_ref()
         {
@@ -1262,7 +1262,7 @@ impl OptVirtualize {
             .get_box_replacement_operand_opt(offset_ref)
             .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
-            // virtualize.py:358-371: walk through RawSlicePtrInfo to the
+            // virtualize.py optimize_RAW_LOAD_I: walk through RawSlicePtrInfo to the
             // underlying VirtualRawBuffer, accumulating any slice offset.
             let (parent, base_offset) = match Self::resolve_raw_slice(buf_ref, ctx) {
                 Some((p, o)) => (p, o),
@@ -1317,7 +1317,7 @@ impl OptVirtualize {
             .get_box_replacement_operand_opt(offset_ref)
             .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
-            // virtualize.py:374-385: same slice→parent walk as raw_load.
+            // virtualize.py optimize_RAW_STORE: same slice→parent walk as raw_load.
             let (parent, base_offset) = match Self::resolve_raw_slice(buf_ref, ctx) {
                 Some((p, o)) => (p, o),
                 None if matches!(
@@ -1343,7 +1343,7 @@ impl OptVirtualize {
             let Some(ad) = descr.as_array_descr() else {
                 return OptimizationResult::PassOn;
             };
-            // virtualize.py:374-381: try setitem_raw → return (remove);
+            // virtualize.py optimize_RAW_STORE: try setitem_raw → return (remove);
             // except InvalidRawOperation → pass → emit(op)
             let item_size = ad.item_size();
             let outcome = ctx.get_box_replacement_operand_opt(parent).and_then(|b| {
@@ -1472,7 +1472,7 @@ impl OptVirtualize {
                 if let Some(PtrInfo::VirtualRawBuffer(vinfo)) =
                     parent_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
                 {
-                    // rawbuffer.py:89/120 store offsets as
+                    // rawbuffer.py write_value/120 store offsets as
                     // signed: `self.offsets[i] > offset` is a
                     // signed compare. A negative
                     // `lookup_offset` is a valid lookup key
@@ -1591,7 +1591,7 @@ impl OptVirtualize {
                 None => None,
             };
             if let Some((parent, base_offset)) = resolved {
-                // rawbuffer.py:89 keeps `offsets` sorted by
+                // rawbuffer.py write_value keeps `offsets` sorted by
                 // signed compare; a negative store_offset is
                 // a legitimate write key.
                 let Some(store_offset) = base_offset.checked_add(item_offset) else {
@@ -1675,7 +1675,7 @@ impl OptVirtualize {
                 ctx.materialize_operand_at(null_ref),
             ),
         ]);
-        // info.py:175-188 stores no fielddescr side-list; the SizeDescr
+        // info.py AbstractStructPtrInfo stores no fielddescr side-list; the SizeDescr
         // (VRefSizeDescr.all_fielddescrs) is the authoritative view.
         let vinfo = VirtualInfo {
             descr: vref_descr,
@@ -1924,7 +1924,7 @@ impl Optimization for OptVirtualize {
         // check therefore reads the prior op's outcome — model that by
         // snapshotting the flag at entry and resetting it. Removal paths
         // (_optimize_JIT_FORCE_VIRTUAL, do_RAW_MALLOC_VARSIZE_CHAR) set the
-        // flag back to true before returning Remove. virtualize.py:67-75
+        // flag back to true before returning Remove. virtualize.py
         // optimize_GUARD_NO_EXCEPTION / optimize_GUARD_NOT_FORCED read the
         // snapshot.
         let prior_emitted_was_removed = self.last_emitted_was_removed;
@@ -1965,7 +1965,7 @@ impl Optimization for OptVirtualize {
             | OpCode::GetarrayitemGcPureR
             | OpCode::GetarrayitemGcPureF => self.optimize_getarrayitem_gc(op, op_rc, ctx),
             // virtualize.py optimize_GETARRAYITEM_RAW_I (aliased
-            // to _F at virtualize.py:334). Upstream's
+            // to _F at virtualize.py). Upstream's
             // `GETARRAYITEM_RAW` family is `_I/_F` only — RPython
             // resoperation has no `_R` variant.
             //
@@ -2289,7 +2289,7 @@ impl Optimization for OptVirtualize {
 /// The postcondition of a virtual `set_field`: slot `field_idx` of the struct
 /// descr this PtrInfo carries is the field that supplied the index.
 ///
-/// `info.py:206` writes `self._fields[fielddescr.get_index()]`, and
+/// `info.py` writes `self._fields[fielddescr.get_index()]`, and
 /// `info.py _force_elements` reads it back as
 /// `for i, fielddescr in enumerate(descr.get_all_fielddescrs()): fld =
 /// self._fields[i]` — two descrs, one index. Upstream cannot
@@ -2298,7 +2298,7 @@ impl Optimization for OptVirtualize {
 /// descrs be a mismatched pair: `rclass.py:549` declares a subclass as
 /// `MkStruct(name, ('super', rbase.object_type), *llfields)`, so the inherited
 /// fields are walked first and a field's index is the same in a class as in
-/// every subclass of it. `info.py:184-188` spends exactly that guarantee when
+/// every subclass of it. `info.py` spends exactly that guarantee when
 /// it swaps `self.descr` for "a more precise descr" and keeps the index.
 ///
 /// pyre reaches one such list from two producers that rank fields differently —
@@ -2840,7 +2840,7 @@ impl majit_ir::SizeDescr for VRefSizeDescr {
         true
     }
     fn vtable(&self) -> usize {
-        // virtualref.py:94-98: jit_virtual_ref_const_class — the vtable
+        // virtualref.py is_virtual_ref: jit_virtual_ref_const_class — the vtable
         // identity used by is_virtual_ref(). Pyre stores this as the
         // JIT_VIRTUAL_REF_VTABLE magic value at offset 0
         // (super_.typeptr). NEW_WITH_VTABLE writes it at allocation
@@ -3382,7 +3382,7 @@ mod tests {
     fn ref_field_descr(idx: u32) -> DescrRef {
         // ensure_ptr_info_arg0 (`optimizeopt/mod.rs`) requires field descrs flowing
         // into GETFIELD/SETFIELD to carry a parent_descr backreference per
-        // optimizer.py:478. TestRefFieldDescr mirrors TestFieldDescr but
+        // optimizer.py. TestRefFieldDescr mirrors TestFieldDescr but
         // for Ref-typed slots, returning a fresh parent SizeDescr on each
         // `get_parent_descr()` call so the test doesn't need to keep a
         // Weak parent alive across the test body.
@@ -3399,7 +3399,7 @@ mod tests {
 
     /// Test helper: build a `FieldDescr` with explicit `offset` and
     /// `index_in_parent` for the virtualizable-field test sites.  Mirrors
-    /// the shape `cpu.fielddescrof(VTYPE, name)` produces (descr.py:218-239
+    /// the shape `cpu.fielddescrof(VTYPE, name)` produces (descr.py
     /// `get_field_descr`). The index remains useful for testing ordinary
     /// virtual object field identity; standard virtualizables carry no
     /// optimizer-owned field map.
@@ -4603,7 +4603,7 @@ mod tests {
         // makes `virtualizable_boxes` non-empty for the whole life of such a
         // trace, and `resume.py:236-239` (armed via
         // `minimum_virtualizable_size`) asserts it. Identity first
-        // (`opencoder.py:718-726`), then this config's one static field and
+        // (`opencoder.py _list_of_boxes_virtualizable`), then this config's one static field and
         // its one array item.
         opt.snapshot_vable_boxes = vec![Some(
             [
@@ -5289,7 +5289,7 @@ mod tests {
 
     #[test]
     fn test_new_array_clear_unwritten_item_is_typed_zero() {
-        // virtualize.py:27-35 + info.py:507-514: NEW_ARRAY_CLEAR seeds every
+        // virtualize.py make_varray + info.py:507-514: NEW_ARRAY_CLEAR seeds every  allow-line-citation
         // virtual slot with optimizer.new_const_item(arraydescr), so reading
         // an unwritten integer item folds to zero instead of raising
         // InvalidLoop("reading uninitialized virtual array items").
@@ -5381,7 +5381,7 @@ mod tests {
     fn test_new_array_struct_virtual() {
         // virtualize.py:30-32 array-of-structs NEW_ARRAY_CLEAR virtualization,
         // mirroring the virtual roundtrip exercised by
-        // rpython/jit/metainterp/optimizeopt/test/test_optimizebasic.py:2526
+        // rpython/jit/metainterp/optimizeopt/test/test_optimizebasic.py test_dirty_array_of_structs_field_after_force
         // test_dirty_array_of_structs_field_after_force:
         //   p1 = new_array_clear(1, descr=complexarraydescr)
         //   setinteriorfield_gc(p1, 0, f_real, descr=complexrealdescr)
@@ -5853,7 +5853,7 @@ mod tests {
         // any lazy_set on the cached fields it could touch. PyPy
         // `effectinfo.py effectinfo_from_writeanalyze` force-promotes
         // analyzer-absent EIs to `EF_RANDOM_EFFECTS` (`MOST_GENERAL`,
-        // `effectinfo.py:271-273`). `emit_residual_call` /
+        // `effectinfo.py`). `emit_residual_call` /
         // `handle_side_effects` then see `call_has_random_effects` and
         // route through `clean_caches`,
         // so the per-cached-field flush runs and `setfield_gc` survives
@@ -7468,7 +7468,7 @@ mod tests {
     fn test_guard_fail_args_nested_virtual_field_encodes_into_rd_virtuals() {
         // Nested virtual: outer.field = inner_virtual (Ref), inner.field = OpRef::int_op(40) (Int).
         // RPython resume.py:_number_virtuals (resume.py _number_virtuals;
-        // visitor_walk_recursive at resume.py:426) recursively encodes nested
+        // visitor_walk_recursive at resume.py) recursively encodes nested
         // virtuals as TAGVIRTUAL inside rd_virtuals; no New/NewWithVtable is
         // materialized at numbering time.  Liveboxes only carry the leaf
         // TAGBOX values.

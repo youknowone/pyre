@@ -37,7 +37,7 @@ pub struct JitDriverSpec {
     /// Optional operand-kind declarations parallel to `greens`.
     ///
     /// Upstream derives the portal argument kinds from `PORTALFUNC.ARGS` in
-    /// warmspot.py:658-670. This layer does not carry that portal signature,
+    /// warmspot.py make_args_specification. This layer does not carry that portal signature,
     /// so consumers may declare the positional marker kinds and the codewriter
     /// checks them. This is the positional-argument counterpart to the keyword
     /// validation in rlib/jit.py:892-901.
@@ -178,7 +178,7 @@ pub struct ProgramPipelineResult {
     pub insns: indexmap::IndexMap<String, u8>,
     /// RPython: `Assembler.descrs` (assembler.py), consumed by
     /// `BlackholeInterpBuilder.setup_descrs(asm.descrs)`
-    /// (blackhole.py:59, 102-103). Each 'd'/'j' argcode in a
+    /// (blackhole.py, 102-103). Each 'd'/'j' argcode in a
     /// `JitCode.code` byte stream indexes into this shared descr pool
     /// to read field offsets / call descrs / sub-JitCodes.
     ///
@@ -202,7 +202,7 @@ pub struct ProgramPipelineResult {
     /// The `(gccache slot key, mint arguments)` pairs behind every descr an
     /// `EffectInfo` raw set names — see `majit_ir::descr::ei_descr_mints_snapshot`.
     ///
-    /// `descrs` above is upstream's `opcode_descrs` (`pyjitpl.py:2261
+    /// `descrs` above is upstream's `opcode_descrs` (`pyjitpl.py
     /// setup_descrs(asm.descrs)`), not its `all_descrs` (`pyjitpl.py
     /// self.cpu.setup_descrs()`, the full gccache walk at `descr.py`).
     /// A descr the analyzer minted only to fill a raw set is named by no

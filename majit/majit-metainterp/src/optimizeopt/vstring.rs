@@ -38,7 +38,7 @@ pub struct StrOrUnicode {
 ///
 /// Constant-folding INT_ADD: folds add-0 and const+const at the optimizer
 /// level. Non-constant adds emit an INT_ADD operation that is re-dispatched
-/// from `first_optimization` via `send_extra_operation` (vstring.py:380), so
+/// from `first_optimization` via `send_extra_operation` (vstring.py), so
 /// OptIntBounds — a pass BEFORE OptString — computes the result bound.
 pub fn _int_add(box1: &Operand, box2: &Operand, ctx: &mut OptContext) -> Operand {
     if let Some(v1) = ctx
@@ -192,7 +192,7 @@ pub fn copy_str_content(
     next_offset
 }
 
-/// vstring.py:132-140 / 185-205 / 230-233 / 309-317
+/// vstring.py string_copy_parts / 185-205 / 230-233 / 309-317
 /// string_copy_parts — recursive dispatch to copy string content
 /// into an already-allocated target string at `offsetbox`.
 /// Returns the updated offset after the copy.
@@ -595,8 +595,8 @@ impl OptString {
     /// index — the copy_str_content reader. A constant index folds through the
     /// `strgetitem_emit` path (static virtual/ConstPtr fold, slice rebase,
     /// concat recursion); a non-constant index rebases a virtual slice to its
-    /// source at `start + index` (vstring.py:490-493) and residualizes
-    /// (vstring.py:495: vindex non-constant, so the Plain/Concat folds are
+    /// source at `start + index` (vstring.py) and residualizes
+    /// (vstring.py: vindex non-constant, so the Plain/Concat folds are
     /// skipped).
     fn strgetitem_emit_box(
         &self,
@@ -778,9 +778,9 @@ impl OptString {
     /// vstring.py:490-512: resolve the residual STRGETITEM target after a
     /// static fold miss, mirroring the rest of `strgetitem` past the Plain
     /// fold. A virtual slice rebases `index → start+index`, `s → source`, then
-    /// the dispatch CONTINUES on the rebased string (vstring.py:494 onward); a
+    /// the dispatch CONTINUES on the rebased string (vstring.py onward); a
     /// virtual concat with a constant index recurses into the child holding
-    /// that position (vstring.py:505-512). Returns `Some((string, index))` when
+    /// that position (vstring.py). Returns `Some((string, index))` when
     /// rebasing moved the target off `s`, and `None` when `s` is a plain /
     /// non-virtual string the residual should read directly (the caller then
     /// keeps the op and forces it).
@@ -1360,7 +1360,7 @@ impl OptString {
     }
 
     /// vstring.py handle_str_equal_level2 — `l2box` is the strlen
-    /// box of `arg2`, computed once by the caller (vstring.py:700-704) and
+    /// box of `arg2`, computed once by the caller (vstring.py) and
     /// threaded through, never recomputed here.
     fn handle_str_equal_level2(
         &self,
@@ -1499,7 +1499,7 @@ impl OptString {
             // vstring.py:830-836: comparing two single chars. `replace_op_with`
             // rewrites the original op into INT_SUB(char1, char2) preserving its
             // result box, then `seo = send_extra_operation; seo(op)` re-dispatches
-            // it. `seo`'s default `opt=None` (optimizer.py:594) restarts from
+            // it. `seo`'s default `opt=None` (optimizer.py) restarts from
             // first_optimization, so the INT_SUB runs the whole pass chain — not
             // a final Emit, which would skip every subsequent pass. Mirror that
             // with a new op whose pos is the original result position
@@ -2872,7 +2872,7 @@ mod tests {
         );
     }
 
-    /// vstring.py:110-119 getstrlen_opref parity:
+    /// vstring.py getstrlen getstrlen_opref parity:
     /// getstrlen_opref(opref, mode) looks up info from opref and emits
     /// STRLEN(opref) on cache miss. Cached lgtop is returned on second call.
     #[test]

@@ -10,7 +10,7 @@
 //!
 //! **What the join has to preserve.** A `BhDescr::JitCode` slot names its
 //! callee by an `all_jitcodes` index, and the object that index resolves to
-//! must be *the* object the table holds at it — `codewriter.py:80
+//! must be *the* object the table holds at it — `codewriter.py
 //! all_jitcodes[jitcode.index] is jitcode`, an identity, not an equality.
 //! Minting a second shell per pool slot satisfies every read that only wants a
 //! body and breaks every read that asks whether two references name the same

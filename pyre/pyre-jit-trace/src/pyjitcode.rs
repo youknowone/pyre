@@ -303,10 +303,10 @@ pub struct PyJitCodeMetadata {
 /// callee body at every call site the walker considers.
 ///
 /// This is where upstream keeps the answer too: `look_inside_graph`
-/// (`jit/codewriter/policy.py:48-80`) runs once per graph at codewriter time
+/// (`jit/codewriter/policy.py`) runs once per graph at codewriter time
 /// and the verdict is baked into the jitcode by rewriting `direct_call` to
 /// `inline_call_*`, which is why `_opimpl_inline_call1/2/3`
-/// (`pyjitpl.py:1265-1276`) have no admissibility test left to run.
+/// (`pyjitpl.py`) have no admissibility test left to run.
 ///
 /// Carried on the payload for the reason `sub_descr_pool` is: a `replace_with`
 /// body refill must drop these together with the body they describe.  A side
@@ -430,7 +430,7 @@ impl PyJitCodePayload {
 /// `JitCode` references are shared the same way through Python's
 /// refcount semantics.
 ///
-/// RPython mutates the `JitCode` shell inserted by `call.py:168-170`
+/// RPython mutates the `JitCode` shell inserted by `call.py`
 /// when `assembler.assemble(..., jitcode, ...)` runs in
 /// `codewriter.py:67`. Pyre's assembler still returns a fresh payload,
 /// so the outer `PyJitCode` uses interior mutability to preserve the
@@ -661,7 +661,7 @@ impl PyJitCode {
 
     /// "Has `assembler.assemble` been run on this jitcode yet?" A
     /// freshly-constructed RPython `JitCode(name, fnaddr, calldescr,
-    /// ...)` (jitcode.py:14, call.py:168) leaves `self.code` unset
+    /// ...)` (jitcode.py, call.py:168) leaves `self.code` unset  allow-line-citation
     /// until `setup` (jitcode.py) is invoked by
     /// `assembler.assemble(ssarepr, jitcode, num_regs)`
     /// (codewriter.py:67); pyre's split wrapper uses `metadata.is_drained`
@@ -1094,7 +1094,7 @@ impl PyJitCode {
     }
 
     /// Empty `PyJitCode` slot inserted by `CallControl::get_jitcode`
-    /// (call.py:168 `jitcode = JitCode(graph.name, fnaddr, calldescr, ...)`).
+    /// (call.py `jitcode = JitCode(graph.name, fnaddr, calldescr, ...)`).
     ///
     /// In RPython the `JitCode` constructor returns a fresh object whose
     /// `code` / `descrs` / `liveness` arrays are all empty until
@@ -1102,7 +1102,7 @@ impl PyJitCode {
     /// `make_jitcodes`'s drain loop (codewriter.py).  The skeleton
     /// gives the dict an entry with a stable identity so re-entrant
     /// `get_jitcode` calls can find an existing key without recompiling
-    /// (call.py:155 `if graph in self.jitcodes: return`).
+    /// (call.py `if graph in self.jitcodes: return`).
     pub fn skeleton(code_ptr: *const pyre_interpreter::CodeObject) -> Self {
         Self::from_parts(
             std::sync::Arc::new(RuntimeJitCode::default()),

@@ -232,7 +232,7 @@ fn lowlevel_container_field_type(container: &LowLevelType, attr: &str) -> Option
 /// `cTEMP` argument shape used by `malloc` / `malloc_varsize`
 /// SpaceOperations (and other ops that take a struct/array type as
 /// their first arg). Mirrors upstream `inputconst(Void, TYPE)`
-/// (rmodel.py:215).
+/// (rmodel.py).
 pub(crate) fn lowlevel_type_const(lltype: LowLevelType) -> Hlvalue {
     Hlvalue::Constant(Constant::with_concretetype(
         ConstValue::LowLevelType(Box::new(lltype)),
@@ -243,7 +243,7 @@ pub(crate) fn lowlevel_type_const(lltype: LowLevelType) -> Hlvalue {
 /// Build a `Constant` carrying the `{'flavor': 'gc'}` flags dict —
 /// the `cflags` argument shape used by `malloc` / `malloc_varsize`
 /// SpaceOperations. Mirrors upstream `inputconst(Void, {'flavor':
-/// 'gc'})` (rmodel.py:216, rstr.py:1130).
+/// 'gc'})` (rmodel.py, rstr.py:1130).  allow-line-citation
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
@@ -275,7 +275,7 @@ pub enum setupstate {
     /// Initial state; [`Repr::setup`] still has to run.
     NotInitialized = 0,
     /// Inside an active [`Repr::_setup_repr`] call. Re-entry is an
-    /// `AssertionError` upstream (`rmodel.py:45-47`).
+    /// `AssertionError` upstream (`rmodel.py`).
     InProgress = 1,
     /// `_setup_repr()` raised `TyperError`; subsequent `setup()` calls
     /// re-raise `BrokenReprTyperError` (`rmodel.py`).
@@ -283,7 +283,7 @@ pub enum setupstate {
     /// `_setup_repr()` returned normally; fields are ready to read.
     Finished = 3,
     /// `setup()` deferred pending an outer-pass pre-registration
-    /// (`rmodel.py:82-93`).
+    /// (`rmodel.py`).
     Delayed = 4,
 }
 
@@ -310,7 +310,7 @@ impl setupstate {
 /// harness exercises the singletons concurrently, so [`Repr::setup`]
 /// uses CAS to claim `InProgress` and tracks the owning [`ThreadId`]
 /// in [`ReprState::owner`] to keep RPython's same-thread recursion
-/// panic (`rmodel.py:45-47`) while letting other threads wait.
+/// panic (`rmodel.py`) while letting other threads wait.
 #[derive(Debug)]
 pub struct ReprState {
     initialized: AtomicU8,
@@ -345,7 +345,7 @@ impl ReprState {
     /// the owner to the current thread. Lets the
     /// `setup_on_inprogress_panics_like_upstream_assertion` parity
     /// test simulate the "same thread already in setup" scenario the
-    /// upstream `raise AssertionError` (`rmodel.py:45-47`) panics
+    /// upstream `raise AssertionError` (`rmodel.py`) panics
     /// on, with pyre's CAS+thread-tracking model preserving that
     /// panic on owner==current-thread.
     #[doc(hidden)]
@@ -661,7 +661,7 @@ pub trait Repr: Debug + std::any::Any {
     ///
     /// **Convergence path** (TODO):
     /// the dual-method shape collapses once `rbuiltin.rtype_hlinvoke`
-    /// (rpbc.py-side: rbuiltin.py:312) lands and reveals the production
+    /// (rpbc.py-side: rbuiltin.py) lands and reveals the production
     /// call site shape. Two unification options at that point:
     ///   (a) trait method takes `Arc<Self>` receiver — Rust trait
     ///   methods cannot do this directly; would require a free function
@@ -738,9 +738,9 @@ pub trait Repr: Debug + std::any::Any {
 
     /// RPython `Repr.convert_desc(self, desc)` — not defined on the base
     /// class upstream (Python raises `AttributeError` implicitly when
-    /// hit). Only PBC / class reprs override it (`rpbc.py:255`, `:320`,
+    /// hit). Only PBC / class reprs override it (`rpbc.py`, `:320`,
     /// `:428`, `:647`, `:685`, `:769`, `:878`, `:950` and
-    /// `rclass.py:212`).
+    /// `rclass.py`).
     ///
     /// The Rust port surfaces the same "not supported" outcome as a
     /// structured [`TyperError::missing_rtype_operation`] so callers get
@@ -756,7 +756,7 @@ pub trait Repr: Debug + std::any::Any {
     }
 
     /// RPython `Repr.convert_desc_or_const(self, desc_or_const)`
-    /// (`rmodel.py:111-118`).
+    /// (`rmodel.py`).
     ///
     /// ```python
     /// def convert_desc_or_const(self, desc_or_const):
@@ -967,7 +967,7 @@ pub trait Repr: Debug + std::any::Any {
         Err(self.missing_rtype_operation("simple_call"))
     }
 
-    // ---- arithmetic / conversion missing-op defaults ----
+    // arithmetic / conversion missing-op defaults
     //
     // RPython `rmodel.py:342` registers missing-op stubs for
     // `setattr len contains iter` on the base `Repr`. The pyre port
@@ -1063,7 +1063,7 @@ pub trait Repr: Debug + std::any::Any {
     ///
     /// `foldable` (`not r_list.listitem.mutated`) is read off the container
     /// annotation so an unmutated list's iterator can fold the element load
-    /// (`lltypesystem/rlist.py:462-466`); it is irrelevant on this path (only
+    /// (`lltypesystem/rlist.py`); it is irrelevant on this path (only
     /// `newiter` runs) but kept consistent with the `next`-op repr.
     fn rtype_iter(&self, hop: &HighLevelOp) -> RTypeResult {
         let foldable = hop
@@ -1134,14 +1134,14 @@ pub trait Repr: Debug + std::any::Any {
     /// RPython `Repr.rtype_unicode(self, hop)` — default routes to the
     /// `MissingRTypeOperation` path. Concrete reprs (e.g. `StringRepr`,
     /// `UnicodeRepr`) override. Used by `@typer_for(unicode)` in
-    /// rbuiltin.py:201-203.
+    /// rbuiltin.py.
     fn rtype_unicode(&self, _hop: &HighLevelOp) -> RTypeResult {
         Err(self.missing_rtype_operation("unicode"))
     }
 
     /// RPython `Repr.rtype_bytearray(self, hop)` — default routes to
     /// the `MissingRTypeOperation` path. Used by `@typer_for(bytearray)`
-    /// in rbuiltin.py:205-207.
+    /// in rbuiltin.py.
     fn rtype_bytearray(&self, _hop: &HighLevelOp) -> RTypeResult {
         Err(self.missing_rtype_operation("bytearray"))
     }
@@ -1359,7 +1359,7 @@ pub fn warning(msg: &str) {
 }
 
 /// RPython `class CanBeNull(object).rtype_bool(self, hop)`
-/// (`rmodel.py:251-260`).
+/// (`rmodel.py`).
 ///
 /// ```python
 /// class CanBeNull(object):
@@ -1591,7 +1591,7 @@ pub struct SimplePointerRepr {
 
 impl SimplePointerRepr {
     /// `lowleveltype` must be a [`LowLevelType::Ptr`] variant upstream
-    /// (`rmodel.py:365-375`); enforce via debug assertion.
+    /// (`rmodel.py SimplePointerRepr`); enforce via debug assertion.
     pub fn new(lowleveltype: LowLevelType) -> Self {
         debug_assert!(
             matches!(lowleveltype, LowLevelType::Ptr(_)),
@@ -1621,7 +1621,7 @@ impl Repr for SimplePointerRepr {
         super::pairtype::ReprClassId::SimplePointerRepr
     }
 
-    /// RPython override (`rmodel.py:371-375`): only accept `None`, emit
+    /// RPython override (`rmodel.py convert_const`): only accept `None`, emit
     /// `nullptr(self.lowleveltype.TO)`.
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         if !matches!(value, ConstValue::None) {
@@ -1686,7 +1686,7 @@ impl Repr for AddressRepr {
         ))
     }
 
-    /// raddress.py:41-43
+    /// raddress.py rtype_getattr
     fn rtype_getattr(&self, hop: &HighLevelOp) -> RTypeResult {
         let v_access = hop.inputarg(ConvertedTo::Repr(self), 0)?;
         Ok(Some(v_access))
@@ -1700,7 +1700,7 @@ impl Repr for AddressRepr {
         Ok(None)
     }
 
-    /// raddress.py:54-57
+    /// raddress.py get_ll_hash_function
     fn get_ll_hash_function(
         &self,
         rtyper: &super::rtyper::RPythonTyper,
@@ -2698,16 +2698,16 @@ pub enum BuiltinConstKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ReprKey {
     /// RPython `SomeImpossibleValue.rtyper_makekey = (self.__class__,)`
-    /// (rmodel.py:292-293).
+    /// (rmodel.py).
     Impossible,
     /// RPython `SomeInteger.rtyper_makekey = (self.__class__,
-    /// self.knowntype)` (`rint.py:190-191`).
+    /// self.knowntype)` (`rint.py`).
     Integer(KnownType),
     /// RPython `SomeNone.rtyper_makekey = (self.__class__,)`
-    /// (`rnone.py:39-40`).
+    /// (`rnone.py`).
     None_,
     /// RPython `SomeBool.rtyper_makekey = (self.__class__,)`
-    /// (`rbool.py:43-44`).
+    /// (`rbool.py`).
     Bool,
     /// RPython `SomeFloat.rtyper_makekey = (self.__class__,)`
     /// (`rfloat.py:71-72`).
@@ -2719,16 +2719,16 @@ pub enum ReprKey {
     /// (`rfloat.py:163-164`).
     LongFloat,
     /// RPython `SomeInstance.rtyper_makekey = (self.__class__,
-    /// self.classdef)` (rclass.py:449-450). `None` mirrors the
+    /// self.classdef)` (rclass.py). `None` mirrors the
     /// `SomeInstance(classdef=None)` sentinel.
     Instance(Option<crate::annotator::description::ClassDefKey>),
     /// RPython `SomeException.rtyper_makekey = (self.__class__,
-    /// frozenset(self.classdefs))` (rclass.py:456-457). Stored as a
+    /// frozenset(self.classdefs))` (rclass.py). Stored as a
     /// sorted+deduped `Vec<ClassDefKey>` so the frozenset-equality
     /// semantics carry through `HashMap` lookups.
     Exception(Vec<crate::annotator::description::ClassDefKey>),
     /// RPython `SomeType.rtyper_makekey = (self.__class__,)`
-    /// (rclass.py:463-464).
+    /// (rclass.py).
     Type,
     /// `SomeTypeOf` inherits `SomeType.rtyper_makekey`; because the method
     /// returns `(self.__class__,)`, all `SomeTypeOf` annotations share their
@@ -2856,13 +2856,13 @@ pub enum ReprKey {
         subset_of: Option<Box<ReprKey>>,
     },
     /// RPython `SomeAddress.rtyper_makekey = (self.__class__,)`
-    /// (raddress.py:17-18).
+    /// (raddress.py).
     Address,
     /// RPython `SomeTypedAddressAccess.rtyper_makekey = (self.__class__, self.type)`
-    /// (raddress.py:24-25).
+    /// (raddress.py).
     TypedAddressAccess(LowLevelType),
     /// RPython `SomePtr.rtyper_makekey = (self.__class__, self.ll_ptrtype)`
-    /// (rptr.py:16). Keyed on the pointer lltype by value: `LowLevelType`'s
+    /// (rptr.py). Keyed on the pointer lltype by value: `LowLevelType`'s
     /// `Eq`/`Hash` mirror `lltype.py` `__eq__`/`__hash__`, which
     /// compare `__dict__` structurally (and resolve forward references via
     /// `become()`), so two distinct pointer types never share a bucket and
@@ -2870,13 +2870,13 @@ pub enum ReprKey {
     /// container it points at.
     Ptr(LowLevelType),
     /// RPython `SomeInteriorPtr.rtyper_makekey = (self.__class__,
-    /// self.ll_ptrtype)` (rptr.py:24). Same by-value lltype key as [`Ptr`].
+    /// self.ll_ptrtype)` (rptr.py). Same by-value lltype key as [`Ptr`].
     InteriorPtr(LowLevelType),
     /// RPython `SomeStringBuilder.rtyper_makekey = (self.__class__,)`
-    /// (rstring.py:1228). Class-tag singleton.
+    /// (rstring.py). Class-tag singleton.
     StringBuilder,
     /// RPython `SomeUnicodeBuilder.rtyper_makekey = (self.__class__,)`
-    /// (rstring.py:1268). Class-tag singleton.
+    /// (rstring.py). Class-tag singleton.
     UnicodeBuilder,
     /// Pending variant — carries a textual discriminator from
     /// `rtyper_makekey` arm that hasn't been ported yet.
@@ -2887,7 +2887,7 @@ pub enum ReprKey {
 ///
 /// Upstream attaches a `rtyper_makekey` method per SomeXxx via the
 /// `__extend__` metaclass pattern (rmodel.py, rint.py,
-/// rbool.py:43, ...). Pyre centralises into this match since Rust has
+/// rbool.py, ...). Pyre centralises into this match since Rust has
 /// no `__extend__` equivalent.
 pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
     use crate::annotator::model::SomeValue;
@@ -3497,7 +3497,7 @@ mod tests {
 
     #[test]
     fn setup_transitions_notinitialized_to_finished() {
-        // rmodel.py:35-59: NOTINITIALIZED → INPROGRESS → FINISHED.
+        // rmodel.py setup: NOTINITIALIZED → INPROGRESS → FINISHED.
         let r = VoidRepr::new();
         assert_eq!(r.state().get(), setupstate::NotInitialized);
         r.setup().expect("setup should succeed on default VoidRepr");
@@ -3533,7 +3533,7 @@ mod tests {
 
     #[test]
     fn set_setup_delayed_toggles_state_both_ways() {
-        // rmodel.py:82-88.
+        // rmodel.py set_setup_delayed.
         let r = VoidRepr::new();
         r.set_setup_delayed(true);
         assert_eq!(r.state().get(), setupstate::Delayed);
@@ -3545,7 +3545,7 @@ mod tests {
 
     #[test]
     fn set_setup_maybe_delayed_only_promotes_from_notinitialized() {
-        // rmodel.py:90-93.
+        // rmodel.py set_setup_maybe_delayed.
         let r = VoidRepr::new();
         assert!(r.set_setup_maybe_delayed());
         assert_eq!(r.state().get(), setupstate::Delayed);
@@ -3625,7 +3625,7 @@ mod tests {
 
     #[test]
     fn inputconst_wraps_value_and_records_lowleveltype() {
-        // rmodel.py:379-395.
+        // rmodel.py inputconst.
         let r = VoidRepr::new();
         let c = inputconst(&r, &ConstValue::None).unwrap();
         assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::Void));
@@ -3642,7 +3642,7 @@ mod tests {
 
     #[test]
     fn mangle_uses_internal_prefix_for_dollar_names() {
-        // rmodel.py:402-408.
+        // rmodel.py mangle.
         assert_eq!(mangle("cls", "$hidden"), "clsinternal_hidden");
         assert_eq!(mangle("cls", "method"), "cls_method");
     }
@@ -3650,7 +3650,7 @@ mod tests {
     #[test]
     fn impossible_repr_is_shared_singleton_pointer() {
         // `impossible_repr = VoidRepr()` module-level singleton
-        // (rmodel.py:359). Two calls return Arcs to the same instance.
+        // (rmodel.py). Two calls return Arcs to the same instance.
         let a = impossible_repr();
         let b = impossible_repr();
         assert!(std::sync::Arc::ptr_eq(&a, &b));
@@ -3658,7 +3658,7 @@ mod tests {
 
     #[test]
     fn simple_pointer_repr_only_accepts_none_constant() {
-        // rmodel.py:365-375.
+        // rmodel.py SimplePointerRepr.
         let ptr_ty = LowLevelType::Ptr(Box::new(
             crate::translator::rtyper::lltypesystem::lltype::Ptr {
                 TO: crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(FuncType {
@@ -4325,9 +4325,7 @@ mod tests {
         assert!(r.can_ll_be_null());
     }
 
-    // -----------------------------------------------------------------
     // R5 — SomeInstance / SomeException / SomeType rtyper_make{key,repr}.
-    // -----------------------------------------------------------------
 
     #[test]
     fn rtyper_makekey_someinstance_uses_classdef_identity() {
@@ -4401,7 +4399,7 @@ mod tests {
     ///
     /// `SomeInstance(classdef=None)` is the projection currently used by
     /// `valuetype_to_someshell` for every `ValueType::Ref` operand;
-    /// `rclass.py:445-447` routes `classdef=None` through
+    /// `rclass.py __extend__` routes `classdef=None` through
     /// `getinstancerepr(rtyper, None, Gc)` -> `buildinstancerepr` with
     /// `unboxed=[]` / `virtualizable=false` and produces a regular
     /// `InstanceRepr` for the abstract `object`-root.  This test locks
@@ -4543,9 +4541,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
     // SomePBC.rtyper_makekey (rpbc.py).
-    // -----------------------------------------------------------------
 
     fn pbc_test_desc_function(
         bk: &Rc<crate::annotator::bookkeeper::Bookkeeper>,
@@ -4607,9 +4603,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
     // SomeBuiltin / SomeBuiltinMethod.rtyper_makekey (rbuiltin.py).
-    // -----------------------------------------------------------------
 
     #[test]
     fn rtyper_makekey_someiterator_recursively_keys_on_container_and_variant() {

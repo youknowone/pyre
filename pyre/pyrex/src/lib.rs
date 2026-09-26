@@ -101,7 +101,7 @@ fn drain_args(parser: &mut lexopt::Parser) -> Result<Vec<std::ffi::OsString>, le
 ///
 /// A carriage return does reach this point, and is meant to: the dedent runs on
 /// the argument as it was given, and the tokenizer's own `\r\n` / lone-`\r`
-/// rewrite (`pytokenizer.py:654-662`) happens after it. Counting `"  \r"` as a
+/// rewrite (`pytokenizer.py universal_newline`) happens after it. Counting `"  \r"` as a
 /// line that holds something is what the reference does as well -- against a
 /// two-space margin a `"    \r"` line comes back as `"  "`, where a `"    "`
 /// line comes back empty.
@@ -1717,7 +1717,7 @@ fn run_module(module: &str, no_site: bool, run_code: bool) -> Option<MainSession
     // `_run_module_as_main` reads `sys.modules["__main__"].__dict__` and runs
     // the module's code in it, so a `__main__` module backed by a fresh dict
     // must exist before runpy is imported. Use the canonical W_DictObject so
-    // `__main__.__dict__` and `globals()` share one identity (module.py:77
+    // `__main__.__dict__` and `globals()` share one identity (module.py getdict
     // Module.getdict()).
     let w_globals = execution_context.fresh_module_globals();
     let _root = pyre_object::gc_roots::push_roots();

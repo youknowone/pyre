@@ -16399,7 +16399,7 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
     drop(wc);
 
     // Every argbox is a `Const`, so `record_result_of_call_pure` takes the
-    // `pyjitpl.py:3566` arm: the call is cut back out and the result comes
+    // `pyjitpl.py` arm: the call is cut back out and the result comes
     // back as the constant itself.
     assert_eq!(
         folded_i.inline_const_to_value(),
@@ -16929,7 +16929,7 @@ fn a_guard_after_the_subwalks_store_is_what_declines_the_pop_fold() {
 }
 
 /// `mirror_vable_static_to_boxes` must complete the `_opimpl_setfield_vable`
-/// pairing (pyjitpl.py:1189-1194) — the `virtualizable_boxes[index] = valuebox`
+/// pairing (pyjitpl.py) — the `virtualizable_boxes[index] = valuebox`
 /// store followed by `synchronize_virtualizable()` — so the shadow never runs
 /// ahead of the live frame.
 ///

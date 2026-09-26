@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 /// `PyTupleObject` -- the header, and the items that follow it.
 ///
-/// `tupleobject.py:31-35 PyTupleObjectFields` gives the mirror an array of
+/// `tupleobject.py PyTupleObjectFields` gives the mirror an array of
 /// `ob_size` `PyObject *`, filled when the mirror is built, so that
 /// `PyTuple_GET_ITEM` reads a slot the way CPython's macro does.  The array is
 /// the mirror's own rather than a view on the tuple, and has to be: the
@@ -48,7 +48,7 @@ fn carries_items(ob_type: *mut CPyTypeObject) -> bool {
         && unsafe { (*ob_type).tp_basicsize } == size_of::<CPyVarObject>() as isize
 }
 
-/// `pyobject.py:96-100 allocate`'s `size += itemcount * itemsize`, for the one
+/// `pyobject.py allocate`'s `size += itemcount * itemsize`, for the one
 /// type whose items live in its block.
 pub(super) fn item_bytes(w_obj: PyObjectRef, ob_type: *mut CPyTypeObject) -> usize {
     if !carries_items(ob_type) || unsafe { !pyre_object::is_tuple(w_obj) } {
@@ -87,7 +87,7 @@ fn items_in_block(raw: *mut CPyObject) -> Option<(*mut *mut CPyObject, usize)> {
 }
 
 /// Give the block the items it does not yet hold --
-/// `tupleobject.py:70-96 tuple_attach`, run on the first read rather than when
+/// `tupleobject.py tuple_attach`, run on the first read rather than when
 /// the mirror is built.
 ///
 /// Upstream fills the array before `track_reference` publishes the mirror, so

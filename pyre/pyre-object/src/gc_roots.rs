@@ -93,7 +93,7 @@ const DEFAULT_ROOT_STACK_DEPTH: usize = 163840;
 /// that check is not free: dropping it measures `.8711` / `.8727` on the
 /// any/all rooting probes with a pure-integer control at exactly `1.0000`.
 /// The buffer is raw-allocated once instead, as `_prepare_unused_stack` does
-/// (`shadowstack.py:344-349`), and released by [`RootStackOwner`].
+/// (`shadowstack.py`), and released by [`RootStackOwner`].
 pub struct RootStack {
     base: Cell<*mut PyObjectRef>,
     top: Cell<*mut PyObjectRef>,
@@ -318,7 +318,7 @@ fn with_shadow_stack<R>(f: impl FnOnce(&RootStack) -> R) -> R {
 ///
 /// One query answers it.  `gc_current_object_address` is a nursery range
 /// compare plus, for a nursery address, the `is_forwarded` header test
-/// (`incminimark.py:1235-1252`); a forwarding target is always an old-gen
+/// (`incminimark.py`); a forwarding target is always an old-gen
 /// address, so asking a second time about the value the first store left can
 /// only return it unchanged.  Nor does the slot need re-reading for a foreign
 /// mutator: it is *published*, which is exactly what lets a foreign root walk
@@ -415,8 +415,8 @@ fn normalize_published_slot_hooked(stack: &RootStack, index: usize) -> PyObjectR
 }
 
 /// `increase_root_stack_depth(new_depth)` (`rlib/rgc.py` →
-/// `shadowstack.py:351-364`).  `sys.setrecursionlimit` scales the root stack
-/// with the limit at `pypy/module/sys/vm.py:97`; the depth can only grow.
+/// `shadowstack.py`).  `sys.setrecursionlimit` scales the root stack
+/// with the limit at `pypy/module/sys/vm.py`; the depth can only grow.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn increase_root_stack_depth(new_depth: usize) {
     with_shadow_stack(|stack| stack.grow(new_depth));
@@ -901,7 +901,7 @@ pub fn shadow_stack_cell_truncate(cell: *const RootStack, len: usize) {
 ///
 /// Reads the thread-local `ROOT_STACK` the tracer cannot type; the JIT
 /// residualises the read instead of tracing into it (`@dont_look_inside`,
-/// `rlib/jit.py:139`), the [`shadow_stack_len`] twin.
+/// `rlib/jit.py`), the [`shadow_stack_len`] twin.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn shadow_stack_get(index: usize) -> PyObjectRef {
     // A plain slot read: the slot is already a registered root, so whatever
@@ -953,11 +953,11 @@ pub fn shadow_stack_copy_range(base: usize, dst: &mut [PyObjectRef]) {
 /// Overwrite a single shadow-stack slot by index, panicking if the index
 /// is out of bounds. A slot whose contents change over a bracket's lifetime
 /// is written here rather than re-pinned, mirroring `gc_save_root`'s
-/// overwrite of an already allocated slot (`shadowcolor.py:126-129`).
+/// overwrite of an already allocated slot (`shadowcolor.py _gc_save_root`).
 ///
 /// Writes the thread-local `ROOT_STACK` the tracer cannot type; the JIT
 /// residualises the write instead of tracing into it (`@dont_look_inside`,
-/// `rlib/jit.py:139`), the [`shadow_stack_get`] twin.
+/// `rlib/jit.py`), the [`shadow_stack_get`] twin.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn shadow_stack_set(index: usize, root: PyObjectRef) {
     #[cfg(debug_assertions)]
@@ -1111,7 +1111,7 @@ static PREBUILT_ROOTS_DIRTY: AtomicBool = AtomicBool::new(true);
 ///
 /// Sets the static `PREBUILT_ROOTS_DIRTY` bit the tracer cannot model; the
 /// JIT residualises the call instead of tracing into it (`@dont_look_inside`,
-/// `rlib/jit.py:139`), the `pin_root` twin.
+/// `rlib/jit.py`), the `pin_root` twin.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn mark_prebuilt_roots_dirty() {
     PREBUILT_ROOTS_DIRTY.store(true, Ordering::Relaxed);
@@ -1311,7 +1311,7 @@ mod tests {
 
     /// An empty range is in bounds anywhere up to and including the live
     /// length — `&stack[len..len]` was, and `pop_roots` is emitted even for
-    /// zero livevars (`shadowstack.py:37-40`). The top-of-stack case is the
+    /// zero livevars (`shadowstack.py`). The top-of-stack case is the
     /// one a per-slot bounds check gets wrong.
     #[test]
     fn copy_range_accepts_an_empty_range_at_the_top_of_the_stack() {

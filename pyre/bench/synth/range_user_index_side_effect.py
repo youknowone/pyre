@@ -1,7 +1,7 @@
 # A `__index__` that writes back to its own instance, consumed by `range()`.
 #
 # `functional.py:465` applies `space.index` once per bound and
-# `descroperation.py:607 _index` calls the user method exactly once, so the
+# `descroperation.py _index` calls the user method exactly once, so the
 # counter must equal the iteration count. The specialization runs the callee
 # during recording while keeping the caller pinned at the `range` CALL, so a
 # guard failure resumes by re-entering that CALL and calls `__index__` again --

@@ -623,7 +623,7 @@ pub fn rtype_builtin_enumerate(_hop: &HighLevelOp) -> RTypeResult {
 ///             self.lowleveltype = self.RANGEST
 /// ```
 ///
-/// where (`lltypesystem/rrange.py:51-57`):
+/// where (`lltypesystem/rrange.py`):
 ///
 /// ```python
 /// self.RANGE = Ptr(GcStruct("range", ("start", Signed), ("stop", Signed),
@@ -831,7 +831,7 @@ impl Repr for AbstractRangeRepr {
     }
 
     /// RPython `RangeRepr.make_iterator_repr(self, variant=None)`
-    /// (`lltypesystem/rrange.py:63-67`):
+    /// (`lltypesystem/rrange.py`):
     ///
     /// ```python
     /// def make_iterator_repr(self, variant=None):
@@ -1421,7 +1421,7 @@ fn build_ll_rangeitem_neg_helper_graph(
         Hlvalue::Variable(step_disp.clone()),
     ]);
 
-    // ---- start: is_neg = int_lt(index, 0); branch.
+    // start: is_neg = int_lt(index, 0); branch.
     let is_neg = variable_with_lltype("is_neg", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "int_lt",
@@ -1452,7 +1452,7 @@ fn build_ll_rangeitem_neg_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_neg_fix: length = _ll_rangelen(...); i_fixed = index + length.
+    // block_neg_fix: length = _ll_rangelen(...); i_fixed = index + length.
     let length = emit_range_length(
         &block_neg_fix,
         &l_fix,
@@ -1481,7 +1481,7 @@ fn build_ll_rangeitem_neg_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_dispatch: result = l.start + index*step.
+    // block_dispatch: result = l.start + index*step.
     let result = emit_range_formula(
         &block_dispatch,
         &l_disp,
@@ -1545,7 +1545,7 @@ fn build_ll_rangeitem_nonneg_checked_helper_graph(
         Hlvalue::Variable(step_disp.clone()),
     ]);
 
-    // ---- start: length = _ll_rangelen(...); oob = int_ge(index, length); branch.
+    // start: length = _ll_rangelen(...); oob = int_ge(index, length); branch.
     let length = emit_range_length(&startblock, &l, Hlvalue::Variable(step.clone()), &rangelen);
     let oob = variable_with_lltype("oob", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -1573,7 +1573,7 @@ fn build_ll_rangeitem_nonneg_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_dispatch: result = l.start + index*step.
+    // block_dispatch: result = l.start + index*step.
     let result = emit_range_formula(
         &block_dispatch,
         &l_disp,
@@ -1677,7 +1677,7 @@ fn build_ll_rangeitem_checked_helper_graph(
         Hlvalue::Variable(step_disp.clone()),
     ]);
 
-    // ---- start: length = _ll_rangelen(...); is_neg = int_lt(index, 0); branch.
+    // start: length = _ll_rangelen(...); is_neg = int_lt(index, 0); branch.
     let length = emit_range_length(&startblock, &l, Hlvalue::Variable(step.clone()), &rangelen);
     let is_neg = variable_with_lltype("is_neg", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -1711,7 +1711,7 @@ fn build_ll_rangeitem_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_add: index += length. -> block_check_low.
+    // block_add: index += length. -> block_check_low.
     let i_added = variable_with_lltype("index", LowLevelType::Signed);
     block_add.borrow_mut().operations.push(SpaceOperation::new(
         "int_add",
@@ -1732,7 +1732,7 @@ fn build_ll_rangeitem_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_check_low: if index < 0: raise IndexError; else check_high.
+    // block_check_low: if index < 0: raise IndexError; else check_high.
     let lo = variable_with_lltype("lo", LowLevelType::Bool);
     block_check_low
         .borrow_mut()
@@ -1763,7 +1763,7 @@ fn build_ll_rangeitem_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_check_high: if index >= length: raise IndexError; else dispatch.
+    // block_check_high: if index >= length: raise IndexError; else dispatch.
     let hi = variable_with_lltype("hi", LowLevelType::Bool);
     block_check_high
         .borrow_mut()
@@ -1793,7 +1793,7 @@ fn build_ll_rangeitem_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_dispatch: result = l.start + index*step.
+    // block_dispatch: result = l.start + index*step.
     let result = emit_range_formula(
         &block_dispatch,
         &l_disp,
@@ -1870,7 +1870,7 @@ fn rangeitem_helper(
 }
 
 /// RPython `class RangeIteratorRepr(AbstractRangeIteratorRepr)`
-/// (`rrange.py:145-156` + `lltypesystem/rrange.py:85-97`), covering both
+/// (`rrange.py:145-156` + `lltypesystem/rrange.py`), covering both  allow-line-citation
 /// the constant-step (`step != 0`, `RANGEITER`) and variable-step
 /// (`step == 0`, `RANGESTITER`) shapes.
 ///
@@ -1884,7 +1884,7 @@ fn rangeitem_helper(
 ///             self.lowleveltype = r_rng.RANGESTITER
 /// ```
 ///
-/// where (`lltypesystem/rrange.py:58`) `RANGEITER = Ptr(GcStruct("range",
+/// where (`lltypesystem/rrange.py`) `RANGEITER = Ptr(GcStruct("range",
 /// ("next", Signed), ("stop", Signed)))`. Like
 /// [`super::rtuple::Length1TupleIteratorRepr`], pyre collapses the
 /// abstract/concrete split into one concrete repr.
@@ -1909,7 +1909,7 @@ pub struct RangeIteratorRepr {
     /// `iter.step`) and the `RANGESTITER` iter struct shape.
     step: i64,
     /// `self.lowleveltype = r_rng.RANGEITER` / `RANGESTITER`
-    /// (`lltypesystem/rrange.py:41,58`) — `Ptr(GcStruct("range", ("next",
+    /// (`lltypesystem/rrange.py`) — `Ptr(GcStruct("range", ("next",
     /// Signed), ("stop", Signed)[, ("step", Signed)]))`. The `step` field
     /// is present only for the variable-step `RANGESTITER`.
     lowleveltype: LowLevelType,
@@ -2105,7 +2105,7 @@ impl Repr for RangeIteratorRepr {
 }
 
 /// Synthesise the `ll_rangeiter` helper graph
-/// (`lltypesystem/rrange.py:91-97`):
+/// (`lltypesystem/rrange.py`):
 ///
 /// ```python
 /// def ll_rangeiter(ITERPTR, rng):
@@ -2285,7 +2285,7 @@ fn emit_void_setfield(block: &BlockRef, l: &Variable, field: &str, value: Hlvalu
 }
 
 /// Synthesise the `ll_newrange(RANGE, start, stop)` helper graph
-/// (`lltypesystem/rrange.py:70-74`):
+/// (`lltypesystem/rrange.py`):
 ///
 /// ```python
 /// def ll_newrange(RANGE, start, stop):
@@ -2340,7 +2340,7 @@ pub(crate) fn build_ll_newrange_helper_graph(
 }
 
 /// Synthesise the `ll_newrangest(start, stop, step)` helper graph
-/// (`lltypesystem/rrange.py:77-83`):
+/// (`lltypesystem/rrange.py`):
 ///
 /// ```python
 /// def ll_newrangest(start, stop, step):
@@ -2386,7 +2386,7 @@ pub(crate) fn build_ll_newrangest_helper_graph(
         Hlvalue::Variable(b_step.clone()),
     ]);
 
-    // ---- start: is_zero = int_eq(step, 0); branch.
+    // start: is_zero = int_eq(step, 0); branch.
     let is_zero = variable_with_lltype("is_zero", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "int_eq",
@@ -2413,7 +2413,7 @@ pub(crate) fn build_ll_newrangest_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- build: l = malloc(RANGEST); l.start/stop/step = ...; return l.
+    // build: l = malloc(RANGEST); l.start/stop/step = ...; return l.
     let v_l = emit_gc_malloc(&build, &rangest_lltype, "build_ll_newrangest_helper_graph")?;
     emit_void_setfield(&build, &v_l, "start", Hlvalue::Variable(b_start));
     emit_void_setfield(&build, &v_l, "stop", Hlvalue::Variable(b_stop));
@@ -3578,7 +3578,7 @@ mod tests {
 
     /// Variable-step `ll_rangeiter` additionally copies `iter.step =
     /// rng.step` (the `if ITERPTR.TO is RANGESTITER` branch,
-    /// lltypesystem/rrange.py:95-96), so the block carries a third
+    /// lltypesystem/rrange.py), so the block carries a third
     /// `getfield` + `setfield` pair.
     #[test]
     fn build_ll_rangeiter_helper_graph_variable_step_copies_step_field() {

@@ -2,7 +2,7 @@
 //!
 //! RPython: `MetaInterpStaticData.jitcodes` in `warmspot.py` — the list
 //! of `JitCode` objects produced by `CodeWriter.make_jitcodes()`
-//! (codewriter.py:89). In RPython this list is passed by reference from
+//! (codewriter.py). In RPython this list is passed by reference from
 //! `CallControl.jitcodes` directly into `MetaInterpStaticData`; the two
 //! stores reference the same Python objects.
 //!
@@ -364,7 +364,7 @@ fn compute_portal_jitcode_index() -> Option<usize> {
 /// The orthodox model treats every user CodeObject as the portal's
 /// `pycode` input argument and reuses the single portal JitCode for
 /// every call — see RPython `pypy/module/pypyjit/interp_jit.py
-/// portal_runner` and `rpython/jit/codewriter/jtransform.py:473`
+/// portal_runner` and `rpython/jit/codewriter/jtransform.py handle_regular_call`
 /// `inline_call_*` emit.
 pub fn portal_jitcode() -> Option<Arc<JitCode>> {
     let idx = (*PORTAL_JITCODE_INDEX.get_or_init(compute_portal_jitcode_index))?;
@@ -677,7 +677,7 @@ pub fn newutf8_jitcode() -> Option<Arc<JitCode>> {
 /// the byte the build observed gets serialised.  `JitCode.code[i]`
 /// bytes can be mapped back to opnames through the inverted view
 /// exposed by `opname_for_byte`.  Matches RPython `setup_insns(insns)`
-/// consumption at `pyjitpl.py:2227-2243`.
+/// consumption at `pyjitpl.py`.
 ///
 /// Static justification: this is not a process-global mutable cache.
 /// `insns.bin` is a frozen build artifact emitted alongside the
@@ -692,7 +692,7 @@ pub fn newutf8_jitcode() -> Option<Arc<JitCode>> {
 ///
 /// This is the direct analogue of upstream's `asm.insns`, which is what
 /// `BlackholeInterpBuilder.__init__` hands to `setup_insns`
-/// (`blackhole.py:58-59`): upstream registers exactly what was emitted,
+/// (`blackhole.py`): upstream registers exactly what was emitted,
 /// so its dispatch table covers the whole reachable bytecode universe by
 /// construction.  Any byte in this map that the production blackhole
 /// builder leaves unregistered is a byte a real jitcode can carry and the
@@ -785,7 +785,7 @@ enum RuntimeInsn {
 /// Opcode bytes the runtime assembler allocated after `INSNS_BYTE_TO_OPNAME`
 /// was fixed.
 ///
-/// `assembler.py:220` grows `Assembler.insns` with `setdefault(key,
+/// `assembler.py` grows `Assembler.insns` with `setdefault(key,
 /// len(self.insns))`, so upstream's table is whatever the run has emitted so
 /// far.  Pyre freezes the build-time half into `insns.bin` and lets
 /// `record_insn_key` allocate the rest on demand — the `USE_C_FORM` shapes
@@ -1110,11 +1110,11 @@ pub fn descr_table() -> &'static dyn DescrTable {
     &LAZY_DESCR_TABLE
 }
 
-/// RPython: `metainterp_sd.opcode_descrs` (`pyjitpl.py:2245-2246`) — the
+/// RPython: `metainterp_sd.opcode_descrs` (`pyjitpl.py setup_descrs`) — the
 /// bytecode constant pool, not `metainterp_sd.all_descrs`.
 ///
 /// `all_descrs` upstream is `cpu.setup_descrs()` (`pyjitpl.py`), the full
-/// gccache walk of `descr.py:25-47`; pyre's counterpart of *that* is
+/// gccache walk of `descr.py`; pyre's counterpart of *that* is
 /// `MetaInterpStaticData::finish_setup_descrs`, which enumerates the live
 /// `descr_registry`. The gap between the two tables is what
 /// [`load_ei_descr_mints`] carries.
@@ -1602,7 +1602,7 @@ pub fn descr_set_jit_stats() -> String {
 /// member resolved to SOME descr; it reads 0 while a field is bound under a
 /// parent that numbers its `all_fielddescrs` by a different convention, because
 /// resolving and resolving CORRECTLY are different questions. Upstream cannot
-/// tell them apart either — but it does not have to, since `heaptracker.py:60-72
+/// tell them apart either — but it does not have to, since `heaptracker.py
 /// get_fielddescr_index_in` and `:96-112 all_fielddescrs` are one walker sharing
 /// one skip set, so `all_fielddescrs(S)[i].get_index() == i` holds by
 /// construction and there is nothing to count.
@@ -3727,7 +3727,7 @@ mod tests {
         // (`setdefault(key, len(self.insns))`), so the forward map is
         // injective and the reverse map is naturally 1:1.  Python
         // class-attribute aliases on `BlackholeInterpreter`
-        // (`blackhole.py:913 bhimpl_goto_if_not_int_is_true =
+        // (`blackhole.py bhimpl_goto_if_not_int_is_true =
         // bhimpl_goto_if_not`) share the handler function under two
         // attribute names but never register two opnames at the same
         // byte in `Assembler.insns`.

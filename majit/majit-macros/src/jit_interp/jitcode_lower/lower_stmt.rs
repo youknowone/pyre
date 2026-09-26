@@ -1058,7 +1058,7 @@ impl<'c> Lowerer<'c> {
         }
         let func_path = args[1];
         let result_reg = self.alloc_reg();
-        // RPython jtransform.py:1687 — conditional_call_value_ir_{i|r}
+        // RPython jtransform.py rewrite_op_jit_conditional_call_value — conditional_call_value_ir_{i|r}
         let builder_call = match value_kind {
             BindingKind::Ref => quote! {
                 __builder.conditional_call_value_ir_r_typed_args(__fn_idx, #value_reg, &[#(#typed_arg_tokens),*], #result_reg);
@@ -1096,7 +1096,7 @@ impl<'c> Lowerer<'c> {
         // `call.py getcalldescr`'s loop-invariant non-void-args
         // assert (see plain `conditional_call!` lowerer for the citation).
         // `conditional_call_elidable!` accepts non-elidable cache-computing
-        // helpers per `rlib/jit.py:1334-1336`, so a `LoopInvariant` slot is
+        // helpers per `rlib/jit.py`, so a `LoopInvariant` slot is
         // legal in principle and must enforce the same args-empty rule.
         // Static check applies only to explicit-policy paths; `Infer`
         // resolves slot at runtime from the `__policy` byte.
@@ -1142,7 +1142,7 @@ impl<'c> Lowerer<'c> {
         // `jtransform.py:1681-1683`: append `-live-` exactly when
         // `calldescr_canraise(calldescr)`.  `conditional_call_elidable`
         // still accepts non-elidable cache-computing helpers per
-        // `rlib/jit.py:1334-1336`; their explicit policy maps to
+        // `rlib/jit.py`; their explicit policy maps to
         // `EffectInfoSlot::CanRaise` and therefore keeps the marker.
         // `Infer` resolves slot at runtime; guard the physical marker with
         // the same can-raise policy cases instead of emitting a redundant
@@ -1173,7 +1173,7 @@ impl<'c> Lowerer<'c> {
 
     /// RPython jtransform.py `handle_recursive_call` — recognises
     /// `recursive_portal_call!(driver, green0, green1, ...)` and emits the
-    /// `recursive_call_int` opcode (pyjitpl.py:1376 `opimpl_recursive_call`
+    /// `recursive_call_int` opcode (pyjitpl.py _opimpl_recursive_call `opimpl_recursive_call`
     /// → BC_RECURSIVE_CALL_INT).
     ///
     /// The greens are lowered in jitdriver declaration order and each is
@@ -1495,11 +1495,11 @@ impl<'c> Lowerer<'c> {
         if let Some(()) = self.lower_vable_hint_suppress(expr) {
             return Some(());
         }
-        // RPython jtransform.py:1685 — conditional_call!(condition, func, args...)
+        // RPython jtransform.py rewrite_op_jit_conditional_call — conditional_call!(condition, func, args...)
         if let Some(()) = self.lower_conditional_call(expr) {
             return Some(());
         }
-        // RPython jtransform.py:292 — record_known_result!(result, func, args...)
+        // RPython jtransform.py rewrite_op_jit_record_known_result — record_known_result!(result, func, args...)
         if let Some(()) = self.lower_record_known_result(expr) {
             return Some(());
         }
@@ -1978,7 +1978,7 @@ impl<'c> Lowerer<'c> {
                     // (`pyjitpl/dispatch.rs`) reads
                     // `effectinfo.check_is_elidable()` and routes through
                     // `record_result_of_call_pure` mirroring
-                    // `pyjitpl.py:2111-2115`; the trailing
+                    // `pyjitpl.py`; the trailing
                     // `GUARD_NO_EXCEPTION` is gated on
                     // `effectinfo.check_can_raise(False)` so cannot-raise
                     // elidable callees skip it.
@@ -2149,7 +2149,7 @@ impl<'c> Lowerer<'c> {
                 }
                 // Wrapped Int / Ref / Float statement-form: result discarded,
                 // but the residual_call must still execute the side effect on
-                // the compiled trace.  RPython jtransform.py:456
+                // the compiled trace.  RPython jtransform.py handle_residual_call
                 // handle_residual_call lowers every direct_call regardless of
                 // result usage; the wrapped policy adds the trace_target /
                 // concrete_target tuple resolution shared with the void

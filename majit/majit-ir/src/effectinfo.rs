@@ -77,7 +77,7 @@ pub enum DescrSetMember {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DescrMintSpec {
     /// `descr.py` — the `FieldDescr(name, offset, size, flag,
-    /// index_in_parent, is_pure)` arguments, plus `descr.py:234-238
+    /// index_in_parent, is_pure)` arguments, plus `descr.py
     /// parent_descr = get_size_descr(gccache, STRUCT, vtable)`'s `STRUCT` size.
     ///
     /// No vtable: the analyzer has no vtable surface, and a runtime publish
@@ -97,7 +97,7 @@ pub enum DescrMintSpec {
     /// `descr.py` — the `ArrayDescr(basesize, itemsize, lendescr, flag,
     /// is_pure, concrete_type)` arguments. `length_offset` is what
     /// `get_field_arraylen_descr` (`descr.py`) needs, and is read only
-    /// when `!nolength`, matching `descr.py:359-362`.
+    /// when `!nolength`, matching `descr.py`.
     Array {
         base_size: usize,
         item_size: usize,
@@ -128,7 +128,7 @@ pub enum DescrMintSpec {
 ///
 /// The union over every `EffectInfo`'s six raw sets — the same union
 /// `compute_bitstrings` builds in `descrs = {'fields': set(), ...}`
-/// (`effectinfo.py:478-495`).
+/// (`effectinfo.py`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DescrMintEntry {
     pub member: DescrSetMember,
@@ -157,7 +157,7 @@ impl DescrSetKeys {
     /// the analyzer proved touches no field, array or interiorfield.
     ///
     /// Distinct from `descr_set_keys = None`, which is the
-    /// `EF_RANDOM_EFFECTS` wildcard: `effectinfo.py:149-162` makes the raw
+    /// `EF_RANDOM_EFFECTS` wildcard: `effectinfo.py` makes the raw
     /// sets `None` **iff** the EI is random-effects, and
     /// `compute_bitstrings` (`effectinfo.py`) reads the two shapes
     /// oppositely — empty sets keep the bitstrings, `None` clears them.  A
@@ -243,11 +243,11 @@ impl std::ops::DerefMut for DescrSetKeysImage {
 /// `EffectInfo` with setup-time interior mutability for the bitstring
 /// fields.
 ///
-/// PyPy `effectinfo.py:182-184` documents that `bitstring_*_descrs_*`
+/// PyPy `effectinfo.py` documents that `bitstring_*_descrs_*`
 /// fields are "initialized later, in compute_bitstrings()" — the EI
 /// object is constructed once with raw `_*_descrs_*` frozensets, then
 /// mutated by `effectinfo.compute_bitstrings(self.all_descrs)`
-/// (`pyjitpl.py:2287-2290`) to install the compacted bitstrings.
+/// (`pyjitpl.py`) to install the compacted bitstrings.
 /// Python's mutable object model makes the in-place setattr trivial;
 /// Rust requires explicit interior mutability for the same shape.
 ///
@@ -364,7 +364,7 @@ impl Clone for EffectInfoCell {
 /// must not share a cell — one call site would be handed the other's tag and
 /// re-emit the wrong specialization.
 ///
-/// `effectinfo.py:144-146` deliberately bypasses the cache for release-gil
+/// `effectinfo.py` deliberately bypasses the cache for release-gil
 /// targets by appending a fresh `object()` to the key; those calls receive a
 /// fresh cell here as well.
 pub fn intern_effect_info(effect_info: EffectInfo) -> Arc<EffectInfoCell> {
@@ -556,7 +556,7 @@ pub struct EffectInfo {
     // PyPy stores `_readonly_descrs_fields: frozenset[Descr]` (and the
     // five sibling sets) at `EffectInfo.__init__` time
     // (`effectinfo.py frozenset_or_none`). `compute_bitstrings`
-    // (`effectinfo.py:465-547`) later walks every EI, partitions the
+    // (`effectinfo.py`) later walks every EI, partitions the
     // descrs into (eisetr, eisetw) equivalence classes per category by
     // `id(descr)` (frozenset element identity), assigns
     // `descr.ei_index = class_index`, and only then encodes the
@@ -851,7 +851,7 @@ pub enum OopSpecIndex {
 /// upstream OS_* identity, [`EffectInfo::has_oopspec`] must stay false for
 /// them so the production reghint / vstring passes treat them as ordinary
 /// calls, and the CanRaise members (`load_const` / `load_global` / `box_int`)
-/// would otherwise violate the `_OS_CANRAISE` invariant (effectinfo.py:198).
+/// would otherwise violate the `_OS_CANRAISE` invariant (effectinfo.py).
 /// Discriminants are pyre-internal (no upstream meaning) and variant order is
 /// free: nothing decodes the tag numerically, and the one bincode artefact that
 /// carries it (`descrs.bin`) is written and read back within a single build
@@ -876,7 +876,7 @@ pub enum RuntimeHelperKind {
     /// [`RuntimeHelperKind::LoadGlobal`], eliding the per-iteration residual.
     LoadName,
     /// `bh_store_name_fn(frame, w_name, value)` — the STORE_NAME frame-receiver
-    /// helper (`pyopcode.py:855-859`, delegates to `store_name_value` →
+    /// helper (`pyopcode.py`, delegates to `store_name_value` →
     /// `setitem_str` → `_setitem_str_cell_known` → `typeobject.py:53-71
     /// write_cell`).  The full-body walker recognises this tag to fold a
     /// module-scope int store whose slot holds an `IntMutableCell` (the
@@ -885,12 +885,12 @@ pub enum RuntimeHelperKind {
     /// [`RuntimeHelperKind::LoadName`].
     StoreName,
     /// `bh_store_global_fn(frame, w_name, value)` — the STORE_GLOBAL
-    /// frame-receiver helper (`pyopcode.py:567`, delegates to
+    /// frame-receiver helper (`pyopcode.py`, delegates to
     /// `store_global_value`).  Recognised for the same `IntMutableCell`
     /// in-place store fold as [`RuntimeHelperKind::StoreName`].
     StoreGlobal,
     /// `bh_delete_name_fn(frame, w_name)` — the DELETE_NAME frame-receiver
-    /// helper (`pyopcode.py:869-880`, delegates to `delitem_str`).  Recognised
+    /// helper (`pyopcode.py`, delegates to `delitem_str`).  Recognised
     /// by the walker only to answer upstream's
     /// `opimpl_jit_force_quasi_immutable` question (`pyjitpl.py`)
     /// ahead of the call: a successful delete runs `mutated()`
@@ -902,12 +902,12 @@ pub enum RuntimeHelperKind {
     /// [`RuntimeHelperKind::DeleteName`], recognised for the same reason.
     DeleteGlobal,
     /// `bh_load_locals_fn(frame)` — the LOAD_LOCALS frame-receiver helper
-    /// (`pyopcode.py:793-794`). Carries no fold; the tag exists so the class
+    /// (`pyopcode.py`). Carries no fold; the tag exists so the class
     /// body's namespace read is a residual call like every other frame
     /// method, rather than an untranslatable op.
     LoadLocals,
     /// `bh_load_build_class_fn(frame)` — the LOAD_BUILD_CLASS frame-receiver
-    /// helper (`pyopcode.py:866-870`). Same standing as
+    /// helper (`pyopcode.py`). Same standing as
     /// [`RuntimeHelperKind::LoadLocals`].
     LoadBuildClass,
     /// `bh_load_import_fn(frame)` — the builtin lookup half of IMPORT_NAME.
@@ -1013,7 +1013,7 @@ pub enum RuntimeHelperKind {
     /// `lower_tuple_build_hlop_to_insn` emits after `new_array_clear` +
     /// `setarrayitem_gc`.  The full-body walker recognises this tag to
     /// decompose the list into the virtualizable `opimpl_newlist` shape
-    /// (`pyjitpl.py:779`) — `new_with_vtable` + `new_array` +
+    /// (`pyjitpl.py`) — `new_with_vtable` + `new_array` +
     /// `setarrayitem_gc` + `setfield_gc` — choosing the storage strategy
     /// from the concrete element shadows the way `w_list_new` /
     /// `list_strategy_for` does at runtime, so the array build and the
@@ -1166,7 +1166,7 @@ pub enum RuntimeHelperKind {
     /// remains a normal committed setfield. has_oopspec stays false.
     NurseryAlloc,
     /// `bh_load_method_self_fn(obj, attr, code, name_idx)` — the LOAD_METHOD
-    /// binding half (`callmethod.py:25-85`).  The full-body walker recognises
+    /// binding half (`callmethod.py`).  The full-body walker recognises
     /// this tag to fold the pure `compute_load_method_bound` decision once the
     /// paired [`LoadAttr`] method-cache fold has made `attr` concrete.
     LoadMethodSelf,
@@ -1435,9 +1435,9 @@ impl EffectInfo {
         call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
     };
 
-    // ── Bitstring check methods (effectinfo.py:211-230 parity) ──
+    // ── Bitstring check methods (effectinfo.py check_readonly_descr_field parity) ──
     //
-    // PyPy `effectinfo.py:211-230` does NOT short-circuit on
+    // PyPy `effectinfo.py check_readonly_descr_field` does NOT short-circuit on
     // `EF_RANDOM_EFFECTS`: each `check_*` is a one-liner
     // `bitstring.bitcheck(self.bitstring_*, ei_index)`.  The
     // `EF_RANDOM_EFFECTS` case is handled at construction time —
@@ -1682,7 +1682,7 @@ impl CallInfoCollection {
 /// existing EI's bitstring stale.
 ///
 /// PyPy's analog is the `Ellipsis` sentinel at
-/// `effectinfo.py:185-190` plus the implicit lifecycle ordering
+/// `effectinfo.py` plus the implicit lifecycle ordering
 /// (codewriter mints all EIs before `compute_bitstrings`).  Pyre's
 /// architecture allows trace-time mints, so the invariant is enforced
 /// at the construction site instead of via post-hoc bitcheck failure.
@@ -1740,13 +1740,13 @@ impl EffectInfo {
 /// owned snapshots, and test/macro callers can supply non-interned values.
 /// Two structurally-equal values produce equal `EiCanonKey`s; release-gil
 /// targets retain the fresh-object distinction below.
-/// `effectinfo.py:144-146` release-gil cache-breaker.
+/// `effectinfo.py` release-gil cache-breaker.
 ///
 /// PyPy: `if tgt_func: key += (object(),)` — every release-gil EI
 /// gets a fresh `object()` so its `_cache` key is unique, making
 /// each release-gil EI its own object identity even when
 /// `(tgt_func, tgt_saveerr)` happens to match a previously-cached
-/// instance. This shows up downstream in `effectinfo.py:511-512
+/// instance. This shows up downstream in `effectinfo.py
 /// frozenset(eisetr)` where `id(ei)` distinguishes release-gil EIs.
 ///
 /// Pyre's lift: `NoTarget` for non-release-gil EIs (structural dedup
@@ -1883,7 +1883,7 @@ impl EiCanonKey {
 /// Translation-time form of [`compute_bitstrings`] using stable descriptor
 /// keys instead of live `Arc` addresses.
 ///
-/// This is the same `effectinfo.py:465-547` partition: for each of fields,
+/// This is the same `effectinfo.py` partition: for each of fields,
 /// arrays and interior fields, descriptors with identical `(readers, writers)`
 /// membership share one compact `ei_index`, and the most popular classes are
 /// assigned first. The returned maps are the translated-image equivalent of
@@ -1969,7 +1969,7 @@ pub fn compute_frozen_bitstrings(all_eis: &mut [&mut EffectInfo]) -> FrozenBitst
             memberships.push((member, readers, writers));
         }
 
-        // effectinfo.py:519-526 popularity ordering + mapping.setdefault.
+        // effectinfo.py size_of_both_sets popularity ordering + mapping.setdefault.
         memberships.sort_by(|a, b| {
             (b.1.len() + b.2.len())
                 .cmp(&(a.1.len() + a.2.len()))
@@ -2076,7 +2076,7 @@ fn assert_member_category(member: &DescrSetMember, category: usize) {
 /// `EffectInfo.bitstring_*` field. Idempotent — calling it twice on
 /// the same input is a no-op.
 ///
-/// PyPy `effectinfo.py:526 descr.ei_index = …` stamps the per-descr
+/// PyPy `effectinfo.py descr.ei_index = …` stamps the per-descr
 /// `ei_index` directly on the descriptor object; pyre matches via the
 /// `Descr::set_ei_index` atomic. Readers (`heap.rs::field_effect_index`
 /// etc.) then resolve through `descr.get_ei_index()` alone — no
@@ -2163,7 +2163,7 @@ pub fn compute_bitstrings(all_descrs: &[DescrRef], all_eis: &mut [&mut EffectInf
     // the EffectInfo factory cache on the structural tuple (raw sets,
     // extraeffect, oopspecindex, can_invalidate, can_collect,
     // call_release_gil_target) and returns the same EI instance for
-    // structurally-identical requests. `effectinfo.py:511-512
+    // structurally-identical requests. `effectinfo.py
     // frozenset(eisetr)` then collapses by identity (id(ei)). Pyre
     // lacks the EI._cache today (each `EffectInfoCell` is per-call-
     // descr), so structurally-identical EIs land at distinct
@@ -2218,7 +2218,7 @@ pub fn compute_bitstrings(all_descrs: &[DescrRef], all_eis: &mut [&mut EffectInf
         // position) and `dedup`s per descr to mirror the frozenset
         // collapse. The popularity-sort count
         // (`size_of_both_sets = len(r) + len(w)`,
-        // `effectinfo.py:519-520`) thus weights each logical EI once
+        // `effectinfo.py`) thus weights each logical EI once
         // per descr, regardless of how many call descrs share its
         // structural shape.
         //
@@ -2265,7 +2265,7 @@ pub fn compute_bitstrings(all_descrs: &[DescrRef], all_eis: &mut [&mut EffectInf
             all_sets.push((pid, descr, eisetr, eisetw));
         }
 
-        // `effectinfo.py:519-521`: heuristic — sort by len(eisetr) +
+        // `effectinfo.py size_of_both_sets`: heuristic — sort by len(eisetr) +
         // len(eisetw) descending so the most popular descrs claim the
         // low ei_index slots, reducing total bitstring length. Tie-
         // break on ptr-id ascending, which fixes the order within this

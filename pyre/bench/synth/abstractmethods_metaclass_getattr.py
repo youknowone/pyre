@@ -2,7 +2,7 @@
 # `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
 # rather than any generated code, and reads whatever the host's process
 # spawn cost happens to be that run. The jitstats baselines gate it.
-# descroperation.py:234 — the type getattribute slot is wrapped so even the
+# descroperation.py _handle_getattribute — the type getattribute slot is wrapped so even the
 # hardcoded __abstractmethods__ AttributeError (raised when the slot is unset)
 # consults the metaclass __getattr__ before propagating.
 

@@ -42,7 +42,7 @@ pub fn tag_box(
 /// directly to the optimizer passes. RPython parity: the function
 /// takes the optimizer and applies knowledge inline, never returning
 /// an intermediate struct.
-/// bridgeopt.py:124 signature:
+/// bridgeopt.py signature:
 /// deserialize_optimizer_knowledge(optimizer, resumestorage, frontend_boxes, liveboxes)
 ///
 /// bridgeopt.py `serialize_optimizer_knowledge(optimizer,
@@ -52,13 +52,13 @@ pub fn tag_box(
 /// when the optheap/optrewrite caches are empty; the deserializer relies
 /// on the sections always being present):
 ///
-/// 1. known-class bitfield per Ref livebox (bridgeopt.py:74-90)
-/// 2. heap field + array item triples (bridgeopt.py:92-108)
-/// 3. loopinvariant call results (bridgeopt.py:113-122)
+/// 1. known-class bitfield per Ref livebox (bridgeopt.py)
+/// 2. heap field + array item triples (bridgeopt.py)
+/// 3. loopinvariant call results (bridgeopt.py)
 ///
 /// RPython splits the memo-side wrapper (`_add_optimizer_sections`,
-/// resume.py:570-574) from the serialize core (`serialize_optimizer_knowledge`,
-/// bridgeopt.py:63-122). pyre keeps the same split: this free function
+/// resume.py) from the serialize core (`serialize_optimizer_knowledge`,
+/// bridgeopt.py). pyre keeps the same split: this free function
 /// carries the core, and `ResumeDataLoopMemo::_add_optimizer_sections`
 /// forwards.
 pub fn serialize_optimizer_knowledge(
@@ -167,7 +167,7 @@ pub fn serialize_optimizer_knowledge(
         let obj_tag = tag_box(obj, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(obj_tag as i32);
         // bridgeopt.py:106 numb_state.append_int(index) — pass the original
-        // index unchanged; resumecode.py:90-93 enforces SHORT range on the
+        // index unchanged; resumecode.py enforces SHORT range on the
         // i64 value, panicking instead of silently wrapping a too-large
         // index into an i32.
         numb_state.append_int(index);
@@ -263,7 +263,7 @@ pub fn deserialize_optimizer_knowledge(
             // RPython's type system guarantees frontend_boxes[i] is a valid
             // GcRef when box.type == "r" and class_known is set. Our raw
             // i64 encoding requires a nonnull check (RPython's
-            // `box.nonnull()` equivalent, info.py:763).
+            // `box.nonnull()` equivalent, info.py get_known_class).
             let raw_ref = frontend_boxes[i];
             if raw_ref != 0 {
                 // bridgeopt.py:145 `optimizer.cpu.cls_of_box(box)` — the

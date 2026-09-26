@@ -22,7 +22,7 @@
 //! quasi-immutable watcher valid across the loop.
 //!
 //! `W_ModuleDictObject` (`dictmultiobject.rs`) carries this strategy
-//! as its `mstrategy` slot per `dictmultiobject.py:328-341`.  The
+//! as its `mstrategy` slot per `dictmultiobject.py`.  The
 //! trait `impl crate::dictmultiobject::DictStrategy for
 //! ModuleDictStrategy` lives at the bottom of this file and routes
 //! every method to the existing `w_module_dict_*` / `w_dict_*`
@@ -36,7 +36,7 @@ use crate::pyobject::*;
 
 // ── MutableCell family ──────────────────────────────────────────────
 //
-// `pypy/objspace/std/typeobject.py:22-71` defines the cell layer
+// `pypy/objspace/std/typeobject.py` defines the cell layer
 // referenced by `celldict.py _setitem_str_cell_known` and
 // `:143-145 getitem_str`.  PyPy keeps a level of indirection so that
 // frequently-rewritten module / type attributes mutate the cell's
@@ -378,7 +378,7 @@ unsafe fn classify_cell_write(w_cell: Option<PyObjectRef>, w_value: PyObjectRef)
 ///
 /// This is the tracer's stand-in for the rtyper-inserted
 /// `jit_force_quasi_immutable` that upstream places on that write
-/// (`rclass.py:715-718`). Pyre's store runs inside a residual helper the walker
+/// (`rclass.py`). Pyre's store runs inside a residual helper the walker
 /// never looks into, so the walker has to ask the question ahead of the call
 /// instead of meeting the operation inside it. Side-effect-free by
 /// construction — it only classifies.
@@ -461,7 +461,7 @@ pub fn _wrapkey(key: &str) -> PyObjectRef {
 
 /// Strategy-owned storage for `ModuleDictStrategy`.
 ///
-/// `celldict.py:30-31,41-42`:
+/// `celldict.py`:
 ///
 /// ```python
 /// erase, unerase = rerased.new_erasing_pair("modulecell")
@@ -533,7 +533,7 @@ pub fn module_dict_entries_get(entries: &ModuleDictEntries, key: &str) -> Option
     entries.get(key).copied()
 }
 
-/// The store side of [`module_dict_entries_get`] — `celldict.py:47`'s
+/// The store side of [`module_dict_entries_get`] — `celldict.py getdictvalue_no_unwrapping`'s
 /// `self.unerase(w_dict.dstorage)[key] = w_value`, returning the displaced
 /// value so the caller can tell an overwrite from an insert.
 ///
@@ -886,7 +886,7 @@ impl ModuleDictStrategy {
     ///
     /// Pyre's `space` analogue always picks the builtin per frame
     /// (`PyFrame.w_builtin` assigned at construction, mirroring
-    /// `pyframe.py:115 self.builtin = space.builtin.pick_builtin
+    /// `pyframe.py self.builtin = space.builtin.pick_builtin
     /// (w_globals)` under `honor__builtins__=True`).  Per
     /// `celldict.py not space.config.objspace.honor__builtins__`
     /// the builtincache install is therefore a no-op — attaching a
@@ -1124,7 +1124,7 @@ impl ModuleDictStrategy {
     }
 
     /// `celldict.py delitem` — minimal str-key path
-    /// (`celldict.py:110-121`); the object-fallback /
+    /// (`celldict.py`); the object-fallback /
     /// `_never_equal_to_string` branches belong to the full strategy
     /// dispatch once `ObjectDictStrategy` is wired.
     pub fn delitem_str(&mut self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
@@ -1195,7 +1195,7 @@ impl ModuleDictStrategy {
     }
 
     /// The first live entry slot at or after `from` — `_ll_dictnext`
-    /// (`rordereddict.py:1373`).  A name deleted from a module leaves a
+    /// (`rordereddict.py`).  A name deleted from a module leaves a
     /// tombstone, so a walk steps over the holes rather than counting.
     pub fn next_entry_slot(&self, storage: &ModuleDictStorage, from: usize) -> Option<usize> {
         storage.entries.next_valid_slot(from)
@@ -1220,7 +1220,7 @@ impl ModuleDictStrategy {
     }
 
     /// GC root walk over every live `GlobalCache.cell` reachable through
-    /// this strategy's `caches` registry (`celldict.py:214
+    /// this strategy's `caches` registry (`celldict.py
     /// get_global_cache`), forwarding the movable value each cell holds.
     ///
     /// # Safety

@@ -101,13 +101,13 @@ enum DefaultsRepr {
     /// block, the shape upstream's `defs_w?[*]` lowers to.
     ItemsBlock,
     /// `Cls_ii`: two inline machine ints.  `wraps[i]` is `wrapint`
-    /// (`specialisedtupleobject.py:138-141`), which is what
+    /// (`specialisedtupleobject.py`), which is what
     /// `_flat_pycall_defaults` already runs per call through
     /// `w_tuple_getitem`, so the emitted box is the same fresh box the
     /// interpreter would have made.
     PairInt,
     /// `Cls_oo`: two inline object slots, for which `wraps[i]` is the identity
-    /// (`specialisedtupleobject.py:26-27`) — the field read IS the element.
+    /// (`specialisedtupleobject.py`) — the field read IS the element.
     PairObject,
 }
 
@@ -2263,7 +2263,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    // ---- non-emitting eligibility checks (free to bail with Ok(None)) ----
+    // non-emitting eligibility checks (free to bail with Ok(None))
     // Authoritative walks only: the CALL_ASSEMBLER record + walk-commit
     // bookkeeping is FBW machinery; a non-authoritative context (the
     // diagnostic probe, tests) records the plain residual instead.
@@ -2517,7 +2517,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number);
     }
 
-    // ---- emission ----
+    // emission
     // Past this point every step records IR; `?` propagation aborts the
     // whole walk (the trace is discarded), the correct failure mode for a
     // recording error.
@@ -4225,7 +4225,7 @@ impl Drop for OpenInlineActivation<'_> {
 /// The concrete slot holds the `JitVirtualRef`, not the frame:
 /// `executioncontext::force_vref` resolves it for every reader, and a vref
 /// built by `virtual_ref_during_tracing` already carries `forced = frame` with
-/// `virtual_token = TOKEN_NONE` (`virtualref.py:85-92`), so the resolution is
+/// `virtual_token = TOKEN_NONE` (`virtualref.py`), so the resolution is
 /// exact and cannot fail.  Storing the vref rather than the frame is what lets
 /// the optimizer keep the frame virtual: nothing reads the frame itself unless
 /// something forces it.
@@ -4418,7 +4418,7 @@ pub(crate) fn walker_ec_leave(
         // `VIRTUAL_REF_FINISH(vrefbox, virtualbox)` — the non-null second
         // operand is upstream's "this vref was forced during tracing already"
         // encoding, which `optimize_VIRTUAL_REF_FINISH` lowers to storing the
-        // virtual into `vref.forced` (`virtualize.py:141-151`).
+        // virtual into `vref.forced` (`virtualize.py`).
         //
         // Without it the finish below would emit the NULL form, leaving
         // `forced` NULL and `virtual_token` cleared, and a later read through
@@ -4583,7 +4583,7 @@ mod portal_frame_chain_tests {
 /// `BuiltinCode.func` is an RPython PBC: the codewriter turns its finite
 /// target family into an indirect call whose address is resolved back to the
 /// generated target JitCode by `MetaInterpStaticData.bytecode_for_address`
-/// (`pyjitpl.py:2174-2186`).  The interpreter-level `call_fn` helper hides
+/// (`pyjitpl.py`).  The interpreter-level `call_fn` helper hides
 /// that indirect call behind `Function -> BuiltinCode -> func`, so recover
 /// the same target here and enter the generated wrapper with its one red
 /// `&[PyObjectRef]` argument.
@@ -5971,7 +5971,7 @@ fn inline_caller_py_pc_from_snapshot<Sym: WalkSym>(
 /// Fill in the `name` / `obj` pair on an `AttributeError` raised out of an
 /// inlined attribute hook, reproducing `enrich_attribute_error` (`error.rs`).
 ///
-/// `StdObjSpace.getattr` (`objspace/std/objspace.py:711-716`) performs it on the
+/// `StdObjSpace.getattr` (`objspace/std/objspace.py`) performs it on the
 /// `__getattr__` fallback call, and pyre's `getattr_str` (`baseobjspace.rs`)
 /// wraps the whole dispatch in it, so the `load_attr_fn` residual the hook
 /// routes replace reached it either way.  Without this the compiled iterations
@@ -6131,7 +6131,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
 
 /// The resolved-call inliner with an optional receiver for a nested call's
 /// result.  RPython's `MIFrame.finishframe` hands a returned box to the
-/// previous frame (`pyjitpl.py:1688-1698`) before that caller continues its
+/// previous frame (`pyjitpl.py`) before that caller continues its
 /// current operation.  `intermediate_result` represents that hand-off for a
 /// user call nested inside a specialized builtin: it deliberately leaves the
 /// outer residual's destination untouched, so guards still snapshot the
@@ -6503,7 +6503,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `TraceAction::AbortPermanent`, which stamps `DONT_TRACE_HERE` on the
     // CALLER loop's green key — so one unported opcode anywhere in a callee
     // permanently un-JITs the loop that calls it.  Upstream keeps this
-    // decision static and on the callee: `codewriter/policy.py:48-84`
+    // decision static and on the callee: `codewriter/policy.py look_inside_graph`
     // `look_inside_graph` reads whole-graph properties before tracing, and its
     // own comment (:78-79) spells out the consequence of a "no" — "the call
     // will be turned into a residual call".  Answer the same way.
@@ -6572,7 +6572,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // that region.  `try_walker_inline_type_call` passes the instance it just
     // emitted as `callee_args[0]` and repeats it in `constructor_result`, so
     // matching the two names that instance and nothing else; `is_unescaped`
-    // (`heapcache.py:493-494`) is the other half — nothing outside the walk has
+    // (`heapcache.py`) is the other half — nothing outside the walk has
     // taken a reference between the allocation and this boundary.
     let rewind_built_arg = constructor_result.and_then(|(instance, _)| {
         (instance != OpRef::NONE
@@ -6951,7 +6951,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // refused 17 sites in 14 `bench/synth` fixtures that met every
                 // other term — `entry_is_call_boundary`, a constant callable,
                 // depth 0, and `try_multiframe` — for having no handler, while
-                // the same body carrying one was admitted.  `pyjitpl.py:1415`
+                // the same body carrying one was admitted.  `pyjitpl.py`
                 // `perform_call` pushes a real `MIFrame` for every callee
                 // `can_inline_callable` admits and tests no exception table
                 // anywhere.  The screen exemption below is unaffected: it is
@@ -7243,7 +7243,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let mut callable_guard_value = callable_guard_value;
     if let Some(bound) = bound_method {
         // `_Method._immutable_fields_ = ['w_function', 'w_instance']`
-        // (pypy/interpreter/function.py:567).  Preserve those as red field
+        // (pypy/interpreter/function.py).  Preserve those as red field
         // reads: guard only the Method layout and underlying function, then
         // pass the live receiver field into the callee.  Baking the receiver
         // concrete would collapse bound methods with different `self` values.
@@ -8579,7 +8579,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // what `_opimpl_setarrayitem_vable` does for a
                 // `_nonstandard_virtualizable` (`pyjitpl.py`). Recording
                 // those stores also emits the promote guard in
-                // `vable_getfield_*` (`pyjitpl.py:1916,2582`), whose resume
+                // `vable_getfield_*` (`pyjitpl.py`), whose resume
                 // image must include the paused caller frame
                 // (`opencoder.py capture_resumedata`). Every admitted inline
                 // now carries one, so the remaining question is only whether
@@ -8739,8 +8739,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // `convert_and_run_from_pyjitpl` (`blackhole.py`) rebuilds
             // every framestack frame at its own pc unconditionally —
             // `run_blackhole_interp_to_cancel_tracing` ends `assert False`
-            // (`pyjitpl.py:2956`) — and the caller is resumed PAST its call
-            // (`blackhole.py:1653-1662`), never rewound to it.  The entry
+            // (`pyjitpl.py`) — and the caller is resumed PAST its call
+            // (`blackhole.py`), never rewound to it.  The entry
             // carrier's rewind-to-the-CALL has no upstream counterpart, so it
             // is the fallback for a callee this one cannot rebuild, not the
             // preferred leg; `fbw_set_abort_call_resume` keeps that ordering.
@@ -10491,7 +10491,7 @@ pub(crate) fn try_walker_inline_super_proxy_property_get<Sym: WalkSym>(
 /// LOAD_ATTR residual's non-call `r_args`).  Nested calls are walked normally;
 /// in particular, `raise ValueError(...)` constructs the exception in the
 /// callee sub-walk and returns `SubRaise` to this LOAD_ATTR's enclosing
-/// `catch_exception`, matching `descroperation.py:96-101` tracing through the
+/// `catch_exception`, matching `descroperation.py` tracing through the
 /// property's `__get__` and Python fget.
 /// Top full-body frame only, for the resume-doubling reason
 /// [`try_walker_specialize_load_bound_method_attr`] documents.  Every other
@@ -11019,7 +11019,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
         // pyre's `getattr_str` (`baseobjspace.rs`) enriches the whole
         // `__getattribute__` / `__getattr__` chain, so the `load_attr_fn`
         // residual this route replaces filled the pair in here as well.
-        // `StdObjSpace.getattr` (`objspace/std/objspace.py:668-670`) returns
+        // `StdObjSpace.getattr` (`objspace/std/objspace.py`) returns
         // through `_handle_getattribute` without enriching, so the interpreter
         // this trace has to agree with is ahead of upstream on this arm; the
         // difference is the interpreter's to settle, not the trace's.
@@ -11181,7 +11181,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         None,
         false,
         None,
-        // `StdObjSpace.getattr` (`objspace/std/objspace.py:711-716`) wraps
+        // `StdObjSpace.getattr` (`objspace/std/objspace.py`) wraps
         // the `__getattr__` fallback call in `enrich_attribute_error`, which
         // the `load_attr_fn` residual this route replaces reached through
         // `getattr_str`.
@@ -12103,7 +12103,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     };
     // `Continue` represents either a value return at `op.next_pc`, with `dst`
     // holding the item, or a caught `SubRaise` routed to the caller's handler
-    // target, where `dst` was not written (`pyjitpl.py:2530-2558`).  Only the
+    // target, where `dst` was not written (`pyjitpl.py`).  Only the
     // value-return shape can update the FOR_ITER item bookkeeping below.
     if inline_resume_pc != op.next_pc {
         return Ok(Some((DispatchOutcome::Continue, inline_resume_pc)));

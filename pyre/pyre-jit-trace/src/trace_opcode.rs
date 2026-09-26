@@ -223,7 +223,7 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
 
 /// Runtime helper for traced `PUSH_EXC_INFO`: read the per-thread
 /// `CURRENT_EXCEPTION` slot so the compiled bridge preserves
-/// `pyopcode.py:786` / `eval.rs`'s `push_exc_info` semantics (save the
+/// `pyopcode.py` / `eval.rs`'s `push_exc_info` semantics (save the
 /// previous sys_exc_info before `CURRENT_EXCEPTION` is overwritten).
 #[allow(dead_code)]
 pub(crate) extern "C" fn trace_get_current_exception_jit() -> i64 {
@@ -232,7 +232,7 @@ pub(crate) extern "C" fn trace_get_current_exception_jit() -> i64 {
 
 /// Runtime helper for traced `PUSH_EXC_INFO` / `POP_EXCEPT`: write the
 /// per-thread `CURRENT_EXCEPTION` slot so the compiled bridge preserves
-/// `pyopcode.py:786/:778` / `eval.rs`'s `push_exc_info` / `pop_except`
+/// `pyopcode.py/:778` / `eval.rs`'s `push_exc_info` / `pop_except`
 /// semantics.
 #[allow(dead_code)]
 pub(crate) extern "C" fn trace_set_current_exception_jit(exc: i64) {
@@ -455,7 +455,7 @@ use crate::frame_layout::{PYFRAME_DEBUGDATA_OFFSET, PYFRAME_PYCODE_OFFSET};
 /// NOT mirror into the shared `ctx.virtualizable_boxes`.  Upstream
 /// `rpython/jit/metainterp/pyjitpl.py capture_resumedata` reads
 /// `metainterp.virtualizable_boxes` and hands it to
-/// `rpython/jit/metainterp/opencoder.py:718
+/// `rpython/jit/metainterp/opencoder.py
 /// _list_of_boxes_virtualizable(boxes)` with no fallback heap source.
 /// Pyre matches that single-source model in spirit for the two
 /// per-opcode-advancing fields: `last_instr` / `valuestackdepth` are
@@ -701,7 +701,7 @@ pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: 
 /// `(OpRef, Value)` pairs atomically.
 ///
 /// `virtualizable_boxes` is the single source of truth for the frame's
-/// Ref array (opencoder.py:718); reading each half via
+/// Ref array (opencoder.py _list_of_boxes_virtualizable); reading each half via
 /// `concrete_of_opref` separately would drop non-const Box identity
 /// into the sentinel fallback, hence the `virtualizable_entry_at`
 /// pair-read+pair-write.
@@ -979,7 +979,7 @@ impl MIFrame {
     /// Both the tracer (here) and the blackhole bridge-resume decoder
     /// (`consume_one_section`, `resume.py`) read the same
     /// `all_liveness` byte stream via `jitcode.get_live_vars_info(pc,
-    /// op_live)` (`jitcode.py:82-93`) and iterate the per-bank register
+    /// op_live)` (`jitcode.py`) and iterate the per-bank register
     /// indices with `LivenessIterator` (`liveness.py`). One
     /// source, same order.
     fn get_list_of_active_boxes(
@@ -1005,7 +1005,7 @@ impl MIFrame {
         // at trace_opcode.rs), BEFORE snapshotting registers_r
         // below. Source for the live indices is the same packed
         // `all_liveness` byte stream (`jitcode.get_live_vars_info(pc,
-        // op_live)` at `jitcode.py:82-93`) that resume.py uses at
+        // op_live)` at `jitcode.py`) that resume.py uses at
         // decode time — pyjitpl.py `get_list_of_active_boxes`
         // analog, walking the full live register-file set.
         #[derive(Clone, Copy)]
@@ -1052,7 +1052,7 @@ impl MIFrame {
                 if marker_call_pc.is_some() {
                     // This retired MIFrame trait-interpret leg has no production driver.
                     // Production guard capture (`collect_outer_active_boxes`) captures rather than
-                    // aborts residual-call and inline guards as pyjitpl.py:2599/opencoder.py:819;
+                    // aborts residual-call and inline guards as pyjitpl.py/opencoder.py capture_resumedata;
                     // only trait-leg unit tests reach this abort before Phase-6 deletion.
                     crate::state::request_trace_abort();
                     return Vec::new();
@@ -1417,7 +1417,7 @@ impl MIFrame {
         }
         // `pyjitpl.py:199-233` parity: decode the `-live-` offset from
         // the jitcode byte stream via `jitcode.get_live_vars_info(pc,
-        // op_live)` (`jitcode.py:82-93`), read the `[len_i][len_r]
+        // op_live)` (`jitcode.py`), read the `[len_i][len_r]
         // [len_f]` header in `all_liveness`, then iterate per-bank
         // register indices with `LivenessIterator` (`liveness.py-
         // 201`). Register indices snapshot into `registers_r` in
@@ -1922,7 +1922,7 @@ impl MIFrame {
         // `optimize_guard_false` deletes the body's poll.
         self.loop_close_marker_jit_pc = header_marker_jit_pc;
         // pyjitpl.py reached_loop_header: virtualizable_boxes
-        // (read from locals_cells_stack_w[*] by virtualizable.py:86-98
+        // (read from locals_cells_stack_w[*] by virtualizable.py read_boxes
         // read_boxes) are carried into the JUMP unchanged, including
         // stack slots. Do NOT truncate to nlocals here.
         //
@@ -1931,7 +1931,7 @@ impl MIFrame {
         // `live_args_shape_at`'s reader.  Both helpers share the same
         // shape derivation; reading from different sources lets the two
         // diverge whenever the symbolic mirror drifts from PyFrame.
-        // RPython's pyjitpl.py:2957-2965 derives `live_arg_boxes` from
+        // RPython's pyjitpl.py derives `live_arg_boxes` from
         // PyFrame's `locals_cells_stack_w` length + `valuestackdepth`
         // — no symbolic mirror in the loop.
         let concrete_nlocals = self.sym().nlocals;
@@ -2056,7 +2056,7 @@ impl MIFrame {
         // `MetaInterp::front_target_inputarg_types` doc).
         //
         // A close reached through the walk targets the merge point that matched
-        // (`original_boxes`, pyjitpl.py:3039-3041), whichever kind of trace is
+        // (`original_boxes`, pyjitpl.py), whichever kind of trace is
         // recording: `reached_loop_header` scans `current_merge_points` first
         // and only falls through to the previously compiled loop when nothing
         // matched. So the merge point recorded at the closing header answers
@@ -2390,7 +2390,7 @@ impl MIFrame {
         // virtualizable_boxes + virtualref_boxes.
         //
         // RPython only emits GUARD_FUTURE_CONDITION here. GUARD_NOT_INVALIDATED
-        // is *not* unconditionally emitted before JUMP — pyjitpl.py:1086-1089
+        // is *not* unconditionally emitted before JUMP — pyjitpl.py
         // emits it only inside `opimpl_record_quasi_immutable_field`, after a
         // quasi-immut field read sets `heapcache.need_guard_not_invalidated`.
         // The pyre frontend does the same via `flush_guard_not_invalidated`,
@@ -2425,13 +2425,13 @@ impl MIFrame {
             self.live_args_shape_at(ctx),
             "live_args_shape_at must predict close_loop_args_at output length",
         );
-        // virtualstate.py:39-67 — populate the `Box.value` stamp
+        // virtualstate.py get_runtime_item — populate the `Box.value` stamp
         // so the optimizer can route `cpu.cls_of_box(runtime_box)` /
         // `runtime_box.getref_base()` through the materialised BoxRef's
         // per-type mixin slot. Writes go into `ctx.opref_concrete`; the
         // optimizer stamps them onto BoxRefs before virtualstate matching.
         //
-        // virtualstate.py:646-648 requires `runtime_boxes` to be fully
+        // virtualstate.py generate_guards requires `runtime_boxes` to be fully
         // parallel with `boxes`. Pyre attempts to populate every slot
         // but skips type-mismatched and Null (untracked) entries:
         //   args[0]                                ↔ frame (raw ptr)
@@ -2614,7 +2614,7 @@ impl MIFrame {
             self.flush_guard_not_invalidated(ctx);
         }
         // pyjitpl.py:2575-2578: determine after_residual_call from guard opcode.
-        // opencoder.py:767: when true, all boxes in top frame are live
+        // opencoder.py create_top_snapshot: when true, all boxes in top frame are live
         // (liveness filter disabled for residual call guards).
         let after_residual_call = matches!(
             opcode,
@@ -2694,7 +2694,7 @@ impl MIFrame {
     ///
     /// Temporarily sets frame.pc = resumepc, captures this frame plus
     /// virtualizable_boxes + virtualref_boxes into a snapshot, then
-    /// restores frame.pc.  Matches opencoder.py:819-832
+    /// restores frame.pc.  Matches opencoder.py
     /// `capture_resumedata(framestack, virtualizable_boxes,
     /// virtualref_boxes, after_residual_call=False)`.
     fn capture_resumedata(
@@ -2740,7 +2740,7 @@ impl MIFrame {
     }
 
     /// Build the single-frame `Snapshot` — this frame plus virtualizable
-    /// and virtualref boxes.  Mirrors opencoder.py:819-832
+    /// and virtualref boxes.  Mirrors opencoder.py capture_resumedata
     /// `capture_resumedata(framestack, virtualizable_boxes,
     /// virtualref_boxes, ...)`.
     ///
@@ -2854,7 +2854,7 @@ impl MIFrame {
         }
     }
 
-    /// virtualizable.py:139 _get_virtualizable_field_boxes parity:
+    /// virtualizable.py load_list_of_boxes _get_virtualizable_field_boxes parity:
     /// [static_fields..., array_items..., virtualizable_ptr].
     /// pyjitpl.py:2586: self.virtualizable_boxes → vable_array.
     /// opencoder.py _encode parity: encode OpRef as SnapshotTagged.
@@ -2908,7 +2908,7 @@ impl MIFrame {
             // resume.py:211,214: box.type lives on the Box itself; the
             // typed `OpRef` carries the matching variant tag and the
             // explicit `tp` is the lockstep authority for any
-            // transitional `Untyped` opref (resoperation.py:719/727/739).
+            // transitional `Untyped` opref (resoperation.py InputArgInt/727/739).
             let tp = ctx
                 .get_opref_type(opref)
                 .unwrap_or_else(|| panic!("missing snapshot box type for {:?}", opref));

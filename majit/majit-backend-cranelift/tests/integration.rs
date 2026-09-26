@@ -48,9 +48,7 @@ fn full_mul_u64(a: u64, b: u64) -> (u64, u64) {
     (result as u64, (result >> 64) as u64)
 }
 
-// ---------------------------------------------------------------------------
 // Test helpers
-// ---------------------------------------------------------------------------
 
 /// Test helper — produces a real `ResumeGuardDescr` (PyPy
 /// `compile.py ResumeGuardDescr` family) so that
@@ -66,9 +64,7 @@ fn make_descr(_index: u32) -> DescrRef {
 
 use majit_ir::forwarding::bound_operand_from_opref as rb;
 
-// ---------------------------------------------------------------------------
 // Test 1: Simple arithmetic (trace -> optimize -> compile -> execute)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_simple_arithmetic() {
@@ -95,9 +91,7 @@ fn test_simple_arithmetic() {
     assert_eq!(backend.get_int_value(&frame, 0), 42);
 }
 
-// ---------------------------------------------------------------------------
 // Test 2: Sum loop (trace -> optimize -> compile -> execute)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_sum_loop() {
@@ -169,13 +163,9 @@ fn test_sum_loop() {
     assert_eq!(final_sum + final_i, 5050);
 }
 
-// ---------------------------------------------------------------------------
 // Test 3: Constant folding through pipeline
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // Test 4: Guard failure path
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_guard_failure_path() {
@@ -224,13 +214,9 @@ fn test_guard_failure_path() {
     assert_eq!(backend.get_int_value(&frame, 0), 0);
 }
 
-// ---------------------------------------------------------------------------
 // Test 5: Multiple passes working together (CSE + algebraic simplification)
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // Test 6: Bridge compilation end-to-end
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_bridge_end_to_end() {
@@ -345,9 +331,7 @@ fn test_bridge_end_to_end() {
     assert_eq!(backend.get_int_value(&frame, 0), 10);
 }
 
-// ---------------------------------------------------------------------------
 // Helpers for intdiv pipeline tests
-// ---------------------------------------------------------------------------
 
 /// Floor division (towards negative infinity).
 fn floor_div(a: i64, b: i64) -> i64 {
@@ -474,11 +458,9 @@ fn build_power_of_two_div_trace(divisor: i64, token_id: u64) -> (CraneliftBacken
     (backend, token)
 }
 
-// ---------------------------------------------------------------------------
 // Test 7: IntFloorDiv magic-number pipeline (divisor = 7)
 //
 // The magic-number algorithm produces floor division (towards -inf).
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_intdiv_magic_number_pipeline() {
@@ -510,9 +492,7 @@ fn test_intdiv_magic_number_pipeline() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Test 8: IntMod magic-number pipeline (divisor = 7)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_intmod_magic_number_pipeline() {
@@ -543,13 +523,11 @@ fn test_intmod_magic_number_pipeline() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Test 9: IntFloorDiv power-of-2 pipeline (divisor = 8)
 //
 // The power-of-2 strength reduction uses the Hacker's Delight formula:
 //   result = (x + ((x >> 63) & (2^n - 1))) >> n
 // This produces truncation division (towards zero), matching Cranelift sdiv.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_intdiv_power_of_two_pipeline() {
@@ -581,9 +559,7 @@ fn test_intdiv_power_of_two_pipeline() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Test 10: IntFloorDiv magic-number various divisors
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_intdiv_various_divisors() {
@@ -615,9 +591,7 @@ fn test_intdiv_various_divisors() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Test 11: VecIntAdd native SIMD (pack + add + unpack)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_vec_int_add_simd() {
@@ -683,9 +657,7 @@ fn test_vec_int_add_simd() {
     assert_eq!(backend.get_int_value(&frame, 1), -100); // 100 + (-200)
 }
 
-// ---------------------------------------------------------------------------
 // Test 12: VecIntSub native SIMD
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_vec_int_sub_simd() {
@@ -727,9 +699,7 @@ fn test_vec_int_sub_simd() {
     assert_eq!(backend.get_int_value(&frame, 1), 13);
 }
 
-// ---------------------------------------------------------------------------
 // Test 13: VecIntMul native SIMD
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_vec_int_mul_simd() {
@@ -771,9 +741,7 @@ fn test_vec_int_mul_simd() {
     assert_eq!(backend.get_int_value(&frame, 1), 48);
 }
 
-// ---------------------------------------------------------------------------
 // Test 14: VecExpandI + VecIntAdd (broadcast + vector add)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_vec_expand_add_simd() {
@@ -816,9 +784,7 @@ fn test_vec_expand_add_simd() {
     assert_eq!(backend.get_int_value(&frame, 1), 120);
 }
 
-// ---------------------------------------------------------------------------
 // Test 15: VecFloatAdd native SIMD
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_vec_float_add_simd() {
@@ -887,9 +853,7 @@ fn test_vec_float_add_simd() {
     assert_eq!(f64::from_bits(r1_bits), 6.5); // 2.5 + 4.0
 }
 
-// ---------------------------------------------------------------------------
 // Test 16: Chained VecIntAdd + VecIntMul (vector add then multiply)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_vec_chained_add_mul_simd() {
@@ -958,9 +922,7 @@ fn test_vec_chained_add_mul_simd() {
     assert_eq!(backend.get_int_value(&frame, 1), 160);
 }
 
-// ===========================================================================
 // Stress tests: multi-pass optimizer pipeline integration
-// ===========================================================================
 
 /// Minimal field descriptor for optimizer-level tests.
 #[derive(Debug)]
@@ -1058,7 +1020,6 @@ fn assign_positions(ops: &mut [Op], base: u32) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Stress Test 1: Virtual Object + Guard Elimination + Constant Folding
 //
 // Trace (optimizer-level):
@@ -1078,17 +1039,13 @@ fn assign_positions(ops: &mut [Op], base: u32) {
 //   - int_gt(50, 0) = true (constant folded by IntBounds)
 //   - guard_true(true) eliminated (guard on known-true condition)
 //   - finish(50)
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // Stress Test 2: IntDiv magic numbers + IntBounds guard elimination
 //
 // Part A: Optimizer level - verify redundant guard removal.
 // Part B: Execution level - verify magic number division correctness
 //         (separate trace without redundant guards to avoid fail_index conflicts).
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // Stress Test 3: Loop with CSE + Guard Deduplication
 //
 // Loop trace:
@@ -1108,9 +1065,7 @@ fn assign_positions(ops: &mut [Op], base: u32) {
 //   - cmp2 eliminated by CSE (OptPure)
 //   - second guard_true eliminated (duplicate folded by OptRewrite)
 //   - sq2 eliminated by CSE (OptPure), forwarded to sq
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // Stress Test 4: Heap Cache + Green Field (Immutable) Optimization
 //
 // Trace (optimizer-level):
@@ -1128,9 +1083,7 @@ fn assign_positions(ops: &mut [Op], base: u32) {
 //   - Second immutable getfield (i1) eliminated by OptHeap green field cache
 //   - Second mutable getfield (i3) re-emitted (cache invalidated by call)
 //   - i1 forwarded to i0, so i4 becomes int_add(i0, i0)
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // Stress Test 5: String Virtualization
 //
 // Trace (optimizer-level):
@@ -1150,9 +1103,7 @@ fn assign_positions(ops: &mut [Op], base: u32) {
 //   - strlen folded to constant 3
 //   - int_add(66, 3) folded to 69
 //   - Trace reduces to Finish(69)
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // Stress Test 6: Combined loop with guard dedup, CSE, and IntBounds
 //
 // This test verifies that the full pipeline handles a realistic loop trace
@@ -1183,9 +1134,7 @@ fn assign_positions(ops: &mut [Op], base: u32) {
 // Expected:
 //   - cmp1/guard eliminated (IntBounds: x>=1 implies x-1>=0)
 //   - cmp2/guard eliminated (CSE of cmp0 + guard dedup)
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // Stress Test 7: Full pipeline with arithmetic chains and multiple CSE
 //
 // This test builds a longer arithmetic chain with several CSE opportunities,
@@ -1210,18 +1159,13 @@ fn assign_positions(ops: &mut [Op], base: u32) {
 //   h = f + d
 //   result = h + f
 //   finish(result)
-// ---------------------------------------------------------------------------
 
-// ===========================================================================
 // Threadlocal parity tests (RPython: test_threadlocal.py)
-// ===========================================================================
 
-// ---------------------------------------------------------------------------
 // Test: ThreadlocalrefGet compiles and reads back a value set via the shim
 //
 // Mirrors RPython's test_threadlocalref_get: set a TLS slot, then compile
 // a trace that reads it via ThreadlocalrefGet, verify the value matches.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_threadlocalref_get_basic() {
@@ -1255,13 +1199,11 @@ fn test_threadlocalref_get_basic() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Test: ThreadlocalrefGet reads different slots at different offsets
 //
 // Mirrors RPython's test_threadlocalref_get_char: verify that distinct
 // offsets map to distinct slots. Offsets are in bytes (divided by 8
 // internally to get slot index).
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_threadlocalref_get_multiple_slots() {
@@ -1303,13 +1245,11 @@ fn test_threadlocalref_get_multiple_slots() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Test: ThreadlocalrefGet set-then-read roundtrip
 //
 // Verifies that writing a value with jit_threadlocalref_set and reading
 // it back via compiled ThreadlocalrefGet produces the same value, for
 // several test values including zero and negative numbers.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_threadlocalref_set_and_read_roundtrip() {
@@ -1340,13 +1280,11 @@ fn test_threadlocalref_set_and_read_roundtrip() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Test: Different threads see independent TLS values
 //
 // Mirrors RPython's implicit thread isolation: each thread has its own
 // JIT_THREADLOCAL_SLOTS (thread_local!). Verify that writing on one
 // thread does not affect reads on another.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_threadlocalref_thread_isolation() {
@@ -1386,13 +1324,11 @@ fn test_threadlocalref_thread_isolation() {
     assert_eq!(child_val, 0x2222, "child thread should see its own value");
 }
 
-// ---------------------------------------------------------------------------
 // FFI call (CallReleaseGil) end-to-end parity tests
 // (rpython/jit/metainterp/test/test_fficall.py)
 //
 // Verifies that CallReleaseGilI compiles and executes correctly, with the
 // GIL release/reacquire shims called around the actual foreign function.
-// ---------------------------------------------------------------------------
 
 /// Simple extern "C" function: adds two i64 values.
 extern "C" fn ffi_add(a: i64, b: i64) -> i64 {
@@ -1610,9 +1546,7 @@ fn test_call_release_gil_hooks_are_callable() {
     set_gil_hooks(|| {}, || {});
 }
 
-// ---------------------------------------------------------------------------
 // Raw memory test helpers
-// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 struct RawArrayDescr {
@@ -1667,12 +1601,10 @@ fn raw_descr_float() -> DescrRef {
     })
 }
 
-// ---------------------------------------------------------------------------
 // Test: RawStore + RawLoadI roundtrip (integer)
 //
 // Mirrors RPython's test_raw_storage_int: allocate raw memory, store a value,
 // load it back, verify the result.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_raw_store_load_int_roundtrip() {
@@ -1707,11 +1639,9 @@ fn test_raw_store_load_int_roundtrip() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Test: RawStore + RawLoadF roundtrip (float)
 //
 // Mirrors RPython's test_raw_storage_float.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_raw_store_load_float_roundtrip() {
@@ -1744,12 +1674,10 @@ fn test_raw_store_load_float_roundtrip() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Test: Raw ops at different offsets don't interfere
 //
 // Store two different integers at different offsets, then load both back.
 // Verifies that the Cranelift codegen correctly handles distinct offsets.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_raw_ops_different_offsets_no_interference() {
@@ -1794,12 +1722,10 @@ fn test_raw_ops_different_offsets_no_interference() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Test: RawLoadI with unsigned 1-byte item (zero extension)
 //
 // Mirrors RPython's test_raw_storage_byte: store 0xFF in a 1-byte item,
 // load it as unsigned (should get 255, not -1).
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_raw_load_unsigned_byte() {
@@ -1835,14 +1761,12 @@ fn test_raw_load_unsigned_byte() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // FFI forcing and guard_not_forced parity tests
 // (rpython/jit/metainterp/test/test_fficall.py: test_guard_not_forced_fails)
 //
 // Verifies CallMayForceI + GuardNotForced and CallReleaseGilI + GuardNoException
 // compile and execute correctly, covering the forced path and exception
 // propagation semantics.
-// ---------------------------------------------------------------------------
 
 fn call_descr_may_force_i(idx: u32, arg_types: Vec<Type>) -> DescrRef {
     Arc::new(TestCallDescr {
@@ -1872,7 +1796,7 @@ extern "C" fn ffi_maybe_force(force_token: i64, flag: i64) -> i64 {
     flag * 2
 }
 
-/// OBJECTPTR layout: typeptr at offset 0 (pyjitpl.py:3119-3123).
+/// OBJECTPTR layout: typeptr at offset 0 (pyjitpl.py raise_if_successful).
 #[repr(C)]
 struct FakeExcObject {
     typeptr: usize,
@@ -2083,13 +2007,9 @@ fn test_ffi_call_exception_propagation() {
     );
 }
 
-// ===========================================================================
 // Frame-stack metadata integration tests
-// ===========================================================================
 
-// ---------------------------------------------------------------------------
 // Test: Guard failure preserves frame-stack metadata in describe_deadframe
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
@@ -2147,9 +2067,7 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Test: Bridge guard failure carries frame-stack metadata
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_compiled_bridge_guard_failure_has_frame_stack() {
@@ -2280,9 +2198,7 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Test: CallAssemblerI callee guard failure propagates frame_stack
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_call_assembler_callee_guard_failure_frame_stack() {
@@ -2335,9 +2251,7 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Test: Frame-stack slot_types match fail_arg_types for mixed Int+Float
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_frame_stack_slot_types_match_fail_arg_types() {
@@ -2401,7 +2315,6 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Test: FFI exchange buffer pattern
 //
 // Parity with rpython/jit/metainterp/test/test_fficall.py lines 240-290.
@@ -2413,7 +2326,6 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
 // The buffer layout follows RPython's CIF description convention:
 //   offset 16 = first argument slot
 //   offset 32 = result slot
-// ---------------------------------------------------------------------------
 
 /// FFI function that reads from an exchange buffer and writes back.
 /// Simulates `fake_call_impl_any` from test_fficall.py:

@@ -119,7 +119,7 @@ impl CodeWriter {
     /// RPython: `CodeWriter.__init__(cpu, jitdrivers_sd)` (codewriter.py).
     ///
     /// `debug` mirrors the class-level default `debug = True`
-    /// (`codewriter.py:18`). Upstream always produces per-jitcode
+    /// (`codewriter.py`). Upstream always produces per-jitcode
     /// diagnostic output (`log.dot()` in `print_ssa_repr`), so pyre
     /// matches by defaulting `debug: true`. Tests that want silent
     /// operation may flip the field after construction.
@@ -194,7 +194,7 @@ impl CodeWriter {
         // family (attrfamily merge).  Empty for pyre production.
         registry.register_trait_families(callcontrol.trait_family_registrations());
         // PyPy's `Bookkeeper.compute_at_fixpoint` raises through to
-        // the caller (`bookkeeper.py:108-127`); pyre's dual-gate
+        // the caller (`bookkeeper.py`); pyre's dual-gate
         // mirrors that propagation by routing the populate `TyperError`
         // through `is_known_unported`.  Known-unported categories
         // leave a partial registry (the per-graph dual-gate will
@@ -387,7 +387,7 @@ impl CodeWriter {
                 );
                 // Commit each real-rtyper Variable's `concretetype`
                 // (LowLevelType) onto its placeholder on the graph's
-                // value table.  Mirrors RPython `rtyper.py:258 v.concretetype = ...`
+                // value table.  Mirrors RPython `rtyper.py setconcretetype v.concretetype = ...`
                 // attribute aliasing; reads via `FunctionGraph::concretetype_of(&v)`
                 // then match upstream `getkind(v.concretetype)`.
                 for var in real_value_to_var.values() {
@@ -597,7 +597,7 @@ impl CodeWriter {
         // `CallTarget::Method.resolved_path`. The resolver fast path in
         // `CallControl::resolve_method` / `resolve_method_impl_type`
         // then does `function_graphs.get(&path)` directly instead of
-        // the receiver-root heuristic (mirrors `bookkeeper.py:431-442
+        // the receiver-root heuristic (mirrors `bookkeeper.py getmethoddesc
         // getmethoddesc` classdef-keyed dispatch). Ops whose receiver
         // carries no SomeInstance annotation are left untouched.
         if let Some(value_to_var) = real_value_to_var.as_ref() {
@@ -748,7 +748,7 @@ impl CodeWriter {
     /// graph; Spine B (`transform_opname_graph_to_jitcode`) reaches here after
     /// `jtransform_opname::lower_graph` produced an equivalent rich-`OpKind`
     /// graph from the rtyper's opname `SpaceOperation`s.  From this point the
-    /// pipeline is identical — Steps 2-4 (codewriter.py:45-67): regalloc →
+    /// pipeline is identical — Steps 2-4 (codewriter.py): regalloc →
     /// flatten → liveness/assemble → `get_jitcode_calldescr` → commit body →
     /// assign `jitcode.index`.  Each Variable's `.concretetype` cell is the
     /// kind source (the upstream `getkind(v.concretetype)` access).
@@ -963,7 +963,7 @@ impl CodeWriter {
             // or `print(format_assembler(ssarepr))` (verbose=True). Pyre
             // currently mirrors only the low-noise branch: one line per
             // jitcode with the name, analogous to upstream's udir
-            // filename (`codewriter.py:122-125
+            // filename (`codewriter.py
             // dir.join(name+extra).write(format_assembler(ssarepr))`).
             // The `verbose` parameter is plumbed to match the upstream
             // signature; the high-verbosity branch lands when

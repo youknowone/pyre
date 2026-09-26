@@ -801,7 +801,7 @@ impl Lock {
 /// Upstream picks `rthread.dummy_lock` when the build has no `thread` module;
 /// pyre always registers `_thread`, so the `rthread.allocate_lock()` branch
 /// (`baseobjspace.py`) is the one taken.  `CannotHaveLock`
-/// (`baseobjspace.py:421`) guards the translating-but-not-translated case,
+/// (`baseobjspace.py`) guards the translating-but-not-translated case,
 /// which pyre never occupies, so this cannot fail.
 ///
 /// The returned pointer is deliberately leaked: locks live for the process,
@@ -1077,7 +1077,7 @@ unsafe fn p_recursive_isinstance_w(
     p_abstract_issubclass_w(w_abstractclass, w_cls)
 }
 
-/// abstractinst.py:53-56 / 154-156:
+/// abstractinst.py p_recursive_isinstance_w / 154-156:
 /// `space.isinstance_w(obj, space.w_type)`.
 ///
 /// This deliberately goes through pyre's object-space `isinstance_w`,
@@ -1244,7 +1244,7 @@ pub unsafe fn isinstance_dict_w(obj: PyObjectRef) -> bool {
 /// Recursion is bounded by avoiding the last entry of each `__bases__`
 /// tuple — that one is followed by re-entering the loop.
 ///
-/// `@jit.unroll_safe` (abstractinst.py:128): the `__bases__` walk is a loop, and
+/// `@jit.unroll_safe` (abstractinst.py): the `__bases__` walk is a loop, and
 /// `look_inside_graph` (policy.py) rejects a loop-bearing graph. The hint
 /// clears `contains_loop` before that test, so the graph stays in the candidate
 /// set, mints a jitcode, and the walker unrolls the walk instead of leaving the
@@ -1315,7 +1315,7 @@ pub(crate) unsafe fn p_recursive_issubclass_w(
 /// looked up via `space.lookup(w_klass_or_tuple, "__instancecheck__")`,
 /// then the abstract `__class__`/`__bases__` walk.
 ///
-/// `@jit.unroll_safe` (abstractinst.py:87): the tuple/union classinfo walk is a
+/// `@jit.unroll_safe` (abstractinst.py): the tuple/union classinfo walk is a
 /// loop, and `look_inside_graph` (policy.py) rejects a loop-bearing graph.
 /// The hint clears `contains_loop` before that test, so the graph stays in the
 /// candidate set, mints a jitcode, and the walker unrolls the walk instead of
@@ -1403,7 +1403,7 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
 /// Tuple/union recursion, `__subclasscheck__` override looked up on
 /// `type(classinfo)`, then the abstract `__bases__` walk.
 ///
-/// `@jit.unroll_safe` (abstractinst.py:164): the tuple/union classinfo walk is a
+/// `@jit.unroll_safe` (abstractinst.py): the tuple/union classinfo walk is a
 /// loop, and `look_inside_graph` (policy.py) rejects a loop-bearing graph.
 /// The hint clears `contains_loop` before that test, so the graph stays in the
 /// candidate set, mints a jitcode, and the walker unrolls the walk instead of
@@ -1576,7 +1576,7 @@ pub(crate) unsafe fn subclass_special_override(
 /// generic tail, which consults `__bool__` then `__len__`, where the call
 /// exceptions — and the non-bool-`__bool__` TypeError — propagate.
 pub fn is_true(obj: PyObjectRef) -> Result<bool, PyError> {
-    // descroperation.py:265 — `__bool__` (anywhere in the MRO) is consulted
+    // descroperation.py is_true — `__bool__` (anywhere in the MRO) is consulted
     // before `__len__`.  An exact builtin's `__bool__` / `__len__` are the
     // inherited builtin slots, so its truthiness is computed by layout in
     // `is_true_slot`; any other object (builtin subclass or user instance)
@@ -3284,7 +3284,7 @@ fn iterator_reduce_tuple(
 /// `sequenceiterator.__reduce__()` — `iterobject.py
 /// W_AbstractSeqIterObject.descr_reduce`: `(iter, (seq,), index)` for a live
 /// sequence; an exhausted iterator (`w_seq is None`) pickles to `_empty_iterable`
-/// (`iterobject.py:251-253`) = `(iter, ((),))` so it restores empty.
+/// (`iterobject.py`) = `(iter, ((),))` so it restores empty.
 pub(crate) fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     // CPython 3.14 issue #101765: resolving `builtins.iter` can run an
     // equality hook which exhausts this iterator.  Root the receiver, perform
@@ -3402,7 +3402,7 @@ unsafe fn seq_iter_clamp_length(seq: PyObjectRef) -> Option<i64> {
     }
 }
 
-/// `sequenceiterator.__setstate__(index)` — `iterobject.py:40-45
+/// `sequenceiterator.__setstate__(index)` — `iterobject.py descr_setstate
 /// W_AbstractSeqIterObject.descr_setstate`: restore the cursor only while the
 /// sequence is live, clamping a negative index to 0.
 ///
@@ -3435,7 +3435,7 @@ pub(crate) fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// `sequenceiterator.__length_hint__()` — `W_AbstractSeqIterObject.getlength`
-/// (iterobject.py:16-24): `len(seq) - index` recomputed from the LIVE sequence
+/// (iterobject.py): `len(seq) - index` recomputed from the LIVE sequence
 /// — `space.len(w_seq)`, so a subclass `__len__` override or a mutation made
 /// mid-iteration is reflected — clamped to 0.  An exhausted (cleared) sequence
 /// reports 0.
@@ -5152,7 +5152,7 @@ unsafe fn setitem_instance(obj: PyObjectRef, index: PyObjectRef, value: PyObject
 /// OperationError(KeyError) and allocating W_BytesObject".  Both halves
 /// apply here: `w_dict_getitem_str` probes the strategy with the borrowed
 /// `&str`, so a miss allocates neither the wrapped key nor the exception.
-/// Every other receiver falls through to `baseobjspace.py:868-871`, which
+/// Every other receiver falls through to `baseobjspace.py`, which
 /// wraps the key and defers to the generic `finditem`.
 ///
 /// The probe still compares against whatever the bucket holds, so a stored
@@ -5304,7 +5304,7 @@ pub fn id(w_obj: PyObjectRef) -> PyObjectRef {
 /// the in-place `+=` / `*=` bug-to-bug compatibility branch in
 /// descroperation.
 pub fn flag_sequence_bug_compat(w_type: PyObjectRef) -> bool {
-    // typeobject.py:167 — a W_TypeObject field, not an identity table.
+    // typeobject.py — a W_TypeObject field, not an identity table.
     // TypeCache.build copies TypeDef.flag_sequence_bug_compat; heap
     // subclasses keep the False default.
     !w_type.is_null()
@@ -6040,7 +6040,7 @@ fn getdict_backing(obj: PyObjectRef) -> PyResult {
 /// [`getdict`] for a receiver whose layout the caller already knows: a native
 /// payload object (ctypes, socket, mmap, structseq, …) or an exception.
 /// `Local.getdict` is the one override that executes Python — the first
-/// access from a thread runs the subclass initializer (`os_local.py:73
+/// access from a thread runs the subclass initializer (`os_local.py
 /// create_new_dict`) — and none of those receivers can be a `_local`, so the
 /// lookup is a plain field or mapdict read.
 pub fn getdict_native(obj: PyObjectRef) -> PyObjectRef {
@@ -6505,7 +6505,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
         }
     }
 
-    // GenericAlias.__getattribute__ (`_pypy_generic_alias.py:52`) — every
+    // GenericAlias.__getattribute__ (`_pypy_generic_alias.py`) — every
     // attribute outside `_ATTR_EXCEPTIONS` delegates to `__origin__`.
     // pyre's `getattr` does not dispatch through a typedef
     // `__getattribute__` for builtin W_Roots, so the delegation is wired
@@ -7196,7 +7196,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
 /// so the caller falls through to ordinary attribute lookup.  Taken by WTF-8
 /// so a name carrying a lone surrogate reaches the same walk as any other.
 ///
-/// `@unroll_safe` (typeobject.py:460 `lookup_starting_at`): the MRO-suffix walk
+/// `@unroll_safe` (typeobject.py `lookup_starting_at`): the MRO-suffix walk
 /// is a loop, and `look_inside_graph` (policy.py) rejects a loop-bearing graph.
 /// The hint clears `contains_loop` before that test, so the graph stays in the
 /// candidate set, mints a jitcode, and the walker unrolls the walk instead of
@@ -7666,7 +7666,7 @@ pub(crate) unsafe fn object_getattribute_surrogate(
         // surrogate name can legitimately reach a descriptor via
         // `setattr(cls, '\udc80', descr)`, so a data descriptor's
         // `__get__` takes priority over the instance dict, and a non-data
-        // descriptor binds after it (descroperation.py:88-112).
+        // descriptor binds after it (descroperation.py).
         let w_type = crate::typedef::r#type(obj).map_or(std::ptr::null_mut(), |p| p.as_ptr());
         let w_descr = if w_type.is_null() {
             None
@@ -7746,7 +7746,7 @@ pub unsafe fn object_setattr_surrogate(
 ) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     unsafe {
-        // descroperation.py:114-123 — a data descriptor's `__set__` takes
+        // descroperation.py descr__setattr__ — a data descriptor's `__set__` takes
         // priority over the dict store.  Walk `space.type(obj)` (the
         // metaclass for a type receiver, mirroring object_setattr:4483-4493)
         // comparing WTF-8 keys so a surrogate-named descriptor is found.
@@ -7839,7 +7839,7 @@ pub(crate) unsafe fn object_delattr_surrogate(
 ) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     unsafe {
-        // descroperation.py:131-137 — a data descriptor's `__delete__`
+        // descroperation.py descr__delattr__ — a data descriptor's `__delete__`
         // takes priority over the dict removal.  Mirror object_delattr,
         // comparing WTF-8 keys so a surrogate-named descriptor is found,
         // and run before the module/type/instance dict removal so a
@@ -7900,7 +7900,7 @@ pub(crate) unsafe fn object_delattr_surrogate(
 fn attr_error_wtf8(obj: PyObjectRef, name: &Wtf8) -> PyError {
     // The name goes in verbatim between the quotes. 3.14 keeps the code point
     // itself, so `getattr(Sub, '\udcfe')` reports `... has no attribute
-    // '\udcfe'` holding the lone surrogate; `descroperation.py:58` renders it
+    // '\udcfe'` holding the lone surrogate; `descroperation.py` renders it
     // through `%R` and reports the six-character escape text instead. Measured
     // on both, 2026-08-06 — do not "restore" the repr form.
     let mut message = Wtf8Buf::from_string(format!(
@@ -7957,7 +7957,7 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
             }
             // The receiver namespace is the sole authority at this stage.
             // Read a user instance's mapdict node directly (getdictvalue,
-            // mapdict.py:846-847); a type receiver uses only its canonical
+            // mapdict.py); a type receiver uses only its canonical
             // dictionary, which is the corresponding `getdictvalue` result.
             let value = if instance {
                 crate::objspace::std::mapdict::instance_node_getdictvalue_checked(
@@ -7986,7 +7986,7 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
             if instance && name == "__class__" {
                 return Ok(w_type);
             }
-            // descroperation.py:88 — object.__getattribute__ raises
+            // descroperation.py descr__getattribute__ — object.__getattribute__ raises
             // AttributeError on miss. __getattr__ is space.getattr's job.
             return Err(PyError::attribute_error_with_context(
                 format!(
@@ -8001,7 +8001,7 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
     // Remaining non-instance receivers (module and builtin objects): preserve
     // their pure descriptor protocol with no `__getattr__` fallback — that
     // belongs to space.getattr, not the bare object.__getattribute__ slot
-    // (descroperation.py:88).
+    // (descroperation.py).
     getattr_str_impl(obj, name, false, false)
 }
 
@@ -8298,7 +8298,7 @@ unsafe fn instance_getattr_hook_or_err(
 /// raised anywhere in `type.__getattribute__` — a metatype data descriptor's
 /// `__get__`, a class MRO descriptor's `__get__`, a metatype non-data
 /// descriptor's `__get__`, or the terminal miss — consults `__getattr__` on the
-/// metaclass (descroperation.py:234-245).  `call_getattr` gates the fallback
+/// metaclass (descroperation.py).  `call_getattr` gates the fallback
 /// off for the bare `object.__getattribute__` slot, which propagates instead.
 unsafe fn type_getattr_hook_or_err(
     obj: PyObjectRef,
@@ -9190,7 +9190,7 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                 if let Some(v) = crate::type_dict_lookup(obj, name) {
                     return Ok(v);
                 }
-                // descroperation.py:234 wraps the whole getattribute slot, so
+                // descroperation.py _handle_getattribute wraps the whole getattribute slot, so
                 // even this hardcoded AttributeError consults the metaclass
                 // `__getattr__` before propagating.
                 return type_getattr_hook_or_err(
@@ -9807,7 +9807,7 @@ pub fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
 }
 
 /// baseobjspace.py `ObjSpace.int_w(w_obj,
-/// allow_conversion=True)` composed with `baseobjspace.py:279-285
+/// allow_conversion=True)` composed with `baseobjspace.py
 /// W_Root.int_w`:
 ///
 /// ```python
@@ -10713,7 +10713,7 @@ pub(crate) unsafe fn lookup_in_type_where_uncached(
 /// halves are exposed as two single-`Option` residuals over the same
 /// deterministic, side-effect-free lookup; a caller that needs both rebuilds
 /// the pair via [`lookup_where_pair`].  Marker `_jit_look_inside_ = False`
-/// (rlib/jit.py:139).
+/// (rlib/jit.py).
 #[majit_macros::dont_look_inside]
 pub(crate) unsafe fn lookup_where_class_uncached(
     w_type: PyObjectRef,
@@ -13132,7 +13132,7 @@ pub unsafe fn validate_c3_mro(
 /// graph, so the entire self-recursive C3 walk residualizes here instead of
 /// blocking every numeric/unary and lookup-family graph that funnels through
 /// the cold uncached [`lookup_where`] branch. Marker `_jit_look_inside_ =
-/// False` (rlib/jit.py:139).
+/// False` (rlib/jit.py).
 ///
 /// Mirror: the Vec-returning residuals in `objspace/std/mapdict.rs`
 /// (`instance_node_dict_keys` -> `Vec<PyObjectRef>`).
@@ -13350,7 +13350,7 @@ pub(crate) unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
 /// `space.lookup(w_descr, '__delete__') is not None` — whether the
 /// descriptor exposes a `__delete__`.  `setattr` consults this after a
 /// failed `__set__` lookup to reject a data descriptor that has a deleter
-/// but no setter (descroperation.py:124-126).
+/// but no setter (descroperation.py).
 unsafe fn descr_has_delete(descr: PyObjectRef) -> bool {
     if descr.is_null() {
         return false;
@@ -13408,9 +13408,9 @@ pub(crate) unsafe fn member_typecheck_error(
 
 /// Cold empty-slot error from `Member.descr_member_get`.
 ///
-/// `[3.14-spec]` PyPy `typedef.py:513-515` spells this through `%T`, which
+/// `[3.14-spec]` PyPy `typedef.py` spells this through `%T`, which
 /// reports the bare type name.  CPython 3.14 exposes the heap type's qualified
-/// name here, pinned by `lib-python/3/test/test_descr.py:1311`; retain pyre's
+/// name here, pinned by `lib-python/3/test/test_descr.py`; retain pyre's
 /// `getfulltypename` result while keeping eager message construction behind
 /// the same rejected-access boundary as upstream's `oefmt`.
 unsafe fn member_missing_error(obj: PyObjectRef, slot_name: &str) -> crate::PyError {
@@ -13761,7 +13761,7 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
 /// Validates and performs `obj.__class__ = newcls`.
 pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
     unsafe {
-        // objectobject.py:139-142 — w_newcls must be a W_TypeObject
+        // objectobject.py descr___init_subclass__ — w_newcls must be a W_TypeObject
         if !is_type(w_newcls) {
             return Err(crate::PyError::type_error(format!(
                 "__class__ must be set to a class, not '{}' object",
@@ -13827,7 +13827,7 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         }
         // objectobject.py:150 — w_obj.setclass(space, w_newcls).  For a mapdict
         // instance this re-roots the map chain onto the new class's terminator
-        // (mapdict.py:754-756); pyre then keeps w_class authoritative for type().
+        // (mapdict.py); pyre then keeps w_class authoritative for type().
         if crate::objspace::std::mapdict::has_mapdict_storage(w_obj) {
             crate::objspace::std::mapdict::instance_setclass(w_obj, w_newcls);
         }
@@ -13845,7 +13845,7 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
     // `super` proxies only `__getattribute__` (descriptor.py W_Super); it has
     // no `__setattr__`, so `super().name = value` uses the object default and
     // raises AttributeError rather than resolving a descriptor setter.
-    // descroperation.py:247 — space.lookup for __setattr__ through MRO,
+    // descroperation.py setattr — space.lookup for __setattr__ through MRO,
     // then get_and_call_function which applies descriptor binding.
     unsafe {
         if is_instance(obj) {
@@ -13876,7 +13876,7 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
                 .map(|_| w_none());
             }
         } else if let Some(w_type) = crate::typedef::r#type(obj) {
-            // descroperation.py:247 looks up __setattr__ on the receiver
+            // descroperation.py setattr looks up __setattr__ on the receiver
             // type regardless of receiver kind.  Non-instance receivers
             // (e.g. structseq tuple subclasses) may install a non-default
             // __setattr__; only a real override (≠ object.__setattr__)
@@ -13992,7 +13992,7 @@ pub fn type_immutable_attr_raise_is_stable(obj: PyObjectRef, name: &str, is_dele
 /// The property, member, and getset families are deliberately excluded: their
 /// dedicated arms in `set` and `descr_has_delete` have value- and
 /// descriptor-specific behaviour rather than the general
-/// `descroperation.py:114-126` terminal.
+/// `descroperation.py` terminal.
 pub fn readonly_descr_attr_raise_is_stable(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     unsafe {
         if obj.is_null()
@@ -15065,7 +15065,7 @@ pub(crate) fn raiseattrerror(
     // so only a plainly absent one counts.
     let no_dict_slot =
         site != AttrErrorSite::Get && getdict_backing(obj).is_ok_and(|dict| dict.is_null());
-    // descroperation.py:58-67 — with a descriptor in hand, the attribute
+    // descroperation.py raiseattrerror — with a descriptor in hand, the attribute
     // exists on the type but has no reachable `__set__`/`__delete__`.  That is
     // read-only only for a receiver with no dict slot to store into: with a
     // dictionary in hand the name is reported absent instead, which is the
@@ -15444,7 +15444,7 @@ pub fn call(
     w_args: PyObjectRef,
     w_kwds: Option<PyObjectRef>,
 ) -> PyObjectRef {
-    // baseobjspace.py:1213-1215 — the packed objects remain live while
+    // baseobjspace.py call — the packed objects remain live while
     // `Arguments.frompacked` expands `*args` / `**kwargs`, either of which can
     // execute Python and collect.  RPython's GC transform roots these locals;
     // publish and reload the corresponding raw pointers explicitly.
@@ -15474,7 +15474,7 @@ pub fn call(
     }
 }
 
-/// PyPy `descroperation.py:189 call_args` — dispatch one structured
+/// PyPy `descroperation.py call_args` — dispatch one structured
 /// `Arguments` instance without flattening its keyword half.
 pub fn call_args(
     callable: PyObjectRef,
@@ -15797,7 +15797,7 @@ pub fn call_args_and_c_profile_args(
 pub fn call_method(obj: PyObjectRef, methname: &str, args: &[PyObjectRef]) -> PyObjectRef {
     match method_descriptor_shortcut(obj, methname) {
         Ok(Some(w_descr)) => {
-            // `callmethod.py:142` — `space.call_function(w_descr, w_obj, *arg_w)`.
+            // `callmethod.py` — `space.call_function(w_descr, w_obj, *arg_w)`.
             // `Arguments.prepend` builds the receiver-first list upstream; the
             // vector below is that list, filled from the published slots so a
             // collection inside the fill cannot leave a pre-move address in it.
@@ -15816,7 +15816,7 @@ pub fn call_method(obj: PyObjectRef, methname: &str, args: &[PyObjectRef]) -> Py
             call_function(roots.get(base), &call_args)
         }
         Ok(None) => match getattr_str(obj, methname) {
-            // `callmethod.py:143-145` — `w_meth = space.getattr(w_obj, w_name)`.
+            // `callmethod.py` — `w_meth = space.getattr(w_obj, w_name)`.
             Ok(method) => call_function(method, args),
             Err(e) => {
                 crate::call::set_call_error(e);
@@ -15879,7 +15879,7 @@ fn method_descriptor_shortcut(
     if !unsafe { has_object_getattribute(w_type.as_ptr()) } {
         return Ok(None);
     }
-    // `callmethod.py:136` — `w_descr = space.lookup(w_obj, methname)`.
+    // `callmethod.py` — `w_descr = space.lookup(w_obj, methname)`.
     let Some(w_descr) = (unsafe { lookup_in_type(w_type.as_ptr(), methname) }) else {
         return Ok(None);
     };
@@ -15891,7 +15891,7 @@ fn method_descriptor_shortcut(
     {
         return Ok(None);
     }
-    // `callmethod.py:138-139` — `w_value = w_obj.getdictvalue(space, methname)`;
+    // `callmethod.py` — `w_value = w_obj.getdictvalue(space, methname)`;
     // an instance entry of that name is the bound-method path's answer.
     if getdictvalue(obj, methname)?.is_some() {
         return Ok(None);
@@ -15987,7 +15987,7 @@ pub fn wrappable_class_name(class: PyObjectRef) -> String {
 ///
 /// `expected_length = -1` is PyPy's sentinel for "any length".  When
 /// the caller supplies a positive expected_length, the length-validation
-/// arm at `baseobjspace.py:1031-1053
+/// arm at `baseobjspace.py
 /// `_unpackiterable_known_length_jitlook` runs and raises ValueError
 /// on mismatch (`too many values to unpack` /
 /// `not enough values to unpack`).
@@ -16080,7 +16080,7 @@ struct UnpackIterableJitDriver;
 impl UnpackIterableJitDriver {
     /// pypy/interpreter/baseobjspace.py:1012
     /// `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`. `reds='auto'`
-    /// (baseobjspace.py:31) auto-collects the loop's live locals `w_iterator`
+    /// (baseobjspace.py) auto-collects the loop's live locals `w_iterator`
     /// and `items`; pyre's meta-tracer cannot auto-collect Rust locals, so the
     /// merge-point passes them to the hook as the two concrete reds.
     #[inline]
@@ -16777,7 +16777,7 @@ pub fn index_int_w_preserve_negative(obj: PyObjectRef) -> Result<i64, PyError> {
 /// outside a C int's range is an OverflowError rather than a truncation.
 ///
 /// [`c_int_w`] cannot serve here because `gateway_int_w` is `int_w`
-/// (baseobjspace.py:2043), which converts through `__int__` first — so an
+/// (baseobjspace.py), which converts through `__int__` first — so an
 /// object carrying both dunders would be read from the wrong one, and one
 /// carrying only `__int__` would be accepted where 3.14 raises TypeError.
 pub fn index_c_int_w(obj: PyObjectRef) -> Result<i32, PyError> {
@@ -16842,7 +16842,7 @@ pub fn frame_builtin_obj_checked(
 }
 
 /// `pyframe.py:115-116 self.builtin = space.builtin.pick_builtin(
-/// w_globals)`.  Body ports `pypy/module/__builtin__/moduledef.py:89-109
+/// w_globals)`.  Body ports `pypy/module/__builtin__/moduledef.py
 /// pick_builtin`:
 ///   1. `space.getitem(w_globals, '__builtins__')` (`KeyError` ⇒ default)
 ///   2. recognise `Module` ⇒ return that Module
@@ -17072,7 +17072,7 @@ pub fn unpackiterable_unroll(
 ///         return self.get_strategy().view_as_kwargs(self)
 ///     return None, None
 ///
-/// # dictmultiobject.py:1325-1334 (kwargs strategy)
+/// # dictmultiobject.py (kwargs strategy)
 /// def view_as_kwargs(self, w_dict):
 ///     d = self.unerase(w_dict.dstorage)
 ///     l = len(d)
@@ -17112,7 +17112,7 @@ pub fn view_as_kwargs(w_dict: PyObjectRef) -> (Option<Vec<PyObjectRef>>, Option<
     //
     // Polymorphic dispatch via `w_dict_get_strategy(obj).view_as_kwargs`:
     // UnicodeDictStrategy and KwargsDictStrategy override to return
-    // parallel arrays directly (`:1323-1334`, `kwargsdict.py:154-156`);
+    // parallel arrays directly (`:1323-1334`, `kwargsdict.py`);
     // every other strategy returns `(None, None)` from the trait
     // default (`:568-569`), forcing the slow `keys()` path in
     // `argument.py:121-150`.
@@ -17794,7 +17794,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // pyre's W_BaseDictMultiIterObject captures `startlen` at iter()
         // time and raises `RuntimeError("dictionary changed size
         // during iteration")` mid-iteration — matches PyPy's
-        // `_check_modified` (`dictmultiobject.py:1716+`) without the
+        // `_check_modified` (`dictmultiobject.py+`) without the
         // snapshot list materialisation.
         if is_dict(obj) {
             // `space.iter(w_mapping)` must honor a dict subclass's own
@@ -17936,12 +17936,12 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         {
             return Ok(obj);
         }
-        // `pypy/module/__builtin__/functional.py:277-278
+        // `pypy/module/__builtin__/functional.py descr___iter__
         // W_Enumerate.descr___iter__` — `return self`.
         if pyre_object::functional::is_enumerate(obj) {
             return Ok(obj);
         }
-        // `pypy/module/__builtin__/functional.py:371-372
+        // `pypy/module/__builtin__/functional.py descr___iter__
         // W_ReversedIterator.descr___iter__` — `return self`.
         if pyre_object::functional::is_reversed(obj) {
             return Ok(obj);
@@ -20205,7 +20205,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 w_item,
             ]));
         }
-        // `pypy/module/__builtin__/functional.py:385-405
+        // `pypy/module/__builtin__/functional.py descr_next
         // W_ReversedIterator.descr_next` — `getitem(sequence, remaining)`
         // then decrement; IndexError / StopIteration ends the walk and
         // clears the slot.
@@ -22812,7 +22812,7 @@ fn not_container_or_iterable_error(obj: PyObjectRef) -> PyError {
     ))
 }
 
-/// `pypy/interpreter/baseobjspace.py:840-845 W_ObjectSpace.hash_w` —
+/// `pypy/interpreter/baseobjspace.py is_none W_ObjectSpace.hash_w` —
 /// returns the `__hash__` digest as `i64`.  Routes through pyre's
 /// existing `builtins::hash_value`, which already covers
 /// int/long/bool/float/str/tuple/frozenset/None plus user
@@ -22868,7 +22868,7 @@ pub fn eq_w(a: PyObjectRef, b: PyObjectRef) -> Result<bool, PyError> {
 /// unreachable and this always returns `True`, matching the non-revdb path.
 /// The JIT does not trace this cache write because the cache lookup lives in
 /// the `@jit.dont_look_inside` `find_map_attr_cache` and the JIT calls
-/// `compute_find_map_attr` directly (`mapdict.py:100-103`).
+/// `compute_find_map_attr` directly (`mapdict.py`).
 pub fn side_effects_ok() -> bool {
     true
 }
@@ -23124,7 +23124,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
     Err(PyError::type_error("object does not support item deletion"))
 }
 
-/// Delete item from dict by key.  `pypy/objspace/std/dictmultiobject.py:177
+/// Delete item from dict by key.  `pypy/objspace/std/dictmultiobject.py descr_delitem
 /// W_DictMultiObject.descr_delitem` routes `self.delitem(w_key)` through
 /// the strategy slot, so both module and regular dicts get typed-storage
 /// dispatch (IntDictStrategy / BytesDictStrategy / KwargsDictStrategy
@@ -23732,7 +23732,7 @@ mod tests {
         assert!(!is_iterable(w_none()));
     }
 
-    /// pypy/objspace/std/objspace.py:609-617 + dictmultiobject.py:307
+    /// pypy/objspace/std/objspace.py + dictmultiobject.py view_as_kwargs
     /// — exact `dict` with all string keys takes the
     /// strategy-specific fast path and returns parallel
     /// `(Some(keys), Some(values))`.  An empty exact dict goes
@@ -23745,7 +23745,7 @@ mod tests {
         assert_eq!(values.as_ref().map(|v| v.len()), Some(0));
     }
 
-    /// pypy/objspace/std/dictmultiobject.py:1325 — kwargs strategy
+    /// pypy/objspace/std/dictmultiobject.py view_as_kwargs — kwargs strategy
     /// only succeeds when every key is a unicode string; the base
     /// `(None, None)` is returned for non-string keys (e.g. int).
     #[test]

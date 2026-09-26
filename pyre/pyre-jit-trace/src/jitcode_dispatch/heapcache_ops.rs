@@ -487,7 +487,7 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
         // concrete object holding its pre-store bytes while the trace
         // heapcache carries `valuebox`, and the next `getfield_gc_*` on the
         // same field hits the cache and trips its `executor.execute`
-        // sanity check (`pyjitpl.py:934-945`) on the divergence.
+        // sanity check (`pyjitpl.py`) on the divergence.
         //
         // Restricted to boxes this walk allocated (`heapcache.new`'s
         // HF_SEEN_ALLOCATION, set by `new/d>r` and `new_with_vtable/d>r`
@@ -530,7 +530,7 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
 /// uniformly: heapcache hit returns the cached box (no IR op);
 /// heapcache miss records the opcode the dispatch selected +
 /// writes through. RPython aliases the `_pure` jitcode spelling to
-/// the plain opimpl (`pyjitpl.py:884`), so both spellings record the
+/// the plain opimpl (`pyjitpl.py`), so both spellings record the
 /// plain opnum here; the optimizer re-derives purity from
 /// `descr.is_always_pure()` (`heap.py:641` const fold +
 /// invalidation-exempt field cache). There is no post-trace rewrite

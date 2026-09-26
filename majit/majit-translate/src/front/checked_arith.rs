@@ -436,7 +436,7 @@ fn rewire_one_checked_arith_site(
         }
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     // The Some target reads the payload via `opt.__pos_0`; with the `_ovf`
     // result flowing directly, that read collapses to the carried value.
@@ -630,7 +630,7 @@ fn rewire_checked_arith_ok_or_else(
         return Err("checked result does not map to the ok_or_else receiver".to_string());
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     // Normal edge: the raising op's result is the sum, wrapped as `Ok(sum)`.
     let (normal_id, normal_inputs) = graph.create_block_with_arg_vars(1);

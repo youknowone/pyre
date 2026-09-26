@@ -66,7 +66,7 @@ fn call_method(
     )
 }
 
-/// `contextvars.py:11-28 PyContextVar_New`.
+/// `contextvars.py PyContextVar_New`.
 ///
 /// `default` is the keyword `ContextVar` declares it as; a null one is the
 /// variable with no default rather than a default of `None`.
@@ -111,7 +111,7 @@ pub unsafe extern "C" fn PyContextVar_New(
     result(made)
 }
 
-/// `contextvars.py:30-37 PyContextVar_Set` — the token that undoes it.
+/// `contextvars.py PyContextVar_Set` — the token that undoes it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyContextVar_Set(
     var: *mut CPyObject,
@@ -120,7 +120,7 @@ pub unsafe extern "C" fn PyContextVar_Set(
     result(call_method(var, "set", value))
 }
 
-/// `contextvars.py:39-47 PyContextVar_Reset`.
+/// `contextvars.py PyContextVar_Reset`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyContextVar_Reset(var: *mut CPyObject, token: *mut CPyObject) -> c_int {
     match trap(call_method(var, "reset", token)) {
@@ -129,7 +129,7 @@ pub unsafe extern "C" fn PyContextVar_Reset(var: *mut CPyObject, token: *mut CPy
     }
 }
 
-/// `contextvars.py:49-71 PyContextVar_Get`.
+/// `contextvars.py PyContextVar_Get`.
 ///
 /// A variable with neither a value in this context nor a default is not an
 /// error: `value` is left null and the call still reports success, which is

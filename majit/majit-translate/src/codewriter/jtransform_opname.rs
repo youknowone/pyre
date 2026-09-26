@@ -15,7 +15,7 @@
 //! EXISTING flatten/regalloc/assembler tail unchanged
 //! (`CodeWriter::finalize_rewritten_graph_to_jitcode`).  This is the port of
 //! `jtransform.py`'s `_rewrite_ops[op.opname]` dispatch
-//! (`jtransform.py:238`), reading each `Variable.concretetype` directly (the
+//! (`jtransform.py`), reading each `Variable.concretetype` directly (the
 //! upstream `getkind(v.concretetype)` path) rather than through the
 //! `value_to_var` bridge the rich-`OpKind` spine uses.
 //!
@@ -977,7 +977,7 @@ mod tests {
             Hlvalue::Variable(newstr_c.clone()),
         ]);
 
-        // ---- startblock.
+        // startblock.
         let chars = variable_with_lltype("chars", chars_ptr.clone());
         startblock.borrow_mut().operations.push(SpaceOperation::new(
             "getsubstruct",
@@ -1022,7 +1022,7 @@ mod tests {
             .into_ref(),
         ]);
 
-        // ---- copy block.
+        // copy block.
         let chars_s = variable_with_lltype("chars_s", chars_ptr.clone());
         copy_block.borrow_mut().operations.push(SpaceOperation::new(
             "getsubstruct",

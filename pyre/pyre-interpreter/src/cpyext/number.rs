@@ -397,7 +397,7 @@ pub unsafe extern "C" fn PyNumber_Power(
 
 /// `PyNumber_InPlacePower(base, exponent, modulus)` — a modulus other than
 /// `None` has no in-place operator to reach, so it is refused
-/// (`number.py:146-152`).
+/// (`number.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyNumber_InPlacePower(
     base: *mut CPyObject,
@@ -423,7 +423,7 @@ pub unsafe extern "C" fn PyNumber_InPlacePower(
 }
 
 /// `PyNumber_ToBase(n, base)` — `n.__index__()` written in `base` behind its
-/// `0b`/`0o`/`0x` marker (`number.py:57-83`).
+/// `0b`/`0o`/`0x` marker (`number.py`).
 ///
 /// Any other base is a `SystemError`: the marker table has no entry for it.
 #[unsafe(no_mangle)]

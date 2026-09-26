@@ -69,7 +69,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     // ── emit_op_gc_load ──
-    // aarch64/opassembler.py:365-370 emit_op_gc_load_i/r/f
+    // aarch64/opassembler.py emit_op_gc_store emit_op_gc_load_i/r/f
     // x86/assembler.py:1645 genop_gc_load_i — size_loc/sign_loc
 
     /// `size`: byte size (1/2/4/8). Negative = signed load (for ints).

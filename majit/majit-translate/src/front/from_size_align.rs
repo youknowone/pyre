@@ -380,7 +380,7 @@ fn rewire_one_from_size_align_site(
         format!("{name}: from_size_align align {align} exceeds the target Signed max")
     })?;
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     crate::front::bool_then::validate_dynamic_option_exit(graph, graph.blocks[p].id)?;
     // The rewritten .ok() forwards Q's own input, not the now-removed P
@@ -603,7 +603,7 @@ fn rewire_one_from_size_align_expect_site(
         ));
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     let p_id = graph.blocks[p].id;
     // Drop the residual `from_size_align` call (P's last op).

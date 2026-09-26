@@ -8,7 +8,7 @@
 //! * `getitem` / `getitem_internal` (rtuple.py).
 //! * `newtuple` / `newtuple_cached` / `_rtype_newtuple` (rtuple.py).
 //! * `convert_const` / `instantiate` (rtuple.py).
-//! * pair-type / iterator / hash / eq / str (rtuple.py:200-414).
+//! * pair-type / iterator / hash / eq / str (rtuple.py).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -72,7 +72,7 @@ pub fn TUPLE_TYPE(field_lltypes: &[LowLevelType]) -> LowLevelType {
 }
 
 /// RPython `rtype_newtuple(hop): return TupleRepr._rtype_newtuple(hop)`
-/// (rtuple.py:256-257).
+/// (rtuple.py).
 pub fn rtype_newtuple(
     hop: &crate::translator::rtyper::rtyper::HighLevelOp,
 ) -> crate::translator::rtyper::rmodel::RTypeResult {
@@ -83,7 +83,7 @@ pub fn rtype_newtuple(
 pub fn dum_empty_tuple() {}
 
 /// RPython `_gen_eq_function_cache` (rtuple.py) + `gen_eq_function`
-/// (rtuple.py:31-51).
+/// (rtuple.py).
 ///
 /// ```python
 /// _gen_eq_function_cache = {}
@@ -260,7 +260,7 @@ fn lltype_shape_suffix(lltypes: &[LowLevelType]) -> String {
 /// `(1000003 * x) ^ y` mixing per item. Per-item `y_i = hash_func_i(item_i)`
 /// is dispatched via `direct_call` to the helper returned by
 /// `r_item.get_ll_hash_function()` — every item Repr must define a
-/// hash helper (rmodel.py:138 base default raises). Resolved eagerly
+/// hash helper (rmodel.py base default raises). Resolved eagerly
 /// so nested helpers register before the outer helper's builder runs.
 pub fn gen_hash_function(
     rtyper: &RPythonTyper,
@@ -371,7 +371,7 @@ fn build_gen_hash_function_graph(
     let argnames = vec!["t".to_string()];
 
     // Single-block linear graph: read each item, dispatch to its
-    // hash helper, mix into x. For n=0 (upstream rtuple.py:62 with
+    // hash helper, mix into x. For n=0 (upstream rtuple.py ll_hash with
     // empty `autounrolling_funclist`) the loop is skipped and the
     // helper returns the seed `0x345678`.
     let t_arg = variable_with_lltype("t", tuple_lltype.clone());
@@ -522,7 +522,7 @@ fn build_gen_eq_function_graph(
     let tuple_lltype = args[0].clone();
     let argnames = vec!["t1".to_string(), "t2".to_string()];
 
-    // upstream rtuple.py:39-50 — empty `autounrolling_funclist` leaves
+    // upstream rtuple.py ll_eq — empty `autounrolling_funclist` leaves
     // `equal_so_far = True`. Synthesize a single-block graph that
     // returns the constant True directly. Tuple lltype here is
     // `Void` (rtuple.py:120-121 short-circuit), so the inputargs are
@@ -782,7 +782,7 @@ pub fn pair_tuple_tuple_rtype_ne(
 }
 
 /// RPython `pairtype(TupleRepr, TupleRepr).convert_from_to`
-/// (rtuple.py:340-353):
+/// (rtuple.py):
 ///
 /// ```python
 /// def convert_from_to((r_from, r_to), v, llops):
@@ -1138,7 +1138,7 @@ fn bookkeeper_immutablevalue_for(
 }
 
 /// RPython `pairtype(TupleRepr, IntegerRepr).rtype_getitem`
-/// (rtuple.py:264-273) free-function entry. Routes through the
+/// (rtuple.py) free-function entry. Routes through the
 /// receiver `TupleRepr`'s `rtype_pair_getitem` method.
 pub fn pair_tuple_int_rtype_getitem(
     r_tup: &dyn Repr,
@@ -1181,7 +1181,7 @@ impl AbstractTupleIteratorRepr {
 }
 
 /// RPython `class Length1TupleIteratorRepr(AbstractTupleIteratorRepr)`
-/// (rtuple.py:390-395).
+/// (rtuple.py).
 #[derive(Debug)]
 pub struct Length1TupleIteratorRepr {
     pub r_tuple_lowleveltype: LowLevelType,
@@ -1570,7 +1570,7 @@ pub struct TupleRepr {
     lltype: LowLevelType,
     /// RPython `self.tuple_cache = {}` (rtuple.py). Caches the
     /// instantiated `_ptr` per `Vec<ConstValue>` key. `convert_const`
-    /// matches upstream rtuple.py:190-191 — it instantiates, inserts
+    /// matches upstream rtuple.py — it instantiates, inserts
     /// the pointer into this cache BEFORE filling fields, and then
     /// mutates the cached entry via a brief `borrow_mut` per field
     /// write so recursive `r.convert_const(obj)` calls stay
@@ -1684,7 +1684,7 @@ impl TupleRepr {
     }
 
     /// RPython `TupleRepr.getitem_internal(self, llops, v_tuple, index)`
-    /// (rtuple.py:248-253):
+    /// (rtuple.py):
     ///
     /// ```python
     /// def getitem_internal(self, llops, v_tuple, index):
@@ -1718,7 +1718,7 @@ impl TupleRepr {
     }
 
     /// RPython `TupleRepr.getitem(self, llops, v_tuple, index)`
-    /// (rtuple.py:144-150):
+    /// (rtuple.py):
     ///
     /// ```python
     /// def getitem(self, llops, v_tuple, index):
@@ -1750,7 +1750,7 @@ impl TupleRepr {
     }
 
     /// RPython `TupleRepr.newtuple(cls, llops, r_tuple, items_v)`
-    /// (rtuple.py:152-168):
+    /// (rtuple.py):
     ///
     /// ```python
     /// @classmethod
@@ -1956,7 +1956,7 @@ impl TupleRepr {
     }
 
     /// RPython `TupleRepr.newtuple_cached(cls, hop, items_v)`
-    /// (rtuple.py:170-176):
+    /// (rtuple.py):
     ///
     /// ```python
     /// @classmethod
@@ -2001,7 +2001,7 @@ impl TupleRepr {
     }
 
     /// RPython `class __extend__(TupleRepr).rtype_getslice(r_tup, hop)`
-    /// (rtuple.py:277-290):
+    /// (rtuple.py):
     ///
     /// ```python
     /// def rtype_getslice(r_tup, hop):
@@ -2184,7 +2184,7 @@ impl Repr for TupleRepr {
     /// `r.rtype_len(hop)` — without this override the default
     /// `Repr.rtype_len` would raise `MissingRTypeOperation` for tuples.
     /// Forwards to the inherent [`TupleRepr::rtype_len`] which mirrors
-    /// upstream rtuple.py:200-201.
+    /// upstream rtuple.py.
     fn rtype_len(
         &self,
         hop: &crate::translator::rtyper::rtyper::HighLevelOp,
@@ -2224,7 +2224,7 @@ impl Repr for TupleRepr {
     }
 
     /// RPython `TupleRepr.make_iterator_repr(self, variant=None)`
-    /// (rtuple.py:214-222).  A tuple is immutable, so the list foldable
+    /// (rtuple.py).  A tuple is immutable, so the list foldable
     /// flag is irrelevant here.
     #[expect(
         clippy::arc_with_non_send_sync,
@@ -2307,7 +2307,7 @@ impl Repr for TupleRepr {
             )));
         }
         if self.items_r.is_empty() {
-            // upstream rtuple.py:184-194 routes the empty case
+            // upstream rtuple.py convert_const routes the empty case
             // through `self.instantiate()` which returns
             // `dum_empty_tuple` (a Python sentinel function used as
             // a Void-typed PBC placeholder), and caches that
@@ -2333,7 +2333,7 @@ impl Repr for TupleRepr {
             ));
         }
         // upstream `p = self.instantiate()` + `self.tuple_cache[key] = p`
-        // (rtuple.py:190-191): cache the instantiated `_ptr` BEFORE
+        // (rtuple.py): cache the instantiated `_ptr` BEFORE
         // filling its fields. Pyre's `_ptr` is value-typed (Clone
         // deep-copies `_obj0`) so we cannot keep an aliased handle
         // outside the cache — instead we hold the slot in the cache
@@ -2540,7 +2540,7 @@ mod tests {
         assert!(err.to_string().contains("ll_tuplenext"));
     }
 
-    /// Verifies the upstream rtuple.py:197-198 override: the default
+    /// Verifies the upstream rtuple.py compact_repr override: the default
     /// `Repr.compact_repr` would format the wrapping struct's
     /// `short_name` (e.g. `"Ptr <gcstruct tuple2>"`) which hides per-
     /// item types. The override flattens to space-joined per-item
@@ -2738,7 +2738,7 @@ mod tests {
         );
     }
 
-    /// upstream rtuple.py:266-273 — tuple constant indexing flows
+    /// upstream rtuple.py rtype_getitem — tuple constant indexing flows
     /// through `self.fieldnames[index]` which is a Python list and
     /// supports negative indexing (`fieldnames[-1]` returns the
     /// last item). Pyre normalises `idx + len` to mirror the
@@ -3408,7 +3408,7 @@ mod tests {
 
     /// rtuple.py — `gen_eq_function([])` produces a helper whose
     /// `autounrolling_funclist` is empty so `equal_so_far = True` is
-    /// returned unchanged. Tuple lltype is `Void` (rtuple.py:120-121).
+    /// returned unchanged. Tuple lltype is `Void` (rtuple.py).
     #[test]
     fn gen_eq_function_empty_tuple_returns_constant_true_helper() {
         let (_ann, rtyper) = fresh_rtyper_live();
@@ -3874,7 +3874,7 @@ mod tests {
 
     /// rtuple.py — `gen_hash_function([])` produces a helper whose
     /// `autounrolling_funclist` is empty so `x = 0x345678` is returned
-    /// unchanged. Tuple lltype is `Void` (rtuple.py:120-121); single
+    /// unchanged. Tuple lltype is `Void` (rtuple.py); single
     /// Void inputarg.
     #[test]
     fn gen_hash_function_empty_tuple_returns_seed_only_helper() {
@@ -4048,7 +4048,7 @@ mod tests {
 
     /// `pairtype(TupleRepr, TupleRepr).convert_from_to` (rtuple.py)
     /// returns the source value unchanged when both reprs have the
-    /// same lowleveltype (rtuple.py:342-343). Different-arity tuples
+    /// same lowleveltype (rtuple.py). Different-arity tuples
     /// return `NotImplemented` (Ok(None)).
     #[test]
     fn pair_tuple_tuple_convert_from_to_identity_when_lltype_matches() {

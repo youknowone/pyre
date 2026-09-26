@@ -44,7 +44,7 @@ use crate::pyobject::PyObjectRef;
 /// - Function-call sites always create small kwarg dicts.
 /// - The JIT can fold the entire lookup loop when both size and key
 ///   are constant via `jit.look_inside_iff`.
-/// - At size ≥ 16 entries (`kwargsdict.py:62`) the strategy
+/// - At size ≥ 16 entries (`kwargsdict.py`) the strategy
 ///   auto-promotes to `UnicodeDictStrategy` to avoid degenerate O(n).
 pub struct KwargsDictStrategy;
 
@@ -72,7 +72,7 @@ pub static KWARGS_DICT_STRATEGY_REF: crate::dictmultiobject::DictStrategyRef =
     };
 
 /// `KwargsDictStrategy` backing — erased `([], [])` parallel arrays
-/// (`kwargsdict.py:27-29`). GC-managed storage box (mirrors the other
+/// (`kwargsdict.py`). GC-managed storage box (mirrors the other
 /// dict strategies; see `dictmultiobject::ObjectDictStorage`).
 pub type KwargsDictStorage = (Vec<PyObjectRef>, Vec<PyObjectRef>);
 
@@ -129,7 +129,7 @@ pub unsafe fn w_dict_switch_kwargs_to_object_strategy(w_dict: PyObjectRef) {
 const KWARGS_PROMOTE_THRESHOLD: usize = 16;
 
 /// Typed accessor for `KwargsDictStrategy.unerase(w_dict.dstorage)` —
-/// `kwargsdict.py:26-32` parallel-array shape.
+/// `kwargsdict.py` parallel-array shape.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` whose strategy is

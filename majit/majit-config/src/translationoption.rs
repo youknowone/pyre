@@ -50,10 +50,8 @@ use crate::config::{
 };
 use crate::support::detect_number_of_processors;
 
-// ---------------------------------------------------------------------
 // Upstream module-level constants. Only those consumed by the schema
 // are ported; platform-specific constants follow upstream semantics.
-// ---------------------------------------------------------------------
 
 /// Upstream `:11 DEFL_INLINE_THRESHOLD = 32.4` — "just enough to
 /// inline `add__Int_Int()` and just small enough to prevent inlining
@@ -85,11 +83,9 @@ pub const SUPPORT__THREAD: bool = cfg!(target_os = "linux") && !cfg!(target_arch
 /// constant so `ChoiceOption("platform", ...)` can reuse it.
 pub const PLATFORMS: &[&str] = &["host", "arm"];
 
-// ---------------------------------------------------------------------
 // Helpers that shape the upstream Python literal into the Rust builder
 // API. Each upstream element is ported verbatim; the helpers exist
 // only to tame the repetition.
-// ---------------------------------------------------------------------
 
 /// Short-hand: `(path, value)` → [`DependencyEdge`]. Mirrors upstream's
 /// tuple literal syntax `("translation.foo", value)` in
@@ -113,13 +109,11 @@ fn desc(d: OptionDescription) -> Child {
     Child::Description(Rc::new(d))
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:44-282 translation_optiondescription = OptionDescription(
 //     "translation", "Translation Options", [...])`
-// ---------------------------------------------------------------------
 
 /// Port of upstream `translation_optiondescription` at
-/// `translationoption.py:44-282`. Every leaf option / nested
+/// `translationoption.py`. Every leaf option / nested
 /// description mirrors upstream's entry line-for-line; ordering is
 /// preserved so reviewers can diff the two files.
 fn translation_optiondescription() -> OptionDescription {
@@ -726,9 +720,7 @@ fn translation_optiondescription() -> OptionDescription {
     OptionDescription::new("translation", "Translation Options", children)
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:284-314 get_combined_translation_config`.
-// ---------------------------------------------------------------------
 
 /// Upstream `get_combined_translation_config(other_optdescr=None,
 /// existing_config=None, overrides=None, translating=False)` at
@@ -812,9 +804,7 @@ pub fn get_combined_translation_config(
     Ok(config)
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:316-340 OPT_LEVELS / OPT_TABLE / OPT_TABLE_DOC`.
-// ---------------------------------------------------------------------
 
 /// Upstream `:318 OPT_LEVELS`.
 pub const OPT_LEVELS: &[&str] = &["0", "1", "size", "mem", "2", "3", "jit"];
@@ -868,9 +858,7 @@ fn opt_table_entry(level: &str) -> std::option::Option<&'static str> {
     }
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:342-382 set_opt_level`.
-// ---------------------------------------------------------------------
 
 /// Upstream `set_opt_level(config, level)` at `:342-382`. Applies
 /// optimisation suggestions on the `translation` subgroup of the
@@ -1003,9 +991,7 @@ pub fn set_opt_level(config: &Rc<Config>, level: &str) -> Result<(), ConfigError
     Ok(())
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:399-407 _GLOBAL_TRANSLATIONCONFIG` / `get_translation_config`.
-// ---------------------------------------------------------------------
 
 thread_local! {
     /// Upstream `:401 _GLOBAL_TRANSLATIONCONFIG = None`. The Rust port
@@ -1031,9 +1017,7 @@ fn _set_translation_config(config: std::option::Option<Rc<Config>>) {
     });
 }
 
-// ---------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

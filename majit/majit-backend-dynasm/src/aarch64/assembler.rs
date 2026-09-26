@@ -571,7 +571,7 @@ pub struct AssemblerARM64<'a> {
     /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
     /// `None` corresponds to RPython's gcremovetypeptr config.
     vtable_offset: Option<usize>,
-    /// llsupport/gc.py:563 vtable→typeid table, materialized by the runner
+    /// llsupport/gc.py get_typeid_from_classptr_if_gcremovetypeptr vtable→typeid table, materialized by the runner
     /// via gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr. Used by
     /// the gcremovetypeptr branch of `_cmp_guard_class`.
     classptr_to_typeid: IndexMap<i64, u32>,
@@ -911,9 +911,7 @@ impl<'a> AssemblerARM64<'a> {
             .propagate_exception_descr as i64
     }
 
-    // ----------------------------------------------------------------
     // Helper methods
-    // ----------------------------------------------------------------
 
     /// Emit the inline propagate-MemoryError sequence: if `reg_x` is
     /// NULL, route through the `propagate_exception_descr` exit
@@ -1317,9 +1315,7 @@ impl<'a> AssemblerARM64<'a> {
         self.emit_str_fp(0, offset);
     }
 
-    // ----------------------------------------------------------------
     // assembler.py:543 _call_header — function prologue
-    // ----------------------------------------------------------------
 
     fn setup_input_state(&mut self, inputargs: &[InputArgRc]) {
         // opref_to_slot stores ABSOLUTE jitframe slot indices so that
@@ -1361,7 +1357,7 @@ impl<'a> AssemblerARM64<'a> {
     /// the JIT glue drains the overflow flag on the way back to the
     /// interpreter.
     ///
-    /// Inline probe (aarch64/assembler.py:1099-1114 parity):
+    /// Inline probe (aarch64/assembler.py parity):
     /// ```text
     ///   gen_load_int x30, endaddr       ; load endaddr
     ///   LDR  x30, [x30]                  ; x30 = end
@@ -1446,9 +1442,7 @@ impl<'a> AssemblerARM64<'a> {
         self.setup_input_state(inputargs);
     }
 
-    // ----------------------------------------------------------------
     // assembler.py:2153 _call_footer — function epilogue
-    // ----------------------------------------------------------------
 
     /// Emit the function epilogue: return jf_ptr in RAX/X0.
     fn _call_footer(&mut self) {
@@ -1870,9 +1864,7 @@ impl<'a> AssemblerARM64<'a> {
         )))
     }
 
-    // ----------------------------------------------------------------
     // assembler.py:501 assemble_loop
-    // ----------------------------------------------------------------
 
     /// assembler.py:501 assemble_loop: compile a loop trace.
     ///
@@ -2824,7 +2816,7 @@ impl<'a> AssemblerARM64<'a> {
             // `opassembler.py:269-270 emit_op_cast_ptr_to_int =
             // _genop_same_as` / `emit_op_cast_int_to_ptr = _genop_same_as`.
             // PyPy's aarch64 backend treats both casts as plain `mov` —
-            // the AddressAsInt low-bit tag is a `blackhole.py:603-610`
+            // the AddressAsInt low-bit tag is a `blackhole.py bhimpl_cast_ptr_to_int`
             // interpreter-side invariant, not a backend codegen step.
             // See x86 sibling for the full rationale.
             OpCode::CastPtrToInt | OpCode::CastIntToPtr => {
@@ -3526,7 +3518,7 @@ impl<'a> AssemblerARM64<'a> {
             OpCode::Newstr => self.genop_newstr(op, arglocs),
             OpCode::Newunicode => self.genop_newunicode(op, arglocs),
             // ── Allocation (rewritten by GC rewriter) ──
-            // aarch64/regalloc.py:958 + assembler.py:682 malloc_cond parity
+            // aarch64/regalloc.py prepare_op_call_malloc_nursery + assembler.py:682 malloc_cond parity  allow-line-citation
             OpCode::CallMallocNursery => {
                 self.genop_call_malloc_nursery(op);
                 if let Some(Loc::Reg(r)) = result_loc
@@ -4644,7 +4636,7 @@ impl<'a> AssemblerARM64<'a> {
         // PyPy encodes each fail-arg location as a USHORT in `rd_locs`;
         // pyre allocates a const-store slot for `Loc::Immed` and writes
         // the slot into rd_locs so the deopt path reads it via PyPy's
-        // stack-position decode (`llmodel.py:422-424`).
+        // stack-position decode (`llmodel.py _decode_pos`).
         let mut const_stores: Vec<(usize, i64)> = Vec::new();
         let rd_locs: majit_ir::RdLocs = faillocs
             .iter()
@@ -4767,9 +4759,7 @@ impl<'a> AssemblerARM64<'a> {
         self.finish_gcmap = Some(token.gcmap);
     }
 
-    // ----------------------------------------------------------------
     // assembler.py:652 write_pending_failure_recoveries
-    // ----------------------------------------------------------------
 
     /// assembler.py:982 generate_quick_failure.
     ///
@@ -4973,9 +4963,7 @@ impl<'a> AssemblerARM64<'a> {
             .collect()
     }
 
-    // ----------------------------------------------------------------
     // assembler.py:965-987 patch_jump_for_descr
-    // ----------------------------------------------------------------
 
     /// Overwrite the code at `at` with a branch to `target`.
     ///
@@ -5075,9 +5063,7 @@ impl<'a> AssemblerARM64<'a> {
         majit_backend::redirect_assembler(old, new, new.number);
     }
 
-    // ----------------------------------------------------------------
     // genop_* — integer arithmetic
-    // ----------------------------------------------------------------
 
     /// INT_ADD: result = arg0 + arg1
     #[allow(dead_code)]
@@ -5198,9 +5184,7 @@ impl<'a> AssemblerARM64<'a> {
         self.store_rax_to_result(op.pos().get());
     }
 
-    // ----------------------------------------------------------------
     // genop_* — overflow arithmetic (assembler.py:1413-1425)
-    // ----------------------------------------------------------------
 
     /// assembler.py genop_int_add_ovf — delegates to genop_int_add,
     /// then sets guard_success_cc = 'NO'. On x86, ADD always sets OF.
@@ -5243,9 +5227,7 @@ impl<'a> AssemblerARM64<'a> {
         self.guard_success_cc = Some(CC_E);
     }
 
-    // ----------------------------------------------------------------
     // genop_* — comparisons
-    // ----------------------------------------------------------------
 
     /// Emit SETcc/CSET to materialize a boolean result.
     /// x64: SETcc AL; MOVZX EAX, AL
@@ -5298,9 +5280,7 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    // ----------------------------------------------------------------
     // genop_* — guards
-    // ----------------------------------------------------------------
 
     /// llsupport/gc.py GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
@@ -5475,7 +5455,7 @@ impl<'a> AssemblerARM64<'a> {
         } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
             // Finish/Jump carry no failargs; their result kind comes from
             // the argument boxes, whose types are fixed at construction
-            // (resoperation.py:719/727/739).  When neither a fail descr nor
+            // (resoperation.py InputArgInt/727/739).  When neither a fail descr nor
             // a preset fail_arg_types list supplies them, infer from the
             // arglist so the FINISH's done_with_this_frame_descr kind
             // matches the caller's CALL_ASSEMBLER result kind (a Void
@@ -5598,9 +5578,7 @@ impl<'a> AssemblerARM64<'a> {
         );
     }
 
-    // ----------------------------------------------------------------
     // genop_* — control flow
-    // ----------------------------------------------------------------
 
     /// FINISH: store result (if any), store descr ptr, return jf_ptr.
     #[allow(dead_code)]
@@ -5689,13 +5667,9 @@ impl<'a> AssemblerARM64<'a> {
         self.fail_descrs.push(descr.clone());
     }
 
-    // ----------------------------------------------------------------
     // genop_* — type conversions
-    // ----------------------------------------------------------------
 
-    // ----------------------------------------------------------------
     // Float helpers
-    // ----------------------------------------------------------------
 
     /// Load a float value from `opref` into XMM0 (x64) / D0 (aarch64).
     /// Float values are stored as bit-cast i64 in frame slots.
@@ -5738,11 +5712,9 @@ impl<'a> AssemblerARM64<'a> {
         self.emit_str_fp_d(0, offset);
     }
 
-    // ----------------------------------------------------------------
     // genop_* — float arithmetic
     // x86/assembler.py:1648 genop_float_add etc.
     // aarch64/assembler.py float equivalents
-    // ----------------------------------------------------------------
 
     /// FLOAT_ADD: result = arg0 + arg1
     #[allow(dead_code)]
@@ -5820,15 +5792,11 @@ impl<'a> AssemblerARM64<'a> {
         self.store_rax_to_result(op.pos().get());
     }
 
-    // ----------------------------------------------------------------
     // genop_* — memory operations
     // x86/assembler.py:1747 genop_getfield_gc etc.
-    // ----------------------------------------------------------------
 
-    // ----------------------------------------------------------------
     // genop_* — calls
     // x86/assembler.py _genop_call
-    // ----------------------------------------------------------------
 
     fn argloc_imm(arglocs: &[Loc], index: usize) -> i64 {
         match arglocs.get(index) {
@@ -5837,7 +5805,7 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    /// aarch64/opassembler.py _emit_call + aarch64/callbuilder.py:21-67
+    /// aarch64/opassembler.py _emit_call + aarch64/callbuilder.py prepare_arguments
     /// prepare_arguments.
     ///
     /// Register-to-ABI-reg shuffles must go through remap_frame_layout to
@@ -6421,11 +6389,9 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    // ----------------------------------------------------------------
     // genop_* — allocation
     // x86/assembler.py:2338 genop_new etc.
     // These require GC runtime support. Emit trap for now.
-    // ----------------------------------------------------------------
 
     /// NEW: allocate a fixed-size object. Requires GC runtime.
     /// Emits a trap (UD2/BRK) until GC nursery allocation is wired.
@@ -6455,7 +6421,7 @@ impl<'a> AssemblerARM64<'a> {
         // `ARMRegisterManager.return_constant` (aarch64/regalloc.py), which
         // materializes every Const into a scratch register. The shared
         // `RegisterManager::return_constant` follows the llsupport spelling
-        // (llsupport/regalloc.py:625) and can hand back a bare `Loc::Immed`,
+        // (llsupport/regalloc.py) and can hand back a bare `Loc::Immed`,
         // so state the contract instead of emitting nothing — a barrier that
         // assembles to zero bytes stays invisible until it corrupts memory.
         let loc_base = match arglocs.first() {
@@ -6742,7 +6708,7 @@ impl<'a> AssemblerARM64<'a> {
             return;
         }
 
-        // aarch64/assembler.py:682-708 uses only x0/x1 plus the reserved IP
+        // aarch64/assembler.py malloc_cond uses only x0/x1 plus the reserved IP
         // scratch registers.  Keep x2..x13 available to regalloc on the fast
         // path; the collecting slow path spills/restores them below.
         self.emit_mov_imm64(16, nf_addr as i64);
@@ -6997,13 +6963,9 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    // ----------------------------------------------------------------
     // genop_* — misc
-    // ----------------------------------------------------------------
 
-    // ================================================================
     // assembler.py genop_save_exc_class / genop_save_exception
-    // ================================================================
 
     /// assembler.py genop_save_exc_class:
     /// `MOV resloc, [pos_exception]`.  The regalloc always assigns the
@@ -7053,9 +7015,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64 ; str x17, [x16]);
     }
 
-    // ================================================================
     // genop_* — extended integer arithmetic
-    // ================================================================
 
     /// UINT_MUL_HIGH: upper 64 bits of unsigned multiply
     #[allow(dead_code)]
@@ -7087,9 +7047,7 @@ impl<'a> AssemblerARM64<'a> {
         self.store_rax_to_result(op.pos().get());
     }
 
-    // ================================================================
     // genop_* — extended float operations
-    // ================================================================
 
     /// FLOAT_ABS: result = |arg0|
     #[allow(dead_code)]
@@ -7123,9 +7081,7 @@ impl<'a> AssemblerARM64<'a> {
         self.store_d0_to_result(op.pos().get());
     }
 
-    // ================================================================
     // genop_* — GC memory operations
-    // ================================================================
 
     /// Emit a sized store of rcx/x1 to [rax]/[x0].
     #[allow(dead_code)]
@@ -7193,13 +7149,9 @@ impl<'a> AssemblerARM64<'a> {
         self.emit_store_to_rax_sized(itemsize);
     }
 
-    // ================================================================
     // genop_* — interior field operations
-    // ================================================================
 
-    // ================================================================
     // genop_* — call variants
-    // ================================================================
 
     /// COND_CALL_N: if arg(0) != 0, call function at arg(1).
     ///
@@ -7290,9 +7242,7 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    // ================================================================
     // genop_* — string/array operations
-    // ================================================================
 
     /// aarch64/opassembler.py `emit_op_load_effective_address` /
     /// `_gen_address`: `result = base + (index << scale) + static_offset`.
@@ -7502,7 +7452,7 @@ impl<'a> AssemblerARM64<'a> {
         };
         let (scale_start, scale_size) = (scale_start.value, scale_size.value);
 
-        // aarch64/opassembler.py:755-839: first compute the byte destination
+        // aarch64/opassembler.py emit_op_zero_array: first compute the byte destination
         // in ip0/x16.  ip0/ip1 are never managed by regalloc.
         self.regalloc_mov(base_loc, &Loc::Reg(crate::aarch64::registers::X16));
         if let Loc::Immed(start) | Loc::ImmedFloat(start) = start_loc {
@@ -7615,9 +7565,7 @@ impl<'a> AssemblerARM64<'a> {
         );
     }
 
-    // ================================================================
     // genop_* — address computation
-    // ================================================================
 }
 
 /// Flush icache — aarch64 only.
@@ -7654,7 +7602,7 @@ mod tests {
 
     use crate::runner::DynasmBackend;
 
-    /// aarch64/regalloc.py:958-977 keeps CALL_MALLOC_NURSERY's result in x0;
+    /// aarch64/regalloc.py prepare_op_call_malloc_nursery keeps CALL_MALLOC_NURSERY's result in x0;
     /// only FrameManager may decide to spill it later.  The old hybrid emitter
     /// also called `allocate_slot` unconditionally, growing every recursive
     /// loop's JitFrame for an otherwise register-resident allocation result.
@@ -7960,7 +7908,7 @@ mod tests {
     /// `index_in_register` selects which argloc kind the emitter sees:
     /// a non-constant `InputArg` is forced into a core register, while a
     /// `ConstInt` reaches `RegisterManager::return_constant`
-    /// (llsupport/regalloc.py:625) with no selected register and comes back
+    /// (llsupport/regalloc.py) with no selected register and comes back
     /// as a bare `Loc::Immed`.
     fn run_cond_call_gc_wb_array(trace_id: u64, obj: GcRef, index: i64, index_in_register: bool) {
         let mut backend = DynasmBackend::new();

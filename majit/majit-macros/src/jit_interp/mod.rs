@@ -93,7 +93,7 @@ pub struct JitInterpConfig {
     /// `(value_bits, GreenType::<tag>)` pair so str / unicode greens route
     /// through the hardcoded `default_str_eq` / `default_str_hash` /
     /// `default_unicode_hash` in `majit-ir/src/value.rs`
-    /// (`warmstate.py:108-128 lltype.Ptr STR/UNICODE` parity, no
+    /// (`warmstate.py equal_whatever lltype.Ptr STR/UNICODE` parity, no
     /// frontend override).
     pub green_type_tags: Vec<Option<green_type_tag::GreenTypeTag>>,
     /// Virtualizable frame field declaration.
@@ -521,7 +521,7 @@ pub struct RefFieldEntry {
 /// field has one descr for a whole family of outer structs, however many of
 /// them exist.
 ///
-/// The base must be the leading field. `lltype.py:296-305` admits an inlined
+/// The base must be the leading field. `lltype.py _first_struct` admits an inlined
 /// substructure only at `_names[0]`, and the offset arithmetic depends on it:
 /// a redirected access keeps the outer pointer in its register and offsets by
 /// the field's position within the *base*, which names the right word only when
@@ -3242,7 +3242,7 @@ fn rewrite_body(
     /// it is what makes `back_edge_structured`'s key equal the key the merge
     /// point at that target derives (`TraceCtx::merge_point_green_key_hash`) —
     /// which is the key `compile_loop` files the loop under
-    /// (pyjitpl.py:3183-3189 `original_boxes[:num_green_args]`).  Without it the
+    /// (pyjitpl.py `original_boxes[:num_green_args]`).  Without it the
     /// loop is stored under a key nothing enters: the interpreter's
     /// `has_compiled_loop` misses forever, every back edge re-arms tracing, and
     /// the compiled artifact is never executed.
@@ -3266,7 +3266,7 @@ fn rewrite_body(
             // Per-green dispatch through `majit_ir::GreenAsI64::__green_repr`
             // so the `(i64-bits, GreenType)` pair travels together for each
             // green expression. `with_types` builds the typed schema;
-            // `warmstate.py:575 _green_args_spec` keys per-type
+            // `warmstate.py comparekey _green_args_spec` keys per-type
             // `equal_whatever`/`hash_whatever` off the green's lltype, so a
             // Ref-typed green must compare by pointer identity, a Float by
             // bit pattern, and an Int by raw value — collapsing all to
@@ -3278,7 +3278,7 @@ fn rewrite_body(
             // `Vec<Option<GreenTypeTag>>` carried alongside `greens`
             // (`JitInterpConfig.green_type_tags`).  Tagged greens
             // bypass the trait dispatch with explicit casts so str /
-            // unicode greens carry `GreenType::Str` (warmstate.py:108-128
+            // unicode greens carry `GreenType::Str` (warmstate.py
             // ll_streq / ll_strhash routing).  Untagged greens
             // (`None`) keep the trait path unchanged.
             let green_reprs: Vec<TokenStream> = greens
@@ -3310,7 +3310,7 @@ fn rewrite_body(
             // `get_uhash` unrolled over the declared greens — the count and
             // types are known here, exactly as upstream's
             // `green_args_name_spec` is fixed per JitCell class at
-            // translation time (warmstate.py:584-593). No `values` /
+            // translation time (warmstate.py). No `values` /
             // `types` vectors are built to hash.
             let fold: Vec<TokenStream> = slots
                 .iter()
@@ -3394,7 +3394,7 @@ fn rewrite_body(
                     //
                     // RPython parity: source-level jit_merge_point() is a codewriter
                     // marker; the runtime hook is the JitCode IR op
-                    // (interp_jit.py:88-90).
+                    // (interp_jit.py).
                     //
                     // The `is_tracing()` guard here is a hot-path short-circuit
                     // (avoids the cold `__merge_*` call when not tracing).  It does NOT
@@ -3419,7 +3419,7 @@ fn rewrite_body(
                                     #pc,
                                     #(#portal_green_args),*
                                 );
-                                // pyjitpl.py:2949
+                                // pyjitpl.py run_blackhole_interp_to_cancel_tracing
                                 // run_blackhole_interp_to_cancel_tracing: an
                                 // abort can stop mid-source-opcode, where the
                                 // walk's own pc names no resume position. The
@@ -3512,7 +3512,7 @@ fn rewrite_body(
                                     #driver.arm_single_pass_label_entry_on_next_back_edge(
                                         &#state,
                                     );
-                                    // RPython pyjitpl.py:3119-3123 ->
+                                    // RPython pyjitpl.py raise_if_successful ->
                                     // 3072-3091 parity: a successful translated
                                     // CloseLoop raises ContinueRunningNormally,
                                     // returning to the interpreter. The compiled

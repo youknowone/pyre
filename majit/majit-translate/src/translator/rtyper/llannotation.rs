@@ -8,11 +8,11 @@
 //! Upstream, this module hosts:
 //!
 //! * `annotation_to_lltype` / `lltype_to_annotation` / `ll_to_annotation`
-//!   (llannotation.py:147-200).
+//!   (llannotation.py).
 //! * `class SomeInteriorPtr(SomePtr)` (llannotation.py).
 //! * `class SomeLLADTMeth(SomeObject)` (llannotation.py).
 //! * `pairtype(SomePtr, SomeInteger)` / `pairtype(SomePtr, SomeObject)`
-//!   binary dispatch (llannotation.py:100-128).
+//!   binary dispatch (llannotation.py).
 //!
 //! In addition, upstream's `class SomePtr` (lltype.py) hosts
 //! its own `getattr` / `setattr` / `len` / `bool` / `call` methods —
@@ -36,9 +36,7 @@ use crate::flowspace::model::{ConstValue, Constant};
 use crate::flowspace::operation::{CanOnlyThrow, HLOperation, OpKind, Specialization, pure};
 use crate::tool::pairtype::DoubleDispatchRegistry;
 
-// =====================================================================
-// llannotation.py:147-200 — annotation ⇄ lltype helpers.
-// =====================================================================
+// llannotation.py annotation_to_lltype — annotation ⇄ lltype helpers.
 
 /// RPython `annotation_to_ll_map` (llannotation.py).
 fn annotation_to_ll_map() -> Vec<(SomeValue, lltype::LowLevelType)> {
@@ -195,9 +193,7 @@ pub fn ll_to_annotation(v: lltype::LowLevelValue) -> SomeValue {
     lltype_to_annotation(lltype::typeOf_value(&v))
 }
 
-// =====================================================================
 // lltype.py — SomePtr pointer-specific methods.
-// =====================================================================
 
 impl SomePtr {
     /// RPython `SomePtr.bool(self)` (lltype.py).
@@ -339,9 +335,7 @@ impl SomePtr {
     }
 }
 
-// =====================================================================
 // llannotation.py — class SomeInteriorPtr(SomePtr)
-// =====================================================================
 
 /// RPython `class SomeInteriorPtr(SomePtr)` (llannotation.py).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -424,7 +418,7 @@ impl SomeInteriorPtr {
         // `None.knowntype` at the first slot that is unbound.  Per-touch
         // [`arg_at`] mirror so an unannotated slot panics with the call
         // boundary name + slot index at the same iteration upstream
-        // would raise (`unaryop.py:940 simple_call_SomeBuiltin` bind-
+        // would raise (`unaryop.py simple_call_SomeBuiltin` bind-
         // then-body sequence).
         let llargs = (0..args_s_opt.len())
             .map(|i| {
@@ -479,9 +473,7 @@ impl SomeObjectTrait for SomeInteriorPtr {
     }
 }
 
-// =====================================================================
 // llannotation.py — class SomeLLADTMeth(SomeObject)
-// =====================================================================
 
 /// RPython `class SomeLLADTMeth(SomeObject)` (llannotation.py).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -528,9 +520,7 @@ impl SomeObjectTrait for SomeLLADTMeth {
     }
 }
 
-// =====================================================================
-// llannotation.py:100-128 — pairtype(SomePtr, SomeInteger/Object)
-// =====================================================================
+// llannotation.py __extend__ — pairtype(SomePtr, SomeInteger/Object)
 
 /// Register the `SomePtr`/`SomeInteger` and `SomePtr`/`SomeObject`
 /// pair dispatch tables. Invoked from `annotator::binaryop::init` at
@@ -692,9 +682,7 @@ fn init_ptr_object_pairtype(
     );
 }
 
-// =====================================================================
-// llannotation.py:15-48 — address-family pair dispatch.
-// =====================================================================
+// llannotation.py __extend__ — address-family pair dispatch.
 
 /// Register the `SomeTypedAddressAccess`/`SomeInteger` getitem/setitem,
 /// `SomeAddress`/`SomeInteger` add/sub, and `SomeAddress`/`SomeAddress`
@@ -808,7 +796,7 @@ fn typed_address_access_integer_setitem(
     None
 }
 
-/// llannotation.py:19-23 — `addr - addr`. Both null-address constants
+/// llannotation.py sub — `addr - addr`. Both null-address constants
 /// fold to the constant `0`; otherwise a plain `SomeInteger`.
 fn address_address_sub(
     ann: &crate::annotator::annrpython::RPythonAnnotator,

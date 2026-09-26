@@ -11,7 +11,7 @@ use crate::flowspace::bytecode::{CoFlags, HostCode};
 use crate::flowspace::model::{Constant, GraphFunc, HostObject};
 
 /// RPython `sourcetools.render_docstr(func, indent_str='',
-/// closing_str='')` (`sourcetools.py:10-27`), specialised to an
+/// closing_str='')` (`sourcetools.py`), specialised to an
 /// already-extracted doc string.
 pub fn render_docstr(
     doc: Option<&str>,
@@ -41,7 +41,7 @@ pub fn render_docstr(
 pub const PY_IDENTIFIER_MAX: usize = 120;
 
 /// RPython `rpython.tool.sourcetools.valid_identifier`
-/// (`sourcetools.py:241-245`).
+/// (`sourcetools.py`).
 ///
 /// Translate `stuff` through `PY_IDENTIFIER` (every byte that is not
 /// `[0-9A-Za-z]` becomes `_`), prepend `_` if the first byte is
@@ -62,13 +62,13 @@ pub fn valid_identifier(stuff: impl std::fmt::Display) -> String {
 }
 
 /// RPython `has_varargs(func)` for callers that already have
-/// `co_flags` (`sourcetools.py:250-252`).
+/// `co_flags` (`sourcetools.py`).
 pub fn has_varargs_flags(co_flags: u32) -> bool {
     (co_flags & CoFlags::VARARGS.bits()) != 0
 }
 
 /// RPython `has_varkeywords(func)` for callers that already have
-/// `co_flags` (`sourcetools.py:254-256`).
+/// `co_flags` (`sourcetools.py`).
 pub fn has_varkeywords_flags(co_flags: u32) -> bool {
     (co_flags & CoFlags::VARKEYWORDS.bits()) != 0
 }
@@ -122,7 +122,7 @@ pub fn has_varkeywords_code(code: &HostCode) -> bool {
 /// caller that hands real globals through gets upstream-shaped
 /// module names. Synthetic callers that hand an empty globals Dict
 /// see `"?"` — exactly upstream's `module = '?'` default at
-/// `sourcetools.py:265-266`.
+/// `sourcetools.py`.
 pub fn nice_repr_for_func(func: &GraphFunc, name: Option<&str>) -> String {
     let display_name = name
         .map(str::to_string)
@@ -138,7 +138,7 @@ pub fn nice_repr_for_func(func: &GraphFunc, name: Option<&str>) -> String {
 }
 
 /// RPython `func_with_new_name(func, newname, globals=None)`
-/// (`sourcetools.py:217-227`) over the Rust `GraphFunc` carrier.
+/// (`sourcetools.py`) over the Rust `GraphFunc` carrier.
 ///
 /// Upstream re-binds the function to a fresh Python `types.FunctionType`
 /// reusing `__code__`, `__defaults__`, and `__closure__`, then copies

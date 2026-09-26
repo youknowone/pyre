@@ -51,7 +51,7 @@ pub struct DataFlowFamilyBuilder {
 
 impl DataFlowFamilyBuilder {
     /// RPython `DataFlowFamilyBuilder.__init__(self, graph)`
-    /// (ssa.py:12-36).
+    /// (ssa.py).
     ///
     /// ```python
     /// def __init__(self, graph):
@@ -226,7 +226,7 @@ impl DataFlowFamilyBuilder {
     }
 
     /// RPython `DataFlowFamilyBuilder.merge_identical_phi_nodes(self)`
-    /// (ssa.py:65-86).
+    /// (ssa.py).
     #[expect(
         clippy::mutable_key_type,
         reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
@@ -271,7 +271,7 @@ impl DataFlowFamilyBuilder {
     }
 
     /// RPython `DataFlowFamilyBuilder.get_variable_families(self)`
-    /// (ssa.py:88-90).
+    /// (ssa.py).
     ///
     /// ```python
     /// def get_variable_families(self):

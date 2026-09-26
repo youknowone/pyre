@@ -52,7 +52,7 @@ pub(crate) trait IntBoundMakeGuards {
     ///
     /// RPython relies on Python-object identity: `op = ResOperation(...)`
     /// and then `[op]` references the same object as the next guard's
-    /// first argument (intutils.py:1275-1284). Pyre's flat-OpRef model
+    /// first argument (intutils.py). Pyre's flat-OpRef model
     /// has no implicit identity, so each `INT_GE` / `INT_LE` / `INT_AND`
     /// producer allocates a fresh Int OpRef into `op.pos` *before* the
     /// consumer guard is constructed. Constants land in the constant

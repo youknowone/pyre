@@ -383,7 +383,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
 
     // RPython parity: every `FunctionGraph::set_concretetype_of_inline(&var, ct)`
     // above publishes the resolved kind on each Variable's
-    // `concretetype` cell, matching `rtyper.py:258 v.concretetype = ...`.
+    // `concretetype` cell, matching `rtyper.py setconcretetype v.concretetype = ...`.
     // Downstream consumers read kinds via
     // `FunctionGraph::concretetype_of(&v)` (i.e.
     // `getkind(v.concretetype)`) directly without a separate
@@ -431,7 +431,7 @@ fn convert_link(graph: &FunctionGraph, link: &Link) {
         // mirrors RPython `_convert_link()` materialising
         // `inputconst(r_to, value)` whose own `concretetype` is the
         // destination repr (`rpython/rtyper/rmodel.py:inputconst`
-        // + `rpython/rtyper/rnone.py:48`).  Force-write so an
+        // + `rpython/rtyper/rnone.py convert_from_to`).  Force-write so an
         // earlier annotation-derived kind (e.g. `Ref → GcRef` from
         // `valuetype_to_concrete` on the upstream `SomeNone → Ref`
         // projection) does not shadow it.
@@ -530,7 +530,7 @@ fn link_arg_concrete_type(src: &LinkArg) -> ConcreteType {
         // construction sites that already know the target repr write
         // it onto `Constant.concretetype` at the construction site
         // (e.g. `set_return` wires `Constant(None, concretetype=Void)`
-        // per `flowcontext.py:687-689` + `:1232-1236`); honour that
+        // per `flowcontext.py RETURN_VALUE` + `:1232-1236`); honour that
         // construction-site hint here.  Falls back to the value-only
         // default (`getkind(Ptr) == GcRef` for None) when the
         // construction site did not set a target repr.
@@ -564,7 +564,7 @@ fn maybe_seed_concrete_type(dst: &Variable, src_ty: ConcreteType) -> bool {
     if FunctionGraph::concretetype_of(dst) == ConcreteType::Unknown
         && src_ty != ConcreteType::Unknown
     {
-        // RPython parity: `rtyper.py:258 v.concretetype = ...` writes the
+        // RPython parity: `rtyper.py setconcretetype v.concretetype = ...` writes the
         // resolved kind inline on the Variable as soon as the resolver
         // knows it.  Pyre's iterative build mirrors that by publishing
         // through the Variable cell so subsequent `concretetype_of(dst)`

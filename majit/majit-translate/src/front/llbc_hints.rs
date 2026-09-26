@@ -99,7 +99,7 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
             // const's *value*, so decode the string literal and emit a
             // companion `oopspec:<spec>` hint that `lib.rs` consumes via
             // `CallControl::mark_oopspec` — which `guess_call_kind` then
-            // classifies as `CallKind::Builtin` (call.py:135-136).
+            // classifies as `CallKind::Builtin` (call.py).
             if leaf.starts_with("oopspec_") {
                 // Fail fast like the `_jit_look_inside_` arm above: the macro
                 // emits a literal string, so an undecodable initializer is a

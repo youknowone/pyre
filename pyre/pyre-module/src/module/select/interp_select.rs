@@ -9,7 +9,7 @@ use pyre_object::PyObjectRef;
 ///
 /// Holds the registered `{fd: events}` map and a re-entrancy guard.
 /// Instances are created only through the module-level `select.poll()`
-/// factory (`interp_select.py:18`); the type has no public constructor.
+/// factory (`interp_select.py`); the type has no public constructor.
 #[cfg(all(unix, feature = "host_env"))]
 // CPython 3.14 Modules/selectmodule.c:select_exec uses
 // PyType_FromModuleAndSpec; poll_Type_spec is a mutable heap type.
@@ -287,7 +287,7 @@ fn selectable_fd(
 /// Dispose of a failed `select()`.  `Ok` means the call was interrupted and
 /// the caller must retry it with the remaining timeout.
 ///
-/// `interp_select.py:182` — an EINTR return delivers the pending signal first,
+/// `interp_select.py` — an EINTR return delivers the pending signal first,
 /// so a handler that raises (KeyboardInterrupt) wins over the retry.
 #[cfg(all(unix, feature = "host_env"))]
 fn select_failure(e: std::io::Error) -> Result<(), pyre_interpreter::PyError> {
@@ -521,7 +521,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     #[cfg(all(unix, feature = "host_env"))]
     {
         // Force the `select.poll` type to register so instances carry a
-        // valid `ob_type`.  `interp_select.py:123
+        // valid `ob_type`.  `interp_select.py
         // Poll.typedef.acceptable_as_base_class = False`.
         let _ = type_object();
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(type_object(), false) };

@@ -80,7 +80,7 @@ pub(crate) enum RrcList {
     O,
 }
 
-/// The collector's rawrefcount section — `incminimark.py:3172-3183
+/// The collector's rawrefcount section — `incminimark.py rawrefcount_init
 /// rawrefcount_init` allocates exactly these.
 ///
 /// `enabled` is `rrc_enabled`: every phase call site is guarded on it, so a
@@ -160,7 +160,7 @@ pub type FinalizerClaimFn = fn(usize) -> bool;
 /// Mirrors do not move, so what it reads is stable either way.
 ///
 /// Upstream has no counterpart.  `rawrefcount` keeps a mirror's object alive on
-/// the bare count (`incminimark.py:3259-3270`) and pypy's `cpyext` never reads
+/// the bare count (`incminimark.py _rrc_minor_trace`) and pypy's `cpyext` never reads
 /// `tp_traverse`, so a cycle through C is uncollectable there.  The one upstream
 /// precedent for the shape is `_hpy_universal`'s tracer
 /// (`pypy/module/_hpy_universal/interp_type.py:44,103-113`), which calls a

@@ -83,7 +83,7 @@ pub trait Cpu: Send + Sync {
     /// `majit_gc::subclass_range`.
     ///
     /// When `supports_guard_gc_type == False` (the boehm-style pyre
-    /// default) only the null check fires, matching `llmodel.py:556-557`.
+    /// default) only the null check fires, matching `llmodel.py`.
     ///
     /// **Fail-closed under `supports_guard_gc_type == true`:** PyPy
     /// asserts the field descr has a `parent_descr` and reaches into

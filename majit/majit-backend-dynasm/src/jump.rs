@@ -27,7 +27,7 @@ use indexmap::IndexMap;
 ///
 /// **Operand contract.** A destination is a register or a frame-pointer
 /// location in either spelling — `Loc::Frame`, which knows its stack position,
-/// or the bare `Loc::Ebp`, which does not (`regloc.py:113 class
+/// or the bare `Loc::Ebp`, which does not (`regloc.py class
 /// FrameLoc(RawEbpLoc)`). A source is one of those or an immediate. The one
 /// location left out is `Loc::Addr`, which upstream cannot key either. An
 /// implementation must fault on anything outside this rather than emit
@@ -82,7 +82,7 @@ pub(crate) fn loc_as_key(loc: &Loc) -> i32 {
         Loc::Immed(_) | Loc::ImmedFloat(_) => i32::MIN,
         // `AddressLoc` is the one location class upstream leaves without a key:
         // it overrides neither `_getregkey` nor, for its `'a'`/`'m'` codes, the
-        // `value` the inherited one reads (`regloc.py:207-250`), so a parallel
+        // `value` the inherited one reads (`regloc.py`), so a parallel
         // move handed one raises there as well. Minting a key here instead
         // would put an entry in `pending_dests` that no emitter can retire.
         Loc::Addr(a) => panic!(

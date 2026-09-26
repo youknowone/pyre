@@ -2,7 +2,7 @@
 //!
 //! RPython's `RPythonAnnotator.complete()` attaches a `SomeValue`
 //! directly to each `Variable.annotation` slot on the flowgraph
-//! (`rpython/annotator/annrpython.py:54-66`,
+//! (`rpython/annotator/annrpython.py`,
 //! `rpython/flowspace/model.py: Variable.annotation`).  Pyre writes the
 //! same lattice node into `Variable.annotation` via
 //! [`crate::translator::rtyper::legacy_annotator::setbinding`], which
@@ -70,7 +70,7 @@ pub(crate) fn dump_classdef_less_ref_census() {}
 /// |--------------------|------------------------|--------------------------|
 /// | `Int`              | `Integer(SomeInteger)` | `model.py` -> `SomeValue::Integer` arm. |
 /// | `Float`            | `Float(SomeFloat)`     | `model.py` -> `SomeValue::Float` arm. |
-/// | `Ref(_)`           | `Instance(SomeInstance{classdef:None,..})` | `model.py`.  Typed pointers should lift to `SomePtr(ll_ptrtype)` (`llannotation.py:64-70`), but the correct Ptr must come from the producer writing `Variable.annotation` directly — not from a process-global root-string lookup.  This fallback projection keeps all Ref variants classdef-less → `GcRef` via `rclass.py:445-447`. |
+/// | `Ref(_)`           | `Instance(SomeInstance{classdef:None,..})` | `model.py`.  Typed pointers should lift to `SomePtr(ll_ptrtype)` (`llannotation.py:64-70`), but the correct Ptr must come from the producer writing `Variable.annotation` directly — not from a process-global root-string lookup.  This fallback projection keeps all Ref variants classdef-less → `GcRef` via `rclass.py`. |  allow-line-citation
 /// | `Void`             | `Impossible`           | `model.py:627` -> `SomeValue::Impossible` arm. |
 /// | `State`            | `Instance(SomeInstance{classdef:None,..})` | **TODO: no upstream equivalent**.  Pyre-only `State` carries the JIT state pointer (a struct pointer to interpreter state).  RPython has no analogue; the `SomeInstance(classdef=None)` projection is a temporary fallback that lets the rtyper proceed without a real bookkeeper-attached pyre `ClassDef`.  Projects to `GcRef` via the same chain as `Ref`. |
 /// | `Unknown`          | `None`                 | **Fail-loud — annotation gap with no annotation-stage shell.**  RPython's annotator never produces an unknown lattice node — every Variable is annotated with a definite `SomeValue`, and unreachable code stays at `SomeImpossible`.  Pyre's `Unknown` is a coverage gap (annotator did not narrow / producer did not call `set_some`).  Returning `None` leaves `Variable.annotation` empty so `bindingrepr` panics with `KeyError: no binding for arg` (`annotator/annrpython.rs`'s `binding`) on the first attempt to lower the affected `Variable`, surfacing the producer-side gap rather than silently bridging it to `GcRef` via a fabricated `SomeInstance(None)` shell — that bridging conflated an *annotation-stage* lattice node with the **legacy** `resolve_types(Unknown) -> ConcreteType::Unknown -> GcRef` resolver-stage backfill. |
@@ -137,7 +137,7 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             // and bypasses RPython's object-identity-based lltype cache.
             // The MIR front-end does not attach a per-`&Foo`-input
             // lltype `Ptr` to `Variable.annotation` (the faithful
-            // counterpart of `lltype.py:1513-1518
+            // counterpart of `lltype.py
             // _ptrEntry.compute_annotation`), so every `Ref` input
             // shells to the classdef-less `SomeInstance` here rather
             // than fabricating a `Ptr` from a bare name.  Routing a

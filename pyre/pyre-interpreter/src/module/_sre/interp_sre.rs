@@ -157,7 +157,7 @@ fn sre_match_receiver(args: &[PyObjectRef]) -> Result<*const W_SRE_Match, crate:
 /// W_SRE_Pattern.typedef (interp_sre.py): instance methods are
 /// registered on the type so `pat.match(s)` binds `pat` as `self`,
 /// plus the `flags` / `groupindex` / `groups` / `pattern` attribute
-/// properties (interp_sre.py:662-667).
+/// properties (interp_sre.py).
 pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
     // interp_sre.py `__new__ = interp2app(SRE_Pattern__new__)`.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -339,7 +339,7 @@ pub(crate) fn init_sre_match_type(ns: PyObjectRef) {
         "expand",
         make_builtin_function("expand", sre_match_expand),
     ) };
-    // interp_sre.py:873-875 `__copy__`/`__deepcopy__`/`__repr__`
+    // interp_sre.py fget_endpos `__copy__`/`__deepcopy__`/`__repr__`
     // (copy_identity_w returns self — match results are immutable).
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
@@ -639,7 +639,7 @@ fn get_code(pat: PyObjectRef) -> Option<&'static [u32]> {
 /// `_index_to_byte` (`unicodeobject.py`) — the byte offset of a character
 /// index, read through the object's cached index storage.  An index at or past
 /// the end is the end of the payload, which is the bound `make_ctx` applies to
-/// `endpos` (interp_sre.py:243-244).
+/// `endpos` (interp_sre.py).
 #[inline]
 fn char_to_byte(obj: PyObjectRef, char_pos: usize) -> usize {
     let s = unsafe { w_str_get_wtf8(obj) };
@@ -662,7 +662,7 @@ fn byte_slice(b: &'static [u8], start: i64, end: i64) -> Option<&'static [u8]> {
 }
 
 /// Clamp `pos`/`endpos` into `[0, len]` with `endpos >= pos` (make_ctx's
-/// position fixup, interp_sre.py:224-227/272-275).  `len` is the subject
+/// position fixup, interp_sre.py/272-275).  `len` is the subject
 /// length in the engine's position units (characters for `str`, bytes for
 /// a bytes-like subject).
 fn normalize_bounds(len: usize, pos: i64, endpos: i64) -> (usize, usize) {
@@ -677,7 +677,7 @@ fn normalize_bounds(len: usize, pos: i64, endpos: i64) -> (usize, usize) {
 /// The subject of a match: a unicode `str` (the sre-engine driver reports
 /// character positions and slices back to `str`) or a bytes-like buffer
 /// (byte positions, slices back to `bytes`).  Mirrors make_ctx's
-/// Utf8/Str/BufMatchContext split (interp_sre.py:220-285).
+/// Utf8/Str/BufMatchContext split (interp_sre.py).
 ///
 /// A `str` subject is driven over its `Wtf8` backing rather than a `&str`
 /// view: the engine walks code points, and a lone surrogate is a code point
@@ -686,7 +686,7 @@ fn normalize_bounds(len: usize, pos: i64, endpos: i64) -> (usize, usize) {
 #[derive(Clone, Copy)]
 enum Subject {
     /// `UnicodeAsciiMatchContext` (interp_sre.py), selected by `is_ascii()`
-    /// at interp_sre.py:246 — one byte per code point, so a character position
+    /// at interp_sre.py — one byte per code point, so a character position
     /// *is* a byte offset and the engine drives the payload as bytes.
     /// `StrDrive` carries no semantics of its own (it is `count` and cursor
     /// arithmetic; every unicode decision keys on the compiled pattern's
@@ -717,7 +717,7 @@ impl Subject {
 }
 
 /// The subject for a `str` (or `str` subclass) — `make_ctx`'s `is_ascii()`
-/// split (interp_sre.py:246-250).
+/// split (interp_sre.py).
 ///
 /// # Safety
 /// `string` must point to a valid `W_UnicodeObject`.
@@ -1227,7 +1227,7 @@ fn do_match(
 }
 
 /// Flatten the engine marks into the span table `do_flatten_marks`
-/// (interp_sre.py:84-98) would produce, with group 0 (the whole match)
+/// (interp_sre.py) would produce, with group 0 (the whole match)
 /// prepended.  The table is sized by the pattern's `num_groups` (filled
 /// with `(-1, -1)` before copying the marks); the engine only
 /// materialises marks up to the last touched group.  Positions are
@@ -1648,7 +1648,7 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         let (mstart, mend) = snap.spans[0];
         // interp_sre.py:393 — the slice preceding this match.
         append_slice((last, mstart), w_empty);
-        // interp_sre.py:396-399 — interleave each group's capture; an
+        // interp_sre.py split_w — interleave each group's capture; an
         // unmatched group span `(-1, -1)` becomes None via slice_subject.
         for g in 1..=num_groups {
             append_slice(snap.spans[g], w_none());
@@ -1674,7 +1674,7 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 
 /// A parsed replacement-template element: either a literal run or a
 /// reference to group `n` (0 = whole match) — `parse_template`'s result
-/// list (`re/_parser.py:990-1066`).
+/// list (`re/_parser.py`).
 enum TemplateItem {
     /// A literal run, stored as raw bytes (UTF-8 for a `str` template).
     Literal(Vec<u8>),

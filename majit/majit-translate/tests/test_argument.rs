@@ -11,7 +11,7 @@ use majit_translate::flowspace::argument::{CallSpec, Signature};
 use majit_translate::flowspace::model::{ConstValue, Constant, Hlvalue};
 use std::collections::HashMap;
 
-// ---- TestSignature ----
+// TestSignature
 
 #[test]
 fn test_helpers() {
@@ -93,7 +93,7 @@ fn test_tuply() {
     assert_eq!(z, Some("e"));
 }
 
-// ---- module-level `test_flatten_CallSpec` ----
+// module-level `test_flatten_CallSpec`
 
 fn hi(n: i64) -> Hlvalue {
     Hlvalue::Constant(Constant::new(ConstValue::Int(n)))

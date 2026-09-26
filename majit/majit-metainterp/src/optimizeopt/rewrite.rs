@@ -821,7 +821,7 @@ impl OptRewrite {
                         return OptimizationResult::PassOn;
                     }
                     // rewrite.py:335-347: replace old guard with GUARD_VALUE.
-                    // last_guard_pos is a _newoperations index (info.py:100-103).
+                    // last_guard_pos is a _newoperations index (info.py get_last_guard).
                     // rewrite.py:339-340: old descr must not be ResumeAtPositionDescr
                     // — RPython's fresh ResumeGuardDescr() at line 335 must
                     // not overwrite a RAPD marker.
@@ -975,7 +975,7 @@ impl OptRewrite {
                 // old_guard_op or isinstance(descr, RAPD)` evaluates
                 // to False — pass `update_last_guard=false` so that
                 // make_constant_class preserves the strengthened
-                // guard's position in last_guard_pos (optimizer.py:137
+                // guard's position in last_guard_pos (optimizer.py
                 // parity) rather than snapping it to the tail of
                 // new_operations.
                 if let Some(class_val) = ctx.get_constant_int_box(&op.arg(1))
@@ -994,7 +994,7 @@ impl OptRewrite {
         // `postprocess_GUARD_CLASS` runs unconditionally (no
         // virtual-skip): `make_constant_class` already preserves
         // existing `InstancePtrInfo` whether or not `is_virtual=True`
-        // (`optimizer.py:137-151`), so the Rust port skips the local
+        // (`optimizer.py`), so the Rust port skips the local
         // `is_virtual` guard and lets `Optimizer::make_constant_class`
         // dispatch on the live `Instance` / `Virtual` arm.
         if op.num_args() >= 2
@@ -1051,7 +1051,7 @@ impl OptRewrite {
         if ctx.opref_type(opref) == Some(majit_ir::Type::Ref) {
             return true;
         }
-        // has_ptr_info takes &Operand per info.py:880-894.
+        // has_ptr_info takes &Operand per info.py getptrinfo.
         ctx.get_box_replacement_operand_opt(opref)
             .as_ref()
             .is_some_and(|b| ctx.has_ptr_info(b))
@@ -1358,7 +1358,7 @@ impl OptRewrite {
                 return false;
             }
             // rewrite.py:628-629: all_fdescrs = arraydescr.get_all_fielddescrs()
-            // → all_interiorfielddescrs in descr.py:291.
+            // → all_interiorfielddescrs in descr.py.
             let all_fdescr_indices: Vec<u32> = arraydescr
                 .as_array_descr()
                 .and_then(|ad| ad.get_all_interiorfielddescrs())
@@ -2096,7 +2096,7 @@ impl Optimization for OptRewrite {
                 );
                 OptimizationResult::PassOn
             }
-            // jtransform.py:1264-1266: CAST_OPAQUE_PTR is identity (no-op).
+            // jtransform.py rewrite_op_cast_opaque_ptr: CAST_OPAQUE_PTR is identity (no-op).
             OpCode::CastOpaquePtr => {
                 let b_old = Operand::from_bound_op(op_rc);
                 let b_arg = ctx.resolve_operand_operand(&op.arg(0));
@@ -2136,7 +2136,7 @@ impl Optimization for OptRewrite {
             //         return self.emit(op)
             //
             // `last_emitted_operation` is set by every pass's emit
-            // (optimizer.py:84-92), so the flag reflects the
+            // (optimizer.py), so the flag reflects the
             // PREVIOUS op's fate regardless of which pass dropped it.
             // pyre's ctx.last_op_removed is the cross-pass equivalent.
             OpCode::GuardNoException => {
@@ -2153,7 +2153,7 @@ impl Optimization for OptRewrite {
 
             // INT_SIGNEXT belongs on `OptIntBounds`, not `OptRewrite`.
             // rewrite.py has no `optimize_INT_SIGNEXT`; the handler lives
-            // at intbounds.py:450-466 (optimize + postprocess). pyre's
+            // at intbounds.py (optimize + postprocess). pyre's
             // intbounds.rs's `optimize_int_signext` /
             // `postprocess_int_signext` already implement the full upstream
             // logic (is_within_range check), so this `OptRewrite` arm
@@ -3765,7 +3765,7 @@ mod tests {
         // branch — `arg0 is arg1` (line 542) is object identity, which is
         // False for distinct ConstPtr, so it falls through to `emit(op)`
         // (line 564). The actual constant fold lives in the pure pass
-        // (pure.py:126-136 → execute_ptr_compare_const), not rewrite.
+        // (pure.py → execute_ptr_compare_const), not rewrite.
         // history.py ConstPtr — Value::Ref must land on a Ref-tagged
         // OpRef so the box class identity matches the resoperation.py:615
         // RefOp mixin of the producer SameAsR.

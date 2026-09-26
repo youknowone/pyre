@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 /// RPython `gensupp.uniquemodulename(name, SEEN=set())`
-/// (`gensupp.py:6-14`).
+/// (`gensupp.py`).
 ///
 /// Returns `name_<i>` where `<i>` is the smallest positive integer that
 /// has not been handed out before during this process. Upstream stashes
@@ -110,7 +110,7 @@ impl NameManager {
     }
 
     /// RPython `NameManager.uniquename(basename, with_number=None,
-    /// bare=False, lenmax=50)` (`gensupp.py:52-66`).
+    /// bare=False, lenmax=50)` (`gensupp.py`).
     ///
     /// Returns the prefixed unique name (upstream `bare=False`).
     /// Callers needing the bare/prefixed pair use
@@ -179,7 +179,7 @@ impl NameManager {
     }
 
     /// RPython `NameManager.localScope(self, parent=None)`
-    /// (`gensupp.py:68-72`).
+    /// (`gensupp.py`).
     ///
     /// Upstream's `_LocalScope.__init__` stores `self.glob = glob`
     /// (`gensupp.py`), so subsequent `_LocalScope.uniquename`
@@ -220,7 +220,7 @@ impl NameManager {
     }
 
     /// RPython `NameManager.localScope` CamelCase alias
-    /// (`gensupp.py:68`). Both spellings forward to the same
+    /// (`gensupp.py`). Both spellings forward to the same
     /// constructor so callers that grep upstream by method name
     /// land on a hit. Per AGENTS.md §4 ("Removing an RPython method
     /// to 'simplify' things is not allowed"), the upstream-shape
@@ -280,7 +280,7 @@ pub(crate) struct LocalScope {
 #[allow(dead_code)]
 impl LocalScope {
     /// RPython `_LocalScope.uniquename(self, basename)`
-    /// (`gensupp.py:85-94`).
+    /// (`gensupp.py`).
     pub fn uniquename(&mut self, basename: &str) -> String {
         let basename = translate_c_identifier(basename);
         let p = *self.usednames.get(&basename).unwrap_or(&0);
@@ -316,7 +316,7 @@ impl LocalScope {
     }
 
     /// RPython `_LocalScope.localname(self, name, wrapped=False)`
-    /// (`gensupp.py:96-117`). Mangles a local name through
+    /// (`gensupp.py`). Mangles a local name through
     /// [`Self::uniquename`], with the `v`/`w_`/`l_` prefix selection
     /// upstream uses to pacify a tcc parser bug.
     pub fn localname(&mut self, name: &str, wrapped: bool) -> String {

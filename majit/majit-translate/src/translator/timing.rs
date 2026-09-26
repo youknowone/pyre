@@ -58,7 +58,7 @@ use crate::tool::ansi_print::AnsiLogger;
 pub static LOG: AnsiLogger = AnsiLogger::new("Timer");
 
 /// Pluggable clock source, matching upstream's `timer=time.time`
-/// constructor arg at `timing.py:12`. Returns a monotonically non-
+/// constructor arg at `timing.py __init__`. Returns a monotonically non-
 /// decreasing `f64` number of seconds since an epoch of the source's
 /// choosing (only differences are observable).
 pub trait TimeSource {
@@ -150,7 +150,7 @@ impl Default for Timer<SystemClock> {
 
 impl<T: TimeSource> Timer<T> {
     /// Upstream `Timer.__init__(self, timer=time.time)` at
-    /// `timing.py:12-16`. Accepts an injected clock so downstream
+    /// `timing.py`. Accepts an injected clock so downstream
     /// tests can assert on deterministic elapsed values.
     pub fn with_source(timer: T) -> Self {
         Timer {

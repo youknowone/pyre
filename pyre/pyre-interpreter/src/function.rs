@@ -281,10 +281,10 @@ impl QuasiImmutSlot {
 /// `method_descriptor`, `wrapper_descriptor` — all allocate a real `Function`
 /// whose slots are initialised, and skipping any of them would leave a write
 /// unannounced. Under-invalidation is the unsound direction; over-invalidation
-/// is not (`quasiimmut.py:85-110`).
+/// is not (`quasiimmut.py`).
 ///
 /// Answers `None` while [`Function::mutate_slots`] is still null, which is the
-/// null `mutate_<name>` of `quasiimmut.py:41`: nothing has folded the field, so
+/// null `mutate_<name>` of `quasiimmut.py`: nothing has folded the field, so
 /// there is nothing to revoke. Only [`function_current_qmut_instance`] creates
 /// the block.
 ///
@@ -433,7 +433,7 @@ fn function_write_barrier(obj: PyObjectRef) {
     // `walk_raw_function_roots`, which clean minor collections skip;
     // record every field store (gc_roots.rs prebuilt-root tracking).
     // RPython's GC transform inserts the old-to-young `write_barrier`
-    // (minimark.py:1065) after such post-alloc field stores; pyre has no
+    // (minimark.py) after such post-alloc field stores; pyre has no
     // transform pass, so callers run it by hand through this helper.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
 }
@@ -1708,7 +1708,7 @@ pub unsafe fn fset_func_qualname(
 /// (`runtime_ops::make_function_from_code_obj_with_globals_obj`) stamps `w_qualname`
 /// from `codeobj.co_qualname` at construction, so subsequent
 /// `__code__ = new_code` assignments do NOT alter `__qualname__`
-/// (matching `pypy/interpreter/pyopcode.py:1457` + `function.py:54`).
+/// (matching `pypy/interpreter/pyopcode.py` + `function.py:54`).  allow-line-citation
 /// Pyre keeps the wrapped text object in `w_qualname`, the direct equivalent
 /// of that object-owned PyPy field.  Returning it directly preserves the
 /// identity installed by `f.__qualname__ = value`, which `update_wrapper`
@@ -2193,7 +2193,7 @@ pub unsafe fn setdict(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate:
 ///   - `BuiltinCode`: stores `docstring` directly (`gateway.rs`'s
 ///     `BuiltinCode.docstring`).
 ///   - `PyCode`: docstring is the first const when `code.flags`
-///     has `HAS_DOCSTRING` set, mirroring `pycode.py:230
+///     has `HAS_DOCSTRING` set, mirroring `pycode.py
 ///     PyCode.getdocstring`.
 pub fn function_get_doc(obj: PyObjectRef) -> PyObjectRef {
     if obj.is_null() {
@@ -3184,7 +3184,7 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // None, ())` returns a function whose `__closure__` reads back as `()`, and
     // a `tuple` subclass is accepted and read back as that subclass.  The two
     // widenings only decide what may be stored once, at construction; the
-    // `closure?[*]` hint (function.py:34) governs rebinding the field and the
+    // `closure?[*]` hint (function.py) governs rebinding the field and the
     // immutability of the cells it holds, and every accepted element is still
     // checked to be a `Cell` below.
     let nfreevars = unsafe { (&(*code_ptr).freevars).len() };
@@ -4083,7 +4083,7 @@ pub fn funccall_valuestack(
     let natural_arity_call = nargs == fast_natural_arity;
 
     // function.py:153-184 — nargs == fast_natural_arity: builtin fast path
-    // baseobjspace.py:1243 — skip when profiling (c_call/c_return events)
+    // baseobjspace.py call_valuestack — skip when profiling (c_call/c_return events)
     if natural_arity_call && nargs <= 4 && !frame.get_is_being_profiled() {
         debug_assert!(
             (fast_natural_arity & crate::BuiltinCodeFlags::FLATPYCALL.bits() as usize) == 0,

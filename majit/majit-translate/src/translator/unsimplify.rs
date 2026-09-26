@@ -10,7 +10,7 @@ use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::translator::TranslationContext;
 
 /// RPython `unsimplify.varoftype(concretetype, name=None)`
-/// (unsimplify.py:5-8).
+/// (unsimplify.py).
 pub fn varoftype(concretetype: LowLevelType, name: Option<&str>) -> Variable {
     let var = name.map(Variable::named).unwrap_or_default();
     var.set_concretetype(Some(concretetype));
@@ -18,7 +18,7 @@ pub fn varoftype(concretetype: LowLevelType, name: Option<&str>) -> Variable {
 }
 
 /// RPython `unsimplify.insert_empty_block(link, newops=[])`
-/// (unsimplify.py:10-31).
+/// (unsimplify.py).
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
@@ -110,7 +110,7 @@ pub fn insert_empty_block(link: &LinkRef, newops: Vec<SpaceOperation>) -> BlockR
 }
 
 /// RPython `unsimplify.insert_empty_startblock(graph)`
-/// (unsimplify.py:33-37).
+/// (unsimplify.py).
 pub fn insert_empty_startblock(graph: &mut FunctionGraph) {
     let vars: Vec<Hlvalue> = graph
         .startblock
@@ -127,7 +127,7 @@ pub fn insert_empty_startblock(graph: &mut FunctionGraph) {
 }
 
 /// RPython `unsimplify.starts_with_empty_block(graph)`
-/// (unsimplify.py:39-42).
+/// (unsimplify.py).
 pub fn starts_with_empty_block(graph: &FunctionGraph) -> bool {
     let startblock = graph.startblock.borrow();
     startblock.operations.is_empty()
@@ -138,7 +138,7 @@ pub fn starts_with_empty_block(graph: &FunctionGraph) -> bool {
 }
 
 /// RPython `unsimplify.call_initial_function(translator, initial_func, annhelper=None)`
-/// (unsimplify.py:125-146).
+/// (unsimplify.py).
 ///
 /// Upstream receives a Python callable and turns it into a low-level
 /// function pointer through `MixLevelHelperAnnotator.constfunc`. pyre's
@@ -171,7 +171,7 @@ pub fn call_initial_function(translator: &TranslationContext, c_initial_func: Co
 }
 
 /// RPython `unsimplify.call_final_function(translator, final_func, annhelper=None)`
-/// (unsimplify.py:148-173).
+/// (unsimplify.py).
 ///
 /// See [`call_initial_function`] for the Rust boundary around upstream's
 /// `annhelper.constfunc` step.
@@ -221,7 +221,7 @@ pub fn call_final_function(translator: &TranslationContext, c_final_func: Consta
 }
 
 /// RPython `unsimplify.split_block(block, index, _forcelink=None)`
-/// at `unsimplify.py:44-123`.
+/// at `unsimplify.py`.
 ///
 /// Returns a Link whose `prevblock` is `block` (truncated to operations
 /// before `index`) and whose `target` is a fresh block holding the

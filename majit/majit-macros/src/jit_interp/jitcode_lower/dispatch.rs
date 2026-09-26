@@ -51,7 +51,7 @@ mod find_dispatch_loop_body_tests {
 /// Walk a dispatch arm body and collect the parent-scope idents it
 /// references, paired with the parent's [`Binding`] for each.
 ///
-/// `pyopcode.py:179` keeps `oparg` / `next_instr` etc. as flowgraph
+/// `pyopcode.py` keeps `oparg` / `next_instr` etc. as flowgraph
 /// variables shared between the dispatch loop and the per-opcode
 /// handler bodies; `jtransform.py:480 inline_call_<types>(jitcode,
 /// args...)` then threads those variables as call args so the callee
@@ -514,7 +514,7 @@ mod assign_caller_local_layout_tests {
 /// Walk `func_block` to find the dispatch while-loop, then lower every stmt
 /// that appears before the dispatch match in source order.
 ///
-/// interp_jit.py:91-93 — stmts between jit_merge_point and the opcode
+/// interp_jit.py — stmts between jit_merge_point and the opcode
 /// dispatch (e.g. `co_code = pycode.co_code`, `valuestackdepth = promote(...)`)
 /// execute unconditionally before each dispatch. We lower them into the
 /// dispatch JitCode body so the JIT sees them on every loop iteration.
@@ -603,7 +603,7 @@ pub(super) fn lower_pre_dispatch_stmts(
         // policy (e.g. `bytecode_only_trace_helper();` annotated with
         // `#[majit_macros::dont_look_inside]` under `auto_calls = true`).
         // RPython `pyopcode.py:174` `ec.bytecode_only_trace(self)` lowers
-        // through `jtransform.py:456-470 rewrite_op` + `call.py:282-324
+        // through `jtransform.py handle_residual_call rewrite_op` + `call.py:282-324  allow-line-citation
         // getcalldescr`'s analyzer trio at translation time. Pyre's
         // `resolve_call_policy` + `lower_config_call_stmt` is the
         // per-callsite equivalent before the analyzer
@@ -766,7 +766,7 @@ fn pat_bound_ident_name(pat: &Pat) -> Option<String> {
 }
 
 /// A.2.3b: lower a recognized EXTENDED_ARG inner while loop to dispatch
-/// JitCode IR. Mirrors RPython `pyopcode.py:187-193`:
+/// JitCode IR. Mirrors RPython `pyopcode.py`:
 ///
 /// ```text
 /// while opcode == opcodedesc.EXTENDED_ARG.index:
@@ -852,7 +852,7 @@ fn lower_extended_arg_inner_while(
     lowerer.emit_aux(quote! { let #after_loop = __builder.new_label(); });
     lowerer.emit_label_def(&inner_loop_top);
 
-    // jtransform.py:196-225 fuses int_eq + goto_if_not into
+    // jtransform.py optimize_goto_if_not fuses int_eq + goto_if_not into
     // goto_if_not_int_eq/iiL. `opcode_reg` is the canonical loop reg
     // updated each iteration by the inner BC_GETARRAYITEM_GC_I aliased
     // through `inner_alias`.
@@ -1980,7 +1980,7 @@ mod dispatch_arm_inline_call_tokens_tests {
 /// match. After all checks, emits an unconditional `jump` (BC_GOTO) to the
 /// default label.
 ///
-/// pyopcode.py:183+ if/elif chain over opcode constants.
+/// pyopcode.py+ if/elif chain over opcode constants.
 /// jtransform.py optimize_goto_if_not fuses `int_eq + goto_if_not`
 /// into `goto_if_not_int_eq/iiL`.
 ///
@@ -2694,7 +2694,7 @@ pub(super) fn lower_dispatch_chain(
             .filter_map(|label| label.clone())
             .collect::<Vec<_>>();
         // RPython flatten.py:270-308 emits one `-live-` before `switch`;
-        // pyjitpl.py:598-617 records GuardValue on a hit and fallback guards
+        // pyjitpl.py opimpl_switch records GuardValue on a hit and fallback guards
         // on a miss. The marker keeps the opcode and all case targets live.
         lowerer.emit_op(
             OpMeta::live_marker_with(vec![Register::int(opcode_reg)], live_targets),
@@ -3218,7 +3218,7 @@ pub(super) fn lower_dispatch_chain(
         // codex strict-parity audit — arm-level existence ≠ conditional
         // call-site).
         //
-        // interp_jit.py:95-100 — loop back-edge: after each matched arm,
+        // interp_jit.py — loop back-edge: after each matched arm,
         // jump back to jit_merge_point so the next iteration re-enters
         // the dispatch loop at the portal merge point.  The GOTO is
         // required for control-flow correctness regardless of whether
@@ -3308,7 +3308,7 @@ fn pat_contains_range(pat: &Pat) -> bool {
 /// has no compile-time green constants so every entry is promoted), emit a
 /// `-live-` marker followed by `<kind>_guard_value(reg)`.  The guard forces
 /// the runtime value to a constant before `BC_JIT_MERGE_POINT`, satisfying
-/// `pyjitpl.py:1530` which expects all greens to be constants at the merge
+/// `pyjitpl.py verify_green_args` which expects all greens to be constants at the merge
 /// point.
 ///
 /// Must be called after the portal-input bindings are installed (so that
@@ -3798,18 +3798,18 @@ fn assert_kind_sorted(label: &str, vars: &[(u8, String, TokenStream)]) {
 ///
 /// Lowers a `#[jit_interp]` function's `while { jit_merge_point!(); ...
 /// match opcode { ... } }` dispatch loop into a single dispatch JitCode
-/// body. Mirrors RPython `pypy/module/pypyjit/interp_jit.py:82-94`
+/// body. Mirrors RPython `pypy/module/pypyjit/interp_jit.py`
 /// portal + `pypy/interpreter/pyopcode.py` dispatch_bytecode.
 ///
 /// Output IR shape:
 /// 1. `BC_LIVE` (canonical entry)
-/// 2. `BC_JIT_MERGE_POINT(_C)` (interp_jit.py:88-90 jit_merge_point hook)
+/// 2. `BC_JIT_MERGE_POINT(_C)` (interp_jit.py jit_merge_point hook)
 /// 3. `BC_LOOP_HEADER`
 /// 4. pre-dispatch ops, source-order (interp_jit.py)
-/// 5. opcode/oparg fetch + pc advance (pyopcode.py:171-181)
+/// 5. opcode/oparg fetch + pc advance (pyopcode.py)
 /// 6. dispatch chain via existing `BC_GOTO_IF_NOT_*` ops
-///    (jtransform.py:196-225 conditional fusion)
-/// 7. per-arm `BC_INLINE_CALL sub_jitcode_idx` (jtransform.py:473-482)
+///    (jtransform.py optimize_goto_if_not conditional fusion)
+/// 7. per-arm `BC_INLINE_CALL sub_jitcode_idx` (jtransform.py handle_regular_call)
 /// 8. loop close `BC_GOTO 0` — Task 1.7
 /// 9. default arm: typed return / dispatch-exit ABI — Task 1.7
 pub(crate) fn lower_dispatch_body(
@@ -3964,7 +3964,7 @@ pub(crate) fn lower_dispatch_body(
 
     // A.3.5 (jtransform.py:1693-1714): emit a `-live-` + `<kind>_guard_value`
     // pair for each declared green BEFORE `jit_merge_point`.  Forces every
-    // green to a constant at trace time; `pyjitpl.py:1530` asserts all greens
+    // green to a constant at trace time; `pyjitpl.py verify_green_args` asserts all greens
     // are constants when the merge point is reached.
     emit_promote_greens(&mut lowerer, config);
 
@@ -4054,7 +4054,7 @@ pub(crate) fn lower_dispatch_body(
     // Optional virtualizable input uses r1, because r0 is already the
     // bytecode object in the dispatch JitCode entry ABI.
     //
-    // Mirrors interp_jit.py:67-70 reds=['frame', 'ec'] for PyPy's portal;
+    // Mirrors interp_jit.py reds=['frame', 'ec'] for PyPy's portal;
     // pyre's per-#[jit_interp] dispatch uses (program, pc) as the minimal
     // reds.  The actual value seeding (binding i0/r0 to the outer Rust
     // `program`/`pc` at trace time) is the `__trace_*` rewrite.
@@ -4079,7 +4079,7 @@ pub(crate) fn lower_dispatch_body(
     // then iterate stmts before the match-containing stmt.
     //
     // Task 1.5: emit dispatch chain.
-    // pyopcode.py:183+ if/elif chain over opcode value.
+    // pyopcode.py+ if/elif chain over opcode value.
     // jtransform.py optimize_goto_if_not fuses int_eq + goto_if_not
     // into goto_if_not_int_eq/iiL (BC_GOTO_IF_NOT_INT_EQ).
     //
@@ -4130,7 +4130,7 @@ pub(crate) fn lower_dispatch_body(
     // The ref bank must cover the ref-scalar identity slots at
     // `ref_regs[ref_identity_base..ref_identity_end)`, not just the
     // r0=program / r1=vable arguments. `MIFrame.setup` sizes `registers_r`
-    // from `jitcode.num_regs_r()` (`pyjitpl.py:88`) and guard-failure
+    // from `jitcode.num_regs_r()` (`pyjitpl.py`) and guard-failure
     // resume reads every ref register out of that bank, so a bank capped
     // at 2 would leave the ref scalars out of the frame and drop them from
     // the snapshot. `ref_identity_end` is 0 when there are no ref scalars,
@@ -4153,7 +4153,7 @@ pub(crate) fn lower_dispatch_body(
 
     // Task 1.7: default arm typed return.
     // Bind default_label here so the dispatch chain's fall-through GOTO lands
-    // at the typed-return emission (interp_jit.py:95-100 return boundary).
+    // at the typed-return emission (interp_jit.py return boundary).
     lowerer.emit_label_def(&default_label);
 
     // Locate the source dispatch loop and its post-loop epilogue.  A terminal

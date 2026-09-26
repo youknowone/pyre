@@ -171,13 +171,13 @@ pub(crate) enum WalkEndCommitLeg {
 /// Upstream's rule is not "never rewind".  `opimpl_str_guard_value`
 /// (`pyjitpl.py`) runs a real `do_residual_call` and then records its
 /// guard with `resumepc=orgpc`, an earlier pc; `capture_resumedata` stamps that
-/// pc into the frame (`pyjitpl.py:2617-2620`).  What upstream forbids is
+/// pc into the frame (`pyjitpl.py`).  What upstream forbids is
 /// rewinding past an *effectful* residual, and it decides both the permission
 /// and the prohibition STATICALLY — the licence is the codewriter-time
 /// `EffectInfo.EF_ELIDABLE_CANNOT_RAISE` registration
 /// (`jtransform.py:620-630`), and the ban is by opnum: the four guards that can
 /// follow a residual take `after_residual_call`, which pins the resume pc to
-/// the POST-call `self.pc` (`pyjitpl.py:2599-2602` → `194-198`).  Upstream's
+/// the POST-call `self.pc` (`pyjitpl.py` → `194-198`).  Upstream's
 /// only op counters are profiling-only and gate nothing
 /// (`jitprof.py EmptyProfiler.count_ops` is `pass`).
 ///
@@ -189,7 +189,7 @@ pub(crate) enum WalkEndCommitLeg {
 /// missing inner-frame rebuild) have no upstream counterpart at all;
 /// `convert_and_run_from_pyjitpl` (`blackhole.py`) gives every frame
 /// its own current pc and splices the callee result in PAST the caller's call
-/// (`blackhole.py:1653-1662`), which is the [`WalkEndResume::AfterApplied`]
+/// (`blackhole.py`), which is the [`WalkEndResume::AfterApplied`]
 /// shape.
 #[derive(Clone, Copy)]
 pub(crate) enum WalkEndResume {
@@ -227,7 +227,7 @@ pub(crate) enum WalkEndResume {
     /// (`jtransform.py:620-630`).  A commit-time counter sample would answer a
     /// different question — the forcing residual itself moves the odometer
     /// after the window is read — and upstream's op counters gate nothing
-    /// (`jitprof.py:43-44`).
+    /// (`jitprof.py count_ops`).
     RewindProvenAtLatch,
     /// The resume pc is AHEAD of what the walk applied — a rebuilt callee
     /// resumed at its own abort pc.  Nothing re-runs; committing is what
@@ -235,7 +235,7 @@ pub(crate) enum WalkEndResume {
     /// discarded trace was their only carrier).  Needs no effect gate at all,
     /// which is why upstream's version of this leg is unconditional
     /// (`run_blackhole_interp_to_cancel_tracing` ends `assert False`,
-    /// `pyjitpl.py:2956`).
+    /// `pyjitpl.py`).
     AfterApplied,
 }
 
@@ -2337,7 +2337,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // call that wrote the heap or entered a Python frame, and the guard resume
     // re-runs the callee from the same coordinate.  Upstream has no such
     // rewind — `_handle_guard_failure` ends `assert False, "should always
-    // raise"` (`pyjitpl.py:2956`).  Drive the frames the sub-walk reached
+    // raise"` (`pyjitpl.py`).  Drive the frames the sub-walk reached
     // instead; they were latched at its stop coordinate.
     //
     // Ordering: adopt BEFORE `discard_bridge_carrier_walk`, whose
@@ -2944,9 +2944,9 @@ fn frame_resume_py_pc(frame: usize) -> usize {
 /// nothing reconstructs its contents.  It can afford that because the
 /// blackhole's virtualizable ops are write-through —
 /// `bhimpl_setarrayitem_vable_r` and `bhimpl_setfield_vable_i`
-/// (`blackhole.py:1390-1490`) fetch the array out of the virtualizable and
+/// (`blackhole.py`) fetch the array out of the virtualizable and
 /// store into it — so by the time `bhimpl_jit_merge_point` raises
-/// (`blackhole.py:1068-1069`) the frame already holds the driven region's
+/// (`blackhole.py`) the frame already holds the driven region's
 /// result.  That raise only fires at the bottommost level, which is the portal
 /// frame: `convert_and_run_from_pyjitpl` links `framestack[0]` last, so
 /// `nextblackholeinterp is None` names the root and no other.
@@ -4668,7 +4668,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 // offset (`entry` above).  The live registers there are the
                 // guard-time abstract-register colors the resume data decoded
                 // into `bridge_registers_r` (color-indexed, `consume_boxes`
-                // parity, resume.py:1055) — the SAME bank the blackhole's
+                // parity, resume.py) — the SAME bank the blackhole's
                 // `init_register_files` + resume fill would hold.  Seed each
                 // non-NONE color directly; the `nlocals + depth` slot→color
                 // shortcut below is wrong here because a kept temp's abstract
@@ -5284,7 +5284,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         // the pre-flush locals / operand stack / resume coordinate back so the
         // replay re-derives them instead of compounding onto the walk's
         // mid-region values.  When a blackhole terminal or a committed escape
-        // pc DID take over, the flush stands — `virtualizable.py:101-138
+        // pc DID take over, the flush stands — `virtualizable.py write_boxes
         // write_boxes` has no undo once the vable is forced, and the resumed
         // interpreter reads its fastlocals straight out of that array.
         // `walk_abort_adopted` is a blackhole terminal in exactly that sense:
@@ -5343,7 +5343,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             // CALLEE coordinate with no meaning in the outer py_pc tables,
             // so the outer CALL py_pc and operand stack come from the latch.
             // Convergence of `run_blackhole_interp_to_cancel_tracing`
-            // (`pyjitpl.py:2949`), minus the inner-frame rebuild (#126/#215).
+            // (`pyjitpl.py`), minus the inner-frame rebuild (#126/#215).
             let carrier = crate::jitcode_dispatch::fbw_abort_carrier_clone();
             match carrier.as_ref() {
                 Some(crate::jitcode_dispatch::InlineAbortCarrier::Entry {
@@ -5778,7 +5778,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 let committed = if let Some(ref stack) = mirror {
                     // RPython converts the current MIFrame — including its
                     // register-held mid-expression operands — directly into a
-                    // blackhole frame (`blackhole.py:1711-1727`).  The vable
+                    // blackhole frame (`blackhole.py _copy_data_from_miframe`).  The vable
                     // array is only complete at merge points, so prefer the
                     // exact-coordinate walk mirror here.  Resolution and GC
                     // rooting are shared with the established escape/qmut

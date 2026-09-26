@@ -367,7 +367,7 @@ fn _storesink_block(block: &BlockRef, cache: &mut Cache) -> bool {
 }
 
 /// Mirror of upstream's nested `clear_cache_for(cache, concretetype,
-/// fieldname)` (`storesink.py:75-78`). Drops any cache entry whose
+/// fieldname)` (`storesink.py`). Drops any cache entry whose
 /// anchor has the same concrete pointer-type AND the same field
 /// name, since a `setfield` on `concretetype.field` may have
 /// invalidated it.
