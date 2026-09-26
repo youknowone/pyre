@@ -3370,9 +3370,15 @@ impl OptHeap {
             OpCode::SetfieldGc => self.optimize_setfield(op, op_rc, ctx),
 
             // ── Array item reads ──
-            OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcF => {
-                self.optimize_getarrayitem(op, op_rc, ctx)
-            }
+            // `GETARRAYITEM_GC_PURE_*` is `optimize_GETARRAYITEM_GC_PURE_I`:
+            // heap-cache the read, then emit on a miss. Constant folding of
+            // an all-constant pure read is `OptPure.optimize_default`.
+            OpCode::GetarrayitemGcI
+            | OpCode::GetarrayitemGcR
+            | OpCode::GetarrayitemGcF
+            | OpCode::GetarrayitemGcPureI
+            | OpCode::GetarrayitemGcPureR
+            | OpCode::GetarrayitemGcPureF => self.optimize_getarrayitem(op, op_rc, ctx),
 
             // ── Raw array item reads/writes ──
             // Same rationale as the `GetfieldRaw*` / `SetfieldRaw` arms:

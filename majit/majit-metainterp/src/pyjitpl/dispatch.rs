@@ -5445,7 +5445,8 @@ where
             // re-read during the observer concrete replay returns the same
             // pointer — no `record_observed_*` queue is needed (none exists
             // for getarrayitem).
-            jitcode::insns::BC_GETARRAYITEM_GC_R_RID => {
+            jitcode::insns::BC_GETARRAYITEM_GC_R_RID
+            | jitcode::insns::BC_GETARRAYITEM_GC_R_PURE => {
                 let (array_reg, index_reg, descr_idx, dst) = {
                     let frame = self.frames.current_mut();
                     let array_reg = frame.next_reg() as usize;
@@ -5471,67 +5472,82 @@ where
                         descr.as_array_descr().expect("GC ref array descriptor"),
                     )
                     .0 as i64;
-                let (opref, reg_concrete) = if let Some(cached) = cached {
-                    ctx.profiler().count_ops(
-                        OpCode::GetarrayitemGcR,
-                        crate::pyjitpl::counters::HEAPCACHED_OPS,
-                    );
-                    // `_do_getarrayitem_gc_any`'s `typ == 'r'` arm compares the
-                    // freshly executed load against the cached box's
-                    // `tobox.getref_base()`. Same structure as the int/float
-                    // arm above: a mismatch records a fallback op whose result
-                    // is discarded, asserts in debug, and still answers with
-                    // the stale cached box.
-                    let expected = match ctx.box_value(cached) {
-                        Some(Value::Ref(majit_ir::GcRef(p))) => Some(p as i64),
-                        _ => None,
-                    };
-                    let stale = matches!(expected, Some(exp) if exp != concrete);
-                    if stale {
-                        ctx.heapcache_invalidate_caches_varargs(
-                            OpCode::GetarrayitemGcR,
-                            None,
-                            &[array_opref, index_opref],
-                        );
-                        ctx.profiler()
-                            .count_ops(OpCode::GetarrayitemGcR, crate::counters::RECORDED_OPS);
-                        let _ = ctx.record_op_with_descr(
-                            OpCode::GetarrayitemGcR,
-                            &[array_opref, index_opref],
-                            descr,
-                        );
-                        debug_assert!(
-                            false,
-                            "GetarrayitemGcR sanity check failed: \
-                             cached={expected:?} concrete={concrete}",
-                        );
-                    }
-                    let reg_concrete = if stale {
-                        expected.expect("stale only set when expected is Some")
-                    } else {
-                        concrete
-                    };
-                    (cached, reg_concrete)
+                // `getarrayitem_gc_r_pure` records `GetarrayitemGcPureR`
+                // (`rewrite_op_getarrayitem` `_pure`). An all-constant read
+                // folds here, the same way `BC_GETARRAYITEM_GC_I_PURE` does:
+                // the pure opcode is what licenses it, and the live pointer
+                // is already in hand so `protect_speculative_array` is not
+                // asked to classify a block that has no GC type header.
+                let pure = bytecode == jitcode::insns::BC_GETARRAYITEM_GC_R_PURE;
+                let opcode = if pure {
+                    OpCode::GetarrayitemGcPureR
                 } else {
-                    ctx.profiler()
-                        .count_ops(OpCode::GetarrayitemGcR, crate::counters::OPS);
-                    ctx.profiler()
-                        .count_ops(OpCode::GetarrayitemGcR, crate::counters::RECORDED_OPS);
-                    let opref = ctx.record_op_with_descr(
-                        OpCode::GetarrayitemGcR,
-                        &[array_opref, index_opref],
-                        descr,
-                    );
-                    ctx.set_opref_concrete(opref, Value::Ref(majit_ir::GcRef(concrete as usize)));
-                    ctx.heapcache_getarrayitem_now_known(
-                        array_opref,
-                        index_opref,
-                        descr_index,
-                        opref,
-                    );
-                    (opref, concrete)
+                    OpCode::GetarrayitemGcR
                 };
-                self.set_ref_reg(dst, Some(opref), Some(reg_concrete));
+                if pure && array_opref.is_constant() && index_opref.is_constant() {
+                    ctx.profiler().count_ops(opcode, crate::counters::OPS);
+                    let opref = ctx.const_ref(concrete);
+                    self.set_ref_reg(dst, Some(opref), Some(concrete));
+                } else {
+                    let (opref, reg_concrete) = if let Some(cached) = cached {
+                        ctx.profiler()
+                            .count_ops(opcode, crate::pyjitpl::counters::HEAPCACHED_OPS);
+                        // `_do_getarrayitem_gc_any`'s `typ == 'r'` arm compares the
+                        // freshly executed load against the cached box's
+                        // `tobox.getref_base()`. Same structure as the int/float
+                        // arm above: a mismatch records a fallback op whose result
+                        // is discarded, asserts in debug, and still answers with
+                        // the stale cached box.
+                        let expected = match ctx.box_value(cached) {
+                            Some(Value::Ref(majit_ir::GcRef(p))) => Some(p as i64),
+                            _ => None,
+                        };
+                        let stale = matches!(expected, Some(exp) if exp != concrete);
+                        if stale {
+                            ctx.heapcache_invalidate_caches_varargs(
+                                opcode,
+                                None,
+                                &[array_opref, index_opref],
+                            );
+                            ctx.profiler()
+                                .count_ops(opcode, crate::counters::RECORDED_OPS);
+                            let _ = ctx.record_op_with_descr(
+                                opcode,
+                                &[array_opref, index_opref],
+                                descr,
+                            );
+                            debug_assert!(
+                                false,
+                                "GetarrayitemGcR sanity check failed: \
+                             cached={expected:?} concrete={concrete}",
+                            );
+                        }
+                        let reg_concrete = if stale {
+                            expected.expect("stale only set when expected is Some")
+                        } else {
+                            concrete
+                        };
+                        (cached, reg_concrete)
+                    } else {
+                        ctx.profiler().count_ops(opcode, crate::counters::OPS);
+                        ctx.profiler()
+                            .count_ops(opcode, crate::counters::RECORDED_OPS);
+                        let opref =
+                            ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
+                        ctx.set_opref_concrete(
+                            opref,
+                            Value::Ref(majit_ir::GcRef(concrete as usize)),
+                        );
+                        ctx.heapcache_getarrayitem_now_known(
+                            array_opref,
+                            index_opref,
+                            descr_index,
+                            opref,
+                        );
+                        (opref, concrete)
+                    };
+                    self.set_ref_reg(dst, Some(opref), Some(reg_concrete));
+                }
             }
             // blackhole.py:1350-1358 bhimpl_setarrayitem_gc_{i,r,f}: record
             // SetarrayitemGc (a single op-kind whose descr carries the item

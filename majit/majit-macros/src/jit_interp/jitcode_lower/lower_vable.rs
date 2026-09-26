@@ -418,6 +418,27 @@ enum ArrayFieldHolder {
     StateRef(Expr),
 }
 
+/// `jtransform.py` `rewrite_op_getarrayitem`: `_immutable_fields_ = ['x[*]']`
+/// (`ImmutableRank::ImmutableArray`) makes the load `getarrayitem_gc_*_pure`.
+/// The check runs while the jitcode is built, against the struct's own
+/// `__MAJIT_IMMUTABLE_FIELDS` (`rclass.py` `_parse_field_list`).
+fn immutable_array_item_pure(struct_path: &syn::Path, member: &syn::Member) -> TokenStream {
+    let name = named_member(member).unwrap_or_default();
+    let starred = format!("{name}[*]");
+    let quasi = format!("{name}?[*]");
+    quote! {
+        {
+            #[allow(unused_imports)]
+            use majit_metainterp::MajitImmutableFields as _;
+            let __fields = <#struct_path>::__MAJIT_IMMUTABLE_FIELDS;
+            __fields.split(',').any(|__entry| {
+                let __entry = __entry.trim();
+                __entry == #starred || __entry == #quasi
+            })
+        }
+    }
+}
+
 /// A `<ref binding or state ref scalar>.<field>` access that `array_fields`
 /// declares, resolved but not yet emitted.  See
 /// [`JitCodeLowerer::match_array_field_base`].
@@ -2126,6 +2147,7 @@ impl<'c> Lowerer<'c> {
                         )
                     }
                 });
+            let item_pure = immutable_array_item_pure(&shape.struct_path, &shape.member);
             self.emit_op(
                 OpMeta::linear(
                     OpKind::Vable,
@@ -2134,12 +2156,23 @@ impl<'c> Lowerer<'c> {
                 ),
                 quote! {
                     let __descr_idx = #descr_tokens;
-                    __builder.getarrayitem_gc_r(
-                        #result_reg as u16,
-                        #buffer_reg as u16,
-                        #index_reg as u16,
-                        __descr_idx,
-                    );
+                    // `rewrite_op_getarrayitem`: `pure = '_pure'` when
+                    // `ARRAY._immutable_field(None)` (`_immutable_fields_ = ['x[*]']`).
+                    if #item_pure {
+                        __builder.getarrayitem_gc_r_pure(
+                            #result_reg as u16,
+                            #buffer_reg as u16,
+                            #index_reg as u16,
+                            __descr_idx,
+                        );
+                    } else {
+                        __builder.getarrayitem_gc_r(
+                            #result_reg as u16,
+                            #buffer_reg as u16,
+                            #index_reg as u16,
+                            __descr_idx,
+                        );
+                    }
                 },
             );
             return Some(Binding {
@@ -2149,6 +2182,7 @@ impl<'c> Lowerer<'c> {
                 struct_type: None,
             });
         }
+        let item_pure = immutable_array_item_pure(&shape.struct_path, &shape.member);
         self.emit_op(
             OpMeta::linear(
                 OpKind::Vable,
@@ -2166,12 +2200,23 @@ impl<'c> Lowerer<'c> {
                     // compile here rather than loading as a signed word.
                     (<#element_type>::MIN as i128) < 0,
                 );
-                __builder.getarrayitem_gc_i(
-                    #result_reg as u16,
-                    #buffer_reg as u16,
-                    #index_reg as u16,
-                    __descr_idx,
-                );
+                // `rewrite_op_getarrayitem`: `pure = '_pure'` when
+                // `ARRAY._immutable_field(None)` (`_immutable_fields_ = ['x[*]']`).
+                if #item_pure {
+                    __builder.getarrayitem_gc_i_pure(
+                        #result_reg as u16,
+                        #buffer_reg as u16,
+                        #index_reg as u16,
+                        __descr_idx,
+                    );
+                } else {
+                    __builder.getarrayitem_gc_i(
+                        #result_reg as u16,
+                        #buffer_reg as u16,
+                        #index_reg as u16,
+                        __descr_idx,
+                    );
+                }
             },
         );
         Some(Binding {

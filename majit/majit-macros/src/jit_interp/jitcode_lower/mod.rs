@@ -2833,6 +2833,53 @@ mod tests {
         }
     }
 
+    /// `_immutable_fields_ = ['items[*]']` (`rewrite_op_getarrayitem`) emits
+    /// `getarrayitem_gc_r_pure`. The choice is the struct's
+    /// `__MAJIT_IMMUTABLE_FIELDS`, not a CEL-specific opcode.
+    #[test]
+    fn immutable_array_item_emits_getarrayitem_gc_pure() {
+        let func = parse_fn(
+            r#"
+            fn load(tup: *mut Tup, i: i64) -> *mut CelObject {
+                tup.items[i]
+            }
+            "#,
+        );
+        let array_fields = [crate::jit_interp::ArrayFieldEntry {
+            struct_type: syn::parse_quote!(Tup),
+            field: syn::parse_quote!(items),
+            element_type: syn::parse_quote!(CelRef),
+            header: Some(syn::parse_quote!(Block)),
+        }];
+        let int_fields = [crate::jit_interp::IntFieldEntry {
+            struct_type: syn::parse_quote!(Block),
+            field: syn::parse_quote!(capacity),
+            int_type: syn::parse_quote!(usize),
+        }];
+        let helper = generate_inline_helper_jitcode_with_calls(
+            &func,
+            &[],
+            &[(syn::parse_quote!(tup), syn::parse_quote!(Tup))],
+            &[],
+            &array_fields,
+            &int_fields,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("jit_inline lowering should succeed")
+        .expect("helper should lower");
+        let body = helper.body.to_string();
+        assert!(
+            body.contains("getarrayitem_gc_r_pure"),
+            "immutable array item must be getarrayitem_gc_pure: {body}"
+        );
+        assert!(body.contains("__MAJIT_IMMUTABLE_FIELDS"), "{body}");
+        assert!(body.contains("items[*]"), "{body}");
+    }
+
     fn parse_fn(code: &str) -> ItemFn {
         syn::parse_str(code).expect("failed to parse function")
     }

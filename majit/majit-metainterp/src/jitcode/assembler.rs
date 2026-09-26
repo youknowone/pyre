@@ -2153,6 +2153,30 @@ impl JitCodeBuilder {
         self.push_reg_u8(dst, "getarrayitem_gc_f dst");
     }
 
+    /// Always-pure spelling of [`Self::getarrayitem_gc_r`].
+    ///
+    /// `jtransform.py` `rewrite_op_getarrayitem` appends `_pure` when
+    /// `ARRAY._immutable_field(None)` (`_immutable_fields_ = ['x[*]']`).
+    /// `blackhole.py` aliases the pure handler onto the plain read; the
+    /// recorded opcode is `GetarrayitemGcPureR`, which
+    /// `OpHelpers.is_always_pure` admits.
+    pub fn getarrayitem_gc_r_pure(
+        &mut self,
+        dst: u16,
+        array_reg: u16,
+        index_reg: u16,
+        descr_idx: u16,
+    ) {
+        self.touch_ref_reg(array_reg);
+        self.touch_reg(index_reg);
+        self.touch_ref_reg(dst);
+        self.write_insn("getarrayitem_gc_r_pure/rid>r");
+        self.push_reg_u8(array_reg, "getarrayitem_gc_r_pure array");
+        self.push_reg_u8(index_reg, "getarrayitem_gc_r_pure index");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "getarrayitem_gc_r_pure dst");
+    }
+
     /// Add the array descriptor for a byte-element array to the descrs pool.
     ///
     /// Returns the descr index to pass as `descr_idx` to `getarrayitem_gc_i`.
