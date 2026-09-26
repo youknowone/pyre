@@ -709,11 +709,6 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         }
     }
 
-    #[cfg(target_arch = "wasm32")]
-    for (path, fnptr) in math::math_gateway_fnaddrs() {
-        single(entries, path, fnptr);
-    }
-
     // `%` over two floats: `lloperation.py` has no `float_mod`, so the
     // codewriter lowers it to a residual call of this name carrying the C
     // `fmod` signature rather than the raising wrapper's.

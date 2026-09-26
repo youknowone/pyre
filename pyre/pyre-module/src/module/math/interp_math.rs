@@ -292,15 +292,10 @@ pub fn __majit_wrap_math_sqrt(args: &[PyObjectRef]) -> PyResult {
     sqrt_slow(args)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_math_sqrt:
-    pyre_interpreter::gateway::BuiltinWrapperDescriptor =
-    pyre_interpreter::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", stringify!(__majit_wrap_math_sqrt)),
-        func: __majit_wrap_math_sqrt,
-    };
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_math_sqrt,
+    __majit_wrap_math_sqrt
+);
 
 /// One jitcode per builtin: the domain test is expanded into the function,
 /// and the leaf is a direct call. `$domain` binds the operand with `|x|`.
@@ -352,19 +347,10 @@ macro_rules! majit_math1_gateway {
                 [<$name _slow>](args)
             }
 
-            #[cfg(not(target_arch = "wasm32"))]
-            #[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-            #[allow(non_upper_case_globals)]
-            static [<__majit_builtin_wrapper_target_math_ $name>]:
-                pyre_interpreter::gateway::BuiltinWrapperDescriptor =
-                pyre_interpreter::gateway::BuiltinWrapperDescriptor {
-                    path: concat!(
-                        module_path!(),
-                        "::",
-                        stringify!([<__majit_wrap_math_ $name>]),
-                    ),
-                    func: [<__majit_wrap_math_ $name>],
-                };
+            pyre_interpreter::builtin_wrapper_descriptor!(
+                [<__majit_builtin_wrapper_target_math_ $name>],
+                [<__majit_wrap_math_ $name>]
+            );
         }
     };
 }
@@ -441,19 +427,10 @@ macro_rules! majit_math1_raw_gateway {
                 [<$name _slow>](args)
             }
 
-            #[cfg(not(target_arch = "wasm32"))]
-            #[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-            #[allow(non_upper_case_globals)]
-            static [<__majit_builtin_wrapper_target_math_ $name>]:
-                pyre_interpreter::gateway::BuiltinWrapperDescriptor =
-                pyre_interpreter::gateway::BuiltinWrapperDescriptor {
-                    path: concat!(
-                        module_path!(),
-                        "::",
-                        stringify!([<__majit_wrap_math_ $name>]),
-                    ),
-                    func: [<__majit_wrap_math_ $name>],
-                };
+            pyre_interpreter::builtin_wrapper_descriptor!(
+                [<__majit_builtin_wrapper_target_math_ $name>],
+                [<__majit_wrap_math_ $name>]
+            );
         }
     };
 }
@@ -528,19 +505,10 @@ macro_rules! majit_math2_gateway {
                 [<$name _slow>](args)
             }
 
-            #[cfg(not(target_arch = "wasm32"))]
-            #[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-            #[allow(non_upper_case_globals)]
-            static [<__majit_builtin_wrapper_target_math_ $name>]:
-                pyre_interpreter::gateway::BuiltinWrapperDescriptor =
-                pyre_interpreter::gateway::BuiltinWrapperDescriptor {
-                    path: concat!(
-                        module_path!(),
-                        "::",
-                        stringify!([<__majit_wrap_math_ $name>]),
-                    ),
-                    func: [<__majit_wrap_math_ $name>],
-                };
+            pyre_interpreter::builtin_wrapper_descriptor!(
+                [<__majit_builtin_wrapper_target_math_ $name>],
+                [<__majit_wrap_math_ $name>]
+            );
         }
     };
 }
@@ -623,19 +591,10 @@ macro_rules! majit_math_round_gateway {
                 [<$name _slow>](args)
             }
 
-            #[cfg(not(target_arch = "wasm32"))]
-            #[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-            #[allow(non_upper_case_globals)]
-            static [<__majit_builtin_wrapper_target_math_ $name>]:
-                pyre_interpreter::gateway::BuiltinWrapperDescriptor =
-                pyre_interpreter::gateway::BuiltinWrapperDescriptor {
-                    path: concat!(
-                        module_path!(),
-                        "::",
-                        stringify!([<__majit_wrap_math_ $name>]),
-                    ),
-                    func: [<__majit_wrap_math_ $name>],
-                };
+            pyre_interpreter::builtin_wrapper_descriptor!(
+                [<__majit_builtin_wrapper_target_math_ $name>],
+                [<__majit_wrap_math_ $name>]
+            );
         }
     };
 }
@@ -675,15 +634,10 @@ pub fn __majit_wrap_math_fabs(args: &[PyObjectRef]) -> PyResult {
     fabs_slow(args)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_math_fabs:
-    pyre_interpreter::gateway::BuiltinWrapperDescriptor =
-    pyre_interpreter::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", stringify!(__majit_wrap_math_fabs)),
-        func: __majit_wrap_math_fabs,
-    };
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_math_fabs,
+    __majit_wrap_math_fabs
+);
 
 /// `log` keeps its optional base, so this residual is the original body
 /// rather than a fixed arity-1 check.
@@ -719,37 +673,9 @@ pub fn __majit_wrap_math_log(args: &[PyObjectRef]) -> PyResult {
     log_slow(args)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_math_log:
-    pyre_interpreter::gateway::BuiltinWrapperDescriptor =
-    pyre_interpreter::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", stringify!(__majit_wrap_math_log)),
-        func: __majit_wrap_math_log,
-    };
-
-/// Every `math` gateway with the path its `BUILTIN_WRAPPER_DESCRIPTORS` entry
-/// carries.  wasm32 links no descriptor slice, so `publish_optional_fnaddrs`
-/// binds these paths there instead, the way `jit_fnaddr` binds the
-/// interpreter's own gateways; the descent finds the jitcode by that path.
-macro_rules! math_gateway_fnaddrs {
-    ($($name:ident),* $(,)?) => {
-        ::paste::paste! {
-            pub fn math_gateway_fnaddrs() -> Vec<(&'static str, *const ())> {
-                vec![$((
-                    concat!(module_path!(), "::__majit_wrap_math_", stringify!($name)),
-                    [<__majit_wrap_math_ $name>] as *const (),
-                )),*]
-            }
-        }
-    };
-}
-
-math_gateway_fnaddrs!(
-    sqrt, sin, cos, tan, asin, acos, atan, tanh, asinh, acosh, atanh, log1p, cbrt, erf, erfc, ulp,
-    degrees, radians, fabs, exp, exp2, expm1, sinh, cosh, gamma, lgamma, floor, ceil, trunc, isqrt,
-    log, isclose, pow, fmod, copysign, remainder, atan2, ldexp
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_math_log,
+    __majit_wrap_math_log
 );
 
 /// The name of the canonical `math` builtin `callable` is, or `None` for any
@@ -825,15 +751,10 @@ pub fn __majit_wrap_math_ldexp(args: &[PyObjectRef]) -> PyResult {
     ldexp_slow(args)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_math_ldexp:
-    pyre_interpreter::gateway::BuiltinWrapperDescriptor =
-    pyre_interpreter::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", stringify!(__majit_wrap_math_ldexp)),
-        func: __majit_wrap_math_ldexp,
-    };
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_math_ldexp,
+    __majit_wrap_math_ldexp
+);
 
 /// `isqrt` on an exact positive machine int below `2**53`. Zero, a bool,
 /// a long and a negative stay in `isqrt`.
@@ -862,15 +783,10 @@ pub fn __majit_wrap_math_isqrt(args: &[PyObjectRef]) -> PyResult {
     isqrt_slow(args)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_math_isqrt:
-    pyre_interpreter::gateway::BuiltinWrapperDescriptor =
-    pyre_interpreter::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", stringify!(__majit_wrap_math_isqrt)),
-        func: __majit_wrap_math_isqrt,
-    };
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_math_isqrt,
+    __majit_wrap_math_isqrt
+);
 
 /// Keyword tolerances stay in `isclose`. This residual is the original body.
 #[majit_macros::dont_look_inside]
@@ -917,15 +833,10 @@ pub fn __majit_wrap_math_isclose(args: &[PyObjectRef]) -> PyResult {
     isclose_slow(args)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_math_isclose:
-    pyre_interpreter::gateway::BuiltinWrapperDescriptor =
-    pyre_interpreter::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", stringify!(__majit_wrap_math_isclose)),
-        func: __majit_wrap_math_isclose,
-    };
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_math_isclose,
+    __majit_wrap_math_isclose
+);
 
 /// Raw counterparts of `ll_math_floor` / `ll_math_ceil` for a guarded JIT fast
 /// path.  Both are total on finite input and cannot raise, so the walker emits
