@@ -9042,6 +9042,7 @@ impl<'a> Lowering<'a> {
                     .or_else(|| known_array_layout_const(&segments))
                     .or_else(|| self.const_eval_global(id))
                     .or_else(|| self.fold_size_const_global(id))
+                    .or_else(|| self.fold_transparent_int_const_global(id))
                     .or_else(|| self.fold_named_const_int_array_global(id))
                     .or_else(|| primitive_float_const(&segments))
                     .or_else(|| code_flags_const(&segments))
@@ -9203,13 +9204,13 @@ impl<'a> Lowering<'a> {
         };
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64)? as usize;
         let td = self.llbc.type_by_id(type_id)?;
-        let TypeDeclKind::Enum(variants) = &td.kind else {
-            return None;
-        };
-        if !type_decl_is_fieldless_enum(td, self.llbc) {
-            return None;
+        match &td.kind {
+            TypeDeclKind::Enum(variants) if type_decl_is_fieldless_enum(td, self.llbc) => {
+                variants.get(variant_idx)?.discriminant_i64()
+            }
+            TypeDeclKind::Opaque => opaque_fieldless_enum_tags(td)?.get(variant_idx).copied(),
+            _ => None,
         }
-        variants.get(variant_idx)?.discriminant_i64()
     }
 
     /// The trailing `bool` is `true` when the decl is a `TypeDeclKind::Struct`.
@@ -10109,6 +10110,30 @@ impl<'a> Lowering<'a> {
         Some(OpKind::ConstInt(
             self.size_align_const_from_tyexpr(want_align, &ty)?,
         ))
+    }
+
+    /// Fold a `NamedConst` whose initializer computes an integer and wraps
+    /// it in a single-field ADT (`from_bits_retain` + `Aggregate`).
+    ///
+    /// `bitflags!` associated consts (`impl Flags { const NAME: Self =
+    /// Self::from_bits_retain(1 << k) }`) compile to that shape. The init
+    /// function is a Transparent Unstructured body, so the numeric value
+    /// is in the LLBC; [`const_eval_init_body`] follows the wrapper Call
+    /// and the Aggregate. Foreign-crate consts whose init is `Opaque`
+    /// still miss this lane.
+    fn fold_transparent_int_const_global(&self, def_id: u64) -> Option<OpKind> {
+        let gd = self.llbc.global_by_id(def_id)?;
+        if gd
+            .rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("NamedConst")
+        {
+            return None;
+        }
+        let init_id = gd.rest.get("init")?.as_u64()?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
+        const_eval_init_body(self.llbc, &body)
     }
 
     /// The build-time byte size / alignment of a `size_of` / `align_of`
@@ -13828,7 +13853,7 @@ impl<'a> Lowering<'a> {
                     OpKind::Call {
                         target,
                         args: crate::model::call_args(args),
-                        result_ty: result_ty.clone(),
+                        result_ty,
                     }
                 }
             }
@@ -28862,8 +28887,18 @@ fn type_decl_is_fieldless_enum(td: &TypeDecl, llbc: &Llbc) -> bool {
                     .iter()
                     .all(|v| v.fields.iter().all(|f| tyref_is_zero_sized(&f.ty, llbc)))
         }
+        TypeDeclKind::Opaque => opaque_fieldless_enum_tags(td).is_some(),
         _ => false,
     }
+}
+
+/// The variant tags of an `Opaque` declaration whose layout is a tagged
+/// enum without fields: another crate's fieldless enum, which this
+/// artefact knows only by its layout.  Variant `i` is the value `tags[i]`,
+/// as the defining crate's `discriminant_i64` spells it.
+fn opaque_fieldless_enum_tags(td: &TypeDecl) -> Option<Vec<i64>> {
+    td.layout_for_target(&std::env::var("TARGET").unwrap_or_default())?
+        .fieldless_enum_tags()
 }
 
 /// The crate-stripped `module::Enum` spelling of a fieldless enum `ty`,
@@ -33459,10 +33494,18 @@ fn const_eval_init_body(llbc: &Llbc, u: &Unstructured) -> Option<OpKind> {
 }
 
 fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<ConstLit> {
+    const_eval_init_body_with_locals(llbc, u, depth, std::collections::HashMap::new())
+}
+
+fn const_eval_init_body_with_locals(
+    llbc: &Llbc,
+    u: &Unstructured,
+    depth: usize,
+    mut locals: std::collections::HashMap<u64, ConstLit>,
+) -> Option<ConstLit> {
     if depth > 32 {
         return None;
     }
-    let mut locals: std::collections::HashMap<u64, ConstLit> = std::collections::HashMap::new();
     let eval_operand =
         |locals: &std::collections::HashMap<u64, ConstLit>, op: &Operand| -> Option<ConstLit> {
             match op {
@@ -33544,6 +33587,29 @@ fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Opti
                             eval_operand(&locals, lhs)?,
                             eval_operand(&locals, rhs)?,
                         )?,
+                        // Single-field ADT wrapping an integer
+                        // (`repr(transparent)` newtype, bitflags
+                        // `from_bits_retain`).
+                        // A struct aggregate is `{"Adt": [type_id, null, ..]}`;
+                        // an enum variant (`Some(1)`) carries a variant
+                        // index and is not its payload.
+                        Rvalue::Aggregate(kind, operands) => {
+                            let is_struct = kind
+                                .get("Adt")
+                                .and_then(serde_json::Value::as_array)
+                                .and_then(|adt| adt.get(1))
+                                .is_some_and(serde_json::Value::is_null);
+                            if !is_struct {
+                                return None;
+                            }
+                            let [op] = operands.as_slice() else {
+                                return None;
+                            };
+                            match eval_operand(&locals, op)? {
+                                v @ (ConstLit::Int(_) | ConstLit::UInt(_) | ConstLit::Bool(_)) => v,
+                                _ => return None,
+                            }
+                        }
                         _ => return None,
                     };
                     // rustc computes each assignment at the destination's
@@ -33573,8 +33639,33 @@ fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Opti
                 let PlaceKind::Local(dst) = call.dest.kind else {
                     return None;
                 };
-                locals.insert(dst, const_eval_size_align_call(llbc, &call)?);
-                bb = target as usize;
+                if let Some(size) = const_eval_size_align_call(llbc, &call) {
+                    locals.insert(dst, size);
+                    bb = target as usize;
+                } else {
+                    let CallFunc::Regular(reg) = &call.func else {
+                        return None;
+                    };
+                    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                        return None;
+                    };
+                    let mut arg_vals = Vec::with_capacity(call.args.len());
+                    for op in &call.args {
+                        arg_vals.push(eval_operand(&locals, op)?);
+                    }
+                    let body = llbc.fn_by_id(*id)?.unstructured()?;
+                    let mut callee_locals = std::collections::HashMap::new();
+                    for (i, v) in arg_vals.into_iter().enumerate() {
+                        callee_locals.insert((i as u64) + 1, v);
+                    }
+                    let result =
+                        const_eval_init_body_with_locals(llbc, &body, depth + 1, callee_locals)?;
+                    locals.insert(
+                        dst,
+                        const_narrow_to_target(const_literal_ty(llbc, &call.dest.ty), result),
+                    );
+                    bb = target as usize;
+                }
             }
             _ => return None,
         }
@@ -38733,9 +38824,11 @@ mod tests {
             variant_layouts: vec![
                 majit_charon_reader::ullbc::VariantLayout {
                     field_offsets: vec![payload_off],
+                    tagger: None,
                 },
                 majit_charon_reader::ullbc::VariantLayout {
                     field_offsets: vec![payload_off],
+                    tagger: None,
                 },
             ],
             discriminator: Some(serde_json::json!({

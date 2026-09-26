@@ -101,24 +101,38 @@ pub fn call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyO
     // `self = jit.promote(self)`.
     let ct: &W_CType = unsafe { &*majit_metainterp::jit::promote(ct as *const W_CType) };
     if funcaddr == 0 {
-        return Err(PyError::runtime_error(format!(
-            "cannot call null function pointer from cdata '{}'",
-            ct.name()
-        )));
+        return Err(unsafe { PyError::from_exc_object(cannot_call_null(ct)) });
     }
     let nargs = fargs_len(ct.fargs);
     if ct.cif_descr != 0 {
         if args_w.len() != nargs {
-            return Err(PyError::type_error(format!(
-                "'{}' expects {} arguments, got {}",
-                ct.name(),
-                nargs,
-                args_w.len()
-            )));
+            return Err(unsafe { PyError::from_exc_object(wrong_nargs(ct, nargs, args_w.len())) });
         }
         return do_call(ct, funcaddr, args_w);
     }
     call_varargs(ct, funcaddr, args_w)
+}
+
+/// `W_CTypeFunc.call` — `oefmt("cannot call null function pointer from cdata '%s'")`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn cannot_call_null(ct: &W_CType) -> PyObjectRef {
+    PyError::runtime_error(format!(
+        "cannot call null function pointer from cdata '{}'",
+        ct.name()
+    ))
+    .to_exc_object()
+}
+
+/// `W_CTypeFunc.call` — `oefmt("'%s' expects %d arguments, got %d")`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn wrong_nargs(ct: &W_CType, expected: usize, got: usize) -> PyObjectRef {
+    PyError::type_error(format!(
+        "'{}' expects {} arguments, got {}",
+        ct.name(),
+        expected,
+        got
+    ))
+    .to_exc_object()
 }
 
 /// `len(self.fargs)` — the declared argument count of a function type.
@@ -223,15 +237,13 @@ fn do_call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyOb
     let called = 'body: {
         for i in 0..args_w.len() {
             let data = cdataobj::raw_ptradd(buffer, unsafe { exchange_arg(cif, i) });
-            // `self.fargs[i]` is read out of a list declared
-            // `_immutable_fields_ = ['fargs[*]']` (`ctypefunc.py:30`), so with
-            // the function type promoted the element is a trace constant and
-            // the `W_CType` dispatch below folds against it.  Here `fargs` is
-            // a tuple object whose items block shares one array identity with
-            // every object-strategy list, so the element read cannot carry
-            // that purity; promoting the element hands the trace the same
-            // constant behind one guard.
-            let w_argtype = majit_metainterp::jit::promote(farg(ct.fargs, i));
+            // `argtype = self.fargs[i]` (`ctypefunc.py` `_call`).  The
+            // constant comes from `fargs[*]` (`W_CTypeFunc._immutable_fields_`)
+            // through the tuple's `wrappeditems[*]` (`rclass.py
+            // _parse_field_list` IR_IMMUTABLE_ARRAY): a promoted function
+            // type makes the field, the items block, and the element
+            // `getarrayitem_gc_r_pure`.
+            let w_argtype = farg(ct.fargs, i);
             let argtype = match ctypeobj::ctype_arg(w_argtype) {
                 Ok(argtype) => argtype,
                 Err(e) => break 'body Err(e),
@@ -244,13 +256,7 @@ fn do_call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyOb
                 Err(e) => break 'body Err(e),
             }
         }
-        // `clibffi.py c_ffi_call` carries `save_err=RFFI_ERR_ALL |
-        // RFFI_ALT_ERRNO`, which swaps the thread's alternate errno into the C
-        // runtime around the foreign call.  Pyre spells that swap as its own
-        // two calls rather than as a flag the callee reads.
-        super::cerrno::errno_before();
         unsafe { jit_ffi_call(cif, funcaddr, buffer) };
-        super::cerrno::errno_after();
         let resultdata = cdataobj::raw_ptradd(buffer, unsafe { exchange_result(cif) });
         unsafe { ctypeobj::copy_and_convert_to_object(fresult, resultdata) }
     };
@@ -307,9 +313,7 @@ fn do_call_fargs(
                 Err(e) => break 'body Err(e),
             }
         }
-        super::cerrno::errno_before();
         unsafe { jit_ffi_call(cif, funcaddr, buffer) };
-        super::cerrno::errno_after();
         let resultdata = cdataobj::raw_ptradd(buffer, unsafe { exchange_result(cif) });
         unsafe { ctypeobj::copy_and_convert_to_object(fresult, resultdata) }
     };

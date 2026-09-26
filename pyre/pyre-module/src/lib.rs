@@ -746,7 +746,7 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         not(target_arch = "wasm32")
     ))]
     {
-        use module::_cffi_backend::{cdataobj, cerrno, ctypefunc, jit_libffi, misc};
+        use module::_cffi_backend::{cdataobj, ctypefunc, ctypeprim, jit_libffi, misc};
         single(
             entries,
             "pyre_interpreter::module::_cffi_backend::cdataobj::raw_malloc_varsize_char",
@@ -759,6 +759,16 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         );
         single(
             entries,
+            "pyre_interpreter::module::_cffi_backend::cdataobj::raw_malloc_varsize_zero",
+            cdataobj::raw_malloc_varsize_zero as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::cdataobj::raw_malloc_varsize_zero",
+            cdataobj::raw_malloc_varsize_zero as *const (),
+        );
+        single(
+            entries,
             "pyre_interpreter::module::_cffi_backend::cdataobj::raw_free",
             cdataobj::raw_free as *const (),
         );
@@ -766,26 +776,6 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
             entries,
             "pyre_module::module::_cffi_backend::cdataobj::raw_free",
             cdataobj::raw_free as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::cerrno::errno_before",
-            cerrno::errno_before as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::cerrno::errno_before",
-            cerrno::errno_before as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::cerrno::errno_after",
-            cerrno::errno_after as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::cerrno::errno_after",
-            cerrno::errno_after as *const (),
         );
         single(
             entries,
@@ -1257,6 +1247,28 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
             "pyre_module::module::_cffi_backend::misc::raw_write_f64",
             misc::raw_write_f64 as *const (),
         );
+        // `@jit.dont_look_inside` leaves of the `_CDataBase` descent, and the
+        // `raw_write_ptr` oopspec leaf.
+        for (interp, module, fnptr) in [
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeprim::copy_longdouble",
+                "pyre_module::module::_cffi_backend::ctypeprim::copy_longdouble",
+                ctypeprim::copy_longdouble as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::misc::raw_memcopy_opaque",
+                "pyre_module::module::_cffi_backend::misc::raw_memcopy_opaque",
+                misc::raw_memcopy_opaque as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::cdataobj::raw_write_ptr",
+                "pyre_module::module::_cffi_backend::cdataobj::raw_write_ptr",
+                cdataobj::raw_write_ptr as *const (),
+            ),
+        ] {
+            single(entries, interp, fnptr);
+            single(entries, module, fnptr);
+        }
     }
     #[cfg(all(
         feature = "full",
@@ -1452,6 +1464,76 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    /// `W_CTypePrimitiveLongDouble._copy_longdouble` is
+    /// `@jit.dont_look_inside`. The helper moved here with `_cffi_backend`.
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
+    #[test]
+    fn jit_trace_fnaddrs_covers_copy_longdouble() {
+        crate::register();
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        let expected =
+            crate::module::_cffi_backend::ctypeprim::copy_longdouble as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_module::module::_cffi_backend::ctypeprim::copy_longdouble"],
+            expected
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::module::_cffi_backend::ctypeprim::copy_longdouble"],
+            expected
+        );
+    }
+
+    /// `misc.py _raw_memcopy_opaque` is `@jit.dont_look_inside`.
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
+    #[test]
+    fn jit_trace_fnaddrs_covers_raw_memcopy_opaque() {
+        crate::register();
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        let expected =
+            crate::module::_cffi_backend::misc::raw_memcopy_opaque as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_module::module::_cffi_backend::misc::raw_memcopy_opaque"],
+            expected
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::module::_cffi_backend::misc::raw_memcopy_opaque"],
+            expected
+        );
+    }
+
+    /// `rffi.cast(rffi.CCHARPP, data)[0] = value` is the `raw_write_ptr` oopspec.
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
+    #[test]
+    fn jit_trace_fnaddrs_covers_raw_write_ptr() {
+        crate::register();
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        let expected =
+            crate::module::_cffi_backend::cdataobj::raw_write_ptr as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_module::module::_cffi_backend::cdataobj::raw_write_ptr"],
+            expected
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::module::_cffi_backend::cdataobj::raw_write_ptr"],
+            expected
+        );
+    }
 
     /// The `_csv::dialect_class::type_object` accessor is hand-written (not
     /// `#[pyre_methods]` / `py_class!`), yet the front recognizer stamps every

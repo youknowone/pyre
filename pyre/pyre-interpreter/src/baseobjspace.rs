@@ -9824,15 +9824,26 @@ pub fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
 /// `intobject.py` / `longobject.py` `_int_w`. For non-int/long
 /// objects, delegate to `space_int` (the `space.int(self)` protocol)
 /// and then re-apply `_int_w`. `allow_conversion=True` is implicit —
-/// the `unwrap_spec` call sites that pyre supports all opt in.
+/// the `unwrap_spec` call sites that pyre supports all opt in; the
+/// explicit spelling is [`int_w_allow_conversion`].
 ///
 /// Floats are explicitly rejected by `floatobject.py:177`.
 pub fn int_w(obj: PyObjectRef) -> Result<i64, PyError> {
+    int_w_allow_conversion(obj, true)
+}
+
+/// baseobjspace.py `ObjSpace.int_w(w_obj, allow_conversion)`; see
+/// [`int_w`].  With `allow_conversion=False` an object that is neither an
+/// `int` nor a `long` takes `W_Root._int_w`, `_typed_unwrap_error(space,
+/// "integer")`.
+pub fn int_w_allow_conversion(obj: PyObjectRef, allow_conversion: bool) -> Result<i64, PyError> {
     if obj.is_null() {
         return Err(PyError::type_error("int_w: null object"));
     }
-    // floatobject.py `int_w` — floats are explicitly rejected.
-    if unsafe { pyre_object::pyobject::is_float(obj) } {
+    // floatobject.py `int_w` — floats are explicitly rejected.  Without
+    // conversion a float reaches `_typed_unwrap_error` below, which is the
+    // message `W_FloatObject.int_w` raises.
+    if allow_conversion && unsafe { pyre_object::pyobject::is_float(obj) } {
         return Err(PyError::type_error(
             "an integer is required (got type float)",
         ));
@@ -9854,6 +9865,14 @@ pub fn int_w(obj: PyObjectRef) -> Result<i64, PyError> {
             return Ok(pyre_object::longobject::jit_bigint_to_i64_value(big));
         }
         return Err(PyError::overflow_error("int too large to convert to int"));
+    }
+    if !allow_conversion {
+        // baseobjspace.py `W_Root._int_w` → `_typed_unwrap_error(space,
+        // "integer")`, `"expected %s, got %T object"`.
+        return Err(PyError::type_error(format!(
+            "expected integer, got {} object",
+            object_functionstr_type_name(obj)
+        )));
     }
     // baseobjspace.py `w_obj = space.int(self)` — __int__ or __index__.
     let w_obj = space_int(obj)?;
@@ -16713,22 +16732,45 @@ pub fn float_w(obj: PyObjectRef) -> Result<f64, PyError> {
         }
     }
     let Some(method) = (unsafe { lookup(obj, "__float__") }) else {
-        return Err(PyError::type_error(format!(
-            "must be real number, not {}",
-            object_functionstr_type_name(obj)
-        )));
+        return Err(unsafe { PyError::from_exc_object(float_w_must_be_real(obj)) });
     };
-    let w_type = crate::typedef::r#type(obj)
-        .map(|w_type| w_type.as_ptr())
-        .unwrap_or(obj);
+    let w_type = match crate::typedef::r#type(obj) {
+        Some(w_type) => w_type.as_ptr(),
+        None => obj,
+    };
     let w_result = unsafe { get_and_call_function(method, obj, w_type, &[]) }?;
     if unsafe { pyre_object::is_float(w_result) } {
         return Ok(unsafe { pyre_object::w_float_get_value(w_result) });
     }
-    Err(PyError::type_error(format!(
+    Err(unsafe { PyError::from_exc_object(float_w_returned_non_float(w_result)) })
+}
+
+/// `DescrOperation.float` — `oefmt(space.w_TypeError, "must be real
+/// number, not %T", w_obj)`.
+///
+/// `error::oefmt` renders the message eagerly, so the rendering stays
+/// behind `dont_look_inside` and the helper answers the exception instance:
+/// one residual word, which the caller wraps into the `PyError` the way
+/// `OperationError` stores `w_value`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn float_w_must_be_real(obj: PyObjectRef) -> PyObjectRef {
+    PyError::type_error(format!(
+        "must be real number, not {}",
+        object_functionstr_type_name(obj)
+    ))
+    .to_exc_object()
+}
+
+/// `DescrOperation.float` — `oefmt(space.w_TypeError, "__float__ returned
+/// non-float (type '%T')", w_result)`, shaped as
+/// [`float_w_must_be_real`].
+#[majit_macros::dont_look_inside]
+pub(crate) fn float_w_returned_non_float(w_result: PyObjectRef) -> PyObjectRef {
+    PyError::type_error(format!(
         "__float__ returned non-float (type '{}')",
         object_functionstr_type_name(w_result)
-    )))
+    ))
+    .to_exc_object()
 }
 
 /// baseobjspace.py `getindex_w` with `w_exception=None` — apply

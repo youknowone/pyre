@@ -1027,12 +1027,6 @@ fn stamp_and_publish_label_targets(
 static JIT_EXC_VALUE: AtomicI64 = AtomicI64::new(0);
 static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
 
-thread_local! {
-    /// Cranelift/dynasm `JIT_THREADLOCAL_SLOTS` parity: `THREADLOCALREF_GET`
-    /// indexes this array by byte offset / 8.
-    static JIT_THREADLOCAL_SLOTS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
-}
-
 /// Residual-call scratch shared by emitted wasm and the host trampoline.
 /// Trampoline use is strictly LIFO: the host materialises every argument
 /// before invoking the callee, and the guest loads the result immediately on
@@ -1101,25 +1095,29 @@ pub fn jit_call_area_addr() -> usize {
     core::ptr::addr_of!(JIT_CALL_AREA) as usize
 }
 
-/// Read a thread-local slot at the given byte offset.
+/// `llop.threadlocalref_get`: the word at byte offset `offset` of this
+/// thread's `pypy_threadlocal_s`.
 pub extern "C" fn wasm_jit_threadlocalref_get(offset: i64) -> i64 {
-    JIT_THREADLOCAL_SLOTS.with(|slots| {
-        let slots = slots.borrow();
-        let idx = (offset / 8) as usize;
-        slots.get(idx).copied().unwrap_or(0)
-    })
+    majit_rlib::rthread::threadlocalref_get(offset as usize)
 }
 
 /// Write a thread-local slot that compiled traces may read back.
 pub fn jit_threadlocalref_set(offset: i64, value: i64) {
-    JIT_THREADLOCAL_SLOTS.with(|slots| {
-        let mut slots = slots.borrow_mut();
-        let idx = (offset / 8) as usize;
-        if idx >= slots.len() {
-            slots.resize(idx + 1, 0);
-        }
-        slots[idx] = value;
-    });
+    majit_rlib::rthread::threadlocalref_set(offset as usize, value);
+}
+
+/// callbuilder.py `write_real_errno`, run just before a CALL_RELEASE_GIL's
+/// raw call. The result is a dummy that keeps the `(i64)->i64` helper type.
+extern "C" fn wasm_jit_write_real_errno(save_err: i64) -> i64 {
+    majit_rlib::rposix::_errno_before(save_err);
+    0
+}
+
+/// callbuilder.py `read_real_errno`, run just after a CALL_RELEASE_GIL's
+/// raw call.
+extern "C" fn wasm_jit_read_real_errno(save_err: i64) -> i64 {
+    majit_rlib::rposix::_errno_after(save_err);
+    0
 }
 
 /// The per-thread GC box, and the accessors every trampoline reaches it through.
@@ -2479,6 +2477,8 @@ fn alloc_helpers() -> codegen::AllocHelpers {
         headerless_fn_ptr: wasm_jit_alloc_headerless as *const () as usize as i64,
         threadlocal_fn_ptr: wasm_jit_threadlocalref_get as *const () as usize as i64,
         fmod_fn_ptr: wasm_jit_fmod as *const () as usize as i64,
+        write_real_errno_fn_ptr: wasm_jit_write_real_errno as *const () as usize as i64,
+        read_real_errno_fn_ptr: wasm_jit_read_real_errno as *const () as usize as i64,
     }
 }
 

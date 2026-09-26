@@ -31,6 +31,7 @@ libc = { workspace = true }
 linkme = { workspace = true }
 bitflags = { workspace = true }
 majit-ir = { workspace = true }
+majit-jitcode = { workspace = true }
 majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }
 majit-rlib = { workspace = true }

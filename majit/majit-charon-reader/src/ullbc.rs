@@ -213,6 +213,24 @@ pub struct VariantLayout {
     /// [`FieldDecl`] order).
     #[serde(default)]
     pub field_offsets: Vec<u64>,
+    /// The writes that store this variant's tag, as
+    /// `[[offset, {"Unsigned": ["U8", "<value>"]}], ...]`. Kept raw; read
+    /// via [`VariantLayout::tag_i64`].
+    #[serde(default)]
+    pub tagger: Option<Value>,
+}
+
+impl VariantLayout {
+    /// The tag value this variant stores, when the tagger is a single
+    /// scalar write.
+    pub fn tag_i64(&self) -> Option<i64> {
+        let [write] = self.tagger.as_ref()?.as_array()?.as_slice() else {
+            return None;
+        };
+        let scalar = write.as_array()?.get(1)?;
+        let pair = scalar.get("Unsigned").or_else(|| scalar.get("Signed"))?;
+        pair.get(1)?.as_str()?.parse::<i64>().ok()
+    }
 }
 
 impl TypeDecl {
@@ -272,6 +290,30 @@ impl TypeLayout {
     /// Byte offset of field `field_idx` of a struct (the single variant).
     pub fn struct_field_offset(&self, field_idx: usize) -> Option<u64> {
         self.field_offset(0, field_idx)
+    }
+
+    /// The tag of every variant of a tagged enum none of whose variants
+    /// has a field, in variant order; `None` for any other layout (a
+    /// struct or single-variant type has no `Branch` discriminator).
+    ///
+    /// A dependency's enum reaches another crate's artefact as an `Opaque`
+    /// declaration that keeps only this layout, and the tags are the only
+    /// place that artefact spells the variants' values.
+    pub fn fieldless_enum_tags(&self) -> Option<Vec<i64>> {
+        self.discriminant_offset()?;
+        if self.variant_layouts.is_empty() {
+            return None;
+        }
+        self.variant_layouts
+            .iter()
+            .map(|variant| {
+                if variant.field_offsets.is_empty() {
+                    variant.tag_i64()
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Byte position of the discriminant tag (`discriminator.Branch.offset`).
@@ -990,6 +1032,38 @@ mod tests {
         assert_eq!(layout.field_offset(2, 0), None);
         assert_eq!(layout.discriminant_offset(), Some(0));
         assert_eq!(layout.discriminant_int_type(), Some("u8"));
+    }
+
+    /// A fieldless enum's variant values are the tags its layout writes;
+    /// a struct, or an enum with a field, has none.
+    #[test]
+    fn fieldless_enum_tags_come_from_the_taggers() {
+        let json = r#"{
+            "size": 1, "align": 1,
+            "discriminator": {"Branch": {"offset": 0, "int_ty": {"Signed": "I8"}}},
+            "variant_layouts": [
+                {"field_offsets": [], "tagger": [[0, {"Signed": ["I8", "-1"]}]]},
+                {"field_offsets": [], "tagger": [[0, {"Signed": ["I8", "4"]}]]}
+            ]
+        }"#;
+        let layout: TypeLayout = serde_json::from_str(json).unwrap();
+        assert_eq!(layout.fieldless_enum_tags(), Some(vec![-1, 4]));
+
+        let unit_struct: TypeLayout =
+            serde_json::from_str(r#"{"size": 0, "variant_layouts": [{"field_offsets": []}]}"#)
+                .unwrap();
+        assert_eq!(unit_struct.fieldless_enum_tags(), None);
+
+        let payload = r#"{
+            "size": 16,
+            "discriminator": {"Branch": {"offset": 0, "int_ty": {"Unsigned": "U8"}}},
+            "variant_layouts": [
+                {"field_offsets": [], "tagger": [[0, {"Unsigned": ["U8", "0"]}]]},
+                {"field_offsets": [8], "tagger": [[0, {"Unsigned": ["U8", "1"]}]]}
+            ]
+        }"#;
+        let payload: TypeLayout = serde_json::from_str(payload).unwrap();
+        assert_eq!(payload.fieldless_enum_tags(), None);
     }
 
     #[test]
