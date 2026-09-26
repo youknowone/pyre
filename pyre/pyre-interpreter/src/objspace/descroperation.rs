@@ -7222,6 +7222,9 @@ macro_rules! ldexp_exact_bits {
     };
 }
 
+/// Only valid on the exact arm: the caller has already checked
+/// `-1022 <= exp <= 1023`. Outside it the exponent field wraps, and the
+/// result is not `x * 2**exp`.
 #[inline(never)]
 pub fn _float_ldexp_raw(x: f64, exp: i64) -> f64 {
     ldexp_exact_bits!(x, exp)

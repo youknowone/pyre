@@ -2049,11 +2049,7 @@ pub fn sumprod(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn frexp(args: &[PyObjectRef]) -> PyResult {
-    if args.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
-            "frexp() takes exactly 1 argument",
-        ));
-    }
+    pyre_interpreter::gateway::check_declared_positional_arity("frexp", 1, args)?;
     let (m, e) = pymath::math::frexp(try_get_double(args[0])?);
     let mut fields = pyre_object::gc_roots::RootedItems::new();
     fields.push(floatobject::w_float_new(m));
