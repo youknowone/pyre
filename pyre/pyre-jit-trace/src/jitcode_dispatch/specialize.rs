@@ -3978,7 +3978,6 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -7456,7 +7455,6 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
 }
-
 
 /// #171/#11 Approach C, SUBSCRIPT slice: walker-native PURE element load
 /// for a canonical array-backed `W_TupleObject[i]` (the tuple analogue of
@@ -15933,7 +15931,6 @@ pub(crate) fn try_walker_specialize_builtin_fold1<Sym: WalkSym>(
     Ok(None)
 }
 
-
 /// `float(x)` on an exact int/float argument: inline the conversion
 /// (`W_IntObject.descr_float` → `space.newfloat`, or the identity
 /// `float(f) is f` for an exact float) instead of the opaque
@@ -17146,7 +17143,6 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
     walker_emit_jit_int_str_padded(ctx, op.pc, value, boxed_result, pad, dst)
 }
 
-
 /// `s.startswith(prefix)` / `s.endswith(suffix)` on two exact `str`s:
 /// `rstring.py startswith` / `endswith` as one elidable `call_i`, instead of
 /// the MayForce residual through the bound builtin.  The recorded loop in
@@ -17289,9 +17285,6 @@ pub(crate) fn try_walker_specialize_str_prefix_match<Sym: WalkSym>(
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
     Ok(Some(()))
 }
-
-
-
 
 /// BUILD_STRING — already-string fragments concatenated by
 /// `pyopcode.py BUILD_STRING`.
@@ -19552,7 +19545,6 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', new_op)?;
     Ok(Some(()))
 }
-
 
 /// Walker-native RAISE_VARARGS inline-built-exception fast path. The
 /// `RaiseVarargs` residual is `normalize_raise_varargs_jit(frame, exc,
@@ -22589,7 +22581,6 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
 
     Ok(Some(item))
 }
-
 
 /// Both operands of a `str` comparison, with their concrete objects —
 /// the gate of [`try_walker_specialize_compare_op_str`].
