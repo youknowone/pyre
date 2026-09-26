@@ -478,8 +478,11 @@ pub fn load_extension_module(
         // `create_extension_module` takes the CFFI branch before it reaches the
         // extension cache, so a generated module is rebuilt on every import.
         // Serving one from the cache restores `name` alone and leaves the
-        // `name.lib` entry the initializer also registers missing.
-        let cffi = lookup_cffi_init(handle, name).is_some();
+        // `name.lib` entry the initializer also registers missing. The CFFI
+        // branch runs only with the `pyre-module` hooks; without them the
+        // `PyInit_*` module is the one cached.
+        let cffi = lookup_cffi_init(handle, name).is_some()
+            && crate::importing::optional_module_hooks().is_some();
         if !cffi && lookup_init(handle, name)?.is_none() {
             return Err(missing_init_error(name, path));
         }
