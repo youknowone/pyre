@@ -7973,15 +7973,45 @@ pub(crate) fn try_walker_specialize_math_frexp<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor {
+        return Ok(None);
+    }
     if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
         if is_math_builtin(callable, "frexp") && r_args.len() >= 3 {
-            walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
-            if try_walker_orthodox_frexp(ctx, op.pc, r_args[2], operands[0], dst, 'r')?.is_some() {
-                return Ok(Some(()));
+            // Every decline that needs no trace runs before the callable
+            // guard, so a declined call leaves nothing recorded.
+            if let Some((is_int, x)) = frexp_fold_operand(operands[0]) {
+                walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
+                if try_walker_orthodox_frexp(ctx, op.pc, r_args[2], operands[0], is_int, x, dst)?
+                    .is_some()
+                {
+                    return Ok(Some(()));
+                }
             }
         }
     }
     Ok(None)
+}
+
+/// The unboxed value of an exact int/bool/float `obj` the frexp leaves
+/// accept, with whether it came from an int.  The leaves assume a normal
+/// finite non-zero: specials and subnormals stay on the residual, matching
+/// ll_math_frexp's first-arm return of `(x, 0)`.
+fn frexp_fold_operand(obj: pyre_object::PyObjectRef) -> Option<(bool, f64)> {
+    if !unsafe { pyre_object::is_exact_builtin_instance(obj) } {
+        return None;
+    }
+    let (is_int, x) = if unsafe { pyre_object::is_float(obj) } {
+        (false, unsafe { pyre_object::w_float_get_value(obj) })
+    } else if unsafe { pyre_object::is_int(obj) || pyre_object::is_bool(obj) } {
+        (true, unsafe { pyre_object::w_int_get_value(obj) as f64 })
+    } else {
+        return None;
+    };
+    if !x.is_finite() || x == 0.0 || !x.abs().is_normal() {
+        return None;
+    }
+    Some((is_int, x))
 }
 
 fn try_walker_orthodox_frexp<Sym: WalkSym>(
@@ -7989,30 +8019,13 @@ fn try_walker_orthodox_frexp<Sym: WalkSym>(
     op_pc: usize,
     operand: OpRef,
     obj: pyre_object::PyObjectRef,
+    is_int: bool,
+    x: f64,
     dst: usize,
-    dst_bank: char,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
-    if !ctx.is_authoritative_executor || dst_bank != 'r' {
-        return Ok(None);
-    }
-    if !unsafe { pyre_object::is_exact_builtin_instance(obj) } {
-        return Ok(None);
-    }
-    let (is_int, x) = if unsafe { pyre_object::is_float(obj) } {
-        (false, unsafe { pyre_object::w_float_get_value(obj) })
-    } else if unsafe { pyre_object::is_int(obj) || pyre_object::is_bool(obj) } {
-        (true, unsafe { pyre_object::w_int_get_value(obj) as f64 })
-    } else {
-        return Ok(None);
-    };
+    let dst_bank = 'r';
     let xa =
         walker_coerce_dispatching_operand_to_float(ctx, op_pc, operand, obj, is_int, x, false)?;
-    // The leaves assume a normal finite non-zero: specials and
-    // subnormals stay on the residual, matching ll_math_frexp's
-    // first-arm return of `(x, 0)`.
-    if !x.is_finite() || x == 0.0 || !x.abs().is_normal() {
-        return Ok(None);
-    }
     // `MIN_POSITIVE <= |x| < inf`: finite, normal, non-zero.
     let min_normal = ctx
         .trace_ctx
