@@ -6,7 +6,7 @@
 //! split MIR basic blocks, so the literal definition may be in a straight-line
 //! predecessor rather than in the call's block.
 
-use crate::flowspace::model::Variable;
+use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{BlockId, CallTarget, FunctionGraph, LinkArg, OpKind};
 
 const BOX_STR_CONSTANT_PATH: [&str; 3] = [
@@ -15,7 +15,7 @@ const BOX_STR_CONSTANT_PATH: [&str; 3] = [
     "box_str_constant",
 ];
 
-fn is_box_str_constant_call(kind: &OpKind) -> Option<&Variable> {
+fn is_box_str_constant_call(kind: &OpKind) -> Option<&LinkArg> {
     let OpKind::Call {
         target: CallTarget::FunctionPath { segments, .. },
         args,
@@ -126,7 +126,15 @@ pub fn fold_box_str_constants(graph: &mut FunctionGraph) {
             let Some(arg) = is_box_str_constant_call(&op.kind) else {
                 continue;
             };
-            if let Some(bytes) = dominating_literal(graph, block.id, op_index, arg) {
+            let literal = match arg {
+                LinkArg::Value(var) => dominating_literal(graph, block.id, op_index, var),
+                LinkArg::Const(c) => match &c.value {
+                    ConstValue::ByteStr(bytes) => Some(bytes.clone()),
+                    ConstValue::UniStr(s) => Some(s.as_bytes().to_vec()),
+                    _ => None,
+                },
+            };
+            if let Some(bytes) = literal {
                 rewrites.push((block.id, op_index, bytes));
             }
         }
@@ -162,6 +170,39 @@ mod tests {
             args: crate::model::call_args(vec![arg]),
             result_ty: ValueType::Ref(None),
         }
+    }
+
+    /// A constant operand is not a `Variable`; a string constant folds
+    /// directly and any other constant leaves the call alone.
+    #[test]
+    fn a_constant_operand_folds_without_a_producer() {
+        let mut graph = FunctionGraph::new("box_const_operand");
+        let entry = graph.startblock;
+        let call = |value: ConstValue| OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: BOX_STR_CONSTANT_PATH.map(str::to_string).to_vec(),
+                fun_decl_id: None,
+            },
+            args: vec![LinkArg::from(value)],
+            result_ty: ValueType::Ref(None),
+        };
+        graph
+            .push_op_var(entry, call(ConstValue::UniStr("__len__".into())), true)
+            .expect("box call must produce a value");
+        graph
+            .push_op_var(entry, call(ConstValue::Int(7)), true)
+            .expect("box call must produce a value");
+
+        fold_box_str_constants(&mut graph);
+
+        assert_eq!(
+            graph.block(entry).operations[0].kind,
+            OpKind::ConstInternedStr(b"__len__".to_vec())
+        );
+        assert_eq!(
+            graph.block(entry).operations[1].kind,
+            call(ConstValue::Int(7))
+        );
     }
 
     #[test]
