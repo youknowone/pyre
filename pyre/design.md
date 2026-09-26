@@ -595,20 +595,19 @@ compiled path is close to what it could be.
 
 ### 3.8 The fold layer: hand-written compensation for an opaque objspace
 
-pyre records traces through 68 `try_walker_specialize_*` functions — 64 in
+pyre records traces through 66 `try_walker_specialize_*` functions — 62 in
 `jitcode_dispatch/specialize.rs`, one in `residual_call.rs`
 (`load_deref`) and three in `inline_call.rs` (`instance_iter`,
-`instance_next`, `generator_next`) — described by the 78 rows of
+`instance_next`, `generator_next`) — described by the 73 rows of
 `SPEC_FOLD_ROWS` (one fold can back several rows, and row-less folds exist).
-Five of those rows are not folds at all: every label ending in `_descent` —
-`subscr_tuple_descent`, `binary_op_descent`, `compare_op_descent`,
-`builtin_len_descent` and `load_super_attr_descent` — carry a row only so they
-can be suppressed and A/B'd like the fold they replaced. Four of the five
-(`subscr_tuple_descent`, `binary_op_descent`, `compare_op_descent`,
-`load_super_attr_descent`) are orthodox sub-walks through a
+Four of those rows are not folds at all: every label ending in `_descent` —
+`subscr_tuple_descent`, `binary_op_descent`, `compare_op_descent` and
+`builtin_len_descent` — carry a row only so they can be suppressed and A/B'd
+like the fold they replaced. Three of the four (`subscr_tuple_descent`,
+`binary_op_descent`, `compare_op_descent`) are orthodox sub-walks through a
 `try_walker_orthodox_*` entry, while `builtin_len_descent` gates the generated
 gateway shortcut in `inline_call.rs` instead. Counting them as debt
-overstates it by five; the fold count is 73. The three unary descent rows
+overstates it by four; the fold count is 69. The three unary descent rows
 retired when `flatten` began emitting canonical codewriter `inline_call_r_r`
 operations to `descroperation::pos`, `neg` and `invert`. `pos` and `invert`
 enter those bodies with no residual-call gate. The `unary_neg` and `unary_not`
@@ -623,18 +622,18 @@ Every command below is quoted as it must be typed.
 
 * Rows — select the complete `spec_folds!` invocation by its symbol boundaries:
   `sed -n '/^spec_folds! {/,/^}/p' pyre/pyre-jit-trace/src/jitcode_dispatch/diag.rs | rg -cF '=> ("'`
-  answers 78; replacing the final matcher with `rg -cF '_descent"'` answers
-  the 5 descent rows. A fixed line range is invalid here: the previous range
+  answers 73; replacing the final matcher with `rg -cF '_descent"'` answers
+  the 4 descent rows. A fixed line range is invalid here: the previous range
   ended before the macro did and published a stale count.
   `-F` is load-bearing: without it the `(` is an unclosed regex group and
   `rg` exits 2 rather than counting.
-* Definitions — `rg -c` reports one count *per file*, so it answers 64/1/3
-  rather than 68. Sum the matches instead:
+* Definitions — `rg -c` reports one count *per file*, so it answers 62/1/3
+  rather than 66. Sum the matches instead:
   `rg -o 'fn try_walker_specialize_' pyre/ majit/ -g '*.rs' | wc -l`.
   The descent entries are a separate population:
-  `rg -o 'fn try_walker_orthodox_' pyre/ majit/ -g '*.rs' | wc -l` answers 19.
+  `rg -o 'fn try_walker_orthodox_' pyre/ majit/ -g '*.rs' | wc -l` answers 18.
 * Corpus — `ls pyre/bench/synth/*.py | wc -l`. Non-recursive **on purpose**:
-  it answers 557. A recursive walk also sweeps archived subdirectories and
+  it answers 559. A recursive walk also sweeps archived subdirectories and
   over-counts the active corpus. Do not "fix" this to a recursive `find`.
 
 `specialize.rs`'s own line count moved seven times in seven commits and is
@@ -664,7 +663,7 @@ boundaries contain judgement calls (`set_add_method` may be read as a call or
 a heap mutation, and the `super` rows mix virtual construction with frame
 access), so attaching an independently edited `n` column made the table look
 exact while letting it disagree with `SPEC_FOLD_ROWS`. The reproducible split
-is 73 hand-written rows plus 5 orthodox descent rows, re-derived on 2026-09-26.
+is 69 hand-written rows plus 4 orthodox descent rows, re-derived on 2026-09-26.
 
 Four groups have only downstream cleanup upstream, three have nothing at all,
 and exactly one has a counterpart that is a pass rather than a consumer. So
@@ -698,10 +697,10 @@ That is a missing capability rather than dead weight — closure-callee
 inlining needs the fold, the fold needs constant cells, and constant cells
 need the inlining.
 
-**What does not hold it in place.** 57 fixtures carry a `spec-folds=` header
-and they name 54 distinct rows between them (3 of those descent rows;
-`subscr_tuple_descent` and `load_super_attr_descent` are named by none), so
-24 of the 78 rows have no fixture coupling at all
+**What does not hold it in place.** 54 fixtures carry a `spec-folds=` header
+and they name 50 distinct rows between them (3 of those descent rows;
+`subscr_tuple_descent` is named by none), so
+23 of the 73 rows have no fixture coupling at all
 (`rg -o --no-filename --max-depth 1 'spec-folds=[^ ]+' pyre/bench/synth -g '*.py' | sed 's/spec-folds=//' | tr ',' '\n' | sort -u | wc -l`;
 `-o` must be spelled without `-h`, which is `rg`'s help flag).  Retirement
 is blocked by reach, not by headers.
