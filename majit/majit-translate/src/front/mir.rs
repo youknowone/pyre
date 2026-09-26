@@ -16353,7 +16353,7 @@ impl<'a> Lowering<'a> {
                     {
                         old
                     } else if let Some(old) =
-                        self.exchange_deref_aggregate(mir_bb, &place, Some(args[1].clone()))?
+                        self.exchange_deref_aggregate(mir_bb, &place, args[1].clone())?
                     {
                         old
                     } else {
@@ -16404,10 +16404,27 @@ impl<'a> Lowering<'a> {
                 if let Some(place) = self.bare_deref_place(&slot)
                     && self.move_plan(&place.ty).is_some()
                 {
-                    // `mem::take` is `replace(dest, T::default())`. A scalar
-                    // field's `Default` is the zero this span stores; a
-                    // non-scalar field has no literal and stays a call.
-                    let Some(old) = self.exchange_deref_aggregate(mir_bb, &place, None)? else {
+                    // `mem::take` is `replace(dest, <T as Default>::default())`.
+                    // Resolve that call before any read: a missing impl
+                    // leaves the whole `take` residual and emits nothing.
+                    let Some(target) = self.default_call_for_take(reg, &place.ty) else {
+                        return Ok(false);
+                    };
+                    let result_ty =
+                        tyref_to_value_type_with(&place.ty, self.llbc, self.tombstoned_leaves);
+                    let bb_id = self.block_id[mir_bb];
+                    let fresh = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(fresh.clone()),
+                        kind: OpKind::Call {
+                            target,
+                            args: Vec::new(),
+                            result_ty,
+                        },
+                    });
+                    let Some(old) = self.exchange_deref_aggregate(mir_bb, &place, fresh)? else {
                         return Ok(false);
                     };
                     self.local_var[dest_local] = Some(old);
@@ -16427,6 +16444,115 @@ impl<'a> Lowering<'a> {
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(true)
+    }
+
+    /// `<T as Default>::default` bound by `take`'s trait obligation.
+    ///
+    /// The call carries the `TraitImpl` of `core::default::Default` for
+    /// `T`. That impl's `default` method is the assoc-fn target
+    /// `call_target_segments` would emit for a direct call: no receiver,
+    /// so a `FunctionPath` of `[owner, default]`.
+    fn default_call_for_take(&self, reg: &RegularCall, ty: &TyRef) -> Option<CallTarget> {
+        let want = self.tyref_adt_def_id(ty)?;
+        let refs = reg.generics.get("trait_refs")?.as_array()?;
+        for raw in refs {
+            let node = peel_hashcons_value(self.llbc, raw);
+            let Some(obj) = node.as_object() else {
+                continue;
+            };
+            let Some(impl_id) = obj
+                .get("kind")
+                .and_then(|kind| kind.get("TraitImpl"))
+                .and_then(|impl_row| impl_row.get("id"))
+                .and_then(serde_json::Value::as_u64)
+            else {
+                continue;
+            };
+            let Some(trait_id) = obj
+                .get("trait_decl_ref")
+                .and_then(|decl| decl.get("skip_binder"))
+                .and_then(|binder| binder.get("id"))
+                .and_then(serde_json::Value::as_u64)
+            else {
+                continue;
+            };
+            let Some(trait_path) = self
+                .llbc
+                .trait_by_id(trait_id)
+                .map(|decl| decl.item_meta.name_path())
+            else {
+                continue;
+            };
+            if trait_path != "core::default::Default" {
+                continue;
+            }
+            let Some(ti) = self.llbc.trait_impl_by_id(impl_id) else {
+                continue;
+            };
+            let Some(self_ty) = ti
+                .get("impl_trait")
+                .and_then(|row| row.get("generics"))
+                .and_then(|generics| generics.get("types"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|types| types.first())
+            else {
+                continue;
+            };
+            if self.resolve_tyexpr_to_adt_def_id(self_ty) != Some(want) {
+                continue;
+            }
+            let Some(methods) = ti.get("methods").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for method in methods {
+                let Some(fid) = method
+                    .get("skip_binder")
+                    .and_then(|binder| binder.get("id"))
+                    .and_then(serde_json::Value::as_u64)
+                else {
+                    continue;
+                };
+                let Some(fd) = self.llbc.fn_by_id(fid) else {
+                    continue;
+                };
+                if fd.item_meta.name_path().rsplit("::").next() != Some("default") {
+                    continue;
+                }
+                return Some(self.assoc_fn_call_target(fd));
+            }
+        }
+        None
+    }
+
+    /// Call target of an impl-owned function, matching `call_target_segments`
+    /// for a direct call of `fd`.
+    fn assoc_fn_call_target(&self, fd: &FunDecl) -> CallTarget {
+        let method_hint = self.impl_method_owner(fd);
+        let segments = if method_hint.is_none()
+            && let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(self.llbc, fd)
+        {
+            let mut v: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
+            v.push(leaf);
+            v
+        } else {
+            fd.item_meta
+                .name_path()
+                .split("::")
+                .map(str::to_string)
+                .collect()
+        };
+        let mut target = match method_hint {
+            Some((owner_root, leaf)) => CallTarget::method(leaf, Some(owner_root)),
+            None => CallTarget::FunctionPath {
+                segments,
+                fun_decl_id: None,
+            },
+        };
+        target = target.with_fun_decl_id(fd.def_id);
+        if matches!(target, CallTarget::Method { .. }) {
+            target = target.with_resolved_path(registered_path_for_fun_decl(self.llbc, fd));
+        }
+        target
     }
 
     fn mem_slot(&self, local: Option<usize>) -> Option<MemSlot> {
@@ -16541,8 +16667,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// Read `place`'s fields into a fresh aggregate, then store `new_value`'s
-    /// fields over it. `None` as `new_value` stores the zero of each scalar
-    /// field (`mem::take`). `Ok(None)` leaves the residual call.
+    /// fields over it. `Ok(None)` leaves the residual call.
     ///
     /// `rffi.py` `_get_structcopy_fn` copies an inline struct one field at a
     /// time. The offsets are Charon's `variant_layouts`, so a 16-byte enum
@@ -16551,16 +16676,12 @@ impl<'a> Lowering<'a> {
         &mut self,
         mir_bb: usize,
         place: &Place,
-        new_value: Option<Variable>,
+        new_value: Variable,
     ) -> Result<Option<Variable>, LowerError> {
         let Some(old) = self.read_moved_aggregate(mir_bb, place)? else {
             return Ok(None);
         };
-        let stored = match new_value {
-            Some(value) => self.store_moved_aggregate(mir_bb, place, &value)?,
-            None => self.store_zero_aggregate(mir_bb, place)?,
-        };
-        if !stored {
+        if !self.store_moved_aggregate(mir_bb, place, &new_value)? {
             return Ok(None);
         }
         Ok(Some(old))
@@ -16599,21 +16720,6 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    fn store_zero_aggregate(&mut self, mir_bb: usize, place: &Place) -> Result<bool, LowerError> {
-        let Some(plan) = self.move_plan(&place.ty) else {
-            return Ok(false);
-        };
-        if plan.spans.iter().any(|span| span.zero_kind().is_none()) {
-            return Ok(false);
-        }
-        let base = self.deref_base(mir_bb, place)?;
-        for span in &plan.spans {
-            let zero = self.emit_span_zero(mir_bb, span);
-            self.emit_span_write(mir_bb, &base, span, zero);
-        }
-        Ok(true)
-    }
-
     fn deref_base(&mut self, mir_bb: usize, place: &Place) -> Result<Variable, LowerError> {
         let PlaceKind::Projection(inner, _) = &place.kind else {
             return Err(LowerError::Unsupported(format!(
@@ -16625,10 +16731,9 @@ impl<'a> Lowering<'a> {
 
     /// Charon fields of a multi-word inline value. A transparent newtype
     /// (`Dynamic` over `Union`) contributes the inner type's fields. A
-    /// struct field is a `getfield`/`setfield`. An enum contributes one
-    /// raw span per non-overlapping layout field, at that field's byte
-    /// size — a wide JIT tag must not swallow the payload that sits in
-    /// the next bytes.
+    /// struct field and an enum field are both `getfield`/`setfield`.
+    /// Overlapping enum fields keep the wider span. A wide JIT tag must
+    /// not swallow the payload that sits in the next bytes.
     fn move_plan(&self, ty: &TyRef) -> Option<MovePlan> {
         let id = self.tyref_adt_def_id(ty)?;
         let td = self.llbc.type_by_id(id)?;
@@ -16715,15 +16820,16 @@ impl<'a> Lowering<'a> {
                     ));
                     for (i, field) in variant.fields.iter().enumerate() {
                         let Some(offset) = layout.field_offset(vidx, i) else {
-                            continue;
+                            return None;
                         };
-                        let Some((_item_ty, itemsize, _is_signed)) =
-                            self.span_raw_for_ty(&field.ty)
-                        else {
-                            continue;
+                        let Some((_, itemsize, _)) = self.span_raw_for_ty(&field.ty) else {
+                            return None;
                         };
-                        if itemsize == 0 || itemsize > 8 {
+                        if itemsize == 0 {
                             continue;
+                        }
+                        if itemsize > 8 {
+                            return None;
                         }
                         let name = field.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
                         let value_ty =
@@ -16771,33 +16877,18 @@ impl<'a> Lowering<'a> {
         let result = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        let kind = match &span.kind {
-            SpanKind::Field {
-                name,
-                owner,
-                owner_id,
-                ty,
-            } => OpKind::FieldRead {
-                base: base.clone(),
-                field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
-                    .with_owner_id(Some(*owner_id)),
-                ty: ty.clone(),
-                pure: false,
-            },
-            SpanKind::Raw {
-                item_ty,
-                itemsize,
-                is_signed,
-            } => {
-                let offset = self.emit_span_offset(bb_id, span.offset);
-                OpKind::RawLoad {
-                    base: base.clone(),
-                    offset,
-                    item_ty: item_ty.clone(),
-                    itemsize: *itemsize,
-                    is_item_signed: *is_signed,
-                }
-            }
+        let SpanKind::Field {
+            name,
+            owner,
+            owner_id,
+            ty,
+        } = &span.kind;
+        let kind = OpKind::FieldRead {
+            base: base.clone(),
+            field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
+                .with_owner_id(Some(*owner_id)),
+            ty: ty.clone(),
+            pure: false,
         };
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result.clone()),
@@ -16814,63 +16905,23 @@ impl<'a> Lowering<'a> {
         value: Variable,
     ) {
         let bb_id = self.block_id[mir_bb];
-        let kind = match &span.kind {
-            SpanKind::Field {
-                name,
-                owner,
-                owner_id,
-                ty,
-            } => OpKind::FieldWrite {
-                base: base.clone(),
-                field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
-                    .with_owner_id(Some(*owner_id)),
-                value: crate::model::LinkArg::Value(value),
-                ty: ty.clone(),
-            },
-            SpanKind::Raw {
-                item_ty,
-                itemsize,
-                is_signed,
-            } => {
-                let offset = self.emit_span_offset(bb_id, span.offset);
-                OpKind::RawStore {
-                    base: base.clone(),
-                    offset,
-                    value,
-                    item_ty: item_ty.clone(),
-                    itemsize: *itemsize,
-                    is_item_signed: *is_signed,
-                }
-            }
+        let SpanKind::Field {
+            name,
+            owner,
+            owner_id,
+            ty,
+        } = &span.kind;
+        let kind = OpKind::FieldWrite {
+            base: base.clone(),
+            field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
+                .with_owner_id(Some(*owner_id)),
+            value: crate::model::LinkArg::Value(value),
+            ty: ty.clone(),
         };
         self.graph
             .block_mut(bb_id)
             .operations
             .push(SpaceOperation { result: None, kind });
-    }
-
-    fn emit_span_offset(&mut self, bb_id: crate::model::BlockId, offset: u64) -> Variable {
-        let var = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(var.clone()),
-            kind: OpKind::ConstInt(offset as i64),
-        });
-        var
-    }
-
-    fn emit_span_zero(&mut self, mir_bb: usize, span: &MoveSpan) -> Variable {
-        let bb_id = self.block_id[mir_bb];
-        let kind = span.zero_kind().expect("caller checked zero_kind");
-        let var = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(var.clone()),
-            kind,
-        });
-        var
     }
 
     /// Fresh aggregate holding `parts`, in `plan.spans` order. The
@@ -20249,6 +20300,15 @@ impl<'a> Lowering<'a> {
                 result_ty,
             };
         }
+        // `Result<T, E>::branch` returns
+        // `ControlFlow<Result<Infallible, E>, T>`. `Break`'s payload is
+        // that `Result`, not `E`. `adt_node_class_root_with` declines a
+        // `core` ADT that still has type arguments, so
+        // `tyref_to_value_type_with` banks `Result<Infallible, E>` as
+        // `Ref(None)`. That kind is not `E`. The match builds `Err(e)`
+        // when the two kinds differ. rustc lays this `Result` out as `E`
+        // with no discriminant, because `Ok(Infallible)` is uninhabited;
+        // the translator does not collapse the kind to `E`.
         let payloads = crate::model::ResultBranchPayloads {
             ok: adt_variant_payload_type(recv_ty, "Ok", self.llbc, self.tombstoned_leaves),
             err: adt_variant_payload_type(recv_ty, "Err", self.llbc, self.tombstoned_leaves),
@@ -27710,47 +27770,44 @@ struct MoveSpan {
 }
 
 enum SpanKind {
-    /// Named struct field. `getfield_gc` / `setfield_gc`.
+    /// Named field. `getfield_gc` / `setfield_gc`.
     Field {
         name: String,
         owner: String,
         owner_id: majit_ir::descr::StructId,
         ty: ValueType,
     },
-    /// Enum layout byte. Width is the Charon field, not the JIT tag model.
-    Raw {
-        item_ty: ValueType,
-        itemsize: usize,
-        is_signed: bool,
-    },
 }
 
-impl SpanKind {
-    fn size(&self) -> usize {
-        match self {
-            SpanKind::Field { ty, .. } => match ty {
-                ValueType::Float | ValueType::Int | ValueType::Unsigned | ValueType::Ref(_) => 8,
-                ValueType::Bool => 1,
-                _ => 8,
-            },
-            SpanKind::Raw { itemsize, .. } => *itemsize,
-        }
-    }
-}
-
-impl MoveSpan {
-    fn zero_kind(&self) -> Option<OpKind> {
-        let ty = match &self.kind {
-            SpanKind::Field { ty, .. } => ty.clone(),
-            SpanKind::Raw { item_ty, .. } => item_ty.clone(),
+/// Peel `Deduplicated` / `HashConsedValue` wrappers off a Charon value.
+fn peel_hashcons_value<'a>(
+    llbc: &'a Llbc,
+    mut value: &'a serde_json::Value,
+) -> &'a serde_json::Value {
+    loop {
+        let Some(obj) = value.as_object() else {
+            break;
         };
-        match ty {
-            ValueType::Int | ValueType::Ref(_) => Some(OpKind::ConstInt(0)),
-            ValueType::Unsigned | ValueType::Bool => Some(OpKind::ConstUInt(0)),
-            ValueType::Float => Some(OpKind::ConstFloat(0.0f64.to_bits())),
-            _ => None,
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            match llbc.dedup_body(id) {
+                Some(body) => {
+                    value = body;
+                    continue;
+                }
+                None => break,
+            }
         }
+        if let Some(body) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| arr.get(1))
+        {
+            value = body;
+            continue;
+        }
+        break;
     }
+    value
 }
 
 fn borrowed_place_referent(rvalue: &Rvalue) -> Option<Place> {
@@ -35947,18 +36004,33 @@ fn lower_result_branch_as_match(
         };
         let payload_owner = format!("{cf_owner}::{flow_variant}");
         let payload = match (read_ty, write_ty) {
-            (Some(read_ty), Some(write_ty)) => Some((
-                payload_owner,
-                push_enum_field_read(
+            (Some(read_ty), Some(write_ty)) => {
+                let read = push_enum_field_read(
                     graph,
                     arm,
                     operand_arm,
                     &format!("{result_owner}::{result_variant}"),
                     "__pos_0",
-                    read_ty,
-                ),
-                write_ty,
-            )),
+                    read_ty.clone(),
+                );
+                // Kinds differ: `Break` holds `Result<Infallible, E>`, so
+                // store `Err(e)` rather than the bare `E`.
+                let (value, field_ty) = if tag == 1 && read_ty != write_ty {
+                    let err_field = format!("{result_owner}::Err");
+                    let wrapped = emit_sum_variant(
+                        graph,
+                        arm,
+                        result_owner,
+                        "Err",
+                        1,
+                        Some((err_field.as_str(), read, read_ty)),
+                    );
+                    (wrapped, write_ty)
+                } else {
+                    (read, write_ty)
+                };
+                Some((payload_owner, value, field_ty))
+            }
             _ => None,
         };
         let built = emit_sum_variant(
@@ -38877,7 +38949,7 @@ mod tests {
         assert!(ctors.iter().any(|name| name == "Break"), "{ctors:?}");
     }
 
-    fn result_flow_llbc(ok_ty: serde_json::Value, err_ty: serde_json::Value) -> Llbc {
+    fn result_flow_llbc() -> Llbc {
         let span = serde_json::json!({"data": {
             "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
         }});
@@ -38890,14 +38962,14 @@ mod tests {
                 "is_local": false
             })
         };
-        let enum_decl = |def_id: u64, path: &[&str], variants: &[(&str, u64)]| {
+        let enum_decl = |def_id: u64, path: &[&str], variants: &[(&str, u64, u64)]| {
             serde_json::json!({
                 "def_id": def_id,
                 "item_meta": meta(path),
-                "kind": {"Enum": variants.iter().map(|(name, index)| serde_json::json!({
+                "kind": {"Enum": variants.iter().map(|(name, disc, tvar)| serde_json::json!({
                     "name": name,
-                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, index]}}}],
-                    "discriminant": {"Scalar": {"Signed": ["Isize", index.to_string()]}}
+                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, tvar]}}}],
+                    "discriminant": {"Scalar": {"Signed": ["Isize", disc.to_string()]}}
                 })).collect::<Vec<_>>()},
                 "layout": []
             })
@@ -38908,8 +38980,10 @@ mod tests {
             "translated": {
                 "crate_name": "fixture",
                 "type_decls": [
-                    enum_decl(0, &["core", "result", "Result"], &[("Ok", 0), ("Err", 1)]),
-                    enum_decl(1, &["core", "ops", "control_flow", "ControlFlow"], &[("Break", 0), ("Continue", 1)]),
+                    enum_decl(0, &["core", "result", "Result"], &[("Ok", 0, 0), ("Err", 1, 1)]),
+                    // `ControlFlow<B, C>`: Continue(C) is variant 0 (type var 1),
+                    // Break(B) is variant 1 (type var 0).
+                    enum_decl(1, &["core", "ops", "control_flow", "ControlFlow"], &[("Continue", 0, 1), ("Break", 1, 0)]),
                 ],
                 "fun_decls": [],
                 "global_decls": [],
@@ -38917,7 +38991,6 @@ mod tests {
                 "trait_impls": []
             }
         });
-        let _ = (ok_ty, err_ty);
         Llbc::from_slice(file.to_string().as_bytes()).expect("result/controlflow llbc")
     }
 
@@ -38977,10 +39050,45 @@ mod tests {
     #[test]
     fn result_branch_match_uses_int_payloads_from_the_type_decls() {
         let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
-        let llbc = result_flow_llbc(i64_ty.clone(), i64_ty.clone());
+        let u8_ty = serde_json::json!({"Literal": {"UInt": "U8"}});
+        let llbc = result_flow_llbc();
+        let result_ty = branch_adt_ty(0, &[i64_ty.clone(), u8_ty.clone()]);
+        // ControlFlow<B, C = U8, I64>: Break is B, Continue is C.
+        let flow_ty = branch_adt_ty(1, &[u8_ty, i64_ty]);
+        let tombstoned = std::collections::HashSet::new();
+        let payloads = crate::model::ResultBranchPayloads {
+            ok: super::adt_variant_payload_type(&result_ty, "Ok", &llbc, &tombstoned),
+            err: super::adt_variant_payload_type(&result_ty, "Err", &llbc, &tombstoned),
+            continue_ty: super::adt_variant_payload_type(&flow_ty, "Continue", &llbc, &tombstoned),
+            break_ty: super::adt_variant_payload_type(&flow_ty, "Break", &llbc, &tombstoned),
+        };
+        assert_eq!(payloads.ok, Some(ValueType::Int));
+        assert_eq!(payloads.err, Some(ValueType::Unsigned));
+        assert_eq!(payloads.continue_ty, Some(ValueType::Int));
+        assert_eq!(payloads.break_ty, Some(ValueType::Unsigned));
+        let mut graph = branch_graph(payloads);
+        super::lower_result_branch_to_control_flow(&mut graph);
+        let (reads, writes) = payload_field_tys(&graph);
+        assert_eq!(reads, vec![ValueType::Int, ValueType::Unsigned]);
+        assert_eq!(writes, vec![ValueType::Int, ValueType::Unsigned]);
+    }
+
+    #[test]
+    fn result_branch_break_of_infallible_result_builds_err() {
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let llbc = result_flow_llbc();
+        let infallible = serde_json::json!({
+            "Adt": {"id": {"Adt": 99}, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}
+        });
+        let residual = serde_json::json!({
+            "Adt": {
+                "id": {"Adt": 0},
+                "generics": {"regions": [], "types": [infallible, i64_ty.clone()], "const_generics": [], "trait_refs": []}
+            }
+        });
         let result_ty = branch_adt_ty(0, &[i64_ty.clone(), i64_ty.clone()]);
-        // ControlFlow<B, C>: field 0 is Break, field 1 is Continue.
-        let flow_ty = branch_adt_ty(1, &[i64_ty.clone(), i64_ty]);
+        // ControlFlow<Result<Infallible, i64>, i64>: type 0 is Break, type 1 is Continue.
+        let flow_ty = branch_adt_ty(1, &[residual, i64_ty]);
         let tombstoned = std::collections::HashSet::new();
         let payloads = crate::model::ResultBranchPayloads {
             ok: super::adt_variant_payload_type(&result_ty, "Ok", &llbc, &tombstoned),
@@ -38991,18 +39099,40 @@ mod tests {
         assert_eq!(payloads.ok, Some(ValueType::Int));
         assert_eq!(payloads.err, Some(ValueType::Int));
         assert_eq!(payloads.continue_ty, Some(ValueType::Int));
-        assert_eq!(payloads.break_ty, Some(ValueType::Int));
+        assert_ne!(
+            payloads.break_ty, payloads.err,
+            "Result<Infallible, i64> is not banked as i64"
+        );
         let mut graph = branch_graph(payloads);
         super::lower_result_branch_to_control_flow(&mut graph);
+        let mut ctors = Vec::new();
+        for block in &graph.blocks {
+            for op in &block.operations {
+                if let OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } = &op.kind
+                {
+                    ctors.push(name.clone());
+                }
+            }
+        }
+        assert!(
+            ctors.iter().any(|name| name == "Err"),
+            "Break payload must be Result::Err, got {ctors:?}"
+        );
         let (reads, writes) = payload_field_tys(&graph);
         assert_eq!(reads, vec![ValueType::Int, ValueType::Int]);
-        assert_eq!(writes, vec![ValueType::Int, ValueType::Int]);
+        assert!(
+            writes.iter().any(|ty| *ty == ValueType::Ref(None)),
+            "Break stores the Result value, got {writes:?}"
+        );
     }
 
     #[test]
     fn result_branch_match_emits_nothing_for_void_payloads() {
         let unit = serde_json::json!({"Adt": {"id": "Tuple", "generics": {"types": []}}});
-        let llbc = result_flow_llbc(unit.clone(), unit.clone());
+        let llbc = result_flow_llbc();
         let result_ty = branch_adt_ty(0, &[unit.clone(), unit.clone()]);
         let flow_ty = branch_adt_ty(1, &[unit.clone(), unit]);
         let tombstoned = std::collections::HashSet::new();
