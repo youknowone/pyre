@@ -1,6 +1,4 @@
 # pyre-check: max-pypy-ratio=12
-# pyre-check: skip-backends=cranelift
-# cranelift runs the core build, which has no `pyre-module` and so no `math`.
 # The ceiling is twice the slowest ratio observed, 14.2x on the macos runner.
 # A function-entry trace records only the early-return arm.  The first true
 # call then fails that guard and blackhole-replays the previously unvisited
@@ -13,8 +11,6 @@ try:
     pypyjit.set_param("threshold=-1,function_threshold=20")
 except ImportError:
     pass
-
-import math
 
 seen = []
 
@@ -32,7 +28,7 @@ def run(raise_inside):
     if not raise_inside:
         return
     with Context():
-        math.sin()
+        abs()
 
 
 for _ in range(30):
