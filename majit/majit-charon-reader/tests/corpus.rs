@@ -55,7 +55,8 @@ fn loads_fixture_corpus() {
     // `replace_reborrow_then_read`. Each is one local body.
     //
     // + 2 for `take_odd_default` and its hand-written `Default::default`.
-    assert_eq!(local_count, 46, "46 local fns expected");
+    // + 1 for `replace_wide_payload` (a `u128` variant field).
+    assert_eq!(local_count, 47, "47 local fns expected");
 }
 
 #[test]

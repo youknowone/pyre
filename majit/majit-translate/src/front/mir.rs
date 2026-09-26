@@ -16821,15 +16821,18 @@ impl<'a> Lowering<'a> {
                     ));
                     for (i, field) in variant.fields.iter().enumerate() {
                         let Some(offset) = layout.field_offset(vidx, i) else {
-                            continue;
+                            return None;
                         };
                         let Some((_item_ty, itemsize, _is_signed)) =
                             self.span_raw_for_ty(&field.ty)
                         else {
-                            continue;
+                            return None;
                         };
-                        if itemsize == 0 || itemsize > 8 {
+                        if itemsize == 0 {
                             continue;
+                        }
+                        if itemsize > 8 {
+                            return None;
                         }
                         let name = field.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
                         let value_ty =

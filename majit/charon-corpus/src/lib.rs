@@ -552,3 +552,14 @@ pub enum WordUnion {
 pub fn replace_word_union(slot: &mut WordUnion, new: WordUnion) -> WordUnion {
     std::mem::replace(slot, new)
 }
+
+/// A variant field wider than one word. A whole-value move cannot copy it
+/// as a field span, so `move_plan` declines.
+pub enum WidePayload {
+    Big(u128),
+}
+
+#[inline(never)]
+pub fn replace_wide_payload(slot: &mut WidePayload, new: WidePayload) -> WidePayload {
+    std::mem::replace(slot, new)
+}

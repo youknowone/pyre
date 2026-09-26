@@ -1786,4 +1786,19 @@ fn mem_replace_of_a_multi_word_value_is_field_wise() {
         names.iter().any(|name| name == "__pos_0"),
         "enum exchange reads a payload field, got {names:?}"
     );
+
+    let wide = lower_function(llbc, "replace_wide_payload").unwrap_or_else(|e| panic!("{e}"));
+    let wide_calls: Vec<String> = wide
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call { target, .. } => Some(format!("{target:?}")),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        wide_calls.iter().any(|call| call.contains("replace")),
+        "a u128 variant field makes move_plan None, so replace stays: {wide_calls:?}"
+    );
 }
