@@ -406,6 +406,14 @@ pub fn scalar_slot_get(v: &Vec<i64>, i: usize) -> i64 {
     }
 }
 
+/// An `Option<char>` joined with a `char` literal default, then compared.
+/// Both links into the join carry a `char`, so both are int-kind.
+#[inline(never)]
+pub fn char_unwrap_or_join(align: Option<char>) -> i64 {
+    let a = align.unwrap_or('>');
+    if a == '^' { 1 } else { 0 }
+}
+
 /// A `char` element read at a constant index and switched on. `char` is a
 /// 4-byte unsigned item, so the index arm lowers it to an int-banked
 /// `ArrayRead` and the match switches on that int.

@@ -58,7 +58,9 @@ fn loads_fixture_corpus() {
     // + 1 for `replace_wide_payload` (a `u128` variant field).
     //
     // + 1 for `char_slot_index`, the `char` element array read.
-    assert_eq!(local_count, 48, "48 local fns expected");
+    //
+    // + 1 for `char_unwrap_or_join`, the `Option<char>` literal-default join.
+    assert_eq!(local_count, 49, "49 local fns expected");
 }
 
 #[test]

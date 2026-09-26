@@ -1406,6 +1406,79 @@ fn a_char_element_indexes_to_an_int_banked_array_read() {
     );
 }
 
+/// `align.unwrap_or('>')` over an `Option<char>` joins the `Some` payload with
+/// the literal default. A `char` is an int-kind scalar, so both links into the
+/// join carry an Int: the payload read and the literal's `ConstInt` code point.
+/// A literal lowered as a `__str_const` string would put a Ref on one link and
+/// an Int on the other, which `flatten` cannot rename into one register.
+#[test]
+fn a_char_literal_default_joins_an_option_char_payload_in_the_int_bank() {
+    use majit_translate::flowspace::model::Variable;
+    use majit_translate::model::{LinkArg, OpKind, ValueType};
+
+    let graph = lower_function(load_corpus(), "char_unwrap_or_join").expect("lowering");
+    let producer = |var: &Variable| -> Option<&OpKind> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .find(|op| op.result.as_ref() == Some(var))
+            .map(|op| &op.kind)
+    };
+    assert!(
+        !graph.blocks.iter().flat_map(|b| b.operations.iter()).any(|op| matches!(
+            &op.kind,
+            OpKind::Call { target: majit_translate::model::CallTarget::FunctionPath { segments, .. }, .. }
+                if segments.first().map(String::as_str) == Some("__str_const")
+        )),
+        "a char literal lowers to no __str_const",
+    );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| matches!(op.kind, OpKind::ConstInt(0x3e))),
+        "the '>' default is the Int code point 0x3e",
+    );
+    // Every link argument into a block input produced by the literal or by
+    // the `Some.__pos_0` payload read is int-kind, and at least one input
+    // receives both — the `unwrap_or` join.
+    let mut joins = 0;
+    for target in &graph.blocks {
+        for (slot, _) in target.inputargs.iter().enumerate() {
+            let mut kinds = Vec::new();
+            for block in &graph.blocks {
+                for link in block.exits.iter().filter(|l| l.target == target.id) {
+                    let Some(LinkArg::Value(v)) = link.args.get(slot) else {
+                        continue;
+                    };
+                    match producer(v) {
+                        Some(OpKind::ConstInt(0x3e)) => kinds.push(("literal", ValueType::Int)),
+                        Some(OpKind::FieldRead { field, ty, .. }) if field.name == "__pos_0" => {
+                            kinds.push(("payload", ty.clone()))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if kinds.iter().any(|(k, _)| *k == "literal")
+                && kinds.iter().any(|(k, _)| *k == "payload")
+            {
+                joins += 1;
+                assert!(
+                    kinds.iter().all(|(_, ty)| *ty == ValueType::Int),
+                    "both links into the unwrap_or join are int-kind, got {kinds:?}",
+                );
+            }
+        }
+    }
+    assert_eq!(
+        joins, 1,
+        "one block input joins the payload and the literal default"
+    );
+}
+
 /// The same pair over `Vec<i64>`, an element bank the index arm is already
 /// known to serve. It separates the two ways the sibling test could read: an
 /// aggregate element that failed to lower would differ from this baseline,
