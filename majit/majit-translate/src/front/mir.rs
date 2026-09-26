@@ -1097,6 +1097,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     let mut functions = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     let mut atomic_load_decls = Vec::new();
+    let spec = std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new());
     for fd in llbc.iter_local_fns() {
         // Charon emits static / const initialiser bodies (e.g. the
         // body that builds `static NONE_SINGLETON`) as ordinary
@@ -1177,6 +1178,8 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             builder_mode,
             &accum,
             &mut atomic_reasons,
+            Some(&spec),
+            false,
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -1259,6 +1262,111 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // Aggregate `"ref"` results stay unstamped — the call-signature
         // validator skips a missing declaration, and a struct name is not
         // a register class.
+        let stamp_return_token = dont_look_inside.contains(&fn_path)
+            || elidable_residual.contains(&fn_path)
+            || trait_root.is_some();
+        let signature_token = if gcref_result {
+            Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
+        } else {
+            dont_look_inside_return_token(&fd.signature.output, llbc, static_addrs.error_carrier)
+        };
+        let return_type = if gcref_result || stamp_return_token {
+            signature_token
+        } else if signature_token.as_deref().is_some_and(scalar_result_token) {
+            signature_token
+        } else {
+            None
+        };
+        functions.push(crate::front::semantic::SemanticFunction {
+            name,
+            graph,
+            return_type,
+            self_ty_root,
+            trait_impl_id,
+            fun_decl_id: Some(fd.def_id),
+            module_path,
+            hints: Vec::new(),
+            trait_root,
+            trait_qualified,
+            returns_objectptr,
+        });
+    }
+    // `specialize.py` `cachedgraph` keys one graph per instantiation. The
+    // walk above enqueues each concrete call; lowering a copy enqueues the
+    // callees whose clauses that copy just bound.
+    loop {
+        let Some(req) = spec.borrow_mut().pop() else {
+            break;
+        };
+        let Some(fd) = llbc.fn_by_id(req.fn_id) else {
+            continue;
+        };
+        let Some(body) = crate::front::clause_spec::substituted_unstructured(
+            fd,
+            llbc,
+            &req.trait_refs,
+        ) else {
+            continue;
+        };
+        let accum = AccumulatorFacts::build(llbc, &body);
+        let builder_mode = accum.has_builder;
+        let mut atomic_reasons = Vec::new();
+        let Ok(mut graph) = lower_unstructured_with_static_addrs_and_attrs(
+            llbc,
+            fd,
+            &body,
+            static_addrs,
+            jitdriver_receiver_roots,
+            &struct_field_attrs,
+            &dont_look_inside,
+            &tombstoned_leaves,
+            builder_mode,
+            &accum,
+            &mut atomic_reasons,
+            Some(&spec),
+            true,
+        ) else {
+            continue;
+        };
+        let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
+        let trait_impl_id = trait_impl_id_for_fundecl(fd);
+        let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+        let module_path = stripped
+            .rsplit_once("::")
+            .map(|(module, _)| module.to_string())
+            .unwrap_or_default();
+        let name = req.leaf;
+        let segments = spec_segments(llbc, fd, &name);
+        graph.name = segments.join("::");
+        let source_identity = match (&self_ty_root, trait_impl_id) {
+            (Some(owner), Some(impl_id)) => {
+                format!("{module_path}::{owner}::<Impl#{impl_id}>::{name}")
+            }
+            (Some(owner), None) => format!("{module_path}::{owner}::{name}"),
+            _ => graph.name.clone(),
+        };
+        let graph = if let Some(owner) = &self_ty_root {
+            graph
+                .with_owner_root(owner.clone())
+                .with_source_identity(source_identity)
+        } else {
+            graph.with_source_identity(source_identity)
+        };
+        let graph = graph.with_fun_decl_id(fd.def_id);
+        let trait_qualified = trait_impl_trait_path_for_fundecl(llbc, fd);
+        let trait_root = trait_qualified
+            .as_ref()
+            .and_then(|p| p.rsplit("::").next())
+            .map(str::to_string)
+            .or_else(|| trait_default_owner_for_fundecl(fd, &known_trait_names));
+        let fn_path = if module_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{module_path}::{name}")
+        };
+        let gcref_result = gc_root_gcref_result_path(&fn_path);
+        let returns_objectptr =
+            output_type_is_objectptr(&fd.signature.output, llbc) && !gcref_result;
         let stamp_return_token = dont_look_inside.contains(&fn_path)
             || elidable_residual.contains(&fn_path)
             || trait_root.is_some();
@@ -2967,6 +3075,8 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         builder_mode,
         &accum,
         &mut atomic_load_reasons,
+        None,
+        false,
     )
 }
 
@@ -3030,6 +3140,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     builder_mode: bool,
     accum: &AccumulatorFacts,
     atomic_load_reasons: &mut Vec<String>,
+    spec: Option<&std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
+    spec_body: bool,
 ) -> Result<FunctionGraph, LowerError> {
     let name = fd.item_meta.name_path();
     // The Result-of-PyError exception-link lowering's callee rule
@@ -3690,6 +3802,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         if builder_mode {
             lo.enable_builder_mode();
         }
+        if let Some(spec) = spec {
+            lo.set_spec(spec);
+            if spec_body {
+                lo.set_spec_body();
+            }
+        }
         // Back-edge targets (loop headers); empty for an acyclic body, in
         // which case `lower_framestate` reduces exactly to the two-pass
         // RPO walk.  Treat the threaded lowering and its shared
@@ -3738,6 +3856,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     if builder_mode {
         lo.enable_builder_mode();
     }
+    if let Some(spec) = spec {
+        lo.set_spec(spec);
+        if spec_body {
+            lo.set_spec_body();
+        }
+    }
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => {
             finish(&mut lo)?;
@@ -3768,6 +3892,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             )?;
             if builder_mode {
                 lo.enable_builder_mode();
+            }
+            if let Some(spec) = spec {
+                lo.set_spec(spec);
+                if spec_body {
+                    lo.set_spec_body();
+                }
             }
             lo.lower(BlockOrder::ReversePostorder)?;
             finish(&mut lo)?;
@@ -4844,6 +4974,12 @@ struct Lowering<'a> {
     /// Non-`Relaxed` `Atomic*::load` sites seen in the body, independent of
     /// which lowering error is reported first.
     ordered_atomic_load_reasons: Vec<String>,
+    /// `FunctionDesc.cachedgraph` for this lowering. `None` outside the
+    /// whole-program walk.
+    spec: Option<&'a std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
+    /// This body is a `cachedgraph` copy, so clause refs have been
+    /// replaced and a `TraitImpl` call names the impl method.
+    spec_body: bool,
     /// MIR locals whose enum discriminant is a translation-time
     /// constant: single-assignment locals bound by an always-`Ok`
     /// decomposed conversion ([`Lowering::try_lower_usize_try_from`]).
@@ -5331,6 +5467,8 @@ impl<'a> Lowering<'a> {
             atomic_ref_place: std::collections::HashMap::new(),
             atomic_ordering_locals: std::collections::HashMap::new(),
             ordered_atomic_load_reasons: Vec::new(),
+            spec: None,
+            spec_body: false,
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
             string_byte_view_locals: Vec::new(),
@@ -15690,6 +15828,94 @@ impl<'a> Lowering<'a> {
         clippy::type_complexity,
         reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
     )]
+    fn set_spec(&mut self, spec: &'a std::cell::RefCell<crate::front::clause_spec::SpecQueue>) {
+        self.spec = Some(spec);
+    }
+
+    fn set_spec_body(&mut self) {
+        self.spec_body = true;
+    }
+
+    /// Specialized path for a direct call whose `generics.trait_refs` name
+    /// impls. The bare path is unchanged when the callee is not generic or
+    /// the call still carries a `Clause`.
+    fn specialized_fun_segments(&self, fd: &FunDecl, reg: &RegularCall) -> Option<Vec<String>> {
+        self.enqueue_spec(fd, &reg.generics)
+    }
+
+    /// Impl method named by a `TraitImpl` trait ref, specialized when that
+    /// impl's own clauses are concrete. A `Clause` ref returns `None` so
+    /// the call keeps the trait-declaration path.
+    fn specialized_trait_target(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Option<(Vec<String>, Option<(String, String)>)> {
+        if !self.spec_body {
+            return None;
+        }
+        let (fn_id, generics) =
+            crate::front::clause_spec::trait_impl_method(payload, self.llbc)?;
+        let fd = self.llbc.fn_by_id(fn_id)?;
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next().unwrap_or("fn");
+        let segments = spec_segments(self.llbc, fd, leaf);
+        if path.contains("closure") || segments.iter().any(|seg| seg.contains("closure")) {
+            return None;
+        }
+        if let Some(segments) = self.enqueue_spec(fd, &generics) {
+            return Some((segments, None));
+        }
+        Some((segments, None))
+    }
+
+    fn enqueue_spec(&self, fd: &FunDecl, generics: &serde_json::Value) -> Option<Vec<String>> {
+        let spec = self.spec?;
+        if !crate::front::clause_spec::decl_is_generic(fd) {
+            return None;
+        }
+        if !spec
+            .borrow_mut()
+            .body_has_own_clause(fd, self.llbc)
+        {
+            return None;
+        }
+        let path = fd.item_meta.name_path();
+        if self
+            .dont_look_inside
+            .contains(&strip_crate_prefix(&path))
+        {
+            return None;
+        }
+        // A closure shim's specialized return token does not match the
+        // body yet (`call_once`). Leave that instantiation unspecialized.
+        if path.contains("closure") {
+            return None;
+        }
+        let bare_leaf = path.rsplit("::").next().unwrap_or("fn");
+        if spec_segments(self.llbc, fd, bare_leaf)
+            .iter()
+            .any(|seg| seg.contains("closure"))
+        {
+            return None;
+        }
+        let trait_refs = crate::front::clause_spec::concrete_trait_refs(generics, self.llbc)?;
+        let leaf = fd
+            .item_meta
+            .name_path()
+            .rsplit("::")
+            .next()
+            .unwrap_or("fn")
+            .to_string();
+        let leaf = crate::front::clause_spec::spec_leaf(&leaf, fd.def_id, generics, self.llbc);
+        spec.borrow_mut()
+            .enqueue(crate::front::clause_spec::SpecRequest {
+                fn_id: fd.def_id,
+                leaf: leaf.clone(),
+                trait_refs,
+            });
+        Some(spec_segments(self.llbc, fd, &leaf))
+    }
+
     fn call_target_segments(
         &self,
         mir_bb: usize,
@@ -15700,6 +15926,9 @@ impl<'a> Lowering<'a> {
                 .llbc
                 .fn_by_id(*id)
                 .map(|fd| {
+                    if let Some(segments) = self.specialized_fun_segments(fd, reg) {
+                        return (segments, None);
+                    }
                     // Blanket `impl<T, U: From<T>> Into<U> for T`
                     // (core::convert) — `x.into()` is `U::from(x)`.
                     // The callsite's resolved `U: From<T>` obligation
@@ -15797,6 +16026,9 @@ impl<'a> Lowering<'a> {
             // the trait-method shape (e.g. when arr[2] is missing or
             // points at an `Impl` block).
             CallKind::Trait(v) => {
+                if let Some(target) = self.specialized_trait_target(v) {
+                    return Ok(target);
+                }
                 let fn_id = v
                     .as_array()
                     .and_then(|a| a.get(2))
@@ -24912,6 +25144,24 @@ fn regular_call_fun_decl_id(kind: &CallKind) -> Option<u64> {
 /// free-function path, or `for_impl_method(owner, leaf)` for an impl
 /// method (`register_trait_method` / inherent registration). A trait-impl
 /// id is local to one LLBC and is not part of this key.
+fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str) -> Vec<String> {
+    if let Some((owner, _)) = impl_method_owner_for_fundecl(llbc, fd) {
+        return crate::parse::CallPath::for_impl_method(&owner, leaf).segments;
+    }
+    // Same key `free_function_alias_paths` registers: the module portion
+    // of `name_path` is one segment when it contains `<Impl>`, not a
+    // split of that token.
+    let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+    let module = stripped.rsplit_once("::").map(|(module, _)| module).unwrap_or("");
+    let mut segments: Vec<String> = if module.is_empty() {
+        Vec::new()
+    } else {
+        module.split("::").map(str::to_string).collect()
+    };
+    segments.push(leaf.to_string());
+    segments
+}
+
 fn registered_path_for_fun_decl(llbc: &Llbc, fd: &FunDecl) -> crate::parse::CallPath {
     if let Some((owner, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
         crate::parse::CallPath::for_impl_method(&owner, &leaf)
