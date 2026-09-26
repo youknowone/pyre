@@ -608,20 +608,6 @@ pub fn push_roots() -> RootScope {
     RootScope::new()
 }
 
-/// One-word residual ABI for [`push_roots`].
-///
-/// `RootScope` is the `save_point` word (`gct_fv_gc_malloc.push_roots`).
-/// The residual dispatcher reads one result register, and dropping the guard
-/// here would run `pop_roots` before the bracketed allocation. The word stays
-/// live until `root_scope_close`.
-#[majit_macros::dont_look_inside_cannot_raise]
-pub extern "C" fn push_roots_jit_abi() -> i64 {
-    let scope = push_roots();
-    let save_point = scope.base() as i64;
-    std::mem::forget(scope);
-    save_point
-}
-
 /// A set of freshly allocated items held as GC roots while the rest of the
 /// set is still being built.
 ///
