@@ -3306,6 +3306,27 @@ pub unsafe fn store_global_value_w(
     Ok(())
 }
 
+/// `celldict.py _LOAD_GLOBAL_cached`: the `cache.getvalue(space)` and
+/// `builtincache.getvalue(space)` hits, which run before
+/// `load_global_via_cache` roots its operands; every other outcome falls
+/// through to it.  The cell is copied out under the cache mutex and unwrapped
+/// after the mutex is released, because unwrapping an `IntMutableCell`
+/// allocates.  Residual for the same reason as `load_global_via_cache`.
+#[majit_macros::dont_look_inside]
+#[inline]
+unsafe fn load_global_cache_hit(pycode: PyObjectRef, nameindex: usize) -> Option<PyObjectRef> {
+    let cache = unsafe { crate::pycode::w_code_globals_caches_get(pycode, nameindex) }?;
+    let cell = {
+        let c = cache.lock();
+        match c.cell {
+            Some(v) => v,
+            None if c.valid => c.builtincache.as_ref()?.lock().cell?,
+            None => return None,
+        }
+    };
+    Some(unsafe { pyre_object::celldict::unwrap_cell(cell) })
+}
+
 /// `celldict.py _LOAD_GLOBAL_cached`.  When `pycode` is
 /// non-null, `pycode._globals_caches[nameindex]` is consulted before
 /// `mstrategy.get_global_cache(name)`; on the slow path, the resolved
@@ -3325,27 +3346,6 @@ pub unsafe fn store_global_value_w(
 /// residualize it (`@jit.dont_look_inside`) like the sibling
 /// `load_attr_caching`.
 #[majit_macros::dont_look_inside]
-/// `celldict.py _LOAD_GLOBAL_cached`: the `cache.getvalue(space)` and
-/// `builtincache.getvalue(space)` hits.  Neither allocates, so this runs
-/// before `load_global_via_cache` roots its operands; every other outcome
-/// falls through to it.
-#[inline]
-unsafe fn load_global_cache_hit(pycode: PyObjectRef, nameindex: usize) -> Option<PyObjectRef> {
-    use pyre_object::celldict::unwrap_cell;
-    let cache = unsafe { crate::pycode::w_code_globals_caches_get(pycode, nameindex) }?;
-    let c = cache.lock();
-    if let Some(v) = c.cell {
-        return Some(unsafe { unwrap_cell(v) });
-    }
-    if c.valid
-        && let Some(bc) = &c.builtincache
-        && let Some(v) = bc.lock().cell
-    {
-        return Some(unsafe { unwrap_cell(v) });
-    }
-    None
-}
-
 unsafe fn load_global_via_cache(
     w_module_dict: PyObjectRef,
     w_builtin: PyObjectRef,
