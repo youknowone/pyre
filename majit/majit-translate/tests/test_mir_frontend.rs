@@ -1739,8 +1739,42 @@ fn mem_replace_of_a_multi_word_value_is_field_wise() {
     );
     assert_eq!(
         field_names("take_two_words", true),
-        vec!["hi".to_string(), "lo".to_string()],
-        "take reads the slot once, then stores zeros"
+        vec![
+            "hi".to_string(),
+            "hi".to_string(),
+            "lo".to_string(),
+            "lo".to_string()
+        ],
+        "take reads the slot and the Default value"
+    );
+
+    let odd = lower_function(llbc, "take_odd_default").unwrap_or_else(|e| panic!("{e}"));
+    let mut called_default = false;
+    let mut wrote = Vec::new();
+    for block in &odd.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::Call { target, .. } => {
+                    let rendered = format!("{target:?}");
+                    assert!(
+                        !rendered.contains("take"),
+                        "take_odd_default still calls take: {rendered}"
+                    );
+                    if rendered.contains("default") {
+                        called_default = true;
+                    }
+                }
+                OpKind::FieldWrite { field, .. } => wrote.push(field.name.clone()),
+                _ => {}
+            }
+        }
+    }
+    assert!(called_default, "take_odd_default did not call Default::default");
+    wrote.sort();
+    assert!(
+        wrote.iter().filter(|name| name.as_str() == "lo").count() >= 1
+            && wrote.iter().filter(|name| name.as_str() == "hi").count() >= 1,
+        "take_odd_default did not store the default fields: {wrote:?}"
     );
 
     let names = field_names("replace_word_union", true);

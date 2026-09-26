@@ -16353,7 +16353,7 @@ impl<'a> Lowering<'a> {
                     {
                         old
                     } else if let Some(old) =
-                        self.exchange_deref_aggregate(mir_bb, &place, Some(args[1].clone()))?
+                        self.exchange_deref_aggregate(mir_bb, &place, args[1].clone())?
                     {
                         old
                     } else {
@@ -16404,10 +16404,27 @@ impl<'a> Lowering<'a> {
                 if let Some(place) = self.bare_deref_place(&slot)
                     && self.move_plan(&place.ty).is_some()
                 {
-                    // `mem::take` is `replace(dest, T::default())`. A scalar
-                    // field's `Default` is the zero this span stores; a
-                    // non-scalar field has no literal and stays a call.
-                    let Some(old) = self.exchange_deref_aggregate(mir_bb, &place, None)? else {
+                    // `mem::take` is `replace(dest, <T as Default>::default())`.
+                    // Resolve that call before any read: a missing impl
+                    // leaves the whole `take` residual and emits nothing.
+                    let Some(target) = self.default_call_for_take(reg, &place.ty) else {
+                        return Ok(false);
+                    };
+                    let result_ty =
+                        tyref_to_value_type_with(&place.ty, self.llbc, self.tombstoned_leaves);
+                    let bb_id = self.block_id[mir_bb];
+                    let fresh = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(fresh.clone()),
+                        kind: OpKind::Call {
+                            target,
+                            args: Vec::new(),
+                            result_ty,
+                        },
+                    });
+                    let Some(old) = self.exchange_deref_aggregate(mir_bb, &place, fresh)? else {
                         return Ok(false);
                     };
                     self.local_var[dest_local] = Some(old);
@@ -16427,6 +16444,115 @@ impl<'a> Lowering<'a> {
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(true)
+    }
+
+    /// `<T as Default>::default` bound by `take`'s trait obligation.
+    ///
+    /// The call carries the `TraitImpl` of `core::default::Default` for
+    /// `T`. That impl's `default` method is the assoc-fn target
+    /// `call_target_segments` would emit for a direct call: no receiver,
+    /// so a `FunctionPath` of `[owner, default]`.
+    fn default_call_for_take(&self, reg: &RegularCall, ty: &TyRef) -> Option<CallTarget> {
+        let want = self.tyref_adt_def_id(ty)?;
+        let refs = reg.generics.get("trait_refs")?.as_array()?;
+        for raw in refs {
+            let node = peel_hashcons_value(self.llbc, raw);
+            let Some(obj) = node.as_object() else {
+                continue;
+            };
+            let Some(impl_id) = obj
+                .get("kind")
+                .and_then(|kind| kind.get("TraitImpl"))
+                .and_then(|impl_row| impl_row.get("id"))
+                .and_then(serde_json::Value::as_u64)
+            else {
+                continue;
+            };
+            let Some(trait_id) = obj
+                .get("trait_decl_ref")
+                .and_then(|decl| decl.get("skip_binder"))
+                .and_then(|binder| binder.get("id"))
+                .and_then(serde_json::Value::as_u64)
+            else {
+                continue;
+            };
+            let Some(trait_path) = self
+                .llbc
+                .trait_by_id(trait_id)
+                .map(|decl| decl.item_meta.name_path())
+            else {
+                continue;
+            };
+            if trait_path != "core::default::Default" {
+                continue;
+            }
+            let Some(ti) = self.llbc.trait_impl_by_id(impl_id) else {
+                continue;
+            };
+            let Some(self_ty) = ti
+                .get("impl_trait")
+                .and_then(|row| row.get("generics"))
+                .and_then(|generics| generics.get("types"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|types| types.first())
+            else {
+                continue;
+            };
+            if self.resolve_tyexpr_to_adt_def_id(self_ty) != Some(want) {
+                continue;
+            }
+            let Some(methods) = ti.get("methods").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for method in methods {
+                let Some(fid) = method
+                    .get("skip_binder")
+                    .and_then(|binder| binder.get("id"))
+                    .and_then(serde_json::Value::as_u64)
+                else {
+                    continue;
+                };
+                let Some(fd) = self.llbc.fn_by_id(fid) else {
+                    continue;
+                };
+                if fd.item_meta.name_path().rsplit("::").next() != Some("default") {
+                    continue;
+                }
+                return Some(self.assoc_fn_call_target(fd));
+            }
+        }
+        None
+    }
+
+    /// Call target of an impl-owned function, matching `call_target_segments`
+    /// for a direct call of `fd`.
+    fn assoc_fn_call_target(&self, fd: &FunDecl) -> CallTarget {
+        let method_hint = self.impl_method_owner(fd);
+        let segments = if method_hint.is_none()
+            && let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(self.llbc, fd)
+        {
+            let mut v: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
+            v.push(leaf);
+            v
+        } else {
+            fd.item_meta
+                .name_path()
+                .split("::")
+                .map(str::to_string)
+                .collect()
+        };
+        let mut target = match method_hint {
+            Some((owner_root, leaf)) => CallTarget::method(leaf, Some(owner_root)),
+            None => CallTarget::FunctionPath {
+                segments,
+                fun_decl_id: None,
+            },
+        };
+        target = target.with_fun_decl_id(fd.def_id);
+        if matches!(target, CallTarget::Method { .. }) {
+            target = target.with_resolved_path(registered_path_for_fun_decl(self.llbc, fd));
+        }
+        target
     }
 
     fn mem_slot(&self, local: Option<usize>) -> Option<MemSlot> {
@@ -16541,8 +16667,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// Read `place`'s fields into a fresh aggregate, then store `new_value`'s
-    /// fields over it. `None` as `new_value` stores the zero of each scalar
-    /// field (`mem::take`). `Ok(None)` leaves the residual call.
+    /// fields over it. `Ok(None)` leaves the residual call.
     ///
     /// `rffi.py` `_get_structcopy_fn` copies an inline struct one field at a
     /// time. The offsets are Charon's `variant_layouts`, so a 16-byte enum
@@ -16551,16 +16676,12 @@ impl<'a> Lowering<'a> {
         &mut self,
         mir_bb: usize,
         place: &Place,
-        new_value: Option<Variable>,
+        new_value: Variable,
     ) -> Result<Option<Variable>, LowerError> {
         let Some(old) = self.read_moved_aggregate(mir_bb, place)? else {
             return Ok(None);
         };
-        let stored = match new_value {
-            Some(value) => self.store_moved_aggregate(mir_bb, place, &value)?,
-            None => self.store_zero_aggregate(mir_bb, place)?,
-        };
-        if !stored {
+        if !self.store_moved_aggregate(mir_bb, place, &new_value)? {
             return Ok(None);
         }
         Ok(Some(old))
@@ -16595,21 +16716,6 @@ impl<'a> Lowering<'a> {
         for span in &plan.spans {
             let part = self.emit_span_read(mir_bb, value, span);
             self.emit_span_write(mir_bb, &base, span, part);
-        }
-        Ok(true)
-    }
-
-    fn store_zero_aggregate(&mut self, mir_bb: usize, place: &Place) -> Result<bool, LowerError> {
-        let Some(plan) = self.move_plan(&place.ty) else {
-            return Ok(false);
-        };
-        if plan.spans.iter().any(|span| span.zero_kind().is_none()) {
-            return Ok(false);
-        }
-        let base = self.deref_base(mir_bb, place)?;
-        for span in &plan.spans {
-            let zero = self.emit_span_zero(mir_bb, span);
-            self.emit_span_write(mir_bb, &base, span, zero);
         }
         Ok(true)
     }
@@ -16856,19 +16962,6 @@ impl<'a> Lowering<'a> {
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(var.clone()),
             kind: OpKind::ConstInt(offset as i64),
-        });
-        var
-    }
-
-    fn emit_span_zero(&mut self, mir_bb: usize, span: &MoveSpan) -> Variable {
-        let bb_id = self.block_id[mir_bb];
-        let kind = span.zero_kind().expect("caller checked zero_kind");
-        let var = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(var.clone()),
-            kind,
         });
         var
     }
@@ -27738,19 +27831,35 @@ impl SpanKind {
     }
 }
 
-impl MoveSpan {
-    fn zero_kind(&self) -> Option<OpKind> {
-        let ty = match &self.kind {
-            SpanKind::Field { ty, .. } => ty.clone(),
-            SpanKind::Raw { item_ty, .. } => item_ty.clone(),
+/// Peel `Deduplicated` / `HashConsedValue` wrappers off a Charon value.
+fn peel_hashcons_value<'a>(
+    llbc: &'a Llbc,
+    mut value: &'a serde_json::Value,
+) -> &'a serde_json::Value {
+    for _ in 0..8 {
+        let Some(obj) = value.as_object() else {
+            break;
         };
-        match ty {
-            ValueType::Int | ValueType::Ref(_) => Some(OpKind::ConstInt(0)),
-            ValueType::Unsigned | ValueType::Bool => Some(OpKind::ConstUInt(0)),
-            ValueType::Float => Some(OpKind::ConstFloat(0.0f64.to_bits())),
-            _ => None,
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            match llbc.dedup_body(id) {
+                Some(body) => {
+                    value = body;
+                    continue;
+                }
+                None => break,
+            }
         }
+        if let Some(body) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| arr.get(1))
+        {
+            value = body;
+            continue;
+        }
+        break;
     }
+    value
 }
 
 fn borrowed_place_referent(rvalue: &Rvalue) -> Option<Place> {
