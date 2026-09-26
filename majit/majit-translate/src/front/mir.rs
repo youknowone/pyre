@@ -1305,9 +1305,17 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             fd,
             llbc,
             &req.trait_refs,
+            &req.types,
+            &req.const_generics,
         ) else {
             continue;
         };
+        let signature = crate::front::clause_spec::substituted_signature(
+            &fd.signature,
+            llbc,
+            &req.types,
+            &req.const_generics,
+        );
         let accum = AccumulatorFacts::build(llbc, &body);
         let builder_mode = accum.has_builder;
         let mut atomic_reasons = Vec::new();
@@ -1366,14 +1374,14 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         };
         let gcref_result = gc_root_gcref_result_path(&fn_path);
         let returns_objectptr =
-            output_type_is_objectptr(&fd.signature.output, llbc) && !gcref_result;
+            output_type_is_objectptr(&signature.output, llbc) && !gcref_result;
         let stamp_return_token = dont_look_inside.contains(&fn_path)
             || elidable_residual.contains(&fn_path)
             || trait_root.is_some();
         let signature_token = if gcref_result {
             Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
         } else {
-            dont_look_inside_return_token(&fd.signature.output, llbc, static_addrs.error_carrier)
+            dont_look_inside_return_token(&signature.output, llbc, static_addrs.error_carrier)
         };
         let return_type = if gcref_result || stamp_return_token {
             signature_token
@@ -15899,6 +15907,8 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let trait_refs = crate::front::clause_spec::concrete_trait_refs(generics, self.llbc)?;
+        let (types, const_generics) =
+            crate::front::clause_spec::concrete_type_args(generics, self.llbc)?;
         let leaf = fd
             .item_meta
             .name_path()
@@ -15912,6 +15922,8 @@ impl<'a> Lowering<'a> {
                 fn_id: fd.def_id,
                 leaf: leaf.clone(),
                 trait_refs,
+                types,
+                const_generics,
             });
         Some(spec_segments(self.llbc, fd, &leaf))
     }
