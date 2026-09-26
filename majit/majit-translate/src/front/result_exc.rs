@@ -2032,7 +2032,8 @@ fn rewire_one_call_site(
 
 /// The `Err` payload of the match `exit` reaches is never read.
 ///
-/// `Err(_)` still switches on the discriminant. The handler does not use
+/// Either the shell is discarded unread (`let _ = f();`), or `Err(_)` still
+/// switches on the discriminant. The handler does not use
 /// the caught carrier, so rebuilding it would pass an `Exception` into
 /// `from_exc_object`'s `PyObject` parameter.
 fn err_payload_is_dead(graph: &FunctionGraph, exit: &Link, r: &Variable) -> bool {
@@ -2046,6 +2047,15 @@ fn err_payload_is_dead(graph: &FunctionGraph, exit: &Link, r: &Variable) -> bool
     let Some(shell) = graph.blocks[exit.target.0].inputargs.get(pos).cloned() else {
         return false;
     };
+    // `let _ = f()?`-less discard: the shell reaches its block and nothing
+    // reads or forwards it, so neither arm's payload is ever observed.
+    let uses = count_var_uses(graph, &shell);
+    if uses.op_uses == 0
+        && uses.link_uses == 0
+        && !matches!(&graph.blocks[exit.target.0].exitswitch, Some(ExitSwitch::Value(v)) if *v == shell)
+    {
+        return true;
+    }
     let Ok((_, _, disc_shell)) = match_discriminant(graph, exit.target.0) else {
         return false;
     };
@@ -5266,5 +5276,46 @@ mod rebuilt_shell_collapse_tests {
             shell_ctors(&graph) >= 1,
             "a non-match consumer keeps the rebuilt shells"
         );
+    }
+
+    /// `let _ = f();` discards the `Result` unread, so the caught word is
+    /// never materialised back into a carrier: `from_exc_object` takes a
+    /// `PyObject` and the caught word is an `Exception`.
+    #[test]
+    fn catch_and_rewrap_does_not_rebuild_a_discarded_err() {
+        let mut graph = FunctionGraph::new("rewrap_discarded");
+        let a = graph.startblock;
+        let r = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+        let (tail, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(tail, None);
+        graph.set_goto(a, tail, vec![r.clone()]);
+        let spec = crate::ErrorCarrierSpec {
+            carrier_path: "carrier::PyError",
+            carrier_wrappers: &[],
+            to_exc_object: None,
+            from_exc_object: Some(("PyError", "from_exc_object")),
+        };
+        catch_and_rewrap(&mut graph, a.0, &r, "<(),PyError>", &ValueType::Void, spec)
+            .expect("rewrap");
+        let rebuilds = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(&op.kind, OpKind::Call { target, .. }
+                    if format!("{target:?}").contains("from_exc_object"))
+            })
+            .count();
+        assert_eq!(rebuilds, 0, "a discarded Err payload is not rebuilt");
     }
 }
