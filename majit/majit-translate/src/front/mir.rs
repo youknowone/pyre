@@ -15846,8 +15846,7 @@ impl<'a> Lowering<'a> {
         if !self.spec_body {
             return None;
         }
-        let (fn_id, generics) =
-            crate::front::clause_spec::trait_impl_method(payload, self.llbc)?;
+        let (fn_id, generics) = crate::front::clause_spec::trait_impl_method(payload, self.llbc)?;
         let fd = self.llbc.fn_by_id(fn_id)?;
         let path = fd.item_meta.name_path();
         let leaf = path.rsplit("::").next().unwrap_or("fn");
@@ -15883,10 +15882,7 @@ impl<'a> Lowering<'a> {
                 return None;
             }
             let path = fd.item_meta.name_path();
-            if self
-                .dont_look_inside
-                .contains(&strip_crate_prefix(&path))
-            {
+            if self.dont_look_inside.contains(&strip_crate_prefix(&path)) {
                 return None;
             }
             crate::front::clause_spec::concrete_trait_refs(generics, self.llbc)?
@@ -15950,8 +15946,7 @@ impl<'a> Lowering<'a> {
             method_hint
         };
         let segments: Vec<String> = if method_hint.is_none()
-            && let Some((owner_qualified, leaf)) =
-                impl_method_owner_for_fundecl(self.llbc, fd)
+            && let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(self.llbc, fd)
         {
             let mut v: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
             v.push(leaf);
@@ -17752,8 +17747,7 @@ impl<'a> Lowering<'a> {
         let CallKind::Trait(payload) = &reg.kind else {
             return false;
         };
-        let Some(impl_id) =
-            crate::front::clause_spec::resolved_trait_impl_id(payload, self.llbc)
+        let Some(impl_id) = crate::front::clause_spec::resolved_trait_impl_id(payload, self.llbc)
         else {
             return false;
         };
@@ -17773,7 +17767,9 @@ impl<'a> Lowering<'a> {
         let Some(ti) = self.llbc.trait_impls_raw().get(impl_id as usize) else {
             return false;
         };
-        let Some(trait_id) = ti.pointer("/impl_trait/id").and_then(serde_json::Value::as_u64)
+        let Some(trait_id) = ti
+            .pointer("/impl_trait/id")
+            .and_then(serde_json::Value::as_u64)
         else {
             return false;
         };
@@ -21604,9 +21600,11 @@ impl<'a> Lowering<'a> {
     /// arithmetic is modular machine arithmetic — `rint.py rtype_add
     /// rtype_add` emits `int_add` with no overflow check, and `int_add`
     /// wraps (`rarithmetic.py intmask` semantics) — so the wrapping
-    /// method IS the plain llop.  Restricted to word-sized receivers; a
-    /// narrower `wrapping_add` (which wraps at its own width) keeps the
-    /// `Call` form.
+    /// method IS the plain llop.  A narrower receiver lowers to that word
+    /// op followed by a truncation back to its width — an `and` mask for
+    /// an unsigned receiver, an `lshift`/`rshift` pair for a signed one —
+    /// the way `rint.py` casts a narrow repr's result back with
+    /// `cast_primitive`.
     ///
     /// Both integer banks count, the lesson [`vec_index_type_is_scalar`]
     /// already carries: `usize` serializes as `{"UInt": "Usize"}`, which
@@ -21807,20 +21805,45 @@ impl<'a> Lowering<'a> {
             return Ok(false);
         };
         let word_bytes = crate::layout::target_word_size();
-        let signed_word = self.tyref_literal_int_atom(src).is_some_and(|atom| {
-            crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes)
-        });
-        let unsigned_word = self.tyref_literal_uint_atom(src).is_some_and(|atom| {
-            crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes)
-        });
-        if !signed_word && !unsigned_word {
+        let word_bits = (word_bytes * 8) as u32;
+        let signed_atom = self.tyref_literal_int_atom(src);
+        let unsigned_atom = self.tyref_literal_uint_atom(src);
+        let (atom, unsigned_receiver) = match (signed_atom, unsigned_atom) {
+            (Some(atom), None) => (atom, false),
+            (None, Some(atom)) => (atom, true),
+            _ => return Ok(false),
+        };
+        // `I128` / `U128` and any unrecognised atom stay a `Call`.
+        // `Isize` / `Usize` are the target word.
+        let bits = match atom {
+            "I8" | "U8" => 8,
+            "I16" | "U16" => 16,
+            "I32" | "U32" => 32,
+            "I64" | "U64" => 64,
+            "Isize" | "Usize" => word_bits,
+            _ => return Ok(false),
+        };
+        let signed_word = !unsigned_receiver
+            && crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes);
+        let unsigned_word = unsigned_receiver
+            && crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes);
+        // Only `wrapping_{add,sub,mul}` widen a receiver narrower than the
+        // word: the word op, then a truncation back (`rint.py`
+        // `cast_primitive`). `div` / `rem` / `shl` / `shr` keep the
+        // word-only gate.
+        let narrow_truncation = bits < word_bits
+            && matches!(
+                leaf.as_str(),
+                "wrapping_add" | "wrapping_sub" | "wrapping_mul"
+            );
+        if !signed_word && !unsigned_word && !narrow_truncation {
             return Ok(false);
         }
         if signed_only && !signed_word {
             return Ok(false);
         }
         let bb_id = self.block_id[mir_bb];
-        let result_ty = if unsigned_word {
+        let result_ty = if unsigned_receiver {
             ValueType::Unsigned
         } else {
             ValueType::Int
@@ -21872,9 +21895,68 @@ impl<'a> Lowering<'a> {
                 op: op.to_string(),
                 lhs: lhs.clone(),
                 rhs: shift_rhs,
-                result_ty,
+                result_ty: result_ty.clone(),
             },
         });
+        let res = if narrow_truncation && unsigned_receiver {
+            let mask_val = (1u64 << bits) - 1;
+            let mask = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(mask.clone()),
+                kind: OpKind::ConstUInt(mask_val),
+            });
+            let masked = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(masked.clone()),
+                kind: OpKind::BinOp {
+                    op: "and".to_string(),
+                    lhs: res,
+                    rhs: mask,
+                    result_ty,
+                },
+            });
+            masked
+        } else if narrow_truncation {
+            let shift_amt = i64::from(word_bits - bits);
+            let shift = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(shift.clone()),
+                kind: OpKind::ConstInt(shift_amt),
+            });
+            let shifted = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(shifted.clone()),
+                kind: OpKind::BinOp {
+                    op: "lshift".to_string(),
+                    lhs: res,
+                    rhs: shift.clone(),
+                    result_ty: result_ty.clone(),
+                },
+            });
+            let extended = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(extended.clone()),
+                kind: OpKind::BinOp {
+                    op: "rshift".to_string(),
+                    lhs: shifted,
+                    rhs: shift,
+                    result_ty,
+                },
+            });
+            extended
+        } else {
+            res
+        };
         self.local_var[dest_local] = Some(res);
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
@@ -25231,7 +25313,10 @@ fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str) -> Vec<String> {
     // of `name_path` is one segment when it contains `<Impl>`, not a
     // split of that token.
     let stripped = strip_crate_prefix(&fd.item_meta.name_path());
-    let module = stripped.rsplit_once("::").map(|(module, _)| module).unwrap_or("");
+    let module = stripped
+        .rsplit_once("::")
+        .map(|(module, _)| module)
+        .unwrap_or("");
     let mut segments: Vec<String> = if module.is_empty() {
         Vec::new()
     } else {
@@ -45371,6 +45456,117 @@ mod tests {
         assert!(
             !call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_shl"),
             "usize::wrapping_shl must not residualize; ops={ops:?}"
+        );
+    }
+
+    fn rhs_defined_by(
+        ops: &[&SpaceOperation],
+        rhs: &Variable,
+        kind_is: impl Fn(&OpKind) -> bool,
+    ) -> bool {
+        ops.iter()
+            .any(|op| op.result.as_ref() == Some(rhs) && kind_is(&op.kind))
+    }
+
+    #[test]
+    fn wrapping_add_of_u32_is_add_then_mask() {
+        let u32_ty = serde_json::json!({"Literal": {"UInt": "U32"}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_add_u32",
+            &["core", "num", "<Impl>", "wrapping_add"],
+            &[u32_ty.clone(), u32_ty.clone()],
+            u32_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "wrapping_add_u32").expect("lower u32::wrapping_add");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
+            "u32::wrapping_add must become add; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| match &op.kind {
+                OpKind::BinOp { op, rhs, .. } if op == "and" => {
+                    rhs_defined_by(&ops, rhs, |kind| {
+                        matches!(kind, OpKind::ConstUInt(0xFFFF_FFFF))
+                    })
+                }
+                _ => false,
+            }),
+            "u32::wrapping_add must mask with 0xFFFF_FFFF; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_add"),
+            "u32::wrapping_add must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn wrapping_add_of_i32_is_add_then_sign_extend() {
+        let i32_ty = serde_json::json!({"Literal": {"Int": "I32"}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_add_i32",
+            &["core", "num", "<Impl>", "wrapping_add"],
+            &[i32_ty.clone(), i32_ty.clone()],
+            i32_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "wrapping_add_i32").expect("lower i32::wrapping_add");
+        let ops = graph_ops(&graph);
+        let shift_amt = (crate::layout::target_word_size() as i64) * 8 - 32;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
+            "i32::wrapping_add must become add; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| match &op.kind {
+                OpKind::BinOp { op, rhs, .. } if op == "lshift" => {
+                    rhs_defined_by(
+                        &ops,
+                        rhs,
+                        |kind| matches!(kind, OpKind::ConstInt(n) if *n == shift_amt),
+                    )
+                }
+                _ => false,
+            }),
+            "i32::wrapping_add must lshift by word_bits - 32; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| match &op.kind {
+                OpKind::BinOp { op, rhs, .. } if op == "rshift" => {
+                    rhs_defined_by(
+                        &ops,
+                        rhs,
+                        |kind| matches!(kind, OpKind::ConstInt(n) if *n == shift_amt),
+                    )
+                }
+                _ => false,
+            }),
+            "i32::wrapping_add must rshift by word_bits - 32; ops={ops:?}"
+        );
+        assert!(
+            call_leafs(&ops).is_empty(),
+            "i32::wrapping_add must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn wrapping_div_of_u32_stays_a_call() {
+        let u32_ty = serde_json::json!({"Literal": {"UInt": "U32"}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_div_u32",
+            &["core", "num", "<Impl>", "wrapping_div"],
+            &[u32_ty.clone(), u32_ty.clone()],
+            u32_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "wrapping_div_u32").expect("lower u32::wrapping_div");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_div"),
+            "u32::wrapping_div must stay a call; ops={ops:?}"
         );
     }
 
