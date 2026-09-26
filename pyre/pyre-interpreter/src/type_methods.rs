@@ -6648,12 +6648,9 @@ pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // The lookup hashes and compares the key, which is user code. Pin the
     // backing, key, and default first and reload every operand from its slot.
     let _roots = pyre_object::gc_roots::push_roots();
-    let live: Vec<PyObjectRef> = if args.len() >= 3 {
-        vec![dict, args[1], args[2]]
-    } else {
-        vec![dict, args[1]]
-    };
-    let base = pyre_object::gc_roots::pin_roots(&live);
+    let has_default = args.len() >= 3;
+    let live = [dict, args[1], if has_default { args[2] } else { PY_NULL }];
+    let base = pyre_object::gc_roots::pin_roots(&live[..2 + usize::from(has_default)]);
     let found = dict_lookup_checked(
         pyre_object::gc_roots::shadow_stack_get(base),
         pyre_object::gc_roots::shadow_stack_get(base + 1),
