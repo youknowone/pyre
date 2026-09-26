@@ -1387,6 +1387,18 @@ pub trait GcAllocator: Send {
         None
     }
 
+    /// Whether this descr has a `gcrootmap`.
+    ///
+    /// `GcLLDescr_boehm.gcrootmap` is `None`; `GcLLDescr_framework` builds
+    /// one in `_make_gcrootmap`. The backend pushes a jitframe onto a shadow
+    /// stack only when `gcrootmap and gcrootmap.is_shadow_stack`
+    /// (`assembler.py` `_call_header_shadowstack`). A collector that can run
+    /// and has to find live jitframes is exactly "the installed descr has a
+    /// gcrootmap". Default `true` keeps every existing allocator on that path.
+    fn has_gcrootmap(&self) -> bool {
+        true
+    }
+
     /// llsupport/gc.py:162 / gc.py:318 `supports_guard_gc_type` flag.
     /// `GcLLDescr_boehm` sets it to `False`; `GcLLDescr_framework` sets
     /// it to `True`. Relayed to `cpu.supports_guard_gc_type` via
@@ -2454,11 +2466,25 @@ pub fn supports_guard_gc_type() -> bool {
 #[cfg(any(test, feature = "gc_box"))]
 static GC_BOX_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Record that a backend has installed a per-thread GC box. Called from each
-/// backend's box-installing entry point.
+/// Set once a per-thread box whose descr has a `gcrootmap` is installed.
+/// Set-only, never cleared, same as [`GC_BOX_INSTALLED`]: one such box
+/// anywhere in the process means a collector can run and must find frames.
 #[cfg(any(test, feature = "gc_box"))]
-pub fn note_gc_box_installed() {
+static GC_BOX_HAS_GCROOTMAP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record that a backend has installed a per-thread GC box.
+///
+/// `has_gcrootmap` is the installed allocator's [`GcAllocator::has_gcrootmap`].
+/// Only a box with a `gcrootmap` sets [`GC_BOX_HAS_GCROOTMAP`]; a box without
+/// one still sets [`GC_BOX_INSTALLED`] so allocation and barrier trampolines
+/// route to it. Neither flag is ever cleared.
+#[cfg(any(test, feature = "gc_box"))]
+pub fn note_gc_box_installed(has_gcrootmap: bool) {
     GC_BOX_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
+    if has_gcrootmap {
+        GC_BOX_HAS_GCROOTMAP.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// A build without `gc_box` answers every [`gc_box_installed`] query with a
@@ -2466,7 +2492,7 @@ pub fn note_gc_box_installed() {
 /// and its owner would silently allocate out of the singleton instead. Refuse
 /// loudly rather than let that read as a pass.
 #[cfg(not(any(test, feature = "gc_box")))]
-pub fn note_gc_box_installed() {
+pub fn note_gc_box_installed(_has_gcrootmap: bool) {
     panic!(
         "a per-thread GC box was installed in a build without the `gc_box` feature; \
          a process-global runtime must use `install_gc_standalone`, while a test or \
@@ -2490,14 +2516,32 @@ pub fn gc_box_installed() -> bool {
     false
 }
 
+/// Whether any installed per-thread box has a `gcrootmap`. See
+/// [`GC_BOX_HAS_GCROOTMAP`].
+#[cfg(any(test, feature = "gc_box"))]
+#[inline]
+fn gc_box_has_gcrootmap() -> bool {
+    GC_BOX_HAS_GCROOTMAP.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// No box can exist in this build, so no box-owned `gcrootmap` either.
+#[cfg(not(any(test, feature = "gc_box")))]
+#[inline(always)]
+fn gc_box_has_gcrootmap() -> bool {
+    false
+}
+
 /// Whether a collector can run and therefore has to find live jitframes.
 ///
-/// `gc_box_installed` is the thread-confined heap; `gc_sync::is_initialized`
-/// is the process-global one. Neither means frames are ordinary allocations
-/// and nothing walks them (`GcLLDescr_boehm` with no collection in progress).
+/// That is "the installed descr has a `gcrootmap`"
+/// (`GcLLDescr_boehm.gcrootmap` is `None`; `GcLLDescr_framework` has one via
+/// `_make_gcrootmap`). A per-thread box without a gcrootmap still answers
+/// [`gc_box_installed`] so allocation and barrier trampolines route to it;
+/// it does not make this true. `gc_sync::is_initialized` is the
+/// process-global collector, which always has one.
 #[inline]
 pub fn collector_installed() -> bool {
-    gc_box_installed() || gc_sync::is_initialized()
+    gc_box_has_gcrootmap() || gc_sync::is_initialized()
 }
 
 /// `GcLLDescr_boehm.malloc_fn_ptr`, the address `gen_malloc_fixedsize` calls.

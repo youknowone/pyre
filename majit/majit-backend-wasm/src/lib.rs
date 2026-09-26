@@ -1336,7 +1336,7 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> ActiveGcBox {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
     majit_gc::disarm_published_nursery();
-    majit_gc::note_gc_box_installed();
+    majit_gc::note_gc_box_installed(gc.has_gcrootmap());
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     let (generation, installed) = gc_box::store(gc);
     if installed {

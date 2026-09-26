@@ -494,7 +494,7 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     // nursery is not the singleton's, so the process-wide published range can
     // no longer stand in for `is_nursery_object`.
     majit_gc::disarm_published_nursery();
-    majit_gc::note_gc_box_installed();
+    majit_gc::note_gc_box_installed(gc.has_gcrootmap());
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     check_jitframe_descr(gc.as_ref());
     gc_box::store(gc);

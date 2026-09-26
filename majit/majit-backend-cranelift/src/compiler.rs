@@ -1473,8 +1473,8 @@ fn with_cranelift_gc_required<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R
 }
 
 fn set_cranelift_active_gc(gc: Option<Box<dyn GcAllocator>>) {
-    if gc.is_some() {
-        majit_gc::note_gc_box_installed();
+    if let Some(gc) = gc.as_ref() {
+        majit_gc::note_gc_box_installed(gc.has_gcrootmap());
     }
     gc_box::store(gc);
 }
