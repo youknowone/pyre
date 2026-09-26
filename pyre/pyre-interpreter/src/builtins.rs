@@ -9676,6 +9676,13 @@ pub(crate) fn exception_getset_fget_obj() -> PyObjectRef {
     exception_getset_ends().0
 }
 
+/// `exception_attr_slot_fold` looks through a typedef getset only when its
+/// `fget` is the one [`exception_getset_ends`] installed. A user override of
+/// the same name has a different function object.
+pub(crate) fn is_exception_canonical_fget(fget: PyObjectRef) -> bool {
+    std::ptr::eq(fget, exception_getset_fget_obj())
+}
+
 /// Store `value` under `key` in the type namespace dict rooted at shadow-stack
 /// slot `ns_slot`.
 ///
