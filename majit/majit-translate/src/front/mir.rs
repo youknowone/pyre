@@ -16733,11 +16733,8 @@ impl<'a> Lowering<'a> {
                             continue;
                         }
                         let name = field.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
-                        let value_ty = tyref_to_value_type_with(
-                            &field.ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                        );
+                        let value_ty =
+                            tyref_to_value_type_with(&field.ty, self.llbc, self.tombstoned_leaves);
                         candidates.push(MoveSpan {
                             offset,
                             bytes: itemsize,
@@ -16751,7 +16748,9 @@ impl<'a> Lowering<'a> {
                     }
                 }
                 candidates.sort_by(|left, right| {
-                    left.offset.cmp(&right.offset).then(right.bytes.cmp(&left.bytes))
+                    left.offset
+                        .cmp(&right.offset)
+                        .then(right.bytes.cmp(&left.bytes))
                 });
                 let mut spans: Vec<MoveSpan> = Vec::new();
                 for candidate in candidates {
@@ -16931,7 +16930,11 @@ impl<'a> Lowering<'a> {
             }
         }
         if tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
-            return Some((ValueType::Ref(None), crate::layout::target_word_size(), false));
+            return Some((
+                ValueType::Ref(None),
+                crate::layout::target_word_size(),
+                false,
+            ));
         }
         let id = self.tyref_adt_def_id(ty)?;
         let td = self.llbc.type_by_id(id)?;

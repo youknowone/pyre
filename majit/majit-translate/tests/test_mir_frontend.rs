@@ -1669,7 +1669,6 @@ fn mem_replace_reborrow_then_read_returns_new() {
     assert_eq!(replace_calls, 0, "still calls mem::replace: {kinds:?}");
 }
 
-
 /// A multi-word value moves one field at a time. `TwoWords` is two `i64`
 /// fields (`getfield` / `setfield`). `WordUnion` is a 16-byte enum: the tag
 /// and each non-overlapping payload field are `getfield` / `setfield`.
