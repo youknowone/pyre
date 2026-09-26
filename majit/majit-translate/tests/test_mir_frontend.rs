@@ -1769,7 +1769,10 @@ fn mem_replace_of_a_multi_word_value_is_field_wise() {
             }
         }
     }
-    assert!(called_default, "take_odd_default did not call Default::default");
+    assert!(
+        called_default,
+        "take_odd_default did not call Default::default"
+    );
     wrote.sort();
     assert!(
         wrote.iter().filter(|name| name.as_str() == "lo").count() >= 1
