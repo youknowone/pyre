@@ -892,6 +892,11 @@ pub struct ImportedShortPureOp {
     pub result: OpRef,
     /// RPython: PreambleOp stored in pure cache. Used by force_op_from_preamble.
     pub pop: crate::optimizeopt::info::PreambleOp,
+    /// `pure.py` `RecentPureOps.add` stores the op, and `lookup2` calls
+    /// `get_box_replacement` on its args at lookup time. These are those
+    /// argument boxes. Rematerializing them from an `OpRef` in the peeled
+    /// context drops the forwarding a later `guard_value` wrote.
+    pub cache_args: Vec<majit_ir::operand::Operand>,
 }
 
 impl ImportedShortPureOp {
@@ -964,6 +969,7 @@ impl ImportedShortPureOp {
             descr,
             args,
             result,
+            cache_args: Vec::new(),
             pop: crate::optimizeopt::info::PreambleOp {
                 op: pop_op,
                 invented_name,

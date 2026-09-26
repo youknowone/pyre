@@ -750,6 +750,24 @@ impl OptPure {
             .unwrap_or(true)
     }
 
+    /// `pure.py` `opt.pure(opnum, PreambleOp(op, ...))` with `op`'s own
+    /// argument boxes. `RecentPureOps.lookup2` applies
+    /// `get_box_replacement` when the peeled loop looks the op up.
+    fn pure_preamble_boxes(
+        &mut self,
+        opcode: OpCode,
+        args: Vec<Operand>,
+        descr_identity: Option<usize>,
+        pop: PreambleOp,
+    ) {
+        let key = PureOpKey {
+            opcode,
+            args: args.into_iter().collect(),
+            descr_identity,
+        };
+        self.cache.borrow_mut().insert_preamble(key, pop);
+    }
+
     /// Store PreambleOp in OptPure for always-pure ops.
     /// RPython shortpreamble.py: opt.pure(op.getopnum(), PreambleOp(...))
     pub fn pure_preamble(
@@ -1390,6 +1408,17 @@ impl Optimization for OptPure {
             if entry.opcode.is_call_pure() || entry.opcode.is_call() {
                 // shortpreamble.py: optpure.extra_call_pure.append(PreambleOp(...))
                 self.extra_call_pure_preamble(entry.opcode, resolved_args, descr_identity, pop);
+            } else if !entry.cache_args.is_empty() {
+                // pure.py RecentPureOps.lookup2 compares
+                // get_box_replacement of the cached args at lookup time.
+                // Keep the preamble boxes; rematerializing them here drops
+                // the guard_value forwarding.
+                self.pure_preamble_boxes(
+                    entry.opcode,
+                    entry.cache_args.clone(),
+                    descr_identity,
+                    pop,
+                );
             } else {
                 // shortpreamble.py: opt.pure(opnum, PreambleOp(...))
                 self.pure_preamble(entry.opcode, resolved_args, descr_identity, pop, ctx);

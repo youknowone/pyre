@@ -397,11 +397,22 @@ impl PreambleOp {
                 //   else:
                 //       opnum = op.getopnum()
                 //   return ProducedShortOp(self, op.copy_and_change(opnum, args=arglist))
+                //
+                // shortpreamble.py ShortBoxes.produce_arg returns a Const only
+                // when the argument itself is a Const. guard_value forwards the
+                // original box afterwards (resoperation.py get_box_replacement);
+                // RecentPureOps.lookup2 compares that replacement at lookup
+                // time. Feed produce_arg the replacement so the exported pure
+                // op is int_ge(Const, b), not dropped because the unreplaced
+                // inputarg is no longer a label arg.
                 let args = self
                     .op
                     .getarglist()
                     .iter()
-                    .map(|arg| sb.produce_arg(ctx, arg.to_opref()))
+                    .map(|arg| {
+                        let replaced = arg.get_box_replacement(false);
+                        sb.produce_arg(ctx, replaced.to_opref())
+                    })
                     .collect::<Option<smallvec::SmallVec<[majit_ir::operand::Operand; 3]>>>()?;
                 let opnum = if self.op.opcode.is_call() {
                     match self.op.opcode {
@@ -1659,6 +1670,7 @@ impl ProducedShortOp {
                     descr: self.preamble_op.getdescr(),
                     args,
                     result: result_opref,
+                    cache_args: Vec::new(),
                     pop: crate::optimizeopt::info::PreambleOp {
                         // shortpreamble.py `PreambleOp(self.res, preamble_op)`.
                         op: self.res.clone(),
@@ -1679,6 +1691,11 @@ impl ProducedShortOp {
                 self.same_as_source.clone(),
             ),
         };
+        // pure.py RecentPureOps.add stores the op. lookup2 reads
+        // get_box_replacement(op.getarg(i)) later, after guard_value has
+        // forwarded an arg to a Const. Keep those argument boxes.
+        let mut imported = imported;
+        imported.cache_args = self.source_op.getarglist().to_vec();
         ctx.imported_short_pure_ops.push(imported);
         // shortpreamble.py add_preamble_op + 437-438 extra_same_as:
         // RPython collects the SameAs op into `short_preamble_producer.extra_same_as`
