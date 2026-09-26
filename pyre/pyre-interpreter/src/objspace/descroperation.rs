@@ -189,6 +189,56 @@ fn bigint_add(a: &BigInt, b: &BigInt) -> *mut BigInt {
     pyre_object::longobject::alloc_bigint_nursery(a.add(b))
 }
 
+/// Host form of `rbigint.sub` (`rbigint.py`). A zero subtrahend returns
+/// `self`; the MIR front retargets this call to `jit_bigint_sub`.
+#[majit_macros::dont_look_inside]
+fn bigint_sub(a: &BigInt, b: &BigInt) -> *mut BigInt {
+    if b.get_sign() == 0 {
+        return a as *const BigInt as *mut BigInt;
+    }
+    pyre_object::longobject::alloc_bigint_nursery(a.sub(b))
+}
+
+/// Host form of `rbigint.mul` (`rbigint.py`). A zero factor returns the
+/// shared zero inside the elidable multiply; the MIR front retargets this
+/// call to `jit_bigint_mul`.
+#[majit_macros::dont_look_inside]
+fn bigint_mul(a: &BigInt, b: &BigInt) -> *mut BigInt {
+    pyre_object::longobject::alloc_bigint_nursery(a.mul(b))
+}
+
+/// Host form of `rbigint.int_add`. `iother == 0` returns `self` unless
+/// `self` is already zero (`rbigint.py` `int_add`). The MIR front retargets
+/// this call to `jit_bigint_int_add`.
+#[majit_macros::dont_look_inside]
+fn bigint_int_add(a: &BigInt, b: i64) -> *mut BigInt {
+    if a.get_sign() != 0 && b == 0 {
+        return a as *const BigInt as *mut BigInt;
+    }
+    pyre_object::longobject::alloc_bigint_nursery(a.int_add(b))
+}
+
+/// Host form of `rbigint.int_sub`. `iother == 0` returns `self`
+/// (`rbigint.py` `int_sub`). Retargeted to `jit_bigint_int_sub`.
+#[majit_macros::dont_look_inside]
+fn bigint_int_sub(a: &BigInt, b: i64) -> *mut BigInt {
+    if b == 0 {
+        return a as *const BigInt as *mut BigInt;
+    }
+    pyre_object::longobject::alloc_bigint_nursery(a.int_sub(b))
+}
+
+/// Host form of `rbigint.int_mul`. A positive one digit returns `self`
+/// when `self` is nonzero (`rbigint.py` `int_mul`). Retargeted to
+/// `jit_bigint_int_mul`.
+#[majit_macros::dont_look_inside]
+fn bigint_int_mul(a: &BigInt, b: i64) -> *mut BigInt {
+    if a.get_sign() != 0 && b == 1 {
+        return a as *const BigInt as *mut BigInt;
+    }
+    pyre_object::longobject::alloc_bigint_nursery(a.int_mul(b))
+}
+
 /// Host form of `rbigint.pow(a, b, None)` used by `long_pow`.
 ///
 /// The MIR front erases this Rust `Result` carrier back to RPython's implicit
@@ -1062,51 +1112,36 @@ pub(crate) fn ll_int_py_mod(x: i64, y: i64) -> i64 {
 // ── Long (BigInt) arithmetic operations ─────────────────────────────
 
 unsafe fn long_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    // longobject.py:_make_generic_descr_binop('add'): preserve the dedicated
-    // rbigint.int_add path in both commutative operand orders. PyPy's
-    // W_BoolObject subclasses W_IntObject and shares `intval`; pyre stores
-    // bool separately, so the one upstream W_IntObject arm has two storage
-    // projections here.
+    // longobject.py `_make_generic_descr_binop('add')`: one type dispatch,
+    // then `rbigint.int_add` or `rbigint.add`. The zero alias lives inside
+    // those elidable operations (`bigint_int_add` / `bigint_add`). PyPy's
+    // W_BoolObject subclasses W_IntObject; pyre stores bool separately, so
+    // the one upstream W_IntObject arm has two storage projections here.
     if is_long(a) && is_bool(b) {
-        if !w_long_get_value(a).is_zero() && !w_bool_get_value(b) {
-            return Ok(pyre_object::longobject::w_long_from_raw(
-                w_long_get_raw_value(a),
-            ));
-        }
-        return Ok(w_long_new(
-            w_long_get_value(a).int_add(w_bool_get_value(b) as i64),
-        ));
+        return Ok(pyre_object::longobject::w_long_from_raw(bigint_int_add(
+            w_long_get_value(a),
+            w_bool_get_value(b) as i64,
+        )));
     }
     if is_long(a) && is_int(b) {
-        if !w_long_get_value(a).is_zero() && w_int_get_value(b) == 0 {
-            return Ok(pyre_object::longobject::w_long_from_raw(
-                w_long_get_raw_value(a),
-            ));
-        }
-        return Ok(w_long_new(w_long_get_value(a).int_add(w_int_get_value(b))));
+        return Ok(pyre_object::longobject::w_long_from_raw(bigint_int_add(
+            w_long_get_value(a),
+            w_int_get_value(b),
+        )));
     }
     if is_bool(a) && is_long(b) {
-        if !w_long_get_value(b).is_zero() && !w_bool_get_value(a) {
-            return Ok(pyre_object::longobject::w_long_from_raw(
-                w_long_get_raw_value(b),
-            ));
-        }
-        return Ok(w_long_new(
-            w_long_get_value(b).int_add(w_bool_get_value(a) as i64),
-        ));
+        return Ok(pyre_object::longobject::w_long_from_raw(bigint_int_add(
+            w_long_get_value(b),
+            w_bool_get_value(a) as i64,
+        )));
     }
     if is_int(a) && is_long(b) {
-        if !w_long_get_value(b).is_zero() && w_int_get_value(a) == 0 {
-            return Ok(pyre_object::longobject::w_long_from_raw(
-                w_long_get_raw_value(b),
-            ));
-        }
-        return Ok(w_long_new(w_long_get_value(b).int_add(w_int_get_value(a))));
+        return Ok(pyre_object::longobject::w_long_from_raw(bigint_int_add(
+            w_long_get_value(b),
+            w_int_get_value(a),
+        )));
     }
     debug_assert!(is_long(a) && is_long(b));
-    // `rbigint.add` returns the other operand when either sign is 0.
-    // `bigint_add` keeps that alias and returns the payload pointer; the MIR
-    // front retargets the call to `jit_bigint_add`. `descr_add` only wraps it.
     Ok(pyre_object::longobject::w_long_from_raw(bigint_add(
         w_long_get_value(a),
         w_long_get_value(b),
@@ -1114,34 +1149,27 @@ unsafe fn long_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn long_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    // longobject.py:descr_sub specializes only `long - int`; descr_rsub keeps
-    // `int - long` on the ordinary two-rbigint subtraction path.
+    // longobject.py `descr_sub` specializes only `long - int`; `descr_rsub`
+    // keeps `int - long` on the ordinary two-rbigint path. The zero alias
+    // lives inside `rbigint.int_sub` / `rbigint.sub`.
     if is_long(a) && is_bool(b) {
-        if !w_bool_get_value(b) {
-            return Ok(pyre_object::longobject::w_long_from_raw(
-                w_long_get_raw_value(a),
-            ));
-        }
-        return Ok(w_long_new(
-            w_long_get_value(a).int_sub(w_bool_get_value(b) as i64),
-        ));
+        return Ok(pyre_object::longobject::w_long_from_raw(bigint_int_sub(
+            w_long_get_value(a),
+            w_bool_get_value(b) as i64,
+        )));
     }
     if is_long(a) && is_int(b) {
-        if w_int_get_value(b) == 0 {
-            return Ok(pyre_object::longobject::w_long_from_raw(
-                w_long_get_raw_value(a),
-            ));
-        }
-        return Ok(w_long_new(w_long_get_value(a).int_sub(w_int_get_value(b))));
+        return Ok(pyre_object::longobject::w_long_from_raw(bigint_int_sub(
+            w_long_get_value(a),
+            w_int_get_value(b),
+        )));
     }
     if is_long(a) {
         debug_assert!(is_long(b));
-        if w_long_get_value(b).is_zero() {
-            return Ok(pyre_object::longobject::w_long_from_raw(
-                w_long_get_raw_value(a),
-            ));
-        }
-        return Ok(w_long_new(w_long_get_value(a).sub(w_long_get_value(b))));
+        return Ok(pyre_object::longobject::w_long_from_raw(bigint_sub(
+            w_long_get_value(a),
+            w_long_get_value(b),
+        )));
     }
     // Reflected int/bool - long follows descr_rsub's ordinary rbigint path:
     // only the machine-word left operand needs materialising.
@@ -1152,45 +1180,37 @@ unsafe fn long_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn long_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    // longobject.py:_make_generic_descr_binop('mul'): commutative int_mul.
+    // longobject.py `_make_generic_descr_binop('mul')`: commutative
+    // `rbigint.int_mul`. The one-alias lives inside `bigint_int_mul`.
     if is_long(a) && is_bool(b) {
-        if !w_long_get_value(a).is_zero() && w_bool_get_value(b) {
-            return Ok(pyre_object::longobject::w_long_from_raw(
-                w_long_get_raw_value(a),
-            ));
-        }
-        return Ok(w_long_new(
-            w_long_get_value(a).int_mul(w_bool_get_value(b) as i64),
-        ));
+        return Ok(pyre_object::longobject::w_long_from_raw(bigint_int_mul(
+            w_long_get_value(a),
+            w_bool_get_value(b) as i64,
+        )));
     }
     if is_long(a) && is_int(b) {
-        if !w_long_get_value(a).is_zero() && w_int_get_value(b) == 1 {
-            return Ok(pyre_object::longobject::w_long_from_raw(
-                w_long_get_raw_value(a),
-            ));
-        }
-        return Ok(w_long_new(w_long_get_value(a).int_mul(w_int_get_value(b))));
+        return Ok(pyre_object::longobject::w_long_from_raw(bigint_int_mul(
+            w_long_get_value(a),
+            w_int_get_value(b),
+        )));
     }
     if is_bool(a) && is_long(b) {
-        if !w_long_get_value(b).is_zero() && w_bool_get_value(a) {
-            return Ok(pyre_object::longobject::w_long_from_raw(
-                w_long_get_raw_value(b),
-            ));
-        }
-        return Ok(w_long_new(
-            w_long_get_value(b).int_mul(w_bool_get_value(a) as i64),
-        ));
+        return Ok(pyre_object::longobject::w_long_from_raw(bigint_int_mul(
+            w_long_get_value(b),
+            w_bool_get_value(a) as i64,
+        )));
     }
     if is_int(a) && is_long(b) {
-        if !w_long_get_value(b).is_zero() && w_int_get_value(a) == 1 {
-            return Ok(pyre_object::longobject::w_long_from_raw(
-                w_long_get_raw_value(b),
-            ));
-        }
-        return Ok(w_long_new(w_long_get_value(b).int_mul(w_int_get_value(a))));
+        return Ok(pyre_object::longobject::w_long_from_raw(bigint_int_mul(
+            w_long_get_value(b),
+            w_int_get_value(a),
+        )));
     }
     debug_assert!(is_long(a) && is_long(b));
-    Ok(w_long_new(w_long_get_value(a).mul(w_long_get_value(b))))
+    Ok(pyre_object::longobject::w_long_from_raw(bigint_mul(
+        w_long_get_value(a),
+        w_long_get_value(b),
+    )))
 }
 
 unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1259,17 +1279,9 @@ unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         owned_a = BigInt::from(int_value(a));
         &owned_a
     };
-    if is_long(a)
-        && jit_bigint_divrem_returns_lhs_remainder(
-            va as *const BigInt as i64,
-            vb as *const BigInt as i64,
-        ) != 0
-    {
-        return Ok(pyre_object::longobject::w_long_from_raw(
-            w_long_get_raw_value(a),
-        ));
-    }
-    // rbigint.mod → _divmod, returning the remainder half (rbigint.py).
+    // `rbigint.mod` (`_divmod` / `_divrem`) returns the input when it is
+    // already smaller than the divisor. That alias stays inside the elidable
+    // `jit_bigint_mod_floor` residual; `descr_mod` only boxes the result.
     Ok(w_long_new(bigint_modulo_nonzero(va, vb)))
 }
 
@@ -5435,6 +5447,111 @@ pub(crate) fn try_inplace_special(
     Ok(None)
 }
 
+/// `intobject.py _pow_nomod` — look inside when the exponent is constant.
+fn _pow_nomod_iff(_iv: i64, iw: i64) -> bool {
+    majit_rlib::jit::isconstant(&iw)
+}
+
+#[majit_macros::look_inside_iff(_pow_nomod_iff)]
+pub(crate) fn _pow_nomod(iv: i64, mut iw: i64) -> Result<i64, PyError> {
+    if iw <= 0 {
+        if iw == 0 {
+            return Ok(1);
+        }
+        // `intobject.py _pow_nomod`: a negative exponent always returns a float,
+        // so the machine body raises and the caller takes the float path.
+        return Err(PyError::value_error(""));
+    }
+    let mut temp = iv;
+    let mut ix = 1_i64;
+    loop {
+        if iw & 1 != 0 {
+            // `ovfcheck(ix * temp)` — `checked_mul` plus a `Some`/`None` match.
+            let Some(value) = ix.checked_mul(temp) else {
+                return Err(PyError::overflow_error(
+                    "signed integer expression did overflow",
+                ));
+            };
+            ix = value;
+        }
+        iw >>= 1;
+        if iw == 0 {
+            break;
+        }
+        let Some(value) = temp.checked_mul(temp) else {
+            return Err(PyError::overflow_error(
+                "signed integer expression did overflow",
+            ));
+        };
+        temp = value;
+    }
+    Ok(ix)
+}
+
+/// `intobject.py _pow_mod` — look inside when the exponent and the modulus
+/// are both constants, so the squaring loop unrolls into `mulmod` calls.
+fn _pow_mod_iff(_iv: i64, iw: i64, iz: i64) -> bool {
+    majit_rlib::jit::isconstant(&iw) && majit_rlib::jit::isconstant(&iz)
+}
+
+/// Floor remainder. `iz` may be negative (`1 % iz` when the exponent is 0).
+fn floor_mod_i64(iv: i64, iz: i64) -> i64 {
+    let mut remainder = iv % iz;
+    if remainder != 0 && (remainder < 0) != (iz < 0) {
+        remainder += iz;
+    }
+    remainder
+}
+
+#[majit_macros::look_inside_iff(_pow_mod_iff)]
+pub(crate) fn _pow_mod(mut iv: i64, mut iw: i64, mut iz: i64) -> Result<i64, PyError> {
+    if iw == 0 {
+        return Ok(floor_mod_i64(1, iz));
+    }
+    let mut iz_negative = false;
+    if iz < 0 {
+        // `intobject.py _pow_mod`: `iz = ovfcheck(-iz)`. `checked_neg` plus a
+        // `Some`/`None` match is that overflow edge; `i64::MIN` raises.
+        let Some(negated) = iz.checked_neg() else {
+            return Err(PyError::overflow_error(
+                "signed integer expression did overflow",
+            ));
+        };
+        iz = negated;
+        iz_negative = true;
+    }
+    if iw <= 0 {
+        // A negative exponent takes `invmod` on the long path. Signal that
+        // with ValueError so the caller leaves this machine body.
+        return Err(PyError::value_error(""));
+    }
+    let mut temp = iv;
+    let mut ix = 1_i64;
+    loop {
+        if iw & 1 != 0 {
+            ix = majit_rlib::rarithmetic::mulmod(ix, temp, iz);
+        }
+        iw >>= 1;
+        if iw == 0 {
+            break;
+        }
+        temp = majit_rlib::rarithmetic::mulmod(temp, temp, iz);
+    }
+    if iz_negative && ix > 0 {
+        ix -= iz;
+    }
+    Ok(ix)
+}
+
+/// `intobject.py _pow`. `iz == 0` is the two-argument form.
+pub(crate) fn _pow(iv: i64, iw: i64, iz: i64) -> Result<i64, PyError> {
+    if iz == 0 {
+        _pow_nomod(iv, iw)
+    } else {
+        _pow_mod(iv, iw, iz)
+    }
+}
+
 /// `(int|long) ** (int|long) % (int|long)` fast path used by `space.pow`
 /// when a modulus is supplied — longobject.py `int_pow`.
 pub(crate) fn try_int_long_pow_with_modulo(
@@ -5453,6 +5570,25 @@ pub(crate) fn try_int_long_pow_with_modulo(
         // is a long. So the result stays a long unless all three operands are
         // machine ints, in which case `space.newint` demotes it.
         let all_int_like = is_int_like(base) && is_int_like(exp) && is_int_like(modulus);
+
+        // `W_IntObject.descr_pow` / `_pow_mod` for three machine ints.
+        // `is_int_like` is a subclass check and is also true of a long, so
+        // a long stays on the bigint path below. A negative exponent does too.
+        if all_int_like && !is_long(base) && !is_long(exp) && !is_long(modulus) {
+            let iv = int_value(base);
+            let iw = int_value(exp);
+            let iz = int_value(modulus);
+            if iz == 0 {
+                return Err(PyError::value_error("pow() 3rd argument cannot be 0"));
+            }
+            if iw >= 0 {
+                // Overflow (`ovfcheck(-iz)`) and a negative exponent both leave
+                // the machine body; the long path below is that continuation.
+                if let Ok(result) = _pow_mod(iv, iw, iz) {
+                    return Ok(Some(w_int_new(result)));
+                }
+            }
+        }
 
         let base_owned;
         let base = if is_long(base) {

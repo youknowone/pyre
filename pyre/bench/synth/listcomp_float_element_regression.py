@@ -28,7 +28,7 @@ except ImportError:
 
 failures = []
 
-SIZES = list(range(30)) + [2000]
+SIZES = list(range(30)) + [60000]
 
 
 def listcomp_mul(n):
@@ -76,9 +76,9 @@ def main():
     check("listcomp-truediv", listcomp_truediv)
     check("listcomp-call", listcomp_call)
 
-    expected = 400 * 2016.0
+    expected = 12000 * 2016.0
     try:
-        warmed = warm(400)
+        warmed = warm(12000)
     except TypeError as exc:
         failures.append(f"warm loop: raised TypeError: {exc}")
     else:

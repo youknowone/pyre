@@ -25,7 +25,7 @@ def bump(x):
 def main():
     total = 0
     stale = 0
-    for i in range(20000):
+    for i in range(200000):
         total += bump(i)
         if box[0].f_back.f_locals['total'] != total:
             stale += 1

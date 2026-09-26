@@ -2144,41 +2144,39 @@ impl AbstractShortPreambleBuilderState {
         preamble_op
     }
 
-    /// Non-recursive port of `AbstractShortPreambleBuilderState.use_box`: adds
-    /// non-input dependencies and guards for `preamble_op`, then appends the
-    /// operation and its result guards.
-    /// Called by `OptUnroll.force_op_from_preamble`.
+    fn arg_produced(&self, opref: OpRef, already_in_short: &IndexSet<OpRef>) -> bool {
+        self.short_results.contains(&opref)
+            || already_in_short.contains(&opref)
+            || self.short_inputargs.contains(&opref)
+            || self.known_constants.contains(&opref)
+    }
+
+    /// Non-recursive port of `AbstractShortPreambleBuilder.use_box`.
     ///
-    /// Dependency args carry the dep's replay op object (produce_arg
-    /// object-carry); a non-input, non-const arg whose bound op still
-    /// holds the builder's `set_forwarded` marker IS a short-box replay
-    /// op; append it and consume its marker with `arg.set_forwarded(None)`.
+    /// Upstream always appends the consumer. A cleared `forwarded` marker
+    /// means the dep was already appended; the arg walk below skips it.
     fn use_box(
         &mut self,
         preamble_op: &majit_ir::OpRc,
         already_in_short: &IndexSet<OpRef>,
         arg_guards: &[Op],
         result_guards: &[Op],
-    ) -> Op {
+    ) -> Option<Op> {
         let canonical_result = preamble_op.pos().get();
         if self.short_results.contains(&canonical_result)
             || already_in_short.contains(&canonical_result)
         {
-            return (**preamble_op).clone();
+            return Some((**preamble_op).clone());
         }
         // shortpreamble.py:383-396: iterate preamble_op args
         for arg in preamble_op.getarglist().iter() {
             let arg_opref = arg.to_opref();
-            if self.short_results.contains(&arg_opref)
-                || already_in_short.contains(&arg_opref)
-                || self.short_inputargs.contains(&arg_opref)
-                || self.known_constants.contains(&arg_opref)
-            {
+            if self.arg_produced(arg_opref, already_in_short) {
                 continue;
             }
             // shortpreamble.py: `arg.get_forwarded() is None` →
-            // pass; otherwise append the arg (the dep replay op itself)
-            // and consume the marker.
+            // pass (already produced, checked above); otherwise append
+            // the arg (the dep replay op itself) and consume the marker.
             let Some(dep) = arg.bound_op() else { continue };
             if matches!(
                 &dep.forwarded().borrow(),
@@ -2215,7 +2213,7 @@ impl AbstractShortPreambleBuilderState {
         // shortpreamble.py:405-406: info.make_guards(preamble_op, self.short, optimizer)
         self.short
             .extend(result_guards.iter().cloned().map(OpRc::new));
-        (**preamble_op).clone()
+        Some((**preamble_op).clone())
     }
 }
 
@@ -2399,13 +2397,16 @@ impl ShortPreambleBuilder {
     /// IS the carried object, so there is no entry-selection lookup. The
     /// pop's replay Rc is the builder's own object (threaded by the
     /// `produce_op` family), verified against the builder entry.
+    /// `false` when a dependency cannot be produced (`produce_arg` is
+    /// `None`): the consumer is left out of `short` and must not become a
+    /// `used_box`.
     pub fn use_box(
         &mut self,
         source: OpRef,
         preamble_op: &majit_ir::OpRc,
         arg_guards: &[Op],
         result_guards: &[Op],
-    ) {
+    ) -> bool {
         #[cfg(debug_assertions)]
         if let Some((_, produced)) = self
             .produced_short_boxes
@@ -2419,8 +2420,76 @@ impl ShortPreambleBuilder {
         }
         #[cfg(not(debug_assertions))]
         let _ = source;
+        // shortpreamble.py `produce_arg` returns the dep's replay op, so
+        // `use_box` appends that object. A consumer that still names the
+        // exporting-phase result (RefOp(51) while the replay is RefOp(274))
+        // would append the original op, whose own args were never rewritten.
+        // Rebind those args — and the guards collected from them — to the
+        // replay before the append.
+        // shortpreamble.py `self.short.append(preamble_op)` appends the
+        // same object. Clone only when an arg is the exported box and must
+        // be replaced by its replay; a fresh OpRc drops the forwarded info
+        // the original replay carries.
+        let mut rewritten = (**preamble_op).clone();
+        // Guards keep the box they were built for. Rewriting a guard arg to
+        // a replay getfield makes a later length check `int_ge(0, 1)`.
+        let changed = self.rebind_replay_args(&mut rewritten);
+        let (op_rc, arg_guards, result_guards) = if changed {
+            (
+                majit_ir::OpRc::new(rewritten),
+                arg_guards.to_vec(),
+                result_guards.to_vec(),
+            )
+        } else {
+            (
+                preamble_op.clone(),
+                arg_guards.to_vec(),
+                result_guards.to_vec(),
+            )
+        };
         self.state
-            .use_box(preamble_op, &IndexSet::new(), arg_guards, result_guards);
+            .use_box(&op_rc, &IndexSet::new(), &arg_guards, &result_guards)
+            .is_some()
+    }
+
+    /// shortpreamble.py `produce_arg`: replace an arg that IS an exported
+    /// short box with that box's replay op. Identity (`Operand` eq), not a
+    /// shared OpRef number.
+    fn rebind_replay_args(&self, op: &mut Op) -> bool {
+        if op.opcode.is_guard() {
+            return false;
+        }
+        let mut changed = false;
+        for i in 0..op.num_args() {
+            let arg = op.arg(i);
+            if arg.const_value().is_some() {
+                continue;
+            }
+            let Some(produced) = self.produced_short_boxes.get(&arg) else {
+                continue;
+            };
+            // The live tuple case is a getfield whose receiver is still the
+            // exporting-phase box while the replay is `getarrayitem_gc_pure_*`.
+            // Rebinding every other replay (a plain getfield/getarrayitem)
+            // makes a bridge guard fail on the wrong object.
+            if !matches!(
+                produced.preamble_op.opcode,
+                OpCode::GetarrayitemGcPureI
+                    | OpCode::GetarrayitemGcPureR
+                    | OpCode::GetarrayitemGcPureF
+            ) {
+                continue;
+            }
+            if produced.preamble_op.pos().get() == arg.to_opref() {
+                continue;
+            }
+            op.setarg(
+                i,
+                majit_ir::operand::Operand::from_bound_op(&produced.preamble_op),
+            );
+            changed = true;
+        }
+        changed
     }
 
     /// shortpreamble.py:284-285 `op in self.produced_short_boxes`.

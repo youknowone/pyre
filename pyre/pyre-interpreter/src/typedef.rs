@@ -355,13 +355,15 @@ pub fn r#type(obj: PyObjectRef) -> Option<NonNull<PyObject>> {
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
         return gettypefor(&pyre_object::INT_TYPE);
     }
+    // The class read itself is not promoted. `type(x)` promotes through
+    // `promoted_w_class`; doing it here puts a guard on every other reader,
+    // including the overflow path of `acc * 2 + 1`.
     unsafe {
         // Trust a specialised `w_class` for every object, exception or not.
-        // The generic `EXCEPTION_TYPE` stub is *not* the real class — only
+        // The generic `EXCEPTION_TYPE` stub is not the real class — only
         // then walk the `ExcKind` registry (`lookup_exc_class_for_kind`).
-        // Checking the stub after the field read (instead of `is_exception`
-        // first) keeps `type()` of ints/lists/specialised exceptions off
-        // the `ll_isinstance` range walk.
+        // Checking the stub after the field read keeps `type()` of
+        // ints/lists/specialised exceptions off the `ll_isinstance` range walk.
         let w_class = (*obj).w_class;
         if !w_class.is_null() {
             let exc_stub =
@@ -380,12 +382,32 @@ pub fn r#type(obj: PyObjectRef) -> Option<NonNull<PyObject>> {
         if !w_class.is_null() {
             return NonNull::new(w_class);
         }
-        // Fallback for objects created before init_typeobjects (None, True,
-        // False, Ellipsis, NotImplemented). These are `static`s in RODATA,
-        // so writing to (*obj).w_class would SIGBUS — just look it up via
-        // gettypefor(), which reads an AtomicPtr on the PyType.
+        // Objects created before init_typeobjects (None, True, False,
+        // Ellipsis, NotImplemented) are `static`s in RODATA, so writing
+        // `(*obj).w_class` would SIGBUS. `gettypefor` reads the `PyType`.
         let tp = (*obj).ob_type;
         gettypefor(tp)
+    }
+}
+
+/// Promoted `w_class` when it is the object's real class.
+///
+/// A null class, or the generic exception stub, returns `None` so the caller
+/// takes the registry / `ob_type` fallback. `StdObjSpace.type` promotes the
+/// class it returns.
+pub fn promoted_w_class(obj: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe {
+        let w_class = (*obj).w_class;
+        if w_class.is_null() {
+            return None;
+        }
+        let w_class = majit_metainterp::jit::promote(w_class);
+        let exc_stub =
+            pyre_object::get_instantiate(&pyre_object::interp_exceptions::EXCEPTION_TYPE);
+        if std::ptr::eq(w_class, exc_stub) {
+            return None;
+        }
+        Some(w_class)
     }
 }
 
@@ -30152,8 +30174,16 @@ fn coroutine_get_frame(args: &[PyObjectRef]) -> crate::PyResult {
     // CPython 3.14 releases a temporary coroutine immediately after
     // `f().cr_frame`; schedule pyre's tracing-GC equivalent for the next
     // opcode, when the getter receiver is no longer rooted by LOAD_ATTR.
+    // A running coroutine stays rooted by its executing frame and an
+    // exhausted one has nothing left to finalize, so neither can be observed
+    // through that pass.
+    let obj = args[1];
+    let observable = unsafe {
+        !pyre_object::generator::w_generator_is_running(obj)
+            && !pyre_object::generator::w_generator_is_exhausted(obj)
+    };
     let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
-    if !ec.is_null() {
+    if observable && !ec.is_null() {
         unsafe { (*ec).finalize_discarded_coroutine_after_frame_get() };
     }
     Ok(frame)
@@ -31200,7 +31230,7 @@ fn init_callable_iterator_type(ns: PyObjectRef) {
     for (name, function) in [
         (
             "__iter__",
-            crate::baseobjspace::iter_self_method as fn(&[PyObjectRef]) -> crate::PyResult,
+            crate::builtins::__majit_wrap_iter_self as fn(&[PyObjectRef]) -> crate::PyResult,
         ),
         ("__next__", crate::baseobjspace::iter_next_method),
         (

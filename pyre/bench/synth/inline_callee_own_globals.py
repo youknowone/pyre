@@ -30,7 +30,7 @@ def drive(n):
 
 
 def main():
-    n = 5000
+    n = 150000
     got = drive(n)
     want = n * 1000 + n * (n - 1) // 2
     if got != want:

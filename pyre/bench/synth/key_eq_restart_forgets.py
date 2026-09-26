@@ -102,7 +102,7 @@ def main():
     # the interpreter, where the deferred probe lives regardless of the JIT.)
     settled = {Recorded(i): i for i in range(3)}
     hits = 0
-    for _ in range(20000):
+    for _ in range(360000):
         if Recorded(1) in settled:
             hits += 1
     print("hot", hits)

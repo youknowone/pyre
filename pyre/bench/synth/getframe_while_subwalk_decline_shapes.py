@@ -41,7 +41,7 @@ def part_a():
     total = 0
     caught = 0
     i = 0
-    while i < 30000:
+    while i < 200000:
         try:
             total = leaf_a(total)
         except ValueError:
@@ -62,7 +62,7 @@ def outer_b(x):
 def part_b():
     total = 0
     i = 0
-    while i < 30000:
+    while i < 200000:
         total = outer_b(total)
         i = i + 1
     return total

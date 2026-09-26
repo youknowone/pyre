@@ -80,6 +80,13 @@ unsafe fn exact_builtin_len_shortcut_receiver(obj: pyre_object::PyObjectRef) -> 
         || std::ptr::eq(ob_type, &pyre_object::setobject::SET_TYPE)
         || std::ptr::eq(ob_type, &pyre_object::setobject::FROZENSET_TYPE)
         || std::ptr::eq(ob_type, &pyre_object::functional::RANGE_TYPE)
+        // `len_slot` forwards an exact dict and its views to `w_dict_len`.
+        // That leaf stays `dont_look_inside`, so the walk records the call
+        // and does not read strategy storage itself.
+        || std::ptr::eq(ob_type, &pyre_object::pyobject::DICT_TYPE)
+        || std::ptr::eq(ob_type, &pyre_object::dictmultiobject::DICT_KEYS_TYPE)
+        || std::ptr::eq(ob_type, &pyre_object::dictmultiobject::DICT_VALUES_TYPE)
+        || std::ptr::eq(ob_type, &pyre_object::dictmultiobject::DICT_ITEMS_TYPE)
     {
         pyre_object::pyobject::get_instantiate(unsafe { &*ob_type })
     } else if specialised_pair_kind(ob_type).is_some() {
@@ -198,6 +205,12 @@ struct KwonlyDefaultInline {
     slot: usize,
     stored: pyre_object::PyObjectRef,
     value: pyre_object::PyObjectRef,
+}
+
+/// `_match_signature` allocates a fresh kwargs dict on every call
+/// (`space.newdict(kwargs=True)` / `w_dict_new_kwargs`).
+extern "C" fn jit_empty_kwargs_dict() -> i64 {
+    pyre_object::dictmultiobject::w_dict_new_kwargs() as i64
 }
 
 /// What the record-time resolve proved about `Function.w_kw_defs`, carried to
@@ -2136,32 +2149,6 @@ pub(crate) fn collect_callee_active_boxes(
     Ok(active)
 }
 
-/// Whether a loop-carried operand parked below the call keeps the fold
-/// worthwhile.
-///
-/// A numeric accumulator (`a` in `a += r(d)`) does: the fold's resume rebuilds
-/// it from the caller's own register writeback, and folding the call is what
-/// turns a residual recursion back into an assembler-to-assembler jump.
-///
-/// A live iterator does not.  Folding a self-call that sits under a `FOR_ITER`
-/// iterator costs the caller a compiled loop and a bridge — measured on
-/// `recursive_call_frame_relocation` (`for k in range(n): r += cat(n - 1)`) as
-/// `loops_compiled 3 -> 2`, `bridges_compiled 3 -> 2` and 0.18s -> 0.22s.  The
-/// residual path keeps that loop, so leave the iterator-bearing shape to it.
-fn loop_carried_slot_keeps_fold_profitable<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    slot: OpRef,
-) -> bool {
-    match ctx.trace_ctx.box_value(slot) {
-        Some(majit_ir::Value::Int(_)) | Some(majit_ir::Value::Float(_)) => true,
-        Some(majit_ir::Value::Ref(r)) => {
-            let obj = r.as_usize();
-            obj != 0 && unsafe { pyre_object::is_int(obj as pyre_object::PyObjectRef) }
-        }
-        _ => false,
-    }
-}
-
 /// Whether the call at `op_pc` in the walk's own code sits inside a protected
 /// region its `GUARD_NO_EXCEPTION` deopt would have to resume into.
 ///
@@ -2234,7 +2221,7 @@ fn foreign_callee_admits_call_assembler(w_code: *const ()) -> bool {
 /// `recursion_exceeded -> assembler_call`, `pyjitpl.py`, and
 /// `do_residual_call`'s assembler branch, `pyjitpl.py`).
 ///
-/// First cut — the `fib` shape only: a single positional INT argument to a
+/// The `fib` shape and any other red-box arguments: positional arguments to a
 /// self-recursive (`callee code == portal code`) callee whose frame is
 /// `ncells == 0`, non-global-storing, and inline-buildable via
 /// [`crate::helpers::emit_new_pyframe_inline_self_recursive`]
@@ -2323,60 +2310,28 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     else {
         return Ok(None);
     };
-    // Dense positional fill only: the call must pass exactly `nparams`
-    // positional args (`r_args = [callable, null_or_self, arg0..arg{n-1}]`),
-    // so the built frame's `locals[0..nparams]` come straight from the args.
-    // A default/vararg/kwarg mismatch would leave a hole the frame build
-    // cannot fill — decline to the residual.
-    if has_closure || nparams < 1 || nparams != r_args.len() - 2 || nparams > FBW_REC_CA_MAX_PARAMS
-    {
+    // Positional args fill `locals[0..co_argcount]`. Keyword-only defaults,
+    // the empty `*args` tuple and the empty `**kwargs` dict are filled below
+    // from the function object (`_match_signature`), so a scope that owns
+    // those locals is not declined here. A count that is not exactly the
+    // positional arity still leaves a hole this builder does not fill.
+    let npositional = r_args.len() - 2;
+    if has_closure || npositional != nparams || nparams > FBW_REC_CA_MAX_PARAMS {
         return Ok(None);
     }
-    // Every positional argument must be an exact boxed int at trace time
-    // (`concrete_arg is_int`): the callee was traced against int locals whose
-    // speculative low-bit guard would deopt on a non-int box.  `is_int` also
-    // accepts `bool`, whose payload reads through a different accessor than the
-    // int one the unbox below uses, so a `bool` argument must decline too.  A
-    // non-int (or bool) argument declines to the residual call.
+    // Positional arguments are red boxes. `_opimpl_recursive_call` /
+    // `direct_assembler_call` (`pyjitpl.py`) record `call_assembler` for any
+    // red, including a `W_LongObject` accumulator. A null or non-ref concrete
+    // is not a box this frame build can store. The box is stored as itself:
+    // the callee portal's entry (`GuardClass` / `guard_value` on `w_class`,
+    // recorded from the red local) is what rejects a later class. Re-boxing
+    // an exact int into a fresh `W_IntObject` would make that guard see only
+    // the manufactured class.
     for i in 0..nparams {
         let ConcreteValue::Ref(arg_obj) = arg_concretes[2 + i] else {
             return Ok(None);
         };
-        if arg_obj.is_null()
-            || !unsafe { pyre_object::is_int(arg_obj) }
-            || unsafe { pyre_object::is_bool(arg_obj) }
-        {
-            return Ok(None);
-        }
-    }
-    // The operand stack below the call's own operands (`r_args = [callable,
-    // null_or_self, arg0..]`) may hold loop-carried input args: the enclosing
-    // loop's `FOR_ITER` iterator, or an accumulator reloaded for `+=`.  Only
-    // the iterator disqualifies the fold — see
-    // `loop_carried_slot_keeps_fold_profitable`.  Declining every loop-carried
-    // operand instead kept a recursion called from a `while` body on the
-    // residual path permanently: `r(8)` a million times over measured 1.23s
-    // against 0.07s for the same run with the numeric shape admitted, because
-    // every recursive call re-entered through the func-entry residency door.
-    // The loopless `fib` shape keeps only within-iteration temps (a prior call
-    // result), no InputArg, and was foldable either way.
-    if ctx.vstack_valid {
-        let kept_below = ctx
-            .frame_state
-            .borrow()
-            .vstack_boxes
-            .len()
-            .saturating_sub(r_args.len());
-        if ctx.frame_state.borrow().vstack_boxes[..kept_below]
-            .iter()
-            .any(|slot| slot.is_input_arg() && !loop_carried_slot_keeps_fold_profitable(ctx, *slot))
-        {
-            if p2_diag_enabled() {
-                eprintln!(
-                    "[p2-ca] decline pc={} reason=loop-carried-inputarg-below",
-                    op.pc
-                );
-            }
+        if arg_obj.is_null() {
             return Ok(None);
         }
     }
@@ -2464,6 +2419,42 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     if pyre_interpreter::ncells(callee_code) != 0 {
         return Ok(None);
     }
+    let kwonly_count = callee_code.kwonlyarg_count as usize;
+    let has_varargs = callee_code
+        .flags
+        .contains(pyre_interpreter::CodeFlags::VARARGS);
+    let has_varkeywords = callee_code
+        .flags
+        .contains(pyre_interpreter::CodeFlags::VARKEYWORDS);
+    // `def f():` has nothing to store. A zero-arg scope that owns kwonly /
+    // `*args` / `**kwargs` still has slots `_match_signature` fills.
+    if nparams == 0 && kwonly_count == 0 && !has_varargs && !has_varkeywords {
+        return Ok(None);
+    }
+    let total_slots =
+        nparams + kwonly_count + usize::from(has_varargs) + usize::from(has_varkeywords);
+    if total_slots > FBW_REC_CA_MAX_PARAMS {
+        return Ok(None);
+    }
+    // Resolve before any IR. A missing kwonly default is a TypeError the
+    // residual call raises; this builder only fills entries the mapping has.
+    let kwonly_resolved = if kwonly_count == 0 {
+        None
+    } else {
+        match unsafe { kwonly_defaults_for_inline(callable, w_code, nparams, kwonly_count) } {
+            Some(resolved) => Some(resolved),
+            None => return Ok(None),
+        }
+    };
+    let empty_vararg = if has_varargs {
+        let concrete = pyre_object::w_tuple_new_array_backed(Vec::new());
+        if concrete.is_null() || majit_gc::can_move(majit_ir::GcRef(concrete as usize)) {
+            return Ok(None);
+        }
+        Some(concrete)
+    } else {
+        None
+    };
     // The callee's globals OBJECT (`function.w_func_globals_obj`) for the
     // `frame_stores_global` stamp.
     let callee_globals_obj = unsafe { pyre_interpreter::function_get_globals_obj(callable) };
@@ -2482,10 +2473,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // being traced; emission below resolves compiled-or-tmp so the descr never
     // carries a bodyless token.
     let (driver, _) = crate::driver::driver_pair();
-    let callee_key = crate::driver::make_green_key(w_code, 0, is_being_profiled);
-    // warmstate.py / compile.py: resolve an installed
-    // procedure token, or synthesize a tmp callback token while the real loop
-    // is still tracing.
+    let callee_key = crate::driver::make_green_key_typed(w_code, 0, is_being_profiled);
+    // `get_jitcell(*greenargs)` — the token and the later loop attach share
+    // this cell. The hash alone would file a comparekey-less sibling.
     let greenboxes = [
         majit_ir::Value::Int(0),
         majit_ir::Value::Int(is_being_profiled as i64),
@@ -2493,7 +2483,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     ];
     let red_types = [Type::Ref, Type::Ref];
     let token =
-        match driver.get_or_make_portal_assembler_token_arc(callee_key, &greenboxes, &red_types) {
+        match driver.get_or_make_portal_assembler_token_arc(&callee_key, &greenboxes, &red_types) {
             Some(token) => token,
             None => {
                 if p2_diag_enabled() {
@@ -2518,24 +2508,89 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     }
 
     // emission
+    // The token is the callee this callable resolved to. A loop-carried
+    // callable (`op` in `op(value)`) is not pinned by LOAD_GLOBAL, so a later
+    // function must fail this guard instead of entering the traced callee.
+    // Same `GuardValue` the inline path records on a non-constant callable.
+    if !r_args[0].is_constant() {
+        ctx.trace_ctx.set_opref_concrete(
+            r_args[0],
+            majit_ir::Value::Ref(majit_ir::GcRef(callable as usize)),
+        );
+        let expected = ctx.trace_ctx.const_ref(callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[r_args[0], expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(r_args[0], expected);
+    }
     // Past this point every step records IR; `?` propagation aborts the
     // whole walk (the trace is discarded), the correct failure mode for a
     // recording error.
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let nlocals = callee_code.varnames.len();
     let max_stack = callee_code.max_stackdepth as usize;
 
-    // Unbox each boxed int argument -> raw payload, then re-box it into the
-    // callee's `locals[i]` through `wrapint` so the local carries the same
-    // representation the callee was traced against.  Under `CAN_BE_TAGGED` a
-    // small `int` becomes a tagged immediate (`ll_int_box`); a heap-only
-    // re-box would force a `W_IntObject` and the callee's speculative low-bit
-    // guard on the local would deopt on every recursion.  Mirror of
-    // `trace_guarded_int_payload(args[i])`.
-    let mut param_boxes: Vec<OpRef> = Vec::with_capacity(nparams);
-    for i in 0..nparams {
-        let raw_arg = walker_unbox_int(ctx, op.pc, r_args[2 + i], int_type_addr)?;
-        param_boxes.push(crate::state::wrapint(ctx.trace_ctx, raw_arg));
+    // `direct_assembler_call` stores the red boxes it was given. The callee
+    // entry guards their class; manufacturing a `W_IntObject` here would
+    // hide a subclass from that guard.
+    //
+    // `_match_signature` then fills keyword-only locals from `w_kw_defs`,
+    // writes `()` into the `*args` slot, and a fresh dict into `**kwargs`.
+    // The cell read is the same live load the inline seeder emits, so an
+    // in-place `__kwdefaults__` store is visible on the next call.
+    let mut param_boxes: Vec<OpRef> = r_args[2..2 + nparams].to_vec();
+    if let Some(resolved) = kwonly_resolved {
+        let kw_defs_descr = crate::descr::function_w_kw_defs_descr();
+        if r_args[0].is_constant() {
+            let callable_const = ctx.trace_ctx.const_ref(callable as i64);
+            crate::state::record_quasiimmut_field(ctx.trace_ctx, callable_const, kw_defs_descr);
+        } else {
+            walker_guard_function_field(
+                ctx,
+                op.pc,
+                r_args[0],
+                kw_defs_descr,
+                resolved.mapping as i64,
+            )?;
+        }
+        let strategy_const = ctx.trace_ctx.const_ref(resolved.strategy as i64);
+        crate::state::record_quasiimmut_field(
+            ctx.trace_ctx,
+            strategy_const,
+            crate::descr::module_dict_version_descr(),
+        );
+        walker_flush_guard_not_invalidated(ctx, op.pc)?;
+        for kwonly in &resolved.values {
+            if crate::state::module_dict_cell_value_direct(resolved.mapping, kwonly.slot)
+                != Some(kwonly.stored)
+            {
+                return Err(DispatchError::KwonlyDefaultsMappingRacedRecord { pc: op.pc });
+            }
+            let Some((value_op, _)) = emit_namespace_cell_value(ctx, op.pc, kwonly.stored)? else {
+                return Err(DispatchError::KwonlyDefaultsMappingRacedRecord { pc: op.pc });
+            };
+            param_boxes.push(value_op);
+        }
+    }
+    if let Some(concrete) = empty_vararg {
+        param_boxes.push(ctx.trace_ctx.const_ref(concrete as i64));
+    }
+    if has_varkeywords {
+        // `_match_signature` does `space.newdict(kwargs=True)` on every call.
+        // The dict is mutable, so it cannot be the shared empty constant.
+        let dict_op = crate::helpers::emit_trace_call_ref_typed(
+            ctx.trace_ctx,
+            jit_empty_kwargs_dict as *const (),
+            &[],
+            &[],
+        );
+        let concrete = pyre_object::dictmultiobject::w_dict_new_kwargs();
+        ctx.trace_ctx.set_opref_concrete(
+            dict_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+        );
+        param_boxes.push(dict_op);
     }
 
     // `ec` is the portal's second red (`interp_jit.py reds=['frame', 'ec']`).
@@ -4669,10 +4724,19 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // A type-dict `__call__` installed from a `BuiltinCode` is a slot wrapper:
     // the same `Function` carrier under `SLOT_WRAPPER_TYPE`, so the carrier
     // test admits it and the `Function.code` read below is the same load.
-    let (callable, receiver) = if method_form
-        || bound_method
-        || unsafe { pyre_interpreter::is_function(callable) }
-    {
+    // One-argument `type(x)` enters `type_descr_call_impl`'s graph
+    // (`__majit_wrap_type_query`) instead of the instantiation emit.
+    let type_query = !method_form
+        && !bound_method
+        && !is_call_kw
+        && r_args.len() == 3
+        && unsafe {
+            pyre_object::is_type(callable_operand)
+                && std::ptr::eq(callable_operand, pyre_interpreter::typedef::w_type())
+        };
+    let (callable, receiver) = if type_query {
+        (callable, None)
+    } else if method_form || bound_method || unsafe { pyre_interpreter::is_function(callable) } {
         (callable, receiver)
     } else {
         match unsafe { lookup_instance_dunder_call(callable) } {
@@ -4747,17 +4811,26 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             }
         };
     }
-    if !unsafe { pyre_interpreter::is_function_carrier(callable) } {
-        builtin_inline_decline!("not is_function", 0usize);
-        return Ok(None);
-    }
-    let builtin_code =
-        unsafe { pyre_interpreter::function_get_code(callable) } as pyre_object::PyObjectRef;
-    if builtin_code.is_null() || !unsafe { pyre_interpreter::is_builtin_code(builtin_code) } {
-        builtin_inline_decline!("not builtin_code", 0usize);
-        return Ok(None);
-    }
-    let fnaddr = unsafe { pyre_interpreter::builtin_code_get(builtin_code) as usize };
+    let fnaddr = if type_query {
+        pyre_interpreter::call::__majit_wrap_type_query as usize
+    } else {
+        if !unsafe { pyre_interpreter::is_function_carrier(callable) } {
+            builtin_inline_decline!("not is_function", 0usize);
+            return Ok(None);
+        }
+        let builtin_code =
+            unsafe { pyre_interpreter::function_get_code(callable) as pyre_object::PyObjectRef };
+        if builtin_code.is_null() || !unsafe { pyre_interpreter::is_builtin_code(builtin_code) } {
+            builtin_inline_decline!("not builtin_code", 0usize);
+            return Ok(None);
+        }
+        unsafe { pyre_interpreter::builtin_code_get(builtin_code) as usize }
+    };
+    let builtin_code = if type_query {
+        pyre_object::PY_NULL
+    } else {
+        unsafe { pyre_interpreter::function_get_code(callable) as pyre_object::PyObjectRef }
+    };
     let Some(jitcode) = crate::state::bytecode_for_address(fnaddr) else {
         builtin_inline_decline!("no jitcode for address", fnaddr);
         return Ok(None);
@@ -4819,8 +4892,11 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             )
         })?
         .is_some();
-    let builtin_sig =
-        unsafe { pyre_interpreter::gateway::builtin_code_get_signature(builtin_code) };
+    let builtin_sig = if type_query || builtin_code.is_null() {
+        None
+    } else {
+        unsafe { pyre_interpreter::gateway::builtin_code_get_signature(builtin_code) }
+    };
     if is_call_kw && builtin_sig.is_none() {
         builtin_inline_decline!("call_kw builtin has no Signature", fnaddr);
         return Ok(None);
@@ -5424,7 +5500,7 @@ fn builtin_gateway_undescendable_reason(
         return Some("not is_function_carrier");
     }
     let builtin_code =
-        unsafe { pyre_interpreter::function_get_code(callable) } as pyre_object::PyObjectRef;
+        unsafe { pyre_interpreter::function_get_code(callable) as pyre_object::PyObjectRef };
     if builtin_code.is_null() || !unsafe { pyre_interpreter::is_builtin_code(builtin_code) } {
         return Some("not builtin_code");
     }
@@ -6808,7 +6884,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // as other CALL-entered inlines.  Its catch arm owns exception-to-exhaustion
     // conversion, so neither replay safety nor an unseeded caller-boundary
     // resume is part of that route's deopt discipline.
+    // A zero-param `for` body's back-edge is a plain `goto`, so the
+    // forward-branch scan would walk the loop and skip the portal activation
+    // a residual call charges. That chain runs past the recursion limit.
+    // Parameter-bearing loop callees stay on the multiframe path: refusing
+    // them crashes the recursive-portal handler fixtures. `step()` has no
+    // `for`, so it stays eligible.
     let try_multiframe = multiframe_eligible
+        && !(nparams == 0 && pyre_interpreter::code_has_for_iter(callee_code))
         && inline_depth < effective_multiframe_depth
         && callee_fast_path_inlinable_allowing_forward_branch(
             body.code,
@@ -7094,17 +7177,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             shown += 1;
         }
     }
-    // A zero-param callee has no positional argument to seed, so the register
-    // convention above holds vacuously and the strict path serves it like any
-    // other straight-line leaf.  The residual it would otherwise fall back to
-    // is not cheap: `def f0(): return 1` called from a `while` loop measured
-    // 569 ns/iter against 1.16 ns for the same call with one parameter.  Only a
-    // zero-param callee the strict path cannot serve declines here, so such a
-    // body still takes the residual rather than the decline-to-interpretation
-    // below.
-    if nparams == 0 && !strict_inlinable {
-        return resolved_inline_decline(op.pc, line!());
-    }
+    // A zero-param callee has no positional argument to seed. `perform_call`
+    // (`pyjitpl.py`) still pushes its MIFrame: parameter count is not an
+    // admission test. A body neither `try_multiframe` nor `strict_seed`
+    // accepts residualizes at the `!seeded_inline` decline below (`Ok(None)`),
+    // which records a residual call instead of stamping the caller key into
+    // `FBW_DECLINED_KEYS`.
 
     // A self-recursive callee unrolls until its own frame count reaches
     // `max_unroll_recursion`, then routes to the direct `CALL_ASSEMBLER` arm
@@ -12113,7 +12191,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     let Some(concrete_item) = walker_concrete_ref_object(ctx, item_op) else {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     };
-    fbw_foriter_inflight_capture(concrete_item, body_coord);
+    fbw_foriter_inflight_capture(concrete_item, body_coord, false);
     ctx.frame_state.borrow_mut().vstack_last_ref = item_op;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
@@ -13324,7 +13402,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         return Ok(None);
     };
     write_ref_reg(ctx, op.pc, dst, item, ConcreteValue::Ref(concrete_item))?;
-    fbw_foriter_inflight_capture(concrete_item, body_coord);
+    fbw_foriter_inflight_capture(concrete_item, body_coord, false);
     ctx.frame_state.borrow_mut().vstack_last_ref = item;
     let _ = code_root;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))

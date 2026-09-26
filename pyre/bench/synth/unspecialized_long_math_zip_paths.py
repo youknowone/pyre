@@ -25,14 +25,14 @@ except ImportError:
 
 # Each leg only needs to compile and make its declared fold fire; the census
 # carries the performance-sensitive signal directly.
-N_ZIP = 1000
-N_ZIP_STRICT = 1000
-N_CMP = 10000
-N_TRUEDIV = 5000
-N_POW = 2000
-N_SHIFT = 5000
-N_FREXP = 5000
-N_LDEXP = 5000
+N_ZIP = 10000
+N_ZIP_STRICT = 10000
+N_CMP = 100000
+N_TRUEDIV = 50000
+N_POW = 20000
+N_SHIFT = 50000
+N_FREXP = 50000
+N_LDEXP = 50000
 
 
 def f_zip(n):

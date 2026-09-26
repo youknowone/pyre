@@ -31,7 +31,7 @@ try:
 except ImportError:
     pass
 
-N = 2000
+N = 60000
 
 
 class Inner:

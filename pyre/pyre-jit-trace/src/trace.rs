@@ -5142,7 +5142,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         // `leaves_complete_image`; the cases below have narrower recovery and
         // must not be pre-empted here.  Root qmut uses its one-frame flush,
         // while inline qmut belongs here because it captured the full stack.
-        let walk_abort_adopted = !trace_too_long_adopted
+        let mut walk_abort_adopted = !trace_too_long_adopted
             && !segment_adopted
             && matches!(&walk_result, Err(error) if error.leaves_complete_image()
             && !matches!(
@@ -5166,6 +5166,22 @@ fn run_perfn_walk<Sym: WalkSym>(
                 live_root_addr,
                 WalkEndCommitLeg::WalkAbort,
             );
+        // The match above skips a carrier-owned error.  An unjournaled
+        // FOR_ITER consume is not replay-safe: entry replay calls `__next__`
+        // again, while `convert_and_run_from_pyjitpl` continues the framestack.
+        if !walk_abort_adopted
+            && walk_abort_leg_enabled()
+            && !flush_committed.get()
+            && crate::jitcode_dispatch::fbw_foriter_unjournaled_consume()
+        {
+            walk_abort_adopted = try_adopt_blackhole(
+                flush_committed,
+                ctx,
+                cf_addr,
+                live_root_addr,
+                WalkEndCommitLeg::WalkAbort,
+            );
+        }
         if walk_abort_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] adopted WALK_ABORT forward resume");
         }
@@ -6952,6 +6968,11 @@ fn full_body_walk_trace<Sym: WalkSym>(
                     ctx.set_green_key(target_key, (w_code as usize, loop_header_pc));
                     ctx.header_pc = loop_header_pc;
                     ctx.cut_inner_green_key = Some(target_key);
+                    ctx.set_close_typed_key(crate::driver::make_green_key_typed(
+                        w_code,
+                        loop_header_pc,
+                        is_being_profiled,
+                    ));
                 } else {
                     let key = crate::driver::make_green_key(w_code, start_pc, is_being_profiled);
                     ctx.set_green_key(key, (w_code as usize, start_pc));

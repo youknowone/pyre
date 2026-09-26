@@ -33,7 +33,7 @@ import sys
 
 # Past the loop threshold (1039) several times over, so the measured pass is
 # the compiled one for the shape that compiles.
-N = 3000
+N = 40000
 
 
 def pure(n):

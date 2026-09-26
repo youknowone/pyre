@@ -13,7 +13,7 @@
 # SAVE_EXC_CLASS / SAVE_EXCEPTION + RESTORE_EXCEPTION pair around it the entry
 # guard is deleted and the final IndexError escapes uncaught -- upstream issue
 # #2132, pinned there by test_guard_no_exception_incorrectly_removed_from_bridge.
-R = 4000
+R = 15000
 START = 14
 
 

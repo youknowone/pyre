@@ -1752,7 +1752,11 @@ impl UnrollOptimizer {
                                     preamble_op: produced.preamble_op.clone(),
                                     same_as_source: produced.same_as_source.clone(),
                                 };
-                                let source = final_ctx.force_op_from_preamble_op(&preamble_op);
+                                let Some(source) =
+                                    final_ctx.force_op_from_preamble_op(&preamble_op)
+                                else {
+                                    return;
+                                };
                                 let _ = opt_p2.force_box(source, &mut final_ctx);
                                 return;
                             }
@@ -7965,8 +7969,8 @@ mod tests {
             preamble_op: dep_op,
             same_as_source: None,
         };
-        assert_eq!(ctx.force_op_from_preamble_op(&mask_pop), masked);
-        assert_eq!(ctx.force_op_from_preamble_op(&dep_pop), dependent);
+        assert_eq!(ctx.force_op_from_preamble_op(&mask_pop), Some(masked));
+        assert_eq!(ctx.force_op_from_preamble_op(&dep_pop), Some(dependent));
 
         let target_vs = VirtualState::new(vec![VirtualStateInfo::IntBounded(IntBound::bounded(
             0, MASK,
@@ -8518,7 +8522,7 @@ mod tests {
             preamble_op: produced.preamble_op,
         };
         let forced = ctx.force_op_from_preamble_op(&pop);
-        assert_eq!(forced, OpRef::int_op(20));
+        assert_eq!(forced, Some(OpRef::int_op(20)));
 
         // RPython `unroll.py:32` `use_box` populates `self.short`.
         let sp = ctx.build_imported_short_preamble().unwrap();
@@ -8580,7 +8584,7 @@ mod tests {
                 op: {
                     let mut op = Op::with_descr(
                         OpCode::GetfieldGcR,
-                        &[rooted_resop_operand(Type::Ref, 3)],
+                        &[rooted_resop_operand(Type::Ref, 10)],
                         majit_ir::descr::make_field_descr_full(56, 0, 8, Type::Ref, false),
                     );
                     op.pos().set(OpRef::ref_op(19));
@@ -8611,7 +8615,7 @@ mod tests {
         let forced = ctx.force_op_from_preamble_op(&pop);
         // RPython `unroll.py UnrollOptimizer.force_op_from_preamble return preamble_op.op` ≡ self.res.
         // pyre's Phase 1 source IS self.res for the imported short box.
-        assert_eq!(forced, OpRef::ref_op(19));
+        assert_eq!(forced, Some(OpRef::ref_op(19)));
 
         let sp = ctx.build_imported_short_preamble().unwrap();
         assert_eq!(sp.ops.len(), 1);
@@ -8631,7 +8635,7 @@ mod tests {
         );
 
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
-        let _ = optimizer.force_box(forced, &mut ctx);
+        let _ = optimizer.force_box(forced.expect("published"), &mut ctx);
 
         let sp = ctx.build_imported_short_preamble().unwrap();
         // shortpreamble.py:436 `op = preamble_op.op.get_box_replacement()`.
@@ -8723,7 +8727,7 @@ mod tests {
         let pop = ctx2.imported_short_pure_ops[0].pop.clone();
         let forced = ctx2.force_op_from_preamble_op(&pop);
         // force_op_from_preamble may return the imported position (not necessarily 30)
-        let _ = forced;
+        let forced = forced.expect("short box deps are produced");
         assert_eq!(ctx2.imported_short_pure_ops.len(), 1);
         // RPython parity: extra_same_as is populated lazily by add_preamble_op
         // (called from optimizer.force_box's potential_extra_ops.pop path).

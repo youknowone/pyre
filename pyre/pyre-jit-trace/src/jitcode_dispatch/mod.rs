@@ -2114,7 +2114,130 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     pub live_after_jit_pc: usize,
 }
 
+/// Locals of one frame that is live on this trace.
+pub(crate) enum ReceiverTraceLocals {
+    /// The portal virtualizable's `locals_cells_stack_w` boxes.
+    Portal,
+    /// One inline frame's own slot map. Missing slots are not listed.
+    Inline(Vec<(i64, OpRef, majit_ir::Value)>),
+}
+
+fn inline_shadow_slots(shadow: &CalleeLocalsShadow) -> Vec<(i64, OpRef, majit_ir::Value)> {
+    let mut slots: Vec<(i64, OpRef, majit_ir::Value)> = shadow
+        .opref
+        .iter()
+        .filter(|(_, opref)| !opref.is_none())
+        .map(|(&slot, &opref)| {
+            let value = shadow
+                .concrete
+                .get(&slot)
+                .map(|entry| entry.value)
+                .unwrap_or(majit_ir::Value::Void);
+            (slot, opref, value)
+        })
+        .collect();
+    slots.sort_by_key(|(slot, _, _)| *slot);
+    slots
+}
+
+fn inline_shadow_matches(shadow: &CalleeLocalsShadow, obj: OpRef, concrete: usize) -> bool {
+    (shadow.frame_box != OpRef::NONE && shadow.frame_box == obj)
+        || (concrete != 0 && shadow.concrete_frame == concrete)
+}
+
 impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
+    /// The frame on this trace — portal virtualizable or any inline level —
+    /// whose box or concrete address is `obj` / `concrete`.
+    pub(crate) fn receiver_trace_locals(
+        &self,
+        obj: OpRef,
+        concrete: usize,
+    ) -> Option<ReceiverTraceLocals> {
+        let hit = |shadow: &CalleeLocalsShadow| -> Option<ReceiverTraceLocals> {
+            inline_shadow_matches(shadow, obj, concrete)
+                .then(|| ReceiverTraceLocals::Inline(inline_shadow_slots(shadow)))
+        };
+        if let Some(found) = self
+            .frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .and_then(&hit)
+        {
+            return Some(found);
+        }
+        let session = self.session.borrow();
+        for frame in &session.framestack {
+            if let Some(live) = frame.live.as_ref()
+                && let Some(found) = live
+                    .frame_state
+                    .borrow()
+                    .callee_shadow
+                    .as_ref()
+                    .and_then(&hit)
+            {
+                return Some(found);
+            }
+            for parent in &frame.parents {
+                let Some(state) = parent.frame_state.as_ref() else {
+                    continue;
+                };
+                if let Some(found) = state.borrow().callee_shadow.as_ref().and_then(&hit) {
+                    return Some(found);
+                }
+            }
+        }
+        for helper in &session.helper_live {
+            if let Some(found) = helper
+                .frame_state
+                .borrow()
+                .callee_shadow
+                .as_ref()
+                .and_then(&hit)
+            {
+                return Some(found);
+            }
+        }
+        drop(session);
+        let vable_box = self.trace_ctx.standard_virtualizable_box();
+        let vable_ptr = self.trace_ctx.standard_virtualizable_ptr();
+        let heap_ptr = self
+            .trace_ctx
+            .virtualizable_heap_ptr()
+            .map(|ptr| ptr as usize);
+        let vref_box = (concrete != 0)
+            .then(|| self.trace_ctx.virtualref_virtual_for_object_ptr(concrete))
+            .flatten();
+        let portal = vable_box == Some(obj)
+            || vable_ptr == Some(concrete)
+            || heap_ptr == Some(concrete)
+            || vref_box.is_some_and(|red| vable_box == Some(red) || red == obj);
+        if portal {
+            return Some(ReceiverTraceLocals::Portal);
+        }
+        // The executing inline frame's `f_back` is still on this trace. When
+        // that caller is the loop portal, its locals are the virtualizable
+        // boxes even if the traceback names the live object and the vable
+        // cell names the snapshot copy.
+        let inline = current_inline_concrete_frame();
+        if inline != 0 && concrete != 0 {
+            let raw = unsafe { (*(inline as *const pyre_interpreter::PyFrame)).f_backref };
+            if !raw.is_null() {
+                let caller = if unsafe {
+                    majit_metainterp::virtualref::ptr_is_virtual_ref(raw as *const u8)
+                } {
+                    unsafe { majit_metainterp::virtualref::vref_forced(raw as *const u8) as usize }
+                } else {
+                    raw as usize
+                };
+                if caller == concrete && (vable_box.is_some() || vable_ptr.is_some()) {
+                    return Some(ReceiverTraceLocals::Portal);
+                }
+            }
+        }
+        None
+    }
+
     /// The standing exception, read from the one session-wide slot
     /// (`metainterp.last_exc_value`, `pyjitpl.py opimpl_last_exc_value`).
     fn last_exc_value(&self) -> Option<OpRef> {
@@ -3266,7 +3389,18 @@ impl DispatchError {
             let loc = std::panic::Location::caller();
             eprintln!("[lb-site] {}:{} pc={pc}", loc.file(), loc.line());
         }
-        Self::callee_inline_abort(pc, false)
+        // Most call sites have no MIFrame session, so they cannot see the
+        // per-frame effect delta `fbw_decline_inline_callee` reads.  An
+        // in-flight consume those sites still have to honor: a generator,
+        // map, dict/set iterator, itertools iterator, or user `__next__`
+        // has no cursor to roll back, and re-entering the CALL runs
+        // `__next__` again.  `convert_and_run_from_pyjitpl` continues the
+        // framestack instead.  A journaled cursor stays replayable here
+        // unless a body effect already stands.
+        let blackhole_required = fbw_state::fbw_foriter_unjournaled_consume()
+            || (fbw_state::fbw_foriter_inflight_active()
+                && fbw_state::fbw_foriter_any_body_effect_signal());
+        Self::callee_inline_abort(pc, blackhole_required)
     }
 
     /// Classify a nested residual decline by whether the aborting MIFrame has
@@ -7165,6 +7299,10 @@ struct InflightForiter {
     item: pyre_object::PyObjectRef,
     body: InflightForiterBody,
     body_effect_since_consume: bool,
+    /// [`fbw_bridge_iter_journal_capture`] pushed a cursor for this consume.
+    /// False for a generator, `map`, dict/set iterator, itertools, or user
+    /// `__next__`: entry replay would call `__next__` again.
+    consume_journaled: bool,
     /// The walk re-reached this FOR_ITER's consume after the item's body ran
     /// (a NEW `for_iter_next` attempt was dispatched for the same body).
     /// A completed entry must never be re-delivered — its body already ran
@@ -14208,7 +14346,7 @@ fn handle<Sym: WalkSym>(
                 })
                 .flatten();
             if let Some(callee_code) = callee_code {
-                let callee_key = crate::driver::make_green_key(
+                let callee_key = crate::driver::make_green_key_typed(
                     callee_code as *const (),
                     next_instr,
                     is_being_profiled,
@@ -14221,7 +14359,7 @@ fn handle<Sym: WalkSym>(
                 ];
                 let red_types = [Type::Ref, Type::Ref];
                 if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
-                    callee_key,
+                    &callee_key,
                     &greenboxes,
                     &red_types,
                 ) {
@@ -14258,7 +14396,7 @@ fn handle<Sym: WalkSym>(
                         })
                         .flatten();
                     if let Some(callee_code) = callee_code {
-                        let callee_key = crate::driver::make_green_key(
+                        let callee_key = crate::driver::make_green_key_typed(
                             callee_code as *const (),
                             next_instr,
                             is_being_profiled,
@@ -14271,7 +14409,7 @@ fn handle<Sym: WalkSym>(
                         ];
                         let red_types = [Type::Ref, Type::Ref];
                         if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
-                            callee_key,
+                            &callee_key,
                             &greenboxes,
                             &red_types,
                         ) {

@@ -15,7 +15,7 @@ try:
 except ImportError:
     pass
 
-N = 4000
+N = 120000
 
 
 class L(int):

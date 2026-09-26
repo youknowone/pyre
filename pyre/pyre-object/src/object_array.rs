@@ -135,6 +135,7 @@ pub struct ArrayToken {
 /// `MAJIT_GC_ITEMSBLOCK=0` fallback (provably identical pre-migration
 /// behaviour).
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("capacity")]
 pub struct ItemsBlock {
     /// Allocated capacity — treated as the GcArray-length header
     /// (rlist.py:251 `len(l.items)`). The GC registration sets

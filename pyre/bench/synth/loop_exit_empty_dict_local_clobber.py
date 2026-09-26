@@ -28,7 +28,7 @@
 #     slot just as `range_iterator` did).
 #
 # Expected output: ('set', 'dict')
-N = 8000
+N = 240000
 
 
 def driver(n):

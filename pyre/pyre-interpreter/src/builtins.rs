@@ -3344,7 +3344,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         make_module_builtin_function("sorted", crate::app_functional::__majit_wrap_builtin_sorted)
     });
     crate::module_ns_get_or_insert_with(ns, "iter", || {
-        make_module_builtin_function("iter", builtin_iter)
+        make_module_builtin_function("iter", __majit_wrap_builtin_iter)
     });
     crate::module_ns_get_or_insert_with(ns, "next", || {
         make_module_builtin_function("next", builtin_next)
@@ -4064,7 +4064,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         make_module_builtin_function("divmod", builtin_divmod)
     });
     crate::module_ns_get_or_insert_with(ns, "pow", || {
-        make_module_builtin_function("pow", builtin_pow)
+        make_module_builtin_function("pow", __majit_wrap_builtin_pow)
     });
     crate::module_ns_get_or_insert_with(ns, "hex", || {
         make_module_builtin_function("hex", builtin_hex)
@@ -6997,6 +6997,11 @@ pub(crate) fn type_of_object(obj: PyObjectRef) -> PyObjectRef {
     if let Some(tp) = crate::typedef::r#type(obj) {
         return tp.as_ptr();
     }
+    type_of_object_unnamed(obj)
+}
+
+#[majit_macros::dont_look_inside]
+fn type_of_object_unnamed(obj: PyObjectRef) -> PyObjectRef {
     if obj.is_null() {
         return crate::typedef::gettypeobject(&pyre_object::pyobject::NONE_TYPE);
     }
@@ -13313,6 +13318,78 @@ pub(crate) fn super_check(
          or subtype of type ({start_type_name})."
     )))
 }
+
+#[majit_macros::dont_look_inside]
+fn iter_cold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_iter(args)
+}
+
+/// `operation.py iter` / `iter_sentinel`. Two arguments build a
+/// `_CallableIterator`; one argument on that iterator is `__iter__`
+/// returning self. Every other shape stays in `builtin_iter`.
+///
+/// Builtin keyword calls append a trailing `__pyre_kw__` marker dict to this
+/// same flat slice (`split_builtin_kwargs`). The wrapper tests that tail with
+/// the scalar `builtin_kwargs_marker_tail` instead of building the positional
+/// sub-slice, so `iter(f, **{})` and `iter(f, sentinel=x)` reach
+/// `builtin_iter` through the cold arm: a real keyword is its TypeError, and
+/// an empty marker is not a sentinel.
+pub fn __majit_wrap_builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() == 2 {
+        let callable = args[0];
+        let sentinel = args[1];
+        // A function (the hot `iter(f, sentinel)` shape) skips the general
+        // callable test, which closes over a type lookup.
+        if unsafe { crate::is_function(callable) } && !builtin_kwargs_marker_tail(sentinel) {
+            return Ok(pyre_object::operation::w_callable_iterator_new(
+                callable, sentinel,
+            ));
+        }
+        return iter_cold(args);
+    }
+    if args.len() == 1 {
+        let obj = args[0];
+        // `iter(**{})` is the lone marker word; `builtin_iter` rejects it.
+        if unsafe { pyre_object::operation::is_callable_iterator(obj) } {
+            return Ok(obj);
+        }
+    }
+    iter_cold(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_builtin_iter_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__majit_wrap_builtin_iter"),
+        func: __majit_wrap_builtin_iter,
+    };
+
+/// `__iter__` of an iterator — `operation.py _CallableIterator.__iter__`.
+pub fn __majit_wrap_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // A slice pattern compares the list with the integer length and has no
+    // rtype. One positional word is `__iter__` returning self; a keyword
+    // dict makes the slice longer and stays in the cold body.
+    if args.len() == 1 {
+        return Ok(args[0]);
+    }
+    iter_self_cold(args)
+}
+
+#[majit_macros::dont_look_inside]
+fn iter_self_cold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::baseobjspace::iter_self_method(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_iter_self_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__majit_wrap_iter_self"),
+        func: __majit_wrap_iter_self,
+    };
 
 /// `iter(obj)` / `iter(callable, sentinel)` — PyPy:
 /// `module/__builtin__/operation.py` iter
@@ -23849,6 +23926,104 @@ pub(crate) fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     }
     crate::baseobjspace::divmod(args[0], args[1])
 }
+
+/// Exact builtin machine `int` or `bool`. A `long` shares the `int` class
+/// but not the machine-int layout, and a subclass that overrides `__pow__`
+/// has its own class.
+unsafe fn exact_machine_int(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    // A long can report the `int` layout and still hold a bigint.
+    if pyre_object::is_long(obj) {
+        return false;
+    }
+    let layout_int = pyre_object::is_exact_type(obj, &pyre_object::INT_TYPE)
+        || pyre_object::is_exact_type(obj, &pyre_object::BOOL_TYPE);
+    if !layout_int {
+        return false;
+    }
+    let w_class = (*obj).w_class;
+    if w_class.is_null() {
+        return true;
+    }
+    std::ptr::eq(
+        w_class,
+        pyre_object::get_instantiate(&pyre_object::INT_TYPE),
+    ) || std::ptr::eq(
+        w_class,
+        pyre_object::get_instantiate(&pyre_object::BOOL_TYPE),
+    )
+}
+
+/// `W_IntObject.descr_pow` for three machine ints. Anything else, including a
+/// negative exponent, stays on the existing long / inverse path.
+fn machine_int_pow3(
+    base: PyObjectRef,
+    exp: PyObjectRef,
+    modulus: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        let iz = crate::objspace::descroperation::int_value(modulus);
+        if iz == 0 {
+            return Err(crate::PyError::value_error(
+                "pow() 3rd argument cannot be 0",
+            ));
+        }
+        let iv = crate::objspace::descroperation::int_value(base);
+        let iw = crate::objspace::descroperation::int_value(exp);
+        // Negative exponent and `ovfcheck(-iz)` on `i64::MIN` leave the
+        // machine body. The remaining calls return the residue.
+        if iw < 0 || iz == i64::MIN {
+            return pow3_cold(base, exp, modulus);
+        }
+        Ok(pyre_object::w_int_new(
+            crate::objspace::descroperation::_pow_mod(iv, iw, iz)?,
+        ))
+    }
+}
+
+#[majit_macros::dont_look_inside]
+fn pow3_cold(
+    base: PyObjectRef,
+    exp: PyObjectRef,
+    modulus: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    crate::baseobjspace::pow3(base, exp, modulus)
+}
+
+#[majit_macros::dont_look_inside]
+fn pow_dispatch_cold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_pow(args)
+}
+
+/// Manual interp2app gateway for `pow`. The three-int arm is
+/// `descr_pow` / `_pow_mod`; every other shape, including keywords, falls
+/// through to `builtin_pow`.
+pub fn __majit_wrap_builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `pow(2, 3, mod=5)` is three words ending in the keyword dict, which is
+    // not a machine int, so the fast path falls through to `builtin_pow`.
+    if args.len() == 3 {
+        let base = args[0];
+        let exp = args[1];
+        let modulus = args[2];
+        if unsafe {
+            exact_machine_int(base) && exact_machine_int(exp) && exact_machine_int(modulus)
+        } {
+            return machine_int_pow3(base, exp, modulus);
+        }
+    }
+    pow_dispatch_cold(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_builtin_pow_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__majit_wrap_builtin_pow"),
+        func: __majit_wrap_builtin_pow,
+    };
 
 /// `pow(base, exp[, mod])` — pypy/interpreter/baseobjspace.py pow row.
 fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

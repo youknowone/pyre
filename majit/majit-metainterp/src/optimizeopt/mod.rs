@@ -4263,9 +4263,6 @@ impl OptContext {
                             // is the renamed short-inputarg (or replay result),
                             // while `source_op` separately carries the original
                             // receiver used by HeapOp.produce_op for PtrInfo.
-                            // Resolving this arg through `short_args` collapses
-                            // those identities and emits guards on an exporting-
-                            // phase box that a retrace cannot bind.
                             let obj_b = produced_op.preamble_op.arg(0);
                             let mut op = Op::new(opcode, &[obj_b]);
                             op.pos().set(replay_pos(*source, produced_op));
@@ -4386,10 +4383,13 @@ impl OptContext {
     ///
     /// RPython receives a PreambleOp with invented_name already set.
     /// Calls use_box then registers in potential_extra_ops.
+    /// `None` when `use_box` cannot produce a dependency
+    /// (`shortpreamble.py` `produce_arg` returns `None`): the consumer is
+    /// not published and must not be registered in `potential_extra_ops`.
     pub fn force_op_from_preamble_op(
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
-    ) -> OpRef {
+    ) -> Option<OpRef> {
         let preamble_source = preamble_op.op.to_opref();
         // RPython `return preamble_op.op` returns the carried Box. In majit,
         // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()` —
@@ -4401,9 +4401,9 @@ impl OptContext {
         let is_constant = resolved.const_value().is_some();
         let first_use = !self.imported_short_preamble_used.contains(&preamble_source);
         if first_use {
+            // Mark before use_box. use_box can force a dependency, which
+            // re-enters here; pushing afterwards re-enters the same box.
             self.imported_short_preamble_used.push(preamble_source);
-        }
-        if first_use {
             // unroll.py:32: use_box(op, preamble_op.preamble_op, self).
             // RPython passes the preamble_op directly — no lookup miss possible.
             // majit prefers the produced_short_boxes lookup (Phase-2 remapped pos)
@@ -4412,10 +4412,12 @@ impl OptContext {
                 self.collect_use_box_guards(&preamble_op.preamble_op)
             else {
                 self.signal_invalid_loop("short preamble GC layout tid is unresolved");
-                return preamble_source;
+                return Some(preamble_source);
             };
             // unroll.py:28: assert self.short_preamble_producer is not None
-            if let Some(mut builder) = self.active_short_preamble_producer.take() {
+            let published = if let Some(mut builder) = self.active_short_preamble_producer.take() {
+                // ExtendedShortPreambleBuilder::use_box still returns ().
+                // The peel builder is the imported ShortPreambleBuilder.
                 builder.use_box(
                     preamble_source,
                     &preamble_op.preamble_op,
@@ -4423,16 +4425,22 @@ impl OptContext {
                     &result_guards,
                 );
                 self.active_short_preamble_producer = Some(builder);
+                true
             } else if let Some(mut builder) = self.imported_short_preamble_builder.take() {
-                builder.use_box(
+                let published = builder.use_box(
                     preamble_source,
                     &preamble_op.preamble_op,
                     &arg_guards,
                     &result_guards,
                 );
                 self.imported_short_preamble_builder = Some(builder);
+                published
             } else {
                 unreachable!("force_op_from_preamble_op: no short_preamble_producer");
+            };
+            if !published {
+                self.imported_short_preamble_used.pop();
+                return None;
             }
             // shortpreamble.py:401-405: info = preamble_op.get_forwarded();
             // preamble_op.set_forwarded(None);
@@ -4486,7 +4494,7 @@ impl OptContext {
         // `used_boxes` / `short_preamble_jump` / `extra_same_as` for the
         // imported short box.
         let _ = result;
-        preamble_source
+        Some(preamble_source)
     }
 
     /// shortpreamble.py:383-396,401-406: collect guards from the forwarded
@@ -12053,7 +12061,7 @@ mod imported_short_preamble_fallback_tests {
         };
 
         let forced = ctx.force_op_from_preamble_op(&pop);
-        assert_eq!(forced, OpRef::int_op(41));
+        assert_eq!(forced, Some(OpRef::int_op(41)));
 
         let sp = ctx
             .build_imported_short_preamble()

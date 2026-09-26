@@ -595,6 +595,13 @@ pub struct Transformer<'a> {
         crate::flowspace::model::Variable,
         crate::flowspace::model::Variable,
     >,
+    /// Results of `getfield` on an `IR_IMMUTABLE_ARRAY` field, plus the
+    /// identity copies the items-base accessor and block phis make of them.
+    /// `rewrite_op_getarrayitem` marks a load of one of these pure.
+    /// The shared `object_ref_gcarray` type stays out of
+    /// `immutable_array_types`: list items use that same ARRAY identity
+    /// and must keep a non-pure descr.
+    immutable_array_bases: std::collections::HashSet<crate::flowspace::model::Variable>,
     /// Result of a `__fn_const` 0-arg Call rewritten to `ConstInt(fnaddr)`.
     /// `fn_const_target_for_var` reads the producer Call; after the rewrite
     /// that producer is gone, so later `conditional_call` / indirect-call
@@ -616,6 +623,10 @@ pub struct Transformer<'a> {
     /// Threaded for `constant_fold_ll_issubclass`; `None` is the
     /// `cpu is None` no-op arm.
     excmatch: Option<&'a crate::translator::rtyper::rtyper::LowLevelFunction>,
+    /// Result ids whose producer is `ValueType::Unsigned`, captured before
+    /// `r_uint` / `intmask` identity aliases erase that annotation.
+    /// `prefix_unsigned_binop` reads the pre-alias operands against this set.
+    unsigned_vars: std::collections::HashSet<u64>,
 }
 
 /// RPython: `jtransform.py` `vable_flags` values — the `flags` dict
@@ -1095,6 +1106,128 @@ fn reversed_comparison_binop(name: &str) -> &str {
         "uint_gt" => "uint_lt",
         "uint_ge" => "uint_le",
         other => other,
+    }
+}
+
+/// Producers whose result is an unsigned machine word: `r_uint`,
+/// `ConstUInt`, and any op whose result bank is `ValueType::Unsigned`
+/// (including unsigned `wrapping_add`). `getkind(Unsigned) == 'int'`, so
+/// the op name is the only place the signedness survives.
+fn kind_produces_unsigned(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::ConstUInt(_) | OpKind::ConstUInt128(_) => true,
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::VableFieldRead { ty, .. }
+        | OpKind::LoadStatic { ty, .. } => *ty == ValueType::Unsigned,
+        OpKind::ArrayRead { item_ty, .. }
+        | OpKind::InteriorFieldRead { item_ty, .. }
+        | OpKind::VableArrayRead { item_ty, .. }
+        | OpKind::RawLoad { item_ty, .. } => *item_ty == ValueType::Unsigned,
+        OpKind::Call { result_ty, .. }
+        | OpKind::IndirectCall { result_ty, .. }
+        | OpKind::BinOp { result_ty, .. }
+        | OpKind::UnaryOp { result_ty, .. } => *result_ty == ValueType::Unsigned,
+        _ => false,
+    }
+}
+
+/// `IntegerRepr.opprefix` is `uint_` for `lltype.Unsigned`. Record every
+/// result of an unsigned producer, then any phi that receives only those
+/// words. Collected before identity folds so a later `r_uint` alias does
+/// not drop the operand out of the set.
+fn collect_unsigned_vars(graph: &FunctionGraph) -> std::collections::HashSet<u64> {
+    let mut unsigned = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let Some(result) = &op.result
+                && kind_produces_unsigned(&op.kind)
+            {
+                unsigned.insert(result.id());
+            }
+        }
+    }
+    loop {
+        let mut grew = false;
+        for block in &graph.blocks {
+            if block.inputargs.is_empty() {
+                continue;
+            }
+            let incoming: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|pred| &pred.exits)
+                .filter(|link| link.target == block.id)
+                .collect();
+            if incoming.is_empty() {
+                continue;
+            }
+            for (slot, arg) in block.inputargs.iter().enumerate() {
+                if unsigned.contains(&arg.id()) {
+                    continue;
+                }
+                let all_unsigned = incoming.iter().all(|link| {
+                    link.args
+                        .get(slot)
+                        .and_then(|link_arg| link_arg.as_variable())
+                        .is_some_and(|var| unsigned.contains(&var.id()))
+                });
+                if all_unsigned {
+                    unsigned.insert(arg.id());
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    unsigned
+}
+
+/// After `_rewrite_symmetric`, rename `lt`/`le`/`gt`/`ge`/`rshift` to
+/// `uint_*` when both pre-alias operands are unsigned producers.
+/// `eq`/`ne` and wrapping add/sub/mul stay `int_*`. `uint_floordiv` /
+/// `uint_mod` are not emitted (`blackhole.py` has neither).
+fn prefix_unsigned_binop(
+    original: &SpaceOperation,
+    op: SpaceOperation,
+    unsigned: &std::collections::HashSet<u64>,
+) -> SpaceOperation {
+    let OpKind::BinOp { op: name, .. } = &op.kind else {
+        return op;
+    };
+    if !matches!(name.as_str(), "lt" | "le" | "gt" | "ge" | "rshift") {
+        return op;
+    }
+    let OpKind::BinOp {
+        lhs: orig_lhs,
+        rhs: orig_rhs,
+        ..
+    } = &original.kind
+    else {
+        return op;
+    };
+    if !unsigned.contains(&orig_lhs.id()) || !unsigned.contains(&orig_rhs.id()) {
+        return op;
+    }
+    let OpKind::BinOp {
+        op: name,
+        lhs,
+        rhs,
+        result_ty,
+    } = op.kind
+    else {
+        return op;
+    };
+    SpaceOperation {
+        result: op.result,
+        kind: OpKind::BinOp {
+            op: format!("uint_{name}"),
+            lhs,
+            rhs,
+            result_ty,
+        },
     }
 }
 
@@ -1633,6 +1766,7 @@ impl<'a> Transformer<'a> {
             vable_flags: std::collections::HashMap::new(),
             aliases: std::collections::HashMap::new(),
             cast_ptr_to_int_src: std::collections::HashMap::new(),
+            immutable_array_bases: std::collections::HashSet::new(),
             fn_const_results: std::collections::HashMap::new(),
             direct_ptradd_type_arg: None,
             notes: Vec::new(),
@@ -1640,6 +1774,7 @@ impl<'a> Transformer<'a> {
             calls_classified: 0,
             analysis_cache: crate::call::AnalysisCache::default(),
             excmatch: None,
+            unsigned_vars: std::collections::HashSet::new(),
         }
     }
 
@@ -1719,6 +1854,7 @@ impl<'a> Transformer<'a> {
         // post-annotation, pre-rewrite — keeping the un-annotatable
         // `SpecTag` out of the annotator.
         fold_we_are_jitted_calls(&mut rewritten);
+        self.collect_immutable_array_bases(&rewritten);
 
         // Scalarise the front's iterator markers (`core::slice::iter`,
         // `__iter_next`, `__majit_range`) that only the lifted spine's
@@ -1726,6 +1862,11 @@ impl<'a> Transformer<'a> {
         // this spine keeps them to the codewriter, where each is a
         // symbolic residual no host symbol backs.
         crate::codewriter::iter_lower::lower_iterators(&mut rewritten);
+
+        // Before `r_uint` is folded to identity. Later blocks still name
+        // the pre-alias result; `remap_op` would otherwise show the signed
+        // source word.
+        self.unsigned_vars = collect_unsigned_vars(&rewritten);
 
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
@@ -1748,6 +1889,83 @@ impl<'a> Transformer<'a> {
             vable_rewrites: self.vable_rewrites,
             calls_classified: self.calls_classified,
         }
+    }
+
+    /// Seed `immutable_array_bases` from `field[*]` reads.
+    ///
+    /// `rewrite_op_getarrayitem` uses `ARRAY._immutable_field(None)`.
+    /// The items ARRAY identity is shared with mutable list storage, so
+    /// purity is recovered from the producing `getfield` instead of the
+    /// type. `items_block_items_base` returns that same header pointer.
+    fn collect_immutable_array_bases(&mut self, graph: &crate::model::FunctionGraph) {
+        let Some(cc) = self.callcontrol.as_deref() else {
+            return;
+        };
+        let mut bases = std::collections::HashSet::new();
+        for block in &graph.blocks {
+            for op in &block.operations {
+                let (Some(result), crate::model::OpKind::FieldRead { field, .. }) =
+                    (&op.result, &op.kind)
+                else {
+                    continue;
+                };
+                let immutable_array = cc
+                    .field_immutability(field.owner_root.as_deref(), &field.name)
+                    .is_some_and(|rank| rank.is_array() && rank.is_immutable());
+                if immutable_array {
+                    bases.insert(result.clone());
+                }
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    let (Some(result), crate::model::OpKind::Call { target, args, .. }) =
+                        (&op.result, &op.kind)
+                    else {
+                        continue;
+                    };
+                    if !Self::call_target_is_items_block_accessor(target) {
+                        continue;
+                    }
+                    let Some(arg) = args.first().and_then(|arg| arg.as_variable()) else {
+                        continue;
+                    };
+                    if bases.contains(arg) && bases.insert(result.clone()) {
+                        changed = true;
+                    }
+                }
+                for (slot, input) in block.inputargs.iter().enumerate() {
+                    if bases.contains(input) {
+                        continue;
+                    }
+                    let mut preds = 0usize;
+                    let mut all_immutable = true;
+                    for src in &graph.blocks {
+                        for link in &src.exits {
+                            if link.target != block.id {
+                                continue;
+                            }
+                            preds += 1;
+                            let carried = link
+                                .args
+                                .get(slot)
+                                .and_then(|arg| arg.as_variable())
+                                .is_some_and(|var| bases.contains(var));
+                            if !carried {
+                                all_immutable = false;
+                            }
+                        }
+                    }
+                    if preds > 0 && all_immutable && bases.insert(input.clone()) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        self.immutable_array_bases = bases;
     }
 
     /// RPython: Transformer.optimize_block()
@@ -1794,6 +2012,7 @@ impl<'a> Transformer<'a> {
             // `rewrite_op_<name>` for the symmetric ops, so it runs before
             // any other rewriting can look at the operands.
             let op = rewrite_symmetric(graph, op);
+            let op = prefix_unsigned_binop(original_op, op, &self.unsigned_vars);
             let rewritten = self.rewrite_operation(&op, graph_name, graph);
             count_before_last_operation = Some(new_ops.len());
             match rewritten {
@@ -4683,6 +4902,34 @@ impl<'a> Transformer<'a> {
         //                           [v_inst, descr, descr1], None),
         //            op1]       # op1 = getfield_*_pure
         // Mutable fields stay as plain `getfield_gc_*`.
+        // `ItemsBlock.capacity` is the GcArray length header (`len(items)`,
+        // rlist.py `_ll_list_resize_hint`). `list.obj_capacity` already
+        // lowers that word to `arraylen_gc`. A struct `getfield` of the same
+        // offset is not an always-pure opcode, so a tuple length read stays
+        // in the peeled loop. `TypedItemsBlock.capacity` is a different
+        // array and is left alone.
+        if field.name == "capacity"
+            && field
+                .owner_root
+                .as_deref()
+                .is_some_and(|owner| owner.rsplit("::").next() == Some("ItemsBlock"))
+        {
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                return RewriteResult::Keep;
+            };
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: "rewrite: getfield(ItemsBlock.capacity) → arraylen_gc".to_string(),
+            });
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::ArrayLen {
+                    base: base.clone(),
+                    array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                    nolength: false,
+                },
+            }]);
+        }
         let rank = self
             .callcontrol
             .as_deref()
@@ -4903,6 +5150,16 @@ impl<'a> Transformer<'a> {
         RewriteResult::Keep
     }
 
+    fn call_target_is_items_block_accessor(target: &crate::model::CallTarget) -> bool {
+        let crate::model::CallTarget::FunctionPath { segments, .. } = target else {
+            return false;
+        };
+        matches!(
+            segments.last().map(String::as_str),
+            Some("items_block_items_base" | "items_block_items_ptr")
+        )
+    }
+
     /// RPython: rewrite_op_getarrayitem
     fn rewrite_op_getarrayitem(
         &mut self,
@@ -4966,7 +5223,17 @@ impl<'a> Transformer<'a> {
                 .as_deref()
                 .is_some_and(|cc| cc.immutable_array_types.contains(aid))
         });
-        let pure = source_pure || immutable;
+        // `ARRAY._immutable_field(None)` is a property of the ARRAY the
+        // field's pointer denotes.  List and tuple items share
+        // `object_ref_gcarray`, so the type cannot be marked pure.
+        // A load whose base is the `wrappeditems[*]` field (or the
+        // header-identity accessor of that field) still is.
+        let from_immutable_field = self.immutable_array_bases.contains(base)
+            || self
+                .aliases
+                .get(base)
+                .is_some_and(|aliased| self.immutable_array_bases.contains(aliased));
+        let pure = source_pure || immutable || from_immutable_field;
         if &typed_item_ty != item_ty || pure != source_pure {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
@@ -5575,10 +5842,10 @@ impl<'a> Transformer<'a> {
         // otherwise consume it, so fold both through the same identity alias
         // used for no-op coercions (`jtransform.py::_noop_rewrite`).
         //
-        // Aliasing loses the marker's Unsigned annotation, which is why this
-        // sits here and not earlier: the rtyper runs before jtransform and has
-        // already picked `uint_lt` over `int_lt` wherever the annotation
-        // mattered.  Both spellings name the same machine word.
+        // Aliasing drops the marker's Unsigned annotation. Ordered compares
+        // and `rshift` recover it in `prefix_unsigned_binop` from the
+        // pre-alias operands (`IntegerRepr.opprefix` is `uint_`). `eq`/`ne`
+        // stay `int_*`: both spellings are the same machine word.
         if let CallTarget::FunctionPath { segments, .. } = target
             && let [head @ .., leaf] = segments.as_slice()
             && head == ["rpython", "rlib", "rarithmetic"]

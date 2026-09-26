@@ -62,6 +62,7 @@ pub const TUPLE_HASH_UNSET: i64 = -1;
 /// items are loaded as `getfield_gc_pure_r` and the array length
 /// comes from `arraylen_gc` against the GcArray header.
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("wrappeditems[*]")]
 pub struct W_TupleObject {
     pub ob_header: PyObject,
     /// CPython 3.14 `PyTupleObject.ob_hash`; `TUPLE_HASH_UNSET` until computed.
@@ -656,12 +657,20 @@ pub unsafe fn is_plain_float_strict(obj: PyObjectRef) -> bool {
 /// # Safety
 /// `obj` must point to a valid tuple of any of the four variants.
 pub unsafe fn w_tuple_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
-    let len = w_tuple_len(obj) as i64;
-    let idx = if index < 0 { index + len } else { index };
-    if idx < 0 || idx >= len {
-        return None;
+    // rlist.py `ll_getitem` (`func is dum_checkidx`): one unsigned
+    // `r_uint(index) >= r_uint(length)` test. A failing index is either
+    // negative or out of range; add `length` and test again, then
+    // `intmask` the adjusted index.
+    let length = w_tuple_len(obj) as i64;
+    let mut index_u = index as u64;
+    let length_u = length as u64;
+    if index_u >= length_u {
+        index_u = index_u.wrapping_add(length_u);
+        if index_u >= length_u {
+            return None;
+        }
     }
-    Some(w_tuple_getitem_known(obj, idx as usize))
+    Some(w_tuple_getitem_known(obj, index_u as usize))
 }
 
 /// Internal: read a tuple item at a known-in-bounds index. Splitting

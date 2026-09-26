@@ -9710,12 +9710,12 @@ impl<S: JitState> JitDriver<S> {
     /// trace-in-progress marker for inline decisions.
     pub fn get_or_make_portal_assembler_token_arc(
         &mut self,
-        green_key: u64,
+        key: &majit_ir::GreenKey,
         greenboxes: &[Value],
         red_arg_types: &[Type],
     ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
         self.meta
-            .get_or_make_portal_assembler_token_arc(green_key, greenboxes, red_arg_types)
+            .get_or_make_portal_assembler_token_arc(key, greenboxes, red_arg_types)
     }
 
     /// Decide how to handle a function call during tracing.

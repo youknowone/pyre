@@ -48,7 +48,7 @@ def main():
         b"ab",
         bytearray(b"abcd"),
     )
-    print(hot(4000, objects))
+    print(hot(120000, objects))
 
 
 main()

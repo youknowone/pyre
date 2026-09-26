@@ -6272,7 +6272,7 @@ mod tests {
     /// hash-marked key reaches `StartTracing` on the THRESHOLD tick by the
     /// ordinary counter route, because the typed decision never saw the mark;
     /// the typed-marked key reaches it on the FIRST tick by
-    /// `should_start_dont_trace_here_trace` (warmstate.py), which is
+    /// `should_start_dont_trace_here_trace` (`warmstate.py` `maybe_compile_and_run`), which is
     /// the rule upstream intends to apply. Both trace in the end, so this is
     /// NOT demonstrated to be a user-visible wrong answer — it is a lost
     /// decision input. Whether a production key reaches both entry points, and
@@ -6297,7 +6297,7 @@ mod tests {
         assert_eq!(ws.get_stats().num_cells, 2, "but two cells");
 
         // `install_new_cell` folds the SURVIVOR in front of the newcomer
-        // (counter.py `cell.next = keep; keep = cell`), so the
+        // (`counter.py` `install_new_cell`: `cell.next = keep; keep = cell`), so the
         // HASH-written cell stays the head and the TYPED cell is chained
         // behind it. This is the direction that matters: every bare-head
         // reader — `self.lookup_chain(hash)`, ~26 of them in this file — reads

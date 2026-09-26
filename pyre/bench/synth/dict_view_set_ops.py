@@ -36,7 +36,7 @@ K2 = {"b": 2, "c": 3}
 
 
 def main():
-    print("warm", warm(1000))
+    print("warm", warm(30000))
     # forward ops, view vs view
     m("keys_sub", lambda: s(K.keys() - K2.keys()))
     m("keys_and", lambda: s(K.keys() & K2.keys()))

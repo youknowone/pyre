@@ -6,7 +6,7 @@
 # ResultToTos boundary, including heap-int (>= 256) merge slots, nested user
 # iterators, and a comprehension.
 
-N = 6000
+N = 60000
 
 
 class NextIter:

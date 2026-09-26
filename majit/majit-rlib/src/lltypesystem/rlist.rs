@@ -156,6 +156,7 @@ pub fn itemsblock_gc_enabled() -> bool {
 /// `f64` / `i64` by the wrapper; the JIT-visible array descriptor carries the
 /// element type.
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("capacity")]
 pub struct TypedItemsBlock {
     /// Allocated capacity — the GcArray length header (rlist.py:251).
     pub capacity: usize,

@@ -41,7 +41,7 @@ def caught(fn, st):
 
 
 def main():
-    print("warm", warm(15000))
+    print("warm", warm(300000))
     # a duplicate in the operand toggles once, not twice
     m("sdu_dups", lambda: sdu({1}, [2, 2]))
     m("sdu_dups_present", lambda: sdu({1, 2}, [2, 2]))

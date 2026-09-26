@@ -3054,7 +3054,7 @@ pub fn set_symbolic_fnaddr_path_resolver(hook: Option<SymbolicFnaddrPathResolver
     );
 }
 
-pub(crate) fn resolve_symbolic_fnaddr_path(fnaddr: i64) -> Option<&'static str> {
+pub fn resolve_symbolic_fnaddr_path(fnaddr: i64) -> Option<&'static str> {
     let hook = SYMBOLIC_FNADDR_PATH_RESOLVER.load(std::sync::atomic::Ordering::Acquire);
     if hook == 0 {
         return None;
@@ -6192,14 +6192,21 @@ impl<M: Clone> MetaInterp<M> {
             return BackEdgeAction::AlreadyTracing;
         }
 
-        // Force-start via the typed greenkey when the raw (code, pc) is
-        // present so the cell carries a `comparekey` like the back-edge
-        // path; synthetic (0, 0) call sites keep the legacy u64 path.
-        let hot = match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+        // `JitCell.__init__(*greenargs)` stores the greens on the cell.
+        // The portal spelling is `with_typed_decision_key`. A driver whose
+        // greens are not that spelling still handed `green_key_values` in;
+        // installing through the hash alone leaves a comparekey-less cell,
+        // and the later `ensure_jit_cell_at_key` chains a second cell for
+        // the same greens. Only a caller with neither key stays on the hash.
+        let hot = if let Some(hot) =
+            Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                self.warm_state.force_start_tracing_for_key(key)
+            }) {
+            hot
+        } else if let Some(key) = green_key_values.as_ref() {
             self.warm_state.force_start_tracing_for_key(key)
-        }) {
-            Some(h) => h,
-            None => self.warm_state.force_start_tracing(green_key),
+        } else {
+            self.warm_state.force_start_tracing(green_key)
         };
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
@@ -6216,6 +6223,11 @@ impl<M: Clone> MetaInterp<M> {
                     self.warm_state.cell_key_for(key)
                 })
                 .flatten()
+                .or_else(|| {
+                    green_key_values
+                        .as_ref()
+                        .and_then(|key| self.warm_state.cell_key_for(key))
+                })
                 .unwrap_or(green_key);
                 self.prepare_trace_start_runtime();
                 self.setup_tracing(
@@ -6655,11 +6667,12 @@ impl<M: Clone> MetaInterp<M> {
             // index: the token comes off the celltable and the key travels
             // on to the `CALL_ASSEMBLER` descr, so both must name the cell
             // the callee's greens own rather than whatever heads its bucket.
+            let typed = majit_ir::GreenKey::with_types(green_values.to_vec(), spec.clone());
             let green_key = runtime_state
                 .borrow()
                 .0
                 .resolve_cell_key(crate::green_key_hash_typed(green_values, &spec), || {
-                    majit_ir::GreenKey::with_types(green_values.to_vec(), spec.clone())
+                    typed.clone()
                 });
             if let Some(token) = runtime_state.borrow().0.get_compiled(green_key) {
                 return Some((token, green_key));
@@ -6677,19 +6690,23 @@ impl<M: Clone> MetaInterp<M> {
             let red_arg_types = jd.red_arg_types_as_ir_types();
             let mut state = runtime_state.borrow_mut();
             let (warm_state, backend) = &mut *state;
+            warm_state.ensure_cell_for_key(&typed);
+            let cell_key = warm_state
+                .cell_key_for(&typed)
+                .unwrap_or_else(|| typed.get_uhash());
             let token_number = warm_state.alloc_token_number();
-            match warm_state.get_assembler_token(green_key, |memmgr| {
+            match warm_state.get_assembler_token_with_key(&typed, |memmgr| {
                 compile::compile_tmp_callback(
                     *backend,
                     &jd,
                     token_number,
-                    green_key,
+                    cell_key,
                     &greenboxes,
                     &red_arg_types,
                     Some(memmgr),
                 )
             }) {
-                Ok(token) => Some((token, green_key)),
+                Ok(token) => Some((token, cell_key)),
                 Err(err) => {
                     if crate::majit_log_enabled() {
                         eprintln!(
@@ -8086,15 +8103,15 @@ impl<M: Clone> MetaInterp<M> {
         // `closed`, and the merge point was filed under the greens themselves,
         // not under the resolved cell key.
         let closed_for_scan = closed.clone();
-        // File the loop under the CELL key, not the bucket hash: this is the
-        // key a later warm entry resolves and looks `compiled_loops` up by, and
-        // on a chained bucket a bucket hash names a different cell's slot. The
-        // resolve is the same one the entry does (`warmstate.py:458-464`), so
-        // compile and entry agree by construction.
+        // File the loop on the cell `get_jitcell(*greenargs)` /
+        // `ensure_jit_cell_at_key` would own. `resolve_cell_key` answers the
+        // raw hash when the bucket is empty or holds only a comparekey-less
+        // cell, and `attach_procedure_to_interp` then installs the token
+        // there. The later `get_assembler_token` walk compares greens and
+        // misses that cell. Ensure the typed cell first so the token and the
+        // entry share it.
         let green_key = match closed {
-            Some(key) => self
-                .warm_state
-                .resolve_cell_key(key.get_uhash(), || key.clone()),
+            Some(key) => self.warm_state.ensure_cell_key(&key),
             // `outer` is `ctx.green_key`, already resolved at trace start. The
             // cross-loop-cut inner key is produced inside the trace walker,
             // which holds no `WarmEnterState`, so it arrives as a bucket hash
@@ -8314,10 +8331,17 @@ impl<M: Clone> MetaInterp<M> {
             // though — it lands on the outcome the `except InvalidLoop` arm
             // just below it already defines, "this trace produced no loop",
             // reached one step earlier because pyre's cut is materialized.
+            // A loop entry (`compile.py compile_loop`) supplies only the
+            // merge-point red boxes. A snapshot box that cannot be replayed
+            // is an inputarg only on a bridge (`compile.py compile_retrace`,
+            // `opencoder.py CutTrace`); appending it here widens the entry
+            // `patch_new_loop_to_load_virtualizable_fields` asserts, so the
+            // cut declines and this compilation is cancelled.
             let Some(cut) = trace.cut_trace_from_with_consts(
                 start,
                 original_boxes,
                 &ctx.initial_inputarg_consts,
+                false,
             ) else {
                 return CompileOutcome::Cancelled;
             };
@@ -10334,6 +10358,7 @@ impl<M: Clone> MetaInterp<M> {
                     start,
                     original_boxes,
                     &initial_inputarg_consts,
+                    true,
                 ) else {
                     return false;
                 };
@@ -19577,9 +19602,10 @@ impl<M: Clone> MetaInterp<M> {
         // Resolve to the target's CELL key: the token this key selects is
         // carried into the `CALL_ASSEMBLER` descr, so it has to be the token of
         // the cell these greens own.
+        let typed = majit_ir::GreenKey::with_types(green_values.clone(), green_types.clone());
         let green_key = self.warm_state.resolve_cell_key(
             crate::green_key_hash_typed(&green_values, &green_types),
-            || majit_ir::GreenKey::with_types(green_values.clone(), green_types.clone()),
+            || typed.clone(),
         );
         // `compile.py:187` parity: `op.getdescr()` IS a `JitCellToken`.  Carry
         // the *same* Arc that `compiled_loops` / warm cell own through to the
@@ -19605,19 +19631,26 @@ impl<M: Clone> MetaInterp<M> {
                     }
                 })
                 .collect();
+            self.warm_state.ensure_cell_for_key(&typed);
+            let cell_key = self
+                .warm_state
+                .cell_key_for(&typed)
+                .unwrap_or_else(|| typed.get_uhash());
             let token_number = self.warm_state.alloc_token_number();
             let backend = &mut self.backend;
-            match self.warm_state.get_assembler_token(green_key, |memmgr| {
-                compile::compile_tmp_callback(
-                    backend,
-                    &target_sd,
-                    token_number,
-                    green_key,
-                    &greenboxes,
-                    &arg_types,
-                    Some(memmgr),
-                )
-            }) {
+            match self
+                .warm_state
+                .get_assembler_token_with_key(&typed, |memmgr| {
+                    compile::compile_tmp_callback(
+                        backend,
+                        &target_sd,
+                        token_number,
+                        cell_key,
+                        &greenboxes,
+                        &arg_types,
+                        Some(memmgr),
+                    )
+                }) {
                 Ok(token) => token,
                 Err(err) => {
                     if crate::majit_log_enabled() {
@@ -19675,16 +19708,23 @@ impl<M: Clone> MetaInterp<M> {
     /// `[next_instr, is_being_profiled, pycode]` / `[frame, ec]` → `[Ref, Ref]`
     /// (`build_portal_calldescr`), for a registered driver whatever its
     /// `jit_merge_point` spec names.
+    ///
+    /// `typed_key` is the caller's green tuple when it has one: the token is
+    /// then installed on the typed cell (`JitCell.get_jitcell(*greenargs)`),
+    /// which also returns an installed token, temporary or compiled, as-is.
     fn assembler_token_arc_for_driver(
         &mut self,
         target_sd: &crate::jitdriver::JitDriverStaticData,
         green_key: u64,
+        typed_key: Option<&majit_ir::GreenKey>,
         greenboxes: &[Value],
         red_arg_types: &[Type],
         log_tag: &str,
     ) -> Option<Arc<JitCellToken>> {
         // `compile.py:187` parity: an already-compiled loop token wins.
-        if let Some(arc) = self.get_loop_token_arc(green_key) {
+        if typed_key.is_none()
+            && let Some(arc) = self.get_loop_token_arc(green_key)
+        {
             return Some(arc);
         }
         if target_sd.portal_runner_adr == 0 {
@@ -19696,7 +19736,7 @@ impl<M: Clone> MetaInterp<M> {
         // 1150`).
         let token_number = self.warm_state.alloc_token_number();
         let backend = &mut self.backend;
-        match self.warm_state.get_assembler_token(green_key, |memmgr| {
+        let make_token = |memmgr: &mut crate::memmgr::MemoryManager| {
             compile::compile_tmp_callback(
                 backend,
                 target_sd,
@@ -19706,7 +19746,14 @@ impl<M: Clone> MetaInterp<M> {
                 red_arg_types,
                 Some(memmgr),
             )
-        }) {
+        };
+        let token = match typed_key {
+            Some(key) => self
+                .warm_state
+                .get_assembler_token_with_key(key, make_token),
+            None => self.warm_state.get_assembler_token(green_key, make_token),
+        };
+        match token {
             Ok(token) => Some(token),
             Err(err) => {
                 if crate::majit_log_enabled() {
@@ -19721,15 +19768,14 @@ impl<M: Clone> MetaInterp<M> {
 
     pub fn get_or_make_portal_assembler_token_arc(
         &mut self,
-        green_key: u64,
+        key: &majit_ir::GreenKey,
         greenboxes: &[Value],
         red_arg_types: &[Type],
     ) -> Option<Arc<JitCellToken>> {
-        // Resolved before the portal-driver lookup — an installed token does
-        // not need the portal staticdata.
-        if let Some(arc) = self.get_loop_token_arc(green_key) {
-            return Some(arc);
-        }
+        // `warmstate.py get_assembler_token(greenkey)` reaches the cell through
+        // `JitCell.get_jitcell(*greenargs)`. The caller supplies that green
+        // tuple; this crate does not invent one. A hash-only install would
+        // file a comparekey-less cell the later typed attach never redirects.
         // The real portal driver has greens; the empty
         // `ensure_default_driver_sd` placeholder (jitdrivers_sd[0]) has none.
         let idx = self
@@ -19738,9 +19784,15 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .position(|jd| jd.num_greens() > 0)?;
         let target_sd = self.staticdata.jitdrivers_sd.get(idx).cloned()?;
+        self.warm_state.ensure_cell_for_key(key);
+        let cell_key = self
+            .warm_state
+            .cell_key_for(key)
+            .unwrap_or_else(|| key.get_uhash());
         self.assembler_token_arc_for_driver(
             &target_sd,
-            green_key,
+            cell_key,
+            Some(key),
             greenboxes,
             red_arg_types,
             "walker-ca",
@@ -19767,6 +19819,7 @@ impl<M: Clone> MetaInterp<M> {
         self.assembler_token_arc_for_driver(
             &target_sd,
             green_key,
+            None,
             greenboxes,
             red_arg_types,
             "jd-ca",

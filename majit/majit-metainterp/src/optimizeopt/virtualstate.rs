@@ -2571,7 +2571,7 @@ pub(crate) fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
     let mut cache = ExportCache::new();
     let state: Vec<Rc<VirtualStateInfoNode>> = oprefs
         .iter()
-        .map(|opref| export_single_value(*opref, ctx, &mut cache))
+        .map(|opref| export_single_value(*opref, ctx, &mut cache, false))
         .collect();
     // virtualstate.py VirtualState.__init__ assigns positions via
     // _enum so subsequent walks dedup shared Rc'd subtrees via
@@ -2588,7 +2588,7 @@ pub(crate) fn export_state_operands(
     let mut cache = ExportCache::new();
     let state: Vec<Rc<VirtualStateInfoNode>> = operands
         .iter()
-        .map(|operand| export_single_operand(operand, ctx, &mut cache))
+        .map(|operand| export_single_operand(operand, ctx, &mut cache, false))
         .collect();
     VirtualState::from_shared_rcs(state)
 }
@@ -2636,6 +2636,7 @@ fn create_state_or_none(
     operand: &majit_ir::operand::Operand,
     ctx: &OptContext,
     cache: &mut ExportCache,
+    clear_known_low_bit: bool,
 ) -> Option<Rc<VirtualStateInfoNode>> {
     // virtualstate.py `create_state_or_none`: `if box is None: return None`. The
     // absent-slot sentinel is `Operand::None`, not `to_opref() == None`:
@@ -2648,9 +2649,14 @@ fn create_state_or_none(
         if opref.is_none() {
             // Bound ResOp whose `pos` was never stamped: keep the
             // operand so `Op.type_` can still pick the not_virtual leaf.
-            Some(export_single_operand(operand, ctx, cache))
+            Some(export_single_operand(
+                operand,
+                ctx,
+                cache,
+                clear_known_low_bit,
+            ))
         } else {
-            Some(export_single_value(opref, ctx, cache))
+            Some(export_single_value(opref, ctx, cache, clear_known_low_bit))
         }
     }
 }
@@ -2684,14 +2690,21 @@ fn export_single_value(
     opref: OpRef,
     ctx: &OptContext,
     cache: &mut ExportCache,
+    clear_known_low_bit: bool,
 ) -> Rc<VirtualStateInfoNode> {
-    export_single_operand(&ctx.get_box_replacement_operand(opref), ctx, cache)
+    export_single_operand(
+        &ctx.get_box_replacement_operand(opref),
+        ctx,
+        cache,
+        clear_known_low_bit,
+    )
 }
 
 fn export_single_operand(
     operand: &majit_ir::operand::Operand,
     ctx: &OptContext,
     cache: &mut ExportCache,
+    clear_known_low_bit: bool,
 ) -> Rc<VirtualStateInfoNode> {
     // virtualstate.py:713-716 `box = get_box_replacement(box)` then keyed
     // lookup on `self.info`: resolve the forwarding chain BEFORE the cache
@@ -2738,7 +2751,7 @@ fn export_single_operand(
     let key = box_.clone();
     cache.in_progress.insert(key.clone());
 
-    let info = export_single_value_inner(&box_, ctx, cache);
+    let info = export_single_value_inner(&box_, ctx, clear_known_low_bit, cache);
     // virtualstate.py NotVirtualStateInfoPtr.__init__: retain the
     // widened ArrayPtrInfo / StrPtrInfo length bound on the per-instance
     // pointer leaf. Virtual pointer infos have their own state variants and
@@ -2765,6 +2778,7 @@ fn export_single_operand(
 fn export_single_value_inner(
     box_: &majit_ir::operand::Operand,
     ctx: &OptContext,
+    clear_known_low_bit: bool,
     cache: &mut ExportCache,
 ) -> VirtualStateInfo {
     let opref = box_.to_opref();
@@ -2792,7 +2806,7 @@ fn export_single_value_inner(
                     .fields
                     .iter()
                     .filter_map(|(field_idx, field_ref)| {
-                        create_state_or_none(field_ref, ctx, cache)
+                        create_state_or_none(field_ref, ctx, cache, false)
                             .map(|field_state| (*field_idx, field_state))
                     })
                     .collect();
@@ -2810,7 +2824,7 @@ fn export_single_value_inner(
                 let items: Vec<Option<Rc<VirtualStateInfoNode>>> = vinfo
                     .items
                     .iter()
-                    .map(|item_ref| create_state_or_none(item_ref, ctx, cache))
+                    .map(|item_ref| create_state_or_none(item_ref, ctx, cache, false))
                     .collect();
                 let len = items.len();
                 return VirtualStateInfo::VArray {
@@ -2826,7 +2840,7 @@ fn export_single_value_inner(
                     .fields
                     .iter()
                     .filter_map(|(field_idx, field_ref)| {
-                        create_state_or_none(field_ref, ctx, cache)
+                        create_state_or_none(field_ref, ctx, cache, false)
                             .map(|field_state| (*field_idx, field_state))
                     })
                     .collect();
@@ -2846,7 +2860,8 @@ fn export_single_value_inner(
                             .map(|(field_idx, field_ref)| {
                                 // virtualstate.py:724-725: retain the dense
                                 // field slot while making unwritten state absent.
-                                let field_state = create_state_or_none(field_ref, ctx, cache);
+                                let field_state =
+                                    create_state_or_none(field_ref, ctx, cache, false);
                                 (*field_idx, field_state)
                             })
                             .collect()
@@ -2934,26 +2949,31 @@ fn export_single_value_inner(
             );
         });
     // virtualstate.py NotVirtualStateInfoInt.__init__: an int leaf's
-    // info is `getintbound(op)` (optimizer.py — always an IntBound for a
-    // non-constant int), and the constructor widens it (`info.widen_update()`)
-    // and stores it as `self.intbound`. Carry that here so the loop/bridge close
-    // can emit `IntBound.make_guards` (virtualstate.py): when a peeled
-    // loop's exit guard has been const-folded away (because the loop-variant
-    // bound proved it redundant), the bound on this leaf is what makes the bridge
-    // that re-enters the loop re-emit the bound check — without it the re-entered
-    // loop has no exit and runs forever. A widened-unbounded bound carries no
-    // information, so collapse it back to the always-match `Unknown` leaf
-    // (behaviorally identical to NotVirtualStateInfoInt with an unbounded
-    // `intbound`: `_generate_guards_unkown`'s `is_within_range(MININT, MAXINT)`
-    // is always true → no guard).
-    if tp == Type::Int
-        && let Some(widened) = ctx
+    // info is `getintbound(op)`, and the constructor widens a clone
+    // (`info.widen()` / `widen_update`, which clears the tristate) stored
+    // as `self.intbound`. The live phase-1 bound stays precise so the
+    // preamble trace can still fold. The peeled import applies that
+    // widened info (`setinfo_from_preamble`). A widened-unbounded bound
+    // carries no information, so collapse it back to the always-match
+    // `Unknown` leaf. The stored bound is also what makes a bridge that
+    // re-enters the loop re-emit `IntBound.make_guards`.
+    if tp == Type::Int {
+        // NotVirtualStateInfoInt.__init__ calls widen_update on the live
+        // info. Doing that for every bound drops known bits the preamble
+        // still needs and adds bridges. The peel failure is only a
+        // non-constant int whose low bit is already known (`i & 1`), which
+        // the next iteration then treats as invariant. Clear just that
+        // tristate on the live box; the exported leaf below is still the
+        // widened clone.
+        let _ = clear_known_low_bit;
+        if let Some(widened) = ctx
             .get_box_replacement_operand_opt(opref)
             .and_then(|b| ctx.peek_intbound_box(&b))
             .map(|b| b.widen())
             .filter(|b| !b.is_unbounded())
-    {
-        return VirtualStateInfo::IntBounded(widened);
+        {
+            return VirtualStateInfo::IntBounded(widened);
+        }
     }
     VirtualStateInfo::Unknown(tp)
 }

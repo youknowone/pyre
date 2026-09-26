@@ -14,7 +14,7 @@
 
 from operator import index as _index
 
-N = 5000
+N = 150000
 hits = [0]
 
 

@@ -45,7 +45,7 @@ try:
 except ImportError:
     pass
 
-OUTER = 100
+OUTER = 3000
 INNER = 50
 
 

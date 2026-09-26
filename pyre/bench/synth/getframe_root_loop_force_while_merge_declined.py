@@ -35,7 +35,7 @@ def main():
     global kept
     total = 0
     i = 0
-    while i < 30000:
+    while i < 600000:
         kept = _gf(0)
         total = total + len(kept.f_locals)
         i = i + 1

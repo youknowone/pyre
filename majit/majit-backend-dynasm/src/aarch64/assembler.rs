@@ -2643,10 +2643,28 @@ impl<'a> AssemblerARM64<'a> {
                 }
             }
             OpCode::IntSignext => {
-                // arglocs = [argloc, numbytes_loc], result_loc = separate reg
+                // arglocs = [argloc, numbytes_loc]. Sign-extend the low
+                // `numbytes` of the source (`genop_int_signext`).
                 if let (Some(src), Some(Loc::Reg(r))) = (arglocs.first(), result_loc) {
-                    self.regalloc_mov(src, &Loc::Reg(*r));
-                    // signext handled by assembler based on numbytes
+                    let src_reg = self.load_loc_to_reg(src, 17);
+                    let num_bytes = match arglocs.get(1).and_then(Loc::as_immed) {
+                        Some((n, false)) => n,
+                        other => {
+                            panic!("int_signext: numbytes must be an immediate, got {other:?}")
+                        }
+                    };
+                    let shift = 64 - num_bytes * 8;
+                    if (1..64).contains(&shift) {
+                        let sh = shift as u32;
+                        dynasm!(self.mc ; .arch aarch64
+                            ; lsl X(r.value), X(src_reg as u8), sh
+                            ; asr X(r.value), X(r.value), sh
+                        );
+                    } else {
+                        dynasm!(self.mc ; .arch aarch64
+                            ; mov X(r.value), X(src_reg as u8)
+                        );
+                    }
                 }
             }
             // ── Float binary ──
@@ -7034,7 +7052,7 @@ impl<'a> AssemblerARM64<'a> {
         self.load_arg_to_rax(op.arg(0).to_opref());
         let num_bytes = match self.resolve_opref(op.arg(1).to_opref()) {
             ResolvedArg::Const(v) => v,
-            _ => 8,
+            _ => panic!("int_signext: numbytes must be a constant"),
         };
         let shift = 64 - num_bytes * 8;
         if shift > 0 && shift < 64 {

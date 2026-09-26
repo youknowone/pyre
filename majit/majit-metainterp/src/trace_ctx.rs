@@ -381,6 +381,10 @@ pub struct TraceCtx {
     /// greens, so reconstructing the interpreter-entered key for a close needs
     /// this target in addition to the merge-point green tuple.
     pub(crate) close_green_pc: Option<i64>,
+    /// Typed greens of the merge point that closed the trace, when the
+    /// producer built them itself. `close_green_key` returns this before
+    /// reconstructing from the int/ref/float banks.
+    close_typed_key: Option<GreenKey>,
     /// pyjitpl.py `compile_trace(live_arg_boxes, ptoken)`: the procedure
     /// token key of the merge point the trace just reached, set when that merge point
     /// already has compiled targets.  A close carrying this JUMPs into the existing
@@ -1936,6 +1940,7 @@ impl TraceCtx {
             header_greens: None,
             close_greens: None,
             close_green_pc: None,
+            close_typed_key: None,
             close_jump_into_key: None,
             heap_cache: HeapCache::new(),
             force_finish: false,
@@ -2013,6 +2018,7 @@ impl TraceCtx {
             header_greens: None,
             close_greens: None,
             close_green_pc: None,
+            close_typed_key: None,
             close_jump_into_key: None,
             heap_cache: HeapCache::new(),
             force_finish: false,
@@ -2573,7 +2579,14 @@ impl TraceCtx {
     /// through this (`WarmEnterState::resolve_cell_key`) and file under the
     /// resolved cell key; the vectors it builds are the ones
     /// `merge_point_green_key_hash` already built to hash.
+    pub fn set_close_typed_key(&mut self, key: GreenKey) {
+        self.close_typed_key = Some(key);
+    }
+
     pub fn close_green_key(&self) -> Option<GreenKey> {
+        if let Some(key) = &self.close_typed_key {
+            return Some(key.clone());
+        }
         let greens = self.close_greens.as_ref()?;
         let pc = self.close_green_pc?;
         self.merge_point_green_key(pc, &greens.0, &greens.1, &greens.2)
@@ -5877,6 +5890,28 @@ impl TraceCtx {
             );
         }
         true
+    }
+
+    /// `GETARRAYITEM_GC_R` of one locals slot. Does not consult the
+    /// virtualizable shadow: the caller has already decided this slot is not
+    /// a live vable box and must be read off the frame object.
+    pub fn read_gc_array_item_ref(
+        &mut self,
+        array_opref: OpRef,
+        item_index: i64,
+        adescr: DescrRef,
+    ) -> OpRef {
+        let index = self.const_int(item_index);
+        let op = self.execute_and_record(
+            None,
+            OpCode::GetarrayitemGcR,
+            Some(adescr.clone()),
+            &[array_opref, index],
+            None,
+            0,
+        );
+        let _ = self.stamp_vable_array_item(op, array_opref, item_index, &adescr, Type::Ref);
+        op
     }
 
     /// `_opimpl_setarrayitem_vable` body with the `_nonstandard_virtualizable`
