@@ -13858,23 +13858,6 @@ impl<'a> Lowering<'a> {
                             }
                         }
                     };
-                    // `Default::default` reached through the trait path with
-                    // a raw-pointer Self names the impl rustc selects
-                    // (`impl Default for *mut T` in `core::ptr::mut_ptr`),
-                    // which jtransform folds as `rtype_ptr_null`.
-                    let target = if args.is_empty()
-                        && let CallTarget::FunctionPath { segments, .. } = &target
-                        && crate::codewriter::jtransform::is_generic_default_path(segments)
-                        && let Some(segments) =
-                            raw_ptr_default_impl_segments(&call.dest.ty, self.llbc)
-                    {
-                        CallTarget::FunctionPath {
-                            segments,
-                            fun_decl_id: None,
-                        }
-                    } else {
-                        target
-                    };
                     OpKind::Call {
                         target,
                         args: crate::model::call_args(args),
@@ -30039,28 +30022,6 @@ fn raw_ptr_pointee_container_root(node: &serde_json::Value, llbc: &Llbc) -> Opti
     let rendered = charon_type_value_to_ast_string(pointee, llbc, 0);
     (rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") || rendered.starts_with('['))
         .then_some(rendered)
-}
-
-/// The path of the `Default` impl for the raw pointer `ty`
-/// (`core::ptr::mut_ptr` / `core::ptr::const_ptr`), or `None` when `ty` is
-/// not a raw pointer.
-fn raw_ptr_default_impl_segments(ty: &TyRef, llbc: &Llbc) -> Option<Vec<String>> {
-    let raw = tyref_node(ty, llbc)
-        .and_then(|n| strip_ty_wrappers(n, llbc))?
-        .as_object()?
-        .get("RawPtr")?
-        .as_array()?;
-    let module = match raw.get(1)?.as_str()? {
-        "Mut" => "mut_ptr",
-        "Shared" => "const_ptr",
-        _ => return None,
-    };
-    Some(
-        ["core", "ptr", module, "<Impl>", "default"]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-    )
 }
 
 /// Whether `ty` is a raw pointer onto a byte-sized integer literal —
