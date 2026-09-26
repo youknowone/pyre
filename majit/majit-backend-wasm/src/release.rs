@@ -17,12 +17,12 @@ pub struct LoopAsmResources {
     pub gcmaps: Vec<Box<[usize]>>,
     /// Real `__indirect_function_table` pair bases. `0` is not a host slot.
     pub table_slots: Vec<u32>,
-    pub label_ids: Vec<usize>,
-    pub label_handle: u32,
-    /// `JitCellToken.number` that published `label_ids`. A later compile that
-    /// overwrites the same descr updates `LabelTarget.owner_token`, and this
-    /// drop leaves that row alone.
-    pub label_owner: u64,
+    /// `LabelTarget` boxes this emission published. `ll_loop_code` is the
+    /// address of the box (`assembler.py` `fixup_target_tokens` writes
+    /// `TargetToken._ll_loop_code`). A later compile overwrites the word
+    /// with its own box; `Drop` clears the word only when it still names
+    /// this box.
+    pub label_targets: Vec<(majit_ir::DescrRef, Box<crate::failguard::LabelTarget>)>,
     /// One [`crate::failguard::FailDescrCell`] per guard exit. The address is
     /// what the exit stores in `jf_descr` (`get_latest_descr`). The cell
     /// outlives every module that can still leave through that exit because
@@ -89,17 +89,12 @@ impl Drop for LoopAsmResources {
                 let _ = slot;
             }
         }
-        if self.label_owner != 0 {
-            let mut reg = crate::failguard::LABEL_TARGETS.lock();
-            if let Some(labels) = reg.as_mut() {
-                for id in self.label_ids.drain(..) {
-                    let still_ours = labels
-                        .get(&id)
-                        .is_some_and(|target| target.owner_token == self.label_owner);
-                    if still_ours {
-                        labels.remove(&id);
-                    }
-                }
+        for (descr, boxed) in self.label_targets.drain(..) {
+            let addr = &*boxed as *const crate::failguard::LabelTarget as usize;
+            if let Some(loop_target) = descr.as_loop_target_descr()
+                && loop_target.ll_loop_code() == addr
+            {
+                loop_target.set_ll_loop_code(0);
             }
         }
     }

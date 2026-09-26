@@ -77,7 +77,7 @@ use std::sync::{Arc, Weak};
 /// call trampoline on a movable CA frame.  Index 16 records the dormant
 /// forced-terminal-decline runtime regression hook. Sub-breakdown of the
 /// index-8 unresolved-target decline: 17 = the terminal JUMP carries no descr
-/// at all, 18 = the descr is present but `LABEL_TARGETS` holds no entry for it.
+/// at all, 18 = the descr is present but `ll_loop_code` is 0.
 /// Publish-side counterpart, so an unresolved lookup can be told from a label
 /// that was never offered: 19 = labels published off a peeled trace, 20 =
 /// published off a non-peeled trace, 21 = a non-peeled trace's first label left
@@ -860,18 +860,20 @@ use majit_ir::{FailDescr, GcRef, InputArgRc, Op, OpRc, Value};
 /// so a retrace IS a bridge that defines its own LABEL.
 ///
 /// Returns `(label_descrs, published_descrs)`: the descr identity of every
-/// LABEL in ordinal order, and the subset actually entered into
-/// `LABEL_TARGETS`. `compile_loop` keeps the first for its own JUMP
-/// resolution; `compile_bridge` hands the second to the source loop so
-/// `Drop` retracts them.
+/// LABEL in ordinal order, and the subset whose `LabelTarget` box was
+/// stored in `resources` with its address written to
+/// `LoopTargetDescr::ll_loop_code`. `compile_loop` keeps the first for
+/// its own JUMP resolution; `compile_bridge` hands the second to the source
+/// loop so `Drop` retracts them.
 fn stamp_and_publish_label_targets(
+    resources: &mut release::LoopAsmResources,
     func_handle: u32,
     frame: codegen::FrameGeometry,
     inputargs: &[InputArgRc],
     ops: &[Op],
     bridge_entry_arity: Option<usize>,
     owner_token: u64,
-) -> (Vec<usize>, Vec<usize>) {
+) -> (Vec<usize>, Vec<majit_ir::DescrRef>) {
     // Stamp each LABEL's loop-target descr with its ordinal (0, 1, 2, …) so a
     // loop-closing bridge can recover which label its terminal JUMP targets:
     // the JUMP and the LABEL share the descr by Arc identity, so the ordinal
@@ -881,10 +883,12 @@ fn stamp_and_publish_label_targets(
     // would panic on a non-`AtomicU32` slot).
     let mut label_block_id: u32 = 0;
     let mut label_descrs: Vec<usize> = Vec::new();
+    let mut label_refs: Vec<Option<majit_ir::DescrRef>> = Vec::new();
     for op in ops.iter() {
         if op.opcode != majit_ir::OpCode::Label {
             continue;
         }
+        label_refs.push(op.getdescr());
         // Descr identity of each label, in ordinal order, so
         // `compile_bridge` can resolve which of THIS loop's labels a
         // closing JUMP targets by Arc identity (the JUMP and the LABEL
@@ -924,7 +928,7 @@ fn stamp_and_publish_label_targets(
     } else {
         0
     };
-    let mut published_descrs = Vec::new();
+    let mut published_descrs: Vec<majit_ir::DescrRef> = Vec::new();
     // A parameter entry with no fail values remains structurally `(i32) ->
     // i32`, so type-0 indirect calls may enter it. Only a nonzero parameter
     // entry is incompatible with published LABEL targets.
@@ -948,12 +952,16 @@ fn stamp_and_publish_label_targets(
             if id == 0 {
                 continue;
             }
+            let Some(descr) = label_refs[j].clone() else {
+                continue;
+            };
             if suppress_publication {
                 diag_bump(47);
             } else {
                 diag_bump(19);
                 publish_label_target(
-                    id,
+                    resources,
+                    &descr,
                     LabelTarget {
                         func_handle,
                         wide_slot,
@@ -966,7 +974,7 @@ fn stamp_and_publish_label_targets(
                         owner_token,
                     },
                 );
-                published_descrs.push(id);
+                published_descrs.push(descr);
             }
         }
     } else {
@@ -992,10 +1000,13 @@ fn stamp_and_publish_label_targets(
         if publishable && suppress_publication {
             diag_bump(47);
         } else if publishable {
-            let id = label_descrs[0];
+            let descr = label_refs[0]
+                .clone()
+                .expect("publishable label has a descr");
             diag_bump(20);
             publish_label_target(
-                id,
+                resources,
+                &descr,
                 LabelTarget {
                     func_handle,
                     wide_slot,
@@ -1011,7 +1022,7 @@ fn stamp_and_publish_label_targets(
                     owner_token,
                 },
             );
-            published_descrs.push(id);
+            published_descrs.push(descr);
         }
     }
 
@@ -3953,8 +3964,8 @@ impl WasmBackend {
                     diag_bump(32);
                 }
                 // The guard cell stays zero so the inlined region is not
-                // also dispatched. Keep LABEL_TARGETS rows: inbound JUMPs
-                // still enter the old module.
+                // also dispatched. Leave the label descr's target in place:
+                // inbound JUMPs still enter the old module.
                 return (leftover, false);
             }
             Err(error) => {
@@ -4226,7 +4237,6 @@ impl WasmBackend {
             asm_resources.table_slots.push(install_handle);
         }
         publish_exit_slots(&mut asm_resources, &guard_exits, &descrs);
-        asm_resources.label_owner = token.number;
         // Keep still-standalone bridge descriptors after the rebuilt merged
         // prefix. Adding regions grows that prefix, so every old positional
         // range moves by exactly the difference in guard-cell counts.
@@ -4274,7 +4284,8 @@ impl WasmBackend {
 
         // LABEL targets bake only the stable table slot, so restamp them for
         // this build. CA dispatch additionally carries the new finish index.
-        let (_, published_labels) = stamp_and_publish_label_targets(
+        let (_, _published_labels) = stamp_and_publish_label_targets(
+            &mut asm_resources,
             install_handle,
             compiled.frame,
             &inputs.inputargs,
@@ -4282,7 +4293,6 @@ impl WasmBackend {
             inputs.bridge_entry_arity,
             token.number,
         );
-        asm_resources.label_ids = published_labels;
         release::push_resources(token, asm_resources);
         if let Some(mut target) = target_from_token(token) {
             target.func_handle = install_handle;
@@ -4376,14 +4386,14 @@ fn has_cross_loop_terminal_jump(ops: &[Op]) -> bool {
     has_jump && codegen::find_loop_label_index(ops).is_none()
 }
 
-/// Resolve the re-entry target of a cross-loop terminal JUMP BY DESCR IDENTITY
-/// through the `LABEL_TARGETS` registry — the JUMP and its target LABEL share
-/// the loop-target descr Arc, and every compiled loop published its enterable
-/// labels there. The stamped `label_block_id` ordinal is NOT identity: a
-/// retraced loop has several sibling specializations whose start labels all
-/// carry ordinal 0, and a trace legitimately closes into a SIBLING
-/// (jump-to-existing-trace) — the registry resolves the owning module's table
-/// slot and resume key, so the tail call chains into the RIGHT loop.
+/// Resolve the re-entry target of a cross-loop terminal JUMP off the descr
+/// the JUMP holds (`LoopTargetDescr::ll_loop_code`). The JUMP and its
+/// target LABEL share that descr, and every compiled loop published its
+/// enterable labels there. The stamped `label_block_id` ordinal is NOT
+/// identity: a retraced loop has several sibling specializations whose start
+/// labels all carry ordinal 0, and a trace legitimately closes into a SIBLING
+/// (jump-to-existing-trace) — the descr names the owning module's table slot
+/// and resume key, so the tail call chains into the RIGHT loop.
 ///
 /// Decline (`None`, after tallying which question answered) when the target is
 /// unpublished (descr stripped, or its loop declined/was dropped), the JUMP
@@ -4409,17 +4419,14 @@ fn resolve_cross_loop_jump_target(
         .iter()
         .rev()
         .find(|op| op.opcode == majit_ir::OpCode::Jump);
-    let target_descr_id = closing_jump
-        .and_then(|j| j.getdescr())
-        .map(|d| std::sync::Arc::as_ptr(&d) as *const () as usize)
-        .filter(|id| *id != 0);
-    let target = target_descr_id.and_then(label_target);
+    let target_descr = closing_jump.and_then(|j| j.getdescr());
+    let target = target_descr.as_ref().and_then(label_target);
     let arity = closing_jump.map_or(0, |j| j.getarglist().len());
     match target {
         // Descr stripped, or the target label was never published.
         None => {
             diag_bump(8);
-            diag_bump(if target_descr_id.is_none() { 17 } else { 18 });
+            diag_bump(if target_descr.is_none() { 17 } else { 18 });
             None
         }
         Some(t) if arity != t.num_args => {
@@ -5338,14 +5345,18 @@ impl majit_backend::Backend for WasmBackend {
         // the last LABEL. Computed through the same predicate codegen's wrapper
         // gates on, so the recorded field and the emitted wrapper cannot drift.
         let has_preamble = codegen::is_resumable_peeled(ops);
-        let (label_descrs, published_labels) =
-            stamp_and_publish_label_targets(func_handle, frame, inputargs, ops, None, token.number);
+        let (label_descrs, published_labels) = stamp_and_publish_label_targets(
+            &mut asm_resources,
+            func_handle,
+            frame,
+            inputargs,
+            ops,
+            None,
+            token.number,
+        );
         if func_handle != 0 {
             asm_resources.table_slots.push(func_handle);
         }
-        asm_resources.label_ids = published_labels;
-        asm_resources.label_handle = func_handle;
-        asm_resources.label_owner = token.number;
         publish_exit_slots(&mut asm_resources, &guard_exits, &fail_descrs);
         if let Some(cells) = bridge_cells_owner {
             asm_resources.bridge_cells.push(cells);
@@ -5382,6 +5393,7 @@ impl majit_backend::Backend for WasmBackend {
             num_guard_cells: std::cell::Cell::new(guard_exits.len()),
             has_preamble,
             label_descrs,
+            published_label_descrs: published_labels,
             guard_fail_arg_advanced,
             guard_fail_arg_counts: guard_exits
                 .iter()
@@ -6367,6 +6379,7 @@ impl majit_backend::Backend for WasmBackend {
         // existing `first_label_at_entry` / arity guard correctly leaves that
         // label unpublished, because key 0 would re-run the work before it.
         let (_, published_label_descrs) = stamp_and_publish_label_targets(
+            &mut asm_resources,
             bridge_slot,
             source_frame,
             inputargs,
@@ -6377,9 +6390,6 @@ impl majit_backend::Backend for WasmBackend {
         if bridge_slot != 0 {
             asm_resources.table_slots.push(bridge_slot);
         }
-        asm_resources.label_ids = published_label_descrs.clone();
-        asm_resources.label_handle = bridge_slot;
-        asm_resources.label_owner = original_token.number;
         if let Some(cells) = bridge_cells_owner {
             asm_resources.bridge_cells.push(cells);
         }
@@ -6414,7 +6424,7 @@ impl majit_backend::Backend for WasmBackend {
             source_loop.bridge_owned_label_targets.borrow_mut().extend(
                 published_label_descrs
                     .into_iter()
-                    .map(|descr_id| (descr_id, bridge_slot)),
+                    .map(|descr| (descr, bridge_slot)),
             );
             if let Some(targets) = ca_targets.as_ref().filter(|_| allow_ca) {
                 // Freeze this recursion to the CA mechanism: no further bridge
@@ -6984,7 +6994,7 @@ mod tests {
         let mut backend = WasmBackend::new();
         let token = JitCellToken::new(9_910_001);
         let label = majit_ir::make_loop_target_descr(70, false);
-        let label_id = std::sync::Arc::as_ptr(&label) as *const () as usize;
+        let label_kept = label.clone();
         let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let label_op = OpRc::new(majit_ir::Op::new(
             majit_ir::OpCode::Label,
@@ -7027,7 +7037,7 @@ mod tests {
             .compile_loop(&inputargs, &ops, &token)
             .expect("loop compiles");
         assert!(target_from_token(&token).is_some());
-        assert!(failguard::label_target(label_id).is_some());
+        assert!(failguard::label_target(&label_kept).is_some());
         let fail = FreeFailDescr {
             fail_index: 0,
             arg_types: vec![majit_ir::Type::Int, majit_ir::Type::Int],
@@ -7072,7 +7082,7 @@ mod tests {
 
         backend.free_loop(&token);
         assert!(token.ll_function_addr() == 0 || target_from_token(&token).is_none());
-        assert!(failguard::label_target(label_id).is_none());
+        assert!(failguard::label_target(&label_kept).is_none());
         assert!(
             token
                 .compiled_loop_token_expect()
@@ -7112,7 +7122,7 @@ mod tests {
         backend
             .compile_loop(&inputargs, &[label_op, advance, jump], &token2)
             .expect("second loop compiles");
-        assert!(failguard::label_target(label_id).is_none());
+        assert!(failguard::label_target(&label_kept).is_none());
         assert!(
             token2
                 .compiled_loop_token_expect()
@@ -7126,6 +7136,130 @@ mod tests {
                 }),
             "second compile owns a fresh gcmap"
         );
+    }
+
+    /// A closing JUMP names the label descr of a loop compiled earlier.
+    /// Freeing an unrelated loop must leave that descr's target in place
+    /// (`assembler.py` `closing_jump` reads `TargetToken._ll_loop_code`
+    /// off the JUMP, not a process-global table).
+    #[test]
+    fn closing_jump_resolves_after_unrelated_loop_is_freed() {
+        let _compile_guard = failguard::lock_cpu();
+        let mut backend = WasmBackend::new();
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let token = JitCellToken::new(9_910_101);
+        let label = majit_ir::make_loop_target_descr(80, false);
+        let label_op = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Label,
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        label_op.setdescr(label.clone());
+        let advance = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::IntAdd,
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::const_int(1)),
+            ],
+        ));
+        advance.pos().set(majit_ir::OpRef::int_op(2));
+        let guard = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::GuardTrue,
+            &[rb(majit_ir::OpRef::int_op(2))],
+        ));
+        guard.setfailargs(
+            vec![
+                rb(majit_ir::OpRef::int_op(2)),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ]
+            .into(),
+        );
+        guard.set_fail_arg_types(vec![majit_ir::Type::Int, majit_ir::Type::Int]);
+        let jump = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Jump,
+            &[
+                majit_ir::operand::Operand::from_bound_op(&advance),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        jump.setdescr(label.clone());
+        backend
+            .compile_loop(&inputargs, &[label_op, advance, guard, jump], &token)
+            .expect("first loop compiles");
+        let published = failguard::label_target(&label).expect("label published on its descr");
+
+        let other = JitCellToken::new(9_910_102);
+        let other_label = majit_ir::make_loop_target_descr(81, false);
+        let other_label_op = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Label,
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        other_label_op.setdescr(other_label.clone());
+        let other_advance = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::IntAdd,
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::const_int(1)),
+            ],
+        ));
+        other_advance.pos().set(majit_ir::OpRef::int_op(2));
+        let other_jump = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Jump,
+            &[
+                majit_ir::operand::Operand::from_bound_op(&other_advance),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        other_jump.setdescr(other_label.clone());
+        backend
+            .compile_loop(
+                &inputargs,
+                &[other_label_op, other_advance, other_jump],
+                &other,
+            )
+            .expect("unrelated loop compiles");
+        backend.free_loop(&other);
+        assert!(failguard::label_target(&other_label).is_none());
+        let still = failguard::label_target(&label).expect("earlier label survives");
+        assert_eq!(still.func_handle, published.func_handle);
+        assert_eq!(still.key, published.key);
+
+        let fail = FreeFailDescr {
+            fail_index: 0,
+            arg_types: vec![majit_ir::Type::Int, majit_ir::Type::Int],
+        };
+        let bridge_advance = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::IntAdd,
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::const_int(1)),
+            ],
+        ));
+        bridge_advance.pos().set(majit_ir::OpRef::int_op(3));
+        let bridge_jump = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Jump,
+            &[
+                majit_ir::operand::Operand::from_bound_op(&bridge_advance),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        bridge_jump.setdescr(label.clone());
+        backend
+            .compile_bridge(
+                &fail,
+                &inputargs,
+                &[bridge_advance, bridge_jump],
+                &token,
+                &[],
+                None,
+            )
+            .expect("closing JUMP still resolves the earlier label");
+        assert!(failguard::label_target(&label).is_some());
     }
 
     #[derive(Debug)]
