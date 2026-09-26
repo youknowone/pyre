@@ -1202,14 +1202,13 @@ pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
 
 /// The GC types this module owns, in `build_gc` registration order.
 pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
-    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
     use pyre_object::lltype::PyreClassPyTypeOf;
     // `lib_pypy/_overlapped.py Overlapped`: the object owns its native
     // OVERLAPPED record and pending buffers until cancellation/completion.
     // Its three Python fields are ordinary generated trace offsets; sweep
     // performs PyPy's cancel/wait-before-free ordering and closes hEvent.
     types.push(ModuleGcType {
-        anchor: ModuleGcAnchor::AfterScandirIterator,
         descriptor: <W_Overlapped as PyreClassPyTypeOf>::DESCRIPTOR,
         layout: ModuleGcLayout::PyreClass {
             memory_pressure_offset: None,

@@ -1,6 +1,6 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=<module>,entry-bridge:forward
-# The module loop inlines `forward`, whose Fraction division is a forcing call.
+# The module loop inlines `forward`, whose Ratio division is a forcing call.
 # The following LOAD_DEREF must recover `adjust` from the inlined callee's own
 # frame shadow after that call invalidates heap-cache facts.  Losing the callee
 # frame makes the walk abort or resume with the wrong closure cell.
@@ -11,7 +11,46 @@
 # division still forces -- the run emits more `ForceToken` than it did, not
 # fewer -- and `forward`, the callee this guard is actually about, compiles on
 # both sides of the change.
-from fractions import Fraction
+#
+# `Ratio` keeps the shape of `fractions.Fraction` this needs -- `__truediv__`
+# built by `_operator_fallbacks` around a monomorphic `_div`, a normalizing
+# `__new__`, and the int comparison -- without importing `fractions`, which
+# pulls in `math`.
+
+
+def _gcd(a, b):
+    while b:
+        a, b = b, a % b
+    return a
+
+
+class Ratio:
+    __slots__ = ("_numerator", "_denominator")
+
+    def __new__(cls, numerator, denominator):
+        g = _gcd(numerator, denominator)
+        if denominator < 0:
+            g = -g
+        self = object.__new__(cls)
+        self._numerator = numerator // g
+        self._denominator = denominator // g
+        return self
+
+    def _operator_fallbacks(monomorphic_operator):
+        def forward(a, b):
+            if isinstance(b, Ratio):
+                return monomorphic_operator(a, b)
+            return NotImplemented
+
+        return forward
+
+    def _div(a, b):
+        return Ratio(a._numerator * b._denominator, a._denominator * b._numerator)
+
+    __truediv__ = _operator_fallbacks(_div)
+
+    def __gt__(a, b):
+        return a._numerator > b * a._denominator
 
 try:
     import pypyjit
@@ -22,15 +61,15 @@ except ImportError:
 
 
 # Keep object construction outside the measured loop.  The regression needs
-# one forcing Fraction division followed by LOAD_DEREF of `adjust`; rebuilding
-# three invariant Fractions per iteration only measures constructor overhead
+# one forcing Ratio division followed by LOAD_DEREF of `adjust`; rebuilding
+# three invariant Ratios per iteration only measures constructor overhead
 # and does not add another resume shape.
-DIVISOR = Fraction(2, 89)
-INPUTS = tuple(Fraction(i + 1, 97) for i in range(97))
+DIVISOR = Ratio(2, 89)
+INPUTS = tuple(Ratio(i + 1, 97) for i in range(97))
 
 
 # Low thresholds make both required compilation arms deterministic; additional
-# iterations only repeat Fraction allocation and no longer strengthen the test.
+# iterations only repeat Ratio allocation and no longer strengthen the test.
 N = 6000
 
 

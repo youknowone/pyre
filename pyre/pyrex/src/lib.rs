@@ -894,8 +894,9 @@ fn real_main(binary_name: &str) {
         std::process::exit(2);
     }
 
-    // Optional-module rclass aliases must be installed before the collector
-    // is built: `init_jit_hooks` / `build_gc` snapshots the alias census.
+    // The module hooks must be installed before the collector is built:
+    // `init_jit_hooks` / `build_gc` numbers their GC classes.
+    #[cfg(feature = "pyre-module")]
     pyre_module::register();
 
     if !is_interact {

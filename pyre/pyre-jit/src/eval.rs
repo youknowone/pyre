@@ -31,7 +31,7 @@ use majit_metainterp::blackhole::ExceptionState;
 use majit_metainterp::jit_env::{env_var, env_var_os};
 use majit_metainterp::warmstate::FunctionEntryStep;
 use majit_metainterp::{CompiledExitLayout, DetailedDriverRunOutcome, JitState};
-use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout};
+use pyre_interpreter::importing::ModuleGcLayout;
 
 /// Host tracer registered with majit-gc so `walk_jf_roots` can reach
 /// the interior Ref slots of our libc-allocated jitframes. The
@@ -1970,53 +1970,55 @@ fn build_gc() -> Box<MiniMarkGC> {
          descr: &'static pyre_object::lltype::PyreClassDescriptor|
          -> u32 { register_pyre_class_with_pressure(gc, pytype_to_tid, descr, None) };
     // The GC types `pyre-module` owns, each declaring its own layout and sweep
-    // destructor; `build_gc` only fixes where in the id order they register.
-    // Missing hooks would shift every later type id away from the ids
-    // `SUBCLASS_RANGE_HIERARCHY` hardcodes, so fail here instead.
-    let module_hooks = pyre_interpreter::importing::optional_module_hooks()
-        .expect("pyre_module::register must run before the collector is built");
-    let module_gc_types = (module_hooks.gc_types)();
-    let module_immortal_w_class_only_descriptors =
-        (module_hooks.immortal_w_class_only_descriptors)();
-    let register_module_gc_types = |gc: &mut MiniMarkGC,
-                                    pytype_to_tid: &mut HashMap<usize, u32>,
-                                    anchor: ModuleGcAnchor| {
-        for ty in module_gc_types.iter().filter(|ty| ty.anchor == anchor) {
-            let descr = ty.descriptor;
-            let type_info = match ty.layout {
-                ModuleGcLayout::PyreClass {
-                    memory_pressure_offset,
-                } => {
-                    let tid = register_pyre_class_with_pressure(
-                        gc,
-                        pytype_to_tid,
-                        descr,
+    // destructor. They register after every interpreter class, so an
+    // interpreter without the module hooks keeps the same ids for its own.
+    let module_hooks = pyre_interpreter::importing::optional_module_hooks();
+    let module_gc_types = pyre_interpreter::module_gc_types();
+    let module_immortal_w_class_only_descriptors = module_hooks
+        .map(|hooks| (hooks.immortal_w_class_only_descriptors)())
+        .unwrap_or_default();
+    let register_module_gc_types =
+        |gc: &mut MiniMarkGC, pytype_to_tid: &mut HashMap<usize, u32>| {
+            for ty in &module_gc_types {
+                let descr = ty.descriptor;
+                let type_info = match ty.layout {
+                    ModuleGcLayout::PyreClass {
                         memory_pressure_offset,
-                    );
-                    if let Some(destructor) = ty.destructor {
-                        gc.types.set_destructor(tid, destructor);
+                    } => {
+                        let tid = register_pyre_class_with_pressure(
+                            gc,
+                            pytype_to_tid,
+                            descr,
+                            memory_pressure_offset,
+                        );
+                        if let Some(destructor) = ty.destructor {
+                            gc.types.set_destructor(tid, destructor);
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                ModuleGcLayout::Object => TypeInfo::object_subclass(descr.object_size, object_tid),
-                ModuleGcLayout::CustomTrace(trace) => TypeInfo::object_subclass_with_custom_trace(
-                    descr.object_size,
-                    object_tid,
-                    trace,
-                ),
-            };
-            let type_info = match ty.destructor {
-                Some(destructor) => type_info.with_destructor_fn(destructor),
-                None => type_info,
-            };
-            let tid = gc.register_type(type_info);
-            descr.gc_type_id.set(tid);
-            let pytype_ptr = descr.pytype_ptr as usize;
-            majit_gc::GcAllocator::register_vtable_for_type(gc, pytype_ptr, tid);
-            pytype_to_tid.insert(pytype_ptr, tid);
-            pyre_object::gc_hook::register_pyre_class_offsets(pytype_ptr, descr.ptr_offsets);
-        }
-    };
+                    ModuleGcLayout::Object => {
+                        TypeInfo::object_subclass(descr.object_size, object_tid)
+                    }
+                    ModuleGcLayout::CustomTrace(trace) => {
+                        TypeInfo::object_subclass_with_custom_trace(
+                            descr.object_size,
+                            object_tid,
+                            trace,
+                        )
+                    }
+                };
+                let type_info = match ty.destructor {
+                    Some(destructor) => type_info.with_destructor_fn(destructor),
+                    None => type_info,
+                };
+                let tid = gc.register_type(type_info);
+                descr.gc_type_id.set(tid);
+                let pytype_ptr = descr.pytype_ptr as usize;
+                majit_gc::GcAllocator::register_vtable_for_type(gc, pytype_ptr, tid);
+                pytype_to_tid.insert(pytype_ptr, tid);
+                pyre_object::gc_hook::register_pyre_class_offsets(pytype_ptr, descr.ptr_offsets);
+            }
+        };
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
         &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
@@ -2422,7 +2424,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     debug_assert_eq!(w_exception_tid, W_BASE_EXCEPTION_GC_TYPE_ID);
     // Pre-register fieldless ExcKind PyTypes to the slim tid.  Extra-field
     // kinds are wired to the extended tid after that TypeInfo is
-    // registered (id 188).  The `all_foreign_pytypes` loop below skips
+    // registered.  The `all_foreign_pytypes` loop below skips
     // entries already in `pytype_to_tid`.
     for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::EOFError as u8) {
         // Round-trip the byte through the enum so we don't depend
@@ -3674,12 +3676,6 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_collections::W_DequeRevIter
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // `_tokenize`'s iterator owns Rust heap its sweep destructor frees.
-    register_module_gc_types(
-        &mut gc,
-        &mut pytype_to_tid,
-        ModuleGcAnchor::AfterDequeRevIter,
-    );
     // Python 3.14 FrameLocalsProxy — its sole managed edge owns the live
     // PyFrame whose fast locals it exposes.  Keep the proxy in the ordinary
     // AUTO-ID class chain so the generated offset walker forwards that frame
@@ -3866,13 +3862,6 @@ fn build_gc() -> Box<MiniMarkGC> {
             descriptor.ptr_offsets,
         );
     }
-    // `_functools.keyobject` and `unicodedata.UCD`, appended so no
-    // established AUTO-ID moves.
-    register_module_gc_types(
-        &mut gc,
-        &mut pytype_to_tid,
-        ModuleGcAnchor::AfterWClassOnlyTypes,
-    );
     // `__pypy__.Bufferable`: an `allocate_stable` type with no inline object
     // payload, so the header `w_class` is the only edge its marker forwards.
     register_pyre_class(
@@ -3913,8 +3902,6 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_io::W_StringIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // `_json`'s scanner and encoder, then `_hashlib`'s native-state owners.
-    register_module_gc_types(&mut gc, &mut pytype_to_tid, ModuleGcAnchor::AfterStringIO);
     // `pypy/module/gc/referents.py W_GcRef`: the wrapper's raw gcref
     // field is a normal traced edge so an internal object stays live and is
     // forwarded in place.  Register it before the target-gated DirEntry slot;
@@ -3943,10 +3930,6 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::gc::stats::W_GcStats
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // The unconditional native owners of `zlib`, `_bz2`, `_lzma`, `_lsprof`
-    // and `_queue`, ahead of the target-gated tail so their ids agree on
-    // wasm and native.
-    register_module_gc_types(&mut gc, &mut pytype_to_tid, ModuleGcAnchor::AfterGcStats);
 
     // `_PyLineIterator` / `_PyPositionsIterator` / `_PyBranchesIterator` —
     // each holds the code object its suspended walk reads.  All three are
@@ -3964,7 +3947,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     }
 
     // The two `step == 1` iterator shapes.  Their ids are explicit
-    // (`type_id = 183` / `184`) because their descr groups bake them at
+    // (`type_id = 165` / `166`) because their descr groups bake them at
     // compile time to guard and virtualize a FOR_ITER, and an explicit id only
     // holds where registration order does: they are unconditional, so they
     // close the ungated block here, ahead of the target-gated tail whose ids
@@ -4038,13 +4021,6 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::posix::W_ScandirIterator
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // The target-gated module owners: `_ssl`, `mmap`, and the two Windows
-    // `Overlapped` records.
-    register_module_gc_types(
-        &mut gc,
-        &mut pytype_to_tid,
-        ModuleGcAnchor::AfterScandirIterator,
-    );
 
     // `_io._WindowsConsoleIO` is a PEP 528 raw stream: its own fields are the
     // descriptor, the three mode flags and the carry buffer, but the type
@@ -4062,13 +4038,14 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_io::W_WindowsConsoleIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // `_cffi_backend`'s object types, at the end of the rclass census where
-    // the sandbox hierarchy filter can remove one contiguous trailing slice.
-    register_module_gc_types(
-        &mut gc,
-        &mut pytype_to_tid,
-        ModuleGcAnchor::AfterWindowsConsoleIO,
+    // The classes `pyre-module` registers close the rclass census, numbered
+    // from `MODULE_FIRST_TYPE_ID` in the order its hooks list them.
+    assert_eq!(
+        gc.types.len() as u32,
+        pyre_interpreter::MODULE_FIRST_TYPE_ID,
+        "interpreter classes must end where the module classes begin"
     );
+    register_module_gc_types(&mut gc, &mut pytype_to_tid);
     // `rrandom.Random` — the Mersenne Twister `interp_random.py` allocates
     // beside its holder. Like W_DequeBlock it is GC-managed without being an
     // rclass.OBJECT subclass and has no Python-visible vtable, so it takes a
