@@ -17,6 +17,7 @@ def parse(s):
     start = 0
     while s.find(";", start) == start:
         start += 1
+        assert s.rfind(";", start - 1, start) == start - 1
         end = s.find(";", start)
         ind, diff = start, 0
         while end > 0:
