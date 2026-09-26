@@ -4089,15 +4089,23 @@ where
     };
     let lhs_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let rhs_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
-    // `is` / `is_not` stay residual.  Walking `compare_value_from_tag` →
-    // `is_w` records `GuardSubclass` against an unbound type constant
-    // (classptr 0) on the value-comparing arms (`int`/`float`/`str`/…),
-    // and the assembler panics looking up that range.  The residual fold
-    // (`try_walker_fold_is_op`) already emits `ptr_eq` for pointer-identity
-    // classes and declines the value-comparing ones — which is the shape
-    // `is_op_identity` pins.  Other COMPARE tags stay residual so
-    // `CompareOpDescent` and `finishframe_exception` own the portal-frame
-    // raise.
+    // `is` / `is_not` are `pyopcode.py IS_OP`: an `inline_call_ir_r` of
+    // `runtime_ops::is_op`, whose `space.is_w` the walk traces, when this
+    // build carries that body fully bound.  Other COMPARE tags stay
+    // residual so `CompareOpDescent` and `finishframe_exception` own the
+    // portal-frame raise.
+    if pyre_interpreter::runtime_ops::compare_op_tag_is_identity(op_val)
+        && let Some(insn) = build_orthodox_inline_call_ir_r(
+            inline_call_targets::IS_OP,
+            vec![Operand::ConstInt(
+                (op_val == pyre_interpreter::runtime_ops::COMPARE_OP_IS_NOT) as i64,
+            )],
+            vec![lhs_operand.clone(), rhs_operand.clone()],
+            result_reg,
+        )
+    {
+        return Some(insn);
+    }
     Some(build_residual_call_ir_r_insn_from_operands(
         ctx.compare_op_fn_idx,
         op_val,
@@ -6488,6 +6496,8 @@ mod inline_call_targets {
     pub const POS: &str = "pyre_interpreter::objspace::descroperation::pos";
     /// UNARY_NOT — `lower_unary_not_hlop_to_insn`.
     pub const NOT: &str = "pyre_interpreter::baseobjspace::not_";
+    /// IS_OP — `lower_compare_op_hlop_to_insn`.
+    pub const IS_OP: &str = "pyre_interpreter::runtime_ops::is_op";
 }
 
 /// The body of a fixed callee path whose host addresses this build has fully
@@ -10133,21 +10143,18 @@ mod tests {
 
         match insn {
             Insn::Op { opname, args, .. } => {
-                assert!(
-                    opname == "inline_call_ir_r" || opname == "residual_call_ir_r",
-                    "unexpected compare lowering {opname}"
-                );
-                let tag_list = &args[1];
-                match tag_list {
+                // The inline call of `runtime_ops::is_op` carries the invert
+                // flag (0 for `is`); the residual `compare_op` carries the tag.
+                let expected = match opname.as_str() {
+                    "inline_call_ir_r" => 0,
+                    "residual_call_ir_r" => pyre_interpreter::runtime_ops::COMPARE_OP_IS,
+                    other => panic!("unexpected compare lowering {other}"),
+                };
+                let int_list = &args[1];
+                match int_list {
                     Operand::ListOfKind(list) => match &list.content[0] {
-                        Operand::ConstInt(v) => {
-                            assert_eq!(
-                                *v,
-                                pyre_interpreter::runtime_ops::COMPARE_OP_IS,
-                                "is → COMPARE_OP_IS"
-                            )
-                        }
-                        other => panic!("expected ConstInt(8) in ListI, got {other:?}"),
+                        Operand::ConstInt(v) => assert_eq!(*v, expected, "{opname} int arg"),
+                        other => panic!("expected ConstInt in ListI, got {other:?}"),
                     },
                     other => panic!("expected ListOfKind(Int, 1), got {other:?}"),
                 }

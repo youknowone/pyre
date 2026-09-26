@@ -599,6 +599,17 @@ pub fn compare_op_tag_is_identity(tag: i64) -> bool {
     tag == COMPARE_OP_IS || tag == COMPARE_OP_IS_NOT
 }
 
+/// `pyopcode.py IS_OP`: `space.is_w(w_1, w_2)`, inverted when `invert`
+/// is non-zero, returned as `space.w_True` / `space.w_False`.
+///
+/// IS_OP lowers to an `inline_call` of this body, so the JIT traces
+/// `is_w`'s per-type identity rather than a may-force residual.
+#[inline(never)]
+pub fn is_op(w_1: PyObjectRef, w_2: PyObjectRef, invert: i64) -> PyObjectRef {
+    let res = crate::baseobjspace::is_w(w_1, w_2);
+    pyre_object::w_bool_from(if invert != 0 { !res } else { res })
+}
+
 pub fn compare_op_tag_is_contains(tag: i64) -> bool {
     tag == COMPARE_OP_CONTAINS || tag == COMPARE_OP_NOT_CONTAINS
 }

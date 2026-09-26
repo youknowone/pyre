@@ -1212,6 +1212,11 @@ pub extern "C" fn jit_descroperation_pos(value: i64) -> i64 {
 }
 
 #[inline(never)]
+pub extern "C" fn jit_runtime_ops_is_op(w_1: i64, w_2: i64, invert: i64) -> i64 {
+    crate::runtime_ops::is_op(w_1 as PyObjectRef, w_2 as PyObjectRef, invert) as i64
+}
+
+#[inline(never)]
 pub extern "C" fn jit_baseobjspace_not_(value: i64) -> i64 {
     let _roots = pyre_object::gc_roots::push_roots();
     let value = pyre_object::gc_roots::pin_root(value as PyObjectRef);

@@ -4846,15 +4846,11 @@ impl OpcodeStepExecutor for PyFrame {
     fn is_op(&mut self, invert: crate::bytecode::Invert) -> Result<(), PyError> {
         let b = self.pop();
         let a = self.pop();
-        // `COMPARE_OP 'is'` → `space.is_w` (descroperation.py): plain
-        // `int`s are identical by value (`W_IntObject.is_w`), everything
-        // else by pointer.
-        let same = crate::baseobjspace::is_w(a, b);
-        let result = match invert {
-            crate::bytecode::Invert::No => same,
-            crate::bytecode::Invert::Yes => !same,
+        let invert = match invert {
+            crate::bytecode::Invert::No => 0,
+            crate::bytecode::Invert::Yes => 1,
         };
-        self.push(pyre_object::w_bool_from(result));
+        self.push(crate::runtime_ops::is_op(a, b, invert));
         Ok(())
     }
 

@@ -1411,6 +1411,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::opcode_ops::compare_value_from_tag",
         crate::opcode_ops::jit_compare_value_from_tag,
     );
+    cp3(
+        &mut entries,
+        "pyre_interpreter::runtime_ops::is_op",
+        crate::opcode_ops::jit_runtime_ops_is_op,
+    );
     cp1(
         &mut entries,
         "pyre_interpreter::baseobjspace::len",
@@ -5861,6 +5866,10 @@ mod tests {
             (
                 "pyre_interpreter::opcode_ops::compare_value_from_tag",
                 crate::opcode_ops::jit_compare_value_from_tag as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::runtime_ops::is_op",
+                crate::opcode_ops::jit_runtime_ops_is_op as *const () as usize as i64,
             ),
         ] {
             assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
