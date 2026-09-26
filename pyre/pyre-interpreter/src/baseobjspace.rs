@@ -8301,13 +8301,6 @@ pub(crate) fn exception_descr_getargs(obj: PyObjectRef) -> PyResult {
     Ok(unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) })
 }
 
-/// `interp_exceptions.py W_BaseException.descr_setargs`.
-pub(crate) fn exception_descr_setargs(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
-    let coerced = unsafe { coerce_to_list_for_args(value)? };
-    unsafe { pyre_object::interp_exceptions::w_exception_set_args(obj, coerced) };
-    Ok(w_none())
-}
-
 /// `interp_exceptions.py descr_delargs` / `descr_delcause` /
 /// `descr_delcontext` / `descr_deltraceback` — the name may not be deleted.
 pub(crate) fn exception_descr_del_refused(name: &str) -> PyResult {
@@ -8320,42 +8313,10 @@ pub(crate) fn exception_descr_getcause(obj: PyObjectRef) -> PyResult {
     Ok(if stored.is_null() { w_none() } else { stored })
 }
 
-/// `interp_exceptions.py descr_setcause`.  `None` or a `BaseException`,
-/// and the store always sets `suppress_context`.
-pub(crate) fn exception_descr_setcause(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
-    if !unsafe { pyre_object::is_none(value) } {
-        let value_type = crate::typedef::r#type(value).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-        if value_type.is_null() || !unsafe { exception_is_valid_class_w(value_type) } {
-            return Err(PyError::type_error(
-                "exception cause must be None or derive from BaseException",
-            ));
-        }
-    }
-    unsafe {
-        pyre_object::interp_exceptions::w_exception_set_cause(obj, value);
-        pyre_object::interp_exceptions::w_exception_set_suppress_context(obj, true);
-    };
-    Ok(w_none())
-}
-
 /// `interp_exceptions.py descr_getcontext`.
 pub(crate) fn exception_descr_getcontext(obj: PyObjectRef) -> PyResult {
     let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_context(obj) };
     Ok(if stored.is_null() { w_none() } else { stored })
-}
-
-/// `interp_exceptions.py descr_setcontext`.
-pub(crate) fn exception_descr_setcontext(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
-    if !unsafe { pyre_object::is_none(value) } {
-        let value_type = crate::typedef::r#type(value).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-        if value_type.is_null() || !unsafe { exception_is_valid_class_w(value_type) } {
-            return Err(PyError::type_error(
-                "exception context must be None or derive from BaseException",
-            ));
-        }
-    }
-    unsafe { pyre_object::interp_exceptions::w_exception_set_context(obj, value) };
-    Ok(w_none())
 }
 
 /// `interp_exceptions.py W_BaseException.descr_gettraceback`.  The traceback
@@ -8400,20 +8361,6 @@ pub(crate) fn exception_descr_get_written(obj: PyObjectRef) -> PyResult {
     Ok(pyre_object::PY_NULL)
 }
 
-/// `interp_exceptions.py W_OSError.descr_set_written`.  `Ok(PY_NULL)` when
-/// the receiver is not an `OSError`.
-pub(crate) fn exception_descr_set_written(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
-    let Some(os_error) = crate::builtins::lookup_exc_class("OSError") else {
-        return Ok(pyre_object::PY_NULL);
-    };
-    if unsafe { isinstance_w(obj, os_error) } {
-        let written = int_w(value)?;
-        unsafe { pyre_object::interp_exceptions::w_exception_set_written(obj, written) };
-        return Ok(w_none());
-    }
-    Ok(pyre_object::PY_NULL)
-}
-
 /// `interp_exceptions.py W_OSError.descr_del_written`.
 pub(crate) fn exception_descr_del_written(obj: PyObjectRef) -> PyResult {
     let Some(os_error) = crate::builtins::lookup_exc_class("OSError") else {
@@ -8447,17 +8394,6 @@ pub(crate) fn exception_descr_get_group(obj: PyObjectRef, name: &str) -> PyResul
         if !value.is_null() {
             return Ok(value);
         }
-    }
-    Ok(pyre_object::PY_NULL)
-}
-
-/// Group `message` / `exceptions` are read-only `interp_attrproperty_w` slots.
-/// `Ok(PY_NULL)` when the receiver is not a `BaseExceptionGroup`.
-pub(crate) fn exception_descr_set_group(obj: PyObjectRef) -> PyResult {
-    if crate::builtins::lookup_exc_class("BaseExceptionGroup")
-        .is_some_and(|base_group| isinstance(obj, base_group).unwrap_or(false))
-    {
-        return Err(PyError::attribute_error("readonly attribute"));
     }
     Ok(pyre_object::PY_NULL)
 }
@@ -13829,12 +13765,22 @@ pub fn readonly_descr_attr_raise_is_stable(obj: PyObjectRef, name: &str) -> Opti
 /// path.  `PY_NULL` means the name is not one this exception kind
 /// declares, so the caller falls back to the instance dict.
 pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
-    if matches!(name, "message" | "exceptions") {
-        return exception_descr_set_group(obj);
+    if matches!(name, "message" | "exceptions")
+        && crate::builtins::lookup_exc_class("BaseExceptionGroup")
+            .is_some_and(|base_group| isinstance(obj, base_group).unwrap_or(false))
+    {
+        return Err(PyError::attribute_error("readonly attribute"));
     }
-    // `interp_exceptions.py` `W_BaseException.descr_setargs`.
+    // `interp_exceptions.py` `W_BaseException.descr_setargs` →
+    //   self.args_w = space.fixedview(w_newargs)
+    // `space.fixedview` materialises any iterable into a list of
+    // wrapped objects; pyre stores `args_w` as a tuple `PyObjectRef`,
+    // so coerce the incoming value into a tuple shape (tuple stays
+    // as-is, list wraps into tuple, anything else iterates).
     if name == "args" {
-        return exception_descr_setargs(obj, value);
+        let coerced = unsafe { coerce_to_list_for_args(value)? };
+        unsafe { pyre_object::interp_exceptions::w_exception_set_args(obj, coerced) };
+        return Ok(w_none());
     }
     // `W_BaseException.typedef` — the four special exception
     // attributes (`__cause__`, `__context__`, `__traceback__`,
@@ -13846,8 +13792,40 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
     // directly — no side store for these four names.
     match name {
         "__dict__" => return exception_descr_set_dict(obj, value),
-        "__cause__" => return exception_descr_setcause(obj, value),
-        "__context__" => return exception_descr_setcontext(obj, value),
+        "__cause__" => {
+            // `interp_exceptions.py descr_setcause` — None
+            // OR an instance whose type derives from `BaseException`,
+            // and always flips `suppress_context` to True.
+            if !unsafe { pyre_object::is_none(value) } {
+                let value_type =
+                    crate::typedef::r#type(value).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+                if value_type.is_null() || !unsafe { exception_is_valid_class_w(value_type) } {
+                    return Err(PyError::type_error(
+                        "exception cause must be None or derive from BaseException",
+                    ));
+                }
+            }
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_cause(obj, value);
+                pyre_object::interp_exceptions::w_exception_set_suppress_context(obj, true);
+            };
+            return Ok(w_none());
+        }
+        "__context__" => {
+            // `interp_exceptions.py descr_setcontext` — None
+            // OR an instance whose type derives from `BaseException`.
+            if !unsafe { pyre_object::is_none(value) } {
+                let value_type =
+                    crate::typedef::r#type(value).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+                if value_type.is_null() || !unsafe { exception_is_valid_class_w(value_type) } {
+                    return Err(PyError::type_error(
+                        "exception context must be None or derive from BaseException",
+                    ));
+                }
+            }
+            unsafe { pyre_object::interp_exceptions::w_exception_set_context(obj, value) };
+            return Ok(w_none());
+        }
         "__traceback__" => return exception_descr_settraceback(obj, value),
         "__suppress_context__" => {
             // `interp_exceptions.py descr_setsuppresscontext`
@@ -13956,8 +13934,16 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
                 return Ok(w_none());
             }
         }
-        // `interp_exceptions.py W_OSError.descr_set_written`.
-        "characters_written" => return exception_descr_set_written(obj, value),
+        "characters_written" => {
+            let Some(os_error) = crate::builtins::lookup_exc_class("OSError") else {
+                return Ok(pyre_object::PY_NULL);
+            };
+            if unsafe { isinstance_w(obj, os_error) } {
+                let written = int_w(value)?;
+                unsafe { pyre_object::interp_exceptions::w_exception_set_written(obj, written) };
+                return Ok(w_none());
+            }
+        }
         // `W_OSError.typedef`: the `winerror` descriptor is
         // installed only where the platform has Windows error codes, so
         // elsewhere the name falls through to the ordinary instance dict.
