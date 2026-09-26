@@ -1369,6 +1369,43 @@ fn an_aggregate_element_index_declines_instead_of_striding_by_one_word() {
     );
 }
 
+/// `v[1]` over a `Vec<char>` reaches the index arm and lowers to an
+/// int-banked `ArrayRead` whose descr strides by the 4-byte `char`. Left
+/// residual, the call returned a `&char` reference and the following `*`
+/// collapsed onto it, so the `match` switched on a Ref and `flatten`
+/// rejected the switch.
+#[test]
+fn a_char_element_indexes_to_an_int_banked_array_read() {
+    use majit_translate::model::ValueType;
+
+    let indexed = slot_read_shape("char_slot_index");
+    assert_eq!(
+        indexed.residual_indexes, 0,
+        "the char element leaves no residual `Index::index` call",
+    );
+    assert_eq!(
+        indexed.array_reads,
+        vec![ValueType::Int],
+        "the char element reads as one ArrayRead in the int bank",
+    );
+    let (array_type_id, _) = indexed.array_descr_keys[0].clone();
+    let callcontrol = majit_translate::codewriter::call::CallControl::new();
+    let descr = callcontrol.arraydescrof_for_type(
+        &ValueType::Int,
+        &array_type_id,
+        majit_ir::value::Type::Int,
+        None,
+    );
+    let array_descr = descr
+        .as_array_descr()
+        .expect("arraydescrof_for_type must answer an ArrayDescr");
+    assert_eq!(
+        array_descr.item_size(),
+        4,
+        "the char descr ({array_type_id:?}) strides by 4 bytes",
+    );
+}
+
 /// The same pair over `Vec<i64>`, an element bank the index arm is already
 /// known to serve. It separates the two ways the sibling test could read: an
 /// aggregate element that failed to lower would differ from this baseline,
