@@ -341,6 +341,7 @@ two-phase-never-a-subject	pyre_interpreter::function::method_class_bound_qualnam
 two-phase-never-a-subject	pyre_interpreter::function::method_wrapper_new
 two-phase-never-a-subject	pyre_interpreter::function::restamped_bound_method_new
 two-phase-never-a-subject	pyre_interpreter::gateway::builtin_code_get_docstring
+two-phase-never-a-subject	pyre_interpreter::gateway::builtin_fixed_arity_fn
 two-phase-never-a-subject	pyre_interpreter::gateway::fsdecode_filename_bytes
 two-phase-never-a-subject	pyre_interpreter::gateway::fsdecode_filename_wtf8
 two-phase-never-a-subject	pyre_interpreter::gateway::fsencode_bytes_w
@@ -1889,4 +1890,3 @@ two-phase-never-a-subject	pyre_object::unicodeobject::w_str_new_managed
 two-phase-never-a-subject	pyre_object::unicodeobject::w_str_slot_get
 two-phase-never-a-subject	pyre_object::weakref::w_weakref_new
 two-phase-never-a-subject	pyre_object::weakref::w_weakref_object_slot_get
-two-phase-rtype-skipped	pyre_interpreter::gateway::builtin_fixed_arity_fn
