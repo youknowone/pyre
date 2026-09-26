@@ -1,6 +1,4 @@
 # pyre-check: selfcheck
-# pyre-check: skip-backends=cranelift
-# cranelift runs the core build, which has no `pyre-module` and so no `math`.
 # pyre-check: selfcheck-compiles=<module>,entry-bridge:forward
 # The module loop inlines `forward`, whose Fraction division is a forcing call.
 # The following LOAD_DEREF must recover `adjust` from the inlined callee's own

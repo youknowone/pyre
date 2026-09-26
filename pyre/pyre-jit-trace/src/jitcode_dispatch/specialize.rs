@@ -14622,12 +14622,9 @@ impl MathFloatDomain {
     }
 }
 
-/// Whether `callable` is the canonical builtin `math.<name>`, asked of the
-/// `math` module through the optional-module hooks.
+/// Whether `callable` is the canonical builtin `math.<name>`.
 fn is_math_builtin(callable: pyre_object::PyObjectRef, name: &str) -> bool {
-    pyre_interpreter::importing::optional_module_hooks()
-        .and_then(|hooks| (hooks.math_builtin_name)(callable))
-        == Some(name)
+    pyre_interpreter::module::math::interp_math::math_builtin_name(callable) == Some(name)
 }
 
 /// `math.sqrt(x)` on an exact int/float argument: the domain-guarded pure
@@ -15273,9 +15270,10 @@ impl Math1ResultCheck {
                 if x <= 0.0 && x == x.trunc() {
                     return false;
                 }
-                pyre_interpreter::importing::optional_module_hooks().is_some_and(|hooks| {
-                    (hooks.math1_gamma_result_finite)(x, matches!(self, Self::Lgamma))
-                })
+                pyre_interpreter::module::math::interp_math::math1_gamma_result_finite(
+                    x,
+                    matches!(self, Self::Lgamma),
+                )
             }
         }
     }

@@ -3436,9 +3436,185 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_ll_arraycopy",
         pyre_object::object_array::jit_ll_arraycopy,
     );
-    // `ll_math.py` residuals live in `pyre-module`. The optional-module
-    // hook publishes them under the same `ll_math::math_*` / crate-root
-    // alias paths the front retargets Opaque `f64::{hypot,atan2,…}` to.
+    // `ll_math.py` residuals live in `module::math`. Published under the
+    // same `ll_math::math_*` / crate-root alias paths the front retargets
+    // Opaque `f64::{hypot,atan2,…}` to.
+    cpa2(
+        &mut entries,
+        "ll_math::math_hypot",
+        "math_hypot",
+        crate::module::math::interp_math::jit_math_hypot,
+    );
+    cpa2(
+        &mut entries,
+        "ll_math::math_atan2",
+        "math_atan2",
+        crate::module::math::interp_math::jit_math_atan2,
+    );
+    cpa2(
+        &mut entries,
+        "ll_math::math_copysign",
+        "math_copysign",
+        crate::module::math::interp_math::jit_math_copysign,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_floor",
+        "math_floor",
+        crate::module::math::interp_math::jit_math_floor_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_ceil",
+        "math_ceil",
+        crate::module::math::interp_math::jit_math_ceil_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_log",
+        "math_log",
+        crate::module::math::interp_math::jit_math_log_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_log10",
+        "math_log10",
+        crate::module::math::interp_math::jit_math_log10_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_log1p",
+        "math_log1p",
+        crate::module::math::interp_math::jit_math_log1p_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_exp",
+        "math_exp",
+        crate::module::math::interp_math::jit_math_exp_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_exp2",
+        "math_exp2",
+        crate::module::math::interp_math::jit_math_exp2_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_expm1",
+        "math_expm1",
+        crate::module::math::interp_math::jit_math_expm1_raw,
+    );
+    cpa2(
+        &mut entries,
+        "ll_math::math_pow",
+        "math_pow",
+        crate::module::math::interp_math::jit_math_pow_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_sqrt",
+        "math_sqrt",
+        crate::module::math::interp_math::jit_math_sqrt_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_cbrt",
+        "math_cbrt",
+        crate::module::math::interp_math::jit_math_cbrt_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_sin",
+        "math_sin",
+        crate::module::math::interp_math::jit_math_sin_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_cos",
+        "math_cos",
+        crate::module::math::interp_math::jit_math_cos_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_tan",
+        "math_tan",
+        crate::module::math::interp_math::jit_math_tan_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_asin",
+        "math_asin",
+        crate::module::math::interp_math::jit_math_asin_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_acos",
+        "math_acos",
+        crate::module::math::interp_math::jit_math_acos_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_atan",
+        "math_atan",
+        crate::module::math::interp_math::jit_math_atan_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_sinh",
+        "math_sinh",
+        crate::module::math::interp_math::jit_math_sinh_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_cosh",
+        "math_cosh",
+        crate::module::math::interp_math::jit_math_cosh_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_tanh",
+        "math_tanh",
+        crate::module::math::interp_math::jit_math_tanh_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_asinh",
+        "math_asinh",
+        crate::module::math::interp_math::jit_math_asinh_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_acosh",
+        "math_acosh",
+        crate::module::math::interp_math::jit_math_acosh_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_atanh",
+        "math_atanh",
+        crate::module::math::interp_math::jit_math_atanh_raw,
+    );
+    cpa2(
+        &mut entries,
+        "ll_math::math_fmod",
+        "math_fmod",
+        crate::module::math::interp_math::jit_math_fmod_raw,
+    );
+    // `%` over two floats: `lloperation.py` has no `float_mod`, so the
+    // codewriter lowers it to a residual call of this name carrying the C
+    // `fmod` signature rather than the raising wrapper's.
+    cp2(
+        &mut entries,
+        "ll_math_fmod",
+        crate::module::math::interp_math::jit_math_fmod_raw,
+    );
+    // `pymath` is outside the extraction set, so every call of it reaches the
+    // artifact as an un-lowerable target.  `ulp` takes and returns one float,
+    // which the residual-call ABI carries, so binding its real address makes
+    // the call executable; the rest of the family returns `Result<f64, _>`,
+    // which is wider than a result slot, and stays unpublished.
+    p1(&mut entries, "pymath::math::misc::ulp", pymath::math::ulp);
     if let Some(hooks) = crate::importing::optional_module_hooks() {
         (hooks.publish_fnaddrs)(&mut entries);
     }
@@ -5862,6 +6038,26 @@ mod tests {
                         .strip_prefix("jit_")
                         .is_some_and(|rest| rest == leaf_a))
         }
+        /// The codewriter's lowering name beside the `ll_math.py` entry
+        /// point whose body it residualizes.  `lloperation.py` has no
+        /// `float_mod`, so `jtransform` emits a residual call of
+        /// `ll_math_fmod`; that call carries the C `fmod` signature, not the
+        /// raising `ll_math_fmod` wrapper's wider one, so the registry binds
+        /// the lowering name to the same body `ll_math::math_fmod` names.
+        fn ll_math_lowering_name(a: &str, b: &str) -> bool {
+            /// The operation an `ll_math.py` entry point names, under either
+            /// the module-qualified spelling or the crate-root alias.
+            fn entry_point_op(path: &str) -> Option<&str> {
+                path.strip_prefix("ll_math::math_")
+                    .or_else(|| path.strip_prefix("math_").filter(|_| !path.contains("::")))
+            }
+            fn lowers(lowering: &str, entry_point: &str) -> bool {
+                lowering
+                    .strip_prefix("ll_math_")
+                    .is_some_and(|op| entry_point_op(entry_point) == Some(op))
+            }
+            lowers(a, b) || lowers(b, a)
+        }
         // A crate-root re-export (`pyre_interpreter::acquire_buffered_lock`)
         // beside its defining path (`pyre_interpreter::module::_io::
         // acquire_buffered_lock`) is related by neither suffix while the crate
@@ -5875,7 +6071,11 @@ mod tests {
         // rule: `module::a::type_object` and `module::b::type_object` would
         // read as aliases while address-keyed patching between them stays
         // ambiguous. Those are related by no suffix here and are reported.
-        if extends(a, b) || drops_one_segment(a, b) || jit_wrapper_leaf(a, b) {
+        if extends(a, b)
+            || drops_one_segment(a, b)
+            || jit_wrapper_leaf(a, b)
+            || ll_math_lowering_name(a, b)
+        {
             return true;
         }
         match (split_head(a), split_head(b)) {
@@ -5918,6 +6118,12 @@ mod tests {
             "pyre_interpreter::objspace::descroperation::jit_bigint_mul",
             "pyre_interpreter::objspace::descroperation::bigint_add",
         ));
+        // The codewriter's lowering name beside the `ll_math.py` entry point
+        // whose body it residualizes, under both registered spellings.
+        assert!(are_alias_spellings("ll_math_fmod", "ll_math::math_fmod"));
+        assert!(are_alias_spellings("ll_math_fmod", "math_fmod"));
+        assert!(!are_alias_spellings("ll_math_fmod", "ll_math::math_sqrt"));
+        assert!(!are_alias_spellings("ll_math_fmod", "math_sqrt"));
         // Two crates cannot re-export one another's item, so identical module
         // paths under different crates are two functions, not two spellings.
         assert!(!are_alias_spellings(
@@ -6094,6 +6300,22 @@ mod tests {
             expected
         );
         assert_eq!(bindings["module::_random::Random::genrand32"], expected);
+    }
+
+    /// `ll_math.py`'s residuals are interpreter-owned.  Both the `ll_math::`
+    /// path the front retargets the Opaque `f64` intrinsics to and the
+    /// crate-root alias resolve to the same address.
+    #[test]
+    fn jit_trace_fnaddrs_covers_ll_math_residuals() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let hypot = crate::module::math::interp_math::jit_math_hypot as *const () as usize as i64;
+        assert_eq!(bindings["ll_math::math_hypot"], hypot);
+        assert_eq!(bindings["math_hypot"], hypot);
+        let asin = crate::module::math::interp_math::jit_math_asin_raw as *const () as usize as i64;
+        assert_eq!(bindings["ll_math::math_asin"], asin);
+        assert_eq!(bindings["math_asin"], asin);
+        let ulp = pymath::math::ulp as *const () as usize as i64;
+        assert_eq!(bindings["pymath::math::misc::ulp"], ulp);
     }
 
     /// Every `#[pyre_methods]` `type_object()` accessor publishes its residual

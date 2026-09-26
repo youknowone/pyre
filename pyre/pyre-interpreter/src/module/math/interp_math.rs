@@ -19,7 +19,7 @@ pub fn get_double(obj: PyObjectRef) -> f64 {
 /// numeric interpretation (no int/float/bool/long layout and no
 /// __float__/__index__ method). mathmodule.c's entry points use this
 /// to reject `math.exp("spam")` etc.
-pub fn try_get_double(obj: PyObjectRef) -> Result<f64, pyre_interpreter::PyError> {
+pub fn try_get_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
     unsafe {
         if is_float(obj) {
             return Ok(floatobject::w_float_get_value(obj));
@@ -31,7 +31,7 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, pyre_interpreter::PyError
         // reproduces the payload.  The `float` arm stays ungated because the
         // conversion short-circuits on the layout and ignores an override.
         if pyre_object::is_exact_builtin_instance(obj)
-            && let Some(value) = pyre_interpreter::builtins::int_payload_as_f64(obj)
+            && let Some(value) = crate::builtins::int_payload_as_f64(obj)
         {
             return value;
         }
@@ -40,17 +40,17 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, pyre_interpreter::PyError
     // instance attribute named `__float__` is not consulted. A raising
     // `__float__` (descriptor `__get__` or the call itself) propagates
     // instead of being reported as "must be real number".
-    match unsafe { pyre_interpreter::baseobjspace::lookup_special(obj, "__float__") } {
+    match unsafe { crate::baseobjspace::lookup_special(obj, "__float__") } {
         Ok(Some(method)) => {
-            let result = pyre_interpreter::builtins::call_and_check(method, &[])?;
+            let result = crate::builtins::call_and_check(method, &[])?;
             unsafe {
                 if is_float(result) {
                     // A strict `float` subclass is accepted but deprecated;
                     // an exact `float` is used as-is.
                     if !is_exact_type(result, &FLOAT_TYPE) {
-                        let value_type = pyre_interpreter::type_methods::arg_type_name(obj);
-                        let result_type = pyre_interpreter::type_methods::arg_type_name(result);
-                        pyre_interpreter::warn::warn_deprecation(&format!(
+                        let value_type = crate::type_methods::arg_type_name(obj);
+                        let result_type = crate::type_methods::arg_type_name(result);
+                        crate::warn::warn_deprecation(&format!(
                             "{value_type}.__float__ returned non-float (type {result_type}).  \
                              The ability to return an instance of a strict subclass of \
                              float is deprecated, and may be removed in a future version \
@@ -63,16 +63,16 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, pyre_interpreter::PyError
             // descroperation.py:891 — a non-float result (including int/long)
             // is rejected rather than coerced.
             let result_type = unsafe { pyre_object::type_name_of(result) };
-            return Err(pyre_interpreter::PyError::type_error(format!(
+            return Err(crate::PyError::type_error(format!(
                 "__float__ returned non-float (type '{result_type}')",
             )));
         }
         Ok(None) => {}
         Err(err) => return Err(err),
     }
-    match pyre_interpreter::baseobjspace::getattr_str(obj, "__index__") {
+    match crate::baseobjspace::getattr_str(obj, "__index__") {
         Ok(method) => {
-            let result = pyre_interpreter::builtins::call_and_check(method, &[])?;
+            let result = crate::builtins::call_and_check(method, &[])?;
             unsafe {
                 if is_int(result) {
                     return Ok(w_int_get_value(result) as f64);
@@ -80,7 +80,7 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, pyre_interpreter::PyError
                 if is_long(result) {
                     let v = jit_bigint_to_f64_or_nan(w_long_get_value(result));
                     if !v.is_finite() {
-                        return Err(pyre_interpreter::PyError::overflow_error(
+                        return Err(crate::PyError::overflow_error(
                             "int too large to convert to float",
                         ));
                     }
@@ -88,46 +88,40 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, pyre_interpreter::PyError
                 }
             }
         }
-        Err(err) if err.kind != pyre_interpreter::PyErrorKind::AttributeError => return Err(err),
+        Err(err) if err.kind != crate::PyErrorKind::AttributeError => return Err(err),
         Err(_) => {}
     }
-    Err(pyre_interpreter::PyError::type_error(format!(
+    Err(crate::PyError::type_error(format!(
         "must be real number, not {}",
-        pyre_interpreter::type_methods::arg_type_name(obj)
+        crate::type_methods::arg_type_name(obj)
     )))
 }
 
-type PyResult = Result<PyObjectRef, pyre_interpreter::PyError>;
+type PyResult = Result<PyObjectRef, crate::PyError>;
 
 fn map_err(r: pymath::Result<f64>) -> PyResult {
     match r {
         Ok(v) => Ok(floatobject::w_float_new(v)),
-        Err(pymath::Error::EDOM) => {
-            Err(pyre_interpreter::PyError::value_error("math domain error"))
-        }
-        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
-            "math range error",
-        )),
+        Err(pymath::Error::EDOM) => Err(crate::PyError::value_error("math domain error")),
+        Err(pymath::Error::ERANGE) => Err(crate::PyError::overflow_error("math range error")),
     }
 }
 
-fn map_int_err(e: pymath::Error) -> pyre_interpreter::PyError {
+fn map_int_err(e: pymath::Error) -> crate::PyError {
     match e {
-        pymath::Error::EDOM => pyre_interpreter::PyError::value_error("math domain error"),
-        pymath::Error::ERANGE => pyre_interpreter::PyError::overflow_error("math range error"),
+        pymath::Error::EDOM => crate::PyError::value_error("math domain error"),
+        pymath::Error::ERANGE => crate::PyError::overflow_error("math range error"),
     }
 }
 
-fn map_rbigint_err(e: RBigIntError) -> pyre_interpreter::PyError {
+fn map_rbigint_err(e: RBigIntError) -> crate::PyError {
     match e {
-        RBigIntError::Memory => pyre_interpreter::PyError::memory_error(""),
+        RBigIntError::Memory => crate::PyError::memory_error(""),
         RBigIntError::Overflow | RBigIntError::FloatDivisionOverflow => {
-            pyre_interpreter::PyError::overflow_error("math range error")
+            crate::PyError::overflow_error("math range error")
         }
-        RBigIntError::DivisionByZero => {
-            pyre_interpreter::PyError::zero_division("integer division by zero")
-        }
-        _ => pyre_interpreter::PyError::value_error("math domain error"),
+        RBigIntError::DivisionByZero => crate::PyError::zero_division("integer division by zero"),
+        _ => crate::PyError::value_error("math domain error"),
     }
 }
 
@@ -143,7 +137,7 @@ fn float_repr(val: f64) -> String {
             "-inf".to_owned()
         }
     } else {
-        pyre_interpreter::display::format_float_repr(val)
+        crate::display::format_float_repr(val)
     }
 }
 
@@ -170,17 +164,15 @@ fn math1_pymath(
     edom: fn(f64) -> String,
 ) -> PyResult {
     if args.len() != 1 {
-        return Err(pyre_interpreter::PyError::type_error(format!(
+        return Err(crate::PyError::type_error(format!(
             "{name}() takes exactly one argument"
         )));
     }
     let val = try_get_double(args[0])?;
     match compute(val) {
-        Ok(v) => pyre_interpreter::objspace::descroperation::_float_pos(v),
-        Err(pymath::Error::EDOM) => Err(pyre_interpreter::PyError::value_error(edom(val))),
-        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
-            "math range error",
-        )),
+        Ok(v) => crate::objspace::descroperation::_float_pos(v),
+        Err(pymath::Error::EDOM) => Err(crate::PyError::value_error(edom(val))),
+        Err(pymath::Error::ERANGE) => Err(crate::PyError::overflow_error("math range error")),
     }
 }
 
@@ -313,12 +305,12 @@ struct MathBuiltinWrappers {
 static MATH_WRAPPERS: std::sync::OnceLock<MathBuiltinWrappers> = std::sync::OnceLock::new();
 
 fn math_wrapper_addr(ns: PyObjectRef, name: &str) -> usize {
-    let callable = pyre_interpreter::module_ns_get(ns, name)
+    let callable = crate::module_ns_get(ns, name)
         .unwrap_or_else(|| panic!("math.{name} missing after module registration"));
     unsafe {
-        let code = pyre_interpreter::function_get_code(callable) as PyObjectRef;
-        debug_assert!(pyre_interpreter::gateway::is_builtin_code(code));
-        pyre_interpreter::gateway::builtin_code_get(code) as usize
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        debug_assert!(crate::gateway::is_builtin_code(code));
+        crate::gateway::builtin_code_get(code) as usize
     }
 }
 
@@ -384,13 +376,13 @@ pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
 
 unsafe fn math_builtin_wrapper_matches(callable: PyObjectRef, expected: usize) -> bool {
     unsafe {
-        if callable.is_null() || !pyre_interpreter::is_function(callable) {
+        if callable.is_null() || !crate::is_function(callable) {
             return false;
         }
-        let code = pyre_interpreter::function_get_code(callable) as PyObjectRef;
+        let code = crate::function_get_code(callable) as PyObjectRef;
         !code.is_null()
-            && pyre_interpreter::gateway::is_builtin_code(code)
-            && expected == pyre_interpreter::gateway::builtin_code_get(code) as usize
+            && crate::gateway::is_builtin_code(code)
+            && expected == crate::gateway::builtin_code_get(code) as usize
     }
 }
 
@@ -755,14 +747,14 @@ static MATH_FLOAT2_FOLDS: [MathFloat2Fold; 0] = [];
 /// for a callable that is not a builtin function.
 unsafe fn builtin_wrapper_addr(callable: PyObjectRef) -> Option<usize> {
     unsafe {
-        if callable.is_null() || !pyre_interpreter::is_function(callable) {
+        if callable.is_null() || !crate::is_function(callable) {
             return None;
         }
-        let code = pyre_interpreter::function_get_code(callable) as PyObjectRef;
-        if code.is_null() || !pyre_interpreter::gateway::is_builtin_code(code) {
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
             return None;
         }
-        Some(pyre_interpreter::gateway::builtin_code_get(code) as usize)
+        Some(crate::gateway::builtin_code_get(code) as usize)
     }
 }
 
@@ -894,21 +886,19 @@ pub fn lgamma(args: &[PyObjectRef]) -> PyResult {
 /// `math.fabs` after `_get_double`: the unboxed `_float_abs` leaf.
 pub fn fabs(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 1 {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "fabs() takes exactly one argument",
         ));
     }
-    pyre_interpreter::objspace::descroperation::_float_abs(try_get_double(args[0])?)
+    crate::objspace::descroperation::_float_abs(try_get_double(args[0])?)
 }
 pub fn ulp(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 1 {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "ulp() takes exactly one argument",
         ));
     }
-    pyre_interpreter::objspace::descroperation::_float_pos(pymath::math::ulp(try_get_double(
-        args[0],
-    )?))
+    crate::objspace::descroperation::_float_pos(pymath::math::ulp(try_get_double(args[0])?))
 }
 
 // ── 2-arg float→float via pymath ─────────────────────────────────────
@@ -921,20 +911,16 @@ fn math2_pymath(
     compute: fn(f64, f64) -> Result<f64, pymath::Error>,
 ) -> PyResult {
     if args.len() != 2 {
-        return Err(pyre_interpreter::PyError::type_error(format!(
+        return Err(crate::PyError::type_error(format!(
             "{name}() takes exactly 2 arguments"
         )));
     }
     let x = try_get_double(args[0])?;
     let y = try_get_double(args[1])?;
     match compute(x, y) {
-        Ok(v) => pyre_interpreter::objspace::descroperation::_float_pos(v),
-        Err(pymath::Error::EDOM) => {
-            Err(pyre_interpreter::PyError::value_error("math domain error"))
-        }
-        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
-            "math range error",
-        )),
+        Ok(v) => crate::objspace::descroperation::_float_pos(v),
+        Err(pymath::Error::EDOM) => Err(crate::PyError::value_error("math domain error")),
+        Err(pymath::Error::ERANGE) => Err(crate::PyError::overflow_error("math range error")),
     }
 }
 
@@ -965,12 +951,12 @@ pub fn hypot(args: &[PyObjectRef]) -> PyResult {
 
 pub fn dist(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 2 {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "dist() takes exactly 2 arguments",
         ));
     }
-    let collect_coords = |obj: PyObjectRef| -> Result<Vec<f64>, pyre_interpreter::PyError> {
-        let items = pyre_interpreter::builtins::collect_iterable(obj)?;
+    let collect_coords = |obj: PyObjectRef| -> Result<Vec<f64>, crate::PyError> {
+        let items = crate::builtins::collect_iterable(obj)?;
         // Conversion can call an element's `__float__`, so publish the whole
         // materialized sequence before converting any member. `pin_roots`
         // writes every pointer before the first forwarding query; a
@@ -986,7 +972,7 @@ pub fn dist(args: &[PyObjectRef]) -> PyResult {
     let p = collect_coords(args[0])?;
     let q = collect_coords(args[1])?;
     if p.len() != q.len() {
-        return Err(pyre_interpreter::PyError::value_error(
+        return Err(crate::PyError::value_error(
             "both points must have the same number of dimensions",
         ));
     }
@@ -1008,7 +994,7 @@ fn math_unary_int(
     fallback_float: bool,
 ) -> PyResult {
     if args.len() != 1 {
-        return Err(pyre_interpreter::PyError::type_error(format!(
+        return Err(crate::PyError::type_error(format!(
             "{fname}() takes exactly 1 argument",
         )));
     }
@@ -1026,22 +1012,17 @@ fn math_unary_int(
     // than a function or method descriptor, and neither of those runs user
     // code to bind.  `lookup` reads the type MRO only, so an instance
     // attribute of the same name stays ignored.
-    if let Some(w_descr) = unsafe { pyre_interpreter::baseobjspace::lookup(args[0], dunder) }
-        && let Some(w_type) = pyre_interpreter::typedef::r#type(args[0])
+    if let Some(w_descr) = unsafe { crate::baseobjspace::lookup(args[0], dunder) }
+        && let Some(w_type) = crate::typedef::r#type(args[0])
     {
         return unsafe {
-            pyre_interpreter::baseobjspace::get_and_call_function(
-                w_descr,
-                args[0],
-                w_type.as_ptr(),
-                &[],
-            )
+            crate::baseobjspace::get_and_call_function(w_descr, args[0], w_type.as_ptr(), &[])
         };
     }
     if !fallback_float {
-        return Err(pyre_interpreter::PyError::type_error(format!(
+        return Err(crate::PyError::type_error(format!(
             "type {} doesn't define {dunder} method",
-            pyre_interpreter::baseobjspace::object_functionstr_type_name(args[0])
+            crate::baseobjspace::object_functionstr_type_name(args[0])
         )));
     }
     // Fall back to `__float__` coercion.  `try_get_double` already reports
@@ -1054,12 +1035,12 @@ fn math_unary_int(
     // and a finite value outside the machine range becomes a long.  A direct
     // `as i64` saturates instead, so `floor(FloatLike(1e300))` answered
     // `i64::MAX` and `floor(FloatLike(nan))` answered `0`.
-    pyre_interpreter::typedef::float_to_pyint(
+    crate::typedef::float_to_pyint(
         v,
         match dunder {
-            "__ceil__" => pyre_interpreter::typedef::FloatToIntMode::Ceil,
-            "__floor__" => pyre_interpreter::typedef::FloatToIntMode::Floor,
-            _ => pyre_interpreter::typedef::FloatToIntMode::Trunc,
+            "__ceil__" => crate::typedef::FloatToIntMode::Ceil,
+            "__floor__" => crate::typedef::FloatToIntMode::Floor,
+            _ => crate::typedef::FloatToIntMode::Trunc,
         },
     )
 }
@@ -1088,7 +1069,7 @@ pub fn trunc(args: &[PyObjectRef]) -> PyResult {
 /// two arms also state their refusal differently — an integer can be
 /// arbitrarily large, so its message carries no value — and which spelling a
 /// program sees says which arm read the operand.
-fn loghelper(w_x: PyObjectRef, base: f64) -> Result<f64, pyre_interpreter::PyError> {
+fn loghelper(w_x: PyObjectRef, base: f64) -> Result<f64, crate::PyError> {
     unsafe {
         if pyre_object::is_bool(w_x) || pyre_object::is_int(w_x) || pyre_object::is_long(w_x) {
             let num_owned;
@@ -1102,9 +1083,7 @@ fn loghelper(w_x: PyObjectRef, base: f64) -> Result<f64, pyre_interpreter::PyErr
                 &num_owned
             };
             if num.int_le(0) {
-                return Err(pyre_interpreter::PyError::value_error(
-                    "expected a positive input",
-                ));
+                return Err(crate::PyError::value_error("expected a positive input"));
             }
             // `PyLong_AsDouble` first, so a value a `float` can hold takes the
             // logarithm of that conversion and answers as the float beside it
@@ -1123,7 +1102,7 @@ fn loghelper(w_x: PyObjectRef, base: f64) -> Result<f64, pyre_interpreter::PyErr
     }
     // Domain error for x <= 0 (but x == +inf is fine).
     if x <= 0.0 {
-        return Err(pyre_interpreter::PyError::value_error(format!(
+        return Err(crate::PyError::value_error(format!(
             "expected a positive input, got {}",
             float_repr(x)
         )));
@@ -1148,10 +1127,10 @@ fn log_of_double(x: f64, base: f64) -> f64 {
 pub(crate) fn no_keywords<'a>(
     args: &'a [PyObjectRef],
     name: &str,
-) -> Result<&'a [PyObjectRef], pyre_interpreter::PyError> {
-    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
-        return Err(pyre_interpreter::PyError::type_error(format!(
+) -> Result<&'a [PyObjectRef], crate::PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(format!(
             "math.{name}() takes no keyword arguments"
         )));
     }
@@ -1161,12 +1140,12 @@ pub(crate) fn no_keywords<'a>(
 pub fn log(args: &[PyObjectRef]) -> PyResult {
     let args = no_keywords(args, "log")?;
     if args.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "log expected at least 1 argument, got 0",
         ));
     }
     if args.len() > 2 {
-        return Err(pyre_interpreter::PyError::type_error(format!(
+        return Err(crate::PyError::type_error(format!(
             "log expected at most 2 arguments, got {}",
             args.len()
         )));
@@ -1182,14 +1161,14 @@ pub fn log(args: &[PyObjectRef]) -> PyResult {
     };
     let den = loghelper(base, 0.0)?;
     if den == 0.0 {
-        return Err(pyre_interpreter::PyError::zero_division("division by zero"));
+        return Err(crate::PyError::zero_division("division by zero"));
     }
     Ok(floatobject::w_float_new(num / den))
 }
 
 pub fn log10(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 1 {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "log10() takes exactly 1 argument",
         ));
     }
@@ -1198,7 +1177,7 @@ pub fn log10(args: &[PyObjectRef]) -> PyResult {
 
 pub fn log2(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 1 {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "log2() takes exactly 1 argument",
         ));
     }
@@ -1207,29 +1186,25 @@ pub fn log2(args: &[PyObjectRef]) -> PyResult {
 
 pub fn degrees(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "degrees() takes exactly 1 argument",
         ));
     }
-    pyre_interpreter::objspace::descroperation::_float_pos(pymath::math::degrees(try_get_double(
-        args[0],
-    )?))
+    crate::objspace::descroperation::_float_pos(pymath::math::degrees(try_get_double(args[0])?))
 }
 
 pub fn radians(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "radians() takes exactly 1 argument",
         ));
     }
-    pyre_interpreter::objspace::descroperation::_float_pos(pymath::math::radians(try_get_double(
-        args[0],
-    )?))
+    crate::objspace::descroperation::_float_pos(pymath::math::radians(try_get_double(args[0])?))
 }
 
 pub fn isinf(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "isinf() takes exactly 1 argument",
         ));
     }
@@ -1238,7 +1213,7 @@ pub fn isinf(args: &[PyObjectRef]) -> PyResult {
 
 pub fn isnan(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "isnan() takes exactly 1 argument",
         ));
     }
@@ -1247,7 +1222,7 @@ pub fn isnan(args: &[PyObjectRef]) -> PyResult {
 
 pub fn isfinite(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "isfinite() takes exactly 1 argument",
         ));
     }
@@ -1257,7 +1232,7 @@ pub fn isfinite(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn isclose(args: &[PyObjectRef]) -> PyResult {
-    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     if pos.len() < 2 {
         // `_PyArg_ParseStackAndKeywords` names the first slot it could not
         // fill; both are positional-only, so a keyword never fills one.
@@ -1266,18 +1241,18 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
         } else {
             "b' (pos 2"
         };
-        return Err(pyre_interpreter::PyError::type_error(format!(
+        return Err(crate::PyError::type_error(format!(
             "isclose() missing required argument '{missing})"
         )));
     }
     if pos.len() > 2 {
-        return Err(pyre_interpreter::PyError::type_error(format!(
+        return Err(crate::PyError::type_error(format!(
             "isclose() takes exactly 2 positional arguments ({} given)",
             pos.len()
         )));
     }
     // `rel_tol` and `abs_tol` are the only (keyword-only) parameters.
-    pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, &["rel_tol", "abs_tol"], "isclose")?;
+    crate::builtins::kwarg_reject_unknown(kwargs, &["rel_tol", "abs_tol"], "isclose")?;
     // `interp_math.py`'s `isclose` — all four operands are converted, in this
     // order, before anything about them is checked, so a non-numeric `a` is
     // reported even when a tolerance is negative.  An omitted tolerance
@@ -1286,8 +1261,8 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
     // `pymath` supplies the same defaults.
     let a = try_get_double(pos[0])?;
     let b = try_get_double(pos[1])?;
-    let read = |name: &str| -> Result<Option<f64>, pyre_interpreter::PyError> {
-        match pyre_interpreter::builtins::kwarg_get(kwargs, name) {
+    let read = |name: &str| -> Result<Option<f64>, crate::PyError> {
+        match crate::builtins::kwarg_get(kwargs, name) {
             Some(v) => Ok(Some(try_get_double(v)?)),
             None => Ok(None),
         }
@@ -1299,7 +1274,7 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
     // `pymath` reports the same rejection as EDOM, which `map_int_err`
     // relabels "math domain error".
     if rel_tol.is_some_and(|t| t < 0.0) || abs_tol.is_some_and(|t| t < 0.0) {
-        return Err(pyre_interpreter::PyError::value_error(
+        return Err(crate::PyError::value_error(
             "tolerances must be non-negative",
         ));
     }
@@ -1311,7 +1286,7 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
 
 pub fn factorial(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "factorial() takes exactly 1 argument",
         ));
     }
@@ -1323,22 +1298,22 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
     // reason strings are rather than by a numeric-value test. `dir(n)` only
     // reports membership, so the check must not bind the descriptor — the one
     // binding belongs to `get_bigint` below.
-    if unsafe { pyre_interpreter::baseobjspace::lookup(args[0], "__index__") }.is_none() {
-        return Err(pyre_interpreter::PyError::type_error(format!(
+    if unsafe { crate::baseobjspace::lookup(args[0], "__index__") }.is_none() {
+        return Err(crate::PyError::type_error(format!(
             "'{}' object cannot be interpreted as an integer",
-            pyre_interpreter::baseobjspace::object_functionstr_type_name(args[0])
+            crate::baseobjspace::object_functionstr_type_name(args[0])
         )));
     }
     let n_big = get_bigint(args[0])?;
     if n_big.int_lt(0) {
-        return Err(pyre_interpreter::PyError::value_error(
+        return Err(crate::PyError::value_error(
             "factorial() not defined for negative values",
         ));
     }
     let n = if jit_bigint_to_i64_fits(&n_big) != 0 {
         jit_bigint_to_i64_value(&n_big)
     } else {
-        return Err(pyre_interpreter::PyError::overflow_error(format!(
+        return Err(crate::PyError::overflow_error(format!(
             "factorial() argument should not exceed {}",
             i64::MAX
         )));
@@ -1389,7 +1364,7 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
 /// W_IntObject/W_LongObject/W_BoolObject union and materializes rbigint.
 /// Raises TypeError for non-integer inputs via `__index__` dunder, matching
 /// CPython's `_PyLong_FromNbIndexOrNbInt`.
-fn get_bigint(obj: PyObjectRef) -> Result<BigInt, pyre_interpreter::PyError> {
+fn get_bigint(obj: PyObjectRef) -> Result<BigInt, crate::PyError> {
     unsafe {
         if pyre_object::is_long(obj) {
             return Ok(pyre_object::w_long_get_value(obj).translated_alias());
@@ -1405,7 +1380,7 @@ fn get_bigint(obj: PyObjectRef) -> Result<BigInt, pyre_interpreter::PyError> {
             }));
         }
         if pyre_object::is_float(obj) {
-            return Err(pyre_interpreter::PyError::type_error(
+            return Err(crate::PyError::type_error(
                 "'float' object cannot be interpreted as an integer",
             ));
         }
@@ -1413,9 +1388,9 @@ fn get_bigint(obj: PyObjectRef) -> Result<BigInt, pyre_interpreter::PyError> {
     // __index__ dunder — descroperation.py `_index`: type-only special-method
     // lookup, then propagate a raising `__index__` instead of masking it with
     // the generic "object cannot be interpreted as an integer".
-    match unsafe { pyre_interpreter::baseobjspace::lookup_special(obj, "__index__") } {
+    match unsafe { crate::baseobjspace::lookup_special(obj, "__index__") } {
         Ok(Some(method)) => {
-            let result = pyre_interpreter::builtins::call_and_check(method, &[])?;
+            let result = crate::builtins::call_and_check(method, &[])?;
             unsafe {
                 if pyre_object::is_int(result) {
                     return Ok(BigInt::from(pyre_object::w_int_get_value(result)));
@@ -1426,14 +1401,14 @@ fn get_bigint(obj: PyObjectRef) -> Result<BigInt, pyre_interpreter::PyError> {
             }
             // descroperation.py:612 — __index__ returned non-int (type %T)
             let result_type = unsafe { (*(*result).ob_type).name };
-            return Err(pyre_interpreter::PyError::type_error(format!(
+            return Err(crate::PyError::type_error(format!(
                 "__index__ returned non-int (type '{result_type}')",
             )));
         }
         Ok(None) => {}
         Err(err) => return Err(err),
     }
-    Err(pyre_interpreter::PyError::type_error(
+    Err(crate::PyError::type_error(
         "object cannot be interpreted as an integer",
     ))
 }
@@ -1547,7 +1522,7 @@ fn perm_machine_word(n: i64, k: i64) -> Option<i64> {
 
 pub fn comb(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 2 {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "comb() takes exactly two arguments",
         ));
     }
@@ -1559,12 +1534,12 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
         && let (Some(n), Some(k)) = (machine_word_int(*n), machine_word_int(*k))
     {
         if n < 0 {
-            return Err(pyre_interpreter::PyError::value_error(
+            return Err(crate::PyError::value_error(
                 "n must be a non-negative integer",
             ));
         }
         if k < 0 {
-            return Err(pyre_interpreter::PyError::value_error(
+            return Err(crate::PyError::value_error(
                 "k must be a non-negative integer",
             ));
         }
@@ -1581,12 +1556,12 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
     let k_big = get_bigint(args[1])?;
 
     if n_big.int_lt(0) {
-        return Err(pyre_interpreter::PyError::value_error(
+        return Err(crate::PyError::value_error(
             "n must be a non-negative integer",
         ));
     }
     if k_big.int_lt(0) {
-        return Err(pyre_interpreter::PyError::value_error(
+        return Err(crate::PyError::value_error(
             "k must be a non-negative integer",
         ));
     }
@@ -1627,12 +1602,12 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
 pub fn perm(args: &[PyObjectRef]) -> PyResult {
     let args = no_keywords(args, "perm")?;
     if args.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "perm() takes at least 1 argument",
         ));
     }
     if args.len() > 2 {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "perm() takes at most 2 arguments",
         ));
     }
@@ -1648,12 +1623,12 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
         }
     {
         if n < 0 {
-            return Err(pyre_interpreter::PyError::value_error(
+            return Err(crate::PyError::value_error(
                 "n must be a non-negative integer",
             ));
         }
         if k < 0 {
-            return Err(pyre_interpreter::PyError::value_error(
+            return Err(crate::PyError::value_error(
                 "k must be a non-negative integer",
             ));
         }
@@ -1667,7 +1642,7 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
     // Keep `n` rooted while a non-None `k` invokes its `__index__`.
     let n_big = RBigIntGcRoot::new(get_bigint(args[0])?);
     if n_big.int_lt(0) {
-        return Err(pyre_interpreter::PyError::value_error(
+        return Err(crate::PyError::value_error(
             "n must be a non-negative integer",
         ));
     }
@@ -1679,7 +1654,7 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
     };
     if let Some(ref k_val) = k_big {
         if k_val.int_lt(0) {
-            return Err(pyre_interpreter::PyError::value_error(
+            return Err(crate::PyError::value_error(
                 "k must be a non-negative integer",
             ));
         }
@@ -1722,14 +1697,14 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
 
 pub fn isqrt(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "isqrt() takes exactly 1 argument",
         ));
     }
     let n = get_bigint(args[0])?;
-    let value = n.isqrt().map_err(|_| {
-        pyre_interpreter::PyError::value_error("isqrt() argument must be nonnegative")
-    })?;
+    let value = n
+        .isqrt()
+        .map_err(|_| crate::PyError::value_error("isqrt() argument must be nonnegative"))?;
     Ok(bigint_to_pyint(&value))
 }
 
@@ -1742,9 +1717,7 @@ pub fn fsum(args: &[PyObjectRef]) -> PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let iterable_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(args[0]);
-    let w_iter = pyre_interpreter::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(
-        iterable_slot,
-    ))?;
+    let w_iter = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?;
     let iter_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_iter);
 
@@ -1752,13 +1725,12 @@ pub fn fsum(args: &[PyObjectRef]) -> PyResult {
     let mut special_sum = 0.0;
     let mut partials: Vec<f64> = Vec::new();
     loop {
-        let w_value = match pyre_interpreter::baseobjspace::next(
-            pyre_object::gc_roots::shadow_stack_get(iter_slot),
-        ) {
-            Ok(value) => value,
-            Err(err) if err.matches_stop_iteration() => break,
-            Err(err) => return Err(err),
-        };
+        let w_value =
+            match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
+                Ok(value) => value,
+                Err(err) if err.matches_stop_iteration() => break,
+                Err(err) => return Err(err),
+            };
         // `_get_double` can invoke user code.  Keep the yielded object rooted
         // only across that conversion, exactly like the translated livevar at
         // this point in the upstream loop.
@@ -1843,7 +1815,7 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
     // prod iterates with `space.mul` and returns the accumulated product.
     // `start` is keyword-only; positional `start` raises TypeError.
     if args.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "prod() takes at least 1 argument",
         ));
     }
@@ -1866,7 +1838,7 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
             match name.as_str() {
                 Ok("__pyre_kw__") | Ok("start") => {}
                 _ => {
-                    return Err(pyre_interpreter::PyError::type_error(format!(
+                    return Err(crate::PyError::type_error(format!(
                         "prod() got an unexpected keyword argument '{name}'"
                     )));
                 }
@@ -1877,22 +1849,21 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
             unsafe { pyre_object::w_dict_lookup(kwargs, start_key) }.unwrap_or(w_int_new(1));
         (&args[..args.len() - 1], start)
     } else if args.len() >= 2 {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "prod() takes only one positional argument (the iterable)",
         ));
     } else {
         (&args[..1], w_int_new(1))
     };
     if positional.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "prod() takes at least 1 argument",
         ));
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let acc_slot = pyre_object::gc_roots::pin_roots(&[start, positional[0]]);
-    let items = pyre_interpreter::builtins::collect_iterable(
-        pyre_object::gc_roots::shadow_stack_get(acc_slot + 1),
-    )?;
+    let items =
+        crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(acc_slot + 1))?;
     // `collect_iterable` returns unrooted pointers. Publish the whole
     // slice before any forwarding query; a per-item `pin_root` is a
     // safepoint that can move the still-unpinned tail.
@@ -1900,7 +1871,7 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
     // Multiplication can call `__mul__`; reload both operands after every
     // collection and keep the running product in its rooted slot.
     for index in 0..items.len() {
-        let product = pyre_interpreter::baseobjspace::mul(
+        let product = crate::baseobjspace::mul(
             pyre_object::gc_roots::shadow_stack_get(acc_slot),
             pyre_object::gc_roots::shadow_stack_get(items_base + index),
         )?;
@@ -1915,24 +1886,24 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
 /// `space.mul` + `space.add` loop.
 pub fn sumprod(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 2 {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "sumprod() takes exactly 2 arguments",
         ));
     }
-    let p = pyre_interpreter::builtins::collect_iterable(args[0])?;
+    let p = crate::builtins::collect_iterable(args[0])?;
     // Collecting the second input runs its iterator, so publish the first
     // materialized sequence before that call. `pin_roots` writes every
     // pointer before the first forwarding query.
     let _roots = pyre_object::gc_roots::push_roots();
     let p_base = pyre_object::gc_roots::pin_roots(&p);
-    let q = pyre_interpreter::builtins::collect_iterable(args[1])?;
+    let q = crate::builtins::collect_iterable(args[1])?;
     // `mul` and `add` dispatch to the operands' `__mul__` / `__add__`, so a
     // Decimal or Fraction element makes every turn a collection point.  Both
     // collected sequences and the running total are native locals no root
     // walker updates, so publish them and read each operand back per turn.
     let q_base = pyre_object::gc_roots::pin_roots(&q);
     if p.len() != q.len() {
-        return Err(pyre_interpreter::PyError::value_error(
+        return Err(crate::PyError::value_error(
             "Inputs are not the same length",
         ));
     }
@@ -1942,7 +1913,7 @@ pub fn sumprod(args: &[PyObjectRef]) -> PyResult {
     let acc_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
     for index in 0..p.len() {
-        let prod = pyre_interpreter::baseobjspace::mul(
+        let prod = crate::baseobjspace::mul(
             pyre_object::gc_roots::shadow_stack_get(p_base + index),
             pyre_object::gc_roots::shadow_stack_get(q_base + index),
         )?;
@@ -1951,7 +1922,7 @@ pub fn sumprod(args: &[PyObjectRef]) -> PyResult {
         let iteration_roots = pyre_object::gc_roots::push_roots();
         let prod_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = iteration_roots.pin_root(prod);
-        let total = pyre_interpreter::baseobjspace::add(
+        let total = crate::baseobjspace::add(
             pyre_object::gc_roots::shadow_stack_get(acc_slot),
             pyre_object::gc_roots::shadow_stack_get(prod_slot),
         )?;
@@ -1963,7 +1934,7 @@ pub fn sumprod(args: &[PyObjectRef]) -> PyResult {
 
 pub fn frexp(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "frexp() takes exactly 1 argument",
         ));
     }
@@ -1976,7 +1947,7 @@ pub fn frexp(args: &[PyObjectRef]) -> PyResult {
 
 pub fn ldexp(args: &[PyObjectRef]) -> PyResult {
     if args.len() < 2 {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "ldexp() takes exactly 2 arguments",
         ));
     }
@@ -2008,16 +1979,14 @@ pub fn ldexp(args: &[PyObjectRef]) -> PyResult {
             let signed = if x.is_sign_positive() { 0.0 } else { -0.0 };
             return Ok(floatobject::w_float_new(signed));
         }
-        return Err(pyre_interpreter::PyError::overflow_error(
-            "math range error",
-        ));
+        return Err(crate::PyError::overflow_error("math range error"));
     };
     map_err(pymath::math::ldexp(x, exp))
 }
 
 pub fn modf(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "modf() takes exactly 1 argument",
         ));
     }
@@ -2042,7 +2011,7 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
         (args, None)
     };
     if pos.len() != 2 {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "nextafter() takes exactly 2 positional arguments",
         ));
     }
@@ -2052,7 +2021,7 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
             use num_traits::ToPrimitive;
             let b = get_bigint(s)?;
             if b.int_lt(0) {
-                return Err(pyre_interpreter::PyError::value_error(
+                return Err(crate::PyError::value_error(
                     "steps must be a non-negative integer",
                 ));
             }
@@ -2073,7 +2042,7 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
 
 pub fn fma(args: &[PyObjectRef]) -> PyResult {
     if args.len() < 3 {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "fma() takes exactly 3 arguments",
         ));
     }

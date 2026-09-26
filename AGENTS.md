@@ -274,13 +274,19 @@ comment at the site citing both sides.
 
 ## Before committing
 
-- `cargo test --all --no-default-features --features dynasm`. Both halves matter.
-  `--features dynasm` selects a backend; `--no-default-features` is what keeps the
-  selection consistent across crates. With default features on, the workspace's
-  example interpreters default to `cranelift` and supply it to the one shared
-  `majit-metainterp`, while `pyre-jit` compiles in its dynasm registrations — so
-  the binary dispatches through one backend and holds the other's hooks. Nothing
-  emits an error; the tests simply run against a mismatched pair.
+- `cargo test --all --no-default-features --features dynasm,pyre-module`. All
+  three parts matter. `--features dynasm` selects a backend;
+  `--no-default-features` is what keeps the selection consistent across crates.
+  With default features on, the workspace's example interpreters default to
+  `cranelift` and supply it to the one shared `majit-metainterp`, while
+  `pyre-jit` compiles in its dynasm registrations — so the binary dispatches
+  through one backend and holds the other's hooks. Nothing emits an error; the
+  tests simply run against a mismatched pair. `pyre-module` names the crate that
+  owns the optional builtin modules; it is a `pyrex` default, and because the
+  dependency is optional, `--no-default-features` leaves the crate out of the
+  launcher the integration tests run. CI's cargo test steps pass it, and the
+  tests that need those modules are gated on the feature, so leaving it out
+  here does not fail — it silently runs fewer tests than CI does.
 - `python3 pyre/check.py` — every backend the host can build. A perf regression
   is a finding to explain, not an automatic veto: if the slower code is the
   line-by-line port and the faster was a shortcut, **the port stands** — record

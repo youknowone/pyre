@@ -100,8 +100,6 @@ pub fn install_optional_modules() {
     #[cfg(target_os = "macos")]
     pyre_interpreter::importing::register_builtin_module("_scproxy", module::_scproxy::init);
     pyre_interpreter::importing::register_builtin_module("binascii", module::binascii::init);
-    pyre_interpreter::importing::register_builtin_module("cmath", module::cmath::init);
-    pyre_interpreter::importing::register_builtin_module("math", module::math::init);
     #[cfg(all(windows, feature = "host_env"))]
     pyre_interpreter::importing::register_builtin_module("msvcrt", module::msvcrt::init);
     #[cfg(all(
@@ -343,8 +341,6 @@ pub fn register() {
             gc_types: module_gc_types,
             immortal_w_class_only_descriptors: all_immortal_w_class_only_descriptors,
             libffi_cif_shape: hook_libffi_cif_shape,
-            math_builtin_name: module::math::interp_math::math_builtin_name,
-            math1_gamma_result_finite: module::math::interp_math::math1_gamma_result_finite,
         },
     );
 }
@@ -428,165 +424,10 @@ fn module_gc_types() -> Vec<pyre_interpreter::importing::ModuleGcType> {
     types
 }
 
-/// `ll_math.py` C llexternals. The front retargets the Opaque `f64`
-/// inherent methods `ll_math::f64_method_llexternal` names onto these
-/// paths; the raising `ll_math_*` wrappers stay around them.
+/// Residual addresses whose functions still live in this crate (`mmap`,
+/// `_cffi_backend`). `jit_trace_fnaddrs` appends these after the
+/// interpreter-owned table.
 fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
-    use module::math::interp_math as math;
-
-    fn pair(
-        entries: &mut Vec<(&'static str, i64)>,
-        module_path: &'static str,
-        root_path: &'static str,
-        fnptr: *const (),
-    ) {
-        let addr = fnptr as usize as i64;
-        if addr != 0 {
-            entries.push((module_path, addr));
-            entries.push((root_path, addr));
-        }
-    }
-
-    for (module_path, root_path, fnptr) in [
-        (
-            "ll_math::math_hypot",
-            "math_hypot",
-            math::jit_math_hypot as *const (),
-        ),
-        (
-            "ll_math::math_atan2",
-            "math_atan2",
-            math::jit_math_atan2 as *const (),
-        ),
-        (
-            "ll_math::math_copysign",
-            "math_copysign",
-            math::jit_math_copysign as *const (),
-        ),
-        (
-            "ll_math::math_floor",
-            "math_floor",
-            math::jit_math_floor_raw as *const (),
-        ),
-        (
-            "ll_math::math_ceil",
-            "math_ceil",
-            math::jit_math_ceil_raw as *const (),
-        ),
-        (
-            "ll_math::math_log",
-            "math_log",
-            math::jit_math_log_raw as *const (),
-        ),
-        (
-            "ll_math::math_log10",
-            "math_log10",
-            math::jit_math_log10_raw as *const (),
-        ),
-        (
-            "ll_math::math_log1p",
-            "math_log1p",
-            math::jit_math_log1p_raw as *const (),
-        ),
-        (
-            "ll_math::math_exp",
-            "math_exp",
-            math::jit_math_exp_raw as *const (),
-        ),
-        (
-            "ll_math::math_exp2",
-            "math_exp2",
-            math::jit_math_exp2_raw as *const (),
-        ),
-        (
-            "ll_math::math_expm1",
-            "math_expm1",
-            math::jit_math_expm1_raw as *const (),
-        ),
-        (
-            "ll_math::math_pow",
-            "math_pow",
-            math::jit_math_pow_raw as *const (),
-        ),
-        (
-            "ll_math::math_sqrt",
-            "math_sqrt",
-            math::jit_math_sqrt_raw as *const (),
-        ),
-        (
-            "ll_math::math_cbrt",
-            "math_cbrt",
-            math::jit_math_cbrt_raw as *const (),
-        ),
-        (
-            "ll_math::math_sin",
-            "math_sin",
-            math::jit_math_sin_raw as *const (),
-        ),
-        (
-            "ll_math::math_cos",
-            "math_cos",
-            math::jit_math_cos_raw as *const (),
-        ),
-        (
-            "ll_math::math_tan",
-            "math_tan",
-            math::jit_math_tan_raw as *const (),
-        ),
-        (
-            "ll_math::math_asin",
-            "math_asin",
-            math::jit_math_asin_raw as *const (),
-        ),
-        (
-            "ll_math::math_acos",
-            "math_acos",
-            math::jit_math_acos_raw as *const (),
-        ),
-        (
-            "ll_math::math_atan",
-            "math_atan",
-            math::jit_math_atan_raw as *const (),
-        ),
-        (
-            "ll_math::math_sinh",
-            "math_sinh",
-            math::jit_math_sinh_raw as *const (),
-        ),
-        (
-            "ll_math::math_cosh",
-            "math_cosh",
-            math::jit_math_cosh_raw as *const (),
-        ),
-        (
-            "ll_math::math_tanh",
-            "math_tanh",
-            math::jit_math_tanh_raw as *const (),
-        ),
-        (
-            "ll_math::math_asinh",
-            "math_asinh",
-            math::jit_math_asinh_raw as *const (),
-        ),
-        (
-            "ll_math::math_acosh",
-            "math_acosh",
-            math::jit_math_acosh_raw as *const (),
-        ),
-        (
-            "ll_math::math_atanh",
-            "math_atanh",
-            math::jit_math_atanh_raw as *const (),
-        ),
-        (
-            "ll_math::math_fmod",
-            "math_fmod",
-            math::jit_math_fmod_raw as *const (),
-        ),
-    ] {
-        pair(entries, module_path, root_path, fnptr);
-    }
-
     fn single(entries: &mut Vec<(&'static str, i64)>, path: &'static str, fnptr: *const ()) {
         let addr = fnptr as usize as i64;
         if addr != 0 {
@@ -594,25 +435,6 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         }
     }
 
-    // `%` over two floats: `lloperation.py` has no `float_mod`, so the
-    // codewriter lowers it to a residual call of this name carrying the C
-    // `fmod` signature rather than the raising wrapper's.
-    single(
-        entries,
-        "ll_math_fmod",
-        math::jit_math_fmod_raw as *const (),
-    );
-
-    // `pymath` is outside the extraction set, so every call of it reaches the
-    // artifact as an un-lowerable target.  `ulp` takes and returns one float,
-    // which the residual-call ABI carries, so binding its real address makes
-    // the call executable; the rest of the family returns `Result<f64, _>`,
-    // which is wider than a result slot, and stays unpublished.
-    single(
-        entries,
-        "pymath::math::misc::ulp",
-        pymath::math::ulp as *const (),
-    );
     #[cfg(all(
         not(target_arch = "wasm32"),
         feature = "host_env",
@@ -1294,25 +1116,5 @@ mod tests {
             ),
             "moved _lsprof #[pyre_methods] wrappers must publish residual fnaddrs",
         );
-    }
-
-    #[test]
-    fn jit_trace_fnaddrs_covers_moved_ll_math_hypot() {
-        let bindings: HashMap<&'static str, i64> =
-            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
-        assert!(
-            bindings.contains_key("ll_math::math_hypot"),
-            "moved ll_math hypot residual must publish after optional-module register",
-        );
-        assert!(
-            bindings.contains_key("math_hypot"),
-            "the crate-root hypot alias must resolve too",
-        );
-        for leaf in ["math_asin", "math_acosh", "math_expm1", "math_log1p"] {
-            assert!(
-                bindings.contains_key(leaf),
-                "ll_math {leaf} residual must publish after optional-module register",
-            );
-        }
     }
 }

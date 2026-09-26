@@ -29,6 +29,7 @@ pub mod _warnings;
 pub mod _weakref;
 pub mod array;
 pub mod atexit;
+pub mod cmath;
 pub mod errno;
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 pub mod faulthandler;
@@ -37,6 +38,7 @@ pub mod imp;
 pub mod importlib;
 pub mod itertools;
 pub mod marshal;
+pub mod math;
 pub mod operator;
 pub mod posix;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
