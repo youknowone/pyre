@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=205
-# pyre-check: spec-folds=import_cached
 N = 400000
 
 

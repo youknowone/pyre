@@ -1,6 +1,5 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-interpreted
-# pyre-check: spec-folds=builtin_locals_trace_limit_cut
 # The `locals()` expansion's own trace_limit cut, witnessed.
 #
 # `pyjitpl.py` `MetaInterp._interpret` asks `blackhole_if_trace_too_long()`
