@@ -2224,6 +2224,107 @@ impl AssemblerEncode for Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            // `jtransform.py rewrite_op_getinteriorfield`: GcArray of Struct
+            // lowers to `getinteriorfield_gc_{i,r,f}(v_inst, v_index, descr)`.
+            OpKind::InteriorFieldRead {
+                base,
+                index,
+                field,
+                item_ty: _,
+                array_type_id,
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                assert_eq!(
+                    kc, 'r',
+                    "getinteriorfield base must be Ref (gc), got {kc:?} — graph {:?}",
+                    self.current_graph_name,
+                );
+                state.code.push(reg);
+                argcodes.push(kc);
+                let (reg, kc) = self.lookup_reg_with_kind_var(index, regallocs);
+                assert_eq!(
+                    kc, 'i',
+                    "getinteriorfield index must be int-kind, got {kc:?} — \
+                     graph {:?}, array_type_id {array_type_id:?}",
+                    self.current_graph_name,
+                );
+                state.code.push(reg);
+                argcodes.push(kc);
+                let descr = interiorfield_bh_descr(
+                    callcontrol,
+                    array_type_id,
+                    &field.name,
+                    &self.current_graph_name,
+                );
+                let descr_idx = self.emit_ready_descr(descr);
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                // `bhimpl_getinteriorfield_gc_{i,r,f}` keys off the result
+                // register kind (`@arguments("cpu", "r", "i", "d", returns="X")`),
+                // the same way `rewrite_op_getfield` keys `getfield_gc_*`.
+                let result_kind = if let Some(result) = op.result.as_ref() {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                    kc
+                } else {
+                    'v'
+                };
+                let opname = format!("getinteriorfield_gc_{result_kind}");
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+            // `jtransform.py rewrite_op_setinteriorfield`:
+            // `setinteriorfield_gc_{i,r,f}(v_inst, v_index, v_value, descr)`.
+            OpKind::InteriorFieldWrite {
+                base,
+                index,
+                field,
+                value,
+                item_ty: _,
+                array_type_id,
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                assert_eq!(
+                    kc, 'r',
+                    "setinteriorfield base must be Ref (gc), got {kc:?} — graph {:?}",
+                    self.current_graph_name,
+                );
+                state.code.push(reg);
+                argcodes.push(kc);
+                let (reg, kc) = self.lookup_reg_with_kind_var(index, regallocs);
+                assert_eq!(
+                    kc, 'i',
+                    "setinteriorfield index must be int-kind, got {kc:?} — \
+                     graph {:?}, array_type_id {array_type_id:?}",
+                    self.current_graph_name,
+                );
+                state.code.push(reg);
+                argcodes.push(kc);
+                // `rewrite_op_setinteriorfield` passes `v_value` through;
+                // the op stores a register (`ArrayWrite`'s variable arm).
+                // `setinteriorfield_gc_*` is not in `USE_C_FORM` (`assembler.py`).
+                let (reg, value_kind) = self.lookup_reg_with_kind_var(value, regallocs);
+                state.code.push(reg);
+                argcodes.push(value_kind);
+                let descr = interiorfield_bh_descr(
+                    callcontrol,
+                    array_type_id,
+                    &field.name,
+                    &self.current_graph_name,
+                );
+                let descr_idx = self.emit_ready_descr(descr);
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let opname = format!("setinteriorfield_gc_{value_kind}");
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
             // `arraylen_gc(array, arraydescr)` — `len(l.items)` reads the
             // GcArray length header. Operand shape `rd>i`: base reg + descr
             // + int result. The descr is `arraydescrof(ARRAY)` with a
@@ -4689,6 +4790,46 @@ fn raw_carray_descrof(
         interior_fields: Vec::new(),
         is_gc_managed: false,
     }
+}
+
+/// `cpu.interiorfielddescrof(ARRAY, fieldname)` (`descr.py`) wrapped as
+/// the `BhDescr::InteriorField` `emit_ready_descr` stores.
+///
+/// `idx` is `DescrIndexRegistry::interiorfield_index`, the same
+/// `(array_type_id, fieldname)` namespace `push_interior_effect` and
+/// `heaptracker::all_interiorfielddescrs` pass to `interiorfielddescrof`.
+/// An access with no descr would address the wrong bytes, so a missing
+/// `CallControl` or a `None` mint panics instead of encoding bare registers.
+fn interiorfield_bh_descr(
+    callcontrol: Option<&CallControl>,
+    array_type_id: &Option<String>,
+    field_name: &str,
+    graph_name: &Option<String>,
+) -> crate::jitcode::BhDescr {
+    let Some(cc) = callcontrol else {
+        panic!(
+            "interior field access requires a CallControl \
+             (jtransform.py rewrite_op_getinteriorfield) — \
+             graph {graph_name:?}, array {array_type_id:?}, field {field_name}"
+        );
+    };
+    let idx = cc
+        .descr_indices
+        .interiorfield_index(array_type_id, field_name);
+    let Some(descr) = cc.interiorfielddescrof(idx, array_type_id, field_name) else {
+        panic!(
+            "interiorfielddescrof returned no descr \
+             (jtransform.py rewrite_op_getinteriorfield) — \
+             graph {graph_name:?}, array {array_type_id:?}, field {field_name}"
+        );
+    };
+    let Some(ifd) = descr.as_interior_field_descr() else {
+        panic!(
+            "interiorfielddescrof did not return an InteriorFieldDescr — \
+             graph {graph_name:?}, array {array_type_id:?}, field {field_name}"
+        );
+    };
+    crate::jitcode::BhDescr::from_interior_field_descr(ifd)
 }
 
 /// jtransform.py:773,802 cpu.arraydescrof(ARRAY) equivalent.
@@ -8220,5 +8361,182 @@ mod tests {
         assert_eq!(asm._register_liveness_offset(&[2], &[], &[]), prefix.len());
         asm.prepend_embedded_liveness(&prefix);
         assert_eq!(asm.all_liveness(), [prefix.as_slice(), &original].concat());
+    }
+
+    fn point_struct_callcontrol() -> crate::call::CallControl {
+        let mut cc = crate::call::CallControl::new();
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "Point".to_string(),
+            vec![
+                ("x".to_string(), "i64".to_string()),
+                ("p".to_string(), "&PyObject".to_string()),
+            ],
+        );
+        cc.set_struct_fields(registry);
+        cc.set_known_struct_names(["Point".to_string()].into_iter().collect());
+        cc
+    }
+
+    /// `jtransform.py rewrite_op_getinteriorfield` emits
+    /// `getinteriorfield_gc_i/rid>i` plus an `InteriorFieldDescr` for the field.
+    #[test]
+    fn interior_field_read_encodes_getinteriorfield_with_descr() {
+        use crate::model::{FieldDescriptor, OpKind, ValueType};
+
+        let cc = point_struct_callcontrol();
+        let mut graph = crate::model::FunctionGraph::new("interior_read");
+        let base = push_input_var(&mut graph, "arr", ValueType::Ref(None));
+        let index = push_input_var(&mut graph, "i", ValueType::Int);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::InteriorFieldRead {
+                    base: base.clone(),
+                    index: index.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    item_ty: ValueType::Int,
+                    array_type_id: Some("Vec<Point>".into()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        crate::model::FunctionGraph::set_concretetype_of_inline(
+            &base,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        crate::model::FunctionGraph::set_concretetype_of_inline(
+            &index,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        crate::model::FunctionGraph::set_concretetype_of_inline(
+            &result,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        assert!(
+            asm.insns.contains_key("getinteriorfield_gc_i/rid>i"),
+            "expected getinteriorfield_gc_i/rid>i, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        let descrs = asm.snapshot_descrs();
+        assert!(
+            descrs.iter().any(|d| matches!(
+                d,
+                crate::jitcode::BhDescr::InteriorField { field, .. }
+                    if matches!(
+                        field.as_ref(),
+                        crate::jitcode::BhDescr::Field { name, .. } if name == "x" || name.ends_with(".x")
+                    )
+            )),
+            "expected an interior field descr for x, got {descrs:?}"
+        );
+    }
+
+    /// `jtransform.py rewrite_op_setinteriorfield` emits
+    /// `setinteriorfield_gc_r/rird` plus an `InteriorFieldDescr` for the field.
+    #[test]
+    fn interior_field_write_encodes_setinteriorfield_with_descr() {
+        use crate::model::{FieldDescriptor, OpKind, ValueType};
+
+        let cc = point_struct_callcontrol();
+        let mut graph = crate::model::FunctionGraph::new("interior_write");
+        let base = push_input_var(&mut graph, "arr", ValueType::Ref(None));
+        let index = push_input_var(&mut graph, "i", ValueType::Int);
+        let value = push_input_var(&mut graph, "v", ValueType::Ref(None));
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::InteriorFieldWrite {
+                base: base.clone(),
+                index: index.clone(),
+                field: FieldDescriptor::new("p", Some("Point".into())),
+                value: value.clone(),
+                item_ty: ValueType::Ref(None),
+                array_type_id: Some("Vec<Point>".into()),
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+        crate::model::FunctionGraph::set_concretetype_of_inline(
+            &base,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        crate::model::FunctionGraph::set_concretetype_of_inline(
+            &index,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        crate::model::FunctionGraph::set_concretetype_of_inline(
+            &value,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        assert!(
+            asm.insns.contains_key("setinteriorfield_gc_r/rird"),
+            "expected setinteriorfield_gc_r/rird, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        let descrs = asm.snapshot_descrs();
+        assert!(
+            descrs.iter().any(|d| matches!(
+                d,
+                crate::jitcode::BhDescr::InteriorField { field, .. }
+                    if matches!(
+                        field.as_ref(),
+                        crate::jitcode::BhDescr::Field { name, .. } if name == "p" || name.ends_with(".p")
+                    )
+            )),
+            "expected an interior field descr for p, got {descrs:?}"
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn interior_field_read_without_descr_panics() {
+        use crate::model::{FieldDescriptor, OpKind, ValueType};
+
+        let cc = point_struct_callcontrol();
+        let mut graph = crate::model::FunctionGraph::new("interior_missing");
+        let base = push_input_var(&mut graph, "arr", ValueType::Ref(None));
+        let index = push_input_var(&mut graph, "i", ValueType::Int);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::InteriorFieldRead {
+                    base: base.clone(),
+                    index: index.clone(),
+                    field: FieldDescriptor::new("x", Some("Missing".into())),
+                    item_ty: ValueType::Int,
+                    array_type_id: Some("Vec<Missing>".into()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        crate::model::FunctionGraph::set_concretetype_of_inline(
+            &base,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        crate::model::FunctionGraph::set_concretetype_of_inline(
+            &index,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        crate::model::FunctionGraph::set_concretetype_of_inline(
+            &result,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
     }
 }

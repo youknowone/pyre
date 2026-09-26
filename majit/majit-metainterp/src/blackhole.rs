@@ -11168,6 +11168,18 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
             majit_jitcode::insns::BC_GETINTERIORFIELD_GC_F,
         ),
         (
+            "setinteriorfield_gc_i/riid",
+            majit_jitcode::insns::BC_SETINTERIORFIELD_GC_I,
+        ),
+        (
+            "setinteriorfield_gc_r/rird",
+            majit_jitcode::insns::BC_SETINTERIORFIELD_GC_R,
+        ),
+        (
+            "setinteriorfield_gc_f/rifd",
+            majit_jitcode::insns::BC_SETINTERIORFIELD_GC_F,
+        ),
+        (
             "cast_float_to_int/f>i",
             majit_jitcode::insns::BC_CAST_FLOAT_TO_INT,
         ),

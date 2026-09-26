@@ -103,6 +103,15 @@ pub const BC_STRGETITEM: u8 = 243;
 /// `strgetitem` with a `USE_C_FORM` index (`assembler.py`).
 pub const BC_STRGETITEM_C: u8 = 244;
 
+/// `setinteriorfield_gc_{i,r,f}` — `blackhole.py`
+/// `bhimpl_setinteriorfield_gc_{i,r,f}`
+/// (`@arguments("cpu", "r", "i", "i"|"r"|"f", "d")`).
+/// The load siblings occupy bytes 3–5; these stores take the next free
+/// bytes above [`BC_STRGETITEM_C`] so existing serialised assignments stay put.
+pub const BC_SETINTERIORFIELD_GC_I: u8 = 245;
+pub const BC_SETINTERIORFIELD_GC_R: u8 = 246;
+pub const BC_SETINTERIORFIELD_GC_F: u8 = 247;
+
 /// "This cached control opcode is absent" sentinel for the
 /// `blackhole.py:72-74` fields (`op_live`, `op_catch_exception`,
 /// `op_rvmprof_code`).
@@ -1097,6 +1106,11 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("getinteriorfield_gc_i/rid>i", BC_GETINTERIORFIELD_GC_I);
     m.insert("getinteriorfield_gc_r/rid>r", BC_GETINTERIORFIELD_GC_R);
     m.insert("getinteriorfield_gc_f/rid>f", BC_GETINTERIORFIELD_GC_F);
+    // `blackhole.py` `bhimpl_setinteriorfield_gc_{i,r,f}`
+    // (`@arguments("cpu", "r", "i", "i"|"r"|"f", "d")`).
+    m.insert("setinteriorfield_gc_i/riid", BC_SETINTERIORFIELD_GC_I);
+    m.insert("setinteriorfield_gc_r/rird", BC_SETINTERIORFIELD_GC_R);
+    m.insert("setinteriorfield_gc_f/rifd", BC_SETINTERIORFIELD_GC_F);
 
     // List item load — `blackhole.py bhimpl_getlistitem_gc_i`
     // `bhimpl_getlistitem_gc_{i,r,f}`
