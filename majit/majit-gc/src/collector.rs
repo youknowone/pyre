@@ -2895,9 +2895,27 @@ impl MiniMarkGC {
     ///
     /// Varsize types are exempt: their items live past `size` and the length
     /// is not readable here.
-    fn audit_allocation_size(&self, type_id: u32, total_size: usize, obj_addr: usize, kind: &str) {
+    /// `PYRE_GC_SIZE_AUDIT`. Read once; `finish_alloc_in_oldgen` asks this
+    /// together with the other birth diagnostics.
+    fn allocation_size_audit_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ENABLED.get_or_init(|| std::env::var_os("PYRE_GC_SIZE_AUDIT").is_some()) {
+        *ENABLED.get_or_init(|| std::env::var_os("PYRE_GC_SIZE_AUDIT").is_some())
+    }
+
+    /// One flag for every per-allocation diagnostic `finish_alloc_in_oldgen`
+    /// used to test separately: `bh_probe_enabled`, `PYRE_GC_SIZE_AUDIT`,
+    /// `gc_lifetime_log_enabled`, and `note_bh_object` (which is the probe).
+    fn oldgen_birth_diagnostics_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            crate::bh_probe_enabled()
+                || crate::gc_lifetime_log_enabled()
+                || Self::allocation_size_audit_enabled()
+        })
+    }
+
+    fn audit_allocation_size(&self, type_id: u32, total_size: usize, obj_addr: usize, kind: &str) {
+        if !Self::allocation_size_audit_enabled() {
             return;
         }
         if (type_id as usize) >= self.types.len() {
@@ -2933,14 +2951,6 @@ impl MiniMarkGC {
         ptr: *mut u8,
         extra_flags: GcFlags,
     ) -> GcRef {
-        if crate::bh_probe_enabled() {
-            let lo = self.nursery.start_ptr() as usize;
-            crate::BH_PROBE_NURSERY_LO.store(lo, std::sync::atomic::Ordering::Relaxed);
-            crate::BH_PROBE_NURSERY_HI.store(
-                lo + self.nursery.size(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
         let hdr = unsafe { &mut *(ptr as *mut GcHeader) };
         // Old objects start with TRACK_YOUNG_PTRS set (they need write barrier).
         // incminimark.py:1080 ORs it in after the card question, so it reaches
@@ -2954,6 +2964,26 @@ impl MiniMarkGC {
         // `size_objects_made_old` counts promotions, not old-gen births.
         // `external_malloc(..., alloc_young=False)` does not bump it.
         let obj_addr = (ptr as usize) + GcHeader::SIZE;
+        // `malloc_fixedsize` reads destructor / finalizer / weakref off the
+        // flags the caller already holds. With every birth diagnostic off and
+        // a type that registers none of those, one flag and one type-table
+        // read (`type_alloc_is_plain`) answer the same question.
+        if !Self::oldgen_birth_diagnostics_enabled()
+            && ((type_id as usize) >= self.types.len() || self.type_alloc_is_plain(type_id))
+        {
+            if self.threshold_reached(total_size) && deferred_major_request_wanted() {
+                majit_ir::eval_breaker_word::set_gc();
+            }
+            return GcRef(obj_addr);
+        }
+        if crate::bh_probe_enabled() {
+            let lo = self.nursery.start_ptr() as usize;
+            crate::BH_PROBE_NURSERY_LO.store(lo, std::sync::atomic::Ordering::Relaxed);
+            crate::BH_PROBE_NURSERY_HI.store(
+                lo + self.nursery.size(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         self.audit_allocation_size(type_id, total_size, obj_addr, "oldgen");
         if crate::gc_lifetime_log_enabled() {
             // Pairs with `[gc][free]`: whether a dangling reference names an
@@ -2982,9 +3012,10 @@ impl MiniMarkGC {
             if info.is_weakref {
                 self.old_objects_with_weakrefs.push(obj_addr);
             }
-        }
-        if self.type_has_old_style_finalizer(type_id) {
-            self.register_finalizer_index(-1, GcRef(obj_addr));
+            // `q_is_old_style_finalizer` from the same `TypeInfo` read.
+            if info.old_style_finalizer.is_some() {
+                self.register_finalizer_index(-1, GcRef(obj_addr));
+            }
         }
         crate::note_bh_object(
             obj_addr,

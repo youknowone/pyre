@@ -389,6 +389,20 @@ pub fn dispatch_safepoint(breaker: usize) {
     }
 }
 
+/// Periodic half of `executioncontext.py action_dispatcher`: the action
+/// ticker has wrapped, or an urgent `EB_GC` fired it. Runs next to the
+/// other `PeriodicAsyncAction`s. `poll_due` is not decremented here; the
+/// bytecode countdown is `ActionFlag.decrement_ticker`.
+#[cold]
+pub fn on_ticker_wrap() {
+    let breaker = majit_ir::eval_breaker_word::load();
+    if breaker & majit_ir::eval_breaker_word::EB_GC != 0 {
+        safepoint();
+    } else if breaker & majit_ir::eval_breaker_word::EB_GC_INTERP != 0 {
+        poll_safepoint();
+    }
+}
+
 /// The `action_dispatcher` half of [`dispatch_safepoint`]: the ticker has
 /// already crossed zero, so ask the collector without decrementing it again.
 #[majit_macros::dont_look_inside]

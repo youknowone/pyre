@@ -305,6 +305,11 @@ pub fn is_finalizing() -> bool {
     FINALIZING.load(Ordering::Acquire)
 }
 
+/// Whether this thread is the one running interpreter teardown.
+pub(crate) fn current_is_finalizing_thread() -> bool {
+    is_finalizing() && FINALIZING_THREAD.load(Ordering::Acquire) == current_ident()
+}
+
 /// Stop a non-owner mutator from running Python once interpreter teardown has
 /// begun.  The forgotten blocking guard keeps it outside the GC RUNNING census;
 /// process exit terminates these daemon OS threads after the owner completes
@@ -449,6 +454,8 @@ pub(crate) fn has_pending_async_exception() -> bool {
 pub(crate) fn set_trace_all_execution_contexts(w_func: PyObjectRef) {
     *TRACE_ALL_HOOK.lock() = w_func as usize;
     TRACE_ALL_GENERATION.fetch_add(1, Ordering::Release);
+    // Other threads observe the generation at the next `decrement_ticker`.
+    majit_ir::eval_breaker_word::fire_action_ticker();
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     if !ec.is_null() {
         let _ = unsafe { apply_all_thread_hooks(&mut *ec) };
@@ -460,6 +467,7 @@ pub(crate) fn set_profile_all_execution_contexts(
 ) -> Result<(), crate::PyError> {
     *PROFILE_ALL_HOOK.lock() = w_func as usize;
     PROFILE_ALL_GENERATION.fetch_add(1, Ordering::Release);
+    majit_ir::eval_breaker_word::fire_action_ticker();
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     if !ec.is_null() {
         unsafe { apply_all_thread_hooks(&mut *ec)? };

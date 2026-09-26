@@ -291,8 +291,12 @@ pub fn get_root_stack_limit_addr() -> usize {
 }
 
 thread_local! {
-    /// Thread-local shadow stack for individual GcRef roots.
-    static SHADOW_STACK: RefCell<ShadowStack> = const { RefCell::new(ShadowStack::new()) };
+    /// Thread-local shadow stack for individual GcRef roots.  No destructor:
+    /// see [`ShadowStack`]; [`SHADOW_STACK_OWNER`] frees the buffer.
+    static SHADOW_STACK: ShadowStack = const { ShadowStack::new() };
+
+    /// Registered on the first [`ShadowStack::init`]; see [`ShadowStackOwner`].
+    static SHADOW_STACK_OWNER: ShadowStackOwner = const { ShadowStackOwner };
 
     /// Long-lived translated livevar slots whose owners are not lexical
     /// `push`/`pop_to` scopes.  RPython assigns these values fixed shadow-stack
@@ -353,7 +357,7 @@ thread_local! {
 /// be mutably accessed by its owner during a walk.
 struct MutatorEntry {
     thread_id: std::thread::ThreadId,
-    shadow_stack: *const RefCell<ShadowStack>,
+    shadow_stack: *const ShadowStack,
     owner_roots: *const RefCell<Vec<Option<GcRef>>>,
     jf_root_stack: *const RefCell<JitFrameShadowStack>,
     bh_regs_stack: *const RefCell<Vec<BhRegsEntry>>,
@@ -447,7 +451,12 @@ static MUTATOR_REGISTRY: Mutex<Vec<MutatorEntry>> = Mutex::new(Vec::new());
 /// arming with an extra step.
 pub fn register_mutator() {
     let thread_id = std::thread::current().id();
-    let shadow_stack = SHADOW_STACK.with(|stack| stack as *const _);
+    // `init` registers [`SHADOW_STACK_OWNER`]'s destructor here, before
+    // `RuntimeThread`'s, so the buffer outlives this registry entry.
+    let shadow_stack = SHADOW_STACK.with(|stack| {
+        stack.init();
+        stack as *const ShadowStack
+    });
     let owner_roots = OWNER_ROOTS.with(|roots| roots as *const _);
     let jf_root_stack = JF_ROOT_STACK.with(|stack| stack as *const _);
     let bh_regs_stack = BH_REGS_STACK.with(|stack| stack as *const _);
@@ -688,35 +697,169 @@ pub fn after_fork_child() {
     registry.retain(|entry| entry.thread_id == thread_id);
 }
 
-/// The shadow stack itself.
+/// The GcRef shadow stack — `gcdata.root_stack_base` / `root_stack_top`
+/// (`shadowstack.py`), with the `limit` cell [`JitFrameShadowStack`] also
+/// keeps so a push sees the end of the buffer without a separate depth load.
+///
+/// Holds no `Vec` and no `RefCell`.  A thread-local carrying drop glue pays a
+/// registration-state check on every access, and a `RefCell` adds a borrow
+/// flag test and two stores around each push and pop; upstream's push is a
+/// store and a bump of `root_stack_top`.  The buffer is raw-allocated once at
+/// `root_stack_depth` slots, as `_prepare_unused_stack` does
+/// (`shadowstack.py`), and released by [`ShadowStackOwner`].
 struct ShadowStack {
-    entries: Vec<GcRef>,
+    base: Cell<*mut GcRef>,
+    top: Cell<*mut GcRef>,
+    limit: Cell<*mut GcRef>,
     /// shadowstack.py:281 `root_stack_depth`, which upstream keeps on the
     /// `ShadowStackPool` beside the stack it caps rather than in a key of its
     /// own.  Growable via `increase_root_stack_depth`; can never shrink.
-    max_depth: usize,
+    max_depth: Cell<usize>,
 }
 
 impl ShadowStack {
     const fn new() -> Self {
         ShadowStack {
-            entries: Vec::new(),
-            max_depth: DEFAULT_SHADOW_STACK_DEPTH,
+            base: Cell::new(std::ptr::null_mut()),
+            top: Cell::new(std::ptr::null_mut()),
+            limit: Cell::new(std::ptr::null_mut()),
+            max_depth: Cell::new(DEFAULT_SHADOW_STACK_DEPTH),
         }
+    }
+
+    fn layout_for(depth: usize) -> std::alloc::Layout {
+        std::alloc::Layout::array::<GcRef>(depth).expect("shadow stack layout")
+    }
+
+    /// Slots in use — `root_stack_top - root_stack_base`.
+    #[inline(always)]
+    fn len(&self) -> usize {
+        let base = self.base.get();
+        if base.is_null() {
+            return 0;
+        }
+        // SAFETY: `top` is derived from `base` within the one live buffer.
+        unsafe { self.top.get().offset_from(base) as usize }
+    }
+
+    fn capacity(&self) -> usize {
+        let base = self.base.get();
+        if base.is_null() {
+            return 0;
+        }
+        // SAFETY: `limit` is the one-past-the-end pointer of `base`'s buffer.
+        unsafe { self.limit.get().offset_from(base) as usize }
+    }
+
+    /// `_prepare_unused_stack` on first use, then
+    /// `increase_root_stack_depth`: allocate `max_depth` slots, copy the used
+    /// portion over and re-derive base/top/limit.  Never shrinks.
+    #[cold]
+    fn init(&self) {
+        let depth = self.max_depth.get();
+        if depth <= self.capacity() {
+            return;
+        }
+        // Registering the free-at-exit hook here keeps the hot key
+        // destructor-free.
+        let _ = SHADOW_STACK_OWNER.try_with(|_| ());
+        let old_base = self.base.get();
+        let used = self.len();
+        // SAFETY: a non-zero array layout; zeroed slots read as null roots.
+        let new_base = unsafe { std::alloc::alloc_zeroed(Self::layout_for(depth)) } as *mut GcRef;
+        assert!(!new_base.is_null(), "shadow stack allocation failed");
+        if !old_base.is_null() {
+            // SAFETY: `used` live slots, non-overlapping fresh destination.
+            unsafe { std::ptr::copy_nonoverlapping(old_base, new_base, used) };
+            // SAFETY: the old buffer came from this allocator with this layout;
+            // callers hold depths, not slot addresses, across a push.
+            unsafe { std::alloc::dealloc(old_base as *mut u8, Self::layout_for(self.capacity())) };
+        }
+        self.base.set(new_base);
+        // SAFETY: both offsets are inside or one past the new buffer.
+        unsafe {
+            self.top.set(new_base.add(used));
+            self.limit.set(new_base.add(depth));
+        }
+    }
+
+    /// `incr_stack(1)` with the store — returns the depth the root took.
+    #[inline(always)]
+    fn push(&self, gcref: GcRef) -> usize {
+        let mut top = self.top.get();
+        if top == self.limit.get() {
+            assert!(self.base.get().is_null(), "shadow stack overflow");
+            self.init();
+            top = self.top.get();
+        }
+        // SAFETY: `top` is below `limit`, so it names a live slot.
+        unsafe {
+            *top = gcref;
+            self.top.set(top.add(1));
+        }
+        self.len() - 1
+    }
+
+    /// `decr_stack` to an absolute depth; a depth at or above the current one
+    /// leaves the stack alone.
+    #[inline(always)]
+    fn truncate(&self, depth: usize) {
+        if depth < self.len() {
+            // SAFETY: `depth` is below the live length.
+            self.top.set(unsafe { self.base.get().add(depth) });
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, index: usize) -> GcRef {
+        assert!(index < self.len(), "shadow stack index out of range");
+        // SAFETY: `index` is below the live length.
+        unsafe { *self.base.get().add(index) }
+    }
+
+    /// The live slots, for a root walk.
+    ///
+    /// # Safety
+    /// No push may run while the returned slice is alive.
+    unsafe fn slots_mut(&self) -> &mut [GcRef] {
+        let base = self.base.get();
+        if base.is_null() {
+            return &mut [];
+        }
+        // SAFETY: `base..top` is the live prefix of the one buffer.
+        unsafe { std::slice::from_raw_parts_mut(base, self.len()) }
+    }
+}
+
+/// Frees [`SHADOW_STACK`]'s buffer when the thread exits.  It lives in its own
+/// thread-local key, touched only from [`ShadowStack::init`], so the key on
+/// the push/read path keeps no destructor of its own.
+struct ShadowStackOwner;
+
+impl Drop for ShadowStackOwner {
+    fn drop(&mut self) {
+        let _ = SHADOW_STACK.try_with(|stack| {
+            let base = stack.base.get();
+            if base.is_null() {
+                return;
+            }
+            let layout = ShadowStack::layout_for(stack.capacity());
+            stack.base.set(std::ptr::null_mut());
+            stack.top.set(std::ptr::null_mut());
+            stack.limit.set(std::ptr::null_mut());
+            // SAFETY: the buffer came from this allocator with this layout and
+            // the cells that named it have just been cleared.
+            unsafe { std::alloc::dealloc(base as *mut u8, layout) };
+        });
     }
 }
 
 // ── GcRef shadow stack (individual refs) ─────────────────────────
 
 /// Push a GC reference onto the shadow stack.
+#[inline]
 pub fn push(gcref: GcRef) -> usize {
-    SHADOW_STACK.with(|ss| {
-        let mut ss = ss.borrow_mut();
-        let depth = ss.entries.len();
-        assert!(depth < ss.max_depth, "shadow stack overflow");
-        ss.entries.push(gcref);
-        depth
-    })
+    SHADOW_STACK.with(|ss| ss.push(gcref))
 }
 
 /// Pop entries from the shadow stack back to the given depth.
@@ -734,34 +877,26 @@ pub fn push(gcref: GcRef) -> usize {
 /// needs.  A plain `assert!` and not `debug_assert!` — this crate is
 /// extracted to LLBC, where debug assertions are compiled in.
 ///
-/// `try_with` and not `with`.  Rust registers a thread-local's destructor when
-/// the thread first touches it and runs the registered destructors in reverse,
-/// so anything reached from inside another thread-local's destructor can run
-/// after `SHADOW_STACK`'s own has fired, and `with` answers that with an
-/// `AccessError` panic.  Nothing pops from a thread-local destructor today —
-/// the guards that pop are stack locals, and the one destructor that does run
-/// at thread exit, `pyre_interpreter::module::thread`'s `RuntimeThread`,
-/// unregisters the mutator rather than popping — so this is a standing
-/// precaution and not a live path.  RPython has no analogous hazard at all:
-/// the GIL thread does not tear its thread-locals down mid-run.
+/// `SHADOW_STACK` has no destructor, so the key is never torn down and the
+/// access cannot fail even from another thread-local's destructor; once
+/// [`ShadowStackOwner`] has freed the buffer the stack reads as empty.
+#[inline]
 pub fn pop_to(depth: usize) {
-    let _ = SHADOW_STACK.try_with(|ss| {
-        let mut ss = ss.borrow_mut();
+    SHADOW_STACK.with(|ss| {
+        let len = ss.len();
         assert!(
-            depth <= ss.entries.len(),
-            "shadow stack pop_to({depth}) above depth {}",
-            ss.entries.len(),
+            depth <= len,
+            "shadow stack pop_to({depth}) above depth {len}"
         );
-        ss.entries.truncate(depth);
+        ss.truncate(depth);
     });
 }
 
 /// [`pop_to`] without the balance assertion.
 ///
-/// Not the teardown-tolerant half of a pair: both reach the thread-local
-/// through `try_with` and both no-op once it is destroyed.  The assert is the
-/// whole difference, and `Vec::truncate` saturates, so a depth above the
-/// current one leaves the stack alone rather than shortening it.
+/// Not the teardown-tolerant half of a pair: the assert is the whole
+/// difference, and the truncate saturates, so a depth above the current one
+/// leaves the stack alone rather than shortening it.
 ///
 /// The callers that want it are all `Drop` impls — `FrameRoot` in both the
 /// jit and the call-jit evaluator, `FrameAnchor`, and the `RootGuard`s inside
@@ -770,19 +905,15 @@ pub fn pop_to(depth: usize) {
 /// the original panic's report with it.  That is a choice per site, not a rule
 /// about destructors: `ExportedState::release_roots` and
 /// `Trace::release_roots` are `Drop` paths that keep the assert.
+#[inline]
 pub fn try_pop_to(depth: usize) {
-    let _ = SHADOW_STACK.try_with(|ss| {
-        let mut ss = ss.borrow_mut();
-        ss.entries.truncate(depth);
-    });
+    SHADOW_STACK.with(|ss| ss.truncate(depth));
 }
 
 /// Get a GcRef at the given index.
+#[inline]
 pub fn get(index: usize) -> GcRef {
-    SHADOW_STACK.with(|ss| {
-        let ss = ss.borrow();
-        ss.entries[index]
-    })
+    SHADOW_STACK.with(|ss| ss.get(index))
 }
 
 /// Acquire a fixed translated-livevar root slot.
@@ -891,7 +1022,7 @@ impl Drop for OwnerRootGuard {
 /// once-per-function `gc_enter_roots_frame` resolution and the x86 JIT's
 /// register-cached root-stack top.
 #[derive(Clone, Copy)]
-pub struct ShadowStackSlot(*const RefCell<ShadowStack>);
+pub struct ShadowStackSlot(*const ShadowStack);
 
 /// Resolve this thread's `SHADOW_STACK` cell once, for reuse by [`slot_get`].
 pub fn shadow_stack_slot() -> ShadowStackSlot {
@@ -906,20 +1037,19 @@ pub fn shadow_stack_slot() -> ShadowStackSlot {
 #[inline]
 pub fn top() -> (ShadowStackSlot, usize) {
     SHADOW_STACK.with(|ss| {
-        let len = ss.borrow().entries.len();
+        let len = ss.len();
         assert!(len > 0, "shadow stack empty");
         (ShadowStackSlot(ss as *const _), len - 1)
     })
 }
 
-/// Get the top GcRef through one thread-local resolve and one borrow.
+/// Get the top GcRef through one thread-local resolve.
 #[inline]
 pub fn top_ref() -> GcRef {
     SHADOW_STACK.with(|ss| {
-        let ss = ss.borrow();
-        let len = ss.entries.len();
+        let len = ss.len();
         debug_assert!(len > 0, "shadow stack empty");
-        ss.entries[len - 1]
+        ss.get(len - 1)
     })
 }
 
@@ -929,11 +1059,11 @@ pub fn top_ref() -> GcRef {
 ///
 /// `slot` must have been produced by [`shadow_stack_slot`] on the current
 /// thread and the thread must still be alive (its `SHADOW_STACK` not yet torn
-/// down). No `&mut` borrow of the cell may be held across this call.
+/// down).
+#[inline]
 pub unsafe fn slot_get(slot: ShadowStackSlot, index: usize) -> GcRef {
     // SAFETY: per the contract, `slot.0` points at the live owning-thread cell.
-    let ss = unsafe { &*slot.0 }.borrow();
-    ss.entries[index]
+    unsafe { &*slot.0 }.get(index)
 }
 
 /// Walk all entries on the GcRef shadow stack.
@@ -946,8 +1076,8 @@ pub unsafe fn slot_get(slot: ShadowStackSlot, index: usize) -> GcRef {
 /// `walk_stack_root`'s `if content:` in `shadowstack.py`.
 pub fn walk_roots(mut visitor: impl FnMut(&mut GcRef)) {
     SHADOW_STACK.with(|ss| {
-        let mut ss = ss.borrow_mut();
-        for entry in ss.entries.iter_mut() {
+        // SAFETY: the visitor forwards slots in place and never pushes.
+        for entry in unsafe { ss.slots_mut() } {
             if !entry.is_null() {
                 visitor(entry);
             }
@@ -964,10 +1094,10 @@ pub fn walk_roots(mut visitor: impl FnMut(&mut GcRef)) {
 
 /// Walk every registered mutator's GcRef shadow stack during STW.
 ///
-/// This deliberately bypasses `RefCell::borrow_mut`: a RefCell borrow is a
-/// same-thread runtime check and must not be used as the synchronization
-/// mechanism for foreign TLS. gc_sync's quiescence is what makes the raw
-/// dereferences and in-place forwarding sound.
+/// This deliberately bypasses `RefCell::borrow_mut` on the owner-root cell: a
+/// RefCell borrow is a same-thread runtime check and must not be used as the
+/// synchronization mechanism for foreign TLS. gc_sync's quiescence is what
+/// makes the raw dereferences and in-place forwarding sound.
 pub fn walk_all_roots(mut visitor: impl FnMut(&mut GcRef)) {
     debug_assert!(
         crate::gc_sync::mutators_quiesced(),
@@ -977,8 +1107,8 @@ pub fn walk_all_roots(mut visitor: impl FnMut(&mut GcRef)) {
     for mutator in registry.iter() {
         // SAFETY: every registered mutator is quiesced, and registry removal
         // precedes the owner's RUNNING decrement and TLS destruction.
-        let ss = unsafe { &mut *(*mutator.shadow_stack).as_ptr() };
-        for entry in ss.entries.iter_mut() {
+        let ss = unsafe { (*mutator.shadow_stack).slots_mut() };
+        for entry in ss.iter_mut() {
             if !entry.is_null() {
                 visitor(entry);
             }
@@ -994,14 +1124,11 @@ pub fn walk_all_roots(mut visitor: impl FnMut(&mut GcRef)) {
 
 /// Current depth of the GcRef shadow stack.
 ///
-/// Answers through `try_with` for the reason [`pop_to`] gives.
-/// Returns 0 when the TLS has been destroyed; callers running under
-/// Drop (e.g. `ExportedState::release_roots`) observe an empty
-/// stack instead of panicking on the destroyed key.
+/// Returns 0 once [`ShadowStackOwner`] has freed the buffer; callers running
+/// under Drop (e.g. `ExportedState::release_roots`) observe an empty stack.
+#[inline]
 pub fn depth() -> usize {
-    SHADOW_STACK
-        .try_with(|ss| ss.borrow().entries.len())
-        .unwrap_or(0)
+    SHADOW_STACK.with(|ss| ss.len())
 }
 
 /// rpython/memory/gctransform/shadowstack.py increase_root_stack_depth
@@ -1016,9 +1143,11 @@ pub fn depth() -> usize {
 /// `int(new_limit * 0.001 * 163840)` (pypy/module/sys/vm.py).
 pub fn increase_root_stack_depth(new_depth: usize) {
     SHADOW_STACK.with(|ss| {
-        let mut ss = ss.borrow_mut();
-        if new_depth > ss.max_depth {
-            ss.max_depth = new_depth;
+        if new_depth > ss.max_depth.get() {
+            ss.max_depth.set(new_depth);
+            if !ss.base.get().is_null() {
+                ss.init();
+            }
         }
     });
     JF_ROOT_STACK.with(|stack| {
@@ -1030,7 +1159,7 @@ pub fn increase_root_stack_depth(new_depth: usize) {
 
 /// Clear both shadow stacks.
 pub fn clear() {
-    SHADOW_STACK.with(|ss| ss.borrow_mut().entries.clear());
+    SHADOW_STACK.with(|ss| ss.truncate(0));
     OWNER_ROOTS.with(|roots| roots.borrow_mut().clear());
     JF_ROOT_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
@@ -1369,7 +1498,7 @@ pub unsafe fn push_bh_regs_with_live(
     BH_REGS_STACK.with(|ss| {
         let mut ss = ss.borrow_mut();
         let depth = ss.len();
-        let max = SHADOW_STACK.with(|s| s.borrow().max_depth);
+        let max = SHADOW_STACK.with(|s| s.max_depth.get());
         assert!(depth < max, "blackhole regs stack overflow");
         ss.push(BhRegsEntry {
             regs_ptr: regs.as_mut_ptr(),
@@ -2031,10 +2160,9 @@ pub extern "C" fn majit_shadow_stack_push(gcref_raw: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn majit_shadow_stack_pop_and_get(_depth: i64, index: i64) -> i64 {
     SHADOW_STACK.with(|ss| {
-        let ss = ss.borrow();
         let idx = index as usize;
-        if idx < ss.entries.len() {
-            ss.entries[idx].0 as i64
+        if idx < ss.len() {
+            ss.get(idx).0 as i64
         } else {
             0
         }
@@ -2044,10 +2172,7 @@ pub extern "C" fn majit_shadow_stack_pop_and_get(_depth: i64, index: i64) -> i64
 /// Set shadow stack depth (truncate).
 #[unsafe(no_mangle)]
 pub extern "C" fn majit_shadow_stack_set_depth(new_depth: i64) {
-    SHADOW_STACK.with(|ss| {
-        let mut ss = ss.borrow_mut();
-        ss.entries.truncate(new_depth as usize);
-    });
+    SHADOW_STACK.with(|ss| ss.truncate(new_depth as usize));
 }
 
 /// Read the top jf_ptr from the jitframe shadow stack.

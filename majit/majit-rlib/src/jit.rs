@@ -5,35 +5,22 @@
 //! the `ref_isvirtual` / `*_isconstant` ops; the bodies here are the
 //! untranslated residual (`rlib/jit.py isconstant` / `isvirtual`).
 //!
-//! `we_are_jitted` is a hook because this crate cannot depend on
-//! `majit-backend`.  `pyre-jit` / the metainterp install
-//! [`majit_backend::we_are_jitted`] at process start.
-
-use std::sync::atomic::{AtomicPtr, Ordering};
-
-static WE_ARE_JITTED: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+//! `we_are_jitted` is `_we_are_jitted = CDefinedIntSymbolic('0 /* we are not
+//! jitted here */', default=0)`: the translated interpreter reads a literal
+//! `0`, and only the codewriter's view of a graph folds it to true.
 
 /// `rlib/jit.py we_are_jitted`.
 ///
 /// `inline(never)` so Charon keeps the call. `jtransform.rs`
 /// `fold_we_are_jitted_calls` rewrites it to `_we_are_jitted`, then
 /// jitcode folds that to const true (`jtransform.py`
-/// `rewrite_op_int_is_true` of `_we_are_jitted`). Inlining the hook
-/// body leaves an AtomicPtr load the fold cannot see.
+/// `rewrite_op_int_is_true` of `_we_are_jitted`).  Natively the body is the
+/// symbolic's C value, so a `look_inside_iff` dispatch in the running
+/// interpreter never pays a thread-local read to choose between two arms
+/// that both call the original function.
 #[inline(never)]
 pub fn we_are_jitted() -> bool {
-    let p = WE_ARE_JITTED.load(Ordering::Relaxed);
-    if p.is_null() {
-        return false;
-    }
-    let f: fn() -> bool = unsafe { std::mem::transmute(p) };
-    f()
-}
-
-/// Install the process-wide `we_are_jitted` reader.  Called once from
-/// `init_jit_hooks`.
-pub fn install_we_are_jitted(f: fn() -> bool) {
-    WE_ARE_JITTED.store(f as *mut (), Ordering::Relaxed);
+    false
 }
 
 /// `rlib/jit.py isconstant`.

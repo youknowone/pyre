@@ -879,23 +879,26 @@ impl ModuleDictStrategy {
     ///         if (not space.config.objspace.honor__builtins__ and
     ///                 cell is None and
     ///                 w_dict is not space.builtin.w_dict):
-    ///             # …attach `cache.builtincache` …
+    ///             w_builtin_dict = space.builtin.w_dict
+    ///             assert isinstance(w_builtin_dict, W_ModuleDictObject)
+    ///             builtin_strategy = w_builtin_dict.mstrategy
+    ///             if isinstance(builtin_strategy, ModuleDictStrategy):
+    ///                 cell = builtin_strategy.getdictvalue_no_unwrapping(
+    ///                         w_builtin_dict, key)
+    ///                 # logic: if the global is not defined but the builtin is,
+    ///                 # cache it. otherwise don't cache the builtin ever
+    ///                 if cell is not None:
+    ///                     builtincache = builtin_strategy.get_global_cache(
+    ///                             w_builtin_dict, key)
+    ///                     cache.builtincache = builtincache
     ///         self.caches[key] = cache
     ///     return cache
     /// ```
     ///
-    /// Pyre's `space` analogue always picks the builtin per frame
-    /// (`PyFrame.w_builtin` assigned at construction, mirroring
-    /// `pyframe.py self.builtin = space.builtin.pick_builtin
-    /// (w_globals)` under `honor__builtins__=True`).  Per
-    /// `celldict.py not space.config.objspace.honor__builtins__`
-    /// the builtincache install is therefore a no-op — attaching a
-    /// cache keyed to `space.builtin.w_dict` would mis-fire whenever
-    /// a frame's picked builtin differs from the singleton.  Only the
-    /// per-dict cell cache is installed here; the builtin lookup
-    /// stays a live `space.finditem_str(frame.w_builtin.w_dict, name)`
-    /// at every call (see `load_global_via_cache` final fallback in
-    /// `pyre-interpreter/src/eval.rs`).
+    /// `w_builtin_dict` is `space.builtin.w_dict` when
+    /// `honor__builtins__` is off, and null when it is on: `pyre-object`
+    /// has no `space` to read either from, so the interpreter-side caller
+    /// resolves both.
     #[expect(
         clippy::arc_with_non_send_sync,
         reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
@@ -904,6 +907,7 @@ impl ModuleDictStrategy {
         &mut self,
         w_dict: PyObjectRef,
         key: &str,
+        w_builtin_dict: PyObjectRef,
     ) -> std::sync::Arc<parking_lot::Mutex<GlobalCache>> {
         let mut cache_registry = self.caches.lock();
         // `celldict.py`:
@@ -927,17 +931,35 @@ impl ModuleDictStrategy {
             return cache;
         }
         let cell = self.getdictvalue_no_unwrapping(w_dict, key);
+        let mut cache = GlobalCache::new(cell);
+        if !w_builtin_dict.is_null()
+            && cell.is_none()
+            && !std::ptr::eq(w_dict, w_builtin_dict)
+            && unsafe { crate::dictmultiobject::is_module_dict(w_builtin_dict) }
+            && !unsafe { crate::dictmultiobject::w_module_dict_is_object_strategy(w_builtin_dict) }
+        {
+            // A different dict's strategy, so no alias of `self`; its
+            // `caches` lock nests inside this one and never the reverse.
+            let builtin_strategy = unsafe {
+                crate::dictmultiobject::w_module_dict_module_strategy_mut(w_builtin_dict)
+            };
+            if builtin_strategy
+                .getdictvalue_no_unwrapping(w_builtin_dict, key)
+                .is_some()
+            {
+                cache.builtincache = Some(builtin_strategy.get_global_cache(
+                    w_builtin_dict,
+                    key,
+                    crate::pyobject::PY_NULL,
+                ));
+            }
+        }
         let caches = cache_registry.as_mut().unwrap();
-        // `celldict.py cache = GlobalCache(cell)`.  Lines 224-238
-        // (`if not honor__builtins__ and cell is None and w_dict is
-        // not space.builtin.w_dict:` …) are skipped because pyre is
-        // permanently in `honor__builtins__=True` mode (see method
-        // docstring above); builtincache attachment is unreachable.
         // The fresh cache duplicates the (possibly nursery-young) cell /
         // value pointer into walker-only storage (`walk_cache_cells`);
         // record the store like any other prebuilt-family write.
         crate::gc_roots::mark_prebuilt_roots_dirty();
-        let cache = std::sync::Arc::new(parking_lot::Mutex::new(GlobalCache::new(cell)));
+        let cache = std::sync::Arc::new(parking_lot::Mutex::new(cache));
         caches.insert(key.to_string(), cache.clone());
         cache
     }
@@ -1090,6 +1112,9 @@ impl ModuleDictStrategy {
         unsafe {
             crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict).set(key, w_to_store);
         }
+        // The store lands in `w_dict.dstorage`; an in-place `write_cell`
+        // above barriered the cell it wrote instead.
+        crate::dictmultiobject::dict_write_barrier(w_dict);
         // `celldict.py:88-90`: keep any live cache for `key` in step
         // with the new stored value so subsequent LOAD_GLOBAL through
         // the cache reads the fresh entry without an invalidation
