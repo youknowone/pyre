@@ -2156,31 +2156,54 @@ impl Bookkeeper {
     /// to `SomeInstance(variant_k)` in arm `k` through `follow_link`'s
     /// `improve` (binaryop.py).  `enum_root` is the receiver class
     /// name; the variant table is dual-keyed by qualified path and bare
-    /// leaf, so either spelling resolves.  Returns `None` when the class
-    /// is not a registered enum root (the read then stays a plain
-    /// `SomeInteger`).
+    /// leaf, so either spelling resolves.  A receiver already narrowed to
+    /// a variant subclass (`importing::GcdCache::Miss`) has no `<…>` for
+    /// [`majit_ir::descr::strip_instantiation_suffix`] to cut, and its
+    /// final segment is the variant, not the enum leaf — walk each `::`
+    /// parent (and that parent's bare leaf) so the read resolves the same
+    /// table as the base.  Returns `Ok(None)` when the class is not a
+    /// registered enum root (the read then stays a plain `SomeInteger`).
+    /// Once a registered root's table is found, a variant classdef that
+    /// cannot be built is an [`AnnotatorError`], not a silent `None`.
     pub fn enum_variant_narrowing_knowntypedata(
         self: &Rc<Self>,
         enum_root: &str,
         receiver: &Rc<crate::flowspace::model::Variable>,
-    ) -> Option<super::model::KnownTypeData> {
+    ) -> Result<Option<super::model::KnownTypeData>, AnnotatorError> {
         let by_discr = {
             // The discriminant→variant table is keyed by the bare
             // charon-template root (one template per generic ADT), so a
             // per-instantiation receiver name (`Result<bool>`) must drop
             // its `<…>` suffix to resolve.  Bare names pass through
-            // unchanged.
+            // unchanged.  A variant-qualified name with no `<…>`
+            // (`module::Enum::Variant`) is not reduced by that cut; each
+            // `::` parent is tried, exact key then bare leaf, until a
+            // registered root hits.
             let lookup_root = majit_ir::descr::strip_instantiation_suffix(enum_root);
             let guard = self.enum_variant_by_discriminant.borrow();
-            let map = guard.as_ref()?;
-            map.get(lookup_root)
-                .or_else(|| {
-                    lookup_root
-                        .rsplit("::")
-                        .next()
-                        .and_then(|leaf| map.get(leaf))
-                })
-                .cloned()?
+            let Some(map) = guard.as_ref() else {
+                return Ok(None);
+            };
+            let mut cursor = lookup_root;
+            let found = loop {
+                if let Some(hit) = map.get(cursor) {
+                    break Some(hit);
+                }
+                if let Some(leaf) = cursor.rsplit("::").next()
+                    && leaf != cursor
+                    && let Some(hit) = map.get(leaf)
+                {
+                    break Some(hit);
+                }
+                let Some((parent, _)) = cursor.rsplit_once("::") else {
+                    break None;
+                };
+                cursor = parent;
+            };
+            let Some(found) = found else {
+                return Ok(None);
+            };
+            found.clone()
         };
         // A receiver already narrowed to a variant subclass
         // (`Option<T>::None`) reaches this read with `enum_root` carrying
@@ -2202,9 +2225,8 @@ impl Bookkeeper {
         };
         let mut ktd = super::model::KnownTypeData::new();
         for (discr, variant_name) in &by_discr {
-            let variant_cd = self
-                .getuniqueclassdef_for_enum_variant(base_enum_root, variant_name)
-                .ok()?;
+            let variant_cd =
+                self.getuniqueclassdef_for_enum_variant(base_enum_root, variant_name)?;
             let s_variant = SomeValue::Instance(super::model::SomeInstance::new(
                 Some(variant_cd),
                 false,
@@ -2217,7 +2239,7 @@ impl Bookkeeper {
                 s_variant,
             );
         }
-        Some(ktd)
+        Ok(Some(ktd))
     }
 
     /// TODO: no upstream equivalent.  The closest thing upstream,
@@ -5595,6 +5617,7 @@ mod tests {
         let receiver = Rc::new(Variable::new());
         let ktd = bk
             .enum_variant_narrowing_knowntypedata("Color", &receiver)
+            .expect("variant classdefs build")
             .expect("enum root has a variant table");
 
         // One knowntypedata case per variant, keyed by the integer tag.
@@ -5632,6 +5655,7 @@ mod tests {
         let other_recv = Rc::new(Variable::new());
         assert!(
             bk.enum_variant_narrowing_knowntypedata("NotAnEnum", &other_recv)
+                .expect("unregistered class is not an annotator error")
                 .is_none(),
             "non-enum class yields no knowntypedata"
         );
@@ -5674,9 +5698,11 @@ mod tests {
         let receiver = Rc::new(Variable::new());
         let from_base = bk
             .enum_variant_narrowing_knowntypedata("Opt<i64>", &receiver)
+            .expect("variant classdefs build")
             .expect("base enum resolves the variant table");
         let from_variant = bk
             .enum_variant_narrowing_knowntypedata("Opt<i64>::A", &receiver)
+            .expect("variant classdefs build")
             .expect("an already-narrowed receiver still resolves the base table");
 
         let classdef_of = |ktd: &crate::annotator::model::KnownTypeData, discr: i64| match ktd
@@ -5695,6 +5721,71 @@ mod tests {
                 ),
                 "Int({discr}): narrowing an already-narrowed receiver must reuse \
                  the base variant classdef, not deepen it (::A::A)"
+            );
+        }
+    }
+
+    #[test]
+    fn enum_variant_narrowing_resolves_module_qualified_variant_classdef() {
+        // `importing::GcdCache::Miss` has no `<…>` for
+        // `strip_instantiation_suffix` to cut, and the table is published
+        // under the bare leaf `GcdCache` plus the crate-qualified root —
+        // not under `Miss` or `importing::GcdCache`.  A `__discriminant`
+        // read on the already-narrowed variant classdef must attach the
+        // same knowntypedata as a read on the base.
+        use crate::annotator::model::{ExitCaseKey, SomeValue};
+        use crate::flowspace::model::Variable;
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        for name in [
+            "GcdCache",
+            "importing::GcdCache",
+            "pyre_interpreter::importing::GcdCache",
+        ] {
+            reg.fields.insert(
+                name.to_string(),
+                vec![("__discriminant".to_string(), "i64".to_string())],
+            );
+        }
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut by_discr: HashMap<i64, String> = HashMap::new();
+        by_discr.insert(0, "Miss".to_string());
+        by_discr.insert(1, "Ready".to_string());
+        by_discr.insert(2, "Initializing".to_string());
+        let mut map: HashMap<String, HashMap<i64, String>> = HashMap::new();
+        map.insert("GcdCache".to_string(), by_discr.clone());
+        map.insert(
+            "pyre_interpreter::importing::GcdCache".to_string(),
+            by_discr,
+        );
+        bk.set_enum_variant_by_discriminant(Rc::new(map));
+
+        let receiver = Rc::new(Variable::new());
+        let from_base = bk
+            .enum_variant_narrowing_knowntypedata("importing::GcdCache", &receiver)
+            .expect("variant classdefs build")
+            .expect("module-qualified base resolves via the bare leaf");
+        let from_variant = bk
+            .enum_variant_narrowing_knowntypedata("importing::GcdCache::Miss", &receiver)
+            .expect("variant classdefs build")
+            .expect("variant classdef resolves the same enum table");
+        assert_eq!(from_base.len(), 3);
+        assert_eq!(from_variant.len(), 3);
+        for discr in [0i64, 1, 2] {
+            let classdef_of = |ktd: &crate::annotator::model::KnownTypeData| match ktd
+                .get(&ExitCaseKey::Int(discr))
+                .and_then(|c| c.get(&receiver))
+            {
+                Some(SomeValue::Instance(si)) => si.classdef.clone().expect("classdef"),
+                other => panic!("Int({discr}) expected SomeInstance, got {other:?}"),
+            };
+            assert!(
+                Rc::ptr_eq(&classdef_of(&from_base), &classdef_of(&from_variant)),
+                "Int({discr}): variant-qualified receiver must reuse the base variant classdef"
             );
         }
     }
