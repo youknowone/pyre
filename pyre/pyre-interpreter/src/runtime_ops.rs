@@ -627,6 +627,15 @@ pub fn compare_op_from_tag(tag: i64) -> Option<ComparisonOperator> {
     })
 }
 
+/// One-word residual ABI for [`build_list_from_refs`].
+///
+/// The items argument is a length-prefixed `GcTypedArray` (`bh_newlist_from_array`).
+#[majit_macros::dont_look_inside]
+pub extern "C" fn build_list_from_refs_jit_abi(array: i64) -> i64 {
+    let items = pyre_object::gc_roots::gcarray_ref_items(array);
+    build_list_from_refs(&items) as i64
+}
+
 pub fn build_list_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
     // BUILD_LIST pops the elements first, so they live only in this slice
     // while `w_list_new` allocates. Pin them and hand the constructor the
@@ -637,6 +646,15 @@ pub fn build_list_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
         .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
         .collect();
     w_list_new(live)
+}
+
+/// One-word residual ABI for [`build_tuple_from_refs`].
+///
+/// Same length-prefixed array word as [`build_list_from_refs_jit_abi`].
+#[majit_macros::dont_look_inside]
+pub extern "C" fn build_tuple_from_refs_jit_abi(array: i64) -> i64 {
+    let items = pyre_object::gc_roots::gcarray_ref_items(array);
+    build_tuple_from_refs(&items) as i64
 }
 
 pub fn build_tuple_from_refs(items: &[PyObjectRef]) -> PyObjectRef {

@@ -816,6 +816,28 @@ pub fn publish_roots(roots: &[PyObjectRef]) -> usize {
     })
 }
 
+/// One-word residual ABI for [`publish_roots`].
+///
+/// `&[PyObjectRef]` is `Ptr(GcArray(Ptr(PyObject)))`: one word, length at
+/// offset 0 (`bh_newtuple_from_array`). The executor passes that word, not a
+/// fat `(ptr, len)` pair.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn publish_roots_jit_abi(array: i64) -> i64 {
+    let items = gcarray_ref_items(array);
+    publish_roots(&items) as i64
+}
+
+/// Copy the items of a length-prefixed ref `GcTypedArray` word.
+pub fn gcarray_ref_items(array: i64) -> Vec<PyObjectRef> {
+    let arr = array as *const crate::object_array::GcTypedArray;
+    let len = crate::object_array::gcarray_len(arr);
+    let mut items = Vec::with_capacity(len);
+    for index in 0..len {
+        items.push(crate::object_array::getarrayitem_ref(arr, index));
+    }
+    items
+}
+
 /// Resolve forwarding across the `len` published slots starting at `base` —
 /// the half of the pin that is itself a GC operation. See [`pin_root`] for why
 /// a value copied into the bracket from outside it can already name a

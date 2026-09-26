@@ -1624,6 +1624,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::reload_top_root",
         pyre_object::gc_roots::reload_top_root_jit_abi,
     );
+    // `&[PyObjectRef]` arrives as one length-prefixed array word.
+    cpa1(
+        &mut entries,
+        "pyre_object::gc_roots::publish_roots",
+        "pyre_object::publish_roots",
+        pyre_object::gc_roots::publish_roots_jit_abi,
+    );
     // The scope-local pair a bracket body spells as `roots.pin_root(w)` /
     // `roots.get(slot)`: the same pin through the cached cell, and its
     // read-back half.  The codewriter names an inherent method by its
@@ -1668,6 +1675,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::unicodeobject::w_str_from_codepoint",
         "pyre_object::w_str_from_codepoint",
         pyre_object::unicodeobject::w_str_from_codepoint,
+    );
+    cpa1(
+        &mut entries,
+        "pyre_interpreter::runtime_ops::build_tuple_from_refs",
+        "pyre_interpreter::build_tuple_from_refs",
+        crate::runtime_ops::build_tuple_from_refs_jit_abi,
+    );
+    cpa1(
+        &mut entries,
+        "pyre_interpreter::runtime_ops::build_list_from_refs",
+        "pyre_interpreter::build_list_from_refs",
+        crate::runtime_ops::build_list_from_refs_jit_abi,
     );
     pa4(
         &mut entries,

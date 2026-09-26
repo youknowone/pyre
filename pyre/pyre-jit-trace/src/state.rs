@@ -1096,56 +1096,85 @@ pub fn frame_locals_cells_stack_array_ref(ctx: &mut TraceCtx, frame: OpRef) -> O
     frame_locals_cells_stack_array(ctx, frame)
 }
 
-/// warmspot.py:282 metainterp_sd.jitcodes[jitcode_index]:
-/// Resolve jitcode_index (sequential int from snapshot numbering)
-/// to the corresponding CodeObject pointer.
-pub fn code_for_jitcode_index(jitcode_index: i32) -> Option<*const ()> {
+/// One index space. `CodeWriter.make_jitcodes` numbers each body, `warmspot`
+/// stores that list on `pyjitpl.py` `MetaInterpStaticData.jitcodes`, and
+/// `resume.py` `rebuild_from_resumedata` / `blackhole.py` `resume_in_blackhole`
+/// index only that list.
+///
+/// A build-time index (`index < jitcode_runtime::jitcode_count()`) is a vacant
+/// skeleton until this materializes the frozen body into `sd.jitcodes[index]`
+/// via [`ensure_build_time_jitcode_at`]. That helper borrows `METAINTERP_SD`
+/// itself, so the check drops its borrow before the call. Runtime indices stay
+/// `>= jitcode_count()` and take the straight `sd.jitcodes` read; the default
+/// non-interpret path only carries those.
+///
+/// Returns the payload only when the slot is occupied by a real body. A shared
+/// null skeleton is a vacant marker and is never stamped.
+pub fn jitcode_payload_at(jitcode_index: i32) -> Option<std::sync::Arc<crate::PyJitCode>> {
+    if jitcode_index < 0 {
+        return None;
+    }
+    let index = jitcode_index as usize;
     ensure_finish_setup();
+    let build_time_len = crate::jitcode_runtime::jitcode_count();
+    let needs_reserve = METAINTERP_SD.with(|r| r.borrow().jitcodes.len() < build_time_len);
+    if needs_reserve {
+        METAINTERP_SD.with(|r| r.borrow_mut().reserve_build_time_index_space());
+    }
+    if index < build_time_len {
+        let vacant = METAINTERP_SD.with(|r| {
+            let sd = r.borrow();
+            sd.jitcodes
+                .get(index)
+                .map(|entry| entry.payload.is_skeleton())
+                .unwrap_or(true)
+        });
+        if vacant {
+            ensure_build_time_jitcode_at(index);
+        }
+    }
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
-        let idx = jitcode_index as usize;
-        sd.jitcodes.get(idx).map(|jc| {
-            pyre_interpreter::live_code_wrapper(jc.payload.code_ptr as *const ()) as *const ()
+        sd.jitcodes.get(index).and_then(|entry| {
+            if entry.payload.is_skeleton() {
+                None
+            } else {
+                Some(std::sync::Arc::clone(&entry.payload))
+            }
         })
     })
 }
 
-/// warmspot.py:282 `metainterp_sd.jitcodes[jitcode_index]` helper:
-/// resolve the indexed runtime entry to its canonical raw `CodeObject*`.
+/// `MetaInterpStaticData.jitcodes[jitcode_index]`: resolve the snapshot index
+/// to the corresponding CodeObject pointer.
+pub fn code_for_jitcode_index(jitcode_index: i32) -> Option<*const ()> {
+    let payload = jitcode_payload_at(jitcode_index)?;
+    Some(pyre_interpreter::live_code_wrapper(payload.code_ptr as *const ()) as *const ())
+}
+
+/// `MetaInterpStaticData.jitcodes[jitcode_index]` helper: resolve the indexed
+/// entry to its canonical raw `CodeObject*`.
 ///
 /// Unlike [`code_for_jitcode_index`], this strips the wrapper round-trip
 /// up front for callers that only need the graph identity to re-enter
 /// `CallControl.jitcodes`.
 pub fn raw_code_for_jitcode_index(jitcode_index: i32) -> Option<*const CodeObject> {
-    ensure_finish_setup();
-    METAINTERP_SD.with(|r| {
-        let sd = r.borrow();
-        let idx = jitcode_index as usize;
-        // A novable drain portal (the jd1 unpackiterable driver) is a native
-        // function with no Python `CodeObject`; its degenerate PyJitCode carries
-        // a null `code_ptr`. Report that as "no raw code" so the instruction-
-        // decoding consumers (bare-reraise probe, traceback lineno) skip it
-        // instead of dereferencing null.
-        sd.jitcodes.get(idx).and_then(|jc| {
-            let raw = unsafe { jc.raw_code() };
-            (!raw.is_null()).then_some(raw)
-        })
-    })
+    let payload = jitcode_payload_at(jitcode_index)?;
+    // A novable drain portal (the jd1 unpackiterable driver) is a native
+    // function with no Python `CodeObject`; its degenerate PyJitCode carries
+    // a null `code_ptr`. Report that as "no raw code" so the instruction-
+    // decoding consumers (bare-reraise probe, traceback lineno) skip it
+    // instead of dereferencing null.
+    let raw = payload.code_ptr;
+    (!raw.is_null()).then_some(raw)
 }
 
 /// Resolve `MetaInterpStaticData.jitcodes[jitcode_index]` to the same
 /// PyJitCode payload the trace-side frame used. This keeps blackhole /
-/// resume consumers on the RPython single-store path instead of
-/// re-looking-up through pyre-jit's CodeWriter side cache.
+/// resume consumers on the single-store path (`resume.py`
+/// `rebuild_from_resumedata`) instead of re-looking-up through a second table.
 pub fn pyjitcode_for_jitcode_index(jitcode_index: i32) -> Option<std::sync::Arc<crate::PyJitCode>> {
-    ensure_finish_setup();
-    METAINTERP_SD.with(|r| {
-        let sd = r.borrow();
-        let idx = jitcode_index as usize;
-        sd.jitcodes
-            .get(idx)
-            .map(|jc| std::sync::Arc::clone(&jc.payload))
-    })
+    jitcode_payload_at(jitcode_index)
 }
 
 /// `PyFrame.frame_finished_execution = True` for a blackhole level that has
@@ -1663,88 +1692,52 @@ fn sub_descr_pool_for_payload(pjc: &crate::PyJitCode) -> SubDescrPool {
 /// return the number of tagged values encoded for a frame at
 /// (jitcode_index, pc).
 ///
-/// Upstream `pyjitpl.py:199` / `jitcode.py`: decode the `-live-`
-/// offset from the jitcode byte stream at `jitcode.get_live_vars_info(
-/// pc, op_live)`, then read the three-byte `[len_i][len_r][len_f]`
-/// header in `all_liveness`. Total live value count = `len_i +
-/// len_r + len_f`.
-///
-/// Fallback: when the jitcode is still a skeleton payload or has no
-/// backing CodeObject, decode via the pyre-jit-trace
-/// `LiveVars` analysis over the Python bytecode. This path is used
-/// for inlined callee frames whose majit_jitcode has not been built
-/// at trace time.
+/// Decode the `-live-` offset from the one `MetaInterpStaticData.jitcodes`
+/// entry at `jitcode.get_live_vars_info(pc, op_live)`, then read the
+/// three-byte `[len_i][len_r][len_f]` header in `liveness_info`. Total live
+/// value count = `len_i + len_r + len_f`. [`jitcode_payload_at`] materializes
+/// a build-time index into that list before the decode.
 pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
-    ensure_finish_setup();
-    METAINTERP_SD.with(|r| {
-        let idx = jitcode_index as usize;
-        let runtime = {
-            let sd = r.borrow();
-            match sd.jitcodes.get(idx) {
-                Some(jc) => {
-                    // Snapshot publication stores only a decodable JitCode `-live-`
-                    // coordinate. An unrepresentable coordinate must have declined
-                    // during capture, before it could reach this frame-boundary
-                    // decoder.
-                    let count = decode_live_var_count(
-                        &jc.payload.jitcode,
-                        pc,
-                        sd.op_live,
-                        &sd.liveness_info,
-                    );
-                    Some((
-                        count,
-                        jc.payload.metadata.n_py_instrs as usize,
-                        sd.liveness_info.len(),
-                    ))
-                }
-                // `record_guard_with_snapshot` (`history.rs`) mints the
-                // interpreter-side vable promotes' resume frame with no
-                // coordinate of its own, marked
-                // `recorder::UNSTAMPED_JITCODE_INDEX`, and the walker re-stamps
-                // it with the real position
-                // (`walker_capture_inline_nonstandard_vable_guard`). Arriving
-                // here still carrying the mark means that re-stamp was missed
-                // and the guard was compiled against a resume coordinate that
-                // names no frame. The frame holds no boxes, so `0` is the
-                // arithmetically right answer and the decode would survive it
-                // — but the guard it belongs to cannot resume, so say so
-                // instead of continuing.
-                None if jitcode_index
-                    == majit_metainterp::recorder::UNSTAMPED_JITCODE_INDEX as i32 =>
-                {
-                    panic!(
-                        "frame_value_count_at: guard resume frame is still \
-                         unstamped (jitcode_index=UNSTAMPED_JITCODE_INDEX, \
-                         pc={pc}) — the `record_guard_with_snapshot` placeholder \
-                         reached the decoder without the walker's real position"
-                    )
-                }
-                None => None,
-            }
-        };
-        let Some((count, n_py_instrs, live_len)) = runtime else {
-            return 0;
-        };
-        if let Some(count) = count {
-            return count;
-        }
-        // `MetaInterp::interpret` inlines extracted helper JitCodes whose
-        // `JitCode::index` is the build-time `all_jitcodes` slot. The
-        // runtime store at that number can be a different body; try the
-        // table the helper was assembled into.
-        if let Some(count) = decode_build_time_live_var_count(jitcode_index, pc) {
-            return count;
-        }
-        // A published non-decodable coordinate violates the capture contract.
-        // This remains a fail-loud internal invariant, not a fallback path.
+    // `record_guard_with_snapshot` (`history.rs`) mints the interpreter-side
+    // vable promotes' resume frame with no coordinate of its own, marked
+    // `recorder::UNSTAMPED_JITCODE_INDEX`, and the walker re-stamps it with
+    // the real position (`walker_capture_inline_nonstandard_vable_guard`).
+    // Arriving here still carrying the mark means that re-stamp was missed
+    // and the guard was compiled against a resume coordinate that names no
+    // frame. The frame holds no boxes, so `0` is the arithmetically right
+    // answer and the decode would survive it — but the guard it belongs to
+    // cannot resume, so say so instead of continuing.
+    if jitcode_index == majit_metainterp::recorder::UNSTAMPED_JITCODE_INDEX as i32 {
         panic!(
-            "frame_value_count_at: fallback hit for jitcode_index={} pc={} \
-             (n_py_instrs={n_py_instrs}, all_liveness.len={live_len}). Phase \
-             X-0/X-1 removed all known triggers — further hits are bugs.",
-            jitcode_index, pc,
-        );
-    })
+            "frame_value_count_at: guard resume frame is still \
+             unstamped (jitcode_index=UNSTAMPED_JITCODE_INDEX, \
+             pc={pc}) — the `record_guard_with_snapshot` placeholder \
+             reached the decoder without the walker's real position"
+        )
+    }
+    // Materialize before borrowing `op_live` / `liveness_info`. A published
+    // coordinate the single list cannot name is a capture bug.
+    let Some(payload) = jitcode_payload_at(jitcode_index) else {
+        panic!(
+            "frame_value_count_at: no jitcode at jitcode_index={jitcode_index} pc={pc} \
+             — `MetaInterpStaticData.jitcodes` (`resume.py` `rebuild_from_resumedata`) \
+             has no body for a published resume coordinate"
+        )
+    };
+    let (op_live, liveness) = METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        (sd.op_live, std::sync::Arc::clone(&sd.liveness_info))
+    });
+    if let Some(count) = decode_live_var_count(&payload.jitcode, pc, op_live, &liveness) {
+        return count;
+    }
+    panic!(
+        "frame_value_count_at: no decodable `-live-` for jitcode_index={jitcode_index} pc={pc} \
+         (n_py_instrs={}, all_liveness.len={}). A published resume coordinate must decode \
+         from `MetaInterpStaticData.jitcodes`.",
+        payload.metadata.n_py_instrs,
+        liveness.len(),
+    );
 }
 
 fn decode_live_var_count(
@@ -1766,85 +1759,14 @@ fn decode_live_var_count(
     Some(length_i + length_r + length_f)
 }
 
-fn decode_build_time_live_var_count(jitcode_index: i32, pc: i32) -> Option<usize> {
-    let op_live = crate::jitcode_runtime::insns_opname_to_byte()
-        .get("live/")
-        .copied()?;
-    let jitcode = crate::jitcode_runtime::get_jitcode_by_index(jitcode_index as usize)?;
-    decode_live_var_count(&jitcode, pc, op_live, &liveness_info_snapshot())
-}
-
-/// [`frame_value_count_at`] for a driver whose frames are numbered in the
-/// build-time `jitcode_runtime` tables instead of the runtime
-/// `MetaInterpStaticData` store.
-///
-/// pyre has two jitcode numbering spaces. jd0 (`pyframe_driver`) numbers
-/// Python-bytecode jitcodes into `MetaInterpStaticData.jitcodes`, keyed by
-/// CodeObject. A novable driver over an extracted interpreter body — jd1
-/// `unpackiterable_driver`, whose jitcode is the
-/// `_unpackiterable_unknown_length` graph plus its inlined build-time callees —
-/// numbers against the lazy build-time jitcode table.
-///
-/// Decoding one space's index against the other's table does not fail loudly,
-/// which is why the store has to be picked per driver rather than tried and
-/// retried: the runtime store's low indices hold unrelated PyCode jitcodes that
-/// decode at the same pc and hand back a mistyped count (the drain's 2 refs
-/// read as ints → `Const::getint on Ref`). Same split, and same reasoning, as
-/// the `novable` arm of `resolve_jitcode` in `call_jit.rs`.
-///
-/// The `-live-` *offsets* are no longer split: the build-time byte stream is
-/// the prefix of `metainterp_sd.liveness_info`
-/// (`Assembler::resuming_build_time_liveness`), so this reads the one pool
-/// `resume.py:1022` reads, exactly like [`frame_value_count_at`]. Only the
-/// jitcode table below is still per-space.
-///
-/// Installed on jd1's `JitDriverStaticData::frame_value_count_fn`, so only that
-/// driver's guard metadata decodes here.
+/// Same decode as [`frame_value_count_at`]. jd1's
+/// `JitDriverStaticData::frame_value_count_fn` still names this function.
+/// Build-time and runtime indices share `MetaInterpStaticData.jitcodes`
+/// (`CodeWriter.make_jitcodes` / `warmspot`); the `-live-` bytes are the
+/// prefix of that staticdata's `liveness_info`
+/// (`Assembler::resuming_build_time_liveness`).
 pub fn build_time_frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
-    // `pyjitpl.py:2236` `self.op_live = self.opcode_implementations...` — the
-    // `live/` byte of the table the jitcode's bytes were assembled with. Read it
-    // off the build-time table rather than `blackhole_control_opcodes()`, whose
-    // value comes from the runtime assembler's `insns`; the two agree
-    // (`jitcode_runtime.rs` `build_default_bh_builder_matches_insns_table`), but
-    // the build-time decode should not depend on the runtime store being set up.
-    let Some(op_live) = crate::jitcode_runtime::insns_opname_to_byte()
-        .get("live/")
-        .copied()
-    else {
-        return 0;
-    };
-    let jitcode = match crate::jitcode_runtime::get_jitcode_by_index(jitcode_index as usize) {
-        Some(jc) => jc,
-        // Same missed re-stamp [`frame_value_count_at`] reports; see the
-        // comment there.
-        None if jitcode_index == majit_metainterp::recorder::UNSTAMPED_JITCODE_INDEX as i32 => {
-            panic!(
-                "build_time_frame_value_count_at: guard resume frame is still \
-                 unstamped (jitcode_index=UNSTAMPED_JITCODE_INDEX, pc={pc}) — \
-                 the `record_guard_with_snapshot` placeholder reached the \
-                 decoder without the walker's real position"
-            )
-        }
-        None => return 0,
-    };
-    let all_liveness = liveness_info_snapshot();
-    if pc >= 0 && jitcode.can_decode_live_vars(pc as usize, op_live) {
-        let off = jitcode.get_live_vars_info(pc as usize, op_live);
-        if off + 2 < all_liveness.len() {
-            let length_i = all_liveness[off] as usize;
-            let length_r = all_liveness[off + 1] as usize;
-            let length_f = all_liveness[off + 2] as usize;
-            return length_i + length_r + length_f;
-        }
-    }
-    // Same fail-loud contract as `frame_value_count_at`: a published resume
-    // coordinate that does not decode violates the capture contract.
-    panic!(
-        "build_time_frame_value_count_at: no decodable `-live-` for \
-         jitcode_index={jitcode_index} pc={pc} (code_len={}, all_liveness.len={})",
-        jitcode.code.len(),
-        all_liveness.len(),
-    );
+    frame_value_count_at(jitcode_index, pc)
 }
 
 /// Resolve the JitCode byte offset the full-body walk should RESUME at for a
@@ -1857,15 +1779,9 @@ pub fn build_time_frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
 /// when the carried word does not name a decodable startpoint, which declines
 /// the bridge at the caller.
 pub fn resolve_bridge_walk_entry_at(jitcode_index: i32, carried_jitcode_pc: i32) -> Option<usize> {
-    ensure_finish_setup();
-    METAINTERP_SD.with(|r| {
-        let sd = r.borrow();
-        let jc = sd.jitcodes.get(jitcode_index as usize)?;
-        let resolved = jc
-            .payload
-            .resolve_bridge_walk_entry_pc(carried_jitcode_pc, sd.op_live);
-        resolved
-    })
+    let payload = jitcode_payload_at(jitcode_index)?;
+    let op_live = METAINTERP_SD.with(|r| r.borrow().op_live);
+    payload.resolve_bridge_walk_entry_pc(carried_jitcode_pc, op_live)
 }
 
 /// virtualizable.py `read_boxes` parity: assemble the
@@ -2014,12 +1930,9 @@ pub fn try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
     jitcode_index: i32,
     carried_jitcode_pc: i32,
 ) -> Option<FrameLivenessRegIndices> {
-    ensure_finish_setup();
+    let payload = jitcode_payload_at(jitcode_index)?;
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
-        let idx = jitcode_index as usize;
-        let jc = sd.jitcodes.get(idx)?;
-        let payload = &jc.payload;
         // No Python-pc reconstruction is available here: an absent carried
         // coordinate declines.
         let jit_pc: usize =
@@ -2074,18 +1987,11 @@ pub(crate) fn frame_liveness_reg_indices_by_bank_from_pc(
 /// `frame.jitcode_pc != NO_JITCODE_PC` twin test: the twin is non-sentinel iff a
 /// marker resolved iff `frame.pc` is a decodable offset.
 pub(crate) fn frame_pc_is_resolved_offset_at(jitcode_index: i32, pc: i32) -> bool {
-    ensure_finish_setup();
-    METAINTERP_SD.with(|r| {
-        let sd = r.borrow();
-        let Some(jc) = sd.jitcodes.get(jitcode_index as usize) else {
-            return false;
-        };
-        pc >= 0
-            && jc
-                .payload
-                .jitcode
-                .can_decode_live_vars(pc as usize, sd.op_live)
-    })
+    let Some(payload) = jitcode_payload_at(jitcode_index) else {
+        return false;
+    };
+    let op_live = METAINTERP_SD.with(|r| r.borrow().op_live);
+    pc >= 0 && payload.jitcode.can_decode_live_vars(pc as usize, op_live)
 }
 
 pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
