@@ -191,25 +191,27 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
             OpCode::GetarrayitemGcF | OpCode::GetarrayitemGcPureF => Some(majit_ir::Type::Float),
             _ => None,
         };
-        let live_value = if let (
-            Some(ty),
-            Some(majit_ir::Value::Ref(array_ref)),
-            Some(majit_ir::Value::Int(index_value)),
-        ) = (
-            load_type,
-            ctx.trace_ctx.box_value(array),
-            ctx.trace_ctx.box_value(index),
-        ) {
-            let array_ptr = array_ref.0 as i64;
+        // `executor.py do_getarrayitem_gc_*` reads `arraybox.getref_base()`
+        // and `indexbox.getint()`. A bridge or inlined helper can hold those
+        // on the MIFrame register shadow when the OpRef itself was not
+        // stamped in this recorder (`concrete_ref_operand_ptr`).
+        let array_ptr = concrete_ref_operand_ptr(code, op, 0, array, ctx);
+        let index_value = match ctx.trace_ctx.box_value(index) {
+            Some(majit_ir::Value::Int(n)) => Some(n),
+            _ => match read_int_reg_concrete(code, op, 1, ctx) {
+                ConcreteValue::Int(n) => Some(n),
+                _ => None,
+            },
+        };
+        let live_value = if let (Some(ty), Some(array_ptr), Some(index_value)) =
+            (load_type, array_ptr, index_value)
+        {
             // A helper walk can put a Ref bit-pattern in an Int index
             // register.  `bh_getarrayitem_gc_r` then SIGBUS
             // (`test.test_dict` `items ^ items`).  On wasm32 that
             // bit-pattern still fits `i32`, so prove `0 <= index < len`
             // instead of a magnitude heuristic.
-            if array_ptr != usize::MAX as i64
-                && array_ptr != 0
-                && index_in_array_bounds(ctx, array_ptr, index_value, &descr)
-            {
+            if index_in_array_bounds(ctx, array_ptr, index_value, &descr) {
                 ctx.trace_ctx
                     .array_sanity_load(array_ptr, index_value, &descr, ty)
             } else {

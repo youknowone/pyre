@@ -623,6 +623,10 @@ pub struct Transformer<'a> {
     /// Threaded for `constant_fold_ll_issubclass`; `None` is the
     /// `cpu is None` no-op arm.
     excmatch: Option<&'a crate::translator::rtyper::rtyper::LowLevelFunction>,
+    /// Result ids whose producer is `ValueType::Unsigned`, captured before
+    /// `r_uint` / `intmask` identity aliases erase that annotation.
+    /// `prefix_unsigned_binop` reads the pre-alias operands against this set.
+    unsigned_vars: std::collections::HashSet<u64>,
 }
 
 /// RPython: `jtransform.py` `vable_flags` values — the `flags` dict
@@ -1102,6 +1106,128 @@ fn reversed_comparison_binop(name: &str) -> &str {
         "uint_gt" => "uint_lt",
         "uint_ge" => "uint_le",
         other => other,
+    }
+}
+
+/// Producers whose result is an unsigned machine word: `r_uint`,
+/// `ConstUInt`, and any op whose result bank is `ValueType::Unsigned`
+/// (including unsigned `wrapping_add`). `getkind(Unsigned) == 'int'`, so
+/// the op name is the only place the signedness survives.
+fn kind_produces_unsigned(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::ConstUInt(_) | OpKind::ConstUInt128(_) => true,
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::VableFieldRead { ty, .. }
+        | OpKind::LoadStatic { ty, .. } => *ty == ValueType::Unsigned,
+        OpKind::ArrayRead { item_ty, .. }
+        | OpKind::InteriorFieldRead { item_ty, .. }
+        | OpKind::VableArrayRead { item_ty, .. }
+        | OpKind::RawLoad { item_ty, .. } => *item_ty == ValueType::Unsigned,
+        OpKind::Call { result_ty, .. }
+        | OpKind::IndirectCall { result_ty, .. }
+        | OpKind::BinOp { result_ty, .. }
+        | OpKind::UnaryOp { result_ty, .. } => *result_ty == ValueType::Unsigned,
+        _ => false,
+    }
+}
+
+/// `IntegerRepr.opprefix` is `uint_` for `lltype.Unsigned`. Record every
+/// result of an unsigned producer, then any phi that receives only those
+/// words. Collected before identity folds so a later `r_uint` alias does
+/// not drop the operand out of the set.
+fn collect_unsigned_vars(graph: &FunctionGraph) -> std::collections::HashSet<u64> {
+    let mut unsigned = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let Some(result) = &op.result
+                && kind_produces_unsigned(&op.kind)
+            {
+                unsigned.insert(result.id());
+            }
+        }
+    }
+    loop {
+        let mut grew = false;
+        for block in &graph.blocks {
+            if block.inputargs.is_empty() {
+                continue;
+            }
+            let incoming: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|pred| &pred.exits)
+                .filter(|link| link.target == block.id)
+                .collect();
+            if incoming.is_empty() {
+                continue;
+            }
+            for (slot, arg) in block.inputargs.iter().enumerate() {
+                if unsigned.contains(&arg.id()) {
+                    continue;
+                }
+                let all_unsigned = incoming.iter().all(|link| {
+                    link.args
+                        .get(slot)
+                        .and_then(|link_arg| link_arg.as_variable())
+                        .is_some_and(|var| unsigned.contains(&var.id()))
+                });
+                if all_unsigned {
+                    unsigned.insert(arg.id());
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    unsigned
+}
+
+/// After `_rewrite_symmetric`, rename `lt`/`le`/`gt`/`ge`/`rshift` to
+/// `uint_*` when both pre-alias operands are unsigned producers.
+/// `eq`/`ne` and wrapping add/sub/mul stay `int_*`. `uint_floordiv` /
+/// `uint_mod` are not emitted (`blackhole.py` has neither).
+fn prefix_unsigned_binop(
+    original: &SpaceOperation,
+    op: SpaceOperation,
+    unsigned: &std::collections::HashSet<u64>,
+) -> SpaceOperation {
+    let OpKind::BinOp { op: name, .. } = &op.kind else {
+        return op;
+    };
+    if !matches!(name.as_str(), "lt" | "le" | "gt" | "ge" | "rshift") {
+        return op;
+    }
+    let OpKind::BinOp {
+        lhs: orig_lhs,
+        rhs: orig_rhs,
+        ..
+    } = &original.kind
+    else {
+        return op;
+    };
+    if !unsigned.contains(&orig_lhs.id()) || !unsigned.contains(&orig_rhs.id()) {
+        return op;
+    }
+    let OpKind::BinOp {
+        op: name,
+        lhs,
+        rhs,
+        result_ty,
+    } = op.kind
+    else {
+        return op;
+    };
+    SpaceOperation {
+        result: op.result,
+        kind: OpKind::BinOp {
+            op: format!("uint_{name}"),
+            lhs,
+            rhs,
+            result_ty,
+        },
     }
 }
 
@@ -1648,6 +1774,7 @@ impl<'a> Transformer<'a> {
             calls_classified: 0,
             analysis_cache: crate::call::AnalysisCache::default(),
             excmatch: None,
+            unsigned_vars: std::collections::HashSet::new(),
         }
     }
 
@@ -1735,6 +1862,11 @@ impl<'a> Transformer<'a> {
         // this spine keeps them to the codewriter, where each is a
         // symbolic residual no host symbol backs.
         crate::codewriter::iter_lower::lower_iterators(&mut rewritten);
+
+        // Before `r_uint` is folded to identity. Later blocks still name
+        // the pre-alias result; `remap_op` would otherwise show the signed
+        // source word.
+        self.unsigned_vars = collect_unsigned_vars(&rewritten);
 
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
@@ -1880,6 +2012,7 @@ impl<'a> Transformer<'a> {
             // `rewrite_op_<name>` for the symmetric ops, so it runs before
             // any other rewriting can look at the operands.
             let op = rewrite_symmetric(graph, op);
+            let op = prefix_unsigned_binop(original_op, op, &self.unsigned_vars);
             let rewritten = self.rewrite_operation(&op, graph_name, graph);
             count_before_last_operation = Some(new_ops.len());
             match rewritten {
@@ -5709,10 +5842,10 @@ impl<'a> Transformer<'a> {
         // otherwise consume it, so fold both through the same identity alias
         // used for no-op coercions (`jtransform.py::_noop_rewrite`).
         //
-        // Aliasing loses the marker's Unsigned annotation, which is why this
-        // sits here and not earlier: the rtyper runs before jtransform and has
-        // already picked `uint_lt` over `int_lt` wherever the annotation
-        // mattered.  Both spellings name the same machine word.
+        // Aliasing drops the marker's Unsigned annotation. Ordered compares
+        // and `rshift` recover it in `prefix_unsigned_binop` from the
+        // pre-alias operands (`IntegerRepr.opprefix` is `uint_`). `eq`/`ne`
+        // stay `int_*`: both spellings are the same machine word.
         if let CallTarget::FunctionPath { segments, .. } = target
             && let [head @ .., leaf] = segments.as_slice()
             && head == ["rpython", "rlib", "rarithmetic"]

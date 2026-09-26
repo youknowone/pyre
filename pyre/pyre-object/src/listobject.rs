@@ -2945,6 +2945,22 @@ pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`, and the caller must hold
 /// `w_list_lock(obj)`.
+/// `rlist.py ll_getitem` (`func is dum_checkidx`): `r_uint(index) >= r_uint(length)`,
+/// then `index = r_uint(index) + r_uint(length)` and the same test again.
+/// `Some` is the `intmask`'d in-range index.
+#[inline(always)]
+fn ll_getitem_index(index: i64, length: i64) -> Option<usize> {
+    let mut index_u = index as u64;
+    let length_u = length as u64;
+    if index_u >= length_u {
+        index_u = index_u.wrapping_add(length_u);
+        if index_u >= length_u {
+            return None;
+        }
+    }
+    Some(index_u as usize)
+}
+
 pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     let list = &*(obj as *const W_ListObject);
     match list.strategy {
@@ -2952,35 +2968,23 @@ pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObj
         ListStrategy::Empty | ListStrategy::Size => None,
         ListStrategy::SimpleRange | ListStrategy::Range => {
             let len = range_list_length(list) as i64;
-            let idx = if index < 0 { index + len } else { index };
-            if idx < 0 || idx >= len {
-                return None;
-            }
-            Some(w_int_new(range_list_item_unchecked(list, idx as usize)))
+            let idx = ll_getitem_index(index, len)?;
+            Some(w_int_new(range_list_item_unchecked(list, idx)))
         }
         ListStrategy::Object => {
             let len = list.length_relaxed() as i64;
-            let idx = if index < 0 { index + len } else { index };
-            if idx < 0 || idx >= len {
-                return None;
-            }
-            Some(ll_list_obj_getitem_fast(list, idx as usize))
+            let idx = ll_getitem_index(index, len)?;
+            Some(ll_list_obj_getitem_fast(list, idx))
         }
         ListStrategy::Integer => {
             let len = ll_list_int_length(list) as i64;
-            let idx = if index < 0 { index + len } else { index };
-            if idx < 0 || idx >= len {
-                return None;
-            }
-            Some(w_int_new(ll_list_int_getitem_fast(list, idx as usize)))
+            let idx = ll_getitem_index(index, len)?;
+            Some(w_int_new(ll_list_int_getitem_fast(list, idx)))
         }
         ListStrategy::IntOrFloat => {
             let len = ll_list_int_length(list) as i64;
-            let idx = if index < 0 { index + len } else { index };
-            if idx < 0 || idx >= len {
-                return None;
-            }
-            let value = ll_list_int_getitem_fast(list, idx as usize);
+            let idx = ll_getitem_index(index, len)?;
+            let value = ll_list_int_getitem_fast(list, idx);
             Some(if int_or_float_is_int(value) {
                 w_int_new(int_or_float_decode_int(value))
             } else {
@@ -2989,27 +2993,18 @@ pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObj
         }
         ListStrategy::Float => {
             let len = ll_list_float_length(list) as i64;
-            let idx = if index < 0 { index + len } else { index };
-            if idx < 0 || idx >= len {
-                return None;
-            }
-            Some(w_float_new(ll_list_float_getitem_fast(list, idx as usize)))
+            let idx = ll_getitem_index(index, len)?;
+            Some(w_float_new(ll_list_float_getitem_fast(list, idx)))
         }
         ListStrategy::Bytes => {
             let len = list.bytes_items.len() as i64;
-            let idx = if index < 0 { index + len } else { index };
-            if idx < 0 || idx >= len {
-                return None;
-            }
-            Some(w_bytes_from_block(list.bytes_items[idx as usize]))
+            let idx = ll_getitem_index(index, len)?;
+            Some(w_bytes_from_block(list.bytes_items[idx]))
         }
         ListStrategy::Ascii => {
             let len = list.ascii_items.len() as i64;
-            let idx = if index < 0 { index + len } else { index };
-            if idx < 0 || idx >= len {
-                return None;
-            }
-            Some(w_str_from_storage(list.ascii_items[idx as usize] as *mut _))
+            let idx = ll_getitem_index(index, len)?;
+            Some(w_str_from_storage(list.ascii_items[idx] as *mut _))
         }
     }
 }
