@@ -17759,10 +17759,24 @@ impl<'a> Lowering<'a> {
         }
         let node = tyref_node(dest_ty, self.llbc)
             .and_then(|node| strip_ty_indirections(node, self.llbc))?;
-        let kind = if json_ty_is_thin_pointer_element(node, self.llbc) {
+        // `T::default` for a thin pointer is otherwise a GCREF
+        // `ConstRefNull`. `fn` / `Option<fn>` are `Ptr(FuncType)`, and
+        // `history.getkind` puts that in the int bank — the same answer
+        // [`tyref_to_value_type_with`] gives. A ref null copied into that
+        // inputarg is the `Move` from Ref to Int.
+        let value_ty = tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves);
+        if matches!(value_ty, ValueType::Int)
+            && (type_node_is_fn_ptr(node, self.llbc)
+                || tyref_option_payload_is_fn_ptr(dest_ty, self.llbc))
+        {
+            return Some(self.graph.push_null_fn_ptr(bb_id));
+        }
+        let kind = if json_ty_is_thin_pointer_element(node, self.llbc)
+            && !matches!(value_ty, ValueType::Int | ValueType::Unsigned)
+        {
             OpKind::ConstRefNull
         } else {
-            match tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves) {
+            match value_ty {
                 ValueType::Int => OpKind::ConstInt(0),
                 ValueType::Unsigned => OpKind::ConstUInt(0),
                 ValueType::Bool => OpKind::ConstBool(false),
@@ -19899,6 +19913,7 @@ impl<'a> Lowering<'a> {
             is_some,
             niche: self.tyref_is_niche_option_ptr(&pointee),
             niche_null_cast: self.option_niche_null_cast(&pointee),
+            fn_ptr: self.option_payload_is_fn_ptr(&pointee),
         })
     }
 
@@ -20973,6 +20988,8 @@ impl<'a> Lowering<'a> {
             result_option_owner,
             result_some_owner,
             result_niche,
+            result_fn_ptr: matches!(kind, ClosureCombinator::Map | ClosureCombinator::AndThen)
+                && tyref_option_payload_is_fn_ptr(dest_ty, self.llbc),
             result_fieldless_none_tag,
             call_once_owner,
             fn_item_segments,
@@ -21008,6 +21025,25 @@ impl<'a> Lowering<'a> {
         self.tyref_ref_adt_def_id(ty)
             .and_then(|def_id| self.llbc.type_by_id(def_id))
             .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc))
+    }
+
+    /// `Option<fn>` payload — the null arm is `null_fn` (`SomePtr`), not
+    /// `null_mut` (`SomeInstance`).
+    fn option_payload_is_fn_ptr(&self, option_ty: &TyRef) -> bool {
+        if !crate::front::result_exc::tyref_is_option(option_ty, self.llbc) {
+            return false;
+        }
+        let Some(payload) = tyref_node(option_ty, self.llbc)
+            .and_then(|node| node.as_object())
+            .and_then(|m| m.get("Adt"))
+            .and_then(|a| a.get("generics"))
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.as_array())
+            .and_then(|t| t.first())
+        else {
+            return false;
+        };
+        type_node_is_fn_ptr(payload, self.llbc)
     }
 
     /// `true` when `ty` is represented as a one-word nullable `Option` in
@@ -21247,6 +21283,13 @@ impl<'a> Lowering<'a> {
     /// one repr-adaptive source.
     fn push_niche_null_ptr(&mut self, mir_bb: usize, option_ty: &TyRef) -> Variable {
         let bb_id = self.block_id[mir_bb];
+        // `Option<fn>` is a null function pointer (`SomePtr(FuncType)`),
+        // not a nullable GC instance. `null_mut()` annotates as
+        // classdef-less `SomeInstance` and then cannot union with the
+        // `fn` field read (`llannotation.py` `pairtype(SomePtr, SomePtr)`).
+        if self.option_payload_is_fn_ptr(option_ty) {
+            return self.graph.push_null_fn_ptr(bb_id);
+        }
         let null = self.graph.push_null_mut_ptr(bb_id);
         let Some((root, result_ty)) = self.option_niche_null_cast(option_ty) else {
             return null;
@@ -28312,6 +28355,13 @@ fn tyref_to_value_type_with(
     if tyref_option_fieldless_niche(ty, llbc).is_some() {
         return ValueType::Int;
     }
+    // `Option<fn(..)>` is the nullable `Ptr(FuncType)`: one raw machine
+    // address, `None` being the null function pointer. `history.getkind`
+    // puts `Ptr(FuncType)` in the int bank (the bare `FnPtr` arm above).
+    // Leaving the Option in the Ref bank emits `is_(opt:Ref, null:Int)`.
+    if tyref_option_payload_is_fn_ptr(ty, llbc) {
+        return ValueType::Int;
+    }
     // Non-`Literal` (ADT / pointer / tuple) shapes only. Atomic wrappers
     // type as their inner value, including signedness. Checked after the
     // cheap `Literal` fast-path so primitive operands never pay the lookup.
@@ -28560,18 +28610,23 @@ fn tyref_is_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
 /// A value with no runtime representation: unit `()`, a layout-size-0
 /// struct, or one borrow of such a struct (`&self` on a ZST).
 ///
+/// A closure environment and a function item stay values. Each names one
+/// callable, and the annotator has to see which one (`SomePBC`). `getkind`
+/// (`history.py`) returns `"void"` only for `lltype.Void`, and that low-level
+/// repr belongs to `FunctionsPBCRepr` / `SingleFrozenPBCRepr`, not to this
+/// flow value. Erasing a closure env to `Void` makes a `getattr` of
+/// `call_once` read a `Constant(None, Void)`. Identified from the type decl's
+/// `src: Closure` origin, or from a `FnDef` type node — never from the
+/// `closure` name leaf.
+///
 /// A fieldless enum is a discriminant integer, including through a borrow,
-/// so it is not void. A closure environment is not void either: `getkind`
-/// (`history.py`) returns `"void"` only for `lltype.Void`, and a closure
-/// is a callable — `getattr` of `call_once` still names it. Erasing the
-/// env to `Void` makes that getattr read a `Constant(None, Void)`.
-/// `strip_ty_wrappers` peels the borrow; the pointee's layout is what
-/// `tyref_is_zero_sized` reads.
+/// so it is not void. `strip_ty_wrappers` peels the borrow; the pointee's
+/// layout is what `tyref_is_zero_sized` reads.
 fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool {
-    if tyref_is_fieldless_enum_free(ty, llbc)
-        || tyref_is_borrowed_fieldless_enum_free(ty, llbc)
-        || tyref_is_closure_env(ty, llbc)
-    {
+    if tyref_keeps_callable_identity(ty, llbc) {
+        return false;
+    }
+    if tyref_is_fieldless_enum_free(ty, llbc) || tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return false;
     }
     if is_unit_type(ty, llbc) || tyref_is_zero_sized(ty, llbc) {
@@ -28581,10 +28636,29 @@ fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     };
     let peeled = TyRef::Other(node.clone());
+    if tyref_keeps_callable_identity(&peeled, llbc) {
+        return false;
+    }
     if tyref_is_fieldless_enum_free(&peeled, llbc) {
         return false;
     }
     is_unit_type(&peeled, llbc) || tyref_is_zero_sized(&peeled, llbc)
+}
+
+/// A closure ADT or a function item (`FnDef`). Layout size 0 does not erase
+/// either one: the flow value is the callable the annotator reads.
+fn tyref_keeps_callable_identity(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_is_closure_env(ty, llbc) {
+        return true;
+    }
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    if type_node_fn_def_fun_id(node, llbc).is_some() {
+        return true;
+    }
+    strip_ty_wrappers(node, llbc)
+        .is_some_and(|peeled| type_node_fn_def_fun_id(peeled, llbc).is_some())
 }
 
 fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -29153,6 +29227,14 @@ fn tyref_to_attr_value_type_with(
     // records the physical pointer-sized slot independently.
     if tyref_is_string_value(ty, llbc) || tyref_raw_ptr_pointee_is_string_value(ty, llbc) {
         return ValueType::Str;
+    }
+    // `history.getkind` puts `Ptr(FuncType)` in the int bank. A struct
+    // field or enum payload (`Option<fn>`'s `Some` word, a stored `fn`)
+    // must use the same classifier as a value site. Leaving it
+    // `Ref(Some(root))` below colors the field Ref while the place is
+    // Int, and the join copies Ref into an Int inputarg.
+    if type_node_is_fn_ptr(value, llbc) || tyref_option_payload_is_fn_ptr(ty, llbc) {
+        return tyref_to_value_type_with(ty, llbc, tombstoned);
     }
     // Matching [`tyref_to_value_type`]: a payload-carrying enum field
     // seeds `Ref(Some(root))` so the FORCE-attr / call-result narrow
@@ -30116,6 +30198,17 @@ fn type_node_is_mut_ref<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> 
             .is_some_and(|kind| kind.to_ascii_lowercase().contains("mut"));
     }
     false
+}
+
+/// `Option<fn(..)>` — the nullable raw function pointer, one machine address.
+fn tyref_option_payload_is_fn_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    if !crate::front::result_exc::tyref_is_option(ty, llbc) {
+        return false;
+    }
+    crate::front::result_exc::tyref_option_payload(ty, llbc)
+        .as_ref()
+        .and_then(|payload| tyref_node(payload, llbc))
+        .is_some_and(|node| type_node_is_fn_ptr(node, llbc))
 }
 
 /// Whether a Charon type node's top-level constructor is a function pointer,

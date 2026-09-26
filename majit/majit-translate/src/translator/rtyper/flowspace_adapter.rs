@@ -1759,6 +1759,26 @@ pub fn translate_op(
         OpKind::FieldRead { base, field, .. } => {
             let base_hl = lookup_operand(value_map, base, op, "base")?;
             let result = resolve_result_hlvalue(op, value_map)?;
+            // `VecFieldPart::Len` is the list length word (`rtype_len` /
+            // `ll_length`), an integer. `getattr` of the Vec field yields
+            // the list itself (`GcRef`); `len` yields the count (`Signed`).
+            if field.vec_part == Some(crate::model::VecFieldPart::Len) {
+                if field.inline_vec {
+                    let list_var = Hlvalue::Variable(Variable::new());
+                    return Ok(vec![
+                        FlowspaceOp::new(
+                            "getattr",
+                            vec![
+                                base_hl,
+                                Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
+                            ],
+                            list_var.clone(),
+                        ),
+                        FlowspaceOp::new("len", vec![list_var], result),
+                    ]);
+                }
+                return Ok(vec![FlowspaceOp::new("len", vec![base_hl], result)]);
+            }
             Ok(vec![FlowspaceOp::new(
                 "getattr",
                 vec![
@@ -7967,6 +7987,62 @@ mod tests {
         };
         assert_eq!(m1.id(), m2.id());
         assert_eq!(translated[1].args.len(), 1, "the receiver is not re-passed");
+    }
+
+    #[test]
+    fn translate_op_vec_len_word_lowers_to_len() {
+        // `VecFieldPart::Len` is `rtype_len`: the result is the count, not
+        // the list. An inline field is `len(getattr(owner, field))`; a
+        // pointer to the Vec is `len(vec)`.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let inline = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("entries", Some("RDict".into()))
+                    .with_inline_vec(true)
+                    .with_vec_part(crate::model::VecFieldPart::Len),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated =
+            translate_op(&inline, &value_map, &empty_call_registry()).expect("inline Vec len read");
+        let names: Vec<&str> = translated.iter().map(|op| op.opname.as_str()).collect();
+        assert_eq!(names, vec!["getattr", "len"]);
+        let Hlvalue::Variable(ref list_v) = translated[0].result else {
+            panic!("getattr result must be the list");
+        };
+        let Hlvalue::Variable(ref len_arg) = translated[1].args[0] else {
+            panic!("len argument must be the list");
+        };
+        assert_eq!(list_v.id(), len_arg.id());
+        let Hlvalue::Variable(ref len_res) = translated[1].result else {
+            panic!("len result must be a variable");
+        };
+        let Hlvalue::Variable(mapped) = value_map.get(&vars[2]).unwrap() else {
+            panic!("field-read result must map to a variable");
+        };
+        assert_eq!(len_res.id(), mapped.id());
+
+        let word = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("len", Some("alloc::vec::Vec".into()))
+                    .with_vec_part(crate::model::VecFieldPart::Len),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated =
+            translate_op(&word, &value_map, &empty_call_registry()).expect("Vec len word");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "len");
     }
 
     #[test]
