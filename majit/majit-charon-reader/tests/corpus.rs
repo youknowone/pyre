@@ -55,7 +55,9 @@ fn loads_fixture_corpus() {
     // `replace_reborrow_then_read`. Each is one local body.
     //
     // + 1 for `char_slot_index`, the `char` element array read.
-    assert_eq!(local_count, 45, "45 local fns expected");
+    //
+    // + 1 for `char_unwrap_or_join`, the `Option<char>` literal-default join.
+    assert_eq!(local_count, 46, "46 local fns expected");
 }
 
 #[test]

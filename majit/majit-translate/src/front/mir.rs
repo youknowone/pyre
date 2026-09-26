@@ -8149,7 +8149,7 @@ impl<'a> Lowering<'a> {
             DecodedConst::Bool(b) => OpKind::ConstBool(b),
             DecodedConst::Float(bits) => OpKind::ConstFloat(bits),
             DecodedConst::SingleFloat(bits) => OpKind::ConstSingleFloat(bits),
-            // String / char / byte-string constants — no
+            // String / byte-string constants — no
             // ConstStr opkind exists; synthesise a 0-arg `Call` whose
             // path encodes the literal text so the IR stays stable.
             DecodedConst::Str(s) => OpKind::Call {
@@ -33599,9 +33599,10 @@ enum DecodedConst {
     /// width on the constant (`{"Float": {"value": "...", "ty": "F32"}}`),
     /// and parsing both widths into an f64 bit pattern is what erased it.
     SingleFloat(u32),
-    /// String / char / byte-string literals. The IR has no dedicated
-    /// string constant opkind; the codewriter treats these as opaque
-    /// pointer-typed values. We carry the textual representation as a
+    /// String / byte-string literals. The IR has no dedicated string
+    /// constant opkind; the codewriter treats these as opaque pointer-typed
+    /// values. A `char` literal is not one of them: it decodes to
+    /// [`Self::Int`]. We carry the textual representation as a
     /// unique-string `ConstValue` so the generated IR is stable across
     /// runs.
     Str(String),
@@ -34608,8 +34609,17 @@ fn decode_literal(lit: &serde_json::Value) -> Result<DecodedConst, LowerError> {
     if let Some(s) = lit_obj.get("Str").and_then(Value::as_str) {
         return Ok(DecodedConst::Str(s.to_string()));
     }
+    // A `char` is one code point, RPython's `UniChar`: an int-kind scalar
+    // (`getkind(UniChar) == 'int'`), the same bank a `char` field or array
+    // element read produces and the value a `SwitchInt` arm matches.
     if let Some(s) = lit_obj.get("Char").and_then(Value::as_str) {
-        return Ok(DecodedConst::Str(s.to_string()));
+        let mut chars = s.chars();
+        return match (chars.next(), chars.next()) {
+            (Some(c), None) => Ok(DecodedConst::Int(i64::from(u32::from(c)))),
+            _ => Err(LowerError::Schema(format!(
+                "Char literal is not one code point: {lit}"
+            ))),
+        };
     }
     if let Some(s) = lit_obj.get("ByteStr").and_then(Value::as_str) {
         return Ok(DecodedConst::Str(s.to_string()));
@@ -40444,6 +40454,21 @@ mod tests {
             tyref_to_value_type(&ty, &llbc),
             ValueType::Int,
             "RPython history.getkind(Ptr(FuncType)) uses the int bank"
+        );
+    }
+
+    #[test]
+    fn decode_char_literal_is_its_int_code_point() {
+        for (lit, code) in [(">", 0x3e_i64), ("\u{0}", 0), ("\u{10ffff}", 0x10ffff)] {
+            let json = serde_json::json!({ "Char": lit });
+            assert!(
+                matches!(decode_literal(&json), Ok(DecodedConst::Int(n)) if n == code),
+                "char literal {lit:?} decodes to Int({code})",
+            );
+        }
+        assert!(
+            decode_literal(&serde_json::json!({ "Str": ">" }))
+                .is_ok_and(|c| matches!(c, DecodedConst::Str(ref s) if s == ">"))
         );
     }
 
