@@ -8669,8 +8669,12 @@ impl<'a> Lowering<'a> {
                     {
                         return self.resolve_place(mir_bb, *inner);
                     }
-                    // A zero-sized field has no runtime representation, so a
-                    // projection from a payload-free enum reads no bytes.
+                    // A zero-sized field has no runtime representation.
+                    // `rclass.py InstanceRepr.getfield` emits `getfield`
+                    // with `resulttype=r` where `r.lowleveltype is Void`
+                    // for a void attribute, and `jtransform.py
+                    // rewrite_op_getfield` drops a getfield whose result
+                    // is Void. The read is a Void value for every base.
                     // Give the projected value the `Void` kind rather than
                     // materialising it in a value bank.  `getkind(lltype.Void)`
                     // is `'void'`, and both `call.py NON_VOID_ARGS` and
@@ -8688,10 +8692,8 @@ impl<'a> Lowering<'a> {
                     // so the adapter can preserve its identity through phi
                     // simplification; a fresh undefined Void variable loses
                     // the constant representative on outgoing links.
-                    // Keep this collapse scoped to a fieldless-enum base: a
-                    // zero-sized field in any other aggregate retains that
-                    // aggregate's ordinary field model.
-                    if self.tyref_is_fieldless_enum(&inner.ty)
+                    if tyref_is_void_zst(&place_ty, self.llbc)
+                        || self.tyref_is_fieldless_enum(&inner.ty)
                         || self.tyref_is_borrowed_fieldless_enum(&inner.ty)
                     {
                         return Ok(self.emit_unit(self.block_id[mir_bb]));

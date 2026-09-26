@@ -7,8 +7,10 @@
 use majit_charon_reader::Llbc;
 use majit_translate::{
     HostStaticAddrs,
-    front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-    model::{CallTarget, OpKind, ValueType},
+    front::mir::{
+        build_semantic_program_from_llbcs_with_static_addrs_and_function_names, lower_function,
+    },
+    model::{CallTarget, ConcreteType, FunctionGraph, OpKind, ValueType},
 };
 
 const OBJECT_LLBC: &str = concat!(
@@ -202,6 +204,44 @@ fn put_unit_spec_graph_drops_the_value_arg() {
         puts[0].name,
         op_kinds(&puts[0].graph)
     );
+}
+
+/// `fn f(s: &mut S) { replace(&mut s.u, ()) }` where `S.u` is `()`.
+/// The borrow aliases a Void field read: no `getfield` of `u`.
+#[test]
+fn unit_field_borrow_is_void_and_emits_no_getfield() {
+    let llbc = Llbc::from_slice(unit_field_fixture_llbc().as_bytes()).expect("parse S fixture");
+    let graph = lower_function(&llbc, "f").expect("lower f");
+    assert!(
+        !graph_reads_field(&graph, "u"),
+        "zero-sized field u must not be a getfield, ops {:?}",
+        op_kinds(&graph)
+    );
+    let arg = replace_first_arg(&graph);
+    assert_eq!(
+        FunctionGraph::concretetype_of(arg),
+        ConcreteType::Void,
+        "&mut s.u must be Void, ops {:?}",
+        op_kinds(&graph)
+    );
+}
+
+fn graph_reads_field(graph: &FunctionGraph, name: &str) -> bool {
+    graph.blocks.iter().flat_map(|block| &block.operations).any(|op| {
+        matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == name)
+    })
+}
+
+fn replace_first_arg(graph: &FunctionGraph) -> &majit_translate::flowspace::model::Variable {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match &op.kind {
+            OpKind::Call { args, .. } if !args.is_empty() => args[0].as_variable(),
+            _ => None,
+        })
+        .expect("put call")
 }
 
 fn non_void_input_kinds(graph: &majit_translate::model::FunctionGraph) -> Vec<&'static str> {
@@ -586,6 +626,102 @@ fn put_fixture_llbc() -> String {
                 "impl_trait": {"id": 0, "generics": {"regions": [], "types": [unit], "const_generics": [], "trait_refs": []}},
                 "implied_trait_refs": []
             }]
+        }
+    });
+    file.to_string()
+}
+
+fn unit_field_fixture_llbc() -> String {
+    use serde_json::json;
+    let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let meta = |path: &[&str], local: bool| {
+        json!({
+            "name": path.iter().map(|seg| json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": local
+        })
+    };
+    let empty_g = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
+    let i64_ty = json!({"Literal": {"Int": "I64"}});
+    let unit = json!({"Adt": {"id": "Tuple", "generics": {"types": []}}});
+    let s_ty = json!({"Adt": {"id": {"Adt": 0}, "generics": empty_g}});
+    let s_ref = json!({"Ref": ["Erased", s_ty, "Mut"]});
+    let place = |id: u64, ty: &serde_json::Value| json!({"kind": {"Local": id}, "ty": ty});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        json!({"index": index, "name": name, "span": span, "ty": ty})
+    };
+    let field_u = json!({
+        "kind": {"Projection": [
+            {"kind": {"Projection": [place(1, &s_ref), "Deref"]}, "ty": s_ty},
+            {"Field": [{"Adt": [0, null]}, 1]}
+        ]},
+        "ty": unit
+    });
+    let file = json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [{
+                "def_id": 0,
+                "item_meta": meta(&["fixture", "S"], true),
+                "kind": {"Struct": [
+                    {"name": "a", "ty": i64_ty, "attr_info": null},
+                    {"name": "u", "ty": unit, "attr_info": null}
+                ]}
+            }],
+            "fun_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["fixture", "f"], true),
+                    "signature": {"is_unsafe": false, "inputs": [s_ref], "output": unit},
+                    "body": {"Unstructured": {
+                        "span": span,
+                        "locals": {"arg_count": 1, "locals": [
+                            local(0, None, &unit),
+                            local(1, Some("s"), &s_ref),
+                            local(2, Some("slot"), &unit),
+                            local(3, Some("val"), &unit)
+                        ]},
+                        "body": [
+                            {"statements": [
+                                {"span": span, "kind": {"Assign": [
+                                    place(2, &unit),
+                                    {"Ref": {"place": field_u, "kind": "Mut", "ptr_metadata": "None"}}
+                                ]}},
+                                {"span": span, "kind": {"Assign": [
+                                    place(3, &unit),
+                                    {"Aggregate": [{"Adt": ["Tuple", null, null, empty_g]}, []]}
+                                ]}}
+                            ], "terminator": {"span": span, "kind": {"Call": {
+                                "call": {
+                                    "func": {"Regular": {
+                                        "kind": {"Fun": {"Regular": 1}},
+                                        "generics": empty_g
+                                    }},
+                                    "args": [{"Copy": place(2, &unit)}, {"Copy": place(3, &unit)}],
+                                    "dest": place(0, &unit)
+                                },
+                                "target": 1,
+                                "on_unwind": 2
+                            }}}},
+                            {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+                            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                        ]
+                    }}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(&["fixture", "put"], true),
+                    "signature": {"is_unsafe": false, "inputs": [unit, unit], "output": unit},
+                    "body": null
+                }
+            ],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
         }
     });
     file.to_string()
