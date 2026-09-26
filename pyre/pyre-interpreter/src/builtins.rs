@@ -14144,6 +14144,62 @@ fn first_starred_target(
     }
 }
 
+/// The index recovery recorded for an expression it could not parse, if
+/// `expr` holds one.
+///
+/// A missing operand reaches the tree as an `ExprName` carrying an empty name
+/// over the empty range `missing_node_range` puts at the end of the last token
+/// that was read, so `x ===` arrives as a comparison whose right operand is
+/// that node.  `star_targets` matches no such target: the parse stopped at the
+/// token after it, which is the failure reported, so the diagnostics below must
+/// not name a target holding one.  The smallest index wins, because a target
+/// can hold more than one and the earliest is where the parse stopped.
+fn missing_expression_index(expr: &rustpython_compiler::ast::Expr) -> Option<usize> {
+    use rustpython_compiler::ast::{
+        Expr,
+        visitor::{self, Visitor},
+    };
+
+    struct MissingFinder {
+        index: Option<usize>,
+    }
+
+    impl<'a> Visitor<'a> for MissingFinder {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if let Expr::Name(name) = expr
+                && name.id.as_str().is_empty()
+            {
+                let index = expr.range().start().to_usize();
+                self.index = Some(self.index.map_or(index, |first| first.min(index)));
+            }
+            visitor::walk_expr(self, expr);
+        }
+    }
+
+    let mut finder = MissingFinder { index: None };
+    finder.visit_expr(expr);
+    finder.index
+}
+
+/// The span of the token the parse stopped on, given the index recovery
+/// recorded for the expression that is missing.
+///
+/// `missing_node_range` sits at the end of the last token that was read, so the
+/// token that failed opens at the next character that is neither a space nor a
+/// tab.  A newline is that token when the expression ran off the end of the
+/// line -- `x ==` is reported at the newline's own column, one past the source
+/// text -- so only spaces and tabs are skipped.
+fn stopped_token_span(source: &str, missing_index: usize) -> (usize, usize) {
+    let start = source.get(missing_index..).map_or(missing_index, |rest| {
+        missing_index
+            + rest
+                .char_indices()
+                .find(|(_, character)| !matches!(character, ' ' | '\t'))
+                .map_or(rest.len(), |(index, _)| index)
+    });
+    (start, start + 1)
+}
+
 /// The span of the token a statement opens with.
 ///
 /// Every compound statement opens with a keyword, and a decorated one with
@@ -14399,6 +14455,14 @@ fn assignment_target_error(
             ) {
                 return None;
             }
+            // A target the parse never finished reaches no alternative at all:
+            // `x == += 1` stops at the augmented operator and is reported there,
+            // over the operator's own two columns, rather than named.
+            if let Some(index) = missing_expression_index(target) {
+                let (start, end) =
+                    assignment_operator_span(source, index, node.value.range().start().to_usize())?;
+                return Some(("invalid syntax".to_owned(), start, end));
+            }
             // That alternative reads `star_expressions augassign`, and an
             // unparenthesized yield is not one: the parse stops at the operator.
             if matches!(target, Expr::Yield(_) | Expr::YieldFrom(_))
@@ -14431,6 +14495,19 @@ fn assignment_target_error(
                     start,
                     end,
                 ));
+            }
+            // A target the parse never finished is named by none of the
+            // alternatives: `x ===` and `[x ==] = 1` stop at the token after the
+            // missing operand -- the third `=` and the `]` -- and report the
+            // plain failure there instead of calling the target a comparison.
+            if let Some(index) = node
+                .targets
+                .iter()
+                .filter_map(missing_expression_index)
+                .min()
+            {
+                let (start, end) = stopped_token_span(source, index);
+                return Some(("invalid syntax".to_owned(), start, end));
             }
             // `(star_targets '=')*` consumes the assignable targets ahead of the
             // one that fails, which is why a chain reports its second target.
