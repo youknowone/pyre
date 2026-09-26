@@ -1863,3 +1863,33 @@ fn mem_replace_of_a_multi_word_value_is_field_wise() {
         "enum exchange reads a payload field, got {names:?}"
     );
 }
+
+/// A flag const built the way `bitflags!` builds one — an associated const
+/// initialised through a `const fn` constructor of a `repr(transparent)`
+/// wrapper around a `repr(transparent)` wrapper around a `u16` — reads as the
+/// prebuilt integer, not as a nullary call to the const's path that no host
+/// symbol backs.
+#[test]
+fn a_transparent_flag_const_folds_to_its_integer() {
+    use majit_translate::model::{CallTarget, OpKind};
+
+    let graph = lower_function(load_corpus(), "code_flags_bits_or").expect("lowering");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .collect();
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                if segments.last().map(String::as_str) == Some("FLAT")
+        )),
+        "the flag const lowers to no accessor call",
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op.kind, OpKind::ConstUInt(0x100) | OpKind::ConstInt(0x100))),
+        "the flag const is the integer 0x100",
+    );
+}

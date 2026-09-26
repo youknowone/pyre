@@ -33865,10 +33865,26 @@ fn const_eval_init_body(llbc: &Llbc, u: &Unstructured) -> Option<OpKind> {
 }
 
 fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<ConstLit> {
+    const_eval_body_lit(llbc, u, &[], depth)
+}
+
+/// Evaluate a const-context body with `args` bound to its argument locals
+/// `_1..=_n`: a global's initializer (no arguments), or a `const fn` that
+/// initializer calls.
+fn const_eval_body_lit(
+    llbc: &Llbc,
+    u: &Unstructured,
+    args: &[ConstLit],
+    depth: usize,
+) -> Option<ConstLit> {
     if depth > 32 {
         return None;
     }
-    let mut locals: std::collections::HashMap<u64, ConstLit> = std::collections::HashMap::new();
+    let mut locals: std::collections::HashMap<u64, ConstLit> = args
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (index as u64 + 1, *value))
+        .collect();
     let eval_operand =
         |locals: &std::collections::HashMap<u64, ConstLit>, op: &Operand| -> Option<ConstLit> {
             match op {
@@ -33950,6 +33966,12 @@ fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Opti
                             eval_operand(&locals, lhs)?,
                             eval_operand(&locals, rhs)?,
                         )?,
+                        // A `repr(transparent)` struct is its one sized
+                        // field, so building it is that field's value.
+                        Rvalue::Aggregate(kind, operands) => {
+                            let index = const_transparent_aggregate_field(llbc, &kind)?;
+                            eval_operand(&locals, operands.get(index)?)?
+                        }
                         _ => return None,
                     };
                     // rustc computes each assignment at the destination's
@@ -33979,13 +34001,79 @@ fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Opti
                 let PlaceKind::Local(dst) = call.dest.kind else {
                     return None;
                 };
-                locals.insert(dst, const_eval_size_align_call(llbc, &call)?);
+                let value = match const_eval_size_align_call(llbc, &call) {
+                    Some(value) => value,
+                    None => {
+                        let args = call
+                            .args
+                            .iter()
+                            .map(|arg| eval_operand(&locals, arg))
+                            .collect::<Option<Vec<_>>>()?;
+                        const_eval_const_fn_call(llbc, &call, &args, depth)?
+                    }
+                };
+                locals.insert(dst, value);
                 bb = target as usize;
             }
             _ => return None,
         }
     }
     None
+}
+
+/// Evaluate a call a const initializer makes to a `const fn` whose body
+/// this LLBC carries, over literal arguments.
+///
+/// Only a `const fn` can be called from a const context, so the callee is
+/// one rustc already evaluated to build the constant; running its body over
+/// the same literals gives the host value RPython's flowspace would receive
+/// as a prebuilt Constant.  A generic callee, a callee without a body, and
+/// any body shape [`const_eval_body_lit`] cannot evaluate stay unharvested.
+fn const_eval_const_fn_call(
+    llbc: &Llbc,
+    call: &CallPayload,
+    args: &[ConstLit],
+    depth: usize,
+) -> Option<ConstLit> {
+    let CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    if reg
+        .generics
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|types| !types.is_empty())
+    {
+        return None;
+    }
+    let body = llbc.fn_by_id(*id)?.unstructured()?;
+    if body.locals.arg_count as usize != args.len() {
+        return None;
+    }
+    let value = const_eval_body_lit(llbc, &body, args, depth + 1)?;
+    Some(const_narrow_to_target(
+        const_literal_ty(llbc, &call.dest.ty),
+        value,
+    ))
+}
+
+/// The operand index that is the value of a `repr(transparent)` struct
+/// aggregate: its one sized field.  `None` for any other aggregate.
+fn const_transparent_aggregate_field(llbc: &Llbc, kind: &serde_json::Value) -> Option<usize> {
+    let adt = kind.as_object()?.get("Adt")?.as_array()?;
+    let head = adt.first()?;
+    let type_id = match head.as_u64() {
+        Some(id) => id,
+        None => head.get("id")?.get("Adt")?.as_u64()?,
+    };
+    if adt.get(1).is_some_and(|variant| !variant.is_null()) {
+        return None;
+    }
+    let decl = llbc.type_by_id(type_id)?;
+    transparent_nonzst_field(decl, llbc).map(|(index, _)| index)
 }
 
 /// Fold a const-init `Call` terminator only when it is nullary

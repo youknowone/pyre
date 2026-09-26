@@ -57,7 +57,10 @@ fn loads_fixture_corpus() {
     // + 1 for `char_slot_index`, the `char` element array read.
     //
     // + 1 for `char_unwrap_or_join`, the `Option<char>` literal-default join.
-    assert_eq!(local_count, 46, "46 local fns expected");
+    //
+    // + 6 for the `bitflags!`-shaped flag type: `code_flags_bits_or`, the
+    // `FLAT` initializer, and the constructor and accessor on both wrappers.
+    assert_eq!(local_count, 52, "52 local fns expected");
 }
 
 #[test]
