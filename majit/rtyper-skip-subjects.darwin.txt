@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=2ff84247b88218c5 platform=darwin
+# corpus=f611c5811215d553 platform=darwin
 two-phase-never-a-subject	eval_loop_jit_portal
 two-phase-never-a-subject	ll_int_abs
 two-phase-never-a-subject	ll_listslice_minusone__ref__majit__object_ref_gcarray
@@ -1317,10 +1317,6 @@ two-phase-never-a-subject	pyre_module::module::_bz2::decompressor_methods::__maj
 two-phase-never-a-subject	pyre_module::module::_bz2::decompressor_methods::__majit_wrap_decompress
 two-phase-never-a-subject	pyre_module::module::_bz2::decompressor_methods::__majit_wrap_unused_data
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::__majit_wrap_cdata_call
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::new_cdata
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::new_cdata_copy
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::new_cdata_full
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::new_cdata_mem
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypefunc::call
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypefunc::do_call
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypefunc::farg
@@ -1339,7 +1335,6 @@ two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_ulonglong
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_to_char
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_to_char_n_t
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_to_object
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::overflow
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::unpack_complex
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeptr::accept_movable_str
