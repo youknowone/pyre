@@ -4662,7 +4662,7 @@ impl OpcodeStepExecutor for PyFrame {
             return Ok(m);
         }
         crate::importing::importhook(
-            name,
+            rustpython_wtf8::Wtf8::new(name),
             self.get_w_globals(),
             pyre_object::w_none(),
             0,

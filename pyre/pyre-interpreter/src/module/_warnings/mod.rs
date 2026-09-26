@@ -24,7 +24,7 @@ fn import_module(name: &str) -> Result<PyObjectRef, PyError> {
         return Ok(module);
     }
     crate::importing::importhook(
-        name,
+        rustpython_wtf8::Wtf8::new(name),
         w_none(),
         w_list_new(vec![w_str_new("*")]),
         0,

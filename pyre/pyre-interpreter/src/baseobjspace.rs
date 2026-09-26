@@ -7388,7 +7388,7 @@ pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
             false,
         )
     } else {
-        unsafe { getattr_surrogate(obj, w_name, name) }
+        unsafe { getattr_surrogate(obj, w_name, name, false) }
     };
     result.map_err(|mut err| {
         err.enrich_attribute_error(
@@ -7418,7 +7418,7 @@ pub fn lookup_attr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
             true,
         )
     } else {
-        unsafe { getattr_surrogate(obj, w_name, name) }
+        unsafe { getattr_surrogate(obj, w_name, name, true) }
     }
 }
 
@@ -7464,7 +7464,12 @@ pub fn delattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
 /// generic-instance tail: terminal `__dict__` read, then the
 /// `__getattr__` hook on miss.  (A surrogate cannot match any of
 /// `getattr_str`'s builtin-type special-cases, all valid identifiers.)
-unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) -> PyResult {
+unsafe fn getattr_surrogate(
+    obj: PyObjectRef,
+    w_name: PyObjectRef,
+    name: &Wtf8,
+    suppress: bool,
+) -> PyResult {
     unsafe {
         if pyre_object::is_exact_type(obj, &pyre_object::descriptor::SUPER_TYPE) {
             return super_getattribute(obj, w_name);
@@ -7544,8 +7549,10 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
                     }
                     // module.py `descr_getattribute` phrases a miss that no module
                     // `__getattr__` claimed. A lone surrogate is still the
-                    // attribute name (`text_w`).
-                    if !from_hook {
+                    // attribute name (`text_w`). `suppress` matches
+                    // `module_getattr_hook_or_err`: `hasattr` must not run
+                    // `__spec__.has_location`.
+                    if !from_hook && !suppress {
                         e = unsafe { module_miss_error(obj, name) }?;
                     }
                 }
@@ -8098,13 +8105,19 @@ unsafe fn module_miss_error(obj: PyObjectRef, name: &Wtf8) -> Result<PyError, Py
             let (origin, is_shadowing, is_shadowing_stdlib) =
                 crate::importing::module_shadow_info(w_spec, w_modname)?;
             let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
-            let with_origin = |head: Wtf8Buf, tail: &str| {
+            let with_origin = |head: Wtf8Buf, tail: &Wtf8| {
                 let mut msg = head;
                 msg.push_wtf8(origin.as_deref().unwrap_or(Wtf8::new("")));
-                msg.push_str(tail);
+                msg.push_wtf8(tail);
                 msg
             };
             if is_shadowing_stdlib {
+                let mut tail = Wtf8Buf::new();
+                tail.push_str(
+                    "' since it has the same name as the standard library module named '",
+                );
+                tail.push_wtf8(&nm);
+                tail.push_str("' and prevents importing that standard library module)");
                 with_origin(
                     crate::display::wtf8_format!(
                         "module '",
@@ -8113,11 +8126,7 @@ unsafe fn module_miss_error(obj: PyObjectRef, name: &Wtf8) -> Result<PyError, Py
                         name,
                         "' (consider renaming '"
                     ),
-                    &format!(
-                        "' since it has the same name as the standard library module \
-                         named '{nm}' and prevents importing that standard library \
-                         module)"
-                    ),
+                    &tail,
                 )
             } else if crate::importing::is_spec_initializing(w_spec)? {
                 if is_shadowing {
@@ -8129,7 +8138,7 @@ unsafe fn module_miss_error(obj: PyObjectRef, name: &Wtf8) -> Result<PyError, Py
                             name,
                             "' (consider renaming '"
                         ),
-                        "' if it has the same name as a library you intended to import)",
+                        Wtf8::new("' if it has the same name as a library you intended to import)"),
                     )
                 } else if origin.is_some() {
                     let mut msg = crate::display::wtf8_format!(

@@ -1132,7 +1132,7 @@ fn run_python_impl(source: &str) -> String {
     // `sys.stderr` and gives up silently when the module is absent, so every
     // warning raised before the first `import sys` disappeared.
     let _ = pyre_interpreter::importing::importhook(
-        "sys",
+        rustpython_wtf8::Wtf8::new("sys"),
         canonical,
         pyre_object::PY_NULL,
         0,

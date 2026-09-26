@@ -5305,7 +5305,6 @@ impl PyFrame {
     /// pyframe.py descr_repr — `<frame at 0x…, file '…', line …,
     /// code …>` via `getrepr(space, "frame", moreinfo)`.
     pub fn descr_repr(&self) -> rustpython_wtf8::Wtf8Buf {
-        let code = self.code();
         let filename = crate::gateway::fsdecode_filename_wtf8(&unsafe {
             crate::pycode::code_filename_bytes(self.pycode as pyre_object::PyObjectRef)
         });
@@ -5319,13 +5318,20 @@ impl PyFrame {
         // the quote character too).  `code_repr` is a separate decision and
         // keeps its own quotes around a `%U`, which is why the two disagree on
         // the same path.
-        rustpython_wtf8::Wtf8Buf::from_string(format!(
-            "<frame at {}, file {}, line {}, code {}>",
-            crate::display::repr_addr(self as *const PyFrame as usize),
-            crate::display::format_wtf8_repr(&filename),
-            self.get_last_lineno(),
-            code.obj_name.as_str()
-        ))
+        let w_name =
+            unsafe { crate::pycode::w_code_name_obj(self.pycode as pyre_object::PyObjectRef) };
+        let mut repr = rustpython_wtf8::Wtf8Buf::new();
+        repr.push_str("<frame at ");
+        repr.push_str(&crate::display::repr_addr(self as *const PyFrame as usize));
+        repr.push_str(", file ");
+        repr.push_str(&crate::display::format_wtf8_repr(&filename));
+        repr.push_str(", line ");
+        repr.push_str(&self.get_last_lineno().to_string());
+        repr.push_str(", code ");
+        if !w_name.is_null() {
+            repr.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_name) });
+        }
+        repr
     }
 
     /// `frame_clear` (`frame.clear()`): clear most references held by the
