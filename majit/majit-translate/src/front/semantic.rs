@@ -929,6 +929,17 @@ pub(crate) fn propagate_access_directly(
     // function object itself; a crate-stripped path is a weaker key, so a
     // collision has to be refused rather than silently resolved to whichever
     // function was collected last.
+    // Harvested `dont_look_inside` paths name the declaration. A spec
+    // copy shares that `fun_decl_id` and must stay residual too.
+    let mut residual_decls: HashSet<u64> = HashSet::new();
+    for func in functions.iter() {
+        if let Some(id) = func.fun_decl_id
+            && dont_look_inside.contains(&path_of(func))
+        {
+            residual_decls.insert(id);
+        }
+    }
+
     let mut index: HashMap<String, Option<usize>> = HashMap::new();
     for (i, func) in functions.iter().enumerate() {
         index
@@ -985,7 +996,13 @@ pub(crate) fn propagate_access_directly(
                 // caller reaches it. Dropping the edge here is that deletion:
                 // the argument neither flags the callee nor travels further
                 // through it.
-                if dont_look_inside.contains(&path_of(&functions[callee])) {
+                let callee_fn = &functions[callee];
+                if dont_look_inside.contains(&path_of(callee_fn))
+                    || callee_fn
+                        .fun_decl_id
+                        .is_some_and(|id| residual_decls.contains(&id))
+                    || callee_fn.hints.iter().any(|hint| hint == "dont_look_inside")
+                {
                     continue;
                 }
                 for (pos, arg) in args.iter().enumerate() {

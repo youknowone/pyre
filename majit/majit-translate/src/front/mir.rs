@@ -1222,6 +1222,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             &dont_look_inside,
             &elidable_residual,
             static_addrs.error_carrier,
+            &fn_path,
         ));
     }
     // `specialize.py` `cachedgraph` keys one graph per instantiation. The
@@ -1270,10 +1271,15 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             continue;
         };
         let stripped = strip_crate_prefix(&fd.item_meta.name_path());
-        let module_path = stripped
-            .rsplit_once("::")
-            .map(|(module, _)| module.to_string())
-            .unwrap_or_default();
+        let (module_path, bare_leaf) = match stripped.rsplit_once("::") {
+            Some((module, leaf)) => (module.to_string(), leaf.to_string()),
+            None => (String::new(), stripped),
+        };
+        let policy_fn_path = if module_path.is_empty() {
+            bare_leaf
+        } else {
+            format!("{module_path}::{bare_leaf}")
+        };
         let name = req.leaf;
         graph.name = spec_segments(llbc, fd, &name).join("::");
         functions.push(semantic_function_from_lowered(
@@ -1287,6 +1293,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             &dont_look_inside,
             &elidable_residual,
             static_addrs.error_carrier,
+            &policy_fn_path,
         ));
     }
     // `specialize.py default_specialize` runs while the annotator walks
@@ -1376,7 +1383,9 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
 
 /// One lowered body as a `SemanticFunction`. `name` is the bare leaf or
 /// the specialized leaf; `signature` is the declaration signature or the
-/// substituted copy. Both loops register through this function.
+/// substituted copy. `policy_fn_path` is `module_path::<bare leaf>`, the
+/// key the hint sets use; `fn_path` stays the spec name. Both loops
+/// register through this function.
 fn semantic_function_from_lowered(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -1388,6 +1397,7 @@ fn semantic_function_from_lowered(
     dont_look_inside: &std::collections::HashSet<String>,
     elidable_residual: &std::collections::HashSet<String>,
     error_carrier: crate::ErrorCarrierSpec<'_>,
+    policy_fn_path: &str,
 ) -> crate::front::semantic::SemanticFunction {
     let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
     let trait_impl_id = trait_impl_id_for_fundecl(fd);
@@ -1410,7 +1420,7 @@ fn semantic_function_from_lowered(
     } else {
         graph.with_source_identity(source_identity)
     };
-    let graph = graph.with_fun_decl_id(fd.def_id);
+    let mut graph = graph.with_fun_decl_id(fd.def_id);
     // Trait-impl methods carry the trait leaf so registration calls
     // `register_trait_method`. Inherent impls leave `trait_root` empty.
     // Trait-default bodies match the parent ident against `known_trait_names`.
@@ -1420,15 +1430,30 @@ fn semantic_function_from_lowered(
         .and_then(|p| p.rsplit("::").next())
         .map(str::to_string)
         .or_else(|| trait_default_owner_for_fundecl(fd, known_trait_names));
-    let gcref_result = gc_root_gcref_result_path(&fn_path);
+    let gcref_result = gc_root_gcref_result_path(policy_fn_path);
     let returns_objectptr = output_type_is_objectptr(&signature.output, llbc) && !gcref_result;
     // `dont_look_inside` / `elidable` callees and every trait-method
     // member of an indirect-call row stamp FUNC.RESULT.
     // A `repr(transparent)` scalar wrapper is that word.
     // Aggregate `"ref"` results stay unstamped.
-    let stamp_return_token = dont_look_inside.contains(&fn_path)
-        || elidable_residual.contains(&fn_path)
+    let stamp_return_token = dont_look_inside.contains(policy_fn_path)
+        || elidable_residual.contains(policy_fn_path)
         || trait_root.is_some();
+    // A spec copy's own path is not in the harvested sets. Copy the
+    // declaration's residual markers onto this graph so registration and
+    // `look_inside_graph` keep the same status.
+    let mut hints = Vec::new();
+    if policy_fn_path != fn_path {
+        if dont_look_inside.contains(policy_fn_path) {
+            hints.push("dont_look_inside".to_string());
+        }
+        if elidable_residual.contains(policy_fn_path) {
+            hints.push("elidable".to_string());
+        }
+        if !hints.is_empty() {
+            crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &hints);
+        }
+    }
     let signature_token = if gcref_result {
         Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
     } else {
@@ -1449,7 +1474,7 @@ fn semantic_function_from_lowered(
         trait_impl_id,
         fun_decl_id: Some(fd.def_id),
         module_path,
-        hints: Vec::new(),
+        hints,
         trait_root,
         trait_qualified,
         returns_objectptr,
