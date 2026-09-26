@@ -591,6 +591,13 @@ pub const MEMBER_SUPER_SELF_CLASS: u32 = MEMBER_DIRECT_FLAG | 54;
 /// Declared on every platform, registered on `OSError` only where the
 /// platform has Windows error codes (`interp_exceptions.py:723-728`).
 pub const MEMBER_OS_ERROR_WINERROR: u32 = MEMBER_DIRECT_FLAG | 61;
+/// CPython 3.14 `tb_memberlist.tb_frame`, backed by PyPy's
+/// `interp_attrproperty_w('frame')`.  Read-only on both sides.
+pub const MEMBER_TRACEBACK_FRAME: u32 = MEMBER_DIRECT_FLAG | 62;
+/// CPython 3.14 `tb_memberlist.tb_lasti`, backed by PyPy's `lasti` field.
+/// `Py_READONLY` there, writable through `descr_set_tb_lasti` in PyPy; the
+/// setter is not wired here, for the reason `init_pytraceback_type` records.
+pub const MEMBER_TRACEBACK_LASTI: u32 = MEMBER_DIRECT_FLAG | 63;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {

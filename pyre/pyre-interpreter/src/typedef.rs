@@ -8983,30 +8983,31 @@ fn init_dict_view_items_type(ns: PyObjectRef) {
     init_dict_view_set_like_type(ns, dict_items_reversed);
 }
 
-/// `pypy/interpreter/pytraceback.py PyTraceback.typedef` —
-/// the four Python-visible getsets.
+/// `pypy/interpreter/pytraceback.py PyTraceback.typedef` — the four
+/// Python-visible attributes.
 ///
 /// ```python
 /// PyTraceback.typedef = TypeDef("traceback",
-///     __new__ = interp2app(PyTraceback.descr_new),
-///     __dir__ = interp2app(PyTraceback.descr__dir__),
 ///     __reduce__ = interp2app(PyTraceback.descr__reduce__),
+///     __new__ = interp2app(PyTraceback.descr_new),
 ///     __setstate__ = interp2app(PyTraceback.descr__setstate__),
-///     tb_frame  = GetSetProperty(PyTraceback.descr_get_tb_frame),
-///     tb_lasti  = GetSetProperty(PyTraceback.descr_get_tb_lasti,
-///                                PyTraceback.descr_set_tb_lasti),
+///     __dir__ = interp2app(PyTraceback.descr__dir__),
+///     tb_frame = interp_attrproperty_w('frame', cls=PyTraceback),
+///     tb_lasti = GetSetProperty(PyTraceback.descr_get_tb_lasti,
+///                               PyTraceback.descr_set_tb_lasti),
 ///     tb_lineno = GetSetProperty(PyTraceback.descr_get_tb_lineno,
 ///                                PyTraceback.descr_set_tb_lineno),
-///     tb_next   = GetSetProperty(PyTraceback.descr_get_next,
-///                                PyTraceback.descr_set_next),
-/// )
+///     tb_next = GetSetProperty(PyTraceback.descr_get_next,
+///                              PyTraceback.descr_set_next),
+///     )
+/// PyTraceback.typedef.acceptable_as_base_class = False
 /// ```
 ///
-/// Pyre wires `tb_lasti`, `tb_lineno`, `tb_next`, `tb_frame`,
+/// Pyre wires `tb_frame`, `tb_lasti`, `tb_lineno`, `tb_next`,
 /// `__new__`, `__dir__`.
 ///   - `tb_frame` returns the live `PyFrame` (`FRAME_TYPE`), which is
-///     always GC-owned once the subsystem is installed at boot (see the
-///     getter below).
+///     always GC-owned once the subsystem is installed at boot (see
+///     `direct_member_get`).
 ///   - `__new__` = `TracebackType(tb_next, tb_frame, tb_lasti,
 ///     tb_lineno)` (3.7+ constructor), taking a live `frame` object.
 ///   - `__reduce__` / `__setstate__` are intentionally NOT wired:
@@ -9039,27 +9040,24 @@ fn traceback_c_int_arg(obj: PyObjectRef) -> Result<i64, crate::PyError> {
 }
 
 fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // 3.14's `traceback()` names its four arguments, so a short call reports
-    // the first one still missing and a long one reports the limit; both
-    // messages carry the type's own name, not the `types` alias.
+    // `traceback()` declares its four arguments as positional-or-keyword, so
+    // the shared binder fills them by position and then by name, counts the
+    // two together for the upper limit, and reports the first slot left empty;
+    // all three messages carry the type's own name, not the `types` alias.
+    // `descr_new` takes no keywords at all upstream, and the type is not
+    // acceptable as a base, so `type_descr_call_impl` has to be told that this
+    // one binds them.
     const ARG_NAMES: [&str; 4] = ["tb_next", "tb_frame", "tb_lasti", "tb_lineno"];
-    let given = args.len().saturating_sub(1);
-    if given < ARG_NAMES.len() {
-        return Err(crate::PyError::type_error(format!(
-            "traceback() missing required argument '{}' (pos {})",
-            ARG_NAMES[given],
-            given + 1
-        )));
-    }
-    if given > ARG_NAMES.len() {
-        return Err(crate::PyError::type_error(format!(
-            "traceback() takes at most 4 arguments ({given} given)"
-        )));
-    }
-    let w_next = args[1];
-    let w_frame = args[2];
-    let w_lasti = args[3];
-    let w_lineno = args[4];
+    let scope = crate::builtins::bind_builtin_kwargs(
+        args.get(1..).unwrap_or(&[]),
+        &ARG_NAMES,
+        &[true; 4],
+        "traceback",
+    )?;
+    let w_next = scope[0];
+    let w_frame = scope[1];
+    let w_lasti = scope[2];
+    let w_lineno = scope[3];
 
     // tb_next: a traceback or None.
     let next = if unsafe { pyre_object::is_none(w_next) } {
@@ -9079,7 +9077,7 @@ fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     {
         return Err(crate::PyError::type_error(format!(
             "traceback() argument 'tb_frame' must be frame, not {}",
-            type_name_of(w_frame)
+            crate::type_methods::clinic_arg_type_name(w_frame)
         )));
     }
     // `PyTraceback.descr_new` keeps `w_next` / `w_frame` as GC locals across
@@ -9169,45 +9167,29 @@ fn init_pytraceback_type(ns: PyObjectRef) {
     // at boot (`init_gc_subsystem`), so all frames — including under
     // `PYRE_JIT=0` — are GC-owned oldgen blocks that stay alive as long as
     // the traceback references them.
-    let frame_getter = make_builtin_function_with_arity(
-        "tb_frame",
-        |args| {
-            let tb = args[1];
-            if tb.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            let frame = unsafe { crate::pytraceback::w_pytraceback_get_frame(tb) };
-            if frame.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            // Mark escaped so the JIT keeps the frame materialised for
-            // the exposed reference (pyframe.py `mark_as_escaped`), the
-            // way `sys/vm.py _getframe` does for the frame it hands out.
-            // This store has no counterpart on the upstream `tb_frame`,
-            // whose complete caller set is `executioncontext.py leave`,
-            // `error.py OperationError.get_traceback`,
-            // `interp_exceptions.py descr_gettraceback` and
-            // `sys/vm.py _getframe` — a deviation, not a port.
-            unsafe { (*frame).mark_as_escaped() };
-            Ok(frame as pyre_object::PyObjectRef)
-        },
-        2,
-    );
+    //
+    // `tb_frame` and `tb_lasti` are members rather than getsets because that
+    // is what a refused write has to answer: both are `Py_READONLY` entries in
+    // `tb_memberlist`, so `tb.tb_frame = f` and `del tb.tb_frame` raise
+    // `readonly attribute`, where a getset with a null setter answers
+    // `attribute 'tb_frame' of 'traceback' objects is not writable`, which is
+    // the wording `tb_lineno` — a getset there — does answer.  The kind is
+    // observable in its own right (`member_descriptor`, and a repr reading
+    // `<member 'tb_frame' of 'traceback' objects>`), and it is also the
+    // read-only attrproperty half of PyPy's own split.  Measured at 3.14.6.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "tb_frame",
-            make_getset_property_named(
-                frame_getter,
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_TRACEBACK_FRAME,
+                "tb_frame".to_owned(),
                 pyre_object::PY_NULL,
-                pyre_object::PY_NULL,
-                "tb_frame",
             ),
         )
     };
-    // pytraceback.py descr_get_tb_lasti — the slot is handed out as it is.
-    // It already holds the byte offset `tb_lasti` means, so
-    // `traceback._get_code_position` recovers the instruction with its `// 2`.
+    // pytraceback.py descr_get_tb_lasti — the slot is handed out as it is
+    // (`direct_member_get`).
     //
     // `descr_set_tb_lasti` and `descr_set_tb_lineno` are deliberately NOT
     // wired, for the reason `__reduce__` / `__setstate__` are not: 3.14 is the
@@ -9219,27 +9201,14 @@ fn init_pytraceback_type(ns: PyObjectRef) {
     // would read back as a resolved line, which is an answer neither reference
     // gives.  The constructor still takes both values, which is how a
     // traceback with a chosen offset is built here as it is there.
-    let lasti_getter = make_builtin_function_with_arity(
-        "tb_lasti",
-        |args| {
-            let tb = args[1];
-            if tb.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            let lasti = unsafe { crate::pytraceback::w_pytraceback_get_lasti(tb) };
-            Ok(pyre_object::w_int_new(lasti))
-        },
-        2,
-    );
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "tb_lasti",
-            make_getset_property_named(
-                lasti_getter,
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_TRACEBACK_LASTI,
+                "tb_lasti".to_owned(),
                 pyre_object::PY_NULL,
-                pyre_object::PY_NULL,
-                "tb_lasti",
             ),
         )
     };
@@ -15136,6 +15105,28 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
             let value = unsafe { pyre_object::descriptor::w_super_get_obj_type(obj) };
             Ok(if value.is_null() { w_none() } else { value })
         }
+        pyre_object::MEMBER_TRACEBACK_FRAME => {
+            let frame = unsafe { crate::pytraceback::w_pytraceback_get_frame(obj) };
+            if frame.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            // Mark escaped so the JIT keeps the frame materialised for the
+            // exposed reference (pyframe.py `mark_as_escaped`), the way
+            // `sys/vm.py _getframe` does for the frame it hands out.  This
+            // store has no counterpart on the upstream `tb_frame`, whose
+            // complete caller set is `executioncontext.py leave`, `error.py
+            // OperationError.get_traceback`, `interp_exceptions.py
+            // descr_gettraceback` and `sys/vm.py _getframe` — a deviation, not
+            // a port.
+            unsafe { (*frame).mark_as_escaped() };
+            Ok(frame as pyre_object::PyObjectRef)
+        }
+        // `descr_get_tb_lasti` — the slot already holds the byte offset
+        // `tb_lasti` means, so `traceback._get_code_position` recovers the
+        // instruction with its `// 2`.
+        pyre_object::MEMBER_TRACEBACK_LASTI => Ok(pyre_object::w_int_new(unsafe {
+            crate::pytraceback::w_pytraceback_get_lasti(obj)
+        })),
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {
