@@ -567,7 +567,12 @@ impl JitFrameDescrs {
     /// so on 32-bit builds a FLOAT slot spans two Signed words.
     fn frame_itemsize(&self, ty: Type) -> i64 {
         match ty {
-            Type::Int | Type::Ref => self.sign_size as i64,
+            // Value slots are i64 on every backend. wasm32's Signed is 4,
+            // but `publish_ca_initial_locs` and the entry loader address
+            // `FRAME_SLOT_BASE + k*8` and the loader does an 8-byte load.
+            // A 4-byte store leaves the high half stale, so a pointer
+            // compare against a zero-extended field load fails.
+            Type::Int | Type::Ref => 8,
             Type::Float => {
                 if self.sign_size == 4 {
                     (self.sign_size * 2) as i64
