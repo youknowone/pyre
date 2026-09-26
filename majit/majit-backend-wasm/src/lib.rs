@@ -53,7 +53,6 @@ mod serial_cpu_tests {
 #[cfg(target_arch = "wasm32")]
 mod glue;
 
-use indexmap::IndexMap;
 use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -510,9 +509,15 @@ fn compiled_wasm_loop(token: &JitCellToken) -> Option<&CompiledWasmLoop> {
         .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
 }
 
-/// Deferred merges waiting on their entry trip.
-pub fn pending_inline_count() -> usize {
-    with_pending_inlines(|pending| pending.len())
+/// Live deferred merges on `owner`'s `asmmemmgr_blocks`.
+pub fn pending_inline_count(owner: &JitCellToken) -> usize {
+    owner_pending_slot_addrs(owner)
+        .into_iter()
+        .filter(|&addr| {
+            // SAFETY: `addr` was just read out of this owner's `pending_inlines`.
+            unsafe { pending_slot_at(addr) }.entry.borrow().is_some()
+        })
+        .count()
 }
 
 /// Entries the bridge standing in for a merge must be entered before the merge
@@ -2605,6 +2610,10 @@ pub struct WasmBackend {
     /// `propagate_exception_descr`. Heap-pinned so a moved `WasmBackend`
     /// keeps the `jf_descr` immediates compiled modules already baked.
     pub(crate) exit_cells: std::sync::Arc<failguard::CpuExitCells>,
+    /// Trips recorded while a bridge was running: the owner's `Weak` plus the
+    /// slot address. A later drain upgrades the owner and checks the address
+    /// is still in that owner's `asmmemmgr_blocks` before dereferencing it.
+    tripped_inlines: RefCell<Vec<(Weak<JitCellToken>, usize)>>,
 }
 
 /// GC type id of the `JitFrame`. The single registration authority is `eval.rs`
@@ -2780,7 +2789,7 @@ const DEFAULT_INLINE_EAGER_MAX_BYTES: u32 = 4096;
 /// returns. Until that swap the guard keeps dispatching to the attached
 /// bridge, the same window `patch_jump_for_descr` leaves closed. Invalidation
 /// remains owned by the loop token across module replacement.
-struct PendingInline {
+pub(crate) struct PendingInline {
     /// The loop this region merges into. Weak so a leftover retry
     /// cannot keep an otherwise unreachable owner (and its module)
     /// alive for the rest of the thread.
@@ -2807,80 +2816,51 @@ impl PendingInline {
     }
 }
 
-// Deferred merges by id, the id being what the bridge module passes back.
-//
-// Thread-local: the stored `Op` graph holds non-atomic `Rc` (`OpRc`,
-// `InputArgRc`). PyPy's cpu compiles and resumes on the thread that
-// ran the compiled frame (`eval.rs` post-`run_compiled`). `memmgr`
-// owns token GC globally; the IR itself stays on this cpu.
-thread_local! {
-    static PENDING_INLINES: RefCell<IndexMap<i64, PendingInline>> =
-        RefCell::new(IndexMap::new());
-    /// Ids whose bridges have reached [`INLINE_TRIP_THRESHOLD`] on this
-    /// thread. The probe runs inside the bridge, so the host is between
-    /// `run_compiled` and its return; only this thread's driver may
-    /// install.
-    static TRIPPED_INLINES: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
-}
-/// Source of the ids above. A counter is not IR; unique ids can be
-/// process-wide.
-static NEXT_PENDING_INLINE_ID: AtomicI64 = AtomicI64::new(1);
-
-fn with_pending_inlines<R>(f: impl FnOnce(&IndexMap<i64, PendingInline>) -> R) -> R {
-    PENDING_INLINES.with(|pending| f(&pending.borrow()))
-}
-
-/// Drop this thread's deferred-inline Op graphs before the cpu lock
-/// is released. The graph holds `OpRc` / ExtraHeap slots; a worker
-/// TLS dtor freeing them after the next test has started is what
-/// smashed ExtraHeap's process mutex.
-#[cfg(test)]
-pub(crate) fn clear_pending_inlines_for_tests() {
-    PENDING_INLINES.with(|pending| pending.borrow_mut().clear());
-    TRIPPED_INLINES.with(|tripped| tripped.borrow_mut().clear());
-}
-
-fn with_pending_inlines_mut<R>(f: impl FnOnce(&mut IndexMap<i64, PendingInline>) -> R) -> R {
-    PENDING_INLINES.with(|pending| f(&mut pending.borrow_mut()))
-}
-
-fn push_tripped_inline(pending_id: i64) {
-    TRIPPED_INLINES.with(|tripped| tripped.borrow_mut().push(pending_id));
-}
-
-fn take_tripped_inline_queue() -> Vec<i64> {
-    TRIPPED_INLINES.with(|tripped| std::mem::take(&mut *tripped.borrow_mut()))
-}
-
-/// Put unused trip ids back without dropping ids recorded since the take.
-fn restore_tripped_inlines(keep: Vec<i64>) {
-    TRIPPED_INLINES.with(|tripped| tripped.borrow_mut().extend(keep));
-}
-
-/// Drops a registered [`PendingInline`] unless the bridge whose probe would
-/// fire its callback actually got published.
+/// `addr` is the box address baked into the bridge (`alloc_pending_inline`).
 ///
-/// Registration has to precede the module build — the probe is one of the
-/// build's inputs — so a build or host rejection after it would otherwise leave
-/// an entry nothing can ever reach, holding the owner's `Arc<JitCellToken>`,
-/// the copied region and its pool for the life of the thread, once per
-/// rejected attempt. The counter stays leaked either way; it is eight bytes,
-/// and on this path no module was published to increment it.
-struct PendingInlineGuard(Option<i64>);
-
-impl PendingInlineGuard {
-    /// The bridge is published, so the entry is the callback's to remove.
-    fn disarm(mut self) {
-        self.0 = None;
-    }
+/// # Safety
+/// `addr` must still be a `PendingInlineSlot` box inside some live
+/// `LoopAsmResources::pending_inlines`. `free_loop_and_bridges` drops that box.
+unsafe fn pending_slot_at(addr: usize) -> &'static release::PendingInlineSlot {
+    unsafe { &*(addr as *const release::PendingInlineSlot) }
 }
 
-impl Drop for PendingInlineGuard {
-    fn drop(&mut self) {
-        if let Some(pending_id) = self.0 {
-            with_pending_inlines_mut(|pending| {
-                pending.shift_remove(&pending_id);
-            });
+fn pending_slot_is_member(owner: &JitCellToken, addr: usize) -> bool {
+    owner_pending_slot_addrs(owner).contains(&addr)
+}
+
+/// Pending-inline slots on `owner`, in `asmmemmgr_blocks` order.
+/// `push_resources` runs at the end of each `compile_bridge`, which is the
+/// order the old process-wide ids were allocated, so this replaces the id sort.
+/// The lock is not held after this returns: a later re-emission pushes blocks.
+fn owner_pending_slot_addrs(owner: &JitCellToken) -> Vec<usize> {
+    let Some(clt) = owner.compiled_loop_token() else {
+        return Vec::new();
+    };
+    let blocks = clt.asmmemmgr_blocks.lock();
+    let mut addrs = Vec::new();
+    for block in blocks.iter() {
+        let Some(resources) = block.downcast_ref::<release::LoopAsmResources>() else {
+            continue;
+        };
+        for slot in &resources.pending_inlines {
+            addrs.push(&**slot as *const release::PendingInlineSlot as usize);
+        }
+    }
+    addrs
+}
+
+/// Drop every live deferred merge of an invalidated `owner` and point its
+/// guard cells back at the attached bridges. A dead owner's slots are freed
+/// with its `asmmemmgr_blocks`.
+fn discard_invalidated_owner_inlines(owner: &Arc<JitCellToken>) {
+    for addr in owner_pending_slot_addrs(owner) {
+        // SAFETY: `addr` was just read out of this owner's `pending_inlines`.
+        let Some(item) = unsafe { pending_slot_at(addr) }.entry.borrow_mut().take() else {
+            continue;
+        };
+        if item.remap.is_none() {
+            WasmBackend::restore_dispatch_cell(owner, item.region.source_fail_index);
         }
     }
 }
@@ -2912,17 +2892,34 @@ fn merged_region_fail_index(
 }
 
 /// Note that a bridge has counted its way to the threshold. Called from
-/// compiled code, inside the bridge module. When a loop is on the wasm
-/// stack, install now: the parent is not re-entered, and its next back-edge
-/// loads the resume cell. Otherwise queue for the host after return.
-pub fn record_inline_trip(pending_id: i64) {
-    push_tripped_inline(pending_id);
+/// compiled code, inside the bridge module. Install now: the parent is not
+/// re-entered, and its next back-edge loads the resume cell. The slot stays
+/// on the queue so `execute_assembler` can retry after the trace returns.
+pub fn record_inline_trip(pending_slot: i64) {
     let backend = EXECUTING_WASM_BACKEND.load(std::sync::atomic::Ordering::Relaxed);
-    if !backend.is_null() {
-        // The pointer is the backend whose `execute_token` is inside
-        // `glue::execute` on this thread. Install only writes a cell and
-        // replaces a module; it does not call the running function.
-        unsafe { (*backend).install_pending_inline(pending_id) };
+    if backend.is_null() {
+        debug_assert!(false, "inline trip with no executing wasm backend");
+        return;
+    }
+    let slot = pending_slot as usize;
+    // SAFETY: the probe runs inside this bridge, so its slot box is still
+    // on the bridge's `LoopAsmResources`.
+    let owner = unsafe { pending_slot_at(slot) }
+        .entry
+        .borrow()
+        .as_ref()
+        .map(|item| item.owner.clone());
+    let Some(owner) = owner else {
+        return;
+    };
+    // The pointer is the backend whose `execute_token` is inside
+    // `glue::execute` on this thread. Install only writes a cell and
+    // replaces a module; it does not call the running function.
+    // Membership is not re-checked: this call is still inside the bridge,
+    // so the slot cannot have been freed since the read above.
+    unsafe {
+        (*backend).tripped_inlines.borrow_mut().push((owner, slot));
+        (*backend).install_live_pending_inline(slot);
     }
 }
 
@@ -2951,62 +2948,27 @@ impl Drop for ExecutingBackendGuard {
     }
 }
 
-fn sweep_dead_pending() {
-    with_pending_inlines_mut(|pending| {
-        pending.retain(|_, item| {
-            let Some(owner) = item.owner() else {
-                return false;
-            };
-            if !owner.is_invalidated() {
-                return true;
-            }
-            // The cell still names the attached bridge. Republish it so an
-            // invalidated owner does not keep a stale slot for the next compile.
-            if item.remap.is_none() {
-                WasmBackend::restore_dispatch_cell(&owner, item.region.source_fail_index);
-            }
-            false
-        });
-    });
-}
-
-/// Take the merges whose bridges have tripped since the last call, for a caller
-/// with no compiled trace left on the stack.
-pub fn take_tripped_inlines() -> Vec<i64> {
-    take_tripped_inline_queue()
-}
-
 /// Record a deferred merge and describe the probe the bridge standing in for
-/// it carries.
-///
-/// ⛔ The counter is leaked rather than owned by the entry below: the bridge
-/// module increments it on every entry and outlives the merge, which takes its
-/// entry out of the map. One `u64` per deferred merge, and the alternative is a
-/// live module writing to freed memory.
+/// it carries. The slot lives in `asm_resources`, dropped with a rejected
+/// build and freed with the bridge's `asmmemmgr_blocks` once published.
 fn register_pending_inline(
+    asm_resources: &mut release::LoopAsmResources,
     owner: Arc<JitCellToken>,
     region: codegen::InlinedBridge,
     owner_module_bytes: u32,
     remap: Option<(u64, u32)>,
 ) -> codegen::InlineTripProbe {
-    let counter_addr = Box::leak(Box::new(0u64)) as *const u64 as usize as u32;
-    let pending_id = NEXT_PENDING_INLINE_ID.fetch_add(1, Ordering::Relaxed);
-    with_pending_inlines_mut(|pending| {
-        pending.insert(
-            pending_id,
-            PendingInline {
-                owner: Arc::downgrade(&owner),
-                region,
-                remap,
-                retry_on_sibling: false,
-            },
-        );
+    let (pending_slot, counter_addr) = asm_resources.alloc_pending_inline(PendingInline {
+        owner: Arc::downgrade(&owner),
+        region,
+        remap,
+        retry_on_sibling: false,
     });
     codegen::InlineTripProbe {
         counter_addr,
         threshold: inline_trip_threshold_for(owner_module_bytes),
         trip_fn_ptr: inline_trip_helper_slot() as i64,
-        pending_id,
+        pending_slot: pending_slot as i64,
     }
 }
 
@@ -3196,6 +3158,7 @@ impl WasmBackend {
             vtable_offset: None,
             gc_box: None,
             exit_cells: std::sync::Arc::new(failguard::CpuExitCells::new()),
+            tripped_inlines: RefCell::new(Vec::new()),
         }
     }
 
@@ -3424,68 +3387,131 @@ impl WasmBackend {
         }
     }
 
+    /// Take the merges whose bridges have tripped since the last call, for a
+    /// caller with no compiled trace left on the stack.
+    pub fn take_tripped_inlines(&self) -> Vec<(Weak<JitCellToken>, usize)> {
+        std::mem::take(&mut *self.tripped_inlines.borrow_mut())
+    }
+
     /// Merge a deferred region into its owner, for a bridge that has been
     /// entered [`INLINE_TRIP_THRESHOLD`] times.
     ///
-    /// The trip itself only queued the id ([`record_inline_trip`]); this runs
-    /// from the host once the trace has returned.
+    /// The trip itself only queued the slot ([`record_inline_trip`]); this runs
+    /// from the host once the trace has returned, and also from the probe while
+    /// the bridge is still on the stack.
     ///
     /// A candidate that no longer qualifies — an invalidated owner, a loop that
     /// has since taken a region for the same guard — is dropped rather than
     /// retried: the bridge is already installed and correct, so the only thing
     /// lost is the merge.
-    pub fn install_pending_inline(&self, pending_id: i64) {
-        sweep_dead_pending();
-        let Some(pending) = with_pending_inlines_mut(|p| p.shift_remove(&pending_id)) else {
+    ///
+    /// `tripped` is `(owner weak, slot address)`. The address is dereferenced
+    /// only after the owner upgrades and the address is still one of that
+    /// owner's `pending_inlines`.
+    pub fn install_pending_inline(&self, tripped: (Weak<JitCellToken>, usize)) {
+        let (owner_weak, slot_addr) = tripped;
+        let Some(owner) = owner_weak.upgrade() else {
             return;
         };
-        let Some(owner) = pending.owner() else {
+        if !pending_slot_is_member(&owner, slot_addr) {
+            return;
+        }
+        self.install_live_pending_inline(slot_addr);
+    }
+
+    /// Install `slot_addr`, which the caller has already shown is live.
+    fn install_live_pending_inline(&self, slot_addr: usize) {
+        // SAFETY: `record_inline_trip` calls this while the bridge is still
+        // on the stack. `install_pending_inline` calls it only after
+        // `pending_slot_is_member`.
+        let owner = {
+            let borrowed = unsafe { pending_slot_at(slot_addr) }.entry.borrow();
+            borrowed.as_ref().and_then(|item| item.owner())
+        };
+        let Some(owner) = owner else {
+            // SAFETY: same live-slot guarantee as the read above.
+            unsafe { pending_slot_at(slot_addr) }
+                .entry
+                .borrow_mut()
+                .take();
+            return;
+        };
+        // `sweep_dead_pending` only ran from here. A dead owner is freed with
+        // its blocks; an invalidated one still has them, so restore its cells.
+        if owner.is_invalidated() {
+            discard_invalidated_owner_inlines(&owner);
+            return;
+        }
+        // SAFETY: same live-slot guarantee as the owner read above.
+        let Some(pending) = unsafe { pending_slot_at(slot_addr) }
+            .entry
+            .borrow_mut()
+            .take()
+        else {
             return;
         };
         // The driver has already classified the exit, and no compiled frame
         // remains. Re-emission swaps the owner's module here.
         diag_bump(55);
-        let mut work = vec![(pending_id, pending.region, pending.remap)];
+        let mut work = vec![(slot_addr, pending.region, pending.remap)];
         // Other trips for this owner would each re-emit the whole module.
         // Fold them into this rebuild so one Cranelift compile covers them.
-        // Children compiled as `not_direct` wait in PENDING with a remap.
+        // Children compiled as `not_direct` wait with a remap.
         // An `uninitialized_label` trip can also fire before the sibling
         // peel that publishes its JUMP target; fold those too so the
         // one-shot probe is not the only retry.
-        let mut sibling_ids: Vec<i64> = with_pending_inlines(|pending| {
-            pending
-                .iter()
-                .filter(|(_, item)| {
-                    item.same_owner(&owner) && (item.remap.is_some() || item.retry_on_sibling)
-                })
-                .map(|(&id, _)| id)
-                .collect()
-        });
-        sibling_ids.sort_unstable();
-        for id in sibling_ids {
-            if let Some(item) = with_pending_inlines_mut(|p| p.shift_remove(&id)) {
-                work.push((id, item.region, item.remap));
+        // Block order is attach order (`push_resources` at the end of each
+        // `compile_bridge`), the same order the old ids were allocated in.
+        let sibling_addrs: Vec<usize> = owner_pending_slot_addrs(&owner)
+            .into_iter()
+            .filter(|&addr| {
+                // SAFETY: `addr` was just read out of this owner's `pending_inlines`.
+                unsafe { pending_slot_at(addr) }
+                    .entry
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|item| {
+                        item.same_owner(&owner) && (item.remap.is_some() || item.retry_on_sibling)
+                    })
+            })
+            .collect();
+        for addr in sibling_addrs {
+            // SAFETY: `addr` was just read out of this owner's `pending_inlines`.
+            if let Some(item) = unsafe { pending_slot_at(addr) }.entry.borrow_mut().take() {
+                work.push((addr, item.region, item.remap));
             }
         }
-        let queued = take_tripped_inline_queue();
+        let queued = std::mem::take(&mut *self.tripped_inlines.borrow_mut());
         let mut keep = Vec::new();
-        let mut extra_ids = Vec::new();
-        with_pending_inlines(|pending| {
-            for id in queued {
-                if pending.get(&id).is_some_and(|item| item.same_owner(&owner)) {
-                    extra_ids.push(id);
-                } else {
-                    keep.push(id);
-                }
+        let mut extra_addrs = Vec::new();
+        for (weak, addr) in queued {
+            let Some(queued_owner) = weak.upgrade() else {
+                continue;
+            };
+            if !pending_slot_is_member(&queued_owner, addr) {
+                continue;
             }
-        });
-        restore_tripped_inlines(keep);
-        for id in extra_ids {
+            // SAFETY: `pending_slot_is_member` just found `addr` in this owner's blocks.
+            let same = unsafe { pending_slot_at(addr) }
+                .entry
+                .borrow()
+                .as_ref()
+                .is_some_and(|item| item.same_owner(&owner));
+            if same {
+                extra_addrs.push(addr);
+            } else {
+                keep.push((weak, addr));
+            }
+        }
+        self.tripped_inlines.borrow_mut().extend(keep);
+        for addr in extra_addrs {
             diag_bump(55);
-            if let Some(item) = with_pending_inlines_mut(|p| p.shift_remove(&id)) {
+            // SAFETY: `addr` passed `pending_slot_is_member` above, and this
+            // install has not freed the owner's blocks.
+            if let Some(item) = unsafe { pending_slot_at(addr) }.entry.borrow_mut().take() {
                 // Remapped children still name a parent-local fail index;
                 // the owner's descr array does not hold that guard.
-                work.push((id, item.region, item.remap));
+                work.push((addr, item.region, item.remap));
             }
         }
         let fail_indices: Vec<u32> = work
@@ -3493,23 +3519,34 @@ impl WasmBackend {
             .filter(|(_, _, remap)| remap.is_none())
             .map(|(_, r, _)| r.source_fail_index)
             .collect();
-        // The compiled probe still names the id it was registered under.
-        // Leftover remaps must go back under that same id; a fresh one
+        // The compiled probe still names the slot it was registered under.
+        // Leftover remaps must go back into that same slot; a fresh one
         // would leave the already-emitted trip calling a hole.
-        let remap_pending_ids: HashMap<(u64, u32), i64> = work
+        let remap_pending_ids: HashMap<(u64, u32), usize> = work
             .iter()
-            .filter_map(|(id, _, remap)| remap.map(|key| (key, *id)))
+            .filter_map(|(addr, _, remap)| remap.map(|key| (key, *addr)))
             .collect();
-        let fail_pending_ids: HashMap<u32, i64> = work
+        let fail_pending_ids: HashMap<u32, usize> = work
             .iter()
             .filter(|(_, _, remap)| remap.is_none())
-            .map(|(id, region, _)| (region.source_fail_index, *id))
+            .map(|(addr, region, _)| (region.source_fail_index, *addr))
             .collect();
-        let trigger_id = pending_id;
+        let trigger_id = slot_addr;
         let (mut leftover, mut terminal) = self.install_inline_region_batch(
             &owner,
             work.into_iter().map(|(_, r, remap)| (r, remap)).collect(),
         );
+        let put_back = |addr: usize, region: codegen::InlinedBridge, remap: Option<(u64, u32)>| {
+            // SAFETY: `addr` is a slot box still stored in this owner's
+            // `pending_inlines`. This install takes the `Option` and does not
+            // drop the box; re-emission only pushes new blocks.
+            *unsafe { pending_slot_at(addr) }.entry.borrow_mut() = Some(PendingInline {
+                owner: Arc::downgrade(&owner),
+                region,
+                remap,
+                retry_on_sibling: remap.is_none(),
+            });
+        };
         // Optional remaps / leftover labels must not make the newly
         // tripped region fail the whole rebuild.
         if terminal && leftover.len() > 1 && !owner.is_invalidated() {
@@ -3517,7 +3554,7 @@ impl WasmBackend {
                 leftover
                     .into_iter()
                     .partition(|(region, remap)| match remap {
-                        Some(key) => remap_pending_ids.get(&key) == Some(&trigger_id),
+                        Some(key) => remap_pending_ids.get(key) == Some(&trigger_id),
                         None => {
                             fail_pending_ids.get(&region.source_fail_index) == Some(&trigger_id)
                         }
@@ -3526,24 +3563,14 @@ impl WasmBackend {
                 (leftover, terminal) = self.install_inline_region_batch(&owner, trigger_left);
                 if !terminal && !owner.is_invalidated() {
                     for (region, remap) in optional_left {
-                        let id = match remap {
+                        let addr = match remap {
                             Some(key) => remap_pending_ids.get(&key).copied(),
                             None => fail_pending_ids.get(&region.source_fail_index).copied(),
                         };
-                        let Some(id) = id else {
+                        let Some(addr) = addr else {
                             continue;
                         };
-                        with_pending_inlines_mut(|pending| {
-                            pending.insert(
-                                id,
-                                PendingInline {
-                                    owner: Arc::downgrade(&owner),
-                                    region,
-                                    remap,
-                                    retry_on_sibling: remap.is_none(),
-                                },
-                            );
-                        });
+                        put_back(addr, region, remap);
                     }
                 }
             } else {
@@ -3560,24 +3587,16 @@ impl WasmBackend {
         }
         // Leftovers whose parent or sibling is not in the owner yet stay
         // pending so a later install can pick them up. The compiled probe
-        // still names this id.
+        // still names this slot.
         for (region, remap) in leftover {
-            let id = match remap {
+            let addr = match remap {
                 Some(key) => remap_pending_ids.get(&key).copied(),
                 None => fail_pending_ids.get(&region.source_fail_index).copied(),
             };
-            let Some(id) = id else {
+            let Some(addr) = addr else {
                 continue;
             };
-            let item = PendingInline {
-                owner: Arc::downgrade(&owner),
-                region,
-                remap,
-                retry_on_sibling: remap.is_none(),
-            };
-            with_pending_inlines_mut(|pending| {
-                pending.insert(id, item);
-            });
+            put_back(addr, region, remap);
         }
     }
 
@@ -5903,10 +5922,15 @@ impl majit_backend::Backend for WasmBackend {
                     // to join this owner. A parent declined as
                     // `not_loop_closing` never enters PENDING, so the child
                     // would re-register forever.
-                    let parent_pending = with_pending_inlines(|pending| {
-                        pending.values().any(|item| {
-                            item.same_owner(&owner) && item.region.trace_id == source_trace_id
-                        })
+                    let parent_pending = owner_pending_slot_addrs(&owner).into_iter().any(|addr| {
+                        // SAFETY: `addr` was just read out of this owner's `pending_inlines`.
+                        unsafe { pending_slot_at(addr) }
+                            .entry
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|item| {
+                                item.same_owner(&owner) && item.region.trace_id == source_trace_id
+                            })
                     });
                     if parent_pending {
                         defer_inline = Some((
@@ -6125,6 +6149,11 @@ impl majit_backend::Backend for WasmBackend {
         // The region carries the trace id of the bridge standing in for it, so
         // a guard of this bridge that fails later resolves to its merged region
         // (`merged_region_fail_index`) when the owner is finally rebuilt.
+        // Built before the probe so a rejected module drops the slot with
+        // these resources instead of publishing it (`push_resources` is only
+        // reached once the host has accepted the bridge).
+        let mut asm_resources = release::LoopAsmResources::default();
+        asm_resources.exit_cells = Some(std::sync::Arc::clone(&self.exit_cells));
         let inline_trip = defer_inline.map(|(owner, merged_fail_index, outside_loop, remap)| {
             if region_external.is_some() {
                 diag_bump(51);
@@ -6146,9 +6175,8 @@ impl majit_backend::Backend for WasmBackend {
             // The owner's size prices this merge alone.
             let owner_module_bytes =
                 compiled_wasm_loop(&owner).map_or(0, |loop_| loop_.module_bytes.get());
-            register_pending_inline(owner, region, owner_module_bytes, remap)
+            register_pending_inline(&mut asm_resources, owner, region, owner_module_bytes, remap)
         });
-        let pending_guard = PendingInlineGuard(inline_trip.map(|probe| probe.pending_id));
 
         let guard_exit_count = codegen::guard_exit_count(inputargs, ops);
         let base = 0u32;
@@ -6185,8 +6213,6 @@ impl majit_backend::Backend for WasmBackend {
             frame: source_frame,
             ca: ca_params,
         };
-        let mut asm_resources = release::LoopAsmResources::default();
-        asm_resources.exit_cells = Some(std::sync::Arc::clone(&self.exit_cells));
         module_inputs.ca.exit_table_base = asm_resources.alloc_exit_table(guard_exit_count) as u32;
         module_inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
         // `runner.rs` captures `AttachedDescrPtrs` at `compile_bridge` entry.
@@ -6257,9 +6283,6 @@ impl majit_backend::Backend for WasmBackend {
             &module_inputs.ca.attached,
         );
         Self::register_meta_descrs(original_token, &bridge_descrs);
-        // Past every path that can fail with no module published: from here the
-        // probe exists and its callback owns the pending entry.
-        pending_guard.disarm();
         // Only a bridge that survived the decline above gets its reference
         // constants rooted. The table is attached to the long-lived original
         // loop token, so rooting a rejected bridge's table would keep its
@@ -6860,6 +6883,51 @@ mod tests {
         let bits = usize::BITS as usize;
         let word = 1 + index / bits;
         word < buf.len() && (buf[word] & (1usize << (index % bits))) != 0
+    }
+
+    /// A trip queued while the bridge was alive must not be dereferenced after
+    /// `free_loop_and_bridges` drops that bridge's `LoopAsmResources`.
+    #[test]
+    fn a_freed_pending_slot_is_not_dereferenced_on_drain() {
+        let token = std::sync::Arc::new(JitCellToken::new(9_910_077));
+        let clt = std::sync::Arc::new(majit_backend::CompiledLoopToken::new(token.number));
+        clt.set_loop_token_wref(std::sync::Arc::downgrade(&token));
+        token.set_compiled_loop_token(Some(clt));
+
+        let mut resources = release::LoopAsmResources::default();
+        let (slot, _counter) = resources.alloc_pending_inline(PendingInline {
+            owner: std::sync::Arc::downgrade(&token),
+            region: codegen::InlinedBridge {
+                source_fail_index: 0,
+                external_jump: None,
+                outside_loop: false,
+                trace_id: 1,
+                inputargs: Vec::new(),
+                ops: Vec::new(),
+                gc_table_base: 0,
+                gc_const_keys: Vec::new(),
+                constants: indexmap::IndexMap::new(),
+            },
+            remap: None,
+            retry_on_sibling: false,
+        });
+        release::push_resources(&token, resources);
+        let backend = WasmBackend::new();
+        backend
+            .tripped_inlines
+            .borrow_mut()
+            .push((std::sync::Arc::downgrade(&token), slot));
+        token.compiled_loop_token_expect().free_loop_and_bridges();
+
+        let before = bridge_diag(55);
+        for tripped in backend.take_tripped_inlines() {
+            backend.install_pending_inline(tripped);
+        }
+        assert_eq!(
+            bridge_diag(55),
+            before,
+            "a trip whose block was freed must not install"
+        );
     }
 
     /// `llmodel.py` `free_loop_and_bridges`: a loop and its bridge drop their

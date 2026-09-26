@@ -1273,7 +1273,6 @@ pub fn lock_cpu() -> CpuTestGuard {
 fn reset_cpu_for_tests() {
     crate::gc_box::clear();
     majit_gc::shadow_stack::clear();
-    crate::clear_pending_inlines_for_tests();
     crate::jit_exc_clear();
     crate::set_wasm_jitframe_tid(0);
 }

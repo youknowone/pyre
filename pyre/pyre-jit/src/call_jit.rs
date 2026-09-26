@@ -4717,8 +4717,8 @@ fn try_compile_ca_bridge(
 ///
 /// Returns 0 because the trace drops the result.
 #[cfg(target_arch = "wasm32")]
-pub extern "C" fn wasm_jit_inline_trip(pending_id: i64) -> i64 {
-    majit_backend_wasm::record_inline_trip(pending_id);
+pub extern "C" fn wasm_jit_inline_trip(pending_slot: i64) -> i64 {
+    majit_backend_wasm::record_inline_trip(pending_slot);
     0
 }
 

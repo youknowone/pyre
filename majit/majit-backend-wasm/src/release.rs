@@ -6,8 +6,19 @@
 //! (`history.py`), so this token is not freed while that caller exists.
 
 use std::any::Any;
+use std::cell::{Cell, RefCell};
 
 use majit_backend::JitCellToken;
+
+/// One deferred inline merge and the entry counter its bridge increments.
+///
+/// The box lives in [`LoopAsmResources::pending_inlines`] and is freed with
+/// that block (`free_loop_and_bridges`). The probe bakes this box's address
+/// and the address of `counter`.
+pub struct PendingInlineSlot {
+    pub(crate) entry: RefCell<Option<super::PendingInline>>,
+    pub(crate) counter: Cell<u64>,
+}
 
 /// Compile-time maps, table slots, label rows, fail indices, and bridge
 /// cells of one emission. Pushed into `asmmemmgr_blocks`; `Drop` runs when
@@ -39,7 +50,18 @@ pub struct LoopAsmResources {
     /// `[descr_cell, gcmap]` pairs the exit loads. The address is baked
     /// into the module; the allocation does not move.
     pub exit_table: Option<Box<[usize]>>,
+    /// Deferred merges whose out-of-line bridges this emission compiled.
+    /// Pushed with the bridge onto the original loop token
+    /// (`push_resources`; `assembler.py` keeps bridge blocks on
+    /// `original_loop_token.compiled_loop_token.asmmemmgr_blocks`).
+    pub pending_inlines: Vec<Box<PendingInlineSlot>>,
 }
+
+// Loop asm resources are transferred through the token's `Any + Send`
+// holder, but all access to its IR snapshot and cell arrays is confined to the
+// single wasm execution thread. The contained `RefCell`s enforce that runtime
+// ownership model; moving the holder does not permit concurrent access.
+unsafe impl Send for LoopAsmResources {}
 
 impl LoopAsmResources {
     pub fn park_gcmap(&mut self, map: Box<[usize]>) -> usize {
@@ -70,6 +92,19 @@ impl LoopAsmResources {
         let ptr = table.as_ptr() as usize;
         self.exit_table = Some(table);
         ptr
+    }
+
+    /// Stable address of a new pending-inline slot, and the address of its
+    /// entry counter. Both are baked into the bridge module.
+    pub(crate) fn alloc_pending_inline(&mut self, inline: super::PendingInline) -> (usize, u32) {
+        let slot = Box::new(PendingInlineSlot {
+            entry: RefCell::new(Some(inline)),
+            counter: Cell::new(0),
+        });
+        let slot_addr = &*slot as *const PendingInlineSlot as usize;
+        let counter_addr = &slot.counter as *const Cell<u64> as usize as u32;
+        self.pending_inlines.push(slot);
+        (slot_addr, counter_addr)
     }
 
     pub fn write_exit_slot(&mut self, index: usize, descr_cell: usize, gcmap: usize) {

@@ -2246,7 +2246,7 @@ fn a_deferred_merge_trips_once_at_its_threshold() {
         // Table slot 1 below; slot 0 stays null so a mis-selected slot traps
         // rather than calling the wrong function.
         trip_fn_ptr: 1,
-        pending_id: 77,
+        pending_slot: 77,
     });
 
     let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("the armed module builds");
@@ -6590,7 +6590,7 @@ fn an_oversized_owner_defers_a_gni_region_instead_of_dropping_it() {
     };
     let deferred_before = majit_backend_wasm::bridge_diag(54);
     let inline_ok_before = majit_backend_wasm::bridge_diag(32);
-    let pending_before = majit_backend_wasm::pending_inline_count();
+    let pending_before = majit_backend_wasm::pending_inline_count(&token);
     majit_backend_wasm::set_inline_trip_helper_slot(1);
     backend
         .compile_bridge(
@@ -6615,7 +6615,7 @@ fn an_oversized_owner_defers_a_gni_region_instead_of_dropping_it() {
         "an oversized owner is not merged before the trip"
     );
     assert!(
-        majit_backend_wasm::pending_inline_count() > pending_before,
+        majit_backend_wasm::pending_inline_count(&token) > pending_before,
         "the trip is armed so the raise path can still merge once hot"
     );
 }

@@ -4103,8 +4103,8 @@ pub struct InlineTripProbe {
     pub threshold: u64,
     /// `__indirect_function_table` index of the `(i64) -> i64` callback.
     pub trip_fn_ptr: i64,
-    /// The callback's only argument: which deferred merge to install.
-    pub pending_id: i64,
+    /// The callback's only argument: address of the `PendingInlineSlot`.
+    pub pending_slot: i64,
 }
 
 /// Owned inputs for one wasm module build.  A loop retains this after its
@@ -5061,7 +5061,7 @@ pub fn build_wasm_module(
         }
         next_type_idx += max as u32 + 1;
     }
-    // Deferred-merge trip callback `(i64 pending_id) -> i64`, declared before
+    // Deferred-merge trip callback `(i64 pending_slot) -> i64`, declared before
     // the bridge-parameter arities so an armed probe cannot shift their
     // indices.
     let inline_trip_type_idx = next_type_idx;
@@ -9612,7 +9612,7 @@ pub fn entry_dispatch_key_count(ops: &[Op]) -> usize {
     }
 }
 
-/// `counter += 1; if counter == threshold { trip(pending_id) }`, at the entry
+/// `counter += 1; if counter == threshold { trip(pending_slot) }`, at the entry
 /// of an out-of-line bridge whose merge into its owner is waiting on this
 /// count. Equality rather than `>=` so the callback fires exactly once.
 ///
@@ -9640,7 +9640,7 @@ fn emit_inline_trip_probe(sink: &mut PeepSink<'_, '_>, probe: InlineTripProbe, t
     // Install from here. The probe runs in the bridge module; the parent
     // stays on the stack and is not re-entered. The parent's next back-edge
     // reads the resume cell and tail-calls the replacement.
-    sink.i64_const(probe.pending_id);
+    sink.i64_const(probe.pending_slot);
     sink.i32_const(probe.trip_fn_ptr as i32);
     sink.call_indirect(0, type_idx);
     sink.drop(); // returns 0; ignored
