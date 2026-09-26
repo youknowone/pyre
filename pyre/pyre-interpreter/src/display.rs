@@ -1121,7 +1121,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             return Ok(out);
         } else if std::ptr::eq(tp, &TYPE_TYPE as *const PyType) {
             let name = crate::baseobjspace::type_repr_qualified_name(obj);
-            format!("<class '{name}'>")
+            return Ok(wtf8_format!("<class '", name, "'>"));
         } else if std::ptr::eq(tp, &pyre_object::UNION_TYPE as *const PyType) {
             // PyPy: UnionType.__repr__ → " | ".join([_repr_item(x) for x in self.__args__])
             let args = pyre_object::w_union_get_args(obj);
@@ -1273,7 +1273,8 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             }
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let name = crate::baseobjspace::getfulltypename(obj);
-            format!("<{name} object at {}>", repr_addr(obj as usize))
+            let addr = repr_addr(obj as usize);
+            return Ok(wtf8_format!("<", name, format!(" object at {addr}>")));
         } else {
             // A builtin type carrying its own `__repr__` dict entry (e.g.
             // `_struct.Struct`) — dispatch it before the generic
@@ -1297,7 +1298,8 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             }
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let name = crate::baseobjspace::getfulltypename(obj);
-            format!("<{name} object at {}>", repr_addr(obj as usize))
+            let addr = repr_addr(obj as usize);
+            return Ok(wtf8_format!("<", name, format!(" object at {addr}>")));
         };
         Ok(Wtf8Buf::from_string(formatted))
     }

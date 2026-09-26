@@ -2925,7 +2925,7 @@ unsafe fn read_code_str(v: PyObjectRef, field: &str) -> Result<String, crate::Py
     if !unsafe { pyre_object::is_str(v) } {
         return Err(crate::PyError::type_error(format!("{field} must be a str")));
     }
-    Ok(unsafe { pyre_object::w_str_get_value(v) }.to_string())
+    Ok(crate::baseobjspace::str_utf8_w(v)?.to_string())
 }
 
 /// `pycode.py filename='fsencode'`: retain filesystem bytes that the
@@ -2979,7 +2979,7 @@ unsafe fn read_code_names(v: PyObjectRef, field: &str) -> Result<Box<[String]>, 
                 "{field} must be a tuple of strings"
             )));
         }
-        out.push(unsafe { pyre_object::w_str_get_value(e) }.to_string());
+        out.push(crate::baseobjspace::str_utf8_w(e)?.to_string());
     }
     Ok(out.into_boxed_slice())
 }

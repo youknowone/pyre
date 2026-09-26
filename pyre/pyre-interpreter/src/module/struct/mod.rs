@@ -716,7 +716,7 @@ fn unpack_simple_int(raw: &[u8], size: usize, signed: bool, bigendian: bool) -> 
 fn pack_slow(this: &W_Struct, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     this.ensure_ready()?;
     let format = majit_metainterp::jit::promote_string(this.format);
-    let fmt = unsafe { w_str_get_value(format) };
+    let fmt = crate::baseobjspace::str_utf8_w(format)?;
     do_pack(fmt, &args[1..])
 }
 
@@ -725,7 +725,7 @@ fn pack_slow(this: &W_Struct, args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 fn unpack_slow(this: &W_Struct, w_str: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     this.ensure_ready()?;
     let format = majit_metainterp::jit::promote_string(this.format);
-    let fmt = unsafe { w_str_get_value(format) };
+    let fmt = crate::baseobjspace::str_utf8_w(format)?;
     let buf = unsafe { readbuf(w_str)? };
     do_unpack(fmt, buf)
 }
@@ -1389,7 +1389,9 @@ impl W_Struct {
         if self.size < 0 {
             return (-1, -1);
         }
-        let fmt = unsafe { w_str_get_value(self.format) };
+        let Some(fmt) = (unsafe { w_str_get_value_opt(self.format) }) else {
+            return (self.size, -1);
+        };
         match parse_format(fmt) {
             Ok(parsed) => (self.size, parsed.expected_args() as i64),
             Err(_) => (self.size, -1),
@@ -1454,7 +1456,7 @@ impl W_Struct {
     fn unpack(&self, w_str: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         if self.size >= 0 {
             let format = majit_metainterp::jit::promote_string(self.format);
-            let fmt = unsafe { w_str_get_value(format) };
+            let fmt = unsafe { w_str_get_wtf8(format) };
             if let Some((size, signed, bigendian)) = simple_int_format!(fmt) {
                 if unsafe { bytesobject::is_bytes_like(w_str) } {
                     let buf = unsafe { bytesobject::bytes_like_data(w_str) };
@@ -1481,7 +1483,7 @@ impl W_Struct {
     ) -> Result<PyObjectRef, crate::PyError> {
         self.ensure_ready()?;
         let format = majit_metainterp::jit::promote_string(self.format);
-        let fmt = unsafe { w_str_get_value(format) };
+        let fmt = crate::baseobjspace::str_utf8_w(format)?;
         // Coerce `offset` before borrowing the buffer: `space_index_w` may run
         // `__index__`, which can resize or free the backing store `readbuf`
         // hands back as a raw slice.
@@ -1531,7 +1533,7 @@ impl W_Struct {
     /// `prepare_s()`'s `ncodes` pass does.
     fn __sizeof__(&self) -> Result<i64, crate::PyError> {
         self.ensure_ready()?;
-        let fmt = unsafe { w_str_get_value(self.format) };
+        let fmt = crate::baseobjspace::str_utf8_w(self.format)?;
         let parsed = parse_format(fmt)?;
         let ncodes = parsed
             .units
@@ -1650,7 +1652,7 @@ fn struct_pack_into(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1], args[2], args[3]]);
     let format = majit_metainterp::jit::promote_string(this.format);
-    let fmt = unsafe { w_str_get_value(format) }.to_owned();
+    let fmt = crate::baseobjspace::str_utf8_w(format)?.to_owned();
     let offset = unsafe {
         crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(base + 2))?
     };
@@ -1712,7 +1714,7 @@ pub mod unpack_iter {
             }
             let start = self.index as usize;
             let end = start + self.size as usize;
-            let fmt = unsafe { w_str_get_value(self.format) };
+            let fmt = crate::baseobjspace::str_utf8_w(self.format)?;
             let res = do_unpack(fmt, &buf[start..end])?;
             self.index += self.size;
             Ok(res)

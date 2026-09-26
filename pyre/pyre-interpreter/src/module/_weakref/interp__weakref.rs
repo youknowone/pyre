@@ -900,7 +900,7 @@ pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let objtype_name = unsafe {
         match crate::typedef::r#type(w_obj) {
             Some(tp) => crate::baseobjspace::type_fully_qualified_name(tp.as_ptr()),
-            None => "object".to_string(),
+            None => rustpython_wtf8::Wtf8Buf::from("object"),
         }
     };
     // The state also carries the referent's own address, which `getrepr`
@@ -908,12 +908,13 @@ pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     Ok(pyre_object::w_str_from_wtf8_managed(
         crate::display::wtf8_format!(
             format!(
-                "<{type_name} at {}; to '{objtype_name}' at {}",
+                "<{type_name} at {}; to '",
                 crate::display::repr_addr(
                     pyre_object::gc_roots::shadow_stack_get(self_slot) as usize
                 ),
-                crate::display::repr_addr(w_obj as usize),
             ),
+            objtype_name,
+            format!("' at {}", crate::display::repr_addr(w_obj as usize),),
             name,
             ">",
         ),
@@ -1803,20 +1804,26 @@ pub fn proxy_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 // 2-/3-arg attribute ops with name-string conversion.
 pub fn proxy_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    let name = unsafe { pyre_object::w_str_get_value(args[1]) };
-    crate::baseobjspace::getattr_str(w_obj0, name)
+    match unsafe { pyre_object::w_str_get_value_opt(args[1]) } {
+        Some(name) => crate::baseobjspace::getattr_str(w_obj0, name),
+        None => crate::baseobjspace::getattr(w_obj0, args[1]),
+    }
 }
 
 pub fn proxy_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    let name = unsafe { pyre_object::w_str_get_value(args[1]) };
-    crate::baseobjspace::setattr_str(w_obj0, name, args[2])
+    match unsafe { pyre_object::w_str_get_value_opt(args[1]) } {
+        Some(name) => crate::baseobjspace::setattr_str(w_obj0, name, args[2]),
+        None => crate::baseobjspace::setattr(w_obj0, args[1], args[2]),
+    }
 }
 
 pub fn proxy_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    let name = unsafe { pyre_object::w_str_get_value(args[1]) };
-    crate::baseobjspace::delattr_str(w_obj0, name)
+    match unsafe { pyre_object::w_str_get_value_opt(args[1]) } {
+        Some(name) => crate::baseobjspace::delattr_str(w_obj0, name),
+        None => crate::baseobjspace::delattr(w_obj0, args[1]),
+    }
 }
 
 // Item ops — interp__weakref.py:365 single special method, so
@@ -2961,12 +2968,14 @@ mod tests {
         crate::typedef::init_typeobjects();
         let referent = pyre_object::w_str_new("weakref target");
         let weakref = W_Weakref_new(weakref_type(), referent, PY_NULL);
-        let text = unsafe { pyre_object::w_str_get_value(descr__repr__(&[weakref]).unwrap()) };
+        let text = unsafe { pyre_object::w_str_get_wtf8(descr__repr__(&[weakref]).unwrap()) };
+        let text = text.as_str().unwrap();
         assert!(text.starts_with("<weakref at 0x"), "{text}");
         assert!(text.contains("; to 'str' at 0x"), "{text}");
 
         let proxy = W_Proxy_new(referent, PY_NULL);
-        let text = unsafe { pyre_object::w_str_get_value(descr__repr__(&[proxy]).unwrap()) };
+        let text = unsafe { pyre_object::w_str_get_wtf8(descr__repr__(&[proxy]).unwrap()) };
+        let text = text.as_str().unwrap();
         assert!(text.starts_with("<weakproxy at 0x"), "{text}");
         assert!(text.contains("; to 'str' at 0x"), "{text}");
     }

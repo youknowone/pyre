@@ -228,7 +228,9 @@ pub(super) fn stginfo_paramfunc(info: PyObjectRef) -> ParamFunc {
 pub(super) fn stginfo_format(info: PyObjectRef) -> Option<String> {
     match unsafe { pyre_object::w_dict_getitem_str(dict_of(info), K_FORMAT) } {
         Some(o) if unsafe { pyre_object::is_str(o) } => {
-            Some(unsafe { pyre_object::w_str_get_value(o) }.to_string())
+            pyre_interpreter::baseobjspace::str_utf8_w(o)
+                .ok()
+                .map(str::to_string)
         }
         _ => None,
     }

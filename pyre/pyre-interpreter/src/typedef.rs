@@ -20,7 +20,7 @@ use pyre_object::rutf8::{
     invalid_byte_2_of_3, invalid_byte_2_of_4, invalid_cont_byte, surrogate_bytes,
 };
 use pyre_object::*;
-use rustpython_wtf8::{CodePoint, Wtf8Buf};
+use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
 use crate::{make_builtin_function, make_builtin_function_with_arity};
 
@@ -11983,14 +11983,14 @@ fn getset_descriptor_type() -> pyre_object::PyObjectRef {
 fn readonly_attribute(descr: pyre_object::PyObjectRef) -> crate::PyError {
     let name_obj = read_descr_name(descr);
     let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
-        Some(unsafe { pyre_object::w_str_get_value(name_obj) })
+        Some(unsafe { pyre_object::w_str_get_wtf8(name_obj) })
     } else {
         None
     };
     match name {
-        Some(n) if n != "<generic property>" => {
-            crate::PyError::attribute_error(format!("readonly attribute '{}'", n))
-        }
+        Some(n) if n != "<generic property>" => crate::PyError::attribute_error(
+            crate::display::wtf8_format!("readonly attribute '", n, "'"),
+        ),
         _ => crate::PyError::attribute_error("readonly attribute".to_string()),
     }
 }
@@ -12038,15 +12038,22 @@ fn getset_missing_accessor(
     verb: &str,
 ) -> crate::PyError {
     let name_obj = read_descr_name(descr);
+    // `typedef.py` `GetSetProperty` `oefmt(... "%s" ..., self.name)` prints the
+    // raw name, so a lone surrogate stays in the message.
     let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
-        unsafe { pyre_object::w_str_get_value(name_obj) }
+        unsafe { pyre_object::w_str_get_wtf8(name_obj) }
     } else {
-        "?"
+        Wtf8::new("?")
     };
     let owner_name = unsafe { pyre_object::w_type_get_name(owner) };
-    crate::PyError::attribute_error(format!(
-        "attribute '{name}' of '{owner_name}' objects is not {verb}"
-    ))
+    let mut msg = Wtf8Buf::new();
+    msg.push_str("attribute '");
+    msg.push_wtf8(name);
+    msg.push_str("' of '");
+    msg.push_str(owner_name);
+    msg.push_str("' objects is not ");
+    msg.push_str(verb);
+    crate::PyError::attribute_error(msg)
 }
 
 /// Either refusal above, chosen by whether the descriptor names an owner.
@@ -12307,7 +12314,8 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                         let name_obj = read_descr_name(w_self);
                         let name =
                             if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
-                                unsafe { pyre_object::w_str_get_value(name_obj) }
+                                unsafe { pyre_object::w_str_get_value_opt(name_obj) }
+                                    .unwrap_or("<generic property>")
                             } else {
                                 "<generic property>"
                             };
@@ -12492,7 +12500,7 @@ fn patch_getset_descriptor_metadata() {
                             };
                             let name_obj = pyre_object::typedef::w_getset_get_name(descr);
                             let name = if !name_obj.is_null() && pyre_object::is_str(name_obj) {
-                                pyre_object::w_str_get_value(name_obj).to_string()
+                                crate::baseobjspace::str_utf8_w(name_obj)?.to_string()
                             } else {
                                 "<generic property>".to_string()
                             };
@@ -12559,7 +12567,7 @@ unsafe fn descriptor_owner_qualname(owner: PyObjectRef) -> String {
 pub(crate) unsafe fn getset_descriptor_repr(descr: PyObjectRef) -> String {
     let name_obj = unsafe { pyre_object::typedef::w_getset_get_name(descr) };
     let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
-        unsafe { pyre_object::w_str_get_value(name_obj) }
+        unsafe { pyre_object::w_str_get_value_opt(name_obj) }.unwrap_or("<generic property>")
     } else {
         "<generic property>"
     };
@@ -13147,11 +13155,12 @@ fn init_type_type(ns: PyObjectRef) {
                             "descriptor '__repr__' requires a 'type' object",
                         ));
                     }
-                    let rendered = format!(
-                        "<class '{}'>",
-                        crate::baseobjspace::type_repr_qualified_name(obj)
+                    let rendered = crate::display::wtf8_format!(
+                        "<class '",
+                        crate::baseobjspace::type_repr_qualified_name(obj),
+                        "'>"
                     );
-                    Ok(pyre_object::w_str_new_managed(&rendered))
+                    Ok(pyre_object::w_str_from_wtf8_managed(rendered))
                 },
                 1,
             ),
@@ -21177,7 +21186,11 @@ fn init_float_type(ns: PyObjectRef) {
                             .get(1)
                             .copied()
                             .filter(|&a| unsafe { pyre_object::is_str(a) })
-                            .map(|a| unsafe { pyre_object::w_str_get_value(a).to_string() })
+                            .and_then(|a| {
+                                unsafe { crate::baseobjspace::str_utf8_w(a) }
+                                    .ok()
+                                    .map(str::to_string)
+                            })
                             .ok_or_else(|| {
                                 crate::PyError::type_error(
                                     "__getformat__() argument must be 'double' or 'float'",
@@ -21231,7 +21244,7 @@ fn init_float_type(ns: PyObjectRef) {
                         // Parse hexadecimal floating-point literals like '0x1.8p3'.
                         crate::type_methods::arity_exact(args, "fromhex", 1)?;
                         let s_arg = if unsafe { pyre_object::is_str(args[1]) } {
-                            unsafe { pyre_object::w_str_get_value(args[1]).to_string() }
+                            unsafe { crate::baseobjspace::str_utf8_w(args[1])?.to_string() }
                         } else {
                             // `@unwrap_spec(s='text')` — the operand is rejected by
                             // `space.text_w`, which words it this way.
@@ -22365,10 +22378,14 @@ fn init_object_type(ns: PyObjectRef) {
                         if pyre_object::is_instance(obj) {
                             // `w_obj.getrepr(space, '%s object' % fulltypename)`.
                             let name = crate::baseobjspace::getfulltypename(obj);
-                            return Ok(pyre_object::w_str_new_managed(&format!(
-                                "<{name} object at {}>",
-                                crate::display::repr_addr(obj as usize)
-                            )));
+                            let addr = crate::display::repr_addr(obj as usize);
+                            return Ok(pyre_object::w_str_from_wtf8_managed(
+                                crate::display::wtf8_format!(
+                                    "<",
+                                    name,
+                                    format!(" object at {addr}>")
+                                ),
+                            ));
                         }
                     }
                     // For non-instances, delegate to display
@@ -22551,23 +22568,16 @@ fn init_object_type(ns: PyObjectRef) {
                 // argument.py:250-287 collects the keywords before the
                 // positional overflow is judged, so `__init_subclass__(1, x=1)`
                 // names the keyword.
-                let unknown: Vec<String> = match kwargs {
+                let has_unknown = match kwargs {
                     Some(kw) => unsafe {
-                        pyre_object::w_dict_items(kw)
-                            .into_iter()
-                            .filter(|(k, _)| pyre_object::is_str(*k))
-                            .filter_map(|(k, _)| {
-                                pyre_object::w_str_get_wtf8(k)
-                                    .as_str()
-                                    .ok()
-                                    .map(str::to_string)
-                            })
-                            .filter(|name| name != "__pyre_kw__")
-                            .collect()
+                        pyre_object::w_dict_items(kw).into_iter().any(|(k, _)| {
+                            pyre_object::is_str(k)
+                                && pyre_object::w_str_get_wtf8(k) != "__pyre_kw__"
+                        })
                     },
-                    None => Vec::new(),
+                    None => false,
                 };
-                if !unknown.is_empty() {
+                if has_unknown {
                     // argument.py — `parse_obj` does not report an
                     // unknown keyword when the signature has neither `**kwargs`
                     // nor a keyword-only argument; it collapses every such
@@ -29993,31 +30003,30 @@ fn generator_frame(obj: PyObjectRef) -> *mut crate::pyframe::PyFrame {
     unsafe { pyre_object::generator::w_generator_get_frame(obj) as *mut crate::pyframe::PyFrame }
 }
 
+fn descr_repr_at(kind: &str, name: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
+    let addr = crate::display::repr_addr(obj as usize);
+    w_str_from_wtf8_managed(crate::display::wtf8_format!(
+        "<",
+        kind,
+        " object ",
+        unsafe { pyre_object::w_str_get_wtf8(name) },
+        format!(" at {addr}>"),
+    ))
+}
+
 fn generator_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let name = generator_name_value(args[0], true)?;
-    Ok(w_str_new_managed(&format!(
-        "<generator object {} at {}>",
-        unsafe { pyre_object::w_str_get_value(name) },
-        crate::display::repr_addr(args[0] as usize)
-    )))
+    Ok(descr_repr_at("generator", name, args[0]))
 }
 
 fn coroutine_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let name = generator_name_value(args[0], true)?;
-    Ok(w_str_new_managed(&format!(
-        "<coroutine object {} at {}>",
-        unsafe { pyre_object::w_str_get_value(name) },
-        crate::display::repr_addr(args[0] as usize)
-    )))
+    Ok(descr_repr_at("coroutine", name, args[0]))
 }
 
 fn async_generator_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let name = generator_name_value(args[0], true)?;
-    Ok(w_str_new_managed(&format!(
-        "<async_generator object {} at {}>",
-        unsafe { pyre_object::w_str_get_value(name) },
-        crate::display::repr_addr(args[0] as usize)
-    )))
+    Ok(descr_repr_at("async_generator", name, args[0]))
 }
 
 fn generator_name_value(obj: PyObjectRef, qualname: bool) -> crate::PyResult {
@@ -33831,20 +33840,28 @@ fn getset_descr_mismatch(
     reqcls: pyre_object::PyObjectRef,
 ) -> crate::PyError {
     let name_obj = read_descr_name(descr);
+    // `typedef.py` `GetSetProperty` `oefmt(... "%s" ..., self.name)` prints the
+    // raw name, so a lone surrogate stays in the message.
     let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
-        unsafe { pyre_object::w_str_get_value(name_obj) }
+        unsafe { pyre_object::w_str_get_wtf8(name_obj) }
     } else {
-        "<generic property>"
+        Wtf8::new("<generic property>")
     };
     let owner = if reqcls.is_null() {
         "?"
     } else {
         unsafe { pyre_object::w_type_get_name(reqcls) }
     };
-    crate::PyError::type_error(format!(
-        "descriptor '{name}' for '{owner}' objects doesn't apply to a '{}' object",
-        type_name_of(obj)
-    ))
+    let obj_type = type_name_of(obj);
+    let mut msg = Wtf8Buf::new();
+    msg.push_str("descriptor '");
+    msg.push_wtf8(name);
+    msg.push_str("' for '");
+    msg.push_str(owner);
+    msg.push_str("' objects doesn't apply to a '");
+    msg.push_str(&obj_type);
+    msg.push_str("' object");
+    crate::PyError::type_error(msg)
 }
 
 /// typedef.py GetSetProperty.copy_for_type.
@@ -34798,7 +34815,7 @@ mod tests {
         ] {
             let callable = crate::baseobjspace::getattr_str(owner, name).unwrap();
             let qualname = crate::baseobjspace::getattr_str(callable, "__qualname__").unwrap();
-            assert_eq!(unsafe { pyre_object::w_str_get_value(qualname) }, expected);
+            assert_eq!(unsafe { pyre_object::w_str_get_wtf8(qualname) }, expected);
         }
     }
 
@@ -34855,7 +34872,8 @@ mod tests {
         assert!(unsafe { pyre_object::is_not_implemented(foreign) });
 
         let repr = super::cell_descr_repr(&[one]).unwrap();
-        let repr = unsafe { pyre_object::w_str_get_value(repr) };
+        let repr = unsafe { pyre_object::w_str_get_wtf8(repr) };
+        let repr = repr.as_str().unwrap();
         assert!(repr.starts_with("<cell at 0x"));
         assert!(repr.contains(": int object at 0x"));
         let err = crate::builtins::try_hash_value(one).unwrap_err();

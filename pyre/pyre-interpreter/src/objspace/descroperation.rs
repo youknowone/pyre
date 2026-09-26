@@ -4068,13 +4068,17 @@ unsafe fn try_reflected_binary_special(
 
 pub(crate) unsafe fn str_concat_type_error(rhs: PyObjectRef) -> PyError {
     let name = unsafe { concat_operand_name(rhs) };
-    PyError::type_error(format!("can only concatenate str (not \"{name}\") to str"))
+    PyError::type_error(crate::display::wtf8_format!(
+        "can only concatenate str (not \"",
+        name,
+        "\") to str"
+    ))
 }
 
 /// The operand name every `sq_concat` refusal below spells.
-unsafe fn concat_operand_name(obj: PyObjectRef) -> String {
+unsafe fn concat_operand_name(obj: PyObjectRef) -> rustpython_wtf8::Wtf8Buf {
     crate::typedef::r#type(obj).map_or_else(
-        || "object".to_owned(),
+        || rustpython_wtf8::Wtf8Buf::from("object"),
         |w_type| crate::baseobjspace::type_fully_qualified_name(w_type.as_ptr()),
     )
 }
@@ -4083,16 +4087,20 @@ unsafe fn concat_operand_name(obj: PyObjectRef) -> String {
 /// type, so a `list` subclass still reports `list` on the left.
 unsafe fn list_concat_type_error(rhs: PyObjectRef) -> PyError {
     let name = unsafe { concat_operand_name(rhs) };
-    PyError::type_error(format!(
-        "can only concatenate list (not \"{name}\") to list"
+    PyError::type_error(crate::display::wtf8_format!(
+        "can only concatenate list (not \"",
+        name,
+        "\") to list"
     ))
 }
 
 /// `tuple_concat`'s refusal, the same shape as `list_concat`'s.
 unsafe fn tuple_concat_type_error(rhs: PyObjectRef) -> PyError {
     let name = unsafe { concat_operand_name(rhs) };
-    PyError::type_error(format!(
-        "can only concatenate tuple (not \"{name}\") to tuple"
+    PyError::type_error(crate::display::wtf8_format!(
+        "can only concatenate tuple (not \"",
+        name,
+        "\") to tuple"
     ))
 }
 

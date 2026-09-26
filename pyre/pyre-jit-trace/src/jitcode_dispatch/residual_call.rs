@@ -6363,8 +6363,10 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
     } {
         return None;
     }
-    let name = unsafe {
-        pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
+    let Some(name) = (unsafe {
+        pyre_object::unicodeobject::w_str_get_value_opt(w_name_ptr as pyre_object::PyObjectRef)
+    }) else {
+        return None;
     };
     let slot = crate::state::module_dict_cell_slot_direct(w_ns, name);
     let bumps = if is_store {

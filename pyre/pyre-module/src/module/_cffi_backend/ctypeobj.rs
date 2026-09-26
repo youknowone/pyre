@@ -339,7 +339,7 @@ impl W_CType {
             let ob_slot = roots.base();
             let _ = roots.pin_root(unsafe { convert_to_object(self, cdata as usize)? });
             let w_repr = pyre_interpreter::builtins::builtin_repr(&[roots.get(ob_slot)])?;
-            return Ok(unsafe { pyre_object::w_str_get_value(w_repr) }.to_string());
+            return Ok(pyre_interpreter::baseobjspace::str_utf8_w(w_repr)?.to_string());
         }
         Ok(if cdata.is_null() {
             "NULL".to_string()

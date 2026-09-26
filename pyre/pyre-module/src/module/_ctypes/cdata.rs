@@ -236,7 +236,8 @@ fn cdata_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
             .into_iter()
             .filter(|&(key, _)| {
                 !unsafe { pyre_object::is_str(key) }
-                    || !STORAGE_KEYS.contains(&unsafe { pyre_object::w_str_get_value(key) })
+                    || !unsafe { pyre_object::w_str_get_value_opt(key) }
+                        .is_some_and(|key| STORAGE_KEYS.contains(&key))
             })
             .collect()
     };
@@ -375,7 +376,7 @@ pub(super) fn cdata_in_dll(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_int
             "name must be a string",
         ));
     }
-    let name = unsafe { pyre_object::w_str_get_value(args[2]) };
+    let name = pyre_interpreter::baseobjspace::str_utf8_w(args[2])?;
     if name == "Py_OptimizeFlag" {
         let optimize = pyre_interpreter::importing::get_interpreter_sys_module()
             .and_then(|sys| pyre_interpreter::baseobjspace::getattr_str(sys, "flags").ok())
@@ -1108,7 +1109,9 @@ fn struct_pep3118_format(cls: PyObjectRef) -> String {
         if !unsafe { pyre_object::is_str(name_obj) } {
             continue;
         }
-        let name = unsafe { pyre_object::w_str_get_value(name_obj) };
+        let Ok(name) = pyre_interpreter::baseobjspace::str_utf8_w(name_obj) else {
+            continue;
+        };
         let Some(descr) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, name) })
         else {
             continue;

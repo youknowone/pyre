@@ -326,7 +326,15 @@ fn structure_setattr(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let obj = args[0];
-    let name = unsafe { pyre_object::w_str_get_value(args[1]) };
+    let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(args[1]) }) else {
+        // A lone surrogate names no field. `object_setattr_surrogate` stores
+        // it the way `object.__setattr__` stores any other name.
+        let w_name = args[1];
+        let text = unsafe { pyre_object::w_str_get_wtf8(w_name) };
+        return unsafe {
+            pyre_interpreter::baseobjspace::object_setattr_surrogate(obj, w_name, text, args[2])
+        };
+    };
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let slots_empty = pyre_interpreter::type_dict_lookup(cls, "__slots__").is_some_and(|slots| {
         (unsafe { pyre_object::is_tuple(slots) } && unsafe { pyre_object::w_tuple_len(slots) } == 0)
@@ -693,7 +701,7 @@ fn anonymous_names(cls: PyObjectRef) -> Result<Vec<String>, pyre_interpreter::Py
         .into_iter()
         .map(|item| {
             if unsafe { pyre_object::is_str(item) } {
-                Ok(unsafe { pyre_object::w_str_get_value(item) }.to_string())
+                Ok(pyre_interpreter::baseobjspace::str_utf8_w(item)?.to_string())
             } else {
                 Err(pyre_interpreter::PyError::type_error(
                     "_anonymous_ items must be strings",
@@ -802,7 +810,7 @@ fn field_entries(fields: PyObjectRef) -> Result<Vec<FieldEntry>, pyre_interprete
                 "field type must be a ctypes type",
             ));
         }
-        let name = unsafe { pyre_object::w_str_get_value(name) }.to_string();
+        let name = pyre_interpreter::baseobjspace::str_utf8_w(name)?.to_string();
         let bits = if n == 3 {
             let value =
                 unsafe { pyre_object::w_tuple_getitem(it, 2) }.unwrap_or(pyre_object::PY_NULL);
@@ -1700,8 +1708,9 @@ fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
             "byte_size does not match type size",
         ));
     }
+    let field_name = pyre_interpreter::baseobjspace::str_utf8_w(name_obj)?;
     let field = cfield_new(
-        unsafe { pyre_object::w_str_get_value(name_obj) },
+        field_name,
         proto,
         byte_offset.max(0) as usize,
         byte_size as usize,
@@ -1722,7 +1731,7 @@ fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
         if bits <= 0 || bit_offset < 0 || bit_offset + bits > byte_size * 8 {
             return Err(pyre_interpreter::PyError::value_error(format!(
                 "bit field '{}' overflows its type ({} + {} > {})",
-                unsafe { pyre_object::w_str_get_value(name_obj) },
+                field_name,
                 bit_offset,
                 bits,
                 byte_size * 8,
@@ -1839,7 +1848,7 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
             if !unsafe { pyre_object::is_str(key_obj) } {
                 continue;
             }
-            let key = unsafe { pyre_object::w_str_get_value(key_obj) }.to_string();
+            let key = pyre_interpreter::baseobjspace::str_utf8_w(key_obj)?.to_string();
             if key == "__pyre_kw__" {
                 continue;
             }
@@ -1885,7 +1894,10 @@ fn type_name(cls: PyObjectRef) -> String {
     if !unsafe { pyre_object::is_type(cls) } {
         return "?".to_string();
     }
-    unsafe { pyre_object::w_str_get_value(pyre_object::w_type_get_name_obj(cls)) }.to_string()
+    pyre_interpreter::baseobjspace::str_utf8_w(unsafe { pyre_object::w_type_get_name_obj(cls) })
+        .ok()
+        .map(str::to_string)
+        .unwrap_or_else(|| "?".to_string())
 }
 
 // ── PyCArrayType + Array ───────────────────────────────────────────────

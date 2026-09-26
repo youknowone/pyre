@@ -3234,12 +3234,15 @@ pub unsafe fn store_name_value_w(
     let w_locals = frame.get_or_create_w_locals();
     let w_name = roots.get(name_slot);
     let value = roots.get(value_slot);
-    let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) };
     // The trace's own `box_str_constant` names the key, so it is the same
     // string object on every execution — `rstr.py ll_strhash`'s memo
     // makes it hashed once rather than once per store.
     let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_name) };
-    if store_name_into_dict(w_locals, name, hash, value) {
+    // A lone surrogate has no `&str` dict key. `setitem` below keeps the
+    // object (`W_UnicodeObject.text_w` returns the buffer verbatim).
+    if let Some(name) = unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) }
+        && store_name_into_dict(w_locals, name, hash, value)
+    {
         return Ok(());
     }
     crate::baseobjspace::setitem(w_locals, w_name, value)?;
@@ -3262,8 +3265,21 @@ pub unsafe fn delete_name_w(frame: &mut PyFrame, w_name: PyObjectRef) -> Result<
     let w_locals = frame.get_or_create_w_locals();
     crate::baseobjspace::delitem(w_locals, roots.get(name_slot)).map_err(|err| {
         if matches!(err.kind, PyErrorKind::KeyError) {
-            let name = unsafe { pyre_object::unicodeobject::w_str_get_value(roots.get(name_slot)) };
-            PyError::name_error_with_name(format!("name '{name}' is not defined"), name)
+            let w_name = roots.get(name_slot);
+            match unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) } {
+                Some(name) => {
+                    PyError::name_error_with_name(format!("name '{name}' is not defined"), name)
+                }
+                None => {
+                    let text = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_name) };
+                    let mut msg = rustpython_wtf8::Wtf8Buf::from("name '");
+                    msg.push_wtf8(text);
+                    msg.push_str("' is not defined");
+                    let mut err = PyError::new(PyErrorKind::NameError, msg);
+                    err.w_name_context = w_name;
+                    err
+                }
+            }
         } else {
             err
         }
@@ -3280,11 +3296,14 @@ pub unsafe fn store_global_value_w(
     w_name: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), PyError> {
-    let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) };
     let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_name) };
     let w_globals = frame.get_w_globals();
-    if !w_globals.is_null() && !store_name_into_dict(w_globals, name, hash, value) {
-        crate::baseobjspace::setitem(w_globals, w_name, value)?;
+    if !w_globals.is_null() {
+        let stored = unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) }
+            .is_some_and(|name| store_name_into_dict(w_globals, name, hash, value));
+        if !stored {
+            crate::baseobjspace::setitem(w_globals, w_name, value)?;
+        }
     }
     Ok(())
 }

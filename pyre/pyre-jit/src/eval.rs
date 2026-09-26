@@ -5136,15 +5136,9 @@ fn build_jit_driver_pair() -> JitDriverPair {
                 match mode {
                     // vstring.mode_string — UTF-8 byte length per
                     // `rstr.py:1226 Array(Char)` / `llmodel.py bh_strlen`.
-                    0 => {
-                        let s = unsafe { pyre_object::unicodeobject::w_str_get_value(obj) };
-                        Some(s.len() as i64)
-                    }
+                    0 => Some(unsafe { pyre_object::unicodeobject::w_str_byte_len(obj) } as i64),
                     // vstring.mode_unicode — codepoint count.
-                    1 => {
-                        let s = unsafe { pyre_object::unicodeobject::w_str_get_value(obj) };
-                        Some(s.chars().count() as i64)
-                    }
+                    1 => Some(unsafe { pyre_object::unicodeobject::w_str_len(obj) } as i64),
                     _ => None,
                 }
             },

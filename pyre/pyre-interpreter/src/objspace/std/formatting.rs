@@ -826,10 +826,12 @@ unsafe fn bytes_char_arg(obj: PyObjectRef) -> Result<u8, PyError> {
     } else {
         let type_name = match crate::typedef::r#type(obj) {
             Some(w_type) => crate::baseobjspace::type_fully_qualified_name(w_type.as_ptr()),
-            None => crate::baseobjspace::object_functionstr_type_name(obj),
+            None => rustpython_wtf8::Wtf8Buf::from(
+                crate::baseobjspace::object_functionstr_type_name(obj),
+            ),
         };
-        return Err(PyError::type_error(format!(
-            "%c requires an integer in range(256) or a single byte, not {}",
+        return Err(PyError::type_error(crate::display::wtf8_format!(
+            "%c requires an integer in range(256) or a single byte, not ",
             type_name
         )));
     };
@@ -994,10 +996,13 @@ unsafe fn char_arg(obj: PyObjectRef) -> Result<CodePoint, PyError> {
     } else {
         let tn = match crate::typedef::r#type(obj) {
             Some(w_type) => crate::baseobjspace::type_fully_qualified_name(w_type.as_ptr()),
-            None => crate::baseobjspace::object_functionstr_type_name(obj),
+            None => rustpython_wtf8::Wtf8Buf::from(
+                crate::baseobjspace::object_functionstr_type_name(obj),
+            ),
         };
-        return Err(PyError::type_error(format!(
-            "%c requires an int or a unicode character, not {tn}"
+        return Err(PyError::type_error(crate::display::wtf8_format!(
+            "%c requires an int or a unicode character, not ",
+            tn
         )));
     };
     let overflow = || {

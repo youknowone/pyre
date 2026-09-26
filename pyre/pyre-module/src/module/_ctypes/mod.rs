@@ -118,7 +118,7 @@ mod tests {
             );
             let w_module = pyre_interpreter::baseobjspace::getattr_str(ty, "__module__").unwrap();
             assert_eq!(
-                unsafe { pyre_object::w_str_get_value(w_module) },
+                unsafe { pyre_object::w_str_get_wtf8(w_module) },
                 module,
                 "{name}.__module__"
             );

@@ -42,7 +42,10 @@ impl W_Library {
         if self.w_name.is_null() {
             return "";
         }
-        unsafe { pyre_object::w_str_get_value(self.w_name) }
+        // A lone surrogate is not a library name the host can pass through.
+        unsafe { pyre_object::w_str_get_wtf8(self.w_name) }
+            .as_str()
+            .unwrap_or("")
     }
 }
 

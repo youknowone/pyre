@@ -7280,9 +7280,7 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
                     "__package__ not set to a string",
                 ));
             }
-            return Ok(Some(
-                unsafe { pyre_object::w_str_get_value(pkg) }.to_string(),
-            ));
+            return Ok(Some(crate::baseobjspace::str_utf8_w(pkg)?.to_string()));
         }
     }
     if spec.is_some() {
@@ -7294,9 +7292,7 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
                     "__spec__.parent is not a string",
                 ));
             }
-            return Ok(Some(
-                unsafe { pyre_object::w_str_get_value(parent) }.to_string(),
-            ));
+            return Ok(Some(crate::baseobjspace::str_utf8_w(parent)?.to_string()));
         }
     }
 
@@ -7321,7 +7317,7 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
         let has_path =
             crate::baseobjspace::finditem_str(shadow_stack_get(globals_slot), "__path__")?
                 .is_some();
-        let name = unsafe { pyre_object::w_str_get_value(shadow_stack_get(name_slot)) };
+        let name = crate::baseobjspace::str_utf8_w(shadow_stack_get(name_slot))?;
         if has_path {
             return Ok(Some(name.to_string()));
         }
@@ -7803,7 +7799,7 @@ where
             type_name_for_err(module_name_w),
         )));
     }
-    let module_name = unsafe { pyre_object::w_str_get_value(module_name_w) }.to_string();
+    let module_name = crate::baseobjspace::str_utf8_w(module_name_w)?.to_string();
 
     // pyopcode.py — `for name in all:` lazy iteration.
     let w_iter = crate::baseobjspace::iter(w_iterable)?;
@@ -7825,7 +7821,7 @@ where
                 type_name_for_err(w_name),
             )));
         }
-        let name = unsafe { pyre_object::w_str_get_value(w_name) }.to_string();
+        let name = crate::baseobjspace::str_utf8_w(w_name)?.to_string();
         // pyopcode.py:2256-2257 — leading-underscore filter (only for
         // the `__dict__.keys()` fallback).
         if skip_leading_underscores && name.starts_with('_') {
@@ -8103,10 +8099,7 @@ mod tests {
             .unwrap()
             .expect("public has_location");
         assert!(unsafe { pyre_object::is_str(origin) });
-        assert_eq!(
-            unsafe { pyre_object::w_str_get_value(origin) },
-            "keyword.py"
-        );
+        assert_eq!(unsafe { pyre_object::w_str_get_wtf8(origin) }, "keyword.py");
     }
 
     #[test]

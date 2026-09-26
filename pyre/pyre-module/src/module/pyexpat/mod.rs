@@ -290,7 +290,7 @@ impl<'a> MiniXmlParser<'a> {
             if is_none(encoding) {
                 None
             } else {
-                Some(w_str_get_value(encoding).to_string())
+                Some(pyre_interpreter::baseobjspace::str_utf8_w(encoding)?.to_string())
             }
         } {
             validate_decl_encoding(&enc).map_err(|m| self.make_error(m))?;
@@ -511,7 +511,7 @@ impl<'a> MiniXmlParser<'a> {
                 name.clone(),
                 (
                     system.clone(),
-                    Some(unsafe { w_str_get_value(pubid) }.to_string()),
+                    Some(pyre_interpreter::baseobjspace::str_utf8_w(pubid)?.to_string()),
                 ),
             );
             sysid = w_str_new_managed(&system);
@@ -1046,7 +1046,9 @@ impl<'a> MiniXmlParser<'a> {
     fn namespace_separator(&self) -> Option<String> {
         match pyre_interpreter::baseobjspace::getattr_str(self.parser, "_pyre_namespace_separator")
         {
-            Ok(obj) if unsafe { is_str(obj) } => Some(unsafe { w_str_get_value(obj) }.to_string()),
+            Ok(obj) if unsafe { is_str(obj) } => pyre_interpreter::baseobjspace::str_utf8_w(obj)
+                .ok()
+                .map(str::to_string),
             _ => None,
         }
     }
@@ -1383,7 +1385,7 @@ fn object_to_xml_string(
 ) -> Result<String, pyre_interpreter::PyError> {
     unsafe {
         if is_str(obj) {
-            Ok(w_str_get_value(obj).to_string())
+            Ok(pyre_interpreter::baseobjspace::str_utf8_w(obj)?.to_string())
         } else if pyre_object::bytesobject::is_bytes_like(obj) {
             decode_xml_bytes(parser, pyre_object::bytesobject::bytes_like_data(obj))
         } else {
@@ -1464,7 +1466,7 @@ fn declared_or_forced_encoding(
     if let Ok(obj) = pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_forced_encoding")
         && unsafe { is_str(obj) }
     {
-        return Ok(unsafe { w_str_get_value(obj) }.to_string());
+        return Ok(pyre_interpreter::baseobjspace::str_utf8_w(obj)?.to_string());
     }
     let prefix: String = data.iter().take(200).map(|b| *b as char).collect();
     if let Some(pos) = prefix.find("encoding")
@@ -1562,7 +1564,10 @@ fn make_builtin_error(name: &str, msg: &str) -> pyre_interpreter::PyError {
 
 fn parser_pending(parser: PyObjectRef) -> String {
     match pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_pending_xml") {
-        Ok(obj) if unsafe { is_str(obj) } => unsafe { w_str_get_value(obj) }.to_string(),
+        Ok(obj) if unsafe { is_str(obj) } => pyre_interpreter::baseobjspace::str_utf8_w(obj)
+            .ok()
+            .map(str::to_string)
+            .unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -1838,7 +1843,7 @@ mod xmlparser_class {
                     roots.set(data_slot, data);
                     let data = roots.get(data_slot);
                     let eof = if unsafe { is_str(data) } {
-                        unsafe { w_str_get_value(data).is_empty() }
+                        unsafe { w_str_get_wtf8(data).is_empty() }
                     } else if unsafe { pyre_object::bytesobject::is_bytes_like(data) } {
                         unsafe { pyre_object::bytesobject::bytes_like_data(data).is_empty() }
                     } else {
@@ -1955,7 +1960,16 @@ mod xmlparser_class {
                 if unsafe { !is_str(name) } {
                     return Err(pyre_interpreter::PyError::type_error("attribute name must be string"));
                 }
-                let name_s = unsafe { w_str_get_value(name) };
+                let Some(name_s) = (unsafe { w_str_get_value_opt(name) }) else {
+                    // Not a slot name. Store the raw buffer the way
+                    // `object.__setattr__` stores a lone surrogate.
+                    let text = unsafe { w_str_get_wtf8(name) };
+                    return unsafe {
+                        pyre_interpreter::baseobjspace::object_setattr_surrogate(
+                            self_obj, name, text, value,
+                        )
+                    };
+                };
                 if name_s == "returns_unicode" {
                     return Err(pyre_interpreter::PyError::attribute_error("returns_unicode"));
                 }

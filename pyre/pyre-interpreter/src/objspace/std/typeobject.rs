@@ -245,7 +245,7 @@ mod tests {
                 w_dict_getitem_str(other_ns, "method")
             );
             assert_eq!(
-                w_str_get_value(w_dict_getitem_str(first_ns, "__doc__").unwrap()),
+                w_str_get_wtf8(w_dict_getitem_str(first_ns, "__doc__").unwrap()),
                 "declaration doc"
             );
             assert!(!w_type_get_mro(first).is_null());
@@ -355,7 +355,7 @@ mod tests {
             // `w_doc` is the derived declaration (absent → None).
             let ns = w_type_get_dict_ptr(derived) as PyObjectRef;
             assert_eq!(
-                w_str_get_value(w_dict_getitem_str(ns, "__doc__").unwrap()),
+                w_str_get_wtf8(w_dict_getitem_str(ns, "__doc__").unwrap()),
                 "override doc"
             );
             assert!(is_none(w_type_get_w_doc(derived)));
@@ -384,10 +384,10 @@ mod tests {
             let derived = space.gettypeobject(derived_def).unwrap();
             let ns = w_type_get_dict_ptr(derived) as PyObjectRef;
             assert_eq!(
-                w_str_get_value(w_dict_getitem_str(ns, "__doc__").unwrap()),
+                w_str_get_wtf8(w_dict_getitem_str(ns, "__doc__").unwrap()),
                 "derived doc"
             );
-            assert_eq!(w_str_get_value(w_type_get_w_doc(derived)), "derived doc");
+            assert_eq!(w_str_get_wtf8(w_type_get_w_doc(derived)), "derived doc");
         }
     }
 

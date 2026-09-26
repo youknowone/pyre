@@ -4532,8 +4532,10 @@ pub(crate) fn check_type_instantiable(w_type: PyObjectRef) -> Result<(), PyError
         // The name here is `tp_name`, which a heap type such as `sys.flags`
         // spells with its module in front of it.
         let name = unsafe { crate::baseobjspace::type_repr_qualified_name(w_type) };
-        return Err(PyError::type_error(format!(
-            "cannot create '{name}' instances"
+        return Err(PyError::type_error(crate::display::wtf8_format!(
+            "cannot create '",
+            name,
+            "' instances"
         )));
     }
     // Abstract-class rejection lives in `object.__new__` (objectobject.py
@@ -5644,7 +5646,9 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         (&args[2..], None, None)
     };
 
-    let name = unsafe { pyre_object::w_str_get_value(name_obj) };
+    // `type(name, bases, namespace)` rejects a lone surrogate. `str_utf8_w`
+    // is `UnicodeEncodeError` ("surrogates not allowed").
+    let name = crate::baseobjspace::str_utf8_w(name_obj)?;
     // compiling.py:166-167 — resolve __mro_entries__ before metaclass
     // inference; record the original bases for __orig_bases__ when changed.
     //

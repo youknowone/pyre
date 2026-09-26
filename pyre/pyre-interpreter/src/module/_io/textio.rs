@@ -583,7 +583,7 @@ impl W_TextIOWrapper {
         )?)? {
             return Ok(());
         }
-        let encoding = unsafe { pyre_object::w_str_get_value(self.w_encoding) }.to_string();
+        let encoding = crate::baseobjspace::str_utf8_w(self.w_encoding)?.to_string();
         let codec = Self::lookup_text_codec(&encoding)?;
         self.set_encoder_decoder(codec)
     }
@@ -1850,9 +1850,11 @@ impl W_TextIOWrapper {
         // wrapper.  In particular, a failing codec lookup must leave
         // `encoding`, `errors`, and the incremental encoder/decoder intact.
         let new_codec = if reset_codec {
-            let encoding = new_encoding
-                .as_deref()
-                .unwrap_or_else(|| unsafe { pyre_object::w_str_get_value(self.w_encoding) });
+            let encoding = if let Some(encoding) = new_encoding.as_deref() {
+                encoding
+            } else {
+                crate::baseobjspace::str_utf8_w(self.w_encoding)?
+            };
             // CPython 3.14's TextIOWrapper reconfigure path reaches codec
             // lookup with this value (test_io:test_reconfigure_errors), where
             // an embedded NUL is an unknown encoding rather than the

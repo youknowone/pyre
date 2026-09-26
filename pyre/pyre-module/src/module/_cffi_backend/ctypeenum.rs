@@ -76,7 +76,7 @@ pub unsafe fn string(ct: &W_CType, cdata: *const u8) -> Result<PyObjectRef, PyEr
 /// word when the base type is an unsigned 64-bit one.
 fn value_str(w_value: PyObjectRef) -> Result<String, PyError> {
     let w_text = pyre_interpreter::builtins::builtin_str(&[w_value])?;
-    Ok(unsafe { pyre_object::w_str_get_value(w_text) }.to_string())
+    Ok(pyre_interpreter::baseobjspace::str_utf8_w(w_text)?.to_string())
 }
 
 /// `_Mixin_Enum._fget` builds its answer fresh each time, so neither map a

@@ -434,10 +434,11 @@ pub fn string(w_cdata: PyObjectRef, maxlen: i64) -> Result<PyObjectRef, PyError>
     }
     if cdata.ptr == 0 {
         let w_repr = pyre_interpreter::builtins::builtin_repr(&[w_cdata])?;
-        return Err(PyError::runtime_error(format!(
-            "cannot use string() on {}",
-            unsafe { pyre_object::w_str_get_value(w_repr) }
-        )));
+        return Err(PyError::runtime_error(
+            pyre_interpreter::display::wtf8_format!("cannot use string() on ", unsafe {
+                pyre_object::w_str_get_wtf8(w_repr)
+            }),
+        ));
     }
     let mut length = maxlen;
     if length < 0 && ct.kind == ctypeobj::KIND_ARRAY {
