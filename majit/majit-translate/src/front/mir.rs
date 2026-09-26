@@ -20345,6 +20345,15 @@ impl<'a> Lowering<'a> {
                 result_ty,
             };
         }
+        // `Result<T, E>::branch` returns
+        // `ControlFlow<Result<Infallible, E>, T>`. `Break`'s payload is
+        // that `Result`, not `E`. `adt_node_class_root_with` declines a
+        // `core` ADT that still has type arguments, so
+        // `tyref_to_value_type_with` banks `Result<Infallible, E>` as
+        // `Ref(None)`. That kind is not `E`. The match builds `Err(e)`
+        // when the two kinds differ. rustc lays this `Result` out as `E`
+        // with no discriminant, because `Ok(Infallible)` is uninhabited;
+        // the translator does not collapse the kind to `E`.
         let payloads = crate::model::ResultBranchPayloads {
             ok: adt_variant_payload_type(recv_ty, "Ok", self.llbc, self.tombstoned_leaves),
             err: adt_variant_payload_type(recv_ty, "Err", self.llbc, self.tombstoned_leaves),
@@ -36059,18 +36068,33 @@ fn lower_result_branch_as_match(
         };
         let payload_owner = format!("{cf_owner}::{flow_variant}");
         let payload = match (read_ty, write_ty) {
-            (Some(read_ty), Some(write_ty)) => Some((
-                payload_owner,
-                push_enum_field_read(
+            (Some(read_ty), Some(write_ty)) => {
+                let read = push_enum_field_read(
                     graph,
                     arm,
                     operand_arm,
                     &format!("{result_owner}::{result_variant}"),
                     "__pos_0",
-                    read_ty,
-                ),
-                write_ty,
-            )),
+                    read_ty.clone(),
+                );
+                // Kinds differ: `Break` holds `Result<Infallible, E>`, so
+                // store `Err(e)` rather than the bare `E`.
+                let (value, field_ty) = if tag == 1 && read_ty != write_ty {
+                    let err_field = format!("{result_owner}::Err");
+                    let wrapped = emit_sum_variant(
+                        graph,
+                        arm,
+                        result_owner,
+                        "Err",
+                        1,
+                        Some((err_field.as_str(), read, read_ty)),
+                    );
+                    (wrapped, write_ty)
+                } else {
+                    (read, write_ty)
+                };
+                Some((payload_owner, value, field_ty))
+            }
             _ => None,
         };
         let built = emit_sum_variant(
@@ -39109,6 +39133,62 @@ mod tests {
         let (reads, writes) = payload_field_tys(&graph);
         assert_eq!(reads, vec![ValueType::Int, ValueType::Int]);
         assert_eq!(writes, vec![ValueType::Int, ValueType::Int]);
+    }
+
+    #[test]
+    fn result_branch_break_of_infallible_result_builds_err() {
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let llbc = result_flow_llbc(i64_ty.clone(), i64_ty.clone());
+        let infallible = serde_json::json!({
+            "Adt": {"id": {"Adt": 99}, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}
+        });
+        let residual = serde_json::json!({
+            "Adt": {
+                "id": {"Adt": 0},
+                "generics": {"regions": [], "types": [infallible, i64_ty.clone()], "const_generics": [], "trait_refs": []}
+            }
+        });
+        let result_ty = branch_adt_ty(0, &[i64_ty.clone(), i64_ty.clone()]);
+        // ControlFlow<Result<Infallible, i64>, i64>: type 0 is Break, type 1 is Continue.
+        let flow_ty = branch_adt_ty(1, &[residual, i64_ty]);
+        let tombstoned = std::collections::HashSet::new();
+        let payloads = crate::model::ResultBranchPayloads {
+            ok: super::adt_variant_payload_type(&result_ty, "Ok", &llbc, &tombstoned),
+            err: super::adt_variant_payload_type(&result_ty, "Err", &llbc, &tombstoned),
+            continue_ty: super::adt_variant_payload_type(&flow_ty, "Continue", &llbc, &tombstoned),
+            break_ty: super::adt_variant_payload_type(&flow_ty, "Break", &llbc, &tombstoned),
+        };
+        assert_eq!(payloads.ok, Some(ValueType::Int));
+        assert_eq!(payloads.err, Some(ValueType::Int));
+        assert_eq!(payloads.continue_ty, Some(ValueType::Int));
+        assert_ne!(
+            payloads.break_ty, payloads.err,
+            "Result<Infallible, i64> is not banked as i64"
+        );
+        let mut graph = branch_graph(payloads);
+        super::lower_result_branch_to_control_flow(&mut graph);
+        let mut ctors = Vec::new();
+        for block in &graph.blocks {
+            for op in &block.operations {
+                if let OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } = &op.kind
+                {
+                    ctors.push(name.clone());
+                }
+            }
+        }
+        assert!(
+            ctors.iter().any(|name| name == "Err"),
+            "Break payload must be Result::Err, got {ctors:?}"
+        );
+        let (reads, writes) = payload_field_tys(&graph);
+        assert_eq!(reads, vec![ValueType::Int, ValueType::Int]);
+        assert!(
+            writes.iter().any(|ty| *ty == ValueType::Ref(None)),
+            "Break stores the Result value, got {writes:?}"
+        );
     }
 
     #[test]
