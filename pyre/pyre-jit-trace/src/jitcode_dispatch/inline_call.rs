@@ -16210,38 +16210,23 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
-        if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
-            super::specialize::try_walker_orthodox_binary_op(
-                ctx,
-                op.pc,
-                op_tag,
-                int_args_tag,
-                &ref_args,
-                dst,
-                dst_bank,
-            )
-        })? {
-            return Ok((outcome, op.next_pc));
-        }
-        // `descr_pow` still declines inside `long_pow`, so the mixed
-        // long/int power fold stays. The other long binary folds no longer fire.
-        if let Ok(setup) = inline_fnaddr_call_setup_binary_helper(ctx, op.pc, &int_args, &ref_args)
-            && let Some(call_descr) = setup.descr.as_call_descr()
-            && spec_gate(SpecFold::BinaryOpLongIntPow, || {
-                super::specialize::try_walker_specialize_binary_op_long_int_pow(
+        // Inside a transparent helper subwalk this frame already walks the
+        // `binary_value_from_tag` body; descending again re-enters the same
+        // inline_call.  Walk the callee body instead (see the `iRd` site).
+        if !ctx.fbw_mode.transparent_helper_subwalk
+            && let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
+                super::specialize::try_walker_orthodox_binary_op(
                     ctx,
                     op.pc,
                     op_tag,
+                    int_args_tag,
                     &ref_args,
-                    &setup.allboxes,
-                    call_descr,
                     dst,
                     dst_bank,
                 )
             })?
-            .is_some()
         {
-            return Ok((DispatchOutcome::Continue, op.next_pc));
+            return Ok((outcome, op.next_pc));
         }
         // Residual BINARY_OP used to admit a Python forward dunder here.
         // Flatten now lowers BINARY to `inline_call` of

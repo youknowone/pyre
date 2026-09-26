@@ -2080,7 +2080,11 @@ fn variable_is_used(graph: &FunctionGraph, var: &Variable) -> bool {
             op_operand_vars(&op.kind)
                 .iter()
                 .any(|operand| operand == var)
-        }) || block.exits.iter().any(|link| {
+        }) || match &block.exitswitch {
+            Some(ExitSwitch::Value(sw)) => sw == var,
+            Some(ExitSwitch::Fused { args, .. }) => args.iter().any(|arg| arg == var),
+            Some(ExitSwitch::LastException) | None => false,
+        } || block.exits.iter().any(|link| {
             link.args
                 .iter()
                 .any(|arg| matches!(arg, LinkArg::Value(v) if v == var))

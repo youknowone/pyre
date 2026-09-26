@@ -1970,6 +1970,123 @@ fn wtf8_idx_window(
     Ok(Some((byte_start, byte_end)))
 }
 
+#[inline(always)]
+fn bound_is_none_or_exact_int(w: PyObjectRef) -> bool {
+    if w.is_null() {
+        return true;
+    }
+    unsafe { pyre_object::is_none(w) || pyre_object::is_exact_type(w, &pyre_object::INT_TYPE) }
+}
+
+/// Omitted bound is null. `None` and an exact `int` stay on the elidable
+/// search; anything else (`__index__`, a subclass) is the slow arm.
+/// A plain index, not `slice::get`: that `Option` does not lower.
+#[inline(always)]
+fn str_search_bound(args: &[PyObjectRef], i: usize) -> PyObjectRef {
+    if i < args.len() {
+        args[i]
+    } else {
+        pyre_object::PY_NULL
+    }
+}
+
+/// Bounds that are not `None` or an exact `int` (`__index__`, a subclass)
+/// stay in the interpreter body. `dont_look_inside` so that arm does not
+/// pull its helpers into the generated wrapper.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn str_descr_find_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    str_method_find(args)
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn str_descr_rfind_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    str_method_rfind(args)
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn str_descr_count_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    str_method_count(args)
+}
+
+/// `unicodeobject.py descr_find`. The search is `ll_find`: an elidable
+/// residual (`jit_str_find_objs`), not a hand trace.
+pub fn __majit_wrap_str_descr_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // Arity and kwargs stay on the slow arm. `arity_at_least` pulls the
+    // kwargs-marker read into this graph, and that effect makes every later
+    // helper a descent blocker.
+    if args.len() < 2 || args.len() > 4 {
+        return str_descr_find_slow(args);
+    }
+    if unsafe { !pyre_object::is_str(args[0]) || !pyre_object::is_str(args[1]) } {
+        return str_descr_find_slow(args);
+    }
+    let start = str_search_bound(args, 2);
+    let end = str_search_bound(args, 3);
+    if !bound_is_none_or_exact_int(start) || !bound_is_none_or_exact_int(end) {
+        return str_descr_find_slow(args);
+    }
+    let n = unsafe {
+        pyre_object::unicodeobject::jit_str_find_objs(
+            args[0] as i64,
+            args[1] as i64,
+            start as i64,
+            end as i64,
+        )
+    };
+    Ok(w_int_new(n))
+}
+
+/// `unicodeobject.py descr_rfind`. The search is `ll_rfind`.
+pub fn __majit_wrap_str_descr_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 2 || args.len() > 4 {
+        return str_descr_rfind_slow(args);
+    }
+    if unsafe { !pyre_object::is_str(args[0]) || !pyre_object::is_str(args[1]) } {
+        return str_descr_rfind_slow(args);
+    }
+    let start = str_search_bound(args, 2);
+    let end = str_search_bound(args, 3);
+    if !bound_is_none_or_exact_int(start) || !bound_is_none_or_exact_int(end) {
+        return str_descr_rfind_slow(args);
+    }
+    let n = unsafe {
+        pyre_object::unicodeobject::jit_str_rfind_objs(
+            args[0] as i64,
+            args[1] as i64,
+            start as i64,
+            end as i64,
+        )
+    };
+    Ok(w_int_new(n))
+}
+
+/// `unicodeobject.py descr_count`. The search is `ll_count`.
+pub fn __majit_wrap_str_descr_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 2 || args.len() > 4 {
+        return str_descr_count_slow(args);
+    }
+    if unsafe { !pyre_object::is_str(args[0]) || !pyre_object::is_str(args[1]) } {
+        return str_descr_count_slow(args);
+    }
+    let start = str_search_bound(args, 2);
+    let end = str_search_bound(args, 3);
+    if !bound_is_none_or_exact_int(start) || !bound_is_none_or_exact_int(end) {
+        return str_descr_count_slow(args);
+    }
+    let n = unsafe {
+        pyre_object::unicodeobject::jit_str_count_objs(
+            args[0] as i64,
+            args[1] as i64,
+            start as i64,
+            end as i64,
+        )
+    };
+    Ok(w_int_new(n))
+}
+
 pub fn str_method_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "find", 1)?;
     arity_at_most(args, "find", 3)?;
@@ -7060,6 +7177,45 @@ static __majit_builtin_wrapper_target_str_descr_endswith: crate::gateway::Builti
             stringify!(__majit_wrap_str_descr_endswith)
         ),
         func: __majit_wrap_str_descr_endswith,
+    };
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_str_descr_find: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_str_descr_find)
+        ),
+        func: __majit_wrap_str_descr_find,
+    };
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_str_descr_rfind: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_str_descr_rfind)
+        ),
+        func: __majit_wrap_str_descr_rfind,
+    };
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_str_descr_count: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_str_descr_count)
+        ),
+        func: __majit_wrap_str_descr_count,
     };
 
 #[cfg(not(target_arch = "wasm32"))]

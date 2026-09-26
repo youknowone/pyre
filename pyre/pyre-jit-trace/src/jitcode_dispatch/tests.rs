@@ -4362,6 +4362,43 @@ fn newutf8_and_int_descr_str_jitcodes_are_the_pypy_leaf() {
         descr_str_ops.len()
     );
     dump(&descr_str.code, "descr_str");
+    // `ll_int2dec` is the one residual that returns the STR; `len(res)` is
+    // `LLHelpers.ll_strlen`, a field read off that STR, and the result is
+    // wrapped by the inlined newutf8 body.
+    assert_eq!(
+        descr_str_ops
+            .iter()
+            .filter(|op| op.starts_with("residual_call_") && op.ends_with("_r"))
+            .count(),
+        1,
+        "descr_str must residualize only ll_int2dec as a ref call; ops={descr_str_ops:?}"
+    );
+    let strlen_at = descr_str_ops
+        .iter()
+        .position(|op| *op == "getfield_gc_i")
+        .unwrap_or_else(|| {
+            panic!("descr_str must read the STR length field; ops={descr_str_ops:?}")
+        });
+    let int2dec_at = descr_str_ops
+        .iter()
+        .position(|op| op.starts_with("residual_call_") && op.ends_with("_r"))
+        .unwrap();
+    assert!(
+        int2dec_at < strlen_at,
+        "the length read must follow ll_int2dec; ops={descr_str_ops:?}"
+    );
+    assert!(
+        !descr_str_ops[int2dec_at + 1..]
+            .iter()
+            .any(|op| op.starts_with("residual_call_") && op.ends_with("_i")),
+        "the STR length must not be a Signed residual; ops={descr_str_ops:?}"
+    );
+    assert!(
+        descr_str_ops[strlen_at..]
+            .iter()
+            .any(|op| op.starts_with("inline_call_") && op.ends_with("_r")),
+        "descr_str must wrap through the inlined newutf8 body; ops={descr_str_ops:?}"
+    );
     assert!(
         newutf8_ops.iter().any(|op| *op == "new_with_vtable"),
         "newutf8 must box via new_with_vtable; ops={newutf8_ops:?}"

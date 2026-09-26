@@ -14317,7 +14317,7 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 2
             && match segments.last().map(String::as_str) {
-                Some("bigint_lshift_count") => {
+                Some("bigint_lshift_count" | "bigint_int_pow_nomod") => {
                     first_arg_ty
                         .as_ref()
                         .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
@@ -14344,6 +14344,7 @@ impl<'a> Lowering<'a> {
             }
             && let Some(residual) = crate::front::rbigint_call::lshift_count_residual_path(segments)
                 .or_else(|| crate::front::rbigint_call::ovf2long_residual_path(segments))
+                .or_else(|| crate::front::rbigint_call::pow_nomod_residual_path(segments))
         {
             OpKind::Call {
                 target: CallTarget::FunctionPath {

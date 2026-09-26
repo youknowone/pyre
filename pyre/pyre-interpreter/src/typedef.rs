@@ -7318,14 +7318,14 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "find",
-            make_builtin_function("find", crate::type_methods::str_method_find),
+            make_builtin_function("find", crate::type_methods::__majit_wrap_str_descr_find),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "rfind",
-            make_builtin_function("rfind", crate::type_methods::str_method_rfind),
+            make_builtin_function("rfind", crate::type_methods::__majit_wrap_str_descr_rfind),
         )
     };
     unsafe {
@@ -7436,7 +7436,7 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "count",
-            make_builtin_function("count", crate::type_methods::str_method_count),
+            make_builtin_function("count", crate::type_methods::__majit_wrap_str_descr_count),
         )
     };
     unsafe {

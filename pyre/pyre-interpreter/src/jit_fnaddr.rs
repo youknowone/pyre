@@ -1198,6 +1198,24 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     #[cfg(target_arch = "wasm32")]
     push_abi_unsound_fnaddr(
         &mut entries,
+        "pyre_interpreter::type_methods::__majit_wrap_str_descr_find",
+        crate::type_methods::__majit_wrap_str_descr_find as *const (),
+    );
+    #[cfg(target_arch = "wasm32")]
+    push_abi_unsound_fnaddr(
+        &mut entries,
+        "pyre_interpreter::type_methods::__majit_wrap_str_descr_rfind",
+        crate::type_methods::__majit_wrap_str_descr_rfind as *const (),
+    );
+    #[cfg(target_arch = "wasm32")]
+    push_abi_unsound_fnaddr(
+        &mut entries,
+        "pyre_interpreter::type_methods::__majit_wrap_str_descr_count",
+        crate::type_methods::__majit_wrap_str_descr_count as *const (),
+    );
+    #[cfg(target_arch = "wasm32")]
+    push_abi_unsound_fnaddr(
+        &mut entries,
         "pyre_interpreter::module::r#struct::__majit_wrap_struct_pack",
         crate::module::r#struct::__majit_wrap_struct_pack as *const (),
     );
@@ -3333,6 +3351,26 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::unicodeobject::jit_str_endswith",
         "pyre_object::jit_str_endswith",
         pyre_object::unicodeobject::jit_str_endswith,
+    );
+    // `ll_find` / `ll_rfind` / `ll_count`: elidable residuals the
+    // `descr_find` / `descr_rfind` / `descr_count` wrappers record.
+    cpa4(
+        &mut entries,
+        "pyre_object::unicodeobject::jit_str_find_objs",
+        "pyre_object::jit_str_find_objs",
+        pyre_object::unicodeobject::jit_str_find_objs,
+    );
+    cpa4(
+        &mut entries,
+        "pyre_object::unicodeobject::jit_str_rfind_objs",
+        "pyre_object::jit_str_rfind_objs",
+        pyre_object::unicodeobject::jit_str_rfind_objs,
+    );
+    cpa4(
+        &mut entries,
+        "pyre_object::unicodeobject::jit_str_count_objs",
+        "pyre_object::jit_str_count_objs",
+        pyre_object::unicodeobject::jit_str_count_objs,
     );
     cpa2(
         &mut entries,

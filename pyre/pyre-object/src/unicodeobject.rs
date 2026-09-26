@@ -1619,6 +1619,52 @@ pub extern "C" fn jit_str_slice(s: i64, start: i64, end: i64) -> i64 {
     }
 }
 
+fn cp_bound_from_obj(w: i64, default: i64) -> i64 {
+    let w = w as PyObjectRef;
+    if w.is_null() || unsafe { crate::pyobject::is_none(w) } {
+        return default;
+    }
+    unsafe { crate::intobject::w_int_get_value(w) }
+}
+
+/// `descr_find` with `None` or an exact int bound still boxed.
+/// `ll_find` (`rstr.py`): `@signature`, residual from the method body.
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_str_find_objs(s: i64, sub: i64, w_start: i64, w_end: i64) -> i64 {
+    jit_str_search_bounds(
+        s,
+        sub,
+        cp_bound_from_obj(w_start, 0),
+        cp_bound_from_obj(w_end, i64::MAX),
+        true,
+    )
+}
+
+/// `descr_rfind` with `None` or an exact int bound still boxed.
+/// `ll_rfind` (`rstr.py`).
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_str_rfind_objs(s: i64, sub: i64, w_start: i64, w_end: i64) -> i64 {
+    jit_str_search_bounds(
+        s,
+        sub,
+        cp_bound_from_obj(w_start, 0),
+        cp_bound_from_obj(w_end, i64::MAX),
+        false,
+    )
+}
+
+/// `descr_count` with `None` or an exact int bound still boxed.
+/// `ll_count` (`rstr.py`).
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_str_count_objs(s: i64, sub: i64, w_start: i64, w_end: i64) -> i64 {
+    jit_str_count_bounds(
+        s,
+        sub,
+        cp_bound_from_obj(w_start, 0),
+        cp_bound_from_obj(w_end, i64::MAX),
+    )
+}
+
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_str_count_bounds(s: i64, sub: i64, start: i64, end: i64) -> i64 {
     let s = s as PyObjectRef;

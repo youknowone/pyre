@@ -8260,61 +8260,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::StrFind, || {
-            try_walker_specialize_str_search(
-                ctx,
-                code,
-                op,
-                &r_args,
-                dst,
-                dst_bank,
-                StrSearchKind::Find,
-            )
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::StrRfind, || {
-            try_walker_specialize_str_search(
-                ctx,
-                code,
-                op,
-                &r_args,
-                dst,
-                dst_bank,
-                StrSearchKind::RFind,
-            )
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::StrCount, || {
-            try_walker_specialize_str_search(
-                ctx,
-                code,
-                op,
-                &r_args,
-                dst,
-                dst_bank,
-                StrSearchKind::Count,
-            )
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
     // `divmod(a, b)` on two exact ints: inline the guarded
     // `OS_INT_PY_DIV` / `OS_INT_PY_MOD` pair into a virtual `Cls_ii`
     // specialised tuple (intobject.py `_divmod` → `newtuple2`) instead of the
@@ -8688,13 +8633,12 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
-                // The call op is already recorded. A symbolic fnaddr decline
-                // must not leave it: the backend emits a call to the hash.
-                // Cut back to the position taken before the record, then
-                // abort this walk so the result box is not used.
-                if cause == ResidualDecline::Symbolic
-                    && let Some(addr) = recorded_symbolic_funcptr(ctx, &allboxes)
-                {
+                // The call op is already recorded. A symbolic fnaddr must
+                // not stay in it whatever the decline cause (a `PureUnfolded`
+                // `CallPure*` keeps the call too): the backend emits a call
+                // to the hash. Cut back to the position taken before the
+                // record, then abort this walk so the result box is not used.
+                if let Some(addr) = recorded_symbolic_funcptr(ctx, &allboxes) {
                     ctx.trace_ctx.cut_trace_with_snapshots(patch_pos);
                     return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
                         pc: op.pc,
@@ -9979,17 +9923,10 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         })? {
                             return Ok((outcome, op.next_pc));
                         }
-                        // Exact int pairs have already been taken
-                        // whole by `binary_op_descent`, including overflow and
-                        // zero-division exception arms.
-                        // `descr_pow` keeps a `W_IntObject` exponent unwrapped
-                        // and calls `rbigint.int_pow`. Descent still stops in
-                        // `long_pow`, so this fold remains.
-                        spec_gate(SpecFold::BinaryOpLongIntPow, || {
-                            try_walker_specialize_binary_op_long_int_pow(
-                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )
-                        })?
+                        // Exact int pairs and long `**` are recorded by
+                        // `binary_op_descent` (`long_pow` →
+                        // `jit_bigint_int_pow_nomod`).
+                        None
                     }
                 } else if op_tag == 10 && ctx.is_authoritative_executor {
                     // `op_tag == 10` is CHECK_EXC_MATCH
@@ -10240,13 +10177,12 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
-                // The call op is already recorded. A symbolic fnaddr decline
-                // must not leave it: the backend emits a call to the hash.
-                // Cut back to the position taken before the record, then
-                // abort this walk so the result box is not used.
-                if cause == ResidualDecline::Symbolic
-                    && let Some(addr) = recorded_symbolic_funcptr(ctx, &allboxes)
-                {
+                // The call op is already recorded. A symbolic fnaddr must
+                // not stay in it whatever the decline cause (a `PureUnfolded`
+                // `CallPure*` keeps the call too): the backend emits a call
+                // to the hash. Cut back to the position taken before the
+                // record, then abort this walk so the result box is not used.
+                if let Some(addr) = recorded_symbolic_funcptr(ctx, &allboxes) {
                     ctx.trace_ctx.cut_trace_with_snapshots(patch_pos);
                     return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
                         pc: op.pc,
@@ -10561,13 +10497,12 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
-                // The call op is already recorded. A symbolic fnaddr decline
-                // must not leave it: the backend emits a call to the hash.
-                // Cut back to the position taken before the record, then
-                // abort this walk so the result box is not used.
-                if cause == ResidualDecline::Symbolic
-                    && let Some(addr) = recorded_symbolic_funcptr(ctx, &allboxes)
-                {
+                // The call op is already recorded. A symbolic fnaddr must
+                // not stay in it whatever the decline cause (a `PureUnfolded`
+                // `CallPure*` keeps the call too): the backend emits a call
+                // to the hash. Cut back to the position taken before the
+                // record, then abort this walk so the result box is not used.
+                if let Some(addr) = recorded_symbolic_funcptr(ctx, &allboxes) {
                     ctx.trace_ctx.cut_trace_with_snapshots(patch_pos);
                     return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
                         pc: op.pc,
