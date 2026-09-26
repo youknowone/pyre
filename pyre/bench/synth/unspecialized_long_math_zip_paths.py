@@ -1,4 +1,4 @@
-# pyre-check: spec-folds=builtin_zip,zip_two_tuple_iters,math_frexp,math_ldexp
+# pyre-check: spec-folds=zip_two_tuple_iters,math_frexp,math_ldexp
 # Throughput gate for the hand-written folds this file still fires: `zip`
 # over two tuples (positional and `strict=True`), and `math.frexp` /
 # `math.ldexp`. `bigint ** int` is the descended `long_pow` body.

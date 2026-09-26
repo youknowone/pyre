@@ -393,7 +393,6 @@ spec_folds! {
     BuiltinTypeGetattr   => ("builtin_type_getattr",     "residual_call", "-"),
     BuiltinGetattr       => ("builtin_getattr",          "residual_call", "-"),
     BuiltinRange         => ("builtin_range",            "residual_call", "-"),
-    BuiltinZip           => ("builtin_zip",              "residual_call", "-"),
     BuiltinLocals        => ("builtin_locals",           "residual_call", "-"),
     SysGetframe          => ("sys_getframe",             "residual_call", "-"),
     SysExcInfo           => ("sys_exc_info",             "residual_call", "-"),
