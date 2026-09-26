@@ -5751,6 +5751,9 @@ pub fn bind_builtin_kwargs(
     // `e.args[0]` intact. Keep the WTF-8 rather than a lossy `String`.
     let keyword_entries = kwargs.map(|dict| unsafe { pyre_object::w_dict_str_entries_wtf8(dict) });
     let mut unknown: Option<usize> = None;
+    // The slot a keyword named that a positional had already filled, and the
+    // entry it came from; reported after the missing-required scan below.
+    let mut duplicate: Option<(usize, usize)> = None;
     // PyPy `_match_signature` copies positional values with
     // `take = min(num_args, co_argcount - upfront)` and `for i in range(take)`,
     // so the constant signature bounds let the JIT unroll ordinary indexed
@@ -5792,13 +5795,24 @@ pub fn bind_builtin_kwargs(
             match matched_index {
                 Some(idx) => {
                     if filled[idx] {
-                        return Err(crate::PyError::type_error(format!(
-                            "argument for {fn_name}() given by name ('{key}') and position ({})",
-                            idx + 1,
-                        )));
+                        // Deferred for the reason the unrecognized name below
+                        // is: `_PyArg_UnpackKeywords` scans for a name that
+                        // duplicates a positional only after every declared
+                        // slot has been accounted for, so a call that also
+                        // leaves a required slot empty is reported against
+                        // that slot.  `function(code, code=code)` names the
+                        // missing `globals`, while `function(code, {},
+                        // code=code)` — nothing missing — names the duplicate.
+                        // The scan runs over the declared slots, not over the
+                        // keywords, so two duplicates are reported against the
+                        // lower slot rather than the earlier keyword.
+                        if duplicate.is_none_or(|(_, filled_idx)| idx < filled_idx) {
+                            duplicate = Some((entry_index, idx));
+                        }
+                    } else {
+                        scope[idx] = *val;
+                        filled[idx] = true;
                     }
-                    scope[idx] = *val;
-                    filled[idx] = true;
                 }
                 // `_PyArg_UnpackKeywords` collects the unrecognized names and
                 // only reports them once every declared slot has been filled,
@@ -5821,6 +5835,12 @@ pub fn bind_builtin_kwargs(
         }
         name_index += 1;
     }
+    if let Some((entry_index, idx)) = duplicate {
+        let entries = keyword_entries
+            .as_ref()
+            .expect("a duplicate keyword index requires keyword entries");
+        return builtin_name_and_position_failure(fn_name, &entries[entry_index].0, idx + 1);
+    }
     if let Some(entry_index) = unknown {
         let entries = keyword_entries
             .as_ref()
@@ -5828,6 +5848,24 @@ pub fn bind_builtin_kwargs(
         return builtin_unexpected_keyword_failure(fn_name, &entries[entry_index].0);
     }
     Ok(scope)
+}
+
+/// Cold `_PyArg_UnpackKeywords` name-and-position formatter.
+///
+/// The conflict scan runs after the missing-required report, so the hot binder
+/// carries only the offending entry index and the slot it names and reaches
+/// this residual helper once every declared slot has been accounted for.
+#[cold]
+#[majit_macros::dont_look_inside]
+pub(crate) fn builtin_name_and_position_failure(
+    fn_name: &str,
+    key: &rustpython_wtf8::Wtf8,
+    position: usize,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let mut msg = Wtf8Buf::from_string(format!("argument for {fn_name}() given by name ('"));
+    msg.push_wtf8(key);
+    msg.push_str(&format!("') and position ({position})"));
+    Err(crate::PyError::type_error(msg))
 }
 
 /// Cold `Arguments._match_signature` unexpected-keyword formatter.
