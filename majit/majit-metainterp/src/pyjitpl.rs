@@ -5865,13 +5865,13 @@ impl<M: Clone> MetaInterp<M> {
         self.string_constant_alloc = Some(alloc);
     }
 
-    /// `model.py cpu.cls_of_box` — override the default backend
-    /// `Cpu` impl's `cls_of_box` by wrapping a bare `fn(i64) -> i64`
-    /// hook.  The default reads the first word at offset 0 (typeptr).
+    /// `llmodel.py bh_classof` — override the default backend `Cpu`
+    /// impl's class read by wrapping a bare `fn(i64) -> i64` hook.  The
+    /// default reads the first word at offset 0 (typeptr).
     /// Callers with a richer backend can install via the underlying
     /// `cpu` field directly.
-    pub fn set_cls_of_box(&mut self, f: fn(i64) -> i64) {
-        self.cpu = crate::cpu::cpu_from_cls_of_box_fn(f);
+    pub fn set_bh_classof(&mut self, f: fn(i64) -> i64) {
+        self.cpu = crate::cpu::cpu_from_bh_classof_fn(f);
     }
 
     /// Install a full `Cpu` trait object (model.py `AbstractCPU`).
@@ -24804,7 +24804,7 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
         // Override cls_of_box so we can inject a known typeptr without
         // dereferencing a raw pointer.
-        meta.cpu = crate::cpu::cpu_from_cls_of_box_fn(|_| 0xc1a55);
+        meta.cpu = crate::cpu::cpu_from_bh_classof_fn(|_| 0xc1a55);
 
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -24855,7 +24855,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        meta.cpu = crate::cpu::cpu_from_cls_of_box_fn(|_| 0xc1a55);
+        meta.cpu = crate::cpu::cpu_from_bh_classof_fn(|_| 0xc1a55);
 
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -25084,7 +25084,7 @@ mod metainterp_static_data_tests {
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        meta.cpu = crate::cpu::cpu_from_cls_of_box_fn(|_| 0xcafef00d);
+        meta.cpu = crate::cpu::cpu_from_bh_classof_fn(|_| 0xcafef00d);
 
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));

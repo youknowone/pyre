@@ -3251,7 +3251,7 @@ mod tests {
         // `0x200 -> 0x100`, so the runtime read matches `known_class`.
         // Slot 1 (NonNull) only requires runtime_box.is_some(); reuse
         // the same const-pool ref.
-        ctx.cpu = crate::cpu::cpu_from_cls_of_box_fn(|raw| if raw == 0x200 { 0x100 } else { 0 });
+        ctx.cpu = crate::cpu::cpu_from_bh_classof_fn(|raw| if raw == 0x200 { 0x100 } else { 0 });
         let rb0 = ctx.make_constant_ref(GcRef(0x200));
         let rb1 = ctx.make_constant_ref(GcRef(0x300));
         let boxes = vec![OpRef::ref_op(100), OpRef::ref_op(101)];
