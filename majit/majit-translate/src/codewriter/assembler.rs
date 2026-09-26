@@ -3932,6 +3932,33 @@ fn is_explicit_shell_variant_owner(owner: &str) -> bool {
         .any(|anchor| majit_ir::descr::struct_template_id_for_name(anchor) == Some(owner_id))
 }
 
+/// `BhSizeSpec.type_id` for one owner spelling.
+///
+/// `descr.py` `get_size_descr` keys on the lltype STRUCT. A registered
+/// `StructId` is that object for a GC struct. Otherwise hash the
+/// crate-stripped definition path with [`definition_path_type_id`], the
+/// same function `majit_metainterp::__majit_struct_type_id` uses after
+/// `type_name::<T>()`.
+fn bh_size_type_id(owner: &str, layout_owner: &str, is_gc_managed: bool) -> u64 {
+    if is_gc_managed {
+        majit_ir::descr::struct_id_for_name(owner)
+            .map(majit_ir::descr::StructId::as_u64)
+            .unwrap_or_else(|| definition_path_type_id(layout_owner, is_gc_managed))
+    } else {
+        definition_path_type_id(layout_owner, is_gc_managed)
+    }
+}
+
+/// Hash a crate-stripped definition path for a low-level struct identity.
+///
+/// Charon's module origin drops the crate boundary (`front/mir.rs`
+/// `strip_crate_prefix`). `path_hash_for_gc_kind` is the hasher; raw
+/// layouts append the `"raw"` discriminator so `GcStruct(T)` and
+/// `Struct(T)` stay distinct (`descr.py` `get_size_descr`).
+pub fn definition_path_type_id(definition_path: &str, is_gc_managed: bool) -> u64 {
+    majit_ir::descr::path_hash_for_gc_kind(definition_path, is_gc_managed)
+}
+
 pub(crate) fn bh_size_spec_from_callcontrol(
     cc: &CallControl,
     owner: &str,
@@ -4120,15 +4147,7 @@ pub(crate) fn bh_size_spec_from_callcontrol(
         // already preserve this identity in `fielddescrof`; allocations must
         // use the same key or a freshly virtualized object and its first
         // setfield acquire different parents.
-        type_id: if is_gc_managed {
-            majit_ir::descr::struct_id_for_name(owner)
-                .map(majit_ir::descr::StructId::as_u64)
-                .unwrap_or_else(|| {
-                    majit_ir::descr::path_hash_for_gc_kind(layout_owner, is_gc_managed)
-                })
-        } else {
-            majit_ir::descr::path_hash_for_gc_kind(layout_owner, is_gc_managed)
-        },
+        type_id: bh_size_type_id(owner, layout_owner, is_gc_managed),
         vtable: 0,
         all_fielddescrs,
     })

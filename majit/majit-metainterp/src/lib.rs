@@ -54,57 +54,23 @@ use majit_ir::{OpRef, Type};
 
 /// Runtime surrogate for RPython's lltype `STRUCT` identity.
 ///
-/// Descriptor caches are process-global, so this only needs to be stable for
-/// the lifetime of this process. Rust's `TypeId` is exactly that identity and
-/// is independent of whether callers spell the type with an absolute or a
-/// relative module path. Keep GC-managed and raw layouts distinct, matching
-/// RPython's distinct `GcStruct(T)` / `Struct(T)` lltypes.
+/// `descr.py` `get_size_descr` / `get_field_descr` key the cache by the
+/// lltype `STRUCT` object, never by the spelling a graph used to name it.
+/// `type_name::<T>()` is the compiler-resolved definition path (through
+/// `use` and re-exports). Charon's module origin drops the crate segment
+/// (`front/mir.rs` `strip_crate_prefix`); hash what remains with the same
+/// function the graph codewriter uses for `BhSizeSpec.type_id`
+/// ([`majit_translate::codewriter::assembler::definition_path_type_id`]).
+/// GC-managed and raw layouts stay distinct, matching `GcStruct(T)` /
+/// `Struct(T)`.
 #[doc(hidden)]
 pub fn __majit_struct_type_id<T: 'static>(is_gc_managed: bool) -> u64 {
-    use std::any::TypeId;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    TypeId::of::<T>().hash(&mut hasher);
-    if !is_gc_managed {
-        "raw".hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-/// Resolve a `crate`/`self`/`super` type path at its macro expansion module
-/// and hash the crate-stripped definition path used by the graph codewriter.
-#[doc(hidden)]
-pub fn __majit_struct_type_id_path(module_path: &str, type_path: &str, is_gc_managed: bool) -> u64 {
-    use std::hash::{Hash, Hasher};
-
-    let mut resolved: Vec<&str> = module_path.split("::").collect();
-    let mut segments = type_path.split("::").peekable();
-    match segments.peek().copied() {
-        Some("crate") => {
-            resolved.truncate(1);
-            segments.next();
-        }
-        Some("self") => {
-            segments.next();
-        }
-        Some("super") => {
-            while segments.peek().copied() == Some("super") {
-                assert!(resolved.len() > 1, "type path escapes its crate root");
-                resolved.pop();
-                segments.next();
-            }
-        }
-        _ => unreachable!("only crate/self/super paths use this resolver"),
-    }
-    resolved.extend(segments);
-    let definition_path = resolved.into_iter().skip(1).collect::<Vec<_>>().join("::");
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    definition_path.hash(&mut hasher);
-    if !is_gc_managed {
-        "raw".hash(&mut hasher);
-    }
-    hasher.finish()
+    let type_name = core::any::type_name::<T>();
+    let definition_path = match type_name.split_once("::") {
+        Some((_, rest)) => rest,
+        None => type_name,
+    };
+    majit_translate::codewriter::assembler::definition_path_type_id(definition_path, is_gc_managed)
 }
 
 pub mod blackhole;
@@ -2390,3 +2356,59 @@ mod tests {
     }
 }
 pub(crate) mod resumecode;
+
+#[cfg(test)]
+mod a {
+    #[repr(C)]
+    pub struct X {
+        pub v: f64,
+    }
+
+    pub fn id_self(gc: bool) -> u64 {
+        super::__majit_struct_type_id::<self::X>(gc)
+    }
+}
+
+#[cfg(test)]
+mod reexport_x {
+    pub use super::a::X;
+}
+
+#[cfg(test)]
+mod child_of_a {
+    pub fn id_super(gc: bool) -> u64 {
+        super::__majit_struct_type_id::<super::a::X>(gc)
+    }
+}
+
+#[cfg(test)]
+mod struct_type_id_spellings {
+    use super::a::X as Used;
+    use super::reexport_x::X as Reexported;
+
+    #[test]
+    fn crate_self_super_use_and_reexport_share_one_id() {
+        for gc in [true, false] {
+            let id = super::__majit_struct_type_id::<crate::a::X>(gc);
+            assert_eq!(id, super::a::id_self(gc), "self::X gc={gc}");
+            assert_eq!(id, super::child_of_a::id_super(gc), "super::a::X gc={gc}");
+            assert_eq!(
+                id,
+                super::__majit_struct_type_id::<Used>(gc),
+                "use-imported X gc={gc}"
+            );
+            assert_eq!(
+                id,
+                super::__majit_struct_type_id::<Reexported>(gc),
+                "re-exported X gc={gc}"
+            );
+            let type_name = core::any::type_name::<crate::a::X>();
+            let definition = type_name.split_once("::").map(|(_, rest)| rest).unwrap();
+            assert_eq!(
+                id,
+                majit_translate::codewriter::assembler::definition_path_type_id(definition, gc),
+                "codewriter hasher gc={gc}"
+            );
+        }
+    }
+}

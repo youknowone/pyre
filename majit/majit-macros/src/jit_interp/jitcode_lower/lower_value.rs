@@ -6,7 +6,8 @@ use super::*;
 /// paths gives two different token streams.
 ///
 /// Descriptor/layout identities instead use [`struct_type_id_tokens`], which
-/// emits the runtime `TypeId`-based identity helper. The same id keys the
+/// emits `__majit_struct_type_id::<T>()` (resolved `type_name`, hashed like
+/// `BhSizeSpec.type_id`). The same id keys the
 /// builder's `struct_size_specs` cache so each
 /// `setfield_gc_*` resolves its field's parent SizeDescr + `index_in_parent`
 /// (`descr.py`).  Distinct struct paths collide only at `DefaultHasher`'s
@@ -34,16 +35,19 @@ pub(super) fn struct_type_id(path: &syn::Path, is_gc_managed: bool) -> u64 {
 
 /// Emit the runtime lltype-identity surrogate for `path`.
 ///
-/// RPython's `descr.py:get_size_descr()` is keyed by the lltype `STRUCT`
-/// object, not by a textual spelling in an individual graph. `TypeId` gives
-/// the corresponding process-local Rust type identity, so an inline helper
-/// using `super::linkedlist::Stack` and a caller using its fully qualified
-/// spelling share the same field descr cache key.
+/// `descr.py` `get_size_descr` is keyed by the lltype `STRUCT` object, not
+/// by a textual spelling in an individual graph. Every non-generic spelling
+/// emits `__majit_struct_type_id::<#path>`, whose body hashes
+/// `core::any::type_name::<T>()` — rustc resolves `crate::` / `self::` /
+/// `super::` / `use` / re-exports to one definition — through the same
+/// function the graph codewriter uses for `BhSizeSpec.type_id`.
 ///
-/// `TypeId::of` requires a `'static` type. A path with generic arguments can
-/// name a non-static type parameter and cannot be proven static by this proc
-/// macro, so preserve the legacy path hash for that conservative fallback.
-/// Concrete JIT structs use the runtime identity path.
+/// A path with generic arguments can name a type parameter this proc macro
+/// cannot prove `'static`, so `type_name::<#path>()` is not emitted there.
+/// The legacy token hash stays. It does not alias a non-generic spelling:
+/// `quote!(#path)` inserts spaces (`Foo < T >`) and `type_name` does not, so
+/// the two hashes are of different strings. A 64-bit collision is the same
+/// residual `path_hash` already accepts between distinct structs.
 pub(super) fn struct_type_id_tokens(path: &syn::Path, is_gc_managed: bool) -> TokenStream {
     let has_generic_args = path
         .segments
@@ -52,46 +56,6 @@ pub(super) fn struct_type_id_tokens(path: &syn::Path, is_gc_managed: bool) -> To
     if has_generic_args {
         let legacy = struct_type_id(path, is_gc_managed);
         quote! { #legacy }
-    } else if path.segments.len() > 1 {
-        let first = path
-            .segments
-            .first()
-            .map(|segment| segment.ident.to_string())
-            .unwrap_or_default();
-        if matches!(first.as_str(), "crate" | "self" | "super") {
-            let type_path = path
-                .segments
-                .iter()
-                .map(|segment| segment.ident.to_string())
-                .collect::<Vec<_>>()
-                .join("::");
-            return quote! {
-                majit_metainterp::__majit_struct_type_id_path(
-                    module_path!(),
-                    #type_path,
-                    #is_gc_managed,
-                )
-            };
-        }
-        // A fully qualified external Rust path carries its defining crate as
-        // the first segment. Charon's module origin drops that crate boundary,
-        // so hash the remaining definition path exactly as the graph
-        // codewriter does for `BhSizeSpec.type_id`.
-        let definition_path = path
-            .segments
-            .iter()
-            .skip(1)
-            .map(|segment| segment.ident.to_string())
-            .collect::<Vec<_>>()
-            .join("::");
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        definition_path.hash(&mut hasher);
-        if !is_gc_managed {
-            "raw".hash(&mut hasher);
-        }
-        let type_id = hasher.finish();
-        quote! { #type_id }
     } else {
         quote! { majit_metainterp::__majit_struct_type_id::<#path>(#is_gc_managed) }
     }
@@ -3389,6 +3353,32 @@ mod tests {
             depends_on_stack: false,
             struct_type: None,
         }
+    }
+
+    #[test]
+    fn non_generic_spellings_emit_the_resolved_type_id_helper() {
+        for path in ["crate::a::X", "self::X", "super::a::X", "X", "reexport::X"] {
+            let parsed: syn::Path = syn::parse_str(path).unwrap();
+            let emitted = struct_type_id_tokens(&parsed, true).to_string();
+            assert!(
+                emitted.contains("__majit_struct_type_id"),
+                "{path} -> {emitted}"
+            );
+            assert!(
+                !emitted.contains("struct_type_id_path"),
+                "{path} -> {emitted}"
+            );
+            assert!(
+                emitted.contains(&path.replace("::", " :: ")),
+                "{path} -> {emitted}"
+            );
+        }
+        let generic: syn::Path = syn::parse_str("Foo<Bar>").unwrap();
+        let emitted = struct_type_id_tokens(&generic, true).to_string();
+        assert!(
+            !emitted.contains("__majit_struct_type_id"),
+            "generic fallback must stay a token hash, got {emitted}"
+        );
     }
 
     #[test]
