@@ -10,6 +10,11 @@ const INTERPRETER_LLBC: &str = concat!(
     "/../../build/llbc/pyre-interpreter.ullbc"
 );
 
+const OBJECT_LLBC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../build/llbc/pyre-object.ullbc"
+);
+
 /// `dunder_import_absolute_head` is the empty-fromlist arm that holds
 /// `name.find('.')` and `name[:dotindex]`; `dunder_import` itself delegates
 /// to it and carries neither call.
@@ -65,4 +70,92 @@ fn dunder_import_lowers_rust_string_find_and_slices_to_rpython_ops() {
         } if segments.starts_with(&["core".to_string(), "str".to_string()])
             && matches!(segments.last().map(String::as_str), Some("find" | "index"))
     )));
+}
+
+/// Tuple length is `ll_fixed_length` on `wrappeditems`, the fixed list.
+/// It must not call `items_block_capacity`, which also receives the
+/// resizable list's `ll_items` pointer.
+#[test]
+fn tuple_len_reads_the_fixed_list_not_the_items_block() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        HostStaticAddrs::default(),
+        &["tupleobject"],
+        &["w_tuple_len"],
+    )
+    .expect("lower tupleobject::w_tuple_len");
+    let function = program
+        .functions
+        .iter()
+        .find(|f| f.name == "w_tuple_len")
+        .expect("w_tuple_len graph");
+    let ops = function
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect::<Vec<_>>();
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::ArrayLen {
+                array_type_id: Some(id),
+                nolength: false,
+                ..
+            } if id == "majit::object_ref_gcarray"
+        )),
+        "wrappeditems length is arraylen on the fixed list"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("items_block_capacity")
+        )),
+        "the fixed list must not enter items_block_capacity"
+    );
+}
+
+/// `ll_list_obj_capacity` is `len(l.items)` on the resizable list's
+/// `ItemsBlock` header. That header is not a fixed-list GcArray, so the
+/// call stays.
+#[test]
+fn list_items_capacity_stays_on_the_items_block() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        HostStaticAddrs::default(),
+        &["listobject"],
+        &["ll_list_obj_capacity"],
+    )
+    .expect("lower listobject::ll_list_obj_capacity");
+    let function = program
+        .functions
+        .iter()
+        .find(|f| f.name == "ll_list_obj_capacity")
+        .expect("ll_list_obj_capacity graph");
+    let ops = function
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect::<Vec<_>>();
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("items_block_capacity")
+        )),
+        "ItemsBlock capacity stays a call"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::ArrayLen { .. })),
+        "the items header is not ll_fixed_length"
+    );
 }
