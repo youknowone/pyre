@@ -36,7 +36,7 @@ pub(crate) struct SpecRequest {
 pub(crate) struct SpecQueue {
     pending: VecDeque<SpecRequest>,
     seen: HashSet<String>,
-    /// `def_id`s whose body contains a depth-0 `Clause` and no closure call.
+    /// `def_id`s whose body contains a depth-0 `Clause`.
     clause_body: std::collections::HashMap<u64, bool>,
 }
 
@@ -62,7 +62,7 @@ impl SpecQueue {
             let Some(body) = value.get("Unstructured") else {
                 return false;
             };
-            mentions_own_clause(body, llbc) && !body_calls_closure(body, llbc)
+            mentions_own_clause(body, llbc)
         });
         self.clause_body.insert(fd.def_id, has);
         has
@@ -318,21 +318,6 @@ fn clause_index(v: &Value, llbc: &Llbc) -> Option<usize> {
         return None;
     }
     Some(bound.get(1)?.as_u64()? as usize)
-}
-
-fn body_calls_closure(v: &Value, llbc: &Llbc) -> bool {
-    match v {
-        Value::Object(map) => {
-            if let Some(id) = map.get("Regular").and_then(Value::as_u64)
-                && llbc.fn_by_id(id).is_some_and(|fd| fd.item_meta.name_path().contains("closure"))
-            {
-                return true;
-            }
-            map.values().any(|item| body_calls_closure(item, llbc))
-        }
-        Value::Array(items) => items.iter().any(|item| body_calls_closure(item, llbc)),
-        _ => false,
-    }
 }
 
 fn mentions_own_clause(v: &Value, llbc: &Llbc) -> bool {

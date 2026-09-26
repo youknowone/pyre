@@ -15841,9 +15841,6 @@ impl<'a> Lowering<'a> {
         let path = fd.item_meta.name_path();
         let leaf = path.rsplit("::").next().unwrap_or("fn");
         let segments = spec_segments(self.llbc, fd, leaf);
-        if path.contains("closure") || segments.iter().any(|seg| seg.contains("closure")) {
-            return None;
-        }
         if let Some(segments) = self.enqueue_spec(fd, &generics) {
             return Some((segments, None));
         }
@@ -15865,18 +15862,6 @@ impl<'a> Lowering<'a> {
         if self
             .dont_look_inside
             .contains(&strip_crate_prefix(&path))
-        {
-            return None;
-        }
-        // A closure shim's specialized return token does not match the
-        // body yet (`call_once`). Leave that instantiation unspecialized.
-        if path.contains("closure") {
-            return None;
-        }
-        let bare_leaf = path.rsplit("::").next().unwrap_or("fn");
-        if spec_segments(self.llbc, fd, bare_leaf)
-            .iter()
-            .any(|seg| seg.contains("closure"))
         {
             return None;
         }
