@@ -5493,8 +5493,9 @@ impl<S: JitState> JitDriver<S> {
     /// resolved key would also rebuild the caller's `GreenKey` on a chained
     /// bucket, which is the allocation the carry exists to avoid), and the
     /// token is entered as given.
-    #[cold]
-    #[inline(never)]
+    ///
+    /// Unannotated, as `warmstate.py maybe_compile_and_run` is: the body is
+    /// a call to `back_edge_internal`, which stays out of line.
     pub fn back_edge_resolved(
         &mut self,
         cell_key: u64,
