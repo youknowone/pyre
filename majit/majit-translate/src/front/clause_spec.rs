@@ -13,6 +13,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
+use majit_charon_reader::ullbc::{Signature, TyRef};
 use majit_charon_reader::{FunDecl, Llbc, Unstructured};
 use serde::Deserialize;
 use serde_json::Value;
@@ -24,6 +25,10 @@ pub(crate) struct SpecRequest {
     /// jitcode name keeps only that segment.
     pub leaf: String,
     pub trait_refs: Vec<Value>,
+    /// `generics.types` of the call. Depth-0 `TypeVar`s are already rejected.
+    pub types: Vec<Value>,
+    /// `generics.const_generics` of the call.
+    pub const_generics: Vec<Value>,
 }
 
 /// Instantiations reached from concrete call sites. The set is the
@@ -138,17 +143,44 @@ pub(crate) fn spec_leaf(leaf: &str, fn_id: u64, generics: &Value, llbc: &Llbc) -
     format!("{leaf}__s{fn_id}_{impls}_{types}")
 }
 
+/// `generics.types` / `generics.const_generics` when neither list contains
+/// a depth-0 `TypeVar`. `None` leaves the callee unspecialized.
+pub(crate) fn concrete_type_args(
+    generics: &Value,
+    llbc: &Llbc,
+) -> Option<(Vec<Value>, Vec<Value>)> {
+    let types = generics
+        .get("types")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let const_generics = generics
+        .get("const_generics")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let open = |items: &[Value]| items.iter().any(|item| contains_depth0_type_var(item, llbc, 0));
+    if open(&types) || open(&const_generics) {
+        return None;
+    }
+    Some((types, const_generics))
+}
+
 /// Copy `fd`'s unstructured body with each depth-0 `Clause` replaced by
-/// `trait_refs[index]`.
+/// `trait_refs[index]` and each depth-0 type / const-generic variable
+/// replaced by the call's arguments.
 pub(crate) fn substituted_unstructured(
     fd: &FunDecl,
     llbc: &Llbc,
     trait_refs: &[Value],
+    types: &[Value],
+    const_generics: &[Value],
 ) -> Option<Unstructured> {
     let raw = fd.body.as_ref()?.get();
     let mut value: Value = serde_json::from_str(raw).ok()?;
     let body = value.get_mut("Unstructured")?;
     substitute_clauses(body, llbc, trait_refs);
+    substitute_type_vars(body, llbc, types, const_generics);
     #[derive(Deserialize)]
     struct Proj {
         #[serde(rename = "Unstructured")]
@@ -305,6 +337,190 @@ fn mentions_own_clause(v: &Value, llbc: &Llbc) -> bool {
         Value::Object(map) => map.values().any(|item| mentions_own_clause(item, llbc)),
         _ => false,
     }
+}
+
+/// Replace depth-0 type variables with `types[i]` and depth-0 const-generic
+/// variables with `const_generics[i]`. A `Deduplicated` / `HashConsedValue`
+/// node whose resolved body contains such a variable is replaced by the
+/// substituted plain node. The shared dedup table is not written.
+pub(crate) fn substitute_type_vars(
+    body: &mut Value,
+    llbc: &Llbc,
+    types: &[Value],
+    const_generics: &[Value],
+) {
+    subst_vars(body, llbc, types, const_generics, 0);
+}
+
+/// `fd.signature` with the same depth-0 substitution as the copied body.
+pub(crate) fn substituted_signature(
+    sig: &Signature,
+    llbc: &Llbc,
+    types: &[Value],
+    const_generics: &[Value],
+) -> Signature {
+    Signature {
+        is_unsafe: sig.is_unsafe,
+        inputs: sig
+            .inputs
+            .iter()
+            .map(|ty| subst_tyref(ty, llbc, types, const_generics))
+            .collect(),
+        output: subst_tyref(&sig.output, llbc, types, const_generics),
+    }
+}
+
+fn subst_tyref(ty: &TyRef, llbc: &Llbc, types: &[Value], const_generics: &[Value]) -> TyRef {
+    let mut value = match ty {
+        TyRef::Dedup { id } => serde_json::json!({ "Deduplicated": id }),
+        TyRef::Inline { value: (id, body) } => {
+            serde_json::json!({ "HashConsedValue": [id, body] })
+        }
+        TyRef::Other(body) => body.clone(),
+    };
+    substitute_type_vars(&mut value, llbc, types, const_generics);
+    serde_json::from_value(value.clone()).unwrap_or(TyRef::Other(value))
+}
+
+fn subst_vars(
+    v: &mut Value,
+    llbc: &Llbc,
+    types: &[Value],
+    const_generics: &[Value],
+    depth: usize,
+) {
+    if depth > 64 {
+        return;
+    }
+    if let Some(index) = type_var_index(v)
+        && let Some(replacement) = types.get(index)
+    {
+        *v = replacement.clone();
+        return;
+    }
+    if let Some(index) = const_var_index(v)
+        && let Some(replacement) = const_generics.get(index)
+    {
+        *v = replacement.clone();
+        return;
+    }
+    if let Some(mut plain) = indirect_body_with_var(v, llbc) {
+        subst_vars(&mut plain, llbc, types, const_generics, depth + 1);
+        *v = plain;
+        return;
+    }
+    match v {
+        Value::Array(items) => {
+            for item in items {
+                subst_vars(item, llbc, types, const_generics, depth + 1);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                subst_vars(item, llbc, types, const_generics, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Depth-0 `TypeVar` index: `{"TypeVar":{"Bound":[0, i]}}` or
+/// `{"TypeVar":{"Free": i}}`.
+fn type_var_index(v: &Value) -> Option<usize> {
+    let var = v.as_object()?.get("TypeVar")?;
+    if let Some(bound) = var.get("Bound").and_then(Value::as_array) {
+        if bound.first()?.as_u64()? != 0 {
+            return None;
+        }
+        return Some(bound.get(1)?.as_u64()? as usize);
+    }
+    var.get("Free").and_then(Value::as_u64).map(|index| index as usize)
+}
+
+/// Depth-0 const-generic variable index:
+/// `{"kind":{"Var":{"Bound":[0, i]}}}` or `{"kind":{"Var":{"Free": i}}}`.
+fn const_var_index(v: &Value) -> Option<usize> {
+    let var = v.as_object()?.get("kind")?.get("Var")?;
+    if let Some(bound) = var.get("Bound").and_then(Value::as_array) {
+        if bound.first()?.as_u64()? != 0 {
+            return None;
+        }
+        return Some(bound.get(1)?.as_u64()? as usize);
+    }
+    var.get("Free").and_then(Value::as_u64).map(|index| index as usize)
+}
+
+fn contains_depth0_type_var(v: &Value, llbc: &Llbc, depth: usize) -> bool {
+    if depth > 64 {
+        return false;
+    }
+    if type_var_index(v).is_some() {
+        return true;
+    }
+    if let Some(body) = indirect_body(v, llbc) {
+        return contains_depth0_type_var(&body, llbc, depth + 1);
+    }
+    match v {
+        Value::Array(items) => items
+            .iter()
+            .any(|item| contains_depth0_type_var(item, llbc, depth + 1)),
+        Value::Object(map) => map
+            .values()
+            .any(|item| contains_depth0_type_var(item, llbc, depth + 1)),
+        _ => false,
+    }
+}
+
+fn contains_depth0_var(v: &Value, llbc: &Llbc, depth: usize) -> bool {
+    if depth > 64 {
+        return false;
+    }
+    if type_var_index(v).is_some() || const_var_index(v).is_some() {
+        return true;
+    }
+    if let Some(body) = indirect_body(v, llbc) {
+        return contains_depth0_var(&body, llbc, depth + 1);
+    }
+    match v {
+        Value::Array(items) => items
+            .iter()
+            .any(|item| contains_depth0_var(item, llbc, depth + 1)),
+        Value::Object(map) => map
+            .values()
+            .any(|item| contains_depth0_var(item, llbc, depth + 1)),
+        _ => false,
+    }
+}
+
+/// Resolved body of a dedup wrapper when that body contains a depth-0
+/// variable. `None` when `v` is not a wrapper or the body has no such variable.
+fn indirect_body_with_var(v: &Value, llbc: &Llbc) -> Option<Value> {
+    let body = indirect_body(v, llbc)?;
+    if contains_depth0_var(&body, llbc, 0) {
+        Some(body)
+    } else {
+        None
+    }
+}
+
+fn indirect_body(v: &Value, llbc: &Llbc) -> Option<Value> {
+    let obj = v.as_object()?;
+    if obj.len() != 1 {
+        return None;
+    }
+    if let Some(id) = obj.get("Deduplicated").and_then(Value::as_u64) {
+        return llbc.dedup_body(id).cloned();
+    }
+    let arr = obj.get("HashConsedValue").and_then(Value::as_array)?;
+    if arr.len() != 2 {
+        return None;
+    }
+    if let Some(id) = arr.first().and_then(Value::as_u64)
+        && let Some(body) = llbc.dedup_body(id)
+    {
+        return Some(body.clone());
+    }
+    Some(arr[1].clone())
 }
 
 fn substitute_clauses(v: &mut Value, llbc: &Llbc, trait_refs: &[Value]) {
