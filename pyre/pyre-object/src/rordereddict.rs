@@ -297,12 +297,6 @@ impl EntryDummy for String {
     }
 }
 
-impl EntryDummy for Vec<u8> {
-    fn dummy() -> Self {
-        Vec::new()
-    }
-}
-
 /// A borrowed key that can be compared against a `K` without building one.
 ///
 /// The same shape as `indexmap::Equivalent`, so a lookup type written for the

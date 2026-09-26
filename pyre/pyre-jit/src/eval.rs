@@ -848,13 +848,18 @@ unsafe fn int_dict_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     }
 }
 
-/// `rerased.new_erasing_pair("bytes")`: only values are GC refs.
+/// `rerased.new_erasing_pair("bytes")`: `BytesDictStrategy` keys are the
+/// `str` block `unerase` yields, and values are `W_Root`. Both are GC refs.
+/// The block does not move; the visit keeps it alive.
 unsafe fn bytes_dict_storage_custom_trace(
     obj_addr: usize,
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
     let storage = &mut *(obj_addr as *mut pyre_object::dictmultiobject::BytesDictStorage);
-    for value in storage.values_mut() {
+    for (key, value) in storage.iter_mut() {
+        let key_ptr = key as *const pyre_object::dictmultiobject::BytesKey
+            as *mut pyre_object::dictmultiobject::BytesKey;
+        f(std::ptr::addr_of_mut!((*key_ptr).0) as *mut majit_ir::GcRef);
         f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     }
 }
