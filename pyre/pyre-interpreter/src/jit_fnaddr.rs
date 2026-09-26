@@ -3328,23 +3328,24 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     // `ll_find` / `ll_rfind` / `ll_count`: elidable residuals the
     // `descr_find` / `descr_rfind` / `descr_count` wrappers record.
+    // Bounds are already machine ints; the strings stay GC refs.
     cpa4(
         &mut entries,
-        "pyre_object::unicodeobject::jit_str_find_objs",
-        "pyre_object::jit_str_find_objs",
-        pyre_object::unicodeobject::jit_str_find_objs,
+        "pyre_object::unicodeobject::jit_str_find_bounds",
+        "pyre_object::jit_str_find_bounds",
+        pyre_object::unicodeobject::jit_str_find_bounds,
     );
     cpa4(
         &mut entries,
-        "pyre_object::unicodeobject::jit_str_rfind_objs",
-        "pyre_object::jit_str_rfind_objs",
-        pyre_object::unicodeobject::jit_str_rfind_objs,
+        "pyre_object::unicodeobject::jit_str_rfind_bounds",
+        "pyre_object::jit_str_rfind_bounds",
+        pyre_object::unicodeobject::jit_str_rfind_bounds,
     );
     cpa4(
         &mut entries,
-        "pyre_object::unicodeobject::jit_str_count_objs",
-        "pyre_object::jit_str_count_objs",
-        pyre_object::unicodeobject::jit_str_count_objs,
+        "pyre_object::unicodeobject::jit_str_count_bounds",
+        "pyre_object::jit_str_count_bounds",
+        pyre_object::unicodeobject::jit_str_count_bounds,
     );
     cpa2(
         &mut entries,

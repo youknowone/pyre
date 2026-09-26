@@ -1990,6 +1990,18 @@ fn str_search_bound(args: &[PyObjectRef], i: usize) -> PyObjectRef {
     }
 }
 
+/// `_convert_idx_params` (`stringmethods.py`) unwraps each bound to a
+/// machine int before `ll_find` / `ll_rfind` / `ll_count`. Omitted or
+/// `None` is the default; an exact int is `w_int_get_value`.
+#[inline(always)]
+fn str_search_bound_int(w: PyObjectRef, default: i64) -> i64 {
+    if w.is_null() || unsafe { pyre_object::is_none(w) } {
+        default
+    } else {
+        unsafe { pyre_object::w_int_get_value(w) }
+    }
+}
+
 /// Bounds that are not `None` or an exact `int` (`__index__`, a subclass)
 /// stay in the interpreter body. `dont_look_inside` so that arm does not
 /// pull its helpers into the generated wrapper.
@@ -2011,8 +2023,8 @@ fn str_descr_count_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     str_method_count(args)
 }
 
-/// `unicodeobject.py descr_find`. The search is `ll_find`: an elidable
-/// residual (`jit_str_find_objs`), not a hand trace.
+/// `unicodeobject.py descr_find`. Bounds are unwrapped here, then `ll_find`
+/// (`jit_str_find_bounds`) sees two GC refs and two machine ints.
 pub fn __majit_wrap_str_descr_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Arity and kwargs stay on the slow arm. `arity_at_least` pulls the
     // kwargs-marker read into this graph, and that effect makes every later
@@ -2023,23 +2035,18 @@ pub fn __majit_wrap_str_descr_find(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     if unsafe { !pyre_object::is_str(args[0]) || !pyre_object::is_str(args[1]) } {
         return str_descr_find_slow(args);
     }
-    let start = str_search_bound(args, 2);
-    let end = str_search_bound(args, 3);
-    if !bound_is_none_or_exact_int(start) || !bound_is_none_or_exact_int(end) {
+    let w_start = str_search_bound(args, 2);
+    let w_end = str_search_bound(args, 3);
+    if !bound_is_none_or_exact_int(w_start) || !bound_is_none_or_exact_int(w_end) {
         return str_descr_find_slow(args);
     }
-    let n = unsafe {
-        pyre_object::unicodeobject::jit_str_find_objs(
-            args[0] as i64,
-            args[1] as i64,
-            start as i64,
-            end as i64,
-        )
-    };
+    let start = str_search_bound_int(w_start, 0);
+    let end = str_search_bound_int(w_end, i64::MAX);
+    let n = pyre_object::unicodeobject::jit_str_find_bounds(args[0], args[1], start, end);
     Ok(w_int_new(n))
 }
 
-/// `unicodeobject.py descr_rfind`. The search is `ll_rfind`.
+/// `unicodeobject.py descr_rfind`. Bounds are unwrapped here, then `ll_rfind`.
 pub fn __majit_wrap_str_descr_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 2 || args.len() > 4 {
         return str_descr_rfind_slow(args);
@@ -2047,23 +2054,18 @@ pub fn __majit_wrap_str_descr_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef,
     if unsafe { !pyre_object::is_str(args[0]) || !pyre_object::is_str(args[1]) } {
         return str_descr_rfind_slow(args);
     }
-    let start = str_search_bound(args, 2);
-    let end = str_search_bound(args, 3);
-    if !bound_is_none_or_exact_int(start) || !bound_is_none_or_exact_int(end) {
+    let w_start = str_search_bound(args, 2);
+    let w_end = str_search_bound(args, 3);
+    if !bound_is_none_or_exact_int(w_start) || !bound_is_none_or_exact_int(w_end) {
         return str_descr_rfind_slow(args);
     }
-    let n = unsafe {
-        pyre_object::unicodeobject::jit_str_rfind_objs(
-            args[0] as i64,
-            args[1] as i64,
-            start as i64,
-            end as i64,
-        )
-    };
+    let start = str_search_bound_int(w_start, 0);
+    let end = str_search_bound_int(w_end, i64::MAX);
+    let n = pyre_object::unicodeobject::jit_str_rfind_bounds(args[0], args[1], start, end);
     Ok(w_int_new(n))
 }
 
-/// `unicodeobject.py descr_count`. The search is `ll_count`.
+/// `unicodeobject.py descr_count`. Bounds are unwrapped here, then `ll_count`.
 pub fn __majit_wrap_str_descr_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 2 || args.len() > 4 {
         return str_descr_count_slow(args);
@@ -2071,19 +2073,14 @@ pub fn __majit_wrap_str_descr_count(args: &[PyObjectRef]) -> Result<PyObjectRef,
     if unsafe { !pyre_object::is_str(args[0]) || !pyre_object::is_str(args[1]) } {
         return str_descr_count_slow(args);
     }
-    let start = str_search_bound(args, 2);
-    let end = str_search_bound(args, 3);
-    if !bound_is_none_or_exact_int(start) || !bound_is_none_or_exact_int(end) {
+    let w_start = str_search_bound(args, 2);
+    let w_end = str_search_bound(args, 3);
+    if !bound_is_none_or_exact_int(w_start) || !bound_is_none_or_exact_int(w_end) {
         return str_descr_count_slow(args);
     }
-    let n = unsafe {
-        pyre_object::unicodeobject::jit_str_count_objs(
-            args[0] as i64,
-            args[1] as i64,
-            start as i64,
-            end as i64,
-        )
-    };
+    let start = str_search_bound_int(w_start, 0);
+    let end = str_search_bound_int(w_end, i64::MAX);
+    let n = pyre_object::unicodeobject::jit_str_count_bounds(args[0], args[1], start, end);
     Ok(w_int_new(n))
 }
 
