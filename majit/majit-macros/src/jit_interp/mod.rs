@@ -3458,6 +3458,15 @@ fn rewrite_body(
                                     #driver.writeback_scalar_state_fields(
                                         &mut #state,
                                     );
+                                    // Ref scalars are stashed beside the ints
+                                    // (`single_pass_ref_scalar_values`) and are
+                                    // not part of the scalar vector. The bridge
+                                    // resume hook writes them back; this close
+                                    // owes the same transfer or native `state`
+                                    // keeps the trace-start ref.
+                                    #driver.writeback_ref_scalar_state_fields(
+                                        &mut #state,
+                                    );
                                     // Push the walk-final loop-carried virt-array
                                     // element values into native `state` too. A
                                     // field embedding a Rust `Vec` by value is

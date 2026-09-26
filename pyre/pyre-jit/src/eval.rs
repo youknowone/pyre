@@ -4709,9 +4709,6 @@ fn walk_parked_exception_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     // Children of the off-GC exception singletons, which no carrier and no
     // collection phase reaches on its own.
     walk_immortal_exception_singleton_roots(visitor);
-    // Stored `PyError` carrier whose GC refs the precise collector cannot
-    // reach through its raw TLS cell. Mirrors `walk_pending_call_error`.
-    crate::call_jit::walk_last_ca_exception(visitor);
 }
 
 /// The immortal, process-global stores whose GC-heap slots nothing else
@@ -4804,11 +4801,6 @@ fn register_thread_root_areas() {
             fbw_finish_concrete_root_walker_area,
             pyre_jit_trace::jitcode_dispatch::capture_fbw_finish_concrete_root_area(),
             "fbw_finish_concrete",
-        );
-        register(
-            fbw_finish_payload_root_walker_area,
-            pyre_jit_trace::jitcode_dispatch::capture_fbw_finish_payload_root_area(),
-            "fbw_finish_payload",
         );
         register(
             walk_end_root_walker_area,
@@ -5706,13 +5698,6 @@ unsafe fn fbw_finish_concrete_root_walker_area(
     unsafe {
         pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_root_walker_area(data, visitor)
     };
-}
-
-unsafe fn fbw_finish_payload_root_walker_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
-    unsafe { pyre_jit_trace::jitcode_dispatch::fbw_finish_payload_root_walker_area(data, visitor) };
 }
 
 unsafe fn walk_end_root_walker_area(
@@ -7416,11 +7401,6 @@ fn drive_unpack_iterable_trace(
         // producer today) and is promoted instead of discarded; an exit that
         // already picked one keeps it, since that one is the earlier failure.
         if let Err(err) = pyre_interpreter::stack_check::drain_jit_pending_exception()
-            && !err.matches_stop_iteration()
-        {
-            pending_err.get_or_insert(err);
-        }
-        if let Some(err) = crate::call_jit::take_ca_exception()
             && !err.matches_stop_iteration()
         {
             pending_err.get_or_insert(err);
@@ -10537,12 +10517,6 @@ fn execute_assembler(
         return Some(LoopResult::Done(Err(exc)));
     }
 
-    // warmspot.py:998 ExitFrameWithExceptionRef: check for exceptions
-    // stashed by blackhole/force callbacks across FFI boundaries.
-    if let Some(exc) = crate::call_jit::take_ca_exception() {
-        return Some(LoopResult::Done(Err(exc)));
-    }
-
     if majit_metainterp::majit_log_enabled() {
         let kind = match &outcome {
             DetailedDriverRunOutcome::Finished { .. } => "finished",
@@ -10863,7 +10837,7 @@ fn compile_and_run_once(
             } else {
                 let concrete_frame = frame_root.frame().snapshot_for_tracing();
                 let live_frame_addr = frame_root.frame() as *const PyFrame as usize;
-                let (action, executed_frame) = trace_bytecode(
+                let (action, executed_frame, walk_end_flushed) = trace_bytecode(
                     meta,
                     sym,
                     code,
@@ -10872,7 +10846,6 @@ fn compile_and_run_once(
                     live_frame_addr,
                     true,
                 );
-                let walk_end_flushed = pyre_jit_trace::trace::take_walk_end_flush_committed();
                 let walk_end_restart_pc = pyre_jit_trace::trace::take_walk_end_restart_pc();
                 if walk_end_flushed {
                     frame_root
@@ -11388,11 +11361,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // the JIT-overflow flag the backend probe records when it
         // trips during compiled execution at function entry.
         if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
-            return Some(Err(exc));
-        }
-        // warmspot.py:998 ExitFrameWithExceptionRef: check for exceptions
-        // stashed by blackhole/force callbacks across FFI boundaries.
-        if let Some(exc) = crate::call_jit::take_ca_exception() {
             return Some(Err(exc));
         }
         if majit_metainterp::majit_log_enabled() {

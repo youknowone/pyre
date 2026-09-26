@@ -400,6 +400,13 @@ pub(crate) struct AddedBlocksGuard<'a> {
     saved: Option<Option<IndexMap<BlockKey, BlockRef>>>,
     saved_annotation_snapshots: Option<Option<IndexMap<BlockKey, BlockAnnotationSnapshot>>>,
     annotated_at_entry: std::collections::HashSet<BlockKey>,
+    /// `links_followed` at scope entry. `flowin` records a link only
+    /// after the block's ops bind (`annrpython.py` `flowin`: a
+    /// `BlockedInference` on `simple_call` returns before
+    /// `follow_link`). A failed subject's reflow can follow the link
+    /// and then restore the unbound `simple_call` result; without
+    /// restoring this map, Phase B `bindingrepr`s that result.
+    links_followed_at_entry: IndexMap<LinkKey, LinkRef>,
     committed: std::cell::Cell<bool>,
 }
 
@@ -417,6 +424,12 @@ impl<'a> AddedBlocksGuard<'a> {
 impl<'a> Drop for AddedBlocksGuard<'a> {
     fn drop(&mut self) {
         if !self.committed.get() {
+            // `flowin` does not follow a link out of a `simple_call` that
+            // raised `BlockedInference`. A reflow inside this scope may
+            // have recorded the link, then the snapshot below puts the
+            // result annotation back to unbound. Drop the link record
+            // with the annotation or `specialize_block` bindingreprs it.
+            *self.ann.links_followed.borrow_mut() = self.links_followed_at_entry.clone();
             // Restore only previously-seen blocks that this subject actually
             // touched. `snapshot_block_if_tracking` records the cells before
             // mergeinputargs/reflow mutates them.
@@ -942,6 +955,7 @@ impl RPythonAnnotator {
             saved: Some(saved),
             saved_annotation_snapshots: Some(saved_annotation_snapshots),
             annotated_at_entry: std::collections::HashSet::new(),
+            links_followed_at_entry: self.links_followed.borrow().clone(),
             committed: std::cell::Cell::new(true),
         };
         self.complete()?;
@@ -1569,11 +1583,13 @@ impl RPythonAnnotator {
             .replace(IndexMap::new());
         let annotated_at_entry: std::collections::HashSet<BlockKey> =
             self.annotated.borrow().keys().cloned().collect();
+        let links_followed_at_entry = self.links_followed.borrow().clone();
         AddedBlocksGuard {
             ann: self,
             saved: Some(saved),
             saved_annotation_snapshots: Some(saved_annotation_snapshots),
             annotated_at_entry,
+            links_followed_at_entry,
             committed: std::cell::Cell::new(false),
         }
     }
@@ -1944,7 +1960,17 @@ impl RPythonAnnotator {
                 inputs_s.push(SomeValue::Impossible);
                 continue;
             };
-            let mut s_out = self.annotation(v_out).unwrap_or(SomeValue::Impossible);
+            // `flowin` returns before `follow_link` when `simple_call`
+            // raises `BlockedInference` (`annrpython.py` `flowin`), so
+            // the unbound result is never a followed link. Recording it
+            // here leaves Phase B to `bindingrepr` a `None` annotation.
+            let mut s_out = match self.annotation(v_out) {
+                Some(s) => s,
+                None => {
+                    ignore_link = true;
+                    SomeValue::Impossible
+                }
+            };
             // upstream: `if v_out in constraints: s_out = pair(s_out, s_c).improve()`.
             if let Hlvalue::Variable(v) = v_out {
                 let key = Rc::new(v.clone());
@@ -2155,7 +2181,11 @@ impl RPythonAnnotator {
                 }
                 inputs_s.push(s_out);
             } else {
-                let s_out = self.annotation(v_out).unwrap_or(SomeValue::Impossible);
+                // Same `flowin` rule as `follow_link`: an unbound arg
+                // means this raise-link was not followed.
+                let Some(s_out) = self.annotation(v_out) else {
+                    return;
+                };
                 let s_out = self.apply_renaming(s_out, &renaming);
                 inputs_s.push(s_out);
             }
@@ -3424,6 +3454,61 @@ mod tests {
             matches!(bound, Some(SomeValue::Integer(_))),
             "got {:?}",
             bound
+        );
+    }
+
+    #[test]
+    fn follow_link_does_not_record_unbound_simple_call_result() {
+        // `flowin` (`annrpython.py`) swallows `BlockedInference` on
+        // `simple_call` and returns before `follow_link`, so the
+        // unbound result is not a followed link. Recording it makes
+        // Phase B `bindingrepr` raise `KeyError: no binding for arg`.
+        use super::super::super::flowspace::model::{Block, Link};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_graph("unbound_call", 0);
+        let unbound = Hlvalue::Variable(Variable::named("call_result"));
+        let target = Block::shared(vec![Hlvalue::Variable(Variable::named("u0"))]);
+        let link = Rc::new(RefCell::new(Link::new(vec![unbound], Some(target), None)));
+        ann.follow_link(&graph, &link, &HashMap::new());
+        assert!(
+            !ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&link)),
+            "unbound simple_call result must not be links_followed"
+        );
+    }
+
+    #[test]
+    fn uncommitted_scope_drops_links_followed_by_reflow() {
+        // A failed per-subject reflow restores the pre-reflow
+        // annotation (still unbound) and must restore `links_followed`
+        // with it. `flowin` would not have recorded the link.
+        use super::super::super::flowspace::model::{Block, Link};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_graph("reflow_rollback", 1);
+        let source = graph.borrow().startblock.clone();
+        {
+            let mut src = source.borrow_mut();
+            if let Hlvalue::Variable(v) = &mut src.inputargs[0] {
+                ann.setbinding(v, SomeValue::Integer(SomeInteger::default()));
+            }
+        }
+        let source_a0 = source.borrow().inputargs[0].clone();
+        let target = Block::shared(vec![Hlvalue::Variable(Variable::named("u0"))]);
+        let link = Rc::new(RefCell::new(Link::new(vec![source_a0], Some(target), None)));
+        let scope = ann.enter_added_blocks_scope();
+        ann.follow_link(&graph, &link, &HashMap::new());
+        assert!(
+            ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&link))
+        );
+        drop(scope);
+        assert!(
+            !ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&link)),
+            "uncommitted reflow must not leave links_followed set"
         );
     }
 

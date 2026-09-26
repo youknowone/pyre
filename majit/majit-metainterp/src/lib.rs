@@ -212,7 +212,6 @@ pub use jitdriver::{
     MultiFrameBlackholeResult, PendingAbortBlackhole, SingleFrameBlackholeResult,
     TraceContinuationSuspendGuard, bridge_fuel_take, current_state_field_fvc_epoch,
     drive_multi_frame_blackhole, drive_single_frame_blackhole, no_bridge_enabled, spdiag_enabled,
-    trace_continuation_suspended,
 };
 // The warm-entry stage probe, which an embedder drives from its own harness —
 // the split has to be read through the frontend's own door, so the counts are

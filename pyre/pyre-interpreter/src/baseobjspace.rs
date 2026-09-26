@@ -2761,7 +2761,9 @@ pub unsafe fn getitem_fast_path(
 ///
 /// # Safety
 /// `w_obj` must be a live object.
-pub unsafe fn iter_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+pub unsafe fn iter_fast_path(
+    w_obj: PyObjectRef,
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
     unsafe {
         if crate::module::r#struct::is_unpack_iter(w_obj) || !is_instance(w_obj) {
             return None;
@@ -2780,10 +2782,11 @@ pub unsafe fn iter_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, Py
         if version_tag == 0 {
             return None;
         }
-        if type_attr_stored_is_cell(w_type, Wtf8::new("__iter__")) {
-            return None;
-        }
-        Some((w_type, version_tag, method))
+        // An in-place `ObjectMutableCell` write does not move `version_tag`, so
+        // the tag alone does not make `method` green.  Hand the cell back and
+        // let the caller pay [`type_attr_object_cell`]'s getfield and guard.
+        let cell = type_attr_object_cell(w_type, Wtf8::new("__iter__"));
+        Some((w_type, version_tag, method, cell))
     }
 }
 
@@ -2797,7 +2800,9 @@ pub unsafe fn iter_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, Py
 ///
 /// # Safety
 /// `w_obj` must be a live object.
-pub unsafe fn next_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+pub unsafe fn next_fast_path(
+    w_obj: PyObjectRef,
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
     unsafe {
         if crate::module::r#struct::is_unpack_iter(w_obj) || !is_instance(w_obj) {
             return None;
@@ -2811,10 +2816,11 @@ pub unsafe fn next_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, Py
         if version_tag == 0 {
             return None;
         }
-        if type_attr_stored_is_cell(w_type, Wtf8::new("__next__")) {
-            return None;
-        }
-        Some((w_type, version_tag, method))
+        // An in-place `ObjectMutableCell` write does not move `version_tag`, so
+        // the tag alone does not make `method` green.  Hand the cell back and
+        // let the caller pay [`type_attr_object_cell`]'s getfield and guard.
+        let cell = type_attr_object_cell(w_type, Wtf8::new("__next__"));
+        Some((w_type, version_tag, method, cell))
     }
 }
 
@@ -11769,15 +11775,16 @@ pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef,
 /// general `__get__` lookup that reaches `descr_function_get`); every other
 /// kind may run Python while binding.
 ///
-/// Returns `(w_type, version_tag, w_descr)` when the reduction holds, `None`
-/// otherwise.
+/// Returns `(w_type, version_tag, w_descr, cell)` when the reduction holds,
+/// `None` otherwise.  `cell` is the `ObjectMutableCell` holding `w_descr`, or
+/// null when the namespace entry is the descriptor itself.
 ///
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
 pub unsafe fn load_special_fast_path(
     w_obj: PyObjectRef,
     name: &str,
-) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
     if w_obj.is_null() {
         return None;
     }
@@ -11794,14 +11801,14 @@ pub unsafe fn load_special_fast_path(
     if version_tag == 0 {
         return None;
     }
-    if type_attr_stored_is_cell(w_type, Wtf8::new(name)) {
-        return None;
-    }
+    // An in-place `ObjectMutableCell` write does not move `version_tag`.  The
+    // cell is stable under the tag; the caller getfields `w_value` and guards it.
+    let cell = type_attr_object_cell(w_type, Wtf8::new(name));
     let w_descr = lookup_in_type(w_type, name)?;
     if !std::ptr::eq((*w_descr).ob_type, &crate::FUNCTION_TYPE as *const _) {
         return None;
     }
-    Some((w_type, version_tag, w_descr))
+    Some((w_type, version_tag, w_descr, cell))
 }
 
 /// CPython 3.14 `PyType_GetFullyQualifiedName` — the `%T` formatting name.
@@ -15440,6 +15447,47 @@ pub fn call_valuestack(
     call_function(callable, &args)
 }
 
+/// Root the GC children of a `malloc_typed` exception the collector does not
+/// trace. A managed exception is reached through its own pinned slot.
+/// Returns the shadow-stack base and the offset table written back after the
+/// hook. No heap allocation: publishing after a `Vec` would collect before
+/// the children were visible.
+fn pin_unmanaged_exception_children(exc: PyObjectRef) -> Option<(usize, &'static [usize])> {
+    if exc.is_null() || unsafe { !pyre_object::interp_exceptions::is_exception(exc) } {
+        return None;
+    }
+    if pyre_object::gc_hook::try_gc_owns_object(exc as *mut u8) {
+        return None;
+    }
+    let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
+    let offsets: &'static [usize] =
+        if pyre_object::interp_exceptions::exc_kind_uses_extended_layout(kind) {
+            &pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS
+        } else {
+            &pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_PTR_OFFSETS
+        };
+    let mut buf = [pyre_object::PY_NULL; 35];
+    const _: () =
+        assert!(pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS.len() <= 35);
+    debug_assert!(offsets.len() <= buf.len());
+    for (index, &offset) in offsets.iter().enumerate() {
+        buf[index] = unsafe { *((exc as usize + offset) as *const PyObjectRef) };
+    }
+    let base = pyre_object::gc_roots::publish_roots(&buf[..offsets.len()]);
+    pyre_object::gc_roots::normalize_roots(base, offsets.len());
+    Some((base, offsets))
+}
+
+fn write_unmanaged_exception_children(exc: PyObjectRef, base: usize, offsets: &[usize]) {
+    if exc.is_null() {
+        return;
+    }
+    for (index, &offset) in offsets.iter().enumerate() {
+        let live = pyre_object::gc_roots::shadow_stack_get(base + index);
+        unsafe { *((exc as usize + offset) as *mut PyObjectRef) = live };
+    }
+}
+
 /// PyPy: baseobjspace.py `call_args_and_c_profile`.
 ///
 /// ```python
@@ -15553,16 +15601,38 @@ pub fn call_args_and_c_profile_args(
             // stash already holds the original OperationError; if
             // c_exception_trace raises, overwrite the stash so the
             // tracer error is what propagates.
-            // The bare `raise` re-raises the error the call left pending, so it
-            // has to outlive the hook — and the hook runs Python, whose every
-            // call resets the one-cell stash.  Park it where the collector
-            // still walks it for the duration.
-            let parked = crate::call::park_call_error();
+            // `ObjSpace.call_args_and_c_profile` keeps the `OperationError`
+            // as a local across `ExecutionContext.c_exception_trace`, then
+            // re-raises it. The hook runs Python and every call resets the
+            // one-cell stash, so the local is rooted on the shadow stack for
+            // the call and written back with `set_call_error`. A tracer error
+            // replaces it, matching `except` replacing the in-flight error.
+            let mut parked = crate::call::take_call_error();
+            let parked_base = parked.as_ref().map(|err| {
+                let base = pyre_object::gc_roots::publish_roots(&[
+                    err.exc_object,
+                    err.w_name_context,
+                    err.w_obj_context,
+                ]);
+                pyre_object::gc_roots::normalize_roots(base, 3);
+                base
+            });
+            let exc_children = parked
+                .as_ref()
+                .and_then(|err| pin_unmanaged_exception_children(err.exc_object));
             let traced = unsafe {
                 (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable())
             };
-            if parked {
-                crate::call::unpark_call_error();
+            if let Some(mut err) = parked.take() {
+                if let Some(base) = parked_base {
+                    err.exc_object = pyre_object::gc_roots::shadow_stack_get(base);
+                    err.w_name_context = pyre_object::gc_roots::shadow_stack_get(base + 1);
+                    err.w_obj_context = pyre_object::gc_roots::shadow_stack_get(base + 2);
+                }
+                if let Some((child_base, offsets)) = exc_children {
+                    write_unmanaged_exception_children(err.exc_object, child_base, offsets);
+                }
+                crate::call::set_call_error(err);
             }
             if let Err(trace_err) = traced {
                 crate::call::set_call_error(trace_err);
@@ -16404,7 +16474,9 @@ pub(crate) unsafe fn int_as_base(obj: PyObjectRef) -> PyObjectRef {
 ///
 /// # Safety
 /// `w_obj` must be a live object.
-pub unsafe fn index_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+pub unsafe fn index_fast_path(
+    w_obj: PyObjectRef,
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
     unsafe {
         if w_obj.is_null() || pyre_object::pyobject::is_int_or_long(w_obj) {
             return None;
@@ -16415,10 +16487,11 @@ pub unsafe fn index_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, P
         if version_tag == 0 {
             return None;
         }
-        if type_attr_stored_is_cell(w_type, Wtf8::new("__index__")) {
-            return None;
-        }
-        Some((w_type, version_tag, method))
+        // An in-place `ObjectMutableCell` write does not move `version_tag`, so
+        // the tag alone does not make `method` green.  Hand the cell back and
+        // let the caller pay [`type_attr_object_cell`]'s getfield and guard.
+        let cell = type_attr_object_cell(w_type, Wtf8::new("__index__"));
+        Some((w_type, version_tag, method, cell))
     }
 }
 

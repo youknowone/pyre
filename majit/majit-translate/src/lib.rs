@@ -3101,6 +3101,111 @@ mod portal_driver_tests {
         assert!(call_control.jitcodes().contains_key(&portal));
     }
 
+    /// A portal whose body calls a `dyn` method: one family with a
+    /// registered impl, one with none. The public `CodeWriter::make_jitcodes`
+    /// must lower both before jtransform, the unregistered one to the
+    /// unknown family.
+    #[test]
+    fn codewriter_make_jitcodes_lowers_indirect_calls() {
+        let handler_impl = |name: &str| {
+            let mut graph = FunctionGraph::new(name);
+            graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "self".to_string(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, None);
+            graph
+        };
+        let mut call_control = call::CallControl::new();
+        call_control.register_trait_method("run", Some("Handler"), "A", handler_impl("A::run"));
+        let portal = CallPath::from_segments(["fixture", "portal"]);
+        let mut graph = FunctionGraph::new("portal");
+        let receiver = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "handler".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        for (trait_root, method) in [("Handler", "run"), ("Unregistered", "go")] {
+            graph.push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::indirect(trait_root, method),
+                    args: crate::model::call_args(vec![receiver.clone()]),
+                    result_ty: ValueType::Void,
+                },
+                true,
+            );
+        }
+        graph.set_return(graph.startblock, None);
+        call_control.register_function_graph(portal.clone(), graph);
+        let config = pipeline::PipelineConfig {
+            transform: GraphTransformConfig::default(),
+            jit_drivers: vec![driver(portal.clone())],
+            register_trait_families: Vec::new(),
+            helper_graphs: Vec::new(),
+        };
+        register_configured_jitdrivers(
+            &mut call_control,
+            &config.jit_drivers,
+            &config.transform.jitdriver_receiver_roots,
+        );
+        let mut policy = policy::DefaultJitPolicy::new();
+        call_control.find_all_graphs(&mut policy);
+
+        let mut codewriter = codewriter::CodeWriter::new();
+        let all = codewriter.make_jitcodes(&mut call_control, &config.transform);
+        assert!(all.by_path.contains_key(&portal));
+
+        // The in-place pass fills `Handler::run` with its one registered
+        // impl and leaves `Unregistered::go` as a `CallTarget::Indirect`.
+        let stored = call_control
+            .function_graphs()
+            .get(&portal)
+            .expect("portal graph stays registered");
+        let ops: Vec<_> = stored
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        let filled: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::IndirectCall {
+                    graphs, family_key, ..
+                } => Some((graphs.clone(), family_key.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            filled,
+            vec![(Some(vec![CallPath::from_segments(["A", "run"])]), None)],
+            "Handler::run must keep A::run as its only candidate"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Indirect { trait_root, method_name },
+                    ..
+                } if trait_root == "Unregistered" && method_name == "go"
+            )),
+            "Unregistered::go must stay an unresolved indirect call"
+        );
+    }
+
     #[test]
     fn make_jitcodes_keeps_explicit_driver_reds_from_marker_callsite() {
         use crate::codewriter::flatten::FlatOp;

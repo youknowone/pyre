@@ -1592,7 +1592,11 @@ pub fn translate_op(
                     "translate_op: allocation owner {owner:?} is not a known struct root: {e}"
                 ))
             })?;
-            let host = bk.intern_class_by_qualname(owner);
+            // Same call-site wrapper as `SyntheticTransparentCtor`: the
+            // constant stays the canonical class for annotation, and
+            // `ClassesPBCRepr.redispatch_call` allocates with
+            // `rtype_new_instance` without dispatching a seeded `__init__`.
+            let host = HostObject::new_transparent_class_ctor(bk.intern_class_by_qualname(owner));
             let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(host)));
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
@@ -9007,6 +9011,17 @@ mod tests {
             .expect("both allocation variants must reach the rtyper as a typed constructor");
             assert_eq!(translated.len(), 1);
             assert_eq!(translated[0].opname, "simple_call");
+            let crate::flowspace::model::Hlvalue::Constant(ref callable) = translated[0].args[0]
+            else {
+                panic!("allocation callable must be a Constant");
+            };
+            let crate::flowspace::model::ConstValue::HostObject(ref host) = callable.value else {
+                panic!("allocation callable must be a HostObject");
+            };
+            assert!(
+                host.transparent_class_target().is_some(),
+                "New/NewWithVtable must keep the transparent-ctor marker"
+            );
         }
     }
 

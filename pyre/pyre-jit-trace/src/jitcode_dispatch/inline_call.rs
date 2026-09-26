@@ -5379,7 +5379,16 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
                 )))
             }
         }
-        DispatchOutcome::Terminate => Ok(Some((DispatchOutcome::Terminate, op.next_pc))),
+        DispatchOutcome::Terminate {
+            finish_arg,
+            finish_arg_type,
+        } => Ok(Some((
+            DispatchOutcome::Terminate {
+                finish_arg,
+                finish_arg_type,
+            },
+            op.next_pc,
+        ))),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -5728,7 +5737,16 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
                 )))
             }
         }
-        DispatchOutcome::Terminate => Ok(Some((DispatchOutcome::Terminate, op.next_pc))),
+        DispatchOutcome::Terminate {
+            finish_arg,
+            finish_arg_type,
+        } => Ok(Some((
+            DispatchOutcome::Terminate {
+                finish_arg,
+                finish_arg_type,
+            },
+            op.next_pc,
+        ))),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -10914,7 +10932,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((w_type, version_tag, map, w_getattribute)) = (unsafe {
+    let Some((w_type, version_tag, map, w_getattribute, attr_cell)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::getattribute_hook_fast_path(concrete_obj)
     }) else {
         return Ok(None);
@@ -10939,6 +10957,12 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, version_tag, map)?;
+    // The version-tag pin above does not cover an in-place cell write.  Same
+    // getfield and `guard_value` as [`super::walker_promote_object_mutable_cell`]
+    // on `ExceptionInlineReceiverGuard::attr_cell`.
+    if !attr_cell.is_null() {
+        super::walker_promote_object_mutable_cell(ctx, op.pc, attr_cell, w_getattribute)?;
+    }
     if let Some(field) = wrapper_field {
         walker_pin_descriptor_slot(ctx, op.pc, w_getattribute, field.quasi_descr())?;
     }
@@ -11035,7 +11059,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((w_type, version_tag, map, w_getattr)) = (unsafe {
+    let Some((w_type, version_tag, map, w_getattr, attr_cell)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::getattr_hook_fast_path(concrete_obj, &name)
     }) else {
         return Ok(None);
@@ -11082,6 +11106,12 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     // Both pins the oracle asked for, plus the layout guard its map read needs.
     walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, version_tag, map)?;
+    // The version-tag pin above does not cover an in-place cell write.  Same
+    // getfield and `guard_value` as [`super::walker_promote_object_mutable_cell`]
+    // on `ExceptionInlineReceiverGuard::attr_cell`.
+    if !attr_cell.is_null() {
+        super::walker_promote_object_mutable_cell(ctx, op.pc, attr_cell, w_getattr)?;
+    }
     // The pins above make the DESCRIPTOR a constant; they say nothing about the
     // callable inside it.  Re-initialising an installed wrapper swaps
     // `w_function` without touching the owner type's version tag, which is the
@@ -11310,6 +11340,7 @@ pub(crate) struct IndexInlineCandidate {
     w_type: pyre_object::PyObjectRef,
     version_tag: u64,
     method: pyre_object::PyObjectRef,
+    attr_cell: pyre_object::PyObjectRef,
     w_code: *const (),
     nparams: usize,
     has_closure: bool,
@@ -11346,7 +11377,7 @@ pub(crate) fn prepare_walker_inline_index<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || ctx.fbw_mode.inline_subwalk {
         return None;
     }
-    let (w_type, version_tag, method) =
+    let (w_type, version_tag, method, attr_cell) =
         unsafe { pyre_interpreter::baseobjspace::index_fast_path(concrete_arg) }?;
     let (w_code, nparams, has_closure) = unsafe { resolve_inlinable_callee(method) }?;
     // `get_and_call_function(w_impl, w_obj)` supplies exactly `self`.
@@ -11405,6 +11436,7 @@ pub(crate) fn prepare_walker_inline_index<Sym: WalkSym>(
         w_type,
         version_tag,
         method,
+        attr_cell,
         w_code,
         nparams,
         has_closure,
@@ -11429,10 +11461,12 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         w_type,
         version_tag,
         method,
+        attr_cell,
         w_code,
         nparams,
         has_closure,
     } = candidate;
+    let cell_guard = (!attr_cell.is_null()).then_some((attr_cell, method));
     let arg_concretes = vec![
         ConcreteValue::Ref(method),
         ConcreteValue::Null,
@@ -11460,7 +11494,7 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((arg, concrete_arg, w_type, version_tag, None)),
+        Some((arg, concrete_arg, w_type, version_tag, cell_guard)),
         None,
         // This method call is nested inside `range(...)`, not represented by
         // a caller bytecode CALL of its own.
@@ -11769,7 +11803,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj_op) else {
         return Ok(None);
     };
-    let Some((w_type, version_tag, w_iter)) =
+    let Some((w_type, version_tag, w_iter, attr_cell)) =
         (unsafe { pyre_interpreter::baseobjspace::iter_fast_path(concrete_obj) })
     else {
         return Ok(None);
@@ -11802,12 +11836,21 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
     let _ = pyre_object::gc_roots::pin_root(w_type);
     let iter_root = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_iter);
+    let cell_root = (!attr_cell.is_null()).then(|| {
+        let cell_root = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(attr_cell);
+        cell_root
+    });
     let code_root = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
 
     let concrete_obj = pyre_object::gc_roots::shadow_stack_get(obj_root);
     let w_type = pyre_object::gc_roots::shadow_stack_get(type_root);
     let w_iter = pyre_object::gc_roots::shadow_stack_get(iter_root);
+    let attr_cell = cell_root.map_or(std::ptr::null_mut(), |cell_root| {
+        pyre_object::gc_roots::shadow_stack_get(cell_root)
+    });
+    let cell_guard = (!attr_cell.is_null()).then_some((attr_cell, w_iter));
     let w_code = pyre_object::gc_roots::shadow_stack_get(code_root) as *const ();
 
     let iter_const = ctx.trace_ctx.const_ref(w_iter as i64);
@@ -11836,7 +11879,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((obj_op, concrete_obj, w_type, version_tag, None)),
+        Some((obj_op, concrete_obj, w_type, version_tag, cell_guard)),
         None,
         // GET_ITER consumes one iterable and produces one iterator. Its
         // caller-operand shape is recorded by `caller_operand_slots`, so the
@@ -11929,7 +11972,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     let Some(iter_obj) = walker_concrete_ref_object(ctx, iter_op) else {
         return Ok(None);
     };
-    let Some((w_type, version_tag, w_next)) =
+    let Some((w_type, version_tag, w_next, attr_cell)) =
         (unsafe { pyre_interpreter::baseobjspace::next_fast_path(iter_obj) })
     else {
         return Ok(None);
@@ -11962,12 +12005,21 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     let _ = pyre_object::gc_roots::pin_root(w_type);
     let next_root = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_next);
+    let cell_root = (!attr_cell.is_null()).then(|| {
+        let cell_root = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(attr_cell);
+        cell_root
+    });
     let code_root = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
 
     let iter_obj = pyre_object::gc_roots::shadow_stack_get(iter_root);
     let w_type = pyre_object::gc_roots::shadow_stack_get(type_root);
     let w_next = pyre_object::gc_roots::shadow_stack_get(next_root);
+    let attr_cell = cell_root.map_or(std::ptr::null_mut(), |cell_root| {
+        pyre_object::gc_roots::shadow_stack_get(cell_root)
+    });
+    let cell_guard = (!attr_cell.is_null()).then_some((attr_cell, w_next));
     let w_code = pyre_object::gc_roots::shadow_stack_get(code_root) as *const ();
     let iter_layout = unsafe { (*iter_obj).ob_type } as i64;
     if !iter_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(iter_op) {
@@ -12011,7 +12063,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((iter_op, iter_obj, w_type, version_tag, None)),
+        Some((iter_op, iter_obj, w_type, version_tag, cell_guard)),
         None,
         true,
         false,
@@ -15925,7 +15977,16 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
             }
         }
-        DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
+        DispatchOutcome::Terminate {
+            finish_arg,
+            finish_arg_type,
+        } => Ok((
+            DispatchOutcome::Terminate {
+                finish_arg,
+                finish_arg_type,
+            },
+            op.next_pc,
+        )),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -16396,7 +16457,16 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
             }
         }
-        DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
+        DispatchOutcome::Terminate {
+            finish_arg,
+            finish_arg_type,
+        } => Ok((
+            DispatchOutcome::Terminate {
+                finish_arg,
+                finish_arg_type,
+            },
+            op.next_pc,
+        )),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -16620,7 +16690,16 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
             }
         }
-        DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
+        DispatchOutcome::Terminate {
+            finish_arg,
+            finish_arg_type,
+        } => Ok((
+            DispatchOutcome::Terminate {
+                finish_arg,
+                finish_arg_type,
+            },
+            op.next_pc,
+        )),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,

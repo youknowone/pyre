@@ -600,7 +600,8 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 }
                 fbw_publish_exit_last_instr(&mut wc, position);
                 fbw_store_token_in_vable(&mut wc, position)?;
-                fbw_terminate_with_raise(seed.exc, seed.exc_concrete);
+                let (finish_arg, finish_arg_type) =
+                    fbw_terminate_with_raise(&wc, seed.exc, seed.exc_concrete);
                 carrier_raise_escapes = true;
                 position
             }
@@ -653,7 +654,18 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             position
         };
         let outcome = if carrier_raise_escapes {
-            Ok((DispatchOutcome::Terminate, walk_position))
+            let (finish_arg, finish_arg_type) = wc
+                .session
+                .borrow()
+                .finish_payload
+                .unwrap_or((OpRef::NONE, majit_ir::Type::Void));
+            Ok((
+                DispatchOutcome::Terminate {
+                    finish_arg,
+                    finish_arg_type,
+                },
+                walk_position,
+            ))
         } else {
             // This walk's Ref bank is a local, not the anchored
             // `sym.registers_r`, so publish it for the length of the walk or a

@@ -770,6 +770,11 @@ pub struct TraceCtx {
     /// Only `resume.py`'s box reader can raise it: the recording-only walk has
     /// nothing to apply and leaves it false.
     pub(crate) bridge_replay_incomplete: bool,
+    /// Set while this tracing session runs a residual or rebuilt callee that
+    /// re-enters the portal. `JitDriver::jit_merge_point_keyed` must not start
+    /// a nested trace on the same `TraceCtx` (`MIFrame.do_recursive_call`
+    /// stays on this metainterp instead of a second tracer).
+    pub trace_continuation_suspended: std::cell::Cell<bool>,
 }
 
 /// A decoded-but-not-yet-built description of one inlined
@@ -1972,6 +1977,7 @@ impl TraceCtx {
             bridge_reg_indices: None,
             bridge_source_is_exception_guard: false,
             bridge_replay_incomplete: false,
+            trace_continuation_suspended: std::cell::Cell::new(false),
         }
     }
 
@@ -2048,6 +2054,7 @@ impl TraceCtx {
             bridge_reg_indices: None,
             bridge_source_is_exception_guard: false,
             bridge_replay_incomplete: false,
+            trace_continuation_suspended: std::cell::Cell::new(false),
         }
     }
 

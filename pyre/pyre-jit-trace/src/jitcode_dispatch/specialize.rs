@@ -3724,6 +3724,7 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
         shadow,
         dst,
         dst_bank,
+        None,
     )?;
     Ok(Some(()))
 }
@@ -3810,7 +3811,7 @@ pub(crate) fn try_walker_specialize_load_special_method<Sym: WalkSym>(
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
         return Ok(None);
     };
-    let Some((w_type, _version_tag, w_descr)) =
+    let Some((w_type, _version_tag, w_descr, attr_cell)) =
         (unsafe { pyre_interpreter::baseobjspace::load_special_fast_path(concrete_obj, name) })
     else {
         return Ok(None);
@@ -3819,6 +3820,7 @@ pub(crate) fn try_walker_specialize_load_special_method<Sym: WalkSym>(
     let Some(header) = super_attr_method_header(w_descr) else {
         return Ok(None);
     };
+    let cell_guard = (!attr_cell.is_null()).then_some((attr_cell, w_descr));
     walker_emit_constant_descr_bound_method(
         ctx,
         op_pc,
@@ -3830,6 +3832,7 @@ pub(crate) fn try_walker_specialize_load_special_method<Sym: WalkSym>(
         None,
         dst,
         dst_bank,
+        cell_guard,
     )?;
     Ok(Some(()))
 }
@@ -3862,6 +3865,7 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
     shadow: Option<ShadowGuard>,
     dst: usize,
     dst_bank: char,
+    attr_cell: Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>,
 ) -> Result<(), DispatchError> {
     let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
@@ -3885,6 +3889,11 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
         .replace_box(w_class_op, w_type_const);
 
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+    // The version-tag pin does not cover an in-place cell write.  Same
+    // getfield and `guard_value` as `ExceptionInlineReceiverGuard`'s attr_cell.
+    if let Some((cell, expected)) = attr_cell {
+        super::walker_promote_object_mutable_cell(ctx, op_pc, cell, expected)?;
+    }
 
     if let Some(shadow) = shadow {
         walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
@@ -11503,6 +11512,7 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
             shadow,
             dst,
             'r',
+            None,
         )?;
         return Ok(Some(()));
     }

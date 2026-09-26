@@ -787,6 +787,14 @@ pub struct WalkSession {
     /// [`fbw_state::BinopRewindInlineGuard`] and cleared when it unwinds, so it
     /// never carries a position from a region that has already ended.
     pub binop_rewind_fresh_from: Option<u32>,
+    /// FINISH operand of a top-level portal exit (`N_aryOp._args`).
+    ///
+    /// The same pair rides [`DispatchOutcome::Terminate`] back to
+    /// `full_body_walk_trace`. This field is the copy `walk_session_roots`
+    /// forwards when the operand is a `ConstPtr`, so a collection between
+    /// the return and the compile `FINISH` does not leave the outcome's
+    /// address stale.
+    pub finish_payload: Option<(OpRef, majit_ir::Type)>,
 }
 
 impl Default for WalkSession {
@@ -814,6 +822,7 @@ impl Default for WalkSession {
             binop_rewind_depth: 0,
             binop_rewind_refused: false,
             binop_rewind_fresh_from: None,
+            finish_payload: None,
         }
     }
 }
@@ -2189,7 +2198,15 @@ pub enum DispatchOutcome {
     /// Trace ends here. The arm produced a final `ref_return`/`raise`
     /// equivalent at the top-level frame and no further bytes should
     /// be walked.
-    Terminate,
+    ///
+    /// `finish_arg` / `finish_arg_type` are the FINISH operand
+    /// (`N_aryOp._args`). `Type::Void` is a `void_return/` with no
+    /// operand (`OpRef::NONE`). A raised exit is the same `Type::Ref`
+    /// operand distinguished by [`fbw_finish_is_exception`].
+    Terminate {
+        finish_arg: OpRef,
+        finish_arg_type: Type,
+    },
     /// Sub-walk frame returned with a result OpRef (Some) or void
     /// (None — no `>X` slot in the callee's `*_return` op). Surfaced
     /// only when `WalkContext::is_top_level == false`. The caller's
@@ -2424,7 +2441,16 @@ impl PartialEq for DispatchOutcome {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Continue, Self::Continue) => true,
-            (Self::Terminate, Self::Terminate) => true,
+            (
+                Self::Terminate {
+                    finish_arg: a_arg,
+                    finish_arg_type: a_ty,
+                },
+                Self::Terminate {
+                    finish_arg: b_arg,
+                    finish_arg_type: b_ty,
+                },
+            ) => a_arg == b_arg && a_ty == b_ty,
             (Self::SubReturn { result: a }, Self::SubReturn { result: b }) => a == b,
             (
                 Self::SubRaise {
@@ -3868,7 +3894,7 @@ pub fn walk<Sym: WalkSym>(
         }
         match outcome {
             DispatchOutcome::Continue => {}
-            DispatchOutcome::Terminate
+            DispatchOutcome::Terminate { .. }
             | DispatchOutcome::SubReturn { .. }
             | DispatchOutcome::SwitchToBlackhole { .. }
             | DispatchOutcome::CloseLoop { .. }
@@ -4046,8 +4072,15 @@ pub fn walk<Sym: WalkSym>(
                     // records the FINISH once against
                     // `exit_frame_with_exception_descr`.  Recording it here too
                     // would double it.
-                    fbw_terminate_with_raise(exc, exc_concrete);
-                    return Ok((DispatchOutcome::Terminate, pc));
+                    let (finish_arg, finish_arg_type) =
+                        fbw_terminate_with_raise(ctx, exc, exc_concrete);
+                    return Ok((
+                        DispatchOutcome::Terminate {
+                            finish_arg,
+                            finish_arg_type,
+                        },
+                        pc,
+                    ));
                 } else {
                     if !recording_raise_keeps_existing_traceback(ctx, opcode_position) {
                         // Emit the node at runtime as well as applying it for
@@ -6974,6 +7007,9 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
         }
     }
     session.tmpreg_r.walk_const_ptr_refs_mut(visitor);
+    if let Some((value, _)) = session.finish_payload.as_mut() {
+        value.walk_const_ptr_refs_mut(visitor);
+    }
     if let ConcreteValue::Ref(value) = &mut session.tmpreg_r_concrete {
         walk_ptr(value, visitor);
     }
@@ -7094,23 +7130,6 @@ pub unsafe fn fbw_finish_concrete_root_walker_area(
         } else {
             FinishConcrete::Return(value)
         }));
-    }
-}
-
-/// # Safety
-/// `data` must come from [`capture_fbw_finish_payload_root_area`], and the
-/// owning thread must be quiesced.
-pub unsafe fn fbw_finish_payload_root_walker_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
-    let cell = unsafe { &*(data as *const std::cell::Cell<Option<(OpRef, Type)>>) };
-    let Some((payload, ty)) = cell.get() else {
-        return;
-    };
-    if let OpRef::ConstPtr(mut gcref) = payload {
-        visitor(&mut gcref);
-        cell.set(Some((OpRef::ConstPtr(gcref), ty)));
     }
 }
 
@@ -12671,11 +12690,18 @@ fn handle<Sym: WalkSym>(
                             ));
                         }
                     }
-                    fbw_terminate_with_finish(ctx, yielded, op.pc)?;
+                    let (finish_arg, finish_arg_type) =
+                        fbw_terminate_with_finish(ctx, yielded, op.pc)?;
                     // After the finish's own `last_instr` store, so the hint
                     // flushes the yield coordinate and the popped depth.
                     flush_yield_exit(ctx, yield_py_pc);
-                    return Ok((DispatchOutcome::Terminate, op.next_pc));
+                    return Ok((
+                        DispatchOutcome::Terminate {
+                            finish_arg,
+                            finish_arg_type,
+                        },
+                        op.next_pc,
+                    ));
                 }
                 return Ok((
                     DispatchOutcome::SubReturn {
@@ -13526,9 +13552,15 @@ fn handle<Sym: WalkSym>(
                         fbw_finish_concrete_set(ConcreteValue::Ref(ptr));
                     }
                 }
-                fbw_terminate_with_finish(ctx, result, op.pc)?;
+                let (finish_arg, finish_arg_type) = fbw_terminate_with_finish(ctx, result, op.pc)?;
                 commit_top_level_frame_finished(ctx);
-                Ok((DispatchOutcome::Terminate, op.next_pc))
+                Ok((
+                    DispatchOutcome::Terminate {
+                        finish_arg,
+                        finish_arg_type,
+                    },
+                    op.next_pc,
+                ))
             } else {
                 Ok((
                     DispatchOutcome::SubReturn {
@@ -13567,9 +13599,15 @@ fn handle<Sym: WalkSym>(
                 if let ConcreteValue::Int(v) = read_int_reg_concrete(code, op, 0, ctx) {
                     fbw_finish_concrete_set(ConcreteValue::Int(v));
                 }
-                fbw_terminate_with_finish(ctx, result, op.pc)?;
+                let (finish_arg, finish_arg_type) = fbw_terminate_with_finish(ctx, result, op.pc)?;
                 commit_top_level_frame_finished(ctx);
-                Ok((DispatchOutcome::Terminate, op.next_pc))
+                Ok((
+                    DispatchOutcome::Terminate {
+                        finish_arg,
+                        finish_arg_type,
+                    },
+                    op.next_pc,
+                ))
             } else {
                 Ok((
                     DispatchOutcome::SubReturn {
@@ -13591,9 +13629,15 @@ fn handle<Sym: WalkSym>(
             finish_current_frame_execution(ctx, op.pc);
             if ctx.is_top_level {
                 fbw_finish_concrete_set(ConcreteValue::Int(value));
-                fbw_terminate_with_finish(ctx, result, op.pc)?;
+                let (finish_arg, finish_arg_type) = fbw_terminate_with_finish(ctx, result, op.pc)?;
                 commit_top_level_frame_finished(ctx);
-                Ok((DispatchOutcome::Terminate, op.next_pc))
+                Ok((
+                    DispatchOutcome::Terminate {
+                        finish_arg,
+                        finish_arg_type,
+                    },
+                    op.next_pc,
+                ))
             } else {
                 Ok((
                     DispatchOutcome::SubReturn {
@@ -13621,9 +13665,15 @@ fn handle<Sym: WalkSym>(
                 if let Some(majit_ir::Value::Float(v)) = ctx.trace_ctx.box_value(result) {
                     fbw_finish_concrete_set(ConcreteValue::Float(v));
                 }
-                fbw_terminate_with_finish(ctx, result, op.pc)?;
+                let (finish_arg, finish_arg_type) = fbw_terminate_with_finish(ctx, result, op.pc)?;
                 commit_top_level_frame_finished(ctx);
-                Ok((DispatchOutcome::Terminate, op.next_pc))
+                Ok((
+                    DispatchOutcome::Terminate {
+                        finish_arg,
+                        finish_arg_type,
+                    },
+                    op.next_pc,
+                ))
             } else {
                 Ok((
                     DispatchOutcome::SubReturn {
@@ -13664,9 +13714,15 @@ fn handle<Sym: WalkSym>(
                 // returns directly instead of re-running its already
                 // applied effects.
                 fbw_finish_concrete_set(ConcreteValue::Null);
-                fbw_terminate_void_with_finish(ctx, op.pc)?;
+                let (finish_arg, finish_arg_type) = fbw_terminate_void_with_finish(ctx, op.pc)?;
                 commit_top_level_frame_finished(ctx);
-                Ok((DispatchOutcome::Terminate, op.next_pc))
+                Ok((
+                    DispatchOutcome::Terminate {
+                        finish_arg,
+                        finish_arg_type,
+                    },
+                    op.next_pc,
+                ))
             } else {
                 Ok((DispatchOutcome::SubReturn { result: None }, op.next_pc))
             }

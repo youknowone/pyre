@@ -6156,6 +6156,41 @@ impl ClassesPBCRepr {
         Ok((access, class_repr))
     }
 
+    /// RPython `ClassesPBCRepr.replace_class_with_inst_arg(self, hop,
+    /// v_inst, s_inst, call_args)` (rpbc.py):
+    ///
+    /// ```python
+    /// def replace_class_with_inst_arg(self, hop, v_inst, s_inst, call_args):
+    ///     hop2 = hop.copy()
+    ///     hop2.r_s_popfirstarg()   # discard the class pointer argument
+    ///     if call_args:
+    ///         _, s_shape = hop2.r_s_popfirstarg() # temporarely remove shape
+    ///         hop2.v_s_insertfirstarg(v_inst, s_inst)  # add 'instance'
+    ///         adjust_shape(hop2, s_shape)
+    ///     else:
+    ///         hop2.v_s_insertfirstarg(v_inst, s_inst)  # add 'instance'
+    ///     return hop2
+    /// ```
+    fn replace_class_with_inst_arg(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+        v_inst: crate::flowspace::model::Hlvalue,
+        s_inst: crate::annotator::model::SomeValue,
+        call_args: bool,
+    ) -> Result<crate::translator::rtyper::rtyper::HighLevelOp, TyperError> {
+        // upstream: `hop2 = hop.copy(); hop2.r_s_popfirstarg()`.
+        let hop2 = hop.copy();
+        hop2.r_s_popfirstarg();
+        if call_args {
+            let (_, s_shape) = hop2.r_s_popfirstarg();
+            hop2.v_s_insertfirstarg(v_inst, s_inst)?;
+            adjust_shape(&hop2, &s_shape)?;
+        } else {
+            hop2.v_s_insertfirstarg(v_inst, s_inst)?;
+        }
+        Ok(hop2)
+    }
+
     /// RPython `ClassesPBCRepr.redispatch_call(self, hop, call_args)`
     /// (rpbc.py:1006-1061):
     ///
@@ -6193,15 +6228,14 @@ impl ClassesPBCRepr {
     ///     return v_instance
     /// ```
     ///
-    /// Only the single-class, `Void`-lowleveltype arm with no `__init__`
-    /// is ported (the shape produced by transparent-ctor instantiation).
-    /// The multi-class arm, the non-`Void` single-class arm (upstream
-    /// `assert 0`), and the `__init__` dispatch arm raise a descriptive
-    /// error citing the upstream lines they cover.
+    /// The single-class `Void` arm is ported, including a class that has
+    /// `__init__` (`replace_class_with_inst_arg` then `hop2.dispatch`).
+    /// The multi-class arm and the non-`Void` single-class arm (upstream
+    /// `assert 0`) raise a descriptive error citing the lines they cover.
     pub fn redispatch_call(
         &self,
         hop: &crate::translator::rtyper::rtyper::HighLevelOp,
-        _call_args: bool,
+        call_args: bool,
     ) -> crate::translator::rtyper::rmodel::RTypeResult {
         use crate::annotator::classdesc::ClassDef;
         use crate::annotator::classdesc::ClassDesc;
@@ -6230,12 +6264,17 @@ impl ClassesPBCRepr {
                 "single non-Void class instantiation (rpbc.py:1037-1038)",
             ));
         }
-        // upstream `assert isinstance(s_instance, annmodel.SomeInstance);
+        // upstream `s_instance = hop.s_result` then
+        // `assert isinstance(s_instance, annmodel.SomeInstance);
         // classdef = s_instance.classdef`.
-        let s_result = hop.s_result.borrow().clone();
-        let classdef = match s_result {
-            Some(SomeValue::Instance(si)) => match si.classdef {
-                Some(cd) => cd,
+        let s_instance = hop
+            .s_result
+            .borrow()
+            .clone()
+            .ok_or_else(|| unported("s_result is not a SomeInstance"))?;
+        let classdef = match &s_instance {
+            SomeValue::Instance(si) => match &si.classdef {
+                Some(cd) => cd.clone(),
                 None => return Err(unported("object-only instance (classdef=None)")),
             },
             _ => return Err(unported("s_result is not a SomeInstance")),
@@ -6265,10 +6304,8 @@ impl ClassesPBCRepr {
             TyperError::message("ClassesPBCRepr.redispatch_call: rtyper weak ref dropped")
         })?;
 
-        // Ported envelope gates (each a graceful known-unported skip):
-        //  - has `__init__` ⇒ the rpbc.py dispatch arm is not
-        //    ported (would need `replace_class_with_inst_arg`);
-        //  - `classdef.minid` unset ⇒ `assign_inheritance_ids` has not
+        // Ported envelope gate: `classdef.minid` unset ⇒
+        // `assign_inheritance_ids` has not
         //    numbered this class, so `getvtable` (rclass.py) cannot
         //    bake the subclass range.  The session prologue numbers only
         //    the struct-root + standard-exception prefix; enum-variant
@@ -6311,8 +6348,38 @@ impl ClassesPBCRepr {
             return Ok(Some(v_instance));
         }
 
+        // upstream `ClassesPBCRepr.redispatch_call` — a class with
+        // `__init__` allocates, then `hop2.dispatch()` runs the init
+        // function as `simple_call(initfunc, instance, args...)`.
         if !init_is_impossible {
-            return Err(unported("class has __init__ (rpbc.py:1060-1067)"));
+            let v_instance = {
+                let mut llops = hop.llops.borrow_mut();
+                crate::translator::rtyper::rclass::rtype_new_instance(
+                    &rtyper,
+                    Some(&classdef),
+                    &mut llops,
+                    Some(hop),
+                    false,
+                )?
+            };
+            // upstream `v_init = Constant("init-func-dummy")` — the
+            // value is not read; `inputarg` re-converts it through the
+            // init function's repr.
+            let v_init = crate::flowspace::model::Hlvalue::Constant(
+                crate::flowspace::model::Constant::with_concretetype(
+                    crate::flowspace::model::ConstValue::byte_str("init-func-dummy"),
+                    crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+                ),
+            );
+            let hop2 =
+                self.replace_class_with_inst_arg(hop, v_instance.clone(), s_instance, call_args)?;
+            hop2.v_s_insertfirstarg(v_init, s_init)?;
+            let s_none = crate::annotator::model::s_none();
+            let r_none = rtyper.getrepr(&s_none)?;
+            *hop2.s_result.borrow_mut() = Some(s_none);
+            *hop2.r_result.borrow_mut() = Some(r_none);
+            hop2.dispatch()?;
+            return Ok(Some(v_instance));
         }
 
         // upstream rpbc.py:1024-1035 — simple built-in exception special
@@ -9270,6 +9337,165 @@ mod pbc_repr_tests {
         let err = r.get_access_set("nonexistent").unwrap_err();
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("nonexistent"));
+    }
+
+    /// Single-class instantiation whose class has `__init__`
+    /// (`ClassesPBCRepr.redispatch_call`): the lowered ops malloc the
+    /// instance and `direct_call` the init graph with that instance as
+    /// the first argument.
+    #[test]
+    fn classes_pbc_repr_simple_call_with_init_mallocs_then_direct_calls_init() {
+        use crate::annotator::argument::ArgumentsForTranslation;
+        use crate::annotator::classdesc::{ClassDesc, ClassDictEntry};
+        use crate::annotator::description::GraphCacheKey;
+        use crate::annotator::model::{SomeInstance, SomeValue};
+        use crate::flowspace::model::{BlockRefExt, Hlvalue, HostObject, SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+        use std::cell::RefCell as StdRef;
+
+        let (ann, rtyper) = make_rtyper();
+        let host = HostObject::new_class("pkg.C", vec![]);
+        let class_entry = ann.bookkeeper.getdesc(&host).expect("getdesc");
+        let DescEntry::Class(class_rc) = &class_entry else {
+            unreachable!();
+        };
+        let classdef = ClassDesc::getuniqueclassdef(class_rc).expect("getuniqueclassdef");
+        {
+            let mut cd = classdef.borrow_mut();
+            cd.minid = Some(2);
+            cd.maxid = Some(3);
+        }
+        let s_inst = SomeValue::Instance(SomeInstance::new(
+            Some(classdef.clone()),
+            false,
+            Default::default(),
+        ));
+
+        let sig = crate::flowspace::argument::Signature::new(vec!["self".to_string()], None, None);
+        let fd = Rc::new(StdRefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "__init__",
+            sig,
+            None,
+            None,
+        )));
+        let init_graph = {
+            let arg_var = Variable::named("self");
+            arg_var.annotation.replace(Some(Rc::new(s_inst.clone())));
+            let arg = Hlvalue::Variable(arg_var);
+            let startblock = crate::flowspace::model::Block::shared(vec![arg.clone()]);
+            let ret_var = Variable::new();
+            ret_var
+                .annotation
+                .replace(Some(Rc::new(crate::annotator::model::s_none())));
+            let graph = crate::flowspace::model::FunctionGraph::with_return_var(
+                "__init__",
+                startblock.clone(),
+                Hlvalue::Variable(ret_var),
+            );
+            let link = Rc::new(StdRef::new(crate::flowspace::model::Link::new(
+                vec![arg],
+                Some(graph.returnblock.clone()),
+                None,
+            )));
+            startblock.closeblock(vec![link]);
+            Rc::new(PyGraph {
+                graph: Rc::new(StdRef::new(graph)),
+                func: crate::flowspace::model::GraphFunc::new(
+                    "__init__",
+                    crate::flowspace::model::Constant::new(ConstValue::Dict(Default::default())),
+                ),
+                signature: StdRef::new(crate::flowspace::argument::Signature::new(
+                    vec!["self".to_string()],
+                    None,
+                    None,
+                )),
+                defaults: StdRef::new(None),
+                access_directly: std::cell::Cell::new(false),
+            })
+        };
+        fd.borrow()
+            .cache
+            .borrow_mut()
+            .insert(GraphCacheKey::None, init_graph.clone());
+        let call_args = ArgumentsForTranslation::new(vec![Some(s_inst.clone())], None, None);
+        FunctionDesc::consider_call_site(
+            std::slice::from_ref(&fd),
+            &call_args,
+            &crate::annotator::model::s_none(),
+            None,
+        )
+        .expect("consider_call_site");
+        class_rc.borrow_mut().classdict.insert(
+            "__init__".into(),
+            ClassDictEntry::Desc(DescEntry::function(fd)),
+        );
+
+        let s_pbc = SomePBC::new(vec![class_entry.clone()], false);
+        let r = ClassesPBCRepr::new(&rtyper, s_pbc.clone()).unwrap();
+        let r_dyn: std::sync::Arc<dyn Repr> = std::sync::Arc::new(r);
+
+        let class_const = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::HostObject(host),
+            LowLevelType::Void,
+        ));
+        let result_h = Hlvalue::Variable(Variable::new());
+        let spaceop = SpaceOperation::new("simple_call", vec![class_const.clone()], result_h);
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        *hop.args_v.borrow_mut() = vec![class_const];
+        *hop.args_s.borrow_mut() = vec![SomeValue::PBC(s_pbc)];
+        *hop.args_r.borrow_mut() = vec![Some(r_dyn.clone())];
+        *hop.s_result.borrow_mut() = Some(s_inst.clone());
+        *hop.r_result.borrow_mut() = Some(
+            crate::translator::rtyper::rclass::getinstancerepr(
+                &rtyper,
+                Some(&classdef),
+                crate::translator::rtyper::rclass::Flavor::Gc,
+            )
+            .expect("getinstancerepr") as std::sync::Arc<dyn Repr>,
+        );
+
+        let result = r_dyn
+            .rtype_simple_call(&hop)
+            .expect("rtype_simple_call with __init__");
+        let Some(Hlvalue::Variable(inst)) = result else {
+            panic!("redispatch_call must return the new instance variable, got {result:?}");
+        };
+
+        let ops = hop.llops.borrow();
+        let malloc = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "malloc")
+            .expect("instance malloc");
+        let Hlvalue::Variable(malloc_v) = &malloc.result else {
+            panic!("malloc result must be a Variable, got {:?}", malloc.result);
+        };
+        assert_eq!(
+            &inst, malloc_v,
+            "returned instance must be the malloc result"
+        );
+        let direct = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "direct_call")
+            .expect("direct_call of __init__");
+        assert!(
+            const_points_at_graph(&direct.args[0], &init_graph),
+            "direct_call target must be the __init__ graph"
+        );
+        let Hlvalue::Variable(call_self) = &direct.args[1] else {
+            panic!(
+                "direct_call first argument must be the new instance, got {:?}",
+                direct.args[1]
+            );
+        };
+        assert_eq!(
+            &inst, call_self,
+            "direct_call's first argument must be the malloc'd instance"
+        );
     }
 
     #[test]

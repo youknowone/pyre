@@ -570,9 +570,11 @@ impl CodeWriter {
 
         // Indirect calls were lowered in place on the graphs `CallControl`
         // owns (`CallControl::lower_registered_indirect_calls`), before this
-        // clone. The clone is the graph jtransform rewrites; it must not
-        // still contain `CallTarget::Indirect`.
+        // clone. That pass leaves a family with no registered impl as a
+        // `CallTarget::Indirect` marker; the clone jtransform rewrites takes
+        // it as the unknown family (`indirect_call` with `graphs=None`).
         let mut graph_owned = graph.clone();
+        crate::translator::rtyper::rpbc::lower_indirect_calls(&mut graph_owned, callcontrol);
         #[cfg(debug_assertions)]
         crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(&graph_owned);
         // Pre-jtransform rtyper fold of unit-variant ctors to singleton
@@ -1038,6 +1040,7 @@ impl CodeWriter {
         // path suffers. The per-graph `dual_gate_publish_concretetypes` then
         // reads the cached result.
         self.run_two_phase_prepass(callcontrol);
+        callcontrol.lower_registered_indirect_calls();
         self.make_jitcodes_pending(callcontrol, config)
     }
 

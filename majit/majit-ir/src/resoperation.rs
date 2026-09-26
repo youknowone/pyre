@@ -2150,30 +2150,17 @@ fn live_arg_len(stored: u8, data: &ArgData) -> usize {
     }
 }
 
-/// Construction-time arg lengths. Nested `ArgSlot::new` (an operand
-/// that itself mints an `Op`) must not clobber the outer `op!` length.
-thread_local! {
-    static ARG_LEN_STACK: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-fn push_arg_len(len: u8) {
-    ARG_LEN_STACK.with(|s| s.borrow_mut().push(len));
-}
-
-fn pop_arg_len() -> u8 {
-    ARG_LEN_STACK.with(|s| s.borrow_mut().pop().unwrap_or(0))
-}
-
 /// `N_aryOp._args` slot. Length is [`Op`]'s `arg_len`; this is the
 /// two-operand union. `UnsafeCell` matches RPython's unrestricted
 /// `op._args[i] = ...` on a shared ResOp.
 pub struct ArgSlot(std::cell::UnsafeCell<ArgData>);
 
 impl ArgSlot {
-    pub fn new(v: OpArgVec) -> Self {
+    /// `N_aryOp.initarglist`: `numargs` is `len(self._args)`, returned with
+    /// the slot so a nested constructor cannot clobber the outer length.
+    pub fn new(v: OpArgVec) -> (Self, u8) {
         let len = store_arg_len(v.len());
-        push_arg_len(len);
-        ArgSlot(std::cell::UnsafeCell::new(Self::pack_data(v)))
+        (ArgSlot(std::cell::UnsafeCell::new(Self::pack_data(v))), len)
     }
 
     fn pack_data(v: OpArgVec) -> ArgData {
@@ -2278,10 +2265,6 @@ impl ArgSlot {
             std::ptr::write(data, Self::pack_data(v));
         }
         new_len
-    }
-
-    pub fn take_last_len() -> u8 {
-        pop_arg_len()
     }
 }
 
@@ -3832,17 +3815,17 @@ impl Clone for Op {
         if stamp != 0 {
             descr.set_stamp_word(stamp);
         }
+        let (args, arg_len) = ArgSlot::new(self.args.clone_vec(self.arg_len_value()));
         let op = Op {
             opcode: self.opcode,
             type_: self.type_,
-            arg_len: std::cell::Cell::new(self.arg_len.get()),
+            arg_len: std::cell::Cell::new(arg_len),
             pos_payload: std::cell::Cell::new(0),
-            args: ArgSlot::new(self.args.clone_vec(self.arg_len_value())),
+            args,
             descr,
             extra: ExtraSlot::new(None),
         };
         op.pos().set(self.pos().get());
-        let _ = pop_arg_len();
         op
     }
 }
@@ -3968,34 +3951,30 @@ impl Op {
 
     pub fn new(opcode: OpCode, args: &[Operand]) -> Self {
         let collected: OpArgVec = args.iter().cloned().collect();
-        let arg_len = store_arg_len(collected.len());
-        let op = Op {
+        let (args, arg_len) = ArgSlot::new(collected);
+        Op {
             opcode,
             type_: opcode.result_type(),
             arg_len: std::cell::Cell::new(arg_len),
             pos_payload: std::cell::Cell::new(0),
-            args: ArgSlot::new(collected),
+            args,
             descr: DescrSlot::new(None),
             extra: ExtraSlot::new(None),
-        };
-        let _ = pop_arg_len();
-        op
+        }
     }
 
     pub fn with_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Self {
         let collected: OpArgVec = args.iter().cloned().collect();
-        let arg_len = store_arg_len(collected.len());
-        let op = Op {
+        let (args, arg_len) = ArgSlot::new(collected);
+        Op {
             opcode,
             type_: opcode.result_type(),
             arg_len: std::cell::Cell::new(arg_len),
             pos_payload: std::cell::Cell::new(0),
-            args: ArgSlot::new(collected),
+            args,
             descr: DescrSlot::new(Some(descr)),
             extra: ExtraSlot::new(None),
-        };
-        let _ = pop_arg_len();
-        op
+        }
     }
 
     #[inline]
@@ -4118,23 +4097,22 @@ impl Op {
             Some(d) => d,
             None => self.descr.borrow(),
         };
-        let new_len = store_arg_len(new_args.len());
         let stamp = self.descr.stamp_word();
         let descr = DescrSlot::from_parts(new_descr, self.descr.extra_clone_box());
         if stamp != 0 {
             descr.set_stamp_word(stamp);
         }
+        let (args, new_len) = ArgSlot::new(new_args);
         let newop = Op {
             opcode,
             type_: opcode.result_type(),
             arg_len: std::cell::Cell::new(new_len),
             pos_payload: std::cell::Cell::new(0),
-            args: ArgSlot::new(new_args),
+            args,
             descr,
             extra: ExtraSlot::new(None),
         };
         newop.pos().set(self.pos().get());
-        let _ = pop_arg_len();
         // resoperation.py GuardResOp.copy_and_change:
         //   newop.setfailargs(self.getfailargs())
         //   newop.rd_resume_position = self.rd_resume_position
@@ -6799,17 +6777,17 @@ mod tests {
             pos: $pos:expr,
             extra: $extra:expr $(,)?
         ) => {{
+            let (__args, __arg_len) = $args;
             let mut __op = Op {
                 opcode: $opcode,
                 type_: Type::Void,
-                arg_len: std::cell::Cell::new(0),
+                arg_len: std::cell::Cell::new(__arg_len),
                 pos_payload: std::cell::Cell::new(0),
-                args: $args,
+                args: __args,
                 descr: $descr,
                 extra: $extra,
             };
             __op.type_ = __op.opcode.result_type();
-            __op.set_arg_len_value(ArgSlot::take_last_len());
             __op.pos().set($pos.get());
             __op
         }};
