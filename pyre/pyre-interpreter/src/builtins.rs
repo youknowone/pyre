@@ -16964,7 +16964,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // PyPy checks the public AST boundary before source_as_str so AST
     // subclasses are compiled as trees rather than probed for a buffer.
     let ast_module = crate::importing::importhook(
-        "_ast",
+        rustpython_wtf8::Wtf8::new("_ast"),
         PY_NULL,
         PY_NULL,
         0,

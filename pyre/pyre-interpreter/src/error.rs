@@ -2755,7 +2755,7 @@ pub fn display_through_traceback_module(exc_value: PyObjectRef, exc_tb: PyObject
     }
     let ec = crate::call::getexecutioncontext();
     let Ok(module) = crate::importing::importhook(
-        "traceback",
+        rustpython_wtf8::Wtf8::new("traceback"),
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
         0,
@@ -3402,7 +3402,7 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
 fn notes_is_abc_sequence(notes_slot: usize) -> bool {
     let module = crate::importing::get_sys_module("collections.abc").or_else(|| {
         crate::importing::importhook(
-            "collections.abc",
+            rustpython_wtf8::Wtf8::new("collections.abc"),
             pyre_object::w_none(),
             pyre_object::w_none(),
             0,
@@ -3730,7 +3730,7 @@ fn exception_suggestion(exc_slot: usize) -> Option<String> {
                     crate::importing::get_sys_module(&module_name)
                         .or_else(|| {
                             crate::importing::importhook(
-                                &module_name,
+                                rustpython_wtf8::Wtf8::new(module_name.as_str()),
                                 pyre_object::w_none(),
                                 pyre_object::w_none(),
                                 0,

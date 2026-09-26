@@ -1401,7 +1401,14 @@ pub(crate) fn seed_main_loader(
     use pyre_interpreter::baseobjspace::getattr_str;
 
     let load = |module: &str, attr: &str| -> Option<pyre_object::PyObjectRef> {
-        importing::importhook(module, w_main_globals, pyre_object::PY_NULL, 0, ec_ptr).ok()?;
+        importing::importhook(
+            rustpython_wtf8::Wtf8::new(module),
+            w_main_globals,
+            pyre_object::PY_NULL,
+            0,
+            ec_ptr,
+        )
+        .ok()?;
         let w_mod = importing::get_sys_module(module)?;
         getattr_str(w_mod, attr).ok()
     };
@@ -1470,7 +1477,13 @@ fn init_warnoptions(
     }
     let attempt = (|| -> Result<(), pyre_interpreter::PyError> {
         let Some(w_warnings) = importing::get_sys_module("warnings") else {
-            importing::importhook("warnings", w_main_globals, pyre_object::PY_NULL, 0, ec_ptr)?;
+            importing::importhook(
+                rustpython_wtf8::Wtf8::new("warnings"),
+                w_main_globals,
+                pyre_object::PY_NULL,
+                0,
+                ec_ptr,
+            )?;
             return Ok(());
         };
         let Some(w_sys) = importing::get_interpreter_sys_module() else {
@@ -1548,7 +1561,7 @@ fn init_faulthandler(
         use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
         let module = importing::importhook(
-            "faulthandler",
+            rustpython_wtf8::Wtf8::new("faulthandler"),
             w_main_globals,
             pyre_object::PY_NULL,
             0,
@@ -1842,7 +1855,13 @@ fn path_hook_accepts(
 ) -> Result<bool, pyre_interpreter::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
-    let sys = importing::importhook("sys", canonical, pyre_object::PY_NULL, 0, ec_ptr)?;
+    let sys = importing::importhook(
+        rustpython_wtf8::Wtf8::new("sys"),
+        canonical,
+        pyre_object::PY_NULL,
+        0,
+        ec_ptr,
+    )?;
     let path_hooks = pyre_interpreter::baseobjspace::getattr_str(sys, "path_hooks")?;
     // `for hook in sys.path_hooks` is a plain iteration, so a `sitecustomize`
     // that replaces the list with a tuple or any other iterable still gets its
@@ -1890,7 +1909,13 @@ fn runpy_run_module_as_main(
     module: &str,
     alter_argv: bool,
 ) -> Result<(), pyre_interpreter::PyError> {
-    let runpy = importing::importhook("runpy", canonical, pyre_object::PY_NULL, 0, ec_ptr)?;
+    let runpy = importing::importhook(
+        rustpython_wtf8::Wtf8::new("runpy"),
+        canonical,
+        pyre_object::PY_NULL,
+        0,
+        ec_ptr,
+    )?;
     let func = pyre_interpreter::getattr(runpy, pyre_object::w_str_new("_run_module_as_main"))?;
     let _roots = pyre_object::gc_roots::push_roots();
     let func_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2340,7 +2365,13 @@ fn run_script_path(
     let result = (|| -> Result<bool, pyre_interpreter::PyError> {
         // Import `sys` up front so its creation flushes the native search-path
         // seed into `sys.path` before `site` and user code read it.
-        let _ = importing::importhook("sys", canonical, pyre_object::PY_NULL, 0, ec_ptr);
+        let _ = importing::importhook(
+            rustpython_wtf8::Wtf8::new("sys"),
+            canonical,
+            pyre_object::PY_NULL,
+            0,
+            ec_ptr,
+        );
         // pylifecycle.c init_importlib before site: install the importlib
         // bootstrap so `sys.meta_path` / `sys.path_hooks` are populated before
         // the run target is chosen.
@@ -2440,7 +2471,13 @@ fn run_source(
 
     // Import `sys` up front so its creation flushes the native search-path seed
     // into `sys.path` before `site` and user code read it.
-    let _ = importing::importhook("sys", canonical, pyre_object::PY_NULL, 0, ec_ptr);
+    let _ = importing::importhook(
+        rustpython_wtf8::Wtf8::new("sys"),
+        canonical,
+        pyre_object::PY_NULL,
+        0,
+        ec_ptr,
+    );
 
     // pylifecycle.c init_importlib before site: install the importlib
     // bootstrap so `builtins.__import__` routes imports through

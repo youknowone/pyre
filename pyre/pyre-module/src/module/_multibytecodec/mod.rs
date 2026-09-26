@@ -343,7 +343,7 @@ pub(crate) fn getcodec(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let module = match pyre_interpreter::importing::get_sys_module("_multibytecodec") {
         Some(module) => module,
         None => pyre_interpreter::importing::importhook(
-            "_multibytecodec",
+            rustpython_wtf8::Wtf8::new("_multibytecodec"),
             pyre_object::PY_NULL,
             pyre_object::w_tuple_new(vec![pyre_object::w_str_new("MultibyteCodec")]),
             0,

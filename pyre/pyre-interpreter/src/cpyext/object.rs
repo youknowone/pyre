@@ -1562,9 +1562,12 @@ unsafe fn call_vector(
                     "vectorcall keyword name is not a string",
                 ));
             }
-            names.push(rustpython_wtf8::Wtf8Buf::from_string(
-                crate::baseobjspace::str_utf8_w(name)?.to_owned(),
-            ));
+            // `call_named` takes the keyword as WTF-8. Copy the raw
+            // buffer: `str_utf8_w` rejects a lone surrogate the tuple is
+            // still allowed to hold.
+            let mut keyword = rustpython_wtf8::Wtf8Buf::new();
+            keyword.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(name) });
+            names.push(keyword);
         }
     }
 

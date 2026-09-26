@@ -2206,7 +2206,7 @@ pub fn strptime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_mod = match crate::importing::get_sys_module("_strptime") {
         Some(m) => m,
         None => crate::importing::importhook(
-            "_strptime",
+            rustpython_wtf8::Wtf8::new("_strptime"),
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
             0,

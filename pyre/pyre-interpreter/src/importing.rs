@@ -4840,11 +4840,11 @@ fn install_importlib_bootstrap(
     let module_slot = shadow_stack_len();
     let _ = pin_root(module);
 
-    let w_sys = absolute_import("sys", pyre_object::PY_NULL, execution_context)?;
+    let w_sys = absolute_import(Wtf8::new("sys"), pyre_object::PY_NULL, execution_context)?;
     let sys_slot = shadow_stack_len();
     let _ = pin_root(w_sys);
 
-    let w_imp = absolute_import("_imp", pyre_object::PY_NULL, execution_context)?;
+    let w_imp = absolute_import(Wtf8::new("_imp"), pyre_object::PY_NULL, execution_context)?;
     let imp_slot = shadow_stack_len();
     let _ = pin_root(w_imp);
 
@@ -4912,7 +4912,11 @@ fn install_importlib_bootstrap(
     // `set_frozen_alias_metadata` call that registers that alias.
     // A failed import leaves the hook out — the tolerant `# can't import
     // zipimport` path — rather than failing the whole bootstrap.
-    if let Ok(w_zipimport) = absolute_import("zipimport", pyre_object::PY_NULL, execution_context) {
+    if let Ok(w_zipimport) = absolute_import(
+        Wtf8::new("zipimport"),
+        pyre_object::PY_NULL,
+        execution_context,
+    ) {
         let zipimport_slot = shadow_stack_len();
         let _ = pin_root(w_zipimport);
         let w_zipimporter =
@@ -4980,8 +4984,15 @@ fn bootstrap_importlib_modules(
     canonical: PyObjectRef,
     execution_context: *const PyExecutionContext,
 ) -> Result<(), crate::PyError> {
-    let import =
-        |name: &str| importhook(name, canonical, pyre_object::PY_NULL, 0, execution_context);
+    let import = |name: &str| {
+        importhook(
+            Wtf8::new(name),
+            canonical,
+            pyre_object::PY_NULL,
+            0,
+            execution_context,
+        )
+    };
 
     for name in ["_thread", "_warnings", "_weakref"] {
         import(name)?;
@@ -5113,11 +5124,22 @@ fn load_namespace_package(
 // PyPy equivalent: importing.py `load_part()`
 
 fn load_part(
-    modulename: &str,
-    partname: &str,
+    modulename: &Wtf8,
+    partname: &Wtf8,
     parent_dirs: Option<&[PathBuf]>,
     execution_context: *const PyExecutionContext,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
+    // Builtin tables and filesystem paths are `&str`. A name that is not
+    // UTF-8 is absent from both: answer the cache or the block, then miss.
+    let (Some(modulename), Some(partname)) = (name_utf8(modulename), name_utf8(partname)) else {
+        if modules_block(modulename) {
+            return Err(import_halted(modulename));
+        }
+        if let Some(cached) = modules_cached(modulename) {
+            return Ok(Some(cached));
+        }
+        return Ok(None);
+    };
     // A blocked name is answered before any search, so it also applies to a
     // name that was never importable to begin with.
     if sys_modules_blocks(modulename) {
@@ -5321,8 +5343,107 @@ fn frozen_bootstrap_source(modulename: &str) -> Result<Option<PathBuf>, crate::P
     }
 }
 
+/// A WTF-8 module name that is also UTF-8. Surrogate bytes are the `ED A0`
+/// pattern; everything else is viewed as `&str` without a `Result`.
+fn name_utf8(name: &Wtf8) -> Option<&str> {
+    let bytes = name.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0xED
+            && index + 2 < bytes.len()
+            && bytes[index + 1] >= 0xA0
+            && bytes[index + 1] <= 0xBF
+        {
+            return None;
+        }
+        index += 1;
+    }
+    Some(unsafe { std::str::from_utf8_unchecked(bytes) })
+}
+
+/// `sys.modules` block for a module name carried as WTF-8.
+fn modules_block(name: &Wtf8) -> bool {
+    if let Some(utf8) = name_utf8(name) {
+        sys_modules_blocks(utf8)
+    } else {
+        sys_modules_blocks_wtf8(name)
+    }
+}
+
+/// `check_sys_modules` for a module name carried as WTF-8. A UTF-8 name
+/// keeps the `&str` dict probe; a lone surrogate is looked up as an object.
+fn modules_cached(name: &Wtf8) -> Option<PyObjectRef> {
+    if let Some(utf8) = name_utf8(name) {
+        check_sys_modules(utf8)
+    } else {
+        check_sys_modules_w(pyre_object::w_str_from_wtf8_managed(name.to_wtf8_buf()))
+    }
+}
+
+fn module_not_found_name(name: &Wtf8) -> crate::PyError {
+    let mut message = Wtf8Buf::new();
+    message.push_str("No module named '");
+    message.push_wtf8(name);
+    message.push_str("'");
+    crate::PyError::module_not_found_with_name_obj(
+        message,
+        pyre_object::w_str_from_wtf8_managed(name.to_wtf8_buf()),
+    )
+}
+
+fn module_not_found_parent(full: &Wtf8, parent: &Wtf8) -> crate::PyError {
+    let mut message = Wtf8Buf::new();
+    message.push_str("No module named '");
+    message.push_wtf8(full);
+    message.push_str("'; '");
+    message.push_wtf8(parent);
+    message.push_str("' is not a package");
+    crate::PyError::module_not_found_with_name_obj(
+        message,
+        pyre_object::w_str_from_wtf8_managed(full.to_wtf8_buf()),
+    )
+}
+
+fn import_halted(name: &Wtf8) -> crate::PyError {
+    let mut message = Wtf8Buf::new();
+    message.push_str("import of ");
+    message.push_wtf8(name);
+    message.push_str(" halted; None in sys.modules");
+    crate::PyError::module_not_found_with_name_obj(
+        message,
+        pyre_object::w_str_from_wtf8_managed(name.to_wtf8_buf()),
+    )
+}
+
+/// Split a module name on `.`. The separator is ASCII, so it never falls
+/// inside a WTF-8 sequence.
+fn split_module_name(name: &Wtf8) -> Vec<&Wtf8> {
+    let bytes = name.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte == b'.' {
+            parts.push(unsafe { Wtf8::from_bytes_unchecked(&bytes[start..index]) });
+            start = index + 1;
+        }
+    }
+    parts.push(unsafe { Wtf8::from_bytes_unchecked(&bytes[start..]) });
+    parts
+}
+
+fn join_module_name(parts: &[&Wtf8]) -> Wtf8Buf {
+    let mut joined = Wtf8Buf::new();
+    for (index, part) in parts.iter().enumerate() {
+        if index != 0 {
+            joined.push_str(".");
+        }
+        joined.push_wtf8(part);
+    }
+    joined
+}
+
 fn absolute_import(
-    modulename: &str,
+    modulename: &Wtf8,
     w_fromlist: PyObjectRef,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -5331,39 +5452,35 @@ fn absolute_import(
     // only under the frozen names, leaving `importlib/__init__.py` unexecuted.
     // The package's `else` arm publishes the public aliases later, when
     // something imports `importlib`.
-    if matches!(
-        modulename,
-        "_frozen_importlib" | "_frozen_importlib_external"
-    ) {
+    if let Some(frozen) = name_utf8(modulename)
+        && matches!(frozen, "_frozen_importlib" | "_frozen_importlib_external")
+    {
         // `sys.modules[name] = None` is an explicit import block.  In
         // particular, `test.support.import_helper.import_fresh_module` uses
         // it to force importlib's source bootstrap: the failed frozen import
         // is what selects the `except ImportError` arm that calls
         // `_bootstrap._setup(sys, _imp)`.  Do not turn that sentinel back
         // into the source module.
-        if sys_modules_blocks(modulename) {
-            return Err(crate::PyError::module_not_found_with_name(
-                format!("import of {modulename} halted; None in sys.modules"),
-                modulename,
-            ));
+        if sys_modules_blocks(frozen) {
+            return Err(import_halted(modulename));
         }
-        if let Some(cached) = check_sys_modules(modulename) {
+        if let Some(cached) = check_sys_modules(frozen) {
             return Ok(cached);
         }
         #[cfg(feature = "host_env")]
-        if let Some(pathname) = frozen_bootstrap_source(modulename)? {
-            return load_source_module(modulename, &pathname, None, execution_context);
+        if let Some(pathname) = frozen_bootstrap_source(frozen)? {
+            return load_source_module(frozen, &pathname, None, execution_context);
         }
     }
 
-    let parts: Vec<&str> = modulename.split('.').collect();
+    let parts = split_module_name(modulename);
     let mut first: Option<PyObjectRef> = None;
     let mut parent: Option<PyObjectRef> = None;
-    let mut prefix = Vec::new();
+    let mut prefix: Vec<&Wtf8> = Vec::new();
 
     for (level, &part) in parts.iter().enumerate() {
         prefix.push(part);
-        let full_name = prefix.join(".");
+        let full_name = join_module_name(&prefix);
         // A submodule is resolved against its parent package's `__path__`;
         // top-level names (level 0, no parent) search sys.path.
         //
@@ -5379,17 +5496,14 @@ fn absolute_import(
         // `_find_and_load_unlocked` runs, so the parent binding below is the
         // business of a load this call actually performed.  Read before
         // `load_part`, which answers the cache and cannot be asked afterwards.
-        let was_cached = check_sys_modules(&full_name).is_some();
+        let was_cached = modules_cached(&full_name).is_some();
         let parent_dirs = match parent {
             None => None,
-            Some(_) if was_cached || sys_modules_blocks(&full_name) => None,
+            Some(_) if was_cached || modules_block(&full_name) => None,
             Some(parent_mod) => {
                 if crate::baseobjspace::findattr_result(parent_mod, "__path__")?.is_none() {
-                    let parent_name = parts[..level].join(".");
-                    return Err(crate::PyError::module_not_found_with_name(
-                        format!("No module named '{full_name}'; '{parent_name}' is not a package"),
-                        &full_name,
-                    ));
+                    let parent_name = join_module_name(&parts[..level]);
+                    return Err(module_not_found_parent(&full_name, &parent_name));
                 }
                 parent_package_path(parent_mod)?
             }
@@ -5398,27 +5512,31 @@ fn absolute_import(
         let Some(module) = w_mod else {
             // _bootstrap.py:1335 raises for the prefix that actually failed
             // (`name=name`): `import a.b.c` with `a.b` missing reports `a.b`.
-            return Err(crate::PyError::module_not_found_with_name(
-                format!("No module named '{full_name}'"),
-                &full_name,
-            ));
+            return Err(module_not_found_name(&full_name));
         };
         // _bootstrap._find_and_load (_bootstrap.py): bind the
         // submodule as an attribute of its parent package so `import a.b`
         // makes `a.b` reachable. Only an AttributeError is swallowed (with an
         // ImportWarning); any other exception propagates.
+        // A child whose name is not UTF-8 was answered from `sys.modules`
+        // (`was_cached`) or not found; the attribute bind is a `&str` store.
         if !was_cached
             && let Some(parent_mod) = parent
-            && let Err(err) = crate::setattr_str(parent_mod, part, module)
+            && let Some(part_utf8) = name_utf8(part)
+            && let Err(err) = crate::setattr_str(parent_mod, part_utf8, module)
         {
             if err.kind != crate::PyErrorKind::AttributeError {
                 return Err(err);
             }
-            let parent_name = parts[..level].join(".");
-            crate::warn::warn(
-                &format!("Cannot set an attribute on '{parent_name}' for child module '{part}'"),
-                "ImportWarning",
-            );
+            let parent_name = join_module_name(&parts[..level]);
+            if let Some(parent_utf8) = name_utf8(&parent_name) {
+                crate::warn::warn(
+                    &format!(
+                        "Cannot set an attribute on '{parent_utf8}' for child module '{part_utf8}'"
+                    ),
+                    "ImportWarning",
+                );
+            }
         }
         if level == 0 {
             first = Some(module);
@@ -5430,18 +5548,13 @@ fn absolute_import(
     // Otherwise, return the first (top-level) module.
     if !w_fromlist.is_null() && !unsafe { is_none(w_fromlist) } {
         // `from X.Y import Z` → return the leaf module (Y)
-        if let Some(cached) = check_sys_modules(modulename) {
+        if let Some(cached) = modules_cached(modulename) {
             return Ok(cached);
         }
     }
 
     // `import X.Y` → return the top-level module (X)
-    first.ok_or_else(|| {
-        crate::PyError::module_not_found_with_name(
-            format!("No module named '{modulename}'"),
-            modulename,
-        )
-    })
+    first.ok_or_else(|| module_not_found_name(modulename))
 }
 
 // ── IMPORT_NAME ──────────────────────────────────────────────────────
@@ -6398,7 +6511,7 @@ pub(crate) fn dunder_import_slow(
     // `absolute_import` execs the on-disk bootstrap source under that name.
     if matches!(name, "_frozen_importlib" | "_frozen_importlib_external") {
         return importhook(
-            name,
+            Wtf8::new(name),
             if w_globals.is_null() {
                 pyre_object::PY_NULL
             } else {
@@ -6458,7 +6571,7 @@ pub(crate) fn dunder_import_slow(
         }
     }
     importhook(
-        name,
+        Wtf8::new(name),
         if w_globals.is_null() {
             pyre_object::PY_NULL
         } else {
@@ -6682,15 +6795,15 @@ pub fn dunder_import_name_obj(
         None
     };
     let Some(w_import) = bootstrap else {
-        // The bootstrap is not importable yet, and no native lookup can serve
-        // this name, so it is reported missing.
-        let repr = crate::display::format_wtf8_repr(unsafe {
-            pyre_object::w_str_get_wtf8(shadow_stack_get(name_slot))
-        });
-        return Err(crate::PyError::module_not_found_with_name_obj(
-            format!("No module named {repr}"),
-            shadow_stack_get(name_slot),
-        ));
+        // No app-level importer yet. The native `importhook` carries the
+        // name as WTF-8, including a lone surrogate.
+        return importhook(
+            unsafe { pyre_object::w_str_get_wtf8(shadow_stack_get(name_slot)) },
+            shadow_stack_get(globals_slot),
+            shadow_stack_get(fromlist_slot),
+            level,
+            crate::call::getexecutioncontext(),
+        );
     };
     call_bootstrap_import(
         w_import,
@@ -6843,7 +6956,7 @@ fn relative_import_head(
 // PyPy equivalent: importing.py `importhook()`
 
 pub fn importhook(
-    name: &str,
+    name: &Wtf8,
     w_globals: PyObjectRef,
     w_fromlist: PyObjectRef,
     level: i64,
@@ -6932,45 +7045,44 @@ pub fn importhook(
 /// name are the trailing bytes of `name` itself and the cut lands in the same
 /// place either way.
 fn import_head(
-    name: &str,
+    name: &Wtf8,
     w_mod: PyObjectRef,
     level: i64,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
-    let dotindex = rpython_str_find_char(name, '.', 0);
-    if dotindex < 0 {
-        // `name.partition('.')[0]` is the whole name, so the head is the module
-        // this call already resolved -- and so is `not name`.
-        return Ok(w_mod);
-    }
+    let dotindex = match name.as_bytes().iter().position(|&byte| byte == b'.') {
+        Some(index) => index,
+        None => {
+            // `name.partition('.')[0]` is the whole name, so the head is the
+            // module this call already resolved -- and so is `not name`.
+            return Ok(w_mod);
+        }
+    };
     if level == 0 {
         // `_gcd_import(name.partition('.')[0])`, answered from `sys.modules`,
         // which the import that preceded this has already populated.
-        return absolute_import(
-            rpython_str_slice_prefix(name, dotindex),
-            pyre_object::PY_NULL,
-            execution_context,
-        );
+        let head = unsafe { Wtf8::from_bytes_unchecked(&name.as_bytes()[..dotindex]) };
+        return absolute_import(head, pyre_object::PY_NULL, execution_context);
     }
 
     let _roots = push_roots();
     let mod_slot = shadow_stack_len();
     let _ = pin_root(w_mod);
-    let cut_off = name.len() - rpython_str_slice_prefix(name, dotindex).len();
+    let cut_off = name.len() - dotindex;
     let w_name = crate::baseobjspace::getattr_str(shadow_stack_get(mod_slot), "__name__")?;
-    // A resolved module name with no UTF-8 spelling cannot be a `sys.modules`
-    // key this importer can ask for; the leaf is the best answer available.
-    let Some(full) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
-        return Ok(shadow_stack_get(mod_slot));
-    };
+    let full = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     if cut_off >= full.len() {
         return Ok(shadow_stack_get(mod_slot));
     }
-    let head = &full[..full.len() - cut_off];
-    check_sys_modules(head).ok_or_else(|| {
-        crate::PyError::key_error(format!("'{head}' not in sys.modules as expected"))
+    let head = unsafe { Wtf8::from_bytes_unchecked(&full.as_bytes()[..full.len() - cut_off]) };
+    modules_cached(head).ok_or_else(|| {
+        let mut message = Wtf8Buf::new();
+        message.push_str("'");
+        message.push_wtf8(head);
+        message.push_str("' not in sys.modules as expected");
+        crate::PyError::key_error(message)
     })
 }
 
@@ -7095,27 +7207,7 @@ pub(crate) fn handle_fromlist(
             shadow_stack_get(x_slot),
             Wtf8::new(""),
         )?);
-        // The native importer names modules by `&str` throughout, so a child
-        // whose name has no UTF-8 spelling can be neither found nor cached
-        // here.  That is the outcome `_handle_fromlist` already swallows: the
-        // import raises `ModuleNotFoundError` for exactly this name.  The one
-        // entry that contradicts the swallow is an explicit `None` block, and
-        // `sys.modules.get(from_name, _NEEDS_LOADING) is not None` reads it
-        // whatever the name spells — so ask for it as an object before
-        // swallowing, and re-raise the error the import would have raised.
-        if from_name.as_str().is_err() && sys_modules_blocks_wtf8(&from_name) {
-            let mut message: Wtf8Buf = "No module named '".into();
-            message.push_wtf8(&from_name);
-            message.push_str("'");
-            return Err(crate::PyError::module_not_found_with_name_obj(
-                message,
-                pyre_object::w_str_from_wtf8_managed(from_name),
-            ));
-        }
-        let Ok(child) = from_name.as_str() else {
-            continue;
-        };
-        if let Err(err) = absolute_import(child, pyre_object::PY_NULL, execution_context) {
+        if let Err(err) = absolute_import(&from_name, pyre_object::PY_NULL, execution_context) {
             // Backwards-compatibility dictates we ignore failed imports
             // triggered by fromlist for modules that don't exist:
             // `exc.name == from_name and sys.modules.get(from_name,
@@ -7123,8 +7215,8 @@ pub(crate) fn handle_fromlist(
             // sentinel, so the only entry that re-raises is an explicit
             // `None` block.
             if err.kind != crate::PyErrorKind::ModuleNotFoundError
-                || !error_names_module(&err, child)
-                || sys_modules_blocks(child)
+                || !error_names_module(&err, &from_name)
+                || modules_block(&from_name)
             {
                 return Err(err);
             }
@@ -7158,16 +7250,13 @@ pub extern "C" fn handle_fromlist_jit_abi(
 /// error raised for a *different* name propagates: `from a import b` where
 /// `a.b` exists but its body raises `ModuleNotFoundError` for `c` is a real
 /// failure.
-fn error_names_module(err: &crate::PyError, module_name: &str) -> bool {
+fn error_names_module(err: &crate::PyError, module_name: &Wtf8) -> bool {
     if err.w_name_context.is_null() || !unsafe { pyre_object::is_str(err.w_name_context) } {
         return false;
     }
-    // `_opt`, not `w_str_get_value`: a module name reaches here through
-    // `fsdecode` and so may hold a lone surrogate, which the panicking
-    // spelling would turn into a crash.  Such a name is simply not equal to
-    // the `&str` the caller built.
-    let name = unsafe { pyre_object::w_str_get_value_opt(err.w_name_context) };
-    name == Some(module_name)
+    // Compare the raw buffer. A lone surrogate has no `&str` spelling, and
+    // `w_str_get_value` would panic on it.
+    unsafe { pyre_object::w_str_get_wtf8(err.w_name_context) == module_name }
 }
 
 /// Relative import: `from .foo import bar` (level=1), `from ..foo import bar` (level=2).
@@ -7176,7 +7265,7 @@ fn error_names_module(err: &crate::PyError, module_name: &str) -> bool {
 /// Resolves the package base from __package__ or __name__ in w_globals,
 /// strips `level - 1` trailing components, then does absolute import.
 fn relative_import(
-    name: &str,
+    name: &Wtf8,
     w_globals: PyObjectRef,
     w_fromlist: PyObjectRef,
     level: i64,
@@ -7215,36 +7304,39 @@ fn relative_import(
 
     // Strip (level - 1) trailing components from package
     // PyPy: for dotted name "a.b.c" with level=2, strip "c" → "a.b", then strip "b" → "a"
-    let mut parts: Vec<&str> = package.split('.').collect();
+    let mut parts = split_module_name(&package);
     let strips = (level - 1) as usize;
     if strips >= parts.len() {
+        let mut message = Wtf8Buf::new();
+        message.push_str("attempted relative import beyond top-level package (package='");
+        message.push_wtf8(&package);
+        message.push_str("', level=");
+        message.push_str(&format!("{level}"));
+        message.push_str(")");
         return Err(crate::PyError::new(
             crate::PyErrorKind::ImportError,
-            format!(
-                "attempted relative import beyond top-level package (package='{package}', level={level})"
-            ),
+            message,
         ));
     }
     for _ in 0..strips {
         parts.pop();
     }
-    let base = parts.join(".");
+    let mut base = join_module_name(&parts);
 
     // Build the fully-qualified module name
-    let fqn = if name.is_empty() {
-        base.clone()
-    } else {
-        format!("{base}.{name}")
-    };
+    if !name.is_empty() {
+        base.push_str(".");
+        base.push_wtf8(name);
+    }
 
-    absolute_import(&fqn, shadow_stack_get(fromlist_slot), execution_context)
+    absolute_import(&base, shadow_stack_get(fromlist_slot), execution_context)
 }
 
 /// Extract the package name from the calling module's globals namespace.
 ///
 /// PyPy: importing.py — checks __package__ first, falls back to __name__,
 /// strips the last component if __name__ has dots (module in a package).
-fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate::PyError> {
+fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<Wtf8Buf>, crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
     if w_globals.is_null() {
@@ -7280,7 +7372,9 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
                     "__package__ not set to a string",
                 ));
             }
-            return Ok(Some(crate::baseobjspace::str_utf8_w(pkg)?.to_string()));
+            let mut package_name = Wtf8Buf::new();
+            package_name.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(pkg) });
+            return Ok(Some(package_name));
         }
     }
     if spec.is_some() {
@@ -7292,7 +7386,9 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
                     "__spec__.parent is not a string",
                 ));
             }
-            return Ok(Some(crate::baseobjspace::str_utf8_w(parent)?.to_string()));
+            let mut parent_name = Wtf8Buf::new();
+            parent_name.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(parent) });
+            return Ok(Some(parent_name));
         }
     }
 
@@ -7317,15 +7413,20 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
         let has_path =
             crate::baseobjspace::finditem_str(shadow_stack_get(globals_slot), "__path__")?
                 .is_some();
-        let name = crate::baseobjspace::str_utf8_w(shadow_stack_get(name_slot))?;
+        let name = unsafe { pyre_object::w_str_get_wtf8(shadow_stack_get(name_slot)) };
+        let mut package_name = Wtf8Buf::new();
         if has_path {
-            return Ok(Some(name.to_string()));
+            package_name.push_wtf8(name);
+            return Ok(Some(package_name));
         }
         // Otherwise `rpartition('.')[0]` is also the empty string for a
         // top-level module such as __main__.
-        return Ok(Some(
-            name.rfind('.').map_or("", |dot| &name[..dot]).to_string(),
-        ));
+        let end = match name.as_bytes().iter().rposition(|&byte| byte == b'.') {
+            Some(dot) => dot,
+            None => 0,
+        };
+        package_name.push_wtf8(unsafe { Wtf8::from_bytes_unchecked(&name.as_bytes()[..end]) });
+        return Ok(Some(package_name));
     }
 
     Ok(None)
@@ -8130,11 +8231,12 @@ mod tests {
     #[test]
     fn importhook_rejects_invalid_absolute_name_and_level() {
         crate::test_hooks::install_hash_hook();
-        let empty = importhook("", PY_NULL, PY_NULL, 0, std::ptr::null()).unwrap_err();
+        let empty = importhook(Wtf8::new(""), PY_NULL, PY_NULL, 0, std::ptr::null()).unwrap_err();
         assert_eq!(empty.kind, crate::PyErrorKind::ValueError);
         assert_eq!(empty.message_text(), "Empty module name");
 
-        let negative = importhook("sys", PY_NULL, PY_NULL, -1, std::ptr::null()).unwrap_err();
+        let negative =
+            importhook(Wtf8::new("sys"), PY_NULL, PY_NULL, -1, std::ptr::null()).unwrap_err();
         assert_eq!(negative.kind, crate::PyErrorKind::ValueError);
         assert_eq!(negative.message_text(), "level must be >= 0");
 
@@ -8142,7 +8244,8 @@ mod tests {
         unsafe {
             pyre_object::w_dict_setitem_str(globals, "__package__", pyre_object::w_str_new(""));
         }
-        let no_parent = importhook("", globals, PY_NULL, 1, std::ptr::null()).unwrap_err();
+        let no_parent =
+            importhook(Wtf8::new(""), globals, PY_NULL, 1, std::ptr::null()).unwrap_err();
         assert_eq!(no_parent.kind, crate::PyErrorKind::ImportError);
         assert_eq!(
             no_parent.message_text(),
