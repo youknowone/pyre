@@ -3,17 +3,6 @@
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
 # corpus=79699280e0772f88 platform=linux
-# The `ctypeprim.py` / `misc.py` convert helpers split out of the
-# primitive ctypes.  Their bodies stop on the phase-A walls
-# `misc::as_long` already stops on (`Integer ∪ Instance(error::PyError)`
-# at a `Result<_, PyError>` payload), a `String ∪ Instance` union, and
-# `unpack_complex`'s failed source lift.
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_complex
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_float
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_longdouble
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_longlong
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_ulonglong
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::as_long_long
 two-phase-never-a-subject	eval_loop_jit_portal
 two-phase-never-a-subject	ll_int_abs
 two-phase-never-a-subject	ll_listslice_minusone__ref__majit__object_ref_gcarray
@@ -105,6 +94,7 @@ two-phase-never-a-subject	pyre_interpreter::baseobjspace::index_int_w_preserve_n
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::instance_getattr_hook_or_err
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::instance_getattr_hook_or_err_wtf8
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::int_w
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::int_w_allow_conversion
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::is_true
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::is_true_slot
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::isinstance
@@ -1327,9 +1317,10 @@ two-phase-never-a-subject	pyre_module::module::_bz2::decompressor_methods::__maj
 two-phase-never-a-subject	pyre_module::module::_bz2::decompressor_methods::__majit_wrap_decompress
 two-phase-never-a-subject	pyre_module::module::_bz2::decompressor_methods::__majit_wrap_unused_data
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::__majit_wrap_cdata_call
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::new_cdata
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::new_cdata_copy
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::new_cdata_full
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::new_cdata_mem
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::raw_alloc
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypefunc::call
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypefunc::do_call
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypefunc::farg
@@ -1341,25 +1332,25 @@ two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeobj::convert_
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeobj::convert_to_object
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeobj::copy_and_convert_to_object
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_complex
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_float
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_longdouble
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_longlong
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_ulonglong
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_to_char
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_to_char_n_t
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_to_object
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::overflow
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::read_bool_0_or_1
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::unichr
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::unpack_complex
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::unsigned_as_object
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeptr::accept_movable_str
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeptr::array_convert_from_object
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeptr::array_convert_to_object
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeptr::errno
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeptr::held_file
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeptr::item_of
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeptr::lock_open_files
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeptr::must_be_string_of_zero_or_one
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeptr::open_files
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeptr::pointer_convert_argument_from_object
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeptr::pointer_convert_from_object
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeptr::pointer_convert_to_object
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeptr::prepare_file
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeptr::prepare_file_argument
@@ -1369,16 +1360,9 @@ two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypestruct::conve
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypestruct::copy_and_convert_to_object
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypestruct::copy_from_same
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::as_long
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::as_long_long
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::as_unsigned_long
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::as_unsigned_long_long
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::bad_float_size
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::bad_integer_size
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::read_raw_float_data
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::read_raw_signed_data
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::read_raw_unsigned_data
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::write_raw_float_data
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::write_raw_signed_data
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::write_raw_unsigned_data
 two-phase-never-a-subject	pyre_interpreter::module::_functools::<Impl>::__call__
 two-phase-never-a-subject	pyre_interpreter::module::_functools::<Impl>::__eq__
 two-phase-never-a-subject	pyre_interpreter::module::_functools::<Impl>::__ge__
