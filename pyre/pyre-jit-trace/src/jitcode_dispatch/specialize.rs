@@ -2512,37 +2512,6 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
-    // `object.__class__`, under the pins the class-attribute arm above uses.
-    // `class_descr_fast_path` proves the receiver type resolves the name to
-    // `object`'s own getset, whose body is `space.type(w_obj)` — and the
-    // `w_class` guard the shape emits is that read, so the answer is the class
-    // the map terminator names.  A `__class__` overridden by a property
-    // declines in the predicate, and a later override bumps the pinned
-    // `version_tag`.
-    if name == "__class__"
-        && let Some(()) = spec_gate(SpecFold::ObjectClassAttr, || {
-            let Some((w_type, version_tag, map)) = (unsafe {
-                pyre_interpreter::objspace::std::mapdict::class_descr_fast_path(concrete_obj)
-            }) else {
-                return Ok(None);
-            };
-            walker_guard_mapdict_instance_shape(
-                ctx,
-                op_pc,
-                obj,
-                concrete_obj,
-                w_type,
-                version_tag,
-                map,
-            )?;
-            let value = ctx.trace_ctx.const_ref(w_type as i64);
-            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
-            Ok(Some(()))
-        })?
-    {
-        return Ok(Some(()));
-    }
-
     if let Some(walk_field) = traceback_walk_field(concrete_obj, name) {
         if let Some(()) = walker_specialize_traceback_walk_field(
             ctx,
@@ -4009,167 +3978,6 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Emit `super(C, self).name` as the `Method` `W_Super.getattribute` builds,
-/// in place of the opaque `bh_load_super_attr_fn` residual.
-///
-/// The residual rebuilds the proxy, re-walks the MRO suffix and re-binds the
-/// descriptor on every iteration, and being may-force it also wipes the
-/// trace's heap-field cache.  Upstream needs no such fold: `super()` there is
-/// `LOAD_GLOBAL` + `CALL` + `LOAD_METHOD` traced generically, `W_Super`
-/// virtualizes, and `lookup_starting_at` is an unrolled MRO walk.  The
-/// codewriter is bytecode-driven and cannot expand the fused 3.14
-/// `LOAD_SUPER_ATTR` into those three, so the fold is where the same trace
-/// shape is reached — as
-/// [`try_walker_specialize_load_bound_method_attr`] does for `LOAD_ATTR`.
-///
-/// Only the zero-argument oparg form reaches here: `codewriter.rs` lowers
-/// `super(C, self).name` to `simple_call` + `getattr`, which
-/// [`try_walker_specialize_two_arg_super_call`] and
-/// [`try_walker_specialize_load_attr_on_super`] answer between them.
-///
-/// The stack operands are authoritative for that form too.  The frame path
-/// they stand in for reads `locals_w[0]` and the `__class__` freevar cell
-/// (`super_operands_from_frame`), which are exactly what the `LOAD_FAST 0` /
-/// `LOAD_DEREF __class__` preceding this opcode pushed.
-///
-/// This emits one runtime guard FEWER than the ordinary method load: there is
-/// no instance-map / exception-dict shadow guard, because
-/// `W_Super.getattribute` never consults the receiver's dict, so `o.name = x`
-/// cannot shadow `super().name`.
-#[allow(clippy::too_many_arguments)]
-fn try_walker_orthodox_load_super_attr<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    global_super: OpRef,
-    self_obj: OpRef,
-    cls: OpRef,
-    w_code_ptr: usize,
-    name_idx: usize,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    let Some(concrete_super) = walker_concrete_ref_object(ctx, global_super) else {
-        return Ok(None);
-    };
-    if !pyre_interpreter::builtins::is_builtin_super_type(concrete_super) {
-        return Ok(None);
-    }
-    let Some(concrete_cls) = walker_concrete_ref_object(ctx, cls) else {
-        return Ok(None);
-    };
-    let Some(concrete_self) = walker_concrete_ref_object(ctx, self_obj) else {
-        return Ok(None);
-    };
-    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
-        return Ok(None);
-    };
-
-    // The generated body is safe to try transactionally when both the
-    // `_super_check` and descriptor-binding path are Python-free.  The tests
-    // here are only a descent gate; the guards and result come exclusively
-    // from `load_super_attr_value`'s generated JitCode.  Python-running arms
-    // keep the established residual/fallback route until SubRaise propagation
-    // from an opcode-owned helper walk is wired below this boundary.
-    let Some((_objtype, _version, w_descr, class_mode)) = (unsafe {
-        pyre_interpreter::baseobjspace::super_attr_fast_path(concrete_cls, concrete_self, &name)
-    }) else {
-        return Ok(None);
-    };
-    if super_attr_binding(w_descr, concrete_self, class_mode).is_none() {
-        return Ok(None);
-    }
-
-    // An orthodox helper sub-walk records a synthetic sub-body whose register
-    // bank is its own.  While an inlined callee sits on the framestack,
-    // `ActiveResumeFrame::current` resolves the branch-resume gate to THAT
-    // callee's jitcode, so a kept-slot colour read out of its `pcdep` map
-    // indexes this walk's `concrete_registers_r` --- two different colour
-    // spaces.  `kept_stack_has_boxed_int_hazard` then reads whatever word the
-    // colour lands on as a `PyObjectRef`, and faults inside `is_int` rather
-    // than answering wrongly.  The two spaces coincide only when the walk is
-    // executing the framestack frame's own jitcode, which is what an empty
-    // framestack witnesses here.
-    if !ctx.session.borrow().at_portal() {
-        return Ok(None);
-    }
-    let Some(jc_arc) = crate::jitcode_runtime::load_super_attr_value_jitcode() else {
-        return Ok(None);
-    };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
-        return Ok(None);
-    };
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() || unsafe { (&*sym_ptr).jitcode().is_null() } {
-        return Ok(None);
-    }
-    let Some((frame_box, frame_ptr)) = walker_executing_frame_box(ctx) else {
-        return Ok(None);
-    };
-    let sym = unsafe { &*sym_ptr };
-    let w_code = w_code_ptr as pyre_object::PyObjectRef;
-    // PyPy's opcode hands `W_Super.getattribute` the immutable wrapped
-    // `co_names_w[nameindex]`, not the host `Vec` that owns the compiler's
-    // strings.  Realize that same interned object before descending so the
-    // generated graph does not need to reinterpret Rust's `Vec` layout.
-    let w_name = unsafe {
-        pyre_interpreter::pycode::w_code_getname_w_or_new(w_code, name_idx, name.as_ref())
-    };
-    let code = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
-    };
-    let (self_is_cell, class_slot) =
-        pyre_interpreter::builtins::bare_super_frame_layout_words(code);
-    let w_name_arg = ctx.trace_ctx.const_ref(w_name as i64);
-    let is_two_arg = ctx.trace_ctx.const_int(0);
-    let self_is_cell_arg = ctx.trace_ctx.const_int(i64::from(self_is_cell));
-    let class_slot_arg = ctx.trace_ctx.const_int(class_slot as i64);
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
-        return Ok(None);
-    };
-    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let walk = run_orthodox_helper_subwalk(
-        ctx,
-        op_pc,
-        sym,
-        &sub_body,
-        nested_entry,
-        "load_super_attr_value_commit",
-        "load_super_attr_value_call_site",
-        &[is_two_arg, self_is_cell_arg, class_slot_arg],
-        &[
-            ConcreteValue::Int(0),
-            ConcreteValue::Int(i64::from(self_is_cell)),
-            ConcreteValue::Int(class_slot as i64),
-        ],
-        &[global_super, self_obj, cls, frame_box, w_name_arg],
-        &[
-            ConcreteValue::Ref(concrete_super),
-            ConcreteValue::Ref(concrete_self),
-            ConcreteValue::Ref(concrete_cls),
-            ConcreteValue::Ref(frame_ptr as pyre_object::PyObjectRef),
-            ConcreteValue::Ref(w_name),
-        ],
-        &[],
-    );
-    let (outcome, _walk_start) = match walk {
-        Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let result = match outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
-        _ => {
-            return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc });
-        }
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-    Ok(Some(()))
-}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
@@ -4188,27 +3996,6 @@ pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
     }
     if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
         return Ok(None);
-    }
-    // This descent runs before the hand-written fold and currently stops at
-    // unpublished `w_method_new`.  After closing its RootScope brackets it is
-    // linear but still 4.2x slower than the fold, so keep that wall.  The
-    // four-N measurement is recorded in `bench/synth/zero_arg_super_attr.py`.
-    if spec_gate(SpecFold::LoadSuperAttrDescent, || {
-        try_walker_orthodox_load_super_attr(
-            ctx,
-            op_pc,
-            global_super,
-            self_obj,
-            cls,
-            w_code_ptr,
-            name_idx,
-            dst,
-            dst_bank,
-        )
-    })?
-    .is_some()
-    {
-        return Ok(Some(()));
     }
     let Some(concrete_super) = walker_concrete_ref_object(ctx, global_super) else {
         return Ok(None);
@@ -7670,6 +7457,25 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+
+/// #171/#11 Approach C, SUBSCRIPT slice: walker-native PURE element load
+/// for a canonical array-backed `W_TupleObject[i]` (the tuple analogue of
+/// the object-storage list arm of [`try_walker_specialize_subscr`]).
+///
+/// Recognition (caller already verified `ob_type == &TUPLE_TYPE`): a
+/// non-negative int (or bool, which shares `intval`) index in bounds.
+/// Specialised tuples never reach here — the caller gates them out — so
+/// reading `wrappeditems` is always sound.
+///
+/// IR shape: `guard_class(&TUPLE_TYPE)` → `getfield(wrappeditems)` →
+/// `arraylen_gc(wrappeditems)` for the bounds length → `IntLt` +
+/// `GuardTrue` (NON-pure, so an out-of-range deopt still fires) →
+/// `getarrayitem_gc_pure_r(wrappeditems, idx)` (the ONLY pure op; the
+/// body is immutable per `_immutable_fields_ = ['wrappeditems[*]']`).
+/// Object storage → the element is a boxed Ref read directly (no
+/// unbox/rebox).  The authentic boxed result is taken from the same
+/// `execute_may_force` path the generic leg uses.
+#[allow(clippy::too_many_arguments)]
 /// Walker-native `tupleobject.py descr_getslice` for an exact constant
 /// unit-step slice whose result has two object elements.
 ///
@@ -7873,24 +7679,6 @@ pub(crate) fn try_walker_specialize_subscr_tuple_slice2<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// #171/#11 Approach C, SUBSCRIPT slice: walker-native PURE element load
-/// for a canonical array-backed `W_TupleObject[i]` (the tuple analogue of
-/// the object-storage list arm of [`try_walker_specialize_subscr`]).
-///
-/// Recognition (caller already verified `ob_type == &TUPLE_TYPE`): a
-/// non-negative int (or bool, which shares `intval`) index in bounds.
-/// Specialised tuples never reach here — the caller gates them out — so
-/// reading `wrappeditems` is always sound.
-///
-/// IR shape: `guard_class(&TUPLE_TYPE)` → `getfield(wrappeditems)` →
-/// `arraylen_gc(wrappeditems)` for the bounds length → `IntLt` +
-/// `GuardTrue` (NON-pure, so an out-of-range deopt still fires) →
-/// `getarrayitem_gc_pure_r(wrappeditems, idx)` (the ONLY pure op; the
-/// body is immutable per `_immutable_fields_ = ['wrappeditems[*]']`).
-/// Object storage → the element is a boxed Ref read directly (no
-/// unbox/rebox).  The authentic boxed result is taken from the same
-/// `execute_may_force` path the generic leg uses.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -12171,13 +11959,6 @@ fn locals_expansion_cut_if_too_long<Sym: WalkSym>(
     if !ctx.trace_ctx.is_too_long() {
         return Ok(());
     }
-    // The row is what makes the cut visible to `check.py`: it ends the trace
-    // rather than returning a specialization, so nothing downstream of the
-    // fold changes when it is removed, and only this census does.
-    // `locals_expansion_trace_too_long` declares it under `spec-folds`.
-    if !super::diag::spec_gate_locals_trace_limit_cut() {
-        return Ok(());
-    }
     let latched = residual_call::latch_abort_blackhole(ctx, pc, "locals-expansion");
     if !latched && super::fbw_state::fbw_executed_effect_count() != 0 {
         majit_metainterp::mc_diag_bump(26);
@@ -16152,6 +15933,14 @@ pub(crate) fn try_walker_specialize_builtin_fold1<Sym: WalkSym>(
     Ok(None)
 }
 
+
+/// `float(x)` on an exact int/float argument: inline the conversion
+/// (`W_IntObject.descr_float` → `space.newfloat`, or the identity
+/// `float(f) is f` for an exact float) instead of the opaque
+/// `bh_call_fn(float_type, NULL, x)` residual, so the result virtualizes.  The
+/// callable must be the exact `float` type object; a rebound name or a float
+/// subclass (which reboxes rather than returning the argument) declines.  Any
+/// non-matching shape falls through to the generic residual (SAFE).
 /// The two-argument half of the generic builtin fold — `min(a, b)` and
 /// `max(a, b)`, whose helpers return one of their own arguments rather than
 /// building anything.  Same shape and same soundness argument as
@@ -16314,13 +16103,6 @@ pub(crate) fn try_walker_specialize_builtin_fold2<Sym: WalkSym>(
     Ok(None)
 }
 
-/// `float(x)` on an exact int/float argument: inline the conversion
-/// (`W_IntObject.descr_float` → `space.newfloat`, or the identity
-/// `float(f) is f` for an exact float) instead of the opaque
-/// `bh_call_fn(float_type, NULL, x)` residual, so the result virtualizes.  The
-/// callable must be the exact `float` type object; a rebound name or a float
-/// subclass (which reboxes rather than returning the argument) declines.  Any
-/// non-matching shape falls through to the generic residual (SAFE).
 pub(crate) fn try_walker_specialize_float_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -17364,93 +17146,6 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
     walker_emit_jit_int_str_padded(ctx, op.pc, value, boxed_result, pad, dst)
 }
 
-/// FORMAT_WITH_SPEC (`f"{x:spec}"`) on an exact `int` or exact `str` plus
-/// an exact `str` spec: `format_w` as a CanRaise call instead of the
-/// MayForce residual.  A bool, subclass, long, or user `__format__`
-/// declines (SAFE); those stay on [`try_walker_inline_format`] or the
-/// residual.
-pub(crate) fn try_walker_specialize_format_with_spec<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op: &DecodedOp,
-    r_args: &[OpRef],
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 2 {
-        return Ok(None);
-    }
-    let Some(concrete) = walker_concrete_ref_object(ctx, r_args[0]) else {
-        return Ok(None);
-    };
-    let Some(concrete_spec) = walker_concrete_ref_object(ctx, r_args[1]) else {
-        return Ok(None);
-    };
-    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(concrete) {
-        return Ok(None);
-    }
-    if !unsafe { pyre_object::is_exact_type(concrete_spec, &pyre_object::STR_TYPE) } {
-        return Ok(None);
-    }
-    let value_is_exact_str =
-        unsafe { pyre_object::is_exact_type(concrete, &pyre_object::STR_TYPE) };
-    let value_is_exact_int = unsafe {
-        std::ptr::eq((*concrete).ob_type, &pyre_object::pyobject::INT_TYPE)
-            && std::ptr::eq(
-                (*concrete).w_class,
-                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE),
-            )
-    };
-    if !value_is_exact_str && !value_is_exact_int {
-        return Ok(None);
-    }
-    let boxed_result = {
-        let _plain_guard = pyre_interpreter::call::force_plain_eval();
-        pyre_interpreter::type_methods::format_w(concrete, concrete_spec)
-    };
-    let Ok(boxed_result) = boxed_result else {
-        return Ok(None);
-    };
-    if boxed_result.is_null()
-        || !unsafe { pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE) }
-    {
-        return Ok(None);
-    }
-    let value = r_args[0];
-    let spec = r_args[1];
-    if value_is_exact_str {
-        let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
-        let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
-        walker_guard_class(ctx, op.pc, value, str_type_addr)?;
-        walker_guard_exact_w_class(ctx, op.pc, value, str_typeobj)?;
-    } else {
-        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-        let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
-        walker_guard_class(ctx, op.pc, value, int_type_addr)?;
-        walker_guard_exact_w_class(ctx, op.pc, value, int_typeobj)?;
-    }
-    let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
-    let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
-    walker_guard_class(ctx, op.pc, spec, str_type_addr)?;
-    walker_guard_exact_w_class(ctx, op.pc, spec, str_typeobj)?;
-    let helper = crate::helpers::jit_format_w as *const ();
-    let raw = ctx.trace_ctx.call_typed_with_effect(
-        OpCode::CallR,
-        helper,
-        &[value, spec],
-        &[majit_ir::Type::Ref, majit_ir::Type::Ref],
-        majit_ir::Type::Ref,
-        majit_ir::EffectInfo::const_new(
-            majit_ir::ExtraEffect::CanRaise,
-            majit_ir::OopSpecIndex::None,
-        ),
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        raw,
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
-    );
-    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', raw)?;
-    Ok(Some(()))
-}
 
 /// `s.startswith(prefix)` / `s.endswith(suffix)` on two exact `str`s:
 /// `rstring.py startswith` / `endswith` as one elidable `call_i`, instead of
@@ -17595,231 +17290,8 @@ pub(crate) fn try_walker_specialize_str_prefix_match<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Runtime residual for [`try_walker_specialize_import_cached`].
-///
-/// Reads the current initialized `sys.modules` entry and nothing else.
-/// A miss, a replaced module, a missing `__spec__`, or a still-initializing
-/// module returns null so the record-time `GuardValue` side-exits to the
-/// original `IMPORT_NAME`.  That is `interp_import.py _gcd_import`'s
-/// `FastPathGiveUp`.  Running `dunder_import` here would execute a finder
-/// on a miss, then swallow the error as null and let the result guard
-/// retry the same import.
-///
-/// A non-`AttributeError` from `__spec__` / `_initializing` is published
-/// for the trailing `GuardNoException`, matching `_gcd_import`'s re-raise.
-///
-/// `fromlist_empty != 0` is `import a.b` (no fromlist): `__import__`
-/// answers the top-level package, so a dotted name returns the initialized
-/// `sys.modules["a"]` after the leaf is confirmed present.
-extern "C" fn jit_import_cached(name: i64, fromlist_empty: i64) -> i64 {
-    let w_name = name as pyre_object::PyObjectRef;
-    if w_name.is_null() {
-        return 0;
-    }
-    let Some(s) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
-        return 0;
-    };
-    match import_cached_lookup(s, fromlist_empty != 0) {
-        Some(module) => module as i64,
-        None => 0,
-    }
-}
 
-fn import_cached_lookup(name: &str, fromlist_empty: bool) -> Option<pyre_object::PyObjectRef> {
-    let leaf = pyre_interpreter::importing::sys_module_if_initialized(name)?;
-    if fromlist_empty {
-        if let Some(dot) = name.find('.') {
-            return pyre_interpreter::importing::sys_module_if_initialized(&name[..dot]);
-        }
-        return Some(leaf);
-    }
-    // `interp___import__` else-arm: a fromlist on a non-package returns
-    // the cached module.  Recheck `__path__` here (`findattr`) so a later
-    // package conversion is a residual miss, not a baked "not a package".
-    if pyre_interpreter::importing::module_is_package_no_callback(leaf)? {
-        None
-    } else {
-        Some(leaf)
-    }
-}
 
-/// Cached absolute `import name` / `from name import ...` on a module already
-/// in `sys.modules`: `_gcd_import` as one non-forcing residual instead of
-/// `CallMayForce` through `builtins.__import__`.
-///
-/// PyPy's `test_import.test_import_in_function` wants the IMPORT_NAME region
-/// to be `guard_not_invalidated` only.  Look-inside of the generated
-/// `__import__` wrapper is still refused (un-lowered helpers in the body), so
-/// the walker records an impure `jit_import_cached` `sys.modules` read
-/// and `GuardValue`s the module observed at record time.  A replaced or
-/// deleted entry side-exits to the original `IMPORT_NAME`.
-///
-/// A non-empty exact-tuple fromlist is admitted only when the cached
-/// module is not a package: `interp___import__` then returns `w_mod`.
-/// `__path__` is re-probed on every residual call (hook-free `findattr`)
-/// so a later package conversion misses instead of baking "not a package".
-/// A package, a hooky `__path__`, a relative import, a non-zero level, a
-/// rebound `__import__`, or a cache miss decline (SAFE).
-pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    code: &[u8],
-    op: &DecodedOp,
-    r_args: &[OpRef],
-    dst: usize,
-) -> Result<Option<DispatchOutcome>, DispatchError> {
-    // `simple_call(__import__, NULL, name, globals, locals, fromlist, level)`
-    if r_args.len() != 7 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(w_name),
-        _,
-        _,
-        ConcreteValue::Ref(w_fromlist),
-        ConcreteValue::Ref(w_level),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-        arg_concretes[4],
-        arg_concretes[5],
-        arg_concretes[6],
-    )
-    else {
-        return Ok(None);
-    };
-    if callable.is_null() || !null_or_self.is_null() || w_name.is_null() || w_level.is_null() {
-        return Ok(None);
-    }
-    if !unsafe { pyre_object::is_exact_type(w_name, &pyre_object::STR_TYPE) } {
-        return Ok(None);
-    }
-    if !unsafe { pyre_object::is_exact_type(w_level, &pyre_object::INT_TYPE) } {
-        return Ok(None);
-    }
-    if unsafe { pyre_object::w_int_get_value(w_level) } != 0 {
-        return Ok(None);
-    }
-    if !unsafe { pyre_interpreter::is_function_carrier(callable) } {
-        return Ok(None);
-    }
-    let builtin_code =
-        unsafe { pyre_interpreter::function_get_code(callable) } as pyre_object::PyObjectRef;
-    if builtin_code.is_null() || !unsafe { pyre_interpreter::is_builtin_code(builtin_code) } {
-        return Ok(None);
-    }
-    let fnaddr = unsafe { pyre_interpreter::builtin_code_get(builtin_code) as usize };
-    if fnaddr
-        != pyre_interpreter::builtins::__majit_wrap_builtin_dunder_import as *const () as usize
-    {
-        return Ok(None);
-    }
-    // `interp___import__` uses `space.is_true(w_fromlist)`.  Only None
-    // and an exact tuple are classified here: a list can change
-    // emptiness after GuardValue on the pointer, and a tuple subclass
-    // can override `__bool__`.  Exact-tuple emptiness is `len == 0`,
-    // the same answer `is_true` gives without a hook.
-    if !w_fromlist.is_null()
-        && !unsafe { pyre_object::is_none(w_fromlist) }
-        && !unsafe { pyre_object::is_exact_tuple(w_fromlist) }
-    {
-        return Ok(None);
-    }
-    let fromlist_empty = w_fromlist.is_null()
-        || unsafe { pyre_object::is_none(w_fromlist) }
-        || unsafe { pyre_object::w_tuple_len(w_fromlist) == 0 };
-    // Record-time probe: dict-only, no Python hooks.  FastPathGiveUp and
-    // hook-shaped objects decline so the generic importer (CallMayForce)
-    // runs once.
-    let Some(s) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
-        return Ok(None);
-    };
-    let Some(w_mod) = import_cached_lookup(s, fromlist_empty) else {
-        return Ok(None);
-    };
-
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(callable as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[callable_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
-    let name_op = r_args[2];
-    let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
-    let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::STR_TYPE);
-    walker_guard_class(ctx, op.pc, name_op, str_type_addr)?;
-    walker_guard_exact_w_class(ctx, op.pc, name_op, str_typeobj)?;
-    if !name_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(w_name as i64);
-        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[name_op, expected])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(name_op, expected);
-    }
-    let fromlist_op = r_args[5];
-    if !fromlist_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(w_fromlist as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[fromlist_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(fromlist_op, expected);
-    }
-    let level_op = r_args[6];
-    let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(w_level);
-    let level_raw = walker_unbox_int_exact(
-        ctx,
-        op.pc,
-        level_op,
-        int_type,
-        int_descr,
-        walker_numeric_builtin_class(w_level),
-    )?;
-    let zero = ctx.trace_ctx.const_int(0);
-    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[level_raw, zero])?;
-
-    let helper = jit_import_cached as *const ();
-    // Impure `CallR`: `sys.modules` is mutable.  `call_typed_with_effect_pure`
-    // would CSE / const-fold the lookup; a later replacement of
-    // `sys.modules[name]` must re-run and `GuardValue`-exit.  The helper
-    // only reads module/spec dicts on exact `module` objects whose
-    // `__getattribute__` is the module default, so it cannot raise or
-    // force a virtualizable.  Hook-shaped objects declined above;
-    // `IMPORT_NAME` keeps CallMayForce.
-    let fromlist_empty_op = ctx.trace_ctx.const_int(i64::from(fromlist_empty));
-    let result = ctx.trace_ctx.call_typed_with_effect(
-        OpCode::CallR,
-        helper,
-        &[name_op, fromlist_empty_op],
-        &[majit_ir::Type::Ref, majit_ir::Type::Int],
-        majit_ir::Type::Ref,
-        majit_metainterp::cannot_raise_effect_info(),
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        result,
-        majit_ir::Value::Ref(majit_ir::GcRef(w_mod as usize)),
-    );
-    let expected = ctx.trace_ctx.const_ref(w_mod as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[result, expected])?;
-    ctx.trace_ctx.heap_cache_mut().replace_box(result, expected);
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
-    Ok(Some(DispatchOutcome::Continue))
-}
 
 /// BUILD_STRING — already-string fragments concatenated by
 /// `pyopcode.py BUILD_STRING`.
@@ -20081,6 +19553,27 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+
+/// Walker-native RAISE_VARARGS inline-built-exception fast path. The
+/// `RaiseVarargs` residual is `normalize_raise_varargs_jit(frame, exc,
+/// cause)` — `r_args = [frame, exc, cause]`.  When `exc` was built inline by
+/// [`try_walker_trace_exception_new`] (∈ [`FBW_BUILT_EXC`]) and there is
+/// no explicit `from` cause (concrete `cause` is `PY_NULL`), skip the
+/// residual publish + its `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION` and
+/// emit `__context__` as a `SetfieldGc` on the (still virtual) exception:
+///
+///   active = GETFIELD_GC_R(ec, sys_exc_value)
+///   SETFIELD_GC(exc, active, w_exception.w_context)
+///
+/// For a fresh exception `w_context` is null and the self-cycle is
+/// impossible, so `attach_raise_cause`'s conditional `w_context = active`
+/// reduces to the unconditional store (a null store when no exception is
+/// active is a no-op that DCEs).  The normalized result is the same
+/// instance for a flat builtin, so the inline-built `exc` OpRef is
+/// written straight to the dst that fed the following `raise/r`.
+///
+/// Returns `None` (fall through to the residual) when `exc` was not
+/// inline-built or a `from` cause is present.
 /// `BaseException.descr_reduce`: `(cls, args)` when `w_dict` is unset or
 /// empty.  The residual `bh_call_fn(__reduce__)` forces a virtual exception
 /// every iteration; this emit keeps the 2-tuple virtual so the constructor
@@ -20286,26 +19779,6 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Walker-native RAISE_VARARGS inline-built-exception fast path. The
-/// `RaiseVarargs` residual is `normalize_raise_varargs_jit(frame, exc,
-/// cause)` — `r_args = [frame, exc, cause]`.  When `exc` was built inline by
-/// [`try_walker_trace_exception_new`] (∈ [`FBW_BUILT_EXC`]) and there is
-/// no explicit `from` cause (concrete `cause` is `PY_NULL`), skip the
-/// residual publish + its `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION` and
-/// emit `__context__` as a `SetfieldGc` on the (still virtual) exception:
-///
-///   active = GETFIELD_GC_R(ec, sys_exc_value)
-///   SETFIELD_GC(exc, active, w_exception.w_context)
-///
-/// For a fresh exception `w_context` is null and the self-cycle is
-/// impossible, so `attach_raise_cause`'s conditional `w_context = active`
-/// reduces to the unconditional store (a null store when no exception is
-/// active is a no-op that DCEs).  The normalized result is the same
-/// instance for a flat builtin, so the inline-built `exc` OpRef is
-/// written straight to the dst that fed the following `raise/r`.
-///
-/// Returns `None` (fall through to the residual) when `exc` was not
-/// inline-built or a `from` cause is present.
 pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -23117,6 +22590,104 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     Ok(Some(item))
 }
 
+
+/// Both operands of a `str` comparison, with their concrete objects —
+/// the gate of [`try_walker_specialize_compare_op_str`].
+///
+/// Exactness is required on both sides.  A `str` SUBCLASS shares the payload
+/// `ob_type` but retags `w_class` and may override `__eq__` / `__add__`, and
+/// `_compare` / `descr_add` (unicodeobject.py) honour that override, so such
+/// an operand falls through to the generic residual.
+fn walker_str_pair_operands<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    r_args: &[OpRef],
+) -> Option<(
+    OpRef,
+    OpRef,
+    pyre_object::PyObjectRef,
+    pyre_object::PyObjectRef,
+)> {
+    if r_args.len() != 2 {
+        return None;
+    }
+    let (lhs, rhs) = (r_args[0], r_args[1]);
+    let lhs_obj = walker_concrete_ref_object(ctx, lhs)?;
+    let rhs_obj = walker_concrete_ref_object(ctx, rhs)?;
+    let exact = |obj: pyre_object::PyObjectRef| unsafe {
+        pyre_object::is_exact_type(obj, &pyre_object::STR_TYPE)
+            && pyre_object::w_str_get_value_opt(obj).is_some()
+    };
+    if !exact(lhs_obj) || !exact(rhs_obj) {
+        return None;
+    }
+    Some((lhs, rhs, lhs_obj, rhs_obj))
+}
+
+/// Admission for `COMPARE_OP_DESCENT` on tags 6/7.  Same job as the
+/// exact-numeric gate on tags 0..=5: do not start a sub-walk whose body
+/// can run Python (`__hash__` / `__eq__` / a subclass `__contains__`).
+/// A declining residual would re-run those side effects.  This is not
+/// a type-specialization fold: it is the callback-free gate the other
+/// compare-op descent already uses.  Removing it would re-run a stored
+/// `__eq__` when the sub-walk then declines.
+///
+/// Exact `str`/`bytes` plus a needle whose membership is an elidable
+/// find (another exact `str`/`bytes`, or a byte in `range(256)`), and
+/// an exact `IntegerListStrategy` list plus a plain `int`, are
+/// callback-free.  `dict`/`set` stay on the residual: a stored
+/// element's `__eq__` can still run on a hash collision.
+fn walker_contains_descent_callback_free(
+    needle: pyre_object::PyObjectRef,
+    haystack: pyre_object::PyObjectRef,
+) -> bool {
+    let exact = |obj: pyre_object::PyObjectRef, tp: &pyre_object::pyobject::PyType| unsafe {
+        pyre_object::is_exact_type(obj, tp)
+            && std::ptr::eq((*obj).w_class, pyre_object::get_instantiate(tp))
+    };
+    if exact(haystack, &pyre_object::pyobject::STR_TYPE) {
+        return exact(needle, &pyre_object::pyobject::STR_TYPE)
+            && unsafe { pyre_object::w_str_get_value_opt(needle).is_some() };
+    }
+    if exact(haystack, &pyre_object::bytesobject::BYTES_TYPE) {
+        if exact(needle, &pyre_object::bytesobject::BYTES_TYPE) {
+            return true;
+        }
+        return unsafe {
+            pyre_object::listobject::is_plain_int1(needle) && pyre_object::is_int(needle)
+        } && (0..=255).contains(&unsafe { pyre_object::w_int_get_value(needle) });
+    }
+    if exact(haystack, &pyre_object::pyobject::LIST_TYPE) {
+        return unsafe {
+            pyre_object::listobject::w_list_strategy(haystack)
+                == pyre_object::listobject::ListStrategy::Integer
+                && pyre_object::listobject::is_plain_int1(needle)
+                && pyre_object::is_int(needle)
+        };
+    }
+    false
+}
+
+/// `guard_class(&STR_TYPE)` + the exact canonical `w_class` guard, the pair
+/// that keeps a `str` subclass out of a fold written for the builtin body.
+fn walker_guard_exact_str<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+) -> Result<(), DispatchError> {
+    walker_guard_class(
+        ctx,
+        op_pc,
+        operand,
+        &pyre_object::pyobject::STR_TYPE as *const _ as i64,
+    )?;
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        operand,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE),
+    )
+}
+
 /// Specialize `STORE_SUBSCR target[const_slice] = source` for a same-length,
 /// step-1 slice between two Integer-strategy exact lists, eliding the
 /// `CALL_MAY_FORCE` `store_subscr` residual that would force the virtualizable
@@ -23363,103 +22934,6 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
         }
     }
     Ok(Some(()))
-}
-
-/// Both operands of a `str` comparison, with their concrete objects —
-/// the gate of [`try_walker_specialize_compare_op_str`].
-///
-/// Exactness is required on both sides.  A `str` SUBCLASS shares the payload
-/// `ob_type` but retags `w_class` and may override `__eq__` / `__add__`, and
-/// `_compare` / `descr_add` (unicodeobject.py) honour that override, so such
-/// an operand falls through to the generic residual.
-fn walker_str_pair_operands<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    r_args: &[OpRef],
-) -> Option<(
-    OpRef,
-    OpRef,
-    pyre_object::PyObjectRef,
-    pyre_object::PyObjectRef,
-)> {
-    if r_args.len() != 2 {
-        return None;
-    }
-    let (lhs, rhs) = (r_args[0], r_args[1]);
-    let lhs_obj = walker_concrete_ref_object(ctx, lhs)?;
-    let rhs_obj = walker_concrete_ref_object(ctx, rhs)?;
-    let exact = |obj: pyre_object::PyObjectRef| unsafe {
-        pyre_object::is_exact_type(obj, &pyre_object::STR_TYPE)
-            && pyre_object::w_str_get_value_opt(obj).is_some()
-    };
-    if !exact(lhs_obj) || !exact(rhs_obj) {
-        return None;
-    }
-    Some((lhs, rhs, lhs_obj, rhs_obj))
-}
-
-/// Admission for `COMPARE_OP_DESCENT` on tags 6/7.  Same job as the
-/// exact-numeric gate on tags 0..=5: do not start a sub-walk whose body
-/// can run Python (`__hash__` / `__eq__` / a subclass `__contains__`).
-/// A declining residual would re-run those side effects.  This is not
-/// a type-specialization fold: it is the callback-free gate the other
-/// compare-op descent already uses.  Removing it would re-run a stored
-/// `__eq__` when the sub-walk then declines.
-///
-/// Exact `str`/`bytes` plus a needle whose membership is an elidable
-/// find (another exact `str`/`bytes`, or a byte in `range(256)`), and
-/// an exact `IntegerListStrategy` list plus a plain `int`, are
-/// callback-free.  `dict`/`set` stay on the residual: a stored
-/// element's `__eq__` can still run on a hash collision.
-fn walker_contains_descent_callback_free(
-    needle: pyre_object::PyObjectRef,
-    haystack: pyre_object::PyObjectRef,
-) -> bool {
-    let exact = |obj: pyre_object::PyObjectRef, tp: &pyre_object::pyobject::PyType| unsafe {
-        pyre_object::is_exact_type(obj, tp)
-            && std::ptr::eq((*obj).w_class, pyre_object::get_instantiate(tp))
-    };
-    if exact(haystack, &pyre_object::pyobject::STR_TYPE) {
-        return exact(needle, &pyre_object::pyobject::STR_TYPE)
-            && unsafe { pyre_object::w_str_get_value_opt(needle).is_some() };
-    }
-    if exact(haystack, &pyre_object::bytesobject::BYTES_TYPE) {
-        if exact(needle, &pyre_object::bytesobject::BYTES_TYPE) {
-            return true;
-        }
-        return unsafe {
-            pyre_object::listobject::is_plain_int1(needle) && pyre_object::is_int(needle)
-        } && (0..=255).contains(&unsafe { pyre_object::w_int_get_value(needle) });
-    }
-    if exact(haystack, &pyre_object::pyobject::LIST_TYPE) {
-        return unsafe {
-            pyre_object::listobject::w_list_strategy(haystack)
-                == pyre_object::listobject::ListStrategy::Integer
-                && pyre_object::listobject::is_plain_int1(needle)
-                && pyre_object::is_int(needle)
-        };
-    }
-    false
-}
-
-/// `guard_class(&STR_TYPE)` + the exact canonical `w_class` guard, the pair
-/// that keeps a `str` subclass out of a fold written for the builtin body.
-fn walker_guard_exact_str<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-) -> Result<(), DispatchError> {
-    walker_guard_class(
-        ctx,
-        op_pc,
-        operand,
-        &pyre_object::pyobject::STR_TYPE as *const _ as i64,
-    )?;
-    walker_guard_exact_w_class(
-        ctx,
-        op_pc,
-        operand,
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE),
-    )
 }
 
 /// Walker-native specialization for the `COMPARE_OP` residual on two exact

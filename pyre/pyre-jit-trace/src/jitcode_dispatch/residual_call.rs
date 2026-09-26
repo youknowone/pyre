@@ -7308,20 +7308,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok(inlined);
     }
 
-    // Cached `import math` / `from math import pi`: `_gcd_import` hit
-    // recorded as a non-forcing residual when look-inside of `__import__`
-    // is still refused.  Tried after the descent so a walkable wrapper
-    // produces the PyPy field-read shape instead of this CallR.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && let Some(outcome) = spec_gate(SpecFold::ImportCached, || {
-            try_walker_specialize_import_cached(ctx, code, op, &r_args, dst)
-        })?
-    {
-        return Ok((outcome, op.next_pc));
-    }
-
     // #62 slice (3c): attempt full-body-walk inline of a user-function call
     // unconditionally. Eligible exact-positional closure-free
     // calls sub-walk the callee body in place of the residual; ineligible
@@ -7435,15 +7421,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             try_walker_inline_format(ctx, op, code, &r_args, call_descr, dst, dst_bank)?
         {
             return Ok(inlined);
-        }
-        if ctx.is_authoritative_executor
-            && dst_bank == 'r'
-            && spec_gate(SpecFold::FormatWithSpec, || {
-                try_walker_specialize_format_with_spec(ctx, op, &r_args, dst)
-            })?
-            .is_some()
-        {
-            return Ok((DispatchOutcome::Continue, op.next_pc));
         }
     }
 
