@@ -1812,36 +1812,9 @@ impl<'a> GraphFlattener<'a> {
 
     fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool) {
         let exits = block.borrow().exits.clone();
-        // `raise/r` is not a canraise op (`graph_op_can_raise` omits it).
-        // A later merge that appends a normal exit, or vable stores after
-        // the raise, used to take the multi-exit early-return and drop
-        // `catch_exception`.  Any block that recorded `raise` is
-        // raise-terminated: emit the adjacent catch and the seeded
-        // exception exit.  Do not go through `raising_op()` — that is
-        // `None` when `canraise()` is false.
-        if block
-            .borrow()
-            .operations
-            .iter()
-            .any(|op| op.opname == "raise")
-        {
-            let link = exits
-                .iter()
-                .find(|link| {
-                    let link = link.borrow();
-                    link.last_exception.is_some() && link.last_exc_value.is_some()
-                })
-                .expect(
-                    "raise-terminated block has an exception-carrying exit; \
-                     attach_catch_exception_edge must run after recording raise",
-                );
-            let catch_label = self.tlabel_for_link(link);
-            self.emitline(Insn::op("catch_exception", vec![catch_label]));
-            let handler_label = self.label_for_link(link);
-            self.emitline(handler_label);
-            self.make_exception_link(link, handling_ovf);
-            return;
-        }
+        // `flatten.py insert_exits` chooses the arm from `len(exits)` and
+        // `block.canraise` (`exitswitch is c_last_exception`). A `raise`
+        // operation does not pick the exit.
         if exits.len() == 1 {
             // `flatten.py assert link.exitcase in (None, False, True)`
             // — single-exit links carry either the default fall-through
@@ -1880,13 +1853,6 @@ impl<'a> GraphFlattener<'a> {
             // `catch_exception TLabel(normal) … Label(normal) …
             // make_exception_link` layout (flatten.py).
             if block.borrow().canraise() {
-                debug_assert!(
-                    block
-                        .borrow()
-                        .raising_op()
-                        .is_some_and(|op| op.opname == "raise"),
-                    "single-exit canraise block must be raise-terminated"
-                );
                 let catch_label = self.tlabel_for_link(link);
                 self.emitline(Insn::op("catch_exception", vec![catch_label]));
                 let handler_label = self.label_for_link(link);
@@ -8552,6 +8518,71 @@ mod tests {
                 .insns
                 .iter()
                 .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "last_exc_value"))
+        );
+    }
+
+    /// `flatten.py insert_exits` picks the raising exits from `block.canraise`
+    /// and the link list (`exits[0]` normal, `exits[1:]` exception), never from
+    /// an operation's name. A `raise` op inside that block must not discard
+    /// the normal link.
+    #[test]
+    fn insert_exits_raise_op_still_lowers_every_canraise_link() {
+        use crate::jit::flow::{Block, ExitSwitch, FunctionGraph, Link, c_last_exception};
+        let exc_type = Variable::new(VariableId(0), Kind::Int);
+        let exc_value = Variable::new(VariableId(1), Kind::Ref);
+        let raised = Variable::new(VariableId(2), Kind::Ref);
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("raise_canraise", start.clone(), Some(exc_value));
+        let handler = graph.new_block(vec![exc_type.into(), exc_value.into()]);
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new("raise", vec![raised.into()], None, 0),
+        );
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new(crate::jit::flatten::OPNAME_LIVE, Vec::new(), None, 0),
+        );
+        handler.closeblock(vec![
+            Link::new(
+                vec![Constant::signed(2).into()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        start.borrow_mut().exitswitch = Some(ExitSwitch::Value(c_last_exception().into()));
+        let normal_link = Link::new(
+            vec![Constant::signed(1).into()],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        let mut exc_link = Link::new(
+            vec![exc_type.into(), exc_value.into()],
+            Some(handler.clone()),
+            None,
+        );
+        exc_link.extravars(Some(exc_type), Some(exc_value));
+        start.closeblock(vec![normal_link, exc_link.into_ref()]);
+
+        let mut ssarepr = SSARepr::new("raise_canraise");
+        flatten_graph_for_test(&graph, &mut ssarepr);
+
+        let returns: Vec<i64> = ssarepr
+            .insns
+            .iter()
+            .filter_map(|insn| match insn {
+                Insn::Op { opname, args, .. } if opname == "int_return" => match args.as_slice() {
+                    [Operand::ConstInt(value)] => Some(*value),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            returns.contains(&1) && returns.contains(&2),
+            "canraise links must both lower (normal=1, handler=2), got {returns:?} from {:?}",
+            ssarepr.insns
         );
     }
 
