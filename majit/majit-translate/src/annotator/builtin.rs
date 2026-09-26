@@ -338,6 +338,12 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "std.ptr.null_mut", ptr_null_constant);
     analyzer_for(&mut reg, "core.ptr.null", ptr_null_constant);
     analyzer_for(&mut reg, "std.ptr.null", ptr_null_constant);
+    // `Option<fn>`'s null niche. A GC pointer's null is
+    // `ptr_null_constant` (classdef-less `SomeInstance`); a raw function
+    // pointer's null is the same `SomePtr(FuncType)` as the `fn` field
+    // (`raw_fn_ptr_somevalue`), so the two arms of `Option<fn>` union.
+    analyzer_for(&mut reg, "core.ptr.null_fn", fn_null_constant);
+    analyzer_for(&mut reg, "std.ptr.null_fn", fn_null_constant);
     // Rust `std::mem::size_of::<T>() -> usize` — compile-time type-size
     // constant called by `lltype::malloc_typed` /
     // `object_array::items_block_layout`.  Returns `SomeInteger`.
@@ -1426,6 +1432,22 @@ fn ptr_null_constant(
         true,
         std::collections::BTreeMap::new(),
     )))
+}
+
+/// Null `Option<fn>` — `lltype.nullptr(FuncType)` as `SomePtr`, not the
+/// classdef-less `SomeInstance` that `ptr_null_constant` returns for a
+/// GC pointer. `llannotation.py` `pairtype(SomePtr, SomePtr).union`
+/// requires the same `ll_ptrtype` as the function-pointer field read
+/// (`raw_fn_ptr_somevalue`).
+fn fn_null_constant(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !args_s.is_empty() || !kwds.is_empty() {
+        return Err(AnnotatorError::new("ptr::null_fn() takes no arguments"));
+    }
+    Ok(super::bookkeeper::raw_fn_ptr_somevalue())
 }
 
 /// Analyzer for `std::mem::size_of::<T>() -> usize` — compile-time
@@ -2608,6 +2630,33 @@ mod tests {
 
     fn bk() -> Rc<Bookkeeper> {
         Rc::new(Bookkeeper::new())
+    }
+
+    /// `Option<fn>`'s null and a `fn` field read are one `SomePtr`.
+    /// `ptr_null_constant` is a classdef-less `SomeInstance` and does not
+    /// union with that pointer (`llannotation.py` `pairtype(SomePtr, SomePtr)`).
+    #[test]
+    fn option_fn_null_unions_with_fn_pointer() {
+        use crate::annotator::bookkeeper::raw_fn_ptr_somevalue;
+        use crate::annotator::model::unionof;
+        let s_fn = raw_fn_ptr_somevalue();
+        let s_null =
+            fn_null_constant(&bk(), &[], &std::collections::HashMap::new()).expect("null_fn");
+        let merged = unionof([&s_fn, &s_null]).expect("Option<fn> arms union");
+        assert!(
+            matches!(merged, SomeValue::Ptr(_)),
+            "null_fn must stay SomePtr, got {merged:?}"
+        );
+        // `null_mut` is a classdef-less `SomeInstance`. Joining it with a
+        // function pointer collapses to that instance, which is the return
+        // slot Phase B then cannot convert a `Ptr(FuncType)` into.
+        let s_gc_null =
+            ptr_null_constant(&bk(), &[], &std::collections::HashMap::new()).expect("null_mut");
+        let collapsed = unionof([&s_fn, &s_gc_null]).expect("Instance/Ptr join");
+        assert!(
+            matches!(collapsed, SomeValue::Instance(_)),
+            "null_mut collapses a fn pointer, got {collapsed:?}"
+        );
     }
 
     /// Build a `SomeInstance` whose classdesc does or does not declare
