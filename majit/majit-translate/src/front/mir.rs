@@ -28560,18 +28560,23 @@ fn tyref_is_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
 /// A value with no runtime representation: unit `()`, a layout-size-0
 /// struct, or one borrow of such a struct (`&self` on a ZST).
 ///
+/// A closure environment and a function item stay values. Each names one
+/// callable, and the annotator has to see which one (`SomePBC`). `getkind`
+/// (`history.py`) returns `"void"` only for `lltype.Void`, and that low-level
+/// repr belongs to `FunctionsPBCRepr` / `SingleFrozenPBCRepr`, not to this
+/// flow value. Erasing a closure env to `Void` makes a `getattr` of
+/// `call_once` read a `Constant(None, Void)`. Identified from the type decl's
+/// `src: Closure` origin, or from a `FnDef` type node — never from the
+/// `closure` name leaf.
+///
 /// A fieldless enum is a discriminant integer, including through a borrow,
-/// so it is not void. A closure environment is not void either: `getkind`
-/// (`history.py`) returns `"void"` only for `lltype.Void`, and a closure
-/// is a callable — `getattr` of `call_once` still names it. Erasing the
-/// env to `Void` makes that getattr read a `Constant(None, Void)`.
-/// `strip_ty_wrappers` peels the borrow; the pointee's layout is what
-/// `tyref_is_zero_sized` reads.
+/// so it is not void. `strip_ty_wrappers` peels the borrow; the pointee's
+/// layout is what `tyref_is_zero_sized` reads.
 fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool {
-    if tyref_is_fieldless_enum_free(ty, llbc)
-        || tyref_is_borrowed_fieldless_enum_free(ty, llbc)
-        || tyref_is_closure_env(ty, llbc)
-    {
+    if tyref_keeps_callable_identity(ty, llbc) {
+        return false;
+    }
+    if tyref_is_fieldless_enum_free(ty, llbc) || tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return false;
     }
     if is_unit_type(ty, llbc) || tyref_is_zero_sized(ty, llbc) {
@@ -28581,10 +28586,29 @@ fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     };
     let peeled = TyRef::Other(node.clone());
+    if tyref_keeps_callable_identity(&peeled, llbc) {
+        return false;
+    }
     if tyref_is_fieldless_enum_free(&peeled, llbc) {
         return false;
     }
     is_unit_type(&peeled, llbc) || tyref_is_zero_sized(&peeled, llbc)
+}
+
+/// A closure ADT or a function item (`FnDef`). Layout size 0 does not erase
+/// either one: the flow value is the callable the annotator reads.
+fn tyref_keeps_callable_identity(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_is_closure_env(ty, llbc) {
+        return true;
+    }
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    if type_node_fn_def_fun_id(node, llbc).is_some() {
+        return true;
+    }
+    strip_ty_wrappers(node, llbc)
+        .is_some_and(|peeled| type_node_fn_def_fun_id(peeled, llbc).is_some())
 }
 
 fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> bool {
