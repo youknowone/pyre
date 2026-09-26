@@ -3900,7 +3900,17 @@ pub fn trace_and_compile_from_bridge(
                     green_key, trace_id, fail_index, resume_pc, pc, compiled
                 );
             }
-            if compiled {
+            // `pyjitpl.py handle_guard_failure` never goes back to the
+            // guard's resume state once `interpret()` has run: a failed
+            // `compile_trace` keeps tracing, and the give-up is a
+            // `SwitchToBlackhole` from the current framestack. The walk above
+            // already executed the region from the guard to `pc` and handed
+            // its end state to `jit_state`, so resuming the guard state in the
+            // blackhole would run that region a second time. Continue from
+            // the walk's position whether or not a bridge was attached.
+            // `usize::MAX` is the walk that returned from the frame, whose
+            // result this path does not receive.
+            if compiled || pc != usize::MAX {
                 return BridgeResolution::CompiledContinue;
             }
             return BridgeResolution::ResumeBlackhole;

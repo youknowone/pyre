@@ -3773,6 +3773,33 @@ impl<S: JitState> JitDriver<S> {
         self.continue_running_normally_payload = values.map(|values| (values, restart_pc));
     }
 
+    /// A `compile_loop` that gave up after taking the trace ctx leaves no
+    /// trace to continue, while the walk that reached this merge point has
+    /// already executed every residual call on the way. Upstream never
+    /// reaches this state: `compile.compile_loop` returns None with the
+    /// history intact and `reached_loop_header` keeps tracing, and the
+    /// eventual `SwitchToBlackhole(ABORT_BAD_LOOP)` runs the blackhole from
+    /// the current framestack (`run_blackhole_interp_to_cancel_tracing`),
+    /// which at a merge point ends in `ContinueRunningNormally` with the
+    /// live boxes. Neither path rewinds to the trace entry. Hand the
+    /// interpreter the walk's merge-point values the same way, so the
+    /// executed iteration is not replayed over the heap it already changed.
+    ///
+    /// A walk entered at a guard's resume position hands its end state over
+    /// through the `single_pass_outcome` staged at the top of the `CloseLoop`
+    /// arm, which `bridge_from_guard_resume_position` consumes; it has no
+    /// reader for this payload.
+    fn continue_after_drained_cancel(
+        &mut self,
+        values: Option<Vec<Value>>,
+        restart_pc: Option<usize>,
+    ) {
+        if self.bridge_entered_at_guard_resume {
+            return;
+        }
+        self.note_continue_running_normally(values, restart_pc);
+    }
+
     pub fn compile_trace_success_pending(&self) -> bool {
         self.compile_trace_success
     }
@@ -4532,11 +4559,16 @@ impl<S: JitState> JitDriver<S> {
                                 // incremented inside compile_loop and tracing
                                 // continues unless `cancelled_too_many_times`
                                 // escalates to Aborted. The wrapper restored
-                                // session↔tracing alignment so no extra cleanup
-                                // is required here — either the early-Cancelled
-                                // path kept both live (tracing continues) or a
-                                // late-Cancelled path drained both (next bound
-                                // reaches begins a fresh session).
+                                // session↔tracing alignment: either the
+                                // early-Cancelled path kept both live (tracing
+                                // continues) or a late-Cancelled path drained
+                                // both.
+                                if !self.meta.is_tracing() {
+                                    self.continue_after_drained_cancel(
+                                        continue_running_normally_values,
+                                        None,
+                                    );
+                                }
                             }
                             crate::CompileOutcome::Aborted => {
                                 // pyjitpl.py:3028 SwitchToBlackhole(ABORT_BAD_LOOP)
@@ -4759,6 +4791,12 @@ impl<S: JitState> JitDriver<S> {
                                 // tracing continues (or is already drained inside
                                 // compile_loop for late-cancel cases). The wrapper
                                 // maintains the session↔tracing invariant.
+                                if !self.meta.is_tracing() {
+                                    self.continue_after_drained_cancel(
+                                        continue_running_normally_values,
+                                        loop_header_pc,
+                                    );
+                                }
                             }
                             crate::CompileOutcome::Aborted => {
                                 // pyjitpl.py:3028 SwitchToBlackhole
