@@ -4457,11 +4457,20 @@ impl OptContext {
                 arg,
                 OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
             );
+            // `use_box` keeps the info of a body box it appends as a
+            // dependency (its `_forwarded` is what the body was optimized
+            // under), so a box already in `short` still carries info here.
+            // Upstream's `arg.set_forwarded(None)` makes that second use an
+            // `arg.get_forwarded() is None` no-op; `short_results` answers the
+            // same question without discarding the body's info.
             let has_replay_marker = arg_operand.bound_op().is_some_and(|op| {
                 !matches!(
                     &op.forwarded().borrow(),
                     majit_ir::forwarding::Forwarded::None
-                )
+                ) && !self
+                    .imported_short_preamble_builder
+                    .as_ref()
+                    .is_some_and(|builder| builder.has_short_result(op.pos().get()))
             });
             if (is_input || has_replay_marker)
                 && let Some(info) = snapshot_forwarded(self, arg)
