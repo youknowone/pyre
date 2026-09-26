@@ -221,13 +221,17 @@ pub(crate) fn int_comparison_residual_for_method(leaf: &str) -> Option<Vec<Strin
     )
 }
 
-/// `descroperation::bigint_add(&RBigInt, &RBigInt) -> *mut RBigInt` is the
-/// source spelling of `rbigint.add`. The call is retargeted to
-/// `jit_bigint_add`, whose result the front models as one GC reference.
+/// `descroperation::bigint_{add,sub,mul}(&RBigInt, &RBigInt) -> *mut RBigInt`
+/// are the source spellings of `rbigint.add` / `sub` / `mul`. Each call is
+/// retargeted to the matching `jit_bigint_*`, whose result the front models
+/// as one GC reference.
 pub(crate) fn bigint_add_residual_path(segments: &[String]) -> Option<Vec<String>> {
-    if segments.last().map(String::as_str) != Some("bigint_add") {
-        return None;
-    }
+    let residual = match segments.last().map(String::as_str) {
+        Some("bigint_add") => "jit_bigint_add",
+        Some("bigint_sub") => "jit_bigint_sub",
+        Some("bigint_mul") => "jit_bigint_mul",
+        _ => return None,
+    };
     if !segments
         .iter()
         .rev()
@@ -242,7 +246,40 @@ pub(crate) fn bigint_add_residual_path(segments: &[String]) -> Option<Vec<String
             crate::runtime_names::crates::INTERPRETER,
             "objspace",
             "descroperation",
-            "jit_bigint_add",
+            residual,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    )
+}
+
+/// `descroperation::bigint_int_{add,sub,mul}(&RBigInt, i64) -> *mut RBigInt`
+/// are the source spellings of `rbigint.int_add` / `int_sub` / `int_mul`.
+/// The zero/one alias stays inside the helper; the front retargets the call
+/// to the elidable `jit_bigint_int_*` residual.
+pub(crate) fn bigint_int_payload_residual_path(segments: &[String]) -> Option<Vec<String>> {
+    let residual = match segments.last().map(String::as_str) {
+        Some("bigint_int_add") => "jit_bigint_int_add",
+        Some("bigint_int_sub") => "jit_bigint_int_sub",
+        Some("bigint_int_mul") => "jit_bigint_int_mul",
+        _ => return None,
+    };
+    if !segments
+        .iter()
+        .rev()
+        .skip(1)
+        .take(2)
+        .eq(["descroperation", "objspace"])
+    {
+        return None;
+    }
+    Some(
+        [
+            crate::runtime_names::crates::INTERPRETER,
+            "objspace",
+            "descroperation",
+            residual,
         ]
         .into_iter()
         .map(str::to_string)
@@ -708,6 +745,67 @@ mod tests {
         );
         assert!(
             bigint_add_residual_path(&segs(&["majit_rlib", "rbigint", "RBigInt", "add"])).is_none()
+        );
+        assert_eq!(
+            bigint_add_residual_path(&segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "bigint_sub",
+            ])),
+            Some(segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "jit_bigint_sub",
+            ]))
+        );
+        assert_eq!(
+            bigint_add_residual_path(&segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "bigint_mul",
+            ])),
+            Some(segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "jit_bigint_mul",
+            ]))
+        );
+    }
+
+    #[test]
+    fn maps_bigint_int_payload_leaves_to_pointer_abi() {
+        for (source, residual) in [
+            ("bigint_int_add", "jit_bigint_int_add"),
+            ("bigint_int_sub", "jit_bigint_int_sub"),
+            ("bigint_int_mul", "jit_bigint_int_mul"),
+        ] {
+            assert_eq!(
+                bigint_int_payload_residual_path(&segs(&[
+                    crate::runtime_names::crates::INTERPRETER,
+                    "objspace",
+                    "descroperation",
+                    source,
+                ])),
+                Some(segs(&[
+                    crate::runtime_names::crates::INTERPRETER,
+                    "objspace",
+                    "descroperation",
+                    residual,
+                ]))
+            );
+        }
+        assert!(
+            bigint_int_payload_residual_path(&segs(&[
+                "majit_rlib",
+                "rbigint",
+                "RBigInt",
+                "int_add",
+            ]))
+            .is_none()
         );
     }
 

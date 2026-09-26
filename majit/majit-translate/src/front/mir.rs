@@ -14089,9 +14089,15 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .is_some_and(|ty| self.tyref_literal_int_atom(ty) == Some("I64"))
             && let Some(residual) = match target {
-                CallTarget::FunctionPath { segments, .. } => segments.last().and_then(|leaf| {
-                    crate::front::rbigint_call::int_binop_residual_for_method(leaf)
-                }),
+                CallTarget::FunctionPath { segments, .. } => {
+                    crate::front::rbigint_call::bigint_int_payload_residual_path(segments).or_else(
+                        || {
+                            segments.last().and_then(|leaf| {
+                                crate::front::rbigint_call::int_binop_residual_for_method(leaf)
+                            })
+                        },
+                    )
+                }
                 CallTarget::Method { name, .. } => {
                     crate::front::rbigint_call::int_binop_residual_for_method(name)
                 }
