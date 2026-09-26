@@ -1405,6 +1405,29 @@ impl JitCodeBuilder {
         self.push_reg_u8(dest, "getfield_gc_r result");
     }
 
+    /// Emit `getfield_gc_f/rd>f` (`jtransform.py` `rewrite_op_getfield`:
+    /// `getkind` of a `lltype.Float` field is `f`).
+    ///
+    /// Pair of [`Self::setfield_gc_f`]. Both intern the field descr as
+    /// `Type::Float` (`descr.py` `get_type_flag` `FLAG_FLOAT`).
+    pub fn getfield_gc_f(
+        &mut self,
+        dest: u16,
+        struct_reg: u16,
+        offset: usize,
+        type_id: u64,
+        field_name: &str,
+    ) {
+        self.touch_ref_reg(struct_reg);
+        self.touch_float_reg(dest);
+        let descr =
+            self.add_struct_field_descr(offset, majit_ir::value::Type::Float, type_id, field_name);
+        self.write_insn("getfield_gc_f/rd>f");
+        self.push_reg_u8(struct_reg, "getfield_gc_f struct");
+        self.push_u16(descr);
+        self.push_reg_u8(dest, "getfield_gc_f result");
+    }
+
     pub fn vable_getfield_int_with_base(&mut self, dest: u16, vable_reg: u16, field_idx: u16) {
         self.touch_ref_reg(vable_reg);
         self.touch_reg(dest);
@@ -2114,6 +2137,22 @@ impl JitCodeBuilder {
         self.push_reg_u8(dst, "getarrayitem_gc_r dst");
     }
 
+    /// Load an f64 element (`blackhole.py` `bhimpl_getarrayitem_gc_f`).
+    ///
+    /// `jtransform.py` `rewrite_op_getarrayitem` picks `getarrayitem_gc_f`
+    /// when the array's item type is `lltype.Float`. The descr is
+    /// [`Self::add_raw_float_array_descr`].
+    pub fn getarrayitem_gc_f(&mut self, dst: u16, array_reg: u16, index_reg: u16, descr_idx: u16) {
+        self.touch_ref_reg(array_reg);
+        self.touch_reg(index_reg);
+        self.touch_float_reg(dst);
+        self.write_insn("getarrayitem_gc_f/rid>f");
+        self.push_reg_u8(array_reg, "getarrayitem_gc_f array");
+        self.push_reg_u8(index_reg, "getarrayitem_gc_f index");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "getarrayitem_gc_f dst");
+    }
+
     /// Add the array descriptor for a byte-element array to the descrs pool.
     ///
     /// Returns the descr index to pass as `descr_idx` to `getarrayitem_gc_i`.
@@ -2618,6 +2657,28 @@ impl JitCodeBuilder {
         self.push_reg_u8(array_reg, "setarrayitem_gc_r array");
         self.push_reg_u8(index_reg, "setarrayitem_gc_r index");
         self.push_reg_u8(value_reg, "setarrayitem_gc_r value");
+        self.push_u16(descr_idx);
+    }
+
+    /// Store an f64 element (`blackhole.py` `bhimpl_setarrayitem_gc_f`).
+    ///
+    /// Store counterpart of [`Self::getarrayitem_gc_f`]. `jtransform.py`
+    /// `rewrite_op_setarrayitem` emits this when the item type is
+    /// `lltype.Float`.
+    pub fn setarrayitem_gc_f(
+        &mut self,
+        array_reg: u16,
+        index_reg: u16,
+        value_reg: u16,
+        descr_idx: u16,
+    ) {
+        self.touch_ref_reg(array_reg);
+        self.touch_int_reg_or_pool_slot(index_reg);
+        self.touch_float_reg(value_reg);
+        self.write_insn("setarrayitem_gc_f/rifd");
+        self.push_reg_u8(array_reg, "setarrayitem_gc_f array");
+        self.push_reg_u8(index_reg, "setarrayitem_gc_f index");
+        self.push_reg_u8(value_reg, "setarrayitem_gc_f value");
         self.push_u16(descr_idx);
     }
 

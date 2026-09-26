@@ -245,6 +245,10 @@ pub struct LowererConfig {
     /// width and signedness with the struct layout instead of the machine-word
     /// default, which is what makes `descr.is_integer_bounded()` true for it.
     pub(super) int_fields: HashMap<String, (Ident, bool)>,
+    /// `int_fields` entries whose type is `f64`. Key = `"StructType::field"`.
+    /// A read is `getfield_gc_f` and the layout flag is `FLAG_FLOAT`
+    /// (`descr.py` `get_type_flag`).
+    pub(super) float_fields: HashSet<String>,
     /// `"StructType::field"` keys some access site asked about while lowering.
     ///
     /// A declared key that never appears here matched no access, so it emitted
@@ -959,25 +963,37 @@ pub(super) fn inferred_record_known_result_policy_check(result_kind: BindingKind
 }
 
 /// Build the `int_fields` lookup: key = `"StructLastSegment::field"`.
+fn field_entry_key(struct_type: &syn::Path, field: &Ident) -> String {
+    let struct_name = struct_type
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    format!("{}::{}", struct_name, field)
+}
+
 fn int_fields_map(
     int_fields: &[crate::jit_interp::IntFieldEntry],
 ) -> HashMap<String, (Ident, bool)> {
     int_fields
         .iter()
+        .filter(|entry| !entry.is_float())
         .map(|entry| {
-            let struct_name = entry
-                .struct_type
-                .segments
-                .last()
-                .map(|s| s.ident.to_string())
-                .unwrap_or_default();
-            let key = format!("{}::{}", struct_name, entry.field);
+            let key = field_entry_key(&entry.struct_type, &entry.field);
             // Validated at parse time.
             (
                 key,
                 (entry.int_type.clone(), entry.is_signed().unwrap_or(true)),
             )
         })
+        .collect()
+}
+
+fn float_fields_set(int_fields: &[crate::jit_interp::IntFieldEntry]) -> HashSet<String> {
+    int_fields
+        .iter()
+        .filter(|entry| entry.is_float())
+        .map(|entry| field_entry_key(&entry.struct_type, &entry.field))
         .collect()
 }
 
@@ -1085,6 +1101,7 @@ impl LowererConfig {
             array_fields: array_fields_map,
             array_headers: array_headers_map,
             int_fields: int_fields_map(int_fields),
+            float_fields: float_fields_set(int_fields),
             consulted_field_keys: Default::default(),
             call_returns: HashMap::new(),
             headerless_structs: headerless_structs
@@ -1394,6 +1411,7 @@ impl LowererConfig {
             array_fields: array_fields_map,
             array_headers: array_headers_map,
             int_fields: int_fields_map(int_fields),
+            float_fields: float_fields_set(int_fields),
             consulted_field_keys: Default::default(),
             call_returns: call_returns
                 .iter()
@@ -1549,7 +1567,7 @@ impl LowererConfig {
             let outer_to_base = quote! {
                 (#base_offset + ::core::mem::offset_of!(#current, #base_field))
             };
-            for (field, is_ref, size, signed) in self.declared_fields_of(base) {
+            for (field, is_ref, size, signed, is_float) in self.declared_fields_of(base) {
                 entries.push(quote! {
                     (
                         #outer_to_base + ::core::mem::offset_of!(#base, #field),
@@ -1557,7 +1575,7 @@ impl LowererConfig {
                         stringify!(#field),
                         #size,
                         #signed,
-                        false,
+                        #is_float,
                     )
                 });
             }
@@ -1583,7 +1601,7 @@ impl LowererConfig {
     fn declared_fields_of(
         &self,
         struct_path: &syn::Path,
-    ) -> Vec<(syn::Ident, bool, TokenStream, TokenStream)> {
+    ) -> Vec<(syn::Ident, bool, TokenStream, TokenStream, bool)> {
         let Some(last) = struct_path.segments.last() else {
             return Vec::new();
         };
@@ -1593,6 +1611,7 @@ impl LowererConfig {
             .keys()
             .map(|key| (key, true))
             .chain(self.int_fields.keys().map(|key| (key, false)))
+            .chain(self.float_fields.iter().map(|key| (key, false)))
             .chain(self.array_fields.keys().map(|key| (key, true)))
             .filter_map(|(key, is_ref)| key.strip_prefix(&prefix).map(|field| (field, is_ref)))
             .collect();
@@ -1606,9 +1625,13 @@ impl LowererConfig {
                 // reports its own type's width, an array field the pointer it
                 // reaches its buffer through, and anything else the eight-byte
                 // scalar an undeclared field defaults to.
+                let is_float = self.float_fields.contains(&key);
                 let (size, signed) = match self.int_fields.get(&key) {
                     Some((ty, signed)) => {
                         (quote! { ::core::mem::size_of::<#ty>() }, quote! { #signed })
+                    }
+                    None if is_float => {
+                        (quote! { ::core::mem::size_of::<f64>() }, quote! { false })
                     }
                     None if self.array_fields.contains_key(&key) => {
                         (quote! { ::core::mem::size_of::<usize>() }, quote! { false })
@@ -1620,6 +1643,7 @@ impl LowererConfig {
                     is_ref,
                     size,
                     signed,
+                    is_float,
                 )
             })
             .collect()
@@ -1635,6 +1659,7 @@ impl LowererConfig {
         let key = format!("{}::{}", struct_name.ident, field);
         self.ref_fields.contains_key(&key)
             || self.int_fields.contains_key(&key)
+            || self.float_fields.contains(&key)
             || self.array_fields.contains_key(&key)
     }
 }

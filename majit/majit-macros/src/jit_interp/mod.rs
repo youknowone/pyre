@@ -584,13 +584,21 @@ pub struct IntFieldEntry {
 impl IntFieldEntry {
     /// `descr.py get_type_flag(FIELDTYPE)` — the signed/unsigned half,
     /// read off the declared Rust type.
+    /// `f64` is `lltype.Float`, not an integer field.
+    pub(crate) fn is_float(&self) -> bool {
+        self.int_type == "f64"
+    }
+
     pub(crate) fn is_signed(&self) -> syn::Result<bool> {
         match self.int_type.to_string().as_str() {
             "i8" | "i16" | "i32" | "i64" | "isize" => Ok(true),
             "u8" | "u16" | "u32" | "u64" | "usize" | "bool" => Ok(false),
+            // `lltype.Float` (`descr.py` `get_type_flag` `FLAG_FLOAT`).
+            // Signedness does not apply; the lowerer emits `getfield_gc_f`.
+            "f64" => Ok(false),
             other => Err(syn::Error::new_spanned(
                 &self.int_type,
-                format!("int_fields: `{other}` is not an integer type"),
+                format!("int_fields: `{other}` is not an integer or f64 type"),
             )),
         }
     }

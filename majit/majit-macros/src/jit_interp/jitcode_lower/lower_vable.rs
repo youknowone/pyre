@@ -150,6 +150,12 @@ impl<'c> Lowerer<'c> {
     }
 }
 
+fn path_is_f64(path: &syn::Path) -> bool {
+    path.segments
+        .last()
+        .is_some_and(|segment| segment.ident == "f64")
+}
+
 /// The `(field_size, is_signed)` a struct-layout registration reports for one
 /// field, plus a compile-time check that the declaration matches the Rust
 /// struct.  `descr.py get_field_descr` derives both from `FIELDTYPE`,
@@ -181,6 +187,25 @@ pub(super) fn field_scalar_tokens(
         .consulted_field_keys
         .borrow_mut()
         .insert(key.to_string());
+    if config.float_fields.contains(key) {
+        // `descr.py` `get_type_flag` for `lltype.Float`: eight bytes, not an
+        // integer. The access site still passes `is_float` separately.
+        return (
+            quote! { ::core::mem::size_of::<f64>() },
+            quote! { false },
+            quote! {
+                const _: () = {
+                    const fn __majit_float_field_width<T>(_: fn(&#struct_path) -> &T) {
+                        assert!(
+                            ::core::mem::size_of::<T>() == ::core::mem::size_of::<f64>(),
+                            "float field width does not match f64",
+                        );
+                    }
+                    __majit_float_field_width(|__s: &#struct_path| &__s.#member);
+                };
+            },
+        );
+    }
     match config.int_fields.get(key) {
         Some((ty, signed)) => (
             quote! { ::core::mem::size_of::<#ty>() },
@@ -1650,6 +1675,52 @@ impl<'c> Lowerer<'c> {
                 depends_on_stack: false,
                 struct_type: ref_field_entry.map(|(_, _, pointee_path)| pointee_path.clone()),
             })
+        } else if config.float_fields.contains(&ref_field_key) {
+            // `jtransform.py` `rewrite_op_getfield`: `getkind` `f` →
+            // `getfield_gc_f`.
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![Register::ref_(base_reg)],
+                    vec![Register::float(result_reg)],
+                ),
+                quote! {
+                    #__fcheck
+                    #prefix_witness
+                    __builder.register_struct_layout(
+                        ::core::mem::size_of::<#struct_path>(),
+                        #tid,
+                        #gc_managed,
+                        #headerless,
+                        &[#(#prefix_fields,)* (
+                            ::core::mem::offset_of!(#struct_path, #member),
+                            false,
+                            stringify!(#member),
+                            #__fsize,
+                            #__fsigned,
+                            true,
+                        )],
+                        {
+                            #[allow(unused_imports)]
+                            use majit_metainterp::MajitImmutableFields as _;
+                            <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
+                        },
+                    );
+                    __builder.getfield_gc_f(
+                        #result_reg,
+                        #base_reg,
+                        ::core::mem::offset_of!(#struct_path, #member),
+                        #tid,
+                        stringify!(#member),
+                    );
+                },
+            );
+            Some(Binding {
+                reg: result_reg,
+                kind: BindingKind::Float,
+                depends_on_stack: false,
+                struct_type: None,
+            })
         } else if is_varsize_length_member(config, &struct_path, &member_name) {
             // The length word of a varsize block is `arraylen_gc`
             // (`opimpl_arraylen_gc`), so a virtual `new_array` folds it.
@@ -1960,6 +2031,7 @@ impl<'c> Lowerer<'c> {
         let shape = self.match_array_field_base(field)?;
         let element_type = shape.element_type.clone();
         let header = shape.header.clone();
+        let element_is_float = path_is_f64(&element_type);
         let buffer_reg = self.emit_array_field_base(&shape)?;
         let index = self.lower_value_expr(&index_expr.index)?;
         if !matches!(index.kind, BindingKind::Int) {
@@ -1967,6 +2039,31 @@ impl<'c> Lowerer<'c> {
         }
         let index_reg = index.reg;
         let result_reg = self.alloc_reg();
+        if element_is_float && header.is_none() {
+            // `jtransform.py` `rewrite_op_getarrayitem` for `lltype.Float`.
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![Register::ref_(buffer_reg), Register::int(index_reg)],
+                    vec![Register::float(result_reg)],
+                ),
+                quote! {
+                    let __descr_idx = __builder.add_raw_float_array_descr();
+                    __builder.getarrayitem_gc_f(
+                        #result_reg as u16,
+                        #buffer_reg as u16,
+                        #index_reg as u16,
+                        __descr_idx,
+                    );
+                },
+            );
+            return Some(Binding {
+                reg: result_reg,
+                kind: BindingKind::Float,
+                depends_on_stack: index.depends_on_stack,
+                struct_type: None,
+            });
+        }
         if let Some(header) = header {
             // Pointer elements living after `header.items`. The base
             // register is the header, so the descr's base_size is that
@@ -2063,9 +2160,14 @@ impl<'c> Lowerer<'c> {
         let shape = self.match_array_field_base(field)?;
         let element_type = shape.element_type.clone();
         let header = shape.header.clone();
+        let element_is_float = path_is_f64(&element_type) && header.is_none();
         let value = self.lower_value_expr(&assign.right)?;
         let value_is_ref = header.is_some();
-        if value_is_ref {
+        if element_is_float {
+            if !matches!(value.kind, BindingKind::Float) {
+                return None;
+            }
+        } else if value_is_ref {
             if !matches!(value.kind, BindingKind::Ref) {
                 return None;
             }
@@ -2079,6 +2181,29 @@ impl<'c> Lowerer<'c> {
         }
         let index_reg = index.reg;
         let value_reg = value.reg;
+        if element_is_float {
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![
+                        Register::ref_(buffer_reg),
+                        Register::int(index_reg),
+                        Register::float(value_reg),
+                    ],
+                    vec![],
+                ),
+                quote! {
+                    let __descr_idx = __builder.add_raw_float_array_descr();
+                    __builder.setarrayitem_gc_f(
+                        #buffer_reg as u16,
+                        #index_reg as u16,
+                        #value_reg as u16,
+                        __descr_idx,
+                    );
+                },
+            );
+            return Some(());
+        }
         if let Some(header) = header {
             let descr_tokens = self
                 .config
@@ -2432,6 +2557,7 @@ impl<'c> Lowerer<'c> {
         let (__fsize, __fsigned, __fcheck) =
             field_scalar_tokens(config, &ref_field_key, &struct_path, &member);
         let is_ref_field = config.ref_fields.contains_key(&ref_field_key);
+        let is_float_field = config.float_fields.contains(&ref_field_key);
         let gc_managed = config.struct_gc_kind_is_managed(&struct_path);
         let headerless = config.is_headerless_struct(&struct_path);
         let tid = struct_type_id_tokens(&struct_path, gc_managed);
@@ -2440,7 +2566,49 @@ impl<'c> Lowerer<'c> {
         let (prefix_fields, prefix_witness) = config.prefix_field_entries_tokens(&struct_path);
         let base_reg = binding.reg;
         let rhs = self.lower_value_expr(&assign.right)?;
-        if is_ref_field {
+        if is_float_field {
+            if !matches!(rhs.kind, BindingKind::Float) {
+                return None;
+            }
+            let src = rhs.reg;
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::SetfieldGc,
+                    vec![Register::ref_(base_reg), Register::float(src)],
+                    vec![],
+                ),
+                quote! {
+                    #__fcheck
+                    #prefix_witness
+                    __builder.register_struct_layout(
+                        ::core::mem::size_of::<#struct_path>(),
+                        #tid,
+                        #gc_managed,
+                        #headerless,
+                        &[#(#prefix_fields,)* (
+                            ::core::mem::offset_of!(#struct_path, #member),
+                            false,
+                            stringify!(#member),
+                            #__fsize,
+                            #__fsigned,
+                            true,
+                        )],
+                        {
+                            #[allow(unused_imports)]
+                            use majit_metainterp::MajitImmutableFields as _;
+                            <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
+                        },
+                    );
+                    __builder.setfield_gc_f(
+                        #base_reg,
+                        #src,
+                        ::core::mem::offset_of!(#struct_path, #member),
+                        #tid,
+                        stringify!(#member),
+                    );
+                },
+            );
+        } else if is_ref_field {
             if !matches!(rhs.kind, BindingKind::Ref) {
                 return None;
             }
@@ -2803,5 +2971,66 @@ mod tests {
             "a key `ref_fields` does not declare must emit nothing; emitting a \
              witness there would reject every legitimate integer field"
         );
+    }
+
+    /// `int_fields` `=> f64` is `getfield_gc_f`; an `f64` array field is
+    /// `getarrayitem_gc_f` / `setarrayitem_gc_f` (`rewrite_op_getfield` /
+    /// `rewrite_op_setarrayitem` pick the kind from the field type).
+    #[test]
+    fn float_field_and_float_array_lower_to_gc_f() {
+        let floatval = crate::jit_interp::IntFieldEntry {
+            struct_type: syn::parse_quote!(Num),
+            field: syn::parse_quote!(floatval),
+            int_type: syn::parse_quote!(f64),
+        };
+        let data = crate::jit_interp::ArrayFieldEntry {
+            struct_type: syn::parse_quote!(Col),
+            field: syn::parse_quote!(data),
+            element_type: syn::parse_quote!(f64),
+            header: None,
+        };
+        let config =
+            LowererConfig::inline_helper(&[], &[data], &[floatval], &[], &[], &[], &[], &[]);
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.bindings.insert(
+            "num".to_string(),
+            Binding {
+                reg: 1,
+                kind: BindingKind::Ref,
+                depends_on_stack: false,
+                struct_type: Some(syn::parse_quote!(Num)),
+            },
+        );
+        lowerer.bindings.insert(
+            "col".to_string(),
+            Binding {
+                reg: 2,
+                kind: BindingKind::Ref,
+                depends_on_stack: false,
+                struct_type: Some(syn::parse_quote!(Col)),
+            },
+        );
+        lowerer.bindings.insert(
+            "i".to_string(),
+            Binding {
+                reg: 3,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let read: syn::Expr = syn::parse_quote!(num.floatval);
+        let got = lowerer.lower_value_expr(&read).expect("float field read");
+        assert!(matches!(got.kind, BindingKind::Float));
+        let store: syn::Stmt = syn::parse_quote!(col.data[i] = num.floatval;);
+        assert!(lowerer.lower_stmt(&store).is_some());
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("getfield_gc_f"), "{emitted}");
+        assert!(emitted.contains("setarrayitem_gc_f"), "{emitted}");
+        assert!(emitted.contains("add_raw_float_array_descr"), "{emitted}");
     }
 }
