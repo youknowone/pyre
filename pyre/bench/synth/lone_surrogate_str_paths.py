@@ -82,9 +82,16 @@ show("dec", lambda: b"\xed\xa0\x80".decode("utf-8"))
 show("decsp", lambda: b"\xed\xa0\x80".decode("utf-8", "surrogatepass"))
 show("handler", lambda: "\xff".encode("ascii", "lone_surrogate_probe"))
 
-# os path functions
+# os path functions. On POSIX a str path is encoded with the filesystem
+# encoding, so a lone surrogate has to fail the encode or be escaped. Windows
+# hands the name to the wide-char API, where the lookup itself fails and the
+# message is the host's; that is not what this fixture checks.
 show("path", lambda: os.path.join(S, "a"))
-show("listdir", lambda: os.listdir(S))
-show("open", lambda: open(S))
+if os.name == "posix":
+    show("listdir", lambda: os.listdir(S))
+    show("open", lambda: open(S))
+else:
+    print("listdir posix-only")
+    print("open posix-only")
 
 print("done")
