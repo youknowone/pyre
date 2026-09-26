@@ -17603,6 +17603,12 @@ pub fn exec_or_eval(
             },
         );
         let f = pyre_object::gc_roots::pin_root(f);
+        let w_name = unsafe {
+            crate::pycode::w_code_name_obj(pyre_object::gc_roots::shadow_stack_get(code_slot))
+        };
+        if !w_name.is_null() {
+            unsafe { crate::function::function_set_name_obj(f, w_name) };
+        }
         Some(f)
     } else {
         None

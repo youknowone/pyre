@@ -3833,7 +3833,7 @@ fn write_traceback_chain_from_tb<W: Write>(
     let _roots = pyre_object::gc_roots::push_roots();
     // `StackSummary.format` dedup state: the previous frame's identity and how
     // many consecutive frames have carried it.
-    let mut last: Option<(Vec<u8>, Option<i64>, String)> = None;
+    let mut last: Option<(Vec<u8>, Option<i64>, rustpython_wtf8::Wtf8Buf)> = None;
     let mut repeats: usize = 0;
     while !tb.is_null() {
         let tb_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -3849,15 +3849,20 @@ fn write_traceback_chain_from_tb<W: Write>(
         // returns early for a summary that has no line to read.
         let lineno = unsafe { crate::pytraceback::w_pytraceback_get_lineno(current_tb) };
         let lasti = unsafe { crate::pytraceback::w_pytraceback_get_lasti(current_tb) };
+        let unknown_name = || {
+            let mut name = rustpython_wtf8::Wtf8Buf::new();
+            name.push_str("<unknown>");
+            name
+        };
         let (filename, funcname, location) = if w_code.is_null() {
-            (b"<unknown>".to_vec(), String::from("<unknown>"), None)
+            (b"<unknown>".to_vec(), unknown_name(), None)
         } else {
             // `w_code` is a GC-rooted `PyCode` pointer captured
             // at `record_application_traceback` time; the inner
             // `CodeObject` lives as long as `w_code` is reachable.
             let code_obj = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
             if code_obj.is_null() {
-                (b"<unknown>".to_vec(), String::from("<unknown>"), None)
+                (b"<unknown>".to_vec(), unknown_name(), None)
             } else {
                 let code = unsafe { &*code_obj };
                 // `lasti` is a byte offset; `locations` is indexed by
@@ -3873,9 +3878,16 @@ fn write_traceback_chain_from_tb<W: Write>(
                             end.character_offset.get().saturating_sub(1),
                         )
                     });
+                let w_name = unsafe { crate::pycode::w_code_name_obj(w_code) };
+                let mut funcname = rustpython_wtf8::Wtf8Buf::new();
+                if w_name.is_null() {
+                    funcname.push_str("<unknown>");
+                } else {
+                    funcname.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_name) });
+                }
                 (
                     unsafe { crate::pycode::code_filename_bytes(w_code) },
-                    code.obj_name.to_string(),
+                    funcname,
                     location,
                 )
             }
@@ -3903,7 +3915,11 @@ fn write_traceback_chain_from_tb<W: Write>(
         let shown_filename = crate::gateway::fsdecode_filename_wtf8(&filename);
         writer.write_all(b"  File \"")?;
         writer.write_all(shown_filename.as_bytes())?;
-        writeln!(writer, "\", line {shown_lineno}, in {funcname}")?;
+        writer.write_all(b"\", line ")?;
+        writer.write_all(shown_lineno.as_bytes())?;
+        writer.write_all(b", in ")?;
+        writer.write_all(funcname.as_bytes())?;
+        writer.write_all(b"\n")?;
         // `FrameSummary._set_lines` collects every line the failing
         // instruction spans, so a statement written across several lines (a
         // class body, a multi-line call) shows all of them, dedented by the

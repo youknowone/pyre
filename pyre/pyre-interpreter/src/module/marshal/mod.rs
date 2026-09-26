@@ -203,7 +203,10 @@ fn write_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<(), PyError> {
 }
 
 fn write_marshal_str(out: &mut Vec<u8>, value: &str, version: i32) -> Result<(), PyError> {
-    let bytes = value.as_bytes();
+    write_marshal_wtf8(out, value.as_bytes(), version)
+}
+
+fn write_marshal_wtf8(out: &mut Vec<u8>, bytes: &[u8], version: i32) -> Result<(), PyError> {
     if version >= 4 && bytes.len() < 256 && bytes.is_ascii() {
         out.write_u8(b'z');
         out.write_u8(bytes.len() as u8);
@@ -292,8 +295,20 @@ unsafe fn write_code(
 
     write_bytes(out, &code.localspluskinds)?;
     write_marshal_str(out, code.source_path.as_ref(), version)?;
-    write_marshal_str(out, code.obj_name.as_ref(), version)?;
-    write_marshal_str(out, code.qualname.as_ref(), version)?;
+    // `marshal_pycode` writes `co_name` / `co_qualname` as the str objects
+    // (`w_code_name_obj`), not the compiler `String` mirror.
+    let w_name = Rooted::new(unsafe { crate::pycode::w_code_name_obj(code_root.get()) });
+    let w_qualname = Rooted::new(unsafe { crate::pycode::w_code_qualname_obj(code_root.get()) });
+    write_marshal_wtf8(
+        out,
+        unsafe { pyre_object::w_str_get_wtf8(w_name.get()) }.as_bytes(),
+        version,
+    )?;
+    write_marshal_wtf8(
+        out,
+        unsafe { pyre_object::w_str_get_wtf8(w_qualname.get()) }.as_bytes(),
+        version,
+    )?;
     out.write_u32(
         unsafe { (*(code_root.get() as *const crate::pycode::PyCode)).co_firstlineno_raw } as u32,
     );
@@ -740,12 +755,17 @@ impl ErrorSink {
 #[derive(Clone, Copy)]
 struct PyreMarshalBag {
     errors: ErrorSink,
+    /// Shadow-stack slots of every `str_from_value` read while decoding one
+    /// code object (`co_names`, localsplus names, filename, `co_name`,
+    /// `co_qualname`). Nested code objects pop their own run first.
+    names: *mut Vec<usize>,
 }
 
 impl PyreMarshalBag {
-    fn new(pending_error: &mut Option<PyError>) -> Self {
+    fn new(pending_error: &mut Option<PyError>, names: &mut Vec<usize>) -> Self {
         Self {
             errors: ErrorSink(pending_error),
+            names,
         }
     }
 
@@ -782,6 +802,9 @@ impl PyreMarshalBag {
         // form duplicated the whole recursive constants graph and then threw
         // the original away — once per code object in every unmarshalled
         // module.
+        // `str_from_value` ran once per co_names entry, once per localsplus
+        // name, then filename / co_name / co_qualname.
+        let name_count = code.names.len() + code.localspluskinds.len() + 3;
         let code = Rooted::new(crate::pycode::box_code_object(code));
         // `box_code_object` allocates, so read each constant out of its
         // shadow-stack slot only now. PyPy gives the complete decoded wrapped
@@ -790,6 +813,22 @@ impl PyreMarshalBag {
         let constants: Vec<_> = constants.into_iter().map(Rooted::get).collect();
         unsafe { crate::pycode::w_code_fill_wrapped_consts(code.get(), &constants) };
         unsafe { crate::pycode::set_co_code_bytes(code.get(), raw_code_bytes) };
+        // `unmarshal_pycode` passes the decoded str objects to `PyCode`.
+        // A lone surrogate has no `String` spelling; `install_code_name_objects`
+        // is the same store `code_replace` uses.
+        let slots = unsafe { &mut *self.names };
+        if slots.len() >= name_count {
+            let name_obj = pyre_object::gc_roots::shadow_stack_get(slots[slots.len() - 2]);
+            let qual_obj = pyre_object::gc_roots::shadow_stack_get(slots[slots.len() - 1]);
+            slots.truncate(slots.len() - name_count);
+            let name = unsafe { (!pyre_object::w_str_is_utf8(name_obj)).then_some(name_obj) };
+            let qualname = unsafe { (!pyre_object::w_str_is_utf8(qual_obj)).then_some(qual_obj) };
+            return Ok(Rooted::new(crate::pycode::install_code_name_objects(
+                code.get(),
+                name,
+                qualname,
+            )));
+        }
         Ok(code)
     }
 }
@@ -1076,8 +1115,9 @@ impl wire::MarshalBag for PyreMarshalBag {
         // is one byte per code point, so the cached counts behind this
         // accessor decide it carries no surrogate without reading the bytes.
         // `to_string_lossy` has no such shortcut and rescans every name.
+        unsafe { (*self.names).push(value.0) };
         Some(match unsafe { unicodeobject::w_str_get_value_opt(obj) } {
-            Some(value) => value.to_owned(),
+            Some(text) => text.to_owned(),
             None => unsafe { unicodeobject::w_str_get_wtf8(obj) }
                 .to_string_lossy()
                 .into_owned(),
@@ -1140,7 +1180,8 @@ fn marshal_to_bytes(
 fn unmarshal_bytes(data: &[u8], allow_code: bool) -> PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let mut pending_error = None;
-    let bag = PyreMarshalBag::new(&mut pending_error);
+    let mut name_slots = Vec::new();
+    let bag = PyreMarshalBag::new(&mut pending_error, &mut name_slots);
     let mut reader = BytesReader {
         data,
         errors: bag.errors,
@@ -1285,7 +1326,8 @@ crate::py_module! {
             let allow_code = resolve_allow_code(allow_code)?;
             let _roots = pyre_object::gc_roots::push_roots();
             let mut pending_error = None;
-            let bag = PyreMarshalBag::new(&mut pending_error);
+            let mut name_slots = Vec::new();
+            let bag = PyreMarshalBag::new(&mut pending_error, &mut name_slots);
             let mut reader = FileReader::new(file, bag.errors)?;
             let result = match wire::deserialize_value(&mut reader, bag) {
                 Ok(result) => result,
@@ -1322,7 +1364,8 @@ mod tests {
         let w_code = crate::pycode::w_code_new(std::ptr::null());
         let rooted = Rooted::new(w_code);
         let mut pending_error = None;
-        let bag = PyreMarshalBag::new(&mut pending_error);
+        let mut name_slots = Vec::new();
+        let bag = PyreMarshalBag::new(&mut pending_error, &mut name_slots);
 
         let placeholder = wire::MarshalBag::code_constant_from_value(&bag, &rooted)
             .expect("PyCode constant must be accepted");

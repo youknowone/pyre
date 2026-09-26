@@ -30,6 +30,7 @@ use parking_lot::Mutex;
 use std::sync::OnceLock;
 
 use pyre_object::PyObjectRef;
+use rustpython_wtf8::Wtf8Buf;
 
 use crate::PyError;
 
@@ -268,7 +269,10 @@ fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         )));
     }
 
-    let mut changes: Vec<(String, PyObjectRef)> = Vec::new();
+    // Key stays the str object. A lone surrogate is not a field name and
+    // must survive into the unexpected-field repr (`structseq___replace__`
+    // formats the key list with `%R`) instead of a UTF-8 encode.
+    let mut changes: Vec<(PyObjectRef, PyObjectRef)> = Vec::new();
     for (key, value) in kwargs
         .map(|dict| unsafe { pyre_object::w_dict_items(dict) })
         .unwrap_or_default()
@@ -278,26 +282,34 @@ fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         {
             continue;
         } else if unsafe { pyre_object::is_str(key) } {
-            // A lone surrogate is not a field name. `str_utf8_w` reports it
-            // as UnicodeEncodeError ("surrogates not allowed").
-            changes.push((crate::baseobjspace::str_utf8_w(key)?.to_string(), value));
+            changes.push((key, value));
         } else {
             // Python call syntax guarantees string keyword names.  Keep a
             // defensive non-string marker without invoking user `repr`
             // while the copied structseq fields are held in raw locals.
-            changes.push(("<non-string>".to_string(), value));
+            changes.push((pyre_object::PY_NULL, value));
         }
     }
-    let unexpected: Vec<String> = changes
+    let unexpected: Vec<PyObjectRef> = changes
         .iter()
-        .filter(|(key, _)| !fields.contains(key) && !extra_fields.contains(key))
-        .map(|(key, _)| format!("'{key}'"))
+        .filter(|(key, _)| !structseq_field_named(*key, &fields, &extra_fields))
+        .map(|(key, _)| *key)
         .collect();
     if !unexpected.is_empty() {
-        return Err(PyError::type_error(format!(
-            "Got unexpected field name(s): [{}]",
-            unexpected.join(", ")
-        )));
+        let mut msg = Wtf8Buf::new();
+        msg.push_str("Got unexpected field name(s): [");
+        for (index, key) in unexpected.iter().enumerate() {
+            if index > 0 {
+                msg.push_str(", ");
+            }
+            if key.is_null() {
+                msg.push_str("'<non-string>'");
+            } else {
+                msg.push_wtf8(&unsafe { crate::display::py_repr_wtf8(*key)? });
+            }
+        }
+        msg.push_str("]");
+        return Err(PyError::type_error(msg));
     }
 
     let body: Vec<PyObjectRef> = fields
@@ -306,7 +318,7 @@ fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         .map(|(index, field)| {
             changes
                 .iter()
-                .find(|(key, _)| key == field)
+                .find(|(key, _)| structseq_key_eq(*key, field))
                 .map(|(_, value)| *value)
                 .or_else(|| unsafe { pyre_object::w_tuple_getitem(inst, index as i64) })
                 .unwrap_or_else(pyre_object::w_none)
@@ -318,7 +330,7 @@ fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         .map(|field| {
             let value = changes
                 .iter()
-                .find(|(key, _)| key == field)
+                .find(|(key, _)| structseq_key_eq(*key, field))
                 .map(|(_, value)| *value)
                 .or_else(|| {
                     (!source_dict.is_null())
@@ -330,6 +342,25 @@ fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         })
         .collect();
     Ok(new_instance_with_extra(cls, body, extras))
+}
+
+/// A keyword matches a structseq field when its WTF-8 view is that UTF-8 name.
+/// A lone surrogate never matches (`structseq___replace__` then reports it).
+fn structseq_key_eq(key: PyObjectRef, field: &str) -> bool {
+    if key.is_null() || unsafe { !pyre_object::is_str(key) } {
+        return false;
+    }
+    match unsafe { pyre_object::w_str_get_wtf8(key) }.as_str() {
+        Ok(name) => name == field,
+        Err(_) => false,
+    }
+}
+
+fn structseq_field_named(key: PyObjectRef, fields: &[String], extra_fields: &[String]) -> bool {
+    fields.iter().any(|field| structseq_key_eq(key, field))
+        || extra_fields
+            .iter()
+            .any(|field| structseq_key_eq(key, field))
 }
 
 /// `lib_pypy/_structseq.py structseq_setattr` — structseq instances are

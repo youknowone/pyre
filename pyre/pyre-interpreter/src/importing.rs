@@ -7799,7 +7799,10 @@ where
             type_name_for_err(module_name_w),
         )));
     }
-    let module_name = crate::baseobjspace::str_utf8_w(module_name_w)?.to_string();
+    // Diagnostic only (`pyopcode.py` interpolates it into the TypeError).
+    // A lone surrogate must not fail the import of the names in `__all__`.
+    let mut module_name = Wtf8Buf::new();
+    module_name.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(module_name_w) });
 
     // pyopcode.py — `for name in all:` lazy iteration.
     let w_iter = crate::baseobjspace::iter(w_iterable)?;
@@ -7816,10 +7819,15 @@ where
             } else {
                 ("__all__", "Item")
             };
-            return Err(crate::PyError::type_error(format!(
-                "{accessor} in {module_name}.{container} must be str, not {}",
-                type_name_for_err(w_name),
-            )));
+            let mut msg = Wtf8Buf::new();
+            msg.push_str(accessor);
+            msg.push_str(" in ");
+            msg.push_wtf8(&module_name);
+            msg.push_str(".");
+            msg.push_str(container);
+            msg.push_str(" must be str, not ");
+            msg.push_str(&type_name_for_err(w_name));
+            return Err(crate::PyError::type_error(msg));
         }
         let name = crate::baseobjspace::str_utf8_w(w_name)?.to_string();
         // pyopcode.py:2256-2257 — leading-underscore filter (only for

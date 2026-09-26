@@ -1657,6 +1657,32 @@ fn publish_code_slot_store(obj: PyObjectRef) {
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
 }
 
+/// `code_replace` and `unmarshal_pycode` both store a non-UTF-8 `co_name` /
+/// `co_qualname` on `PyCode.w_name` / `w_qualname` (`PyCode.__init__`'s
+/// `self.co_name = name`). `None` leaves the slot for `w_code_name_obj` to
+/// realize from the compiler `String`.
+pub(crate) fn install_code_name_objects(
+    mut code: PyObjectRef,
+    name: Option<PyObjectRef>,
+    qualname: Option<PyObjectRef>,
+) -> PyObjectRef {
+    if let Some(w_name) = name {
+        let published = publish_code_slot_store_rooting(code, &[w_name]);
+        code = published.owner();
+        unsafe {
+            (*(code as *mut PyCode)).w_name = published.get(0);
+        }
+    }
+    if let Some(w_qualname) = qualname {
+        let published = publish_code_slot_store_rooting(code, &[w_qualname]);
+        code = published.owner();
+        unsafe {
+            (*(code as *mut PyCode)).w_qualname = published.get(0);
+        }
+    }
+    code
+}
+
 /// The words a code-slot store is about to publish, reloaded after the
 /// barrier that guards it.
 struct RootedSlotStore {
@@ -2048,9 +2074,9 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 fn code_data_equal(a: &crate::CodeObject, b: &crate::CodeObject) -> bool {
-    a.obj_name == b.obj_name
-        && a.qualname == b.qualname
-        && a.arg_count == b.arg_count
+    // `co_name` / `co_qualname` are the realized str slots (`descr_code__eq__`
+    // reads `self.co_name`), not the compiler `String` mirror.
+    a.arg_count == b.arg_count
         && a.posonlyarg_count == b.posonlyarg_count
         && a.kwonlyarg_count == b.kwonlyarg_count
         && a.varnames.len() == b.varnames.len()
@@ -2105,8 +2131,18 @@ unsafe fn code_objects_equal(
     let other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let a = unsafe { require_code(this, "__eq__")? };
     let b = unsafe { require_code(other, "__eq__")? };
-    if unsafe { (*(this as *const PyCode)).co_firstlineno_raw }
-        != unsafe { (*(other as *const PyCode)).co_firstlineno_raw }
+    let left_name = unsafe { w_code_name_obj(pyre_object::gc_roots::shadow_stack_get(root_base)) };
+    let right_name =
+        unsafe { w_code_name_obj(pyre_object::gc_roots::shadow_stack_get(root_base + 1)) };
+    let this = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    // [3.14-spec] code equality ignores co_qualname ↔ `descr_code__eq__`
+    // compares `self.co_qualname`. A qualname-only `replace` still compares equal.
+    if left_name.is_null()
+        || right_name.is_null()
+        || !unsafe { pyre_object::w_str_eq_w(left_name, right_name) }
+        || unsafe { (*(this as *const PyCode)).co_firstlineno_raw }
+            != unsafe { (*(other as *const PyCode)).co_firstlineno_raw }
         || unsafe { code_bytes(this) } != unsafe { code_bytes(other) }
         || !code_data_equal(a, b)
     {
@@ -2166,6 +2202,9 @@ pub unsafe fn code_ne(
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let obj = pyre_object::gc_roots::pin_root(obj);
     let code = unsafe { require_code(obj, "__hash__")? };
     #[inline]
     fn scramble(result: i64, value: i64) -> i64 {
@@ -2177,8 +2216,12 @@ pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
         Ok(())
     }
     let mut result = 20_250_211i64;
-    add_obj(&mut result, w_str_new_managed(&code.obj_name))?;
-    add_obj(&mut result, w_str_new_managed(&code.qualname))?;
+    // `descr_code__hash__` also hashes `co_qualname`. 3.14's code hash does
+    // not, so equal qualname-only replacements keep one hash (`code_hash`).
+    add_obj(&mut result, unsafe {
+        w_code_name_obj(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+    })?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     for value in [
         code.arg_count as i64,
         code.posonlyarg_count as i64,
@@ -2226,18 +2269,29 @@ pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let code = unsafe { require_code(obj, "__repr__")? };
-    // pycode.py:570-572 represents the internal zero sentinel as line -1.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let obj = pyre_object::gc_roots::pin_root(obj);
+    let _code = unsafe { require_code(obj, "__repr__")? };
+    let w_name = unsafe { w_code_name_obj(pyre_object::gc_roots::shadow_stack_get(obj_slot)) };
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    // pycode.py `get_repr` / `descr_code__repr__` print `self.co_name`.
+    // The zero sentinel is line -1.
     let raw_line = (*(obj as *const PyCode)).co_firstlineno_raw as i64;
     let line = if raw_line == 0 { -1 } else { raw_line };
-    let mut repr = rustpython_wtf8::Wtf8Buf::from_string(format!(
-        "<code object {} at {}, file \"",
-        code.obj_name,
-        crate::display::repr_addr(obj as usize),
-    ));
+    let mut repr = rustpython_wtf8::Wtf8Buf::new();
+    repr.push_str("<code object ");
+    if !w_name.is_null() {
+        repr.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_name) });
+    }
+    repr.push_str(" at ");
+    repr.push_str(&crate::display::repr_addr(obj as usize));
+    repr.push_str(", file \"");
     let filename = crate::gateway::fsdecode_filename_wtf8(&unsafe { code_filename_bytes(obj) });
     repr.push_wtf8(&filename);
-    repr.push_str(&format!("\", line {line}>"));
+    repr.push_str("\", line ");
+    repr.push_str(&line.to_string());
+    repr.push_str(">");
     Ok(pyre_object::w_str_from_wtf8_managed(repr))
 }
 
@@ -2801,12 +2855,40 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             rustpython_compiler_core::OneIndexed::new(n as usize)
         };
     }
+    // `pycode.py` `PyCode.__init__` stores one field, `self.co_name = name`
+    // (and `self.co_qualname`). That field is `PyCode.w_name` /
+    // `w_qualname` (`w_code_name_obj`). Every app-level reader uses it.
+    // `CodeObject.obj_name` stays the compiler UTF-8 mirror JIT debug names
+    // read; a lone surrogate is not written into it.
+    let mut surrogate_name: Option<PyObjectRef> = None;
+    let mut surrogate_qualname: Option<PyObjectRef> = None;
     if let Some(v) = get("co_name") {
-        code.obj_name = unsafe { read_code_str(v, "co_name")? };
+        if unsafe { pyre_object::is_str(v) } && unsafe { !pyre_object::w_str_is_utf8(v) } {
+            surrogate_name = Some(v);
+        } else {
+            code.obj_name = unsafe { read_code_str(v, "co_name")? };
+        }
     }
     if let Some(v) = get("co_qualname") {
-        code.qualname = unsafe { read_code_str(v, "co_qualname")? };
+        if unsafe { pyre_object::is_str(v) } && unsafe { !pyre_object::w_str_is_utf8(v) } {
+            surrogate_qualname = Some(v);
+        } else {
+            code.qualname = unsafe { read_code_str(v, "co_qualname")? };
+        }
     }
+    // Hold the str objects across the allocations below. The kwargs dict is
+    // forwarded, but these copies are ordinary locals.
+    let _name_roots = pyre_object::gc_roots::push_roots();
+    let name_slot = surrogate_name.map(|w| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w);
+        slot
+    });
+    let qual_slot = surrogate_qualname.map(|w| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w);
+        slot
+    });
     if let Some(v) = get("co_filename") {
         (code.source_path, filename_bytes) =
             unsafe { read_code_filename(v, "co_filename", Some(&code.source_path))? };
@@ -2881,7 +2963,10 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         code.instructions.len(),
     );
 
-    let result = box_code_object_with_firstlineno(code, firstlineno_raw);
+    let mut result = box_code_object_with_firstlineno(code, firstlineno_raw);
+    let w_name = name_slot.map(pyre_object::gc_roots::shadow_stack_get);
+    let w_qualname = qual_slot.map(pyre_object::gc_roots::shadow_stack_get);
+    result = install_code_name_objects(result, w_name, w_qualname);
     unsafe { set_filename_bytes(result, filename_bytes) };
     unsafe { set_co_code_bytes(result, co_code_bytes) };
     unsafe {

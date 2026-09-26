@@ -1802,28 +1802,40 @@ pub fn proxy_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 // 2-/3-arg attribute ops with name-string conversion.
+// `w_str_get_value_opt` reads a `W_UnicodeObject`. A non-str name must not
+// enter it: `getattr` / `setattr` / `delattr` raise TypeError for it, and a
+// surrogate str takes their WTF-8 path (`w_str_get_value_opt` is None).
 pub fn proxy_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    match unsafe { pyre_object::w_str_get_value_opt(args[1]) } {
-        Some(name) => crate::baseobjspace::getattr_str(w_obj0, name),
-        None => crate::baseobjspace::getattr(w_obj0, args[1]),
+    let w_name = args[1];
+    if unsafe { pyre_object::is_str(w_name) }
+        && let Some(name) = unsafe { pyre_object::w_str_get_value_opt(w_name) }
+    {
+        return crate::baseobjspace::getattr_str(w_obj0, name);
     }
+    crate::baseobjspace::getattr(w_obj0, w_name)
 }
 
 pub fn proxy_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    match unsafe { pyre_object::w_str_get_value_opt(args[1]) } {
-        Some(name) => crate::baseobjspace::setattr_str(w_obj0, name, args[2]),
-        None => crate::baseobjspace::setattr(w_obj0, args[1], args[2]),
+    let w_name = args[1];
+    if unsafe { pyre_object::is_str(w_name) }
+        && let Some(name) = unsafe { pyre_object::w_str_get_value_opt(w_name) }
+    {
+        return crate::baseobjspace::setattr_str(w_obj0, name, args[2]);
     }
+    crate::baseobjspace::setattr(w_obj0, w_name, args[2])
 }
 
 pub fn proxy_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    match unsafe { pyre_object::w_str_get_value_opt(args[1]) } {
-        Some(name) => crate::baseobjspace::delattr_str(w_obj0, name),
-        None => crate::baseobjspace::delattr(w_obj0, args[1]),
+    let w_name = args[1];
+    if unsafe { pyre_object::is_str(w_name) }
+        && let Some(name) = unsafe { pyre_object::w_str_get_value_opt(w_name) }
+    {
+        return crate::baseobjspace::delattr_str(w_obj0, name);
     }
+    crate::baseobjspace::delattr(w_obj0, w_name)
 }
 
 // Item ops — interp__weakref.py:365 single special method, so

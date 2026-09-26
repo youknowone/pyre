@@ -21182,20 +21182,21 @@ fn init_float_type(ns: PyObjectRef) {
                     |args| {
                         // A class method, so `args[0]` is the class and the kind
                         // follows it.
-                        let kind = args
-                            .get(1)
-                            .copied()
-                            .filter(|&a| unsafe { pyre_object::is_str(a) })
-                            .and_then(|a| {
-                                unsafe { crate::baseobjspace::str_utf8_w(a) }
-                                    .ok()
-                                    .map(str::to_string)
-                            })
-                            .ok_or_else(|| {
-                                crate::PyError::type_error(
-                                    "__getformat__() argument must be 'double' or 'float'",
-                                )
-                            })?;
+                        let kind_obj = args.get(1).copied().ok_or_else(|| {
+                            crate::PyError::type_error(
+                                "__getformat__() argument must be 'double' or 'float'",
+                            )
+                        })?;
+                        if unsafe { !pyre_object::is_str(kind_obj) } {
+                            return Err(crate::PyError::type_error(
+                                "__getformat__() argument must be 'double' or 'float'",
+                            ));
+                        }
+                        // [3.14-spec] UnicodeEncodeError ↔ ValueError — lone surrogate.
+                        // `descr___getformat__` `@unwrap_spec(kind='text')` raises
+                        // ValueError; the 3.14 `s` converter raises UnicodeEncodeError.
+                        let kind =
+                            unsafe { crate::baseobjspace::str_utf8_w(kind_obj) }?.to_string();
                         match kind.as_str() {
                             "double" | "float" => {
                                 Ok(pyre_object::w_str_new_managed("IEEE, little-endian"))
@@ -30051,7 +30052,8 @@ fn generator_name_value(obj: PyObjectRef, qualname: bool) -> crate::PyResult {
     if code_ptr.is_null() {
         return Ok(w_str_new_managed("<finished>"));
     }
-    Ok(w_str_new_managed(unsafe { &(*code_ptr).obj_name }))
+    // generator.py `get_name`: the fallback is `pycode.co_name`.
+    Ok(unsafe { crate::pycode::w_code_name_obj(pycode) })
 }
 
 fn generator_getter_for(args: &[PyObjectRef], field: usize, kind: u8) -> crate::PyResult {

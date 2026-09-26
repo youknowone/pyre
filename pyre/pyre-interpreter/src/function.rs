@@ -3201,10 +3201,16 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         }
         let nclosure = unsafe { pyre_object::w_tuple_len(w_closure) };
         if nclosure != nfreevars {
-            return Err(crate::PyError::value_error(format!(
-                "{} requires closure of length {nfreevars}, not {nclosure}",
-                unsafe { &(*code_ptr).obj_name }
-            )));
+            let w_shown = unsafe { crate::pycode::w_code_name_obj(w_code) };
+            let mut msg = rustpython_wtf8::Wtf8Buf::new();
+            if !w_shown.is_null() {
+                msg.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_shown) });
+            }
+            msg.push_str(" requires closure of length ");
+            msg.push_str(&nfreevars.to_string());
+            msg.push_str(", not ");
+            msg.push_str(&nclosure.to_string());
+            return Err(crate::PyError::value_error(msg));
         }
         for index in 0..nclosure {
             let cell = unsafe { pyre_object::w_tuple_getitem(w_closure, index as i64) }
@@ -3224,18 +3230,29 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // supplies unresolved names through `__missing__` when it clones a PEP
     // 649 annotate function with `types.FunctionType`.
     let func = function_new_with_closure(w_code as *const (), name, w_globals, closure);
-    // As in `descr_function__new__`: the mirror cannot hold a lone surrogate,
-    // so the supplied object is what `__name__` reads back.
-    if !w_name.is_null() && !unsafe { pyre_object::is_none(w_name) } {
-        unsafe { function_set_name_obj(func, w_name) };
-    }
+    // `function.py` `self.name = forcename or code.co_name`. The raw `name`
+    // mirror cannot hold a lone surrogate, so `__name__` reads the str object.
     let _qual_roots = pyre_object::gc_roots::push_roots();
+    let code_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_code);
     let func_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(func);
+    let name_obj = if !w_name.is_null() && !unsafe { pyre_object::is_none(w_name) } {
+        w_name
+    } else {
+        unsafe {
+            crate::pycode::w_code_name_obj(pyre_object::gc_roots::shadow_stack_get(code_slot))
+        }
+    };
+    if !name_obj.is_null() {
+        unsafe {
+            function_set_name_obj(pyre_object::gc_roots::shadow_stack_get(func_slot), name_obj)
+        };
+    }
     let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(unsafe {
-        (*code_ptr).qualname.as_ref()
-    }));
+    let _ = pyre_object::gc_roots::pin_root(unsafe {
+        crate::pycode::w_code_qualname_obj(pyre_object::gc_roots::shadow_stack_get(code_slot))
+    });
     unsafe {
         function_set_qualname(
             pyre_object::gc_roots::shadow_stack_get(func_slot),
