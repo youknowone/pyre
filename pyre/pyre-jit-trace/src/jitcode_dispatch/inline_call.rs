@@ -2308,6 +2308,33 @@ pub(crate) fn collect_callee_active_boxes(
     Ok(active)
 }
 
+/// Whether a loop-carried operand parked below the call keeps the fold
+/// worthwhile.
+///
+/// A numeric accumulator (`a` in `a += r(d)`) does: the fold's resume rebuilds
+/// it from the caller's own register writeback, and folding the call is what
+/// turns a residual recursion back into an assembler-to-assembler jump.
+///
+/// A live iterator does not, for a recursive callee.  Folding a self-call that
+/// sits under a `FOR_ITER` iterator costs the caller a compiled loop and a
+/// bridge — measured on
+/// `recursive_call_frame_relocation` (`for k in range(n): r += cat(n - 1)`) as
+/// `loops_compiled 3 -> 2`, `bridges_compiled 3 -> 2` and 0.18s -> 0.22s.  The
+/// residual path keeps that loop, so leave the iterator-bearing shape to it.
+fn loop_carried_slot_keeps_fold_profitable<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    slot: OpRef,
+) -> bool {
+    match ctx.trace_ctx.box_value(slot) {
+        Some(majit_ir::Value::Int(_)) | Some(majit_ir::Value::Float(_)) => true,
+        Some(majit_ir::Value::Ref(r)) => {
+            let obj = r.as_usize();
+            obj != 0 && unsafe { pyre_object::is_int(obj as pyre_object::PyObjectRef) }
+        }
+        _ => false,
+    }
+}
+
 /// Whether the call at `op_pc` in the walk's own code sits inside a protected
 /// region its `GUARD_NO_EXCEPTION` deopt would have to resume into.
 ///
@@ -2349,13 +2376,14 @@ fn call_site_inside_protected_region<Sym: WalkSym>(sym: &Sym, op_pc: usize) -> b
 ///
 /// This screen is the fold's own precondition, not upstream's.  The whole call
 /// collapses into one `CALL_ASSEMBLER` plus
-/// `GUARD_NOT_FORCED`/`GUARD_NO_EXCEPTION`, so a callee that leaves its frame
-/// by any route other than returning — a `raise` crossing the boundary, a
-/// protected region, an `abort_permanent` marker — has nowhere to put the
-/// unwind in the caller's trace.  Those are the same body facts the inline
-/// route screens on before it walks a callee body, and they answer in the same
-/// direction `look_inside_graph` (`codewriter/policy.py`) answers a "no" with:
-/// the call stays a residual.
+/// `GUARD_NOT_FORCED`/`GUARD_NO_EXCEPTION`.  A `raise` that crosses the
+/// boundary needs nothing more: the callee's compiled trace propagates it and
+/// `GUARD_NO_EXCEPTION` resumes the caller into its unwind, as
+/// `do_recursive_call(assembler_call=True)` (`pyjitpl.py`) does for every
+/// callee it reaches.  What the fold cannot represent is a protected region
+/// inside the callee or an `abort_permanent` marker; those stay a residual,
+/// the direction `look_inside_graph` (`codewriter/policy.py`) answers a "no"
+/// with.
 ///
 /// Not asked of the walk's own code: `call_site_inside_protected_region` already
 /// read that body's table at this very call site.
@@ -2363,7 +2391,7 @@ fn foreign_callee_admits_call_assembler(w_code: *const ()) -> bool {
     let Some(facts) = sub_jitcode_body_facts_for_code(w_code) else {
         return false;
     };
-    !facts.contains_raise && !facts.has_exception_table && !facts.has_abort_permanent
+    !facts.has_exception_table && !facts.has_abort_permanent
 }
 
 /// #62: full-body-walk direct `CALL_ASSEMBLER` for a self-recursive call
@@ -2552,6 +2580,50 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         if !admit_mutual && !foreign_callee_admits_call_assembler(w_code) {
             if p2_diag_enabled() {
                 eprintln!("[p2-ca] decline pc={} reason=not-self-nor-mutual", op.pc);
+            }
+            return Ok(None);
+        }
+    }
+    // The operand stack below the call's own operands (`r_args = [callable,
+    // null_or_self, arg0..]`) may hold loop-carried input args: the enclosing
+    // loop's `FOR_ITER` iterator, or an accumulator reloaded for `+=`.  Only
+    // the iterator disqualifies the fold — see
+    // `loop_carried_slot_keeps_fold_profitable`.  Declining every loop-carried
+    // operand instead kept a recursion called from a `while` body on the
+    // residual path permanently: `r(8)` a million times over measured 1.23s
+    // against 0.07s for the same run with the numeric shape admitted, because
+    // every recursive call re-entered through the func-entry residency door.
+    // The loopless `fib` shape keeps only within-iteration temps (a prior call
+    // result), no InputArg, and was foldable either way.
+    //
+    // The screen is about a recursion re-entering through the loop it sits
+    // in.  A foreign, non-recursive callee called from a `for` body is the
+    // shape `do_recursive_call(assembler_call=True)` (`pyjitpl.py`) folds for
+    // any callee with its own loop token; declining it left the whole callee
+    // as a residual call per iteration.
+    let recursive_callee = w_code as usize == caller_code as usize
+        || ctx
+            .session
+            .borrow()
+            .framestack
+            .iter()
+            .any(|f| f.w_code == w_code as usize);
+    if recursive_callee && ctx.vstack_valid {
+        let kept_below = ctx
+            .frame_state
+            .borrow()
+            .vstack_boxes
+            .len()
+            .saturating_sub(r_args.len());
+        if ctx.frame_state.borrow().vstack_boxes[..kept_below]
+            .iter()
+            .any(|slot| slot.is_input_arg() && !loop_carried_slot_keeps_fold_profitable(ctx, *slot))
+        {
+            if p2_diag_enabled() {
+                eprintln!(
+                    "[p2-ca] decline pc={} reason=loop-carried-inputarg-below",
+                    op.pc
+                );
             }
             return Ok(None);
         }
