@@ -814,37 +814,6 @@ fn resolves_to_null_ptr_builtin(segments: &[String]) -> bool {
         .is_some_and(|attr| NULL_PTR_BUILTIN_QUALNAMES.contains(&attr.qualname()))
 }
 
-/// `<*mut T as Default>::default` / `<*const T as Default>::default`
-/// is `ptr::null[_mut]()` (`rtype_ptr_null`). Charon spells the
-/// inherent impl `core::ptr::mut_ptr::<Impl>::default`, which is
-/// not a `core.ptr` module attr, so it misses
-/// [`resolves_to_null_ptr_builtin`].
-fn is_raw_ptr_default_null(segments: &[String]) -> bool {
-    let Some(leaf) = segments.last() else {
-        return false;
-    };
-    if leaf != "default" {
-        return false;
-    }
-    let joined = segments.join("::");
-    (joined.starts_with("core::ptr::") || joined.starts_with("std::ptr::"))
-        && (joined.contains("mut_ptr") || joined.contains("const_ptr"))
-}
-
-/// The generic trait method `core::default::<Impl>::default` /
-/// `Default::default`. Concrete inherent impls (`Vec::default`,
-/// `W_CData::default`) keep their own paths and are not this.
-pub(crate) fn is_generic_default_path(segments: &[String]) -> bool {
-    let Some((leaf, rest)) = segments.split_last() else {
-        return false;
-    };
-    if leaf != "default" {
-        return false;
-    }
-    let joined = rest.join("::");
-    joined == "Default" || joined.starts_with("core::default") || joined.starts_with("std::default")
-}
-
 /// `gc_hook::try_gc_write_barrier` / `try_gc_write_barrier_managed` —
 /// the interpreter's spelling of `llop.gc_writebarrier`, which
 /// [`drop_guarded_gc_write_barriers`] drops when the store it guards
@@ -1094,19 +1063,6 @@ fn immutable_array_origin(
         cur = next;
     }
     cur
-}
-
-/// `rtype_const_result` for a Default whose Self is a known zero:
-/// integer, bool or float. A `Ref` is `Vec` / a GC struct and stays
-/// residual; a raw-pointer Self reaches jtransform as its own impl path
-/// ([`is_raw_ptr_default_null`]).
-fn default_zero_rewrite(result_ty: &ValueType) -> Option<OpKind> {
-    match result_ty {
-        ValueType::Int | ValueType::Unsigned => Some(OpKind::ConstInt(0)),
-        ValueType::Bool => Some(OpKind::ConstBool(false)),
-        ValueType::Float => Some(OpKind::ConstFloat(0.0f64.to_bits())),
-        _ => None,
-    }
 }
 
 pub(crate) fn jit_marker_key_from_target(
@@ -6248,27 +6204,11 @@ impl<'a> Transformer<'a> {
         if let CallTarget::FunctionPath { segments, .. } = target
             && args.is_empty()
             && matches!(result_ty, ValueType::Ref(_))
-            && (resolves_to_null_ptr_builtin(segments) || is_raw_ptr_default_null(segments))
+            && resolves_to_null_ptr_builtin(segments)
         {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::ConstRefNull,
-            }]);
-        }
-        // `rbuiltin.py rtype_const_result` for `Default::default`. The
-        // trait method is one symbolic path
-        // (`core::default::<Impl>::default`) for every monomorphization,
-        // so fold only a known-zero Self (integer / bool / float).
-        // `Vec::default` and a GC-struct Default stay residual.
-        if let CallTarget::FunctionPath { segments, .. } = target
-            && args.is_empty()
-            && is_generic_default_path(segments)
-            && let Some(kind) = default_zero_rewrite(result_ty)
-        {
-            self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind,
             }]);
         }
         // `rewrite_op_cast_pointer` → `rewrite_op_same_as`
@@ -18922,7 +18862,6 @@ mod tests {
     fn ptr_null_builtin_rewrites_to_null_ref_constant() {
         for path in [
             vec!["core", "ptr", "null_mut"],
-            vec!["core", "ptr", "mut_ptr::<Impl>", "default"],
             vec![crate::runtime_names::crates::OBJECT, "pyobject", "PY_NULL"],
         ] {
             let config = GraphTransformConfig::default();
@@ -18951,112 +18890,6 @@ mod tests {
                 .find(|op| op.result.as_ref() == Some(&result_var))
                 .expect("null result must survive as a constant definition");
             assert!(matches!(folded.kind, OpKind::ConstRefNull));
-        }
-    }
-
-    /// `rtype_const_result` for `Default::default` of a primitive Self.
-    #[test]
-    fn generic_default_of_int_rewrites_to_zero() {
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config);
-        let mut graph = FunctionGraph::new("default_int");
-        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
-        let target = CallTarget::function_path(["core", "default::<Impl>", "default"]);
-        let op = SpaceOperation {
-            result: Some(result),
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: crate::model::call_args(vec![]),
-                result_ty: ValueType::Int,
-            },
-        };
-        match transformer.rewrite_op_direct_call(
-            &op,
-            &target,
-            &[],
-            &ValueType::Int,
-            "default_int",
-            &mut graph,
-        ) {
-            RewriteResult::Replace(ops) => {
-                assert!(matches!(
-                    ops.as_slice(),
-                    [SpaceOperation {
-                        kind: OpKind::ConstInt(0),
-                        ..
-                    }]
-                ));
-            }
-            _ => panic!("expected ConstInt(0)"),
-        }
-    }
-
-    /// A raw-pointer Self is `rtype_ptr_null`. The front names the impl
-    /// (`core::ptr::mut_ptr::<Impl>::default`) rather than the trait path.
-    #[test]
-    fn generic_default_of_raw_ptr_rewrites_to_null_ref() {
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config);
-        let mut graph = FunctionGraph::new("default_raw_ptr");
-        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let target = CallTarget::function_path(["core", "ptr", "mut_ptr", "<Impl>", "default"]);
-        let result_ty = ValueType::Ref(None);
-        let op = SpaceOperation {
-            result: Some(result),
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: crate::model::call_args(vec![]),
-                result_ty: result_ty.clone(),
-            },
-        };
-        match transformer.rewrite_op_direct_call(
-            &op,
-            &target,
-            &[],
-            &result_ty,
-            "default_raw_ptr",
-            &mut graph,
-        ) {
-            RewriteResult::Replace(ops) => {
-                assert!(matches!(
-                    ops.as_slice(),
-                    [SpaceOperation {
-                        kind: OpKind::ConstRefNull,
-                        ..
-                    }]
-                ));
-            }
-            _ => panic!("expected ConstRefNull"),
-        }
-    }
-
-    /// `Vec::default` / a GC-struct Default shares the trait path but
-    /// not a known-zero result. Residualize it.
-    #[test]
-    fn generic_default_of_unknown_ref_stays_residual() {
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config);
-        let mut graph = FunctionGraph::new("default_vec");
-        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let target = CallTarget::function_path(["core", "default::<Impl>", "default"]);
-        let op = SpaceOperation {
-            result: Some(result),
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: crate::model::call_args(vec![]),
-                result_ty: ValueType::Ref(None),
-            },
-        };
-        match transformer.rewrite_op_direct_call(
-            &op,
-            &target,
-            &[],
-            &ValueType::Ref(None),
-            "default_vec",
-            &mut graph,
-        ) {
-            RewriteResult::Keep => {}
-            _ => panic!("expected residual Keep for allocating Default"),
         }
     }
 
