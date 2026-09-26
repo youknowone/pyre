@@ -418,13 +418,15 @@ CARGO_CONFIG = {
         # `_testmultiphase` against the binary built here: without the feature
         # `test_buffer` skips `TestBufferProtocol` wholesale, which is 95 of
         # that module's cases, and `test_importlib.extension` skips too.
-        # `full` is a pyrex default that `--no-default-features` drops; without
-        # it the binary lacks the native-library modules the product ships.
-        "extra": ["--no-default-features", "--features", "dynasm,cpyext,full"],
+        # `pyre-module` is a pyrex default that `--no-default-features` drops;
+        # without it the binary lacks the builtin modules the product ships.
+        "extra": ["--no-default-features", "--features", "dynasm,cpyext,pyre-module"],
         "bin": "pyre-dynasm",
     },
     "cranelift": {
-        "extra": ["--no-default-features", "--features", "cranelift,full"],
+        # The core: no `pyre-module`, so its build neither compiles nor
+        # translates the builtin modules that crate owns.
+        "extra": ["--no-default-features", "--features", "cranelift"],
         "bin": "pyre-cranelift",
     },
     # The wasm backend is not a `pyrex` binary: it is the wasm32 build of
@@ -5047,7 +5049,7 @@ class Check:
         """
         print(f"  {name}")
         if spec_folds and not self._check_spec_folds(
-            name, script, spec_folds, timeout, "-", "-",
+            name, script, spec_folds, timeout, "-", "-", skip_backends,
         ):
             return
         for backend in ALL_BACKENDS:
@@ -5206,7 +5208,9 @@ class Check:
 
     # ── synthetic parity suite ──
 
-    def _check_spec_folds(self, name, path, spec_folds, timeout, t_cpython, t_pypy):
+    def _check_spec_folds(
+        self, name, path, spec_folds, timeout, t_cpython, t_pypy, skip_backends=(),
+    ):
         """True if every fold the fixture declares fired; else record and report.
 
         The census reads the same on every backend that shares the trace
@@ -5220,14 +5224,21 @@ class Check:
         is the fixture's own unscaled budget: the scale belongs to a backend,
         and which one that is is not known until the line above. A caller that
         hands over its own already-scaled figure squares the scale.
+
+        *skip_backends* is the fixture's `# pyre-check: skip-backends=` list;
+        the census never runs on a backend the fixture opts out of.
         """
         sys.stdout.write(f"    {'folds':<10s}")
         sys.stdout.flush()
         backend = next(
-            (b for b in ALL_BACKENDS if self.enabled(b) and b != "wasm"), None
+            (
+                b for b in ALL_BACKENDS
+                if self.enabled(b) and b != "wasm" and b not in skip_backends
+            ),
+            None,
         )
         if backend is None:
-            if not self.enabled("wasm"):
+            if not self.enabled("wasm") or "wasm" in skip_backends:
                 print(dim("skip (no backend enabled)"))
                 return True
             backend = "wasm"
@@ -5253,7 +5264,7 @@ class Check:
                 print(f"{dim('done')}  {len(spec_folds)} fired")
                 return True
         for b in ALL_BACKENDS:
-            if self.enabled(b):
+            if self.enabled(b) and b not in skip_backends:
                 self._record(b, False, name, detail)
                 self._append_comparison(b, name, t_cpython, t_pypy, "FAIL")
         return False
@@ -5355,7 +5366,7 @@ class Check:
             return
 
         if spec_folds and not self._check_spec_folds(
-            name, path, spec_folds, timeout, t_cpython, t_pypy,
+            name, path, spec_folds, timeout, t_cpython, t_pypy, skip_backends,
         ):
             return
 

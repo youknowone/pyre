@@ -1,4 +1,6 @@
 # pyre-check: selfcheck
+# pyre-check: skip-backends=cranelift
+# cranelift runs the core build, which has no `pyre-module` and so no `math`.
 # pyre-check: selfcheck-compiles=hot1,hot2
 # A `math` fold recorded on an exact `int` must stop answering once the operand
 # is an `int` subclass.

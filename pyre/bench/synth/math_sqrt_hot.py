@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=0.6
+# pyre-check: skip-backends=cranelift
+# cranelift runs the core build, which has no `pyre-module` and so no `math`.
 # Ubuntu run 33279264115: 0.2-0.3x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # The ceiling sits between the two measured states: folded this runs 0.1x

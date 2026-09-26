@@ -7,13 +7,7 @@ repository.workspace = true
 description = "Trace-time JIT for pyre — MIFrame and tracing logic"
 
 [features]
-default = ["dynasm", "prepass", "full"]
-# The interpreter's whole builtin module set; reaches the build script's host
-# copy too, so the prepass registers the module surface the binary links.
-# Also the translation's `usemodules`: only a full build links `pyre-module`
-# into the build script and translates `pyre-module.ullbc` with the core, so
-# a core build is unaffected by any `pyre-module` edit.
-full = ["pyre-interpreter/full", "dep:pyre-module", "pyre-module/full"]
+default = ["dynasm", "prepass", "pyre-module"]
 cranelift = ["dep:majit-backend-cranelift", "majit-metainterp/cranelift"]
 dynasm = ["dep:majit-backend-dynasm", "majit-metainterp/dynasm"]
 # The build script's translation prepass over the LLBC set, and with it the
@@ -69,7 +63,10 @@ pyre-interpreter = { workspace = true, features = ["host_env", "dynasm"], option
 # Same process as `jit_trace_fnaddrs()`: without this crate the
 # `#[pyre_methods]` wrappers that moved out of the interpreter never
 # join `BUILTIN_WRAPPER_DESCRIPTORS`, and every hot call to those
-# builtins takes the `no jitcode for address` residual.
+# builtins takes the `no jitcode for address` residual. Its implicit
+# feature is the translation's `usemodules`: only a build that links
+# `pyre-module` translates `pyre-module.ullbc` with the core, so a build
+# without it is unaffected by any `pyre-module` edit.
 pyre-module = { workspace = true, optional = true, features = ["host_env"] }
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }

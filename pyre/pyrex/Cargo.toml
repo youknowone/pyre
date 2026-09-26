@@ -32,11 +32,11 @@ name = "allocsites"
 path = "examples/allocsites.rs"
 
 [features]
-default = ["dynasm", "host_env", "mimalloc", "full"]
-# The whole builtin module set (see pyre-interpreter). Off, the launcher is
-# the fast-building core: `--no-default-features --features dynasm,mimalloc`.
-full = ["pyre-interpreter/full", "pyre-jit/full", "pyre-module/full"]
-host_env = ["pyre-interpreter/host_env", "pyre-module/host_env"]
+default = ["dynasm", "host_env", "mimalloc", "pyre-module"]
+# The builtin modules `pyre-module` owns. Off, the launcher is the
+# fast-building core: `--no-default-features --features dynasm,mimalloc`.
+pyre-module = ["dep:pyre-module", "pyre-jit/pyre-module"]
+host_env = ["pyre-interpreter/host_env", "pyre-module?/host_env"]
 jit = []  # meta feature: enabled by cranelift or dynasm
 # The native launchers run the interpreter's importlib bootstrap.  Keep the
 # caller and the interpreter owner under the same cfg when defaults are off;
@@ -59,7 +59,7 @@ mimalloc = ["dep:mimalloc"]
 # gc_stress = ["pyre-jit/gc_stress"]
 # Build the interpreter as an RPython-style sandbox client: every mediated OS
 # call routes through host_seam's marshalling trampoline (see pyre-interpreter).
-sandbox = ["pyre-interpreter/sandbox", "pyre-jit/sandbox", "pyre-module/sandbox"]
+sandbox = ["pyre-interpreter/sandbox", "pyre-jit/sandbox", "pyre-module?/sandbox"]
 # Load C extension modules built against pyre's own ABI (see pyre-interpreter).
 # Off by default; it also exports the C-API entry points the loaded object
 # resolves against, see build.rs.
@@ -74,9 +74,9 @@ seccomp = ["sandbox"]
 parking_lot = { workspace = true }
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
-# `host_env` and `full` arrive through this package's features. A core build
-# does not name `full`. Workspace `pyre-module` already has defaults off.
-pyre-module = { workspace = true }
+# `host_env` arrives through this package's features. A core build leaves
+# the `pyre-module` feature off. Workspace `pyre-module` has defaults off.
+pyre-module = { workspace = true, optional = true }
 # `prepass` is on for every launcher. The backend feature (`dynasm` /
 # `cranelift`) is forwarded by this package's own features, so a
 # cranelift-only build does not also compile dynasm.

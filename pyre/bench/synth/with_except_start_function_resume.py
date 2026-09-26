@@ -12,8 +12,6 @@ try:
 except ImportError:
     pass
 
-import math
-
 seen = []
 
 
@@ -30,7 +28,7 @@ def run(raise_inside):
     if not raise_inside:
         return
     with Context():
-        math.sin()
+        abs()
 
 
 for _ in range(30):

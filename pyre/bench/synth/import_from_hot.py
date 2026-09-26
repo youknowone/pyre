@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=180
-# IMPORT_FROM in a hot loop: `from math import pi, e` runs IMPORT_FROM for
+# IMPORT_FROM in a hot loop: `from errno import EINTR, ENOENT` runs IMPORT_FROM for
 # each imported name every iteration.  The compiled per-CodeObject jitcode
 # walks the import_from residual (getattr on the peeked module, with a
 # `sys.modules` fallback) instead of an abort_permanent marker, so the
@@ -14,8 +14,8 @@ def main():
     acc = 0
     i = 0
     while i < N:
-        from math import pi, e
-        if pi > 3 and e > 2:
+        from errno import EINTR, ENOENT
+        if EINTR > 3 and ENOENT > 1:
             acc = acc + 1
         i = i + 1
     print(acc)

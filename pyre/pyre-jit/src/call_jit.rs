@@ -4606,7 +4606,11 @@ fn jit_ca_handle_guard_failure(
     if compiled {
         // compile.py handle_fail must_compile arm raises
         // ContinueRunningNormally; handle_jitexception re-enters portal_ptr.
-        Some(run_frame_through_portal(fail0, PortalEntry::Resume))
+        // The bridge walk and compile allocate, so a minor collection may
+        // have moved a nursery frame since `fail0` was read. The root holds
+        // the forwarded address.
+        let frame = frame_root.frame() as *mut PyFrame as i64;
+        Some(run_frame_through_portal(frame, PortalEntry::Resume))
     } else {
         None
     }

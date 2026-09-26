@@ -2,7 +2,8 @@
 //! Module teardown must not omit its pre-clear collection just because the
 //! detached import cache contained only ordinary modules.
 
-#![cfg(feature = "dynasm")]
+// `test.support` imports `unicodedata`, which only `pyre-module` provides.
+#![cfg(all(feature = "dynasm", feature = "pyre-module"))]
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

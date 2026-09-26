@@ -478,8 +478,11 @@ pub fn load_extension_module(
         // `create_extension_module` takes the CFFI branch before it reaches the
         // extension cache, so a generated module is rebuilt on every import.
         // Serving one from the cache restores `name` alone and leaves the
-        // `name.lib` entry the initializer also registers missing.
-        let cffi = lookup_cffi_init(handle, name).is_some();
+        // `name.lib` entry the initializer also registers missing. The CFFI
+        // branch runs only with the `pyre-module` hooks; without them the
+        // `PyInit_*` module is the one cached.
+        let cffi = lookup_cffi_init(handle, name).is_some()
+            && crate::importing::optional_module_hooks().is_some();
         if !cffi && lookup_init(handle, name)?.is_none() {
             return Err(missing_init_error(name, path));
         }
@@ -522,19 +525,15 @@ pub fn load_extension_module(
     // library on both of these failures.
     let cffi_address = lookup_cffi_init(handle, name);
     let found = lookup_init(handle, name)?;
-    // `_cffi_backend` is part of the `full` module set. Without it an
-    // extension that only exports the cffi init symbol is the same miss as
-    // one that exports no init at all.
-    #[cfg(feature = "full")]
-    if let Some(address) = cffi_address {
-        let module = crate::importing::optional_module_hooks()
-            .ok_or_else(|| crate::PyError::system_error("_cffi_backend is not available"))
-            .and_then(|hooks| (hooks.load_cffi1_module)(name, path, address))?;
+    // `_cffi_backend` lives in `pyre-module`. Without its hooks an extension
+    // that only exports the cffi init symbol is the same miss as one that
+    // exports no init at all.
+    if let (Some(address), Some(hooks)) = (cffi_address, crate::importing::optional_module_hooks())
+    {
+        let module = (hooks.load_cffi1_module)(name, path, address)?;
         fixup_extension(module, name, path, handle);
         return Ok(module);
     }
-    #[cfg(not(feature = "full"))]
-    let _ = cffi_address;
     let Some((protocol, address)) = found else {
         return Err(missing_init_error(name, path));
     };

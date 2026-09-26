@@ -403,7 +403,7 @@ pub fn init_subclass_ranges() {
         let object_aliases = pyre_object::pyobject::all_subclass_range_aliases();
         let interpreter_aliases = crate::all_subclass_range_aliases();
         pyre_object::pyobject::initialize_subclass_ranges_from_hierarchy(
-            crate::active_subclass_range_hierarchy(),
+            &crate::active_subclass_range_hierarchy(),
             &[&object_aliases, &interpreter_aliases],
         );
     });
