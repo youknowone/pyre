@@ -1978,16 +1978,13 @@ fn bound_is_none_or_exact_int(w: PyObjectRef) -> bool {
     unsafe { pyre_object::is_none(w) || pyre_object::is_exact_type(w, &pyre_object::INT_TYPE) }
 }
 
-/// Omitted bound is null. `None` and an exact `int` stay on the elidable
-/// search; anything else (`__index__`, a subclass) is the slow arm.
+/// An omitted bound is `None`, the `w_start=None, w_end=None` defaults of
+/// `descr_find`. `None` and an exact `int` stay on the elidable search;
+/// anything else (`__index__`, a subclass) is the slow arm.
 /// A plain index, not `slice::get`: that `Option` does not lower.
 #[inline(always)]
 fn str_search_bound(args: &[PyObjectRef], i: usize) -> PyObjectRef {
-    if i < args.len() {
-        args[i]
-    } else {
-        pyre_object::PY_NULL
-    }
+    if i < args.len() { args[i] } else { w_none() }
 }
 
 /// Bounds that are not `None` or an exact `int` (`__index__`, a subclass)
