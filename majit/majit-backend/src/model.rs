@@ -33,8 +33,9 @@ pub trait Cpu: Send + Sync {
     /// `Value::Ref` or when the Ref is null.  A backend with a different
     /// object model overrides `bh_classof`, not this.
     fn cls_of_box(&self, box_: &Operand) -> i64 {
-        // resoperation.py:57-68 walker, then read the concrete ref off the
-        // resolved operand. model.py:199-201 `box.getref_base().typeptr`
+        // `AbstractValue.get_box_replacement` (`resoperation.py`) walker, then
+        // read the concrete ref off the resolved operand. `cls_of_box`
+        // (`llsupport/model.py`) reads `box.getref_base().typeptr`
         // reads any ref-carrying box, so a bound `Op` / `InputArg` with a
         // stamped `Value::Ref` must resolve too — `get_value()`, not the
         // const-only `const_value()`.

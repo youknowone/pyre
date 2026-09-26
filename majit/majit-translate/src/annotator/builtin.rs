@@ -343,7 +343,6 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // pointer's null is the same `SomePtr(FuncType)` as the `fn` field
     // (`raw_fn_ptr_somevalue`), so the two arms of `Option<fn>` union.
     analyzer_for(&mut reg, "core.ptr.null_fn", fn_null_constant);
-    analyzer_for(&mut reg, "std.ptr.null_fn", fn_null_constant);
     // Rust `std::mem::size_of::<T>() -> usize` — compile-time type-size
     // constant called by `lltype::malloc_typed` /
     // `object_array::items_block_layout`.  Returns `SomeInteger`.

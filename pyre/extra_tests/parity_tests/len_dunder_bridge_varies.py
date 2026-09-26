@@ -1,3 +1,11 @@
+# CPython-suite gap: no suite test calls `len()` on a user `__len__` whose
+# answer changes, including a negative one, in a loop hot enough to compile
+# a bridge through the operator.
+#
+# parity-tests reason: the bridge walks `len`'s own tail after `__len__`
+# returns. A result baked at trace time, or a tail that skips the length
+# check, prints a different total and error count.
+#
 # A hot `len()` whose `__len__` answers a different value on every call,
 # including a negative that raises ValueError. The bridge through the
 # operator must re-run the length check; a constant baked at trace time
