@@ -590,10 +590,10 @@ pub unsafe fn w_bytes_find(obj: PyObjectRef, value: u8, start: usize) -> i64 {
 /// `stringmethods.py descr_contains` is `value.find(other) >= 0`.
 /// Empty needle is always present.  `bytes` is immutable, so elidable.
 #[majit_macros::elidable]
-pub extern "C" fn jit_bytes_contains(haystack: i64, needle: i64) -> i64 {
+pub extern "C" fn jit_bytes_contains(haystack: PyObjectRef, needle: PyObjectRef) -> i64 {
     unsafe {
-        let hay = w_bytes_data(haystack as PyObjectRef);
-        let needle = w_bytes_data(needle as PyObjectRef);
+        let hay = w_bytes_data(haystack);
+        let needle = w_bytes_data(needle);
         if needle.is_empty() {
             return 1;
         }
@@ -604,8 +604,8 @@ pub extern "C" fn jit_bytes_contains(haystack: i64, needle: i64) -> i64 {
 /// `n in b` on an exact `bytes` and a byte value in `range(256)`.
 /// `stringmethods.py descr_contains` via `_single_char`.
 #[majit_macros::elidable]
-pub extern "C" fn jit_bytes_contains_byte(haystack: i64, byte: i64) -> i64 {
-    unsafe { i64::from(w_bytes_data(haystack as PyObjectRef).contains(&(byte as u8))) }
+pub extern "C" fn jit_bytes_contains_byte(haystack: PyObjectRef, byte: i64) -> i64 {
+    unsafe { i64::from(w_bytes_data(haystack).contains(&(byte as u8))) }
 }
 
 // ── bytes-like helpers ────────────────────────────────────────────────
@@ -682,17 +682,11 @@ mod tests {
             assert_eq!(w_bytes_data(b), b"hello");
             assert_eq!(w_bytes_find(b, b'l', 0), 2);
             assert_eq!(w_bytes_find(b, b'x', 0), -1);
-            assert_eq!(
-                jit_bytes_contains(b as i64, w_bytes_from_bytes(b"ell") as i64),
-                1
-            );
-            assert_eq!(
-                jit_bytes_contains(b as i64, w_bytes_from_bytes(b"x") as i64),
-                0
-            );
-            assert_eq!(jit_bytes_contains(b as i64, w_bytes_empty() as i64), 1);
-            assert_eq!(jit_bytes_contains_byte(b as i64, b'h' as i64), 1);
-            assert_eq!(jit_bytes_contains_byte(b as i64, b'x' as i64), 0);
+            assert_eq!(jit_bytes_contains(b, w_bytes_from_bytes(b"ell")), 1);
+            assert_eq!(jit_bytes_contains(b, w_bytes_from_bytes(b"x")), 0);
+            assert_eq!(jit_bytes_contains(b, w_bytes_empty()), 1);
+            assert_eq!(jit_bytes_contains_byte(b, b'h' as i64), 1);
+            assert_eq!(jit_bytes_contains_byte(b, b'x' as i64), 0);
         }
     }
 

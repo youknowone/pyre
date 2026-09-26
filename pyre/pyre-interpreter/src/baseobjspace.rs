@@ -22486,7 +22486,7 @@ fn contains_str(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             crate::type_methods::arg_type_name(needle)
         )));
     }
-    Ok(pyre_object::unicodeobject::jit_str_contains(haystack as i64, needle as i64) != 0)
+    Ok(pyre_object::unicodeobject::jit_str_contains(haystack, needle) != 0)
 }
 
 /// `stringmethods.py descr_contains` on bytes/bytearray.
@@ -22495,10 +22495,7 @@ fn contains_bytes_like(haystack: PyObjectRef, needle: PyObjectRef) -> Result<boo
     use pyre_object::*;
     unsafe {
         if is_bytes(haystack) && is_bytes(needle) {
-            return Ok(pyre_object::bytesobject::jit_bytes_contains(
-                haystack as i64,
-                needle as i64,
-            ) != 0);
+            return Ok(pyre_object::bytesobject::jit_bytes_contains(haystack, needle) != 0);
         }
         let receiver = simple_buffer_bytes(haystack)?
             .expect("bytes/bytearray receiver always exports a buffer");
@@ -22511,7 +22508,7 @@ fn contains_bytes_like(haystack: PyObjectRef, needle: PyObjectRef) -> Result<boo
             if !(0..=255).contains(&v) {
                 Err(PyError::value_error("byte must be in range(0, 256)"))
             } else if is_bytes(haystack) {
-                Ok(pyre_object::bytesobject::jit_bytes_contains_byte(haystack as i64, v) != 0)
+                Ok(pyre_object::bytesobject::jit_bytes_contains_byte(haystack, v) != 0)
             } else {
                 Ok(receiver.as_bytes().contains(&(v as u8)))
             }

@@ -6360,7 +6360,7 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             // `W_UnicodeObject.descr_lt` answers from one `_utf8` ordering
             // (`ll_unicode_cmp`). `jit_str_compare` is that ordering on WTF-8
             // bytes, which matches code-point order including lone surrogates.
-            let diff = pyre_object::unicodeobject::jit_str_compare(a as i64, b as i64);
+            let diff = pyre_object::unicodeobject::jit_str_compare(a, b);
             return Ok(w_bool_from(match op {
                 CompareOp::Lt => diff < 0,
                 CompareOp::Le => diff <= 0,
@@ -6927,7 +6927,7 @@ pub(crate) fn sqrt_nonneg(x: f64) -> f64 {
 
 /// ll_math.py `ll_math_sqrt` after the domain pin: `W_FloatObject(sqrt_nonneg(x))`.
 #[inline(never)]
-pub(crate) fn _float_sqrt(x: f64) -> PyResult {
+pub fn _float_sqrt(x: f64) -> PyResult {
     let floatval = sqrt_nonneg(x);
     Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
@@ -6942,7 +6942,7 @@ pub(crate) fn _float_sqrt(x: f64) -> PyResult {
 
 /// ll_math.py `ll_math_sin` after the finite pin: `W_FloatObject(sin(x))`.
 #[inline(never)]
-pub(crate) fn _float_sin(x: f64) -> PyResult {
+pub fn _float_sin(x: f64) -> PyResult {
     Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
@@ -6956,7 +6956,7 @@ pub(crate) fn _float_sin(x: f64) -> PyResult {
 
 /// ll_math.py `ll_math_cos` after the finite pin: `W_FloatObject(cos(x))`.
 #[inline(never)]
-pub(crate) fn _float_cos(x: f64) -> PyResult {
+pub fn _float_cos(x: f64) -> PyResult {
     Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
@@ -6970,7 +6970,7 @@ pub(crate) fn _float_cos(x: f64) -> PyResult {
 
 /// ll_math.py `ll_math_tan` after the finite pin: `W_FloatObject(tan(x))`.
 #[inline(never)]
-pub(crate) fn _float_tan(x: f64) -> PyResult {
+pub fn _float_tan(x: f64) -> PyResult {
     Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
@@ -6984,7 +6984,7 @@ pub(crate) fn _float_tan(x: f64) -> PyResult {
 
 /// ll_math.py `ll_math_atan`: `W_FloatObject(atan(x))`.
 #[inline(never)]
-pub(crate) fn _float_atan(x: f64) -> PyResult {
+pub fn _float_atan(x: f64) -> PyResult {
     Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
@@ -6998,7 +6998,7 @@ pub(crate) fn _float_atan(x: f64) -> PyResult {
 
 /// ll_math.py `ll_math_exp` after the overflow pin: `W_FloatObject(exp(x))`.
 #[inline(never)]
-pub(crate) fn _float_exp(x: f64) -> PyResult {
+pub fn _float_exp(x: f64) -> PyResult {
     Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
@@ -7012,7 +7012,7 @@ pub(crate) fn _float_exp(x: f64) -> PyResult {
 
 /// ll_math.py `ll_math_log1p` after `x > -1`: `W_FloatObject(log1p(x))`.
 #[inline(never)]
-pub(crate) fn _float_log1p(x: f64) -> PyResult {
+pub fn _float_log1p(x: f64) -> PyResult {
     Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
@@ -7026,7 +7026,7 @@ pub(crate) fn _float_log1p(x: f64) -> PyResult {
 
 /// ll_math.py `ll_math_asin` after the `[-1, 1]` pin: `W_FloatObject(asin(x))`.
 #[inline(never)]
-pub(crate) fn _float_asin(x: f64) -> PyResult {
+pub fn _float_asin(x: f64) -> PyResult {
     Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
@@ -7041,9 +7041,9 @@ pub(crate) fn _float_asin(x: f64) -> PyResult {
 /// Unboxed `W_FloatObject` leaf. `|x| $compute` names the parameter; it is
 /// not a Rust closure (those residualize an extra `new` + call).
 macro_rules! float_math1_leaf {
-    ($fn:ident, |$x:ident| $compute:expr) => {
+    ($vis:vis $fn:ident, |$x:ident| $compute:expr) => {
         #[inline(never)]
-        pub(crate) fn $fn($x: f64) -> PyResult {
+        $vis fn $fn($x: f64) -> PyResult {
             Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
                 ob_header: PyObject {
                     ob_type: &FLOAT_TYPE as *const PyType,
@@ -7057,36 +7057,75 @@ macro_rules! float_math1_leaf {
     };
 }
 
-float_math1_leaf!(_float_acos, |x| x.acos());
-float_math1_leaf!(_float_sinh, |x| x.sinh());
-float_math1_leaf!(_float_cosh, |x| x.cosh());
-float_math1_leaf!(_float_tanh, |x| x.tanh());
-float_math1_leaf!(_float_asinh, |x| x.asinh());
-float_math1_leaf!(_float_acosh, |x| x.acosh());
-float_math1_leaf!(_float_atanh, |x| x.atanh());
-float_math1_leaf!(_float_cbrt, |x| x.cbrt());
-float_math1_leaf!(_float_exp2, |x| x.exp2());
-float_math1_leaf!(_float_expm1, |x| x.exp_m1());
-// crates.io pymath is not in the Charon artefact, so these residualize.
-// Interpreter `math1_pymath` already boxed the pymath `Ok` via `_float_pos`.
-float_math1_leaf!(_float_erf, |x| pymath::math::erf(x).unwrap_or(f64::NAN));
-float_math1_leaf!(_float_erfc, |x| pymath::math::erfc(x).unwrap_or(f64::NAN));
-float_math1_leaf!(_float_gamma, |x| pymath::math::gamma(x).unwrap_or(f64::NAN));
-float_math1_leaf!(_float_lgamma, |x| {
-    pymath::math::lgamma(x).unwrap_or(f64::NAN)
-});
-float_math1_leaf!(_float_ulp, |x| pymath::math::ulp(x));
+float_math1_leaf!(pub _float_acos, |x| x.acos());
+float_math1_leaf!(pub _float_tanh, |x| x.tanh());
+float_math1_leaf!(pub _float_cbrt, |x| x.cbrt());
+
+/// `ll_math.py new_unary_math_function` C calls for `asinh` / `acosh` /
+/// `atanh`, reached only inside the gateway's domain pin where the C
+/// function cannot fail.  `f64::asinh` and its siblings are std's own
+/// formulas rather than the C library and differ from it in the last place,
+/// so these call the same libm routine the slow path does, as one residual.
+#[majit_macros::elidable]
+pub fn _float_asinh_raw(x: f64) -> f64 {
+    pymath::math::asinh(x).unwrap_or(f64::NAN)
+}
+
+#[majit_macros::elidable]
+pub fn _float_acosh_raw(x: f64) -> f64 {
+    pymath::math::acosh(x).unwrap_or(f64::NAN)
+}
+
+#[majit_macros::elidable]
+pub fn _float_atanh_raw(x: f64) -> f64 {
+    pymath::math::atanh(x).unwrap_or(f64::NAN)
+}
+
+float_math1_leaf!(pub _float_asinh, |x| _float_asinh_raw(x));
+float_math1_leaf!(pub _float_acosh, |x| _float_acosh_raw(x));
+float_math1_leaf!(pub _float_atanh, |x| _float_atanh_raw(x));
+
+/// `ll_math.py` C calls (`llexternal(.., elidable_function=True)`) the
+/// crates.io pymath port answers; that crate is not in the Charon artefact,
+/// so each is one elidable residual.
+macro_rules! float_math1_raw {
+    ($fn:ident, |$x:ident| $compute:expr) => {
+        #[majit_macros::elidable]
+        pub fn $fn($x: f64) -> f64 {
+            $compute
+        }
+    };
+}
+
+float_math1_raw!(_float_erf_raw, |x| pymath::math::erf(x).unwrap_or(f64::NAN));
+float_math1_raw!(_float_erfc_raw, |x| pymath::math::erfc(x)
+    .unwrap_or(f64::NAN));
+float_math1_raw!(_float_ulp_raw, |x| pymath::math::ulp(x));
+float_math1_leaf!(pub _float_erf, |x| _float_erf_raw(x));
+float_math1_leaf!(pub _float_erfc, |x| _float_erfc_raw(x));
+
+float_math1_raw!(_float_gamma_raw, |x| pymath::math::gamma(x)
+    .unwrap_or(f64::NAN));
+float_math1_raw!(_float_lgamma_raw, |x| pymath::math::lgamma(x)
+    .unwrap_or(f64::NAN));
+float_math1_leaf!(pub _float_sinh, |x| x.sinh());
+float_math1_leaf!(pub _float_cosh, |x| x.cosh());
+float_math1_leaf!(pub _float_exp2, |x| x.exp2());
+float_math1_leaf!(pub _float_expm1, |x| x.exp_m1());
+float_math1_leaf!(pub _float_gamma, |x| _float_gamma_raw(x));
+float_math1_leaf!(pub _float_lgamma, |x| _float_lgamma_raw(x));
+float_math1_leaf!(pub _float_ulp, |x| _float_ulp_raw(x));
 // pymath::math::{degrees,radians} is `x * (180/π)` / `x * (π/180)`.
-float_math1_leaf!(_float_degrees, |x| x * (180.0 / std::f64::consts::PI));
-float_math1_leaf!(_float_radians, |x| x * (std::f64::consts::PI / 180.0));
-float_math1_leaf!(_float_log, |x| x.ln());
+float_math1_leaf!(pub _float_degrees, |x| x * (180.0 / std::f64::consts::PI));
+float_math1_leaf!(pub _float_radians, |x| x * (std::f64::consts::PI / 180.0));
+float_math1_leaf!(pub _float_log, |x| x.ln());
 
 /// Unboxed two-arg `W_FloatObject` leaf. `|x, y| $compute` names the
 /// parameters; it is not a Rust closure.
 macro_rules! float_math2_leaf {
     ($fn:ident, |$x:ident, $y:ident| $compute:expr) => {
         #[inline(never)]
-        pub(crate) fn $fn($x: f64, $y: f64) -> PyResult {
+        pub fn $fn($x: f64, $y: f64) -> PyResult {
             Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
                 ob_header: PyObject {
                     ob_type: &FLOAT_TYPE as *const PyType,
@@ -7101,18 +7140,30 @@ macro_rules! float_math2_leaf {
 }
 
 float_math2_leaf!(_float_pow, |x, y| x.powf(y));
-float_math2_leaf!(_float_fmod, |x, y| x % y);
 float_math2_leaf!(_float_copysign, |x, y| x.copysign(y));
-float_math2_leaf!(_float_remainder, |x, y| {
+
+/// `ll_math.py` `math_fmod` (`llexternal(.., elidable_function=True)`); `%`
+/// over two floats is not an RPython operation.
+#[majit_macros::elidable]
+pub fn _float_fmod_raw(x: f64, y: f64) -> f64 {
+    x % y
+}
+
+#[majit_macros::elidable]
+pub fn _float_remainder_raw(x: f64, y: f64) -> f64 {
     pymath::math::remainder(x, y).unwrap_or(f64::NAN)
-});
+}
+
+float_math2_leaf!(_float_fmod, |x, y| _float_fmod_raw(x, y));
+
+float_math2_leaf!(_float_remainder, |x, y| _float_remainder_raw(x, y));
 float_math2_leaf!(_float_atan2, |x, y| x.atan2(y));
 
 /// `math.floor`/`ceil`/`trunc` after the signed-range pin: `W_IntObject`.
 macro_rules! int_from_float_leaf {
     ($fn:ident, |$x:ident| $compute:expr) => {
         #[inline(never)]
-        pub(crate) fn $fn($x: f64) -> PyResult {
+        pub fn $fn($x: f64) -> PyResult {
             Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
                 ob_header: PyObject {
                     ob_type: &INT_TYPE as *const PyType,
@@ -7136,34 +7187,58 @@ int_from_float_leaf!(_int_from_ceil, |x| unsafe {
 });
 int_from_float_leaf!(_int_from_trunc, |x| unsafe { x.to_int_unchecked::<i64>() });
 
-/// ll_math.py `ll_math_frexp` mantissa half after the walker pins a
-/// normal finite non-zero.  The pair is two leaves because a
-/// `(f64, i64)` return residualizes as an aggregate call.
-float_math1_leaf!(_float_frexp_mantissa, |x| {
-    let bits = unsafe { std::mem::transmute::<f64, i64>(x) };
+/// ll_math.py `ll_math_frexp` exponent half for a normal finite non-zero,
+/// unboxed: the `pow` and `ldexp` gateways read it for their domain pins.
+/// The boxing leaves below spell the bit arithmetic in their own bodies so
+/// their jitcode records it directly.
+macro_rules! frexp_exponent_bits {
+    ($x:expr) => {{
+        let bits = $x.to_bits() as i64;
+        ((bits >> 52) & 0x7ff) - 1022
+    }};
+}
+
+#[inline(never)]
+pub fn _int_frexp_exponent_raw(x: f64) -> i64 {
+    frexp_exponent_bits!(x)
+}
+
+/// ll_math.py `ll_math_frexp` mantissa half for the same operand.
+float_math1_leaf!(pub _float_frexp_mantissa, |x| {
+    let bits = x.to_bits() as i64;
     let sign = bits & i64::MIN;
     let fraction = bits & ((1i64 << 52) - 1);
-    unsafe { std::mem::transmute::<i64, f64>(sign | (1022i64 << 52) | fraction) }
+    f64::from_bits((sign | (1022i64 << 52) | fraction) as u64)
 });
+int_from_float_leaf!(_int_frexp_exponent, |x| frexp_exponent_bits!(x));
 
-/// ll_math.py `ll_math_frexp` exponent half after the same pin.
-int_from_float_leaf!(_int_frexp_exponent, |x| {
-    let bits = unsafe { std::mem::transmute::<f64, i64>(x) };
-    let exponent = ((bits >> 52) & 0x7ff) as i64;
-    exponent - 1022
-});
+/// ll_math.py `ll_math_ldexp` on its exact arm: `-1022 <= exp <= 1023`, so
+/// `2**exp` is the normal double built from its exponent bits, and the
+/// caller keeps the product normal, so the multiplication cannot round.
+/// The boxing leaf below spells the same product in its own body.
+macro_rules! ldexp_exact_bits {
+    ($x:expr, $exp:expr) => {
+        $x * f64::from_bits((($exp + 1023) << 52) as u64)
+    };
+}
 
-/// ll_math.py `ll_math_ldexp` after the finite-x pin: `x * 2**exp`.
-/// `powf` is the already-lowered `math_pow` leaf; overflow becomes
-/// inf and the walker's finite-result guard resumes in the builtin.
+/// Only valid on the exact arm: the caller has already checked
+/// `-1022 <= exp <= 1023`. Outside it the exponent field wraps, and the
+/// result is not `x * 2**exp`.
 #[inline(never)]
-pub(crate) fn _float_ldexp(x: f64, exp: i64) -> PyResult {
+pub fn _float_ldexp_raw(x: f64, exp: i64) -> f64 {
+    ldexp_exact_bits!(x, exp)
+}
+
+/// ll_math.py `ll_math_ldexp` after the finite-x pin.
+#[inline(never)]
+pub fn _float_ldexp(x: f64, exp: i64) -> PyResult {
     Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
         },
-        floatval: x * 2.0f64.powf(exp as f64),
+        floatval: ldexp_exact_bits!(x, exp),
         w_dict: PY_NULL,
         w_slots: PY_NULL,
     }) as PyObjectRef)
@@ -7173,7 +7248,7 @@ pub(crate) fn _float_ldexp(x: f64, exp: i64) -> PyResult {
 /// `f64`.  One ulp correction, written as arithmetic so the body
 /// stays branch-free for `fuse_boxing_alloc`.
 #[inline(never)]
-pub(crate) fn _int_isqrt(n: i64) -> PyResult {
+pub fn _int_isqrt(n: i64) -> PyResult {
     let guess = unsafe { (n as f64).sqrt().to_int_unchecked::<i64>() };
     let too_high = i64::from(guess > n / guess);
     let too_low = i64::from(guess < n / (guess + 1));
@@ -7191,7 +7266,7 @@ pub(crate) fn _int_isqrt(n: i64) -> PyResult {
 /// after the walker pins finite operands.  `|` rather than `||` so
 /// the comparison is one expression.
 #[inline(never)]
-pub(crate) fn _float_isclose(a: f64, b: f64) -> PyResult {
+pub fn _float_isclose(a: f64, b: f64) -> PyResult {
     let diff = (b - a).abs();
     let close = (a == b) | (diff <= (1e-9 * b).abs()) | (diff <= (1e-9 * a).abs());
     Ok(w_bool_from(close))

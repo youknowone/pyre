@@ -332,8 +332,7 @@ pub const CANNOT_RAISE_NO_HEAP_EFFECT_INFO: EffectInfo = EffectInfo {
 /// `extraeffect >= EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`;
 /// `EF_ELIDABLE_CANNOT_RAISE` is 0.  Elidable with `can_collect=false` is
 /// therefore the analyzer output for an `@jit.elidable` leaf whose collect
-/// analyzer clears it, which is the shape of every helper in
-/// `jit_builtin_folds`.
+/// analyzer clears it.
 ///
 /// `EffectInfo.__new__` additionally empties `_write_descrs_*` for every
 /// `EF_ELIDABLE_*`.  Those sets are already empty here, so no other field

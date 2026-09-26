@@ -1669,57 +1669,66 @@ fn str_prefix_match_slow(
     .map(w_bool_from)
 }
 
+/// The whole `str.startswith` method behind the gateway's fast arm.
+#[majit_macros::dont_look_inside]
+fn str_startswith_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    str_method_startswith(args)
+}
+
+/// The whole `str.endswith` method behind the gateway's fast arm.
+#[majit_macros::dont_look_inside]
+fn str_endswith_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    str_method_endswith(args)
+}
+
 /// `BuiltinCode.func` PBC member for `str.startswith`.
 ///
 /// `interp2app` would generate this wrapper; the descent walker keys the
 /// args-array heap-cache off the element reads, the same shape
-/// `__majit_wrap_builtin_len` uses.  The non-default-bounds / tuple /
-/// TypeError arms go through [`str_prefix_match_slow`] so they stay
-/// `dont_look_inside` and do not pull `__getslice_minusone` into this graph.
+/// `__majit_wrap_builtin_len` uses.  The fast arm comes before the arity
+/// check: a keyword argument rides the same slice as a trailing dict, which
+/// is never a `str`, so two `str` elements are exactly one positional
+/// prefix.  Every other shape, the arity and keyword errors included, runs
+/// the method through the `dont_look_inside` [`str_startswith_slow`], so the
+/// kwargs scan and `__getslice_minusone` stay out of this graph.  The match
+/// is `rstring.py startswith`, which is `@jit.elidable`: one pure call.
 pub fn __majit_wrap_str_descr_startswith(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least(args, "startswith", 1)?;
-    arity_at_most(args, "startswith", 3)?;
-    if args.len() != 2 {
-        return str_prefix_match_slow(args, "startswith", true);
-    }
-    let w_self = args[0];
-    let w_prefix = args[1];
-    unsafe {
-        if !pyre_object::is_str(w_self)
-            || pyre_object::is_tuple(w_prefix)
-            || !pyre_object::is_str(w_prefix)
-        {
-            return str_prefix_match_slow(args, "startswith", true);
+    if args.len() == 2 {
+        let w_self = args[0];
+        let w_prefix = args[1];
+        if unsafe {
+            pyre_object::is_str(w_self)
+                && !pyre_object::is_tuple(w_prefix)
+                && pyre_object::is_str(w_prefix)
+        } {
+            let found =
+                unsafe { pyre_object::unicodeobject::startswith(w_self, w_prefix, 0, i64::MAX) };
+            return Ok(w_bool_from(found));
         }
     }
-    // Walk is spelled here, not delegated: a callee of this wrapper
-    // is never a CodeWriter candidate, so the call would stay residual
-    // and look-inside would die on `callable type method`.
-    Ok(w_bool_from(rstring_prefix_eq!(w_self, w_prefix)))
+    str_startswith_slow(args)
 }
 
 /// `BuiltinCode.func` PBC member for `str.endswith`.
 pub fn __majit_wrap_str_descr_endswith(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least(args, "endswith", 1)?;
-    arity_at_most(args, "endswith", 3)?;
-    if args.len() != 2 {
-        return str_prefix_match_slow(args, "endswith", false);
-    }
-    let w_self = args[0];
-    let w_suffix = args[1];
-    unsafe {
-        if !pyre_object::is_str(w_self)
-            || pyre_object::is_tuple(w_suffix)
-            || !pyre_object::is_str(w_suffix)
-        {
-            return str_prefix_match_slow(args, "endswith", false);
+    if args.len() == 2 {
+        let w_self = args[0];
+        let w_suffix = args[1];
+        if unsafe {
+            pyre_object::is_str(w_self)
+                && !pyre_object::is_tuple(w_suffix)
+                && pyre_object::is_str(w_suffix)
+        } {
+            let found =
+                unsafe { pyre_object::unicodeobject::endswith(w_self, w_suffix, 0, i64::MAX) };
+            return Ok(w_bool_from(found));
         }
     }
-    Ok(w_bool_from(rstring_suffix_eq!(w_self, w_suffix)))
+    str_endswith_slow(args)
 }
 
 /// Apply `startswith`/`endswith`'s optional `start`/`end` bounds to `s`,
@@ -1990,6 +1999,18 @@ fn str_search_bound(args: &[PyObjectRef], i: usize) -> PyObjectRef {
     }
 }
 
+/// `_convert_idx_params` on a bound [`bound_is_none_or_exact_int`] admitted:
+/// an omitted or `None` bound is `default`, an exact `int` its value.  The
+/// unwrap stays in the traced body so `ll_find` receives machine ints.
+#[inline(always)]
+fn str_search_bound_value(w: PyObjectRef, default: i64) -> i64 {
+    if w.is_null() || unsafe { pyre_object::is_none(w) } {
+        default
+    } else {
+        unsafe { pyre_object::w_int_get_value(w) }
+    }
+}
+
 /// Bounds that are not `None` or an exact `int` (`__index__`, a subclass)
 /// stay in the interpreter body. `dont_look_inside` so that arm does not
 /// pull its helpers into the generated wrapper.
@@ -2012,7 +2033,7 @@ fn str_descr_count_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 /// `unicodeobject.py descr_find`. The search is `ll_find`: an elidable
-/// residual (`jit_str_find_objs`), not a hand trace.
+/// residual (`jit_str_find_bounds`), not a hand trace.
 pub fn __majit_wrap_str_descr_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Arity and kwargs stay on the slow arm. `arity_at_least` pulls the
     // kwargs-marker read into this graph, and that effect makes every later
@@ -2029,11 +2050,11 @@ pub fn __majit_wrap_str_descr_find(args: &[PyObjectRef]) -> Result<PyObjectRef, 
         return str_descr_find_slow(args);
     }
     let n = unsafe {
-        pyre_object::unicodeobject::jit_str_find_objs(
-            args[0] as i64,
-            args[1] as i64,
-            start as i64,
-            end as i64,
+        pyre_object::unicodeobject::jit_str_find_bounds(
+            args[0],
+            args[1],
+            str_search_bound_value(start, 0),
+            str_search_bound_value(end, i64::MAX),
         )
     };
     Ok(w_int_new(n))
@@ -2053,11 +2074,11 @@ pub fn __majit_wrap_str_descr_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef,
         return str_descr_rfind_slow(args);
     }
     let n = unsafe {
-        pyre_object::unicodeobject::jit_str_rfind_objs(
-            args[0] as i64,
-            args[1] as i64,
-            start as i64,
-            end as i64,
+        pyre_object::unicodeobject::jit_str_rfind_bounds(
+            args[0],
+            args[1],
+            str_search_bound_value(start, 0),
+            str_search_bound_value(end, i64::MAX),
         )
     };
     Ok(w_int_new(n))
@@ -2077,11 +2098,11 @@ pub fn __majit_wrap_str_descr_count(args: &[PyObjectRef]) -> Result<PyObjectRef,
         return str_descr_count_slow(args);
     }
     let n = unsafe {
-        pyre_object::unicodeobject::jit_str_count_objs(
-            args[0] as i64,
-            args[1] as i64,
-            start as i64,
-            end as i64,
+        pyre_object::unicodeobject::jit_str_count_bounds(
+            args[0],
+            args[1],
+            str_search_bound_value(start, 0),
+            str_search_bound_value(end, i64::MAX),
         )
     };
     Ok(w_int_new(n))

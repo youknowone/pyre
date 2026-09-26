@@ -589,11 +589,22 @@ fn normalize_unary_op_name(source_name: &str) -> Result<String, TyperError> {
         // string-build lowering (`str(arg)` ++ `ll_strconcat`) in place of
         // the graph-less `fmt::rt::Argument::new_display` chain.
         "str" => Ok("str".to_string()),
+        // `abs` — `operation.py add_operator('abs', 1, dispatch=1,
+        // pyfunc=abs, pure=True)`, dispatched at `rtyper.rs "abs"` into
+        // `FloatRepr.rtype_abs` (`float_abs`) / `IntegerRepr.rtype_abs`.
+        // The front lowers `f64::abs` to this unary op.
+        "abs" => Ok("abs".to_string()),
+        // `cast_float_to_int` is what `rfloat.py FloatRepr.rtype_int`
+        // emits for `int(x)` on a float, so the flowspace op it stands for
+        // is `int` (`operation.py add_operator('int', 1, dispatch=1,
+        // pyfunc=int)`).  The front emits it for
+        // `f64::to_int_unchecked::<i64>` and the float-to-int scalar cast.
+        "cast_float_to_int" => Ok("int".to_string()),
         other => Err(TyperError::missing_rtype_operation(format!(
             "normalize_unary_op_name: pyre UnaryOp `{other}` has no \
              flowspace counterpart (operation.py registers \
-             `pos` / `neg` / `invert` / `bool` and the ported `str` \
-             as unary ops; \
+             `pos` / `neg` / `invert` / `bool` / `abs` and the ported \
+             `str` as unary ops, and `cast_float_to_int` stands for `int`; \
              `same_as` is rtyper's internal renaming op per \
              rtyper.py:478-481; all 13 typed cast names retired \
              across Slices A.3 / B.1 / A.4a / A.4b / A.4c — frontend \
