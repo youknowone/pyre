@@ -933,3 +933,57 @@ fn finditem_str_named_and_attr_cached_lower() {
         "we_are_jitted ConstBool(true) clears the interpreter shortcut: {leaves:?}"
     );
 }
+
+#[test]
+fn a_payload_less_err_shell_of_an_inlined_callee_is_left_materialised() {
+    // `from_utf8`'s `Err(Utf8Error)` is built field by field and consumed in
+    // the body; it never reaches `returnblock`, so the callee rule skips it
+    // like the other consumed intermediates.
+    lower_function(
+        interp(),
+        "pyre_interpreter::baseobjspace::module_miss_error",
+    )
+    .expect("module_miss_error lowers under the carrier");
+}
+
+#[test]
+fn a_dont_look_inside_by_value_adt_return_declares_its_class() {
+    let graph = lower_function(interp(), "pyre_interpreter::call::take_call_error")
+        .expect("take_call_error lowers");
+    assert_eq!(
+        graph.return_class_root.as_deref(),
+        Some("core::option::Option<PyError>"),
+        "the stub result is SomeInstance of the declared Option<PyError>"
+    );
+}
+
+#[test]
+fn result_map_of_some_builds_the_option_instead_of_a_fn_const() {
+    let graph = lower_function(
+        interp(),
+        "pyre_interpreter::display::exception_kind_str_wtf8",
+    )
+    .expect("exception_kind_str_wtf8 lowers");
+    let ops: Vec<&OpKind> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .map(|op| &op.kind)
+        .collect();
+    let fn_consts: Vec<_> = ops
+        .iter()
+        .filter_map(|kind| match kind {
+            OpKind::Call { target, .. } => majit_translate::model::fn_const_segments(target),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        fn_consts.is_empty(),
+        "`.map(Some)` leaves no function-item define: {fn_consts:?}"
+    );
+    assert!(
+        !ops.iter().any(|kind| matches!(kind,
+            OpKind::Call { target: CallTarget::Method { name, .. }, .. } if name == "map")),
+        "`.map(Some)` leaves no residual Result::map"
+    );
+}

@@ -196,6 +196,7 @@ two-phase-never-a-subject	pyre_interpreter::baseobjspace::view_as_kwargs
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::w_type_getdictvalue
 two-phase-never-a-subject	pyre_interpreter::builtins::<Impl>::acquire
 two-phase-never-a-subject	pyre_interpreter::builtins::<Impl>::as_mut_slice
+two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_builtin_abs
 two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_builtin_dunder_import
 two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_builtin_isinstance
 two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_builtin_iter
@@ -226,7 +227,6 @@ two-phase-never-a-subject	pyre_interpreter::builtins::file_write_buffer_bytes
 two-phase-never-a-subject	pyre_interpreter::builtins::fileio_writebuf
 two-phase-never-a-subject	pyre_interpreter::builtins::getindex_w
 two-phase-never-a-subject	pyre_interpreter::builtins::has_real_kwargs
-two-phase-never-a-subject	pyre_interpreter::builtins::import_bound_objects
 two-phase-never-a-subject	pyre_interpreter::builtins::is_native_exception_dunder
 two-phase-never-a-subject	pyre_interpreter::builtins::kwarg_get
 two-phase-never-a-subject	pyre_interpreter::builtins::memoryview_call_python_release_unraisable
@@ -314,6 +314,7 @@ two-phase-never-a-subject	pyre_interpreter::error::<Impl>::normalize_exception
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::os_error_syscall
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::os_error_syscall2
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::os_error_with_errno
+two-phase-never-a-subject	pyre_interpreter::error::<Impl>::record_context
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::reload_exc_object
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::render_exception_wtf8
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::set_cause
@@ -322,6 +323,7 @@ two-phase-never-a-subject	pyre_interpreter::error::<Impl>::write_to_sys_stderr
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::write_unraisable
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::write_unraisable_default
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::write_unraisable_with_traceback
+two-phase-never-a-subject	pyre_interpreter::error::chain_context
 two-phase-never-a-subject	pyre_interpreter::error::emit_report_to_host_stderr
 two-phase-never-a-subject	pyre_interpreter::error::exc_object_class_name
 two-phase-never-a-subject	pyre_interpreter::error::system_error_from_cause
@@ -331,6 +333,7 @@ two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::binary_value
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::build_map
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::call_callable
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::compare_value
+two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::ellipsis_constant
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::iter_next
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::iter_value
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::list_append
@@ -415,6 +418,7 @@ two-phase-never-a-subject	pyre_interpreter::importing::optional_module_hooks
 two-phase-never-a-subject	pyre_interpreter::importing::save_module_content_for_future_reload
 two-phase-never-a-subject	pyre_interpreter::importing::set_sys_module
 two-phase-never-a-subject	pyre_interpreter::importing::spec_file_origin
+two-phase-never-a-subject	pyre_interpreter::importing::startup_builtin_module_impl
 two-phase-never-a-subject	pyre_interpreter::importing::utf8_mode_flag
 two-phase-never-a-subject	pyre_interpreter::importing::warn_default_encoding_flag
 two-phase-never-a-subject	pyre_interpreter::module::__pypy__::interp_buffer::<Impl>::__buffer__
@@ -899,7 +903,6 @@ two-phase-never-a-subject	pyre_interpreter::module::_random::<Impl>::__new__
 two-phase-never-a-subject	pyre_interpreter::module::_random::<Impl>::seed
 two-phase-never-a-subject	pyre_interpreter::module::_random::__majit_wrap___new__
 two-phase-never-a-subject	pyre_interpreter::module::_random::__majit_wrap_getrandbits
-two-phase-never-a-subject	pyre_interpreter::module::_random::__majit_wrap_getstate
 two-phase-never-a-subject	pyre_interpreter::module::_random::__majit_wrap_seed
 two-phase-never-a-subject	pyre_interpreter::module::_random::__majit_wrap_setstate
 two-phase-never-a-subject	pyre_interpreter::module::_random::seed_from_time
@@ -1714,6 +1717,7 @@ two-phase-never-a-subject	pyre_object::gc_hook::gc_identity_hash
 two-phase-never-a-subject	pyre_object::gc_hook::try_gc_alloc
 two-phase-never-a-subject	pyre_object::gc_hook::try_gc_alloc_collecting_rooted
 two-phase-never-a-subject	pyre_object::gc_hook::try_gc_alloc_stable
+two-phase-never-a-subject	pyre_object::gc_hook::try_gc_register_finalizer
 two-phase-never-a-subject	pyre_object::gc_roots::<Impl>::new
 two-phase-never-a-subject	pyre_object::generator::w_async_generator_new
 two-phase-never-a-subject	pyre_object::generator::w_coroutine_new
@@ -1829,6 +1833,7 @@ two-phase-never-a-subject	pyre_object::setobject::w_set_insert_key_into
 two-phase-never-a-subject	pyre_object::setobject::w_set_insert_key_into::<Impl>::call_once
 two-phase-never-a-subject	pyre_object::setobject::w_set_insert_key_reentrant
 two-phase-never-a-subject	pyre_object::slots::slot_get
+two-phase-never-a-subject	pyre_object::special::w_ellipsis
 two-phase-never-a-subject	pyre_object::tupleobject::w_tuple_getitem
 two-phase-never-a-subject	pyre_object::tupleobject::w_tuple_getitem_known
 two-phase-never-a-subject	pyre_object::unicode_array::<Impl>::pop

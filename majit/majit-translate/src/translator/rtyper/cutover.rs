@@ -2162,7 +2162,8 @@ fn install_source_graph(
             .as_deref()
             .map(|identity| FunctionPathKey::from_segments(identity.split("::")))
             .unwrap_or_else(|| key.clone());
-        let result_shell = residual_stub_result_shell(&semantic_key, graph.return_type.as_deref());
+        let result_shell = residual_stub_result_shell(&semantic_key, graph.return_type.as_deref())
+            .map(|shell| declared_return_instance(registry, graph).unwrap_or(shell));
         if let Some(result_shell) = result_shell {
             let stub = build_stub_pygraph_with_result_shell(
                 graph.name.clone(),
@@ -2821,6 +2822,33 @@ fn residual_stub_result_shell(
     } else {
         residual_return_shell(token)
     }
+}
+
+/// `SomeInstance(classdef)` of a residual callee's by-value ADT result
+/// (`FunctionGraph::return_class_root`), the result a `_signature_` naming
+/// that class declares.  The `ref` token alone shells the result as a
+/// classdef-less instance, whose payload reads (`__discriminant`,
+/// `__pos_0`) cannot be annotated.  `None` when the token is not `ref` or
+/// the graph names no class.
+fn declared_return_instance(
+    registry: &CallRegistry,
+    graph: &LegacyGraph,
+) -> Option<crate::annotator::model::SomeValue> {
+    if graph.return_type.as_deref() != Some("ref") {
+        return None;
+    }
+    let root = graph.return_class_root.as_deref()?;
+    let bk = registry.bookkeeper();
+    let classdef = bk
+        .getuniqueclassdef(&bk.intern_class_by_qualname(root))
+        .ok()?;
+    Some(crate::annotator::model::SomeValue::Instance(
+        crate::annotator::model::SomeInstance::new(
+            Some(classdef),
+            false,
+            std::collections::BTreeMap::new(),
+        ),
+    ))
 }
 
 /// Project a FUNC.RESULT token (the `return_type` string) to its

@@ -4666,8 +4666,7 @@ mod static_result_shell_tests {
         let returnblock = graph.returnblock;
         graph.set_goto(entry, returnblock, vec![shell.clone()]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
-                .expect("payload-less Ok lowers"),
+            lower_result_exc_returns(&mut graph, 0).expect("payload-less Ok lowers"),
             1
         );
         let ops = &graph.blocks[entry.0].operations;

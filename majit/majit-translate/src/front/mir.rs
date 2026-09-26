@@ -3976,6 +3976,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     );
     let result_exc_ok_is_unit = result_exc_ok_is_unit(fd, llbc, static_addrs.error_carrier);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
+        lo.graph.return_class_root = dont_look_inside_return_class_root(
+            &fd.signature.output,
+            llbc,
+            static_addrs.error_carrier,
+        );
         // MIR framestate argument threading must finish before adding native
         // enum arms: its successor table names MIR blocks, not these new
         // flow blocks. No temporary tagged-pair root reaches annotation.
@@ -4075,6 +4080,21 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             crate::front::slice_index::rewire_slice_index_rangeto_sites(
                 &mut lo.graph,
                 &lo.slice_index_rangeto_sites,
+            );
+        }
+        // `map`/`and_then` on a carrier Result is an if/else on the receiver
+        // (`DiscCombinatorSite::carrier_recv`); build it before the carrier
+        // becomes exception edges, as `result_map_err` does below.
+        let (carrier_disc_sites, disc_combinator_sites): (Vec<_>, Vec<_>) = lo
+            .disc_combinator_sites
+            .iter()
+            .cloned()
+            .partition(|site| site.carrier_recv);
+        if !carrier_disc_sites.is_empty() {
+            rewire_disc_combinator_sites(
+                &mut lo.graph,
+                &carrier_disc_sites,
+                static_addrs.error_carrier,
             );
         }
         if !lo.result_exc_call_results.is_empty() {
@@ -4460,10 +4480,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             .map_err(LowerError::Unsupported)?;
         }
         let closure_select_rewritten = closure_select_outcome.rewritten;
-        if !lo.disc_combinator_sites.is_empty() {
+        if !disc_combinator_sites.is_empty() {
             rewire_disc_combinator_sites(
                 &mut lo.graph,
-                &lo.disc_combinator_sites,
+                &disc_combinator_sites,
                 static_addrs.error_carrier,
             );
         }
@@ -23890,12 +23910,13 @@ impl<'a> Lowering<'a> {
             }
             _ => {}
         }
-        if is_result
+        let carrier_recv = is_result
             && crate::front::result_exc::tyref_is_result_of_carrier(
                 &recv_ty,
                 self.llbc,
                 self.static_addrs.error_carrier,
-            )
+            );
+        if carrier_recv
             && matches!(
                 kind,
                 DiscCombinator::ResultUnwrapOrElse
@@ -23905,8 +23926,8 @@ impl<'a> Lowering<'a> {
             )
         {
             // Carrier Results whose combinator would rebuild a Result shell
-            // are `result_exc`'s domain.  `map`/`and_then` still lower: the
-            // post-pass handles the LastException form `result_exc` leaves.
+            // are `result_exc`'s domain.  `map`/`and_then` still lower, as an
+            // if/else on the receiver built before `result_exc` runs.
             return None;
         }
 
@@ -23934,6 +23955,7 @@ impl<'a> Lowering<'a> {
             args_tuple_suffix: String::new(),
             call_result_ty: ValueType::Ref(None),
             call_result_class: None,
+            carrier_recv,
         };
 
         if is_option {
@@ -35620,6 +35642,54 @@ fn dont_look_inside_return_token(
     Some(token.to_string())
 }
 
+/// Class key of a callee's by-value ADT result — the value
+/// `FunctionGraph::return_class_root` carries so a `dont_look_inside` stub
+/// returns `SomeInstance(classdef)` instead of the classdef-less `ref`
+/// shell.  Reads the same `Result<T, PyError>` payload
+/// [`dont_look_inside_return_token`] reads.
+///
+/// An enum instantiation keys as its template path plus the `<…>` suffix,
+/// the spelling a `Some(..)` / `Ok(..)` construction of that instantiation
+/// mints.  Only instantiations whose type arguments are all by-value ADTs
+/// qualify: a reference, raw-pointer or `Box` argument can make the enum a
+/// null-niche pointer, which has no enum class.  A named struct keys as its
+/// class root.  `None` otherwise.
+fn dont_look_inside_return_class_root(
+    output: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Option<String> {
+    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
+        crate::front::result_exc::tyref_result_ok(output, llbc)
+    } else {
+        None
+    };
+    let ty = payload.as_ref().unwrap_or(output);
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let adt = node.as_object()?.get("Adt")?.as_object()?;
+    let td = llbc.type_by_id(adt_node_def_id(node)?)?;
+    if !matches!(td.kind, TypeDeclKind::Enum(_)) {
+        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+    }
+    let type_args = adt
+        .get("generics")
+        .and_then(|g| g.get("types"))
+        .and_then(serde_json::Value::as_array)?;
+    if type_args.is_empty() {
+        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+    }
+    let by_value_args = type_args.iter().all(|arg| {
+        strip_ty_indirections(arg, llbc).is_some_and(|arg| {
+            adt_node_def_id(arg).is_some() && type_node_box_pointee(arg, llbc).is_none()
+        })
+    });
+    if !by_value_args {
+        return None;
+    }
+    let suffix = adt_head_instantiation_suffix(adt, llbc)?;
+    Some(format!("{}{suffix}", td.item_meta.name_path()))
+}
+
 /// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to the
 /// exact `majit_rlib::rbigint::RBigInt` ADT. Guards the
 /// RBigInt binary-operator retarget (`front::bigint_binop`) so a same-named
@@ -36873,37 +36943,13 @@ fn type_node_fn_def_fun_id<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) 
             node = &arr[1];
             continue;
         }
-        return obj
-            .get("FnDef")?
-            .as_object()?
-            .get("kind")?
-            .get("Fun")?
-            .as_u64();
+        // The item's `FnPtr` sits under a `RegionBinder`
+        // (`{"FnDef": {"regions": …, "skip_binder": {"kind": …}}}`).
+        let fn_def = obj.get("FnDef")?;
+        let fn_ptr = fn_def.get("skip_binder").unwrap_or(fn_def);
+        return fn_ptr.get("kind")?.get("Fun")?.as_u64();
     }
     None
-}
-
-/// Direct-call `FunctionPath` segments of a `FnDef` type, or `None` when
-/// `ty` is not a named function item.
-fn tyref_fn_def_call_segments(ty: &TyRef, llbc: &Llbc) -> Option<Vec<String>> {
-    let fun_id = type_node_fn_def_fun_id(tyref_node(ty, llbc)?, llbc)?;
-    let fd = llbc.fn_by_id(fun_id)?;
-    let segments = fundecl_fn_item_segments(llbc, fd);
-    (!segments.is_empty()).then_some(segments)
-}
-
-/// Callable named by a combinator's second argument when that argument is a
-/// function item: a `FnDef` constant, or a Copy/Move of a `FnDef`-typed
-/// local.  `None` for a closure ADT (handled via `call_once`) and for any
-/// unproven shape.
-fn operand_fn_item_segments(llbc: &Llbc, op: Option<&Operand>) -> Option<Vec<String>> {
-    match op? {
-        Operand::Const(value) => match decode_constant(llbc, value) {
-            Ok(DecodedConst::FnPath(segments)) if !segments.is_empty() => Some(segments),
-            _ => None,
-        },
-        Operand::Copy(p) | Operand::Move(p) => tyref_fn_def_call_segments(&p.ty, llbc),
-    }
 }
 
 /// The `FunDecl` a combinator's function-item argument names — the operand
@@ -42014,6 +42060,12 @@ struct DiscCombinatorSite {
     args_tuple_suffix: String,
     call_result_ty: ValueType,
     call_result_class: Option<String>,
+    /// The receiver is a `Result<_, carrier>`.  Its `map`/`and_then` is
+    /// rewritten into the if/else on the receiver before `result_exc` turns
+    /// the carrier into exception edges, so the receiver call is caught and
+    /// rewrapped like any other `match` on it, and the built `Ok`/`Err`
+    /// shells reach the callee rule.
+    carrier_recv: bool,
 }
 
 #[derive(Clone)]
@@ -42307,7 +42359,6 @@ fn rewire_disc_combinator_diamond(
     if site.kind == DiscCombinator::OptionFilter {
         return rewire_option_filter_diamond(graph, site, a, ci, recv, extra, flow_result, &name);
     }
-    let exception_lowered = matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException));
     let [exit] = graph.blocks[a].exits.as_slice() else {
         if exception_lowered && graph.blocks[a].exits.len() == 2 {
             return rewire_result_map_last_exception(
@@ -42357,7 +42408,6 @@ fn rewire_disc_combinator_diamond(
             DiscCombinator::ResultErr => (true, true, false, false, false),
             DiscCombinator::ResultIsOk | DiscCombinator::ResultIsErr => unreachable!(),
         };
-
     // A function-item callable is named, not threaded: only a closure env or
     // a plain value argument flows into the arm.
     let extra = extra.filter(|_| site.fn_item_segments.is_none());
@@ -42869,8 +42919,13 @@ fn build_disc_arm(
     }
 }
 
-fn rewire_result_map_last_exception(
+/// Run a Result combinator's callable on `payload` in `block`: a function
+/// item directly, a closure as `call_once(env, (payload,))` with the env
+/// threaded in as `extra`.
+#[allow(clippy::too_many_arguments)]
+fn emit_disc_callable(
     graph: &mut FunctionGraph,
+    block: BlockId,
     site: &DiscCombinatorSite,
     spec: crate::ErrorCarrierSpec<'_>,
     (a, ci): (usize, usize),
@@ -48046,6 +48101,7 @@ mod tests {
             args_tuple_suffix: String::new(),
             call_result_ty: ValueType::Int,
             call_result_class: None,
+            carrier_recv: false,
         };
         let live_before: std::collections::HashSet<_> =
             graph.blocks.iter().map(|block| block.id).collect();
@@ -65202,6 +65258,7 @@ mod tests {
             args_tuple_suffix: String::new(),
             call_result_ty: ValueType::Int,
             call_result_class: None,
+            carrier_recv: false,
         }
     }
 

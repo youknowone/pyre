@@ -7231,6 +7231,13 @@ pub struct FunctionGraph {
     /// `with_return_type(rt)` after construction (parse.rs + lib.rs
     /// free-function, trait-method, and inherent-method registration).
     pub return_type: Option<String>,
+    /// Class key of the declared return value when it is a by-value ADT
+    /// (`core::option::Option<PyError>`, a named struct) — the
+    /// `SomeInstance` result a `_signature_` would declare.  `return_type`
+    /// only carries the residual-call register kind (`ref`), so a
+    /// `dont_look_inside` stub reads the class from here.  `None` for
+    /// scalar, pointer and unit returns.
+    pub return_class_root: Option<String>,
     /// Per-graph JIT hints — the `_jit_*_` / `_elidable_function_`
     /// attributes RPython `policy.py look_inside_graph` reads off
     /// `graph.func`. Pyre carries them on the graph itself so
@@ -7361,6 +7368,7 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
         blocks,
         notes: graph.notes.clone(),
         return_type: graph.return_type.clone(),
+        return_class_root: graph.return_class_root.clone(),
         hints: graph.hints.clone(),
         access_directly: graph.access_directly,
         func: graph.func.clone(),
@@ -7426,6 +7434,7 @@ impl FunctionGraph {
             ],
             notes: Vec::new(),
             return_type: None,
+            return_class_root: None,
             owner_root: None,
             source_identity: None,
             fun_decl_id: None,
