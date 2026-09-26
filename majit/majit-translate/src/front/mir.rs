@@ -16731,10 +16731,9 @@ impl<'a> Lowering<'a> {
 
     /// Charon fields of a multi-word inline value. A transparent newtype
     /// (`Dynamic` over `Union`) contributes the inner type's fields. A
-    /// struct field is a `getfield`/`setfield`. An enum contributes one
-    /// raw span per non-overlapping layout field, at that field's byte
-    /// size — a wide JIT tag must not swallow the payload that sits in
-    /// the next bytes.
+    /// struct field and an enum field are both `getfield`/`setfield`.
+    /// Overlapping enum fields keep the wider span. A wide JIT tag must
+    /// not swallow the payload that sits in the next bytes.
     fn move_plan(&self, ty: &TyRef) -> Option<MovePlan> {
         let id = self.tyref_adt_def_id(ty)?;
         let td = self.llbc.type_by_id(id)?;
@@ -16823,9 +16822,7 @@ impl<'a> Lowering<'a> {
                         let Some(offset) = layout.field_offset(vidx, i) else {
                             return None;
                         };
-                        let Some((_item_ty, itemsize, _is_signed)) =
-                            self.span_raw_for_ty(&field.ty)
-                        else {
+                        let Some((_, itemsize, _)) = self.span_raw_for_ty(&field.ty) else {
                             return None;
                         };
                         if itemsize == 0 {
@@ -16880,33 +16877,18 @@ impl<'a> Lowering<'a> {
         let result = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        let kind = match &span.kind {
-            SpanKind::Field {
-                name,
-                owner,
-                owner_id,
-                ty,
-            } => OpKind::FieldRead {
-                base: base.clone(),
-                field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
-                    .with_owner_id(Some(*owner_id)),
-                ty: ty.clone(),
-                pure: false,
-            },
-            SpanKind::Raw {
-                item_ty,
-                itemsize,
-                is_signed,
-            } => {
-                let offset = self.emit_span_offset(bb_id, span.offset);
-                OpKind::RawLoad {
-                    base: base.clone(),
-                    offset,
-                    item_ty: item_ty.clone(),
-                    itemsize: *itemsize,
-                    is_item_signed: *is_signed,
-                }
-            }
+        let SpanKind::Field {
+            name,
+            owner,
+            owner_id,
+            ty,
+        } = &span.kind;
+        let kind = OpKind::FieldRead {
+            base: base.clone(),
+            field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
+                .with_owner_id(Some(*owner_id)),
+            ty: ty.clone(),
+            pure: false,
         };
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result.clone()),
@@ -16923,50 +16905,23 @@ impl<'a> Lowering<'a> {
         value: Variable,
     ) {
         let bb_id = self.block_id[mir_bb];
-        let kind = match &span.kind {
-            SpanKind::Field {
-                name,
-                owner,
-                owner_id,
-                ty,
-            } => OpKind::FieldWrite {
-                base: base.clone(),
-                field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
-                    .with_owner_id(Some(*owner_id)),
-                value: crate::model::LinkArg::Value(value),
-                ty: ty.clone(),
-            },
-            SpanKind::Raw {
-                item_ty,
-                itemsize,
-                is_signed,
-            } => {
-                let offset = self.emit_span_offset(bb_id, span.offset);
-                OpKind::RawStore {
-                    base: base.clone(),
-                    offset,
-                    value,
-                    item_ty: item_ty.clone(),
-                    itemsize: *itemsize,
-                    is_item_signed: *is_signed,
-                }
-            }
+        let SpanKind::Field {
+            name,
+            owner,
+            owner_id,
+            ty,
+        } = &span.kind;
+        let kind = OpKind::FieldWrite {
+            base: base.clone(),
+            field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
+                .with_owner_id(Some(*owner_id)),
+            value: crate::model::LinkArg::Value(value),
+            ty: ty.clone(),
         };
         self.graph
             .block_mut(bb_id)
             .operations
             .push(SpaceOperation { result: None, kind });
-    }
-
-    fn emit_span_offset(&mut self, bb_id: crate::model::BlockId, offset: u64) -> Variable {
-        let var = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(var.clone()),
-            kind: OpKind::ConstInt(offset as i64),
-        });
-        var
     }
 
     /// Fresh aggregate holding `parts`, in `plan.spans` order. The
@@ -27815,32 +27770,13 @@ struct MoveSpan {
 }
 
 enum SpanKind {
-    /// Named struct field. `getfield_gc` / `setfield_gc`.
+    /// Named field. `getfield_gc` / `setfield_gc`.
     Field {
         name: String,
         owner: String,
         owner_id: majit_ir::descr::StructId,
         ty: ValueType,
     },
-    /// Enum layout byte. Width is the Charon field, not the JIT tag model.
-    Raw {
-        item_ty: ValueType,
-        itemsize: usize,
-        is_signed: bool,
-    },
-}
-
-impl SpanKind {
-    fn size(&self) -> usize {
-        match self {
-            SpanKind::Field { ty, .. } => match ty {
-                ValueType::Float | ValueType::Int | ValueType::Unsigned | ValueType::Ref(_) => 8,
-                ValueType::Bool => 1,
-                _ => 8,
-            },
-            SpanKind::Raw { itemsize, .. } => *itemsize,
-        }
-    }
 }
 
 /// Peel `Deduplicated` / `HashConsedValue` wrappers off a Charon value.
