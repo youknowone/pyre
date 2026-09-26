@@ -1046,7 +1046,7 @@ impl OptString {
         // fall back to its canonical materialized stand-in rather than the
         // total resolver's position-only panic.
         let args: smallvec::SmallVec<[Operand; 4]> = op
-            .getarglist()
+            .args_slice()
             .iter()
             .map(|a| match ctx.resolve_operand_operand_opt(a) {
                 Some(resolved) => resolved,
@@ -2172,7 +2172,7 @@ mod tests {
         // arg0 is the SOURCE (ref_op(10)), not the slice (ref_op(11)); arg1 is
         // `start + 0`, which collapses back to the start box (int_op(300)).
         assert_eq!(
-            op.getarglist()
+            op.args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -2388,7 +2388,7 @@ mod tests {
         assert_eq!(last_op.opcode, OpCode::Unicodelen);
         assert_eq!(
             last_op
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -2923,7 +2923,7 @@ mod tests {
         assert_eq!(strlen_op.opcode, OpCode::Strlen);
         assert_eq!(
             strlen_op
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),

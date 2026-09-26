@@ -338,7 +338,7 @@ where
         };
         for op in trace[start..end].iter().map(std::borrow::Borrow::borrow) {
             consider(op.pos().get());
-            for a in op.getarglist().iter() {
+            for a in op.args_slice().iter() {
                 consider(a.to_opref());
             }
             op.visit_failarg_oprefs(&mut consider);
@@ -3602,7 +3602,7 @@ mod tests {
         let op0 = iter.next().unwrap();
         assert_eq!(op0.pos().get(), iop(104));
         assert_eq!(
-            op0.getarglist()
+            op0.args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -3611,7 +3611,7 @@ mod tests {
 
         let op1 = iter.next().unwrap();
         assert_eq!(
-            op1.getarglist()
+            op1.args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -3623,7 +3623,7 @@ mod tests {
         let finish = iter.next().unwrap();
         assert_eq!(
             finish
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -5103,7 +5103,7 @@ mod tests {
         assert_eq!(ops[0].opcode, OpCode::IntAdd);
         assert_eq!(
             ops[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),

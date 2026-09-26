@@ -779,7 +779,7 @@ impl Optimizer {
         if !forwarded.is_const() {
             return false;
         }
-        op.num_args() == 0 || op.getarglist().iter().all(|arg| arg.is_none())
+        op.num_args() == 0 || op.args_slice().iter().all(|arg| arg.is_none())
     }
 
     fn import_virtual_state_value(
@@ -2210,7 +2210,7 @@ impl Optimizer {
                 // graph (fields, descrs, nested ops), dumping tens of MB per
                 // box and stalling the run.
                 let arg_oprefs: Vec<OpRef> =
-                    entry.op.getarglist().iter().map(|a| a.to_opref()).collect();
+                    entry.op.args_slice().iter().map(|a| a.to_opref()).collect();
                 eprintln!(
                     "[jit] exported_short_box: kind={:?} pos={:?} opcode={:?} args={:?} descr_idx={:?} invented={} same_as_source={:?}",
                     entry.kind,
@@ -3033,7 +3033,7 @@ impl Optimizer {
             // been Int/Ref/Float per producer-side typing.
             let mut types = vec![majit_ir::Type::Ref; num_inputs];
             for op in ops.iter() {
-                for arg in op.getarglist().iter() {
+                for arg in op.args_slice().iter() {
                     // Const args (inline-value or legacy idx) never reference an
                     // inputarg slot; only InputArg*/IntOp/FloatOp/RefOp do.
                     if arg.is_constant() {
@@ -3135,7 +3135,7 @@ impl Optimizer {
         // those before `ensure_inputarg_bindings` mints a second host per
         // slot (`or_insert` / same-type keep).
         for op in ops {
-            for arg in op.getarglist() {
+            for arg in op.args_slice() {
                 if let Some(ia) = arg.bound_inputarg() {
                     ctx.inputarg_refs.entry(ia.index).or_insert(ia);
                 }
@@ -3537,7 +3537,7 @@ impl Optimizer {
             let inputargs = self.trace_inputargs.clone();
             // Phase 1: resolve and call force_at_the_end_of_preamble on all args
             let resolved_args: Vec<OpRef> = terminal_op
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|arg| arg.get_box_replacement(false).to_opref())
                 .collect();
@@ -3743,7 +3743,7 @@ impl Optimizer {
                     .clone()
                     .map(|v| v.iter().map(|b| b.to_opref()).collect())
                     .unwrap_or_else(|| {
-                        jump.getarglist()
+                        jump.args_slice()
                             .iter()
                             .map(|a| a.get_box_replacement(false).to_opref())
                             .collect()
@@ -3899,7 +3899,7 @@ impl Optimizer {
                 }
                 self.publish_preview_short_state(&mut ctx, &resolved_args)?;
                 let jump_arglist_oprefs: Vec<OpRef> =
-                    jump.getarglist().iter().map(|a| a.to_opref()).collect();
+                    jump.args_slice().iter().map(|a| a.to_opref()).collect();
                 let exported_int_bounds =
                     self.collect_exported_int_bounds(&jump_arglist_oprefs, &mut ctx);
                 // RPython unroll.py:186-193 + compile.py: `info.renamed_inputargs`
@@ -4620,7 +4620,7 @@ impl Optimizer {
             ));
         };
         let jump_args: Vec<OpRef> = terminal_jump
-            .getarglist()
+            .args_slice()
             .iter()
             .map(|a| a.to_opref())
             .collect();
@@ -7394,7 +7394,7 @@ mod tests {
         assert_eq!(terminal.opcode, OpCode::Jump);
         assert_eq!(
             terminal
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),

@@ -1493,7 +1493,7 @@ fn prepare_bridge_trace_from_owned(
     };
     for op in bridge_ops.iter() {
         consider(op.pos().get());
-        for a in op.getarglist().iter() {
+        for a in op.args_slice().iter() {
             consider(a.to_opref());
         }
         op.visit_failarg_oprefs(&mut consider);
@@ -1927,7 +1927,7 @@ fn densify_root_loop_inputargs(
         .into_iter()
         .map(|op| {
             let args: majit_ir::resoperation::OpArgVec =
-                op.getarglist().iter().map(&remap).collect();
+                op.args_slice().iter().map(&remap).collect();
             let cloned = OpRc::new(op.copy_and_change(op.opcode, Some(&args), None));
             if let Some(failargs) = op.guard_fail_args() {
                 cloned.setfailargs(failargs.iter().map(&remap).collect());
@@ -2156,7 +2156,7 @@ fn compute_next_global_opref<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
         .map(|op| {
             let op = op.as_ref();
             let mut hw = opref_high_water(op.pos().get());
-            for a in op.getarglist().iter() {
+            for a in op.args_slice().iter() {
                 hw = hw.max(opref_high_water(a.to_opref()));
             }
             if let Some(fa) = op.guard_fail_args() {
@@ -14207,7 +14207,7 @@ impl<M: Clone> MetaInterp<M> {
             }) {
                 return Some(
                     label
-                        .getarglist()
+                        .args_slice()
                         .iter()
                         .map(|arg| {
                             type_index
@@ -15876,7 +15876,7 @@ impl<M: Clone> MetaInterp<M> {
             .last()
             .map(std::borrow::Borrow::borrow)
             .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+            .map(|op| op.args_slice().iter().map(|a| a.to_opref()).collect())
             .unwrap_or_default();
         if jump_arg_oprefs.is_empty() {
             return jump_arg_oprefs;
@@ -26973,7 +26973,7 @@ mod tests {
         assert_eq!(prepared.ops[0].pos().get(), OpRef::ref_op(12));
         assert_eq!(
             prepared.ops[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -26982,7 +26982,7 @@ mod tests {
         assert_eq!(prepared.ops[1].pos().get(), OpRef::int_op(13));
         assert_eq!(
             prepared.ops[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -26990,7 +26990,7 @@ mod tests {
         );
         assert_eq!(
             prepared.ops[2]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -27113,7 +27113,7 @@ mod tests {
         );
         assert_eq!(
             prepared.ops[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),

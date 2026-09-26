@@ -718,7 +718,7 @@ impl TreeLoop {
                 }
             }
             // history.py: each arg must be Const or in seen
-            for arg in op.getarglist().iter() {
+            for arg in op.args_slice().iter() {
                 if arg.is_none() {
                     return false;
                 }
@@ -761,7 +761,7 @@ impl TreeLoop {
             // history.py:596-602: LABEL resets seen
             if op.opcode == OpCode::Label {
                 seen.clear();
-                for arg in op.getarglist().iter() {
+                for arg in op.args_slice().iter() {
                     if arg.is_none() || arg.is_constant() {
                         return false;
                     }
@@ -874,7 +874,7 @@ impl TreeLoop {
         // cut namespace owes them nothing. Only regular op args seed escaped
         // refs for prefix re-emission.
         for op in cut_ops {
-            for arg in op.getarglist().iter() {
+            for arg in op.args_slice().iter() {
                 if is_pre_cut_ref(&arg.to_opref()) && escaped_set.insert(arg.to_opref()) {
                     queue.push_back(arg.to_opref());
                 }
@@ -979,7 +979,7 @@ impl TreeLoop {
                         return None;
                     }
                     for other in self.ops[..start.op_index].iter() {
-                        if !other.getarglist().iter().any(|a| a.to_opref() == r) {
+                        if !other.args_slice().iter().any(|a| a.to_opref() == r) {
                             continue;
                         }
                         if other.opcode.is_guard() {
@@ -1004,7 +1004,7 @@ impl TreeLoop {
                         extra.push(other.pos().get());
                     }
                 }
-                for arg in op.getarglist().iter() {
+                for arg in op.args_slice().iter() {
                     let a = arg.to_opref();
                     if is_pre_cut_ref(&a) {
                         stack.push((a, false));
@@ -1069,7 +1069,7 @@ impl TreeLoop {
             }
             let op_idx = (esc_ref.raw() - num_original_inputargs) as usize;
             if let Some(op) = self.ops.get(op_idx) {
-                for arg in op.getarglist().iter() {
+                for arg in op.args_slice().iter() {
                     if is_pre_cut_ref(&arg.to_opref()) && escaped_set.insert(arg.to_opref()) {
                         queue.push_back(arg.to_opref());
                     }
@@ -5759,7 +5759,7 @@ mod history_record_tests {
         let op = take_single_call_op(ctx, &args);
         assert_eq!(op.opcode, OpCode::CallAssemblerR);
         assert_eq!(
-            op.getarglist()
+            op.args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -5794,7 +5794,7 @@ mod history_record_tests {
         let op = take_single_call_op(ctx, &[frame]);
         assert_eq!(op.opcode, OpCode::CallAssemblerR);
         assert_eq!(
-            op.getarglist()
+            op.args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),

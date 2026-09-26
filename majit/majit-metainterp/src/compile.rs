@@ -768,7 +768,7 @@ fn exit_types_for_guard_or_finish<A: AsRef<InputArg>>(
     }
     let finish_arg_type = |b: &Operand| -> Type { b.to_opref().ty().unwrap_or(Type::Int) };
     if is_finish {
-        out.extend(op.getarglist().iter().map(finish_arg_type));
+        out.extend(op.args_slice().iter().map(finish_arg_type));
         return out;
     }
     if let Some(fail_args) = op.guard_fail_args() {
@@ -1761,7 +1761,7 @@ pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>, A: AsRef<InputA
     let fail_index = find_fail_index_for_exit_op(ops, op_index).unwrap_or(u32::MAX);
     let type_index = majit_ir::OpTypeIndex::new(inputargs, ops);
     let exit_types: ExitTypes = op
-        .getarglist()
+        .args_slice()
         .iter()
         .map(|opref| {
             // `OpRef::NONE` represents a null-ref placeholder per
@@ -2205,7 +2205,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     };
     for op in ops.iter() {
         consider(op.pos().get());
-        for b in op.getarglist().iter() {
+        for b in op.args_slice().iter() {
             consider(b.to_opref());
         }
         op.visit_failarg_oprefs(&mut consider);
@@ -2879,7 +2879,7 @@ mod tests {
         let jump_args = |ops: &[OpRc]| -> Vec<OpRef> {
             ops.iter()
                 .rfind(|op| op.opcode == OpCode::Jump)
-                .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+                .map(|op| op.args_slice().iter().map(|a| a.to_opref()).collect())
                 .unwrap()
         };
 
@@ -3258,7 +3258,7 @@ mod tests {
         assert_eq!(ops[1].opcode, OpCode::SameAsR);
         assert_eq!(
             ops[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -3270,7 +3270,7 @@ mod tests {
         assert_eq!(ops[2].opcode, OpCode::Label);
         assert_eq!(
             ops[2]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -3280,7 +3280,7 @@ mod tests {
         assert_eq!(ops[3].opcode, OpCode::GetfieldGcI);
         assert_eq!(
             ops[3]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -3337,7 +3337,7 @@ mod tests {
         assert_eq!(ops[1].opcode, OpCode::GetfieldGcI);
         assert_eq!(
             ops[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -3350,7 +3350,7 @@ mod tests {
         assert_eq!(ops[4].opcode, OpCode::Label);
         assert_eq!(
             ops[4]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -3417,7 +3417,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             label
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -3492,7 +3492,7 @@ mod tests {
         assert_eq!(ops[4].opcode, OpCode::Label);
         assert_eq!(
             ops[4]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),

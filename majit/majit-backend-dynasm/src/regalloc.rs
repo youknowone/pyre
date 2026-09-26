@@ -2174,7 +2174,7 @@ impl<'a> RegAlloc<'a> {
     /// real Box's intrinsic type and falls back to `Type::Int` only for a
     /// `TempVar` (the `_check_type` exemption, regalloc.py).
     pub fn possibly_free_vars_for_op(&mut self, op: &Op) {
-        for arg in op.getarglist().iter() {
+        for arg in op.args_slice().iter() {
             if !arg.is_constant() && !arg.is_none() {
                 let arg = arg.to_opref();
                 let tp = self.tp(arg);
@@ -2672,7 +2672,7 @@ impl<'a> RegAlloc<'a> {
 
     /// Free args and result of an op (x86/regalloc.py:308).
     fn _free_op_vars(&mut self, op: &Op) {
-        for arg in op.getarglist().iter() {
+        for arg in op.args_slice().iter() {
             if !arg.is_constant() && !arg.is_none() {
                 let arg = arg.to_opref();
                 let tp = self.tp(arg);
@@ -3681,7 +3681,7 @@ impl<'a> RegAlloc<'a> {
                 let args: Vec<OpRef> =
                     op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
                 let mut arglocs = Vec::new();
-                for (idx, arg) in op.getarglist().iter().enumerate() {
+                for (idx, arg) in op.args_slice().iter().enumerate() {
                     let arg = arg.to_opref();
                     let tp = if idx == 0 { Type::Ref } else { Type::Int };
                     arglocs.push(self.make_sure_var_in_reg(arg, tp, &args, None, false));
@@ -4000,7 +4000,7 @@ impl<'a> RegAlloc<'a> {
                 return false;
             }
         } else if next_op
-            .getarglist()
+            .args_slice()
             .iter()
             .skip(1)
             .any(|a| a.to_opref() == result)
@@ -5352,7 +5352,7 @@ impl<'a> RegAlloc<'a> {
         arglocs.push(Loc::immed(calldescr.result_size() as i64));
         arglocs.push(Loc::immed(if calldescr.is_result_signed() { 1 } else { 0 }));
         let mut force_store_refs = Vec::new();
-        for (arg_index, arg) in op.getarglist().iter().enumerate() {
+        for (arg_index, arg) in op.args_slice().iter().enumerate() {
             let arg = arg.to_opref();
             let tp = if arg_index >= first_arg_index {
                 calldescr.arg_types()[arg_index - first_arg_index]
@@ -5555,7 +5555,7 @@ impl<'a> RegAlloc<'a> {
         }
 
         let mut arglocs = Vec::with_capacity(op.num_args());
-        for arg in op.getarglist().iter() {
+        for arg in op.args_slice().iter() {
             let arg = arg.to_opref();
             arglocs.push(self.loc(arg, self.tp(arg)));
         }
@@ -5714,7 +5714,7 @@ impl<'a> RegAlloc<'a> {
         );
 
         let mut arglocs = Vec::new();
-        for arg in op.getarglist().iter() {
+        for arg in op.args_slice().iter() {
             let arg = arg.to_opref();
             let tp = self.tp(arg);
             arglocs.push(self.loc(arg, tp));
@@ -6161,7 +6161,7 @@ impl<'a> RegAlloc<'a> {
         });
         self.jump_target_descr = descr_id;
         let mut locs = Vec::new();
-        for arg in op.getarglist().iter() {
+        for arg in op.args_slice().iter() {
             let arg = arg.to_opref();
             let tp = self.tp(arg);
             locs.push(self.loc_must_exist(arg, tp));
@@ -6191,7 +6191,7 @@ impl<'a> RegAlloc<'a> {
     #[allow(dead_code)] // x86/regalloc.py consider_label
     fn consider_label(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let position = self.rm.position;
-        for arg in op.getarglist().iter() {
+        for arg in op.args_slice().iter() {
             let arg = arg.to_opref();
             let tp = self.tp(arg);
             if self
@@ -6204,7 +6204,7 @@ impl<'a> RegAlloc<'a> {
         }
 
         let mut locs = Vec::new();
-        for arg in op.getarglist().iter() {
+        for arg in op.args_slice().iter() {
             let arg = arg.to_opref();
             let tp = self.tp(arg);
             let loc = self.loc(arg, tp);
@@ -6349,7 +6349,7 @@ impl<'a> RegAlloc<'a> {
     /// materializing a framed base.
     #[allow(dead_code)] // x86/regalloc.py consider_load_effective_address
     fn consider_load_effective_address(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+        let args: Vec<OpRef> = op.args_slice().iter().map(|a| a.to_opref()).collect();
         self.consider_load_effective_address_j2(op.pos().get(), &args, i, output);
     }
 
@@ -6544,7 +6544,7 @@ impl<'a> RegAlloc<'a> {
     #[allow(dead_code)] // x86/regalloc.py consider_discard_nargs
     fn consider_discard_nargs(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let mut locs = Vec::new();
-        for arg in op.getarglist().iter() {
+        for arg in op.args_slice().iter() {
             let arg = arg.to_opref();
             let tp = self.tp(arg);
             locs.push(self.loc(arg, tp));

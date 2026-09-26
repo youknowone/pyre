@@ -2427,7 +2427,7 @@ impl OptContext {
         // (`inputarg_from_tp` / `history.inputargs`) so the mint below
         // does not create a second object for the same index.
         for op in &self.input_ops {
-            for arg in op.getarglist() {
+            for arg in op.args_slice() {
                 if let Some(ia) = arg.bound_inputarg() {
                     self.inputarg_refs.entry(ia.index).or_insert(ia);
                 }
@@ -2887,7 +2887,7 @@ impl OptContext {
             // keeps test fixtures that seed `inputarg_refs` separately
             // from per-call `bound_arg` mints.
             if self.inputarg_base != 0 {
-                for arg in op.getarglist() {
+                for arg in op.args_slice() {
                     if let Some(ia) = arg.bound_inputarg() {
                         self.inputarg_refs.insert(ia.index, ia);
                     }
@@ -4259,7 +4259,7 @@ impl OptContext {
             match produced_op.kind {
                 PreambleOpKind::Pure => {
                     let mut resolved_args = Vec::with_capacity(produced_op.preamble_op.num_args());
-                    for arg in produced_op.preamble_op.getarglist().iter() {
+                    for arg in produced_op.preamble_op.args_slice().iter() {
                         let Some(resolved) = resolve_arg(
                             arg.to_opref(),
                             self,
@@ -4702,7 +4702,7 @@ impl OptContext {
             is_input: bool,
         }
         let mut arg_entries: Vec<ArgEntry> = Vec::new();
-        for arg_operand in preamble_op.getarglist().iter() {
+        for arg_operand in preamble_op.args_slice().iter() {
             let arg = arg_operand.to_opref();
             // Branch 1: shortpreamble.py:384 `isinstance(arg, Const): continue`.
             if arg.is_constant() || arg.is_none() {
@@ -12210,7 +12210,7 @@ mod imported_short_preamble_fallback_tests {
         assert_eq!(
             sp.ops[0]
                 .op
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),

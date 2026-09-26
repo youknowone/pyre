@@ -1012,7 +1012,7 @@ impl UnrollOptimizer {
                 ops.iter()
                     .rfind(|op| op.opcode == OpCode::Jump)
                     .map(|op| {
-                        op.getarglist()
+                        op.args_slice()
                             .iter()
                             .map(|a| match a.get_value() {
                                 Some(value) if !matches!(value, Value::Void) => {
@@ -1638,12 +1638,12 @@ impl UnrollOptimizer {
         // trusting the stale copy.
         let body_jump_args: Vec<OpRef> = body_terminal_op
             .as_ref()
-            .map(|jump| jump.getarglist().iter().map(|a| a.to_opref()).collect())
+            .map(|jump| jump.args_slice().iter().map(|a| a.to_opref()).collect())
             .or_else(|| {
                 p2_ops
                     .iter()
                     .rfind(|op| op.opcode == OpCode::Jump)
-                    .map(|jump| jump.getarglist().iter().map(|a| a.to_opref()).collect())
+                    .map(|jump| jump.args_slice().iter().map(|a| a.to_opref()).collect())
             })
             .unwrap_or_default();
         let (imported_short_preamble_builder, rebuilt_imported_short_preamble) =
@@ -1773,7 +1773,7 @@ impl UnrollOptimizer {
                                 let _ = opt_p2.force_box(&resolved_box, &mut final_ctx);
                             }
                         };
-                        for a in op.getarglist().iter() {
+                        for a in op.args_slice().iter() {
                             consider_arg(a);
                         }
                         if let Some(fail_args) = op.guard_fail_args() {
@@ -1920,12 +1920,12 @@ impl UnrollOptimizer {
         let jump_was_redirected = {
             let body_jump_args: Vec<OpRef> = body_terminal_op
                 .as_ref()
-                .map(|jump| jump.getarglist().iter().map(|a| a.to_opref()).collect())
+                .map(|jump| jump.args_slice().iter().map(|a| a.to_opref()).collect())
                 .or_else(|| {
                     body_ops
                         .iter()
                         .rfind(|o| o.opcode == OpCode::Jump)
-                        .map(|j| j.getarglist().iter().map(|a| a.to_opref()).collect())
+                        .map(|j| j.args_slice().iter().map(|a| a.to_opref()).collect())
                 })
                 .unwrap_or_default();
             let mut current_label_args = label_args.clone();
@@ -2868,7 +2868,7 @@ impl ExportedState {
         };
         let visit_op = |op: &Op, visit: &mut dyn FnMut(OpRef)| {
             visit(op.pos().get());
-            for arg in op.getarglist().iter() {
+            for arg in op.args_slice().iter() {
                 visit(arg.to_opref());
             }
             if let Some(fail_args) = op.guard_fail_args() {
@@ -3957,7 +3957,7 @@ impl OptUnroll {
                 for mut guard_op in emitted {
                     if crate::log_jtet_enabled() {
                         let arg_values: Vec<_> = guard_op
-                            .getarglist()
+                            .args_slice()
                             .iter()
                             .map(|arg| {
                                 let arg = arg.to_opref();
@@ -5650,7 +5650,7 @@ fn assemble_peeled_trace_with_jump_args(
         if is_trace_runtime_ref(op.pos().get(), constants) {
             max_pos = max_pos.max(op.pos().get().raw().saturating_add(1));
         }
-        for arg in op.getarglist().iter() {
+        for arg in op.args_slice().iter() {
             if is_trace_runtime_ref(arg.to_opref(), constants) {
                 max_pos = max_pos.max(arg.to_opref().raw().saturating_add(1));
             }
@@ -5781,7 +5781,7 @@ fn assemble_peeled_trace_with_jump_args(
                 appended_label_args.push(arg);
                 label_set.insert(arg);
             };
-            for a in op.getarglist().iter() {
+            for a in op.args_slice().iter() {
                 consider_arg(a.to_opref());
             }
             op.visit_failarg_oprefs(&mut consider_arg);
@@ -5944,7 +5944,7 @@ fn assemble_peeled_trace_with_jump_args(
         // arm extends this vec; a Vec per p2 op was a 32 B malloc on
         // every getfield/setfield (regex and/or 0.15 class).
         let mut original_args: Vec<OpRef> = if op.opcode == OpCode::Label {
-            op.getarglist().iter().map(|a| a.to_opref()).collect()
+            op.args_slice().iter().map(|a| a.to_opref()).collect()
         } else {
             Vec::new()
         };
@@ -6039,7 +6039,7 @@ fn assemble_peeled_trace_with_jump_args(
                         extra_inner_sources.push(arg);
                     }
                 };
-                for a in later_op.getarglist().iter() {
+                for a in later_op.args_slice().iter() {
                     consider_arg(a.to_opref());
                 }
                 later_op.visit_failarg_oprefs(&mut consider_arg);
@@ -6095,7 +6095,7 @@ fn assemble_peeled_trace_with_jump_args(
             // the trace inputarg slots OpRef(0)..OpRef(start_label_args.len());
             // remap those positional refs to start_label_args[i].
             let mapped_base_args: Vec<OpRef> = new_op
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|arg| {
                     let arg = arg.to_opref();
@@ -6124,7 +6124,7 @@ fn assemble_peeled_trace_with_jump_args(
                 .and_then(|label_idx| {
                     result
                         .get(label_idx)
-                        .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+                        .map(|op| op.args_slice().iter().map(|a| a.to_opref()).collect())
                 })
                 .unwrap_or_else(|| full_label_args.clone());
             let jump_target_descr_idx = new_op.getdescr().map(|descr| descr.index());
@@ -6225,7 +6225,7 @@ fn assemble_peeled_trace_with_jump_args(
         if let Some(label_idx) = current_inner_label_index {
             let mut extra_live_args = Vec::new();
             let label_args: smallvec::SmallVec<[OpRef; 3]> = result[label_idx]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect();
@@ -6245,13 +6245,13 @@ fn assemble_peeled_trace_with_jump_args(
                 }
                 extra_live_args.push(arg);
             };
-            for a in new_op.getarglist().iter() {
+            for a in new_op.args_slice().iter() {
                 consider_arg(a.to_opref());
             }
             new_op.visit_failarg_oprefs(&mut consider_arg);
             if !extra_live_args.is_empty() {
                 let existing: crate::FxIndexSet<OpRef> = result[label_idx]
-                    .getarglist()
+                    .args_slice()
                     .iter()
                     .map(|a| a.to_opref())
                     .collect();
@@ -6302,7 +6302,7 @@ fn assemble_peeled_trace_with_jump_args(
                 (
                     idx,
                     op.pos().get(),
-                    op.getarglist()
+                    op.args_slice()
                         .iter()
                         .map(|a| a.to_opref())
                         .collect::<Vec<_>>(),
@@ -6317,7 +6317,7 @@ fn assemble_peeled_trace_with_jump_args(
                 (
                     idx,
                     op.pos().get(),
-                    op.getarglist()
+                    op.args_slice()
                         .iter()
                         .map(|a| a.to_opref())
                         .collect::<Vec<_>>(),
@@ -6868,7 +6868,7 @@ mod tests {
         assert_eq!(result[1].opcode, OpCode::Jump);
         assert_eq!(
             result[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -6918,7 +6918,7 @@ mod tests {
         assert_eq!(result[1].opcode, OpCode::Jump);
         assert_eq!(
             result[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -7396,7 +7396,7 @@ mod tests {
         let jump_args = ops.last().unwrap().getarglist_copy();
         assert_eq!(
             label
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -8872,7 +8872,7 @@ mod tests {
         assert_eq!(combined[1].opcode, OpCode::SameAsI);
         assert_eq!(
             combined[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -8951,7 +8951,7 @@ mod tests {
         assert_eq!(combined[1].pos().get(), OpRef::int_op(50));
         assert_eq!(
             combined[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9082,7 +9082,7 @@ mod tests {
             .expect("assembled peel has a body LABEL");
         assert_eq!(
             label
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9149,7 +9149,7 @@ mod tests {
         assert_eq!(combined[1].opcode, OpCode::Label);
         assert_eq!(
             combined[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9295,7 +9295,7 @@ mod tests {
         assert_eq!(combined[2].opcode, OpCode::Label);
         assert_eq!(
             combined[2]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9304,7 +9304,7 @@ mod tests {
         assert_eq!(combined[4].opcode, OpCode::Jump);
         assert_eq!(
             combined[4]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9375,7 +9375,7 @@ mod tests {
         assert_eq!(combined[1].opcode, OpCode::Label);
         assert_eq!(
             combined[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9389,7 +9389,7 @@ mod tests {
         assert_eq!(combined[2].opcode, OpCode::GuardValue);
         assert_eq!(
             combined[2]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9398,7 +9398,7 @@ mod tests {
         assert_eq!(combined[3].opcode, OpCode::Jump);
         assert_eq!(
             combined[3]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9464,7 +9464,7 @@ mod tests {
         let extra_label_arg = label.arg(1);
         assert_eq!(
             label
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9474,7 +9474,7 @@ mod tests {
         assert_eq!(body_getfield.opcode, OpCode::GetfieldGcI);
         assert_eq!(
             body_getfield
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9527,7 +9527,7 @@ mod tests {
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(
             combined[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9536,7 +9536,7 @@ mod tests {
         assert_eq!(combined[1].opcode, OpCode::GuardTrue);
         assert_eq!(
             combined[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9602,7 +9602,7 @@ mod tests {
         // The caller is responsible for constructing the preamble-shaped Jump.
         assert_eq!(
             combined[2]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9662,7 +9662,7 @@ mod tests {
         let jump = combined.last().expect("assembled jump");
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(
-            jump.getarglist()
+            jump.args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9725,7 +9725,7 @@ mod tests {
             .expect("body label");
         assert_eq!(
             body_label
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9735,7 +9735,7 @@ mod tests {
         let jump = combined.last().expect("assembled jump");
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(
-            jump.getarglist()
+            jump.args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9822,7 +9822,7 @@ mod tests {
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(
             combined[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9923,7 +9923,7 @@ mod tests {
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(
             combined[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9934,7 +9934,7 @@ mod tests {
         assert_eq!(combined[2].opcode, OpCode::Jump);
         assert_eq!(
             combined[2]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9994,7 +9994,7 @@ mod tests {
             .iter()
             .find(|op| op.opcode == OpCode::Label)
             .expect("assembled loop LABEL");
-        let label_args: Vec<OpRef> = label.getarglist().iter().map(|a| a.to_opref()).collect();
+        let label_args: Vec<OpRef> = label.args_slice().iter().map(|a| a.to_opref()).collect();
         assert!(
             !label_args
                 .iter()
@@ -10005,7 +10005,7 @@ mod tests {
             .iter()
             .find(|op| op.opcode == OpCode::Jump)
             .expect("assembled JUMP");
-        let jump_args: Vec<OpRef> = jump.getarglist().iter().map(|a| a.to_opref()).collect();
+        let jump_args: Vec<OpRef> = jump.args_slice().iter().map(|a| a.to_opref()).collect();
         assert_eq!(jump_args, start.to_vec());
     }
 
@@ -10135,7 +10135,7 @@ mod tests {
         let jump = combined.last().expect("assembled jump");
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(
-            jump.getarglist()
+            jump.args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -10184,7 +10184,7 @@ mod tests {
         assert_eq!(spliced[2].opcode, OpCode::Jump);
         assert_eq!(
             spliced[2]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),

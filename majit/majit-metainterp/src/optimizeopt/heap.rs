@@ -1875,7 +1875,7 @@ impl OptHeap {
     fn call_argument_owner_closure(&self, op: &Op, ctx: &OptContext) -> Vec<OpRef> {
         let mut owners = Vec::new();
         let mut stack: Vec<OpRef> = op
-            .getarglist()
+            .args_slice()
             .iter()
             .map(|arg| arg.get_box_replacement(false).to_opref())
             .collect();
@@ -1906,7 +1906,7 @@ impl OptHeap {
         ctx: &mut OptContext,
     ) {
         let needs_postponed = self.postponed_op.as_ref().is_some_and(|postponed| {
-            op.getarglist()
+            op.args_slice()
                 .iter()
                 .any(|arg| arg.to_opref() == postponed.pos().get())
         });
@@ -2426,7 +2426,7 @@ impl OptHeap {
                 }
                 if let Some(ref postponed) = self.postponed_op {
                     let ppos = postponed.pos().get();
-                    if lazy_op.getarglist().iter().any(|a| a.to_opref() == ppos)
+                    if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
                         ctx.emit_extra(ctx.current_pass_idx, p);
@@ -2707,7 +2707,7 @@ impl OptHeap {
                 // heap.py emit postponed_op if referenced.
                 if let Some(ref postponed) = self.postponed_op {
                     let ppos = postponed.pos().get();
-                    if lazy_op.getarglist().iter().any(|a| a.to_opref() == ppos)
+                    if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
                         ctx.emit_extra(ctx.current_pass_idx, p);
@@ -2865,7 +2865,7 @@ impl OptHeap {
                 // heap.py emit postponed_op if referenced.
                 if let Some(ref postponed) = self.postponed_op {
                     let ppos = postponed.pos().get();
-                    if lazy_op.getarglist().iter().any(|a| a.to_opref() == ppos)
+                    if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
                         ctx.emit_extra(ctx.current_pass_idx, p);
@@ -3034,7 +3034,7 @@ impl OptHeap {
                     }
                     if let Some(ref postponed) = self.postponed_op {
                         let ppos = postponed.pos().get();
-                        if lazy_op.getarglist().iter().any(|a| a.to_opref() == ppos)
+                        if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                             && let Some(p) = self.postponed_op.take()
                         {
                             ctx.emit_extra(ctx.current_pass_idx, p);

@@ -258,7 +258,7 @@ impl CollectedShortPreambleBuilder {
             .into_iter()
             .map(|op| {
                 let mut arg_mapping = Vec::new();
-                for (arg_pos, arg_ref) in op.getarglist().iter().enumerate() {
+                for (arg_pos, arg_ref) in op.args_slice().iter().enumerate() {
                     if let Some(label_idx) =
                         label_args.iter().position(|a| *a == arg_ref.to_opref())
                     {
@@ -399,7 +399,7 @@ impl PreambleOp {
                 // `lookup2` applies `get_box_replacement` at lookup time.
                 let args = self
                     .op
-                    .getarglist()
+                    .args_slice()
                     .iter()
                     .map(|arg| sb.produce_arg(ctx, arg.to_opref()))
                     .collect::<Option<smallvec::SmallVec<[majit_ir::operand::Operand; 3]>>>()?;
@@ -423,7 +423,7 @@ impl PreambleOp {
                 //   return ProducedShortOp(self, op.copy_and_change(opnum, args=arglist))
                 let args = self
                     .op
-                    .getarglist()
+                    .args_slice()
                     .iter()
                     .map(|arg| sb.produce_arg(ctx, arg.to_opref()))
                     .collect::<Option<smallvec::SmallVec<[majit_ir::operand::Operand; 3]>>>()?;
@@ -977,7 +977,7 @@ impl ShortBoxes {
             };
             // shortpreamble.py:277-278: copy_and_change(opnum, [preamble_arg] + args[1:])
             let mut new_args = vec![preamble_arg];
-            new_args.extend_from_slice(&getfield_op.getarglist()[1..]);
+            new_args.extend_from_slice(&getfield_op.args_slice()[1..]);
             // A heap op reaches here with its descr, so this is the same
             // never-taken arm `produce_heap_field` and `produce_heap_array_item`
             // spell as `getdescr()?`; drop the short box rather than abort the
@@ -1253,7 +1253,7 @@ impl CollectedExtendedShortPreambleBuilder {
             .into_iter()
             .map(|preamble_op| {
                 let mut arg_mapping = Vec::new();
-                for (arg_pos, arg_ref) in preamble_op.op.getarglist().iter().enumerate() {
+                for (arg_pos, arg_ref) in preamble_op.op.args_slice().iter().enumerate() {
                     if let Some(label_idx) =
                         label_args.iter().position(|a| *a == arg_ref.to_opref())
                     {
@@ -1611,7 +1611,7 @@ impl ProducedShortOp {
         // not be the cache key, or the peeled body no longer matches.
         let args = self
             .source_op
-            .getarglist()
+            .args_slice()
             .iter()
             .map(|arg| {
                 classify_short_arg(
@@ -2170,7 +2170,7 @@ impl AbstractShortPreambleBuilderState {
             return (**preamble_op).clone();
         }
         // shortpreamble.py:383-396: iterate preamble_op args
-        for arg in preamble_op.getarglist().iter() {
+        for arg in preamble_op.args_slice().iter() {
             let arg_opref = arg.to_opref();
             if self.short_results.contains(&arg_opref)
                 || already_in_short.contains(&arg_opref)
@@ -2233,7 +2233,7 @@ fn build_short_preamble_struct_from_ops(
         .map(|op| (**op).clone())
         .map(|op| {
             let arg_mapping = op
-                .getarglist()
+                .args_slice()
                 .iter()
                 .enumerate()
                 .filter_map(|(arg_pos, arg_ref)| {
@@ -2372,7 +2372,7 @@ impl ShortPreambleBuilder {
         if !visiting.insert(result.clone()) {
             return None;
         }
-        for arg in produced.preamble_op.getarglist().iter() {
+        for arg in produced.preamble_op.args_slice().iter() {
             // shortpreamble.py:288 isinstance(arg, Const) → skip.
             // `produce_arg` stored the producer's replay op, and the map
             // is keyed by `short_op.res`, so this lookup hits only when
@@ -2752,7 +2752,7 @@ impl ExtendedShortPreambleBuilder {
         }
         for entry in &short_preamble.ops {
             for &(arg_pos, label_idx) in &entry.arg_mapping {
-                if let Some(phase1_ref) = entry.op.getarglist().get(arg_pos) {
+                if let Some(phase1_ref) = entry.op.args_slice().get(arg_pos) {
                     let phase1_ref = phase1_ref.to_opref();
                     if let Some(&current_inputarg) = label_args.get(label_idx)
                         && phase1_ref != current_inputarg
@@ -2822,7 +2822,7 @@ impl ExtendedShortPreambleBuilder {
             // whole inline, which is what this loop used to do unconditionally,
             // so `jump_to_existing_trace` falls back to `jump_to_preamble`
             // (unroll.py:154/167).
-            let resolvable = op.getarglist().iter().all(|arg| {
+            let resolvable = op.args_slice().iter().all(|arg| {
                 self.insert_dep_recursive(arg.to_opref(), &inputargs_set, &constants_set)
             });
             if !resolvable {
@@ -3066,7 +3066,7 @@ impl ExtendedShortPreambleBuilder {
         if !visiting.insert(result) {
             return None;
         }
-        for arg in produced.preamble_op.getarglist().iter() {
+        for arg in produced.preamble_op.args_slice().iter() {
             let arg = arg.to_opref();
             // shortpreamble.py:288 isinstance(arg, Const) → skip
             if arg.is_constant() {
@@ -3264,7 +3264,7 @@ impl ExtendedShortPreambleBuilder {
             // hits its entry directly — RPython single Box-identity lookup. The
             // former `preamble_op.pos → key` reverse index can never fire
             // (key == pos by construction) and was removed.
-            for arg in preamble_op.getarglist().iter() {
+            for arg in preamble_op.args_slice().iter() {
                 let arg = arg.to_opref();
                 if self.short_results.contains(&arg)
                     || self.short_inputargs.contains(&arg)
@@ -3430,7 +3430,7 @@ pub(crate) fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
             let ovf_op = &peeled_ops[idx - 1];
             if ovf_op.opcode.is_ovf() && included_positions.insert(ovf_op.pos().get()) {
                 let ovf_arg_mapping: Vec<(usize, usize)> = ovf_op
-                    .getarglist()
+                    .args_slice()
                     .iter()
                     .enumerate()
                     .filter_map(|(pos, arg)| label_arg_idx(&arg.to_opref()).map(|idx| (pos, idx)))
@@ -3468,7 +3468,7 @@ pub(crate) fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
         }
 
         let arg_mapping: Vec<(usize, usize)> = op
-            .getarglist()
+            .args_slice()
             .iter()
             .enumerate()
             .filter_map(|(pos, arg)| label_arg_idx(&arg.to_opref()).map(|idx| (pos, idx)))
@@ -3661,7 +3661,7 @@ mod tests {
             .expect("reachable IntAdd must be exported");
         assert_eq!(
             pure.preamble_op
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|arg| arg.to_opref())
                 .collect::<Vec<_>>(),
@@ -4142,7 +4142,7 @@ mod tests {
         assert_eq!(
             pure.1
                 .preamble_op
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -4608,7 +4608,7 @@ mod tests {
         assert_ne!(used.pos().get(), OpRef::int_op(10));
         assert_eq!(
             short[3]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -4660,7 +4660,7 @@ mod tests {
         assert_eq!(extra[0].pos().get(), alias_result);
         assert_eq!(
             extra[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -4696,7 +4696,7 @@ mod tests {
         assert_eq!(extra[0].pos().get(), OpRef::int_op(41));
         assert_eq!(
             extra[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -4732,7 +4732,7 @@ mod tests {
         assert_eq!(extra[0].pos().get(), OpRef::int_op(41));
         assert_eq!(
             extra[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),

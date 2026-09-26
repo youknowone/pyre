@@ -738,7 +738,7 @@ impl OptPure {
             }
             // _same_args(known_op, op, 1, start_index):
             // entry.args is already known_op.args[1..], so compare from 0.
-            let op_args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+            let op_args: Vec<OpRef> = op.args_slice().iter().map(|a| a.to_opref()).collect();
             if Self::_same_args(&entry.args, &op_args, 0, start_index, ctx) {
                 return Some(entry.result);
             }
@@ -905,7 +905,7 @@ impl OptPure {
             0
         };
         // pure.py: self._same_args(old_op, op, old_start_index, start_index)
-        let op_args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+        let op_args: Vec<OpRef> = op.args_slice().iter().map(|a| a.to_opref()).collect();
         Self::_same_args(old_op_args, &op_args, old_start_index, start_index, ctx)
     }
 }
@@ -1105,7 +1105,7 @@ impl Optimization for OptPure {
             if op.num_args() >= 2 {
                 self.known_result_call_pure.push(KnownResultEntry {
                     descr_identity: op.getdescr().as_ref().map(majit_ir::descr::descr_identity),
-                    args: op.getarglist()[1..].iter().map(|a| a.to_opref()).collect(),
+                    args: op.args_slice()[1..].iter().map(|a| a.to_opref()).collect(),
                     result: op.arg(0).to_opref(),
                 });
             }
@@ -1205,7 +1205,7 @@ impl Optimization for OptPure {
                         .as_ref()
                         .map(majit_ir::descr::descr_identity);
                     let old_op_args: Vec<OpRef> =
-                        old_op.getarglist().iter().map(|a| a.to_opref()).collect();
+                        old_op.args_slice().iter().map(|a| a.to_opref()).collect();
                     if Self::optimize_call_pure_old(
                         op,
                         old_op.opcode,
@@ -1921,7 +1921,7 @@ mod tests {
         // Demotion preserves the operand identities — the two header inputs.
         assert_eq!(
             result[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),

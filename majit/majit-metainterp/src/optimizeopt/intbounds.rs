@@ -1536,7 +1536,7 @@ impl OptIntBounds {
     /// Mirrors RPython's self.last_emitted_operation = op in Optimization.emit().
     fn record_emitted(&mut self, op: &Op, op_rc: &OpRc) {
         self.last_emitted_opcode = Some(op.opcode);
-        let args = op.getarglist();
+        let args = op.args_slice();
         self.last_emitted_arg0 = args.first().cloned().unwrap_or(Operand::None);
         self.last_emitted_arg1 = args.get(1).cloned().unwrap_or(Operand::None);
         self.last_emitted_n_args = args.len().min(2) as u8;
