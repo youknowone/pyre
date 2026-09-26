@@ -15819,32 +15819,6 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// Resolve a Charon `CallKind` to a flattened path segment list the
-    /// codewriter consumes as `CallTarget::FunctionPath`, plus an
-    /// optional `(owner_root_leaf, method_leaf)` pair for impl methods,
-    /// plus the `[Owner, leaf]` registration spelling when the callee is
-    /// an inherent-impl *associated function* (no receiver).
-    ///
-    /// The method hint is `Some` when the FunDecl's raw name segments
-    /// encode an `Impl` block immediately before the leaf `Ident` —
-    /// the standard Charon shape for inherent / trait-impl methods
-    /// (e.g. `pyre_interpreter::pyframe::<Impl>::locals_w_mut`).  The
-    /// caller uses the hint to pick `CallTarget::Method` over
-    /// `CallTarget::FunctionPath` so the annotator can prepend a
-    /// classdef-bound `SomeInstance` for `self`; see the comment at
-    /// the use site in [`Self::lower_call`].
-    ///
-    /// The associated-function spelling is computed only when the
-    /// method hint is `None` (a receiver-shaped callee never consumes
-    /// it), and only the `CallTarget::FunctionPath` construction in
-    /// `lower_call` applies it — the raw `name_path()` segments stay
-    /// untouched for the std special-case matchers (`checked_neg` /
-    /// `try_from` / `into` / `expect`) that key on the
-    /// `[.., "<Impl>", leaf]` shape.
-    #[expect(
-        clippy::type_complexity,
-        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
-    )]
     fn set_spec(&mut self, spec: &'a std::cell::RefCell<crate::front::clause_spec::SpecQueue>) {
         self.spec = Some(spec);
     }
@@ -15927,6 +15901,32 @@ impl<'a> Lowering<'a> {
         Some(spec_segments(self.llbc, fd, &leaf))
     }
 
+    /// Resolve a Charon `CallKind` to a flattened path segment list the
+    /// codewriter consumes as `CallTarget::FunctionPath`, plus an
+    /// optional `(owner_root_leaf, method_leaf)` pair for impl methods,
+    /// plus the `[Owner, leaf]` registration spelling when the callee is
+    /// an inherent-impl *associated function* (no receiver).
+    ///
+    /// The method hint is `Some` when the FunDecl's raw name segments
+    /// encode an `Impl` block immediately before the leaf `Ident` —
+    /// the standard Charon shape for inherent / trait-impl methods
+    /// (e.g. `pyre_interpreter::pyframe::<Impl>::locals_w_mut`).  The
+    /// caller uses the hint to pick `CallTarget::Method` over
+    /// `CallTarget::FunctionPath` so the annotator can prepend a
+    /// classdef-bound `SomeInstance` for `self`; see the comment at
+    /// the use site in [`Self::lower_call`].
+    ///
+    /// The associated-function spelling is computed only when the
+    /// method hint is `None` (a receiver-shaped callee never consumes
+    /// it), and only the `CallTarget::FunctionPath` construction in
+    /// `lower_call` applies it — the raw `name_path()` segments stay
+    /// untouched for the std special-case matchers (`checked_neg` /
+    /// `try_from` / `into` / `expect`) that key on the
+    /// `[.., "<Impl>", leaf]` shape.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     fn call_target_segments(
         &self,
         mir_bb: usize,
@@ -17724,27 +17724,6 @@ impl<'a> Lowering<'a> {
             .is_some_and(|leaf| matches!(leaf.as_str(), "String" | "Vec"))
     }
 
-    /// `<String as AsRef<str>>::as_ref(&self) -> &str`,
-    /// `String::as_str(&self) -> &str`, `Wtf8::as_str(&self) -> &str`, and
-    /// `<String as Borrow<str>>::borrow(&self) -> &str`, and pyre's
-    /// `as_str_unchecked(&Wtf8) -> &str` — every one
-    /// returns a `&str` view of the same string, an identity in the
-    /// lifted value model (Rust `String`/`&str`/`str`/`Wtf8`/`Wtf8Buf`
-    /// all lower to the immutable rpy_string).  `as_str_unchecked` names
-    /// the view `Wtf8::as_str` gives once its validity arm has been taken
-    /// separately: `as_str` itself returns `Result<&str, Utf8Error>`,
-    /// whose destination does not strip to `str`, so it fails the gate
-    /// below and stays a wall.  Without the intercept the
-    /// call keeps a `CallTarget::Method` `as_ref` getattr the rtyper
-    /// cannot route on the classdef-less string receiver (the `Cannot
-    /// find attribute "as_ref" on UnicodeString` wall).  Bind the
-    /// destination to the receiver instead, the same alias shape as the
-    /// container deref above.  Gated on the receiver being a string value
-    /// (`tyref_is_string_value`: `str`/`String`/`Wtf8`/`Wtf8Buf`), more
-    /// precise than the impl owner-leaf, plus the `str`-typed result so
-    /// `String`'s sibling `AsRef<[u8]>` / `AsRef<OsStr>` / `AsRef<Path>`
-    /// impls — whose `&[u8]`/etc. result is a *different* value-model
-    /// family — keep their ordinary lowering.
     /// A resolved `core::borrow::Borrow::borrow` whose impl is one of the
     /// core/alloc identity views and whose method has no extracted body.
     /// A `Clause` ref and a local impl with a body stay calls.
@@ -17795,6 +17774,27 @@ impl<'a> Lowering<'a> {
         crate::front::std_identity::is_identity_borrow_pair(self_ty, borrowed, self.llbc)
     }
 
+    /// `<String as AsRef<str>>::as_ref(&self) -> &str`,
+    /// `String::as_str(&self) -> &str`, `Wtf8::as_str(&self) -> &str`, and
+    /// `<String as Borrow<str>>::borrow(&self) -> &str`, and pyre's
+    /// `as_str_unchecked(&Wtf8) -> &str` — every one
+    /// returns a `&str` view of the same string, an identity in the
+    /// lifted value model (Rust `String`/`&str`/`str`/`Wtf8`/`Wtf8Buf`
+    /// all lower to the immutable rpy_string).  `as_str_unchecked` names
+    /// the view `Wtf8::as_str` gives once its validity arm has been taken
+    /// separately: `as_str` itself returns `Result<&str, Utf8Error>`,
+    /// whose destination does not strip to `str`, so it fails the gate
+    /// below and stays a wall.  Without the intercept the
+    /// call keeps a `CallTarget::Method` `as_ref` getattr the rtyper
+    /// cannot route on the classdef-less string receiver (the `Cannot
+    /// find attribute "as_ref" on UnicodeString` wall).  Bind the
+    /// destination to the receiver instead, the same alias shape as the
+    /// container deref above.  Gated on the receiver being a string value
+    /// (`tyref_is_string_value`: `str`/`String`/`Wtf8`/`Wtf8Buf`), more
+    /// precise than the impl owner-leaf, plus the `str`-typed result so
+    /// `String`'s sibling `AsRef<[u8]>` / `AsRef<OsStr>` / `AsRef<Path>`
+    /// impls — whose `&[u8]`/etc. result is a *different* value-model
+    /// family — keep their ordinary lowering.
     fn is_string_to_str_identity(
         &self,
         reg: &RegularCall,
@@ -25201,10 +25201,7 @@ fn regular_call_fun_decl_id(kind: &CallKind) -> Option<u64> {
     }
 }
 
-/// The `CallPath` `lib.rs` registers for this FunDecl: crate-stripped
-/// free-function path, or `for_impl_method(owner, leaf)` for an impl
-/// method (`register_trait_method` / inherent registration). A trait-impl
-/// id is local to one LLBC and is not part of this key.
+/// Call-path segments for a specialized leaf of this declaration.
 fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str) -> Vec<String> {
     if let Some((owner, _)) = impl_method_owner_for_fundecl(llbc, fd) {
         return crate::parse::CallPath::for_impl_method(&owner, leaf).segments;
@@ -25223,6 +25220,10 @@ fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str) -> Vec<String> {
     segments
 }
 
+/// The `CallPath` `lib.rs` registers for this FunDecl: crate-stripped
+/// free-function path, or `for_impl_method(owner, leaf)` for an impl
+/// method (`register_trait_method` / inherent registration). A trait-impl
+/// id is local to one LLBC and is not part of this key.
 fn registered_path_for_fun_decl(llbc: &Llbc, fd: &FunDecl) -> crate::parse::CallPath {
     if let Some((owner, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
         crate::parse::CallPath::for_impl_method(&owner, &leaf)
