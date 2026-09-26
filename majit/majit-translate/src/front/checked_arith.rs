@@ -123,7 +123,7 @@ pub(crate) fn is_ovf_width_int_atom_for(atom: &str, word_bytes: usize) -> bool {
 /// Charon leaves a literal operand (`n.checked_add(1)`) without a Place
 /// type (`Operand::Const` → no `second_arg_ty`), so demanding both
 /// operands would drop the constant-rhs form the integer fast paths
-/// spell (`RBuilder::grow_by_sizes` `needed.checked_add(63)`).  The
+/// spell (`rbuilder_runtime::ll_grow_by` `needed.checked_add(63)`).  The
 /// destination is `Option<Self>` and is always present; its payload atom
 /// *is* the overflow width `add_ovf` will test.  Either operand is only
 /// a fallback when that payload is unreadable.  A readable narrow

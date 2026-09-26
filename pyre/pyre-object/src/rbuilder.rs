@@ -283,35 +283,37 @@ pub mod rbuilder_runtime {
         })
     }
 
-    /// `rbuilder.py ll_grow_by` growth arithmetic — the three `ovfcheck`s that
-    /// add the requested growth to `total_size` and round it up to a multiple of
-    /// 64. Upstream any overflow is `raise MemoryError`; this returns `None` so
-    /// the caller fails cleanly instead of wrapping to a small allocation.
-    /// Returns `(needed, new_total)`.
-    fn grow_by_sizes(needed: i64, total_size: i64) -> Option<(i64, i64)> {
-        let needed = needed.checked_add(total_size)?;
-        let needed = needed.checked_add(63)? & !63;
-        let new_total = total_size.checked_add(needed)?;
-        Some((needed, new_total))
+    /// `except OverflowError: raise MemoryError` of `rbuilder.py ll_grow_by`.
+    /// MemoryError propagation out of the builder is not ported, so abort
+    /// loudly rather than wrap to a small allocation and corrupt the build.
+    #[cold]
+    fn ll_grow_by_memory_error() -> ! {
+        panic!("StringBuilder grow size overflow; MemoryError propagation is not ported yet")
     }
 
     /// `rbuilder.py ll_grow_by`: round the growth up to a multiple of 64,
     /// chain the filled `current_buf` into a fresh STRINGPIECE, install a new
-    /// empty `current_buf`. The growth `ovfcheck`s are ported via
-    /// [`grow_by_sizes`]; upstream raises `MemoryError` on overflow, which the
-    /// residual shim cannot, so it aborts loudly instead. (The JIT
-    /// graph-builder's `int_add_ovf` exception edge is a separate deferred half.)
+    /// empty `current_buf`. Each `ovfcheck` is a `checked_add` matched on
+    /// the spot, which the front lifts to `int_add_ovf` with an
+    /// OverflowError edge (`rarithmetic.py ovfcheck`).
     fn ll_grow_by(builder: i64, needed: i64, item_size: usize) {
         // SAFETY: `builder` is a live StringBuilderBox body pointer.
         let (old_buf, old_extra, total_size) = {
             let b = unsafe { &*(builder as *const StringBuilderBox) };
             (b.current_buf, b.extra_pieces, b.total_size)
         };
-        let (needed, new_total) = grow_by_sizes(needed, total_size).unwrap_or_else(|| {
-            // Upstream `except OverflowError: raise MemoryError`; abort loudly
-            // rather than wrap to a small allocation and corrupt the build.
-            panic!("StringBuilder grow size overflow; MemoryError propagation is not ported yet")
-        });
+        let needed = match needed.checked_add(total_size) {
+            Some(needed) => needed,
+            None => ll_grow_by_memory_error(),
+        };
+        let needed = match needed.checked_add(63) {
+            Some(needed) => needed & !63,
+            None => ll_grow_by_memory_error(),
+        };
+        let new_total = match total_size.checked_add(needed) {
+            Some(new_total) => new_total,
+            None => ll_grow_by_memory_error(),
+        };
         let needed = needed as usize;
         let base = str_base_size(item_size);
         let new_string = bh_alloc_lowlevel_string(needed, base, item_size);
@@ -799,16 +801,20 @@ pub mod rbuilder_runtime {
         }
 
         #[test]
-        fn grow_by_sizes_rounds_up_and_reports_overflow() {
+        fn ll_grow_by_rounds_up_to_a_multiple_of_64() {
             // (needed + total_size) rounded up to a multiple of 64, then
-            // new_total = total_size + that.
-            assert_eq!(grow_by_sizes(10, 4), Some((64, 68)));
-            assert_eq!(grow_by_sizes(0, 0), Some((0, 0)));
-            assert_eq!(grow_by_sizes(64, 0), Some((64, 64)));
-            // Each of the three `ovfcheck` points overflows near i64::MAX.
-            assert_eq!(grow_by_sizes(i64::MAX, 1), None); // needed + total_size
-            assert_eq!(grow_by_sizes(i64::MAX - 10, 0), None); // + 63
-            assert_eq!(grow_by_sizes(0, i64::MAX - 100), None); // total_size + needed
+            // total_size += that.
+            let builder = ll_new(4, STR_ITEM_SIZE);
+            ll_grow_by(builder, 10, STR_ITEM_SIZE);
+            let b = unsafe { &*(builder as *const StringBuilderBox) };
+            assert_eq!((b.current_pos, b.current_end, b.total_size), (0, 64, 68));
+        }
+
+        #[test]
+        #[should_panic(expected = "StringBuilder grow size overflow")]
+        fn ll_grow_by_overflow_is_memory_error() {
+            let builder = ll_new(4, STR_ITEM_SIZE);
+            ll_grow_by(builder, i64::MAX, STR_ITEM_SIZE);
         }
     }
 }
