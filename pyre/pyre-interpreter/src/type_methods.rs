@@ -2028,14 +2028,7 @@ pub fn __majit_wrap_str_descr_find(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     if !bound_is_none_or_exact_int(start) || !bound_is_none_or_exact_int(end) {
         return str_descr_find_slow(args);
     }
-    let n = unsafe {
-        pyre_object::unicodeobject::jit_str_find_objs(
-            args[0] as i64,
-            args[1] as i64,
-            start as i64,
-            end as i64,
-        )
-    };
+    let n = unsafe { pyre_object::unicodeobject::jit_str_find_objs(args[0], args[1], start, end) };
     Ok(w_int_new(n))
 }
 
@@ -2052,14 +2045,7 @@ pub fn __majit_wrap_str_descr_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef,
     if !bound_is_none_or_exact_int(start) || !bound_is_none_or_exact_int(end) {
         return str_descr_rfind_slow(args);
     }
-    let n = unsafe {
-        pyre_object::unicodeobject::jit_str_rfind_objs(
-            args[0] as i64,
-            args[1] as i64,
-            start as i64,
-            end as i64,
-        )
-    };
+    let n = unsafe { pyre_object::unicodeobject::jit_str_rfind_objs(args[0], args[1], start, end) };
     Ok(w_int_new(n))
 }
 
@@ -2076,14 +2062,7 @@ pub fn __majit_wrap_str_descr_count(args: &[PyObjectRef]) -> Result<PyObjectRef,
     if !bound_is_none_or_exact_int(start) || !bound_is_none_or_exact_int(end) {
         return str_descr_count_slow(args);
     }
-    let n = unsafe {
-        pyre_object::unicodeobject::jit_str_count_objs(
-            args[0] as i64,
-            args[1] as i64,
-            start as i64,
-            end as i64,
-        )
-    };
+    let n = unsafe { pyre_object::unicodeobject::jit_str_count_objs(args[0], args[1], start, end) };
     Ok(w_int_new(n))
 }
 
