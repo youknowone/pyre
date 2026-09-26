@@ -563,6 +563,10 @@ pub fn propagate_exception_handle_fail(descr: &dyn FailDescr, grabbed: i64) -> O
         } else {
             crate::memory_error_singleton_ref()
         };
+        assert!(
+            exception != 0,
+            "propagate exit with no exception and no memory_error"
+        );
         Some(exception)
     } else {
         None

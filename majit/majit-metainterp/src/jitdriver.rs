@@ -6937,9 +6937,7 @@ impl<S: JitState> JitDriver<S> {
         // rather than a different pair per outcome — and before the FINISH
         // arm takes the exit values out from under it.
         #[cfg(feature = "__back-edge-stage-probe")]
-        if result.is_finish
-            || (result.fail_index == u32::MAX && !result.is_exit_frame_with_exception)
-        {
+        if result.is_finish || result.fail_index == u32::MAX {
             count_back_edge_stage_passes(BackEdgeStage::MarshalOut, stage_repeats.marshal_out);
             for _ in 0..stage_repeats.marshal_out {
                 if !result.is_finish && !result.typed_values.is_empty() {
@@ -6948,6 +6946,30 @@ impl<S: JitState> JitDriver<S> {
                 self.sync_after(state, &compiled_meta, vable, None);
                 std::hint::black_box(&mut *state);
             }
+        }
+
+        if result.is_finish && result.is_exit_frame_with_exception {
+            // compile.py `ExitFrameWithExceptionDescrRef.handle_fail`:
+            // `value = cpu.get_ref_value(deadframe, 0)` and raise
+            // `jitexc.ExitFrameWithExceptionRef(value)`, which the portal
+            // runner re-raises as the portal's own exception. It is not a
+            // return value, so nothing is published on the finish latch;
+            // the exception goes to the same interpreter hook the blackhole
+            // `_exit_frame_with_exception` arms use.
+            let exc = match result.typed_values.first() {
+                Some(Value::Ref(exc)) => *exc,
+                other => panic!("exit-with-exception FINISH carried {other:?}, not a Ref"),
+            };
+            self.sync_after(state, compiled_meta, vable, None);
+            let Some(resume_pc) = state.deliver_blackhole_exception(exc) else {
+                eprintln!(
+                    "[jit] exception escaped the compiled portal and this interpreter has \
+                     no `deliver_blackhole_exception` — ending the dispatch loop"
+                );
+                self.meta.single_pass_finish = true;
+                return Some(usize::MAX);
+            };
+            return Some(resume_pc);
         }
 
         if result.is_finish {
@@ -7001,27 +7023,6 @@ impl<S: JitState> JitDriver<S> {
             // callers see today's behaviour unchanged; a caller that drains
             // the latch never reaches this pc.
             return Some(target_pc);
-        }
-
-        // `compile.py` `PropagateExceptionDescr.handle_fail` raises
-        // `jitexc.ExitFrameWithExceptionRef`. The descr's `fail_index` is
-        // `u32::MAX`, so this has to run before the back-edge arm.
-        if result.is_exit_frame_with_exception {
-            let exc = result
-                .typed_values
-                .iter()
-                .find_map(|value| match value {
-                    majit_ir::Value::Ref(referent) => Some(*referent),
-                    _ => None,
-                })
-                .unwrap_or(majit_ir::GcRef(result.exception.exc_value as usize));
-            self.meta.back_edge_finish = None;
-            self.meta.back_edge_finish_word = None;
-            if let Some(resume_pc) = state.deliver_blackhole_exception(exc) {
-                return Some(resume_pc);
-            }
-            self.meta.single_pass_finish = true;
-            return Some(usize::MAX);
         }
 
         // Normal loop back-edge JUMP, not a guard failure.
@@ -8682,21 +8683,6 @@ impl<S: JitState> JitDriver<S> {
             };
         }
 
-        // `PropagateExceptionDescr.handle_fail`: not a finish, and not a
-        // back-edge. The same `ExitFrameWithExceptionRef` outcome as the
-        // finish arm above.
-        if result.is_exit_frame_with_exception {
-            let typed_values = std::mem::take(&mut result.typed_values).into_vec();
-            drop(result);
-            self.restore_trace_vable_ptr(saved_vable_ptr);
-            return DetailedDriverRunOutcome::Finished {
-                typed_values,
-                via_blackhole: false,
-                raw_int_result: false,
-                is_exit_frame_with_exception: true,
-            };
-        }
-
         let exit_meta = result.meta.take().expect("a detailed run carries its meta");
         // JUMP already decoded on its own arm. A guard-failure through this
         // runner still `restore_values`; re-derive the list from the deadframe.
@@ -8893,20 +8879,6 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
                 raw_int_result: self.meta.has_raw_int_finish(),
                 is_exit_frame_with_exception,
-            };
-        }
-
-        // `compile.py` `PropagateExceptionDescr.handle_fail`, before the
-        // `fail_index == u32::MAX` back-edge test.
-        if is_exit_frame_with_exception {
-            let typed_values = std::mem::take(&mut result.typed_values).into_vec();
-            drop(result);
-            self.restore_trace_vable_ptr(saved_vable_ptr);
-            return DetailedDriverRunOutcome::Finished {
-                typed_values,
-                via_blackhole: false,
-                raw_int_result: false,
-                is_exit_frame_with_exception: true,
             };
         }
 

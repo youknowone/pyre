@@ -354,14 +354,20 @@ mod tests {
         // Do not install a provider: `memory_error_singleton_ref` is
         // process-global, and a stand-in address is what later tests
         // dereference as an exception object.
+        // `handle_fail` asserts the fallback is non-null, so the null-cell
+        // arm is checked only once some provider is registered.
         let memory_error = majit_backend::memory_error_singleton_ref();
-        assert_eq!(
-            majit_backend::propagate_exception_handle_fail(fd, 0),
-            Some(memory_error)
-        );
+        if memory_error != 0 {
+            assert_eq!(
+                majit_backend::propagate_exception_handle_fail(fd, 0),
+                Some(memory_error)
+            );
+        }
 
-        super::attach_propagate_exception_descr(Arc::clone(&descr));
-        let cell = super::descr_at(super::propagate_exception_descr_ptr()).expect("propagate cell");
+        let cpu = crate::WasmBackend::new();
+        cpu.exit_cells.attach_propagate(Arc::clone(&descr));
+        let cell = super::descr_at(cpu.exit_cells.descr_ptrs().propagate_exception_descr)
+            .expect("propagate cell");
         assert!(!cell.is_finish);
         let meta = cell.meta_descr.clone().expect("attached propagate descr");
         assert!(Arc::ptr_eq(&meta, &descr));
@@ -379,10 +385,13 @@ mod tests {
         // CALL_ASSEMBLER check compares against the same constant, so a
         // singleton that failed to bind would send every clean callee finish
         // back to the host to be decoded and handed straight over.
+        let cpu = crate::WasmBackend::new();
         let descr: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrRef::new());
-        super::attach_finish_descr(super::FINISH_EXIT_INDEX_REF, Arc::clone(&descr));
+        cpu.exit_cells
+            .attach_finish(super::FINISH_EXIT_INDEX_REF, Arc::clone(&descr));
+        let attached = cpu.exit_cells.descr_ptrs();
         assert_eq!(
-            super::attached_finish_exit_index(&Some(Arc::clone(&descr))),
+            super::attached_finish_exit_index(&attached, &Some(Arc::clone(&descr))),
             Some(super::FINISH_EXIT_INDEX_REF),
         );
         assert_eq!(
@@ -393,7 +402,10 @@ mod tests {
         // its own exit.
         let unattached: majit_ir::DescrRef =
             Arc::new(majit_backend::DoneWithThisFrameDescrRef::new());
-        assert_eq!(super::attached_finish_exit_index(&Some(unattached)), None);
+        assert_eq!(
+            super::attached_finish_exit_index(&attached, &Some(unattached)),
+            None
+        );
     }
 
     #[test]
@@ -401,13 +413,48 @@ mod tests {
         // CALL_ASSEMBLER compares `jf_descr` with the address baked at
         // compile time. Rebinding the singleton must not move that address.
         let _serialized = super::lock_cpu();
-        let ptr = super::finish_descr_ptr(super::FINISH_EXIT_INDEX_REF);
-        let again = super::finish_descr_ptr(super::FINISH_EXIT_INDEX_REF);
+        let cpu = crate::WasmBackend::new();
+        let ptr =
+            super::finish_cell_ptr(&cpu.exit_cells.descr_ptrs(), super::FINISH_EXIT_INDEX_REF);
+        let again =
+            super::finish_cell_ptr(&cpu.exit_cells.descr_ptrs(), super::FINISH_EXIT_INDEX_REF);
         assert_eq!(ptr, again);
-        assert_ne!(ptr, super::finish_descr_ptr(super::FINISH_EXIT_INDEX_INT));
+        assert_ne!(
+            ptr,
+            super::finish_cell_ptr(&cpu.exit_cells.descr_ptrs(), super::FINISH_EXIT_INDEX_INT)
+        );
         let descr = super::descr_at(ptr).expect("finish cell");
         assert!(descr.is_finish);
         assert_eq!(descr.fail_arg_types, vec![Type::Ref]);
+    }
+
+    #[test]
+    fn two_backends_attach_distinct_finish_cells() {
+        let _serialized = super::lock_cpu();
+        let left = crate::WasmBackend::new();
+        let right = crate::WasmBackend::new();
+        let left_descr: majit_ir::DescrRef =
+            Arc::new(majit_backend::DoneWithThisFrameDescrRef::new());
+        let right_descr: majit_ir::DescrRef =
+            Arc::new(majit_backend::DoneWithThisFrameDescrRef::new());
+        left.exit_cells
+            .attach_finish(super::FINISH_EXIT_INDEX_REF, Arc::clone(&left_descr));
+        right
+            .exit_cells
+            .attach_finish(super::FINISH_EXIT_INDEX_REF, Arc::clone(&right_descr));
+        let left_ptr = left.exit_cells.descr_ptrs().done_with_this_frame_descr_ref;
+        let right_ptr = right.exit_cells.descr_ptrs().done_with_this_frame_descr_ref;
+        assert_ne!(left_ptr, right_ptr);
+        let left_cell = super::descr_at(left_ptr).expect("left cell");
+        let right_cell = super::descr_at(right_ptr).expect("right cell");
+        assert!(Arc::ptr_eq(
+            left_cell.meta_descr.as_ref().expect("left descr"),
+            &left_descr
+        ));
+        assert!(Arc::ptr_eq(
+            right_cell.meta_descr.as_ref().expect("right descr"),
+            &right_descr
+        ));
     }
 
     #[test]
@@ -495,23 +542,25 @@ mod tests {
     #[test]
     fn retract_label_target_keeps_a_replacement_handle() {
         let _serialized = super::lock_cpu();
-        let id = 0x7e71_ac10_usize;
-        super::publish_label_target(id, dummy_label_target(7));
-        super::retract_label_target_if_handle(id, 7);
-        assert!(super::label_target(id).is_none());
+        let descr = majit_ir::make_loop_target_descr(0x7e71, false);
+        let mut first = crate::release::LoopAsmResources::default();
+        let mut second = crate::release::LoopAsmResources::default();
+        super::publish_label_target(&mut first, &descr, dummy_label_target(7));
+        super::retract_label_target_if_handle(&descr, 7);
+        assert!(super::label_target(&descr).is_none());
 
-        super::publish_label_target(id, dummy_label_target(9));
-        super::retract_label_target_if_handle(id, 7);
-        assert_eq!(super::label_target(id).map(|t| t.func_handle), Some(9));
-        super::retract_label_target_if_handle(id, 9);
-        assert!(super::label_target(id).is_none());
+        super::publish_label_target(&mut second, &descr, dummy_label_target(9));
+        super::retract_label_target_if_handle(&descr, 7);
+        assert_eq!(super::label_target(&descr).map(|t| t.func_handle), Some(9));
+        super::retract_label_target_if_handle(&descr, 9);
+        assert!(super::label_target(&descr).is_none());
     }
 }
 
-/// A resumable `LABEL` of a compiled loop, published in `LABEL_TARGETS` so a
-/// loop-closing bridge can chain into ANY compiled loop's label in-module
-/// (jump-to-existing-trace), not only its own source loop's. Keyed by the
-/// label's loop-target descr identity (`Arc::as_ptr`), which the JUMP shares.
+/// A resumable `LABEL` of a compiled loop. The publishing loop's
+/// `LoopAsmResources` owns the `Box`, and `LoopTargetDescr::ll_loop_code`
+/// holds its address (`history.py` `TargetToken._ll_loop_code`;
+/// `assembler.py` `closing_jump` reads that word off the JUMP's descr).
 #[derive(Clone, Copy, Debug)]
 pub struct LabelTarget {
     /// Table slot of the owning loop's compiled function.
@@ -670,8 +719,9 @@ pub const WASM_CA_TARGET_LABEL_REF_SLOTS_OFS: u64 =
 /// clean callee finish by comparing against one value.
 ///
 /// The shared identity is the cell address stored in `jf_descr`. The five
-/// cells never move; `attach_finish_descr` replaces the `Arc` inside the
-/// cell. `get_latest_descr` reads that `Arc`'s `meta_descr`.
+/// cells live on the owning `WasmBackend` and never move;
+/// `CpuExitCells::attach_finish` replaces the `Arc` inside the cell.
+/// `get_latest_descr` reads that `Arc`'s `meta_descr`.
 pub const FINISH_EXIT_INDEX_VOID: u32 = 0;
 pub const FINISH_EXIT_INDEX_INT: u32 = 1;
 pub const FINISH_EXIT_INDEX_REF: u32 = 2;
@@ -790,31 +840,24 @@ pub fn alloc_exit_cell(sink: usize, fail_index: u32) -> usize {
     resources.alloc_fail_cell(descr)
 }
 
-/// CPU singletons for the five `done_with_this_frame` / exception exits.
-///
-/// The `Box` is allocated once and never replaced, so the address baked
-/// into a module stays valid when `attach_finish_descr` rebinds the `Arc`.
-static FINISH_EXITS: parking_lot::Mutex<[Option<Box<FailDescrCell>>; 5]> =
-    parking_lot::Mutex::new([None, None, None, None, None]);
-
-fn finish_descr_ptr_locked(exits: &mut [Option<Box<FailDescrCell>>; 5], index: u32) -> usize {
-    let slot = &mut exits[index as usize];
-    if slot.is_none() {
-        *slot = Some(Box::new(FailDescrCell::new(reserved_finish_descr(
-            index, None,
-        ))));
-    }
-    &**slot.as_ref().expect("finish cell") as *const FailDescrCell as usize
-}
-
-/// Stable `jf_descr` immediate for one reserved finish exit.
-pub fn finish_descr_ptr(index: u32) -> usize {
-    let mut exits = FINISH_EXITS.lock();
-    finish_descr_ptr_locked(&mut exits, index)
-}
-
 fn thin_descr_ptr(descr: &DescrRef) -> usize {
     Arc::as_ptr(descr) as *const () as usize
+}
+
+fn cell_addr(cell: &FailDescrCell) -> usize {
+    cell as *const FailDescrCell as usize
+}
+
+/// `jf_descr` immediate captured for one reserved finish exit.
+pub fn finish_cell_ptr(attached: &majit_backend::AttachedDescrPtrs, index: u32) -> usize {
+    match index {
+        FINISH_EXIT_INDEX_VOID => attached.done_with_this_frame_descr_void,
+        FINISH_EXIT_INDEX_INT => attached.done_with_this_frame_descr_int,
+        FINISH_EXIT_INDEX_REF => attached.done_with_this_frame_descr_ref,
+        FINISH_EXIT_INDEX_FLOAT => attached.done_with_this_frame_descr_float,
+        FINISH_EXIT_INDEX_EXC => attached.exit_frame_with_exception_descr_ref,
+        _ => 0,
+    }
 }
 
 /// `make_and_attach_done_descrs` pointer identity: the reserved exit index for
@@ -823,39 +866,44 @@ fn thin_descr_ptr(descr: &DescrRef) -> usize {
 /// Mirrors `AttachedDescrPtrs::is_done_with_this_frame_descr`, which is how the
 /// native backends recognise the same descrs on the FINISH fast path.
 ///
-/// Answered from the reserved entries themselves, so an index this returns
-/// always names a registry entry carrying `descr` — `get_latest_descr_arc`
-/// keeps its `AbstractDescr` identity whatever order attachment and the first
-/// compile happened in.
-pub fn attached_finish_exit_index(descr: &Option<DescrRef>) -> Option<u32> {
+/// Answered from the cells whose addresses `compile_loop` /
+/// `compile_bridge` captured, so an index this returns always names a cell
+/// carrying `descr`.
+pub fn attached_finish_exit_index(
+    attached: &majit_backend::AttachedDescrPtrs,
+    descr: &Option<DescrRef>,
+) -> Option<u32> {
     let ptr = thin_descr_ptr(descr.as_ref()?);
-    let exits = FINISH_EXITS.lock();
-    exits.iter().enumerate().find_map(|(index, reserved)| {
-        let cell = reserved.as_ref()?;
-        cell.get()
+    let slots = [
+        (
+            FINISH_EXIT_INDEX_VOID,
+            attached.done_with_this_frame_descr_void,
+        ),
+        (
+            FINISH_EXIT_INDEX_INT,
+            attached.done_with_this_frame_descr_int,
+        ),
+        (
+            FINISH_EXIT_INDEX_REF,
+            attached.done_with_this_frame_descr_ref,
+        ),
+        (
+            FINISH_EXIT_INDEX_FLOAT,
+            attached.done_with_this_frame_descr_float,
+        ),
+        (
+            FINISH_EXIT_INDEX_EXC,
+            attached.exit_frame_with_exception_descr_ref,
+        ),
+    ];
+    slots.into_iter().find_map(|(index, cell)| {
+        descr_at(cell)?
             .meta_descr
             .as_ref()
-            .is_some_and(|attached| thin_descr_ptr(attached) == ptr)
-            .then_some(index as u32)
+            .is_some_and(|attached_descr| thin_descr_ptr(attached_descr) == ptr)
+            .then_some(index)
     })
 }
-
-/// `make_and_attach_done_descrs`' per-target attachment for one of the five.
-/// Rebinds the `Arc` inside the existing cell, so a module that already
-/// baked [`finish_descr_ptr`] still names this descr.
-pub fn attach_finish_descr(exit_index: u32, descr: DescrRef) {
-    let cell = finish_descr_ptr(exit_index);
-    fill_exit_cell(cell, reserved_finish_descr(exit_index, Some(descr)));
-}
-
-/// `pyjitpl.py` `self.cpu.propagate_exception_descr = exc_descr`.
-///
-/// `_build_propagate_exception_path` writes this cell into `jf_descr`.
-/// `get_latest_descr_arc` recovers the Arc from `WasmFailDescr.meta_descr`.
-/// The metainterp reader runs `PropagateExceptionDescr.handle_fail`; this
-/// cell is not a finish exit.
-static PROPAGATE_EXCEPTION_CELL: parking_lot::Mutex<Option<Box<FailDescrCell>>> =
-    parking_lot::Mutex::new(None);
 
 fn propagate_wasm_descr(meta_descr: Option<DescrRef>) -> Arc<WasmFailDescr> {
     Arc::new(WasmFailDescr {
@@ -876,25 +924,74 @@ fn propagate_wasm_descr(meta_descr: Option<DescrRef>) -> Arc<WasmFailDescr> {
     })
 }
 
-/// Stable `jf_descr` immediate for `propagate_exception_descr`.
-pub fn propagate_exception_descr_ptr() -> usize {
-    let mut slot = PROPAGATE_EXCEPTION_CELL.lock();
-    if slot.is_none() {
-        *slot = Some(Box::new(FailDescrCell::new(propagate_wasm_descr(None))));
+/// The six exit cells of one cpu.
+///
+/// `compile.py` `make_and_attach_done_descrs` writes
+/// `cpu.done_with_this_frame_descr_*` /
+/// `cpu.exit_frame_with_exception_descr_ref`, and `pyjitpl.py` sets
+/// `cpu.propagate_exception_descr`. Each cell is a `Box` allocated once
+/// in [`CpuExitCells::new`], so the address a module bakes as `jf_descr`
+/// stays valid when [`CpuExitCells::attach_finish`] rebinds the `Arc`.
+/// The owner is an `Arc` on `WasmBackend`: moving the backend does not
+/// move the cells.
+pub struct CpuExitCells {
+    finish: [Box<FailDescrCell>; 5],
+    propagate: Box<FailDescrCell>,
+}
+
+impl CpuExitCells {
+    pub fn new() -> Self {
+        Self {
+            finish: std::array::from_fn(|index| {
+                Box::new(FailDescrCell::new(reserved_finish_descr(
+                    index as u32,
+                    None,
+                )))
+            }),
+            propagate: Box::new(FailDescrCell::new(propagate_wasm_descr(None))),
+        }
     }
-    &**slot.as_ref().expect("propagate cell") as *const FailDescrCell as usize
-}
 
-pub fn attach_propagate_exception_descr(descr: DescrRef) {
-    let cell = propagate_exception_descr_ptr();
-    fill_exit_cell(cell, propagate_wasm_descr(Some(descr)));
-}
+    /// Snapshot the six cell addresses for one `compile_loop` /
+    /// `compile_bridge`. Finish cells are always published: `_call_assembler`
+    /// compares `jf_descr` against the reserved cell even before a singleton
+    /// is bound. `propagate_exception_descr` is `0` until
+    /// [`Self::attach_propagate`], the unattached answer
+    /// `AttachedDescrPtrs` uses on the native cpus.
+    pub fn descr_ptrs(&self) -> majit_backend::AttachedDescrPtrs {
+        let propagate = cell_addr(&self.propagate);
+        majit_backend::AttachedDescrPtrs {
+            done_with_this_frame_descr_void: cell_addr(&self.finish[0]),
+            done_with_this_frame_descr_int: cell_addr(&self.finish[1]),
+            done_with_this_frame_descr_ref: cell_addr(&self.finish[2]),
+            done_with_this_frame_descr_float: cell_addr(&self.finish[3]),
+            exit_frame_with_exception_descr_ref: cell_addr(&self.finish[4]),
+            propagate_exception_descr: descr_at(propagate)
+                .is_some_and(|descr| descr.meta_descr.is_some())
+                .then_some(propagate)
+                .unwrap_or(0),
+        }
+    }
 
-pub fn propagate_exception_attached() -> bool {
-    descr_at(propagate_exception_descr_ptr())
-        .expect("propagate cell")
-        .meta_descr
-        .is_some()
+    /// `make_and_attach_done_descrs`. Rebinds the `Arc` inside the existing
+    /// cell, so a module that already baked the address still names this descr.
+    pub fn attach_finish(&self, exit_index: u32, descr: DescrRef) {
+        let cell = cell_addr(&self.finish[exit_index as usize]);
+        fill_exit_cell(cell, reserved_finish_descr(exit_index, Some(descr)));
+    }
+
+    /// `pyjitpl.py` `self.cpu.propagate_exception_descr = exc_descr`.
+    ///
+    /// `_build_propagate_exception_path` writes this cell into `jf_descr`.
+    /// `get_latest_descr_arc` recovers the Arc from `WasmFailDescr.meta_descr`.
+    /// The metainterp reader runs `PropagateExceptionDescr.handle_fail`; this
+    /// cell is not a finish exit.
+    pub fn attach_propagate(&self, descr: DescrRef) {
+        fill_exit_cell(
+            cell_addr(&self.propagate),
+            propagate_wasm_descr(Some(descr)),
+        );
+    }
 }
 
 impl WasmCaDispatchEntry {
@@ -1146,23 +1243,20 @@ pub fn write_guard_cell(cell_addr: u32, slot: u32) {
     let _ = (cell_addr, slot);
 }
 
-/// Serializes tests that mutate cpu-global tables (finish singletons,
-/// finish singletons, GC box, label targets). The wasm host never
-/// interleaves those; cargo's parallel unit-test runner does. Held by
-/// every lib test in this crate.
+/// Serializes tests that mutate cpu-global tables (GC box, label targets).
+/// The wasm host never interleaves those; cargo's parallel unit-test runner
+/// does. Held by every lib test in this crate.
 #[cfg(test)]
 pub static FAIL_DESCR_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Acquires [`FAIL_DESCR_TEST_LOCK`], then installs a fresh cpu.
 ///
 /// `BaseBackendTest.setup_method` does `self.cpu = self.get_cpu()` and
-/// sets `done_with_this_frame_descr_* = None`. The wasm host keeps those
-/// tables process-global (guest writes an exit index, not a cpu pointer),
-/// so the equivalent is to empty them here. Drop is
-/// `AsmMemoryManager._delete`: the cpu dies with the frame
-/// (`cpu.gc_ll_descr` / shadowstack). Struct fields drop in declaration
-/// order, so `_cleanup` is declared first and runs while `_lock` is
-/// still held.
+/// sets `done_with_this_frame_descr_* = None`. Those descrs live on the
+/// `WasmBackend` under test. Drop is `AsmMemoryManager._delete`: the cpu
+/// dies with the frame (`cpu.gc_ll_descr` / shadowstack). Struct fields
+/// drop in declaration order, so `_cleanup` is declared first and runs
+/// while `_lock` is still held.
 #[cfg(test)]
 pub fn lock_cpu() -> CpuTestGuard {
     let guard = CpuTestGuard {
@@ -1173,15 +1267,10 @@ pub fn lock_cpu() -> CpuTestGuard {
     guard
 }
 
-/// Empty the process-global cpu tables and uninstall this thread's
-/// `gc_ll_descr`. `BaseBackendTest.setup_method` / `get_cpu`.
+/// Uninstall this thread's `gc_ll_descr`. `BaseBackendTest.setup_method` /
+/// `get_cpu`. Finish and propagate cells belong to the `WasmBackend`.
 #[cfg(test)]
 fn reset_cpu_for_tests() {
-    {
-        let mut exits = FINISH_EXITS.lock();
-        *exits = [None, None, None, None, None];
-    }
-    *LABEL_TARGETS.lock() = None;
     crate::gc_box::clear();
     majit_gc::shadow_stack::clear();
     crate::clear_pending_inlines_for_tests();
@@ -1206,45 +1295,56 @@ pub struct CpuTestGuard {
     _lock: parking_lot::MutexGuard<'static, ()>,
 }
 
-/// Global `label descr identity → LabelTarget` registry (see `LabelTarget`).
-/// The wasm host is single-threaded; the `Mutex` is for `static` soundness
-/// only. `compile_loop` inserts every resumable label of a peeled loop;
-/// `CompiledWasmLoop::drop` removes its own entries (guarded by
-/// `func_handle`, so a recompile that re-stamped the same descr keeps the
-/// replacement's entry).
-pub static LABEL_TARGETS: parking_lot::Mutex<
-    Option<std::collections::HashMap<usize, LabelTarget>>,
-> = parking_lot::Mutex::new(None);
-
-/// Look up a label target by descr identity.
-pub fn label_target(descr_id: usize) -> Option<LabelTarget> {
-    LABEL_TARGETS
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&descr_id).copied())
+/// `closing_jump` reads `_ll_loop_code` off the JUMP's descr.
+///
+/// SAFETY: a non-zero word is `&*Box<LabelTarget>` owned by the publishing
+/// loop's `LoopAsmResources`. `free_loop_and_bridges` drops that block after
+/// `LoopAsmResources::drop` clears the word when it still names this box.
+/// `LabelTarget` is `Copy`.
+pub fn label_target(descr: &majit_ir::DescrRef) -> Option<LabelTarget> {
+    let addr = descr.as_loop_target_descr()?.ll_loop_code();
+    if addr == 0 {
+        return None;
+    }
+    Some(unsafe { *(addr as *const LabelTarget) })
 }
 
-/// Publish a label target (see `LABEL_TARGETS`).
-pub fn publish_label_target(descr_id: usize, target: LabelTarget) {
-    LABEL_TARGETS
-        .lock()
-        .get_or_insert_with(Default::default)
-        .insert(descr_id, target);
+/// `fixup_target_tokens`: write this label's entry onto its `TargetToken`.
+/// The box stays in `resources` for the emission's life. A later compile
+/// overwrites `_ll_loop_code` with its own box's address.
+pub fn publish_label_target(
+    resources: &mut crate::release::LoopAsmResources,
+    descr: &majit_ir::DescrRef,
+    target: LabelTarget,
+) {
+    let Some(loop_target) = descr.as_loop_target_descr() else {
+        return;
+    };
+    let boxed = Box::new(target);
+    let addr = &*boxed as *const LabelTarget as usize;
+    loop_target.set_ll_loop_code(addr);
+    resources.label_targets.push((descr.clone(), boxed));
 }
 
 /// Retract a published label if it still names `func_handle`.
 /// Same handle guard as [`CompiledWasmLoop::drop`]: a later publish that
 /// re-stamped the same descr onto a different slot keeps the replacement.
-pub fn retract_label_target_if_handle(descr_id: usize, func_handle: u32) {
-    if descr_id == 0 || func_handle == 0 {
+/// The box stays with its `LoopAsmResources` until that emission is freed.
+pub fn retract_label_target_if_handle(descr: &majit_ir::DescrRef, func_handle: u32) {
+    if func_handle == 0 {
         return;
     }
-    let mut reg = LABEL_TARGETS.lock();
-    if let Some(map) = reg.as_mut()
-        && let Some(t) = map.get(&descr_id)
-        && t.func_handle == func_handle
-    {
-        map.remove(&descr_id);
+    let Some(loop_target) = descr.as_loop_target_descr() else {
+        return;
+    };
+    let addr = loop_target.ll_loop_code();
+    if addr == 0 {
+        return;
+    }
+    // SAFETY: see [`label_target`].
+    let current = unsafe { &*(addr as *const LabelTarget) };
+    if current.func_handle == func_handle {
+        loop_target.set_ll_loop_code(0);
         crate::BRIDGE_DIAG[22].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -1392,13 +1492,15 @@ pub struct CompiledWasmLoop {
     /// Post-intern module inputs retained for a loop re-emission. Entry
     /// bridges store `None` because they tail-call another loop.
     pub reemit: RefCell<Option<crate::codegen::ModuleBuildInputs>>,
-    /// The environment-gated identity re-emission runs once per token.
-    pub reemitted: Cell<bool>,
-    /// `(descr identity, table slot)` for every label published by a bridge
+    /// Label descrs this loop published. `Drop` retracts a row that still
+    /// names this loop's table slot (`TargetToken._ll_loop_code` cleared
+    /// when the assembled code is freed).
+    pub published_label_descrs: Vec<majit_ir::DescrRef>,
+    /// `(label descr, table slot)` for every label published by a bridge
     /// chained onto this loop. The bridge module lives as long as its source
     /// loop, so `Drop` retracts the entries that still name that bridge's
     /// slot.
-    pub bridge_owned_label_targets: RefCell<Vec<(usize, u32)>>,
+    pub bridge_owned_label_targets: RefCell<Vec<(majit_ir::DescrRef, u32)>>,
     /// Set when `compile_bridge` accepts a self-recursive `CallAssemblerR`
     /// bridge (`PYRE_WASM_CA`) for this loop. While set, `compile_bridge`
     /// declines chaining any FURTHER bridge into this recursion (the guard
@@ -1512,11 +1614,11 @@ impl Drop for CompiledWasmLoop {
         // replacement loop has already overwritten the entry, which must
         // survive the old loop's drop.
         let handle = self.func_handle.get();
-        for id in self.label_descrs.iter().copied() {
-            retract_label_target_if_handle(id, handle);
+        for descr in &self.published_label_descrs {
+            retract_label_target_if_handle(descr, handle);
         }
-        for (id, slot) in self.bridge_owned_label_targets.get_mut().iter().copied() {
-            retract_label_target_if_handle(id, slot);
+        for (descr, slot) in self.bridge_owned_label_targets.get_mut().drain(..) {
+            retract_label_target_if_handle(&descr, slot);
         }
     }
 }

@@ -6363,6 +6363,49 @@ fn host_gni_bridge_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec
     ops
 }
 
+/// `host_loop_ops` plus a chain of `IntAdd`s. Each result feeds the next, and
+/// the last feeds the guard and the JUMP, so none of the adds are dead. The
+/// chain is long enough that the emitted module exceeds the eager-merge
+/// ceiling (`DEFAULT_INLINE_EAGER_MAX_BYTES`, 4096).
+fn host_oversized_loop_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<OpRc> {
+    let mut ops = host_loop_ops(label_descr);
+    let mut producer = ops[1].clone();
+    // `host_loop_ops` is [label, advance, guard, jump]. The chain replaces
+    // the guard and the JUMP so both read the last add.
+    ops.truncate(2);
+    const EXTRA: u32 = 700;
+    for i in 0..EXTRA {
+        let next = Op::new(
+            OpCode::IntAdd,
+            &[
+                Operand::from_bound_op(&producer),
+                rb(OpRef::input_arg_int(1)),
+            ],
+        );
+        let pos = OpRef::int_op(3 + i);
+        next.pos().set(pos);
+        producer = OpRc::new(next);
+        ops.push(producer.clone());
+    }
+    let carried = producer.pos().get();
+    let guard = OpRc::new(make_guard(
+        OpCode::GuardTrue,
+        &[carried],
+        &[carried, OpRef::input_arg_int(1)],
+    ));
+    let jump = OpRc::new(Op::new(
+        OpCode::Jump,
+        &[
+            Operand::from_bound_op(&producer),
+            rb(OpRef::input_arg_int(1)),
+        ],
+    ));
+    jump.setdescr(label_descr.clone());
+    ops.push(guard);
+    ops.push(jump);
+    ops
+}
+
 fn host_bridge_inputargs() -> Vec<InputArgRc> {
     vec![
         InputArg::from_type_rc(Type::Int, 40),
@@ -6409,7 +6452,11 @@ fn assert_valid_owner_defers_inline_trial(case: &str, preamble: bool, large_head
     clt.set_loop_token_wref(std::sync::Arc::downgrade(&token));
     token.set_compiled_loop_token(Some(clt));
     let label_descr = majit_ir::make_loop_target_descr(70, false);
-    let mut loop_ops = host_loop_ops(&label_descr);
+    let mut loop_ops = if large_header {
+        host_oversized_loop_ops(&label_descr)
+    } else {
+        host_loop_ops(&label_descr)
+    };
     let mut bridge_target = label_descr.clone();
     if preamble {
         bridge_target = majit_ir::make_loop_target_descr(73, false);
@@ -6440,9 +6487,16 @@ fn assert_valid_owner_defers_inline_trial(case: &str, preamble: bool, large_head
         );
     }
 
-    backend
+    let owner = backend
         .compile_loop(&host_loop_inputargs(), &loop_ops, &token)
         .unwrap_or_else(|_| panic!("case {case}: the owner loop compiles"));
+    if large_header {
+        assert!(
+            owner.code_size > 4096,
+            "case {case}: owner module is {} bytes; the eager ceiling is 4096",
+            owner.code_size
+        );
+    }
     assert!(!token.is_invalidated(), "case {case}");
 
     let fail_descr = HostFailDescr {
@@ -6456,11 +6510,6 @@ fn assert_valid_owner_defers_inline_trial(case: &str, preamble: bool, large_head
     // A merge is only considered once there is a callback to act on the
     // entry-count trip; the guest publishes the real one.
     majit_backend_wasm::set_inline_trip_helper_slot(1);
-    if large_header {
-        // Price even this small test owner above the eager limit. It must
-        // wait for measured hotness, not become permanently ineligible.
-        majit_backend_wasm::set_inline_eager_max_bytes(0);
-    }
     let compiled = backend.compile_bridge(
         &fail_descr,
         &host_bridge_inputargs(),
@@ -6469,9 +6518,6 @@ fn assert_valid_owner_defers_inline_trial(case: &str, preamble: bool, large_head
         &[],
         None,
     );
-    if large_header {
-        majit_backend_wasm::set_inline_eager_max_bytes(4096);
-    }
     majit_backend_wasm::set_inline_trip_helper_slot(0);
     compiled.unwrap_or_else(|_| panic!("case {case}: the loop-closing bridge compiles"));
 
@@ -6508,9 +6554,8 @@ fn assert_valid_owner_defers_inline_trial(case: &str, preamble: bool, large_head
     );
 }
 
-/// After a peel has already grown the owner past
-/// [`majit_backend_wasm::set_inline_eager_max_bytes`], a later
-/// invalidation-watched region used to refuse the eager arm and never
+/// After a peel has already grown the owner past the eager-merge ceiling, a
+/// later invalidation-watched region used to refuse the eager arm and never
 /// register a trip. That left `exception_loop_warmup`'s raise path as
 /// a permanent crossing. The size check still refuses the unmeasured
 /// re-emission; it now arms the same trip as the no-GNI deferral.
@@ -6526,29 +6571,18 @@ fn an_oversized_owner_defers_a_gni_region_instead_of_dropping_it() {
     token.set_compiled_loop_token(Some(clt));
     let label_descr = majit_ir::make_loop_target_descr(71, false);
 
-    struct RestoreEagerMax(u32);
-    impl Drop for RestoreEagerMax {
-        fn drop(&mut self) {
-            majit_backend_wasm::set_inline_eager_max_bytes(self.0);
-        }
-    }
-    struct RestoreParams;
-    impl Drop for RestoreParams {
-        fn drop(&mut self) {
-            majit_backend_wasm::bridge_params_enable();
-        }
-    }
-    // Any compiled owner is larger than 1 byte.
-    let _restore = RestoreEagerMax(4096);
-    majit_backend_wasm::set_inline_eager_max_bytes(1);
-    // Parameter dispatch is not the point of this test and the host
-    // compile of a GNI+JUMP region asserts it is enabled.
-    let _restore_params = RestoreParams;
-    majit_backend_wasm::bridge_params_disable();
-
-    backend
-        .compile_loop(&host_loop_inputargs(), &host_loop_ops(&label_descr), &token)
+    let owner = backend
+        .compile_loop(
+            &host_loop_inputargs(),
+            &host_oversized_loop_ops(&label_descr),
+            &token,
+        )
         .expect("the owner loop compiles");
+    assert!(
+        owner.code_size > 4096,
+        "owner module is {} bytes; the eager ceiling is 4096",
+        owner.code_size
+    );
 
     let fail_descr = HostFailDescr {
         fail_index: 0,
@@ -6572,7 +6606,8 @@ fn an_oversized_owner_defers_a_gni_region_instead_of_dropping_it() {
 
     assert!(
         majit_backend_wasm::bridge_diag(54) > deferred_before,
-        "an oversized owner waits on the entry-count trip, not an unmeasured merge"
+        "an oversized owner waits on the entry-count trip, not an unmeasured merge: {}",
+        majit_backend_wasm::inline_declines()
     );
     assert_eq!(
         majit_backend_wasm::bridge_diag(32),

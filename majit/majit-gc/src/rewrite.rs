@@ -14,7 +14,6 @@ use indexmap::{IndexMap, IndexSet};
 /// Reference: rpython/jit/backend/llsupport/rewrite.py GcRewriterAssembler.
 use majit_ir::Type;
 use majit_ir::descr::{DescrRef, FieldDescr, SizeDescr};
-use majit_ir::forwarding::Forwarded;
 use majit_ir::operand::Operand;
 use majit_ir::resoperation::{Op, OpCode, OpRc, OpRef};
 use majit_ir::{Const, ConstMap, GcRef, Value};
@@ -34,9 +33,8 @@ fn mk_op_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Op {
 /// rewrite.py `emit_op`'s reference-constant loop, run on its own.
 ///
 /// The full rewrite ([`GcRewriterImpl`]) also lowers mallocs, GC
-/// loads/stores and write barriers. A backend that lowers those itself —
-/// wasm emits its own inline nursery bump, its own barriers, and has no
-/// descr-driven `GC_LOAD` model — still needs this half: a raw `GcRef`
+/// loads/stores and write barriers. A backend that runs only this half
+/// still gets the constant-pointer contract: a raw `GcRef`
 /// baked as a code immediate is a pointer the moving collector can
 /// neither find nor update, so the first minor collection that promotes
 /// the referenced object out of the nursery leaves the immediate
@@ -52,7 +50,7 @@ fn mk_op_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Op {
 /// per-loop table.
 /// rewrite.py `emit_op` operand rewrite: follow `_forwarded`, then
 /// `remove_constptr` on a non-null `ConstPtr`. A folded InputArg/Op
-/// still carries `Forwarded::Const`; `const_value()` on the operand
+/// carries its constant on `_forwarded`; `const_value()` on the operand
 /// itself is then `None`, so follow the replacement first.
 fn rewrite_operand(
     operand: Operand,
@@ -85,21 +83,6 @@ fn rewrite_operand(
         if !orig.is_none() && !orig.is_constant() && defined.contains(&orig.raw()) {
             return operand;
         }
-    }
-    // Off-stream producer: flattening left a `RefOp(pos)` / InputArg whose
-    // `_resref` still names the object (`history.py *FrontendOp`). rewrite.py
-    // never sees that shape — RPython Box identity keeps the Const on the
-    // box itself after get_box_replacement.
-    if let Some(gcref) = leftover_folded_ref(&operand, defined) {
-        return intern_constptr_operand(
-            Operand::const_from_value(Value::Ref(gcref)),
-            gcrefs,
-            gcrefs_map,
-            recently_loaded,
-            next_pos,
-            out,
-        )
-        .unwrap_or(replaced);
     }
     replaced
 }
@@ -163,33 +146,6 @@ fn intern_constptr_operand(
             load
         }
     })
-}
-
-/// A folded producer that is no longer in the compiled stream still
-/// carries the object on `_resref` / `_forwarded` (`history.py
-/// *FrontendOp`). Flattening that operand to `RefOp(pos)` without a
-/// pool entry or a `LoadFromGcTable` leaves wasm reading an unbound local.
-///
-/// An `InputArg.get_value()` is only the object observed while tracing,
-/// not proof the argument is constant. Recover that shape only from
-/// `Forwarded::Const` — the same gate `remove_constptr` uses after
-/// `get_box_replacement`.
-fn leftover_folded_ref(arg: &Operand, defined: &HashSet<u32>) -> Option<GcRef> {
-    let opref = arg.to_opref();
-    if opref != OpRef::NONE && !opref.is_constant() && defined.contains(&opref.raw()) {
-        return None;
-    }
-    // `get_value()` / `_resref` is the tracing observation. Only
-    // `Forwarded::Const` is a fold — the same gate `remove_constptr`
-    // uses after `get_box_replacement`.
-    let value = match arg.get_forwarded() {
-        Forwarded::Const(c) => c.get(),
-        _ => return None,
-    };
-    match value {
-        Value::Ref(gcref) if !gcref.is_null() => Some(gcref),
-        _ => None,
-    }
 }
 
 pub fn remove_ref_constants(ops: &[Op], next_pos: u32) -> (Vec<Op>, Vec<GcRef>) {

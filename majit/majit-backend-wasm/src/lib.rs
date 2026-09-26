@@ -57,7 +57,7 @@ use indexmap::IndexMap;
 use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 /// Diagnostic-only `compile_bridge` outcome tallies, read out via the
@@ -77,7 +77,7 @@ use std::sync::{Arc, Weak};
 /// call trampoline on a movable CA frame.  Index 16 records the dormant
 /// forced-terminal-decline runtime regression hook. Sub-breakdown of the
 /// index-8 unresolved-target decline: 17 = the terminal JUMP carries no descr
-/// at all, 18 = the descr is present but `LABEL_TARGETS` holds no entry for it.
+/// at all, 18 = the descr is present but `ll_loop_code` is 0.
 /// Publish-side counterpart, so an unresolved lookup can be told from a label
 /// that was never offered: 19 = labels published off a peeled trace, 20 =
 /// published off a non-peeled trace, 21 = a non-peeled trace's first label left
@@ -109,8 +109,9 @@ use std::sync::{Arc, Weak};
 /// re-bridged after its first bridge was outgrown); a count that tracks
 /// `BRIDGE_OK` says the epilogue dispatch is not taking the cell at all and
 /// every bridge after the first is dead weight.
-/// 30 = a host-armed loop re-emission was attempted but failed;
-/// 31 = it succeeded and the rebuilt module is installed in the loop's
+/// 30 = a re-emitted module was rejected by the host, or there is no host
+/// replacement binding (`classify_inline_install_error`);
+/// 31 = re-emission succeeded and the rebuilt module is installed in the loop's
 /// original table slot. 31 is the only positive evidence that a re-emission
 /// ran at all: a re-emission that silently never fires is indistinguishable
 /// from one that fires and changes nothing.
@@ -118,8 +119,8 @@ use std::sync::{Arc, Weak};
 /// because the source guard belongs to an already chained trace; 34 = the
 /// bridge is not loop-closing; 35 = the owner has no retained module inputs;
 /// 36 = that guard already owns a region; 37 = the merged stream exceeds the
-/// owner's frozen frame geometry; 38 = the bridge does not resume at the loop
-/// header; 39 = the merged stream has no local loop LABEL for the wasm back
+/// owner's frozen frame geometry; 38 = unused since the non-header gate was
+/// removed; 39 = the merged stream has no local loop LABEL for the wasm back
 /// edge. 40-43 split a rejected inline trial into value-layout,
 /// Ref-home-layout, missing-local-label, and other backend errors. 44 = a
 /// bridge compiled with a parameter entry; 45 = parameter entry declined
@@ -127,8 +128,8 @@ use std::sync::{Arc, Weak};
 /// cannot name the source guard's fail arguments — a parameter entry whose
 /// arity disagrees with the guard's live count, or a frame entry whose
 /// positional slots are not where that guard spilled them (the two arms are
-/// mutually exclusive: `bridge_params_enabled` selects one for the whole
-/// process); 47 =
+/// mutually exclusive: `bridge_param_dispatch_for` selects one for the
+/// module from its guard count); 47 =
 /// LABEL publication suppressed because the bridge entry has nonzero parameters.
 /// 48 = an inline trial's LABEL-resume storage exceeds the frozen frame; 49 =
 /// the region carries a CALL_ASSEMBLER the owner build emits no arm for; 50 =
@@ -393,13 +394,6 @@ fn classify_inline_install_error(error: &BackendError) {
     }
 }
 
-static REEMIT_ENABLED: AtomicBool = AtomicBool::new(false);
-
-static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
-/// On: non-header regions are placed outside the header `loop`, so they
-/// do not tax the fall-through path. See `inline_nonheader_enable`.
-static INLINE_NONHEADER_ENABLED: AtomicBool = AtomicBool::new(true);
-static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Above this many exits, duplicating a parameter bridge arm at every guard is
 /// larger and slower to compile than the shared frame-entry epilogue.
 ///
@@ -413,13 +407,6 @@ static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
 /// arm for ordinary traces and use the one shared frame dispatch once that
 /// replication is no longer bounded.
 const MAX_BRIDGE_PARAM_GUARDS: usize = 256;
-/// Entries a merge must earn per byte of the module it re-emits. See
-/// `inline_trip_threshold_for`. Zero leaves `INLINE_TRIP_THRESHOLD` as the
-/// whole rule.
-static INLINE_TRIP_BYTES_FACTOR: AtomicU64 = AtomicU64::new(DEFAULT_INLINE_TRIP_BYTES_FACTOR);
-/// Owner size at which the eager merge arm stops merging. See
-/// `DEFAULT_INLINE_EAGER_MAX_BYTES`.
-static INLINE_EAGER_MAX_BYTES: AtomicU32 = AtomicU32::new(DEFAULT_INLINE_EAGER_MAX_BYTES);
 static TRACE_ENTRY_CENSUS_FORCED: AtomicBool = AtomicBool::new(false);
 
 /// One compiled trace's guest-memory entry counters.  The generated module
@@ -514,67 +501,6 @@ pub fn trace_entry_census_summary() -> String {
     report
 }
 
-/// Arm loop-module replacement from the host before guest execution starts.
-pub fn reemit_enable() {
-    REEMIT_ENABLED.store(true, Ordering::Relaxed);
-}
-
-fn reemit_enabled() -> bool {
-    REEMIT_ENABLED.load(Ordering::Relaxed)
-}
-
-/// Disable loop-closing bridge inlining from the host before guest execution
-/// starts. A bridge that closes back onto its owner's loop is merged into the
-/// owner's module by default, so the guard reaching it becomes a branch inside
-/// one module instead of a call out to another; this carries the host's
-/// explicit opt-out into the backend.
-pub fn inline_bridge_disable() {
-    INLINE_BRIDGE_ENABLED.store(false, Ordering::Relaxed);
-}
-
-fn inline_bridge_enabled() -> bool {
-    INLINE_BRIDGE_ENABLED.load(Ordering::Relaxed)
-}
-
-/// Admit a region whose closing JUMP names a resumable LABEL that is not the
-/// loop header AND whose guard sits inside the loop body. Both halves of that
-/// class re-enter the same way — `codegen` wraps the entry dispatch in a `loop`
-/// the region branches back into, landing past the named label's resume loader
-/// with the values already in locals — but they are placed differently and they
-/// measure differently, so only this half is behind the flag.
-///
-/// A region attached to a PREAMBLE guard is admitted unconditionally: the
-/// `loop` holding the body regions' blocks has not been entered there, so
-/// `build_function` opens its blocks outside that loop and emits its body past
-/// the loop's `end`. On `str_getitem_len_hot`, whose bytes and bytearray legs
-/// fail a peeled-preamble GuardClass on every iteration, that removes 72.0M of
-/// 120.0M cross-module crossings and takes exec from 0.985s to 0.716s — 0.73x,
-/// min of 15 interleaved runs with each arm's startup floor subtracted.
-/// `spectral_norm` measures 0.95x and `fannkuch` 0.98x on the same change.
-///
-/// Loop-body non-header regions are placed outside the header `loop` (the
-/// same placement as preamble regions), so they do not tax the fall-through
-/// path. On by default; [`inline_nonheader_disable`] opts out.
-pub fn inline_nonheader_enable() {
-    INLINE_NONHEADER_ENABLED.store(true, Ordering::Relaxed);
-}
-
-/// Restore the pre-default policy: only preamble non-header regions merge.
-pub fn inline_nonheader_disable() {
-    INLINE_NONHEADER_ENABLED.store(false, Ordering::Relaxed);
-}
-
-fn inline_nonheader_enabled() -> bool {
-    INLINE_NONHEADER_ENABLED.load(Ordering::Relaxed)
-}
-
-/// Set the per-byte entry price a deferred merge must earn, from the host
-/// before guest execution, in place of [`DEFAULT_INLINE_TRIP_BYTES_FACTOR`].
-/// Zero leaves [`INLINE_TRIP_THRESHOLD`] as the whole rule.
-pub fn set_inline_trip_bytes_factor(entries_per_byte: u64) {
-    INLINE_TRIP_BYTES_FACTOR.store(entries_per_byte, Ordering::Relaxed);
-}
-
 /// The wasm loop `token` was last compiled as, when it has one. Both merge
 /// arms price themselves off its `module_bytes`.
 fn compiled_wasm_loop(token: &JitCellToken) -> Option<&CompiledWasmLoop> {
@@ -582,12 +508,6 @@ fn compiled_wasm_loop(token: &JitCellToken) -> Option<&CompiledWasmLoop> {
         .compiled
         .get()
         .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
-}
-
-/// Set the owner size above which eager merging becomes deferred, from the host
-/// before guest execution, in place of [`DEFAULT_INLINE_EAGER_MAX_BYTES`].
-pub fn set_inline_eager_max_bytes(max_bytes: u32) {
-    INLINE_EAGER_MAX_BYTES.store(max_bytes, Ordering::Relaxed);
 }
 
 /// Deferred merges waiting on their entry trip.
@@ -601,9 +521,9 @@ pub fn pending_inline_count() -> usize {
 /// A merge re-emits the whole owner, so its cost scales with the owner's size
 /// rather than the region's: cranelift charges about 0.65 ms per KB of module,
 /// while a cross-module crossing the merge removes is about 2.5 ns. Those two
-/// rates are what [`INLINE_TRIP_BYTES_FACTOR`] converts between; a bridge's
-/// entry count is a floor on the crossings removed, so the price is a floor
-/// too.
+/// rates are what [`DEFAULT_INLINE_TRIP_BYTES_FACTOR`] converts between; a
+/// bridge's entry count is a floor on the crossings removed, so the price is
+/// a floor too.
 ///
 /// [`INLINE_TRIP_THRESHOLD`] stays as the lower bound, because a fixture whose
 /// entire crossing budget is under a millisecond cannot pay back any rebuild.
@@ -612,35 +532,16 @@ pub fn pending_inline_count() -> usize {
 /// price only postpones a merge that is taken anyway, and every crossing in
 /// that window is paid for nothing. The default sits below that band.
 fn inline_trip_threshold_for(owner_module_bytes: u32) -> u64 {
-    let priced = INLINE_TRIP_BYTES_FACTOR
-        .load(Ordering::Relaxed)
-        .saturating_mul(owner_module_bytes as u64);
+    let priced = DEFAULT_INLINE_TRIP_BYTES_FACTOR.saturating_mul(owner_module_bytes as u64);
     priced.max(INLINE_TRIP_THRESHOLD)
 }
 
-/// Disable guard-to-bridge value parameters from the host before guest
-/// execution. By default, a generated guard keeps the ordinary frame recovery
-/// state for the uncompiled case, then passes its live failure values directly
-/// once a bridge table slot is present.
-pub fn bridge_params_disable() {
-    BRIDGE_PARAMS_ENABLED.store(false, Ordering::Relaxed);
-}
-
-/// Restore the default after [`bridge_params_disable`].
-pub fn bridge_params_enable() {
-    BRIDGE_PARAMS_ENABLED.store(true, Ordering::Relaxed);
-}
-
-fn bridge_params_enabled() -> bool {
-    BRIDGE_PARAMS_ENABLED.load(Ordering::Relaxed)
-}
-
-fn bridge_param_dispatch_profitable(enabled: bool, guard_count: usize) -> bool {
-    enabled && guard_count <= MAX_BRIDGE_PARAM_GUARDS
+fn bridge_param_dispatch_profitable(guard_count: usize) -> bool {
+    guard_count <= MAX_BRIDGE_PARAM_GUARDS
 }
 
 fn bridge_param_dispatch_for(guard_count: usize) -> bool {
-    bridge_param_dispatch_profitable(bridge_params_enabled(), guard_count)
+    bridge_param_dispatch_profitable(guard_count)
 }
 
 /// Read a `BRIDGE_DIAG` tally (saturating index). Surfaced to the host through
@@ -860,18 +761,20 @@ use majit_ir::{FailDescr, GcRef, InputArgRc, Op, OpRc, Value};
 /// so a retrace IS a bridge that defines its own LABEL.
 ///
 /// Returns `(label_descrs, published_descrs)`: the descr identity of every
-/// LABEL in ordinal order, and the subset actually entered into
-/// `LABEL_TARGETS`. `compile_loop` keeps the first for its own JUMP
-/// resolution; `compile_bridge` hands the second to the source loop so
-/// `Drop` retracts them.
+/// LABEL in ordinal order, and the subset whose `LabelTarget` box was
+/// stored in `resources` with its address written to
+/// `LoopTargetDescr::ll_loop_code`. `compile_loop` keeps the first for
+/// its own JUMP resolution; `compile_bridge` hands the second to the source
+/// loop so `Drop` retracts them.
 fn stamp_and_publish_label_targets(
+    resources: &mut release::LoopAsmResources,
     func_handle: u32,
     frame: codegen::FrameGeometry,
     inputargs: &[InputArgRc],
     ops: &[Op],
     bridge_entry_arity: Option<usize>,
     owner_token: u64,
-) -> (Vec<usize>, Vec<usize>) {
+) -> (Vec<usize>, Vec<majit_ir::DescrRef>) {
     // Stamp each LABEL's loop-target descr with its ordinal (0, 1, 2, …) so a
     // loop-closing bridge can recover which label its terminal JUMP targets:
     // the JUMP and the LABEL share the descr by Arc identity, so the ordinal
@@ -881,10 +784,12 @@ fn stamp_and_publish_label_targets(
     // would panic on a non-`AtomicU32` slot).
     let mut label_block_id: u32 = 0;
     let mut label_descrs: Vec<usize> = Vec::new();
+    let mut label_refs: Vec<Option<majit_ir::DescrRef>> = Vec::new();
     for op in ops.iter() {
         if op.opcode != majit_ir::OpCode::Label {
             continue;
         }
+        label_refs.push(op.getdescr());
         // Descr identity of each label, in ordinal order, so
         // `compile_bridge` can resolve which of THIS loop's labels a
         // closing JUMP targets by Arc identity (the JUMP and the LABEL
@@ -924,7 +829,7 @@ fn stamp_and_publish_label_targets(
     } else {
         0
     };
-    let mut published_descrs = Vec::new();
+    let mut published_descrs: Vec<majit_ir::DescrRef> = Vec::new();
     // A parameter entry with no fail values remains structurally `(i32) ->
     // i32`, so type-0 indirect calls may enter it. Only a nonzero parameter
     // entry is incompatible with published LABEL targets.
@@ -948,12 +853,16 @@ fn stamp_and_publish_label_targets(
             if id == 0 {
                 continue;
             }
+            let Some(descr) = label_refs[j].clone() else {
+                continue;
+            };
             if suppress_publication {
                 diag_bump(47);
             } else {
                 diag_bump(19);
                 publish_label_target(
-                    id,
+                    resources,
+                    &descr,
                     LabelTarget {
                         func_handle,
                         wide_slot,
@@ -966,7 +875,7 @@ fn stamp_and_publish_label_targets(
                         owner_token,
                     },
                 );
-                published_descrs.push(id);
+                published_descrs.push(descr);
             }
         }
     } else {
@@ -992,10 +901,13 @@ fn stamp_and_publish_label_targets(
         if publishable && suppress_publication {
             diag_bump(47);
         } else if publishable {
-            let id = label_descrs[0];
+            let descr = label_refs[0]
+                .clone()
+                .expect("publishable label has a descr");
             diag_bump(20);
             publish_label_target(
-                id,
+                resources,
+                &descr,
                 LabelTarget {
                     func_handle,
                     wide_slot,
@@ -1011,7 +923,7 @@ fn stamp_and_publish_label_targets(
                     owner_token,
                 },
             );
-            published_descrs.push(id);
+            published_descrs.push(descr);
         }
     }
 
@@ -2689,6 +2601,10 @@ pub struct WasmBackend {
     /// box so a cargo worker thread does not run MiniMark `Drop` at
     /// pthread TLS teardown.
     gc_box: Option<ActiveGcBox>,
+    /// `compile.py` `make_and_attach_done_descrs` and `pyjitpl.py`
+    /// `propagate_exception_descr`. Heap-pinned so a moved `WasmBackend`
+    /// keeps the `jf_descr` immediates compiled modules already baked.
+    pub(crate) exit_cells: std::sync::Arc<failguard::CpuExitCells>,
 }
 
 /// GC type id of the `JitFrame`. The single registration authority is `eval.rs`
@@ -3279,6 +3195,7 @@ impl WasmBackend {
             constants: indexmap::IndexMap::new(),
             vtable_offset: None,
             gc_box: None,
+            exit_cells: std::sync::Arc::new(failguard::CpuExitCells::new()),
         }
     }
 
@@ -3848,13 +3765,6 @@ impl WasmBackend {
                     diag_bump(36);
                     continue;
                 }
-                if region.external_jump.is_none()
-                    && region.outside_loop
-                    && !inline_nonheader_enabled()
-                {
-                    still.push((region, remap));
-                    continue;
-                }
                 region.outside_loop = region.outside_loop
                     || codegen::source_guard_precedes_loop_label(&candidate.ops, source_fail_index)
                     || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
@@ -3953,8 +3863,8 @@ impl WasmBackend {
                     diag_bump(32);
                 }
                 // The guard cell stays zero so the inlined region is not
-                // also dispatched. Keep LABEL_TARGETS rows: inbound JUMPs
-                // still enter the old module.
+                // also dispatched. Leave the label descr's target in place:
+                // inbound JUMPs still enter the old module.
                 return (leftover, false);
             }
             Err(error) => {
@@ -4008,9 +3918,7 @@ impl WasmBackend {
             .map(|region| codegen::guard_exit_count(&region.inputargs, &region.ops))
             .collect();
         let merged_guard_count = own_guard_count + region_guard_counts.iter().sum::<usize>();
-        if inputs.bridge_param_dispatch
-            && !bridge_param_dispatch_profitable(true, merged_guard_count)
-        {
+        if inputs.bridge_param_dispatch && !bridge_param_dispatch_profitable(merged_guard_count) {
             // compile_bridge has already published functions with the source
             // guards' parameter ABI. Flipping this flag would call those
             // functions with the frame-only type and trap. Retain the existing
@@ -4058,6 +3966,7 @@ impl WasmBackend {
         inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes.get();
         inputs.ca.home_gcmap_min_labels = compiled.used_label_homes.get();
         let mut asm_resources = release::LoopAsmResources::default();
+        asm_resources.exit_cells = Some(std::sync::Arc::clone(&self.exit_cells));
         asm_resources.bridge_cells.extend(_fresh_cells);
         inputs.ca.exit_table_base = asm_resources.alloc_exit_table(merged_guard_count) as u32;
         inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
@@ -4225,8 +4134,12 @@ impl WasmBackend {
         if install_handle != 0 && install_handle != old_handle {
             asm_resources.table_slots.push(install_handle);
         }
-        publish_exit_slots(&mut asm_resources, &guard_exits, &descrs);
-        asm_resources.label_owner = token.number;
+        publish_exit_slots(
+            &mut asm_resources,
+            &guard_exits,
+            &descrs,
+            &inputs.ca.attached,
+        );
         // Keep still-standalone bridge descriptors after the rebuilt merged
         // prefix. Adding regions grows that prefix, so every old positional
         // range moves by exactly the difference in guard-cell counts.
@@ -4274,7 +4187,8 @@ impl WasmBackend {
 
         // LABEL targets bake only the stable table slot, so restamp them for
         // this build. CA dispatch additionally carries the new finish index.
-        let (_, published_labels) = stamp_and_publish_label_targets(
+        let (_, _published_labels) = stamp_and_publish_label_targets(
+            &mut asm_resources,
             install_handle,
             compiled.frame,
             &inputs.inputargs,
@@ -4282,7 +4196,6 @@ impl WasmBackend {
             inputs.bridge_entry_arity,
             token.number,
         );
-        asm_resources.label_ids = published_labels;
         release::push_resources(token, asm_resources);
         if let Some(mut target) = target_from_token(token) {
             target.func_handle = install_handle;
@@ -4376,14 +4289,14 @@ fn has_cross_loop_terminal_jump(ops: &[Op]) -> bool {
     has_jump && codegen::find_loop_label_index(ops).is_none()
 }
 
-/// Resolve the re-entry target of a cross-loop terminal JUMP BY DESCR IDENTITY
-/// through the `LABEL_TARGETS` registry — the JUMP and its target LABEL share
-/// the loop-target descr Arc, and every compiled loop published its enterable
-/// labels there. The stamped `label_block_id` ordinal is NOT identity: a
-/// retraced loop has several sibling specializations whose start labels all
-/// carry ordinal 0, and a trace legitimately closes into a SIBLING
-/// (jump-to-existing-trace) — the registry resolves the owning module's table
-/// slot and resume key, so the tail call chains into the RIGHT loop.
+/// Resolve the re-entry target of a cross-loop terminal JUMP off the descr
+/// the JUMP holds (`LoopTargetDescr::ll_loop_code`). The JUMP and its
+/// target LABEL share that descr, and every compiled loop published its
+/// enterable labels there. The stamped `label_block_id` ordinal is NOT
+/// identity: a retraced loop has several sibling specializations whose start
+/// labels all carry ordinal 0, and a trace legitimately closes into a SIBLING
+/// (jump-to-existing-trace) — the descr names the owning module's table slot
+/// and resume key, so the tail call chains into the RIGHT loop.
 ///
 /// Decline (`None`, after tallying which question answered) when the target is
 /// unpublished (descr stripped, or its loop declined/was dropped), the JUMP
@@ -4409,17 +4322,14 @@ fn resolve_cross_loop_jump_target(
         .iter()
         .rev()
         .find(|op| op.opcode == majit_ir::OpCode::Jump);
-    let target_descr_id = closing_jump
-        .and_then(|j| j.getdescr())
-        .map(|d| std::sync::Arc::as_ptr(&d) as *const () as usize)
-        .filter(|id| *id != 0);
-    let target = target_descr_id.and_then(label_target);
+    let target_descr = closing_jump.and_then(|j| j.getdescr());
+    let target = target_descr.as_ref().and_then(label_target);
     let arity = closing_jump.map_or(0, |j| j.getarglist().len());
     match target {
         // Descr stripped, or the target label was never published.
         None => {
             diag_bump(8);
-            diag_bump(if target_descr_id.is_none() { 17 } else { 18 });
+            diag_bump(if target_descr.is_none() { 17 } else { 18 });
             None
         }
         Some(t) if arity != t.num_args => {
@@ -4812,12 +4722,14 @@ fn publish_exit_slots(
     resources: &mut release::LoopAsmResources,
     guards: &[codegen::GuardExit],
     descrs: &[Arc<WasmFailDescr>],
+    attached: &majit_backend::AttachedDescrPtrs,
 ) {
     for (index, (guard, descr)) in guards.iter().zip(descrs).enumerate() {
         fill_exit_cell(guard.descr_cell, Arc::clone(descr));
         let cell = if guard.is_finish {
-            failguard::attached_finish_exit_index(&guard.meta_descr)
-                .map(failguard::finish_descr_ptr)
+            failguard::attached_finish_exit_index(attached, &guard.meta_descr)
+                .map(|exit| failguard::finish_cell_ptr(attached, exit))
+                .filter(|cell| *cell != 0)
                 .unwrap_or(guard.descr_cell)
         } else {
             guard.descr_cell
@@ -5208,8 +5120,11 @@ impl majit_backend::Backend for WasmBackend {
             ),
         };
         let mut asm_resources = release::LoopAsmResources::default();
+        asm_resources.exit_cells = Some(std::sync::Arc::clone(&self.exit_cells));
         module_inputs.ca.exit_table_base = asm_resources.alloc_exit_table(guard_exit_count) as u32;
         module_inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
+        // `runner.rs` captures `AttachedDescrPtrs` at `compile_loop` entry.
+        module_inputs.ca.attached = self.exit_cells.descr_ptrs();
         let resume_entry = Box::new(failguard::ResumeEntry::new());
         #[cfg(target_arch = "wasm32")]
         {
@@ -5338,15 +5253,24 @@ impl majit_backend::Backend for WasmBackend {
         // the last LABEL. Computed through the same predicate codegen's wrapper
         // gates on, so the recorded field and the emitted wrapper cannot drift.
         let has_preamble = codegen::is_resumable_peeled(ops);
-        let (label_descrs, published_labels) =
-            stamp_and_publish_label_targets(func_handle, frame, inputargs, ops, None, token.number);
+        let (label_descrs, published_labels) = stamp_and_publish_label_targets(
+            &mut asm_resources,
+            func_handle,
+            frame,
+            inputargs,
+            ops,
+            None,
+            token.number,
+        );
         if func_handle != 0 {
             asm_resources.table_slots.push(func_handle);
         }
-        asm_resources.label_ids = published_labels;
-        asm_resources.label_handle = func_handle;
-        asm_resources.label_owner = token.number;
-        publish_exit_slots(&mut asm_resources, &guard_exits, &fail_descrs);
+        publish_exit_slots(
+            &mut asm_resources,
+            &guard_exits,
+            &fail_descrs,
+            &module_inputs.ca.attached,
+        );
         if let Some(cells) = bridge_cells_owner {
             asm_resources.bridge_cells.push(cells);
         }
@@ -5382,6 +5306,7 @@ impl majit_backend::Backend for WasmBackend {
             num_guard_cells: std::cell::Cell::new(guard_exits.len()),
             has_preamble,
             label_descrs,
+            published_label_descrs: published_labels,
             guard_fail_arg_advanced,
             guard_fail_arg_counts: guard_exits
                 .iter()
@@ -5397,13 +5322,9 @@ impl majit_backend::Backend for WasmBackend {
             // Retaining the snapshot costs long-lived heap for the token's
             // whole lifetime, which moves when the collector next runs and so
             // moves which iteration a back edge's eval-breaker guard bails on.
-            // Keep it only when a re-emission can actually consume it, so a run
-            // with the switches off allocates exactly what it did before.
-            reemit: std::cell::RefCell::new(
-                (entry_bridge_target.is_none() && (reemit_enabled() || inline_bridge_enabled()))
-                    .then_some(module_inputs),
-            ),
-            reemitted: std::cell::Cell::new(false),
+            // Keep it only for a loop a merge can rebuild. An entry bridge
+            // tail-calls another loop and stores none.
+            reemit: std::cell::RefCell::new(entry_bridge_target.is_none().then_some(module_inputs)),
             bridge_owned_label_targets: std::cell::RefCell::new(Vec::new()),
             ca_active: std::cell::Cell::new(false),
             ca_terminal_declined: std::cell::Cell::new(false),
@@ -5489,32 +5410,35 @@ impl majit_backend::Backend for WasmBackend {
 
     // `make_and_attach_done_descrs` — the FINISH fast path
     // needs the singletons' identity, so this backend takes the attachment
-    // instead of the trait's no-op default. Where a native backend publishes
-    // `Arc::as_ptr` to its comparison sites, a wasm frame slot holds an exit
-    // index rather than a pointer, so each singleton is bound to a reserved
-    // index in the global exit space (`failguard::FINISH_EXIT_INDEX_*`).
+    // instead of the trait's no-op default. The cell address is what a wasm
+    // frame stores in `jf_descr` (`CpuExitCells`).
     fn set_done_with_this_frame_descr_void(&mut self, descr: Arc<dyn majit_ir::Descr>) {
-        failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_VOID, descr);
+        self.exit_cells
+            .attach_finish(failguard::FINISH_EXIT_INDEX_VOID, descr);
     }
 
     fn set_done_with_this_frame_descr_int(&mut self, descr: Arc<dyn majit_ir::Descr>) {
-        failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_INT, descr);
+        self.exit_cells
+            .attach_finish(failguard::FINISH_EXIT_INDEX_INT, descr);
     }
 
     fn set_done_with_this_frame_descr_ref(&mut self, descr: Arc<dyn majit_ir::Descr>) {
-        failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_REF, descr);
+        self.exit_cells
+            .attach_finish(failguard::FINISH_EXIT_INDEX_REF, descr);
     }
 
     fn set_done_with_this_frame_descr_float(&mut self, descr: Arc<dyn majit_ir::Descr>) {
-        failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_FLOAT, descr);
+        self.exit_cells
+            .attach_finish(failguard::FINISH_EXIT_INDEX_FLOAT, descr);
     }
 
     fn set_exit_frame_with_exception_descr_ref(&mut self, descr: Arc<dyn majit_ir::Descr>) {
-        failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_EXC, descr);
+        self.exit_cells
+            .attach_finish(failguard::FINISH_EXIT_INDEX_EXC, descr);
     }
 
     fn set_propagate_exception_descr(&mut self, descr: Arc<dyn majit_ir::Descr>) {
-        failguard::attach_propagate_exception_descr(descr);
+        self.exit_cells.attach_propagate(descr);
     }
 
     fn set_next_header_pc(&mut self, header_pc: u64) {
@@ -5913,7 +5837,7 @@ impl majit_backend::Backend for WasmBackend {
         // Set by the inline block below to the owner of a merge candidate whose
         // merge waits on `INLINE_TRIP_THRESHOLD` entries into this bridge.
         let mut defer_inline: Option<(Arc<JitCellToken>, u32, bool, Option<(u64, u32)>)> = None;
-        if inline_bridge_enabled() {
+        {
             // `model.py`: a bridge compiled after `invalidate_loop`
             // starts valid, and only a later invalidation activates its
             // GUARD_NOT_INVALIDATED (`runner_test.py test_guard_not_invalidated`
@@ -5971,9 +5895,6 @@ impl majit_backend::Backend for WasmBackend {
                 // 0, so this stays a permanent out-of-line decline.
                 if inline_trip_helper_slot() != 0
                     && bridge_is_loop_closing
-                    && (resumes_at_loop_header
-                        || inline_nonheader_enabled()
-                        || region_external.is_some())
                     && let Some(owner) = original_token
                         .compiled_loop_token()
                         .and_then(|clt| clt.upgrade_loop_token())
@@ -6023,17 +5944,6 @@ impl majit_backend::Backend for WasmBackend {
                 } else if !codegen::merged_stream_has_loop_label(&candidate) {
                     diag_bump(39);
                     decline("no_loop_label");
-                } else if region_external.is_none()
-                    && !resumes_at_loop_header
-                    && !source_in_preamble
-                    && !inline_nonheader_enabled()
-                {
-                    // Resuming at the header lets a region inside the `loop`
-                    // `br` straight to it. Resuming at an earlier LABEL is
-                    // placed outside the header loop (no fall-through tax)
-                    // and is on by default.
-                    diag_bump(38);
-                    decline("not_header");
                 } else if inline_trip_helper_slot() == 0 {
                     // Nothing to defer to: without the callback published the
                     // count could never be acted on, so the bridge stays out of
@@ -6090,8 +6000,7 @@ impl majit_backend::Backend for WasmBackend {
                         || outside_loop
                         || region_external.is_some()
                         || compiled_wasm_loop(&owner).is_some_and(|loop_| {
-                            loop_.module_bytes.get()
-                                > INLINE_EAGER_MAX_BYTES.load(Ordering::Relaxed)
+                            loop_.module_bytes.get() > DEFAULT_INLINE_EAGER_MAX_BYTES
                         })
                     {
                         // compile.py::record_loop_or_bridge registers quasi-
@@ -6277,8 +6186,11 @@ impl majit_backend::Backend for WasmBackend {
             ca: ca_params,
         };
         let mut asm_resources = release::LoopAsmResources::default();
+        asm_resources.exit_cells = Some(std::sync::Arc::clone(&self.exit_cells));
         module_inputs.ca.exit_table_base = asm_resources.alloc_exit_table(guard_exit_count) as u32;
         module_inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
+        // `runner.rs` captures `AttachedDescrPtrs` at `compile_bridge` entry.
+        module_inputs.ca.attached = self.exit_cells.descr_ptrs();
         let (wasm_bytes, guard_exits, _num_ref_homes, _used_labels) =
             match codegen::build_wasm_module(&module_inputs) {
                 Ok(built) => built,
@@ -6338,7 +6250,12 @@ impl majit_backend::Backend for WasmBackend {
         // The host accepted the bridge. Only now publish its global exit
         // descriptors and attach their resume-data tracer to the source CLT;
         // a rejected module can never execute and must retain neither.
-        publish_exit_slots(&mut asm_resources, &guard_exits, &bridge_descrs);
+        publish_exit_slots(
+            &mut asm_resources,
+            &guard_exits,
+            &bridge_descrs,
+            &module_inputs.ca.attached,
+        );
         Self::register_meta_descrs(original_token, &bridge_descrs);
         // Past every path that can fail with no module published: from here the
         // probe exists and its callback owns the pending entry.
@@ -6367,6 +6284,7 @@ impl majit_backend::Backend for WasmBackend {
         // existing `first_label_at_entry` / arity guard correctly leaves that
         // label unpublished, because key 0 would re-run the work before it.
         let (_, published_label_descrs) = stamp_and_publish_label_targets(
+            &mut asm_resources,
             bridge_slot,
             source_frame,
             inputargs,
@@ -6377,9 +6295,6 @@ impl majit_backend::Backend for WasmBackend {
         if bridge_slot != 0 {
             asm_resources.table_slots.push(bridge_slot);
         }
-        asm_resources.label_ids = published_label_descrs.clone();
-        asm_resources.label_handle = bridge_slot;
-        asm_resources.label_owner = original_token.number;
         if let Some(cells) = bridge_cells_owner {
             asm_resources.bridge_cells.push(cells);
         }
@@ -6414,7 +6329,7 @@ impl majit_backend::Backend for WasmBackend {
             source_loop.bridge_owned_label_targets.borrow_mut().extend(
                 published_label_descrs
                     .into_iter()
-                    .map(|descr_id| (descr_id, bridge_slot)),
+                    .map(|descr| (descr, bridge_slot)),
             );
             if let Some(targets) = ca_targets.as_ref().filter(|_| allow_ca) {
                 // Freeze this recursion to the CA mechanism: no further bridge
@@ -6499,23 +6414,6 @@ impl majit_backend::Backend for WasmBackend {
         // block of its own.
         let block = self.asm_memory_stats.record_block(code_size, code_size);
         self.asm_memory_blocks.borrow_mut().push(block);
-
-        // The first bridge installation is the identity re-emission probe.
-        // A failed probe leaves the old module installed and must not disrupt
-        // the bridge that just became reachable.
-        if is_direct && reemit_enabled() {
-            let should_reemit = original_token
-                .compiled
-                .get()
-                .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
-                .is_some_and(|loop_| !loop_.reemitted.replace(true));
-            if should_reemit {
-                match self.reemit_loop(original_token) {
-                    Ok(()) => diag_bump(31),
-                    Err(_) => diag_bump(30),
-                }
-            }
-        }
 
         Ok(AsmInfo {
             code_addr: 0,
@@ -6713,25 +6611,23 @@ impl majit_backend::Backend for WasmBackend {
 
             // Host-buffer frame path, for an embedder that registered no
             // `JitFrame` type id: fail_index at item[0], inputs/outputs at
-            // item[1 + i], surviving Ref homes rooted across the trace. A home
-            // slot only ever holds null (entry init) or a valid GcRef
-            // (store-on-def), so forwarding is safe. No collection moves this
-            // buffer; a body reload simply reads the same stack root. The release below is
-            // straight-line and the wasm32 build is `panic=abort`, so
-            // `glue::execute` cannot unwind and leak roots.
+            // item[1 + i]. A home slot only ever holds null (entry init) or a
+            // valid GcRef (store-on-def), so forwarding is safe. No collection
+            // moves this buffer; a body reload simply reads the same stack
+            // root. The release below is straight-line and the wasm32 build is
+            // `panic=abort`, so `glue::execute` cannot unwind past the pop.
             //
-            // The buffer carries a `JitFrame` header all the same, and is
-            // published on the jitframe shadow stack for the span of the call.
-            // Rooting the homes with the active GC reaches only *that*
-            // collector. A frontend keeping a heap of its own reads the shadow
-            // stack instead -- it is the one publication point a collector that
-            // is not this one can consult -- so without the frame on it a home
-            // holding one of that heap's objects is invisible: the collector
-            // moves the object, the home keeps the address it had, and the
-            // trace resumes on a pointer into free space. The two walks forward
-            // the same slots, which a forwarding collector does idempotently:
-            // the second visit reads an address the first already took out of
-            // from-space.
+            // One root mechanism: the off-GC frame is published on the jitframe
+            // shadow stack for the span of the call, and `jf_gcmap`
+            // (`home_gcmap_ptr`) names its Ref homes. `llmodel.py`
+            // `execute_token` allocates through `malloc_jitframe` and
+            // `jitframe.py` `jitframe_trace` walks that map; dynasm `runner.rs`
+            // `execute_token` runs the same off-GC frame, pushed by the
+            // prologue (`gen_shadowstack_header`). A minor
+            // (`MiniMarkGC::minor_collection_body`) or major
+            // (`walk_stack_shaped_roots`) collection traces a
+            // `register_libc_jitframe` entry through the libc-jitframe tracer,
+            // which applies `jf_gcmap`.
             let sign = std::mem::size_of::<isize>();
             let depth = frame_size * 8 / sign;
             let alloc_size = majit_backend::jitframe::JitFrame::alloc_size(depth);
@@ -6752,11 +6648,6 @@ impl majit_backend::Backend for WasmBackend {
                 };
                 unsafe { *items.add(1 + i) = v };
             }
-            let home_base = compiled.frame.home_slot_base as usize / 8;
-            for h in 0..compiled.frame.home_slots {
-                let slot = unsafe { items.add(home_base + h) } as *mut GcRef;
-                unsafe { wasm_gc_add_root(slot) };
-            }
             majit_gc::shadow_stack::register_libc_jitframe(jf as usize);
             let saved = majit_gc::shadow_stack::push_jf(GcRef(jf as usize));
             {
@@ -6767,10 +6658,6 @@ impl majit_backend::Backend for WasmBackend {
                 }
             }
             majit_gc::shadow_stack::pop_jf_to(saved);
-            for h in 0..compiled.frame.home_slots {
-                let slot = unsafe { items.add(home_base + h) } as *mut GcRef;
-                wasm_gc_remove_root(slot);
-            }
             let fail_descr =
                 descr_at(unsafe { (*jf).jf_descr }).expect("invalid jf_descr from compiled wasm");
             // FINISH(force_token) parks this JitFrame pointer in the frame.
@@ -6984,7 +6871,7 @@ mod tests {
         let mut backend = WasmBackend::new();
         let token = JitCellToken::new(9_910_001);
         let label = majit_ir::make_loop_target_descr(70, false);
-        let label_id = std::sync::Arc::as_ptr(&label) as *const () as usize;
+        let label_kept = label.clone();
         let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let label_op = OpRc::new(majit_ir::Op::new(
             majit_ir::OpCode::Label,
@@ -7027,7 +6914,7 @@ mod tests {
             .compile_loop(&inputargs, &ops, &token)
             .expect("loop compiles");
         assert!(target_from_token(&token).is_some());
-        assert!(failguard::label_target(label_id).is_some());
+        assert!(failguard::label_target(&label_kept).is_some());
         let fail = FreeFailDescr {
             fail_index: 0,
             arg_types: vec![majit_ir::Type::Int, majit_ir::Type::Int],
@@ -7072,7 +6959,7 @@ mod tests {
 
         backend.free_loop(&token);
         assert!(token.ll_function_addr() == 0 || target_from_token(&token).is_none());
-        assert!(failguard::label_target(label_id).is_none());
+        assert!(failguard::label_target(&label_kept).is_none());
         assert!(
             token
                 .compiled_loop_token_expect()
@@ -7112,7 +6999,7 @@ mod tests {
         backend
             .compile_loop(&inputargs, &[label_op, advance, jump], &token2)
             .expect("second loop compiles");
-        assert!(failguard::label_target(label_id).is_none());
+        assert!(failguard::label_target(&label_kept).is_none());
         assert!(
             token2
                 .compiled_loop_token_expect()
@@ -7126,6 +7013,130 @@ mod tests {
                 }),
             "second compile owns a fresh gcmap"
         );
+    }
+
+    /// A closing JUMP names the label descr of a loop compiled earlier.
+    /// Freeing an unrelated loop must leave that descr's target in place
+    /// (`assembler.py` `closing_jump` reads `TargetToken._ll_loop_code`
+    /// off the JUMP, not a process-global table).
+    #[test]
+    fn closing_jump_resolves_after_unrelated_loop_is_freed() {
+        let _compile_guard = failguard::lock_cpu();
+        let mut backend = WasmBackend::new();
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let token = JitCellToken::new(9_910_101);
+        let label = majit_ir::make_loop_target_descr(80, false);
+        let label_op = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Label,
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        label_op.setdescr(label.clone());
+        let advance = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::IntAdd,
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::const_int(1)),
+            ],
+        ));
+        advance.pos().set(majit_ir::OpRef::int_op(2));
+        let guard = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::GuardTrue,
+            &[rb(majit_ir::OpRef::int_op(2))],
+        ));
+        guard.setfailargs(
+            vec![
+                rb(majit_ir::OpRef::int_op(2)),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ]
+            .into(),
+        );
+        guard.set_fail_arg_types(vec![majit_ir::Type::Int, majit_ir::Type::Int]);
+        let jump = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Jump,
+            &[
+                majit_ir::operand::Operand::from_bound_op(&advance),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        jump.setdescr(label.clone());
+        backend
+            .compile_loop(&inputargs, &[label_op, advance, guard, jump], &token)
+            .expect("first loop compiles");
+        let published = failguard::label_target(&label).expect("label published on its descr");
+
+        let other = JitCellToken::new(9_910_102);
+        let other_label = majit_ir::make_loop_target_descr(81, false);
+        let other_label_op = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Label,
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        other_label_op.setdescr(other_label.clone());
+        let other_advance = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::IntAdd,
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::const_int(1)),
+            ],
+        ));
+        other_advance.pos().set(majit_ir::OpRef::int_op(2));
+        let other_jump = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Jump,
+            &[
+                majit_ir::operand::Operand::from_bound_op(&other_advance),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        other_jump.setdescr(other_label.clone());
+        backend
+            .compile_loop(
+                &inputargs,
+                &[other_label_op, other_advance, other_jump],
+                &other,
+            )
+            .expect("unrelated loop compiles");
+        backend.free_loop(&other);
+        assert!(failguard::label_target(&other_label).is_none());
+        let still = failguard::label_target(&label).expect("earlier label survives");
+        assert_eq!(still.func_handle, published.func_handle);
+        assert_eq!(still.key, published.key);
+
+        let fail = FreeFailDescr {
+            fail_index: 0,
+            arg_types: vec![majit_ir::Type::Int, majit_ir::Type::Int],
+        };
+        let bridge_advance = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::IntAdd,
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::const_int(1)),
+            ],
+        ));
+        bridge_advance.pos().set(majit_ir::OpRef::int_op(3));
+        let bridge_jump = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Jump,
+            &[
+                majit_ir::operand::Operand::from_bound_op(&bridge_advance),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        bridge_jump.setdescr(label.clone());
+        backend
+            .compile_bridge(
+                &fail,
+                &inputargs,
+                &[bridge_advance, bridge_jump],
+                &token,
+                &[],
+                None,
+            )
+            .expect("closing JUMP still resolves the earlier label");
+        assert!(failguard::label_target(&label).is_some());
     }
 
     #[derive(Debug)]
@@ -7220,15 +7231,10 @@ mod tests {
     #[test]
     fn parameter_bridge_dispatch_is_bounded_by_guard_population() {
         let _compile_guard = failguard::lock_cpu();
-        assert!(bridge_param_dispatch_profitable(
-            true,
-            MAX_BRIDGE_PARAM_GUARDS
-        ));
+        assert!(bridge_param_dispatch_profitable(MAX_BRIDGE_PARAM_GUARDS));
         assert!(!bridge_param_dispatch_profitable(
-            true,
             MAX_BRIDGE_PARAM_GUARDS + 1
         ));
-        assert!(!bridge_param_dispatch_profitable(false, 1));
     }
 
     #[test]

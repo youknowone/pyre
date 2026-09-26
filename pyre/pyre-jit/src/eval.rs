@@ -7869,12 +7869,6 @@ fn drive_unpack_iterable_trace(
                 }
                 break;
             }
-            // `PropagateExceptionDescr.handle_fail` — `fail_index` is
-            // `u32::MAX`, so this has to run before the back-edge break.
-            if is_exception_exit {
-                pending_err = drain_error_from_exc_ref(values.first().copied().unwrap_or(0));
-                break;
-            }
             // A normal back-edge JUMP (`fail_index == u32::MAX`) or a guard exit
             // that carries no resume storage cannot be blackhole-resumed; hand
             // the rest to `ln` rather than panic in the resume decoder.
