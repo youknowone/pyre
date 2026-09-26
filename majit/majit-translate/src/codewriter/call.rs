@@ -9623,6 +9623,10 @@ pub(crate) fn get_type_flag(
         "u16" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2),
         "u8" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
         "bool" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
+        // RPython: UniChar is not an `lltype.Number`, so it lands
+        // FLAG_UNSIGNED; its storage is the 4-byte code point Rust's
+        // `char` also occupies.
+        "char" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
         // An inline `[T; N]` is N repeats of T. `get_type_flag`'s unknown-name
         // fallback would bank it as a word-sized `Ref`, so `__pos_1` of
         // `[u8; 4]` would stride 8. A GC-pointer element keeps `FLAG_POINTER`;

@@ -30776,18 +30776,24 @@ fn tyref_index_element_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l ser
 /// than 8. [`ValueType`] cannot supply it — `Unsigned` is one width-less
 /// variant spanning `u8` through `usize`.
 ///
-/// A spelling the flag table does not carry — `char` among them — is not
-/// named, and the caller leaves that site residual rather than describe it
-/// with a width nothing computed.
+/// A spelling the flag table does not carry is not named, and the caller
+/// leaves that site residual rather than describe it with a width nothing
+/// computed. `char` is carried: it is RPython's `UniChar`, a 4-byte
+/// unsigned item.
 fn json_ty_scalar_element_spelling(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
     let obj = strip_ty_indirections(node, llbc)?.as_object()?;
     let lit = obj.get("Literal")?;
-    if lit.as_str() == Some("Bool") {
-        return Some("bool".to_string());
+    match lit.as_str() {
+        Some("Bool") => return Some("bool".to_string()),
+        Some("Char") => return Some("char".to_string()),
+        _ => {}
     }
     let lit = lit.as_object()?;
     if lit.contains_key("Bool") {
         return Some("bool".to_string());
+    }
+    if lit.contains_key("Char") {
+        return Some("char".to_string());
     }
     let named = |key: &str, pairs: &[(&str, &str)]| -> Option<String> {
         let atom = lit.get(key)?.as_str()?;
@@ -31743,6 +31749,7 @@ fn reader_scalar_spelling(element: &str) -> bool {
     matches!(
         element,
         "bool"
+            | "char"
             | "u8"
             | "u16"
             | "u32"
@@ -44184,9 +44191,20 @@ mod tests {
             Some("bool")
         );
 
-        // `char` has no `get_type_flag` row, so naming it would hand the descr
-        // a width nothing computed.
-        assert_eq!(spelling(serde_json::json!({"Literal": "Char"})), None);
+        // `char` is `UniChar`: named, so the descr strides by its 4 bytes
+        // instead of the identity-less word.
+        assert_eq!(
+            spelling(serde_json::json!({"Literal": "Char"})).as_deref(),
+            Some("char")
+        );
+        assert_eq!(
+            crate::codewriter::call::get_type_flag("char"),
+            (
+                majit_ir::descr::ArrayFlag::Unsigned,
+                majit_ir::value::Type::Int,
+                4
+            )
+        );
         // A named ADT is the element itself, not a pointer to one, so its size
         // is whatever the struct is — `String` is three words.
         assert_eq!(spelling(named_adt.clone()), None);

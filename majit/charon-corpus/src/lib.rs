@@ -406,6 +406,18 @@ pub fn scalar_slot_get(v: &Vec<i64>, i: usize) -> i64 {
     }
 }
 
+/// A `char` element read at a constant index and switched on. `char` is a
+/// 4-byte unsigned item, so the index arm lowers it to an int-banked
+/// `ArrayRead` and the match switches on that int.
+#[inline(never)]
+pub fn char_slot_index(v: &Vec<char>) -> i64 {
+    if v.len() >= 2 && matches!(v[1], '<' | '>' | '=' | '^') {
+        1
+    } else {
+        0
+    }
+}
+
 // 10. Register bank of a borrowed primitive, by container.
 //
 // Three shapes one peel decision has to answer together.  The payload's own

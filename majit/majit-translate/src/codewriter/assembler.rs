@@ -3749,7 +3749,7 @@ fn type_flag_from_str(
         "i8" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 1),
         "u64" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 8),
         "usize" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word),
-        "u32" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
+        "u32" | "char" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
         "u16" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2),
         "u8" | "bool" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
         "()" => (ArrayFlag::Void, majit_ir::value::Type::Void, 0),
