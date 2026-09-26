@@ -4,7 +4,7 @@
 //! implementation intact: `_contextvars.Context` deliberately stores its
 //! bindings in this persistent map rather than in a mutable dict.
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_immutables_map",
     appleveldefs: {
         "../../../../../lib_pypy/_immutables_map.py" => ["Map"],

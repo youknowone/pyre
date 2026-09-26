@@ -82,7 +82,7 @@ fn lock_faulthandler_state() -> parking_lot::MutexGuard<'static, ()> {
     if let Some(guard) = HANDLER.state_lock.try_lock() {
         return guard;
     }
-    let blocked = crate::module::thread::before_external_block();
+    let blocked = pyre_interpreter::module::thread::before_external_block();
     let guard = HANDLER.state_lock.lock();
     drop(blocked);
     guard
@@ -188,7 +188,7 @@ unsafe fn faulthandler_dump_current_traceback(fd: i32) {
     rustpython_host_env::faulthandler::write_fd(fd, &hex[start..]);
     rustpython_host_env::faulthandler::write_fd(fd, b" (most recent call first):\n");
 
-    let ec = crate::call::getexecutioncontext();
+    let ec = pyre_interpreter::call::getexecutioncontext();
     let mut frame = if ec.is_null() {
         std::ptr::null_mut()
     } else {
@@ -196,11 +196,11 @@ unsafe fn faulthandler_dump_current_traceback(fd: i32) {
     };
     let mut depth = 0usize;
     while !frame.is_null() && depth < 100 {
-        let pycode = unsafe { (*frame).pycode as *const crate::pycode::PyCode };
+        let pycode = unsafe { (*frame).pycode as *const pyre_interpreter::pycode::PyCode };
         if pycode.is_null() || unsafe { (*pycode).code_ptr.is_null() } {
             break;
         }
-        let code = unsafe { &*((*pycode).code_ptr as *const crate::CodeObject) };
+        let code = unsafe { &*((*pycode).code_ptr as *const pyre_interpreter::CodeObject) };
         let filename = if unsafe { (*pycode).filename_bytes.is_null() } {
             code.source_path.as_bytes()
         } else {
@@ -376,14 +376,14 @@ extern "C" fn faulthandler_signal_handler(signum: libc::c_int) {
 /// nothing to own.
 fn faulthandler_get_fileno_and_file(
     w_file: pyre_object::PyObjectRef,
-) -> Result<(i32, pyre_object::PyObjectRef), crate::PyError> {
+) -> Result<(i32, pyre_object::PyObjectRef), pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let resolved = if w_file.is_null() || unsafe { pyre_object::is_none(w_file) } {
-        let sys = crate::importing::get_interpreter_sys_module()
-            .ok_or_else(|| crate::PyError::runtime_error("sys.stderr is None"))?;
-        let w_stderr = crate::baseobjspace::getattr_str(sys, "stderr")?;
+        let sys = pyre_interpreter::importing::get_interpreter_sys_module()
+            .ok_or_else(|| pyre_interpreter::PyError::runtime_error("sys.stderr is None"))?;
+        let w_stderr = pyre_interpreter::baseobjspace::getattr_str(sys, "stderr")?;
         if w_stderr.is_null() || unsafe { pyre_object::is_none(w_stderr) } {
-            return Err(crate::PyError::runtime_error(
+            return Err(pyre_interpreter::PyError::runtime_error(
                 "sys.stderr is None",
             ));
         }
@@ -391,7 +391,7 @@ fn faulthandler_get_fileno_and_file(
     } else if unsafe { pyre_object::is_int(w_file) } {
         let fd = unsafe { pyre_object::w_int_get_value(w_file) } as i32;
         if fd < 0 {
-            return Err(crate::PyError::value_error(
+            return Err(pyre_interpreter::PyError::value_error(
                 "file is not a valid file descriptor",
             ));
         }
@@ -406,10 +406,10 @@ fn faulthandler_get_fileno_and_file(
     let _ = pyre_object::gc_roots::pin_root(resolved);
     let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let resolved = pyre_object::gc_roots::shadow_stack_get(file_slot);
-    let method = crate::baseobjspace::getattr_str(resolved, "fileno")?;
-    let res = crate::call::call_function_impl_result(method, &[])?;
+    let method = pyre_interpreter::baseobjspace::getattr_str(resolved, "fileno")?;
+    let res = pyre_interpreter::call::call_function_impl_result(method, &[])?;
     if !unsafe { pyre_object::is_int(res) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "fileno() returned non-integer",
         ));
     }
@@ -419,7 +419,7 @@ fn faulthandler_get_fileno_and_file(
         // `pypy_faulthandler_enable`, and PyPy accepts a negative descriptor
         // (measured: `enable()` succeeds); 3.14 rejects it, with a message
         // naming `fileno()` to distinguish it from the direct-int arm above.
-        return Err(crate::PyError::runtime_error(
+        return Err(pyre_interpreter::PyError::runtime_error(
             "file.fileno() is not a valid file descriptor",
         ));
     }
@@ -437,16 +437,16 @@ fn faulthandler_get_fileno_and_file(
     // and on PyPy: they disagree, and 3.14 is the behaviour target).  Ignore
     // every flush failure, including an asynchronous one.
     let resolved = pyre_object::gc_roots::shadow_stack_get(file_slot);
-    let _ = crate::baseobjspace::getattr_str(resolved, "flush")
-        .and_then(|flush| crate::call::call_function_impl_result(flush, &[]));
+    let _ = pyre_interpreter::baseobjspace::getattr_str(resolved, "flush")
+        .and_then(|flush| pyre_interpreter::call::call_function_impl_result(flush, &[]));
     Ok((fd, pyre_object::gc_roots::shadow_stack_get(file_slot)))
 }
 
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    pyre_interpreter::module_ns_store(
         ns,
         "enable",
-        crate::make_builtin_function_with_signature(
+        pyre_interpreter::make_builtin_function_with_signature(
             "enable",
             |args| {
                 // `handler.py enable` — file=None, all_threads=True.
@@ -515,21 +515,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     HANDLER
                         .fd
                         .store(previous_fd, std::sync::atomic::Ordering::Relaxed);
-                    Err(crate::PyError::runtime_error(
+                    Err(pyre_interpreter::PyError::runtime_error(
                         "faulthandler.enable: sigaction failed",
                     ))
                 }
                 #[cfg(not(all(any(unix, windows), feature = "host_env")))]
                 {
                     let _ = args;
-                    Err(crate::PyError::not_implemented(
+                    Err(pyre_interpreter::PyError::not_implemented(
                         "faulthandler.enable requires host_env feature",
                     ))
                 }
             },
             // `enable(file=sys.stderr, all_threads=True, c_stack=True)` —
             // `c_stack` (3.14) selects C-stack dumping; accept and ignore it.
-            crate::Signature::new(
+            pyre_interpreter::Signature::new(
                 vec!["file", "all_threads", "c_stack"],
                 None,
                 None,
@@ -538,10 +538,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ),
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "disable",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "disable",
             |_| {
                 #[cfg(all(any(unix, windows), feature = "host_env"))]
@@ -565,10 +565,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             0,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "is_enabled",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "is_enabled",
             |_| {
                 #[cfg(all(any(unix, windows), feature = "host_env"))]
@@ -583,32 +583,32 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             0,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "dump_traceback",
-        crate::make_builtin_function("dump_traceback", |_| {
+        pyre_interpreter::make_builtin_function("dump_traceback", |_| {
             // No Python-level traceback machinery — emit a placeholder
             // so callers that want a forensic dump at least see *something*
             // instead of silent success.  Through the stderr seam, so it
             // reaches an embedder that has no fd 2 and every host gets it, not
             // just the ones with a `libc::write`.
-            crate::host_seam::emit_stderr(
+            pyre_interpreter::host_seam::emit_stderr(
                 b"<faulthandler: pyre has no Python-level traceback yet>\n",
             );
             Ok(pyre_object::w_none())
         }),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "dump_traceback_later",
-        crate::make_builtin_function("dump_traceback_later", |_| {
+        pyre_interpreter::make_builtin_function("dump_traceback_later", |_| {
             Ok(pyre_object::w_none())
         }),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "cancel_dump_traceback_later",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "cancel_dump_traceback_later",
             |_| Ok(pyre_object::w_none()),
             0,
@@ -626,15 +626,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // A name that is there but answers every call with an error is worse than
     // no name: `hasattr(faulthandler, "register")` is how its callers ask.
     #[cfg(unix)]
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "register",
-        crate::make_builtin_function_with_signature(
+        pyre_interpreter::make_builtin_function_with_signature(
             "register",
             |args| {
                 let w_signum = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 if w_signum.is_null() {
-                    return Err(crate::PyError::type_error(
+                    return Err(pyre_interpreter::PyError::type_error(
                         "register() missing signal",
                     ));
                 }
@@ -649,7 +649,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     .get(2)
                     .copied()
                     .filter(|a| !a.is_null())
-                    .map(crate::baseobjspace::gateway_int_w)
+                    .map(pyre_interpreter::baseobjspace::gateway_int_w)
                     .transpose()?
                     .unwrap_or(1)
                     != 0;
@@ -657,7 +657,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     .get(3)
                     .copied()
                     .filter(|a| !a.is_null())
-                    .map(crate::baseobjspace::gateway_int_w)
+                    .map(pyre_interpreter::baseobjspace::gateway_int_w)
                     .transpose()?
                     .unwrap_or(0)
                     != 0;
@@ -688,7 +688,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         faulthandler_user_handler,
                     )
                     .map_err(|e| {
-                        crate::PyError::os_error_with_errno(
+                        pyre_interpreter::PyError::os_error_with_errno(
                             e.raw_os_error().unwrap_or(0),
                             format!("register: {e}"),
                         )
@@ -707,12 +707,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
                     let _ = (signum, all_threads, chain);
-                    Err(crate::PyError::not_implemented(
+                    Err(pyre_interpreter::PyError::not_implemented(
                         "faulthandler.register requires host_env feature",
                     ))
                 }
             },
-            crate::Signature::new(
+            pyre_interpreter::Signature::new(
                 vec!["signum", "file", "all_threads", "chain"],
                 None,
                 None,
@@ -722,16 +722,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         ),
     );
     #[cfg(unix)]
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "unregister",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "unregister",
             |args| {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
                     if args.is_empty() {
-                        return Err(crate::PyError::type_error(
+                        return Err(pyre_interpreter::PyError::type_error(
                             "unregister() missing signal",
                         ));
                     }
@@ -758,18 +758,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // process — only ever called from test_faulthandler.py in a
     // subprocess.  Pyre cannot construct an OperationError here
     // because the abort/segfault leaves no caller to catch it.
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "_read_null",
-        crate::make_builtin_function("_read_null", |args| {
+        pyre_interpreter::make_builtin_function("_read_null", |args| {
             if args.len() > 1 {
-                return Err(crate::PyError::type_error(format!(
+                return Err(pyre_interpreter::PyError::type_error(format!(
                     "_read_null() takes at most 1 argument ({} given)",
                     args.len()
                 )));
             }
             if let Some(&release_gil) = args.first() {
-                let _ = crate::baseobjspace::int_w(release_gil)?;
+                let _ = pyre_interpreter::baseobjspace::int_w(release_gil)?;
             }
             suppress_crash_report();
             // `handler.py read_null` — null-pointer deref.
@@ -778,18 +778,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             Ok(pyre_object::w_none())
         }),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "_sigsegv",
-        crate::make_builtin_function("_sigsegv", |args| {
+        pyre_interpreter::make_builtin_function("_sigsegv", |args| {
             if args.len() > 1 {
-                return Err(crate::PyError::type_error(format!(
+                return Err(pyre_interpreter::PyError::type_error(format!(
                     "_sigsegv() takes at most 1 argument ({} given)",
                     args.len()
                 )));
             }
             if let Some(&release_gil) = args.first() {
-                let _ = crate::baseobjspace::int_w(release_gil)?;
+                let _ = pyre_interpreter::baseobjspace::int_w(release_gil)?;
             }
             suppress_crash_report();
             // `raise` is in the Windows CRT too, and `enable` installs the
@@ -802,10 +802,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             Ok(pyre_object::w_none())
         }),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "_sigfpe",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "_sigfpe",
             |_| {
                 suppress_crash_report();
@@ -828,10 +828,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             0,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "_sigabrt",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "_sigabrt",
             |_| {
                 suppress_crash_report();
@@ -850,21 +850,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     #[cfg(windows)]
     {
         for (name, code) in WINDOWS_EXCEPTIONS {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(i64::from(code)));
+            pyre_interpreter::module_ns_store(ns, name, pyre_object::w_int_new(i64::from(code)));
         }
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "_raise_exception",
-            crate::make_builtin_function("_raise_exception", |args| {
+            pyre_interpreter::make_builtin_function("_raise_exception", |args| {
                 // `_raise_exception(code, flags=0)`.
                 let Some(&w_code) = args.first() else {
-                    return Err(crate::PyError::type_error(
+                    return Err(pyre_interpreter::PyError::type_error(
                         "_raise_exception() missing required argument 'code'",
                     ));
                 };
-                let code = crate::baseobjspace::int_w(w_code)? as u32;
+                let code = pyre_interpreter::baseobjspace::int_w(w_code)? as u32;
                 let flags = match args.get(1) {
-                    Some(&w_flags) => crate::baseobjspace::int_w(w_flags)? as u32,
+                    Some(&w_flags) => pyre_interpreter::baseobjspace::int_w(w_flags)? as u32,
                     None => 0,
                 };
                 #[cfg(feature = "host_env")]
@@ -887,10 +887,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }),
         );
     }
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "_stack_overflow",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "_stack_overflow",
             |_| {
                 suppress_crash_report();

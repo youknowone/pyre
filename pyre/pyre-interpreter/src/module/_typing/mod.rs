@@ -5,7 +5,7 @@
 //! `typing.py`, while `Union` is bound to the builtin `types.UnionType`.
 //! `_idfunc` is interp-level: the identity used as `NewType.__call__`.
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_typing",
     appleveldefs: {
         "_typing_app.py" => [
@@ -28,7 +28,7 @@ crate::py_module! {
         // `_typing._idfunc(x)` surface as the one-argument case.
         "_idfunc" / * = |args| match args {
             [value] | [_, value] => Ok(*value),
-            _ => Err(crate::PyError::type_error(
+            _ => Err(pyre_interpreter::PyError::type_error(
                 "_typing._idfunc() takes exactly one argument",
             )),
         },

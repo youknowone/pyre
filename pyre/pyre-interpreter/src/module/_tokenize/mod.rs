@@ -74,7 +74,7 @@ enum TokenizerPhase {
 
 // CPython 3.14 Python/Python-tokenize.c:tokenizemodule_exec uses
 // PyType_FromModuleAndSpec; tokenizeriter_spec is immutable.
-#[crate::pyre_class("_tokenize.TokenizerIter", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_tokenize.TokenizerIter", cpython_heaptype)]
 pub struct W_TokenizerIter {
     readline: PyObjectRef,
     extra_tokens: bool,
@@ -103,16 +103,16 @@ pub unsafe fn w_tokenizer_iter_dealloc(obj: PyObjectRef) {
     unsafe { std::ptr::drop_in_place(obj as *mut W_TokenizerIter) }
 }
 
-fn read_line(self_obj: PyObjectRef) -> Result<String, crate::PyError> {
+fn read_line(self_obj: PyObjectRef) -> Result<String, pyre_interpreter::PyError> {
     let (readline, encoding) = {
         let this = W_TokenizerIter::from_obj(self_obj)
-            .ok_or_else(|| crate::PyError::type_error("invalid tokenizer iterator"))?;
+            .ok_or_else(|| pyre_interpreter::PyError::type_error("invalid tokenizer iterator"))?;
         (this.readline, this.encoding.clone())
     };
     let _roots = gc_roots::push_roots();
     let _ = gc_roots::pin_root(self_obj);
     let _ = gc_roots::pin_root(readline);
-    let raw = match crate::builtins::call_and_check(
+    let raw = match pyre_interpreter::builtins::call_and_check(
         gc_roots::shadow_stack_get(gc_roots::shadow_stack_len() - 1),
         &[],
     ) {
@@ -123,7 +123,7 @@ fn read_line(self_obj: PyObjectRef) -> Result<String, crate::PyError> {
     match encoding {
         Some(encoding) => unsafe {
             if !is_bytes(raw) {
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "readline() returned a non-bytes object",
                 ));
             }
@@ -136,18 +136,21 @@ fn read_line(self_obj: PyObjectRef) -> Result<String, crate::PyError> {
                 let mut msg =
                     rustpython_wtf8::Wtf8Buf::from_string("unknown encoding: ".to_string());
                 msg.push_wtf8(&encoding);
-                return Err(crate::PyError::new(crate::PyErrorKind::LookupError, msg));
+                return Err(pyre_interpreter::PyError::new(
+                    pyre_interpreter::PyErrorKind::LookupError,
+                    msg,
+                ));
             };
-            let decoded = crate::typedef::decode_bytes_to_wtf8(&bytes, name, "strict")?;
-            crate::typedef::utf8_strict_w(decoded)
+            let decoded = pyre_interpreter::typedef::decode_bytes_to_wtf8(&bytes, name, "strict")?;
+            pyre_interpreter::typedef::utf8_strict_w(decoded)
         },
         None => unsafe {
             if !is_str(raw) {
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "readline() returned a non-string object",
                 ));
             }
-            crate::typedef::utf8_strict_w(w_str_get_wtf8(raw).to_wtf8_buf())
+            pyre_interpreter::typedef::utf8_strict_w(w_str_get_wtf8(raw).to_wtf8_buf())
         },
     }
 }
@@ -166,7 +169,7 @@ fn prepare_tokens(self_obj: PyObjectRef) {
     this.phase = TokenizerPhase::Yielding;
 }
 
-fn tokenizer_next(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+fn tokenizer_next(self_obj: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = gc_roots::push_roots();
     let _ = gc_roots::pin_root(self_obj);
     let slot = gc_roots::shadow_stack_len() - 1;
@@ -189,43 +192,49 @@ fn tokenizer_next(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> 
                 }
             }
             TokenizerPhase::Yielding => return emit_next_token(self_obj),
-            TokenizerPhase::Done => return Err(crate::PyError::stop_iteration()),
+            TokenizerPhase::Done => return Err(pyre_interpreter::PyError::stop_iteration()),
         }
     }
 }
 
-#[crate::pyre_methods]
+#[pyre_interpreter::pyre_methods]
 impl W_TokenizerIter {
     #[staticmethod]
-    fn __new__(_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    fn __new__(
+        _cls: PyObjectRef,
+        args: &[PyObjectRef],
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+        let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
         // The descriptor ABI includes the requested class at positional[0].
         let positional = positional.get(1..).unwrap_or(&[]);
-        crate::builtins::kwarg_reject_unknown(
+        pyre_interpreter::builtins::kwarg_reject_unknown(
             kwargs,
             &["encoding", "extra_tokens"],
             "tokenizeriter",
         )?;
         if positional.len() != 1 {
-            return Err(crate::PyError::type_error(format!(
+            return Err(pyre_interpreter::PyError::type_error(format!(
                 "tokenizeriter() takes exactly 1 positional argument ({} given)",
                 positional.len()
             )));
         }
         let readline = positional[0];
-        if !crate::baseobjspace::callable_w(readline) {
-            return Err(crate::PyError::type_error("source must be callable"));
+        if !pyre_interpreter::baseobjspace::callable_w(readline) {
+            return Err(pyre_interpreter::PyError::type_error(
+                "source must be callable",
+            ));
         }
-        let w_extra = crate::builtins::kwarg_get(kwargs, "extra_tokens").ok_or_else(|| {
-            crate::PyError::type_error(
-                "tokenizeriter() missing required argument 'extra_tokens' (pos 2)",
-            )
-        })?;
-        let extra_tokens = crate::baseobjspace::is_true(w_extra)?;
-        let encoding = match crate::builtins::kwarg_get(kwargs, "encoding") {
+        let w_extra =
+            pyre_interpreter::builtins::kwarg_get(kwargs, "extra_tokens").ok_or_else(|| {
+                pyre_interpreter::PyError::type_error(
+                    "tokenizeriter() missing required argument 'extra_tokens' (pos 2)",
+                )
+            })?;
+        let extra_tokens = pyre_interpreter::baseobjspace::is_true(w_extra)?;
+        let encoding = match pyre_interpreter::builtins::kwarg_get(kwargs, "encoding") {
             Some(value) => unsafe {
                 if !is_str(value) {
-                    return Err(crate::PyError::type_error(format!(
+                    return Err(pyre_interpreter::PyError::type_error(format!(
                         "tokenizeriter() argument 'encoding' must be str, not {}",
                         type_name_of(value)
                     )));
@@ -260,12 +269,12 @@ impl W_TokenizerIter {
         args[0]
     }
 
-    fn __next__(&mut self) -> Result<PyObjectRef, crate::PyError> {
+    fn __next__(&mut self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         tokenizer_next(self as *mut W_TokenizerIter as PyObjectRef)
     }
 }
 
-fn emit_next_token(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+fn emit_next_token(self_obj: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let this = W_TokenizerIter::from_obj(self_obj).expect("TokenizerIter payload");
 
     if let Some((kind, line, col, line_str)) = this.pending_empty_fstring_middle.take() {
@@ -698,7 +707,7 @@ fn raise_indentation_error(
     error: &ParseError,
     source: &str,
     lines: &SourceLines,
-) -> crate::PyError {
+) -> pyre_interpreter::PyError {
     let start = u32::from(error.location.start()) as usize;
     let (line, _) = lines.line_col(source, start);
     let text = lines
@@ -715,13 +724,17 @@ fn raise_indentation_error(
     )
 }
 
-fn raise_lexical_error(error: &ParseError, source: &str, lines: &SourceLines) -> crate::PyError {
+fn raise_lexical_error(
+    error: &ParseError,
+    source: &str,
+    lines: &SourceLines,
+) -> pyre_interpreter::PyError {
     let start = u32::from(error.location.start()) as usize;
     let (line, column) = lines.line_col(source, start);
     raise_syntax_error(&error.error.to_string(), line, column + 1)
 }
 
-fn raise_syntax_error(message: &str, line: usize, offset: usize) -> crate::PyError {
+fn raise_syntax_error(message: &str, line: usize, offset: usize) -> pyre_interpreter::PyError {
     positioned_syntax_error("SyntaxError", message, line, offset, None)
 }
 
@@ -731,35 +744,46 @@ fn positioned_syntax_error(
     line: usize,
     offset: usize,
     text: Option<&str>,
-) -> crate::PyError {
-    let Some(class) = crate::builtins::lookup_exc_class(class_name) else {
-        return crate::PyError::syntax_error(message);
+) -> pyre_interpreter::PyError {
+    let Some(class) = pyre_interpreter::builtins::lookup_exc_class(class_name) else {
+        return pyre_interpreter::PyError::syntax_error(message);
     };
     let _roots = gc_roots::push_roots();
     let _ = gc_roots::pin_root(class);
     let _ = gc_roots::pin_root(w_str_new_managed(message));
     let base = gc_roots::shadow_stack_len() - 2;
-    let exc = match crate::builtins::call_and_check(
+    let exc = match pyre_interpreter::builtins::call_and_check(
         gc_roots::shadow_stack_get(base),
         &[gc_roots::shadow_stack_get(base + 1)],
     ) {
         Ok(exc) => exc,
-        Err(_) => return crate::PyError::syntax_error(message),
+        Err(_) => return pyre_interpreter::PyError::syntax_error(message),
     };
     let _ = gc_roots::pin_root(exc);
     let exc_slot = gc_roots::shadow_stack_len() - 1;
     for (name, value) in [("lineno", line as i64), ("offset", offset as i64)] {
         let value = w_int_new(value);
-        let _ = crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(exc_slot), name, value);
+        let _ = pyre_interpreter::baseobjspace::setattr_str(
+            gc_roots::shadow_stack_get(exc_slot),
+            name,
+            value,
+        );
     }
     for (name, value) in [("msg", message), ("filename", "<string>")] {
         let value = w_str_new_managed(value);
-        let _ = crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(exc_slot), name, value);
+        let _ = pyre_interpreter::baseobjspace::setattr_str(
+            gc_roots::shadow_stack_get(exc_slot),
+            name,
+            value,
+        );
     }
     let text_value = text.map(w_str_new_managed).unwrap_or_else(w_none);
-    let _ =
-        crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(exc_slot), "text", text_value);
-    unsafe { crate::PyError::from_exc_object(gc_roots::shadow_stack_get(exc_slot)) }
+    let _ = pyre_interpreter::baseobjspace::setattr_str(
+        gc_roots::shadow_stack_get(exc_slot),
+        "text",
+        text_value,
+    );
+    unsafe { pyre_interpreter::PyError::from_exc_object(gc_roots::shadow_stack_get(exc_slot)) }
 }
 
 fn find_fstring_middle_type(tokens: &[Token], index: usize) -> u8 {
@@ -1000,7 +1024,7 @@ const fn token_kind_value(kind: TokenKind) -> u8 {
     }
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_tokenize",
     interpleveldefs: {
         "TokenizerIter" => type_object(),
@@ -1008,8 +1032,8 @@ crate::py_module! {
 }
 
 /// The GC types this module owns, in `build_gc` registration order.
-pub(crate) fn gc_types(types: &mut Vec<crate::importing::ModuleGcType>) {
-    use crate::importing::{ModuleGcLayout, ModuleGcType};
+pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
+    use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
     use pyre_object::lltype::PyreClassPyTypeOf;
     // W_TokenizerIter owns Rust heap (source string, token / error vectors, the
     // line table); as an immortal it was never swept, but now that it is
