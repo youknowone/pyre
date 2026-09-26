@@ -1124,15 +1124,21 @@ def _first_stderr_line(stderr):
     CI log holds no other copy of the frames. The line that names the failure
     is the last one, so append it — the same reason `_jit_panic_reason`
     appends the message line that follows a Rust panic's location.
+
+    That line is the first unindented one after the banner, not the last line
+    of stderr: under `MAJIT_STATS` the JIT summary follows the traceback.
     """
-    lines = [line.strip() for line in (stderr or "").splitlines()]
-    lines = [line for line in lines if line]
-    if not lines:
+    raw = [line.rstrip() for line in (stderr or "").splitlines()]
+    raw = [line for line in raw if line.strip()]
+    if not raw:
         return ""
-    reason = lines[0][:160]
+    reason = raw[0].strip()[:160]
     banner = "Traceback (most recent call last):"
-    if len(lines) > 1 and any(line.startswith(banner) for line in lines):
-        reason += f" | {lines[-1][:400]}"
+    starts = [i for i, line in enumerate(raw) if line.strip().startswith(banner)]
+    if starts and len(raw) > 1:
+        tail = raw[starts[-1] + 1:]
+        message = next((line for line in tail if not line[0].isspace()), raw[-1])
+        reason += f" | {message.strip()[:400]}"
     return f"  {reason}"
 
 
