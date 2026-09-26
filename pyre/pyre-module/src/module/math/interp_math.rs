@@ -149,16 +149,6 @@ fn float_repr(val: f64) -> String {
 
 // ── 1-arg float→float via pymath ─────────────────────────────────────
 
-/// True when pymath's `gamma`/`lgamma` returns a finite `Ok`.
-pub fn math1_gamma_result_finite(x: f64, lgamma: bool) -> bool {
-    let result = if lgamma {
-        pymath::math::lgamma(x)
-    } else {
-        pymath::math::gamma(x)
-    };
-    matches!(result, Ok(v) if v.is_finite())
-}
-
 /// Domain pin via pymath; box the pymath success value.  The walker
 /// still descends the unboxed leaf, which recomputes the operation so
 /// the generated jitcode has a body.  crates.io pymath cannot be walked
@@ -312,272 +302,630 @@ static __majit_builtin_wrapper_target_math_sqrt:
         func: __majit_wrap_math_sqrt,
     };
 
-/// Checked-arity wrapper pointers installed by `py_module!` for the
-/// builtins the walker probes by identity.  One record, filled once at
-/// module init: `py_checked_arity_fn!` wraps each body in a non-capturing
-/// closure, so a BuiltinCode stores that wrapper rather than (for example)
-/// [`frexp`] itself.
-struct MathBuiltinWrappers {
-    log: usize,
-    cos: usize,
-    sin: usize,
-    tan: usize,
-    atan: usize,
-    exp: usize,
-    log1p: usize,
-    asin: usize,
-    acos: usize,
-    sinh: usize,
-    cosh: usize,
-    tanh: usize,
-    asinh: usize,
-    acosh: usize,
-    atanh: usize,
-    cbrt: usize,
-    exp2: usize,
-    expm1: usize,
-    erf: usize,
-    erfc: usize,
-    gamma: usize,
-    lgamma: usize,
-    ulp: usize,
-    degrees: usize,
-    radians: usize,
-    frexp: usize,
-    ldexp: usize,
-    isqrt: usize,
-    fabs: usize,
-    floor: usize,
-    ceil: usize,
-    trunc: usize,
-    isclose: usize,
-    pow: usize,
-    fmod: usize,
-    copysign: usize,
-    remainder: usize,
-    atan2: usize,
+/// One jitcode per builtin: the domain test is expanded into the function,
+/// and the leaf is a direct call. `$domain` binds the operand with `|x|`.
+macro_rules! majit_math1_gateway {
+    ($name:ident, $leaf:path, total) => {
+        majit_math1_gateway!(@emit $name, x, { return $leaf(x); });
+    };
+    ($name:ident, $leaf:path, |$x:ident| $domain:expr) => {
+        majit_math1_gateway!(@emit $name, $x, {
+            if $domain {
+                return $leaf($x);
+            }
+        });
+    };
+    (@emit $name:ident, $x:ident, $fast:stmt) => {
+        ::paste::paste! {
+            #[majit_macros::dont_look_inside]
+            fn [<$name _slow>](args: &[PyObjectRef]) -> PyResult {
+                pyre_interpreter::gateway::check_declared_positional_arity(
+                    stringify!($name),
+                    1,
+                    args,
+                )?;
+                $name(args)
+            }
+
+            /// interp_math.py `math1`: exact float, or a machine int/bool read
+            /// as `f64`. Outside the domain the original body runs.
+            pub fn [<__majit_wrap_math_ $name>](args: &[PyObjectRef]) -> PyResult {
+                if args.len() == 1 {
+                    let w_x = args[0];
+                    let $x = if unsafe {
+                        pyre_object::is_exact_builtin_instance(w_x)
+                            && pyre_object::is_float(w_x)
+                    } {
+                        Some(unsafe { pyre_object::w_float_get_value(w_x) })
+                    } else if unsafe {
+                        pyre_object::is_exact_builtin_instance(w_x)
+                            && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
+                    } {
+                        Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
+                    } else {
+                        None
+                    };
+                    if let Some($x) = $x {
+                        $fast
+                    }
+                }
+                [<$name _slow>](args)
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            #[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+            #[allow(non_upper_case_globals)]
+            static [<__majit_builtin_wrapper_target_math_ $name>]:
+                pyre_interpreter::gateway::BuiltinWrapperDescriptor =
+                pyre_interpreter::gateway::BuiltinWrapperDescriptor {
+                    path: concat!(
+                        module_path!(),
+                        "::",
+                        stringify!([<__majit_wrap_math_ $name>]),
+                    ),
+                    func: [<__majit_wrap_math_ $name>],
+                };
+        }
+    };
 }
 
-static MATH_WRAPPERS: std::sync::OnceLock<MathBuiltinWrappers> = std::sync::OnceLock::new();
+use pyre_interpreter::objspace::descroperation::{
+    _float_acos, _float_acosh, _float_asin, _float_asinh, _float_atan, _float_atanh, _float_cbrt,
+    _float_cos, _float_degrees, _float_erf, _float_erfc, _float_log, _float_log1p, _float_radians,
+    _float_sin, _float_tan, _float_tanh, _float_ulp,
+};
 
-fn math_wrapper_addr(ns: PyObjectRef, name: &str) -> usize {
-    let callable = pyre_interpreter::module_ns_get(ns, name)
-        .unwrap_or_else(|| panic!("math.{name} missing after module registration"));
-    unsafe {
-        let code = pyre_interpreter::function_get_code(callable) as PyObjectRef;
-        debug_assert!(pyre_interpreter::gateway::is_builtin_code(code));
-        pyre_interpreter::gateway::builtin_code_get(code) as usize
+majit_math1_gateway!(sin, _float_sin, |x| x.is_finite());
+majit_math1_gateway!(cos, _float_cos, |x| x.is_finite());
+majit_math1_gateway!(tan, _float_tan, |x| x.is_finite());
+majit_math1_gateway!(asin, _float_asin, |x| x >= -1.0 && x <= 1.0);
+majit_math1_gateway!(acos, _float_acos, |x| x >= -1.0 && x <= 1.0);
+majit_math1_gateway!(atan, _float_atan, |x| x.is_finite());
+majit_math1_gateway!(tanh, _float_tanh, |x| x.is_finite());
+majit_math1_gateway!(asinh, _float_asinh, |x| x.is_finite());
+majit_math1_gateway!(acosh, _float_acosh, |x| x.is_finite() && x >= 1.0);
+majit_math1_gateway!(atanh, _float_atanh, |x| x.is_finite()
+    && x > -1.0
+    && x < 1.0);
+majit_math1_gateway!(log1p, _float_log1p, |x| x.is_finite() && x > -1.0);
+majit_math1_gateway!(cbrt, _float_cbrt, total);
+majit_math1_gateway!(erf, _float_erf, total);
+majit_math1_gateway!(erfc, _float_erfc, total);
+majit_math1_gateway!(ulp, _float_ulp, total);
+majit_math1_gateway!(degrees, _float_degrees, total);
+majit_math1_gateway!(radians, _float_radians, total);
+
+/// `math1` whose leaf can overflow: call the raw `f64` sibling, and a
+/// non-finite result (the fold's result check) stays in the original body.
+/// `$guard` binds the operand and the raw result with `|x, y|`.
+macro_rules! majit_math1_raw_gateway {
+    ($name:ident, $raw:path, |$x:ident, $y:ident| $guard:expr) => {
+        ::paste::paste! {
+            #[majit_macros::dont_look_inside]
+            fn [<$name _slow>](args: &[PyObjectRef]) -> PyResult {
+                pyre_interpreter::gateway::check_declared_positional_arity(
+                    stringify!($name),
+                    1,
+                    args,
+                )?;
+                $name(args)
+            }
+
+            /// interp_math.py `math1`: exact float, or a machine int/bool read
+            /// as `f64`. A non-finite operand or raw result runs `$name`.
+            pub fn [<__majit_wrap_math_ $name>](args: &[PyObjectRef]) -> PyResult {
+                if args.len() == 1 {
+                    let w_x = args[0];
+                    let $x = if unsafe {
+                        pyre_object::is_exact_builtin_instance(w_x)
+                            && pyre_object::is_float(w_x)
+                    } {
+                        Some(unsafe { pyre_object::w_float_get_value(w_x) })
+                    } else if unsafe {
+                        pyre_object::is_exact_builtin_instance(w_x)
+                            && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
+                    } {
+                        Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
+                    } else {
+                        None
+                    };
+                    if let Some($x) = $x {
+                        if $x.is_finite() {
+                            let $y = $raw($x);
+                            if $guard {
+                                return pyre_interpreter::objspace::descroperation::_float_pos($y);
+                            }
+                        }
+                    }
+                }
+                [<$name _slow>](args)
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            #[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+            #[allow(non_upper_case_globals)]
+            static [<__majit_builtin_wrapper_target_math_ $name>]:
+                pyre_interpreter::gateway::BuiltinWrapperDescriptor =
+                pyre_interpreter::gateway::BuiltinWrapperDescriptor {
+                    path: concat!(
+                        module_path!(),
+                        "::",
+                        stringify!([<__majit_wrap_math_ $name>]),
+                    ),
+                    func: [<__majit_wrap_math_ $name>],
+                };
+        }
+    };
+}
+
+use pyre_interpreter::objspace::descroperation::{
+    _float_cosh, _float_exp, _float_exp2, _float_expm1, _float_gamma_raw, _float_lgamma_raw,
+    _float_sinh,
+};
+
+// The overflow direction is pinned before the C call rather than read off
+// its result: `ll_math` raises `OverflowError` from inside the same graph,
+// while a gateway can only hand the operand back to the slow path, which
+// must not be reachable once the call has run.  Below `709` (`1023` for the
+// base-2 form) the result is finite; the band up to the true bound stays in
+// the slow path.
+majit_math1_gateway!(exp, _float_exp, |x| x.is_finite() && x < 709.0);
+majit_math1_gateway!(exp2, _float_exp2, |x| x.is_finite() && x < 1023.0);
+majit_math1_gateway!(expm1, _float_expm1, |x| x.is_finite() && x < 709.0);
+majit_math1_gateway!(sinh, _float_sinh, |x| x > -709.0 && x < 709.0);
+majit_math1_gateway!(cosh, _float_cosh, |x| x > -709.0 && x < 709.0);
+// A pole and an overflow both come back non-finite (`NaN` / inf).
+majit_math1_raw_gateway!(gamma, _float_gamma_raw, |x, y| y.is_finite());
+majit_math1_raw_gateway!(lgamma, _float_lgamma_raw, |x, y| y.is_finite());
+
+/// interp_math.py `math2`. `$fast` binds the operands with `|x, y|` and returns on the
+/// fast arm. Two arguments are read directly; anything else is `_slow`.
+macro_rules! majit_math2_gateway {
+    ($name:ident, |$x:ident, $y:ident| $fast:block) => {
+        ::paste::paste! {
+            #[majit_macros::dont_look_inside]
+            fn [<$name _slow>](args: &[PyObjectRef]) -> PyResult {
+                pyre_interpreter::gateway::check_declared_positional_arity(
+                    stringify!($name),
+                    2,
+                    args,
+                )?;
+                $name(args)
+            }
+
+            pub fn [<__majit_wrap_math_ $name>](args: &[PyObjectRef]) -> PyResult {
+                if args.len() == 2 {
+                    let w_x = args[0];
+                    let w_y = args[1];
+                    let $x = if unsafe {
+                        pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x)
+                    } {
+                        Some(unsafe { pyre_object::w_float_get_value(w_x) })
+                    } else if unsafe {
+                        pyre_object::is_exact_builtin_instance(w_x)
+                            && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
+                    } {
+                        Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
+                    } else {
+                        None
+                    };
+                    let $y = if unsafe {
+                        pyre_object::is_exact_builtin_instance(w_y) && pyre_object::is_float(w_y)
+                    } {
+                        Some(unsafe { pyre_object::w_float_get_value(w_y) })
+                    } else if unsafe {
+                        pyre_object::is_exact_builtin_instance(w_y)
+                            && (pyre_object::is_int(w_y) || pyre_object::is_bool(w_y))
+                    } {
+                        Some(unsafe { pyre_object::w_int_get_value(w_y) } as f64)
+                    } else {
+                        None
+                    };
+                    if let (Some($x), Some($y)) = ($x, $y) {
+                        $fast
+                    }
+                }
+                [<$name _slow>](args)
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            #[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+            #[allow(non_upper_case_globals)]
+            static [<__majit_builtin_wrapper_target_math_ $name>]:
+                pyre_interpreter::gateway::BuiltinWrapperDescriptor =
+                pyre_interpreter::gateway::BuiltinWrapperDescriptor {
+                    path: concat!(
+                        module_path!(),
+                        "::",
+                        stringify!([<__majit_wrap_math_ $name>]),
+                    ),
+                    func: [<__majit_wrap_math_ $name>],
+                };
+        }
+    };
+}
+
+use pyre_interpreter::objspace::descroperation::{
+    _float_atan2, _float_copysign, _float_fmod, _float_isclose, _float_ldexp_raw, _float_pos,
+    _float_pow, _float_remainder, _int_frexp_exponent_raw, _int_from_ceil, _int_from_floor,
+    _int_from_trunc, _int_isqrt,
+};
+
+// ll_math.py `ll_math_pow` on the arm where the C call can neither overflow
+// nor leave the real line, pinned before the call for the reason `exp`
+// gives. The frexp exponent `e` of a normal finite `x` is in
+// `[-1021, 1024]` (a zero, subnormal, infinity or NaN falls outside), and
+// `|x|` lies in `[2**(e-1), 2**e)`, so `|log2(|x|)| <= |e| + 1` and
+// `|y| * (|e| + 1) < 1000` keeps the result inside the double range. A
+// negative base needs an integral `y` (below `2**53`, where the
+// float-to-int cast is exact).
+majit_math2_gateway!(pow, |x, y| {
+    let e = _int_frexp_exponent_raw(x);
+    if e >= -1021 && e <= 1024 {
+        let e_abs = if e < 0 { -e } else { e };
+        let y_abs = if y < 0.0 { -y } else { y };
+        if y_abs * ((e_abs + 1) as f64) < 1000.0
+            && (x > 0.0 || (y_abs < 9007199254740992.0 && ((y as i64) as f64) == y))
+        {
+            return _float_pow(x, y);
+        }
     }
-}
-
-/// Record the checked-arity wrapper pointers installed by `py_module!`.
-///
-/// The wrappers are immutable process code, hence a process-global
-/// `OnceLock` is the same ownership shape as pyre's other immortal runtime
-/// metadata and needs no GC rooting.
-pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
-    let _ = MATH_WRAPPERS.set(MathBuiltinWrappers {
-        log: math_wrapper_addr(ns, "log"),
-        cos: math_wrapper_addr(ns, "cos"),
-        sin: math_wrapper_addr(ns, "sin"),
-        tan: math_wrapper_addr(ns, "tan"),
-        atan: math_wrapper_addr(ns, "atan"),
-        exp: math_wrapper_addr(ns, "exp"),
-        log1p: math_wrapper_addr(ns, "log1p"),
-        asin: math_wrapper_addr(ns, "asin"),
-        acos: math_wrapper_addr(ns, "acos"),
-        sinh: math_wrapper_addr(ns, "sinh"),
-        cosh: math_wrapper_addr(ns, "cosh"),
-        tanh: math_wrapper_addr(ns, "tanh"),
-        asinh: math_wrapper_addr(ns, "asinh"),
-        acosh: math_wrapper_addr(ns, "acosh"),
-        atanh: math_wrapper_addr(ns, "atanh"),
-        cbrt: math_wrapper_addr(ns, "cbrt"),
-        exp2: math_wrapper_addr(ns, "exp2"),
-        expm1: math_wrapper_addr(ns, "expm1"),
-        erf: math_wrapper_addr(ns, "erf"),
-        erfc: math_wrapper_addr(ns, "erfc"),
-        gamma: math_wrapper_addr(ns, "gamma"),
-        lgamma: math_wrapper_addr(ns, "lgamma"),
-        ulp: math_wrapper_addr(ns, "ulp"),
-        degrees: math_wrapper_addr(ns, "degrees"),
-        radians: math_wrapper_addr(ns, "radians"),
-        frexp: math_wrapper_addr(ns, "frexp"),
-        ldexp: math_wrapper_addr(ns, "ldexp"),
-        isqrt: math_wrapper_addr(ns, "isqrt"),
-        fabs: math_wrapper_addr(ns, "fabs"),
-        floor: math_wrapper_addr(ns, "floor"),
-        ceil: math_wrapper_addr(ns, "ceil"),
-        trunc: math_wrapper_addr(ns, "trunc"),
-        isclose: math_wrapper_addr(ns, "isclose"),
-        pow: math_wrapper_addr(ns, "pow"),
-        fmod: math_wrapper_addr(ns, "fmod"),
-        copysign: math_wrapper_addr(ns, "copysign"),
-        remainder: math_wrapper_addr(ns, "remainder"),
-        atan2: math_wrapper_addr(ns, "atan2"),
-    });
-    // The generic float folds are identified the same way; they differ only in
-    // that one table entry stands for one raw helper rather than one probe fn.
-    for (name, slot) in MATH_FLOAT1_FOLDS
-        .iter()
-        .map(|fold| (fold.name, &fold.slot))
-        .chain(MATH_FLOAT2_FOLDS.iter().map(|fold| (fold.name, &fold.slot)))
-    {
-        let wrapper = math_wrapper_addr(ns, name);
-        let installed = slot.get_or_init(|| wrapper);
-        debug_assert_eq!(*installed, wrapper);
+});
+// `y != 0` is the fold's `YNonZero` pin. Both zeros compare equal.
+majit_math2_gateway!(fmod, |x, y| {
+    if x.is_finite() && y.is_finite() && y != 0.0 {
+        return _float_fmod(x, y);
     }
+});
+majit_math2_gateway!(remainder, |x, y| {
+    if x.is_finite() && y.is_finite() && y != 0.0 {
+        return _float_remainder(x, y);
+    }
+});
+// `copysign` and `atan2` are total on every exact float or machine int.
+majit_math2_gateway!(copysign, |x, y| {
+    return _float_copysign(x, y);
+});
+majit_math2_gateway!(atan2, |x, y| {
+    return _float_atan2(x, y);
+});
+
+/// `floor` / `ceil` / `trunc` on an exact float inside the signed machine
+/// range. `2**63` is the strict upper bound (`i64::MAX` is not a float).
+/// NaN, infinities, out-of-range values and non-floats stay in `_slow`.
+macro_rules! majit_math_round_gateway {
+    ($name:ident, $leaf:path) => {
+        ::paste::paste! {
+            #[majit_macros::dont_look_inside]
+            fn [<$name _slow>](args: &[PyObjectRef]) -> PyResult {
+                pyre_interpreter::gateway::check_declared_positional_arity(
+                    stringify!($name),
+                    1,
+                    args,
+                )?;
+                $name(args)
+            }
+
+            pub fn [<__majit_wrap_math_ $name>](args: &[PyObjectRef]) -> PyResult {
+                if args.len() == 1 {
+                    let w_x = args[0];
+                    if unsafe {
+                        pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x)
+                    } {
+                        let x = unsafe { pyre_object::w_float_get_value(w_x) };
+                        const SIGNED_MIN_AS_FLOAT: f64 = -9223372036854775808.0;
+                        const SIGNED_LIMIT_AS_FLOAT: f64 = 9223372036854775808.0;
+                        if x >= SIGNED_MIN_AS_FLOAT && x < SIGNED_LIMIT_AS_FLOAT {
+                            return $leaf(x);
+                        }
+                    }
+                }
+                [<$name _slow>](args)
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            #[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+            #[allow(non_upper_case_globals)]
+            static [<__majit_builtin_wrapper_target_math_ $name>]:
+                pyre_interpreter::gateway::BuiltinWrapperDescriptor =
+                pyre_interpreter::gateway::BuiltinWrapperDescriptor {
+                    path: concat!(
+                        module_path!(),
+                        "::",
+                        stringify!([<__majit_wrap_math_ $name>]),
+                    ),
+                    func: [<__majit_wrap_math_ $name>],
+                };
+        }
+    };
 }
 
-unsafe fn math_builtin_wrapper_matches(callable: PyObjectRef, expected: usize) -> bool {
+majit_math_round_gateway!(floor, _int_from_floor);
+majit_math_round_gateway!(ceil, _int_from_ceil);
+majit_math_round_gateway!(trunc, _int_from_trunc);
+
+/// Arity / keyword / domain residual of `fabs`.
+#[majit_macros::dont_look_inside]
+fn fabs_slow(args: &[PyObjectRef]) -> PyResult {
+    pyre_interpreter::gateway::check_declared_positional_arity("fabs", 1, args)?;
+    fabs(args)
+}
+
+/// interp_math.py `fabs` = `math1` of `math.fabs`. Every exact float or
+/// machine int/bool is in domain; `ll_math_fabs` raises for none of them.
+pub fn __majit_wrap_math_fabs(args: &[PyObjectRef]) -> PyResult {
+    if args.len() == 1 {
+        let w_x = args[0];
+        let x =
+            if unsafe { pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x) }
+            {
+                Some(unsafe { pyre_object::w_float_get_value(w_x) })
+            } else if unsafe {
+                pyre_object::is_exact_builtin_instance(w_x)
+                    && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
+            } {
+                Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
+            } else {
+                None
+            };
+        if let Some(x) = x {
+            return pyre_interpreter::objspace::descroperation::_float_abs(x);
+        }
+    }
+    fabs_slow(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_math_fabs:
+    pyre_interpreter::gateway::BuiltinWrapperDescriptor =
+    pyre_interpreter::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", stringify!(__majit_wrap_math_fabs)),
+        func: __majit_wrap_math_fabs,
+    };
+
+/// `log` keeps its optional base, so this residual is the original body
+/// rather than a fixed arity-1 check.
+#[majit_macros::dont_look_inside]
+fn log_slow(args: &[PyObjectRef]) -> PyResult {
+    log(args)
+}
+
+/// interp_math.py `log` = `loghelper` of one operand (`ll_math_log`) when the
+/// value is finite and strictly positive. A base, a non-positive input, or a
+/// non-machine number stays in `log`.
+pub fn __majit_wrap_math_log(args: &[PyObjectRef]) -> PyResult {
+    if args.len() == 1 {
+        let w_x = args[0];
+        let x =
+            if unsafe { pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x) }
+            {
+                Some(unsafe { pyre_object::w_float_get_value(w_x) })
+            } else if unsafe {
+                pyre_object::is_exact_builtin_instance(w_x)
+                    && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
+            } {
+                Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
+            } else {
+                None
+            };
+        if let Some(x) = x {
+            if x.is_finite() && x > 0.0 {
+                return _float_log(x);
+            }
+        }
+    }
+    log_slow(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_math_log:
+    pyre_interpreter::gateway::BuiltinWrapperDescriptor =
+    pyre_interpreter::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", stringify!(__majit_wrap_math_log)),
+        func: __majit_wrap_math_log,
+    };
+
+/// Every `math` gateway with the path its `BUILTIN_WRAPPER_DESCRIPTORS` entry
+/// carries.  wasm32 links no descriptor slice, so `publish_optional_fnaddrs`
+/// binds these paths there instead, the way `jit_fnaddr` binds the
+/// interpreter's own gateways; the descent finds the jitcode by that path.
+macro_rules! math_gateway_fnaddrs {
+    ($($name:ident),* $(,)?) => {
+        ::paste::paste! {
+            pub fn math_gateway_fnaddrs() -> Vec<(&'static str, *const ())> {
+                vec![$((
+                    concat!(module_path!(), "::__majit_wrap_math_", stringify!($name)),
+                    [<__majit_wrap_math_ $name>] as *const (),
+                )),*]
+            }
+        }
+    };
+}
+
+math_gateway_fnaddrs!(
+    sqrt, sin, cos, tan, asin, acos, atan, tanh, asinh, acosh, atanh, log1p, cbrt, erf, erfc, ulp,
+    degrees, radians, fabs, exp, exp2, expm1, sinh, cosh, gamma, lgamma, floor, ceil, trunc, isqrt,
+    log, isclose, pow, fmod, copysign, remainder, atan2, ldexp
+);
+
+/// The name of the canonical `math` builtin `callable` is, or `None` for any
+/// other value.  Only `frexp` keeps a walker fold, so it is the one name
+/// answered; a value rebound under it carries a different builtin code and
+/// answers `None`.
+pub fn math_builtin_name(callable: PyObjectRef) -> Option<&'static str> {
     unsafe {
         if callable.is_null() || !pyre_interpreter::is_function(callable) {
-            return false;
+            return None;
         }
         let code = pyre_interpreter::function_get_code(callable) as PyObjectRef;
-        !code.is_null()
+        let is_frexp = !code.is_null()
             && pyre_interpreter::gateway::is_builtin_code(code)
-            && expected == pyre_interpreter::gateway::builtin_code_get(code) as usize
+            && pyre_interpreter::gateway::builtin_code_get(code) as usize
+                == frexp as *const () as usize;
+        is_frexp.then_some("frexp")
     }
 }
 
-fn math_wrapper_is(callable: PyObjectRef, pick: fn(&MathBuiltinWrappers) -> usize) -> bool {
-    MATH_WRAPPERS
-        .get()
-        .is_some_and(|wrappers| unsafe { math_builtin_wrapper_matches(callable, pick(wrappers)) })
+/// `ldexp` off its exact arm: a zero, subnormal or non-finite `x`, an
+/// exponent outside the normal range, or a result that would round,
+/// overflow or underflow.
+#[majit_macros::dont_look_inside]
+fn ldexp_slow(args: &[PyObjectRef]) -> PyResult {
+    pyre_interpreter::gateway::check_declared_positional_arity("ldexp", 2, args)?;
+    ldexp(args)
 }
 
-pub fn is_math_log_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.log)
+/// interp_math.py `ldexp`. A bool exponent, a non-int, or an overflowing
+/// scale stays in `ldexp`.
+pub fn __majit_wrap_math_ldexp(args: &[PyObjectRef]) -> PyResult {
+    if args.len() == 2 {
+        let w_x = args[0];
+        let w_i = args[1];
+        let x =
+            if unsafe { pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x) }
+            {
+                Some(unsafe { pyre_object::w_float_get_value(w_x) })
+            } else if unsafe {
+                pyre_object::is_exact_builtin_instance(w_x)
+                    && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
+            } {
+                Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
+            } else {
+                None
+            };
+        let exp = if unsafe {
+            pyre_object::is_exact_builtin_instance(w_i)
+                && pyre_object::is_int(w_i)
+                && !pyre_object::is_bool(w_i)
+        } {
+            Some(unsafe { pyre_object::w_int_get_value(w_i) })
+        } else {
+            None
+        };
+        if let (Some(x), Some(exp)) = (x, exp) {
+            // ll_math.py `ll_math_ldexp` where scaling is exact: a normal
+            // `x` and a normal `2**exp` whose product stays normal, i.e. the
+            // frexp exponent `e` of `x` has `-1021 <= e + exp <= 1024`.
+            if x.is_finite()
+                && (x >= f64::MIN_POSITIVE || x <= -f64::MIN_POSITIVE)
+                && exp >= -1022
+                && exp <= 1023
+            {
+                let e = _int_frexp_exponent_raw(x) + exp;
+                if e >= -1021 && e <= 1024 {
+                    return _float_pos(_float_ldexp_raw(x, exp));
+                }
+            }
+        }
+    }
+    ldexp_slow(args)
 }
 
-pub fn is_math_cos_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.cos)
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_math_ldexp:
+    pyre_interpreter::gateway::BuiltinWrapperDescriptor =
+    pyre_interpreter::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", stringify!(__majit_wrap_math_ldexp)),
+        func: __majit_wrap_math_ldexp,
+    };
+
+/// `isqrt` on an exact positive machine int below `2**53`. Zero, a bool,
+/// a long and a negative stay in `isqrt`.
+#[majit_macros::dont_look_inside]
+fn isqrt_slow(args: &[PyObjectRef]) -> PyResult {
+    pyre_interpreter::gateway::check_declared_positional_arity("isqrt", 1, args)?;
+    isqrt(args)
 }
 
-pub fn is_math_sin_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.sin)
+/// app_math.py `isqrt` on a `W_IntObject` that fits an exact `f64`.
+pub fn __majit_wrap_math_isqrt(args: &[PyObjectRef]) -> PyResult {
+    if args.len() == 1 {
+        let w_n = args[0];
+        if unsafe {
+            pyre_object::is_exact_builtin_instance(w_n)
+                && pyre_object::is_int(w_n)
+                && !pyre_object::is_bool(w_n)
+        } {
+            let n = unsafe { pyre_object::w_int_get_value(w_n) };
+            const EXACT_FLOAT_INT: i64 = 1 << 53;
+            if n >= 1 && n < EXACT_FLOAT_INT {
+                return _int_isqrt(n);
+            }
+        }
+    }
+    isqrt_slow(args)
 }
 
-pub fn is_math_tan_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.tan)
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_math_isqrt:
+    pyre_interpreter::gateway::BuiltinWrapperDescriptor =
+    pyre_interpreter::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", stringify!(__majit_wrap_math_isqrt)),
+        func: __majit_wrap_math_isqrt,
+    };
+
+/// Keyword tolerances stay in `isclose`. This residual is the original body.
+#[majit_macros::dont_look_inside]
+fn isclose_slow(args: &[PyObjectRef]) -> PyResult {
+    isclose(args)
 }
 
-pub fn is_math_atan_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.atan)
+/// interp_math.py `isclose` with both tolerances defaulted, on two finite
+/// exact floats or machine ints.
+pub fn __majit_wrap_math_isclose(args: &[PyObjectRef]) -> PyResult {
+    if args.len() == 2 {
+        let w_a = args[0];
+        let w_b = args[1];
+        let a =
+            if unsafe { pyre_object::is_exact_builtin_instance(w_a) && pyre_object::is_float(w_a) }
+            {
+                Some(unsafe { pyre_object::w_float_get_value(w_a) })
+            } else if unsafe {
+                pyre_object::is_exact_builtin_instance(w_a)
+                    && (pyre_object::is_int(w_a) || pyre_object::is_bool(w_a))
+            } {
+                Some(unsafe { pyre_object::w_int_get_value(w_a) } as f64)
+            } else {
+                None
+            };
+        let b =
+            if unsafe { pyre_object::is_exact_builtin_instance(w_b) && pyre_object::is_float(w_b) }
+            {
+                Some(unsafe { pyre_object::w_float_get_value(w_b) })
+            } else if unsafe {
+                pyre_object::is_exact_builtin_instance(w_b)
+                    && (pyre_object::is_int(w_b) || pyre_object::is_bool(w_b))
+            } {
+                Some(unsafe { pyre_object::w_int_get_value(w_b) } as f64)
+            } else {
+                None
+            };
+        if let (Some(a), Some(b)) = (a, b) {
+            if a.is_finite() && b.is_finite() {
+                return _float_isclose(a, b);
+            }
+        }
+    }
+    isclose_slow(args)
 }
 
-pub fn is_math_exp_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.exp)
-}
-
-pub fn is_math_log1p_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.log1p)
-}
-
-pub fn is_math_asin_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.asin)
-}
-
-pub fn is_math_acos_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.acos)
-}
-pub fn is_math_sinh_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.sinh)
-}
-pub fn is_math_cosh_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.cosh)
-}
-pub fn is_math_tanh_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.tanh)
-}
-pub fn is_math_asinh_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.asinh)
-}
-pub fn is_math_acosh_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.acosh)
-}
-pub fn is_math_atanh_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.atanh)
-}
-pub fn is_math_cbrt_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.cbrt)
-}
-pub fn is_math_exp2_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.exp2)
-}
-pub fn is_math_expm1_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.expm1)
-}
-pub fn is_math_erf_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.erf)
-}
-pub fn is_math_erfc_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.erfc)
-}
-pub fn is_math_gamma_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.gamma)
-}
-pub fn is_math_lgamma_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.lgamma)
-}
-pub fn is_math_ulp_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.ulp)
-}
-pub fn is_math_degrees_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.degrees)
-}
-pub fn is_math_radians_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.radians)
-}
-
-/// Callable-identity probes used by the meta-trace walker.  Compare the
-/// immutable BuiltinCode function pointer rather than a module/name string
-/// so rebinding `math.frexp` or `math.ldexp` cannot enter a specialization
-/// for the old callable.
-pub fn is_math_frexp_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.frexp)
-}
-
-pub fn is_math_ldexp_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.ldexp)
-}
-
-pub fn is_math_isqrt_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.isqrt)
-}
-
-pub fn is_math_fabs_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.fabs)
-}
-
-pub fn is_math_floor_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.floor)
-}
-
-pub fn is_math_ceil_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.ceil)
-}
-
-pub fn is_math_trunc_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.trunc)
-}
-
-pub fn is_math_pow_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.pow)
-}
-pub fn is_math_fmod_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.fmod)
-}
-pub fn is_math_copysign_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.copysign)
-}
-pub fn is_math_remainder_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.remainder)
-}
-pub fn is_math_atan2_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.atan2)
-}
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_math_isclose:
+    pyre_interpreter::gateway::BuiltinWrapperDescriptor =
+    pyre_interpreter::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", stringify!(__majit_wrap_math_isclose)),
+        func: __majit_wrap_math_isclose,
+    };
 
 /// Raw counterparts of `ll_math_floor` / `ll_math_ceil` for a guarded JIT fast
 /// path.  Both are total on finite input and cannot raise, so the walker emits
@@ -591,84 +939,7 @@ pub extern "C" fn jit_math_ceil_raw(x: f64) -> f64 {
     x.ceil()
 }
 
-/// Raw, allocation-free counterparts of RPython's `ll_math_frexp` result
-/// components.  The translated PyPy trace carries the pair as two unboxed
-/// values before `space.newtuple2` virtualizes; pyre's walker emits one pure
-/// call per component because the IR has no multi-result call opcode.
-pub extern "C" fn jit_math_frexp_mantissa(x: f64) -> f64 {
-    pymath::math::frexp(x).0
-}
-
-pub extern "C" fn jit_math_frexp_exponent(x: f64) -> i64 {
-    pymath::math::frexp(x).1 as i64
-}
-
-/// Non-raising raw `ldexp` for a guarded JIT fast path.  RPython lowers
-/// `ll_math_ldexp` to the platform operation and guards its exceptional
-/// result.  On overflow, return signed infinity so the walker's finite-result
-/// guard deoptimizes and the ordinary builtin re-executes to raise
-/// `OverflowError`; successful finite/underflow results are returned exactly.
-pub extern "C" fn jit_math_ldexp_raw(x: f64, exp: i64) -> f64 {
-    if x == 0.0 || !x.is_finite() {
-        return x;
-    }
-    let Ok(exp) = i32::try_from(exp) else {
-        return if exp < 0 {
-            0.0f64.copysign(x)
-        } else {
-            f64::INFINITY.copysign(x)
-        };
-    };
-    match pymath::math::ldexp(x, exp) {
-        Ok(result) => result,
-        Err(_) => f64::INFINITY.copysign(x),
-    }
-}
-
-/// Allocation-free exact machine-integer arm of `app_math.isqrt`.
-///
-/// PyPy meta-traces the app-level implementation with an unboxed Signed when
-/// the argument is a `W_IntObject`.  The native wrapper otherwise promotes
-/// that value to `rbigint` before running the same algorithm, hiding the
-/// unboxed arm from pyre's walker.  Use a hardware square-root estimate and
-/// exact division-based corrections; the latter preserve integer semantics
-/// even where `f64` cannot represent every input.
-pub extern "C" fn jit_math_isqrt_i64(n: i64) -> i64 {
-    debug_assert!(n >= 0);
-    if n == 0 {
-        return 0;
-    }
-    let n = n as u64;
-    let mut root = (n as f64).sqrt() as u64;
-    while root < n / (root + 1) {
-        root += 1;
-    }
-    while root > n / root {
-        root -= 1;
-    }
-    root as i64
-}
-
 // ── raw helpers and identity table for the generic float folds ───────
-
-/// One entry of the walker's generic `math` fold table: the module
-/// attribute's checked-arity wrapper pointer and the raw helper that computes
-/// the same value without boxing.
-///
-/// Each helper answers exactly what the builtin body would compute for the
-/// same `f64` operands, and reports the builtin's raising directions as NaN.
-/// The walker guards the result finite, so a NaN — whether it came from a
-/// raising direction or from a genuine NaN result — resumes in the builtin
-/// and reproduces the interpreter's answer.  That makes the fold sound for
-/// every operand without the walker knowing any function's domain.
-pub struct MathFloatFold<Raw: 'static> {
-    name: &'static str,
-    slot: std::sync::OnceLock<usize>,
-    raw: Raw,
-}
-
-pub type MathFloat1Fold = MathFloatFold<extern "C" fn(f64) -> f64>;
-pub type MathFloat2Fold = MathFloatFold<extern "C" fn(f64, f64) -> f64>;
 
 macro_rules! jit_raw2 {
     ($helper:ident, $name:ident) => {
@@ -741,140 +1012,6 @@ pub extern "C" fn jit_math_fmod_raw(x: f64, y: f64) -> f64 {
     x % y
 }
 
-/// Raw `math.isclose(a, b)` with both keyword tolerances left at their
-/// defaults, `rel_tol=1e-09` and `abs_tol=0.0`.
-///
-/// Spelled out rather than delegated to `pymath::math::isclose` so that it is
-/// total: the only rejection the builtin has is a negative tolerance, which
-/// no default is, so this form has no error direction to report and the
-/// walker can read the answer as a plain truth value.  Identical operands
-/// (including two infinities of the same sign) compare close; a single
-/// infinity and any NaN do not.
-pub extern "C" fn jit_math_isclose_default(a: f64, b: f64) -> i64 {
-    const REL_TOL: f64 = 1e-09;
-    if a == b {
-        return 1;
-    }
-    if a.is_infinite() || b.is_infinite() {
-        return 0;
-    }
-    let diff = (b - a).abs();
-    i64::from(diff <= (REL_TOL * b).abs() || diff <= (REL_TOL * a).abs())
-}
-
-/// True iff `callable` is the canonical builtin `math.isclose`.
-pub fn is_math_isclose_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.isclose)
-}
-
-#[allow(unused_macros)]
-macro_rules! math_fold_table {
-    ($table:ident: $entry:ty, $($name:literal => $helper:ident),* $(,)?) => {
-        // The length is spelled out from the entry list rather than left to a
-        // slice reference: a `static` holding `&[..]` extends the temporary's
-        // lifetime, and an entry's `OnceLock` makes that temporary interior
-        // mutable, which a static borrow may not refer to.
-        static $table: [$entry; [$(stringify!($helper)),*].len()] = [
-            $(MathFloatFold {
-                name: $name,
-                slot: std::sync::OnceLock::new(),
-                raw: $helper,
-            }),*
-        ];
-    };
-}
-
-/// All one-arg float builtins now have dedicated leaves.
-static MATH_FLOAT1_FOLDS: [MathFloat1Fold; 0] = [];
-
-/// All two-arg float builtins now have dedicated leaves.
-static MATH_FLOAT2_FOLDS: [MathFloat2Fold; 0] = [];
-
-/// The wrapper pointer `py_module!` installed for `math.<name>`, or `None`
-/// for a callable that is not a builtin function.
-unsafe fn builtin_wrapper_addr(callable: PyObjectRef) -> Option<usize> {
-    unsafe {
-        if callable.is_null() || !pyre_interpreter::is_function(callable) {
-            return None;
-        }
-        let code = pyre_interpreter::function_get_code(callable) as PyObjectRef;
-        if code.is_null() || !pyre_interpreter::gateway::is_builtin_code(code) {
-            return None;
-        }
-        Some(pyre_interpreter::gateway::builtin_code_get(code) as usize)
-    }
-}
-
-/// The raw 1-arg helper for `callable`, or `None` when it is not one of the
-/// canonical `math` builtins in [`MATH_FLOAT1_FOLDS`].  A value rebound under
-/// the same name carries a different code object and declines here.
-pub fn math_float1_fold_helper(callable: PyObjectRef) -> Option<extern "C" fn(f64) -> f64> {
-    let wrapper = unsafe { builtin_wrapper_addr(callable)? };
-    MATH_FLOAT1_FOLDS
-        .iter()
-        .find(|fold| fold.slot.get() == Some(&wrapper))
-        .map(|fold| fold.raw)
-}
-
-pub fn math_float2_fold_helper(callable: PyObjectRef) -> Option<extern "C" fn(f64, f64) -> f64> {
-    let wrapper = unsafe { builtin_wrapper_addr(callable)? };
-    MATH_FLOAT2_FOLDS
-        .iter()
-        .find(|fold| fold.slot.get() == Some(&wrapper))
-        .map(|fold| fold.raw)
-}
-
-/// The name of the canonical `math` builtin `callable` is, or `None` for any
-/// other value.  A value rebound under a `math` name carries a different
-/// builtin code and answers `None`.
-pub fn math_builtin_name(callable: PyObjectRef) -> Option<&'static str> {
-    let wrapper = unsafe { builtin_wrapper_addr(callable)? };
-    let wrappers = MATH_WRAPPERS.get()?;
-    [
-        ("sqrt", wrappers.sqrt),
-        ("log", wrappers.log),
-        ("cos", wrappers.cos),
-        ("sin", wrappers.sin),
-        ("tan", wrappers.tan),
-        ("atan", wrappers.atan),
-        ("exp", wrappers.exp),
-        ("log1p", wrappers.log1p),
-        ("asin", wrappers.asin),
-        ("acos", wrappers.acos),
-        ("sinh", wrappers.sinh),
-        ("cosh", wrappers.cosh),
-        ("tanh", wrappers.tanh),
-        ("asinh", wrappers.asinh),
-        ("acosh", wrappers.acosh),
-        ("atanh", wrappers.atanh),
-        ("cbrt", wrappers.cbrt),
-        ("exp2", wrappers.exp2),
-        ("expm1", wrappers.expm1),
-        ("erf", wrappers.erf),
-        ("erfc", wrappers.erfc),
-        ("gamma", wrappers.gamma),
-        ("lgamma", wrappers.lgamma),
-        ("ulp", wrappers.ulp),
-        ("degrees", wrappers.degrees),
-        ("radians", wrappers.radians),
-        ("frexp", wrappers.frexp),
-        ("ldexp", wrappers.ldexp),
-        ("isqrt", wrappers.isqrt),
-        ("fabs", wrappers.fabs),
-        ("floor", wrappers.floor),
-        ("ceil", wrappers.ceil),
-        ("trunc", wrappers.trunc),
-        ("isclose", wrappers.isclose),
-        ("pow", wrappers.pow),
-        ("fmod", wrappers.fmod),
-        ("copysign", wrappers.copysign),
-        ("remainder", wrappers.remainder),
-        ("atan2", wrappers.atan2),
-    ]
-    .into_iter()
-    .find(|&(_, addr)| addr == wrapper)
-    .map(|(name, _)| name)
-}
 pub fn cbrt(args: &[PyObjectRef]) -> PyResult {
     math1_pymath("cbrt", args, pymath::math::cbrt, |_| {
         "math domain error".to_string()

@@ -443,7 +443,6 @@ pub fn register() {
             immortal_w_class_only_descriptors: all_immortal_w_class_only_descriptors,
             libffi_cif_shape: hook_libffi_cif_shape,
             math_builtin_name: module::math::interp_math::math_builtin_name,
-            math1_gamma_result_finite: module::math::interp_math::math1_gamma_result_finite,
         },
     );
 }
@@ -536,26 +535,12 @@ fn module_gc_types() -> Vec<pyre_interpreter::importing::ModuleGcType> {
     types
 }
 
-/// `ll_math.py` C llexternals. The front retargets the Opaque `f64`
-/// inherent methods `ll_math::f64_method_llexternal` names onto these
-/// paths; the raising `ll_math_*` wrappers stay around them.
-fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
+/// `ll_math.py` C llexternals as `(module path, root path, address)`: the
+/// Opaque `f64` inherent methods `ll_math::f64_method_llexternal` names are
+/// retargeted onto these paths.
+fn ll_math_llexternals() -> [(&'static str, &'static str, *const ()); 27] {
     use module::math::interp_math as math;
-
-    fn pair(
-        entries: &mut Vec<(&'static str, i64)>,
-        module_path: &'static str,
-        root_path: &'static str,
-        fnptr: *const (),
-    ) {
-        let addr = fnptr as usize as i64;
-        if addr != 0 {
-            entries.push((module_path, addr));
-            entries.push((root_path, addr));
-        }
-    }
-
-    for (module_path, root_path, fnptr) in [
+    [
         (
             "ll_math::math_hypot",
             "math_hypot",
@@ -691,7 +676,29 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
             "math_fmod",
             math::jit_math_fmod_raw as *const (),
         ),
-    ] {
+    ]
+}
+
+/// `ll_math.py` C llexternals. The front retargets the Opaque `f64`
+/// inherent methods `ll_math::f64_method_llexternal` names onto these
+/// paths; the raising `ll_math_*` wrappers stay around them.
+fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
+    use module::math::interp_math as math;
+
+    fn pair(
+        entries: &mut Vec<(&'static str, i64)>,
+        module_path: &'static str,
+        root_path: &'static str,
+        fnptr: *const (),
+    ) {
+        let addr = fnptr as usize as i64;
+        if addr != 0 {
+            entries.push((module_path, addr));
+            entries.push((root_path, addr));
+        }
+    }
+
+    for (module_path, root_path, fnptr) in ll_math_llexternals() {
         pair(entries, module_path, root_path, fnptr);
     }
 
@@ -700,6 +707,11 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         if addr != 0 {
             entries.push((path, addr));
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    for (path, fnptr) in math::math_gateway_fnaddrs() {
+        single(entries, path, fnptr);
     }
 
     // `%` over two floats: `lloperation.py` has no `float_mod`, so the

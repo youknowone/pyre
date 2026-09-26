@@ -601,9 +601,6 @@ pub struct OptionalModuleHooks {
     pub libffi_cif_shape: unsafe fn(usize) -> Option<LibffiCifShape>,
     /// The name of the canonical `math` builtin a callable is, if any.
     pub math_builtin_name: fn(PyObjectRef) -> Option<&'static str>,
-    /// Whether `math.gamma` (or `lgamma` when the flag is set) is finite at
-    /// the argument.
-    pub math1_gamma_result_finite: fn(f64, bool) -> bool,
 }
 
 static OPTIONAL_MODULE_HOOKS: std::sync::OnceLock<OptionalModuleHooks> = std::sync::OnceLock::new();

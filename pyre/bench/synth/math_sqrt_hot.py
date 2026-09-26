@@ -2,7 +2,7 @@
 # Ubuntu run 33279264115: 0.2-0.3x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # The ceiling sits between the two measured states: folded this runs 0.1x
-# pypy, and with `math_isqrt` suppressed it runs about 2.1x.
+# pypy, and with the `isqrt` gateway's fast arm suppressed it runs about 2.1x.
 # pyre-check: skip-cpython
 # cpython 3.46s vs pyre 0.29s (11.9x on the ubuntu runner), and it is not
 # gated on — only pypy is.
@@ -16,8 +16,8 @@
 # two guards, so the result `W_FloatObject` virtualizes.  A negative /
 # non-finite argument takes the `dont_look_inside` slow path.
 #
-# `math.isqrt(i)`: `try_walker_specialize_math_isqrt` turns the call into the
-# elidable integer body.  Suppressing that one fold alone measures 20.2x here
+# `math.isqrt(i)`: `__majit_wrap_math_isqrt` walks `_int_isqrt` for an exact
+# positive machine int below `2**53`.  Suppressing that fast arm measures 20.2x here
 # (0.097s -> 1.961s), so a regression that loses it walks straight through the
 # ceiling below.  Loosen the ceiling if the machine gets slower; do not drop
 # the loop.

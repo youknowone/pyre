@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=1.8
-# pyre-check: spec-folds=math_ceil,math_fabs,math_float1,math_float2,math_floor,math_isclose,math_log_trig,math_trunc,float_call
+# pyre-check: spec-folds=float_call
 # pyre-check: skip-cpython
 # This fixture carried a wasm allowance of 13, fitted to a darwin-arm64
 # reading of 8.1-9.0x.  Most of that was the host crossing: `isclose`, `frexp`
@@ -28,21 +28,18 @@
 #   sqrt         `__majit_wrap_math_sqrt` descent — `x >= 0` and `isfinite(x)`
 #                pin the two `ll_math_sqrt` branches, then `_float_sqrt`
 #                (`sqrt_nonneg`) with no result guard.
-#   log/cos/sin  `try_walker_specialize_math_log_trig` — same shape, one
-#                domain guard each.
-#   fabs         `try_walker_specialize_math_fabs` — a single `FloatAbs`;
-#                `fabs` raises for no input, so it carries no domain guard.
-#   floor/ceil/  `try_walker_specialize_math_round_to_int` — guard the operand
-#   trunc        into the signed machine range, round, `CastFloatToInt`.
-#   isclose      `try_walker_specialize_math_isclose` — one pure `CALL_I`
-#                into a total helper, whose truth the branch's own guard
-#                already pins, so it carries no result guard.
-#   the rest     `try_walker_specialize_math_float{1,2}` — one pure elidable
-#                `CALL_F` into the function's raw helper plus a finite-result
-#                guard.  The helper reports every raising direction as NaN, so
-#                the guard alone carries the domain: `exp` overflowing,
-#                `atanh` outside (-1, 1) and `pow(0.0, -2.0)` all resume in
-#                the builtin and raise there.
+#   log/cos/sin  `__majit_wrap_math_{log,cos,sin}` descent — one domain guard
+#                each (`x > 0` for `log`, `isfinite` for `cos`/`sin`), then
+#                `_float_log` / `_float_cos` / `_float_sin`.
+#   fabs         `__majit_wrap_math_fabs` descent — `_float_abs` with no
+#                domain guard. `fabs` raises for no input.
+#   floor/ceil/  `__majit_wrap_math_{floor,ceil,trunc}` — an exact float inside
+#   trunc        the signed machine range, then `_int_from_{floor,ceil,trunc}`.
+#   isclose      `__majit_wrap_math_isclose` — two finite operands and the
+#                default tolerances, then `_float_isclose`.
+#   the rest     `__majit_wrap_math_{exp,pow,...}` — the raw leaf, and a
+#                non-finite result (overflow, `pow(0.0, -2.0)`) stays in the
+#                original body.
 #
 # A rebound callable, a numeric subclass, or an operand outside the folded
 # domain keeps the residual in every case.
