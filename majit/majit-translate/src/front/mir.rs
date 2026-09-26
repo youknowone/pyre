@@ -22337,10 +22337,9 @@ impl<'a> Lowering<'a> {
     /// rtype_add` emits `int_add` with no overflow check, and `int_add`
     /// wraps (`rarithmetic.py intmask` semantics) — so the wrapping
     /// method IS the plain llop.  A narrower receiver lowers to that word
-    /// op followed by a truncation back to its width — an `and` mask for
-    /// an unsigned receiver, an `lshift`/`rshift` pair for a signed one —
-    /// the way `rint.py` casts a narrow repr's result back with
-    /// `cast_primitive`.
+    /// op followed by a truncation back to its width — `int_and` for an
+    /// unsigned target, `int_signext` for a signed one — the way `rint.py`
+    /// `cast_primitive` and `jtransform.py` `_int_to_int_cast` narrow.
     ///
     /// Both integer banks count, the lesson [`vec_index_type_is_scalar`]
     /// already carries: `usize` serializes as `{"UInt": "Usize"}`, which
@@ -22565,8 +22564,9 @@ impl<'a> Lowering<'a> {
             && crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes);
         // Only `wrapping_{add,sub,mul}` widen a receiver narrower than the
         // word: the word op, then a truncation back (`rint.py`
-        // `cast_primitive`). `div` / `rem` / `shl` / `shr` keep the
-        // word-only gate.
+        // `cast_primitive`, `jtransform.py` `_int_to_int_cast`: `int_and`
+        // for an unsigned target, `int_signext` for a signed one).
+        // `div` / `rem` / `shl` / `shr` keep the word-only gate.
         let narrow_truncation = bits < word_bits
             && matches!(
                 leaf.as_str(),
@@ -22657,25 +22657,16 @@ impl<'a> Lowering<'a> {
             });
             masked
         } else if narrow_truncation {
-            let shift_amt = i64::from(word_bits - bits);
-            let shift = self
+            // `jtransform.py` `_int_to_int_cast`: signed narrow target is
+            // `int_signext(v, nbytes)` with `nbytes = size2` in bytes.
+            // The front spells the leaf the way `"and"` becomes `int_and`.
+            let nbytes = i64::from(bits / 8);
+            let width = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(shift.clone()),
-                kind: OpKind::ConstInt(shift_amt),
-            });
-            let shifted = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(shifted.clone()),
-                kind: OpKind::BinOp {
-                    op: "lshift".to_string(),
-                    lhs: res,
-                    rhs: shift.clone(),
-                    result_ty: result_ty.clone(),
-                },
+                result: Some(width.clone()),
+                kind: OpKind::ConstInt(nbytes),
             });
             let extended = self
                 .graph
@@ -22683,9 +22674,9 @@ impl<'a> Lowering<'a> {
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(extended.clone()),
                 kind: OpKind::BinOp {
-                    op: "rshift".to_string(),
-                    lhs: shifted,
-                    rhs: shift,
+                    op: "signext".to_string(),
+                    lhs: res,
+                    rhs: width,
                     result_ty,
                 },
             });
@@ -46494,7 +46485,6 @@ mod tests {
         let graph =
             super::lower_function(&llbc, "wrapping_add_i32").expect("lower i32::wrapping_add");
         let ops = graph_ops(&graph);
-        let shift_amt = (crate::layout::target_word_size() as i64) * 8 - 32;
         assert!(
             ops.iter()
                 .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
@@ -46502,29 +46492,25 @@ mod tests {
         );
         assert!(
             ops.iter().any(|op| match &op.kind {
-                OpKind::BinOp { op, rhs, .. } if op == "lshift" => {
-                    rhs_defined_by(
-                        &ops,
-                        rhs,
-                        |kind| matches!(kind, OpKind::ConstInt(n) if *n == shift_amt),
-                    )
+                OpKind::BinOp { op, rhs, .. } if op == "signext" => {
+                    rhs_defined_by(&ops, rhs, |kind| matches!(kind, OpKind::ConstInt(4)))
                 }
                 _ => false,
             }),
-            "i32::wrapping_add must lshift by word_bits - 32; ops={ops:?}"
+            "i32::wrapping_add must signext by 4 bytes; ops={ops:?}"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "signext"))
+                .count(),
+            1,
+            "i32::wrapping_add must emit one signext; ops={ops:?}"
         );
         assert!(
-            ops.iter().any(|op| match &op.kind {
-                OpKind::BinOp { op, rhs, .. } if op == "rshift" => {
-                    rhs_defined_by(
-                        &ops,
-                        rhs,
-                        |kind| matches!(kind, OpKind::ConstInt(n) if *n == shift_amt),
-                    )
-                }
-                _ => false,
+            !ops.iter().any(|op| {
+                matches!(&op.kind, OpKind::BinOp { op, .. } if op == "lshift" || op == "rshift")
             }),
-            "i32::wrapping_add must rshift by word_bits - 32; ops={ops:?}"
+            "i32::wrapping_add must not lshift/rshift; ops={ops:?}"
         );
         assert!(
             call_leafs(&ops).is_empty(),

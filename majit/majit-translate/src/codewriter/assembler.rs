@@ -5544,6 +5544,49 @@ mod tests {
     }
 
     #[test]
+    fn front_signext_binop_encodes_as_int_signext_ii() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("signext_i32");
+        let value = push_input_var(&mut graph, "value", ValueType::Int);
+        let nbytes = push_input_var(&mut graph, "nbytes", ValueType::Int);
+        let extended = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "signext".into(),
+                    lhs: value.clone(),
+                    rhs: nbytes.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(extended.clone()));
+        FunctionGraph::set_concretetype_of_inline(&value, crate::model::ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&nbytes, crate::model::ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&extended, crate::model::ConcreteType::Signed);
+
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            asm.insns.contains_key("int_signext/ii>i"),
+            "front signext BinOp must encode as int_signext/ii>i, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        let byte = *asm.insns.get("int_signext/ii>i").expect("int_signext/ii>i");
+        assert_eq!(byte, crate::insns::BC_INT_SIGNEXT);
+        assert!(
+            body.code.contains(&byte),
+            "assembled code must contain the int_signext opcode byte"
+        );
+    }
+
+    #[test]
     fn canonical_int_binop_is_not_double_prefixed() {
         let lhs = crate::flowspace::model::Variable::new();
         let rhs = crate::flowspace::model::Variable::new();
