@@ -561,6 +561,34 @@ pub fn bool_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     SomeValue::Bool(r)
 }
 
+/// `bool(disc)` of an enum `__discriminant` read (`SomeFloat.bool`, which
+/// `SomeInteger` inherits) keeps its per-tag variant narrowing, the way
+/// `SomeBool.bool` returns `self` and keeps its `knowntypedata`
+/// (unaryop.py): the `False` arm is tag `0`, the
+/// `True` arm every other tag, refined to the union of their variants
+/// (`merge_knowntypedata`).  The tag-keyed table is pyre's own (enum
+/// discriminant narrowing, see `SomeInstance.getattr("__discriminant")`);
+/// without this a two-variant `match` lowered to `set_branch` reads the
+/// variant payload off the unrefined base class.
+fn bool_of_discriminant_knowntypedata(
+    discriminant_ktd: &super::model::KnownTypeData,
+) -> super::model::KnownTypeData {
+    let mut knowntypedata = super::model::KnownTypeData::new();
+    for (case, constraints) in discriminant_ktd {
+        let ExitCaseKey::Int(tag) = case else {
+            continue;
+        };
+        let key = ExitCaseKey::Bool(*tag != 0);
+        let mut arm = super::model::KnownTypeData::new();
+        arm.insert(key, constraints.clone());
+        if *tag != 0 && knowntypedata.contains_key(&key) {
+            arm = super::model::merge_knowntypedata(&knowntypedata, &arm);
+        }
+        knowntypedata.extend(arm);
+    }
+    knowntypedata
+}
+
 #[allow(non_snake_case)]
 pub fn simple_call_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeValue> {
     // Mirror RPython `unaryop.py:114-118`:
@@ -1026,7 +1054,13 @@ fn init_somefloat_overrides(
                         Some(Constant::new(ConstValue::Bool(f64::from_bits(bits) != 0.0)));
                     return SomeValue::Bool(r);
                 }
-                SomeValue::Bool(SomeBool::new())
+                let mut r = SomeBool::new();
+                if let SomeValue::Integer(s_int) = &s
+                    && let Some(discriminant_ktd) = &s_int.knowntypedata
+                {
+                    r.set_knowntypedata(bool_of_discriminant_knowntypedata(discriminant_ktd));
+                }
+                SomeValue::Bool(r)
             }),
             can_only_throw: CanOnlyThrow::Absent,
         },
@@ -5476,6 +5510,37 @@ mod tests {
             SomeValue::String(s) => assert!(!s.inner.can_be_none),
             other => panic!("expected SomeString refinement, got {other:?}"),
         }
+    }
+
+    /// `bool(disc)` of a two-variant discriminant narrows the receiver to
+    /// the tag-0 variant on `False` and the tag-1 variant on `True`.
+    #[test]
+    fn bool_of_a_discriminant_keeps_the_variant_narrowing() {
+        let recv = Rc::new(Variable::named("shell"));
+        let s_ok = SomeValue::String(SomeString::new(false, false));
+        let s_err = SomeValue::Integer(SomeInteger::default());
+        let mut ktd = super::super::model::KnownTypeData::new();
+        add_knowntypedata(
+            &mut ktd,
+            ExitCaseKey::Int(0),
+            std::slice::from_ref(&recv),
+            s_ok.clone(),
+        );
+        add_knowntypedata(
+            &mut ktd,
+            ExitCaseKey::Int(1),
+            std::slice::from_ref(&recv),
+            s_err.clone(),
+        );
+        let mut s_disc = SomeInteger::new(true, false);
+        s_disc.set_knowntypedata(ktd);
+        let (hl, ann) = hl1(OpKind::Bool, SomeValue::Integer(s_disc));
+        let SomeValue::Bool(b) = hl.consider(&ann).unwrap().unwrap() else {
+            panic!("expected SomeBool");
+        };
+        let ktd = b.knowntypedata.expect("knowntypedata must be populated");
+        assert_eq!(ktd[&ExitCaseKey::Bool(false)][&recv], s_ok);
+        assert_eq!(ktd[&ExitCaseKey::Bool(true)][&recv], s_err);
     }
 
     #[test]
