@@ -1905,12 +1905,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `&[PyObjectRef]` as the `object_ref_gcarray` its aggregate built.
     cpa1(
         &mut entries,
-        "pyre_object::gc_roots::publish_roots",
-        "pyre_object::publish_roots",
-        pyre_object::gc_roots::publish_roots_jit_abi,
-    );
-    cpa1(
-        &mut entries,
         "pyre_object::gc_roots::pin_roots",
         "pyre_object::pin_roots",
         pyre_object::gc_roots::pin_roots_jit_abi,
