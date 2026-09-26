@@ -1365,6 +1365,9 @@ pub fn materialize_gccache_owned_descrs() {
 /// exit `3221226505` (`STATUS_STACK_BUFFER_OVERRUN`). A spawned thread's
 /// stack is empty, which is the same room a Linux main thread has at boot.
 /// `clone` is refused after seccomp; that path decodes on the caller.
+///
+/// Collector tids stay on this thread. `gc_op` is the GIL-backed borrow
+/// of `malloc_fast` (`framework.py`); the helper thread does not hold it.
 fn decode_kind0_descrs_off_caller_stack() {
     let spawned = std::thread::Builder::new()
         .name("gccache-kind0".into())
@@ -1402,7 +1405,6 @@ fn decode_kind0_descrs() {
         ));
         crate::descr::make_descr_from_bh(&bh);
     }
-    register_synthetic_struct_tids();
 }
 
 /// Stamp collector tids onto synthetic struct `SizeDescr`s.
