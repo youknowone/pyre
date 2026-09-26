@@ -1846,11 +1846,6 @@ impl GcRewriterImpl {
         result_pos: OpRef,
         st: &mut RewriteState<'_>,
     ) -> Option<Operand> {
-        // `CallMallocNurseryVarsize` reserves a `GcHeader`. A headerless
-        // nursery has nowhere to put it, so the caller takes `malloc_fixedsize`.
-        if self.headerless_fixedsize {
-            return None;
-        }
         let ad = arraydescr
             .as_array_descr()
             .expect("gen_malloc_nursery_varsize descr must be ArrayDescr");
@@ -1873,10 +1868,14 @@ impl GcRewriterImpl {
         st.emitting_an_operation_that_can_collect();
         let kind_ref = st.const_int(kind);
         let itemsize_ref = st.const_int(ad.item_size() as i64);
-        let varsize_op = mk_op(
-            OpCode::CallMallocNurseryVarsize,
-            &[kind_ref, itemsize_ref, v_length],
-        );
+        // Headerless: same args and descr, no `GcHeader` in the bump.
+        // `CallMallocNurseryVarsize` still stamps a tid before the payload.
+        let opcode = if self.headerless_fixedsize {
+            OpCode::CallMallocNurseryVarsizeHeaderless
+        } else {
+            OpCode::CallMallocNurseryVarsize
+        };
+        let varsize_op = mk_op(opcode, &[kind_ref, itemsize_ref, v_length]);
         varsize_op.setdescr(arraydescr);
         // rewrite.py:863-866, said out loud because the fixed-size sibling
         // does the opposite and the difference is one absent call:
@@ -4544,6 +4543,32 @@ mod tests {
             .unwrap();
         // rewrite.py:858: [ConstInt(kind), ConstInt(itemsize), v_length]
         assert_eq!(varsize.arg(2).to_opref(), length_ref);
+    }
+
+    /// Headerless nurseries use `CallMallocNurseryVarsizeHeaderless`:
+    /// the same length/itemsize args, and no `GcHeader` in the bump.
+    #[test]
+    fn test_headerless_new_array_uses_headerless_varsize() {
+        let mut rw = make_rewriter();
+        rw.headerless_fixedsize = true;
+        let length_ref = OpRef::int_op(100);
+        let ops = vec![Op::with_descr(
+            OpCode::NewArray,
+            &[ro(length_ref)],
+            array_descr_int(),
+        )];
+        let result = rw.rewrite_ops(&ops);
+        assert!(
+            result
+                .iter()
+                .any(|o| o.opcode == OpCode::CallMallocNurseryVarsizeHeaderless),
+            "headerless NEW_ARRAY must emit CallMallocNurseryVarsizeHeaderless, got {result:?}"
+        );
+        assert!(
+            !result
+                .iter()
+                .any(|o| o.opcode == OpCode::CallMallocNurseryVarsize)
+        );
     }
 
     #[test]

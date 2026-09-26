@@ -8596,6 +8596,13 @@ fn build_function(
                     );
                 }
             }
+            // Wasm does not install a headerless allocator.
+            OpCode::CallMallocNurseryVarsizeHeaderless => {
+                return Err(BackendError::Unsupported(format!(
+                    "wasm codegen: unhandled opcode {:?}",
+                    op.opcode
+                )));
+            }
             OpCode::CallMallocNurseryVarsize => {
                 // x86 `malloc_cond_varsize`: bump `nursery_free` by the
                 // 8-aligned `length * itemsize + basesize + header` when the

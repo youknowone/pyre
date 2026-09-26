@@ -3669,7 +3669,10 @@ impl<'a> AssemblerARM64<'a> {
             }
             // aarch64/assembler.py malloc_cond_varsize
             // arglocs = [lengthloc, imm(itemsize), imm(kind)]
-            OpCode::CallMallocNurseryVarsize => {
+            OpCode::CallMallocNurseryVarsize | OpCode::CallMallocNurseryVarsizeHeaderless => {
+                // Headerless allocators have no `GcHeader` and do not collect
+                // on the overflow path. Cranelift and wasm do not install one.
+                let headerless = op.opcode == OpCode::CallMallocNurseryVarsizeHeaderless;
                 let (base_size, type_id) = op
                     .with_array_descr(|ad| (ad.base_size(), ad.type_id()))
                     .expect("CallMallocNurseryVarsize requires an ArrayDescr");
@@ -3693,12 +3696,21 @@ impl<'a> AssemblerARM64<'a> {
                 // `maxlength = (max_size_of_young_obj - WORD * 2) / itemsize`.
                 // The compare below is against the item count, not the byte
                 // bound x86's precheck uses.
-                let max_length = max_young.saturating_sub(2 * word) / itemsize as usize;
-                let header_size = majit_gc::header::GcHeader::SIZE as i64;
+                let header_size = if headerless {
+                    0
+                } else {
+                    majit_gc::header::GcHeader::SIZE as i64
+                };
+                let max_length = if headerless {
+                    max_young.saturating_sub(base_size as usize) / itemsize as usize
+                } else {
+                    max_young.saturating_sub(2 * word) / itemsize as usize
+                };
                 debug_assert!(itemsize > 0);
                 debug_assert!(
-                    base_size as usize + majit_gc::header::GcHeader::SIZE
-                        >= majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE
+                    headerless
+                        || base_size as usize + majit_gc::header::GcHeader::SIZE
+                            >= majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE
                 );
                 if nf_addr == 0 || nt_addr == 0 || max_length == 0 {
                     dynasm!(self.mc ; .arch aarch64 ; b =>slow_path);
@@ -3742,14 +3754,57 @@ impl<'a> AssemblerARM64<'a> {
                     );
                     self.emit_mov_imm64(16, nf_addr as i64);
                     dynasm!(self.mc ; .arch aarch64 ; str x1, [x16]);
-                    self.emit_mov_imm64(16, type_id);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; str x16, [x0]
-                        ; add x0, x0, header_size as u32
-                        ; b =>done
-                    );
+                    if headerless {
+                        dynasm!(self.mc ; .arch aarch64 ; b =>done);
+                    } else {
+                        self.emit_mov_imm64(16, type_id);
+                        dynasm!(self.mc ; .arch aarch64
+                            ; str x16, [x0]
+                            ; add x0, x0, header_size as u32
+                            ; b =>done
+                        );
+                    }
                 }
                 dynasm!(self.mc ; .arch aarch64 ; =>slow_path);
+                if headerless {
+                    // Overflow opens a segment and returns the block base.
+                    // No collection, so the headered varsize helper is not used.
+                    match arglocs.first() {
+                        Some(Loc::Reg(len_r)) => {
+                            dynasm!(self.mc ; .arch aarch64 ; mov x1, X(len_r.value));
+                        }
+                        Some(Loc::Immed(len_i) | Loc::ImmedFloat(len_i)) => {
+                            self.emit_mov_imm64(1, len_i.value);
+                        }
+                        Some(Loc::Frame(len_f)) => self.emit_ldr_fp(1, len_f.ebp_loc.value),
+                        Some(Loc::Ebp(len_e)) => self.emit_ldr_fp(1, len_e.value),
+                        other => panic!(
+                            "CallMallocNurseryVarsizeHeaderless length is not a value: {other:?}"
+                        ),
+                    }
+                    self.emit_mov_imm64(16, itemsize);
+                    dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x16);
+                    self.emit_mov_imm64(16, base_size + 7);
+                    dynasm!(self.mc ; .arch aarch64 ; add x1, x1, x16);
+                    self.emit_mov_imm64(16, -8);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; and x0, x1, x16
+                    );
+                    self.emit_mov_imm64(
+                        2,
+                        crate::runner::dynasm_nursery_slowpath_headerless as *const () as i64,
+                    );
+                    self.emit_malloc_slowpath_helper_call(2);
+                    self.reload_frame_if_necessary();
+                    self.emit_propagate_memory_error_if_null(0);
+                    if let Some(Loc::Reg(r)) = result_loc
+                        && r.value != 0
+                    {
+                        let rv = r.value;
+                        dynasm!(self.mc ; .arch aarch64 ; mov X(rv), x0);
+                    }
+                    dynasm!(self.mc ; .arch aarch64 ; b =>done);
+                }
                 // assembler.py:254 `_push_all_regs_to_jitframe` — the helper
                 // below can collect, and `emit_malloc_slowpath_helper_call`
                 // only saves the volatiles to the *stack*, where the

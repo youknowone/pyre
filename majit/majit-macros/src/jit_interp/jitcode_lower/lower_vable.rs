@@ -156,6 +156,17 @@ fn path_is_f64(path: &syn::Path) -> bool {
         .is_some_and(|segment| segment.ident == "f64")
 }
 
+/// Primitive integer element of a headered array (`CelIntWords::items`).
+/// A header does not make the element a GC pointer.
+fn path_is_int_elem(path: &syn::Path) -> bool {
+    const INTS: &[&str] = &[
+        "i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize",
+    ];
+    path.segments
+        .last()
+        .is_some_and(|segment| INTS.contains(&segment.ident.to_string().as_str()))
+}
+
 /// The `(field_size, is_signed)` a struct-layout registration reports for one
 /// field, plus a compile-time check that the declaration matches the Rust
 /// struct.  `descr.py get_field_descr` derives both from `FIELDTYPE`,
@@ -2064,6 +2075,41 @@ impl<'c> Lowerer<'c> {
                 struct_type: None,
             });
         }
+        if let Some(header) = header.clone().filter(|_| path_is_int_elem(&element_type)) {
+            let descr_tokens = self
+                .config
+                .map(|config| gc_varsize_descr_tokens(config, &header))
+                .unwrap_or_else(|| {
+                    quote! {
+                        __builder.add_raw_int_array_descr_signed(
+                            ::core::mem::size_of::<#element_type>(),
+                            (<#element_type>::MIN as i128) < 0,
+                        )
+                    }
+                });
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![Register::ref_(buffer_reg), Register::int(index_reg)],
+                    vec![Register::int(result_reg)],
+                ),
+                quote! {
+                    let __descr_idx = #descr_tokens;
+                    __builder.getarrayitem_gc_i(
+                        #result_reg as u16,
+                        #buffer_reg as u16,
+                        #index_reg as u16,
+                        __descr_idx,
+                    );
+                },
+            );
+            return Some(Binding {
+                reg: result_reg,
+                kind: BindingKind::Int,
+                depends_on_stack: index.depends_on_stack,
+                struct_type: None,
+            });
+        }
         if let Some(header) = header {
             // Pointer elements living after `header.items`. The base
             // register is the header, so the descr's base_size is that
@@ -2161,8 +2207,9 @@ impl<'c> Lowerer<'c> {
         let element_type = shape.element_type.clone();
         let header = shape.header.clone();
         let element_is_float = path_is_f64(&element_type) && header.is_none();
+        let element_is_int = path_is_int_elem(&element_type);
         let value = self.lower_value_expr(&assign.right)?;
-        let value_is_ref = header.is_some();
+        let value_is_ref = header.is_some() && !element_is_int;
         if element_is_float {
             if !matches!(value.kind, BindingKind::Float) {
                 return None;
@@ -2216,6 +2263,29 @@ impl<'c> Lowerer<'c> {
                         )
                     }
                 });
+            if element_is_int {
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::Vable,
+                        vec![
+                            Register::ref_(buffer_reg),
+                            Register::int(index_reg),
+                            Register::int(value_reg),
+                        ],
+                        vec![],
+                    ),
+                    quote! {
+                        let __descr_idx = #descr_tokens;
+                        __builder.setarrayitem_gc_i(
+                            #buffer_reg as u16,
+                            #index_reg as u16,
+                            #value_reg as u16,
+                            __descr_idx,
+                        );
+                    },
+                );
+                return Some(());
+            }
             self.emit_op(
                 OpMeta::linear(
                     OpKind::Vable,

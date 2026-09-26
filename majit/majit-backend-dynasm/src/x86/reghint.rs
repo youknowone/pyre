@@ -124,6 +124,7 @@ impl RegisterHints {
             OpCode::CallMallocNursery
             | OpCode::CallMallocNurseryHeaderless
             | OpCode::CallMallocNurseryVarsize
+            | OpCode::CallMallocNurseryVarsizeHeaderless
             | OpCode::CallMallocNurseryVarsizeFrame => {
                 self.consider_call_malloc_nursery(longevity, op, position);
             }

@@ -1446,6 +1446,7 @@ fn nursery_alloc_params(ops: &[Op]) -> Option<codegen::NurseryAllocParams> {
             majit_ir::OpCode::CallMallocNursery
                 | majit_ir::OpCode::CallMallocNurseryHeaderless
                 | majit_ir::OpCode::CallMallocNurseryVarsize
+                | majit_ir::OpCode::CallMallocNurseryVarsizeHeaderless
                 | majit_ir::OpCode::CallMallocNurseryVarsizeFrame
         )
     });

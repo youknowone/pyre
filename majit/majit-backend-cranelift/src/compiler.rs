@@ -14270,6 +14270,13 @@ impl CraneliftBackend {
                         return Err(missing_gc_runtime(op.opcode));
                     }
                 }
+                // This backend does not install a headerless allocator.
+                OpCode::CallMallocNurseryVarsizeHeaderless => {
+                    return Err(BackendError::Unsupported(format!(
+                        "opcode {:?} has no backend lowering",
+                        OpCode::CallMallocNurseryVarsizeHeaderless
+                    )));
+                }
                 OpCode::CallMallocNurseryVarsize => {
                     if !cranelift_gc_active() {
                         return Err(missing_gc_runtime(op.opcode));
