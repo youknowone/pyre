@@ -1462,8 +1462,11 @@ fn withdraw_root_hooks_if_last_box() {
 /// box. `WASM_ACTIVE_GC` stays `None`, so every trampoline routes to the
 /// process-global `gc_sync` singleton (the per-thread GC box is the
 /// free-threading gap R4 removes).
+///
+/// The type table stays open. `gctypelayout.py encode_type_shapes_now`
+/// closes it at translation; pyre closes it before the first reader so
+/// JIT-only types can still be registered after startup.
 pub fn install_gc_standalone() {
-    majit_gc::gc_sync::gc_op(|gc| gc.freeze_types());
     let supports_guard_gc_type = majit_gc::gc_sync::gc_query(|gc| gc.supports_guard_gc_type());
     register_active_hooks(supports_guard_gc_type);
 }
@@ -5165,6 +5168,9 @@ impl majit_backend::Backend for WasmBackend {
         ops: &[OpRc],
         token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
+        // at translation. Close before `collect_guard_gc_type_info` reads it.
+        majit_gc::ensure_type_registry_closed();
         diag_bump(23);
         let _header_pc = std::mem::take(&mut self.next_header_pc);
         // `x86/assembler.py:514` parity — bump
@@ -5637,6 +5643,8 @@ impl majit_backend::Backend for WasmBackend {
         _previous_tokens: &[std::sync::Arc<JitCellToken>],
         _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
+        // Same close as `compile_loop`: bridge codegen reads `type_info_group`.
+        majit_gc::ensure_type_registry_closed();
         // A bridge is a fresh trace that continues from a source loop's guard
         // exit. Instead of returning that guard's index to the host and
         // round-tripping through the interpreter, the source loop's epilogue

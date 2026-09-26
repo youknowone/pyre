@@ -1201,6 +1201,7 @@ fn func_effects_marks(effects: &crate::model::FuncEffects) -> Vec<String> {
     for (flag, name) in [
         (effects.cannot_collect, "cannot_collect"),
         (effects.random_effects_on_gcobjs, "random_effects_on_gcobjs"),
+        (!effects.canraise, "canraise=false"),
         (effects.canmallocgc, "canmallocgc"),
         (effects.cannot_raise_assertion, "cannot_raise_assertion"),
         (effects.memerror_only_assertion, "memerror_only_assertion"),
@@ -2271,7 +2272,7 @@ impl DescrIndexRegistry {
 impl CallControl {
     /// RPython: `CallControl.__init__`.
     pub fn new() -> Self {
-        Self {
+        let mut cc = Self {
             function_graphs: GraphStore::new(),
             external_funcobjs: HashMap::new(),
             trait_method_impls: HashMap::new(),
@@ -2313,6 +2314,21 @@ impl CallControl {
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls: Vec::new(),
+        };
+        cc.stamp_ll_math_llexternal_canraise();
+        cc
+    }
+
+    /// Copy `canraise` from `ll_math::llexternal` onto each raw `math_*`
+    /// C leaf. The raising `ll_math_*` wrappers are not in this table.
+    fn stamp_ll_math_llexternal_canraise(&mut self) {
+        use crate::translator::rtyper::lltypesystem::module::ll_math::{
+            F64_METHOD_LLEXTERNALS, llexternal,
+        };
+        for row in F64_METHOD_LLEXTERNALS {
+            let ext = llexternal(row.name);
+            let path = CallPath::from_segments(["ll_math", row.name]);
+            self.func_effects_mut(&path).canraise = ext.canraise;
         }
     }
 
@@ -6774,8 +6790,14 @@ impl CallControl {
         }
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
-            // RPython: analyze_external_call → getattr(fnobj, 'canraise', True)
-            None => return true,
+            // `canraise.py analyze_external_call`: getattr(fnobj, 'canraise', True)
+            None => {
+                return self
+                    .external_funcobjs
+                    .get(path)
+                    .map(|funcobj| funcobj.canraise)
+                    .unwrap_or(true);
+            }
         };
         for block in &graph.blocks {
             // RPython: analyze_simple_operation(op) per operation.

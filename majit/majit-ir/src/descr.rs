@@ -1443,6 +1443,44 @@ impl GcCache {
         registered
     }
 
+    /// Re-announce synthetic struct layouts to a replacement collector.
+    ///
+    /// `register_unresolved_struct_tids` skips a descriptor whose collector
+    /// tid is already stored. A fresh `MiniMarkGC` starts with an empty
+    /// registry, so those stored tids have to be appended again, in the
+    /// same insertion order, before any still-unresolved descriptor.
+    pub fn replay_synthetic_struct_tids(
+        &mut self,
+        mut register: impl FnMut(usize, Vec<usize>) -> u32,
+    ) {
+        // A replacement collector does not hand the same ids back: its
+        // `build_gc` prefix can be one longer than the collector that
+        // stamped these descriptors. The old heap is gone, so the
+        // descriptor adopts the id this collector just assigned.
+        let mut pending: Vec<(usize, Vec<usize>, *const SimpleSizeDescr)> = Vec::new();
+        for descr in self._cache_size.values() {
+            let Some(sd) = descr
+                .as_any()
+                .and_then(|descr| descr.downcast_ref::<SimpleSizeDescr>())
+            else {
+                continue;
+            };
+            if !sd.is_gc_managed() || sd.headerless() || sd.cache_key() <= u32::MAX as u64 {
+                continue;
+            }
+            let ref_offsets = sd
+                .gc_fielddescrs()
+                .iter()
+                .map(|field| field.offset())
+                .collect();
+            pending.push((sd.size(), ref_offsets, sd as *const SimpleSizeDescr));
+        }
+        for (size, offsets, sd) in pending {
+            let tid = register(size, offsets);
+            unsafe { (*sd).set_type_id(tid) };
+        }
+    }
+
     /// `gc.py GcLLDescr_framework.init_size_descr` analog.
     /// Allocates a dense GC tid via `next_type_id` (the
     /// `TypeLayoutBuilder.get_type_id` analog) and stamps

@@ -1339,20 +1339,17 @@ fn rehydrated_call_descr_ref(bh: majit_jitcode::jitcode::BhCallDescr) -> majit_i
     )
 }
 
-/// Publish the GcCache-owned (non-call) opcode descrs so
-/// `GcCache::register_unresolved_struct_tids` can stamp collector tids.
+/// Publish the GcCache-owned (non-call) opcode descrs and stamp synthetic
+/// struct collector tids on the first JIT use.
 ///
-/// `gc.py GcLLDescr_framework.init_size_descr` / `init_array_descr` run at
-/// translation against the Size/Array objects already in `GcCache`, not
-/// against the Field/Call universe.  `descr_ref_at` used to walk every
-/// baked slot and thereby pulled [`rehydrate_build_descr_raw_sets`] into
-/// process startup (`pyre-jit` `build_gc`). PyPy populates these objects
-/// during translation, before `GcCache.setup_descrs` enumerates them.
-/// Rust's build script cannot embed its object addresses in the executable,
-/// so pyre restores GC layouts at startup and frozen EffectInfo before the
-/// first JIT; CallDescr restoration can wait for the first slot lookup.
-/// Kind-0 slots are Size/Field/Array: Field minting publishes the parent Size
-/// the tid walk reads.
+/// `GcLLDescr_framework.init_size_descr` asks `TypeLayoutBuilder.get_type_id`
+/// for those ids during translation, against Size objects already in
+/// `GcCache`. pyre cannot embed the collector ids in the executable, so a
+/// process that never traces does not decode the descr table. Kind-0 slots
+/// are Size/Field/Array: Field minting publishes the parent Size the tid walk
+/// reads. `set_type_registry_close_hook` runs this before `freeze_types`, so
+/// the registry is still open when the tids are registered. CallDescr
+/// restoration stays on the first slot lookup.
 pub fn materialize_gccache_owned_descrs() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -1382,6 +1379,52 @@ pub fn materialize_gccache_owned_descrs() {
             ));
             crate::descr::make_descr_from_bh(&bh);
         }
+        register_synthetic_struct_tids();
+    });
+    // The decode `Once` may have run before a collector existed. Register
+    // once the live collector is installed; a second call is a no-op.
+    register_synthetic_struct_tids();
+}
+
+/// Stamp collector tids onto synthetic struct `SizeDescr`s.
+///
+/// No-op until `gc_sync` has a collector: unit tests rehydrate the descr
+/// table with no `MiniMarkGC`. Once a collector exists the registry must
+/// still be open — `set_type_registry_close_hook` guarantees that in
+/// production by running [`materialize_gccache_owned_descrs`] before
+/// `freeze_types`.
+fn register_synthetic_struct_tids() {
+    if !majit_gc::gc_sync::is_initialized() {
+        return;
+    }
+    // One registration per collector. `reset_gc_fresh_for_test` installs a
+    // new `MiniMarkGC`; a process-wide `Once` would leave that registry
+    // without the tids already stamped on the shared size descriptors.
+    static LAST_GC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    majit_gc::gc_sync::gc_op(|gc| {
+        use majit_gc::GcAllocator;
+        use std::sync::atomic::Ordering;
+        let addr = gc as *mut majit_gc::collector::MiniMarkGC as usize;
+        let previous = LAST_GC.swap(addr, Ordering::AcqRel);
+        if previous == addr && gc.types_frozen() {
+            return;
+        }
+        assert!(
+            !gc.types_frozen(),
+            "materialize_gccache_owned_descrs: synthetic struct tids must be \
+             registered while the type registry is still open; \
+             set_type_registry_close_hook runs this before freeze_types"
+        );
+        let mut cache = majit_ir::descr::gc_cache().lock();
+        if previous == addr || previous == 0 {
+            cache.register_unresolved_struct_tids(|size, offsets| {
+                gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets))
+            });
+            return;
+        }
+        cache.replay_synthetic_struct_tids(|size, offsets| {
+            gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets))
+        });
     });
 }
 
@@ -1405,8 +1448,9 @@ pub fn materialize_gccache_owned_descrs() {
 /// [`crate::state::blackhole_control_opcodes`],
 /// [`crate::state::setup_indirectcalltargets`],
 /// [`crate::state::bytecode_for_address`].  An interpreter that never traces
-/// never runs it.  (Descriptor *minting* does happen at startup, which is easy
-/// to mistake for this pass when reading an allocation census.)
+/// never runs it.  Kind-0 descr minting is the same first-JIT pass
+/// ([`materialize_gccache_owned_descrs`]), which is easy to mistake for a
+/// startup cost when reading an allocation census.
 ///
 /// **Its size is not currently measured, and two obvious instruments cannot
 /// measure it.**  Allocation here is mmap-backed, so `malloc_history` / `heap`
@@ -1444,10 +1488,9 @@ pub fn rehydrate_build_descr_raw_sets() {
         // layout.  Resolving in the other order would leave every member
         // whose struct has not been published yet unresolvable.
         //
-        // Shared with process startup (`materialize_gccache_owned_descrs`):
-        // `init_size_descr` needs those Size objects in `_cache_size` at
-        // `build_gc`, but must not pull the EffectInfo/Call half of this
-        // pass into `_setup_once`.
+        // `materialize_gccache_owned_descrs` publishes the Size objects
+        // `init_size_descr` walks and stamps their collector tids. EffectInfo
+        // and Call restoration stay in this pass, off the startup path.
         materialize_gccache_owned_descrs();
         // Members already published by the opcode-descr pass need only the
         // `compute_bitstrings` partition stamp. PyPy mutates that one cached
@@ -1492,6 +1535,9 @@ pub fn rehydrate_build_descr_raw_sets() {
         // `rehydrated_call_descr_ref` after this pass publishes its frozen
         // EffectInfo identity, preserving the canonical call-cache key.
         report_descr_spelling_gate();
+        // EffectInfo mints can create size descriptors after the first
+        // registration. Stamp those onto the still-open collector.
+        register_synthetic_struct_tids();
     });
 }
 

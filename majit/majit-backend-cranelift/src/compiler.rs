@@ -426,10 +426,13 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
 /// box. `CRANELIFT_ACTIVE_GC` stays `None`, so every trampoline routes to
 /// the process-global `gc_sync` singleton (the per-thread GC box is the
 /// free-threading gap R4 removes).
+///
+/// The type table stays open. `gctypelayout.py encode_type_shapes_now`
+/// closes it at translation; pyre closes it before the first reader so
+/// JIT-only types can still be registered after startup.
 pub fn install_gc_standalone() {
     majit_gc::gc_sync::gc_op(|gc| {
         check_jitframe_descr(gc);
-        gc.freeze_types();
     });
     let supports_guard_gc_type = majit_gc::gc_sync::gc_query(|gc| gc.supports_guard_gc_type());
     register_active_hooks(supports_guard_gc_type);
@@ -17800,6 +17803,10 @@ impl majit_backend::Backend for CraneliftBackend {
         ops: &[OpRc],
         token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
+        // at translation. Close before GUARD_IS_OBJECT / GUARD_SUBCLASS
+        // lowering reads it. Once frozen this is a query.
+        majit_gc::ensure_type_registry_closed();
         let _writing = majit_backend::AssemblerWriting::enter();
         // `x86/assembler.py:514` parity — bump
         // `cpu.tracker.total_compiled_loops` and open the
@@ -17944,6 +17951,8 @@ impl majit_backend::Backend for CraneliftBackend {
         previous_tokens: &[std::sync::Arc<JitCellToken>],
         caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
+        // Same close as `compile_loop`: bridge lowering reads `type_info_group`.
+        majit_gc::ensure_type_registry_closed();
         let _writing = majit_backend::AssemblerWriting::enter();
         // `x86/runner.py:100-101` parity — bump this backend's
         // tracker and the per-loop bridges_count before assembling.

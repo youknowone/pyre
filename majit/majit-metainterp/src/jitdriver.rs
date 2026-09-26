@@ -1267,6 +1267,16 @@ pub struct JitDriverStaticData {
     /// `MetaInterp.do_recursive_call` (pyjitpl.py) to set
     /// `portal_code.calldescr` for the residual CALL_ASSEMBLER op.
     pub mainjitcode: Option<std::sync::Arc<crate::jitcode::JitCode>>,
+    /// Deferred source for [`Self::mainjitcode`]. `call.py grab_initial_jitcodes`
+    /// binds `jd.mainjitcode` during translation; pyre keeps that binding at
+    /// driver build and runs the decode on the first `mainjitcode_of` read.
+    /// `None` when the eager field is the only source.
+    ///
+    /// The loader must return one process-wide `Arc`: this struct is `Clone`,
+    /// and each clone has its own [`Self::mainjitcode_loaded`] cell.
+    pub mainjitcode_loader: Option<fn() -> Option<std::sync::Arc<crate::jitcode::JitCode>>>,
+    /// Jitcode produced by [`Self::mainjitcode_loader`] on this clone.
+    pub mainjitcode_loaded: std::sync::OnceLock<std::sync::Arc<crate::jitcode::JitCode>>,
     /// warmspot.py:946 `jd.portal_runner_adr = adr_of(portal_runner)`.
     ///
     /// Address of the portal_runner C function — the funcbox for
@@ -1471,6 +1481,8 @@ impl JitDriverStaticData {
             result_type: Type::Ref,
             is_recursive: false,
             mainjitcode: None,
+            mainjitcode_loader: None,
+            mainjitcode_loaded: std::sync::OnceLock::new(),
             portal_runner_adr: 0,
             virtualizable_info: None,
             greenfield_info: None,
@@ -2355,6 +2367,21 @@ impl<S: JitState> JitDriver<S> {
             .jitdriver_sd_mut(portal_jd_index)
             .expect("install_extracted_portal_jitcode: jitdrivers_sd slot is vacant")
             .mainjitcode = Some(jitcode);
+        self.portal_jd_index = Some(portal_jd_index);
+    }
+
+    /// `call.py grab_initial_jitcodes` binding without decoding the portal.
+    /// Same slot assignment as [`Self::install_extracted_portal_jitcode`]; the
+    /// jitcode is filled by `MetaInterp::mainjitcode_of` on the first read.
+    pub fn install_extracted_portal_jitcode_loader(
+        &mut self,
+        loader: fn() -> Option<std::sync::Arc<crate::jitcode::JitCode>>,
+    ) {
+        let portal_jd_index = self.index().unwrap_or(0);
+        self.meta
+            .jitdriver_sd_mut(portal_jd_index)
+            .expect("install_extracted_portal_jitcode_loader: jitdrivers_sd slot is vacant")
+            .mainjitcode_loader = Some(loader);
         self.portal_jd_index = Some(portal_jd_index);
     }
 
@@ -7697,6 +7724,11 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) {
+        // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
+        // at translation. Close before tracing so a reader in this trace
+        // sees the frozen table, and JIT-only types can still register
+        // after startup.
+        majit_gc::ensure_type_registry_closed();
         // Note: no is_hot_or_tracing check here — the caller (try_function_entry_jit)
         // already verified the threshold. force_start_tracing must unconditionally start.
         //
@@ -9971,6 +10003,9 @@ impl<S: JitState> JitDriver<S> {
         // as `execute_and_record` does as well as record it.
         execute_replay: bool,
     ) -> bool {
+        // Same close as `force_start_tracing`: bridge codegen reads
+        // `type_info_group` (`gctypelayout.py encode_type_shapes_now`).
+        majit_gc::ensure_type_registry_closed();
         majit_metainterp::mc_diag_bump(12); // start_bridge_tracing entered
         // Same reason as the primary trace entry: the bridge compile decodes
         // frame value counts through the per-thread store, so aim it here.

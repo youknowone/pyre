@@ -15,11 +15,14 @@ pub const use_library_isinf_isnan: bool = false;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MathExternal {
     pub name: String,
+    /// `rffi.py llexternal` stamps `canraise=False` on the C function.
+    pub canraise: bool,
 }
 
 pub fn llexternal(name: &str) -> MathExternal {
     MathExternal {
         name: name.to_owned(),
+        canraise: false,
     }
 }
 

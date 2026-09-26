@@ -3140,7 +3140,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // `W_BASE_EXCEPTION_GC_TYPE_ID`) AFTER all hardcoded registrations.
     // Each new TypeInfo carries the W_BaseException layout
     // (size + GC ptr offsets) so allocation still works, and the
-    // correct `parent_typeid` so `freeze_types` builds the
+    // correct `parent_typeid` so `assign_inheritance_ids_now` builds the
     // preorder subclass tree.  Then `register_vtable_for_type`
     // overrides the earlier pytype → 31 mapping so
     // `subclass_range(pytype)` resolves to the per-class range.
@@ -4305,9 +4305,7 @@ fn build_gc() -> Box<MiniMarkGC> {
 
     // gateway.py interp2app is an internal prebuilt W_Root, not an
     // app-level builtin type. Trace its Code reference like the hidden
-    // WeakrefLifeline above. This is the tail of fixed layouts, BEFORE
-    // register_unresolved_struct_tids: that dynamic cache registers only
-    // previously unresolved descriptors, so its count differs on GC rebuild.
+    // WeakrefLifeline above.
     let gateway_descr =
         <pyre_object::gateway::interp2app as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
     let gateway_tid = gc.register_type(TypeInfo::with_gc_ptrs(
@@ -4324,20 +4322,11 @@ fn build_gc() -> Box<MiniMarkGC> {
         gateway_descr.ptr_offsets,
     );
 
-    // `gc.py GcLLDescr_framework.init_size_descr` asks the
-    // gctypelayout layoutbuilder for a collector type id after the translated
-    // GC layouts are known, and only walks Size/Array objects already in
-    // GcCache.  Materialize those (plus Field slots, which publish the
-    // parent Size) without pulling `rehydrate_build_descr_raw_sets` —
-    // EffectInfo/Call restoration — into process startup. PyPy populates
-    // descriptors during translation; `MetaInterpStaticData.finish_setup_descrs`
-    // enumerates them, and `_setup_once` does not mint descriptors.
-    pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
-    let _registered_synthetic_structs = majit_ir::descr::gc_cache()
-        .lock()
-        .register_unresolved_struct_tids(|size, offsets| {
-            gc.register_type(TypeInfo::with_gc_ptrs(size, offsets))
-        });
+    // `GcLLDescr_framework.init_size_descr` asks `TypeLayoutBuilder.get_type_id`
+    // for synthetic struct tids during translation. pyre stamps them from
+    // `init_gc_subsystem` via `materialize_gccache_owned_descrs`, once this
+    // collector is installed. They are not registered in this function: it
+    // runs before `gc_sync` publishes the collector.
 
     // `bytes` `data` block — `rstr.py`'s `STR.chars`, an
     // `Array(Char)`. A varsize GcArray of bytes with no inner refs, so it
@@ -4347,7 +4336,9 @@ fn build_gc() -> Box<MiniMarkGC> {
     // header. `bytes_object_custom_trace` greys it through the `data` field
     // slot, the same edge the storage box was reached by.
     //
-    // Registered after every other type, synthetic structs included. A tid is a
+    // Registered at the tail of the fixed layouts. Synthetic struct tids are
+    // stamped later, from `init_gc_subsystem`, and do not occupy a slot here.
+    // A tid is a
     // position in this chain, and the interpreter spells many of them as
     // literals — `W_BYTES_GC_TYPE_ID` is 27, `W_LIST_GC_TYPE_ID` is 7 — so an
     // insertion anywhere earlier renumbers every registration below it while the
@@ -4426,8 +4417,12 @@ fn build_gc() -> Box<MiniMarkGC> {
     }
 
     // rclass.py ClassRepr.fill_vtable_root owns subclassrange_{min,max}.
-    // freeze_types computes the collector's matching inheritance ids; it
-    // must not republish the interpreter's prebuilt vtables.
+    // assign_inheritance_ids_now computes the collector's matching
+    // inheritance ids and must not republish the interpreter's prebuilt
+    // vtables. `gctypelayout.py encode_type_shapes_now` closes
+    // `type_info_group` at translation; pyre leaves that table open here
+    // and closes it before the first reader, so JIT-only types can still
+    // be registered after startup.
     let object_aliases = pyre_object::pyobject::all_subclass_range_aliases();
     let interpreter_aliases = pyre_interpreter::all_subclass_range_aliases();
     let mut expected_aliases: Vec<_> = object_aliases
@@ -4483,7 +4478,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         .with_destructor_fn(majit_metainterp::AllVirtuals::destructor),
     );
     majit_metainterp::set_all_virtuals_gc_type_id(all_virtuals_tid);
-    gc.freeze_types();
+    gc.assign_inheritance_ids_now();
     pyre_interpreter::typedef::init_subclass_ranges();
     assert_subclass_ranges(
         object_aliases
@@ -5006,6 +5001,12 @@ pub fn init_gc_subsystem() {
         install_gc_into_backend();
         GC_TLS_INSTALLED.with(|c| c.set(true));
     }
+    // `ensure_type_registry_closed` runs this before `freeze_types`, so the
+    // synthetic struct tids are registered whichever comes first — a rehydrate
+    // or a close.
+    majit_gc::set_type_registry_close_hook(
+        pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs,
+    );
     // rbigint.py constructs `_parts_cache_10` at module import.  Force pyre's
     // translated prebuilt equivalent before any collector root walk rather
     // than lazily manufacturing it from inside the walker. After registration,
@@ -5058,6 +5059,24 @@ thread_local! {
 /// so `gc.get_stats()` still creates none.
 fn active_jit_backend_memory_stats() -> (usize, usize) {
     majit_backend::process_assembler_memory_stats()
+}
+
+/// One portal `Arc` for every clone of the driver static data.
+/// `call.py grab_initial_jitcodes` binds `jd.mainjitcode` during translation;
+/// pyre defers only the decode until the first reader.
+static PORTAL_MAINJITCODE: std::sync::OnceLock<Option<std::sync::Arc<majit_metainterp::JitCode>>> =
+    std::sync::OnceLock::new();
+
+fn load_portal_mainjitcode() -> Option<std::sync::Arc<majit_metainterp::JitCode>> {
+    PORTAL_MAINJITCODE
+        .get_or_init(|| {
+            pyre_jit_trace::jitcode_runtime::portal_jitcode().map(|canonical| {
+                std::sync::Arc::new(majit_metainterp::JitCode::from_canonical(
+                    (*canonical).clone(),
+                ))
+            })
+        })
+        .clone()
 }
 
 fn build_jit_driver_pair() -> JitDriverPair {
@@ -5175,15 +5194,11 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // warmstate.py get_unique_id(greenkey) → interp_jit.py get_unique_id.
     jd.get_unique_id = Some(portal_unique_id_from_greens);
     d.meta_interp_mut().register_jitdriver_sd(jd);
-    // call.py grab_initial_jitcodes: `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`.
-    // Production never calls `register_dispatch_jitcode`; without this the
-    // portal interpret seeds an empty framestack.
-    if let Some(canonical) = pyre_jit_trace::jitcode_runtime::portal_jitcode() {
-        let jitcode = std::sync::Arc::new(majit_metainterp::JitCode::from_canonical(
-            (*canonical).clone(),
-        ));
-        d.install_extracted_portal_jitcode(jitcode);
-    }
+    // call.py grab_initial_jitcodes binds `jd.mainjitcode` during translation.
+    // Production never calls `register_dispatch_jitcode`; without this binding
+    // the portal interpret seeds an empty framestack. The decode itself waits
+    // for the first `mainjitcode_of` read.
+    d.install_extracted_portal_jitcode_loader(load_portal_mainjitcode);
     // baseobjspace.py `unpackiterable_driver = JitDriver(greens=['greenkey'],
     // reds='auto', ...)` — the second portal driver (jd1) for the
     // unknown-length unpack loop `unpackiterable_portal`. Registered
@@ -7089,6 +7104,9 @@ fn drive_portal_metatrace(
         ]
     };
     meta.initialize_state_from_start(jitcode, &args);
+    // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
+    // at translation. Close before the portal walk reads it.
+    majit_gc::ensure_type_registry_closed();
     let action = meta.interpret(&mut PortalMetatraceSym { header_pc }, loop_header_pc);
     let depth = meta.framestack.len();
     let top = meta.framestack.frames.last();
@@ -7855,6 +7873,14 @@ pub fn init_jit_hooks() {
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).
     init_gc_subsystem();
+    // Kind-0 descrs stay off `PYRE_JIT=0` / `PYRE_NO_JIT`. When the JIT is
+    // on, decode them before user code runs. The close hook still runs the
+    // same function before `freeze_types`; doing that decode first from
+    // inside `frame_chain`'s recursive `CALL_ASSEMBLER` makes Windows ask
+    // for a garbage-sized allocation and exit 3221226505.
+    if env_var_os("PYRE_NO_JIT").is_none() && env_var("PYRE_JIT").as_deref() != Some("0") {
+        pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
+    }
     // `warmstate.py JitCell.__init__` stores every green as an ordinary field
     // on a GC object, so a Ref green is both owned and forwarded with the
     // cell. Pyre's Rust-owned BaseJitCell uses fixed owner-root slots for the
@@ -15977,7 +16003,7 @@ mod tests {
     }
 
     /// rclass.py `ll_issubclass(subcls, cls)` parity. After
-    /// `install_gc_standalone` runs `freeze_types`, the materialized
+    /// `build_gc` runs `assign_inheritance_ids_now`, the
     /// `(subclassrange_min, subclassrange_max)` for each registered
     /// PyType must satisfy `int_between(cls.min, subcls.min, cls.max)`
     /// for every (cls, subcls) pair where `subcls` Python-inherits from

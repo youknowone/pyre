@@ -1404,7 +1404,7 @@ pub(crate) fn seed_main_loader(
 
     let loader = match script_file {
         Some(path) => load(
-            "importlib._bootstrap_external",
+            "_frozen_importlib_external",
             if sourceless {
                 "SourcelessFileLoader"
             } else {
@@ -1428,7 +1428,7 @@ pub(crate) fn seed_main_loader(
             )
             .ok()
         }),
-        None => load("importlib._bootstrap", "BuiltinImporter"),
+        None => load("_frozen_importlib", "BuiltinImporter"),
     };
     let Some(loader) = loader else {
         return;

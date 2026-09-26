@@ -5735,6 +5735,91 @@ impl MiniMarkGC {
             .collect()
     }
 
+    /// Shadow stack, JitFrame and libc jitframe slots, live deadframe slots,
+    /// blackhole registers, resume-construction roots, and mutator extra areas.
+    ///
+    /// Shared by [`Self::enumerate_labeled_root_walker_values`] and
+    /// [`Self::rescan_major_stack_roots_black_and_drain`]. Registered roots and
+    /// the extra-root walker are separate sets. `mutators_quiesced` selects
+    /// `walk_all_*` over `walk_*`.
+    fn walk_stack_shaped_roots(mut visit: impl FnMut(GcRef, &'static str)) {
+        let walk_all_mutators = crate::gc_sync::mutators_quiesced();
+        {
+            let mut visit_shadow_root = |gcref: &mut GcRef| {
+                visit(*gcref, "shadow_stack_root");
+            };
+            if walk_all_mutators {
+                crate::shadow_stack::walk_all_roots(&mut visit_shadow_root);
+            } else {
+                crate::shadow_stack::walk_roots(&mut visit_shadow_root);
+            }
+        }
+        {
+            let mut visit_jf_root = |gcref: &mut GcRef| {
+                if !gcref.is_null() && crate::shadow_stack::is_libc_jitframe(gcref.0) {
+                    crate::shadow_stack::trace_libc_jitframe(gcref.0, &mut |slot_ptr| {
+                        let field_ref = unsafe { *slot_ptr };
+                        if !field_ref.is_null() {
+                            visit(field_ref, "jitframe_slot");
+                        }
+                    });
+                } else {
+                    visit(*gcref, "jf_root");
+                }
+            };
+            if walk_all_mutators {
+                crate::shadow_stack::walk_all_jf_roots(&mut visit_jf_root);
+            } else {
+                crate::shadow_stack::walk_jf_roots(&mut visit_jf_root);
+            }
+        }
+        // Same source the minor-collection root phase reads; enumerated here
+        // too, so a root that exists for the collector is also a root this
+        // listing reports. A listing that omitted it would say an object is
+        // unreachable while the collector keeps it.
+        crate::walk_active_live_deadframes(&mut |addr| {
+            crate::shadow_stack::trace_libc_jitframe(addr, &mut |slot_ptr| {
+                let field_ref = unsafe { *slot_ptr };
+                if !field_ref.is_null() {
+                    visit(field_ref, "deadframe_slot");
+                }
+            });
+        });
+        {
+            let mut visit_bh_root = |gcref: &mut GcRef| {
+                visit(*gcref, "blackhole_register");
+            };
+            if walk_all_mutators {
+                crate::shadow_stack::walk_all_bh_regs(&mut visit_bh_root);
+            } else {
+                crate::shadow_stack::walk_bh_regs(&mut visit_bh_root);
+            }
+        }
+        // Resume-construction roots (`BlackholeInterpreter` registers and the
+        // in-flight `virtuals_cache`): see the minor-collection path for why
+        // those slices must be seeded as roots.
+        {
+            let mut visit_resume_root = |gcref: &mut GcRef| {
+                visit(*gcref, "resume_ref_root");
+            };
+            if walk_all_mutators {
+                crate::shadow_stack::walk_all_resume_ref_roots(&mut visit_resume_root);
+            } else {
+                crate::shadow_stack::walk_resume_ref_roots(&mut visit_resume_root);
+            }
+        }
+        {
+            let mut visit_extra_area = |gcref: &mut GcRef| {
+                visit(*gcref, crate::shadow_stack::current_extra_area());
+            };
+            if walk_all_mutators {
+                crate::shadow_stack::walk_all_extra_areas(&mut visit_extra_area);
+            } else {
+                crate::shadow_stack::walk_my_extra_areas(&mut visit_extra_area);
+            }
+        }
+    }
+
     /// [`Self::enumerate_root_walker_values`] with each value tagged by the
     /// walker that produced it, so a root carrying a freed address can be
     /// attributed to its source rather than to the marking loop that pops it.
@@ -5750,75 +5835,7 @@ impl MiniMarkGC {
             result.push((unsafe { *root_ptr }, "registered_root"));
         }
 
-        let walk_all_mutators = crate::gc_sync::mutators_quiesced();
-        let mut visit_shadow_root = |gcref: &mut GcRef| {
-            result.push((*gcref, "shadow_stack_root"));
-        };
-        if walk_all_mutators {
-            crate::shadow_stack::walk_all_roots(&mut visit_shadow_root);
-        } else {
-            crate::shadow_stack::walk_roots(&mut visit_shadow_root);
-        }
-
-        let mut visit_jf_root = |gcref: &mut GcRef| {
-            if !gcref.is_null() && crate::shadow_stack::is_libc_jitframe(gcref.0) {
-                crate::shadow_stack::trace_libc_jitframe(gcref.0, &mut |slot_ptr| {
-                    let field_ref = unsafe { *slot_ptr };
-                    if !field_ref.is_null() {
-                        result.push((field_ref, "jitframe_slot"));
-                    }
-                });
-            } else {
-                result.push((*gcref, "jf_root"));
-            }
-        };
-        if walk_all_mutators {
-            crate::shadow_stack::walk_all_jf_roots(&mut visit_jf_root);
-        } else {
-            crate::shadow_stack::walk_jf_roots(&mut visit_jf_root);
-        }
-        // Same source the minor-collection root phase reads; enumerated here
-        // too, so a root that exists for the collector is also a root this
-        // listing reports. A listing that omitted it would say an object is
-        // unreachable while the collector keeps it.
-        crate::walk_active_live_deadframes(&mut |addr| {
-            crate::shadow_stack::trace_libc_jitframe(addr, &mut |slot_ptr| {
-                let field_ref = unsafe { *slot_ptr };
-                if !field_ref.is_null() {
-                    result.push((field_ref, "deadframe_slot"));
-                }
-            });
-        });
-
-        let mut visit_bh_root = |gcref: &mut GcRef| {
-            result.push((*gcref, "blackhole_register"));
-        };
-        if walk_all_mutators {
-            crate::shadow_stack::walk_all_bh_regs(&mut visit_bh_root);
-        } else {
-            crate::shadow_stack::walk_bh_regs(&mut visit_bh_root);
-        }
-
-        // blackhole resume construction roots (`resume.py:1312`): see the
-        // minor-collection path for why the in-flight virtuals_cache /
-        // registers_r slices must be seeded as roots.
-        let mut visit_resume_root = |gcref: &mut GcRef| {
-            result.push((*gcref, "resume_ref_root"));
-        };
-        if walk_all_mutators {
-            crate::shadow_stack::walk_all_resume_ref_roots(&mut visit_resume_root);
-        } else {
-            crate::shadow_stack::walk_resume_ref_roots(&mut visit_resume_root);
-        }
-
-        let mut visit_extra_area = |gcref: &mut GcRef| {
-            result.push((*gcref, crate::shadow_stack::current_extra_area()));
-        };
-        if walk_all_mutators {
-            crate::shadow_stack::walk_all_extra_areas(&mut visit_extra_area);
-        } else {
-            crate::shadow_stack::walk_my_extra_areas(&mut visit_extra_area);
-        }
+        Self::walk_stack_shaped_roots(|gcref, site| result.push((gcref, site)));
 
         crate::shadow_stack::walk_extra_roots(|gcref| {
             result.push((*gcref, "extra_root"));
@@ -6468,14 +6485,40 @@ impl MiniMarkGC {
         }
     }
 
-    /// incminimark.py `collect_nonstack_roots(); visit_all_objects()`.
+    /// Re-gray a root the end-of-marking rescan has already visited, or seed it
+    /// when it is still white.
     ///
-    /// Non-stack roots may grow after the initial root snapshot while marking
-    /// is incremental.  Revisit the process/interpreter-owned root walkers and
-    /// pending-finalizer queues immediately before finalizer processing and
-    /// sweep, then drain every newly greyed object.  Thread frame/shadow-stack
-    /// roots are deliberately not repeated here: upstream repeats only
-    /// `collect_nonstack_roots`, not `collect_roots`.
+    /// `seed_major_root` leaves an object with `GCFLAG_VISITED` off the gray
+    /// stack, so a black root that picked up a new child would not be traced
+    /// again. A nursery root takes the seed path, which marks without queueing
+    /// when the marking worklist must not hold it.
+    fn regray_or_seed_major_root(&mut self, gcref: GcRef, site: &str) {
+        if gcref.is_null() {
+            return;
+        }
+        // incminimark.py keeps nursery objects out of a marking worklist, so a
+        // nursery root goes through the seeding path.
+        let regray = !self.is_in_nursery(gcref.0)
+            && self.is_managed_heap_object(gcref.0)
+            && unsafe { (*header_of(gcref.0)).has_flag(GcFlags::GCFLAG_VISITED) };
+        if regray {
+            self.incr_state.gray_stack.push(gcref.0);
+        } else {
+            self.seed_major_root(gcref, site);
+        }
+    }
+
+    /// `collect_nonstack_roots` at the end of MARKING (`major_collection_step`).
+    ///
+    /// Owns `prebuilt_root_objects`, the extra-root walker,
+    /// `walk_rescan_roots`, and the finalizer death queues. Already-black
+    /// values are left black: `seed_major_root` does not re-trace a
+    /// `GCFLAG_VISITED` object. The barrier-less stack-shaped sets are the
+    /// ones that need regray, and they belong to
+    /// [`Self::rescan_major_stack_roots_black_and_drain`].
+    ///
+    /// Upstream `collect_nonstack_roots` walks `prebuilt_root_objects`, the
+    /// static roots (`root_walker.walk_roots`), and `enum_pending_finalizers`.
     fn rescan_major_nonstack_roots_and_drain(&mut self) {
         // In place, for the reason `seed_major_roots` gives.
         let mut i = 0;
@@ -7495,54 +7538,39 @@ impl MiniMarkGC {
         }
     }
 
-    /// incminimark.py:1792-1799 turns every old object modified since the cycle
-    /// began back to gray — "precisely the old objects that have been modified
-    /// and need rescanning" — before the sweep decides survivors, and
-    /// :2478-2481 rescans the roots that can grow after the cycle's opening
-    /// snapshot. Upstream needs only the non-stack half there, because its
-    /// stack roots are covered by two invariants pyre does not share: a
-    /// JITFRAME is nursery-allocated, so every minor re-traces it and a
-    /// promotion during MARKING re-queues it (:2079-2083), and the objects a
-    /// mutator stores into a stack slot mid-cycle were promoted during MARKING
-    /// and are therefore born black.
+    /// End-of-marking rescan of the barrier-less stack-shaped roots.
     ///
-    /// pyre's stack root sets are mutated with no write barrier and hold
-    /// pre-cycle objects: an off-GC JitFrame is `alloc_zeroed` memory outside
-    /// the heap entirely, so its pointer stays valid across a collecting call
-    /// while compiled code stores Refs into its gcmap slots (the nursery-built
-    /// frames get their pointer back from `_reload_frame_if_necessary`
-    /// instead), the blackhole register banks and resume-construction roots
-    /// are plain slices, and `seed_major_root` arms a newly seeded old root
-    /// into the remembered set only once — the next minor drains that set and
-    /// nothing re-arms it. A black root can therefore come to hold the only
-    /// reference to a white object. Walk the root sets once more here and turn
-    /// the black ones gray again; this can only add survivors, never free a
-    /// reachable object.
+    /// Owns the shadow stack, JitFrame / libc jitframe slots, live deadframe
+    /// slots, blackhole register banks, resume-construction roots, and the
+    /// mutator extra areas. Each value is re-grayed when it is already
+    /// `GCFLAG_VISITED` outside the nursery, and seeded otherwise. Registered
+    /// roots and the extra-root walker belong to
+    /// [`Self::rescan_major_nonstack_roots_and_drain`].
+    ///
+    /// `major_collection_step` repeats only `collect_nonstack_roots` at the end
+    /// of MARKING. Upstream's stack roots stay covered without this pass: a
+    /// JITFRAME is nursery-allocated, so every minor re-traces it and a
+    /// promotion during MARKING re-queues it, and a value stored into a stack
+    /// slot mid-cycle was promoted during MARKING and is born black. pyre's
+    /// stack-shaped sets are mutated with no write barrier and hold pre-cycle
+    /// objects. An off-GC JitFrame is `alloc_zeroed` memory outside the heap,
+    /// so its pointer stays valid across a collecting call while compiled code
+    /// stores Refs into its gcmap slots (nursery-built frames get their
+    /// pointer back from `_reload_frame_if_necessary` instead). The blackhole
+    /// register banks and resume-construction roots are plain slices, and
+    /// `seed_major_root` arms a newly seeded old root into the remembered set
+    /// only once — the next minor drains that set and nothing re-arms it. A
+    /// black root can therefore come to hold the only reference to a white
+    /// object. Walking these sets once more here can only add survivors.
     fn rescan_major_stack_roots_black_and_drain(&mut self) {
-        // The labeled list directly: `enumerate_root_walker_values` drops the
-        // labels into a second full-population `Vec` because `GcRef` and
-        // `(GcRef, &str)` are different widths, and this pass runs once per
-        // major cycle over every root.  The label is what inspection wants,
-        // not this walk.
-        for (gcref, _) in self.enumerate_labeled_root_walker_values() {
-            if gcref.is_null() {
-                continue;
-            }
-            // incminimark.py:1322-1340 keeps nursery objects out of a marking
-            // worklist, so a nursery root goes through the seeding path, which
-            // marks it without queueing it.
-            let regray = !self.is_in_nursery(gcref.0)
-                && self.is_managed_heap_object(gcref.0)
-                && unsafe { (*header_of(gcref.0)).has_flag(GcFlags::GCFLAG_VISITED) };
-            if regray {
-                self.incr_state.gray_stack.push(gcref.0);
-            } else {
-                self.seed_major_root(gcref, "marking_regray_root");
-            }
+        // Same split as the non-stack rescan: finish the walk, then mutate
+        // the mark state. `walk_stack_shaped_roots` reads TLS root slots.
+        let mut roots = Vec::new();
+        Self::walk_stack_shaped_roots(|gcref, _site| roots.push(gcref));
+        for gcref in roots {
+            self.regray_or_seed_major_root(gcref, "marking_regray_root");
         }
-        while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
-            self.mark_object(obj_addr);
-        }
+        self.drain_gray_stack();
     }
 
     /// incminimark.py `visit_all_objects`: mark until the worklist is
@@ -9894,6 +9922,14 @@ impl GcAllocator for MiniMarkGC {
     /// `assign_inheritance_ids` (normalizecalls.py).
     fn freeze_types(&mut self) {
         self.types.freeze_types();
+    }
+
+    fn assign_inheritance_ids_now(&mut self) {
+        self.types.assign_inheritance_ids_now();
+    }
+
+    fn types_frozen(&self) -> bool {
+        self.types.is_frozen()
     }
 
     /// Owns a `TypeRegistry`, so a shape id can always be resolved against

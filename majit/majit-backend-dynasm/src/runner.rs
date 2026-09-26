@@ -475,10 +475,13 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
 /// Production path: register all `set_active_*` hooks WITHOUT storing a
 /// box, so every trampoline routes to the process-global `gc_sync` singleton
 /// (the per-thread GC box is the free-threading gap R4 removes).
+///
+/// The type table stays open. `gctypelayout.py encode_type_shapes_now`
+/// closes it at translation; pyre closes it before the first reader so
+/// JIT-only types can still be registered after startup.
 pub fn install_gc_standalone() {
     majit_gc::gc_sync::gc_op(|gc| {
         check_jitframe_descr(gc);
-        gc.freeze_types();
     });
     let supports_guard_gc_type = majit_gc::gc_sync::gc_query(|gc| gc.supports_guard_gc_type());
     register_active_hooks(supports_guard_gc_type);
@@ -2747,6 +2750,11 @@ impl Backend for DynasmBackend {
         ops: &[OpRc],
         token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
+        // at translation. Close before `collect_guard_gc_type_info` reads it.
+        // Once frozen this is a query; backend-only tests never reach the
+        // metainterp compile entry.
+        majit_gc::ensure_type_registry_closed();
         let _writing = majit_backend::AssemblerWriting::enter();
         // `x86/assembler.py:514` parity: PyPy creates the
         // `CompiledLoopToken` inside `assemble_loop`, and that's where
@@ -3007,6 +3015,8 @@ impl Backend for DynasmBackend {
         _previous_tokens: &[std::sync::Arc<JitCellToken>],
         _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
+        // Same close as `compile_loop`: bridge codegen reads `type_info_group`.
+        majit_gc::ensure_type_registry_closed();
         let _writing = majit_backend::AssemblerWriting::enter();
         // `x86/runner.py:100-101` parity:
         //   clt = original_loop_token.compiled_loop_token

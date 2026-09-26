@@ -4479,13 +4479,23 @@ impl<M: Clone> MetaInterp<M> {
             .get_mut(index)
     }
 
-    /// call.py:147 `jd.mainjitcode` for a `jitdrivers_sd` slot.
+    /// `call.py grab_initial_jitcodes` `jd.mainjitcode` for a `jitdrivers_sd`
+    /// slot. The eager field wins; otherwise a bound loader decodes once into
+    /// the slot's `OnceLock` and stamps `jitdriver_sd` the way
+    /// `JitDriver::install_extracted_portal_jitcode` does.
     pub fn mainjitcode_of(&self, index: usize) -> Option<&std::sync::Arc<crate::jitcode::JitCode>> {
-        self.staticdata
-            .jitdrivers_sd
-            .get(index)?
-            .mainjitcode
-            .as_ref()
+        let jd = self.staticdata.jitdrivers_sd.get(index)?;
+        if let Some(jitcode) = jd.mainjitcode.as_ref() {
+            return Some(jitcode);
+        }
+        let loader = jd.mainjitcode_loader?;
+        if jd.mainjitcode_loaded.get().is_none() {
+            if let Some(jitcode) = loader() {
+                jitcode.set_jitdriver_sd(index);
+                let _ = jd.mainjitcode_loaded.set(jitcode);
+            }
+        }
+        jd.mainjitcode_loaded.get()
     }
 
     /// Whether the driver in `jitdrivers_sd[index]` carries a
@@ -7855,6 +7865,10 @@ impl<M: Clone> MetaInterp<M> {
     /// is dropped alongside it; if not (early-Cancelled paths), both
     /// halves stay live for continued tracing.
     pub fn compile_loop(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
+        // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
+        // at translation. Close before the optimizer reads it. A trace that
+        // did not enter through `force_start_tracing` still reaches here.
+        majit_gc::ensure_type_registry_closed();
         self.remember_compiled_graph_write();
         let outcome = self.compile_loop_body(jump_args, meta);
         self.retire_speculative_cut_key(outcome);
@@ -11431,6 +11445,9 @@ impl<M: Clone> MetaInterp<M> {
         meta: M,
         exit_with_exception: bool,
     ) -> Result<(), SwitchToBlackhole> {
+        // Root FINISH optimizes here. `gctypelayout.py encode_type_shapes_now`
+        // closes `type_info_group` at translation; close before that read.
+        majit_gc::ensure_type_registry_closed();
         self.remember_compiled_graph_write();
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
@@ -12010,6 +12027,9 @@ impl<M: Clone> MetaInterp<M> {
     /// Returns the green_key on success (caller must call
     /// attach_procedure_to_interp), None on failure.
     pub fn compile_simple_loop(&mut self, meta: M) -> Option<u64> {
+        // Segmented loops optimize here without `compile_loop`.
+        // `gctypelayout.py encode_type_shapes_now` closes at translation.
+        majit_gc::ensure_type_registry_closed();
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
@@ -15187,6 +15207,9 @@ impl<M: Clone> MetaInterp<M> {
     where
         T: std::borrow::Borrow<majit_ir::Op>,
     {
+        // Entry bridges optimize here. `gctypelayout.py encode_type_shapes_now`
+        // closes `type_info_group` at translation; close before that read.
+        majit_gc::ensure_type_registry_closed();
         if !self.compiled_loops.contains_key(&green_key) {
             crate::mc_diag_bump(34); // compile_entry_bridge: target has no compiled loop
             return false;
@@ -15809,6 +15832,9 @@ impl<M: Clone> MetaInterp<M> {
         // SimpleCompileData (optimize_loop) otherwise.
         ends_with_jump: bool,
     ) -> bool {
+        // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
+        // at translation. Close before bridge optimization reads it.
+        majit_gc::ensure_type_registry_closed();
         self.remember_compiled_graph_write();
         self.last_compiled_artifact_token = None;
         crate::mc_diag_bump(8); // compile_bridge entered
@@ -22728,6 +22754,8 @@ mod metainterp_static_data_tests {
             result_type: majit_ir::Type::Ref,
             is_recursive: false,
             mainjitcode: None,
+            mainjitcode_loader: None,
+            mainjitcode_loaded: std::sync::OnceLock::new(),
             portal_runner_adr: 0,
             virtualizable_info: None,
             greenfield_info: None,

@@ -366,6 +366,12 @@ pub struct TypeRegistry {
     /// types at the end of `make_type_info_group` /
     /// `encode_type_shapes_now` (gctypelayout.py).
     can_add_new_types: bool,
+    /// Set once `assign_inheritance_ids_now` has run
+    /// (`normalizecalls.py assign_inheritance_ids`). `register` then
+    /// rejects a type with `has_subclass_range`, because those preorder
+    /// bounds are the whole classdef census. Types without a subclass
+    /// range can still be registered until `freeze_types`.
+    inheritance_ids_assigned: bool,
 }
 
 /// Custom trace function type.
@@ -1076,6 +1082,7 @@ impl TypeRegistry {
             offset_tables: Vec::new(),
             custom_data: Vec::new(),
             can_add_new_types: true,
+            inheritance_ids_assigned: false,
         }
     }
 
@@ -1089,17 +1096,24 @@ impl TypeRegistry {
     /// matching `TypeLayoutBuilder.close_table` rather than imposing an
     /// arbitrary registration cap to keep a build-time pointer stable.
     ///
-    /// `subclassrange_{min,max}` are intentionally left at 0 here;
-    /// `freeze_types` walks the inheritance tree afterwards and
-    /// assigns preorder bounds via `assign_inheritance_ids`
-    /// (normalizecalls.py:373-389), then refreshes the materialized
-    /// `TypeEntry` rows.
+    /// `subclassrange_{min,max}` are intentionally left at 0 here.
+    /// `assign_inheritance_ids_now` walks the inheritance tree and
+    /// assigns preorder bounds (`normalizecalls.py assign_inheritance_ids`);
+    /// `freeze_types` calls that and then refreshes the materialized
+    /// `TypeEntry` rows (`gctypelayout.py encode_type_shapes_now`).
     pub fn register(&mut self, mut info: TypeInfo) -> u32 {
         assert!(
             self.can_add_new_types,
             "TypeRegistry::register called after freeze_types \
              (gctypelayout.can_add_new_types == False)"
         );
+        if self.inheritance_ids_assigned {
+            assert!(
+                !info.has_subclass_range,
+                "a type with a subclass range cannot be registered after \
+                 inheritance ids were assigned"
+            );
+        }
         let id = self.entries.len();
         // `T_MEMBER_INDEX` is the low 16 bits of `infobits`, so an id past
         // `u16::MAX` cannot round-trip through `encode_type_shape` — it would
@@ -1248,7 +1262,7 @@ impl TypeRegistry {
             return;
         }
         self.can_add_new_types = false;
-        self.assign_inheritance_ids();
+        self.assign_inheritance_ids_now();
         self.offset_tables.reserve(self.entries.len() * 2);
         self.custom_data.reserve(self.entries.len());
         for (i, info) in self.entries.iter().enumerate() {
@@ -1296,6 +1310,25 @@ impl TypeRegistry {
         let address = table.as_ptr() as usize;
         storage.push(table);
         address
+    }
+
+    /// Run `normalizecalls.py assign_inheritance_ids` once.
+    ///
+    /// `freeze_types` (`gctypelayout.py encode_type_shapes_now`) calls this
+    /// before it publishes `frozen_layout_table`. A startup caller can assign
+    /// the preorder `subclassrange_{min,max}` first and still register later
+    /// types that have no subclass range. Idempotent.
+    ///
+    /// `assign_inheritance_ids` writes min/max only for entries with
+    /// `has_subclass_range`. Every constructor leaves the other entries at
+    /// `(0, 0)`, and a type without the flag adds no peer, so skipping a
+    /// second pass leaves a late entry exactly where a full pass would.
+    pub fn assign_inheritance_ids_now(&mut self) {
+        if self.inheritance_ids_assigned {
+            return;
+        }
+        self.assign_inheritance_ids();
+        self.inheritance_ids_assigned = true;
     }
 
     /// `rtyper/normalizecalls.py assign_inheritance_ids` /
@@ -1388,10 +1421,13 @@ impl TypeRegistry {
         }
     }
 
-    /// Whether the registry has been frozen
-    /// (gctypelayout.can_add_new_types == False).
+    /// Whether `freeze_types` has published `frozen_layout_table`.
+    ///
+    /// Compiled guards embed that table's base address
+    /// (`llsupport/gc.py get_translated_info_for_typeinfo`).
+    /// `assign_inheritance_ids_now` does not publish it.
     pub fn is_frozen(&self) -> bool {
-        !self.can_add_new_types
+        self.frozen_layout_table.is_some()
     }
 
     /// Look up type info by ID.
@@ -1830,5 +1866,102 @@ mod tests {
                 obj_addr + 6 * word,
             ]
         );
+    }
+
+    fn recorded_ranges(reg: &TypeRegistry, ids: &[u32]) -> Vec<(i64, i64)> {
+        ids.iter()
+            .map(|&id| {
+                let info = reg.get(id);
+                (info.subclassrange_min, info.subclassrange_max)
+            })
+            .collect()
+    }
+
+    /// Logical `type_info_group` rows. Offset-table addresses differ between
+    /// registries; the length word and the offsets themselves do not.
+    fn recorded_table(reg: &TypeRegistry) -> Vec<(usize, usize, Vec<usize>, i64, i64)> {
+        reg.type_info_table()
+            .iter()
+            .map(|row| {
+                let offsets_ptr = row.type_info.ofstoptrs as *const usize;
+                let header = unsafe { *offsets_ptr };
+                let offsets = (1..=header)
+                    .map(|i| unsafe { *offsets_ptr.add(i) })
+                    .collect();
+                let class = unsafe { row.tail.classtype };
+                (
+                    row.type_info.fixedsize,
+                    row.type_info.infobits,
+                    offsets,
+                    class.subclassrange_min,
+                    class.subclassrange_max,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn assign_inheritance_ids_now_keeps_ranges_when_a_late_type_is_frozen() {
+        let mut reg = TypeRegistry::new();
+        let parent = reg.register(TypeInfo::object(16));
+        let child = reg.register(TypeInfo::object_subclass(24, parent));
+        let other = reg.register(TypeInfo::object(16));
+        reg.assign_inheritance_ids_now();
+        let ids = [parent, child, other];
+        let ranges = recorded_ranges(&reg, &ids);
+        assert!(ranges.iter().all(|(min, max)| min < max));
+
+        let late = reg.register(TypeInfo::with_gc_ptrs(24, vec![0, 8]));
+        assert!(!reg.is_frozen());
+        reg.freeze_types();
+        assert!(reg.is_frozen());
+        assert_eq!(recorded_ranges(&reg, &ids), ranges);
+
+        let late_info = reg.get(late);
+        assert_eq!(
+            (late_info.subclassrange_min, late_info.subclassrange_max),
+            (0, 0)
+        );
+        let row = &reg.type_info_table()[late as usize];
+        assert_eq!(row.type_info.fixedsize, late_info.size);
+        let offsets_ptr = row.type_info.ofstoptrs as *const usize;
+        unsafe {
+            assert_eq!(*offsets_ptr, late_info.gc_ptr_offsets.len());
+            for (i, offset) in late_info.gc_ptr_offsets.iter().enumerate() {
+                assert_eq!(*offsets_ptr.add(i + 1), *offset);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "a type with a subclass range cannot be registered after inheritance ids were assigned"
+    )]
+    fn register_subclass_range_after_assign_inheritance_ids_panics() {
+        let mut reg = TypeRegistry::new();
+        reg.register(TypeInfo::object(16));
+        reg.assign_inheritance_ids_now();
+        reg.register(TypeInfo::object_subclass(16, 0));
+    }
+
+    #[test]
+    fn freeze_after_assign_inheritance_ids_matches_plain_freeze() {
+        fn build(
+            assign_first: bool,
+        ) -> (Vec<(i64, i64)>, Vec<(usize, usize, Vec<usize>, i64, i64)>) {
+            let mut reg = TypeRegistry::new();
+            let parent = reg.register(TypeInfo::object(16));
+            let child = reg.register(TypeInfo::object_subclass(24, parent));
+            let other = reg.register(TypeInfo::object(32));
+            if assign_first {
+                reg.assign_inheritance_ids_now();
+                reg.assign_inheritance_ids_now();
+            }
+            reg.freeze_types();
+            let ids = [parent, child, other];
+            (recorded_ranges(&reg, &ids), recorded_table(&reg))
+        }
+
+        assert_eq!(build(true), build(false));
     }
 }

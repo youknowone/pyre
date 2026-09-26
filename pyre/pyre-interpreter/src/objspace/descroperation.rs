@@ -5785,9 +5785,22 @@ pub fn float_pow_raw(x: f64, y: f64) -> Result<f64, PyError> {
 }
 
 /// floatobject.py `W_FloatObject.descr_pow`.
-fn float_pow_impl(x: f64, y: f64) -> PyResult {
+///
+/// Descent leaf: the success arm boxes with the same in-graph
+/// `malloc_typed_managed` spelling as `_float_truediv`. `w_float_new` is the
+/// synthetic constructor the float-binop walk does not lower.
+#[inline(never)]
+pub(crate) fn float_pow_impl(x: f64, y: f64) -> PyResult {
     match float_pow_inner(x, y) {
-        Ok(z) => Ok(w_float_new(z)),
+        Ok(z) => Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: z,
+            w_dict: PY_NULL,
+            w_slots: PY_NULL,
+        }) as PyObjectRef),
         // Negative numbers raised to fractional powers become complex.
         Err(FloatPowError::Domain) => unsafe {
             complex_pow(w_complex_new(x, 0.0), w_complex_new(y, 0.0))
@@ -5795,6 +5808,12 @@ fn float_pow_impl(x: f64, y: f64) -> PyResult {
         Err(FloatPowError::ZeroDivision) => Err(PyError::zero_division("zero to a negative power")),
         Err(FloatPowError::Overflow) => Err(float_pow_overflow_error()),
     }
+}
+
+/// Host predicate for the float `**` descent: a raising `_pow` arm is not
+/// descended (same rule as a zero divisor on `_float_truediv`).
+pub fn float_pow_would_raise(x: f64, y: f64) -> bool {
+    float_pow_inner(x, y).is_err()
 }
 
 /// Left shift dispatch (`<<` operator).
