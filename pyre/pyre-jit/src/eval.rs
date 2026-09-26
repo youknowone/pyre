@@ -5135,9 +5135,8 @@ fn build_jit_driver_pair() -> JitDriverPair {
                 .filter_map(|(name, addr)| {
                     // `frame_anchor_push` is a recorded `CallI` whose depth
                     // word the trace keeps, so its release is recorded too.
-                    (name.contains("stack_check")
-                        || name.contains("set_in_flight_exception"))
-                    .then_some(addr)
+                    (name.contains("stack_check") || name.contains("set_in_flight_exception"))
+                        .then_some(addr)
                 })
                 .collect(),
         });
