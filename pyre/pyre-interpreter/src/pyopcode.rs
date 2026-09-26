@@ -324,7 +324,7 @@ pub fn decode_instruction_forward(
             continue;
         }
         if opcode_pc != start
-            && u8::from(instruction) < 44
+            && opcode_byte_of_code_unit_word(word) < 44
             && !matches!(instruction, Instruction::Reserved)
         {
             return Err(crate::pycode::BytecodeCorruption);
@@ -354,13 +354,14 @@ pub fn decode_instruction_forward_pc(code: &CodeObject, pc: usize) -> usize {
         if opcode_pc >= code_instructions_len(code) {
             return usize::MAX;
         }
-        let instruction = instruction_from_code_unit_word(code_unit_at(code, opcode_pc));
+        let word = code_unit_at(code, opcode_pc);
+        let instruction = instruction_from_code_unit_word(word);
         if matches!(instruction, Instruction::ExtendedArg) {
             opcode_pc += 1;
             continue;
         }
         if opcode_pc != start
-            && u8::from(instruction) < 44
+            && opcode_byte_of_code_unit_word(word) < 44
             && !matches!(instruction, Instruction::Reserved)
         {
             return usize::MAX;
@@ -400,7 +401,7 @@ pub fn decode_instruction_forward_packed(code: &CodeObject, pc: usize) -> u64 {
             continue;
         }
         if opcode_pc != start
-            && u8::from(instruction) < 44
+            && opcode_byte_of_code_unit_word(word) < 44
             && !matches!(instruction, Instruction::Reserved)
         {
             return u64::MAX;
@@ -2247,6 +2248,15 @@ pub fn oparg_from_u32(value: u32) -> OpArg {
     // SAFETY: `OpArg` is `#[repr(transparent)] struct OpArg(u32)`; every
     // `u32` is a valid `OpArg`.
     unsafe { std::mem::transmute::<u32, OpArg>(value) }
+}
+
+/// The opcode byte of a code unit word: the byte
+/// [`instruction_from_code_unit_word`] reinterprets, read without the
+/// `u8::from(Instruction)` call into the bytecode crate, which lies outside
+/// the extracted LLBC.
+#[inline]
+fn opcode_byte_of_code_unit_word(word: u16) -> u8 {
+    word as u8
 }
 
 #[inline]
