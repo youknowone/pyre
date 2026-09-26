@@ -38,7 +38,9 @@ def main():
         except (ValueError, TypeError) as e:
             key = type(e).__name__
             counts[key] = counts.get(key, 0) + 1
-    print(total, sorted(counts.items()))
+    result = (total, sorted(counts.items()))
+    assert result == (372400, [("TypeError", 55), ("ValueError", 62)]), result
 
 
 main()
+print("OK")

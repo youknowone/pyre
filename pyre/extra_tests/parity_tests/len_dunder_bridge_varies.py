@@ -52,7 +52,12 @@ def main():
         total += n
         if i in (0, 3999, 4000, 4001, 4017, 7999):
             seen.append((i, n))
-    print(total, errors, seen)
+    assert (total, errors, seen) == (
+        41885,
+        235,
+        [(0, 3), (3999, 3), (4000, 8), (4001, 8), (4017, 8), (7999, 8)],
+    ), (total, errors, seen)
 
 
 main()
+print("OK")

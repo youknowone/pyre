@@ -41,7 +41,8 @@ def main():
     for s in ["", "foo=bar", " FOO = bar    "]:
         src = f"{s};" * (N - 1) + s
         res = parse(src)
-        print(len(res), len(set(res)))
+        assert (len(res), len(set(res))) == (N, 1), (s, len(res), len(set(res)))
 
 
 main()
+print("OK")
