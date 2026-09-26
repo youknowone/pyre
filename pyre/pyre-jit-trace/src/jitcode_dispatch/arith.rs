@@ -1071,6 +1071,7 @@ regular_record_table! {
         "int_sub/ii>i" => IntSub,
         "int_mul/ii>i" => IntMul,
         "int_and/ii>i" => IntAnd,
+        "int_signext/ii>i" => IntSignext,
         "int_or/ii>i" => IntOr,
         "int_xor/ii>i" => IntXor,
         "int_lshift/ii>i" => IntLshift,
