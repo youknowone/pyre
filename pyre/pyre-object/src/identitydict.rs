@@ -40,6 +40,12 @@ impl PartialEq for IdentityKey {
 
 impl Eq for IdentityKey {}
 
+impl crate::rordereddict::EntryDummy for IdentityKey {
+    fn dummy() -> Self {
+        Self(std::ptr::null_mut())
+    }
+}
+
 /// `IdentityDictStrategy` backing — erased identity-keyed `{}`
 /// (`identitydict.py`). GC-managed storage box (mirrors the other
 /// dict strategies; see `dictmultiobject::ObjectDictStorage`).

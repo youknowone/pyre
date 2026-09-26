@@ -116,6 +116,12 @@ unsafe impl Send for PyObject {}
 
 pub type PyObjectRef = *mut PyObject;
 
+impl crate::rordereddict::EntryDummy for PyObjectRef {
+    fn dummy() -> Self {
+        std::ptr::null_mut()
+    }
+}
+
 /// Null object reference, used as a sentinel for "no value".
 pub const PY_NULL: PyObjectRef = std::ptr::null_mut();
 

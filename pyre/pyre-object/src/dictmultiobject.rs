@@ -90,6 +90,15 @@ impl PartialEq for ObjectKey {
 
 impl Eq for ObjectKey {}
 
+impl crate::rordereddict::EntryDummy for ObjectKey {
+    fn dummy() -> Self {
+        Self {
+            hash: 0,
+            obj: std::ptr::null_mut(),
+        }
+    }
+}
+
 /// Hash adapter for an `r_dict` key whose Python hash was already computed.
 ///
 /// `rordereddict` feeds that cached integer directly into its table, and so
@@ -4354,7 +4363,10 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
 /// # Safety
 /// `dict` must point to a valid `W_DictObject` whose `dstorage` is an
 /// `RDict<K, PyObjectRef, S>`.
-unsafe fn typed_move_to_end<K: std::hash::Hash + Eq, S: std::hash::BuildHasher>(
+unsafe fn typed_move_to_end<
+    K: std::hash::Hash + Eq + crate::rordereddict::EntryDummy,
+    S: std::hash::BuildHasher,
+>(
     dict: *mut W_DictObject,
     k: &K,
     last: bool,
