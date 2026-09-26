@@ -434,13 +434,11 @@ pub fn any_call_to_raising_graphs(
     false
 }
 
-// ============================================================
 // Auto-inlining heuristics — pure read-only graph cost model.
 // `OP_WEIGHTS` / `block_weight` / `static_instruction_count` /
 // `inlinable_static_callers` / `always_inline`. The
 // `_dont_inline_` / `_always_inline_` flag reads default to upstream's
 // `getattr(..., default)` fallback.
-// ============================================================
 
 /// `OP_WEIGHTS` at `inline.py`. Per-opname weight table
 /// consumed by `block_weight`. Opnames absent from the map default
@@ -696,11 +694,9 @@ fn callable_dont_inline(callee: &GraphRef) -> bool {
     g.func.as_ref().is_some_and(|f| f._dont_inline_)
 }
 
-// ============================================================
 // Median-execution-cost solver + inlining_heuristic.
 // Depends on `tool::algo::sparsemat::SparseMatrix` and
 // `super::support::find_loop_blocks`.
-// ============================================================
 
 /// `measure_median_execution_cost(graph)` at `inline.py`.
 ///
@@ -890,12 +886,10 @@ pub fn inlining_heuristic(graph: &GraphRef) -> (f64, bool) {
     (0.9999 * median + count, true)
 }
 
-// ============================================================
 // BaseInliner foundation — fields, constructor, and the read-only
 // / pure helpers (get_new_name, passon_vars, copy_operation,
 // copy_link, copy_block, search_for_calls,
 // find_args_in_exceptional_case).
-// ============================================================
 
 /// Sub-inliner kind selector — controls
 /// [`BaseInliner::search_for_calls`]'s behaviour.
@@ -952,7 +946,7 @@ pub enum PassonCacheKey {
 /// `inline_once` / `do_inline` and the rewire mutators follow;
 /// the public entry points are at the bottom.
 pub struct BaseInliner<'t> {
-    // ----- upstream `__init__` parameters -----
+    // upstream `__init__` parameters
     /// Upstream `self.translator`.
     pub translator: &'t TranslationContext,
     /// Upstream `self.graph` — the host graph being mutated.
@@ -983,11 +977,11 @@ pub struct BaseInliner<'t> {
     /// invocation; pyre Arcshares the closure cell to mirror that.
     pub call_count_pred: Option<CallCountPred>,
 
-    // ----- upstream `Inliner.__init__` extension -----
+    // upstream `Inliner.__init__` extension
     /// Upstream `self.inline_func` and the kind discriminator.
     pub kind: InlinerKind,
 
-    // ----- upstream "inline-all" queue -----
+    // upstream "inline-all" queue
     /// Upstream `self.block_to_index`. Maps each pending block
     /// to a per-op-index callee dict.
     ///
@@ -1007,7 +1001,7 @@ pub struct BaseInliner<'t> {
         ),
     >,
 
-    // ----- upstream "per-inline-call" state -----
+    // upstream "per-inline-call" state
     /// Upstream `self.varmap` (`:194`).
     pub varmap: std::collections::HashMap<
         crate::flowspace::model::Variable,
@@ -1448,7 +1442,7 @@ impl<'t> BaseInliner<'t> {
         linkargs
     }
 
-    // ----- orchestrator + rewire mutators + drivers -----
+    // orchestrator + rewire mutators + drivers
 
     /// `inline_all(self)` at `inline.py`.
     ///
@@ -2175,13 +2169,11 @@ pub fn simple_inline_function(
     )
 }
 
-// ============================================================
 // Automatic inlining driver.
 //
 // `instrument_inline_candidates` (`:569-602`),
 // `auto_inlining` (`:608-713`),
 // `auto_inline_graphs` (`:715-731`).
-// ============================================================
 
 /// `instrument_inline_candidates(graphs, threshold)` at
 /// `inline.py:569-602`.
@@ -2979,7 +2971,7 @@ mod tests {
         assert!(!contains_call(&g, CalleeMatcher::Any, &translator));
     }
 
-    // ----- auto-inlining heuristics -----
+    // auto-inlining heuristics
 
     #[test]
     fn op_weight_table_matches_upstream_six_overrides() {
@@ -3113,7 +3105,7 @@ mod tests {
         assert_eq!(result_with_ops.len(), 0);
     }
 
-    // ----- median-execution cost + inlining_heuristic -----
+    // median-execution cost + inlining_heuristic
 
     #[test]
     fn measure_median_execution_cost_int_add_graph_returns_block_weight() {
@@ -3163,7 +3155,7 @@ mod tests {
         assert_eq!(weight, 200.0);
     }
 
-    // ----- BaseInliner construction + simple helpers -----
+    // BaseInliner construction + simple helpers
 
     fn fixture_inliner<'t>(
         translator: &'t TranslationContext,
@@ -3312,7 +3304,7 @@ mod tests {
         assert!(Rc::ptr_eq(&target, &copied));
     }
 
-    // ----- orchestrator + drivers -----
+    // orchestrator + drivers
 
     #[test]
     fn inline_all_empty_queue_returns_zero() {
@@ -3403,7 +3395,7 @@ mod tests {
         use crate::flowspace::model::{ConstValue, Constant};
         let translator = fixture_translator();
 
-        // ---- Callee ----
+        // Callee
         let x = Variable::named("x");
         let f_start = Block::shared(vec![Hlvalue::Variable(x.clone())]);
         let f_graph = FunctionGraph::new("f", f_start.clone());
@@ -3431,7 +3423,7 @@ mod tests {
         // Build the funcobj Constant pointing at f.
         let f_funcobj_const = make_func_constant(&f, "f");
 
-        // ---- Host ----
+        // Host
         let g_start = Block::shared(vec![]);
         let g_graph = FunctionGraph::new("g", g_start.clone());
         let g_r = Variable::named("g_r");
@@ -3482,7 +3474,7 @@ mod tests {
         assert!(!any_direct_call, "direct_call should have been inlined out");
     }
 
-    // ----- public entry points -----
+    // public entry points
 
     /// Helper: build the trivial host graph `g(): r = f(...); return r`
     /// where the call's funcobj points at `callee`. Returns the host
@@ -3645,7 +3637,7 @@ mod tests {
         Hlvalue::Constant(Constant::new(ConstValue::LLPtr(Box::new(ptr))))
     }
 
-    // ----- instrument_inline_candidates -----
+    // instrument_inline_candidates
 
     #[test]
     fn instrument_inline_candidates_empty_graphs_returns_zero() {
@@ -3734,7 +3726,7 @@ mod tests {
         assert_eq!(labels, [0, 1]);
     }
 
-    // ----- auto_inlining -----
+    // auto_inlining
 
     /// Test heuristic that always reports a low fixed weight so the
     /// `weight >= threshold` early-exit doesn't fire. Returns
@@ -3852,7 +3844,7 @@ mod tests {
         );
     }
 
-    // ----- auto_inline_graphs -----
+    // auto_inline_graphs
 
     #[test]
     fn auto_inline_graphs_empty_returns_zero() {

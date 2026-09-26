@@ -232,7 +232,7 @@ fn rewire_one_option_try_site(
         ));
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     let (some_bb, some_inputs) = graph.create_block_with_arg_vars(some_sources.len());
     let (none_bb, _none_inputs) = graph.create_block_with_arg_vars(0);

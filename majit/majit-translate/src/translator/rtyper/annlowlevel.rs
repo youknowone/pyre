@@ -308,9 +308,7 @@ pub fn typemeth_placeholder_sigarg(s: &str) -> Result<SigArgType, TyperError> {
     }
 }
 
-// ---------------------------------------------------------------------
 // annlowlevel.py — KeyComp
-// ---------------------------------------------------------------------
 
 /// RPython `class KeyComp(object)` (annlowlevel.py).
 ///
@@ -368,9 +366,7 @@ impl std::fmt::Display for KeyComp {
     }
 }
 
-// ---------------------------------------------------------------------
 // annlowlevel.py — LowLevelAnnotatorPolicy
-// ---------------------------------------------------------------------
 
 /// RPython `class LowLevelAnnotatorPolicy(AnnotatorPolicy)`
 /// (annlowlevel.py:43-90).
@@ -597,9 +593,7 @@ impl From<LowLevelAnnotatorPolicy> for PolicyHandle {
     }
 }
 
-// ---------------------------------------------------------------------
 // annlowlevel.py — annotate_lowlevel_helper
-// ---------------------------------------------------------------------
 
 /// RPython `annotate_lowlevel_helper(annotator, ll_function, args_s,
 /// policy=None)` (annlowlevel.py:92-95).
@@ -630,9 +624,7 @@ pub fn annotate_lowlevel_helper(
         .map_err(|e| TyperError::message(e.to_string()))
 }
 
-// ---------------------------------------------------------------------
 // annlowlevel.py — MixLevelAnnotatorPolicy
-// ---------------------------------------------------------------------
 
 /// RPython `class MixLevelAnnotatorPolicy(LowLevelAnnotatorPolicy)`
 /// (annlowlevel.py:100-123).
@@ -790,9 +782,7 @@ impl From<MixLevelAnnotatorPolicy> for PolicyHandle {
     }
 }
 
-// ---------------------------------------------------------------------
 // annlowlevel.py — MixLevelHelperAnnotator
-// ---------------------------------------------------------------------
 
 /// One entry of [`MixLevelHelperAnnotator::pending`] — matches the
 /// upstream 4-tuple `(ll_function, graph, args_s, s_result)`
@@ -1868,9 +1858,7 @@ impl MixLevelHelperAnnotator {
     }
 }
 
-// ---------------------------------------------------------------------
 // annlowlevel.py — make_string_entries / hlstr / llstr
-// ---------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StringEntryType {
@@ -1946,9 +1934,7 @@ pub const llunicode: StringEntryHelper = StringEntryHelper {
     direction: StringEntryDirection::Ll,
 };
 
-// ---------------------------------------------------------------------
 // annlowlevel.py:453-568 — pointer-cast helpers and extregistry entries
-// ---------------------------------------------------------------------
 
 pub fn cast_object_to_ptr(_ptr: LowLevelType, _object: ConstValue) -> Result<Constant, TyperError> {
     Err(TyperError::message(
@@ -2024,11 +2010,9 @@ pub fn cast_adr_to_nongc_instance(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CastBasePtrToInstanceEntry;
 
-// ---------------------------------------------------------------------
 // Unit tests — lock in that every stub surface reports its upstream
 // line number so follow-up body fills can trip on the exact error
 // string.
-// ---------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

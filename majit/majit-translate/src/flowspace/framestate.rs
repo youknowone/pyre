@@ -314,7 +314,7 @@ impl FrameState {
     }
 }
 
-// ---- free functions --------------------------------------------------------
+// free functions
 
 /// RPython `framestate.py:_copy` — deep-copy a cell so every Variable
 /// becomes a fresh one.

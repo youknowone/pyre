@@ -7051,7 +7051,7 @@ mod tests {
             .collect()
     }
 
-    // --- virtualizable_boxes tests ---
+    // virtualizable_boxes tests
 
     fn make_test_vable_info() -> crate::virtualizable::VirtualizableInfo {
         let mut info = crate::virtualizable::VirtualizableInfo::new(0);

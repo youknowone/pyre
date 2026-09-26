@@ -977,7 +977,7 @@ mod tests {
             Hlvalue::Variable(newstr_c.clone()),
         ]);
 
-        // ---- startblock.
+        // startblock.
         let chars = variable_with_lltype("chars", chars_ptr.clone());
         startblock.borrow_mut().operations.push(SpaceOperation::new(
             "getsubstruct",
@@ -1022,7 +1022,7 @@ mod tests {
             .into_ref(),
         ]);
 
-        // ---- copy block.
+        // copy block.
         let chars_s = variable_with_lltype("chars_s", chars_ptr.clone());
         copy_block.borrow_mut().operations.push(SpaceOperation::new(
             "getsubstruct",

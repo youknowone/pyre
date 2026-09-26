@@ -66,7 +66,7 @@ pub unsafe fn xor_payloads_collecting(a: *const RBigInt, b: *const RBigInt) -> R
     unsafe { (&*a).xor_with_gc_roots(&*b, Some(&mut roots)) }
 }
 
-// ---- RBigIntGcRoot ----
+// RBigIntGcRoot
 /// Address-stable GC root for a host-side, by-value `RBigInt`.
 ///
 /// RPython's GC transform puts an `rbigint` local's `_digits` edge in the
@@ -116,7 +116,7 @@ impl Drop for RBigIntGcRoot {
     }
 }
 
-// ---- payload offsets, type id, prebuilt identity, payload allocators ----
+// payload offsets, type id, prebuilt identity, payload allocators
 /// Offset used when registering the raw RBigInt payload with MiniMark.
 pub const RBIGINT_DIGITS_OFFSET: usize = std::mem::offset_of!(RBigInt, _digits);
 pub const RBIGINT_PAYLOAD_SIZE: usize = std::mem::size_of::<RBigInt>();
@@ -358,7 +358,7 @@ pub fn alloc_rbigint_stable(value: RBigInt) -> *mut RBigInt {
     crate::malloc_raw(value)
 }
 
-// ---- pair type id and pair allocators ----
+// pair type id and pair allocators
 /// Runtime GC id for the `tuple2` struct. Both fields are traced edges; a pair
 /// allocated before the id is published (bare tests, pre-init bootstrap) falls
 /// back to a leaked raw allocation, like the payload helpers above.
@@ -477,7 +477,7 @@ pub fn alloc_rbigint_pair_no_collect(item0: *mut RBigInt, item1: *mut RBigInt) -
     crate::malloc_raw(RBigIntPair { item0, item1 })
 }
 
-// ---- PendingPartsCacheDigitRoot ----
+// PendingPartsCacheDigitRoot
 /// Explicit root for a cached rbigint that has been computed but is not yet
 /// reachable from the translated module-global `_parts_cache` graph.
 ///
@@ -510,7 +510,7 @@ impl Drop for PendingPartsCacheDigitRoot {
     }
 }
 
-// ---- walk_rbigint_cache_digit_slots ----
+// walk_rbigint_cache_digit_slots
 /// Visit the `_digits` GC slots held by the process-global formatter cache.
 /// PyPy's module-global `_parts_cache` is part of the translated prebuilt root
 /// graph; pyre's embedder adapts these raw slots to its `GcRef` root visitor.

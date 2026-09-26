@@ -21,9 +21,7 @@ use serde_json::Value;
 use serde_json::value::RawValue;
 use std::sync::OnceLock;
 
-// ---------------------------------------------------------------------------
 // FunDecl + meta
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 pub struct FunDecl {
@@ -531,11 +529,9 @@ pub struct Signature {
     pub output: TyRef,
 }
 
-// ---------------------------------------------------------------------------
 // Types — kept thin. The lowering driver only needs to *label* types
 // for diff output, not deeply reason about them, so the type table is
 // not walked here.
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
@@ -569,9 +565,7 @@ impl TyRef {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Bodies
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 pub struct Unstructured {
@@ -687,9 +681,7 @@ impl Statement {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Statements
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
 pub enum StmtKind {
@@ -716,9 +708,7 @@ pub struct AssertStmt {
     pub check_kind: Value,
 }
 
-// ---------------------------------------------------------------------------
 // Places, operands, rvalues
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Place {
@@ -811,9 +801,7 @@ pub enum Operand {
     Const(Value),
 }
 
-// ---------------------------------------------------------------------------
 // Terminators
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
 pub enum TermKind {

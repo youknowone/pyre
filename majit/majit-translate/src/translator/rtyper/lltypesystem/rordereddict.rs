@@ -1414,7 +1414,7 @@ pub(crate) fn build_ll_dict_bool_helper_graph(
     let d_for_len = variable_with_lltype("d", ptr_lltype);
     let block_check_len = Block::shared(vec![Hlvalue::Variable(d_for_len.clone())]);
 
-    // ---- start: ptr_nonzero(d); branch on the result.
+    // start: ptr_nonzero(d); branch on the result.
     let v_nz = variable_with_lltype("v_nz", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "ptr_nonzero",
@@ -1436,7 +1436,7 @@ pub(crate) fn build_ll_dict_bool_helper_graph(
     .into_ref();
     startblock.closeblock(vec![start_true_link, start_false_link]);
 
-    // ---- check_len: getfield(num_live_items); int_ne(n, 0).
+    // check_len: getfield(num_live_items); int_ne(n, 0).
     let v_count = variable_with_lltype("num_live_items", LowLevelType::Signed);
     block_check_len
         .borrow_mut()
@@ -1899,7 +1899,7 @@ pub fn build_ll_dict_lookup_helper_graph(
     let uns = || LowLevelType::Unsigned;
     let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
 
-    // ---- startblock inputargs: (d, key, hash, store_flag).
+    // startblock inputargs: (d, key, hash, store_flag).
     let d = new_var("d", dict_ptr_lltype.clone());
     let key = new_var("key", key_lltype.clone());
     let hash = new_var("hash", sig());
@@ -2100,7 +2100,7 @@ pub fn build_ll_dict_lookup_helper_graph(
     let block_free_choose_slot =
         Block::shared(vec![var(&fc_d), var(&fc_indexes), var(&fc_i), var(&fc_ds)]);
 
-    // ===== startblock =====
+    // startblock
     let entries = new_var("entries", entries_ptr_lltype.clone());
     push(
         &startblock,
@@ -2177,7 +2177,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_first_valid: checkingkey == key on the first probe. =====
+    // block_first_valid: checkingkey == key on the first probe.
     let fv_slot = new_var("slot", sig());
     push(
         &block_first_valid,
@@ -2312,7 +2312,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         ]);
     }
 
-    // ===== block_first_notvalid: DELETED vs pristine FREE. =====
+    // block_first_notvalid: DELETED vs pristine FREE.
     let nv_i_s = new_var("i_s", sig());
     push(
         &block_first_notvalid,
@@ -2353,7 +2353,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_first_pristine_store: store at i iff FLAG_STORE, else -1. =====
+    // block_first_pristine_store: store at i iff FLAG_STORE, else -1.
     let ps_i_s = new_var("i_s", sig());
     push(
         &block_first_pristine_store,
@@ -2384,7 +2384,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_store_at: indexes[slot] = num_ever_used + VALID_OFFSET; return -1. =====
+    // block_store_at: indexes[slot] = num_ever_used + VALID_OFFSET; return -1.
     let st_neu = new_var("num_ever_used_items", sig());
     push(
         &block_store_at,
@@ -2417,7 +2417,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         Link::new(vec![signed(-1)], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
-    // ===== block_loop_init: perturb = r_uint(hash); enter loop. =====
+    // block_loop_init: perturb = r_uint(hash); enter loop.
     let li_perturb = new_var("perturb", uns());
     push(
         &block_loop_init,
@@ -2444,7 +2444,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_loop_body: i = ((i<<2)+i+perturb+1)&mask; read slot; branch FREE. =====
+    // block_loop_body: i = ((i<<2)+i+perturb+1)&mask; read slot; branch FREE.
     let lb_ish = new_var("ish", uns());
     push(
         &block_loop_body,
@@ -2541,7 +2541,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_loop_notfree: index >= VALID_OFFSET vs DELETED. =====
+    // block_loop_notfree: index >= VALID_OFFSET vs DELETED.
     let nf_ge = new_var("ge", LowLevelType::Bool);
     push(
         &block_loop_notfree,
@@ -2578,7 +2578,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_loop_valid: checkingkey == key on a probed slot. =====
+    // block_loop_valid: checkingkey == key on a probed slot.
     let lv_slot = new_var("slot", sig());
     push(
         &block_loop_valid,
@@ -2715,7 +2715,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         ]);
     }
 
-    // ===== block_loop_deleted: record first deleted slot (deletedslot == -1). =====
+    // block_loop_deleted: record first deleted slot (deletedslot == -1).
     let ld_i_s = new_var("i_s", sig());
     push(
         &block_loop_deleted,
@@ -2760,7 +2760,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_perturb_shift: perturb >>= PERTURB_SHIFT; back-edge to loop body. =====
+    // block_perturb_shift: perturb >>= PERTURB_SHIFT; back-edge to loop body.
     let sh_perturb_new = new_var("perturb", uns());
     push(
         &block_perturb_shift,
@@ -2787,7 +2787,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_loop_free: store at deletedslot iff FLAG_STORE, else -1. =====
+    // block_loop_free: store at deletedslot iff FLAG_STORE, else -1.
     let lf_is_store = new_var("is_store", LowLevelType::Bool);
     push(
         &block_loop_free,
@@ -2811,7 +2811,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_free_choose_slot: deletedslot==-1 ? i : deletedslot, then store. =====
+    // block_free_choose_slot: deletedslot==-1 ? i : deletedslot, then store.
     let fc_i_s = new_var("i_s", sig());
     push(
         &block_free_choose_slot,
@@ -3720,7 +3720,7 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
         var(&ad_perturb),
     ]);
 
-    // ---- block_cond body: read indexes[i]; branch on == FREE.
+    // block_cond body: read indexes[i]; branch on == FREE.
     let cd_i_s = new_var("i_s", sig());
     push(&block_cond, "cast_uint_to_int", vec![var(&cd_i)], &cd_i_s);
     let cd_elem = new_var("elem", uns());
@@ -3767,7 +3767,7 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_advance body: i = ((i<<2)+i+perturb+1)&mask_u; perturb >>= PERTURB_SHIFT.
+    // block_advance body: i = ((i<<2)+i+perturb+1)&mask_u; perturb >>= PERTURB_SHIFT.
     let ad_ish = new_var("ish", uns());
     push(
         &block_advance,
@@ -3829,7 +3829,7 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_write body: _ll_write_indexes(d, i_s, index + VALID_OFFSET).
+    // block_write body: _ll_write_indexes(d, i_s, index + VALID_OFFSET).
     let wr_value = new_var("value", sig());
     push(
         &block_write,
@@ -6860,13 +6860,13 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
     let mut graph =
         FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
 
-    // ===== overwrite path (i >= 0): entries[i].value = value. =====
+    // overwrite path (i >= 0): entries[i].value = value.
     let ow_d = new_var("d", dict_ptr_lltype.clone());
     let ow_i = new_var("i", sig());
     let ow_value = new_var("value", value_lltype.clone());
     let block_overwrite = Block::shared(vec![var(&ow_d), var(&ow_i), var(&ow_value)]);
 
-    // ===== insert path (i < 0). =====
+    // insert path (i < 0).
     let ins_d = new_var("d", dict_ptr_lltype.clone());
     let ins_key = new_var("key", key_lltype.clone());
     let ins_value = new_var("value", value_lltype.clone());
@@ -6896,7 +6896,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_overwrite body.
+    // block_overwrite body.
     let ow_entries = new_var("entries", entries_ptr_lltype.clone());
     push(
         &block_overwrite,
@@ -6919,7 +6919,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
-    // ---- block_insert_entry body: len(entries) == num_ever_used_items?
+    // block_insert_entry body: len(entries) == num_ever_used_items?
     let orig_entries = new_var("orig_entries", entries_ptr_lltype.clone());
     push(
         &block_insert_entry,
@@ -6997,7 +6997,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_do_grow body.
+    // block_do_grow body.
     let reindexed_grow = new_var("reindexed_grow", LowLevelType::Bool);
     push(
         &block_do_grow,
@@ -7020,7 +7020,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_after_grow body: rc = resize_counter - 3; branch rc <= 0.
+    // block_after_grow body: rc = resize_counter - 3; branch rc <= 0.
     let rc0 = new_var("rc0", sig());
     push(
         &block_after_grow,
@@ -7094,7 +7094,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_do_resize body: ll_dict_resize(d); reindexed=True; rc = resize_counter - 3.
+    // block_do_resize body: ll_dict_resize(d); reindexed=True; rc = resize_counter - 3.
     push(
         &block_do_resize,
         "direct_call",
@@ -7131,7 +7131,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_after_resize body: branch on reindexed.
+    // block_after_resize body: branch on reindexed.
     block_after_resize.borrow_mut().exitswitch = Some(var(&ar_reindexed));
 
     // block_do_insert_clean(d, key, value, hash, rc).
@@ -7189,7 +7189,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_do_insert_clean body.
+    // block_do_insert_clean body.
     let num_ever_ic = new_var("num_ever_ic", sig());
     push(
         &block_do_insert_clean,
@@ -7223,7 +7223,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_write_entry body: write the fresh entry, bump counters.
+    // block_write_entry body: write the fresh entry, bump counters.
     push(
         &block_write_entry,
         "setfield",
@@ -7508,7 +7508,7 @@ pub fn build_ll_dictnext_helper_graph(
 
     let exc_args = exception_args("StopIteration")?;
 
-    // ---- startblock inputargs: (iter).
+    // startblock inputargs: (iter).
     let iter = new_var("iter", iter_ptr_lltype.clone());
     let startblock = Block::shared(vec![var(&iter)]);
     let return_var = new_var("result", sig());
@@ -7591,7 +7591,7 @@ pub fn build_ll_dictnext_helper_graph(
     let cl_iter = new_var("iter", iter_ptr_lltype.clone());
     let block_clear = Block::shared(vec![var(&cl_iter)]);
 
-    // ===== startblock: dict = iter.dict; if dict raise-guard. =====
+    // startblock: dict = iter.dict; if dict raise-guard.
     let dict0 = new_var("dict", dict_ptr_lltype.clone());
     push(
         &startblock,
@@ -7623,7 +7623,7 @@ pub fn build_ll_dictnext_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_setup: read entries, index, entries_len; enter loop. =====
+    // block_setup: read entries, index, entries_len; enter loop.
     let su_entries = new_var("entries", entries_ptr_lltype.clone());
     push(
         &block_setup,
@@ -7660,7 +7660,7 @@ pub fn build_ll_dictnext_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_loop_cond: while index < entries_len. =====
+    // block_loop_cond: while index < entries_len.
     let lt = new_var("lt", LowLevelType::Bool);
     push(
         &block_loop_cond,
@@ -7696,7 +7696,7 @@ pub fn build_ll_dictnext_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_loop_body: nextindex = index + 1; branch on entries.valid. =====
+    // block_loop_body: nextindex = index + 1; branch on entries.valid.
     let lb_next = new_var("nextindex", sig());
     push(
         &block_loop_body,
@@ -7744,7 +7744,7 @@ pub fn build_ll_dictnext_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_return_valid: iter.index = nextindex; return index. =====
+    // block_return_valid: iter.index = nextindex; return index.
     let rv_void = new_var("v", LowLevelType::Void);
     push(
         &block_return_valid,
@@ -7756,7 +7756,7 @@ pub fn build_ll_dictnext_helper_graph(
         Link::new(vec![var(&rv_index)], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
-    // ===== block_invalid: popitem(last=False) fast-forward hack. =====
+    // block_invalid: popitem(last=False) fast-forward hack.
     let iv_lfn = new_var("lfn", sig());
     push(
         &block_invalid,
@@ -7813,7 +7813,7 @@ pub fn build_ll_dictnext_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_bump: lookup_function_no += (1 << FUNC_SHIFT); loop back. =====
+    // block_bump: lookup_function_no += (1 << FUNC_SHIFT); loop back.
     let bp_new_lfn = new_var("lfn", sig());
     push(
         &block_bump,
@@ -7847,7 +7847,7 @@ pub fn build_ll_dictnext_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== block_clear: iter.dict = nullptr; raise StopIteration. =====
+    // block_clear: iter.dict = nullptr; raise StopIteration.
     let cl_void = new_var("v", LowLevelType::Void);
     push(
         &block_clear,

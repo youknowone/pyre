@@ -969,9 +969,7 @@ fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
         .map(|entry| bind_lookup_instance(entry, host))
 }
 
-// ---------------------------------------------------------------------------
 // Value-level registry — RPython `EXT_REGISTRY_BY_VALUE` (extregistry.py).
-// ---------------------------------------------------------------------------
 
 /// RPython `extregistry.is_registered(instance)` (extregistry.py).
 ///
@@ -1026,9 +1024,7 @@ pub fn lookup(instance: &ConstValue) -> Option<ExtRegistryEntry> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Type-level registry — RPython `EXT_REGISTRY_BY_TYPE` (extregistry.py).
-// ---------------------------------------------------------------------------
 
 /// RPython `extregistry.is_registered_type(tp)` (extregistry.py).
 ///

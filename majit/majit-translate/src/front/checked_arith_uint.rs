@@ -261,7 +261,7 @@ fn rewire_one_checked_arith_uint_site(
 
     crate::front::bool_then::validate_dynamic_option_exit(graph, graph.blocks[a].id)?;
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     let a_id = graph.blocks[a].id;
     // Drop the residual call (A's last op) so `opt` is produced solely by the

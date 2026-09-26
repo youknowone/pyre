@@ -2201,7 +2201,7 @@ fn jit_blackhole_resume_from_guard(
         );
     }
 
-    // --- Path 1: rd_numb-based resume (resume.py:1312 exact parity) ---
+    // Path 1: rd_numb-based resume (resume.py blackhole_from_resumedata)
     // When rd_numb is present, use ResumeDataDirectReader to decode
     // frame sections precisely, matching RPython blackhole_from_resumedata.
     //
@@ -5266,7 +5266,6 @@ pub extern "C" fn jit_frame_set_slot_float(frame_ptr: i64, idx: i64, raw: f64) {
     locals_w_mut!(frame)[idx as usize] = boxed;
 }
 
-// ===========================================================================
 // Blackhole helper functions
 //
 // RPython blackhole.py: bhimpl_recursive_call_i, bhimpl_residual_call_*
@@ -5274,7 +5273,6 @@ pub extern "C" fn jit_frame_set_slot_float(frame_ptr: i64, idx: i64, raw: f64) {
 // These are called by the BlackholeInterpreter through JitCode.fn_ptrs.
 // Residual calls execute without accidental JIT re-entry; recursive portal
 // calls are routed explicitly through the jitdriver's portal runner.
-// ===========================================================================
 
 fn bh_call_self_recursive_portal(
     ec: *const pyre_interpreter::PyExecutionContext,

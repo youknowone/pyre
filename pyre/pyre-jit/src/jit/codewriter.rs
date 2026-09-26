@@ -32,9 +32,7 @@ use super::flatten::{
     CallDescrStub, CallFlavor, GraphFlattener, Kind, ResKind, SSARepr, slot_for_call_flavor,
 };
 
-// ---------------------------------------------------------------------------
 // RPython: codewriter/flatten.py KINDS = ['int', 'ref', 'float']
-// ---------------------------------------------------------------------------
 
 /// Python `var_num` → flat index into the `locals_cells_stack_w`
 /// virtualizable array.
@@ -6066,9 +6064,7 @@ fn decode_exception_catch_sites(
 // whose `nlocals` alone exceeds 256 — the same condition that crashes
 // the RPython translator.
 
-// ---------------------------------------------------------------------------
 // RPython: codewriter/codewriter.py — class CodeWriter
-// ---------------------------------------------------------------------------
 
 /// Compiles Python CodeObjects into JitCode for blackhole execution.
 ///
@@ -14292,7 +14288,7 @@ impl CodeWriter {
                         // three groups below are the opcodes this compiler cannot emit;
                         // each still declines, and each now says which one it was.
 
-                        // ---- Adaptive specializations ----
+                        // Adaptive specializations
                         // A specializing interpreter rewrites the generic opcode in place
                         // in the code object; the compiler never emits one.  pyre's eval
                         // loop does not quicken, so the walk cannot meet one.
@@ -14386,7 +14382,7 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // ---- sys.monitoring instrumentation ----
+                        // sys.monitoring instrumentation
                         // Substituted at runtime while a monitoring tool is attached, and
                         // never produced by the static compiler.  Nothing in the tree
                         // writes one.
@@ -14414,7 +14410,7 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // ---- Interpreter- and JIT-internal ----
+                        // Interpreter- and JIT-internal
                         // `EnterExecutor`, `InterpreterExit` and the two `JumpBackward`
                         // forms belong to a tier-2 executor this interpreter does not
                         // have; `Reserved` is a hole in the opcode table.
@@ -16377,9 +16373,7 @@ impl CodeWriter {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Jump target calculation (RPython: flatten.py link following)
-// ---------------------------------------------------------------------------
 
 /// True when a backward bytecode jump returns from an exception handler to
 /// earlier code, rather than closing a loop.
@@ -16401,11 +16395,9 @@ fn backward_jump_is_handler_only_target(
     !pyre_interpreter::target_dominates(&succ, target_pc, source_pc)
 }
 
-// ---------------------------------------------------------------------------
 // JitCode cache — RPython: `CallControl.get_jitcode` (call.py).
 // The cache + `unfinished_graphs` queue live on `super::call::CallControl`;
 // `CallControl::get_jitcode` is the canonical entry point.
-// ---------------------------------------------------------------------------
 
 /// Portal entry path: `setup_jitdriver` followed by `make_jitcodes` —
 /// the warmspot order at codewriter.py:74-99. RPython runs this once

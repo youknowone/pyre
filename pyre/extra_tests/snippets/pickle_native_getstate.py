@@ -22,7 +22,7 @@ def refuses(obj):
     return False
 
 
-# --- publishes `__getstate__`: reduces through the hook ---------------------
+# publishes `__getstate__`: reduces through the hook
 b = io.BytesIO(b"abcdef")
 b.seek(2)
 b.tag = "kept"
@@ -41,12 +41,12 @@ state = s.__reduce_ex__(2)[2]
 assert state[0] == "hello", state
 assert state[2] == 2, state
 
-# --- publishes a refusing `__getstate__`: the hook owns the refusal ---------
+# publishes a refusing `__getstate__`: the hook owns the refusal
 w = io.BufferedWriter(io.BytesIO())
 assert io.BufferedWriter.__getstate__ is not object.__getstate__
 assert refuses(w)
 
-# --- publishes none: `object_getstate_default(required)` refuses ------------
+# publishes none: `object_getstate_default(required)` refuses
 for obj in (
     types.ModuleType("m"),
     property(),

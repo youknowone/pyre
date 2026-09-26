@@ -138,9 +138,7 @@ impl GraphInfo for () {}
 /// The trait is parameterised over the result lattice (`R`) and the
 /// graph-info type (`I`). Subclasses pin both via the impl.
 pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
-    // ------------------------------------------------------------
     // upstream-overridable hooks
-    // ------------------------------------------------------------
 
     /// `compute_graph_info(graph)` (`graphanalyze.py`). Default
     /// is `None` (`I::default()`). Subclasses override to compute
@@ -251,9 +249,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     /// the trait owning a concrete field.
     fn analyzed_calls(&mut self) -> &mut UnionFind<usize, Dependency<R>>;
 
-    // ------------------------------------------------------------
     // dispatch
-    // ------------------------------------------------------------
 
     /// `analyze(op, seen, graphinfo)` (`graphanalyze.py`).
     fn analyze(

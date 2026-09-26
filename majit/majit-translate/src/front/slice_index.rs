@@ -331,7 +331,7 @@ fn rewire_one_slice_index_site(
         }
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     // 4. Remove the range construction for RangeFrom and Range rewrites.
     // RangeTo (including MinusOne) leaves the ctor and its FieldWrite in

@@ -81,9 +81,7 @@ fn const_float(x: f64) -> SomeValue {
     SomeValue::Float(s)
 }
 
-// ---------------------------------------------------------------------------
 // test_equality (test_model.py)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_equality() {
@@ -119,9 +117,7 @@ fn test_equality() {
     let _ = SomeImpossibleValue::new();
 }
 
-// ---------------------------------------------------------------------------
 // test_contains (test_model.py)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_contains() {
@@ -156,9 +152,7 @@ fn test_contains() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // test_signedness (test_model.py)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_signedness() {
@@ -173,7 +167,6 @@ fn test_signedness() {
     assert!(unsigned.contains(&nonneg));
 }
 
-// ---------------------------------------------------------------------------
 // test_list_union (test_model.py)
 //
 // Upstream body:
@@ -214,7 +207,6 @@ fn test_list_union() {
     assert_eq!(s2, s3);
 }
 
-// ---------------------------------------------------------------------------
 // test_list_contains (test_model.py)
 //
 // Upstream semantics are identity-based: independently constructed
@@ -249,9 +241,7 @@ fn test_list_contains() {
     assert_ne!(s1, s2);
 }
 
-// ---------------------------------------------------------------------------
 // test_nan (test_model.py)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_nan() {
@@ -262,9 +252,7 @@ fn test_nan() {
     assert!(f2.contains(&f1));
 }
 
-// ---------------------------------------------------------------------------
 // unionof variadic smoke test — upstream tests `unionof(*somevalues)`.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_unionof_multiple_integers() {

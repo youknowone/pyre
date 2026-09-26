@@ -70,9 +70,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use majit_metainterp::JitDriver;
 
-// ---------------------------------------------------------------------------
 // the meter
-// ---------------------------------------------------------------------------
 
 std::thread_local! {
     /// Allocations made by THIS thread. `const`-initialised and holding a
@@ -238,9 +236,7 @@ fn local_allocs() -> u64 {
     LOCAL_ALLOCS.with(Cell::get)
 }
 
-// ---------------------------------------------------------------------------
 // what the entry hook records
-// ---------------------------------------------------------------------------
 
 /// Entries seen since the last [`reset_entries`].
 static ENTRIES: AtomicU64 = AtomicU64::new(0);
@@ -275,9 +271,7 @@ fn window() -> (u64, u64) {
     (entries, spanned)
 }
 
-// ---------------------------------------------------------------------------
 // the GC
-// ---------------------------------------------------------------------------
 
 /// Install the process GC, because WHERE the jitframe comes from is part of
 /// the configuration this file measures.
@@ -326,9 +320,7 @@ fn install_gc() {
     majit_backend_dynasm::runner::install_gc_standalone();
 }
 
-// ---------------------------------------------------------------------------
 // the fixture: one machine, one persistent driver
-// ---------------------------------------------------------------------------
 
 pub type Bytecode = [u8];
 
@@ -423,9 +415,7 @@ fn expected() -> i64 {
     N * (N + 1) / 2
 }
 
-// ---------------------------------------------------------------------------
 // report
-// ---------------------------------------------------------------------------
 
 fn backend() -> &'static str {
     if cfg!(feature = "cranelift") {
@@ -484,7 +474,7 @@ fn main() {
          reported from here would be about neither."
     );
 
-    // ---- the counted window -------------------------------------------
+    // the counted window
     const CALLS: usize = 256;
     reset_entries();
     let before_local = local_allocs();
@@ -497,7 +487,7 @@ fn main() {
         (GLOBAL_ALLOCS.load(Ordering::Relaxed) - before_global).saturating_sub(call_allocs);
     let (entries, spanned) = window();
 
-    // ---- the attribution window ---------------------------------------
+    // the attribution window
     // Separate and short: symbolizing a backtrace per allocation costs far
     // more than the entry it describes, so a counted window run this way
     // would be measuring the profiler.

@@ -323,8 +323,8 @@ pub fn float_repr() -> Arc<FloatRepr> {
 /// `TAKE_NEXT = 2147483648.0` (`2**31`); inlined as a Float constant.
 /// `intmask(x)` is identity on a 64-bit Signed host.
 pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, TyperError> {
-    // ---- Block layout (created up-front so closeblock can reference
-    // ---- successors).
+    // Block layout (created up-front so closeblock can reference
+    // successors).
     let f_start = variable_with_lltype("f", LowLevelType::Float);
     let startblock = Block::shared(vec![Hlvalue::Variable(f_start.clone())]);
 
@@ -352,7 +352,7 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
     let float_zero = || constant_with_lltype(ConstValue::float(0.0), LowLevelType::Float);
     let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
 
-    // ---- start block: isfinite check via `(f - f) == 0.0`.
+    // start block: isfinite check via `(f - f) == 0.0`.
     let diff = variable_with_lltype("diff", LowLevelType::Float);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "float_sub",
@@ -383,7 +383,7 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
     .into_ref();
     startblock.closeblock(vec![start_true_link, start_false_link]);
 
-    // ---- block_not_finite: distinguish inf from NaN via `f == f`.
+    // block_not_finite: distinguish inf from NaN via `f == f`.
     let is_self = variable_with_lltype("is_self", LowLevelType::Bool);
     block_not_finite
         .borrow_mut()
@@ -411,7 +411,7 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
     .into_ref();
     block_not_finite.closeblock(vec![nf_true_link, nf_false_link]);
 
-    // ---- block_inf: branch on sign.
+    // block_inf: branch on sign.
     let is_neg = variable_with_lltype("is_neg", LowLevelType::Bool);
     block_inf.borrow_mut().operations.push(SpaceOperation::new(
         "float_lt",
@@ -433,7 +433,7 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
     .into_ref();
     block_inf.closeblock(vec![inf_neg_link, inf_pos_link]);
 
-    // ---- block_finite: short-circuit `f == 0.0` to return 0 since the
+    // block_finite: short-circuit `f == 0.0` to return 0 since the
     // bit-manipulation `decompose_float` formula returns (0.5, -1022)
     // for f == 0.0 (the formula's output is `frexp` for non-zero
     // values only). _hash_float(0.0) is canonically 0.
@@ -461,7 +461,7 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
     .into_ref();
     block_finite.closeblock(vec![fin_zero_link, fin_nonzero_link]);
 
-    // ---- block_finite_nonzero: extract IEEE 754 components, then
+    // block_finite_nonzero: extract IEEE 754 components, then
     // branch on `exp_raw == 0` (subnormal) so the two flavors
     // converge on a normalized `(expo_ll, mantissa_lo, sign_bit)`
     // before reconstructing the [0.5, 1)-mantissa float for the hash
@@ -584,7 +584,7 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
     .into_ref();
     block_finite_nonzero.closeblock(vec![to_subnormal, to_normal]);
 
-    // ---- block_subnormal: recover leading-bit position B via the
+    // block_subnormal: recover leading-bit position B via the
     // IEEE 754 round-trip trick. `cast_longlong_to_float` is exact for
     // the 52-bit mantissa (< 2^53), so the resulting f64's biased
     // exponent (`exp = 1023 + B`) directly yields B without a
@@ -702,7 +702,7 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
         .into_ref(),
     ]);
 
-    // ---- block_normal: `expo_ll = exp_raw - 1022`. Normal floats
+    // block_normal: `expo_ll = exp_raw - 1022`. Normal floats
     // already encode (1 + frac/2^52) at bias 1023, so mantissa_lo
     // passes through unchanged.
     let expo_ll_normal = variable_with_lltype("expo_ll", LowLevelType::SignedLongLong);
@@ -727,7 +727,7 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
         .into_ref(),
     ]);
 
-    // ---- block_join: assemble the [0.5, 1)-mantissa float and run
+    // block_join: assemble the [0.5, 1)-mantissa float and run
     // PyPy's `_hash_float` arithmetic on it.
     //
     // `mantissa_bits = mantissa_lo_normalized | (1022 << 52) | sign_bit`.

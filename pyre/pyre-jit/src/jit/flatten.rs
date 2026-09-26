@@ -1063,7 +1063,6 @@ impl ResKind {
     }
 }
 
-// --------------------------------------------------------------------------
 // Instruction shape.
 //
 // RPython's `ssarepr.insns` is a list of Python tuples with five possible
@@ -1078,7 +1077,6 @@ impl ResKind {
 // five shapes explicitly. The `Op` variant retains a separate `result`
 // field to match RPython's `'->'` marker rather than requiring the caller
 // to scan the args list.
-// --------------------------------------------------------------------------
 
 /// `flatten.py` / `assembler.py` tuple-argument types.
 ///
@@ -3372,9 +3370,7 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
     )
 }
 
-// ---------------------------------------------------------------------------
 // Flatten-time pre-rtype HLOp lowering.
-// ---------------------------------------------------------------------------
 
 /// Per-CodeWriter context that the pre-rtype HLOp lowering arms read
 /// to reconstruct the inline-equivalent `residual_call_*` Insn.
@@ -11714,7 +11710,6 @@ mod tests {
         }
     }
 
-    // ----------------------------------------------------------------
     // `_ovf` popline rewrite + handling_ovf=true reraise.
     //
     // Tests for `rpython/jit/codewriter/flatten.py:120-204`:
@@ -11724,7 +11719,6 @@ mod tests {
     //   * `make_exception_link` `handling_ovf=True` arm (lines 165-170)
     //     emitting `raise <OverflowError const>` via the cpu/rtyper/
     //     exceptiondata shim.
-    // ----------------------------------------------------------------
 
     /// Build a canraise startblock containing a single overflow-checked
     /// arithmetic op, then close it with `(normal, ovf [, catch_all])`

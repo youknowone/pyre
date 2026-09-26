@@ -6333,7 +6333,7 @@ mod tests {
         assert_eq!(op2.args[1], Hlvalue::Variable(b));
     }
 
-    // --- HostObject class_dict / mro ---
+    // HostObject class_dict / mro
 
     #[test]
     fn class_dict_get_set_roundtrip() {

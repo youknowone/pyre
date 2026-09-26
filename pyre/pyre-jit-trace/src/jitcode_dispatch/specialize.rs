@@ -5671,7 +5671,7 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // --- emit the virtualizable decomposed newlist (walker-native) ---
+    // emit the virtualizable decomposed newlist (walker-native)
     let list_op = match emit {
         Emit::Int(vals) => {
             let int_type_addr = int_ty as i64;
@@ -5943,7 +5943,7 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
         unsafe { pyre_object::w_int_get_value(c1) }
     };
 
-    // --- emit the virtual spec_ii walker-native ---
+    // emit the virtual spec_ii walker-native
     // Paired `w_class` guard per element so a runtime int subclass sharing
     // the public `int` `w_class` side-exits, then the plain-int payload unbox.
     // A fits-int `W_LongObject` also carries the public `int` `w_class`
@@ -6248,7 +6248,7 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
     // classes. Inlined here.
     let matched = pyre_interpreter::eval::check_exc_match_against(exc, match_type);
 
-    // --- commit to the fold: emit IR (no further declines) ---
+    // commit to the fold: emit IR (no further declines)
     // Pin `match_type` so a runtime divergence (a reassigned handler global)
     // side-exits rather than running the wrong handler.
     //
@@ -6570,7 +6570,7 @@ pub(crate) fn try_walker_fold_is_op<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // --- commit to the fold: emit IR (no further declines) ---
+    // commit to the fold: emit IR (no further declines)
     for (operand, operand_type) in [(lhs, lhs_type), (rhs, rhs_type)] {
         if operand.is_constant() || ctx.trace_ctx.heap_cache().is_class_known(operand) {
             continue;
@@ -6732,7 +6732,7 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
         }
     }
 
-    // --- commit to the fold: emit IR (no further declines) ---
+    // commit to the fold: emit IR (no further declines)
     // The only mutable input: `globals['__builtins__']` may be rebound after
     // this function is built, and a later iteration must then see the new
     // mapping.  Pinning the namespace `version?` revokes the loop instead.
@@ -6924,7 +6924,7 @@ pub(crate) fn try_walker_specialize_set_function_attribute<Sym: WalkSym>(
         (w_attr, w_func)
     };
 
-    // --- commit to the fold: emit IR (no further declines) ---
+    // commit to the fold: emit IR (no further declines)
     // The rebuild is a residual because it allocates — but it takes only the
     // mapping.  `func_op` is not an argument and stays unescaped, which is what
     // keeps the `defaults` store emitted behind this one foldable.  Rebuilding
@@ -7315,7 +7315,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     // Exact `w_class` first: it implies the LIST vtable, so the GuardClass
     // below is skipped. A list subclass shares `ob_type == &LIST_TYPE` but
     // retags `w_class` and may override `__getitem__`.
@@ -7623,7 +7623,7 @@ pub(crate) fn try_walker_specialize_subscr_tuple_slice2<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // --- commit: exact tuple guards, fixed length, immutable item reads ---
+    // commit: exact tuple guards, fixed length, immutable item reads
     let tuple_type_addr = &pyre_object::TUPLE_TYPE as *const _ as i64;
     walker_guard_exact_w_class(
         ctx,
@@ -7720,7 +7720,7 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     let tuple_type_addr = &pyre_object::pyobject::TUPLE_TYPE as *const _ as i64;
     walker_guard_exact_w_class(
         ctx,
@@ -10357,7 +10357,7 @@ fn try_walker_specialize_subscr_str<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
     let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
     walker_guard_class(ctx, op_pc, seq_op, str_type_addr)?;
@@ -11025,7 +11025,7 @@ pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     let callable_op = r_args[0];
     if !callable_op.is_constant() {
         let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
@@ -12313,7 +12313,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     }
     let concrete_locals_value = majit_ir::Value::Ref(majit_ir::GcRef(concrete_locals as usize));
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     // Pin the callable identity (LOAD_GLOBAL `locals` is usually already a
     // constant via the namespace cell fold).
     let callable_op = r_args[0];
@@ -13068,7 +13068,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     }
     let concrete_locals_value = majit_ir::Value::Ref(majit_ir::GcRef(concrete_locals as usize));
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     let callable_op = r_args[0];
     if !callable_op.is_constant() {
         let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
@@ -13498,7 +13498,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
         }
     }
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
 
     // `sys` is an ordinary mutable module, so nothing else keeps the name bound
@@ -14010,7 +14010,7 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
             )
         };
 
-    // --- commit: no declines below this point ---
+    // commit: no declines below this point
     let callable_op = r_args[0];
     if !callable_op.is_constant() {
         let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
@@ -15971,7 +15971,7 @@ pub(crate) fn try_walker_specialize_float_call<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     let callable_op = r_args[0];
     if !callable_op.is_constant() {
         let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
@@ -17308,7 +17308,7 @@ pub(crate) fn try_walker_specialize_builtin_divmod<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     walker_guard_builtin_callable_identity(ctx, op.pc, r_args[0], concrete_callable)?;
     let (lhs_op, rhs_op) = (r_args[2], r_args[3]);
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
@@ -17476,7 +17476,7 @@ fn try_walker_specialize_builtin_divmod_long_int<Sym: WalkSym>(
         return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op.pc });
     }
 
-    // --- emit ---
+    // emit
     walker_guard_builtin_callable_identity(ctx, op.pc, r_args[0], concrete_callable)?;
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op.pc, long_op, long_type_addr)?;
@@ -19214,7 +19214,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
             }
         }
     }
-    // --- commit to the specialization: emit IR (no further declines) ---
+    // commit to the specialization: emit IR (no further declines)
     // Pin the callable identity so the trace-time kind / vtable stay
     // valid across iterations (`implement_guard_value`).
     let callable_op = r_args[0];
@@ -19660,7 +19660,7 @@ pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
         pyre_object::interp_exceptions::w_exception_get_kind(exc)
     };
 
-    // --- commit: emit the `__context__` chaining, skip the publish ---
+    // commit: emit the `__context__` chaining, skip the publish
     // active = GETFIELD_GC_R(ec, sys_exc_value).
     //
     // Route the EC through `walker_ensure_execution_context` so the
@@ -19832,7 +19832,7 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // --- commit: pin the class identity, emit the construction + raise ---
+    // commit: pin the class identity, emit the construction + raise
     // Guard the class operand so the trace-time kind / vtable stay valid
     // across iterations (`implement_guard_value`).
     if !class_op.is_constant() {
@@ -20006,7 +20006,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // --- commit: pin the receiver, run the authentic raise, emit inline ---
+    // commit: pin the receiver, run the authentic raise, emit inline
     // The stability predicate makes the raise a pure function of `(obj,
     // name)`; `GuardValue` pins the one live input (`name` is a co_names
     // constant).
@@ -20214,7 +20214,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // --- commit: pin both MRO decisions, run the authentic raise, emit inline ---
+    // commit: pin both MRO decisions, run the authentic raise, emit inline
     // GuardClass pins the receiver payload without pinning its identity.
     let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
     let physical_type_const = ctx.trace_ctx.const_int(physical_type);
@@ -20995,7 +20995,7 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     // Exact `w_class` first: it implies the LIST vtable, so GuardClass skips.
     let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
     walker_guard_exact_w_class(
@@ -22606,7 +22606,7 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
         (start, slice_len)
     };
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     // For BOTH target (`list_op`) and source (`value_op`): guard_class LIST +
     // exact `w_class` (a list subclass sharing `ob_type == &LIST_TYPE` but with
     // an overridden `__setitem__` / `__iter__` side-exits to the generic
@@ -22812,7 +22812,7 @@ pub(crate) fn try_walker_specialize_compare_op_str<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // --- emit the specialized IR (walker-native) ---
+    // emit the specialized IR (walker-native)
     walker_guard_exact_str(ctx, op_pc, lhs)?;
     walker_guard_exact_str(ctx, op_pc, rhs)?;
     let helper = pyre_object::unicodeobject::jit_str_compare as *const ();

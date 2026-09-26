@@ -191,7 +191,7 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
         }
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     // `then_bb` carries `carried` plus `env` — for `then` the closure receiver
     // for `call_once`, for `then_some` the already-evaluated payload value

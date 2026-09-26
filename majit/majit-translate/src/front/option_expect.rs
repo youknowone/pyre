@@ -147,7 +147,7 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
         }
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     // `then_bb` (`Some`) carries `carried` plus `opt` (the base for the
     // `__pos_0` read); `else_bb` (`None`) has no inputs — it raises.  The

@@ -1161,12 +1161,10 @@ pub fn dispatch_rtyper_makerepr(
     }
 }
 
-// =====================================================================
 // @typer_for(...) registrations — rbuiltin.py- onwards.
 // Each function mirrors one upstream `@typer_for(<python builtin>)`
 // decorated `rtype_builtin_*` body. Registration is driven by
 // [`install_default_typers`] via the [`BUILTIN_TYPER`] OnceLock init.
-// =====================================================================
 
 fn arg_repr(hop: &HighLevelOp, index: usize) -> Result<Arc<dyn Repr>, TyperError> {
     hop.args_r

@@ -4896,7 +4896,7 @@ impl OptContext {
             return;
         }
 
-        // --- Sequential checks (RPython: NOT elif, all accumulate) ---
+        // Sequential checks (RPython: NOT elif, all accumulate)
 
         // unroll.py:69-74: Struct/Instance with descr → set_forwarded
         if preamble_info.get_descr().is_some() {

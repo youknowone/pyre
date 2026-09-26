@@ -26,7 +26,7 @@ def raises(exc, fn, what):
     raise AssertionError("%s: no %s" % (what, exc.__name__))
 
 
-# --- unicode_escape: an escape running off the end is held back -------------
+# unicode_escape: an escape running off the end is held back
 for tail in ["", "u", "u12", "u123", "x", "x4", "U", "U000", "N", "N{", "N{GREEK"]:
     data = (BS + tail).encode()
     check(codecs.unicode_escape_decode(data, "strict", False), ("", 0),
@@ -66,7 +66,7 @@ raises(UnicodeDecodeError, lambda: codecs.unicode_escape_decode((BS + "u12").enc
        "ue default final")
 
 
-# --- raw_unicode_escape: only \uXXXX and \UXXXXXXXX are escapes -------------
+# raw_unicode_escape: only \uXXXX and \UXXXXXXXX are escapes
 for tail in ["", "u", "u1", "u12", "u123", "U", "U0001"]:
     data = (BS + tail).encode()
     check(codecs.raw_unicode_escape_decode(data, "strict", False), ("", 0),
@@ -102,7 +102,7 @@ check(codecs.unicode_escape_decode(memoryview((BS + "u1234").encode())),
       (chr(0x1234), 6), "ue memoryview input")
 
 
-# --- charmap_decode: U+FFFE means undefined, as an int or as a str ----------
+# charmap_decode: U+FFFE means undefined, as an int or as a str
 a, b = ord("a"), ord("b")
 data = bytes([0, 1, 2])
 for table in ({0: a, 1: b, 2: 0xFFFE}, {0: a, 1: b, 2: chr(0xFFFE)}, {0: a, 1: b}):
@@ -120,12 +120,12 @@ raises(TypeError,
        "charmap out of range")
 
 
-# --- escape_encode quotes an apostrophe, not a double quote -----------------
+# escape_encode quotes an apostrophe, not a double quote
 check(codecs.escape_encode(b"a'b" + chr(34).encode()), (b"a" + BS.encode() + b"'b" + chr(34).encode(), 4),
       "escape_encode apostrophe")
 
 
-# --- \N{NAME} resolves through the character database ----------------------
+# \N{NAME} resolves through the character database
 def esc(name):
     return codecs.unicode_escape_decode((BS + "N{" + name + "}").encode())
 

@@ -14,7 +14,7 @@ assert n is not m
 assert id(n) != id(m)
 assert n is n and n != n
 
-# --- arity-2 tuple: `makespecialisedtuple2` / Cls_ff -----------------------
+# arity-2 tuple: `makespecialisedtuple2` / Cls_ff
 t = (n, n)
 assert t[0] is n and t[1] is n
 
@@ -22,7 +22,7 @@ assert t[0] is n and t[1] is n
 mixed = (f, n)
 assert mixed[0] is f and mixed[1] is n
 
-# --- instance attribute: mapdict `UnboxedPlainAttribute` -------------------
+# instance attribute: mapdict `UnboxedPlainAttribute`
 class C:
     pass
 
@@ -37,7 +37,7 @@ c2.y = f
 c2.y = n
 assert c2.y is n
 
-# --- list: FloatListStrategy / IntOrFloatListStrategy ----------------------
+# list: FloatListStrategy / IntOrFloatListStrategy
 lst = [n]
 assert lst[0] is n
 

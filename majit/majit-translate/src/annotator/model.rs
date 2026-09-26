@@ -52,9 +52,7 @@ use super::bookkeeper::Bookkeeper;
 use super::classdesc::ClassDef;
 pub use crate::translator::rtyper::llannotation::{SomeInteriorPtr, SomeLLADTMeth};
 
-// ---------------------------------------------------------------------------
 // State / TLS (model.py).
-// ---------------------------------------------------------------------------
 
 /// RPython `class State(object)` (model.py).
 ///
@@ -106,9 +104,7 @@ thread_local! {
     pub static TLS: RefCell<State> = const { RefCell::new(State::new()) };
 }
 
-// ---------------------------------------------------------------------------
 // KnownType — mirror of upstream `SomeObject.knowntype` class attribute.
-// ---------------------------------------------------------------------------
 
 /// RPython stores `knowntype` as a live Python type object
 /// (`int`, `float`, `str`, the classdef's `classdesc.pyobj`, …).
@@ -258,9 +254,7 @@ fn same_struct_identity(a: &str, b: &str) -> bool {
     identity(a) == identity(b)
 }
 
-// ---------------------------------------------------------------------------
 // SomeObject base — RPython `model.py`.
-// ---------------------------------------------------------------------------
 
 /// RPython `class SomeObject(object)` (model.py).
 ///
@@ -301,9 +295,7 @@ impl Default for SomeObject {
     }
 }
 
-// ---------------------------------------------------------------------------
 // SomeObjectTrait — the method contract shared by every Some* variant.
-// ---------------------------------------------------------------------------
 
 /// Methods every `SomeValue` variant forwards. Mirrors the subset of
 /// upstream `SomeObject` methods that the annotator calls through the
@@ -330,9 +322,7 @@ pub trait SomeObjectTrait {
     fn can_be_none(&self) -> bool;
 }
 
-// ---------------------------------------------------------------------------
 // Concrete Some* variants (A4.1 shells).
-// ---------------------------------------------------------------------------
 
 /// RPython `class SomeType(SomeObject)` (model.py).
 /// Stands for a `type` value; upstream sets `can_be_none = False`.
@@ -1101,7 +1091,6 @@ impl SomeObjectTrait for SomeUnicodeCodePoint {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Container-family Some* variants (A4.4).
 //
 // upstream: `class SomeList(SomeObject)` (model.py),
@@ -1115,7 +1104,6 @@ impl SomeObjectTrait for SomeUnicodeCodePoint {
 // [`super::listdef`] / [`super::dictdef`] and are re-exported here
 // so model.rs stays the single import surface for `SomeList` /
 // `SomeDict`-wielding code.
-// ---------------------------------------------------------------------------
 
 /// RPython `rpython/annotator/listdef.py:ListDef` — re-export of
 /// [`super::listdef::ListDef`].
@@ -1303,9 +1291,7 @@ impl SomeObjectTrait for SomeIterator {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Instance / PBC / Builtin / Exception / None / Weakref / TypeOf variants (A4.5).
-// ---------------------------------------------------------------------------
 
 // `ClassDef` lives in [`super::classdesc`]; the Rust enum references
 // classes through `Rc<RefCell<classdesc::ClassDef>>` with identity
@@ -2153,9 +2139,7 @@ impl SomeObjectTrait for SomeTypeOf {
     }
 }
 
-// ---------------------------------------------------------------------------
 // SomeValue closed enum.
-// ---------------------------------------------------------------------------
 
 /// Closed sum of every RPython `SomeXxx` subclass.
 ///
@@ -2878,9 +2862,7 @@ pub(crate) fn bind_callables_under(
     }
 }
 
-// ---------------------------------------------------------------------------
 // UnionError — raised by A4.6's union dispatch.
-// ---------------------------------------------------------------------------
 
 /// RPython `class UnionError(Exception)` (model.py — exact line
 /// varies by upstream revision). Produced by the union dispatch when
@@ -2907,9 +2889,7 @@ impl fmt::Display for UnionError {
 
 impl std::error::Error for UnionError {}
 
-// ---------------------------------------------------------------------------
 // Module-level singletons (model.py:685-694).
-// ---------------------------------------------------------------------------
 
 /// RPython `s_None = SomeNone()` (model.py).
 pub(crate) fn s_none() -> SomeValue {
@@ -2945,9 +2925,7 @@ pub(crate) fn s_str0() -> SomeValue {
     SomeValue::String(SomeString::new(false, true))
 }
 
-// ---------------------------------------------------------------------------
 // AnnotatorError + helpers (model.py + 787-795).
-// ---------------------------------------------------------------------------
 
 /// RPython `class AnnotatorError(Exception)` (model.py). Base
 /// error raised by the annotator outside of the structural `UnionError`
@@ -3086,9 +3064,7 @@ impl AnnotatorError {
     }
 }
 
-// ---------------------------------------------------------------------------
 // union() dispatch (A4.6) — model.py + binaryop.py pair().union().
-// ---------------------------------------------------------------------------
 
 /// Short identity of a `union` operand for the unhandled-pair error text.
 ///

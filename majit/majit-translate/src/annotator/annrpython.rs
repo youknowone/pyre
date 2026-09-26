@@ -719,15 +719,11 @@ impl RPythonAnnotator {
         TLS.with(|state| state.borrow_mut().bookkeeper = Some(Rc::clone(&self.bookkeeper)));
     }
 
-    // ======================================================================
     // RPython `convenience high-level interface` — diagnostics + validation
     // helpers used by the driver/caller side.
-    // ======================================================================
 
-    // ======================================================================
     // RPython `convenience high-level interface` (annrpython.py) —
     // build_types / build_graph_types / annotate_helper entrypoints.
-    // ======================================================================
 
     /// RPython `build_types(self, function, input_arg_types,
     /// complete_now=True, main_entry_point=False)` (annrpython.py:73-92).
@@ -994,9 +990,7 @@ impl RPythonAnnotator {
         }
     }
 
-    // ======================================================================
     // RPython `interface for annotator.bookkeeper` (annrpython.py).
-    // ======================================================================
 
     /// RPython `recursivecall(self, graph, whence, inputcells)`
     /// (annrpython.py:315-336).
@@ -1671,10 +1665,8 @@ impl RPythonAnnotator {
         Err(err)
     }
 
-    // ======================================================================
     // RPython `medium-level interface` (annrpython.py) — block
     // scheduling and pending-blocks queue.
-    // ======================================================================
 
     /// RPython `addpendinggraph(self, flowgraph, inputcells)`
     /// (annrpython.py:164-165).
@@ -2413,9 +2405,7 @@ impl RPythonAnnotator {
         }
     }
 
-    // ======================================================================
     // RPython `flowing annotations in blocks` (annrpython.py).
-    // ======================================================================
 
     /// RPython `consider_op(self, op)` (annrpython.py).
     ///
@@ -3698,9 +3688,7 @@ mod tests {
         assert!(!ann.blocked_blocks.borrow().contains_key(&bkey));
     }
 
-    // ------------------------------------------------------------------
     // Dispatch::None consider() — upstream operation.py.
-    // ------------------------------------------------------------------
 
     #[test]
     fn consider_newtuple_builds_sometuple_from_args() {
@@ -3781,9 +3769,7 @@ mod tests {
         assert!(err.msg.unwrap_or_default().contains("extended slicing"));
     }
 
-    // ------------------------------------------------------------------
     // gather_error / keepgoing — upstream annrpython.py:531-537.
-    // ------------------------------------------------------------------
 
     #[test]
     fn gather_error_returns_location_string() {

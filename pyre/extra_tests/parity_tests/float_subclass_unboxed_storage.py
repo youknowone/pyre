@@ -23,7 +23,7 @@ assert type(s) is F
 assert s == 2.5
 assert type(f) is float
 
-# --- arity-2 tuple: `makespecialisedtuple2` / Cls_ff -----------------------
+# arity-2 tuple: `makespecialisedtuple2` / Cls_ff
 t = (s, s)
 assert t[0] is s and t[1] is s
 
@@ -31,7 +31,7 @@ assert t[0] is s and t[1] is s
 mixed = (f, s)
 assert mixed[0] is f and mixed[1] is s
 
-# --- instance attribute: mapdict `UnboxedPlainAttribute` -------------------
+# instance attribute: mapdict `UnboxedPlainAttribute`
 class C:
     pass
 
@@ -46,7 +46,7 @@ c2.y = f
 c2.y = s
 assert c2.y is s
 
-# --- list: FloatListStrategy / IntOrFloatListStrategy ----------------------
+# list: FloatListStrategy / IntOrFloatListStrategy
 lst = [s]
 assert lst[0] is s
 

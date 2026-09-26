@@ -6243,7 +6243,7 @@ pub unsafe fn w_dict_view_get_dict(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_DictViewObject)).w_dict }
 }
 
-// -- DictStrategy family -----------------------------------------------------
+// -- DictStrategy family
 // PyPy keeps DictStrategy and the built-in concrete strategies in
 // pypy/objspace/std/dictmultiobject.py.  Keep them in this Rust module too so
 // paths and generated JIT symbol names line up with the source port.

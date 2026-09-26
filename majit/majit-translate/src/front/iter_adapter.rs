@@ -1064,7 +1064,7 @@ fn rewire_one_map_collect_site(
         ));
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     let mapped_origin = ctor.mapped.clone();
     let inner = ctor.inner.clone();

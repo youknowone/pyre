@@ -2263,7 +2263,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    // ---- non-emitting eligibility checks (free to bail with Ok(None)) ----
+    // non-emitting eligibility checks (free to bail with Ok(None))
     // Authoritative walks only: the CALL_ASSEMBLER record + walk-commit
     // bookkeeping is FBW machinery; a non-authoritative context (the
     // diagnostic probe, tests) records the plain residual instead.
@@ -2517,7 +2517,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number);
     }
 
-    // ---- emission ----
+    // emission
     // Past this point every step records IR; `?` propagation aborts the
     // whole walk (the trace is discarded), the correct failure mode for a
     // recording error.

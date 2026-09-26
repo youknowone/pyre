@@ -69,9 +69,7 @@ use super::model::{
 };
 use crate::flowspace::model::ConstValue;
 
-// ---------------------------------------------------------------------------
 // Registry.
-// ---------------------------------------------------------------------------
 
 /// Signature of a builtin analyser.
 ///
@@ -258,9 +256,7 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "min", builtin_min);
     analyzer_for(&mut reg, "max", builtin_max);
 
-    // ------------------------------------------------------------------
     // `@analyzer_for(...)` decoration sites.
-    // ------------------------------------------------------------------
 
     // builtin.py:198-214 — object.__init__ / EnvironmentError.__init__ /
     // WindowsError.__init__ — builtin-exception-class skip gate reads
@@ -577,9 +573,7 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     reg
 }
 
-// ---------------------------------------------------------------------------
 // Helpers.
-// ---------------------------------------------------------------------------
 
 /// Upstream `constpropagate(func, args_s, s_result)` (builtin.py).
 ///
@@ -657,9 +651,7 @@ fn is_str_annotation(s: &SomeValue) -> bool {
     matches!(s, SomeValue::String(_) | SomeValue::Char(_))
 }
 
-// ---------------------------------------------------------------------------
 // `builtin_*` analysers (mass-registered via the `builtin_` prefix scan).
-// ---------------------------------------------------------------------------
 
 /// Upstream `builtin_range(*args)` (builtin.py).
 pub fn builtin_range(
@@ -1305,9 +1297,7 @@ pub fn builtin_max(
     Ok(s)
 }
 
-// ---------------------------------------------------------------------------
 // `@analyzer_for(...)` analysers.
-// ---------------------------------------------------------------------------
 
 /// Upstream `object_init(s_self, *args)` (builtin.py).
 pub fn object_init(
@@ -2520,9 +2510,7 @@ pub fn pdb_set_trace(
     ))
 }
 
-// ---------------------------------------------------------------------------
 // Private helpers.
-// ---------------------------------------------------------------------------
 
 /// Emulates Python's `hasattr(host, name)` for a constant [`HostObject`]
 /// receiver.
@@ -2611,9 +2599,7 @@ fn someiterator_next_stub(bk: &Rc<Bookkeeper>, it: &SomeIterator) -> SomeValue {
     super::unaryop::container_getanyitem(&it.s_container, variant, bk.current_position_key())
 }
 
-// ---------------------------------------------------------------------------
 // Tests.
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

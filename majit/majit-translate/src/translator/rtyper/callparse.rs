@@ -72,9 +72,7 @@ use crate::translator::rtyper::rmodel::{Repr, inputconst, inputconst_from_lltype
 use crate::translator::rtyper::rtuple::TupleRepr;
 use crate::translator::rtyper::rtyper::{HighLevelOp, RPythonTyper};
 
-// ---------------------------------------------------------------------
 // callparse.py — class ArgumentsForRtype(ArgumentsForTranslation):
-// ---------------------------------------------------------------------
 
 /// RPython `class ArgumentsForRtype(ArgumentsForTranslation)`
 /// (callparse.py:7-14).
@@ -343,9 +341,7 @@ impl ArgumentsForRtype {
     }
 }
 
-// ---------------------------------------------------------------------
 // callparse.py — Holder hierarchy.
-// ---------------------------------------------------------------------
 
 /// RPython `class Holder(object)` + four direct subclasses
 /// (callparse.py:73-164). Rust collapses the inheritance into a single
@@ -603,9 +599,7 @@ impl Holder {
     }
 }
 
-// ---------------------------------------------------------------------
 // callparse.py — getrinputs / getrresult / getsig.
-// ---------------------------------------------------------------------
 
 /// RPython `getrinputs(rtyper, graph)` (callparse.py):
 /// ```python
@@ -693,9 +687,7 @@ pub fn getsig(
     ))
 }
 
-// ---------------------------------------------------------------------
 // callparse.py — `def callparse(rtyper, graph, hop, r_self=None)`.
-// ---------------------------------------------------------------------
 
 /// RPython `callparse(rtyper, graph, hop, r_self=None)`
 /// (callparse.py:34-70):
@@ -822,11 +814,9 @@ pub fn callparse(
     Ok(vlist)
 }
 
-// ---------------------------------------------------------------------
 // Local helper — decode the `(shape_cnt, shape_keys, shape_star)` tuple
 // constant that `call_args` ops carry as their first argument. Mirrors
 // `bookkeeper::call_shape_from_const` (which is annotator-level only).
-// ---------------------------------------------------------------------
 
 /// Decode a `(shape_cnt, shape_keys, shape_star)` Constant into the
 /// corresponding [`CallShape`]. Mirrors the shape encoding produced by
@@ -931,7 +921,7 @@ mod tests {
         )
     }
 
-    // ---- Holder structural ----
+    // Holder structural
 
     #[test]
     fn var_holder_is_tuple_returns_true_for_some_tuple_annotation() {
@@ -1000,7 +990,7 @@ mod tests {
         }
     }
 
-    // ---- ArgumentsForRtype.match_signature ----
+    // ArgumentsForRtype.match_signature
 
     #[test]
     fn match_signature_simple_positional_pass_through() {
@@ -1150,7 +1140,7 @@ mod tests {
         }
     }
 
-    // ---- Shape decoder ----
+    // Shape decoder
 
     #[test]
     fn call_shape_from_const_decodes_simple_positional_only() {

@@ -1261,7 +1261,7 @@ fn rewire_one_next_site(
         }
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
     *mutated = true;
 
     if enum_pair.is_some() {

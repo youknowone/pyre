@@ -3873,7 +3873,6 @@ impl MiniMarkGC {
         }
     }
 
-    // ----------
     // RawRefCount — incminimark.py:3157-3409
 
     /// incminimark.py `rawrefcount_init`.
@@ -12057,7 +12056,9 @@ mod tests {
         assert!(gc.is_young_rawmalloced(at_boundary.0));
     }
 
-    // --- Lightweight destructor tests (incminimark.py:2884-2912 parity) ---
+    // Lightweight destructor tests (incminimark.py
+    // deal_with_young_objects_with_destructors /
+    // deal_with_old_objects_with_destructors)
     //
     // The counting destructor below deliberately does NOT `drop_in_place`
     // the dummy payload (the test allocations are raw bytes, not a real

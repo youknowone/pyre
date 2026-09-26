@@ -198,7 +198,7 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
         }
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     // The payload arm carries `carried` plus `recv` (the base for the
     // `__pos_0` read); the default arm carries `carried` plus `default` (the

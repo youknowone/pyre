@@ -1075,7 +1075,7 @@ mod tests {
         check_invariants(&d);
     }
 
-    // ---- a reference model: insertion-ordered Vec + linear lookup ----
+    // a reference model: insertion-ordered Vec + linear lookup
     #[derive(Default)]
     struct Model {
         items: Vec<(u64, u64)>,
@@ -1585,7 +1585,7 @@ mod tests {
         assert_eq!(e.entry_slots(), 0);
     }
 
-    // ---- a comparison that re-enters and reshapes the dict ----
+    // a comparison that re-enters and reshapes the dict
     //
     // The container promises only that this cannot panic and cannot leave the
     // table inconsistent; the *answer* is allowed to be wrong, because the

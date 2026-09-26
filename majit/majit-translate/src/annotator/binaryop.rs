@@ -167,9 +167,7 @@ fn register(
     reg.entry(op).or_default().set((tag1, tag2), spec);
 }
 
-// =====================================================================
 // binaryop.py:26-60 — @op.is_.register(SomeObject, SomeObject)
-// =====================================================================
 
 fn init_is_default(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -368,9 +366,7 @@ fn bind_is(
     }
 }
 
-// =====================================================================
 // binaryop.py:90-144 — pairtype(SomeObject, SomeObject) fallback
-// =====================================================================
 
 fn init_object_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -754,9 +750,7 @@ fn read_can_only_throw_for_pair(
     result
 }
 
-// =====================================================================
 // binaryop.py:175-242 — pairtype(SomeInteger, SomeInteger)
-// =====================================================================
 
 fn init_integer_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -988,9 +982,7 @@ fn integer_rshift(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     }
 }
 
-// =====================================================================
 // binaryop.py — _make_cmp_annotator_default
-// =====================================================================
 
 fn init_cmp_default(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -1061,9 +1053,7 @@ fn cmp_default_annotate(
     super::model::s_bool()
 }
 
-// =====================================================================
 // binaryop.py — _make_cmp_annotator_int
-// =====================================================================
 
 fn init_cmp_integer(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -1175,9 +1165,7 @@ fn cmp_integer(cmp_op: OpKind, annotator: &RPythonAnnotator, hl: &HLOperation) -
     SomeValue::Bool(r)
 }
 
-// =====================================================================
 // binaryop.py:296-336 — pairtype(SomeBool, SomeBool)
-// =====================================================================
 
 fn init_bool_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -1281,9 +1269,7 @@ fn bool_xor(annotator: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     SomeValue::Bool(s)
 }
 
-// =====================================================================
 // binaryop.py:428-447 — pairtype(SomeFloat, SomeFloat)
-// =====================================================================
 
 fn init_float_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -1347,9 +1333,7 @@ fn init_float_pairtype(
     );
 }
 
-// =====================================================================
 // binaryop.py:450-459 — pairtype(SomeSingleFloat/LongFloat, ...)
-// =====================================================================
 
 fn init_singlefloat_pairtype(
     _reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -1366,9 +1350,7 @@ fn init_longfloat_pairtype(
     // only defines `union`. Same note as `init_singlefloat_pairtype`.
 }
 
-// =====================================================================
 // binaryop.py:338-350 — pairtype(SomeString, SomeString)
-// =====================================================================
 
 fn init_string_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -1435,9 +1417,7 @@ fn string_string_add(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     SomeValue::String(result)
 }
 
-// =====================================================================
 // binaryop.py:352-358 — pairtype(SomeByteArray, SomeByteArray)
-// =====================================================================
 
 fn init_bytearray_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -1461,9 +1441,7 @@ fn init_bytearray_pairtype(
     // lattice commits, not this dispatch commit).
 }
 
-// =====================================================================
 // binaryop.py:360-365 — pairtype(SomeByteArray, SomeInteger)
-// =====================================================================
 
 fn init_bytearray_integer_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -1515,9 +1493,7 @@ fn bytearray_integer_setitem(ann: &RPythonAnnotator, hl: &HLOperation) -> Option
     None
 }
 
-// =====================================================================
 // binaryop.py — pairtype cross-str/bytearray for `add`
-// =====================================================================
 //
 //     class __extend__(pairtype(SomeString, SomeByteArray),
 //                      pairtype(SomeByteArray, SomeString),
@@ -1549,9 +1525,7 @@ fn init_string_bytearray_cross_pairtype(
     }
 }
 
-// =====================================================================
 // binaryop.py:374-378 — pairtype(SomeChar, SomeChar)
-// =====================================================================
 
 fn init_char_pairtype(
     _reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -1559,9 +1533,7 @@ fn init_char_pairtype(
     // Upstream only defines `union`, already covered in model::union().
 }
 
-// =====================================================================
 // binaryop.py:381-384 — pairtype(SomeUnicodeCodePoint, SomeUnicodeCodePoint)
-// =====================================================================
 
 fn init_unicodecp_pairtype(
     _reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -1569,9 +1541,7 @@ fn init_unicodecp_pairtype(
     // Upstream only defines `union`, already covered in model::union().
 }
 
-// =====================================================================
 // binaryop.py:386-390 — pairtype(SomeString, SomeUnicodeString) / reverse
-// =====================================================================
 //
 //     class __extend__(pairtype(SomeString, SomeUnicodeString),
 //                      pairtype(SomeUnicodeString, SomeString)):
@@ -1603,10 +1573,8 @@ fn init_string_unicodestring_mod(
     }
 }
 
-// =====================================================================
 // binaryop.py:393-418 — pairtype(SomeString, SomeTuple) /
 //                       pairtype(SomeUnicodeString, SomeTuple)
-// =====================================================================
 
 fn init_string_tuple_mod(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -1705,10 +1673,8 @@ fn string_tuple_mod(ann: &RPythonAnnotator, hl: &HLOperation, lhs_tag: SomeValue
     }
 }
 
-// =====================================================================
 // binaryop.py:421-426 — pairtype(SomeString, SomeObject) /
 //                       pairtype(SomeUnicodeString, SomeObject)
-// =====================================================================
 
 fn init_string_object_mod(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -1787,9 +1753,7 @@ fn string_object_mod(ann: &RPythonAnnotator, hl: &HLOperation, lhs_tag: SomeValu
     }
 }
 
-// =====================================================================
 // binaryop.py:462-475 — pairtype(SomeList, SomeList)
-// =====================================================================
 
 fn init_list_list_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -1856,9 +1820,7 @@ fn list_list_eq(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
 
-// =====================================================================
 // binaryop.py:489-515 — pairtype(SomeTuple, SomeTuple)
-// =====================================================================
 
 fn init_tuple_tuple_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -1937,9 +1899,7 @@ fn tuple_tuple_eq(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
 
-// =====================================================================
 // binaryop.py:559-569 — pairtype(SomeTuple, SomeInteger)
-// =====================================================================
 
 fn init_tuple_integer_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -1997,9 +1957,7 @@ fn tuple_integer_getitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue 
     unionof(tup1.items.iter()).expect("tuple_int_getitem: unionof failed")
 }
 
-// =====================================================================
 // binaryop.py:572-595 — pairtype(SomeList, SomeInteger)
-// =====================================================================
 
 fn init_list_integer_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -2115,9 +2073,7 @@ fn list_integer_delitem(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<Some
     None
 }
 
-// =====================================================================
 // binaryop.py:597-608 — pairtype(SomeString, SomeInteger)
-// =====================================================================
 
 fn init_string_integer_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -2172,9 +2128,7 @@ fn string_integer_mul(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     SomeValue::String(SomeString::new(false, s1.inner.no_nul))
 }
 
-// =====================================================================
 // binaryop.py:610-620 — pairtype(SomeUnicodeString, SomeInteger)
-// =====================================================================
 
 fn init_unicodestring_integer_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -2227,9 +2181,7 @@ fn unicodestring_integer_mul(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeVa
     SomeValue::UnicodeString(SomeUnicodeString::new(false, s1.inner.no_nul))
 }
 
-// =====================================================================
 // binaryop.py:622-626 — pairtype(SomeInteger, SomeString|SomeUnicodeString)
-// =====================================================================
 
 fn init_integer_string_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -2276,11 +2228,9 @@ fn integer_unicodestring_mul(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeVa
     SomeValue::UnicodeString(SomeUnicodeString::new(false, s2.inner.no_nul))
 }
 
-// =====================================================================
 // binaryop.py:628-641 — pairtype(SomeUnicodeCodePoint, SomeUnicodeString)
 //                     / (SomeUnicodeString, SomeUnicodeCodePoint)
 //                     / (SomeUnicodeString, SomeUnicodeString): add
-// =====================================================================
 
 fn init_unicode_family_union_add(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -2357,9 +2307,7 @@ fn unicode_family_add(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     SomeValue::UnicodeString(result)
 }
 
-// =====================================================================
 // binaryop.py:643-654 — @cmp_op.register(...) cross str/unicode comparisons
-// =====================================================================
 
 fn init_cmp_str_unicode(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -2415,9 +2363,7 @@ pub fn cmp_str_unicode(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue 
     panic!("AnnotatorError: Comparing byte strings with unicode strings is not RPython")
 }
 
-// =====================================================================
 // binaryop.py:657-661 — pairtype(SomeInteger, SomeList)
-// =====================================================================
 
 fn init_integer_list_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -2450,9 +2396,7 @@ fn integer_list_mul(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     SomeValue::List(s_new)
 }
 
-// =====================================================================
 // binaryop.py:518-525 — pairtype(SomeDict, SomeDict)
-// =====================================================================
 
 fn init_dict_dict_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -2471,9 +2415,7 @@ fn init_dict_dict_pairtype(
     // `union` handled in model::union().
 }
 
-// =====================================================================
 // binaryop.py — helpers + @op.getitem.register(SomeDict, SomeObject)
-// =====================================================================
 //
 //     def _dict_can_only_throw_keyerror(s_dct, *ignore):
 //         if s_dct.dictdef.dictkey.custom_eq_hash:
@@ -2554,9 +2496,7 @@ pub fn getitem_SomeDict(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     s_dict.dictdef.read_value(position)
 }
 
-// =====================================================================
 // binaryop.py:547-556 — pairtype(SomeDict, SomeObject)
-// =====================================================================
 
 fn init_dict_object_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -2626,9 +2566,7 @@ fn dict_object_delitem(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeV
     None
 }
 
-// =====================================================================
 // binaryop.py:749-756 — pairtype(SomeIterator, SomeIterator)
-// =====================================================================
 
 fn init_iterator_pairtype(
     _reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -2636,9 +2574,7 @@ fn init_iterator_pairtype(
     // Upstream only defines `union` — handled in model::union().
 }
 
-// =====================================================================
 // binaryop.py:759-766 — pairtype(SomeBuiltinMethod, SomeBuiltinMethod)
-// =====================================================================
 
 fn init_builtinmethod_pairtype(
     _reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -2646,9 +2582,7 @@ fn init_builtinmethod_pairtype(
     // Upstream only defines `union` — handled in model::union().
 }
 
-// =====================================================================
 // binaryop.py:768-780 — @op.is_.register(SomePBC, SomePBC)
-// =====================================================================
 //
 //     def is__PBC_PBC(annotator, pbc1, pbc2):
 //         s = is__default(annotator, pbc1, pbc2)
@@ -2711,11 +2645,9 @@ pub fn is__PBC_PBC(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     SomeValue::Bool(s)
 }
 
-// =====================================================================
 // binaryop.py — Impossible/None union is handled via model::union().
 // This init is a no-op guard placeholder — those pair types only bind
 // `union`, which the union dispatch already covers.
-// =====================================================================
 
 fn init_impossible_none_pairtype(
     _reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -2727,9 +2659,7 @@ fn init_impossible_none_pairtype(
     //   pairtype(SomeImpossibleValue, SomeNone) / reverse
 }
 
-// =====================================================================
 // binaryop.py:815-820 — pairtype(SomePBC, SomeObject)
-// =====================================================================
 
 fn init_pbc_object_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -2757,9 +2687,7 @@ fn init_pbc_object_pairtype(
     );
 }
 
-// =====================================================================
 // binaryop.py:822-828 — pairtype(SomeNone, SomeObject)
-// =====================================================================
 
 fn init_none_object_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -2790,9 +2718,7 @@ fn init_none_object_pairtype(
     );
 }
 
-// =====================================================================
 // binaryop.py:830-844 — pairtype(SomePBC|SomeNone, SomeString) / reverse
-// =====================================================================
 
 fn init_pbc_string_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
@@ -2821,9 +2747,7 @@ fn init_pbc_string_pairtype(
     );
 }
 
-// =====================================================================
 // binaryop.py / 685-708 — `pair(...).improve()` free function
-// =====================================================================
 //
 // `improve` is NOT an OpKind — `pair(a, b).improve()` is invoked
 // directly by the annotator's flowin/isinstance-branch refinement
@@ -2923,9 +2847,7 @@ fn init_none_string_pairtype(
     );
 }
 
-// =====================================================================
 // binaryop.py:727-747 — pairtype(SomeInstance, SomeObject) transforms
-// =====================================================================
 
 /// Build a new [`HLOperation`] with a fresh result [`Variable`] — the
 /// Rust equivalent of upstream `op.<name>(args...)` inside a transform

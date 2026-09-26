@@ -36,9 +36,7 @@ use crate::flowspace::model::{ConstValue, Constant};
 use crate::flowspace::operation::{CanOnlyThrow, HLOperation, OpKind, Specialization, pure};
 use crate::tool::pairtype::DoubleDispatchRegistry;
 
-// =====================================================================
 // llannotation.py:147-200 — annotation ⇄ lltype helpers.
-// =====================================================================
 
 /// RPython `annotation_to_ll_map` (llannotation.py).
 fn annotation_to_ll_map() -> Vec<(SomeValue, lltype::LowLevelType)> {
@@ -195,9 +193,7 @@ pub fn ll_to_annotation(v: lltype::LowLevelValue) -> SomeValue {
     lltype_to_annotation(lltype::typeOf_value(&v))
 }
 
-// =====================================================================
 // lltype.py — SomePtr pointer-specific methods.
-// =====================================================================
 
 impl SomePtr {
     /// RPython `SomePtr.bool(self)` (lltype.py).
@@ -339,9 +335,7 @@ impl SomePtr {
     }
 }
 
-// =====================================================================
 // llannotation.py — class SomeInteriorPtr(SomePtr)
-// =====================================================================
 
 /// RPython `class SomeInteriorPtr(SomePtr)` (llannotation.py).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -479,9 +473,7 @@ impl SomeObjectTrait for SomeInteriorPtr {
     }
 }
 
-// =====================================================================
 // llannotation.py — class SomeLLADTMeth(SomeObject)
-// =====================================================================
 
 /// RPython `class SomeLLADTMeth(SomeObject)` (llannotation.py).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -528,9 +520,7 @@ impl SomeObjectTrait for SomeLLADTMeth {
     }
 }
 
-// =====================================================================
 // llannotation.py:100-128 — pairtype(SomePtr, SomeInteger/Object)
-// =====================================================================
 
 /// Register the `SomePtr`/`SomeInteger` and `SomePtr`/`SomeObject`
 /// pair dispatch tables. Invoked from `annotator::binaryop::init` at
@@ -692,9 +682,7 @@ fn init_ptr_object_pairtype(
     );
 }
 
-// =====================================================================
 // llannotation.py:15-48 — address-family pair dispatch.
-// =====================================================================
 
 /// Register the `SomeTypedAddressAccess`/`SomeInteger` getitem/setitem,
 /// `SomeAddress`/`SomeInteger` add/sub, and `SomeAddress`/`SomeAddress`

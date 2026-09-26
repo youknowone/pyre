@@ -78,7 +78,7 @@ fn not_really_const_declines(module_qualname: &str, attr: &str) -> bool {
 /// `SpaceOperation.opname`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum OpKind {
-    // ---- add_operator table (operation.py) ----
+    // add_operator table (operation.py)
     // unary/binary operators registered via add_operator(); variant
     // names follow the upstream `opname` argument (UpperCamel'd), with
     // `_ovf` siblings as `*Ovf`.
@@ -167,7 +167,7 @@ pub enum OpKind {
     NewSlice,
     Hint,
 
-    // ---- explicit subclasses (operation.py:523-712) ----
+    // explicit subclasses (operation.py Contains and later HLOperation)
     // These carry custom `eval()` / `consider()` overrides in RPython.
     // Commit 3 lifts the custom logic into the Rust port.
     Contains,
@@ -1192,8 +1192,8 @@ impl HLOperation {
 /// explicit subclasses that have custom `eval()` (Iter, Next, GetAttr,
 /// SimpleCall, CallArgs, Pow).
 pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
-    // --- variadic / ternary ops that fall outside the fixed-arity
-    //     match below ---
+    // variadic / ternary ops that fall outside the fixed-arity
+    // match below
     match (kind, args.len()) {
         // RPython `NewTuple` (operation.py). `PureOperation`
         // whose `pyfunc = lambda *args: args`.
@@ -1278,7 +1278,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
     }
 
     match (kind, args) {
-        // --- unary ---
+        // unary
         (OpKind::Bool, [v]) => v.truthy().map(ConstValue::Bool),
         (OpKind::Neg, [ConstValue::Int(n)]) => n.checked_neg().map(ConstValue::Int),
         (OpKind::NegOvf, [ConstValue::Int(n)]) => n.checked_neg().map(ConstValue::Int),
@@ -1323,7 +1323,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         }
         (OpKind::Len, [ConstValue::Dict(items)]) => Some(ConstValue::Int(items.len() as i64)),
 
-        // --- binary identity ---
+        // binary identity
         // `operator.is_` compares Python identity. For the value set
         // the Rust port carries on `Constant`, structural equality of
         // `ConstValue` is a safe proxy: two `ConstValue::Int(3)` do
@@ -1331,7 +1331,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         // synthesise two distinct wrappers for the same primitive.
         (OpKind::Is, [a, b]) => Some(ConstValue::Bool(a == b)),
 
-        // --- binary concat (str / tuple / list) ---
+        // binary concat (str / tuple / list)
         // These come BEFORE the numeric arithmetic arms because the
         // generic `(OpKind::Add, [a, b])` dispatch via `fold_arith`
         // declines on non-numeric operand pairs, so concat-aware arms
@@ -1356,7 +1356,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
             Some(ConstValue::List(out))
         }
 
-        // --- binary arithmetic (numeric, with Python 3 coercion) ---
+        // binary arithmetic (numeric, with Python 3 coercion)
         // `_ovf` siblings are NOT pure (`OpKind::pure()` rejects them),
         // so the `pure()` gate in `HLOperation::constfold` short-
         // circuits before reaching this dispatch — matching upstream
@@ -1469,7 +1469,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         (OpKind::Or, [a, b]) => coerce_int_pair(a, b).map(|(x, y)| ConstValue::Int(x | y)),
         (OpKind::Xor, [a, b]) => coerce_int_pair(a, b).map(|(x, y)| ConstValue::Int(x ^ y)),
 
-        // --- comparisons (int / float / str / bool) ---
+        // comparisons (int / float / str / bool)
         (OpKind::Lt, [a, b]) => cmp_fold(a, b).map(|o| ConstValue::Bool(o.is_lt())),
         (OpKind::Le, [a, b]) => cmp_fold(a, b).map(|o| ConstValue::Bool(o.is_le())),
         (OpKind::Eq, [a, b]) => Some(ConstValue::Bool(python_eq_const(a, b))),
@@ -2096,9 +2096,7 @@ fn cross_type_ordering(a: &ConstValue, b: &ConstValue) -> bool {
     }
 }
 
-// =====================================================================
 // Dispatcher plumbing (operation.py:66-300 + pairtype.py:75-96).
-// =====================================================================
 //
 // Upstream `class SingleDispatchMixin` / `class DoubleDispatchMixin`
 // store the registration table on the HLOperation subclass itself

@@ -129,11 +129,11 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     // Truncate the original block to before-call ops only
     graph.blocks[block_id.0].operations.truncate(op_index);
 
-    // --- Remap callee values and blocks ---
+    // Remap callee values and blocks
     let value_map = remap_callee_values(graph, &callee);
     let block_map = remap_callee_blocks(graph, &callee);
 
-    // --- Create merge block for after-call ops ---
+    // Create merge block for after-call ops
     // Upstream `backendopt/inline.py:253-264` copies caller-block-after
     // ops + exits into a fresh afterblock whenever there is something
     // to preserve.  Pyre creates the merge block when (a) after-call
@@ -185,7 +185,7 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
         None
     };
 
-    // --- Copy callee blocks into the graph ---
+    // Copy callee blocks into the graph
     let callee_entry = *block_map.get(&callee.startblock).unwrap();
 
     for callee_block in &callee.blocks {
@@ -260,7 +260,7 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
         }
     }
 
-    // --- Connect caller's before-block to callee entry ---
+    // Connect caller's before-block to callee entry
     // Map call arguments to callee's Input ops.
     // Callee's Input ops correspond to its entry block's first N ops.
     let callee_entry_block = &callee.blocks[callee.startblock.0];

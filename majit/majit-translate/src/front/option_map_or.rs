@@ -214,7 +214,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
         }
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     // `then_bb` (`Some`) carries `carried` plus `opt` (the base for the
     // `__pos_0` read) and `env` (the `call_once` receiver); `else_bb` (`None`)

@@ -2055,7 +2055,7 @@ pub(crate) fn build_ll_reverse_helper_graph(
         Hlvalue::Variable(j_body.clone()),
     ]);
 
-    // ---- startblock: length = getarraysize(l); length_1_i = length - 1.
+    // startblock: length = getarraysize(l); length_1_i = length - 1.
     let length = variable_with_lltype("length", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getarraysize",
@@ -2081,7 +2081,7 @@ pub(crate) fn build_ll_reverse_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_cond: int_lt(i, length_1_i). True -> body; False -> return None.
+    // block_loop_cond: int_lt(i, length_1_i). True -> body; False -> return None.
     let cond = variable_with_lltype("cond", LowLevelType::Bool);
     block_loop_cond
         .borrow_mut()
@@ -2118,7 +2118,7 @@ pub(crate) fn build_ll_reverse_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_body: read both endpoints, write them crossed, step indices.
+    // block_loop_body: read both endpoints, write them crossed, step indices.
     let tmp = variable_with_lltype("tmp", item_lltype.clone());
     block_loop_body
         .borrow_mut()
@@ -2285,7 +2285,7 @@ pub(crate) fn build_ll_reverse_resized_helper_graph(
         Hlvalue::Variable(j_body.clone()),
     ]);
 
-    // ---- startblock: length = getfield(l, "length"); length_1_i = length - 1.
+    // startblock: length = getfield(l, "length"); length_1_i = length - 1.
     let length = variable_with_lltype("length", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getfield",
@@ -2311,7 +2311,7 @@ pub(crate) fn build_ll_reverse_resized_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_cond: int_lt(i, length_1_i). True -> body; False -> return None.
+    // block_loop_cond: int_lt(i, length_1_i). True -> body; False -> return None.
     let cond = variable_with_lltype("cond", LowLevelType::Bool);
     block_loop_cond
         .borrow_mut()
@@ -2348,7 +2348,7 @@ pub(crate) fn build_ll_reverse_resized_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_body: read BOTH endpoints (each via getfield "items" +
+    // block_loop_body: read BOTH endpoints (each via getfield "items" +
     // getarrayitem) before writing either, then step the indices.
     let items_tmp = variable_with_lltype("items", items_ptr_lltype.clone());
     block_loop_body
@@ -2557,7 +2557,7 @@ fn build_ll_arraycopy_helper_graph(
         Hlvalue::Variable(i_b.clone()),
     ]);
 
-    // ---- startblock: i = 0.
+    // startblock: i = 0.
     startblock.closeblock(vec![
         Link::new(
             vec![
@@ -2572,7 +2572,7 @@ fn build_ll_arraycopy_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_cond: int_lt(i, length). True -> body; False -> return None.
+    // block_cond: int_lt(i, length). True -> body; False -> return None.
     let cond = variable_with_lltype("cond", LowLevelType::Bool);
     block_cond.borrow_mut().operations.push(SpaceOperation::new(
         "int_lt",
@@ -2603,7 +2603,7 @@ fn build_ll_arraycopy_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_body: dest[i] = source[i]; i += 1.
+    // block_body: dest[i] = source[i]; i += 1.
     let v = variable_with_lltype("v", item_lltype);
     block_body.borrow_mut().operations.push(SpaceOperation::new(
         "getarrayitem",
@@ -2738,7 +2738,7 @@ pub(crate) fn build_ll_arraycopy_general_helper_graph(
         Hlvalue::Variable(i_b.clone()),
     ]);
 
-    // ---- startblock: i = 0.
+    // startblock: i = 0.
     startblock.closeblock(vec![
         Link::new(
             vec![
@@ -2755,7 +2755,7 @@ pub(crate) fn build_ll_arraycopy_general_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_cond: int_lt(i, length). True -> body; False -> return None.
+    // block_cond: int_lt(i, length). True -> body; False -> return None.
     let cond = variable_with_lltype("cond", LowLevelType::Bool);
     block_cond.borrow_mut().operations.push(SpaceOperation::new(
         "int_lt",
@@ -2788,7 +2788,7 @@ pub(crate) fn build_ll_arraycopy_general_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_body: dest[dest_start + i] = source[source_start + i]; i += 1.
+    // block_body: dest[dest_start + i] = source[source_start + i]; i += 1.
     let si = variable_with_lltype("si", LowLevelType::Signed);
     block_body.borrow_mut().operations.push(SpaceOperation::new(
         "int_add",
@@ -3238,7 +3238,7 @@ fn build_ll_list_resize_ge_helper_graph(
         Hlvalue::Variable(newsize_tail.clone()),
     ]);
 
-    // ---- startblock: cond = len(l.items) < newsize.
+    // startblock: cond = len(l.items) < newsize.
     let items0 = variable_with_lltype("items", items_ptr.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getfield",
@@ -3279,7 +3279,7 @@ fn build_ll_list_resize_ge_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- grow: some_base = 3 if newsize < 9 else 6.
+    // grow: some_base = 3 if newsize < 9 else 6.
     let small = variable_with_lltype("small", LowLevelType::Bool);
     block_grow.borrow_mut().operations.push(SpaceOperation::new(
         "int_lt",
@@ -3310,7 +3310,7 @@ fn build_ll_list_resize_ge_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- alloc: new_allocated = newsize + some_base + (newsize >> 3);
+    // alloc: new_allocated = newsize + some_base + (newsize >> 3);
     //      newitems = malloc(LIST.items.TO, new_allocated);
     //      ll_arraycopy(l.items, newitems, l.length); l.items = newitems.
     let shifted = variable_with_lltype("shifted", LowLevelType::Signed);
@@ -3418,7 +3418,7 @@ fn build_ll_list_resize_ge_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- tail: l.length = newsize.
+    // tail: l.length = newsize.
     let set_len_void = variable_with_lltype("v", LowLevelType::Void);
     block_tail.borrow_mut().operations.push(SpaceOperation::new(
         "setfield",
@@ -3648,7 +3648,7 @@ fn build_ll_extend_helper_graph(
         Hlvalue::Variable(overflow.clone()),
     ));
 
-    // ---- continue block (overflow false): resize l1 + copy l2 into it.
+    // continue block (overflow false): resize l1 + copy l2 into it.
     let l1_c = variable_with_lltype("l1", ptr_lltype.clone());
     let l2_c = variable_with_lltype("l2", l2_lltype.clone());
     let len1_c = variable_with_lltype("len1", LowLevelType::Signed);
@@ -5094,7 +5094,7 @@ fn build_ll_listslice_startstop_helper_graph(
         Hlvalue::Variable(len_c.clone()),
     ]);
 
-    // ---- startblock: length = ll_length; too_big = int_gt(stop, length); branch.
+    // startblock: length = ll_length; too_big = int_gt(stop, length); branch.
     let length = emit_list_length_read(&startblock, source_layout, &l_arg);
     let too_big = variable_with_lltype("too_big", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -5129,7 +5129,7 @@ fn build_ll_listslice_startstop_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_clamp: stop := length. Merge edge passes `length` as stop.
+    // block_clamp: stop := length. Merge edge passes `length` as stop.
     block_clamp.closeblock(vec![
         Link::new(
             vec![
@@ -5143,7 +5143,7 @@ fn build_ll_listslice_startstop_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_merge: newlength = stop - start; alloc + copy.
+    // block_merge: newlength = stop - start; alloc + copy.
     let newlength = variable_with_lltype("newlength", LowLevelType::Signed);
     block_merge
         .borrow_mut()
@@ -5621,7 +5621,7 @@ fn build_ll_list_getitem_neg_helper_graph(
         Hlvalue::Variable(i_disp.clone()),
     ]);
 
-    // ---- start: is_neg = int_lt(index, 0); branch.
+    // start: is_neg = int_lt(index, 0); branch.
     let is_neg = variable_with_lltype("is_neg", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "int_lt",
@@ -5644,7 +5644,7 @@ fn build_ll_list_getitem_neg_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_neg_fix: length = <len read>; i_fixed = int_add(index, length).
+    // block_neg_fix: length = <len read>; i_fixed = int_add(index, length).
     let length = emit_list_length_read(&block_neg_fix, layout, &l_fix);
     let i_fixed = variable_with_lltype("index", LowLevelType::Signed);
     block_neg_fix
@@ -5664,7 +5664,7 @@ fn build_ll_list_getitem_neg_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_dispatch: c = direct_call(fast, l, index); return c.
+    // block_dispatch: c = direct_call(fast, l, index); return c.
     let c = variable_with_lltype("c", item_lltype);
     block_dispatch
         .borrow_mut()
@@ -5739,7 +5739,7 @@ fn build_ll_list_getitem_nonneg_checked_helper_graph(
         Hlvalue::Variable(i_disp.clone()),
     ]);
 
-    // ---- start: length = <len read>; oob = int_ge(index, length); branch.
+    // start: length = <len read>; oob = int_ge(index, length); branch.
     let length = emit_list_length_read(&startblock, layout, &l);
     let oob = variable_with_lltype("oob", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -5763,7 +5763,7 @@ fn build_ll_list_getitem_nonneg_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_dispatch: c = direct_call(fast, l, index); return c.
+    // block_dispatch: c = direct_call(fast, l, index); return c.
     let c = variable_with_lltype("c", item_lltype);
     block_dispatch
         .borrow_mut()
@@ -5851,7 +5851,7 @@ fn build_ll_list_getitem_checked_helper_graph(
         Hlvalue::Variable(i_disp.clone()),
     ]);
 
-    // ---- start: length = <len read>; index_u = cast_int_to_uint(index);
+    // start: length = <len read>; index_u = cast_int_to_uint(index);
     //      length_u = cast_int_to_uint(length); oob = uint_ge(index_u, length_u);
     //      branch.  The common 0 <= index < length case falls straight through
     //      with no add (`ll_getitem`, rlist.py).
@@ -5897,7 +5897,7 @@ fn build_ll_list_getitem_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_fixup: index_u = uint_add(index_u, length_u);
+    // block_fixup: index_u = uint_add(index_u, length_u);
     //      if uint_ge(index_u, length_u): raise IndexError;
     //      index = intmask(index_u); -> dispatch.
     let i_fixed_u = variable_with_lltype("index", LowLevelType::Unsigned);
@@ -5949,7 +5949,7 @@ fn build_ll_list_getitem_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_dispatch: c = direct_call(fast, l, index); return c.
+    // block_dispatch: c = direct_call(fast, l, index); return c.
     let c = variable_with_lltype("c", item_lltype);
     block_dispatch
         .borrow_mut()
@@ -6235,7 +6235,7 @@ fn build_ll_list_setitem_neg_helper_graph(
         Hlvalue::Variable(item_disp.clone()),
     ]);
 
-    // ---- start: is_neg = int_lt(index, 0); branch.
+    // start: is_neg = int_lt(index, 0); branch.
     let is_neg = variable_with_lltype("is_neg", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "int_lt",
@@ -6266,7 +6266,7 @@ fn build_ll_list_setitem_neg_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_neg_fix: length = <len read>; i_fixed = int_add(index, length).
+    // block_neg_fix: length = <len read>; i_fixed = int_add(index, length).
     let length = emit_list_length_read(&block_neg_fix, layout, &l_fix);
     let i_fixed = variable_with_lltype("index", LowLevelType::Signed);
     block_neg_fix
@@ -6290,7 +6290,7 @@ fn build_ll_list_setitem_neg_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_dispatch: direct_call(fast, l, index, item); return None.
+    // block_dispatch: direct_call(fast, l, index, item); return None.
     let v_void = variable_with_lltype("v", LowLevelType::Void);
     block_dispatch
         .borrow_mut()
@@ -6359,7 +6359,7 @@ fn build_ll_list_setitem_nonneg_checked_helper_graph(
         Hlvalue::Variable(item_disp.clone()),
     ]);
 
-    // ---- start: length = <len read>; oob = int_ge(index, length); branch.
+    // start: length = <len read>; oob = int_ge(index, length); branch.
     let length = emit_list_length_read(&startblock, layout, &l);
     let oob = variable_with_lltype("oob", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -6387,7 +6387,7 @@ fn build_ll_list_setitem_nonneg_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_dispatch: direct_call(fast, l, index, item); return None.
+    // block_dispatch: direct_call(fast, l, index, item); return None.
     let v_void = variable_with_lltype("v", LowLevelType::Void);
     block_dispatch
         .borrow_mut()
@@ -6470,7 +6470,7 @@ fn build_ll_list_setitem_checked_helper_graph(
         Hlvalue::Variable(item_disp.clone()),
     ]);
 
-    // ---- start: length = <len read>; index_u = cast_int_to_uint(index);
+    // start: length = <len read>; index_u = cast_int_to_uint(index);
     //      length_u = cast_int_to_uint(length); oob = uint_ge(index_u, length_u);
     //      branch.  The common 0 <= index < length case falls straight through
     //      with no add (`ll_setitem`, rlist.py).
@@ -6521,7 +6521,7 @@ fn build_ll_list_setitem_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_fixup: index_u = uint_add(index_u, length_u);
+    // block_fixup: index_u = uint_add(index_u, length_u);
     //      if uint_ge(index_u, length_u): raise IndexError;
     //      index = intmask(index_u); -> dispatch.
     let i_fixed_u = variable_with_lltype("index", LowLevelType::Unsigned);
@@ -6577,7 +6577,7 @@ fn build_ll_list_setitem_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_dispatch: direct_call(fast, l, index, item); return None.
+    // block_dispatch: direct_call(fast, l, index, item); return None.
     let v_void = variable_with_lltype("v", LowLevelType::Void);
     block_dispatch
         .borrow_mut()

@@ -3182,7 +3182,7 @@ fn build_ll_charlike_predicate_inrange_helper_graph(
     let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
     let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
 
-    // ---- start block: cast then compare against `lo`.
+    // start block: cast then compare against `lo`.
     let c = variable_with_lltype("c", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         cast_op,
@@ -3210,7 +3210,7 @@ fn build_ll_charlike_predicate_inrange_helper_graph(
     .into_ref();
     startblock.closeblock(vec![start_true_link, start_false_link]);
 
-    // ---- block_check_hi: compare against `hi`, return result.
+    // block_check_hi: compare against `hi`, return result.
     let le = variable_with_lltype("le", LowLevelType::Bool);
     block_check_hi
         .borrow_mut()
@@ -3290,7 +3290,7 @@ fn build_ll_char_case_fold_helper_graph(
     let c_for_offset = variable_with_lltype("c", LowLevelType::Signed);
     let block_offset = Block::shared(vec![Hlvalue::Variable(c_for_offset.clone())]);
 
-    // ---- start: cast + range-lo check.
+    // start: cast + range-lo check.
     let c = variable_with_lltype("c", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "cast_char_to_int",
@@ -3318,7 +3318,7 @@ fn build_ll_char_case_fold_helper_graph(
     .into_ref();
     startblock.closeblock(vec![start_true_link, start_false_link]);
 
-    // ---- block_check_hi: range-hi check.
+    // block_check_hi: range-hi check.
     let le = variable_with_lltype("le", LowLevelType::Bool);
     block_check_hi
         .borrow_mut()
@@ -3343,7 +3343,7 @@ fn build_ll_char_case_fold_helper_graph(
     .into_ref();
     block_check_hi.closeblock(vec![hi_true_link, hi_false_link]);
 
-    // ---- block_offset: int_add(c, offset); cast_int_to_char.
+    // block_offset: int_add(c, offset); cast_int_to_char.
     let c2 = variable_with_lltype("c2", LowLevelType::Signed);
     block_offset
         .borrow_mut()

@@ -276,7 +276,7 @@ fn rewire_one_closure_select_site(
     let (then_bb, then_inputs) = graph.create_block_with_arg_vars(then_sources.len());
     let (else_bb, else_inputs) = graph.create_block_with_arg_vars(else_sources.len());
 
-    // --- `then_bb` (`Some`) ---
+    // `then_bb` (`Some`)
     let opt_in_then = map_source(&then_sources, &then_inputs, &opt)
         .ok_or_else(|| format!("{name}: Option value not threaded into Some arm"))?;
     let mut synthesized_result_exc = None;
@@ -369,7 +369,7 @@ fn rewire_one_closure_select_site(
     )?;
     close_goto_mixed(graph, then_finish_bb, b_target, then_link_args);
 
-    // --- `else_bb` (`None`) ---
+    // `else_bb` (`None`)
     let (else_value, else_finish_bb, else_finish_inputs) = match site.kind {
         // `map`/`and_then` build a fresh `None`.
         ClosureCombinator::Map | ClosureCombinator::AndThen => {

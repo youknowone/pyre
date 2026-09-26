@@ -3373,7 +3373,7 @@ mod tests {
         assert!(!plain.borrow().is_builtin_exception_class());
     }
 
-    // --- c2 step 2c-ii: ClassDesc::new + add_source_attribute + add_mixins ---
+    // c2 step 2c-ii: ClassDesc::new + add_source_attribute + add_mixins
 
     #[test]
     fn classdesc_new_rejects_not_rpython_marker() {

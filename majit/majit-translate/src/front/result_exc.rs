@@ -2158,7 +2158,7 @@ fn catch_and_rewrap(
     let is_r = |arg: &LinkArg| matches!(arg, LinkArg::Value(v) if v == r);
     let has_r = orig.args.iter().any(&is_r);
 
-    // --- Normal arm N: receive every Value arg, rebuild `Ok(r)`.
+    // Normal arm N: receive every Value arg, rebuild `Ok(r)`.
     let value_args: Vec<LinkArg> = orig
         .args
         .iter()
@@ -2207,7 +2207,7 @@ fn catch_and_rewrap(
         vec![Link::new_mixed(n_exit_args, orig.target, None)],
     );
 
-    // --- Exception arm E: receive the non-`r` Value args plus the
+    // Exception arm E: receive the non-`r` Value args plus the
     // caught `[exc_type, exc_value]` pair, rebuild `Err(from_exc_object
     // (exc_value))`.
     let nonr_args: Vec<LinkArg> = orig
@@ -2289,7 +2289,7 @@ fn catch_and_rewrap(
         vec![Link::new_mixed(e_exit_args, orig.target, None)],
     );
 
-    // --- Rewire A: LastException exits — normal → N, exception → E.
+    // Rewire A: LastException exits — normal → N, exception → E.
     let va = graph.alloc_value_var();
     let vb = graph.alloc_value_var();
     let a_to_e_args: Vec<LinkArg> = nonr_args
@@ -2965,7 +2965,7 @@ fn try_fuse_drain_match(
     use crate::model::{BlockId, ExitCase};
     let name = graph.name.clone();
 
-    // --- (1) A: `r = next(iter)` is A's last op, closed by lower_call with
+    // (1) A: `r = next(iter)` is A's last op, closed by lower_call with
     // a single no-exitcase forwarding exit.
     let a_ops = &graph.blocks[a].operations;
     let call_idx = a_ops
@@ -2988,7 +2988,7 @@ fn try_fuse_drain_match(
         ));
     }
 
-    // --- (2) A→B single exit; B holds `d = r.__discriminant[Result<..,PyError>]`,
+    // (2) A→B single exit; B holds `d = r.__discriminant[Result<..,PyError>]`,
     // `exitswitch == Value(d)`, pure besides the read, single predecessor.
     let (b, r_b) =
         follow_single_exit(graph, a, r).map_err(|e| format!("{name}: drain fuse: {e}"))?;
@@ -3023,7 +3023,7 @@ fn try_fuse_drain_match(
     }
     assert_block_pure_besides(graph, b, &[disc_idx], "discriminant", &name)?;
 
-    // --- (3) Split B's diamond; identify Ok/Err arms by the `__pos_0` owner
+    // (3) Split B's diamond; identify Ok/Err arms by the `__pos_0` owner
     // of the read in each arm's target — NOT by discriminant 0/1.
     let (case0, case1) = split_diamond_exits(&graph.blocks[b].exits, &name)?;
     let reads_variant = |target: usize, variant: &str| -> bool {
@@ -3051,12 +3051,12 @@ fn try_fuse_drain_match(
     let ok_target = ok_link.target.0;
     let err_target = err_link.target.0;
 
-    // --- (4) Ok arm: single predecessor; the `__pos_0[Result::Ok]` read is
+    // (4) Ok arm: single predecessor; the `__pos_0[Result::Ok]` read is
     // collapsed to `r` (the LastException normal edge carries the unwrapped
     // payload directly).  Record its payload position on the Ok link.
     assert_single_pred(graph, ok_target, &name)?;
 
-    // --- (5) Err arm: single predecessor, EXACTLY the two guard ops
+    // (5) Err arm: single predecessor, EXACTLY the two guard ops
     // (Err payload read, PyError::matches_stop_iteration call).
     assert_single_pred(graph, err_target, &name)?;
     let r_err = forward_alias(graph, &r_b, &err_link)
@@ -3116,7 +3116,7 @@ fn try_fuse_drain_match(
         &name,
     )?;
 
-    // --- (6) Err arm → bool-switch block: `m2 = bool(predicate)`, `exitswitch ==
+    // (6) Err arm → bool-switch block: `m2 = bool(predicate)`, `exitswitch ==
     // Value(m2)`, pure besides, single predecessor.
     let (bswitch, predicate_bs) = follow_single_exit(graph, err_target, &predicate_result)
         .map_err(|e| format!("{name}: drain fuse: Err arm exit: {e}"))?;
@@ -3144,7 +3144,7 @@ fn try_fuse_drain_match(
     }
     assert_block_pure_besides(graph, bswitch, &[bool_idx], "bool switch", &name)?;
 
-    // --- (7) Split the bool switch by exitcase: true → break arm, false →
+    // (7) Split the bool switch by exitcase: true → break arm, false →
     // reraise arm.  Verify the reraise arm is a pure `return Err(e)` tail.
     if graph.blocks[bswitch].exits.len() != 2 {
         return Err(format!("{name}: drain fuse: bool switch has != 2 exits"));
@@ -3202,7 +3202,7 @@ fn try_fuse_drain_match(
         })
         .collect::<Result<_, _>>()?;
 
-    // --- Build the normal (Ok) edge args (A scope), no mutation yet.
+    // Build the normal (Ok) edge args (A scope), no mutation yet.
     // Mirrors `rewire_one_call_site`'s continue-arm handling: r → payload,
     // the Ok arm's discriminant temp → Const(0), loop-carried values
     // back-substituted across the single A→B edge.
@@ -3284,7 +3284,7 @@ fn try_fuse_drain_match(
         }
     }
 
-    // --- Build the break edge (H → break-target) args, resolving each
+    // Build the break edge (H → break-target) args, resolving each
     // original break-link value back toward A scope.  Values defined in the
     // detached B / Err-arm / bool-switch blocks decline unless they are a
     // const-justifiable temp: the predicate bool (true on the matched arm) and
@@ -3387,7 +3387,7 @@ fn try_fuse_drain_match(
             None => Err(format!("{name}: drain fuse: A→B link lacks arg {pos}")),
         }
     };
-    // --- Classify each break-target slot (MUST-ADD#1).  A transitively-dead
+    // Classify each break-target slot (MUST-ADD#1).  A transitively-dead
     // slot — the loop's SSA merge-threads for the Result value, its
     // discriminant, the caught `e` payload and the guard temps, none read past
     // the break — is pruned from `break_target` and every predecessor link.  A
@@ -3463,7 +3463,7 @@ fn try_fuse_drain_match(
         }
     }
 
-    // --- All validation + arg-building passed; mutate. -----------------
+    // All validation + arg-building passed; mutate.
     // Block H's inputargs: [forwarded loop vars..., va(etype,unused), vb(evalue)].
     let (h_id, h_inputs) = graph.create_block_with_arg_vars(forwarded.len() + 2);
     // H's `etype` inputarg (slot `forwarded.len()`) is the int-kinded caught

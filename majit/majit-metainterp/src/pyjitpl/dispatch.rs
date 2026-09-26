@@ -721,7 +721,7 @@ pub trait JitCodeSym {
         None
     }
 
-    // -- State field support (register/tape machines) -----
+    // -- State field support (register/tape machines)
     //
     // When state_fields is configured, scalar and array fields on the
     // interpreter state are tracked as OpRefs in the Sym.
@@ -10416,7 +10416,7 @@ where
                     action => return action,
                 }
             }
-            // -- Ref-typed bytecodes ----
+            // -- Ref-typed bytecodes
             // RPython `blackhole.py` `bhimpl_ref_copy`. `[src][dst]` per `r>r`.
             jitcode::insns::BC_MOVE_R => {
                 let (src, dst) = {
@@ -10545,7 +10545,7 @@ where
                     action => return action,
                 }
             }
-            // -- Float-typed bytecodes ---
+            // -- Float-typed bytecodes
             // RPython `blackhole.py` `bhimpl_float_copy`. `[src][dst]` per `f>f`.
             jitcode::insns::BC_MOVE_F => {
                 let (src, dst) = {

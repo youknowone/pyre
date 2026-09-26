@@ -95,9 +95,7 @@ use crate::translator::tool::taskengine::{
     SimpleTaskEngine, TaskEngineHooks, TaskError, TaskOutput,
 };
 
-// ---------------------------------------------------------------------
 // Upstream `:1-19` module-level imports + log handle.
-// ---------------------------------------------------------------------
 
 // Upstream `:38 PROFILE = set([])`. The Rust port stores it in a
 // thread-local `RefCell<HashSet<String>>` so callers can mutate it
@@ -112,9 +110,7 @@ fn profile_contains(goal: &str) -> bool {
     PROFILE.with(|p| p.borrow().contains(goal))
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:40-41 class Instrument(Exception): pass`.
-// ---------------------------------------------------------------------
 
 /// Port of upstream `class Instrument(Exception)` at `:40-41`. Raised
 /// by `TranslationDriver.instrument_result` to abort the current task
@@ -130,9 +126,7 @@ impl std::fmt::Display for Instrument {
 
 impl std::error::Error for Instrument {}
 
-// ---------------------------------------------------------------------
 // Upstream `:44-60 class ProfInstrument`.
-// ---------------------------------------------------------------------
 
 /// Port of upstream `class ProfInstrument` at `:44-60`. The class is
 /// only referenced by `TranslationDriver.instrument_result` (the C-
@@ -169,7 +163,6 @@ impl ProfInstrument {
     }
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:13-14 secondary_entrypoints, annotated_jit_entrypoints`.
 //
 // `rpython/rlib/entrypoint.py:1` declares
@@ -184,7 +177,6 @@ impl ProfInstrument {
 // `key` listed in `config.translation.secondaryentrypoints` (a CSV
 // string). Upstream raises `KeyError` when the key is missing; the
 // Rust port returns `Err(TaskError)` matching that contract.
-// ---------------------------------------------------------------------
 
 /// `EntryPointSpec` mirrors upstream's `(func, argtypes)` tuple stored
 /// inside `secondary_entrypoints[key]`. The argtypes are an opaque
@@ -306,7 +298,6 @@ pub fn annotated_jit_entrypoints_register(
     ANNOTATED_JIT_ENTRYPOINTS.with(|s| s.borrow_mut().push((func_any, inputs_any)));
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:22-32 def taskdef(...)` decorator.
 //
 // Upstream attaches `task_deps`, `task_title`, `task_newstate`,
@@ -315,7 +306,6 @@ pub fn annotated_jit_entrypoints_register(
 // it carries the same metadata as a struct passed to
 // `SimpleTaskEngine::register_task`. `TaskDef` keeps the bundle named
 // for grep-parity with upstream call sites.
-// ---------------------------------------------------------------------
 
 /// Port of the metadata `taskdef(deps, title, ..., earlycheck=None)` at
 /// upstream `:22-32` would attach to a `task_*` function.
@@ -353,10 +343,8 @@ impl TaskDef {
     }
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:339 RTYPE = 'rtype_lltype'` and `:378 BACKENDOPT =
 // 'backendopt_lltype'` and `:387 STACKCHECKINSERTION = 'stackcheckinsertion_lltype'`.
-// ---------------------------------------------------------------------
 
 /// Upstream `:339 RTYPE = 'rtype_lltype'` — the canonical typed-task
 /// name picked by `task_pyjitpl_lltype` / `task_jittest_lltype`'s deps.
@@ -368,9 +356,7 @@ pub const BACKENDOPT: &str = "backendopt_lltype";
 /// Upstream `:387 STACKCHECKINSERTION = 'stackcheckinsertion_lltype'`.
 pub const STACKCHECKINSERTION: &str = "stackcheckinsertion_lltype";
 
-// ---------------------------------------------------------------------
 // Upstream `:63 class TranslationDriver(SimpleTaskEngine)`.
-// ---------------------------------------------------------------------
 
 /// Port of upstream `class TranslationDriver(SimpleTaskEngine)` at
 /// `:63-622`.
@@ -438,10 +424,8 @@ pub struct TranslationDriver {
     /// `set_backend_extra_options` at `:139-140`.
     pub _backend_extra_options: RefCell<HashMap<String, OptionValue>>,
 
-    // -----------------------------------------------------------------
     // Upstream-`setup`-populated fields. Each is initially absent;
     // `setup` writes them (`:176-216`).
-    // -----------------------------------------------------------------
     /// Upstream `self.standalone = standalone` at `:178`.
     pub standalone: Cell<bool>,
     /// Upstream `self.inputtypes = inputtypes` at `:184`.
@@ -512,12 +496,10 @@ pub struct TranslationDriver {
     /// rewritten by `create_exe`.
     pub c_entryp: RefCell<Option<PathBuf>>,
 
-    // -----------------------------------------------------------------
     // Side table for the upstream `@taskdef(... earlycheck=...)`
     // metadata. Engine-level `register_task` only takes the title +
     // idempotency flag; the earlycheck function rides here so
     // `_event("planned", goal)` can invoke it.
-    // -----------------------------------------------------------------
     #[expect(
         clippy::type_complexity,
         reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
@@ -1229,12 +1211,10 @@ impl TranslationDriver {
         })
     }
 
-    // -----------------------------------------------------------------
     // Upstream `task_*` bodies. Every body either ports a small
     // structural shell (the buildannotator+complete chain that the
     // local annotator ports support) or panics with a citation and the
     // missing leaf name.
-    // -----------------------------------------------------------------
 
     /// Upstream `task_annotate(self)` at `:297-327`.
     ///
@@ -2153,7 +2133,6 @@ pub enum ProceedGoals {
     Many(Vec<String>),
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:262-295 def _do(self, goal, func, *args, **kwds)`.
 //
 // `_do` overrides `SimpleTaskEngine._do` so the engine-driven task
@@ -2162,7 +2141,6 @@ pub enum ProceedGoals {
 // `Instrument` exception into a re-entry on the `compile` goal, and
 // stashes completed goals into `self.done` (for non-idempotent
 // tasks).
-// ---------------------------------------------------------------------
 
 struct DriverHooks {
     driver: Rc<TranslationDriver>,
@@ -2273,13 +2251,11 @@ impl TaskEngineHooks for DriverHooks {
     }
 }
 
-// ---------------------------------------------------------------------
 // Upstream `:624-631 shutil_copy` — module-level helper that handles
 // the "destination is the executable currently being run" case on
 // posix (rename through a `~` suffix). Re-exported so c-backend
 // callers can use it; on non-posix the upstream falls through to
 // `shutil.copy`.
-// ---------------------------------------------------------------------
 
 /// Port of upstream `shutil_copy(src, dst)` at `:624-631`. On non-
 /// Windows hosts the routine renames `dst~` over `dst` to handle the

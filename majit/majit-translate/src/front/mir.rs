@@ -4647,9 +4647,7 @@ impl std::fmt::Display for LowerError {
 
 impl std::error::Error for LowerError {}
 
-// ---------------------------------------------------------------------------
 // Lowering state
-// ---------------------------------------------------------------------------
 
 pub use majit_jitcode::codewriter::jtransform::OBJECT_REF_GCARRAY_TYPE_ID;
 /// PyPy `BytesListStrategy` / `AsciiListStrategy` expose `SomeString`
@@ -5514,9 +5512,7 @@ impl<'a> Lowering<'a> {
         order
     }
 
-    // -----------------------------------------------------------------------
     // Framestate-threaded lowering (acyclic GAP-B path)
-    // -----------------------------------------------------------------------
 
     /// Snapshot the current `local_var` table as a [`FrameState`].  Only
     /// the locals projection is populated — MIR has no value stack /
@@ -6179,9 +6175,7 @@ impl<'a> Lowering<'a> {
         self.lower_terminator(mir_bb, term)
     }
 
-    // -----------------------------------------------------------------------
     // Statements
-    // -----------------------------------------------------------------------
 
     fn lower_statement(
         &mut self,
@@ -10149,9 +10143,7 @@ impl<'a> Lowering<'a> {
         i64::try_from(primitive_size_align(want_align, body.get("Literal")?)?).ok()
     }
 
-    // -----------------------------------------------------------------------
     // Terminators
-    // -----------------------------------------------------------------------
 
     fn lower_terminator(&mut self, mir_bb: usize, term: TermKind) -> Result<(), LowerError> {
         let bb_id = self.block_id[mir_bb];
@@ -23621,9 +23613,7 @@ fn fn_ptr_signature_is_builtin_code_fn(
         && output.contains("PyError")
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 /// Collect the MIR locals bound by a scalar [`Rvalue::BinaryOp`]
 /// anywhere in `body`.  See [`Lowering::binop_result_locals`] for why a
@@ -38415,7 +38405,7 @@ fn rewrite_debug_enum_fmt_site(graph: &mut FunctionGraph, site: &DebugEnumFmtCol
         }
     }
 
-    // --- All structural checks passed; mutate the graph. ---
+    // All structural checks passed; mutate the graph.
 
     // Drop the residual `alloc::fmt::format` op (its block tail).  A
     // fieldless enum is `Int`-valued (`tyref_to_value_type`), so its value

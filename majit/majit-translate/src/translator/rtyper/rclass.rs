@@ -76,9 +76,7 @@ use crate::translator::rtyper::rtyper::{
     GenopResult, HighLevelOp, LowLevelFunction, LowLevelOpList, RPythonTyper,
 };
 
-// ---------------------------------------------------------------------
 // VtableMethodPtr helper (carried over from the pre-R1 rclass.rs scaffold).
-// ---------------------------------------------------------------------
 
 /// Insert a `VtableMethodPtr` op at `(block_id, op_index)` and return the
 /// produced funcptr Variable. Writes the funcptr's `concretetype` cell to
@@ -119,9 +117,7 @@ pub(crate) fn class_get_method_ptr(
     funcptr_var
 }
 
-// ---------------------------------------------------------------------
 // rclass.py — FieldListAccessor / ImmutableRanking / IR_* constants.
-// ---------------------------------------------------------------------
 
 /// RPython `class ImmutableRanking` (`rclass.py`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -201,9 +197,7 @@ pub struct MissingRTypeAttribute {
     pub attr: String,
 }
 
-// ---------------------------------------------------------------------
 // rclass.py — OBJECT_VTABLE / OBJECT / NONGCOBJECT module constants.
-// ---------------------------------------------------------------------
 
 /// RPython `alloc_array_name(name)` (`rclass.py`).
 pub fn alloc_array_name(name: &str) -> Result<_ptr, String> {
@@ -772,9 +766,7 @@ pub(crate) fn constant_to_lowlevel_value(
     }
 }
 
-// ---------------------------------------------------------------------
 // rclass.py — ClassRepr (classdef != None flavour).
-// ---------------------------------------------------------------------
 
 /// RPython `class ClassRepr(Repr)` (rclass.py).
 ///
@@ -1953,9 +1945,7 @@ impl ClassReprArc {
     }
 }
 
-// ---------------------------------------------------------------------
 // rclass.py — RootClassRepr (classdef = None flavour).
-// ---------------------------------------------------------------------
 
 /// RPython `class RootClassRepr(ClassRepr)` (rclass.py).
 ///
@@ -2281,10 +2271,8 @@ impl Repr for RootClassRepr {
     }
 }
 
-// ---------------------------------------------------------------------
 // rclass.py — InstanceRepr (classdef=None + classdef!=None
 // scaffolding branches).
-// ---------------------------------------------------------------------
 
 /// RPython `class InstanceRepr(Repr)` (rclass.py).
 ///
@@ -4403,9 +4391,7 @@ impl Repr for InstanceRepr {
     }
 }
 
-// ---------------------------------------------------------------------
 // rclass.py:67-88, 91-119, 439-440 — module-level accessors.
-// ---------------------------------------------------------------------
 
 /// RPython `get_type_repr(rtyper)` (`rclass.py`).
 ///
@@ -4890,9 +4876,7 @@ pub fn buildinstancerepr(
 /// field directly.
 pub(crate) type InstanceReprKey = (Option<ClassDefKey>, Flavor);
 
-// ---------------------------------------------------------------------
 // Unit tests
-// ---------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -5875,9 +5859,7 @@ mod tests {
         assert_eq!(func._name, "PyError::to_exc_object");
     }
 
-    // -----------------------------------------------------------------
     // R2-A — ClassRepr scaffold + getclassrepr(classdef != None).
-    // -----------------------------------------------------------------
 
     fn fresh_rtyper() -> Rc<RPythonTyper> {
         use crate::annotator::annrpython::RPythonAnnotator;
@@ -6589,9 +6571,7 @@ mod tests {
         assert!(pbcfields.contains_key(&(access_key, "x".to_string())));
     }
 
-    // -----------------------------------------------------------------
     // R2-B — InstanceRepr classdef != None scaffolding.
-    // -----------------------------------------------------------------
 
     #[test]
     fn instance_repr_new_with_classdef_stores_forward_reference_object_type() {
@@ -6892,9 +6872,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
     // R2-C — attrs iteration on ClassRepr + InstanceRepr.
-    // -----------------------------------------------------------------
 
     fn attach_attr(
         classdef: &Rc<RefCell<ClassDef>>,
@@ -7111,9 +7089,7 @@ mod tests {
         assert_eq!(body._names[2], "inst_a_bool");
     }
 
-    // ---------------------------------------------------------------
     // R3 — `ClassRepr::setup_vtable` + constant→lowlevel adapter.
-    // ---------------------------------------------------------------
 
     #[test]
     fn constant_to_lowlevel_value_unwraps_int_bool_float_ptr_and_void() {

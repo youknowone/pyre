@@ -305,7 +305,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
         }
     }
 
-    // ---- mutation: everything below is committed ----
+    // mutation: everything below is committed
 
     let mut idx_of: HashMap<usize, Variable> = HashMap::new();
     for &bi in member_positions.keys() {

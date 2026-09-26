@@ -967,7 +967,7 @@ pub trait Repr: Debug + std::any::Any {
         Err(self.missing_rtype_operation("simple_call"))
     }
 
-    // ---- arithmetic / conversion missing-op defaults ----
+    // arithmetic / conversion missing-op defaults
     //
     // RPython `rmodel.py:342` registers missing-op stubs for
     // `setattr len contains iter` on the base `Repr`. The pyre port
@@ -4325,9 +4325,7 @@ mod tests {
         assert!(r.can_ll_be_null());
     }
 
-    // -----------------------------------------------------------------
     // R5 — SomeInstance / SomeException / SomeType rtyper_make{key,repr}.
-    // -----------------------------------------------------------------
 
     #[test]
     fn rtyper_makekey_someinstance_uses_classdef_identity() {
@@ -4543,9 +4541,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
     // SomePBC.rtyper_makekey (rpbc.py).
-    // -----------------------------------------------------------------
 
     fn pbc_test_desc_function(
         bk: &Rc<crate::annotator::bookkeeper::Bookkeeper>,
@@ -4607,9 +4603,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
     // SomeBuiltin / SomeBuiltinMethod.rtyper_makekey (rbuiltin.py).
-    // -----------------------------------------------------------------
 
     #[test]
     fn rtyper_makekey_someiterator_recursively_keys_on_container_and_variant() {

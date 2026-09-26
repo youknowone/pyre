@@ -419,9 +419,7 @@ impl SharedUnionFindInfo for ClassAttrFamily {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Desc + FunctionDesc (description.py).
-// ---------------------------------------------------------------------------
 
 /// RPython `class Desc(object)` (description.py).
 ///
@@ -2577,9 +2575,7 @@ impl MemoDesc {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MethodDesc + FrozenDesc + MethodOfFrozenDesc (description.py).
-// ---------------------------------------------------------------------------
 
 /// Opaque handle for `ClassDef` references used by
 /// [`MethodDesc::originclassdef`] / `selfclassdef`. Upstream carries
@@ -3441,7 +3437,7 @@ mod tests {
         assert!(a.commonbase.is_none(), "update must not touch commonbase");
     }
 
-    // ---- Desc + FunctionDesc (commit 2) ----
+    // Desc + FunctionDesc (commit 2)
 
     fn bk() -> Rc<Bookkeeper> {
         Rc::new(Bookkeeper::new())
@@ -4242,7 +4238,7 @@ mod tests {
         );
     }
 
-    // ---- MethodDesc + FrozenDesc + MethodOfFrozenDesc (commit 3) ----
+    // MethodDesc + FrozenDesc + MethodOfFrozenDesc (commit 3)
 
     fn wrap_fd(bk: &Rc<Bookkeeper>, name: &str) -> Rc<RefCell<FunctionDesc>> {
         Rc::new(RefCell::new(FunctionDesc::new(

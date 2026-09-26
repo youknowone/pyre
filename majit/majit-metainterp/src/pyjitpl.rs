@@ -17499,7 +17499,7 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// ```python
     /// def initialize_state_from_start(self, original_boxes):
-    ///     # ----- make a new frame -----
+    /// # ----- make a new frame
     ///     self.portal_call_depth = -1 # always one portal around
     ///     self.framestack = []
     ///     f = self.newframe(self.jitdriver_sd.mainjitcode)

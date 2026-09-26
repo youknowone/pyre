@@ -158,7 +158,7 @@ fn rewire_one_saturating_sub_site(
         }
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     // `else_bb` (`a >= b`) needs `minuend` and `subtrahend` to subtract; the
     // `then_bb` (`a < b`) needs only `carried`.  The source-var lists double as

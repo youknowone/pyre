@@ -858,7 +858,7 @@ pub fn build_ll_grow_and_append_helper_graph(
 
     let overflow_error = exception_args("OverflowError")?;
 
-    // ---- block_fast_body: append ll_str as a new big piece (no-overflow) ----
+    // block_fast_body: append ll_str as a new big piece (no-overflow)
     // Receives (ll_builder, ll_str, total_size) where total_size is the
     // ovfcheck result computed in block_fast_check.
     let fb_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
@@ -933,7 +933,7 @@ pub fn build_ll_grow_and_append_helper_graph(
         Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
-    // ---- block_fast_check: total_size = ovfcheck(total_size + size) ----
+    // block_fast_check: total_size = ovfcheck(total_size + size)
     // `except OverflowError: pass` -> the overflow edge falls to the slow path
     // (block_slow), so the trailing int_add_ovf is the block's last op and its
     // exception edge carries the four slow-path inputs, not [class, instance].
@@ -961,7 +961,7 @@ pub fn build_ll_grow_and_append_helper_graph(
     );
     // Closed after block_slow is built (see close_ovfcheck_block call below).
 
-    // ---- block_slow: copy head, grow, copy tail ----
+    // block_slow: copy head, grow, copy tail
     let s = arg_tuple(&builder_ptr_lltype, &buf_lltype);
     let block_slow = Block::shared(tuple_vals(&s));
     let s_pos = variable_with_lltype("current_pos", LowLevelType::Signed);
@@ -1101,8 +1101,8 @@ pub fn build_ll_grow_and_append_helper_graph(
         tuple_vals(&fc),
     );
 
-    // ---- Condition chain: size > 1280 -> pos == 0 -> start == 0 ->
-    //      size == len(ll_str.chars); any failure jumps to block_slow. ----
+    // Condition chain: size > 1280 -> pos == 0 -> start == 0 ->
+    // size == len(ll_str.chars); any failure jumps to block_slow.
     // block_b3: size == len(ll_str.chars)
     let b3 = arg_tuple(&builder_ptr_lltype, &buf_lltype);
     let block_b3 = Block::shared(tuple_vals(&b3));
@@ -1465,7 +1465,7 @@ pub fn build_ll__ll_append_multiple_char_helper_graph(
         Hlvalue::Variable(return_var),
     );
 
-    // ===== Second (unconditional) loop, built first as it is the tail. =====
+    // Second (unconditional) loop, built first as it is the tail.
     // block_after(ll_builder, char, times)
     let a_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
     let a_char = variable_with_lltype("char", char_lltype.clone());
@@ -1601,7 +1601,7 @@ pub fn build_ll__ll_append_multiple_char_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== First (conditional) loop + grow. =====
+    // First (conditional) loop + grow.
     // block_grow_tail(ll_builder, char, times): ll_grow_by then jump to after.
     let gt_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
     let gt_char = variable_with_lltype("char", char_lltype.clone());
@@ -1771,7 +1771,7 @@ pub fn build_ll__ll_append_multiple_char_helper_graph(
         .into_ref(),
     ]);
 
-    // ===== startblock: part1 = current_end - current_pos; if times > part1. =====
+    // startblock: part1 = current_end - current_pos; if times > part1.
     let pos0 = variable_with_lltype("pos0", LowLevelType::Signed);
     push(
         &startblock,
@@ -4935,7 +4935,7 @@ pub fn build_ll_fold_pieces_helper_graph(
         Hlvalue::Variable(return_var),
     );
 
-    // ---- Loop blocks (created first so the back-edge can be wired) ----
+    // Loop blocks (created first so the back-edge can be wired)
     // block_loop(dst, piece, piece_lgt, extra, result)
     let l_dst = variable_with_lltype("dst", LowLevelType::Signed);
     let l_piece = variable_with_lltype("piece", buf_lltype.clone());
@@ -5066,7 +5066,7 @@ pub fn build_ll_fold_pieces_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_fast(ll_builder, extra, final_size) ----
+    // block_fast(ll_builder, extra, final_size)
     let f_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
     let f_extra = variable_with_lltype("extra", piece_ptr_lltype.clone());
     let f_fs = variable_with_lltype("final_size", LowLevelType::Signed);
@@ -5101,7 +5101,7 @@ pub fn build_ll_fold_pieces_helper_graph(
         Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
-    // ---- block_slow(ll_builder, extra, final_size) ----
+    // block_slow(ll_builder, extra, final_size)
     let s_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
     let s_extra = variable_with_lltype("extra", piece_ptr_lltype.clone());
     let s_fs = variable_with_lltype("final_size", LowLevelType::Signed);
@@ -5165,7 +5165,7 @@ pub fn build_ll_fold_pieces_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_cond2(ll_builder, extra, final_size): not extra.prev_piece ----
+    // block_cond2(ll_builder, extra, final_size): not extra.prev_piece
     let c_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
     let c_extra = variable_with_lltype("extra", piece_ptr_lltype.clone());
     let c_fs = variable_with_lltype("final_size", LowLevelType::Signed);
@@ -5221,7 +5221,7 @@ pub fn build_ll_fold_pieces_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- startblock: header ----
+    // startblock: header
     let fs = variable_with_lltype("final_size", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "direct_call",
@@ -5587,7 +5587,7 @@ pub fn build_ll_arrayclear_helper_graph(
         Hlvalue::Variable(i_b.clone()),
     ]);
 
-    // ---- startblock: length = len(p); i = 0.
+    // startblock: length = len(p); i = 0.
     let length = variable_with_lltype("length", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getarraysize",
@@ -5603,7 +5603,7 @@ pub fn build_ll_arrayclear_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_cond: int_lt(i, length). True -> body; False -> return None.
+    // block_cond: int_lt(i, length). True -> body; False -> return None.
     let cond = variable_with_lltype("cond", LowLevelType::Bool);
     block_cond.borrow_mut().operations.push(SpaceOperation::new(
         "int_lt",
@@ -5633,7 +5633,7 @@ pub fn build_ll_arrayclear_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_body: p[i] = ZERO; i += 1.
+    // block_body: p[i] = ZERO; i += 1.
     let store_void = variable_with_lltype("v", LowLevelType::Void);
     block_body.borrow_mut().operations.push(SpaceOperation::new(
         "setarrayitem",
@@ -5752,7 +5752,7 @@ pub fn build_ll_arrayfill_helper_graph(
         Hlvalue::Variable(i_b.clone()),
     ]);
 
-    // ---- startblock: length = len(p); gc_writebarrier(p); i = 0.
+    // startblock: length = len(p); gc_writebarrier(p); i = 0.
     let length = variable_with_lltype("length", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getarraysize",
@@ -5779,7 +5779,7 @@ pub fn build_ll_arrayfill_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_cond: int_lt(i, length). True -> body; False -> return None.
+    // block_cond: int_lt(i, length). True -> body; False -> return None.
     let cond = variable_with_lltype("cond", LowLevelType::Bool);
     block_cond.borrow_mut().operations.push(SpaceOperation::new(
         "int_lt",
@@ -5810,7 +5810,7 @@ pub fn build_ll_arrayfill_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_body: bare_setarrayitem(p, i, item); i += 1.
+    // block_body: bare_setarrayitem(p, i, item); i += 1.
     let store_void = variable_with_lltype("v", LowLevelType::Void);
     block_body.borrow_mut().operations.push(SpaceOperation::new(
         "bare_setarrayitem",

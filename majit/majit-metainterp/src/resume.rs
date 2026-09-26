@@ -7798,7 +7798,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         self.resume_after_guard_not_forced = 1;
     }
 
-    // ---- AbstractResumeDataReader methods (resume.py) ----
+    // AbstractResumeDataReader methods (resume.py)
 
     /// resume.py `read_jitcode_pos_pc`.
     pub fn read_jitcode_pos_pc(&mut self) -> (i32, i32) {
@@ -7982,7 +7982,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    // ---- ResumeDataDirectReader methods (resume.py) ----
+    // ResumeDataDirectReader methods (resume.py)
 
     /// resume.py `consume_one_section(self, blackholeinterp)`.
     ///

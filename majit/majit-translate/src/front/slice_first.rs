@@ -249,7 +249,7 @@ fn rewire_one_slice_first_site(
         }
     }
 
-    // --- All structural validation passed; mutate the graph. ---
+    // All structural validation passed; mutate the graph.
 
     // `then_bb` (`Some`) carries `carried` plus `slice` (the base for the
     // element read); `else_bb` (`None`) carries only `carried`.  The

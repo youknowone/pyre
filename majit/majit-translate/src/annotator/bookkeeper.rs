@@ -6670,7 +6670,7 @@ mod tests {
         }
     }
 
-    // --- classdesc: descs / classdefs / getdesc ---
+    // classdesc: descs / classdefs / getdesc
 
     #[test]
     fn getdesc_for_user_function_returns_function_entry() {

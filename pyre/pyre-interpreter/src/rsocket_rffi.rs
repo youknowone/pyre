@@ -1018,7 +1018,6 @@ pub fn ntop(family: libc::c_int, packed: &[u8]) -> Option<String> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // The legacy `<netdb.h>` resolvers.
 //
 // `libc` 0.2.186 declares none of them, and the two records they answer with
@@ -1027,7 +1026,6 @@ pub fn ntop(family: libc::c_int, packed: &[u8]) -> Option<String> {
 // `s_proto` before `s_port` on Win64 and the other way round everywhere else.
 // A single `#[repr(C)]` mirror would therefore be wrong on one side, so the
 // record stays opaque and every field is read through an accessor.
-// ---------------------------------------------------------------------------
 
 /// The resolver's `hostent` record. Never constructed here — only the pointer
 /// the resolver returns is ever held, and it points into process-global

@@ -82,7 +82,7 @@ def state(args=(), env=None):
 
 assert state() == (False, None)
 
-# -- faulthandler ---------------------------------------------------------
+# -- faulthandler
 # `run_command_line` installs nothing at all unless `'faulthandler' in
 # sys.builtin_module_names`, and that guard is not decoration: pypy drops the
 # module from `working_modules` on Windows (`pypy/config/pypyoption.py:78`), so
@@ -127,7 +127,7 @@ assert state(["-E", "-X", "faulthandler"], env={"PYTHONFAULTHANDLER": ""}) == (
     None,
 )
 
-# -- pycache_prefix -------------------------------------------------------
+# -- pycache_prefix
 assert state(["-X", "pycache_prefix=/tmp/from-option"]) == (False, "/tmp/from-option")
 assert state(env={"PYTHONPYCACHEPREFIX": "/tmp/from-env"}) == (False, "/tmp/from-env")
 # Stored the way it was written: a relative path is not resolved against the

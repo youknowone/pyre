@@ -905,7 +905,7 @@ pub(crate) fn build_ll_str2unicode_helper_graph(name: &str) -> Result<PyGraph, T
         Hlvalue::Variable(c_int_for_store.clone()),
     ]);
 
-    // ---- start: source chars/length, mallocunicode(length), dest chars.
+    // start: source chars/length, mallocunicode(length), dest chars.
     let src_chars = variable_with_lltype("chars", src_chars_ptr_lltype.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getsubstruct",
@@ -949,7 +949,7 @@ pub(crate) fn build_ll_str2unicode_helper_graph(name: &str) -> Result<PyGraph, T
         .into_ref(),
     ]);
 
-    // ---- loop_cond: i < lgt.
+    // loop_cond: i < lgt.
     let keep_going = variable_with_lltype("keep_going", LowLevelType::Bool);
     block_loop_cond
         .borrow_mut()
@@ -984,7 +984,7 @@ pub(crate) fn build_ll_str2unicode_helper_graph(name: &str) -> Result<PyGraph, T
         .into_ref(),
     ]);
 
-    // ---- check_char: ord(str.chars[i]) > 127 raises UnicodeDecodeError.
+    // check_char: ord(str.chars[i]) > 127 raises UnicodeDecodeError.
     let c = variable_with_lltype("c", LowLevelType::Char);
     block_check_char
         .borrow_mut()
@@ -1033,7 +1033,7 @@ pub(crate) fn build_ll_str2unicode_helper_graph(name: &str) -> Result<PyGraph, T
         .into_ref(),
     ]);
 
-    // ---- store_char: cast ASCII code to UniChar, store, increment.
+    // store_char: cast ASCII code to UniChar, store, increment.
     let uc = variable_with_lltype("uc", LowLevelType::UniChar);
     block_store_char
         .borrow_mut()
@@ -1492,7 +1492,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         input_snapshots[&std::rc::Rc::as_ptr(block)][idx].clone()
     };
 
-    // ---- start: temp = malloc(CHAR_ARRAY, 20); branch on i < 0.
+    // start: temp = malloc(CHAR_ARRAY, 20); branch on i < 0.
     let temp = variable_with_lltype("temp", temp_ptr_lltype.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "malloc_varsize",
@@ -1536,7 +1536,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
             .into_ref(),
         ]);
 
-        // ---- b_sign: i < 0 → sign = 1; i = r_uint(-i).
+        // b_sign: i < 0 → sign = 1; i = r_uint(-i).
         let ni = variable_with_lltype("ni", LowLevelType::Signed);
         b_sign.borrow_mut().operations.push(SpaceOperation::new(
             "int_neg",
@@ -1563,7 +1563,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
             .into_ref(),
         ]);
 
-        // ---- b_pos: i >= 0 → sign = 0; i = r_uint(i).
+        // b_pos: i >= 0 → sign = 0; i = r_uint(i).
         let i_u_pos = variable_with_lltype("i_u", LowLevelType::Unsigned);
         b_pos.borrow_mut().operations.push(SpaceOperation::new(
             "cast_primitive",
@@ -1602,7 +1602,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         ]);
     }
 
-    // ---- b_zero: branch on i == 0 (i.e. not uint_is_true(i)).
+    // b_zero: branch on i == 0 (i.e. not uint_is_true(i)).
     let nz = variable_with_lltype("nz", LowLevelType::Bool);
     b_zero.borrow_mut().operations.push(SpaceOperation::new(
         "uint_is_true",
@@ -1635,7 +1635,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_iszero: len = 1; temp[0] = '0'.
+    // b_iszero: len = 1; temp[0] = '0'.
     let zero_ch = char_for(48, &b_iszero);
     let set_void = variable_with_lltype("set", LowLevelType::Void);
     b_iszero.borrow_mut().operations.push(SpaceOperation::new(
@@ -1661,7 +1661,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_loop_cond: while i: ...
+    // b_loop_cond: while i: ...
     let keep = variable_with_lltype("keep", LowLevelType::Bool);
     b_loop_cond
         .borrow_mut()
@@ -1694,7 +1694,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_loop_body: temp[len] = hex_chars[i & 0xf]; i >>= 4; len += 1.
+    // b_loop_body: temp[len] = hex_chars[i & 0xf]; i >>= 4; len += 1.
     let nib = variable_with_lltype("nib", LowLevelType::Unsigned);
     b_loop_body
         .borrow_mut()
@@ -1762,7 +1762,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_after_digits: len += sign; branch on addPrefix.
+    // b_after_digits: len += sign; branch on addPrefix.
     let len_signed = variable_with_lltype("len1", LowLevelType::Signed);
     b_after_digits
         .borrow_mut()
@@ -1801,7 +1801,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_addprefix_len: len += 2.
+    // b_addprefix_len: len += 2.
     let len_prefixed = variable_with_lltype("len2", LowLevelType::Signed);
     b_addprefix_len
         .borrow_mut()
@@ -1828,7 +1828,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_alloc: result = mallocstr(len); result.hash = 0; branch on sign.
+    // b_alloc: result = mallocstr(len); result.hash = 0; branch on sign.
     let result = variable_with_lltype("result", STRPTR.clone());
     b_alloc.borrow_mut().operations.push(SpaceOperation::new(
         "malloc_varsize",
@@ -1890,7 +1890,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_write_sign: result.chars[0] = '-'; j = 1.
+    // b_write_sign: result.chars[0] = '-'; j = 1.
     let minus = char_for(45, &b_write_sign);
     let set_void = variable_with_lltype("set", LowLevelType::Void);
     b_write_sign
@@ -1921,7 +1921,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_check_prefix: branch on addPrefix.
+    // b_check_prefix: branch on addPrefix.
     b_check_prefix.borrow_mut().exitswitch = Some(Hlvalue::Variable(var_of(&b_check_prefix, 0)));
     b_check_prefix.closeblock(vec![
         Link::new(
@@ -1950,7 +1950,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_write_prefix: result.chars[j] = '0'; result.chars[j+1] = 'x'; j += 2.
+    // b_write_prefix: result.chars[j] = '0'; result.chars[j+1] = 'x'; j += 2.
     let prefix_zero = char_for(48, &b_write_prefix);
     let set_void = variable_with_lltype("set", LowLevelType::Void);
     b_write_prefix
@@ -2018,7 +2018,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_copy_cond: while j < len.
+    // b_copy_cond: while j < len.
     let copy_go = variable_with_lltype("copy_go", LowLevelType::Bool);
     b_copy_cond
         .borrow_mut()
@@ -2049,7 +2049,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_copy_body: result.chars[j] = temp[len-j-1]; j += 1.
+    // b_copy_body: result.chars[j] = temp[len-j-1]; j += 1.
     let len_minus_j = variable_with_lltype("lmj", LowLevelType::Signed);
     b_copy_body
         .borrow_mut()
@@ -2294,7 +2294,7 @@ pub(crate) fn build_ll_int2dec_helper_graph(
         input_snapshots[&std::rc::Rc::as_ptr(block)][idx].clone()
     };
 
-    // ---- start: compute sign + unsigned magnitude, enter the count loop.
+    // start: compute sign + unsigned magnitude, enter the count loop.
     if signed_input {
         let b_sign = b_sign.as_ref().expect("b_sign exists in signed build");
         let b_pos = b_pos.as_ref().expect("b_pos exists in signed build");
@@ -2384,7 +2384,7 @@ pub(crate) fn build_ll_int2dec_helper_graph(
         ]);
     }
 
-    // ---- b_count_cond: while i_count != 0.
+    // b_count_cond: while i_count != 0.
     let keep = variable_with_lltype("keep", LowLevelType::Bool);
     b_count_cond
         .borrow_mut()
@@ -2416,7 +2416,7 @@ pub(crate) fn build_ll_int2dec_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_count_body: i_count //= 10; len += 1.
+    // b_count_body: i_count //= 10; len += 1.
     let i_next = variable_with_lltype("i_next", LowLevelType::Unsigned);
     b_count_body
         .borrow_mut()
@@ -2452,7 +2452,7 @@ pub(crate) fn build_ll_int2dec_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_total: zero_add = int(val == 0); go to alloc.
+    // b_total: zero_add = int(val == 0); go to alloc.
     let nz = variable_with_lltype("nz", LowLevelType::Bool);
     b_total.borrow_mut().operations.push(SpaceOperation::new(
         "uint_is_true",
@@ -2485,7 +2485,7 @@ pub(crate) fn build_ll_int2dec_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_alloc: total_len = sign + len + zero_add; result = mallocstr(total_len).
+    // b_alloc: total_len = sign + len + zero_add; result = mallocstr(total_len).
     let s1 = variable_with_lltype("s1", LowLevelType::Signed);
     b_alloc.borrow_mut().operations.push(SpaceOperation::new(
         "int_add",
@@ -2564,7 +2564,7 @@ pub(crate) fn build_ll_int2dec_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_write_minus: result.chars[0] = '-'; enter digit loop (j = 0).
+    // b_write_minus: result.chars[0] = '-'; enter digit loop (j = 0).
     let minus = char_for(45, &b_write_minus);
     let set_void = variable_with_lltype("set", LowLevelType::Void);
     b_write_minus
@@ -2595,7 +2595,7 @@ pub(crate) fn build_ll_int2dec_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_check_zero: if val == 0 write '0', else straight to digit loop.
+    // b_check_zero: if val == 0 write '0', else straight to digit loop.
     let nz2 = variable_with_lltype("nz2", LowLevelType::Bool);
     b_check_zero
         .borrow_mut()
@@ -2634,7 +2634,7 @@ pub(crate) fn build_ll_int2dec_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_write_zero: result.chars[0] = '0'; enter digit loop (len == 0).
+    // b_write_zero: result.chars[0] = '0'; enter digit loop (len == 0).
     let zero_ch = char_for(48, &b_write_zero);
     let set_void = variable_with_lltype("set", LowLevelType::Void);
     b_write_zero
@@ -2665,7 +2665,7 @@ pub(crate) fn build_ll_int2dec_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_digit_cond: while j < len.
+    // b_digit_cond: while j < len.
     let go = variable_with_lltype("go", LowLevelType::Bool);
     b_digit_cond
         .borrow_mut()
@@ -2696,7 +2696,7 @@ pub(crate) fn build_ll_int2dec_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- b_digit_body: chars[total_len-j-1] = chr(val%10 + '0'); val //= 10; j += 1.
+    // b_digit_body: chars[total_len-j-1] = chr(val%10 + '0'); val //= 10; j += 1.
     let t1 = variable_with_lltype("t1", LowLevelType::Signed);
     b_digit_body
         .borrow_mut()
@@ -4228,7 +4228,7 @@ pub(crate) fn build_ll_str_is_true_helper_graph(
     let s_for_len = variable_with_lltype("s", ptr_lltype);
     let block_check_len = Block::shared(vec![Hlvalue::Variable(s_for_len.clone())]);
 
-    // ---- start: ptr_nonzero(s); branch on the result.
+    // start: ptr_nonzero(s); branch on the result.
     let v_nz = variable_with_lltype("v_nz", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "ptr_nonzero",
@@ -4250,7 +4250,7 @@ pub(crate) fn build_ll_str_is_true_helper_graph(
     .into_ref();
     startblock.closeblock(vec![start_true_link, start_false_link]);
 
-    // ---- block_check_len: getsubstruct('chars') + getarraysize +
+    // block_check_len: getsubstruct('chars') + getarraysize +
     // int_ne(len, 0); link to returnblock with the comparison result.
     let v_len = emit_chars_length_ops(
         &block_check_len,
@@ -4315,7 +4315,7 @@ pub(crate) fn build_ll_str_string_helper_graph(
     let none_ptr = const_str_cache_llstr(b"None").map_err(TyperError::message)?;
     let none_const = constant_with_lltype(ConstValue::LLPtr(Box::new(none_ptr)), ptr_lltype);
 
-    // ---- start: ptr_nonzero(s); branch on the result.
+    // start: ptr_nonzero(s); branch on the result.
     let v_nz = variable_with_lltype("v_nz", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "ptr_nonzero",
@@ -4492,7 +4492,7 @@ pub(crate) fn build_ll_streq_helper_graph(
         Hlvalue::Variable(j_for_body.clone()),
     ]);
 
-    // ---- start: ptr_eq(s1, s2); branch on result.
+    // start: ptr_eq(s1, s2); branch on result.
     let v_eq = variable_with_lltype("eq", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "ptr_eq",
@@ -4515,7 +4515,7 @@ pub(crate) fn build_ll_streq_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_null_check_s1: ptr_nonzero(s1).
+    // block_null_check_s1: ptr_nonzero(s1).
     let nz1 = variable_with_lltype("nz1", LowLevelType::Bool);
     block_null_check_s1
         .borrow_mut()
@@ -4544,7 +4544,7 @@ pub(crate) fn build_ll_streq_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_null_check_s2: ptr_nonzero(s2).
+    // block_null_check_s2: ptr_nonzero(s2).
     let nz2 = variable_with_lltype("nz2", LowLevelType::Bool);
     block_null_check_s2
         .borrow_mut()
@@ -4573,7 +4573,7 @@ pub(crate) fn build_ll_streq_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_compare_lens: extract chars + len for both sides,
+    // block_compare_lens: extract chars + len for both sides,
     // then int_eq(len1, len2).
     let chars1 = variable_with_lltype("chars1", chars_array_ptr_lltype.clone());
     block_compare_lens
@@ -4641,7 +4641,7 @@ pub(crate) fn build_ll_streq_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_cond: int_lt(j, len1); branch.
+    // block_loop_cond: int_lt(j, len1); branch.
     let lt = variable_with_lltype("lt", LowLevelType::Bool);
     block_loop_cond
         .borrow_mut()
@@ -4675,7 +4675,7 @@ pub(crate) fn build_ll_streq_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_body: getarrayitem on both, char_eq, int_add(j, 1).
+    // block_loop_body: getarrayitem on both, char_eq, int_add(j, 1).
     let c1 = variable_with_lltype("c1", elem_lltype.clone());
     block_loop_body
         .borrow_mut()
@@ -4863,7 +4863,7 @@ pub(crate) fn build_ll_strcmp_helper_graph(
         Hlvalue::Variable(return_var),
     );
 
-    // ---- Pre-create downstream blocks.
+    // Pre-create downstream blocks.
     // block_s1_null: s1 IS NULL on entry; only s2 is needed.
     let s2_for_null_pair = variable_with_lltype("s2", ptr_lltype.clone());
     let block_s1_null = Block::shared(vec![Hlvalue::Variable(s2_for_null_pair.clone())]);
@@ -4927,7 +4927,7 @@ pub(crate) fn build_ll_strcmp_helper_graph(
         Hlvalue::Variable(len2_for_lendiff.clone()),
     ]);
 
-    // ---- start: ptr_nonzero(s1); branch.
+    // start: ptr_nonzero(s1); branch.
     let nz1 = variable_with_lltype("nz1", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "ptr_nonzero",
@@ -4950,7 +4950,7 @@ pub(crate) fn build_ll_strcmp_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_s1_null: s1 known NULL; ptr_nonzero(s2) decides
+    // block_s1_null: s1 known NULL; ptr_nonzero(s2) decides
     // both-NULL (False → return 1) vs only-s1-NULL (True → return 0).
     let nz2_in_null = variable_with_lltype("nz2", LowLevelType::Bool);
     block_s1_null
@@ -4977,7 +4977,7 @@ pub(crate) fn build_ll_strcmp_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_s1_nonnull: ptr_nonzero(s2). True (both non-NULL) →
+    // block_s1_nonnull: ptr_nonzero(s2). True (both non-NULL) →
     // continue; False (only s2 NULL) → return 0.
     let nz2_in_nn = variable_with_lltype("nz2", LowLevelType::Bool);
     block_s1_nonnull
@@ -5007,7 +5007,7 @@ pub(crate) fn build_ll_strcmp_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_both_nonnull: extract chars/len for both, branch on
+    // block_both_nonnull: extract chars/len for both, branch on
     // int_lt(len1, len2) to compute cmplen = min(len1, len2).
     let chars1 = variable_with_lltype("chars1", chars_array_ptr_lltype.clone());
     block_both_nonnull
@@ -5089,7 +5089,7 @@ pub(crate) fn build_ll_strcmp_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_cond: int_lt(i, cmplen); branch.
+    // block_loop_cond: int_lt(i, cmplen); branch.
     let lt = variable_with_lltype("lt", LowLevelType::Bool);
     block_loop_cond
         .borrow_mut()
@@ -5128,7 +5128,7 @@ pub(crate) fn build_ll_strcmp_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_body: getarrayitem×2, cast×2, int_sub diff,
+    // block_loop_body: getarrayitem×2, cast×2, int_sub diff,
     // int_ne, int_add i_next; branch on has_diff.
     let c1 = variable_with_lltype("c1", elem_lltype.clone());
     block_loop_body
@@ -5224,7 +5224,7 @@ pub(crate) fn build_ll_strcmp_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_return_len_diff: int_sub(len1, len2); link to
+    // block_return_len_diff: int_sub(len1, len2); link to
     // returnblock.
     let len_diff = variable_with_lltype("len_diff", LowLevelType::Signed);
     block_return_len_diff
@@ -5372,7 +5372,7 @@ pub(crate) fn build_ll_startswith_helper_graph(
         Hlvalue::Variable(j_for_body.clone()),
     ]);
 
-    // ---- start: extract chars/len for both, branch on int_lt(len1, len2).
+    // start: extract chars/len for both, branch on int_lt(len1, len2).
     let chars1 = variable_with_lltype("chars1", chars_array_ptr_lltype.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getsubstruct",
@@ -5426,7 +5426,7 @@ pub(crate) fn build_ll_startswith_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_cond: int_lt(j, len2); branch.
+    // block_loop_cond: int_lt(j, len2); branch.
     let lt = variable_with_lltype("lt", LowLevelType::Bool);
     block_loop_cond
         .borrow_mut()
@@ -5460,7 +5460,7 @@ pub(crate) fn build_ll_startswith_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_body: getarrayitem×2, char_eq/unichar_eq,
+    // block_loop_body: getarrayitem×2, char_eq/unichar_eq,
     // int_add(j, 1); branch on chars_eq.
     let c1 = variable_with_lltype("c1", elem_lltype.clone());
     block_loop_body
@@ -5654,7 +5654,7 @@ pub(crate) fn build_ll_endswith_helper_graph(
         Hlvalue::Variable(j_for_body.clone()),
     ]);
 
-    // ---- start: chars1/len1 + chars2/len2 + offset (int_sub) +
+    // start: chars1/len1 + chars2/len2 + offset (int_sub) +
     // length comparison branch.
     let chars1 = variable_with_lltype("chars1", chars_array_ptr_lltype.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -5719,7 +5719,7 @@ pub(crate) fn build_ll_endswith_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_cond: int_lt(j, len2); branch.
+    // block_loop_cond: int_lt(j, len2); branch.
     let lt = variable_with_lltype("lt", LowLevelType::Bool);
     block_loop_cond
         .borrow_mut()
@@ -5754,7 +5754,7 @@ pub(crate) fn build_ll_endswith_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_body: int_add(offset, j) -> idx; getarrayitem
+    // block_loop_body: int_add(offset, j) -> idx; getarrayitem
     // (chars1, idx); getarrayitem(chars2, j); char_eq/unichar_eq;
     // int_add(j, 1); branch on chars_eq.
     let idx = variable_with_lltype("idx", LowLevelType::Signed);
@@ -5960,7 +5960,7 @@ fn build_ll_startsendswith_char_helper_graph(
         Hlvalue::Variable(ch_for_compare.clone()),
     ]);
 
-    // ---- start: getsubstruct + getarraysize + int_eq(length, 0).
+    // start: getsubstruct + getarraysize + int_eq(length, 0).
     let chars = variable_with_lltype("chars", chars_array_ptr_lltype.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getsubstruct",
@@ -6001,7 +6001,7 @@ fn build_ll_startsendswith_char_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_compare: read chars[idx], emit char_eq/unichar_eq,
+    // block_compare: read chars[idx], emit char_eq/unichar_eq,
     // unconditional link to returnblock with the result.
     let idx_value = if is_endswith {
         let idx = variable_with_lltype("idx", LowLevelType::Signed);
@@ -6181,7 +6181,7 @@ pub(crate) fn build_hash_string_helper_graph(
         Hlvalue::Variable(x_for_finalize.clone()),
     ]);
 
-    // ---- start: getarraysize + int_eq(length, 0).
+    // start: getarraysize + int_eq(length, 0).
     let length = variable_with_lltype("length", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getarraysize",
@@ -6210,7 +6210,7 @@ pub(crate) fn build_hash_string_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_init: chars[0] cast + lshift(7) -> x.
+    // block_init: chars[0] cast + lshift(7) -> x.
     let c0 = variable_with_lltype("c0", elem_lltype.clone());
     block_init.borrow_mut().operations.push(SpaceOperation::new(
         "getarrayitem",
@@ -6243,7 +6243,7 @@ pub(crate) fn build_hash_string_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_cond: int_lt(i, length); branch.
+    // block_loop_cond: int_lt(i, length); branch.
     let lt = variable_with_lltype("lt", LowLevelType::Bool);
     block_loop_cond
         .borrow_mut()
@@ -6280,7 +6280,7 @@ pub(crate) fn build_hash_string_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_body: x_mul = int_mul(1000003, x); ci =
+    // block_loop_body: x_mul = int_mul(1000003, x); ci =
     // getarrayitem(chars, i); ci_int = cast(ci); x_new = int_xor(x_mul,
     // ci_int); i_next = int_add(i, 1).
     let x_mul = variable_with_lltype("x_mul", LowLevelType::Signed);
@@ -6345,7 +6345,7 @@ pub(crate) fn build_hash_string_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_finalize: int_xor(x, length); return.
+    // block_finalize: int_xor(x, length); return.
     let x_final = variable_with_lltype("x_final", LowLevelType::Signed);
     block_finalize
         .borrow_mut()
@@ -6541,7 +6541,7 @@ pub(crate) fn build_ll_strhash_internal_helper_graph(
         Hlvalue::Variable(x_for_set.clone()),
     ]);
 
-    // ---- start: chars + direct_call + int_eq(x, 0); branch.
+    // start: chars + direct_call + int_eq(x, 0); branch.
     let chars = variable_with_lltype("chars", chars_array_ptr_lltype);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getsubstruct",
@@ -6578,7 +6578,7 @@ pub(crate) fn build_ll_strhash_internal_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_set_hash: setfield(s, 'hash', x_use); return x_use.
+    // block_set_hash: setfield(s, 'hash', x_use); return x_use.
     let void_var = variable_with_lltype("__set_hash_void", LowLevelType::Void);
     block_set_hash
         .borrow_mut()
@@ -6685,7 +6685,7 @@ pub(crate) fn build_ll_strhash_helper_graph(
     let s_for_lookup = variable_with_lltype("s", ptr_lltype.clone());
     let block_lookup = Block::shared(vec![Hlvalue::Variable(s_for_lookup.clone())]);
 
-    // ---- start: ptr_nonzero(s); branch.
+    // start: ptr_nonzero(s); branch.
     let nz = variable_with_lltype("nz", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "ptr_nonzero",
@@ -6708,7 +6708,7 @@ pub(crate) fn build_ll_strhash_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_lookup: getfield(s, 'hash') + jit_conditional_call_value.
+    // block_lookup: getfield(s, 'hash') + jit_conditional_call_value.
     let h = variable_with_lltype("h", LowLevelType::Signed);
     block_lookup
         .borrow_mut()
@@ -6977,7 +6977,7 @@ fn build_ll_findlike_char_helper_graph(
         Hlvalue::Variable(i_for_body.clone()),
     ]);
 
-    // ---- start: getsubstruct + getarraysize + int_gt(end, length).
+    // start: getsubstruct + getarraysize + int_gt(end, length).
     let chars = variable_with_lltype("chars", chars_array_ptr_lltype.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getsubstruct",
@@ -7044,7 +7044,7 @@ fn build_ll_findlike_char_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_cond: forward int_lt(i, bound), reverse int_gt(i, bound).
+    // block_loop_cond: forward int_lt(i, bound), reverse int_gt(i, bound).
     let cond = variable_with_lltype("cond", LowLevelType::Bool);
     let cond_op = match flavor {
         FindLikeFlavor::Forward => "int_lt",
@@ -7082,7 +7082,7 @@ fn build_ll_findlike_char_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_body: shape depends on direction.
+    // block_loop_body: shape depends on direction.
     // Forward: c = getarrayitem(chars, i); eq = ...; i_next = int_add(i, 1);
     //   branch on eq: True -> return i; False -> loop_cond(i_next).
     // Reverse: i_next = int_sub(i, 1); c = getarrayitem(chars, i_next);
@@ -7306,7 +7306,7 @@ pub(crate) fn build_ll_count_char_helper_graph(
         Hlvalue::Variable(count_for_body.clone()),
     ]);
 
-    // ---- start: getsubstruct + getarraysize + int_gt(end, length).
+    // start: getsubstruct + getarraysize + int_gt(end, length).
     let chars = variable_with_lltype("chars", chars_array_ptr_lltype.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getsubstruct",
@@ -7358,7 +7358,7 @@ pub(crate) fn build_ll_count_char_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_cond: int_lt(i, end_clamped); branch.
+    // block_loop_cond: int_lt(i, end_clamped); branch.
     let lt = variable_with_lltype("lt", LowLevelType::Bool);
     block_loop_cond
         .borrow_mut()
@@ -7393,7 +7393,7 @@ pub(crate) fn build_ll_count_char_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_body: getarrayitem + char_eq + int_add(i, 1) +
+    // block_loop_body: getarrayitem + char_eq + int_add(i, 1) +
     // int_add(count, 1); branch on eq.
     let c = variable_with_lltype("c", elem_lltype.clone());
     block_loop_body
@@ -7677,7 +7677,7 @@ pub(crate) fn build_ll_stritem_helper_graph(
         Hlvalue::Variable(i_for_dispatch.clone()),
     ]);
 
-    // ---- start: int_lt(i, 0); branch.
+    // start: int_lt(i, 0); branch.
     let is_neg = variable_with_lltype("is_neg", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "int_lt",
@@ -7700,7 +7700,7 @@ pub(crate) fn build_ll_stritem_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_neg_fix: chars + length + i_fix = i + length.
+    // block_neg_fix: chars + length + i_fix = i + length.
     let chars = variable_with_lltype("chars", chars_array_ptr_lltype);
     block_neg_fix
         .borrow_mut()
@@ -7737,7 +7737,7 @@ pub(crate) fn build_ll_stritem_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_dispatch: direct_call(ll_stritem_nonneg, s, i_eff).
+    // block_dispatch: direct_call(ll_stritem_nonneg, s, i_eff).
     let c = variable_with_lltype("c", elem_lltype);
     block_dispatch
         .borrow_mut()
@@ -7866,7 +7866,7 @@ pub(crate) fn build_ll_string_isxxx_helper_graph(
         Hlvalue::Variable(i_for_body.clone()),
     ]);
 
-    // ---- start: getsubstruct + getarraysize + int_eq(length, 0).
+    // start: getsubstruct + getarraysize + int_eq(length, 0).
     let chars = variable_with_lltype("chars", chars_array_ptr_lltype);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getsubstruct",
@@ -7905,7 +7905,7 @@ pub(crate) fn build_ll_string_isxxx_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_cond: int_lt(i, length).
+    // block_loop_cond: int_lt(i, length).
     let lt = variable_with_lltype("lt", LowLevelType::Bool);
     block_loop_cond
         .borrow_mut()
@@ -7938,7 +7938,7 @@ pub(crate) fn build_ll_string_isxxx_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_loop_body: c + direct_call(predicate, c) + int_add.
+    // block_loop_body: c + direct_call(predicate, c) + int_add.
     let c = variable_with_lltype("c", elem_lltype);
     block_loop_body
         .borrow_mut()
@@ -8116,7 +8116,7 @@ pub(crate) fn build_ll_string_casefold_helper_graph(
         Hlvalue::Variable(i_for_body.clone()),
     ]);
 
-    // ---- start: s_chars, s_len, empty fast-path branch.
+    // start: s_chars, s_len, empty fast-path branch.
     let chars = variable_with_lltype("s_chars", chars_array_ptr_lltype.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getsubstruct",
@@ -8151,7 +8151,7 @@ pub(crate) fn build_ll_string_casefold_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- empty fast path: no allocation, matching `s.empty()`'s
+    // empty fast path: no allocation, matching `s.empty()`'s
     // allocation-free contract for already-empty input.
     block_empty_return.closeblock(vec![
         Link::new(
@@ -8162,7 +8162,7 @@ pub(crate) fn build_ll_string_casefold_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- non-empty allocation: result = mallocstr(s_len).
+    // non-empty allocation: result = mallocstr(s_len).
     let newstr = variable_with_lltype("result", ptr_lltype.clone());
     block_alloc
         .borrow_mut()
@@ -8200,7 +8200,7 @@ pub(crate) fn build_ll_string_casefold_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- loop_cond: i < s_len.
+    // loop_cond: i < s_len.
     let keep_going = variable_with_lltype("keep_going", LowLevelType::Bool);
     block_loop_cond
         .borrow_mut()
@@ -8235,7 +8235,7 @@ pub(crate) fn build_ll_string_casefold_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- loop_body: result.chars[i] = ll_upper/lower_char(s_chars[i]).
+    // loop_body: result.chars[i] = ll_upper/lower_char(s_chars[i]).
     let c = variable_with_lltype("c", LowLevelType::Char);
     block_loop_body
         .borrow_mut()
@@ -8434,7 +8434,7 @@ pub(crate) fn build_ll_replace_chr_chr_helper_graph(
         Hlvalue::Variable(c_for_store.clone()),
     ]);
 
-    // ---- start: source chars, length, destination allocation/chars.
+    // start: source chars, length, destination allocation/chars.
     let src = variable_with_lltype("src", chars_array_ptr_lltype.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getsubstruct",
@@ -8480,7 +8480,7 @@ pub(crate) fn build_ll_replace_chr_chr_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- loop_cond: j < length.
+    // loop_cond: j < length.
     let keep_going = variable_with_lltype("keep_going", LowLevelType::Bool);
     block_loop_cond
         .borrow_mut()
@@ -8517,7 +8517,7 @@ pub(crate) fn build_ll_replace_chr_chr_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- loop_body: c = src[j]; if c == c1: c = c2.
+    // loop_body: c = src[j]; if c == c1: c = c2.
     let c = variable_with_lltype("c", elem_lltype.clone());
     block_loop_body
         .borrow_mut()
@@ -8576,7 +8576,7 @@ pub(crate) fn build_ll_replace_chr_chr_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- store: dst[j] = c; j += 1.
+    // store: dst[j] = c; j += 1.
     let set_void = variable_with_lltype("set", LowLevelType::Void);
     block_store
         .borrow_mut()
@@ -8717,7 +8717,7 @@ pub(crate) fn build_ll_stritem_nonneg_checked_helper_graph(
         Hlvalue::Variable(i_for_dispatch.clone()),
     ]);
 
-    // ---- start: getsubstruct + getarraysize + int_ge(i, length); branch.
+    // start: getsubstruct + getarraysize + int_ge(i, length); branch.
     let chars = variable_with_lltype("chars", chars_array_ptr_lltype);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getsubstruct",
@@ -8754,7 +8754,7 @@ pub(crate) fn build_ll_stritem_nonneg_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_dispatch: direct_call(ll_stritem_nonneg, s, i).
+    // block_dispatch: direct_call(ll_stritem_nonneg, s, i).
     let c = variable_with_lltype("c", elem_lltype);
     block_dispatch
         .borrow_mut()
@@ -8919,7 +8919,7 @@ pub(crate) fn build_ll_stritem_checked_helper_graph(
         Hlvalue::Variable(i_for_dispatch.clone()),
     ]);
 
-    // ---- start: getsubstruct + getarraysize + int_lt(i, 0); branch.
+    // start: getsubstruct + getarraysize + int_lt(i, 0); branch.
     let chars = variable_with_lltype("chars", chars_array_ptr_lltype);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getsubstruct",
@@ -8962,7 +8962,7 @@ pub(crate) fn build_ll_stritem_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_neg_fix: i_fix = int_add(i, length).
+    // block_neg_fix: i_fix = int_add(i, length).
     let i_fix = variable_with_lltype("i_fix", LowLevelType::Signed);
     block_neg_fix
         .borrow_mut()
@@ -8988,7 +8988,7 @@ pub(crate) fn build_ll_stritem_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_check_high: too_high = int_ge(i, length); branch.
+    // block_check_high: too_high = int_ge(i, length); branch.
     let too_high = variable_with_lltype("too_high", LowLevelType::Bool);
     block_check_high
         .borrow_mut()
@@ -9017,7 +9017,7 @@ pub(crate) fn build_ll_stritem_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_check_low: too_low = int_lt(i, 0); branch.
+    // block_check_low: too_low = int_lt(i, 0); branch.
     let too_low = variable_with_lltype("too_low", LowLevelType::Bool);
     block_check_low
         .borrow_mut()
@@ -9038,7 +9038,7 @@ pub(crate) fn build_ll_stritem_checked_helper_graph(
         .into_ref(),
     ]);
 
-    // ---- block_dispatch: direct_call(ll_stritem_nonneg, s, i).
+    // block_dispatch: direct_call(ll_stritem_nonneg, s, i).
     let c = variable_with_lltype("c", elem_lltype);
     block_dispatch
         .borrow_mut()
@@ -9152,7 +9152,7 @@ pub(crate) fn build_ll_strconcat_helper_graph(
         Hlvalue::Variable(return_var),
     );
 
-    // ---- start: extract source lengths, malloc the result, then copy each
+    // start: extract source lengths, malloc the result, then copy each
     //      source's chars into it via copystrcontent.  Mirrors upstream
     //      `ll_strconcat` (rstr.py): malloc + two `copy_contents_from_str`
     //      calls, each rewritten by the JIT codewriter to a single

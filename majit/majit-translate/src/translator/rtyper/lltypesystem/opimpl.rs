@@ -136,7 +136,7 @@ pub fn op_same_as(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-// ---- int_* ---------------------------------------------------------
+// int_*
 
 /// RPython `opimpl.op_int_is_true` derived from
 /// `flowspace.operation.op.is_true.pyfunc` (`opimpl.py:47-94
@@ -355,7 +355,7 @@ pub fn op_int_force_ge_zero(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-// ---- float_* ------------------------------------------------------
+// float_*
 
 /// `op_float_*` are derived via `get_primitive_op_src` (`opimpl.py`)
 /// for `argtype = float`. RPython folds them as direct IEEE 754
@@ -445,7 +445,7 @@ pub fn op_float_ge(args: &[ConstValue]) -> Option<ConstValue> {
     Some(ConstValue::Bool(a >= b))
 }
 
-// ---- llong_* ------------------------------------------------------
+// llong_*
 //
 // Upstream `op_llong_*` (`opimpl.py:298-358`) operates on `r_longlong_arg`,
 // which on 64-bit hosts aliases the regular Python int (see
@@ -544,7 +544,7 @@ pub fn op_llong_ge(args: &[ConstValue]) -> Option<ConstValue> {
     op_int_ge(args)
 }
 
-// ---- uint_* and ullong_* ------------------------------------------
+// uint_* and ullong_*
 //
 // Upstream `op_uint_*` (`opimpl.py:330-378`) operates on `r_uint` —
 // `unsigned long` in C, `u64` on 64-bit hosts. The Rust port carries
@@ -787,7 +787,7 @@ pub fn op_ullong_ge(args: &[ConstValue]) -> Option<ConstValue> {
     op_uint_ge(args)
 }
 
-// ---- ptr_* ---------------------------------------------------------
+// ptr_*
 
 /// RPython `op_ptr_eq` (`opimpl.py`).
 ///
@@ -986,7 +986,7 @@ pub fn op_cast_adr_to_ptr(restype: &LowLevelType, args: &[ConstValue]) -> Option
         .map(|p| ConstValue::LLPtr(Box::new(p)))
 }
 
-// ---- cast_*_to_* (primitive-only carriers) ------------------------
+// cast_*_to_* (primitive-only carriers)
 
 /// RPython `op_cast_int_to_float` (`opimpl.py`).
 pub fn op_cast_int_to_float(args: &[ConstValue]) -> Option<ConstValue> {
@@ -1121,7 +1121,7 @@ pub fn op_cast_unichar_to_int(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-// ---- wide-int casts (i64 / u64 carrier preserves bit pattern) -----
+// wide-int casts (i64 / u64 carrier preserves bit pattern)
 //
 // On 64-bit hosts every signed/unsigned long-long type collapses onto
 // the single [`ConstValue::Int(i64)`] carrier (per `lltype.rs`).
@@ -1354,7 +1354,7 @@ pub fn op_convert_longlong_bytes_to_float(args: &[ConstValue]) -> Option<ConstVa
     }
 }
 
-// ---- char_* / unichar_* comparisons ------------------------------
+// char_* / unichar_* comparisons
 
 /// RPython `char_lt`/`char_le`/`char_eq`/`char_ne`/`char_gt`/`char_ge`
 /// derived via `get_primitive_op_src` (`opimpl.py`). The
@@ -1424,7 +1424,7 @@ pub fn op_unichar_ne(args: &[ConstValue]) -> Option<ConstValue> {
     Some(ConstValue::Bool(a != b))
 }
 
-// ---- likely / unlikely --------------------------------------------
+// likely / unlikely
 
 /// RPython `op_likely` / `op_unlikely` (`opimpl.py`) —
 /// identity on `bool`. The annotation is a JIT hint; constant folding
@@ -1443,7 +1443,7 @@ pub fn op_unlikely(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-// ---- registry -----------------------------------------------------
+// registry
 
 // TODO: opimpl missing-ops audit.
 //

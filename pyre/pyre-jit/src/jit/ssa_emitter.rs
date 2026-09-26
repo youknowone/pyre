@@ -50,7 +50,7 @@ impl SSAReprEmitter {
         }
     }
 
-    // ---- setup passthrough (mirrors JitCodeBuilder setup API) ----
+    // setup passthrough (mirrors JitCodeBuilder setup API)
 
     pub fn set_name(&mut self, name: impl Into<String>) {
         self.builder.set_name(name);
@@ -119,7 +119,7 @@ impl SSAReprEmitter {
         self.builder.has_abort_flag()
     }
 
-    // ---- label id allocation ----
+    // label id allocation
 
     /// Allocate the next u16 label id. The walker formats the id into
     /// a TLabel name (`catch_landing_{id}`) that `Assembler::assemble`
@@ -134,9 +134,9 @@ impl SSAReprEmitter {
         id
     }
 
-    // ---- portal jit_merge_point ----
+    // portal jit_merge_point
 
-    // ---- finalization ----
+    // finalization
 
     /// Translate an insn-index position into the corresponding JitCode
     /// byte offset using the `ssarepr.insns_pos` table that

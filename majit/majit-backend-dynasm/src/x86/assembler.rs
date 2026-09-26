@@ -2091,7 +2091,7 @@ impl<'a> Assembler386<'a> {
     ///   CMP QWORD [rbp + JF_FRAME_OFS + LENGTHOFS], imm32_placeholder
     ///                              ; → frame_depth_to_patch[]
     ///   JGE  continue              ; fast path: frame large enough
-    ///   ;; --- inlined slowpath body ---
+    /// ;; --- inlined slowpath body
     ///   push_all_regs_to_jitframe(&[], withfloats=true)
     ///   push_gcmap(gcmap)          ; publish live Refs for the collector
     ///   MOV  ARG0, rbp             ; old_jf
