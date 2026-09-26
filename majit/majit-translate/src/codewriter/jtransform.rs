@@ -1048,6 +1048,24 @@ fn rewrite_symmetric(graph: &FunctionGraph, op: SpaceOperation) -> SpaceOperatio
     }
 }
 
+/// `Constant(None, Void)` after `ConstNone` is erased, or the definition
+/// itself when it is still in the block.  `is_(p, None)` uses it as the
+/// null operand (`rnone.py` `rtype_is_None`).
+fn operand_is_void_none(
+    graph: &FunctionGraph,
+    variable: &crate::flowspace::model::Variable,
+) -> bool {
+    if FunctionGraph::concretetype_of(variable) == crate::model::ConcreteType::Void {
+        return true;
+    }
+    graph.blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|op| op.result.as_ref() == Some(variable) && matches!(op.kind, OpKind::ConstNone))
+    })
+}
+
 /// The opnames upstream binds to `_rewrite_symmetric`, in pyre's spelling.
 ///
 /// `add` / `mul` cover both `int_add` / `int_mul` and `float_add` /
@@ -2666,6 +2684,43 @@ impl<'a> Transformer<'a> {
             // this point — the `-live-` in front is what makes that a valid
             // resume point rather than one that merely happens to inherit a
             // marker from the preceding operation.
+            // `<*const T>::is_null` / `<*mut T>::is_null` is `is_(p, None)`
+            // (`front::mir` `is_raw_ptr_is_null`).  The charon path does not
+            // run `rtype_is_None` (`rnone.py`), which would emit `ptr_iszero`.
+            // `None` is a Void constant, so the compare is not an `rr`
+            // `ptr_eq`; leaving it spells `int_is_/r>i`, which blackhole
+            // cannot dispatch.  Fold the pointer operand to `ptr_iszero`.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if binop_name == "is_"
+                && (operand_is_void_none(graph, lhs) ^ operand_is_void_none(graph, rhs)) =>
+            {
+                let operand = if operand_is_void_none(graph, rhs) {
+                    lhs
+                } else {
+                    rhs
+                };
+                if self.get_value_kind_var(operand) == 'r' {
+                    if let Some(result) = &op.result {
+                        result.set_concretetype(Some(
+                            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+                        ));
+                    }
+                    RewriteResult::Replace(vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::UnaryOp {
+                            op: "ptr_iszero".into(),
+                            operand: operand.clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    }])
+                } else {
+                    RewriteResult::Keep
+                }
+            }
             OpKind::BinOp { op: binop_name, .. }
                 if matches!(binop_name.as_str(), "add_ovf" | "sub_ovf" | "mul_ovf") =>
             {

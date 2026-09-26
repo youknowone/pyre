@@ -12870,6 +12870,43 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `core::ptr::{const_ptr,mut_ptr}::<Impl>::is_null(p)` is
+                // upstream's null test `p is None` (`flowspace` `is_`,
+                // `binaryop.py` `is__default`, `rnone.py` `rtype_is_None` →
+                // `ptr_iszero` on a pointer lowleveltype).  Every receiver
+                // takes that operation: a GC string is a nullable
+                // `SomeString`, and routing the call as
+                // `getattr(p, "is_null")` dies on `String` (no such
+                // attribute).  The `None` operand is `Constant(None)`.
+                if args.len() == 1 && self.is_raw_ptr_is_null(&reg) {
+                    // `Constant(None)` is Void (`rmodel.py`
+                    // `pairtype(Repr, VoidRepr).convert_from_to`). jtransform
+                    // erases the definition and folds `is_` to `ptr_iszero`.
+                    let none = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(none.clone()),
+                        kind: OpKind::ConstNone,
+                    });
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: "is_".to_string(),
+                            lhs: args[0].clone(),
+                            rhs: none,
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `<[T]>::is_empty` is `arraylen_gc(s) == 0`.  Keep both
                 // operations in the graph instead of residualizing the
                 // graph-less std helper.  A string-byte-view (`as_bytes()`)
@@ -16023,30 +16060,12 @@ impl<'a> Lowering<'a> {
             }
             // Non-ADT `Self` (primitive / raw pointer / slice): Charon leaves
             // the impl owner type unresolved, so the ADT table has no entry.
-            // Fall back to the module Ident immediately preceding the `Impl`
-            // NameSeg, which Charon names after the primitive's impl module
-            // (`core::ptr::mut_ptr::<Impl>::is_null` → `mut_ptr`).  Restricted
-            // to `(module, method)` pairs that have a classdef-less analyzer
-            // reachable through the `getattr` → bound-method path
-            // (`unaryop.rs::ptr_method_is_null`); analyzer-less primitive
-            // methods stay on the `FunctionPath` form so they do not surface a
-            // new panicking `SomeInstance.getattr`.
-            None => {
-                if last_idx < 2 {
-                    return None;
-                }
-                let module_leaf = match &segs[last_idx - 2] {
-                    NameSeg::Ident { ident: (s, _) } => s.as_str(),
-                    _ => return None,
-                };
-                if !NON_ADT_OWNER_METHOD_ALLOWLIST
-                    .iter()
-                    .any(|&(m, f)| m == module_leaf && f == leaf)
-                {
-                    return None;
-                }
-                module_leaf.to_string()
-            }
+            // Do not invent a `CallTarget::Method` owner from the module
+            // Ident — `core::ptr::{const_ptr,mut_ptr}::<Impl>::is_null` is
+            // lowered to `is_(p, Constant(None))` before this hint is
+            // consulted (`is_raw_ptr_is_null`), and every other primitive
+            // method stays on the `FunctionPath` form.
+            None => return None,
         };
         if owner_leaf.is_empty() {
             return None;
@@ -18432,6 +18451,40 @@ impl<'a> Lowering<'a> {
     /// (the only two callers, `IntArray`/`FloatArray::from_vec`, are host
     /// builtins residualised to their compiled bodies, so no traced consumer
     /// dereferences the folded header).
+    /// `core::ptr::{const_ptr,mut_ptr}::<Impl>::is_null` — Charon's name
+    /// for `<*const T>::is_null` / `<*mut T>::is_null`.  The impl module
+    /// leaf is `const_ptr` or `mut_ptr` and the method leaf is `is_null`;
+    /// the `Impl` segment sits between them.  Mutability does not change
+    /// the null test (`p is None`).
+    fn is_raw_ptr_is_null(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let segs = &fd.item_meta.name;
+        let Some(last_idx) = segs
+            .iter()
+            .rposition(|s| matches!(s, NameSeg::Ident { .. }))
+        else {
+            return false;
+        };
+        let leaf = match &segs[last_idx] {
+            NameSeg::Ident { ident: (s, _) } => s.as_str(),
+            _ => return false,
+        };
+        if leaf != "is_null" || last_idx < 2 {
+            return false;
+        }
+        let module_leaf = match &segs[last_idx - 2] {
+            NameSeg::Ident { ident: (s, _) } => s.as_str(),
+            _ => return false,
+        };
+        matches!(module_leaf, "const_ptr" | "mut_ptr")
+            && matches!(&segs[last_idx - 1], NameSeg::Other(v) if v.get("Impl").is_some())
+    }
+
     fn is_container_as_ptr_identity(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -26992,29 +27045,11 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
             // `[qualified_owner, method]`.
             strip_crate_prefix(&td.item_meta.name_path())
         }
-        // Non-ADT `Self` allowlist fallback — same arm as the instance
-        // method.  An allowlisted method has no TypeDecl, so the module
-        // Ident is the only owner name available; using the same bare
-        // leaf on both sides keeps the call-target key
-        // (`CallTarget::Method { owner, .. }`) and the registration key
-        // (`self_ty_root`) identical should an allowlisted pair ever
-        // match a local fn with a body.
-        None => {
-            if last_idx < 2 {
-                return None;
-            }
-            let module_leaf = match &segs[last_idx - 2] {
-                NameSeg::Ident { ident: (s, _) } => s.as_str(),
-                _ => return None,
-            };
-            if !NON_ADT_OWNER_METHOD_ALLOWLIST
-                .iter()
-                .any(|&(m, f)| m == module_leaf && f == leaf)
-            {
-                return None;
-            }
-            module_leaf.to_string()
-        }
+        // Non-ADT `Self` has no TypeDecl and no `CallTarget::Method`
+        // owner.  `is_null` is not registered here: the front lowers
+        // `<*const T>::is_null` / `<*mut T>::is_null` to `is_`
+        // (`is_raw_ptr_is_null`) instead of a method key.
+        None => return None,
     };
     if owner_qualified.is_empty() {
         return None;
@@ -32777,19 +32812,6 @@ fn field_label_from_payload(payload: &serde_json::Value) -> String {
     }
     "field".into()
 }
-
-/// `(module_leaf, method_leaf)` pairs whose primitive/raw-pointer impl
-/// method has a classdef-less analyzer reachable through the `getattr` →
-/// bound-method path, so [`Lowering::impl_method_owner`] may route them as
-/// `CallTarget::Method` even though Charon leaves the `Self` type unresolved
-/// (non-ADT, no entry in the type table).  `*_ptr::is_null` resolves to
-/// `unaryop.rs::ptr_method_is_null` (yielding `SomeBool`), lowered to
-/// `ptr_iszero`; `const_ptr` and `mut_ptr` share the analyzer since the
-/// receiver mutability does not affect the null test.  Pairs absent here
-/// keep the `FunctionPath` form rather than surface a new panicking
-/// `SomeInstance.getattr`.
-const NON_ADT_OWNER_METHOD_ALLOWLIST: &[(&str, &str)] =
-    &[("mut_ptr", "is_null"), ("const_ptr", "is_null")];
 
 /// Return `(trait_leaf_ident, method_leaf_ident)` when the FunDecl's
 /// raw `NameSeg` vec ends in two consecutive `Ident` segments — the
