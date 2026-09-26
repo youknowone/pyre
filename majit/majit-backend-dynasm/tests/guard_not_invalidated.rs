@@ -163,3 +163,35 @@ fn every_recorded_position_in_a_trace_is_written() {
         "the first guard is the one reached, so its fail argument is the one saved"
     );
 }
+
+/// On x86-64 the site executes as one NOP, not a jump to the next
+/// instruction.  `genop_guard_guard_not_invalidated` emits nothing, so a
+/// `JMP rel32 0` placeholder would put a taken branch in every loop iteration
+/// that upstream does not have; the NOP keeps the site free while still
+/// reserving whole-instruction bytes for `invalidate_loop` to overwrite.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn the_x86_site_is_a_nop_until_invalidated() {
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let token = JitCellToken::new(4);
+    compile_guarded_add(&mut backend, &token);
+
+    let entry = token.ll_function_addr();
+    assert_ne!(entry, 0);
+    let code = unsafe { std::slice::from_raw_parts(entry as *const u8, 256) };
+    let nop8 = [0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let site = (0..code.len() - 8)
+        .find(|&i| (entry + i) % 8 == 0 && code[i..i + 8] == nop8)
+        .expect("the guard site is an aligned eight-byte NOP");
+    assert!(
+        !code.windows(5).any(|w| w == [0xE9, 0x00, 0x00, 0x00, 0x00]),
+        "no jump-to-next placeholder is emitted"
+    );
+
+    backend.invalidate_loop(&token);
+    assert_eq!(
+        code[site], 0xE9,
+        "invalidate_loop writes JMP rel32 over the NOP"
+    );
+}
