@@ -242,6 +242,27 @@ fn bigint_mul(a: &BigInt, b: &BigInt) -> *mut BigInt {
     pyre_object::longobject::alloc_bigint_nursery(a.mul(b))
 }
 
+/// Host form of `rbigint.mod` (`rbigint.py` `mod` / `_divmod` / `_divrem`).
+/// A same-sign divisor of more than one digit returns `self` when `|a| < |b|`;
+/// a one-digit divisor goes through `int_divmod` and constructs, and opposite
+/// signs construct. The MIR front retargets this call to `jit_bigint_mod_floor`.
+#[majit_macros::dont_look_inside]
+fn bigint_mod(a: &BigInt, b: &BigInt) -> *mut BigInt {
+    let selfsign = a.get_sign();
+    let othersign = b.get_sign();
+    if selfsign != 0
+        && othersign != 0
+        && selfsign == othersign
+        && b.numdigits() != 1
+        && divrem_returns_input_as_remainder(a, b)
+    {
+        return a as *const BigInt as *mut BigInt;
+    }
+    pyre_object::longobject::alloc_bigint_nursery(
+        a.divmod(b).expect("divisor was checked nonzero").1,
+    )
+}
+
 /// Host form of `rbigint.int_add`. `iother == 0` returns `self` unless
 /// `self` is already zero (`rbigint.py` `int_add`). The MIR front retargets
 /// this call to `jit_bigint_int_add`.
@@ -970,11 +991,6 @@ fn bigint_gt(a: BigInt, b: BigInt) -> bool {
     a > b
 }
 
-#[majit_macros::elidable]
-fn bigint_mod(a: BigInt, b: BigInt) -> BigInt {
-    a % b
-}
-
 /// longobject.py `_truediv` delegates directly to rbigint.truediv and
 /// only translates its application-level exceptions.
 #[majit_macros::elidable]
@@ -1349,10 +1365,9 @@ unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if !vb.tobool() {
         return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
-    // `rbigint.mod` (`_divmod` / `_divrem`) returns the input when it is
-    // already smaller than the divisor. That alias stays inside the elidable
-    // `jit_bigint_mod_floor` residual; `descr_mod` only boxes the result.
-    Ok(w_long_new(bigint_modulo_nonzero(va, vb)))
+    // `rbigint.mod` returns the input payload when `_divrem` does. The alias
+    // stays inside `bigint_mod`; this descriptor only boxes it.
+    Ok(pyre_object::longobject::w_long_from_raw(bigint_mod(va, vb)))
 }
 
 /// `_int_divmod`: `rbigint.int_divmod`, then `newtuple2` of two `newlong`s.

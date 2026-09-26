@@ -225,15 +225,17 @@ pub(crate) fn int_comparison_residual_for_method(leaf: &str) -> Option<Vec<Strin
     )
 }
 
-/// `descroperation::bigint_{add,sub,mul}(&RBigInt, &RBigInt) -> *mut RBigInt`
-/// are the source spellings of `rbigint.add` / `sub` / `mul`. Each call is
-/// retargeted to the matching `jit_bigint_*`, whose result the front models
-/// as one GC reference.
+/// `descroperation::bigint_{add,sub,mul,mod}(&RBigInt, &RBigInt) -> *mut RBigInt`
+/// are the source spellings of `rbigint.add` / `sub` / `mul` / `mod`. Each
+/// call is retargeted to the matching `jit_bigint_*`, whose result the front
+/// models as one GC reference. `bigint_mod` targets `jit_bigint_mod_floor`,
+/// the same residual as the value-returning `bigint_modulo_nonzero` seam.
 pub(crate) fn bigint_add_residual_path(segments: &[String]) -> Option<Vec<String>> {
     let residual = match segments.last().map(String::as_str) {
         Some("bigint_add") => "jit_bigint_add",
         Some("bigint_sub") => "jit_bigint_sub",
         Some("bigint_mul") => "jit_bigint_mul",
+        Some("bigint_mod") => "jit_bigint_mod_floor",
         _ => return None,
     };
     if !segments
@@ -876,6 +878,20 @@ mod tests {
                 "objspace",
                 "descroperation",
                 "jit_bigint_mul",
+            ]))
+        );
+        assert_eq!(
+            bigint_add_residual_path(&segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "bigint_mod",
+            ])),
+            Some(segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "jit_bigint_mod_floor",
             ]))
         );
     }
