@@ -9639,8 +9639,10 @@ impl<'a> Lowering<'a> {
     ///
     /// A foreign `const` is recorded `Opaque` in the caller's LLBC, so
     /// this also resolves the same path from the defining crate's harvest
-    /// (seeded while that crate's artefact is loaded).  Module constants
-    /// are live host values, independent of which crate reads them.
+    /// (seeded while that crate's artefact is loaded).  A `libc` errno
+    /// constant is not harvested: its initializer is opaque and the host
+    /// `libc` value is not the target's (`EAGAIN` is 35 on macOS and 11
+    /// on Linux and wasm). Leave that read residual.
     fn fold_named_const_global(&self, def_id: u64) -> Option<OpKind> {
         fold_named_const_on_llbc(self.llbc, def_id).or_else(|| {
             let gd = self.llbc.global_by_id(def_id)?;
@@ -9653,7 +9655,6 @@ impl<'a> Lowering<'a> {
                 return None;
             }
             named_const_fold_for_path(&gd.item_meta.name_path())
-                .or_else(|| libc_integer_const(&gd.item_meta.name_path()))
         })
     }
 
@@ -33316,47 +33317,6 @@ pub(crate) fn push_named_const_folds(
 
 fn named_const_fold_for_path(path: &str) -> Option<OpKind> {
     NAMED_CONST_FOLDS.with(|slot| slot.borrow().get(path).cloned())
-}
-
-/// A foreign `libc` `NamedConst` whose initializer Charon recorded `Opaque`.
-/// The defining crate is not in the extracted corpus, so the harvest has
-/// no literal. The value is the C constant (`rffi` `CConstant`): the same
-/// integer the host `libc` crate was built with.
-fn libc_integer_const(path: &str) -> Option<OpKind> {
-    let mut parts = path.split("::");
-    if parts.next() != Some("libc") {
-        return None;
-    }
-    let leaf = path.rsplit("::").next()?;
-    let value = libc_errno_value(leaf)?;
-    Some(OpKind::ConstInt(value))
-}
-
-fn libc_errno_value(leaf: &str) -> Option<i64> {
-    let value = match leaf {
-        "EACCES" => libc::EACCES,
-        "EAGAIN" => libc::EAGAIN,
-        "EALREADY" => libc::EALREADY,
-        "ECHILD" => libc::ECHILD,
-        "ECONNABORTED" => libc::ECONNABORTED,
-        "ECONNREFUSED" => libc::ECONNREFUSED,
-        "ECONNRESET" => libc::ECONNRESET,
-        "EEXIST" => libc::EEXIST,
-        "EINPROGRESS" => libc::EINPROGRESS,
-        "EINTR" => libc::EINTR,
-        "EISDIR" => libc::EISDIR,
-        "ENOENT" => libc::ENOENT,
-        "ENOTDIR" => libc::ENOTDIR,
-        "EPERM" => libc::EPERM,
-        "EPIPE" => libc::EPIPE,
-        "ESRCH" => libc::ESRCH,
-        "ETIMEDOUT" => libc::ETIMEDOUT,
-        "EWOULDBLOCK" => libc::EWOULDBLOCK,
-        #[cfg(unix)]
-        "ESHUTDOWN" => libc::ESHUTDOWN,
-        _ => return None,
-    };
-    Some(i64::from(value))
 }
 
 /// Add one crate's folds to the table, restarting it when `crate_name`
