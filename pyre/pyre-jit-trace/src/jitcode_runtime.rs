@@ -1344,8 +1344,9 @@ fn rehydrated_call_descr_ref(bh: majit_jitcode::jitcode::BhCallDescr) -> majit_i
 ///
 /// `GcLLDescr_framework.init_size_descr` asks `TypeLayoutBuilder.get_type_id`
 /// for those ids during translation, against Size objects already in
-/// `GcCache`. pyre cannot embed the collector ids in the executable, so a
-/// process that never traces does not decode the descr table. Kind-0 slots
+/// `GcCache`. pyre cannot embed the collector ids in the executable.
+/// `init_jit_hooks` publishes them before user code when the JIT is on;
+/// `PYRE_JIT=0` never calls this. Kind-0 slots
 /// are Size/Field/Array: Field minting publishes the parent Size the tid walk
 /// reads. `set_type_registry_close_hook` runs this before `freeze_types`, so
 /// the registry is still open when the tids are registered. CallDescr
