@@ -522,20 +522,24 @@ pub fn take_two_words(slot: &mut TwoWords) -> TwoWords {
 }
 
 /// Hand-written `Default` whose fields are not zero. `mem::take` calls
-/// this impl and stores the fields it returns.
-pub struct OddDefault {
-    pub lo: i64,
-    pub hi: i64,
-}
+/// this impl and stores the fields it returns. The impl lives in its own
+/// module so its name path is not `charon_corpus::<Impl>::default`, which
+/// the derived `TwoWords` impl already uses.
+pub mod odd_default {
+    pub struct OddDefault {
+        pub lo: i64,
+        pub hi: i64,
+    }
 
-impl Default for OddDefault {
-    fn default() -> Self {
-        Self { lo: 7, hi: 9 }
+    impl Default for OddDefault {
+        fn default() -> Self {
+            Self { lo: 7, hi: 9 }
+        }
     }
 }
 
 #[inline(never)]
-pub fn take_odd_default(slot: &mut OddDefault) -> OddDefault {
+pub fn take_odd_default(slot: &mut odd_default::OddDefault) -> odd_default::OddDefault {
     std::mem::take(slot)
 }
 
