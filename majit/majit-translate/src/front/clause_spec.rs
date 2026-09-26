@@ -299,10 +299,7 @@ fn trait_impl_id(v: &Value, llbc: &Llbc, depth: usize) -> Option<u64> {
         return None;
     }
     let obj = unwrap_ref(v, llbc, depth)?;
-    obj.get("kind")?
-        .get("TraitImpl")?
-        .get("id")?
-        .as_u64()
+    obj.get("kind")?.get("TraitImpl")?.get("id")?.as_u64()
 }
 
 fn resolve_trait_ref(v: &Value, llbc: &Llbc, depth: usize) -> Option<Value> {
@@ -404,13 +401,7 @@ fn subst_tyref(ty: &TyRef, llbc: &Llbc, types: &[Value], const_generics: &[Value
     serde_json::from_value(value.clone()).unwrap_or(TyRef::Other(value))
 }
 
-fn subst_vars(
-    v: &mut Value,
-    llbc: &Llbc,
-    types: &[Value],
-    const_generics: &[Value],
-    depth: usize,
-) {
+fn subst_vars(v: &mut Value, llbc: &Llbc, types: &[Value], const_generics: &[Value], depth: usize) {
     if depth > 64 {
         return;
     }
@@ -456,7 +447,9 @@ fn type_var_index(v: &Value) -> Option<usize> {
         }
         return Some(bound.get(1)?.as_u64()? as usize);
     }
-    var.get("Free").and_then(Value::as_u64).map(|index| index as usize)
+    var.get("Free")
+        .and_then(Value::as_u64)
+        .map(|index| index as usize)
 }
 
 /// Depth-0 const-generic variable index:
@@ -469,7 +462,9 @@ fn const_var_index(v: &Value) -> Option<usize> {
         }
         return Some(bound.get(1)?.as_u64()? as usize);
     }
-    var.get("Free").and_then(Value::as_u64).map(|index| index as usize)
+    var.get("Free")
+        .and_then(Value::as_u64)
+        .map(|index| index as usize)
 }
 
 fn contains_depth0_var(v: &Value, llbc: &Llbc, depth: usize) -> bool {
@@ -563,10 +558,7 @@ fn type_key(v: &Value) -> String {
     {
         return format!("d{id}");
     }
-    if let Some(index) = v
-        .pointer("/TypeVar/Bound/1")
-        .and_then(Value::as_u64)
-    {
+    if let Some(index) = v.pointer("/TypeVar/Bound/1").and_then(Value::as_u64) {
         return format!("v{index}");
     }
     let text = v.to_string();

@@ -1001,7 +1001,10 @@ pub(crate) fn propagate_access_directly(
                     || callee_fn
                         .fun_decl_id
                         .is_some_and(|id| residual_decls.contains(&id))
-                    || callee_fn.hints.iter().any(|hint| hint == "dont_look_inside")
+                    || callee_fn
+                        .hints
+                        .iter()
+                        .any(|hint| hint == "dont_look_inside")
                 {
                     continue;
                 }
