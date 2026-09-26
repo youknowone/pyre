@@ -38,7 +38,10 @@ from llbc_extract import (  # noqa: E402
 # `jitcodes_index.bin`, `descrs_index.bin` and the rest of the build script's
 # cross-process determinism set compared byte-equal across the flag).
 # `--no-typecheck` was tried beside it and made the pass slower.
-CHARON_ARGS = ["--hide-marker-traits"]
+# `--include libc::_` translates the libc items an extracted crate reaches,
+# including const initializers. A foreign NamedConst otherwise stays
+# Opaque, so the named-const harvest has no literal.
+CHARON_ARGS = ["--hide-marker-traits", "--include", "libc::_"]
 
 # `pyre-native` is the stable native/backend boundary.  Charon follows local
 # workspace dependencies by default, so merely moving an implementation into

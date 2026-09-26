@@ -7888,11 +7888,29 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble(&mut flat, &regallocs);
-        assert!(
-            asm.insns.contains_key("setarrayitem_vable_i/riidd"),
-            "constant setarrayitem_vable_i missing, got {:?}",
-            asm.insns.keys().collect::<Vec<_>>()
+        let body = asm.assemble(&mut flat, &regallocs);
+        let key = "setarrayitem_vable_i/riidd";
+        let Some(&opnum) = asm.insns.get(key) else {
+            panic!(
+                "constant setarrayitem_vable_i missing, got {:?}",
+                asm.insns.keys().collect::<Vec<_>>()
+            );
+        };
+        let zero_slot = body
+            .constants_i
+            .iter()
+            .position(|value| *value == 0)
+            .expect("int constant pool must contain 0");
+        let value_byte = body
+            .code
+            .windows(4)
+            .find(|window| window[0] == opnum)
+            .map(|window| window[3])
+            .expect("write instruction missing");
+        let selected = value_byte as usize - body.c_num_regs_i as usize;
+        assert_eq!(
+            selected, zero_slot,
+            "value byte {value_byte} does not select the 0 pool slot {zero_slot}"
         );
     }
 
