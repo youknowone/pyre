@@ -375,7 +375,7 @@ pub mod deque_iter {
         }
         let deque = positional[0];
         if W_Deque::from_obj(deque).is_none() {
-            let name = unsafe { pyre_object::type_name_of(deque) };
+            let name = crate::error::type_name_of(deque);
             return Err(crate::PyError::type_error(format!(
                 "must be collections.deque, not {name}"
             )));
@@ -527,7 +527,7 @@ pub mod deque_rev_iter {
             }
             let deque = positional[0];
             if W_Deque::from_obj(deque).is_none() {
-                let name = unsafe { pyre_object::type_name_of(deque) };
+                let name = crate::error::type_name_of(deque);
                 return Err(crate::PyError::type_error(format!(
                     "must be collections.deque, not {name}"
                 )));
@@ -1480,7 +1480,7 @@ impl W_Deque {
         if W_Deque::from_obj(other).is_none() {
             return Err(crate::PyError::type_error(format!(
                 "can only concatenate deque (not \"{}\") to deque",
-                unsafe { pyre_object::type_name_of(other) },
+                crate::error::type_name_of(other),
             )));
         }
 

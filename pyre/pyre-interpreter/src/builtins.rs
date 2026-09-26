@@ -11885,7 +11885,7 @@ pub fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     if let Some(w) = w_encoding
         && !unsafe { is_str(w) }
     {
-        let tn = unsafe { pyre_object::type_name_of(w) };
+        let tn = crate::error::type_name_of(w);
         return Err(crate::PyError::type_error(format!(
             "str() argument 'encoding' must be str, not {tn}"
         )));
@@ -11893,7 +11893,7 @@ pub fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     if let Some(w) = w_errors
         && !unsafe { is_str(w) }
     {
-        let tn = unsafe { pyre_object::type_name_of(w) };
+        let tn = crate::error::type_name_of(w);
         return Err(crate::PyError::type_error(format!(
             "str() argument 'errors' must be str, not {tn}"
         )));
@@ -11905,7 +11905,7 @@ pub fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             return Err(crate::PyError::type_error("decoding str is not supported"));
         }
         let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? else {
-            let tn = unsafe { pyre_object::type_name_of(obj) };
+            let tn = crate::error::type_name_of(obj);
             return Err(crate::PyError::type_error(format!(
                 "decoding to str: need a bytes-like object, {tn} found"
             )));
@@ -12708,10 +12708,13 @@ pub fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                     return Ok(floatobject::w_float_new(w_float_get_value(result)));
                 }
             }
-            // descroperation.py:891 — __float__ returned non-float (type '%T')
-            let result_type = unsafe { pyre_object::type_name_of(result) };
+            // `_PyNumber_Float` names the receiver's class as well, and neither
+            // name is quoted; the deprecation above already reads that way.
+            // `descroperation.py float_w` names only the result, in quotes.
+            let value_type = crate::type_methods::arg_type_name(obj);
+            let result_type = crate::type_methods::arg_type_name(result);
             return Err(crate::PyError::type_error(format!(
-                "__float__ returned non-float (type '{result_type}')",
+                "{value_type}.__float__ returned non-float (type {result_type})",
             )));
         }
         if let Some((_, method)) =
@@ -12787,7 +12790,7 @@ pub fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// unified 3.12+ message).
 fn checkattrname(w_name: PyObjectRef) -> Result<(), crate::PyError> {
     if !unsafe { crate::baseobjspace::isinstance_str_w(w_name) } {
-        let name_type = unsafe { pyre_object::type_name_of(w_name) };
+        let name_type = crate::error::type_name_of(w_name);
         return Err(crate::PyError::type_error(format!(
             "attribute name must be string, not '{name_type}'",
         )));
@@ -21245,7 +21248,7 @@ pub unsafe fn fileio_writebuf(
         // PyPy `ObjSpace.acquire_writebuf` reports the rejected exporter's
         // type.  CPython 3.14's readinto gateways keep the same information
         // but prefix it with the argument name owned by the builtin method.
-        let type_name = unsafe { pyre_object::type_name_of(obj) };
+        let type_name = crate::error::type_name_of(obj);
         crate::PyError::type_error(format!(
             "readinto() argument must be read-write bytes-like object, not {type_name}"
         ))

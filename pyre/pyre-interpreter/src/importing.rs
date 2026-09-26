@@ -7048,7 +7048,7 @@ pub(crate) fn handle_fromlist(
                 message.push_str("``from list''");
             }
             message.push_str(" must be str, not ");
-            message.push_str(unsafe { pyre_object::type_name_of(shadow_stack_get(x_slot)) });
+            message.push_str(&crate::error::type_name_of(shadow_stack_get(x_slot)));
             return Err(crate::PyError::type_error(message));
         }
 

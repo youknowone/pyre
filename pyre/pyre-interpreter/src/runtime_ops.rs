@@ -1435,7 +1435,7 @@ pub fn sequence_len(seq: PyObjectRef) -> Result<usize, PyError> {
         }
         Err(PyError::type_error(format!(
             "cannot unpack non-sequence {}",
-            pyre_object::type_name_of(seq)
+            crate::error::type_name_of(seq)
         )))
     }
 }
@@ -1475,7 +1475,7 @@ pub fn sequence_getitem(seq: PyObjectRef, index: usize) -> Result<PyObjectRef, P
         }
         Err(PyError::type_error(format!(
             "cannot unpack non-sequence {}",
-            pyre_object::type_name_of(seq)
+            crate::error::type_name_of(seq)
         )))
     }
 }

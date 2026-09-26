@@ -437,7 +437,7 @@ fn arg_readbuf(
         return Ok(pyre_interpreter::baseobjspace::str_utf8_w(arg)?.as_bytes());
     }
     unsafe { pyre_interpreter::builtins::acquire_readbuf(arg) }.map_err(|_| {
-        let type_name = unsafe { pyre_object::type_name_of(arg) };
+        let type_name = pyre_interpreter::error::type_name_of(arg);
         pyre_interpreter::PyError::type_error(format!(
             "{callable}() argument 3 must be an integer, a bytes-like object, \
              or a string, not {type_name}"

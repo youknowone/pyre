@@ -2882,13 +2882,7 @@ fn get_thread_name(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn set_thread_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if unsafe { !pyre_object::is_str(args[0]) } {
-        // `_PyArg_BadArgument` renders the None singleton as `None`, rather
-        // than its class name `NoneType`.
-        let type_name = if unsafe { pyre_object::is_none(args[0]) } {
-            "None"
-        } else {
-            unsafe { pyre_object::type_name_of(args[0]) }
-        };
+        let type_name = crate::type_methods::clinic_arg_type_name(args[0]);
         return Err(crate::PyError::type_error(format!(
             "set_name() argument 'name' must be str, not {type_name}"
         )));

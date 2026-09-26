@@ -8323,7 +8323,7 @@ fn init_dict_type(ns: PyObjectRef) {
                         // Unbound `dict.__repr__(x)` on a non-dict receiver —
                         // reject it like a builtin descriptor rather than
                         // formatting an empty `{}`.
-                        let tp_name = unsafe { pyre_object::type_name_of(recv) };
+                        let tp_name = crate::error::type_name_of(recv);
                         return Err(crate::PyError::type_error(format!(
                             "descriptor '__repr__' for 'dict' objects \
                          doesn't apply to a '{tp_name}' object"
@@ -10082,7 +10082,7 @@ pub(crate) fn mappingproxy_from_mapping(
         .unwrap_or(false);
     let is_seq = unsafe { pyre_object::is_list(w_mapping) || pyre_object::is_tuple(w_mapping) };
     if !has_getitem || is_seq {
-        let tp = unsafe { pyre_object::type_name_of(w_mapping) };
+        let tp = crate::error::type_name_of(w_mapping);
         return Err(crate::PyError::type_error(format!(
             "mappingproxy() argument must be a mapping, not {tp}"
         )));
@@ -13929,7 +13929,7 @@ fn init_type_type(ns: PyObjectRef) {
                 return Err(crate::PyError::type_error(format!(
                     "can only assign string to {}.__qualname__, not '{}'",
                     unsafe { pyre_object::w_type_get_name(w_type) },
-                    unsafe { pyre_object::type_name_of(value) }
+                    crate::error::type_name_of(value)
                 )));
             }
             unsafe {
@@ -14155,7 +14155,7 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if w_value.is_null() || !pyre_object::is_tuple(w_value) {
             return Err(crate::PyError::type_error(format!(
                 "can only assign tuple to {type_name}.__bases__, not {}",
-                pyre_object::type_name_of(w_value)
+                crate::error::type_name_of(w_value)
             )));
         }
         let n = pyre_object::w_tuple_len(w_value);
@@ -14182,7 +14182,7 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             if !pyre_object::is_type(w_base) {
                 return Err(crate::PyError::type_error(format!(
                     "{type_name}.__bases__ must be tuple of classes, not '{}'",
-                    pyre_object::type_name_of(w_base)
+                    crate::error::type_name_of(w_base)
                 )));
             }
         }
@@ -20314,7 +20314,7 @@ fn init_int_type(ns: PyObjectRef) {
                     Some(o) => {
                         return Err(crate::PyError::type_error(format!(
                             "expected str, got {} object",
-                            unsafe { pyre_object::type_name_of(o) }
+                            crate::error::type_name_of(o)
                         )));
                     }
                 };
@@ -22793,13 +22793,7 @@ fn bytes_codec_arg_w(
     if let Some(w_value) = value
         && !unsafe { pyre_object::is_str(w_value) }
     {
-        // `_PyArg_BadArgument` renders the None singleton as `None`,
-        // rather than its class name `NoneType`.
-        let type_name = if unsafe { pyre_object::is_none(w_value) } {
-            "None"
-        } else {
-            unsafe { pyre_object::type_name_of(w_value) }
-        };
+        let type_name = crate::type_methods::clinic_arg_type_name(w_value);
         return Err(crate::PyError::type_error(format!(
             "{constructor}() argument '{argument}' must be str, not {type_name}"
         )));
@@ -24436,7 +24430,7 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     if kwargs.is_some() {
         return Err(crate::PyError::type_error(format!(
             "{}.replace() takes no keyword arguments",
-            unsafe { pyre_object::type_name_of(pos[0]) }
+            crate::error::type_name_of(pos[0])
         )));
     }
     crate::type_methods::arity_at_least(pos, "replace", 2)?;
@@ -25013,7 +25007,7 @@ fn bytes_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "{}.removeprefix() takes exactly one argument ({} given)",
-            unsafe { pyre_object::type_name_of(pos[0]) },
+            crate::error::type_name_of(pos[0]),
             pos.len().saturating_sub(1)
         )));
     }
@@ -25042,7 +25036,7 @@ fn bytes_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "{}.removesuffix() takes exactly one argument ({} given)",
-            unsafe { pyre_object::type_name_of(pos[0]) },
+            crate::error::type_name_of(pos[0]),
             pos.len().saturating_sub(1)
         )));
     }
@@ -25353,7 +25347,7 @@ fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
     let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(a)? else {
         return Err(crate::PyError::type_error(format!(
             "fromhex() argument must be str or bytes-like, not {}",
-            unsafe { pyre_object::type_name_of(a) }
+            crate::error::type_name_of(a)
         )));
     };
     let result = parse_hex_bytes(buffer.as_bytes());
@@ -25464,7 +25458,7 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             }
         }
         Some(b) => {
-            let tname = unsafe { pyre_object::type_name_of(b) };
+            let tname = crate::error::type_name_of(b);
             return Err(crate::PyError::type_error(format!(
                 "from_bytes() argument 'byteorder' must be str, not {tname}"
             )));
@@ -25483,7 +25477,7 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if !unsafe { pyre_object::bytesobject::is_bytes(w_bytes) } {
             return Err(crate::PyError::type_error(format!(
                 "__bytes__ returned non-bytes (type '{}')",
-                unsafe { pyre_object::type_name_of(w_bytes) }
+                crate::error::type_name_of(w_bytes)
             )));
         }
         unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes).to_vec() }
@@ -33957,7 +33951,7 @@ fn descr_get_dict(
     let w_obj = args[1];
     let w_dict = crate::baseobjspace::getdict(w_obj)?;
     if w_dict.is_null() {
-        let tp_name = unsafe { pyre_object::type_name_of(w_obj) };
+        let tp_name = crate::error::type_name_of(w_obj);
         return Err(crate::PyError::type_error(format!(
             "descriptor '__dict__' doesn't apply to '{}' objects",
             tp_name,
