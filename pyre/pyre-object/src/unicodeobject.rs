@@ -927,15 +927,6 @@ pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
     obj
 }
 
-/// There is no panicking `&str` view of a `W_UnicodeObject`.
-///
-/// `W_UnicodeObject.text_w` returns `self._utf8` verbatim, surrogates
-/// included, so a caller that only forwards the buffer uses
-/// [`w_str_get_wtf8`]. A caller that needs valid UTF-8 uses
-/// [`w_str_get_value_opt`] and reports `UnicodeEncodeError`
-/// ("surrogates not allowed"), the strict utf-8 encoder's reason
-/// (`unicodehelper.py`).
-
 /// The `&str` view of a WTF-8 buffer already known to hold no lone
 /// surrogate.
 ///
@@ -991,9 +982,9 @@ pub unsafe fn w_str_is_utf8(obj: PyObjectRef) -> bool {
 
 /// Borrow the WTF-8 view of a known W_UnicodeObject, surrogate-aware.
 ///
-/// Unlike [`w_str_get_value`], this never panics on lone surrogates.
-/// Callers that must handle surrogate-bearing strings (codec encode,
-/// repr) read code points through this accessor.
+/// `W_UnicodeObject.text_w` returns `self._utf8` verbatim, surrogates
+/// included. Callers that must handle surrogate-bearing strings (codec
+/// encode, repr) read code points through this accessor.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_UnicodeObject`.
@@ -1135,7 +1126,9 @@ pub unsafe fn w_str_hash_memoized(obj: PyObjectRef) -> i64 {
 ///
 /// String-keyed fast paths that store keys in a `&str`-keyed map use this
 /// to skip surrogate keys and fall through to the generic object-keyed
-/// path instead of panicking in [`w_str_get_value`].
+/// path. Callers that need valid UTF-8 report `UnicodeEncodeError`
+/// ("surrogates not allowed"), the strict utf-8 encoder's reason
+/// (`unicodehelper.py`).
 ///
 /// # Safety
 /// `obj` must point to a valid `W_UnicodeObject`.

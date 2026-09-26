@@ -4473,10 +4473,10 @@ fn push_literal(parts: &mut Vec<JoinedPart>, (start, end): (u32, u32), value: &W
 /// `ast::ConstantValue::Str` and every identifier field are `str`, so a lone
 /// surrogate has nowhere to go on the way back into the compiler.  It gets
 /// there through an ordinary `ast.parse` round trip, since the tree the parse
-/// answers does carry one, and [`w_str_get_value`] would take the process
-/// down over it.
+/// answers does carry one; [`w_str_get_value_opt`] returns `None` and this
+/// path raises `UnicodeEncodeError`.
 ///
-/// [`w_str_get_value`]: pyre_object::w_str_get_value
+/// [`w_str_get_value_opt`]: pyre_object::w_str_get_value_opt
 fn utf8_only(value: PyObjectRef) -> AstResult<&'static str> {
     if let Some(text) = unsafe { pyre_object::w_str_get_value_opt(value) } {
         return Ok(text);
