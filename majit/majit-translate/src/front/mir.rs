@@ -1261,9 +1261,13 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // Aggregate `"ref"` results stay unstamped — the call-signature
         // validator skips a missing declaration, and a struct name is not
         // a register class.
+        // A declaration of the `BuiltinCodeFn` pointer type is a member of
+        // that indirect-call family, so it stamps the pointer type's RESULT
+        // for the same reason a trait-method member does.
         let stamp_return_token = dont_look_inside.contains(&fn_path)
             || elidable_residual.contains(&fn_path)
-            || trait_root.is_some();
+            || trait_root.is_some()
+            || fun_decl_is_builtin_code_fn(fd, llbc);
         let signature_token = if gcref_result {
             Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
         } else {
@@ -23819,6 +23823,27 @@ fn fn_ptr_signature_is_builtin_code_fn(
         .get("output")
         .map(|value| charon_type_value_to_ast_string(value, llbc, 0))
         .unwrap_or_default();
+    builtin_code_fn_shape(&input, &output)
+}
+
+/// Whether a function declaration has the `gateway::BuiltinCodeFn` type
+/// itself — a safe `fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>`.
+/// Every graph an indirect call through that pointer type can reach is such
+/// a declaration, so its `FUNC.RESULT` is the pointer type's `RESULT`.
+fn fun_decl_is_builtin_code_fn(fd: &FunDecl, llbc: &Llbc) -> bool {
+    let [input] = fd.signature.inputs.as_slice() else {
+        return false;
+    };
+    !fd.signature.is_unsafe
+        && builtin_code_fn_shape(
+            &tyref_to_ast_string(input, llbc),
+            &tyref_to_ast_string(&fd.signature.output, llbc),
+        )
+}
+
+/// The `BuiltinCodeFn` shape test on rendered input / output type strings,
+/// shared by the fn-pointer operand and the function-declaration sides.
+fn builtin_code_fn_shape(input: &str, output: &str) -> bool {
     input.starts_with('[')
         && input.contains("PyObject")
         && output.starts_with("Result<")
@@ -40569,6 +40594,27 @@ mod tests {
         }
         assert!(reads >= 1);
         assert!(writes >= 1);
+    }
+
+    #[test]
+    #[ignore]
+    fn builtin_wrapper_declaration_has_builtin_code_fn_type() {
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let wrapper = llbc
+            .iter_local_fns()
+            .find(|fd| fd.item_meta.name_path().ends_with("::__majit_wrap_random"))
+            .expect("_random::__majit_wrap_random");
+        assert!(super::fun_decl_is_builtin_code_fn(wrapper, &llbc));
+        let non_member = llbc
+            .iter_local_fns()
+            .find(|fd| {
+                fd.item_meta
+                    .name_path()
+                    .ends_with("::function::funccall_valuestack")
+            })
+            .expect("function::funccall_valuestack");
+        assert!(!super::fun_decl_is_builtin_code_fn(non_member, &llbc));
     }
 
     #[test]
