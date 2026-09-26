@@ -1533,10 +1533,6 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
     "bridges_compiled",
     "retraces_compiled",
     "guard_failures",
-    # Wasm deliberately withdraws an attached bridge to replace its module.
-    # These deterministic maintenance exits must stay visible and gated, but
-    # must not tick speculative-guard hotness or masquerade as guard failures.
-    "wasm_inline_merge_exits",
     "fbw_blackhole_adopted_single_frame",
     "fbw_blackhole_adopted_multi_frame",
 )
@@ -1608,7 +1604,6 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
 # image and went back to replay.
 JITSTATS_REGRESSION_ON_RISE = JITSTATS_BADNESS_FIELDS + (
     "guard_failures",
-    "wasm_inline_merge_exits",
 )
 JITSTATS_REGRESSION_ON_FALL = (
     "loops_compiled",
@@ -3301,8 +3296,8 @@ def _jitstats_texts_match(a, b):
     """True when two baselines are the same snapshot under the gate.
 
     `_jit_stats_change` reads a field missing from either side as 0, so a
-    backend that prints `wasm_inline_merge_exits=0` and one that omits the
-    key record one baseline. Merging keeps a single file for that case.
+    printed zero and an omitted key record one baseline. Merging keeps a
+    single file for that case.
     """
     left, right = _parse_jit_stats(a), _parse_jit_stats(b)
     keys = set(left) | set(right)

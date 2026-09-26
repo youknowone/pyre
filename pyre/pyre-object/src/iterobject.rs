@@ -10,7 +10,8 @@ use pyre_macros::pyre_class;
 #[pyre_class("sequenceiterator", type_id = 23, static_name = "SEQ_ITER")]
 pub struct W_SeqIterObject {
     pub seq: PyObjectRef,
-    pub index: i64,
+    /// `W_AbstractSeqIterObject.index`: an RPython `Signed` (machine word).
+    pub index: isize,
     pub length: i64,
     /// Python 3.14 has producer-specific iterator types whose exhausted
     /// reduce form retains the producer's empty shape.  Pyre shares this
@@ -35,7 +36,8 @@ pub const SEQ_ITER_EMPTY_KIND_OFFSET: usize = std::mem::offset_of!(W_SeqIterObje
 #[pyre_class("list_iterator", static_name = "LIST_ITER")]
 pub struct W_ListIterObject {
     pub seq: PyObjectRef,
-    pub index: i64,
+    /// `W_AbstractSeqIterObject.index`: an RPython `Signed` (machine word).
+    pub index: isize,
 }
 
 /// `iterobject.py W_ReverseSeqIterObject`, specialized to the list producer
@@ -43,7 +45,8 @@ pub struct W_ListIterObject {
 #[pyre_class("list_reverseiterator", static_name = "LIST_REVERSE_ITER")]
 pub struct W_ListReverseIterObject {
     pub seq: PyObjectRef,
-    pub index: i64,
+    /// `W_ReverseSeqIterObject.index`: an RPython `Signed` (machine word).
+    pub index: isize,
 }
 
 /// PyPy's abstract sequence iterator specialized to immutable tuple storage;
@@ -51,7 +54,8 @@ pub struct W_ListReverseIterObject {
 #[pyre_class("tuple_iterator", static_name = "TUPLE_ITER")]
 pub struct W_TupleIterObject {
     pub seq: PyObjectRef,
-    pub index: i64,
+    /// `W_AbstractSeqIterObject.index`: an RPython `Signed` (machine word).
+    pub index: isize,
 }
 
 // Python 3.14 gives str / bytes / bytearray / memoryview iteration its own
@@ -93,6 +97,19 @@ fn seq_iter_type_for(seq: PyObjectRef) -> &'static PyType {
     }
 }
 
+/// `space.int_w` into a cursor: `Signed` is a machine word, so a Python int
+/// wider than `isize` does not fit.
+#[inline]
+pub fn seq_index_from_i64(value: i64) -> Option<isize> {
+    isize::try_from(value).ok()
+}
+
+/// Box a cursor into the `i64` Python-int payload. `isize` always fits.
+#[inline]
+pub fn seq_index_to_i64(value: isize) -> i64 {
+    value as i64
+}
+
 pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
@@ -124,7 +141,7 @@ pub fn w_list_iter_new(seq: PyObjectRef) -> PyObjectRef {
     })
 }
 
-pub fn w_list_reverse_iter_new(seq: PyObjectRef, index: i64) -> PyObjectRef {
+pub fn w_list_reverse_iter_new(seq: PyObjectRef, index: isize) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let seq = crate::gc_roots::pin_root(seq);
     W_ListReverseIterObject::allocate_stable(W_ListReverseIterObject {
@@ -263,7 +280,7 @@ pub unsafe fn w_list_iter_seq(obj: PyObjectRef) -> PyObjectRef {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_list_iter_index(obj: PyObjectRef) -> i64 {
+pub unsafe fn w_list_iter_index(obj: PyObjectRef) -> isize {
     (*(obj as *const W_ListIterObject)).index
 }
 
@@ -280,7 +297,7 @@ pub unsafe fn w_list_iter_set_seq(obj: PyObjectRef, seq: PyObjectRef) {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_list_iter_set_index(obj: PyObjectRef, index: i64) {
+pub unsafe fn w_list_iter_set_index(obj: PyObjectRef, index: isize) {
     (*(obj as *mut W_ListIterObject)).index = index;
 }
 
@@ -296,7 +313,7 @@ pub unsafe fn w_list_reverse_iter_seq(obj: PyObjectRef) -> PyObjectRef {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_list_reverse_iter_index(obj: PyObjectRef) -> i64 {
+pub unsafe fn w_list_reverse_iter_index(obj: PyObjectRef) -> isize {
     (*(obj as *const W_ListReverseIterObject)).index
 }
 
@@ -313,7 +330,7 @@ pub unsafe fn w_list_reverse_iter_set_seq(obj: PyObjectRef, seq: PyObjectRef) {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_list_reverse_iter_set_index(obj: PyObjectRef, index: i64) {
+pub unsafe fn w_list_reverse_iter_set_index(obj: PyObjectRef, index: isize) {
     (*(obj as *mut W_ListReverseIterObject)).index = index;
 }
 
@@ -329,7 +346,7 @@ pub unsafe fn w_tuple_iter_seq(obj: PyObjectRef) -> PyObjectRef {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_tuple_iter_index(obj: PyObjectRef) -> i64 {
+pub unsafe fn w_tuple_iter_index(obj: PyObjectRef) -> isize {
     (*(obj as *const W_TupleIterObject)).index
 }
 
@@ -346,7 +363,7 @@ pub unsafe fn w_tuple_iter_set_seq(obj: PyObjectRef, seq: PyObjectRef) {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_tuple_iter_set_index(obj: PyObjectRef, index: i64) {
+pub unsafe fn w_tuple_iter_set_index(obj: PyObjectRef, index: isize) {
     (*(obj as *mut W_TupleIterObject)).index = index;
 }
 
@@ -364,7 +381,7 @@ pub unsafe fn w_seq_iter_seq(obj: PyObjectRef) -> PyObjectRef {
 /// # Safety
 /// `obj` must point to a valid `W_SeqIterObject`.
 #[inline]
-pub unsafe fn w_seq_iter_index(obj: PyObjectRef) -> i64 {
+pub unsafe fn w_seq_iter_index(obj: PyObjectRef) -> isize {
     unsafe { (*(obj as *const W_SeqIterObject)).index }
 }
 
@@ -391,7 +408,7 @@ pub unsafe fn w_seq_iter_empty_kind(obj: PyObjectRef) -> u8 {
 /// # Safety
 /// `obj` must point to a valid `W_SeqIterObject`.
 #[inline]
-pub unsafe fn w_seq_iter_set_index(obj: PyObjectRef, value: i64) {
+pub unsafe fn w_seq_iter_set_index(obj: PyObjectRef, value: isize) {
     unsafe {
         (*(obj as *mut W_SeqIterObject)).index = value;
     }

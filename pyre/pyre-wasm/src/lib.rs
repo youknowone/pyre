@@ -774,16 +774,6 @@ pub extern "C" fn pyre_jit_back_edge_polls() -> u64 {
     pyre_jit::eval::driver_pair().0.get_stats().back_edge_polls as u64
 }
 
-/// Explicit deferred-module maintenance, separately gated from guard failures.
-#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn pyre_jit_wasm_inline_merge_exits() -> u64 {
-    pyre_jit::eval::driver_pair()
-        .0
-        .get_stats()
-        .wasm_inline_merge_exits as u64
-}
-
 /// The descr-universe invariants, the remaining `JITSTATS_BADNESS_FIELDS`. The
 /// native backends print these from `descr_set_jit_stats`; the guest has no
 /// stderr, so it exports the counts and the runner prints the line. Without
@@ -1183,29 +1173,43 @@ fn run_python_impl(source: &str) -> String {
         }
     };
 
+    // `app_main.py` `run_toplevel` prints an uncaught exception before
+    // `space.finish`. `SystemExit` only sets the status: resolving `e.code`
+    // walks the exception type, which `finalize_runtime` then collects.
+    let eval_result = match eval_result {
+        Ok(result) => Ok(result),
+        Err(e) if e.kind == pyre_interpreter::PyErrorKind::SystemExit => {
+            EXIT_CODE.with(|c| c.set(pyre_interpreter::system_exit_code(&e)));
+            Err(e)
+        }
+        Err(mut e) => {
+            if !pyre_interpreter::error::print_exception_via_excepthook(&mut e) {
+                pyre_interpreter::eprint_exception(&e, true);
+            }
+            EXIT_CODE.with(|c| c.set(1));
+            Err(e)
+        }
+    };
+    // `baseobjspace.py` `finish`: threading shutdown, atexit, then stream
+    // flush and module teardown. Same function the native launcher runs.
+    // Only the one-shot `wasm-host` guest exits here; the `web` build keeps
+    // one interpreter alive across `run_python` calls.
+    #[cfg(feature = "wasm-host")]
+    pyre_interpreter::shutdown::finalize_runtime(
+        canonical,
+        pyre_interpreter::call::getexecutioncontext(),
+    );
+
     let mut output = OUTPUT_BUF.with(|buf| buf.borrow().clone());
 
-    match eval_result {
-        Ok(result) => {
-            if !result.is_null() && !unsafe { pyre_object::is_none(result) } {
-                if !output.is_empty() && !output.ends_with('\n') {
-                    output.push('\n');
-                }
-                output.push_str(&format!("{}", PyDisplay(result)));
-            }
+    if let Ok(result) = eval_result
+        && !result.is_null()
+        && !unsafe { pyre_object::is_none(result) }
+    {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
         }
-        Err(e) => {
-            // `pyrex::real_main`: a `SystemExit` sets the status and prints
-            // nothing; anything else prints its traceback and exits 1.  Both
-            // go to stderr, so the run's stdout stays byte-comparable with the
-            // native binaries instead of gaining an `Error: …` tail.
-            if e.kind == pyre_interpreter::PyErrorKind::SystemExit {
-                EXIT_CODE.with(|c| c.set(pyre_interpreter::system_exit_code(&e)));
-            } else {
-                pyre_interpreter::eprint_exception(&e, true);
-                EXIT_CODE.with(|c| c.set(1));
-            }
-        }
+        output.push_str(&format!("{}", PyDisplay(result)));
     }
 
     output

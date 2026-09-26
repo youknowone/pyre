@@ -570,6 +570,9 @@ struct OpenFile {
     data: Vec<u8>,
     pos: u64,
     is_dir: bool,
+    /// One of the standard streams 0, 1 and 2. Writes to 1 and 2 reach the
+    /// embedder's output and error capture; 0 reads back empty.
+    stdio: bool,
 }
 
 /// The standard streams hold 0, 1 and 2, so a descriptor this table hands out
@@ -581,7 +584,20 @@ const MAX_OPEN_FILES: i32 = 4096;
 
 static OPEN_FILES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::BTreeMap<i32, OpenFile>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+> = std::sync::LazyLock::new(|| {
+    let table = (0..FIRST_FD)
+        .map(|fd| {
+            let file = OpenFile {
+                data: Vec::new(),
+                pos: 0,
+                is_dir: false,
+                stdio: true,
+            };
+            (fd, file)
+        })
+        .collect();
+    std::sync::Mutex::new(table)
+});
 
 /// Take the lowest free number, which is the number `open` is required to
 /// return.
@@ -697,16 +713,42 @@ pub(crate) fn fd_close(fd: i32) -> Result<(), crate::PyError> {
     Ok(())
 }
 
-/// The answer a write to an open descriptor gets: the seam has no writing
-/// half, so the mount is read-only rather than the descriptor unusable.
-pub(crate) fn fd_refuse_write(fd: i32) -> crate::PyError {
-    match with_raw_fd(fd, |_| Ok(())) {
-        Ok(()) => crate::PyError::os_error_syscall(
-            crate::builtins::wasm_errno::EROFS,
-            pyre_object::w_none(),
-        ),
-        Err(e) => e,
-    }
+/// Write `data` to `fd`, the layer `os.write` and `FileIO.write` share.
+///
+/// 1 and 2 are the embedder's output and error buffers, which is where
+/// `print` writes too, so the two stay in order. With no embedder listening
+/// the bytes take the host descriptor itself, raw: this is not the layer that
+/// rewrites newlines. 0 is not open for writing, and every other open
+/// descriptor is the read-only mount: the seam has no writing half.
+pub(crate) fn fd_write(fd: i32, data: &[u8]) -> Result<i64, crate::PyError> {
+    let stdio = with_raw_fd(fd, |file| Ok(file.stdio))?;
+    let errno = match (stdio, fd) {
+        (true, 1 | 2) => {
+            let delivered = if fd == 1 {
+                crate::print_hook_emit_bytes(data)
+            } else {
+                crate::stderr_hook_emit(data)
+            };
+            if delivered {
+                return Ok(data.len() as i64);
+            }
+            use std::io::Write;
+            let written = if fd == 1 {
+                std::io::stdout().write_all(data)
+            } else {
+                std::io::stderr().write_all(data)
+            };
+            match written {
+                Ok(()) => return Ok(data.len() as i64),
+                Err(error) => error
+                    .raw_os_error()
+                    .unwrap_or(crate::builtins::wasm_errno::EIO),
+            }
+        }
+        // Every other descriptor in the table was opened read-only.
+        _ => crate::builtins::wasm_errno::EBADF,
+    };
+    Err(crate::PyError::os_error_syscall(errno, pyre_object::w_none()))
 }
 
 /// The path argument of a one-path entry point, with `dir_fd` refused the way
@@ -799,6 +841,7 @@ fn open_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         data,
         pos: 0,
         is_dir,
+        stdio: false,
     })?;
     Ok(pyre_object::w_int_new(fd as i64))
 }
@@ -1405,11 +1448,8 @@ fn access(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::w_bool_from(granted))
 }
 
-/// `posix.write(fd, data)` — the two descriptors this guest has a sink for.
-///
-/// 1 and 2 are the embedder's output and error buffers, which is where
-/// `sys.stdout` and `sys.stderr` already write; anything else names either a
-/// read-only descriptor from the table or nothing at all.
+/// `posix.write(fd, data)`; see [`fd_write`] for what each descriptor does
+/// with the bytes.
 fn write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     crate::builtins::kwarg_reject_unknown(kwargs, &[], "write")?;
@@ -1428,39 +1468,8 @@ fn write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
         pyre_object::bytesobject::bytes_like_data(pos[1])
     };
-    let delivered = match fd {
-        1 => crate::print_hook_emit_bytes(data),
-        2 => crate::stderr_hook_emit(data),
-        // Every other number is one nothing can be written through: a
-        // descriptor the table knows was opened for reading, and one it does
-        // not know is no descriptor at all.
-        _ => {
-            return Err(crate::PyError::os_error_syscall(
-                crate::builtins::wasm_errno::EBADF,
-                pyre_object::w_none(),
-            ));
-        }
-    };
-    if !delivered {
-        // No embedder is listening, so the bytes take the descriptor itself,
-        // which is where `emit_stdout` sends them under the same condition.
-        // They go raw: `os.write` is not the layer that rewrites newlines.
-        use std::io::Write;
-        let written = if fd == 1 {
-            std::io::stdout().write_all(data)
-        } else {
-            std::io::stderr().write_all(data)
-        };
-        written.map_err(|error| {
-            crate::PyError::os_error_syscall(
-                error
-                    .raw_os_error()
-                    .unwrap_or(crate::builtins::wasm_errno::EIO),
-                pyre_object::w_none(),
-            )
-        })?;
-    }
-    Ok(pyre_object::w_int_new(data.len() as i64))
+    let n = fd_write(fd, data)?;
+    Ok(pyre_object::w_int_new(n))
 }
 
 /// `posix.fsync(fd)` / `posix.fdatasync(fd)` — nothing to flush, but the
@@ -1473,9 +1482,6 @@ fn sync_fd(args: &[PyObjectRef], name: &'static str) -> Result<PyObjectRef, crat
         )));
     };
     let fd = crate::baseobjspace::c_int_w(w_fd)?;
-    if fd == 1 || fd == 2 {
-        return Ok(pyre_object::w_none());
-    }
     with_raw_fd(fd, |_| Ok(()))?;
     Ok(pyre_object::w_none())
 }

@@ -3293,7 +3293,7 @@ pub(crate) fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         iterator_reduce_tuple(
             pyre_object::gc_roots::shadow_stack_get(sp + 1),
             pyre_object::w_seq_iter_seq(receiver),
-            pyre_object::w_seq_iter_index(receiver),
+            pyre_object::seq_index_to_i64(pyre_object::w_seq_iter_index(receiver)),
             pyre_object::w_seq_iter_empty_kind(receiver),
         )
     }
@@ -3342,6 +3342,13 @@ pub(crate) fn callable_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         pyre_object::gc_roots::shadow_stack_get(sp + 1),
         pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1),
     ]))
+}
+
+/// Narrows a `__setstate__` cursor to the `Signed` iterator index; a value
+/// wider than a machine word raises `OverflowError`.
+fn cursor_from_i64(index: i64) -> Result<isize, PyError> {
+    pyre_object::iterobject::seq_index_from_i64(index)
+        .ok_or_else(|| PyError::overflow_error("Python int too large to convert to C ssize_t"))
 }
 
 /// The cursor argument shared by every builtin iterator's `__setstate__`.
@@ -3416,7 +3423,7 @@ pub(crate) fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
         } else if let Some(length) = seq_iter_clamp_length(seq) {
             index = index.min(length);
         }
-        pyre_object::w_seq_iter_set_index(args[0], index);
+        pyre_object::w_seq_iter_set_index(args[0], cursor_from_i64(index)?);
     }
     Ok(w_none())
 }
@@ -3445,7 +3452,8 @@ pub(crate) fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
             return Ok(pyre_object::special::w_not_implemented());
         }
         let length = len_w(seq)?;
-        let remaining = length - pyre_object::w_seq_iter_index(args[0]);
+        let remaining =
+            length - pyre_object::seq_index_to_i64(pyre_object::w_seq_iter_index(args[0]));
         Ok(w_int_new(remaining.max(0)))
     }
 }
@@ -3463,7 +3471,7 @@ pub(crate) fn list_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         iterator_reduce_tuple(
             pyre_object::gc_roots::shadow_stack_get(sp + 1),
             pyre_object::w_list_iter_seq(receiver),
-            pyre_object::w_list_iter_index(receiver),
+            pyre_object::seq_index_to_i64(pyre_object::w_list_iter_index(receiver)),
             2,
         )
     }
@@ -3493,7 +3501,7 @@ pub(crate) fn list_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
         } else if index > length {
             index = length;
         }
-        pyre_object::w_list_iter_set_index(args[0], index);
+        pyre_object::w_list_iter_set_index(args[0], cursor_from_i64(index)?);
     }
     Ok(w_none())
 }
@@ -3506,7 +3514,7 @@ pub(crate) fn list_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
             return Ok(w_int_new(0));
         }
         Ok(w_int_new(
-            (pyre_object::w_list_len(seq) as i64 - index).max(0),
+            (pyre_object::w_list_len(seq) as i64 - pyre_object::seq_index_to_i64(index)).max(0),
         ))
     }
 }
@@ -3522,7 +3530,7 @@ pub(crate) fn tuple_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         iterator_reduce_tuple(
             pyre_object::gc_roots::shadow_stack_get(sp + 1),
             pyre_object::w_tuple_iter_seq(receiver),
-            pyre_object::w_tuple_iter_index(receiver),
+            pyre_object::seq_index_to_i64(pyre_object::w_tuple_iter_index(receiver)),
             0,
         )
     }
@@ -3540,7 +3548,7 @@ pub(crate) fn tuple_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
             return Ok(w_none());
         }
         index = index.clamp(0, pyre_object::w_tuple_len(seq) as i64);
-        pyre_object::w_tuple_iter_set_index(args[0], index);
+        pyre_object::w_tuple_iter_set_index(args[0], cursor_from_i64(index)?);
     }
     Ok(w_none())
 }
@@ -3552,8 +3560,9 @@ pub(crate) fn tuple_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
             return Ok(w_int_new(0));
         }
         Ok(w_int_new(
-            (pyre_object::w_tuple_len(seq) as i64 - pyre_object::w_tuple_iter_index(args[0]))
-                .max(0),
+            (pyre_object::w_tuple_len(seq) as i64
+                - pyre_object::seq_index_to_i64(pyre_object::w_tuple_iter_index(args[0])))
+            .max(0),
         ))
     }
 }
@@ -3579,7 +3588,7 @@ pub(crate) fn list_reverse_iter_reduce_method(args: &[PyObjectRef]) -> PyResult 
         iterator_reduce_tuple(
             pyre_object::gc_roots::shadow_stack_get(sp + 1),
             seq,
-            index,
+            pyre_object::seq_index_to_i64(index),
             2,
         )
     }
@@ -3606,7 +3615,7 @@ pub(crate) fn list_reverse_iter_setstate_method(args: &[PyObjectRef]) -> PyResul
             // sentinel, so every negative cursor normalizes to it.
             index = -1;
         }
-        pyre_object::w_list_reverse_iter_set_index(args[0], index);
+        pyre_object::w_list_reverse_iter_set_index(args[0], cursor_from_i64(index)?);
     }
     Ok(w_none())
 }
@@ -3617,7 +3626,8 @@ pub(crate) fn list_reverse_iter_length_hint_method(args: &[PyObjectRef]) -> PyRe
         if seq.is_null() {
             return Ok(w_int_new(0));
         }
-        let length = pyre_object::w_list_reverse_iter_index(args[0]) + 1;
+        let length =
+            pyre_object::seq_index_to_i64(pyre_object::w_list_reverse_iter_index(args[0])) + 1;
         Ok(w_int_new(
             if pyre_object::w_list_len(seq) as i64 >= length {
                 length.max(0)
@@ -3888,7 +3898,7 @@ pub(crate) fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
             let len = pyre_object::w_list_len(raw);
             let it = pyre_object::w_list_iter_new(raw);
             let pos = i64_index.clamp(0, len as i64);
-            pyre_object::w_list_iter_set_index(it, pos);
+            pyre_object::w_list_iter_set_index(it, cursor_from_i64(pos)?);
             it
         } else {
             raw
@@ -17924,7 +17934,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             if index < 0 {
                 return Err(PyError::stop_iteration());
             }
-            if let Some(item) = pyre_object::w_list_getitem(seq, index) {
+            if let Some(item) =
+                pyre_object::w_list_getitem(seq, pyre_object::seq_index_to_i64(index))
+            {
                 pyre_object::w_list_iter_set_index(obj, index + 1);
                 return Ok(item);
             }
@@ -17939,7 +17951,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let index = pyre_object::w_list_reverse_iter_index(obj);
             if !seq.is_null()
                 && index >= 0
-                && let Some(item) = pyre_object::w_list_getitem(seq, index)
+                && let Some(item) =
+                    pyre_object::w_list_getitem(seq, pyre_object::seq_index_to_i64(index))
             {
                 pyre_object::w_list_reverse_iter_set_index(obj, index - 1);
                 return Ok(item);
@@ -17958,7 +17971,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 return Err(PyError::stop_iteration());
             }
             let index = pyre_object::w_tuple_iter_index(obj);
-            if let Some(item) = pyre_object::w_tuple_getitem(seq, index) {
+            if let Some(item) =
+                pyre_object::w_tuple_getitem(seq, pyre_object::seq_index_to_i64(index))
+            {
                 pyre_object::w_tuple_iter_set_index(obj, index + 1);
                 return Ok(item);
             }
@@ -17981,9 +17996,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 return Err(PyError::stop_iteration());
             }
             let item = if is_list(seq) {
-                pyre_object::w_list_getitem(seq, idx)
+                pyre_object::w_list_getitem(seq, pyre_object::seq_index_to_i64(idx))
             } else if is_tuple(seq) {
-                pyre_object::w_tuple_getitem(seq, idx)
+                pyre_object::w_tuple_getitem(seq, pyre_object::seq_index_to_i64(idx))
             } else if pyre_object::is_generic_alias(seq) {
                 if idx == 0 {
                     let _roots = pyre_object::gc_roots::push_roots();
@@ -18015,7 +18030,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 None
             } else if pyre_object::bytesobject::is_bytes_like(seq) {
                 // Each item is the byte's ordinal, read from the live buffer.
-                if (idx as usize) < pyre_object::bytesobject::bytes_like_len(seq) {
+                if idx < pyre_object::bytesobject::bytes_like_len(seq) as isize {
                     let _roots = pyre_object::gc_roots::push_roots();
                     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
                     let _ = pyre_object::gc_roots::pin_root(obj);
@@ -18031,7 +18046,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     None
                 }
             } else if pyre_object::interp_array::is_array(seq) {
-                if (idx as usize) < pyre_object::interp_array::w_array_len(seq) {
+                if idx < pyre_object::interp_array::w_array_len(seq) as isize {
                     // [3.14-spec] `arrayiter_next` at v3.14.6 advances its
                     // cursor as part of the getitem argument, even when an
                     // invalid unicode value makes that getitem raise.
@@ -18059,7 +18074,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, seq]);
                 let seq_slot = obj_slot + 1;
                 let idx_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_int_new(idx));
+                let _ =
+                    pyre_object::gc_roots::pin_root(w_int_new(pyre_object::seq_index_to_i64(idx)));
                 match getitem(
                     pyre_object::gc_roots::shadow_stack_get(seq_slot),
                     pyre_object::gc_roots::shadow_stack_get(idx_slot),

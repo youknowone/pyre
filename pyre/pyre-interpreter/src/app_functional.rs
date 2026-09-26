@@ -192,15 +192,7 @@ pub(crate) fn is_published_sorted(func: PyObjectRef) -> bool {
     cached != 0 && func as usize == cached
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_app_sorted: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_builtin_sorted)
-        ),
-        func: __majit_wrap_builtin_sorted,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_app_sorted,
+    __majit_wrap_builtin_sorted
+);

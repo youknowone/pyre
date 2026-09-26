@@ -4363,27 +4363,6 @@ pub trait FailDescr: Descr {
         false
     }
 
-    /// Whether wasm bridge dispatch is withdrawn for deferred module replacement.
-    /// Compiled execution must return before the retained module is replaced.
-    /// An exit through the withdrawn dispatch resumes in the blackhole without
-    /// heating a guard whose bridge is already attached.
-    ///
-    /// This is separate from ST_BUSY_FLAG: a busy guard still reports a real
-    /// failure during bridge tracing, whereas withdrawal is maintenance. The
-    /// remaining status bits hold the jitcounter hash or value-slot index.
-    ///
-    /// The methods stay on every target so a wasm32 layout pass can compile
-    /// against a host-built `majit-ir`. The AtomicBool field remains
-    /// `cfg(target_arch = "wasm32")` and is absent from native layouts.
-    fn wasm_dispatch_withdrawn(&self) -> bool {
-        false
-    }
-
-    fn set_wasm_dispatch_withdrawn(&self, _withdrawn: bool) {
-        let _ = _withdrawn;
-        panic!("wasm dispatch withdrawal requires a resume guard descriptor");
-    }
-
     /// Mark [`FailDescr::bridge_declined_terminally`].  Default panics because
     /// only resume-guard descriptors participate in bridge compilation.
     fn set_bridge_declined_terminally(&self) {

@@ -967,15 +967,10 @@ pub fn __majit_wrap_cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyEr
     )))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_cdata_call:
-    pyre_interpreter::gateway::BuiltinWrapperDescriptor =
-    pyre_interpreter::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", stringify!(__majit_wrap_cdata_call)),
-        func: __majit_wrap_cdata_call,
-    };
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_cdata_call,
+    __majit_wrap_cdata_call
+);
 
 /// `W_CData.getattr`.
 fn cdata_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {

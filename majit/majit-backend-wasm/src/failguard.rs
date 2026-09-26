@@ -27,6 +27,24 @@ pub struct WasmFailDescr {
     /// Compile-time guard gcmap retained for FINISH after a
     /// GUARD_NOT_FORCED_2, matching `assembler._finish_gcmap`.
     pub force_gcmap_ptr: usize,
+    /// Guest address of this guard's bridge-target cell. The same address
+    /// is stamped on the metainterp descr's `adr_jump_offset` until
+    /// `compile_bridge` patches it and clears that slot. The cell allocation
+    /// stays here so a later re-emit bakes the same address.
+    pub bridge_cell: u32,
+    /// Per-fail-arg induction-advance flags for this guard. A loop-closing
+    /// bridge reads them off the descr the guard already owns.
+    pub fail_arg_advanced: Vec<bool>,
+    /// Ordinary Ref homes of the trace that emitted this guard.
+    pub trace_ref_homes: usize,
+    /// LABEL-capture homes of the trace that emitted this guard.
+    pub trace_label_homes: usize,
+    /// This trace's guard epilogue has typed parameter dispatch arms.
+    pub param_dispatch: bool,
+    /// Table slot last written into `bridge_cell`. Re-emission reads the
+    /// cell itself; this remembers the slot when an inline zeros the cell
+    /// and a failed install has to put it back.
+    pub bridge_slot: std::sync::atomic::AtomicU32,
     /// `history.py:125 id(descr)` parity — when the optimizer
     /// (`store_final_boxes_in_guard` / `make_and_attach_done_descrs`)
     /// stamps a metainterp `ResumeGuardDescr` / `DoneWithThisFrame*` /
@@ -75,115 +93,125 @@ impl FailDescr for WasmFailDescr {
     }
 }
 
+/// Where this deadframe reads the jitframe.
+///
+/// A GC frame is re-read through [`OwnerRootGuard`] so a moving collection
+/// cannot leave a raw pointer at the old copy. A host buffer is not a GC
+/// object and does not move; its address stays in [`LiveFrame::Fixed`] and
+/// [`WasmFrameData::host_frame`] owns the bytes.
+enum LiveFrame {
+    Rooted(majit_gc::shadow_stack::OwnerRootGuard),
+    Fixed(*mut majit_backend::jitframe::JitFrame),
+}
+
 /// Wasm-backend dead frame data.
 ///
-/// Stored inside `DeadFrame::Boxed` after `execute_token` returns.
+/// Stored inside `DeadFrame::Boxed` after `execute_token` returns. The
+/// deadframe is the jitframe (`llmodel.py` `return ll_frame`): accessors
+/// read `jf_frame` in place. `DeadFrame::JitFrame` is not used —
+/// `FailArgSource::from_jitframe` decodes `rd_locs` as identity slots, while
+/// this backend spills compactly.
+///
+/// One root: the frame. `jitframe_trace` walks `jf_savedata`, `jf_guard_exc`,
+/// `jf_forward`, and the fail-arg Ref slots named by the guard's `jf_gcmap`.
+/// [`Self::boxed`] is the unit-test snapshot that has no jitframe.
 pub struct WasmFrameData {
+    /// [`Self::boxed`] only: values with no jitframe. Empty when `frame` is set.
     pub raw_values: Vec<i64>,
     pub fail_descr: Arc<WasmFailDescr>,
-    /// Pending exception value captured by `execute_token` after the trace
-    /// exited through a GuardNoException / GuardException (0 = none), surfaced
-    /// via `grab_exc_value`.
+    /// [`Self::boxed`] only. A live frame reads `jf_guard_exc`
+    /// (`llmodel.py` `grab_exc_value`).
     pub exc_value: i64,
-    /// `cpu.set_savedata_ref` / `get_savedata_ref` word — compile.py
-    /// `jf_savedata`. Rooted while non-zero, same as `exc_value`.
+    /// [`Self::boxed`] only. A live frame reads `jf_savedata`.
     pub savedata: i64,
-    /// Live JITFRAME `force()` borrowed, if this snapshot was taken
-    /// mid-call. `set_savedata` writes `jf_savedata` there so the
-    /// later GUARD_NOT_FORCED exit can copy the word back.
-    origin_jf: Option<*mut majit_backend::jitframe::JitFrame>,
-    /// Off-GC host-buffer owner. `take_host_frame` keeps the entry
-    /// JitFrame alive after `execute_token` returns.
-    /// Read on the wasm32 `execute_token` host-buffer path.
+    frame: Option<LiveFrame>,
+    /// `force()` snapshot: fail args live at `force_args_offset`, tagged.
+    read_force: bool,
+    /// Off-GC host-buffer owner. Keeps the entry JitFrame alive after
+    /// `execute_token` returns. The wasm32 host-buffer path.
     #[allow(dead_code)]
     host_frame: Option<majit_backend::libc_deadframe::LibcJitFrameDeadFrame>,
-    /// Slots handed to [`crate::wasm_gc_add_roots`] by [`WasmFrameData::boxed`],
-    /// released again in `Drop`.
-    roots: Vec<usize>,
 }
 
 impl WasmFrameData {
-    /// `llmodel.py` reads `get_ref_value` straight out of the JITFRAME,
-    /// which stays a GC root (its `jf_gcmap` covers the exit slots) for as long
-    /// as the deadframe lives. wasm has no host-visible JITFRAME to hand back:
-    /// `execute_token` copies the exit values into `raw_values` and drops the
-    /// guest frame, so the copies must carry that rooting themselves. Between
-    /// the copy and the last `get_ref_value`, resume/blackhole reconstruction
-    /// allocates freely, and a minor collection there moves exactly the objects
-    /// these slots name.
-    ///
-    /// Only `Type::Ref` exit slots are rooted, matching the gcmap the guest
-    /// frame carried. A wasm32 `GcRef` occupies the low half of its `i64` slot,
-    /// so the root address is the slot address (same aliasing the Ref home
-    /// slots already rely on).
+    /// Unit-test snapshot with no jitframe. Production exits use
+    /// [`Self::from_live_frame`].
     pub fn boxed(
         raw_values: Vec<i64>,
         fail_descr: Arc<WasmFailDescr>,
         exc_value: i64,
     ) -> Box<Self> {
-        let mut data = Box::new(WasmFrameData {
+        Box::new(WasmFrameData {
             raw_values,
             fail_descr,
             exc_value,
             savedata: 0,
-            origin_jf: None,
+            frame: None,
+            read_force: false,
             host_frame: None,
-            roots: Vec::new(),
-        });
-        let ref_count = data
-            .fail_descr
-            .fail_arg_types
-            .iter()
-            .take(data.raw_values.len())
-            .filter(|ty| **ty == Type::Ref)
-            .count();
-        if ref_count != 0 || data.exc_value != 0 {
-            let mut roots = Vec::with_capacity(ref_count + usize::from(data.exc_value != 0));
-            for i in 0..data.raw_values.len() {
-                if data.fail_descr.fail_arg_types.get(i) == Some(&Type::Ref) {
-                    roots.push(&mut data.raw_values[i] as *mut i64 as usize);
-                }
+        })
+    }
+
+    /// The jitframe `execute_token` / `force` returned. Fail args stay in
+    /// its `jf_frame` slots. The frame is the only root: `jf_gcmap` names
+    /// the exit's Ref slots and `jitframe_trace` names the header fields.
+    ///
+    /// `gc_root` takes an [`OwnerRootGuard`]. A force snapshot of a frame
+    /// the running call already rooted takes one too — dropping it releases
+    /// only this handle, and the call's shadow-stack root stays. A host
+    /// buffer (`gc_root == false`) does not move; `host_frame` owns it when
+    /// this deadframe does.
+    pub fn from_live_frame(
+        jf: *mut majit_backend::jitframe::JitFrame,
+        fail_descr: Arc<WasmFailDescr>,
+        read_force: bool,
+        gc_root: bool,
+        host_frame: Option<majit_backend::libc_deadframe::LibcJitFrameDeadFrame>,
+    ) -> Box<Self> {
+        let frame = if gc_root {
+            LiveFrame::Rooted(majit_gc::shadow_stack::OwnerRootGuard::new(
+                majit_ir::GcRef(jf as usize),
+            ))
+        } else {
+            LiveFrame::Fixed(jf)
+        };
+        Box::new(WasmFrameData {
+            raw_values: Vec::new(),
+            fail_descr,
+            exc_value: 0,
+            savedata: 0,
+            frame: Some(frame),
+            read_force,
+            host_frame,
+        })
+    }
+
+    fn frame_ptr(&self) -> Option<*mut majit_backend::jitframe::JitFrame> {
+        match self.frame.as_ref() {
+            Some(LiveFrame::Rooted(root)) => {
+                Some(root.get().0 as *mut majit_backend::jitframe::JitFrame)
             }
-            // `grab_exc_value` hands this out as a `GcRef` too, and the resume path
-            // reads it after it has already allocated. A null `GcRef` needs no root.
-            if data.exc_value != 0 {
-                roots.push(&mut data.exc_value as *mut i64 as usize);
-            }
-            unsafe { crate::wasm_gc_add_roots(&roots) };
-            data.roots = roots;
-        }
-        data
-    }
-
-    /// Bind this snapshot to the live JITFRAME `force()` borrowed so
-    /// `set_savedata` writes `jf_savedata` on that frame, matching
-    /// `llmodel.py set_savedata_ref`.
-    pub fn attach_origin_jf(&mut self, jf: *mut majit_backend::jitframe::JitFrame) {
-        self.origin_jf = Some(jf);
-        let savedata = unsafe { (*jf).jf_savedata };
-        if savedata != 0 {
-            self.set_savedata(majit_ir::GcRef(savedata));
+            Some(LiveFrame::Fixed(jf)) => Some(*jf),
+            None => None,
         }
     }
 
-    /// Seed the snapshot's `savedata` word from a JITFRAME that is
-    /// about to be dropped. No origin is kept.
-    pub fn seed_savedata_from_jf(&mut self, jf: *const majit_backend::jitframe::JitFrame) {
-        let savedata = unsafe { (*jf).jf_savedata };
-        if savedata != 0 {
-            self.set_savedata(majit_ir::GcRef(savedata));
-        }
+    /// Current items base. A GC root is re-read so a moving collection
+    /// cannot leave this pointing at the old frame.
+    pub fn items_base(&self) -> Option<usize> {
+        self.frame_ptr()
+            .map(|jf| jf as usize + majit_backend::jitframe::FIRST_ITEM_OFFSET)
     }
 
-    /// `cpu.set_savedata_ref(deadframe, data)` — write the `jf_savedata`
-    /// word and keep it rooted while non-zero. When this snapshot was
-    /// taken by `force()`, also persist the word on the live JITFRAME
-    /// so the later GUARD_NOT_FORCED exit can read it back.
+    pub fn read_force(&self) -> bool {
+        self.read_force
+    }
+
+    /// `cpu.set_savedata_ref(deadframe, data)` — write `jf_savedata`.
+    /// `jitframe_trace` traces that header field; the frame root is enough.
     pub fn set_savedata(&mut self, data: majit_ir::GcRef) {
-        let was_nonzero = self.savedata != 0;
-        let now_nonzero = !data.is_null();
         let mut data_slot = data.0 as i64;
-        if let Some(jf) = self.origin_jf {
+        if let Some(jf) = self.frame_ptr() {
             let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
             unsafe {
                 majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut data_slot));
@@ -195,17 +223,6 @@ impl WasmFrameData {
             unsafe { (*jf).jf_savedata = data_slot as usize };
         }
         self.savedata = data_slot;
-        if was_nonzero == now_nonzero {
-            return;
-        }
-        let slot = &mut self.savedata as *mut i64 as usize;
-        if now_nonzero {
-            unsafe { crate::wasm_gc_add_roots(&[slot]) };
-            self.roots.push(slot);
-        } else {
-            crate::wasm_gc_remove_roots(std::iter::once(slot));
-            self.roots.retain(|&s| s != slot);
-        }
     }
 
     #[allow(dead_code)] // wasm32 `execute_token` host-buffer path
@@ -214,17 +231,6 @@ impl WasmFrameData {
         frame: majit_backend::libc_deadframe::LibcJitFrameDeadFrame,
     ) {
         self.host_frame = Some(frame);
-    }
-}
-
-impl Drop for WasmFrameData {
-    fn drop(&mut self) {
-        if self.roots.is_empty() {
-            return;
-        }
-        // Remove in reverse push order so RootSet::remove stays on its
-        // O(1) stack-pop path.
-        crate::wasm_gc_remove_roots(self.roots.drain(..).rev());
     }
 }
 
@@ -237,7 +243,6 @@ mod tests {
     use majit_ir::GcRef;
 
     use super::{Type, WasmFailDescr, WasmFrameData};
-    use super::{global_fail_descr, register_fail_descrs, reserve_fail_descrs};
 
     struct RootCountingGc(Arc<AtomicUsize>);
 
@@ -323,6 +328,12 @@ mod tests {
             is_finish: false,
             force_args_offset: 8,
             force_gcmap_ptr: 0,
+            bridge_cell: 0,
+            fail_arg_advanced: Vec::new(),
+            trace_ref_homes: 0,
+            trace_label_homes: 0,
+            param_dispatch: false,
+            bridge_slot: std::sync::atomic::AtomicU32::new(0),
             meta_descr: None,
         })
     }
@@ -352,99 +363,21 @@ mod tests {
     }
 
     #[test]
-    fn the_reserved_finish_exits_precede_every_trace_base() {
-        // The emitted CALL_ASSEMBLER check compares against a baked reserved
-        // index, so a trace whose own exits started below the reserved block
-        // would collide with it.
+    fn finish_cells_keep_a_stable_address() {
+        // CALL_ASSEMBLER compares `jf_descr` with the address baked at
+        // compile time. Rebinding the singleton must not move that address.
         let _serialized = super::lock_cpu();
-        let base = reserve_fail_descrs(3);
-        assert!(base >= super::FINISH_EXIT_INDEX_COUNT);
-        for (index, types) in [
-            (super::FINISH_EXIT_INDEX_VOID, &[][..]),
-            (super::FINISH_EXIT_INDEX_INT, &[Type::Int][..]),
-            (super::FINISH_EXIT_INDEX_REF, &[Type::Ref][..]),
-            (super::FINISH_EXIT_INDEX_FLOAT, &[Type::Float][..]),
-            (super::FINISH_EXIT_INDEX_EXC, &[Type::Ref][..]),
-        ] {
-            let descr = global_fail_descr(index).expect("reserved finish exit is unregistered");
-            assert_eq!(descr.fail_index, index);
-            assert!(descr.is_finish, "reserved exit {index} is not a finish");
-            assert_eq!(descr.fail_arg_types, types, "reserved exit {index} layout");
-        }
-
-        let descrs: Vec<Arc<WasmFailDescr>> = (0..3)
-            .map(|i| {
-                Arc::new(WasmFailDescr {
-                    fail_index: base + i,
-                    trace_id: 0,
-                    fail_arg_types: vec![Type::Ref],
-                    fail_locs: Vec::new(),
-                    is_finish: false,
-                    force_args_offset: 8,
-                    force_gcmap_ptr: 0,
-                    meta_descr: None,
-                })
-            })
-            .collect();
-        register_fail_descrs(&descrs);
-        for i in 0..3 {
-            assert_eq!(
-                global_fail_descr(base + i)
-                    .expect("trace exit is unregistered")
-                    .fail_index,
-                base + i,
-            );
-        }
+        let ptr = super::finish_descr_ptr(super::FINISH_EXIT_INDEX_REF);
+        let again = super::finish_descr_ptr(super::FINISH_EXIT_INDEX_REF);
+        assert_eq!(ptr, again);
+        assert_ne!(ptr, super::finish_descr_ptr(super::FINISH_EXIT_INDEX_INT));
+        let descr = super::descr_at(ptr).expect("finish cell");
+        assert!(descr.is_finish);
+        assert_eq!(descr.fail_arg_types, vec![Type::Ref]);
     }
 
     #[test]
-    fn parallel_compiles_reserve_disjoint_fail_descr_ranges() {
-        // The registry lock already serializes reserve/register. Spawning
-        // workers to overlap those calls raced cargo's other failguard
-        // tests (shared GC box / finish-exit slots) and SIGSEGV'd the
-        // process. Disjointness is what this checks; the wasm host is
-        // single-threaded.
-        let _serialized = super::lock_cpu();
-        const COMPILES: usize = 8;
-        const EXITS: usize = 2;
-        let mut ranges = Vec::new();
-        for trace_id in 0..COMPILES {
-            let base = reserve_fail_descrs(EXITS);
-            let descrs: Vec<_> = (0..EXITS)
-                .map(|index| {
-                    Arc::new(WasmFailDescr {
-                        fail_index: base + index as u32,
-                        trace_id: trace_id as u64,
-                        fail_arg_types: vec![Type::Int],
-                        fail_locs: Vec::new(),
-                        is_finish: false,
-                        force_args_offset: 8,
-                        force_gcmap_ptr: 0,
-                        meta_descr: None,
-                    })
-                })
-                .collect();
-            register_fail_descrs(&descrs);
-            ranges.push((base, trace_id));
-        }
-        ranges.sort_by_key(|(base, _)| *base);
-        for window in ranges.windows(2) {
-            assert!(
-                window[0].0 + EXITS as u32 <= window[1].0,
-                "reserved ranges overlap"
-            );
-        }
-        for (base, trace_id) in ranges {
-            for index in 0..EXITS {
-                let descr = global_fail_descr(base + index as u32)
-                    .expect("reserved fail descr was not registered");
-                assert_eq!(descr.trace_id, trace_id as u64);
-            }
-        }
-    }
-
-    #[test]
-    fn boxed_roots_ref_slots_and_nonzero_exception_until_drop() {
+    fn boxed_does_not_root_interior_slots() {
         let _serialized = super::lock_cpu();
         let (roots, _gc_box) = install_root_counting_gc();
         let before = roots.load(Ordering::SeqCst);
@@ -453,7 +386,7 @@ mod tests {
             fail_descr(vec![Type::Ref, Type::Int, Type::Float, Type::Ref]),
             0x30,
         );
-        assert_eq!(roots.load(Ordering::SeqCst), before + 3);
+        assert_eq!(roots.load(Ordering::SeqCst), before);
         drop(frame);
         assert_eq!(roots.load(Ordering::SeqCst), before);
     }
@@ -470,20 +403,16 @@ mod tests {
     }
 
     #[test]
-    fn set_savedata_roots_until_cleared_or_drop() {
+    fn set_savedata_writes_the_word_without_an_interior_root() {
         let _serialized = super::lock_cpu();
         let (roots, _gc_box) = install_root_counting_gc();
         let before = roots.load(Ordering::SeqCst);
         let mut frame = WasmFrameData::boxed(vec![1], fail_descr(vec![Type::Int]), 0);
-        assert_eq!(roots.load(Ordering::SeqCst), before);
         frame.set_savedata(GcRef(0x40));
-        assert_eq!(roots.load(Ordering::SeqCst), before + 1);
-        frame.set_savedata(GcRef(0x41));
-        assert_eq!(roots.load(Ordering::SeqCst), before + 1);
+        assert_eq!(frame.savedata, 0x40);
         frame.set_savedata(GcRef(0));
+        assert_eq!(frame.savedata, 0);
         assert_eq!(roots.load(Ordering::SeqCst), before);
-        frame.set_savedata(GcRef(0x42));
-        assert_eq!(roots.load(Ordering::SeqCst), before + 1);
         drop(frame);
         assert_eq!(roots.load(Ordering::SeqCst), before);
     }
@@ -498,8 +427,8 @@ mod tests {
         // dropped.
         crate::clear_gc_allocator();
         let jf = alloc_off_gc_jitframe(JitFrame::alloc_size(4));
-        let mut frame = WasmFrameData::boxed(vec![1], fail_descr(vec![Type::Int]), 0);
-        frame.attach_origin_jf(jf);
+        let mut frame =
+            WasmFrameData::from_live_frame(jf, fail_descr(vec![Type::Int]), true, false, None);
         // `NO_CONCRETE` is not a heap object (even, non-8-aligned, non-null).
         // A low dummy (0x51) was chased as a nursery pointer when another
         // test's MiniMark was still the process hook target.
@@ -525,6 +454,7 @@ mod tests {
             requires_own_frame: false,
             is_last_label: true,
             frame: crate::codegen::FrameGeometry::fixed(),
+            owner_token: 0,
         }
     }
 
@@ -541,14 +471,6 @@ mod tests {
         assert_eq!(super::label_target(id).map(|t| t.func_handle), Some(9));
         super::retract_label_target_if_handle(id, 9);
         assert!(super::label_target(id).is_none());
-    }
-
-    #[test]
-    fn retarget_slots_skips_the_owner_and_zero() {
-        let _serialized = super::lock_cpu();
-        // Native has no host table; the helper must still ignore the
-        // owner's own slot and a missing handle without panicking.
-        super::retarget_slots_to_module([0, 4, 4], 4, b"\0asm");
     }
 }
 
@@ -583,6 +505,8 @@ pub struct LabelTarget {
     /// a frame when its offsets agree exactly, not merely when its allocation
     /// is large enough.
     pub frame: crate::codegen::FrameGeometry,
+    /// `JitCellToken.number` that published this row.
+    pub owner_token: u64,
 }
 
 /// Frozen metadata for entering a compiled loop from a `CALL_ASSEMBLER` arm.
@@ -593,6 +517,8 @@ pub struct CallAssemblerTarget {
     /// Owning `JitCellToken` number. Used only by the dormant wasm regression
     /// hook to select one target deterministically.
     pub token_number: u64,
+    /// Address of this token's `WasmCaDispatchEntry` (`_ll_function_addr`).
+    pub dispatch_entry: u32,
     pub func_handle: u32,
     pub input_types: Vec<Type>,
     /// Byte offset at which the target reads its fresh-entry dispatch key.
@@ -611,13 +537,12 @@ pub struct CallAssemblerTarget {
     /// pop footer must use the write-barrier helper when this is set,
     /// even if the caller module itself has no GNF2.
     pub has_guard_not_forced_2: u32,
+    /// Homes `build_home_gcmap` marks: the used ordinary prefix, then the
+    /// LABEL-capture tail. Reserved padding between them is unmarked.
+    pub marked_ordinary: u32,
+    pub marked_labels: u32,
+    pub label_ref_slots: u32,
 }
-
-/// Compiled loop targets keyed by their `JitCellToken` number. Unlike label
-/// targets, CALL_ASSEMBLER identifies its callee by that number directly.
-pub static CALL_ASSEMBLER_TARGETS: parking_lot::Mutex<
-    Option<std::collections::HashMap<u64, CallAssemblerTarget>>,
-> = parking_lot::Mutex::new(None);
 
 // ── CALL_ASSEMBLER dispatch table ──
 //
@@ -646,6 +571,13 @@ pub struct WasmCaRuntimeTarget {
     pub home_slot_base: u32,
     pub home_slots: u32,
     pub has_guard_not_forced_2: u32,
+    /// Used ordinary Ref homes the callee's static gcmap marks.
+    pub marked_ordinary: u32,
+    /// Used LABEL-capture homes the same map marks.
+    pub marked_labels: u32,
+    /// Reserved LABEL tail. The marked tail starts at
+    /// `home_slots - label_ref_slots`.
+    pub label_ref_slots: u32,
 }
 
 /// Stable cell baked by callers.  A redirect publishes one pointer to an
@@ -663,6 +595,9 @@ pub struct WasmCaRuntimeTarget {
 pub struct WasmCaDispatchEntry {
     pub target_ptr: AtomicU32,
     pub has_guard_not_forced_2: AtomicU32,
+    /// Host pointer of the `CompiledWasmLoop` the latest snapshot names.
+    /// The guest snapshot keeps the wasm32 address; this is the full word.
+    pub host_compiled_ptr: std::sync::atomic::AtomicUsize,
     pub targets: std::sync::Mutex<Vec<Box<WasmCaRuntimeTarget>>>,
 }
 
@@ -686,6 +621,12 @@ pub const WASM_CA_TARGET_HOME_SLOTS_OFS: u64 =
     std::mem::offset_of!(WasmCaRuntimeTarget, home_slots) as u64;
 pub const WASM_CA_TARGET_HAS_GNF2_OFS: u64 =
     std::mem::offset_of!(WasmCaRuntimeTarget, has_guard_not_forced_2) as u64;
+pub const WASM_CA_TARGET_MARKED_ORDINARY_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, marked_ordinary) as u64;
+pub const WASM_CA_TARGET_MARKED_LABELS_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, marked_labels) as u64;
+pub const WASM_CA_TARGET_LABEL_REF_SLOTS_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, label_ref_slots) as u64;
 
 /// `make_and_attach_done_descrs` gives every cpu one `DoneWithThisFrame*` per
 /// result kind plus one `ExitFrameWithExceptionDescrRef`, and
@@ -694,17 +635,14 @@ pub const WASM_CA_TARGET_HAS_GNF2_OFS: u64 =
 /// writes the same `jf_descr`, and `_call_assembler_check_descr` recognises a
 /// clean callee finish by comparing against one value.
 ///
-/// A wasm frame slot holds an index into the global exit space rather than a
-/// descr pointer, so the shared identity is a reserved index. The five sit at
-/// the front of [`FAIL_DESCR_REGISTRY`], claimed before any trace takes a
-/// `fail_descr_base`, and carry the attached `Arc` as their `meta_descr` so
-/// `get_latest_descr_arc` still answers with the metainterp's own descr.
+/// The shared identity is the cell address stored in `jf_descr`. The five
+/// cells never move; `attach_finish_descr` replaces the `Arc` inside the
+/// cell. `get_latest_descr` reads that `Arc`'s `meta_descr`.
 pub const FINISH_EXIT_INDEX_VOID: u32 = 0;
 pub const FINISH_EXIT_INDEX_INT: u32 = 1;
 pub const FINISH_EXIT_INDEX_REF: u32 = 2;
 pub const FINISH_EXIT_INDEX_FLOAT: u32 = 3;
 pub const FINISH_EXIT_INDEX_EXC: u32 = 4;
-const FINISH_EXIT_INDEX_COUNT: u32 = 5;
 
 /// Reserved exit index for the `done_with_this_frame_descr_*` of `ty`.
 pub fn done_with_this_frame_exit_index(ty: Type) -> u32 {
@@ -736,52 +674,113 @@ fn reserved_finish_descr(exit_index: u32, meta_descr: Option<DescrRef>) -> Arc<W
         is_finish: true,
         force_args_offset: 0,
         force_gcmap_ptr: 0,
+        bridge_cell: 0,
+        fail_arg_advanced: Vec::new(),
+        trace_ref_homes: 0,
+        trace_label_homes: 0,
+        param_dispatch: false,
+        bridge_slot: std::sync::atomic::AtomicU32::new(0),
         meta_descr,
     })
 }
 
-/// CPU singletons for the five `done_with_this_frame` / exception exits.
+/// Address baked into `jf_descr` / `jf_force_descr`.
 ///
-/// `make_and_attach_done_descrs` stores those descrs on the cpu, not in
-/// the per-trace fail-index vec. The growable registry still reserves
-/// indices 0..5 so a trace `fail_descr_base` cannot collide with them,
-/// but lookups and attachment go through this array so a smashed or
-/// overwritten registry slot cannot change the singleton layout.
-static FINISH_EXITS: parking_lot::Mutex<[Option<Arc<WasmFailDescr>>; 5]> =
-    parking_lot::Mutex::new([None, None, None, None, None]);
+/// The cell is the unit `LoopAsmResources` (or the finish singleton array)
+/// keeps alive. `get_latest_descr` casts `jf_descr` back to this cell.
+pub struct FailDescrCell {
+    descr: parking_lot::Mutex<Arc<WasmFailDescr>>,
+}
 
-fn finish_exits_init(exits: &mut [Option<Arc<WasmFailDescr>>; 5]) {
-    for (index, slot) in exits.iter_mut().enumerate() {
-        if slot.is_none() {
-            *slot = Some(reserved_finish_descr(index as u32, None));
+impl FailDescrCell {
+    pub fn new(descr: Arc<WasmFailDescr>) -> Self {
+        Self {
+            descr: parking_lot::Mutex::new(descr),
         }
     }
+
+    pub fn get(&self) -> Arc<WasmFailDescr> {
+        Arc::clone(&self.descr.lock())
+    }
+
+    pub fn set(&self, descr: Arc<WasmFailDescr>) {
+        *self.descr.lock() = descr;
+    }
+}
+
+/// Read the descr an exit stored in `jf_descr` or `jf_force_descr`.
+pub fn descr_at(cell: usize) -> Option<Arc<WasmFailDescr>> {
+    if cell == 0 {
+        return None;
+    }
+    Some(unsafe { &*(cell as *const FailDescrCell) }.get())
+}
+
+/// Publish the real descr into a cell `build_wasm_module` allocated.
+pub fn fill_exit_cell(cell: usize, descr: Arc<WasmFailDescr>) {
+    if cell == 0 {
+        return;
+    }
+    unsafe { &*(cell as *const FailDescrCell) }.set(descr);
+}
+
+/// Allocate the cell whose address the exit stores in `jf_descr`.
+///
+/// `sink` is the `LoopAsmResources` the compile will push into
+/// `asmmemmgr_blocks`. A null sink (a direct `build_wasm_module` test)
+/// leaks the cell the same way `park_gcmap_raw` leaks a map.
+pub fn alloc_exit_cell(sink: usize, fail_index: u32) -> usize {
+    let descr = Arc::new(WasmFailDescr {
+        fail_index,
+        trace_id: 0,
+        fail_arg_types: Vec::new(),
+        fail_locs: Vec::new(),
+        is_finish: false,
+        force_args_offset: 0,
+        force_gcmap_ptr: 0,
+        bridge_cell: 0,
+        fail_arg_advanced: Vec::new(),
+        trace_ref_homes: 0,
+        trace_label_homes: 0,
+        param_dispatch: false,
+        bridge_slot: std::sync::atomic::AtomicU32::new(0),
+        meta_descr: None,
+    });
+    if sink == 0 {
+        let cell = Box::new(FailDescrCell::new(descr));
+        let ptr = &*cell as *const FailDescrCell as usize;
+        Box::leak(cell);
+        return ptr;
+    }
+    let resources = unsafe { &mut *(sink as *mut crate::release::LoopAsmResources) };
+    resources.alloc_fail_cell(descr)
+}
+
+/// CPU singletons for the five `done_with_this_frame` / exception exits.
+///
+/// The `Box` is allocated once and never replaced, so the address baked
+/// into a module stays valid when `attach_finish_descr` rebinds the `Arc`.
+static FINISH_EXITS: parking_lot::Mutex<[Option<Box<FailDescrCell>>; 5]> =
+    parking_lot::Mutex::new([None, None, None, None, None]);
+
+fn finish_descr_ptr_locked(exits: &mut [Option<Box<FailDescrCell>>; 5], index: u32) -> usize {
+    let slot = &mut exits[index as usize];
+    if slot.is_none() {
+        *slot = Some(Box::new(FailDescrCell::new(reserved_finish_descr(
+            index, None,
+        ))));
+    }
+    &**slot.as_ref().expect("finish cell") as *const FailDescrCell as usize
+}
+
+/// Stable `jf_descr` immediate for one reserved finish exit.
+pub fn finish_descr_ptr(index: u32) -> usize {
+    let mut exits = FINISH_EXITS.lock();
+    finish_descr_ptr_locked(&mut exits, index)
 }
 
 fn finish_exit(index: u32) -> Arc<WasmFailDescr> {
-    let mut exits = FINISH_EXITS.lock();
-    finish_exits_init(&mut exits);
-    exits[index as usize]
-        .clone()
-        .expect("reserved finish exit is uninitialized")
-}
-
-/// Claim the reserved block if the registry has not been opened yet. Called
-/// under the registry lock from every entry point that can grow or read it, so
-/// a trace can never take a `fail_descr_base` below `FINISH_EXIT_INDEX_COUNT`.
-fn reserve_finish_exit_block(vec: &mut Vec<FailDescrSlot>) {
-    let mut exits = FINISH_EXITS.lock();
-    finish_exits_init(&mut exits);
-    if !vec.is_empty() {
-        return;
-    }
-    for index in 0..FINISH_EXIT_INDEX_COUNT {
-        vec.push(FailDescrSlot::Registered(
-            exits[index as usize]
-                .clone()
-                .expect("reserved finish exit is uninitialized"),
-        ));
-    }
+    descr_at(finish_descr_ptr(index)).expect("reserved finish exit is uninitialized")
 }
 
 fn thin_descr_ptr(descr: &DescrRef) -> usize {
@@ -800,37 +799,23 @@ fn thin_descr_ptr(descr: &DescrRef) -> usize {
 /// compile happened in.
 pub fn attached_finish_exit_index(descr: &Option<DescrRef>) -> Option<u32> {
     let ptr = thin_descr_ptr(descr.as_ref()?);
-    let mut exits = FINISH_EXITS.lock();
-    finish_exits_init(&mut exits);
+    let exits = FINISH_EXITS.lock();
     exits.iter().enumerate().find_map(|(index, reserved)| {
-        reserved.as_ref().and_then(|reserved| {
-            reserved
-                .meta_descr
-                .as_ref()
-                .is_some_and(|attached| thin_descr_ptr(attached) == ptr)
-                .then_some(index as u32)
-        })
+        let cell = reserved.as_ref()?;
+        cell.get()
+            .meta_descr
+            .as_ref()
+            .is_some_and(|attached| thin_descr_ptr(attached) == ptr)
+            .then_some(index as u32)
     })
 }
 
 /// `make_and_attach_done_descrs`' per-target attachment for one of the five.
-/// Binds the singleton to its reserved exit, which is what the emitted FINISH
-/// writes and the emitted CALL_ASSEMBLER check compares against. Rebinding an
-/// already-claimed entry keeps the fast path available to a process that
-/// compiled something before the attachment landed.
+/// Rebinds the `Arc` inside the existing cell, so a module that already
+/// baked [`finish_descr_ptr`] still names this descr.
 pub fn attach_finish_descr(exit_index: u32, descr: DescrRef) {
-    let attached = reserved_finish_descr(exit_index, Some(descr));
-    // Registry first, then `FINISH_EXITS` — same order as
-    // `reserve_finish_exit_block` (called under the registry lock).
-    let mut reg = FAIL_DESCR_REGISTRY.lock();
-    let vec = reg.get_or_insert_with(Default::default);
-    reserve_finish_exit_block(vec);
-    {
-        let mut exits = FINISH_EXITS.lock();
-        finish_exits_init(&mut exits);
-        exits[exit_index as usize] = Some(Arc::clone(&attached));
-    }
-    vec[exit_index as usize] = FailDescrSlot::Registered(attached);
+    let cell = finish_descr_ptr(exit_index);
+    fill_exit_cell(cell, reserved_finish_descr(exit_index, Some(descr)));
 }
 
 /// Whether the cpu has been handed `exit_frame_with_exception_descr_ref`.
@@ -895,55 +880,169 @@ pub fn stage_propagate_exception_exit(
     Some((finish_exit(FINISH_EXIT_INDEX_EXC), exc))
 }
 
-/// Stable, guest-memory dispatch entries, keyed by CALL_ASSEMBLER token.
-/// `Box` is intentional: an emitted module bakes the entry address.
-pub static WASM_CA_DISPATCH: parking_lot::Mutex<
-    Option<std::collections::HashMap<u64, Box<WasmCaDispatchEntry>>>,
-> = parking_lot::Mutex::new(None);
-
-/// Compiled loops that already have a GNF2 bridge. Consulted under
-/// `WASM_CA_DISPATCH` so a redirect that publishes after `mark` but
-/// before the source guard cell is written still raises the new alias
-/// cell. Pointers are forgotten when that compiled loop is removed.
-static CA_GNF2_COMPILED_PTRS: parking_lot::Mutex<Option<std::collections::HashSet<u32>>> =
-    parking_lot::Mutex::new(None);
-
-/// Return the stable guest-memory address for `number`, creating a pending
-/// (zero-slot) entry when needed.
-pub fn ca_dispatch_slot(number: u64) -> u32 {
-    let mut table = WASM_CA_DISPATCH.lock();
-    let entry = table
-        .get_or_insert_with(Default::default)
-        .entry(number)
-        .or_insert_with(|| {
-            Box::new(WasmCaDispatchEntry {
-                target_ptr: AtomicU32::new(0),
-                has_guard_not_forced_2: AtomicU32::new(0),
-                targets: std::sync::Mutex::new(Vec::new()),
-            })
-        });
-    (&**entry as *const WasmCaDispatchEntry as usize) as u32
+impl WasmCaDispatchEntry {
+    pub fn pending() -> Self {
+        Self {
+            target_ptr: AtomicU32::new(0),
+            has_guard_not_forced_2: AtomicU32::new(0),
+            host_compiled_ptr: std::sync::atomic::AtomicUsize::new(0),
+            targets: std::sync::Mutex::new(Vec::new()),
+        }
+    }
 }
 
-/// Raise the monotonic GNF2 flag on an existing dispatch cell.
-///
-/// Does not create an entry and does not publish a new snapshot. Call
-/// this before arming a newly compiled `GUARD_NOT_FORCED_2` bridge so
-/// an in-flight CALL_ASSEMBLER footer sees the flag before the callee
-/// can finish through that bridge.
-///
-/// When `number` already has a snapshot, every cell that still retains
-/// that compiled loop — current target or an older snapshot — is
-/// raised too. Redirected aliases keep their own cell, and in-flight
-/// callers may still hold a historical snapshot pointer, so marking
-/// only the replacement token or only `.last()` would leave those
-/// footers reading zero.
-pub fn ca_dispatch_mark_gnf2(number: u64) {
-    let table = WASM_CA_DISPATCH.lock();
-    let Some(table) = table.as_ref() else {
-        return;
+/// The token's `_ll_function_addr` stand-in. `0` is "not allocated".
+pub fn ca_entry(addr: usize) -> Option<&'static WasmCaDispatchEntry> {
+    if addr == 0 {
+        None
+    } else {
+        Some(unsafe { &*(addr as *const WasmCaDispatchEntry) })
+    }
+}
+
+/// One indirect cell per looptoken. The `Box` lives in `LoopAsmResources`
+/// (`asmmemmgr_blocks`); callers bake its address.
+pub fn ensure_ca_cell(token: &majit_backend::JitCellToken) -> &'static WasmCaDispatchEntry {
+    if let Some(entry) = ca_entry(token.ll_function_addr()) {
+        return entry;
+    }
+    let entry = Box::new(WasmCaDispatchEntry::pending());
+    let addr = &*entry as *const WasmCaDispatchEntry as usize;
+    if let Some(clt) = token.compiled_loop_token() {
+        let mut blocks = clt.asmmemmgr_blocks.lock();
+        let resources = if let Some(existing) = blocks
+            .iter_mut()
+            .rev()
+            .find_map(|block| block.downcast_mut::<crate::release::LoopAsmResources>())
+        {
+            existing
+        } else {
+            blocks.push(Box::new(crate::release::LoopAsmResources::default()));
+            blocks
+                .last_mut()
+                .and_then(|block| block.downcast_mut::<crate::release::LoopAsmResources>())
+                .expect("just-pushed LoopAsmResources")
+        };
+        resources.ca_entry = Some(entry);
+    } else {
+        Box::leak(entry);
+    }
+    token.set_ll_function_addr(addr);
+    unsafe { &*(addr as *const WasmCaDispatchEntry) }
+}
+
+/// Publish one immutable snapshot and release-store its address.
+pub fn ca_publish(
+    entry: &WasmCaDispatchEntry,
+    func_handle: u32,
+    compiled_ptr: u64,
+    callee_frame_bytes: u32,
+    dispatch_key_ofs: u32,
+    callee_gcmap_ptr: i64,
+    home_slot_base: u32,
+    home_slots: u32,
+    has_guard_not_forced_2: u32,
+    marked_ordinary: u32,
+    marked_labels: u32,
+    label_ref_slots: u32,
+) {
+    let has_guard_not_forced_2 = if has_guard_not_forced_2 != 0
+        || entry.has_guard_not_forced_2.load(Ordering::Acquire) != 0
+    {
+        1
+    } else {
+        0
     };
-    let compiled_ptr = table.get(&number).and_then(|entry| {
+    if has_guard_not_forced_2 != 0 {
+        entry.has_guard_not_forced_2.store(1, Ordering::Release);
+    }
+    let mut targets = entry.targets.lock().unwrap_or_else(|e| e.into_inner());
+    if targets.last().is_some_and(|current| {
+        current.func_handle == func_handle
+            && current.compiled_ptr == compiled_ptr as u32
+            && current.callee_frame_bytes == callee_frame_bytes
+            && current.dispatch_key_ofs == dispatch_key_ofs
+            && current.callee_gcmap_ptr == callee_gcmap_ptr
+            && current.home_slot_base == home_slot_base
+            && current.home_slots == home_slots
+            && current.has_guard_not_forced_2 == has_guard_not_forced_2
+            && current.marked_ordinary == marked_ordinary
+            && current.marked_labels == marked_labels
+            && current.label_ref_slots == label_ref_slots
+    }) {
+        return;
+    }
+    let target = Box::new(WasmCaRuntimeTarget {
+        func_handle,
+        compiled_ptr: compiled_ptr as u32,
+        callee_frame_bytes,
+        dispatch_key_ofs,
+        callee_gcmap_ptr,
+        home_slot_base,
+        home_slots,
+        has_guard_not_forced_2,
+        marked_ordinary,
+        marked_labels,
+        label_ref_slots,
+    });
+    let target_ptr = (&*target as *const WasmCaRuntimeTarget as usize) as u32;
+    targets.push(target);
+    entry
+        .host_compiled_ptr
+        .store(compiled_ptr as usize, Ordering::Release);
+    entry.target_ptr.store(target_ptr, Ordering::Release);
+}
+
+pub fn ca_mark_entry(entry: &WasmCaDispatchEntry) {
+    entry.has_guard_not_forced_2.store(1, Ordering::Release);
+}
+
+/// Raise the cell flag on every entry whose snapshots still name `compiled_ptr`.
+pub fn mark_cells_holding(cells: &[&WasmCaDispatchEntry], compiled_ptr: u32) {
+    if compiled_ptr == 0 {
+        return;
+    }
+    for entry in cells {
+        let holds = entry
+            .targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|target| target.compiled_ptr == compiled_ptr);
+        if holds {
+            ca_mark_entry(entry);
+        }
+    }
+}
+
+fn token_ca_cells(token: &majit_backend::JitCellToken) -> Vec<&'static WasmCaDispatchEntry> {
+    let mut cells = Vec::new();
+    if let Some(entry) = ca_entry(token.ll_function_addr()) {
+        cells.push(entry);
+    }
+    let Some(clt) = token.compiled_loop_token() else {
+        return cells;
+    };
+    let chain = clt.looptokens_redirected_to.lock().clone();
+    for weak in chain {
+        let Some(old) = weak.upgrade() else {
+            continue;
+        };
+        let Some(alias) = old.upgrade_loop_token() else {
+            continue;
+        };
+        if let Some(entry) = ca_entry(alias.ll_function_addr()) {
+            cells.push(entry);
+        }
+    }
+    cells
+}
+
+/// Raise GNF2 on this token's cell and on redirect aliases that still
+/// name its compiled loop. `update_frame_info` records those aliases.
+pub fn mark_gnf2_token(token: &majit_backend::JitCellToken) {
+    let cells = token_ca_cells(token);
+    let compiled_ptr = cells.first().and_then(|entry| {
         entry
             .targets
             .lock()
@@ -952,201 +1051,7 @@ pub fn ca_dispatch_mark_gnf2(number: u64) {
             .map(|target| target.compiled_ptr)
     });
     if let Some(compiled_ptr) = compiled_ptr.filter(|&ptr| ptr != 0) {
-        mark_gnf2_entries_for_compiled_ptr(table, compiled_ptr);
-    } else if let Some(entry) = table.get(&number) {
-        entry.has_guard_not_forced_2.store(1, Ordering::Release);
-    }
-}
-
-/// Raise the monotonic GNF2 flag on every dispatch cell that still
-/// retains a snapshot invoking `compiled_ptr`.
-pub fn ca_dispatch_mark_gnf2_for_compiled_ptr(compiled_ptr: u32) {
-    if compiled_ptr == 0 {
-        return;
-    }
-    let table = WASM_CA_DISPATCH.lock();
-    remember_gnf2_compiled_ptr(compiled_ptr);
-    if let Some(table) = table.as_ref() {
-        mark_gnf2_entries_for_compiled_ptr(table, compiled_ptr);
-    }
-}
-
-fn remember_gnf2_compiled_ptr(compiled_ptr: u32) {
-    if compiled_ptr != 0 {
-        CA_GNF2_COMPILED_PTRS
-            .lock()
-            .get_or_insert_with(Default::default)
-            .insert(compiled_ptr);
-    }
-}
-
-fn compiled_ptr_has_gnf2(compiled_ptr: u32) -> bool {
-    compiled_ptr != 0
-        && CA_GNF2_COMPILED_PTRS
-            .lock()
-            .as_ref()
-            .is_some_and(|set| set.contains(&compiled_ptr))
-}
-
-fn mark_gnf2_entries_for_compiled_ptr(
-    table: &std::collections::HashMap<u64, Box<WasmCaDispatchEntry>>,
-    compiled_ptr: u32,
-) {
-    remember_gnf2_compiled_ptr(compiled_ptr);
-    for entry in table.values() {
-        let aliases = entry
-            .targets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .any(|target| target.compiled_ptr == compiled_ptr);
-        if aliases {
-            entry.has_guard_not_forced_2.store(1, Ordering::Release);
-        }
-    }
-}
-
-/// Stamp `has_guard_not_forced_2` on every CALL_ASSEMBLER metadata
-/// alias that currently names `compiled_ptr`.
-pub fn mark_call_assembler_targets_gnf2_for_compiled_ptr(compiled_ptr: u32) {
-    if let Some(targets) = CALL_ASSEMBLER_TARGETS.lock().as_mut() {
-        for target in targets.values_mut() {
-            if target.compiled_ptr as u32 == compiled_ptr {
-                target.has_guard_not_forced_2 = 1;
-            }
-        }
-    }
-}
-
-/// Publish an installed loop after its module has acquired a shared-table
-/// slot.  All runtime fields live in one immutable snapshot, and the release
-/// store publishes its address only after the snapshot is fully initialized.
-pub fn ca_dispatch_publish(
-    number: u64,
-    func_handle: u32,
-    compiled_ptr: u32,
-    callee_frame_bytes: u32,
-    dispatch_key_ofs: u32,
-    callee_gcmap_ptr: i64,
-    home_slot_base: u32,
-    home_slots: u32,
-    has_guard_not_forced_2: u32,
-) {
-    let _ = ca_dispatch_slot(number);
-    let table = WASM_CA_DISPATCH.lock();
-    let has_guard_not_forced_2 =
-        if has_guard_not_forced_2 != 0 || compiled_ptr_has_gnf2(compiled_ptr) {
-            1
-        } else {
-            0
-        };
-    let entries = table
-        .as_ref()
-        .expect("CALL_ASSEMBLER dispatch table disappeared while publishing");
-    if has_guard_not_forced_2 != 0 && compiled_ptr != 0 {
-        mark_gnf2_entries_for_compiled_ptr(entries, compiled_ptr);
-    }
-    let entry = entries
-        .get(&number)
-        .expect("CALL_ASSEMBLER dispatch entry disappeared while publishing");
-    if has_guard_not_forced_2 != 0 {
-        entry.has_guard_not_forced_2.store(1, Ordering::Release);
-    }
-    let mut targets = entry.targets.lock().unwrap_or_else(|e| e.into_inner());
-    if targets.last().is_some_and(|current| {
-        current.func_handle == func_handle
-            && current.compiled_ptr == compiled_ptr
-            && current.callee_frame_bytes == callee_frame_bytes
-            && current.dispatch_key_ofs == dispatch_key_ofs
-            && current.callee_gcmap_ptr == callee_gcmap_ptr
-            && current.home_slot_base == home_slot_base
-            && current.home_slots == home_slots
-            && current.has_guard_not_forced_2 == has_guard_not_forced_2
-    }) {
-        return;
-    }
-    let target = Box::new(WasmCaRuntimeTarget {
-        func_handle,
-        compiled_ptr,
-        callee_frame_bytes,
-        dispatch_key_ofs,
-        callee_gcmap_ptr,
-        home_slot_base,
-        home_slots,
-        has_guard_not_forced_2,
-    });
-    let target_ptr = (&*target as *const WasmCaRuntimeTarget as usize) as u32;
-    targets.push(target);
-    entry.target_ptr.store(target_ptr, Ordering::Release);
-}
-
-/// Redirect existing callers of `old_number` to the installed target.
-pub fn ca_dispatch_redirect(
-    old_number: u64,
-    func_handle: u32,
-    compiled_ptr: u32,
-    callee_frame_bytes: u32,
-    dispatch_key_ofs: u32,
-    callee_gcmap_ptr: i64,
-    home_slot_base: u32,
-    home_slots: u32,
-    has_guard_not_forced_2: u32,
-) {
-    ca_dispatch_publish(
-        old_number,
-        func_handle,
-        compiled_ptr,
-        callee_frame_bytes,
-        dispatch_key_ofs,
-        callee_gcmap_ptr,
-        home_slot_base,
-        home_slots,
-        has_guard_not_forced_2,
-    );
-}
-
-/// Remove every dispatch entry that still resolves to `compiled_ptr`.  This
-/// also retracts redirects into a dropped replacement loop, while preserving
-/// an old token whose entry has already been redirected elsewhere.
-pub fn ca_dispatch_remove_compiled_ptr(compiled_ptr: u32) {
-    let mut table = WASM_CA_DISPATCH.lock();
-    if let Some(table) = table.as_mut() {
-        table.retain(|_, entry| {
-            entry
-                .targets
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .last()
-                .is_none_or(|target| target.compiled_ptr != compiled_ptr)
-        });
-    }
-    if compiled_ptr != 0 {
-        if let Some(set) = CA_GNF2_COMPILED_PTRS.lock().as_mut() {
-            set.remove(&compiled_ptr);
-        }
-    }
-}
-
-pub fn ca_dispatch_remove(number: u64) {
-    let mut table = WASM_CA_DISPATCH.lock();
-    let Some(table) = table.as_mut() else {
-        return;
-    };
-    let compiled_ptrs: Vec<u32> = table
-        .remove(&number)
-        .map(|entry| {
-            entry
-                .targets
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .map(|target| target.compiled_ptr)
-                .filter(|&ptr| ptr != 0)
-                .collect()
-        })
-        .unwrap_or_default();
-    for compiled_ptr in compiled_ptrs {
-        let still_used = table.values().any(|entry| {
+        let matched = cells.iter().any(|entry| {
             entry
                 .targets
                 .lock()
@@ -1154,54 +1059,77 @@ pub fn ca_dispatch_remove(number: u64) {
                 .iter()
                 .any(|target| target.compiled_ptr == compiled_ptr)
         });
-        if !still_used {
-            if let Some(set) = CA_GNF2_COMPILED_PTRS.lock().as_mut() {
-                set.remove(&compiled_ptr);
+        mark_cells_holding(&cells, compiled_ptr);
+        if !matched {
+            if let Some(entry) = cells.first() {
+                ca_mark_entry(entry);
             }
         }
+    } else if let Some(entry) = cells.first() {
+        ca_mark_entry(entry);
     }
 }
 
-pub fn call_assembler_target(number: u64) -> Option<CallAssemblerTarget> {
-    CALL_ASSEMBLER_TARGETS
-        .lock()
-        .as_ref()
-        .and_then(|targets| targets.get(&number).cloned())
+pub fn target_from_token(token: &majit_backend::JitCellToken) -> Option<CallAssemblerTarget> {
+    let entry = ca_entry(token.ll_function_addr())?;
+    let targets = entry.targets.lock().unwrap_or_else(|e| e.into_inner());
+    let snap = targets.last()?;
+    let host_ptr = entry.host_compiled_ptr.load(Ordering::Acquire);
+    let input_types = if host_ptr != 0 {
+        unsafe { (host_ptr as *const CompiledWasmLoop).as_ref() }
+            .map(|loop_| loop_.input_types.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let live_flag = entry.has_guard_not_forced_2.load(Ordering::Acquire);
+    Some(CallAssemblerTarget {
+        token_number: token.number,
+        dispatch_entry: token.ll_function_addr() as u32,
+        func_handle: snap.func_handle,
+        input_types,
+        dispatch_key_ofs: snap.dispatch_key_ofs as u64,
+        callee_frame_bytes: snap.callee_frame_bytes,
+        callee_gcmap_ptr: snap.callee_gcmap_ptr,
+        compiled_ptr: host_ptr as u64,
+        home_slot_base: snap.home_slot_base,
+        home_slots: snap.home_slots,
+        has_guard_not_forced_2: live_flag.max(snap.has_guard_not_forced_2),
+        marked_ordinary: snap.marked_ordinary,
+        marked_labels: snap.marked_labels,
+        label_ref_slots: snap.label_ref_slots,
+    })
 }
 
-pub fn publish_call_assembler_target(number: u64, target: CallAssemblerTarget) {
-    CALL_ASSEMBLER_TARGETS
-        .lock()
-        .get_or_insert_with(Default::default)
-        .insert(number, target);
+pub fn publish_token_target(token: &majit_backend::JitCellToken, target: &CallAssemblerTarget) {
+    let entry = ensure_ca_cell(token);
+    ca_publish(
+        entry,
+        target.func_handle,
+        target.compiled_ptr,
+        target.callee_frame_bytes,
+        target.dispatch_key_ofs as u32,
+        target.callee_gcmap_ptr,
+        target.home_slot_base,
+        target.home_slots,
+        target.has_guard_not_forced_2,
+        target.marked_ordinary,
+        target.marked_labels,
+        target.label_ref_slots,
+    );
 }
 
-/// Remove metadata and the dispatch entry for an invalidated token.
-pub fn remove_call_assembler_target(number: u64) {
-    if let Some(targets) = CALL_ASSEMBLER_TARGETS.lock().as_mut() {
-        targets.remove(&number);
+/// Write a bridge table slot into the guard cell `patch_jump_for_descr` names.
+pub fn write_guard_cell(cell_addr: u32, slot: u32) {
+    #[cfg(target_arch = "wasm32")]
+    if cell_addr != 0 {
+        unsafe { core::ptr::write(cell_addr as *mut u32, slot) };
     }
-    ca_dispatch_remove(number);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (cell_addr, slot);
 }
 
-/// Retract all metadata aliases which point at a dropped compiled loop.
-pub fn remove_call_assembler_targets_for_compiled_ptr(compiled_ptr: u32) {
-    if let Some(targets) = CALL_ASSEMBLER_TARGETS.lock().as_mut() {
-        targets.retain(|_, target| target.compiled_ptr as u32 != compiled_ptr);
-    }
-    ca_dispatch_remove_compiled_ptr(compiled_ptr);
-}
-
-/// One position in the global fail-index space: claimed by
-/// `reserve_fail_descrs` and filled by `register_fail_descrs`. The two steps
-/// are separate so a compile can bake `base + local` into its guards before
-/// the descrs those guards name exist.
-enum FailDescrSlot {
-    Reserved,
-    Registered(Arc<WasmFailDescr>),
-}
-
-/// Serializes tests that mutate cpu-global tables (fail-descr registry,
+/// Serializes tests that mutate cpu-global tables (finish singletons,
 /// finish singletons, GC box, label targets). The wasm host never
 /// interleaves those; cargo's parallel unit-test runner does. Held by
 /// every lib test in this crate.
@@ -1233,17 +1161,10 @@ pub fn lock_cpu() -> CpuTestGuard {
 #[cfg(test)]
 fn reset_cpu_for_tests() {
     {
-        // Registry first, then `FINISH_EXITS` — same order as
-        // `reserve_finish_exit_block` / `attach_finish_descr`.
-        let mut reg = FAIL_DESCR_REGISTRY.lock();
-        *reg = None;
         let mut exits = FINISH_EXITS.lock();
         *exits = [None, None, None, None, None];
     }
     *LABEL_TARGETS.lock() = None;
-    *CALL_ASSEMBLER_TARGETS.lock() = None;
-    *WASM_CA_DISPATCH.lock() = None;
-    *CA_GNF2_COMPILED_PTRS.lock() = None;
     crate::gc_box::clear();
     majit_gc::shadow_stack::clear();
     crate::clear_pending_inlines_for_tests();
@@ -1266,82 +1187,6 @@ impl Drop for CpuTestCleanup {
 pub struct CpuTestGuard {
     _cleanup: CpuTestCleanup,
     _lock: parking_lot::MutexGuard<'static, ()>,
-}
-
-/// Global `frame[0]` fail-index space.
-///
-/// Cross-trace chaining (`LABEL_TARGETS`) means the module that last wrote
-/// `frame[0]` is not necessarily the loop `execute_token` entered: a bridge's
-/// terminal JUMP may tail-call a SIBLING loop, whose guards then write THEIR
-/// exit indices. Per-loop index spaces would make those writes ambiguous at
-/// the host — resolving `frame[0]` against the entry loop's own `fail_descrs`
-/// picks a wrong descr (wrong arg types/resume ⇒ type confusion). So every
-/// compile (`compile_loop` and `compile_bridge`) allocates its exits from this
-/// one global space: it reserves as many positions as it has exits and passes
-/// the first as codegen's `fail_index_base`, guards write `base + local` into
-/// `frame[0]`, and the registered descrs fill exactly those reserved positions — any `frame[0]`
-/// then resolves here regardless of which chained module wrote it. The
-/// per-guard bridge-cell epilogue keeps its local indexing by subtracting the
-/// owning module's base (`codegen`'s cell lookup).
-///
-/// Entries are never removed: a dropped loop's modules are unreachable (its
-/// label targets are retracted and its token is gone), so its entries are just
-/// retained memory. A compile that reserves its range and then fails leaves
-/// its slots `Reserved` for good, so the bound is the number of exits
-/// compilation was *attempted* for, not the number that reached a module.
-static FAIL_DESCR_REGISTRY: parking_lot::Mutex<Option<Vec<FailDescrSlot>>> =
-    parking_lot::Mutex::new(None);
-
-/// Atomically reserve `count` global fail indices and return the first one.
-/// Pass that base to `codegen::build_wasm_module`, then fill the reserved
-/// slots with `register_fail_descrs`. Reserving the range under this lock keeps
-/// native parallel compiles and tests from receiving the same base; the wasm
-/// host remains single-threaded, but the backend is also exercised natively.
-pub fn reserve_fail_descrs(count: usize) -> u32 {
-    let mut reg = FAIL_DESCR_REGISTRY.lock();
-    let vec = reg.get_or_insert_with(Default::default);
-    reserve_finish_exit_block(vec);
-    let base = vec.len() as u32;
-    vec.resize_with(vec.len() + count, || FailDescrSlot::Reserved);
-    base
-}
-
-/// Fill a compile's previously reserved slots. Each descr's `fail_index`
-/// (already base-offset by `build_wasm_module`) names its registry position.
-pub fn register_fail_descrs(descrs: &[Arc<WasmFailDescr>]) {
-    let mut reg = FAIL_DESCR_REGISTRY.lock();
-    let vec = reg.get_or_insert_with(Default::default);
-    reserve_finish_exit_block(vec);
-    for d in descrs {
-        assert!(
-            d.fail_index >= FINISH_EXIT_INDEX_COUNT,
-            "trace fail_index {} collides with the reserved finish block",
-            d.fail_index
-        );
-        let slot = vec
-            .get_mut(d.fail_index as usize)
-            .expect("fail descr registered without reserving its global fail_index");
-        assert!(
-            matches!(slot, FailDescrSlot::Reserved),
-            "global fail_index registered more than once"
-        );
-        *slot = FailDescrSlot::Registered(Arc::clone(d));
-    }
-}
-
-/// Resolve a `frame[0]` value through the global fail-index space.
-pub fn global_fail_descr(fail_index: u32) -> Option<Arc<WasmFailDescr>> {
-    if fail_index < FINISH_EXIT_INDEX_COUNT {
-        return Some(finish_exit(fail_index));
-    }
-    FAIL_DESCR_REGISTRY
-        .lock()
-        .as_ref()
-        .and_then(|v| v.get(fail_index as usize))
-        .and_then(|slot| match slot {
-            FailDescrSlot::Reserved => None,
-            FailDescrSlot::Registered(descr) => Some(Arc::clone(descr)),
-        })
 }
 
 /// Global `label descr identity → LabelTarget` registry (see `LabelTarget`).
@@ -1387,80 +1232,25 @@ pub fn retract_label_target_if_handle(descr_id: usize, func_handle: u32) {
     }
 }
 
-pub(crate) fn write_bridge_cell(base: u32, fail_index: u32, slot: u32) {
-    #[cfg(target_arch = "wasm32")]
-    if base != 0 {
-        let cell = (base as usize + fail_index as usize * 4) as *mut u32;
-        unsafe { core::ptr::write(cell, slot) };
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    let _ = (base, fail_index, slot);
+/// Two guest words a running loop loads on its back-edge.
+/// `generation` at offset 0, `slot` at offset 4.
+#[repr(C)]
+pub struct ResumeEntry {
+    pub generation: std::sync::atomic::AtomicU32,
+    pub slot: std::sync::atomic::AtomicU32,
 }
 
-pub(crate) fn write_bridge_cell_aliases(primary: u32, retained: u32, fail_index: u32, slot: u32) {
-    write_bridge_cell(primary, fail_index, slot);
-    if retained != 0 && retained != primary {
-        write_bridge_cell(retained, fail_index, slot);
-    }
-}
-
-/// Point retired table slots at `wasm_bytes` so a caller that baked
-/// `return_call_indirect(slot)` enters the replacement module.
-/// `assembler.py` `patch_jump_for_descr` rewrites the jump; wasm
-/// modules are immutable, so the slot is the patch site
-/// (`glue::replace_module` also rewrites the reserved wide half).
-pub(crate) fn retarget_slots_to_module(
-    slots: impl IntoIterator<Item = u32>,
-    owner_handle: u32,
-    wasm_bytes: &[u8],
-) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        for slot in slots {
-            if slot != 0 && slot != owner_handle {
-                let _ = crate::glue::replace_module(slot, wasm_bytes);
-            }
+impl ResumeEntry {
+    pub fn new() -> Self {
+        Self {
+            generation: std::sync::atomic::AtomicU32::new(1),
+            slot: std::sync::atomic::AtomicU32::new(0),
         }
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (slots, owner_handle, wasm_bytes);
-    }
-}
 
-/// Guard-dispatch metadata of a bridge chained onto a loop, kept on the
-/// source loop's `CompiledWasmLoop.chained_trace_meta` keyed by the bridge's
-/// backend `trace_id`. Lets `compile_bridge` chain a NESTED sub-bridge onto a
-/// guard that lives inside an already-chained bridge: the failing guard's
-/// meta descr carries `(trace_id, per-trace fail_index)`, and this record
-/// supplies the owning bridge's cell array and livelock advance flags — the
-/// same data `CompiledWasmLoop` holds for the loop's own guards.
-pub struct ChainedTraceMeta {
-    /// Base address of the bridge's per-guard bridge-slot cell array
-    /// (`CompiledWasmLoop::bridge_cells_base` analog); `0` = no dispatch.
-    pub cells_base: u32,
-    /// Cell array baked into a retained standalone copy of this bridge
-    /// after it was inlined. `reemit_loop` points `cells_base` at the
-    /// merged-region slice; inbound JUMPs still run the old module, which
-    /// reads this alias. `0` = no retained copy.
-    pub retained_cells_base: u32,
-    /// Cell count = the bridge's own guard count.
-    pub num_cells: usize,
-    /// Per-guard, per-fail-arg induction-advance flags
-    /// (`CompiledWasmLoop::guard_fail_arg_advanced` analog).
-    pub guard_fail_arg_advanced: Vec<Vec<bool>>,
-    /// Number of values each guard transfers to a bridge.  A parameter entry
-    /// is admitted only when this agrees with the bridge's input list.
-    pub guard_fail_arg_counts: Vec<usize>,
-    /// Whether this trace's guard epilogue has typed parameter dispatch arms.
-    pub bridge_param_dispatch: bool,
-    /// Ordinary Ref homes this bridge published. After the bridge is
-    /// inlined, this is the merged stream's extent — `RefHomes::collect`
-    /// reassigns across that stream, so the standalone count is too short.
-    /// A nested sub-bridge floors its map to this.
-    pub num_ref_homes: usize,
-    /// LABEL-capture homes this bridge published.
-    pub used_label_homes: usize,
+    pub fn addr(&self) -> u32 {
+        self as *const Self as usize as u32
+    }
 }
 
 /// Compiled wasm loop metadata, stored in `JitCellToken.compiled`.
@@ -1475,6 +1265,10 @@ pub struct CompiledWasmLoop {
     /// execution: an invalidated trace that never reaches `execute_token`
     /// must not pay the host Wasmtime compilation cost.
     pub(crate) func_handle: Cell<u32>,
+    /// `{generation, slot}` the running loop loads on each back-edge.
+    /// The allocation stays put across in-place re-emission; the module
+    /// bakes its address. `slot` is the table index `replace_module` keeps.
+    pub(crate) resume_entry: Box<ResumeEntry>,
     /// Encoded module retained until lazy host materialization.  This is
     /// backend assembler state, not metainterpreter state: the optimized trace
     /// and all per-token descriptors have already been installed exactly as
@@ -1491,10 +1285,9 @@ pub struct CompiledWasmLoop {
     /// This loop's own guard/finish exit descriptors (positions `[0,
     /// num_guard_cells)`, per-trace order), followed by the descr slices of
     /// every chained bridge `compile_bridge` appended (positional bookkeeping
-    /// for `bridge_descr_ranges` — layouts and jitcounter hashes). `frame[0]`
-    /// exit resolution does NOT index this vec: exit indices live in the
-    /// GLOBAL fail-index space (`register_fail_descrs`), because a cross-trace
-    /// chain can exit through a sibling loop's guard. `RefCell` because the
+    /// for `bridge_descr_ranges` — layouts and jitcounter hashes). An exit
+    /// resolves through `jf_descr` (the cell), not by indexing this vec.
+    /// `RefCell` because the
     /// append happens through the shared `&JitCellToken` the bridge attaches
     /// to; the wasm host is single-threaded so no cross-thread access occurs.
     pub fail_descrs: RefCell<Vec<Arc<WasmFailDescr>>>,
@@ -1579,27 +1372,6 @@ pub struct CompiledWasmLoop {
     /// Recorded in lockstep with the `extend`, inside the same `borrow_mut`
     /// critical section.
     pub bridge_descr_ranges: RefCell<Vec<(u64, u32, usize, usize)>>,
-    /// Guard-dispatch metadata of every bridge chained onto this loop, keyed
-    /// by the bridge's backend `trace_id` (see [`ChainedTraceMeta`]). Lets a
-    /// guard INSIDE a chained bridge chain its own nested sub-bridge.
-    pub chained_trace_meta: RefCell<std::collections::HashMap<u64, ChainedTraceMeta>>,
-    /// Owns this loop's current cell array and every bridge cell array chained
-    /// onto it. A re-emission retains the old array for an already-running
-    /// module before switching its baked base to a new array.
-    pub _bridge_owned_cells: RefCell<Vec<Box<[u32]>>>,
-    /// Direct-loop guard index to bridge table slot. `patch_jump_for_descr`
-    /// rewrites the guard's own jump to reach a newly attached bridge; a wasm
-    /// module is immutable once compiled, so the branch instead reads a slot
-    /// out of a mutable cell array, and these are the writes a re-emission has
-    /// to replay into its fresh array.
-    pub bridge_slots: RefCell<std::collections::HashMap<u32, u32>>,
-    /// The same, for a guard that lives inside a trace chained onto this loop,
-    /// keyed by `(owning trace_id, per-trace fail index)`. A standalone chained
-    /// bridge keeps its cells in its own module's array, which survives; a
-    /// region merged into this loop does not, because a re-emission reallocates
-    /// the loop array its guards are carved out of. Replayed once the rebuilt
-    /// `chained_trace_meta` names the new bases.
-    pub chained_bridge_slots: RefCell<std::collections::HashMap<(u64, u32), u32>>,
     /// Post-intern module inputs retained for a loop re-emission. Entry
     /// bridges store `None` because they tail-call another loop.
     pub reemit: RefCell<Option<crate::codegen::ModuleBuildInputs>>,
@@ -1607,8 +1379,8 @@ pub struct CompiledWasmLoop {
     pub reemitted: Cell<bool>,
     /// `(descr identity, table slot)` for every label published by a bridge
     /// chained onto this loop. The bridge module lives as long as its source
-    /// loop, so `Drop` and `retract_bridge_label_targets_for_slots` retract
-    /// entries that still name that bridge's slot.
+    /// loop, so `Drop` retracts the entries that still name that bridge's
+    /// slot.
     pub bridge_owned_label_targets: RefCell<Vec<(usize, u32)>>,
     /// Set when `compile_bridge` accepts a self-recursive `CallAssemblerR`
     /// bridge (`PYRE_WASM_CA`) for this loop. While set, `compile_bridge`
@@ -1643,7 +1415,6 @@ impl CompiledWasmLoop {
             return;
         }
         let descrs = self.fail_descrs.borrow();
-        register_fail_descrs(&descrs);
         let meta: Vec<DescrRef> = descrs
             .iter()
             .filter_map(|descr| descr.meta_descr.clone())
@@ -1653,30 +1424,6 @@ impl CompiledWasmLoop {
             .asmmemmgr_gcreftracers
             .lock()
             .push(tracer);
-    }
-
-    /// Retract `LABEL_TARGETS` rows and `bridge_owned_label_targets`
-    /// entries whose table slot is being retired. A frame-entry bridge
-    /// that published a LABEL can still be selected by a later JUMP
-    /// after its guard cell is cleared; that immutable module still
-    /// carries the pre-growth home map.
-    pub(crate) fn retract_bridge_label_targets_for_slots(
-        &self,
-        slots: impl IntoIterator<Item = u32>,
-    ) {
-        let retired: Vec<u32> = slots.into_iter().filter(|&slot| slot != 0).collect();
-        if retired.is_empty() {
-            return;
-        }
-        let owned = self.bridge_owned_label_targets.borrow().clone();
-        for (id, slot) in owned {
-            if retired.contains(&slot) {
-                retract_label_target_if_handle(id, slot);
-            }
-        }
-        self.bridge_owned_label_targets
-            .borrow_mut()
-            .retain(|(_, slot)| !retired.contains(slot));
     }
 
     /// Materialize a lazily-installed root trace.  The wasm host is
@@ -1707,6 +1454,27 @@ impl CompiledWasmLoop {
             }
             self.register_descrs_once();
             self.func_handle.set(handle);
+            if self
+                .resume_entry
+                .slot
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                self.resume_entry
+                    .slot
+                    .store(handle, std::sync::atomic::Ordering::Relaxed);
+            }
+            let mut blocks = self.compiled_loop_token.asmmemmgr_blocks.lock();
+            if let Some(resources) = blocks
+                .last_mut()
+                .and_then(|block| block.downcast_mut::<crate::release::LoopAsmResources>())
+            {
+                resources.table_slots.push(handle);
+            } else {
+                let mut resources = crate::release::LoopAsmResources::default();
+                resources.table_slots.push(handle);
+                blocks.push(Box::new(resources));
+            }
             drop(pending);
             self.pending_wasm_bytes.borrow_mut().take();
             Ok(handle)
@@ -1719,7 +1487,8 @@ impl Drop for CompiledWasmLoop {
         // Remove every token alias still targeting this module, including a
         // redirect source. A source redirected to a newer module survives an
         // old-loop drop because its dispatch `compiled_ptr` no longer matches.
-        remove_call_assembler_targets_for_compiled_ptr(self as *const Self as usize as u32);
+        // Label rows and table slots are owned by `LoopAsmResources` in
+        // `asmmemmgr_blocks`, dropped by `free_loop_and_bridges`.
         // Retract this loop's published label targets so a later bridge
         // cannot chain into a dropped loop's stale table slot. Guarded by
         // `func_handle`: a recompile that re-stamped the same descr onto its

@@ -3,15 +3,14 @@
 /// Generates a wasm module from majit IR ops using `wasm-encoder`.
 /// Generated function signature: `(param $frame_ptr i32) (result i32)`
 ///
-/// Frame layout in shared linear memory:
-///   offset 0:       fail_index (i64)
+/// Frame layout in shared linear memory (items base = `jf_frame`):
+///   offset 0:       dispatch key (i64). The exit descr lives in `jf_descr`.
 ///   offset 8:       slot[0] (i64)
 ///   offset 16:      slot[1] (i64)
 ///   ...
 ///
 /// The residual-call trampoline scratch is stored separately at the static
 /// base returned by `jit_call_area_addr`.
-use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -126,84 +125,34 @@ pub fn materialize_unbound_label_args(inputargs: &[InputArgRc], ops: &mut Vec<Op
 pub const FRAME_SLOT_BASE: u64 = 8;
 const SLOT_SIZE: u64 = 8;
 
-/// `frame[0]` is this backend's `jf_descr`: the u32 exit index a guard failure
-/// stamps on its way out. Two bits above that index carry the force protocol
-/// jitframe.py splits across two fields.
-///
-/// [`FORCE_TAKEN_BIT`] stands in for what `force` then writes into `jf_descr`,
-/// the mark `genop_guard_guard_not_forced` reads with
-/// `CMP [rbp + jf_descr], 0` to turn a force that landed inside the call into a
-/// deopt.
-///
-/// The armed descriptor itself lives in the real JitFrame `jf_force_descr`
-/// header, as it does in PyPy.  In particular GUARD_NOT_FORCED_2 is followed by
-/// FINISH, whose exit-index store overwrites `frame[0]`; putting the arm bit in
-/// that word loses the only descriptor a later virtualizable force can use.
-pub(crate) const FORCE_TAKEN_BIT: i64 = 1 << 32;
-
 /// Scratch i64 locals reserved past the value locals for `emit_umulhi`
 /// (al, ah, bl, bh, mid1).
 const UMULHI_SCRATCH: u32 = 5;
 
-thread_local! {
-    /// Per-table ConstPtr maps: `gc_table_base -> (compile_key -> slot index)`.
-    /// Nursery addresses can be reused after a collection, so two retained
-    /// tables may share a compile-time key. Lookup is scoped to the region
-    /// being emitted.
-    static FAILARG_CONST_TABLE: RefCell<HashMap<u32, HashMap<usize, u32>>> =
-        RefCell::new(HashMap::new());
+/// Compile-time ConstPtr identities of the `GcTable`s this emit owns, in
+/// slot order under each table's `base_addr`.
+///
+/// `GcTable::compile_key` is the address `store_info_on_descr` leaves in the
+/// assembler's constant-pointer table. A later collection forwards the slot;
+/// the key does not change. Lookup is the emitting region's base, so two
+/// tables that reuse one nursery address do not share a slot.
+struct ConstPtrTables {
+    entries: Vec<(u32, Vec<usize>)>,
 }
 
-/// Bind the rewrite's gcref list so a ConstPtr failarg can rematerialize
-/// from the same table `LoadFromGcTable` uses. Empty `gcrefs` clears it.
-pub fn bind_failarg_const_table(gcrefs: &[majit_ir::GcRef], gc_table_base: u32) {
-    FAILARG_CONST_TABLE.with(|cell| {
-        let mut map = cell.borrow_mut();
-        map.clear();
-        if gcrefs.is_empty() {
+impl ConstPtrTables {
+    fn push(&mut self, base: u32, keys: &[usize]) {
+        if keys.is_empty() || self.entries.iter().any(|(b, _)| *b == base) {
             return;
         }
-        let mut inner = HashMap::with_capacity(gcrefs.len());
-        for (i, g) in gcrefs.iter().enumerate() {
-            inner.insert(g.0, i as u32);
-        }
-        map.insert(gc_table_base, inner);
-    });
-}
+        self.entries.push((base, keys.to_vec()));
+    }
 
-/// Merge one interned GC table into the force-arm ConstPtr map.
-///
-/// A later compile (an inline bridge) rebuilds the TLS map. Re-emission
-/// must restore every retained region's table, each under its own
-/// `base_addr`, or a non-null owner ConstPtr falls through to a raw address.
-pub fn extend_failarg_const_table_from_gc_table(table: &majit_gc::GcTable) {
-    FAILARG_CONST_TABLE.with(|cell| {
-        let mut map = cell.borrow_mut();
-        let base = table.base_addr() as u32;
-        let mut inner = HashMap::with_capacity(table.len());
-        for i in 0..table.len() {
-            inner.insert(table.compile_key(i), i as u32);
-        }
-        map.insert(base, inner);
-    });
-}
-
-thread_local! {
-    static FAILARG_LOOKUP_BASE: Cell<u32> = const { Cell::new(0) };
-}
-
-fn set_failarg_lookup_base(base: u32) {
-    FAILARG_LOOKUP_BASE.with(|cell| cell.set(base));
-}
-
-fn lookup_failarg_const(compile_key: usize) -> Option<(u32, u32)> {
-    let table_base = FAILARG_LOOKUP_BASE.with(|cell| cell.get());
-    FAILARG_CONST_TABLE.with(|cell| {
-        cell.borrow()
-            .get(&table_base)
-            .and_then(|inner| inner.get(&compile_key).copied())
-            .map(|index| (table_base, index))
-    })
+    fn slot(&self, base: u32, compile_key: usize) -> Option<(u32, u32)> {
+        let keys = self.entries.iter().find(|(b, _)| *b == base)?.1.as_slice();
+        let index = keys.iter().position(|&key| key == compile_key)? as u32;
+        Some((base, index))
+    }
 }
 
 /// Dense wasm-local assignment for the sparse value-id namespace.
@@ -2071,84 +2020,64 @@ fn emit_wb_helper_call(
 /// Emit a write-barrier check on `base_ref` for a rewriter `CondCallGcWb` /
 /// `CondCallGcWbArray`.
 ///
-/// With the residual type family declared (`residual_type_base`), this is
 /// `_write_barrier_fastpath`: one test of the flag byte, and only a flagged
 /// object enters the body. A `card_index` store then follows
 /// `WriteBarrierSlowPath` — CARDS_SET already armed marks the card inline,
 /// otherwise `jit_remember_young_pointer_from_array` runs and the same test
-/// decides again on its return. Everything else calls `wasm_jit_write_barrier`.
+/// decides again on its return. A field store calls `wasm_jit_write_barrier`.
 ///
-/// Operand-stack-neutral: every push is consumed by a store, the call, or the
-/// result drop.
+/// The `(i64)->i64` residual type is declared for every module that contains
+/// one of these ops (`direct_helper_i64_arity`). Operand-stack-neutral: every
+/// push is consumed by a store, the call, or the result drop.
 #[allow(clippy::too_many_arguments)]
 fn emit_write_barrier(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
-    jit_call_idx: Option<u32>,
     residual_type_base: Option<u32>,
     wb: &WriteBarrierHelpers,
     base_ref: OpRef,
     card_index: Option<OpRef>,
-) {
-    if let Some(base) = residual_type_base {
-        emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
-        sink.i32_const(wb.flag_mask(card_index.is_some()));
-        sink.i32_and();
-        sink.if_(BlockType::Empty);
-        match card_index {
-            Some(index) => {
-                emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
-                sink.i32_const(i32::from(wb.cards_set));
-                sink.i32_and();
-                sink.if_(BlockType::Empty);
-                emit_inline_card_mark(sink, constants, value_types, wb, base_ref, index);
-                sink.else_();
-                emit_wb_helper_call(
-                    sink,
-                    constants,
-                    value_types,
-                    base,
-                    wb.array_fn_ptr,
-                    base_ref,
-                );
-                emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
-                sink.i32_const(i32::from(wb.cards_set));
-                sink.i32_and();
-                sink.if_(BlockType::Empty);
-                emit_inline_card_mark(sink, constants, value_types, wb, base_ref, index);
-                sink.end();
-                sink.end();
-            }
-            None => {
-                emit_wb_helper_call(sink, constants, value_types, base, wb.fn_ptr, base_ref);
-            }
-        }
-        sink.end();
-        return;
-    }
-    // Host-trampoline fallback: the call area carries the base and nothing
-    // else, so this arm always takes the plain barrier, which is
-    // `gen_write_barrier_array`'s own fall-back case. The helper re-checks the
-    // flag itself.
-    let Some(jit_call) = jit_call_idx else {
-        return;
+) -> Result<(), BackendError> {
+    let Some(base) = residual_type_base else {
+        return Err(BackendError::Unsupported(
+            "wasm codegen: write barrier has no residual call type".into(),
+        ));
     };
-    // func_ptr = wasm_jit_write_barrier
-    emit_call_area_addr(sink);
-    sink.i64_const(wb.fn_ptr);
-    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
-    // num_args = 1 (the trampoline reflects arity from the wasm signature;
-    // written for protocol symmetry with the alloc/call paths)
-    emit_call_area_addr(sink);
-    sink.i64_const(1);
-    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
-    // arg0 = base object pointer
-    emit_call_area_addr(sink);
-    emit_resolve(sink, constants, value_types, base_ref);
-    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
-    // call trampoline; void result ignored
-    emit_jit_call(sink, jit_call);
+    emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
+    sink.i32_const(wb.flag_mask(card_index.is_some()));
+    sink.i32_and();
+    sink.if_(BlockType::Empty);
+    match card_index {
+        Some(index) => {
+            emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
+            sink.i32_const(i32::from(wb.cards_set));
+            sink.i32_and();
+            sink.if_(BlockType::Empty);
+            emit_inline_card_mark(sink, constants, value_types, wb, base_ref, index);
+            sink.else_();
+            emit_wb_helper_call(
+                sink,
+                constants,
+                value_types,
+                base,
+                wb.array_fn_ptr,
+                base_ref,
+            );
+            emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
+            sink.i32_const(i32::from(wb.cards_set));
+            sink.i32_and();
+            sink.if_(BlockType::Empty);
+            emit_inline_card_mark(sink, constants, value_types, wb, base_ref, index);
+            sink.end();
+            sink.end();
+        }
+        None => {
+            emit_wb_helper_call(sink, constants, value_types, base, wb.fn_ptr, base_ref);
+        }
+    }
+    sink.end();
+    Ok(())
 }
 
 /// Publish Ref-home writes made since the preceding safepoint.  A live old
@@ -2157,13 +2086,14 @@ fn emit_write_barrier(
 /// later home store can survive the next collection.
 fn emit_jitframe_write_barrier(
     sink: &mut PeepSink<'_, '_>,
-    jit_call_idx: Option<u32>,
     residual_type_base: Option<u32>,
     wb: &WriteBarrierHelpers,
-) {
-    if residual_type_base.is_none() && jit_call_idx.is_none() {
-        return;
-    }
+) -> Result<(), BackendError> {
+    let Some(base) = residual_type_base else {
+        return Err(BackendError::Unsupported(
+            "wasm codegen: jitframe write barrier has no residual call type".into(),
+        ));
+    };
     // aarch64/assembler.py _reload_frame_if_necessary invokes
     // _write_barrier_fastpath(is_frame=True): frames never use card marking.
     // Off-GC frames reserve a zeroed header too (alloc_off_gc_jitframe), so
@@ -2177,34 +2107,15 @@ fn emit_jitframe_write_barrier(
     sink.i32_const(i32::from(wb.if_flag));
     sink.i32_and();
     sink.if_(BlockType::Empty);
-    if let Some(base) = residual_type_base {
-        sink.local_get(0);
-        sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
-        sink.i32_sub();
-        sink.i64_extend_i32_u();
-        sink.i32_const(wb.fn_ptr as i32);
-        sink.call_indirect(0, base + 1);
-        sink.drop();
-        sink.end();
-        return;
-    }
-    let Some(jit_call) = jit_call_idx else {
-        return;
-    };
-    emit_call_area_addr(sink);
-    sink.i64_const(wb.fn_ptr);
-    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
-    emit_call_area_addr(sink);
-    sink.i64_const(1);
-    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
-    emit_call_area_addr(sink);
     sink.local_get(0);
     sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
     sink.i32_sub();
     sink.i64_extend_i32_u();
-    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
-    emit_jit_call(sink, jit_call);
+    sink.i32_const(wb.fn_ptr as i32);
+    sink.call_indirect(0, base + 1);
+    sink.drop();
     sink.end();
+    Ok(())
 }
 
 /// Date a use at `at` unless it is an owner-defined value leaking into an
@@ -2402,15 +2313,6 @@ fn collecting_call_positions(ops: &[Op], include_ca_collects: bool) -> Vec<usize
         .collect()
 }
 
-/// Reload the live Ref locals from their home slots after a collecting call
-/// at op index `at_op`, optionally skipping one value id (`skip_raw` — the
-/// freshly-allocated result, whose home is not yet written). The collection
-/// forwarded the home slots (registered as GC roots), so reloading the
-/// locals makes object movement transparent to the trace. Only values live
-/// across `at_op` ([`HomeLiveness::live_across`]) are reloaded: a value not
-/// yet defined has a null home and its local is written at its def, and a
-/// value never read after `at_op` has no consumer for the reload — the
-/// native regalloc likewise reloads a spilled box only on its next use.
 /// Null-initialise the home slots of `range` that `wanted` selects.
 ///
 /// The slots are adjacent 8-byte words, so a run of them is a memset: one
@@ -2819,212 +2721,117 @@ fn emit_ca_reload_caller(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
     sink.i32_add();
 }
 
-/// x86 `malloc_cond_varsize_frame` for a CA callee JitFrame, then the
-/// `jitframe_allocate` stores + `_call_header_shadowstack` push.
+/// `_call_header_shadowstack` (`assembler.py`). `ca_cfp_local` holds the
+/// object base returned by `CallMallocNurseryVarsizeFrame`.
 ///
-/// rewrite.py `gen_malloc_nursery_varsize_frame` emits
-/// `CALL_MALLOC_NURSERY_VARSIZE_FRAME`; the backend inlines the nursery
-/// bump (`assembler.py malloc_cond_varsize_frame`) and only calls the
-/// collecting helper on overflow. The wasm CA arm used to call
-/// `wasm_jit_ca_alloc_frame` on every recursion; that is the helper
-/// body, not the fast path, and it is what bound `fib_recursive`.
+/// The two stores run in the guest when `jf_top` / `jf_limit` are published.
+/// A full shadow stack, or a build that did not publish those cells, calls
+/// `wasm_jit_ca_push_frame`: the stack then lives in host TLS.
+/// Zero the callee's reserved Ref-home region before the frame is a root.
 ///
-/// Size is loaded from the dispatch entry so a later
-/// `redirect_call_assembler` depth increase is honoured. A total that
-/// meets `large_threshold`, or a full shadow stack, takes the helper.
-fn emit_ca_malloc_cond_varsize_frame(
+/// `build_home_gcmap` marks only the used prefix and the LABEL tail, but a
+/// redirect widens that set up to `home_slots` without reallocating the
+/// frame. Slots past the homes are not in the map. A zero-length region
+/// emits nothing.
+fn emit_clear_reserved_homes(
     sink: &mut PeepSink<'_, '_>,
-    inline: CaInlineParams,
-    residual_type_base: u32,
-    ca_alloc_fn_ptr: i64,
-    ca_target_local: u32,
-    alloc_scratch_local: u32,
-    alloc_size_local: u32,
+    object_local: u32,
+    target_local: u32,
+    scratch: u32,
 ) {
-    use majit_backend::jitframe::{
-        JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_INFO_OFS, JF_FRAME_OFS,
-        JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JITFRAME_FIXED_SIZE, SIZEOFSIGNED,
-    };
-    let word = SIZEOFSIGNED as i32;
-    let ss_word = std::mem::size_of::<usize>() as i32;
-    let hdr = GcHeader::SIZE as i32;
-    let min_obj = GcHeader::MIN_NURSERY_OBJ_SIZE as i32;
-
-    // frame_bytes → aligned nursery total into `alloc_size_local`.
-    // `JitFrame::alloc_size(depth)` = FIXED + WORD*(1+depth), and
-    // `depth = frame_bytes / WORD`, so payload = FIXED + WORD + frame_bytes.
-    sink.local_get(ca_target_local);
-    sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
-    sink.i32_wrap_i64();
-    sink.i32_const((JITFRAME_FIXED_SIZE + SIZEOFSIGNED) as i32);
-    sink.i32_add();
-    sink.i32_const(hdr);
-    sink.i32_add();
-    sink.local_set(alloc_size_local);
-    sink.i32_const(min_obj);
-    sink.local_get(alloc_size_local);
-    sink.i32_gt_u();
-    sink.if_(BlockType::Empty);
-    sink.i32_const(min_obj);
-    sink.local_set(alloc_size_local);
-    sink.end();
-    sink.local_get(alloc_size_local);
-    sink.i32_const(7);
-    sink.i32_add();
-    sink.i32_const(!7i32);
-    sink.i32_and();
-    sink.local_set(alloc_size_local);
-
-    // Overflow if total >= large_threshold, new_free > nursery_top, or
-    // the shadow stack cannot take one more `[is_minor, jf]` pair.
-    sink.i32_const(inline.large_threshold as i32);
-    sink.local_get(alloc_size_local);
-    sink.i32_gt_u();
+    use crate::failguard::{WASM_CA_TARGET_HOME_SLOT_BASE_OFS, WASM_CA_TARGET_HOME_SLOTS_OFS};
+    sink.local_get(target_local);
+    sink.i32_load(mem32(WASM_CA_TARGET_HOME_SLOTS_OFS));
+    sink.i32_const(3);
+    sink.i32_shl();
+    sink.local_tee(scratch);
     sink.i32_eqz();
-    sink.i32_const(inline.nursery_free_addr as i32);
-    sink.i32_load(mem32(0));
-    sink.local_tee(alloc_scratch_local);
-    sink.local_get(alloc_size_local);
-    sink.i32_add();
-    sink.i32_const(inline.nursery_top_addr as i32);
-    sink.i32_load(mem32(0));
-    sink.i32_gt_u();
-    sink.i32_or();
-    sink.i32_const(inline.jf_top_addr as i32);
-    sink.i32_load(mem32(0));
-    sink.i32_const(2 * ss_word);
-    sink.i32_add();
-    sink.i32_const(inline.jf_limit_addr as i32);
-    sink.i32_load(mem32(0));
-    sink.i32_gt_u();
-    sink.i32_or();
-    sink.if_(BlockType::Result(ValType::I64));
-    sink.local_get(ca_target_local);
-    sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
-    sink.local_get(ca_target_local);
-    sink.i64_load(mem64(crate::failguard::WASM_CA_TARGET_GCMAP_PTR_OFS));
-    sink.i32_const(ca_alloc_fn_ptr as i32);
-    sink.call_indirect(0, residual_type_base + 2);
-    // The helper may have collected. Reload the caller ITEMS into local 0
-    // only when a callee frame was actually pushed so the bump path can
-    // leave local 0 untouched. A zero return is OOM and does not push;
-    // reloading `top[-3 * WORD]` then would read before the outermost
-    // CA entry, before the later memory-error check can run.
-    sink.i32_wrap_i64();
-    sink.local_tee(alloc_scratch_local);
     sink.if_(BlockType::Empty);
-    emit_ca_reload_caller(sink, inline.jf_top_addr);
-    sink.local_set(0);
-    sink.end();
-    sink.local_get(alloc_scratch_local);
-    sink.i64_extend_i32_u();
     sink.else_();
-    // Commit the bump. Result is the payload pointer (`free + HDR`).
-    sink.i32_const(inline.nursery_free_addr as i32);
-    sink.local_get(alloc_scratch_local);
-    sink.local_get(alloc_size_local);
+    sink.local_get(object_local);
+    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
     sink.i32_add();
-    sink.i32_store(mem32(0));
-    sink.local_get(alloc_scratch_local);
-    sink.i64_const(i64::from(inline.jitframe_tid));
-    sink.i64_store(mem64(0));
-    sink.local_get(alloc_scratch_local);
-    sink.i32_const(hdr);
+    sink.local_get(target_local);
+    sink.i32_load(mem32(WASM_CA_TARGET_HOME_SLOT_BASE_OFS));
     sink.i32_add();
-    sink.local_set(alloc_scratch_local);
-    // Recycled nursery bytes do not start null. `JitFrame::init` and
-    // `wasm_jit_ca_alloc_frame` write a null `jf_frame_info`; PyPy's
-    // `handle_call_assembler` then stores `llfi`. This path has no
-    // frame-info pointer on the dispatch entry, so write null.
-    sink.local_get(alloc_scratch_local);
-    sink.i64_const(0);
-    emit_word_store(sink, JF_FRAME_INFO_OFS as u64);
-    // rewrite.py `gen_malloc_frame`: zero the GCREF fields because of
-    // the unusual malloc pattern.
-    for ofs in [
-        JF_SAVEDATA_OFS,
-        JF_FORCE_DESCR_OFS,
-        JF_DESCR_OFS,
-        JF_GUARD_EXC_OFS,
-        JF_FORWARD_OFS,
-    ] {
-        sink.local_get(alloc_scratch_local);
-        sink.i64_const(0);
-        emit_word_store(sink, ofs as u64);
-    }
-    // rewrite.rs after `gen_malloc_nursery_varsize_frame`: write
-    // `jf_frame` length. Leave `jf_gcmap` null — assembler.py publishes
-    // the map at safepoints once homes are live. The callee entry stores
-    // `home_gcmap_ptr` after its home/input stores.
-    sink.local_get(alloc_scratch_local);
-    sink.local_get(ca_target_local);
-    sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
-    sink.i32_wrap_i64();
-    sink.i32_const(word.trailing_zeros() as i32);
-    sink.i32_shr_u();
-    sink.i64_extend_i32_u();
-    emit_word_store(sink, JF_FRAME_OFS as u64);
-    // Leave `jf_gcmap` null. The callee key-0 prologue nulls the homes
-    // `build_home_gcmap` marks and then publishes — the same moment
-    // PyPy's assembler writes `_finish_gcmap` / the live gcmap, once
-    // those slots are valid or null. Filling `ca_frame_bytes` here on
-    // every recursive bump is what made
-    // `recursion_past_unroll_bound_from_loop` 4.9x dynasm.
-    sink.local_get(alloc_scratch_local);
-    sink.i64_const(0);
-    emit_word_store(sink, JF_GCMAP_OFS as u64);
-    // assembler.py `_call_header_shadowstack`: [is_minor=1, jf_ptr], then
-    // advance top by 2*WORD.
-    sink.i32_const(inline.jf_top_addr as i32);
-    sink.i32_load(mem32(0));
-    sink.local_tee(alloc_size_local);
-    if ss_word == 4 {
-        sink.i32_const(1);
-        sink.i32_store(mem32(0));
-        sink.local_get(alloc_size_local);
-        sink.local_get(alloc_scratch_local);
-        sink.i32_store(memarg(ss_word as u64, 2));
-    } else {
-        sink.i64_const(1);
-        sink.i64_store(mem64(0));
-        sink.local_get(alloc_size_local);
-        sink.local_get(alloc_scratch_local);
-        sink.i64_extend_i32_u();
-        sink.i64_store(memarg(ss_word as u64, 3));
-    }
-    sink.i32_const(inline.jf_top_addr as i32);
-    sink.local_get(alloc_size_local);
-    sink.i32_const(2 * ss_word);
-    sink.i32_add();
-    sink.i32_store(mem32(0));
-    sink.local_get(alloc_scratch_local);
-    sink.i64_extend_i32_u();
+    sink.i32_const(0);
+    sink.local_get(scratch);
+    sink.memory_fill(0);
     sink.end();
 }
 
-/// Reload the Ref operands which the CA arm resolves only after its collecting
-/// callee-frame allocation. Unlike ordinary post-call reloads, these are live
-/// *at* the CALL_ASSEMBLER op, not after it.
-fn emit_reload_ca_input_refs_from_homes(
+fn emit_ca_push_frame(
     sink: &mut PeepSink<'_, '_>,
-    value_types: &ValueLocals,
-    ref_homes: &RefHomes,
-    ref_values: &RefValues,
-    op: &Op,
-    frame: FrameGeometry,
-) {
-    for arg in op.getarglist() {
-        let arg = arg.to_opref();
-        if !ref_values.contains(arg) {
-            continue;
-        }
-        let Some(home) = ref_homes.home(arg) else {
-            continue;
+    inline: Option<&CaInlineParams>,
+    residual_type_base: Option<u32>,
+    ca_push_fn_ptr: i64,
+    jit_call_idx: Option<u32>,
+    ca_cfp_local: u32,
+    alloc_scratch_local: u32,
+) -> Result<(), BackendError> {
+    if let Some(inline) = inline {
+        let ss_word = std::mem::size_of::<usize>() as i32;
+        sink.i32_const(inline.jf_top_addr as i32);
+        sink.i32_load(mem32(0));
+        sink.local_tee(alloc_scratch_local);
+        sink.i32_const(2 * ss_word);
+        sink.i32_add();
+        sink.i32_const(inline.jf_limit_addr as i32);
+        sink.i32_load(mem32(0));
+        sink.i32_gt_u();
+        sink.if_(BlockType::Empty);
+        let Some(base) = residual_type_base else {
+            return Err(BackendError::Unsupported(
+                "wasm codegen: CALL_ASSEMBLER shadow-stack overflow needs a push helper type"
+                    .into(),
+            ));
         };
-        sink.local_get(0);
-        sink.i64_load(mem64(frame.home_slot_base + home as u64 * SLOT_SIZE));
-        sink.local_set(value_types.local(arg.raw()));
+        sink.local_get(ca_cfp_local);
+        sink.i64_extend_i32_u();
+        sink.i32_const(ca_push_fn_ptr as i32);
+        sink.call_indirect(0, base + 1);
+        sink.drop();
+        sink.else_();
+        sink.local_get(alloc_scratch_local);
+        sink.i64_const(1);
+        emit_word_store(sink, 0);
+        sink.local_get(alloc_scratch_local);
+        sink.local_get(ca_cfp_local);
+        sink.i64_extend_i32_u();
+        emit_word_store(sink, ss_word as u64);
+        sink.i32_const(inline.jf_top_addr as i32);
+        sink.local_get(alloc_scratch_local);
+        sink.i32_const(2 * ss_word);
+        sink.i32_add();
+        sink.i32_store(mem32(0));
+        sink.end();
+        return Ok(());
     }
+    if let Some(base) = residual_type_base {
+        sink.local_get(ca_cfp_local);
+        sink.i64_extend_i32_u();
+        sink.i32_const(ca_push_fn_ptr as i32);
+        sink.call_indirect(0, base + 1);
+        sink.drop();
+        return Ok(());
+    }
+    let jit_call = jit_call_idx.ok_or_else(|| {
+        BackendError::Unsupported(
+            "wasm codegen: CALL_ASSEMBLER needs jit_call to push the frame".into(),
+        )
+    })?;
+    emit_call_area_addr(sink);
+    sink.i64_const(ca_push_fn_ptr);
+    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
+    emit_call_area_addr(sink);
+    sink.i64_const(1);
+    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
+    emit_call_area_addr(sink);
+    sink.local_get(ca_cfp_local);
+    sink.i64_extend_i32_u();
+    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
+    emit_jit_call(sink, jit_call);
+    Ok(())
 }
 
 /// Information about a guard exit collected during pre-scan.
@@ -3104,11 +2911,20 @@ pub struct GuardExit {
     /// `assembler._finish_gcmap`; it must not be reconstructed from runtime
     /// fail-argument words after FINISH.
     pub force_ref_home_indices: Vec<u32>,
+    /// `GUARD_NOT_FORCED_2`: this guard's homes are `assembler._finish_gcmap`.
+    pub publishes_finish_gcmap: bool,
+    /// Cell address the exit stores in `jf_descr`. Filled before emit.
+    pub descr_cell: usize,
+    /// Compile-time map the exit stores in `jf_gcmap`. `0` stores a null map.
+    pub exit_gcmap_ptr: usize,
     /// The GUARD_VALUE operand this exit parks in the trace's counter slot,
     /// for `make_a_counter_per_value`. `None` when the guard is not a
     /// GUARD_VALUE, or when its operand is already one of the fail arguments
     /// and so already has a slot. See `counter_value_spill`.
     pub counter_value_spill: Option<OpRef>,
+    /// Guest address of this guard's bridge-target cell. `0` when the
+    /// module has no bridge dispatch. Stamped onto `adr_jump_offset`.
+    pub bridge_cell: u32,
     /// `op.descr` snapshot — passed through to `WasmFailDescr.meta_descr`
     /// so `get_latest_descr_arc` can return the canonical metainterp Arc
     /// (parity with dynasm/cranelift's `meta_descr` forwarding).
@@ -3154,87 +2970,6 @@ pub struct GuardGcTypeInfo {
     /// looked up by constant classptr. Empty when
     /// `supports_guard_gc_type == false`.
     pub subclass_ranges: HashMap<i64, (i64, i64)>,
-}
-
-// Whether an eligible residual CALL may be lowered to a direct in-module
-// `call_indirect` into the callee's `__indirect_function_table` slot, instead
-// of routing through the `jit_call` host trampoline (guest→host→guest
-// reflection + arg marshalling).
-//
-// The lowering takes the callee's wasm type from the IR alone: word-typed
-// arguments and result become `(i64×n) -> i64`, so the static type is fixed by
-// the arity. That is a claim about the embedding language's residual helpers,
-// and one the IR cannot check — a helper declared to take a pointer has an
-// `i32` parameter on wasm32, and `call_indirect` type-checks its callee on
-// every call, so a call lowered this way traps instead of reaching a helper
-// whose real signature is narrower.
-//
-// `ResidualCallAbi` is how an embedder says which of the two it is.
-//
-// Read once per emitted call, so it must be set before the first compile
-// on this thread. Per thread for the same reason
-// `FAITHFUL_RESIDUAL_CALL_ADDRS` is: a wasm32 module is one thread, and a
-// process-global value lets a test that selects `Vouched` change a sibling
-// test that is compiling under the default `Word` ABI.
-thread_local! {
-    static RESIDUAL_CALL_ABI: Cell<u8> = const { Cell::new(0) };
-}
-
-/// How faithfully a residual callee's call descr describes its real wasm
-/// signature.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ResidualCallAbi {
-    /// Every callee reachable as a residual is spelled with word-sized `i64`
-    /// parameters and result and casts at its own boundary, so a descr's word
-    /// type *is* the callee's wasm type. Any word-typed residual then lowers
-    /// to a direct in-module `call_indirect`. The default.
-    Word,
-    /// Only the callees named by [`crate::set_faithful_residual_call_addrs`]
-    /// are known to be spelled that way. Every other residual keeps the host
-    /// trampoline, which reads the callee's declared type before calling it:
-    /// slower, but correct for a callee spelled with a pointer parameter,
-    /// which is narrower than a word on wasm32. Vouching for too few callees
-    /// costs speed; vouching for one whose parameters are not all words costs
-    /// a trap, so the safe direction is to add them one at a time.
-    Vouched,
-}
-
-/// Declare which [`ResidualCallAbi`] this embedder's residual helpers satisfy.
-pub fn set_residual_call_abi(abi: ResidualCallAbi) {
-    let encoded = match abi {
-        ResidualCallAbi::Word => 0,
-        ResidualCallAbi::Vouched => 1,
-    };
-    RESIDUAL_CALL_ABI.with(|cell| cell.set(encoded));
-}
-
-fn residual_call_abi() -> ResidualCallAbi {
-    match RESIDUAL_CALL_ABI.with(|cell| cell.get()) {
-        0 => ResidualCallAbi::Word,
-        _ => ResidualCallAbi::Vouched,
-    }
-}
-
-/// Whether `op`'s callee may be called with the wasm type its descr's word
-/// types imply, rather than through the reflecting trampoline.
-fn func_sig_val_to_valtype(val: crate::FuncSigVal) -> ValType {
-    match val {
-        crate::FuncSigVal::I32 => ValType::I32,
-        crate::FuncSigVal::I64 => ValType::I64,
-        crate::FuncSigVal::F32 => ValType::F32,
-        crate::FuncSigVal::F64 => ValType::F64,
-    }
-}
-
-fn wasm_sig_to_typed(sig: &crate::WasmSig) -> TypedResidualSig {
-    (
-        sig.params
-            .iter()
-            .copied()
-            .map(func_sig_val_to_valtype)
-            .collect(),
-        sig.result.map(func_sig_val_to_valtype),
-    )
 }
 
 /// Descr-derived wasm type the direct arm would use for this op.
@@ -3297,6 +3032,9 @@ fn expected_direct_wasm_sig_at(
             Type::Void => return None,
         }
     };
+    // A void op's `result_size` is the historical dummy-word bit. When the
+    // table names the callee, its declared result wins (`get_result_size`
+    // cannot see an i32/void split the table already published).
     if is_void_op
         && let Some(addr) = const_funcptr_addr(op, constants, func_arg)
         && let Some(real) = crate::residual_target_sig(addr)
@@ -3323,13 +3061,30 @@ fn const_funcptr_addr(
         .then(|| resolve_const_bits(constants, func_ptr))
 }
 
-/// True when `real` differs from `expected` only by i32 where the descr-derived
-/// type has i64 (Int/Ref on the JIT side). f32 anywhere is not this case.
-fn i32_abi_variance(expected: &TypedResidualSig, real: &TypedResidualSig) -> bool {
-    if expected.0.len() != real.0.len() {
-        return false;
+fn func_sig_val_to_valtype(val: crate::FuncSigVal) -> ValType {
+    match val {
+        crate::FuncSigVal::I32 => ValType::I32,
+        crate::FuncSigVal::I64 => ValType::I64,
+        crate::FuncSigVal::F32 => ValType::F32,
+        crate::FuncSigVal::F64 => ValType::F64,
     }
-    if expected.1.is_some() != real.1.is_some() {
+}
+
+fn wasm_sig_to_typed(sig: &crate::WasmSig) -> TypedResidualSig {
+    (
+        sig.params
+            .iter()
+            .copied()
+            .map(func_sig_val_to_valtype)
+            .collect(),
+        sig.result.map(func_sig_val_to_valtype),
+    )
+}
+
+/// True when `real` differs from `expected` only by i32 where the descr has
+/// i64. f32 is not this case.
+fn i32_abi_variance(expected: &TypedResidualSig, real: &TypedResidualSig) -> bool {
+    if expected.0.len() != real.0.len() || expected.1.is_some() != real.1.is_some() {
         return false;
     }
     if real.0.contains(&ValType::F32) || real.1 == Some(ValType::F32) {
@@ -3349,7 +3104,10 @@ fn i32_abi_variance(expected: &TypedResidualSig, real: &TypedResidualSig) -> boo
     }
 }
 
-/// Emit signature for a direct call, or `None` to keep the trampoline.
+/// `_genop_call` emits `CallDescr.get_arg_types` / `get_result_type` /
+/// `get_result_size`. On wasm the same descr is the type only when the
+/// callee's table entry agrees, or differs solely by i32 for an Int/Ref.
+/// A slot the table does not hold (a host import) keeps `jit_call`.
 fn residual_callee_direct_emit_sig_at(
     op: &Op,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -3360,10 +3118,10 @@ fn residual_callee_direct_emit_sig_at(
         return None;
     };
     if !func_ptr.is_constant() {
-        return match residual_call_abi() {
-            ResidualCallAbi::Word if word_descr_shape(expected) => Some(expected.clone()),
-            _ => None,
-        };
+        // The index is computed. The descr is still the type; a host that
+        // cannot see the table (native tests) emits it. The guest bounces,
+        // because a dynamic index is not known to be a function of this type.
+        return (!cfg!(target_arch = "wasm32")).then(|| expected.clone());
     }
     let addr = resolve_const_bits(constants, func_ptr);
     match crate::residual_target_sig(addr) {
@@ -3380,23 +3138,9 @@ fn residual_callee_direct_emit_sig_at(
                 None
             }
         }
-        None => {
-            let all_float =
-                expected.1 == Some(ValType::F64) && expected.0.iter().all(|t| *t == ValType::F64);
-            if all_float
-                || (residual_call_abi() == ResidualCallAbi::Word && word_descr_shape(expected))
-                || crate::residual_call_descr_is_faithful(addr)
-            {
-                Some(expected.clone())
-            } else {
-                None
-            }
-        }
+        None if cfg!(target_arch = "wasm32") => None,
+        None => Some(expected.clone()),
     }
-}
-
-fn word_descr_shape(expected: &TypedResidualSig) -> bool {
-    expected.0.iter().all(|t| *t == ValType::I64) && matches!(expected.1, Some(ValType::I64) | None)
 }
 
 fn residual_direct_emit_sig(
@@ -3474,7 +3218,7 @@ fn conditional_call_true_void_arity(
 /// If `op` is a residual CALL whose ABI is uniformly i64 (all Int/Ref args and
 /// an Int/Ref result), return its argument count — eligible for a direct
 /// `call_indirect` of type `(i64×n) -> i64`. `None` keeps the `jit_call`
-/// trampoline: void / float / release-GIL / cond / assembler calls, a missing
+/// trampoline: void / float / release-GIL / assembler calls, a missing
 /// call descr, or an arg-count/descr-shape mismatch (defensive).
 ///
 /// This includes `CallMayForce{I,R}` when their ABI is uniformly i64: the force
@@ -3483,8 +3227,8 @@ fn conditional_call_true_void_arity(
 /// which neither lowering touches, so a direct call is sound. `CallReleaseGilI`
 /// is the same ABI with the callee at arg 1 (`direct_call_release_gil`);
 /// wasm32 has no GIL to drop, so the call itself is an ordinary residual.
-/// Float / cond / assembler calls and non-reflectable descrs remain on
-/// the trampoline.
+/// Float / assembler calls and non-reflectable descrs remain on
+/// the trampoline. `COND_CALL` declines instead of using it.
 fn residual_func_ofs(opcode: OpCode) -> usize {
     usize::from(matches!(
         opcode,
@@ -3595,8 +3339,8 @@ fn residual_call_typed_sig(
 /// data region (`emit_force_bracket_before_call` before the call,
 /// `GuardNotForced` after), which neither lowering touches, so a direct call is
 /// sound.
-/// Float / release-GIL / cond / assembler calls and non-reflectable descrs
-/// remain on the trampoline.
+/// Float / release-GIL / assembler calls and non-reflectable descrs
+/// remain on the trampoline. `COND_CALL` declines instead of using it.
 fn residual_call_void_word_arity(
     op: &Op,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -3635,9 +3379,9 @@ fn residual_call_void_word_arity(
 /// True-void counterpart of [`residual_call_void_word_arity`]: an eligible
 /// void residual CALL whose descr records a `()` result (`result_size == 0`).
 /// Int/Ref-only arguments lower through the `(i64×n) -> ()` type family with
-/// no result to drop. Float / release-GIL / cond / assembler calls,
+/// no result to drop. Float / release-GIL / assembler calls,
 /// non-reflectable descrs, and descr/operand arity mismatches remain on the
-/// trampoline.
+/// trampoline. `COND_CALL` declines instead of using it.
 fn residual_call_void_true_arity(
     op: &Op,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -3718,9 +3462,10 @@ fn direct_helper_i64_arity(
 ///
 /// Keep this in lockstep with the individual emission arms below: the uniform
 /// i64, typed float, and true-void residual families, `CallMallocNursery*`,
-/// and write barriers are direct as far as [`RESIDUAL_CALL_ABI`] lets each
-/// one be; non-uniform CALLs, an unvouched callee, and string allocation
-/// retain the trampoline.
+/// and write barriers are direct when the call descr and the callee's table
+/// type agree. A `COND_CALL` whose descr does not establish that signature
+/// declines. A mismatch, a host import, and string allocation retain the
+/// trampoline for ordinary calls.
 fn has_trampoline_calls(
     inputargs: &[InputArgRc],
     ops: &[Op],
@@ -3867,7 +3612,11 @@ fn collect_guards_and_vars(inputargs: &[InputArgRc], ops: &[Op]) -> (Vec<GuardEx
                 fail_arg_types,
                 is_finish: op.opcode == OpCode::Finish,
                 force_ref_home_indices: Vec::new(),
+                publishes_finish_gcmap: false,
+                descr_cell: 0,
+                exit_gcmap_ptr: 0,
                 counter_value_spill,
+                bridge_cell: 0,
                 meta_descr,
             });
             fail_index += 1;
@@ -3991,12 +3740,10 @@ pub struct CaParams {
     /// instead of trapping. `0` (unset) ⇒ no helper, so `compile_bridge` declines
     /// the CA lift before reaching codegen.
     pub deopt_helper_slot: u32,
-    /// `__indirect_function_table` slot (`fn as usize`) of
-    /// `lib.rs::wasm_jit_ca_alloc_frame`, which allocates each callee frame as
-    /// a young nursery GC-managed `JitFrame` (push_jf-rooted, traced by its own
-    /// per-frame gcmap). `call_indirect`ed in-module through the residual
-    /// `(i64,i64)->i64` type when declared, else via the `jit_call` trampoline.
-    pub ca_alloc_fn_ptr: i64,
+    /// `__indirect_function_table` slot of `wasm_jit_ca_push_frame`.
+    /// Used when `jf_top` is not published: the shadow stack is host TLS.
+    /// `(i64)->i64`.
+    pub ca_push_fn_ptr: i64,
     /// `__indirect_function_table` slot of `lib.rs::wasm_jit_ca_pop_frame`,
     /// called on CA-arm exit to pop the callee frame off the jitframe shadow
     /// stack (strict LIFO).
@@ -4045,6 +3792,25 @@ pub struct CaParams {
     /// A compiled bridge with more captures than its source also leaves
     /// this false: it writes those slots on the first crossing.
     pub home_gcmap_null_grown_labels: bool,
+    /// `LoopAsmResources` that owns maps published by this build. `0` leaks
+    /// the map (`allocate_gcmap`'s `Box::into_raw`) for a direct codegen test.
+    pub gcmap_sink: usize,
+    /// Guest address of `[descr_cell, gcmap]` pairs, one pair per guard,
+    /// indexed by `guard_idx - fail_index_base`. `0` in a direct codegen
+    /// test: the exit still loads a pair, from offset 0, so two builds of
+    /// the same trace stay byte-identical. `compile_loop` parks the real
+    /// table on `LoopAsmResources` and passes its address.
+    pub exit_table_base: u32,
+    /// Guest address of this owner's `{generation, slot}` cell. `0` emits
+    /// no back-edge check (codegen tests, host-less compiles). A local JUMP
+    /// loads `generation` the way `GuardNotInvalidated` loads its flag and,
+    /// when the cell is newer than the generation baked into this module,
+    /// tail-calls `slot` with the same jitframe.
+    pub resume_entry_addr: u32,
+    /// Generation this module was compiled as. The running copy redirects
+    /// only when the cell is strictly greater, so a module compiled ahead
+    /// of an unbumped cell does not bounce back to the old slot.
+    pub resume_generation: u32,
 }
 
 /// Per-CALL_ASSEMBLER target dispatch baked into the corresponding wasm arm.
@@ -4359,8 +4125,14 @@ pub struct ModuleBuildInputs {
     pub nursery: Option<NurseryAllocParams>,
     pub invalidated_flag_addr: u32,
     pub gc_table_base: u32,
+    /// `GcTable::compile_key` for each slot at `gc_table_base`, in order.
+    pub gc_const_keys: Vec<usize>,
     pub fail_index_base: u32,
     pub bridge_cells_base: u32,
+    /// Per-guard cell addresses in collect order. A non-zero entry is the
+    /// guard's existing cell; re-emission passes these so the new module
+    /// loads the same cells instead of a fresh array.
+    pub guard_cell_addrs: Vec<u32>,
     /// A bridge reached from an armed guard takes its fail values as `i64`
     /// parameters after the frame pointer. Float bits use the same i64 carrier,
     /// so a single function type per arity covers every failure signature.
@@ -4427,6 +4199,8 @@ pub struct InlinedBridge {
     /// Base of this already-interned region's GC table. Each region retains
     /// its own roots; codegen selects it by the LoadFromGcTable producer.
     pub gc_table_base: u32,
+    /// `GcTable::compile_key` for each slot at `gc_table_base`, in order.
+    pub gc_const_keys: Vec<usize>,
     /// The constant pool registered for this region's own trace. A pool is
     /// per-trace (`Backend::set_constants_pool` names the next compile), and
     /// its value-id keys — the folded values that have no producing op — are
@@ -4512,6 +4286,7 @@ impl Clone for InlinedBridge {
             inputargs: self.inputargs.iter().cloned().collect(),
             ops: self.ops.clone(),
             gc_table_base: self.gc_table_base,
+            gc_const_keys: self.gc_const_keys.clone(),
             constants: self.constants.clone(),
         }
     }
@@ -4532,8 +4307,10 @@ impl Clone for ModuleBuildInputs {
             nursery: self.nursery.clone(),
             invalidated_flag_addr: self.invalidated_flag_addr,
             gc_table_base: self.gc_table_base,
+            gc_const_keys: self.gc_const_keys.clone(),
             fail_index_base: self.fail_index_base,
             bridge_cells_base: self.bridge_cells_base,
+            guard_cell_addrs: self.guard_cell_addrs.clone(),
             bridge_entry_arity: self.bridge_entry_arity,
             bridge_param_dispatch: self.bridge_param_dispatch,
             trace_entry_census: self.trace_entry_census,
@@ -4663,6 +4440,7 @@ fn rebase_region_value_ids(
             inputargs,
             ops,
             gc_table_base: bridge.gc_table_base,
+            gc_const_keys: bridge.gc_const_keys.clone(),
             constants: bridge.constants.clone(),
         },
         width,
@@ -4686,8 +4464,10 @@ pub fn build_wasm_module(
         nursery,
         invalidated_flag_addr,
         gc_table_base,
+        gc_const_keys,
         fail_index_base,
         bridge_cells_base,
+        guard_cell_addrs,
         bridge_entry_arity,
         bridge_param_dispatch,
         trace_entry_census,
@@ -4861,16 +4641,45 @@ pub fn build_wasm_module(
         }
     }
 
-    // Every trace's guard/finish exits draw their indices from ONE global
-    // fail-index space (`failguard::FAIL_DESCR_REGISTRY`): a cross-trace chain
-    // can exit through a sibling loop's guard, so `frame[0]` must be
-    // resolvable without knowing which chained module wrote it.
-    // `build_function` seeds its `guard_idx` counter with this base so each
-    // exit writes `base + local`; mirror that here on the returned
-    // `GuardExit.fail_index`.
-    for g in &mut guards {
-        g.fail_index += fail_index_base;
+    // `fail_index` stays a per-module ordinal for bridge-cell addressing.
+    // The exit names itself by the descr cell in `jf_descr`, so a chained
+    // module does not share an index space. `build_function` seeds
+    // `guard_idx` with this base; mirror that on `GuardExit.fail_index`.
+    for (index, g) in guards.iter_mut().enumerate() {
+        g.fail_index += *fail_index_base;
+        let from_list = guard_cell_addrs
+            .get(index)
+            .copied()
+            .filter(|&addr| addr != 0);
+        let preexisting = g
+            .meta_descr
+            .as_ref()
+            .and_then(|meta| meta.as_fail_descr())
+            .map(|fd| fd.adr_jump_offset())
+            .filter(|&addr| addr != 0);
+        let addr = if let Some(addr) = from_list.or(preexisting.map(|addr| addr as u32)) {
+            addr
+        } else if *bridge_cells_base != 0 {
+            *bridge_cells_base
+                + (g.fail_index - *fail_index_base) * std::mem::size_of::<u32>() as u32
+        } else {
+            0
+        };
+        g.bridge_cell = addr;
+        if addr != 0 && preexisting.is_none() {
+            if let Some(meta) = g.meta_descr.as_ref() {
+                if let Some(fd) = meta.as_fail_descr() {
+                    if !fd.is_finish() {
+                        let stamp = std::panic::AssertUnwindSafe(|| {
+                            fd.set_adr_jump_offset(addr as usize);
+                        });
+                        let _ = std::panic::catch_unwind(stamp);
+                    }
+                }
+            }
+        }
     }
+    let cell_addrs: Vec<u32> = guards.iter().map(|g| g.bridge_cell).collect();
 
     // Inter-trace chaining: a loop trace's guard exits dispatch to a compiled
     // bridge in-module via `call_indirect` through the shared
@@ -4887,7 +4696,7 @@ pub fn build_wasm_module(
     // into its CA bridge, and a BRIDGE's own guards chain nested sub-bridges the
     // same way (a hot guard inside a chained bridge would otherwise round-trip
     // to the host forever). So any guarded trace wants dispatch cells.
-    let bridge_dispatch = *bridge_cells_base != 0;
+    let bridge_dispatch = *bridge_cells_base != 0 || cell_addrs.iter().any(|&addr| addr != 0);
     // All boundary values use an i64 carrier, including raw Float bits. That
     // makes the call type depend only on arity while preserving f64 payloads.
     let bridge_param_arities: Vec<usize> = if *bridge_param_dispatch && bridge_dispatch {
@@ -4973,6 +4782,7 @@ pub fn build_wasm_module(
         if !matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2) {
             continue;
         }
+        guard.publishes_finish_gcmap = op.opcode == OpCode::GuardNotForced2;
         let live = live_fail_arg_extent(guard.meta_descr.as_ref(), guard.fail_arg_refs.len());
         for (&arg, &tp) in guard
             .fail_arg_refs
@@ -4987,6 +4797,36 @@ pub fn build_wasm_module(
                 guard.force_ref_home_indices.push((offset / sign) as u32);
             }
         }
+    }
+    // `generate_quick_failure` stores `guardtok.gcmap` into `jf_gcmap` and
+    // the descr into `jf_descr` before the recovery stub returns. The cell
+    // address is stable for the loop's `LoopAsmResources`. A FINISH after
+    // GUARD_NOT_FORCED_2 publishes that guard's `_finish_gcmap` (plus the
+    // result Ref when there is one), matching `genop_finish`.
+    let mut pending_finish: Vec<u32> = Vec::new();
+    for guard in guards.iter_mut() {
+        guard.descr_cell = crate::failguard::alloc_exit_cell(ca.gcmap_sink, guard.fail_index);
+        let mut indices = if guard.is_finish {
+            pending_finish.clone()
+        } else {
+            ref_spill_item_indices(guard, sign)
+        };
+        if guard.is_finish && guard.fail_arg_types.first() == Some(&Type::Ref) {
+            if let Some(slot) = physical_fail_slot(guard, 0) {
+                let bit = ((FRAME_SLOT_BASE as usize + slot * 8) / sign) as u32;
+                if !indices.contains(&bit) {
+                    indices.push(bit);
+                }
+            }
+        }
+        if guard.publishes_finish_gcmap {
+            pending_finish.clone_from(&guard.force_ref_home_indices);
+        }
+        guard.exit_gcmap_ptr = if indices.is_empty() {
+            0
+        } else {
+            crate::release::park_gcmap_raw(ca.gcmap_sink, gcmap_for_item_indices(&indices))
+        };
     }
     let shortage = if num_ref_homes > frame.ordinary_home_slots() {
         Some(super::FrameShortage::new(
@@ -5031,7 +4871,7 @@ pub fn build_wasm_module(
     // keeps the tail call area for future bridges.
     let needs_call =
         has_trampoline_calls(&analysis_inputargs, &analysis_ops, constants, ca.emit_ca);
-    // In-module residual calls ([`RESIDUAL_CALL_ABI`]): the largest
+    // In-module residual calls: the largest
     // eligible `(i64×n)->i64` arity in this trace — residual CALLs (word
     // result or word-ABI void) plus the `CallMallocNursery*` / write-barrier
     // helper targets, which share the same uniform-i64 ABI — or `None` if there
@@ -5057,7 +4897,7 @@ pub fn build_wasm_module(
         if ca.emit_ca {
             // The CA arm's frame helpers (`wasm_jit_ca_reload_frame()`,
             // `wasm_jit_ca_pop_frame(frame_base)`, and
-            // `wasm_jit_ca_alloc_frame(frame_bytes, gcmap_ptr)`) lower through
+            // `wasm_jit_ca_push_frame(frame_ptr)`) lower through
             // this same `(i64×n)->i64` family; make sure arity 2 is declared,
             // which declares the full 0..=2 range including reload's arity 0.
             Some(scanned.map_or(2, |m| m.max(2)))
@@ -5080,7 +4920,7 @@ pub fn build_wasm_module(
     } else {
         residual_max_arity
     };
-    // Typed float residual calls use their descr's faithful wasm ABI instead
+    // Typed float residual calls use the descr-derived wasm type instead
     // of the uniform i64 helper family. Preserve first-use order so a given
     // trace gets stable type indices while declaring each signature once.
     let mut typed_residual_sigs = Vec::new();
@@ -5369,11 +5209,13 @@ pub fn build_wasm_module(
         &ref_homes,
         &label_resume,
         *bridge_cells_base,
+        &cell_addrs,
         bridge_dispatch,
         *bridge_entry_arity,
         &bridge_param_type_indices,
         *invalidated_flag_addr,
         *gc_table_base,
+        gc_const_keys,
         &gc_table_bases,
         *fail_index_base,
         *external_jump_slot,
@@ -5513,15 +5355,17 @@ fn build_function(
     alloc: AllocHelpers,
     wb: &WriteBarrierHelpers,
     nursery: Option<&NurseryAllocParams>,
-    ref_values: &RefValues,
+    _ref_values: &RefValues,
     ref_homes: &RefHomes,
     label_resume: &LabelResumeData,
     cells_base: u32,
+    cell_addrs: &[u32],
     bridge_dispatch: bool,
     bridge_entry_arity: Option<usize>,
     bridge_param_type_indices: &indexmap::IndexMap<usize, u32>,
     invalidated_flag_addr: u32,
     gc_table_base: u32,
+    gc_const_keys: &[usize],
     gc_table_bases: &HashMap<u32, u32>,
     fail_index_base: u32,
     external_jump_slot: u32,
@@ -5732,6 +5576,13 @@ fn build_function(
     // arg, so the guard must rematerialize the load — cranelift
     // `resolve_failarg_opref` / `GC_TABLE_VAR_INDEX`.
     let gc_table_slots = gc_table_failarg_slots(ops, constants, gc_table_base, gc_table_bases);
+    let mut const_tables = ConstPtrTables {
+        entries: Vec::new(),
+    };
+    const_tables.push(gc_table_base, gc_const_keys);
+    for bridge in inlined_bridges {
+        const_tables.push(bridge.gc_table_base, &bridge.gc_const_keys);
+    }
     let inline_guards: Vec<InlineGuard<'_>> = inlined_bridges
         .iter()
         .enumerate()
@@ -5751,6 +5602,7 @@ fn build_function(
         .collect();
     let guard_dispatch = BridgeDispatch {
         cells_base,
+        cell_addrs,
         fail_index_base,
         bridge_slot_local,
         enabled: bridge_dispatch,
@@ -5763,7 +5615,10 @@ fn build_function(
         frame,
         counter_slot: counter_slot(entry_inputargs, ops).map(|slot| slot as u64),
         spill_helpers: spill_helper_indices,
+        exit_table_base: ca.exit_table_base,
         gc_table_slots: &gc_table_slots,
+        const_tables: &const_tables,
+        const_table_base: gc_table_base,
     };
     let mut locals = Vec::new();
     let mut start = 0;
@@ -5843,8 +5698,10 @@ fn build_function(
                 |_| true,
             );
         }
-        Box::leak(build_home_gcmap(frame, used_ordinary, used_labels)).as_ptr() as *const usize
-            as usize as i64
+        crate::release::park_gcmap_raw(
+            ca.gcmap_sink,
+            build_home_gcmap(frame, used_ordinary, used_labels),
+        ) as i64
     } else {
         ca.home_gcmap_ptr
     };
@@ -6097,9 +5954,8 @@ fn build_function(
             skip_nursery_tid_store_at = None;
             continue;
         }
-        set_failarg_lookup_base(table_base_by_op[op_idx]);
         if frame_can_escape && ref_homes.len() != 0 && op.opcode.can_malloc() {
-            emit_jitframe_write_barrier(&mut sink, jit_call_idx, residual_type_base, wb);
+            emit_jitframe_write_barrier(&mut sink, residual_type_base, wb)?;
         }
         if op.opcode == OpCode::Label && key_dispatch && labels_passed < num_labels {
             // End of the segment before label j (key-0 / earlier-label path).
@@ -6269,6 +6125,7 @@ fn build_function(
             outside_region_base,
             closed_body_regions: started_body_regions as u32,
             closed_outside_regions: started_outside_regions as u32,
+            const_table_base: table_base_by_op[op_idx],
             ..guard_dispatch
         };
         // The guard whose condition the previous op already pushed and tested.
@@ -6422,6 +6279,45 @@ fn build_function(
             }
 
             OpCode::Jump => {
+                // `patch_jump_for_descr` makes a replacement the next
+                // iteration of the running loop. The module cannot be
+                // rewritten, so the back-edge loads the owner's cell and
+                // tail-calls the slot `replace_module` already swapped.
+                // Address 0 keeps this arm a plain `br` (tests).
+                if ca.resume_entry_addr != 0 {
+                    sink.i32_const(ca.resume_entry_addr as i32);
+                    sink.i32_load(mem32(0));
+                    sink.i32_const(ca.resume_generation as i32);
+                    sink.i32_gt_u();
+                    sink.if_(BlockType::Empty);
+                    let jump_args = op.getarglist();
+                    for (i, jump_arg) in jump_args.iter().enumerate() {
+                        sink.local_get(0);
+                        let opref = jump_arg.to_opref();
+                        if !opref.is_constant() && value_types.ty(opref.raw()) == ValType::F64 {
+                            emit_resolve_f64(&mut sink, constants, value_types, opref);
+                            sink.i64_reinterpret_f64();
+                        } else {
+                            emit_resolve(&mut sink, constants, value_types, opref);
+                        }
+                        sink.i64_store(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
+                    }
+                    // Peeled: key = label ordinal + 1 lands on that LABEL's
+                    // resume loader. Header included. No local label, or a
+                    // non-peeled loop whose entry is the loop, uses key 0.
+                    let dispatch_key = jump_label_ordinal(ops, op)
+                        .filter(|&j| key_dispatch && j < num_labels)
+                        .map(|j| j + 1)
+                        .unwrap_or(0);
+                    sink.local_get(0);
+                    sink.i64_const(dispatch_key as i64);
+                    sink.i64_store(mem64(frame.dispatch_key_ofs));
+                    sink.local_get(0);
+                    sink.i32_const((ca.resume_entry_addr + 4) as i32);
+                    sink.i32_load(mem32(0));
+                    sink.return_call_indirect(0, 0);
+                    sink.end();
+                }
                 // The jump rebinds the loop's label args to the jump args — a
                 // parallel move. A jump arg may read a target local that another
                 // pair overwrites (e.g. the swap `x, y = y, x` → x<-y, y<-x), so
@@ -6802,15 +6698,21 @@ fn build_function(
                 // trace must not run on holding virtualized fields the force has
                 // already written back, and the virtuals `handle_async_forcing`
                 // materialized are attached for THIS exit's resume to consume.
-                // The bit sits in the upper half of `frame[0]`, so on
-                // little-endian wasm32 it is bit 0 of the i32 at frame offset
-                // 4; masking it leaves the `!= 0` the `if` already applies.
-                const FORCE_TAKEN_HALF_OFS: u64 = 4;
-                const _: () = assert!(FORCE_TAKEN_BIT == 1 << 32);
-                sink.local_get(0);
-                sink.i32_load(memarg(FORCE_TAKEN_HALF_OFS, 2));
-                sink.i32_const(1);
-                sink.i32_and();
+                // `exit_table_base == 0` is a direct codegen test whose frame
+                // sits at address 0: the taken bit lives in `frame[0]`. A real
+                // compile compares `jf_descr` (`genop_guard_guard_not_forced`).
+                if guard_dispatch.exit_table_base == 0 {
+                    const FORCE_TAKEN_BIT: i64 = 1 << 32;
+                    const FORCE_TAKEN_HALF_OFS: u64 = 4;
+                    const _: () = assert!(FORCE_TAKEN_BIT == 1 << 32);
+                    sink.local_get(0);
+                    sink.i32_load(memarg(FORCE_TAKEN_HALF_OFS, 2));
+                    sink.i32_const(1);
+                    sink.i32_and();
+                } else {
+                    emit_header_base(&mut sink);
+                    sink.i32_load(memarg(majit_backend::jitframe::JF_DESCR_OFS as u64, 2));
+                }
                 emit_guard_if_exit(
                     &mut sink,
                     constants,
@@ -6838,6 +6740,10 @@ fn build_function(
                     op,
                     exit_index(op, guard_idx),
                     None,
+                    guard_dispatch.const_tables,
+                    guard_dispatch.const_table_base,
+                    guard_dispatch.exit_table_base,
+                    guard_idx.wrapping_sub(guard_dispatch.fail_index_base),
                 );
                 guard_idx += 1;
             }
@@ -7536,12 +7442,11 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
-                    jit_call_idx,
                     residual_type_base,
                     wb,
                     op.arg(0).to_opref(),
                     None,
-                );
+                )?;
             }
             OpCode::CondCallGcWbArray => {
                 // rewrite.py `gen_write_barrier_array`: cards_set == 0
@@ -7552,19 +7457,18 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
-                    jit_call_idx,
                     residual_type_base,
                     wb,
                     op.arg(0).to_opref(),
                     card,
-                );
+                )?;
             }
             OpCode::CondCallN => {
                 // x86/assembler.py `genop_discard_cond_call`: TEST cond; JZ
                 // skip; CALL. The predicate is arg 0, the callee is arg 1, and
-                // the rest are the call's own arguments. A descr-proven word
-                // ABI reaches the shared table directly; only unresolved or
-                // mixed signatures retain the host trampoline.
+                // the rest are the call's own arguments. The call descr's
+                // word or true-void ABI is a direct `call_indirect`. A descr
+                // that does not establish that signature declines the trace.
                 //
                 // `do_conditional_call` asserts the callee forces no virtual or
                 // virtualizable, so unlike the CALL arm this needs no force
@@ -7610,20 +7514,9 @@ fn build_function(
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, base + nargs as u32);
                 } else {
-                    let jit_call =
-                        jit_call_idx.expect("COND_CALL op present but jit_call not imported");
-                    emit_call_area_addr(&mut sink);
-                    emit_resolve(&mut sink, constants, value_types, func);
-                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(call_args.len() as i64);
-                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
-                    for (i, arg) in call_args.iter().enumerate() {
-                        emit_call_area_addr(&mut sink);
-                        emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                        sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
-                    }
-                    emit_jit_call(&mut sink, jit_call);
+                    return Err(BackendError::Unsupported(
+                        "wasm codegen: COND_CALL has no direct residual signature".into(),
+                    ));
                 }
                 // COND_CALL sits inside the CALL opcode range, so a Ref living
                 // across it already owns a home. Only the arm that called can
@@ -7712,28 +7605,9 @@ fn build_function(
                         sink.drop();
                     }
                 } else {
-                    let jit_call =
-                        jit_call_idx.expect("COND_CALL_VALUE op present but jit_call not imported");
-                    emit_call_area_addr(&mut sink);
-                    emit_resolve(&mut sink, constants, value_types, func);
-                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(call_args.len() as i64);
-                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
-                    for (i, arg) in call_args.iter().enumerate() {
-                        emit_call_area_addr(&mut sink);
-                        emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                        sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
-                    }
-                    emit_jit_call(&mut sink, jit_call);
-                    // Int and Ref are the only result types minted here.
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
-                    if has_result {
-                        sink.local_set(value_types.local(vi));
-                    } else {
-                        sink.drop();
-                    }
+                    return Err(BackendError::Unsupported(
+                        "wasm codegen: COND_CALL_VALUE has no direct residual signature".into(),
+                    ));
                 }
                 // Only the arm that called can have collected, so the reload
                 // sits on it rather than after the `if`.
@@ -8058,6 +7932,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.exit_table_base,
                 );
                 // rewrite.py `clear_varsize_gc_fields` FLAG_STR / FLAG_UNICODE:
                 // `emit_setfield(result, 0, descr=hash_descr)`. Both layouts
@@ -8230,6 +8105,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.exit_table_base,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8334,6 +8210,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.exit_table_base,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8521,6 +8398,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.exit_table_base,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8553,7 +8431,7 @@ fn build_function(
                             .into(),
                     ));
                 };
-                let inlined = matches!((nursery, bump_size, payload), (Some(_), Some(_), Some(_)));
+                let inlined = nursery.is_some();
                 if let (Some(na), Some(bump_size), Some(payload)) = (nursery, bump_size, payload) {
                     sink.i32_const(na.free_addr as i32);
                     sink.i32_load(MemArg {
@@ -8614,6 +8492,114 @@ fn build_function(
                     sink.i32_add();
                     sink.i64_extend_i32_u();
                     sink.end();
+                } else if let Some(na) = nursery {
+                    // `jfi_frame_size` is not a rewrite-time constant.
+                    // `malloc_cond_varsize_frame` bumps that runtime total;
+                    // a total at or above `large_threshold` takes the helper
+                    // (`can_use_nursery_malloc`'s exclusive bound).
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i64_const(7);
+                    sink.i64_add();
+                    sink.i64_const(!7i64);
+                    sink.i64_and();
+                    sink.i64_const(na.large_threshold as i64);
+                    sink.i64_ge_u();
+                    sink.if_(BlockType::Result(ValType::I64));
+                    sink.i64_const(0);
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i64_const(7);
+                    sink.i64_add();
+                    sink.i64_const(!7i64);
+                    sink.i64_and();
+                    sink.i64_const(GcHeader::SIZE as i64);
+                    sink.i64_sub();
+                    sink.i32_const(alloc.new_fn_ptr as i32);
+                    sink.call_indirect(0, base + 2);
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                        frame,
+                    );
+                    sink.else_();
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i64_const(7);
+                    sink.i64_add();
+                    sink.i64_const(!7i64);
+                    sink.i64_and();
+                    sink.i32_wrap_i64();
+                    sink.local_set(alloc_size_local);
+                    sink.i32_const(na.free_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.local_tee(alloc_scratch_local);
+                    sink.local_get(alloc_size_local);
+                    sink.i32_add();
+                    sink.i32_const(na.top_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.i32_gt_u();
+                    sink.if_(BlockType::Result(ValType::I64));
+                    sink.i64_const(0);
+                    sink.local_get(alloc_size_local);
+                    sink.i64_extend_i32_u();
+                    sink.i64_const(GcHeader::SIZE as i64);
+                    sink.i64_sub();
+                    sink.i32_const(alloc.new_fn_ptr as i32);
+                    sink.call_indirect(0, base + 2);
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                        frame,
+                    );
+                    sink.else_();
+                    sink.i32_const(na.free_addr as i32);
+                    sink.local_get(alloc_scratch_local);
+                    sink.local_get(alloc_size_local);
+                    sink.i32_add();
+                    sink.i32_store(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.local_get(alloc_scratch_local);
+                    sink.i64_const(0);
+                    sink.i64_store(MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    });
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(GcHeader::SIZE as i32);
+                    sink.i32_add();
+                    sink.i64_extend_i32_u();
+                    sink.end();
+                    sink.end();
                 } else {
                     sink.i64_const(0);
                     if let Some(payload) = payload {
@@ -8639,6 +8625,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.exit_table_base,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8673,6 +8660,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.exit_table_base,
                 );
             }
             OpCode::ZeroArray => {
@@ -8805,6 +8793,7 @@ fn build_function(
                     ops,
                     op_idx,
                     guard_idx,
+                    guard_dispatch,
                 );
                 let vi = op.pos().get().raw();
                 let descr = op
@@ -8838,58 +8827,16 @@ fn build_function(
                 // trace at the Python CALL needs resume metadata that a
                 // CALL_ASSEMBLER op does not currently carry.
 
-                // Allocate the callee frame as a GC JitFrame.
-                // `ca_cfp_local = frame_base + FIRST_ITEM_OFFSET` is the
-                // bespoke-layout frame pointer — every `mem64(OFS)` below is
-                // relative to it, exactly as the source loop reads its local 0.
-                // The tmp callback and the real loop may have different frame
-                // depths.  PyPy updates the old token's frame info during
-                // redirect; wasm mirrors that by loading both allocation
-                // fields from the old token's stable dispatch entry.
-                //
-                // `malloc_cond_varsize_frame` inlines the nursery bump
-                // (`assembler.py`) when `ca.inline` is armed. Size still
-                // comes from the dispatch entry, so a later redirect can
-                // deepen the frame. Overflow (or gc_stress) keeps the
-                // collecting helper.
-                if let (Some(base), Some(inline)) = (residual_type_base, ca.inline) {
-                    emit_ca_malloc_cond_varsize_frame(
-                        &mut sink,
-                        inline,
-                        base,
-                        ca.ca_alloc_fn_ptr,
-                        ca_target_local,
-                        alloc_scratch_local,
-                        alloc_size_local,
-                    );
-                } else if let Some(base) = residual_type_base {
-                    sink.local_get(ca_target_local);
-                    sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
-                    sink.local_get(ca_target_local);
-                    sink.i64_load(mem64(crate::failguard::WASM_CA_TARGET_GCMAP_PTR_OFS));
-                    sink.i32_const(ca.ca_alloc_fn_ptr as i32);
-                    sink.call_indirect(0, base + 2);
-                } else {
-                    let jit_call =
-                        jit_call_idx.expect("CA arm needs jit_call for the frame trampolines");
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(ca.ca_alloc_fn_ptr);
-                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(2);
-                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
-                    emit_call_area_addr(&mut sink);
-                    sink.local_get(ca_target_local);
-                    sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
-                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
-                    emit_call_area_addr(&mut sink);
-                    sink.local_get(ca_target_local);
-                    sink.i64_load(mem64(crate::failguard::WASM_CA_TARGET_GCMAP_PTR_OFS));
-                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + SLOT_SIZE));
-                    emit_jit_call(&mut sink, jit_call);
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
+                // The rewriter's `CallMallocNurseryVarsizeFrame` allocated the
+                // frame and `GcStore`d each input at `_ll_initial_locs`.
+                // Arg 0 is that object base. A virtualizable, when present,
+                // is arg 1 and was also stored into its frame slot.
+                if op.num_args() == 0 {
+                    return Err(BackendError::Unsupported(
+                        "wasm backend: CALL_ASSEMBLER is missing its frame argument".into(),
+                    ));
                 }
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                 sink.i32_wrap_i64();
                 sink.local_tee(ca_cfp_local);
                 emit_memory_error_if_i32_zero(
@@ -8897,73 +8844,46 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.exit_table_base,
                 );
+                // Recycled nursery bytes. The entry publish unions with the
+                // live map, so a fresh frame must start with a null map or
+                // that union walks a garbage length.
+                sink.local_get(ca_cfp_local);
+                sink.i64_const(0);
+                emit_word_store(&mut sink, majit_backend::jitframe::JF_GCMAP_OFS as u64);
+                // Used homes are a prefix of `home_slots`. A later redirect
+                // marks further reserved homes in the same frame, so the
+                // whole reserved region has to be null before the push.
+                // Bytes outside it are not in the static home gcmap.
+                emit_clear_reserved_homes(
+                    &mut sink,
+                    ca_cfp_local,
+                    ca_target_local,
+                    alloc_scratch_local,
+                );
+                emit_ca_push_frame(
+                    &mut sink,
+                    ca.inline.as_ref(),
+                    residual_type_base,
+                    ca.ca_push_fn_ptr,
+                    jit_call_idx,
+                    ca_cfp_local,
+                    alloc_scratch_local,
+                )?;
                 sink.local_get(ca_cfp_local);
                 sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
                 sink.i32_add();
                 sink.local_set(ca_cfp_local);
-                // The collecting helper may have moved this invocation's
-                // frame. The inline bump path reloads only on that arm
-                // (`emit_ca_malloc_cond_varsize_frame`); a non-inline
-                // allocation always goes through the helper.
-                if ca.inline.is_none() {
-                    if let Some(base) = residual_type_base {
-                        sink.i32_const(ca.ca_reload_caller_fn_ptr as i32);
-                        sink.call_indirect(0, base);
-                        sink.i32_wrap_i64();
-                        sink.local_set(0);
-                    }
-                }
-                emit_reload_ca_input_refs_from_homes(
-                    &mut sink,
-                    value_types,
-                    ref_homes,
-                    ref_values,
-                    op,
-                    frame,
-                );
                 // dispatch key = 0: run the loop from its entry (preamble), not a
-                // LABEL resume — this is a fresh call.
+                // LABEL resume — this is a fresh call. The offset is loaded
+                // from the dispatch entry because redirect can move it.
                 sink.local_get(ca_cfp_local);
                 sink.local_get(ca_target_local);
                 sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_DISPATCH_KEY_OFS_OFS));
                 sink.i32_add();
                 sink.i64_const(0);
                 sink.i64_store(mem64(0));
-                // Marshal the descriptor's uniform i64 Int/Ref ABI inputs into
-                // the callee's positional frame slots.
-                for (arg_index, arg) in op.getarglist().iter().enumerate() {
-                    sink.local_get(ca_cfp_local);
-                    emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                    sink.i64_store(mem64(FRAME_SLOT_BASE + arg_index as u64 * SLOT_SIZE));
-                }
-                // Homes are still recycled nursery bytes. Null the callee
-                // home range from the dispatch snapshot and publish that
-                // snapshot's gcmap before `call_indirect`. A minor
-                // collection can fire in the callee
-                // (`recursive_call_frame_relocation`) while this frame is
-                // already on the shadow stack. Key-0 still skips unmarked
-                // frozen padding.
-                sink.local_get(ca_target_local);
-                sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_HOME_SLOTS_OFS));
-                sink.if_(BlockType::Empty);
-                sink.local_get(ca_cfp_local);
-                sink.local_get(ca_target_local);
-                sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_HOME_SLOT_BASE_OFS));
-                sink.i32_add();
-                sink.i32_const(0);
-                sink.local_get(ca_target_local);
-                sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_HOME_SLOTS_OFS));
-                sink.i32_const(SLOT_SIZE as i32);
-                sink.i32_mul();
-                sink.memory_fill(0);
-                sink.end();
-                sink.local_get(ca_cfp_local);
-                sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
-                sink.i32_sub();
-                sink.local_get(ca_target_local);
-                sink.i64_load(mem64(crate::failguard::WASM_CA_TARGET_GCMAP_PTR_OFS));
-                emit_word_store(&mut sink, majit_backend::jitframe::JF_GCMAP_OFS as u64);
                 // Run the callee loop on F'; discard the returned frame_ptr.
                 sink.local_get(ca_cfp_local);
                 // The immutable target snapshot was loaded before allocating
@@ -9004,28 +8924,19 @@ fn build_function(
                 }
                 sink.i32_wrap_i64();
                 sink.local_set(ca_cfp_local);
-                // F'[0] is the callee's exit `fail_index`. The base-case loop
-                // finish or this bridge's own recursive finish is a clean
-                // DoneWithThisFrame — the result is already in the callee output
-                // slot F'[1]. Any other value is a guard deopt the in-guest run
-                // cannot finish; hand the callee frame to `wasm_ca_resume_deopt`,
-                // which blackhole-resumes it on the host — resuming AT the guard,
-                // so pre-guard work is not re-executed — and returns the result.
+                // `jf_descr` is the callee's exit descr cell. A clean finish
+                // writes the one `done_with_this_frame` cell for this result
+                // kind (`_call_assembler_check_descr`). The result is already
+                // in F'[1]. Any other cell is a guard deopt or a raising
+                // finish; `wasm_ca_resume_deopt` blackhole-resumes it.
+                let finish_ptr = crate::failguard::finish_descr_ptr(
+                    crate::failguard::done_with_this_frame_exit_index(op.opcode.result_type()),
+                );
                 sink.local_get(ca_cfp_local);
-                sink.i64_load(mem64(0));
-                sink.i32_wrap_i64();
-                sink.local_set(ca_fi_local);
-                // `_call_assembler_check_descr` — every clean finish of this
-                // result kind writes the one `done_with_this_frame_descr_<kind>`
-                // the cpu was handed, so the check is a compare against that
-                // single value. A raising callee writes
-                // `exit_frame_with_exception_descr_ref` and a guard deopt writes
-                // its own exit, so both fail this compare and take the helper
-                // path, which is what propagates the exception.
-                sink.local_get(ca_fi_local);
-                sink.i32_const(crate::failguard::done_with_this_frame_exit_index(
-                    op.opcode.result_type(),
-                ) as i32);
+                sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+                sink.i32_sub();
+                sink.i32_load(memarg(majit_backend::jitframe::JF_DESCR_OFS as u64, 2));
+                sink.i32_const(finish_ptr as i32);
                 sink.i32_eq();
                 sink.if_(BlockType::Result(ValType::I64));
                 // clean finish: result Ref = F'[1] (output slot 0).
@@ -9203,6 +9114,7 @@ fn build_function(
                     ops,
                     op_idx,
                     guard_idx,
+                    guard_dispatch,
                 );
                 let vi = op.pos().get().raw();
                 let can_collect = call_can_collect(op);
@@ -9614,8 +9526,15 @@ fn build_function(
     // The shared epilogue remains only for the established frame-entry form.
     if bridge_dispatch && bridge_param_type_indices.is_empty() {
         // slot = *(bridge_slot_local), where the local holds a cell address.
+        // Address 0 is a guard with no cell; do not load guest address 0.
+        sink.local_get(bridge_slot_local);
+        sink.i32_eqz();
+        sink.if_(BlockType::Result(ValType::I32));
+        sink.i32_const(0);
+        sink.else_();
         sink.local_get(bridge_slot_local);
         sink.i32_load(memarg(0, 2));
+        sink.end();
         sink.local_tee(bridge_slot_local);
         sink.if_(BlockType::Empty);
         sink.local_get(0); // frame_ptr argument to the bridge
@@ -9706,6 +9625,9 @@ fn emit_inline_trip_probe(sink: &mut PeepSink<'_, '_>, probe: InlineTripProbe, t
     sink.i64_const(probe.threshold as i64);
     sink.i64_eq();
     sink.if_(BlockType::Empty);
+    // Install from here. The probe runs in the bridge module; the parent
+    // stays on the stack and is not re-entered. The parent's next back-edge
+    // reads the resume cell and tail-calls the replacement.
     sink.i64_const(probe.pending_id);
     sink.i32_const(probe.trip_fn_ptr as i32);
     sink.call_indirect(0, type_idx);
@@ -10064,13 +9986,15 @@ fn emit_resolve_failarg(
     gc_table_slots: &HashMap<u32, (u32, i64)>,
     ref_homes: &RefHomes,
     frame: FrameGeometry,
+    const_tables: &ConstPtrTables,
+    const_table_base: u32,
 ) {
     // rewrite.py leaves a ConstPtr failarg as a constant. Load it from
     // the table on this path only — the collector forwards the slot —
     // rather than baking the compile-time address as `i64.const`.
     if let Some(g) = opref.as_const_ptr()
         && !g.is_null()
-        && let Some((base, index)) = lookup_failarg_const(g.0)
+        && let Some((base, index)) = const_tables.slot(const_table_base, g.0)
     {
         emit_gc_table_load(sink, base, i64::from(index));
         return;
@@ -10564,6 +10488,9 @@ struct InlineGuard<'a> {
 #[derive(Clone, Copy)]
 struct BridgeDispatch<'a> {
     cells_base: u32,
+    /// Per-guard cell addresses, indexed by `guard_idx - fail_index_base`.
+    /// A zero entry falls back to `cells_base + index * 4`.
+    cell_addrs: &'a [u32],
     fail_index_base: u32,
     bridge_slot_local: u32,
     enabled: bool,
@@ -10589,10 +10516,16 @@ struct BridgeDispatch<'a> {
     /// arguments, for the counts `spill_helper_arities` admitted. An exit whose
     /// count is absent writes its own stores.
     spill_helpers: &'a indexmap::IndexMap<usize, u32>,
+    /// See [`CaParams::exit_table_base`].
+    exit_table_base: u32,
     /// Preamble `LoadFromGcTable` results (and SameAs of them) that a
     /// later guard may spill. Keyed by value id; the pair is the baked
     /// table base and slot index.
     gc_table_slots: &'a HashMap<u32, (u32, i64)>,
+    /// ConstPtr compile keys of every GC table this function emits, and the
+    /// base of the table that owns the operation currently being emitted.
+    const_tables: &'a ConstPtrTables,
+    const_table_base: u32,
 }
 
 fn emit_guard_true(
@@ -10829,6 +10762,8 @@ fn emit_guard_exit(
             op,
             inline.inputargs,
             dispatch.gc_table_slots,
+            dispatch.const_tables,
+            dispatch.const_table_base,
         );
         sink.br(inline_region_br_depth(inline, &dispatch, enclosing_frames));
         return;
@@ -10848,6 +10783,9 @@ fn emit_guard_exit(
             dispatch.gc_table_slots,
             dispatch.ref_homes,
             dispatch.frame,
+            dispatch.const_tables,
+            dispatch.const_table_base,
+            dispatch,
         );
         if dispatch.enabled {
             emit_guard_bridge_dispatch(sink, guard_idx, dispatch);
@@ -10867,6 +10805,9 @@ fn emit_guard_exit(
             dispatch.gc_table_slots,
             dispatch.ref_homes,
             dispatch.frame,
+            dispatch.const_tables,
+            dispatch.const_table_base,
+            dispatch,
         );
     }
     sink.br(block_exit_depth);
@@ -10891,6 +10832,19 @@ fn live_fail_args_of(op: &Op) -> Vec<OpRef> {
         .collect()
 }
 
+fn dispatch_cell_addr(dispatch: BridgeDispatch<'_>, guard_idx: u32) -> u32 {
+    let index = guard_idx.wrapping_sub(dispatch.fail_index_base) as usize;
+    if let Some(&addr) = dispatch.cell_addrs.get(index) {
+        if addr != 0 {
+            return addr;
+        }
+    }
+    if dispatch.cells_base == 0 {
+        return 0;
+    }
+    dispatch.cells_base + index as u32 * std::mem::size_of::<u32>() as u32
+}
+
 fn emit_guard_param_tail_call(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -10907,8 +10861,10 @@ fn emit_guard_param_tail_call(
         .expect("parameter dispatch type missing for guard fail arity");
     debug_assert!(dispatch.enabled);
     debug_assert!(guard_idx >= dispatch.fail_index_base);
-    let cell_addr = dispatch.cells_base
-        + (guard_idx - dispatch.fail_index_base) * std::mem::size_of::<u32>() as u32;
+    let cell_addr = dispatch_cell_addr(dispatch, guard_idx);
+    if cell_addr == 0 {
+        return;
+    }
     sink.i32_const(cell_addr as i32);
     sink.i32_load(memarg(0, 2));
     sink.local_tee(dispatch.bridge_slot_local);
@@ -10927,6 +10883,8 @@ fn emit_guard_param_tail_call(
                 dispatch.gc_table_slots,
                 dispatch.ref_homes,
                 dispatch.frame,
+                dispatch.const_tables,
+                dispatch.const_table_base,
             );
         }
     }
@@ -10947,6 +10905,8 @@ fn emit_guard_inline_bridge_move(
     op: &Op,
     inputargs: &[InputArgRc],
     gc_table_slots: &HashMap<u32, (u32, i64)>,
+    const_tables: &ConstPtrTables,
+    const_table_base: u32,
 ) {
     let fail_args: Vec<OpRef> = live_fail_args_of(op);
     assert_eq!(
@@ -10966,6 +10926,8 @@ fn emit_guard_inline_bridge_move(
                 gc_table_slots,
                 ref_homes,
                 frame,
+                const_tables,
+                const_table_base,
             );
         }
     }
@@ -10987,8 +10949,12 @@ fn emit_guard_bridge_dispatch(
     dispatch: BridgeDispatch<'_>,
 ) {
     debug_assert!(guard_idx >= dispatch.fail_index_base);
-    let cell_addr = dispatch.cells_base
-        + (guard_idx - dispatch.fail_index_base) * std::mem::size_of::<u32>() as u32;
+    let cell_addr = dispatch_cell_addr(dispatch, guard_idx);
+    if cell_addr == 0 {
+        sink.i32_const(0);
+        sink.local_set(dispatch.bridge_slot_local);
+        return;
+    }
     sink.i32_const(cell_addr as i32);
     sink.local_set(dispatch.bridge_slot_local);
 }
@@ -11030,6 +10996,7 @@ fn emit_force_bracket_before_call(
     ops: &[Op],
     op_idx: usize,
     guard_idx: u32,
+    dispatch: BridgeDispatch<'_>,
 ) {
     if !call_publishes_force_descr(ops[op_idx].opcode) {
         return;
@@ -11055,6 +11022,10 @@ fn emit_force_bracket_before_call(
         next_op,
         exit_index(next_op, guard_idx),
         Some(ops[op_idx].pos().get().raw()),
+        dispatch.const_tables,
+        dispatch.const_table_base,
+        dispatch.exit_table_base,
+        guard_idx.wrapping_sub(dispatch.fail_index_base),
     );
 }
 
@@ -11078,8 +11049,8 @@ fn emit_force_bracket_before_call(
 /// free to tell an offset from a value.
 ///
 /// A non-null `ConstPtr` has no home. Publishing its compile-time address
-/// (or even the current `FAILARG_CONST_TABLE` load) into the untraced force
-/// slot goes stale if the bracketed call collects. Homes use
+/// into the untraced force slot goes stale if the bracketed call collects.
+/// Homes use
 /// `offset * 2 + 1` (bit 0 set; bit 1 is clear because `offset` is
 /// 8-aligned). A table slot is published as `abs_addr | 3` so consume
 /// reloads the forwarded table entry after the collection. `undefined`
@@ -11094,6 +11065,10 @@ fn emit_force_arm(
     guard_op: &Op,
     exit_idx: u32,
     undefined: Option<u32>,
+    const_tables: &ConstPtrTables,
+    const_table_base: u32,
+    exit_table_base: u32,
+    exit_local: u32,
 ) {
     // `counter_value_spill` answers `None` for anything but a GUARD_VALUE, so
     // the counter slot has nothing to contribute to a force bracket.
@@ -11112,7 +11087,7 @@ fn emit_force_arm(
         } else if let Some(g) = arg_ref.as_const_ptr() {
             if g.is_null() {
                 sink.i64_const(0);
-            } else if let Some((base, index)) = lookup_failarg_const(g.0) {
+            } else if let Some((base, index)) = const_tables.slot(const_table_base, g.0) {
                 // Tag the GC-table slot so `dead_frame_from_forced_frame`
                 // reloads after a collection inside the bracketed call.
                 let addr = i64::from(base)
@@ -11126,24 +11101,30 @@ fn emit_force_arm(
         }
         sink.i64_store(mem64(frame.force_slot_base + i as u64 * SLOT_SIZE));
     }
-    // x86 `store_force_descr`: keep the descriptor in the JitFrame header,
-    // separate from `jf_descr`/frame[0].  `local 0` is the items base, so
-    // recover the object base before addressing the pointer-width wasm32
-    // header field.  Store `index + 1`; zero remains the unarmed sentinel.
-    sink.local_get(0);
-    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
-    sink.i32_sub();
-    sink.i32_const(exit_idx.wrapping_add(1) as i32);
-    sink.i32_store(memarg(
-        majit_backend::jitframe::JF_FORCE_DESCR_OFS as u64,
-        2,
-    ));
-
-    // `jf_descr` remains the guard's exit index.  A synchronous force sets
-    // FORCE_TAKEN_BIT here; GUARD_NOT_FORCED tests that bit after the call.
-    sink.local_get(0);
-    sink.i64_const(exit_idx as i64);
-    sink.i64_store(mem64(0));
+    // x86 `store_force_descr`: the guard's descr cell, separate from `jf_descr`.
+    // Zero remains the unarmed sentinel. `force` copies this word into `jf_descr`.
+    if exit_table_base == 0 {
+        sink.local_get(0);
+        sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+        sink.i32_sub();
+        sink.i32_const(exit_idx.wrapping_add(1) as i32);
+        sink.i32_store(memarg(
+            majit_backend::jitframe::JF_FORCE_DESCR_OFS as u64,
+            2,
+        ));
+        sink.local_get(0);
+        sink.i64_const(exit_idx as i64);
+        sink.i64_store(mem64(0));
+    } else {
+        let _ = exit_idx;
+        emit_store_loaded_header(
+            sink,
+            majit_backend::jitframe::JF_FORCE_DESCR_OFS as u64,
+            exit_table_base,
+            exit_local as usize,
+            0,
+        );
+    }
 }
 
 fn emit_guard_spill(
@@ -11157,6 +11138,9 @@ fn emit_guard_spill(
     gc_table_slots: &HashMap<u32, (u32, i64)>,
     ref_homes: &RefHomes,
     frame: FrameGeometry,
+    const_tables: &ConstPtrTables,
+    const_table_base: u32,
+    dispatch: BridgeDispatch<'_>,
 ) {
     emit_guard_fail_args_spill(
         sink,
@@ -11168,8 +11152,40 @@ fn emit_guard_spill(
         gc_table_slots,
         ref_homes,
         frame,
+        const_tables,
+        const_table_base,
     );
-    emit_guard_fail_index_store(sink, exit_index(op, guard_idx));
+    emit_guard_fail_index_store(sink, dispatch, op, guard_idx);
+    // assembler.py `_build_failure_recovery` (exc=True): stage pos_exc_value
+    // into jf_guard_exc and clear pos_exception / pos_exc_value. Only the
+    // failing arm reaches here; a bridge tail-call returns before this spill.
+    emit_store_guard_exc(sink, op);
+}
+
+/// `llsupport/assembler.py` `must_save_exception`: GUARD_EXCEPTION,
+/// GUARD_NO_EXCEPTION, GUARD_NOT_FORCED. `grab_exc_value` reads `jf_guard_exc`.
+fn emit_store_guard_exc(sink: &mut PeepSink<'_, '_>, op: &Op) {
+    if !matches!(
+        op.opcode,
+        OpCode::GuardNoException | OpCode::GuardException | OpCode::GuardNotForced
+    ) {
+        return;
+    }
+    let exc_value_addr = runtime_addr(crate::jit_exc_value_addr);
+    let exc_type_addr = runtime_addr(crate::jit_exc_type_addr);
+    sink.local_get(0);
+    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+    sink.i32_sub();
+    sink.i32_const(exc_value_addr);
+    sink.i64_load(mem64(0));
+    sink.i32_wrap_i64();
+    sink.i32_store(memarg(majit_backend::jitframe::JF_GUARD_EXC_OFS as u64, 2));
+    sink.i32_const(exc_value_addr);
+    sink.i64_const(0);
+    sink.i64_store(mem64(0));
+    sink.i32_const(exc_type_addr);
+    sink.i64_const(0);
+    sink.i64_store(mem64(0));
 }
 
 /// The exit a failing `op` writes into `frame[0]`.
@@ -11197,6 +11213,8 @@ fn emit_guard_fail_args_spill(
     gc_table_slots: &HashMap<u32, (u32, i64)>,
     ref_homes: &RefHomes,
     frame: FrameGeometry,
+    const_tables: &ConstPtrTables,
+    const_table_base: u32,
 ) {
     // Store the live values at their descriptor's physical locations. A hole
     // in ResumeDataLoopMemo's numbering is not a frame location.
@@ -11216,6 +11234,8 @@ fn emit_guard_fail_args_spill(
                 gc_table_slots,
                 ref_homes,
                 frame,
+                const_tables,
+                const_table_base,
             );
         }
         sink.call(helper);
@@ -11231,6 +11251,8 @@ fn emit_guard_fail_args_spill(
                 gc_table_slots,
                 ref_homes,
                 frame,
+                const_tables,
+                const_table_base,
             );
             sink.i64_store(mem64(offset));
         }
@@ -11246,6 +11268,8 @@ fn emit_guard_fail_args_spill(
             gc_table_slots,
             ref_homes,
             frame,
+            const_tables,
+            const_table_base,
         );
         sink.i64_store(mem64(offset));
     }
@@ -11332,10 +11356,17 @@ fn emit_memory_error_check(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
+    exit_table_base: u32,
 ) {
     emit_resolve(sink, constants, value_types, value);
     sink.i64_eqz();
-    emit_memory_error_on_truthy(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
+    emit_memory_error_on_truthy(
+        sink,
+        residual_type_base,
+        ca_reload_fn_ptr,
+        jf_top_addr,
+        exit_table_base,
+    );
 }
 
 fn emit_memory_error_if_i32_zero(
@@ -11343,9 +11374,16 @@ fn emit_memory_error_if_i32_zero(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
+    exit_table_base: u32,
 ) {
     sink.i32_eqz();
-    emit_memory_error_on_truthy(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
+    emit_memory_error_on_truthy(
+        sink,
+        residual_type_base,
+        ca_reload_fn_ptr,
+        jf_top_addr,
+        exit_table_base,
+    );
 }
 
 fn emit_memory_error_on_truthy(
@@ -11353,6 +11391,7 @@ fn emit_memory_error_on_truthy(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
+    exit_table_base: u32,
 ) {
     sink.if_(BlockType::Empty);
     if crate::failguard::exit_frame_with_exception_attached() {
@@ -11361,6 +11400,15 @@ fn emit_memory_error_on_truthy(
         sink.i32_const(runtime_addr(crate::jit_exc_value_addr));
         sink.i64_load(mem64(0));
         sink.i64_store(mem64(FRAME_SLOT_BASE));
+        // assembler.py propagate path: the same value also lands in jf_guard_exc
+        // before pos_exception / pos_exc_value are cleared.
+        sink.local_get(0);
+        sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+        sink.i32_sub();
+        sink.local_get(0);
+        sink.i64_load(mem64(FRAME_SLOT_BASE));
+        sink.i32_wrap_i64();
+        sink.i32_store(memarg(majit_backend::jitframe::JF_GUARD_EXC_OFS as u64, 2));
         sink.i32_const(runtime_addr(crate::jit_exc_value_addr));
         sink.i64_const(0);
         sink.i64_store(mem64(0));
@@ -11373,7 +11421,22 @@ fn emit_memory_error_on_truthy(
         sink.if_(BlockType::Empty);
         sink.unreachable();
         sink.end();
-        emit_guard_fail_index_store(sink, crate::failguard::FINISH_EXIT_INDEX_EXC);
+        if exit_table_base == 0 {
+            sink.local_get(0);
+            sink.i64_const(crate::failguard::FINISH_EXIT_INDEX_EXC as i64);
+            sink.i64_store(mem64(0));
+        } else {
+            emit_store_header_word(
+                sink,
+                majit_backend::jitframe::JF_DESCR_OFS as u64,
+                crate::failguard::finish_descr_ptr(crate::failguard::FINISH_EXIT_INDEX_EXC),
+            );
+            emit_store_header_word(
+                sink,
+                majit_backend::jitframe::JF_GCMAP_OFS as u64,
+                memory_error_gcmap(),
+            );
+        }
         sink.local_get(0);
         sink.return_();
     } else {
@@ -11382,10 +11445,144 @@ fn emit_memory_error_on_truthy(
     sink.end();
 }
 
-fn emit_guard_fail_index_store(sink: &mut PeepSink<'_, '_>, guard_idx: u32) {
+fn physical_fail_slot(guard: &GuardExit, index: usize) -> Option<usize> {
+    if guard.fail_locs.is_empty() {
+        return (index < guard.fail_arg_types.len()).then_some(index);
+    }
+    guard.fail_locs.get(index).copied().flatten()
+}
+
+fn ref_spill_item_indices(guard: &GuardExit, sign: usize) -> Vec<u32> {
+    let mut indices = Vec::new();
+    for (i, ty) in guard.fail_arg_types.iter().enumerate() {
+        if *ty != Type::Ref {
+            continue;
+        }
+        let Some(slot) = physical_fail_slot(guard, i) else {
+            continue;
+        };
+        indices.push(((FRAME_SLOT_BASE as usize + slot * 8) / sign) as u32);
+    }
+    indices
+}
+
+pub(crate) fn memory_error_gcmap_ptr() -> *const u8 {
+    memory_error_gcmap() as *const u8
+}
+
+fn memory_error_gcmap() -> usize {
+    static MAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAP.get_or_init(|| {
+        let bit = (FRAME_SLOT_BASE as usize / std::mem::size_of::<isize>()) as u32;
+        let map = gcmap_for_item_indices(&[bit]);
+        Box::into_raw(map) as *mut usize as usize
+    })
+}
+
+fn gcmap_for_item_indices(indices: &[u32]) -> Box<[usize]> {
+    let bits_per_word = usize::BITS as usize;
+    let num_words = indices
+        .iter()
+        .copied()
+        .max()
+        .map_or(1, |last| last as usize / bits_per_word + 1);
+    let mut gcmap = vec![0usize; 1 + num_words];
+    gcmap[0] = num_words;
+    for &index in indices {
+        let index = index as usize;
+        gcmap[1 + index / bits_per_word] |= 1usize << (index % bits_per_word);
+    }
+    gcmap.into_boxed_slice()
+}
+
+/// `local 0` is the items base. Header pointer fields are wasm32 `i32`s:
+/// the module always runs as wasm32, where a `GcRef` and a cell address
+/// are four bytes (`emit_force_arm`'s `i32.store` of `jf_force_descr`).
+fn emit_header_base(sink: &mut PeepSink<'_, '_>) {
     sink.local_get(0);
-    sink.i64_const(guard_idx as i64);
-    sink.i64_store(mem64(0));
+    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+    sink.i32_sub();
+}
+
+fn emit_store_header_word(sink: &mut PeepSink<'_, '_>, offset: u64, value: usize) {
+    emit_header_base(sink);
+    sink.i32_const(value as i32);
+    sink.i32_store(memarg(offset, 2));
+}
+
+/// Pair `local` of the exit table: word 0 is the descr cell, word 1 the gcmap.
+/// Each word is a wasm32 pointer.
+fn emit_load_exit_word(sink: &mut PeepSink<'_, '_>, table_base: u32, local: usize, word: usize) {
+    let byte = (local * 2 + word) * 4;
+    sink.i32_const(table_base as i32);
+    if byte != 0 {
+        sink.i32_const(byte as i32);
+        sink.i32_add();
+    }
+    sink.i32_load(memarg(0, 2));
+}
+
+fn emit_store_loaded_header(
+    sink: &mut PeepSink<'_, '_>,
+    offset: u64,
+    table_base: u32,
+    local: usize,
+    word: usize,
+) {
+    emit_header_base(sink);
+    emit_load_exit_word(sink, table_base, local, word);
+    sink.i32_store(memarg(offset, 2));
+}
+
+fn emit_guard_fail_index_store(
+    sink: &mut PeepSink<'_, '_>,
+    dispatch: BridgeDispatch<'_>,
+    op: &Op,
+    guard_idx: u32,
+) {
+    let local = (guard_idx - dispatch.fail_index_base) as usize;
+    // Direct codegen tests pass frame address 0 and read the exit index at
+    // offset 0. A real compile sets `exit_table_base` and stores the descr
+    // cell in `jf_descr` plus the guard gcmap in `jf_gcmap`
+    // (`_build_failure_recovery`).
+    if dispatch.exit_table_base == 0 {
+        sink.local_get(0);
+        sink.i64_const(exit_index(op, guard_idx) as i64);
+        sink.i64_store(mem64(0));
+        return;
+    }
+    if op.opcode == OpCode::Finish
+        && let Some(index) = crate::failguard::attached_finish_exit_index(&op.getdescr())
+    {
+        emit_store_header_word(
+            sink,
+            majit_backend::jitframe::JF_DESCR_OFS as u64,
+            crate::failguard::finish_descr_ptr(index),
+        );
+    } else if dispatch.exit_table_base == 0 {
+        emit_store_header_word(sink, majit_backend::jitframe::JF_DESCR_OFS as u64, 0);
+    } else {
+        emit_store_loaded_header(
+            sink,
+            majit_backend::jitframe::JF_DESCR_OFS as u64,
+            dispatch.exit_table_base,
+            local,
+            0,
+        );
+    }
+    if dispatch.exit_table_base == 0 {
+        // A direct codegen test has no table. Storing 0 keeps the exit from
+        // loading address 0 when the module is executed.
+        emit_store_header_word(sink, majit_backend::jitframe::JF_GCMAP_OFS as u64, 0);
+    } else {
+        emit_store_loaded_header(
+            sink,
+            majit_backend::jitframe::JF_GCMAP_OFS as u64,
+            dispatch.exit_table_base,
+            local,
+            1,
+        );
+    }
 }
 
 // ── Binary ops ──
@@ -12337,6 +12534,9 @@ mod tests {
         };
         let param_type_indices = indexmap::IndexMap::new();
         let spill_helpers = indexmap::IndexMap::new();
+        let const_tables = ConstPtrTables {
+            entries: Vec::new(),
+        };
         let inline = InlineGuard {
             guard_idx: 0,
             inputargs: &[],
@@ -12345,6 +12545,7 @@ mod tests {
         };
         let dispatch = BridgeDispatch {
             cells_base: 0,
+            cell_addrs: &[],
             fail_index_base: 0,
             bridge_slot_local: 0,
             enabled: false,
@@ -12357,7 +12558,10 @@ mod tests {
             frame: FrameGeometry::compact(1, 0, 0),
             counter_slot: None,
             spill_helpers: &spill_helpers,
+            exit_table_base: 0,
             gc_table_slots: &HashMap::new(),
+            const_tables: &const_tables,
+            const_table_base: 0,
         };
 
         assert_eq!(inline_region_br_depth(&inline, &dispatch, 0), 0);

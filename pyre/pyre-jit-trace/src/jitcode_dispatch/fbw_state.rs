@@ -1205,7 +1205,7 @@ pub(crate) fn fbw_bridge_iter_journal_push(
 pub(crate) fn fbw_bridge_list_iter_journal_push(
     iter: pyre_object::PyObjectRef,
     pre_seq: pyre_object::PyObjectRef,
-    pre_index: i64,
+    pre_index: isize,
 ) {
     fbw_bridge_cursor_journal_push(BridgeIterKind::List, iter, pre_seq, pre_index);
 }
@@ -1214,7 +1214,7 @@ pub(crate) fn fbw_bridge_list_iter_journal_push(
 pub(crate) fn fbw_bridge_tuple_iter_journal_push(
     iter: pyre_object::PyObjectRef,
     pre_seq: pyre_object::PyObjectRef,
-    pre_index: i64,
+    pre_index: isize,
 ) {
     fbw_bridge_cursor_journal_push(BridgeIterKind::Tuple, iter, pre_seq, pre_index);
 }
@@ -1223,7 +1223,7 @@ fn fbw_bridge_cursor_journal_push(
     kind: BridgeIterKind,
     iter: pyre_object::PyObjectRef,
     pre_seq: pyre_object::PyObjectRef,
-    pre_index: i64,
+    pre_index: isize,
 ) {
     FBW_BRIDGE_ITER_JOURNAL.with(|j| {
         j.borrow_mut().push(BridgeIterJournalEntry::Cursor {
@@ -1308,7 +1308,7 @@ pub(crate) fn fbw_bridge_iter_journal_rollback() {
                 } => unsafe {
                     let (set_seq, set_index): (
                         unsafe fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef),
-                        unsafe fn(pyre_object::PyObjectRef, i64),
+                        unsafe fn(pyre_object::PyObjectRef, isize),
                     ) = match kind {
                         BridgeIterKind::List => (
                             pyre_object::w_list_iter_set_seq,

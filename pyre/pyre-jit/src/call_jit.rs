@@ -4696,7 +4696,7 @@ fn try_compile_ca_bridge(
     guard_value_operand: Option<i64>,
     // `cpu.grab_exc_value(deadframe)` (llmodel.py). `jit_ca_handle_guard_failure`
     // re-reads `jf_guard_exc` and threads that word; the wasm deopt has already
-    // moved it into this argument (`dead_frame_from_ran_frame`'s `jit_exc_take`).
+    // read that slot (`grab_exc_value` on the live jitframe).
     // `prepare_resume_from_failure` (pyjitpl.py) calls `execute_ll_raised` then
     // `handle_possible_exception`, so the bridge enters the handler with the
     // exception live. `0` is the no-exception resume.

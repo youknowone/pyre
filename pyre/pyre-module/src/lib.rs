@@ -444,11 +444,6 @@ pub fn register() {
             libffi_cif_shape: hook_libffi_cif_shape,
             math_builtin_name: module::math::interp_math::math_builtin_name,
             math1_gamma_result_finite: module::math::interp_math::math1_gamma_result_finite,
-            math_faithful_residual_call_addrs:
-                module::math::interp_math::math_faithful_residual_call_addrs,
-            math_word_residual_call_addrs: || {
-                vec![module::math::interp_math::jit_math_isqrt_i64 as *const () as usize as i64]
-            },
         },
     );
 }

@@ -5194,14 +5194,7 @@ pub fn __majit_wrap_builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     Ok(w_int_new(crate::baseobjspace::len_w(obj)?))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_builtin_len_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__majit_wrap_builtin_len"),
-        func: __majit_wrap_builtin_len,
-    };
+crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_len_target, __majit_wrap_builtin_len);
 
 /// `abs(x)` — return the absolute value of a number.
 pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -5390,14 +5383,7 @@ pub fn __majit_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     builtin_abs_obj(obj)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_builtin_abs_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__majit_wrap_builtin_abs"),
-        func: __majit_wrap_builtin_abs,
-    };
+crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_abs_target, __majit_wrap_builtin_abs);
 
 /// Strip the trailing `__pyre_kw__` dict that `call_with_kwargs`
 /// (`call.rs`) appends for builtin callees and return the positional
@@ -7057,14 +7043,10 @@ pub fn __majit_wrap_builtin_isinstance(
     Ok(w_bool_from(crate::baseobjspace::isinstance(obj, cls)?))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_builtin_isinstance_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__majit_wrap_builtin_isinstance"),
-        func: __majit_wrap_builtin_isinstance,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_wrap_builtin_isinstance_target,
+    __majit_wrap_builtin_isinstance
+);
 
 /// isinstance(obj, cls) for JIT fast path.
 ///
@@ -7363,18 +7345,10 @@ fn exc_init_one_positional(w_self: PyObjectRef, arg: PyObjectRef) {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_base_exception_descr_init_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            "__majit_wrap_base_exception_descr_init"
-        ),
-        func: __majit_wrap_base_exception_descr_init,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_wrap_base_exception_descr_init_target,
+    __majit_wrap_base_exception_descr_init
+);
 
 /// `ValueError(x)` — one positional that is not the trailing `__pyre_kw__`
 /// marker.  `descr_new_base_exception(space, w_subtype, __args__)` receives
@@ -7475,18 +7449,10 @@ fn value_error_one_arg(cls: PyObjectRef, arg: PyObjectRef) -> PyObjectRef {
     pyre_object::gc_roots::shadow_stack_get(exc_slot)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_exc_value_error_descr_new_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            "__majit_wrap_exc_value_error_descr_new"
-        ),
-        func: __majit_wrap_exc_value_error_descr_new,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_wrap_exc_value_error_descr_new_target,
+    __majit_wrap_exc_value_error_descr_new
+);
 
 fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_self = *args.first().ok_or_else(|| {
@@ -17783,14 +17749,10 @@ pub fn __majit_wrap_builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     builtin_locals(args)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_builtin_locals_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__majit_wrap_builtin_locals"),
-        func: __majit_wrap_builtin_locals,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_wrap_builtin_locals_target,
+    __majit_wrap_builtin_locals
+);
 
 fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = split_builtin_kwargs(args);
@@ -19400,7 +19362,9 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         // `list.__reversed__`, which is the same lazy iterator).
         if pyre_object::is_exact_builtin_instance(obj) {
             if pyre_object::is_list(obj) {
-                let n = pyre_object::w_list_len(obj) as i64;
+                let n = isize::try_from(pyre_object::w_list_len(obj)).map_err(|_| {
+                    crate::PyError::overflow_error("Python int too large to convert to C ssize_t")
+                })?;
                 return Ok(pyre_object::w_list_reverse_iter_new(
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
                     n - 1,
@@ -21886,8 +21850,8 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         }
         #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
         {
-            let _ = bytes;
-            return Err(wasm_fd::fd_refuse_write(fd));
+            let n = wasm_fd::fd_write(fd, &bytes)?;
+            return Ok(w_int_new(n));
         }
         #[cfg(not(feature = "host_env"))]
         {
@@ -24456,14 +24420,10 @@ pub fn __majit_wrap_builtin_dunder_import(
     import_bound_objects(name_obj, w_globals, w_locals, w_fromlist, level_obj)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_builtin_dunder_import_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__majit_wrap_builtin_dunder_import"),
-        func: __majit_wrap_builtin_dunder_import,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_wrap_builtin_dunder_import_target,
+    __majit_wrap_builtin_dunder_import
+);
 
 #[cfg(test)]
 mod tests {

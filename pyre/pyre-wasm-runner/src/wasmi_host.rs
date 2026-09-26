@@ -31,6 +31,7 @@ struct Host {
     next_id: u32,
     stdlib_root: Option<String>,
     engine: Option<Engine>,
+    mem_limit: crate::memory_ceiling::GuestMemoryLimit,
 }
 
 fn estr(e: impl std::fmt::Display) -> String {
@@ -90,6 +91,10 @@ pub fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32, Strin
     let module = Module::new(&engine, &bytes[..]).map_err(|e| format!("compile module: {e}"))?;
 
     let mut store = Store::new(&engine, Host::default());
+    store.data_mut().mem_limit.ceiling = crate::memory_ceiling::bytes();
+    if store.data().mem_limit.ceiling != 0 {
+        store.limiter(|host| &mut host.mem_limit);
+    }
     store.data_mut().next_id = 1;
     store.data_mut().stdlib_root = std::env::var("PYRE_STDLIB").ok();
     store.data_mut().engine = Some(engine.clone());

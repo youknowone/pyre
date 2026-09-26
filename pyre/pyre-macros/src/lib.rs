@@ -2394,6 +2394,17 @@ fn expand_pyre_methods(
                     path: concat!(module_path!(), "::", stringify!(#wrapper_name)),
                     func: #wrapper_name,
                 };
+
+            // `distributed_slice` rejects wasm32. Register from a constructor
+            // the way `#[pyre_class]` registers `PYRE_CLASS_DESCRIPTORS`.
+            #[cfg(target_arch = "wasm32")]
+            #[::ctor::ctor(unsafe)]
+            fn #wrapper_target_name() {
+                ::pyre_interpreter::gateway::register_builtin_wrapper_descriptor(
+                    concat!(module_path!(), "::", stringify!(#wrapper_name)),
+                    #wrapper_name,
+                );
+            }
         });
         // The argument `Signature` this method binds keywords against.  An
         // instance method prepends `self` as a positional-only slot (filled by

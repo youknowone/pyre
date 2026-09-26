@@ -4,10 +4,9 @@
 /// regression additionally executes the full wasm host and compares its Python
 /// output with dynasm, because the old failure was a runtime pointer miscast.
 ///
-/// One test thread on every OS. `ResidualCallAbi` and the vouched-callee
-/// set are thread-local, so selecting `Vouched` cannot reach another test.
-/// The single thread guards process-global settings tests flip, such as
-/// the inline-trip helper slot and the eager-merge byte cap.
+/// One test thread on every OS. The single thread guards process-global
+/// settings tests flip, such as the inline-trip helper slot and the
+/// eager-merge byte cap.
 #[cfg(not(target_arch = "wasm32"))]
 mod serial_cpu_tests {
     extern "C" fn set_one_test_thread() {
@@ -199,22 +198,35 @@ fn assert_no_call_assembler_frame_fill(stderr: &str) {
             && lines[index - 3].starts_with("local.get ")
             && lines[index - 2] == "i32.const 0"
             && lines[index - 1].starts_with("i32.const ");
-        // dest = cfp + target.home_slot_base, size = home_slots * SLOT_SIZE.
-        // The two `local.get` of the dispatch-entry pointer must name the
-        // same local, and the loads must be the snapshot home fields.
-        let ca_target = lines[index.saturating_sub(8)]
+        // `emit_clear_reserved_homes`: size = home_slots << 3, skipped when
+        // zero; dest = frame + FIRST_ITEM_OFFSET + home_slot_base (the
+        // guest's wasm32 offset, not this host's). The three `local.get` of
+        // the dispatch-entry pointer must name the same local, the loads must
+        // be the snapshot home fields, and the fill length must be the local
+        // the size was teed into.
+        let ca_target = lines[index.saturating_sub(16)]
             .strip_prefix("local.get ")
             .filter(|s| !s.is_empty());
-        let is_ca_callee_home_null = index >= 9
-            && lines[index - 9].starts_with("local.get ")
+        let home_size = lines[index.saturating_sub(12)]
+            .strip_prefix("local.tee ")
+            .filter(|s| !s.is_empty());
+        let is_ca_callee_home_null = index >= 16
             && ca_target.is_some()
-            && lines[index - 7] == home_base
+            && lines[index - 15] == home_slots
+            && lines[index - 14] == "i32.const 3"
+            && lines[index - 13] == "i32.shl"
+            && home_size.is_some()
+            && lines[index - 11] == "i32.eqz"
+            && lines[index - 10].starts_with("if")
+            && lines[index - 9] == "else"
+            && lines[index - 8].starts_with("local.get ")
+            && lines[index - 7].starts_with("i32.const ")
             && lines[index - 6] == "i32.add"
-            && lines[index - 5] == "i32.const 0"
-            && lines[index - 4].strip_prefix("local.get ") == ca_target
-            && lines[index - 3] == home_slots
-            && lines[index - 2] == "i32.const 8"
-            && lines[index - 1] == "i32.mul";
+            && lines[index - 5].strip_prefix("local.get ") == ca_target
+            && lines[index - 4] == home_base
+            && lines[index - 3] == "i32.add"
+            && lines[index - 2] == "i32.const 0"
+            && lines[index - 1].strip_prefix("local.get ") == home_size;
         // `OpCode::ZeroArray` after `emit_pending_zeros` (scales rewritten
         // to 1, start/size in bytes): dest = wrap(base) + start +
         // `ArrayDescr.base_size()`. PeepSink folds `wrap(const)` to
@@ -284,15 +296,22 @@ memory.fill
 fn call_assembler_home_range_fill_is_not_a_frame_refill() {
     assert_no_call_assembler_frame_fill(
         "\
+local.get 267
+i32.load offset=28
+i32.const 3
+i32.shl
+local.tee 130
+i32.eqz
+if ;; label = @2
+else
 local.get 265
+i32.const 32
+i32.add
 local.get 267
 i32.load offset=24
 i32.add
 i32.const 0
-local.get 267
-i32.load offset=28
-i32.const 8
-i32.mul
+local.get 130
 memory.fill
 ",
     );
@@ -317,15 +336,22 @@ memory.fill
 fn call_assembler_mismatched_target_local_fill_is_rejected() {
     assert_no_call_assembler_frame_fill(
         "\
-local.get 265
 local.get 267
+i32.load offset=28
+i32.const 3
+i32.shl
+local.tee 130
+i32.eqz
+if ;; label = @2
+else
+local.get 265
+i32.const 32
+i32.add
+local.get 268
 i32.load offset=24
 i32.add
 i32.const 0
-local.get 268
-i32.load offset=28
-i32.const 8
-i32.mul
+local.get 130
 memory.fill
 ",
     );
@@ -336,15 +362,22 @@ memory.fill
 fn call_assembler_wrong_home_offset_fill_is_rejected() {
     assert_no_call_assembler_frame_fill(
         "\
+local.get 267
+i32.load offset=28
+i32.const 3
+i32.shl
+local.tee 130
+i32.eqz
+if ;; label = @2
+else
 local.get 265
+i32.const 32
+i32.add
 local.get 267
 i32.load offset=8
 i32.add
 i32.const 0
-local.get 267
-i32.load offset=28
-i32.const 8
-i32.mul
+local.get 130
 memory.fill
 ",
     );
@@ -903,8 +936,10 @@ fn build_module_with_ca(
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -1135,8 +1170,10 @@ fn unbound_read_without_a_producer_declines() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -1325,8 +1362,10 @@ fn build_module_with_write_barrier_target(
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -1351,6 +1390,7 @@ fn build_module_with_gc_table(
     ops: &[Op],
     write_barrier_target: i64,
     gc_table_base: u32,
+    gc_const_keys: &[usize],
 ) -> Vec<u8> {
     let inputs = codegen::ModuleBuildInputs {
         inputargs: inputargs.to_vec(),
@@ -1365,8 +1405,10 @@ fn build_module_with_gc_table(
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base,
+        gc_const_keys: gc_const_keys.to_vec(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -2043,8 +2085,10 @@ fn test_cold_guard_recovery_preserves_nonzero_base_and_typed_bits() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: FAIL_INDEX_BASE,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -2175,10 +2219,9 @@ fn run_inline_region_trace(inputs: &codegen::ModuleBuildInputs) -> (i64, i64, i6
 /// re-emission from one that is crossed a few thousand times and never pays it
 /// back, so both halves of "exactly once, at the threshold" are the point.
 ///
-/// That entry leaves the source guard's dispatch cell alone. The bridge
-/// stays the target until the host publishes the merged owner, the same
-/// way `patch_jump_for_descr` keeps the old jump until the new target is
-/// written.
+/// The trip does not clear the source guard's dispatch cell. The bridge
+/// stays the target until the host, already outside compiled code, installs
+/// the merged module.
 #[test]
 fn a_deferred_merge_trips_once_at_its_threshold() {
     const COUNTER_ADDR: u32 = 0x10000;
@@ -2270,7 +2313,7 @@ fn a_deferred_merge_trips_once_at_its_threshold() {
         assert_eq!(
             cell(&store),
             7,
-            "the dispatch cell still names the bridge after the trip"
+            "the dispatch cell keeps naming the attached bridge after the trip"
         );
     }
     assert_eq!(store.data(), &[77], "the callback names its own merge");
@@ -2298,8 +2341,10 @@ fn inline_region_inputs(
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -2332,6 +2377,7 @@ fn inlined_bridge_without_owner_loop_label_declines() {
             inputargs: vec![InputArg::from_type_rc(Type::Int, 1)],
             ops: vec![Op::new(OpCode::Finish, &[])],
             gc_table_base: 0,
+            gc_const_keys: Vec::new(),
             constants: indexmap::IndexMap::new(),
         }],
     );
@@ -2459,6 +2505,7 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
                 ],
                 ops: region_ops,
                 gc_table_base: 0,
+                gc_const_keys: Vec::new(),
                 constants: indexmap::IndexMap::new(),
             }],
             constants: indexmap::IndexMap::new(),
@@ -2470,8 +2517,10 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
             nursery: None,
             invalidated_flag_addr: 0,
             gc_table_base: 0,
+            gc_const_keys: Vec::new(),
             fail_index_base: 0,
             bridge_cells_base: 0,
+            guard_cell_addrs: Vec::new(),
             bridge_entry_arity: None,
             bridge_param_dispatch: false,
             trace_entry_census: None,
@@ -2589,8 +2638,10 @@ fn call_assembler_accepts_float_and_void_result_locals() {
             nursery: None,
             invalidated_flag_addr: 0,
             gc_table_base: 0,
+            gc_const_keys: Vec::new(),
             fail_index_base: 0,
             bridge_cells_base: 0,
+            guard_cell_addrs: Vec::new(),
             bridge_entry_arity: None,
             bridge_param_dispatch: false,
             trace_entry_census: None,
@@ -2608,7 +2659,7 @@ fn call_assembler_accepts_float_and_void_result_locals() {
                     },
                 )]),
                 deopt_helper_slot: 1,
-                ca_alloc_fn_ptr: 2,
+                ca_push_fn_ptr: 2,
                 ca_pop_fn_ptr: 3,
                 ca_reload_fn_ptr: 4,
                 ca_reload_caller_fn_ptr: 5,
@@ -2639,17 +2690,23 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
     let token = 0x5a5a_u64;
     let nursery_free = 0x1000_u32;
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
-    let call = make_op(
-        OpCode::CallAssemblerI,
+    let frame_ref = OpRef::int_op(2);
+    let malloc = make_op(
+        OpCode::CallMallocNurseryVarsizeFrame,
         &[OpRef::input_arg_int(0)],
-        OpRef::int_op(1),
+        frame_ref,
     );
+    let call = make_op(OpCode::CallAssemblerI, &[frame_ref], OpRef::int_op(1));
     call.setdescr(std::sync::Arc::new(TargetTokenCallDescr {
         arg_types: vec![Type::Int],
         result_type: Type::Int,
         target_token: token,
     }));
-    let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
+    let ops = vec![
+        malloc,
+        call,
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]),
+    ];
     let inputs = codegen::ModuleBuildInputs {
         inputargs,
         ops,
@@ -2658,13 +2715,23 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
-        alloc: codegen::AllocHelpers::default(),
+        alloc: codegen::AllocHelpers {
+            new_fn_ptr: 0x11,
+            ..codegen::AllocHelpers::default()
+        },
         wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
-        nursery: None,
+        nursery: Some(codegen::NurseryAllocParams {
+            free_addr: nursery_free,
+            top_addr: 0x1008,
+            large_threshold: 4096,
+            plain_tids: std::collections::HashSet::new(),
+        }),
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -2672,7 +2739,7 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
         external_jump_slot: 0,
         external_jump_wide_slot: 0,
         external_jump_key: 0,
-        frame: codegen::FrameGeometry::fixed(),
+        frame: codegen::FrameGeometry::compact(4, 1, 0),
         ca: codegen::CaParams {
             emit_ca: true,
             targets: HashMap::from([(
@@ -2682,7 +2749,7 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
                 },
             )]),
             deopt_helper_slot: 1,
-            ca_alloc_fn_ptr: 2,
+            ca_push_fn_ptr: 2,
             ca_pop_fn_ptr: 3,
             ca_reload_fn_ptr: 4,
             ca_reload_caller_fn_ptr: 5,
@@ -2723,7 +2790,7 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
     // The CA arm no longer memory.fills the frozen home range; the
     // callee key-0 prologue nulls only marked slots. The bump itself
     // must not refill `ca_frame_bytes`.
-    let frame = codegen::FrameGeometry::fixed();
+    let frame = codegen::FrameGeometry::compact(4, 1, 0);
     assert!(
         !fill_lengths.contains(&(frame.ca_frame_bytes as i32)),
         "inline CA bump must not memory.fill ca_frame_bytes; fills were {fill_lengths:?}"
@@ -2752,8 +2819,10 @@ fn entry_prologue_does_not_null_unmarked_home_padding() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -2835,8 +2904,10 @@ fn call_assembler_pop_reads_callee_gnf2_from_snapshot() {
             nursery: None,
             invalidated_flag_addr: 0,
             gc_table_base: 0,
+            gc_const_keys: Vec::new(),
             fail_index_base: 0,
             bridge_cells_base: 0,
+            guard_cell_addrs: Vec::new(),
             bridge_entry_arity: None,
             bridge_param_dispatch: false,
             trace_entry_census: None,
@@ -2854,7 +2925,7 @@ fn call_assembler_pop_reads_callee_gnf2_from_snapshot() {
                     },
                 )]),
                 deopt_helper_slot: 1,
-                ca_alloc_fn_ptr: 2,
+                ca_push_fn_ptr: 2,
                 ca_pop_fn_ptr,
                 ca_reload_fn_ptr: 4,
                 ca_reload_caller_fn_ptr: 5,
@@ -3037,6 +3108,7 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
                 ],
                 ops: region_ops,
                 gc_table_base: 0,
+                gc_const_keys: Vec::new(),
                 constants: region_constants,
             }],
             constants: owner_constants,
@@ -3048,8 +3120,10 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
             nursery: None,
             invalidated_flag_addr: 0,
             gc_table_base: 0,
+            gc_const_keys: Vec::new(),
             fail_index_base: 0,
             bridge_cells_base: 0,
+            guard_cell_addrs: Vec::new(),
             bridge_entry_arity: None,
             bridge_param_dispatch: false,
             trace_entry_census: None,
@@ -3236,8 +3310,10 @@ fn label_ref_phi_without_a_producer_declines() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -3310,8 +3386,10 @@ fn compute_home_gcmap_simple_loop_is_valid() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -3380,8 +3458,10 @@ fn home_gcmap_union_call_validates_on_a_reload_only_residual_family() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -3454,8 +3534,10 @@ fn home_gcmap_publish_pointer_eq_guards_the_union_call() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -3528,8 +3610,10 @@ fn reemit_nulls_grown_label_homes_and_builds() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -3590,8 +3674,10 @@ fn label_arg_import_hole_is_not_an_unbound_read() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -3630,8 +3716,10 @@ fn unbound_non_label_read_of_import_hole_is_declined() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -3788,8 +3876,10 @@ fn test_external_jump_leftover_inputarg_declines() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -3854,8 +3944,10 @@ fn test_stray_failarg_ref_declines() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -3935,7 +4027,6 @@ fn test_force_arm_rematerializes_constptr_from_gc_table() {
     // address in the untraced force slot. Tag the GC-table slot so
     // `dead_frame_from_forced_frame` reloads after a collection.
     let table_base = 0x2000u32;
-    codegen::bind_failarg_const_table(&[majit_ir::GcRef(0x1000)], table_base);
     let call = make_op(
         OpCode::CallMayForceI,
         &[OpRef::const_int(42)],
@@ -3961,8 +4052,8 @@ fn test_force_arm_rematerializes_constptr_from_gc_table() {
         &[call, guard, finish],
         127,
         table_base,
+        &[0x1000],
     );
-    codegen::bind_failarg_const_table(&[], 0);
     validate_wasm(&bytes);
     let tagged = i64::from(table_base) | 3;
     assert!(
@@ -3985,8 +4076,6 @@ fn test_force_arm_rebinding_keeps_compile_time_constptr_key() {
             r.0 = 0x9000;
         }
     });
-    codegen::bind_failarg_const_table(&[], 0);
-    codegen::extend_failarg_const_table_from_gc_table(&table);
     let call = make_op(
         OpCode::CallMayForceI,
         &[OpRef::const_int(42)],
@@ -4012,8 +4101,8 @@ fn test_force_arm_rebinding_keeps_compile_time_constptr_key() {
         &[call, guard, finish],
         127,
         table.base_addr() as u32,
+        &[table.compile_key(0)],
     );
-    codegen::bind_failarg_const_table(&[], 0);
     validate_wasm(&bytes);
     let tagged = i64::from(table.base_addr() as u32) | 3;
     assert!(
@@ -4041,9 +4130,6 @@ fn test_force_arm_lookup_stays_on_the_emitting_table() {
         }
     });
     let later = majit_gc::GcTable::from_gcrefs(&[majit_ir::GcRef(0x1000)]);
-    codegen::bind_failarg_const_table(&[], 0);
-    codegen::extend_failarg_const_table_from_gc_table(&owner);
-    codegen::extend_failarg_const_table_from_gc_table(&later);
     let call = make_op(
         OpCode::CallMayForceI,
         &[OpRef::const_int(42)],
@@ -4069,8 +4155,8 @@ fn test_force_arm_lookup_stays_on_the_emitting_table() {
         &[call, guard, finish],
         127,
         owner.base_addr() as u32,
+        &[owner.compile_key(0)],
     );
-    codegen::bind_failarg_const_table(&[], 0);
     validate_wasm(&bytes);
     let owner_tagged = i64::from(owner.base_addr() as u32) | 3;
     let later_tagged = i64::from(later.base_addr() as u32) | 3;
@@ -4118,8 +4204,10 @@ fn test_inputarg_observation_is_not_a_folded_scalar() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -4360,8 +4448,10 @@ fn zero_arity_parameter_entry_is_structurally_type_zero() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 4,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: Some(0),
         bridge_param_dispatch: true,
         trace_entry_census: None,
@@ -4619,7 +4709,7 @@ fn test_list_append_word_abi_and_new_type_indices_match_declared_i64_types() {
 }
 
 #[test]
-fn test_true_void_float_arg_call_keeps_trampoline() {
+fn test_true_void_float_arg_call_lowers_in_module() {
     let inputargs = vec![
         InputArg::from_type_rc(Type::Float, 0),
         InputArg::from_type_rc(Type::Int, 1),
@@ -4629,33 +4719,6 @@ fn test_true_void_float_arg_call_keeps_trampoline() {
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]),
     ];
     let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
-
-    validate_wasm(&bytes);
-    assert_eq!(guards.len(), 1);
-    assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
-    let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
-    assert!(indirect_calls.is_empty());
-}
-
-/// The vouched twin of `test_true_void_float_arg_call_keeps_trampoline`: once
-/// the callee is named, the same `(f64) -> ()` shape lowers in-module. No
-/// uniform family can express it -- the word families cannot carry an `f64`,
-/// and the typed family is the only arm whose result may be `Type::Void` --
-/// so this is the one path that exercises the void arm end to end.
-#[test]
-fn test_vouched_true_void_float_arg_call_lowers_in_module() {
-    let inputargs = vec![
-        InputArg::from_type_rc(Type::Float, 0),
-        InputArg::from_type_rc(Type::Int, 1),
-    ];
-    let ops = vec![
-        void_call(vec![Type::Float], &[OpRef::input_arg_float(0)], 0),
-        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]),
-    ];
-    // `void_call` names its callee with `OpRef::const_int(42)`.
-    majit_backend_wasm::set_faithful_residual_call_addrs(&[42]);
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
-    majit_backend_wasm::set_faithful_residual_call_addrs(&[]);
 
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
@@ -4668,53 +4731,6 @@ fn test_vouched_true_void_float_arg_call_lowers_in_module() {
         (vec![wasmparser::ValType::F64], vec![])
     );
     assert_eq!(drops, 0, "a genuine void call has no result to drop");
-}
-
-/// The precedence guard inside `residual_call_typed_sig`. Admitting a
-/// `Type::Void` result put the typed family in reach of ops the two uniform
-/// void families already claim, and a type collected for such an op would
-/// declare an index no branch targets. The guard's observable is that naming
-/// the callee changes nothing: both void families still win, so the vouched
-/// build is byte-identical to the plain one.
-#[test]
-fn test_vouching_a_uniform_word_callee_emits_the_same_module() {
-    let shapes: Vec<(Vec<Type>, Vec<OpRef>, usize)> = vec![
-        // `residual_call_void_true_arity` -- all-word args, no result at all.
-        (
-            vec![Type::Int, Type::Ref],
-            vec![OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
-            0,
-        ),
-        // `residual_call_void_word_arity` -- the dummy-word C ABI, whose
-        // ignored result is dropped after the i64-family call.
-        (vec![Type::Int], vec![OpRef::input_arg_int(0)], 8),
-    ];
-    let inputargs = vec![
-        InputArg::from_type_rc(Type::Int, 0),
-        InputArg::from_type_rc(Type::Ref, 1),
-    ];
-    for (arg_types, args, result_size) in shapes {
-        let build = || {
-            let ops = vec![
-                void_call(arg_types.clone(), &args, result_size),
-                Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
-            ];
-            build_module_default(&inputargs, &ops, &indexmap::IndexMap::new()).0
-        };
-        majit_backend_wasm::set_faithful_residual_call_addrs(&[]);
-        let plain = build();
-        majit_backend_wasm::set_faithful_residual_call_addrs(&[42]);
-        let vouched = build();
-        majit_backend_wasm::set_faithful_residual_call_addrs(&[]);
-
-        validate_wasm(&plain);
-        validate_wasm(&vouched);
-        assert_eq!(
-            plain, vouched,
-            "a callee a uniform family can express must reach its emit through \
-             that family, so vouching it must change no byte"
-        );
-    }
 }
 
 #[test]
@@ -4903,8 +4919,10 @@ fn test_guard_not_invalidated_loads_runtime_flag() {
         nursery: None,
         invalidated_flag_addr: 0x1000,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -5297,8 +5315,10 @@ fn gc_table_load_inside_a_loop_body_is_emitted_inside_the_loop() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -5410,8 +5430,10 @@ fn preamble_gc_table_failarg_is_reloaded_inside_the_loop() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -5745,8 +5767,10 @@ fn build_external_jump_module(
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 1,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -5972,6 +5996,7 @@ fn build_owner_with_region_closing_at(
             inputargs: vec![InputArg::from_type_rc(Type::Int, 10)],
             ops: region_ops,
             gc_table_base: 0,
+            gc_const_keys: Vec::new(),
             constants: indexmap::IndexMap::new(),
         }],
     );
@@ -6155,6 +6180,7 @@ fn run_non_header_region_repro(with_ref: bool) -> (i64, i64, i64) {
             },
             ops: region_ops,
             gc_table_base: 0,
+            gc_const_keys: Vec::new(),
             constants: indexmap::IndexMap::new(),
         }],
     );
@@ -6712,6 +6738,7 @@ fn run_non_header_capture_repro() -> (i64, i64, i64) {
             inputargs: vec![InputArg::from_type_rc(Type::Int, 10)],
             ops: region_ops,
             gc_table_base: 0,
+            gc_const_keys: Vec::new(),
             constants: indexmap::IndexMap::new(),
         }],
     );
@@ -6830,6 +6857,7 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
                 inputargs: vec![InputArg::from_type_rc(Type::Int, 10)],
                 ops: region_a,
                 gc_table_base: 0,
+                gc_const_keys: Vec::new(),
                 constants: indexmap::IndexMap::new(),
             },
             codegen::InlinedBridge {
@@ -6840,6 +6868,7 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
                 inputargs: vec![InputArg::from_type_rc(Type::Int, 20)],
                 ops: region_b,
                 gc_table_base: 0,
+                gc_const_keys: Vec::new(),
                 constants: indexmap::IndexMap::new(),
             },
         ],
@@ -6992,6 +7021,7 @@ fn preamble_region_inputs() -> codegen::ModuleBuildInputs {
             inputargs: vec![InputArg::from_type_rc(Type::Int, 10)],
             ops: region_ops,
             gc_table_base: 0,
+            gc_const_keys: Vec::new(),
             constants: indexmap::IndexMap::new(),
         }],
     )
@@ -7172,6 +7202,7 @@ fn run_mixed_region_families_repro() -> (i64, i64, i64) {
                 inputargs: vec![InputArg::from_type_rc(Type::Int, 20)],
                 ops: region_b,
                 gc_table_base: 0,
+                gc_const_keys: Vec::new(),
                 constants: indexmap::IndexMap::new(),
             },
             codegen::InlinedBridge {
@@ -7182,6 +7213,7 @@ fn run_mixed_region_families_repro() -> (i64, i64, i64) {
                 inputargs: vec![InputArg::from_type_rc(Type::Int, 10)],
                 ops: region_a,
                 gc_table_base: 0,
+                gc_const_keys: Vec::new(),
                 constants: indexmap::IndexMap::new(),
             },
         ],
@@ -7274,6 +7306,7 @@ fn a_preamble_region_closing_at_a_label_past_its_guard_declines() {
                 region_jump,
             ],
             gc_table_base: 0,
+            gc_const_keys: Vec::new(),
             constants: indexmap::IndexMap::new(),
         }],
     );
@@ -7456,6 +7489,7 @@ fn region_closing_at_the_header_permutes_two_ref_label_args() {
             ],
             ops: region_ops,
             gc_table_base: 0,
+            gc_const_keys: Vec::new(),
             constants: indexmap::IndexMap::new(),
         }],
         constants: indexmap::IndexMap::new(),
@@ -7467,8 +7501,10 @@ fn region_closing_at_the_header_permutes_two_ref_label_args() {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -7653,6 +7689,7 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
             ],
             ops: region_ops,
             gc_table_base: 0,
+            gc_const_keys: Vec::new(),
             constants: indexmap::IndexMap::new(),
         }],
         constants: indexmap::IndexMap::new(),
@@ -7664,8 +7701,10 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -8127,8 +8166,10 @@ fn build_module_with_barrier_helpers(
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -8588,22 +8629,31 @@ fn count_operators(bytes: &[u8], mut f: impl FnMut(&wasmparser::Operator<'_>)) {
 /// args[0].
 #[test]
 fn cond_call_value_tests_its_value_and_calls_arg_one() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
     let inputargs = vec![
         InputArg::from_type_rc(Type::Int, 0),
         InputArg::from_type_rc(Type::Int, 1),
     ];
-    let ops = vec![
-        make_op(
-            OpCode::CondCallValueI,
-            &[
-                OpRef::input_arg_int(0),
-                OpRef::const_int(0x100),
-                OpRef::input_arg_int(1),
-            ],
-            OpRef::int_op(2),
-        ),
-        Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
-    ];
+    let call = make_op(
+        OpCode::CondCallValueI,
+        &[
+            OpRef::input_arg_int(0),
+            OpRef::const_int(0x100),
+            OpRef::input_arg_int(1),
+        ],
+        OpRef::int_op(2),
+    );
+    call.setdescr(Arc::new(SimpleCallDescr::new(
+        0,
+        vec![Type::Int],
+        Type::Int,
+        false,
+        8,
+        EffectInfo::default(),
+    )));
+    let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))])];
     let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
     validate_wasm(&bytes);
     let (mut eqz, mut ifs) = (0, 0);
@@ -8614,10 +8664,7 @@ fn cond_call_value_tests_its_value_and_calls_arg_one() {
     });
     assert!(eqz >= 1, "COND_CALL_VALUE tests its value with i64.eqz");
     assert_eq!(ifs, 1, "the call sits under exactly one predicate");
-    assert!(
-        import_func_type(&bytes, "jit_call_compact").is_some(),
-        "COND_CALL_VALUE uses the residual trampoline"
-    );
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
 }
 
 /// x86/assembler.py `genop_guard_guard_nonnull_class` guards the class compare
@@ -9163,20 +9210,32 @@ fn zero_array_uses_memory_fill_for_the_rewriter_range() {
 /// `genop_discard_cond_call`: CondCallN is a real conditional call, not a no-op.
 #[test]
 fn cond_call_reload_sits_on_the_arm_that_called() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
     let inputargs = vec![
         InputArg::from_type_rc(Type::Int, 0),
         InputArg::from_type_rc(Type::Ref, 1),
     ];
+    let call = make_op(
+        OpCode::CondCallN,
+        &[
+            OpRef::input_arg_int(0),
+            OpRef::const_int(0x100),
+            OpRef::input_arg_ref(1),
+        ],
+        OpRef::NONE,
+    );
+    call.setdescr(Arc::new(SimpleCallDescr::new(
+        0,
+        vec![Type::Ref],
+        Type::Void,
+        false,
+        8,
+        EffectInfo::default(),
+    )));
     let ops = vec![
-        make_op(
-            OpCode::CondCallN,
-            &[
-                OpRef::input_arg_int(0),
-                OpRef::const_int(0x100),
-                OpRef::input_arg_ref(1),
-            ],
-            OpRef::NONE,
-        ),
+        call,
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(1))]),
     ];
     let frame = codegen::FrameGeometry::compact(
@@ -9220,7 +9279,50 @@ fn cond_call_reload_sits_on_the_arm_that_called() {
 }
 
 #[test]
-fn cond_call_n_emits_predicate_and_trampoline() {
+fn cond_call_n_emits_predicate_and_direct_call() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let call = make_op(
+        OpCode::CondCallN,
+        &[
+            OpRef::input_arg_int(0),
+            OpRef::const_int(0x100),
+            OpRef::input_arg_int(1),
+        ],
+        OpRef::NONE,
+    );
+    call.setdescr(Arc::new(SimpleCallDescr::new(
+        0,
+        vec![Type::Int],
+        Type::Void,
+        false,
+        8,
+        EffectInfo::default(),
+    )));
+    let ops = vec![
+        call,
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let (mut eqz, mut ifs) = (0, 0);
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64Eqz => eqz += 1,
+        wasmparser::Operator::If { .. } => ifs += 1,
+        _ => {}
+    });
+    assert!(eqz >= 1, "CondCallN tests the predicate with i64.eqz");
+    assert!(ifs >= 1, "CondCallN wraps the call in an if");
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+}
+
+#[test]
+fn cond_call_without_call_descr_is_unsupported() {
     let inputargs = vec![
         InputArg::from_type_rc(Type::Int, 0),
         InputArg::from_type_rc(Type::Int, 1),
@@ -9237,19 +9339,39 @@ fn cond_call_n_emits_predicate_and_trampoline() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
-    validate_wasm(&bytes);
-    let (mut eqz, mut ifs) = (0, 0);
-    count_operators(&bytes, |op| match op {
-        wasmparser::Operator::I64Eqz => eqz += 1,
-        wasmparser::Operator::If { .. } => ifs += 1,
-        _ => {}
-    });
-    assert!(eqz >= 1, "CondCallN tests the predicate with i64.eqz");
-    assert!(ifs >= 1, "CondCallN wraps the call in an if");
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.clone(),
+        ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        gc_const_keys: Vec::new(),
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
     assert!(
-        import_func_type(&bytes, "jit_call_compact").is_some(),
-        "CondCallN uses the residual trampoline"
+        matches!(
+            codegen::build_wasm_module(&inputs),
+            Err(majit_backend::BackendError::Unsupported(_))
+        ),
+        "COND_CALL without a call descr must decline"
     );
 }
 
@@ -9679,7 +9801,7 @@ fn consecutive_allocations_home_and_reload_before_each_collection() {
     let memory = Memory::new(&mut store, MemoryType::new(1, None)).unwrap();
     let alloc = wasmi::Func::wrap(
         &mut store,
-        move |mut caller: wasmi::Caller<'_, Vec<i64>>, tid: i64, size: i64| -> i64 {
+        move |mut caller: wasmi::Caller<'_, Vec<i64>>, tid: i64, _size: i64| -> i64 {
             assert_eq!(tid, 0, "CallMallocNursery slow path stamps tid later");
             let prior = caller.data().clone();
             for (index, old) in prior.into_iter().enumerate() {
@@ -9766,8 +9888,10 @@ fn nursery_new_inputs(ops: Vec<Op>, plain_tid: u32) -> codegen::ModuleBuildInput
         }),
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -10407,6 +10531,7 @@ fn inlined_region_new_does_not_join_the_owners_nursery_batch() {
         inputargs: region_ia,
         ops: region_ops,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         constants: region_consts,
     }];
     let inputs = rewrite_module_inputs(inputs);
@@ -10747,7 +10872,7 @@ fn call_malloc_nursery_variants_lower() {
     assert_eq!(
         memory_fill_count(&bytes),
         0,
-        "CallMallocNurseryVarsizeFrame fast path must not memory.fill the payload"
+        "CallMallocNurseryVarsizeFrame leaves home clears to the CA arm"
     );
 
     let varsize = make_op(
@@ -10808,8 +10933,10 @@ fn inline_nursery_new_elides_the_barrier_like_gen_malloc_nursery() {
         nursery,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
+        gc_const_keys: Vec::new(),
         fail_index_base: 0,
         bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
@@ -11078,22 +11205,16 @@ fn call_i_two_ints() -> (Vec<InputArgRc>, Vec<Op>) {
     (inputargs, ops)
 }
 
-fn with_vouched_oracle(addr: i64, encoded: Option<i64>, body: impl FnOnce()) {
+/// Host codegen tests have no function table. `encoded` stands in for the
+/// type `jit_func_sig` would read from the guest table.
+fn with_table_sig(addr: i64, encoded: Option<i64>, body: impl FnOnce()) {
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
             majit_backend_wasm::clear_test_residual_target_sigs();
-            majit_backend_wasm::set_faithful_residual_call_addrs(&[]);
-            majit_backend_wasm::codegen::set_residual_call_abi(
-                majit_backend_wasm::codegen::ResidualCallAbi::Word,
-            );
         }
     }
     let _restore = Restore;
-    majit_backend_wasm::codegen::set_residual_call_abi(
-        majit_backend_wasm::codegen::ResidualCallAbi::Vouched,
-    );
-    majit_backend_wasm::set_faithful_residual_call_addrs(&[]);
     majit_backend_wasm::clear_test_residual_target_sigs();
     if let Some(encoded) = encoded {
         majit_backend_wasm::set_test_residual_target_sig(addr, encoded);
@@ -11110,7 +11231,7 @@ fn test_oracle_i64_call_lowers_in_module_without_vouch() {
         ],
         Some(majit_backend_wasm::FuncSigVal::I64),
     );
-    with_vouched_oracle(42, Some(encoded), || {
+    with_table_sig(42, Some(encoded), || {
         let (inputargs, ops) = call_i_two_ints();
         let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
         validate_wasm(&bytes);
@@ -11129,7 +11250,7 @@ fn test_oracle_i32_call_lowers_with_wrap_and_zero_extend() {
         ],
         Some(majit_backend_wasm::FuncSigVal::I32),
     );
-    with_vouched_oracle(42, Some(encoded), || {
+    with_table_sig(42, Some(encoded), || {
         let (inputargs, ops) = call_i_two_ints();
         let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
         validate_wasm(&bytes);
@@ -11143,7 +11264,6 @@ fn test_oracle_i32_call_lowers_with_wrap_and_zero_extend() {
                 vec![wasmparser::ValType::I32]
             )
         );
-        // Two argument wraps. The const table-index wrap folds to `i32.const`.
         assert_eq!(
             count_ops(&bytes, |op| matches!(op, wasmparser::Operator::I32WrapI64)),
             2
@@ -11164,8 +11284,7 @@ fn test_oracle_f32_mismatch_keeps_trampoline_even_if_vouched() {
         &[majit_backend_wasm::FuncSigVal::F32],
         Some(majit_backend_wasm::FuncSigVal::I64),
     );
-    with_vouched_oracle(42, Some(encoded), || {
-        majit_backend_wasm::set_faithful_residual_call_addrs(&[42]);
+    with_table_sig(42, Some(encoded), || {
         let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
         let call = {
             let op = Op::new(
@@ -11190,21 +11309,12 @@ fn test_oracle_f32_mismatch_keeps_trampoline_even_if_vouched() {
 }
 
 #[test]
-fn test_oracle_unknown_follows_vouch_list() {
-    with_vouched_oracle(42, None, || {
-        let (inputargs, ops) = call_i_two_ints();
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
-        validate_wasm(&bytes);
-        assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
-    });
-    with_vouched_oracle(42, None, || {
-        majit_backend_wasm::set_faithful_residual_call_addrs(&[42]);
+fn test_oracle_unknown_follows_descr_not_vouch_list() {
+    with_table_sig(42, None, || {
         let (inputargs, ops) = call_i_two_ints();
         let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
-        let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
-        assert_eq!(indirect_calls.len(), 1);
     });
 }
 
@@ -11217,7 +11327,7 @@ fn test_oracle_picks_calln_void_true_vs_void_word() {
 
     let true_void =
         majit_backend_wasm::encode_func_sig(&[majit_backend_wasm::FuncSigVal::I64], None);
-    with_vouched_oracle(42, Some(true_void), || {
+    with_table_sig(42, Some(true_void), || {
         let ops = vec![call_n(8), finish()];
         let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
         validate_wasm(&bytes);
@@ -11235,7 +11345,7 @@ fn test_oracle_picks_calln_void_true_vs_void_word() {
         &[majit_backend_wasm::FuncSigVal::I64],
         Some(majit_backend_wasm::FuncSigVal::I64),
     );
-    with_vouched_oracle(42, Some(void_word), || {
+    with_table_sig(42, Some(void_word), || {
         let ops = vec![call_n(0), finish()];
         let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
         validate_wasm(&bytes);

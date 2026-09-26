@@ -1,17 +1,17 @@
 # pyre-check: spec-folds=load_attr,builtin_getattr
-# pyre-check: max-wasm-ratio=6.3
+# pyre-check: max-wasm-ratio=4.1
 # Function.call_args now enters every application-level callee through the
 # recursive portal, matching PyPy's PyCode.funcrun -> PyFrame.run chain.  The
 # oracle reaches 446 loops / 4 bridges in this pure-Python pickle workload;
 # pyre's wasm run reaches 72 / 0, so suppressing those entry traces to recover
 # the old timing would move away from the oracle.  wasm materializes the traces
 # as separate modules, while this fixture also retains 450 host residual calls.
-# The post-port ratios reproduce at 5.3x and 5.4x against dynasm on
-# darwin-arm64; 6.3x is the highest observation plus WASM_RATIO_FIT_HEADROOM
-# (15%).  One ubuntu-24.04 run read it at 3.5x, far enough under the 4x
-# ceiling's fit margin that the summary there names the allowance
-# outgrown -- it is the darwin reading no CI run measures that this holds
-# for.
+# The allowance was 6.3x, fitted to darwin-arm64 readings of 5.3x and 5.4x.
+# Four readings on that host now give 3.2x, 3.3x, 3.3x and 3.5x, so 4.1x is
+# the highest of them plus WASM_RATIO_FIT_HEADROOM (15%).  ubuntu-24.04 reads
+# 2.4x and 2.7x and would gate this fixture at WASM_MAX_DYNASM_RATIO without
+# an allowance at all; the allowance is for the darwin reading no CI run
+# measures.
 # The attribute fold, 690 firings across the corpus and undeclared. Pure-Python
 # pickle drives it 122 times here, more than any other fixture.  It also reaches
 # `builtin_getattr`, which a corpus census found no other fixture firing: once

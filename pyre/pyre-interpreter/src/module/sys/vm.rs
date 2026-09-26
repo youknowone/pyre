@@ -1676,14 +1676,7 @@ pub fn is_builtin_exc_info_function(callable: PyObjectRef) -> bool {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_exc_info_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__majit_wrap_exc_info"),
-        func: __majit_wrap_exc_info,
-    };
+crate::builtin_wrapper_descriptor!(__majit_wrap_exc_info_target, __majit_wrap_exc_info);
 
 /// pypy/module/sys/vm.py `exception` — the exception instance currently being
 /// handled, or None outside an `except` block: the value half of
@@ -1716,14 +1709,10 @@ pub fn __majit_wrap_sys_exception(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     Ok(sys_exception_direct())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_sys_exception_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__majit_wrap_sys_exception"),
-        func: __majit_wrap_sys_exception,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_wrap_sys_exception_target,
+    __majit_wrap_sys_exception
+);
 
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     module_ns_store(ns, "maxsize", w_int_new(i64::MAX));
@@ -4503,8 +4492,8 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             if let Some(s_obj) = pick_str(args) {
                 let (encoding, _) = live_stdio_encoding_errors("stderr", "backslashreplace");
                 let bytes = encode_stdio_text(s_obj, "stderr", &encoding, "backslashreplace")?;
-                // An embedder with no fd 2 (wasm32) takes the bytes through
-                // its hook; otherwise fall through to the descriptor.
+                // An embedder that installed a hook takes the bytes here;
+                // otherwise fall through to the descriptor.
                 if !crate::stderr_hook_emit(&bytes) {
                     // Under sandbox fd 1 is the marshalling pipe, so a raw write
                     // would corrupt the protocol: route through ll_os_write(2,…)
@@ -4534,8 +4523,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
                 let (encoding, errors) = live_stdio_encoding_errors("stdout", "strict");
                 let bytes = encode_stdio_text(s_obj, "stdout", &encoding, &errors)?;
                 // Same seam `print` rides, so an embedder that captures stdout
-                // (wasm32, which has no fd 1) sees `sys.stdout.write` too and
-                // the two stay in order.
+                // sees `sys.stdout.write` too and the two stay in order.
                 if !crate::print_hook_emit_bytes(&bytes) {
                     #[cfg(not(feature = "sandbox"))]
                     {

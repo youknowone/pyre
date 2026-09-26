@@ -40,6 +40,7 @@ pub mod minimarkpage;
 pub mod nursery;
 pub mod nursery_clock;
 pub mod oldgen;
+mod process_ceiling;
 pub mod rawrefcount;
 pub mod rewrite;
 pub mod rgil;
@@ -3952,6 +3953,10 @@ pub fn gc_object_finalizer_pending(addr: usize) -> bool {
 pub fn gc_set_max_heap_size(size: usize) {
     gc_sync::gc_op(|gc| gc.set_max_heap_size(size));
 }
+
+pub use process_ceiling::{
+    arm_process_memory_ceiling, note_alloc_refused, process_memory_ceiling, try_charge, uncharge,
+};
 
 /// incminimark.py `max_heap_size_already_raised` — whether the program has
 /// already been handed the one `MemoryError` a bounded heap owes it.

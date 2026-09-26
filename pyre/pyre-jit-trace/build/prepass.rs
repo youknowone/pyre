@@ -1164,9 +1164,10 @@ fn real_main() {
     #[cfg(feature = "full")]
     pyre_module::register();
     let fnaddr_bindings = pyre_interpreter::jit_trace_fnaddrs();
-    // Host-only: `BUILTIN_WRAPPER_DESCRIPTORS` is empty on wasm32.
-    // A missing row here means the build-dep was dropped and every
-    // moved builtin will residualise at `no jitcode for address`.
+    // This build script is the host, so it reads the linkme slice. The
+    // wasm guest fills the same set from constructors. A missing row
+    // here means the build-dep was dropped and every moved builtin
+    // residualises at `no jitcode for address`.
     #[cfg(feature = "full")]
     if !fnaddr_bindings
         .iter()

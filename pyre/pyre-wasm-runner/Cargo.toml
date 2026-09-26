@@ -38,3 +38,6 @@ sha2 = "0.10"
 # The entropy `pyre_host.host_random` serves the guest. wasm32-unknown-unknown
 # has no OS entropy, so the guest's `os.urandom` and `secrets` are this call.
 getrandom = { workspace = true }
+libc = { workspace = true }
+mimalloc = { version = "0.1" }
+wasmi_core = "1.1"

@@ -1840,7 +1840,7 @@ static SEQ_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "index",
                 pyre_object::iterobject::SEQ_ITER_INDEX_OFFSET,
-                8,
+                std::mem::size_of::<isize>(),
                 Type::Int,
                 true,
                 false,
@@ -1889,7 +1889,7 @@ static TUPLE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
             (
                 "index",
                 std::mem::offset_of!(pyre_object::iterobject::W_TupleIterObject, index),
-                std::mem::size_of::<i64>(),
+                std::mem::size_of::<isize>(),
                 Type::Int,
                 true,
                 false,
@@ -1920,7 +1920,7 @@ static LIST_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| 
             (
                 "index",
                 std::mem::offset_of!(pyre_object::iterobject::W_ListIterObject, index),
-                std::mem::size_of::<i64>(),
+                std::mem::size_of::<isize>(),
                 Type::Int,
                 true,
                 false,

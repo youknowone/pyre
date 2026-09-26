@@ -2447,8 +2447,13 @@ impl AsmLargeBlock {
             flags |= libc::MAP_JIT;
         }
         let prot = libc::PROT_EXEC | libc::PROT_READ | libc::PROT_WRITE;
+        if !majit_gc::try_charge(size) {
+            majit_gc::note_alloc_refused();
+            return Err(io::Error::other("process memory limit exceeded"));
+        }
         let ptr = unsafe { libc::mmap(std::ptr::null_mut(), size, prot, flags, -1, 0) };
         if ptr == libc::MAP_FAILED {
+            majit_gc::uncharge(size);
             return Err(io::Error::last_os_error());
         }
         Ok(Self {
@@ -2462,24 +2467,43 @@ impl AsmLargeBlock {
 impl Drop for AsmLargeBlock {
     fn drop(&mut self) {
         unsafe { libc::munmap(self.start as *mut libc::c_void, self.size) };
+        majit_gc::uncharge(self.size);
     }
 }
 
 #[cfg(windows)]
 struct AsmLargeBlock {
     start: usize,
+    size: usize,
     _allocation: region::Allocation,
 }
 
 #[cfg(windows)]
 impl AsmLargeBlock {
     fn map(size: usize) -> io::Result<Self> {
-        let mut allocation = region::alloc(size, region::Protection::READ_WRITE_EXECUTE)
-            .map_err(io::Error::other)?;
+        if !majit_gc::try_charge(size) {
+            majit_gc::note_alloc_refused();
+            return Err(io::Error::other("process memory limit exceeded"));
+        }
+        let mut allocation = match region::alloc(size, region::Protection::READ_WRITE_EXECUTE) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                majit_gc::uncharge(size);
+                return Err(io::Error::other(error));
+            }
+        };
         Ok(Self {
             start: allocation.as_mut_ptr::<u8>() as usize,
+            size,
             _allocation: allocation,
         })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AsmLargeBlock {
+    fn drop(&mut self) {
+        majit_gc::uncharge(self.size);
     }
 }
 

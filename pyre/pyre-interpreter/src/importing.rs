@@ -604,10 +604,6 @@ pub struct OptionalModuleHooks {
     /// Whether `math.gamma` (or `lgamma` when the flag is set) is finite at
     /// the argument.
     pub math1_gamma_result_finite: fn(f64, bool) -> bool,
-    /// The `math` residual targets vouched faithful to their wasm ABI.
-    pub math_faithful_residual_call_addrs: fn() -> Vec<i64>,
-    /// The `math` residual targets vouched to return a word on wasm.
-    pub math_word_residual_call_addrs: fn() -> Vec<i64>,
 }
 
 static OPTIONAL_MODULE_HOOKS: std::sync::OnceLock<OptionalModuleHooks> = std::sync::OnceLock::new();
