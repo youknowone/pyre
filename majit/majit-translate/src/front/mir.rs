@@ -15008,7 +15008,8 @@ impl<'a> Lowering<'a> {
         // RBigInt comparisons are `@jit.elidable` scalar residuals in
         // RPython. Keep the two GCREF operands and return an integer-bank
         // boolean instead of following Rust's trait shim into a classless
-        // receiver method.
+        // receiver method. `_divrem`'s lhs-remainder test takes the same
+        // two-GCREF, one-boolean shape.
         let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
             && args.len() == 2
             && first_arg_ty
@@ -15019,7 +15020,9 @@ impl<'a> Lowering<'a> {
                 .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
             && let Some(residual) = match target {
                 CallTarget::FunctionPath { segments, .. } => {
-                    crate::front::bigint_binop::bigint_comparison_residual_path(segments)
+                    crate::front::bigint_binop::bigint_comparison_residual_path(segments).or_else(
+                        || crate::front::rbigint_call::divrem_lhs_remainder_residual_path(segments),
+                    )
                 }
                 CallTarget::Method { name, .. } => {
                     crate::front::bigint_binop::bigint_comparison_residual_for_method(name)

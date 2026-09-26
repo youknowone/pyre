@@ -191,6 +191,22 @@ fn divrem_returns_input_as_remainder(a: &BigInt, b: &BigInt) -> bool {
         || (size_a == size_b && a.digit((size_a - 1).abs()) < b.digit((size_b - 1).abs()))
 }
 
+/// Whether `rbigint.divmod(a, b)` reaches `_divrem`'s literal
+/// `(NULLRBIGINT, a)` return without a floored-sign adjustment, so the
+/// remainder is `a`'s own payload.
+///
+/// The MIR front retargets this call to
+/// [`jit_bigint_divrem_returns_lhs_remainder`], keeping both operands the GC
+/// references they are rather than machine words that outlive a minor
+/// collection.
+#[majit_macros::dont_look_inside]
+fn bigint_divrem_returns_lhs_remainder(a: &BigInt, b: &BigInt) -> bool {
+    a.get_sign() != 0
+        && a.get_sign() == b.get_sign()
+        && b.numdigits() != 1
+        && divrem_returns_input_as_remainder(a, b)
+}
+
 /// Host form of `rbigint.add` used by `long_add`.
 ///
 /// The MIR front retargets this call to `jit_bigint_add` and models the
@@ -742,25 +758,14 @@ pub extern "C" fn jit_bigint_neg(a: i64) -> pyre_object::longobject::JitBigIntRe
     }
 }
 
-/// Whether `rbigint.divmod(a, b)` reaches `_divrem`'s literal
-/// `(NULLRBIGINT, a)` return without a floored-sign adjustment.
+/// Pointer-ABI residual of [`bigint_divrem_returns_lhs_remainder`].
 ///
-/// This pointer-only predicate is a translation seam for W_LongObject
-/// consumers that must put the returned operand payload into a fresh wrapper.
 /// Keeping it residual avoids rebuilding the opaque RBigInt field graph in
 /// `long_mod` while retaining an elidable/cannot-raise operation.
 #[majit_macros::elidable_cannot_raise]
 pub extern "C" fn jit_bigint_divrem_returns_lhs_remainder(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe {
-        let a = &*a;
-        let b = &*b;
-        let b_size = b.numdigits();
-        (a.get_sign() != 0
-            && a.get_sign() == b.get_sign()
-            && b_size != 1
-            && divrem_returns_input_as_remainder(a, b)) as i64
-    }
+    unsafe { bigint_divrem_returns_lhs_remainder(&*a, &*b) as i64 }
 }
 
 /// `rbigint.invert` payload. Zero returns the canonical -1 prebuilt; every
@@ -1233,18 +1238,26 @@ unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // returns `self.num` with no malloc; the reflected `int` receiver is
     // coerced the way `descr_rbinop` does, after its machine word is copied.
     debug_assert!(is_long(b));
-    let vb = live_long_num(b);
+    if !is_long(a) {
+        // `descr_rbinop` coerces the int receiver first; `b`'s value is read
+        // after that malloc.
+        let va = BigInt::from(int_value(a));
+        let vb = w_long_get_value(b);
+        if !vb.tobool() {
+            return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+        }
+        return Ok(w_long_new(bigint_floordiv_nonzero(&va, vb)));
+    }
+    // Both values are read once and handed to `rbigint.floordiv`, which
+    // roots its operands before `_divmod` allocates.
+    let va = w_long_get_value(a);
+    let vb = w_long_get_value(b);
     if !vb.tobool() {
         return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
-    let va = if is_long(a) {
-        live_long_num(a)
-    } else {
-        RBigIntGcRoot::new(BigInt::from(int_value(a)))
-    };
     // rbigint.floordiv → _divmod, returning the quotient half (rbigint.py).
     // `_floordiv` `newlong`s the quotient, keeping a long.
-    Ok(w_long_new(bigint_floordiv_nonzero(&va, &vb)))
+    Ok(w_long_new(bigint_floordiv_nonzero(va, vb)))
 }
 
 /// `_int_mod`: `rbigint.int_mod_int_result`, then `space.newint`.
@@ -1261,27 +1274,31 @@ unsafe fn long_int_mod(a: PyObjectRef, other: i64) -> PyResult {
 unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // `_mod`. A machine-int divisor is `_int_mod` (`long_int_mod`).
     debug_assert!(is_long(b));
-    let vb = live_long_num(b);
+    if !is_long(a) {
+        // `descr_rbinop` coerces the int receiver first; `b`'s value is read
+        // after that malloc.
+        let va = BigInt::from(int_value(a));
+        let vb = w_long_get_value(b);
+        if !vb.tobool() {
+            return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+        }
+        return Ok(w_long_new(bigint_modulo_nonzero(&va, vb)));
+    }
+    // Both values are read once: the zero and remainder-is-lhs checks
+    // allocate nothing, and `rbigint.mod` roots its operands before
+    // `_divmod` allocates.
+    let va = w_long_get_value(a);
+    let vb = w_long_get_value(b);
     if !vb.tobool() {
         return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
-    let va = if is_long(a) {
-        live_long_num(a)
-    } else {
-        RBigIntGcRoot::new(BigInt::from(int_value(a)))
-    };
-    if is_long(a)
-        && jit_bigint_divrem_returns_lhs_remainder(
-            (&*va) as *const BigInt as i64,
-            (&*vb) as *const BigInt as i64,
-        ) != 0
-    {
+    if bigint_divrem_returns_lhs_remainder(va, vb) {
         return Ok(pyre_object::longobject::w_long_from_raw(
             w_long_get_raw_value(a),
         ));
     }
     // rbigint.mod → _divmod, returning the remainder half (rbigint.py).
-    Ok(w_long_new(bigint_modulo_nonzero(&va, &vb)))
+    Ok(w_long_new(bigint_modulo_nonzero(va, vb)))
 }
 
 /// `_int_divmod`: `rbigint.int_divmod`, then `newtuple2` of two `newlong`s.
@@ -1339,12 +1356,7 @@ unsafe fn integer_divmod_pair(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         return long_int_divmod(a, int_value(b));
     }
     let remainder_aliases_a = if is_long(a) && is_long(b) {
-        let va = live_long_num(a);
-        let vb = live_long_num(b);
-        jit_bigint_divrem_returns_lhs_remainder(
-            (&*va) as *const BigInt as i64,
-            (&*vb) as *const BigInt as i64,
-        ) != 0
+        bigint_divrem_returns_lhs_remainder(w_long_get_value(a), w_long_get_value(b))
     } else {
         false
     };
