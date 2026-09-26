@@ -432,7 +432,20 @@ pub fn init_typeobjects() {
     // downstream test builds such as `pyre-jit` enable via a dev-dependency).
     #[cfg(any(test, feature = "test-hooks"))]
     crate::test_hooks::install_hash_hook();
+
+    // A caller that arrives while another thread is still building the
+    // types must not wait for it holding the GIL: the builder drops the GIL
+    // inside `Cache.getorbuild` whenever that lock is contended, and would
+    // then wait for this caller to give the GIL back while this caller waits
+    // for the build.  So until the registry exists, the wait in `get_or_init`
+    // runs with the GIL released, and the one thread that ends up running the
+    // build takes the GIL back before it starts.
+    let mut waiting = TYPEOBJECT_CACHE
+        .get()
+        .is_none()
+        .then(crate::module::thread::before_external_block);
     TYPEOBJECT_CACHE.get_or_init(|| {
+        drop(waiting.take());
         init_subclass_ranges();
         let mut reg: HashMap<usize, usize> = HashMap::new();
 
@@ -2065,20 +2078,12 @@ pub fn init_typeobjects() {
             unsafe { retag_classmethod_descriptors(w_typeobject_addr as PyObjectRef) };
         }
 
-        reg
-    });
-
-    // The `patch_*` passes install descriptors into the shared global type
-    // dicts (e.g. `object.__class__`).  `get_or_init` above serializes only
-    // the type construction: once it returns, every concurrent
-    // `ExecutionContext::new` caller it was blocking falls through to here at
-    // once, so an unguarded first-time `type_dict_store` would race a sibling
-    // thread's `type_dict_contains` read on the same `IndexMap` and tear its
-    // internal index table.  A dedicated `Once` collapses the patch pass to a
-    // single writer; it runs after `TYPEOBJECT_CACHE` is populated so
-    // `patch_typeobject_descriptor_names` still observes the registry.
-    static PATCH_TYPEOBJECTS: std::sync::Once = std::sync::Once::new();
-    PATCH_TYPEOBJECTS.call_once(|| {
+        // The `patch_*` passes install descriptors into the shared global
+        // type dicts (e.g. `object.__class__`).  They are part of building
+        // the types, so they run before the registry is published: a caller
+        // that finds `TYPEOBJECT_CACHE` set never sees them mid-write, and an
+        // unguarded first-time `type_dict_store` cannot race a sibling
+        // thread's `type_dict_contains` read on the same `IndexMap`.
         patch_object_class_descriptor();
         patch_complex_realimag_descriptors();
         patch_float_realimag_descriptors();
@@ -2088,8 +2093,11 @@ pub fn init_typeobjects() {
         patch_frame_traceback_descriptors();
         patch_cell_descriptor();
         patch_getset_descriptor_metadata();
-        patch_typeobject_descriptor_names();
+        patch_typeobject_descriptor_names(&reg);
+
+        reg
     });
+    drop(waiting);
 }
 
 /// Install `object.__class__` after the root object type exists.
@@ -2231,10 +2239,7 @@ fn patch_float_realimag_descriptors() {
 /// this pass every descriptor's `__name__` would surface as the
 /// sentinel.  Explicit names passed via `make_*_named` survive
 /// (the sentinel-only check skips them).
-fn patch_typeobject_descriptor_names() {
-    let Some(reg) = TYPEOBJECT_CACHE.get() else {
-        return;
-    };
+fn patch_typeobject_descriptor_names(reg: &HashMap<usize, usize>) {
     for &w_typeobject_addr in reg.values() {
         let tp = w_typeobject_addr as PyObjectRef;
         if tp.is_null() {
@@ -34167,6 +34172,105 @@ mod tests {
                 barrier.wait();
                 crate::typedef::init_typeobjects();
             });
+        });
+    }
+
+    /// The contended half of the test above: when another thread holds the
+    /// `Cache.getorbuild` lock, the initializer does drop the GIL while it
+    /// waits for that lock, and a sibling can take the GIL in that window.
+    /// The sibling must not then wait for the initializer while it keeps the
+    /// GIL, or the initializer can never take the GIL back.
+    ///
+    /// Fresh process, for the same reason as the test above.
+    #[test]
+    fn init_typeobjects_does_not_deadlock_when_the_cache_lock_is_contended() {
+        use std::sync::mpsc;
+
+        if std::env::var_os("PYRE_TYPEOBJECT_CONTENDED_DEADLOCK_CHILD").is_none() {
+            let exe = std::env::current_exe().expect("test harness path");
+            let mut child = std::process::Command::new(exe)
+                .arg("typedef::tests::init_typeobjects_does_not_deadlock_when_the_cache_lock_is_contended")
+                .arg("--exact")
+                .env("PYRE_TYPEOBJECT_CONTENDED_DEADLOCK_CHILD", "1")
+                .env("RUST_TEST_THREADS", "1")
+                .spawn()
+                .expect("spawn contended deadlock-scenario child");
+            let start = std::time::Instant::now();
+            loop {
+                match child
+                    .try_wait()
+                    .expect("wait contended deadlock-scenario child")
+                {
+                    Some(status) => {
+                        assert!(
+                            status.success(),
+                            "child contended init_typeobjects scenario failed: {status}"
+                        );
+                        return;
+                    }
+                    None if start.elapsed() > std::time::Duration::from_secs(60) => {
+                        let _ = child.kill();
+                        panic!(
+                            "init_typeobjects deadlocked against a GIL-holding waiter \
+                             while the Cache.getorbuild lock was contended"
+                        );
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+        }
+
+        /// Holds the process-wide `Cache.getorbuild` lock from inside
+        /// `_build` until told to return.
+        struct HoldLock {
+            entered: mpsc::SyncSender<()>,
+            release: std::sync::Mutex<mpsc::Receiver<()>>,
+        }
+        impl majit_rlib::cache::CacheBuilder<usize, usize> for HoldLock {
+            type Error = ();
+
+            fn _build(&self, key: &usize) -> Result<usize, majit_rlib::cache::CacheError<()>> {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                Ok(*key)
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = HoldLock {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        };
+        let cache = majit_rlib::cache::Cache::<usize, usize>::new();
+        std::thread::scope(|scope| {
+            // Not a runtime thread: it holds the cache lock without the GIL.
+            scope.spawn(|| cache.getorbuild(1, &holder).unwrap());
+            entered_rx.recv().unwrap();
+            // Takes the GIL first, then drops it inside
+            // `TYPEOBJECT_CACHE.get_or_init` when it finds the lock taken.
+            let initializer = scope.spawn(crate::typedef::init_typeobjects);
+            // Takes the GIL in that window, then waits for the initializer.
+            let sibling = scope.spawn(crate::typedef::init_typeobjects);
+            // The first holder letting the GIL go is the initializer dropping
+            // it at the contended lock; give the sibling a moment to take it
+            // and reach its wait on the initializer before the lock is handed
+            // over.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut first_holder = 0;
+            while std::time::Instant::now() < deadline {
+                let holder = majit_gc::rgil::gil_get_holder();
+                if first_holder == 0 {
+                    first_holder = holder;
+                } else if holder != first_holder {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            release_tx.send(()).unwrap();
+            initializer.join().unwrap();
+            sibling.join().unwrap();
         });
     }
 
