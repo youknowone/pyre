@@ -1401,7 +1401,7 @@ fn force_box_impl(
                 last_guard_pos: -1,
             });
 
-            let len_ref = ctx.emit_constant_int(len as i64);
+            let len_ref = ctx.make_constant_int(len as i64);
             let alloc_opcode = if vinfo.clear {
                 OpCode::NewArrayClear
             } else {
@@ -1453,7 +1453,7 @@ fn force_box_impl(
                     }
                 }
                 let subbox = force_child(&item_ref, ctx);
-                let idx_ref = ctx.emit_constant_int(i as i64);
+                let idx_ref = ctx.make_constant_int(i as i64);
                 let arg_alloc = ctx.materialize_operand_at(alloc_ref);
                 let arg_idx = ctx.materialize_operand_at(idx_ref);
                 let arg_sub = ctx.resolve_operand_operand(&subbox);
@@ -1494,7 +1494,7 @@ fn force_box_impl(
                 last_guard_pos: -1,
             });
 
-            let len_ref = ctx.emit_constant_int(num_elements as i64);
+            let len_ref = ctx.make_constant_int(num_elements as i64);
             let arg_len = ctx.materialize_operand_at(len_ref);
             let mut alloc_op = Op::new(OpCode::NewArrayClear, std::slice::from_ref(&arg_len));
             alloc_op.pos().set(opref);
@@ -1531,7 +1531,7 @@ fn force_box_impl(
             //               optforce.emit_extra(setfieldop)
             //           i += 1
             for (elem_idx, fields) in element_fields.into_iter().enumerate() {
-                let idx_ref = ctx.emit_constant_int(elem_idx as i64);
+                let idx_ref = ctx.make_constant_int(elem_idx as i64);
                 for (field_idx, value_ref) in fields {
                     if value_ref.is_none() {
                         continue;
@@ -1561,8 +1561,8 @@ fn force_box_impl(
             let calldescr = vinfo.calldescr.take();
 
             // info.py:148: emit CALL_I(func, ConstInt(size), descr=calldescr)
-            let func_ref = ctx.emit_constant_int(func);
-            let size_ref = ctx.emit_constant_int(size as i64);
+            let func_ref = ctx.make_constant_int(func);
+            let size_ref = ctx.make_constant_int(size as i64);
             let arg_func = ctx.materialize_operand_at(func_ref);
             let arg_size = ctx.materialize_operand_at(size_ref);
             let mut call_op = Op::new(OpCode::CallI, &[arg_func.clone(), arg_size.clone()]);
@@ -1613,7 +1613,7 @@ fn force_box_impl(
             // constant-bound int, neither of which upstream does here.
             for (offset, _length, descr, value) in entries {
                 let value_box = ctx.materialize_operand_at(value);
-                let offset_ref = ctx.emit_constant_int(offset);
+                let offset_ref = ctx.make_constant_int(offset);
                 let arg_alloc = ctx.materialize_operand_at(alloc_ref);
                 let arg_offset = ctx.materialize_operand_at(offset_ref);
                 let arg_value = ctx.resolve_operand_operand(&value_box);
@@ -1650,7 +1650,7 @@ fn force_box_impl(
             // raw-slice identity and mis-route any later
             // `get_virtual_fields` / raw-guard path.
             let parent_forced = force_child(&slice.parent, ctx);
-            let offset_ref = ctx.emit_constant_int(slice.offset);
+            let offset_ref = ctx.make_constant_int(slice.offset);
             let arg_parent = ctx.resolve_operand_operand(&parent_forced);
             let arg_offset = ctx.materialize_operand_at(offset_ref);
             let mut add_op = Op::new(OpCode::IntAdd, &[arg_parent.clone(), arg_offset.clone()]);
@@ -1709,7 +1709,7 @@ fn force_box_impl(
 
             // vstring.py: lengthbox = self.getstrlen(op, optstring, mode)
             let lengthbox = match &variant {
-                VStringVariant::Plain(info) => ctx.emit_constant_int(info._chars.len() as i64),
+                VStringVariant::Plain(info) => ctx.make_constant_int(info._chars.len() as i64),
                 VStringVariant::Slice(info) => ctx
                     .resolve_operand_operand_opt(&info.lgtop)
                     .map(|b| b.to_opref())
@@ -1758,7 +1758,7 @@ fn force_box_impl(
             }
 
             // vstring.py: initialize_forced_string(op, optstring, op, CONST_0, mode)
-            let zero = ctx.emit_constant_int(0);
+            let zero = ctx.make_constant_int(0);
             let set_opcode = if is_unicode {
                 OpCode::Unicodesetitem
             } else {
@@ -1769,7 +1769,7 @@ fn force_box_impl(
                 VStringVariant::Plain(info) => {
                     // vstring.py VStringPlainInfo.initialize_forced_string
                     let mut offset = ctx.materialize_operand_at(zero);
-                    let one = ctx.emit_constant_int(1);
+                    let one = ctx.make_constant_int(1);
                     let one = ctx.materialize_operand_at(one);
                     for ch in &info._chars {
                         if let Some(ch_ref) = ch {

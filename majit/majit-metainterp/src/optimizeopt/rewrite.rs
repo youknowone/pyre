@@ -257,7 +257,7 @@ impl OptRewrite {
             if divisor > 1 && divisor.count_ones() == 1 {
                 // Power-of-2 division: x // (2^n) = x >> n
                 let shift = divisor.trailing_zeros();
-                let shift_ref = self.emit_constant_int(ctx, shift as i64);
+                let shift_ref = ctx.make_constant_int(shift as i64);
                 let arg_shift = ctx.materialize_operand_at(shift_ref);
                 let result_ref = ctx.emit(Op::new(OpCode::IntRshift, &[arg0, arg_shift.clone()]));
                 let b_old = Operand::from_bound_op(op_rc);
@@ -496,7 +496,7 @@ impl OptRewrite {
             && inner.opcode == OpCode::IntAnd
             && ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false)) == Some(i64::MIN)
         {
-            let zero = self.emit_constant_int(ctx, 0);
+            let zero = ctx.make_constant_int(0);
             let arg_zero = ctx.materialize_operand_at(zero);
             let mut new_op = Op::new(OpCode::IntLt, &[inner.arg(0), arg_zero.clone()]);
             new_op.pos().set(op.pos().get());
@@ -1662,7 +1662,7 @@ impl OptRewrite {
             if Self::is_exact_power_of_two(divisor) {
                 let reciprocal = 1.0 / divisor;
                 if Self::is_exact_power_of_two(reciprocal) {
-                    let recip_ref = self.emit_constant_float(ctx, reciprocal);
+                    let recip_ref = ctx.make_constant_float(reciprocal);
                     let arg_recip = ctx.materialize_operand_at(recip_ref);
                     let mut new_op = Op::new(OpCode::FloatMul, &[arg0, arg_recip.clone()]);
                     new_op.pos().set(op.pos().get());
@@ -1719,25 +1719,6 @@ impl OptRewrite {
             return OptimizationResult::Remove;
         }
         OptimizationResult::PassOn
-    }
-
-    // ── Helper ──
-
-    /// Emit a constant integer value into the trace and return its OpRef.
-    fn emit_constant_int(&self, ctx: &mut OptContext, value: i64) -> OpRef {
-        let op = Op::new(OpCode::SameAsI, &[]);
-        let opref = ctx.emit(op);
-        let b = ctx.materialize_operand_at(opref);
-        ctx.make_constant_box(&b, Value::Int(value));
-        opref
-    }
-
-    fn emit_constant_float(&self, ctx: &mut OptContext, value: f64) -> OpRef {
-        let op = Op::new(OpCode::SameAsF, &[]);
-        let opref = ctx.emit(op);
-        let b = ctx.materialize_operand_at(opref);
-        ctx.make_constant_box(&b, Value::Float(value));
-        opref
     }
 }
 

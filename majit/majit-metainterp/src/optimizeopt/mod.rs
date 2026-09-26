@@ -3222,66 +3222,13 @@ impl OptContext {
         }
     }
 
-    /// Emit a boxed integer constant through the optimizer pipeline and return
-    /// the resulting OpRef.
-    pub fn emit_constant_int(&mut self, value: i64) -> OpRef {
-        let pos_ref = self.reserve_pos_typed(Type::Int);
-        // The SAME_AS source is the constant itself (`make_constant_box` below
-        // forwards the result to the same `Const`, so the op is a tautology
-        // `result = ConstInt(value)`). A constant operand binds directly; a
-        // position-only `from_opref(pos_ref)` self-reference would have no live
-        // producer and `from_opref` rejects it (#9).
-        let mut op = Op::new(
-            OpCode::SameAsI,
-            &[Operand::const_from_value(Value::Int(value))],
-        );
-        op.pos().set(pos_ref);
-        let opref = self.emit_extra(self.current_pass_idx, op);
-        let b = self.materialize_operand_at(opref);
-        self.make_constant_box(&b, Value::Int(value));
-        opref
-    }
-
-    /// Emit a boxed reference constant through the optimizer pipeline and
-    /// return the resulting OpRef.
-    pub fn emit_constant_ref(&mut self, value: GcRef) -> OpRef {
-        let pos_ref = self.reserve_pos_typed(Type::Ref);
-        // SAME_AS source is the constant ref itself; see `emit_constant_int`.
-        let mut op = Op::new(
-            OpCode::SameAsR,
-            &[Operand::const_from_value(Value::Ref(value))],
-        );
-        op.pos().set(pos_ref);
-        let opref = self.emit_extra(self.current_pass_idx, op);
-        let b = self.materialize_operand_at(opref);
-        self.make_constant_box(&b, Value::Ref(value));
-        opref
-    }
-
-    /// Emit a boxed float constant through the optimizer pipeline and return
-    /// the resulting OpRef.
-    pub fn emit_constant_float(&mut self, value: f64) -> OpRef {
-        let pos_ref = self.reserve_pos_typed(Type::Float);
-        // SAME_AS source is the constant float itself; see `emit_constant_int`.
-        let mut op = Op::new(
-            OpCode::SameAsF,
-            &[Operand::const_from_value(Value::Float(value))],
-        );
-        op.pos().set(pos_ref);
-        let opref = self.emit_extra(self.current_pass_idx, op);
-        let b = self.materialize_operand_at(opref);
-        self.make_constant_box(&b, Value::Float(value));
-        opref
-    }
-
     /// optimizer.py new_const_item(arraydescr) — default value for
-    /// the given item type. Uses emit_extra (downstream-only) so this is
-    /// safe to call during force_box / force_virtual.
+    /// the given item type.
     pub fn new_const_item(&mut self, item_type: Type) -> OpRef {
         match item_type {
-            Type::Int | Type::Void => self.emit_constant_int(0),
-            Type::Ref => self.emit_constant_ref(GcRef::NULL),
-            Type::Float => self.emit_constant_float(0.0),
+            Type::Int | Type::Void => self.make_constant_int(0),
+            Type::Ref => self.make_constant_ref(GcRef::NULL),
+            Type::Float => self.make_constant_float(0.0),
         }
     }
 

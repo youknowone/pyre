@@ -8377,8 +8377,8 @@ mod tests {
         use crate::optimizeopt::OptContext;
 
         let mut ctx = OptContext::with_inputarg_types(64, &[Type::Ref]);
-        let first = ctx.emit_constant_ref(majit_ir::GcRef(0x1000));
-        let second = ctx.emit_constant_ref(majit_ir::GcRef(0x2000));
+        let first = ctx.make_constant_ref(majit_ir::GcRef(0x1000));
+        let second = ctx.make_constant_ref(majit_ir::GcRef(0x2000));
         let unknown = OpRef::input_arg_typed(0, Type::Ref);
 
         assert!(
@@ -8412,9 +8412,9 @@ mod tests {
         let op1 = OpRef::input_arg_typed(0, Type::Ref);
         let op2 = OpRef::input_arg_typed(1, Type::Ref);
 
-        let const_10 = ctx.emit_constant_int(10);
-        let const_20 = ctx.emit_constant_int(20);
-        let const_30 = ctx.emit_constant_int(30);
+        let const_10 = ctx.make_constant_int(10);
+        let const_20 = ctx.make_constant_int(20);
+        let const_30 = ctx.make_constant_int(30);
 
         let op1_box = ctx.materialize_operand_at(op1);
         let op2_box = ctx.materialize_operand_at(op2);

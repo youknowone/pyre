@@ -1656,7 +1656,7 @@ impl OptVirtualize {
         }
 
         // virtualize.py:129: vrefvalue.setfield(descr_forced, newop, CONST_NULL)
-        let null_ref = ctx.emit_constant_ref(majit_ir::GcRef::NULL);
+        let null_ref = ctx.make_constant_ref(majit_ir::GcRef::NULL);
 
         // virtualize.py: make_virtual(c_cls, newop, vref_descr)
         // → InstancePtrInfo(descr, known_class, is_virtual=True)
@@ -1760,9 +1760,9 @@ impl OptVirtualize {
             .unwrap_or(false);
         if did_forced_write {
             // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
-            // emit_constant_ref needs a ctx reborrow, hence two sequential
+            // make_constant_ref needs a ctx reborrow, hence two sequential
             // with_ptr_info_mut calls.
-            let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
+            let null_ref = ctx.make_constant_ref(majit_ir::GcRef(0));
             let null_op = ctx.materialize_operand_at(null_ref);
             if let Some(b) = vref_box.as_ref() {
                 ctx.with_ptr_info_mut(b, |info| {
@@ -1793,7 +1793,7 @@ impl OptVirtualize {
 
         // virtualize.py:155-158: set 'virtual_token' to CONST_NULL via
         // `vrefinfo.descr_virtual_token` (`virtualref.py:40-41`).
-        let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
+        let null_ref = ctx.make_constant_ref(majit_ir::GcRef(0));
         let arg_vref = ctx.materialize_operand_at(vref_ref);
         let arg_null = ctx.materialize_operand_at(null_ref);
         let mut set_token = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_null.clone()]);

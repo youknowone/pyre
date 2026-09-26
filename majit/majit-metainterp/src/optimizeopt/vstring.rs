@@ -52,7 +52,7 @@ pub fn _int_add(box1: &Operand, box2: &Operand, ctx: &mut OptContext) -> Operand
             .resolve_operand_operand_opt(box2)
             .and_then(|cb| cb.const_int())
         {
-            let __c = ctx.emit_constant_int(v1 + v2);
+            let __c = ctx.make_constant_int(v1 + v2);
             return ctx.materialize_operand_at(__c);
         }
     } else if ctx
@@ -134,7 +134,7 @@ pub fn copy_str_content(
             let mut src_offset = srcoffsetbox.clone();
             let mut dst_offset = offsetbox.clone();
             let one = {
-                let __one = ctx.emit_constant_int(1);
+                let __one = ctx.make_constant_int(1);
                 ctx.materialize_operand_at(__one)
             };
             for _i in 0..length {
@@ -255,7 +255,7 @@ pub fn string_copy_parts(
             // vstring.py VStringPlainInfo.initialize_forced_string
             let mut offset = offsetbox.clone();
             let one = {
-                let __one = ctx.emit_constant_int(1);
+                let __one = ctx.make_constant_int(1);
                 ctx.materialize_operand_at(__one)
             };
             for ch in &chars {
@@ -291,7 +291,7 @@ pub fn string_copy_parts(
             let lengthbox = ctx.materialize_operand_at(lengthbox);
             let srcbox = force_child_for_string(opref, ctx);
             let zero = {
-                let __zero = ctx.emit_constant_int(0);
+                let __zero = ctx.make_constant_int(0);
                 ctx.materialize_operand_at(__zero)
             };
             copy_str_content(
@@ -416,19 +416,6 @@ impl OptString {
         resolved
     }
 
-    /// Emit a SameAsI op that produces a constant integer value.
-    ///
-    /// We need a way to reference constant values as OpRefs. We emit a
-    /// SameAsI(dummy) and record the constant in the context.
-    fn emit_constant_int(&self, value: i64, ctx: &mut OptContext) -> OpRef {
-        // Emit a dummy SameAsI to get an OpRef, then record the constant.
-        let op = Op::new(OpCode::SameAsI, &[Operand::none()]);
-        let opref = ctx.emit(op);
-        let b = ctx.materialize_operand_at(opref);
-        ctx.make_constant_box(&b, Value::Int(value));
-        opref
-    }
-
     /// vstring.py StrPtrInfo.getstrlen — delegates to
     /// OptContext::getstrlen_opref which handles per-variant dispatch
     /// and lgtop caching (box identity reuse).
@@ -509,7 +496,7 @@ impl OptString {
                     .as_deref()
                     .and_then(|resolver| resolver(r, mode))
                     .and_then(|chars| chars.get(index as usize).copied())?;
-                Some(ctx.emit_constant_int(ch_val))
+                Some(ctx.make_constant_int(ch_val))
             }
             _ => None,
         }
@@ -1000,7 +987,7 @@ impl OptString {
                 .resolve_operand_operand_opt(a)
                 .and_then(|cb| cb.const_int())
             {
-                let __c = self.emit_constant_int(va - vb, ctx);
+                let __c = ctx.make_constant_int(va - vb);
                 return ctx.materialize_operand_at(__c);
             }
         }
@@ -1282,7 +1269,7 @@ impl OptString {
                     ctx.make_nonnull_str(arg1, mode);
                     // vstring.py: lengthbox = i1.getstrlen(arg1, self, mode)
                     let lengthbox = ctx.getstrlen_opref(arg1.to_opref(), mode);
-                    let zero = ctx.emit_constant_int(0);
+                    let zero = ctx.make_constant_int(0);
                     let arg_len = ctx.materialize_operand_at(lengthbox);
                     let arg_zero = ctx.materialize_operand_at(zero);
                     let mut eq_op = Op::new(OpCode::IntEq, &[arg_len.clone(), arg_zero.clone()]);
@@ -1345,7 +1332,7 @@ impl OptString {
                 return Some(OptimizationResult::Remove);
             }
             // vstring.py:784: PTR_EQ against CONST_NULL (ref-null, not int-zero)
-            let null_const = ctx.emit_constant_ref(majit_ir::GcRef::NULL);
+            let null_const = ctx.make_constant_ref(majit_ir::GcRef::NULL);
             let arg_a = ctx.materialize_operand_at(arg1.to_opref());
             let arg_null = ctx.materialize_operand_at(null_const);
             let mut eq_op = Op::new(OpCode::PtrEq, &[arg_a.clone(), arg_null.clone()]);
@@ -2857,7 +2844,7 @@ mod tests {
         });
 
         // offsetbox and srcoffsetbox: constant 0
-        let off = ctx.emit_constant_int(0);
+        let off = ctx.make_constant_int(0);
         let off_op = ctx.materialize_operand_at(off);
 
         // Call copy_str_content. With intbound-constant length = 2 <= M=2,
