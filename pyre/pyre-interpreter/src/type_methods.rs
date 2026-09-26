@@ -1999,6 +1999,18 @@ fn str_search_bound(args: &[PyObjectRef], i: usize) -> PyObjectRef {
     }
 }
 
+/// `_convert_idx_params` on a bound [`bound_is_none_or_exact_int`] admitted:
+/// an omitted or `None` bound is `default`, an exact `int` its value.  The
+/// unwrap stays in the traced body so `ll_find` receives machine ints.
+#[inline(always)]
+fn str_search_bound_value(w: PyObjectRef, default: i64) -> i64 {
+    if w.is_null() || unsafe { pyre_object::is_none(w) } {
+        default
+    } else {
+        unsafe { pyre_object::w_int_get_value(w) }
+    }
+}
+
 /// Bounds that are not `None` or an exact `int` (`__index__`, a subclass)
 /// stay in the interpreter body. `dont_look_inside` so that arm does not
 /// pull its helpers into the generated wrapper.
@@ -2021,7 +2033,7 @@ fn str_descr_count_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 /// `unicodeobject.py descr_find`. The search is `ll_find`: an elidable
-/// residual (`jit_str_find_objs`), not a hand trace.
+/// residual (`jit_str_find_bounds`), not a hand trace.
 pub fn __majit_wrap_str_descr_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Arity and kwargs stay on the slow arm. `arity_at_least` pulls the
     // kwargs-marker read into this graph, and that effect makes every later
@@ -2038,11 +2050,11 @@ pub fn __majit_wrap_str_descr_find(args: &[PyObjectRef]) -> Result<PyObjectRef, 
         return str_descr_find_slow(args);
     }
     let n = unsafe {
-        pyre_object::unicodeobject::jit_str_find_objs(
-            args[0] as i64,
-            args[1] as i64,
-            start as i64,
-            end as i64,
+        pyre_object::unicodeobject::jit_str_find_bounds(
+            args[0],
+            args[1],
+            str_search_bound_value(start, 0),
+            str_search_bound_value(end, i64::MAX),
         )
     };
     Ok(w_int_new(n))
@@ -2062,11 +2074,11 @@ pub fn __majit_wrap_str_descr_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef,
         return str_descr_rfind_slow(args);
     }
     let n = unsafe {
-        pyre_object::unicodeobject::jit_str_rfind_objs(
-            args[0] as i64,
-            args[1] as i64,
-            start as i64,
-            end as i64,
+        pyre_object::unicodeobject::jit_str_rfind_bounds(
+            args[0],
+            args[1],
+            str_search_bound_value(start, 0),
+            str_search_bound_value(end, i64::MAX),
         )
     };
     Ok(w_int_new(n))
@@ -2086,11 +2098,11 @@ pub fn __majit_wrap_str_descr_count(args: &[PyObjectRef]) -> Result<PyObjectRef,
         return str_descr_count_slow(args);
     }
     let n = unsafe {
-        pyre_object::unicodeobject::jit_str_count_objs(
-            args[0] as i64,
-            args[1] as i64,
-            start as i64,
-            end as i64,
+        pyre_object::unicodeobject::jit_str_count_bounds(
+            args[0],
+            args[1],
+            str_search_bound_value(start, 0),
+            str_search_bound_value(end, i64::MAX),
         )
     };
     Ok(w_int_new(n))
