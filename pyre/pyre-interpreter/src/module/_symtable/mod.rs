@@ -146,9 +146,9 @@ fn table_data(table: &SymbolTable) -> PyObjectRef {
     pyre_object::tupleobject::w_tuple_new(fields.take())
 }
 
-fn symtable_data(args: &[PyObjectRef]) -> crate::PyResult {
+fn symtable_data(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     if args.len() != 3 {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "_symtable.symtable() takes exactly 3 arguments ({} given)",
             args.len()
         )));
@@ -166,11 +166,11 @@ fn symtable_data(args: &[PyObjectRef]) -> crate::PyResult {
             // The filename takes the filesystem decode, so a byte the encoding
             // cannot spell is reported here rather than renamed.
             let data = pyre_object::bytesobject::bytes_like_data(arg);
-            pyre_object::w_str_from_wtf8_managed(crate::typedef::fsdecode_wtf8(data)?)
+            pyre_object::w_str_from_wtf8_managed(pyre_interpreter::typedef::fsdecode_wtf8(data)?)
         } else {
-            return Err(crate::PyError::type_error(format!(
+            return Err(pyre_interpreter::PyError::type_error(format!(
                 "expected str, got {} object",
-                crate::type_methods::arg_type_name(arg)
+                pyre_interpreter::type_methods::arg_type_name(arg)
             )));
         }
     };
@@ -187,27 +187,29 @@ fn symtable_data(args: &[PyObjectRef]) -> crate::PyResult {
     let source = unsafe {
         let arg = pyre_object::gc_roots::shadow_stack_get(base);
         if pyre_object::is_str(arg) {
-            crate::baseobjspace::text_w(arg)?.to_owned()
+            pyre_interpreter::baseobjspace::text_w(arg)?.to_owned()
         } else if pyre_object::is_bytes(arg) {
-            crate::compile::decode_source_bytes(
+            pyre_interpreter::compile::decode_source_bytes(
                 pyre_object::bytesobject::bytes_like_data(arg),
                 pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(filename_slot)),
                 false,
             )?
         } else {
-            return Err(crate::PyError::type_error(format!(
+            return Err(pyre_interpreter::PyError::type_error(format!(
                 "expected str, got {} object",
-                crate::type_methods::arg_type_name(arg)
+                pyre_interpreter::type_methods::arg_type_name(arg)
             )));
         }
     };
-    let mode_text = crate::baseobjspace::text_w(pyre_object::gc_roots::shadow_stack_get(base + 2))?;
+    let mode_text =
+        pyre_interpreter::baseobjspace::text_w(pyre_object::gc_roots::shadow_stack_get(base + 2))?;
     let mode = mode_text
         .parse::<rustpython_compiler::Mode>()
-        .map_err(|err| crate::PyError::value_error(err.to_string()))?;
+        .map_err(|err| pyre_interpreter::PyError::value_error(err.to_string()))?;
     let table =
         rustpython_compiler::compile_symtable(&source, mode, &filename).map_err(|compile_err| {
-            let mut err = crate::builtins::compile_err_to_syntax_error(compile_err, &source, mode);
+            let mut err =
+                pyre_interpreter::builtins::compile_err_to_syntax_error(compile_err, &source, mode);
             err.replace_syntax_error_filename(pyre_object::gc_roots::shadow_stack_get(
                 filename_slot,
             ));
@@ -216,7 +218,7 @@ fn symtable_data(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(table_data(&table))
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_symtable",
     interpleveldefs: {
         "USE" => pyre_object::w_int_new(SymbolFlags::USE.bits() as i64),

@@ -20,7 +20,7 @@ use pyre_object::*;
 /// it on a class.
 // CPython 3.14 Modules/_functoolsmodule.c:functools_exec creates
 // keyobject_type_spec as an immutable module heap type.
-#[crate::pyre_class("functools.KeyWrapper", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("functools.KeyWrapper", cpython_heaptype)]
 pub struct W_KeyWrapper {
     cmp: PyObjectRef,
     object: PyObjectRef,
@@ -48,10 +48,10 @@ fn key_wrapper_new(cmp: PyObjectRef, object: PyObjectRef) -> PyObjectRef {
 fn key_wrapper_compare(
     this: &W_KeyWrapper,
     other: PyObjectRef,
-    op: crate::baseobjspace::CompareOp,
-) -> Result<PyObjectRef, crate::PyError> {
+    op: pyre_interpreter::baseobjspace::CompareOp,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let Some(other) = W_KeyWrapper::from_obj(other) else {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "other argument must be K instance",
         ));
     };
@@ -59,7 +59,7 @@ fn key_wrapper_compare(
     // `this` and `other` name payloads in the managed heap, so every operand
     // has to reach the shadow stack before the first forwarding query.
     let slot = pyre_object::gc_roots::pin_roots(&[this.cmp, this.object, other.object]);
-    let result = crate::call::call_function_impl_result(
+    let result = pyre_interpreter::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(slot),
         &[
             pyre_object::gc_roots::shadow_stack_get(slot + 1),
@@ -71,14 +71,14 @@ fn key_wrapper_compare(
     // `w_int_new` allocate, and reading the result slot before that would leave
     // the argument naming a pre-move address.
     let w_zero = w_int_new(0);
-    crate::baseobjspace::compare(
+    pyre_interpreter::baseobjspace::compare(
         pyre_object::gc_roots::shadow_stack_get(slot + 3),
         w_zero,
         op,
     )
 }
 
-#[crate::pyre_methods(unhashable)]
+#[pyre_interpreter::pyre_methods(unhashable)]
 impl W_KeyWrapper {
     fn __call__(&self, obj: PyObjectRef) -> PyObjectRef {
         key_wrapper_new(self.cmp, obj)
@@ -89,23 +89,23 @@ impl W_KeyWrapper {
         self.object
     }
 
-    fn __lt__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        key_wrapper_compare(self, other, crate::baseobjspace::CompareOp::Lt)
+    fn __lt__(&self, other: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+        key_wrapper_compare(self, other, pyre_interpreter::baseobjspace::CompareOp::Lt)
     }
-    fn __le__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        key_wrapper_compare(self, other, crate::baseobjspace::CompareOp::Le)
+    fn __le__(&self, other: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+        key_wrapper_compare(self, other, pyre_interpreter::baseobjspace::CompareOp::Le)
     }
-    fn __eq__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        key_wrapper_compare(self, other, crate::baseobjspace::CompareOp::Eq)
+    fn __eq__(&self, other: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+        key_wrapper_compare(self, other, pyre_interpreter::baseobjspace::CompareOp::Eq)
     }
-    fn __ne__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        key_wrapper_compare(self, other, crate::baseobjspace::CompareOp::Ne)
+    fn __ne__(&self, other: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+        key_wrapper_compare(self, other, pyre_interpreter::baseobjspace::CompareOp::Ne)
     }
-    fn __gt__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        key_wrapper_compare(self, other, crate::baseobjspace::CompareOp::Gt)
+    fn __gt__(&self, other: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+        key_wrapper_compare(self, other, pyre_interpreter::baseobjspace::CompareOp::Gt)
     }
-    fn __ge__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        key_wrapper_compare(self, other, crate::baseobjspace::CompareOp::Ge)
+    fn __ge__(&self, other: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+        key_wrapper_compare(self, other, pyre_interpreter::baseobjspace::CompareOp::Ge)
     }
 }
 
@@ -114,13 +114,13 @@ impl W_KeyWrapper {
 /// Keep the accumulator in a GC-walked one-element list: `next()` and the
 /// reduction callback may both collect, so a Rust local would not track a
 /// relocated object between iterations.
-fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+fn reduce(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
+    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
     let keyword_initial =
         kwargs.and_then(|dict| unsafe { pyre_object::w_dict_getitem_str(dict, "initial") });
-    let keyword_count = crate::builtins::real_kwarg_count(kwargs);
+    let keyword_count = pyre_interpreter::builtins::real_kwarg_count(kwargs);
     if keyword_count != usize::from(keyword_initial.is_some()) {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "reduce() got an unexpected keyword argument",
         ));
     }
@@ -128,7 +128,7 @@ fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
     // `iterable` positional-only even though `initial` may be named.  A named
     // initial cannot fill either required position.
     if positional.len() < 2 {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "reduce() takes at least 2 positional arguments ({} given)",
             positional.len()
         )));
@@ -138,7 +138,7 @@ fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
         effective.push(initial);
     }
     if effective.len() > 3 {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "reduce() takes at most 3 arguments ({} given)",
             effective.len()
         )));
@@ -153,26 +153,29 @@ fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
     let sequence_slot = base + 1;
     // `_functoolsmodule.c:reduce` reports the failed second argument itself
     // rather than letting the iteration protocol's own message surface.
-    let w_iter =
-        match crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(sequence_slot)) {
-            Ok(w_iter) => w_iter,
-            Err(err) if err.kind == crate::PyErrorKind::TypeError => {
-                return Err(crate::PyError::type_error(
-                    "reduce() arg 2 must support iteration",
-                ));
-            }
-            Err(err) => return Err(err),
-        };
+    let w_iter = match pyre_interpreter::baseobjspace::iter(
+        pyre_object::gc_roots::shadow_stack_get(sequence_slot),
+    ) {
+        Ok(w_iter) => w_iter,
+        Err(err) if err.kind == pyre_interpreter::PyErrorKind::TypeError => {
+            return Err(pyre_interpreter::PyError::type_error(
+                "reduce() arg 2 must support iteration",
+            ));
+        }
+        Err(err) => return Err(err),
+    };
     let _ = pyre_object::gc_roots::pin_root(w_iter);
     let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     let initial = if effective.len() == 3 {
         pyre_object::gc_roots::shadow_stack_get(base + 2)
     } else {
-        match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
+        match pyre_interpreter::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(
+            iter_slot,
+        )) {
             Ok(value) => value,
             Err(err) if err.matches_stop_iteration() => {
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "reduce() of empty iterable with no initial value",
                 ));
             }
@@ -189,12 +192,13 @@ fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
     let accumulator_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     loop {
-        let item =
-            match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
-                Ok(value) => value,
-                Err(err) if err.matches_stop_iteration() => break,
-                Err(err) => return Err(err),
-            };
+        let item = match pyre_interpreter::baseobjspace::next(
+            pyre_object::gc_roots::shadow_stack_get(iter_slot),
+        ) {
+            Ok(value) => value,
+            Err(err) if err.matches_stop_iteration() => break,
+            Err(err) => return Err(err),
+        };
         // `next()` returns a raw object reference.  Keep this iteration's
         // transient values in their own root scope: the reducer is arbitrary
         // Python and `w_list_setitem` may switch list strategy and allocate.
@@ -208,7 +212,7 @@ fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
             )
             .unwrap()
         };
-        let result = crate::call::call_function_impl_result(
+        let result = pyre_interpreter::call::call_function_impl_result(
             pyre_object::gc_roots::shadow_stack_get(function_slot),
             &[current, pyre_object::gc_roots::shadow_stack_get(item_slot)],
         )?;
@@ -231,7 +235,7 @@ fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
     })
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_functools",
     inline_app: {
         r#"
@@ -490,8 +494,8 @@ cmp_to_key = staticmethod(cmp_to_key)
 }
 
 /// The GC types this module owns, in `build_gc` registration order.
-pub(crate) fn gc_types(types: &mut Vec<crate::importing::ModuleGcType>) {
-    use crate::importing::{ModuleGcLayout, ModuleGcType};
+pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
+    use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
     use pyre_object::lltype::PyreClassPyTypeOf;
     // `_functools.keyobject`: the comparator and wrapped object are both
     // managed edges.

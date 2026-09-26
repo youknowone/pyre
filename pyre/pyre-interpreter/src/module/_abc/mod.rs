@@ -107,8 +107,8 @@ static SIMPLE_WEAK_SET_CONTAINS: std::sync::OnceLock<[usize; 4]> = std::sync::On
 /// so the address stays readable while the object lives without the stash being
 /// the reason it lives.
 fn weak_lifeline(obj: PyObjectRef) -> Option<usize> {
-    let lifeline = crate::module::_weakref::interp__weakref::descr__new__weakref(
-        crate::module::_weakref::interp__weakref::weakref_type(),
+    let lifeline = pyre_interpreter::module::_weakref::interp__weakref::descr__new__weakref(
+        pyre_interpreter::module::_weakref::interp__weakref::weakref_type(),
         &[obj],
     )
     .ok()?;
@@ -129,8 +129,9 @@ fn installed_contains_identity() -> Option<(usize, usize, usize, usize)> {
         if lifeline == 0 {
             continue;
         }
-        let referent =
-            crate::module::_weakref::interp__weakref::dereference(lifeline as PyObjectRef);
+        let referent = pyre_interpreter::module::_weakref::interp__weakref::dereference(
+            lifeline as PyObjectRef,
+        );
         if referent.is_null() {
             return None;
         }
@@ -150,7 +151,7 @@ static BUILTIN_TYPE_ERROR: std::sync::OnceLock<usize> = std::sync::OnceLock::new
 /// under the default `honor__builtins__=False`, not the `__builtins__` entry of
 /// the module dict.
 fn builtin_type_error() -> Option<PyObjectRef> {
-    let ec = crate::call::getexecutioncontext();
+    let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() {
         return None;
     }
@@ -181,27 +182,28 @@ fn type_error_names_the_installed_class() -> bool {
     let Some(&lifeline) = BUILTIN_TYPE_ERROR.get() else {
         return false;
     };
-    let installed = crate::module::_weakref::interp__weakref::dereference(lifeline as PyObjectRef);
+    let installed =
+        pyre_interpreter::module::_weakref::interp__weakref::dereference(lifeline as PyObjectRef);
     !installed.is_null() && builtin_type_error().is_some_and(|now| std::ptr::eq(now, installed))
 }
 
 /// The installed `__contains__`, the code object it currently holds and its two
 /// globals, as the tuple [`SIMPLE_WEAK_SET_CONTAINS`] stores.  Anything that is
 /// not a function, or a body missing either global, reads as `(0, 0, 0, 0)`,
-/// which no stash can equal: [`crate::function_get_code`] reads the `code` field
+/// which no stash can equal: [`pyre_interpreter::function_get_code`] reads the `code` field
 /// without checking the type, so a `__contains__` rebound to a non-function must
 /// be rejected before the read rather than by comparing what the read returned.
 fn simple_weak_set_contains_identity() -> (usize, usize, usize, usize) {
     const NONE: (usize, usize, usize, usize) = (0, 0, 0, 0);
-    let Some(method) =
-        (unsafe { crate::baseobjspace::lookup_in_type(simple_weak_set_type(), "__contains__") })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(simple_weak_set_type(), "__contains__")
+    }) else {
         return NONE;
     };
-    if !unsafe { crate::is_function(method) } {
+    if !unsafe { pyre_interpreter::is_function(method) } {
         return NONE;
     }
-    let globals = unsafe { crate::function_get_globals_obj(method) };
+    let globals = unsafe { pyre_interpreter::function_get_globals_obj(method) };
     if globals.is_null() {
         return NONE;
     }
@@ -214,7 +216,7 @@ fn simple_weak_set_contains_identity() -> (usize, usize, usize, usize) {
     let type_error_shadow = global("TypeError").map_or(0, |obj| obj as usize);
     (
         method as usize,
-        unsafe { crate::function_get_code(method) as usize },
+        unsafe { pyre_interpreter::function_get_code(method) as usize },
         ref_global as usize,
         type_error_shadow,
     )
@@ -222,8 +224,8 @@ fn simple_weak_set_contains_identity() -> (usize, usize, usize, usize) {
 
 /// `SimpleWeakSet()` — the empty collection `_abc_init` installs and the
 /// invalidation in `subclass_of` rebinds to.
-fn new_simple_weak_set() -> Result<PyObjectRef, crate::PyError> {
-    crate::call::call_function_impl_result(simple_weak_set_type(), &[])
+fn new_simple_weak_set() -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    pyre_interpreter::call::call_function_impl_result(simple_weak_set_type(), &[])
 }
 
 /// `app_abc.py SimpleWeakSet.__contains__` through the membership
@@ -234,7 +236,7 @@ fn weak_cache_contains(
     cls: PyObjectRef,
     name: &str,
     item: PyObjectRef,
-) -> Result<bool, crate::PyError> {
+) -> Result<bool, pyre_interpreter::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let cls_slot = roots.publish(&[cls]);
     let item_slot = roots.publish(&[item]);
@@ -243,7 +245,7 @@ fn weak_cache_contains(
     if let Some(found) = simple_weak_set_contains(roots.get(cache_slot), roots.get(item_slot))? {
         return Ok(found);
     }
-    crate::baseobjspace::contains(roots.get(cache_slot), roots.get(item_slot))
+    pyre_interpreter::baseobjspace::contains(roots.get(cache_slot), roots.get(item_slot))
 }
 
 /// `app_abc.py SimpleWeakSet.__contains__` without the app-level frame,
@@ -259,8 +261,8 @@ fn weak_cache_contains(
 fn simple_weak_set_contains(
     cache: PyObjectRef,
     item: PyObjectRef,
-) -> Result<Option<bool>, crate::PyError> {
-    if !crate::typedef::r#type(cache)
+) -> Result<Option<bool>, pyre_interpreter::PyError> {
+    if !pyre_interpreter::typedef::r#type(cache)
         .is_some_and(|actual| std::ptr::eq(actual.as_ptr(), simple_weak_set_type()))
     {
         return Ok(None);
@@ -279,7 +281,7 @@ fn simple_weak_set_contains(
     let roots = pyre_object::gc_roots::push_roots();
     let cache_slot = roots.publish(&[cache]);
     let item_slot = roots.publish(&[item]);
-    let data = crate::baseobjspace::getattr_str(roots.get(cache_slot), "data")?;
+    let data = pyre_interpreter::baseobjspace::getattr_str(roots.get(cache_slot), "data")?;
     // Exactly a `set`, not merely one by layout: a subclass keeps the base
     // layout in `ob_type` and retags `w_class`, and `contains` dispatches such
     // a subclass's `__contains__` override through `subclass_special_override`.
@@ -290,12 +292,12 @@ fn simple_weak_set_contains(
     let data_slot = roots.publish(&[data]);
     // `wr = ref(item)`.  The app-level spelling answers False for an item that
     // cannot carry a weakref and lets every other error out, so match both.
-    let probe = match crate::module::_weakref::interp__weakref::descr__new__weakref(
-        crate::module::_weakref::interp__weakref::weakref_type(),
+    let probe = match pyre_interpreter::module::_weakref::interp__weakref::descr__new__weakref(
+        pyre_interpreter::module::_weakref::interp__weakref::weakref_type(),
         &[roots.get(item_slot)],
     ) {
         Ok(probe) => probe,
-        Err(err) if matches!(err.kind, crate::error::PyErrorKind::TypeError) => {
+        Err(err) if matches!(err.kind, pyre_interpreter::error::PyErrorKind::TypeError) => {
             // `except TypeError` resolves the name where the handler runs, so
             // the binding matters on this arm and nowhere else.  A shadowing
             // module entry already moved an identity word and declined above,
@@ -335,9 +337,9 @@ fn simple_weak_set_contains(
         // `__hash__` again before raising, and the expression it stands in for
         // runs it once.  `wr in self.data` is a set membership test, so the
         // recovered error names a set element.
-        Err(_) => Err(crate::baseobjspace::take_pending_set_element_error(
-            roots.get(probe_slot),
-        )),
+        Err(_) => Err(
+            pyre_interpreter::baseobjspace::take_pending_set_element_error(roots.get(probe_slot)),
+        ),
     }
 }
 
@@ -350,28 +352,35 @@ fn simple_weak_set_contains(
 /// class — `register` and `subclass_of` each reject a non-type argument — and a
 /// class is weak-referenceable, so `add` needs no test of its own, which is
 /// also why `app_abc.py add` has none.
-fn weak_cache_add(cls: PyObjectRef, name: &str, item: PyObjectRef) -> Result<(), crate::PyError> {
+fn weak_cache_add(
+    cls: PyObjectRef,
+    name: &str,
+    item: PyObjectRef,
+) -> Result<(), pyre_interpreter::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let cls_slot = roots.publish(&[cls]);
     let item_slot = roots.publish(&[item]);
     let cache = cache_attr(roots.get(cls_slot), name)?;
     let cache_slot = roots.publish(&[cache]);
-    let add = crate::baseobjspace::getattr_str(roots.get(cache_slot), "add")?;
+    let add = pyre_interpreter::baseobjspace::getattr_str(roots.get(cache_slot), "add")?;
     let add_slot = roots.publish(&[add]);
-    crate::call::call_function_impl_result(roots.get(add_slot), &[roots.get(item_slot)])?;
+    pyre_interpreter::call::call_function_impl_result(
+        roots.get(add_slot),
+        &[roots.get(item_slot)],
+    )?;
     Ok(())
 }
 
 /// `SimpleWeakSet.clear` (`app_abc.py`) on the named collection, in
 /// place, so anything already holding it sees the clear.
-fn weak_cache_clear(cls: PyObjectRef, name: &str) -> Result<(), crate::PyError> {
+fn weak_cache_clear(cls: PyObjectRef, name: &str) -> Result<(), pyre_interpreter::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let cls_slot = roots.publish(&[cls]);
     let cache = cache_attr(roots.get(cls_slot), name)?;
     let cache_slot = roots.publish(&[cache]);
-    let clear = crate::baseobjspace::getattr_str(roots.get(cache_slot), "clear")?;
+    let clear = pyre_interpreter::baseobjspace::getattr_str(roots.get(cache_slot), "clear")?;
     let clear_slot = roots.publish(&[clear]);
-    crate::call::call_function_impl_result(roots.get(clear_slot), &[])?;
+    pyre_interpreter::call::call_function_impl_result(roots.get(clear_slot), &[])?;
     Ok(())
 }
 
@@ -383,8 +392,8 @@ fn weak_cache_clear(cls: PyObjectRef, name: &str) -> Result<(), crate::PyError> 
 /// ran `_abc_init` raises `AttributeError` out of the check rather than being
 /// answered as a class with an empty cache.  A metaclass hook that raises
 /// something else propagates unchanged.
-fn cache_attr(cls: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::getattr_str(cls, name)
+fn cache_attr(cls: PyObjectRef, name: &str) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    pyre_interpreter::baseobjspace::getattr_str(cls, name)
 }
 
 /// Compare `cls._abc_negative_cache_version` against the invalidation counter
@@ -395,8 +404,8 @@ fn cache_attr(cls: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyErro
 /// and a value with its own `__lt__` / `__eq__` stays observable.
 fn negative_cache_version_compare(
     cls: PyObjectRef,
-    op: crate::objspace::descroperation::CompareOp,
-) -> Result<bool, crate::PyError> {
+    op: pyre_interpreter::objspace::descroperation::CompareOp,
+) -> Result<bool, pyre_interpreter::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let cls_slot = roots.publish(&[cls]);
     let version = cache_attr(roots.get(cls_slot), "_abc_negative_cache_version")?;
@@ -404,7 +413,7 @@ fn negative_cache_version_compare(
     let counter_slot = roots.publish(&[w_int_new(
         INVALIDATION_COUNTER.load(Ordering::Relaxed) as i64
     )]);
-    crate::baseobjspace::is_true(crate::objspace::descroperation::compare(
+    pyre_interpreter::baseobjspace::is_true(pyre_interpreter::objspace::descroperation::compare(
         roots.get(version_slot),
         roots.get(counter_slot),
         op,
@@ -413,7 +422,7 @@ fn negative_cache_version_compare(
 
 /// `app_abc.py _abc_init` — install the three collections and the
 /// negative-cache generation, then compute `__abstractmethods__`.
-fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if let Some(&cls) = args.first() {
         // `app_abc.py:74-77` — registry and both caches are per-class for the
         // same reason: resolved up the MRO, one base's would answer for every
@@ -422,10 +431,10 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // allocation happens between reading `cls` and using it.
         for name in ["_abc_registry", "_abc_cache", "_abc_negative_cache"] {
             let fresh = new_simple_weak_set()?;
-            crate::baseobjspace::setattr_str(cls, name, fresh)?;
+            pyre_interpreter::baseobjspace::setattr_str(cls, name, fresh)?;
         }
         let version = w_int_new(INVALIDATION_COUNTER.load(Ordering::Relaxed) as i64);
-        crate::baseobjspace::setattr_str(cls, "_abc_negative_cache_version", version)?;
+        pyre_interpreter::baseobjspace::setattr_str(cls, "_abc_negative_cache_version", version)?;
         let mut abstract_names = Vec::new();
         let bases = unsafe { w_type_get_bases(cls) };
         if !bases.is_null() && unsafe { is_tuple(bases) } {
@@ -436,22 +445,29 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 // app_abc.py:67-71 — `getattr(..., set())` defaults only a
                 // missing attribute.  A descriptor failure is observable and
                 // any iterable, not just a set/frozenset, supplies names.
-                let names = match crate::baseobjspace::getattr_str(base, "__abstractmethods__") {
+                let names = match pyre_interpreter::baseobjspace::getattr_str(
+                    base,
+                    "__abstractmethods__",
+                ) {
                     Ok(names) => names,
-                    Err(err) if err.kind == crate::PyErrorKind::AttributeError => w_set_new(),
+                    Err(err) if err.kind == pyre_interpreter::PyErrorKind::AttributeError => {
+                        w_set_new()
+                    }
                     Err(err) => return Err(err),
                 };
-                for name in crate::builtins::collect_iterable(names)? {
+                for name in pyre_interpreter::builtins::collect_iterable(names)? {
                     // `_py_abc.py:69` — object-level getattr validates that
                     // every supplied abstract-method name is a string, then
                     // lets descriptors and metaclass attributes provide an
                     // implementation.  Only a missing attribute defaults.
-                    let value = match crate::baseobjspace::getattr(cls, name) {
+                    let value = match pyre_interpreter::baseobjspace::getattr(cls, name) {
                         Ok(value) => value,
-                        Err(err) if err.kind == crate::PyErrorKind::AttributeError => w_none(),
+                        Err(err) if err.kind == pyre_interpreter::PyErrorKind::AttributeError => {
+                            w_none()
+                        }
                         Err(err) => return Err(err),
                     };
-                    if crate::baseobjspace::isabstractmethod_w(value)? {
+                    if pyre_interpreter::baseobjspace::isabstractmethod_w(value)? {
                         abstract_names.push(name);
                     }
                 }
@@ -461,13 +477,13 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if !namespace.is_null() {
             for (name, value) in unsafe { w_dict_items(namespace) } {
                 let value = unsafe { pyre_object::celldict::unwrap_cell(value) };
-                if crate::baseobjspace::isabstractmethod_w(value)? {
+                if pyre_interpreter::baseobjspace::isabstractmethod_w(value)? {
                     abstract_names.push(name);
                 }
             }
         }
         let methods = w_frozenset_from_items(&abstract_names);
-        crate::baseobjspace::setattr_str(cls, "__abstractmethods__", methods)?;
+        pyre_interpreter::baseobjspace::setattr_str(cls, "__abstractmethods__", methods)?;
 
         // `app_abc.py _abc_init` — fold a `__abc_tpflags__` in the class body
         // into the structural-match marker, then drop the attribute.
@@ -484,7 +500,7 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // (1 << 5) | 1` sets the sequence marker -- so mask here and hand the
         // primitive the single bit its own contract is written against.
         if unsafe { is_type(cls) }
-            && let Some(w_flags) = crate::type_dict_lookup(cls, "__abc_tpflags__")
+            && let Some(w_flags) = pyre_interpreter::type_dict_lookup(cls, "__abc_tpflags__")
         {
             // `PyDict_Pop(dict, &_Py_ID(__abc_tpflags__), &flags)` -- take the
             // entry out of the type dict itself, and take it before validating.
@@ -493,8 +509,8 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             // `_abc_init` does not inherit the same rejection.
             let roots = pyre_object::gc_roots::push_roots();
             let flags_slot = roots.publish(&[w_flags]);
-            crate::type_dict_delete(cls, "__abc_tpflags__");
-            unsafe { crate::baseobjspace::mutated(cls, Some("__abc_tpflags__")) };
+            pyre_interpreter::type_dict_delete(cls, "__abc_tpflags__");
+            unsafe { pyre_interpreter::baseobjspace::mutated(cls, Some("__abc_tpflags__")) };
             let w_flags = roots.get(flags_slot);
             // `PyLong_CheckExact` -- an `int` subclass, `bool` included, is
             // consumed and ignored, as is anything that is not an int at all.
@@ -502,9 +518,9 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             if unsafe { is_exact_type(w_flags, &INT_TYPE) || is_exact_type(w_flags, &LONG_TYPE) } {
                 // `PyLong_AsLong` -- a value past the machine word raises
                 // `OverflowError` rather than being skipped like a non-int.
-                let flags = crate::baseobjspace::int_w(w_flags)?;
+                let flags = pyre_interpreter::baseobjspace::int_w(w_flags)?;
                 if flags & COLLECTION_FLAGS == COLLECTION_FLAGS {
-                    return Err(crate::PyError::type_error(
+                    return Err(pyre_interpreter::PyError::type_error(
                         "__abc_tpflags__ cannot be both Py_TPFLAGS_SEQUENCE and Py_TPFLAGS_MAPPING",
                     ));
                 }
@@ -520,9 +536,9 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 // `_abc_register` (`_abcmodule.c:_abc__abc_register_impl`) —
 // `cls._abc_registry.add(subclass)`.  Pyre stores the registry as a list
 // attribute (no WeakSet).
-fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.len() < 2 {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "_abc_register() requires (cls, subclass)",
         ));
     }
@@ -532,18 +548,20 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // "Can only register classes")`.  Everything downstream reads a registry
     // entry as a class, so the rejection is what makes that sound.
     if !unsafe { is_type(subclass) } {
-        return Err(crate::PyError::type_error("Can only register classes"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "Can only register classes",
+        ));
     }
     // Already a subclass (`issubclass(subclass, cls)`) — nothing to register.
     // This also dedups: a previously registered `subclass` resolves through
     // `__subclasscheck__`'s registry walk.
-    if crate::baseobjspace::issubclass(subclass, cls)? {
+    if pyre_interpreter::baseobjspace::issubclass(subclass, cls)? {
         return Ok(subclass);
     }
     // Registering `subclass` would also make `cls` its subclass.  Tested after
     // the arm above, so `X.register(X)` stays a no-op rather than a cycle.
-    if crate::baseobjspace::issubclass(cls, subclass)? {
-        return Err(crate::PyError::runtime_error(
+    if pyre_interpreter::baseobjspace::issubclass(cls, subclass)? {
+        return Err(pyre_interpreter::PyError::runtime_error(
             "Refusing to create an inheritance cycle",
         ));
     }
@@ -582,7 +600,7 @@ const COLLECTION_FLAGS: i64 = PATMA_SEQUENCE | PATMA_MAPPING;
 ///
 /// `_abc_init` masks `__abc_tpflags__` down to a single bit first, so the
 /// strict test below only ever rejects a caller that spells the flag itself.
-fn set_collection_flag_of(w_type: PyObjectRef, flag: i64) -> Result<(), crate::PyError> {
+fn set_collection_flag_of(w_type: PyObjectRef, flag: i64) -> Result<(), pyre_interpreter::PyError> {
     let marker = collection_marker(w_type, flag, "_internal_set_collection_flag")?;
     unsafe { typeobject::w_type_set_flag_map_or_seq(w_type, marker) };
     Ok(())
@@ -592,44 +610,50 @@ fn set_collection_flag_of(w_type: PyObjectRef, flag: i64) -> Result<(), crate::P
 /// two rejections `set_collection_flag` makes before it stamps anything:
 /// `space.interp_w(W_TypeObject, w_self)` on the receiver, and the strict
 /// one-bit test on the flag.
-fn collection_marker(w_type: PyObjectRef, flag: i64, who: &str) -> Result<u8, crate::PyError> {
+fn collection_marker(
+    w_type: PyObjectRef,
+    flag: i64,
+    who: &str,
+) -> Result<u8, pyre_interpreter::PyError> {
     if !unsafe { is_type(w_type) } {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "{who}() argument 1 must be a type"
         )));
     }
     match flag {
         PATMA_SEQUENCE => Ok(b'S'),
         PATMA_MAPPING => Ok(b'M'),
-        _ => Err(crate::PyError::value_error(format!(
+        _ => Err(pyre_interpreter::PyError::value_error(format!(
             "invalid value for __abc_tpflags__: {flag}"
         ))),
     }
 }
 
 /// `_abc._internal_set_collection_flag(cls, flag)`.
-fn internal_set_collection_flag(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn internal_set_collection_flag(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let [w_type, w_flag] = args else {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "_internal_set_collection_flag() requires (cls, flag)",
         ));
     };
-    set_collection_flag_of(*w_type, crate::baseobjspace::int_w(*w_flag)?)?;
+    set_collection_flag_of(*w_type, pyre_interpreter::baseobjspace::int_w(*w_flag)?)?;
     Ok(w_none())
 }
 
 /// `_abc._internal_set_collection_flag_recursive(cls, flag)`.
 fn internal_set_collection_flag_recursive(
     args: &[PyObjectRef],
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let [w_type, w_flag] = args else {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "_internal_set_collection_flag_recursive() requires (cls, flag)",
         ));
     };
     let marker = collection_marker(
         *w_type,
-        crate::baseobjspace::int_w(*w_flag)?,
+        pyre_interpreter::baseobjspace::int_w(*w_flag)?,
         "_internal_set_collection_flag_recursive",
     )?;
     // `_PyType_SetFlagsRecursive` starts the guarded walk at the argument
@@ -677,13 +701,13 @@ fn set_collection_flag_recursive(w_type: PyObjectRef, flag: u8) {
 // refinement: an uncached miss re-runs all three walks at every level of that
 // recursion, so one `isinstance` against a deep ABC costs a walk of the whole
 // ABC graph.
-fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::PyError> {
+fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, pyre_interpreter::PyError> {
     // _py_abc.py:110-111 — `if not isinstance(subclass, type): raise
     // TypeError('issubclass() arg 1 must be a class')`.  The `__mro__`/registry
     // walks below dereference `subclass` as a type, so a non-type argument
     // (`issubclass({}, ABC)`) must be rejected up front, not read as garbage.
     if !unsafe { is_type(subclass) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "issubclass() arg 1 must be a class",
         ));
     }
@@ -709,12 +733,16 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
     let counter = INVALIDATION_COUNTER.load(Ordering::Relaxed);
     if negative_cache_version_compare(
         roots.get(cls_slot),
-        crate::objspace::descroperation::CompareOp::Lt,
+        pyre_interpreter::objspace::descroperation::CompareOp::Lt,
     )? {
         let fresh = new_simple_weak_set()?;
-        crate::baseobjspace::setattr_str(roots.get(cls_slot), "_abc_negative_cache", fresh)?;
+        pyre_interpreter::baseobjspace::setattr_str(
+            roots.get(cls_slot),
+            "_abc_negative_cache",
+            fresh,
+        )?;
         let version = w_int_new(counter as i64);
-        crate::baseobjspace::setattr_str(
+        pyre_interpreter::baseobjspace::setattr_str(
             roots.get(cls_slot),
             "_abc_negative_cache_version",
             version,
@@ -732,17 +760,18 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
     // cache (`app_abc.py:144-163`, which records at each of its own arms).
     let verdict = 'decide: {
         // _py_abc.py — `ok = cls.__subclasshook__(subclass)`.
-        let hook = crate::baseobjspace::getattr_str(roots.get(cls_slot), "__subclasshook__")?;
+        let hook =
+            pyre_interpreter::baseobjspace::getattr_str(roots.get(cls_slot), "__subclasshook__")?;
         if !hook.is_null() {
             let hook_roots = pyre_object::gc_roots::push_roots();
             let hook_slot = hook_roots.base();
             let _ = hook_roots.pin_root(hook);
-            let ok = crate::call::call_function_impl_result(
+            let ok = pyre_interpreter::call::call_function_impl_result(
                 hook_roots.get(hook_slot),
                 &[roots.get(subclass_slot)],
             )?;
             if !unsafe { is_not_implemented(ok) } {
-                break 'decide crate::baseobjspace::is_true(ok)?;
+                break 'decide pyre_interpreter::baseobjspace::is_true(ok)?;
             }
         }
         // _py_abc.py — direct subclass via `__mro__`.
@@ -766,19 +795,20 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
             let registry_roots = pyre_object::gc_roots::push_roots();
             let registry_slot = registry_roots.base();
             let _ = registry_roots.pin_root(registry);
-            let iterator = crate::baseobjspace::iter(registry_roots.get(registry_slot))?;
+            let iterator = pyre_interpreter::baseobjspace::iter(registry_roots.get(registry_slot))?;
             let iterator_slot = registry_slot + 1;
             let _ = registry_roots.pin_root(iterator);
             loop {
-                let rcls = match crate::baseobjspace::next(registry_roots.get(iterator_slot)) {
-                    Ok(rcls) => rcls,
-                    Err(err) if err.matches_stop_iteration() => break,
-                    Err(err) => return Err(err),
-                };
+                let rcls =
+                    match pyre_interpreter::baseobjspace::next(registry_roots.get(iterator_slot)) {
+                        Ok(rcls) => rcls,
+                        Err(err) if err.matches_stop_iteration() => break,
+                        Err(err) => return Err(err),
+                    };
                 let item_roots = pyre_object::gc_roots::push_roots();
                 let rcls_slot = item_roots.base();
                 let _ = item_roots.pin_root(rcls);
-                if crate::baseobjspace::issubclass(
+                if pyre_interpreter::baseobjspace::issubclass(
                     roots.get(subclass_slot),
                     item_roots.get(rcls_slot),
                 )? {
@@ -791,18 +821,19 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
         // internal type subclass vector directly hides user overrides and their
         // TypeError/custom exceptions, which are observable ABCMeta semantics.
         let subclasses_method =
-            crate::baseobjspace::getattr_str(roots.get(cls_slot), "__subclasses__")?;
+            pyre_interpreter::baseobjspace::getattr_str(roots.get(cls_slot), "__subclasses__")?;
         let walk_roots = pyre_object::gc_roots::push_roots();
         let method_slot = walk_roots.base();
         let _ = walk_roots.pin_root(subclasses_method);
-        let subclasses = crate::call::call_function_impl_result(walk_roots.get(method_slot), &[])?;
+        let subclasses =
+            pyre_interpreter::call::call_function_impl_result(walk_roots.get(method_slot), &[])?;
         let subclasses_slot = method_slot + 1;
         let _ = walk_roots.pin_root(subclasses);
-        let iterator = crate::baseobjspace::iter(walk_roots.get(subclasses_slot))?;
+        let iterator = pyre_interpreter::baseobjspace::iter(walk_roots.get(subclasses_slot))?;
         let iterator_slot = subclasses_slot + 1;
         let _ = walk_roots.pin_root(iterator);
         loop {
-            let scls = match crate::baseobjspace::next(walk_roots.get(iterator_slot)) {
+            let scls = match pyre_interpreter::baseobjspace::next(walk_roots.get(iterator_slot)) {
                 Ok(scls) => scls,
                 Err(err) if err.matches_stop_iteration() => break,
                 Err(err) => return Err(err),
@@ -810,8 +841,10 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
             let item_roots = pyre_object::gc_roots::push_roots();
             let scls_slot = item_roots.base();
             let _ = item_roots.pin_root(scls);
-            if crate::baseobjspace::issubclass(roots.get(subclass_slot), item_roots.get(scls_slot))?
-            {
+            if pyre_interpreter::baseobjspace::issubclass(
+                roots.get(subclass_slot),
+                item_roots.get(scls_slot),
+            )? {
                 break 'decide true;
             }
         }
@@ -839,7 +872,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
 /// hit on the claimed class is taken before the real type is even read, which
 /// is the whole point of inlining the cache check here rather than leaving it
 /// to `__subclasscheck__`.
-fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.len() < 2 {
         return Ok(w_bool_from(false));
     }
@@ -848,7 +881,8 @@ fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let instance_slot = roots.publish(&[args[1]]);
 
     // `app_abc.py _abc_instancecheck subclass = instance.__class__`.
-    let subclass = crate::baseobjspace::getattr_str(roots.get(instance_slot), "__class__")?;
+    let subclass =
+        pyre_interpreter::baseobjspace::getattr_str(roots.get(instance_slot), "__class__")?;
     let subclass_slot = roots.publish(&[subclass]);
     if weak_cache_contains(roots.get(cls_slot), "_abc_cache", roots.get(subclass_slot))? {
         return Ok(w_bool_from(true));
@@ -859,7 +893,7 @@ fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // the real class in `w_class`, so reading `ob_type` directly would resolve
     // to `object`; `r#type` returns the class for both builtin and user
     // instances.
-    let subtype = crate::typedef::r#type(roots.get(instance_slot))
+    let subtype = pyre_interpreter::typedef::r#type(roots.get(instance_slot))
         .map_or(std::ptr::null_mut(), |p| p.as_ptr());
     if subtype.is_null() {
         return Ok(w_bool_from(false));
@@ -873,7 +907,7 @@ fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // registry either.
         if negative_cache_version_compare(
             roots.get(cls_slot),
-            crate::objspace::descroperation::CompareOp::Eq,
+            pyre_interpreter::objspace::descroperation::CompareOp::Eq,
         )? && weak_cache_contains(
             roots.get(cls_slot),
             "_abc_negative_cache",
@@ -898,19 +932,25 @@ fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `cls.__subclasscheck__(subclass)` through attribute lookup, the way
 /// `app_abc.py:118` and `:121` spell it, so an `ABCMeta` subclass that
 /// overrides the hook is the one that answers.
-fn subclasscheck_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::PyError> {
+fn subclasscheck_of(
+    cls: PyObjectRef,
+    subclass: PyObjectRef,
+) -> Result<bool, pyre_interpreter::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let cls_slot = roots.publish(&[cls]);
     let subclass_slot = roots.publish(&[subclass]);
-    let check = crate::baseobjspace::getattr_str(roots.get(cls_slot), "__subclasscheck__")?;
+    let check =
+        pyre_interpreter::baseobjspace::getattr_str(roots.get(cls_slot), "__subclasscheck__")?;
     let check_slot = roots.publish(&[check]);
-    let result =
-        crate::call::call_function_impl_result(roots.get(check_slot), &[roots.get(subclass_slot)])?;
+    let result = pyre_interpreter::call::call_function_impl_result(
+        roots.get(check_slot),
+        &[roots.get(subclass_slot)],
+    )?;
     let result_slot = roots.publish(&[result]);
-    crate::baseobjspace::is_true(roots.get(result_slot))
+    pyre_interpreter::baseobjspace::is_true(roots.get(result_slot))
 }
 
-fn subclasscheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn subclasscheck(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.len() < 2 {
         return Ok(w_bool_from(false));
     }
@@ -922,7 +962,7 @@ fn subclasscheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// registrations between independent users and test cases.
 /// The invalidation counter stays put: only `_abc_register` advances it, so
 /// an outstanding `get_cache_token` survives a registry reset.
-fn reset_registry(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn reset_registry(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if let Some(&cls) = args.first() {
         weak_cache_clear(cls, "_abc_registry")?;
     }
@@ -936,7 +976,7 @@ fn reset_registry(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 ///
 /// Cleared in place rather than rebound, so anything already holding the set
 /// sees the clear.
-fn reset_caches(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn reset_caches(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if let Some(&cls) = args.first() {
         for name in ["_abc_cache", "_abc_negative_cache"] {
             weak_cache_clear(cls, name)?;
@@ -949,7 +989,7 @@ fn reset_caches(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// registry, both caches, and the negative-cache version.  The three sets are
 /// the collections' own `data`, which is why they are `SimpleWeakSet`s and not
 /// bare sets — `ABC._dump_registry` prints what this returns.
-fn get_dump(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn get_dump(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let Some(&cls) = args.first() else {
         return Ok(w_tuple_new(vec![]));
     };
@@ -965,7 +1005,7 @@ fn get_dump(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     for name in ["_abc_registry", "_abc_cache", "_abc_negative_cache"] {
         let cache = cache_attr(roots.get(cls_slot), name)?;
         let cache_slot = roots.publish(&[cache]);
-        let data = crate::baseobjspace::getattr_str(roots.get(cache_slot), "data")?;
+        let data = pyre_interpreter::baseobjspace::getattr_str(roots.get(cache_slot), "data")?;
         data_slots.push(roots.publish(&[data]));
     }
     // `_get_dump` reports the generation attribute itself, not a number derived
@@ -977,7 +1017,7 @@ fn get_dump(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_tuple_new(items))
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_abc",
     functions: {
         "get_cache_token"     / 0 = |_| Ok(w_int_new(INVALIDATION_COUNTER.load(Ordering::Relaxed) as i64)),
@@ -992,7 +1032,7 @@ crate::py_module! {
         "_internal_set_collection_flag_recursive" / 2 = internal_set_collection_flag_recursive,
     },
     extra_init: |ns| {
-        crate::importing::appleveldef_install_seeded(
+        pyre_interpreter::importing::appleveldef_install_seeded(
             ns,
             include_str!("app_abc.py"),
             "app_abc.py",
@@ -1000,7 +1040,7 @@ crate::py_module! {
             &["SimpleWeakSet"],
             &[],
         )?;
-        let simple_weak_set = crate::module_ns_get(ns, "SimpleWeakSet")
+        let simple_weak_set = pyre_interpreter::module_ns_get(ns, "SimpleWeakSet")
             .expect("_abc.SimpleWeakSet must be installed by appleveldefs");
         root_forever(simple_weak_set);
         let _ = SIMPLE_WEAK_SET_TYPE.set(simple_weak_set as usize);

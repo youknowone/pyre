@@ -15,7 +15,7 @@
 //! the common list, and the Darwin-only Mach/RPC block sits behind
 //! `target_vendor = "apple"`.
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "errno",
     extra_init: |ns| {
         // `interp_errno.py` builds `errorcode = {code: name, ...}`
@@ -33,9 +33,9 @@ crate::py_module! {
         let roots = pyre_object::gc_roots::push_roots();
         let errorcode_slot = roots.base();
         let _ = roots.pin_root(pyre_object::w_dict_new());
-        crate::module_ns_store(ns, "errorcode", roots.get(errorcode_slot));
+        pyre_interpreter::module_ns_store(ns, "errorcode", roots.get(errorcode_slot));
         let mut store = |name: &str, value: i64| {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(value));
+            pyre_interpreter::module_ns_store(ns, name, pyre_object::w_int_new(value));
             // Call arguments evaluate left to right, so the key and the value
             // are built first: reading the dict slot inline with them would
             // read it before those allocations and hand over a pre-move word.
