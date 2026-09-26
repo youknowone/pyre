@@ -2619,6 +2619,24 @@ impl HostEnv {
 /// `__builtin__` + 알려진 stdlib 모듈의 placeholder 로 채워진다.
 pub static HOST_ENV: LazyLock<HostEnv> = LazyLock::new(HostEnv::bootstrap);
 
+/// `FunctionPath` resolution through `HOST_ENV`: one segment is
+/// `lookup_builtin(leaf)`, and two or more are
+/// `import_module(prefix).module_get(leaf)`. `translate_op` and
+/// `Lowering::callee_is_host_builtin` both call this.
+pub(crate) fn host_env_callable(segments: &[String]) -> Option<HostObject> {
+    if let [leaf] = segments {
+        HOST_ENV.lookup_builtin(leaf)
+    } else if segments.len() >= 2 {
+        let module = segments[..segments.len() - 1].join(".");
+        let leaf = &segments[segments.len() - 1];
+        HOST_ENV
+            .import_module(&module)
+            .and_then(|module| module.module_get(leaf))
+    } else {
+        None
+    }
+}
+
 /// Flow-space carrier for Python objects referenced directly by the
 /// strict `flowcontext.py` port.
 ///

@@ -2814,20 +2814,11 @@ pub fn translate_op(
                             )));
                         }
                         entry.host_object.clone()
-                    } else if segments.len() == 1
-                        && let Some(builtin) = HOST_ENV.lookup_builtin(&segments[0])
-                    {
-                        builtin
-                    } else if segments.len() >= 2
-                        && let Some(module) =
-                            HOST_ENV.import_module(&segments[..segments.len() - 1].join("."))
-                        && let Some(attr) = module.module_get(&segments[segments.len() - 1])
-                    {
-                        // Branch 3b — fully-qualified inline path resolved
-                        // through `HOST_ENV.import_module` + `module_get`;
-                        // the PRE-EXISTING-ADAPTATION is item `3b.` of this
-                        // arm's Layer 3 resolution-order list.
-                        attr
+                    } else if let Some(host) = flowspace_model::host_env_callable(segments) {
+                        // Branch 3b — builtin leaf or fully-qualified inline
+                        // path. The PRE-EXISTING-ADAPTATION is item `3b.` of
+                        // this arm's Layer 3 resolution-order list.
+                        host
                     } else if let Some(entry) = call_registry.lookup_with_leaf_match(&key) {
                         // Fuzzy leaf-match is the last registry fallback.
                         // Exact registry entries and HOST_ENV

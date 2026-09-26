@@ -206,6 +206,56 @@ fn put_unit_spec_graph_drops_the_value_arg() {
     );
 }
 
+/// A spec copy calls `pyre_object::lltype::malloc_typed`. The call stays
+/// on the bare path: `HOST_ENV` already owns that builtin, so no
+/// `malloc_typed__s` graph is built.
+#[test]
+fn spec_copy_keeps_bare_lltype_malloc_typed() {
+    let llbc =
+        Llbc::from_slice(malloc_typed_fixture_llbc().as_bytes()).expect("parse malloc fixture");
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        HostStaticAddrs::default(),
+        &["fixture"],
+        &["use_wrap"],
+    )
+    .expect("lower use_wrap");
+    let wraps: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| f.name.contains("wrap__s"))
+        .collect();
+    assert_eq!(
+        wraps.len(),
+        1,
+        "expected one specialized wrap, got {:?}",
+        program
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        graph_calls_bare_malloc_typed(&wraps[0].graph),
+        "{} dropped the bare malloc_typed call, ops {:?}",
+        wraps[0].name,
+        op_kinds(&wraps[0].graph)
+    );
+    assert!(
+        program
+            .functions
+            .iter()
+            .all(|f| !f.name.contains("malloc_typed__s")),
+        "host builtin was copied: {:?}",
+        program
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .filter(|name| name.contains("malloc"))
+            .collect::<Vec<_>>()
+    );
+}
+
 /// `fn f(s: &mut S) { replace(&mut s.u, ()) }` where `S.u` is `()`.
 /// The borrow aliases a Void field read: no `getfield` of `u`.
 #[test]
@@ -722,6 +772,185 @@ fn unit_field_fixture_llbc() -> String {
             "global_decls": [],
             "trait_decls": [],
             "trait_impls": []
+        }
+    });
+    file.to_string()
+}
+
+fn graph_calls_bare_malloc_typed(graph: &FunctionGraph) -> bool {
+    graph.blocks.iter().flat_map(|block| &block.operations).any(|op| {
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.last().map(String::as_str) == Some("malloc_typed")
+                    && segments.iter().any(|segment| segment == "lltype")
+            }
+            _ => false,
+        }
+    })
+}
+
+fn malloc_typed_fixture_llbc() -> String {
+    use serde_json::json;
+    let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let meta = |path: &[&str], local: bool| {
+        json!({
+            "name": path.iter().map(|seg| json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": local
+        })
+    };
+    let i64_ty = json!({"Literal": {"Int": "I64"}});
+    let tvar = json!({"TypeVar": {"Bound": [0, 0]}});
+    let empty_g = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
+    let impl_ref = json!({
+        "kind": {"TraitImpl": {"id": 0, "generics": {"regions": [], "types": [i64_ty], "const_generics": [], "trait_refs": []}}}
+    });
+    let generics = json!({
+        "regions": [],
+        "types": [{"index": 0, "name": "T"}],
+        "const_generics": [],
+        "trait_clauses": [{"clause_id": 0}],
+        "regions_outlive": [],
+        "types_outlive": [],
+        "trait_type_constraints": []
+    });
+    let ret_body = |ty: &serde_json::Value| {
+        json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 0, "locals": [{"index": 0, "name": null, "span": span, "ty": ty}]},
+                "body": [
+                    {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                ]
+            }
+        })
+    };
+    let place = |id: u64, ty: &serde_json::Value| json!({"kind": {"Local": id}, "ty": ty});
+    let local = |index: u64, ty: &serde_json::Value| {
+        json!({"index": index, "name": null, "span": span, "ty": ty})
+    };
+    let wrap_body = json!({
+        "Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 0,
+                "locals": [local(0, &i64_ty), local(1, &i64_ty)]
+            },
+            "body": [
+                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0, 0]},
+                            "generics": empty_g
+                        }},
+                        "args": [],
+                        "dest": place(1, &i64_ty)
+                    },
+                    "target": 2,
+                    "on_unwind": 1
+                }}}},
+                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
+                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": {"Regular": 2}},
+                            "generics": {"regions": [], "types": [i64_ty], "const_generics": [], "trait_refs": []}
+                        }},
+                        "args": [],
+                        "dest": place(0, &i64_ty)
+                    },
+                    "target": 3,
+                    "on_unwind": 1
+                }}}},
+                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+            ]
+        }
+    });
+    let use_body = json!({
+        "Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 0, "locals": [local(0, &i64_ty)]},
+            "body": [
+                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": {"Regular": 3}},
+                            "generics": {"regions": [], "types": [i64_ty], "const_generics": [], "trait_refs": [impl_ref]}
+                        }},
+                        "args": [],
+                        "dest": place(0, &i64_ty)
+                    },
+                    "target": 2,
+                    "on_unwind": 1
+                }}}},
+                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
+                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+            ]
+        }
+    });
+    let file = json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "fun_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["core", "marker", "Marker", "mark"], false),
+                    "signature": {"is_unsafe": false, "inputs": [], "output": tvar},
+                    "body": null
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(&["fixture", "mark_i64"], false),
+                    "signature": {"is_unsafe": false, "inputs": [], "output": i64_ty},
+                    "body": null
+                },
+                {
+                    "def_id": 2,
+                    "item_meta": meta(&["pyre_object", "lltype", "malloc_typed"], true),
+                    "signature": {"is_unsafe": false, "inputs": [], "output": i64_ty},
+                    "generics": {
+                        "regions": [],
+                        "types": [{"index": 0, "name": "T"}],
+                        "const_generics": [],
+                        "trait_clauses": [],
+                        "regions_outlive": [],
+                        "types_outlive": [],
+                        "trait_type_constraints": []
+                    },
+                    "body": ret_body(&i64_ty)
+                },
+                {
+                    "def_id": 3,
+                    "item_meta": meta(&["fixture", "wrap"], true),
+                    "signature": {"is_unsafe": false, "inputs": [], "output": i64_ty},
+                    "generics": generics,
+                    "body": wrap_body
+                },
+                {
+                    "def_id": 4,
+                    "item_meta": meta(&["fixture", "use_wrap"], true),
+                    "signature": {"is_unsafe": false, "inputs": [], "output": i64_ty},
+                    "body": use_body
+                }
+            ],
+            "global_decls": [],
+            "type_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": meta(&["core", "marker", "Marker"], false)
+            }],
+            "trait_impls": [{
+                "methods": [{"kind": {"TraitMethod": [0, 0]}, "skip_binder": {"id": 1}}],
+                "impl_trait": {"id": 0, "generics": {"regions": [], "types": [i64_ty], "const_generics": [], "trait_refs": []}},
+                "implied_trait_refs": []
+            }]
         }
     });
     file.to_string()

@@ -15868,6 +15868,10 @@ impl<'a> Lowering<'a> {
         if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
             return None;
         }
+        // A builtin is not a `FunctionDesc` (`BUILTIN_ANALYZERS`); it gets no specialized graph.
+        if self.callee_is_host_builtin(fd) {
+            return None;
+        }
         // Inside a spec copy every concrete instantiation gets its own
         // graph, including a `dont_look_inside` helper with no trait
         // clauses. Outside, only a clause-bearing callee with a TraitImpl
@@ -15906,6 +15910,60 @@ impl<'a> Lowering<'a> {
                 const_generics,
             });
         Some(spec_segments(self.llbc, fd, &leaf))
+    }
+
+    /// `HOST_ENV` resolves the bare call segments, or the crate-qualified
+    /// dotted path (`name_path` with `::` rewritten to `.`).
+    fn callee_is_host_builtin(&self, fd: &FunDecl) -> bool {
+        let (segments, _) = self.unspecialized_fun_segments(fd);
+        if crate::flowspace::model::host_env_callable(&segments).is_some() {
+            return true;
+        }
+        let dotted: Vec<String> = fd
+            .item_meta
+            .name_path()
+            .replace("::", ".")
+            .split('.')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect();
+        crate::flowspace::model::host_env_callable(&dotted).is_some()
+    }
+
+    /// Segments and method hint `call_target_segments` emits for a direct
+    /// call once specialization and blanket `Into` devirtualization decline.
+    fn unspecialized_fun_segments(&self, fd: &FunDecl) -> (Vec<String>, Option<(String, String)>) {
+        let method_hint = self.impl_method_owner(fd);
+        // A `#[dont_look_inside]` inherent method is a residual call, not a
+        // trace target. Routing it as `CallTarget::Method` surfaces
+        // `getattr(recv, method)` on a classed receiver whose classdict
+        // carries no method source, which blocks at annotate
+        // (`complete_pending_blocks failed: Blocked block`). Decline the
+        // Method hint for such a callee so it routes as a `FunctionPath`.
+        let method_hint = if method_hint.is_some()
+            && self
+                .dont_look_inside
+                .contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+        {
+            None
+        } else {
+            method_hint
+        };
+        let segments: Vec<String> = if method_hint.is_none()
+            && let Some((owner_qualified, leaf)) =
+                impl_method_owner_for_fundecl(self.llbc, fd)
+        {
+            let mut v: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
+            v.push(leaf);
+            v
+        } else {
+            fd.item_meta
+                .name_path()
+                .split("::")
+                .map(|s| s.to_string())
+                .collect()
+        };
+        (segments, method_hint)
     }
 
     /// Resolve a Charon `CallKind` to a flattened path segment list the
@@ -15959,51 +16017,7 @@ impl<'a> Lowering<'a> {
                     if let Some(IntoDevirt::Target(segments)) = self.blanket_into_devirt(reg) {
                         return (segments, None);
                     }
-                    let method_hint = self.impl_method_owner(fd);
-                    // A `#[dont_look_inside]` inherent method is a residual
-                    // call, not a trace target. Routing it as
-                    // `CallTarget::Method` surfaces `getattr(recv, method)`
-                    // on a classed receiver whose classdict carries no
-                    // method source, which blocks at annotate
-                    // (`complete_pending_blocks failed: Blocked block`).
-                    // Decline the Method hint for such a callee so it routes
-                    // as a `FunctionPath` the registry resolves to the same
-                    // residual fnaddr — the getattr surface vanishes and the
-                    // enclosing carrier annotates with no annotator change.
-                    let method_hint = if method_hint.is_some()
-                        && self
-                            .dont_look_inside
-                            .contains(&strip_crate_prefix(&fd.item_meta.name_path()))
-                    {
-                        None
-                    } else {
-                        method_hint
-                    };
-                    // An impl-block associated function (the method
-                    // gate rejected it — no `self` receiver) is
-                    // spelled `[<qualified owner>, <fn>]`, the key the
-                    // canonical registration loop derives from
-                    // `self_ty_root`; the raw `name_path()` carries an
-                    // `<Impl>` segment that never matches a registry
-                    // entry.
-                    let segments: Vec<String> = if method_hint.is_none()
-                        && let Some((owner_qualified, leaf)) =
-                            impl_method_owner_for_fundecl(self.llbc, fd)
-                    {
-                        // Split like `CallPath::for_impl_method` so the
-                        // segment vectors compare equal.
-                        let mut v: Vec<String> =
-                            owner_qualified.split("::").map(str::to_string).collect();
-                        v.push(leaf);
-                        v
-                    } else {
-                        fd.item_meta
-                            .name_path()
-                            .split("::")
-                            .map(|s| s.to_string())
-                            .collect()
-                    };
-                    (segments, method_hint)
+                    self.unspecialized_fun_segments(fd)
                 })
                 .ok_or_else(|| {
                     LowerError::Schema(format!(
