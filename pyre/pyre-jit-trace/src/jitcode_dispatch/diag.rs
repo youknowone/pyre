@@ -443,7 +443,6 @@ spec_folds! {
     LoadFastCheck        => ("load_fast_check",          "residual_call", "-"),
     ConvertValue         => ("convert_value",            "residual_call", "-"),
     FormatWithSpecInt    => ("format_with_spec_int",     "residual_call", "-"),
-    BinarySliceStr       => ("binary_slice_str",         "residual_call", "-"),
     SubscrUserGetitem    => ("subscr_user_getitem",      "inline_call",   "subscr"),
     LenUserDunder        => ("len_user_dunder",          "inline_call",   "-"),
 }
