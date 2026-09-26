@@ -2543,7 +2543,11 @@ pub unsafe fn w_module_dict_walk_gc_cells(
         }
     } else {
         let storage = &mut *(md.dstorage as *mut crate::celldict::ModuleDictStorage);
-        for value in storage.iter_values_mut() {
+        for (key, value) in storage.entries.iter_mut() {
+            // `ModuleDictStrategy` keys are the `str` block. The block does
+            // not move; the visit keeps it alive.
+            let key_ptr = key as *const crate::celldict::StrKey as *mut crate::celldict::StrKey;
+            visitor(&mut *(std::ptr::addr_of_mut!((*key_ptr).0) as *mut PyObjectRef));
             crate::celldict::walk_module_value_slot(value, visitor);
         }
         w_module_dict_module_strategy_mut(obj).walk_cache_cells(visitor);
