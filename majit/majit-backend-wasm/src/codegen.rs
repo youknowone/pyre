@@ -7932,7 +7932,6 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
-                    ca.exit_table_base,
                 );
                 // rewrite.py `clear_varsize_gc_fields` FLAG_STR / FLAG_UNICODE:
                 // `emit_setfield(result, 0, descr=hash_descr)`. Both layouts
@@ -8105,7 +8104,6 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
-                    ca.exit_table_base,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8210,7 +8208,6 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
-                    ca.exit_table_base,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8398,7 +8395,6 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
-                    ca.exit_table_base,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8625,7 +8621,6 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
-                    ca.exit_table_base,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8660,7 +8655,6 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
-                    ca.exit_table_base,
                 );
             }
             OpCode::ZeroArray => {
@@ -8844,7 +8838,6 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
-                    ca.exit_table_base,
                 );
                 // Recycled nursery bytes. The entry publish unions with the
                 // live map, so a fresh frame must start with a null map or
@@ -11327,27 +11320,23 @@ fn exit_fail_args(op: &Op) -> Vec<OpRef> {
 /// Address 0 is ordinary linear memory here, so stores that follow an
 /// allocation would corrupt it silently rather than fault.
 ///
-/// The failing arm is `_build_propagate_exception_path` in this backend's exit
-/// spelling. `_store_and_reset_exception` moves the `MemoryError` the
-/// allocation helper published (`lib.rs` `oom_signal_if_zero`) out of the
-/// shared cells and into the frame's first exit slot, `frame[0]` takes the
-/// reserved `exit_frame_with_exception_descr_ref` exit, and the function
-/// returns its frame pointer. It returns rather than branching to the hot-exit
-/// block because the epilogue there dispatches on a per-guard bridge cell, and
-/// this exit belongs to no guard and owns no cell.
+/// The failing arm is `_build_propagate_exception_path`:
+/// `_store_and_reset_exception` moves the `MemoryError` the allocation
+/// helper published (`lib.rs` `oom_signal_if_zero`) into `jf_guard_exc`,
+/// `jf_descr` becomes `propagate_exception_descr`, and the function returns
+/// its frame pointer. The metainterp reader runs
+/// `PropagateExceptionDescr.handle_fail` (null cell → `memory_error`).
+/// It returns rather than branching to the hot-exit block because the
+/// epilogue there dispatches on a per-guard bridge cell, and this exit
+/// belongs to no guard.
 ///
 /// A collecting helper can move the frame before it fails, so local 0 is
 /// reloaded on this arm; the reload reads the shadow-stack top, so a caller
 /// that already reloaded pays nothing for the second one.
 ///
-/// Two configurations cannot deliver the exception and trap instead of
-/// reporting a wrong one: a cpu that was never handed
-/// `exit_frame_with_exception_descr_ref`, whose exit would resolve to a bare
-/// finish and hand the exception back as the loop's result (the same choice
-/// the cranelift sibling's `emit_memory_error_check` makes for an unattached
-/// `propagate_exception_descr`), and a `MemoryError` provider that was never
-/// registered, whose exit slot would carry a null reference into the
-/// frontend's re-raise.
+/// A cpu that was never handed `propagate_exception_descr` traps, the same
+/// choice the cranelift sibling's `emit_memory_error_check` makes for an
+/// unattached descr.
 fn emit_memory_error_check(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -11356,17 +11345,10 @@ fn emit_memory_error_check(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
-    exit_table_base: u32,
 ) {
     emit_resolve(sink, constants, value_types, value);
     sink.i64_eqz();
-    emit_memory_error_on_truthy(
-        sink,
-        residual_type_base,
-        ca_reload_fn_ptr,
-        jf_top_addr,
-        exit_table_base,
-    );
+    emit_memory_error_on_truthy(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
 }
 
 fn emit_memory_error_if_i32_zero(
@@ -11374,16 +11356,9 @@ fn emit_memory_error_if_i32_zero(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
-    exit_table_base: u32,
 ) {
     sink.i32_eqz();
-    emit_memory_error_on_truthy(
-        sink,
-        residual_type_base,
-        ca_reload_fn_ptr,
-        jf_top_addr,
-        exit_table_base,
-    );
+    emit_memory_error_on_truthy(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
 }
 
 fn emit_memory_error_on_truthy(
@@ -11391,22 +11366,17 @@ fn emit_memory_error_on_truthy(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
-    exit_table_base: u32,
 ) {
     sink.if_(BlockType::Empty);
-    if crate::failguard::exit_frame_with_exception_attached() {
+    if crate::failguard::propagate_exception_attached() {
         emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
-        sink.local_get(0);
-        sink.i32_const(runtime_addr(crate::jit_exc_value_addr));
-        sink.i64_load(mem64(0));
-        sink.i64_store(mem64(FRAME_SLOT_BASE));
-        // assembler.py propagate path: the same value also lands in jf_guard_exc
-        // before pos_exception / pos_exc_value are cleared.
+        // `_store_and_reset_exception`: JIT_EXC_VALUE → jf_guard_exc, then
+        // clear both globals. `grab_exc_value` reads jf_guard_exc.
         sink.local_get(0);
         sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
         sink.i32_sub();
-        sink.local_get(0);
-        sink.i64_load(mem64(FRAME_SLOT_BASE));
+        sink.i32_const(runtime_addr(crate::jit_exc_value_addr));
+        sink.i64_load(mem64(0));
         sink.i32_wrap_i64();
         sink.i32_store(memarg(majit_backend::jitframe::JF_GUARD_EXC_OFS as u64, 2));
         sink.i32_const(runtime_addr(crate::jit_exc_value_addr));
@@ -11415,28 +11385,11 @@ fn emit_memory_error_on_truthy(
         sink.i32_const(runtime_addr(crate::jit_exc_type_addr));
         sink.i64_const(0);
         sink.i64_store(mem64(0));
-        sink.local_get(0);
-        sink.i64_load(mem64(FRAME_SLOT_BASE));
-        sink.i64_eqz();
-        sink.if_(BlockType::Empty);
-        sink.unreachable();
-        sink.end();
-        if exit_table_base == 0 {
-            sink.local_get(0);
-            sink.i64_const(crate::failguard::FINISH_EXIT_INDEX_EXC as i64);
-            sink.i64_store(mem64(0));
-        } else {
-            emit_store_header_word(
-                sink,
-                majit_backend::jitframe::JF_DESCR_OFS as u64,
-                crate::failguard::finish_descr_ptr(crate::failguard::FINISH_EXIT_INDEX_EXC),
-            );
-            emit_store_header_word(
-                sink,
-                majit_backend::jitframe::JF_GCMAP_OFS as u64,
-                memory_error_gcmap(),
-            );
-        }
+        emit_store_header_word(
+            sink,
+            majit_backend::jitframe::JF_DESCR_OFS as u64,
+            crate::failguard::propagate_exception_descr_ptr(),
+        );
         sink.local_get(0);
         sink.return_();
     } else {
@@ -11464,19 +11417,6 @@ fn ref_spill_item_indices(guard: &GuardExit, sign: usize) -> Vec<u32> {
         indices.push(((FRAME_SLOT_BASE as usize + slot * 8) / sign) as u32);
     }
     indices
-}
-
-pub(crate) fn memory_error_gcmap_ptr() -> *const u8 {
-    memory_error_gcmap() as *const u8
-}
-
-fn memory_error_gcmap() -> usize {
-    static MAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAP.get_or_init(|| {
-        let bit = (FRAME_SLOT_BASE as usize / std::mem::size_of::<isize>()) as u32;
-        let map = gcmap_for_item_indices(&[bit]);
-        Box::into_raw(map) as *mut usize as usize
-    })
 }
 
 fn gcmap_for_item_indices(indices: &[u32]) -> Box<[usize]> {

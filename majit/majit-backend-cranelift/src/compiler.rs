@@ -8514,22 +8514,11 @@ fn resolve_exit_descr(
     jf_descr_raw: i64,
     fail_descrs: &[DescrRef],
     attachments: &'static CpuDescrAttachments,
-    propagate_descr_ptr: usize,
 ) -> (u32, Option<ExitDescr>) {
     if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
         (CALL_ASSEMBLER_DEADFRAME_SENTINEL, None)
     } else if jf_descr_raw == 0 {
-        // Propagate-into-exit fall-through: when the metainterp
-        // didn't attach an `exit_frame_with_exception_descr_ref`
-        // (unit-test setups), the rewrite above leaves jf_descr at 0;
-        // surface the cranelift singleton directly so the consumer
-        // still sees `is_exit_frame_with_exception=true`.
-        if propagate_descr_ptr != 0 {
-            let cl: DescrRef = EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL.clone();
-            (u32::MAX, Some(ExitDescr::owned(cl)))
-        } else {
-            (0u32, None)
-        }
+        (0u32, None)
     } else if let Some(metainterp_finish) = match_metainterp_finish_descr(jf_descr_raw, attachments)
     {
         // `history.py AbstractDescr.show` / `cpu.get_latest_descr(deadframe)`:
@@ -8560,49 +8549,6 @@ fn resolve_exit_descr(
         // identity, anything else through `recover_fail_descr_cell`.
         let fi = arc.as_ref().map(|a| as_fd(a).fail_index()).unwrap_or(0);
         (fi, arc.map(ExitDescr::owned))
-    }
-}
-
-/// `assembler.py` `gcmap_for_finish`: one bitmap word with bit 0 set, the
-/// map a FINISH returning a Ref leaves on the frame so slot 0 is traced.
-static GCMAP_FOR_FINISH: [isize; 2] = [1, 1];
-
-/// compile.py `PropagateExceptionDescr.handle_fail`: move `jf_guard_exc`
-/// (or `memory_error` when it is empty) into frame slot 0 and retarget
-/// `jf_descr` at the attached `exit_frame_with_exception_descr_ref`, so
-/// the ExitFrameWithExceptionRef reader picks the exception up.
-fn stage_propagate_exception_as_exit(
-    result_jf: *mut i64,
-    attachments: &'static CpuDescrAttachments,
-) {
-    let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
-    let exc_val = unsafe {
-        let slot = result_jf.add(JF_GUARD_EXC_OFS as usize / 8);
-        let v = *slot;
-        *slot = 0;
-        v
-    };
-    let exc_val = if exc_val != 0 {
-        exc_val
-    } else {
-        // compile.py `cast_instance_to_gcref(memory_error)`
-        majit_backend::memory_error_singleton_ref()
-    };
-    // Slot 0 now holds the only reference to the exception. The propagate
-    // guard has no failargs, so its gcmap marks no slot; install
-    // `gcmap_for_finish` so the frame keeps the value rooted and forwarded
-    // until the exit reader consumes it.
-    unsafe {
-        *result_jf.add(header_words) = exc_val;
-        *result_jf.add(JF_GCMAP_OFS as usize / 8) = GCMAP_FOR_FINISH.as_ptr() as i64;
-    }
-    // When unattached (unit-test setup) this writes 0, and
-    // `resolve_exit_descr` surfaces the cranelift singleton.
-    // `AbstractDescr.hide`: the attached word is the cell address, not
-    // `Arc::as_ptr`'s data half.
-    let attached_exit = attachments.descr_ptrs().exit_frame_with_exception_descr_ref;
-    unsafe {
-        *result_jf.add(JF_DESCR_OFS as usize / 8) = attached_exit as i64;
     }
 }
 
@@ -8818,68 +8764,16 @@ fn run_compiled_code_inner(
     // the Arc pointer (for direct descr propagation).
     let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
 
-    // compile.py `PropagateExceptionDescr.handle_fail`:
-    //     exception = cpu.grab_exc_value(deadframe)
-    //     if not exception:
-    //         exception = cast_instance_to_gcref(memory_error)
-    //     raise jitexc.ExitFrameWithExceptionRef(exception)
-    //
-    // Detect-and-transfer before the regular match chain so the
-    // upstream "ExitFrameWithExceptionRef" tail can absorb the
-    // exception ref through the ordinary slot-0 reader path.  The
-    // emitted propagate path (compiler.rs OpCode::CheckMemoryError /
-    // x86 / aarch64 assembler.rs) stores the raw value into
-    // `jf_guard_exc`; here we mirror `cpu.grab_exc_value` (read +
-    // clear) and stage the result into `jf_frame[0]` so
-    // `EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL`'s consumer path
-    // (compile.py:660) reads it through the existing accessor.
-    // Singleton cell (`AbstractDescr.hide` / `descr_instance_ptr`), the
-    // word `_build_propagate_exception_path` writes. The recovery stub
-    // writes the guard's own `FailDescrCell`; that case is the
-    // `cell_is_propagate` arm below (`compile.py`
-    // `PropagateExceptionDescr.handle_fail`, `compile_tmp_callback`).
-    let propagate_descr_ptr = attachments.descr_ptrs().propagate_exception_descr;
-    let raw_propagate = propagate_descr_ptr != 0 && jf_descr_raw as usize == propagate_descr_ptr;
-    if raw_propagate {
-        stage_propagate_exception_as_exit(result_jf, attachments);
-    }
-    let mut jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
-
-    let (mut fail_index, mut direct_descr) =
-        resolve_exit_descr(jf_descr_raw, fail_descrs, attachments, propagate_descr_ptr);
-    // The guard-cell `jf_descr` is resolved above. When the wrapped
-    // descr is `propagate_exception_descr`, stage the same exit the
-    // raw-pointer arm does. Otherwise the resume-guard path finds no
-    // `rd_numb` and the caller continues as if the call returned NULL
-    // (`compile.py` `PropagateExceptionDescr.handle_fail`,
-    // `compile_tmp_callback`).
-    let cell_is_propagate = !raw_propagate
-        && attachments
-            .propagate_exception_descr
-            .as_ref()
-            .is_some_and(|propagate| {
-                direct_descr.as_ref().is_some_and(|descr| {
-                    let recovered = descr.to_arc();
-                    Arc::ptr_eq(&recovered, propagate)
-                })
-            });
-    if cell_is_propagate {
-        stage_propagate_exception_as_exit(result_jf, attachments);
-        jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
-        (fail_index, direct_descr) =
-            resolve_exit_descr(jf_descr_raw, fail_descrs, attachments, propagate_descr_ptr);
-    }
+    // `PropagateExceptionDescr.handle_fail` runs in the metainterp exit
+    // reader (`consume_executed_frame`). This frame keeps `jf_guard_exc`
+    // and the propagate descr `_build_propagate_exception_path` wrote.
+    let (fail_index, direct_descr) = resolve_exit_descr(jf_descr_raw, fail_descrs, attachments);
     #[cfg(feature = "__execute-stage-probe")]
     if majit_backend::deadframe::probe_extra_stage()
         == majit_backend::deadframe::ProbeExtraStage::Descr
     {
         for _ in 0..majit_backend::deadframe::frame_build_repeats() {
-            std::hint::black_box(resolve_exit_descr(
-                jf_descr_raw,
-                fail_descrs,
-                attachments,
-                propagate_descr_ptr,
-            ));
+            std::hint::black_box(resolve_exit_descr(jf_descr_raw, fail_descrs, attachments));
         }
     }
     #[cfg(feature = "__execute-stage-probe")]
@@ -20861,6 +20755,65 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert_eq!(backend.get_int_value(&frame, 0), 999_999);
+    }
+
+    /// `compile.py` `PropagateExceptionDescr.handle_fail` through the exit
+    /// reader: the compiled null check leaves `jf_descr` as the propagate
+    /// descr (`_build_propagate_exception_path`), and the reader raises the
+    /// grabbed value, or `memory_error` when `jf_guard_exc` is null.
+    #[test]
+    fn propagate_exception_exit_raises_through_the_reader() {
+        // Leave the process-global provider alone. A stand-in address
+        // is what a later test dereferences as an exception object.
+        let memory_error = majit_backend::memory_error_singleton_ref();
+
+        let mut backend = CraneliftBackend::new();
+        let propagate: majit_ir::DescrRef = Arc::new(majit_backend::PropagateExceptionDescr::new());
+        backend.set_propagate_exception_descr(Arc::clone(&propagate));
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = [
+            mk_op(
+                OpCode::CheckMemoryError,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let token = JitCellToken::new(70);
+        backend
+            .compile_loop(&inputargs, &ops, &token)
+            .expect("compile CheckMemoryError");
+
+        let exc_obj = 0i64;
+        let exc = &exc_obj as *const i64 as i64;
+        jit_exc_raise(exc);
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        let descr = backend.get_latest_descr_arc(&frame);
+        assert!(Arc::ptr_eq(&descr, &propagate));
+        let fd = descr.as_fail_descr().expect("propagate descr");
+        assert!(!fd.is_finish());
+        assert_eq!(fd.fail_index(), u32::MAX);
+        let grabbed = backend.grab_exc_value(&frame).0 as i64;
+        assert_eq!(grabbed, exc);
+        assert_eq!(
+            majit_backend::propagate_exception_handle_fail(fd, grabbed),
+            Some(exc)
+        );
+
+        jit_exc_clear();
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        let descr = backend.get_latest_descr_arc(&frame);
+        let fd = descr.as_fail_descr().expect("propagate descr");
+        let grabbed = backend.grab_exc_value(&frame).0 as i64;
+        assert_eq!(grabbed, 0);
+        assert_eq!(
+            majit_backend::propagate_exception_handle_fail(fd, grabbed),
+            Some(memory_error)
+        );
     }
 
     #[test]
