@@ -2309,8 +2309,12 @@ pub unsafe fn w_module_dict_setitem_str_no_proxy(
 }
 
 unsafe fn w_module_dict_setitem_str_internal(obj: PyObjectRef, key: &str, w_value: PyObjectRef) {
-    lock_dict_refs!(_module_guard, obj, w_value);
+    // `ModuleDictStrategy.setitem_str` is a cell lookup plus `write_cell`.
+    // That arm allocates only through `malloc_typed_stable` and never runs
+    // user code, so it does not collect. The guard stays on the object-strategy
+    // arm, which wraps a new key or runs a str subclass `__eq__`/`__hash__`.
     if w_module_dict_is_object_strategy(obj) {
+        lock_dict_refs!(_module_guard, obj, w_value);
         // Module-dict storage is Box-immortal, reached only by the
         // prebuilt-family root walk; record the store (gc_roots.rs
         // prebuilt-root write tracking).
@@ -2362,15 +2366,20 @@ unsafe fn w_module_dict_setitem_str_internal(obj: PyObjectRef, key: &str, w_valu
 /// # Safety
 /// `obj` must point to a valid `W_ModuleDictObject`.
 pub unsafe fn w_module_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
-    lock_dict_refs!(_module_guard, obj);
-    if let Some(entries) = w_module_dict_object_storage(obj) {
-        // Post-switch ObjectStrategy: route through `dict_keys_equal`
-        // (`dictmultiobject.py:1210` r_dict(eq_w, hash_w)) instead of
-        // raw String content equality so str-subclass keys with
-        // overridden `__eq__`/`__hash__` are reachable from the
-        // str-fast-path lookup.  A borrowed `&str` probe avoids the
-        // per-lookup throwaway `W_UnicodeObject` (`getitem_str` parity).
-        return dict_entries_get_str(entries, key, 0);
+    // `ModuleDictStrategy.getitem_str` is `getdictvalue_no_unwrapping` plus
+    // `unwrap_cell`. Neither collects. The guard stays on the object-strategy
+    // arm, whose probe can run a str subclass `__eq__`.
+    if w_module_dict_is_object_strategy(obj) {
+        lock_dict_refs!(_module_guard, obj);
+        if let Some(entries) = w_module_dict_object_storage(obj) {
+            // Post-switch ObjectStrategy: route through `dict_keys_equal`
+            // (`ObjectDictStrategy.get_empty_storage` r_dict(eq_w, hash_w)) instead of
+            // raw String content equality so str-subclass keys with
+            // overridden `__eq__`/`__hash__` are reachable from the
+            // str-fast-path lookup.  A borrowed `&str` probe avoids the
+            // per-lookup throwaway `W_UnicodeObject` (`getitem_str` parity).
+            return dict_entries_get_str(entries, key, 0);
+        }
     }
     {
         let strategy = &*w_module_dict_get_strategy(obj);
@@ -3909,6 +3918,15 @@ pub unsafe fn w_dict_setitem_str_hashed(
     hash: i64,
     value: PyObjectRef,
 ) {
+    // STORE_NAME / STORE_GLOBAL on a module dict still in
+    // `ModuleDictStrategy`. That arm is `setitem_str` → `write_cell` and
+    // does not collect, so the guard would root operands nothing moves.
+    // Every other strategy, including a module dict after
+    // `switch_to_object_strategy`, can run user code and keeps the guard.
+    if is_module_dict(obj) && !w_module_dict_is_object_strategy(obj) {
+        w_dict_get_strategy(obj).setitem_str_hashed(obj, key, hash, value);
+        return;
+    }
     lock_dict_refs!(_dict_guard, obj, value);
     w_dict_get_strategy(obj).setitem_str_hashed(obj, key, hash, value)
 }
