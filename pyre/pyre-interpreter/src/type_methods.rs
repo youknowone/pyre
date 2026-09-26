@@ -1669,57 +1669,66 @@ fn str_prefix_match_slow(
     .map(w_bool_from)
 }
 
+/// The whole `str.startswith` method behind the gateway's fast arm.
+#[majit_macros::dont_look_inside]
+fn str_startswith_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    str_method_startswith(args)
+}
+
+/// The whole `str.endswith` method behind the gateway's fast arm.
+#[majit_macros::dont_look_inside]
+fn str_endswith_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    str_method_endswith(args)
+}
+
 /// `BuiltinCode.func` PBC member for `str.startswith`.
 ///
 /// `interp2app` would generate this wrapper; the descent walker keys the
 /// args-array heap-cache off the element reads, the same shape
-/// `__majit_wrap_builtin_len` uses.  The non-default-bounds / tuple /
-/// TypeError arms go through [`str_prefix_match_slow`] so they stay
-/// `dont_look_inside` and do not pull `__getslice_minusone` into this graph.
+/// `__majit_wrap_builtin_len` uses.  The fast arm comes before the arity
+/// check: a keyword argument rides the same slice as a trailing dict, which
+/// is never a `str`, so two `str` elements are exactly one positional
+/// prefix.  Every other shape, the arity and keyword errors included, runs
+/// the method through the `dont_look_inside` [`str_startswith_slow`], so the
+/// kwargs scan and `__getslice_minusone` stay out of this graph.  The match
+/// is `rstring.py startswith`, which is `@jit.elidable`: one pure call.
 pub fn __majit_wrap_str_descr_startswith(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least(args, "startswith", 1)?;
-    arity_at_most(args, "startswith", 3)?;
-    if args.len() != 2 {
-        return str_prefix_match_slow(args, "startswith", true);
-    }
-    let w_self = args[0];
-    let w_prefix = args[1];
-    unsafe {
-        if !pyre_object::is_str(w_self)
-            || pyre_object::is_tuple(w_prefix)
-            || !pyre_object::is_str(w_prefix)
-        {
-            return str_prefix_match_slow(args, "startswith", true);
+    if args.len() == 2 {
+        let w_self = args[0];
+        let w_prefix = args[1];
+        if unsafe {
+            pyre_object::is_str(w_self)
+                && !pyre_object::is_tuple(w_prefix)
+                && pyre_object::is_str(w_prefix)
+        } {
+            let found =
+                unsafe { pyre_object::unicodeobject::startswith(w_self, w_prefix, 0, i64::MAX) };
+            return Ok(w_bool_from(found));
         }
     }
-    // Walk is spelled here, not delegated: a callee of this wrapper
-    // is never a CodeWriter candidate, so the call would stay residual
-    // and look-inside would die on `callable type method`.
-    Ok(w_bool_from(rstring_prefix_eq!(w_self, w_prefix)))
+    str_startswith_slow(args)
 }
 
 /// `BuiltinCode.func` PBC member for `str.endswith`.
 pub fn __majit_wrap_str_descr_endswith(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least(args, "endswith", 1)?;
-    arity_at_most(args, "endswith", 3)?;
-    if args.len() != 2 {
-        return str_prefix_match_slow(args, "endswith", false);
-    }
-    let w_self = args[0];
-    let w_suffix = args[1];
-    unsafe {
-        if !pyre_object::is_str(w_self)
-            || pyre_object::is_tuple(w_suffix)
-            || !pyre_object::is_str(w_suffix)
-        {
-            return str_prefix_match_slow(args, "endswith", false);
+    if args.len() == 2 {
+        let w_self = args[0];
+        let w_suffix = args[1];
+        if unsafe {
+            pyre_object::is_str(w_self)
+                && !pyre_object::is_tuple(w_suffix)
+                && pyre_object::is_str(w_suffix)
+        } {
+            let found =
+                unsafe { pyre_object::unicodeobject::endswith(w_self, w_suffix, 0, i64::MAX) };
+            return Ok(w_bool_from(found));
         }
     }
-    Ok(w_bool_from(rstring_suffix_eq!(w_self, w_suffix)))
+    str_endswith_slow(args)
 }
 
 /// Apply `startswith`/`endswith`'s optional `start`/`end` bounds to `s`,

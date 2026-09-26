@@ -8078,26 +8078,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::StrStartswith, || {
-            try_walker_specialize_str_prefix_match(ctx, code, op, &r_args, dst, dst_bank, true)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::StrEndswith, || {
-            try_walker_specialize_str_prefix_match(ctx, code, op, &r_args, dst, dst_bank, false)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::MathFrexp, || {
             try_walker_specialize_math_frexp(ctx, code, op, &r_args, dst)
         })?
