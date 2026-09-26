@@ -141,6 +141,74 @@ fn defaults_repr_class_addr(repr: DefaultsRepr) -> i64 {
     ty as i64
 }
 
+/// Read element `tuple_index` of a pair tuple whose class is already guarded
+/// to `repr`.  For `Cls_oo` the `valueN` field is the element; for `Cls_ii`
+/// the element is `wrapint` of the field (`specialisedtupleobject.py`
+/// `wraps`), a fresh box the interpreter's `w_tuple_getitem` makes as well.
+/// The second value is the concrete a boxed int was stamped with, which the
+/// caller's argument concrete has to follow.
+fn emit_pair_tuple_item<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    tuple_op: OpRef,
+    repr: DefaultsRepr,
+    tuple_index: usize,
+    value: pyre_object::PyObjectRef,
+) -> Result<(OpRef, Option<ConcreteValue>), DispatchError> {
+    if repr == DefaultsRepr::PairObject {
+        let descr = if tuple_index == 0 {
+            crate::descr::specialised_tuple_oo_value0_descr()
+        } else {
+            crate::descr::specialised_tuple_oo_value1_descr()
+        };
+        let elem = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, tuple_op, descr);
+        return Ok((elem, None));
+    }
+    debug_assert!(repr == DefaultsRepr::PairInt);
+    let descr = if tuple_index == 0 {
+        crate::descr::specialised_tuple_ii_value0_descr()
+    } else {
+        crate::descr::specialised_tuple_ii_value1_descr()
+    };
+    let raw = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, tuple_op, descr);
+    let elem = unsafe { pyre_object::w_int_get_value(value) };
+    let boxed = walker_box_int(ctx, op_pc, raw, elem)?;
+    // `wrapint` emits a heap `NewWithVtable`, so the stamped concrete has to
+    // be a heap pointer too — the walk-time `w_tuple_getitem` box may be a
+    // tagged immediate.  The caller re-homes the argument's concrete onto
+    // whatever `box_int_concrete` picked, or its seeding loop would re-stamp
+    // the op with the other one.
+    let concrete = box_int_concrete(elem, value as i64);
+    ctx.trace_ctx.set_opref_concrete(boxed, concrete);
+    let rehomed = match concrete {
+        majit_ir::Value::Ref(gcref) => Some(ConcreteValue::Ref(
+            gcref.as_usize() as pyre_object::PyObjectRef
+        )),
+        _ => None,
+    };
+    Ok((boxed, rehomed))
+}
+
+/// The [`DefaultsRepr`] a tuple of this exact `ob_type` stores its elements
+/// in, or `None` for a layout the walker has no element read for.
+fn defaults_repr_of(ob_type: *const pyre_object::pyobject::PyType) -> Option<DefaultsRepr> {
+    if std::ptr::eq(ob_type, &pyre_object::pyobject::TUPLE_TYPE) {
+        Some(DefaultsRepr::ItemsBlock)
+    } else if std::ptr::eq(
+        ob_type,
+        &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE,
+    ) {
+        Some(DefaultsRepr::PairInt)
+    } else if std::ptr::eq(
+        ob_type,
+        &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE,
+    ) {
+        Some(DefaultsRepr::PairObject)
+    } else {
+        None
+    }
+}
+
 /// `function.py:188-193,217-231` — which `defs_w` element fills each parameter
 /// the call left unbound.  `defs_w` covers the LAST `len(defs_w)` parameters,
 /// so parameter `p` takes `defs_w[p - (nparams - ndefaults)]`; a `missing`
@@ -165,22 +233,7 @@ unsafe fn positional_defaults_for_inline(
     // The layout is what `ob_type` names.  The type test here only decides
     // which read to emit; keeping that decision valid for a later tuple is the
     // emitting half's job, through the shape guards it records.
-    let ob_type = unsafe { (*tuple).ob_type };
-    let repr = if std::ptr::eq(ob_type, &pyre_object::pyobject::TUPLE_TYPE) {
-        DefaultsRepr::ItemsBlock
-    } else if std::ptr::eq(
-        ob_type,
-        &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE,
-    ) {
-        DefaultsRepr::PairInt
-    } else if std::ptr::eq(
-        ob_type,
-        &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE,
-    ) {
-        DefaultsRepr::PairObject
-    } else {
-        return None;
-    };
+    let repr = defaults_repr_of(unsafe { (*tuple).ob_type })?;
     let ndefaults = unsafe { pyre_object::w_tuple_len(tuple) };
     let first_defaulted = nparams.checked_sub(ndefaults)?;
     let mut values = Vec::with_capacity(missing.len());
@@ -3661,24 +3714,41 @@ fn builtin_call_kw_bind_signature(
     Some((out_args, out_conc))
 }
 
+/// A `f(*args)` star tuple whose elements the resolved half reads off the
+/// tuple, once every non-emitting eligibility check has passed.
+///
+/// `Arguments._combine_starargs_wrapped` takes the positional arguments from
+/// `space.fixedview(w_stararg)`, which for an exact tuple is `w_obj.tolist()`:
+/// the `wrappeditems` elements of a `W_TupleObject`, or the `wraps[i]` of a
+/// specialised pair.  The emit re-proves the layout with a class guard and,
+/// for the array-backed tuple, pins its length to the callee's arity.
+struct StarArgsInline {
+    starargs_op: OpRef,
+    repr: DefaultsRepr,
+    /// The elements at resolve time, in parameter order.
+    values: Vec<pyre_object::PyObjectRef>,
+}
+
 /// Unpack a `bh_call_function_ex_fn(callable, self_or_null, starargs,
 /// kwargs_or_null)` star tuple into the positional argument boxes the inline
 /// path seeds from, or `None` to leave the call a residual.
 ///
-/// The elements are read out of the heap cache rather than off the tuple, so
-/// this folds exactly when the star tuple is virtual at the call — the
-/// `args = (...)` / `f(*args)` pair the walker just recorded, whose
-/// `wrappeditems` block and per-index stores are still cached
-/// (`try_walker_specialize_newtuple_object`).  A tuple that arrived from
-/// anywhere else has no cached block and declines, as does any `**kwargs`
-/// merge (the helper's `kwargs_or_null` is then a real mapping) and any arity
-/// that is not the callee's exact parameter count.
+/// When the star tuple is virtual at the call — the `args = (...)` /
+/// `f(*args)` pair the walker just recorded, whose `wrappeditems` block and
+/// per-index stores are still cached (`try_walker_specialize_newtuple_object`)
+/// — the elements come out of the heap cache and the tuple keeps no consumer.
+/// Any other exact tuple is read the way `space.fixedview` reads it; those
+/// reads are recorded by the resolved half, so the argument boxes returned
+/// here are the tuple itself as a placeholder and the [`StarArgsInline`]
+/// names what replaces them.  A `**kwargs` merge (the helper's
+/// `kwargs_or_null` is then a real mapping) and any arity that is not the
+/// callee's exact parameter count decline.
 fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     r_args: &[OpRef],
     arg_concretes: &[ConcreteValue],
     nparams: usize,
-) -> Option<(Vec<OpRef>, Vec<ConcreteValue>)> {
+) -> Option<(Vec<OpRef>, Vec<ConcreteValue>, Option<StarArgsInline>)> {
     if r_args.len() < 4 || arg_concretes.len() < 4 || nparams == 0 {
         return None;
     }
@@ -3695,16 +3765,41 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     // slots were tuple element refs.  `f(*some_list)` is ordinary Python, so
     // pin the concrete to a real tuple the way the `kwnames` path does before
     // reading the field.
-    match arg_concretes[2] {
+    let starargs_obj = match arg_concretes[2] {
         ConcreteValue::Ref(starargs)
-            if !starargs.is_null() && unsafe { pyre_object::is_tuple(starargs) } => {}
+            if !starargs.is_null() && unsafe { pyre_object::is_tuple(starargs) } =>
+        {
+            starargs
+        }
         _ => return None,
-    }
+    };
     let starargs = r_args[2];
     let items_descr = crate::descr::tuple_wrappeditems_descr();
-    let block = ctx
+    let Some(block) = ctx
         .trace_ctx
-        .heapcache_getfield_cached(starargs, items_descr.index())?;
+        .heapcache_getfield_cached(starargs, items_descr.index())
+    else {
+        // `_uses_tuple_iter` holds for the exact tuple classes alone, and
+        // those are the layouts `defaults_repr_of` has an element read for.
+        let repr = defaults_repr_of(unsafe { (*starargs_obj).ob_type })?;
+        if unsafe { pyre_object::w_tuple_len(starargs_obj) } != nparams {
+            return None;
+        }
+        let mut values = Vec::with_capacity(nparams);
+        for index in 0..nparams {
+            values.push(unsafe { pyre_object::w_tuple_getitem(starargs_obj, index as i64) }?);
+        }
+        let concretes = values.iter().map(|&v| ConcreteValue::Ref(v)).collect();
+        return Some((
+            vec![starargs; nparams],
+            concretes,
+            Some(StarArgsInline {
+                starargs_op: starargs,
+                repr,
+                values,
+            }),
+        ));
+    };
     // The cached length pins the arity: the callee takes exactly `nparams`
     // positional parameters, and a mismatch is a runtime TypeError the inline
     // path does not model.
@@ -3728,7 +3823,7 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
         args.push(elem);
         concretes.push(ConcreteValue::Ref(concrete));
     }
-    Some((args, concretes))
+    Some((args, concretes, None))
 }
 
 /// Body-shape verdicts for a callee's per-fn JitCode, decided once and kept on
@@ -4095,6 +4190,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
             op.pc,
         );
     }
+    let mut star_args = None;
     let (callee_args, callee_arg_concretes) = if is_call_kw {
         // A keyword call folds its `kwnames`->parameter permutation at trace
         // time (`fbw_reorder_call_kw_args`) so the reordered param-order args
@@ -4132,11 +4228,13 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         if method_form {
             return Ok(None);
         }
-        let Some(unpacked) = fbw_unpack_call_function_ex_args(ctx, r_args, &arg_concretes, nparams)
+        let Some((args, concretes, star)) =
+            fbw_unpack_call_function_ex_args(ctx, r_args, &arg_concretes, nparams)
         else {
             return Ok(None);
         };
-        unpacked
+        star_args = star;
+        (args, concretes)
     } else {
         let mut callee_args = Vec::with_capacity(r_args.len().saturating_sub(1));
         let mut callee_arg_concretes = Vec::with_capacity(arg_concretes.len().saturating_sub(1));
@@ -4158,7 +4256,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         callee_arg_concretes.extend_from_slice(&arg_concretes[2..]);
         (callee_args, callee_arg_concretes)
     };
-    try_walker_inline_resolved_user_call(
+    try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
         code,
@@ -4192,6 +4290,12 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         true,
         false,
         None,
+        None,
+        false,
+        None,
+        None,
+        None,
+        star_args,
     )
 }
 
@@ -6324,6 +6428,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -6383,6 +6488,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // guard inside the BODY runs those same checks on the way out
     // (`crate::operator_continuation`).
     operator_tail: Option<crate::operator_continuation::OperatorTail>,
+    // A `f(*args)` star tuple the positional parameters are read from; its
+    // placeholders in `callee_args` are replaced after the eligibility checks.
+    star_args: Option<StarArgsInline>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let is_being_profiled = ctx.session.borrow().is_being_profiled;
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
@@ -7502,6 +7610,53 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         callable_guard_op = function_op;
         callable_guard_value = bound.function;
     }
+    if let Some(star) = star_args {
+        // `space.fixedview(w_stararg)` -> `w_obj.tolist()`: the class guard
+        // re-proves the layout the resolve picked the reads for, and an exact
+        // tuple class is also what `_uses_tuple_iter` needs to take this path.
+        walker_guard_class(
+            ctx,
+            op.pc,
+            star.starargs_op,
+            defaults_repr_class_addr(star.repr),
+        )?;
+        if star.repr == DefaultsRepr::ItemsBlock {
+            let items = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                star.starargs_op,
+                crate::descr::tuple_wrappeditems_descr(),
+            );
+            // `_match_signature` raises on any other count; the pair classes
+            // fix theirs at two, so only the array-backed tuple needs this.
+            let len_op = crate::state::opimpl_arraylen_gc(
+                ctx.trace_ctx,
+                items,
+                crate::state::pyobject_gcarray_descr(),
+            );
+            let expected = ctx.trace_ctx.const_int(star.values.len() as i64);
+            let same_len = ctx.trace_ctx.record_op(OpCode::IntEq, &[len_op, expected]);
+            ctx.trace_ctx
+                .set_opref_concrete(same_len, majit_ir::Value::Int(1));
+            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[same_len])?;
+            for index in 0..star.values.len() {
+                let index_op = ctx.trace_ctx.const_int(index as i64);
+                callee_args[index] = crate::state::trace_items_block_getitem_value_pure(
+                    ctx.trace_ctx,
+                    items,
+                    index_op,
+                );
+            }
+        } else {
+            for (index, &value) in star.values.iter().enumerate() {
+                let (elem, concrete) =
+                    emit_pair_tuple_item(ctx, op.pc, star.starargs_op, star.repr, index, value)?;
+                callee_args[index] = elem;
+                if let Some(concrete) = concrete {
+                    callee_arg_concretes[index] = concrete;
+                }
+            }
+        }
+    }
 
     // `PyCode.frame_stores_global`: the common globals identity lives on the
     // code object and needs no frame field.  A shared code object rebound to a
@@ -7903,40 +8058,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     }
                 }
             }
-            DefaultsRepr::PairObject => {
-                for (param_index, tuple_index, _) in defaults.values {
-                    let descr = if tuple_index == 0 {
-                        crate::descr::specialised_tuple_oo_value0_descr()
-                    } else {
-                        crate::descr::specialised_tuple_oo_value1_descr()
-                    };
-                    callee_args[param_index] =
-                        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, defaults_op, descr);
-                }
-            }
-            DefaultsRepr::PairInt => {
+            DefaultsRepr::PairObject | DefaultsRepr::PairInt => {
                 for (param_index, tuple_index, value) in defaults.values {
-                    let descr = if tuple_index == 0 {
-                        crate::descr::specialised_tuple_ii_value0_descr()
-                    } else {
-                        crate::descr::specialised_tuple_ii_value1_descr()
-                    };
-                    let raw = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, defaults_op, descr);
-                    let elem = unsafe { pyre_object::w_int_get_value(value) };
-                    let boxed = walker_box_int(ctx, op.pc, raw, elem)?;
-                    // `wrapint` emits a heap `NewWithVtable`, so the stamped
-                    // concrete has to be a heap pointer too — the walk-time
-                    // `w_tuple_getitem` box above may be a tagged immediate.
-                    // Re-home the argument's concrete onto whatever
-                    // `box_int_concrete` picked, or the seeding loop below
-                    // would re-stamp the op with the other one.
-                    let concrete = box_int_concrete(elem, value as i64);
-                    if let majit_ir::Value::Ref(gcref) = concrete {
-                        callee_arg_concretes[param_index] =
-                            ConcreteValue::Ref(gcref.as_usize() as pyre_object::PyObjectRef);
+                    let (elem, concrete) = emit_pair_tuple_item(
+                        ctx,
+                        op.pc,
+                        defaults_op,
+                        defaults.repr,
+                        tuple_index,
+                        value,
+                    )?;
+                    callee_args[param_index] = elem;
+                    if let Some(concrete) = concrete {
+                        callee_arg_concretes[param_index] = concrete;
                     }
-                    ctx.trace_ctx.set_opref_concrete(boxed, concrete);
-                    callee_args[param_index] = boxed;
                 }
             }
         }
@@ -11282,6 +11417,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             name_concrete: name_obj,
         }),
         None,
+        None,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -11443,6 +11579,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
             name: name_const,
             name_concrete: name_obj,
         }),
+        None,
         None,
     )?;
     if inlined.is_none() {
@@ -11758,6 +11895,7 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         None,
         None,
         None,
+        None,
     )?;
     match (inlined, result) {
         (Some((DispatchOutcome::Continue, next_pc)), Some(result)) if next_pc == op.next_pc => {
@@ -12006,6 +12144,7 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
         None,
         None,
         Some(crate::operator_continuation::OperatorTail::Len),
+        None,
     )?;
     // A refused result — `__len__` answering a non-int or a negative — declines
     // from inside the call above after the body has been walked.  Cut that
@@ -12142,6 +12281,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
         None,
         None,
         false,
+        None,
         None,
         None,
         None,
@@ -12323,6 +12463,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         None,
         false,
         Some(foriter_green_key),
+        None,
         None,
         None,
     );
