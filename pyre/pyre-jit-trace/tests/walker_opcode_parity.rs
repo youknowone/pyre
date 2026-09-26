@@ -307,6 +307,11 @@ const NEITHER: &[&str] = &[
     "newlist/idddd>r",
     "newlist_hint/idddd>r",
     "record_quasiimmut_field/rdd",
+    // Encoded for the front's `InteriorFieldWrite` alongside the
+    // `getinteriorfield_gc_*` keys above; no tracer walks either yet.
+    "setinteriorfield_gc_f/rifd",
+    "setinteriorfield_gc_i/riid",
+    "setinteriorfield_gc_r/rird",
     "vtable_method_ptr/rd>i",
 ];
 
