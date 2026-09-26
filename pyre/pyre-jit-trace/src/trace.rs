@@ -508,6 +508,18 @@ fn p2_drain_abort() -> TraceAction {
     TraceAction::Abort
 }
 
+/// `pyjitpl.py` `raise SwitchToBlackhole(ABORT_TOO_LONG)`.
+/// `full_body_walk_trace` and the bridge-carrier drain share this signal:
+/// `note_root_trace_too_long` already ran `blackhole_if_trace_too_long`'s
+/// `find_biggest_function` / `prepare_trace_segmenting` arms, and the
+/// driver counts whatever reason this action carries.
+fn abort_too_long_action() -> TraceAction {
+    TraceAction::SwitchToBlackhole(majit_metainterp::SwitchToBlackhole {
+        reason: majit_metainterp::counters::ABORT_TOO_LONG,
+        raising_exception: false,
+    })
+}
+
 pub fn take_fbw_bridge_declined() -> bool {
     FBW_BRIDGE_DECLINED.with(|c| c.replace(false))
 }
@@ -2403,6 +2415,22 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // cursors back on the same condition.
         crate::jitcode_dispatch::fbw_store_journal_rollback();
         crate::jitcode_dispatch::fbw_bridge_iter_journal_rollback();
+    }
+    // An inlined `TraceTooLong` is `SwitchToBlackhole(ABORT_TOO_LONG)` on
+    // the outer walk (`full_body_walk_trace`). The carrier drain used to
+    // drop that `Result` and return `Abort`, which the driver counted as
+    // `AbortReason::Generic` (`mc_diag` 71) because the discarded trace is
+    // no longer `is_too_long`. The raise already ran
+    // `note_root_trace_too_long`.
+    if session.borrow().trace_too_long
+        || matches!(
+            walk,
+            Some(Err(
+                crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
+            ))
+        )
+    {
+        return abort_too_long_action();
     }
     p2_drain_abort()
 }
@@ -7170,12 +7198,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 );
             }
             match e {
-                DE::TraceTooLong { .. } => TraceAction::SwitchToBlackhole(
-                    majit_metainterp::SwitchToBlackhole {
-                        reason: majit_metainterp::counters::ABORT_TOO_LONG,
-                        raising_exception: false,
-                    },
-                ),
+                DE::TraceTooLong { .. } => abort_too_long_action(),
                 // A kept-stack branch guard whose not-taken arm reads an
                 // unrestorable boxed Ref register is a structural abort.
                 // Keeping the permanent mapping is behavior-neutral: a plain

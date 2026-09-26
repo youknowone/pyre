@@ -687,6 +687,12 @@ pub struct WalkSession {
     /// `aborted_tracing` captured, so a single-frame adopt of the caller
     /// declines into entry replay.
     pub crossed_inline_subwalk: bool,
+    /// `DispatchError::TraceTooLong` was raised. A bridge-carrier drain
+    /// drops the `Result` (`P2Drain::MiddleDriveErr`, `p2_drain_abort`)
+    /// and would otherwise count `AbortReason::Generic`. The raise already
+    /// ran `note_root_trace_too_long` (`blackhole_if_trace_too_long`);
+    /// the drain still has to return `SwitchToBlackhole(ABORT_TOO_LONG)`.
+    pub trace_too_long: bool,
     /// `MetaInterp.last_exc_value` (`pyjitpl.py`): the standing
     /// exception the walk is unwinding, as one slot for the whole walk
     /// rather than one per frame.
@@ -815,6 +821,7 @@ impl Default for WalkSession {
             root_debug_merge_point_py_pc: None,
             abort_in_subwalk: false,
             crossed_inline_subwalk: false,
+            trace_too_long: false,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             carrier_raise_seed: None,
@@ -3895,6 +3902,7 @@ pub fn walk<Sym: WalkSym>(
                     ctx.trace_ctx.current_merge_points_first_green_key_pair(),
                     ctx.trace_ctx.resumekey_original_loop_token().cloned(),
                 );
+                ctx.session.borrow_mut().trace_too_long = true;
                 return Err(DispatchError::TraceTooLong {
                     pc: opcode_position,
                     ops,
