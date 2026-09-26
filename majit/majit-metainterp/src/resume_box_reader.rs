@@ -1475,9 +1475,15 @@ pub fn seed_bridge_virtualizable_boxes(
             RebuiltValue::Const(Const::Int(i)) => Some(Value::Int(*i)),
             RebuiltValue::Const(Const::Float(f)) => Some(Value::Float(*f)),
             RebuiltValue::Const(Const::Ref(r)) => Some(Value::Ref(*r)),
-            // A virtualized vable slot has no deadframe concrete; the shadow
-            // would be a guess, so decline the whole seed instead.
-            RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => None,
+            // resume.py `next_box_of_type` → `decode_box` reconstructs a
+            // TAGVIRTUAL via `allocate_with_vtable` + setfields. The box is
+            // a `NewWithVtable` with no deadframe bits; the values shadow
+            // stores Void so `virtualizable_entry_at` still binds the
+            // materialized OpRef and `concrete_shadow_value` reports
+            // unknown. Declining the whole seed left `getarrayitem_vable`
+            // to read the heap ConstPtr and fold immutable `intval`.
+            RebuiltValue::Virtual(_) => Some(Value::Void),
+            RebuiltValue::Unassigned => None,
         }
     }
 

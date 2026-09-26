@@ -859,6 +859,11 @@ pub enum OpKind {
     /// carries bytes here; the assembler mints the lltype pointer and
     /// materialises it through the ref constant pool.
     ConstStr(Vec<u8>),
+    /// Interned Python str constant — `box_str_constant` over a proven
+    /// string literal. Distinct from [`ConstStr`]: that is rstr `Ptr(STR)`
+    /// (`StringRepr.convert_const`); this is the wrapped immortal
+    /// `W_UnicodeObject` a residual `w_name` argument carries as one Ref.
+    ConstInternedStr(Vec<u8>),
     /// RPython `flowmodel.py:Constant(host_object)` resolved by the
     /// rtyper to a singleton instance pointer
     /// (`rtyper/rpbc.py::SingleFrozenPBCRepr`).  Stored as a thin

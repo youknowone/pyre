@@ -118,6 +118,7 @@ fn load_jitcode(index: usize) -> Arc<JitCode> {
     crate::runtime_fnaddr_patch::materialize_unit_variant_consts(std::slice::from_mut(
         &mut jitcode,
     ));
+    crate::runtime_fnaddr_patch::materialize_type_static_consts(std::slice::from_mut(&mut jitcode));
     // RPython codewriter.py:80: `all_jitcodes[jitcode.index] is jitcode`.
     // Check per entry so any regression in
     // `collect_jitcodes_in_alloc_order` is caught immediately.
@@ -372,18 +373,26 @@ pub fn portal_jitcode() -> Option<Arc<JitCode>> {
 }
 
 /// `newframe` takes the metainterp wrapper around the same portal body.
+///
+/// `warmspot.py` / `call.py` `jd.mainjitcode` — the portal JitCode
+/// lives on `JitDriverStaticData`, not a process-global cache.
 pub fn portal_metainterp_jitcode() -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
-    static PORTAL_META: OnceLock<Option<Arc<majit_metainterp::jitcode::JitCode>>> = OnceLock::new();
-    PORTAL_META
-        .get_or_init(|| {
-            let canonical = portal_jitcode()?;
-            let index = canonical.index();
-            Some(Arc::new(
-                majit_metainterp::jitcode::JitCode::from_canonical((*canonical).clone())
-                    .with_reachable_symbolic_residuals(seeded_reachable_symbolic_residuals(index)),
-            ))
-        })
-        .clone()
+    crate::driver::try_driver_pair()?
+        .0
+        .dispatch_jitcode()
+        .cloned()
+}
+
+/// `call.py grab_initial_jitcodes` `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`:
+/// the metainterp wrapper around the portal body, with the reachable symbolic
+/// residual rows every runtime jitcode carries. Installed once on the driver.
+pub fn new_portal_metainterp_jitcode() -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
+    let canonical = portal_jitcode()?;
+    let index = canonical.index();
+    Some(Arc::new(
+        majit_metainterp::jitcode::JitCode::from_canonical((*canonical).clone())
+            .with_reachable_symbolic_residuals(seeded_reachable_symbolic_residuals(index)),
+    ))
 }
 
 /// Resolve the portal `JitCode` for the configured driver whose portal

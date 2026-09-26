@@ -36,7 +36,7 @@ impl crate::lltype::GcType for W_BoolObject {
     /// Every bool flows through the two process-global prebuilt allocations
     /// owned by [`w_bool_from`].
     fn type_id() -> u32 {
-        5
+        BOOL_GC_TYPE_ID
     }
     const SIZE: usize = W_BOOL_OBJECT_SIZE;
 }
@@ -52,45 +52,61 @@ pub unsafe fn w_bool_get_value(obj: PyObjectRef) -> bool {
 
 // ── Bool singletons ──────────────────────────────────────────────────
 //
-// pypy/objspace/std/objspace.py:61 installs `space.w_True` /
-// `space.w_False` as singletons; every PyPy `space.newbool(value)`
-// call (pypy/interpreter/baseobjspace.py `newbool`) returns one of
-// the two pre-allocated objects. pyre mirrors the singleton model with
-// two process-global prebuilt objects and routes all callers through
-// [`w_bool_from`]. Their host allocations carry the same GC header as an
-// RPython translated prebuilt object.
+// `ObjSpace.newbool` returns the prebuilt `w_True` / `w_False`. The
+// header sits immediately in front of the payload so `header_of` reads
+// `init_gc_object_immortal`'s flags. `w_bool_from` is the choice between
+// those two addresses; the codewriter emits each as `ConstRefAddr`.
 
-static TRUE_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static FALSE_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// GC type id of `W_BoolObject` (`GcType::type_id`).
+const BOOL_GC_TYPE_ID: u32 = 5;
 
-#[majit_macros::dont_look_inside]
-fn bool_singleton(slot: &'static std::sync::OnceLock<usize>, intval: i64) -> PyObjectRef {
-    *slot.get_or_init(|| {
-        crate::lltype::malloc_typed_immortal(W_BoolObject {
+#[repr(C)]
+struct PrebuiltBool {
+    header: majit_gc::header::GcHeader,
+    obj: W_BoolObject,
+}
+
+const fn prebuilt_bool(ob_type: &'static PyType, intval: i64) -> PrebuiltBool {
+    let flags = majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS.bits()
+        | majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS.bits();
+    PrebuiltBool {
+        header: majit_gc::header::GcHeader {
+            tid_and_flags: (flags << majit_gc::header::FLAG_SHIFT) | (BOOL_GC_TYPE_ID as u64),
+        },
+        obj: W_BoolObject {
             ob_header: PyObject {
-                ob_type: &BOOL_TYPE as *const PyType,
+                ob_type: ob_type as *const PyType,
                 w_class: std::ptr::null_mut(),
             },
             intval,
-        }) as usize
-    }) as PyObjectRef
+        },
+    }
 }
 
-/// Get a boolean PyObjectRef from a bool value.
-///
-/// Returns a pointer to a pre-allocated static singleton,
-/// avoiding heap allocation on every comparison/branch.
-/// Both singletons are immortal and their addresses never change after the
-/// first materialisation, so the result depends only on `value` and the
-/// call cannot raise.
+static TRUE_BLOCK: PrebuiltBool = prebuilt_bool(&BOOL_TYPE, 1);
+static FALSE_BLOCK: PrebuiltBool = prebuilt_bool(&BOOL_TYPE, 0);
+
+/// Pointer-sized so a read is the payload address (`ObjSpace.w_True`),
+/// not the address of a reference slot.
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+struct SyncObj(*mut PyObject);
+unsafe impl Sync for SyncObj {}
+
+static TRUE_SINGLETON: SyncObj = SyncObj(&raw const TRUE_BLOCK.obj as *mut PyObject);
+static FALSE_SINGLETON: SyncObj = SyncObj(&raw const FALSE_BLOCK.obj as *mut PyObject);
+
+/// `ObjSpace.newbool`: `w_True` when `value` is true, otherwise `w_False`.
 #[majit_macros::elidable_cannot_raise]
 #[inline]
 pub fn w_bool_from(value: bool) -> *mut PyObject {
-    if value {
-        bool_singleton(&TRUE_SINGLETON, 1)
+    let obj = if value {
+        TRUE_SINGLETON
     } else {
-        bool_singleton(&FALSE_SINGLETON, 0)
-    }
+        FALSE_SINGLETON
+    };
+    // `SyncObj` is `repr(transparent)` over the payload pointer.
+    unsafe { std::mem::transmute(obj) }
 }
 
 // ── W_BoolObject.descr_and/or/xor (boolobject.py) ──────────────

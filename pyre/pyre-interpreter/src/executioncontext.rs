@@ -1,5 +1,6 @@
 use pyre_object::PyObjectRef;
 use pyre_object::quasiimmut::QuasiImmutField;
+use rustpython_wtf8::Wtf8;
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3290,9 +3291,12 @@ impl UserDelAction {
         let Some(w_type) = crate::typedef::r#type(current()) else {
             return;
         };
-        let Some(w_del) =
-            (unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__del__") })
-        else {
+        let Some(w_del) = (unsafe {
+            crate::baseobjspace::lookup_in_type(
+                w_type.as_ptr(),
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__del__")),
+            )
+        }) else {
             return;
         };
         if !self.begin_finalizer(current()) {

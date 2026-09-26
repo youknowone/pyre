@@ -422,16 +422,21 @@ pub(crate) fn runtime_fnaddr(build_fnaddr: i64) -> i64 {
 /// pattern.
 const SENTINEL_HIGH_MASK: u64 = 0xFFFF_0000_0000_0000;
 
-/// Materialize one immortal rstr `STR` for a prebuilt-string constant.
-/// `StringRepr.convert_const` (`rstr.py`) yields `Ptr(STR)`, and
-/// `bh_strlen` / `bh_strgetitem` (`llmodel.py`) read that payload.
-/// `box_str_constant` still interns the wrapper; the slot holds
-/// `_utf8`, not the wrapper header.
-fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64) -> i64 {
+/// Materialize one immortal string constant.
+///
+/// `as_unicode_object` is the `box_str_constant` result — a `W_UnicodeObject`
+/// the residual `w_name` ABI passes as one Ref. Otherwise the slot is rstr
+/// `Ptr(STR)` (`StringRepr.convert_const`): `bh_strlen` / `bh_strgetitem`
+/// read that payload.
+fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64, as_unicode_object: bool) -> i64 {
     let wtf8 = rustpython_wtf8::Wtf8::from_bytes(bytes)
         .expect("prebuilt STR constant bytes are not valid WTF-8");
     let wrapper = pyre_object::unicodeobject::box_str_constant(wtf8);
-    unsafe { pyre_object::unicodeobject::w_str_storage(wrapper) as i64 }
+    if as_unicode_object {
+        wrapper as i64
+    } else {
+        unsafe { pyre_object::unicodeobject::w_str_storage(wrapper) as i64 }
+    }
 }
 
 /// Materialize every deferred prebuilt-string constant the codewriter
@@ -451,7 +456,7 @@ fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64) -> i64 {
 /// identity holds across calls even though entries are materialized one
 /// jitcode at a time.
 pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
-    let mut interned: HashMap<Vec<u8>, i64> = HashMap::new();
+    let mut interned: HashMap<(Vec<u8>, bool), i64> = HashMap::new();
     for arc in jitcodes.iter_mut() {
         // Body-less placeholder shells, and bodies with no deferred strings
         // (the common case — only cutover string literals record any), need
@@ -467,14 +472,15 @@ pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
         for i in 0..body.str_consts.len() {
             let idx = body.str_consts[i].constants_r_index;
             let hash = body.str_consts[i].precomputed_hash;
+            let as_unicode_object = body.str_consts[i].as_unicode_object;
             let addr = {
                 let bytes = &body.str_consts[i].bytes;
-                if let Some(&a) = interned.get(bytes) {
+                let key = (bytes.clone(), as_unicode_object);
+                if let Some(&a) = interned.get(&key) {
                     a
                 } else {
-                    let owned = bytes.clone();
-                    let a = materialize_prebuilt_str(&owned, hash);
-                    interned.insert(owned, a);
+                    let a = materialize_prebuilt_str(&key.0, hash, as_unicode_object);
+                    interned.insert(key, a);
                     a
                 }
             };
@@ -553,6 +559,44 @@ pub fn materialize_unit_variant_consts(jitcodes: &mut [Arc<JitCode>]) {
     }
 }
 
+/// Materialize every deferred type-static constant
+/// ([`materialize_str_consts`]' sibling for `PyType` singletons).
+/// Each descriptor names a `constants_r` slot holding a non-canonical
+/// sentinel; overwrite it with the live `&INT_TYPE` (etc.) from
+/// `jit_static_pytype_addrs`, keyed by the shared name.
+pub fn materialize_type_static_consts(jitcodes: &mut [Arc<JitCode>]) {
+    let mut runtime_map: HashMap<&'static str, i64> = HashMap::new();
+    runtime_map.extend(pyre_interpreter::jit_static_pytype_addrs());
+    runtime_map.extend(pyre_interpreter::pyre_class_pytype_addrs());
+    runtime_map.extend(pyre_interpreter::pyre_class_pytype_by_struct_addrs());
+
+    for arc in jitcodes.iter_mut() {
+        if arc
+            .try_body()
+            .is_none_or(|b| b.type_static_consts.is_empty())
+        {
+            continue;
+        }
+        let jc = Arc::get_mut(arc).expect(
+            "materialize_type_static_consts: Arc<JitCode> already shared before patch — \
+             every caller must run this before publishing the table to consumers",
+        );
+        let body = jc.body_mut();
+        for i in 0..body.type_static_consts.len() {
+            let idx = body.type_static_consts[i].constants_r_index;
+            let name = body.type_static_consts[i].name.as_str();
+            assert_eq!(
+                (body.constants_r[idx].get() as u64) & SENTINEL_HIGH_MASK,
+                (majit_jitcode::codewriter::assembler::TYPE_STATIC_CONST_SENTINEL_BASE as u64)
+                    & SENTINEL_HIGH_MASK,
+                "constants_r[{idx}] did not hold a type-static sentinel",
+            );
+            let addr = runtime_map.get(name).copied().unwrap_or(0);
+            body.constants_r[idx] = addr.into();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,6 +638,7 @@ mod tests {
             constants_r_index: 0,
             bytes: b"hello".to_vec(),
             precomputed_hash: 0x1234_5678,
+            as_unicode_object: false,
         }];
         let mut jcs = vec![jitcode_with_str_consts(descs)];
         materialize_str_consts(&mut jcs);
@@ -620,6 +665,7 @@ mod tests {
             constants_r_index: 0,
             bytes: b"x".to_vec(),
             precomputed_hash: 7,
+            as_unicode_object: false,
         };
         let mut jcs = vec![
             jitcode_with_str_consts(vec![desc()]),
@@ -646,6 +692,7 @@ mod tests {
                 constants_r_index: 0,
                 bytes: b"y".to_vec(),
                 precomputed_hash: 9,
+                as_unicode_object: false,
             };
             let mut first = vec![jitcode_with_str_consts(vec![desc()])];
             let mut second = vec![jitcode_with_str_consts(vec![desc()])];
@@ -726,6 +773,31 @@ mod tests {
     }
 
     #[test]
+    fn materialize_type_static_consts_overwrites_sentinel_with_live_int_type() {
+        use majit_jitcode::jitcode::TypeStaticConstDescriptor;
+
+        let jc = JitCode::new("test");
+        jc.set_body(JitCodeBody {
+            type_static_consts: vec![TypeStaticConstDescriptor {
+                constants_r_index: 0,
+                name: "pyobject::INT_TYPE".into(),
+            }],
+            constants_r: vec![
+                (majit_jitcode::codewriter::assembler::TYPE_STATIC_CONST_SENTINEL_BASE).into(),
+            ],
+            ..Default::default()
+        });
+        let mut jcs = vec![Arc::new(jc)];
+        materialize_type_static_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        assert_eq!(
+            addr,
+            &pyre_object::INT_TYPE as *const _ as i64,
+            "sentinel must become the live INT_TYPE address"
+        );
+    }
+
+    #[test]
     fn materialize_unit_variant_consts_interns_one_cell_per_qualname() {
         let mut jcs = vec![
             jitcode_with_unit_variant_consts(vec![unit_variant_desc("JitAction::Return", 1)]),
@@ -780,6 +852,7 @@ mod tests {
             constants_r_index: 0,
             bytes: Vec::new(),
             precomputed_hash: -1,
+            as_unicode_object: false,
         }];
         let mut jcs = vec![jitcode_with_str_consts(descs)];
         materialize_str_consts(&mut jcs);
@@ -797,5 +870,23 @@ mod tests {
             runtime_fnaddr_by_path("pyre_interpreter::call::take_last_exec_ctx").is_some(),
             "pyre_interpreter::call::take_last_exec_ctx must be published in jit_trace_fnaddrs"
         );
+    }
+
+    #[test]
+    fn materialize_str_consts_unicode_object_slot_is_the_wrapper() {
+        let descs = vec![StrConstDescriptor {
+            constants_r_index: 0,
+            bytes: b"__add__".to_vec(),
+            precomputed_hash: 0,
+            as_unicode_object: true,
+        }];
+        let mut jcs = vec![jitcode_with_str_consts(descs)];
+        materialize_str_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        let wrapper =
+            pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new("__add__"));
+        assert_eq!(addr, wrapper as i64);
+        let storage = unsafe { pyre_object::unicodeobject::w_str_storage(wrapper) } as i64;
+        assert_ne!(addr, storage, "w_name is the wrapper, not the rstr payload");
     }
 }

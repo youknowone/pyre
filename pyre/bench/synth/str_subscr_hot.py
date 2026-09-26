@@ -1,4 +1,4 @@
-# pyre-check: spec-folds=subscr_str
+# pyre-check: trace-shape=hot_index:absent=CallMayForceR
 # Hot-loop `s[i]` on an exact `str`. The subscript reaches the walker as the
 # `BinaryOp` helper's `Subscr` tag, and `try_walker_specialize_subscr` only
 # recognized dict, tuple, specialised-pair and list receivers -- a `str` fell

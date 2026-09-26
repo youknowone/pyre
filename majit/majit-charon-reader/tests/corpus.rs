@@ -56,7 +56,14 @@ fn loads_fixture_corpus() {
     //
     // + 2 for `take_odd_default` and its hand-written `Default::default`.
     // + 1 for `replace_wide_payload` (a `u128` variant field).
-    assert_eq!(local_count, 47, "47 local fns expected");
+    //
+    // + 1 for `char_slot_index`, the `char` element array read.
+    //
+    // + 1 for `char_unwrap_or_join`, the `Option<char>` literal-default join.
+    //
+    // + 6 for the `bitflags!`-shaped flag type: `code_flags_bits_or`, the
+    // `FLAT` initializer, and the constructor and accessor on both wrappers.
+    assert_eq!(local_count, 55, "55 local fns expected");
 }
 
 #[test]

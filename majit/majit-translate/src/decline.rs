@@ -112,6 +112,9 @@ pub mod gate {
     pub const GUESS_CALL_KIND: &str = "call::guess_call_kind";
     /// The policy clause behind a discovery refusal.
     pub const LOOK_INSIDE_GRAPH: &str = "policy::look_inside_graph";
+    /// A body whose shadow-stack root bracket keeps its calls, by the shape
+    /// the scalar replacement refused.
+    pub const SHADOW_STACK_ERASE: &str = "mir::erase_shadow_stack";
     /// The `<[T]>::get(slice, i)` bounds-checked-diamond recognizer.  Its
     /// three conjuncts answer different questions, so each records its own
     /// reason: which one dominates decides whether the next stretch of work

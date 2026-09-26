@@ -1,4 +1,3 @@
-# pyre-check: spec-folds=make_function,set_function_attribute
 # An annotated `def` in a hot FOR_ITER body: the SET_FUNCTION_ATTRIBUTE arm
 # 3.14 reaches for far more often than the defaults one, and the one that
 # decides whether anything else in the definition sequence folds.

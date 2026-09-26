@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=4.4
+# pyre-check: trace-shape=run_abs_float:absent=CallMayForceR,run_min_max:absent=CallMayForceR
 # Ubuntu run 33279264115: 1.7-2.2x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython
@@ -23,7 +24,6 @@
 # unboxed values, and under that ordering the answer is the winning operand's
 # own reference.  darwin-arm64 reads 2.0x / 2.2x where it read 4.6x / 4.7x.
 #
-# pyre-check: spec-folds=builtin_fold1,builtin_fold2
 # This fixture carried a wasm allowance of 13 while every folded builtin still
 # left the trace module: a fold removes the frame force, the argument rooting,
 # the execution-context resolution and the gateway binding, but each one still

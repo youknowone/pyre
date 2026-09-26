@@ -252,6 +252,36 @@ fn runtime_array_flag(item_type: Type, signed: bool) -> majit_ir::descr::ArrayFl
     }
 }
 
+/// `descr.py get_field_descr(gccache, STRUCT, fieldname)` — one Arc
+/// per `(STRUCT, fieldname)`. The cache is the owner; do not wrap
+/// callers in a process-global OnceLock.
+fn gc_cached_field_descr(
+    struct_name: &str,
+    field_name: &str,
+    display_name: &str,
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    signed: bool,
+    is_immutable: bool,
+    index: u32,
+) -> DescrRef {
+    majit_ir::descr::gc_cache().lock().get_field_descr(
+        majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(struct_name)),
+        field_name,
+        Some(display_name),
+        offset,
+        field_size,
+        field_type,
+        is_immutable,
+        false,
+        runtime_array_flag(field_type, signed),
+        index,
+        false,
+        None,
+    ) as DescrRef
+}
+
 fn get_or_create_array_descr(
     base_size: usize,
     item_size: usize,
@@ -4108,44 +4138,28 @@ pub fn w_super_size_descr() -> DescrRef {
 /// (not immutable / quasi-immutable); the `version?` guard protects cell
 /// identity, not the payload. Reassigning to a non-int replaces the cell,
 /// bumping the version and invalidating the fold.
-/// Descriptor for `IntMutableCell.intvalue`.  Minted with a reserved unique
-/// [`INT_MUTABLE_CELL_VALUE_INDEX`] rather than `stable_field_index` because
-/// that field's `(offset 16, size 8, Int)` layout collides with
+/// Descriptor for `IntMutableCell.intvalue`.  Index is the reserved
+/// [`INT_MUTABLE_CELL_VALUE_INDEX`] rather than `stable_field_index`
+/// because that field's `(offset 16, size 8, Int)` layout collides with
 /// `W_IntObject.intval` / `W_ListObject.length` in the runtime `HeapCache`
 /// key space (which keys by `descr.index()`; see [`CELL_DESCR_TAG`]).
 ///
-/// A SINGLETON `Arc`, one descr per field exactly as upstream's codewriter
-/// produces one `FieldDescr` per `IntMutableCell.inst_intvalue`.  The
-/// optimizer's `cached_fields` is keyed by `descr_identity`
-/// (`Arc::as_ptr`), so the LOAD `getfield_gc_i` and the STORE
-/// `setfield_gc_i` MUST share the Arc: with per-call fresh Arcs the store's
-/// lazy `setfield` lives in a `CachedField` the load's lookup never finds,
-/// the load skips heap.py `possible_aliasing_two_infos` entirely, and
-/// `force_lazy_sets_for_guard` later flushes the store BELOW the emitted
-/// load — reordering a store past a load of the same location (the nested
-/// module-loop `i = i + 1; while i < n` reads the pre-increment value and
-/// runs one extra iteration).  Distinct cells (`i`/`j`/`k`) do NOT
-/// cross-forward under the shared descr: `CachedField` distinguishes
-/// structs by the obj operand (`same_box` MUST_ALIAS / UNKNOWN_ALIAS →
-/// `force_lazy_set`, heap.py).  Signed `i64` payload, mutable
-/// (`write_cell` rewrites `intvalue` in place for an int->int reassign with
-/// no version bump).
+/// `descr.py get_field_descr` caches by `(STRUCT, fieldname)` so the
+/// LOAD `getfield_gc_i` and STORE `setfield_gc_i` share one Arc.
+/// Signed `i64` payload, mutable (`write_cell` rewrites `intvalue` in
+/// place for an int->int reassign with no version bump).
 pub fn int_mutable_cell_value_descr() -> DescrRef {
-    static DESCR: std::sync::OnceLock<DescrRef> = std::sync::OnceLock::new();
-    DESCR
-        .get_or_init(|| {
-            Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
-                INT_MUTABLE_CELL_VALUE_INDEX,
-                core::mem::offset_of!(pyre_object::celldict::IntMutableCell, intvalue),
-                8,
-                Type::Int,
-                false,
-                majit_ir::descr::ArrayFlag::Signed,
-                "IntMutableCell.intvalue".to_string(),
-                "intvalue".to_string(),
-            ))
-        })
-        .clone()
+    gc_cached_field_descr(
+        "celldict::IntMutableCell",
+        "intvalue",
+        "IntMutableCell.intvalue",
+        core::mem::offset_of!(pyre_object::celldict::IntMutableCell, intvalue),
+        8,
+        Type::Int,
+        true,
+        false,
+        INT_MUTABLE_CELL_VALUE_INDEX,
+    )
 }
 
 /// Size descriptor for `W_ListObject` allocation via NewWithVtable.
@@ -4875,6 +4889,37 @@ pub fn bool_intval_descr() -> DescrRef {
     field_descr_from_group(&W_BOOL_DESCR_GROUP, 0)
 }
 
+/// Look-inside `is_true` reads `PyObject.ob_type` / `w_class` through the
+/// translator's `stable_field_index` descrs, not [`w_class_descr`]'s
+/// reserved tag. `descr.py get_field_descr` caches by `(STRUCT, fieldname)`.
+pub fn pyobject_ob_type_stable_descr() -> DescrRef {
+    gc_cached_field_descr(
+        "pyobject::PyObject",
+        "ob_type",
+        "PyObject.ob_type",
+        pyre_object::pyobject::OB_TYPE_OFFSET,
+        WORD,
+        Type::Ref,
+        false,
+        false,
+        stable_field_index(pyre_object::pyobject::OB_TYPE_OFFSET, 8, Type::Ref, false),
+    )
+}
+
+pub fn pyobject_w_class_stable_descr() -> DescrRef {
+    gc_cached_field_descr(
+        "pyobject::PyObject",
+        "w_class",
+        "PyObject.w_class",
+        pyre_object::pyobject::W_CLASS_OFFSET,
+        WORD,
+        Type::Ref,
+        false,
+        false,
+        stable_field_index(pyre_object::pyobject::W_CLASS_OFFSET, 8, Type::Ref, false),
+    )
+}
+
 pub fn float_floatval_descr() -> DescrRef {
     field_descr_from_group(&W_FLOAT_DESCR_GROUP, 0)
 }
@@ -5010,8 +5055,8 @@ pub fn unicode_index_storage_descr() -> DescrRef {
 static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
     use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
     // `is_immutable` follows `pycode.py _immutable_fields_` per field.
-    // `co_firstlineno` is listed there; `co_name` and `hidden_applevel` are
-    // not, and `code_ptr` is the raw body pointer with no upstream slot.
+    // `co_code` is listed there; `code_ptr` is that bytecode body.
+    // `co_firstlineno` is listed; `co_name` and `hidden_applevel` are not.
     let field = |field_key: &str,
                  offset: usize,
                  field_size: usize,
@@ -5044,7 +5089,7 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             std::mem::size_of::<*const ()>(),
             Type::Int,
             ArrayFlag::Unsigned,
-            false,
+            true,
             false,
         ),
         // `pycode.py PyCode._immutable_fields_`: `w_globals?` is filled on
@@ -5241,6 +5286,19 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
     SPECIALISED_TUPLE_OO_DESCR_GROUP.size_descr.clone()
 }
 
+/// Crate-stripped STRUCT name for slim `W_BaseException`.
+///
+/// `path_hash_stripped_crate` / `module_path_from_source_file` drop
+/// the crate segment, so look-inside Getfield of `.kind` and emit
+/// Setfield share `interp_exceptions::W_BaseException`. A
+/// crate-prefixed spelling is a second hash, not a second type.
+/// Extra-field kinds keep the distinct [`W_ExceptionExtended`] SizeDescr
+/// identity so `_cache_size` cannot first-write-wins the slim layout
+/// onto an OSError.
+fn translator_w_base_exception_struct_name() -> &'static str {
+    "interp_exceptions::W_BaseException"
+}
+
 /// SizeDescr + field descrs for exception allocation via NewWithVtable,
 /// one set per `ExcKind`.  The vtable (`ob_type`) differs per kind
 /// (`exc_kind_to_pytype`), so each kind owns its group.  `_new_exception`
@@ -5340,7 +5398,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             "interp_exceptions::W_BaseException",
             &[],
             &[],
-            "W_BaseException",
+            translator_w_base_exception_struct_name(),
             false,
         );
     }
@@ -6531,8 +6589,8 @@ mod tests {
     #[test]
     fn pycode_field_descrs_share_parent_and_preserve_specs() {
         // The `always_pure` column is `pycode.py _immutable_fields_`:
-        // only `co_firstlineno` is listed there, so only its descr answers
-        // `is_always_pure()`. Stating it per field rather than asserting a
+        // `co_code` (the body `code_ptr` points at) and `co_firstlineno` are
+        // listed there, so only their descrs answer `is_always_pure()`. Stating it per field rather than asserting a
         // blanket "nothing is pure" keeps the test able to fail when a field's
         // immutability moves in either direction.
         let expected = [
@@ -6544,7 +6602,7 @@ mod tests {
                 Type::Int,
                 false,
                 0,
-                false,
+                true,
             ),
             (
                 pycode_co_firstlineno_descr(),

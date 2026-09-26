@@ -688,13 +688,12 @@ That is a missing capability rather than dead weight — closure-callee
 inlining needs the fold, the fold needs constant cells, and constant cells
 need the inlining.
 
-**What does not hold it in place.** 54 fixtures carry a `spec-folds=` header
-and they name 68 distinct rows between them (3 of those descent rows;
-`subscr_tuple_descent` and `load_super_attr_descent` are named by none), so
-34 of the 102 rows have no fixture coupling at all
-(`rg -o --no-filename --max-depth 1 'spec-folds=[^ ]+' pyre/bench/synth -g '*.py' | sed 's/spec-folds=//' | tr ',' '\n' | sort -u | wc -l`;
-`-o` must be spelled without `-h`, which is `rg`'s help flag).  Retirement
-is blocked by reach, not by headers.
+**What does not hold it in place.** Fixture coverage of a fold is
+`# pyre-check: trace-shape=`: a code-object name and the operations the
+optimized loop must contain or omit. No fixture carries `spec-folds=`. Five folds
+have no trace-shape row because no loop compiles both with and without them
+and differs by an operation: `format_with_spec`, `str_endswith`,
+`store_attr_direct`, `load_type_attr`, `frame_lasti`. Retirement is blocked by reach, not by headers.
 
 **The bounded first step has been taken, and it does not settle the
 question.** The type-identity group — `builtin_type`, `builtin_isinstance`,

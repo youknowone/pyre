@@ -1,4 +1,3 @@
-# pyre-check: spec-folds=make_function,set_function_attribute
 # MAKE_FUNCTION plus SET_FUNCTION_ATTRIBUTE in a hot FOR_ITER body. The default
 # value forces the companion attribute initializer onto the definition path.
 #
