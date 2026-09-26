@@ -75,6 +75,11 @@ pub struct StrConstDescriptor {
     /// already applied), written to the STR block's `hash` field at
     /// offset 0 so the runtime never recomputes it.
     pub precomputed_hash: i64,
+    /// When true, the load pass writes the interned `W_UnicodeObject`
+    /// wrapper into the slot (`box_str_constant` result). When false,
+    /// it writes the rstr `_utf8` payload (`StringRepr.convert_const`).
+    #[serde(default)]
+    pub as_unicode_object: bool,
 }
 
 /// A payload-less enum-variant singleton constant whose runtime cell is
@@ -93,6 +98,21 @@ pub struct UnitVariantConstDescriptor {
     /// The variant's declaration index, written to the cell's
     /// `__discriminant` word at offset 0.
     pub tag: i64,
+}
+
+/// A host `PyType` singleton (`INT_TYPE`, `FLOAT_TYPE`, …) whose runtime
+/// address is written at jitcode-load time.  The translator and the
+/// runtime are different processes, so a baked `&INT_TYPE` is
+/// translator-local; the slot holds a non-canonical sentinel until the
+/// load pass overwrites it with the live static.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct TypeStaticConstDescriptor {
+    /// Position in [`JitCodeBody::constants_r`] holding the sentinel that
+    /// the runtime load pass overwrites with the live type-static address.
+    pub constants_r_index: usize,
+    /// The shared name from `HostStaticAddrs.pytypes` /
+    /// `jit_static_pytype_addrs` — the runtime re-pairs by this key.
+    pub name: String,
 }
 
 /// Body of a `JitCode` — populated once by the assembler after
@@ -227,6 +247,13 @@ pub struct JitCodeBody {
     /// carrying the variant's discriminant.  Default empty.
     #[serde(default)]
     pub unit_variant_consts: Vec<UnitVariantConstDescriptor>,
+    /// Host `PyType` singleton constants deferred to runtime
+    /// materialization — [`Self::str_consts`]' shape for type statics:
+    /// each entry names a `constants_r` slot holding a non-canonical
+    /// sentinel the load pass overwrites with the live `&INT_TYPE` (etc.).
+    /// Default empty.
+    #[serde(default)]
+    pub type_static_consts: Vec<TypeStaticConstDescriptor>,
     /// RPython `jitcode.py` `self.c_num_regs_i = chr(num_regs_i)`.
     /// The one-byte carrier is part of the JitCode format; both
     /// `JitCode.setup` and `Assembler.check_result` reject values that do not

@@ -249,10 +249,15 @@ fn build_semantic_program_via_active_frontend(
             let mut immutable_fields = std::collections::HashMap::new();
             let mut unsafe_fn_stubs = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
+            // Paths are in dependency order, so a crate's callees from
+            // earlier artefacts are already classified when it is.
+            let mut stack_sensitive: Vec<String> = Vec::new();
             for p in &paths {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 prof.mark(&format!("    harvest {p}"));
+                llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
+                stack_sensitive.extend(front::mir::discover_stack_sensitive_fns(&llbc));
                 crate_names.push(llbc.crate_name().to_string());
                 discovered.extend(front::mir::discover_transparent_scalar_kinds(&llbc));
                 duplicate_leaf_facts.absorb(front::mir::DuplicateLeafFacts::discover(&llbc));
@@ -290,6 +295,8 @@ fn build_semantic_program_via_active_frontend(
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
+                llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
+                llbc.mark_stack_sensitive_fns_complete();
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_cross);
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_impl_by_ord[ord]);
                 front::mir::register_ambiguous_impl_foldable_const_lits(&llbc);
@@ -958,6 +965,191 @@ fn distinct_struct_identities_by_leaf(
 
 type TraitImplOwners = std::collections::HashMap<String, std::collections::BTreeSet<String>>;
 
+type TraitMethodOverrides<'a> =
+    std::collections::HashMap<(&'a str, &'a str), (&'a str, &'a front::semantic::SemanticFunction)>;
+
+/// Struct identity of one impl-owner spelling.
+///
+/// `struct_ids` stores `None` for a bare leaf two modules share; that
+/// spelling is not one class.  A qualified spelling with no registry
+/// entry keeps its own path-derived id, so it cannot be merged into a
+/// different class that happens to use the same leaf.
+fn struct_id_for_trait_owner(
+    program: &front::SemanticProgram,
+    owner: &str,
+    leaf_identities: &std::collections::HashMap<String, Vec<majit_ir::descr::StructId>>,
+) -> Option<majit_ir::descr::StructId> {
+    match program.struct_ids.get(owner) {
+        Some(Some(id)) => return Some(*id),
+        Some(None) => return None,
+        None => {}
+    }
+    let leaf = owner.rsplit("::").next().unwrap_or(owner);
+    let identities = leaf_identities.get(leaf);
+    if !owner.contains("::") && identities.is_some_and(|ids| ids.len() > 1) {
+        return None;
+    }
+    if let Some(id) = identities.and_then(|ids| (ids.len() == 1).then_some(ids[0])) {
+        return Some(id);
+    }
+    Some(majit_ir::descr::StructId::from_canonical(owner))
+}
+
+/// One [`majit_ir::descr::StructId`] when every owner spelling names that
+/// class, otherwise `None` (no impl, or two classes).
+fn collapse_owner_identities(
+    program: &front::SemanticProgram,
+    owners: &[&str],
+    leaf_identities: &std::collections::HashMap<String, Vec<majit_ir::descr::StructId>>,
+) -> Option<majit_ir::descr::StructId> {
+    if owners.is_empty() {
+        return None;
+    }
+    let mut ids = Vec::new();
+    for owner in owners {
+        let id = struct_id_for_trait_owner(program, owner, leaf_identities)?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.len() == 1 { Some(ids[0]) } else { None }
+}
+
+/// Record one concrete `impl Trait for Type` method on the override maps.
+///
+/// The key is `(trait leaf, method name)`.  Owner strings are not part of
+/// the key: several lookup spellings of one class last-win the same
+/// method, and [`unique_trait_default_override`] decides whether those
+/// spellings are one [`majit_ir::descr::StructId`].
+fn index_concrete_trait_method<'a>(
+    func: &'a front::semantic::SemanticFunction,
+    trait_concrete_impl_types: &mut std::collections::HashMap<&'a str, Vec<&'a str>>,
+    trait_method_overrides: &mut TraitMethodOverrides<'a>,
+) {
+    let (Some(owner), Some(trait_leaf)) =
+        (func.self_ty_root.as_deref(), func.trait_root.as_deref())
+    else {
+        return;
+    };
+    let types = trait_concrete_impl_types.entry(trait_leaf).or_default();
+    if !types.contains(&owner) {
+        types.push(owner);
+    }
+    trait_method_overrides.insert((trait_leaf, func.name.as_str()), (owner, func));
+}
+
+/// The unique concrete override of a trait default, when every owner
+/// spelling of that trait is one struct identity and that identity
+/// implements this method.
+///
+/// `classdesc.py lookup` walks the receiver's MRO and a concrete method
+/// shadows the base-class (trait-default) body.  A generic
+/// `<E: Trait>` call site lowers to `[<Trait>, <method>]`.  Lookup
+/// aliases of one class are one RPython class object, so they must not
+/// keep the default.  Two struct identities leave the receiver ambiguous
+/// and keep the default (indirect-call family).  A method the unique
+/// identity does not override also keeps the default.
+fn unique_trait_default_override<'a>(
+    program: &front::SemanticProgram,
+    leaf_identities: &std::collections::HashMap<String, Vec<majit_ir::descr::StructId>>,
+    is_default: bool,
+    trait_leaf: &str,
+    method_name: &str,
+    trait_method_overrides: &'a TraitMethodOverrides<'a>,
+    trait_concrete_impl_types: &std::collections::HashMap<&str, Vec<&str>>,
+) -> Option<(&'a str, &'a front::semantic::SemanticFunction)> {
+    if !is_default {
+        return None;
+    }
+    let owners = trait_concrete_impl_types.get(trait_leaf)?;
+    let impl_id = collapse_owner_identities(program, owners, leaf_identities)?;
+    let (owner, func) = trait_method_overrides
+        .get(&(trait_leaf, method_name))
+        .copied()?;
+    let owner_id = struct_id_for_trait_owner(program, owner, leaf_identities)?;
+    if owner_id != impl_id {
+        return None;
+    }
+    Some((owner, func))
+}
+
+/// Graph registered on `[<Trait>, <method>]` for one trait-default body.
+///
+/// The unique identity's override replaces the default.  `lookup_impl_method`
+/// may miss when an inherent method shares the name; the override's own
+/// graph is that method, so it is the fallback.
+fn resolved_trait_default_graph(
+    lookup: &front::semantic::MirGraphLookup<'_>,
+    method_name: &str,
+    default_graph: model::FunctionGraph,
+    default_return: Option<&str>,
+    devirt: Option<(&str, &front::semantic::SemanticFunction)>,
+) -> model::FunctionGraph {
+    let (source, ret) = match devirt {
+        Some((impl_type, info)) => (
+            lookup
+                .lookup_impl_method(impl_type, method_name)
+                .cloned()
+                .unwrap_or_else(|| info.graph.clone()),
+            info.return_type.as_deref(),
+        ),
+        None => (default_graph, default_return),
+    };
+    match ret {
+        Some(rt) => source.with_return_type(rt),
+        None => source,
+    }
+}
+
+/// Bind `[<Trait>, <method>]` for every trait default in `program`.
+///
+/// CallKind::Trait lowers to that direct path.  The pseudo-type path
+/// `[<default methods of Trait>, <method>]` stays the base-class body
+/// for impls that do not override the method.
+fn bind_trait_default_direct_paths(
+    program: &front::SemanticProgram,
+    call_control: &mut call::CallControl,
+    leaf_identities: &std::collections::HashMap<String, Vec<majit_ir::descr::StructId>>,
+) {
+    let lookup = front::semantic::MirGraphLookup::from_program(program);
+    let mut trait_concrete_impl_types: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    let mut trait_method_overrides: TraitMethodOverrides<'_> = std::collections::HashMap::new();
+    for func in &program.functions {
+        index_concrete_trait_method(
+            func,
+            &mut trait_concrete_impl_types,
+            &mut trait_method_overrides,
+        );
+    }
+    for func in &program.functions {
+        let (None, Some(trait_leaf)) = (func.self_ty_root.as_deref(), func.trait_root.as_deref())
+        else {
+            continue;
+        };
+        let devirt = unique_trait_default_override(
+            program,
+            leaf_identities,
+            true,
+            trait_leaf,
+            func.name.as_str(),
+            &trait_method_overrides,
+            &trait_concrete_impl_types,
+        );
+        let direct = resolved_trait_default_graph(
+            &lookup,
+            func.name.as_str(),
+            func.graph.clone(),
+            func.return_type.as_deref(),
+            devirt,
+        );
+        call_control.register_function_graph(
+            crate::parse::CallPath::from_segments([trait_leaf, func.name.as_str()]),
+            direct,
+        );
+    }
+}
+
 /// Resolve a trait's sole concrete owner to the struct root used by the
 /// annotator, preserving class identity across the LLBC registry's aliases.
 fn unique_trait_impl_roots(
@@ -968,24 +1160,11 @@ fn unique_trait_impl_roots(
     trait_impl_owners
         .into_iter()
         .filter_map(|(trait_qualified, owners)| {
-            if owners.len() != 1 {
-                return None;
-            }
-            let owner = owners.into_iter().next().unwrap();
-            let leaf = owner.rsplit("::").next().unwrap_or(&owner).to_string();
-            let identities = struct_leaf_identities.get(leaf.as_str());
-            // A bare owner has no namespace left to disambiguate.  Accept it
-            // only when every qualified registry spelling resolves to one
-            // StructId; two identities sharing the leaf stay fail-closed.
-            if !owner.contains("::") && identities.is_some_and(|ids| ids.len() > 1) {
-                return None;
-            }
-            let owner_id = program
-                .struct_ids
-                .get(&owner)
-                .copied()
-                .flatten()
-                .or_else(|| identities.and_then(|ids| (ids.len() == 1).then_some(ids[0])))?;
+            // Collapse lookup aliases to one StructId before the uniqueness
+            // test.  Two spellings of one class are one RPython class object.
+            let owner_refs: Vec<&str> = owners.iter().map(String::as_str).collect();
+            let owner_id =
+                collapse_owner_identities(program, &owner_refs, &struct_leaf_identities)?;
             // RPython carries the class / lltype object, so every spelling of
             // one identity reaches one descriptor cache entry.  The Rust
             // pipeline still transports a string at this seam; choose the
@@ -1307,15 +1486,10 @@ fn analyze_pipeline_from_module_paths(
                     func.hints.clone(),
                     func.graph.clone(),
                 ));
-                let types = trait_concrete_impl_types
-                    .entry(trait_leaf.as_str())
-                    .or_default();
-                if !types.contains(&owner.as_str()) {
-                    types.push(owner.as_str());
-                }
-                trait_method_overrides.insert(
-                    (trait_leaf.as_str(), func.name.as_str()),
-                    (owner.as_str(), func),
+                index_concrete_trait_method(
+                    func,
+                    &mut trait_concrete_impl_types,
+                    &mut trait_method_overrides,
                 );
                 canonical_inherent_methods.push(parse::InherentMethodInfo {
                     for_type: owner.clone(),
@@ -1687,6 +1861,11 @@ fn analyze_pipeline_from_module_paths(
     // re-fetch keyed on the registration path — cheap, and it keeps a
     // single source of truth for the trait-default vs concrete-impl
     // distinction.
+    // `[<Trait>, <method>]` is the CallKind::Trait direct path.  Bind it
+    // before hint stamping so the override graph, not the raising default,
+    // is what those hints attach to.
+    let leaf_identities = distinct_struct_identities_by_leaf(&program);
+    bind_trait_default_direct_paths(&program, &mut call_control, &leaf_identities);
     for impl_info in &canonical_trait_impls {
         let impl_type = impl_info
             .self_ty_root
@@ -1705,62 +1884,21 @@ fn analyze_pipeline_from_module_paths(
         for method in &impl_info.methods {
             // `classdesc.py lookup` MRO: on the generic-dispatch
             // direct path `[<Trait>, <method>]`, the unique concrete
-            // override shadows the trait default body (pre-pass
-            // above).  `None` for concrete-impl entries, defaults
-            // without an override, and traits with several concrete
-            // impl types (the receiver stays ambiguous —
-            // indirect-call family territory keeps the default).
-            //
-            // Staged scope: whole-trait shadowing is blocked on the
-            // classdef-hints-before-BFS annotator work — registering
-            // objspace-heavy overrides (load_attr / call_callable /
-            // binary_op …) pulls their graph closure into the BFS,
-            // where the annotator fails on classdef-less SomeInstance
-            // attr reads and on runtime statics no build-time table
-            // can resolve (`JIT_DRIVER`).  Grown deliberately, one
-            // fail-loud resolution at a time; the motivating members are
-            // the exception-handler pair whose empty defaults broke
-            // generic-dispatch resolution.
-            const DEFAULT_SHADOW_DEVIRT_SCOPE: &[&str] = &[
-                "push_exc_info",
-                "pop_except",
-                // `pyopcode::execute_load_super_attr` is generic over the
-                // executor, but the portal's one concrete executor is
-                // `PyFrame`.  Keeping the trait default here generates the
-                // deliberately-raising "not implemented" body and cuts the
-                // real `PyFrame::load_super_attr_with` call graph out of the
-                // JitCode closure.  PyPy traces the ordinary
-                // `W_Super.getattribute` / `_super_check` bodies, so bind the
-                // concrete override at the same classdef/MRO decision point
-                // as the exception-handler pair above.
-                "load_super_attr_with",
-                // `ControlFlowOpcodeHandler::close_loop`'s default reports
-                // `StepResult::Continue`.  `PyFrame` overrides it to report
-                // `CloseLoop` unconditionally — that report is the back edge,
-                // and the portal turns it into the `loop_header` op
-                // `jtransform.py` rewrites `can_enter_jit` into.  Left on the
-                // default, a walk of the portal reads `Continue` at every back
-                // edge, never reaches `loop_header`, and so leaves
-                // `seen_loop_header_for_jdindex` at -1 for the whole walk:
-                // every `jit_merge_point` is a no-op and no trace can close.
-                // The override is one struct literal over the target pc, so it
-                // carries none of the objspace surface the staging above is
-                // about.
-                "close_loop",
-            ];
+            // override shadows the trait default body.  `None` for
+            // concrete-impl entries, defaults without an override, and
+            // traits with several concrete impl types (the receiver
+            // stays ambiguous — indirect-call family territory keeps
+            // the default).
             let devirt: Option<(&str, &front::semantic::SemanticFunction)> =
-                if is_default && DEFAULT_SHADOW_DEVIRT_SCOPE.contains(&method.name.as_str()) {
-                    trait_method_overrides
-                        .get(&(impl_info.trait_name.as_str(), method.name.as_str()))
-                        .filter(|_| {
-                            trait_concrete_impl_types
-                                .get(impl_info.trait_name.as_str())
-                                .is_some_and(|types| types.len() == 1)
-                        })
-                        .copied()
-                } else {
-                    None
-                };
+                unique_trait_default_override(
+                    &program,
+                    &leaf_identities,
+                    is_default,
+                    impl_info.trait_name.as_str(),
+                    method.name.as_str(),
+                    &trait_method_overrides,
+                    &trait_concrete_impl_types,
+                );
             // Hints for the direct path follow the graph registered
             // there (RPython binds hints to graph identity).
             let direct_hints: &Vec<String> = match devirt {
@@ -1789,51 +1927,10 @@ fn analyze_pipeline_from_module_paths(
                     None => graph,
                 };
                 call_control.register_trait_method(&method.name, trait_root, impl_type, graph);
-                // Parity with upstream `rpython/annotator/classdesc.py lookup
-                // lookup` MRO walk: a trait default body is the
-                // "base-class method" for every impl that does not
-                // override it. Rust-idiomatic call sites emit the call
-                // as `<Trait>::<method>(receiver, ...)` —
-                // `front::mir` lowers that into
-                // `CallTarget::FunctionPath { segments: [<Trait>,
-                // <method>], fun_decl_id: None }`. The upstream-equivalent registration key
-                // is therefore `[<Trait>, <method>]`. The pseudo-type
-                // path `[<default methods of Trait>, <method>]` set by
-                // `register_trait_method` is retained so the filter logic
-                // at `call.rs`'s `resolve_method*` and
-                // `lib.rs` `push_matching_trait_methods` can continue
-                // to distinguish "trait default" from "concrete impl".
-                if is_default {
-                    let direct_path = crate::parse::CallPath::from_segments([
-                        impl_info.trait_name.as_str(),
-                        method.name.as_str(),
-                    ]);
-                    // Prefer the MIR graph for the direct_path
-                    // registration too; fall back to the carried
-                    // graph when the lookup has no entry.  `devirt`
-                    // (hoisted above) swaps in the unique concrete
-                    // override's graph and return type.
-                    let (direct_source, direct_return_type) = match devirt {
-                        Some((impl_type, override_info)) => (
-                            mir_graph_lookup
-                                .lookup_impl_method(impl_type, &method.name)
-                                .cloned()
-                                .or_else(|| Some(override_info.graph.clone())),
-                            override_info.return_type.as_ref(),
-                        ),
-                        None => (
-                            mir_graph.cloned().or_else(|| method.graph.clone()),
-                            method.return_type.as_ref(),
-                        ),
-                    };
-                    if let Some(g) = direct_source {
-                        let direct_graph = match direct_return_type {
-                            Some(rt) => g.with_return_type(rt),
-                            None => g,
-                        };
-                        call_control.register_function_graph(direct_path, direct_graph);
-                    }
-                }
+                // The pseudo-type path `[<default methods of Trait>, <method>]`
+                // is the base-class body.  `[<Trait>, <method>]` is bound by
+                // `bind_trait_default_direct_paths` (`classdesc.py` `lookup`,
+                // the CallKind::Trait path).
             }
             let path = crate::parse::CallPath::for_impl_method(impl_type, method.name.as_str());
             // Mirror RPython `func._elidable_function_` / `func._jit_*_`:
@@ -2453,8 +2550,13 @@ fn analyze_pipeline_from_module_paths(
     };
 
     mark_phase!("call_control + canonical_trait_impls + register graphs");
-    let (jitcodes, indirectcalltarget_indices, insns, descrs, all_liveness) =
-        make_jitcodes(&config.pipeline, &mut call_control, &mut prof);
+    let (jitcodes, indirectcalltarget_indices, insns, descrs, all_liveness) = make_jitcodes(
+        &config.pipeline,
+        &mut call_control,
+        &mut prof,
+        static_addrs.pytypes,
+        static_addrs.pytypes_by_struct,
+    );
     mark_phase!("make_jitcodes");
     // warmspot.py `WarmRunnerDesc.finish` after `make_jitcodes`: unique
     // `vinfo.finish()` then `replace_force_virtualizable_with_call` over
@@ -2707,6 +2809,8 @@ fn make_jitcodes(
     pipeline_config: &pipeline::PipelineConfig,
     call_control: &mut call::CallControl,
     prof: &mut PhaseProfiler,
+    pytypes: &[(&str, i64)],
+    pytypes_by_struct: &[(&str, i64)],
 ) -> (
     Vec<std::sync::Arc<jitcode::JitCode>>,
     Vec<usize>,
@@ -2723,6 +2827,12 @@ fn make_jitcodes(
     // invariant).
     call_control.set_struct_storage(&pipeline_config.transform.struct_storage);
     let mut codewriter = codewriter::CodeWriter::new();
+    // `Assembler.constants_r` is filled while this codewriter runs.
+    // The name rows live on that assembler, not a process-global map.
+    codewriter.assembler.intern_type_static_addrs(pytypes);
+    codewriter
+        .assembler
+        .intern_type_static_addrs(pytypes_by_struct);
 
     // `warmspot.py:262-264` `vrefinfo = VirtualRefInfo(self);
     //  self.codewriter.setup_vrefinfo(vrefinfo)` — installs the
@@ -2983,6 +3093,19 @@ mod portal_driver_tests {
             "one class identity uses its fully-qualified registry spelling"
         );
 
+        let mut owners = TraitImplOwners::new();
+        let bucket = owners
+            .entry("pyre_interpreter::pyopcode::OpcodeStepExecutor".to_string())
+            .or_default();
+        bucket.insert("PyFrame".to_string());
+        bucket.insert("pyframe::PyFrame".to_string());
+        let unique = unique_trait_impl_roots(&program, owners);
+        assert_eq!(
+            unique.get("pyre_interpreter::pyopcode::OpcodeStepExecutor"),
+            Some(&"pyre_interpreter::pyframe::PyFrame".to_string()),
+            "two lookup spellings of one StructId stay one class"
+        );
+
         let foreign = "other_runtime::PyFrame";
         program
             .struct_fields
@@ -2997,6 +3120,348 @@ mod portal_driver_tests {
             identities.get("PyFrame").map(Vec::len),
             Some(2),
             "genuinely distinct same-leaf classes remain ambiguous"
+        );
+    }
+
+    #[test]
+    fn unique_trait_default_override_is_method_agnostic() {
+        let store = front::semantic::SemanticFunction {
+            name: "store_attr_cached".into(),
+            graph: FunctionGraph::new("PyFrame::store_attr_cached"),
+            return_type: None,
+            self_ty_root: Some("PyFrame".into()),
+            trait_impl_id: None,
+            module_path: String::new(),
+            hints: Vec::new(),
+            trait_root: Some("OpcodeStepExecutor".into()),
+            trait_qualified: Some("pyre_interpreter::pyopcode::OpcodeStepExecutor".into()),
+            returns_objectptr: false,
+            fun_decl_id: None,
+        };
+        let to_bool = front::semantic::SemanticFunction {
+            name: "to_bool".into(),
+            graph: FunctionGraph::new("PyFrame::to_bool"),
+            return_type: None,
+            self_ty_root: Some("PyFrame".into()),
+            trait_impl_id: None,
+            module_path: String::new(),
+            hints: Vec::new(),
+            trait_root: Some("OpcodeStepExecutor".into()),
+            trait_qualified: Some("pyre_interpreter::pyopcode::OpcodeStepExecutor".into()),
+            returns_objectptr: false,
+            fun_decl_id: None,
+        };
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            ("OpcodeStepExecutor", "store_attr_cached"),
+            ("PyFrame", &store),
+        );
+        overrides.insert(("OpcodeStepExecutor", "to_bool"), ("PyFrame", &to_bool));
+        let mut types = std::collections::HashMap::new();
+        types.insert("OpcodeStepExecutor", vec!["PyFrame"]);
+        let program = front::SemanticProgram::default();
+        let leaf_identities = std::collections::HashMap::new();
+
+        let hit = unique_trait_default_override(
+            &program,
+            &leaf_identities,
+            true,
+            "OpcodeStepExecutor",
+            "store_attr_cached",
+            &overrides,
+            &types,
+        );
+        assert_eq!(
+            hit.map(|(owner, func)| (owner, func.graph.name.as_str())),
+            Some(("PyFrame", "PyFrame::store_attr_cached"))
+        );
+        let hit = unique_trait_default_override(
+            &program,
+            &leaf_identities,
+            true,
+            "OpcodeStepExecutor",
+            "to_bool",
+            &overrides,
+            &types,
+        );
+        assert_eq!(
+            hit.map(|(owner, func)| (owner, func.graph.name.as_str())),
+            Some(("PyFrame", "PyFrame::to_bool"))
+        );
+        assert!(
+            unique_trait_default_override(
+                &program,
+                &leaf_identities,
+                true,
+                "OpcodeStepExecutor",
+                "no_override",
+                &overrides,
+                &types,
+            )
+            .is_none(),
+            "a method the unique impl does not override keeps the trait default"
+        );
+        assert!(
+            unique_trait_default_override(
+                &program,
+                &leaf_identities,
+                false,
+                "OpcodeStepExecutor",
+                "store_attr_cached",
+                &overrides,
+                &types,
+            )
+            .is_none(),
+            "a concrete impl entry is not a default-body shadow"
+        );
+
+        types.insert("OpcodeStepExecutor", vec!["PyFrame", "OtherFrame"]);
+        assert!(
+            unique_trait_default_override(
+                &program,
+                &leaf_identities,
+                true,
+                "OpcodeStepExecutor",
+                "store_attr_cached",
+                &overrides,
+                &types,
+            )
+            .is_none(),
+            "several concrete impls leave the default on the direct path"
+        );
+    }
+
+    fn sem_fn(
+        name: &str,
+        graph: &str,
+        owner: Option<&str>,
+        trait_root: Option<&str>,
+        trait_qualified: Option<&str>,
+    ) -> front::semantic::SemanticFunction {
+        front::semantic::SemanticFunction {
+            name: name.into(),
+            graph: FunctionGraph::new(graph),
+            return_type: None,
+            self_ty_root: owner.map(str::to_string),
+            trait_impl_id: None,
+            module_path: String::new(),
+            hints: Vec::new(),
+            trait_root: trait_root.map(str::to_string),
+            trait_qualified: trait_qualified.map(str::to_string),
+            returns_objectptr: false,
+            fun_decl_id: None,
+        }
+    }
+
+    fn pyframe_id() -> majit_ir::descr::StructId {
+        majit_ir::descr::StructId::from_canonical("pyre_interpreter::pyframe::PyFrame")
+    }
+
+    /// T1. Two lookup spellings of one class still bind the override.
+    #[test]
+    fn alias_spellings_of_one_class_bind_the_trait_default_override() {
+        let id = pyframe_id();
+        let mut program = front::SemanticProgram::default();
+        for alias in ["pyframe::PyFrame", "pyre_interpreter::pyframe::PyFrame"] {
+            program.struct_ids.insert(alias.to_string(), Some(id));
+        }
+        let first = sem_fn(
+            "to_bool",
+            "PyFrame::to_bool",
+            Some("pyframe::PyFrame"),
+            Some("OpcodeStepExecutor"),
+            Some("pyre_interpreter::pyopcode::OpcodeStepExecutor"),
+        );
+        let second = sem_fn(
+            "to_bool",
+            "PyFrame::to_bool",
+            Some("pyre_interpreter::pyframe::PyFrame"),
+            Some("OpcodeStepExecutor"),
+            Some("pyre_interpreter::pyopcode::OpcodeStepExecutor"),
+        );
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            ("OpcodeStepExecutor", "to_bool"),
+            (first.self_ty_root.as_deref().unwrap(), &first),
+        );
+        overrides.insert(
+            ("OpcodeStepExecutor", "to_bool"),
+            (second.self_ty_root.as_deref().unwrap(), &second),
+        );
+        let mut types = std::collections::HashMap::new();
+        types.insert(
+            "OpcodeStepExecutor",
+            vec!["pyframe::PyFrame", "pyre_interpreter::pyframe::PyFrame"],
+        );
+        let leaf_identities = std::collections::HashMap::new();
+        let hit = unique_trait_default_override(
+            &program,
+            &leaf_identities,
+            true,
+            "OpcodeStepExecutor",
+            "to_bool",
+            &overrides,
+            &types,
+        );
+        let (owner, func) = hit.expect("alias spellings of one StructId bind the override");
+        assert!(
+            owner == "pyframe::PyFrame" || owner == "pyre_interpreter::pyframe::PyFrame",
+            "owner {owner}"
+        );
+        assert_eq!(func.graph.name, "PyFrame::to_bool");
+    }
+
+    /// T2. Two struct identities keep the trait default.
+    #[test]
+    fn two_struct_identities_keep_the_trait_default() {
+        let mut program = front::SemanticProgram::default();
+        program.struct_ids.insert(
+            "pyframe::PyFrame".into(),
+            Some(majit_ir::descr::StructId::from_canonical(
+                "pyframe::PyFrame",
+            )),
+        );
+        program.struct_ids.insert(
+            "other::OtherFrame".into(),
+            Some(majit_ir::descr::StructId::from_canonical(
+                "other::OtherFrame",
+            )),
+        );
+        let override_fn = sem_fn(
+            "to_bool",
+            "PyFrame::to_bool",
+            Some("pyframe::PyFrame"),
+            Some("OpcodeStepExecutor"),
+            Some("pyre_interpreter::pyopcode::OpcodeStepExecutor"),
+        );
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            ("OpcodeStepExecutor", "to_bool"),
+            ("pyframe::PyFrame", &override_fn),
+        );
+        let mut types = std::collections::HashMap::new();
+        types.insert(
+            "OpcodeStepExecutor",
+            vec!["pyframe::PyFrame", "other::OtherFrame"],
+        );
+        let leaf_identities = std::collections::HashMap::new();
+        assert!(
+            unique_trait_default_override(
+                &program,
+                &leaf_identities,
+                true,
+                "OpcodeStepExecutor",
+                "to_bool",
+                &overrides,
+                &types,
+            )
+            .is_none(),
+            "two struct identities leave the default on the direct path"
+        );
+    }
+
+    /// T3. The registration loop binds `[OpcodeStepExecutor, to_bool]` to
+    /// the override and leaves an unimplemented method on the default graph.
+    #[test]
+    fn registration_binds_unique_override_and_keeps_unoverridden_default() {
+        let id = pyframe_id();
+        let mut program = front::SemanticProgram::default();
+        for alias in ["pyframe::PyFrame", "pyre_interpreter::pyframe::PyFrame"] {
+            program.struct_ids.insert(alias.to_string(), Some(id));
+        }
+        program.functions.push(sem_fn(
+            "to_bool",
+            "OpcodeStepExecutor::to_bool",
+            None,
+            Some("OpcodeStepExecutor"),
+            None,
+        ));
+        program.functions.push(sem_fn(
+            "to_bool",
+            "PyFrame::to_bool",
+            Some("pyframe::PyFrame"),
+            Some("OpcodeStepExecutor"),
+            Some("pyre_interpreter::pyopcode::OpcodeStepExecutor"),
+        ));
+        program.functions.push(sem_fn(
+            "to_bool",
+            "PyFrame::to_bool",
+            Some("pyre_interpreter::pyframe::PyFrame"),
+            Some("OpcodeStepExecutor"),
+            Some("pyre_interpreter::pyopcode::OpcodeStepExecutor"),
+        ));
+        program.functions.push(sem_fn(
+            "rotate3",
+            "OpcodeStepExecutor::rotate3",
+            None,
+            Some("OpcodeStepExecutor"),
+            None,
+        ));
+        let leaf_identities = distinct_struct_identities_by_leaf(&program);
+        let mut call_control = call::CallControl::new();
+        bind_trait_default_direct_paths(&program, &mut call_control, &leaf_identities);
+        let to_bool = call_control
+            .function_graphs()
+            .get(&CallPath::from_segments(["OpcodeStepExecutor", "to_bool"]))
+            .expect("direct path registered");
+        assert_eq!(to_bool.name, "PyFrame::to_bool");
+        let rotate3 = call_control
+            .function_graphs()
+            .get(&CallPath::from_segments(["OpcodeStepExecutor", "rotate3"]))
+            .expect("unoverridden default stays registered");
+        assert_eq!(rotate3.name, "OpcodeStepExecutor::rotate3");
+    }
+
+    /// T4. The override key is the trait leaf, matching the default's
+    /// `trait_root`, not the qualified trait path.
+    #[test]
+    fn trait_default_override_key_is_the_leaf_not_the_qualified_path() {
+        let id = pyframe_id();
+        let mut program = front::SemanticProgram::default();
+        program
+            .struct_ids
+            .insert("pyframe::PyFrame".into(), Some(id));
+        let override_fn = sem_fn(
+            "to_bool",
+            "PyFrame::to_bool",
+            Some("pyframe::PyFrame"),
+            Some("OpcodeStepExecutor"),
+            Some("pyre_interpreter::pyopcode::OpcodeStepExecutor"),
+        );
+        let mut types = std::collections::HashMap::new();
+        let mut overrides = std::collections::HashMap::new();
+        index_concrete_trait_method(&override_fn, &mut types, &mut overrides);
+        assert!(overrides.contains_key(&("OpcodeStepExecutor", "to_bool")));
+        assert!(
+            !overrides.contains_key(&("pyre_interpreter::pyopcode::OpcodeStepExecutor", "to_bool")),
+            "the qualified trait path is not the override key"
+        );
+        let leaf_identities = std::collections::HashMap::new();
+        let hit = unique_trait_default_override(
+            &program,
+            &leaf_identities,
+            true,
+            "OpcodeStepExecutor",
+            "to_bool",
+            &overrides,
+            &types,
+        );
+        assert_eq!(
+            hit.map(|(owner, func)| (owner, func.graph.name.as_str())),
+            Some(("pyframe::PyFrame", "PyFrame::to_bool"))
+        );
+        assert!(
+            unique_trait_default_override(
+                &program,
+                &leaf_identities,
+                true,
+                "pyre_interpreter::pyopcode::OpcodeStepExecutor",
+                "to_bool",
+                &overrides,
+                &types,
+            )
+            .is_none(),
+            "looking the leaf-keyed override up under the qualified path misses"
         );
     }
 
@@ -3094,8 +3559,13 @@ mod portal_driver_tests {
         let mut policy = policy::DefaultJitPolicy::new();
         call_control.find_all_graphs(&mut policy);
 
-        let (jitcodes, _, _, _, _) =
-            make_jitcodes(&config, &mut call_control, &mut PhaseProfiler::new());
+        let (jitcodes, _, _, _, _) = make_jitcodes(
+            &config,
+            &mut call_control,
+            &mut PhaseProfiler::new(),
+            &[],
+            &[],
+        );
         assert_eq!(jitcodes.len(), 1);
         assert_eq!(jitcodes[0].index(), 0);
         assert!(call_control.jitcodes().contains_key(&portal));
@@ -3293,8 +3763,13 @@ mod portal_driver_tests {
         let mut policy = policy::DefaultJitPolicy::new();
         call_control.find_all_graphs(&mut policy);
 
-        let (jitcodes, _, _, _, _) =
-            make_jitcodes(&config, &mut call_control, &mut PhaseProfiler::new());
+        let (jitcodes, _, _, _, _) = make_jitcodes(
+            &config,
+            &mut call_control,
+            &mut PhaseProfiler::new(),
+            &[],
+            &[],
+        );
         assert_eq!(jitcodes[0].name, "eval_loop_jit_portal");
         let merge = jitcodes[0]
             .body()

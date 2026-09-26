@@ -15,12 +15,13 @@ static WE_ARE_JITTED: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
 /// `rlib/jit.py we_are_jitted`.
 ///
-/// `inline(never)` so Charon keeps the call. `jtransform.rs`
-/// `fold_we_are_jitted_calls` rewrites it to `_we_are_jitted`, then
-/// jitcode folds that to const true (`jtransform.py`
-/// `rewrite_op_int_is_true` of `_we_are_jitted`). Inlining the hook
-/// body leaves an AtomicPtr load the fold cannot see.
+/// `inline(never)` so Charon keeps the call. `dont_look_inside` so
+/// the translator cannot fold the hook body (`AtomicPtr` starts
+/// null) to const false. `jtransform.rs` `fold_we_are_jitted_calls`
+/// rewrites the call to `_we_are_jitted`, then jitcode folds that
+/// to const true (`jtransform.py` `rewrite_op_int_is_true`).
 #[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn we_are_jitted() -> bool {
     let p = WE_ARE_JITTED.load(Ordering::Relaxed);
     if p.is_null() {

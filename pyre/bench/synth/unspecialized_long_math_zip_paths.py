@@ -1,4 +1,4 @@
-# pyre-check: spec-folds=zip_two_tuple_iters,math_frexp,math_ldexp
+# pyre-check: trace-shape=entry-bridge:f_zip_strict:absent=CallMayForceR,f_zip:absent=CallMayForceR,f_cmp_long_int:absent=CallMayForceR,f_truediv_long:present=NewWithVtable,f_pow_long_int:absent=CallMayForceR,f_shift_long_int:absent=CallMayForceR,f_frexp:absent=CallMayForceR,f_ldexp:absent=CallMayForceR
 # Throughput gate for the hand-written folds this file still fires: `zip`
 # over two tuples (positional and `strict=True`), and `math.frexp` /
 # `math.ldexp`. `bigint ** int` is the descended `long_pow` body.

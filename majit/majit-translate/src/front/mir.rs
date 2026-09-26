@@ -968,6 +968,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     function_filter: Option<&std::collections::HashSet<String>>,
     cross_tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
     // ── Pass 1: walk type_decls + trait_decls ─────────────────────
     let (
         mut known_struct_names,
@@ -1162,6 +1163,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // production keeps going with a degraded SemanticProgram —
         // failing-loud on the single broken function rather than
         // erroring out at program-build time.
+        let body = shadow_stack_erase::erase_or_keep(fd, body, llbc);
         let accum = AccumulatorFacts::build(llbc, &body);
         let builder_mode = accum.has_builder;
         let mut atomic_reasons = Vec::new();
@@ -1259,9 +1261,13 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // Aggregate `"ref"` results stay unstamped — the call-signature
         // validator skips a missing declaration, and a struct name is not
         // a register class.
+        // A declaration of the `BuiltinCodeFn` pointer type is a member of
+        // that indirect-call family, so it stamps the pointer type's RESULT
+        // for the same reason a trait-method member does.
         let stamp_return_token = dont_look_inside.contains(&fn_path)
             || elidable_residual.contains(&fn_path)
-            || trait_root.is_some();
+            || trait_root.is_some()
+            || fun_decl_is_builtin_code_fn(fd, llbc);
         let signature_token = if gcref_result {
             Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
         } else {
@@ -2818,6 +2824,7 @@ pub struct LowerContext<'a> {
 impl<'a> LowerContext<'a> {
     /// Derive the program's lowering metadata once for this context.
     pub fn new(llbc: &'a Llbc) -> Self {
+        shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
         let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
         Self {
             llbc,
@@ -2952,6 +2959,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
             fd.item_meta.name_path()
         ))
     })?;
+    let u = shadow_stack_erase::erase_or_keep(fd, u, llbc);
     let accum = AccumulatorFacts::build(llbc, &u);
     let builder_mode = accum.has_builder;
     let mut atomic_load_reasons = Vec::new();
@@ -2969,6 +2977,11 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         &mut atomic_load_reasons,
     )
 }
+
+#[path = "shadow_stack_erase.rs"]
+mod shadow_stack_erase;
+pub use shadow_stack_erase::census as shadow_stack_erase_census;
+pub use shadow_stack_erase::{discover_stack_sensitive_fns, ensure_stack_sensitive_fns};
 
 /// The MIR locals that can be a fresh string-builder accumulator: the
 /// destination of an [`is_str_builder_ctor`] CALL terminator in the
@@ -7022,11 +7035,74 @@ impl<'a> Lowering<'a> {
                         )),
                         Operand::Const(_) => None,
                     };
+                    let src_int = match &operand {
+                        Operand::Copy(p) | Operand::Move(p) => {
+                            int_cast_size_and_sign(&p.ty, self.llbc)
+                        }
+                        Operand::Const(_) => None,
+                    };
                     let src_kind = self.operand_value_kind(&operand);
                     let src_root = self.operand_class_root(&operand);
                     let arg = self.resolve_operand(mir_bb, operand)?;
                     let dst_kind =
                         tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves);
+                    // An integer cast to a narrower unsigned type keeps only
+                    // the low bytes. The JIT carries every integer in one
+                    // machine word, so the truncation has to be an explicit
+                    // `int_and` (`jtransform.py _int_to_int_cast`); aliasing
+                    // the operand would leave the high bits in place.
+                    if let (Some(src), Some(dst)) =
+                        (src_int, int_cast_size_and_sign(dest_ty, self.llbc))
+                        && let Some(IntToIntCast::And(mask)) =
+                            int_to_int_cast(src, dst, crate::layout::target_word_size() as u64)
+                    {
+                        let bb_id = self.block_id[mir_bb];
+                        // `and_(r_uint, r_uint)` keeps the Unsigned
+                        // annotation the destination has; a signed operand
+                        // is retyped first through the same `r_uint` marker
+                        // the same-width signedness flip below uses.
+                        let lhs = if src.1 {
+                            arg
+                        } else {
+                            let unsigned = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(unsigned.clone()),
+                                kind: OpKind::Call {
+                                    target: CallTarget::FunctionPath {
+                                        segments: ["rpython", "rlib", "rarithmetic", "r_uint"]
+                                            .into_iter()
+                                            .map(str::to_string)
+                                            .collect(),
+                                        fun_decl_id: None,
+                                    },
+                                    args: crate::model::call_args(vec![arg]),
+                                    result_ty: ValueType::Unsigned,
+                                },
+                            });
+                            unsigned
+                        };
+                        let mask_var = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(mask_var.clone()),
+                            kind: OpKind::ConstUInt(mask),
+                        });
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        return Ok((
+                            Some(OpKind::BinOp {
+                                op: "and".to_string(),
+                                lhs,
+                                rhs: mask_var,
+                                result_ty: ValueType::Unsigned,
+                            }),
+                            res,
+                        ));
+                    }
                     // The Rust-only current-address adapter is erased as a
                     // whole GCREF identity.  Its `ptr -> usize -> ptr`
                     // round-trip exists only to call the host GC query; once
@@ -7244,6 +7320,9 @@ impl<'a> Lowering<'a> {
             // itself. Aliasing the dest local to the referent Variable
             // keeps the IR small, treating `&x` as a same-Variable copy.
             Rvalue::Ref { place, .. } => {
+                if let Some(address) = self.lower_inline_substruct_address(mir_bb, &place)? {
+                    return Ok((None, address));
+                }
                 let projection = Self::place_ref_is_address_of(&place);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
@@ -7255,6 +7334,9 @@ impl<'a> Lowering<'a> {
             // and references identically at the IR level (lifetime
             // tracking lives outside the JIT).
             Rvalue::RawPtr { place, .. } => {
+                if let Some(address) = self.lower_inline_substruct_address(mir_bb, &place)? {
+                    return Ok((None, address));
+                }
                 let projection = Self::place_ref_is_address_of(&place);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
@@ -8134,7 +8216,7 @@ impl<'a> Lowering<'a> {
             DecodedConst::Bool(b) => OpKind::ConstBool(b),
             DecodedConst::Float(bits) => OpKind::ConstFloat(bits),
             DecodedConst::SingleFloat(bits) => OpKind::ConstSingleFloat(bits),
-            // String / char / byte-string constants — no
+            // String / byte-string constants — no
             // ConstStr opkind exists; synthesise a 0-arg `Call` whose
             // path encodes the literal text so the IR stays stable.
             DecodedConst::Str(s) => OpKind::Call {
@@ -8372,6 +8454,99 @@ impl<'a> Lowering<'a> {
     ///
     /// The `Deref` test is spelled as `resolve_place` and
     /// `emit_projection_write` already spell it, applied one level out.
+    /// Byte offset of `(*p).f` inside `*p` when `f` is a by-value struct
+    /// stored inline, so `&(*p).f` is an interior address rather than a word
+    /// the container holds.
+    ///
+    /// `jtransform.py rewrite_op_getsubstruct` lowers that access to
+    /// `int_add(p, offsetof(STRUCT, f))`.  The generic `Rvalue::Ref` arm
+    /// aliases a borrow to its referent's value, which for an inline struct
+    /// reads the substructure's first word and hands it on as the address.
+    /// The offset is Charon's layout for the build target, the same one the
+    /// descr layer records.  `None` leaves the place to the generic arm: a
+    /// non-deref container (a local aggregate), an enum payload, a field that
+    /// is itself a pointer or scalar, a `core`/`alloc`/`std` type the front
+    /// models by value, or a container without a resolved layout.
+    fn inline_substruct_field_offset(&self, place: &Place) -> Option<u64> {
+        let PlaceKind::Projection(inner, ProjectionElem::Tagged(elem)) = &place.kind else {
+            return None;
+        };
+        let PlaceKind::Projection(_, ProjectionElem::Atom(deref)) = &inner.kind else {
+            return None;
+        };
+        if deref != "Deref" {
+            return None;
+        }
+        let payload = elem.as_object()?.get("Field")?.as_array()?;
+        let [container, field_idx] = payload.as_slice() else {
+            return None;
+        };
+        let adt = container.as_object()?.get("Adt")?.as_array()?;
+        if adt.get(1).is_some_and(|variant| !variant.is_null()) {
+            return None;
+        }
+        let head = adt.first()?;
+        let owner_id = match head.as_u64() {
+            Some(id) => id,
+            None => head.get("id")?.get("Adt")?.as_u64()?,
+        };
+        let owner = self.llbc.type_by_id(owner_id)?;
+        if !matches!(owner.kind, TypeDeclKind::Struct(_)) {
+            return None;
+        }
+        let field_decl = self
+            .llbc
+            .type_by_id(adt_node_def_id(tyref_node(&place.ty, self.llbc)?)?)?;
+        let TypeDeclKind::Struct(fields) = &field_decl.kind else {
+            return None;
+        };
+        if fields.is_empty() || field_decl.is_repr_transparent() {
+            return None;
+        }
+        let field_path = field_decl.item_meta.name_path();
+        if ["core::", "alloc::", "std::"]
+            .iter()
+            .any(|prefix| field_path.starts_with(prefix))
+        {
+            return None;
+        }
+        let target = std::env::var("TARGET").unwrap_or_default();
+        owner
+            .layout_for_target(&target)?
+            .struct_field_offset(field_idx.as_u64()? as usize)
+    }
+
+    /// Lower `&(*p).f` / `&raw (*p).f` for an inline struct field as
+    /// `rewrite_op_getsubstruct` does.  Offset zero is `p` itself.  A nonzero
+    /// offset takes the same deferred refusal `rewrite_op_getfield` gives a
+    /// nonzero `getsubstruct`: an interior address cannot enter the Ref bank,
+    /// so the graph aborts the trace when it reaches the access.
+    fn lower_inline_substruct_address(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+    ) -> Result<Option<Variable>, LowerError> {
+        let Some(offset) = self.inline_substruct_field_offset(place) else {
+            return Ok(None);
+        };
+        let PlaceKind::Projection(inner, _) = &place.kind else {
+            unreachable!("inline_substruct_field_offset matched a projection");
+        };
+        let base = self.resolve_place(mir_bb, clone_place(inner))?;
+        if offset != 0 {
+            let bb_id = self.block_id[mir_bb];
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Abort {
+                    kind: crate::model::UnknownKind::UnsupportedExpr {
+                        variant: crate::model::UnsupportedExprKind::RawAddr,
+                    },
+                },
+            });
+        }
+        Ok(Some(base))
+    }
+
     fn place_ref_is_address_of(place: &Place) -> bool {
         match &place.kind {
             PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref" => false,
@@ -10238,8 +10413,10 @@ impl<'a> Lowering<'a> {
             // `root_scope_close` residual so a crate that only imports the
             // opaque guard can still name it.  Emit the named residual, not
             // both — a second close would truncate an already-rewound stack.
-            // Other drops keep the legacy goto until their glue bodies and
-            // residual callees are available to the translator.
+            // FrameAnchor drop is the matching rewind for `frame_anchor_new`;
+            // matching it here keeps that glue residual live.  Other drops
+            // keep the legacy goto until their glue bodies and residual
+            // callees are available to the translator.
             TermKind::Drop {
                 place,
                 fn_ptr,
@@ -10247,6 +10424,17 @@ impl<'a> Lowering<'a> {
                 on_unwind,
             } => {
                 let _ = on_unwind;
+                if drop_place_is_frame_anchor(&place, self.body, self.llbc) {
+                    return self.lower_frame_anchor_drop(mir_bb, place, target as usize);
+                }
+                if drop_place_is_list_guard(&place, self.llbc) {
+                    return self.lower_one_word_guard_release(
+                        mir_bb,
+                        place,
+                        target as usize,
+                        LIST_LOCK_RELEASE_PATH,
+                    );
+                }
                 if drop_lowers_as_glue_call(&place, &fn_ptr, self.llbc) {
                     self.emit_root_scope_close(mir_bb, &place);
                 }
@@ -10259,6 +10447,59 @@ impl<'a> Lowering<'a> {
                 "bb{mir_bb}: unknown TermKind"
             ))),
         }
+    }
+
+    /// Close a [`FrameAnchor`] through the bound word-ABI residual.
+    ///
+    /// `front::mir` aliases a one-word `FrameAnchor` local to its depth
+    /// `Int`. `FrameAnchor::drop` takes `&mut self` (`Ref`), so emitting
+    /// that path as the residual made the containing graph fail to
+    /// look-inside (`opcode_compare_op` residualized as unbound `ri`).
+    /// `frame_anchor_release` is already `dont_look_inside` and takes
+    /// the depth as `usize`.
+    fn lower_frame_anchor_drop(
+        &mut self,
+        mir_bb: usize,
+        place: Place,
+        target: usize,
+    ) -> Result<(), LowerError> {
+        self.lower_one_word_guard_release(
+            mir_bb,
+            place,
+            target,
+            ["pyre_interpreter", "eval", "frame_anchor_release"],
+        )
+    }
+
+    /// Drop a one-word guard local by passing its word to the bound release
+    /// residual `release`, then continue to `target`.
+    fn lower_one_word_guard_release(
+        &mut self,
+        mir_bb: usize,
+        place: Place,
+        target: usize,
+        release: [&str; 3],
+    ) -> Result<(), LowerError> {
+        let PlaceKind::Local(local) = place.kind else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: guard Drop over a projection place ({release:?})"
+            )));
+        };
+        let bb_id = self.block_id[mir_bb];
+        if let Some(arg) = self.local_var[local as usize].clone() {
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(release),
+                    args: crate::model::call_args(vec![arg]),
+                    result_ty: ValueType::Void,
+                },
+            });
+        }
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
     }
 
     /// Lower a local `Drop` as the glue call named by its MIR terminator.
@@ -20986,6 +21227,34 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// `true` when Charon's resolved layout for `ty` is a two-variant
+    /// enum stored in one pointer word with no `Branch` tag.
+    ///
+    /// That is the physical encoding of a pointer niche: `None` is the
+    /// null word and `Some(p)` is `p`.  A `Branch` discriminator is a
+    /// tagged enum and stays an aggregate `__discriminant` read.  Generic
+    /// declarations (including `core::option::Option`) emit no layout;
+    /// those return `false` here and the payload-shape walk decides.
+    fn tyref_enum_layout_is_pointer_niche(&self, ty: &TyRef) -> bool {
+        let Some(def_id) = self.tyref_adt_def_id(ty) else {
+            return false;
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return false;
+        };
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            return false;
+        };
+        if variants.len() != 2 {
+            return false;
+        }
+        let target = std::env::var("TARGET").unwrap_or_default();
+        let Some(layout) = td.layout_for_target(&target) else {
+            return false;
+        };
+        !layout.has_branch_discriminant() && matches!(layout.size, Some(4 | 8))
+    }
+
     /// `true` when `ty` resolves to a fieldless (C-like) enum — at least
     /// one variant and every variant carrying zero payload fields.  Such
     /// an enum is represented by-value as its discriminant integer, so
@@ -21087,6 +21356,13 @@ impl<'a> Lowering<'a> {
         if !crate::front::result_exc::tyref_is_option(ty, self.llbc) {
             return false;
         }
+        // Instantiated `Option<T>` whose Charon layout occupies one
+        // pointer word with no `Branch` tag is already a null niche.
+        // Generic `Option` declarations carry no layout; those fall
+        // through to the payload-shape walk below.
+        if self.tyref_enum_layout_is_pointer_niche(ty) {
+            return true;
+        }
         let Some(node) = tyref_node(ty, self.llbc) else {
             return false;
         };
@@ -21110,6 +21386,9 @@ impl<'a> Lowering<'a> {
             .and_then(|node| trait_assoc_projection_target(node, self.llbc));
         let resolved_body = resolved_assoc.as_ref().and_then(|ty| self.tyref_body(ty));
         let payload = resolved_body.unwrap_or(payload);
+        let Some(payload) = type_node_peel_aliases(payload, self.llbc) else {
+            return false;
+        };
         if type_node_is_mut_ref(payload, self.llbc) {
             return true;
         }
@@ -23607,6 +23886,27 @@ fn fn_ptr_signature_is_builtin_code_fn(
         .get("output")
         .map(|value| charon_type_value_to_ast_string(value, llbc, 0))
         .unwrap_or_default();
+    builtin_code_fn_shape(&input, &output)
+}
+
+/// Whether a function declaration has the `gateway::BuiltinCodeFn` type
+/// itself — a safe `fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>`.
+/// Every graph an indirect call through that pointer type can reach is such
+/// a declaration, so its `FUNC.RESULT` is the pointer type's `RESULT`.
+fn fun_decl_is_builtin_code_fn(fd: &FunDecl, llbc: &Llbc) -> bool {
+    let [input] = fd.signature.inputs.as_slice() else {
+        return false;
+    };
+    !fd.signature.is_unsafe
+        && builtin_code_fn_shape(
+            &tyref_to_ast_string(input, llbc),
+            &tyref_to_ast_string(&fd.signature.output, llbc),
+        )
+}
+
+/// The `BuiltinCodeFn` shape test on rendered input / output type strings,
+/// shared by the fn-pointer operand and the function-declaration sides.
+fn builtin_code_fn_shape(input: &str, output: &str) -> bool {
     input.starts_with('[')
         && input.contains("PyObject")
         && output.starts_with("Result<")
@@ -24952,12 +25252,113 @@ fn gc_root_scope_drop_glue_path(name: &str) -> bool {
         && segments.iter().any(|s| *s == "RootScope")
 }
 
+/// Match Charon's `eval::FrameAnchor::<Impl>::drop_in_place` path.
+///
+/// `frame_anchor_new_jit_abi` publishes the slot and forgets `Drop`;
+/// the matching `drop_in_place` must become a residual
+/// `frame_anchor_release` or compiled loops leak every iteration.
+fn frame_anchor_drop_glue_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    let last = segments.last().copied();
+    // Charon names the Drop impl `FrameAnchor::drop`; the MIR
+    // terminator glue is `drop_in_place`. Either must close the
+    // `frame_anchor_new_jit_abi` slot.
+    (last == Some("drop_in_place") || last == Some("drop"))
+        && segments.iter().any(|s| *s == "FrameAnchor")
+}
+
+fn tyref_is_frame_anchor(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_class_root(ty, llbc).is_some_and(|root| root.contains("FrameAnchor")) {
+        return true;
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    if let Some(id) = adt_id_flexible(node)
+        && llbc
+            .type_by_id(id)
+            .is_some_and(|td| td.item_meta.name_path().contains("FrameAnchor"))
+    {
+        return true;
+    }
+    false
+}
+
+fn adt_id_flexible(node: &serde_json::Value) -> Option<u64> {
+    let adt = node.get("Adt")?;
+    if let Some(id) = adt.as_u64() {
+        return Some(id);
+    }
+    let id = adt.get("id")?;
+    if let Some(n) = id.as_u64() {
+        return Some(n);
+    }
+    id.get("Adt").and_then(serde_json::Value::as_u64)
+}
+
+/// Dedup `place.ty` often has no Adt name. Opcode handlers name the
+/// one-word local `anchor` / `frame_anchor`; those locals are
+/// [`FrameAnchor`] (every `let anchor` in the interpreter is one).
+fn drop_place_is_frame_anchor(place: &Place, body: &Unstructured, llbc: &Llbc) -> bool {
+    if tyref_is_frame_anchor(&place.ty, llbc) {
+        return true;
+    }
+    let PlaceKind::Local(local) = place.kind else {
+        return false;
+    };
+    let Some(decl) = body.locals.locals.get(local as usize) else {
+        return false;
+    };
+    matches!(decl.name.as_deref(), Some("anchor") | Some("frame_anchor"))
+        || tyref_is_frame_anchor(&decl.ty, llbc)
+}
+
+/// The release residual a `ListGuard` drop lowers to (`rthread.py`
+/// `Lock.release`).
+const LIST_LOCK_RELEASE_PATH: [&str; 3] = ["pyre_object", "listobject", "w_list_lock_release"];
+
+/// A drop of the list lock's one-word `ListGuard` (`listobject::ListGuard`).
+/// Its `Drop` releases the lock word; without this arm the drop fell through
+/// to a plain goto and the jitcode never released an acquisition.
+fn drop_place_is_list_guard(place: &Place, llbc: &Llbc) -> bool {
+    if !matches!(place.kind, PlaceKind::Local(_)) {
+        return false;
+    }
+    let Some(node) = tyref_node(&place.ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    adt_id_flexible(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| {
+            let path = td.item_meta.name_path();
+            let segments: Vec<&str> = path.split("::").collect();
+            segments.last() == Some(&"ListGuard") && segments.contains(&"listobject")
+        })
+}
+
+/// Match the bound `w_list_lock_release` residual a `ListGuard` drop emits.
+pub(crate) fn is_list_lock_release_call(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    segments.last().map(String::as_str) == Some(LIST_LOCK_RELEASE_PATH[2])
+}
+
 /// Drops supported by both lowering and its liveness analysis.
 fn drop_lowers_as_glue_call(place: &Place, fn_ptr: &RegularCall, llbc: &Llbc) -> bool {
-    matches!(place.kind, PlaceKind::Local(_))
-        && regular_call_name_path(fn_ptr, llbc)
-            .as_deref()
-            .is_some_and(gc_root_scope_drop_glue_path)
+    if !matches!(place.kind, PlaceKind::Local(_)) {
+        return false;
+    }
+    if tyref_is_frame_anchor(&place.ty, llbc) {
+        return true;
+    }
+    regular_call_name_path(fn_ptr, llbc)
+        .as_deref()
+        .is_some_and(|name| gc_root_scope_drop_glue_path(name) || frame_anchor_drop_glue_path(name))
 }
 
 /// Match the lowered RootScope close used by result/exception rewrites.
@@ -24979,11 +25380,36 @@ pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
         || (leaf == Some(ROOT_SCOPE_CLOSE) && in_gc_roots)
 }
 
+/// Match the bound [`frame_anchor_release`] residual emitted for a
+/// `FrameAnchor` Drop. Result/exception rewrites must keep it on the
+/// Err edge the same way they keep a RootScope close: `set_raise`
+/// bypasses the forwarding block that held the Drop.
+pub(crate) fn is_frame_anchor_release_call(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    segments.last().map(String::as_str) == Some("frame_anchor_release")
+}
+
+/// Guard releases that an exceptional Result rewrite must replay on the
+/// raise edge: shadow-stack closes and the list lock release.
+pub(crate) fn is_shadow_stack_bracket_close(kind: &OpKind) -> bool {
+    is_root_scope_drop_glue_call(kind)
+        || is_frame_anchor_release_call(kind)
+        || is_list_lock_release_call(kind)
+}
+
 fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
     let mut out = bit_set::BitSet::with_capacity(body.body.len());
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if let Ok(TermKind::Drop { place, fn_ptr, .. }) = bb.term()
-            && drop_lowers_as_glue_call(&place, &fn_ptr, llbc)
+            && (drop_place_is_frame_anchor(&place, body, llbc)
+                || drop_place_is_list_guard(&place, llbc)
+                || drop_lowers_as_glue_call(&place, &fn_ptr, llbc))
         {
             out.insert(bb_idx);
         }
@@ -25854,7 +26280,13 @@ fn analyze_root_brackets(
 /// An erased bracket publishes nothing, so it owes no rewind and lowers no
 /// close.  A test that counts closes needs this to tell that case from a close
 /// the lowering dropped on the floor.
-pub fn erased_root_bracket_guards(llbc: &Llbc, body: &Unstructured) -> Vec<usize> {
+pub fn erased_root_bracket_guards(llbc: &Llbc, fd: &FunDecl, body: &Unstructured) -> Vec<usize> {
+    // A body the scalar replacement rewrote keeps no bracket at all.
+    if let Ok(Some(_)) = shadow_stack_erase::erase_shadow_stack(fd, body, llbc) {
+        return (0..body.locals.locals.len())
+            .filter(|local| shadow_stack_erase::is_root_scope_local(body, llbc, *local))
+            .collect();
+    }
     let moved = moved_out_locals(body);
     analyze_root_brackets(body, llbc, &moved)
         .scopes
@@ -27934,6 +28366,81 @@ fn tyref_exact_layout_size(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
 /// owner in the path preserves the callable identity that keys
 /// `rbuiltin.py::BUILTIN_TYPER`; a bare leaf can collide with an unrelated
 /// Rust function named `float` or `int` in the flat call registry.
+/// `rffi.size_and_sign(T)` of a Rust integer literal type: its byte size and
+/// whether it is unsigned. `None` for anything but a `{"Int": _}` /
+/// `{"UInt": _}` literal (`bool` and `char` included, which do not reach an
+/// integer `and_` without their own conversion first).
+fn int_cast_size_and_sign(ty: &TyRef, llbc: &Llbc) -> Option<(u64, bool)> {
+    let lit = tyref_node(ty, llbc)?
+        .as_object()?
+        .get("Literal")?
+        .as_object()?;
+    let (atom, unsigned) = if let Some(atom) = lit.get("UInt").and_then(serde_json::Value::as_str) {
+        (atom, true)
+    } else {
+        (lit.get("Int").and_then(serde_json::Value::as_str)?, false)
+    };
+    let size = match atom {
+        "I8" | "U8" => 1,
+        "I16" | "U16" => 2,
+        "I32" | "U32" => 4,
+        "I64" | "U64" => 8,
+        "I128" | "U128" => 16,
+        "Isize" | "Usize" => crate::layout::target_word_size() as u64,
+        _ => return None,
+    };
+    Some((size, unsigned))
+}
+
+/// The operation `jtransform.py _int_to_int_cast` rewrites an integer
+/// `force_cast` into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IntToIntCast {
+    /// The destination holds every source value: no operation.
+    Noop,
+    /// `int_and(v, mask)` — narrowing to an unsigned type.
+    And(u64),
+    /// `int_signext(v, numbytes)` — narrowing to a signed type.
+    Signext(u64),
+}
+
+/// `jtransform.py _int_to_int_cast` for a cast between two integer types of
+/// at most `word` bytes, given as `(size, unsigned)` pairs
+/// (`rffi.size_and_sign`). `None` for a longlong operand, whose
+/// `truncate_longlong_to_int` / `cast_*_to_*longlong` legs this does not
+/// cover.
+fn int_to_int_cast(src: (u64, bool), dst: (u64, bool), word: u64) -> Option<IntToIntCast> {
+    let (size1, unsigned1) = src;
+    let (size2, unsigned2) = dst;
+    if size1 > word || size2 > word {
+        return None;
+    }
+    // the target type is LONG or ULONG
+    if size2 == word {
+        return Some(IntToIntCast::Noop);
+    }
+    // `rarithmetic.integer_bounds`
+    let integer_bounds = |size: u64, unsigned: bool| -> (i128, i128) {
+        let bits = 8 * size as u32;
+        if unsigned {
+            (0, (1i128 << bits) - 1)
+        } else {
+            (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+        }
+    };
+    let (min1, max1) = integer_bounds(size1, unsigned1);
+    let (min2, max2) = integer_bounds(size2, unsigned2);
+    // the target type includes the source range
+    if min2 <= min1 && max1 <= max2 {
+        return Some(IntToIntCast::Noop);
+    }
+    Some(if min2 != 0 {
+        IntToIntCast::Signext(size2)
+    } else {
+        IntToIntCast::And(((1u128 << (8 * size2)) - 1) as u64)
+    })
+}
+
 fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
     let (s, d) = (value_type_bank(src), value_type_bank(dst));
     let lltype = |name: &str| -> Vec<String> {
@@ -30379,6 +30886,35 @@ fn strip_ty_indirections<'l>(
     None
 }
 
+/// Follow `type T = U` declarations to the aliased type node.
+///
+/// Charon keeps a type alias as its own `TypeDecl` (`kind: Alias`) and
+/// call sites name the alias, not `U`.  A payload spelled
+/// `Option<PyObjectRef>` is therefore an `Adt` of the alias rather than
+/// the `RawPtr` `PyObjectRef` stands for; niche recognition has to peel
+/// that layer before it can see a pointer word.
+fn type_node_peel_aliases<'l>(
+    mut node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    for _ in 0..24 {
+        let stripped = strip_ty_indirections(node, llbc)?;
+        let Some(def_id) = adt_node_def_id(stripped) else {
+            return Some(stripped);
+        };
+        let Some(td) = llbc.type_by_id(def_id) else {
+            return Some(stripped);
+        };
+        match &td.kind {
+            TypeDeclKind::Alias(aliased) => {
+                node = aliased;
+            }
+            _ => return Some(stripped),
+        }
+    }
+    None
+}
+
 /// The array element type behind an `Index::index` / `IndexMut::index_mut`
 /// destination — exactly one reference level off its `&T` / `&mut T`.
 ///
@@ -30403,18 +30939,24 @@ fn tyref_index_element_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l ser
 /// than 8. [`ValueType`] cannot supply it — `Unsigned` is one width-less
 /// variant spanning `u8` through `usize`.
 ///
-/// A spelling the flag table does not carry — `char` among them — is not
-/// named, and the caller leaves that site residual rather than describe it
-/// with a width nothing computed.
+/// A spelling the flag table does not carry is not named, and the caller
+/// leaves that site residual rather than describe it with a width nothing
+/// computed. `char` is carried: it is RPython's `UniChar`, a 4-byte
+/// unsigned item.
 fn json_ty_scalar_element_spelling(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
     let obj = strip_ty_indirections(node, llbc)?.as_object()?;
     let lit = obj.get("Literal")?;
-    if lit.as_str() == Some("Bool") {
-        return Some("bool".to_string());
+    match lit.as_str() {
+        Some("Bool") => return Some("bool".to_string()),
+        Some("Char") => return Some("char".to_string()),
+        _ => {}
     }
     let lit = lit.as_object()?;
     if lit.contains_key("Bool") {
         return Some("bool".to_string());
+    }
+    if lit.contains_key("Char") {
+        return Some("char".to_string());
     }
     let named = |key: &str, pairs: &[(&str, &str)]| -> Option<String> {
         let atom = lit.get(key)?.as_str()?;
@@ -31370,6 +31912,7 @@ fn reader_scalar_spelling(element: &str) -> bool {
     matches!(
         element,
         "bool"
+            | "char"
             | "u8"
             | "u16"
             | "u32"
@@ -33219,9 +33762,10 @@ enum DecodedConst {
     /// width on the constant (`{"Float": {"value": "...", "ty": "F32"}}`),
     /// and parsing both widths into an f64 bit pattern is what erased it.
     SingleFloat(u32),
-    /// String / char / byte-string literals. The IR has no dedicated
-    /// string constant opkind; the codewriter treats these as opaque
-    /// pointer-typed values. We carry the textual representation as a
+    /// String / byte-string literals. The IR has no dedicated string
+    /// constant opkind; the codewriter treats these as opaque pointer-typed
+    /// values. A `char` literal is not one of them: it decodes to
+    /// [`Self::Int`]. We carry the textual representation as a
     /// unique-string `ConstValue` so the generated IR is stable across
     /// runs.
     Str(String),
@@ -33459,10 +34003,26 @@ fn const_eval_init_body(llbc: &Llbc, u: &Unstructured) -> Option<OpKind> {
 }
 
 fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<ConstLit> {
+    const_eval_body_lit(llbc, u, &[], depth)
+}
+
+/// Evaluate a const-context body with `args` bound to its argument locals
+/// `_1..=_n`: a global's initializer (no arguments), or a `const fn` that
+/// initializer calls.
+fn const_eval_body_lit(
+    llbc: &Llbc,
+    u: &Unstructured,
+    args: &[ConstLit],
+    depth: usize,
+) -> Option<ConstLit> {
     if depth > 32 {
         return None;
     }
-    let mut locals: std::collections::HashMap<u64, ConstLit> = std::collections::HashMap::new();
+    let mut locals: std::collections::HashMap<u64, ConstLit> = args
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (index as u64 + 1, *value))
+        .collect();
     let eval_operand =
         |locals: &std::collections::HashMap<u64, ConstLit>, op: &Operand| -> Option<ConstLit> {
             match op {
@@ -33544,6 +34104,12 @@ fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Opti
                             eval_operand(&locals, lhs)?,
                             eval_operand(&locals, rhs)?,
                         )?,
+                        // A `repr(transparent)` struct is its one sized
+                        // field, so building it is that field's value.
+                        Rvalue::Aggregate(kind, operands) => {
+                            let index = const_transparent_aggregate_field(llbc, &kind)?;
+                            eval_operand(&locals, operands.get(index)?)?
+                        }
                         _ => return None,
                     };
                     // rustc computes each assignment at the destination's
@@ -33573,13 +34139,79 @@ fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Opti
                 let PlaceKind::Local(dst) = call.dest.kind else {
                     return None;
                 };
-                locals.insert(dst, const_eval_size_align_call(llbc, &call)?);
+                let value = match const_eval_size_align_call(llbc, &call) {
+                    Some(value) => value,
+                    None => {
+                        let args = call
+                            .args
+                            .iter()
+                            .map(|arg| eval_operand(&locals, arg))
+                            .collect::<Option<Vec<_>>>()?;
+                        const_eval_const_fn_call(llbc, &call, &args, depth)?
+                    }
+                };
+                locals.insert(dst, value);
                 bb = target as usize;
             }
             _ => return None,
         }
     }
     None
+}
+
+/// Evaluate a call a const initializer makes to a `const fn` whose body
+/// this LLBC carries, over literal arguments.
+///
+/// Only a `const fn` can be called from a const context, so the callee is
+/// one rustc already evaluated to build the constant; running its body over
+/// the same literals gives the host value RPython's flowspace would receive
+/// as a prebuilt Constant.  A generic callee, a callee without a body, and
+/// any body shape [`const_eval_body_lit`] cannot evaluate stay unharvested.
+fn const_eval_const_fn_call(
+    llbc: &Llbc,
+    call: &CallPayload,
+    args: &[ConstLit],
+    depth: usize,
+) -> Option<ConstLit> {
+    let CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    if reg
+        .generics
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|types| !types.is_empty())
+    {
+        return None;
+    }
+    let body = llbc.fn_by_id(*id)?.unstructured()?;
+    if body.locals.arg_count as usize != args.len() {
+        return None;
+    }
+    let value = const_eval_body_lit(llbc, &body, args, depth + 1)?;
+    Some(const_narrow_to_target(
+        const_literal_ty(llbc, &call.dest.ty),
+        value,
+    ))
+}
+
+/// The operand index that is the value of a `repr(transparent)` struct
+/// aggregate: its one sized field.  `None` for any other aggregate.
+fn const_transparent_aggregate_field(llbc: &Llbc, kind: &serde_json::Value) -> Option<usize> {
+    let adt = kind.as_object()?.get("Adt")?.as_array()?;
+    let head = adt.first()?;
+    let type_id = match head.as_u64() {
+        Some(id) => id,
+        None => head.get("id")?.get("Adt")?.as_u64()?,
+    };
+    if adt.get(1).is_some_and(|variant| !variant.is_null()) {
+        return None;
+    }
+    let decl = llbc.type_by_id(type_id)?;
+    transparent_nonzst_field(decl, llbc).map(|(index, _)| index)
 }
 
 /// Fold a const-init `Call` terminator only when it is nullary
@@ -34228,8 +34860,17 @@ fn decode_literal(lit: &serde_json::Value) -> Result<DecodedConst, LowerError> {
     if let Some(s) = lit_obj.get("Str").and_then(Value::as_str) {
         return Ok(DecodedConst::Str(s.to_string()));
     }
+    // A `char` is one code point, RPython's `UniChar`: an int-kind scalar
+    // (`getkind(UniChar) == 'int'`), the same bank a `char` field or array
+    // element read produces and the value a `SwitchInt` arm matches.
     if let Some(s) = lit_obj.get("Char").and_then(Value::as_str) {
-        return Ok(DecodedConst::Str(s.to_string()));
+        let mut chars = s.chars();
+        return match (chars.next(), chars.next()) {
+            (Some(c), None) => Ok(DecodedConst::Int(i64::from(u32::from(c)))),
+            _ => Err(LowerError::Schema(format!(
+                "Char literal is not one code point: {lit}"
+            ))),
+        };
     }
     if let Some(s) = lit_obj.get("ByteStr").and_then(Value::as_str) {
         return Ok(DecodedConst::Str(s.to_string()));
@@ -38505,6 +39146,8 @@ fn panic_block_is_pure_message(block: &crate::model::Block) -> bool {
             | OpKind::ConstUInt(_)
             | OpKind::ConstBool(_)
             | OpKind::ConstFloat(_)
+            | OpKind::ConstStr(_)
+            | OpKind::ConstInternedStr(_)
             | OpKind::ConstRef(_)
             | OpKind::ConstRefNull
             | OpKind::ConstNone
@@ -40066,6 +40709,21 @@ mod tests {
     }
 
     #[test]
+    fn decode_char_literal_is_its_int_code_point() {
+        for (lit, code) in [(">", 0x3e_i64), ("\u{0}", 0), ("\u{10ffff}", 0x10ffff)] {
+            let json = serde_json::json!({ "Char": lit });
+            assert!(
+                matches!(decode_literal(&json), Ok(DecodedConst::Int(n)) if n == code),
+                "char literal {lit:?} decodes to Int({code})",
+            );
+        }
+        assert!(
+            decode_literal(&serde_json::json!({ "Str": ">" }))
+                .is_ok_and(|c| matches!(c, DecodedConst::Str(ref s) if s == ">"))
+        );
+    }
+
+    #[test]
     fn decode_scalar_i128_and_u128_preserves_full_width() {
         let signed = serde_json::json!({
             "Scalar": {
@@ -40162,6 +40820,27 @@ mod tests {
         }
         assert!(reads >= 1);
         assert!(writes >= 1);
+    }
+
+    #[test]
+    #[ignore]
+    fn builtin_wrapper_declaration_has_builtin_code_fn_type() {
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let wrapper = llbc
+            .iter_local_fns()
+            .find(|fd| fd.item_meta.name_path().ends_with("::__majit_wrap_random"))
+            .expect("_random::__majit_wrap_random");
+        assert!(super::fun_decl_is_builtin_code_fn(wrapper, &llbc));
+        let non_member = llbc
+            .iter_local_fns()
+            .find(|fd| {
+                fd.item_meta
+                    .name_path()
+                    .ends_with("::function::funccall_valuestack")
+            })
+            .expect("function::funccall_valuestack");
+        assert!(!super::fun_decl_is_builtin_code_fn(non_member, &llbc));
     }
 
     #[test]
@@ -40417,6 +41096,67 @@ mod tests {
     /// assigned to — Rust does not treat shifted-out bits as an overflow, so
     /// `200u8 << 1` is a legal const equal to 144, not 400.  rustc truncates
     /// to the destination type and so must the fold.
+    /// `test_flatten.py test_force_cast_ints` on a 64-bit word.
+    #[test]
+    fn int_to_int_cast_follows_the_force_cast_table() {
+        use super::{IntToIntCast, int_to_int_cast};
+        const SCHAR: (u64, bool) = (1, false);
+        const UCHAR: (u64, bool) = (1, true);
+        const SHORT: (u64, bool) = (2, false);
+        const USHORT: (u64, bool) = (2, true);
+        const LONG: (u64, bool) = (8, false);
+        const ULONG: (u64, bool) = (8, true);
+        let noop = Some(IntToIntCast::Noop);
+        let and = |m| Some(IntToIntCast::And(m));
+        let signext = |n| Some(IntToIntCast::Signext(n));
+        for (from, to, expected) in [
+            (SCHAR, SCHAR, noop.clone()),
+            (SCHAR, UCHAR, and(255)),
+            (SCHAR, SHORT, noop.clone()),
+            (SCHAR, USHORT, and(65535)),
+            (SCHAR, LONG, noop.clone()),
+            (SCHAR, ULONG, noop.clone()),
+            (UCHAR, SCHAR, signext(1)),
+            (UCHAR, UCHAR, noop.clone()),
+            (UCHAR, SHORT, noop.clone()),
+            (UCHAR, USHORT, noop.clone()),
+            (UCHAR, LONG, noop.clone()),
+            (UCHAR, ULONG, noop.clone()),
+            (SHORT, SCHAR, signext(1)),
+            (SHORT, UCHAR, and(255)),
+            (SHORT, SHORT, noop.clone()),
+            (SHORT, USHORT, and(65535)),
+            (SHORT, LONG, noop.clone()),
+            (SHORT, ULONG, noop.clone()),
+            (USHORT, SCHAR, signext(1)),
+            (USHORT, UCHAR, and(255)),
+            (USHORT, SHORT, signext(2)),
+            (USHORT, USHORT, noop.clone()),
+            (USHORT, LONG, noop.clone()),
+            (USHORT, ULONG, noop.clone()),
+            (LONG, SCHAR, signext(1)),
+            (LONG, UCHAR, and(255)),
+            (LONG, SHORT, signext(2)),
+            (LONG, USHORT, and(65535)),
+            (LONG, LONG, noop.clone()),
+            (LONG, ULONG, noop.clone()),
+            (ULONG, SCHAR, signext(1)),
+            (ULONG, UCHAR, and(255)),
+            (ULONG, SHORT, signext(2)),
+            (ULONG, USHORT, and(65535)),
+            (ULONG, LONG, noop.clone()),
+            (ULONG, ULONG, noop.clone()),
+            // 32-bit halves: `i64 as u32` masks, `i64 as i32` re-extends.
+            (LONG, (4, true), and(0xffff_ffff)),
+            (LONG, (4, false), signext(4)),
+            ((4, false), (4, true), and(0xffff_ffff)),
+        ] {
+            assert_eq!(int_to_int_cast(from, to, 8), expected, "{from:?} -> {to:?}");
+        }
+        // A 128-bit operand is the longlong leg, not covered here.
+        assert_eq!(int_to_int_cast((16, false), UCHAR, 8), None);
+    }
+
     #[test]
     fn const_narrow_to_target_truncates_to_the_destination_width() {
         use super::{ConstLit, const_narrow_to_target};
@@ -42182,9 +42922,10 @@ mod tests {
 
     /// Anchor compiler-core's exact
     /// `Constants(Box<[C]>)::{deref,index}` storage shape to the real
-    /// interpreter LLBC.  `constant_at` must project the wrapper's sole field
-    /// and index that list; `code_getdocstring` must project the same field
-    /// for its slice view.  Neither accessor may survive as a residual call.
+    /// interpreter LLBC.  `constant_at` is `pyopcode.py getconstant_w`
+    /// (`w_code_const` on `co_consts_w`); it must not project the compiler
+    /// `Constants` wrapper.  `code_getdocstring` still projects that
+    /// wrapper for its slice view.
     ///
     /// `#[ignore]` is deliberate and has a precondition, not a verdict: this
     /// loads a 667 MB artefact that only exists after `extract-llbc.py` has run,
@@ -42297,14 +43038,20 @@ mod tests {
                     )
                 })
                 .count(),
-            1
+            0,
+            "getconstant_w reads co_consts_w, not compiler Constants.__pos_0"
         );
-        assert_eq!(
-            constant_ops
-                .iter()
-                .filter(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
-                .count(),
-            1
+        assert!(
+            constant_ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if super::fmt_path_ends_with(segments, &["w_code_const"])
+                )
+            }),
+            "PyFrame.constant_at must call w_code_const"
         );
         assert!(!constant_ops.iter().any(|op| {
             matches!(
@@ -43802,9 +44549,20 @@ mod tests {
             Some("bool")
         );
 
-        // `char` has no `get_type_flag` row, so naming it would hand the descr
-        // a width nothing computed.
-        assert_eq!(spelling(serde_json::json!({"Literal": "Char"})), None);
+        // `char` is `UniChar`: named, so the descr strides by its 4 bytes
+        // instead of the identity-less word.
+        assert_eq!(
+            spelling(serde_json::json!({"Literal": "Char"})).as_deref(),
+            Some("char")
+        );
+        assert_eq!(
+            crate::codewriter::call::get_type_flag("char"),
+            (
+                majit_ir::descr::ArrayFlag::Unsigned,
+                majit_ir::value::Type::Int,
+                4
+            )
+        );
         // A named ADT is the element itself, not a pointer to one, so its size
         // is whatever the struct is — `String` is three words.
         assert_eq!(spelling(named_adt.clone()), None);
@@ -48409,6 +49167,30 @@ mod tests {
         assert!(!super::gc_root_scope_drop_glue_path(
             "alloc::vec::Vec::<Impl>::drop_in_place"
         ));
+        assert!(super::frame_anchor_drop_glue_path(
+            "pyre_interpreter::eval::FrameAnchor::<Impl>::drop_in_place"
+        ));
+        assert!(super::frame_anchor_drop_glue_path(
+            "eval::FrameAnchor::drop"
+        ));
+        assert!(!super::frame_anchor_drop_glue_path(
+            "pyre_object::gc_roots::RootScope::<Impl>::drop_in_place"
+        ));
+        let release = crate::model::OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath {
+                segments: vec![
+                    "pyre_interpreter".to_string(),
+                    "eval".to_string(),
+                    "frame_anchor_release".to_string(),
+                ],
+                fun_decl_id: None,
+            },
+            args: Vec::new(),
+            result_ty: crate::model::ValueType::Void,
+        };
+        assert!(super::is_frame_anchor_release_call(&release));
+        assert!(super::is_shadow_stack_bracket_close(&release));
+        assert!(!super::is_root_scope_drop_glue_call(&release));
 
         // `_1` is written in bb0 and read only by bb1's Drop.
         let span = || {
@@ -49446,11 +50228,23 @@ mod tests {
     /// arm, so the resulting graph directly exposes whether the classifier
     /// chose aggregate construction or the nullable-pointer identities.
     fn lower_option_source_with_payload(payload: serde_json::Value) -> FunctionGraph {
-        lower_option_source_with_payload_ext(payload, false)
+        lower_option_source_retyped(payload, false, false)
     }
 
     fn lower_option_source_with_payload_ext(
+        payload: serde_json::Value,
+        inject_layoutless_nominal: bool,
+    ) -> FunctionGraph {
+        lower_option_source_retyped(payload, false, inject_layoutless_nominal)
+    }
+
+    fn lower_option_source_with_aliased_payload(payload: serde_json::Value) -> FunctionGraph {
+        lower_option_source_retyped(payload, true, false)
+    }
+
+    fn lower_option_source_retyped(
         mut payload: serde_json::Value,
+        through_alias: bool,
         inject_layoutless_nominal: bool,
     ) -> FunctionGraph {
         fn replace_dedup(
@@ -49495,6 +50289,61 @@ mod tests {
             .get_mut("translated")
             .and_then(serde_json::Value::as_object_mut)
             .expect("corpus translated object");
+
+        if through_alias {
+            let decls = translated
+                .get_mut("type_decls")
+                .and_then(serde_json::Value::as_array_mut)
+                .expect("corpus type_decls");
+            // Charon `type_by_id` indexes the table by position, so the
+            // alias id is the slot this push occupies, not max(def_id)+1.
+            let alias_id = decls.len() as u64;
+            let template = decls
+                .iter()
+                .find(|decl| {
+                    decl.get("kind")
+                        .and_then(|kind| kind.get("Alias"))
+                        .is_some()
+                })
+                .cloned()
+                .expect("corpus has a type alias to copy item_meta from");
+            let mut alias_decl = template;
+            alias_decl
+                .as_object_mut()
+                .expect("type decl object")
+                .insert("def_id".to_string(), serde_json::json!(alias_id));
+            alias_decl
+                .as_object_mut()
+                .expect("type decl object")
+                .insert(
+                    "kind".to_string(),
+                    serde_json::json!({ "Alias": payload.clone() }),
+                );
+            if let Some(meta) = alias_decl
+                .get_mut("item_meta")
+                .and_then(|m| m.as_object_mut())
+            {
+                meta.insert(
+                    "name".to_string(),
+                    serde_json::json!([
+                        {"Ident": ["charon_corpus", 0]},
+                        {"Ident": ["ObjectPtr", 0]}
+                    ]),
+                );
+            }
+            decls.push(alias_decl);
+            payload = serde_json::json!({
+                "Adt": {
+                    "id": { "Adt": alias_id },
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            });
+        }
 
         let option_def_id = translated
             .get("type_decls")
@@ -49664,6 +50513,54 @@ mod tests {
         assert_eq!(
             discriminant_reads, 0,
             "a layout-less nominal raw pointer must not read __discriminant"
+        );
+    }
+
+    #[test]
+    fn niche_option_type_alias_of_raw_nominal_ptr_none_is_null() {
+        use crate::model::OpKind;
+        // `type ObjectPtr = *mut HostRegistry` is the Charon spelling of
+        // `type PyObjectRef = *mut PyObject`: the Option payload names the
+        // alias Adt, not the `RawPtr`.  Discriminant / Some / None must
+        // still see one nullable pointer word.
+        let payload = serde_json::json!({
+            "RawPtr": [
+                {
+                    "Adt": {
+                        "id": { "Adt": 4 },
+                        "generics": {
+                            "regions": [], "types": [],
+                            "const_generics": [], "trait_refs": []
+                        }
+                    }
+                },
+                "Mut"
+            ]
+        });
+        let graph = lower_option_source_with_aliased_payload(payload);
+        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+        assert_eq!(
+            null_muts, 1,
+            "None of an alias-to-raw-nominal-ptr Option must lower to one null pointer"
+        );
+        assert_eq!(
+            transparent_ctors, 0,
+            "Some of an alias-to-raw-nominal-ptr Option must be the payload identity"
+        );
+        let discriminant_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                )
+            })
+            .count();
+        assert_eq!(
+            discriminant_reads, 0,
+            "a pointer-niche Option must not read an aggregate __discriminant"
         );
     }
 
@@ -49859,6 +50756,93 @@ mod tests {
             program.struct_ids.get(frame_owner).copied().flatten(),
             Some(pyframe_ids[0]),
             "the retained owner spelling must resolve to the frame's StructId"
+        );
+    }
+
+    /// `[OpcodeStepExecutor, to_bool]` on the real interpreter LLBC is the
+    /// `PyFrame` override.  The census printed in a failure names which
+    /// uniqueness miss is live: several owner strings of one StructId, a
+    /// missing override row, or a direct path that stayed the trait default.
+    #[test]
+    #[ignore]
+    fn opcode_step_executor_to_bool_direct_path_is_pyframe_override() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+        let mut owners = std::collections::BTreeSet::new();
+        let mut to_bool_override = false;
+        let mut to_bool_default = false;
+        for fd in llbc.iter_local_fns() {
+            let name_path = fd.item_meta.name_path();
+            let trait_path = super::trait_impl_trait_path_for_fundecl(&llbc, fd);
+            let trait_leaf = trait_path.as_deref().and_then(|p| p.rsplit("::").next());
+            if trait_leaf == Some("OpcodeStepExecutor")
+                && let Some((owner, method)) = super::impl_method_owner_for_fundecl(&llbc, fd)
+            {
+                owners.insert(owner);
+                if method == "to_bool" {
+                    to_bool_override = true;
+                }
+            }
+            if name_path.ends_with("::OpcodeStepExecutor::to_bool") {
+                to_bool_default = true;
+            }
+        }
+        let program =
+            super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+                std::slice::from_ref(&llbc),
+                crate::HostStaticAddrs::default(),
+                &[],
+                &["to_bool"],
+            )
+            .expect("build filtered to_bool program");
+        let mut ids = Vec::new();
+        for owner in &owners {
+            let id = program
+                .struct_ids
+                .get(owner)
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| majit_ir::descr::StructId::from_canonical(owner));
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let leaf_identities = crate::distinct_struct_identities_by_leaf(&program);
+        let mut call_control = crate::call::CallControl::new();
+        crate::bind_trait_default_direct_paths(&program, &mut call_control, &leaf_identities);
+        let graph = call_control
+            .function_graphs()
+            .get(&crate::CallPath::from_segments([
+                "OpcodeStepExecutor",
+                "to_bool",
+            ]))
+            .expect("direct path registered");
+        assert!(
+            to_bool_default && to_bool_override,
+            "LLBC must contain both the trait default and the PyFrame override; \
+             owners={owners:?} ids={}",
+            ids.len()
+        );
+        assert_eq!(
+            ids.len(),
+            1,
+            "OpcodeStepExecutor owners must be one struct identity; owners={owners:?}"
+        );
+        assert!(
+            graph.name.contains("eval") && graph.name.contains("<Impl>"),
+            "direct to_bool graph is {:?}; owners={owners:?} ({} strings, {} struct ids); \
+             classified_override={to_bool_override}",
+            graph.name,
+            owners.len(),
+            ids.len()
+        );
+        assert!(
+            !graph.name.contains("OpcodeStepExecutor"),
+            "raising default stayed on the direct path: {}",
+            graph.name
         );
     }
 

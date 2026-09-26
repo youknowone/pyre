@@ -305,6 +305,7 @@ trait AssemblerEncode {
         &mut self,
         bytes: Vec<u8>,
         precomputed_hash: i64,
+        as_unicode_object: bool,
         state: &mut AssemblyState,
     ) -> u8;
 
@@ -316,6 +317,10 @@ trait AssemblerEncode {
     ) -> u8;
 
     fn emit_const_r_bits(&mut self, bits: i64, state: &mut AssemblyState) -> u8;
+
+    fn emit_type_static_or_bits(&mut self, bits: i64, state: &mut AssemblyState) -> u8;
+
+    fn emit_type_static_const_r(&mut self, name: String, state: &mut AssemblyState) -> u8;
 
     fn emit_const_f(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8;
 }
@@ -394,6 +399,7 @@ impl AssemblerExt for Assembler {
             constants_f: Vec::new(),
             str_consts: Vec::new(),
             unit_variant_consts: Vec::new(),
+            type_static_consts: Vec::new(),
             num_regs_i,
             num_regs_r,
             num_regs_f,
@@ -515,6 +521,7 @@ impl AssemblerExt for Assembler {
             constants_f: state.constants_f,
             str_consts: state.str_consts,
             unit_variant_consts: state.unit_variant_consts,
+            type_static_consts: state.type_static_consts,
             c_num_regs_i: num_regs_i as u8,
             c_num_regs_r: num_regs_r as u8,
             c_num_regs_f: num_regs_f as u8,
@@ -1381,6 +1388,21 @@ impl AssemblerEncode for Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            OpKind::ConstInternedStr(bytes) => {
+                let hash = crate::translator::rtyper::lltypesystem::rstr::ll_strhash_value(bytes);
+                let idx = self.emit_str_const_r(bytes.clone(), hash, true, state);
+                state.code.push(idx);
+                argcodes.push('r');
+                if let Some(result) = op.result.as_ref() {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let key = format!("ref_copy/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
             OpKind::ConstRefNull => {
                 let const_value = crate::flowspace::model::ConstValue::LLAddress(
                     crate::translator::rtyper::lltypesystem::lltype::_address::Null,
@@ -1399,7 +1421,7 @@ impl AssemblerEncode for Assembler {
                 state.code[startposition] = opnum;
             }
             OpKind::ConstRefAddr(addr) => {
-                let idx = self.emit_const_r_bits(*addr, state);
+                let idx = self.emit_type_static_or_bits(*addr, state);
                 state.code.push(idx);
                 argcodes.push('r');
                 if let Some(result) = op.result.as_ref() {
@@ -2951,6 +2973,7 @@ impl AssemblerEncode for Assembler {
                 OpKind::ConstSymbolic { .. } => "ConstSymbolic",
                 OpKind::ConstFloat(_) => "ConstFloat",
                 OpKind::ConstStr(_) => "ConstStr",
+                OpKind::ConstInternedStr(_) => "ConstInternedStr",
                 OpKind::ConstRef(_) => "ConstRef",
                 OpKind::ConstRefNull => "ConstRefNull",
                 OpKind::ConstNone => "ConstNone",
@@ -3260,7 +3283,7 @@ impl AssemblerEncode for Assembler {
             && let Some((bytes, hash)) =
                 crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash(p)
         {
-            return self.emit_str_const_r(bytes, hash, state);
+            return self.emit_str_const_r(bytes, hash, false, state);
         }
         // A unit-variant prebuilt singleton is likewise process-local
         // (`rpbc.py SingleFrozenPBCRepr`'s prebuilt instance): the
@@ -3274,6 +3297,14 @@ impl AssemblerEncode for Assembler {
                 )
         {
             return self.emit_unit_variant_const_r(qualname, tag, state);
+        }
+        if let ConstValue::HostObject(obj) = value {
+            let type_name = self
+                .type_static_const_by_addr(obj.identity_id() as i64)
+                .map(str::to_string);
+            if let Some(name) = type_name {
+                return self.emit_type_static_const_r(name, state);
+            }
         }
         let bits = match value {
             // assembler.py::Assembler.emit_const casts ref constants to
@@ -3292,7 +3323,7 @@ impl AssemblerEncode for Assembler {
             ) => 0,
             other => panic!("raise/r constant pool does not support {other:?}"),
         };
-        self.emit_const_r_bits(bits, state)
+        self.emit_type_static_or_bits(bits, state)
     }
 
     /// Record a prebuilt-string constant for runtime materialization and
@@ -3305,9 +3336,14 @@ impl AssemblerEncode for Assembler {
         &mut self,
         bytes: Vec<u8>,
         precomputed_hash: i64,
+        as_unicode_object: bool,
         state: &mut AssemblyState,
     ) -> u8 {
-        if let Some(ordinal) = state.str_consts.iter().position(|d| d.bytes == bytes) {
+        if let Some(ordinal) = state
+            .str_consts
+            .iter()
+            .position(|d| d.bytes == bytes && d.as_unicode_object == as_unicode_object)
+        {
             return self.emit_const_r_bits(str_const_sentinel(ordinal), state);
         }
         let ordinal = state.str_consts.len();
@@ -3322,6 +3358,7 @@ impl AssemblerEncode for Assembler {
             constants_r_index,
             bytes,
             precomputed_hash,
+            as_unicode_object,
         });
         reg
     }
@@ -3358,6 +3395,40 @@ impl AssemblerEncode for Assembler {
                 constants_r_index,
                 qualname,
                 tag,
+            });
+        reg
+    }
+
+    /// Pool a type-static sentinel when `bits` names an interned
+    /// `PyType` singleton; otherwise pool the raw bits.
+    fn emit_type_static_or_bits(&mut self, bits: i64, state: &mut AssemblyState) -> u8 {
+        let type_name = self.type_static_const_by_addr(bits).map(str::to_string);
+        if let Some(name) = type_name {
+            return self.emit_type_static_const_r(name, state);
+        }
+        self.emit_const_r_bits(bits, state)
+    }
+
+    /// Record a host `PyType` singleton for runtime materialization and
+    /// pool its sentinel — [`Self::emit_str_const_r`]'s shape for type
+    /// statics.  Identical names share one descriptor and one sentinel.
+    fn emit_type_static_const_r(&mut self, name: String, state: &mut AssemblyState) -> u8 {
+        if let Some(ordinal) = state.type_static_consts.iter().position(|d| d.name == name) {
+            return self.emit_const_r_bits(type_static_const_sentinel(ordinal), state);
+        }
+        let ordinal = state.type_static_consts.len();
+        let constants_r_index = state.constants_r.len();
+        let reg = self.emit_const_r_bits(type_static_const_sentinel(ordinal), state);
+        debug_assert_eq!(
+            state.constants_r.len(),
+            constants_r_index + 1,
+            "a fresh type-static sentinel must push a new constants_r slot"
+        );
+        state
+            .type_static_consts
+            .push(super::jitcode::TypeStaticConstDescriptor {
+                constants_r_index,
+                name,
             });
         reg
     }
@@ -3474,6 +3545,15 @@ fn unit_variant_const_sentinel(ordinal: usize) -> i64 {
     UNIT_VARIANT_CONST_SENTINEL_BASE | ordinal as i64
 }
 
+/// `TYPE_STATIC_CONST_SENTINEL_BASE | ordinal`.
+fn type_static_const_sentinel(ordinal: usize) -> i64 {
+    debug_assert!(
+        (ordinal as u64) < (1u64 << 48),
+        "too many type-static constants in one jitcode"
+    );
+    TYPE_STATIC_CONST_SENTINEL_BASE | ordinal as i64
+}
+
 /// Per-assembly state (RPython: Assembler.setup() fields).
 struct AssemblyState {
     code: Vec<u8>,
@@ -3488,6 +3568,9 @@ struct AssemblyState {
     /// committed to [`JitCodeBody::unit_variant_consts`]; same ownership
     /// contract as `str_consts`.
     unit_variant_consts: Vec<super::jitcode::UnitVariantConstDescriptor>,
+    /// Host `PyType` singleton constants recorded while assembling,
+    /// committed to [`JitCodeBody::type_static_consts`].
+    type_static_consts: Vec<super::jitcode::TypeStaticConstDescriptor>,
     num_regs_i: usize,
     num_regs_r: usize,
     num_regs_f: usize,
@@ -3643,7 +3726,9 @@ fn type_flag_from_str(
     let word = crate::layout::target_word_size();
     match type_str {
         // descr.py raw Ptr parity; see call.rs::get_type_flag.
-        "*const u8" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word),
+        "*const u8" | "*const CellFamily" | "*mut CellFamily" => {
+            (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word)
+        }
         s if s.starts_with('&')
             || s.starts_with("Box<")
             || s.starts_with("Arc<")
@@ -3664,7 +3749,7 @@ fn type_flag_from_str(
         "i8" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 1),
         "u64" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 8),
         "usize" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word),
-        "u32" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
+        "u32" | "char" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
         "u16" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2),
         "u8" | "bool" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
         "()" => (ArrayFlag::Void, majit_ir::value::Type::Void, 0),
@@ -5004,6 +5089,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // `emit_const_r`, then a `ref_copy/r>r` op moves it into the
         // SSA destination register.
         OpKind::ConstStr(_)
+        | OpKind::ConstInternedStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstRefAddr(_) => "ref_copy".into(),
@@ -6063,6 +6149,7 @@ mod tests {
             constants_f: Vec::new(),
             str_consts: Vec::new(),
             unit_variant_consts: Vec::new(),
+            type_static_consts: Vec::new(),
             num_regs_i: 4,
             num_regs_r: 0,
             num_regs_f: 0,
@@ -6774,6 +6861,21 @@ mod tests {
             body.constants_r[d.constants_r_index].get(),
             UNIT_VARIANT_CONST_SENTINEL_BASE,
         );
+    }
+
+    #[test]
+    fn emit_const_r_records_type_static_descriptor_and_dedups() {
+        let mut state = empty_state();
+        let mut asm = Assembler::new();
+        asm.intern_type_static_addrs(&[("pyobject::INT_TYPE", 0x1020_3040)]);
+        let reg = asm.emit_type_static_or_bits(0x1020_3040, &mut state);
+        assert_eq!(state.type_static_consts.len(), 1);
+        assert_eq!(state.type_static_consts[0].name, "pyobject::INT_TYPE");
+        let idx = state.type_static_consts[0].constants_r_index;
+        assert_eq!(state.constants_r[idx], TYPE_STATIC_CONST_SENTINEL_BASE);
+        let reg2 = asm.emit_type_static_or_bits(0x1020_3040, &mut state);
+        assert_eq!(reg, reg2);
+        assert_eq!(state.type_static_consts.len(), 1);
     }
 
     #[test]

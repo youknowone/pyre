@@ -1446,6 +1446,8 @@ pub fn translate_op(
         | OpKind::ConstUInt(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstFloat(_)
+        | OpKind::ConstStr(_)
+        | OpKind::ConstInternedStr(_)
         | OpKind::ConstRefNull
         | OpKind::ConstNone
         | OpKind::ConstRefAddr(_) => Ok(Vec::new()),

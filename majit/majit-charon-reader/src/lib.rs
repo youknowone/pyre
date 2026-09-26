@@ -74,6 +74,13 @@ pub struct Llbc {
     /// the lowering already loads with `global_by_id`; it is not a path
     /// string and not a thread-local.
     foldable_const_lits: parking_lot::RwLock<Vec<(u64, String)>>,
+    /// Function paths, from this artefact or any it links against, whose
+    /// body can leave shadow-stack slots published past its return or read
+    /// slots below the depth it was entered at.  A caller that calls one
+    /// cannot have its own root bracket scalar-replaced.  Sorted.
+    stack_sensitive_fns: parking_lot::RwLock<Vec<String>>,
+    /// Set once the set above is complete for this artefact.
+    stack_sensitive_ready: std::sync::atomic::AtomicBool,
     /// Trait-decl id → associated-type bindings of its unique impl.
     /// `trait_impls` is immutable after parse, so the map is built once.
     /// See [`TraitAssocIndex`].
@@ -224,6 +231,8 @@ impl Llbc {
             dedup_body,
             transparent_scalar_kinds: parking_lot::RwLock::new(Vec::new()),
             foldable_const_lits: parking_lot::RwLock::new(Vec::new()),
+            stack_sensitive_fns: parking_lot::RwLock::new(Vec::new()),
+            stack_sensitive_ready: std::sync::atomic::AtomicBool::new(false),
             trait_assoc_index: std::sync::OnceLock::new(),
         })
     }
@@ -260,6 +269,38 @@ impl Llbc {
             ),
             Err(index) => lits.insert(index, (def_id, encoded)),
         }
+    }
+
+    /// Record function paths whose shadow-stack effect a caller cannot see
+    /// past.  See the `stack_sensitive_fns` field.
+    pub fn register_stack_sensitive_fns(&self, paths: impl IntoIterator<Item = String>) {
+        let mut known = self.stack_sensitive_fns.write();
+        known.extend(paths);
+        known.sort();
+        known.dedup();
+    }
+
+    /// Declare the registered set complete: every function this artefact
+    /// defines has been classified.
+    pub fn mark_stack_sensitive_fns_complete(&self) {
+        self.stack_sensitive_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether [`mark_stack_sensitive_fns_complete`](Self::mark_stack_sensitive_fns_complete)
+    /// ran.  Until it has, no callee's stack effect is known.
+    pub fn stack_sensitive_fns_complete(&self) -> bool {
+        self.stack_sensitive_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether `path` was registered through
+    /// [`register_stack_sensitive_fns`](Self::register_stack_sensitive_fns).
+    pub fn is_stack_sensitive_fn(&self, path: &str) -> bool {
+        self.stack_sensitive_fns
+            .read()
+            .binary_search_by(|known| known.as_str().cmp(path))
+            .is_ok()
     }
 
     /// The folded initializer stored on `def_id`, if this artefact has one.

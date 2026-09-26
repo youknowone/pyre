@@ -406,6 +406,70 @@ pub fn scalar_slot_get(v: &Vec<i64>, i: usize) -> i64 {
     }
 }
 
+/// An `Option<char>` joined with a `char` literal default, then compared.
+/// Both links into the join carry a `char`, so both are int-kind.
+#[inline(never)]
+pub fn char_unwrap_or_join(align: Option<char>) -> i64 {
+    let a = align.unwrap_or('>');
+    if a == '^' { 1 } else { 0 }
+}
+
+/// The shape `bitflags!` expands to: a `repr(transparent)` public flag type
+/// around a `repr(transparent)` inner type around the integer, each with a
+/// `const fn` constructor and a `const fn` accessor, and the flag an
+/// associated const built through the constructor.  The inner type's methods
+/// are spelled apart from the outer ones so every local body keeps a unique
+/// name path.
+#[repr(transparent)]
+pub struct InnerCodeFlags(u16);
+
+impl InnerCodeFlags {
+    #[inline]
+    pub const fn inner_from_bits_retain(bits: u16) -> Self {
+        Self(bits)
+    }
+
+    #[inline]
+    pub const fn inner_bits(&self) -> u16 {
+        self.0
+    }
+}
+
+#[repr(transparent)]
+pub struct CodeFlags(InnerCodeFlags);
+
+impl CodeFlags {
+    pub const FLAT: Self = Self::from_bits_retain(0x100);
+
+    #[inline]
+    pub const fn from_bits_retain(bits: u16) -> Self {
+        Self(InnerCodeFlags::inner_from_bits_retain(bits))
+    }
+
+    #[inline]
+    pub const fn bits(&self) -> u16 {
+        self.0.inner_bits()
+    }
+}
+
+/// A flag const read through `.bits()` inside an integer expression.
+#[inline(never)]
+pub fn code_flags_bits_or(nargs: usize) -> usize {
+    nargs | CodeFlags::FLAT.bits() as usize
+}
+
+/// A `char` element read at a constant index and switched on. `char` is a
+/// 4-byte unsigned item, so the index arm lowers it to an int-banked
+/// `ArrayRead` and the match switches on that int.
+#[inline(never)]
+pub fn char_slot_index(v: &Vec<char>) -> i64 {
+    if v.len() >= 2 && matches!(v[1], '<' | '>' | '=' | '^') {
+        1
+    } else {
+        0
+    }
+}
+
 // 10. Register bank of a borrowed primitive, by container.
 //
 // Three shapes one peel decision has to answer together.  The payload's own

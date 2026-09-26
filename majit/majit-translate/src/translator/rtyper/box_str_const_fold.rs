@@ -6,7 +6,7 @@
 //! split MIR basic blocks, so the literal definition may be in a straight-line
 //! predecessor rather than in the call's block.
 
-use crate::flowspace::model::Variable;
+use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{BlockId, CallTarget, FunctionGraph, LinkArg, OpKind};
 
 const BOX_STR_CONSTANT_PATH: [&str; 3] = [
@@ -15,7 +15,7 @@ const BOX_STR_CONSTANT_PATH: [&str; 3] = [
     "box_str_constant",
 ];
 
-fn is_box_str_constant_call(kind: &OpKind) -> Option<&Variable> {
+fn is_box_str_constant_call(kind: &OpKind) -> Option<&LinkArg> {
     let OpKind::Call {
         target: CallTarget::FunctionPath { segments, .. },
         args,
@@ -117,8 +117,8 @@ fn dominating_literal(
     }
 }
 
-/// Replace `box_str_constant` calls over proven string literals with the
-/// literal constant while preserving each call's result variable.
+/// Replace `box_str_constant` calls over proven string literals with an
+/// interned-unicode Ref constant while preserving each call's result variable.
 pub fn fold_box_str_constants(graph: &mut FunctionGraph) {
     let mut rewrites = Vec::new();
     for block in &graph.blocks {
@@ -126,14 +126,22 @@ pub fn fold_box_str_constants(graph: &mut FunctionGraph) {
             let Some(arg) = is_box_str_constant_call(&op.kind) else {
                 continue;
             };
-            if let Some(bytes) = dominating_literal(graph, block.id, op_index, arg) {
+            let literal = match arg {
+                LinkArg::Value(var) => dominating_literal(graph, block.id, op_index, var),
+                LinkArg::Const(c) => match &c.value {
+                    ConstValue::ByteStr(bytes) => Some(bytes.clone()),
+                    ConstValue::UniStr(s) => Some(s.as_bytes().to_vec()),
+                    _ => None,
+                },
+            };
+            if let Some(bytes) = literal {
                 rewrites.push((block.id, op_index, bytes));
             }
         }
     }
 
     for (block_id, op_index, bytes) in rewrites {
-        graph.block_mut(block_id).operations[op_index].kind = OpKind::ConstStr(bytes);
+        graph.block_mut(block_id).operations[op_index].kind = OpKind::ConstInternedStr(bytes);
     }
 }
 
@@ -164,6 +172,39 @@ mod tests {
         }
     }
 
+    /// A constant operand is not a `Variable`; a string constant folds
+    /// directly and any other constant leaves the call alone.
+    #[test]
+    fn a_constant_operand_folds_without_a_producer() {
+        let mut graph = FunctionGraph::new("box_const_operand");
+        let entry = graph.startblock;
+        let call = |value: ConstValue| OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: BOX_STR_CONSTANT_PATH.map(str::to_string).to_vec(),
+                fun_decl_id: None,
+            },
+            args: vec![LinkArg::from(value)],
+            result_ty: ValueType::Ref(None),
+        };
+        graph
+            .push_op_var(entry, call(ConstValue::UniStr("__len__".into())), true)
+            .expect("box call must produce a value");
+        graph
+            .push_op_var(entry, call(ConstValue::Int(7)), true)
+            .expect("box call must produce a value");
+
+        fold_box_str_constants(&mut graph);
+
+        assert_eq!(
+            graph.block(entry).operations[0].kind,
+            OpKind::ConstInternedStr(b"__len__".to_vec())
+        );
+        assert_eq!(
+            graph.block(entry).operations[1].kind,
+            call(ConstValue::Int(7))
+        );
+    }
+
     #[test]
     fn folds_frontend_literal_view_across_straight_line_blocks() {
         let mut graph = FunctionGraph::new("box_literal");
@@ -186,7 +227,10 @@ mod tests {
         );
         let folded = &graph.block(call_block).operations[0];
         assert_eq!(folded.result.as_ref(), Some(&boxed));
-        assert_eq!(folded.kind, OpKind::ConstStr(b"__instancecheck__".to_vec()));
+        assert_eq!(
+            folded.kind,
+            OpKind::ConstInternedStr(b"__instancecheck__".to_vec())
+        );
     }
 
     /// The other arm of [`str_literal_bytes`]. A front pass sees the literal
@@ -213,7 +257,10 @@ mod tests {
         );
         let folded = &graph.block(entry).operations[1];
         assert_eq!(folded.result.as_ref(), Some(&boxed));
-        assert_eq!(folded.kind, OpKind::ConstStr(b"__instancecheck__".to_vec()));
+        assert_eq!(
+            folded.kind,
+            OpKind::ConstInternedStr(b"__instancecheck__".to_vec())
+        );
     }
 
     #[test]
@@ -237,5 +284,107 @@ mod tests {
         fold_box_str_constants(&mut graph);
 
         assert_eq!(graph.block(entry).operations[1].kind, original);
+    }
+
+    /// `dunder_overridden`'s caller boxes the literal, then passes the ref.
+    #[test]
+    fn folds_dunder_overridden_caller_literal() {
+        let mut graph = FunctionGraph::new("dunder_overridden_caller");
+        let entry = graph.startblock;
+        let literal = graph
+            .push_op_var(entry, str_const_call("__add__"), true)
+            .expect("string literal must produce a value");
+        let boxed = graph
+            .push_op_var(entry, box_str_constant_call(literal), true)
+            .expect("box call must produce a value");
+
+        fold_box_str_constants(&mut graph);
+
+        assert_eq!(
+            graph.block(entry).operations[1].kind,
+            OpKind::ConstInternedStr(b"__add__".to_vec())
+        );
+        assert_eq!(
+            graph.block(entry).operations[1].result.as_ref(),
+            Some(&boxed)
+        );
+    }
+
+    /// `try_reflected_binary_special`'s caller boxes the reflected literal.
+    #[test]
+    fn folds_reflected_binary_special_caller_literal() {
+        let mut graph = FunctionGraph::new("reflected_binary_special_caller");
+        let entry = graph.startblock;
+        let literal = graph
+            .push_op_var(entry, str_const_call("__radd__"), true)
+            .expect("string literal must produce a value");
+        let boxed = graph
+            .push_op_var(entry, box_str_constant_call(literal), true)
+            .expect("box call must produce a value");
+
+        fold_box_str_constants(&mut graph);
+
+        assert_eq!(
+            graph.block(entry).operations[1].kind,
+            OpKind::ConstInternedStr(b"__radd__".to_vec())
+        );
+        assert_eq!(
+            graph.block(entry).operations[1].result.as_ref(),
+            Some(&boxed)
+        );
+    }
+
+    /// `try_lookup_unaryop` is reached from a per-arm literal. Each arm has
+    /// one predecessor, so both boxes fold.
+    #[test]
+    fn folds_lookup_unaryop_per_arm_literals() {
+        let mut graph = FunctionGraph::new("lookup_unaryop_arms");
+        let entry = graph.startblock;
+        let cond = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "neg".to_string(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .expect("cond must produce a value");
+        let neg_arm = graph.create_block();
+        let pos_arm = graph.create_block();
+        graph.set_branch(entry, cond.clone(), neg_arm, vec![], pos_arm, vec![]);
+
+        let neg_lit = graph
+            .push_op_var(neg_arm, str_const_call("__neg__"), true)
+            .expect("neg literal");
+        let neg_box = graph
+            .push_op_var(neg_arm, box_str_constant_call(neg_lit), true)
+            .expect("neg box");
+        let pos_lit = graph
+            .push_op_var(pos_arm, str_const_call("__pos__"), true)
+            .expect("pos literal");
+        let pos_box = graph
+            .push_op_var(pos_arm, box_str_constant_call(pos_lit), true)
+            .expect("pos box");
+
+        fold_box_str_constants(&mut graph);
+
+        assert_eq!(
+            graph.block(neg_arm).operations[1].kind,
+            OpKind::ConstInternedStr(b"__neg__".to_vec())
+        );
+        assert_eq!(
+            graph.block(neg_arm).operations[1].result.as_ref(),
+            Some(&neg_box)
+        );
+        assert_eq!(
+            graph.block(pos_arm).operations[1].kind,
+            OpKind::ConstInternedStr(b"__pos__".to_vec())
+        );
+        assert_eq!(
+            graph.block(pos_arm).operations[1].result.as_ref(),
+            Some(&pos_box)
+        );
     }
 }

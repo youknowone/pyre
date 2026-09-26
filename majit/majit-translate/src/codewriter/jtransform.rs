@@ -959,6 +959,7 @@ fn is_source_constant_variable(
                 | OpKind::ConstBool(_)
                 | OpKind::ConstFloat(_)
                 | OpKind::ConstStr(_)
+                | OpKind::ConstInternedStr(_)
                 | OpKind::ConstRef(_)
                 | OpKind::ConstRefNull
                 | OpKind::ConstNone
@@ -3234,6 +3235,17 @@ impl<'a> Transformer<'a> {
                 && self.get_value_kind_var(rhs) == 'r'
                 && !self.config.str_concat_helper.is_empty() =>
             {
+                // `rstr.py rtype_add` → `ll_strconcat`: both operands and
+                // the result are `Ptr(STR)`. Stamp the result so assembler
+                // coloring stays `'r'` (`residual_call_r_r`), matching
+                // `jtransform.py` `getkind(op.result.concretetype)`.
+                // `can_raise_memoryerror["stroruni.concat"]` selects
+                // `EF_ELIDABLE_OR_MEMORYERROR`, not `EF_ELIDABLE_CAN_RAISE`.
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::codewriter::type_state::ConcreteType::GcRef,
+                );
                 let target = CallTarget::function_path([self.config.str_concat_helper.as_str()]);
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 let mut ops = vec![funcptr_op];
@@ -3244,7 +3256,10 @@ impl<'a> Transformer<'a> {
                         descriptor: CallDescriptor::from_signature(
                             &[majit_ir::value::Type::Ref, majit_ir::value::Type::Ref],
                             majit_ir::value::Type::Ref,
-                            EffectInfo::new(ExtraEffect::ElidableCanRaise, OopSpecIndex::StrConcat),
+                            EffectInfo::new(
+                                ExtraEffect::ElidableOrMemoryError,
+                                OopSpecIndex::StrConcat,
+                            ),
                         ),
                         args_i: vec![],
                         args_r: vec![lhs.clone(), rhs.clone()],
@@ -5738,16 +5753,11 @@ impl<'a> Transformer<'a> {
         } = target
             && args.is_empty()
             && let ValueType::Ref(Some(owner)) = result_ty
-            && self.callcontrol.as_deref().is_some_and(|cc| {
-                crate::codewriter::assembler::bh_size_spec_from_callcontrol(cc, owner)
-                    .is_some_and(|spec| !spec.all_fielddescrs.is_empty())
-            })
+            && let Some(alloc_owner) = self.struct_ctor_alloc_owner(owner)
         {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
-                kind: OpKind::New {
-                    owner: owner.clone(),
-                },
+                kind: OpKind::New { owner: alloc_owner },
             }]);
         }
         // RPython `rtyper` lowers a heap-carried sum-type variant to
@@ -8929,6 +8939,29 @@ impl<'a> Transformer<'a> {
         ])
     }
 
+    /// Owner string `OpKind::New` can allocate for a niladic struct ctor.
+    ///
+    /// Layouts are keyed by [`struct_id_for_name`]. A qualified spelling
+    /// (`pyre_object::pyobject::PyObject`) and the leaf (`PyObject`) are one
+    /// struct when only the leaf is registered. A spec with no fields is not
+    /// allocatable: the collector would treat the object as pointer-free.
+    fn struct_ctor_alloc_owner(&self, owner: &str) -> Option<String> {
+        let allocable = |name: &str| {
+            self.callcontrol.as_deref().is_some_and(|cc| {
+                crate::codewriter::assembler::bh_size_spec_from_callcontrol(cc, name)
+                    .is_some_and(|spec| !spec.all_fielddescrs.is_empty())
+            })
+        };
+        if allocable(owner) {
+            return Some(owner.to_string());
+        }
+        let leaf = owner.rsplit("::").next().unwrap_or(owner);
+        if leaf != owner && allocable(leaf) {
+            return Some(leaf.to_string());
+        }
+        None
+    }
+
     /// Decide whether a `direct_call` is a transparent Rust prelude
     /// constructor that the frontend has already proved is not a real
     /// callable. Returns `true` iff every requirement holds, so the caller can
@@ -9840,6 +9873,7 @@ fn remap_op(
         | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
         | OpKind::ConstStr(_)
+        | OpKind::ConstInternedStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstNone

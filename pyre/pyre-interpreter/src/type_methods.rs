@@ -7566,9 +7566,18 @@ fn dict_subclass_uses_default_iter(other: PyObjectRef) -> bool {
     if std::ptr::eq(other_type.as_ptr() as *const _, dict_type as *const _) {
         return true;
     }
-    let other_iter =
-        unsafe { crate::baseobjspace::lookup_in_type(other_type.as_ptr(), "__iter__") };
-    let dict_iter = unsafe { crate::baseobjspace::lookup_in_type(dict_type, "__iter__") };
+    let other_iter = unsafe {
+        crate::baseobjspace::lookup_in_type(
+            other_type.as_ptr(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
+        )
+    };
+    let dict_iter = unsafe {
+        crate::baseobjspace::lookup_in_type(
+            dict_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
+        )
+    };
     match (other_iter, dict_iter) {
         (Some(a), Some(b)) => std::ptr::eq(a, b),
         _ => false,
