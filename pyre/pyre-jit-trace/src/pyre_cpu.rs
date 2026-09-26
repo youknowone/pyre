@@ -15,7 +15,6 @@
 
 use std::sync::{Arc, OnceLock};
 
-use majit_ir::operand::Operand;
 use majit_ir::{ArrayDescr, Descr, FieldDescr, GcRef, Type};
 use majit_metainterp::cpu::{Cpu, DefaultCpu, SpeculativeError};
 use pyre_object::lowlevel_string::{
@@ -173,9 +172,6 @@ fn item_index(index: i64) -> Option<usize> {
 }
 
 impl Cpu for PyreCpu {
-    fn cls_of_box(&self, box_: &Operand) -> i64 {
-        self.0.cls_of_box(box_)
-    }
     fn bh_classof(&self, gcref: GcRef) -> i64 {
         self.0.bh_classof(gcref)
     }

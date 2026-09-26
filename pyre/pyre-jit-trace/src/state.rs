@@ -8196,6 +8196,7 @@ fn reconstruct_inline_recipe(
             concrete_r: Vec::new(),
             nargs: 0,
             return_substitute: Some(instance),
+            len_tail: false,
         });
     }
     // An operator's tail (`crate::operator_continuation`) reconstructs no
@@ -8205,8 +8206,23 @@ fn reconstruct_inline_recipe(
     // resume runs it correctly, so decline the whole chain here -- named,
     // rather than as the `NoCodeForJitcodeIndex` every check below would give
     // it anyway.
+    // `capture_resumedata` keeps `operation.py len` on the framestack. This
+    // level is that tail: no code object, applied after `__len__` returns.
     if crate::operator_continuation::is_installed_level(frame.jitcode_index) {
-        decline!("OperatorTail");
+        return Some(ReconstructRecipe {
+            code_ptr: std::ptr::null(),
+            jitcode_index: frame.jitcode_index,
+            jitcode_pc: frame.pc,
+            nlocals: 0,
+            valuestackdepth: 0,
+            registers_i: Vec::new(),
+            registers_r: Vec::new(),
+            registers_f: Vec::new(),
+            concrete_r: Vec::new(),
+            nargs: 0,
+            return_substitute: None,
+            len_tail: true,
+        });
     }
     let py_pc =
         crate::py_coord::resume_py_pc_for_jitcode_word(frame.jitcode_index, frame.pc) as usize;
@@ -8569,6 +8585,7 @@ fn reconstruct_inline_recipe(
                 concrete_r,
                 nargs: frame_nlocals,
                 return_substitute: None,
+                len_tail: false,
             });
         }
         let RebuiltValue::Virtual(frame_vidx) = ref_values[frame_pos] else {
@@ -8709,6 +8726,7 @@ fn reconstruct_inline_recipe(
             concrete_r,
             nargs: frame_nlocals,
             return_substitute: None,
+            len_tail: false,
         });
     }
 
@@ -8860,6 +8878,7 @@ fn reconstruct_inline_recipe(
         concrete_r,
         nargs: frame_nlocals,
         return_substitute: None,
+        len_tail: false,
     })
 }
 

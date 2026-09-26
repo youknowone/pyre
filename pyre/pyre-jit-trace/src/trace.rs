@@ -1925,7 +1925,7 @@ fn carrier_py_frame_depth(carrier: &majit_metainterp::BridgeInlineCarrier) -> us
     carrier
         .recipes
         .iter()
-        .filter(|recipe| recipe.return_substitute.is_none())
+        .filter(|recipe| recipe.return_substitute.is_none() && !recipe.len_tail)
         .count()
 }
 
@@ -2097,6 +2097,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // each recipe's own resume point is what keeps that cover once the test
     // stops reading the whole code.
     for carried in carrier.recipes.iter() {
+        if carried.len_tail {
+            continue;
+        }
         let raw_code = carried.code_ptr as *const pyre_interpreter::CodeObject;
         let seed = (!raw_code.is_null())
             .then(|| crate::state::pyjitcode_for_code(carried.code_ptr))
@@ -2503,7 +2506,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
     // `drive_middle_frame_from_handler` would otherwise reject after
     // deeper uncatching frames have already been popped.
     for middle in middles {
-        if middle.return_substitute.is_some() {
+        if middle.return_substitute.is_some() || middle.len_tail {
             continue;
         }
         let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
@@ -2536,7 +2539,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
     }
     for i in (0..middles.len()).rev() {
         let middle = &middles[i];
-        if middle.return_substitute.is_some() {
+        if middle.return_substitute.is_some() || middle.len_tail {
             continue;
         }
         let middle_pjc =
@@ -2753,6 +2756,68 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
     }
 }
 
+/// `operation.py len` after the inlined `__len__` returns.
+///
+/// The tail level's jitcode is `-live-`, `residual_call_r_r bh_len_tail`,
+/// `ref_return`. `finishframe` (`pyjitpl.py`) writes the callee result into
+/// `code[position - 1]`; walking from the resume pc records that call on the
+/// same box, and a raise leaves through the residual's exception guard.
+fn walk_len_operator_tail<Sym: WalkSym>(
+    ctx: &mut TraceCtx,
+    session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
+    sym: &mut Sym,
+    root_pc: usize,
+    middle: &majit_metainterp::ReconstructRecipe,
+    paused_parents: &[majit_metainterp::ReconstructRecipe],
+    child_result: majit_ir::OpRef,
+) -> Option<Result<majit_ir::OpRef, (majit_ir::OpRef, crate::state::ConcreteValue)>> {
+    let middle_pjc = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)?;
+    let middle_entry = select_recipe_entry(
+        middle.jitcode_index,
+        middle_pjc.jitcode.index() as i32,
+        middle.jitcode_pc,
+    )?;
+    let middle_walk = crate::jitcode_dispatch::drive_bridge_middle_frame(
+        ctx,
+        session,
+        sym,
+        root_pc,
+        &middle_pjc,
+        0,
+        0,
+        middle_entry,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        0,
+        paused_parents,
+        child_result,
+    );
+    match middle_walk {
+        Some(Ok((
+            crate::jitcode_dispatch::DispatchOutcome::SubReturn {
+                result: Some(mid_result),
+            },
+            _,
+        ))) => Some(Ok(mid_result)),
+        Some(Ok((
+            crate::jitcode_dispatch::DispatchOutcome::SubRaise {
+                exc: raised,
+                exc_concrete: raised_concrete,
+            },
+            _,
+        ))) => Some(Err((raised, raised_concrete))),
+        _ => {
+            crate::jitcode_dispatch::census_record("P2Drain::LenTailWalkFailed");
+            None
+        }
+    }
+}
+
 /// Middle-frame drive for the DEFAULT drain: reconstruct one paused middle frame
 /// (`middle`), deliver its callee's `child_result` into its residual-call return
 /// register (`make_result_of_lastop`), and walk it forward.  `paused_parents`
@@ -2786,6 +2851,20 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     // `descr_call`'s tail: no frame to reconstruct and no bytecode to walk.
     // Discarding the child's result and answering with the instance IS its
     // whole body, so perform it here instead of driving a frame.
+    if middle.len_tail {
+        // `operation.py len` after `_len`. The tail is its own jitcode
+        // (`operator_continuation`); walk it from the resume pc with the
+        // child's box in the pending result register.
+        return walk_len_operator_tail(
+            ctx,
+            session,
+            sym,
+            root_pc,
+            middle,
+            paused_parents,
+            child_result,
+        );
+    }
     if let Some(instance) = middle.return_substitute {
         // `check_init_returned_none` still has to hold, and the resumed
         // `__init__` is being walked down an arm the loop never traced — the

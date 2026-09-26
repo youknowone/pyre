@@ -821,6 +821,10 @@ pub struct ReconstructRecipe {
     /// `locals_cells_stack_w` to rebuild.  Every other field above is unread
     /// when this is `Some`.
     pub return_substitute: Option<OpRef>,
+    /// `operation.py len` after `_len`. Not a Python frame: the drain runs
+    /// `bh_len_tail` on the callee's return. `capture_resumedata`
+    /// (`pyjitpl.py`) keeps that graph on the framestack.
+    pub len_tail: bool,
 }
 
 /// The decoded inline-callee recipes for one multi-frame

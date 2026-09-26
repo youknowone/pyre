@@ -7995,6 +7995,62 @@ mod tests {
     }
 
     #[test]
+    fn translate_op_vec_len_word_lowers_to_len() {
+        // `VecFieldPart::Len` is `rtype_len`: the result is the count, not
+        // the list. An inline field is `len(getattr(owner, field))`; a
+        // pointer to the Vec is `len(vec)`.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let inline = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("entries", Some("RDict".into()))
+                    .with_inline_vec(true)
+                    .with_vec_part(crate::model::VecFieldPart::Len),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated =
+            translate_op(&inline, &value_map, &empty_call_registry()).expect("inline Vec len read");
+        let names: Vec<&str> = translated.iter().map(|op| op.opname.as_str()).collect();
+        assert_eq!(names, vec!["getattr", "len"]);
+        let Hlvalue::Variable(ref list_v) = translated[0].result else {
+            panic!("getattr result must be the list");
+        };
+        let Hlvalue::Variable(ref len_arg) = translated[1].args[0] else {
+            panic!("len argument must be the list");
+        };
+        assert_eq!(list_v.id(), len_arg.id());
+        let Hlvalue::Variable(ref len_res) = translated[1].result else {
+            panic!("len result must be a variable");
+        };
+        let Hlvalue::Variable(mapped) = value_map.get(&vars[2]).unwrap() else {
+            panic!("field-read result must map to a variable");
+        };
+        assert_eq!(len_res.id(), mapped.id());
+
+        let word = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("len", Some("alloc::vec::Vec".into()))
+                    .with_vec_part(crate::model::VecFieldPart::Len),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated =
+            translate_op(&word, &value_map, &empty_call_registry()).expect("Vec len word");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "len");
+    }
+
+    #[test]
     fn translate_op_field_read_lowers_to_getattr() {
         // FieldRead → flowspace `getattr(base, ConstValue::ByteStr(name))`
         // mirroring `flowspace/operation.py GetAttr.opname = 'getattr'`.
