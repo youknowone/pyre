@@ -121,6 +121,6 @@ file against CPython and every pyre backend first.
 
 ## Source
 
-The base corpus came from `RustPython/extra_tests/snippets/`. Future updates
-should pull upstream changes while preserving generic pyre-authored gap tests;
-only JIT/GC/PyPy-internal additions belong in `parity_tests/`.
+`snippets/` holds pyre-authored CPython-compatibility gaps. Language, builtin,
+and stdlib behaviour already covered by `lib-python/3/test/` stays there.
+Only JIT/GC/PyPy-internal additions belong in `parity_tests/`.
