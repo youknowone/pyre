@@ -50,7 +50,9 @@ fn rdict_string_and_objectkey_instantiations_resolve_distinct_eq() {
     );
 
     let string_eq = specialized.iter().any(|f| graph_calls_str_eq(&f.graph));
-    let object_eq = specialized.iter().any(|f| graph_calls_object_key_eq(&f.graph));
+    let object_eq = specialized
+        .iter()
+        .any(|f| graph_calls_object_key_eq(&f.graph));
     assert!(
         string_eq,
         "String-key instantiation did not reach <str as PartialEq>::eq"
@@ -68,20 +70,24 @@ fn rdict_string_and_objectkey_instantiations_resolve_distinct_eq() {
 }
 
 fn graph_calls_str_eq(graph: &majit_translate::model::FunctionGraph) -> bool {
-    graph.blocks.iter().flat_map(|block| &block.operations).any(|op| {
-        match &op.kind {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| match &op.kind {
             OpKind::BinOp { op, .. } if op == "eq" => true,
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 ..
-            } => segments.len() >= 4
-                && segments[segments.len() - 4] == "str"
-                && segments[segments.len() - 3] == "traits"
-                && segments[segments.len() - 2] == "<Impl>"
-                && segments[segments.len() - 1] == "eq",
+            } => {
+                segments.len() >= 4
+                    && segments[segments.len() - 4] == "str"
+                    && segments[segments.len() - 3] == "traits"
+                    && segments[segments.len() - 2] == "<Impl>"
+                    && segments[segments.len() - 1] == "eq"
+            }
             _ => false,
-        }
-    })
+        })
 }
 
 /// `fn mk<T: Default>() -> T` at `T = i64` and `T = String` is two graphs.
@@ -277,9 +283,11 @@ fn unit_field_borrow_is_void_and_emits_no_getfield() {
 }
 
 fn graph_reads_field(graph: &FunctionGraph, name: &str) -> bool {
-    graph.blocks.iter().flat_map(|block| &block.operations).any(|op| {
-        matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == name)
-    })
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == name))
 }
 
 fn replace_first_arg(graph: &FunctionGraph) -> &majit_translate::flowspace::model::Variable {
@@ -380,26 +388,31 @@ fn graph_calls_borrow(graph: &majit_translate::model::FunctionGraph) -> bool {
 }
 
 fn graph_calls_string_eq_impl(graph: &majit_translate::model::FunctionGraph) -> bool {
-    graph.blocks.iter().flat_map(|block| &block.operations).any(|op| {
-        match &op.kind {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| match &op.kind {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 ..
-            } => segments.len() >= 4
-                && segments[segments.len() - 4] == "str"
-                && segments[segments.len() - 3] == "traits"
-                && segments[segments.len() - 2] == "<Impl>"
-                && (segments[segments.len() - 1] == "eq"
-                    || segments[segments.len() - 1].starts_with("eq__s")),
+            } => {
+                segments.len() >= 4
+                    && segments[segments.len() - 4] == "str"
+                    && segments[segments.len() - 3] == "traits"
+                    && segments[segments.len() - 2] == "<Impl>"
+                    && (segments[segments.len() - 1] == "eq"
+                        || segments[segments.len() - 1].starts_with("eq__s"))
+            }
             OpKind::BinOp { op, .. } if op == "eq" => true,
             _ => false,
-        }
-    })
+        })
 }
 
 fn mk_fixture_llbc() -> String {
     use serde_json::json;
-    let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let span =
+        json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
     let meta = |path: &[&str], local: bool| {
         json!({
             "name": path.iter().map(|seg| json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
@@ -413,9 +426,7 @@ fn mk_fixture_llbc() -> String {
     let string_ty = json!({"Adt": {"id": {"Adt": 0}, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}});
     let tvar = json!({"TypeVar": {"Bound": [0, 0]}});
     let empty_g = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
-    let impl_ref = |id: u64, ty: &serde_json::Value| {
-        json!({"kind": {"TraitImpl": {"id": id, "generics": {"regions": [], "types": [ty], "const_generics": [], "trait_refs": []}}}})
-    };
+    let impl_ref = |id: u64, ty: &serde_json::Value| json!({"kind": {"TraitImpl": {"id": id, "generics": {"regions": [], "types": [ty], "const_generics": [], "trait_refs": []}}}});
     let opaque = |id: u64, path: &[&str], out: &serde_json::Value| {
         json!({
             "def_id": id,
@@ -513,7 +524,8 @@ fn mk_fixture_llbc() -> String {
 
 fn put_fixture_llbc() -> String {
     use serde_json::json;
-    let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let span =
+        json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
     let meta = |path: &[&str], local: bool| {
         json!({
             "name": path.iter().map(|seg| json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
@@ -528,9 +540,7 @@ fn put_fixture_llbc() -> String {
     let tvar = json!({"TypeVar": {"Bound": [0, 0]}});
     let slot_ty = json!({"Ref": {"region": "Erased", "ty": tvar, "kind": "Mut"}});
     let place = |id: u64, ty: &serde_json::Value| json!({"kind": {"Local": id}, "ty": ty});
-    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
-        json!({"index": index, "name": name, "span": span, "ty": ty})
-    };
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| json!({"index": index, "name": name, "span": span, "ty": ty});
     let impl_ref = json!({
         "kind": {"TraitImpl": {"id": 0, "generics": {"regions": [], "types": [unit], "const_generics": [], "trait_refs": []}}}
     });
@@ -683,7 +693,8 @@ fn put_fixture_llbc() -> String {
 
 fn unit_field_fixture_llbc() -> String {
     use serde_json::json;
-    let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let span =
+        json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
     let meta = |path: &[&str], local: bool| {
         json!({
             "name": path.iter().map(|seg| json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
@@ -699,9 +710,7 @@ fn unit_field_fixture_llbc() -> String {
     let s_ty = json!({"Adt": {"id": {"Adt": 0}, "generics": empty_g}});
     let s_ref = json!({"Ref": ["Erased", s_ty, "Mut"]});
     let place = |id: u64, ty: &serde_json::Value| json!({"kind": {"Local": id}, "ty": ty});
-    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
-        json!({"index": index, "name": name, "span": span, "ty": ty})
-    };
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| json!({"index": index, "name": name, "span": span, "ty": ty});
     let field_u = json!({
         "kind": {"Projection": [
             {"kind": {"Projection": [place(1, &s_ref), "Deref"]}, "ty": s_ty},
@@ -778,8 +787,11 @@ fn unit_field_fixture_llbc() -> String {
 }
 
 fn graph_calls_bare_malloc_typed(graph: &FunctionGraph) -> bool {
-    graph.blocks.iter().flat_map(|block| &block.operations).any(|op| {
-        match &op.kind {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| match &op.kind {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 ..
@@ -788,13 +800,13 @@ fn graph_calls_bare_malloc_typed(graph: &FunctionGraph) -> bool {
                     && segments.iter().any(|segment| segment == "lltype")
             }
             _ => false,
-        }
-    })
+        })
 }
 
 fn malloc_typed_fixture_llbc() -> String {
     use serde_json::json;
-    let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let span =
+        json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
     let meta = |path: &[&str], local: bool| {
         json!({
             "name": path.iter().map(|seg| json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
@@ -831,9 +843,7 @@ fn malloc_typed_fixture_llbc() -> String {
         })
     };
     let place = |id: u64, ty: &serde_json::Value| json!({"kind": {"Local": id}, "ty": ty});
-    let local = |index: u64, ty: &serde_json::Value| {
-        json!({"index": index, "name": null, "span": span, "ty": ty})
-    };
+    let local = |index: u64, ty: &serde_json::Value| json!({"index": index, "name": null, "span": span, "ty": ty});
     let wrap_body = json!({
         "Unstructured": {
             "span": span,
@@ -957,7 +967,8 @@ fn malloc_typed_fixture_llbc() -> String {
 }
 
 fn path_is_object_key_eq(segments: &[String]) -> bool {
-    segments.iter().any(|segment| segment == "ObjectKey") && segments.last().map(String::as_str) == Some("eq")
+    segments.iter().any(|segment| segment == "ObjectKey")
+        && segments.last().map(String::as_str) == Some("eq")
 }
 
 fn graph_calls_object_key_eq(graph: &majit_translate::model::FunctionGraph) -> bool {

@@ -320,8 +320,7 @@ pub(crate) fn is_identity_borrow_pair(
 ) -> bool {
     let self_ty = peel_ty(self_ty, llbc, 0);
     let borrowed = peel_ty(borrowed, llbc, 0);
-    if ref_pointee(self_ty, "Shared")
-        .is_some_and(|pointee| ty_eq(pointee, borrowed, llbc))
+    if ref_pointee(self_ty, "Shared").is_some_and(|pointee| ty_eq(pointee, borrowed, llbc))
         || ref_pointee(self_ty, "Mut").is_some_and(|pointee| ty_eq(pointee, borrowed, llbc))
     {
         return true;
@@ -332,9 +331,8 @@ pub(crate) fn is_identity_borrow_pair(
     if is_named_adt(self_ty, llbc, "alloc::string::String") && is_builtin(borrowed, "Str") {
         return true;
     }
-    vec_elem(self_ty, llbc).is_some_and(|elem| {
-        slice_elem(borrowed, llbc).is_some_and(|item| ty_eq(elem, item, llbc))
-    })
+    vec_elem(self_ty, llbc)
+        .is_some_and(|elem| slice_elem(borrowed, llbc).is_some_and(|item| ty_eq(elem, item, llbc)))
 }
 
 fn peel_ty<'a>(
@@ -354,7 +352,9 @@ fn peel_ty<'a>(
             .map(|body| peel_ty(body, llbc, depth + 1))
             .unwrap_or(v);
     }
-    if let Some(arr) = obj.get("HashConsedValue").and_then(serde_json::Value::as_array)
+    if let Some(arr) = obj
+        .get("HashConsedValue")
+        .and_then(serde_json::Value::as_array)
         && arr.len() == 2
     {
         return peel_ty(&arr[1], llbc, depth + 1);
@@ -385,7 +385,10 @@ fn is_builtin(node: &serde_json::Value, name: &str) -> bool {
 }
 
 fn is_named_adt(node: &serde_json::Value, llbc: &majit_charon_reader::Llbc, path: &str) -> bool {
-    let Some(id) = node.pointer("/Adt/id/Adt").and_then(serde_json::Value::as_u64) else {
+    let Some(id) = node
+        .pointer("/Adt/id/Adt")
+        .and_then(serde_json::Value::as_u64)
+    else {
         return false;
     };
     llbc.type_by_id(id)
