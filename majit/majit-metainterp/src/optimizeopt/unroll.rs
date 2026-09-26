@@ -1073,23 +1073,6 @@ impl UnrollOptimizer {
                 &mut self.quasi_immutable_deps,
                 &opt_p1.quasi_immutable_deps,
             );
-            // RPython parity: Phase 1 optimizer may discover new constants
-            // via make_constant (e.g., constant-folded heap reads, guard
-            // class pointers). These live on the operand's forwarded chain
-            // (and in `ctx.const_pool` for const-namespace OpRefs) but
-            // not in `consts_p1` (which was only seeded from the input
-            // constants). Merge them back so
-            // build_short_preamble_from_exported_boxes can capture all
-            // constants referenced by short preamble ops.
-            if let Some(ref final_ctx) = opt_p1.final_ctx {
-                // history.py:220 box.type parity: every `Value` carries its
-                // Const class identity intrinsically; no companion type map
-                // needs threading alongside.
-                crate::optimizeopt::optimizer::merge_backend_constants_from_ctx(
-                    final_ctx,
-                    &mut consts_p1,
-                );
-            }
             let p1_ni = opt_p1.final_num_inputs();
 
             match opt_p1.exported_loop_state.take() {
@@ -1543,17 +1526,6 @@ impl UnrollOptimizer {
         // disjoint Phase 2 inputarg OpRefs via the inputarg_base parameter.
         // Phase 2 inputarg OpRefs at [phase2_inputarg_base..+body_num_inputs)
         // flow directly into the assembly without translation.
-        // Phase 2 may discover new constants via make_constant (e.g., guard
-        // class pointers from collect_use_box_guards).
-        // Merge back into consts_p2 so the backend can resolve them.
-        if let Some(ref final_ctx) = opt_p2.final_ctx {
-            // history.py:220 box.type parity: every `Value` carries its
-            // Const class identity intrinsically.
-            crate::optimizeopt::optimizer::merge_backend_constants_from_ctx(
-                final_ctx,
-                &mut consts_p2,
-            );
-        }
         let body_terminal_op = opt_p2.terminal_op.clone();
         let p2_ni = opt_p2.final_num_inputs();
         self.all_descrs = std::mem::take(&mut opt_p2.all_descrs);
@@ -2344,10 +2316,6 @@ impl UnrollOptimizer {
                 seen.insert(op.pos().get().raw())
             });
         }
-        crate::optimizeopt::optimizer::sanitize_backend_constants_for_ops(
-            combined.iter().map(|op| &**op),
-            &mut consts_p2,
-        );
         if crate::debug::have_debug_prints() {
             let _s = crate::debug::scope("jit-log-opt-loop");
             crate::debug::debug_print("--- peeled trace (assembled) ---");
@@ -4271,7 +4239,7 @@ impl OptUnroll {
             "inline_short_preamble: short_preamble.constants must be empty in production — \
              history.py:227/268/314 inline-Const is the single source of truth; \
              a non-empty entry indicates a stale legacy producer that would never reach \
-             the backend (merge_backend_constants_from_ctx no longer exports ctx.const_pool)"
+             the backend (nothing exports ctx.const_pool)"
         );
 
         let mut mapping: crate::FxIndexMap<OpRef, OpRef> = crate::FxIndexMap::default();

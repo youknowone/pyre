@@ -3377,8 +3377,6 @@ mod tests {
                 ],
             )],
         );
-        let op_pos = ops[0].pos().get().raw();
-
         let mut opt = Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.record_call_pure_result(vec![Value::Int(0xCAFE), Value::Int(7)], Value::Int(42));
@@ -3390,7 +3388,10 @@ mod tests {
             .expect("test: unexpected InvalidLoop");
 
         assert!(result.is_empty());
-        assert_eq!(constants.get(&op_pos), Some(&majit_ir::Value::Int(42)));
+        assert_eq!(
+            ops[0].forwarded().borrow().const_value(),
+            Some(majit_ir::Value::Int(42))
+        );
     }
 
     /// REF analog of `test_cond_call_value_uses_call_pure_results_*` /
