@@ -693,12 +693,6 @@ unsafe fn object_ref_gcarray_items<'a>(array: *const usize) -> &'a [PyObjectRef]
     }
 }
 
-/// [`publish_roots`] over the lowered slice array.  Publishing writes the
-/// root stack and queries the GC for nothing, so the array stays put.
-pub extern "C" fn publish_roots_jit_abi(roots: *const usize) -> usize {
-    publish_roots(unsafe { object_ref_gcarray_items(roots) })
-}
-
 /// [`pin_roots`] over the lowered slice array.  Every item is published
 /// before the normalize safepoints run, so the array is not read after them.
 pub extern "C" fn pin_roots_jit_abi(roots: *const usize) -> usize {
@@ -1398,7 +1392,7 @@ mod tests {
         let before = shadow_stack_len();
         let array: [usize; 3] = [2, dummy(0x10) as usize, dummy(0x20) as usize];
         let word = push_roots_jit_abi();
-        let base = publish_roots_jit_abi(array.as_ptr());
+        let base = publish_roots_jit_abi(array.as_ptr() as i64) as usize;
         assert_eq!(base, before);
         assert_eq!(root_scope_get_jit_abi(word, base), dummy(0x10));
         assert_eq!(root_scope_get_jit_abi(word, base + 1), dummy(0x20));
