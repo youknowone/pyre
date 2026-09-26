@@ -16668,6 +16668,7 @@ impl<'a> Lowering<'a> {
                         tyref_to_value_type_with(&field.ty, self.llbc, self.tombstoned_leaves);
                     spans.push(MoveSpan {
                         offset,
+                        bytes: itemsize,
                         kind: SpanKind::Field {
                             name,
                             owner: owner.clone(),
@@ -16682,6 +16683,10 @@ impl<'a> Lowering<'a> {
                 Some(MovePlan { ctor_id: id, spans })
             }
             TypeDeclKind::Enum(variants) => {
+                let name_path = td.item_meta.name_path();
+                let leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
+                let canon = strip_crate_prefix(&name_path);
+                let base_id = majit_ir::descr::StructId::from_canonical(&canon);
                 let mut candidates: Vec<MoveSpan> = Vec::new();
                 if let (Some(offset), Some(int_ty)) =
                     (layout.discriminant_offset(), layout.discriminant_int_type())
@@ -16696,52 +16701,64 @@ impl<'a> Lowering<'a> {
                     } else {
                         ValueType::Unsigned
                     };
+                    // `getfield` of `__discriminant`. `raw_load` requires an
+                    // int-kind address; the slot is a reference.
                     candidates.push(MoveSpan {
                         offset,
-                        kind: SpanKind::Raw {
-                            item_ty,
-                            itemsize,
-                            is_signed: signed,
+                        bytes: itemsize,
+                        kind: SpanKind::Field {
+                            name: "__discriminant".to_string(),
+                            owner: leaf.clone(),
+                            owner_id: base_id,
+                            ty: item_ty,
                         },
                     });
                 }
                 for (vidx, variant) in variants.iter().enumerate() {
+                    let variant_owner = format!("{leaf}::{}", variant.name);
+                    let variant_id = majit_ir::descr::StructId::from_canonical(&format!(
+                        "{canon}::{}",
+                        variant.name
+                    ));
                     for (i, field) in variant.fields.iter().enumerate() {
                         let Some(offset) = layout.field_offset(vidx, i) else {
                             continue;
                         };
-                        let Some(node) = tyref_node(&field.ty, self.llbc) else {
+                        let Some((_item_ty, itemsize, _is_signed)) =
+                            self.span_raw_for_ty(&field.ty)
+                        else {
                             continue;
                         };
-                        let Some((item_ty, itemsize, is_signed)) =
-                            json_ty_raw_store_descr(node, self.llbc)
-                        else {
-                            return None;
-                        };
                         if itemsize == 0 || itemsize > 8 {
-                            return None;
+                            continue;
                         }
+                        let name = field.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                        let value_ty = tyref_to_value_type_with(
+                            &field.ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                        );
                         candidates.push(MoveSpan {
                             offset,
-                            kind: SpanKind::Raw {
-                                item_ty,
-                                itemsize,
-                                is_signed,
+                            bytes: itemsize,
+                            kind: SpanKind::Field {
+                                name,
+                                owner: variant_owner.clone(),
+                                owner_id: variant_id,
+                                ty: value_ty,
                             },
                         });
                     }
                 }
                 candidates.sort_by(|left, right| {
-                    left.offset
-                        .cmp(&right.offset)
-                        .then(right.kind.size().cmp(&left.kind.size()))
+                    left.offset.cmp(&right.offset).then(right.bytes.cmp(&left.bytes))
                 });
                 let mut spans: Vec<MoveSpan> = Vec::new();
                 for candidate in candidates {
                     let start = candidate.offset;
-                    let end = start + candidate.kind.size() as u64;
+                    let end = start + candidate.bytes as u64;
                     let overlaps = spans.iter().any(|kept| {
-                        let kept_end = kept.offset + kept.kind.size() as u64;
+                        let kept_end = kept.offset + kept.bytes as u64;
                         start < kept_end && kept.offset < end
                     });
                     if !overlaps {
@@ -16901,6 +16918,29 @@ impl<'a> Lowering<'a> {
             self.emit_span_write(mir_bb, &result, span, part.clone());
         }
         result
+    }
+
+    /// Byte width of one enum field for a whole-value move. A literal uses
+    /// its Charon size. A thin pointer or a small ADT (a `Box`, a C-like
+    /// tag) is that many bytes, so a 16-byte `Union` still moves field by
+    /// field when a payload is not an integer.
+    fn span_raw_for_ty(&self, ty: &TyRef) -> Option<(ValueType, usize, bool)> {
+        if let Some(node) = tyref_node(ty, self.llbc) {
+            if let Some(descr) = json_ty_raw_store_descr(node, self.llbc) {
+                return Some(descr);
+            }
+        }
+        if tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
+            return Some((ValueType::Ref(None), crate::layout::target_word_size(), false));
+        }
+        let id = self.tyref_adt_def_id(ty)?;
+        let td = self.llbc.type_by_id(id)?;
+        let target = std::env::var("TARGET").unwrap_or_default();
+        let size = td.layout_for_target(&target)?.size?;
+        if size == 0 || size > 8 {
+            return None;
+        }
+        Some((ValueType::Unsigned, size as usize, false))
     }
 
     fn raw_word_descr(&self, ty: &TyRef) -> Option<(ValueType, usize, bool)> {
@@ -27670,6 +27710,8 @@ struct MovePlan {
 
 struct MoveSpan {
     offset: u64,
+    /// Physical width. Overlap uses this, not the JIT field's word size.
+    bytes: usize,
     kind: SpanKind,
 }
 
