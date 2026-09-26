@@ -81,6 +81,17 @@ impl SpecQueue {
     }
 }
 
+/// The declaration carries an `Unstructured` body in this LLBC, so there
+/// is a graph to copy. An opaque declaration has none.
+pub(crate) fn decl_has_unstructured_body(fd: &FunDecl) -> bool {
+    fd.body.as_ref().is_some_and(|raw| {
+        raw.get()
+            .trim_start()
+            .strip_prefix('{')
+            .is_some_and(|rest| rest.trim_start().starts_with("\"Unstructured\""))
+    })
+}
+
 /// The declaration has type parameters or trait clauses, so one shared
 /// body is not one instantiation.
 pub(crate) fn decl_is_generic(fd: &FunDecl) -> bool {

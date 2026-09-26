@@ -15863,6 +15863,11 @@ impl<'a> Lowering<'a> {
         if !crate::front::clause_spec::decl_is_generic(fd) {
             return None;
         }
+        // Only a body this LLBC extracted can be copied. An opaque
+        // declaration (a foreign crate's or std's) keeps its bare path.
+        if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+            return None;
+        }
         // Inside a spec copy every concrete instantiation gets its own
         // graph, including a `dont_look_inside` helper with no trait
         // clauses. Outside, only a clause-bearing callee with a TraitImpl
