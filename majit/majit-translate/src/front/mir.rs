@@ -7035,11 +7035,74 @@ impl<'a> Lowering<'a> {
                         )),
                         Operand::Const(_) => None,
                     };
+                    let src_int = match &operand {
+                        Operand::Copy(p) | Operand::Move(p) => {
+                            int_cast_size_and_sign(&p.ty, self.llbc)
+                        }
+                        Operand::Const(_) => None,
+                    };
                     let src_kind = self.operand_value_kind(&operand);
                     let src_root = self.operand_class_root(&operand);
                     let arg = self.resolve_operand(mir_bb, operand)?;
                     let dst_kind =
                         tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves);
+                    // An integer cast to a narrower unsigned type keeps only
+                    // the low bytes. The JIT carries every integer in one
+                    // machine word, so the truncation has to be an explicit
+                    // `int_and` (`jtransform.py _int_to_int_cast`); aliasing
+                    // the operand would leave the high bits in place.
+                    if let (Some(src), Some(dst)) =
+                        (src_int, int_cast_size_and_sign(dest_ty, self.llbc))
+                        && let Some(IntToIntCast::And(mask)) =
+                            int_to_int_cast(src, dst, crate::layout::target_word_size() as u64)
+                    {
+                        let bb_id = self.block_id[mir_bb];
+                        // `and_(r_uint, r_uint)` keeps the Unsigned
+                        // annotation the destination has; a signed operand
+                        // is retyped first through the same `r_uint` marker
+                        // the same-width signedness flip below uses.
+                        let lhs = if src.1 {
+                            arg
+                        } else {
+                            let unsigned = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(unsigned.clone()),
+                                kind: OpKind::Call {
+                                    target: CallTarget::FunctionPath {
+                                        segments: ["rpython", "rlib", "rarithmetic", "r_uint"]
+                                            .into_iter()
+                                            .map(str::to_string)
+                                            .collect(),
+                                        fun_decl_id: None,
+                                    },
+                                    args: crate::model::call_args(vec![arg]),
+                                    result_ty: ValueType::Unsigned,
+                                },
+                            });
+                            unsigned
+                        };
+                        let mask_var = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(mask_var.clone()),
+                            kind: OpKind::ConstUInt(mask),
+                        });
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        return Ok((
+                            Some(OpKind::BinOp {
+                                op: "and".to_string(),
+                                lhs,
+                                rhs: mask_var,
+                                result_ty: ValueType::Unsigned,
+                            }),
+                            res,
+                        ));
+                    }
                     // The Rust-only current-address adapter is erased as a
                     // whole GCREF identity.  Its `ptr -> usize -> ptr`
                     // round-trip exists only to call the host GC query; once
@@ -28303,6 +28366,81 @@ fn tyref_exact_layout_size(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
 /// owner in the path preserves the callable identity that keys
 /// `rbuiltin.py::BUILTIN_TYPER`; a bare leaf can collide with an unrelated
 /// Rust function named `float` or `int` in the flat call registry.
+/// `rffi.size_and_sign(T)` of a Rust integer literal type: its byte size and
+/// whether it is unsigned. `None` for anything but a `{"Int": _}` /
+/// `{"UInt": _}` literal (`bool` and `char` included, which do not reach an
+/// integer `and_` without their own conversion first).
+fn int_cast_size_and_sign(ty: &TyRef, llbc: &Llbc) -> Option<(u64, bool)> {
+    let lit = tyref_node(ty, llbc)?
+        .as_object()?
+        .get("Literal")?
+        .as_object()?;
+    let (atom, unsigned) = if let Some(atom) = lit.get("UInt").and_then(serde_json::Value::as_str) {
+        (atom, true)
+    } else {
+        (lit.get("Int").and_then(serde_json::Value::as_str)?, false)
+    };
+    let size = match atom {
+        "I8" | "U8" => 1,
+        "I16" | "U16" => 2,
+        "I32" | "U32" => 4,
+        "I64" | "U64" => 8,
+        "I128" | "U128" => 16,
+        "Isize" | "Usize" => crate::layout::target_word_size() as u64,
+        _ => return None,
+    };
+    Some((size, unsigned))
+}
+
+/// The operation `jtransform.py _int_to_int_cast` rewrites an integer
+/// `force_cast` into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IntToIntCast {
+    /// The destination holds every source value: no operation.
+    Noop,
+    /// `int_and(v, mask)` — narrowing to an unsigned type.
+    And(u64),
+    /// `int_signext(v, numbytes)` — narrowing to a signed type.
+    Signext(u64),
+}
+
+/// `jtransform.py _int_to_int_cast` for a cast between two integer types of
+/// at most `word` bytes, given as `(size, unsigned)` pairs
+/// (`rffi.size_and_sign`). `None` for a longlong operand, whose
+/// `truncate_longlong_to_int` / `cast_*_to_*longlong` legs this does not
+/// cover.
+fn int_to_int_cast(src: (u64, bool), dst: (u64, bool), word: u64) -> Option<IntToIntCast> {
+    let (size1, unsigned1) = src;
+    let (size2, unsigned2) = dst;
+    if size1 > word || size2 > word {
+        return None;
+    }
+    // the target type is LONG or ULONG
+    if size2 == word {
+        return Some(IntToIntCast::Noop);
+    }
+    // `rarithmetic.integer_bounds`
+    let integer_bounds = |size: u64, unsigned: bool| -> (i128, i128) {
+        let bits = 8 * size as u32;
+        if unsigned {
+            (0, (1i128 << bits) - 1)
+        } else {
+            (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+        }
+    };
+    let (min1, max1) = integer_bounds(size1, unsigned1);
+    let (min2, max2) = integer_bounds(size2, unsigned2);
+    // the target type includes the source range
+    if min2 <= min1 && max1 <= max2 {
+        return Some(IntToIntCast::Noop);
+    }
+    Some(if min2 != 0 {
+        IntToIntCast::Signext(size2)
+    } else {
+        IntToIntCast::And(((1u128 << (8 * size2)) - 1) as u64)
+    })
+}
+
 fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
     let (s, d) = (value_type_bank(src), value_type_bank(dst));
     let lltype = |name: &str| -> Vec<String> {
@@ -40958,6 +41096,67 @@ mod tests {
     /// assigned to — Rust does not treat shifted-out bits as an overflow, so
     /// `200u8 << 1` is a legal const equal to 144, not 400.  rustc truncates
     /// to the destination type and so must the fold.
+    /// `test_flatten.py test_force_cast_ints` on a 64-bit word.
+    #[test]
+    fn int_to_int_cast_follows_the_force_cast_table() {
+        use super::{IntToIntCast, int_to_int_cast};
+        const SCHAR: (u64, bool) = (1, false);
+        const UCHAR: (u64, bool) = (1, true);
+        const SHORT: (u64, bool) = (2, false);
+        const USHORT: (u64, bool) = (2, true);
+        const LONG: (u64, bool) = (8, false);
+        const ULONG: (u64, bool) = (8, true);
+        let noop = Some(IntToIntCast::Noop);
+        let and = |m| Some(IntToIntCast::And(m));
+        let signext = |n| Some(IntToIntCast::Signext(n));
+        for (from, to, expected) in [
+            (SCHAR, SCHAR, noop.clone()),
+            (SCHAR, UCHAR, and(255)),
+            (SCHAR, SHORT, noop.clone()),
+            (SCHAR, USHORT, and(65535)),
+            (SCHAR, LONG, noop.clone()),
+            (SCHAR, ULONG, noop.clone()),
+            (UCHAR, SCHAR, signext(1)),
+            (UCHAR, UCHAR, noop.clone()),
+            (UCHAR, SHORT, noop.clone()),
+            (UCHAR, USHORT, noop.clone()),
+            (UCHAR, LONG, noop.clone()),
+            (UCHAR, ULONG, noop.clone()),
+            (SHORT, SCHAR, signext(1)),
+            (SHORT, UCHAR, and(255)),
+            (SHORT, SHORT, noop.clone()),
+            (SHORT, USHORT, and(65535)),
+            (SHORT, LONG, noop.clone()),
+            (SHORT, ULONG, noop.clone()),
+            (USHORT, SCHAR, signext(1)),
+            (USHORT, UCHAR, and(255)),
+            (USHORT, SHORT, signext(2)),
+            (USHORT, USHORT, noop.clone()),
+            (USHORT, LONG, noop.clone()),
+            (USHORT, ULONG, noop.clone()),
+            (LONG, SCHAR, signext(1)),
+            (LONG, UCHAR, and(255)),
+            (LONG, SHORT, signext(2)),
+            (LONG, USHORT, and(65535)),
+            (LONG, LONG, noop.clone()),
+            (LONG, ULONG, noop.clone()),
+            (ULONG, SCHAR, signext(1)),
+            (ULONG, UCHAR, and(255)),
+            (ULONG, SHORT, signext(2)),
+            (ULONG, USHORT, and(65535)),
+            (ULONG, LONG, noop.clone()),
+            (ULONG, ULONG, noop.clone()),
+            // 32-bit halves: `i64 as u32` masks, `i64 as i32` re-extends.
+            (LONG, (4, true), and(0xffff_ffff)),
+            (LONG, (4, false), signext(4)),
+            ((4, false), (4, true), and(0xffff_ffff)),
+        ] {
+            assert_eq!(int_to_int_cast(from, to, 8), expected, "{from:?} -> {to:?}");
+        }
+        // A 128-bit operand is the longlong leg, not covered here.
+        assert_eq!(int_to_int_cast((16, false), UCHAR, 8), None);
+    }
+
     #[test]
     fn const_narrow_to_target_truncates_to_the_destination_width() {
         use super::{ConstLit, const_narrow_to_target};
