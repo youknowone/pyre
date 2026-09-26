@@ -15514,18 +15514,14 @@ pub(crate) unsafe fn direct_member_delete(
             };
             Ok(pyre_object::w_none())
         }
-        pyre_object::MEMBER_UNICODE_ERROR_START => {
-            unsafe {
-                pyre_object::interp_exceptions::w_exception_set_start(obj, pyre_object::w_none())
-            };
-            Ok(pyre_object::w_none())
-        }
-        pyre_object::MEMBER_UNICODE_ERROR_END => {
-            unsafe {
-                pyre_object::interp_exceptions::w_exception_set_end(obj, pyre_object::w_none())
-            };
-            Ok(pyre_object::w_none())
-        }
+        // `start` and `end` hold a plain index, not an object slot, so there is
+        // no null to store and the delete is refused with the same wording as
+        // `__suppress_context__`.  `exception_attr_delete` already answers this
+        // way for the instance-attribute path; the descriptor is the live writer
+        // once the name resolves through the type, so it has to agree.
+        pyre_object::MEMBER_UNICODE_ERROR_START | pyre_object::MEMBER_UNICODE_ERROR_END => Err(
+            crate::PyError::type_error("can't delete numeric/char attribute"),
+        ),
         pyre_object::MEMBER_UNICODE_ERROR_REASON => {
             unsafe {
                 pyre_object::interp_exceptions::w_exception_set_reason(obj, pyre_object::w_none())
@@ -17771,7 +17767,10 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                     // attributes" suffix: `_PyObject_GenericSetAttrWithDict`
                     // adds that on the store path only.
                     None => Err(crate::baseobjspace::raiseattrerror(
-                        obj, slot_name, None, false,
+                        obj,
+                        slot_name,
+                        None,
+                        crate::baseobjspace::AttrErrorSite::Get,
                     )),
                 }
             }),

@@ -144,54 +144,124 @@ fn is_callable(obj: PyObjectRef) -> bool {
 struct CodecException {
     w_exc: PyObjectRef,
     w_obj: PyObjectRef,
-    w_end: PyObjectRef,
     start: usize,
     end: usize,
     kind: Option<pyre_object::interp_exceptions::ExcKind>,
 }
 
+/// The refusal every handler raises for an argument it cannot use.
+///
+/// `replace_errors`, `xmlcharrefreplace_errors`, `backslashreplace_errors`,
+/// `namereplace_errors`, `surrogatepass_errors` and `surrogateescape_errors` each
+/// write `oefmt(space.w_TypeError, "don't know how to handle %T in error
+/// callback", w_exc)` inline, so there is no such helper upstream; it exists only
+/// because Rust has no `%T` directive.  What `%T` names is the Python-visible
+/// type, which is why the message carries neither the word "exception" nor
+/// `ob_type`'s answer -- `ob_type` names the storage layout, and an instance of a
+/// plain class shares that with `object`.
+fn wrong_exception_type(w_exc: PyObjectRef) -> crate::PyError {
+    crate::PyError::type_error(format!(
+        "don't know how to handle {} in error callback",
+        crate::error::type_name_of(w_exc)
+    ))
+}
+
+/// The one reader every handler goes through, `_PyUnicodeError_GetParams`.
+///
+/// It type-checks the argument before anything else, then reads `object`,
+/// `start` and `end` **off the struct** rather than through attribute lookup, so
+/// a subclass that overrides one of the three with a property does not change
+/// what a handler replaces -- and the slot read is also what keeps the shared
+/// validator off the lookup path.  `strict_errors` consults none of it and so
+/// does not call here.
 fn check_exception(w_exc: PyObjectRef) -> Result<CodecException, crate::PyError> {
-    let map_attr_error = |err: crate::PyError| {
-        if err.kind == crate::PyErrorKind::AttributeError {
-            crate::PyError::type_error("wrong exception")
-        } else {
-            err
-        }
-    };
-    let w_start = crate::baseobjspace::getattr_str(w_exc, "start").map_err(map_attr_error)?;
-    let w_end = crate::baseobjspace::getattr_str(w_exc, "end").map_err(map_attr_error)?;
-    let w_obj = crate::baseobjspace::getattr_str(w_exc, "object").map_err(map_attr_error)?;
-    let start_i64 = crate::baseobjspace::int_w(w_start)?;
-    let end_i64 = crate::baseobjspace::int_w(w_end)?;
-    if end_i64 - start_i64 < 0
-        || !(unsafe { crate::baseobjspace::isinstance_str_w(w_obj) }
-            || unsafe { crate::baseobjspace::isinstance_bytes_w(w_obj) })
-    {
-        return Err(crate::PyError::type_error("wrong exception"));
+    use pyre_object::interp_exceptions::ExcKind as K;
+    if !unsafe { pyre_object::is_exception(w_exc) } {
+        return Err(wrong_exception_type(w_exc));
     }
-    let kind = if unsafe { pyre_object::is_exception(w_exc) } {
-        Some(unsafe { pyre_object::interp_exceptions::w_exception_get_kind(w_exc) })
-    } else {
-        None
+    let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(w_exc) };
+    // Decoding carries the input as bytes, encoding and translation as text.
+    let obj_is_bytes = match kind {
+        K::UnicodeEncodeError | K::UnicodeTranslateError => false,
+        K::UnicodeDecodeError => true,
+        _ => return Err(wrong_exception_type(w_exc)),
     };
-    // Bounds are clamped like the C accessors so Rust slicing stays in range.
-    let start = start_i64.max(0) as usize;
-    let end = end_i64.max(start_i64.max(0)) as usize;
+    let w_obj = unsafe { pyre_object::interp_exceptions::w_exception_get_object(w_exc) };
+    if w_obj.is_null() {
+        return Err(crate::PyError::type_error(
+            "UnicodeError 'object' attribute is not set",
+        ));
+    }
+    let obj_ok = if obj_is_bytes {
+        unsafe { pyre_object::bytesobject::is_bytes(w_obj) }
+    } else {
+        unsafe { crate::baseobjspace::isinstance_str_w(w_obj) }
+    };
+    if !obj_ok {
+        let expected = if obj_is_bytes { "bytes" } else { "string" };
+        return Err(crate::PyError::type_error(format!(
+            "UnicodeError 'object' attribute must be a {expected}"
+        )));
+    }
+    // Both indices are plain machine words on the exception, zero until a
+    // constructor writes them, and a slot holding something that is not an
+    // index reports the bare `an integer is required`.  An index too wide for
+    // the word keeps the overflow the conversion itself raises.
+    let index_of = |w_value: PyObjectRef| -> Result<i64, crate::PyError> {
+        if w_value.is_null() {
+            return Ok(0);
+        }
+        crate::baseobjspace::int_w(w_value).map_err(|err| {
+            if err.kind == crate::PyErrorKind::TypeError {
+                crate::PyError::type_error("an integer is required")
+            } else {
+                err
+            }
+        })
+    };
+    let start_i64 =
+        index_of(unsafe { pyre_object::interp_exceptions::w_exception_get_start(w_exc) })?;
+    let end_i64 = index_of(unsafe { pyre_object::interp_exceptions::w_exception_get_end(w_exc) })?;
+    let kind = Some(kind);
+    // `PyUnicodeEncodeError_GetStart` and `PyUnicodeEncodeError_GetEnd` are what
+    // every handler reads the span through, and they clamp it against the
+    // object's own length before anyone slices: a start below zero becomes zero
+    // and one at or past the end becomes the last index (zero for an empty
+    // object), while an end below one becomes one and is then cut back to the
+    // length.  The clamped end is also what the handler reports back as the
+    // resume position, so an exception carrying a span wider than its object
+    // asks for a replacement covering the object, not the span.  Each index is
+    // clamped on its own, so a `start` past a smaller `end` stays past it.
+    let obj_len = if obj_is_bytes {
+        unsafe { w_bytes_data(w_obj) }.len()
+    } else {
+        unsafe { pyre_object::w_str_len(w_obj) }
+    } as i64;
+    let start = if start_i64 < 0 {
+        0
+    } else if start_i64 >= obj_len {
+        (obj_len - 1).max(0)
+    } else {
+        start_i64
+    } as usize;
+    let end = end_i64.max(1).min(obj_len) as usize;
     Ok(CodecException {
         w_exc,
         w_obj,
-        w_end,
         start,
         end,
         kind,
     })
 }
 
-fn codec_error_arg(args: &[PyObjectRef]) -> Result<CodecException, crate::PyError> {
+fn codec_arg(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     args.first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("error handler requires an exception"))
-        .and_then(check_exception)
+}
+
+fn codec_error_arg(args: &[PyObjectRef]) -> Result<CodecException, crate::PyError> {
+    codec_arg(args).and_then(check_exception)
 }
 
 /// Pins each result field as it is produced. An array literal would mint
@@ -218,14 +288,26 @@ impl RootedTuple {
     }
 }
 
-fn codec_result(replacement: PyObjectRef, position: PyObjectRef) -> PyObjectRef {
-    rooted_tuple().arg(replacement).arg(position).finish()
+/// `Py_BuildValue("(Nn)", ...)` builds the resume position after the
+/// replacement, so the position is minted here rather than by the caller: the
+/// replacement is already pinned by then and the int allocation cannot move it.
+fn codec_result(replacement: PyObjectRef, position: i64) -> PyObjectRef {
+    rooted_tuple()
+        .arg(replacement)
+        .arg(w_int_new(position))
+        .finish()
 }
 
 fn strict_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let exc = codec_error_arg(args)?;
-    if unsafe { pyre_object::is_exception(exc.w_exc) } {
-        Err(unsafe { crate::PyError::from_exc_object(exc.w_exc) })
+    // Upstream's `strict_errors` calls `check_exception` as its first statement,
+    // so a plain `ValueError` is refused with `wrong exception` before it can be
+    // re-raised.  `PyCodec_StrictErrors` re-raises whatever exception instance it
+    // is handed and asks nothing about the span, so this one does not validate:
+    // a plain `ValueError` raises that `ValueError`, and only a non-exception is
+    // refused.
+    let w_exc = codec_arg(args)?;
+    if unsafe { pyre_object::is_exception(w_exc) } {
+        Err(unsafe { crate::PyError::from_exc_object(w_exc) })
     } else {
         Err(crate::PyError::type_error(
             "codec must pass exception instance",
@@ -235,14 +317,12 @@ fn strict_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 fn ignore_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exc = codec_error_arg(args)?;
-    Ok(codec_result(w_str_new_managed(""), exc.w_end))
+    Ok(codec_result(w_str_new_managed(""), exc.end as i64))
 }
 
 fn error_codepoints(exc: &CodecException) -> Result<Vec<u32>, crate::PyError> {
     if !unsafe { crate::baseobjspace::isinstance_str_w(exc.w_obj) } {
-        return Err(crate::PyError::type_error(
-            "don't know how to handle exception in error callback",
-        ));
+        return Err(wrong_exception_type(exc.w_exc));
     }
     Ok(unsafe { w_str_get_wtf8(exc.w_obj) }
         .code_points()
@@ -264,7 +344,14 @@ fn raw_unicode_escape(code: u32) -> String {
 
 fn replace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exc = codec_error_arg(args)?;
-    let size = exc.end - exc.start;
+    // The two indices are clamped against the object independently, so an
+    // inverted span survives as one: `PyUnicodeEncodeError_GetStart` answers the
+    // last index while `..._GetEnd` answers one.  Both upstreams then take the
+    // span's length to zero rather than letting it go negative --
+    // `_PyUnicodeError_GetParams` hands out `slen = Py_MAX(0, end - start)` and
+    // `replace_errors` writes `if size < 0: size = 0` -- so the replacement is
+    // empty and the resume position is the clamped end.
+    let size = exc.end.saturating_sub(exc.start);
     let replacement = match exc.kind {
         Some(pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError) => "?".repeat(size),
         Some(pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError) => "\u{fffd}".to_string(),
@@ -272,26 +359,28 @@ fn replace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "\u{fffd}".repeat(size)
         }
         _ => {
-            return Err(crate::PyError::type_error(
-                "don't know how to handle exception in error callback",
-            ));
+            return Err(wrong_exception_type(exc.w_exc));
         }
     };
-    Ok(codec_result(w_str_new_managed(&replacement), exc.w_end))
+    Ok(codec_result(
+        w_str_new_managed(&replacement),
+        exc.end as i64,
+    ))
 }
 
 fn xmlcharrefreplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exc = codec_error_arg(args)?;
     if exc.kind != Some(pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError) {
-        return Err(crate::PyError::type_error(
-            "don't know how to handle exception in error callback",
-        ));
+        return Err(wrong_exception_type(exc.w_exc));
     }
     let replacement: String = error_codepoints(&exc)?
         .into_iter()
         .map(|code| format!("&#{code};"))
         .collect();
-    Ok(codec_result(w_str_new_managed(&replacement), exc.w_end))
+    Ok(codec_result(
+        w_str_new_managed(&replacement),
+        exc.end as i64,
+    ))
 }
 
 fn backslashreplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -317,20 +406,19 @@ fn backslashreplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
                 .collect::<String>()
         }
         _ => {
-            return Err(crate::PyError::type_error(
-                "don't know how to handle exception in error callback",
-            ));
+            return Err(wrong_exception_type(exc.w_exc));
         }
     };
-    Ok(codec_result(w_str_new_managed(&replacement), exc.w_end))
+    Ok(codec_result(
+        w_str_new_managed(&replacement),
+        exc.end as i64,
+    ))
 }
 
 fn namereplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exc = codec_error_arg(args)?;
     if exc.kind != Some(pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError) {
-        return Err(crate::PyError::type_error(
-            "don't know how to handle exception in error callback",
-        ));
+        return Err(wrong_exception_type(exc.w_exc));
     }
     let mut replacement = String::new();
     for code in error_codepoints(&exc)? {
@@ -342,7 +430,15 @@ fn namereplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             replacement.push_str(&raw_unicode_escape(code));
         }
     }
-    Ok(codec_result(w_str_new_managed(&replacement), exc.w_end))
+    // `PyCodec_NameReplaceErrors` reports the index its own scan stopped at --
+    // `imax`, which starts at `start` and advances while `imax < end` -- rather
+    // than the span's end.  The two agree for every ordinary span and part
+    // company on an inverted one, where the scan never advances and the handler
+    // asks to resume at `start`.  Every other handler reports the end.
+    Ok(codec_result(
+        w_str_new_managed(&replacement),
+        exc.start.max(exc.end) as i64,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -409,7 +505,10 @@ fn surrogatepass_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                     StandardEncoding::Utf32Be => replacement.extend_from_slice(&code.to_be_bytes()),
                 }
             }
-            Ok(codec_result(w_bytes_from_bytes(&replacement), exc.w_end))
+            Ok(codec_result(
+                w_bytes_from_bytes(&replacement),
+                exc.end as i64,
+            ))
         }
         Some(pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError) => {
             let (byte_len, encoding) = exception_encoding(&exc)?;
@@ -442,15 +541,12 @@ fn surrogatepass_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             }
             let mut replacement = Wtf8Buf::new();
             replacement.push(CodePoint::from_u32(code).unwrap());
-            let _roots = gc_roots::push_roots();
-            let repl_slot = gc_roots::shadow_stack_len();
-            let _ = gc_roots::pin_root(w_str_from_wtf8_managed(replacement));
-            let pos = w_int_new((exc.start + byte_len) as i64);
-            Ok(codec_result(gc_roots::shadow_stack_get(repl_slot), pos))
+            Ok(codec_result(
+                w_str_from_wtf8_managed(replacement),
+                (exc.start + byte_len) as i64,
+            ))
         }
-        _ => Err(crate::PyError::type_error(
-            "don't know how to handle exception in error callback",
-        )),
+        _ => Err(wrong_exception_type(exc.w_exc)),
     }
 }
 
@@ -465,7 +561,10 @@ fn surrogateescape_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 }
                 replacement.push((code - 0xDC00) as u8);
             }
-            Ok(codec_result(w_bytes_from_bytes(&replacement), exc.w_end))
+            Ok(codec_result(
+                w_bytes_from_bytes(&replacement),
+                exc.end as i64,
+            ))
         }
         Some(pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError) => {
             if !unsafe { pyre_object::is_bytes(exc.w_obj) } {
@@ -488,15 +587,12 @@ fn surrogateescape_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             if consumed == 0 {
                 return Err(unsafe { crate::PyError::from_exc_object(exc.w_exc) });
             }
-            let _roots = gc_roots::push_roots();
-            let repl_slot = gc_roots::shadow_stack_len();
-            let _ = gc_roots::pin_root(w_str_from_wtf8_managed(replacement));
-            let pos = w_int_new((exc.start + consumed) as i64);
-            Ok(codec_result(gc_roots::shadow_stack_get(repl_slot), pos))
+            Ok(codec_result(
+                w_str_from_wtf8_managed(replacement),
+                (exc.start + consumed) as i64,
+            ))
         }
-        _ => Err(crate::PyError::type_error(
-            "don't know how to handle exception in error callback",
-        )),
+        _ => Err(wrong_exception_type(exc.w_exc)),
     }
 }
 
@@ -939,7 +1035,10 @@ pub(crate) fn encode_text_codec(
     let w_encfunc = unsafe { pyre_object::w_tuple_getitem(w_codec_info, 0).unwrap_or_else(w_none) };
     let w_retval = call_codec(w_encfunc, w_obj, "encoding", encoding, Some(errors))?;
     if !unsafe { pyre_object::bytesobject::is_bytes_like(w_retval) } {
-        let tname = unsafe { pyre_object::type_name_of(w_retval) };
+        // The name is the Python-visible one: `ob_type` names the storage
+        // layout, which a plain class shares with `object` and a `str` or
+        // `bytes` subclass shares with its base.
+        let tname = crate::error::type_name_of(w_retval);
         return Err(crate::PyError::type_error(format!(
             "'{encoding}' encoder returned '{tname}' instead of 'bytes'; use codecs.encode() to encode to arbitrary types"
         )));
@@ -973,7 +1072,10 @@ pub(crate) fn decode_text_codec(
     let w_decfunc = unsafe { pyre_object::w_tuple_getitem(w_codec_info, 1).unwrap_or_else(w_none) };
     let w_retval = call_codec(w_decfunc, w_obj, "decoding", encoding, Some(errors))?;
     if !unsafe { pyre_object::is_str(w_retval) } {
-        let tname = unsafe { pyre_object::type_name_of(w_retval) };
+        // The name is the Python-visible one: `ob_type` names the storage
+        // layout, which a plain class shares with `object` and a `str` or
+        // `bytes` subclass shares with its base.
+        let tname = crate::error::type_name_of(w_retval);
         return Err(crate::PyError::type_error(format!(
             "'{encoding}' decoder returned '{tname}' instead of 'str'; use codecs.decode() to decode to arbitrary types"
         )));

@@ -7600,32 +7600,21 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             pyre_object::interp_exceptions::w_exception_set_syntax_lineno(w_self, details[1]);
             pyre_object::interp_exceptions::w_exception_set_syntax_offset(w_self, details[2]);
             pyre_object::interp_exceptions::w_exception_set_syntax_text(w_self, details[3]);
-            if details.len() >= 6 {
-                pyre_object::interp_exceptions::w_exception_set_syntax_end_lineno(
-                    w_self, details[4],
-                );
-                pyre_object::interp_exceptions::w_exception_set_syntax_end_offset(
-                    w_self, details[5],
-                );
-            } else {
-                // CPython 3.14 clears both end positions when a repeated
-                // `__init__` call supplies the four-field details form.
-                pyre_object::interp_exceptions::w_exception_set_syntax_end_lineno(
-                    w_self,
-                    pyre_object::w_none(),
-                );
-                pyre_object::interp_exceptions::w_exception_set_syntax_end_offset(
-                    w_self,
-                    pyre_object::w_none(),
-                );
-            }
-            if details.len() == 7 {
-                // Only a supplied seventh field writes `_metadata`: the
-                // details parse clears the two end positions up front but
-                // leaves this one, so a re-`__init__` with a shorter tuple
-                // keeps whatever was stored.
-                pyre_object::interp_exceptions::w_exception_set_syntax_metadata(w_self, details[6]);
-            }
+            // `SyntaxError_init` parses the details into locals and then
+            // `Py_XSETREF`s every field, so an optional one the tuple omitted
+            // overwrites its slot instead of leaving it: a repeated `__init__`
+            // with a shorter details form clears both end positions *and*
+            // `_metadata`.  A call that supplies no details form at all does not
+            // reach here and keeps all three.
+            let optional = |index: usize| {
+                details
+                    .get(index)
+                    .copied()
+                    .unwrap_or_else(pyre_object::w_none)
+            };
+            pyre_object::interp_exceptions::w_exception_set_syntax_end_lineno(w_self, optional(4));
+            pyre_object::interp_exceptions::w_exception_set_syntax_end_offset(w_self, optional(5));
+            pyre_object::interp_exceptions::w_exception_set_syntax_metadata(w_self, optional(6));
         }
     }
     let args_list = pyre_object::interp_exceptions::w_exception_args_new(
@@ -15823,6 +15812,22 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             {
                 "invalid syntax".to_owned()
             }
+            // Ruff capitalizes the bare `except *` rejection and reuses it for
+            // `except* as e:`, which the grammar does not name at all.  The
+            // `invalid_except_star_stmt` alternative matches only
+            // `'except' '*' (NEWLINE | ':')` and spells the message lower-case
+            // (`raise_syntax_error_known_location` there), which
+            // `lib-python/3/test/test_syntax.py` asserts; every other shape the
+            // one ruff message covers reports the plain diagnostic.
+            ParseErrorType::OtherError(message)
+                if message == "Expected one or more exception types" =>
+            {
+                if except_star_missing_types_at(source, parse_err.raw_location.start().to_usize()) {
+                    "expected one or more exception types".to_owned()
+                } else {
+                    "invalid syntax".to_owned()
+                }
+            }
             // `ast.c` reports these three through `ast_error`, lower-case and
             // with `follows` where ruff writes `cannot follow`.
             ParseErrorType::PositionalAfterKeywordArgument => {
@@ -16542,6 +16547,36 @@ fn compound_suite_header_at(source: &str, loc: usize) -> bool {
                 .get(kw.len())
                 .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
     })
+}
+
+/// Whether the `except *` clause on `loc`'s line names no exception type at
+/// all, which is the only shape `invalid_except_star_stmt` matches:
+/// `'except' '*' (NEWLINE | ':')`, with end-of-source standing in for the
+/// newline.  A comment before that newline is not a token, so it does not
+/// change the answer.
+fn except_star_missing_types_at(source: &str, loc: usize) -> bool {
+    let loc = loc.min(source.len());
+    let bytes = source.as_bytes();
+    let mut i = loc;
+    while i > 0 {
+        i -= 1;
+        if bytes[i] == b'\n' {
+            i += 1;
+            break;
+        }
+    }
+    let Some(after_except) = source[i..].trim_start().strip_prefix("except") else {
+        return false;
+    };
+    let Some(after_star) = after_except.trim_start().strip_prefix('*') else {
+        return false;
+    };
+    let rest = after_star.trim_start_matches([' ', '\t']);
+    let rest = match rest.split_once('#') {
+        Some((before, _)) if before.is_empty() => "",
+        _ => rest,
+    };
+    rest.is_empty() || rest.starts_with([':', '\n', '\r'])
 }
 
 /// The `SyntaxError` subclass a compile failure belongs to.  3.14 raises
