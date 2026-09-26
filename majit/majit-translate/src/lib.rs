@@ -440,16 +440,16 @@ pub struct ErrorCarrierSpec<'a> {
     /// most once per entry, so `&["alloc::boxed::Box"]` takes
     /// `Box<InterpError>` to `InterpError`.  Empty for a bare carrier.
     pub carrier_wrappers: &'a [&'a str],
-    /// Free function materialising the `Err` payload into the trace-level
-    /// exception value the raise site stores (`BH_LAST_EXC_VALUE`'s domain).
-    /// `None` when the payload already *is* one such value — a carrier that
-    /// is itself a single owned word needs no materialisation and the raise
-    /// site forwards it unchanged.
+    /// Free function materialising a raised carrier into the runtime
+    /// exception value (`BH_LAST_EXC_VALUE`'s domain), emitted by the
+    /// codewriter at every raise of the carrier
+    /// (`codewriter::error_carrier_edges`).  `None` when the carrier already
+    /// *is* one such value — a single owned word needs no materialisation
+    /// and the raise stores it unchanged.
     pub to_exc_object: Option<&'a [&'a str]>,
-    /// The inverse, emitted at a caught-exception rewrap site as
-    /// `(receiver_root, method)`.  `None` for the same reason and with the
-    /// same effect as on [`Self::to_exc_object`]: the caught value already
-    /// is the `Err` payload, so the rewrap forwards it into the shell.
+    /// The inverse, `(receiver_root, method)`, emitted where a handler
+    /// catches the carrier.  `None` for the same reason and with the same
+    /// effect as on [`Self::to_exc_object`].
     pub from_exc_object: Option<(&'a str, &'a str)>,
 }
 
@@ -469,6 +469,34 @@ impl Default for ErrorCarrierSpec<'_> {
             carrier_wrappers: &[],
             to_exc_object: None,
             from_exc_object: None,
+        }
+    }
+}
+
+/// Owned mirror of [`ErrorCarrierSpec`], for a holder that outlives the
+/// caller frame the spec borrows from: a demanded body has to lower with the
+/// spec the whole-program pass used, and the codewriter's representation of
+/// the carrier's exception edges reads it after the front has returned.
+#[derive(Debug, Default, Clone)]
+pub struct OwnedErrorCarrierSpec {
+    pub carrier_path: String,
+    pub carrier_wrappers: Vec<String>,
+    pub to_exc_object: Option<Vec<String>>,
+    pub from_exc_object: Option<(String, String)>,
+}
+
+impl OwnedErrorCarrierSpec {
+    pub fn own(spec: ErrorCarrierSpec<'_>) -> Self {
+        let own_path = |segments: &[&str]| -> Vec<String> {
+            segments.iter().map(|s| (*s).to_string()).collect()
+        };
+        Self {
+            carrier_path: spec.carrier_path.to_string(),
+            carrier_wrappers: own_path(spec.carrier_wrappers),
+            to_exc_object: spec.to_exc_object.map(own_path),
+            from_exc_object: spec
+                .from_exc_object
+                .map(|(receiver, method)| (receiver.to_string(), method.to_string())),
         }
     }
 }
@@ -1415,6 +1443,7 @@ fn analyze_pipeline_from_module_paths(
     call_control.set_known_struct_names(program.known_struct_names.clone());
     // RPython: struct field types for op.args[0].concretetype resolution.
     call_control.set_struct_fields(program.struct_fields.clone());
+    call_control.set_error_carrier(OwnedErrorCarrierSpec::own(static_addrs.error_carrier));
     // Enum `discriminant → variant` tables for the `__discriminant`
     // getattr's discriminant→variant narrowing knowntypedata.
     call_control.set_enum_variant_by_discriminant(program.enum_variant_by_discriminant.clone());

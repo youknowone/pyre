@@ -3445,14 +3445,32 @@ pub struct FlowspaceAdapterOutput {
 /// `flowspace::Link.exitcase`. RPython encodes the discriminating value
 /// as a `Hlvalue::Constant` carrying the matched bool / Python value
 /// (`flowspace/model.py`).
-fn exitcase_to_hlvalue(exitcase: Option<&ExitCase>) -> Option<Hlvalue> {
-    match exitcase {
+fn exitcase_to_hlvalue(
+    exitcase: Option<&ExitCase>,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+) -> Result<Option<Hlvalue>, TyperError> {
+    Ok(match exitcase {
         None => None,
         Some(ExitCase::Bool(b)) => Some(Hlvalue::Constant(constant_from_constvalue(
             ConstValue::Bool(*b),
         ))),
         Some(ExitCase::Const(cv)) => Some(Hlvalue::Constant(constant_from_constvalue(cv.clone()))),
-    }
+        // `except OperationError`: the carrier's class object, the one the
+        // bookkeeper mints as an `Exception` subclass.
+        Some(ExitCase::ErrorCarrier) => {
+            let class = call_registry
+                .bookkeeper()
+                .exception_carrier_class()
+                .ok_or_else(|| {
+                    TyperError::message(
+                        "ExitCase::ErrorCarrier on a pipeline that named no error carrier",
+                    )
+                })?;
+            Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                class,
+            ))))
+        }
+    })
 }
 
 fn constant_from_constvalue(value: ConstValue) -> Constant {
@@ -5030,7 +5048,7 @@ fn function_graph_to_flowspace_inner(
                 translated_ops.push(FlowspaceOp::new("type", vec![evalue], etype.clone()));
                 args[0] = etype;
             }
-            let exitcase = exitcase_to_hlvalue(legacy_link.exitcase.as_ref());
+            let exitcase = exitcase_to_hlvalue(legacy_link.exitcase.as_ref(), call_registry)?;
             let mut link = FlowspaceLink::new(args, Some(target), exitcase);
             // RPython `Link.__init__` (`flowspace/model.rs:Link::new`) leaves
             // `llexitcase` unset; `RPythonTyper._convert_link`

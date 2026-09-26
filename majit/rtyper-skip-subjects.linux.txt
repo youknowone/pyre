@@ -430,7 +430,6 @@ two-phase-never-a-subject	pyre_interpreter::module::__pypy__::interp_buffer::acq
 two-phase-never-a-subject	pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::<Impl>::__buffer__
 two-phase-never-a-subject	pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::__majit_wrap___buffer__
 two-phase-never-a-subject	pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::__majit_wrap___new__
-two-phase-never-a-subject	pyre_interpreter::module::__pypy__::interp_buffer::forwarded_exporter
 two-phase-never-a-subject	pyre_interpreter::module::__pypy__::interp_buffer::memoryview_type
 two-phase-never-a-subject	pyre_interpreter::module::_codecs::bad_arg
 two-phase-never-a-subject	pyre_interpreter::module::_codecs::call_codec

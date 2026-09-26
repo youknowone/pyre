@@ -1746,6 +1746,15 @@ pub enum ExitSwitch {
 pub enum ExitCase {
     Bool(bool),
     Const(ConstValue),
+    /// The interpreter's error-carrier class (`crate::ErrorCarrierSpec`),
+    /// the program's `OperationError`: a handler written `except
+    /// OperationError as e` catches with this exitcase, and `e` is the
+    /// carrier.  The class object is minted by the annotator's bookkeeper
+    /// (`Bookkeeper::set_exception_carrier`), which the front does not
+    /// reach, so the link names it symbolically; the flowspace adapter
+    /// resolves it to that class and the codewriter's
+    /// `error_carrier_edges` rewrites it to the runtime domain.
+    ErrorCarrier,
 }
 
 /// RPython `flowspace/model.py` `Link`.
@@ -1824,6 +1833,9 @@ impl Link {
             Some(ExitCase::Bool(value)) => Some(ConstValue::Bool(*value)),
             Some(ExitCase::Const(value)) if value.string_eq("default") => None,
             Some(ExitCase::Const(value)) => Some(value.clone()),
+            // A class exitcase is converted by the rtyper
+            // (`get_type_repr(...).convert_const`), not copied.
+            Some(ExitCase::ErrorCarrier) => None,
             None => None,
         };
         self
@@ -1847,6 +1859,11 @@ impl Link {
 
 pub fn exception_exitcase() -> ExitCase {
     ExitCase::Const(ConstValue::builtin("Exception"))
+}
+
+/// `except OperationError` — see [`ExitCase::ErrorCarrier`].
+pub fn error_carrier_exitcase() -> ExitCase {
+    ExitCase::ErrorCarrier
 }
 
 /// RPython `Link.args` items are Variables or Constants —

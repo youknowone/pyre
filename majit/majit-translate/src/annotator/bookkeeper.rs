@@ -367,6 +367,12 @@ pub struct Bookkeeper {
     /// where `t` is the already-resolved class object.  Used by
     /// [`Self::getuniqueclassdef_for_struct_root`].
     pub struct_root_classes: RefCell<HashMap<String, HostObject>>,
+    /// Class key (`canonical_struct_name`) of the interpreter's error
+    /// carrier, the `E` of the `Result<T, E>` the front lowers into
+    /// exception edges.  The carrier is what the program raises, so it
+    /// is minted as an `Exception` subclass — `class
+    /// OperationError(Exception)` (`pypy/interpreter/error.py`).
+    exception_carrier: RefCell<Option<String>>,
     /// TODO: no upstream equivalent.  Qualified trait path → owner
     /// root of its only concrete impl in the analyzed LLBC world
     /// (computed in `lib.rs` from `concrete_trait_methods`; multi-impl
@@ -581,6 +587,7 @@ impl Bookkeeper {
             struct_fields: RefCell::new(None),
             enum_variant_by_discriminant: RefCell::new(None),
             struct_root_classes: RefCell::new(HashMap::new()),
+            exception_carrier: RefCell::new(None),
             trait_unique_impls: RefCell::new(HashMap::new()),
             trait_family_bases: RefCell::new(HashMap::new()),
             pending_struct_row_projection: RefCell::new(Vec::new()),
@@ -601,6 +608,34 @@ impl Bookkeeper {
     /// overwrites the previous registry.
     pub fn set_struct_fields(&self, registry: Rc<crate::front::StructFieldRegistry>) {
         *self.struct_fields.borrow_mut() = Some(registry);
+    }
+
+    /// Name the interpreter's error carrier (see the `exception_carrier`
+    /// field doc).  An empty path names none.
+    pub fn set_exception_carrier(&self, carrier_path: &str) {
+        *self.exception_carrier.borrow_mut() = (!carrier_path.is_empty()).then(|| {
+            majit_ir::descr::canonical_struct_name(&normalize_class_qualname(carrier_path))
+        });
+    }
+
+    /// The error carrier's class object, minted on first request.  `None`
+    /// when no carrier is named.
+    pub fn exception_carrier_class(self: &Rc<Self>) -> Option<HostObject> {
+        let key = self.exception_carrier.borrow().clone()?;
+        Some(self.intern_class_by_qualname(&key))
+    }
+
+    /// The `__bases__` a first mint of class `key` receives when nothing
+    /// else supplies one: `Exception` for the error carrier, none otherwise.
+    fn default_class_bases(&self, key: &str) -> Vec<HostObject> {
+        if self.exception_carrier.borrow().as_deref() == Some(key) {
+            let exception = crate::flowspace::model::HOST_ENV
+                .lookup_exception_class("Exception")
+                .expect("HOST_ENV missing builtin Exception");
+            vec![exception]
+        } else {
+            Vec::new()
+        }
     }
 
     /// TODO: no upstream equivalent.  Wire the enum
@@ -2616,7 +2651,10 @@ impl Bookkeeper {
         // Mint base-most first so each class links its base's Arc.
         for node in chain.iter().rev() {
             let key = majit_ir::descr::canonical_struct_name(node);
-            let bases = base_host.iter().cloned().collect();
+            let bases = match &base_host {
+                Some(base) => vec![base.clone()],
+                None => self.default_class_bases(&key),
+            };
             let host = crate::flowspace::model::HostObject::new_class(key.clone(), bases);
             crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
             self.struct_root_classes
@@ -2653,6 +2691,11 @@ impl Bookkeeper {
         if let Some(existing) = self.struct_root_classes.borrow().get(&key) {
             return existing.clone();
         }
+        let bases = if bases.is_empty() {
+            self.default_class_bases(&key)
+        } else {
+            bases
+        };
         let host = crate::flowspace::model::HostObject::new_class(key.clone(), bases);
         crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
         self.struct_root_classes
@@ -4575,6 +4618,55 @@ mod tests {
             .insert("x".to_string(), attrs_attr);
         bk.classdefs.borrow_mut().push(classdef);
         bk.check_no_flags_on_instances();
+    }
+
+    /// `class OperationError(Exception)`: the error carrier is minted as an
+    /// `Exception` subclass whichever entry point mints it first, and a
+    /// caught `Exception` narrowed to it and the carrier's own instances
+    /// share one lattice.
+    #[test]
+    fn the_error_carrier_is_minted_as_an_exception_subclass() {
+        for bases_entry in [false, true] {
+            let bk = bk();
+            bk.set_exception_carrier("pyre_interpreter::error::PyError");
+            let host = if bases_entry {
+                bk.intern_class_by_qualname_with_bases("pyre_interpreter::error::PyError", vec![])
+            } else {
+                bk.intern_class_by_qualname("pyre_interpreter::error::PyError")
+            };
+            let carrier = bk.getuniqueclassdef(&host).expect("carrier classdef");
+            let exception = bk
+                .getuniqueclassdef(
+                    &crate::flowspace::model::HOST_ENV
+                        .lookup_exception_class("Exception")
+                        .unwrap(),
+                )
+                .expect("Exception classdef");
+            assert!(carrier.borrow().issubclass(&exception));
+            let s_carrier = crate::annotator::model::SomeValue::Instance(
+                crate::annotator::model::SomeInstance::new(
+                    Some(carrier.clone()),
+                    false,
+                    Default::default(),
+                ),
+            );
+            let s_exception = crate::annotator::model::SomeValue::Instance(
+                crate::annotator::model::SomeInstance::new(
+                    Some(exception.clone()),
+                    false,
+                    Default::default(),
+                ),
+            );
+            assert_eq!(
+                crate::annotator::model::unionof([&s_carrier, &s_exception]).unwrap(),
+                s_exception
+            );
+        }
+        // Another struct stays base-less.
+        let bk = bk();
+        bk.set_exception_carrier("pyre_interpreter::error::PyError");
+        let other = bk.intern_class_by_qualname("pyre_object::pyobject::PyObject");
+        assert!(other.class_bases().map_or(true, |b| b.is_empty()));
     }
 
     #[test]

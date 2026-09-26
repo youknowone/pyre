@@ -393,6 +393,12 @@ impl CallRegistry {
         self.bookkeeper.set_struct_fields(registry);
     }
 
+    /// Name the interpreter's error carrier to the shared bookkeeper
+    /// ([`crate::annotator::bookkeeper::Bookkeeper::set_exception_carrier`]).
+    pub fn set_exception_carrier(&self, carrier_path: &str) {
+        self.bookkeeper.set_exception_carrier(carrier_path);
+    }
+
     /// Thread the trait → unique-concrete-impl-owner map into the
     /// shared bookkeeper so `derive_subject_inputcells` can resolve a
     /// generic receiver's bound-trait `class_root` to the impl type's

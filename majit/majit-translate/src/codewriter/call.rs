@@ -2573,6 +2573,12 @@ pub struct CallControl {
     /// Equivalent to `op.args[0].concretetype.TO` in RPython's rtyped graph.
     struct_fields: crate::front::StructFieldRegistry,
 
+    /// The interpreter's fallible-return carrier (`ErrorCarrierSpec`): the
+    /// `E` of the `Result<T, E>` the front lowers into exception edges.  The
+    /// class it names is the program's `OperationError`, and the codewriter
+    /// converts its exception edges into the runtime exception-value domain.
+    error_carrier: crate::OwnedErrorCarrierSpec,
+
     /// TODO: no upstream equivalent (RPython has no Rust enums).  Maps an
     /// enum type-root name (dual-keyed: qualified path and bare leaf) to
     /// its `discriminant value → variant name` table.  Threaded into the
@@ -3206,6 +3212,7 @@ impl CallControl {
             fielddescrof_memo: std::cell::RefCell::new(HashMap::new()),
             known_struct_names: HashSet::new(),
             struct_fields: crate::front::StructFieldRegistry::default(),
+            error_carrier: crate::OwnedErrorCarrierSpec::default(),
             enum_variant_by_discriminant: HashMap::new(),
             trait_unique_impls: HashMap::new(),
             trait_family_registrations: Vec::new(),
@@ -3300,6 +3307,16 @@ impl CallControl {
     /// project a struct's fields onto its classdef.
     pub fn struct_fields(&self) -> &crate::front::StructFieldRegistry {
         &self.struct_fields
+    }
+
+    /// Register the interpreter's fallible-return carrier (see the
+    /// `error_carrier` field doc).
+    pub fn set_error_carrier(&mut self, spec: crate::OwnedErrorCarrierSpec) {
+        self.error_carrier = spec;
+    }
+
+    pub fn error_carrier(&self) -> &crate::OwnedErrorCarrierSpec {
+        &self.error_carrier
     }
 
     /// Register the enum `discriminant → variant` tables (see the

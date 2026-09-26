@@ -177,6 +177,9 @@ impl CodeWriter {
         // can project a struct's fields onto its classdef when the
         // real-rtyper seed path resolves a `Ref(type_root)` to a class.
         registry.set_struct_fields(std::rc::Rc::new(callcontrol.struct_fields().clone()));
+        // The carrier class is the program's `OperationError`: it subclasses
+        // `Exception` (see `Bookkeeper::set_exception_carrier`).
+        registry.set_exception_carrier(&callcontrol.error_carrier().carrier_path);
         // Enum `discriminant → variant` tables for the `__discriminant`
         // getattr's narrowing knowntypedata producer.
         registry.set_enum_variant_by_discriminant(std::rc::Rc::new(
@@ -578,6 +581,13 @@ impl CodeWriter {
         // `CallTarget::Indirect` marker; the clone jtransform rewrites takes
         // it as the unknown family (`indirect_call` with `graphs=None`).
         let mut graph_owned = graph.clone();
+        // The error carrier's `raise e` / `except OperationError as e`
+        // edges, annotated as such, move to the runtime exception value
+        // before jtransform reads them.
+        crate::codewriter::error_carrier_edges::lower_error_carrier_edges(
+            &mut graph_owned,
+            &callcontrol.error_carrier().clone(),
+        );
         crate::translator::rtyper::rpbc::lower_indirect_calls(&mut graph_owned, callcontrol);
         #[cfg(debug_assertions)]
         crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(&graph_owned);

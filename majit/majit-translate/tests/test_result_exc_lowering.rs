@@ -33,6 +33,13 @@ const MODULE: &str = concat!(
 /// driver spells it (`pyre-jit-trace/build/prepass.rs`).  `majit-translate`
 /// names no carrier of its own, so a test that expects `Result<T, PyError>`
 /// to become exception links has to declare it.
+const PYRE_CARRIER: ErrorCarrierSpec<'static> = ErrorCarrierSpec {
+    carrier_path: "pyre_interpreter::error::PyError",
+    carrier_wrappers: &[],
+    to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+    from_exc_object: Some(("PyError", "from_exc_object")),
+};
+
 fn lower_function(
     llbc: &Llbc,
     function_name: &str,
@@ -41,15 +48,25 @@ fn lower_function(
         llbc,
         function_name,
         HostStaticAddrs {
-            error_carrier: ErrorCarrierSpec {
-                carrier_path: "pyre_interpreter::error::PyError",
-                carrier_wrappers: &[],
-                to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
-                from_exc_object: Some(("PyError", "from_exc_object")),
-            },
+            error_carrier: PYRE_CARRIER,
             ..Default::default()
         },
     )
+}
+
+/// [`lower_function`], then the codewriter's conversion of the carrier's
+/// exception edges into the runtime exception value
+/// (`codewriter::error_carrier_edges`): the raise paths the JitCode holds.
+fn lower_function_to_runtime_edges(
+    llbc: &Llbc,
+    function_name: &str,
+) -> Result<majit_translate::model::FunctionGraph, majit_translate::front::mir::LowerError> {
+    let mut graph = lower_function(llbc, function_name)?;
+    majit_translate::codewriter::error_carrier_edges::lower_error_carrier_edges(
+        &mut graph,
+        &majit_translate::OwnedErrorCarrierSpec::own(PYRE_CARRIER),
+    );
+    Ok(graph)
 }
 
 fn interp() -> &'static Llbc {
@@ -282,7 +299,8 @@ fn list_append_underflow_lowers_to_raise_links() {
     let llbc = interp();
     // `opcode_list_append`'s `depth == 0` arm returns
     // `Err(stack_underflow_error(..))` directly.
-    let graph = lower_function(llbc, "opcode_list_append").expect("lower opcode_list_append");
+    let graph = lower_function_to_runtime_edges(llbc, "opcode_list_append")
+        .expect("lower opcode_list_append");
     let mut result_ctors = 0usize;
     let mut to_exc_object_calls = 0usize;
     let mut except_links = 0usize;
@@ -433,18 +451,17 @@ fn execute_wrapper_family_lowers_to_raise_links() {
 /// hand-written `match next() { Ok(w) => append, Err(e) if
 /// e.matches_stop_iteration() => break, Err(e) => return Err(e) }`. Lowered
 /// naively it materialises a `Result` shell and leaves the PyError predicate
-/// on its Err arm. `try_fuse_drain_match` (`front::result_exc`) replaces that
-/// shell with a `LastException` exception-edge whose handler runs the
-/// equivalent object-level MRO predicate on the live exception value.
+/// on its Err arm behind a discriminant switch. `try_fuse_drain_match`
+/// (`front::result_exc`) replaces that shell with a `LastException`
+/// exception edge catching the carrier (`except OperationError as e`) whose
+/// handler runs the same predicate on the caught carrier.
 ///
 /// The fusion is FAIL-SAFE: on any shape it does not recognise it silently
-/// falls back to `catch_and_rewrap`, leaving the source predicate in place.
-/// That silent decline is invisible to the default (non-jd1) drain path yet
-/// reintroduces the Result shell the jd1 walk cannot consume. A drain rework
-/// that perturbs the recognised shape (or a recognizer regression) is exactly
-/// such a silent decline. This lowers the real drain and asserts the fused
-/// helper signature is present and the source-method residual is gone, so a
-/// decline fails loud.
+/// falls back to `catch_and_rewrap`, leaving the source predicate on the
+/// shell's Err arm. That silent decline is invisible to the default
+/// (non-jd1) drain path yet reintroduces the Result shell the jd1 walk cannot
+/// consume. This lowers the real drain and asserts every predicate call sits
+/// in a carrier handler reading the caught value, so a decline fails loud.
 #[test]
 fn unpackiterable_drain_match_fuses_to_kind_test() {
     let llbc = interp();
@@ -454,63 +471,67 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
     )
     .expect("lower unpackiterable_portal");
 
-    // Positive firing signal: only the fusion emits this object-level helper
-    // FunctionPath, so its presence proves `try_fuse_drain_match` fired rather
-    // than declining to catch_and_rewrap.
-    let object_predicate_calls = graph
+    // (block, caught value) for every `except OperationError as e` handler.
+    let handlers: Vec<(usize, majit_translate::flowspace::model::Variable)> = graph
         .blocks
         .iter()
-        .flat_map(|b| b.operations.iter())
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                    if segments.last().map(String::as_str)
-                        == Some("exception_object_matches_stop_iteration")
-            )
+        .flat_map(|b| b.exits.iter())
+        .filter(|link| link.exitcase == Some(ExitCase::ErrorCarrier))
+        .filter_map(|link| {
+            let caught = link.last_exc_value.as_ref()?.as_variable()?;
+            let pos = link
+                .args
+                .iter()
+                .position(|arg| arg.as_variable() == Some(caught))?;
+            Some((
+                link.target.0,
+                graph.blocks[link.target.0].inputargs[pos].clone(),
+            ))
+        })
+        .collect();
+    let is_predicate = |op: &majit_translate::model::SpaceOperation| {
+        matches!(
+            &op.kind,
+            OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                if name == "matches_stop_iteration"
+        )
+    };
+    let fused_predicates = handlers
+        .iter()
+        .filter(|(block, caught)| {
+            graph.blocks[*block].operations.iter().any(|op| {
+                is_predicate(op)
+                    && matches!(&op.kind, OpKind::Call { args, .. }
+                        if args.len() == 1 && args[0].as_variable() == Some(caught))
+            })
         })
         .count();
     assert!(
-        object_predicate_calls >= 1,
-        "drain fusion must synthesise the object-level StopIteration predicate \
+        fused_predicates >= 1,
+        "drain fusion must run the StopIteration predicate on the caught carrier \
          (0 = recognizer silently declined to catch_and_rewrap → the \
          Result shell and source predicate remain on the jd1 walk)"
     );
-
-    // Elimination signal: the source PyError method survives only on the
-    // decline path, so a fired fusion leaves none.
-    let source_predicate_calls = graph
+    // Elimination signal: a predicate outside a carrier handler survives
+    // only on the decline path.
+    let stray_predicates = graph
         .blocks
         .iter()
-        .flat_map(|b| b.operations.iter())
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    ..
-                } if name == "matches_stop_iteration"
-            )
-        })
+        .enumerate()
+        .filter(|(bi, _)| !handlers.iter().any(|(h, _)| h == bi))
+        .flat_map(|(_, b)| b.operations.iter())
+        .filter(|op| is_predicate(op))
         .count();
     assert_eq!(
-        source_predicate_calls, 0,
-        "the source PyError predicate must be gone after the drain fusion"
+        stray_predicates, 0,
+        "the source Err-arm predicate must be gone after the drain fusion"
     );
 
-    let reraise = graph
-        .blocks
+    let reraise = handlers
         .iter()
-        .find(|b| {
-            b.operations.iter().any(|op| {
-                matches!(&op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                        if segments.last().map(String::as_str)
-                            == Some("exception_object_matches_stop_iteration"))
-            })
-        })
-        .and_then(|b| {
-            b.exits
+        .find_map(|(block, _)| {
+            graph.blocks[*block]
+                .exits
                 .iter()
                 .find(|link| link.exitcase == Some(ExitCase::Bool(false)))
         })
@@ -597,8 +618,8 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
     );
 
     eprintln!(
-        "drain fusion: object_predicate={object_predicate_calls} \
-         source_predicate={source_predicate_calls} exc_kind_discriminant={exc_kind_calls} \
+        "drain fusion: fused_predicate={fused_predicates} \
+         stray_predicate={stray_predicates} exc_kind_discriminant={exc_kind_calls} \
          lastexc_blocks={lastexc_blocks} shadow_stack_get={shadow_stack_gets}"
     );
 }
@@ -625,8 +646,18 @@ fn eval_loop_custom_match_gets_catch_and_rewrap() {
         matches!(call_block.exitswitch, Some(ExitSwitch::LastException)),
         "custom-match call site gets catch-and-rewrap LastException exits"
     );
-    // The exception arm re-binds the caught value into the PyError
-    // domain before rebuilding the Err shell.
+    // `except OperationError as e`: the call block catches the carrier.
+    assert!(
+        call_block
+            .exits
+            .iter()
+            .any(|link| link.exitcase == Some(ExitCase::ErrorCarrier)),
+        "custom-match call site catches the error carrier"
+    );
+    // At runtime the exception arm re-binds the caught value into the
+    // PyError domain before rebuilding the Err shell.
+    let graph = lower_function_to_runtime_edges(llbc, "pyre_interpreter::eval::eval_loop")
+        .expect("lower eval_loop");
     let from_exc_calls = graph
         .blocks
         .iter()
@@ -654,7 +685,8 @@ fn raise_path_calls(name: &str) -> (usize, usize, usize) {
 /// The same count against a named artefact, for a wrapper whose module is not
 /// in `pyre-interpreter`.
 fn raise_path_calls_in(llbc: &'static Llbc, name: &str) -> (usize, usize, usize) {
-    let graph = lower_function(llbc, name).unwrap_or_else(|e| panic!("lower {name}: {e:?}"));
+    let graph = lower_function_to_runtime_edges(llbc, name)
+        .unwrap_or_else(|e| panic!("lower {name}: {e:?}"));
     let (mut fused, mut materialise, mut ctors) = (0, 0, 0);
     for block in &graph.blocks {
         for op in &block.operations {
@@ -710,7 +742,7 @@ fn negative_shift_value_error_fuses_its_constructor() {
         "pyre_interpreter::objspace::descroperation::int_rshift",
     ] {
         let (fused, _materialise, _ctors) = raise_path_calls(name);
-        let graph = lower_function(interp(), name).expect("lower");
+        let graph = lower_function_to_runtime_edges(interp(), name).expect("lower");
         let leftover: Vec<String> = graph
             .blocks
             .iter()
@@ -797,11 +829,11 @@ fn exact_int_zero_division_raise_sites_fuse_their_constructor() {
 
 #[test]
 fn formatted_message_raise_sites_keep_the_two_call_form() {
-    // `__class_getitem__`'s checks build their message with `format!`, whose
-    // result is not the `box_str_constant` object the helper reads. Those
-    // sites must keep the constructor plus `pyerror_to_exc_object`: the
+    // `list_extend_value` words its non-iterable refusal with `format!`,
+    // whose result is not the `box_str_constant` object the helper reads.
+    // That site must keep the constructor plus `pyerror_to_exc_object`: the
     // fusion is additive and never replaces its own fallback.
-    let (fused, materialise, ctors) = raise_path_calls("__majit_wrap___class_getitem__");
+    let (fused, materialise, ctors) = raise_path_calls("list_extend_value");
     assert_eq!(fused, 0, "a formatted message must not fuse");
     assert!(
         ctors > 0,

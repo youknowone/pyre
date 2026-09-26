@@ -4082,7 +4082,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &mut lo.graph,
                 &lo.result_exc_call_results,
                 result_exc_callee,
-                static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
             tail_forwarded_returns = outcome.tail_forwards;
@@ -4094,25 +4093,18 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &mut lo.graph,
                 &lo.option_ok_or_else_try_sites,
                 result_exc_callee,
-                static_addrs.error_carrier,
             )
         };
         let result_map_err_rewritten = crate::front::result_map_err::rewire_result_map_err_sites(
             &mut lo.graph,
             &lo.result_map_err_sites,
-            static_addrs.error_carrier,
         );
         if result_exc_callee {
             crate::front::result_exc::lower_result_exc_returns(
                 &mut lo.graph,
                 tail_forwarded_returns,
-                static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
-            // Fold each raise site's `PyError` constructor into its
-            // materialisation call, so the transparent constructor — which has
-            // no host symbol and therefore no address — leaves this graph.
-            crate::front::result_exc::fuse_kind_ctor_raise(&mut lo.graph);
             if result_exc_ok_is_unit {
                 // Stamp `FUNC.RESULT = void`.  The exception-link lowering
                 // already returns the unit `()` (the callee no longer
@@ -4232,13 +4224,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // returns cannot certify these new returns: if none of them has a
             // supported shape, the callee must decline instead of exposing a
             // mixture of unwrapped values and Result shells to its callers.
-            crate::front::result_exc::lower_result_exc_returns(
-                &mut lo.graph,
-                0,
-                static_addrs.error_carrier,
-            )
-            .map_err(LowerError::Unsupported)?;
-            crate::front::result_exc::fuse_kind_ctor_raise(&mut lo.graph);
+            crate::front::result_exc::lower_result_exc_returns(&mut lo.graph, 0)
+                .map_err(LowerError::Unsupported)?;
         }
         // The `Layout::from_size_align(..).ok()` rewrite
         // (`front::from_size_align`) collapses the `from_size_align` + `ok`
@@ -4469,7 +4456,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &mut lo.graph,
                 &closure_select_outcome.result_exc_calls,
                 result_exc_callee,
-                static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
         }
