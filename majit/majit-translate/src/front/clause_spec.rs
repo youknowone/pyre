@@ -146,8 +146,8 @@ pub(crate) fn concrete_trait_refs(generics: &Value, llbc: &Llbc) -> Option<Vec<V
     Some(refs.clone())
 }
 
-/// `name__s<fn>_<impl ids>_<type keys>`. Distinct from the bare leaf and
-/// from every other instantiation of the same `fn`.
+/// `name__s<fn>_<impl ids>_<type keys>[_c<const keys>]`. Distinct from the
+/// bare leaf and from every other instantiation of the same `fn`.
 pub(crate) fn spec_leaf(leaf: &str, fn_id: u64, generics: &Value, llbc: &Llbc) -> String {
     let impls = generics
         .get("trait_refs")
@@ -169,7 +169,31 @@ pub(crate) fn spec_leaf(leaf: &str, fn_id: u64, generics: &Value, llbc: &Llbc) -
         .and_then(Value::as_array)
         .map(|types| types.iter().map(type_key).collect::<Vec<_>>().join("_"))
         .unwrap_or_default();
-    format!("{leaf}__s{fn_id}_{impls}_{types}")
+    let consts = generics
+        .get("const_generics")
+        .and_then(Value::as_array)
+        .filter(|consts| !consts.is_empty())
+        .map(|consts| {
+            let keys = consts.iter().map(type_key).collect::<Vec<_>>().join("_");
+            format!("_c{keys}")
+        })
+        .unwrap_or_default();
+    format!("{leaf}__s{fn_id}_{impls}_{types}{consts}")
+}
+
+/// The leaf `spec_leaf` was given: a specialized graph is a copy of the
+/// same function (`FunctionDesc.cachedgraph`), so a pass that recognizes a
+/// callee by its leaf sees through the `__s<fn>_…` key.
+pub(crate) fn unspecialized_leaf(leaf: &str) -> &str {
+    let Some(at) = leaf.rfind("__s") else {
+        return leaf;
+    };
+    let rest = &leaf[at + 3..];
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || !rest[digits..].starts_with('_') {
+        return leaf;
+    }
+    &leaf[..at]
 }
 
 /// `generics.types` / `generics.const_generics` when neither list contains
@@ -566,4 +590,49 @@ fn type_key(v: &Value) -> String {
         acc.wrapping_mul(31).wrapping_add(u64::from(byte))
     });
     format!("h{hash:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn empty_llbc() -> Llbc {
+        Llbc::from_slice(
+            br#"{"charon_version":"t","has_errors":false,"translated":{"crate_name":"c","fun_decls":[],"files":[]}}"#,
+        )
+        .expect("empty llbc")
+    }
+
+    fn usize_const(n: &str) -> Value {
+        json!({"Value": {"Scalar": {"Unsigned": ["Usize", n]}}})
+    }
+
+    /// `fn f<const N: usize>()` at `N = 4` and `N = 8` is two graphs.
+    #[test]
+    fn spec_leaf_distinguishes_const_generic_values() {
+        let llbc = empty_llbc();
+        let generics = |n: &str| json!({"regions": [], "types": [], "const_generics": [usize_const(n)], "trait_refs": []});
+        let four = spec_leaf("f", 7, &generics("4"), &llbc);
+        let eight = spec_leaf("f", 7, &generics("8"), &llbc);
+        assert_ne!(four, eight);
+        assert_eq!(four, spec_leaf("f", 7, &generics("4"), &llbc));
+    }
+
+    #[test]
+    fn spec_leaf_without_const_generics_keeps_its_name() {
+        let llbc = empty_llbc();
+        let generics = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
+        assert_eq!(spec_leaf("f", 7, &generics, &llbc), "f__s7__");
+    }
+
+    #[test]
+    fn unspecialized_leaf_strips_the_spec_key_only() {
+        let llbc = empty_llbc();
+        let generics = json!({"regions": [], "types": [], "const_generics": [usize_const("4")], "trait_refs": []});
+        let leaf = spec_leaf("zero_division", 42, &generics, &llbc);
+        assert_eq!(unspecialized_leaf(&leaf), "zero_division");
+        assert_eq!(unspecialized_leaf("zero_division"), "zero_division");
+        assert_eq!(unspecialized_leaf("a__sb_c"), "a__sb_c");
+    }
 }
