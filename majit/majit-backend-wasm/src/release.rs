@@ -15,6 +15,11 @@ use majit_backend::JitCellToken;
 #[derive(Default)]
 pub struct LoopAsmResources {
     pub gcmaps: Vec<Box<[usize]>>,
+    /// The cpu's exit cells this emission baked as `jf_descr` immediates.
+    /// Held so the cells outlive the `WasmBackend` while the code can still
+    /// run (dynasm keeps the same `CpuDescrHandle` clone on its compiled
+    /// loop).
+    pub exit_cells: Option<std::sync::Arc<crate::failguard::CpuExitCells>>,
     /// Real `__indirect_function_table` pair bases. `0` is not a host slot.
     pub table_slots: Vec<u32>,
     /// `LabelTarget` boxes this emission published. `ll_loop_code` is the

@@ -2700,6 +2700,10 @@ pub struct WasmBackend {
     /// box so a cargo worker thread does not run MiniMark `Drop` at
     /// pthread TLS teardown.
     gc_box: Option<ActiveGcBox>,
+    /// `compile.py` `make_and_attach_done_descrs` and `pyjitpl.py`
+    /// `propagate_exception_descr`. Heap-pinned so a moved `WasmBackend`
+    /// keeps the `jf_descr` immediates compiled modules already baked.
+    pub(crate) exit_cells: std::sync::Arc<failguard::CpuExitCells>,
 }
 
 /// GC type id of the `JitFrame`. The single registration authority is `eval.rs`
@@ -3290,6 +3294,7 @@ impl WasmBackend {
             constants: indexmap::IndexMap::new(),
             vtable_offset: None,
             gc_box: None,
+            exit_cells: std::sync::Arc::new(failguard::CpuExitCells::new()),
         }
     }
 
@@ -4069,6 +4074,7 @@ impl WasmBackend {
         inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes.get();
         inputs.ca.home_gcmap_min_labels = compiled.used_label_homes.get();
         let mut asm_resources = release::LoopAsmResources::default();
+        asm_resources.exit_cells = Some(std::sync::Arc::clone(&self.exit_cells));
         asm_resources.bridge_cells.extend(_fresh_cells);
         inputs.ca.exit_table_base = asm_resources.alloc_exit_table(merged_guard_count) as u32;
         inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
@@ -4236,7 +4242,12 @@ impl WasmBackend {
         if install_handle != 0 && install_handle != old_handle {
             asm_resources.table_slots.push(install_handle);
         }
-        publish_exit_slots(&mut asm_resources, &guard_exits, &descrs);
+        publish_exit_slots(
+            &mut asm_resources,
+            &guard_exits,
+            &descrs,
+            &inputs.ca.attached,
+        );
         // Keep still-standalone bridge descriptors after the rebuilt merged
         // prefix. Adding regions grows that prefix, so every old positional
         // range moves by exactly the difference in guard-cell counts.
@@ -4819,12 +4830,14 @@ fn publish_exit_slots(
     resources: &mut release::LoopAsmResources,
     guards: &[codegen::GuardExit],
     descrs: &[Arc<WasmFailDescr>],
+    attached: &majit_backend::AttachedDescrPtrs,
 ) {
     for (index, (guard, descr)) in guards.iter().zip(descrs).enumerate() {
         fill_exit_cell(guard.descr_cell, Arc::clone(descr));
         let cell = if guard.is_finish {
-            failguard::attached_finish_exit_index(&guard.meta_descr)
-                .map(failguard::finish_descr_ptr)
+            failguard::attached_finish_exit_index(attached, &guard.meta_descr)
+                .map(|exit| failguard::finish_cell_ptr(attached, exit))
+                .filter(|cell| *cell != 0)
                 .unwrap_or(guard.descr_cell)
         } else {
             guard.descr_cell
@@ -5215,8 +5228,11 @@ impl majit_backend::Backend for WasmBackend {
             ),
         };
         let mut asm_resources = release::LoopAsmResources::default();
+        asm_resources.exit_cells = Some(std::sync::Arc::clone(&self.exit_cells));
         module_inputs.ca.exit_table_base = asm_resources.alloc_exit_table(guard_exit_count) as u32;
         module_inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
+        // `runner.rs` captures `AttachedDescrPtrs` at `compile_loop` entry.
+        module_inputs.ca.attached = self.exit_cells.descr_ptrs();
         let resume_entry = Box::new(failguard::ResumeEntry::new());
         #[cfg(target_arch = "wasm32")]
         {
@@ -5357,7 +5373,12 @@ impl majit_backend::Backend for WasmBackend {
         if func_handle != 0 {
             asm_resources.table_slots.push(func_handle);
         }
-        publish_exit_slots(&mut asm_resources, &guard_exits, &fail_descrs);
+        publish_exit_slots(
+            &mut asm_resources,
+            &guard_exits,
+            &fail_descrs,
+            &module_inputs.ca.attached,
+        );
         if let Some(cells) = bridge_cells_owner {
             asm_resources.bridge_cells.push(cells);
         }
@@ -5501,32 +5522,35 @@ impl majit_backend::Backend for WasmBackend {
 
     // `make_and_attach_done_descrs` — the FINISH fast path
     // needs the singletons' identity, so this backend takes the attachment
-    // instead of the trait's no-op default. Where a native backend publishes
-    // `Arc::as_ptr` to its comparison sites, a wasm frame slot holds an exit
-    // index rather than a pointer, so each singleton is bound to a reserved
-    // index in the global exit space (`failguard::FINISH_EXIT_INDEX_*`).
+    // instead of the trait's no-op default. The cell address is what a wasm
+    // frame stores in `jf_descr` (`CpuExitCells`).
     fn set_done_with_this_frame_descr_void(&mut self, descr: Arc<dyn majit_ir::Descr>) {
-        failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_VOID, descr);
+        self.exit_cells
+            .attach_finish(failguard::FINISH_EXIT_INDEX_VOID, descr);
     }
 
     fn set_done_with_this_frame_descr_int(&mut self, descr: Arc<dyn majit_ir::Descr>) {
-        failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_INT, descr);
+        self.exit_cells
+            .attach_finish(failguard::FINISH_EXIT_INDEX_INT, descr);
     }
 
     fn set_done_with_this_frame_descr_ref(&mut self, descr: Arc<dyn majit_ir::Descr>) {
-        failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_REF, descr);
+        self.exit_cells
+            .attach_finish(failguard::FINISH_EXIT_INDEX_REF, descr);
     }
 
     fn set_done_with_this_frame_descr_float(&mut self, descr: Arc<dyn majit_ir::Descr>) {
-        failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_FLOAT, descr);
+        self.exit_cells
+            .attach_finish(failguard::FINISH_EXIT_INDEX_FLOAT, descr);
     }
 
     fn set_exit_frame_with_exception_descr_ref(&mut self, descr: Arc<dyn majit_ir::Descr>) {
-        failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_EXC, descr);
+        self.exit_cells
+            .attach_finish(failguard::FINISH_EXIT_INDEX_EXC, descr);
     }
 
     fn set_propagate_exception_descr(&mut self, descr: Arc<dyn majit_ir::Descr>) {
-        failguard::attach_propagate_exception_descr(descr);
+        self.exit_cells.attach_propagate(descr);
     }
 
     fn set_next_header_pc(&mut self, header_pc: u64) {
@@ -6289,8 +6313,11 @@ impl majit_backend::Backend for WasmBackend {
             ca: ca_params,
         };
         let mut asm_resources = release::LoopAsmResources::default();
+        asm_resources.exit_cells = Some(std::sync::Arc::clone(&self.exit_cells));
         module_inputs.ca.exit_table_base = asm_resources.alloc_exit_table(guard_exit_count) as u32;
         module_inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
+        // `runner.rs` captures `AttachedDescrPtrs` at `compile_bridge` entry.
+        module_inputs.ca.attached = self.exit_cells.descr_ptrs();
         let (wasm_bytes, guard_exits, _num_ref_homes, _used_labels) =
             match codegen::build_wasm_module(&module_inputs) {
                 Ok(built) => built,
@@ -6350,7 +6377,12 @@ impl majit_backend::Backend for WasmBackend {
         // The host accepted the bridge. Only now publish its global exit
         // descriptors and attach their resume-data tracer to the source CLT;
         // a rejected module can never execute and must retain neither.
-        publish_exit_slots(&mut asm_resources, &guard_exits, &bridge_descrs);
+        publish_exit_slots(
+            &mut asm_resources,
+            &guard_exits,
+            &bridge_descrs,
+            &module_inputs.ca.attached,
+        );
         Self::register_meta_descrs(original_token, &bridge_descrs);
         // Past every path that can fail with no module published: from here the
         // probe exists and its callback owns the pending entry.
