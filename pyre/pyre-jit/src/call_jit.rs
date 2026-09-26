@@ -5787,12 +5787,14 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     // gcmap keeps the caller objects alive, but a moving collection cannot
     // rewrite these copied native parameters.  Root them immediately and
     // dispatch only values reloaded from the forwarded slots.
+    //
+    // Both runs are published before the one normalize, so no argument is
+    // still unpublished when a foreign collector can first run, and the
+    // arguments land contiguously after the two leading slots.
     let _roots = pyre_object::gc_roots::push_roots();
-    let mut live = Vec::with_capacity(2 + args.len());
-    live.push(callable);
-    live.push(null_or_self);
-    live.extend_from_slice(args);
-    let root_base = _roots.pin_roots(&live);
+    let root_base = _roots.publish(&[callable, null_or_self]);
+    _roots.publish(args);
+    _roots.normalize(root_base, 2 + args.len());
     // `eval.rs`'s `PyFrame::call` — a non-null null_or_self is the method receiver
     // (load_method_fast_path pushes `[w_descr, w_obj]`); the call proceeds
     // as `callable(null_or_self, *args)`.
