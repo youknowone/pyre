@@ -6955,6 +6955,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // fine; that is why the `code?` marker below covers this arm instead.
     let guards_the_callee_function =
         !callable_guard_op.is_constant() && pinned_object_is_the_callee;
+    // The `__call__` arm pins the instance it dispatched on by class and type
+    // version, and that pin selects the resolved `__call__` the way
+    // `space.lookup` does.  The other user of this guard, the `str(e)`
+    // specializer, pins a different operand than its receiver.
+    let receiver_pinned_by_class =
+        exception_receiver_guard.is_some_and(|(receiver, ..)| receiver == callable_guard_op);
     // `Function.funccall_valuestack` fills every parameter the call left
     // unbound from `defs_w` before entering the frame
     // (`function.py:188-193,217-231`); `Arguments.parse` reaches the same frame
@@ -7726,8 +7732,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // fails that guard on every call.  A non-closure operand keeps
                 // the constant screen: dropping it inlined `self.cb(...)`
                 // wherever the callable really varied.
+                // A class-pinned `__call__` receiver selects one function for
+                // every instance the same way, with no identity guard on the
+                // operand.
                 let seeded_callee_resume = (try_multiframe || strict_seed)
                     && (callable_guard_op.is_constant()
+                        || receiver_pinned_by_class
                         || (has_closure && guards_the_callee_function));
                 // The handler exemption below was measured on a CALL entry
                 // (`blackhole_inlined_callee_local_after_escape_declined`).
@@ -8233,11 +8243,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // bridge count saturated at 29 -- 17.3x CPython against 3.0x for the same
     // loop on one instance.  `self` reaches the callee as the red operand
     // `r_args[0]` (the concrete is only the walk's shadow), so the class and
-    // version guard is the whole requirement.  The other user of this guard,
-    // the `str(e)` specializer, pins a different operand than its receiver, so
-    // it keeps the identity guard.
-    let receiver_pinned_by_class =
-        exception_receiver_guard.is_some_and(|(receiver, ..)| receiver == callable_guard_op);
+    // version guard is the whole requirement (`receiver_pinned_by_class`).
     if !guards_the_callee_function {
         // Those sites resolve the callee through their own guarded path (a
         // type version tag, a receiver class guard); all this has to pin is
