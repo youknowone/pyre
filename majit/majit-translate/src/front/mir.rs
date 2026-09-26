@@ -9646,6 +9646,7 @@ impl<'a> Lowering<'a> {
                 return None;
             }
             named_const_fold_for_path(&gd.item_meta.name_path())
+                .or_else(|| libc_integer_const(&gd.item_meta.name_path()))
         })
     }
 
@@ -13020,21 +13021,12 @@ impl<'a> Lowering<'a> {
                     // residual `__len` that would carry the array out of the
                     // block. The index check uses the same length.
                     let vable_array = self.release_declared_vable_array_address(&args[0]);
-                    if !vable_array
-                        && self.is_vec_len(&reg)
-                        && !reaches_declared_vable_array(&self.graph, &args[0])
-                    {
-                        let len = self.retarget_vec_part(
-                            bb_id,
-                            &args[0],
-                            crate::model::VecFieldPart::Len,
-                        );
-                        self.local_var[dest_local] = Some(len);
-                        let target_bb = self.block_id[target];
-                        let link_args = self.edge_args(mir_bb, target)?;
-                        self.graph.set_goto(bb_id, target_bb, link_args);
-                        return Ok(());
-                    }
+                    // `Vec::len` is `rlist.ll_length`: `return l.length`,
+                    // oopspec `list.len`. The rtyper's `len` op on a
+                    // `SomeList` is that read. A `FieldRead` named `"len"`
+                    // reaches the annotator as `getattr(list, "len")`, and
+                    // the list struct has no such attribute
+                    // (`rlist.py` `("length", Signed)`).
                     let kind = if vable_array {
                         OpKind::ArrayLen {
                             base: args[0].clone(),
@@ -17587,16 +17579,8 @@ impl<'a> Lowering<'a> {
     /// `FixedObjectArray::len` is *not* here: it goes to [`OpKind::ArrayLen`]
     /// via [`Self::is_object_array_len`], because its receiver is the
     /// virtualizable array and a `__len` call would pass that array as a
-    /// call argument.
-    fn is_vec_len(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "alloc::vec::<Impl>::len")
-    }
-
+    /// call argument. `Vec::len` is included: `rlist.ll_length` reads
+    /// `l.length`, and a field named `"len"` is not that attribute.
     fn is_container_len(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -28014,10 +27998,17 @@ fn tyref_is_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
 /// struct, or one borrow of such a struct (`&self` on a ZST).
 ///
 /// A fieldless enum is a discriminant integer, including through a borrow,
-/// so it is not void. `strip_ty_wrappers` peels the borrow; the pointee's
-/// layout is what `tyref_is_zero_sized` reads.
+/// so it is not void. A closure environment is not void either: `getkind`
+/// (`history.py`) returns `"void"` only for `lltype.Void`, and a closure
+/// is a callable — `getattr` of `call_once` still names it. Erasing the
+/// env to `Void` makes that getattr read a `Constant(None, Void)`.
+/// `strip_ty_wrappers` peels the borrow; the pointee's layout is what
+/// `tyref_is_zero_sized` reads.
 fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool {
-    if tyref_is_fieldless_enum_free(ty, llbc) || tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
+    if tyref_is_fieldless_enum_free(ty, llbc)
+        || tyref_is_borrowed_fieldless_enum_free(ty, llbc)
+        || tyref_is_closure_env(ty, llbc)
+    {
         return false;
     }
     if is_unit_type(ty, llbc) || tyref_is_zero_sized(ty, llbc) {
@@ -32749,6 +32740,47 @@ pub(crate) fn push_named_const_folds(
 
 fn named_const_fold_for_path(path: &str) -> Option<OpKind> {
     NAMED_CONST_FOLDS.with(|slot| slot.borrow().get(path).cloned())
+}
+
+/// A foreign `libc` `NamedConst` whose initializer Charon recorded `Opaque`.
+/// The defining crate is not in the extracted corpus, so the harvest has
+/// no literal. The value is the C constant (`rffi` `CConstant`): the same
+/// integer the host `libc` crate was built with.
+fn libc_integer_const(path: &str) -> Option<OpKind> {
+    let mut parts = path.split("::");
+    if parts.next() != Some("libc") {
+        return None;
+    }
+    let leaf = path.rsplit("::").next()?;
+    let value = libc_errno_value(leaf)?;
+    Some(OpKind::ConstInt(value))
+}
+
+fn libc_errno_value(leaf: &str) -> Option<i64> {
+    let value = match leaf {
+        "EACCES" => libc::EACCES,
+        "EAGAIN" => libc::EAGAIN,
+        "EALREADY" => libc::EALREADY,
+        "ECHILD" => libc::ECHILD,
+        "ECONNABORTED" => libc::ECONNABORTED,
+        "ECONNREFUSED" => libc::ECONNREFUSED,
+        "ECONNRESET" => libc::ECONNRESET,
+        "EEXIST" => libc::EEXIST,
+        "EINPROGRESS" => libc::EINPROGRESS,
+        "EINTR" => libc::EINTR,
+        "EISDIR" => libc::EISDIR,
+        "ENOENT" => libc::ENOENT,
+        "ENOTDIR" => libc::ENOTDIR,
+        "EPERM" => libc::EPERM,
+        "EPIPE" => libc::EPIPE,
+        "ESRCH" => libc::ESRCH,
+        "ETIMEDOUT" => libc::ETIMEDOUT,
+        "EWOULDBLOCK" => libc::EWOULDBLOCK,
+        #[cfg(unix)]
+        "ESHUTDOWN" => libc::ESHUTDOWN,
+        _ => return None,
+    };
+    Some(i64::from(value))
 }
 
 /// Add one crate's folds to the table, restarting it when `crate_name`
