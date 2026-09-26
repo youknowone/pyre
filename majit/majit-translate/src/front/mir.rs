@@ -968,6 +968,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     function_filter: Option<&std::collections::HashSet<String>>,
     cross_tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
     // ── Pass 1: walk type_decls + trait_decls ─────────────────────
     let (
         mut known_struct_names,
@@ -1162,6 +1163,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // production keeps going with a degraded SemanticProgram —
         // failing-loud on the single broken function rather than
         // erroring out at program-build time.
+        let body = shadow_stack_erase::erase_or_keep(fd, body, llbc);
         let accum = AccumulatorFacts::build(llbc, &body);
         let builder_mode = accum.has_builder;
         let mut atomic_reasons = Vec::new();
@@ -2818,6 +2820,7 @@ pub struct LowerContext<'a> {
 impl<'a> LowerContext<'a> {
     /// Derive the program's lowering metadata once for this context.
     pub fn new(llbc: &'a Llbc) -> Self {
+        shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
         let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
         Self {
             llbc,
@@ -2952,6 +2955,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
             fd.item_meta.name_path()
         ))
     })?;
+    let u = shadow_stack_erase::erase_or_keep(fd, u, llbc);
     let accum = AccumulatorFacts::build(llbc, &u);
     let builder_mode = accum.has_builder;
     let mut atomic_load_reasons = Vec::new();
@@ -2969,6 +2973,11 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         &mut atomic_load_reasons,
     )
 }
+
+#[path = "shadow_stack_erase.rs"]
+mod shadow_stack_erase;
+pub use shadow_stack_erase::census as shadow_stack_erase_census;
+pub use shadow_stack_erase::{discover_stack_sensitive_fns, ensure_stack_sensitive_fns};
 
 /// The MIR locals that can be a fresh string-builder accumulator: the
 /// destination of an [`is_str_builder_ctor`] CALL terminator in the
@@ -26183,7 +26192,13 @@ fn analyze_root_brackets(
 /// An erased bracket publishes nothing, so it owes no rewind and lowers no
 /// close.  A test that counts closes needs this to tell that case from a close
 /// the lowering dropped on the floor.
-pub fn erased_root_bracket_guards(llbc: &Llbc, body: &Unstructured) -> Vec<usize> {
+pub fn erased_root_bracket_guards(llbc: &Llbc, fd: &FunDecl, body: &Unstructured) -> Vec<usize> {
+    // A body the scalar replacement rewrote keeps no bracket at all.
+    if let Ok(Some(_)) = shadow_stack_erase::erase_shadow_stack(fd, body, llbc) {
+        return (0..body.locals.locals.len())
+            .filter(|local| shadow_stack_erase::is_root_scope_local(body, llbc, *local))
+            .collect();
+    }
     let moved = moved_out_locals(body);
     analyze_root_brackets(body, llbc, &moved)
         .scopes
