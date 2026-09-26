@@ -1352,38 +1352,59 @@ fn rehydrated_call_descr_ref(bh: majit_jitcode::jitcode::BhCallDescr) -> majit_i
 /// restoration stays on the first slot lookup.
 pub fn materialize_gccache_owned_descrs() {
     static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let index = descrs_index();
-        // Every Field of a struct names the same parent layout, which carries
-        // the struct's whole `all_fielddescrs`, and a struct's Fields mostly
-        // sit in consecutive slots.  Reuse the previous slot's layout when it
-        // is the same one: at most one decoded layout is held beyond the slot
-        // that uses it, so the transient stays bounded (see `descr_layout_at`).
-        let mut last_layout: Option<(usize, std::sync::Arc<majit_jitcode::jitcode::BhSizeSpec>)> =
-            None;
-        for (i, kind) in index.kinds.iter().copied().enumerate() {
-            if kind != 0 {
-                continue;
-            }
-            let bh = load_descr_with_parent(i, |layout| match &last_layout {
-                Some((last, spec)) if *last == layout => spec.clone(),
-                _ => {
-                    let spec = descr_layout_at(layout);
-                    last_layout = Some((layout, spec.clone()));
-                    spec
-                }
-            });
-            debug_assert!(!matches!(
-                bh,
-                BhDescr::Call { .. } | BhDescr::JitCode { .. }
-            ));
-            crate::descr::make_descr_from_bh(&bh);
-        }
-        register_synthetic_struct_tids();
-    });
+    ONCE.call_once(decode_kind0_descrs_off_caller_stack);
     // The decode `Once` may have run before a collector existed. Register
     // once the live collector is installed; a second call is a no-op.
     register_synthetic_struct_tids();
+}
+
+/// Kind-0 bincode runs on a fresh 8 MiB stack.
+///
+/// `frame_chain` closes the type registry from inside a recursive
+/// `CALL_ASSEMBLER` chain. Decoding the table on that stack makes Windows
+/// exit `3221226505` (`STATUS_STACK_BUFFER_OVERRUN`). A spawned thread's
+/// stack is empty, which is the same room a Linux main thread has at boot.
+/// `clone` is refused after seccomp; that path decodes on the caller.
+///
+/// Collector tids stay on this thread. `gc_op` is the GIL-backed borrow
+/// of `malloc_fast` (`framework.py`); the helper thread does not hold it.
+fn decode_kind0_descrs_off_caller_stack() {
+    let spawned = std::thread::Builder::new()
+        .name("gccache-kind0".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(decode_kind0_descrs);
+    match spawned {
+        Ok(handle) => handle.join().expect("kind-0 descr decode"),
+        Err(_) => decode_kind0_descrs(),
+    }
+}
+
+fn decode_kind0_descrs() {
+    let index = descrs_index();
+    // Every Field of a struct names the same parent layout, which carries
+    // the struct's whole `all_fielddescrs`, and a struct's Fields mostly
+    // sit in consecutive slots.  Reuse the previous slot's layout when it
+    // is the same one: at most one decoded layout is held beyond the slot
+    // that uses it, so the transient stays bounded (see `descr_layout_at`).
+    let mut last_layout: Option<(usize, std::sync::Arc<majit_jitcode::jitcode::BhSizeSpec>)> = None;
+    for (i, kind) in index.kinds.iter().copied().enumerate() {
+        if kind != 0 {
+            continue;
+        }
+        let bh = load_descr_with_parent(i, |layout| match &last_layout {
+            Some((last, spec)) if *last == layout => spec.clone(),
+            _ => {
+                let spec = descr_layout_at(layout);
+                last_layout = Some((layout, spec.clone()));
+                spec
+            }
+        });
+        debug_assert!(!matches!(
+            bh,
+            BhDescr::Call { .. } | BhDescr::JitCode { .. }
+        ));
+        crate::descr::make_descr_from_bh(&bh);
+    }
 }
 
 /// Stamp collector tids onto synthetic struct `SizeDescr`s.

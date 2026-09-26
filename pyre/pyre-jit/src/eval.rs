@@ -8183,14 +8183,9 @@ pub fn init_jit_hooks() {
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).
     init_gc_subsystem();
-    // Kind-0 descrs stay off `PYRE_JIT=0` / `PYRE_NO_JIT`. When the JIT is
-    // on, decode them before user code runs. The close hook still runs the
-    // same function before `freeze_types`; doing that decode first from
-    // inside `frame_chain`'s recursive `CALL_ASSEMBLER` makes Windows ask
-    // for a garbage-sized allocation and exit 3221226505.
-    if env_var_os("PYRE_NO_JIT").is_none() && env_var("PYRE_JIT").as_deref() != Some("0") {
-        pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
-    }
+    // Kind-0 descrs stay off boot. The close hook decodes them on a fresh
+    // stack at the first `freeze_types`. A process that never traces,
+    // including `PYRE_JIT=0`, does not run that hook.
     // `warmstate.py JitCell.__init__` stores every green as an ordinary field
     // on a GC object, so a Ref green is both owned and forwarded with the
     // cell. Pyre's Rust-owned BaseJitCell uses fixed owner-root slots for the
