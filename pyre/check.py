@@ -5264,7 +5264,7 @@ class Check:
                 print(f"{dim('done')}  {len(spec_folds)} fired")
                 return True
         for b in ALL_BACKENDS:
-            if self.enabled(b):
+            if self.enabled(b) and b not in skip_backends:
                 self._record(b, False, name, detail)
                 self._append_comparison(b, name, t_cpython, t_pypy, "FAIL")
         return False
