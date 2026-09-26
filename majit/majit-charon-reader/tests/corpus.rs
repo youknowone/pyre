@@ -53,7 +53,7 @@ fn loads_fixture_corpus() {
     //
     // + 3 for the `mem::replace` trio, `replace_field`, `replace_elem`, and
     // `replace_reborrow_then_read`. Each is one local body.
-    assert_eq!(local_count, 38, "38 local fns expected");
+    assert_eq!(local_count, 44, "44 local fns expected");
 }
 
 #[test]

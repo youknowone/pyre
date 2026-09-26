@@ -8307,36 +8307,43 @@ fn retarget_vec_operand(
     if reaches_declared_vable_array(graph, vec_var) {
         return vec_var.clone();
     }
-    let inline = graph.blocks.iter().any(|block| {
-        block.operations.iter().any(|op| {
-            op.result.as_ref() == Some(vec_var)
-                && matches!(
-                    &op.kind,
-                    OpKind::FieldRead { field, .. }
-                        if field.inline_vec && field.vec_part.is_none()
-                )
+    // One inline field read can feed both `.len()` and an index. Mutating
+    // that shared read into the first component makes the second use load a
+    // Vec word from the component. Keep the field read and emit a distinct
+    // component read for this use.
+    let inline_field = graph.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| {
+            if op.result.as_ref() != Some(vec_var) {
+                return None;
+            }
+            match &op.kind {
+                OpKind::FieldRead {
+                    base, field, pure, ..
+                } if field.inline_vec && field.vec_part.is_none() => {
+                    Some((base.clone(), field.clone(), *pure))
+                }
+                _ => None,
+            }
         })
     });
-    if inline {
-        for block in &mut graph.blocks {
-            for op in &mut block.operations {
-                if op.result.as_ref() != Some(vec_var) {
-                    continue;
-                }
-                if let OpKind::FieldRead { field, ty, .. } = &mut op.kind
-                    && field.inline_vec
-                    && field.vec_part.is_none()
-                {
-                    field.vec_part = Some(part);
-                    field.taken_by_address = false;
-                    *ty = match part {
-                        crate::model::VecFieldPart::Buf => ValueType::Ref(None),
-                        crate::model::VecFieldPart::Len => ValueType::Int,
-                    };
-                }
-            }
-        }
-        return vec_var.clone();
+    if let Some((base, mut field, pure)) = inline_field {
+        field.vec_part = Some(part);
+        field.taken_by_address = false;
+        let ty = match part {
+            crate::model::VecFieldPart::Buf => ValueType::Ref(None),
+            crate::model::VecFieldPart::Len => ValueType::Int,
+        };
+        let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::FieldRead {
+                base,
+                field,
+                ty,
+                pure,
+            },
+        });
+        return res;
     }
     let name = match part {
         crate::model::VecFieldPart::Buf => "buf",
@@ -9646,6 +9653,7 @@ impl<'a> Lowering<'a> {
                 return None;
             }
             named_const_fold_for_path(&gd.item_meta.name_path())
+                .or_else(|| libc_integer_const(&gd.item_meta.name_path()))
         })
     }
 
@@ -13020,21 +13028,12 @@ impl<'a> Lowering<'a> {
                     // residual `__len` that would carry the array out of the
                     // block. The index check uses the same length.
                     let vable_array = self.release_declared_vable_array_address(&args[0]);
-                    if !vable_array
-                        && self.is_vec_len(&reg)
-                        && !reaches_declared_vable_array(&self.graph, &args[0])
-                    {
-                        let len = self.retarget_vec_part(
-                            bb_id,
-                            &args[0],
-                            crate::model::VecFieldPart::Len,
-                        );
-                        self.local_var[dest_local] = Some(len);
-                        let target_bb = self.block_id[target];
-                        let link_args = self.edge_args(mir_bb, target)?;
-                        self.graph.set_goto(bb_id, target_bb, link_args);
-                        return Ok(());
-                    }
+                    // `Vec::len` is `rlist.ll_length`: `return l.length`,
+                    // oopspec `list.len`. The rtyper's `len` op on a
+                    // `SomeList` is that read. A `FieldRead` named `"len"`
+                    // reaches the annotator as `getattr(list, "len")`, and
+                    // the list struct has no such attribute
+                    // (`rlist.py` `("length", Signed)`).
                     let kind = if vable_array {
                         OpKind::ArrayLen {
                             base: args[0].clone(),
@@ -15632,6 +15631,8 @@ impl<'a> Lowering<'a> {
         }
         let op_kind =
             self.rewrite_equal_layout_result_branch(op_kind, first_arg_ty.as_ref(), &call.dest.ty);
+        let op_kind =
+            self.stamp_result_branch_payloads(op_kind, first_arg_ty.as_ref(), &call.dest.ty);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
@@ -16349,10 +16350,20 @@ impl<'a> Lowering<'a> {
                 // `*p = new` where `p` is not an `index_mut` alias is one word
                 // at that address: `raw_load` then `raw_store`
                 // (`rewrite_op_raw_load` / `rewrite_op_raw_store`). A
-                // `__deref_write` call has no bound address.
+                // multi-word pointee is the same move field by field
+                // (`rffi.py` `_get_structcopy_fn`): each Charon field offset,
+                // not one residual copy. A `__deref_write` call has no bound
+                // address.
                 if let Some(place) = self.bare_deref_place(&slot) {
-                    let Some(old) = self.exchange_deref_word(mir_bb, &place, args[1].clone())?
-                    else {
+                    let old = if let Some(old) =
+                        self.exchange_deref_word(mir_bb, &place, args[1].clone())?
+                    {
+                        old
+                    } else if let Some(old) =
+                        self.exchange_deref_aggregate(mir_bb, &place, Some(args[1].clone()))?
+                    {
+                        old
+                    } else {
                         return Ok(false);
                     };
                     self.local_var[dest_local] = Some(old);
@@ -16369,10 +16380,27 @@ impl<'a> Lowering<'a> {
                 let Some(slot1) = self.mem_slot(arg_locals.get(1).copied().flatten()) else {
                     return Ok(false);
                 };
-                let old0 = self.read_mem_slot(mir_bb, &slot0)?;
-                let old1 = self.read_mem_slot(mir_bb, &slot1)?;
-                self.write_mem_slot(mir_bb, slot0, old1)?;
-                self.write_mem_slot(mir_bb, slot1, old0)?;
+                if let (Some(place0), Some(place1)) =
+                    (self.bare_deref_place(&slot0), self.bare_deref_place(&slot1))
+                    && self.move_plan(&place0.ty).is_some()
+                {
+                    let Some(old0) = self.read_moved_aggregate(mir_bb, &place0)? else {
+                        return Ok(false);
+                    };
+                    let Some(old1) = self.read_moved_aggregate(mir_bb, &place1)? else {
+                        return Ok(false);
+                    };
+                    if !self.store_moved_aggregate(mir_bb, &place0, &old1)?
+                        || !self.store_moved_aggregate(mir_bb, &place1, &old0)?
+                    {
+                        return Ok(false);
+                    }
+                } else {
+                    let old0 = self.read_mem_slot(mir_bb, &slot0)?;
+                    let old1 = self.read_mem_slot(mir_bb, &slot1)?;
+                    self.write_mem_slot(mir_bb, slot0, old1)?;
+                    self.write_mem_slot(mir_bb, slot1, old0)?;
+                }
                 let bb_id = self.block_id[mir_bb];
                 self.local_var[dest_local] = Some(self.emit_unit(bb_id));
             }
@@ -16380,12 +16408,24 @@ impl<'a> Lowering<'a> {
                 let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) else {
                     return Ok(false);
                 };
-                let Some(zero) = self.zero_for_mem_slot(mir_bb, &slot) else {
-                    return Ok(false);
-                };
-                let old = self.read_mem_slot(mir_bb, &slot)?;
-                self.write_mem_slot(mir_bb, slot, zero)?;
-                self.local_var[dest_local] = Some(old);
+                if let Some(place) = self.bare_deref_place(&slot)
+                    && self.move_plan(&place.ty).is_some()
+                {
+                    // `mem::take` is `replace(dest, T::default())`. A scalar
+                    // field's `Default` is the zero this span stores; a
+                    // non-scalar field has no literal and stays a call.
+                    let Some(old) = self.exchange_deref_aggregate(mir_bb, &place, None)? else {
+                        return Ok(false);
+                    };
+                    self.local_var[dest_local] = Some(old);
+                } else {
+                    let Some(zero) = self.zero_for_mem_slot(mir_bb, &slot) else {
+                        return Ok(false);
+                    };
+                    let old = self.read_mem_slot(mir_bb, &slot)?;
+                    self.write_mem_slot(mir_bb, slot, zero)?;
+                    self.local_var[dest_local] = Some(old);
+                }
             }
             _ => return Ok(false),
         }
@@ -16505,6 +16545,405 @@ impl<'a> Lowering<'a> {
             },
         });
         Ok(Some(old))
+    }
+
+    /// Read `place`'s fields into a fresh aggregate, then store `new_value`'s
+    /// fields over it. `None` as `new_value` stores the zero of each scalar
+    /// field (`mem::take`). `Ok(None)` leaves the residual call.
+    ///
+    /// `rffi.py` `_get_structcopy_fn` copies an inline struct one field at a
+    /// time. The offsets are Charon's `variant_layouts`, so a 16-byte enum
+    /// (`Dynamic`'s `Union`) moves as those fields rather than one word.
+    fn exchange_deref_aggregate(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+        new_value: Option<Variable>,
+    ) -> Result<Option<Variable>, LowerError> {
+        let Some(old) = self.read_moved_aggregate(mir_bb, place)? else {
+            return Ok(None);
+        };
+        let stored = match new_value {
+            Some(value) => self.store_moved_aggregate(mir_bb, place, &value)?,
+            None => self.store_zero_aggregate(mir_bb, place)?,
+        };
+        if !stored {
+            return Ok(None);
+        }
+        Ok(Some(old))
+    }
+
+    fn read_moved_aggregate(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+    ) -> Result<Option<Variable>, LowerError> {
+        let Some(plan) = self.move_plan(&place.ty) else {
+            return Ok(None);
+        };
+        let base = self.deref_base(mir_bb, place)?;
+        let mut parts = Vec::with_capacity(plan.spans.len());
+        for span in &plan.spans {
+            parts.push(self.emit_span_read(mir_bb, &base, span));
+        }
+        Ok(Some(self.emit_span_aggregate(mir_bb, &plan, &parts)))
+    }
+
+    fn store_moved_aggregate(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+        value: &Variable,
+    ) -> Result<bool, LowerError> {
+        let Some(plan) = self.move_plan(&place.ty) else {
+            return Ok(false);
+        };
+        let base = self.deref_base(mir_bb, place)?;
+        for span in &plan.spans {
+            let part = self.emit_span_read(mir_bb, value, span);
+            self.emit_span_write(mir_bb, &base, span, part);
+        }
+        Ok(true)
+    }
+
+    fn store_zero_aggregate(&mut self, mir_bb: usize, place: &Place) -> Result<bool, LowerError> {
+        let Some(plan) = self.move_plan(&place.ty) else {
+            return Ok(false);
+        };
+        if plan.spans.iter().any(|span| span.zero_kind().is_none()) {
+            return Ok(false);
+        }
+        let base = self.deref_base(mir_bb, place)?;
+        for span in &plan.spans {
+            let zero = self.emit_span_zero(mir_bb, span);
+            self.emit_span_write(mir_bb, &base, span, zero);
+        }
+        Ok(true)
+    }
+
+    fn deref_base(&mut self, mir_bb: usize, place: &Place) -> Result<Variable, LowerError> {
+        let PlaceKind::Projection(inner, _) = &place.kind else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: aggregate exchange place is not a deref"
+            )));
+        };
+        self.resolve_place(mir_bb, (**inner).clone())
+    }
+
+    /// Charon fields of a multi-word inline value. A transparent newtype
+    /// (`Dynamic` over `Union`) contributes the inner type's fields. A
+    /// struct field is a `getfield`/`setfield`. An enum contributes one
+    /// raw span per non-overlapping layout field, at that field's byte
+    /// size — a wide JIT tag must not swallow the payload that sits in
+    /// the next bytes.
+    fn move_plan(&self, ty: &TyRef) -> Option<MovePlan> {
+        let id = self.tyref_adt_def_id(ty)?;
+        let td = self.llbc.type_by_id(id)?;
+        let target = std::env::var("TARGET").unwrap_or_default();
+        let layout = td.layout_for_target(&target)?;
+        let size = layout.size?;
+        if size <= 8 {
+            return None;
+        }
+        match &td.kind {
+            TypeDeclKind::Struct(fields) => {
+                if td.is_repr_transparent() && fields.len() == 1 {
+                    return self.move_plan(&fields[0].ty);
+                }
+                let name_path = td.item_meta.name_path();
+                let owner = name_path.rsplit("::").next().unwrap_or("").to_string();
+                let owner_id =
+                    majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name_path));
+                let mut spans = Vec::with_capacity(fields.len());
+                for (i, field) in fields.iter().enumerate() {
+                    let offset = layout.struct_field_offset(i)?;
+                    let node = tyref_node(&field.ty, self.llbc)?;
+                    let (_item_ty, itemsize, _is_signed) =
+                        json_ty_raw_store_descr(node, self.llbc)?;
+                    if itemsize == 0 || itemsize > 8 {
+                        return None;
+                    }
+                    let name = field.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                    let value_ty =
+                        tyref_to_value_type_with(&field.ty, self.llbc, self.tombstoned_leaves);
+                    spans.push(MoveSpan {
+                        offset,
+                        bytes: itemsize,
+                        kind: SpanKind::Field {
+                            name,
+                            owner: owner.clone(),
+                            owner_id,
+                            ty: value_ty,
+                        },
+                    });
+                }
+                if spans.is_empty() {
+                    return None;
+                }
+                Some(MovePlan { ctor_id: id, spans })
+            }
+            TypeDeclKind::Enum(variants) => {
+                let name_path = td.item_meta.name_path();
+                let leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
+                let canon = strip_crate_prefix(&name_path);
+                let base_id = majit_ir::descr::StructId::from_canonical(&canon);
+                let mut candidates: Vec<MoveSpan> = Vec::new();
+                if let (Some(offset), Some(int_ty)) =
+                    (layout.discriminant_offset(), layout.discriminant_int_type())
+                {
+                    let itemsize = int_type_byte_width(int_ty) as usize;
+                    if itemsize == 0 || itemsize > 8 {
+                        return None;
+                    }
+                    let signed = int_ty.starts_with('i');
+                    let item_ty = if signed {
+                        ValueType::Int
+                    } else {
+                        ValueType::Unsigned
+                    };
+                    // `getfield` of `__discriminant`. `raw_load` requires an
+                    // int-kind address; the slot is a reference.
+                    candidates.push(MoveSpan {
+                        offset,
+                        bytes: itemsize,
+                        kind: SpanKind::Field {
+                            name: "__discriminant".to_string(),
+                            owner: leaf.clone(),
+                            owner_id: base_id,
+                            ty: item_ty,
+                        },
+                    });
+                }
+                for (vidx, variant) in variants.iter().enumerate() {
+                    let variant_owner = format!("{leaf}::{}", variant.name);
+                    let variant_id = majit_ir::descr::StructId::from_canonical(&format!(
+                        "{canon}::{}",
+                        variant.name
+                    ));
+                    for (i, field) in variant.fields.iter().enumerate() {
+                        let Some(offset) = layout.field_offset(vidx, i) else {
+                            continue;
+                        };
+                        let Some((_item_ty, itemsize, _is_signed)) =
+                            self.span_raw_for_ty(&field.ty)
+                        else {
+                            continue;
+                        };
+                        if itemsize == 0 || itemsize > 8 {
+                            continue;
+                        }
+                        let name = field.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                        let value_ty =
+                            tyref_to_value_type_with(&field.ty, self.llbc, self.tombstoned_leaves);
+                        candidates.push(MoveSpan {
+                            offset,
+                            bytes: itemsize,
+                            kind: SpanKind::Field {
+                                name,
+                                owner: variant_owner.clone(),
+                                owner_id: variant_id,
+                                ty: value_ty,
+                            },
+                        });
+                    }
+                }
+                candidates.sort_by(|left, right| {
+                    left.offset
+                        .cmp(&right.offset)
+                        .then(right.bytes.cmp(&left.bytes))
+                });
+                let mut spans: Vec<MoveSpan> = Vec::new();
+                for candidate in candidates {
+                    let start = candidate.offset;
+                    let end = start + candidate.bytes as u64;
+                    let overlaps = spans.iter().any(|kept| {
+                        let kept_end = kept.offset + kept.bytes as u64;
+                        start < kept_end && kept.offset < end
+                    });
+                    if !overlaps {
+                        spans.push(candidate);
+                    }
+                }
+                if spans.is_empty() {
+                    return None;
+                }
+                Some(MovePlan { ctor_id: id, spans })
+            }
+            _ => None,
+        }
+    }
+
+    fn emit_span_read(&mut self, mir_bb: usize, base: &Variable, span: &MoveSpan) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let kind = match &span.kind {
+            SpanKind::Field {
+                name,
+                owner,
+                owner_id,
+                ty,
+            } => OpKind::FieldRead {
+                base: base.clone(),
+                field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
+                    .with_owner_id(Some(*owner_id)),
+                ty: ty.clone(),
+                pure: false,
+            },
+            SpanKind::Raw {
+                item_ty,
+                itemsize,
+                is_signed,
+            } => {
+                let offset = self.emit_span_offset(bb_id, span.offset);
+                OpKind::RawLoad {
+                    base: base.clone(),
+                    offset,
+                    item_ty: item_ty.clone(),
+                    itemsize: *itemsize,
+                    is_item_signed: *is_signed,
+                }
+            }
+        };
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind,
+        });
+        result
+    }
+
+    fn emit_span_write(
+        &mut self,
+        mir_bb: usize,
+        base: &Variable,
+        span: &MoveSpan,
+        value: Variable,
+    ) {
+        let bb_id = self.block_id[mir_bb];
+        let kind = match &span.kind {
+            SpanKind::Field {
+                name,
+                owner,
+                owner_id,
+                ty,
+            } => OpKind::FieldWrite {
+                base: base.clone(),
+                field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
+                    .with_owner_id(Some(*owner_id)),
+                value: crate::model::LinkArg::Value(value),
+                ty: ty.clone(),
+            },
+            SpanKind::Raw {
+                item_ty,
+                itemsize,
+                is_signed,
+            } => {
+                let offset = self.emit_span_offset(bb_id, span.offset);
+                OpKind::RawStore {
+                    base: base.clone(),
+                    offset,
+                    value,
+                    item_ty: item_ty.clone(),
+                    itemsize: *itemsize,
+                    is_item_signed: *is_signed,
+                }
+            }
+        };
+        self.graph
+            .block_mut(bb_id)
+            .operations
+            .push(SpaceOperation { result: None, kind });
+    }
+
+    fn emit_span_offset(&mut self, bb_id: crate::model::BlockId, offset: u64) -> Variable {
+        let var = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(var.clone()),
+            kind: OpKind::ConstInt(offset as i64),
+        });
+        var
+    }
+
+    fn emit_span_zero(&mut self, mir_bb: usize, span: &MoveSpan) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let kind = span.zero_kind().expect("caller checked zero_kind");
+        let var = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(var.clone()),
+            kind,
+        });
+        var
+    }
+
+    /// Fresh aggregate holding `parts`, in `plan.spans` order. The
+    /// constructor is the same empty `malloc` marker an `Rvalue::Aggregate`
+    /// emits; the parts are the field stores.
+    fn emit_span_aggregate(
+        &mut self,
+        mir_bb: usize,
+        plan: &MovePlan,
+        parts: &[Variable],
+    ) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let td = self
+            .llbc
+            .type_by_id(plan.ctor_id)
+            .expect("move plan type is in the LLBC");
+        let name_path = td.item_meta.name_path();
+        let mut segments: Vec<String> = name_path.split("::").map(str::to_string).collect();
+        let leaf = segments.pop().unwrap_or_default();
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let owner = if segments.is_empty() {
+            leaf.clone()
+        } else {
+            format!("{}::{leaf}", segments.join("::"))
+        };
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_struct_ctor(segments, leaf),
+                args: Vec::new(),
+                result_ty: ValueType::Ref(Some(owner)),
+            },
+        });
+        for (span, part) in plan.spans.iter().zip(parts.iter()) {
+            self.emit_span_write(mir_bb, &result, span, part.clone());
+        }
+        result
+    }
+
+    /// Byte width of one enum field for a whole-value move. A literal uses
+    /// its Charon size. A thin pointer or a small ADT (a `Box`, a C-like
+    /// tag) is that many bytes, so a 16-byte `Union` still moves field by
+    /// field when a payload is not an integer.
+    fn span_raw_for_ty(&self, ty: &TyRef) -> Option<(ValueType, usize, bool)> {
+        if let Some(node) = tyref_node(ty, self.llbc) {
+            if let Some(descr) = json_ty_raw_store_descr(node, self.llbc) {
+                return Some(descr);
+            }
+        }
+        if tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
+            return Some((
+                ValueType::Ref(None),
+                crate::layout::target_word_size(),
+                false,
+            ));
+        }
+        let id = self.tyref_adt_def_id(ty)?;
+        let td = self.llbc.type_by_id(id)?;
+        let target = std::env::var("TARGET").unwrap_or_default();
+        let size = td.layout_for_target(&target)?.size?;
+        if size == 0 || size > 8 {
+            return None;
+        }
+        Some((ValueType::Unsigned, size as usize, false))
     }
 
     fn raw_word_descr(&self, ty: &TyRef) -> Option<(ValueType, usize, bool)> {
@@ -17587,16 +18026,8 @@ impl<'a> Lowering<'a> {
     /// `FixedObjectArray::len` is *not* here: it goes to [`OpKind::ArrayLen`]
     /// via [`Self::is_object_array_len`], because its receiver is the
     /// virtualizable array and a `__len` call would pass that array as a
-    /// call argument.
-    fn is_vec_len(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "alloc::vec::<Impl>::len")
-    }
-
+    /// call argument. `Vec::len` is included: `rlist.ll_length` reads
+    /// `l.length`, and a field named `"len"` is not that attribute.
     fn is_container_len(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -19773,6 +20204,74 @@ impl<'a> Lowering<'a> {
             return op_kind;
         };
         rewrite_result_branch_for_layouts(op_kind, Some(&result_layout), Some(&flow_layout))
+    }
+
+    /// Record each `Result::branch` variant payload from the Result and
+    /// ControlFlow type decls. The later match reads these instead of
+    /// assuming every payload is a reference.
+    fn stamp_result_branch_payloads(
+        &self,
+        kind: OpKind,
+        recv_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> OpKind {
+        let OpKind::Call {
+            target,
+            args,
+            result_ty,
+        } = kind
+        else {
+            return kind;
+        };
+        let CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } = &target
+        else {
+            return OpKind::Call {
+                target,
+                args,
+                result_ty,
+            };
+        };
+        if name != "branch" || !receiver_root.as_deref().unwrap_or("").ends_with("Result") {
+            return OpKind::Call {
+                target,
+                args,
+                result_ty,
+            };
+        }
+        let Some(recv_ty) = recv_ty else {
+            return OpKind::Call {
+                target,
+                args,
+                result_ty,
+            };
+        };
+        if !crate::front::result_exc::tyref_is_result(recv_ty, self.llbc) {
+            return OpKind::Call {
+                target,
+                args,
+                result_ty,
+            };
+        }
+        let payloads = crate::model::ResultBranchPayloads {
+            ok: adt_variant_payload_type(recv_ty, "Ok", self.llbc, self.tombstoned_leaves),
+            err: adt_variant_payload_type(recv_ty, "Err", self.llbc, self.tombstoned_leaves),
+            continue_ty: adt_variant_payload_type(
+                dest_ty,
+                "Continue",
+                self.llbc,
+                self.tombstoned_leaves,
+            ),
+            break_ty: adt_variant_payload_type(dest_ty, "Break", self.llbc, self.tombstoned_leaves),
+        };
+        OpKind::Call {
+            target: target.with_branch_payloads(payloads),
+            args,
+            result_ty,
+        }
     }
 
     fn layout_of_tyref(&self, ty: &TyRef) -> Option<majit_charon_reader::ullbc::TypeLayout> {
@@ -27206,6 +27705,63 @@ enum MemSlot {
     Index(usize),
 }
 
+/// One field of a multi-word `mem::replace` / `swap` / `take`.
+struct MovePlan {
+    ctor_id: u64,
+    spans: Vec<MoveSpan>,
+}
+
+struct MoveSpan {
+    offset: u64,
+    /// Physical width. Overlap uses this, not the JIT field's word size.
+    bytes: usize,
+    kind: SpanKind,
+}
+
+enum SpanKind {
+    /// Named struct field. `getfield_gc` / `setfield_gc`.
+    Field {
+        name: String,
+        owner: String,
+        owner_id: majit_ir::descr::StructId,
+        ty: ValueType,
+    },
+    /// Enum layout byte. Width is the Charon field, not the JIT tag model.
+    Raw {
+        item_ty: ValueType,
+        itemsize: usize,
+        is_signed: bool,
+    },
+}
+
+impl SpanKind {
+    fn size(&self) -> usize {
+        match self {
+            SpanKind::Field { ty, .. } => match ty {
+                ValueType::Float | ValueType::Int | ValueType::Unsigned | ValueType::Ref(_) => 8,
+                ValueType::Bool => 1,
+                _ => 8,
+            },
+            SpanKind::Raw { itemsize, .. } => *itemsize,
+        }
+    }
+}
+
+impl MoveSpan {
+    fn zero_kind(&self) -> Option<OpKind> {
+        let ty = match &self.kind {
+            SpanKind::Field { ty, .. } => ty.clone(),
+            SpanKind::Raw { item_ty, .. } => item_ty.clone(),
+        };
+        match ty {
+            ValueType::Int | ValueType::Ref(_) => Some(OpKind::ConstInt(0)),
+            ValueType::Unsigned | ValueType::Bool => Some(OpKind::ConstUInt(0)),
+            ValueType::Float => Some(OpKind::ConstFloat(0.0f64.to_bits())),
+            _ => None,
+        }
+    }
+}
+
 fn borrowed_place_referent(rvalue: &Rvalue) -> Option<Place> {
     let place = match rvalue {
         Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => place,
@@ -28014,10 +28570,17 @@ fn tyref_is_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
 /// struct, or one borrow of such a struct (`&self` on a ZST).
 ///
 /// A fieldless enum is a discriminant integer, including through a borrow,
-/// so it is not void. `strip_ty_wrappers` peels the borrow; the pointee's
-/// layout is what `tyref_is_zero_sized` reads.
+/// so it is not void. A closure environment is not void either: `getkind`
+/// (`history.py`) returns `"void"` only for `lltype.Void`, and a closure
+/// is a callable — `getattr` of `call_once` still names it. Erasing the
+/// env to `Void` makes that getattr read a `Constant(None, Void)`.
+/// `strip_ty_wrappers` peels the borrow; the pointee's layout is what
+/// `tyref_is_zero_sized` reads.
 fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool {
-    if tyref_is_fieldless_enum_free(ty, llbc) || tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
+    if tyref_is_fieldless_enum_free(ty, llbc)
+        || tyref_is_borrowed_fieldless_enum_free(ty, llbc)
+        || tyref_is_closure_env(ty, llbc)
+    {
         return false;
     }
     if is_unit_type(ty, llbc) || tyref_is_zero_sized(ty, llbc) {
@@ -29902,6 +30465,10 @@ fn json_ty_scalar_element_spelling(node: &serde_json::Value, llbc: &Llbc) -> Opt
 /// A pointer is one word only while it is thin: a pointer to an unsized
 /// pointee carries a length or a vtable beside the address.
 fn json_ty_is_thin_pointer_element(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    // `Box<T>` of a sized `T` is one pointer word, the same width as `&T`.
+    if type_node_is_thin_box(node, llbc) {
+        return true;
+    }
     let Some(obj) = strip_ty_indirections(node, llbc).and_then(serde_json::Value::as_object) else {
         return false;
     };
@@ -32751,6 +33318,47 @@ fn named_const_fold_for_path(path: &str) -> Option<OpKind> {
     NAMED_CONST_FOLDS.with(|slot| slot.borrow().get(path).cloned())
 }
 
+/// A foreign `libc` `NamedConst` whose initializer Charon recorded `Opaque`.
+/// The defining crate is not in the extracted corpus, so the harvest has
+/// no literal. The value is the C constant (`rffi` `CConstant`): the same
+/// integer the host `libc` crate was built with.
+fn libc_integer_const(path: &str) -> Option<OpKind> {
+    let mut parts = path.split("::");
+    if parts.next() != Some("libc") {
+        return None;
+    }
+    let leaf = path.rsplit("::").next()?;
+    let value = libc_errno_value(leaf)?;
+    Some(OpKind::ConstInt(value))
+}
+
+fn libc_errno_value(leaf: &str) -> Option<i64> {
+    let value = match leaf {
+        "EACCES" => libc::EACCES,
+        "EAGAIN" => libc::EAGAIN,
+        "EALREADY" => libc::EALREADY,
+        "ECHILD" => libc::ECHILD,
+        "ECONNABORTED" => libc::ECONNABORTED,
+        "ECONNREFUSED" => libc::ECONNREFUSED,
+        "ECONNRESET" => libc::ECONNRESET,
+        "EEXIST" => libc::EEXIST,
+        "EINPROGRESS" => libc::EINPROGRESS,
+        "EINTR" => libc::EINTR,
+        "EISDIR" => libc::EISDIR,
+        "ENOENT" => libc::ENOENT,
+        "ENOTDIR" => libc::ENOTDIR,
+        "EPERM" => libc::EPERM,
+        "EPIPE" => libc::EPIPE,
+        "ESRCH" => libc::ESRCH,
+        "ETIMEDOUT" => libc::ETIMEDOUT,
+        "EWOULDBLOCK" => libc::EWOULDBLOCK,
+        #[cfg(unix)]
+        "ESHUTDOWN" => libc::ESHUTDOWN,
+        _ => return None,
+    };
+    Some(i64::from(value))
+}
+
 /// Add one crate's folds to the table, restarting it when `crate_name`
 /// repeats.
 ///
@@ -35176,6 +35784,12 @@ fn lower_result_branch_to_control_flow(graph: &mut FunctionGraph) {
             let Some(result) = op.result.clone() else {
                 continue;
             };
+            let payloads = match target {
+                CallTarget::Method {
+                    branch_payloads, ..
+                } => branch_payloads.clone(),
+                _ => None,
+            };
             sites.push((
                 bi,
                 oi,
@@ -35185,10 +35799,11 @@ fn lower_result_branch_to_control_flow(graph: &mut FunctionGraph) {
                 receiver_root
                     .clone()
                     .unwrap_or_else(|| "core::result::Result".to_string()),
+                payloads,
             ));
         }
     }
-    for (bi, oi, operand, result, result_ty, result_owner) in sites.into_iter().rev() {
+    for (bi, oi, operand, result, result_ty, result_owner, payloads) in sites.into_iter().rev() {
         lower_result_branch_as_match(
             graph,
             BlockId(bi),
@@ -35197,6 +35812,7 @@ fn lower_result_branch_to_control_flow(graph: &mut FunctionGraph) {
             &result,
             &result_owner,
             &result_ty,
+            payloads.as_ref(),
         );
     }
 }
@@ -35239,6 +35855,57 @@ fn push_enum_field_read(
 
 /// Replace one `Result::branch` call with a discriminant switch that builds
 /// `ControlFlow::Continue` or `ControlFlow::Break`.
+/// Register bank of one enum variant's payload, taken from that variant's
+/// field on the type decl. A `TypeVar` field is the corresponding generic
+/// argument of `ty`. Unit and other zero-sized payloads are `None`: the
+/// match emits no read and no field for them.
+fn adt_variant_payload_type(
+    ty: &TyRef,
+    variant: &str,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<ValueType> {
+    let node = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc))?;
+    let def_id = adt_node_def_id(node)?;
+    let td = llbc.type_by_id(def_id)?;
+    let TypeDeclKind::Enum(variants) = &td.kind else {
+        return None;
+    };
+    let field = variants
+        .iter()
+        .find(|decl| decl.name == variant)?
+        .fields
+        .first()?;
+    let concrete = substitute_typevar_field(&field.ty, node, llbc)?;
+    if is_unit_type(&concrete, llbc) || tyref_is_void_zst(&concrete, llbc) {
+        return None;
+    }
+    let value = tyref_enum_payload_value_type(&concrete, llbc, tombstoned);
+    if value == ValueType::Void {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn substitute_typevar_field(
+    field_ty: &TyRef,
+    owner_adt: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<TyRef> {
+    let node = tyref_node(field_ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
+    if let Some(index) = typevar_bound_index(node) {
+        let arg = owner_adt
+            .get("Adt")?
+            .get("generics")?
+            .get("types")?
+            .as_array()?
+            .get(index as usize)?;
+        return serde_json::from_value(arg.clone()).ok();
+    }
+    Some(clone_tyref(field_ty))
+}
+
 fn lower_result_branch_as_match(
     graph: &mut FunctionGraph,
     block: BlockId,
@@ -35247,11 +35914,11 @@ fn lower_result_branch_as_match(
     result: &Variable,
     result_owner: &str,
     result_ty: &ValueType,
+    payloads: Option<&crate::model::ResultBranchPayloads>,
 ) {
     use crate::front::bool_then::{emit_sum_variant, map_source};
 
     let cf_owner = control_flow_owner(result_ty);
-    let payload_ty = ValueType::Ref(None);
     let mut prefix_defined = graph.block(block).inputargs.clone();
     for op in graph.block(block).operations.iter().take(op_idx) {
         if let Some(produced) = &op.result {
@@ -35321,22 +35988,38 @@ fn lower_result_branch_as_match(
         let sources = prefix_defined.clone();
         let (arm, arm_inputs) = graph.create_block_with_arg_vars(sources.len());
         let operand_arm = map_source(&sources, &arm_inputs, operand).expect("operand threaded");
-        let payload = push_enum_field_read(
-            graph,
-            arm,
-            operand_arm,
-            &format!("{result_owner}::{result_variant}"),
-            "__pos_0",
-            payload_ty.clone(),
-        );
+        let (read_ty, write_ty) = match (tag, payloads) {
+            (0, Some(payloads)) => (payloads.ok.clone(), payloads.continue_ty.clone()),
+            (1, Some(payloads)) => (payloads.err.clone(), payloads.break_ty.clone()),
+            // A call lowered without type decls keeps the reference bank the
+            // match used before the decls were consulted.
+            _ => (Some(ValueType::Ref(None)), Some(ValueType::Ref(None))),
+        };
         let payload_owner = format!("{cf_owner}::{flow_variant}");
+        let payload = match (read_ty, write_ty) {
+            (Some(read_ty), Some(write_ty)) => Some((
+                payload_owner,
+                push_enum_field_read(
+                    graph,
+                    arm,
+                    operand_arm,
+                    &format!("{result_owner}::{result_variant}"),
+                    "__pos_0",
+                    read_ty,
+                ),
+                write_ty,
+            )),
+            _ => None,
+        };
         let built = emit_sum_variant(
             graph,
             arm,
             &cf_owner,
             flow_variant,
             tag,
-            Some((&payload_owner, payload, payload_ty.clone())),
+            payload
+                .as_ref()
+                .map(|(owner, value, ty)| (owner.as_str(), value.clone(), ty.clone())),
         );
         let mut args: Vec<Variable> = sources
             .iter()
@@ -38242,6 +38925,153 @@ mod tests {
         }
         assert!(ctors.iter().any(|name| name == "Continue"), "{ctors:?}");
         assert!(ctors.iter().any(|name| name == "Break"), "{ctors:?}");
+    }
+
+    fn result_flow_llbc(ok_ty: serde_json::Value, err_ty: serde_json::Value) -> Llbc {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|seg| serde_json::json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            })
+        };
+        let enum_decl = |def_id: u64, path: &[&str], variants: &[(&str, u64)]| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": meta(path),
+                "kind": {"Enum": variants.iter().map(|(name, index)| serde_json::json!({
+                    "name": name,
+                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, index]}}}],
+                    "discriminant": {"Scalar": {"Signed": ["Isize", index.to_string()]}}
+                })).collect::<Vec<_>>()},
+                "layout": []
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    enum_decl(0, &["core", "result", "Result"], &[("Ok", 0), ("Err", 1)]),
+                    enum_decl(1, &["core", "ops", "control_flow", "ControlFlow"], &[("Break", 0), ("Continue", 1)]),
+                ],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let _ = (ok_ty, err_ty);
+        Llbc::from_slice(file.to_string().as_bytes()).expect("result/controlflow llbc")
+    }
+
+    fn branch_adt_ty(def_id: u64, args: &[serde_json::Value]) -> TyRef {
+        serde_json::from_value(serde_json::json!({
+            "Adt": {
+                "id": {"Adt": def_id},
+                "generics": {"regions": [], "types": args, "const_generics": [], "trait_refs": []}
+            }
+        }))
+        .expect("adt ty")
+    }
+
+    fn branch_graph(payloads: crate::model::ResultBranchPayloads) -> FunctionGraph {
+        let mut graph = FunctionGraph::new("result_branch_payload");
+        let entry = graph.startblock;
+        let operand = graph
+            .push_op_var(entry, OpKind::ConstInt(1), true)
+            .expect("operand");
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::method("branch", Some("core::result::Result".into()))
+                        .with_branch_payloads(payloads),
+                    args: vec![LinkArg::Value(operand)],
+                    result_ty: ValueType::Ref(Some("core::ops::control_flow::ControlFlow".into())),
+                },
+                true,
+            )
+            .expect("branch");
+        graph.set_return(entry, Some(result));
+        graph
+    }
+
+    fn payload_field_tys(graph: &FunctionGraph) -> (Vec<ValueType>, Vec<ValueType>) {
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
+        for op in graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+        {
+            match &op.kind {
+                OpKind::FieldRead { field, ty, .. } if field.name == "__pos_0" => {
+                    reads.push(ty.clone());
+                }
+                OpKind::FieldWrite { field, ty, .. } if field.name == "__pos_0" => {
+                    writes.push(ty.clone());
+                }
+                _ => {}
+            }
+        }
+        (reads, writes)
+    }
+
+    #[test]
+    fn result_branch_match_uses_int_payloads_from_the_type_decls() {
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let llbc = result_flow_llbc(i64_ty.clone(), i64_ty.clone());
+        let result_ty = branch_adt_ty(0, &[i64_ty.clone(), i64_ty.clone()]);
+        // ControlFlow<B, C>: field 0 is Break, field 1 is Continue.
+        let flow_ty = branch_adt_ty(1, &[i64_ty.clone(), i64_ty]);
+        let tombstoned = std::collections::HashSet::new();
+        let payloads = crate::model::ResultBranchPayloads {
+            ok: super::adt_variant_payload_type(&result_ty, "Ok", &llbc, &tombstoned),
+            err: super::adt_variant_payload_type(&result_ty, "Err", &llbc, &tombstoned),
+            continue_ty: super::adt_variant_payload_type(&flow_ty, "Continue", &llbc, &tombstoned),
+            break_ty: super::adt_variant_payload_type(&flow_ty, "Break", &llbc, &tombstoned),
+        };
+        assert_eq!(payloads.ok, Some(ValueType::Int));
+        assert_eq!(payloads.err, Some(ValueType::Int));
+        assert_eq!(payloads.continue_ty, Some(ValueType::Int));
+        assert_eq!(payloads.break_ty, Some(ValueType::Int));
+        let mut graph = branch_graph(payloads);
+        super::lower_result_branch_to_control_flow(&mut graph);
+        let (reads, writes) = payload_field_tys(&graph);
+        assert_eq!(reads, vec![ValueType::Int, ValueType::Int]);
+        assert_eq!(writes, vec![ValueType::Int, ValueType::Int]);
+    }
+
+    #[test]
+    fn result_branch_match_emits_nothing_for_void_payloads() {
+        let unit = serde_json::json!({"Adt": {"id": "Tuple", "generics": {"types": []}}});
+        let llbc = result_flow_llbc(unit.clone(), unit.clone());
+        let result_ty = branch_adt_ty(0, &[unit.clone(), unit.clone()]);
+        let flow_ty = branch_adt_ty(1, &[unit.clone(), unit]);
+        let tombstoned = std::collections::HashSet::new();
+        let payloads = crate::model::ResultBranchPayloads {
+            ok: super::adt_variant_payload_type(&result_ty, "Ok", &llbc, &tombstoned),
+            err: super::adt_variant_payload_type(&result_ty, "Err", &llbc, &tombstoned),
+            continue_ty: super::adt_variant_payload_type(&flow_ty, "Continue", &llbc, &tombstoned),
+            break_ty: super::adt_variant_payload_type(&flow_ty, "Break", &llbc, &tombstoned),
+        };
+        assert_eq!(payloads.ok, None);
+        assert_eq!(payloads.err, None);
+        assert_eq!(payloads.continue_ty, None);
+        assert_eq!(payloads.break_ty, None);
+        let mut graph = branch_graph(payloads);
+        super::lower_result_branch_to_control_flow(&mut graph);
+        let (reads, writes) = payload_field_tys(&graph);
+        assert!(reads.is_empty(), "void payload emits no read: {reads:?}");
+        assert!(writes.is_empty(), "void payload emits no field: {writes:?}");
+        assert_eq!(count_branch_calls(&graph), 0);
     }
 
     #[test]
@@ -43037,6 +43867,79 @@ mod tests {
         assert!(!thin(uint("U8")));
     }
 
+    /// `Vec::index_mut` of `Vec<Box<T>>` is one word per element when `T` has
+    /// a concrete size. `IndexMut::index_mut` then lowers to `ArrayRead`
+    /// (`getarrayitem`) instead of staying a residual call.
+    #[test]
+    fn a_box_of_a_sized_adt_is_a_thin_pointer_element() {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let meta = serde_json::json!({
+            "name": [{"Ident": ["fixture", 0]}, {"Ident": ["Payload", 0]}],
+            "span": span, "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta,
+                    "kind": {"Struct": []},
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 16,
+                            "align": 8,
+                            "variant_layouts": [{"field_offsets": []}],
+                            "repr": {"transparent": false}
+                        }
+                    }]
+                }],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let payload = serde_json::json!({
+            "Adt": {
+                "id": {"Adt": 0},
+                "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+            }
+        });
+        let boxed = serde_json::json!({
+            "Adt": {
+                "id": {"Builtin": "Box"},
+                "generics": {"regions": [], "types": [payload], "const_generics": [], "trait_refs": []}
+            }
+        });
+        assert!(
+            json_ty_is_thin_pointer_element(&boxed, &llbc),
+            "Box<sized ADT> is one pointer word, so index_mut can emit ArrayRead"
+        );
+        let fat_box = serde_json::json!({
+            "Adt": {
+                "id": {"Builtin": "Box"},
+                "generics": {
+                    "regions": [],
+                    "types": [{"Slice": {"Literal": {"UInt": "U8"}}}],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        assert!(
+            !json_ty_is_thin_pointer_element(&fat_box, &llbc),
+            "Box<[u8]> is a fat pointer and must not take the one-word stride"
+        );
+    }
+
     #[test]
     fn field_layout_keeps_reference_repr_instead_of_embedding_the_referent() {
         let llbc = llbc_with_trait_impls(serde_json::json!([]));
@@ -46191,8 +47094,24 @@ mod tests {
             .expect("stack field");
         let bb = inline.startblock;
         let buf = super::retarget_vec_operand(&mut inline, bb, &stack, VecFieldPart::Buf);
-        assert_eq!(buf, stack, "inline field retargets the field read in place");
-        assert_eq!(field_part(&inline, &stack), VecFieldPart::Buf);
+        assert_ne!(buf, stack, "inline field keeps the original read");
+        assert!(
+            inline
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. }
+                            if op.result.as_ref() == Some(&stack)
+                                && field.inline_vec
+                                && field.vec_part.is_none()
+                    )
+                }),
+            "the shared field read stays the whole Vec"
+        );
+        assert_eq!(field_part(&inline, &buf), VecFieldPart::Buf);
 
         let mut local = FunctionGraph::new("vec_local");
         let arg = input(&mut local, "v");
@@ -46233,6 +47152,90 @@ mod tests {
             }
             other => panic!("box receiver must getfield the length word, got {other:?}"),
         }
+    }
+
+    /// `let v = &mut frame.items; let n = v.len(); v[0]` binds the inline
+    /// field once. Each use gets its own component read; neither read is
+    /// stacked on the other.
+    #[test]
+    fn shared_inline_vec_len_and_index_keep_the_field_read() {
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType, VecFieldPart};
+
+        let mut graph = FunctionGraph::new("shared_inline_vec");
+        let frame = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "frame".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .expect("frame");
+        let v = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: frame.clone(),
+                    field: FieldDescriptor::new("items", Some("Frame".into()))
+                        .with_inline_vec(true),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .expect("items");
+        let bb = graph.startblock;
+        let len = super::retarget_vec_operand(&mut graph, bb, &v, VecFieldPart::Len);
+        let elem = super::retarget_vec_operand(&mut graph, bb, &v, VecFieldPart::Buf);
+        assert_ne!(len, v);
+        assert_ne!(elem, v);
+        assert_ne!(len, elem);
+        let mut component_bases = Vec::new();
+        let mut original_intact = false;
+        for op in graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+        {
+            match &op.kind {
+                OpKind::FieldRead {
+                    base, field, ty, ..
+                } if op.result.as_ref() == Some(&v) => {
+                    original_intact = field.inline_vec
+                        && field.vec_part.is_none()
+                        && field.name == "items"
+                        && base == &frame;
+                    let _ = ty;
+                }
+                OpKind::FieldRead {
+                    base, field, ty, ..
+                } if op.result.as_ref() == Some(&len) || op.result.as_ref() == Some(&elem) => {
+                    assert_eq!(
+                        base, &frame,
+                        "component read uses the struct, not a Vec word"
+                    );
+                    assert_eq!(field.name, "items");
+                    assert!(field.inline_vec);
+                    assert_ne!(base, &len);
+                    assert_ne!(base, &elem);
+                    component_bases.push((field.vec_part, ty.clone()));
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            original_intact,
+            "original field read must survive both uses"
+        );
+        assert_eq!(
+            component_bases,
+            vec![
+                (Some(VecFieldPart::Len), ValueType::Int),
+                (Some(VecFieldPart::Buf), ValueType::Ref(None)),
+            ]
+        );
     }
 
     /// The `Vec` index fold must accept a `usize` index.

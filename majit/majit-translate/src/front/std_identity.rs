@@ -63,7 +63,7 @@ fn is_identity_wrapper_target(
             }
             match (name.as_str(), path_leaf(receiver_root.as_deref())) {
                 ("get", Some("Cell")) => true,
-                ("as_ref", Some("Box")) => true,
+                ("as_ref" | "as_mut", Some("Box")) => true,
                 ("deref" | "deref_mut", Some("Ref") | Some("MutexGuard")) => true,
                 _ => false,
             }
@@ -84,7 +84,7 @@ fn is_identity_wrapper_target(
                 }
                 Some("new") if path_has(segments, "atomic") => true,
                 Some("get") if recv == Some("Cell") || path_has(segments, "Cell") => true,
-                Some("as_ref")
+                Some("as_ref" | "as_mut")
                     if recv == Some("Box")
                         || path_has(segments, "Box")
                         || path_has(segments, "boxed") =>
@@ -186,8 +186,9 @@ pub(crate) fn lower_std_primitive_op(
         } else {
             receiver_path
         };
-        // `Box::as_ref` is a pointer cast whatever the layout is.
-        if banks_agree && is_box_as_ref(target, receiver_path) {
+        // `Box::as_ref` / `Box::as_mut` are a pointer cast whatever the
+        // layout is.
+        if banks_agree && is_box_as_ref_or_mut(target, receiver_path) {
             return same_as(operand, result_ty.clone());
         }
         if let Some(fields) = layout {
@@ -247,15 +248,18 @@ fn function_leaf_is(target: &CallTarget, leaf: &str) -> bool {
     }
 }
 
-fn is_box_as_ref(target: &CallTarget, receiver_path: Option<&str>) -> bool {
+fn is_box_as_ref_or_mut(target: &CallTarget, receiver_path: Option<&str>) -> bool {
     match target {
         CallTarget::Method {
             name,
             receiver_root,
             ..
-        } => name == "as_ref" && path_leaf(receiver_root.as_deref()) == Some("Box"),
+        } => {
+            matches!(name.as_str(), "as_ref" | "as_mut")
+                && path_leaf(receiver_root.as_deref()) == Some("Box")
+        }
         CallTarget::FunctionPath { segments, .. } => {
-            function_leaf(segments) == Some("as_ref")
+            matches!(function_leaf(segments), Some("as_ref" | "as_mut"))
                 && (path_leaf(receiver_path) == Some("Box")
                     || path_has(segments, "Box")
                     || path_has(segments, "boxed"))
@@ -509,6 +513,25 @@ mod tests {
             matches!(multi, OpKind::UnaryOp { ref op, .. } if op == "same_as"),
             "Box::as_ref stays a pointer cast when the layout is not one field"
         );
+
+        let as_mut = lower_std_primitive_op(
+            call(
+                CallTarget::method("as_mut", Some("Box".into())),
+                vec![v.clone()],
+                ValueType::Ref(None),
+            ),
+            Some("alloc::boxed::Box"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+        );
+        assert!(matches!(
+            as_mut,
+            OpKind::UnaryOp { ref op, .. } if op == "same_as"
+        ));
 
         let deref = lower_std_primitive_op(
             call(

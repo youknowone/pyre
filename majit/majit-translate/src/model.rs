@@ -12,7 +12,7 @@ use crate::flowspace::model::ConstValue;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlockId(pub usize);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ValueType {
     Int,
     /// `lltype.Unsigned` — register class is `'int'` per
@@ -218,6 +218,19 @@ pub enum UnsupportedExprKind {
 
 pub use majit_jitcode::rclass::ImmutableRank;
 
+/// Payload banks of one `Result::branch` call.
+///
+/// `ok` / `err` are the Result variant fields. `continue_ty` / `break_ty`
+/// are the ControlFlow variant fields. `None` is a void payload and is
+/// not read or written.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ResultBranchPayloads {
+    pub ok: Option<ValueType>,
+    pub err: Option<ValueType>,
+    pub continue_ty: Option<ValueType>,
+    pub break_ty: Option<ValueType>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CallTarget {
     Method {
@@ -241,6 +254,9 @@ pub enum CallTarget {
         /// (`#[serde(skip)]`).
         #[serde(skip, default)]
         fun_decl_id: Option<u64>,
+        /// Set only on `Result::branch`. Resolved from the two type decls.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_payloads: Option<ResultBranchPayloads>,
     },
     FunctionPath {
         segments: Vec<String>,
@@ -322,7 +338,18 @@ impl CallTarget {
             receiver_root,
             resolved_path: None,
             fun_decl_id: None,
+            branch_payloads: None,
         }
+    }
+
+    pub fn with_branch_payloads(mut self, payloads: ResultBranchPayloads) -> Self {
+        if let CallTarget::Method {
+            branch_payloads, ..
+        } = &mut self
+        {
+            *branch_payloads = Some(payloads);
+        }
+        self
     }
 
     pub fn resolved_path(&self) -> Option<&crate::parse::CallPath> {
@@ -1240,12 +1267,14 @@ pub enum OpKind {
         array_is_signed: bool,
     },
     /// Virtualizable array write → writes to boxes.
-    /// RPython: `setarrayitem_vable_i/r/f`
+    /// RPython: `setarrayitem_vable_i/r/f`. `rewrite_op_setarrayitem` passes
+    /// the value through; a `Constant` stays a `LinkArg::Const` and the
+    /// assembler encodes it (`jtransform.py` `rewrite_op_setarrayitem`).
     VableArrayWrite {
         base: crate::flowspace::model::Variable,
         array_index: usize,
         elem_index: crate::flowspace::model::Variable,
-        value: crate::flowspace::model::Variable,
+        value: LinkArg,
         item_ty: ValueType,
         /// RPython: arraydescr.itemsize from VirtualizableInfo.array_descrs.
         array_itemsize: usize,
@@ -5929,6 +5958,13 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
                         .entry(target_iarg.clone())
                         .or_default()
                         .push(arg_var.clone());
+                    // A void operand is omitted from `Call.args`
+                    // (`NON_VOID_ARGS`) but the definition still crosses
+                    // this edge. Keeping the target inputarg read retains
+                    // that `ConstNone` and the link that carries it.
+                    if FunctionGraph::concretetype_of(arg_var) == ConcreteType::Void {
+                        read_vars.insert(target_iarg.clone());
+                    }
                 }
             }
         }
@@ -13864,6 +13900,7 @@ mod tests {
             receiver_root: Some("Bar".into()),
             resolved_path: Some(path),
             fun_decl_id: None,
+            branch_payloads: None,
         };
         let json = serde_json::to_string(&t).expect("encode");
         assert!(

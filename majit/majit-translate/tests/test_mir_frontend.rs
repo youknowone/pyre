@@ -1668,3 +1668,88 @@ fn mem_replace_reborrow_then_read_returns_new() {
     let replace_calls = kinds.iter().filter(|k| k.contains("replace")).count();
     assert_eq!(replace_calls, 0, "still calls mem::replace: {kinds:?}");
 }
+
+/// A multi-word value moves one field at a time. `TwoWords` is two `i64`
+/// fields (`getfield` / `setfield`). `WordUnion` is a 16-byte enum: the tag
+/// and each non-overlapping payload field are `getfield` / `setfield`.
+#[test]
+fn mem_replace_of_a_multi_word_value_is_field_wise() {
+    use majit_translate::model::OpKind;
+    let llbc = load_corpus();
+
+    let field_names = |name: &str, want_read: bool| -> Vec<String> {
+        let graph = lower_function(llbc, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut names = Vec::new();
+        let mut replace_calls = 0usize;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::FieldRead { field, .. } if want_read => names.push(field.name.clone()),
+                    OpKind::FieldWrite { field, .. } if !want_read => {
+                        names.push(field.name.clone())
+                    }
+                    OpKind::Call { target, .. } => {
+                        if format!("{target:?}").contains("replace")
+                            || format!("{target:?}").contains("swap")
+                            || format!("{target:?}").contains("take")
+                        {
+                            replace_calls += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            replace_calls, 0,
+            "{name} still calls mem::replace/swap/take"
+        );
+        names.sort();
+        names
+    };
+
+    assert_eq!(
+        field_names("replace_two_words", true),
+        vec![
+            "hi".to_string(),
+            "hi".to_string(),
+            "lo".to_string(),
+            "lo".to_string()
+        ],
+        "replace reads each field of the slot and of the new value"
+    );
+    assert_eq!(
+        field_names("replace_two_words", false),
+        vec![
+            "hi".to_string(),
+            "hi".to_string(),
+            "lo".to_string(),
+            "lo".to_string()
+        ],
+        "replace writes each field of the slot and of the saved value"
+    );
+    assert_eq!(
+        field_names("swap_two_words", true),
+        vec![
+            "hi".to_string(),
+            "hi".to_string(),
+            "lo".to_string(),
+            "lo".to_string()
+        ],
+    );
+    assert_eq!(
+        field_names("take_two_words", true),
+        vec!["hi".to_string(), "lo".to_string()],
+        "take reads the slot once, then stores zeros"
+    );
+
+    let names = field_names("replace_word_union", true);
+    assert!(
+        names.iter().any(|name| name == "__discriminant"),
+        "enum exchange reads the tag, got {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "__pos_0"),
+        "enum exchange reads a payload field, got {names:?}"
+    );
+}

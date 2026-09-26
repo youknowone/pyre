@@ -951,6 +951,7 @@ mod tests {
             receiver_root: Some("Result".into()),
             resolved_path: None,
             fun_decl_id: None,
+            branch_payloads: None,
         };
         let impl_path = CallTarget::FunctionPath {
             segments: segs(&["core", "result", "<Impl>", "ok"]),
@@ -965,6 +966,7 @@ mod tests {
             receiver_root: Some("Option".into()),
             resolved_path: None,
             fun_decl_id: None,
+            branch_payloads: None,
         };
         let unrelated = CallTarget::FunctionPath {
             segments: segs(&["core", "option", "<Impl>", "ok"]),

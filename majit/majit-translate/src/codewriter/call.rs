@@ -11536,6 +11536,7 @@ mod tests {
                         receiver_root: Some("Unrelated".to_string()),
                         resolved_path: None,
                         fun_decl_id: None,
+                        branch_payloads: None,
                     },
                     args: Vec::new(),
                     result_ty: ValueType::Void,
@@ -14016,6 +14017,7 @@ mod tests {
                 receiver_root: Some(receiver.to_string()),
                 resolved_path: None,
                 fun_decl_id: None,
+                branch_payloads: None,
             };
             assert_eq!(
                 cc.target_to_path(&closure_call),
@@ -14041,6 +14043,7 @@ mod tests {
                 receiver_root: Some(receiver.to_string()),
                 resolved_path: None,
                 fun_decl_id: None,
+                branch_payloads: None,
             };
             assert_eq!(
                 cc.target_to_path(&other),
@@ -14057,6 +14060,7 @@ mod tests {
             receiver_root: Some("<default methods of OpcodeStepExecutor>".to_string()),
             resolved_path: None,
             fun_decl_id: None,
+            branch_payloads: None,
         };
         assert_eq!(
             cc.target_to_path(&named_call),
@@ -14110,6 +14114,7 @@ mod tests {
             receiver_root: Some("closure#1".to_string()),
             resolved_path: Some(free_path.clone()),
             fun_decl_id: Some(21),
+            branch_payloads: None,
         };
         assert_eq!(
             cc.target_to_path(&free_call),
@@ -14121,6 +14126,7 @@ mod tests {
             receiver_root: Some("closure#12".to_string()),
             resolved_path: Some(owned_path.clone()),
             fun_decl_id: Some(22),
+            branch_payloads: None,
         };
         assert_eq!(
             cc.target_to_path(&owned_call),
@@ -14227,6 +14233,7 @@ mod tests {
                     receiver_root: Some("closure#1".to_string()),
                     resolved_path: Some(nested.clone()),
                     fun_decl_id: Some(11),
+                    branch_payloads: None,
                 },
             ),
         );

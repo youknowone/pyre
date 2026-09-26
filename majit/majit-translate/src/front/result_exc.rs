@@ -1003,7 +1003,13 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
             elem_index,
             value,
             ..
-        } => vec![base.clone(), elem_index.clone(), value.clone()],
+        } => {
+            let mut refs = vec![base.clone(), elem_index.clone()];
+            if let Some(var) = value.as_variable() {
+                refs.push(var.clone());
+            }
+            refs
+        }
         OpKind::Call { args, .. } => crate::model::call_arg_vars(args),
         OpKind::JitDebug { args }
         | OpKind::NewTuple { args }
