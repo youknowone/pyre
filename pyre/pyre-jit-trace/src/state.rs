@@ -4974,8 +4974,9 @@ pub(crate) fn store_live_frame_array_slot(vable_ptr: usize, slot: usize, value: 
     if slot >= arr.len() {
         return;
     }
-    arr.as_mut_slice()[slot] = r.as_usize() as pyre_object::PyObjectRef;
-    frame_array_write_barrier(vable_ptr as *mut u8, lp);
+    // `setarrayitem_gc` on the GcArray of GCREF: barrier the array
+    // (`write_barrier_from_array`), not a raw slot write.
+    arr.set_ref(slot, r.as_usize() as pyre_object::PyObjectRef);
 }
 
 /// Keep the scalar half of an inlined frame's red virtualizable coherent with
@@ -12768,9 +12769,6 @@ mod tests {
                 callee_frame_helper: |_| None,
                 recursive_force_cache_safe: |_| false,
                 jit_drop_callee_frame: std::ptr::null(),
-                jit_frame_set_slot_ref: std::ptr::null(),
-                jit_frame_set_slot_int: std::ptr::null(),
-                jit_frame_set_slot_float: std::ptr::null(),
                 jit_force_callee_frame: std::ptr::null(),
                 jit_force_recursive_call_1: std::ptr::null(),
                 jit_force_recursive_call_argraw_boxed_1: std::ptr::null(),

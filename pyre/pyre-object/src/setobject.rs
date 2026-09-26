@@ -339,13 +339,13 @@ pub unsafe fn is_set_or_frozenset(obj: PyObjectRef) -> bool {
     unsafe { is_set(obj) || is_frozenset(obj) }
 }
 
-/// Fire the GC write barrier for a set whose element storage just gained
-/// a possibly-young element. `set_object_custom_trace` only forwards the
-/// `items` slots when the set is reached by a collection; an old-gen set
-/// that stored a young element is reached on a minor GC only if it sits in
-/// the remembered set, so the barrier must run after every insert. Mirrors
-/// `dict_write_barrier`: `rordereddict.py` `dicttable` is the box the
-/// barrier remembers, and a no-GC-hook fallback allocation is not
+/// Fire the write barrier on a set whose `items` field was just replaced.
+///
+/// `ll_dict_setitem` records the store on the `dicttable`
+/// (`rordereddict.py` `GcStruct("dicttable")`), not on the set.
+/// [`set_items_write_barrier`] is that store. This one is only the
+/// `sstorage` assignment (`setobject.py` `W_BaseSetObject.clear`,
+/// `get_storage_copy`). A no-GC-hook fallback allocation is not
 /// collector-owned.
 #[inline]
 fn set_write_barrier(obj: PyObjectRef) {
@@ -357,6 +357,18 @@ fn set_write_barrier(obj: PyObjectRef) {
     if !items.is_null() && crate::gc_hook::try_gc_owns_object(items as *mut u8) {
         crate::gc_hook::try_gc_write_barrier(items as *mut u8);
     }
+}
+
+/// Remember `items` after a store of a GC reference into that box.
+///
+/// The box is old (`gc_alloc_storage_box`) and `set_items_storage_custom_trace`
+/// walks its `ObjectKey.obj` slots. A minor reaches an old box only from the
+/// remembered set — `drag_out` does not trace an old root — including a box
+/// `clear` has already detached (`d = self.unerase(w_set.sstorage)`,
+/// `setobject.py`).
+#[inline]
+fn set_items_write_barrier(items: *mut SetItemsStorage) {
+    crate::gc_hook::try_gc_write_barrier(items as *mut u8);
 }
 
 /// Allocate an empty `set`.
@@ -384,14 +396,11 @@ pub fn w_frozenset_new() -> PyObjectRef {
 }
 
 fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
-    // Allocate the body in GC old-gen (mark-sweep, non-moving) so it
-    // carries TRACK_YOUNG_PTRS, mirroring `w_list_new` / `w_tuple_new`.
-    // `w_set_add` stores possibly-young elements into `items`; the write
-    // barrier (`set_write_barrier`) only remembers the set on a minor
-    // collection when the body is an old-gen object, so a body allocated
-    // through the plain `malloc_typed` (no TRACK_YOUNG_PTRS) would leave
-    // young elements unforwarded and collected. Falls back to
-    // `malloc_typed` when no GC hook is installed (unit tests).
+    // Allocate the body on the same nursery bump as `w_tuple_new`
+    // (`malloc_fixedsize`). `w_set_add` stores possibly-young elements
+    // into `items`; the write barrier remembers an old-gen spill so those
+    // elements survive a later minor. Falls back to `malloc_typed` when
+    // no GC hook is installed (unit tests).
     //
     // The items box has no heap edge until the body is written, and both
     // `get_instantiate` and the body malloc can collect.  Pin the box and
@@ -404,7 +413,7 @@ fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
     let _ = crate::gc_roots::pin_root(items as PyObjectRef);
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(get_instantiate(set_type));
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_SET_GC_TYPE_ID, W_SET_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_SET_GC_TYPE_ID, W_SET_OBJECT_SIZE);
     let items = crate::gc_roots::shadow_stack_get(items_slot) as *mut SetItemsStorage;
     let body = W_SetObject {
         ob_header: PyObject {
@@ -461,8 +470,15 @@ pub fn w_frozenset_from_items(items: &[PyObjectRef]) -> PyObjectRef {
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_add(obj: PyObjectRef, item: PyObjectRef) {
-    let key = crate::dictmultiobject::object_key_for(item);
-    let _ = w_set_insert_key_checked(obj, key);
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::pin_roots(&[obj, item]);
+    let item_slot = obj_slot + 1;
+    let key = crate::dictmultiobject::object_key_for(crate::gc_roots::shadow_stack_get(item_slot));
+    let key = crate::dictmultiobject::object_key_hashed(
+        crate::gc_roots::shadow_stack_get(item_slot),
+        key.hash,
+    );
+    let _ = w_set_insert_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key);
 }
 
 /// Insert an element keyed on a `space.hash_w` digest the caller already
@@ -663,12 +679,15 @@ pub unsafe fn w_set_discard_key_checked(
     }
 
     let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
     let items = capture_set_items(obj);
     let (found, _) = scan_set_key_reentrant(items, key)?;
     if let Some(index) = found {
         // Remove from the captured box; a `clear` during the probe orphans it,
         // leaving the live storage untouched (`discard` of an absent element).
         set_remove_slot(items, index);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let s = &mut *(obj as *mut W_SetObject);
         s.set_len_relaxed((*s.items).len());
         s.hash = -1;
@@ -682,8 +701,11 @@ pub unsafe fn w_set_discard_key_checked(
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_contains(obj: PyObjectRef, item: PyObjectRef) -> bool {
-    let key = crate::dictmultiobject::object_key_for(item);
-    w_set_contains_key_checked(obj, key).unwrap_or(false)
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::pin_roots(&[obj, item]);
+    let item_slot = obj_slot + 1;
+    let key = crate::dictmultiobject::object_key_for(crate::gc_roots::shadow_stack_get(item_slot));
+    w_set_contains_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key).unwrap_or(false)
 }
 
 /// Fallible variant of [`w_set_contains`].
@@ -698,8 +720,13 @@ pub unsafe fn w_set_contains_checked(
     obj: PyObjectRef,
     item: PyObjectRef,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
-    let key = crate::dictmultiobject::object_key_for_checked(item)?;
-    w_set_contains_key_checked(obj, key)
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::pin_roots(&[obj, item]);
+    let item_slot = obj_slot + 1;
+    let key = crate::dictmultiobject::object_key_for_checked(crate::gc_roots::shadow_stack_get(
+        item_slot,
+    ))?;
+    w_set_contains_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key)
 }
 
 /// Remove an element if present. Returns true when removed.
@@ -707,8 +734,13 @@ pub unsafe fn w_set_contains_checked(
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_discard(obj: PyObjectRef, item: PyObjectRef) -> bool {
-    let key = crate::dictmultiobject::object_key_for(item);
-    w_set_discard_key_checked(obj, key).unwrap_or(false)
+    // Hashing the element can run `__hash__` and collect: the set and the
+    // element are livevars across it, as in `w_set_contains`.
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::pin_roots(&[obj, item]);
+    let item_slot = obj_slot + 1;
+    let key = crate::dictmultiobject::object_key_for(crate::gc_roots::shadow_stack_get(item_slot));
+    w_set_discard_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key).unwrap_or(false)
 }
 
 /// Fallible variant of [`w_set_discard`].
@@ -719,8 +751,14 @@ pub unsafe fn w_set_discard_checked(
     obj: PyObjectRef,
     item: PyObjectRef,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
-    let key = crate::dictmultiobject::object_key_for_checked(item)?;
-    w_set_discard_key_checked(obj, key)
+    // Same livevar set as [`w_set_discard`].
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::pin_roots(&[obj, item]);
+    let item_slot = obj_slot + 1;
+    let key = crate::dictmultiobject::object_key_for_checked(crate::gc_roots::shadow_stack_get(
+        item_slot,
+    ))?;
+    w_set_discard_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key)
 }
 
 /// Remove every element.
@@ -797,7 +835,13 @@ pub unsafe fn w_set_copy_storage_from(dst: PyObjectRef, src: PyObjectRef) {
     d.items = crate::gc_storage::gc_alloc_storage_box(copied, set_items_gc_type_id());
     d.set_len_relaxed((*d.items).len());
     d.hash = -1;
+    // `sstorage` assignment on the set, then the copied keys on the new table.
+    // The clone filled a host `RDict` before the box existed, so the element
+    // barrier did not run for those stores.
     set_write_barrier(dst);
+    if (*d.items).len() != 0 {
+        set_items_write_barrier(d.items);
+    }
 }
 
 /// Remove a set operand's elements, keeping the digests it holds.
@@ -817,7 +861,17 @@ pub unsafe fn w_set_difference_update_from_set(
     dst: PyObjectRef,
     src: PyObjectRef,
 ) -> Result<(), SetUpdateError> {
-    let (_first_guard, _second_guard) = w_set_lock_pair(dst, src);
+    let _roots = crate::gc_roots::push_roots();
+    let dst_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(dst);
+    let src_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(src);
+    let (_first_guard, _second_guard) = w_set_lock_pair(
+        crate::gc_roots::shadow_stack_get(dst_slot),
+        crate::gc_roots::shadow_stack_get(src_slot),
+    );
+    let dst = crate::gc_roots::shadow_stack_get(dst_slot);
+    let src = crate::gc_roots::shadow_stack_get(src_slot);
     if std::ptr::eq(
         (*(dst as *const W_SetObject)).items,
         (*(src as *const W_SetObject)).items,
@@ -831,48 +885,57 @@ pub unsafe fn w_set_difference_update_from_set(
     // storage wholesale. Besides the complexity bound, this preserves the
     // exact contains-with-hash callback direction of the upstream strategy.
     if w_set_len(dst) < w_set_len(src) {
-        // A set is old-gen and never moves, but the difference accumulator has
-        // no referrer until `w_set_copy_storage_from` below: the `eq_w` a bucket
-        // probe runs is a collection point that would otherwise sweep it.
-        let _roots = crate::gc_roots::push_roots();
-        let result = w_set_new();
-        let result = crate::gc_roots::pin_root(result);
+        // The difference accumulator has no referrer until
+        // `w_set_copy_storage_from` below: the `eq_w` a bucket probe runs is a
+        // collection point that would otherwise sweep it, and the operand
+        // bodies relocate, so each walk step reloads them.
+        let result_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(w_set_new());
+        let dst = crate::gc_roots::shadow_stack_get(dst_slot);
         let dst_items = (*(dst as *const W_SetObject)).items;
         let dst_len = (*dst_items).len();
         let mut i = 0;
-        while let Some(slot) = w_set_next_slot(dst, i) {
+        while let Some(slot) = w_set_next_slot(crate::gc_roots::shadow_stack_get(dst_slot), i) {
+            let dst = crate::gc_roots::shadow_stack_get(dst_slot);
             let Some(key) = w_set_key_at(dst, slot) else {
                 return Err(SetUpdateError::ChangedSize);
             };
-            if !w_set_contains_key_for_update(src, key)? {
+            if !w_set_contains_key_for_update(crate::gc_roots::shadow_stack_get(src_slot), key)? {
+                let dst = crate::gc_roots::shadow_stack_get(dst_slot);
                 if (*(dst as *const W_SetObject)).items != dst_items
                     || (*dst_items).len() != dst_len
                 {
                     return Err(SetUpdateError::ChangedSize);
                 }
                 // The comparison may clear or otherwise shorten `dst`.
-                // CPython's set probe restarts when `entry->key` changes;
+                // The set probe restarts when `entry->key` changes;
                 // once this live index disappeared there is no surviving
                 // entry to copy into the difference result.
                 let Some(key) = w_set_key_at(dst, slot) else {
                     return Err(SetUpdateError::ChangedSize);
                 };
-                w_set_insert_key_checked(result, key)?;
+                w_set_insert_key_checked(crate::gc_roots::shadow_stack_get(result_slot), key)?;
             }
             i = slot + 1;
         }
-        w_set_copy_storage_from(dst, result);
+        w_set_copy_storage_from(
+            crate::gc_roots::shadow_stack_get(dst_slot),
+            crate::gc_roots::shadow_stack_get(result_slot),
+        );
         return Ok(());
     }
     // `src` is a distinct storage, so removing from `dst` cannot renumber it.
+    let src = crate::gc_roots::shadow_stack_get(src_slot);
     let src_items = (*(src as *const W_SetObject)).items;
     let src_len = (*src_items).len();
     let mut i = 0;
-    while let Some(slot) = w_set_next_slot(src, i) {
+    while let Some(slot) = w_set_next_slot(crate::gc_roots::shadow_stack_get(src_slot), i) {
+        let src = crate::gc_roots::shadow_stack_get(src_slot);
         let Some(key) = w_set_key_at(src, slot) else {
             return Err(SetUpdateError::ChangedSize);
         };
-        w_set_remove_key_for_update(dst, key)?;
+        w_set_remove_key_for_update(crate::gc_roots::shadow_stack_get(dst_slot), key)?;
+        let src = crate::gc_roots::shadow_stack_get(src_slot);
         if (*(src as *const W_SetObject)).items != src_items || (*src_items).len() != src_len {
             return Err(SetUpdateError::ChangedSize);
         }
@@ -895,7 +958,19 @@ pub unsafe fn w_set_update_from_set(
     dst: PyObjectRef,
     src: PyObjectRef,
 ) -> Result<(), SetUpdateError> {
-    let (_first_guard, _second_guard) = w_set_lock_pair(dst, src);
+    // The bodies relocate: `w_set_insert_key_into` runs `eq_w`, and this
+    // frame's `dst`/`src` locals are the only referrers for a temporary.
+    let _roots = crate::gc_roots::push_roots();
+    let dst_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(dst);
+    let src_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(src);
+    let (_first_guard, _second_guard) = w_set_lock_pair(
+        crate::gc_roots::shadow_stack_get(dst_slot),
+        crate::gc_roots::shadow_stack_get(src_slot),
+    );
+    let dst = crate::gc_roots::shadow_stack_get(dst_slot);
+    let src = crate::gc_roots::shadow_stack_get(src_slot);
     if std::ptr::eq(
         (*(dst as *const W_SetObject)).items,
         (*(src as *const W_SetObject)).items,
@@ -912,14 +987,13 @@ pub unsafe fn w_set_update_from_set(
     // `src`'s keys are still read one index at a time rather than collected: an
     // `eq_w` raised from the bucket probe below can move every element, and
     // the collector rewrites the `obj` slots inside the two tables in place
-    // (`set_object_custom_trace`) — a `Vec` of keys lifted out of them would
-    // not be walked and would be left holding stale pointers.
-    let _roots = crate::gc_roots::push_roots();
+    // (`set_items_storage_custom_trace`) — a `Vec` of keys lifted out of them
+    // would not be walked and would be left holding stale pointers.
     let dst_items = capture_set_items(dst);
     let src_items = capture_set_items(src);
     let mut i = 0;
     while let Some((slot, &key, _)) = (*src_items).next_entry(i) {
-        w_set_insert_key_into(dst, dst_items, key)?;
+        w_set_insert_key_into(crate::gc_roots::shadow_stack_get(dst_slot), dst_items, key)?;
         i = slot + 1;
     }
     Ok(())
@@ -966,6 +1040,12 @@ unsafe fn w_set_insert_key_into(
     items: *mut SetItemsStorage,
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), SetUpdateError> {
+    let _dst_roots = crate::gc_roots::push_roots();
+    let dst_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(dst);
+    let key_slot = crate::gc_roots::shadow_stack_len();
+    let mut key = key;
+    key.obj = crate::gc_roots::pin_root(key.obj);
     // Single insert probe (matches `r_dict.setitem`'s one bucket scan), run
     // callback-free so no user `__eq__` mutates the set while the table
     // borrow is live.  When every same-hash comparison stays inside the
@@ -978,23 +1058,32 @@ unsafe fn w_set_insert_key_into(
         let entries = &mut *items;
         let index = entries.index_of(&key);
         if crate::dict_eq_hook::callback_free_probe_broken() {
-            return;
+            return false;
         }
         if index.is_some() {
-            return;
+            return false;
         }
         // The probe above proved no bucket entry compares equal without
         // leaving the ladder, so this placement probe repeats those same
         // comparisons and cannot break either.
-        entries.insert(key, ());
-        let set = &mut *(dst as *mut W_SetObject);
-        set.set_len_relaxed((*set.items).len());
-        set.hash = -1;
-        set_write_barrier(dst);
+        let mut live_key = key;
+        live_key.obj = crate::gc_roots::shadow_stack_get(key_slot);
+        entries.insert(live_key, ());
+        true
     }) {
-        return result.map_err(SetUpdateError::Key);
+        if result.map_err(SetUpdateError::Key)? {
+            // The key landed in `items`, which a probing `clear` may already
+            // have detached from `dst`. Barrier that box, not the set body.
+            set_items_write_barrier(items);
+            let dst = crate::gc_roots::shadow_stack_get(dst_slot);
+            let set = &mut *(dst as *mut W_SetObject);
+            set.set_len_relaxed((*set.items).len());
+            set.hash = -1;
+        }
+        return Ok(());
     }
 
+    key.obj = crate::gc_roots::shadow_stack_get(key_slot);
     let (found, key) = scan_set_key_reentrant(items, key).map_err(SetUpdateError::Key)?;
     if found.is_some() {
         return Ok(());
@@ -1003,10 +1092,13 @@ unsafe fn w_set_insert_key_into(
     // repeat its comparisons — the ones that can re-enter this table.  Place it
     // on the digest alone (`ll_call_insert_clean_function`).
     (*items).insert_known_absent(key, ());
+    // Same box the scan captured. A `clear` inside that scan has already
+    // pointed `dst.items` at a fresh table; the new key lives here.
+    set_items_write_barrier(items);
+    let dst = crate::gc_roots::shadow_stack_get(dst_slot);
     let set = &mut *(dst as *mut W_SetObject);
     set.set_len_relaxed((*set.items).len());
     set.hash = -1;
-    set_write_barrier(dst);
     Ok(())
 }
 
@@ -1017,6 +1109,11 @@ unsafe fn w_set_contains_key_for_update(
     probe: PyObjectRef,
     mut key: crate::dictmultiobject::ObjectKey,
 ) -> Result<bool, SetUpdateError> {
+    let _probe_roots = crate::gc_roots::push_roots();
+    let probe_slot = crate::gc_roots::shadow_stack_len();
+    let probe = crate::gc_roots::pin_root(probe);
+    let key_root = crate::gc_roots::shadow_stack_len();
+    key.obj = crate::gc_roots::pin_root(key.obj);
     // Bucket probe first, as in `w_set_contains_key_checked`.  The walk below
     // is the reentrant fallback and visits every entry, so without this a
     // whole-set difference probes linearly per element and runs quadratic.
@@ -1027,6 +1124,8 @@ unsafe fn w_set_contains_key_for_update(
         return result.map_err(SetUpdateError::Key);
     }
     'restart: loop {
+        let probe = crate::gc_roots::shadow_stack_get(probe_slot);
+        key.obj = crate::gc_roots::shadow_stack_get(key_root);
         let items = (*(probe as *const W_SetObject)).items;
         let len = (*items).len();
         let mut i = 0;
@@ -1046,6 +1145,7 @@ unsafe fn w_set_contains_key_for_update(
                 if crate::dictmultiobject::take_dict_key_error() {
                     return Err(SetUpdateError::Key(crate::dictmultiobject::DictKeyError));
                 }
+                let probe = crate::gc_roots::shadow_stack_get(probe_slot);
                 if (*(probe as *const W_SetObject)).items != items
                     || (*items).len() != len
                     || !(*items).get_slot(slot).is_some_and(|(current, _)| {
@@ -1072,6 +1172,11 @@ unsafe fn w_set_remove_key_for_update(
     dst: PyObjectRef,
     mut key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), SetUpdateError> {
+    let _dst_roots = crate::gc_roots::push_roots();
+    let dst_slot = crate::gc_roots::shadow_stack_len();
+    let dst = crate::gc_roots::pin_root(dst);
+    let key_root = crate::gc_roots::shadow_stack_len();
+    key.obj = crate::gc_roots::pin_root(key.obj);
     // Locate the bucket callback-free before falling back to the entry walk,
     // which is linear in the set's size.  The index is resolved inside the
     // probe and the removal withheld when a comparison leaves the builtin
@@ -1080,18 +1185,26 @@ unsafe fn w_set_remove_key_for_update(
         let items = (*(dst as *const W_SetObject)).items;
         let index = (*items).index_of(&key);
         if crate::dict_eq_hook::callback_free_probe_broken() {
-            return;
+            return false;
         }
         if let Some(index) = index {
             set_remove_slot(items, index);
+            true
+        } else {
+            false
+        }
+    }) {
+        if result.map_err(SetUpdateError::Key)? {
+            let dst = crate::gc_roots::shadow_stack_get(dst_slot);
             let set = &mut *(dst as *mut W_SetObject);
             set.set_len_relaxed(set.len_relaxed() - 1);
             set.hash = -1;
         }
-    }) {
-        return result.map_err(SetUpdateError::Key);
+        return Ok(());
     }
     'restart: loop {
+        let dst = crate::gc_roots::shadow_stack_get(dst_slot);
+        key.obj = crate::gc_roots::shadow_stack_get(key_root);
         let items = (*(dst as *const W_SetObject)).items;
         let len = (*items).len();
         let mut found = None;
@@ -1112,6 +1225,7 @@ unsafe fn w_set_remove_key_for_update(
                 if crate::dictmultiobject::take_dict_key_error() {
                     return Err(SetUpdateError::Key(crate::dictmultiobject::DictKeyError));
                 }
+                let dst = crate::gc_roots::shadow_stack_get(dst_slot);
                 if (*(dst as *const W_SetObject)).items != items
                     || (*items).len() != len
                     || !(*items).get_slot(slot).is_some_and(|(current, _)| {
@@ -1129,6 +1243,7 @@ unsafe fn w_set_remove_key_for_update(
         }
         if let Some(index) = found {
             set_remove_slot(items, index);
+            let dst = crate::gc_roots::shadow_stack_get(dst_slot);
             let set = &mut *(dst as *mut W_SetObject);
             set.set_len_relaxed(set.len_relaxed() - 1);
             set.hash = -1;
@@ -1192,8 +1307,8 @@ pub unsafe fn w_set_stored_hashes(obj: PyObjectRef) -> Vec<i64> {
 /// without hashing it again. Reading one index at a time lets a caller whose
 /// loop body reaches user code (an `eq_w` from a bucket probe) re-read the key
 /// afterwards: the collector rewrites the `obj` slots inside the table in place
-/// (`set_object_custom_trace`), so a key read before that point can be stale
-/// while the table itself stays correct.
+/// (`set_items_storage_custom_trace`), so a key read before that point can be
+/// stale while the table itself stays correct.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
@@ -1315,12 +1430,13 @@ pub unsafe fn w_set_items(obj: PyObjectRef) -> Vec<PyObjectRef> {
     items
 }
 
-/// Walk, in place, every element `PyObjectRef` slot of a set for GC root
-/// forwarding.  Forwards each `ObjectKey.obj` slot: `ObjectKey.hash` is
+/// Walk, in place, every element `PyObjectRef` slot of a set for an
+/// immortal owner.  Forwards each `ObjectKey.obj` slot: `ObjectKey.hash` is
 /// identity-stable across a GC move, so writing the relocated pointer through
 /// the key's `obj` slot keeps the bucket index valid.  Alloc-free — unlike
-/// [`w_set_items`], which materialises a `Vec`.  The port of
-/// `set_object_custom_trace`.
+/// [`w_set_items`], which materialises a `Vec`.  A collector-owned set does
+/// not use this walk: `set_items_storage_custom_trace` traces the storage
+/// box, and the set body only forwards `items`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.

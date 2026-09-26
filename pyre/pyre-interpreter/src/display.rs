@@ -11,43 +11,44 @@ use crate::{
     builtin_code_name, function_get_name, function_get_qualname,
 };
 
-/// The address a repr quotes, spelled the way `PyUnicode_FromFormat`'s `%p`
-/// spells it.
+/// Spell `addr` the way `PyUnicode_FromFormat`'s `%p` does.
 ///
 /// That conversion hands the pointer to the platform's own `printf` and
-/// normalizes only the prefix — "guaranteed to start with the literal `0x`
-/// regardless of what the platform's `printf` yields". The platforms disagree
-/// about the rest: the MSVC runtime pads to the pointer width and uppercases,
-/// glibc does neither. So `<function f at 0x000001B7AF7FFCC0>` and
-/// `<function f at 0x1b7af7ffcc0>` are the same repr, each on its own platform,
-/// and Rust's `{:p}` is only ever the second one.
+/// normalizes only the prefix — guaranteed to start with the literal `0x`.
+/// The MSVC runtime pads to the pointer width and uppercases; glibc does
+/// neither, and Rust's `{:p}` is only ever the second spelling.
 ///
-/// The *value* is a raw address, where `getaddrstring` renders `space.id(self)`
-/// — the same number `builtin_id` answers, which since #1316 goes through
-/// `gc_identity_hash` so a nursery move preserves it.  The two spellings can
-/// therefore disagree for a young object, whose id is the shadow address it is
-/// about to be moved to rather than the one it currently occupies.
-///
-/// They do not disagree in practice, and that was measured rather than assumed:
-/// for `object()`, an instance, a function and a generator — the classes whose
-/// repr carries an address at all — the repr address equals `hex(id(x))` at
-/// birth and again after a collection, at the default nursery, at 1MB and at
-/// 512KB, and under `MAJIT_GC_STRESS=1`.  The classes that do move, list and
-/// dict, print no address.  So the sets do not overlap and there is nothing to
-/// observe.
-///
-/// Closing the gap anyway would mean routing the callers through the hook, and
-/// they are not uniform: several pass a `*const` to a Rust struct
-/// (`PyFrame`, the thread lock types) rather than a GC handle, and one already
-/// holds a `usize` computed elsewhere.  It would also put a shadow-allocating
-/// call — i.e. a collection point — inside every address-printing repr.  Take
-/// that on with a witness in hand, not on the strength of the spelling.
+/// The bits are whatever the caller already computed. A Rust struct that is
+/// not a moving GC object — `PyFrame` (born with `try_gc_alloc_stable_raw`)
+/// and the `_thread` lock types (born with `malloc_typed_stable`) — passes
+/// its own address here. A GC object that can move prints
+/// [`repr_gc_addr`] instead, so the text is `getaddrstring`'s id rather than
+/// the nursery address it currently occupies.
 pub fn repr_addr(addr: usize) -> String {
     if cfg!(windows) {
         format!("0x{addr:0width$X}", width = size_of::<usize>() * 2)
     } else {
         format!("0x{addr:x}")
     }
+}
+
+/// Address half of `W_Root.getaddrstring` for a GC object.
+///
+/// `getaddrstring` renders `space.id(self)`. For an object with no
+/// `immutable_unique_id` that is `compute_unique_id`, which incminimark
+/// implements as `id_or_identityhash`: the shadow a nursery object will be
+/// copied to, or the object's own address once it is old. That is the same
+/// number `ObjSpace.id` / `builtin_id` returns, so `hex(id(obj))` and this
+/// text stay equal across a minor collection.
+///
+/// Allocating the id shadow can collect. The receiver is rooted across that
+/// call and the hash reads the reloaded word — a copy taken before the
+/// shadow allocation addresses the pre-move object, and `id_or_identityhash`
+/// refuses a forwarded header.
+pub fn repr_gc_addr(obj: PyObjectRef) -> String {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let live = pyre_object::gc_roots::pin_root(obj);
+    repr_addr(pyre_object::gc_hook::gc_identity_hash(live as usize))
 }
 
 /// Try to call a dunder method (__repr__, __str__, etc.) on an instance,
@@ -1025,9 +1026,12 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // must produce the same address-bearing text.
             // `format!` would render the WTF-8 qualname through `Display`,
             // which substitutes U+FFFD for a lone surrogate.
+            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let mut repr = Wtf8Buf::from_string("<function ".to_string());
             repr.push_wtf8(&function_get_qualname(obj));
-            repr.push_str(&format!(" at {}>", crate::display::repr_addr(obj as usize)));
+            // `function_get_qualname` can allocate the fallback string.
+            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            repr.push_str(&format!(" at {}>", repr_gc_addr(obj)));
             return Ok(repr);
         } else if unsafe { pyre_object::is_exception(obj) } {
             // A user subclass that overrides `__repr__` shadows the builtin
@@ -1233,17 +1237,29 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // `range(start, stop)`, with the step appended only when
             // it is not 1.  Bounds may be bignum, so render each wrapped
             // int rather than a machine word.
+            // `range_obj_to_bigint` of a machine int and each `repr` collect;
+            // the fields come back off the shadow stack.
+            let _range_roots = pyre_object::gc_roots::push_roots();
             let (start, stop, step) = pyre_object::w_range_fields(obj);
-            let step_is_one =
-                pyre_object::range_obj_to_bigint(step) == majit_rlib::rbigint::RBigInt::from(1);
+            let field_base = pyre_object::gc_roots::pin_roots(&[start, stop, step]);
+            let step_is_one = pyre_object::range_obj_to_bigint(
+                pyre_object::gc_roots::shadow_stack_get(field_base + 2),
+            )
+            .int_eq(1);
             let mut out = Wtf8Buf::new();
             out.push_str("range(");
-            out.push_wtf8(&py_repr_wtf8(start)?);
+            out.push_wtf8(&py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                field_base,
+            ))?);
             out.push_str(", ");
-            out.push_wtf8(&py_repr_wtf8(stop)?);
+            out.push_wtf8(&py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                field_base + 1,
+            ))?);
             if !step_is_one {
                 out.push_str(", ");
-                out.push_wtf8(&py_repr_wtf8(step)?);
+                out.push_wtf8(&py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                    field_base + 2,
+                ))?);
             }
             out.push_str(")");
             return Ok(out);
@@ -1256,12 +1272,13 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
         } else if pyre_object::memoryview::is_w_memoryview(obj) {
             // `memoryobject.py descr_repr` — `<memory at 0x...>`, or
             // `<released memory at 0x...>` once the view is released.
+            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let label = if pyre_object::memoryview::w_memoryview_released(obj) {
                 "released memory"
             } else {
                 "memory"
             };
-            format!("<{label} at {}>", repr_addr(obj as usize))
+            format!("<{label} at {}>", repr_gc_addr(obj))
         } else if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
             // Try __repr__ first, then __str__
             if let Some(w) = try_call_dunder_wtf8(obj, "__repr__")? {
@@ -1273,7 +1290,8 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             }
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let name = crate::baseobjspace::getfulltypename(obj);
-            let addr = repr_addr(obj as usize);
+            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let addr = repr_gc_addr(obj);
             return Ok(wtf8_format!("<", name, format!(" object at {addr}>")));
         } else {
             // A builtin type carrying its own `__repr__` dict entry (e.g.
@@ -1298,7 +1316,8 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             }
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let name = crate::baseobjspace::getfulltypename(obj);
-            let addr = repr_addr(obj as usize);
+            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let addr = repr_gc_addr(obj);
             return Ok(wtf8_format!("<", name, format!(" object at {addr}>")));
         };
         Ok(Wtf8Buf::from_string(formatted))
@@ -1402,10 +1421,17 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
             }
         }
         if unsafe { pyre_object::is_exception(obj) } {
-            if let Some(w) = exception_descr_str_wtf8(obj)? {
+            // `exception_descr_str_wtf8` / `exception_kind_str_wtf8` run
+            // `__str__` / `__index__` and can collect.  Pin the receiver so
+            // the later arm does not stringify a from-space word
+            // (`interp_exceptions.py W_BaseException.descr_str`).
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+            let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            if let Some(w) = exception_descr_str_wtf8(obj())? {
                 return Ok(w);
             }
-            if let Some(w) = exception_kind_str_wtf8(obj)? {
+            if let Some(w) = exception_kind_str_wtf8(obj())? {
                 return Ok(w);
             }
             // A user subclass that overrides `__str__` shadows the builtin
@@ -1414,7 +1440,7 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
             // the Unicode / OSError / KeyError `__str__` overrides, so a
             // non-overridden exception here resolves `__str__` to the
             // BaseException builtin and falls through unchanged.
-            return base_exception_str_wtf8(obj);
+            return base_exception_str_wtf8(obj());
         }
         // `int`/`float`/... define no `tp_str`, so `str()` falls back to
         // `repr()` (a `__str__` override wins, otherwise the `__repr__`
@@ -1519,23 +1545,26 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
         // Dispatched on `ExcKind` because Pyre flattens the three
         // PyPy subclasses into the single `W_BaseException`
         // struct.
-        let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+        let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let kind = unsafe { pyre_object::w_exception_get_kind(obj()) };
         match kind {
             pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError => {
-                return unicode_translate_error_str(obj).map(Some);
+                return unicode_translate_error_str(obj()).map(Some);
             }
             pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError => {
-                return unicode_decode_error_str(obj).map(Some);
+                return unicode_decode_error_str(obj()).map(Some);
             }
             pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError => {
-                return unicode_encode_error_str(obj).map(Some);
+                return unicode_encode_error_str(obj()).map(Some);
             }
             // `interp_exceptions.py W_KeyError.descr_str` —
             // a single-argument KeyError stringifies as `repr(args[0])`
             // so `str(KeyError('k'))` is `"'k'"`; with any other arg
             // count it falls back to `W_BaseException.descr_str` below.
             pyre_object::interp_exceptions::ExcKind::KeyError => {
-                let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
+                let args = pyre_object::interp_exceptions::w_exception_get_args(obj());
                 if !args.is_null()
                     && pyre_object::is_tuple(args)
                     && pyre_object::w_tuple_len(args) == 1
@@ -1556,9 +1585,11 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
             // `W_BaseException.descr_str` below.
             pyre_object::interp_exceptions::ExcKind::OSError
             | pyre_object::interp_exceptions::ExcKind::FileNotFoundError => {
-                let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
-                let n = if !args.is_null() && pyre_object::is_tuple(args) {
-                    pyre_object::w_tuple_len(args)
+                let args = pyre_object::interp_exceptions::w_exception_get_args(obj());
+                let args_slot = pyre_object::gc_roots::pin_roots(&[args]);
+                let args = || pyre_object::gc_roots::shadow_stack_get(args_slot);
+                let n = if !args().is_null() && pyre_object::is_tuple(args()) {
+                    pyre_object::w_tuple_len(args())
                 } else {
                     0
                 };
@@ -1569,17 +1600,17 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                         return Some(slot);
                     }
                     if (2..=5).contains(&n) && idx < n {
-                        unsafe { pyre_object::w_tuple_getitem(args, idx as i64) }
+                        unsafe { pyre_object::w_tuple_getitem(args(), idx as i64) }
                     } else {
                         None
                     }
                 };
                 let w_errno = slot_or_arg(
-                    pyre_object::interp_exceptions::w_exception_get_errno(obj),
+                    pyre_object::interp_exceptions::w_exception_get_errno(obj()),
                     0,
                 );
                 let w_strerror = slot_or_arg(
-                    pyre_object::interp_exceptions::w_exception_get_strerror(obj),
+                    pyre_object::interp_exceptions::w_exception_get_strerror(obj()),
                     1,
                 );
                 // `interp_exceptions.py:676-689`: a Windows error code takes
@@ -1588,12 +1619,24 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                 // strerror as `None`, or a strerror on its own.  With neither,
                 // the code is not reported at all and the errno arms below
                 // answer, exactly as they do without one.
-                let w_winerror = pyre_object::interp_exceptions::w_exception_get_winerror(obj);
+                let w_winerror = pyre_object::interp_exceptions::w_exception_get_winerror(obj());
                 let w_filename = slot_or_arg(
-                    pyre_object::interp_exceptions::w_exception_get_filename(obj),
+                    pyre_object::interp_exceptions::w_exception_get_filename(obj()),
                     2,
                 )
                 .filter(|&f| !pyre_object::is_none(f));
+                let field_base = pyre_object::gc_roots::pin_roots(&[
+                    w_errno.unwrap_or_else(pyre_object::w_none),
+                    w_strerror.unwrap_or_else(pyre_object::w_none),
+                    w_winerror,
+                    w_filename.unwrap_or_else(pyre_object::w_none),
+                ]);
+                let w_errno = w_errno.map(|_| pyre_object::gc_roots::shadow_stack_get(field_base));
+                let w_strerror =
+                    w_strerror.map(|_| pyre_object::gc_roots::shadow_stack_get(field_base + 1));
+                let w_winerror = pyre_object::gc_roots::shadow_stack_get(field_base + 2);
+                let w_filename =
+                    w_filename.map(|_| pyre_object::gc_roots::shadow_stack_get(field_base + 3));
                 if !w_winerror.is_null() && (w_filename.is_some() || w_strerror.is_some()) {
                     let mut out = Wtf8Buf::new();
                     out.push_str("[WinError ");
@@ -1603,10 +1646,11 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                         w_strerror.unwrap_or_else(pyre_object::w_none),
                     )?);
                     if let Some(fname) = w_filename {
+                        let fname = pyre_object::gc_roots::shadow_stack_get(field_base + 3);
                         out.push_str(": ");
                         out.push_wtf8(&py_repr_wtf8(fname)?);
                         let w_filename2 = slot_or_arg(
-                            pyre_object::interp_exceptions::w_exception_get_filename2(obj),
+                            pyre_object::interp_exceptions::w_exception_get_filename2(obj()),
                             4,
                         )
                         .filter(|&f| !pyre_object::is_none(f));
@@ -1618,16 +1662,18 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                     return Ok(Some(out));
                 }
                 if let (Some(w_errno), Some(w_strerror)) = (w_errno, w_strerror) {
-                    let errno = py_str_wtf8(w_errno)?;
-                    let strerror = py_str_wtf8(w_strerror)?;
+                    let errno = py_str_wtf8(pyre_object::gc_roots::shadow_stack_get(field_base))?;
+                    let strerror =
+                        py_str_wtf8(pyre_object::gc_roots::shadow_stack_get(field_base + 1))?;
                     let mut out = Wtf8Buf::new();
                     out.push_str("[Errno ");
                     out.push_wtf8(&errno);
                     out.push_str("] ");
                     out.push_wtf8(&strerror);
-                    if let Some(fname) = w_filename {
+                    if let Some(_fname) = w_filename {
+                        let fname = pyre_object::gc_roots::shadow_stack_get(field_base + 3);
                         let w_filename2 = slot_or_arg(
-                            pyre_object::interp_exceptions::w_exception_get_filename2(obj),
+                            pyre_object::interp_exceptions::w_exception_get_filename2(obj()),
                             4,
                         )
                         .filter(|&f| !pyre_object::is_none(f));
@@ -1652,7 +1698,7 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
             // WTF-8 path already implements this; reuse it and drop any
             // lone surrogates for the plain-`String` caller.
             pyre_object::interp_exceptions::ExcKind::SyntaxError => {
-                if let Some(w) = exception_descr_str_wtf8(obj)? {
+                if let Some(w) = exception_descr_str_wtf8(obj())? {
                     return Ok(Some(w));
                 }
             }
@@ -1953,11 +1999,17 @@ unsafe fn unicode_err_str_slot(stored: PyObjectRef) -> Result<Wtf8Buf, crate::Py
         if stored.is_null() {
             return Ok(Wtf8Buf::new());
         }
+        // `__str__` below can collect; pin before the exact-type probe so a
+        // nursery encoding/reason is forwarded rather than stringified as a
+        // from-space word (`interp_exceptions.py` `%s` coerce).
+        let _roots = pyre_object::gc_roots::push_roots();
+        let stored_slot = pyre_object::gc_roots::pin_roots(&[stored]);
+        let stored = pyre_object::gc_roots::shadow_stack_get(stored_slot);
         if pyre_object::is_exact_type(stored, &pyre_object::STR_TYPE) {
             return Ok(pyre_object::w_str_get_wtf8(stored).to_wtf8_buf());
         }
         // `%s` propagates an exception raised by the value's `__str__`.
-        py_str_wtf8(stored)
+        py_str_wtf8(pyre_object::gc_roots::shadow_stack_get(stored_slot))
     }
 }
 

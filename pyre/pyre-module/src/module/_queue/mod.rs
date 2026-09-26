@@ -149,6 +149,10 @@ fn simplequeue_put(queue: &W_SimpleQueue, item: PyObjectRef) -> PyObjectRef {
     let base = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(item);
     queue_push_back(&queue.queue, base);
+    // The deque is storage `w_simplequeue_custom_trace` walks. The queue is
+    // old (`allocate_stable`), so the item it now holds reaches the next
+    // minor only through the barrier's remembered set.
+    pyre_object::gc_hook::try_gc_write_barrier(queue as *const W_SimpleQueue as *mut u8);
     queue.not_empty.notify_one();
     w_none()
 }

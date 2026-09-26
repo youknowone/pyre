@@ -2938,7 +2938,13 @@ impl<'a> AssemblerARM64<'a> {
                 }
             }
             // ── Memory stores: setarrayitem pattern ──
-            OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
+            // `rewrite.py transform_to_gc_load` lowers SETARRAYITEM_GC to
+            // GC_STORE_INDEXED (after `handle_write_barrier_setarrayitem`)
+            // for every compiled loop, so the backend has no handler for it.
+            OpCode::SetarrayitemGc => {
+                panic!("dynasm: SetarrayitemGc must have been lowered by rewrite_ops_for_gc");
+            }
+            OpCode::SetarrayitemRaw => {
                 if let (Some(Loc::Reg(base)), Some(index_loc), Some(value_loc)) =
                     (arglocs.first(), arglocs.get(1), arglocs.get(2))
                 {
@@ -7169,9 +7175,9 @@ impl<'a> AssemblerARM64<'a> {
     /// does NOT spill caller-saved registers across this op. On the taken
     /// path the callee clobbers x0..x13 + d0..d7, which would destroy any
     /// value live across the cond_call (e.g. a residual-call result stored
-    /// into a frame after the cond_call). Save and restore all volatile
-    /// registers around the call — `_build_cond_call_slowpath(callee_only=
-    /// False)` parity, inlined like the WB slowpath.
+    /// into a frame after the cond_call). Spill every register into the
+    /// jitframe and publish `jf_gcmap` — `_build_cond_call_slowpath` plus
+    /// `_emit_op_cond_call`'s `push_gcmap` / `pop_gcmap`.
     fn genop_discard_cond_call(&mut self, op: &Op, arglocs: &[Loc]) {
         let _ = op;
         let skip_label = self.mc.new_dynamic_label();
@@ -7190,9 +7196,19 @@ impl<'a> AssemblerARM64<'a> {
             dynasm!(self.mc ; .arch aarch64 ; cbz x16, =>skip_label);
         }
 
-        self.emit_push_all_volatile_regs();
+        // aarch64/opassembler.py `_emit_op_cond_call`:
+        //   gcmap = self._regalloc.get_gcmap([res_loc])
+        //   self.push_gcmap(self.mc, gcmap)
+        //   BL cond_call_slowpath  # `_push_all_regs_to_jitframe` then BLR
+        //   self.pop_gcmap(self.mc)
+        // `clear_vable_token` → `force_now` allocates; a CPU-stack save of
+        // volatiles is not a GC root, and a null `jf_gcmap` leaves every
+        // spilled Ref slot unforwarded.
+        self.push_all_regs_to_jitframe(&[], true);
+        let pushed_gcmap = self.push_pending_call_gcmap();
         self.emit_call_from_arglocs(arglocs, 1);
-        self.emit_pop_all_volatile_regs();
+        self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
+        self.pop_all_regs_from_jitframe(&[], true);
 
         dynasm!(self.mc ; .arch aarch64 ; =>skip_label);
     }
@@ -7233,7 +7249,16 @@ impl<'a> AssemblerARM64<'a> {
         let skip_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; cbnz x0, =>skip_label);
 
+        // aarch64/opassembler.py `_emit_op_cond_call` for COND_CALL_VALUE:
+        // same slowpath as COND_CALL — push_gcmap, cond_call_slowpath
+        // (`_reload_frame_if_necessary`), pop_gcmap. x0 holds the call
+        // result; `_pop_all_regs_from_jitframe` skips it so the return
+        // survives the restore.
+        self.push_all_regs_to_jitframe(&[], true);
+        let pushed_gcmap = self.push_pending_call_gcmap();
         self.emit_call_from_arglocs(arglocs, 1);
+        self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
+        self.pop_all_regs_from_jitframe(&[crate::aarch64::registers::X0], true);
 
         dynasm!(self.mc ; .arch aarch64 ; =>skip_label);
 

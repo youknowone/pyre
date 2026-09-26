@@ -4080,40 +4080,25 @@ impl<'a> Assembler386<'a> {
                     ),
                 }
             }
-            // Structural adaptation: PyPy's llsupport/rewrite.py
-            // normally lowers SETARRAYITEM_* to GC_STORE(_INDEXED), but
-            // pyre's CI also exercises direct backend emission paths before
-            // that rewrite has run.
-            OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
+            // `rewrite.py transform_to_gc_load` lowers SETARRAYITEM_GC to
+            // GC_STORE_INDEXED (after `handle_write_barrier_setarrayitem`)
+            // for every compiled loop, so the backend has no handler for it.
+            OpCode::SetarrayitemGc => {
+                panic!("dynasm: SetarrayitemGc must have been lowered by rewrite_ops_for_gc");
+            }
+            OpCode::SetarrayitemRaw => {
                 if let (Some(Loc::Reg(base)), Some(index_loc), Some(value_loc)) =
                     (arglocs.first(), arglocs.get(1), arglocs.get(2))
                 {
-                    let (base_size, item_size, is_ref_array) = op
-                        .with_array_descr(|ad| {
-                            (
-                                ad.base_size() as i32,
-                                ad.item_size() as i32,
-                                ad.is_array_of_pointers(),
-                            )
-                        })
-                        .unwrap_or((0, 8, false));
+                    let (base_size, item_size) = op
+                        .with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
+                        .unwrap_or((0, 8));
                     let index_reg = crate::regloc::X86_64_SCRATCH_REG.value;
                     // r11 is already the computed destination address here.
                     // Stage non-register values through a saved GPR: r12 is
                     // allocatable on x86-64, so using SCRATCH_REG_2 would
                     // clobber live regalloc state.
                     let value_reg = crate::regloc::EAX.value;
-
-                    let store_may_need_wb = op.opcode == OpCode::SetarrayitemGc
-                        && is_ref_array
-                        && item_size as usize == WORD
-                        && self.setarrayitem_value_needs_write_barrier(
-                            op.arg(2).to_opref(),
-                            value_loc,
-                        );
-                    if store_may_need_wb {
-                        self.emit_setarrayitem_gc_write_barrier(&arglocs[..2]);
-                    }
 
                     self.regalloc_mov(
                         index_loc,
@@ -7743,47 +7728,6 @@ impl<'a> Assembler386<'a> {
     // x86/assembler.py:2338 genop_new etc.
     // These require GC runtime support. Emit trap for now.
 
-    /// rewrite.py `handle_write_barrier_setarrayitem` value gate.
-    ///
-    /// PyPy emits a barrier only for Ref-typed values, and `rgc.needs_write_barrier`
-    /// returns false for NULL constants and true for non-NULL constants
-    /// (rpython/rlib/rgc.py).  The normal rewriter path already performs
-    /// this check; this is the direct-backend fallback for unre-written tests.
-    fn setarrayitem_value_needs_write_barrier(&self, value: OpRef, value_loc: &Loc) -> bool {
-        if matches!(value_loc, Loc::Reg(val) if val.is_xmm) {
-            return false;
-        }
-        // history.py/268/314 — inline-Const variants carry value
-        // inline; the variant tag IS the box type.
-        if let Some(val) = value.inline_const_bits() {
-            if !matches!(value, OpRef::ConstPtr(_)) {
-                return false;
-            }
-            return val != 0;
-        }
-        if let Some(tp) = self.constants.get(&value.raw()).map(|c| c.get_type()) {
-            if tp != Type::Ref {
-                return false;
-            }
-        }
-        if let Some(constant) = self.constants.get(&value.raw()) {
-            return constant.as_raw_i64() != 0;
-        }
-        !matches!(value_loc, Loc::Immed(i) | Loc::ImmedFloat(i) if i.value == 0)
-    }
-
-    /// rewrite.py `gen_write_barrier_array` for the direct
-    /// SETARRAYITEM_GC fallback.  This assembler-only path has no
-    /// `RewriteState.known_lengths`, so it mirrors PyPy's
-    /// `known_length(v_base, LARGE)` default: unknown length selects the array
-    /// barrier when card marking exists; otherwise it falls back to the generic
-    /// write barrier.
-    fn emit_setarrayitem_gc_write_barrier(&mut self, arglocs: &[Loc]) {
-        let use_array_barrier =
-            crate::runner::dynasm_write_barrier_descr().is_some_and(|wb| wb.jit_wb_cards_set != 0);
-        self.emit_write_barrier_fastpath_kind(arglocs, use_array_barrier, false);
-    }
-
     /// x86/assembler.py _write_barrier_fastpath parity.
     fn emit_write_barrier_fastpath(&mut self, op: &Op, arglocs: &[Loc]) {
         let is_array = op.opcode == majit_ir::OpCode::CondCallGcWbArray;
@@ -8584,8 +8528,10 @@ impl<'a> Assembler386<'a> {
         // ecx/edx/esi/edi/r8..r10 + the XMM regs, destroying any value live
         // across the cond_call. Save and restore all managed registers
         // around the call — `_build_cond_call_slowpath(callee_only=False)`
-        // parity. rbp is callee-saved (survives the call) and the clear-vable
-        // helper does not allocate, so no frame reload / gcmap is required.
+        // parity, plus `push_gcmap` / `pop_gcmap` from
+        // `aarch64/opassembler.py _emit_op_cond_call`. `clear_vable_token`
+        // → `force_now` allocates; a leftover null `jf_gcmap` leaves every
+        // spilled Ref slot unforwarded.
         //
         // Load the callee (func_index 1) and its args from their regalloc
         // locations via `emit_call_from_arglocs`, not by re-resolving the op
@@ -8593,7 +8539,9 @@ impl<'a> Assembler386<'a> {
         // has no slot mapping and would panic in `resolve_opref` (or read a
         // stale slot).  Mirrors the AArch64 `genop_discard_cond_call`.
         push_all_regs_to_jitframe_raw(&mut self.mc, &[], true);
+        let pushed_gcmap = self.push_pending_call_gcmap();
         self.emit_call_from_arglocs(op, arglocs, 1);
+        self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         pop_all_regs_from_jitframe_raw(&mut self.mc, &[], true);
 
         dynasm!(self.mc ; .arch x64 ; =>skip_label);
@@ -8617,7 +8565,16 @@ impl<'a> Assembler386<'a> {
         let skip_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch x64 ; test rax, rax ; jnz =>skip_label);
 
+        // x86/opassembler.py `_emit_op_cond_call` for COND_CALL_VALUE:
+        // same slowpath as COND_CALL — push_gcmap, cond_call_slowpath
+        // (`_reload_frame_if_necessary`), pop_gcmap. rax holds the call
+        // result; `_pop_all_regs_from_jitframe` skips it so the return
+        // survives the restore.
+        push_all_regs_to_jitframe_raw(&mut self.mc, &[], true);
+        let pushed_gcmap = self.push_pending_call_gcmap();
         self.emit_call_from_arglocs(op, arglocs, 1);
+        self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
+        pop_all_regs_from_jitframe_raw(&mut self.mc, &[crate::regloc::EAX], true);
 
         dynasm!(self.mc ; .arch x64 ; =>skip_label);
 

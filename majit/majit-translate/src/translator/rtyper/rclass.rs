@@ -4686,6 +4686,40 @@ pub(super) fn pair_instance_instance_convert_from_to(
     Ok(None)
 }
 
+/// The low-level side of the annotator's `union(SomeInstance(None),
+/// SomePtr)` (`model.rs`): a Gc-opaque pointer merged into the
+/// classdef-less top instance.  Both annotations denote one type-erased GC
+/// reference, the role `llmemory.GCREF` (`Ptr(GcOpaqueType)`) plays
+/// upstream, so the conversion is the GCREF edge
+/// `pairtype(GCRefRepr, Repr).convert_from_to` (`rgcref.py`):
+/// `cast_opaque_ptr` to the instance pointer.  Any other pointer, or a
+/// classdef-bearing destination, is outside that union and stays
+/// `NotImplemented`.
+pub(super) fn pair_opaque_ptr_instance_convert_from_to(
+    r_from: &dyn Repr,
+    r_to: &dyn Repr,
+    v: &Hlvalue,
+    llops: &mut LowLevelOpList,
+) -> Result<Option<Hlvalue>, TyperError> {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+    let LowLevelType::Ptr(ptr) = r_from.lowleveltype() else {
+        return Ok(None);
+    };
+    let PtrTarget::Opaque(opaque) = &ptr.TO else {
+        return Ok(None);
+    };
+    if opaque._gckind != GcKind::Gc {
+        return Ok(None);
+    }
+    let Some(r_ins) = (r_to as &dyn std::any::Any).downcast_ref::<InstanceRepr>() else {
+        return Ok(None);
+    };
+    if r_ins.classdef.is_some() {
+        return Ok(None);
+    }
+    super::lltypesystem::rgcref::pair_gcref_repr_convert_from_to(r_from, r_to, v, llops)
+}
+
 /// RPython `pairtype(InstanceRepr, InstanceRepr).rtype_is_`
 /// (rclass.py):
 ///
@@ -7318,5 +7352,64 @@ mod tests {
             LowLevelValue::Signed(42),
             "leaf-class override must win — value should come from C.classdesc"
         );
+    }
+
+    /// A Gc-opaque pointer converts to the classdef-less root instance with
+    /// the GCREF edge's `cast_opaque_ptr`; a raw opaque pointer has no
+    /// such edge.
+    #[test]
+    fn gc_opaque_ptr_converts_to_root_instance_by_cast_opaque_ptr() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::translator::rtyper::lltypesystem::lltype::{OpaqueType, Ptr};
+        use crate::translator::rtyper::rmodel::PtrRepr;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let r_root = getinstancerepr(&rtyper, None, Flavor::Gc).expect("root InstanceRepr");
+
+        let gc_opaque = Ptr::from_container_type(LowLevelType::Opaque(Box::new(OpaqueType::gc(
+            "MAJIT_REF_OPAQUE",
+        ))))
+        .unwrap();
+        let r_ptr = PtrRepr::new(gc_opaque.clone());
+        let v = Variable::new();
+        v.set_concretetype(Some(LowLevelType::Ptr(Box::new(gc_opaque))));
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let converted = super::super::pairtype::pair_convert_from_to(
+            &r_ptr,
+            r_root.as_ref(),
+            &Hlvalue::Variable(v),
+            &mut llops,
+        )
+        .expect("conversion does not error")
+        .expect("Gc-opaque pointer converts to the root instance");
+        assert_eq!(llops.ops.len(), 1);
+        assert_eq!(llops.ops[0].opname, "cast_opaque_ptr");
+        let Hlvalue::Variable(v_converted) = converted else {
+            panic!("cast_opaque_ptr yields a Variable");
+        };
+        assert_eq!(
+            v_converted.concretetype().as_ref(),
+            Some(r_root.lowleveltype())
+        );
+
+        let raw_opaque =
+            Ptr::from_container_type(LowLevelType::Opaque(Box::new(OpaqueType::new("RAW"))))
+                .unwrap();
+        let r_raw = PtrRepr::new(raw_opaque.clone());
+        let v_raw = Variable::new();
+        v_raw.set_concretetype(Some(LowLevelType::Ptr(Box::new(raw_opaque))));
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let converted = super::super::pairtype::pair_convert_from_to(
+            &r_raw,
+            r_root.as_ref(),
+            &Hlvalue::Variable(v_raw),
+            &mut llops,
+        )
+        .expect("conversion does not error");
+        assert!(converted.is_none());
+        assert!(llops.ops.is_empty());
     }
 }

@@ -101,12 +101,15 @@ pub fn w_memoryview_alloc_header(released: bool, owns_export: bool) -> PyObjectR
         restricted: false,
         owns_export,
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         <W_MemoryView as crate::lltype::GcType>::type_id(),
         <W_MemoryView as crate::lltype::GcType>::SIZE,
     );
     if !raw.is_null() {
         unsafe { std::ptr::write(raw as *mut W_MemoryView, payload) };
+        // Nursery-full spill lands in old-gen with TRACK_YOUNG_PTRS still
+        // set (`spill_to_oldgen_or_null`). `w_class` is an old-gen type.
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     } else {
         crate::lltype::malloc_typed(payload) as PyObjectRef

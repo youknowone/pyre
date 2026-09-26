@@ -542,12 +542,16 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
     let save_point = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(bases);
     let _ = crate::gc_roots::pin_root(dict_ptr as PyObjectRef);
-    // Heap types stay in the non-moving old generation.  Callers cache the
-    // resulting pointer in `OnceLock<usize>` (structseq types, sys.flags)
-    // and the JIT caches `w_class`; a nursery type would move and leave
-    // those addresses stale (`getfield_gc_r` sanity check, "no field
-    // verbose").  Full nursery types need those caches to follow
-    // forwarding first (#1449).
+    // `typeobject.py W_TypeObject` is `malloc_fixedsize` (young). pyre
+    // births the wrapper old-gen: `w_class` / `instantiate` / type caches
+    // hold raw type pointers the translator would rewrite as GCREFs, and
+    // an old instance whose `w_class` is a young type is not scanned on a
+    // minor unless the instance is in the remembered set. A nursery type
+    // that dies leaves those slots as recycled poison (`mro_w` reads
+    // `0xaaaaaaaaaaaaaaaa`). `try_gc_alloc_stable_raw` keeps the identity
+    // still, matching `w_type_alloc_builtin`'s non-moving contract for the
+    // same raw couriers. Young `bases` / name boxes still take the barrier
+    // below.
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_TYPE_GC_TYPE_ID, W_TYPE_OBJECT_SIZE);
     // A mortal (GC-managed) heap type boxes its name in a GC-managed storage box
     // reclaimed by the box tid's drop glue (`NameStorage`), greyed through the
@@ -635,9 +639,9 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         (crate::lltype::malloc_typed(value) as PyObjectRef, false)
     };
     if gc_managed {
-        // A stable header is old-gen; `bases` / name boxes may still be
-        // young.  Remember the type so the next minor collection scans it
-        // and `type_object_custom_trace` forwards those children.
+        // Old-gen header; `bases` / name boxes may still be young.
+        // Remember the type so the next minor scans it and
+        // `type_object_custom_trace` forwards those children.
         crate::gc_hook::try_gc_write_barrier(w_type as *mut u8);
     } else {
         // Immortal fallback type (pre-GC): its trace never fires, so root its
@@ -1353,8 +1357,9 @@ pub unsafe fn w_type_get_name_obj(obj: PyObjectRef) -> PyObjectRef {
         } else {
             full.rsplit('.').next().unwrap_or(full)
         };
-        t.w_name = crate::w_str_new(bare);
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        let w_name = crate::w_str_new(bare);
+        type_write_barrier(obj);
+        t.w_name = w_name;
     }
     t.w_name
 }
@@ -1391,8 +1396,8 @@ pub unsafe fn w_type_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
     if let Some(name) = crate::w_str_get_value_opt(w_name) {
         *t.name = name.to_string();
     }
+    type_write_barrier(obj);
     t.w_name = w_name;
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// `typeobject.py` / `getqualname`: the class qualified name lives
@@ -1411,8 +1416,9 @@ pub unsafe fn w_type_get_qualname(obj: PyObjectRef) -> &'static str {
 pub unsafe fn w_type_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
     let t = &mut *(obj as *mut W_TypeObject);
     if t.w_qualname.is_null() {
-        t.w_qualname = crate::w_str_new(&*t.qualname);
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        let w_qualname = crate::w_str_new(&*t.qualname);
+        type_write_barrier(obj);
+        t.w_qualname = w_qualname;
     }
     t.w_qualname
 }
@@ -1428,8 +1434,8 @@ pub unsafe fn w_type_set_qualname(obj: PyObjectRef, w_qualname: PyObjectRef) {
     // itself, and `w_type_get_qualname_obj` hands that back verbatim, so
     // `__qualname__` still reads the code points that were assigned.
     *t.qualname = crate::w_str_get_wtf8(w_qualname).to_string();
+    type_write_barrier(obj);
     t.w_qualname = w_qualname;
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// typeobject.py `type_get_text_signature` backing field.
@@ -1470,9 +1476,23 @@ pub unsafe fn w_type_get_w_doc(obj: PyObjectRef) -> PyObjectRef {
 /// (`w_None` or a unicode).
 pub unsafe fn w_type_set_w_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
     let t = &mut *(obj as *mut W_TypeObject);
-    t.w_doc = w_doc;
     crate::gc_roots::mark_prebuilt_roots_dirty();
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    type_write_barrier(obj);
+    t.w_doc = w_doc;
+}
+
+/// `FixedObjectArray::set_ref`: inspect TRACK_YOUNG_PTRS inline, then
+/// `remember_young_pointer` on the type before an old→young field store.
+#[inline]
+fn type_write_barrier(obj: PyObjectRef) {
+    if obj.is_null() {
+        return;
+    }
+    let header = unsafe { majit_gc::header::header_of(obj as usize) };
+    if unsafe { !(*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
+        return;
+    }
+    crate::gc_hook::try_gc_write_barrier_managed(obj as *mut u8);
 }
 
 /// Get the bases tuple.
@@ -1491,8 +1511,8 @@ pub unsafe fn w_type_get_bases(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_type_set_bases(obj: PyObjectRef, bases: PyObjectRef) {
     let bases = crate::gc_roots::pin_root(bases);
     crate::gc_roots::mark_prebuilt_roots_dirty();
+    type_write_barrier(obj);
     (*(obj as *mut W_TypeObject)).bases = bases;
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// Get the class namespace pointer (as *mut u8).
@@ -1626,8 +1646,9 @@ pub unsafe fn w_type_get_best_base(w_type: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
     let purely_of_types = is_mro_purely_of_types(&mro);
-    (*(obj as *mut W_TypeObject)).mro_w = crate::object_array::alloc_mro_block_gc(&mro);
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    let mro_w = crate::object_array::alloc_mro_block_gc(&mro);
+    type_write_barrier(obj);
+    (*(obj as *mut W_TypeObject)).mro_w = mro_w;
     if !purely_of_types {
         w_type_set_version_tag(obj, 0);
     }
@@ -2172,20 +2193,34 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
     if !is_type(w_parent) || !is_type(w_subclass) {
         return;
     }
+    // typeobject.py `add_subclass`: `newref = weakref.ref(w_subclass)` allocates.
+    // gct_fv_gc_malloc reloads `self` / `w_subclass`; pin them for the
+    // native path before the lock so the parent word is live for it.
+    let _roots = crate::gc_roots::push_roots();
+    let parent_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_parent);
+    let subclass_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_subclass);
+    let w_parent = crate::gc_roots::shadow_stack_get(parent_slot);
     // Serialize against a concurrent `remove_subclass` / `get_subclasses` /
     // `add_subclass` on the same parent: the null-check-then-install below and
     // the `push` reallocation both invalidate what another thread is indexing.
     let _subclasses_guard = w_type_subclasses_lock(w_parent);
-    let parent = &mut *(w_parent as *mut W_TypeObject);
-    if parent.weak_subclasses.is_null() {
-        parent.weak_subclasses = Box::into_raw(Box::new(Vec::new()));
+    {
+        let parent = &mut *(crate::gc_roots::shadow_stack_get(parent_slot) as *mut W_TypeObject);
+        if parent.weak_subclasses.is_null() {
+            parent.weak_subclasses = Box::into_raw(Box::new(Vec::new()));
+        }
     }
-    let subs = &mut *parent.weak_subclasses;
     // typeobject.py:651-660 — `newref = weakref.ref(w_subclass);
     // for i in range(...): if ref() is w_subclass: return; if ref()
     // is None: self.weak_subclasses[i] = newref; return;
     // else: self.weak_subclasses.append(newref)`.
-    let newref = crate::weakref::w_weakref_new(w_subclass);
+    let newref = crate::weakref::w_weakref_new(crate::gc_roots::shadow_stack_get(subclass_slot));
+    let w_subclass = crate::gc_roots::shadow_stack_get(subclass_slot);
+    let w_parent = crate::gc_roots::shadow_stack_get(parent_slot);
+    let parent = &mut *(w_parent as *mut W_TypeObject);
+    let subs = &mut *parent.weak_subclasses;
     for slot in subs.iter_mut() {
         let existing = crate::weakref::w_weakref_deref(*slot);
         if existing == w_subclass {
@@ -2314,18 +2349,19 @@ pub unsafe fn w_type_ready(w_self: PyObjectRef) {
     if w_self.is_null() || !is_type(w_self) {
         return;
     }
-    let bases = (*(w_self as *const W_TypeObject)).bases;
+    // `typeobject.py ready`: `for w_base in self.bases_w: w_base.add_subclass(self)`.
+    // `add_subclass` allocates a weakref; pin `self` and reread `bases_w`
+    // from it each time, as `gct_fv_gc_malloc` reloads those livevars.
+    let _roots = crate::gc_roots::push_roots();
+    let self_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_self);
+    let bases = (*(crate::gc_roots::shadow_stack_get(self_slot) as *const W_TypeObject)).bases;
     if bases.is_null() {
         return;
     }
     let n = crate::w_tuple_len(bases);
-    // `add_subclass` allocates the weakref, so the type is the only value
-    // kept across it, as a root; `bases_w` is read back from it each time.
-    let _roots = crate::gc_roots::push_roots();
-    let self_idx = _roots.base();
-    let _ = _roots.pin_root(w_self);
     for i in 0..n as i64 {
-        let w_self = _roots.get(self_idx);
+        let w_self = crate::gc_roots::shadow_stack_get(self_slot);
         let bases = (*(w_self as *const W_TypeObject)).bases;
         let Some(w_base) = crate::w_tuple_getitem(bases, i) else {
             continue;
@@ -2333,7 +2369,7 @@ pub unsafe fn w_type_ready(w_self: PyObjectRef) {
         if w_base.is_null() || !is_type(w_base) {
             continue;
         }
-        w_type_add_subclass(w_base, w_self);
+        w_type_add_subclass(w_base, crate::gc_roots::shadow_stack_get(self_slot));
     }
 }
 

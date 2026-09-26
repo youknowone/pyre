@@ -880,11 +880,18 @@ pub(crate) fn function_new_impl(
         return raw as PyObjectRef;
     }
 
-    // No collector hook yet (bootstrap, unit tests). The box is immortal.
-    // Register it the way `pycode.rs` `register_prebuilt_code_root` registers
-    // a code wrapper minted in the same window: a later `w_module` store has
-    // no managed trace to follow.
-    let obj = pyre_object::lltype::malloc_typed(function) as PyObjectRef;
+    // Immortal holder with the prebuilt header (`init_gc_object_immortal`):
+    // every later field store (`__name__`, `__qualname__`, `__module__`,
+    // `__doc__` materialised on first read, the JIT's `SETFIELD_GC`) goes
+    // through a barrier on this box, and the barrier just below covers the
+    // construction-time fields. `remember_young_pointer` then puts the box in
+    // `old_objects_pointing_to_young` and `prebuilt_root_objects`, so the
+    // collector traces it by `FUNCTION_GC_TYPE_ID` whichever holder reaches
+    // it. `walk_raw_function_roots` reaches it only through module dicts,
+    // frames and import roots, which miss a builtin held only by a managed
+    // object (`mock.patch` keeps the original in a `_patch` attribute).
+    let obj = pyre_object::lltype::malloc_typed_immortal(function) as PyObjectRef;
+    function_write_barrier(obj);
     register_prebuilt_function_root(obj);
     obj
 }
@@ -1466,12 +1473,19 @@ pub unsafe fn builtin_function_repr_text(name: &str, w_self: PyObjectRef) -> Str
     if !bound {
         return format!("<built-in function {name}>");
     }
+    // `r#type` walks the class and can allocate; the bound receiver is the
+    // address `getaddrstring` prints, so keep it live until that id is taken.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let w_self = pyre_object::gc_roots::pin_root(w_self);
     let type_name = crate::typedef::r#type(w_self)
         .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
-        .unwrap_or("object");
+        .unwrap_or("object")
+        .to_string();
+    let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
     format!(
         "<built-in method {name} of {type_name} object at {}>",
-        crate::display::repr_addr(w_self as usize)
+        crate::display::repr_gc_addr(w_self)
     )
 }
 
@@ -2965,7 +2979,6 @@ pub unsafe fn fset_func_closure(obj: PyObjectRef, closure: PyObjectRef) {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
-        let mut obj = obj;
         let func = obj as *mut Function;
         // function.py:504: if self.w_module is None
         if (*func).w_module.is_null() {
@@ -2977,26 +2990,42 @@ pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
                 // override `get` are observed.  When the lookup yields
                 // PY_NULL we fall back to `space.w_None` per the
                 // upstream attribute-not-found branch.
-                let mut name_key = pyre_object::unicodeobject::intern_str_value("__name__");
-                // `function.py Function.fget___module__` stores the app-call
-                // result back into `self.w_module`.  The translated graph's
-                // pop-roots reloads `self`; mirror that writeback before the
-                // native path dereferences `func` again.
-                let result = pyre_object::with_roots!(obj, name_key =>
-                    crate::baseobjspace::call_method(w_globals, "get", &[name_key])
+                //
+                // `call_method` is a collection point.  Pin the function, the
+                // globals dict, the interned key, and the returned name, then
+                // reload each after the call — a raw `w_globals` across that
+                // call is the dict's pre-move address, and storing the
+                // unrooted result writes an interior word into `w_module`
+                // that the next minor copies as a root.
+                let name_key = pyre_object::unicodeobject::intern_str_value("__name__");
+                let _roots = pyre_object::gc_roots::push_roots();
+                let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(obj);
+                let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(w_globals);
+                let key_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(name_key);
+                let result = crate::baseobjspace::call_method(
+                    pyre_object::gc_roots::shadow_stack_get(globals_slot),
+                    "get",
+                    &[pyre_object::gc_roots::shadow_stack_get(key_slot)],
                 );
-                let func = obj as *mut Function;
-                function_write_barrier(obj);
-                (*func).w_module = if result.is_null() {
+                let stored = if result.is_null() {
                     pyre_object::w_none()
                 } else {
                     result
                 };
-            } else {
-                // function.py:508: self.w_module = space.w_None
+                let stored_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(stored);
+                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 function_write_barrier(obj);
-                (*func).w_module = pyre_object::w_none();
+                let func = obj as *mut Function;
+                (*func).w_module = pyre_object::gc_roots::shadow_stack_get(stored_slot);
+                return (*func).w_module;
             }
+            // function.py `fget___module__`: self.w_module = space.w_None
+            function_write_barrier(obj);
+            (*func).w_module = pyre_object::w_none();
         }
         // function.py:509: return self.w_module
         let func = obj as *mut Function;
@@ -3321,15 +3350,14 @@ pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
     // to the address-based uid.
     unsafe {
         if is_exact_type(obj, &INT_TYPE) {
-            // `b.lshift(IDTAG_SHIFT).int_or_(IDTAG_INT)`; the shifted
-            // value is even, so `| IDTAG_INT` equals `+ IDTAG_INT`.
+            // `b.lshift(IDTAG_SHIFT).int_or_(IDTAG_INT)`.
             let b = (pyre_object::functional::range_obj_to_bigint(obj) << IDTAG_SHIFT as usize)
-                + majit_rlib::rbigint::RBigInt::from(IDTAG_INT);
+                .int_or_(IDTAG_INT);
             return Some(pyre_object::functional::range_bigint_to_obj(b));
         }
         if is_exact_type(obj, &FLOAT_TYPE) {
             // `float2longlong(float_w(self))` reinterprets the f64 bits as
-            // a signed i64; the same `| IDTAG_FLOAT` == `+ IDTAG_FLOAT`.
+            // a signed i64, then `lshift(IDTAG_SHIFT).int_or_(IDTAG_FLOAT)`.
             // NaNs use the address uid, matching `is_w`'s pointer identity.
             let value = pyre_object::floatobject::w_float_get_value(obj);
             if value.is_nan() {
@@ -3337,7 +3365,7 @@ pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
             }
             let bits = value.to_bits() as i64;
             let b = (majit_rlib::rbigint::RBigInt::from(bits) << IDTAG_SHIFT as usize)
-                + majit_rlib::rbigint::RBigInt::from(IDTAG_FLOAT);
+                .int_or_(IDTAG_FLOAT);
             return Some(pyre_object::functional::range_bigint_to_obj(b));
         }
         // Unlike `W_ComplexObject.immutable_unique_id` (complexobject.py),

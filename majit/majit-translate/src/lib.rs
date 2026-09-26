@@ -1488,6 +1488,55 @@ fn analyze_pipeline_from_module_paths(
             Signature::new(vec!["depth".into()], None, None),
             None,
         ),
+        // Fixed frame slots for a local live across several collecting calls.
+        // `gc_save_root` / `gc_restore_root` write one index; `push_roots` /
+        // `pop_roots` only bump the LIFO shadow stack around a single call.
+        // `majit_gc` is not lowered, so the four operations arrive as calls
+        // with no graph — the same `register_external` carrier as `push`.
+        (
+            vec![
+                "majit_gc".into(),
+                "shadow_stack".into(),
+                "acquire_owner_root".into(),
+            ],
+            Signature::new(vec!["root".into()], None, None),
+            Some("u64".into()),
+        ),
+        (
+            vec![
+                "majit_gc".into(),
+                "shadow_stack".into(),
+                "release_owner_root".into(),
+            ],
+            Signature::new(vec!["index".into()], None, None),
+            None,
+        ),
+        (
+            vec![
+                "majit_gc".into(),
+                "shadow_stack".into(),
+                "get_owner_root".into(),
+            ],
+            Signature::new(vec!["index".into()], None, None),
+            Some("gcref".into()),
+        ),
+        (
+            vec![
+                "majit_gc".into(),
+                "shadow_stack".into(),
+                "set_owner_root".into(),
+            ],
+            Signature::new(vec!["index".into(), "root".into()], None, None),
+            None,
+        ),
+        // `framework.py` keeps the GC as a prebuilt constant, so a nursery
+        // request always has a route. This query is the port's stand-in and
+        // lives in unlowered `majit_gc`; declare the bool result here.
+        (
+            vec!["majit_gc".into(), "gc_allocator_installed".into()],
+            Signature::new(vec![], None, None),
+            Some("bool".into()),
+        ),
     ]);
     // Parallel carrier for foreign opaque-ADT method externals
     // (`<BigInt as Add>::add`, …) — `populate_call_registry_from_call_graphs`

@@ -567,7 +567,7 @@ unsafe fn type_object_destructor(obj_addr: usize) {
     // get_current_qmut_instance`) is Rust-owned and off-GC too. A type that was
     // compiled against and never mutated afterwards still holds one, so without
     // this the box outlives the only pointer to it.
-    drop(unsafe { (*t).quasi_immut_watchers.take() });
+    unsafe { (*t).quasi_immut_watchers.reclaim() };
 }
 
 /// Reclaim `W_Property`'s `w_fget?` / `w_fset?` instances on sweep.
@@ -577,9 +577,11 @@ unsafe fn type_object_destructor(obj_addr: usize) {
 /// strands one allocation per watched owner. Upstream needs no such hook: its
 /// `mutate_<name>` is itself a GC pointer.
 ///
-/// [`pyre_object::quasiimmut::QuasiImmutField::take`] drops exactly one strong
-/// count, so an in-flight compile holding its own clone keeps the instance
-/// alive and reclaiming here cannot pull the ground out from under it.
+/// [`pyre_object::quasiimmut::QuasiImmutField::reclaim`] drops exactly one
+/// strong count, so an in-flight compile holding its own clone keeps the
+/// instance alive and reclaiming here cannot pull the ground out from under
+/// it. It also frees the field's out-of-line lock, which the collector's
+/// sweep reaches no drop glue to release.
 ///
 /// # Safety
 ///
@@ -587,8 +589,8 @@ unsafe fn type_object_destructor(obj_addr: usize) {
 /// and the collector must call this exactly once.
 unsafe fn property_destructor(obj_addr: usize) {
     let p = obj_addr as *const pyre_object::descriptor::W_Property;
-    drop(unsafe { (*p).fget_watchers.take() });
-    drop(unsafe { (*p).fset_watchers.take() });
+    unsafe { (*p).fget_watchers.reclaim() };
+    unsafe { (*p).fset_watchers.reclaim() };
 }
 
 /// The `w_function?` counterpart of [`property_destructor`] for `staticmethod`.
@@ -598,7 +600,7 @@ unsafe fn property_destructor(obj_addr: usize) {
 /// As [`property_destructor`], for a `StaticMethod` payload.
 unsafe fn staticmethod_destructor(obj_addr: usize) {
     let m = obj_addr as *const pyre_object::function::StaticMethod;
-    drop(unsafe { (*m).w_function_watchers.take() });
+    unsafe { (*m).w_function_watchers.reclaim() };
 }
 
 /// The `classmethod` twin of [`staticmethod_destructor`].
@@ -608,7 +610,7 @@ unsafe fn staticmethod_destructor(obj_addr: usize) {
 /// As [`property_destructor`], for a `ClassMethod` payload.
 unsafe fn classmethod_destructor(obj_addr: usize) {
     let m = obj_addr as *const pyre_object::function::ClassMethod;
-    drop(unsafe { (*m).w_function_watchers.take() });
+    unsafe { (*m).w_function_watchers.reclaim() };
 }
 
 /// Custom trace for `GeneratorIterator` (generator.py GeneratorIterator).
@@ -635,8 +637,9 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
         &mut gen_obj.previous_gen_or_coroutine as *mut pyre_object::PyObjectRef
             as *mut majit_ir::GcRef,
     );
-    // W_BaseException is currently malloc_typed-immortal, so forwarding its
-    // carrier above does not make the collector visit traceback/context/args.
+    // Forwarding the exception carrier still does not walk its
+    // traceback/context/args slots; those sit behind the exception
+    // object's own offsets.
     // Preserve the children of the exception parked by
     // `ExecutionContext.pop_gen_or_coroutine`, just as the EC root walker does
     // for its active `sys_exc_value` slot.
@@ -686,8 +689,11 @@ unsafe fn pycode_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
     let code = unsafe { &mut *(obj_addr as *mut pyre_interpreter::pycode::PyCode) };
     f(&mut code.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     let mut adapter = |slot: &mut majit_ir::GcRef| f(slot as *mut majit_ir::GcRef);
+    // Skip `is_code` (`walk_raw_code_roots`): this hook is type-directed
+    // on tid 43, so a wrapper whose `ob_type` the visitor has not yet
+    // forwarded still has `co_consts_w` visited.
     unsafe {
-        pyre_interpreter::eval::walk_raw_code_roots(
+        pyre_interpreter::eval::walk_enrolled_code_roots(
             obj_addr as pyre_object::PyObjectRef,
             &mut adapter,
         )
@@ -853,7 +859,11 @@ unsafe fn bytes_dict_storage_custom_trace(
     }
 }
 
-/// `rdict.py` `dicttable` for a set: each `ObjectKey.obj` is a GC ref.
+/// `rordereddict.py` `GcStruct("dicttable")` for a set: every live
+/// `ObjectKey.obj`. `ObjectKey.hash` is identity-stable across a move, so
+/// rewriting `obj` keeps the bucket index. The set body only forwards the
+/// `items` pointer; a box `clear` has detached stays reachable from the
+/// shadow stack and from the remembered set (`set_items_write_barrier`).
 unsafe fn set_items_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let storage = &mut *(obj_addr as *mut pyre_object::setobject::SetItemsStorage);
     for (key, _) in storage.iter_mut() {
@@ -1011,25 +1021,12 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     // releases the last other reference to a frozenset subclass immediately
     // before its instance finalizer resolves `__del__` through that class.
     f(&mut set.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    // Keep the storage box alive by forwarding its owning field slot. The
-    // box's own custom_trace also walks ObjectKey.obj, so a visit of either
-    // object greys the elements. A no-GC-hook fallback allocation is not
-    // collector-owned.
+    // `sstorage` (`setobject.py`). The box traces its own entries
+    // (`set_items_storage_custom_trace`). A no-GC-hook fallback allocation
+    // is not collector-owned.
     if !set.items.is_null() && pyre_object::gc_hook::try_gc_owns_object(set.items as *mut u8) {
         let items_slot = std::ptr::addr_of_mut!(set.items);
         f(items_slot as *mut majit_ir::GcRef);
-    }
-    let entries = unsafe { &mut *set.items };
-    for (key, _) in entries.iter_mut() {
-        // ObjectKey.hash is identity-stable across GC moves, so writing the
-        // relocated pointer through the key's `obj` slot keeps the bucket
-        // index valid — mirrors `dict_object_custom_trace`.
-        let key_ptr = key as *const pyre_object::dictmultiobject::ObjectKey
-            as *mut pyre_object::dictmultiobject::ObjectKey;
-        f(
-            std::ptr::addr_of_mut!((*key_ptr).obj) as *mut pyre_object::PyObjectRef
-                as *mut majit_ir::GcRef,
-        );
     }
 }
 
@@ -1038,9 +1035,8 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
 /// element slots are unreachable through inline `gc_ptr_offsets` — the
 /// collector would see `wrappeditems` as a single non-managed pointer and
 /// stop.
-/// Forward each element slot in place, exactly as `set_object_custom_trace`
-/// walks the off-GC `Vec`, so a moving collector relocates young tuple
-/// elements and rewrites the block. The block is exact-size for tuples
+/// Forward each element slot in place, so a moving collector relocates young
+/// tuple elements and rewrites the block. The block is exact-size for tuples
 /// (`capacity == len`, every slot written by `alloc_tuple_items_block`).
 unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let tuple_ptr = obj_addr as *mut pyre_object::tupleobject::W_TupleObject;
@@ -1341,27 +1337,19 @@ unsafe fn memoryview_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
 /// `std::alloc` box would leak on every memoryview / slice / cast that
 /// dies.  `release()` drops the box and nulls `view` eagerly, so the null
 /// guard covers both a released view and the brief
-/// header-allocated-before-`set_view` window.
+/// header-allocated-before-`set_view` window.  An owning view whose release
+/// has a side effect is registered for `W_MemoryView._finalize_`
+/// (`objspace.py newmemoryview`), which released it and dropped the box
+/// before the header died.
 unsafe fn memoryview_object_destructor(obj_addr: usize) {
     let mv = obj_addr as *const pyre_object::memoryview::W_MemoryView;
     let view_ptr = unsafe { (*mv).view } as *mut pyre_object::bufferview::BufferView;
     if !view_ptr.is_null() {
-        if unsafe { (*mv).owns_export } {
-            let owner = unsafe { (&*view_ptr).w_obj() };
-            if unsafe { pyre_object::memoryview::is_w_buffer_wrapper(owner) } {
-                // `bufferwrapper_releasebuf` without a Python execution
-                // context: end the returned memoryview's active Py_buffer
-                // export and drop the wrapper edges.  The returned view owns
-                // (and eventually releases) its own native backing export.
-                let returned = unsafe { pyre_object::memoryview::w_buffer_wrapper_mv(owner) };
-                if !returned.is_null() {
-                    unsafe { pyre_object::memoryview::w_memoryview_exports_decref(returned) };
-                }
-                unsafe { pyre_object::memoryview::w_buffer_wrapper_clear(owner) };
-            } else {
-                unsafe { (&*view_ptr).backing().release_export() };
-            }
-        }
+        debug_assert!(
+            !(unsafe { (*mv).owns_export } && unsafe { (&*view_ptr).backing() }.needs_release()),
+            "memoryview_object_destructor: an owning view with a releasing \
+             backing died without running its finalizer"
+        );
         drop(unsafe { Box::from_raw(view_ptr) });
     }
 }
@@ -1394,10 +1382,11 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 ///     items in either generation; `set_ref` / `remember_frame_locals_array`
 ///     arm the barrier. A stationary `std::alloc` block always forwards
 ///     its items in place.
-///   - `w_yielding_from`, `w_builtin`, `w_globals` — the ref-bearing statics.
-///     `f_generator_nowref` is excluded: it is the raw counterpart of PyPy's
-///     translated `f_generator_wref` (pyframe.py/276-279), hence a
-///     non-owning back-reference rather than a GC edge.
+///   - `f_generator_nowref`, `w_yielding_from`, `w_builtin`, `w_globals` —
+///     the ref-bearing statics. `f_generator_nowref` is the strong edge
+///     `initialize_as_generator` stores when `rweakref` is off;
+///     `get_generator` reads it. The slot is an ordinary GC edge to the
+///     generator, traced like any other instance attribute.
 ///   - `debugdata` / `lastblock` — managed field slots are forwarded.
 ///   - `debugdata->{w_globals, w_locals, w_extra_locals, w_f_trace,
 ///     hidden_operationerr}` — a GC-managed payload's own
@@ -1474,6 +1463,10 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
         }
     }
 
+    // Strong edge: `f_generator_nowref` (`initialize_as_generator` /
+    // `get_generator`). Forwarding the slot keeps a later comparison
+    // against the generator on the updated address.
+    f(&mut frame.f_generator_nowref as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut frame.w_yielding_from as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut frame.w_builtin as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 
@@ -2384,9 +2377,9 @@ fn build_gc() -> Box<MiniMarkGC> {
         w_dict_tid,
     );
     pytype_to_tid.insert(&pyre_object::DICT_TYPE as *const _ as usize, w_dict_tid);
-    // W_SetObject carries `items: *mut IndexMap<ObjectKey, ()>`. Register a
-    // custom trace hook so GC forwarding updates indirect key object slots.
-    // Both `set` and `frozenset` PyTypes share this Rust struct/tid.
+    // W_SetObject carries `items: *mut SetItemsStorage`. The trace forwards
+    // `w_class` and that pointer; the box tid traces the keys. Both `set`
+    // and `frozenset` PyTypes share this Rust struct/tid.
     let w_set_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
         std::mem::size_of::<pyre_object::setobject::W_SetObject>(),
         object_tid,
@@ -4081,11 +4074,10 @@ fn build_gc() -> Box<MiniMarkGC> {
         twister_descr.ptr_offsets.to_vec(),
     ));
     twister_descr.gc_type_id.set(twister_tid);
-    // PyPy setobject.py:875/963 stores a copied r_dict behind the set's GC
-    // pointer field; rdict.py:210 makes that table a GcStruct("dicttable").
-    // The box's custom_trace walks ObjectKey.obj the way dicttable does, so a
-    // write barrier that remembers the box (not the set header) still greys
-    // the elements. Keep this runtime id at the absolute registration tail.
+    // setobject.py stores the copied r_dict behind `sstorage`;
+    // rordereddict.py makes that table a GcStruct("dicttable") the collector
+    // traces itself. `set_object_custom_trace` only greys the `items` slot.
+    // Keep this runtime id at the absolute registration tail.
     register_traced_storage_box::<pyre_object::setobject::SetItemsStorage>(
         &mut gc,
         set_items_storage_custom_trace,
@@ -4739,8 +4731,14 @@ fn walk_immortal_store_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// answer for has been allocated.
 fn install_gc_root_walkers() {
     pyre_interpreter::eval::register_interpreter_global_root_walker();
-    majit_gc::shadow_stack::register_extra_root_walker(walk_parked_exception_roots);
-    majit_gc::shadow_stack::register_extra_root_walker(walk_immortal_store_roots);
+    majit_gc::shadow_stack::register_extra_root_walker(
+        walk_parked_exception_roots,
+        "parked_exception_roots",
+    );
+    majit_gc::shadow_stack::register_extra_root_walker(
+        walk_immortal_store_roots,
+        "immortal_store_roots",
+    );
     majit_gc::shadow_stack::register_rescan_root_walker(walk_rescan_tls_exception_roots);
     // The mapdict side tables are keyed by owner address. Their values are
     // conditional edges, matching the instance-dict and weakref fields PyPy
@@ -4961,6 +4959,7 @@ fn build_gc_global() {
 pub fn reset_gc_fresh_for_test() {
     let gc = build_gc();
     majit_gc::gc_sync::replace_singleton_leaking_old(gc);
+    pyre_interpreter::pycode::clear_prebuilt_code_roots_for_test();
 }
 
 /// Initialize the GC subsystem independently of the JIT driver.
@@ -5276,6 +5275,21 @@ fn build_jit_driver_pair() -> JitDriverPair {
     (d, info)
 }
 
+/// After `write_from_resume_data_partial` copies every
+/// `locals_cells_stack_w` slot from the vable boxes, null the words at
+/// and above `valuestackdepth`. A popped box can still hold a young
+/// pointer; the type-9 array walker traces every allocated slot, so
+/// leave those words NULL. The guard-failure path does this in
+/// `decode_and_restore_guard_failure`; the force path has to do it on
+/// the frame that was just forced, before the residual that forced it
+/// can allocate.
+///
+/// `frame` must be the live address: a caller whose force can collect roots
+/// the frame across it and passes the reloaded root.
+fn trim_forced_pyframe_stack(frame: &mut pyre_interpreter::PyFrame) {
+    frame.clear_stack_above(frame.valuestackdepth);
+}
+
 /// The materializing arm of `virtualref.py force_virtual_if_necessary`.
 ///
 /// The interpreter's `force_vref` runs the typeptr check — upstream's "common,
@@ -5330,8 +5344,14 @@ unsafe extern "C" fn force_pyframe_vref(
     // `leave` restores `topframeref`.  The state that would reach here is a
     // vref finished with the NULL form and still read afterwards, which
     // requires that propagation to have been skipped.
-    forced.expect("InvalidVirtualRef: frame-chain vref forced after its frame died")
-        as *mut pyre_interpreter::PyFrame
+    let forced = forced.expect("InvalidVirtualRef: frame-chain vref forced after its frame died")
+        as *mut pyre_interpreter::PyFrame;
+    // `vref.forced` is read after the force, so it is already the live
+    // address.
+    if !forced.is_null() {
+        trim_forced_pyframe_stack(unsafe { &mut *forced });
+    }
+    forced
 }
 
 unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
@@ -5379,6 +5399,10 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
             _ => false,
         };
         let mut force = |ptr: *mut u8| {
+            // The force materializes virtuals and can collect: keep the
+            // frame on the shadow stack across it and reload it after, as
+            // gctransform `push_roots` / `pop_roots` do for a GC local.
+            let mut root = FrameRoot::new(&mut *(ptr as *mut PyFrame));
             info.force_virtualizable_if_necessary(ptr, |token| {
                 // `compile.py ResumeGuardForcedDescr.force_now` decodes
                 // the resume data with the same allocator ordinary guard failure
@@ -5398,6 +5422,7 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
                 }
                 driver.force_virtualizable_token(token);
             });
+            trim_forced_pyframe_stack(root.frame());
         };
         // Force the traced frame only when the frame handed to Python belongs
         // to the traced virtualizable — either it IS the virtualizable, or it
@@ -6534,9 +6559,6 @@ fn init_callbacks() {
             callee_frame_helper: crate::call_jit::callee_frame_helper,
             recursive_force_cache_safe: crate::call_jit::recursive_force_cache_safe,
             jit_drop_callee_frame: crate::call_jit::jit_drop_callee_frame as *const (),
-            jit_frame_set_slot_ref: crate::call_jit::jit_frame_set_slot_ref as *const (),
-            jit_frame_set_slot_int: crate::call_jit::jit_frame_set_slot_int as *const (),
-            jit_frame_set_slot_float: crate::call_jit::jit_frame_set_slot_float as *const (),
             jit_force_callee_frame: crate::call_jit::jit_force_callee_frame as *const (),
             jit_force_recursive_call_1: crate::call_jit::jit_force_recursive_call_1 as *const (),
             jit_force_recursive_call_argraw_boxed_1:
@@ -8977,9 +8999,31 @@ fn portal_activation_bracketed(
     // Same shape, and the same assign-only-what-came-back-live rule, as
     // `eval::eval_frame_plain_with_resume`.
     let mut w_exitvalue = w_none();
+    // `call_trace` runs before `resume_execute_frame`. A thrown
+    // `OperationError` (`error.py`) is a GC object on that path; pin the
+    // native carrier and write the slot back before the resume reads
+    // `exc_object`.
+    let operr_pin = resume.as_ref().and_then(|resume| {
+        resume.operr.as_ref().and_then(|err| {
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = err.pin_exc_object(&roots)?;
+            Some((roots, slot))
+        })
+    });
+    let mut resume = resume;
     let outer_result = match unsafe { (*ec).call_trace(frame_root.frame() as *mut PyFrame) } {
-        Err(err) => Err(err),
+        Err(err) => {
+            drop(operr_pin);
+            Err(err)
+        }
         Ok(()) => {
+            if let Some((roots, slot)) = &operr_pin
+                && let Some(resume) = resume.as_mut()
+                && let Some(err) = resume.operr.as_mut()
+            {
+                err.reload_exc_object(roots, Some(*slot));
+            }
+            drop(operr_pin);
             // `self.resume_execute_frame(w_arg_or_err)` and its
             // `except pyopcode.Yield` arm, in `execute_frame`'s inner `try`: a
             // resumed frame is positioned mid-body and the sent value belongs
@@ -10511,6 +10555,28 @@ fn apply_blackhole_crn_handoff(frame: &mut PyFrame, green_int: &[i64]) {
     correct_resume_vsd(frame, ni as usize);
 }
 
+/// Pin a GC-managed deadframe on the jitframe shadow stack for one
+/// `handle_fail` / blackhole window.
+///
+/// `JitFrameDeadFrame` already holds an `OwnerRootGuard`, but that slot
+/// is walked with `drag_out_root`: a nursery frame is copied, an old
+/// frame is left alone. Compiled execution had interior-traced the same
+/// old frame through `walk_jf_roots` (`visit_jf_root` →
+/// `trace_and_update_object`). The epilogue pops that stack before
+/// `execute_token` returns, so a later minor during bridge tracing skips
+/// `jf_gcmap` slots. Guard failure saved young Refs there with no write
+/// barrier (`_push_all_regs_to_jitframe`), so the words go stale until a
+/// later frame barrier remembers the jitframe and `jitframe_trace` trips
+/// GC BUG.
+fn pin_deadframe_jf(
+    deadframe: &Option<majit_backend::DeadFrame>,
+) -> Option<majit_gc::shadow_stack::JitFramePin> {
+    let ptr = deadframe.as_ref()?.jitframe_ptr()?;
+    Some(majit_gc::shadow_stack::JitFramePin::enter(majit_ir::GcRef(
+        ptr as usize,
+    )))
+}
+
 /// compile.py handle_fail.
 ///
 /// Single function containing the complete guard failure handling:
@@ -11265,6 +11331,9 @@ fn execute_assembler(
             // already replayed that store. `YIELD_VALUE` finishes the same
             // way without the store; `generator.py` `send_ex` reads the bit
             // to tell the two apart, so a FINISH must not set it again.
+            // `store_token_in_vable` leaves the jitframe in `vable_token`:
+            // the PyFrame's custom trace keeps it alive and its finish gcmap
+            // describes the slots a later lazy force reads.
             Some(LoopResult::Done(Ok(result)))
         }
         // warmstate.py:416-422 general: handle_fail
@@ -11279,29 +11348,32 @@ fn execute_assembler(
             ref exit_layout,
             guard_exc,
             savedata,
-            deadframe: _deadframe,
-        } => match dispatch_handle_fail(
-            &mut frame_root,
-            green_key,
-            trace_id,
-            fail_index,
-            descr_arc,
-            should_bridge,
-            owning_key,
-            exit_layout,
-            raw_values,
-            guard_exc,
-            info,
-            savedata,
-            true,
-            false,
-        ) {
-            HandleFailDispatch::ContinueRunningNormally => {
-                Some(LoopResult::ContinueRunningNormally)
+            ref deadframe,
+        } => {
+            let _jf_pin = pin_deadframe_jf(deadframe);
+            match dispatch_handle_fail(
+                &mut frame_root,
+                green_key,
+                trace_id,
+                fail_index,
+                descr_arc,
+                should_bridge,
+                owning_key,
+                exit_layout,
+                raw_values,
+                guard_exc,
+                info,
+                savedata,
+                true,
+                false,
+            ) {
+                HandleFailDispatch::ContinueRunningNormally => {
+                    Some(LoopResult::ContinueRunningNormally)
+                }
+                HandleFailDispatch::Done(r) => Some(LoopResult::Done(r)),
+                HandleFailDispatch::Fallthrough => None,
             }
-            HandleFailDispatch::Done(r) => Some(LoopResult::Done(r)),
-            HandleFailDispatch::Fallthrough => None,
-        },
+        }
         DetailedDriverRunOutcome::Jump { .. } | DetailedDriverRunOutcome::Abort { .. } => None,
     }
 }
@@ -11761,9 +11833,10 @@ fn bound_reached(
             ref exit_layout,
             guard_exc,
             savedata,
-            deadframe: _deadframe,
+            ref deadframe,
         } = outcome
         {
+            let _jf_pin = pin_deadframe_jf(deadframe);
             match dispatch_handle_fail(
                 &mut frame_root,
                 green_key,
@@ -12041,9 +12114,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             ref exit_layout,
             guard_exc,
             savedata,
-            deadframe: _deadframe,
+            ref deadframe,
         } = outcome
         {
+            let _jf_pin = pin_deadframe_jf(deadframe);
             match dispatch_handle_fail(
                 &mut frame_root,
                 green_key,

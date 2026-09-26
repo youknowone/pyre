@@ -837,6 +837,23 @@ pub fn get_owner_root(index: usize) -> GcRef {
     OWNER_ROOTS.with(|roots| roots.borrow()[index].expect("reading an inactive owner-root slot"))
 }
 
+/// Overwrite a live owner-root slot with a newly published value.
+///
+/// RPython's GC transform stores into an existing frame slot when a live
+/// local is reassigned; it does not acquire a second slot. Host-side guards
+/// that replace an `rbigint` handle use this so the same slot names the new
+/// digit array.
+pub fn set_owner_root(index: usize, root: GcRef) {
+    OWNER_ROOTS.with(|roots| {
+        let mut roots = roots.borrow_mut();
+        assert!(
+            index < roots.len() && roots[index].is_some(),
+            "writing an inactive owner-root slot"
+        );
+        roots[index] = Some(root);
+    });
+}
+
 /// RAII owner for one fixed translated-livevar root slot.
 pub struct OwnerRootGuard {
     index: usize,
@@ -871,6 +888,14 @@ impl OwnerRootGuard {
         // as long as the guard (which cannot leave the thread), and the slot
         // stays acquired until `Drop`.
         unsafe { (*self.roots).borrow()[self.index].expect("inactive owner-root guard") }
+    }
+
+    #[inline]
+    pub fn set(&self, root: GcRef) {
+        // SAFETY: same cell and slot lifetime as [`Self::get`].
+        unsafe {
+            (*self.roots).borrow_mut()[self.index] = Some(root);
+        }
     }
 }
 
@@ -1136,6 +1161,37 @@ pub fn jf_depth() -> usize {
         stack.ensure_init();
         (stack.top.get() - stack.base) / (2 * WORD)
     })
+}
+
+/// Keeps one jitframe on the jitframe shadow stack for a scope outside
+/// compiled code, the way `_call_header_shadowstack` /
+/// `_call_footer_shadowstack` bracket a compiled call.
+///
+/// A frame whose compiled code already returned (a guard-failure deadframe)
+/// or is suspended in a residual call (`llmodel.py force` returns the frame
+/// that pushed `jf_gcmap`, and `pop_gcmap` runs only after the residual
+/// returns) is otherwise walked only through an owner root, which copies a
+/// nursery frame but does not interior-trace an old one. Pinning it here
+/// lets `walk_jf_roots` trace its `jf_frame` slots through `jitframe_trace`.
+/// Dropping the pin restores the stack to its depth at entry.
+pub struct JitFramePin {
+    depth: usize,
+}
+
+impl JitFramePin {
+    pub fn enter(jf_ptr: GcRef) -> Self {
+        Self {
+            depth: push_jf(jf_ptr),
+        }
+    }
+}
+
+impl Drop for JitFramePin {
+    fn drop(&mut self) {
+        if jf_depth() > self.depth {
+            pop_jf_to(self.depth);
+        }
+    }
 }
 
 /// Walk jitframe shadow stack entries as GC roots.
@@ -1777,24 +1833,26 @@ pub fn extra_root_walk_kind() -> ExtraRootWalkKind {
 const MAX_EXTRA_ROOT_WALKERS: usize = 8;
 
 /// Registered root walkers. Each slot is either `None` or a function
-/// pointer. We cap the count to keep the set stack-allocatable and
-/// avoid dynamic allocation in the GC hot path.
+/// pointer plus the label the debug walk prints. We cap the count to keep
+/// the set stack-allocatable and avoid dynamic allocation in the GC hot path.
+/// Collection walks the function and ignores the label.
 static EXTRA_ROOT_WALKERS: parking_lot::RwLock<
-    [Option<ExtraRootWalkerFn>; MAX_EXTRA_ROOT_WALKERS],
+    [Option<(ExtraRootWalkerFn, &'static str)>; MAX_EXTRA_ROOT_WALKERS],
 > = parking_lot::RwLock::new([None; MAX_EXTRA_ROOT_WALKERS]);
 
 /// Register an additional root walker.
 ///
 /// Called at process start (or module init) by the embedder once per
 /// root source. Duplicate registrations are tolerated — the walker is
-/// only appended if not already present.
-pub fn register_extra_root_walker(walker: ExtraRootWalkerFn) {
+/// only appended if not already present. `label` is debug-only: the
+/// collector's root walk does not read it.
+pub fn register_extra_root_walker(walker: ExtraRootWalkerFn, label: &'static str) {
     let mut guard = EXTRA_ROOT_WALKERS.write();
     for slot in guard.iter_mut() {
         match slot {
-            Some(existing) if std::ptr::fn_addr_eq(*existing, walker) => return,
+            Some((existing, _)) if std::ptr::fn_addr_eq(*existing, walker) => return,
             None => {
-                *slot = Some(walker);
+                *slot = Some((walker, label));
                 return;
             }
             _ => {}
@@ -1850,7 +1908,8 @@ pub fn walk_rescan_roots(mut visitor: impl FnMut(&mut GcRef)) {
 
 /// Invoke every registered extra root walker with the given visitor.
 ///
-/// Called by `MiniMarkGC::do_collect_nursery` (Phase 1e).
+/// Called by `MiniMarkGC::do_collect_nursery` (Phase 1e). The label stored
+/// beside each walker is not read here.
 pub fn walk_extra_roots(mut visitor: impl FnMut(&mut GcRef)) {
     // Snapshot the walker list under a read guard so a walker that
     // triggers further allocation (and recursively a collection) does
@@ -1859,8 +1918,23 @@ pub fn walk_extra_roots(mut visitor: impl FnMut(&mut GcRef)) {
         let guard = EXTRA_ROOT_WALKERS.read();
         *guard
     };
-    for walker in walkers.iter().flatten() {
+    for (walker, _) in walkers.iter().flatten() {
         walker(&mut visitor);
+    }
+}
+
+/// [`walk_extra_roots`] that also names the walker.
+///
+/// `enumerate_labeled_root_walker_values` is the reader. Collection keeps
+/// using [`walk_extra_roots`].
+pub fn walk_extra_roots_labeled(mut visitor: impl FnMut(&mut GcRef, &'static str)) {
+    let walkers = {
+        let guard = EXTRA_ROOT_WALKERS.read();
+        *guard
+    };
+    for (walker, label) in walkers.iter().flatten() {
+        let label = *label;
+        walker(&mut |gcref| visitor(gcref, label));
     }
 }
 

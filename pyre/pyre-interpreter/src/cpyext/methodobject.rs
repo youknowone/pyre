@@ -14,7 +14,6 @@ use pyre_object::PyObjectRef;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::hash::BuildHasherDefault;
-use std::sync::OnceLock;
 
 bitflags::bitflags! {
     /// The `methodobject.h` flags a `PyMethodDef` row carries in `ml_flags`.
@@ -138,8 +137,10 @@ fn method_def_at(index: i64) -> Option<*mut CPyMethodDef> {
     Some(address as *mut CPyMethodDef)
 }
 
-static PYCFUNCTION_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
-static PYCMETHOD_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static PYCFUNCTION_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
+static PYCMETHOD_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `__setattr__` / `__delattr__` for a carrier type.
 ///
@@ -220,7 +221,7 @@ pub(super) fn install_attribute_fence(ns: PyObjectRef) {
 /// back from `PyCFunction_GetFunction` but an error, which a caller spelling
 /// the two as one expression does not look for.
 pub fn pycfunction_type() -> PyObjectRef {
-    *PYCFUNCTION_TYPE_OBJ.get_or_init(|| {
+    PYCFUNCTION_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("builtin_function_or_method", |ns| {
             unsafe {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -237,8 +238,8 @@ pub fn pycfunction_type() -> PyObjectRef {
             install_attribute_fence(ns);
         });
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 /// `methodobject.py W_PyCMethodObject` — the carrier a `METH_METHOD` row
@@ -248,15 +249,15 @@ pub fn pycfunction_type() -> PyObjectRef {
 /// This is what `PyCMethod_Type` names, and it derives from
 /// `PyCFunction_Type`, so `PyCFunction_Check` answers yes for one.
 pub fn pycmethod_type() -> PyObjectRef {
-    *PYCMETHOD_TYPE_OBJ.get_or_init(|| {
+    PYCMETHOD_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_base(
             "builtin_method",
             |_ns| {},
             pycfunction_type(),
         );
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 /// Whether `carrier` is one of this module's own, rather than something that
@@ -715,8 +716,8 @@ const _: () = {
 /// [`pycfunction_type`] mints its type on first call, and this runs from
 /// inside the mint of some other type's mirror; a type that does not exist yet
 /// has no instances, so the answer for one is the same either way.
-fn built_carrier_type(cell: &OnceLock<usize>) -> PyObjectRef {
-    cell.get().copied().unwrap_or(0) as PyObjectRef
+fn built_carrier_type(cell: &pyre_object::gc_roots::RootedOnceRef) -> PyObjectRef {
+    cell.get().unwrap_or(std::ptr::null_mut())
 }
 
 /// What `tp_basicsize` a synthesized mirror of `w_type` carries --

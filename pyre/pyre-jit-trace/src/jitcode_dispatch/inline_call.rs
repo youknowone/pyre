@@ -240,12 +240,11 @@ unsafe fn kwonly_defaults_for_inline(
     // The version lives on the strategy box, so that is what the pin names and
     // what has to exist.  An ordinary dict has none.
     let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(dict) };
-    // The strategy box is baked AND named by raw address outside the trace --
-    // the emit installs the mapping's version marker against that address
-    // (`record_quasiimmut_field`) -- so this one keeps its movability test
-    // even though the `active_sym_registers` root area covers the bank.  A
-    // `malloc_typed` strategy box answers it for free.
-    if strategy.is_null() || majit_gc::can_move(majit_ir::GcRef(strategy as usize)) {
+    // The emit records `record_quasiimmut_field` against this strategy box.
+    // `QuasiImmutDescr.struct_ptr` is a GCREF `walk_const_ptr_refs` forwards,
+    // the same way `quasiimmut.py self.struct` is.  Movability does not
+    // decide the pin.
+    if strategy.is_null() {
         return None;
     }
     let raw = unsafe {
@@ -307,9 +306,9 @@ pub(crate) fn try_resolve_inline_callee_static_field<Sym: WalkSym>(
     if dst_bank != 'r' {
         return Ok(None);
     }
-    let Some(consts) = ctx.inline_callee_consts else {
+    if ctx.inline_callee_consts.is_none() {
         return Ok(None);
-    };
+    }
     let descr = read_descr(code, op, 1, ctx)?;
     let field_idx = {
         let Some(info) = ctx.trace_ctx.virtualizable_info() else {
@@ -321,7 +320,7 @@ pub(crate) fn try_resolve_inline_callee_static_field<Sym: WalkSym>(
         }
     };
     let const_ptr = match field_idx {
-        VABLE_CODE_FIELD_IDX => consts.w_code,
+        VABLE_CODE_FIELD_IDX => ctx.inline_w_code(),
         _ => return Ok(None),
     };
     let result = ctx.trace_ctx.const_ref(const_ptr as i64);
@@ -6227,16 +6226,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // fine; that is why the `code?` marker below covers this arm instead.
     let guards_the_callee_function =
         !callable_guard_op.is_constant() && pinned_object_is_the_callee;
-    if !guards_the_callee_function && majit_gc::can_move(majit_ir::GcRef(callable as usize)) {
-        // The arm below stands the baked code up on `function.py:47`'s `code?`
-        // instead of a per-iteration guard, and the marker names its owner by
-        // raw address at both record and compile time.  The jitcode
-        // `MAKE_FUNCTION` lowering allocates its function in the nursery, so
-        // such a callee can be relocated between those two reads; refuse the
-        // inline rather than bake a body no invalidation covers.  `rgc.can_move`
-        // parity — false when no moving GC is active.
-        return resolved_inline_decline(op.pc, line!());
-    }
     // `Function.funccall_valuestack` fills every parameter the call left
     // unbound from `defs_w` before entering the frame
     // (`function.py:188-193,217-231`); `Arguments.parse` reaches the same frame
@@ -6364,12 +6353,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             return resolved_inline_decline(op.pc, line!());
         }
         // A zero-surplus vararg is baked rather than built (see the emit
-        // below), and a freshly minted `ConstPtr` sits in the walker's
-        // `registers_r`, which no registered root area walks.  So the object
-        // has to be one a collection during this walk cannot move.
-        if surplus_ops.is_empty() && majit_gc::can_move(majit_ir::GcRef(concrete as usize)) {
-            return resolved_inline_decline(op.pc, line!());
-        }
+        // below).  That `ConstPtr` lands in the walker's `registers_r`, which
+        // `InlineRegisterBankGuard` (`miframe_registers`) forwards, and then
+        // in the recorded op / gcref table.  Movability does not decide it.
         callee_args.truncate(nparams);
         callee_arg_concretes.truncate(nparams);
         Some((surplus_ops, concrete))
@@ -7284,13 +7270,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         return resolved_inline_decline(op.pc, line!());
     }
 
+    // Nursery-born `Function.__globals__` / `W_Code` must survive the guards
+    // below until they land in `WalkFrameState`, which
+    // `InlineFrameStateGuard` walks.
+    let _inline_const_roots = pyre_object::gc_roots::push_roots();
+    let inline_globals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(callee_globals_obj);
+    let inline_code_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
+
     // Path-1 (#68): the inlined callee's promoted `pycode` static field and
     // its code-derived globals semantic constant.  The latter is no longer a
     // physical virtualizable scalar; LOAD_GLOBAL derives it through the
     // callee frame's pycode.
     let inline_consts = InlineCalleeConsts {
-        w_globals: callee_globals_obj as usize,
-        w_code: callee_code_key,
         jitcode_index: crate::state::ensure_jitcode_index(callee_code_key as *const ())
             .map_or(-1, |index| index as i32),
     };
@@ -7446,7 +7439,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             op.pc,
             callable_guard_op,
             crate::descr::function_w_globals_descr(),
-            inline_consts.w_globals as i64,
+            pyre_object::gc_roots::shadow_stack_get(inline_globals_slot) as i64,
         )?;
         if !concrete_freevar_cells.is_empty() {
             // `closure?[*]`: the tuple itself is rebuilt by every
@@ -7728,9 +7721,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // baked `ConstPtr` the guard arm must stay off.  What being constant
         // adds is the part a marker needs and cannot check for itself -- one
         // object on every execution, which is what makes watching that object's
-        // slot answer for all of them.  The caller has already refused a callee
-        // the collector can relocate on this arm, so both reads find it where
-        // the constant says it is.
+        // slot answer for all of them.  The owner word lives on
+        // `QuasiImmutDescr.struct_ptr`, which `walk_const_ptr_refs` forwards.
         //
         // Off a live operand the callee's identity is not fixed -- two closures
         // minted from one `def` both satisfy the class-and-code test -- so the
@@ -7752,8 +7744,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             )?;
         }
         // `walker_pin_namespace_version`'s body, opened up: the resolve already
-        // read the strategy box and proved it immovable, and there is no way
-        // back from here to act on the `Ok(false)` the wrapper would return.
+        // read the strategy box, and there is no way back from here to act on
+        // the `Ok(false)` the wrapper would return.  The marker names that
+        // box through `QuasiImmutDescr.struct_ptr`, which is forwarded.
         let strategy_const = ctx.trace_ctx.const_ref(resolved.strategy as i64);
         crate::state::record_quasiimmut_field(
             ctx.trace_ctx,
@@ -7816,6 +7809,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // can allocate. The later WalkContext uses these same slots.
     let callee_state = WalkFrameState::new(WalkFrameStateData {
         concrete_registers_r: callee_concrete_r,
+        inline_w_globals: pyre_object::gc_roots::shadow_stack_get(inline_globals_slot) as usize,
+        inline_w_code: pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as usize,
         ..Default::default()
     });
     let _setup_state_guard = crate::trace::InlineFrameStateGuard::enter(&callee_state);
@@ -8060,8 +8055,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             return resolved_inline_decline(op.pc, line!());
         }
 
-        let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
-        let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_consts.w_globals as i64);
+        let pycode_const = ctx
+            .trace_ctx
+            .const_ref(callee_state.borrow().inline_w_code as i64);
+        let w_globals_obj_const = ctx
+            .trace_ctx
+            .const_ref(callee_state.borrow().inline_w_globals as i64);
         let param_boxes: Vec<OpRef> = (0..seeded_locals).map(|i| callee_args[i]).collect();
         // `finish_for_call_with_globals_obj` fills the cell band in two
         // halves: one fresh `w_cell_new(PY_NULL, family)` per pure cellvar,
@@ -8097,7 +8096,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         cell_slots.extend_from_slice(&freevar_cell_ops);
         // Same pairing as the Branch A site: the `frame_stores_global`
         // decline earlier in this walk is what lets a `debugdata`-less
-        // frame answer for `inline_consts.w_globals`.
+        // frame answer for `inline_w_globals`.
         let Some(callee_frame) = crate::helpers::emit_new_pyframe_inline_with_params(
             ctx.trace_ctx,
             &param_boxes,
@@ -8141,7 +8140,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
                 w_code,
                 &concrete_args,
-                inline_consts.w_globals as pyre_object::PyObjectRef,
+                callee_state.borrow().inline_w_globals as pyre_object::PyObjectRef,
                 concrete_ec,
                 concrete_closure,
                 pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
@@ -12381,12 +12380,14 @@ fn yield_marker_py_pc<Sym: WalkSym>(
         .iter()
         .find(|&&(off, _)| off as usize == op_pc)
         .map(|&(_, py)| py as usize)?;
-    if consts.w_code == 0 {
+    // The callee's `W_Code` lives on `WalkFrameStateData` (`inline_w_code`),
+    // not on the consts.
+    let w_code = ctx.inline_w_code();
+    if w_code == 0 {
         return None;
     }
-    let code_ptr =
-        unsafe { pyre_interpreter::w_code_get_ptr(consts.w_code as pyre_object::PyObjectRef) }
-            as *const pyre_interpreter::CodeObject;
+    let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) }
+        as *const pyre_interpreter::CodeObject;
     Some((py_pc, code_ptr))
 }
 
@@ -15104,6 +15105,12 @@ struct SubWalkFrame<'a, Sym: WalkSym> {
     /// Residual SubReturn still replays the CALL so a cut specialize
     /// preamble is recorded again.
     pending_subreturn: Option<PendingSubReturn>,
+    /// Results of the callees this frame's current CALL step already
+    /// entered, in entry order.  The step replays from its start after each
+    /// callee finishes, so every entry before the one that suspended must
+    /// receive its own earlier result again rather than walk the callee a
+    /// second time; `finishframe` hands each result to the call that made it.
+    replay_log: Vec<CompletedSubWalk>,
 }
 
 struct PendingSubReturn {
@@ -15278,7 +15285,11 @@ struct CompletedSubWalk {
 /// borrowed frame object.
 struct SubWalkExchange<'a, Sym: WalkSym> {
     pending: Option<SubWalkFrame<'a, Sym>>,
-    completed: Option<CompletedSubWalk>,
+    /// The active frame's [`SubWalkFrame::replay_log`], lent to it while it
+    /// is driven.
+    completed: Vec<CompletedSubWalk>,
+    /// How many `completed` entries the current pass of the step consumed.
+    completed_cursor: usize,
     active_frame_id: usize,
     next_frame_id: usize,
     step_trace_position: Option<majit_metainterp::recorder::TracePosition>,
@@ -15308,7 +15319,8 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
             state_guards: Vec::new(),
             exchange: SubWalkExchange {
                 pending: None,
-                completed: None,
+                completed: Vec::new(),
+                completed_cursor: 0,
                 active_frame_id: 0,
                 next_frame_id,
                 step_trace_position: None,
@@ -15377,6 +15389,8 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 .last_mut()
                 .expect("sub-walk driver lost its root frame");
             self.exchange.active_frame_id = frame.id;
+            self.exchange.completed = std::mem::take(&mut frame.replay_log);
+            self.exchange.completed_cursor = 0;
             let driven = frame.drive(trace_ctx);
             match driven {
                 Err(DispatchError::SubWalkSuspended { pc }) => {
@@ -15404,6 +15418,11 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                         *trace_ctx.heap_cache_mut() = heap_cache;
                     }
                     frame.pc = pc;
+                    // Keep the results this pass consumed; the callee that
+                    // just suspended appends its own when it finishes.
+                    let mut replay_log = std::mem::take(&mut self.exchange.completed);
+                    replay_log.truncate(self.exchange.completed_cursor);
+                    frame.replay_log = replay_log;
                     let child = self
                         .exchange
                         .pending
@@ -15412,6 +15431,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                     self.push_frame(child);
                 }
                 result => {
+                    self.exchange.completed.clear();
                     let frame = self.pop_frame();
                     let class_state = frame.fbw_mode.class_of_last_exc_is_const;
                     let caller_pc = frame.caller_pc;
@@ -15437,7 +15457,14 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                     }
                     SUBWALK_CALL_REPLAY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     parent.pc = caller_pc;
-                    self.exchange.completed = Some(CompletedSubWalk {
+                    debug_assert!(
+                        parent
+                            .replay_log
+                            .iter()
+                            .all(|entry| entry.caller_pc == caller_pc),
+                        "a replay log spans two CALL steps"
+                    );
+                    parent.replay_log.push(CompletedSubWalk {
                         parent_id: parent.id,
                         caller_pc,
                         result,
@@ -15467,6 +15494,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
 /// needs only the opname and the trace position.
 pub(crate) fn note_subwalk_driver_step<Sym: WalkSym>(
     opname: &str,
+    pc: usize,
     trace_position: majit_metainterp::recorder::TracePosition,
 ) {
     SUBWALK_DRIVER.with(|slot| {
@@ -15480,6 +15508,16 @@ pub(crate) fn note_subwalk_driver_step<Sym: WalkSym>(
         // the driver while this callback runs. Nested walks keep the same
         // `Sym` monomorphization.
         let exchange = unsafe { &mut *(pointer as *mut SubWalkExchange<'_, Sym>) };
+        // A replay of the CALL step starts consuming its log from the first
+        // entry; any other step means that CALL finished and its log is spent.
+        exchange.completed_cursor = 0;
+        if exchange
+            .completed
+            .first()
+            .is_some_and(|entry| entry.caller_pc != pc)
+        {
+            exchange.completed.clear();
+        }
         exchange.step_trace_position = Some(trace_position);
         exchange.step_effect_count = fbw_executed_effect_count();
         exchange.step_unjournaled = fbw_has_unjournaled_effect();
@@ -15518,7 +15556,8 @@ mod subwalk_checkpoint_tests {
     fn only_calls_keep_a_heap_cache_replay_checkpoint() {
         let mut exchange = SubWalkExchange::<crate::state::PyreSym> {
             pending: None,
-            completed: None,
+            completed: Vec::new(),
+            completed_cursor: 0,
             active_frame_id: 0,
             next_frame_id: 1,
             step_trace_position: None,
@@ -15547,7 +15586,7 @@ mod subwalk_checkpoint_tests {
             ("inline_call_irf_v", false),
             ("int_return", false),
         ] {
-            note_subwalk_driver_step::<crate::state::PyreSym>(opname, position);
+            note_subwalk_driver_step::<crate::state::PyreSym>(opname, 0, position);
             assert_eq!(
                 exchange.step_heap_cache.is_some(),
                 keeps_checkpoint,
@@ -15555,10 +15594,59 @@ mod subwalk_checkpoint_tests {
             );
             assert_eq!(exchange.step_trace_position, Some(position));
         }
-        note_subwalk_driver_step::<crate::state::PyreSym>("residual_call_ir_r", position);
+        note_subwalk_driver_step::<crate::state::PyreSym>("residual_call_ir_r", 0, position);
         assert!(exchange.step_heap_cache.is_none());
         snapshot_residual_heap_before_suspend::<crate::state::PyreSym>(&heap_cache);
         assert!(exchange.step_heap_cache.is_some());
+    }
+
+    /// Two callees entered by one CALL step: the replay after the second
+    /// finishes has to hand the first entry its own result again, and only
+    /// leaving the step spends the log.
+    #[test]
+    fn a_replayed_call_step_keeps_every_earlier_callee_result() {
+        let entry = |caller_pc: usize, leaf_pc: usize| CompletedSubWalk {
+            parent_id: 0,
+            caller_pc,
+            result: Err(DispatchError::UndecodableOpcode { pc: leaf_pc }),
+            class_of_last_exc_is_const: false,
+        };
+        let mut exchange = SubWalkExchange::<crate::state::PyreSym> {
+            pending: None,
+            completed: vec![entry(7, 0), entry(7, 140)],
+            completed_cursor: 2,
+            active_frame_id: 0,
+            next_frame_id: 1,
+            step_trace_position: None,
+            step_effect_count: 0,
+            step_unjournaled: false,
+            step_heap_cache: None,
+            residual_step: false,
+        };
+        let _driver = SubWalkDriverGuard::install(&mut exchange);
+        let position = majit_metainterp::recorder::TracePosition {
+            _pos: 0,
+            _count: 0,
+            _index: 0,
+            snapshot_data_len: 0,
+            snapshot_array_data_len: 0,
+            guard_count: Some(0),
+        };
+        note_subwalk_driver_step::<crate::state::PyreSym>("residual_call_ir_r", 7, position);
+        assert_eq!(exchange.completed_cursor, 0);
+        assert_eq!(
+            exchange
+                .completed
+                .iter()
+                .map(|entry| entry.result.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Err(DispatchError::UndecodableOpcode { pc: 0 }),
+                Err(DispatchError::UndecodableOpcode { pc: 140 }),
+            ]
+        );
+        note_subwalk_driver_step::<crate::state::PyreSym>("int_add", 9, position);
+        assert!(exchange.completed.is_empty());
     }
 
     #[test]
@@ -15643,14 +15731,15 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         // SAFETY: installed by the enclosing invocation of this same generic
         // function; see `SubWalkDriverGuard`.
         let exchange = unsafe { &mut *(driver_pointer as *mut SubWalkExchange<'a, Sym>) };
-        if exchange.completed.as_ref().is_some_and(|completed| {
-            completed.parent_id == exchange.active_frame_id && completed.caller_pc == pc
-        }) {
-            let completed = exchange.completed.take().unwrap();
+        if let Some(completed) = exchange.completed.get(exchange.completed_cursor)
+            && completed.parent_id == exchange.active_frame_id
+            && completed.caller_pc == pc
+        {
+            exchange.completed_cursor += 1;
             if completed.result.is_ok() {
                 ctx.fbw_mode.class_of_last_exc_is_const = completed.class_of_last_exc_is_const;
             }
-            return completed.result;
+            return completed.result.clone();
         }
     }
 
@@ -15828,6 +15917,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
         pending_subreturn: None,
+        replay_log: Vec::new(),
     };
 
     if !driver_pointer.is_null() {

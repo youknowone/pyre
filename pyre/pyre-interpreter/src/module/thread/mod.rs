@@ -43,38 +43,6 @@ const TIMEOUT_MAX: f64 = (if PY_TIMEOUT_MAX < PYTIME_MAX_US {
     PYTIME_MAX_US
 } / 1_000_000) as f64;
 static THREAD_COUNT: AtomicI64 = AtomicI64::new(0);
-/// `os_thread.py` `Bootstrapper.lock`. Held from the moment start-up data is
-/// published until the new thread has copied it into its own shadow stack.
-static BOOTSTRAP_LOCK: AtomicBool = AtomicBool::new(false);
-/// `os_thread.py` `Bootstrapper.w_callable` / `args`, packed as one tuple.
-/// A raw address copied into the child is not a root: a moving collection
-/// reuses that nursery word, and the child then pins whatever object landed
-/// there. This slot is forwarded by `walk_thread_roots`.
-static BOOTSTRAP_PAYLOAD: AtomicUsize = AtomicUsize::new(0);
-/// Bumped on every acquire so a worker that dies late cannot clear a newer
-/// start's payload.
-static BOOTSTRAP_GEN: AtomicUsize = AtomicUsize::new(0);
-
-fn acquire_bootstrap_lock() -> usize {
-    loop {
-        if BOOTSTRAP_LOCK
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            return BOOTSTRAP_GEN.fetch_add(1, Ordering::AcqRel) + 1;
-        }
-        // `Bootstrapper.acquire`: the lock wait releases the GIL.
-        let _blocked = before_external_block();
-        std::thread::yield_now();
-    }
-}
-
-fn release_bootstrap_if_owner(epoch: usize) {
-    if BOOTSTRAP_GEN.load(Ordering::Acquire) == epoch {
-        BOOTSTRAP_PAYLOAD.store(0, Ordering::Release);
-        BOOTSTRAP_LOCK.store(false, Ordering::Release);
-    }
-}
 static STACK_SIZE: AtomicUsize = AtomicUsize::new(0);
 static FINALIZING: AtomicBool = AtomicBool::new(false);
 static FINALIZING_THREAD: AtomicI64 = AtomicI64::new(0);
@@ -164,6 +132,7 @@ unsafe extern "C" fn atfork_child_reinit_thread_tables() {
         SHUTDOWN_HANDLES.reinit_after_fork();
         TRACE_ALL_HOOK.reinit_after_fork();
         PROFILE_ALL_HOOK.reinit_after_fork();
+        BOOTSTRAPPER.reinit();
         crate::module::posix::reinit_fork_tables_after_fork();
     }
 }
@@ -386,11 +355,6 @@ pub(crate) fn walk_thread_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     }
     visitor(unsafe { &mut *(&mut *TRACE_ALL_HOOK.lock() as *mut usize as *mut majit_ir::GcRef) });
     visitor(unsafe { &mut *(&mut *PROFILE_ALL_HOOK.lock() as *mut usize as *mut majit_ir::GcRef) });
-    let mut payload = BOOTSTRAP_PAYLOAD.load(Ordering::Acquire) as PyObjectRef;
-    if !payload.is_null() {
-        visitor(unsafe { &mut *(&mut payload as *mut PyObjectRef as *mut majit_ir::GcRef) });
-        BOOTSTRAP_PAYLOAD.store(payload as usize, Ordering::Release);
-    }
 }
 
 pub(crate) fn register_execution_context(ec: *const crate::PyExecutionContext) {
@@ -1984,75 +1948,137 @@ fn call_thread_target(
     }
 }
 
+/// os_thread.py `class Bootstrapper`: "A global container used to pass
+/// information to newly starting threads."
+///
+/// The object fields are the prebuilt `bootstrapper` instance's GCREF fields:
+/// process-global slots that [`Bootstrapper::setup`] registers as collector
+/// roots, so a collection between [`Bootstrapper::acquire`] and the new
+/// thread's read forwards them.
+struct Bootstrapper {
+    /// `bootstrapper.lock`: "held whenever the fields 'bootstrapper.w_callable'
+    /// and 'bootstrapper.args' are in use".  The starting thread takes it and
+    /// the new thread releases it, so it is a word rather than a guard.
+    lock: AtomicBool,
+    registered: AtomicBool,
+    w_callable: UnsafeCell<PyObjectRef>,
+    /// `bootstrapper.args` is `Arguments.frompacked(space, w_args, w_kwargs)`;
+    /// these two slots hold that packed tuple and dict.
+    w_args: UnsafeCell<PyObjectRef>,
+    w_kwargs: UnsafeCell<PyObjectRef>,
+    /// The `_ThreadHandle` that `start_joinable_thread` hands the new thread.
+    w_handle: UnsafeCell<PyObjectRef>,
+}
+
+// The object fields are written only by the holder of `lock`.
+unsafe impl Sync for Bootstrapper {}
+
+static BOOTSTRAPPER: Bootstrapper = Bootstrapper {
+    lock: AtomicBool::new(false),
+    registered: AtomicBool::new(false),
+    w_callable: UnsafeCell::new(PY_NULL),
+    w_args: UnsafeCell::new(PY_NULL),
+    w_kwargs: UnsafeCell::new(PY_NULL),
+    w_handle: UnsafeCell::new(PY_NULL),
+};
+
+impl Bootstrapper {
+    fn slots(&self) -> [*mut PyObjectRef; 4] {
+        [
+            self.w_callable.get(),
+            self.w_args.get(),
+            self.w_kwargs.get(),
+            self.w_handle.get(),
+        ]
+    }
+
+    /// os_thread.py `Bootstrapper.setup`.
+    fn setup(&self) {
+        if self.registered.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        for slot in self.slots() {
+            let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot as *mut *mut u8) };
+            debug_assert!(
+                registered || !pyre_object::gc_hook::add_root_hook_installed(),
+                "the collector declined a bootstrapper root"
+            );
+        }
+    }
+
+    /// os_thread.py `Bootstrapper.acquire`: "If the previous thread didn't
+    /// start yet, wait until it does."  The wait releases the GIL, so the
+    /// caller keeps the objects pinned and `objects` reads them after it.
+    fn acquire(&self, objects: impl FnOnce() -> [PyObjectRef; 4]) {
+        if self
+            .lock
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            let _blocked = before_external_block();
+            while self
+                .lock
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                std::thread::yield_now();
+            }
+        }
+        for (slot, w_obj) in self.slots().into_iter().zip(objects()) {
+            unsafe { *slot = w_obj };
+        }
+    }
+
+    /// os_thread.py `Bootstrapper.bootstrap`'s reads of
+    /// `bootstrapper.w_callable` and `bootstrapper.args`.  The new thread
+    /// holds the GIL, so no collection runs before the caller publishes
+    /// these words to its own roots.
+    fn fields(&self) -> [PyObjectRef; 4] {
+        self.slots().map(|slot| unsafe { *slot })
+    }
+
+    /// os_thread.py `Bootstrapper.release`: "clean up 'bootstrapper' to make
+    /// it ready for the next start_new_thread() and release the lock to tell
+    /// that there isn't any bootstrapping thread left."
+    fn release(&self) {
+        for slot in self.slots() {
+            unsafe { *slot = PY_NULL };
+        }
+        self.lock.store(false, Ordering::Release);
+    }
+
+    /// os_thread.py `Bootstrapper.reinit`, in the child after `fork()`: no
+    /// bootstrapping thread survived, so the fields are cleared and the lock
+    /// is free.
+    fn reinit(&self) {
+        self.release();
+    }
+}
+
 fn spawn_thread(
-    callable: PyObjectRef,
-    positional: Vec<PyObjectRef>,
-    kwargs: Option<PyObjectRef>,
-    handle: Option<PyObjectRef>,
+    w_callable: PyObjectRef,
+    w_args: PyObjectRef,
+    w_kwargs: PyObjectRef,
+    w_handle: PyObjectRef,
 ) -> Result<i64, crate::PyError> {
     let parent_ec = crate::call::getexecutioncontext();
     if parent_ec.is_null() {
         return Err(crate::PyError::runtime_error("no execution context"));
     }
     // RPython roots every live GC local for the whole function, so
-    // `setup_threads` cannot collect past `w_callable`. Publish every
-    // pointer we already hold before the first query (`pin_roots`): a query
-    // after the first pin is a safepoint.
+    // `setup_threads` cannot collect past `w_callable`. Pin every pointer we
+    // already hold before the first collecting call.
     let roots = pyre_object::gc_roots::push_roots();
-    let nargs = positional.len();
-    let mut head = Vec::with_capacity(nargs + 3);
-    head.push(callable);
-    head.extend_from_slice(&positional);
-    let kw_at = kwargs.map(|kw| {
-        let index = head.len();
-        head.push(kw);
-        index
-    });
-    let handle_at = handle.map(|handle| {
-        let index = head.len();
-        head.push(handle);
-        index
-    });
-    let callable_i = roots.publish(&head);
-    roots.normalize(callable_i, head.len());
-    let args_base = callable_i + 1;
-    let none = w_none();
-    let kw_i = if let Some(offset) = kw_at {
-        callable_i + offset
-    } else {
-        let index = roots.publish(&[none]);
-        roots.normalize(index, 1);
-        index
-    };
-    let handle_i = if let Some(offset) = handle_at {
-        callable_i + offset
-    } else {
-        let index = roots.publish(&[none]);
-        roots.normalize(index, 1);
-        index
-    };
+    let base = roots.pin_roots(&[w_callable, w_args, w_kwargs, w_handle]);
 
     // os_thread.py `start_new_thread` begins with `setup_threads(space)`.
     gil::setup_threads(unsafe { &mut *(parent_ec as *mut crate::PyExecutionContext) });
-
-    // `Bootstrapper.acquire` then stores `w_callable` and `args` on the
-    // global bootstrapper. The tuple is the traced stand-in for those fields.
-    // A contended wait releases the GIL, so every input is rooted before it.
-    let boot_gen = acquire_bootstrap_lock();
-    let mut arg_items = Vec::with_capacity(nargs);
-    for i in 0..nargs {
-        arg_items.push(roots.get(args_base + i));
-    }
-    let args_tuple = roots.pin_root(w_tuple_new(arg_items));
-    let payload = roots.pin_root(w_tuple_new(vec![
-        roots.get(callable_i),
-        args_tuple,
-        roots.get(kw_i),
-        roots.get(handle_i),
-    ]));
-    let payload_i = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let payload = roots.get(payload_i);
-    BOOTSTRAP_PAYLOAD.store(payload as usize, Ordering::Release);
+    BOOTSTRAPPER.setup();
+    // `Bootstrapper.acquire` stores `w_callable` and `args` on the global
+    // bootstrapper. A contended wait releases the GIL, so every input is
+    // rooted before it.
+    BOOTSTRAPPER.acquire(|| std::array::from_fn(|i| roots.get(base + i)));
+    drop(roots);
     let parent_ec_addr = parent_ec as usize;
     // `os_thread.py`'s Bootstrapper uses the RPython pthread lock: the new
     // thread publishes that bootstrap completed and releases the starter.
@@ -2068,15 +2094,24 @@ fn spawn_thread(
     struct Bootstrap {
         word: AtomicUsize,
         error: std::sync::OnceLock<String>,
-        epoch: usize,
     }
     /// Worker-side handle on the rendezvous.  A dropped `mpsc` sender signalled
     /// a dead worker for free; a bare word does not, so every exit that never
     /// reached `publish` has to hand `START_FAILED` over instead — including an
     /// unwind, which only a destructor can catch.  Otherwise a worker that dies
-    /// during bootstrap leaves the starter spinning forever.
-    struct BootstrapSignal(std::sync::Arc<Bootstrap>);
+    /// during bootstrap leaves the starter spinning forever.  The same holds
+    /// for `bootstrapper.lock`, which the worker releases once it has read the
+    /// bootstrapper fields, or on any exit before that read.
+    struct BootstrapSignal {
+        started: std::sync::Arc<Bootstrap>,
+        holds_bootstrapper: bool,
+    }
     impl BootstrapSignal {
+        fn release_bootstrapper(&mut self) {
+            if std::mem::take(&mut self.holds_bootstrapper) {
+                BOOTSTRAPPER.release();
+            }
+        }
         /// The word carries the ident *and* two reserved states, so an ident
         /// equal to either would be misread: `0` leaves the starter looping
         /// and `START_FAILED` raises "can't start new thread" for a thread
@@ -2088,34 +2123,32 @@ fn spawn_thread(
                 ident as usize != 0 && ident as usize != START_FAILED,
                 "thread ident collides with a reserved rendezvous state"
             );
-            self.0.word.store(ident as usize, Ordering::Release);
+            self.started.word.store(ident as usize, Ordering::Release);
         }
         /// Preserve the diagnostic the starter raises.  `os_thread.py:145`
         /// reports a bare "can't start new thread", which stays the fallback
         /// when bootstrap died without recording anything.
         fn fail(&self, message: String) {
-            let _ = self.0.error.set(message);
+            let _ = self.started.error.set(message);
         }
     }
     impl Drop for BootstrapSignal {
         fn drop(&mut self) {
+            self.release_bootstrapper();
             // Takes the word only from its initial state, so this is a no-op
             // once `publish` has run.
-            if self
-                .0
-                .word
-                .compare_exchange(0, START_FAILED, Ordering::Release, Ordering::Relaxed)
-                .is_ok()
-            {
-                release_bootstrap_if_owner(self.0.epoch);
-            }
+            let _ = self.started.word.compare_exchange(
+                0,
+                START_FAILED,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
         }
     }
 
     let started = std::sync::Arc::new(Bootstrap {
         word: AtomicUsize::new(0),
         error: std::sync::OnceLock::new(),
-        epoch: boot_gen,
     });
     let worker_started = std::sync::Arc::clone(&started);
 
@@ -2130,62 +2163,21 @@ fn spawn_thread(
         .spawn(move || {
             // First statement: from here on every exit path, panic included,
             // releases the starter.
-            let bootstrap = BootstrapSignal(worker_started);
+            let mut bootstrap = BootstrapSignal {
+                started: worker_started,
+                holds_bootstrapper: true,
+            };
             crate::stack_check::configure_current_thread_stack_size(stack_size);
             crate::call::enter_runtime_thread();
-            // Register before reading `BOOTSTRAP_PAYLOAD`: a collection moves
-            // the tuple and `walk_thread_roots` writes the new address back.
-            // `gc_thread_start` before `Bootstrapper.bootstrap` reads
-            // `w_callable`: the stack area has to exist before the load.
+            // os_thread.py `bootstrap` runs as a callback that already holds
+            // the GIL, then `rthread.gc_thread_start()`: become a registered
+            // mutator holding the GIL before touching the Bootstrapper.
             ensure_runtime_thread();
-            let payload = BOOTSTRAP_PAYLOAD.load(Ordering::Acquire) as PyObjectRef;
-            if payload.is_null() {
-                release_bootstrap_if_owner(bootstrap.0.epoch);
-                bootstrap.fail("can't start new thread".to_string());
-                return;
-            }
+            // Read `bootstrapper.w_callable` / `bootstrapper.args` into this
+            // mutator's own roots, then `bootstrapper.release()`.
             let worker_roots = pyre_object::gc_roots::push_roots();
-            // One publish of the global word and every field copied out of it,
-            // then one normalize. `pin_root` per field queries after the first
-            // write; that query is a safepoint, and a foreign collection
-            // forwards the payload tuple without rewriting the still-unpublished
-            // `callable` local. `Bootstrapper.release` runs only after those
-            // words are on this thread's shadow stack.
-            let payload_i = worker_roots.publish(&[payload]);
-            worker_roots.normalize(payload_i, 1);
-            // `w_none` builds its immortal on first use. Do that before the
-            // field copies: a collection there would move them while they
-            // still live only in locals.
-            let none = w_none();
-            let payload = worker_roots.get(payload_i);
-            let callable = unsafe { w_tuple_getitem(payload, 0).unwrap_or(PY_NULL) };
-            let args_tuple = unsafe { w_tuple_getitem(payload, 1).unwrap_or(PY_NULL) };
-            let kwargs_obj = unsafe { w_tuple_getitem(payload, 2).unwrap_or(PY_NULL) };
-            let handle_obj = unsafe { w_tuple_getitem(payload, 3).unwrap_or(PY_NULL) };
-            let nargs = if args_tuple.is_null() {
-                0
-            } else {
-                unsafe { w_tuple_len(args_tuple) }
-            };
-            let has_kwargs = !kwargs_obj.is_null() && kwargs_obj != none;
-            let has_handle = !handle_obj.is_null() && handle_obj != none;
-            let mut fields =
-                Vec::with_capacity(2 + nargs + usize::from(has_kwargs) + usize::from(has_handle));
-            fields.push(args_tuple);
-            fields.push(callable);
-            for i in 0..nargs {
-                fields.push(unsafe { w_tuple_getitem(args_tuple, i as i64).unwrap_or(PY_NULL) });
-            }
-            if has_kwargs {
-                fields.push(kwargs_obj);
-            }
-            if has_handle {
-                fields.push(handle_obj);
-            }
-            let args_tuple_i = worker_roots.publish(&fields);
-            let worker_base = args_tuple_i + 1;
-            worker_roots.normalize(args_tuple_i, fields.len());
-            release_bootstrap_if_owner(bootstrap.0.epoch);
+            let worker_base = worker_roots.pin_roots(&BOOTSTRAPPER.fields());
+            bootstrap.release_bootstrapper();
 
             let mut ec = Box::new(unsafe {
                 (*(parent_ec_addr as *const crate::PyExecutionContext)).clone_for_thread()
@@ -2200,11 +2192,9 @@ fn spawn_thread(
             // actionflag; this is an idempotent bootstrap guard.
             gil::initialize(&mut ec);
             let ident = current_ident();
-            if has_handle {
-                let handle_slot = worker_base + 1 + nargs + usize::from(has_kwargs);
-                let h =
-                    W_ThreadHandle::from_obj(pyre_object::gc_roots::shadow_stack_get(handle_slot))
-                        .unwrap();
+            let w_handle = pyre_object::gc_roots::shadow_stack_get(worker_base + 3);
+            if !w_handle.is_null() {
+                let h = W_ThreadHandle::from_obj(w_handle).unwrap();
                 if let Err(e) = h.start(ident) {
                     bootstrap.fail(e.message_text());
                     thread_is_stopping(&mut ec);
@@ -2218,22 +2208,16 @@ fn spawn_thread(
             bootstrap.publish(ident);
 
             let callable = pyre_object::gc_roots::shadow_stack_get(worker_base);
-            let args: Vec<PyObjectRef> = (0..nargs)
-                .map(|i| pyre_object::gc_roots::shadow_stack_get(worker_base + 1 + i))
-                .collect();
-            let mut next = worker_base + 1 + nargs;
-            let kwargs = if has_kwargs {
-                let d = pyre_object::gc_roots::shadow_stack_get(next);
-                next += 1;
-                Some(d)
+            let w_args = pyre_object::gc_roots::shadow_stack_get(worker_base + 1);
+            let args = if w_args.is_null() {
+                Vec::new()
             } else {
-                None
+                unsafe { w_tuple_items_copy_as_vec(w_args) }
             };
-            let handle = if has_handle {
-                Some(pyre_object::gc_roots::shadow_stack_get(next))
-            } else {
-                None
-            };
+            let kwargs = Some(pyre_object::gc_roots::shadow_stack_get(worker_base + 2))
+                .filter(|w_kwargs| !w_kwargs.is_null());
+            let handle = Some(pyre_object::gc_roots::shadow_stack_get(worker_base + 3))
+                .filter(|w_handle| !w_handle.is_null());
             // `JitDriver` currently owns a per-TLS background compiler.
             // Creating a compiler thread for every short-lived Python thread
             // makes teardown wait on unrelated compiler polling.  Execute
@@ -2291,7 +2275,9 @@ fn spawn_thread(
             }
         })
         .map_err(|_| {
-            release_bootstrap_if_owner(boot_gen);
+            // os_thread.py: "bootstrapper.release()  # normally called by the
+            // new thread".
+            BOOTSTRAPPER.release();
             crate::PyError::runtime_error("can't start new thread")
         })?;
 
@@ -2315,7 +2301,6 @@ fn spawn_thread(
             std::thread::yield_now();
         }
     };
-    drop(roots);
     result.map_err(crate::PyError::runtime_error)
 }
 
@@ -2338,7 +2323,7 @@ fn start_new_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     if unsafe { !is_tuple(pos[1]) } {
         return Err(crate::PyError::type_error("2nd arg must be a tuple"));
     }
-    let positional = unsafe { w_tuple_items_copy_as_vec(pos[1]) };
+    let w_args = pos[1];
     let kwargs = pos
         .get(2)
         .copied()
@@ -2348,7 +2333,12 @@ fn start_new_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             "optional 3rd arg must be a dictionary",
         ));
     }
-    Ok(w_int_new(spawn_thread(callable, positional, kwargs, None)?))
+    Ok(w_int_new(spawn_thread(
+        callable,
+        w_args,
+        kwargs.unwrap_or(PY_NULL),
+        PY_NULL,
+    )?))
 }
 
 fn start_joinable_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -2382,7 +2372,7 @@ fn start_joinable_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     if let Some(handle_obj) = W_ThreadHandle::from_obj(handle) {
         lock_state(&handle_obj.state).daemon = daemon;
     }
-    spawn_thread(callable, Vec::new(), None, Some(handle))?;
+    spawn_thread(callable, PY_NULL, PY_NULL, handle)?;
     if !daemon {
         SHUTDOWN_HANDLES.lock().push(handle as usize);
     }
@@ -2508,8 +2498,8 @@ fn interrupt_main(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `threading.excepthook`.  The storage and descriptors come from pyre's
 /// line-by-line port of PyPy `lib_pypy/_structseq.py`.
 fn except_hook_args_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         let _roots = pyre_object::gc_roots::push_roots();
         let ty = crate::_structseq::make_struct_seq(
             "_thread._ExceptHookArgs",
@@ -2532,8 +2522,8 @@ fn except_hook_args_type() -> PyObjectRef {
                 pyre_object::gc_roots::shadow_stack_get(doc_slot),
             );
         }
-        pyre_object::gc_roots::shadow_stack_get(ty_slot) as usize
-    }) as PyObjectRef
+        pyre_object::gc_roots::shadow_stack_get(ty_slot)
+    })
 }
 
 #[inline]

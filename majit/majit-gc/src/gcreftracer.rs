@@ -303,7 +303,7 @@ fn gc_table_extra_root_walker(visitor: &mut dyn FnMut(&mut GcRef)) {
 /// `register_extra_root_walker` dedups by fn address
 /// (`shadow_stack.rs`). Call once at backend init.
 pub fn install_gc_table_walker() {
-    crate::shadow_stack::register_extra_root_walker(gc_table_extra_root_walker);
+    crate::shadow_stack::register_extra_root_walker(gc_table_extra_root_walker, "gc_table");
 }
 
 #[cfg(test)]

@@ -169,14 +169,16 @@ impl QuasiImmut {
 /// because that bare test is the whole cost a mutation on an object no loop
 /// watches has to pay.
 ///
-/// Both owners are allocated non-moving (`try_gc_alloc_stable_raw` /
-/// `malloc_typed`), so the lock cannot be remapped out from under a holder and
-/// no address-striped indirection is needed. The critical section allocates
-/// nothing GC-managed and crosses no safepoint, so it cannot park a mutator the
-/// collector is waiting for.
+/// The lock lives in a heap box, not inline. Upstream's owner is a
+/// nursery `malloc_fixedsize` object (`function.py` `Function` /
+/// `StaticMethod`); an embedded `parking_lot::Mutex` cannot move, so
+/// the lock is allocated on first use and the field stores only the
+/// pointer. A minor collection memcpy's that word. The critical section
+/// allocates nothing GC-managed and crosses no safepoint, so it cannot
+/// park a mutator the collector is waiting for.
 pub struct QuasiImmutField {
     ptr: AtomicPtr<QuasiImmut>,
-    lock: parking_lot::Mutex<()>,
+    lock: AtomicPtr<parking_lot::Mutex<()>>,
 }
 
 impl Default for QuasiImmutField {
@@ -189,8 +191,30 @@ impl QuasiImmutField {
     pub const fn new() -> Self {
         Self {
             ptr: AtomicPtr::new(std::ptr::null_mut()),
-            lock: parking_lot::Mutex::new(()),
+            lock: AtomicPtr::new(std::ptr::null_mut()),
         }
+    }
+
+    fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        let existing = self.lock.load(Ordering::Acquire);
+        let mutex = if existing.is_null() {
+            let fresh = Box::into_raw(Box::new(parking_lot::Mutex::new(())));
+            match self.lock.compare_exchange(
+                std::ptr::null_mut(),
+                fresh,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => fresh,
+                Err(winner) => {
+                    drop(unsafe { Box::from_raw(fresh) });
+                    winner
+                }
+            }
+        } else {
+            existing
+        };
+        unsafe { (*mutex).lock() }
     }
 
     /// Whether any read has been recorded since the last invalidation — the
@@ -211,7 +235,7 @@ impl QuasiImmutField {
     /// `compile.py register_loop_token` both read later; pyre returns it
     /// for the same two consumers.
     pub fn get_current_qmut_instance(&self) -> Arc<QuasiImmut> {
-        let _guard = self.lock.lock();
+        let _guard = self.lock();
         let qmut_ptr = self.ptr.load(Ordering::Acquire);
         if qmut_ptr.is_null() {
             let fresh = Arc::new(QuasiImmut::new());
@@ -248,7 +272,7 @@ impl QuasiImmutField {
     /// [`Self::get_current_qmut_instance`] from installing a watcher
     /// against the old value in between.
     pub fn invalidate_then_store<F: FnOnce()>(&self, store: F) {
-        let _guard = self.lock.lock();
+        let _guard = self.lock();
         let qmut_ptr = self.ptr.swap(std::ptr::null_mut(), Ordering::AcqRel);
         if !qmut_ptr.is_null() {
             unsafe { Arc::from_raw(qmut_ptr) }.invalidate();
@@ -265,7 +289,7 @@ impl QuasiImmutField {
     /// the compiler registering into freed memory.
     pub fn take(&self) -> Option<Arc<QuasiImmut>> {
         let qmut_ptr = {
-            let _guard = self.lock.lock();
+            let _guard = self.lock();
             self.ptr.swap(std::ptr::null_mut(), Ordering::AcqRel)
         };
         if qmut_ptr.is_null() {
@@ -275,14 +299,40 @@ impl QuasiImmutField {
         // happens once.
         Some(unsafe { Arc::from_raw(qmut_ptr) })
     }
+
+    /// The sweep-side counterpart of [`Drop`]: release the instance reference
+    /// and the out-of-line lock box.
+    ///
+    /// A collector reclaiming the owner's payload runs no Rust drop glue for
+    /// the fields inside it, so a destructor that only calls [`Self::take`]
+    /// strands the lock. `take` locks before it swaps, so it also *allocates*
+    /// a lock to strand on a field no watcher ever used. Reclaiming needs no
+    /// lock at all: the owner is dead, which is the same "nobody else can
+    /// reach this field" that the GIL gives upstream for free.
+    ///
+    /// The instance reference is released the way [`Self::take`] releases it —
+    /// one strong count — so an in-flight compile holding its own clone keeps
+    /// the instance alive.
+    ///
+    /// # Safety
+    ///
+    /// The owner must be unreachable, and this must run exactly once.
+    pub unsafe fn reclaim(&self) {
+        let qmut_ptr = self.ptr.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !qmut_ptr.is_null() {
+            drop(unsafe { Arc::from_raw(qmut_ptr) });
+        }
+        let lock = self.lock.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !lock.is_null() {
+            drop(unsafe { Box::from_raw(lock) });
+        }
+    }
 }
 
 impl Drop for QuasiImmutField {
     fn drop(&mut self) {
-        let qmut_ptr = *self.ptr.get_mut();
-        if !qmut_ptr.is_null() {
-            drop(unsafe { Arc::from_raw(qmut_ptr) });
-        }
+        // SAFETY: `&mut self` is exclusive and drop glue runs once.
+        unsafe { self.reclaim() };
     }
 }
 
@@ -485,7 +535,7 @@ mod tests {
         assert_eq!(Arc::strong_count(&recorded), 2, "the field's and ours");
 
         // The collector sweeps the owner and the destructor runs.
-        drop(field.take());
+        unsafe { field.reclaim() };
         assert_eq!(
             Arc::strong_count(&recorded),
             1,
@@ -501,6 +551,46 @@ mod tests {
         recorded.register_loop_token(&token);
         assert!(!flag.load(Ordering::Acquire));
         assert_eq!(recorded.len(), 1);
+    }
+
+    /// The sweep hooks reach no drop glue, so the call that hands the instance
+    /// back is also what frees the field's out-of-line lock. [`QuasiImmutField::take`]
+    /// cannot hold that job: it locks before it swaps, so on a field no watcher
+    /// ever used it mints a lock and leaves it behind — one per swept property,
+    /// static method and class method.
+    #[test]
+    fn reclaiming_a_swept_field_releases_its_lock() {
+        let untouched = QuasiImmutField::new();
+        drop(untouched.take());
+        assert!(
+            !untouched.lock.load(Ordering::Acquire).is_null(),
+            "`take` locks first, so it mints a lock with nothing to take"
+        );
+
+        let field = QuasiImmutField::new();
+        let recorded = field.get_current_qmut_instance();
+        assert!(
+            !field.lock.load(Ordering::Acquire).is_null(),
+            "publishing the instance took the lock"
+        );
+
+        unsafe { field.reclaim() };
+        assert!(
+            field.ptr.load(Ordering::Acquire).is_null(),
+            "the instance reference is released"
+        );
+        assert!(
+            field.lock.load(Ordering::Acquire).is_null(),
+            "and so is the lock"
+        );
+        assert_eq!(
+            Arc::strong_count(&recorded),
+            1,
+            "only the compile's is left"
+        );
+
+        // `Drop` delegates to the same call, so running out of scope here is a
+        // no-op rather than a double free — for both fields.
     }
 
     /// Recording runs on one thread while any other Python thread can be

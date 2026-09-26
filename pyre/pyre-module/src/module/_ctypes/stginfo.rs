@@ -10,7 +10,6 @@
 
 use pyre_object::PyObjectRef;
 use rustpython_host_env::ctypes as host_ctypes;
-use std::sync::OnceLock;
 
 /// Reserved key under which the carrier lives in a ctypes type's own dict.
 const STGINFO_KEY: &str = "__stginfo__";
@@ -33,15 +32,16 @@ const K_FORMAT: &str = "format";
 const K_POINTER_TYPE: &str = "pointer_type";
 const K_BIG_ENDIAN: &str = "big_endian";
 
-static STGINFO_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static STGINFO_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// The private `StgInfo` carrier type (`hasdict=true`, never registered).
 fn stginfo_type() -> PyObjectRef {
-    *STGINFO_TYPE_OBJ.get_or_init(|| {
+    STGINFO_TYPE_OBJ.get_or_init(|| {
         let tp = pyre_interpreter::typedef::make_builtin_type("StgInfo", |_| {});
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 /// `StgInfo.paramfunc` — the storage shape a ctypes type has.

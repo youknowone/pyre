@@ -28,8 +28,9 @@
 //! ## The rewrite (`rewire_one_expect_site`)
 //!
 //! Block A holds the residual `expect` call producing `result` as its last op,
-//! closed by `lower_call` with a single forwarding exit to block B (the
-//! continuation consuming `result`).  The rewrite:
+//! or followed by one `__cast_instance_intrinsic` on that result, closed by
+//! `lower_call` with a single forwarding exit to block B (the continuation
+//! consuming `result` or the cast).  The rewrite:
 //! 1. drops the `expect` call, reads `disc = opt.__discriminant`, and closes A
 //!    with a `bool(disc)` branch to two fresh arms;
 //! 2. the `then_bb` (`Some`) arm reads `opt.__pos_0` and forwards it to B as
@@ -100,14 +101,40 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
         })
         .ok_or_else(|| format!("{name}: expect result var has no producer block"))?;
 
-    // The call must be A's last op (lower_call closes the block right after
-    // pushing it) so removing it leaves the receiver construction as the tail.
-    let call_idx = graph.blocks[a].operations.len() - 1;
-    if graph.blocks[a].operations[call_idx].result.as_ref() != Some(&site.result_var) {
+    // The call sits at the block tail, optionally followed by the single
+    // `__cast_instance_intrinsic(result)` `lower_call` appends for a by-value
+    // user-class payload (`annotationoftype` → `SomeInstance`). Same shape
+    // `option_unwrap` accepts: the cast is jitcode-identity, but the
+    // continuation consumes its result, so it moves into the `Some` arm.
+    let call_idx = graph.blocks[a]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(&site.result_var))
+        .expect("result var producer resolved to block A above");
+    let last_idx = graph.blocks[a].operations.len() - 1;
+    let (cast, out_var): (Option<(String, ValueType)>, Variable) = if call_idx == last_idx {
+        (None, site.result_var.clone())
+    } else if call_idx == last_idx - 1 {
+        let tail = &graph.blocks[a].operations[last_idx];
+        match tail.result.clone() {
+            Some(narrowed)
+                if let Some(root) =
+                    crate::model::cast_instance_of(&tail.kind, &site.result_var)
+                    && let OpKind::Call { result_ty, .. } = &tail.kind =>
+            {
+                (Some((root.to_string(), result_ty.clone())), narrowed)
+            }
+            _ => {
+                return Err(format!(
+                    "{name}: expect call is not the last op of block {a}"
+                ));
+            }
+        }
+    } else {
         return Err(format!(
             "{name}: expect call is not the last op of block {a}"
         ));
-    }
+    };
     // Capture the receiver `Option` operand (`args[0]`); `args[1]` is the
     // panic-message `&str`, dropped — the `None` arm raises without it.
     let opt = match &graph.blocks[a].operations[call_idx].kind {
@@ -140,7 +167,7 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
     let mut carried: Vec<Variable> = Vec::new();
     for arg in &saved_exit.args {
         if let LinkArg::Value(v) = arg
-            && *v != site.result_var
+            && *v != out_var
             && !carried.contains(v)
         {
             carried.push(v.clone());
@@ -186,10 +213,11 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
         });
         payload
     };
+    let payload_value = crate::front::option_unwrap_or::emit_narrow(graph, then_bb, &cast, payload);
     let then_link_args = reproduce_exit_args(
         &saved_exit,
-        &site.result_var,
-        &payload,
+        &out_var,
+        &payload_value,
         &then_sources,
         &then_inputs,
         &name,
@@ -205,6 +233,9 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
     // `Option` tags None=0 / Some=1, so `bool(disc)` selects the `Some` (then)
     // arm.  The receiver construction ops stay as A's tail.
     let a_id = graph.blocks[a].id;
+    if cast.is_some() {
+        graph.blocks[a].operations.remove(last_idx);
+    }
     graph.blocks[a].operations.remove(call_idx);
     let disc = graph.alloc_value_var();
     if site.niche {
@@ -327,6 +358,67 @@ mod tests {
             .filter(|blk| blk.exits.iter().any(|link| link.target == g.exceptblock))
             .count();
         assert_eq!(raises, 1, "the None arm raises to exceptblock");
+    }
+
+    /// `lower_call` appends `__cast_instance_intrinsic` after a by-value
+    /// user-class result. The cast is jitcode-identity; the continuation
+    /// consumes it, so the rewrite must move it into the `Some` arm the way
+    /// `option_unwrap` does.
+    #[test]
+    fn rewrite_lifts_expect_when_instance_cast_follows() {
+        let mut g = FunctionGraph::new("test_option_expect_cast");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let msg = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: expect_target(),
+                    args: crate::model::call_args(vec![opt, msg]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let narrowed = g
+            .push_op_var(
+                a,
+                crate::model::cast_instance_call("Random", result.clone()),
+                true,
+            )
+            .unwrap();
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![narrowed]);
+
+        let rewritten = rewire_expect_call_sites(
+            &mut g,
+            &[ExpectSite {
+                result_var: result,
+                option_owner: "core::option::Option".to_string(),
+                some_owner: "core::option::Option::Some".to_string(),
+                payload_ty: ValueType::Ref(None),
+                niche: true,
+            }],
+        );
+        assert_eq!(
+            rewritten, 1,
+            "trailing instance cast must not decline expect"
+        );
+        let has_expect_call = g.blocks.iter().flat_map(|blk| &blk.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::Method { name, .. }, .. } if name == "expect"
+            )
+        });
+        assert!(!has_expect_call, "residual expect call removed");
+        let has_cast = g
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .any(|op| crate::model::cast_instance_root(&op.kind) == Some("Random"));
+        assert!(has_cast, "Some arm keeps the instance cast");
     }
 
     /// A producer op that is not a 2-arg call declines (fail-safe).

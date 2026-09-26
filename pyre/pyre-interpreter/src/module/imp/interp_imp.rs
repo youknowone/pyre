@@ -1097,10 +1097,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::make_builtin_function_with_arity(
             "create_builtin",
             |args| {
-                // `BuiltinImporter.create_module` passes the spec and expects the
-                // module back; `_load` then binds it in sys.modules. A name
-                // already imported keeps its module, so the machinery and a plain
-                // `import X` agree on one object.
+                // `interp_imp.py create_builtin`. `BuiltinImporter.create_module`
+                // passes the spec and expects the module back; `_load` then
+                // binds it in sys.modules.
                 let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
                 if crate::builtins::has_real_kwargs(kwargs) {
                     return Err(crate::PyError::type_error(
@@ -1125,15 +1124,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 if name.as_bytes().contains(&0) {
                     return Err(crate::PyError::value_error("embedded null character"));
                 }
-                if let Some(module) = crate::importing::get_sys_module(&name) {
-                    return Ok(module);
-                }
+                // If the module is already in sys.modules, it must be a
+                // reload, so we want to reuse (and reinitialize) the existing
+                // module object
+                let reuse = crate::importing::sys_modules_entry(&name).is_some();
                 // A name that is spelled correctly but names no builtin is
                 // reported by returning None, leaving the diagnostic to
                 // `BuiltinImporter.create_module`, which has already screened
                 // the name against `sys.builtin_module_names`.
-                Ok(crate::importing::create_builtin_module(
+                Ok(crate::importing::getbuiltinmodule(
                     &name,
+                    true,
+                    reuse,
                     crate::call::getexecutioncontext(),
                 )?
                 .unwrap_or_else(pyre_object::w_none))

@@ -685,9 +685,13 @@ impl RootedItems {
     /// readers sees the forwarded pointer.  Unlike [`take`], this does not
     /// require the set to own the top of the stack.
     #[inline]
-    pub fn get(&self, index: usize) -> PyObjectRef {
-        assert!(index < self.len);
-        self.scope.get(self.base + index)
+    pub fn get(&self, i: usize) -> PyObjectRef {
+        assert!(
+            i < self.len,
+            "RootedItems::get index {i} out of range (len {})",
+            self.len
+        );
+        self.scope.get(self.base + i)
     }
 
     #[inline]
@@ -703,6 +707,109 @@ impl RootedItems {
         (0..self.len)
             .map(|i| self.scope.get(self.base + i))
             .collect()
+    }
+}
+
+/// Process-global GCREF slot, the translator's static root for a cached
+/// heap type. `OnceLock<usize>` stores an address the collector cannot
+/// rewrite; this slot is registered with MiniMark on first init.
+pub struct RootedOnceRef {
+    slot: std::cell::UnsafeCell<usize>,
+    init: std::sync::Mutex<()>,
+    ready: std::sync::atomic::AtomicBool,
+    registered: std::sync::atomic::AtomicBool,
+}
+
+// The slot is written once under `init`, then only by the collector.
+unsafe impl Sync for RootedOnceRef {}
+unsafe impl Send for RootedOnceRef {}
+
+impl RootedOnceRef {
+    pub const fn new() -> Self {
+        Self {
+            slot: std::cell::UnsafeCell::new(0),
+            init: std::sync::Mutex::new(()),
+            ready: std::sync::atomic::AtomicBool::new(false),
+            registered: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn try_register(&self) -> bool {
+        if self
+            .registered
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return true;
+        }
+        let ok = unsafe { crate::gc_hook::try_gc_add_root(self.slot.get() as *mut *mut u8) };
+        if !ok {
+            self.registered
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        ok
+    }
+
+    /// True when this slot may cache a pointer: either it is a registered
+    /// MiniMark root, or no add-root hook exists so nothing can collect.
+    fn can_publish(&self) -> bool {
+        self.try_register() || !crate::gc_hook::add_root_hook_installed()
+    }
+
+    pub fn get_or_init(&self, init: impl FnOnce() -> PyObjectRef) -> PyObjectRef {
+        if self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = self.try_register();
+            return unsafe { *self.slot.get() as PyObjectRef };
+        }
+        let _guard = self.init.lock().unwrap_or_else(|e| e.into_inner());
+        if self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = self.try_register();
+            return unsafe { *self.slot.get() as PyObjectRef };
+        }
+        // Register the empty slot first. A hook that declines it leaves
+        // the cell uninitialized so a later call retries; publishing
+        // first would cache a pointer the collector cannot rewrite.
+        if !self.can_publish() {
+            return init();
+        }
+        let value = init();
+        unsafe {
+            *self.slot.get() = value as usize;
+        }
+        self.ready.store(true, std::sync::atomic::Ordering::Release);
+        value
+    }
+
+    pub fn get(&self) -> Option<PyObjectRef> {
+        if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let _ = self.try_register();
+        Some(unsafe { *self.slot.get() as PyObjectRef })
+    }
+
+    pub fn set(&self, value: PyObjectRef) {
+        if self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = self.try_register();
+            return;
+        }
+        let _guard = self.init.lock().unwrap_or_else(|e| e.into_inner());
+        if self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = self.try_register();
+            return;
+        }
+        if !self.can_publish() {
+            return;
+        }
+        unsafe {
+            *self.slot.get() = value as usize;
+        }
+        self.ready.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 

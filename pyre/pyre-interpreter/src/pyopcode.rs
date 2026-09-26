@@ -908,11 +908,10 @@ pub fn opcode_binary_op<H: ArithmeticOpcodeHandler + ?Sized>(
 ) -> Result<(), PyError> {
     let b = handler.pop_value()?;
     let a = handler.pop_value()?;
-    // `binaryoperation()` in `pyopcode.py` keeps `self` live across the
-    // allocating `space.<op>(w_1, w_2)` and then calls `self.pushvalue`.
-    // RPython's shadow-stack transform forwards that livevar.  Anchor it
-    // explicitly here so a materialised nursery PyFrame is reloaded before
-    // the result push.
+    // `pyopcode.py binaryoperation`: `w_2 = popvalue(); w_1 = popvalue();
+    // w_result = space.<op>(w_1, w_2)`. Those pops are livevars across
+    // the operation, which may run `__xor__` / `__eq__` and collect.
+    // The concrete handler pins both; anchor `self` for the result push.
     let anchor = handler.anchor();
     let result = handler.binary_value(a, b, op)?;
     H::push_anchored(&anchor, result)
@@ -924,8 +923,8 @@ pub fn opcode_compare_op<H: ArithmeticOpcodeHandler + ?Sized>(
 ) -> Result<(), PyError> {
     let b = handler.pop_value()?;
     let a = handler.pop_value()?;
-    // Same translated-livevar obligation as `opcode_binary_op`: rich
-    // comparison may allocate or invoke application code before the push.
+    // Same translated-livevar obligation as `opcode_binary_op`:
+    // `binaryoperation()`'s pops stay live across `space.eq` / `lt` / …
     let anchor = handler.anchor();
     let result = handler.compare_value(a, b, op)?;
     H::push_anchored(&anchor, result)

@@ -554,11 +554,24 @@ pub unsafe fn pointer_convert_argument_from_object(
         if ct.has(ctypeobj::CTypeFlags::ACCEPT_STR)
             && let Some(offset) = super::func::OffsetInBytes::from_obj(w_ob)
         {
+            // `process_str_from_offset_in_bytes` hands C the string's own
+            // characters only where `STR.chars` carries the final null
+            // `extra_item_after_alloc` reserves.  A `BytesBlock` reserves
+            // none, so this is that function's copy arm: the tail from
+            // `offset`, null-terminated, freed after the call.
             let value = unsafe { pyre_object::bytesobject::w_bytes_data(offset.w_bytes) };
-            let ptr = unsafe { value.as_ptr().offset(offset.offset as isize) };
-            unsafe { cdata.cast::<*const u8>().cast_mut().write_unaligned(ptr) };
-            set_mustfree_flag(cdata, MUSTFREE_NOTHING);
-            return Ok(false);
+            let tail = usize::try_from(offset.offset)
+                .ok()
+                .and_then(|start| value.get(start..))
+                .unwrap_or(&[]);
+            let buf = cdataobj::raw_alloc(tail.len() as i64 + 1, false)?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(tail.as_ptr(), buf as *mut u8, tail.len());
+                (buf as *mut u8).add(tail.len()).write(0);
+                cdata.cast::<usize>().write_unaligned(buf);
+            }
+            set_mustfree_flag(cdata, MUSTFREE_FREE);
+            return Ok(true);
         }
         if ct.has(ctypeobj::CTypeFlags::ACCEPT_STR)
             && unsafe { pyre_object::bytesobject::is_bytes(w_ob) }

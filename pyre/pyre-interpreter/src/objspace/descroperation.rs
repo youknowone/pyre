@@ -7,7 +7,7 @@
 #![allow(non_camel_case_types, non_snake_case)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntGcRoot};
+use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntGcRoot, live_rbigint};
 use num_traits::ToPrimitive;
 
 use pyre_object::unicodeobject::is_str;
@@ -33,6 +33,9 @@ const ZERO_DIVISION_MSG: &str = "division by zero";
 /// Box a BigInt result, demoting to W_IntObject if it fits in i64.
 
 pub(crate) fn bigint_result(value: BigInt) -> PyObjectRef {
+    // `fits_int` / `toint` only read `_size` and digits; they do not allocate.
+    // Boxing is the single allocation, and `w_long_new` roots `_digits` across
+    // that payload malloc itself.
     if jit_bigint_to_i64_fits(&value) != 0 {
         w_int_new(jit_bigint_to_i64_value(&value))
     } else {
@@ -40,25 +43,41 @@ pub(crate) fn bigint_result(value: BigInt) -> PyObjectRef {
     }
 }
 
+/// Root `obj`'s `rbigint` for a caller that reads it again after its own
+/// collecting call. An arm that reads the value once and hands it to one
+/// `rbigint` method reads [`w_long_get_value`] instead: the method roots its
+/// receiver itself before it allocates (`_x_int_add`, `int_mod_int_result`),
+/// and `descr_binop` holds no livevar across a collecting call
+/// (`gctransform/framework.py` `get_livevars_for_roots`).
+unsafe fn live_long_num(obj: PyObjectRef) -> RBigIntGcRoot {
+    live_rbigint(w_long_get_value(obj))
+}
+
 /// CPython `long_invmod` / PyPy three-argument `pow` inverse step.
 ///
 /// Keep the Bézout coefficients as rbigints: the loop is the ordinary
 /// extended Euclidean algorithm and never crosses into an opaque host bigint.
 fn bigint_mod_inverse(base: &BigInt, modulus: &BigInt) -> Result<BigInt, PyError> {
-    let mut old_r = base
-        .r#mod(modulus)
-        .map_err(|_| PyError::value_error("pow() 3rd argument cannot be 0"))?;
-    let mut r = modulus.translated_alias();
-    let mut old_s = BigInt::one();
-    let mut s = BigInt::zero();
+    let base = RBigIntGcRoot::new(base.translated_alias());
+    let modulus = RBigIntGcRoot::new(modulus.translated_alias());
+    let mut old_r = RBigIntGcRoot::new(
+        base.r#mod(&modulus)
+            .map_err(|_| PyError::value_error("pow() 3rd argument cannot be 0"))?,
+    );
+    let mut r = RBigIntGcRoot::new(modulus.translated_alias());
+    let mut old_s = RBigIntGcRoot::new(BigInt::one());
+    let mut s = RBigIntGcRoot::new(BigInt::zero());
     while !r.is_zero() {
-        let quotient = old_r
-            .floordiv(&r)
-            .map_err(|_| PyError::value_error("base is not invertible for the given modulus"))?;
-        let next_r = old_r.sub(&quotient.mul(&r));
+        let quotient =
+            RBigIntGcRoot::new(old_r.floordiv(&r).map_err(|_| {
+                PyError::value_error("base is not invertible for the given modulus")
+            })?);
+        let qr = RBigIntGcRoot::new(quotient.mul(&r));
+        let next_r = RBigIntGcRoot::new(old_r.sub(&qr));
         old_r = r;
         r = next_r;
-        let next_s = old_s.sub(&quotient.mul(&s));
+        let qs = RBigIntGcRoot::new(quotient.mul(&s));
+        let next_s = RBigIntGcRoot::new(old_s.sub(&qs));
         old_s = s;
         s = next_s;
     }
@@ -68,7 +87,7 @@ fn bigint_mod_inverse(base: &BigInt, modulus: &BigInt) -> Result<BigInt, PyError
         ));
     }
     old_s
-        .r#mod(modulus)
+        .r#mod(&modulus)
         .map_err(|_| PyError::value_error("pow() 3rd argument cannot be 0"))
 }
 
@@ -409,9 +428,7 @@ pub extern "C" fn jit_bigint_and(a: i64, b: i64) -> pyre_object::longobject::Jit
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
         pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(
-                majit_rlib::rbigint::and_payloads_collecting(a, b),
-            ),
+            pyre_object::longobject::alloc_bigint_nursery_collecting(BigInt::and_(&*a, &*b)),
         )
     }
 }
@@ -422,9 +439,7 @@ pub extern "C" fn jit_bigint_or(a: i64, b: i64) -> pyre_object::longobject::JitB
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
         pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(
-                majit_rlib::rbigint::or_payloads_collecting(a, b),
-            ),
+            pyre_object::longobject::alloc_bigint_nursery_collecting(BigInt::or_(&*a, &*b)),
         )
     }
 }
@@ -435,9 +450,7 @@ pub extern "C" fn jit_bigint_xor(a: i64, b: i64) -> pyre_object::longobject::Jit
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
         pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(
-                majit_rlib::rbigint::xor_payloads_collecting(a, b),
-            ),
+            pyre_object::longobject::alloc_bigint_nursery_collecting(BigInt::xor(&*a, &*b)),
         )
     }
 }
@@ -451,9 +464,7 @@ pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> pyre_object::longobject::Jit
             return pyre_object::longobject::encode_jit_bigint_result(a as *mut BigInt);
         }
         pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(
-                majit_rlib::rbigint::sub_payloads_collecting(a, b),
-            ),
+            pyre_object::longobject::alloc_bigint_nursery_collecting(BigInt::sub(&*a, &*b)),
         )
     }
 }
@@ -464,9 +475,7 @@ pub extern "C" fn jit_bigint_mul(a: i64, b: i64) -> pyre_object::longobject::Jit
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
         pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(
-                majit_rlib::rbigint::mul_payloads_collecting(a, b),
-            ),
+            pyre_object::longobject::alloc_bigint_nursery_collecting(BigInt::mul(&*a, &*b)),
         )
     }
 }
@@ -483,9 +492,7 @@ pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> pyre_object::longobject::Jit
             return pyre_object::longobject::encode_jit_bigint_result(a as *mut BigInt);
         }
         pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(
-                majit_rlib::rbigint::add_payloads_collecting(a, b),
-            ),
+            pyre_object::longobject::alloc_bigint_nursery_collecting(BigInt::add(&*a, &*b)),
         )
     }
 }
@@ -972,7 +979,8 @@ pub(crate) unsafe fn int_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// `rbigint.truediv`.
 #[majit_macros::dont_look_inside]
 fn int_truediv_ovf2long(va: i64, vb: i64) -> PyResult {
-    let a = BigInt::from(va);
+    // `fromint` of `vb` collects.
+    let a = RBigIntGcRoot::new(BigInt::from(va));
     let b = BigInt::from(vb);
     Ok(w_float_new(bigint_truediv(&a, &b)?))
 }
@@ -980,24 +988,27 @@ fn int_truediv_ovf2long(va: i64, vb: i64) -> PyResult {
 /// longobject.py `_truediv` / mixed long-int.  At least one operand is
 /// `W_LongObject`; machine-int pairs stay in [`int_truediv`].
 unsafe fn long_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    if !is_long(b) && as_float(b) == 0.0 {
+    // `fromint` of a machine-int operand collects before the other operand
+    // is read. `descr_truediv` keeps both live (`gct_direct_call` /
+    // `get_livevars_for_roots`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
+    let a = || pyre_object::gc_roots::shadow_stack_get(base);
+    let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    if !is_long(b()) && as_float(b()) == 0.0 {
         return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
-    let a_owned;
-    let va = if is_long(a) {
-        w_long_get_value(a)
+    let va = if is_long(a()) {
+        live_long_num(a())
     } else {
-        a_owned = BigInt::from(int_value(a));
-        &a_owned
+        RBigIntGcRoot::new(BigInt::from(int_value(a())))
     };
-    let b_owned;
-    let vb = if is_long(b) {
-        w_long_get_value(b)
+    let vb = if is_long(b()) {
+        live_long_num(b())
     } else {
-        b_owned = BigInt::from(int_value(b));
-        &b_owned
+        RBigIntGcRoot::new(BigInt::from(int_value(b())))
     };
-    Ok(w_float_new(bigint_truediv(va, vb)?))
+    Ok(w_float_new(bigint_truediv(&va, &vb)?))
 }
 
 unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1009,7 +1020,8 @@ unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // intobject.py `_floordiv`: `ovfcheck(x // y)` has exactly one
     // non-zero-divisor overflow on a signed machine word.
     if va == -9_223_372_036_854_775_808_i64 && vb == -1 {
-        let va = BigInt::from(va);
+        // `fromint` of `vb` collects.
+        let va = RBigIntGcRoot::new(BigInt::from(va));
         let vb = BigInt::from(vb);
         return Ok(bigint_result(bigint_floordiv_nonzero(&va, &vb)));
     }
@@ -1025,7 +1037,8 @@ unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // intobject.py `_mod`: the matching machine-word overflow is
     // `MIN % -1`; bounce that one case to rbigint like `ovfcheck`.
     if va == -9_223_372_036_854_775_808_i64 && vb == -1 {
-        let va = BigInt::from(va);
+        // `fromint` of `vb` collects.
+        let va = RBigIntGcRoot::new(BigInt::from(va));
         let vb = BigInt::from(vb);
         return Ok(bigint_result(bigint_modulo_nonzero(&va, &vb)));
     }
@@ -1068,40 +1081,40 @@ unsafe fn long_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // bool separately, so the one upstream W_IntObject arm has two storage
     // projections here.
     if is_long(a) && is_bool(b) {
-        if !w_long_get_value(a).is_zero() && !w_bool_get_value(b) {
+        let va = w_long_get_value(a);
+        if !va.is_zero() && !w_bool_get_value(b) {
             return Ok(pyre_object::longobject::w_long_from_raw(
                 w_long_get_raw_value(a),
             ));
         }
-        return Ok(w_long_new(
-            w_long_get_value(a).int_add(w_bool_get_value(b) as i64),
-        ));
+        return Ok(w_long_new(va.int_add(w_bool_get_value(b) as i64)));
     }
     if is_long(a) && is_int(b) {
-        if !w_long_get_value(a).is_zero() && w_int_get_value(b) == 0 {
+        let va = w_long_get_value(a);
+        if !va.is_zero() && w_int_get_value(b) == 0 {
             return Ok(pyre_object::longobject::w_long_from_raw(
                 w_long_get_raw_value(a),
             ));
         }
-        return Ok(w_long_new(w_long_get_value(a).int_add(w_int_get_value(b))));
+        return Ok(w_long_new(va.int_add(w_int_get_value(b))));
     }
     if is_bool(a) && is_long(b) {
-        if !w_long_get_value(b).is_zero() && !w_bool_get_value(a) {
+        let vb = w_long_get_value(b);
+        if !vb.is_zero() && !w_bool_get_value(a) {
             return Ok(pyre_object::longobject::w_long_from_raw(
                 w_long_get_raw_value(b),
             ));
         }
-        return Ok(w_long_new(
-            w_long_get_value(b).int_add(w_bool_get_value(a) as i64),
-        ));
+        return Ok(w_long_new(vb.int_add(w_bool_get_value(a) as i64)));
     }
     if is_int(a) && is_long(b) {
-        if !w_long_get_value(b).is_zero() && w_int_get_value(a) == 0 {
+        let vb = w_long_get_value(b);
+        if !vb.is_zero() && w_int_get_value(a) == 0 {
             return Ok(pyre_object::longobject::w_long_from_raw(
                 w_long_get_raw_value(b),
             ));
         }
-        return Ok(w_long_new(w_long_get_value(b).int_add(w_int_get_value(a))));
+        return Ok(w_long_new(vb.int_add(w_int_get_value(a))));
     }
     debug_assert!(is_long(a) && is_long(b));
     // `rbigint.add` returns the other operand when either sign is 0.
@@ -1117,152 +1130,150 @@ unsafe fn long_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // longobject.py:descr_sub specializes only `long - int`; descr_rsub keeps
     // `int - long` on the ordinary two-rbigint subtraction path.
     if is_long(a) && is_bool(b) {
+        let va = w_long_get_value(a);
         if !w_bool_get_value(b) {
             return Ok(pyre_object::longobject::w_long_from_raw(
                 w_long_get_raw_value(a),
             ));
         }
-        return Ok(w_long_new(
-            w_long_get_value(a).int_sub(w_bool_get_value(b) as i64),
-        ));
+        return Ok(w_long_new(va.int_sub(w_bool_get_value(b) as i64)));
     }
     if is_long(a) && is_int(b) {
+        let va = w_long_get_value(a);
         if w_int_get_value(b) == 0 {
             return Ok(pyre_object::longobject::w_long_from_raw(
                 w_long_get_raw_value(a),
             ));
         }
-        return Ok(w_long_new(w_long_get_value(a).int_sub(w_int_get_value(b))));
+        return Ok(w_long_new(va.int_sub(w_int_get_value(b))));
     }
     if is_long(a) {
         debug_assert!(is_long(b));
-        if w_long_get_value(b).is_zero() {
-            return Ok(pyre_object::longobject::w_long_from_raw(
-                w_long_get_raw_value(a),
-            ));
+        let av = w_long_get_raw_value(a);
+        let bv = w_long_get_raw_value(b);
+        if (*bv).get_sign() == 0 {
+            return Ok(pyre_object::longobject::w_long_from_raw(av));
         }
-        return Ok(w_long_new(w_long_get_value(a).sub(w_long_get_value(b))));
+        return Ok(w_long_new(BigInt::sub(&*av, &*bv)));
     }
     // Reflected int/bool - long follows descr_rsub's ordinary rbigint path:
     // only the machine-word left operand needs materialising.
     debug_assert!(is_long(b));
-    Ok(w_long_new(
-        BigInt::from(int_value(a)).sub(w_long_get_value(b)),
-    ))
+    let vb = live_long_num(b);
+    Ok(w_long_new(BigInt::from(int_value(a)).sub(&vb)))
 }
 
 unsafe fn long_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // longobject.py:_make_generic_descr_binop('mul'): commutative int_mul.
     if is_long(a) && is_bool(b) {
-        if !w_long_get_value(a).is_zero() && w_bool_get_value(b) {
+        let va = w_long_get_value(a);
+        if !va.is_zero() && w_bool_get_value(b) {
             return Ok(pyre_object::longobject::w_long_from_raw(
                 w_long_get_raw_value(a),
             ));
         }
-        return Ok(w_long_new(
-            w_long_get_value(a).int_mul(w_bool_get_value(b) as i64),
-        ));
+        return Ok(w_long_new(va.int_mul(w_bool_get_value(b) as i64)));
     }
     if is_long(a) && is_int(b) {
-        if !w_long_get_value(a).is_zero() && w_int_get_value(b) == 1 {
+        let va = w_long_get_value(a);
+        if !va.is_zero() && w_int_get_value(b) == 1 {
             return Ok(pyre_object::longobject::w_long_from_raw(
                 w_long_get_raw_value(a),
             ));
         }
-        return Ok(w_long_new(w_long_get_value(a).int_mul(w_int_get_value(b))));
+        return Ok(w_long_new(va.int_mul(w_int_get_value(b))));
     }
     if is_bool(a) && is_long(b) {
-        if !w_long_get_value(b).is_zero() && w_bool_get_value(a) {
+        let vb = w_long_get_value(b);
+        if !vb.is_zero() && w_bool_get_value(a) {
             return Ok(pyre_object::longobject::w_long_from_raw(
                 w_long_get_raw_value(b),
             ));
         }
-        return Ok(w_long_new(
-            w_long_get_value(b).int_mul(w_bool_get_value(a) as i64),
-        ));
+        return Ok(w_long_new(vb.int_mul(w_bool_get_value(a) as i64)));
     }
     if is_int(a) && is_long(b) {
-        if !w_long_get_value(b).is_zero() && w_int_get_value(a) == 1 {
+        let vb = w_long_get_value(b);
+        if !vb.is_zero() && w_int_get_value(a) == 1 {
             return Ok(pyre_object::longobject::w_long_from_raw(
                 w_long_get_raw_value(b),
             ));
         }
-        return Ok(w_long_new(w_long_get_value(b).int_mul(w_int_get_value(a))));
+        return Ok(w_long_new(vb.int_mul(w_int_get_value(a))));
     }
     debug_assert!(is_long(a) && is_long(b));
-    Ok(w_long_new(w_long_get_value(a).mul(w_long_get_value(b))))
+    Ok(w_long_new(BigInt::mul(
+        &*w_long_get_raw_value(a),
+        &*w_long_get_raw_value(b),
+    )))
+}
+
+/// `_int_floordiv`: a machine-int divisor never becomes an rbigint.
+/// The guard runs before the receiver is read, then `rbigint.int_floordiv`,
+/// then `newlong`. Nothing allocates between entry and that read.
+unsafe fn long_int_floordiv(a: PyObjectRef, other: i64) -> PyResult {
+    if other == 0 {
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+    }
+    debug_assert!(is_long(a));
+    let va = w_long_get_value(a);
+    // `int_floordiv` returns `self` for a positive receiver and divisor 1.
+    // `newlong` wraps that payload.
+    if va.get_sign() == 1 && other == 1 {
+        return Ok(pyre_object::longobject::w_long_from_raw(
+            w_long_get_raw_value(a),
+        ));
+    }
+    Ok(w_long_new(bigint_int_floordiv_nonzero(va, other)))
 }
 
 unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    // longobject.py `_make_descr_binop(_floordiv, _int_floordiv)`: a
-    // machine-int divisor takes the dedicated `rbigint.int_floordiv` leg.
-    // PyPy's `_floordiv` still carries the 2.x "long ..." wording
-    // (longobject.py:409), which a 3.x runtime does not.
-    if is_int_like(b) {
-        let vb = int_value(b);
-        if vb == 0 {
-            return Err(PyError::zero_division(ZERO_DIVISION_MSG));
-        }
-        debug_assert!(is_long(a));
-        if w_long_get_value(a).get_sign() == 1 && vb == 1 {
-            return Ok(pyre_object::longobject::w_long_from_raw(
-                w_long_get_raw_value(a),
-            ));
-        }
-        return Ok(w_long_new(bigint_int_floordiv_nonzero(
-            w_long_get_value(a),
-            vb,
-        )));
-    }
+    // `_floordiv`. A machine-int divisor is `_int_floordiv`
+    // (`long_int_floordiv`) and does not reach here. `W_LongObject.asbigint`
+    // returns `self.num` with no malloc; the reflected `int` receiver is
+    // coerced the way `descr_rbinop` does, after its machine word is copied.
     debug_assert!(is_long(b));
-    let vb = w_long_get_value(b);
+    let vb = live_long_num(b);
     if !vb.tobool() {
         return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
-    let owned_a;
     let va = if is_long(a) {
-        w_long_get_value(a)
+        live_long_num(a)
     } else {
-        owned_a = BigInt::from(int_value(a));
-        &owned_a
+        RBigIntGcRoot::new(BigInt::from(int_value(a)))
     };
     // rbigint.floordiv → _divmod, returning the quotient half (rbigint.py).
-    // `_floordiv`/`_int_floordiv` both `newlong` the quotient, keeping a long.
-    Ok(w_long_new(bigint_floordiv_nonzero(va, vb)))
+    // `_floordiv` `newlong`s the quotient, keeping a long.
+    Ok(w_long_new(bigint_floordiv_nonzero(&va, &vb)))
+}
+
+/// `_int_mod`: `rbigint.int_mod_int_result`, then `space.newint`.
+/// The remainder of a long by a machine int always fits a machine int.
+unsafe fn long_int_mod(a: PyObjectRef, other: i64) -> PyResult {
+    if other == 0 {
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+    }
+    debug_assert!(is_long(a));
+    let va = w_long_get_value(a);
+    Ok(w_int_new(bigint_int_modulo_int_result_nonzero(va, other)))
 }
 
 unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    // longobject.py `_make_descr_binop(_mod, _int_mod)`. `_int_mod`
-    // (machine-int RHS) computes through `rbigint.int_mod_int_result` and
-    // returns `space.newint` — the remainder of a long by a machine int always
-    // fits — while `_mod` (long RHS) returns `newlong`.
-    if is_int_like(b) {
-        let vb = int_value(b);
-        if vb == 0 {
-            return Err(PyError::zero_division(ZERO_DIVISION_MSG));
-        }
-        debug_assert!(is_long(a));
-        return Ok(w_int_new(bigint_int_modulo_int_result_nonzero(
-            w_long_get_value(a),
-            vb,
-        )));
-    }
+    // `_mod`. A machine-int divisor is `_int_mod` (`long_int_mod`).
     debug_assert!(is_long(b));
-    let vb = w_long_get_value(b);
+    let vb = live_long_num(b);
     if !vb.tobool() {
         return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
-    let owned_a;
     let va = if is_long(a) {
-        w_long_get_value(a)
+        live_long_num(a)
     } else {
-        owned_a = BigInt::from(int_value(a));
-        &owned_a
+        RBigIntGcRoot::new(BigInt::from(int_value(a)))
     };
     if is_long(a)
         && jit_bigint_divrem_returns_lhs_remainder(
-            va as *const BigInt as i64,
-            vb as *const BigInt as i64,
+            (&*va) as *const BigInt as i64,
+            (&*vb) as *const BigInt as i64,
         ) != 0
     {
         return Ok(pyre_object::longobject::w_long_from_raw(
@@ -1270,7 +1281,25 @@ unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         ));
     }
     // rbigint.mod → _divmod, returning the remainder half (rbigint.py).
-    Ok(w_long_new(bigint_modulo_nonzero(va, vb)))
+    Ok(w_long_new(bigint_modulo_nonzero(&va, &vb)))
+}
+
+/// `_int_divmod`: `rbigint.int_divmod`, then `newtuple2` of two `newlong`s.
+unsafe fn long_int_divmod(a: PyObjectRef, other: i64) -> PyResult {
+    if other == 0 {
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+    }
+    debug_assert!(is_long(a));
+    let va = live_long_num(a);
+    let (q, r) = va.int_divmod(other).expect("divisor was checked nonzero");
+    // Two live rbigints before either wrapper is allocated. The GC transform
+    // roots both across those collecting allocations.
+    let q = RBigIntGcRoot::new(q);
+    let r = RBigIntGcRoot::new(r);
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(w_long_new(q.translated_alias()));
+    fields.push(w_long_new(r.translated_alias()));
+    Ok(w_tuple_new(fields.take()))
 }
 
 /// PyPy longobject.py `_divmod` / `_int_divmod`: compute both halves with one
@@ -1304,34 +1333,29 @@ unsafe fn integer_divmod_pair(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         return Ok(w_tuple_new(fields.take()));
     }
 
-    // longobject.py `_make_descr_binop(_divmod, _int_divmod)` preserves a
-    // dedicated long/int residual; reflected int/long follows `_divmod`.
+    // `_make_descr_binop(_divmod, _int_divmod)`: a machine-int divisor is
+    // `_int_divmod`. Reflected int/long follows `_divmod`.
+    if is_long(a) && is_int_like(b) {
+        return long_int_divmod(a, int_value(b));
+    }
     let remainder_aliases_a = if is_long(a) && is_long(b) {
-        let va = w_long_get_value(a);
-        let vb = w_long_get_value(b);
+        let va = live_long_num(a);
+        let vb = live_long_num(b);
         jit_bigint_divrem_returns_lhs_remainder(
-            va as *const BigInt as i64,
-            vb as *const BigInt as i64,
+            (&*va) as *const BigInt as i64,
+            (&*vb) as *const BigInt as i64,
         ) != 0
     } else {
         false
     };
-    let (q, r) = if is_long(a) && is_int_like(b) {
-        w_long_get_value(a)
-            .int_divmod(int_value(b))
-            .expect("divisor was checked nonzero")
+    debug_assert!(is_long(b));
+    let va = if is_long(a) {
+        live_long_num(a)
     } else {
-        debug_assert!(is_long(b));
-        let owned_a;
-        let va = if is_long(a) {
-            w_long_get_value(a)
-        } else {
-            owned_a = BigInt::from(int_value(a));
-            &owned_a
-        };
-        va.divmod(w_long_get_value(b))
-            .expect("divisor was checked nonzero")
+        RBigIntGcRoot::new(BigInt::from(int_value(a)))
     };
+    let vb = live_long_num(b);
+    let (q, r) = va.divmod(&vb).expect("divisor was checked nonzero");
     // `_divmod` produces two live rbigints before either wrapper is
     // allocated. RPython's GC transform roots both across those collecting
     // allocations.
@@ -1883,13 +1907,11 @@ fn int_pow_negative(base: i64, exp: i64) -> Result<f64, PyError> {
 }
 
 unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let vb_owned;
-    let vb = if is_long(b) {
-        w_long_get_value(b)
+    let vb = RBigIntGcRoot::new(if is_long(b) {
+        w_long_get_value(b).translated_alias()
     } else {
-        vb_owned = BigInt::from(int_value(b));
-        &vb_owned
-    };
+        BigInt::from(int_value(b))
+    });
     if vb.get_sign() < 0 {
         // longobject.py calls descr_float on both integer operands
         // before float pow.  RBigInt::tofloat raises on an out-of-range value;
@@ -1907,13 +1929,11 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         return Ok(w_long_new(BigInt::from(1)));
     }
     // longobject.py:224-231: rbigint.pow handles arbitrary exponents.
-    let va_owned;
-    let va = if is_long(a) {
-        w_long_get_value(a)
+    let va = RBigIntGcRoot::new(if is_long(a) {
+        w_long_get_value(a).translated_alias()
     } else {
-        va_owned = BigInt::from(int_value(a));
-        &va_owned
-    };
+        BigInt::from(int_value(a))
+    });
     // Both rbigint.int_pow(1) and rbigint.pow(ONERBIGINT) return the base
     // reference after the zero-base check. W_LongObject adds only a wrapper.
     if is_long(a) && va.get_sign() != 0 && vb.int_eq(1) {
@@ -1935,9 +1955,9 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // unwrapped (`exp_bigint` stays None) and calls `rbigint.int_pow`; only a
     // long exponent reaches `rbigint.pow`.
     if is_int_like(b) {
-        return Ok(w_long_new(bigint_int_pow_nomod(va, int_value(b))?));
+        return Ok(w_long_new(bigint_int_pow_nomod(&va, int_value(b))?));
     }
-    Ok(w_long_new(bigint_pow_nomod(va, vb)?))
+    Ok(w_long_new(bigint_pow_nomod(&va, &vb)?))
 }
 
 // ── Shift operations ─────────────────────────────────────────────────
@@ -1987,36 +2007,72 @@ unsafe fn int_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(w_int_new(va >> vb))
 }
 
+/// `_int_lshift`. Nothing allocates between the guard and the receiver read.
+unsafe fn long_int_lshift(a: PyObjectRef, other: i64) -> PyResult {
+    if other < 0 {
+        return Err(PyError::value_error("negative shift count"));
+    }
+    debug_assert!(is_long(a));
+    // `rbigint.lshift` returns `self` for a zero count or a zero receiver.
+    // `W_LongObject` wraps that payload.
+    if other == 0 || live_long_num(a).get_sign() == 0 {
+        return Ok(pyre_object::longobject::w_long_from_raw(
+            w_long_get_raw_value(a),
+        ));
+    }
+    let va = live_long_num(a);
+    Ok(w_long_new(bigint_lshift_count(&va, other)?))
+}
+
+/// `_int_rshift`: `newlong(self.num.rshift(other))`.
+unsafe fn long_int_rshift(a: PyObjectRef, other: i64) -> PyResult {
+    if other < 0 {
+        return Err(PyError::value_error("negative shift count"));
+    }
+    debug_assert!(is_long(a));
+    // `rbigint.rshift(0)` returns `self`; `newlong` adds a fresh wrapper.
+    if other == 0 {
+        return Ok(pyre_object::longobject::w_long_from_raw(
+            w_long_get_raw_value(a),
+        ));
+    }
+    let va = live_long_num(a);
+    Ok(w_long_new(bigint_rshift(&va, other)))
+}
+
 unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let vb_owned;
-    let vb = if is_long(b) {
-        w_long_get_value(b)
-    } else {
-        vb_owned = BigInt::from(int_value(b));
-        &vb_owned
-    };
+    // `_lshift` reads `w_other.asbigint()` before `self`. `descr_lshift`
+    // keeps both operands live across that call (`gct_direct_call` /
+    // `get_livevars_for_roots`). A machine-int count is `_int_lshift`
+    // (`long_int_lshift`) and does not reach here.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
+    let a = || pyre_object::gc_roots::shadow_stack_get(base);
+    let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    debug_assert!(is_long(b()));
+    let vb = live_long_num(b());
     if vb.get_sign() < 0 {
         return Err(PyError::value_error("negative shift count"));
     }
     // longobject.py: `toint()` (signed machine int / i64) overflows
     // when the count exceeds i64::MAX → 0 if base is zero, OverflowError
     // otherwise.
-    let shift = if jit_bigint_to_i64_fits(vb) != 0 {
-        jit_bigint_to_i64_value(vb)
+    let shift = if jit_bigint_to_i64_fits(&vb) != 0 {
+        jit_bigint_to_i64_value(&vb)
     } else {
-        let base_is_zero = if is_long(a) {
-            w_long_get_value(a).get_sign() == 0
+        let base_is_zero = if is_long(a()) {
+            live_long_num(a()).get_sign() == 0
         } else {
-            int_value(a) == 0
+            int_value(a()) == 0
         };
         if base_is_zero {
             // `_lshift` returns `self` (a W_LongObject) for a zero base.
-            return Ok(if is_long(a) {
-                a
+            return Ok(if is_long(a()) {
+                a()
             } else {
                 // A reflected compact-int operand is first coerced to the
-                // W_LongObject receiver in PyPy's `_make_descr_binop`.
-                w_long_new(BigInt::from(0))
+                // W_LongObject receiver in `_make_descr_binop`.
+                w_long_new(BigInt::zero())
             });
         }
         return Err(PyError::overflow_error("shift count too large"));
@@ -2025,60 +2081,58 @@ unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // `W_LongObject._lshift` then puts that same payload into a fresh long
     // wrapper (except for the huge-count zero case above, which returns the
     // receiver wrapper itself).
-    if is_long(a) && (shift == 0 || w_long_get_value(a).get_sign() == 0) {
+    if is_long(a()) && (shift == 0 || live_long_num(a()).get_sign() == 0) {
         return Ok(pyre_object::longobject::w_long_from_raw(
-            w_long_get_raw_value(a),
+            w_long_get_raw_value(a()),
         ));
     }
-    let va_owned;
-    let va = if is_long(a) {
-        w_long_get_value(a)
+    let va = if is_long(a()) {
+        live_long_num(a())
     } else {
-        va_owned = BigInt::from(int_value(a));
-        &va_owned
+        RBigIntGcRoot::new(BigInt::from(int_value(a())))
     };
-    let shifted = bigint_lshift_count(va, shift)?;
+    let shifted = bigint_lshift_count(&va, shift)?;
     Ok(w_long_new(shifted))
 }
 
 unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let vb_owned;
-    let vb = if is_long(b) {
-        w_long_get_value(b)
-    } else {
-        vb_owned = BigInt::from(int_value(b));
-        &vb_owned
-    };
+    // `_rshift` reads `w_other.asbigint()` before `self`. `descr_rshift`
+    // keeps both operands live (`gct_direct_call` / `get_livevars_for_roots`).
+    // A machine-int count is `_int_rshift` (`long_int_rshift`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
+    let a = || pyre_object::gc_roots::shadow_stack_get(base);
+    let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    debug_assert!(is_long(b()));
+    let vb = live_long_num(b());
     if vb.get_sign() < 0 {
         return Err(PyError::value_error("negative shift count"));
     }
     // longobject.py: `toint()` overflow (count > i64::MAX) → positive
     // yields 0, negative yields -1 (all bits shifted out).
-    let shift = if jit_bigint_to_i64_fits(vb) != 0 {
-        jit_bigint_to_i64_value(vb)
+    let shift = if jit_bigint_to_i64_fits(&vb) != 0 {
+        jit_bigint_to_i64_value(&vb)
     } else {
-        let negative = if is_long(a) {
-            w_long_get_value(a).get_sign() < 0
+        let negative = if is_long(a()) {
+            live_long_num(a()).get_sign() < 0
         } else {
-            int_value(a) < 0
+            int_value(a()) < 0
         };
         return Ok(w_int_new(if negative { -1 } else { 0 }));
     };
     // rbigint.rshift(0) returns `self`; `newlong` adds only a fresh wrapper.
-    if is_long(a) && shift == 0 {
+    if is_long(a()) && shift == 0 {
         return Ok(pyre_object::longobject::w_long_from_raw(
-            w_long_get_raw_value(a),
+            w_long_get_raw_value(a()),
         ));
     }
     // `_rshift`/`_int_rshift` `newlong` the normal-count result, keeping a long.
-    let va_owned;
-    let va = if is_long(a) {
-        w_long_get_value(a)
+    let va = if is_long(a()) {
+        live_long_num(a())
     } else {
-        va_owned = BigInt::from(int_value(a));
-        &va_owned
+        RBigIntGcRoot::new(BigInt::from(int_value(a())))
     };
-    Ok(w_long_new(bigint_rshift(va, shift)))
+    Ok(w_long_new(bigint_rshift(&va, shift)))
 }
 
 // ── bool-as-int helpers ──────────────────────────────────────────────
@@ -2118,64 +2172,64 @@ unsafe fn int_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 unsafe fn long_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if is_long(a) && is_bool(b) {
         return Ok(w_long_new(
-            w_long_get_value(a).int_and_(w_bool_get_value(b) as i64),
+            live_long_num(a).int_and_(w_bool_get_value(b) as i64),
         ));
     }
     if is_long(a) && is_int(b) {
-        return Ok(w_long_new(w_long_get_value(a).int_and_(w_int_get_value(b))));
+        return Ok(w_long_new(live_long_num(a).int_and_(w_int_get_value(b))));
     }
     if is_bool(a) && is_long(b) {
         return Ok(w_long_new(
-            w_long_get_value(b).int_and_(w_bool_get_value(a) as i64),
+            live_long_num(b).int_and_(w_bool_get_value(a) as i64),
         ));
     }
     if is_int(a) && is_long(b) {
-        return Ok(w_long_new(w_long_get_value(b).int_and_(w_int_get_value(a))));
+        return Ok(w_long_new(live_long_num(b).int_and_(w_int_get_value(a))));
     }
     debug_assert!(is_long(a) && is_long(b));
-    Ok(w_long_new(w_long_get_value(a).and_(w_long_get_value(b))))
+    Ok(w_long_new(live_long_num(a).and_(&live_long_num(b))))
 }
 
 unsafe fn long_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if is_long(a) && is_bool(b) {
         return Ok(w_long_new(
-            w_long_get_value(a).int_or_(w_bool_get_value(b) as i64),
+            live_long_num(a).int_or_(w_bool_get_value(b) as i64),
         ));
     }
     if is_long(a) && is_int(b) {
-        return Ok(w_long_new(w_long_get_value(a).int_or_(w_int_get_value(b))));
+        return Ok(w_long_new(live_long_num(a).int_or_(w_int_get_value(b))));
     }
     if is_bool(a) && is_long(b) {
         return Ok(w_long_new(
-            w_long_get_value(b).int_or_(w_bool_get_value(a) as i64),
+            live_long_num(b).int_or_(w_bool_get_value(a) as i64),
         ));
     }
     if is_int(a) && is_long(b) {
-        return Ok(w_long_new(w_long_get_value(b).int_or_(w_int_get_value(a))));
+        return Ok(w_long_new(live_long_num(b).int_or_(w_int_get_value(a))));
     }
     debug_assert!(is_long(a) && is_long(b));
-    Ok(w_long_new(w_long_get_value(a).or_(w_long_get_value(b))))
+    Ok(w_long_new(live_long_num(a).or_(&live_long_num(b))))
 }
 
 unsafe fn long_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if is_long(a) && is_bool(b) {
         return Ok(w_long_new(
-            w_long_get_value(a).int_xor(w_bool_get_value(b) as i64),
+            live_long_num(a).int_xor(w_bool_get_value(b) as i64),
         ));
     }
     if is_long(a) && is_int(b) {
-        return Ok(w_long_new(w_long_get_value(a).int_xor(w_int_get_value(b))));
+        return Ok(w_long_new(live_long_num(a).int_xor(w_int_get_value(b))));
     }
     if is_bool(a) && is_long(b) {
         return Ok(w_long_new(
-            w_long_get_value(b).int_xor(w_bool_get_value(a) as i64),
+            live_long_num(b).int_xor(w_bool_get_value(a) as i64),
         ));
     }
     if is_int(a) && is_long(b) {
-        return Ok(w_long_new(w_long_get_value(b).int_xor(w_int_get_value(a))));
+        return Ok(w_long_new(live_long_num(b).int_xor(w_int_get_value(a))));
     }
     debug_assert!(is_long(a) && is_long(b));
-    Ok(w_long_new(w_long_get_value(a).xor(w_long_get_value(b))))
+    Ok(w_long_new(live_long_num(a).xor(&live_long_num(b))))
 }
 
 // ── String operations ────────────────────────────────────────────────
@@ -2560,9 +2614,11 @@ pub(crate) unsafe fn bytearray_inplace_repeat(
         .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "repeated bytes are too long"))?;
     // Only an actual length change touches the buffer size; an exported buffer
     // blocks it.
-    if new_size != len {
-        crate::builtins::bytearray_check_exports(ba)?;
-    }
+    let ba = if new_size != len {
+        crate::builtins::bytearray_check_exports(ba)?
+    } else {
+        ba
+    };
     if count == 0 {
         pyre_object::bytearrayobject::w_bytearray_vec_mut(ba).clear();
         pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, len);
@@ -2804,9 +2860,23 @@ unsafe fn specialised_tuple_same_class_eq(
         let pair = roots.publish(&[a, b]);
         roots.normalize(pair, 2);
         for i in 0..2 {
+            // `getvalue` itself does not allocate, but `eq_w` does, and a
+            // specialised `_oo` payload can hold a young box.  Pin each
+            // value before the sibling read and the comparison, the same
+            // first-then-second shape as `list_eq`.
+            let _val_roots = pyre_object::gc_roots::push_roots();
+            let val_base = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_specialised_tuple_oo_getvalue(
+                roots.get(pair),
+                i,
+            ));
+            let _ = pyre_object::gc_roots::pin_root(w_specialised_tuple_oo_getvalue(
+                roots.get(pair + 1),
+                i,
+            ));
             if !crate::baseobjspace::eq_w(
-                w_specialised_tuple_oo_getvalue(roots.get(pair), i),
-                w_specialised_tuple_oo_getvalue(roots.get(pair + 1), i),
+                pyre_object::gc_roots::shadow_stack_get(val_base),
+                pyre_object::gc_roots::shadow_stack_get(val_base + 1),
             )? {
                 return Ok(Some(false));
             }
@@ -2819,13 +2889,15 @@ unsafe fn specialised_tuple_same_class_eq(
 /// floatobject.py `do_compare_bigint` — compare a float against a
 /// bigint without converting the bigint to a double, which would round it.
 fn do_compare_bigint(f1: f64, b2: &BigInt, op: CompareOp) -> bool {
+    // `_fromfloat_finite` collects.
+    let b2 = live_rbigint(b2);
     if matches!(op, CompareOp::Eq | CompareOp::Ne) {
         let ne = matches!(op, CompareOp::Ne);
         // A non-finite or fractional float is never equal to an integer.
         if !f1.is_finite() || f1.floor() != f1 {
             return ne;
         }
-        return BigInt::_fromfloat_finite(f1).eq(b2) != ne;
+        return BigInt::_fromfloat_finite(f1).eq(&b2) != ne;
     }
     if !f1.is_finite() {
         return compare_f64(f1, 0.0, op);
@@ -2841,10 +2913,10 @@ fn do_compare_bigint(f1: f64, b2: &BigInt, op: CompareOp) -> bool {
     };
     let b1 = BigInt::_fromfloat_finite(f1);
     match op {
-        CompareOp::Lt => b1.lt(b2),
-        CompareOp::Le => b1.le(b2),
-        CompareOp::Gt => b1.gt(b2),
-        CompareOp::Ge => b1.ge(b2),
+        CompareOp::Lt => b1.lt(&b2),
+        CompareOp::Le => b1.le(&b2),
+        CompareOp::Gt => b1.gt(&b2),
+        CompareOp::Ge => b1.ge(&b2),
         CompareOp::Eq | CompareOp::Ne => unreachable!("handled above"),
     }
 }
@@ -4682,6 +4754,12 @@ pub(crate) fn floordiv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str
                 return int_floordiv(a, b);
             }
             if is_int_or_long(a) && is_int_or_long(b) {
+                // `_make_descr_binop` hands a `W_IntObject` operand to
+                // `_int_floordiv` as a machine word; only a long operand
+                // reaches `_floordiv`.
+                if is_int_like(b) {
+                    return long_int_floordiv(a, int_value(b));
+                }
                 return long_floordiv(a, b);
             }
             if is_float_pair(a, b) {
@@ -4747,6 +4825,10 @@ pub(crate) fn mod_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
                 return int_mod(a, b);
             }
             if is_int_or_long(a) && is_int_or_long(b) {
+                // `_make_descr_binop(_mod, _int_mod)`.
+                if is_int_like(b) {
+                    return long_int_mod(a, int_value(b));
+                }
                 return long_mod(a, b);
             }
             if is_float_pair(a, b) {
@@ -5014,6 +5096,12 @@ pub(crate) fn floordiv_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return int_floordiv(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
+            // `_make_descr_binop` hands a `W_IntObject` operand to
+            // `_int_floordiv` as a machine word; only a long operand
+            // reaches `_floordiv`.
+            if is_int_like(b) {
+                return long_int_floordiv(a, int_value(b));
+            }
             return long_floordiv(a, b);
         }
         if is_float_pair(a, b) {
@@ -5029,6 +5117,10 @@ pub(crate) fn mod_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return int_mod(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
+            // `_make_descr_binop(_mod, _int_mod)`.
+            if is_int_like(b) {
+                return long_int_mod(a, int_value(b));
+            }
             return long_mod(a, b);
         }
         if is_float_pair(a, b) {
@@ -5094,6 +5186,12 @@ pub(crate) fn lshift_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return int_lshift(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
+            // `_make_descr_binop` hands a `W_IntObject` operand to
+            // `_int_lshift` as a machine word; only a long operand
+            // reaches `_lshift`.
+            if is_int_like(b) {
+                return long_int_lshift(a, int_value(b));
+            }
             return long_lshift(a, b);
         }
         Ok(w_not_implemented())
@@ -5106,6 +5204,12 @@ pub(crate) fn rshift_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return int_rshift(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
+            // `_make_descr_binop` hands a `W_IntObject` operand to
+            // `_int_rshift` as a machine word; only a long operand
+            // reaches `_rshift`.
+            if is_int_like(b) {
+                return long_int_rshift(a, int_value(b));
+            }
             return long_rshift(a, b);
         }
         Ok(w_not_implemented())
@@ -5454,27 +5558,22 @@ pub(crate) fn try_int_long_pow_with_modulo(
         // machine ints, in which case `space.newint` demotes it.
         let all_int_like = is_int_like(base) && is_int_like(exp) && is_int_like(modulus);
 
-        let base_owned;
-        let base = if is_long(base) {
-            w_long_get_value(base)
-        } else {
-            base_owned = BigInt::from(int_value(base));
-            &base_owned
+        // `fromint` / payload clones collect. Pin the three Python
+        // operands and reload after each conversion so a nursery-born
+        // int/long is not read from from-space as a negative exponent.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slots = pyre_object::gc_roots::pin_roots(&[base, exp, modulus]);
+        let load = |i: usize| pyre_object::gc_roots::shadow_stack_get(slots + i);
+        let as_bigint = |obj: PyObjectRef| -> RBigIntGcRoot {
+            if is_long(obj) {
+                live_long_num(obj)
+            } else {
+                RBigIntGcRoot::new(BigInt::from(int_value(obj)))
+            }
         };
-        let exp_owned;
-        let exp = if is_long(exp) {
-            w_long_get_value(exp)
-        } else {
-            exp_owned = BigInt::from(int_value(exp));
-            &exp_owned
-        };
-        let modulus_owned;
-        let modulus = if is_long(modulus) {
-            w_long_get_value(modulus)
-        } else {
-            modulus_owned = BigInt::from(int_value(modulus));
-            &modulus_owned
-        };
+        let base = as_bigint(load(0));
+        let exp = as_bigint(load(1));
+        let modulus = as_bigint(load(2));
 
         if modulus.get_sign() == 0 {
             return Err(PyError::value_error("pow() 3rd argument cannot be 0"));
@@ -5485,49 +5584,54 @@ pub(crate) fn try_int_long_pow_with_modulo(
             // long_invmod).  The inverse exists only when `base` is
             // coprime to the modulus.
             let negative_modulus = modulus.get_sign() < 0;
-            let abs_modulus_owned;
             let abs_modulus = if negative_modulus {
-                abs_modulus_owned = modulus.neg();
-                &abs_modulus_owned
+                RBigIntGcRoot::new(modulus.neg())
             } else {
-                modulus
+                RBigIntGcRoot::new(modulus.translated_alias())
             };
-            let inverse = bigint_mod_inverse(base, abs_modulus)?;
-            let pos_exp = exp.neg();
-            let mut result = inverse
-                .pow(&pos_exp, Some(abs_modulus))
-                .map_err(|_| PyError::memory_error("exponent too large"))?;
+            let inverse = RBigIntGcRoot::new(bigint_mod_inverse(&base, &abs_modulus)?);
+            let pos_exp = RBigIntGcRoot::new(exp.neg());
+            let mut result = RBigIntGcRoot::new(
+                inverse
+                    .pow(&pos_exp, Some(&abs_modulus))
+                    .map_err(|_| PyError::memory_error("exponent too large"))?,
+            );
             if negative_modulus && result.get_sign() > 0 {
-                result = result.sub(abs_modulus);
+                result = RBigIntGcRoot::new(result.sub(&abs_modulus));
             }
-            return Ok(Some(pow_mod_result(result, all_int_like)));
+            return Ok(Some(pow_mod_result(
+                result.translated_alias(),
+                all_int_like,
+            )));
         }
         if exp.get_sign() == 0 {
             // `x ** 0 % m` is `1 % m` under floor semantics, so a negative
             // modulus yields a negative residue (`pow(2, 0, -13) == -12`).
             return Ok(Some(pow_mod_result(
                 BigInt::one()
-                    .r#mod(modulus)
+                    .r#mod(&modulus)
                     .expect("modulus was checked nonzero"),
                 all_int_like,
             )));
         }
 
         let negative_modulus = modulus.get_sign() < 0;
-        let abs_modulus_owned;
         let abs_modulus = if negative_modulus {
-            abs_modulus_owned = modulus.neg();
-            &abs_modulus_owned
+            RBigIntGcRoot::new(modulus.neg())
         } else {
-            modulus
+            RBigIntGcRoot::new(modulus.translated_alias())
         };
-        let mut result = base
-            .pow(exp, Some(abs_modulus))
-            .map_err(|_| PyError::memory_error("exponent too large"))?;
+        let mut result = RBigIntGcRoot::new(
+            base.pow(&exp, Some(&abs_modulus))
+                .map_err(|_| PyError::memory_error("exponent too large"))?,
+        );
         if negative_modulus && result.get_sign() > 0 {
-            result = result.sub(abs_modulus);
+            result = RBigIntGcRoot::new(result.sub(&abs_modulus));
         }
-        Ok(Some(pow_mod_result(result, all_int_like)))
+        Ok(Some(pow_mod_result(
+            result.translated_alias(),
+            all_int_like,
+        )))
     }
 }
 
@@ -5854,6 +5958,12 @@ pub(crate) fn lshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
                 return int_lshift(a, b);
             }
             if is_int_or_long(a) && is_int_or_long(b) {
+                // `_make_descr_binop` hands a `W_IntObject` operand to
+                // `_int_lshift` as a machine word; only a long operand
+                // reaches `_lshift`.
+                if is_int_like(b) {
+                    return long_int_lshift(a, int_value(b));
+                }
                 return long_lshift(a, b);
             }
         }
@@ -5897,6 +6007,12 @@ pub(crate) fn rshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
                 return int_rshift(a, b);
             }
             if is_int_or_long(a) && is_int_or_long(b) {
+                // `_make_descr_binop` hands a `W_IntObject` operand to
+                // `_int_rshift` as a machine word; only a long operand
+                // reaches `_rshift`.
+                if is_int_like(b) {
+                    return long_int_rshift(a, int_value(b));
+                }
                 return long_rshift(a, b);
             }
         }
@@ -6570,10 +6686,16 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
             // under (`setobject.py _issubset_unwrapped`), so a
             // comparison hashes nothing and an `eq_w` raised from a bucket
             // probe propagates instead of reading as "not a subset".
-            let la = pyre_object::w_set_len(a);
-            let lb = pyre_object::w_set_len(b);
-            let a_subset_b = || crate::typedef::set_is_subset_of(a, b);
-            let b_subset_a = || crate::typedef::set_is_subset_of(b, a);
+            // `eq_w` is a collection point; `a`/`b` were popped off the
+            // value stack, so pin them for the length reads and the walk.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::pin_roots(&[a, b]);
+            let a = || pyre_object::gc_roots::shadow_stack_get(root_base);
+            let b = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+            let la = pyre_object::w_set_len(a());
+            let lb = pyre_object::w_set_len(b());
+            let a_subset_b = || crate::typedef::set_is_subset_of(a(), b());
+            let b_subset_a = || crate::typedef::set_is_subset_of(b(), a());
             return Ok(w_bool_from(match op {
                 CompareOp::Eq => la == lb && a_subset_b()?,
                 CompareOp::Ne => la != lb || !a_subset_b()?,
@@ -6604,16 +6726,29 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
                 return Ok(w_bool_from(matches!(op, CompareOp::Ne)));
             }
 
+            // Two extra slots sit next to the lists so each boxed getitem
+            // is stored with `set` rather than `pin_root`: a push can grow
+            // the shadow-stack buffer, and an inlined `shadow_stack_get`
+            // would then read the old `base`.  `tupleobject.py
+            // _compare_tuples` uses the same four-slot shape.
+            let elem_roots = pyre_object::gc_roots::push_roots();
+            let pair = elem_roots.publish(&[PY_NULL, PY_NULL]);
+            elem_roots.normalize(pair, 2);
             let mut i = 0usize;
             while i < pyre_object::w_list_len(a()) && i < pyre_object::w_list_len(b()) {
-                let ea = pyre_object::w_list_getitem(a(), i as i64).unwrap_or(PY_NULL);
-                let eb = pyre_object::w_list_getitem(b(), i as i64).unwrap_or(PY_NULL);
-                let _elem_roots = pyre_object::gc_roots::push_roots();
-                let pair = pyre_object::gc_roots::pin_roots(&[ea, eb]);
-                if !crate::baseobjspace::eq_w(
-                    pyre_object::gc_roots::shadow_stack_get(pair),
-                    pyre_object::gc_roots::shadow_stack_get(pair + 1),
-                )? {
+                // Integer/float/range strategies box through `w_int_new` /
+                // `w_float_new`.  Store the first box before the second
+                // getitem, which is another collecting malloc
+                // (`listobject.py list_eq` / `_compare_unwrappeditems`).
+                elem_roots.set(
+                    pair,
+                    pyre_object::w_list_getitem(a(), i as i64).unwrap_or(PY_NULL),
+                );
+                elem_roots.set(
+                    pair + 1,
+                    pyre_object::w_list_getitem(b(), i as i64).unwrap_or(PY_NULL),
+                );
+                if !crate::baseobjspace::eq_w(elem_roots.get(pair), elem_roots.get(pair + 1))? {
                     break;
                 }
                 i += 1;
@@ -6633,11 +6768,18 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
             if matches!(op, CompareOp::Eq | CompareOp::Ne) {
                 return Ok(w_bool_from(matches!(op, CompareOp::Ne)));
             }
-            // CPython deliberately fetches the live items again: equality may
-            // have replaced either element before the ordering comparison.
-            let ea = pyre_object::w_list_getitem(a(), i as i64).unwrap_or(PY_NULL);
-            let eb = pyre_object::w_list_getitem(b(), i as i64).unwrap_or(PY_NULL);
-            return compare(ea, eb, op);
+            // Fetch the live items again: equality may have replaced either
+            // element before the ordering comparison.  Same first-then-second
+            // `set` as the equality loop: the second getitem can collect.
+            elem_roots.set(
+                pair,
+                pyre_object::w_list_getitem(a(), i as i64).unwrap_or(PY_NULL),
+            );
+            elem_roots.set(
+                pair + 1,
+                pyre_object::w_list_getitem(b(), i as i64).unwrap_or(PY_NULL),
+            );
+            return compare(elem_roots.get(pair), elem_roots.get(pair + 1), op);
         }
         // range value comparison — functional.py W_Range.descr_eq:
         // two ranges are equal iff they generate the same sequence
@@ -7906,24 +8048,23 @@ mod tests {
 
             let magnitude = BigInt::one().lshift(130).unwrap().int_add(17);
             let value = w_long_new(magnitude);
-            let count_zero = w_int_new(0);
 
-            // rbigint returns `self`; newlong creates a fresh W_LongObject
+            // rbigint returns `self`; `W_LongObject` / `newlong` wraps that payload.
             // around that exact translated payload.
-            let shifted_left = long_lshift(value, count_zero).unwrap();
+            let shifted_left = long_int_lshift(value, 0).unwrap();
             assert_ne!(shifted_left, value);
             assert_eq!(
                 w_long_get_raw_value(shifted_left),
                 w_long_get_raw_value(value)
             );
-            let shifted_right = long_rshift(value, count_zero).unwrap();
+            let shifted_right = long_int_rshift(value, 0).unwrap();
             assert_ne!(shifted_right, value);
             assert_eq!(
                 w_long_get_raw_value(shifted_right),
                 w_long_get_raw_value(value)
             );
 
-            let zero_shifted = long_lshift(zero, w_int_new(5)).unwrap();
+            let zero_shifted = long_int_lshift(zero, 5).unwrap();
             assert_ne!(zero_shifted, zero);
             assert_eq!(
                 w_long_get_raw_value(zero_shifted),
@@ -7953,7 +8094,7 @@ mod tests {
                 long_sub(value, zero).unwrap(),
                 long_mul(value, w_int_new(1)).unwrap(),
                 long_mul(w_bool_from(true), value).unwrap(),
-                long_floordiv(value, w_int_new(1)).unwrap(),
+                long_int_floordiv(value, 1).unwrap(),
                 long_pow(value, w_int_new(1)).unwrap(),
             ] {
                 assert_ne!(result, value);

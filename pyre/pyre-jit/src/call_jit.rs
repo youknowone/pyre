@@ -380,9 +380,8 @@ fn alloc_callee_frame(
 fn unroot_callee_frame(ptr: *mut PyFrame) {
     // This list is what makes a minor collection scan the frame's slots.
     // Once it stops, a young ref stored since the last minor — argument
-    // boxing, the CALL_ASSEMBLER writeback through `jit_frame_set_slot_*` —
-    // is reachable only through the old-gen locals array's own items, which
-    // a minor does not walk. The frame outlives the call whenever the program
+    // boxing, for one — is reachable only through the old-gen locals
+    // array's own items, which a minor does not walk. The frame outlives the call whenever the program
     // retained it (a traceback node, an `f_back` chain), so re-arm the
     // remembered set here, at the moment root-walking stops: the same barrier
     // `pyframe.py __init__` arms at creation, for the same reason.
@@ -414,6 +413,9 @@ unsafe fn visit_callee_frame_roots(frame: *mut PyFrame, visitor: &mut dyn FnMut(
     for slot in locals_w_mut!(frame).as_mut_slice() {
         visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut GcRef) });
     }
+    // Strong edge `f_generator_nowref` (`initialize_as_generator` /
+    // `get_generator`), the same slot `walk_pyframe_roots` and
+    // `pyframe_object_custom_trace` forward.
     visitor(unsafe { &mut *(&mut frame.f_generator_nowref as *mut PyObjectRef as *mut GcRef) });
     visitor(unsafe { &mut *(&mut frame.w_yielding_from as *mut PyObjectRef as *mut GcRef) });
     if !frame.debugdata.is_null() {
@@ -5238,35 +5240,6 @@ pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
     unroot_callee_frame(ptr);
 }
 
-/// Store a W_Root into a callee frame's `locals_cells_stack_w[idx]`.
-///
-/// Residual helper for the inline back-edge CALL_ASSEMBLER writeback
-/// (do_recursive_call, pyjitpl.py): the callee's compiled
-/// loop reads its locals from the frame object at entry, so the
-/// inlined prefix's register values are stored back through these
-/// helpers before the call. Plain store, same as `PyFrame::push`.
-#[majit_macros::dont_look_inside]
-pub extern "C" fn jit_frame_set_slot_ref(frame_ptr: i64, idx: i64, value: i64) {
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    locals_w_mut!(frame)[idx as usize] = value as PyObjectRef;
-}
-
-/// `jit_frame_set_slot_ref` for a raw int value — boxes via `w_int_new`.
-#[majit_macros::dont_look_inside]
-pub extern "C" fn jit_frame_set_slot_int(frame_ptr: i64, idx: i64, raw: i64) {
-    let boxed = pyre_object::intobject::w_int_new(raw);
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    locals_w_mut!(frame)[idx as usize] = boxed;
-}
-
-/// `jit_frame_set_slot_ref` for a raw float value — boxes via `w_float_new`.
-#[majit_macros::dont_look_inside]
-pub extern "C" fn jit_frame_set_slot_float(frame_ptr: i64, idx: i64, raw: f64) {
-    let boxed = pyre_object::floatobject::w_float_new(raw);
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    locals_w_mut!(frame)[idx as usize] = boxed;
-}
-
 // Blackhole helper functions
 //
 // RPython blackhole.py: bhimpl_recursive_call_i, bhimpl_residual_call_*
@@ -7940,7 +7913,15 @@ pub fn cranelift_resumedata_deopt(
     //    deadframe (the JITed exit code stored fail_args here).
     //    Snapshot all_liveness once so the slice outlives the reader.
     let all_liveness = pyre_jit_trace::state::liveness_info_snapshot();
-    let deadframe: Vec<i64> = outputs.clone();
+    let mut deadframe: Vec<i64> = outputs.clone();
+    // `cpu.get_ref_value(deadframe, num)` reads a GC-traced frame; this copy
+    // is not one, so root its Ref slots for as long as the reader decodes
+    // them. Materializing a virtual below can collect.
+    let _deadframe_roots = unsafe {
+        resume::DeadFrameRefRoots::enter(&mut deadframe, |index| {
+            types.get(index) == Some(&majit_ir::Type::Ref)
+        })
+    };
     let allocator = crate::eval::PyreBlackholeAllocator;
     let mut reader = resume::ResumeDataDirectReader::new(
         rd_numb,
@@ -7955,7 +7936,8 @@ pub fn cranelift_resumedata_deopt(
     // 6. resume.py:1324-1325 — prepare virtuals/pendingfields, then
     //    consume the vref + vable sections that precede the per-frame
     //    sections.
-    reader.prepare(rd_virtuals_slice, rd_pendingfields);
+    let _resume_roots =
+        resume::prepare_resume_heap_with_roots(&mut reader, rd_virtuals_slice, rd_pendingfields);
     let vinfo_dyn: &dyn resume::VirtualizableInfo = driver_vinfo.as_ref();
     let vrefinfo_dyn: &dyn resume::VRefInfo = driver.meta_interp().virtualref_info();
     if std::env::var_os("PYRE_DEOPT_PROBE").is_some() {

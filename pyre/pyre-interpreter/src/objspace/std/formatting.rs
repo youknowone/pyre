@@ -439,23 +439,50 @@ pub(crate) unsafe fn bytes_format_percent(fmt: PyObjectRef, args: PyObjectRef) -
     // `_PyBytes_FormatEx` observes the receiver and decrements it after every
     // success/error return.  Re-entrant formatting callbacks may overwrite
     // bytes, but cannot resize and invalidate the live pointer/length pair.
+    // Pin first: `exports_incref` on a pre-pin pointer would account the
+    // stub after a collection, and the release would miss the live copy.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let fmt_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _fmt = pyre_object::gc_roots::pin_root(fmt);
+    let args = pyre_object::gc_roots::pin_root(args);
+    // The args pin is a safepoint. `descr_mod` / `mod_format` keep the live
+    // receiver, so the bytearray export count is taken on the moved object.
+    let fmt = pyre_object::gc_roots::shadow_stack_get(fmt_slot);
     let receiver_exported = pyre_object::bytearrayobject::is_bytearray(fmt);
     if receiver_exported {
-        pyre_object::bytearrayobject::w_bytearray_exports_incref(fmt);
+        pyre_object::bytearrayobject::w_bytearray_exports_incref(
+            pyre_object::gc_roots::shadow_stack_get(fmt_slot),
+        );
     }
-    let formatted = bytes_format_percent_inner(fmt, args);
-    if receiver_exported {
-        pyre_object::bytearrayobject::w_bytearray_exports_decref(fmt);
+    struct ExportGuard {
+        slot: usize,
+        exported: bool,
     }
-    formatted
+    impl Drop for ExportGuard {
+        fn drop(&mut self) {
+            if self.exported {
+                unsafe {
+                    pyre_object::bytearrayobject::w_bytearray_exports_decref(
+                        pyre_object::gc_roots::shadow_stack_get(self.slot),
+                    );
+                }
+            }
+        }
+    }
+    let _export = ExportGuard {
+        slot: fmt_slot,
+        exported: receiver_exported,
+    };
+    bytes_format_percent_inner(pyre_object::gc_roots::shadow_stack_get(fmt_slot), args)
 }
 
 unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
     // As `str_format_percent`: the conversions run Python and `BINARY_OP %`
-    // popped both operands, so nothing else roots them.  `fmt` is pinned for
-    // the borrow below — a bytes-like object never moves, but an unreachable
-    // one is still swept, and the slice points into its payload.
+    // popped both operands, so nothing else roots them.  A nursery bytearray
+    // `fmt` moves across a conversion, so the result kind is read from the
+    // slot.
     let _roots = pyre_object::gc_roots::push_roots();
+    let fmt_slot = pyre_object::gc_roots::shadow_stack_len();
     let fmt = pyre_object::gc_roots::pin_root(fmt);
     let args_slot = pyre_object::gc_roots::shadow_stack_len();
     let args = pyre_object::gc_roots::pin_root(args);
@@ -480,7 +507,10 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
                 CFormatPart::Spec(_) => unreachable!(),
             }
         }
-        return Ok(bytes_format_result(fmt, &result));
+        return Ok(bytes_format_result(
+            pyre_object::gc_roots::shadow_stack_get(fmt_slot),
+            &result,
+        ));
     }
 
     if mapping_required {
@@ -522,7 +552,10 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
         if let Some(error) = deferred_error {
             error.after_parts(is_mapping)?;
         }
-        return Ok(bytes_format_result(fmt, &result));
+        return Ok(bytes_format_result(
+            pyre_object::gc_roots::shadow_stack_get(fmt_slot),
+            &result,
+        ));
     }
 
     let items: Vec<PyObjectRef> = if pyre_object::is_tuple(args) {
@@ -570,7 +603,10 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
             "not all arguments converted during bytes formatting",
         ))
     } else {
-        Ok(bytes_format_result(fmt, &result))
+        Ok(bytes_format_result(
+            pyre_object::gc_roots::shadow_stack_get(fmt_slot),
+            &result,
+        ))
     }
 }
 

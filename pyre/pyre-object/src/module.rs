@@ -8,7 +8,7 @@ use crate::pyobject::*;
 
 /// Python module object.
 ///
-/// Layout: `[ob_type | w_name | w_dict]`
+/// Layout: `[ob_type | w_name | w_dict | w_initialdict | startup_called]`
 ///
 /// `w_dict` mirrors PyPy `module.py self.w_dict = w_dict` — every
 /// Module owns a non-null `W_DictObject` (or dict subclass instance
@@ -26,6 +26,13 @@ pub struct Module {
     /// Authoritative dict object (`PyPy module.w_dict`).  Always non-null
     /// after construction.
     pub w_dict: PyObjectRef,
+    /// `mixedmodule.py MixedModule.w_initialdict`: `PY_NULL` as long as the
+    /// builtin module has not been imported yet, and when it has been, its
+    /// `__dict__.copy()` taken just after `startup()`. Stays `PY_NULL` on a
+    /// module that is not a builtin.
+    pub w_initialdict: PyObjectRef,
+    /// `module.py Module.startup_called`.
+    pub startup_called: bool,
 }
 
 /// GC type id assigned to `Module` at JitDriver init time.
@@ -47,10 +54,13 @@ pub const W_MODULE_OBJECT_SIZE: usize = std::mem::size_of::<Module>();
 /// `type(m)` / slot dispatch pointing at freed memory. `W_ObjectObject`
 /// traces its `w_class` for the same reason (`object_object_custom_trace`).
 ///
-pub const W_MODULE_GC_PTR_OFFSETS: [usize; 3] = [
+/// `w_initialdict` — the saved builtin dict a later import copies from.
+///
+pub const W_MODULE_GC_PTR_OFFSETS: [usize; 4] = [
     std::mem::offset_of!(Module, ob_header.w_class),
     std::mem::offset_of!(Module, w_name),
     std::mem::offset_of!(Module, w_dict),
+    std::mem::offset_of!(Module, w_initialdict),
 ];
 
 impl crate::lltype::GcType for Module {
@@ -98,6 +108,8 @@ fn module_value(name: &str) -> Module {
         },
         w_name,
         w_dict,
+        w_initialdict: PY_NULL,
+        startup_called: false,
     }
 }
 
@@ -185,6 +197,8 @@ fn module_aliasing_dict_value(name: &str, w_dict_object: PyObjectRef) -> Module 
         },
         w_name,
         w_dict: w_dict_object,
+        w_initialdict: PY_NULL,
+        startup_called: false,
     }
 }
 
@@ -208,6 +222,43 @@ pub unsafe fn w_module_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
     let module = &mut *(obj as *mut Module);
     module.w_name = w_name;
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+/// `MixedModule.w_initialdict`.
+///
+/// # Safety
+/// `obj` must point to a valid `Module`.
+pub unsafe fn w_module_get_initialdict(obj: PyObjectRef) -> PyObjectRef {
+    (*(obj as *const Module)).w_initialdict
+}
+
+/// `mixedmodule.py save_module_content_for_future_reload` stores the copy.
+/// A managed holder records the edge through the minimark write barrier; an
+/// immortal one is root-walked by `walk_module_dicts_gc`, which the next minor
+/// runs only once the prebuilt family is dirty.
+///
+/// # Safety
+/// `obj` must point to a valid `Module`.
+pub unsafe fn w_module_set_initialdict(obj: PyObjectRef, w_initialdict: PyObjectRef) {
+    (*(obj as *mut Module)).w_initialdict = w_initialdict;
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_roots::mark_prebuilt_roots_dirty();
+}
+
+/// `Module.startup_called`.
+///
+/// # Safety
+/// `obj` must point to a valid `Module`.
+pub unsafe fn w_module_startup_called(obj: PyObjectRef) -> bool {
+    (*(obj as *const Module)).startup_called
+}
+
+/// `Module.init` sets `startup_called` before it runs `startup()`.
+///
+/// # Safety
+/// `obj` must point to a valid `Module`.
+pub unsafe fn w_module_set_startup_called(obj: PyObjectRef) {
+    (*(obj as *mut Module)).startup_called = true;
 }
 
 /// Get the aliased `W_DictObject` (`PY_NULL` when storage-only).

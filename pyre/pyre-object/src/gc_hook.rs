@@ -312,15 +312,11 @@ pub fn try_gc_alloc_young_nonmoving_raw(type_id: u32, payload_size: usize) -> *m
 /// A nursery-full request spills to the old generation rather than collecting,
 /// so the block this hands back is never worse placed than the stable twin's.
 ///
-/// Not for a constructor a compiled trace calls directly.  One bound in
-/// `jit_fnaddr` hands its block back in a machine register the gcmap does not
-/// describe as a reference, so a minor collection between the return and the
-/// store leaves the caller naming moved bytes, and the non-moving old
-/// generation is what stands in for that missing root today.
-/// `PYPY_GC_NURSERY=64K` tells the two apart in one run: routing
-/// `w_int_gc_alloc` here puts recycled nursery bytes in an old-gen
-/// `W_BaseException.w_start` (`type_name_surrogate_reject`,
-/// `site=minor_fixed_field_target`).
+/// A compiled residual whose result is `Type::Ref` is spilled to the
+/// jitframe immediately after the call (`regalloc.rs` `consider_call`),
+/// so the next collecting call's gcmap rewrites it. Constructors that
+/// return an integer-class word (`i64` ABI with no Ref descr) still
+/// need the stable twin.
 ///
 /// Residualised (`@dont_look_inside`, `rlib/jit.py`) for the same reason as its
 /// twin: the hook dispatch is process-global state the trace carries nothing by
@@ -341,7 +337,8 @@ majit_gc::global_hook!(static GC_ALLOC_COLLECTING_HOOK: GcAllocHookFn);
 /// for callers that hold no unrooted GC pointer across the allocation and run at
 /// a JIT safepoint (gcmap-rooted). The elidable bigint payload helpers were the
 /// first; the rooted sibling now also carries every list header
-/// (`w_list_new_with_strategy`), heap-type headers (`w_type_new`),
+/// (`w_list_new_with_strategy`), heap-type headers (`w_type_new` is
+/// old-gen; this hook is the collecting nursery sibling),
 /// `w_weakref_new`, and builtin `str()`'s `w_str_from_wtf8_managed_collecting`.
 pub fn register_gc_alloc_collecting_hook(hook: GcAllocHookFn) {
     GC_ALLOC_COLLECTING_HOOK.set(Some(hook));
@@ -668,6 +665,12 @@ majit_gc::global_hook!(static GC_REMOVE_ROOT_HOOK: GcRemoveRootHookFn);
 pub fn register_gc_root_hooks(add: GcAddRootHookFn, remove: GcRemoveRootHookFn) {
     GC_REMOVE_ROOT_HOOK.set(Some(remove));
     GC_ADD_ROOT_HOOK.set(Some(add));
+}
+
+/// Whether [`try_gc_add_root`] has a callback to invoke.
+#[inline]
+pub fn add_root_hook_installed() -> bool {
+    GC_ADD_ROOT_HOOK.get().is_some()
 }
 
 /// Remove the root-register callbacks.

@@ -83,13 +83,14 @@ impl Poll {
         w_fd: PyObjectRef,
         #[default(pyre_object::w_none())] w_events: PyObjectRef,
     ) -> Result<(), pyre_interpreter::PyError> {
-        let fd = filedescriptor_w(w_fd)?;
-        // @unwrap_spec(events="c_ushort"): reject negative / >0xffff.
+        // @unwrap_spec(events="c_ushort"): reject negative / >0xffff.  The
+        // gateway converts it before the body resolves the descriptor.
         let events = if unsafe { pyre_object::is_none(w_events) } {
             default_poll_events()
         } else {
             pyre_interpreter::baseobjspace::c_ushort_w(w_events)? as i16
         };
+        let fd = filedescriptor_w(w_fd)?;
         self.fddict.insert(fd, events);
         Ok(())
     }
@@ -101,9 +102,10 @@ impl Poll {
         w_fd: PyObjectRef,
         w_events: PyObjectRef,
     ) -> Result<(), pyre_interpreter::PyError> {
-        let fd = filedescriptor_w(w_fd)?;
-        // @unwrap_spec(events="c_ushort"): reject negative / >0xffff.
+        // @unwrap_spec(events="c_ushort"): reject negative / >0xffff.  The
+        // gateway converts it before the body resolves the descriptor.
         let events = pyre_interpreter::baseobjspace::c_ushort_w(w_events)? as i16;
+        let fd = filedescriptor_w(w_fd)?;
         let known = self.fddict.contains_key(&fd);
         if known {
             self.fddict.insert(fd, events);
@@ -342,20 +344,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // `interp_select.py:226` — `space.unpackiterable` accepts any
                 // iterable (list, tuple, generator, …); each item is an int
                 // fd or an object exposing fileno().
+                //
+                // `list_w` is a GC list upstream; the items come back here as
+                // native copies, and every later `fileno()`, `__float__` and
+                // the blocking `select` itself collect. Each item is pinned on
+                // the caller's root bracket and named by its slot.
                 fn collect_fds(
                     seq: pyre_object::PyObjectRef,
-                ) -> Result<
-                    Vec<(pyre_object::PyObjectRef, host_select::RawFd)>,
-                    pyre_interpreter::PyError,
-                > {
+                ) -> Result<Vec<(usize, host_select::RawFd)>, pyre_interpreter::PyError> {
                     let items = pyre_interpreter::baseobjspace::unpackiterable(seq, -1)?;
+                    let base = pyre_object::gc_roots::pin_roots(&items);
                     let mut out = Vec::with_capacity(items.len());
-                    for item in items {
+                    for slot in base..base + items.len() {
                         // `interp_select.py _build_fd_set` — each item is
                         // resolved through `space.c_filedescriptor_w`, then
                         // checked against what this platform's fd_set holds.
-                        let fd = filedescriptor_w(item)?;
-                        out.push((item, selectable_fd(fd, out.len())?));
+                        let fd = filedescriptor_w(pyre_object::gc_roots::shadow_stack_get(slot))?;
+                        out.push((slot, selectable_fd(fd, out.len())?));
                     }
                     Ok(out)
                 }
@@ -373,6 +378,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 let _ = arg_roots.pin_root(args[0]);
                 let _ = arg_roots.pin_root(args[1]);
                 let _ = arg_roots.pin_root(args[2]);
+                let _ = arg_roots.pin_root(args.get(3).copied().unwrap_or(pyre_object::PY_NULL));
                 let rfds = collect_fds(arg_roots.get(args_base))?;
                 let wfds = collect_fds(arg_roots.get(args_base + 1))?;
                 let xfds = collect_fds(arg_roots.get(args_base + 2))?;
@@ -398,10 +404,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // `interp_select.py:230-235` — `None` blocks forever, else
                 // `space.float_w` (applies `__float__`); a negative count is
                 // a ValueError.
-                let timeout_secs: Option<f64> = match args.get(3) {
+                let w_timeout = arg_roots.get(args_base + 3);
+                let timeout_secs: Option<f64> = match (!w_timeout.is_null()).then_some(w_timeout) {
                     None => None,
-                    Some(&t) if unsafe { pyre_object::is_none(t) } => None,
-                    Some(&t) => {
+                    Some(t) if unsafe { pyre_object::is_none(t) } => None,
+                    Some(t) => {
                         let secs = pyre_interpreter::baseobjspace::float_w(t)?;
                         if secs < 0.0 {
                             return Err(pyre_interpreter::PyError::value_error(
@@ -480,11 +487,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
 
                 fn build_ready(
                     set: &mut host_select::FdSet,
-                    inputs: &[(pyre_object::PyObjectRef, host_select::RawFd)],
+                    inputs: &[(usize, host_select::RawFd)],
                 ) -> pyre_object::PyObjectRef {
                     let items: Vec<_> = inputs
                         .iter()
-                        .filter_map(|&(obj, fd)| if set.contains(fd) { Some(obj) } else { None })
+                        .filter(|&&(_, fd)| set.contains(fd))
+                        .map(|&(slot, _)| pyre_object::gc_roots::shadow_stack_get(slot))
                         .collect();
                     pyre_object::w_list_new(items)
                 }

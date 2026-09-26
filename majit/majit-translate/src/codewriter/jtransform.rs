@@ -4065,6 +4065,20 @@ impl<'a> Transformer<'a> {
         )
     }
 
+    /// True when `ty` is `CCHARP` or `Ptr(Array)`.
+    /// `rewrite_op_direct_ptradd` uses this to accept the item type
+    /// `push_direct_ptradd` stamps on the result. Sizing still goes
+    /// through `direct_ptradd_item_bytes` and the callcontrol layout.
+    fn direct_ptradd_type_has_item(
+        ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> bool {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        if ty == &*crate::translator::rtyper::lltypesystem::rffi::CCHARP {
+            return true;
+        }
+        matches!(ty, LowLevelType::Ptr(ptr) if matches!(ptr.TO, PtrTarget::Array(_)))
+    }
+
     /// `llmemory.sizeof(concretetype.TO.OF)` as a byte count.
     /// `CCHARP` is handled by the caller and never reaches this.
     fn direct_ptradd_item_bytes(
@@ -4143,13 +4157,22 @@ impl<'a> Transformer<'a> {
         ) {
             return RewriteResult::Keep;
         }
-        // The value added is the renamed pointer. The item type is the
-        // one `op.args[0]` had before that rename.
-        let ptr_ty = self
+        // `rewrite_op_direct_ptradd` reads `sizeof(args[0].concretetype.TO.OF)`.
+        // `push_direct_ptradd` leaves a GC pointer as the operand (so
+        // `ann_direct_ptradd` still sees `SomePtr`) and stamps `CArrayPtr`
+        // / `CCHARP` on the result. That result type is `TO.OF` when the
+        // operand itself is not an array pointer.
+        let arg_ty = self
             .direct_ptradd_type_arg
             .as_ref()
             .and_then(|typed| typed.concretetype())
             .or_else(|| ptr.concretetype());
+        let result_ty_ll = op.result.as_ref().and_then(|result| result.concretetype());
+        let ptr_ty = [arg_ty.clone(), result_ty_ll]
+            .into_iter()
+            .flatten()
+            .find(|ty| Self::direct_ptradd_type_has_item(ty))
+            .or(arg_ty);
         let is_ccharp = ptr_ty
             .as_ref()
             .is_some_and(|ty| ty == &*crate::translator::rtyper::lltypesystem::rffi::CCHARP);
@@ -4210,11 +4233,19 @@ impl<'a> Transformer<'a> {
                 crate::codewriter::type_state::ConcreteType::Signed,
             );
         }
+        // A GC pointer is ref-kind. `int_add` wants the address integer
+        // (`cast_ptr_to_int`), which is what a raw `Ptr` already is.
+        let (addr, cast_ops) = if self.get_value_kind_var(ptr) == 'r' {
+            self.coerce_operand_to_int(graph, ptr)
+        } else {
+            (ptr.clone(), Vec::new())
+        };
+        ops.extend(cast_ops);
         ops.push(SpaceOperation {
             result: op.result.clone(),
             kind: OpKind::BinOp {
                 op: "int_add".to_string(),
-                lhs: ptr.clone(),
+                lhs: addr,
                 rhs: shift_v,
                 result_ty: ValueType::Int,
             },
@@ -14870,6 +14901,92 @@ mod tests {
                     if op == "int_add" && lhs == &ptr && rhs == &shift
             )),
             "*const u8 is one int_add; ops={ops:?}"
+        );
+    }
+
+    /// `push_direct_ptradd` keeps a GC pointer as the operand and stamps
+    /// `CArrayPtr` on the result. `rewrite_op_direct_ptradd` must still
+    /// emit `cast_ptr_to_int` + `int_mul` + `int_add`, not a raw
+    /// `direct_call`.
+    #[test]
+    fn direct_ptradd_of_gc_pointer_uses_result_array_type() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let item = LowLevelType::Signed;
+        let array_ptr = crate::front::mir::lltype_for_direct_ptradd_pointer(None, &item);
+        let mut graph = FunctionGraph::new("utf8_payload_bytes");
+        let ptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "ptr".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&ptr, ConcreteType::GcRef);
+        let shift = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&shift, ConcreteType::Signed);
+        let result = graph.alloc_value_var();
+        result.set_concretetype(Some(array_ptr));
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "direct_ptradd",
+        ]);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![ptr.clone(), shift.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let mut cc = crate::call::CallControl::new();
+        let rewritten = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .rewrite_op_direct_call(
+                &op,
+                &target,
+                &[ptr, shift],
+                &ValueType::Int,
+                "utf8_payload_bytes",
+                &mut graph,
+            );
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!("gc-pointer direct_ptradd must rewrite");
+        };
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::Call { .. } | OpKind::Abort { .. })),
+            "jitcode must not carry direct_call; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int"
+            )),
+            "ref pointer becomes an address integer; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, .. } if op == "int_add"
+            )),
+            "rewrite_op_direct_ptradd emits int_add; ops={ops:?}"
         );
     }
 

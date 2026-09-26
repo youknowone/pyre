@@ -277,8 +277,15 @@ impl W_Random {
                 crate::bail_value_error!("state vector is the wrong size");
             }
             let mut new_state = [0u32; N];
+            // `obj_to_bigint` of a machine int collects; the state tuple
+            // comes back off the shadow stack.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let state_slot = pyre_object::gc_roots::pin_roots(&[w_state]);
             for i in 0..N {
-                let Some(item) = w_tuple_getitem(w_state, i as i64) else {
+                let Some(item) = w_tuple_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(state_slot),
+                    i as i64,
+                ) else {
                     crate::bail_value_error!("state vector is the wrong size");
                 };
                 if !is_int_or_long(item) {
@@ -286,19 +293,22 @@ impl W_Random {
                 }
                 let mut v = crate::builtins::obj_to_bigint(item);
                 if v.get_sign() < 0 {
-                    v += BigInt::from(1u64 << 32);
+                    v = v.int_add(1i64 << 32);
                 }
                 // space.uint_w: every word must fit an unsigned 32-bit int.
                 if v.get_sign() < 0 {
                     crate::bail_overflow_error!("cannot convert negative integer to unsigned int");
                 }
-                if v >= BigInt::from(1u64 << 32) {
+                if v.int_ge(1i64 << 32) {
                     crate::bail_overflow_error!("int too large to convert to unsigned int");
                 }
                 let (_s, digits) = v.to_u32_digits();
                 new_state[i] = digits.first().copied().unwrap_or(0);
             }
-            let Some(item) = w_tuple_getitem(w_state, N as i64) else {
+            let Some(item) = w_tuple_getitem(
+                pyre_object::gc_roots::shadow_stack_get(state_slot),
+                N as i64,
+            ) else {
                 crate::bail_value_error!("state vector is the wrong size");
             };
             // space.int_w: handles long overflow / non-int (TypeError).

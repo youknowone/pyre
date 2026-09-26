@@ -1704,7 +1704,14 @@ impl MiniMarkGC {
             if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
                 return obj;
             }
-            return self.alloc_in_oldgen_clear(type_id, total_size);
+            // `external_malloc` (`incminimark.py`): `arena_malloc` returning
+            // NULL is `MemoryError`, not a process abort. `rbigint.lshift`
+            // of `1 << 10**18` is the public edge that depends on it.
+            if let Some(obj) = self.try_alloc_in_oldgen(type_id, total_size) {
+                Self::raw_memclear(obj, total_size);
+                return obj;
+            }
+            return GcRef(0);
         }
 
         // `IncrementalMiniMarkGC.collect_and_reserve`: a failed bump may have
@@ -1948,7 +1955,14 @@ impl MiniMarkGC {
             if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
                 return obj;
             }
-            return self.alloc_in_oldgen_clear(type_id, total_size);
+            // `external_malloc` (`incminimark.py`): `arena_malloc` returning
+            // NULL is `MemoryError`, not a process abort. `rbigint.lshift`
+            // of `1 << 10**18` is the public edge that depends on it.
+            if let Some(obj) = self.try_alloc_in_oldgen(type_id, total_size) {
+                Self::raw_memclear(obj, total_size);
+                return obj;
+            }
+            return GcRef(0);
         }
 
         // `IncrementalMiniMarkGC.collect_and_reserve`: crossing a pinned
@@ -3554,9 +3568,22 @@ impl MiniMarkGC {
                 let obj_addr = self.old_objects_pointing_to_young[idx];
                 idx += 1;
 
-                // incminimark.py:2095-2098: re-set TRACK_YOUNG_PTRS.
+                let hdr = unsafe { header_of(obj_addr) };
+                // `_remember_young_pointer_inlined`: "addr cannot be in the
+                // nursery, because nursery objects never have the flag
+                // GCFLAG_TRACK_YOUNG_PTRS". Every producer of this list pushes
+                // an old object, so no entry is a nursery object or the
+                // forwarding stub the root walk left behind one.
+                debug_assert!(
+                    !unsafe { (*hdr).is_forwarded() } && !self.is_in_nursery(obj_addr),
+                    "nursery object {obj_addr:#x} in old_objects_pointing_to_young"
+                );
+
+                // incminimark.py collect_oldrefs_to_nursery: set the flag
+                // then trace. `seed_major_root` may already have armed
+                // it on a jitframe spill; OR-ing it in is a no-op then.
                 unsafe {
-                    (*header_of(obj_addr)).set_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
+                    (*hdr).set_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
                 }
 
                 // Trace this old-gen object's fields and copy any nursery
@@ -4523,6 +4550,33 @@ impl MiniMarkGC {
         self.drain_gray_stack();
     }
 
+    /// incminimark.py `deal_with_young_objects_with_finalizers`: a young object
+    /// registered with a finalizer survives the next minor whatever reaches it
+    /// ("they all survive"), so upstream's major meets it only once it is on
+    /// `old_objects_with_finalizers`, with its children marked by the
+    /// finalization-order pass. A non-moving major runs without that minor.
+    /// Leaving the young object unmarked would sweep the old objects only it
+    /// names, and the minor would then keep it alive with fields pointing at
+    /// freed memory. Mark from each one, as the minor will keep it.
+    fn nonmoving_major_trace_young_finalizers(&mut self) {
+        debug_assert!(self.oldgen_nonmoving_active);
+        let young: Vec<usize> = self
+            .probably_young_objects_with_finalizers
+            .iter()
+            .map(|&(addr, _)| addr)
+            .collect();
+        for addr in young {
+            if !self.is_managed_heap_object(addr) {
+                continue;
+            }
+            if unsafe { (*header_of(addr)).has_flag(GcFlags::GCFLAG_IGNORE_FINALIZER) } {
+                continue;
+            }
+            self.seed_major_root(GcRef(addr), "nonmoving_major_young_finalizer");
+        }
+        self.drain_gray_stack();
+    }
+
     /// A non-moving major runs with a live nursery and no leading minor
     /// (`do_collect_oldgen_nonmoving`), so `rrc_minor_collection_trace` never
     /// ran and the young P list still holds mirrors whose linked nursery object
@@ -5039,15 +5093,12 @@ impl MiniMarkGC {
                     obj_addr
                 };
                 let length = unsafe { *((length_addr + type_info.length_offset) as *const usize) };
-                // `set_forwarding_address` stores the new address in the word
-                // right after the header — `obj_addr + 0`.  Every type whose
-                // `length_offset` is 0 therefore has its length word overwritten
-                // the moment it is forwarded, and `ItemsBlock` is one
-                // (`ITEMS_BLOCK_LEN_OFFSET` is `capacity`, its first field).  A
-                // length that is a plausible heap address is that corpse, read
-                // by a path that skipped the `is_forwarded` check, not an
-                // uninitialized allocation — name which one this is rather than
-                // leaving both readings open.
+                // On 64-bit, `set_forwarding_address` stores the live copy in
+                // the first payload word (`obj_addr + 0`). Types with
+                // `length_offset == 0` (`ItemsBlock.capacity`) then look like
+                // a huge length if `is_forwarded` was skipped. On wasm32 the
+                // live copy sits in the header padding, so a marker length
+                // is a payload that was itself used as a header.
                 let forwarded = unsafe { (*header_of(obj_addr)).is_forwarded() };
                 panic!(
                     "GC BUG: varsize length describes no allocation: length={} (read at \
@@ -5836,8 +5887,8 @@ impl MiniMarkGC {
 
         Self::walk_stack_shaped_roots(|gcref, site| result.push((gcref, site)));
 
-        crate::shadow_stack::walk_extra_roots(|gcref| {
-            result.push((*gcref, "extra_root"));
+        crate::shadow_stack::walk_extra_roots_labeled(|gcref, label| {
+            result.push((*gcref, label));
         });
         // Monotone: the hint only ever grows, so a collection that happens to
         // see fewer roots does not send the next one back through the ladder.
@@ -6661,6 +6712,10 @@ impl MiniMarkGC {
     /// assertions rather than `debug_assert!`s that a release build drops.
     /// `PYPY_GC_DEBUG` is the only way to arm them, and a run that sets it is
     /// asking to be aborted on a broken invariant.
+    fn debug_check_consistency(&self) {
+        self.debug_check_consistency_at("unspecified");
+    }
+
     fn debug_check_consistency_at(&self, site: &'static str) {
         if self.config.debug == 0 {
             return;
@@ -6730,26 +6785,47 @@ impl MiniMarkGC {
     /// Upstream keeps its seen set and pending stack as GC-side `AddressDict` /
     /// `AddressStack` because it has no other allocator; here they are ordinary
     /// Rust containers, which is the same structure without the bookkeeping.
+    /// The parent map is the same kind of container: each object records the
+    /// holder that reached it, so a slot that does not name an object can
+    /// report that holder and the root the walk started from. `GCBase.trace`
+    /// receives a typed pointer and would not load an integer; this walk
+    /// validates before the load of the child header.
     fn debug_check_reachable(&self, site: &'static str) {
         let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut pending: Vec<usize> = Vec::new();
-        let record =
-            |addr: usize, seen: &mut std::collections::HashSet<usize>, pending: &mut Vec<usize>| {
-                // `base.py _debug_callback2` / `trace` only follow GC objects.
-                // A declared gc-ptr offset can name a host `Box` (Function.name
-                // for an immortal builtin); the live tracer skips those with
-                // `is_managed_heap_object`.
-                if addr == 0 || !self.is_managed_heap_object(addr) {
-                    return;
+        // child -> (holder, slot address). A root has no entry.
+        let mut parent: std::collections::HashMap<usize, (usize, usize)> =
+            std::collections::HashMap::new();
+        let labeled: Vec<(GcRef, &'static str)> = {
+            let mut v = self.enumerate_labeled_root_walker_values();
+            for root in self.enumerate_all_root_values() {
+                v.push((root, "all_root"));
+            }
+            v
+        };
+        for (root, label) in labeled {
+            if root.is_null() {
+                continue;
+            }
+            // A root may name mapped host storage the production walks skip:
+            // `walk_rbigint_parts_cache` yields headerless `std::alloc` digit
+            // blocks, and a recorded trace `Ref` can hold `Function.name`
+            // storage. See `debug_accept_host_storage_child`.
+            if !self.debug_child_is_traceable(root.0) {
+                if self.debug_accept_host_storage_child(root.0) {
+                    continue;
                 }
-                if seen.insert(addr) {
-                    self.debug_check_object_at(addr, site);
-                    pending.push(addr);
-                }
-            };
-        for root in self.enumerate_all_root_values() {
-            if !root.is_null() {
-                record(root.0, &mut seen, &mut pending);
+                panic!(
+                    "debug_check_reachable: bad root label={label} value={:#x} value_state={} {} {} site={site}",
+                    root.0,
+                    self.debug_describe_bad_value(root.0),
+                    self.debug_describe_external_miss(root.0),
+                    self.debug_describe_type_layout(root.0),
+                );
+            }
+            if seen.insert(root.0) {
+                self.debug_check_object_at(root.0, site);
+                pending.push(root.0);
             }
         }
         while let Some(obj_addr) = pending.pop() {
@@ -6757,19 +6833,307 @@ impl MiniMarkGC {
             if (type_id as usize) >= self.types.len() {
                 continue;
             }
-            let mut children: Vec<usize> = Vec::new();
+            let mut children: Vec<(usize, usize)> = Vec::new();
             unsafe {
                 self.types.get(type_id).for_each_gc_ptr(obj_addr, |slot| {
                     let child = *slot;
-                    if !child.is_null() {
-                        children.push(child.0);
+                    if child.is_null() {
+                        return;
                     }
+                    // A custom trace reads through the slot after this visitor
+                    // returns (an instance's boxed storage length, for one).
+                    // After a minor no reachable slot may still name a
+                    // forwarding stub or a retired nursery, so report it here,
+                    // before the trace dereferences it.
+                    let stale = self.nursery.contains_retired(child.0)
+                        || (self.is_nursery_object_start(child.0)
+                            && (*header_of(child.0)).is_forwarded());
+                    if stale {
+                        self.debug_panic_bad_child(
+                            obj_addr,
+                            type_id,
+                            slot as usize,
+                            child.0,
+                            &parent,
+                        );
+                    }
+                    children.push((child.0, slot as usize));
                 });
             }
-            for child in children {
-                record(child, &mut seen, &mut pending);
+            for (child, slot_addr) in children {
+                if seen.contains(&child) {
+                    continue;
+                }
+                // A slot may name mapped host storage on purpose
+                // (`Function.name`, see `debug_accept_host_storage_child`).
+                // An unmapped word, a nursery address and a retired-nursery
+                // address are the defects this walk reports.
+                if !self.debug_child_is_traceable(child) {
+                    if self.debug_accept_host_storage_child(child) {
+                        continue;
+                    }
+                    self.debug_panic_bad_child(obj_addr, type_id, slot_addr, child, &parent);
+                }
+                seen.insert(child);
+                parent.insert(child, (obj_addr, slot_addr));
+                self.debug_check_object_at(child, site);
+                pending.push(child);
             }
         }
+    }
+
+    /// Mapped host storage the collector never moves, as a root or a child.
+    ///
+    /// The minor and major traces skip a root or child `is_managed_heap_object`
+    /// rejects. `Function.name` (`FUNCTION_NAME_OFFSET`) is such a child by
+    /// design, in an immortal builtin (a `malloc_raw` String) and in a
+    /// collector-owned function alike (`FunctionName::Borrowed`, the
+    /// `co_name` of a `Box::into_raw`'d code object that is never freed). An
+    /// unmapped word is not host storage: an integer in a GC slot is what
+    /// this walk exists to report. Nursery addresses (an interior pointer
+    /// included) and retired-nursery addresses are collector territory and
+    /// never take this skip.
+    fn debug_accept_host_storage_child(&self, child: usize) -> bool {
+        self.debug_outside_collector(child) && self.debug_address_mapped(child)
+    }
+
+    /// Not in any nursery and not collector-owned.
+    ///
+    /// `nursery.contains` is the live arena; `contains_retired` is every arena
+    /// `debug_rotate` has protected. Both fail the "not in any nursery" test
+    /// a forwarding stub has to fail. `is_in_nursery` is not used here: it
+    /// asserts on an odd word, and this predicate is how an integer is
+    /// rejected. Young raw-malloced payloads are collector-owned;
+    /// `try_alloc_young` also inserts them into the raw-malloc set
+    /// `is_managed_heap_object` reads, and the young test stays so the two
+    /// cannot drift apart.
+    fn debug_outside_collector(&self, addr: usize) -> bool {
+        addr != 0
+            && !self.nursery.contains_retired(addr)
+            && !self.nursery.contains(addr)
+            && !self.is_young_rawmalloced(addr)
+            && !self.is_managed_heap_object(addr)
+    }
+
+    /// A child the debug walk may read a header from.
+    ///
+    /// Nursery membership keeps the header inside the arena
+    /// (`is_nursery_object_start`). Old-gen arenas and raw-malloc payloads are
+    /// exact membership (`OldGeneration::contains`). `malloc_typed` and
+    /// `malloc_typed_immortal` leaves (`None`, the other prebuilt singletons)
+    /// sit outside both and are still real headers; `registered_external_header`
+    /// is what admits one, and only after a mapped-page probe so an integer in
+    /// the slot is not dereferenced. A forwarding stub fails both: after the
+    /// collection the slot should name the copy, and the stub's page stays
+    /// mapped when the nursery ring has not reused it.
+    ///
+    /// Nothing outside the collector is admitted by its header word alone: the
+    /// allocator word in front of a host allocation can read as a registered
+    /// type id with no flags. Such an address is host storage, a leaf here as
+    /// it is to the production traces (`debug_accept_host_storage_child`).
+    fn debug_child_is_traceable(&self, addr: usize) -> bool {
+        if !self.is_valid_gc_object(addr) {
+            return false;
+        }
+        if self.is_nursery_object_start(addr) || self.oldgen.contains(addr) {
+            let hdr = unsafe { *header_of(addr) };
+            return !hdr.is_forwarded();
+        }
+        self.debug_external_object(addr)
+    }
+
+    /// `alloc_with_gc_header` object outside the managed arenas.
+    ///
+    /// The page probe is the whole point: `registered_external_header` loads
+    /// the payload's first word, which is the segfault this check exists to
+    /// turn into a panic.
+    fn debug_external_object(&self, addr: usize) -> bool {
+        if addr < GcHeader::SIZE
+            || !self.debug_address_mapped(addr)
+            || !self.debug_address_mapped(addr - GcHeader::SIZE)
+        {
+            return false;
+        }
+        let hdr = unsafe { *header_of(addr) };
+        if hdr.is_forwarded() {
+            return false;
+        }
+        self.registered_external_header(addr).is_some()
+    }
+
+    /// Whether `addr` is in some mapped region. False on targets without
+    /// `region::query`; the debug walk then refuses the address instead of
+    /// loading it.
+    fn debug_address_mapped(&self, addr: usize) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = self;
+            // A retired nursery is still mapped, with `Protection::NONE`.
+            // `query` succeeds and a header load then faults. Readable is
+            // the predicate the load needs.
+            match region::query(addr as *const u8) {
+                Ok(info) => info.is_readable(),
+                Err(_) => false,
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (self, addr);
+            false
+        }
+    }
+
+    /// `bh_probe_type_name` for a holder the walk has already accepted.
+    ///
+    /// `TypeInfo` carries no name. The namer reads `ob_type`, so it is only
+    /// called for an `is_object` layout whose first word is a registered
+    /// vtable — the same guard as the blackhole probe.
+    fn debug_object_type_name(&self, addr: usize, type_id: u32) -> &'static str {
+        if (type_id as usize) >= self.types.len() || !self.types.get(type_id).is_object {
+            return "?";
+        }
+        let vtable = unsafe { *(addr as *const usize) };
+        if !self.vtable_to_type_id.contains_key(&vtable) {
+            return "?";
+        }
+        crate::bh_probe_type_name(addr).unwrap_or("?")
+    }
+
+    /// Walk the parent map to the object that entered the graph as a root.
+    fn debug_reach_root(
+        start: usize,
+        parent: &std::collections::HashMap<usize, (usize, usize)>,
+    ) -> usize {
+        let mut addr = start;
+        let limit = parent.len().saturating_add(1);
+        for _ in 0..limit {
+            match parent.get(&addr) {
+                Some(&(up, _)) if up != addr => addr = up,
+                _ => break,
+            }
+        }
+        addr
+    }
+
+    /// Registered-type shape of a mapped header, for a root the vtable witness
+    /// declined. `TypeInfo` has no name; the size and pointer offsets identify
+    /// the layout.
+    fn debug_describe_type_layout(&self, addr: usize) -> String {
+        if addr < GcHeader::SIZE
+            || !self.debug_address_mapped(addr)
+            || !self.debug_address_mapped(addr - GcHeader::SIZE)
+        {
+            return "layout=unread".to_string();
+        }
+        let hdr = unsafe { *header_of(addr) };
+        if hdr.is_forwarded() {
+            return "layout=forwarded".to_string();
+        }
+        let tid = hdr.type_id();
+        if (tid as usize) >= self.types.len() {
+            return format!("layout=tid_oor flags={:#x}", hdr.flags().bits());
+        }
+        let info = self.types.get(tid);
+        format!(
+            "layout=size:{} is_object:{} has_gc_ptrs:{} offsets:{:?} item_size:{} \
+             custom:{} flags={:#x}",
+            info.size,
+            info.is_object,
+            info.has_gc_ptrs,
+            info.gc_ptr_offsets,
+            info.item_size,
+            info.custom_trace.is_some(),
+            hdr.flags().bits(),
+        )
+    }
+
+    /// Why a mapped address was not `registered_external_header`.
+    ///
+    /// A root or child outside the arenas is admitted only when its first word
+    /// is a registered vtable and the header tid matches. The miss names which
+    /// half failed, and the type name when that vtable is one the namer can read.
+    fn debug_describe_external_miss(&self, addr: usize) -> String {
+        if !self.is_valid_gc_object(addr)
+            || addr < GcHeader::SIZE
+            || !self.debug_address_mapped(addr)
+            || !self.debug_address_mapped(addr - GcHeader::SIZE)
+        {
+            return "external=unmapped".to_string();
+        }
+        let word0 = unsafe { *(addr as *const usize) };
+        let vtable_tid = self.vtable_to_type_id.get(&word0).copied();
+        let name = vtable_tid.and_then(|_| crate::bh_probe_type_name(addr));
+        format!(
+            "word0={word0:#x} vtable_tid={vtable_tid:?} name={}",
+            name.unwrap_or("?")
+        )
+    }
+
+    /// What a rejected value looks like, without loading an unmapped page.
+    fn debug_describe_bad_value(&self, addr: usize) -> String {
+        let generation = self.describe_generation(addr);
+        if !self.is_valid_gc_object(addr) || addr < GcHeader::SIZE {
+            return format!("invalid gen={generation}");
+        }
+        if !self.debug_address_mapped(addr) || !self.debug_address_mapped(addr - GcHeader::SIZE) {
+            return format!("unmapped gen={generation}");
+        }
+        let hdr = unsafe { *header_of(addr) };
+        if hdr.is_forwarded() {
+            let fwd = unsafe { GcHeader::forwarding_address(header_of(addr)) };
+            return format!("forwarded fwd={fwd:#x} gen={generation}");
+        }
+        format!("tid={} gen={generation}", hdr.type_id())
+    }
+
+    fn debug_panic_bad_child(
+        &self,
+        holder: usize,
+        holder_tid: u32,
+        slot_addr: usize,
+        value: usize,
+        parent: &std::collections::HashMap<usize, (usize, usize)>,
+    ) -> ! {
+        let offset = slot_addr.wrapping_sub(holder);
+        let holder_type = self.debug_object_type_name(holder, holder_tid);
+        let field = crate::bh_probe_field_name(holder_tid, offset);
+        let root = Self::debug_reach_root(holder, parent);
+        let parent_desc = match parent.get(&holder) {
+            Some(&(parent_addr, parent_slot)) => {
+                let parent_tid = unsafe { (*header_of(parent_addr)).type_id() };
+                let parent_type = self.debug_object_type_name(parent_addr, parent_tid);
+                format!(
+                    "parent={parent_addr:#x} parent_tid={parent_tid} parent_type={parent_type} \
+                     parent_slot={parent_slot:#x}"
+                )
+            }
+            None => "parent=root".to_string(),
+        };
+        let root_desc = if root == holder {
+            "root=holder".to_string()
+        } else {
+            let root_tid = unsafe { (*header_of(root)).type_id() };
+            let root_type = self.debug_object_type_name(root, root_tid);
+            format!("root={root:#x} root_tid={root_tid} root_type={root_type}")
+        };
+        let mut holder_words = [0usize; 8];
+        if let Some(total) = self.try_object_total_size(holder) {
+            let payload = total.saturating_sub(GcHeader::SIZE);
+            let words = (payload / std::mem::size_of::<usize>()).min(holder_words.len());
+            for (index, word) in holder_words.iter_mut().take(words).enumerate() {
+                *word = unsafe { *((holder as *const usize).add(index)) };
+            }
+        }
+        let enclosing = self.describe_enclosing_container(holder, slot_addr, &holder_words);
+        let holder_layout = self.debug_describe_type_layout(holder);
+        panic!(
+            "debug_check_reachable: bad child holder={holder:#x} holder_tid={holder_tid} \
+             holder_type={holder_type} slot_addr={slot_addr:#x} slot_offset={offset:#x} \
+             field={field} value={value:#x} value_state={} {parent_desc} {root_desc} \
+             enclosing={enclosing} {holder_layout} holder_words={:?}",
+            self.debug_describe_bad_value(value),
+            &holder_words,
+        );
     }
 
     /// incminimark.py `debug_check_object`: after a collection nothing is left
@@ -7331,8 +7695,26 @@ impl MiniMarkGC {
     /// type system guarantees every `Ptr(GcStruct)` is GC-managed; it converges
     /// away once every `gc_ptr_offsets` target is a real GC allocation.
     fn grey_child(&mut self, addr: usize, holder_addr: usize, slot_addr: usize, site: &str) {
-        if self.is_managed_heap_object(addr) && self.may_enter_marking_worklist(addr) {
-            let hdr = unsafe { header_of(addr) };
+        if addr == 0 || !self.is_managed_heap_object(addr) {
+            return;
+        }
+        let hdr = unsafe { header_of(addr) };
+        // incminimark `visit`: forwarding stubs exist only inside
+        // `collect_nursery`, which updates every slot naming one before it
+        // returns. A slot that still names a stub here is a missed root or
+        // write barrier of the previous minor.
+        debug_assert!(
+            !unsafe { (*hdr).is_forwarded() },
+            "forwarding stub reached major marking: child={addr:#x} holder={holder_addr:#x} \
+             slot={slot_addr:#x} site={site}"
+        );
+        // incminimark `visit`: `ll_assert(not self.is_in_nursery(obj), ...)`.
+        debug_assert!(
+            self.may_enter_marking_worklist(addr),
+            "nursery child reached major marking: child={addr:#x} holder={holder_addr:#x} \
+             slot={slot_addr:#x} site={site}"
+        );
+        if self.may_enter_marking_worklist(addr) {
             let type_id = unsafe { (*hdr).type_id() };
             if type_id as usize >= self.types.len() {
                 let holder_type_id = unsafe { (*header_of(holder_addr)).type_id() };
@@ -7657,6 +8039,10 @@ impl MiniMarkGC {
         // after the cycle's initial snapshot.  Rescan and trace them before
         // finalizers, weakrefs, and sweep inspect VISITED.
         self.rescan_major_nonstack_roots_and_drain();
+        // A young finalizer object survives the minor this cycle skips.
+        if self.oldgen_nonmoving_active {
+            self.nonmoving_major_trace_young_finalizers();
+        }
         // incminimark.py:2486-2487 — the P list is a root source like any
         // other, and it is consulted here, after the ordinary roots and before
         // anything reads VISITED to decide what dies.
@@ -8681,6 +9067,14 @@ impl MiniMarkGC {
         // mutated and therefore cannot be re-added between sweep steps.
         let type_id = unsafe { (*header_of(obj.0)).type_id() };
         self.validate_type_id(type_id, obj.0, "remember_young_pointer_insert");
+        // `_remember_young_pointer_inlined`: "We know that 'addr' cannot be
+        // in the nursery, because nursery objects never have the flag
+        // GCFLAG_TRACK_YOUNG_PTRS to start with."
+        debug_assert!(
+            !self.is_in_nursery(obj.0),
+            "remember_young_pointer on nursery object {:#x}",
+            obj.0
+        );
         self.old_objects_pointing_to_young.push(obj.0);
         crate::bh_probe_note_barriered(obj.0);
         let hdr = unsafe { header_of(obj.0) };
@@ -14119,6 +14513,395 @@ mod tests {
         gc.roots.clear();
     }
 
+    fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(msg) = err.downcast_ref::<String>() {
+            return msg.clone();
+        }
+        if let Some(msg) = err.downcast_ref::<&str>() {
+            return (*msg).to_string();
+        }
+        "<non-string panic>".to_string()
+    }
+
+    /// One old object whose GC-pointer slot holds an integer. The walk must
+    /// name that object, the slot, the integer, and the root — and must not
+    /// load the integer as a header.
+    #[test]
+    fn debug_check_names_the_holder_of_a_bad_child() {
+        let mut gc = debug_gc(4096);
+        let ptr_size = std::mem::size_of::<usize>();
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let holder = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        let bad = 0x0de0_b6b3_a764_0000usize;
+        unsafe { *(holder.0 as *mut usize) = bad };
+        let mut root = holder;
+        unsafe { gc.roots.add(&mut root) };
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gc.debug_check_consistency();
+        }));
+        gc.roots.clear();
+        let msg = panic_message(err.expect_err("an integer child must panic"));
+        assert!(msg.contains("debug_check_reachable: bad child"), "{msg}");
+        assert!(msg.contains(&format!("holder={:#x}", holder.0)), "{msg}");
+        assert!(msg.contains(&format!("holder_tid={tid}")), "{msg}");
+        assert!(msg.contains("slot_offset=0x0"), "{msg}");
+        assert!(msg.contains(&format!("value={bad:#x}")), "{msg}");
+        assert!(msg.contains("unmapped"), "{msg}");
+        assert!(msg.contains("root=holder"), "{msg}");
+        assert!(msg.contains("parent=root"), "{msg}");
+    }
+
+    /// The parent map walks past the holder to the root that reached it.
+    #[test]
+    fn debug_check_names_the_root_that_reached_a_bad_child() {
+        let mut gc = debug_gc(4096);
+        let ptr_size = std::mem::size_of::<usize>();
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let total = GcHeader::SIZE + ptr_size;
+        let root_obj = gc.alloc_in_oldgen_clear(tid, total);
+        let mid = gc.alloc_in_oldgen_clear(tid, total);
+        let holder = gc.alloc_in_oldgen_clear(tid, total);
+        let bad = 0x0de0_b6b3_a764_0000usize;
+        unsafe {
+            *(root_obj.0 as *mut usize) = mid.0;
+            *(mid.0 as *mut usize) = holder.0;
+            *(holder.0 as *mut usize) = bad;
+        }
+        let mut root = root_obj;
+        unsafe { gc.roots.add(&mut root) };
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gc.debug_check_consistency();
+        }));
+        gc.roots.clear();
+        let msg = panic_message(err.expect_err("an integer child must panic"));
+        assert!(msg.contains(&format!("holder={:#x}", holder.0)), "{msg}");
+        assert!(msg.contains(&format!("parent={:#x}", mid.0)), "{msg}");
+        assert!(msg.contains(&format!("root={:#x}", root_obj.0)), "{msg}");
+        assert!(msg.contains(&format!("value={bad:#x}")), "{msg}");
+    }
+
+    /// A managed child is still checked. Rejecting every non-null slot would
+    /// make the walk vacuous.
+    #[test]
+    fn debug_check_follows_a_managed_child() {
+        let mut gc = debug_gc(4096);
+        let ptr_size = std::mem::size_of::<usize>();
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let total = GcHeader::SIZE + ptr_size;
+        let child = gc.alloc_in_oldgen_clear(tid, total);
+        let holder = gc.alloc_in_oldgen_clear(tid, total);
+        unsafe {
+            *(holder.0 as *mut usize) = child.0;
+            (*header_of(child.0)).set_flag(GcFlags::GCFLAG_VISITED_RMY);
+        }
+        let mut root = holder;
+        unsafe { gc.roots.add(&mut root) };
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gc.debug_check_consistency();
+        }));
+        unsafe { (*header_of(child.0)).clear_flag(GcFlags::GCFLAG_VISITED_RMY) };
+        gc.roots.clear();
+        let msg = panic_message(err.expect_err("the child's flag must still be checked"));
+        assert!(msg.contains("GCFLAG_VISITED_RMY"), "{msg}");
+    }
+
+    /// `malloc_typed` leaves are outside the arenas and still real objects.
+    /// The walk follows one instead of reporting it as a broken slot.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn debug_check_follows_a_registered_external_child() {
+        let mut gc = debug_gc(4096);
+        let ptr_size = std::mem::size_of::<usize>();
+        let holder_tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let ext_tid = gc.register_type(TypeInfo::simple(2 * ptr_size));
+        let vtable = 0x51_7E_usize;
+        gc.register_vtable_for_type(vtable, ext_tid);
+        let ext = crate::header::alloc_with_gc_header([vtable, 0usize], ext_tid);
+        let holder = gc.alloc_in_oldgen_clear(holder_tid, GcHeader::SIZE + ptr_size);
+        unsafe { *(holder.0 as *mut usize) = ext as usize };
+        let mut root = holder;
+        unsafe { gc.roots.add(&mut root) };
+        gc.debug_check_consistency();
+        gc.roots.clear();
+    }
+
+    /// A host `alloc_with_gc_header` that is not an OBJECT layout has no
+    /// vtable in word 0, so nothing but its header word says it is an object,
+    /// and that word is what a host allocation's neighbour can imitate. The
+    /// production traces skip a root outside the collector, and so does this
+    /// walk: an integer in such a box's slot is not reached.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn debug_check_leaves_a_non_object_host_root_untraced() {
+        let mut gc = debug_gc(4096);
+        let ptr_size = std::mem::size_of::<usize>();
+        // Keep the test type off tid 0, the object root.
+        let _ = gc.register_type(TypeInfo::simple(ptr_size));
+        let ext_tid = gc.register_type(TypeInfo::with_gc_ptrs(2 * ptr_size, vec![ptr_size]));
+        let ext = crate::header::alloc_with_gc_header([0usize, 0usize], ext_tid);
+        unsafe { *(ext as *mut usize).add(1) = 0x0de0_b6b3_a764_0000usize };
+        let mut root = GcRef(ext as usize);
+        unsafe { gc.roots.add(&mut root) };
+        gc.debug_check_consistency();
+        gc.roots.clear();
+    }
+
+    /// A slot that still names the pre-move address is the missing-barrier
+    /// shape. The stub is mapped, so the failure has to say it is forwarded
+    /// rather than treating the page as unmapped.
+    #[test]
+    fn debug_check_rejects_a_forwarding_stub() {
+        let mut gc = debug_gc(4096);
+        let ptr_size = std::mem::size_of::<usize>();
+        let young_tid = gc.register_type(TypeInfo::simple(16));
+        let holder_tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let young = gc.alloc_with_type(young_tid, 16);
+        let copy = gc.alloc_in_oldgen_clear(young_tid, GcHeader::SIZE + 16);
+        let holder = gc.alloc_in_oldgen_clear(holder_tid, GcHeader::SIZE + ptr_size);
+        unsafe {
+            GcHeader::set_forwarding_address(header_of(young.0), copy.0);
+            *(holder.0 as *mut usize) = young.0;
+        }
+        let mut root = holder;
+        unsafe { gc.roots.add(&mut root) };
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gc.debug_check_consistency();
+        }));
+        gc.roots.clear();
+        let msg = panic_message(err.expect_err("a forwarding stub must panic"));
+        assert!(msg.contains("debug_check_reachable: bad child"), "{msg}");
+        assert!(msg.contains(&format!("holder={:#x}", holder.0)), "{msg}");
+        assert!(msg.contains(&format!("value={:#x}", young.0)), "{msg}");
+        assert!(msg.contains("forwarded"), "{msg}");
+        assert!(msg.contains(&format!("fwd={:#x}", copy.0)), "{msg}");
+    }
+
+    /// Host block shaped like a prebuilt digit array: tid 0 in the word
+    /// before the payload, `payload0` as the first payload word. The
+    /// `GCFLAG_VISITED_RMY` bit makes `debug_check_object` fail if a walk
+    /// treats the block as a GC object instead of leaving it alone.
+    fn host_block_like_prebuilt_digits(payload0: usize) -> usize {
+        let total = GcHeader::SIZE + std::mem::size_of::<usize>();
+        let layout =
+            std::alloc::Layout::from_size_align(total, GcHeader::ALIGN).expect("host block layout");
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!raw.is_null(), "host block allocation");
+        let mut hdr = GcHeader::new(0);
+        hdr.set_flag(GcFlags::GCFLAG_VISITED_RMY);
+        unsafe {
+            (raw as *mut GcHeader).write(hdr);
+            let payload = raw.add(GcHeader::SIZE);
+            (payload as *mut usize).write(payload0);
+            payload as usize
+        }
+    }
+
+    thread_local! {
+        static DEBUG_IMMORTAL_RAW_ROOT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn walk_debug_immortal_raw_root(visitor: &mut dyn FnMut(&mut GcRef)) {
+        let addr = DEBUG_IMMORTAL_RAW_ROOT.with(|cell| cell.get());
+        if addr != 0 {
+            let mut root = GcRef(addr);
+            visitor(&mut root);
+        }
+    }
+
+    struct ClearImmortalRawRoot;
+    impl Drop for ClearImmortalRawRoot {
+        fn drop(&mut self) {
+            DEBUG_IMMORTAL_RAW_ROOT.with(|cell| cell.set(0));
+        }
+    }
+
+    /// A GC slot may name mapped host storage, in an immortal holder (a
+    /// builtin's `malloc_raw` name) and in a collector-owned one (a borrowed
+    /// code-object name). An unmapped word in the same slot still panics.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn debug_check_accepts_a_host_storage_child() {
+        let mut gc = debug_gc(4096);
+        let ptr_size = std::mem::size_of::<usize>();
+        // Keep the test type off tid 0, the object root.
+        let _ = gc.register_type(TypeInfo::simple(ptr_size));
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let holder = crate::header::alloc_with_gc_header([0usize], tid);
+        let raw = host_block_like_prebuilt_digits(0x1);
+        unsafe { *(holder as *mut usize) = raw };
+        let mut root = GcRef(holder as usize);
+        unsafe { gc.roots.add(&mut root) };
+        gc.debug_check_consistency();
+
+        gc.roots.clear();
+        let owned = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        unsafe { *(owned.0 as *mut usize) = raw };
+        let mut owned_root = owned;
+        unsafe { gc.roots.add(&mut owned_root) };
+        gc.debug_check_consistency();
+
+        let bad = 0x0de0_b6b3_a764_0000usize;
+        unsafe { *(owned.0 as *mut usize) = bad };
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gc.debug_check_consistency();
+        }));
+        gc.roots.clear();
+        let msg = panic_message(err.expect_err("an unmapped word must still panic"));
+        assert!(msg.contains("debug_check_reachable: bad child"), "{msg}");
+        assert!(msg.contains(&format!("holder={:#x}", owned.0)), "{msg}");
+        assert!(msg.contains(&format!("value={bad:#x}")), "{msg}");
+    }
+
+    /// A slot naming host storage whose preceding allocator word reads as a
+    /// registered type id with no flags is still a leaf: only a root may be
+    /// admitted by that header guess. The host payload holds an integer where
+    /// the guessed type would put a pointer.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn debug_check_does_not_guess_a_header_for_a_host_storage_child() {
+        let mut gc = debug_gc(4096);
+        let ptr_size = std::mem::size_of::<usize>();
+        let _ = gc.register_type(TypeInfo::simple(ptr_size));
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let raw = host_block_like_prebuilt_digits(0x1a);
+        unsafe { (header_of(raw) as *mut GcHeader).write(GcHeader::new(tid)) };
+        let owned = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        unsafe { *(owned.0 as *mut usize) = raw };
+        let mut root = owned;
+        unsafe { gc.roots.add(&mut root) };
+        gc.debug_check_consistency();
+        gc.roots.clear();
+    }
+
+    /// `walk_immortal_store_roots` may yield a `std::alloc` digit block, and
+    /// any root may name mapped host storage. A forwarding stub, a retired
+    /// nursery address, and a collector-owned object still panic under the
+    /// immortal-store label as under any other.
+    #[test]
+    fn debug_check_accepts_an_immortal_store_raw_root() {
+        let _guard = SHADOW_STACK_TEST_LOCK.lock();
+        let _clear = ClearImmortalRawRoot;
+        crate::shadow_stack::register_extra_root_walker(
+            walk_debug_immortal_raw_root,
+            "immortal_store_roots",
+        );
+
+        let mut gc = debug_gc(4096);
+        let raw = host_block_like_prebuilt_digits(0x1);
+
+        let mut ordinary = GcRef(raw);
+        unsafe { gc.roots.add(&mut ordinary) };
+        gc.debug_check_consistency();
+        gc.roots.clear();
+
+        DEBUG_IMMORTAL_RAW_ROOT.with(|cell| cell.set(raw));
+        gc.debug_check_consistency();
+        DEBUG_IMMORTAL_RAW_ROOT.with(|cell| cell.set(0));
+
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let young = gc.alloc_with_type(tid, 16);
+        let copy = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
+        unsafe { GcHeader::set_forwarding_address(header_of(young.0), copy.0) };
+        DEBUG_IMMORTAL_RAW_ROOT.with(|cell| cell.set(young.0));
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gc.debug_check_consistency();
+        }));
+        DEBUG_IMMORTAL_RAW_ROOT.with(|cell| cell.set(0));
+        let msg = panic_message(err.expect_err("a forwarding stub root must panic"));
+        assert!(msg.contains("debug_check_reachable: bad root"), "{msg}");
+        assert!(msg.contains("label=immortal_store_roots"), "{msg}");
+        assert!(msg.contains("forwarded"), "{msg}");
+
+        let old = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
+        unsafe { (*header_of(old.0)).set_flag(GcFlags::GCFLAG_VISITED_RMY) };
+        DEBUG_IMMORTAL_RAW_ROOT.with(|cell| cell.set(old.0));
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gc.debug_check_consistency();
+        }));
+        unsafe { (*header_of(old.0)).clear_flag(GcFlags::GCFLAG_VISITED_RMY) };
+        DEBUG_IMMORTAL_RAW_ROOT.with(|cell| cell.set(0));
+        let msg = panic_message(err.expect_err("a collector-owned root must still be checked"));
+        assert!(msg.contains("GCFLAG_VISITED_RMY"), "{msg}");
+
+        if crate::nursery::HAS_PROTECT {
+            let mut rotating = MiniMarkGC::with_config(GcConfig {
+                nursery_size: 4096,
+                large_object_threshold: 2048,
+                debug: 2,
+                gc_nursery_debug: true,
+                ..GcConfig::default()
+            });
+            let rot_tid = rotating.register_type(TypeInfo::simple(16));
+            let obj = rotating.alloc_with_type(rot_tid, 16);
+            let stale = obj.0;
+            let mut root = obj;
+            unsafe { rotating.roots.add(&mut root) };
+            rotating.do_collect_nursery();
+            rotating.roots.clear();
+            assert!(
+                rotating.nursery.contains_retired(stale),
+                "the collected arena must be the retired one"
+            );
+            DEBUG_IMMORTAL_RAW_ROOT.with(|cell| cell.set(stale));
+            let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rotating.debug_check_consistency();
+            }));
+            DEBUG_IMMORTAL_RAW_ROOT.with(|cell| cell.set(0));
+            let msg = panic_message(err.expect_err("a retired nursery root must panic"));
+            assert!(msg.contains("debug_check_reachable: bad root"), "{msg}");
+            assert!(msg.contains("label=immortal_store_roots"), "{msg}");
+            assert!(msg.contains(&format!("value={stale:#x}")), "{msg}");
+        }
+    }
+
+    /// A headerless digit block whose preceding allocator word reads as a
+    /// registered type id with no flags. The walk must not read that word as
+    /// a header, under the immortal-store label or any other: the block is
+    /// host storage, and tracing it would read the digit as a pointer.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn debug_check_does_not_guess_a_header_for_a_host_storage_root() {
+        let _guard = SHADOW_STACK_TEST_LOCK.lock();
+        let _clear = ClearImmortalRawRoot;
+        crate::shadow_stack::register_extra_root_walker(
+            walk_debug_immortal_raw_root,
+            "immortal_store_roots",
+        );
+
+        let mut gc = debug_gc(4096);
+        let ptr_size = std::mem::size_of::<usize>();
+        let _ = gc.register_type(TypeInfo::simple(ptr_size));
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let raw = host_block_like_prebuilt_digits(0x0de0_b6b3_a764_0000);
+        unsafe { (header_of(raw) as *mut GcHeader).write(GcHeader::new(tid)) };
+
+        DEBUG_IMMORTAL_RAW_ROOT.with(|cell| cell.set(raw));
+        gc.debug_check_consistency();
+        DEBUG_IMMORTAL_RAW_ROOT.with(|cell| cell.set(0));
+
+        let mut ordinary = GcRef(raw);
+        unsafe { gc.roots.add(&mut ordinary) };
+        gc.debug_check_consistency();
+        gc.roots.clear();
+    }
+
+    /// The same integer is invisible when the level is off: the body returns
+    /// before the walk, which is what keeps an unset `PYPY_GC_DEBUG` on the
+    /// ordinary path.
+    #[test]
+    fn debug_check_ignores_a_bad_child_when_the_level_is_off() {
+        let mut gc = test_gc(4096);
+        assert_eq!(gc.config.debug, 0);
+        let ptr_size = std::mem::size_of::<usize>();
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let holder = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        unsafe { *(holder.0 as *mut usize) = 0x0de0_b6b3_a764_0000 };
+        let mut root = holder;
+        unsafe { gc.roots.add(&mut root) };
+        gc.debug_check_consistency();
+        gc.roots.clear();
+    }
+
     /// No `#[cfg(debug_assertions)]`: `debug_check_consistency` self-gates on
     /// the debug level and asserts for real, so the check survives a release
     /// build — which is what makes `PYPY_GC_DEBUG` worth setting there.
@@ -14257,6 +15040,22 @@ mod tests {
 
         // What a holder that kept the pre-collection pointer does next.
         gc.remember_young_pointer(GcRef(stale));
+    }
+
+    /// `_remember_young_pointer_inlined`: a nursery object never enters
+    /// `old_objects_pointing_to_young`. A barrier that fires on one (a
+    /// flag byte read through a stale pointer) fails at the producer.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "remember_young_pointer on nursery object")]
+    fn remember_young_pointer_rejects_a_nursery_object() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(1 << 20);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+
+        let obj = gc.alloc_with_type(tid, ptr_size);
+        assert!(gc.is_in_nursery(obj.0));
+        gc.remember_young_pointer(obj);
     }
 
     #[test]
@@ -15411,7 +16210,7 @@ cache size\t: 8192 kB\n";
 
         let _guard = SHADOW_STACK_TEST_LOCK.lock();
         crate::shadow_stack::clear();
-        crate::shadow_stack::register_extra_root_walker(record);
+        crate::shadow_stack::register_extra_root_walker(record, "test_pin_walk");
         SEEN.with(|seen| seen.borrow_mut().clear());
 
         let mut gc = test_gc(4096);
@@ -15972,6 +16771,54 @@ cache size\t: 8192 kB\n";
         assert!(unsafe { !(*q_hdr).has_flag(GcFlags::GCFLAG_VISITED) });
 
         gc.roots.clear();
+    }
+
+    /// A young object registered with a finalizer survives the next minor even
+    /// when nothing reaches it, so a non-moving major that runs before that
+    /// minor must keep the old objects it names. Sweeping them left the
+    /// promoted object's fields pointing at freed memory, which its finalizer
+    /// then read (`_socket.socket.__del__` reading an unboxed `_fd` block).
+    #[test]
+    fn nonmoving_major_keeps_old_children_of_an_unreachable_young_finalizer() {
+        fn trigger() {}
+
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+
+        // q: an old-gen leaf named only by the young finalizer object.
+        let q = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        unsafe { *(q.0 as *mut GcRef) = GcRef(0) };
+        // f: unrooted nursery object with a registered finalizer.
+        let f = gc.alloc_with_type(tid, ptr_size);
+        assert!(gc.is_in_nursery(f.0));
+        unsafe { *(f.0 as *mut GcRef) = q };
+        GcAllocator::register_finalizer(&mut gc, 0, f, trigger);
+        assert_eq!(gc.oldgen.object_count(), 1);
+
+        gc.do_collect_oldgen_nonmoving();
+
+        assert_eq!(
+            gc.oldgen.object_count(),
+            1,
+            "the old child of a young finalizer object must survive"
+        );
+        assert!(gc.is_in_nursery(f.0), "nursery object must not move/free");
+        let f_hdr = unsafe { header_of(f.0) };
+        assert!(
+            unsafe { !(*f_hdr).has_flag(GcFlags::GCFLAG_VISITED) },
+            "no greyed nursery object retains VISITED"
+        );
+
+        // The next minor keeps f and it still names q.
+        gc.do_collect_nursery();
+        let f = gc
+            .old_objects_with_finalizers
+            .iter()
+            .map(|&(addr, _)| addr)
+            .next()
+            .expect("the minor moves the young finalizer to the old list");
+        assert_eq!(unsafe { *(f as *const GcRef) }, q);
     }
 
     /// An explicit non-moving collection must use roots observed at the call,

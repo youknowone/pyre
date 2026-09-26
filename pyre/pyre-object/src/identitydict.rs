@@ -161,21 +161,37 @@ pub unsafe fn w_dict_store_identity_strategy(
 /// `w_dict` must be a valid `W_DictObject` on [`IDENTITY_DICT_STRATEGY`].
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_dict_switch_identity_to_object_strategy(w_dict: PyObjectRef) {
-    let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-    // Borrow the old typed box (its field stays live, so it is traced
-    // while the migration builds the object map); after the store the
-    // box is unreachable and the sweep reclaims it.
-    let old = &*(dict.dstorage as *const IdentityDictStorage);
-    let mut new_map = crate::dictmultiobject::object_dict_storage_with_capacity(old.len());
-    for (k, &v) in old.iter() {
-        new_map.insert(crate::dictmultiobject::object_key_for(k.0), v);
+    // Rooted exactly as `w_dict_switch_int_to_object_strategy` is: the
+    // receiver moves, `object_key_for` hashes, and a pair copied into a
+    // stack-local map would be pre-move by the next key's hash.
+    let roots = crate::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    let w_dict = roots.pin_root(w_dict);
+    let old = &*((*(w_dict as *const crate::dictmultiobject::W_DictObject)).dstorage
+        as *const IdentityDictStorage);
+    let len = old.len();
+    let mut hashes = Vec::with_capacity(len);
+    let pairs_base = dict_slot + 1;
+    let mut next = 0;
+    while let Some(i) = old.next_valid_slot(next) {
+        let k = old.get_slot(i).unwrap().0.0;
+        let object_key = crate::dictmultiobject::object_key_for(k);
+        let v = *old.get_slot(i).unwrap().1;
+        hashes.push(object_key.hash);
+        roots.publish(&[object_key.obj, v]);
+        next = i + 1;
     }
-    dict.dstorage = crate::gc_storage::gc_alloc_storage_box(
-        new_map,
+    let new_storage = crate::gc_storage::gc_alloc_storage_box(
+        crate::dictmultiobject::object_dict_storage_with_capacity(len),
         crate::dictmultiobject::object_dict_storage_gc_type_id(),
-    ) as *mut u8;
-    dict.dstrategy = &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF;
-    crate::dictmultiobject::dict_write_barrier(w_dict);
+    );
+    let new_map = &mut *new_storage;
+    for (i, &hash) in hashes.iter().enumerate() {
+        let obj = roots.get(pairs_base + 2 * i);
+        let value = roots.get(pairs_base + 2 * i + 1);
+        new_map.insert(crate::dictmultiobject::ObjectKey { hash, obj }, value);
+    }
+    crate::dictmultiobject::install_object_dict_storage(roots.get(dict_slot), new_storage);
 }
 
 #[inline]
@@ -290,10 +306,11 @@ impl DictStrategy for IdentityDictStrategy {
     /// on mismatch, promote to Object.
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
         if Self::is_correct_type(w_key) {
+            crate::dictmultiobject::dict_write_barrier(w_dict);
             if w_dict_store_identity_strategy(w_dict, w_key, w_value) {
                 crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
             }
-            crate::dictmultiobject::dict_write_barrier(w_dict);
+
             return;
         }
         self.switch_to_object_strategy(w_dict);

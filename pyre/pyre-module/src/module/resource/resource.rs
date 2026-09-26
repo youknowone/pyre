@@ -5,10 +5,11 @@
 /// `lib_pypy/resource.py class struct_rusage(
 /// metaclass=structseqtype)` — process-wide cached subclass-of-tuple
 /// type.
-static STRUCT_RUSAGE_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static STRUCT_RUSAGE_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 fn struct_rusage_type() -> pyre_object::PyObjectRef {
-    *STRUCT_RUSAGE_TYPE.get_or_init(|| {
+    STRUCT_RUSAGE_TYPE.get_or_init(|| {
         pyre_interpreter::_structseq::make_struct_seq(
             "resource.struct_rusage",
             &[
@@ -29,8 +30,8 @@ fn struct_rusage_type() -> pyre_object::PyObjectRef {
                 "ru_nvcsw",
                 "ru_nivcsw",
             ],
-        ) as usize
-    }) as pyre_object::PyObjectRef
+        )
+    })
 }
 
 /// resource module — `lib_pypy/resource.py` (PyPy keeps it app-level

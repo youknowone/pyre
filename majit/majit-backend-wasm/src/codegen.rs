@@ -1083,6 +1083,18 @@ fn emit_sized_int_store(sink: &mut PeepSink<'_, '_>, offset: u64, size: usize) {
     };
 }
 
+/// A GCREF is a machine word. The rewriter's size immediate can still be
+/// 8 when a descr was built with host `sizeof(void*)`; an `i64` load/store
+/// would then fold the next field (or the GC header of the next object)
+/// into the pointer on wasm32.
+fn wasm_ref_access_size(is_ref: bool, size: usize) -> usize {
+    if is_ref {
+        std::mem::size_of::<usize>()
+    } else {
+        size
+    }
+}
+
 fn value_is_f64(value_types: &ValueLocals, val: OpRef) -> bool {
     if val.is_constant() {
         return val.ty() == Some(Type::Float);
@@ -7245,12 +7257,20 @@ fn build_function(
                 }
             }
 
+            // Same contract as `SetfieldGc` / `SetarrayitemGc`: a Ref
+            // interior store must have been rewritten to COND_CALL_GC_WB
+            // plus a raw store. Reaching here would write the pointer
+            // without the barrier.
+            OpCode::SetinteriorfieldGc => {
+                panic!(
+                    "wasm codegen: SetinteriorfieldGc must have been lowered by rewrite_ops_for_gc"
+                );
+            }
             // Pre-rewrite interior-field, string and raw-memory ops. The rewriter
             // consumes these; reaching codegen with one is a producer bug.
             OpCode::GetinteriorfieldGcI
             | OpCode::GetinteriorfieldGcR
             | OpCode::GetinteriorfieldGcF
-            | OpCode::SetinteriorfieldGc
             | OpCode::SetinteriorfieldRaw
             | OpCode::Strlen
             | OpCode::Unicodelen
@@ -7286,6 +7306,7 @@ fn build_function(
                     }
                     let offset = emit_gc_indexed_addr(&mut sink, constants, value_types, op, 2, 3)?;
                     let (size, signed) = gc_rewrite_access_size(op, constants, 4)?;
+                    let size = wasm_ref_access_size(op.opcode == OpCode::GcLoadIndexedR, size);
                     if op.opcode == OpCode::GcLoadIndexedF {
                         match size {
                             4 => {
@@ -7325,6 +7346,7 @@ fn build_function(
                         op.arg(1).to_opref(),
                     );
                     let (size, signed) = gc_rewrite_access_size(op, constants, 2)?;
+                    let size = wasm_ref_access_size(op.opcode == OpCode::GcLoadR, size);
                     if op.opcode == OpCode::GcLoadF {
                         match size {
                             4 => {
@@ -7362,6 +7384,7 @@ fn build_function(
                 );
                 let (size, _) = gc_rewrite_access_size(op, constants, 3)?;
                 let val = op.arg(2).to_opref();
+                let size = wasm_ref_access_size(val.ty() == Some(Type::Ref), size);
                 if size == 4 && value_is_f64(value_types, val) {
                     emit_resolve_f64(&mut sink, constants, value_types, val);
                     emit_float_store(&mut sink, offset, size)?;
@@ -7381,6 +7404,7 @@ fn build_function(
                 let offset = emit_gc_indexed_addr(&mut sink, constants, value_types, op, 3, 4)?;
                 let (size, _) = gc_rewrite_access_size(op, constants, 5)?;
                 let val = op.arg(2).to_opref();
+                let size = wasm_ref_access_size(val.ty() == Some(Type::Ref), size);
                 if size == 4 && value_is_f64(value_types, val) {
                     emit_resolve_f64(&mut sink, constants, value_types, val);
                     emit_float_store(&mut sink, offset, size)?;
