@@ -1522,3 +1522,149 @@ fn a_borrowed_primitive_banks_by_its_container() {
         "a struct's `&u8` field is a pointer the program stores and compares",
     );
 }
+
+/// `stored` is `new_arg`, or a block input that a link feeds with `new_arg`
+/// (one hop is what the slice replace splits into).
+fn operand_is_new_argument(
+    graph: &majit_translate::model::FunctionGraph,
+    new_arg: &majit_translate::flowspace::model::Variable,
+    stored: &majit_translate::flowspace::model::Variable,
+) -> bool {
+    if stored == new_arg {
+        return true;
+    }
+    graph.blocks.iter().any(|block| {
+        block.exits.iter().any(|link| {
+            let target = graph.block(link.target);
+            link.args
+                .iter()
+                .zip(target.inputargs.iter())
+                .any(|(arg, input)| arg.as_variable() == Some(new_arg) && input == stored)
+        })
+    })
+}
+
+/// `mem::replace(&mut place, new)` is a read of `place` then a store of `new`.
+/// The read's variable is what the function returns; the store's value is the
+/// new argument.
+#[test]
+fn mem_replace_field_and_slice_element_read_then_store() {
+    use majit_translate::model::OpKind;
+    let llbc = load_corpus();
+
+    let assert_exchange = |name: &str, read_is_field: bool| {
+        let graph = lower_function(llbc, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut read_at = None;
+        let mut write_at = None;
+        let mut read_result = None;
+        let mut write_value = None;
+        let mut replace_calls = 0usize;
+        let mut step = 0usize;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::FieldRead { .. } if read_is_field => {
+                        read_at = Some(step);
+                        read_result = op.result.clone();
+                    }
+                    OpKind::ArrayRead { .. } if !read_is_field => {
+                        read_at = Some(step);
+                        read_result = op.result.clone();
+                    }
+                    OpKind::FieldWrite { value, .. } if read_is_field => {
+                        write_at = Some(step);
+                        write_value = Some(value.clone());
+                    }
+                    OpKind::ArrayWrite { value, .. } if !read_is_field => {
+                        write_at = Some(step);
+                        write_value = Some(value.clone());
+                    }
+                    OpKind::Call { target, .. } => {
+                        if format!("{target:?}").contains("replace") {
+                            replace_calls += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                step += 1;
+            }
+        }
+        assert_eq!(replace_calls, 0, "{name} still calls mem::replace");
+        let kinds: Vec<String> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .map(|op| format!("{:?}", op.kind).chars().take(80).collect())
+            .collect();
+        let read_at = read_at.unwrap_or_else(|| panic!("{name} no read: {kinds:?}"));
+        let write_at = write_at.unwrap_or_else(|| panic!("{name} no store: {kinds:?}"));
+        assert!(
+            read_at < write_at,
+            "{name} store at {write_at} precedes read at {read_at}: {kinds:?}"
+        );
+        let read_result = read_result.unwrap_or_else(|| panic!("{name} no read: {kinds:?}"));
+        let write_value = write_value.unwrap_or_else(|| panic!("{name} no store: {kinds:?}"));
+        // `new` is the last parameter. A later block may take it as its own
+        // input; the store must be that parameter, not some other operand.
+        let new_arg = graph
+            .block(graph.startblock)
+            .inputargs
+            .last()
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} has no new argument"));
+        let stored = write_value
+            .as_variable()
+            .unwrap_or_else(|| panic!("{name} store is not a variable: {kinds:?}"));
+        assert!(
+            operand_is_new_argument(&graph, &new_arg, stored),
+            "{name} store operand is not the new argument: {kinds:?}"
+        );
+        assert_ne!(
+            write_value.as_variable(),
+            Some(&read_result),
+            "{name} stores the old value back"
+        );
+        let returned = graph.blocks.iter().flat_map(|b| &b.exits).any(|link| {
+            link.target == graph.returnblock
+                && link
+                    .args
+                    .iter()
+                    .any(|arg| arg.as_variable() == Some(&read_result))
+        });
+        assert!(returned, "{name} does not return the old value");
+    };
+
+    assert_exchange("replace_field", true);
+    assert_exchange("replace_elem", false);
+}
+
+/// `let r = &mut slot; mem::replace(&mut *r, new); *r` returns `new`.
+/// The reborrow's read follows the local the replace wrote.
+#[test]
+fn mem_replace_reborrow_then_read_returns_new() {
+    let llbc = load_corpus();
+    let graph =
+        lower_function(llbc, "replace_reborrow_then_read").unwrap_or_else(|e| panic!("{e}"));
+    let new_arg = graph
+        .block(graph.startblock)
+        .inputargs
+        .last()
+        .cloned()
+        .expect("new argument");
+    let returned = graph.blocks.iter().flat_map(|b| &b.exits).any(|link| {
+        link.target == graph.returnblock
+            && link
+                .args
+                .iter()
+                .any(|arg| arg.as_variable() == Some(&new_arg))
+    });
+    let kinds: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .map(|op| format!("{:?}", op.kind).chars().take(80).collect())
+        .collect();
+    assert!(returned, "reborrow read did not return new: {kinds:?}");
+    let replace_calls = kinds.iter().filter(|k| k.contains("replace")).count();
+    assert_eq!(replace_calls, 0, "still calls mem::replace: {kinds:?}");
+}

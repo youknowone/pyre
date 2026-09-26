@@ -1297,6 +1297,15 @@ impl MIFrame {
                     callee.ref_values[i] = self.ref_values[index];
                 }
                 b'F' => {
+                    if i >= callee.float_regs.len() || index >= self.float_regs.len() {
+                        panic!(
+                            "fill_registers: float arg {i} of {} into {} (callee float regs {}, caller float regs {}, caller index {index})",
+                            self.jitcode.name(),
+                            callee.jitcode.name(),
+                            callee.float_regs.len(),
+                            self.float_regs.len(),
+                        );
+                    }
                     callee.float_regs[i] = self.float_regs[index];
                     callee.float_values[i] = self.float_values[index];
                 }

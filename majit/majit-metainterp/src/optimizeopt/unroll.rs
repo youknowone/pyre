@@ -465,6 +465,9 @@ pub struct UnrollOptimizer {
     /// originals and would otherwise read a stale pre-move gcref. Prepended to
     /// each phase's slot list rather than overwritten.
     pub persistent_snapshot_root_slots: Vec<usize>,
+    /// `compile.py` `enable_opts` handed to `build_opt_chain` for each phase
+    /// optimizer. Defaults to `ENABLE_ALL_OPTS`.
+    pub enable_opts: Vec<String>,
 }
 
 /// Withdraws the address `publish_short_preamble_producer` installed in
@@ -627,7 +630,19 @@ impl UnrollOptimizer {
             compile_resume_memos_slot: None,
             compile_short_preamble_producer_slot: None,
             persistent_snapshot_root_slots: Vec::new(),
+            enable_opts: crate::optimizeopt::optimizer::ENABLE_ALL_OPTS
+                .split(':')
+                .filter(|name| !name.is_empty())
+                .map(String::from)
+                .collect(),
         }
+    }
+
+    fn phase_optimizer(
+        &self,
+        vable: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
+    ) -> crate::optimizeopt::optimizer::Optimizer {
+        crate::optimizeopt::optimizer::Optimizer::build_opt_chain(&self.enable_opts, vable)
     }
 
     fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usize> {
@@ -916,14 +931,7 @@ impl UnrollOptimizer {
             // ── Phase 1: PreambleCompileData.optimize() ──
             // ── Phase 1: optimize_preamble (compile.py:275-276) ──
             let mut consts_p1 = constants.clone();
-            let mut opt_p1 = match vable_config.as_ref() {
-                Some(c) => {
-                    crate::optimizeopt::optimizer::Optimizer::default_pipeline_with_virtualizable(
-                        c.clone(),
-                    )
-                }
-                None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
-            };
+            let mut opt_p1 = self.phase_optimizer(vable_config.clone());
             self.register_resume_memo(&opt_p1);
             opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
             opt_p1.callinfocollection = self.callinfocollection.clone();
@@ -1231,14 +1239,7 @@ impl UnrollOptimizer {
         // the same isolation.
         let mut consts_p2 = consts_p1.clone();
 
-        let mut opt_p2 = match vable_config.as_ref() {
-            Some(c) => {
-                crate::optimizeopt::optimizer::Optimizer::default_pipeline_with_virtualizable(
-                    c.clone(),
-                )
-            }
-            None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
-        };
+        let mut opt_p2 = self.phase_optimizer(vable_config.clone());
         // Bound after `opt_p2` so it drops first and withdraws the published
         // address while the optimizer it names is still alive.
         let _published_short_preamble_producer = self.publish_short_preamble_producer(&mut opt_p2);
@@ -4133,6 +4134,18 @@ impl OptUnroll {
                         );
                     }
                 }
+                // The assembled LABEL's extra tail is `used_boxes` with
+                // constants removed. An extended builder records a short
+                // jump arg that tail never carried, and the bridge JUMP
+                // is then one arg longer than the stored LABEL.
+                let prefix = extra.len().min(sp.used_boxes.len());
+                let mut kept = Vec::with_capacity(prefix);
+                for i in 0..prefix {
+                    if short_extra_is_carried(sp.used_boxes[i]) {
+                        kept.push(extra[i]);
+                    }
+                }
+                extra = kept;
             }
 
             // A short-preamble replay that hit an unresolvable Phase 1 arg or
@@ -5470,7 +5483,7 @@ fn assemble_peeled_trace_with_jump_args(
     // HeapField result that still has optimizer constant knowledge attached).
     for (idx, &label_arg) in extra_label_args.iter().enumerate() {
         let jump_arg = extra_jump_args.get(idx).copied().unwrap_or(label_arg);
-        if label_arg.is_constant() {
+        if !short_extra_is_carried(label_arg) {
             continue;
         }
         filtered_extra_label_args.push(label_arg);
@@ -6608,6 +6621,14 @@ impl Optimization for OptUnroll {
     fn name(&self) -> &'static str {
         "unroll"
     }
+}
+
+/// A literal Const short-preamble extra is not a LABEL or JUMP slot.
+/// The loop assembler and the bridge close both consult this, so a
+/// constant virtualizable field cannot make the bridge JUMP one arg
+/// longer than the loop LABEL.
+fn short_extra_is_carried(arg: OpRef) -> bool {
+    !arg.is_constant()
 }
 
 #[cfg(test)]
@@ -9774,6 +9795,50 @@ mod tests {
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
             &[OpRef::int_op(10), OpRef::int_op(8)]
+        );
+    }
+
+    #[test]
+    fn loop_label_and_bridge_jump_drop_the_same_constant_extra() {
+        let extras = [
+            OpRef::const_int(16),
+            OpRef::int_op(8),
+            OpRef::const_int(0),
+            OpRef::int_op(9),
+        ];
+        let base = [OpRef::int_op(10)];
+        let p2_ops = vec![Op::new(
+            OpCode::Jump,
+            &[rooted_resop_operand(Type::Int, 10)],
+        )];
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let combined = assemble_peeled_trace(
+            &[],
+            &p2_ops,
+            &base,
+            &[OpRef::int_op(0)],
+            &extras,
+            1,
+            true,
+            &[],
+            &constants,
+            None,
+            None,
+        );
+        let label_args: Vec<_> = combined[0]
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        let mut jump_args = base.to_vec();
+        jump_args.extend(
+            extras
+                .into_iter()
+                .filter(|arg| short_extra_is_carried(*arg)),
+        );
+        assert_eq!(
+            jump_args, label_args,
+            "a bridge JUMP and its loop LABEL carry the same boxes"
         );
     }
 

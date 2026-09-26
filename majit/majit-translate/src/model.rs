@@ -668,11 +668,30 @@ pub struct FieldDescriptor {
     /// Excluded from `PartialEq` / `Hash` for the same reason as
     /// `owner_id` and `base_is_deref`.
     pub taken_by_address: bool,
+    /// The field's layout spelling is an inline `Vec<T>` (three words), not
+    /// a pointer to one. Set on the field read the front emits for the
+    /// projection; `vec_part` then selects the buffer pointer or the length.
+    /// Excluded from equality: it describes the access, and the part below
+    /// is what makes two reads of one field distinct.
+    pub inline_vec: bool,
+    /// Which word of an inline `Vec<T>` this read loads. `None` is the
+    /// field's own value. `Buf` / `Len` add the measured offset of that
+    /// word (`vec_layout::probe`) on top of the field's offset.
+    pub vec_part: Option<VecFieldPart>,
+}
+
+/// A word of `alloc::vec::Vec<T>`: the buffer pointer or the length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VecFieldPart {
+    Buf,
+    Len,
 }
 
 impl PartialEq for FieldDescriptor {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name && self.owner_root == other.owner_root
+        self.name == other.name
+            && self.owner_root == other.owner_root
+            && self.vec_part == other.vec_part
     }
 }
 
@@ -682,6 +701,7 @@ impl std::hash::Hash for FieldDescriptor {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.name.hash(state);
         self.owner_root.hash(state);
+        self.vec_part.hash(state);
     }
 }
 
@@ -693,6 +713,8 @@ impl FieldDescriptor {
             owner_id: None,
             base_is_deref: None,
             taken_by_address: false,
+            inline_vec: false,
+            vec_part: None,
         }
     }
 
@@ -718,6 +740,20 @@ impl FieldDescriptor {
     /// Builder-style setter for [`Self::taken_by_address`].
     pub fn with_taken_by_address(mut self, taken_by_address: bool) -> Self {
         self.taken_by_address = taken_by_address;
+        self
+    }
+
+    pub fn with_inline_vec(mut self, inline_vec: bool) -> Self {
+        self.inline_vec = inline_vec;
+        self
+    }
+
+    /// Load one measured word of this `Vec` field. Clears the address mark:
+    /// the result is the word's value, not the address of the three-word
+    /// aggregate.
+    pub fn with_vec_part(mut self, part: VecFieldPart) -> Self {
+        self.vec_part = Some(part);
+        self.taken_by_address = false;
         self
     }
 
@@ -9129,6 +9165,8 @@ mod tests {
                         owner_id: None,
                         base_is_deref: None,
                         taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
                     },
                     value: LinkArg::Value(v),
                     ty: ValueType::Ref(None),
@@ -9186,6 +9224,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(b0),
                 ty: ValueType::Ref(None),
@@ -9238,6 +9278,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(value),
                 ty: ValueType::Int,
@@ -9332,6 +9374,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::from(ConstValue::Int(7)),
                 ty: ValueType::Int,
@@ -9845,6 +9889,8 @@ mod tests {
                 owner_id: None,
                 base_is_deref: None,
                 taken_by_address: false,
+                inline_vec: false,
+                vec_part: None,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -9935,6 +9981,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(header),
                 ty: ValueType::Ref(None),
@@ -9951,6 +9999,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(v.clone()),
                 ty: ValueType::Ref(None),
@@ -10110,6 +10160,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(header),
                 ty: ValueType::Ref(None),
@@ -10126,6 +10178,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(v.clone()),
                 ty: ValueType::Ref(None),
@@ -10254,6 +10308,8 @@ mod tests {
                         owner_id: None,
                         base_is_deref: None,
                         taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
                     },
                     value: LinkArg::Value(header),
                     ty: ValueType::Ref(None),
@@ -10270,6 +10326,8 @@ mod tests {
                         owner_id: None,
                         base_is_deref: None,
                         taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
                     },
                     value: LinkArg::Value(v),
                     ty: ValueType::Ref(None),
@@ -10389,6 +10447,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(header),
                 ty: ValueType::Ref(None),
@@ -10405,6 +10465,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(v),
                 ty: ValueType::Ref(None),
@@ -10480,6 +10542,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(header),
                 ty: ValueType::Ref(None),
@@ -10497,6 +10561,8 @@ mod tests {
                         owner_id: None,
                         base_is_deref: None,
                         taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
                     },
                     value: LinkArg::Value(v),
                     ty: ValueType::Ref(None),
@@ -10659,6 +10725,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Ref(None),
@@ -10860,6 +10928,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Ref(None),
@@ -11128,6 +11198,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Ref(None),
@@ -11389,6 +11461,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Ref(None),
@@ -11576,6 +11650,8 @@ mod tests {
                 owner_id: None,
                 base_is_deref: None,
                 taken_by_address: false,
+                inline_vec: false,
+                vec_part: None,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -11777,6 +11853,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value,
                 ty,
@@ -11946,6 +12024,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Ref(None),
@@ -12175,6 +12255,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Ref(None),
@@ -12405,6 +12487,8 @@ mod tests {
                 owner_id: None,
                 base_is_deref: None,
                 taken_by_address: false,
+                inline_vec: false,
+                vec_part: None,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -12483,6 +12567,8 @@ mod tests {
                 owner_id: None,
                 base_is_deref: None,
                 taken_by_address: false,
+                inline_vec: false,
+                vec_part: None,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -12663,6 +12749,8 @@ mod tests {
                 owner_id: None,
                 base_is_deref: None,
                 taken_by_address: false,
+                inline_vec: false,
+                vec_part: None,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -13475,6 +13563,8 @@ mod tests {
                     owner_id: None,
                     base_is_deref: None,
                     taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Float,

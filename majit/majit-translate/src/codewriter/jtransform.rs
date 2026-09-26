@@ -4534,6 +4534,15 @@ impl<'a> Transformer<'a> {
         // class constant; pyre's receivers here are SSA variables (a prebuilt
         // constant reaches a field read through `ConstRef`, not as an
         // operand), so that arm has no input and is not spelled.
+        // A `Vec` buffer word loaded from a declared virtualizable array is
+        // the array pointer. `deref` aliases that pointer onto this base, so
+        // the getfield would be a use of the array. Keep the array op.
+        if field.vec_part == Some(crate::model::VecFieldPart::Buf)
+            && let OpKind::FieldRead { base, .. } = &op.kind
+            && self.vable_array_vars.contains_key(base)
+        {
+            return RewriteResult::Identity(base.clone());
+        }
         if let OpKind::FieldRead { base, .. } = &op.kind
             && is_typeptr_field(field)
         {
@@ -4786,6 +4795,20 @@ impl<'a> Transformer<'a> {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
                 detail: format!("rewrite: setfield({}) → dropped", field.name),
+            });
+            return RewriteResult::Replace(Vec::new());
+        }
+        // `jtransform.py rewrite_op_setfield`: `if RESULT is lltype.Void: return`.
+        // A unit payload has no register; emitting the store sends it to
+        // the assembler with no coloring.
+        let value_is_void = match value {
+            crate::model::LinkArg::Value(var) => self.get_value_kind_var(var) == 'v',
+            crate::model::LinkArg::Const(c) => crate::flatten::constant_kind(c) == 'v',
+        };
+        if value_is_void {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!("rewrite: setfield({}) → dropped (void)", field.name),
             });
             return RewriteResult::Replace(Vec::new());
         }
@@ -8678,6 +8701,16 @@ impl<'a> Transformer<'a> {
             .map(|(var, _)| var)
             .unwrap_or(funcptr)
             .clone();
+        // `rewrite_call` / `make_three_lists` drop `getkind == 'void'` for
+        // direct and indirect calls. The family's declared `FUNC.ARGS`
+        // is that same list, so a void slot the callee's jitcode does
+        // not take is absent from the calldescr and from `args_*`.
+        let filtered_args = self
+            .callcontrol
+            .as_deref()
+            .map(|cc| cc.non_void_actual_args_for_graphs(graphs, args))
+            .unwrap_or_else(|| args.to_vec());
+        let args = filtered_args.as_slice();
         let (args_i, args_r, args_f) = self.rewrite_call_three_lists(args, graph_name);
         let resolved_result = self.resolve_call_result(op.result.as_ref(), result_ty);
         let result_kind = resolved_result.kind;
@@ -10923,6 +10956,134 @@ mod tests {
         assert_eq!(
             getsubstruct_offset_for_access(&address, || Some(0)),
             Some(0)
+        );
+    }
+
+    /// Moving a multi-variant enum out of a slice slot is a load and a store
+    /// of the GC reference the codewriter already carries for that value.
+    /// The address of the word-sized cell is not an interior substructure, so
+    /// the lowered graph has no abort.
+    #[test]
+    fn moving_enum_out_of_slice_slot_has_no_abort() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::{FieldDescriptor, LinkArg};
+
+        let owner = "jtransform_enum_slot::Slice";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        let word = crate::layout::target_word_size();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 24,
+                align: word,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "cell".to_string(),
+                        offset: 8,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "inline_word".to_string(),
+                        offset: 16,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Struct,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                ],
+            },
+        );
+
+        let cell_field =
+            FieldDescriptor::new("cell", Some(owner.into())).with_taken_by_address(true);
+        assert_eq!(
+            crate::assembler::inline_substruct_field_offset(&cc, &cell_field),
+            None,
+            "a pointer-sized Ref cell is a load, not an interior address"
+        );
+        let inline_word =
+            FieldDescriptor::new("inline_word", Some(owner.into())).with_taken_by_address(true);
+        assert_eq!(
+            crate::assembler::inline_substruct_field_offset(&cc, &inline_word),
+            Some(16),
+            "a word-sized inline struct stays an interior address"
+        );
+
+        let mut graph = FunctionGraph::new("move_enum_from_slice");
+        let slice = graph.alloc_value_var();
+        let index = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, slice.clone());
+        graph.push_inputarg_var(graph.startblock, index.clone());
+        let loaded = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base: slice.clone(),
+                    index: index.clone(),
+                    item_ty: ValueType::Ref(None),
+                    array_type_id: Some("enum_slice".into()),
+                    nolength: true,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("array read");
+        let empty = graph
+            .push_op_var(graph.startblock, OpKind::ConstRefNull, true)
+            .expect("null");
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayWrite {
+                base: slice,
+                index,
+                value: LinkArg::Value(empty),
+                item_ty: ValueType::Ref(None),
+                array_type_id: Some("enum_slice".into()),
+                nolength: true,
+            },
+            false,
+        );
+        let cell = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: loaded,
+                    field: cell_field,
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .expect("cell");
+        graph.set_return(graph.startblock, Some(cell));
+
+        let result = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let aborting = result.graph.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::Abort { .. }))
+        });
+        assert!(
+            !aborting,
+            "moving the enum ref must not emit an abort: {:?}",
+            result
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .map(|op| op.kind.clone())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -14920,6 +15081,7 @@ mod tests {
             sid,
             crate::call::StructLayout {
                 size: 12,
+                align: 4,
                 fields: vec![],
             },
         );
@@ -19729,6 +19891,116 @@ mod tests {
             .unwrap();
         graph.set_return(graph.startblock, None);
         graph
+    }
+
+    /// An indirect family whose first parameter is void
+    /// (`map_by_fn_name_token::call`'s ZST receiver) and whose caller
+    /// still passes that slot as a ref. The calldescr and `args_r`
+    /// both drop it, matching the callee's non-void inputs.
+    #[test]
+    fn indirect_family_drops_void_receiver_with_the_callee() {
+        use crate::call::CallControl;
+
+        let mut callee = FunctionGraph::new("Token::call");
+        callee
+            .push_op_var(
+                callee.startblock,
+                OpKind::Input {
+                    name: "self".into(),
+                    ty: ValueType::Void,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        callee
+            .push_op_var(
+                callee.startblock,
+                OpKind::Input {
+                    name: "a".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        callee
+            .push_op_var(
+                callee.startblock,
+                OpKind::Input {
+                    name: "b".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        callee.set_return(callee.startblock, None);
+
+        let mut cc = CallControl::new();
+        cc.register_trait_method("call", Some("MapByName"), "Token", callee);
+        let family = cc.all_impls_for_indirect("MapByName", "call");
+        assert_eq!(family.len(), 1);
+
+        let mut graph = FunctionGraph::new("caller");
+        let bb = graph.startblock;
+        let funcptr = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let args: Vec<_> = (0..3)
+            .map(|_| graph.alloc_value_var_with_type(ConcreteType::GcRef))
+            .collect();
+        graph.block_mut(bb).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::IndirectCall {
+                funcptr,
+                args,
+                graphs: Some(family),
+                family_key: Some(("MapByName".into(), "call".into())),
+                result_ty: ValueType::Void,
+            },
+        });
+        graph.set_return(bb, None);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let result = transformer.transform(&graph);
+        let args_r_len = result
+            .graph
+            .block(bb)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual { args_r, .. } => Some(args_r.len()),
+                _ => None,
+            })
+            .expect("indirect call lowered to a residual");
+        assert_eq!(args_r_len, 2);
+    }
+
+    /// `rewrite_op_setfield` drops a void value (`RESULT is lltype.Void`),
+    /// so a unit payload never reaches the assembler uncolored.
+    #[test]
+    fn setfield_of_void_unit_payload_is_dropped() {
+        let mut graph = FunctionGraph::new("apply_assign_fast");
+        let bb = graph.startblock;
+        let base = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let unit = graph.alloc_value_var_with_type(ConcreteType::Void);
+        graph.block_mut(bb).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base,
+                field: crate::model::FieldDescriptor::new("payload", None),
+                value: LinkArg::Value(unit),
+                ty: ValueType::Ref(None),
+            },
+        });
+        graph.set_return(bb, None);
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert!(transformed.graph.blocks.iter().all(|block| {
+            block
+                .operations
+                .iter()
+                .all(|op| !matches!(op.kind, OpKind::FieldWrite { .. }))
+        }));
     }
 
     /// Build a graph that calls `receiver.run()` on a `dyn Handler`

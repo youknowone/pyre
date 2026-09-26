@@ -440,7 +440,11 @@ impl AssemblerExt for Assembler {
                 .unwrap_or_else(|| panic!("undefined TLabel {label:?} at fixup {fixup_pos}"));
             let target_u16 = target as u16;
             // RPython `assembler.py assert 0 <= target <= 0xFFFF`.
-            assert!(target <= 0xFFFF, "label target {target} exceeds u16 range");
+            assert!(
+                target <= 0xFFFF,
+                "label target {target} exceeds u16 range in {}",
+                self.current_graph_name.as_deref().unwrap_or("?")
+            );
             // RPython `assembler.py:252-253 assert self.code[pos] == "temp 1"`
             // — the fixup must point to two reserved placeholder
             // bytes still in range.
@@ -1844,6 +1848,16 @@ impl AssemblerEncode for Assembler {
                 field,
                 ty,
             } => {
+                // `rewrite_op_setfield` drops a void value. A unit payload
+                // that still reaches here has no coloring; emit nothing.
+                if let crate::model::LinkArg::Value(var) = value
+                    && crate::model::FunctionGraph::concretetype_of(var)
+                        == crate::model::ConcreteType::Void
+                {
+                    state.code.pop();
+                    state.startpoints.shift_remove(&startposition);
+                    return;
+                }
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 assert!(
                     kc == 'r' || kc == 'i',
@@ -2632,6 +2646,11 @@ impl AssemblerEncode for Assembler {
             other => {
                 let mut operand_kinds = String::new();
                 for v in crate::inline::op_variable_refs(other) {
+                    if crate::model::FunctionGraph::concretetype_of(&v)
+                        == crate::model::ConcreteType::Void
+                    {
+                        continue;
+                    }
                     let (reg, kind_char) = self.lookup_reg_with_kind_var(&v, regallocs);
                     state.code.push(reg);
                     argcodes.push(kind_char);
@@ -3614,12 +3633,13 @@ fn type_flag_from_str(
             || s.starts_with("Box<")
             || s.starts_with("Arc<")
             || s.starts_with("Rc<")
-            || s.starts_with("Vec<")
             || s.starts_with("Option<")
             || s == "String" =>
         {
             (ArrayFlag::Pointer, majit_ir::value::Type::Ref, word)
         }
+        // `{cap, ptr, len}` inline. Same arm as `get_type_flag`.
+        s if s.starts_with("Vec<") => (ArrayFlag::Struct, majit_ir::value::Type::Ref, 3 * word),
         "f64" => (ArrayFlag::Float, majit_ir::value::Type::Float, 8),
         "f32" => (ArrayFlag::Float, majit_ir::value::Type::Float, 4),
         "i64" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 8),
@@ -4353,7 +4373,7 @@ fn fielddescrof(
     // census downstream inherits that.
     let mut index_in_parent: Option<usize> = None;
     let mut parent = None;
-    let field_key = if let Some(owner) = field.owner_root.as_deref() {
+    let mut field_key = if let Some(owner) = field.owner_root.as_deref() {
         let prefix = format!("{owner}.");
         field
             .name
@@ -4451,7 +4471,6 @@ fn fielddescrof(
                 }
             }
         }
-
         if let Some(rank) = cc.field_immutability(Some(owner), &field_key) {
             is_immutable = rank.is_immutable();
             is_quasi_immutable = rank.is_quasi_immutable();
@@ -4531,6 +4550,35 @@ fn fielddescrof(
             .or_else(|| unique_slot_at_offset(&parent_spec.all_fielddescrs, offset))
     {
         majit_ir::descr::census_attached_index(pos, index_in_parent);
+    }
+    // `rlist.py` `ll_getitem_fast` is `l.ll_items()[index]` and `ll_length`
+    // is `l.length`. A Rust `Vec<T>` is those two words inside the value.
+    // The field offset above is the value; the component offset is measured
+    // in `vec_layout::probe` because Charon's `Vec` decl has no layout.
+    // Applied after the slot census so the parent slot stays the field's.
+    if let Some(part) = field.vec_part {
+        let layout = crate::vec_layout::probe();
+        let word = crate::layout::target_word_size();
+        let add = match part {
+            crate::model::VecFieldPart::Buf => layout.ptr_offset,
+            crate::model::VecFieldPart::Len => layout.len_offset,
+        };
+        offset = offset.saturating_add(add);
+        field_size = word;
+        match part {
+            crate::model::VecFieldPart::Buf => {
+                field_type = majit_ir::value::Type::Ref;
+                field_flag = majit_ir::descr::ArrayFlag::Pointer;
+                is_field_signed = false;
+                field_key = format!("{field_key}.buf");
+            }
+            crate::model::VecFieldPart::Len => {
+                field_type = majit_ir::value::Type::Int;
+                field_flag = majit_ir::descr::ArrayFlag::Unsigned;
+                is_field_signed = false;
+                field_key = format!("{field_key}.len");
+            }
+        }
     }
     crate::jitcode::BhDescr::Field {
         offset,
@@ -5175,6 +5223,134 @@ mod tests {
     use crate::flowspace::model::{ConstValue, HostObject};
     use crate::regalloc;
 
+    /// Index and len of an inline `Vec<u8>` / `Vec<i64>` field are
+    /// `getfield` of the measured buffer pointer or length word, then a
+    /// headerless array op. `[u8]` stays length-prefixed; the Vec identity
+    /// does not.
+    #[test]
+    fn vec_field_index_and_len_use_buf_and_len_words() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::{FieldDescriptor, ValueType, VecFieldPart};
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let layout = crate::vec_layout::probe();
+        let word = crate::layout::target_word_size();
+        assert_ne!(layout.ptr_offset, layout.len_offset);
+        assert_ne!(layout.ptr_offset, layout.cap_offset);
+        assert!(layout.ptr_offset < 3 * word);
+        assert!(layout.len_offset < 3 * word);
+
+        let owner = "vec_component_layout::Holder";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 6 * word,
+                align: word,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "bytes".into(),
+                        offset: 0,
+                        size: 3 * word,
+                        flag: ArrayFlag::Struct,
+                        field_type: Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "words".into(),
+                        offset: 3 * word,
+                        size: 3 * word,
+                        flag: ArrayFlag::Struct,
+                        field_type: Type::Ref,
+                        rank: None,
+                    },
+                ],
+            },
+        );
+
+        let check = |field: &str, field_off: usize, part: VecFieldPart, id: &str, item: usize| {
+            let descr = fielddescrof(
+                &FieldDescriptor::new(field, Some(owner.into()))
+                    .with_owner_id(Some(owner_id))
+                    .with_vec_part(part),
+                &match part {
+                    VecFieldPart::Buf => ValueType::Ref(None),
+                    VecFieldPart::Len => ValueType::Int,
+                },
+                Some(&cc),
+            );
+            let (offset, size, flag, name) = match descr {
+                crate::jitcode::BhDescr::Field {
+                    offset,
+                    field_size,
+                    field_flag,
+                    name,
+                    ..
+                } => (offset, field_size, field_flag, name),
+                other => panic!("expected field descr, got {other:?}"),
+            };
+            let add = match part {
+                VecFieldPart::Buf => layout.ptr_offset,
+                VecFieldPart::Len => layout.len_offset,
+            };
+            assert_eq!(offset, field_off + add, "{field} {part:?}");
+            assert_eq!(size, word);
+            let expect_flag = match part {
+                VecFieldPart::Buf => ArrayFlag::Pointer,
+                VecFieldPart::Len => ArrayFlag::Unsigned,
+            };
+            assert_eq!(flag, expect_flag);
+            assert!(name.ends_with(match part {
+                VecFieldPart::Buf => ".buf",
+                VecFieldPart::Len => ".len",
+            }));
+            if part == VecFieldPart::Buf {
+                assert!(crate::front::typestr::nolength_from_array_type_id(Some(id)));
+                let array = arraydescrof(&ValueType::Int, &Some(id.to_string()), None, Some(&cc));
+                match array {
+                    crate::jitcode::BhDescr::Array {
+                        base_size,
+                        itemsize,
+                        len_offset,
+                        ..
+                    } => {
+                        assert_eq!(base_size, 0, "{id} buffer has no length header");
+                        assert_eq!(itemsize, item, "{id}");
+                        assert_eq!(len_offset, None);
+                    }
+                    other => panic!("expected array descr, got {other:?}"),
+                }
+            }
+        };
+        check("bytes", 0, VecFieldPart::Buf, "Vec<u8>", 1);
+        check("bytes", 0, VecFieldPart::Len, "Vec<u8>", 1);
+        check("words", 3 * word, VecFieldPart::Buf, "Vec<i64>", word);
+        check("words", 3 * word, VecFieldPart::Len, "Vec<i64>", word);
+        // A pointer to the Vec (Box<Vec<_>> after the box load) adds nothing
+        // but the component offset.
+        let boxed = fielddescrof(
+            &FieldDescriptor::new("buf", Some("alloc::vec::Vec".into()))
+                .with_vec_part(VecFieldPart::Buf),
+            &ValueType::Ref(None),
+            Some(&cc),
+        );
+        match boxed {
+            crate::jitcode::BhDescr::Field {
+                offset, field_size, ..
+            } => {
+                assert_eq!(offset, layout.ptr_offset);
+                assert_eq!(field_size, word);
+            }
+            other => panic!("expected field descr, got {other:?}"),
+        }
+    }
+
     #[test]
     fn surviving_ref_identity_uses_rpython_ptr_eq_opname() {
         let lhs = crate::flowspace::model::Variable::new();
@@ -5377,6 +5553,7 @@ mod tests {
             owner_id,
             StructLayout {
                 size: 16,
+                align: 8,
                 fields: vec![
                     StructFieldLayout {
                         name: "visible_zero".to_string(),
@@ -5463,6 +5640,7 @@ mod tests {
             owner_id,
             StructLayout {
                 size: 8,
+                align: 8,
                 fields: vec![StructFieldLayout {
                     name: "visible_zero".to_string(),
                     offset: 0,
@@ -5913,6 +6091,28 @@ mod tests {
         assert!(!use_c_form("ref_copy"));
         assert!(!use_c_form("float_copy"));
         assert!(!use_c_form("getfield_gc_i"));
+    }
+
+    #[test]
+    fn setfield_of_void_value_encodes_no_opcode() {
+        use crate::model::{FunctionGraph, OpKind, SpaceOperation};
+
+        let mut graph = FunctionGraph::new("unit_payload");
+        let base = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        let unit = graph.alloc_value_var_with_type(crate::model::ConcreteType::Void);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base,
+                field: crate::model::FieldDescriptor::new("payload", None),
+                value: crate::model::LinkArg::Value(unit),
+                ty: crate::model::ValueType::Void,
+            },
+        };
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        asm.encode_op(&op, &HashMap::new(), &mut state, None);
+        assert!(state.code.is_empty());
     }
 
     #[test]
@@ -7439,6 +7639,145 @@ mod tests {
             array_at,
             "the second descr operand must be the array descr"
         );
+    }
+
+    /// Safe `Index` / `IndexMut` / `.len()` of a virtualizable `Vec<i64>`
+    /// field. The front end's address-of mark is cleared because the field is
+    /// the declared array, and the codewriter then emits the `_vable` forms.
+    /// `nolength: false` is the bounds check the index implies.
+    #[test]
+    fn vec_index_of_a_vable_array_field_lowers_to_vable_int_ops() {
+        use crate::flatten::flatten_graph;
+        use crate::front::mir::release_declared_vable_array_address;
+        use crate::jtransform::{GraphTransformConfig, Transformer, VirtualizableFieldDescriptor};
+        use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType};
+        use crate::virtualizable_decl::register_virtualizable_declarations;
+
+        register_virtualizable_declarations([("Frame".to_string(), vec!["words[*]".to_string()])]);
+        struct ClearDecl;
+        impl Drop for ClearDecl {
+            fn drop(&mut self) {
+                register_virtualizable_declarations(std::iter::empty::<(String, Vec<String>)>());
+            }
+        }
+        let _clear = ClearDecl;
+
+        let mut graph = FunctionGraph::new("vec_vable_index");
+        let frame = push_input_var(&mut graph, "frame", ValueType::Ref(None));
+        let index = push_input_var(&mut graph, "index", ValueType::Int);
+        let stored = push_input_var(&mut graph, "stored", ValueType::Int);
+        let array = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: frame.clone(),
+                    field: FieldDescriptor::new("words", Some("Frame".into()))
+                        .with_taken_by_address(true),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        assert!(
+            release_declared_vable_array_address(&mut graph, &array),
+            "the declared array field's address mark must clear"
+        );
+        let loaded = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base: array.clone(),
+                    index: index.clone(),
+                    item_ty: ValueType::Int,
+                    array_type_id: Some("[Signed]".to_string()),
+                    nolength: false,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayWrite {
+                base: array.clone(),
+                index: index.clone(),
+                value: LinkArg::Value(stored.clone()),
+                item_ty: ValueType::Int,
+                array_type_id: Some("[Signed]".to_string()),
+                nolength: false,
+            },
+            false,
+        );
+        let len = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayLen {
+                    base: array,
+                    array_type_id: None,
+                    nolength: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(loaded.clone()));
+        FunctionGraph::set_concretetype_of_inline(
+            &frame,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        for var in [&index, &stored, &loaded, &len] {
+            FunctionGraph::set_concretetype_of_inline(
+                var,
+                crate::codewriter::type_state::ConcreteType::Signed,
+            );
+        }
+
+        let config = GraphTransformConfig {
+            vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                "words",
+                Some("Frame".into()),
+                0,
+                8,
+                true,
+            )],
+            ..Default::default()
+        };
+        let mut rewritten = Transformer::new(&config).transform(&graph).graph;
+        let names: Vec<String> = rewritten
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .map(|op| op_kind_to_opname(&op.kind))
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "getarrayitem_vable_i"),
+            "expected getarrayitem_vable_i, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "setarrayitem_vable_i"),
+            "expected setarrayitem_vable_i, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "arraylen_vable"),
+            "expected arraylen_vable, got {names:?}"
+        );
+
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        for key in [
+            "getarrayitem_vable_i/ridd>i",
+            "setarrayitem_vable_i/riidd",
+            "arraylen_vable/rdd>i",
+        ] {
+            assert!(
+                asm.insns.contains_key(key),
+                "{key} missing, got {:?}",
+                asm.insns.keys().collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

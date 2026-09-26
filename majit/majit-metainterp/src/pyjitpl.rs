@@ -5805,11 +5805,10 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     fn make_optimizer(&self) -> Optimizer {
-        let mut opt = if let Some(config) = self.current_virtualizable_optimizer_config() {
-            Optimizer::default_pipeline_with_virtualizable(config)
-        } else {
-            Optimizer::default_pipeline()
-        };
+        // compile.py `CompileData.optimize_trace` → `build_opt_chain(enable_opts)`.
+        let enable_opts = self.warm_state.get_enable_opts();
+        let mut opt =
+            Optimizer::build_opt_chain(enable_opts, self.current_virtualizable_optimizer_config());
         self.pin_optimizer_host_state(&mut opt);
         opt
     }
@@ -5821,7 +5820,12 @@ impl<M: Clone> MetaInterp<M> {
                     .current_virtualizable_optimizer_config()
                     .map(|config| config.static_field_offsets.len() as i64)
                     .unwrap_or(-1);
-                if opt.minimum_virtualizable_size != want_vable {
+                let expected = Optimizer::build_opt_chain(
+                    self.warm_state.get_enable_opts(),
+                    self.current_virtualizable_optimizer_config(),
+                )
+                .pass_names();
+                if opt.minimum_virtualizable_size != want_vable || opt.pass_names() != expected {
                     return self.make_optimizer();
                 }
                 opt.recycle_for_next_compile();
@@ -8413,6 +8417,7 @@ impl<M: Clone> MetaInterp<M> {
         self.pending_preamble_tokens.swap_remove(&green_key);
         let prior_front_target_tokens: Vec<crate::history::TargetToken> = Vec::new();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
+        unroll_opt.enable_opts = self.warm_state.get_enable_opts().to_vec();
         unroll_opt.supports_efficient_uint_mul_high =
             self.backend.supports_efficient_uint_mul_high();
         unroll_opt.compile_snapshot_root_slots =
@@ -8617,11 +8622,10 @@ impl<M: Clone> MetaInterp<M> {
                             &mut snapshot_vref_map,
                         ]);
                         let mut retry_constants = constants_snapshot;
-                        let mut simple_opt = if let Some(config) = vable_config.clone() {
-                            Optimizer::default_pipeline_with_virtualizable(config)
-                        } else {
-                            Optimizer::default_pipeline()
-                        };
+                        let mut simple_opt = Optimizer::build_opt_chain(
+                            self.warm_state.get_enable_opts(),
+                            vable_config.clone(),
+                        );
                         self.pin_optimizer_host_state(&mut simple_opt);
                         // Clone rather than move: only the success arm below hands
                         // the list back, so a retry that aborts would otherwise
@@ -10436,6 +10440,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         };
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
+        unroll_opt.enable_opts = self.warm_state.get_enable_opts().to_vec();
         unroll_opt.supports_efficient_uint_mul_high =
             self.backend.supports_efficient_uint_mul_high();
         unroll_opt.compile_snapshot_root_slots =
@@ -11535,11 +11540,8 @@ impl<M: Clone> MetaInterp<M> {
         );
 
         let num_ops_before = trace_ops.len();
-        let mut optimizer = if let Some(config) = vable_config {
-            Optimizer::default_pipeline_with_virtualizable(config)
-        } else {
-            Optimizer::default_pipeline()
-        };
+        let mut optimizer =
+            Optimizer::build_opt_chain(self.warm_state.get_enable_opts(), vable_config);
         self.pin_optimizer_host_state(&mut optimizer);
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
@@ -12066,11 +12068,8 @@ impl<M: Clone> MetaInterp<M> {
         let num_trace_inputargs = simple_data.base.inputargs().len();
 
         // Simple optimizer — no unrolling (compile.py SimpleCompileData).
-        let mut optimizer = if let Some(config) = vable_config {
-            Optimizer::default_pipeline_with_virtualizable(config)
-        } else {
-            Optimizer::default_pipeline()
-        };
+        let mut optimizer =
+            Optimizer::build_opt_chain(self.warm_state.get_enable_opts(), vable_config);
         self.pin_optimizer_host_state(&mut optimizer);
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();

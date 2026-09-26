@@ -5,9 +5,26 @@ use crate::optimizeopt::{
     intbounds::OptIntBounds,
     pure::OptPure,
     rewrite::OptRewrite,
+    simplify::OptSimplify,
     virtualize::{OptVirtualize, VirtualizableConfig},
     vstring::OptString,
 };
+
+/// `optimizeopt/__init__.py` `ALL_OPTS`. `unroll` is listed and is not
+/// instantiated (`opt is None`).
+pub const ALL_OPTS: &[(&str, bool)] = &[
+    ("intbounds", true),
+    ("rewrite", true),
+    ("virtualize", true),
+    ("string", true),
+    ("pure", true),
+    ("earlyforce", true),
+    ("heap", true),
+    ("unroll", false),
+];
+
+/// `rlib/jit.py` `ENABLE_ALL_OPTS`.
+pub const ENABLE_ALL_OPTS: &str = "intbounds:rewrite:virtualize:string:pure:earlyforce:heap:unroll";
 /// Main optimization driver.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/optimizer.py.
@@ -6096,59 +6113,86 @@ impl Optimizer {
 }
 
 impl Optimizer {
-    /// Create an optimizer with the standard pass pipeline.
-    /// RPython __init__.py ALL_OPTS + ENABLE_ALL_OPTS (rlib/jit.py):
-    ///   intbounds:rewrite:virtualize:string:pure:earlyforce:heap:unroll
-    /// (unroll is handled separately by UnrollOptimizer)
-    pub fn default_pipeline() -> Self {
+    /// `optimizeopt/__init__.py` `build_opt_chain`. Passes are the names in
+    /// `enable_opts`, in `ALL_OPTS` order. `unroll` is not a pass.
+    /// `OptSimplify` is appended when `rewrite`, `virtualize`, `heap`, or
+    /// `pure` is absent.
+    pub fn build_opt_chain(enable_opts: &[String], vable: Option<VirtualizableConfig>) -> Self {
+        let enabled = |name: &str| enable_opts.iter().any(|opt| opt == name);
         let mut opt = Self::new();
-        opt.add_pass(Box::new(OptIntBounds::new()));
-        opt.add_pass(Box::new(OptRewrite::new()));
-        opt.add_pass(Box::new(OptVirtualize::new()));
-        opt.add_pass(Box::new(OptString::new()));
-        opt.add_pass(Box::new(OptPure::new()));
-        opt.add_pass(Box::new(OptEarlyForce::new()));
-        opt.add_pass(Box::new(OptHeap::new()));
+        if let Some(config) = vable.as_ref() {
+            // resume.py:399-402 `minimum_virtualizable_size` from
+            // `virtualizable_info.minimum_size()` (`num_static_fields`).
+            // The size is a property of the driver, not of whether the
+            // `virtualize` pass is in the chain.
+            opt.minimum_virtualizable_size = config.static_field_offsets.len() as i64;
+        }
+        for (name, instantiate) in ALL_OPTS {
+            if !instantiate || !enabled(name) {
+                continue;
+            }
+            let pass: Box<dyn Optimization> = match *name {
+                "intbounds" => Box::new(OptIntBounds::new()),
+                "rewrite" => Box::new(OptRewrite::new()),
+                "virtualize" => {
+                    if let Some(config) = vable.clone() {
+                        Box::new(OptVirtualize::with_virtualizable(config))
+                    } else {
+                        Box::new(OptVirtualize::new())
+                    }
+                }
+                "string" => Box::new(OptString::new()),
+                "pure" => Box::new(OptPure::new()),
+                "earlyforce" => Box::new(OptEarlyForce::new()),
+                "heap" => Box::new(OptHeap::new()),
+                _ => continue,
+            };
+            opt.add_pass(pass);
+        }
+        if !enabled("rewrite") || !enabled("virtualize") || !enabled("heap") || !enabled("pure") {
+            opt.add_pass(Box::new(OptSimplify::new()));
+        }
         opt
     }
 
+    /// Create an optimizer with the standard pass pipeline.
+    /// `ENABLE_ALL_OPTS` (`unroll` is handled by `UnrollOptimizer`).
+    pub fn default_pipeline() -> Self {
+        Self::build_opt_chain(&default_enable_opt_names(), None)
+    }
+
     /// Create an optimizer with virtualizable config for frame field tracking.
+    ///
+    /// Deviation, deliberate: RPython gates `minimum_virtualizable_size` on
+    /// the STATIC per-jitdriver `virtualizable_info`, while this gates on the
+    /// PER-TRACE config, which exists only when `has_virtualizable_boxes()`
+    /// held at `make_optimizer`. Ours is therefore strictly narrower — it
+    /// cannot fire on a trace that never installed a shadow. That direction
+    /// is the safe one (no false positives), but it does mean a trace whose
+    /// `virtualizable_boxes` is `None` while the driver's `vinfo` is `Some`
+    /// still slips past here and is caught only by the reader's
+    /// `assert!(vable_size > 0)` in `resume.rs::consume_vable_info`.
     pub(crate) fn default_pipeline_with_virtualizable(config: VirtualizableConfig) -> Self {
-        let mut opt = Self::new();
-        // resume.py:399-402:
-        //     if self.optimizer.jitdriver_sd.virtualizable_info:
-        //         minimum_virtualizable_size = \
-        //             self.optimizer.jitdriver_sd.virtualizable_info.minimum_size()
-        //     else:
-        //         minimum_virtualizable_size = -1
-        //
-        // `virtualizable.py minimum_size()` returns `num_static_fields`,
-        // which is what `static_field_offsets` enumerates.
-        //
-        // Deviation, deliberate: RPython gates on the STATIC per-jitdriver
-        // `virtualizable_info`, while this gates on the PER-TRACE config, which
-        // exists only when `has_virtualizable_boxes()` held at
-        // `make_optimizer`. Ours is therefore strictly narrower — it cannot
-        // fire on a trace that never installed a shadow. That direction is the
-        // safe one (no false positives), but it does mean a trace whose
-        // `virtualizable_boxes` is `None` while the driver's `vinfo` is `Some`
-        // still slips past here and is caught only by the reader's
-        // `assert!(vable_size > 0)` in `resume.rs::consume_vable_info`.
-        opt.minimum_virtualizable_size = config.static_field_offsets.len() as i64;
-        opt.add_pass(Box::new(OptIntBounds::new()));
-        opt.add_pass(Box::new(OptRewrite::new()));
-        opt.add_pass(Box::new(OptVirtualize::with_virtualizable(config)));
-        opt.add_pass(Box::new(OptString::new()));
-        opt.add_pass(Box::new(OptPure::new()));
-        opt.add_pass(Box::new(OptEarlyForce::new()));
-        opt.add_pass(Box::new(OptHeap::new()));
-        opt
+        Self::build_opt_chain(&default_enable_opt_names(), Some(config))
     }
 
     /// Number of passes in this optimizer.
     pub fn num_passes(&self) -> usize {
         self.passes.len()
     }
+
+    /// Names of the installed passes, in chain order.
+    pub fn pass_names(&self) -> Vec<&'static str> {
+        self.passes.iter().map(|pass| pass.name()).collect()
+    }
+}
+
+fn default_enable_opt_names() -> Vec<String> {
+    ENABLE_ALL_OPTS
+        .split(':')
+        .filter(|name| !name.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 impl Default for Optimizer {
@@ -7019,10 +7063,45 @@ mod tests {
 
     #[test]
     fn test_default_pipeline_has_7_passes() {
-        // RPython __init__.py ALL_OPTS + ENABLE_ALL_OPTS (rlib/jit.py):
-        // intbounds:rewrite:virtualize:string:pure:earlyforce:heap (unroll separate)
+        // ENABLE_ALL_OPTS minus `unroll` (not instantiated) and without
+        // OptSimplify, which is appended only when a core pass is absent.
         let opt = Optimizer::default_pipeline();
         assert_eq!(opt.num_passes(), 7);
+        assert_eq!(
+            opt.pass_names(),
+            [
+                "intbounds",
+                "rewrite",
+                "virtualize",
+                "string",
+                "pure",
+                "earlyforce",
+                "heap",
+            ]
+        );
+    }
+
+    /// `optimizeopt/test/test_optimizeopt.py` `test_build_opt_chain`.
+    #[test]
+    fn test_build_opt_chain_follows_all_opts_order() {
+        let names = |spec: &str| {
+            let enable_opts: Vec<String> = spec
+                .split(':')
+                .filter(|name| !name.is_empty())
+                .map(String::from)
+                .collect();
+            Optimizer::build_opt_chain(&enable_opts, None).pass_names()
+        };
+        assert_eq!(names(""), ["simplify"]);
+        assert_eq!(names("heap:intbounds"), ["intbounds", "heap", "simplify"]);
+        assert_eq!(names("unroll"), ["simplify"]);
+        assert_eq!(names("aaa:bbb"), ["simplify"]);
+        assert!(
+            !names("intbounds:rewrite:virtualize:string:pure:earlyforce")
+                .iter()
+                .any(|name| *name == "heap"),
+            "a chain built without heap has no heap pass",
+        );
     }
 
     #[test]

@@ -1833,6 +1833,9 @@ impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout for CallCon
 pub struct StructLayout {
     /// RPython: `symbolic.get_size(STRUCT, tsc)` — total struct size.
     pub size: usize,
+    /// Alignment of the struct: Charon `TypeLayout.align` when the
+    /// layout was registered, otherwise the max of the fields' alignments.
+    pub align: usize,
     /// Per-field layout: (field_name, offset, size, type).
     /// RPython: `symbolic.get_field_token(STRUCT, name, tsc) → (offset, size)`.
     pub fields: Vec<StructFieldLayout>,
@@ -1946,6 +1949,7 @@ impl StructLayout {
         fields: &[(String, String)],
         known_structs: &std::collections::HashSet<String>,
         known_struct_sizes: &std::collections::HashMap<String, usize>,
+        known_struct_aligns: &std::collections::HashMap<String, usize>,
         immutable_field_ranks: &std::collections::HashMap<String, crate::model::ImmutableRank>,
     ) -> Self {
         // RPython: symbolic.get_array_token() computes itemsize for ANY struct,
@@ -2009,26 +2013,36 @@ impl StructLayout {
             .iter()
             .map(|(_, ty)| {
                 if is_known_by_value_struct(known_structs, ty) {
-                    // Use actual nested struct size for alignment.
-                    known_struct_sizes
-                        .get(ty.as_str())
-                        .copied()
-                        .unwrap_or(crate::layout::target_word_size())
-                        .min(crate::layout::target_word_size())
+                    if let Some(&align) = known_struct_aligns.get(ty.as_str()) {
+                        align
+                    } else {
+                        match known_struct_sizes.get(ty.as_str()).copied() {
+                            Some(size) if size == 0 || size.is_power_of_two() => size,
+                            Some(size) => {
+                                panic!("type `{ty}` has size {size} but no field alignment")
+                            }
+                            None => type_align(ty),
+                        }
+                    }
                 } else {
-                    get_type_flag(ty).2
+                    type_align(ty)
                 }
             })
             .filter(|s| *s > 0)
-            .max()
-            .unwrap_or_else(crate::layout::target_word_size);
+            .max();
+        let align = match max_align {
+            Some(align) => align,
+            None if offset == 0 => 0,
+            None => panic!("struct has no layout and no fields"),
+        };
         let size = if offset > 0 {
-            (offset + max_align - 1) & !(max_align - 1)
+            (offset + align - 1) & !(align - 1)
         } else {
             0
         };
         StructLayout {
             size,
+            align,
             fields: layout_fields,
         }
     }
@@ -5226,6 +5240,44 @@ impl CallControl {
             // Leave malformed arity untouched so `getcalldescr` reports the
             // orthodox hard error instead of silently hiding an argument.
             return args.to_vec();
+        }
+        args.iter()
+            .zip(declared)
+            .filter_map(|(arg, ty)| (ty != crate::model::ValueType::Void).then(|| arg.clone()))
+            .collect()
+    }
+
+    /// Same drop as [`Self::non_void_actual_args_for_target`], for an
+    /// indirect-call family. The witness graph's `FUNC.ARGS` is the
+    /// family's signature; a `Void` slot is absent from every member's
+    /// jitcode inputs and from the calldescr, so the call drops that
+    /// position even when the actual's own `concretetype` is still `Ref`.
+    pub(crate) fn non_void_actual_args_for_graphs(
+        &self,
+        graphs: Option<&[crate::parse::CallPath]>,
+        args: &[crate::flowspace::model::Variable],
+    ) -> Vec<crate::flowspace::model::Variable> {
+        let drop_void_concretetype = || {
+            args.iter()
+                .filter(|arg| {
+                    crate::model::FunctionGraph::concretetype_of(arg)
+                        != crate::model::ConcreteType::Void
+                })
+                .cloned()
+                .collect()
+        };
+        let Some(graphs) = graphs else {
+            return drop_void_concretetype();
+        };
+        let Some(graph) = graphs
+            .iter()
+            .find_map(|path| self.function_graphs.get(path))
+        else {
+            return drop_void_concretetype();
+        };
+        let declared = graph_arg_types(graph);
+        if declared.len() != args.len() {
+            return drop_void_concretetype();
         }
         args.iter()
             .zip(declared)
@@ -8587,7 +8639,9 @@ fn apply_readwrite_replay(
                     cc,
                 )
                 .or_else(|| array_type_id.clone());
-                let len_offset = if *nolength { None } else { Some(0) };
+                let headerless = *nolength
+                    || crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref());
+                let len_offset = if headerless { None } else { Some(0) };
                 push_array_effect(
                     &mut acc.read_arrays,
                     &mut acc.array_read_descrs,
@@ -8613,7 +8667,9 @@ fn apply_readwrite_replay(
                     cc,
                 )
                 .or_else(|| array_type_id.clone());
-                let len_offset = if *nolength { None } else { Some(0) };
+                let headerless = *nolength
+                    || crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref());
+                let len_offset = if headerless { None } else { Some(0) };
                 push_array_effect(
                     &mut acc.write_arrays,
                     &mut acc.array_write_descrs,
@@ -9225,14 +9281,13 @@ fn all_interiorfielddescrs(
     }
     let max_align = fields
         .iter()
-        .map(|(_, ty)| get_type_flag(ty).2)
+        .map(|(_, ty)| type_align(ty))
         .filter(|s| *s > 0)
-        .max()
-        .unwrap_or_else(crate::layout::target_word_size);
-    let item_size = if offset > 0 {
-        (offset + max_align - 1) & !(max_align - 1)
-    } else {
-        0
+        .max();
+    let item_size = match max_align {
+        Some(align) if offset > 0 => (offset + align - 1) & !(align - 1),
+        None if offset == 0 => 0,
+        _ => panic!("struct `{struct_name}` has no layout and no fields"),
     };
     // Path 2 mirror of the Path 1 `get_size_descr` seed — populates
     // `_cache_size[struct_key]` before the per-field loop so each
@@ -9403,16 +9458,15 @@ fn compute_struct_size_uncached(
         .map(|(_, ty)| {
             if cc.is_known_struct(ty) {
                 cc.struct_layout_for(ty)
-                    .map(|l| l.size)
-                    .unwrap_or(crate::layout::target_word_size())
-                    .min(crate::layout::target_word_size())
+                    .map(|l| l.align)
+                    .unwrap_or_else(|| type_align(ty))
             } else {
-                get_type_flag(ty).2
+                type_align(ty)
             }
         })
         .filter(|s| *s > 0)
         .max()
-        .unwrap_or_else(crate::layout::target_word_size);
+        .unwrap_or_else(|| panic!("struct `{struct_name}` has no layout and no fields"));
     let size = if offset > 0 {
         (offset + max_align - 1) & !(max_align - 1)
     } else {
@@ -9492,7 +9546,6 @@ pub(crate) fn get_type_flag(
             || s.starts_with("Box<")
             || s.starts_with("Arc<")
             || s.starts_with("Rc<")
-            || s.starts_with("Vec<")
             || s.starts_with("Option<")
             || s == "String" =>
         {
@@ -9502,6 +9555,14 @@ pub(crate) fn get_type_flag(
                 crate::layout::target_word_size(),
             )
         }
+        // `{cap, ptr, len}`. The field is the three-word value, so
+        // `&mut vec_field` is the address of that value. A one-word
+        // pointer load reads `cap`.
+        s if s.starts_with("Vec<") => (
+            ArrayFlag::Struct,
+            majit_ir::value::Type::Ref,
+            3 * crate::layout::target_word_size(),
+        ),
         // RPython: TYPE is lltype.Float → FLAG_FLOAT
         "f64" => (ArrayFlag::Float, majit_ir::value::Type::Float, 8),
         // RPython: SingleFloat is not lltype.Float and `rffi.cast(_, -1)
@@ -9552,6 +9613,26 @@ pub(crate) fn get_type_flag(
             crate::layout::target_word_size(),
         ),
     }
+}
+
+/// Byte alignment of a type string.
+///
+/// A scalar or pointer aligns to its size. `[T; N]` aligns as `T`.
+/// `Vec<T>` is three word fields (pointer, length, capacity), so it
+/// aligns to one word. Any other non-power-of-two size is an aggregate
+/// whose fields are not in hand: that fails instead of assuming a word.
+pub(crate) fn type_align(type_str: &str) -> usize {
+    if let Some((elem, len)) = crate::front::mir::shaped_array_parts(type_str) {
+        return if len == 0 { 0 } else { type_align(elem) };
+    }
+    if crate::vec_layout::field_layout_is_inline_vec(type_str) {
+        return crate::layout::target_word_size();
+    }
+    let size = get_type_flag(type_str).2;
+    if size == 0 || size.is_power_of_two() {
+        return size;
+    }
+    panic!("type `{type_str}` has no layout and no fields (size {size})")
 }
 
 /// RPython: `RaiseAnalyzer.analyze_simple_operation(op)` (canraise.py).
@@ -10298,6 +10379,119 @@ mod tests {
         assert_eq!(
             return_type_string_to_value_type(Some(&"f64".to_string())),
             Type::Float
+        );
+    }
+
+    /// A `Vec<T>` field is the three-word value `{cap, ptr, len}`.
+    /// Loading one word at the field's offset reads `cap`. The address
+    /// of the field is the address of that value; the buffer pointer
+    /// sits one word in.
+    #[test]
+    fn vec_field_is_an_inline_three_word_value() {
+        use crate::model::FieldDescriptor;
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let word = crate::layout::target_word_size();
+        let (flag, ty, size) = get_type_flag("Vec<Box<Dynamic>>");
+        assert_eq!(flag, ArrayFlag::Struct);
+        assert_eq!(ty, Type::Ref);
+        assert_eq!(size, 3 * word);
+        let (box_flag, _, box_size) = get_type_flag("Box<Dynamic>");
+        assert_eq!(box_flag, ArrayFlag::Pointer);
+        assert_eq!(box_size, word);
+
+        let layout = StructLayout::from_type_strings(
+            &[
+                ("stack".into(), "Vec<Box<Dynamic>>".into()),
+                ("depth".into(), "usize".into()),
+            ],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(layout.fields[0].name, "stack");
+        assert_eq!(layout.fields[0].offset, 0);
+        assert_eq!(layout.fields[0].size, 3 * word);
+        assert_eq!(layout.fields[0].flag, ArrayFlag::Struct);
+        assert_eq!(layout.fields[1].name, "depth");
+        assert_eq!(layout.fields[1].offset, 3 * word);
+        // `depth` is a word, so the struct's alignment is a word and the
+        // size stays `3 * word + word`.
+        assert_eq!(layout.size, 4 * word);
+
+        let vec_only = StructLayout::from_type_strings(
+            &[("v".into(), "Vec<u8>".into())],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(vec_only.fields.len(), 1);
+        assert_eq!(vec_only.fields[0].size, 3 * word);
+        assert_eq!(vec_only.size, 3 * word);
+
+        let vec_then_flag = StructLayout::from_type_strings(
+            &[("v".into(), "Vec<u8>".into()), ("flag".into(), "u8".into())],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(vec_then_flag.fields[1].offset, 3 * word);
+        assert_eq!(vec_then_flag.size, 4 * word);
+
+        let triple = StructLayout::from_type_strings(
+            &[
+                ("a".into(), "u32".into()),
+                ("b".into(), "u32".into()),
+                ("c".into(), "u32".into()),
+            ],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(triple.align, 4);
+        assert_eq!(triple.size, 12);
+        let mut nested_known = std::collections::HashSet::new();
+        nested_known.insert("Triple".to_string());
+        let nested = StructLayout::from_type_strings(
+            &[("t".into(), "Triple".into())],
+            &nested_known,
+            &std::collections::HashMap::from([("Triple".to_string(), 12)]),
+            &std::collections::HashMap::from([("Triple".to_string(), 4)]),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(nested.align, 4, "three u32 align to 4, not a word");
+        assert_eq!(nested.size, 12);
+
+        let mut heuristic = CallControl::new();
+        let mut rows = crate::front::StructFieldRegistry::default();
+        rows.fields
+            .insert("vec_only".into(), vec![("v".into(), "Vec<u8>".into())]);
+        rows.fields.insert(
+            "vec_then_flag".into(),
+            vec![("v".into(), "Vec<u8>".into()), ("flag".into(), "u8".into())],
+        );
+        heuristic.set_struct_fields(rows);
+        assert_eq!(compute_struct_size(&heuristic, "vec_only"), 3 * word);
+        assert_eq!(compute_struct_size(&heuristic, "vec_then_flag"), 4 * word);
+
+        let owner = "vec_field_layout::Vm";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(owner_id, layout);
+        let stack = FieldDescriptor::new("stack", Some(owner.into())).with_taken_by_address(true);
+        assert_eq!(
+            crate::assembler::inline_substruct_field_offset(&cc, &stack),
+            Some(0),
+            "the address of an inline Vec is the field, not a load of cap"
         );
     }
 
@@ -12356,6 +12550,10 @@ mod tests {
 
         // Fixed-point iteration (same algorithm as lib.rs).
         let mut known_sizes: HashMap<String, usize> = HashMap::new();
+        let mut known_aligns: HashMap<String, usize> = HashMap::new();
+        for (name, _) in [("A", ()), ("B", ()), ("C", ())] {
+            known_aligns.insert(name.to_string(), 1);
+        }
         let all_fields: Vec<(&str, &Vec<(String, String)>)> =
             vec![("A", &fields_a), ("B", &fields_b), ("C", &fields_c)];
         loop {
@@ -12365,10 +12563,14 @@ mod tests {
                     fields,
                     &known_structs,
                     &known_sizes,
+                    &known_aligns,
                     &HashMap::new(),
                 );
-                if known_sizes.get(*name) != Some(&layout.size) {
+                if known_sizes.get(*name) != Some(&layout.size)
+                    || known_aligns.get(*name) != Some(&layout.align)
+                {
                     known_sizes.insert(name.to_string(), layout.size);
+                    known_aligns.insert(name.to_string(), layout.align);
                     changed = true;
                 }
             }
@@ -12498,8 +12700,13 @@ mod tests {
         .collect();
         let fields = vec![("__pos_0".to_string(), "*mut PyObject".to_string())];
 
-        let layout =
-            StructLayout::from_type_strings(&fields, &known_structs, &known_sizes, &HashMap::new());
+        let layout = StructLayout::from_type_strings(
+            &fields,
+            &known_structs,
+            &known_sizes,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert_eq!(layout.size, crate::layout::target_word_size());
         assert_eq!(layout.fields.len(), 1);
         assert_eq!(layout.fields[0].flag, ArrayFlag::Pointer);
@@ -14374,6 +14581,7 @@ mod tests {
             sid,
             StructLayout {
                 size: 32,
+                align: 8,
                 fields: vec![StructFieldLayout {
                     name: "x".to_string(),
                     offset: 16,

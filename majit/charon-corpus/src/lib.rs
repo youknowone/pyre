@@ -140,7 +140,11 @@ pub fn bool_then_some(c: bool, x: i64) -> Option<i64> {
 
 #[inline(never)]
 fn option_source(keep: bool, value: i64) -> Option<i64> {
-    if keep { Some(value) } else { None }
+    if keep {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 #[inline(never)]
@@ -469,4 +473,30 @@ pub fn widening_int_from(narrow: u16) -> u32 {
 #[inline(never)]
 pub fn widening_float_from(narrow: i32) -> f64 {
     f64::from(narrow) + 1.0
+}
+
+/// `mem::replace` of a field. The old field is the result; the field then
+/// holds `new`.
+pub struct ReplaceField {
+    pub slot: i64,
+}
+
+#[inline(never)]
+pub fn replace_field(cell: &mut ReplaceField, new: i64) -> i64 {
+    std::mem::replace(&mut cell.slot, new)
+}
+
+/// `mem::replace` of a slice element. Same read-then-store as the field.
+#[inline(never)]
+pub fn replace_elem(items: &mut [i64], index: usize, new: i64) -> i64 {
+    std::mem::replace(&mut items[index], new)
+}
+
+/// `mem::replace(&mut *r, new)` where `r` reborrows a local, then `*r`.
+/// The read must observe `new`, not the value bound into `r`.
+#[inline(never)]
+pub fn replace_reborrow_then_read(mut slot: i64, new: i64) -> i64 {
+    let r = &mut slot;
+    std::mem::replace(&mut *r, new);
+    *r
 }

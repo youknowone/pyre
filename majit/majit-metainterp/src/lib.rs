@@ -208,7 +208,7 @@ pub use jitcode::{
     RuntimeDescrTable, init_global_build_descr_pool, insns, live_slots_for_state_field_jit,
 };
 pub use jitdriver::{
-    DeclarativeJitDriver, FlatEntryContract, JitDriver, JitDriverStaticData,
+    BackEdgeWarmth, DeclarativeJitDriver, FlatEntryContract, JitDriver, JitDriverStaticData,
     MultiFrameBlackholeResult, PendingAbortBlackhole, SingleFrameBlackholeResult,
     TraceContinuationSuspendGuard, bridge_fuel_take, current_state_field_fvc_epoch,
     drive_multi_frame_blackhole, drive_single_frame_blackhole, no_bridge_enabled, spdiag_enabled,
