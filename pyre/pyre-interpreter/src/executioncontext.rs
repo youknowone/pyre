@@ -1274,23 +1274,6 @@ impl ExecutionContext {
         mut frame: *mut PyFrame,
         decr_by: usize,
     ) -> Result<(), crate::PyError> {
-        // This runs on the per-tick path, so neither anchor is taken
-        // unconditionally: each rides the same test that decides whether the
-        // call below it can run Python at all.
-        if !crate::module::thread::all_thread_hooks_current(self) {
-            let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
-            crate::module::thread::apply_all_thread_hooks(self)?;
-            frame = anchor.live();
-        }
-        if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_ASYNC != 0 {
-            // The OS signal handler may only touch atomics.  Copy its breaker
-            // request into the ordinary ActionFlag ticker here, before the
-            // upstream decrement-and-dispatch sequence below.
-            // interp_signal.py `perform` raises the pending async exception
-            // once `action_dispatcher` runs; consuming the type here skipped
-            // that path and built the exception with no message.
-            self.actionflag.sync_async_ticker();
-        }
         // executioncontext.py bytecode_trace:
         //   def bytecode_trace(self, frame, decr_by=TICK_COUNTER_STEP):
         //       self.bytecode_only_trace(frame)
@@ -1500,9 +1483,6 @@ impl ExecutionContext {
         frame: *mut PyFrame,
     ) -> Result<(), crate::PyError> {
         let frame = self.bytecode_only_trace(frame)?;
-        if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_ASYNC != 0 {
-            self.actionflag.sync_async_ticker();
-        }
         if self.actionflag.get_ticker() < 0 {
             // executioncontext.py — `if actionflag.get_ticker()
             // < 0: actionflag.action_dispatcher(self, frame)`.  Routed
@@ -2419,9 +2399,26 @@ pub trait ActionFlagOps {
         // Each `perform` may deliver a signal, which runs the handler at
         // app level; the next action in the loop is handed the same frame.
         let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+        // Breaker bits are armed together with `fire_action_ticker`. Handle
+        // them before `reset_ticker` so a sticky request is not cleared by
+        // the positive reload, and so `MemoryError` reaches the caller's
+        // exception path (`pyopcode.py handle_bytecode`).
+        service_eval_breaker(ec, anchor.live())?;
         // executioncontext.py — `self.reset_ticker(self.checkinterval_scaled)`.
         let interval = self.abstract_flag().checkinterval_scaled as isize;
         self.reset_ticker(interval);
+        // Interpreter GC poll, the `PeriodicAsyncAction` that runs at this
+        // wrap. Urgent `EB_GC` also enters through `fire_action_ticker`.
+        // `has_bytecode_counter` is false until a periodic action (the GIL
+        // release, or this poll) registers, and `decrement_ticker` then does
+        // not count, so the ticker never wraps on its own. Registering the
+        // poll sets that flag; the period is `getcheckinterval` (10000)
+        // bytecodes, against `gc_interp::POLL_INTERVAL` (1024).
+        pyre_object::gc_interp::on_ticker_wrap();
+        if majit_ir::eval_breaker_word::take_memory_error() {
+            majit_gc::gc_sync::safepoint_poll();
+            return Err(crate::PyError::memory_error(""));
+        }
         // executioncontext.py:539-540 — periodic actions iter.
         // Snapshot pointers before iteration; perform() may register
         // additional actions and mutate `_periodic_actions`.
@@ -2458,8 +2455,60 @@ pub trait ActionFlagOps {
                 self.reset_ticker(-1);
             }
         }
+        // A request that is still armed (STW not finished, signal not
+        // consumed, memory error owed to another thread) must make the next
+        // bytecode re-enter. `EB_GC_INTERP` is excluded: it stays set for
+        // the process lifetime and is not itself an event.
+        //
+        // A lost `-1` from `decrement_ticker`'s plain store is recovered
+        // here, at the next wrap, so delivery slips by at most one ticker
+        // period (`signals.c pypysig_counter` has the same race).
+        let still = majit_ir::eval_breaker_word::load()
+            & (majit_ir::eval_breaker_word::EB_ASYNC
+                | majit_ir::eval_breaker_word::EB_STW
+                | majit_ir::eval_breaker_word::EB_FINALIZING
+                | majit_ir::eval_breaker_word::EB_GC
+                | majit_ir::eval_breaker_word::EB_MEMORY_ERROR);
+        if still != 0 {
+            self.reset_ticker(-1);
+        }
         Ok(())
     }
+}
+
+/// Events the per-bytecode head used to poll, now run from
+/// `action_dispatcher` after `fire_action_ticker` forced the ticker negative.
+pub(crate) fn service_eval_breaker(
+    ec: *mut ExecutionContext,
+    frame: *mut PyFrame,
+) -> Result<(), crate::PyError> {
+    let _ = frame;
+    if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_STW != 0 {
+        majit_gc::gc_sync::safepoint_poll();
+    }
+    // After the rendezvous: `set_finalizing` publishes the flag inside a
+    // stop-the-world, so a thread resuming from that safepoint must park
+    // before the actions below run a finalizer on it.
+    if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_FINALIZING != 0 {
+        crate::module::thread::park_if_finalizing();
+    }
+    if majit_ir::eval_breaker_word::take_memory_error() {
+        // The collection that armed the error may have requested STW after
+        // the poll above.
+        majit_gc::gc_sync::safepoint_poll();
+        return Err(crate::PyError::memory_error(""));
+    }
+    if !ec.is_null() && !crate::module::thread::all_thread_hooks_current(unsafe { &*ec }) {
+        crate::module::thread::apply_all_thread_hooks(unsafe { &mut *ec })?;
+    }
+    // A bit armed without a store into this EC's ticker (the published cell
+    // can lag registration) is copied here, off the per-bytecode path.
+    if !ec.is_null()
+        && majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_ASYNC != 0
+    {
+        unsafe { (*ec).actionflag.sync_async_ticker() };
+    }
+    Ok(())
 }
 
 /// pypy/interpreter/executioncontext.py `ActionFlag` merged with
@@ -2468,15 +2517,25 @@ pub trait ActionFlagOps {
 /// PyPy starts with a plain `ActionFlag` (its ticker is a Python field)
 /// and, when the `signal` module loads, rebinds `space.actionflag` to a
 /// `SignalActionFlag` whose ticker is the C `pypysig_counter` cell.  pyre
-/// merges the two while respecting Rust's memory model: `_ticker` remains a
-/// plain field for the translated per-bytecode hot path, the OS handler arms
-/// the atomic process eval breaker, and `sync_async_ticker` makes the field
-/// negative at the next safe interpreter checkpoint.  No asynchronous code
-/// reads or writes `_ticker`.
-#[derive(Clone)]
+/// merges the two. `_ticker` is an `AtomicIsize` (`pypysig_counter`): the
+/// OS handler and `fire_action_ticker` store `-1` into it, and the
+/// interpreter reads it from `decrement_ticker`.
 pub struct ActionFlag {
     base: AbstractActionFlag,
-    _ticker: isize,
+    /// `executioncontext.py ActionFlag._ticker`, stored atomically so an OS
+    /// signal handler and a collector can store `-1` (`pypysig_counter`).
+    _ticker: std::sync::atomic::AtomicIsize,
+}
+
+impl Clone for ActionFlag {
+    fn clone(&self) -> Self {
+        Self {
+            base: self.base.clone(),
+            _ticker: std::sync::atomic::AtomicIsize::new(
+                self._ticker.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
 }
 
 impl Default for ActionFlag {
@@ -2489,7 +2548,7 @@ impl ActionFlag {
     pub fn new() -> Self {
         Self {
             base: AbstractActionFlag::new(),
-            _ticker: 0,
+            _ticker: std::sync::atomic::AtomicIsize::new(0),
         }
     }
 
@@ -2501,16 +2560,33 @@ impl ActionFlag {
     /// handler never dereferences it; it is stable for the process lifetime
     /// because the owning process `ActionFlag` allocation never moves.
     pub fn ticker_addr(&mut self) -> *mut isize {
-        &mut self._ticker
+        self._ticker.as_ptr()
     }
 
     /// Transfer an asynchronous eval-breaker request into the registered
-    /// ticker.  Called only by the owning interpreter thread while it holds
-    /// the GIL and after observing `EB_ASYNC`; the OS signal handler never
-    /// accesses `_ticker` itself.
+    /// ticker. The OS handler may already have stored `-1`; this is the
+    /// GIL-side copy for a bit armed without that store.
     pub(crate) fn sync_async_ticker(&mut self) {
         if self.is_registered_ticker() {
-            self._ticker = -1;
+            self._ticker.store(-1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Count bytecodes on this ticker so `action_dispatcher` (and the GC
+    /// poll beside its periodic actions) runs every `getcheckinterval`
+    /// dispatches. `decrement_ticker` does not subtract while
+    /// `has_bytecode_counter` is false, so without this the poll never
+    /// wraps unless a thread or signal action already set the flag.
+    /// Does not add another periodic-action object: the poll is the
+    /// `on_ticker_wrap` call in `action_dispatcher`.
+    pub fn enable_gc_bytecode_counter(&mut self) {
+        if self.base.has_bytecode_counter {
+            return;
+        }
+        self.base.has_bytecode_counter = true;
+        if self._ticker.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            let interval = self.base.checkinterval_scaled as isize;
+            self.reset_ticker(interval);
         }
     }
 
@@ -2526,7 +2602,7 @@ impl ActionFlag {
     /// `int_eq/ir>i` kind shape that has no blackhole handler; casting both
     /// addresses to `usize` keeps the comparison an int/int equality.
     fn is_registered_ticker(&self) -> bool {
-        let here = &self._ticker as *const isize as usize;
+        let here = self._ticker.as_ptr() as usize;
         let registered = crate::module::signal::signalstate::registered_ticker_ptr() as usize;
         here == registered
     }
@@ -2546,13 +2622,14 @@ impl ActionFlagOps for ActionFlag {
     /// The safe-checkpoint synchronization above is the Rust equivalent of
     /// the signal handler making this cell negative.
     fn get_ticker(&self) -> isize {
-        self._ticker
+        self._ticker.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// interp_signal.py `SignalActionFlag.reset_ticker` —
     /// `p.c_value = value`.
     fn reset_ticker(&mut self, value: isize) {
-        self._ticker = value;
+        self._ticker
+            .store(value, std::sync::atomic::Ordering::Relaxed);
         if self.is_registered_ticker() {
             if value < 0 {
                 arm_async_eval_breaker();
@@ -2595,15 +2672,28 @@ impl ActionFlagOps for ActionFlag {
     /// decremented here — it only goes negative when the OS handler calls
     /// `signal_pushback` (or `fire` requests a non-periodic action).
     fn decrement_ticker(&mut self, by: isize) -> isize {
+        // `signals.c pypysig_counter`: a relaxed load and a relaxed store.
+        // A concurrent `fire_action_ticker` store of `-1` can land between
+        // them and be overwritten. That is the race `pypysig_pushback` has.
+        // The armer also sets its breaker bit, and `action_dispatcher`
+        // calls `reset_ticker(-1)` while any of those bits is still set, so
+        // a lost `-1` delays delivery by at most one ticker period, or until
+        // `CheckSignalAction::after_thread_switch` re-arms from the pending
+        // signal bits when a blocked thread resumes.
+        let value = self._ticker.load(std::sync::atomic::Ordering::Relaxed);
         if self.base.has_bytecode_counter {
-            self._ticker -= by;
-            // This path bypasses reset_ticker, so mirror a future periodic
-            // decrement that crosses negative.
-            if self._ticker < 0 && self.is_registered_ticker() {
+            if by == 0 {
+                return value;
+            }
+            let next = value.wrapping_sub(by);
+            self._ticker
+                .store(next, std::sync::atomic::Ordering::Relaxed);
+            if next < 0 && self.is_registered_ticker() {
                 arm_async_eval_breaker();
             }
+            return next;
         }
-        self._ticker
+        value
     }
 
     fn rearm_ticker(&mut self) {
@@ -2642,6 +2732,8 @@ impl SpaceActionFlag {
         let ptr = *SPACE_ACTIONFLAG
             .get_or_init(|| Box::into_raw(Box::new(ActionFlag::new())) as usize)
             as *mut ActionFlag;
+        // The leaked process flag is the ticker cell armers store into.
+        majit_ir::eval_breaker_word::publish_action_ticker(unsafe { &raw mut (*ptr)._ticker });
         Self { ptr }
     }
 
@@ -2674,6 +2766,18 @@ impl SpaceActionFlag {
     pub(crate) fn sync_async_ticker(&mut self) {
         self.inner_mut().sync_async_ticker()
     }
+
+    pub fn enable_gc_bytecode_counter(&mut self) {
+        self.inner_mut().enable_gc_bytecode_counter();
+    }
+}
+
+/// Arm the bytecode countdown for the interpreter GC poll. The process
+/// flag is the ticker every EC shares (`executioncontext.py` `space.actionflag`).
+/// Setup at activation entry, never part of a trace.
+#[majit_macros::dont_look_inside]
+pub fn enable_gc_bytecode_counter() {
+    SpaceActionFlag::new().enable_gc_bytecode_counter();
 }
 
 impl ActionFlagOps for SpaceActionFlag {

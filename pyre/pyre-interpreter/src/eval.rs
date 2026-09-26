@@ -2569,6 +2569,9 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResul
         // per activation, before the first dispatch. Compiled back-edges mask
         // this bit out.
         majit_ir::eval_breaker_word::set_gc_interp();
+        // The periodic poll rides the action ticker. Without
+        // `has_bytecode_counter` the ticker never wraps (`decrement_ticker`).
+        crate::executioncontext::enable_gc_bytecode_counter();
     }
     let _current_frame_guard = if ec.is_null() {
         install_current_frame(frame)
@@ -2579,63 +2582,6 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResul
     let mut next_instr = frame.next_instr();
 
     loop {
-        // PyPy's ActionFlag is one process breaker.  Keep pyre's free-threaded
-        // finalization and STW extensions on the same already-established
-        // breaker word, so the ordinary dispatch pays one relaxed load rather
-        // than polling two process-global atomics independently.
-        let dispatch_breaker = majit_ir::eval_breaker_word::load();
-        if dispatch_breaker & majit_ir::eval_breaker_word::EB_FINALIZING != 0 {
-            crate::module::thread::park_if_finalizing();
-        }
-        // Interpreter-path GC safepoint (PYRE_GC_INTERP), mirroring the JIT
-        // eval loop. Between opcodes the only live refs are in the frame,
-        // reachable through the installed `current_frame` root walker; no
-        // bytecode handler holds a Rust-stack temporary here. A no-op unless
-        // the flag is on and enough interpreter objects have accumulated.
-        // Without it, a JIT-off run reclaims interpreter-routed old-gen
-        // allocations only at explicit `gc.collect`, so RSS grows unbounded.
-        pyre_object::gc_interp::dispatch_safepoint(dispatch_breaker);
-        // Free-threaded stop-the-world rendezvous.  Worker threads deliberately
-        // execute this plain evaluator (their JitDriver state is thread-owned),
-        // so they must poll the same process breaker as compiled/JIT-warm
-        // loops; otherwise a non-allocating Python loop can prevent collection
-        // and fork/finalization STW forever.
-        if dispatch_breaker & majit_ir::eval_breaker_word::EB_STW != 0 {
-            majit_gc::gc_sync::safepoint_poll();
-        }
-        // A bounded major collection that reached `max_heap_size` owes a
-        // `MemoryError` — incminimark.py `major_collection_step` raises one
-        // there, and the safepoint above is where the interpreter path's
-        // collections happen but it returns `()` and cannot raise. Deliver it
-        // here, at the same seam an asynchronously delivered signal uses below:
-        // the block search runs at `last_instr`, so a `try` around the region
-        // that was running catches it rather than the frame unwinding.
-        //
-        // Reads the word rather than `dispatch_breaker`: the safepoint above is
-        // the usual armer and it runs after that load, so testing the loaded
-        // copy would defer delivery by a dispatch this loop is not guaranteed
-        // to reach. `take_memory_error` opens with a relaxed load and returns
-        // on it, so the ordinary dispatch pays that load and a branch against a
-        // word it just touched.
-        //
-        // After the park above, not before it: `handle_exception` runs Python
-        // and allocates, and both bits can be armed at once — this thread's
-        // own breach and another thread's STW request. Delivering first would
-        // run a handler through a world the collector has asked to stop.
-        if majit_ir::eval_breaker_word::take_memory_error() {
-            // Park again, on a fresh read: the test above ran against the
-            // dispatch-time copy of the word, and the collection between them
-            // is a whole major cycle, so a request that arrived during it is
-            // not in that copy. Delivery runs a Python handler, which must not
-            // run through a world the collector has asked to stop.
-            majit_gc::gc_sync::safepoint_poll();
-            let mut err = crate::PyError::memory_error("");
-            if handle_exception(frame, &mut err, &mut next_instr) {
-                continue;
-            }
-            return Err(err);
-        }
-
         if next_instr >= code.instructions.len() {
             return Ok(w_none());
         }
@@ -2679,16 +2625,22 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResul
                 }
                 return Err(err);
             }
-            // A trace callback may perform a debugger line-jump by setting
-            // `frame.f_lineno` (`PyFrame::fset_f_lineno` → `last_instr =
-            // best_addr`).  Honour it: if a tracer is installed and it
-            // moved `last_instr` off the instruction we were about to
-            // dispatch, resume from the jump target instead of `pc`.  The
-            // `gettrace` null-check keeps this off the no-tracer hot path.
-            if unsafe { !(*ec).gettrace().is_null() } && frame.last_instr as usize != pc {
+            // `pyopcode.py dispatch_bytecode` reloads `next_instr` from
+            // `last_instr` after `bytecode_only_trace` / `action_dispatcher`
+            // (`fset_f_lineno` writes `best_addr` into `last_instr`). The
+            // compare is the reload; it does not call `gettrace`.
+            if frame.last_instr as usize != pc {
                 next_instr = frame.last_instr as usize;
                 continue;
             }
+        } else if let Err(mut err) = crate::executioncontext::service_eval_breaker(
+            std::ptr::null_mut(),
+            frame as *mut PyFrame,
+        ) {
+            if handle_exception(frame, &mut err, &mut next_instr) {
+                continue;
+            }
+            return Err(err);
         }
         let (opcode_pc, instruction, op_arg) = decode_instruction_forward(code, pc)?;
         let fallthrough = opcode_pc + 1;

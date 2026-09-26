@@ -9668,6 +9668,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // Share the interpreter-path GC configuration through the dispatch
         // breaker load; the compiled back-edge mask deliberately excludes it.
         majit_ir::eval_breaker_word::set_gc_interp();
+        // Same countdown as `eval_loop`: the process action ticker, not a
+        // fresh `getexecutioncontext` on this loop.
+        pyre_interpreter::executioncontext::enable_gc_bytecode_counter();
     }
     // The code object is NOT read here. `interp_jit.py` `PyFrame.dispatch`
     // takes `pycode` as a parameter and reads `co_code = pycode.co_code`
@@ -9690,82 +9693,43 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     let mut f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
 
     loop {
-        // PyPy's ActionFlag is one process breaker.  Keep pyre's free-threaded
-        // finalization and STW extensions on the same already-established
-        // breaker word, so the ordinary dispatch pays one relaxed load rather
-        // than polling two process-global atomics independently.
-        let dispatch_breaker = majit_ir::eval_breaker_word::load();
-        if dispatch_breaker & majit_ir::eval_breaker_word::EB_FINALIZING != 0 {
-            pyre_interpreter::module::thread::park_if_finalizing();
-        }
-        // Interpreter-path GC safepoint (PYRE_GC_INTERP). Between opcodes the
-        // only live refs are in the frame, reachable through the registered
-        // pyframe root walker; no bytecode handler holds a Rust-stack temporary
-        // here. A no-op unless the flag is on and enough interpreter objects
-        // have accumulated to warrant a collection.
-        pyre_object::gc_interp::dispatch_safepoint(dispatch_breaker);
-
-        // Stop-the-world safepoint: a compiled loop's back-edge poll deopts
-        // here when a collector has requested STW; park until it completes.
-        // Between opcodes no bytecode handler holds a Rust-stack ref (see the
-        // note above), so this is a walkable safepoint.
-        if dispatch_breaker & majit_ir::eval_breaker_word::EB_STW != 0 {
-            majit_gc::gc_sync::safepoint_poll();
-        }
-
-        // Seed the frame pointer once after the two top-of-loop safepoints.
-        // The frame is GC-managed and can move only at a collection point; this
-        // pointer stays valid until the next such point, so the reads below reuse
-        // it instead of re-resolving the shadow-stack slot each time. Re-seeded
-        // after every collection-point call in this loop (bytecode_trace,
-        // perform_actions, execute_opcode_step, handle_exception, can_enter_jit /
-        // maybe_compile_and_run).
+        // Frame may move at a collection point. Collection now happens inside
+        // `action_dispatcher` (ticker wrap / fired breaker). Reload once per
+        // iteration so `pc` is the live frame.
         f = FrameView::reload(f);
 
-        // The plain evaluator's twin: a bounded major collection that reached
-        // `max_heap_size` owes a `MemoryError`, and the safepoint above — which
-        // is where the interpreter path collects — cannot raise one.
-        // `EB_MEMORY_ERROR` is in `JIT_BREAKER_MASK`, so a compiled loop leaves
-        // machine code for this seam instead of running on past an exhausted
-        // heap, and delivering before `jit_merge_point` below keeps a hot loop
-        // from re-entering compiled code with the exception still owed.
-        //
-        // Reads the word rather than `dispatch_breaker`, and the difference is
-        // not academic: the safepoint above is the usual armer and it runs
-        // after that load, so `dispatch_breaker` is one dispatch stale. This
-        // loop is not guaranteed a next dispatch — measured, a run under
-        // `--heapsize` reaches this seam with the bit set exactly once — so a
-        // stale test does not delay the exception, it drops it, and the
-        // program's next sign of a full heap is the abort on the second breach.
-        if majit_ir::eval_breaker_word::take_memory_error() {
-            // Park again, on a fresh read: the test above ran against the
-            // dispatch-time copy of the word, and the collection between them
-            // is a whole major cycle, so a request that arrived during it is
-            // not in that copy. Delivery runs a Python handler, which must not
-            // run through a world the collector has asked to stop.
-            majit_gc::gc_sync::safepoint_poll();
-            let mut err = pyre_interpreter::PyError::memory_error("");
-            let mut next_instr = unsafe { &*f }.next_instr();
-            if pyre_interpreter::eval::handle_exception(
-                unsafe { &mut *f },
-                &mut err,
-                &mut next_instr,
-            ) {
-                // handle_exception allocates → re-seed before the write.
-                f = FrameView::reload(f);
-                unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
-                continue;
-            }
-            return Err(err);
-        }
-
         let pc = unsafe { &*f }.next_instr();
+        // The signal/MemoryError handler search uses `last_instr`. Point it
+        // at this opcode before `perform_actions`, same as `eval_loop`.
+        unsafe { &mut *f }.last_instr = pc as isize;
+        // One EC read for the marker's red `ec` and the ticker. A fired
+        // breaker stores `-1` (`fire_action_ticker`); service it before
+        // `jit_merge_point` so a compiled back-edge does not re-enter on the
+        // still-armed guard.
+        let marker_ec = pyre_interpreter::call::getexecutioncontext();
+        let pre_ec = marker_ec as *mut PyExecutionContext;
+        if !pre_ec.is_null() && unsafe { (*pre_ec).actionflag.get_ticker() } < 0 {
+            if let Err(mut err) = unsafe { (*pre_ec).perform_actions(f) } {
+                f = FrameView::reload(f);
+                let mut next_instr = unsafe { &*f }.next_instr();
+                if pyre_interpreter::eval::handle_exception(
+                    unsafe { &mut *f },
+                    &mut err,
+                    &mut next_instr,
+                ) {
+                    f = FrameView::reload(f);
+                    unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
+                    continue;
+                }
+                return Err(err);
+            }
+            f = FrameView::reload(f);
+        }
 
         // interp_jit.py:85-87 — source-level marker declaration.  Its
         // untranslated body is a no-op; source translation
         // recognizes this method call and lowers it to JitCode
         // `jit_merge_point` rather than leaving a residual call.
-        let marker_ec = pyre_interpreter::call::getexecutioncontext();
         let marker_pycode = unsafe { &*f }.pycode as pyre_object::PyObjectRef;
         let marker_profiled = unsafe { &*f }.get_is_being_profiled();
         pypyjitdriver.jit_merge_point(
@@ -9778,6 +9742,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // `f` is the marker's red `frame` — the one frame value declared
         // live across the split, as PyFrame.dispatch's `self` is upstream.
         // The marker does not collect.
+        // The EC pointer after the split is recomputed from the red `ec`.
+        let ec_ptr = marker_ec as *mut PyExecutionContext;
 
         // `interp_jit.py` `PyFrame.dispatch`: `co_code = pycode.co_code`,
         // read from the green the marker just declared and nowhere else. One
@@ -9848,7 +9814,6 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // constant upstream's translator sees, so splitting on it would strip
         // the ticker from nested interpreted frames rather than from traced
         // ones.
-        let ec_ptr = pyre_interpreter::call::getexecutioncontext() as *mut PyExecutionContext;
         if !ec_ptr.is_null() {
             // Keep the JIT portal's concrete dispatch in lockstep with
             // `pyre_interpreter::eval::eval_loop`'s opcode boundary.  The
@@ -9862,16 +9827,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             }
             f = FrameView::reload(f);
             let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
-            // A compiled back-edge deopts when the process breaker is armed.
-            // On resume, run the live frame's ordinary bytecode_trace so its
-            // EC-owned `w_async_exception_type` is consumed.  This is the
-            // source-level equivalent of PyPy resuming into
-            // CheckSignalAction.perform; testing only `needs_trace` here used
-            // to bypass the interpreter semantic path and immediately re-enter
-            // the compiled loop with the exception still pending.
-            let async_pending =
-                majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_ASYNC != 0;
-            if needs_trace || async_pending {
+            // A fired breaker stores `-1` into the action ticker
+            // (`fire_action_ticker`), so the no-tracer arm's
+            // `decrement_ticker < 0` runs `action_dispatcher`.
+            if needs_trace {
                 if let Err(mut err) = unsafe {
                     (*ec_ptr)
                         .bytecode_trace(f, pyre_interpreter::executioncontext::TICK_COUNTER_STEP)
