@@ -191,6 +191,13 @@ pub(crate) fn substituted_unstructured(
         .map(|proj| proj.unstructured)
 }
 
+/// Trait-impl id of a resolved trait call. `None` for a `Clause` ref.
+pub(crate) fn resolved_trait_impl_id(payload: &Value, llbc: &Llbc) -> Option<u64> {
+    let arr = payload.as_array()?;
+    let resolved = resolve_trait_ref(arr.first()?, llbc, 0)?;
+    trait_impl_id(&resolved, llbc, 0)
+}
+
 /// The impl method a resolved trait call names, plus the `trait_refs`
 /// that instantiate that method. `None` when the ref is still a clause.
 pub(crate) fn trait_impl_method(payload: &Value, llbc: &Llbc) -> Option<(u64, Value)> {

@@ -11175,6 +11175,13 @@ impl<'a> Lowering<'a> {
                 // the destination to the receiver instead of emitting an
                 // `as_ref` method call the rtyper cannot route on the
                 // classdef-less string receiver.
+                if args.len() == 1 && self.is_std_borrow_identity(&reg) {
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 if args.len() == 1
                     && self.is_string_to_str_identity(&reg, first_arg_ty.as_ref(), &call.dest.ty)
                 {
@@ -17746,6 +17753,56 @@ impl<'a> Lowering<'a> {
     /// `String`'s sibling `AsRef<[u8]>` / `AsRef<OsStr>` / `AsRef<Path>`
     /// impls — whose `&[u8]`/etc. result is a *different* value-model
     /// family — keep their ordinary lowering.
+    /// A resolved `core::borrow::Borrow::borrow` whose impl is one of the
+    /// core/alloc identity views and whose method has no extracted body.
+    /// A `Clause` ref and a local impl with a body stay calls.
+    fn is_std_borrow_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Trait(payload) = &reg.kind else {
+            return false;
+        };
+        let Some(impl_id) =
+            crate::front::clause_spec::resolved_trait_impl_id(payload, self.llbc)
+        else {
+            return false;
+        };
+        let Some((fn_id, _)) = crate::front::clause_spec::trait_impl_method(payload, self.llbc)
+        else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(fn_id) else {
+            return false;
+        };
+        if fd.unstructured().is_some() {
+            return false;
+        }
+        if fd.item_meta.name_path().rsplit("::").next() != Some("borrow") {
+            return false;
+        }
+        let Some(ti) = self.llbc.trait_impls_raw().get(impl_id as usize) else {
+            return false;
+        };
+        let Some(trait_id) = ti.pointer("/impl_trait/id").and_then(serde_json::Value::as_u64)
+        else {
+            return false;
+        };
+        let Some(td) = self.llbc.trait_by_id(trait_id) else {
+            return false;
+        };
+        if td.item_meta.name_path() != "core::borrow::Borrow" {
+            return false;
+        }
+        let Some(types) = ti
+            .pointer("/impl_trait/generics/types")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return false;
+        };
+        let (Some(self_ty), Some(borrowed)) = (types.first(), types.get(1)) else {
+            return false;
+        };
+        crate::front::std_identity::is_identity_borrow_pair(self_ty, borrowed, self.llbc)
+    }
+
     fn is_string_to_str_identity(
         &self,
         reg: &RegularCall,
