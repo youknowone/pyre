@@ -629,7 +629,9 @@ mod tests {
         let (done, _) = g.create_block_with_arg_vars(0);
         let some_link =
             Link::new_mixed(vec![LinkArg::Value(h_it), LinkArg::Value(item)], body, None);
-        let stop_link = Link::new_mixed(vec![], done, Some(stopiteration()));
+        let mut stop_link = Link::new_mixed(vec![], done, Some(stopiteration()));
+        stop_link.last_exception = Some(LinkArg::Value(g.alloc_value_var()));
+        stop_link.last_exc_value = Some(LinkArg::Value(g.alloc_value_var()));
         g.set_control_flow_metadata(
             head,
             Some(ExitSwitch::LastException),
@@ -692,6 +694,28 @@ mod tests {
                 "advance block inherited the retired iterator kind",
             );
         }
+    }
+
+    /// The scalarised range slot keeps its integer kind through the rest of
+    /// the codewriter: the rtyper typed that slot as the range iterator
+    /// pointer, and nothing after jtransform may copy that type back.
+    #[test]
+    fn a_range_loop_assembles_through_the_codewriter() {
+        let (g, _, _, _) = range_loop_graph();
+        let path = crate::parse::CallPath::from_segments(["f"]);
+        let mut callcontrol = crate::codewriter::call::CallControl::new();
+        callcontrol.register_function_graph(path.clone(), g.clone());
+        let mut codewriter = crate::codewriter::codewriter::CodeWriter::new();
+        let jitcode = std::sync::Arc::new(crate::codewriter::jitcode::JitCode::new("f"));
+        codewriter.transform_graph_to_jitcode(
+            &g,
+            &path,
+            &mut callcontrol,
+            &crate::GraphTransformConfig::default(),
+            &jitcode,
+            false,
+            0,
+        );
     }
 
     /// `for &w in args_w { use(w) }` in the front's shape, with a sibling
