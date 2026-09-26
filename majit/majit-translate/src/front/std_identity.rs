@@ -309,6 +309,110 @@ fn same_value_bank(lhs: &ValueType, rhs: &ValueType) -> bool {
     matches!((bank(lhs), bank(rhs)), (Some(a), Some(b)) if a == b)
 }
 
+/// `(self_ty, borrowed)` is a core/alloc `Borrow` view whose method body
+/// is not extracted: `<T as Borrow<T>>`, `<&T as Borrow<T>>`,
+/// `<&mut T as Borrow<T>>`, `<String as Borrow<str>>`,
+/// `<Vec<T> as Borrow<[T]>>`.
+pub(crate) fn is_identity_borrow_pair(
+    self_ty: &serde_json::Value,
+    borrowed: &serde_json::Value,
+    llbc: &majit_charon_reader::Llbc,
+) -> bool {
+    let self_ty = peel_ty(self_ty, llbc, 0);
+    let borrowed = peel_ty(borrowed, llbc, 0);
+    if ref_pointee(self_ty, "Shared").is_some_and(|pointee| ty_eq(pointee, borrowed, llbc))
+        || ref_pointee(self_ty, "Mut").is_some_and(|pointee| ty_eq(pointee, borrowed, llbc))
+    {
+        return true;
+    }
+    if ty_eq(self_ty, borrowed, llbc) {
+        return true;
+    }
+    if is_named_adt(self_ty, llbc, "alloc::string::String") && is_builtin(borrowed, "Str") {
+        return true;
+    }
+    vec_elem(self_ty, llbc)
+        .is_some_and(|elem| slice_elem(borrowed, llbc).is_some_and(|item| ty_eq(elem, item, llbc)))
+}
+
+fn peel_ty<'a>(
+    v: &'a serde_json::Value,
+    llbc: &'a majit_charon_reader::Llbc,
+    depth: usize,
+) -> &'a serde_json::Value {
+    if depth > 8 {
+        return v;
+    }
+    let Some(obj) = v.as_object() else {
+        return v;
+    };
+    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return llbc
+            .dedup_body(id)
+            .map(|body| peel_ty(body, llbc, depth + 1))
+            .unwrap_or(v);
+    }
+    if let Some(arr) = obj
+        .get("HashConsedValue")
+        .and_then(serde_json::Value::as_array)
+        && arr.len() == 2
+    {
+        return peel_ty(&arr[1], llbc, depth + 1);
+    }
+    v
+}
+
+fn ty_eq(
+    lhs: &serde_json::Value,
+    rhs: &serde_json::Value,
+    llbc: &majit_charon_reader::Llbc,
+) -> bool {
+    peel_ty(lhs, llbc, 0) == peel_ty(rhs, llbc, 0)
+}
+
+fn ref_pointee<'a>(node: &'a serde_json::Value, kind: &str) -> Option<&'a serde_json::Value> {
+    let arr = node.get("Ref")?.as_array()?;
+    if arr.get(2).and_then(serde_json::Value::as_str) != Some(kind) {
+        return None;
+    }
+    arr.get(1)
+}
+
+fn is_builtin(node: &serde_json::Value, name: &str) -> bool {
+    node.pointer("/Adt/id/Builtin")
+        .and_then(serde_json::Value::as_str)
+        == Some(name)
+}
+
+fn is_named_adt(node: &serde_json::Value, llbc: &majit_charon_reader::Llbc, path: &str) -> bool {
+    let Some(id) = node
+        .pointer("/Adt/id/Adt")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return false;
+    };
+    llbc.type_by_id(id)
+        .is_some_and(|td| td.item_meta.name_path() == path)
+}
+
+fn vec_elem<'a>(
+    node: &'a serde_json::Value,
+    llbc: &'a majit_charon_reader::Llbc,
+) -> Option<&'a serde_json::Value> {
+    if !is_named_adt(node, llbc, "alloc::vec::Vec") {
+        return None;
+    }
+    node.pointer("/Adt/generics/types/0")
+}
+
+fn slice_elem<'a>(
+    node: &'a serde_json::Value,
+    llbc: &'a majit_charon_reader::Llbc,
+) -> Option<&'a serde_json::Value> {
+    let elem = node.get("Slice")?;
+    Some(peel_ty(elem, llbc, 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

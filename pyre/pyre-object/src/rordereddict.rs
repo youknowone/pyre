@@ -23,8 +23,8 @@
 //! `num_live_items`; a tombstone makes them diverge.  Every index this type
 //! hands out or accepts — [`RDict::index_of`], [`RDict::get_slot`],
 //! [`RDict::remove_slot`] — is a **slot**, an index into `entries`, never the
-//! n-th live pair.  Walk a dict with `0..d.entry_slots()` and skip the `None`s,
-//! which is what `_ll_dictnext` (1373) does.
+//! n-th live pair.  Walk a dict with `0..d.entry_slots()` and skip the slots
+//! whose `f_valid` is false, which is what `_ll_dictnext` (1373) does.
 
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
@@ -49,13 +49,13 @@ const PERTURB_SHIFT: u32 = 5;
 /// Walk live `d.entries` slots with `ll_getitem_fast`, not
 /// `Enumerate` / `FilterMap`.
 pub struct LiveIter<'a, K, V> {
-    entries: &'a [Option<Entry<K, V>>],
+    entries: &'a [Entry<K, V>],
     front: usize,
     back: usize,
 }
 
 impl<'a, K, V> LiveIter<'a, K, V> {
-    fn new(entries: &'a [Option<Entry<K, V>>]) -> Self {
+    fn new(entries: &'a [Entry<K, V>]) -> Self {
         Self {
             entries,
             front: 0,
@@ -64,8 +64,12 @@ impl<'a, K, V> LiveIter<'a, K, V> {
     }
 
     fn entry_at(&self, i: usize) -> Option<(&'a K, &'a V)> {
-        let e = unsafe { &*self.entries.as_ptr().add(i) };
-        e.as_ref().map(|e| (&e.key, &e.value))
+        let e = &self.entries[i];
+        if e.f_valid {
+            Some((&e.key, &e.value))
+        } else {
+            None
+        }
     }
 }
 
@@ -161,14 +165,14 @@ impl<K, V> DoubleEndedIterator for LiveValues<'_, K, V> {
 }
 
 pub struct LiveIterMut<'a, K, V> {
-    entries: *mut Option<Entry<K, V>>,
+    entries: *mut Entry<K, V>,
     len: usize,
     front: usize,
     back: usize,
-    _mark: std::marker::PhantomData<&'a mut Option<Entry<K, V>>>,
+    _mark: std::marker::PhantomData<&'a mut Entry<K, V>>,
 }
 
-// `entries` is derived from the `&'a mut [Option<Entry<K, V>>]` handed to
+// `entries` is derived from the `&'a mut [Entry<K, V>]` handed to
 // `new`, so the iterator holds that slice's unique borrow, and `front` / `back`
 // only ever move toward each other — no index is yielded twice and the two ends
 // cannot hand out the same item. That makes the raw pointer carry exactly the
@@ -179,7 +183,7 @@ unsafe impl<K: Send, V: Send> Send for LiveIterMut<'_, K, V> {}
 unsafe impl<K: Sync, V: Sync> Sync for LiveIterMut<'_, K, V> {}
 
 impl<'a, K, V> LiveIterMut<'a, K, V> {
-    fn new(entries: &'a mut [Option<Entry<K, V>>]) -> Self {
+    fn new(entries: &'a mut [Entry<K, V>]) -> Self {
         let len = entries.len();
         Self {
             entries: entries.as_mut_ptr(),
@@ -193,7 +197,11 @@ impl<'a, K, V> LiveIterMut<'a, K, V> {
     fn entry_at(&mut self, i: usize) -> Option<(&'a K, &'a mut V)> {
         debug_assert!(i < self.len);
         let e = unsafe { &mut *self.entries.add(i) };
-        e.as_mut().map(|e| (&e.key, &mut e.value))
+        if e.f_valid {
+            Some((&e.key, &mut e.value))
+        } else {
+            None
+        }
     }
 }
 
@@ -246,17 +254,53 @@ fn replace_value<V>(slot: &mut V, value: V) -> V {
     std::mem::replace(slot, value)
 }
 
-/// One `d.entries` slot's payload — the key, its value, and the digest
-/// `ENTRY.f_hash` caches, so a reindex and a probe both read the digest
-/// instead of recomputing it.
+/// One `d.entries` slot — upstream `ENTRY` (`odictentry`): `key`, `value`,
+/// `f_valid` (`ll_valid_from_flag`), and `f_hash` (the cached digest).
 ///
 /// Public only because it names the iterator types; nothing outside can read
 /// or build one.
+#[repr(C)]
 #[derive(Clone, Debug)]
 pub struct Entry<K, V> {
-    hash: u64,
     key: K,
     value: V,
+    f_valid: bool,
+    f_hash: u64,
+}
+
+/// The value a deleted `ENTRY` slot's key or value is reset to
+/// (`must_clear_key` / `must_clear_value` store `nullptr`), so the slot
+/// keeps nothing alive.
+pub trait EntryDummy {
+    fn dummy() -> Self;
+}
+
+impl EntryDummy for u64 {
+    fn dummy() -> Self {
+        0
+    }
+}
+
+impl EntryDummy for i64 {
+    fn dummy() -> Self {
+        0
+    }
+}
+
+impl EntryDummy for () {
+    fn dummy() -> Self {}
+}
+
+impl EntryDummy for String {
+    fn dummy() -> Self {
+        String::new()
+    }
+}
+
+impl EntryDummy for Vec<u8> {
+    fn dummy() -> Self {
+        Vec::new()
+    }
 }
 
 /// A borrowed key that can be compared against a `K` without building one.
@@ -281,9 +325,9 @@ pub struct RDict<K, V, S = RandomState> {
     /// a byte/short/int/long element width from the entry count; a single
     /// `u32` covers every dict that fits in memory here.
     indexes: Vec<u32>,
-    /// `d.entries`.  `len()` is `num_ever_used_items`; a `None` is a slot
-    /// `entries.valid(i)` answers false for.
-    entries: Vec<Option<Entry<K, V>>>,
+    /// `d.entries`.  `len()` is `num_ever_used_items`; a slot whose
+    /// `f_valid` is false is one `entries.valid(i)` answers false for.
+    entries: Vec<Entry<K, V>>,
     /// `d.num_live_items`.
     num_live_items: usize,
     /// `d.resize_counter`.  Signed because upstream tests `rc <= 0` after
@@ -362,34 +406,49 @@ impl<K, V, S> RDict<K, V, S> {
         self.num_live_items == 0
     }
 
+    /// `ll_valid_from_flag` (`entries[i].f_valid`).
+    #[inline]
+    fn entry_valid(&self, slot: usize) -> bool {
+        self.entries[slot].f_valid
+    }
+
     /// `ll_getitem_nonneg` / `ll_getitem_fast` on `d.entries`.
     #[inline]
-    fn entry_at(&self, slot: usize) -> &Option<Entry<K, V>> {
-        debug_assert!(slot < self.entries.len());
-        unsafe { &*self.entries.as_ptr().add(slot) }
+    fn entry_at(&self, slot: usize) -> &Entry<K, V> {
+        &self.entries[slot]
     }
 
     /// `ll_setitem_fast` on `d.entries`.
     #[inline]
-    fn entry_at_mut(&mut self, slot: usize) -> &mut Option<Entry<K, V>> {
-        debug_assert!(slot < self.entries.len());
-        unsafe { &mut *self.entries.as_mut_ptr().add(slot) }
+    fn entry_at_mut(&mut self, slot: usize) -> &mut Entry<K, V> {
+        &mut self.entries[slot]
+    }
+
+    /// `ll_mark_deleted_in_flag`, then `must_clear_key` / `must_clear_value`:
+    /// `f_valid = False` and the key and value are reset to [`EntryDummy::dummy`].
+    #[inline]
+    fn mark_deleted(&mut self, slot: usize) -> (K, V)
+    where
+        K: EntryDummy,
+        V: EntryDummy,
+    {
+        let e = self.entry_at_mut(slot);
+        e.f_valid = false;
+        let key = std::mem::replace(&mut e.key, K::dummy());
+        let value = std::mem::replace(&mut e.value, V::dummy());
+        (key, value)
     }
 
     /// `ll_getitem_nonneg` on `d.indexes`.
     #[inline]
     fn index_at(&self, i: usize) -> u32 {
-        debug_assert!(i < self.indexes.len());
-        unsafe { *self.indexes.as_ptr().add(i) }
+        self.indexes[i]
     }
 
     /// `ll_setitem_fast` on `d.indexes`.
     #[inline]
     fn set_index_at(&mut self, i: usize, value: u32) {
-        debug_assert!(i < self.indexes.len());
-        unsafe {
-            *self.indexes.as_mut_ptr().add(i) = value;
-        }
+        self.indexes[i] = value;
     }
 
     /// The first live slot at or after `from`, which is `_ll_dictnext`'s scan
@@ -399,7 +458,7 @@ impl<K, V, S> RDict<K, V, S> {
     /// moves.
     #[inline]
     pub fn next_valid_slot(&self, from: usize) -> Option<usize> {
-        (from..self.entries.len()).find(|&i| self.entry_at(i).is_some())
+        (from..self.entries.len()).find(|&i| self.entry_valid(i))
     }
 
     /// [`Self::next_valid_slot`] descending: the last live slot strictly below
@@ -409,17 +468,20 @@ impl<K, V, S> RDict<K, V, S> {
     pub fn prev_valid_slot(&self, before: usize) -> Option<usize> {
         (0..before.min(self.entries.len()))
             .rev()
-            .find(|&i| self.entry_at(i).is_some())
+            .find(|&i| self.entry_valid(i))
     }
 
     /// `d.num_ever_used_items` — one past the highest slot ever filled, and so
-    /// the bound of a slot walk.  Dead slots below it read as `None`.
+    /// the bound of a slot walk.  Dead slots below it have `f_valid` false.
     #[inline]
     /// `_ll_dictnext` (rordereddict.py) — the entry at or after `from`,
     /// paired with the slot holding it.
     pub fn next_entry(&self, from: usize) -> Option<(usize, &K, &V)> {
         let slot = self.next_valid_slot(from)?;
-        let e = self.entry_at(slot).as_ref()?;
+        if !self.entry_valid(slot) {
+            return None;
+        }
+        let e = self.entry_at(slot);
         Some((slot, &e.key, &e.value))
     }
 
@@ -429,7 +491,7 @@ impl<K, V, S> RDict<K, V, S> {
 
     #[inline]
     pub fn is_valid_slot(&self, slot: usize) -> bool {
-        slot < self.entries.len() && self.entry_at(slot).is_some()
+        slot < self.entries.len() && self.entry_valid(slot)
     }
 
     /// Changes whenever a compaction or reindex moves entries; see the field.
@@ -467,7 +529,11 @@ impl<K, V, S> RDict<K, V, S> {
         if slot >= self.entries.len() {
             return None;
         }
-        self.entry_at(slot).as_ref().map(|e| (&e.key, &e.value))
+        if !self.entry_valid(slot) {
+            return None;
+        }
+        let e = self.entry_at(slot);
+        Some((&e.key, &e.value))
     }
 
     #[inline]
@@ -475,9 +541,11 @@ impl<K, V, S> RDict<K, V, S> {
         if slot >= self.entries.len() {
             return None;
         }
-        self.entry_at_mut(slot)
-            .as_mut()
-            .map(|e| (&e.key, &mut e.value))
+        if !self.entry_valid(slot) {
+            return None;
+        }
+        let e = self.entry_at_mut(slot);
+        Some((&e.key, &mut e.value))
     }
 
     pub fn iter(&self) -> LiveIter<'_, K, V> {
@@ -585,10 +653,9 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
             }
             if index >= VALID_OFFSET {
                 let slot = (index - VALID_OFFSET) as usize;
-                if slot < self.entries.len()
-                    && let Some(e) = self.entry_at(slot).as_ref()
-                {
-                    if e.hash == hash && key.equivalent(&e.key) {
+                if slot < self.entries.len() && self.entry_valid(slot) {
+                    let e = self.entry_at(slot);
+                    if e.f_hash == hash && key.equivalent(&e.key) {
                         return Some(slot);
                     }
                 }
@@ -628,10 +695,9 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
                 }
             } else {
                 let slot = (index - VALID_OFFSET) as usize;
-                if slot < self.entries.len()
-                    && let Some(e) = self.entry_at(slot).as_ref()
-                {
-                    if e.hash == hash && key.equivalent(&e.key) {
+                if slot < self.entries.len() && self.entry_valid(slot) {
+                    let e = self.entry_at(slot);
+                    if e.f_hash == hash && key.equivalent(&e.key) {
                         return Ok(slot);
                     }
                 }
@@ -660,10 +726,10 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         self.indexes = vec![FREE; new_size];
         self.resize_counter = (new_size * 2) as isize - (self.num_live_items * 3) as isize;
         for slot in 0..self.entries.len() {
-            let hash = match self.entry_at(slot) {
-                Some(e) => e.hash,
-                None => continue,
-            };
+            if !self.entry_valid(slot) {
+                continue;
+            }
+            let hash = self.entry_at(slot).f_hash;
             self.insert_clean(hash, slot as u32);
         }
         self.generation = self.generation.wrapping_add(1);
@@ -676,7 +742,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     #[majit_macros::dont_look_inside]
     fn remove_deleted_items(&mut self) {
         let shrink = self.num_live_items < self.entries.capacity() / 4;
-        self.entries.retain(|e| e.is_some());
+        self.entries.retain(|e| e.f_valid);
         debug_assert_eq!(self.entries.len(), self.num_live_items);
         if shrink {
             // "At least 75% of the allocated entries are dead, so shrink the
@@ -714,7 +780,10 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     {
         let hash = self.hash_of(key);
         let slot = self.lookup(hash, key)?;
-        self.entry_at(slot).as_ref().map(|e| &e.value)
+        if !self.entry_valid(slot) {
+            return None;
+        }
+        Some(&self.entry_at(slot).value)
     }
 
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
@@ -723,7 +792,10 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     {
         let hash = self.hash_of(key);
         let slot = self.lookup(hash, key)?;
-        self.entry_at_mut(slot).as_mut().map(|e| &mut e.value)
+        if !self.entry_valid(slot) {
+            return None;
+        }
+        Some(&mut self.entry_at_mut(slot).value)
     }
 
     pub fn contains_key<Q>(&self, key: &Q) -> bool
@@ -752,7 +824,8 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         }
         let index_slot = match self.lookup_for_store(hash, &key) {
             Ok(slot) => {
-                let e = self.entry_at_mut(slot).as_mut().expect("valid slot");
+                assert!(self.entry_valid(slot), "valid slot");
+                let e = self.entry_at_mut(slot);
                 return Some(replace_value(&mut e.value, value));
             }
             Err(index_slot) => index_slot,
@@ -819,7 +892,12 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
             }
         }
         self.resize_counter = rc;
-        self.entries.push(Some(Entry { hash, key, value }));
+        self.entries.push(Entry {
+            key,
+            value,
+            f_valid: true,
+            f_hash: hash,
+        });
         self.num_live_items += 1;
     }
 
@@ -845,6 +923,8 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     /// name says `remove` and not `shift_remove` because nothing shifts.
     pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
+        K: EntryDummy,
+        V: EntryDummy,
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let hash = self.hash_of(key);
@@ -855,6 +935,8 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
 
     pub fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
     where
+        K: EntryDummy,
+        V: EntryDummy,
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let hash = self.hash_of(key);
@@ -863,44 +945,56 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     }
 
     /// Delete the pair at `slot`, which must be valid.
-    pub fn remove_slot(&mut self, slot: usize) -> Option<(K, V)> {
+    pub fn remove_slot(&mut self, slot: usize) -> Option<(K, V)>
+    where
+        K: EntryDummy,
+        V: EntryDummy,
+    {
         if slot >= self.entries.len() {
             return None;
         }
-        let hash = match self.entry_at(slot) {
-            Some(e) => e.hash,
-            None => return None,
-        };
+        if !self.entry_valid(slot) {
+            return None;
+        }
+        let hash = self.entry_at(slot).f_hash;
         Some(self.take_slot(hash, slot))
     }
 
-    fn take_slot(&mut self, hash: u64, slot: usize) -> (K, V) {
+    fn take_slot(&mut self, hash: u64, slot: usize) -> (K, V)
+    where
+        K: EntryDummy,
+        V: EntryDummy,
+    {
         self.delete_by_entry_index(hash, slot);
-        let entry = self.entry_at_mut(slot).take().expect("valid slot");
+        let (key, value) = self.mark_deleted(slot);
         self.num_live_items -= 1;
 
         if self.num_live_items == 0 {
             self.entries.clear();
         } else if slot == self.entries.len() - 1 {
-            while matches!(self.entries.last(), Some(None)) {
+            while self.entries.last().is_some_and(|e| !e.f_valid) {
                 self.entries.pop();
             }
         }
         if self.num_live_items + DICT_INITSIZE <= self.entries.capacity() / 8 {
             self.resize();
         }
-        (entry.key, entry.value)
+        (key, value)
     }
 
     /// `ll_dict_popitem` (rordereddict.py) — the last live pair.
-    pub fn pop(&mut self) -> Option<(K, V)> {
+    pub fn pop(&mut self) -> Option<(K, V)>
+    where
+        K: EntryDummy,
+        V: EntryDummy,
+    {
         let mut slot = self.entries.len();
         loop {
             if slot == 0 {
                 return None;
             }
             slot -= 1;
-            if self.entry_at(slot).is_some() {
+            if self.entry_valid(slot) {
                 return self.remove_slot(slot);
             }
         }
@@ -915,14 +1009,18 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     /// `internal_delitem` + `setitem` pair.  To the front there is no cheap
     /// move; upstream calls its own path "a *very slow* fall-back" and rebuilds
     /// the dict, so this does too.
-    pub fn move_slot_to_end(&mut self, slot: usize, last: bool) -> bool {
+    pub fn move_slot_to_end(&mut self, slot: usize, last: bool) -> bool
+    where
+        K: EntryDummy,
+        V: EntryDummy,
+    {
         if slot >= self.entries.len() {
             return false;
         }
-        let hash = match self.entry_at(slot) {
-            Some(e) => e.hash,
-            None => return false,
-        };
+        if !self.entry_valid(slot) {
+            return false;
+        }
+        let hash = self.entry_at(slot).f_hash;
         if last {
             if slot + 1 == self.entries.len() {
                 return false;
@@ -937,7 +1035,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
             let rest: Vec<(K, V)> = self
                 .entries
                 .drain(..)
-                .flatten()
+                .filter(|e| e.f_valid)
                 .map(|e| (e.key, e.value))
                 .collect();
             self.indexes.clear();
@@ -955,6 +1053,8 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     /// [`Self::move_slot_to_end`] by key; answers `None` when the key is absent.
     pub fn move_to_end<Q>(&mut self, key: &Q, last: bool) -> Option<bool>
     where
+        K: EntryDummy,
+        V: EntryDummy,
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let hash = self.hash_of(key);
@@ -1032,15 +1132,17 @@ impl<'a, K, V, S> IntoIterator for &'a RDict<K, V, S> {
 
 impl<K, V, S> IntoIterator for RDict<K, V, S> {
     type Item = (K, V);
-    type IntoIter = std::iter::Map<
-        std::iter::Flatten<std::vec::IntoIter<Option<Entry<K, V>>>>,
-        fn(Entry<K, V>) -> (K, V),
-    >;
+    type IntoIter =
+        std::iter::FilterMap<std::vec::IntoIter<Entry<K, V>>, fn(Entry<K, V>) -> Option<(K, V)>>;
     fn into_iter(self) -> Self::IntoIter {
-        fn pair<K, V>(e: Entry<K, V>) -> (K, V) {
-            (e.key, e.value)
+        fn pair<K, V>(e: Entry<K, V>) -> Option<(K, V)> {
+            if e.f_valid {
+                Some((e.key, e.value))
+            } else {
+                None
+            }
         }
-        self.entries.into_iter().flatten().map(pair as fn(_) -> _)
+        self.entries.into_iter().filter_map(pair as fn(_) -> _)
     }
 }
 
@@ -1601,6 +1703,12 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     struct Nasty(u64);
 
+    impl EntryDummy for Nasty {
+        fn dummy() -> Self {
+            Nasty(0)
+        }
+    }
+
     impl Hash for Nasty {
         fn hash<H: Hasher>(&self, state: &mut H) {
             // every key into one bucket run, so a probe has to walk
@@ -1666,6 +1774,26 @@ mod tests {
             assert_eq!(d.get(&Nasty(i)).copied(), Some(i), "lost inserted key {i}");
         }
         assert_eq!(d.get(&Nasty(101)).copied(), None);
+    }
+
+    #[test]
+    fn a_deleted_slot_is_invalid_and_cleared() {
+        let mut d: RDict<String, String> = RDict::new();
+        d.insert("a".to_string(), "A".to_string());
+        d.insert("b".to_string(), "B".to_string());
+        d.insert("c".to_string(), "C".to_string());
+        assert_eq!(d.remove("b"), Some("B".to_string()));
+        assert!(!d.entry_valid(1));
+        assert_eq!(d.entries[1].key, "");
+        assert_eq!(d.entries[1].value, "");
+        let got: Vec<(String, String)> = d.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a".to_string(), "A".to_string()),
+                ("c".to_string(), "C".to_string())
+            ]
+        );
     }
 
     #[test]

@@ -1097,6 +1097,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     let mut functions = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     let mut atomic_load_decls = Vec::new();
+    let spec = std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new());
     for fd in llbc.iter_local_fns() {
         // Charon emits static / const initialiser bodies (e.g. the
         // body that builds `static NONE_SINGLETON`) as ordinary
@@ -1177,6 +1178,8 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             builder_mode,
             &accum,
             &mut atomic_reasons,
+            Some(&spec),
+            false,
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -1208,85 +1211,100 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // Without this, every impl method built by the MIR driver looks
         // like a free function to the canonical registration loop and
         // the impl-key return-type / hint registrations get dropped.
-        let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
-        let trait_impl_id = trait_impl_id_for_fundecl(fd);
-        let graph = if let Some(owner) = &self_ty_root {
-            let source_identity = match trait_impl_id {
-                Some(impl_id) => format!("{module_path}::{owner}::<Impl#{impl_id}>::{name}"),
-                None => format!("{module_path}::{owner}::{name}"),
-            };
-            graph
-                .with_owner_root(owner.clone())
-                .with_source_identity(source_identity)
-        } else {
-            graph.with_source_identity(fn_path.clone())
-        };
-        let graph = graph.with_fun_decl_id(fd.def_id);
-        // Surface trait identity for trait-impl methods so the
-        // canonical registration loop can call `register_trait_method`
-        // instead of routing through `extract_trait_impls`.  Inherent
-        // impls leave `trait_root = None`; trait-impl methods carry the
-        // trait's leaf name.
-        //
-        // Two sources feed `trait_root`:
-        //   1. trait-impl bodies — penultimate NameSeg is `Impl{Trait:id}`
-        //      indirecting through `trait_impls`.  `trait_impl_trait_path_for_fundecl`
-        //      reads the id; `trait_qualified` keeps the full path so
-        //      the unique-impl map can key on trait identity.
-        //   2. trait-default bodies — Charon emits these as bare
-        //      functions inside the trait's namespace; the penultimate
-        //      NameSeg is `Ident{TraitLeaf}` with no `Impl` segment.
-        //      Detect by matching the parent ident against
-        //      `known_trait_names` (which derive_program_metadata seeds
-        //      with both qualified path and bare leaf).
-        let trait_qualified = trait_impl_trait_path_for_fundecl(llbc, fd);
-        let trait_root = trait_qualified
-            .as_ref()
-            .and_then(|p| p.rsplit("::").next())
-            .map(str::to_string)
-            .or_else(|| trait_default_owner_for_fundecl(fd, &known_trait_names));
-        let gcref_result = gc_root_gcref_result_path(&fn_path);
-        let returns_objectptr =
-            output_type_is_objectptr(&fd.signature.output, llbc) && !gcref_result;
-        // `dont_look_inside` / `elidable` callees and every trait-method
-        // member of an indirect-call row stamp FUNC.RESULT.  RPython's
-        // `FunctionReprBase.call` reads that row from `FuncType.RESULT`.
-        // Left `None`, pyre maps it to `Void`, so a callee whose body
-        // produces a scalar disagrees with the call's `result_ty`.
-        // A `repr(transparent)` scalar wrapper is that word: the same
-        // token an opaque callee gets, including an inherent constructor
-        // that is not itself a trait method.
-        // Aggregate `"ref"` results stay unstamped — the call-signature
-        // validator skips a missing declaration, and a struct name is not
-        // a register class.
-        let stamp_return_token = dont_look_inside.contains(&fn_path)
-            || elidable_residual.contains(&fn_path)
-            || trait_root.is_some();
-        let signature_token = if gcref_result {
-            Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
-        } else {
-            dont_look_inside_return_token(&fd.signature.output, llbc, static_addrs.error_carrier)
-        };
-        let return_type = if gcref_result || stamp_return_token {
-            signature_token
-        } else if signature_token.as_deref().is_some_and(scalar_result_token) {
-            signature_token
-        } else {
-            None
-        };
-        functions.push(crate::front::semantic::SemanticFunction {
-            name,
+        functions.push(semantic_function_from_lowered(
+            llbc,
+            fd,
             graph,
-            return_type,
-            self_ty_root,
-            trait_impl_id,
-            fun_decl_id: Some(fd.def_id),
+            name,
             module_path,
-            hints: Vec::new(),
-            trait_root,
-            trait_qualified,
-            returns_objectptr,
-        });
+            &fd.signature,
+            &known_trait_names,
+            &dont_look_inside,
+            &elidable_residual,
+            static_addrs.error_carrier,
+            &fn_path,
+        ));
+    }
+    // `specialize.py` `cachedgraph` keys one graph per instantiation. The
+    // walk above enqueues each concrete call; lowering a copy enqueues the
+    // callees whose clauses that copy just bound.
+    loop {
+        let Some(req) = spec.borrow_mut().pop() else {
+            break;
+        };
+        let spec_name = req.leaf.clone();
+        let Some(fd) = llbc.fn_by_id(req.fn_id) else {
+            continue;
+        };
+        let Some(body) = crate::front::clause_spec::substituted_unstructured(
+            fd,
+            llbc,
+            &req.trait_refs,
+            &req.types,
+            &req.const_generics,
+        ) else {
+            skipped.push((spec_name, "no substituted unstructured body".into()));
+            continue;
+        };
+        let signature = crate::front::clause_spec::substituted_signature(
+            &fd.signature,
+            llbc,
+            &req.types,
+            &req.const_generics,
+        );
+        let accum = AccumulatorFacts::build(llbc, &body);
+        let builder_mode = accum.has_builder;
+        let mut atomic_reasons = Vec::new();
+        let mut graph = match lower_unstructured_with_static_addrs_and_attrs(
+            llbc,
+            fd,
+            &body,
+            static_addrs,
+            jitdriver_receiver_roots,
+            &struct_field_attrs,
+            &dont_look_inside,
+            &tombstoned_leaves,
+            builder_mode,
+            &accum,
+            &mut atomic_reasons,
+            Some(&spec),
+            true,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                let msg = e.to_string();
+                if let Some(reason) = atomic_reasons.first() {
+                    atomic_load_decls.push(declined_atomic_load_fun_decl(llbc, fd, reason.clone()));
+                }
+                skipped.push((spec_name, msg));
+                continue;
+            }
+        };
+        let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+        let (module_path, bare_leaf) = match stripped.rsplit_once("::") {
+            Some((module, leaf)) => (module.to_string(), leaf.to_string()),
+            None => (String::new(), stripped),
+        };
+        let policy_fn_path = if module_path.is_empty() {
+            bare_leaf
+        } else {
+            format!("{module_path}::{bare_leaf}")
+        };
+        let name = req.leaf;
+        graph.name = spec_segments(llbc, fd, &name).join("::");
+        functions.push(semantic_function_from_lowered(
+            llbc,
+            fd,
+            graph,
+            name,
+            module_path,
+            &signature,
+            &known_trait_names,
+            &dont_look_inside,
+            &elidable_residual,
+            static_addrs.error_carrier,
+            &policy_fn_path,
+        ));
     }
     // `specialize.py default_specialize` runs while the annotator walks
     // calls; on this path the whole function set has to exist first, so it
@@ -1371,6 +1389,106 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         foreign_opaque_method_externals: Vec::new(),
         atomic_load_decls,
     })
+}
+
+/// One lowered body as a `SemanticFunction`. `name` is the bare leaf or
+/// the specialized leaf; `signature` is the declaration signature or the
+/// substituted copy. `policy_fn_path` is `module_path::<bare leaf>`, the
+/// key the hint sets use; `fn_path` stays the spec name. Both loops
+/// register through this function.
+fn semantic_function_from_lowered(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    graph: crate::model::FunctionGraph,
+    name: String,
+    module_path: String,
+    signature: &majit_charon_reader::ullbc::Signature,
+    known_trait_names: &std::collections::HashSet<String>,
+    dont_look_inside: &std::collections::HashSet<String>,
+    elidable_residual: &std::collections::HashSet<String>,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+    policy_fn_path: &str,
+) -> crate::front::semantic::SemanticFunction {
+    let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
+    let trait_impl_id = trait_impl_id_for_fundecl(fd);
+    let fn_path = if module_path.is_empty() {
+        name.clone()
+    } else {
+        format!("{module_path}::{name}")
+    };
+    let source_identity = match (&self_ty_root, trait_impl_id) {
+        (Some(owner), Some(impl_id)) => {
+            format!("{module_path}::{owner}::<Impl#{impl_id}>::{name}")
+        }
+        (Some(owner), None) => format!("{module_path}::{owner}::{name}"),
+        _ => fn_path.clone(),
+    };
+    let graph = if let Some(owner) = &self_ty_root {
+        graph
+            .with_owner_root(owner.clone())
+            .with_source_identity(source_identity)
+    } else {
+        graph.with_source_identity(source_identity)
+    };
+    let mut graph = graph.with_fun_decl_id(fd.def_id);
+    // Trait-impl methods carry the trait leaf so registration calls
+    // `register_trait_method`. Inherent impls leave `trait_root` empty.
+    // Trait-default bodies match the parent ident against `known_trait_names`.
+    let trait_qualified = trait_impl_trait_path_for_fundecl(llbc, fd);
+    let trait_root = trait_qualified
+        .as_ref()
+        .and_then(|p| p.rsplit("::").next())
+        .map(str::to_string)
+        .or_else(|| trait_default_owner_for_fundecl(fd, known_trait_names));
+    let gcref_result = gc_root_gcref_result_path(policy_fn_path);
+    let returns_objectptr = output_type_is_objectptr(&signature.output, llbc) && !gcref_result;
+    // `dont_look_inside` / `elidable` callees and every trait-method
+    // member of an indirect-call row stamp FUNC.RESULT.
+    // A `repr(transparent)` scalar wrapper is that word.
+    // Aggregate `"ref"` results stay unstamped.
+    let stamp_return_token = dont_look_inside.contains(policy_fn_path)
+        || elidable_residual.contains(policy_fn_path)
+        || trait_root.is_some();
+    // A spec copy's own path is not in the harvested sets. Copy the
+    // declaration's residual markers onto this graph so registration and
+    // `look_inside_graph` keep the same status.
+    let mut hints = Vec::new();
+    if policy_fn_path != fn_path {
+        if dont_look_inside.contains(policy_fn_path) {
+            hints.push("dont_look_inside".to_string());
+        }
+        if elidable_residual.contains(policy_fn_path) {
+            hints.push("elidable".to_string());
+        }
+        if !hints.is_empty() {
+            crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &hints);
+        }
+    }
+    let signature_token = if gcref_result {
+        Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
+    } else {
+        dont_look_inside_return_token(&signature.output, llbc, error_carrier)
+    };
+    let return_type = if gcref_result || stamp_return_token {
+        signature_token
+    } else if signature_token.as_deref().is_some_and(scalar_result_token) {
+        signature_token
+    } else {
+        None
+    };
+    crate::front::semantic::SemanticFunction {
+        name,
+        graph,
+        return_type,
+        self_ty_root,
+        trait_impl_id,
+        fun_decl_id: Some(fd.def_id),
+        module_path,
+        hints,
+        trait_root,
+        trait_qualified,
+        returns_objectptr,
+    }
 }
 
 fn should_lower_module(
@@ -2967,6 +3085,8 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         builder_mode,
         &accum,
         &mut atomic_load_reasons,
+        None,
+        false,
     )
 }
 
@@ -3030,6 +3150,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     builder_mode: bool,
     accum: &AccumulatorFacts,
     atomic_load_reasons: &mut Vec<String>,
+    spec: Option<&std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
+    spec_body: bool,
 ) -> Result<FunctionGraph, LowerError> {
     let name = fd.item_meta.name_path();
     // The Result-of-PyError exception-link lowering's callee rule
@@ -3690,6 +3812,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         if builder_mode {
             lo.enable_builder_mode();
         }
+        if let Some(spec) = spec {
+            lo.set_spec(spec);
+            if spec_body {
+                lo.set_spec_body();
+            }
+        }
         // Back-edge targets (loop headers); empty for an acyclic body, in
         // which case `lower_framestate` reduces exactly to the two-pass
         // RPO walk.  Treat the threaded lowering and its shared
@@ -3738,6 +3866,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     if builder_mode {
         lo.enable_builder_mode();
     }
+    if let Some(spec) = spec {
+        lo.set_spec(spec);
+        if spec_body {
+            lo.set_spec_body();
+        }
+    }
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => {
             finish(&mut lo)?;
@@ -3768,6 +3902,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             )?;
             if builder_mode {
                 lo.enable_builder_mode();
+            }
+            if let Some(spec) = spec {
+                lo.set_spec(spec);
+                if spec_body {
+                    lo.set_spec_body();
+                }
             }
             lo.lower(BlockOrder::ReversePostorder)?;
             finish(&mut lo)?;
@@ -4011,7 +4151,7 @@ fn scalar_replace_named_struct_aggregates(
         let Some(site) = next_struct_aggregate_ctor(graph, &malloc_args, struct_field_attrs) else {
             break;
         };
-        if !scalar_replace_one_struct_aggregate(graph, site) {
+        if !scalar_replace_one_struct_aggregate(graph, site, &malloc_args, struct_field_attrs) {
             break;
         }
         rewritten += 1;
@@ -4183,9 +4323,732 @@ fn struct_ctor_kind_has_whole_value_use(kind: &OpKind, result: &Variable) -> boo
     }
 }
 
+/// `malloc.py` `LifeTime` — one union-find class of `(block, var)` pairs.
+struct MallocLifeTime {
+    parent: usize,
+    variables: Vec<(usize, Variable)>,
+    /// `("op", block, op)` or a non-op tag (`"inputargs"`, `"constant"`,
+    /// `"last_exception"`, `"last_exc_value"`).
+    creations: Vec<MallocCreation>,
+    /// `("op", block, op, index)` or a non-op tag (`"return"`, `"except"`,
+    /// `"exitswitch"`, `"dup"`).
+    uses: Vec<MallocUse>,
+}
+
+enum MallocCreation {
+    Op { block: usize, op_idx: usize },
+    Other,
+}
+
+enum MallocUse {
+    Op {
+        block: usize,
+        op_idx: usize,
+        index: usize,
+    },
+    Other,
+}
+
+/// Current value of one flattened field inside `flowin`.
+#[derive(Clone)]
+enum FieldCur {
+    /// `malloc.py` `newvarsmap` entry: a variable or a constant.
+    Arg(LinkArg),
+    /// Typed zero of a `Ref` / `Str` field (`ConstRefNull`).
+    NullRef,
+}
+
+/// `malloc.py` `compute_lifetimes` + `_try_inline_malloc` for the lifetime
+/// that contains `ctor` (`block_idx`, `result`). `true` when `flowin`
+/// removed that malloc. A later `scalar_replace_named_struct_aggregates`
+/// iteration is the `remove_simple_mallocs` fixpoint.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded"
+)]
+fn try_inline_malloc_lifetime(
+    graph: &mut FunctionGraph,
+    block_idx: usize,
+    result: &Variable,
+    owner: &str,
+    malloc_args: &std::collections::HashSet<Variable>,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> bool {
+    let Some(flatnames) = struct_flatnames(owner, struct_field_attrs) else {
+        return false;
+    };
+    if flatnames.is_empty() {
+        return false;
+    }
+    let lifetimes = compute_lifetimes(graph);
+    let Some(info_idx) = lifetimes.index.get(&(block_idx, result.clone())).copied() else {
+        return false;
+    };
+    let info_idx = lifetimes.root_of(info_idx);
+    let info = &lifetimes.nodes[info_idx];
+    if !lifetime_is_removable(
+        graph,
+        info,
+        owner,
+        &flatnames,
+        malloc_args,
+        struct_field_attrs,
+    ) {
+        return false;
+    }
+    let mut by_block: Vec<(usize, Vec<Variable>)> = Vec::new();
+    for (block, var) in &info.variables {
+        if let Some((_, vars)) = by_block.iter_mut().find(|(seen, _)| seen == block) {
+            if !vars.iter().any(|existing| existing == var) {
+                vars.push(var.clone());
+            }
+        } else {
+            by_block.push((*block, vec![var.clone()]));
+        }
+    }
+    let zeros: Vec<FieldCur> = flatnames.iter().map(|(_, ty)| zero_field_cur(ty)).collect();
+    // `malloc.py` `_try_inline_malloc`: inputargs first, then mallocs
+    // created in the block. Each successful malloc increments progress.
+    let mut progress = 0usize;
+    for (block, vars) in by_block {
+        let mut new_map: Option<Vec<FieldCur>> = None;
+        let mut new_inputargs: Vec<Variable> = Vec::new();
+        let mut inputvars: Vec<Variable> = Vec::new();
+        for var in graph.blocks[block].inputargs.clone() {
+            if vars.iter().any(|candidate| candidate == &var) {
+                inputvars.push(var);
+                if new_map.is_none() {
+                    let mut map = Vec::with_capacity(flatnames.len());
+                    for (_, ty) in &flatnames {
+                        let fresh = graph.alloc_value_var_with_type(concretetype_for_field(ty));
+                        map.push(FieldCur::Arg(LinkArg::Value(fresh.clone())));
+                        new_inputargs.push(fresh);
+                    }
+                    new_map = Some(map);
+                }
+            } else {
+                new_inputargs.push(var);
+            }
+        }
+        graph.blocks[block].inputargs = new_inputargs;
+        if !inputvars.is_empty() {
+            flowin_malloc_block(graph, block, inputvars, new_map, &flatnames, &zeros);
+        }
+        let created: Vec<Variable> = graph.blocks[block]
+            .operations
+            .iter()
+            .filter_map(|op| {
+                let produced = op.result.as_ref()?;
+                let still_malloc = matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor {
+                            is_struct: true,
+                            ..
+                        },
+                        args,
+                        ..
+                    } if args.is_empty()
+                );
+                if still_malloc && vars.iter().any(|candidate| candidate == produced) {
+                    Some(produced.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for var in created {
+            flowin_malloc_block(graph, block, vec![var], None, &flatnames, &zeros);
+            progress += 1;
+        }
+    }
+    // Input-flowin may already have dropped the malloc (`progress` stays 0).
+    // The caller treats `false` as "fall back to `New`", so any completed
+    // inline reports success. `progress` still counts mallocs removed inside
+    // the block, matching `malloc.py` `_try_inline_malloc`.
+    let _ = progress;
+    true
+}
+
+fn struct_flatnames(
+    owner: &str,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> Option<Vec<(String, ValueType)>> {
+    struct_field_attrs
+        .get(owner)
+        .or_else(|| {
+            owner
+                .rsplit("::")
+                .next()
+                .and_then(|leaf| struct_field_attrs.get(leaf))
+        })
+        .cloned()
+}
+
+fn concretetype_for_field(ty: &ValueType) -> crate::model::ConcreteType {
+    match ty {
+        ValueType::Float => crate::model::ConcreteType::Float,
+        ValueType::Void => crate::model::ConcreteType::Void,
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => {
+            crate::model::ConcreteType::GcRef
+        }
+        ValueType::State | ValueType::Unknown => crate::model::ConcreteType::Unknown,
+        ValueType::Int
+        | ValueType::Unsigned
+        | ValueType::Bool
+        | ValueType::SingleFloat
+        | ValueType::Int128
+        | ValueType::UInt128 => crate::model::ConcreteType::Signed,
+    }
+}
+
+/// Typed zero, matching `emit_zero_constant_of_ty`. `Ref` is null.
+fn zero_field_cur(ty: &ValueType) -> FieldCur {
+    match ty {
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => FieldCur::NullRef,
+        ValueType::Bool => FieldCur::Arg(LinkArg::Const(crate::flowspace::model::Constant::new(
+            ConstValue::Bool(false),
+        ))),
+        ValueType::Float => FieldCur::Arg(LinkArg::Const(crate::flowspace::model::Constant::new(
+            ConstValue::Float(0),
+        ))),
+        ValueType::Int128 => FieldCur::Arg(LinkArg::Const(crate::flowspace::model::Constant::new(
+            ConstValue::Int128(0),
+        ))),
+        ValueType::UInt128 => FieldCur::Arg(LinkArg::Const(
+            crate::flowspace::model::Constant::new(ConstValue::UInt128(0)),
+        )),
+        ValueType::Void => FieldCur::Arg(LinkArg::Const(crate::flowspace::model::Constant::new(
+            ConstValue::None,
+        ))),
+        ValueType::SingleFloat => FieldCur::Arg(LinkArg::Const(
+            crate::flowspace::model::Constant::new(ConstValue::Int(0)),
+        )),
+        ValueType::Int | ValueType::Unsigned | ValueType::State | ValueType::Unknown => {
+            FieldCur::Arg(LinkArg::Const(crate::flowspace::model::Constant::new(
+                ConstValue::Int(0),
+            )))
+        }
+    }
+}
+
+fn alias_op_for_field(cur: &FieldCur, ty: &ValueType) -> Option<OpKind> {
+    match cur {
+        FieldCur::NullRef => Some(OpKind::ConstRefNull),
+        FieldCur::Arg(arg) => {
+            if matches!(ty, ValueType::Unsigned)
+                && matches!(arg, LinkArg::Const(constant) if matches!(constant.value, ConstValue::Int(0)))
+            {
+                return Some(OpKind::ConstUInt(0));
+            }
+            if matches!(ty, ValueType::SingleFloat)
+                && matches!(arg, LinkArg::Const(constant) if matches!(constant.value, ConstValue::Int(0)))
+            {
+                return Some(OpKind::ConstSingleFloat(0));
+            }
+            link_arg_as_alias_op(arg, ty)
+        }
+    }
+}
+
+fn field_value_aliasable(value: &LinkArg, ty: &ValueType) -> bool {
+    alias_op_for_field(&FieldCur::Arg(value.clone()), ty).is_some()
+}
+
+/// `malloc.py` `LLTypeMallocRemover.check_malloc` for a front aggregate ctor,
+/// the same selection as [`next_struct_aggregate_ctor`].
+fn aggregate_ctor_owner(
+    graph: &FunctionGraph,
+    op: &SpaceOperation,
+    malloc_args: &std::collections::HashSet<Variable>,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> Option<String> {
+    let result = op.result.as_ref()?;
+    if malloc_args.contains(result) {
+        return None;
+    }
+    let OpKind::Call {
+        target:
+            CallTarget::SyntheticTransparentCtor {
+                name,
+                is_struct: true,
+                ..
+            },
+        args,
+        result_ty,
+    } = &op.kind
+    else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    if majit_charon_reader::ullbc::is_closure_leaf(name) {
+        return None;
+    }
+    let ValueType::Ref(Some(owner)) = result_ty else {
+        return None;
+    };
+    if owner.is_empty() {
+        return None;
+    }
+    let layout_empty = struct_field_attrs
+        .get(owner)
+        .or_else(|| {
+            owner
+                .rsplit("::")
+                .next()
+                .and_then(|leaf| struct_field_attrs.get(leaf))
+        })
+        .is_some_and(|rows| rows.is_empty());
+    let discovered = struct_ctor_discovered_fields(graph, result);
+    if discovered.is_empty() {
+        return None;
+    }
+    if layout_empty && struct_ctor_has_whole_value_use(graph, result) {
+        return None;
+    }
+    Some(owner.clone())
+}
+
+struct MallocLifetimes {
+    index: std::collections::HashMap<(usize, Variable), usize>,
+    nodes: Vec<MallocLifeTime>,
+}
+
+impl MallocLifetimes {
+    fn ensure(&mut self, block: usize, var: &Variable) -> usize {
+        let key = (block, var.clone());
+        if let Some(&idx) = self.index.get(&key) {
+            return idx;
+        }
+        let idx = self.nodes.len();
+        self.nodes.push(MallocLifeTime {
+            parent: idx,
+            variables: vec![key.clone()],
+            creations: Vec::new(),
+            uses: Vec::new(),
+        });
+        self.index.insert(key, idx);
+        idx
+    }
+
+    fn root_of(&self, mut idx: usize) -> usize {
+        while self.nodes[idx].parent != idx {
+            idx = self.nodes[idx].parent;
+        }
+        idx
+    }
+
+    fn find(&mut self, block: usize, var: &Variable) -> usize {
+        let idx = self.ensure(block, var);
+        let root = self.root_of(idx);
+        let mut cursor = idx;
+        while cursor != root {
+            let parent = self.nodes[cursor].parent;
+            self.nodes[cursor].parent = root;
+            cursor = parent;
+        }
+        root
+    }
+
+    fn set_creation(&mut self, block: usize, var: &Variable, creation: MallocCreation) {
+        let root = self.find(block, var);
+        self.nodes[root].creations.push(creation);
+    }
+
+    fn set_use(&mut self, block: usize, var: &Variable, use_point: MallocUse) {
+        let root = self.find(block, var);
+        self.nodes[root].uses.push(use_point);
+    }
+
+    /// `malloc.py` `compute_lifetimes` `union`.
+    fn union(&mut self, block1: usize, var1: &Variable, block2: usize, var2: &Variable) {
+        let left = self.find(block1, var1);
+        let right = self.find(block2, var2);
+        if left == right {
+            return;
+        }
+        let variables = std::mem::take(&mut self.nodes[right].variables);
+        let creations = std::mem::take(&mut self.nodes[right].creations);
+        let uses = std::mem::take(&mut self.nodes[right].uses);
+        self.nodes[left].variables.extend(variables);
+        self.nodes[left].creations.extend(creations);
+        self.nodes[left].uses.extend(uses);
+        self.nodes[right].parent = left;
+    }
+}
+
+/// `malloc.py` `BaseMallocRemover.compute_lifetimes`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded"
+)]
+fn compute_lifetimes(graph: &FunctionGraph) -> MallocLifetimes {
+    let id_to_idx: std::collections::HashMap<BlockId, usize> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(idx, block)| (block.id, idx))
+        .collect();
+    let mut lifetimes = MallocLifetimes {
+        index: std::collections::HashMap::new(),
+        nodes: Vec::new(),
+    };
+    let start = id_to_idx[&graph.startblock];
+    for var in &graph.blocks[start].inputargs {
+        lifetimes.set_creation(start, var, MallocCreation::Other);
+    }
+    let return_block = id_to_idx[&graph.returnblock];
+    if let Some(var) = graph.blocks[return_block].inputargs.first() {
+        lifetimes.set_use(return_block, var, MallocUse::Other);
+    }
+    let except_block = id_to_idx[&graph.exceptblock];
+    for var in graph.blocks[except_block].inputargs.iter().take(2) {
+        lifetimes.set_use(except_block, var, MallocUse::Other);
+    }
+
+    let reachable = graph.iterblocks_order();
+    for block_id in &reachable {
+        let Some(&block_idx) = id_to_idx.get(block_id) else {
+            continue;
+        };
+        let block = &graph.blocks[block_idx];
+        for (op_idx, op) in block.operations.iter().enumerate() {
+            // `IDENTITY_OPS`: `link_arg_as_alias_op`'s plain `same_as`.
+            if let OpKind::UnaryOp {
+                op: name, operand, ..
+            } = &op.kind
+                && name == "same_as"
+                && let Some(produced) = &op.result
+            {
+                lifetimes.union(block_idx, operand, block_idx, produced);
+                continue;
+            }
+            for (index, var) in crate::inline::op_variable_refs(&op.kind).iter().enumerate() {
+                lifetimes.set_use(
+                    block_idx,
+                    var,
+                    MallocUse::Op {
+                        block: block_idx,
+                        op_idx,
+                        index,
+                    },
+                );
+            }
+            if let Some(produced) = &op.result {
+                lifetimes.set_creation(
+                    block_idx,
+                    produced,
+                    MallocCreation::Op {
+                        block: block_idx,
+                        op_idx,
+                    },
+                );
+            }
+        }
+        match &block.exitswitch {
+            Some(ExitSwitch::Value(var)) => {
+                lifetimes.set_use(block_idx, var, MallocUse::Other);
+            }
+            Some(ExitSwitch::Fused { args, .. }) => {
+                for var in args {
+                    lifetimes.set_use(block_idx, var, MallocUse::Other);
+                }
+            }
+            Some(ExitSwitch::LastException) | None => {}
+        }
+    }
+
+    for block_id in &reachable {
+        let Some(&block_idx) = id_to_idx.get(block_id) else {
+            continue;
+        };
+        for link in &graph.blocks[block_idx].exits {
+            if let Some(var) = link.last_exception.as_ref().and_then(LinkArg::as_variable) {
+                lifetimes.set_creation(block_idx, var, MallocCreation::Other);
+            }
+            if let Some(var) = link.last_exc_value.as_ref().and_then(LinkArg::as_variable) {
+                lifetimes.set_creation(block_idx, var, MallocCreation::Other);
+            }
+            let Some(&target_idx) = id_to_idx.get(&link.target) else {
+                continue;
+            };
+            let target_args = graph.blocks[target_idx].inputargs.clone();
+            let mut duplicate_roots: Vec<usize> = Vec::new();
+            for (index, arg) in link.args.iter().enumerate() {
+                let Some(target_var) = target_args.get(index) else {
+                    continue;
+                };
+                match arg {
+                    LinkArg::Value(var) => {
+                        lifetimes.union(block_idx, var, target_idx, target_var);
+                    }
+                    LinkArg::Const(_) => {
+                        lifetimes.set_creation(target_idx, target_var, MallocCreation::Other);
+                    }
+                }
+                let Some(var) = arg.as_variable() else {
+                    continue;
+                };
+                let root = lifetimes.find(block_idx, var);
+                if duplicate_roots.contains(&root) && lifetimes.nodes[root].creations.len() > 1 {
+                    lifetimes.set_use(block_idx, var, MallocUse::Other);
+                } else {
+                    duplicate_roots.push(root);
+                }
+            }
+        }
+    }
+    lifetimes
+}
+
+fn lifetime_is_removable(
+    graph: &FunctionGraph,
+    info: &MallocLifeTime,
+    owner: &str,
+    flatnames: &[(String, ValueType)],
+    malloc_args: &std::collections::HashSet<Variable>,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> bool {
+    // `_try_inline_malloc`: every creation point is a malloc of one owner.
+    if info.creations.is_empty() {
+        return false;
+    }
+    for creation in &info.creations {
+        let MallocCreation::Op { block, op_idx } = creation else {
+            return false;
+        };
+        let Some(op) = graph
+            .blocks
+            .get(*block)
+            .and_then(|block| block.operations.get(*op_idx))
+        else {
+            return false;
+        };
+        if aggregate_ctor_owner(graph, op, malloc_args, struct_field_attrs).as_deref()
+            != Some(owner)
+        {
+            return false;
+        }
+    }
+    for use_point in &info.uses {
+        let MallocUse::Op {
+            block,
+            op_idx,
+            index,
+        } = use_point
+        else {
+            return false;
+        };
+        if *index != 0 {
+            return false;
+        }
+        let Some(op) = graph
+            .blocks
+            .get(*block)
+            .and_then(|block| block.operations.get(*op_idx))
+        else {
+            return false;
+        };
+        let field_name = match &op.kind {
+            OpKind::FieldRead { field, .. } => field.name.as_str(),
+            OpKind::FieldWrite {
+                field, value, ty, ..
+            } => {
+                if !field_value_aliasable(value, ty) {
+                    return false;
+                }
+                field.name.as_str()
+            }
+            _ => return false,
+        };
+        if !flatnames.iter().any(|(name, _)| name == field_name) {
+            return false;
+        }
+    }
+    // A field op before the malloc (and with no incoming field vars) would
+    // miss `newvarsmap`. That is not removable (`handle_unreachable` is out
+    // of scope).
+    let mut by_block: Vec<(usize, Vec<Variable>)> = Vec::new();
+    for (block, var) in &info.variables {
+        if let Some((_, vars)) = by_block.iter_mut().find(|(seen, _)| seen == block) {
+            if !vars.iter().any(|existing| existing == var) {
+                vars.push(var.clone());
+            }
+        } else {
+            by_block.push((*block, vec![var.clone()]));
+        }
+    }
+    for (block, mut vars) in by_block {
+        let mut ready = graph.blocks[block]
+            .inputargs
+            .iter()
+            .any(|var| vars.iter().any(|candidate| candidate == var));
+        for op in &graph.blocks[block].operations {
+            if let OpKind::UnaryOp {
+                op: name, operand, ..
+            } = &op.kind
+                && name == "same_as"
+                && vars.iter().any(|candidate| candidate == operand)
+                && let Some(produced) = &op.result
+            {
+                vars.push(produced.clone());
+                continue;
+            }
+            let refs = crate::inline::op_variable_refs(&op.kind);
+            let base_in = refs
+                .first()
+                .is_some_and(|var| vars.iter().any(|candidate| candidate == var));
+            let result_in = op
+                .result
+                .as_ref()
+                .is_some_and(|var| vars.iter().any(|candidate| candidate == var));
+            if base_in {
+                if !ready {
+                    return false;
+                }
+            } else if result_in {
+                ready = true;
+            }
+        }
+    }
+    true
+}
+
+/// `malloc.py` `BaseMallocRemover.flowin` + `LLTypeMallocRemover.flowin_op`
+/// (`getfield` / `setfield` / `same_as` only).
+fn flowin_malloc_block(
+    graph: &mut FunctionGraph,
+    block: usize,
+    mut vars: Vec<Variable>,
+    mut newvarsmap: Option<Vec<FieldCur>>,
+    flatnames: &[(String, ValueType)],
+    zeros: &[FieldCur],
+) {
+    let ops = std::mem::take(&mut graph.blocks[block].operations);
+    let mut newops: Vec<SpaceOperation> = Vec::new();
+    for op in ops {
+        if let OpKind::UnaryOp {
+            op: name, operand, ..
+        } = &op.kind
+            && name == "same_as"
+            && vars.iter().any(|candidate| candidate == operand)
+        {
+            // `flowin_op` same_as: one flattened list for both pointers.
+            if let Some(produced) = &op.result {
+                vars.push(produced.clone());
+            }
+            continue;
+        }
+        let refs = crate::inline::op_variable_refs(&op.kind);
+        let base_in = refs
+            .first()
+            .is_some_and(|var| vars.iter().any(|candidate| candidate == var));
+        let result_in = op
+            .result
+            .as_ref()
+            .is_some_and(|var| vars.iter().any(|candidate| candidate == var));
+        if base_in {
+            match &op.kind {
+                OpKind::FieldRead { field, ty, .. } => {
+                    let Some(map) = newvarsmap.as_ref() else {
+                        newops.push(op);
+                        continue;
+                    };
+                    let Some(index) = flatnames.iter().position(|(name, _)| name == &field.name)
+                    else {
+                        newops.push(op);
+                        continue;
+                    };
+                    let Some(kind) = alias_op_for_field(&map[index], ty) else {
+                        newops.push(op);
+                        continue;
+                    };
+                    newops.push(SpaceOperation {
+                        result: op.result.clone(),
+                        kind,
+                    });
+                }
+                OpKind::FieldWrite { field, value, .. } => {
+                    let Some(map) = newvarsmap.as_mut() else {
+                        newops.push(op);
+                        continue;
+                    };
+                    let Some(index) = flatnames.iter().position(|(name, _)| name == &field.name)
+                    else {
+                        newops.push(op);
+                        continue;
+                    };
+                    map[index] = FieldCur::Arg(value.clone());
+                }
+                _ => newops.push(op),
+            }
+        } else if result_in {
+            // Drop the malloc. Field vars start as the typed zeros.
+            newvarsmap = Some(zeros.to_vec());
+        } else {
+            newops.push(op);
+        }
+    }
+    let exits = std::mem::take(&mut graph.blocks[block].exits);
+    let mut rewritten = Vec::with_capacity(exits.len());
+    for mut link in exits {
+        let mut appended = false;
+        let mut new_args: Vec<LinkArg> = Vec::new();
+        for arg in &link.args {
+            if arg
+                .as_variable()
+                .is_some_and(|var| vars.iter().any(|candidate| candidate == var))
+            {
+                if !appended {
+                    if let Some(map) = &newvarsmap {
+                        for (index, cur) in map.iter().enumerate() {
+                            new_args.push(field_cur_as_link_arg(
+                                graph,
+                                &mut newops,
+                                cur,
+                                &flatnames[index].1,
+                            ));
+                        }
+                    }
+                    appended = true;
+                }
+            } else {
+                new_args.push(arg.clone());
+            }
+        }
+        link.args = new_args;
+        rewritten.push(link);
+    }
+    graph.blocks[block].operations = newops;
+    graph.blocks[block].exits = rewritten;
+}
+
+fn field_cur_as_link_arg(
+    graph: &mut FunctionGraph,
+    newops: &mut Vec<SpaceOperation>,
+    cur: &FieldCur,
+    _ty: &ValueType,
+) -> LinkArg {
+    match cur {
+        FieldCur::NullRef => {
+            let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+            newops.push(SpaceOperation {
+                result: Some(var.clone()),
+                kind: OpKind::ConstRefNull,
+            });
+            LinkArg::Value(var)
+        }
+        FieldCur::Arg(arg) => arg.clone(),
+    }
+}
+
 fn scalar_replace_one_struct_aggregate(
     graph: &mut FunctionGraph,
     site: StructAggregateCtorSite,
+    malloc_args: &std::collections::HashSet<Variable>,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
 ) -> bool {
     let StructAggregateCtorSite {
         block_idx,
@@ -4201,6 +5064,19 @@ fn scalar_replace_one_struct_aggregate(
             })
     });
     if foreign_field_ops {
+        // `malloc.py` `_try_inline_malloc` / `flowin`: a field op in another
+        // block is not an escape when the value only moves along links.
+        // Fall back to one `New` per copy when the lifetime is not removable.
+        if try_inline_malloc_lifetime(
+            graph,
+            block_idx,
+            &result,
+            &owner,
+            malloc_args,
+            struct_field_attrs,
+        ) {
+            return true;
+        }
         graph.blocks[block_idx].operations[op_idx].kind = OpKind::New {
             owner: owner.clone(),
         };
@@ -4844,6 +5720,12 @@ struct Lowering<'a> {
     /// Non-`Relaxed` `Atomic*::load` sites seen in the body, independent of
     /// which lowering error is reported first.
     ordered_atomic_load_reasons: Vec<String>,
+    /// `FunctionDesc.cachedgraph` for this lowering. `None` outside the
+    /// whole-program walk.
+    spec: Option<&'a std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
+    /// This body is a `cachedgraph` copy, so clause refs have been
+    /// replaced and a `TraitImpl` call names the impl method.
+    spec_body: bool,
     /// MIR locals whose enum discriminant is a translation-time
     /// constant: single-assignment locals bound by an always-`Ok`
     /// decomposed conversion ([`Lowering::try_lower_usize_try_from`]).
@@ -5331,6 +6213,8 @@ impl<'a> Lowering<'a> {
             atomic_ref_place: std::collections::HashMap::new(),
             atomic_ordering_locals: std::collections::HashMap::new(),
             ordered_atomic_load_reasons: Vec::new(),
+            spec: None,
+            spec_body: false,
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
             string_byte_view_locals: Vec::new(),
@@ -8521,8 +9405,12 @@ impl<'a> Lowering<'a> {
                     {
                         return self.resolve_place(mir_bb, *inner);
                     }
-                    // A zero-sized field has no runtime representation, so a
-                    // projection from a payload-free enum reads no bytes.
+                    // A zero-sized field has no runtime representation.
+                    // `rclass.py InstanceRepr.getfield` emits `getfield`
+                    // with `resulttype=r` where `r.lowleveltype is Void`
+                    // for a void attribute, and `jtransform.py
+                    // rewrite_op_getfield` drops a getfield whose result
+                    // is Void. The read is a Void value for every base.
                     // Give the projected value the `Void` kind rather than
                     // materialising it in a value bank.  `getkind(lltype.Void)`
                     // is `'void'`, and both `call.py NON_VOID_ARGS` and
@@ -8540,10 +9428,8 @@ impl<'a> Lowering<'a> {
                     // so the adapter can preserve its identity through phi
                     // simplification; a fresh undefined Void variable loses
                     // the constant representative on outgoing links.
-                    // Keep this collapse scoped to a fieldless-enum base: a
-                    // zero-sized field in any other aggregate retains that
-                    // aggregate's ordinary field model.
-                    if self.tyref_is_fieldless_enum(&inner.ty)
+                    if tyref_is_void_zst(&place_ty, self.llbc)
+                        || self.tyref_is_fieldless_enum(&inner.ty)
                         || self.tyref_is_borrowed_fieldless_enum(&inner.ty)
                     {
                         return Ok(self.emit_unit(self.block_id[mir_bb]));
@@ -11029,6 +11915,13 @@ impl<'a> Lowering<'a> {
                 // the destination to the receiver instead of emitting an
                 // `as_ref` method call the rtyper cannot route on the
                 // classdef-less string receiver.
+                if args.len() == 1 && self.is_std_borrow_identity(&reg) {
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 if args.len() == 1
                     && self.is_string_to_str_identity(&reg, first_arg_ty.as_ref(), &call.dest.ty)
                 {
@@ -15664,6 +16557,146 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
+    fn set_spec(&mut self, spec: &'a std::cell::RefCell<crate::front::clause_spec::SpecQueue>) {
+        self.spec = Some(spec);
+    }
+
+    fn set_spec_body(&mut self) {
+        self.spec_body = true;
+    }
+
+    /// Specialized path for a direct call whose `generics.trait_refs` name
+    /// impls. The bare path is unchanged when the callee is not generic or
+    /// the call still carries a `Clause`.
+    fn specialized_fun_segments(&self, fd: &FunDecl, reg: &RegularCall) -> Option<Vec<String>> {
+        self.enqueue_spec(fd, &reg.generics)
+    }
+
+    /// Impl method named by a `TraitImpl` trait ref, specialized when that
+    /// impl's own clauses are concrete. A `Clause` ref returns `None` so
+    /// the call keeps the trait-declaration path.
+    fn specialized_trait_target(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Option<(Vec<String>, Option<(String, String)>)> {
+        if !self.spec_body {
+            return None;
+        }
+        let (fn_id, generics) = crate::front::clause_spec::trait_impl_method(payload, self.llbc)?;
+        let fd = self.llbc.fn_by_id(fn_id)?;
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next().unwrap_or("fn");
+        let segments = spec_segments(self.llbc, fd, leaf);
+        if let Some(segments) = self.enqueue_spec(fd, &generics) {
+            return Some((segments, None));
+        }
+        Some((segments, None))
+    }
+
+    fn enqueue_spec(&self, fd: &FunDecl, generics: &serde_json::Value) -> Option<Vec<String>> {
+        let spec = self.spec?;
+        if !crate::front::clause_spec::decl_is_generic(fd) {
+            return None;
+        }
+        // Only a body this LLBC extracted can be copied. An opaque
+        // declaration (a foreign crate's or std's) keeps its bare path.
+        if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+            return None;
+        }
+        // A builtin is not a `FunctionDesc` (`BUILTIN_ANALYZERS`); it gets no specialized graph.
+        if self.callee_is_host_builtin(fd) {
+            return None;
+        }
+        // Inside a spec copy every concrete instantiation gets its own
+        // graph, including a `dont_look_inside` helper with no trait
+        // clauses. Outside, only a clause-bearing callee with a TraitImpl
+        // ref is copied.
+        let trait_refs = if self.spec_body {
+            crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)?
+        } else {
+            if !spec.borrow_mut().body_has_own_clause(fd, self.llbc) {
+                return None;
+            }
+            let path = fd.item_meta.name_path();
+            if self.dont_look_inside.contains(&strip_crate_prefix(&path)) {
+                return None;
+            }
+            crate::front::clause_spec::concrete_trait_refs(generics, self.llbc)?
+        };
+        let (types, const_generics) =
+            crate::front::clause_spec::concrete_type_args(generics, self.llbc)?;
+        let leaf = fd
+            .item_meta
+            .name_path()
+            .rsplit("::")
+            .next()
+            .unwrap_or("fn")
+            .to_string();
+        let leaf = crate::front::clause_spec::spec_leaf(&leaf, fd.def_id, generics, self.llbc);
+        spec.borrow_mut()
+            .enqueue(crate::front::clause_spec::SpecRequest {
+                fn_id: fd.def_id,
+                leaf: leaf.clone(),
+                trait_refs,
+                types,
+                const_generics,
+            });
+        Some(spec_segments(self.llbc, fd, &leaf))
+    }
+
+    /// `HOST_ENV` resolves the bare call segments, or the crate-qualified
+    /// dotted path (`name_path` with `::` rewritten to `.`).
+    fn callee_is_host_builtin(&self, fd: &FunDecl) -> bool {
+        let (segments, _) = self.unspecialized_fun_segments(fd);
+        if crate::flowspace::model::host_env_callable(&segments).is_some() {
+            return true;
+        }
+        let dotted: Vec<String> = fd
+            .item_meta
+            .name_path()
+            .replace("::", ".")
+            .split('.')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect();
+        crate::flowspace::model::host_env_callable(&dotted).is_some()
+    }
+
+    /// Segments and method hint `call_target_segments` emits for a direct
+    /// call once specialization and blanket `Into` devirtualization decline.
+    fn unspecialized_fun_segments(&self, fd: &FunDecl) -> (Vec<String>, Option<(String, String)>) {
+        let method_hint = self.impl_method_owner(fd);
+        // A `#[dont_look_inside]` inherent method is a residual call, not a
+        // trace target. Routing it as `CallTarget::Method` surfaces
+        // `getattr(recv, method)` on a classed receiver whose classdict
+        // carries no method source, which blocks at annotate
+        // (`complete_pending_blocks failed: Blocked block`). Decline the
+        // Method hint for such a callee so it routes as a `FunctionPath`.
+        let method_hint = if method_hint.is_some()
+            && self
+                .dont_look_inside
+                .contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+        {
+            None
+        } else {
+            method_hint
+        };
+        let segments: Vec<String> = if method_hint.is_none()
+            && let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(self.llbc, fd)
+        {
+            let mut v: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
+            v.push(leaf);
+            v
+        } else {
+            fd.item_meta
+                .name_path()
+                .split("::")
+                .map(|s| s.to_string())
+                .collect()
+        };
+        (segments, method_hint)
+    }
+
     /// Resolve a Charon `CallKind` to a flattened path segment list the
     /// codewriter consumes as `CallTarget::FunctionPath`, plus an
     /// optional `(owner_root_leaf, method_leaf)` pair for impl methods,
@@ -15700,6 +16733,9 @@ impl<'a> Lowering<'a> {
                 .llbc
                 .fn_by_id(*id)
                 .map(|fd| {
+                    if let Some(segments) = self.specialized_fun_segments(fd, reg) {
+                        return (segments, None);
+                    }
                     // Blanket `impl<T, U: From<T>> Into<U> for T`
                     // (core::convert) — `x.into()` is `U::from(x)`.
                     // The callsite's resolved `U: From<T>` obligation
@@ -15712,51 +16748,7 @@ impl<'a> Lowering<'a> {
                     if let Some(IntoDevirt::Target(segments)) = self.blanket_into_devirt(reg) {
                         return (segments, None);
                     }
-                    let method_hint = self.impl_method_owner(fd);
-                    // A `#[dont_look_inside]` inherent method is a residual
-                    // call, not a trace target. Routing it as
-                    // `CallTarget::Method` surfaces `getattr(recv, method)`
-                    // on a classed receiver whose classdict carries no
-                    // method source, which blocks at annotate
-                    // (`complete_pending_blocks failed: Blocked block`).
-                    // Decline the Method hint for such a callee so it routes
-                    // as a `FunctionPath` the registry resolves to the same
-                    // residual fnaddr — the getattr surface vanishes and the
-                    // enclosing carrier annotates with no annotator change.
-                    let method_hint = if method_hint.is_some()
-                        && self
-                            .dont_look_inside
-                            .contains(&strip_crate_prefix(&fd.item_meta.name_path()))
-                    {
-                        None
-                    } else {
-                        method_hint
-                    };
-                    // An impl-block associated function (the method
-                    // gate rejected it — no `self` receiver) is
-                    // spelled `[<qualified owner>, <fn>]`, the key the
-                    // canonical registration loop derives from
-                    // `self_ty_root`; the raw `name_path()` carries an
-                    // `<Impl>` segment that never matches a registry
-                    // entry.
-                    let segments: Vec<String> = if method_hint.is_none()
-                        && let Some((owner_qualified, leaf)) =
-                            impl_method_owner_for_fundecl(self.llbc, fd)
-                    {
-                        // Split like `CallPath::for_impl_method` so the
-                        // segment vectors compare equal.
-                        let mut v: Vec<String> =
-                            owner_qualified.split("::").map(str::to_string).collect();
-                        v.push(leaf);
-                        v
-                    } else {
-                        fd.item_meta
-                            .name_path()
-                            .split("::")
-                            .map(|s| s.to_string())
-                            .collect()
-                    };
-                    (segments, method_hint)
+                    self.unspecialized_fun_segments(fd)
                 })
                 .ok_or_else(|| {
                     LowerError::Schema(format!(
@@ -15797,6 +16789,9 @@ impl<'a> Lowering<'a> {
             // the trait-method shape (e.g. when arr[2] is missing or
             // points at an `Impl` block).
             CallKind::Trait(v) => {
+                if let Some(target) = self.specialized_trait_target(v) {
+                    return Ok(target);
+                }
                 let fn_id = v
                     .as_array()
                     .and_then(|a| a.get(2))
@@ -17479,6 +18474,57 @@ impl<'a> Lowering<'a> {
         }
         deref_impl_owner_leaf(self.llbc, fd)
             .is_some_and(|leaf| matches!(leaf.as_str(), "String" | "Vec"))
+    }
+
+    /// A resolved `core::borrow::Borrow::borrow` whose impl is one of the
+    /// core/alloc identity views and whose method has no extracted body.
+    /// A `Clause` ref and a local impl with a body stay calls.
+    fn is_std_borrow_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Trait(payload) = &reg.kind else {
+            return false;
+        };
+        let Some(impl_id) = crate::front::clause_spec::resolved_trait_impl_id(payload, self.llbc)
+        else {
+            return false;
+        };
+        let Some((fn_id, _)) = crate::front::clause_spec::trait_impl_method(payload, self.llbc)
+        else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(fn_id) else {
+            return false;
+        };
+        if fd.unstructured().is_some() {
+            return false;
+        }
+        if fd.item_meta.name_path().rsplit("::").next() != Some("borrow") {
+            return false;
+        }
+        let Some(ti) = self.llbc.trait_impls_raw().get(impl_id as usize) else {
+            return false;
+        };
+        let Some(trait_id) = ti
+            .pointer("/impl_trait/id")
+            .and_then(serde_json::Value::as_u64)
+        else {
+            return false;
+        };
+        let Some(td) = self.llbc.trait_by_id(trait_id) else {
+            return false;
+        };
+        if td.item_meta.name_path() != "core::borrow::Borrow" {
+            return false;
+        }
+        let Some(types) = ti
+            .pointer("/impl_trait/generics/types")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return false;
+        };
+        let (Some(self_ty), Some(borrowed)) = (types.first(), types.get(1)) else {
+            return false;
+        };
+        crate::front::std_identity::is_identity_borrow_pair(self_ty, borrowed, self.llbc)
     }
 
     /// `<String as AsRef<str>>::as_ref(&self) -> &str`,
@@ -21290,9 +22336,10 @@ impl<'a> Lowering<'a> {
     /// arithmetic is modular machine arithmetic — `rint.py rtype_add
     /// rtype_add` emits `int_add` with no overflow check, and `int_add`
     /// wraps (`rarithmetic.py intmask` semantics) — so the wrapping
-    /// method IS the plain llop.  Restricted to word-sized receivers; a
-    /// narrower `wrapping_add` (which wraps at its own width) keeps the
-    /// `Call` form.
+    /// method IS the plain llop.  A narrower receiver lowers to that word
+    /// op followed by a truncation back to its width — `int_and` for an
+    /// unsigned target, `int_signext` for a signed one — the way `rint.py`
+    /// `cast_primitive` and `jtransform.py` `_int_to_int_cast` narrow.
     ///
     /// Both integer banks count, the lesson [`vec_index_type_is_scalar`]
     /// already carries: `usize` serializes as `{"UInt": "Usize"}`, which
@@ -21493,20 +22540,46 @@ impl<'a> Lowering<'a> {
             return Ok(false);
         };
         let word_bytes = crate::layout::target_word_size();
-        let signed_word = self.tyref_literal_int_atom(src).is_some_and(|atom| {
-            crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes)
-        });
-        let unsigned_word = self.tyref_literal_uint_atom(src).is_some_and(|atom| {
-            crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes)
-        });
-        if !signed_word && !unsigned_word {
+        let word_bits = (word_bytes * 8) as u32;
+        let signed_atom = self.tyref_literal_int_atom(src);
+        let unsigned_atom = self.tyref_literal_uint_atom(src);
+        let (atom, unsigned_receiver) = match (signed_atom, unsigned_atom) {
+            (Some(atom), None) => (atom, false),
+            (None, Some(atom)) => (atom, true),
+            _ => return Ok(false),
+        };
+        // `I128` / `U128` and any unrecognised atom stay a `Call`.
+        // `Isize` / `Usize` are the target word.
+        let bits = match atom {
+            "I8" | "U8" => 8,
+            "I16" | "U16" => 16,
+            "I32" | "U32" => 32,
+            "I64" | "U64" => 64,
+            "Isize" | "Usize" => word_bits,
+            _ => return Ok(false),
+        };
+        let signed_word = !unsigned_receiver
+            && crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes);
+        let unsigned_word = unsigned_receiver
+            && crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes);
+        // Only `wrapping_{add,sub,mul}` widen a receiver narrower than the
+        // word: the word op, then a truncation back (`rint.py`
+        // `cast_primitive`, `jtransform.py` `_int_to_int_cast`: `int_and`
+        // for an unsigned target, `int_signext` for a signed one).
+        // `div` / `rem` / `shl` / `shr` keep the word-only gate.
+        let narrow_truncation = bits < word_bits
+            && matches!(
+                leaf.as_str(),
+                "wrapping_add" | "wrapping_sub" | "wrapping_mul"
+            );
+        if !signed_word && !unsigned_word && !narrow_truncation {
             return Ok(false);
         }
         if signed_only && !signed_word {
             return Ok(false);
         }
         let bb_id = self.block_id[mir_bb];
-        let result_ty = if unsigned_word {
+        let result_ty = if unsigned_receiver {
             ValueType::Unsigned
         } else {
             ValueType::Int
@@ -21558,9 +22631,59 @@ impl<'a> Lowering<'a> {
                 op: op.to_string(),
                 lhs: lhs.clone(),
                 rhs: shift_rhs,
-                result_ty,
+                result_ty: result_ty.clone(),
             },
         });
+        let res = if narrow_truncation && unsigned_receiver {
+            let mask_val = (1u64 << bits) - 1;
+            let mask = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(mask.clone()),
+                kind: OpKind::ConstUInt(mask_val),
+            });
+            let masked = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(masked.clone()),
+                kind: OpKind::BinOp {
+                    op: "and".to_string(),
+                    lhs: res,
+                    rhs: mask,
+                    result_ty,
+                },
+            });
+            masked
+        } else if narrow_truncation {
+            // `jtransform.py` `_int_to_int_cast`: signed narrow target is
+            // `int_signext(v, nbytes)` with `nbytes = size2` in bytes.
+            // The front spells the leaf the way `"and"` becomes `int_and`.
+            let nbytes = i64::from(bits / 8);
+            let width = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(width.clone()),
+                kind: OpKind::ConstInt(nbytes),
+            });
+            let extended = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(extended.clone()),
+                kind: OpKind::BinOp {
+                    op: "signext".to_string(),
+                    lhs: res,
+                    rhs: width,
+                    result_ty,
+                },
+            });
+            extended
+        } else {
+            res
+        };
         self.local_var[dest_local] = Some(res);
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
@@ -24906,6 +26029,28 @@ fn regular_call_fun_decl_id(kind: &CallKind) -> Option<u64> {
             .and_then(serde_json::Value::as_u64),
         _ => None,
     }
+}
+
+/// Call-path segments for a specialized leaf of this declaration.
+fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str) -> Vec<String> {
+    if let Some((owner, _)) = impl_method_owner_for_fundecl(llbc, fd) {
+        return crate::parse::CallPath::for_impl_method(&owner, leaf).segments;
+    }
+    // Same key `free_function_alias_paths` registers: the module portion
+    // of `name_path` is one segment when it contains `<Impl>`, not a
+    // split of that token.
+    let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+    let module = stripped
+        .rsplit_once("::")
+        .map(|(module, _)| module)
+        .unwrap_or("");
+    let mut segments: Vec<String> = if module.is_empty() {
+        Vec::new()
+    } else {
+        module.split("::").map(str::to_string).collect()
+    };
+    segments.push(leaf.to_string());
+    segments
 }
 
 /// The `CallPath` `lib.rs` registers for this FunDecl: crate-stripped
@@ -39385,6 +40530,250 @@ mod tests {
             .collect()
     }
 
+    fn pair_field_attrs() -> std::collections::HashMap<String, Vec<(String, ValueType)>> {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert(
+            "Pair".to_string(),
+            vec![
+                ("a".to_string(), ValueType::Int),
+                ("b".to_string(), ValueType::Int),
+            ],
+        );
+        attrs
+    }
+
+    fn push_pair_ctor(graph: &mut FunctionGraph, block: crate::model::BlockId) -> Variable {
+        graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["pair".to_string()],
+                        "Pair",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("Pair".to_string())),
+                },
+                true,
+            )
+            .expect("pair ctor")
+    }
+
+    fn push_pair_write(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        base: &Variable,
+        field: &str,
+        value: Variable,
+    ) {
+        graph.push_op_var(
+            block,
+            OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor::new(field, Some("Pair".to_string())),
+                value: LinkArg::Value(value),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+    }
+
+    fn push_pair_read(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        base: &Variable,
+        field: &str,
+    ) -> Variable {
+        graph
+            .push_op_var(
+                block,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new(field, Some("Pair".to_string())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("field read")
+    }
+
+    fn graph_has_ctor_or_new(graph: &FunctionGraph) -> bool {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| match &op.kind {
+                OpKind::New { .. } => true,
+                OpKind::Call {
+                    target:
+                        CallTarget::SyntheticTransparentCtor {
+                            is_struct: true, ..
+                        },
+                    ..
+                } => true,
+                _ => false,
+            })
+    }
+
+    fn same_as_operand(graph: &FunctionGraph, result: &Variable) -> Option<Variable> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::UnaryOp {
+                    op: name, operand, ..
+                } if name == "same_as" && op.result.as_ref() == Some(result) => {
+                    Some(operand.clone())
+                }
+                _ => None,
+            })
+    }
+
+    /// `malloc.py` `flowin` across one link: the field value is the new link
+    /// arg, and the successor read is an alias of that input.
+    #[test]
+    fn malloc_removal_follows_a_link() {
+        let mut graph = FunctionGraph::new("malloc_removal_link");
+        let entry = graph.startblock;
+        let x = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs = vec![x.clone()];
+        let agg = push_pair_ctor(&mut graph, entry);
+        push_pair_write(&mut graph, entry, &agg, "a", x.clone());
+        let (next, _) = graph.create_block_with_arg_vars(0);
+        graph.block_mut(next).inputargs = vec![agg.clone()];
+        let read = push_pair_read(&mut graph, next, &agg, "a");
+        graph.set_goto(entry, next, vec![agg]);
+        graph.set_return(next, Some(read.clone()));
+
+        scalar_replace_named_struct_aggregates(&mut graph, &pair_field_attrs());
+
+        assert!(!graph_has_ctor_or_new(&graph));
+        assert_eq!(
+            graph.block(entry).exits[0].args.first(),
+            Some(&LinkArg::Value(x))
+        );
+        let field_input = graph.block(next).inputargs.first().cloned();
+        assert_eq!(same_as_operand(&graph, &read), field_input);
+    }
+
+    /// Two mallocs of one struct join. The join reads a per-field input.
+    #[test]
+    fn malloc_removal_merges_two_ctors_at_a_join() {
+        let mut graph = FunctionGraph::new("malloc_removal_join");
+        let entry = graph.startblock;
+        let x = graph.alloc_value_var();
+        let y = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs = vec![x.clone(), y.clone()];
+        let cond = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .expect("cond");
+        let (left, _) = graph.create_block_with_arg_vars(0);
+        let (right, _) = graph.create_block_with_arg_vars(0);
+        let (join, _) = graph.create_block_with_arg_vars(0);
+        let agg_l = push_pair_ctor(&mut graph, left);
+        push_pair_write(&mut graph, left, &agg_l, "a", x);
+        let agg_r = push_pair_ctor(&mut graph, right);
+        push_pair_write(&mut graph, right, &agg_r, "a", y.clone());
+        graph.block_mut(join).inputargs = vec![agg_l.clone()];
+        let read = push_pair_read(&mut graph, join, &agg_l, "a");
+        graph.set_goto(left, join, vec![agg_l]);
+        graph.set_goto(right, join, vec![agg_r]);
+        graph.set_return(join, Some(read.clone()));
+        graph.block_mut(entry).exitswitch = Some(crate::model::ExitSwitch::Value(cond));
+        graph.block_mut(entry).exits = vec![
+            crate::model::Link::from_variables(
+                &graph,
+                vec![],
+                left,
+                Some(crate::model::ExitCase::Bool(true)),
+            )
+            .with_prevblock(entry),
+            crate::model::Link::from_variables(
+                &graph,
+                vec![],
+                right,
+                Some(crate::model::ExitCase::Bool(false)),
+            )
+            .with_prevblock(entry),
+        ];
+
+        scalar_replace_named_struct_aggregates(&mut graph, &pair_field_attrs());
+
+        assert!(!graph_has_ctor_or_new(&graph));
+        assert_eq!(graph.block(join).inputargs.len(), 2);
+        assert_eq!(
+            graph.block(left).exits[0]
+                .args
+                .first()
+                .and_then(LinkArg::as_variable),
+            graph.block(entry).inputargs.first()
+        );
+        assert_eq!(
+            graph.block(right).exits[0].args.first(),
+            Some(&LinkArg::Value(y))
+        );
+        assert_eq!(
+            same_as_operand(&graph, &read),
+            graph.block(join).inputargs.first().cloned()
+        );
+    }
+
+    /// A returned aggregate escapes. `foreign_field_ops` keeps the `New` fallback.
+    #[test]
+    fn malloc_removal_keeps_an_escaping_aggregate() {
+        let mut graph = FunctionGraph::new("malloc_removal_escape");
+        let entry = graph.startblock;
+        let x = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs = vec![x.clone()];
+        let agg = push_pair_ctor(&mut graph, entry);
+        push_pair_write(&mut graph, entry, &agg, "a", x);
+        let (next, _) = graph.create_block_with_arg_vars(0);
+        graph.block_mut(next).inputargs = vec![agg.clone()];
+        push_pair_read(&mut graph, next, &agg, "a");
+        graph.set_goto(entry, next, vec![agg.clone()]);
+        graph.set_return(next, Some(agg));
+
+        scalar_replace_named_struct_aggregates(&mut graph, &pair_field_attrs());
+
+        assert!(graph_has_ctor_or_new(&graph));
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| { matches!(op.kind, OpKind::New { ref owner } if owner == "Pair") })
+        );
+    }
+
+    /// A field that is never stored is the typed zero (`malloc.py` `flatconstants`).
+    #[test]
+    fn malloc_removal_reads_zero_for_an_unwritten_field() {
+        let mut graph = FunctionGraph::new("malloc_removal_zero");
+        let entry = graph.startblock;
+        let x = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs = vec![x.clone()];
+        let agg = push_pair_ctor(&mut graph, entry);
+        push_pair_write(&mut graph, entry, &agg, "a", x);
+        let (next, _) = graph.create_block_with_arg_vars(0);
+        graph.block_mut(next).inputargs = vec![agg.clone()];
+        let read = push_pair_read(&mut graph, next, &agg, "b");
+        graph.set_goto(entry, next, vec![agg]);
+        graph.set_return(next, Some(read));
+
+        scalar_replace_named_struct_aggregates(&mut graph, &pair_field_attrs());
+
+        assert!(!graph_has_ctor_or_new(&graph));
+        let zero = graph.block(entry).exits[0].args.get(1).cloned();
+        assert_eq!(
+            zero,
+            Some(LinkArg::Const(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::Int(0)
+            )))
+        );
+    }
+
     /// A unique, unescaped named struct becomes its fields: the constructor
     /// and its stores disappear, and the field read is the stored SSA value.
     /// Transparent newtype wrappers are a different arm and stay a no-op alias.
@@ -45038,6 +46427,112 @@ mod tests {
         assert!(
             !call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_shl"),
             "usize::wrapping_shl must not residualize; ops={ops:?}"
+        );
+    }
+
+    fn rhs_defined_by(
+        ops: &[&SpaceOperation],
+        rhs: &Variable,
+        kind_is: impl Fn(&OpKind) -> bool,
+    ) -> bool {
+        ops.iter()
+            .any(|op| op.result.as_ref() == Some(rhs) && kind_is(&op.kind))
+    }
+
+    #[test]
+    fn wrapping_add_of_u32_is_add_then_mask() {
+        let u32_ty = serde_json::json!({"Literal": {"UInt": "U32"}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_add_u32",
+            &["core", "num", "<Impl>", "wrapping_add"],
+            &[u32_ty.clone(), u32_ty.clone()],
+            u32_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "wrapping_add_u32").expect("lower u32::wrapping_add");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
+            "u32::wrapping_add must become add; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| match &op.kind {
+                OpKind::BinOp { op, rhs, .. } if op == "and" => {
+                    rhs_defined_by(&ops, rhs, |kind| {
+                        matches!(kind, OpKind::ConstUInt(0xFFFF_FFFF))
+                    })
+                }
+                _ => false,
+            }),
+            "u32::wrapping_add must mask with 0xFFFF_FFFF; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_add"),
+            "u32::wrapping_add must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn wrapping_add_of_i32_is_add_then_sign_extend() {
+        let i32_ty = serde_json::json!({"Literal": {"Int": "I32"}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_add_i32",
+            &["core", "num", "<Impl>", "wrapping_add"],
+            &[i32_ty.clone(), i32_ty.clone()],
+            i32_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "wrapping_add_i32").expect("lower i32::wrapping_add");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
+            "i32::wrapping_add must become add; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| match &op.kind {
+                OpKind::BinOp { op, rhs, .. } if op == "signext" => {
+                    rhs_defined_by(&ops, rhs, |kind| matches!(kind, OpKind::ConstInt(4)))
+                }
+                _ => false,
+            }),
+            "i32::wrapping_add must signext by 4 bytes; ops={ops:?}"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "signext"))
+                .count(),
+            1,
+            "i32::wrapping_add must emit one signext; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(&op.kind, OpKind::BinOp { op, .. } if op == "lshift" || op == "rshift")
+            }),
+            "i32::wrapping_add must not lshift/rshift; ops={ops:?}"
+        );
+        assert!(
+            call_leafs(&ops).is_empty(),
+            "i32::wrapping_add must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn wrapping_div_of_u32_stays_a_call() {
+        let u32_ty = serde_json::json!({"Literal": {"UInt": "U32"}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_div_u32",
+            &["core", "num", "<Impl>", "wrapping_div"],
+            &[u32_ty.clone(), u32_ty.clone()],
+            u32_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "wrapping_div_u32").expect("lower u32::wrapping_div");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_div"),
+            "u32::wrapping_div must stay a call; ops={ops:?}"
         );
     }
 

@@ -8576,6 +8576,11 @@ fn int_binop_records_opcode_with_both_operands_and_writes_dst() {
         ("int_sub", "int_sub/ii>i", majit_ir::OpCode::IntSub),
         ("int_mul", "int_mul/ii>i", majit_ir::OpCode::IntMul),
         ("int_and", "int_and/ii>i", majit_ir::OpCode::IntAnd),
+        (
+            "int_signext",
+            "int_signext/ii>i",
+            majit_ir::OpCode::IntSignext,
+        ),
         ("int_or", "int_or/ii>i", majit_ir::OpCode::IntOr),
         ("int_xor", "int_xor/ii>i", majit_ir::OpCode::IntXor),
         ("int_rshift", "int_rshift/ii>i", majit_ir::OpCode::IntRshift),
