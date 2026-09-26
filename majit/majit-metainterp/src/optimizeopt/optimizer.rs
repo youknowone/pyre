@@ -5175,15 +5175,22 @@ impl Optimizer {
         //    `optimize_with_constants_and_inputs_oprc` threads the recorder's
         //    own ops and documents the transfer on its own signature.
         for i in 0..op_rc.num_args() {
-            let arg = op_rc.arg(i);
             // `get_box_replacement` is the consumer walk (`optimizer.py`
-            // `get_box_replacement(op.getarg(i))`). The old resolver stays
-            // in the debug witness only: compute the new terminal first so
-            // the witness's `materialize_operand_at` cannot heal before
-            // the comparison.
-            let resolved = arg.get_box_replacement(false);
+            // `get_box_replacement(op.getarg(i))`). A slot that already holds
+            // its chain terminal keeps it: `setarg` of the same box changes
+            // nothing. The old resolver stays in the debug witness only:
+            // compute the new terminal first so the witness's
+            // `materialize_operand_at` cannot heal before the comparison.
+            let replaced = {
+                let arg = &op_rc.args_slice()[i];
+                arg.with_box_replacement(|terminal| {
+                    (!terminal.same_box(arg)).then(|| terminal.clone())
+                })
+            };
             #[cfg(debug_assertions)]
             {
+                let arg = op_rc.arg(i);
+                let resolved = replaced.clone().unwrap_or_else(|| arg.clone());
                 let old = match ctx.resolve_operand_operand_opt(&arg) {
                     Some(b) => b,
                     None => {
@@ -5204,7 +5211,9 @@ impl Optimizer {
                     old.to_opref()
                 );
             }
-            op_rc.setarg(i, resolved);
+            if let Some(resolved) = replaced {
+                op_rc.setarg(i, resolved);
+            }
         }
 
         // Borrowed until a pass replaces the operation; `Replace` and
