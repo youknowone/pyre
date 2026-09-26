@@ -3231,3 +3231,64 @@ else:
         "_properror must re-read the property after __qualname__",
     );
 }
+
+/// `bufferwrapper_releasebuf`, native-subclass arm: the Python
+/// `__release_buffer__` override runs with the returned memoryview as a
+/// livevar, then the native backing is released through that view. An
+/// override that collects forwards the view; the release must read it back
+/// from its root rather than through the pre-callback address, which
+/// `MAJIT_GC_NURSERY_POISON` fills with `0xAA`.
+#[test]
+fn memoryview_buffer_wrapper_release_reloads_after_override() {
+    const CHILD: &str = "PYRE_MEMORYVIEW_WRAPPER_RELEASE_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "memoryview_buffer_wrapper_release_reloads_after_override",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .env("MAJIT_GC_NURSERY_POISON", "1")
+            .output()
+            .expect("run isolated memoryview wrapper-release regression");
+        assert!(
+            output.status.success(),
+            "buffer-wrapper release read a moved memoryview:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+import gc
+
+released = []
+
+class B(bytearray):
+    def __buffer__(self, flags):
+        return super().__buffer__(flags)
+    def __release_buffer__(self, view):
+        released.append(view.readonly)
+        gc.collect()
+        junk = [object() for _ in range(40)]
+
+i = 0
+while i < 20:
+    b = B(b"abcd")
+    m = memoryview(b)
+    assert m[0] == 97
+    m.release()
+    b.append(101)
+    assert bytes(b) == b"abcde", bytes(b)
+    i += 1
+assert released
+"#,
+        "memoryview_wrapper_release.py",
+        "memoryview wrapper release",
+        "bufferwrapper_releasebuf must re-read the view after __release_buffer__",
+    );
+}

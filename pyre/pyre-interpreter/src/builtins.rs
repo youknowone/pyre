@@ -2359,10 +2359,14 @@ unsafe fn memoryview_release_buffer_wrapper(wrapper: PyObjectRef) {
                 memoryview_call_python_release_unraisable(r_obj, r_mv, descr);
             }
         } else if !w_memoryview_released(r_mv) {
+            // The Python release override runs app-level code and collects,
+            // and so can a C exporter's `bf_releasebuffer`: the view is a
+            // livevar across each and is read back from its slot after it.
             memoryview_release_native_python_slot(r_obj, r_mv);
+            let r_mv = pyre_object::gc_roots::shadow_stack_get(sp + 1);
             let backing = w_memoryview_backing(r_mv);
             let _ = release_native_backing(r_mv, backing);
-            w_memoryview_set_released(r_mv);
+            w_memoryview_set_released(pyre_object::gc_roots::shadow_stack_get(sp + 1));
         }
         w_buffer_wrapper_clear(pyre_object::gc_roots::shadow_stack_get(sp));
     }
