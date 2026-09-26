@@ -15,19 +15,17 @@ use super::misc;
 /// `W_CTypePrimitiveLongDouble._copy_longdouble`.
 ///
 /// `@jit.dont_look_inside` (`ctypeprim.py`): the body is a LONGDOUBLE load
-/// and store. Rust has no that type, so the bits move as a
-/// `sizeof(long double)` raw copy — the same width the C ABI stores.
-/// Convert of a primitive walks every `kind` arm of the fused
-/// `convert_to_object`, so leaving `copy_nonoverlapping` in those arms
-/// residualizes as an un-lowered helper on the int path too.
+/// and store. Rust has no that type, so `lvalue` holds the
+/// `sizeof(long double)` bytes the C ABI stores. Loading all of it before
+/// the store keeps an aliasing `cdatasrc` / `cdatadst` well defined.
 #[majit_macros::dont_look_inside]
 pub fn copy_longdouble(cdatasrc: usize, cdatadst: usize) {
+    let size = misc::sizeof_long_double() as usize;
+    let mut lvalue = [0u8; 16];
+    assert!(size <= lvalue.len());
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            cdatasrc as *const u8,
-            cdatadst as *mut u8,
-            misc::sizeof_long_double() as usize,
-        );
+        std::ptr::copy_nonoverlapping(cdatasrc as *const u8, lvalue.as_mut_ptr(), size);
+        std::ptr::copy_nonoverlapping(lvalue.as_ptr(), cdatadst as *mut u8, size);
     }
 }
 
