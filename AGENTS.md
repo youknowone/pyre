@@ -272,6 +272,36 @@ comment at the site citing both sides.
   available; otherwise wait for the five-minute boundary. Do not spend tokens
   on repetitive status-only updates.
 
+## Iterate on the core; gate on the product
+
+The product binary links `pyre-module`, the crate that owns the builtin
+modules under `pyre/pyre-module/src/module/` (`math`, `_json`, `_ssl`,
+`_cffi_backend`, `unicodedata`, `zlib`, …). Work on majit, the JIT, the GC or
+the interpreter core does not need them, so the edit–build–test loop leaves
+them out:
+
+```bash
+export CHARON_TARGET_DIR=$HOME/Projects/.pyre-build/charon-target-<worktree>
+pyre/scripts/build-jit-core.sh           # extract the 4 core crates, release pyre-dynasm without pyre-module
+pyre/scripts/build-jit-core.sh --check   # same extraction, `cargo check` only
+python3 pyre/check.py --backend cranelift   # check.py's cranelift leg is the core build
+cargo test -p pyre-jit --no-default-features --features dynasm,prepass
+```
+
+- **Core-green is not product-green.** The core compiles nothing behind
+  `cfg(feature = "pyre-module")`, including the JIT registrations that name
+  those modules. A change that touches `pyre-module` or those registrations
+  needs the product build before it is judged.
+- **A fixture that imports a `pyre-module` module cannot run on the core.**
+  It says so in its header (`# pyre-check: skip-backends=cranelift` plus a
+  line naming the module); a new fixture that needs one does the same.
+- **`build-jit-core.sh` writes `target/release/pyre-dynasm`**, the path
+  `check.py`'s dynasm leg builds *with* `pyre-module`. `--build no --backend
+  dynasm` after the script measures the core binary, and its import failures
+  are not regressions.
+- The core loop replaces neither gate below: the full `cargo test` and a bare
+  `python3 pyre/check.py` still run before every commit.
+
 ## Before committing
 
 - `cargo test --all --no-default-features --features dynasm`. Both halves matter.

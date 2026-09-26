@@ -8,13 +8,26 @@ below: a closed finding leaves a one-line verdict there only where re-deriving i
 is the live risk. Keep this document small enough that it is worth re-reading.
 
 Original audit: branch `pc-map`, 2026-07-05, against the charter's axioms A1–A7
-and norms N1–N7. Re-measured 2026-08-08 on `ec-wiring`.
+and norms N1–N7. Re-measured 2026-08-08 on `ec-wiring`. Design re-audit
+2026-09-21 on `gate` (F5–F21); counts marked *09-23* were re-measured on
+2026-09-23.
 
 The verdict has not changed shape: **the skeleton is right, the JIT spine is
 where the violations live.** The layer map of charter §1 is real in the tree and
-none of the anti-roadmap (§3.5) items have been rebuilt. What changed is the size
-of the remainder — three of the original five findings are closed and deleted,
-and thirteen of the fifteen tracked issues are closed.
+none of the anti-roadmap (§3.5) items have been rebuilt. Two of the original
+five findings remain (F4, F3). The 2026-09-21 re-audit added F5–F21, and they
+are larger than both: the translator spine (F5) is the one the most other
+findings wait on, and the rooting discipline (F17) is the one F18 and F3's
+exit test wait on.
+
+| group | findings | waits on |
+|---|---|---|
+| opcode coverage | F4 | — |
+| GC roots and allocation | F3, F17, F18, F19 | F17, which needs a decision |
+| translator spine | F5, F6, F7, F8, F9 | F5 |
+| interpreter ↔ JIT contract | F10, F11 | charter §3.7 |
+| majit internals | F12, F13, F14, F15, F16 | — (F13 feeds F12) |
+| threading and backends | F20, F21 | charter §3.3 decision (F20) |
 
 ---
 
@@ -27,7 +40,10 @@ matches, unchanged in scale" and left the finding unmeasurable behind a census
 that was never built. Counting *emission sites* rather than mentions changed the
 picture: the textual matches across 20 files are almost all comments, and the
 real surface is the `emit_abort_permanent!` sites in
-`pyre-jit/src/jit/codewriter.rs` — now **25**, every one of them named.
+`pyre-jit/src/jit/codewriter.rs` — 25 on 08-08, every one of them named, and 32
+on *09-23*. The table is the 08-08 classification and has not been redone
+against the 32. Since then `LoadSpecial` lowers `Enter` / `Exit` and aborts only
+on `AEnter` / `AExit`; `CallIntrinsic1` / `CallIntrinsic2` are still partial.
 
 | class | n | opcodes |
 |---|---|---|
@@ -119,27 +135,31 @@ nowhere to go belongs inside an existing kind, not in a new slot.
 runs), and the regrtest harness under moving collection. The real exit test is
 that the oldgen-nonmoving concession becomes deletable.
 
-### Design audit 2026-09-21 — findings not yet tracked above
+### F5–F21 — design audit 2026-09-21
 
 Six-axis read-only audit against `rpython/jit`, `rpython/translator` and
-`rpython/memory` at `gate` `3ad44d126e9`. Charter §3.7 (the runtime codewriter),
-§3.8 (the fold layer) and §3.3 (threading) already own their areas and are not
-repeated. **[v]** = checked by hand; censuses re-measured the same day (F6, F12, F14, F17, F19 numbers are the
-re-measured ones); anything else is audit-reported.
+`rpython/memory` at `gate` `3ad44d126e9`. Charter §3.7 (the runtime
+codewriter), §3.8 (the fold layer) and §3.3 (threading) already own their areas
+and are not repeated here. **[v]** = checked by hand. The F6, F12, F14, F17 and
+F19 numbers were re-measured the same day; anything unmarked is
+audit-reported.
 
-**Translator spine**
+#### Translator spine
 
 - **F5 — the rtyper is a kind oracle, not the spine. [v]** `front/mir.rs` emits
   already-lowered ops into `model::FunctionGraph`; the annotator and rtyper run
   on a `flowspace_adapter` copy and `dual_gate_publish_concretetypes` copies
   back only `getkind(concretetype)`. The lowered ops and ll helper graphs are
-  discarded; a Skip (`rtyper-skip-subjects.*.txt`, 1858 lines) falls to
-  `legacy_annotator` / `legacy_resolve`. Violates A1, N2. Raising the Match
+  discarded; a Skip (`rtyper-skip-subjects.darwin.txt`: 1858 lines on 09-21,
+  1916 on *09-23*) falls to `legacy_annotator` / `legacy_resolve`. Violates
+  A1, N2. Raising the Match
   rate never changes which ops `jtransform` consumes. *Exit:* the front end
   emits high-level `flowspace` graphs, the rtyper-lowered graph is the only
   `jtransform` input, and `model.rs`, `flowspace_adapter.rs`, `cutover.rs`,
-  `legacy_*` are deleted. **Deepest dependency: F6–F8 and §3.7/§3.8 convergence
-  sit behind it.**
+  `legacy_*` are deleted. **Deepest dependency: F6, F7, F9 and the §3.7 / §3.8
+  convergence sit behind it.** Opname-dispatch "Spine B"
+  (`codewriter/jtransform_opname.rs`, `call.rs`) already consumes
+  rtyper-lowered graphs, but only for `ll_*` helpers.
 - **F6 — the front end is a recogniser catalogue with string identity.** 33
   `front/*.rs` files, 295 `== "` comparisons in `mir.rs` alone, types and graph
   identity as strings (`CallPath{segments}`), Charon `monomorphize:false`.
@@ -150,15 +170,17 @@ re-measured ones); anything else is audit-reported.
   canraise}.rs` and the virtualizable / quasi-immut analyzers are test-only;
   production is `call.rs` `analyze_readwrite` over the legacy IR. Same for
   `inline.rs` vs `backendopt/inline.rs`. Collapses with F5.
-- **F8 — hints are walls. [v]** 546 `dont_look_inside`-family attributes in
-  pyre-interpreter + pyre-object against 28 in `pypy/interpreter` +
-  `pypy/objspace`; `jit_fnaddr.rs` is a 6.7k-line hand list. Charter §3.2
-  already names the direction; the metric is this count falling.
+- **F8 — hints are walls. [v]** `dont_look_inside`-family attributes in
+  pyre-interpreter + pyre-object: 546 on 09-21, 511 on *09-23* (423
+  `majit_macros::dont_look_inside`, 56 bare, 32 `_cannot_raise`), against 28
+  in `pypy/interpreter` + `pypy/objspace`; `jit_fnaddr.rs` is a 6.7k-line
+  hand list. Charter §3.2 already names the direction; the metric is this
+  count falling.
 - **F9 — three codewriters.** majit-translate, `majit-macros/jit_interp` (the 13
   JIT examples) and §3.7's runtime one; pyre string literals inside
   majit-translate (N1). Phase E work; blocked on F5/F6 for small crates.
 
-**Interpreter ↔ JIT contract**
+#### Interpreter ↔ JIT contract
 
 - **F10 — `JitState` is a marshalling API.** `jit_state.rs` has 90 trait items,
   `jitdriver.rs` 12.7k lines; `handle_fail`, `maybe_compile_and_run` and
@@ -170,29 +192,30 @@ re-measured ones); anything else is audit-reported.
   orthodox `ResumeDataDirectReader`; undecodable recipes degrade to blackhole
   resume (N3). Follows §3.7.
 
-**majit internals (independent of the above)**
+#### majit internals (independent of the above)
 
 - **F12 — two box identities.** positional `OpRef` dominates `Rc` `Operand`
-  (optimizeopt 3465 vs 866; cranelift 1619 vs 10; dynasm 755 vs 19); `opref_audit.rs` and the
-  ~870-line `assemble_peeled_trace_with_jump_args` remap family exist because
-  of it. *Exit:* `Operand` end to end, `OpRef` an opencoder wire tag.
+  (optimizeopt 3465 vs 866; cranelift 1619 vs 10; dynasm 755 vs 19);
+  `opref_audit.rs` and the ~870-line `assemble_peeled_trace_with_jump_args`
+  remap family exist because of it. *Exit:* `Operand` end to end, `OpRef` an opencoder wire tag.
 - **F13 — two recorders, three snapshot stores.** `opencoder.rs::Trace` beside
   the hybrid `recorder.rs::Trace` (two numberings per op) and the `OptContext`
   `snapshot_*` side tables. Feeds F12.
 - **F14 — descrs have five mint channels.** `make_*_descr` bypassing `gc_cache`
-  (~182 metainterp + ~106 pyre call sites outside `tests.rs`), `descr_registry.rs`, `PyreFieldDescr` with the
-  `u32::MAX` sentinel. *Exit:* every mint through the LLType-keyed cache.
+  (~182 metainterp + ~106 pyre call sites outside `tests.rs`),
+  `descr_registry.rs`, `PyreFieldDescr` with the `u32::MAX` sentinel. *Exit:* every mint through the LLType-keyed cache.
 - **F15 — `pyjitpl.rs` / `TraceCtx` file boundaries.** ~17k lines of compile
   bodies in `impl MetaInterp`; `TraceCtx` fuses MetaInterp, History, heapcache.
 - **F16 — const identity slabs never free.** `operand.rs` `NEXT_SMALL_INT_ID`,
   `WIDE_CHUNKS`; exhaustion panics.
 
-**GC (extends F3)**
+#### GC (extends F3)
 
 - **F17 — native rooting and write barriers are hand-written.**
-  `push_roots` ×2013, pin family ×4129, 247 manual barrier API calls (446 counting every
-  `*write_barrier(`) with no checker; `gc-root-brackets.baseline.json` tolerates 2044 unbracketed
-  collecting calls on darwin. A2. *Decision needed:* LLBC analysis as a hard
+  `push_roots` ×2013, pin family ×4129, 247 manual barrier API calls (446
+  counting every `*write_barrier(`) with no checker;
+  `gc-root-brackets.baseline.json` tolerates 2044 unbracketed collecting calls
+  on darwin. A2. *Decision needed:* LLBC analysis as a hard
   gate at zero, a handle-typed API, or conservative native-stack scanning with
   pinning.
 - **F18 — stable / nursery / collecting allocation split. [v]**
@@ -203,6 +226,9 @@ re-measured ones); anything else is audit-reported.
   `pyre-jit/src/eval.rs`, registration-order type ids, 37 of 67 checks only
   `debug_assert_eq!`, `#[pyre_class]` offsets, custom tracers and JIT
   `SizeDescr`s built separately; GC construction lives in the JIT crate (N1).
+
+#### Threading and backends
+
 - **F20 — per-thread JIT under the GIL. [v]** `thread_local! JIT_DRIVER`,
   `METAINTERP_SD`: neither upstream's one global JIT nor gh#396's target;
   compiled code and counters are not shared across threads. Needs a written
@@ -215,14 +241,15 @@ re-measured ones); anything else is audit-reported.
 ### Smaller open items
 
 - **`blackhole_resume_via_rd_numb` hand-inlines a `_run_forever` loop**
-  although `blackhole.rs` has `run_forever`. The loop
-  cannot call it yet (delegate report, unverified): `on_leave_level` is
+  although `blackhole.rs` has `run_forever`. The loop cannot call it yet
+  (delegate report, unverified): `on_leave_level` is
   `Fn(i64)` with no `got_exception` for `leave_resumed_blackhole_frame` and is
   skipped on the bottommost JitException exit, and there is no hook for the
   per-iteration rooting of `exception_last_value`.
-- **`unported_category`** (`rtyper/cutover.rs`) classifies Skips by substring
-  matching diagnostic strings.
-
+- **`unported_category`** (`rtyper/cutover.rs`) classifies Skips by matching
+  substrings of their diagnostic strings. Since `a6dfb7eaf97` the substrings
+  sit in one ordered `UNPORTED_CATEGORIES` table instead of a `contains`
+  chain; the classification still depends on message wording.
 - **One unproven resume coordinate.** `build_state_field_snapshot` stamps
   `py_pc: frame.pc` — the JitCode offset — into the field whose readers in
   `pyre-jit/src/eval.rs` treat it as a Python pc (`f_lasti`, traceback
@@ -235,8 +262,9 @@ re-measured ones); anything else is audit-reported.
   (cross-check the decoded `py_pc` against
   `containing_py_pc_for_jitcode_pc_public(jitcode_index, pc)` over the corpus)
   before it is a finding rather than a suspicion.
-- **Compilation cliffs** outside F4's census: nested-loop / cross-loop no-token
-  walls (gh#152, gh#177) and the recursion / call-frame wall (gh#126, open).
+- **Compilation cliffs** outside F4's census: the recursion / call-frame wall
+  (gh#126, open). The nested-loop / cross-loop walls (gh#152, gh#177) are
+  closed.
 - **Phase C decision document** (gh#376, open): a C-extension strategy document,
   not an implementation. Writing it does not require Phase A to finish, and the
   EU final report's admitted decade-costing error is exactly this deferral.
@@ -253,13 +281,30 @@ away, and that is gone.
   work through. The silent hole is closed, so Phase A's cliff-free exit criterion
   is checkable without any new instrument — an opcode the walker declines names
   itself, and one it has never seen fails the build.
-- **F3 next**: the deepest structural work, unblocked by one answerable question
-  (the mid-major rescan above) rather than by a taxonomy.
+- **F3 next**: the deeper of the two, unblocked by one answerable question
+  (the mid-major rescan above) rather than by a taxonomy. Its exit test, the
+  deletable oldgen-nonmoving concession, sits at the end of the rooting chain
+  below.
 
 F4 and F3 are parallel-safe, though not for the reason an earlier revision gave:
 both touch `pyre-jit`, so "different crates" was wrong. They share no file and no
 symbol — F4 is confined to `jit/codewriter.rs`, F3 to the root-walker
 registration in `eval.rs` / `call_jit.rs` and `majit-gc/shadow_stack.rs`.
+
+**The design-audit findings run in two chains.** Neither blocks F4 or F3's
+class-(b) step:
+
+- **Spine chain: F5 first.** F6, F7, F9 and the §3.7 / §3.8 convergence wait
+  on it. First slice: widen Spine B from `ll_*` helpers to one Match'd general
+  graph, and build the instrument that compares the jitcode it emits byte for
+  byte with the legacy path's before anything is switched over. F8 falls as
+  hints are retired and needs no ordering of its own. F10 / F11 follow §3.7.
+- **Rooting chain: F17 → F18 → gh#396.** F17 cannot start until one endpoint
+  is chosen: LLBC analysis as a hard gate at zero, a handle-typed API, or
+  conservative native-stack scanning with pinning. F18's non-moving old
+  generation is F3's concession and can go only after F17 lands.
+- **Independent:** F12 (after F13, which feeds it), F14, F15, F16, F19, F21.
+  F20 needs its written decision in §3.3 first.
 
 Each item closes by the charter's instruments: N4 gates for every landing, N5
 evidence for every default flip, N7 written rationale for every mechanism deleted
@@ -323,3 +368,9 @@ or replaced. **And then its section here is deleted.**
 - If F3's class-(b) absorption measurably regresses minor-collection pause
   (prebuilt scanning cost), the registry survives *for that class only*,
   documented as the deliberate adaptation it currently is not.
+- If F5's first slice finds the rtyper-lowered graph already emits the legacy
+  path's jitcode byte for byte on Match'd graphs, F5 is a deletion of the
+  legacy path rather than a restructuring, and the Skip ratchet becomes its
+  only measure.
+- If §3.3's written decision adopts per-thread compiled code as the target,
+  F20 moves to *Settled* as a deliberate adaptation.
