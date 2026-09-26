@@ -8,7 +8,7 @@ use majit_charon_reader::Llbc;
 use majit_translate::{
     HostStaticAddrs,
     front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-    model::{CallTarget, OpKind},
+    model::{CallTarget, OpKind, ValueType},
 };
 
 const OBJECT_LLBC: &str = concat!(
@@ -164,6 +164,60 @@ fn string_eqv_spec_aliases_borrow_and_calls_string_eq() {
             spec.name
         );
     }
+}
+
+/// A spec copy at `V = ()` calls `put<V>(slot: &mut V, v: V) -> V`.
+/// The specialized `put` graph keeps one non-void argument, the `Ref`
+/// slot; the unit value is dropped.
+#[test]
+fn put_unit_spec_graph_drops_the_value_arg() {
+    let llbc = Llbc::from_slice(put_fixture_llbc().as_bytes()).expect("parse put fixture");
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        HostStaticAddrs::default(),
+        &["fixture"],
+        &["use_unit"],
+    )
+    .expect("lower use_unit");
+    let puts: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| f.name.contains("put__s"))
+        .collect();
+    assert_eq!(
+        puts.len(),
+        1,
+        "expected one specialized put, got {:?}",
+        program
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    let kinds = non_void_input_kinds(&puts[0].graph);
+    assert_eq!(
+        kinds,
+        vec!["Ref"],
+        "{} non-void inputs {kinds:?}, ops {:?}",
+        puts[0].name,
+        op_kinds(&puts[0].graph)
+    );
+}
+
+fn non_void_input_kinds(graph: &majit_translate::model::FunctionGraph) -> Vec<&'static str> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Input { ty, .. } if !matches!(ty, ValueType::Void) => match ty {
+                ValueType::Ref(_) | ValueType::Str => Some("Ref"),
+                ValueType::Int | ValueType::Unsigned => Some("Int"),
+                _ => Some("other"),
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 fn graph_return_kind(graph: &majit_translate::model::FunctionGraph) -> &'static str {
@@ -367,6 +421,175 @@ fn mk_fixture_llbc() -> String {
     file.to_string()
 }
 
+fn put_fixture_llbc() -> String {
+    use serde_json::json;
+    let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let meta = |path: &[&str], local: bool| {
+        json!({
+            "name": path.iter().map(|seg| json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": local
+        })
+    };
+    let empty_g = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
+    let unit = json!({"Adt": {"id": "Tuple", "generics": empty_g}});
+    let tvar = json!({"TypeVar": {"Bound": [0, 0]}});
+    let slot_ty = json!({"Ref": {"region": "Erased", "ty": tvar, "kind": "Mut"}});
+    let place = |id: u64, ty: &serde_json::Value| json!({"kind": {"Local": id}, "ty": ty});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        json!({"index": index, "name": name, "span": span, "ty": ty})
+    };
+    let impl_ref = json!({
+        "kind": {"TraitImpl": {"id": 0, "generics": {"regions": [], "types": [unit], "const_generics": [], "trait_refs": []}}}
+    });
+    let generics = |clauses: bool| {
+        json!({
+            "regions": [],
+            "types": [{"index": 0, "name": "V"}],
+            "const_generics": [],
+            "trait_clauses": if clauses { json!([{"clause_id": 0}]) } else { json!([]) },
+            "regions_outlive": [],
+            "types_outlive": [],
+            "trait_type_constraints": []
+        })
+    };
+    let sig = json!({
+        "is_unsafe": false,
+        "inputs": [slot_ty, tvar],
+        "output": tvar
+    });
+    let put_body = json!({
+        "Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 2,
+                "locals": [local(0, None, &tvar), local(1, Some("slot"), &slot_ty), local(2, Some("v"), &tvar)]
+            },
+            "body": [
+                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+            ]
+        }
+    });
+    let fill_body = json!({
+        "Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 2,
+                "locals": [
+                    local(0, None, &tvar),
+                    local(1, Some("slot"), &slot_ty),
+                    local(2, Some("v"), &tvar),
+                    local(3, Some("tmp"), &tvar)
+                ]
+            },
+            "body": [
+                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0, 0]},
+                            "generics": empty_g
+                        }},
+                        "args": [],
+                        "dest": place(3, &tvar)
+                    },
+                    "target": 2,
+                    "on_unwind": 1
+                }}}},
+                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
+                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": {"Regular": 2}},
+                            "generics": {"regions": [], "types": [tvar], "const_generics": [], "trait_refs": []}
+                        }},
+                        "args": [{"Copy": place(1, &slot_ty)}, {"Copy": place(2, &tvar)}],
+                        "dest": place(0, &tvar)
+                    },
+                    "target": 3,
+                    "on_unwind": 1
+                }}}},
+                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+            ]
+        }
+    });
+    let use_body = json!({
+        "Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 0, "locals": [local(0, None, &unit)]},
+            "body": [
+                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": {"Regular": 3}},
+                            "generics": {"regions": [], "types": [unit], "const_generics": [], "trait_refs": [impl_ref]}
+                        }},
+                        "args": [],
+                        "dest": place(0, &unit)
+                    },
+                    "target": 2,
+                    "on_unwind": 1
+                }}}},
+                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
+                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+            ]
+        }
+    });
+    let file = json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "fun_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["core", "default", "Default", "default"], false),
+                    "signature": {"is_unsafe": false, "inputs": [], "output": tvar},
+                    "body": null
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(&["core", "default", "Default", "default"], false),
+                    "signature": {"is_unsafe": false, "inputs": [], "output": unit},
+                    "body": null
+                },
+                {
+                    "def_id": 2,
+                    "item_meta": meta(&["fixture", "put"], true),
+                    "signature": sig,
+                    "generics": generics(false),
+                    "body": put_body
+                },
+                {
+                    "def_id": 3,
+                    "item_meta": meta(&["fixture", "fill"], true),
+                    "signature": sig,
+                    "generics": generics(true),
+                    "body": fill_body
+                },
+                {
+                    "def_id": 4,
+                    "item_meta": meta(&["fixture", "use_unit"], true),
+                    "signature": {"is_unsafe": false, "inputs": [], "output": unit},
+                    "body": use_body
+                }
+            ],
+            "global_decls": [],
+            "type_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": meta(&["core", "default", "Default"], false)
+            }],
+            "trait_impls": [{
+                "methods": [{"kind": {"TraitMethod": [0, 0]}, "skip_binder": {"id": 1}}],
+                "impl_trait": {"id": 0, "generics": {"regions": [], "types": [unit], "const_generics": [], "trait_refs": []}},
+                "implied_trait_refs": []
+            }]
+        }
+    });
+    file.to_string()
+}
 
 fn path_is_object_key_eq(segments: &[String]) -> bool {
     segments.iter().any(|segment| segment == "ObjectKey") && segments.last().map(String::as_str) == Some("eq")
