@@ -9630,6 +9630,11 @@ fn exception_getset_fget(args: &[PyObjectRef]) -> crate::PyResult {
     let name = exception_getset_name(w_descr);
     let found = crate::baseobjspace::exception_attr_get(w_obj, &name)?;
     if found.is_null() {
+        // `interp_exceptions.py descr_get_written` raises under the
+        // descriptor's own name for an unset slot.
+        if name == "characters_written" {
+            return Err(crate::PyError::attribute_error("characters_written"));
+        }
         return Err(exception_getset_absent(w_obj, &name));
     }
     Ok(found)
