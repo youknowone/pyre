@@ -36,8 +36,13 @@
 //!   0:          inline_call_r_r <placeholder> -> dunder_result
 //!   resume_pc:  -live-                        [nothing live, r0 pending]
 //!               residual_call_r_r  bh_len_tail(dunder_result) -> answer
+//!               -live-                        [nothing live]
 //!               ref_return         answer
 //! ```
+//!
+//! The second `-live-` is the resume coordinate of the residual's exception
+//! guard. Nothing is live there: a failing guard carries the exception, and
+//! `ref_return` runs only on the trace that passed the guard.
 //!
 //! Pushed as a paused parent level under the caller (`InlineFrame::parents`,
 //! outermost-first), so the chain is `caller -> tail -> __len__ -> ...` and
@@ -114,34 +119,24 @@ const ANSWER_REG: u16 = 0;
 /// `_setup_return_value_r` only reads the last operand as the dest register.
 const PLACEHOLDER_CALLEE: u16 = 0;
 
-/// Publish `err` where `handler_residual_call_*` reads it.
-///
-/// `bh_call_*_dispatch` (`majit-backend/src/call_stub.rs`) transmutes the
-/// address to an `extern "C"` fn and cannot unwind, so the exception reaches
-/// the blackhole through `BH_LAST_EXC_VALUE`, which every residual-call
-/// handler zeroes before the call and tests after it
-/// (`check_residual_call_exception_after`).  The compiled-code channel
-/// (`store_jit_exception`) is deliberately not written: these jitcodes are
-/// resume coordinates, never compilation units.
-fn publish_blackhole_exception(err: &mut pyre_interpreter::PyError) {
-    let exc_obj = err.to_exc_object();
-    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
-}
-
 /// `operation.py len` after `_len`: `space.index` on what `__len__` returned,
 /// then `_check_len_result` on that, and the machine length re-boxed.
 ///
 /// The re-box is the operator's, not a convenience: `builtins.rs builtin_len`
 /// answers `w_int_new(space.len_w(obj))`, so `len()` is an exact `int` even
 /// where `__len__` returned a `bool`.
+///
+/// A refusal publishes through `ResidualError::publish_residual`
+/// (`jit_publish_residual_error`): `BH_LAST_EXC_VALUE` for the blackhole
+/// handler and the compiled `GUARD_NO_EXCEPTION` cell. The return is the
+/// residual ABI's zero; the handler does not read it.
 pub extern "C" fn bh_len_tail(dunder_result: i64) -> i64 {
     let w_res = dunder_result as pyre_object::PyObjectRef;
     match pyre_interpreter::baseobjspace::len_result_tail(w_res) {
         Ok(length) => pyre_object::w_int_new(length) as i64,
-        Err(mut err) => {
-            publish_blackhole_exception(&mut err);
-            // The handler propagates on the channel above before it stores a
-            // result, so this value is never read.
+        Err(err) => {
+            use majit_ir::helper_fnaddr::ResidualError;
+            err.publish_residual();
             0
         }
     }
@@ -226,10 +221,14 @@ fn build(tail: OperatorTail) -> Option<(i32, usize)> {
     match result_type {
         'r' => {
             builder.residual_call_ref_canonical_typed_args(funcptr, &args, calldescr, ANSWER_REG);
+            let after_call = builder.live_placeholder();
+            builder.patch_live_offset(after_call, liveness_offset);
             builder.ref_return(ANSWER_REG);
         }
         'i' => {
             builder.residual_call_int_canonical_typed_args(funcptr, &args, calldescr, ANSWER_REG);
+            let after_call = builder.live_placeholder();
+            builder.patch_live_offset(after_call, liveness_offset);
             builder.int_return(ANSWER_REG);
         }
         _ => return None,
@@ -292,10 +291,10 @@ mod tests {
             );
             // `run_inner` asserts membership on every dispatched position,
             // not only the entry one: `inline_call`, `-live-`,
-            // `residual_call`, the return.
+            // `residual_call`, the guard's `-live-`, the return.
             assert_eq!(
                 startpoints.len(),
-                4,
+                5,
                 "{tail:?}: startpoints must cover every op, got {startpoints:?}",
             );
         }

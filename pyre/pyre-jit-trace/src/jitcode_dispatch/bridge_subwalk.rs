@@ -942,6 +942,17 @@ pub(crate) fn call_dst_reg_for_residual_return(code: &[u8], entry: usize) -> Opt
     None
 }
 
+/// Resume of a continuation level sits on the `-live-` after the never-decoded
+/// `inline_call`. `code[position - 1]` is the register that call's result
+/// lands in (`BhFrame::call_result_reg`).
+fn pending_inline_call_result_reg(code: &[u8], entry: usize) -> Option<usize> {
+    let op = crate::jitcode_runtime::decoded_ops(code)
+        .find(|op| op.next_pc == entry && op.opname.starts_with("inline_call"))?;
+    (op.argcodes.ends_with(">r"))
+        .then(|| code.get(entry.checked_sub(1)?).map(|&b| b as usize))
+        .flatten()
+}
+
 pub(crate) fn recipe_parent_frame_from_recipe(
     ctx: &mut TraceCtx,
     is_being_profiled: bool,
@@ -1260,7 +1271,8 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         regs_f[i] = box_ref;
     }
     if let Some(result) = child_result {
-        let call_dst_reg = call_dst_reg_for_residual_return(jc.code.as_slice(), entry)?;
+        let call_dst_reg = call_dst_reg_for_residual_return(jc.code.as_slice(), entry)
+            .or_else(|| pending_inline_call_result_reg(jc.code.as_slice(), entry))?;
         if call_dst_reg >= regs_r.len() {
             return Some(Err(DispatchError::InlineCallArityMismatch {
                 pc: entry,
@@ -1294,7 +1306,9 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         w_code: crate::state::recover_inline_callee_code(callee_code_key as *const ()) as usize,
         jitcode_index: jc.try_index().map_or(-1, |index| index as i32),
     };
-    if consts.w_code == 0 {
+    // A continuation level (`operator_continuation`, `ctor_continuation`) has
+    // no Python code object. Its jitcode is still the frame `walk` runs.
+    if consts.w_code == 0 && !callee_pjc.code_ptr.is_null() {
         return None;
     }
     let callee_w_code = consts.w_code;
@@ -1311,6 +1325,9 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     // same position the forward inline records it at.
     let mut pending_ctor_tail: Option<InlineParentFrame> = None;
     for parent_recipe in paused_parent_recipes {
+        if parent_recipe.len_tail {
+            continue;
+        }
         if let Some(instance) = parent_recipe.return_substitute {
             let Some(tail) = crate::jitcode_dispatch::ctor_continuation_parent_frame(instance)
             else {
