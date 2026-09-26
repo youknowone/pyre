@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runner for imported and pyre-authored generic extra_tests snippets.
+"""Runner for pyre-authored extra_tests snippets.
 
 Runs every `*.py` under `pyre/extra_tests/snippets/` against:
   - CPython (the system `python3`),
@@ -7,9 +7,7 @@ Runs every `*.py` under `pyre/extra_tests/snippets/` against:
   - pyre-cranelift (release build, if present).
 
 A snippet passes when the process exits with code 0.  Unlike
-`pyre/parity_tests/run.py` we do NOT require a trailing "OK" line —
-the original RustPython runner only checks the return code, so we
-mirror that.
+`pyre/parity_tests/run.py` we do NOT require a trailing "OK" line.
 
 The interpreter's cwd is set to the snippets directory so the local
 `testutils.py` import succeeds.
@@ -22,11 +20,9 @@ Usage:
                                     [--timeout SECONDS]
                                     [--list]
 
-Exit code is 0 iff every (script, backend) pair passed.  The imported
-corpus is not all green, so a bare run is survey material; use
-`--filter` to focus on a category.  `--gated-only` selects the
-`# pyre-check: gate=1` subset, which is green everywhere and is what CI
-blocks on.
+Exit code is 0 iff every (script, backend) pair passed.  `--gated-only`
+selects the `# pyre-check: gate=1` subset, which is green everywhere and
+is what CI blocks on.
 """
 
 from __future__ import annotations
@@ -47,11 +43,8 @@ PLATFORMS_PREFIX = "# pyre-check: platforms="
 
 # A snippet carrying `# pyre-check: gate=1` is green on every backend and is
 # expected to stay that way, so CI runs the marked subset (`--gated-only`) as
-# a hard gate.  The rest of the corpus is the imported RustPython set, parts
-# of which fail today — some only under CPython, which asserts behaviour the
-# original suite never ran there.  Marking a snippet is what moves it from
-# survey material to something a red run blocks a merge on; do it only once
-# the script passes under CPython and both backends.
+# a hard gate.  Language, builtin, and stdlib behaviour already covered by
+# `lib-python/3/test/` belongs there, not in this directory.
 GATE_PREFIX = "# pyre-check: gate="
 
 # Snippet basenames that are not standalone test files (helpers /

@@ -1,13 +1,13 @@
 # pyre/extra_tests
 
-Pure-Python snippet tests imported from
-[RustPython's `extra_tests/snippets`](https://github.com/RustPython/RustPython/tree/main/extra_tests/snippets),
-plus pyre-authored generic CPython-compatibility gaps that do not belong to a
+Pure-Python snippet tests for CPython-compatibility gaps that the vendored
+CPython suite (`lib-python/3/test/`) does not pin, and that do not belong to a
 JIT, GC, or PyPy-internal parity suite.
 
 Each `snippets/*.py` is a self-contained script that asserts a small
 piece of CPython semantics.  A snippet "passes" when the interpreter
-exits with code 0.
+exits with code 0.  Language, builtin, and stdlib behaviour already
+covered by `lib-python/3/test/` lives there, not here.
 
 ## Running
 
@@ -19,12 +19,10 @@ python3 pyre/extra_tests/run.py --filter builtin_dict
 python3 pyre/extra_tests/run.py -v         # show every (script, backend)
 ```
 
-Parts of the imported corpus fail today — a few only under CPython,
-because they assert behaviour the original suite never ran there — so a
-bare run is survey material rather than a gate.  A snippet that is green
-under CPython **and** both backends can declare `# pyre-check: gate=1` on
-its first line; CI runs exactly that subset (`--gated-only`) and a red
-run there blocks the merge.  Add the marker only after checking all three.
+A snippet that is green under CPython **and** both backends declares
+`# pyre-check: gate=1` on its first line; CI runs exactly that subset
+(`--gated-only`) and a red run there blocks the merge.  Add the marker
+only after checking all three.
 
 The runner sets `cwd` to `snippets/` so `from testutils import ...`
 works.  `testutils.py` is the helper module shipped with the snippets
@@ -37,16 +35,16 @@ while builds with a builtin `_pickle` hide that collision.
 
 ## Layout
 
-- `snippets/` — imported RustPython tests and generic pyre-authored gaps,
-  breadth-first surface coverage.  The pyre-authored ones carry
+- `snippets/` — pyre-authored CPython-compatibility gaps that the
+  vendored CPython suite does not already pin. They carry
   `# pyre-check: gate=1`, which is what CI runs.  Runner:
   `pyre/extra_tests/run.py`.
 - `parity_tests/` — pyre-authored scripts reserved for specific PyPy/JIT/GC
   invariants with no existing owner in `snippets/`, root `extra_tests/`,
   `lib-python/3/test/`, or `bench/synth/`. General language, builtin, and
-  stdlib behavior belongs in `snippets/`; a JIT census or performance target
-  belongs in `bench/synth/`. Extend an existing owner instead of mirroring it
-  here. Each parity script states both the missing CPython-suite coverage and
+  stdlib behavior belongs in `lib-python/3/test/`; a JIT census or performance
+  target belongs in `bench/synth/`. Extend an existing owner instead of
+  mirroring it here. Each parity script states both the missing CPython-suite coverage and
   the JIT/GC/PyPy-internal reason it remains here; the runner rejects missing
   header fields. Cite upstream by symbol, not a line number. Passing requires
   `exit 0` and a final stdout line of `OK`; the runner does not compare the
@@ -123,6 +121,6 @@ file against CPython and every pyre backend first.
 
 ## Source
 
-The base corpus came from `RustPython/extra_tests/snippets/`. Future updates
-should pull upstream changes while preserving generic pyre-authored gap tests;
-only JIT/GC/PyPy-internal additions belong in `parity_tests/`.
+`snippets/` holds pyre-authored CPython-compatibility gaps. Language, builtin,
+and stdlib behaviour already covered by `lib-python/3/test/` stays there.
+Only JIT/GC/PyPy-internal additions belong in `parity_tests/`.
