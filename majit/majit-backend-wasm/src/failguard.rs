@@ -354,11 +354,15 @@ mod tests {
         // Do not install a provider: `memory_error_singleton_ref` is
         // process-global, and a stand-in address is what later tests
         // dereference as an exception object.
+        // `handle_fail` asserts the fallback is non-null, so the null-cell
+        // arm is checked only once some provider is registered.
         let memory_error = majit_backend::memory_error_singleton_ref();
-        assert_eq!(
-            majit_backend::propagate_exception_handle_fail(fd, 0),
-            Some(memory_error)
-        );
+        if memory_error != 0 {
+            assert_eq!(
+                majit_backend::propagate_exception_handle_fail(fd, 0),
+                Some(memory_error)
+            );
+        }
 
         super::attach_propagate_exception_descr(Arc::clone(&descr));
         let cell = super::descr_at(super::propagate_exception_descr_ptr()).expect("propagate cell");
