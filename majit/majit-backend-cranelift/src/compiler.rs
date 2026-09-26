@@ -2595,7 +2595,7 @@ fn unregister_call_assembler_bridge_tree(fail_descrs: &[DescrRef]) {
     }
 }
 
-fn collect_call_assembler_expectations(ops: &[Op]) -> Result<IndexMap<u64, u64>, BackendError> {
+fn collect_call_assembler_expectations(ops: &[OpRc]) -> Result<IndexMap<u64, u64>, BackendError> {
     let mut expectations = IndexMap::new();
     for op in ops {
         let opcode = op.opcode;
@@ -2636,7 +2636,7 @@ fn collect_call_assembler_expectations(ops: &[Op]) -> Result<IndexMap<u64, u64>,
 
 fn install_call_assembler_expectations(
     caller_id: CallAssemblerCallerId,
-    ops: &[Op],
+    ops: &[OpRc],
 ) -> Result<(), BackendError> {
     let expectations = collect_call_assembler_expectations(ops)?;
 
@@ -5011,7 +5011,7 @@ fn missing_gc_runtime(opcode: OpCode) -> BackendError {
 /// emitted code would dispatch on a null callee jitframe. Refuse to
 /// compile with the same error shape RPython surfaces from
 /// `gc_ll_descr.gen_malloc_frame` when the descrs are missing.
-fn validate_call_assembler_rewrite_prereqs(ops: &[Op]) -> Result<(), BackendError> {
+fn validate_call_assembler_rewrite_prereqs(ops: &[OpRc]) -> Result<(), BackendError> {
     for op in ops {
         if !matches!(
             op.opcode,
@@ -5714,28 +5714,24 @@ fn log_internal_jump_type_mismatches(
     }
 }
 
-/// Simple normalization: assign sequential pos to ops without pos.
-fn normalize_ops_for_codegen_simple(inputargs: &[InputArgRc], ops: &[Op]) -> Vec<Op> {
+/// Simple normalization: assign sequential pos to ops without pos. `pos` is
+/// interior-mutable, so the incoming `OpRc` identities stay shared with the
+/// optimizer.
+fn normalize_ops_for_codegen_simple(inputargs: &[InputArgRc], ops: &[OpRc]) {
     let num_inputs = inputargs.len() as u32;
-    ops.iter()
-        .enumerate()
-        .map(|(op_idx, op)| {
-            let normalized = op.clone();
-            let rt = normalized.result_type();
-            if rt != Type::Void && normalized.pos().get().is_none() {
-                // op_typed mints the typed Int/Float/Ref variant
-                // (resoperation.py AbstractResOp + IntOp/FloatOp/
-                // RefOp mixins) — the Void branch is filtered above.
-                normalized
-                    .pos()
-                    .set(OpRef::op_typed(num_inputs + op_idx as u32, rt));
-            }
-            normalized
-        })
-        .collect()
+    for (op_idx, op) in ops.iter().enumerate() {
+        let rt = op.result_type();
+        if rt != Type::Void && op.pos().get().is_none() {
+            // op_typed mints the typed Int/Float/Ref variant
+            // (resoperation.py AbstractResOp + IntOp/FloatOp/
+            // RefOp mixins) — the Void branch is filtered above.
+            op.pos()
+                .set(OpRef::op_typed(num_inputs + op_idx as u32, rt));
+        }
+    }
 }
 
-fn inject_builtin_string_descrs(ops: &mut [Op]) {
+fn inject_builtin_string_descrs(ops: &[OpRc]) {
     for op in ops {
         if op.has_descr() {
             continue;
@@ -9606,18 +9602,17 @@ impl CraneliftBackend {
     fn prepare_ops_for_compile(
         &mut self,
         inputargs: &[InputArgRc],
-        ops: &[Op],
+        ops: &[OpRc],
     ) -> (Vec<Op>, Vec<GcRef>) {
-        let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
-        inject_builtin_string_descrs(&mut normalized);
+        // rewrite.py assemble_loop mutates the same ResOperation objects.
+        normalize_ops_for_codegen_simple(inputargs, ops);
+        inject_builtin_string_descrs(ops);
         {
             let rewriter = self.gc_rewriter();
-            // The rewriter takes/returns `OpRc`; cranelift still owns a
-            // `Vec<Op>` past this boundary, so wrap and unwrap here.
-            let boxed: Vec<OpRc> = normalized.into_iter().map(OpRc::new).collect();
             // `RewriteState::const_int` emits fresh `ConstInt`s inline, so
             // the borrowed pool is not extended.
-            let (result, gcrefs) = rewriter.rewrite_for_gc_with_constants(&boxed, &self.constants);
+            let (result, gcrefs) = rewriter.rewrite_for_gc_with_constants(ops, &self.constants);
+            // Cranelift owns a `Vec<Op>` past this boundary.
             let result: Vec<Op> = result.iter().map(|rc| (**rc).clone()).collect();
             (result, gcrefs)
         }
@@ -9901,7 +9896,7 @@ impl CraneliftBackend {
     fn do_compile(
         &mut self,
         inputargs: &[InputArgRc],
-        ops: &[Op],
+        ops: &[OpRc],
         invalidation_flag_ptr: Option<usize>,
         source_guard: Option<(u64, u32)>,
         caller_layout: Option<&ExitRecoveryLayout>,
@@ -18435,10 +18430,6 @@ impl majit_backend::Backend for CraneliftBackend {
         // going to make anyway, on a path taken once per compiled loop
         // instead of once per entry into one.
         slice_x2_probe::arm_reporter();
-        // Deep-clone Op out of OpRc for the internal pipeline (post-optimizer
-        // boundary; backend stages do not depend on `_forwarded` sharing).
-        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
-        let ops: &[Op] = &ops_owned;
         token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp.get()).collect());
         // Pass the address of the invalidation flag so GUARD_NOT_INVALIDATED
         // can load from it at runtime.
@@ -18573,8 +18564,6 @@ impl majit_backend::Backend for CraneliftBackend {
         if let Some(clt) = original_token.compiled_loop_token() {
             clt.compiling_a_bridge(&self.cpu_tracker);
         }
-        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
-        let ops: &[Op] = &ops_owned;
         let invalidated_arc = original_token.mint_bridge_invalidation_flag();
         let flag_ptr =
             Arc::as_ptr(&invalidated_arc) as *const std::sync::atomic::AtomicBool as usize;
