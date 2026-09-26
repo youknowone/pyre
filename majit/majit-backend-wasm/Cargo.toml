@@ -26,6 +26,7 @@ majit-gc = { workspace = true }
 # `BhDescr` (blackhole allocation descriptors) names the `bh_new*` override
 # parameter types, matching the `Backend` trait signature.
 majit-jitcode = { workspace = true }
+majit-rlib = { workspace = true }
 wasm-encoder = { workspace = true }
 
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "wasi")))'.dependencies]

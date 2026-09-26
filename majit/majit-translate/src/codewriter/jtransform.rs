@@ -606,6 +606,13 @@ pub struct Transformer<'a> {
     /// pre-rename operand (`jtransform.py` `rewrite_op_direct_ptradd`
     /// reads `op.args[0].concretetype`).
     direct_ptradd_type_arg: Option<crate::flowspace::model::Variable>,
+    /// Results of `FieldRead`s whose `(owner, field)` is an immutable
+    /// array rank (`name[*]`, `rclass.py _parse_field_list`).  An
+    /// `ArrayRead` whose base (after `canonical_gc_base` and pointer
+    /// arithmetic) is one of these is `getarrayitem_gc_*_pure` —
+    /// `jtransform.py rewrite_op_getarrayitem` `ARRAY._immutable_field(None)`.
+    /// `None` until computed once per graph.
+    immutable_array_vars: Option<std::collections::HashSet<crate::flowspace::model::Variable>>,
     notes: Vec<GraphTransformNote>,
     vable_rewrites: usize,
     calls_classified: usize,
@@ -805,6 +812,257 @@ fn resolves_to_null_ptr_builtin(segments: &[String]) -> bool {
         .import_module(&module_path.join("."))
         .and_then(|module| module.module_get(leaf))
         .is_some_and(|attr| NULL_PTR_BUILTIN_QUALNAMES.contains(&attr.qualname()))
+}
+
+/// `gc_hook::try_gc_write_barrier` / `try_gc_write_barrier_managed` —
+/// the interpreter's spelling of `llop.gc_writebarrier`, which
+/// [`drop_guarded_gc_write_barriers`] drops when the store it guards
+/// follows. `try_gc_write_barrier_before_move` is a different op
+/// (`gct_gc_writebarrier_before_move`) and is not this.
+fn is_gc_write_barrier_path(segments: &[String]) -> bool {
+    let [.., module, leaf] = segments else {
+        return false;
+    };
+    module == "gc_hook"
+        && matches!(
+            leaf.as_str(),
+            "try_gc_write_barrier" | "try_gc_write_barrier_managed"
+        )
+}
+
+/// Identity-cast markers `rewrite_op_direct_call` folds to `same_as`
+/// (`__cast_pointer`, `__cast_instance_intrinsic`,
+/// `__cast_address_intrinsic`).
+fn is_identity_cast_path(segments: &[String]) -> bool {
+    let [leaf] = segments else {
+        return false;
+    };
+    leaf == "__cast_pointer"
+        || leaf == crate::runtime_names::shims::CAST_INSTANCE
+        || leaf == crate::runtime_names::shims::CAST_ADDRESS
+}
+
+/// `core::ptr::from_ref` / `from_mut` — rustc `ptr/mod.rs` `from_ref` is
+/// `return r`, the same bits as `r as *const T`. RPython has no
+/// reference type separate from `Ptr`; the rtyper emits `cast_pointer`
+/// (`rptr.py` / `annlowlevel.py specialize_call`) and
+/// `jtransform.py rewrite_op_cast_pointer` aliases via `same_as`.
+///
+/// Not `slice::from_ref` (one-element slice) and not `NonNull::from_ref`
+/// (wrapper struct).
+fn is_ptr_from_ref_path(segments: &[String]) -> bool {
+    let Some(leaf) = segments.last() else {
+        return false;
+    };
+    if leaf != "from_ref" && leaf != "from_mut" {
+        return false;
+    }
+    let joined = segments.join("::");
+    if joined.contains("slice") || joined.contains("NonNull") || joined.contains("non_null") {
+        return false;
+    }
+    joined.starts_with("core::ptr::") || joined.starts_with("std::ptr::")
+}
+
+/// Stored value of a GC-pointer `setfield_gc` / `setarrayitem_gc`
+/// (`rewrite.py handle_write_barrier_setfield` keys on `v.type == 'r'`).
+fn value_type_is_gc_ref(ty: &ValueType) -> bool {
+    matches!(ty, ValueType::Ref(_))
+}
+
+/// Operand of an identity-cast Call that produced `var`, if any.
+fn identity_cast_operand(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<crate::flowspace::model::Variable> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            if let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+                && (is_identity_cast_path(segments) || is_ptr_from_ref_path(segments))
+            {
+                return args.iter().find_map(LinkArg::as_variable).cloned();
+            }
+        }
+    }
+    None
+}
+
+/// Follow `resolve_alias` then identity-cast Calls to the source pointer.
+fn canonical_gc_base(
+    graph: &FunctionGraph,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+    var: &crate::flowspace::model::Variable,
+) -> crate::flowspace::model::Variable {
+    let mut cur = resolve_alias(var, aliases);
+    for _ in 0..32 {
+        let Some(src) = identity_cast_operand(graph, &cur) else {
+            break;
+        };
+        let next = resolve_alias(&src, aliases);
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
+/// `framework.py gct_gc_writebarrier` turns `llop.gc_writebarrier` into a
+/// call the JIT rewriter does not keep: `rewrite.py
+/// handle_write_barrier_setfield` already grows `COND_CALL_GC_WB` on the
+/// `SETFIELD_GC` / `SETARRAYITEM_GC` of a pointer. The interpreter spells
+/// that barrier as an explicit `try_gc_write_barrier(obj)` right before the
+/// store it guards, so the call is dropped only when a GC `FieldWrite` /
+/// `ArrayWrite` of the same base follows it in the same block: that store
+/// lowers to the op the backend barriers. Any other barrier stays residual.
+///
+/// The result becomes `true`: the hook is installed before any compiled
+/// code runs.
+fn drop_guarded_gc_write_barriers(graph: &mut FunctionGraph) {
+    let aliases = std::collections::HashMap::new();
+    let mut drops: Vec<(usize, usize)> = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (oi, op) in block.operations.iter().enumerate() {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if args.len() != 1 || !is_gc_write_barrier_path(segments) {
+                continue;
+            }
+            let Some(arg) = args[0].as_variable() else {
+                continue;
+            };
+            let canon = canonical_gc_base(graph, &aliases, arg);
+            let guarded = block.operations[oi + 1..].iter().any(|next| {
+                let base = match &next.kind {
+                    OpKind::FieldWrite { base, ty, .. } if value_type_is_gc_ref(ty) => base,
+                    OpKind::ArrayWrite { base, item_ty, .. } if value_type_is_gc_ref(item_ty) => {
+                        base
+                    }
+                    _ => return false,
+                };
+                base == arg || canonical_gc_base(graph, &aliases, base) == canon
+            });
+            if guarded {
+                drops.push((bi, oi));
+            }
+        }
+    }
+    for (bi, oi) in drops {
+        let op = &mut graph.blocks[bi].operations[oi];
+        op.kind = OpKind::ConstBool(true);
+    }
+}
+
+/// Variables that hold an immutable array: each is the result of a
+/// `FieldRead` whose field has `IR_IMMUTABLE_ARRAY` rank
+/// (`rclass.py _parse_field_list` `name[*]`).  Computed once per graph.
+fn collect_immutable_array_vars(
+    graph: &FunctionGraph,
+    cc: Option<&crate::call::CallControl>,
+) -> std::collections::HashSet<crate::flowspace::model::Variable> {
+    let mut set = std::collections::HashSet::new();
+    let Some(cc) = cc else {
+        return set;
+    };
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::FieldRead { field, .. } = &op.kind else {
+                continue;
+            };
+            let Some(rank) = cc.field_immutability(field.owner_root.as_deref(), &field.name) else {
+                continue;
+            };
+            if rank.is_array() && rank.is_immutable() {
+                if let Some(result) = op.result.clone() {
+                    set.insert(result);
+                }
+            }
+        }
+    }
+    set
+}
+
+/// `<*T>::add` / `wrapping_add` — rustc's `direct_ptradd`, which keeps the
+/// array pointer it offsets.
+fn is_ptr_add_path(segments: &[String]) -> bool {
+    let Some(leaf) = segments.last() else {
+        return false;
+    };
+    if leaf != "add" && leaf != "wrapping_add" {
+        return false;
+    }
+    let joined = segments.join("::");
+    (joined.starts_with("core::ptr::") || joined.starts_with("std::ptr::"))
+        && (joined.contains("mut_ptr") || joined.contains("const_ptr"))
+}
+
+/// Operand of a pointer-arithmetic Call that produced `var`, if any.
+/// The front's `items_block_items_base` accessor aliases to its receiver;
+/// a leftover `ptr::add` / `wrapping_add` of that receiver still names
+/// the array header in arg 0.
+fn ptr_arith_base_operand(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<crate::flowspace::model::Variable> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if args.len() == 2 && is_ptr_add_path(segments) {
+                return args.first()?.as_variable().cloned();
+            }
+        }
+    }
+    None
+}
+
+/// Array pointer an `ArrayRead` indexes, after alias / identity-cast /
+/// pointer-arithmetic chasing.
+fn immutable_array_origin(
+    graph: &FunctionGraph,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+    var: &crate::flowspace::model::Variable,
+) -> crate::flowspace::model::Variable {
+    let mut cur = canonical_gc_base(graph, aliases, var);
+    for _ in 0..32 {
+        let Some(src) = ptr_arith_base_operand(graph, &cur) else {
+            break;
+        };
+        let next = canonical_gc_base(graph, aliases, &src);
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
 }
 
 pub(crate) fn jit_marker_key_from_target(
@@ -1635,6 +1893,7 @@ impl<'a> Transformer<'a> {
             cast_ptr_to_int_src: std::collections::HashMap::new(),
             fn_const_results: std::collections::HashMap::new(),
             direct_ptradd_type_arg: None,
+            immutable_array_vars: None,
             notes: Vec::new(),
             vable_rewrites: 0,
             calls_classified: 0,
@@ -1729,6 +1988,11 @@ impl<'a> Transformer<'a> {
 
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
+        drop_guarded_gc_write_barriers(&mut rewritten);
+        self.immutable_array_vars = Some(collect_immutable_array_vars(
+            &rewritten,
+            self.callcontrol.as_deref(),
+        ));
         for block_idx in 0..rewritten.blocks.len() {
             self.optimize_block(&mut rewritten, block_idx, &graph_name, exceptblock);
         }
@@ -2602,7 +2866,7 @@ impl<'a> Transformer<'a> {
                 item_ty,
                 ..
             } if self.config.lower_virtualizable => {
-                self.rewrite_op_getarrayitem(op, base, index, item_ty, graph_name)
+                self.rewrite_op_getarrayitem(op, base, index, item_ty, graph_name, graph)
             }
             // ── rewrite_op_setarrayitem ──
             OpKind::ArrayWrite {
@@ -4911,6 +5175,7 @@ impl<'a> Transformer<'a> {
         index: &crate::flowspace::model::Variable,
         item_ty: &ValueType,
         graph_name: &str,
+        graph: &FunctionGraph,
     ) -> RewriteResult {
         let typed_item_ty = op
             .result
@@ -4958,14 +5223,30 @@ impl<'a> Transformer<'a> {
         // → `pure = '_pure'`. The front leaves ordinary reads `pure: false`;
         // the array type's immutability lives on
         // `CallControl.immutable_array_types` (`descr.py is_pure`).
+        // Object arrays share one type id, so a `name[*]` field's array
+        // is also recognised from the FieldRead that produced the base
+        // (`rclass.py _parse_field_list` IR_IMMUTABLE_ARRAY).
         // `OpHelpers.is_pure_with_descr` does not consult the descr for
         // `GETARRAYITEM_GC_*`, so the opcode itself must be the `_pure`
         // form.
-        let immutable = array_type_id.as_deref().is_some_and(|aid| {
-            self.callcontrol
-                .as_deref()
-                .is_some_and(|cc| cc.immutable_array_types.contains(aid))
-        });
+        if self.immutable_array_vars.is_none() {
+            self.immutable_array_vars = Some(collect_immutable_array_vars(
+                graph,
+                self.callcontrol.as_deref(),
+            ));
+        }
+        let from_star_field = {
+            let origin = immutable_array_origin(graph, &self.aliases, base);
+            self.immutable_array_vars
+                .as_ref()
+                .is_some_and(|vars| vars.contains(&origin) || vars.contains(base))
+        };
+        let immutable = from_star_field
+            || array_type_id.as_deref().is_some_and(|aid| {
+                self.callcontrol
+                    .as_deref()
+                    .is_some_and(|cc| cc.immutable_array_types.contains(aid))
+            });
         let pure = source_pure || immutable;
         if &typed_item_ty != item_ty || pure != source_pure {
             return RewriteResult::Replace(vec![SpaceOperation {
@@ -5246,6 +5527,14 @@ impl<'a> Transformer<'a> {
                     return RewriteResult::Identity(src);
                 }
                 if self.get_value_kind_var(&arg) == 'i' {
+                    // Stamp the operand Signed so flatten emits
+                    // `cast_int_to_ptr/i>r` (`insns.rs`), not an unwired
+                    // `/r>r` from an unstamped Unknown.
+                    self.stamp_value_kind(
+                        graph,
+                        Some(arg.clone()),
+                        crate::codewriter::type_state::ConcreteType::Signed,
+                    );
                     self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
                     return rewrite_as_unary_llop(
                         op,
@@ -5930,6 +6219,16 @@ impl<'a> Transformer<'a> {
         // folds back to the operand alias and emits no jitcode op.
         if let CallTarget::FunctionPath { segments, .. } = target
             && segments.as_slice() == ["__cast_pointer"]
+            && args.len() == 1
+        {
+            return RewriteResult::Identity(args[0].clone());
+        }
+        // `ptr::from_ref` / `from_mut` is rustc's `r as *const T` /
+        // `*mut T` (`ptr/mod.rs from_ref` returns `r`). Same
+        // `rewrite_op_cast_pointer` → `same_as` alias as the marker
+        // above: no jitcode op, not a residual helper.
+        if let CallTarget::FunctionPath { segments, .. } = target
+            && is_ptr_from_ref_path(segments)
             && args.len() == 1
         {
             return RewriteResult::Identity(args[0].clone());
@@ -10727,6 +11026,10 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
         // malloc is the one raw allocation the optimizer can virtualise
         // (`virtualize.py do_RAW_MALLOC_VARSIZE_CHAR`).
         "raw_malloc_varsize_char" => OopSpecIndex::RawMallocVarsizeChar,
+        // `_rewrite_raw_malloc` appends `_zero` to the helper name and
+        // still attaches `OS_RAW_MALLOC_VARSIZE_CHAR` when `TYPE.OF`
+        // is Char.
+        "raw_malloc_varsize_zero" => OopSpecIndex::RawMallocVarsizeChar,
         "raw_free" => OopSpecIndex::RawFree,
         // jtransform.py:507-509: oopspec_name.endswith('dict.lookup')
         _ if base.ends_with("dict.lookup") => OopSpecIndex::DictLookup,
@@ -16137,6 +16440,229 @@ mod tests {
         );
     }
 
+    /// `rewrite_op_getarrayitem`: a base loaded from a `name[*]` field
+    /// (`IR_IMMUTABLE_ARRAY`) makes the element read `getarrayitem_gc_*_pure`.
+    #[test]
+    fn getarrayitem_from_star_field_is_pure() {
+        use crate::call::CallControl;
+        use crate::model::{FieldDescriptor, ImmutableRank};
+
+        let mut cc = CallControl::new();
+        cc.immutable_fields_by_struct.insert(
+            "Holder".to_string(),
+            vec![("payload".to_string(), ImmutableRank::ImmutableArray)],
+        );
+
+        let mut graph = FunctionGraph::new("read_star_item");
+        let holder = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "holder".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let arr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: holder,
+                    field: FieldDescriptor::new("payload", Some("Holder".to_string())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayRead {
+                base: arr,
+                index,
+                item_ty: ValueType::Ref(None),
+                array_type_id: None,
+                nolength: false,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let result = transformer.transform(&graph);
+        assert!(
+            result
+                .graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .any(|o| matches!(&o.kind, OpKind::ArrayRead { pure: true, .. })),
+            "ArrayRead from a [*] field must be rewritten pure"
+        );
+    }
+
+    /// A base loaded from a field that is not `name[*]` stays a mutable
+    /// `getarrayitem_gc_*`.
+    #[test]
+    fn getarrayitem_from_non_star_field_is_not_pure() {
+        use crate::call::CallControl;
+        use crate::model::FieldDescriptor;
+
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("read_list_item");
+        let list = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "list".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let arr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: list,
+                    field: FieldDescriptor::new("items", Some("ListLike".to_string())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayRead {
+                base: arr,
+                index,
+                item_ty: ValueType::Ref(None),
+                array_type_id: None,
+                nolength: false,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let result = transformer.transform(&graph);
+        assert!(
+            result
+                .graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .any(|o| matches!(&o.kind, OpKind::ArrayRead { pure: false, .. })),
+            "ArrayRead from a non-[*] field must stay non-pure"
+        );
+        assert!(
+            !result
+                .graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .any(|o| matches!(&o.kind, OpKind::ArrayRead { pure: true, .. })),
+            "no ArrayRead should have been rewritten pure"
+        );
+    }
+
+    /// A base that is a block input has unknown provenance and stays
+    /// non-pure.
+    #[test]
+    fn getarrayitem_from_input_arg_is_not_pure() {
+        use crate::call::CallControl;
+
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("read_arg_item");
+        let arr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "arr".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayRead {
+                base: arr,
+                index,
+                item_ty: ValueType::Ref(None),
+                array_type_id: None,
+                nolength: false,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let result = transformer.transform(&graph);
+        assert!(
+            result
+                .graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .any(|o| matches!(&o.kind, OpKind::ArrayRead { pure: false, .. })),
+            "ArrayRead of an input arg must stay non-pure"
+        );
+        assert!(
+            !result
+                .graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .any(|o| matches!(&o.kind, OpKind::ArrayRead { pure: true, .. })),
+            "no ArrayRead should have been rewritten pure"
+        );
+    }
+
     #[test]
     fn handle_jit_marker_loop_header_emits_single_loop_header_op() {
         // jtransform.py `SpaceOperation('loop_header', [c_index], None)`.
@@ -17191,6 +17717,81 @@ mod tests {
         match rewritten {
             RewriteResult::Identity(alias) => assert_eq!(alias, arg),
             _ => panic!("expected Identity alias to the operand"),
+        }
+    }
+
+    /// `ptr::from_ref` is rustc `return r` / rtyper `cast_pointer` /
+    /// `rewrite_op_same_as`. The host Call must alias, not residualise.
+    #[test]
+    fn ptr_from_ref_elides_to_operand_alias() {
+        for path in [
+            vec!["core", "ptr", "from_ref"],
+            vec!["std", "ptr", "from_mut"],
+            vec!["core", "ptr::<Impl>", "from_ref"],
+        ] {
+            let config = GraphTransformConfig::default();
+            let mut transformer = Transformer::new(&config);
+            let mut graph = FunctionGraph::new("ptr_from_ref");
+            let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let target = CallTarget::function_path(path);
+            let result_ty = ValueType::Ref(None);
+            let op = SpaceOperation {
+                result: Some(result_var),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![arg.clone()]),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            match transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                std::slice::from_ref(&arg),
+                &result_ty,
+                "ptr_from_ref",
+                &mut graph,
+            ) {
+                RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+                _ => panic!("expected Identity alias to the operand"),
+            }
+        }
+    }
+
+    /// `slice::from_ref` builds a one-element slice; `NonNull::from_ref`
+    /// wraps. Neither is `cast_pointer`.
+    #[test]
+    fn slice_and_nonnull_from_ref_are_not_pointer_identity() {
+        for path in [
+            vec!["core", "slice", "from_ref"],
+            vec!["core", "ptr", "non_null", "NonNull", "from_ref"],
+        ] {
+            let config = GraphTransformConfig::default();
+            let mut transformer = Transformer::new(&config);
+            let mut graph = FunctionGraph::new("not_ptr_from_ref");
+            let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let target = CallTarget::function_path(path);
+            let result_ty = ValueType::Ref(None);
+            let op = SpaceOperation {
+                result: Some(result_var),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![arg.clone()]),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            match transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                std::slice::from_ref(&arg),
+                &result_ty,
+                "not_ptr_from_ref",
+                &mut graph,
+            ) {
+                RewriteResult::Identity(_) => panic!("must not alias slice/NonNull from_ref"),
+                _ => {}
+            }
         }
     }
 
@@ -18292,6 +18893,120 @@ mod tests {
         }
     }
 
+    fn wb_call(obj: &crate::flowspace::model::Variable, leaf: &str) -> OpKind {
+        OpKind::Call {
+            target: CallTarget::function_path(["pyre_object", "gc_hook", leaf]),
+            args: crate::model::call_args(vec![obj.clone()]),
+            result_ty: ValueType::Bool,
+        }
+    }
+
+    fn wb_store(
+        obj: &crate::flowspace::model::Variable,
+        stored: &crate::flowspace::model::Variable,
+    ) -> OpKind {
+        OpKind::FieldWrite {
+            base: obj.clone(),
+            field: FieldDescriptor::new("w_value", Some("W_Foo".to_string())),
+            value: crate::model::LinkArg::Value(stored.clone()),
+            ty: ValueType::Ref(None),
+        }
+    }
+
+    fn is_wb_call(kind: &OpKind) -> bool {
+        matches!(kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+            if is_gc_write_barrier_path(segments))
+    }
+
+    /// `rewrite.py handle_write_barrier_setfield` owns the barrier on
+    /// SETFIELD_GC: the explicit hook right before the GC store it guards
+    /// does not survive as a residual helper.
+    #[test]
+    fn gc_write_barrier_before_its_store_is_dropped() {
+        let mut graph = FunctionGraph::new("wb_drop");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let entry = graph.startblock;
+        graph.push_op_var(entry, wb_call(&obj, "try_gc_write_barrier_managed"), false);
+        graph.push_op_var(entry, wb_store(&obj, &stored), false);
+        drop_guarded_gc_write_barriers(&mut graph);
+        let ops = &graph.blocks[entry.0].operations;
+        assert!(matches!(ops[0].kind, OpKind::ConstBool(true)));
+        assert!(matches!(ops[1].kind, OpKind::FieldWrite { .. }));
+    }
+
+    /// A barrier whose argument has no GC store after it in its block
+    /// stays a residual call — dropping it would be a GC hole.
+    #[test]
+    fn gc_write_barrier_without_following_store_stays_residual() {
+        let mut graph = FunctionGraph::new("wb_keep");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let entry = graph.startblock;
+        // The store precedes the barrier: it does not guard it.
+        graph.push_op_var(entry, wb_store(&obj, &stored), false);
+        graph.push_op_var(entry, wb_call(&obj, "try_gc_write_barrier"), false);
+        drop_guarded_gc_write_barriers(&mut graph);
+        assert!(is_wb_call(&graph.blocks[entry.0].operations[1].kind));
+
+        let mut graph = FunctionGraph::new("wb_keep_alone");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let entry = graph.startblock;
+        graph.push_op_var(entry, wb_call(&obj, "try_gc_write_barrier"), false);
+        drop_guarded_gc_write_barriers(&mut graph);
+        assert!(is_wb_call(&graph.blocks[entry.0].operations[0].kind));
+    }
+
+    /// Only the `gc_hook` barrier is this op: a same-named leaf in another
+    /// module is an ordinary call.
+    #[test]
+    fn gc_write_barrier_path_requires_gc_hook_module() {
+        let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(is_gc_write_barrier_path(&path(&[
+            "pyre_object",
+            "gc_hook",
+            "try_gc_write_barrier"
+        ])));
+        assert!(!is_gc_write_barrier_path(&path(&[
+            "pyre_object",
+            "other",
+            "try_gc_write_barrier"
+        ])));
+        assert!(!is_gc_write_barrier_path(&path(&["try_gc_write_barrier"])));
+    }
+
+    #[test]
+    fn gc_write_barrier_before_move_stays_residual() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("wb_before_move");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path([
+            "pyre_object",
+            "gc_hook",
+            "try_gc_write_barrier_before_move",
+        ]);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![obj.clone()]),
+                result_ty: ValueType::Bool,
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&obj),
+            &ValueType::Bool,
+            "wb_before_move",
+            &mut graph,
+        ) {
+            RewriteResult::Keep => {}
+            _ => panic!("expected residual Keep for before_move"),
+        }
+    }
+
     /// `rtuple.py TupleRepr.newtuple`: a non-empty tuple lowers to
     /// `malloc(GcStruct)`; the following per-item `FieldWrite`s supply the
     /// `setfield`s.  It must never survive as a synthetic residual call.
@@ -19064,6 +19779,10 @@ mod tests {
             OopSpecIndex::RawFree
         );
         assert_eq!(
+            super::map_user_oopspec_to_index("raw_malloc_varsize_zero(n)"),
+            OopSpecIndex::RawMallocVarsizeChar
+        );
+        assert_eq!(
             super::map_user_oopspec_to_index("ordereddict.lookup(d, key, hash, flag)"),
             OopSpecIndex::DictLookup
         );
@@ -19079,6 +19798,134 @@ mod tests {
             super::map_user_oopspec_to_index("dict.setitem"),
             OopSpecIndex::None
         );
+    }
+
+    /// `jtransform.py rewrite_op_cast_ptr_to_int` keeps a GC cast as the
+    /// `cast_ptr_to_int` op. The host-callable `lltype.cast_ptr_to_int`
+    /// path must become that op, not a residual helper.
+    #[test]
+    fn lltype_cast_ptr_to_int_call_becomes_unop() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_ptr_to_int_call");
+        let ptr = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_ptr_to_int",
+        ]);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![ptr.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&ptr),
+            &ValueType::Int,
+            "cast_ptr_to_int_call",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                assert!(matches!(
+                    ops.as_slice(),
+                    [SpaceOperation {
+                        kind: OpKind::UnaryOp { op, operand, .. },
+                        ..
+                    }] if op == "cast_ptr_to_int" && operand == &ptr
+                ));
+            }
+            _ => panic!("expected UnaryOp rewrite"),
+        }
+    }
+
+    /// A raw pointer is already kind `'int'` (`history.py getkind`).
+    /// `rewrite_op_cast_ptr_to_int` returns None and aliases the operand.
+    #[test]
+    fn lltype_cast_ptr_to_int_of_int_aliases() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_raw_to_int");
+        let raw = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_ptr_to_int",
+        ]);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![raw.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&raw),
+            &ValueType::Int,
+            "cast_raw_to_int",
+            &mut graph,
+        ) {
+            RewriteResult::Identity(alias) => assert_eq!(alias, raw),
+            _ => panic!("expected Identity alias"),
+        }
+    }
+
+    /// `rbuiltin.py rtype_cast_int_to_ptr` emits `cast_int_to_ptr`.
+    /// The host-callable path must become that op, not a residual helper.
+    #[test]
+    fn lltype_cast_int_to_ptr_call_becomes_unop() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_int_to_ptr_call");
+        let n = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_int_to_ptr",
+        ]);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![n.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&n),
+            &ValueType::Ref(None),
+            "cast_int_to_ptr_call",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                assert!(matches!(
+                    ops.as_slice(),
+                    [SpaceOperation {
+                        kind: OpKind::UnaryOp { op, operand, .. },
+                        ..
+                    }] if op == "cast_int_to_ptr" && operand == &n
+                ));
+            }
+            _ => panic!("expected UnaryOp rewrite"),
+        }
     }
 
     /// `Transformer._handle_str2unicode_call` records the Str2Unicode

@@ -14,6 +14,7 @@ parking_lot = { workspace = true }
 majit-ir = { workspace = true }
 majit-backend = { workspace = true }
 majit-jitcode = { workspace = true }
+majit-rlib = { workspace = true }
 majit-gc = { workspace = true }
 dynasm = { workspace = true }
 dynasmrt = { workspace = true }

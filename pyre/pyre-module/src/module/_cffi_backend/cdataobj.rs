@@ -12,6 +12,7 @@ use rustpython_wtf8::Wtf8Buf;
 use std::sync::OnceLock;
 
 use super::ctypeobj::{self, W_CType};
+use super::misc;
 
 // ── the subclass discriminant ───────────────────────────────────────────
 
@@ -193,11 +194,18 @@ impl W_CData {
 pub fn cdata_arg(w_cdata: PyObjectRef) -> Result<&'static mut W_CData, PyError> {
     match W_CData::from_obj(w_cdata) {
         Some(cdata) => Ok(cdata),
-        None => Err(PyError::type_error(format!(
-            "expected a cdata object, got '{}'",
-            pyre_interpreter::type_methods::arg_type_name(w_cdata)
-        ))),
+        None => Err(unsafe { PyError::from_exc_object(expected_cdata_object(w_cdata)) }),
     }
+}
+
+/// `@unwrap_spec(w_cdata=cdataobj.W_CData)` miss — `oefmt`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn expected_cdata_object(w_got: PyObjectRef) -> PyObjectRef {
+    PyError::type_error(format!(
+        "expected a cdata object, got '{}'",
+        pyre_interpreter::type_methods::arg_type_name(w_got)
+    ))
+    .to_exc_object()
 }
 
 // ── construction ────────────────────────────────────────────────────────
@@ -367,7 +375,7 @@ pub unsafe fn new_cdata_copy(
     size: i64,
 ) -> Result<PyObjectRef, PyError> {
     let ptr = raw_alloc(size, false)?;
-    unsafe { std::ptr::copy_nonoverlapping(source, ptr as *mut u8, size.max(0) as usize) };
+    misc::raw_memcopy(source as usize, ptr, size.max(0) as usize);
     Ok(new_cdata_full(
         ptr,
         w_ctype,
@@ -486,14 +494,27 @@ pub fn add_memory_pressure(w_cdata: PyObjectRef, size: i64) {
 /// of every GC allocator, and the pointee of every root slot — so it banks
 /// as a reference the collector traces and rewrites.  A raw block is
 /// neither traced nor moved, and the two must not share a spelling.
+#[inline(never)]
 #[majit_macros::oopspec("raw_malloc_varsize_char(size)")]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn raw_malloc_varsize_char(size: usize) -> usize {
     unsafe { libc::malloc(size.max(1)) as usize }
 }
 
+/// `lltype.malloc(..., flavor='raw', zero=True)` — the
+/// `_ll_1_raw_malloc_varsize_zero` residual. Same
+/// `OS_RAW_MALLOC_VARSIZE_CHAR` as the non-zero Char helper
+/// (`jtransform.py _rewrite_raw_malloc` when `TYPE.OF == Char`).
+#[inline(never)]
+#[majit_macros::oopspec("raw_malloc_varsize_zero(size)")]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_malloc_varsize_zero(size: usize) -> usize {
+    unsafe { libc::calloc(size.max(1), 1) as usize }
+}
+
 /// `lltype.free(ptr, flavor='raw')` — the `raw_free` residual
 /// (`support.py ll_raw_free`).
+#[inline(never)]
 #[majit_macros::oopspec("raw_free(ptr)")]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn raw_free(ptr: usize) {
@@ -516,25 +537,34 @@ pub fn raw_read_ptr(data: usize) -> usize {
     unsafe { (data as *const usize).read_unaligned() }
 }
 
+/// One pointer-sized store into an exchange-buffer argument slot
+/// (`rffi.cast(rffi.CCHARPP, data)[0] = value`).
+#[majit_macros::oopspec("raw_write_ptr(data, value)")]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_write_ptr(data: usize, value: usize) {
+    unsafe { (data as *mut usize).write_unaligned(value) }
+}
+
 pub fn raw_alloc(size: i64, zero: bool) -> Result<usize, PyError> {
     if size < 0 {
         return Err(PyError::value_error("negative allocation size"));
     }
     let bytes = size.max(1) as usize;
-    let ptr = unsafe {
-        if zero {
-            libc::calloc(bytes, 1)
-        } else {
-            libc::malloc(bytes)
-        }
+    // `support.py _ll_1_raw_malloc_varsize[_zero]`: the C leaf stays
+    // inside the residual. Inlining `raw_alloc` onto `libc::calloc`
+    // made the descent scan decline on that un-lowered helper.
+    let ptr = if zero {
+        raw_malloc_varsize_zero(bytes)
+    } else {
+        raw_malloc_varsize_char(bytes)
     };
-    if ptr.is_null() {
+    if ptr == 0 {
         return Err(PyError::new(
             pyre_interpreter::PyErrorKind::MemoryError,
             "out of memory",
         ));
     }
-    Ok(ptr as usize)
+    Ok(ptr)
 }
 
 /// `lltype.free(self._ptr, flavor='raw')` in the light finalizers of
@@ -964,10 +994,14 @@ pub fn __majit_wrap_cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyEr
     if ct.kind == ctypeobj::KIND_FUNC {
         return super::ctypefunc::call(ct, cdata.ptr, &args[1..]);
     }
-    Err(PyError::type_error(format!(
-        "cdata '{}' is not callable",
-        ct.name()
-    )))
+    Err(unsafe { PyError::from_exc_object(cdata_not_callable(ct)) })
+}
+
+/// `W_CType.call` — `oefmt("cdata '%s' is not callable", self.name)`,
+/// shaped as [`ctypeobj::cannot_return_cdata`].
+#[majit_macros::dont_look_inside]
+pub(crate) fn cdata_not_callable(ct: &W_CType) -> PyObjectRef {
+    PyError::type_error(format!("cdata '{}' is not callable", ct.name())).to_exc_object()
 }
 
 pyre_interpreter::builtin_wrapper_descriptor!(

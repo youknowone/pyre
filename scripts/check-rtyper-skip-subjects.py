@@ -318,8 +318,22 @@ def main() -> int:
     # Relocation is the ordinary shape of progress here: a graph that
     # stops declining on its first blocker reaches a later one and is
     # categorised by that instead.
-    pair_added = flat_got - flat_want
-    pair_gone = flat_want - flat_got
+    def module_move_key(name: str) -> str:
+        # `#1854` moved optional modules from `pyre-interpreter` to
+        # `pyre-module`. The graph is the same subject; only the crate
+        # prefix changed, so both spellings compare as one name.
+        for prefix in (
+            "pyre_interpreter::module::",
+            "pyre_module::module::",
+        ):
+            if name.startswith(prefix):
+                return "module::" + name[len(prefix) :]
+        return name
+
+    pair_added = ({(c, module_move_key(s)) for c, s in flat_got}
+                  - {(c, module_move_key(s)) for c, s in flat_want})
+    pair_gone = ({(c, module_move_key(s)) for c, s in flat_want}
+                 - {(c, module_move_key(s)) for c, s in flat_got})
     gone_names = {s for _, s in pair_gone}
     added_names = {s for _, s in pair_added}
     added = sorted((c, s) for c, s in pair_added if s not in gone_names)

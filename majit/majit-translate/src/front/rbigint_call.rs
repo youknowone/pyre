@@ -30,7 +30,11 @@ pub(crate) fn constructor_residual_path(
     let leaf = segments.last()?.as_str();
     let matches_constructor = match leaf {
         "from" => true,
-        "fromint" => !unsigned,
+        "fromint" | "fromrarith_int" => !unsigned,
+        // Unsigned specialization of `@specialize.argtype(0) fromrarith_int`
+        // (`rbigint.py`). The leaf is the proof of unsigned; do not wait
+        // on the argument-type gate that `from` uses.
+        "fromrarith_uint" => true,
         // RPython's JIT has no longlonglong register kind. Keep the decline
         // local to this mapper instead of relying on the caller's width gate.
         "from_u128" => return None,
@@ -48,7 +52,7 @@ pub(crate) fn constructor_residual_path(
         .map(|part| part.to_string())
         .collect();
     path.push(
-        if unsigned {
+        if unsigned || leaf == "fromrarith_uint" {
             "jit_bigint_from_u64"
         } else {
             "jit_bigint_from_i64"
@@ -548,6 +552,22 @@ mod tests {
                 "jit_bigint_from_u64"
             ]))
         );
+        assert_eq!(
+            constructor_residual_path(&segs(&["rbigint", "RBigInt", "fromrarith_int"]), false),
+            Some(segs(&[
+                crate::runtime_names::crates::OBJECT,
+                "longobject",
+                "jit_bigint_from_i64"
+            ]))
+        );
+        assert_eq!(
+            constructor_residual_path(&segs(&["rbigint", "RBigInt", "fromrarith_uint"]), true),
+            Some(segs(&[
+                crate::runtime_names::crates::OBJECT,
+                "longobject",
+                "jit_bigint_from_u64"
+            ]))
+        );
     }
 
     #[test]
@@ -560,6 +580,20 @@ mod tests {
             constructor_residual_path(&segs(&["rbigint", "RBigInt", "from_u128"]), true).is_none()
         );
         assert!(constructor_residual_path(&segs(&["rbigint", "RBigInt", "add"]), false).is_none());
+        assert!(
+            constructor_residual_path(&segs(&["rbigint", "RBigInt", "fromrarith_int"]), true)
+                .is_none()
+        );
+        // The leaf names the unsigned constructor even if the argument
+        // atom was not classified as unsigned.
+        assert_eq!(
+            constructor_residual_path(&segs(&["rbigint", "RBigInt", "fromrarith_uint"]), false),
+            Some(segs(&[
+                crate::runtime_names::crates::OBJECT,
+                "longobject",
+                "jit_bigint_from_u64"
+            ]))
+        );
     }
 
     #[test]

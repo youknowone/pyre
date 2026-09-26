@@ -1334,6 +1334,18 @@ fn switch_descr_targets(descr_index: usize) -> Option<Vec<usize>> {
         .collect()
 }
 
+/// One-key lookup for a known `switch/id` discriminant.
+///
+/// `bhimpl_switch`: `switchdict.dict[switchvalue]`, or the fallthrough pc
+/// on `KeyError`. `None` means this descr is not a switch table, so the
+/// scan keeps the conservative all-arm successor set.
+fn switch_descr_lookup(descr_index: usize, value: i64) -> Option<Option<usize>> {
+    let descrs = crate::jitcode_runtime::descr_ref_table();
+    let descr = descrs.at(descr_index)?;
+    let switch = descr.as_switch_descr()?;
+    Some(switch.lookup(value))
+}
+
 /// Evaluate the Int result of the small, side-effect-free opcode family the
 /// blocker scan needs to decide a following conditional edge.
 ///
@@ -1963,22 +1975,35 @@ pub(crate) fn summarize_body_blockers_with(
                 push!(points, work, d.next_pc, state);
             }
             "switch" => {
-                // The arm table hangs off the descr rather than the code
-                // bytes.  With the table in hand the successors are its arms
-                // plus the fallthrough a key outside the table takes
-                // (`bhimpl_switch`); without it every instruction start is
-                // named, a superset that keeps the answer sound but lets the
-                // state at one arm's switch reach every other arm.
-                match descr_operand_index(code, &d).and_then(|index| switch_targets(index)) {
-                    Some(targets) => {
-                        for target in targets {
-                            push!(points, work, target, state.clone());
-                        }
-                        push!(points, work, d.next_pc, state);
+                // `bhimpl_switch`: a known discriminant takes one arm, or
+                // the fallthrough on a miss — the same one-successor
+                // reading `goto_if` already applies to a known condition.
+                // A red discriminant still joins every listed arm plus
+                // fallthrough (`bhimpl_switch` KeyError path).
+                let disc = code
+                    .get(d.pc + 1)
+                    .and_then(|&slot| known_i.get(slot as usize).copied())
+                    .flatten();
+                let descr_index = descr_operand_index(code, &d);
+                if let (Some(value), Some(index)) = (disc, descr_index)
+                    && let Some(hit) = switch_descr_lookup(index, value)
+                {
+                    match hit {
+                        Some(target) => push!(points, work, target, state),
+                        None => push!(points, work, d.next_pc, state),
                     }
-                    None => {
-                        for &target in &starts {
-                            push!(points, work, target, state.clone());
+                } else {
+                    match descr_index.and_then(|index| switch_targets(index)) {
+                        Some(targets) => {
+                            for target in targets {
+                                push!(points, work, target, state.clone());
+                            }
+                            push!(points, work, d.next_pc, state);
+                        }
+                        None => {
+                            for &target in &starts {
+                                push!(points, work, target, state.clone());
+                            }
                         }
                     }
                 }

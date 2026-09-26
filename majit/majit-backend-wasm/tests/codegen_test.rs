@@ -9764,6 +9764,25 @@ fn unlowered_virtual_refs_and_errno_calls_decline() {
     }
 }
 
+#[test]
+fn call_release_gil_save_err_lowers_through_the_errno_helpers() {
+    let call = make_op(
+        OpCode::CallReleaseGilI,
+        &[OpRef::const_int(1), OpRef::const_int(0x22)],
+        OpRef::int_op(1),
+    );
+    let mut inputs = inline_region_inputs(
+        &[InputArg::from_type_rc(Type::Int, 0)],
+        vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])],
+        vec![],
+    );
+    inputs.alloc.write_real_errno_fn_ptr = 0x77;
+    inputs.alloc.read_real_errno_fn_ptr = 0x78;
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("CALL_RELEASE_GIL with save_err should lower");
+    validate_wasm(&bytes);
+}
+
 fn count_rewritten_malloc_nursery(ops: &[Op]) -> (usize, usize) {
     let mallocs = ops
         .iter()
@@ -9878,6 +9897,8 @@ fn nursery_new_inputs(ops: Vec<Op>, plain_tid: u32) -> codegen::ModuleBuildInput
             headerless_fn_ptr: 0x55,
             threadlocal_fn_ptr: 0x66,
             fmod_fn_ptr: 0,
+            write_real_errno_fn_ptr: 0x77,
+            read_real_errno_fn_ptr: 0x78,
         },
         wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
         nursery: Some(codegen::NurseryAllocParams {
