@@ -3328,24 +3328,33 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     // `ll_find` / `ll_rfind` / `ll_count`: elidable residuals the
     // `descr_find` / `descr_rfind` / `descr_count` wrappers record.
-    // Bounds are already machine ints; the strings stay GC refs.
+    // Bounds are already machine ints; the strings stay GC refs. These bind
+    // the `__majit_call_target_*` trampoline: the raw fn is
+    // `(i32, i32, i64, i64) -> i64` on wasm32, while the residual
+    // `call_indirect` is typed `(i64 x 4) -> i64` from the descr.
+    let jit_str_find_bounds: extern "C" fn(i64, i64, i64, i64) -> i64 =
+        pyre_object::unicodeobject::__majit_call_target_jit_str_find_bounds;
     cpa4(
         &mut entries,
         "pyre_object::unicodeobject::jit_str_find_bounds",
         "pyre_object::jit_str_find_bounds",
-        pyre_object::unicodeobject::jit_str_find_bounds,
+        jit_str_find_bounds,
     );
+    let jit_str_rfind_bounds: extern "C" fn(i64, i64, i64, i64) -> i64 =
+        pyre_object::unicodeobject::__majit_call_target_jit_str_rfind_bounds;
     cpa4(
         &mut entries,
         "pyre_object::unicodeobject::jit_str_rfind_bounds",
         "pyre_object::jit_str_rfind_bounds",
-        pyre_object::unicodeobject::jit_str_rfind_bounds,
+        jit_str_rfind_bounds,
     );
+    let jit_str_count_bounds: extern "C" fn(i64, i64, i64, i64) -> i64 =
+        pyre_object::unicodeobject::__majit_call_target_jit_str_count_bounds;
     cpa4(
         &mut entries,
         "pyre_object::unicodeobject::jit_str_count_bounds",
         "pyre_object::jit_str_count_bounds",
-        pyre_object::unicodeobject::jit_str_count_bounds,
+        jit_str_count_bounds,
     );
     cpa2(
         &mut entries,
