@@ -3252,7 +3252,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(ns, "min", || {
         make_module_builtin_function_with_doc(
             "min",
-            builtin_min,
+            __majit_wrap_builtin_min,
             "min(iterable, *[, default=obj, key=func]) -> value\n\
              min(arg1, arg2, *args, *[, key=func]) -> value\n\
              \n\
@@ -3265,7 +3265,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(ns, "max", || {
         make_module_builtin_function_with_doc(
             "max",
-            builtin_max,
+            __majit_wrap_builtin_max,
             "max(iterable, *[, default=obj, key=func]) -> value\n\
              max(arg1, arg2, *args, *[, key=func]) -> value\n\
              \n\
@@ -3320,10 +3320,10 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         make_module_builtin_function_with_arity("id", builtin_id, 1)
     });
     crate::module_ns_get_or_insert_with(ns, "hash", || {
-        make_module_builtin_function_with_arity("hash", builtin_hash, 1)
+        make_module_builtin_function_with_arity("hash", __majit_wrap_builtin_hash, 1)
     });
     crate::module_ns_get_or_insert_with(ns, "ord", || {
-        make_module_builtin_function_with_arity("ord", builtin_ord, 1)
+        make_module_builtin_function_with_arity("ord", __majit_wrap_builtin_ord, 1)
     });
     crate::module_ns_get_or_insert_with(ns, "chr", || {
         make_module_builtin_function_with_arity("chr", builtin_chr, 1)
@@ -5107,7 +5107,7 @@ pub fn is_builtin_hash_function(callable: PyObjectRef) -> bool {
         }
         crate::gateway::builtin_code_fn_eq(
             crate::gateway::builtin_code_get(code),
-            builtin_hash as crate::gateway::BuiltinCodeFn,
+            __majit_wrap_builtin_hash as crate::gateway::BuiltinCodeFn,
         )
     }
 }
@@ -5126,7 +5126,7 @@ pub fn is_builtin_ord_function(callable: PyObjectRef) -> bool {
         }
         crate::gateway::builtin_code_fn_eq(
             crate::gateway::builtin_code_get(code),
-            builtin_ord as crate::gateway::BuiltinCodeFn,
+            __majit_wrap_builtin_ord as crate::gateway::BuiltinCodeFn,
         )
     }
 }
@@ -5375,12 +5375,32 @@ fn abs_bad_operand(obj: PyObjectRef) -> crate::PyError {
     ))
 }
 
+#[majit_macros::dont_look_inside]
+fn builtin_abs_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_abs(args)
+}
+
+/// operation.py `abs` → `space.abs`.  An exact machine int (short of
+/// `i64::MIN`, which `ovfcheck` promotes to a long), an exact float or an
+/// exact complex runs its `descr_abs` leaf; every other shape runs
+/// `builtin_abs`.
 pub fn __majit_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 1 {
-        return builtin_abs(args);
+    if args.len() == 1 {
+        let w_val = args[0];
+        unsafe {
+            if is_exact_builtin_instance(w_val) && is_int(w_val) {
+                let value = w_int_get_value(w_val);
+                if value != i64::MIN {
+                    return crate::objspace::descroperation::_int_abs(value);
+                }
+            } else if is_exact_builtin_instance(w_val) && is_float(w_val) {
+                return crate::objspace::descroperation::_float_abs(w_float_get_value(w_val));
+            } else if is_exact_builtin_instance(w_val) && pyre_object::is_complex(w_val) {
+                return crate::objspace::descroperation::complex_abs(w_val);
+            }
+        }
     }
-    let obj = args[0];
-    builtin_abs_obj(obj)
+    builtin_abs_slow(args)
 }
 
 crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_abs_target, __majit_wrap_builtin_abs);
@@ -6009,6 +6029,62 @@ pub(crate) fn builtin_min(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 pub(crate) fn builtin_max(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     min_max_dispatch(args, /* want_max= */ true, "max")
 }
+
+/// functional.py `min_max` over two positional arguments that compare without
+/// a dunder dispatch: two exact machine ints or two exact floats.  The scan
+/// keeps the first argument unless the second compares strictly past it under
+/// `$op` (`<` for `min`, `>` for `max`), a NaN included.  A keyword dict rides
+/// the same slice and is neither, so it reaches the slow path.
+macro_rules! min_max_exact_pair {
+    ($args:expr, $op:tt) => {
+        if $args.len() == 2 {
+            let w_a = $args[0];
+            let w_b = $args[1];
+            unsafe {
+                if is_exact_builtin_instance(w_a)
+                    && is_exact_builtin_instance(w_b)
+                    && is_int(w_a)
+                    && is_int(w_b)
+                {
+                    let second_wins = w_int_get_value(w_b) $op w_int_get_value(w_a);
+                    return Ok(if second_wins { w_b } else { w_a });
+                }
+                if is_exact_builtin_instance(w_a)
+                    && is_exact_builtin_instance(w_b)
+                    && is_float(w_a)
+                    && is_float(w_b)
+                {
+                    let second_wins = w_float_get_value(w_b) $op w_float_get_value(w_a);
+                    return Ok(if second_wins { w_b } else { w_a });
+                }
+            }
+        }
+    };
+}
+
+#[majit_macros::dont_look_inside]
+fn builtin_min_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_min(args)
+}
+
+pub fn __majit_wrap_builtin_min(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    min_max_exact_pair!(args, <);
+    builtin_min_slow(args)
+}
+
+#[majit_macros::dont_look_inside]
+fn builtin_max_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_max(args)
+}
+
+pub fn __majit_wrap_builtin_max(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    min_max_exact_pair!(args, >);
+    builtin_max_slow(args)
+}
+
+crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_min_target, __majit_wrap_builtin_min);
+
+crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_max_target, __majit_wrap_builtin_max);
 
 fn min_max_dispatch(
     args: &[PyObjectRef],
@@ -18237,6 +18313,59 @@ pub(crate) fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     Ok(w_int_new(try_hash_value(args[0])?))
 }
 
+/// `hash_value` for an exact `str`, `long`, `bytes` or non-NaN `float`, the
+/// scalars whose digest needs no `__hash__` lookup.  A `str` digest is
+/// memoized through `w_str_set_hash`, which stores the value the next call
+/// would recompute, so the leaf stays elidable.
+#[majit_macros::elidable_cannot_raise]
+pub fn hash_exact_scalar(w_obj: PyObjectRef) -> i64 {
+    unsafe {
+        if is_str(w_obj) {
+            return str_hash_value(w_obj);
+        }
+        if is_long(w_obj) {
+            return _hash_long(pyre_object::w_long_get_value(w_obj));
+        }
+        if is_float(w_obj) {
+            return _hash_float(w_float_get_value(w_obj));
+        }
+        _hash_bytes(pyre_object::bytesobject::w_bytes_data(w_obj))
+    }
+}
+
+#[majit_macros::dont_look_inside]
+fn builtin_hash_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_hash(args)
+}
+
+/// operation.py `hash` → `space.hash`.  An exact machine int (or bool)
+/// computes `_hash_int` inline; an exact `str`, `long`, `bytes` or non-NaN
+/// `float` answers through [`hash_exact_scalar`].  The type is pinned before
+/// that call, so every other shape reaches `builtin_hash` without it.  A NaN
+/// `float` is excluded because its identity hash allocates.
+pub fn __majit_wrap_builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() == 1 {
+        let w_obj = args[0];
+        unsafe {
+            if is_exact_builtin_instance(w_obj) {
+                if is_int(w_obj) {
+                    return Ok(w_int_new(_hash_int(w_int_get_value(w_obj))));
+                }
+                if is_str(w_obj)
+                    || is_long(w_obj)
+                    || pyre_object::is_bytes(w_obj)
+                    || (is_float(w_obj) && !w_float_get_value(w_obj).is_nan())
+                {
+                    return Ok(w_int_new(hash_exact_scalar(w_obj)));
+                }
+            }
+        }
+    }
+    builtin_hash_slow(args)
+}
+
+crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_hash_target, __majit_wrap_builtin_hash);
+
 /// `tupleobject.py W_AbstractTupleObject.descr_hash` — the hash a tuple has by
 /// virtue of its contents, with no `__hash__` lookup on the receiver.
 ///
@@ -18880,6 +19009,38 @@ fn frozenset_hash_from_storage(obj: PyObjectRef) -> i64 {
     }
 }
 
+/// `W_UnicodeObject.descr_hash`: the memoized content digest.
+///
+/// # Safety
+/// `obj` must be a live `str`.
+unsafe fn str_hash_value(obj: PyObjectRef) -> i64 {
+    unsafe {
+        // CPython `unicode_hash` caches the PEP 393 content digest.
+        let cached = pyre_object::w_str_get_hash(obj);
+        if cached != 0 {
+            return cached;
+        }
+        let wtf8 = pyre_object::w_str_get_wtf8(obj);
+        let storage = wtf8.as_bytes();
+        // Prefer the header `byte_len` when the `Wtf8Buf` length disagrees
+        // (a swept value box can leave a huge `Vec` len on the dangling
+        // pointer). A valid string has both counts equal.
+        let declared = pyre_object::unicodeobject::w_str_byte_len(obj);
+        let max_n = isize::MAX as usize / 4;
+        // A live header with a swept value box reports a garbage
+        // `Wtf8Buf` length. Do not slice or scan that buffer — the
+        // prefix path SIGBUS'd on the unmapped page. Hash empty and
+        // leave the missing GC edge as a separate defect.
+        let hash = if declared == storage.len() && declared <= max_n {
+            _hash_unicode(wtf8)
+        } else {
+            _hash_bytes(&[])
+        };
+        pyre_object::w_str_set_hash(obj, hash);
+        hash
+    }
+}
+
 /// `pypy/objspace/std/objspace.py StdObjSpace.hash` parity — share one
 /// implementation across builtin `hash()`, dict / set lookup, and
 /// tuple/frozenset content hashing.  Dispatches to PyPy's per-type
@@ -18925,29 +19086,7 @@ pub fn hash_value(mut obj: PyObjectRef) -> i64 {
             );
         }
         if is_str(obj) {
-            // CPython `unicode_hash` caches the PEP 393 content digest.
-            let cached = pyre_object::w_str_get_hash(obj);
-            if cached != 0 {
-                return cached;
-            }
-            let wtf8 = pyre_object::w_str_get_wtf8(obj);
-            let storage = wtf8.as_bytes();
-            // Prefer the header `byte_len` when the `Wtf8Buf` length disagrees
-            // (a swept value box can leave a huge `Vec` len on the dangling
-            // pointer). A valid string has both counts equal.
-            let declared = pyre_object::unicodeobject::w_str_byte_len(obj);
-            let max_n = isize::MAX as usize / 4;
-            // A live header with a swept value box reports a garbage
-            // `Wtf8Buf` length. Do not slice or scan that buffer — the
-            // prefix path SIGBUS'd on the unmapped page. Hash empty and
-            // leave the missing GC edge as a separate defect.
-            let hash = if declared == storage.len() && declared <= max_n {
-                _hash_unicode(wtf8)
-            } else {
-                _hash_bytes(&[])
-            };
-            pyre_object::w_str_set_hash(obj, hash);
-            return hash;
+            return str_hash_value(obj);
         }
         // CPython `bytes_hash` — the same `_Py_HashBytes` primitive, over the
         // bytes payload itself (bytearray is mutable / unhashable).
@@ -19095,6 +19234,39 @@ pub(crate) fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         crate::baseobjspace::object_functionstr_type_name(obj)
     )))
 }
+
+/// `ord` on an exact one-code-point `str`: the code point, or -1.
+#[majit_macros::elidable_cannot_raise]
+pub fn ord_exact_str_char(w_obj: PyObjectRef) -> i64 {
+    unsafe {
+        if !(is_exact_builtin_instance(w_obj) && is_str(w_obj)) || w_str_len(w_obj) != 1 {
+            return -1;
+        }
+        w_str_get_wtf8(w_obj)
+            .code_points()
+            .next()
+            .map_or(-1, |cp| cp.to_u32() as i64)
+    }
+}
+
+#[majit_macros::dont_look_inside]
+fn builtin_ord_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_ord(args)
+}
+
+/// operation.py `ord` → `space.ord`.  An exact one-code-point `str` answers
+/// through [`ord_exact_str_char`]; every other shape runs `builtin_ord`.
+pub fn __majit_wrap_builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() == 1 {
+        let code_point = ord_exact_str_char(args[0]);
+        if code_point >= 0 {
+            return Ok(w_int_new(code_point));
+        }
+    }
+    builtin_ord_slow(args)
+}
+
+crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_ord_target, __majit_wrap_builtin_ord);
 
 /// `chr(i)` — PyPy: operation.py chr
 fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -24933,7 +25105,7 @@ mod tests {
             u16,
             fn(PyObjectRef) -> bool,
         )] = &[
-            ("ord", builtin_ord, 1, is_builtin_ord_function),
+            ("ord", __majit_wrap_builtin_ord, 1, is_builtin_ord_function),
             (
                 "isinstance",
                 __majit_wrap_builtin_isinstance,

@@ -397,8 +397,6 @@ spec_folds! {
     SysGetframe          => ("sys_getframe",             "residual_call", "-"),
     SysExcInfo           => ("sys_exc_info",             "residual_call", "-"),
     MathFrexp            => ("math_frexp",               "residual_call", "-"),
-    BuiltinFold1         => ("builtin_fold1",            "residual_call", "-"),
-    BuiltinFold2         => ("builtin_fold2",            "residual_call", "-"),
     IntCall              => ("int_call",                 "residual_call", "-"),
     FloatCall            => ("float_call",               "residual_call", "-"),
     StrCall              => ("str_call",                 "residual_call", "-"),
