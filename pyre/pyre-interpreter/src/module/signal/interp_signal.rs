@@ -436,6 +436,11 @@ impl CheckSignalAction {
     ///
     /// `rgc.no_collect`: only reads the current EC and arms the ticker.
     fn after_thread_switch() {
+        // A non-finalizing thread that takes the GIL back after teardown
+        // began must not run anything: it may be resuming inside
+        // `action_dispatcher`, whose fired actions would run a finalizer on
+        // it.
+        crate::module::thread::park_if_finalizing();
         let action = check_signal_action();
         if action.is_null() {
             return;
@@ -451,6 +456,22 @@ impl CheckSignalAction {
         {
             unsafe { (*action).fire_in_another_thread = false };
             signalstate::rearm_ticker();
+        } else if !ec.is_null()
+            && unsafe { (*ec).signals_enabled } != 0
+            && signalstate::has_pending_signals()
+        {
+            // `decrement_ticker` can overwrite the handler's `-1` store, and
+            // a thread that then blocks runs too few bytecodes to reach the
+            // next wrap. Re-arm from the pending bits when it resumes.
+            signalstate::rearm_ticker();
+        }
+        // A thread that blocked across `settrace_all_threads` missed the
+        // process ticker store. Rearm so its next bytecode runs
+        // `action_dispatcher` and applies the hook before the opcode.
+        if !ec.is_null()
+            && !crate::module::thread::all_thread_hooks_current(unsafe { &*ec })
+        {
+            majit_ir::eval_breaker_word::fire_action_ticker();
         }
     }
 

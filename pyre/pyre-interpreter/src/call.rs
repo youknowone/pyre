@@ -1240,7 +1240,11 @@ fn call_user_function_with_eval(
         PreparedUserCall::Generator(generator) => return Ok(generator),
     };
     func_frame.fix_array_ptrs();
-    let _caller_locals_root = FrameLocalsRoot::new(frame);
+    // The caller is the executing frame: `FrameAnchor` and the
+    // execution-context chain already root it, and
+    // `pyframe_object_custom_trace` visits `locals_cells_stack_w`.
+    // The callee is a `FrameBox` on the Rust stack until `eval_fn` links
+    // it, so its locals slot stays registered for that window.
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
     eval_fn(&mut func_frame, None)
 }
@@ -1506,14 +1510,13 @@ enum CallMode {
 /// [`call_callable_in_ctx`], or through [`call_args_in_frame`] when a frame is
 /// current but the call is the interpreter's own.
 ///
-/// Pyre adds one thing to that shape: `FrameLocalsRoot` on the caller.  RPython
-/// roots the caller's locals through the shadowstack of the translated
-/// `call_valuestack`; this Rust ABI boundary is outside that transform, so the
-/// root is installed here and held across the whole dispatch.
+/// `baseobjspace.py call_valuestack` does not register the caller frame's
+/// locals slot: the executing frame is already rooted (`FrameAnchor`, the
+/// execution-context chain) and `pyframe_object_custom_trace` visits
+/// `locals_cells_stack_w`.
 pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     let profile_frame = frame as *mut PyFrame;
     let execution_context = getexecutioncontext();
-    let _caller_locals_root = FrameLocalsRoot::new(frame);
     call_callable_with_mode(
         execution_context,
         callable,
@@ -1527,15 +1530,14 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
 /// interpreter makes on its own account rather than one the bytecode made.
 /// `pyopcode.py IMPORT_NAME` is the shape: it calls `space.call_function(
 /// w_import, …)`, which carries no C-profile arm however builtin `__import__`
-/// turns out to be.  The frame is a parameter only because pyre needs the
-/// caller `FrameLocalsRoot` that RPython gets from the translated
-/// dispatcher's shadowstack — see [`call_callable`].
+/// turns out to be.  The frame is the executing frame, already rooted the
+/// same way as [`call_callable`].
 pub fn call_args_in_frame(
     frame: &mut PyFrame,
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    let _caller_locals_root = FrameLocalsRoot::new(frame);
+    let _ = frame;
     call_callable_in_ctx(getexecutioncontext(), callable, args)
 }
 
@@ -1641,8 +1643,8 @@ fn call_function_carrier_with_mode(
 
 /// [`call_function_ex_in_ctx`] reached from a frame — the `pyopcode.py CALL_FUNCTION_EX
 /// CALL_FUNCTION_EX` shape, whose else-branch is the frameless
-/// `space.call_args(w_function, args)`.  Installs the caller `FrameLocalsRoot`
-/// the way [`call_callable`] does.
+/// `space.call_args(w_function, args)`.  The caller frame is already rooted
+/// the way [`call_callable`] describes.
 pub fn call_function_ex(
     frame: &mut PyFrame,
     callable: PyObjectRef,
@@ -1652,7 +1654,6 @@ pub fn call_function_ex(
 ) -> PyResult {
     let profile_frame = frame as *mut PyFrame;
     let execution_context = getexecutioncontext();
-    let _caller_locals_root = FrameLocalsRoot::new(frame);
     call_function_ex_impl(
         execution_context,
         callable,
@@ -1819,8 +1820,8 @@ fn call_function_ex_impl(
 
 /// [`call_kw_in_ctx`] reached from a frame — the `pyopcode.py:1402
 /// CALL_FUNCTION_KW` shape, whose else-branch is the frameless
-/// `space.call_args(w_function, args)`.  Installs the caller `FrameLocalsRoot`
-/// the way [`call_callable`] does.
+/// `space.call_args(w_function, args)`.  The caller frame is already rooted
+/// the way [`call_callable`] describes.
 pub fn call_kw(
     frame: &mut PyFrame,
     callable: PyObjectRef,
@@ -1830,7 +1831,6 @@ pub fn call_kw(
 ) -> PyResult {
     let profile_frame = frame as *mut PyFrame;
     let execution_context = getexecutioncontext();
-    let _caller_locals_root = FrameLocalsRoot::new(frame);
     call_kw_in_ctx_impl(
         execution_context,
         callable,
@@ -2560,7 +2560,8 @@ pub fn call_callable_inline_residual(
 ) -> PyResult {
     let profile_frame = frame as *mut PyFrame;
     let execution_context = getexecutioncontext();
-    let _caller_locals_root = FrameLocalsRoot::new(frame);
+    // Inline residual caller: a nursery `PyFrame` already rooted by
+    // `FrameAnchor` / `FrameRoot`. Its trace visits the locals array.
     call_callable_with_mode(
         execution_context,
         callable,
@@ -3192,7 +3193,8 @@ pub(crate) fn bind_kwargs_to_signature(
             }
         }
     }
-    let mut result: Vec<PyObjectRef> = Vec::with_capacity(nparams);
+    let mut result: Vec<PyObjectRef> =
+        Vec::with_capacity(nparams + usize::from(has_varargs) + usize::from(has_varkw));
     for i in 0..nparams {
         result.push(roots.get(result_slot + i));
     }
@@ -3242,8 +3244,8 @@ fn builtin_too_many_positional_failure(
     )))
 }
 
-/// [`call_with_kwargs_in_ctx`] reached from a frame.  Installs the caller
-/// `FrameLocalsRoot` the way [`call_args_in_frame`] does, and like it carries
+/// [`call_with_kwargs_in_ctx`] reached from a frame.  The caller frame is
+/// already rooted the way [`call_args_in_frame`] is, and like it carries
 /// no C-profile arm: every caller is an interpreter-level forward — a builtin
 /// passing its own `*args, **kwargs` onward, `_pickle` reconstructing an
 /// object, `thread` running `__init__` — and none of them is a call the
@@ -3255,7 +3257,7 @@ pub fn call_with_kwargs(
     pos_args: &[PyObjectRef],
     kwargs: &[(Wtf8Buf, PyObjectRef)],
 ) -> PyResult {
-    let _caller_locals_root = FrameLocalsRoot::new(frame);
+    let _ = frame;
     call_with_kwargs_in_ctx(getexecutioncontext(), callable, pos_args, kwargs)
 }
 

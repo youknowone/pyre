@@ -3265,8 +3265,6 @@ pub unsafe fn w_code_getname_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectR
     if w_code_obj.is_null() {
         return pyre_object::pyobject::PY_NULL;
     }
-    let roots = pyre_object::gc_roots::push_roots();
-    let w_code_obj = roots.pin_root(w_code_obj);
     let w_code = unsafe { &*(w_code_obj as *const PyCode) };
     if w_code.co_names_w.is_null() {
         return pyre_object::pyobject::PY_NULL;
@@ -3293,7 +3291,11 @@ pub unsafe fn w_code_getname_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectR
         return pyre_object::pyobject::PY_NULL;
     };
     // `pycode.py space.new_interned_str(aname)` — one canonical object
-    // per name value, not one per code object that names it.
+    // per name value, not one per code object that names it.  The code
+    // object is live across this, the only allocation here; `slot` and
+    // `name` point into its non-GC tables.
+    let roots = pyre_object::gc_roots::push_roots();
+    let _ = roots.pin_root(w_code_obj);
     let realized = pyre_object::unicodeobject::intern_str_value(name);
     match slot.compare_exchange(
         std::ptr::null_mut(),

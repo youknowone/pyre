@@ -9591,18 +9591,6 @@ fn exception_typedef_attrs(class_name: &str) -> &'static [&'static str] {
     }
 }
 
-/// The attribute name a descriptor built by [`make_exception_getset`] carries.
-fn exception_getset_name(w_descr: PyObjectRef) -> String {
-    let w_name = unsafe { pyre_object::typedef::w_getset_get_name(w_descr) };
-    if w_name.is_null() || !unsafe { pyre_object::is_str(w_name) } {
-        return String::new();
-    }
-    crate::baseobjspace::str_utf8_w(w_name)
-        .ok()
-        .map(str::to_string)
-        .unwrap_or_default()
-}
-
 /// A name the receiving exception kind does not declare — `OSError`'s
 /// `characters_written` on anything but a `BlockingIOError`, say.  The
 /// descriptor is inherited but reads back as absent.
@@ -9617,63 +9605,264 @@ fn exception_getset_absent(w_obj: PyObjectRef, name: &str) -> crate::PyError {
     )
 }
 
-fn exception_getset_fget(args: &[PyObjectRef]) -> crate::PyResult {
-    let (w_descr, w_obj) = (args[0], args[1]);
-    let name = exception_getset_name(w_descr);
-    let found = crate::baseobjspace::exception_attr_get(w_obj, &name)?;
+/// `Ok(PY_NULL)` from a per-name accessor means this receiver's kind does
+/// not declare the slot.  An `Err` from the slot itself propagates.
+fn exception_getset_finish(
+    w_obj: PyObjectRef,
+    name: &'static str,
+    found: crate::PyResult,
+) -> crate::PyResult {
+    let found = found?;
     if found.is_null() {
-        // `interp_exceptions.py descr_get_written` raises under the
-        // descriptor's own name for an unset slot.
-        if name == "characters_written" {
-            return Err(crate::PyError::attribute_error("characters_written"));
-        }
-        return Err(exception_getset_absent(w_obj, &name));
+        return Err(exception_getset_absent(w_obj, name));
     }
     Ok(found)
 }
 
-fn exception_getset_fset(args: &[PyObjectRef]) -> crate::PyResult {
-    let (w_descr, w_obj, w_value) = (args[0], args[1], args[2]);
-    let name = exception_getset_name(w_descr);
-    let handled = crate::baseobjspace::exception_attr_set(w_obj, &name, w_value)?;
-    if handled.is_null() {
-        return Err(exception_getset_absent(w_obj, &name));
-    }
-    Ok(handled)
-}
-
-fn exception_getset_fdel(args: &[PyObjectRef]) -> crate::PyResult {
-    let (w_descr, w_obj) = (args[0], args[1]);
-    let name = exception_getset_name(w_descr);
-    let handled = crate::baseobjspace::exception_attr_delete(w_obj, &name)?;
-    if handled.is_null() {
-        return Err(exception_getset_absent(w_obj, &name));
-    }
-    Ok(handled)
-}
-
-/// The three ends of every exception `GetSetProperty`.  One function object
-/// backs all of them, so `exception_attr_slot_fold` recognises a descriptor
-/// it may look through by comparing the `fget` it found against this one.
-fn exception_getset_ends() -> (PyObjectRef, PyObjectRef, PyObjectRef) {
-    static ENDS: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
-    let (fget, fset, fdel) = *ENDS.get_or_init(|| {
-        (
-            make_builtin_function_with_arity("__get__", exception_getset_fget, 2) as usize,
-            make_builtin_function_with_arity("__set__", exception_getset_fset, 3) as usize,
-            make_builtin_function_with_arity("__delete__", exception_getset_fdel, 2) as usize,
-        )
-    });
-    (
-        fget as PyObjectRef,
-        fset as PyObjectRef,
-        fdel as PyObjectRef,
+/// The setters whose arms stay inline in `exception_attr_set`: that function
+/// is also the instance-store path's writer (`object_setattr`), so moving an
+/// arm out would add a second graph for the same store without removing one.
+fn exception_getset_store(args: &[PyObjectRef], name: &'static str) -> crate::PyResult {
+    let w_obj = args[1];
+    exception_getset_finish(
+        w_obj,
+        name,
+        crate::baseobjspace::exception_attr_set(w_obj, name, args[2]),
     )
 }
 
-/// The shared `fget` every exception `GetSetProperty` carries.
-pub(crate) fn exception_getset_fget_obj() -> PyObjectRef {
-    exception_getset_ends().0
+fn exc_gs_get_dict(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::baseobjspace::exception_descr_get_dict(args[1])
+}
+fn exc_gs_set_dict(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::baseobjspace::exception_descr_set_dict(args[1], args[2])
+}
+fn exc_gs_del_dict(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::baseobjspace::exception_descr_del_dict(args[1])
+}
+
+fn exc_gs_get_args(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::baseobjspace::exception_descr_getargs(args[1])
+}
+fn exc_gs_set_args(args: &[PyObjectRef]) -> crate::PyResult {
+    exception_getset_store(args, "args")
+}
+fn exc_gs_del_args(_args: &[PyObjectRef]) -> crate::PyResult {
+    crate::baseobjspace::exception_descr_del_refused("args")
+}
+
+fn exc_gs_get_cause(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::baseobjspace::exception_descr_getcause(args[1])
+}
+fn exc_gs_set_cause(args: &[PyObjectRef]) -> crate::PyResult {
+    exception_getset_store(args, "__cause__")
+}
+fn exc_gs_del_cause(_args: &[PyObjectRef]) -> crate::PyResult {
+    crate::baseobjspace::exception_descr_del_refused("__cause__")
+}
+
+fn exc_gs_get_context(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::baseobjspace::exception_descr_getcontext(args[1])
+}
+fn exc_gs_set_context(args: &[PyObjectRef]) -> crate::PyResult {
+    exception_getset_store(args, "__context__")
+}
+fn exc_gs_del_context(_args: &[PyObjectRef]) -> crate::PyResult {
+    crate::baseobjspace::exception_descr_del_refused("__context__")
+}
+
+fn exc_gs_get_traceback(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::baseobjspace::exception_descr_gettraceback(args[1])
+}
+fn exc_gs_set_traceback(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::baseobjspace::exception_descr_settraceback(args[1], args[2])
+}
+fn exc_gs_del_traceback(_args: &[PyObjectRef]) -> crate::PyResult {
+    crate::baseobjspace::exception_descr_del_refused("__traceback__")
+}
+
+fn exc_gs_get_written(args: &[PyObjectRef]) -> crate::PyResult {
+    let w_obj = args[1];
+    exception_getset_finish(
+        w_obj,
+        "characters_written",
+        crate::baseobjspace::exception_descr_get_written(w_obj),
+    )
+}
+fn exc_gs_set_written(args: &[PyObjectRef]) -> crate::PyResult {
+    exception_getset_store(args, "characters_written")
+}
+fn exc_gs_del_written(args: &[PyObjectRef]) -> crate::PyResult {
+    let w_obj = args[1];
+    exception_getset_finish(
+        w_obj,
+        "characters_written",
+        crate::baseobjspace::exception_descr_del_written(w_obj),
+    )
+}
+
+fn exc_gs_get_message(args: &[PyObjectRef]) -> crate::PyResult {
+    let w_obj = args[1];
+    exception_getset_finish(
+        w_obj,
+        "message",
+        crate::baseobjspace::exception_descr_get_group(w_obj, "message"),
+    )
+}
+fn exc_gs_set_message(args: &[PyObjectRef]) -> crate::PyResult {
+    exception_getset_store(args, "message")
+}
+fn exc_gs_del_message(args: &[PyObjectRef]) -> crate::PyResult {
+    Err(exception_getset_absent(args[1], "message"))
+}
+
+fn exc_gs_get_exceptions(args: &[PyObjectRef]) -> crate::PyResult {
+    let w_obj = args[1];
+    exception_getset_finish(
+        w_obj,
+        "exceptions",
+        crate::baseobjspace::exception_descr_get_group(w_obj, "exceptions"),
+    )
+}
+fn exc_gs_set_exceptions(args: &[PyObjectRef]) -> crate::PyResult {
+    exception_getset_store(args, "exceptions")
+}
+fn exc_gs_del_exceptions(args: &[PyObjectRef]) -> crate::PyResult {
+    Err(exception_getset_absent(args[1], "exceptions"))
+}
+
+struct ExcGetsetRow {
+    name: &'static str,
+    fget: std::sync::atomic::AtomicUsize,
+    fset: std::sync::atomic::AtomicUsize,
+    fdel: std::sync::atomic::AtomicUsize,
+}
+
+type ExcGetsetSpec = (
+    &'static str,
+    crate::gateway::BuiltinCodeFn,
+    crate::gateway::BuiltinCodeFn,
+    crate::gateway::BuiltinCodeFn,
+);
+
+const EXC_GETSET_SPECS: [ExcGetsetSpec; 8] = [
+    (
+        "__dict__",
+        exc_gs_get_dict,
+        exc_gs_set_dict,
+        exc_gs_del_dict,
+    ),
+    ("args", exc_gs_get_args, exc_gs_set_args, exc_gs_del_args),
+    (
+        "__cause__",
+        exc_gs_get_cause,
+        exc_gs_set_cause,
+        exc_gs_del_cause,
+    ),
+    (
+        "__context__",
+        exc_gs_get_context,
+        exc_gs_set_context,
+        exc_gs_del_context,
+    ),
+    (
+        "__traceback__",
+        exc_gs_get_traceback,
+        exc_gs_set_traceback,
+        exc_gs_del_traceback,
+    ),
+    (
+        "characters_written",
+        exc_gs_get_written,
+        exc_gs_set_written,
+        exc_gs_del_written,
+    ),
+    (
+        "message",
+        exc_gs_get_message,
+        exc_gs_set_message,
+        exc_gs_del_message,
+    ),
+    (
+        "exceptions",
+        exc_gs_get_exceptions,
+        exc_gs_set_exceptions,
+        exc_gs_del_exceptions,
+    ),
+];
+
+static EXC_GETSET_ROWS: std::sync::OnceLock<Vec<ExcGetsetRow>> = std::sync::OnceLock::new();
+
+/// One builtin function object per accessor.  `exception_attr_slot_fold`
+/// recognises a canonical descriptor by membership of its `fget` in this
+/// table (`interp_exceptions.py` `GetSetProperty` / `readwrite_attrproperty_w`).
+///
+/// Each accessor is pinned while the rest are built, and the published table
+/// is a root ([`walk_exception_getset_roots`]): an accessor whose class has
+/// not installed it yet is reachable from nothing else.
+fn exception_getset_rows() -> &'static [ExcGetsetRow] {
+    EXC_GETSET_ROWS.get_or_init(|| {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let first_slot = pyre_object::gc_roots::shadow_stack_len();
+        for (_, get, set, del) in EXC_GETSET_SPECS {
+            let _ = pyre_object::gc_roots::pin_root(make_builtin_function_with_arity(
+                "__get__", get, 2,
+            ));
+            let _ = pyre_object::gc_roots::pin_root(make_builtin_function_with_arity(
+                "__set__", set, 3,
+            ));
+            let _ = pyre_object::gc_roots::pin_root(make_builtin_function_with_arity(
+                "__delete__",
+                del,
+                2,
+            ));
+        }
+        let slot = |i: usize| {
+            std::sync::atomic::AtomicUsize::new(pyre_object::gc_roots::shadow_stack_get(
+                first_slot + i,
+            ) as usize)
+        };
+        EXC_GETSET_SPECS
+            .iter()
+            .enumerate()
+            .map(|(i, &(name, ..))| ExcGetsetRow {
+                name,
+                fget: slot(3 * i),
+                fset: slot(3 * i + 1),
+                fdel: slot(3 * i + 2),
+            })
+            .collect()
+    })
+}
+
+/// Forward the exception accessor table's function slots.
+pub(crate) fn walk_exception_getset_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    let Some(rows) = EXC_GETSET_ROWS.get() else {
+        return;
+    };
+    for row in rows {
+        for cell in [&row.fget, &row.fset, &row.fdel] {
+            unsafe { visitor(&mut *(cell.as_ptr() as *mut PyObjectRef)) };
+        }
+    }
+}
+
+fn exception_getset_for(attr: &str) -> (PyObjectRef, PyObjectRef, PyObjectRef) {
+    let row = exception_getset_rows()
+        .iter()
+        .find(|row| row.name == attr)
+        .unwrap_or_else(|| panic!("exception getset {attr}"));
+    let load = |cell: &std::sync::atomic::AtomicUsize| {
+        cell.load(std::sync::atomic::Ordering::Relaxed) as PyObjectRef
+    };
+    (load(&row.fget), load(&row.fset), load(&row.fdel))
+}
+
+/// True when `fget` is one of the canonical exception-typedef getters.
+pub(crate) fn is_exception_canonical_fget(fget: PyObjectRef) -> bool {
+    exception_getset_rows()
+        .iter()
+        .any(|row| row.fget.load(std::sync::atomic::Ordering::Relaxed) == fget as usize)
 }
 
 /// Store `value` under `key` in the type namespace dict rooted at shadow-stack
@@ -9704,8 +9893,8 @@ fn install_exception_getsets(ns: PyObjectRef, class_name: &str) {
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(ns);
-    let (fget, fset, fdel) = exception_getset_ends();
     for attr in exception_typedef_attrs(class_name) {
+        let (fget, fset, fdel) = exception_getset_for(attr);
         type_ns_store(
             ns_slot,
             attr,

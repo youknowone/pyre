@@ -392,40 +392,6 @@ pub type Method = pyre_object::function::Method;
 pub type StaticMethod = pyre_object::function::StaticMethod;
 pub type ClassMethod = pyre_object::function::ClassMethod;
 
-struct FrameLocalsRoot {
-    frame: *mut crate::pyframe::PyFrame,
-    registered: bool,
-}
-
-impl FrameLocalsRoot {
-    #[majit_macros::dont_look_inside]
-    fn new(frame: &mut crate::pyframe::PyFrame) -> Self {
-        let frame = frame as *mut crate::pyframe::PyFrame;
-        let registered = unsafe { register_frame_locals_slot(frame) };
-        Self { frame, registered }
-    }
-}
-
-impl Drop for FrameLocalsRoot {
-    fn drop(&mut self) {
-        if self.registered {
-            unregister_frame_locals_slot(self.frame);
-        }
-    }
-}
-
-#[majit_macros::dont_look_inside]
-unsafe fn register_frame_locals_slot(frame: *mut crate::pyframe::PyFrame) -> bool {
-    let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) as *mut *mut u8 };
-    unsafe { pyre_object::gc_hook::try_gc_add_root(slot) }
-}
-
-#[majit_macros::dont_look_inside]
-fn unregister_frame_locals_slot(frame: *mut crate::pyframe::PyFrame) {
-    let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) as *mut *mut u8 };
-    pyre_object::gc_hook::try_gc_remove_root(slot);
-}
-
 #[inline]
 fn function_write_barrier(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
@@ -4038,11 +4004,11 @@ pub fn funccall_valuestack(
     dropvalues: usize,
     methodcall: bool,
 ) -> PyObjectRef {
-    // RPython's translated `Function.funccall_valuestack` keeps `frame` and
-    // its virtualizable array live from function entry.  The pending-stack
-    // exception drain below and all code/default metadata lookups therefore
-    // see forwarded stack operands before `_flat_pycall` copies them.
-    let _caller_locals_root = FrameLocalsRoot::new(frame);
+    // `function.py funccall_valuestack` does not register an extra root: the
+    // caller frame is already a GC object kept live by `FrameAnchor` and the
+    // execution-context chain, and `pyframe_object_custom_trace` visits
+    // `locals_cells_stack_w`. Value-stack stores can still leave a young
+    // pointer in an old array, so the write barrier runs before anything allocates.
     crate::pyframe::remember_frame_locals_array(frame.locals_cells_stack_w);
     // A compiled callee prologue can publish an overflow before control
     // returns to this dispatcher.  The fresh stack check belongs to the
@@ -4241,12 +4207,10 @@ fn _flat_pycall(
     frame: &mut crate::pyframe::PyFrame,
     dropvalues: usize,
 ) -> PyObjectRef {
-    // RPython's GC transform keeps the live caller frame rooted across
-    // `space.createframe`: the positional arguments still live on its value
-    // stack and are copied only after that collecting allocation returns
-    // (`function.py:208-211`).  Register the locals/value-stack array before
-    // constructing the callee, not merely while the callee executes, so a
-    // moved argument is reloaded from the forwarded caller slot.
+    // `function.py _flat_pycall` copies positional arguments off the caller
+    // value stack after `space.createframe`. The caller is the executing
+    // frame (`FrameAnchor`, execution-context chain); its trace reaches the
+    // stack, so the copy sees forwarded operands.
     let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
@@ -4285,10 +4249,11 @@ fn _flat_pycall(
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 
-    // function.py:214 — return new_frame.run(self.name, self.qualname)
+    // function.py `_flat_pycall` — return new_frame.run(self.name, self.qualname)
     // Generator/coroutine: wrap the frame in a generator object and hand it
-    // ownership (no execution). Normal functions execute through the JIT-aware
-    // eval, which needs the locals roots registered for the duration.
+    // ownership (no execution). The callee `FrameBox` keeps a GC frame live
+    // through `OwnerRootGuard`; `pyframe_object_custom_trace` visits its
+    // locals array, so eval does not register that slot again.
     if new_frame._is_generator_or_coroutine() {
         match crate::call::frame_into_generator_for_function(new_frame, func) {
             Ok(v) => v,
@@ -4298,7 +4263,6 @@ fn _flat_pycall(
             }
         }
     } else {
-        let _callee_locals_root = FrameLocalsRoot::new(&mut new_frame);
         let eval_fn = crate::call::get_eval_fn();
         match eval_fn(&mut new_frame, None) {
             Ok(v) => v,
@@ -4327,10 +4291,11 @@ fn _flat_pycall_defaults(
     defs_to_load: usize,
     dropvalues: usize,
 ) -> PyObjectRef {
-    // Same RPython GC-transform live-frame root as `_flat_pycall`: positional
-    // stack entries are copied only after the callee allocation returns.
-    // Normalizing a published root is a safepoint, so every call input goes
-    // out in one publish and is read back from its slot before use.
+    // Same live caller frame as `_flat_pycall`: positional stack entries are
+    // copied only after the callee allocation returns, and the executing
+    // frame's trace keeps them. Normalizing a published root is a safepoint,
+    // so every call input goes out in one publish and is read back from its
+    // slot before use.
     let _roots = pyre_object::gc_roots::push_roots();
     let inputs_base = _roots.publish(&[func, code, defs]);
     _roots.normalize(inputs_base, 3);
@@ -4383,7 +4348,8 @@ fn _flat_pycall_defaults(
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 
-    // function.py:231 — return new_frame.run(self.name, self.qualname)
+    // function.py `_flat_pycall_defaults` — return new_frame.run.
+    // Same callee root as `_flat_pycall`: `FrameBox`'s `OwnerRootGuard`.
     if new_frame._is_generator_or_coroutine() {
         match crate::call::frame_into_generator_for_function(new_frame, _roots.get(inputs_base)) {
             Ok(v) => v,
@@ -4393,7 +4359,6 @@ fn _flat_pycall_defaults(
             }
         }
     } else {
-        let _callee_locals_root = FrameLocalsRoot::new(&mut new_frame);
         let eval_fn = crate::call::get_eval_fn();
         match eval_fn(&mut new_frame, None) {
             Ok(v) => v,

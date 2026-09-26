@@ -982,8 +982,8 @@ struct GuardToken {
     /// opassembler.py:515 GuardToken.gcmap.
     gcmap: *mut usize,
     /// `assembler.py genop_guard_guard_not_invalidated`'s
-    /// `guard_token.pos_jump_offset` — the offset of the four-byte displacement
-    /// field this guard's branch is patched through.
+    /// `guard_token.pos_jump_offset` — the offset of the eight-byte `NOP` this
+    /// guard's branch is written over.
     /// `Some` only for `GUARD_NOT_INVALIDATED`, the one guard whose branch is
     /// written after the buffer is materialised; every other guard reaches its
     /// recovery stub through a `fail_label` dynasm resolves at finalize.
@@ -1824,7 +1824,7 @@ impl<'a> Assembler386<'a> {
             }
             AbiArgPlacement::Xmm(dst) => {
                 if src.is_xmm {
-                    dynasm!(self.mc ; .arch x64 ; movsd Rx(dst), Rx(src.value));
+                    dynasm!(self.mc ; .arch x64 ; movapd Rx(dst), Rx(src.value));
                 } else {
                     dynasm!(self.mc ; .arch x64 ; movq Rx(dst), Rq(src.value));
                 }
@@ -5591,16 +5591,19 @@ impl<'a> Assembler386<'a> {
     /// `ensure_next_label_is_at_least_at_position(n + 5)` to keep a jump target
     /// out of them.  That facility has no counterpart here: dynasm owns label
     /// binding, and a bound label's position is not something a caller can push
-    /// forward.  So pyre leaves a `JMP .+0` of exactly the width the branch
-    /// will need and writes only its displacement.  That is upstream's own
-    /// aarch64 shape — `opassembler.py _emit_guard` emits a `NOP`,
+    /// forward.  So pyre reserves the bytes itself, as upstream aarch64 does —
+    /// `opassembler.py _emit_guard` emits a `NOP`,
     /// `aarch64/assembler.py process_pending_guards` records it, and
-    /// `aarch64/runner.py invalidate_loop` writes a `B` over it —
-    /// and it is the shape the free-threaded build requires: a five-byte
-    /// overwrite of live code leaves a window in which another thread's
-    /// instruction fetch sees half of each of two instructions, while a single
-    /// naturally-aligned four-byte store reaches no byte outside this guard's
-    /// own instruction and cannot be observed torn.
+    /// `aarch64/runner.py invalidate_loop` writes a `B` over it.  Here the
+    /// placeholder is one eight-byte `NOP` on an eight-byte boundary, and
+    /// `write_invalidate_positions` replaces it with `JMP rel32` in a single
+    /// aligned eight-byte store.  The free-threaded build needs that: a
+    /// five-byte overwrite of live code leaves a window in which another
+    /// thread's instruction fetch sees half of each of two instructions, while
+    /// one naturally-aligned store that stays inside this guard's own
+    /// instruction cannot be observed torn.  A `NOP` rather than a live
+    /// `JMP .+0` keeps the unpatched guard free: a jump to the next
+    /// instruction is still a taken branch on every iteration.
     fn implement_guard_not_invalidated_with_faillocs(
         &mut self,
         op: &Op,
@@ -5609,19 +5612,27 @@ impl<'a> Assembler386<'a> {
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
     ) {
-        // Align the displacement, not the instruction: `JMP rel32` puts it one
-        // byte in.  A multi-byte NOP rather than a run of `0x90`, so the pad
-        // costs the front end one instruction however wide it is.
-        match (4 - (self.mc.offset().0 + 1) % 4) % 4 {
+        // Pad to the boundary with one multi-byte NOP, so the pad costs the
+        // front end one instruction however wide it is.
+        match (8 - self.mc.offset().0 % 8) % 8 {
             0 => {}
             1 => dynasm!(self.mc ; .arch x64 ; nop),
             2 => dynasm!(self.mc ; .arch x64 ; .u8 0x66u8 ; .u8 0x90u8),
-            _ => dynasm!(self.mc ; .arch x64 ; .u8 0x0Fu8 ; .u8 0x1Fu8 ; .u8 0x00u8),
+            3 => dynasm!(self.mc ; .arch x64 ; .u8 0x0Fu8 ; .u8 0x1Fu8 ; .u8 0x00u8),
+            4 => dynasm!(self.mc ; .arch x64 ; .u8 0x0Fu8 ; .u8 0x1Fu8 ; .u8 0x40u8 ; .u8 0x00u8),
+            5 => dynasm!(self.mc ; .arch x64
+                ; .u8 0x0Fu8 ; .u8 0x1Fu8 ; .u8 0x44u8 ; .u8 0x00u8 ; .u8 0x00u8),
+            6 => dynasm!(self.mc ; .arch x64
+                ; .u8 0x66u8 ; .u8 0x0Fu8 ; .u8 0x1Fu8 ; .u8 0x44u8 ; .u8 0x00u8 ; .u8 0x00u8),
+            _ => dynasm!(self.mc ; .arch x64
+                ; .u8 0x0Fu8 ; .u8 0x1Fu8 ; .u8 0x80u8 ; .u32 0u32),
         }
-        let mut pos = self.mc.offset().0;
-        // `E9 rel32` with a zero displacement: a jump to the next instruction.
-        dynasm!(self.mc ; .arch x64 ; .u8 0xE9u8 ; .u32 0u32);
-        pos += 1; // after the jmp opcode
+        let pos = self.mc.offset().0;
+        // `NOP DWORD [RAX+RAX*1+0]`, the eight-byte form (`0F 1F 84 00 00000000`).
+        // Its last three bytes are the tail `collect_invalidate_positions`
+        // keeps after the `JMP rel32` it writes over the first five.
+        dynasm!(self.mc ; .arch x64
+            ; .u8 0x0Fu8 ; .u8 0x1Fu8 ; .u8 0x84u8 ; .u8 0x00u8 ; .u32 0u32);
         // The label is bound at the recovery stub like any other guard's; under
         // an unpatched placeholder nothing jumps to it.
         self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, guard_argloc, faillocs);
@@ -5988,13 +5999,17 @@ impl<'a> Assembler386<'a> {
             .iter()
             .filter_map(|stub| {
                 let pos_jump_offset = stub.pos_jump_offset?;
-                // `relative_target = tok.pos_recovery_stub - (tok.pos_jump_offset + 4)`
-                let relative_target = stub.pos_recovery_stub as i64 - (pos_jump_offset as i64 + 4);
+                // `relative_target = tok.pos_recovery_stub - (tok.pos_jump_offset + 4)`,
+                // with `pos_jump_offset` here naming the `JMP` opcode byte rather
+                // than the displacement after it.
+                let relative_target = stub.pos_recovery_stub as i64 - (pos_jump_offset as i64 + 5);
                 let relative_target = i32::try_from(relative_target)
                     .expect("guard recovery stub within JMP rel32 reach of its guard");
+                // `E9 rel32` over the placeholder's first five bytes; its last
+                // three stay the `00 00 00` it was emitted with.
                 Some(majit_backend::InvalidatePosition {
                     addr: rawstart + pos_jump_offset,
-                    word: relative_target as u32,
+                    word: 0xE9 | u64::from(relative_target as u32) << 8,
                 })
             })
             .collect()
@@ -8979,7 +8994,8 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
             (Loc::Reg(s), Loc::Reg(d)) if s == d => {}
             (Loc::Reg(s), Loc::Reg(d)) => {
                 if s.is_xmm && d.is_xmm {
-                    dynasm!(self.mc ; .arch x64 ; movsd Rx(d.value), Rx(s.value));
+                    // copy 128-bit from -> to
+                    dynasm!(self.mc ; .arch x64 ; movapd Rx(d.value), Rx(s.value));
                 } else if !s.is_xmm && !d.is_xmm {
                     dynasm!(self.mc ; .arch x64 ; mov Rq(d.value), Rq(s.value));
                 } else if s.is_xmm && !d.is_xmm {

@@ -844,6 +844,11 @@ pub fn init_typeobjects() {
         // typedef.py:765 Method.typedef.acceptable_as_base_class = False
         let method_type = new_typeobject_with_base("method", init_method_type, object_type);
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(method_type, false) };
+        // `function.py Method.descr_method_getattribute` is this type's own
+        // slot. `StdObjSpace.getattr` reaches it through
+        // `getattribute_if_not_from_object`, which only admits a builtin
+        // owner that opted in.
+        unsafe { pyre_object::w_type_set_dispatch_own_getattribute(method_type) };
         // typedef.py:763 — Method exposes __weakref__.
         unsafe { pyre_object::w_type_set_weakrefable(method_type, true) };
         reg.insert(
@@ -1026,6 +1031,8 @@ pub fn init_typeobjects() {
             object_type,
         );
         unsafe { pyre_object::w_type_set_weakrefable(generic_alias_type, true) };
+        // `_pypy_generic_alias.py GenericAlias.__getattribute__`.
+        unsafe { pyre_object::w_type_set_dispatch_own_getattribute(generic_alias_type) };
         reg.insert(
             &pyre_object::GENERIC_ALIAS_TYPE as *const PyType as usize,
             generic_alias_type as usize,
@@ -1168,14 +1175,18 @@ pub fn init_typeobjects() {
         // `send`/`throw`/`close` in `pypy/interpreter/generator.py`):
         // pyre carries those slots elsewhere in the dispatch path so
         // the typedef itself stays empty.
+        let super_type = new_typeobject_with_base_and_layout(
+            "super",
+            init_super_type,
+            object_type,
+            &pyre_object::descriptor::SUPER_TYPE as *const PyType,
+        );
+        // `descriptor.py W_Super.getattribute` — `StdObjSpace.getattr`
+        // dispatches this slot instead of an object-space type test.
+        unsafe { pyre_object::w_type_set_dispatch_own_getattribute(super_type) };
         reg.insert(
             &pyre_object::descriptor::SUPER_TYPE as *const PyType as usize,
-            new_typeobject_with_base_and_layout(
-                "super",
-                init_super_type,
-                object_type,
-                &pyre_object::descriptor::SUPER_TYPE as *const PyType,
-            ) as usize,
+            super_type as usize,
         );
         let generator_type = new_typeobject_with_base_and_layout(
             "generator",
@@ -12096,12 +12107,13 @@ pub(crate) fn getset_property_get(
     w_obj: PyObjectRef,
     w_cls: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let w_obj_is_none = !w_obj.is_null() && unsafe { pyre_object::is_none(w_obj) };
-    let none_type =
-        crate::typedef::r#type(pyre_object::w_none()).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-    let w_cls_is_none_type = !w_cls.is_null() && std::ptr::eq(w_cls, none_type);
-    // typedef.py if w_obj is None and w_cls is not type(None):
-    if w_obj_is_none && !w_cls_is_none_type {
+    // typedef.py if w_obj is None and w_cls is not type(None): — `type(None)`
+    // is only computed once `w_obj is None` holds.
+    if !w_obj.is_null() && unsafe { pyre_object::is_none(w_obj) } && {
+        let none_type = crate::typedef::r#type(pyre_object::w_none())
+            .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+        !(!w_cls.is_null() && std::ptr::eq(w_cls, none_type))
+    } {
         // typedef.py if w_cls is None: raise TypeError
         if w_cls.is_null() || unsafe { pyre_object::is_none(w_cls) } {
             return Err(crate::PyError::type_error(

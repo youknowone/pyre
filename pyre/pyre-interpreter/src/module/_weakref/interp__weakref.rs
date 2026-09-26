@@ -420,6 +420,8 @@ pub fn proxy_type() -> PyObjectRef {
         unsafe {
             pyre_object::w_type_set_hasdict(tp, true);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
+            // `proxy_typedef_dict` `__getattribute__` (`proxy_getattribute`).
+            pyre_object::w_type_set_dispatch_own_getattribute(tp);
         }
         tp as usize
     }) as PyObjectRef
@@ -491,6 +493,8 @@ pub fn callable_proxy_type() -> PyObjectRef {
         unsafe {
             pyre_object::w_type_set_hasdict(tp, true);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
+            // `callable_proxy_typedef_dict` shares `proxy_getattribute`.
+            pyre_object::w_type_set_dispatch_own_getattribute(tp);
         }
         tp as usize
     }) as PyObjectRef
@@ -1801,29 +1805,22 @@ pub fn proxy_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     )?))
 }
 
-// 2-/3-arg attribute ops with name-string conversion.
+// 2-/3-arg attribute ops.  The wrapped name goes to `space.getattr` /
+// `setattr` / `delattr` unchanged, so a lone-surrogate name reaches the
+// referent's WTF-8 lookup.
 pub fn proxy_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    match unsafe { pyre_object::w_str_get_value_opt(args[1]) } {
-        Some(name) => crate::baseobjspace::getattr_str(w_obj0, name),
-        None => crate::baseobjspace::getattr(w_obj0, args[1]),
-    }
+    crate::baseobjspace::getattr(w_obj0, args[1])
 }
 
 pub fn proxy_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    match unsafe { pyre_object::w_str_get_value_opt(args[1]) } {
-        Some(name) => crate::baseobjspace::setattr_str(w_obj0, name, args[2]),
-        None => crate::baseobjspace::setattr(w_obj0, args[1], args[2]),
-    }
+    crate::baseobjspace::setattr(w_obj0, args[1], args[2])
 }
 
 pub fn proxy_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    match unsafe { pyre_object::w_str_get_value_opt(args[1]) } {
-        Some(name) => crate::baseobjspace::delattr_str(w_obj0, name),
-        None => crate::baseobjspace::delattr(w_obj0, args[1]),
-    }
+    crate::baseobjspace::delattr(w_obj0, args[1])
 }
 
 // Item ops — interp__weakref.py:365 single special method, so

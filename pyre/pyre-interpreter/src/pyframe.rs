@@ -1464,9 +1464,27 @@ unsafe fn alloc_frame_locals_array(
 /// Write barrier for a batch of stores into a frame's
 /// `locals_cells_stack_w`: the array is its own GC object, so an old array
 /// receiving young values must join the remembered set.
+///
+/// `incminimark.py write_barrier` remembers an object only when
+/// `GCFLAG_TRACK_YOUNG_PTRS` is set. Nursery objects are born without that
+/// flag, and a raw `alloc_fixed_array_with_header` block has a zeroed header
+/// (`GcFramePrefix`), so the flag test covers both regimes. The membership
+/// query would only reject the same flag-clear addresses.
+///
+/// `dont_look_inside`: the flag is mutable GC state. A traced load can
+/// keep the clear bit from the young birth and skip the barrier after the
+/// array is promoted (`incminimark.py write_barrier` reads it at the store).
 #[inline]
+#[majit_macros::dont_look_inside]
 pub fn remember_frame_locals_array(array: *mut FixedObjectArray) {
-    if pyre_object::gc_hook::try_gc_owns_object(array as *mut u8) {
+    if array.is_null() {
+        return;
+    }
+    let tracks_young = unsafe {
+        (*majit_gc::header::header_of(array as usize))
+            .has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS)
+    };
+    if tracks_young {
         pyre_object::gc_hook::try_gc_write_barrier(array as *mut u8);
     }
 }
@@ -3929,11 +3947,12 @@ impl PyFrame {
     /// it never disturbs `CO_FAST_HIDDEN` slots.
     #[inline]
     pub fn get_or_create_w_locals(&mut self) -> PyObjectRef {
-        let frame_anchor = crate::eval::FrameAnchor::new(self);
-        let existing = unsafe { (&*frame_anchor.live()).get_w_locals() };
+        let existing = self.get_w_locals();
         if !existing.is_null() {
             return existing;
         }
+        // Only the allocating arm below needs the frame held as a root.
+        let frame_anchor = crate::eval::FrameAnchor::new(self);
         // A frame that reaches STORE_NAME / SETUP_ANNOTATIONS without a
         // bound locals mapping is degenerate (module / class / exec all
         // bind one in `initialize_frame_scopes` / `setdictscope`).

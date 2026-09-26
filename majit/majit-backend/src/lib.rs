@@ -1926,11 +1926,12 @@ impl std::fmt::Debug for JitCellToken {
 pub struct InvalidatePosition {
     /// The placeholder the emitter left at the guard site.
     pub addr: usize,
-    /// The word to store there: a `JMP rel32` displacement on x86-64, a whole
-    /// `B imm26` instruction on aarch64.  One naturally-aligned word, so a
-    /// thread executing the loop while this store lands fetches either the
-    /// placeholder or the branch and never a half-written instruction.
-    pub word: u32,
+    /// The word to store there: `JMP rel32` over an eight-byte `NOP` on
+    /// x86-64, a whole `B imm26` instruction (the low four bytes) on aarch64.
+    /// One naturally-aligned word, so a thread executing the loop while this
+    /// store lands fetches either the placeholder or the branch and never a
+    /// half-written instruction.
+    pub word: u64,
 }
 
 /// `clt.invalidate_positions`, together with the backend writer that turns one

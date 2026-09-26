@@ -126,6 +126,14 @@ pub fn signal_pushback(signum: i32) {
         let index = (signum / N_LONGBITS) as usize;
         let bitmask = 1i64 << (signum % N_LONGBITS);
         SIG_PENDING[index].fetch_or(bitmask, Ordering::SeqCst);
+        // `signals.c pypysig_pushback` stores into `pypysig_counter` directly.
+        // The cell is an atomic; this store is the handler's whole ticker write.
+        let ticker = TICKER_PTR.load(Ordering::Relaxed);
+        if !ticker.is_null() {
+            unsafe {
+                (*(ticker as *mut std::sync::atomic::AtomicIsize)).store(-1, Ordering::Relaxed);
+            }
+        }
         rearm_ticker();
     }
 }
@@ -339,8 +347,8 @@ mod tests {
         assert!(pypysig_setflag(libc::SIGINT));
         assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
         assert!(
-            actionflag.get_ticker() >= 0,
-            "the async handler must not write the plain Rust ticker field"
+            actionflag.get_ticker() < 0,
+            "the async handler stores -1 into the atomic ticker (pypysig_counter)"
         );
         assert_ne!(
             load_eval_breaker_word() & majit_ir::eval_breaker_word::EB_ASYNC,

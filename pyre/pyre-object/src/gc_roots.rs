@@ -472,6 +472,7 @@ impl RootScope {
     }
 
     /// Scope-local [`pin_root`] on this thread's root-stack cell.
+    #[inline]
     #[majit_macros::dont_look_inside_cannot_raise]
     #[must_use = "a pinned root may have been normalized; use the returned live word or bind it to `let _ =` for liveness-only pins"]
     pub fn pin_root(&self, root: PyObjectRef) -> PyObjectRef {
@@ -491,6 +492,7 @@ impl RootScope {
     }
 
     /// Scope-local [`shadow_stack_get`] on this thread's root-stack cell.
+    #[inline]
     #[majit_macros::dont_look_inside_cannot_raise]
     pub fn get(&self, index: usize) -> PyObjectRef {
         let stack_slot = shadow_stack_cell();
@@ -499,6 +501,7 @@ impl RootScope {
     }
 
     /// Scope-local [`publish_roots`] on this thread's root-stack cell.
+    #[inline]
     #[majit_macros::dont_look_inside_cannot_raise]
     pub fn publish(&self, roots: &[PyObjectRef]) -> usize {
         #[cfg(debug_assertions)]
@@ -519,6 +522,7 @@ impl RootScope {
     /// Scope-local [`pin_roots`]: publish every live word, then normalize
     /// the run. Sequential [`Self::pin_root`] would query after the first
     /// write and leave later values invisible to a foreign collection.
+    #[inline]
     #[majit_macros::dont_look_inside_cannot_raise]
     pub fn pin_roots(&self, roots: &[PyObjectRef]) -> usize {
         let base = self.publish(roots);
@@ -527,6 +531,7 @@ impl RootScope {
     }
 
     /// Scope-local [`normalize_roots`] on this thread's root-stack cell.
+    #[inline]
     #[majit_macros::dont_look_inside_cannot_raise]
     pub fn normalize(&self, base: usize, len: usize) {
         #[cfg(debug_assertions)]
@@ -543,6 +548,7 @@ impl RootScope {
     /// A caller that has to rebuild a native view of the run from the slots
     /// only owes that rebuild when the run actually moved; `false` says the
     /// words it already holds are the live ones.
+    #[inline]
     #[majit_macros::dont_look_inside_cannot_raise]
     pub fn normalize_moved(&self, base: usize, len: usize) -> bool {
         #[cfg(debug_assertions)]
@@ -554,6 +560,7 @@ impl RootScope {
 
     /// Scope-local [`shadow_stack_set`] on this thread's root-stack cell — the
     /// write a slot whose contents change over the bracket takes on each update.
+    #[inline]
     #[majit_macros::dont_look_inside_cannot_raise]
     pub fn set(&self, index: usize, root: PyObjectRef) {
         #[cfg(debug_assertions)]
@@ -588,6 +595,7 @@ impl Drop for RootScope {
 /// are: the bracket's helpers are named by the runtime rather than looked
 /// inside, and only a named helper resolves from a crate that carries no
 /// declaration of it.
+#[inline]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn root_scope_close(scope: &RootScope) {
     #[cfg(debug_assertions)]
@@ -603,6 +611,7 @@ pub fn root_scope_close(scope: &RootScope) {
 ///
 /// Residualised: `RootScope` is one word (`save_point`), which the residual
 /// ABI can carry.  `rlib/jit.py` `@dont_look_inside`.
+#[inline]
 #[majit_macros::dont_look_inside]
 pub fn push_roots() -> RootScope {
     RootScope::new()
@@ -729,6 +738,7 @@ impl Default for RootedItems {
 /// tracer cannot type; the JIT residualises the call instead of tracing into
 /// it (`@dont_look_inside`, `rlib/jit.py`), the `shadow_stack_len` twin.
 #[must_use = "a pinned root may have been normalized; use the returned live word or bind it to `let _ =` for liveness-only pins"]
+#[inline]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn pin_root(root: PyObjectRef) -> PyObjectRef {
     #[cfg(debug_assertions)]
@@ -788,6 +798,7 @@ pub extern "C" fn reload_top_root_jit_abi(root: i64) -> i64 {
 /// [`normalize_roots`]. Calling this function per slice would reopen the
 /// window it exists to close: the first call's queries are safepoints, and
 /// the later slices are not yet on the stack when they run.
+#[inline]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn pin_roots(roots: &[PyObjectRef]) -> usize {
     let base = publish_roots(roots);
@@ -802,6 +813,7 @@ pub fn pin_roots(roots: &[PyObjectRef]) -> usize {
 /// every `publish_roots` before the first [`normalize_roots`], so no value is
 /// still invisible to a foreign collector once this mutator starts entering
 /// safepoints.
+#[inline]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn publish_roots(roots: &[PyObjectRef]) -> usize {
     #[cfg(debug_assertions)]
@@ -860,6 +872,7 @@ pub fn normalize_roots(base: usize, len: usize) {
 /// into it (`@dont_look_inside`, `rlib/jit.py`). The attribute is a
 /// tracing-policy marker only — it leaves the host backend free to inline
 /// this body, exactly as the RPython decorator leaves the C backend free.
+#[inline]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn shadow_stack_len() -> usize {
     with_shadow_stack(RootStack::len)
@@ -868,11 +881,13 @@ pub fn shadow_stack_len() -> usize {
 /// The thread's root-stack cell.  The JIT residualises the resolution instead
 /// of tracing into it (`@dont_look_inside`, `rlib/jit.py`), the
 /// `shadow_stack_len` twin.
+#[inline]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn shadow_stack_cell() -> *const RootStack {
     with_shadow_stack(|stack| stack as *const RootStack)
 }
 
+#[inline]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn shadow_stack_cell_len(cell: *const RootStack) -> usize {
     // SAFETY: `cell` is this thread's root-stack cell, and `_not_send` keeps
@@ -880,6 +895,7 @@ pub fn shadow_stack_cell_len(cell: *const RootStack) -> usize {
     unsafe { (*cell).len() }
 }
 
+#[inline]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn shadow_stack_cell_truncate(cell: *const RootStack, len: usize) {
     // SAFETY: `cell` is this thread's root-stack cell, and `_not_send` keeps
@@ -902,6 +918,7 @@ pub fn shadow_stack_cell_truncate(cell: *const RootStack, len: usize) {
 /// Reads the thread-local `ROOT_STACK` the tracer cannot type; the JIT
 /// residualises the read instead of tracing into it (`@dont_look_inside`,
 /// `rlib/jit.py`), the [`shadow_stack_len`] twin.
+#[inline]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn shadow_stack_get(index: usize) -> PyObjectRef {
     // A plain slot read: the slot is already a registered root, so whatever
@@ -958,6 +975,7 @@ pub fn shadow_stack_copy_range(base: usize, dst: &mut [PyObjectRef]) {
 /// Writes the thread-local `ROOT_STACK` the tracer cannot type; the JIT
 /// residualises the write instead of tracing into it (`@dont_look_inside`,
 /// `rlib/jit.py`), the [`shadow_stack_get`] twin.
+#[inline]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn shadow_stack_set(index: usize, root: PyObjectRef) {
     #[cfg(debug_assertions)]

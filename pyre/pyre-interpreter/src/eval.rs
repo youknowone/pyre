@@ -1540,6 +1540,10 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // first call, named by no module dict, and owned by nothing else
         // between one returned instance and the next.
         crate::module::gc::walk_gc_stats_type_gc(&mut fwd);
+        // The exception accessor table is the same shape: built on the first
+        // exception class, and an accessor whose class has not installed it
+        // yet is owned by nothing else.
+        crate::builtins::walk_exception_getset_roots(&mut fwd);
         if let Some(hooks) = crate::importing::optional_module_hooks() {
             (hooks.walk_prebuilt_slots)(&mut fwd);
         }
@@ -2569,6 +2573,9 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResul
         // per activation, before the first dispatch. Compiled back-edges mask
         // this bit out.
         majit_ir::eval_breaker_word::set_gc_interp();
+        // The periodic poll rides the action ticker. Without
+        // `has_bytecode_counter` the ticker never wraps (`decrement_ticker`).
+        crate::executioncontext::enable_gc_bytecode_counter();
     }
     let _current_frame_guard = if ec.is_null() {
         install_current_frame(frame)
@@ -2579,63 +2586,6 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResul
     let mut next_instr = frame.next_instr();
 
     loop {
-        // PyPy's ActionFlag is one process breaker.  Keep pyre's free-threaded
-        // finalization and STW extensions on the same already-established
-        // breaker word, so the ordinary dispatch pays one relaxed load rather
-        // than polling two process-global atomics independently.
-        let dispatch_breaker = majit_ir::eval_breaker_word::load();
-        if dispatch_breaker & majit_ir::eval_breaker_word::EB_FINALIZING != 0 {
-            crate::module::thread::park_if_finalizing();
-        }
-        // Interpreter-path GC safepoint (PYRE_GC_INTERP), mirroring the JIT
-        // eval loop. Between opcodes the only live refs are in the frame,
-        // reachable through the installed `current_frame` root walker; no
-        // bytecode handler holds a Rust-stack temporary here. A no-op unless
-        // the flag is on and enough interpreter objects have accumulated.
-        // Without it, a JIT-off run reclaims interpreter-routed old-gen
-        // allocations only at explicit `gc.collect`, so RSS grows unbounded.
-        pyre_object::gc_interp::dispatch_safepoint(dispatch_breaker);
-        // Free-threaded stop-the-world rendezvous.  Worker threads deliberately
-        // execute this plain evaluator (their JitDriver state is thread-owned),
-        // so they must poll the same process breaker as compiled/JIT-warm
-        // loops; otherwise a non-allocating Python loop can prevent collection
-        // and fork/finalization STW forever.
-        if dispatch_breaker & majit_ir::eval_breaker_word::EB_STW != 0 {
-            majit_gc::gc_sync::safepoint_poll();
-        }
-        // A bounded major collection that reached `max_heap_size` owes a
-        // `MemoryError` — incminimark.py `major_collection_step` raises one
-        // there, and the safepoint above is where the interpreter path's
-        // collections happen but it returns `()` and cannot raise. Deliver it
-        // here, at the same seam an asynchronously delivered signal uses below:
-        // the block search runs at `last_instr`, so a `try` around the region
-        // that was running catches it rather than the frame unwinding.
-        //
-        // Reads the word rather than `dispatch_breaker`: the safepoint above is
-        // the usual armer and it runs after that load, so testing the loaded
-        // copy would defer delivery by a dispatch this loop is not guaranteed
-        // to reach. `take_memory_error` opens with a relaxed load and returns
-        // on it, so the ordinary dispatch pays that load and a branch against a
-        // word it just touched.
-        //
-        // After the park above, not before it: `handle_exception` runs Python
-        // and allocates, and both bits can be armed at once — this thread's
-        // own breach and another thread's STW request. Delivering first would
-        // run a handler through a world the collector has asked to stop.
-        if majit_ir::eval_breaker_word::take_memory_error() {
-            // Park again, on a fresh read: the test above ran against the
-            // dispatch-time copy of the word, and the collection between them
-            // is a whole major cycle, so a request that arrived during it is
-            // not in that copy. Delivery runs a Python handler, which must not
-            // run through a world the collector has asked to stop.
-            majit_gc::gc_sync::safepoint_poll();
-            let mut err = crate::PyError::memory_error("");
-            if handle_exception(frame, &mut err, &mut next_instr) {
-                continue;
-            }
-            return Err(err);
-        }
-
         if next_instr >= code.instructions.len() {
             return Ok(w_none());
         }
@@ -2679,16 +2629,27 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResul
                 }
                 return Err(err);
             }
-            // A trace callback may perform a debugger line-jump by setting
-            // `frame.f_lineno` (`PyFrame::fset_f_lineno` → `last_instr =
-            // best_addr`).  Honour it: if a tracer is installed and it
-            // moved `last_instr` off the instruction we were about to
-            // dispatch, resume from the jump target instead of `pc`.  The
-            // `gettrace` null-check keeps this off the no-tracer hot path.
-            if unsafe { !(*ec).gettrace().is_null() } && frame.last_instr as usize != pc {
+            // `pyopcode.py dispatch_bytecode` reloads `next_instr` from
+            // `last_instr` after `bytecode_only_trace` / `action_dispatcher`
+            // (`fset_f_lineno` writes `best_addr` into `last_instr`). The
+            // compare is the reload; it does not call `gettrace`.
+            if frame.last_instr as usize != pc {
                 next_instr = frame.last_instr as usize;
                 continue;
             }
+        } else {
+            // No EC means no ticker, so this frame polls the breaker word
+            // itself, the interpreter GC poll included.
+            if let Err(mut err) = crate::executioncontext::service_eval_breaker(
+                std::ptr::null_mut(),
+                frame as *mut PyFrame,
+            ) {
+                if handle_exception(frame, &mut err, &mut next_instr) {
+                    continue;
+                }
+                return Err(err);
+            }
+            pyre_object::gc_interp::dispatch_safepoint(majit_ir::eval_breaker_word::load());
         }
         let (opcode_pc, instruction, op_arg) = decode_instruction_forward(code, pc)?;
         let fallthrough = opcode_pc + 1;
@@ -3025,46 +2986,19 @@ impl NamespaceOpcodeHandler for PyFrame {
     /// so `exec("x = len", {"__builtins__": {}})` raises `NameError`
     /// because the empty dict is the picked builtin.
     fn load_global_value(&mut self, name: &str, nameindex: usize) -> Result<Self::Value, PyError> {
-        // `pyopcode.py DELETE_GLOBAL _load_global_fallback` uses
-        // `space.finditem_str(self.get_w_globals(), varname)`.  finditem_str
-        // takes a borrowed-string fast path for real W_DictObject /
-        // W_ModuleDictObject layouts and dispatches a dict subclass through
-        // the general mapping object, so a raising key `__eq__` propagates
-        // instead of being swallowed as a miss.
+        // `celldict.py _LOAD_GLOBAL_cached`: under the JIT, or when the
+        // frame's globals is not the pycode's first-seen globals, the whole
+        // cached path is bypassed via `_load_global_fallback` — both the
+        // per-pycode `_globals_caches[nameindex]` slot and the strategy-level
+        // `get_global_cache(varname)` install, because both would attach a
+        // cache to a module that is not the one being executed.  Identity is
+        // `pycode.w_globals is self.get_w_globals_storage()` — the wrapped
+        // dict OBJECT on both sides (`w_code_get_w_globals` vs the frame's
+        // `w_globals`).  Positive form (`load_attr_cached`) keeps the
+        // annotator off the bare-`!` hazard; `we_are_jitted()` folds to
+        // `ConstBool(true)` so the cache arm and its `Arc<Mutex<GlobalCache>>`
+        // chase are dead-code-eliminated on the lifted graph.
         let w_globals = self.get_w_globals();
-        if !w_globals.is_null()
-            && let Some(value) = crate::baseobjspace::finditem_str_named(
-                w_globals,
-                name,
-                self.pycode as PyObjectRef,
-                nameindex,
-            )?
-        {
-            return Ok(value);
-        }
-        // `pyopcode.py _load_global` — fall back to
-        // `self.get_builtin().getdictvalue(space, varname)`.  Pyre's
-        // path consults the `GlobalCache` (`celldict.py get_global_cache`)
-        // on the globals' backing W_ModuleDictObject so a repeated
-        // LOAD_GLOBAL miss reuses the cached builtin entry instead of
-        // re-walking `__builtins__.w_dict` every iteration.
-        // `celldict.py _LOAD_GLOBAL_cached`: when the frame's
-        // globals is not the pycode's first-seen globals the entire
-        // cached path is bypassed via `_load_global_fallback` — both
-        // the per-pycode `_globals_caches[nameindex]` slot AND the
-        // strategy-level `get_global_cache(varname)` install are
-        // skipped, because both would attach a cache to a module that
-        // is not the one being executed.  Identity is `pycode.w_globals
-        // is self.get_w_globals_storage()` — the wrapped dict OBJECT on both
-        // sides (`w_code_get_w_globals` vs the frame's `w_globals`).
-        // `celldict.py _LOAD_GLOBAL_cached`: under the JIT the
-        // whole `GlobalCache` chase is bypassed via `_load_global_fallback`
-        // → `_load_global` (`pyopcode.py space.finditem_str`), so
-        // only the builtin `finditem_str` fallback below runs.  Positive
-        // form (`load_attr_cached`) keeps the annotator off
-        // the bare-`!` hazard; `we_are_jitted()` folds to `ConstBool(true)`
-        // so the cache arm and its `Arc<Mutex<GlobalCache>>` chase are
-        // dead-code-eliminated on the lifted graph.
         let use_cache = if majit_metainterp::jit::we_are_jitted() {
             false
         } else {
@@ -3085,6 +3019,12 @@ impl NamespaceOpcodeHandler for PyFrame {
         // exactly such a frame: reading the raw field made the builtins leg
         // silently find nothing there, raising `NameError` for a builtin that
         // plainly exists.
+        if use_cache
+            && let Some(value) =
+                unsafe { load_global_cache_hit(self.pycode as PyObjectRef, nameindex) }
+        {
+            return Ok(value);
+        }
         let w_builtin = self.get_builtin();
         if use_cache {
             let cache_hit: Option<PyObjectRef> = unsafe {
@@ -3099,7 +3039,26 @@ impl NamespaceOpcodeHandler for PyFrame {
             if let Some(value) = cache_hit {
                 return Ok(value);
             }
-        } else if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+        }
+        // `_load_global_fallback` → `_load_global` (`pyopcode.py`):
+        // `space.finditem_str(self.get_w_globals(), varname)`.  finditem_str
+        // takes a borrowed-string fast path for real W_DictObject /
+        // W_ModuleDictObject layouts and dispatches a dict subclass through
+        // the general mapping object, so a raising key `__eq__` propagates
+        // instead of being swallowed as a miss.  A cached miss lands here too
+        // and finds nothing again before the `NameError`.
+        if !w_globals.is_null()
+            && let Some(value) = crate::baseobjspace::finditem_str_named(
+                w_globals,
+                name,
+                self.pycode as PyObjectRef,
+                nameindex,
+            )?
+        {
+            return Ok(value);
+        }
+        // `self.get_builtin().getdictvalue(space, varname)`.
+        if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
             let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
             if !w_dict.is_null()
                 && let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)?
@@ -3308,6 +3267,27 @@ pub unsafe fn store_global_value_w(
     Ok(())
 }
 
+/// `celldict.py _LOAD_GLOBAL_cached`: the `cache.getvalue(space)` and
+/// `builtincache.getvalue(space)` hits, which run before
+/// `load_global_via_cache` roots its operands; every other outcome falls
+/// through to it.  The cell is copied out under the cache mutex and unwrapped
+/// after the mutex is released, because unwrapping an `IntMutableCell`
+/// allocates.  Residual for the same reason as `load_global_via_cache`.
+#[majit_macros::dont_look_inside]
+#[inline]
+unsafe fn load_global_cache_hit(pycode: PyObjectRef, nameindex: usize) -> Option<PyObjectRef> {
+    let cache = unsafe { crate::pycode::w_code_globals_caches_get(pycode, nameindex) }?;
+    let cell = {
+        let c = cache.lock();
+        match c.cell {
+            Some(v) => v,
+            None if c.valid => c.builtincache.as_ref()?.lock().cell?,
+            None => return None,
+        }
+    };
+    Some(unsafe { pyre_object::celldict::unwrap_cell(cell) })
+}
+
 /// `celldict.py _LOAD_GLOBAL_cached`.  When `pycode` is
 /// non-null, `pycode._globals_caches[nameindex]` is consulted before
 /// `mstrategy.get_global_cache(name)`; on the slow path, the resolved
@@ -3363,13 +3343,10 @@ unsafe fn load_global_via_cache(
             //                 return w_value
             //             # builtin getdictvalue + _load_global_failed
             //
-            // The builtins fallback is GATED on `builtincache is not None`.
-            // Under pyre's honor__builtins__=True equivalence the
-            // `builtincache` attach is dead, so the slot path just
-            // returns early on a cell hit and otherwise falls through to
-            // the slow path (`# either no cache or an invalid cache`),
-            // which calls `_load_global` whose own fallback chain reads
-            // the frame's picked builtin via `space.finditem_str`.
+            // The builtins fallback is GATED on `builtincache is not None`:
+            // `get_global_cache` attaches one only for a name the globals
+            // lack and the builtins hold, so any other miss falls through to
+            // the slow path (`# either no cache or an invalid cache`).
             let (cell_opt, valid, bc_opt) = {
                 let c = cache.lock();
                 (c.cell, c.valid, c.builtincache.clone())
@@ -3382,12 +3359,9 @@ unsafe fn load_global_via_cache(
                 if let Some(v) = bcell {
                     return Ok(Some(unwrap_cell(v)));
                 }
-                // `celldict.py`: the `_load_global_failed`
-                // branch is inside `if builtincache is not None` — only
-                // reachable when a real builtincache is installed.
-                // Under honor=True this scope is dead; included for
-                // strict line-by-line shape parity should
-                // honor__builtins__ ever flip False.
+                // `celldict.py`: the builtin's cell went away, so ask
+                // `self.get_builtin().getdictvalue(space, varname)`; the
+                // `_load_global_failed` NameError is the caller's on `None`.
                 if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
                     let w_builtin_dict = pyre_object::w_module_get_w_dict(w_builtin);
                     if !w_builtin_dict.is_null() {
@@ -3419,15 +3393,26 @@ unsafe fn load_global_via_cache(
         // `celldict.py:315-322`: the slow-path install just routes through
         // `w_globals.get_global_cache(varname)` and writes
         // `pycode._globals_caches[nameindex] = cache.ref`.
-        //
-        // Under pyre's permanent `honor__builtins__=True` (frame picks its
-        // own builtin per `pyframe.py:115`), the cache carries no
-        // `builtincache` — that branch is dead in
-        // `ModuleDictStrategy::get_global_cache` per its line-by-line port
-        // of `celldict.py not space.config.objspace.honor__builtins__`.
+        // `get_global_cache` reads `space.builtin.w_dict` when
+        // `honor__builtins__` is off, to attach the builtin's own cache.
+        let w_space_builtin_dict = if crate::baseobjspace::HONOR_BUILTINS {
+            pyre_object::PY_NULL
+        } else {
+            let ec = crate::call::getexecutioncontext();
+            let w_space_builtin = if ec.is_null() {
+                pyre_object::PY_NULL
+            } else {
+                (*ec).get_builtin()
+            };
+            if !w_space_builtin.is_null() && pyre_object::is_module(w_space_builtin) {
+                pyre_object::w_module_get_w_dict(w_space_builtin)
+            } else {
+                pyre_object::PY_NULL
+            }
+        };
         let strategy =
             pyre_object::dictmultiobject::w_module_dict_module_strategy_mut(w_module_dict);
-        let cache = strategy.get_global_cache(w_module_dict, name);
+        let cache = strategy.get_global_cache(w_module_dict, name, w_space_builtin_dict);
         // `celldict.py:321/353 pycode._globals_caches[nameindex] = cache.ref`.
         if !pycode.is_null() {
             crate::pycode::w_code_globals_caches_set(pycode, nameindex, &cache);

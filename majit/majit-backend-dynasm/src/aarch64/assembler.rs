@@ -4957,7 +4957,7 @@ impl<'a> AssemblerARM64<'a> {
                 let imm26 = ((relative_offset >> 2) & 0x03FF_FFFF) as u32;
                 Some(majit_backend::InvalidatePosition {
                     addr: rawstart + pos_jump_offset,
-                    word: 0x1400_0000 | imm26,
+                    word: u64::from(0x1400_0000 | imm26),
                 })
             })
             .collect()

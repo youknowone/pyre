@@ -39,7 +39,7 @@
 //! until coherence propagates it; this is a bounded park-latency window.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicUsize, Ordering};
 
 /// bit0 — interpreter-path allocation/collection integration is enabled.
 /// Lowest bit so that it is the only value below `JIT_BREAKER_FLOOR`.
@@ -91,6 +91,40 @@ const _: () = {
 /// The shared eval-breaker word (see module docs).
 static EVAL_BREAKER_WORD: AtomicUsize = AtomicUsize::new(0);
 
+/// Address of `ActionFlag`'s ticker (`executioncontext.py ActionFlag._ticker`,
+/// `signals.c pypysig_counter`). Null until the process flag publishes it.
+/// Armers store `-1` through this pointer so the next `decrement_ticker`
+/// takes the `action_dispatcher` path. A fire that arrives first sticks in
+/// `TICKER_FORCED` and is folded in at publish.
+static ACTION_TICKER: AtomicPtr<AtomicIsize> = AtomicPtr::new(std::ptr::null_mut());
+static TICKER_FORCED: AtomicIsize = AtomicIsize::new(0);
+
+/// Publish the process `ActionFlag` ticker. The cell is an `AtomicIsize`;
+/// signal handlers and collectors store `-1` into it.
+pub fn publish_action_ticker(ptr: *mut AtomicIsize) {
+    if ptr.is_null() {
+        return;
+    }
+    // Publish before draining `TICKER_FORCED`: a fire that found no cell is
+    // picked up by the swap, and every later one writes the cell itself.
+    ACTION_TICKER.store(ptr, Ordering::Release);
+    if TICKER_FORCED.swap(0, Ordering::AcqRel) < 0 {
+        unsafe { (*ptr).store(-1, Ordering::Relaxed) };
+    }
+}
+
+/// `AbstractActionFlag.fire` / `signals.c pypysig_pushback`: force the next
+/// `decrement_ticker` below zero. Lock-free; safe in an OS signal handler
+/// once the ticker cell is an atomic.
+pub fn fire_action_ticker() {
+    let ptr = ACTION_TICKER.load(Ordering::Relaxed);
+    if ptr.is_null() {
+        TICKER_FORCED.store(-1, Ordering::Relaxed);
+        return;
+    }
+    unsafe { (*ptr).store(-1, Ordering::Relaxed) };
+}
+
 /// Width of the word, in bytes. The back-edge poll's load descriptor must use
 /// exactly this size: a wider load reads past the word into the adjacent
 /// static, so the poll's nonzero test would always be true and every back-edge
@@ -134,6 +168,10 @@ pub extern "C" fn load_jit_abi() -> i64 {
 // `fetch_or` is a single lock-free atomic RMW → async-signal-safe.
 pub fn set_async() {
     EVAL_BREAKER_WORD.fetch_or(EB_ASYNC, Ordering::Relaxed);
+    // `signals.c pypysig_pushback` drives `pypysig_counter` negative in the
+    // handler. The breaker bit stays the compiled back-edge deopt; the ticker
+    // is what the interpreter's `decrement_ticker` observes.
+    fire_action_ticker();
 }
 pub fn clear_async() {
     EVAL_BREAKER_WORD.fetch_and(!EB_ASYNC, Ordering::Relaxed);
@@ -142,6 +180,7 @@ pub fn clear_async() {
 // stw (bit1): armed/cleared by the collector under the quiesce lock
 pub fn set_stw() {
     EVAL_BREAKER_WORD.fetch_or(EB_STW, Ordering::Release);
+    fire_action_ticker();
 }
 pub fn clear_stw() {
     EVAL_BREAKER_WORD.fetch_and(!EB_STW, Ordering::Release);
@@ -149,6 +188,7 @@ pub fn clear_stw() {
 
 pub fn set_finalizing() {
     EVAL_BREAKER_WORD.fetch_or(EB_FINALIZING, Ordering::Release);
+    fire_action_ticker();
 }
 
 pub fn set_gc_interp() {
@@ -168,6 +208,10 @@ pub fn set_gc_interp() {
 /// collection.
 pub fn set_gc() {
     EVAL_BREAKER_WORD.fetch_or(EB_GC, Ordering::Relaxed);
+    // `finish_alloc_in_oldgen` arms this when the threshold is already
+    // reached. Firing the ticker makes `action_dispatcher` run on the next
+    // bytecode instead of waiting out the periodic poll.
+    fire_action_ticker();
 }
 
 /// Consume the pending-collection request, reporting whether one was armed.
@@ -236,6 +280,7 @@ fn release_one_owed() {
     // idempotent rather than a second signal.
     if MEMORY_ERROR_OWERS.load(Ordering::Acquire) != 0 {
         EVAL_BREAKER_WORD.fetch_or(EB_MEMORY_ERROR, Ordering::Relaxed);
+        fire_action_ticker();
     }
 }
 
@@ -251,6 +296,7 @@ pub fn memory_error_after_fork_child() {
     MEMORY_ERROR_OWERS.store(usize::from(owed_here), Ordering::SeqCst);
     if owed_here {
         EVAL_BREAKER_WORD.fetch_or(EB_MEMORY_ERROR, Ordering::Relaxed);
+        fire_action_ticker();
     } else {
         EVAL_BREAKER_WORD.fetch_and(!EB_MEMORY_ERROR, Ordering::Relaxed);
     }
@@ -286,6 +332,7 @@ pub fn set_memory_error() {
         }
         MEMORY_ERROR_OWERS.fetch_add(1, Ordering::AcqRel);
         EVAL_BREAKER_WORD.fetch_or(EB_MEMORY_ERROR, Ordering::Relaxed);
+        fire_action_ticker();
     });
 }
 
