@@ -64,7 +64,7 @@ impl<'a, K, V> LiveIter<'a, K, V> {
     }
 
     fn entry_at(&self, i: usize) -> Option<(&'a K, &'a V)> {
-        let e = unsafe { &*self.entries.as_ptr().add(i) };
+        let e = &self.entries[i];
         e.as_ref().map(|e| (&e.key, &e.value))
     }
 }
@@ -365,31 +365,25 @@ impl<K, V, S> RDict<K, V, S> {
     /// `ll_getitem_nonneg` / `ll_getitem_fast` on `d.entries`.
     #[inline]
     fn entry_at(&self, slot: usize) -> &Option<Entry<K, V>> {
-        debug_assert!(slot < self.entries.len());
-        unsafe { &*self.entries.as_ptr().add(slot) }
+        &self.entries[slot]
     }
 
     /// `ll_setitem_fast` on `d.entries`.
     #[inline]
     fn entry_at_mut(&mut self, slot: usize) -> &mut Option<Entry<K, V>> {
-        debug_assert!(slot < self.entries.len());
-        unsafe { &mut *self.entries.as_mut_ptr().add(slot) }
+        &mut self.entries[slot]
     }
 
     /// `ll_getitem_nonneg` on `d.indexes`.
     #[inline]
     fn index_at(&self, i: usize) -> u32 {
-        debug_assert!(i < self.indexes.len());
-        unsafe { *self.indexes.as_ptr().add(i) }
+        self.indexes[i]
     }
 
     /// `ll_setitem_fast` on `d.indexes`.
     #[inline]
     fn set_index_at(&mut self, i: usize, value: u32) {
-        debug_assert!(i < self.indexes.len());
-        unsafe {
-            *self.indexes.as_mut_ptr().add(i) = value;
-        }
+        self.indexes[i] = value;
     }
 
     /// The first live slot at or after `from`, which is `_ll_dictnext`'s scan
