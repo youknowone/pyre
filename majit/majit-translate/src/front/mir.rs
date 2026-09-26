@@ -15852,20 +15852,25 @@ impl<'a> Lowering<'a> {
         if !crate::front::clause_spec::decl_is_generic(fd) {
             return None;
         }
-        if !spec
-            .borrow_mut()
-            .body_has_own_clause(fd, self.llbc)
-        {
-            return None;
-        }
-        let path = fd.item_meta.name_path();
-        if self
-            .dont_look_inside
-            .contains(&strip_crate_prefix(&path))
-        {
-            return None;
-        }
-        let trait_refs = crate::front::clause_spec::concrete_trait_refs(generics, self.llbc)?;
+        // Inside a spec copy every concrete instantiation gets its own
+        // graph, including a `dont_look_inside` helper with no trait
+        // clauses. Outside, only a clause-bearing callee with a TraitImpl
+        // ref is copied.
+        let trait_refs = if self.spec_body {
+            crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)?
+        } else {
+            if !spec.borrow_mut().body_has_own_clause(fd, self.llbc) {
+                return None;
+            }
+            let path = fd.item_meta.name_path();
+            if self
+                .dont_look_inside
+                .contains(&strip_crate_prefix(&path))
+            {
+                return None;
+            }
+            crate::front::clause_spec::concrete_trait_refs(generics, self.llbc)?
+        };
         let (types, const_generics) =
             crate::front::clause_spec::concrete_type_args(generics, self.llbc)?;
         let leaf = fd

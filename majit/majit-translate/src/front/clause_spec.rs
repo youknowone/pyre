@@ -96,6 +96,24 @@ pub(crate) fn decl_is_generic(fd: &FunDecl) -> bool {
     nonempty("types") || nonempty("trait_clauses")
 }
 
+/// `generics.trait_refs` when every ref is resolved (no `Clause`),
+/// including an empty list. Used while lowering a spec copy, where a
+/// callee may have no trait clauses.
+pub(crate) fn concrete_trait_refs_or_empty(generics: &Value, llbc: &Llbc) -> Option<Vec<Value>> {
+    let refs = generics
+        .get("trait_refs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if refs
+        .iter()
+        .any(|tref| matches!(ref_class(tref, llbc, 0), RefClass::Clause))
+    {
+        return None;
+    }
+    Some(refs)
+}
+
 /// `generics.trait_refs` when every ref is resolved (no `Clause`) and at
 /// least one is a `TraitImpl`. `None` leaves the callee unspecialized.
 pub(crate) fn concrete_trait_refs(generics: &Value, llbc: &Llbc) -> Option<Vec<Value>> {
@@ -144,7 +162,8 @@ pub(crate) fn spec_leaf(leaf: &str, fn_id: u64, generics: &Value, llbc: &Llbc) -
 }
 
 /// `generics.types` / `generics.const_generics` when neither list contains
-/// a depth-0 `TypeVar`. `None` leaves the callee unspecialized.
+/// a depth-0 type or const-generic variable. `None` leaves the callee
+/// unspecialized.
 pub(crate) fn concrete_type_args(
     generics: &Value,
     llbc: &Llbc,
@@ -159,7 +178,7 @@ pub(crate) fn concrete_type_args(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let open = |items: &[Value]| items.iter().any(|item| contains_depth0_type_var(item, llbc, 0));
+    let open = |items: &[Value]| items.iter().any(|item| contains_depth0_var(item, llbc, 0));
     if open(&types) || open(&const_generics) {
         return None;
     }
@@ -440,27 +459,6 @@ fn const_var_index(v: &Value) -> Option<usize> {
         return Some(bound.get(1)?.as_u64()? as usize);
     }
     var.get("Free").and_then(Value::as_u64).map(|index| index as usize)
-}
-
-fn contains_depth0_type_var(v: &Value, llbc: &Llbc, depth: usize) -> bool {
-    if depth > 64 {
-        return false;
-    }
-    if type_var_index(v).is_some() {
-        return true;
-    }
-    if let Some(body) = indirect_body(v, llbc) {
-        return contains_depth0_type_var(&body, llbc, depth + 1);
-    }
-    match v {
-        Value::Array(items) => items
-            .iter()
-            .any(|item| contains_depth0_type_var(item, llbc, depth + 1)),
-        Value::Object(map) => map
-            .values()
-            .any(|item| contains_depth0_type_var(item, llbc, depth + 1)),
-        _ => false,
-    }
 }
 
 fn contains_depth0_var(v: &Value, llbc: &Llbc, depth: usize) -> bool {
