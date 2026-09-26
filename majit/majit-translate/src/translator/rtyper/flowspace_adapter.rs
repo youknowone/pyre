@@ -1759,6 +1759,31 @@ pub fn translate_op(
         OpKind::FieldRead { base, field, .. } => {
             let base_hl = lookup_operand(value_map, base, op, "base")?;
             let result = resolve_result_hlvalue(op, value_map)?;
+            // `retarget_vec_operand` reuses this FieldRead's result as the
+            // length word (`ValueType::Int`). A bare `getattr` of the Vec
+            // field is the list pointer (`SomeList` → `Ptr(GcStruct)` →
+            // GcRef). RPython `ll_length` (`lltypesystem/rlist.py`) is
+            // `return l.length`, a Signed, via `ListRepr.rtype_len`.
+            if field.vec_part == Some(crate::model::VecFieldPart::Len) {
+                // Inline: the read's base is the parent struct, so the list
+                // is `getattr(parent, field)` and `len` is `ll_length`.
+                // A pointer to the Vec is already the list (`ll_length(l)`).
+                if field.inline_vec {
+                    let list = Hlvalue::Variable(Variable::new());
+                    return Ok(vec![
+                        FlowspaceOp::new(
+                            "getattr",
+                            vec![
+                                base_hl,
+                                Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
+                            ],
+                            list.clone(),
+                        ),
+                        FlowspaceOp::new("len", vec![list], result),
+                    ]);
+                }
+                return Ok(vec![FlowspaceOp::new("len", vec![base_hl], result)]);
+            }
             Ok(vec![FlowspaceOp::new(
                 "getattr",
                 vec![
@@ -8005,6 +8030,51 @@ mod tests {
             name_const.value,
             ConstValue::ByteStr(ref bytes) if bytes == b"f"
         ));
+    }
+
+    #[test]
+    fn translate_op_inline_vec_len_lowers_to_ll_length() {
+        // `self.entries.len()` retargets the field read in place
+        // (`retarget_vec_operand`). The result must be `len` of that
+        // list — `ListRepr.rtype_len` / `ll_length` → Signed — not
+        // `getattr` of the Vec field (the list pointer, GcRef).
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let base_var = Hlvalue::Variable(Variable::new());
+        let result_var = Hlvalue::Variable(Variable::new());
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11);
+        value_map.insert(vars[1].clone(), base_var);
+        value_map.insert(vars[2].clone(), result_var.clone());
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("entries", Some("RDict".into()))
+                    .with_inline_vec(true)
+                    .with_vec_part(crate::model::VecFieldPart::Len),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("inline Vec length field read must lower");
+        assert_eq!(translated.len(), 2);
+        assert_eq!(translated[0].opname, "getattr");
+        assert_eq!(translated[1].opname, "len");
+        let Hlvalue::Variable(ref list) = translated[0].result else {
+            panic!("getattr result must be the list");
+        };
+        let Hlvalue::Variable(ref len_arg) = translated[1].args[0] else {
+            panic!("len receiver must be the list");
+        };
+        assert_eq!(list.id(), len_arg.id());
+        let Hlvalue::Variable(ref len_res) = translated[1].result else {
+            panic!("len result must be a Variable");
+        };
+        let Hlvalue::Variable(ref expect) = result_var else {
+            panic!("fixture result must be a Variable");
+        };
+        assert_eq!(len_res.id(), expect.id());
     }
 
     #[test]

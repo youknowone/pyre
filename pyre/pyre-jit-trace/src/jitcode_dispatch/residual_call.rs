@@ -2985,8 +2985,17 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     // So guard the executor entry against NULL Ref arguments and fall through
     // to recording the IR op as-is.  The downstream optimizer then sees the
     // call op and emits the necessary guards.
+    //
+    // A constant null is not that invented zero. `record_result_of_call_pure`
+    // admits `ConstPtr(NULL)` once the call has run: the box's value is the
+    // pointer the trace observed (`_establish_nullity` reads `box.nonnull()`
+    // off that same value). Skipping it leaves the result without a value, so
+    // a later `goto_if_not_ptr_iszero` declines in `_establish_nullity`.
     for (i, &arg) in args.iter().enumerate() {
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
+            if ref_null_arg_is_constant(allboxes, i) {
+                continue;
+            }
             return recorded;
         }
     }
@@ -3070,6 +3079,15 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
 ///   A nested function's `LOAD_GLOBAL` folds it to the NULL constant.
 /// * `RaiseVarargs` trailing arg — `cause`: `normalize_raise_varargs` carries it
 ///   as the `raise X` (no `from`) sentinel, never dereferenced when null.
+/// `ConstPtr(NULL)` — the box is a constant, so the null is the value the
+/// traced call actually passed. A non-constant box whose concrete value is 0
+/// is the invented `getfield_gc_r` zero and stays refused.
+fn ref_null_arg_is_constant(allboxes: &[OpRef], arg_index: usize) -> bool {
+    allboxes
+        .get(1 + arg_index)
+        .is_some_and(|box_| box_.is_constant())
+}
+
 pub(crate) fn mayforce_null_ref_arg_is_checked_sentinel(
     helper: majit_ir::RuntimeHelperKind,
     arg_index: usize,
@@ -3797,6 +3815,14 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             continue;
         }
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
+            // `ConstPtr(NULL)` is the operand the trace observed. Execute it,
+            // as `record_result_of_call_pure` does after the call has run.
+            // The non-constant NULL this refuses is a value `getfield_gc_r`
+            // stamped onto a recorded box; executing that one dereferences
+            // a pointer the program did not pass.
+            if ref_null_arg_is_constant(allboxes, i) {
+                continue;
+            }
             // The refusal names the helper and slot it fired on, because the
             // repair for a helper that does check its NULL is a row in
             // `mayforce_null_ref_arg_is_checked_sentinel` and the row needs
