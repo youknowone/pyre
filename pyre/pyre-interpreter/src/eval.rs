@@ -1540,6 +1540,10 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // first call, named by no module dict, and owned by nothing else
         // between one returned instance and the next.
         crate::module::gc::walk_gc_stats_type_gc(&mut fwd);
+        // The exception accessor table is the same shape: built on the first
+        // exception class, and an accessor whose class has not installed it
+        // yet is owned by nothing else.
+        crate::builtins::walk_exception_getset_roots(&mut fwd);
         if let Some(hooks) = crate::importing::optional_module_hooks() {
             (hooks.walk_prebuilt_slots)(&mut fwd);
         }
@@ -2633,14 +2637,19 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResul
                 next_instr = frame.last_instr as usize;
                 continue;
             }
-        } else if let Err(mut err) = crate::executioncontext::service_eval_breaker(
-            std::ptr::null_mut(),
-            frame as *mut PyFrame,
-        ) {
-            if handle_exception(frame, &mut err, &mut next_instr) {
-                continue;
+        } else {
+            // No EC means no ticker, so this frame polls the breaker word
+            // itself, the interpreter GC poll included.
+            if let Err(mut err) = crate::executioncontext::service_eval_breaker(
+                std::ptr::null_mut(),
+                frame as *mut PyFrame,
+            ) {
+                if handle_exception(frame, &mut err, &mut next_instr) {
+                    continue;
+                }
+                return Err(err);
             }
-            return Err(err);
+            pyre_object::gc_interp::dispatch_safepoint(majit_ir::eval_breaker_word::load());
         }
         let (opcode_pc, instruction, op_arg) = decode_instruction_forward(code, pc)?;
         let fallthrough = opcode_pc + 1;

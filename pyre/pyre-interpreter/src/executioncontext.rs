@@ -2458,17 +2458,21 @@ pub trait ActionFlagOps {
         // A request that is still armed (STW not finished, signal not
         // consumed, memory error owed to another thread) must make the next
         // bytecode re-enter. `EB_GC_INTERP` is excluded: it stays set for
-        // the process lifetime and is not itself an event.
+        // the process lifetime and is not itself an event. `EB_FINALIZING`
+        // also stays set, and the thread running teardown is the one it
+        // never parks, so only another thread re-arms for it.
         //
         // A lost `-1` from `decrement_ticker`'s plain store is recovered
         // here, at the next wrap, so delivery slips by at most one ticker
         // period (`signals.c pypysig_counter` has the same race).
-        let still = majit_ir::eval_breaker_word::load()
-            & (majit_ir::eval_breaker_word::EB_ASYNC
-                | majit_ir::eval_breaker_word::EB_STW
-                | majit_ir::eval_breaker_word::EB_FINALIZING
-                | majit_ir::eval_breaker_word::EB_GC
-                | majit_ir::eval_breaker_word::EB_MEMORY_ERROR);
+        let mut pending = majit_ir::eval_breaker_word::EB_ASYNC
+            | majit_ir::eval_breaker_word::EB_STW
+            | majit_ir::eval_breaker_word::EB_GC
+            | majit_ir::eval_breaker_word::EB_MEMORY_ERROR;
+        if !crate::module::thread::current_is_finalizing_thread() {
+            pending |= majit_ir::eval_breaker_word::EB_FINALIZING;
+        }
+        let still = majit_ir::eval_breaker_word::load() & pending;
         if still != 0 {
             self.reset_ticker(-1);
         }
@@ -2729,11 +2733,12 @@ impl Default for SpaceActionFlag {
 
 impl SpaceActionFlag {
     pub fn new() -> Self {
-        let ptr = *SPACE_ACTIONFLAG
-            .get_or_init(|| Box::into_raw(Box::new(ActionFlag::new())) as usize)
-            as *mut ActionFlag;
-        // The leaked process flag is the ticker cell armers store into.
-        majit_ir::eval_breaker_word::publish_action_ticker(unsafe { &raw mut (*ptr)._ticker });
+        let ptr = *SPACE_ACTIONFLAG.get_or_init(|| {
+            let ptr = Box::into_raw(Box::new(ActionFlag::new()));
+            // The leaked process flag is the ticker cell armers store into.
+            majit_ir::eval_breaker_word::publish_action_ticker(unsafe { &raw mut (*ptr)._ticker });
+            ptr as usize
+        }) as *mut ActionFlag;
         Self { ptr }
     }
 

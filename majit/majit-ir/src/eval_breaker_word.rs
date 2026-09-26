@@ -105,10 +105,12 @@ pub fn publish_action_ticker(ptr: *mut AtomicIsize) {
     if ptr.is_null() {
         return;
     }
-    if TICKER_FORCED.swap(0, Ordering::Relaxed) < 0 {
+    // Publish before draining `TICKER_FORCED`: a fire that found no cell is
+    // picked up by the swap, and every later one writes the cell itself.
+    ACTION_TICKER.store(ptr, Ordering::Release);
+    if TICKER_FORCED.swap(0, Ordering::AcqRel) < 0 {
         unsafe { (*ptr).store(-1, Ordering::Relaxed) };
     }
-    ACTION_TICKER.store(ptr, Ordering::Release);
 }
 
 /// `AbstractActionFlag.fire` / `signals.c pypysig_pushback`: force the next

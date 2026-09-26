@@ -9647,7 +9647,7 @@ fn exc_gs_get_args(args: &[PyObjectRef]) -> crate::PyResult {
 fn exc_gs_set_args(args: &[PyObjectRef]) -> crate::PyResult {
     exception_getset_store(args, "args")
 }
-fn exc_gs_del_args(args: &[PyObjectRef]) -> crate::PyResult {
+fn exc_gs_del_args(_args: &[PyObjectRef]) -> crate::PyResult {
     crate::baseobjspace::exception_descr_del_refused("args")
 }
 
@@ -9657,7 +9657,7 @@ fn exc_gs_get_cause(args: &[PyObjectRef]) -> crate::PyResult {
 fn exc_gs_set_cause(args: &[PyObjectRef]) -> crate::PyResult {
     exception_getset_store(args, "__cause__")
 }
-fn exc_gs_del_cause(args: &[PyObjectRef]) -> crate::PyResult {
+fn exc_gs_del_cause(_args: &[PyObjectRef]) -> crate::PyResult {
     crate::baseobjspace::exception_descr_del_refused("__cause__")
 }
 
@@ -9667,7 +9667,7 @@ fn exc_gs_get_context(args: &[PyObjectRef]) -> crate::PyResult {
 fn exc_gs_set_context(args: &[PyObjectRef]) -> crate::PyResult {
     exception_getset_store(args, "__context__")
 }
-fn exc_gs_del_context(args: &[PyObjectRef]) -> crate::PyResult {
+fn exc_gs_del_context(_args: &[PyObjectRef]) -> crate::PyResult {
     crate::baseobjspace::exception_descr_del_refused("__context__")
 }
 
@@ -9677,7 +9677,7 @@ fn exc_gs_get_traceback(args: &[PyObjectRef]) -> crate::PyResult {
 fn exc_gs_set_traceback(args: &[PyObjectRef]) -> crate::PyResult {
     crate::baseobjspace::exception_descr_settraceback(args[1], args[2])
 }
-fn exc_gs_del_traceback(args: &[PyObjectRef]) -> crate::PyResult {
+fn exc_gs_del_traceback(_args: &[PyObjectRef]) -> crate::PyResult {
     crate::baseobjspace::exception_descr_del_refused("__traceback__")
 }
 
@@ -9733,72 +9733,118 @@ fn exc_gs_del_exceptions(args: &[PyObjectRef]) -> crate::PyResult {
 
 struct ExcGetsetRow {
     name: &'static str,
-    fget: usize,
-    fset: usize,
-    fdel: usize,
+    fget: std::sync::atomic::AtomicUsize,
+    fset: std::sync::atomic::AtomicUsize,
+    fdel: std::sync::atomic::AtomicUsize,
 }
+
+type ExcGetsetSpec = (
+    &'static str,
+    crate::gateway::BuiltinCodeFn,
+    crate::gateway::BuiltinCodeFn,
+    crate::gateway::BuiltinCodeFn,
+);
+
+const EXC_GETSET_SPECS: [ExcGetsetSpec; 8] = [
+    (
+        "__dict__",
+        exc_gs_get_dict,
+        exc_gs_set_dict,
+        exc_gs_del_dict,
+    ),
+    ("args", exc_gs_get_args, exc_gs_set_args, exc_gs_del_args),
+    (
+        "__cause__",
+        exc_gs_get_cause,
+        exc_gs_set_cause,
+        exc_gs_del_cause,
+    ),
+    (
+        "__context__",
+        exc_gs_get_context,
+        exc_gs_set_context,
+        exc_gs_del_context,
+    ),
+    (
+        "__traceback__",
+        exc_gs_get_traceback,
+        exc_gs_set_traceback,
+        exc_gs_del_traceback,
+    ),
+    (
+        "characters_written",
+        exc_gs_get_written,
+        exc_gs_set_written,
+        exc_gs_del_written,
+    ),
+    (
+        "message",
+        exc_gs_get_message,
+        exc_gs_set_message,
+        exc_gs_del_message,
+    ),
+    (
+        "exceptions",
+        exc_gs_get_exceptions,
+        exc_gs_set_exceptions,
+        exc_gs_del_exceptions,
+    ),
+];
+
+static EXC_GETSET_ROWS: std::sync::OnceLock<Vec<ExcGetsetRow>> = std::sync::OnceLock::new();
 
 /// One builtin function object per accessor.  `exception_attr_slot_fold`
 /// recognises a canonical descriptor by membership of its `fget` in this
 /// table (`interp_exceptions.py` `GetSetProperty` / `readwrite_attrproperty_w`).
+///
+/// Each accessor is pinned while the rest are built, and the published table
+/// is a root ([`walk_exception_getset_roots`]): an accessor whose class has
+/// not installed it yet is reachable from nothing else.
 fn exception_getset_rows() -> &'static [ExcGetsetRow] {
-    static ROWS: std::sync::OnceLock<Vec<ExcGetsetRow>> = std::sync::OnceLock::new();
-    ROWS.get_or_init(|| {
-        let row = |name: &'static str,
-                   get: crate::gateway::BuiltinCodeFn,
-                   set: crate::gateway::BuiltinCodeFn,
-                   del: crate::gateway::BuiltinCodeFn| ExcGetsetRow {
-            name,
-            fget: make_builtin_function_with_arity("__get__", get, 2) as usize,
-            fset: make_builtin_function_with_arity("__set__", set, 3) as usize,
-            fdel: make_builtin_function_with_arity("__delete__", del, 2) as usize,
+    EXC_GETSET_ROWS.get_or_init(|| {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let first_slot = pyre_object::gc_roots::shadow_stack_len();
+        for (_, get, set, del) in EXC_GETSET_SPECS {
+            let _ = pyre_object::gc_roots::pin_root(make_builtin_function_with_arity(
+                "__get__", get, 2,
+            ));
+            let _ = pyre_object::gc_roots::pin_root(make_builtin_function_with_arity(
+                "__set__", set, 3,
+            ));
+            let _ = pyre_object::gc_roots::pin_root(make_builtin_function_with_arity(
+                "__delete__",
+                del,
+                2,
+            ));
+        }
+        let slot = |i: usize| {
+            std::sync::atomic::AtomicUsize::new(pyre_object::gc_roots::shadow_stack_get(
+                first_slot + i,
+            ) as usize)
         };
-        vec![
-            row(
-                "__dict__",
-                exc_gs_get_dict,
-                exc_gs_set_dict,
-                exc_gs_del_dict,
-            ),
-            row("args", exc_gs_get_args, exc_gs_set_args, exc_gs_del_args),
-            row(
-                "__cause__",
-                exc_gs_get_cause,
-                exc_gs_set_cause,
-                exc_gs_del_cause,
-            ),
-            row(
-                "__context__",
-                exc_gs_get_context,
-                exc_gs_set_context,
-                exc_gs_del_context,
-            ),
-            row(
-                "__traceback__",
-                exc_gs_get_traceback,
-                exc_gs_set_traceback,
-                exc_gs_del_traceback,
-            ),
-            row(
-                "characters_written",
-                exc_gs_get_written,
-                exc_gs_set_written,
-                exc_gs_del_written,
-            ),
-            row(
-                "message",
-                exc_gs_get_message,
-                exc_gs_set_message,
-                exc_gs_del_message,
-            ),
-            row(
-                "exceptions",
-                exc_gs_get_exceptions,
-                exc_gs_set_exceptions,
-                exc_gs_del_exceptions,
-            ),
-        ]
+        EXC_GETSET_SPECS
+            .iter()
+            .enumerate()
+            .map(|(i, &(name, ..))| ExcGetsetRow {
+                name,
+                fget: slot(3 * i),
+                fset: slot(3 * i + 1),
+                fdel: slot(3 * i + 2),
+            })
+            .collect()
     })
+}
+
+/// Forward the exception accessor table's function slots.
+pub(crate) fn walk_exception_getset_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    let Some(rows) = EXC_GETSET_ROWS.get() else {
+        return;
+    };
+    for row in rows {
+        for cell in [&row.fget, &row.fset, &row.fdel] {
+            unsafe { visitor(&mut *(cell.as_ptr() as *mut PyObjectRef)) };
+        }
+    }
 }
 
 fn exception_getset_for(attr: &str) -> (PyObjectRef, PyObjectRef, PyObjectRef) {
@@ -9806,18 +9852,17 @@ fn exception_getset_for(attr: &str) -> (PyObjectRef, PyObjectRef, PyObjectRef) {
         .iter()
         .find(|row| row.name == attr)
         .unwrap_or_else(|| panic!("exception getset {attr}"));
-    (
-        row.fget as PyObjectRef,
-        row.fset as PyObjectRef,
-        row.fdel as PyObjectRef,
-    )
+    let load = |cell: &std::sync::atomic::AtomicUsize| {
+        cell.load(std::sync::atomic::Ordering::Relaxed) as PyObjectRef
+    };
+    (load(&row.fget), load(&row.fset), load(&row.fdel))
 }
 
 /// True when `fget` is one of the canonical exception-typedef getters.
 pub(crate) fn is_exception_canonical_fget(fget: PyObjectRef) -> bool {
     exception_getset_rows()
         .iter()
-        .any(|row| std::ptr::eq(row.fget as PyObjectRef, fget))
+        .any(|row| row.fget.load(std::sync::atomic::Ordering::Relaxed) == fget as usize)
 }
 
 /// Store `value` under `key` in the type namespace dict rooted at shadow-stack

@@ -305,6 +305,11 @@ pub fn is_finalizing() -> bool {
     FINALIZING.load(Ordering::Acquire)
 }
 
+/// Whether this thread is the one running interpreter teardown.
+pub(crate) fn current_is_finalizing_thread() -> bool {
+    is_finalizing() && FINALIZING_THREAD.load(Ordering::Acquire) == current_ident()
+}
+
 /// Stop a non-owner mutator from running Python once interpreter teardown has
 /// begun.  The forgotten blocking guard keeps it outside the GC RUNNING census;
 /// process exit terminates these daemon OS threads after the owner completes
