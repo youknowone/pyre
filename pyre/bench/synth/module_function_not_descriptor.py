@@ -1,13 +1,11 @@
 # A function directly in a builtin module is a non-descriptor builtin function
-# pyre-check: skip-backends=cranelift
-# cranelift runs the core build, which has no `pyre-module` and so no `math`.
 # (no `__get__`), so storing it on a user class and reading it through an
 # instance returns the SAME function object — it does not synthesize a bound
 # method or inject `self`.  Mirrors mixedmodule.py:_load_lazily; guards
 # demote_module_function_to_builtin at both call sites:
 #   - builtins.rs new_builtin_module_dict   (the `builtins` module: len)
 #   - importing.rs load_builtin_module      (every other builtin module:
-#       sys.exc_info from a non-macro register_module; math.sqrt inline)
+#       sys.exc_info from a non-macro register_module; operator.neg inline)
 # A function that carries an instance attribute (populated `w_func_dict`) must
 # NOT be demoted (`builtin_function_or_method` has no instance `__dict__`, so
 # the retag would hide the attribute): `itertools.chain` keeps its
@@ -24,7 +22,7 @@
 # so `time.sleep` is left out — `sys.exc_info` already covers the same non-macro
 # register_module path.
 import sys
-import math
+import operator
 import itertools
 
 BUILTIN_FN_NAMES = ("builtin_function_or_method", "builtin_function")
@@ -47,7 +45,7 @@ def check_non_binding(f):
 def main():
     check_non_binding(len)           # builtins module dict path
     check_non_binding(sys.exc_info)  # non-macro register_module path
-    check_non_binding(math.sqrt)     # macro-module inline function
+    check_non_binding(operator.neg)  # macro-module inline function
 
     class C:
         info = sys.exc_info
