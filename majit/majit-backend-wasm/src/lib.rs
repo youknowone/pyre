@@ -1970,8 +1970,8 @@ fn wasm_bh_alloc_struct(sizedescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
 /// `MemoryError`, which lowers to "store the singleton in `pos_exc_value`,
 /// return NULL". These trampolines return 0 directly, so the store belongs
 /// here — the emitted memory-error check (`codegen.rs`
-/// `emit_memory_error_check`) moves the value out of the cell and into the
-/// frame's exception exit slot.
+/// `emit_memory_error_check`) moves the value out of the cell and into
+/// `jf_guard_exc`. `PropagateExceptionDescr.handle_fail` reads it back.
 #[inline]
 fn oom_signal_if_zero(result: i64) -> i64 {
     if result == 0 {
@@ -4714,38 +4714,6 @@ fn exit_arg_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize) -> 
     })
 }
 
-/// Host `execute_token` reader for `compile.py`
-/// `PropagateExceptionDescr.handle_fail`.
-///
-/// `failguard::stage_propagate_exception_exit` retargets the guard at
-/// `exit_frame_with_exception_descr_ref`. The exception moves from
-/// `jf_guard_exc` into fail-arg slot 0, the identity slot that finish
-/// descr reads, and `jf_descr` / `jf_gcmap` follow
-/// (`assembler.py` `gcmap_for_finish`). The deadframe stays this jitframe.
-/// The in-guest CALL_ASSEMBLER path does not come through here:
-/// `dead_frame_from_ran_frame` keeps the singleton so
-/// `wasm_ca_resume_deopt` publishes `jf_guard_exc` to the caller's
-/// `GUARD_NO_EXCEPTION`.
-#[cfg(target_arch = "wasm32")]
-fn stage_propagate_on_live_frame(
-    jf: *mut majit_backend::jitframe::JitFrame,
-    fail_descr: Arc<WasmFailDescr>,
-) -> Arc<WasmFailDescr> {
-    let exc_value = unsafe { (*jf).jf_guard_exc as i64 };
-    let Some((staged, exc)) = failguard::stage_propagate_exception_exit(&fail_descr, exc_value)
-    else {
-        return fail_descr;
-    };
-    let items = jf as usize + majit_backend::jitframe::FIRST_ITEM_OFFSET;
-    unsafe {
-        *((items + codegen::FRAME_SLOT_BASE as usize) as *mut i64) = exc;
-        (*jf).jf_gcmap = codegen::memory_error_gcmap_ptr();
-        (*jf).jf_guard_exc = 0;
-        (*jf).jf_descr = failguard::finish_descr_ptr(failguard::FINISH_EXIT_INDEX_EXC);
-    }
-    staged
-}
-
 /// Reconstruct a [`DeadFrame`] from a callee frame an in-guest `call_indirect`
 /// already ran to a guard/finish exit (the self-recursive CALL_ASSEMBLER fast
 /// path, `PYRE_WASM_CA`). This is the post-`glue::execute` tail of
@@ -6737,7 +6705,6 @@ impl majit_backend::Backend for WasmBackend {
                 let jf = majit_gc::shadow_stack::peek_jf(saved).0 as *mut JitFrame;
                 let fail_descr = descr_at(unsafe { (*jf).jf_descr })
                     .expect("invalid jf_descr from compiled wasm");
-                let fail_descr = stage_propagate_on_live_frame(jf, fail_descr);
                 let data = WasmFrameData::from_live_frame(jf, fail_descr, false, true, None);
                 majit_gc::shadow_stack::pop_jf_to(saved);
 
@@ -6820,7 +6787,6 @@ impl majit_backend::Backend for WasmBackend {
                     None,
                 )
             };
-            let fail_descr = stage_propagate_on_live_frame(jf, fail_descr);
             DeadFrame::Boxed(WasmFrameData::from_live_frame(
                 jf,
                 fail_descr,

@@ -338,6 +338,40 @@ mod tests {
         })
     }
 
+    /// `compile.py` `PropagateExceptionDescr.handle_fail` through the same
+    /// reader the metainterp calls. The wasm exit cell is that descr, not
+    /// `FINISH_EXIT_INDEX_EXC`.
+    #[test]
+    fn propagate_exception_exit_raises_through_the_reader() {
+        let descr: majit_ir::DescrRef = Arc::new(majit_backend::PropagateExceptionDescr::new());
+        let fd = descr.as_fail_descr().expect("fail descr");
+        assert!(!fd.is_finish());
+        assert_eq!(fd.fail_index(), u32::MAX);
+        assert_eq!(
+            majit_backend::propagate_exception_handle_fail(fd, 0x42),
+            Some(0x42)
+        );
+        // Do not install a provider: `memory_error_singleton_ref` is
+        // process-global, and a stand-in address is what later tests
+        // dereference as an exception object.
+        let memory_error = majit_backend::memory_error_singleton_ref();
+        assert_eq!(
+            majit_backend::propagate_exception_handle_fail(fd, 0),
+            Some(memory_error)
+        );
+
+        super::attach_propagate_exception_descr(Arc::clone(&descr));
+        let cell = super::descr_at(super::propagate_exception_descr_ptr()).expect("propagate cell");
+        assert!(!cell.is_finish);
+        let meta = cell.meta_descr.clone().expect("attached propagate descr");
+        assert!(Arc::ptr_eq(&meta, &descr));
+        let meta_fd = meta.as_fail_descr().expect("meta fail descr");
+        assert_eq!(
+            majit_backend::propagate_exception_handle_fail(meta_fd, 0x99),
+            Some(0x99)
+        );
+    }
+
     #[test]
     fn a_finish_singleton_resolves_to_its_reserved_exit() {
         let _serialized = super::lock_cpu();
@@ -779,10 +813,6 @@ pub fn finish_descr_ptr(index: u32) -> usize {
     finish_descr_ptr_locked(&mut exits, index)
 }
 
-fn finish_exit(index: u32) -> Arc<WasmFailDescr> {
-    descr_at(finish_descr_ptr(index)).expect("reserved finish exit is uninitialized")
-}
-
 fn thin_descr_ptr(descr: &DescrRef) -> usize {
     Arc::as_ptr(descr) as *const () as usize
 }
@@ -818,66 +848,53 @@ pub fn attach_finish_descr(exit_index: u32, descr: DescrRef) {
     fill_exit_cell(cell, reserved_finish_descr(exit_index, Some(descr)));
 }
 
-/// Whether the cpu has been handed `exit_frame_with_exception_descr_ref`.
-///
-/// The memory-error check the allocation codegen emits leaves through
-/// [`FINISH_EXIT_INDEX_EXC`], and only the attached metainterp descr carries
-/// `is_exit_frame_with_exception`. The reserved entry on its own reads as a
-/// plain finish, which would hand the raised value back as the loop's result
-/// instead of raising it, so the emitter has to know which of the two it has.
-pub fn exit_frame_with_exception_attached() -> bool {
-    finish_exit(FINISH_EXIT_INDEX_EXC).meta_descr.is_some()
-}
-
 /// `pyjitpl.py` `self.cpu.propagate_exception_descr = exc_descr`.
 ///
-/// Dynasm and cranelift compare `Arc::as_ptr` of this singleton, and of the
-/// `FailDescrCell` a `GUARD_NO_EXCEPTION` recovery stub writes, against
-/// `jf_descr`. A wasm frame stores an exit index; `get_latest_descr_arc`
-/// recovers this Arc from `WasmFailDescr.meta_descr`, so the same identity
-/// compare is `Arc::ptr_eq`.
-static PROPAGATE_EXCEPTION_DESCR: parking_lot::Mutex<Option<DescrRef>> =
+/// `_build_propagate_exception_path` writes this cell into `jf_descr`.
+/// `get_latest_descr_arc` recovers the Arc from `WasmFailDescr.meta_descr`.
+/// The metainterp reader runs `PropagateExceptionDescr.handle_fail`; this
+/// cell is not a finish exit.
+static PROPAGATE_EXCEPTION_CELL: parking_lot::Mutex<Option<Box<FailDescrCell>>> =
     parking_lot::Mutex::new(None);
 
+fn propagate_wasm_descr(meta_descr: Option<DescrRef>) -> Arc<WasmFailDescr> {
+    Arc::new(WasmFailDescr {
+        fail_index: u32::MAX,
+        trace_id: 0,
+        fail_arg_types: Vec::new(),
+        fail_locs: Vec::new(),
+        is_finish: false,
+        force_args_offset: 0,
+        force_gcmap_ptr: 0,
+        bridge_cell: 0,
+        fail_arg_advanced: Vec::new(),
+        trace_ref_homes: 0,
+        trace_label_homes: 0,
+        param_dispatch: false,
+        bridge_slot: std::sync::atomic::AtomicU32::new(0),
+        meta_descr,
+    })
+}
+
+/// Stable `jf_descr` immediate for `propagate_exception_descr`.
+pub fn propagate_exception_descr_ptr() -> usize {
+    let mut slot = PROPAGATE_EXCEPTION_CELL.lock();
+    if slot.is_none() {
+        *slot = Some(Box::new(FailDescrCell::new(propagate_wasm_descr(None))));
+    }
+    &**slot.as_ref().expect("propagate cell") as *const FailDescrCell as usize
+}
+
 pub fn attach_propagate_exception_descr(descr: DescrRef) {
-    *PROPAGATE_EXCEPTION_DESCR.lock() = Some(descr);
+    let cell = propagate_exception_descr_ptr();
+    fill_exit_cell(cell, propagate_wasm_descr(Some(descr)));
 }
 
-pub fn is_propagate_exception_descr(descr: &DescrRef) -> bool {
-    PROPAGATE_EXCEPTION_DESCR
-        .lock()
-        .as_ref()
-        .is_some_and(|propagate| Arc::ptr_eq(descr, propagate))
-}
-
-/// `compile.py` `PropagateExceptionDescr.handle_fail` for the host's
-/// outermost exit reader.
-///
-/// That descr's `fail_index` is `u32::MAX` and `is_finish` is false, so the
-/// reader treats the exit as a loop-back JUMP and drops the exception.
-/// When `fail_descr` carries the propagate singleton, return the attached
-/// `exit_frame_with_exception_descr_ref` and the grabbed value (or
-/// `memory_error` when the cell is empty) so the finish reader raises
-/// `ExitFrameWithExceptionRef` from slot 0. `None` when this is not that
-/// exit, when the exception descr was never attached — a bare finish would
-/// hand the object back as the loop result — or when neither cell holds one.
-pub fn stage_propagate_exception_exit(
-    fail_descr: &WasmFailDescr,
-    exc_value: i64,
-) -> Option<(Arc<WasmFailDescr>, i64)> {
-    let meta = fail_descr.meta_descr.as_ref()?;
-    if !is_propagate_exception_descr(meta) || !exit_frame_with_exception_attached() {
-        return None;
-    }
-    let exc = if exc_value != 0 {
-        exc_value
-    } else {
-        majit_backend::memory_error_singleton_ref()
-    };
-    if exc == 0 {
-        return None;
-    }
-    Some((finish_exit(FINISH_EXIT_INDEX_EXC), exc))
+pub fn propagate_exception_attached() -> bool {
+    descr_at(propagate_exception_descr_ptr())
+        .expect("propagate cell")
+        .meta_descr
+        .is_some()
 }
 
 impl WasmCaDispatchEntry {

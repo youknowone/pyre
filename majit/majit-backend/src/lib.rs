@@ -131,6 +131,7 @@ pub use finish_descrs::{
     DoneWithThisFrameDescrMulti, DoneWithThisFrameDescrRef, DoneWithThisFrameDescrVoid,
     ExitFrameWithExceptionDescrRef, PropagateExceptionDescr,
     get_or_attach_done_with_this_frame_descr_multi, make_and_attach_done_descrs,
+    propagate_exception_handle_fail,
 };
 pub use jitframe::JitFrameInfo;
 pub use llmodel::{FailArgSource, get_int_value, get_int_value_direct};

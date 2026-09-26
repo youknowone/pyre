@@ -542,6 +542,31 @@ impl Descr for PropagateExceptionDescr {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+}
+
+/// `compile.py` `PropagateExceptionDescr.handle_fail`.
+///
+/// `Some(exception)` when `descr` is that class: `grabbed` is
+/// `cpu.grab_exc_value(deadframe)`, and a null cell becomes
+/// `cast_instance_to_gcref(memory_error)`. `None` for every other descr,
+/// so the caller does not treat this exit as a back-edge.
+pub fn propagate_exception_handle_fail(descr: &dyn FailDescr, grabbed: i64) -> Option<i64> {
+    if descr
+        .as_any()
+        .is_some_and(|any| any.is::<PropagateExceptionDescr>())
+    {
+        let exception = if grabbed != 0 {
+            grabbed
+        } else {
+            crate::memory_error_singleton_ref()
+        };
+        Some(exception)
+    } else {
+        None
+    }
 }
 
 impl FailDescr for PropagateExceptionDescr {

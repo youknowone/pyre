@@ -13027,6 +13027,34 @@ impl<M: Clone> MetaInterp<M> {
         let exit_types: &[Type] = descr.fail_arg_types();
         let status = descr.get_status();
         let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
+        // `compile.py` `PropagateExceptionDescr.handle_fail`, before the
+        // `fail_index == u32::MAX` back-edge reading below.
+        if let Some(exc) = majit_backend::propagate_exception_handle_fail(descr, {
+            let grabbed = self.backend.grab_exc_value(&frame);
+            grabbed.0 as i64
+        }) {
+            Self::finish_compiled_run_io();
+            return Some(CompileResult {
+                typed_values: ExitValues::from_vec(vec![Value::Ref(GcRef(exc as usize))]),
+                meta: Some(meta),
+                fail_index,
+                trace_id,
+                descr_arc: Some(descr_arc),
+                is_finish: true,
+                is_exit_frame_with_exception: true,
+                exit_layout: None,
+                rd_loop_token: None,
+                savedata: None,
+                deadframe: Some(frame),
+                exception: ExceptionState {
+                    exc_class: 0,
+                    exc_value: exc,
+                    ovf_flag: false,
+                },
+                status,
+                guard_value_operand,
+            });
+        }
         // compile.py `descr.rd_loop_token` — owning loop's green key,
         // stamped onto the clt at `set_loop_token_wref`. Guard exits
         // that belong to a loop other than the one currently executing
@@ -13438,6 +13466,41 @@ impl<M: Clone> MetaInterp<M> {
         // final descr resumes nothing, is counted by nothing, and owns no
         // resume data, so every one of those is gathered and dropped unread.
         //
+        // `compile.py` `PropagateExceptionDescr.handle_fail`, before any
+        // back-edge test. `fail_index` is `u32::MAX` and `is_finish` is
+        // false, which is also how a loop-carried JUMP is spelled; the class
+        // check is what keeps this exit out of that arm.
+        if descr
+            .as_any()
+            .is_some_and(|any| any.is::<majit_backend::PropagateExceptionDescr>())
+        {
+            let grabbed = self.backend.grab_exc_value(&frame);
+            let exc = majit_backend::propagate_exception_handle_fail(descr, grabbed.0 as i64)
+                .unwrap_or(0);
+            let descr_arc = self.backend.get_latest_descr_arc(&frame);
+            Self::finish_compiled_run_io();
+            return CompileResult {
+                typed_values: ExitValues::from_vec(vec![Value::Ref(GcRef(exc as usize))]),
+                meta,
+                fail_index,
+                trace_id,
+                descr_arc: Some(descr_arc),
+                is_finish: true,
+                is_exit_frame_with_exception: true,
+                exit_layout: None,
+                rd_loop_token: None,
+                savedata: None,
+                deadframe: Some(frame),
+                exception: ExceptionState {
+                    exc_class: 0,
+                    exc_value: exc,
+                    ovf_flag: false,
+                },
+                status: 0,
+                guard_value_operand: None,
+            };
+        }
+
         // Split here rather than lower down because a portal whose calls each
         // run one compiled body to completion reaches this point once per call
         // and never reaches the general case at all.
@@ -17188,6 +17251,17 @@ impl<M: Clone> MetaInterp<M> {
 
         if is_finish {
             // Normal finish (not a guard failure)
+            return Some(RunResult::Finished {
+                values,
+                meta,
+                savedata,
+            });
+        }
+
+        // `PropagateExceptionDescr.handle_fail` raises
+        // `ExitFrameWithExceptionRef`. `RunResult` has no separate arm; the
+        // value is the exception ref, and this is not a back-edge JUMP.
+        if result.is_exit_frame_with_exception {
             return Some(RunResult::Finished {
                 values,
                 meta,

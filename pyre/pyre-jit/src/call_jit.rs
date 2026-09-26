@@ -4783,22 +4783,14 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             } else {
                 Outcome::Finished(result)
             }
-        } else if majit_backend_wasm::failguard::is_propagate_exception_descr(&descr_arc) {
-            // compile.py `PropagateExceptionDescr.handle_fail`
-            // (`compile_tmp_callback`). The guard's descr is the cpu's
-            // `propagate_exception_descr` singleton and its failargs are
-            // empty, so the resume-guard arm below has no `rd_numb` and
-            // the caller would continue as if the call returned NULL.
-            // `grab_exc_value` reads the exception the guard left in the
-            // frame; an empty cell falls back to `memory_error`. Publish
-            // it the way the ExitFrameWithException arm does, so the
-            // caller's GUARD_NO_EXCEPTION sees the raise.
-            let exc_val = backend.grab_exc_value(&frame).0 as i64;
-            let value = if exc_val != 0 {
-                exc_val
-            } else {
-                majit_backend::memory_error_singleton_ref()
-            };
+        } else if let Some(value) = majit_backend::propagate_exception_handle_fail(
+            descr,
+            backend.grab_exc_value(&frame).0 as i64,
+        ) {
+            // `compile.py` `PropagateExceptionDescr.handle_fail`. Same
+            // reader as the host exit: `grab_exc_value`, then
+            // `memory_error` when the cell is null. Publish it the way
+            // the ExitFrameWithException arm does.
             Outcome::FinishedException(value)
         } else {
             let green_key = majit_backend::descr_owning_jct(descr)
