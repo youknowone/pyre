@@ -5,9 +5,9 @@
 # type change. The roots list differs by platform, so guard_failures is
 # deterministic per runner but spread by up to 8 across runners (470 windows,
 # 473 macos, 481 ubuntu, measured before the MutableCell roots were wrapped
-# as GcRef). The root count gap is the open prebuilt-root divergence:
-# incminimark adds a GCFLAG_NO_HEAP_PTRS prebuilt object to
-# prebuilt_root_objects only when a write barrier first fires on it.
+# as GcRef; wasm 373 ubuntu, 375 macos). Only about 16k of the 22.5k roots are
+# distinct objects: several off-GC side-table walkers report the same type,
+# str or descriptor, where pypy3 reaches those objects through the heap.
 import gc
 import sys
 
