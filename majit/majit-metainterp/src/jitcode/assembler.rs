@@ -2502,6 +2502,7 @@ impl JitCodeBuilder {
             OpCode::IntSub => "int_sub/ii>i",
             OpCode::IntMul => "int_mul/ii>i",
             OpCode::IntAnd => "int_and/ii>i",
+            OpCode::IntSignext => "int_signext/ii>i",
             OpCode::IntOr => "int_or/ii>i",
             OpCode::IntXor => "int_xor/ii>i",
             OpCode::IntLshift => "int_lshift/ii>i",

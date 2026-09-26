@@ -111,6 +111,8 @@ pub const BC_STRGETITEM_C: u8 = 244;
 pub const BC_SETINTERIORFIELD_GC_I: u8 = 245;
 pub const BC_SETINTERIORFIELD_GC_R: u8 = 246;
 pub const BC_SETINTERIORFIELD_GC_F: u8 = 247;
+/// `blackhole.py` `bhimpl_int_signext`. Lowest free byte at or above 248.
+pub const BC_INT_SIGNEXT: u8 = 248;
 
 /// "This cached control opcode is absent" sentinel for the
 /// `blackhole.py:72-74` fields (`op_live`, `op_catch_exception`,
@@ -948,6 +950,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // SSA-name → bytecode table never matches these.  See the
     // `BC_INT_AND` constants block above for the parity rationale.
     m.insert("int_and/ii>i", BC_INT_AND);
+    m.insert("int_signext/ii>i", BC_INT_SIGNEXT);
     m.insert("int_or/ii>i", BC_INT_OR);
     m.insert("int_xor/ii>i", BC_INT_XOR);
     m.insert("int_lshift/ii>i", BC_INT_LSHIFT);

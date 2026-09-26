@@ -6023,6 +6023,7 @@ where
             // `BC_INT_FLOORDIV` / `BC_INT_MOD` opcode is allocated, so
             // no dispatch arm exists.
             jitcode::insns::BC_INT_AND => self.trace_binop_i(ctx, OpCode::IntAnd),
+            jitcode::insns::BC_INT_SIGNEXT => self.trace_binop_i(ctx, OpCode::IntSignext),
             jitcode::insns::BC_INT_OR => self.trace_binop_i(ctx, OpCode::IntOr),
             jitcode::insns::BC_INT_XOR => self.trace_binop_i(ctx, OpCode::IntXor),
             jitcode::insns::BC_INT_LSHIFT => self.trace_binop_i(ctx, OpCode::IntLshift),
@@ -12702,6 +12703,7 @@ pub fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
             }
         }
         OpCode::IntAnd => lhs & rhs,
+        OpCode::IntSignext => crate::support::int_signext(lhs, rhs),
         OpCode::IntOr => lhs | rhs,
         OpCode::IntXor => lhs ^ rhs,
         OpCode::IntLshift => lhs.wrapping_shl(rhs as u32),

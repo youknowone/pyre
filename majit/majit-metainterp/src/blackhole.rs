@@ -4570,6 +4570,27 @@ mod tests {
     }
 
     #[test]
+    fn handler_int_signext_narrows_signed_widths() {
+        // `blackhole.py` `bhimpl_int_signext` through `bhhandler_ii_i!`:
+        // code bytes are register indices `[lhs, nbytes, dst]`.
+        let cases = [
+            (0x80_i64, 1_i64, -128_i64),
+            (0xffff_ffff, 4, -1),
+            (0x7fff_ffff, 4, 0x7fff_ffff),
+        ];
+        for (value, nbytes, expected) in cases {
+            let mut bh = BlackholeInterpreter::default();
+            bh.registers_i = vec![value, nbytes, 0];
+            let next = handler_int_signext(&mut bh, &[0, 1, 2], 0).unwrap();
+            assert_eq!(next, 3);
+            assert_eq!(
+                bh.registers_i[2], expected,
+                "int_signext({value:#x}, {nbytes})"
+            );
+        }
+    }
+
+    #[test]
     fn test_executor_int_signext_rejects_nonpositive_width() {
         for numbytes in [0, -1] {
             assert!(
@@ -10470,6 +10491,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         ("int_sub/ii>i", majit_jitcode::insns::BC_INT_SUB),
         ("int_mul/ii>i", majit_jitcode::insns::BC_INT_MUL),
         ("int_and/ii>i", majit_jitcode::insns::BC_INT_AND),
+        ("int_signext/ii>i", majit_jitcode::insns::BC_INT_SIGNEXT),
         ("int_or/ii>i", majit_jitcode::insns::BC_INT_OR),
         ("int_xor/ii>i", majit_jitcode::insns::BC_INT_XOR),
         ("int_lshift/ii>i", majit_jitcode::insns::BC_INT_LSHIFT),
