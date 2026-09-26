@@ -164,7 +164,7 @@ fn bracket_closes_when_the_drop_is_not_adjacent_to_the_binding() {
         let Some(body) = fd.unstructured() else {
             continue;
         };
-        let erased = erased_root_bracket_guards(llbc, &body);
+        let erased = erased_root_bracket_guards(llbc, fd, &body);
         let moved = moved_out_locals(&body);
         let opens = opener_blocks(llbc, &body);
         let distant = guard_drop_sites(llbc, &body).any(|(bb, local)| {
@@ -249,7 +249,7 @@ fn only_a_moved_out_or_erased_guard_keeps_its_bracket_open() {
         }
         let name = fd.item_meta.name_path().to_string();
         let moved = moved_out_locals(&body);
-        let erased = erased_root_bracket_guards(llbc, &body);
+        let erased = erased_root_bracket_guards(llbc, fd, &body);
         let excused = guard_drop_sites(llbc, &body)
             .any(|(_, local)| moved.contains(&local) || erased.contains(&(local as usize)));
         assert!(
@@ -342,7 +342,7 @@ fn nearly_every_dropped_bracket_closes() {
             let Some(body) = fd.unstructured() else {
                 continue;
             };
-            let want = owed_closes(llbc, &body);
+            let want = owed_closes(llbc, fd, &body);
             if want == 0 {
                 continue;
             }
@@ -398,9 +398,13 @@ fn nearly_every_dropped_bracket_closes() {
 /// The closes a body owes: one per drop of an unmoved, unerased guard, counting
 /// only the drops the front lowers. A cleanup-only drop is not one of them —
 /// the front does not follow `on_unwind`.
-fn owed_closes(llbc: &Llbc, body: &Unstructured) -> usize {
+fn owed_closes(
+    llbc: &Llbc,
+    fd: &majit_charon_reader::ullbc::FunDecl,
+    body: &Unstructured,
+) -> usize {
     let moved = moved_out_locals(body);
-    let erased = erased_root_bracket_guards(llbc, body);
+    let erased = erased_root_bracket_guards(llbc, fd, body);
     let live = reachable_without_unwind(body);
     guard_drop_sites(llbc, body)
         .filter(|(bb, local)| {
@@ -478,4 +482,53 @@ fn reachable_closes(graph: &FunctionGraph) -> usize {
         stack.extend(graph.blocks[b].exits.iter().map(|e| e.target.0));
     }
     found
+}
+
+/// A bracket whose slots are all constant offsets from the body's own depth
+/// leaves no shadow-stack call in the lowered graph:
+/// `w_range_iter_one_arg_new` opens a scope around its allocation.
+#[test]
+fn a_constant_offset_bracket_is_scalar_replaced() {
+    let Some(llbc) = object_llbc() else { return };
+    let graph = lower_named(llbc, "w_range_iter_one_arg_new");
+    for leaf in [
+        "push_roots",
+        "shadow_stack_len",
+        "publish_roots",
+        "normalize_roots",
+        "shadow_stack_get",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "w_range_iter_one_arg_new still calls {leaf} after the bracket was scalar-replaced"
+        );
+    }
+}
+
+/// Print how many bracketed bodies the scalar replacement rewrites, and why it
+/// refuses the rest.  A measurement, not a gate.
+#[test]
+#[ignore]
+fn shadow_stack_erase_census() {
+    for (name, load) in [
+        ("pyre-object", object_llbc as fn() -> Option<&'static Llbc>),
+        ("pyre-interpreter", interpreter_llbc),
+        ("pyre-module", module_llbc),
+    ] {
+        if std::env::var("CENSUS_ONLY").is_ok_and(|only| only != name) {
+            continue;
+        }
+        let Some(llbc) = load() else { continue };
+        let census = majit_translate::front::mir::shadow_stack_erase_census(llbc);
+        for (bucket, bodies) in &census {
+            eprintln!("[census {name}] {bucket} {}", bodies.len());
+        }
+        if let Ok(filter) = std::env::var("CENSUS_LIST") {
+            for body in census.get(filter.as_str()).into_iter().flatten() {
+                eprintln!("[census {name}] {filter}: {body}");
+            }
+        }
+    }
 }
