@@ -3448,6 +3448,43 @@ pub(crate) fn helper_kind_writes_live_heap(helper: majit_ir::RuntimeHelperKind) 
     )
 }
 
+/// The standard virtualizable word `try_execute_residual_call_via_executor`
+/// saves across a non-forcing residual, rooted for the duration of the call.
+struct SavedVableRoot {
+    slot: Box<i64>,
+    depth: Option<usize>,
+}
+
+impl SavedVableRoot {
+    fn push(ptr: Option<*const u8>) -> Self {
+        let mut root = Self {
+            slot: Box::new(ptr.map_or(0, |p| p as usize as i64)),
+            depth: None,
+        };
+        if ptr.is_some() {
+            root.depth = Some(majit_gc::shadow_stack::resume_ref_roots_depth());
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(
+                    &mut *root.slot,
+                ));
+            }
+        }
+        root
+    }
+
+    fn forwarded(&self) -> Option<*const u8> {
+        self.depth.map(|_| *self.slot as usize as *const u8)
+    }
+}
+
+impl Drop for SavedVableRoot {
+    fn drop(&mut self) {
+        if let Some(depth) = self.depth {
+            majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+        }
+    }
+}
+
 pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_opcode: OpCode,
@@ -3969,6 +4006,14 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // subsequent vable token protocol / field reads see the frame being
     // traced, mirroring RPython's separate-state isolation.
     let saved_vable_heap_ptr = ctx.trace_ctx.virtualizable_heap_ptr();
+    // The call can allocate, and a minor collection moves a nursery frame.
+    // A MayForce call roots the frame through `vable_obj_root`; every other
+    // call roots the saved word here, so the restore below writes the
+    // forwarded address (`pyjitpl.py` holds the virtualizable in a box the
+    // GC traces).
+    let saved_vable_root = SavedVableRoot::push(
+        saved_vable_heap_ptr.filter(|p| vable_obj_root.is_none() && !p.is_null()),
+    );
     // #57 Option C (Finding #1, R1 double-apply guard): whether THIS residual
     // could commit an irreversible heap mutation the journals do not cover,
     // while an in-flight FOR_ITER item is already captured (a consume ran
@@ -4712,8 +4757,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     let restored_vable_heap_ptr = vable_obj_root
         .as_ref()
         .map(|obj| **obj as usize as *const u8)
-        .or(saved_vable_heap_ptr)
+        .or(saved_vable_root.forwarded().or(saved_vable_heap_ptr))
         .unwrap_or(std::ptr::null());
+    drop(saved_vable_root);
     ctx.trace_ctx
         .set_virtualizable_heap_ptr(restored_vable_heap_ptr);
     // `pyjitpl.py:2049` step 3, "after this call, check the vrefs.  If any
