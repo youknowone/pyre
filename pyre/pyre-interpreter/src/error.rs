@@ -1129,19 +1129,17 @@ impl PyError {
         Self::new(PyErrorKind::SystemError, msg)
     }
 
-    /// `_PyEval_FormatExcCheckArg` parity — a NameError carrying the
-    /// undefined `name` so `e.name` reads back once the instance is
-    /// materialised (Python 3.10+).
-    pub fn name_error_with_name(msg: impl Into<Wtf8Buf>, name: &str) -> Self {
-        Self::name_error_with_name_obj(msg, pyre_object::w_str_new_managed(name))
+    /// [`Self::oefmt_name_error`] for a name the caller holds as text, which
+    /// is how the eval loop reports an undefined one
+    /// (`_PyEval_FormatExcCheckArg` parity).
+    pub fn oefmt_name_error_text(msg: impl Into<Wtf8Buf>, name: &str) -> Self {
+        Self::oefmt_name_error(msg, pyre_object::w_str_new_managed(name))
     }
 
-    /// [`name_error_with_name`] for a name that is already a `str` object
-    /// (`pyopcode.py _load_global_failed` takes `w_varname`).
-    pub fn name_error_with_name_obj(
-        msg: impl Into<Wtf8Buf>,
-        w_name: pyre_object::PyObjectRef,
-    ) -> Self {
+    /// `error.py oefmt_name_error` — a NameError carrying the undefined name so
+    /// `e.name` reads back once the instance is materialised (Python 3.10+);
+    /// `pyopcode.py _load_global_failed` passes `w_varname` the same way.
+    pub fn oefmt_name_error(msg: impl Into<Wtf8Buf>, w_name: pyre_object::PyObjectRef) -> Self {
         let mut err = Self::new(PyErrorKind::NameError, msg);
         err.w_name_context = w_name;
         err
@@ -1595,12 +1593,12 @@ impl PyError {
     /// A failed `from X import Y` (pyopcode.py import_from) raises through
     /// this so `.name` (the package) and `.path` (its file) are readable,
     /// which `PyError::new(ImportError, msg)` cannot carry.
-    pub fn import_error_name_path(
+    pub fn new_import_error(
         msg: impl Into<Wtf8Buf>,
         w_name: PyObjectRef,
         w_path: PyObjectRef,
     ) -> Self {
-        Self::import_error_name_path_from(msg, w_name, w_path, pyre_object::PY_NULL)
+        Self::new_import_error_name_from(msg, w_name, w_path, pyre_object::PY_NULL)
     }
 
     /// `_PyErr_SetImportErrorWithNameFrom` — the same error carrying the name
@@ -1608,7 +1606,7 @@ impl PyError {
     /// `TracebackException.__init__` gates its spelling
     /// suggestion on `.name_from` being other than `None`, so only a raise that
     /// stamps it can offer one.
-    pub fn import_error_name_path_from(
+    pub fn new_import_error_name_from(
         msg: impl Into<Wtf8Buf>,
         w_name: PyObjectRef,
         w_path: PyObjectRef,

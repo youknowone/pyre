@@ -466,7 +466,7 @@ fn frozen_name(
 /// `set_frozen_error` — both frozen diagnostics carry the module name as
 /// `.name` with no `.path`, and render it the way `%R` does.
 fn frozen_error(message: String, name: &Wtf8) -> crate::PyError {
-    crate::PyError::import_error_name_path(
+    crate::PyError::new_import_error(
         message,
         pyre_object::w_str_from_wtf8_managed(name.to_owned()),
         pyre_object::w_none(),

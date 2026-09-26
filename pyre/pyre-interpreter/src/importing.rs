@@ -7703,7 +7703,7 @@ fn import_from_slow(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crat
     let w_pkgname = pyre_object::gc_roots::shadow_stack_get(pkgname_slot);
     let w_pkgpath = pyre_object::gc_roots::shadow_stack_get(pkgpath_slot);
     let w_name_from = pyre_object::gc_roots::shadow_stack_get(name_from_slot);
-    Err(crate::PyError::import_error_name_path_from(
+    Err(crate::PyError::new_import_error_name_from(
         msg,
         w_pkgname,
         w_pkgpath,

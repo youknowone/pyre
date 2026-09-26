@@ -251,9 +251,9 @@ two-phase-never-a-subject	pyre_interpreter::error::<Impl>::errno_pair
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::key_error_with_key
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::message_text
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::message_wtf8
-two-phase-never-a-subject	pyre_interpreter::error::<Impl>::name_error_with_name
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::new
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::normalize_exception
+two-phase-never-a-subject	pyre_interpreter::error::<Impl>::oefmt_name_error_text
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::os_error_syscall
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::os_error_syscall2
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::os_error_with_errno
