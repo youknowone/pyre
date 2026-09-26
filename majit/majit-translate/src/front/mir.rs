@@ -27784,7 +27784,7 @@ fn peel_hashcons_value<'a>(
     llbc: &'a Llbc,
     mut value: &'a serde_json::Value,
 ) -> &'a serde_json::Value {
-    for _ in 0..8 {
+    loop {
         let Some(obj) = value.as_object() else {
             break;
         };
