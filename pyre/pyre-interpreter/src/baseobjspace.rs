@@ -11688,7 +11688,11 @@ pub unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<Py
 pub unsafe fn getfulltypename(w_obj: PyObjectRef) -> Wtf8Buf {
     match crate::typedef::r#type(w_obj) {
         Some(w_type) => getfulltypename_of_type(w_type.as_ptr()),
-        None => Wtf8Buf::from("object"),
+        None => {
+            let mut out = Wtf8Buf::new();
+            out.push_str("object");
+            out
+        }
     }
 }
 
@@ -11718,7 +11722,9 @@ pub unsafe fn type_owner_is_in_dict(w_type: PyObjectRef) -> bool {
 /// `w_type` must be a valid `W_TypeObject`.
 pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> Wtf8Buf {
     if !unsafe { type_owner_is_in_dict(w_type) } {
-        return Wtf8Buf::from(w_type_get_name(w_type));
+        let mut out = Wtf8Buf::new();
+        out.push_str(w_type_get_name(w_type));
+        return out;
     }
     let qualname = pyre_object::w_type_get_qualname(w_type);
     // `w_type.lookup("__module__")` prepends a string module name; a
@@ -11733,7 +11739,11 @@ pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> Wtf8Buf {
             out.push_str(qualname);
             out
         }
-        _ => Wtf8Buf::from(qualname),
+        _ => {
+            let mut out = Wtf8Buf::new();
+            out.push_str(qualname);
+            out
+        }
     }
 }
 
@@ -11747,7 +11757,9 @@ pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> Wtf8Buf {
 pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> Wtf8Buf {
     let name = w_type_get_name(w_type);
     if !unsafe { type_owner_is_in_dict(w_type) } {
-        return Wtf8Buf::from(name);
+        let mut out = Wtf8Buf::new();
+        out.push_str(name);
+        return out;
     }
     // `descr_repr` reads the module string. A lone surrogate has a WTF-8
     // spelling (`text_w`) and is part of `<class '…'>`.
@@ -11763,9 +11775,15 @@ pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> Wtf8Buf {
                 out.push_str(qualname);
                 return out;
             }
-            Wtf8Buf::from(name)
+            let mut out = Wtf8Buf::new();
+            out.push_str(name);
+            out
         }
-        _ => Wtf8Buf::from(name),
+        _ => {
+            let mut out = Wtf8Buf::new();
+            out.push_str(name);
+            out
+        }
     }
 }
 
@@ -13396,7 +13414,8 @@ pub(crate) unsafe fn member_typecheck_error(
 /// `getfulltypename` result while keeping eager message construction behind
 /// the same rejected-access boundary as upstream's `oefmt`.
 unsafe fn member_missing_error(obj: PyObjectRef, slot_name: &str) -> crate::PyError {
-    let mut msg = Wtf8Buf::from("'");
+    let mut msg = Wtf8Buf::new();
+    msg.push_str("'");
     msg.push_wtf8(&getfulltypename(obj));
     msg.push_str("' object has no attribute '");
     msg.push_str(slot_name);

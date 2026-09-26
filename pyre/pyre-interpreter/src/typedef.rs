@@ -20,7 +20,7 @@ use pyre_object::rutf8::{
     invalid_byte_2_of_3, invalid_byte_2_of_4, invalid_cont_byte, surrogate_bytes,
 };
 use pyre_object::*;
-use rustpython_wtf8::{CodePoint, Wtf8Buf};
+use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
 use crate::{make_builtin_function, make_builtin_function_with_arity};
 
@@ -12038,15 +12038,22 @@ fn getset_missing_accessor(
     verb: &str,
 ) -> crate::PyError {
     let name_obj = read_descr_name(descr);
+    // `typedef.py` `GetSetProperty` `oefmt(... "%s" ..., self.name)` prints the
+    // raw name, so a lone surrogate stays in the message.
     let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
-        unsafe { pyre_object::w_str_get_value_opt(name_obj) }.unwrap_or("?")
+        unsafe { pyre_object::w_str_get_wtf8(name_obj) }
     } else {
-        "?"
+        Wtf8::new("?")
     };
     let owner_name = unsafe { pyre_object::w_type_get_name(owner) };
-    crate::PyError::attribute_error(format!(
-        "attribute '{name}' of '{owner_name}' objects is not {verb}"
-    ))
+    let mut msg = Wtf8Buf::new();
+    msg.push_str("attribute '");
+    msg.push_wtf8(name);
+    msg.push_str("' of '");
+    msg.push_str(owner_name);
+    msg.push_str("' objects is not ");
+    msg.push_str(verb);
+    crate::PyError::attribute_error(msg)
 }
 
 /// Either refusal above, chosen by whether the descriptor names an owner.
@@ -33833,20 +33840,28 @@ fn getset_descr_mismatch(
     reqcls: pyre_object::PyObjectRef,
 ) -> crate::PyError {
     let name_obj = read_descr_name(descr);
+    // `typedef.py` `GetSetProperty` `oefmt(... "%s" ..., self.name)` prints the
+    // raw name, so a lone surrogate stays in the message.
     let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
-        unsafe { pyre_object::w_str_get_value_opt(name_obj) }.unwrap_or("<generic property>")
+        unsafe { pyre_object::w_str_get_wtf8(name_obj) }
     } else {
-        "<generic property>"
+        Wtf8::new("<generic property>")
     };
     let owner = if reqcls.is_null() {
         "?"
     } else {
         unsafe { pyre_object::w_type_get_name(reqcls) }
     };
-    crate::PyError::type_error(format!(
-        "descriptor '{name}' for '{owner}' objects doesn't apply to a '{}' object",
-        type_name_of(obj)
-    ))
+    let obj_type = type_name_of(obj);
+    let mut msg = Wtf8Buf::new();
+    msg.push_str("descriptor '");
+    msg.push_wtf8(name);
+    msg.push_str("' for '");
+    msg.push_str(owner);
+    msg.push_str("' objects doesn't apply to a '");
+    msg.push_str(&obj_type);
+    msg.push_str("' object");
+    crate::PyError::type_error(msg)
 }
 
 /// typedef.py GetSetProperty.copy_for_type.
