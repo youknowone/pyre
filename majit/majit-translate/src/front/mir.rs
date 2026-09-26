@@ -38949,7 +38949,7 @@ mod tests {
         assert!(ctors.iter().any(|name| name == "Break"), "{ctors:?}");
     }
 
-    fn result_flow_llbc(ok_ty: serde_json::Value, err_ty: serde_json::Value) -> Llbc {
+    fn result_flow_llbc() -> Llbc {
         let span = serde_json::json!({"data": {
             "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
         }});
@@ -38962,14 +38962,14 @@ mod tests {
                 "is_local": false
             })
         };
-        let enum_decl = |def_id: u64, path: &[&str], variants: &[(&str, u64)]| {
+        let enum_decl = |def_id: u64, path: &[&str], variants: &[(&str, u64, u64)]| {
             serde_json::json!({
                 "def_id": def_id,
                 "item_meta": meta(path),
-                "kind": {"Enum": variants.iter().map(|(name, index)| serde_json::json!({
+                "kind": {"Enum": variants.iter().map(|(name, disc, tvar)| serde_json::json!({
                     "name": name,
-                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, index]}}}],
-                    "discriminant": {"Scalar": {"Signed": ["Isize", index.to_string()]}}
+                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, tvar]}}}],
+                    "discriminant": {"Scalar": {"Signed": ["Isize", disc.to_string()]}}
                 })).collect::<Vec<_>>()},
                 "layout": []
             })
@@ -38980,8 +38980,10 @@ mod tests {
             "translated": {
                 "crate_name": "fixture",
                 "type_decls": [
-                    enum_decl(0, &["core", "result", "Result"], &[("Ok", 0), ("Err", 1)]),
-                    enum_decl(1, &["core", "ops", "control_flow", "ControlFlow"], &[("Break", 0), ("Continue", 1)]),
+                    enum_decl(0, &["core", "result", "Result"], &[("Ok", 0, 0), ("Err", 1, 1)]),
+                    // `ControlFlow<B, C>`: Continue(C) is variant 0 (type var 1),
+                    // Break(B) is variant 1 (type var 0).
+                    enum_decl(1, &["core", "ops", "control_flow", "ControlFlow"], &[("Continue", 0, 1), ("Break", 1, 0)]),
                 ],
                 "fun_decls": [],
                 "global_decls": [],
@@ -38989,7 +38991,6 @@ mod tests {
                 "trait_impls": []
             }
         });
-        let _ = (ok_ty, err_ty);
         Llbc::from_slice(file.to_string().as_bytes()).expect("result/controlflow llbc")
     }
 
@@ -39049,10 +39050,11 @@ mod tests {
     #[test]
     fn result_branch_match_uses_int_payloads_from_the_type_decls() {
         let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
-        let llbc = result_flow_llbc(i64_ty.clone(), i64_ty.clone());
-        let result_ty = branch_adt_ty(0, &[i64_ty.clone(), i64_ty.clone()]);
-        // ControlFlow<B, C>: field 0 is Break, field 1 is Continue.
-        let flow_ty = branch_adt_ty(1, &[i64_ty.clone(), i64_ty]);
+        let u8_ty = serde_json::json!({"Literal": {"UInt": "U8"}});
+        let llbc = result_flow_llbc();
+        let result_ty = branch_adt_ty(0, &[i64_ty.clone(), u8_ty.clone()]);
+        // ControlFlow<B, C = U8, I64>: Break is B, Continue is C.
+        let flow_ty = branch_adt_ty(1, &[u8_ty, i64_ty]);
         let tombstoned = std::collections::HashSet::new();
         let payloads = crate::model::ResultBranchPayloads {
             ok: super::adt_variant_payload_type(&result_ty, "Ok", &llbc, &tombstoned),
@@ -39061,20 +39063,20 @@ mod tests {
             break_ty: super::adt_variant_payload_type(&flow_ty, "Break", &llbc, &tombstoned),
         };
         assert_eq!(payloads.ok, Some(ValueType::Int));
-        assert_eq!(payloads.err, Some(ValueType::Int));
+        assert_eq!(payloads.err, Some(ValueType::Unsigned));
         assert_eq!(payloads.continue_ty, Some(ValueType::Int));
-        assert_eq!(payloads.break_ty, Some(ValueType::Int));
+        assert_eq!(payloads.break_ty, Some(ValueType::Unsigned));
         let mut graph = branch_graph(payloads);
         super::lower_result_branch_to_control_flow(&mut graph);
         let (reads, writes) = payload_field_tys(&graph);
-        assert_eq!(reads, vec![ValueType::Int, ValueType::Int]);
-        assert_eq!(writes, vec![ValueType::Int, ValueType::Int]);
+        assert_eq!(reads, vec![ValueType::Int, ValueType::Unsigned]);
+        assert_eq!(writes, vec![ValueType::Int, ValueType::Unsigned]);
     }
 
     #[test]
     fn result_branch_break_of_infallible_result_builds_err() {
         let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
-        let llbc = result_flow_llbc(i64_ty.clone(), i64_ty.clone());
+        let llbc = result_flow_llbc();
         let infallible = serde_json::json!({
             "Adt": {"id": {"Adt": 99}, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}
         });
@@ -39130,7 +39132,7 @@ mod tests {
     #[test]
     fn result_branch_match_emits_nothing_for_void_payloads() {
         let unit = serde_json::json!({"Adt": {"id": "Tuple", "generics": {"types": []}}});
-        let llbc = result_flow_llbc(unit.clone(), unit.clone());
+        let llbc = result_flow_llbc();
         let result_ty = branch_adt_ty(0, &[unit.clone(), unit.clone()]);
         let flow_ty = branch_adt_ty(1, &[unit.clone(), unit]);
         let tombstoned = std::collections::HashSet::new();
