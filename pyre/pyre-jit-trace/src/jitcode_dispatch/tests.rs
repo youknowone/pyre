@@ -4134,48 +4134,6 @@ fn sub_jitcode_body_by_index_builds_w_list_append() {
     assert!(super::sub_jitcode_body_by_index(usize::MAX).is_none());
 }
 
-/// Jitcode index named by each `inline_call*` op's `d` descr. An op whose
-/// descr does not resolve to a jitcode fails here rather than being skipped.
-fn inline_call_jitcode_targets(code: &[u8]) -> Vec<usize> {
-    let zeros = [0i64; 256];
-    let regs = crate::jitcode_runtime::RegisterFileView {
-        registers_i: &zeros,
-        registers_r: &zeros,
-        registers_f: &zeros,
-    };
-    let descrs = crate::jitcode_runtime::descr_ref_table();
-    let mut targets = Vec::new();
-    for op in crate::jitcode_runtime::decoded_ops(code) {
-        if !op.opname.starts_with("inline_call") {
-            continue;
-        }
-        let resolved = crate::jitcode_runtime::resolve_op_at(code, op.pc, regs);
-        let slot = resolved.as_ref().and_then(|resolved| {
-            resolved.operands.iter().find_map(|operand| match operand {
-                crate::jitcode_runtime::ResolvedOperand::DescrIdx {
-                    index,
-                    is_jitcode: false,
-                } => Some(*index as usize),
-                _ => None,
-            })
-        });
-        let index = slot.and_then(|slot| {
-            descrs
-                .at(slot)
-                .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
-        });
-        assert!(
-            index.is_some(),
-            "{} at pc {} must resolve its d descr to a jitcode; argcodes={}",
-            op.opname,
-            op.pc,
-            op.argcodes
-        );
-        targets.push(index.unwrap());
-    }
-    targets
-}
-
 #[test]
 fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
     // intobject.py `_truediv` + `space.newfloat`: the `/` descent walks
@@ -4208,11 +4166,9 @@ fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
         truediv_ops.iter().any(|op| *op == "new_with_vtable"),
         "_truediv must box via in-graph new_with_vtable; ops={truediv_ops:?}"
     );
-    // An inline_call of the error-arm constructor is allowed; only one targeting newfloat is forbidden.
-    let inline_targets = inline_call_jitcode_targets(&truediv.code);
     assert!(
-        !inline_targets.contains(&newfloat.index()),
-        "_truediv must not inline_call newfloat; ops={truediv_ops:?}; inline_call targets={inline_targets:?}"
+        !truediv_ops.iter().any(|op| op.starts_with("inline_call")),
+        "_truediv must not inline_call newfloat; ops={truediv_ops:?}"
     );
     assert!(
         newfloat_ops.iter().any(|op| *op == "new_with_vtable"),
@@ -4477,10 +4433,6 @@ fn newutf8_and_int_descr_str_jitcodes_are_the_pypy_leaf() {
 fn float_binop_leaves_are_the_pypy_leaf() {
     // floatobject.py `descr_add` after `_to_float`: `W_FloatObject(x + y)`.
     // The descent walks `_float_add`, which must contain the fused New.
-    let newfloat_index =
-        crate::jitcode_runtime::pathed_jitcode("pyre_object::floatobject::newfloat")
-            .expect("newfloat must be a discovered jitcode")
-            .index();
     for (path, arith) in [
         (
             "pyre_interpreter::objspace::descroperation::_float_add",
@@ -4512,11 +4464,9 @@ fn float_binop_leaves_are_the_pypy_leaf() {
             ops.iter().any(|op| *op == "new_with_vtable"),
             "{path} must box via in-graph new_with_vtable; ops={ops:?}"
         );
-        // An inline_call of the error-arm constructor is allowed; only one targeting newfloat is forbidden.
-        let inline_targets = inline_call_jitcode_targets(&jc.code);
         assert!(
-            !inline_targets.contains(&newfloat_index),
-            "{path} must not inline_call newfloat; ops={ops:?}; inline_call targets={inline_targets:?}"
+            !ops.iter().any(|op| op.starts_with("inline_call")),
+            "{path} must not inline_call newfloat; ops={ops:?}"
         );
         assert!(
             !ops.iter().any(|op| op.starts_with("residual_call_irf")),

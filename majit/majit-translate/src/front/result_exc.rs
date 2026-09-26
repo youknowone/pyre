@@ -4494,7 +4494,8 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
         if n < 2 || segments[n - 2] != "PyError" {
             continue;
         }
-        let Some((_, helper)) = FUSED_KIND_CTORS.iter().find(|(c, _)| *c == segments[n - 1]) else {
+        let ctor = crate::front::clause_spec::unspecialized_leaf(&segments[n - 1]);
+        let Some((_, helper)) = FUSED_KIND_CTORS.iter().find(|(c, _)| *c == ctor) else {
             continue;
         };
         let [v_msg] = args.as_slice() else {
