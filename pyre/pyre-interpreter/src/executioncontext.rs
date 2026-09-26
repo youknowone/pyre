@@ -475,6 +475,10 @@ pub(crate) fn walk_space_user_del_action_roots(visitor: &mut dyn FnMut(&mut maji
 /// the lifeline itself, while instance/generator/PickleBuffer construction
 /// registers its own object. The collector additionally keeps its duplicate
 /// guard as a fail-safe for repeated construction hooks.
+// `rgc.py FinalizerQueue.register_finalizer` carries `@jit.dont_look_inside`.
+// Its collector hook is runtime state, so the translated trace keeps one
+// residual call, as for [`may_ignore_finalizer`].
+#[majit_macros::dont_look_inside]
 pub fn register_finalizer(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
 }
@@ -1396,11 +1400,14 @@ impl ExecutionContext {
 
     /// Consume a failed-attribute finalization request after the live red
     /// frame has cleared its own dispatch flag.  This boundary has no live
-    /// opcode temporaries outside the published PyFrame roots.
+    /// opcode temporaries outside the published PyFrame roots, so a moving
+    /// collection is admissible.  Nursery-born `hasuserdel` instances are
+    /// invisible to `try_gc_collect_oldgen`; `incminimark.collect(2)` is
+    /// the same full pass `gc.collect` uses to discover them.
     pub fn run_failed_attr_finalizers(&self) {
         let action = space_user_del_action();
         if !action.is_null() {
-            pyre_object::gc_hook::try_gc_collect_oldgen();
+            pyre_object::gc_hook::try_gc_collect(2);
             unsafe { (*action)._run_finalizers() };
         }
     }
@@ -1433,19 +1440,23 @@ impl ExecutionContext {
         if frame.is_null() {
             return Ok(());
         }
-        let last_instr = unsafe { (*frame).last_instr };
+        // Reached only with a tracer installed, so the anchor is already on the
+        // slow path.  `getorcreatedebug` allocates a nursery `FrameDebugData`
+        // and the events below run Python, so take it before either.
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+        let last_instr = unsafe { (*anchor.live()).last_instr };
         // `frame.pycode._get_lineno_for_pc_tracing(frame.last_instr)`, not
         // `get_last_lineno`: the two differ on exactly the instructions that
         // carry a line but may not start one, and `-1` is what both guards
         // below are written against.
-        let lineno = unsafe { (*frame).get_lineno_for_pc_tracing() };
+        let lineno = unsafe { (*anchor.live()).get_lineno_for_pc_tracing() };
         let (want_line, want_opcode) = unsafe {
             // `getorcreatedebug()` with no argument: reached only through
             // `bytecode_only_trace`, which returns early unless
             // `get_w_f_trace()` is non-null, so the debug block already exists
             // and the seed is dead.  Passing `lineno` here would seed
             // `f_lineno` with the line whose novelty decides the event.
-            let d = (*frame).getorcreatedebug(-1);
+            let d = (*anchor.live()).getorcreatedebug(-1);
             let lastline = d.f_lineno;
             // Persistent, so the next invocation compares against this line —
             // but only for an instruction that names one, or a `RESUME` would
@@ -1459,12 +1470,8 @@ impl ExecutionContext {
             let want_opcode = d.f_trace_opcodes;
             (want_line, want_opcode)
         };
-        // Reached only with a tracer installed, so the anchor is already on the
-        // slow path; both events run Python and the sentinel write below is a
-        // store into the frame's debug block.
-        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
         if want_line {
-            self._trace(frame, "line", pyre_object::w_none(), None)?;
+            self._trace(anchor.live(), "line", pyre_object::w_none(), None)?;
         }
         if want_opcode {
             self._trace(anchor.live(), "opcode", pyre_object::w_none(), None)?;
@@ -1799,6 +1806,14 @@ impl ExecutionContext {
         };
 
         if !w_callback.is_null() && event != "leaveframe" {
+            // The callback is a nursery function; `normalize_exception`,
+            // `getorcreatedebug`, and `fast2locals` all allocate before it is
+            // pinned for the call below.  Hold it (and `w_arg`) across those.
+            let _callback_roots = pyre_object::gc_roots::push_roots();
+            let callback_live_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_callback);
+            let arg_live_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_arg);
             // `executioncontext.py _trace` exception-event branch:
             //   if operr is not None:
             //       w_value = operr.normalize_exception(space)
@@ -1824,8 +1839,10 @@ impl ExecutionContext {
                 fields.push(w_traceback);
                 pyre_object::tupleobject::w_tuple_new(fields.take())
             } else {
-                w_arg
+                pyre_object::gc_roots::shadow_stack_get(arg_live_slot)
             };
+            let _ = pyre_object::gc_roots::pin_root(w_arg);
+            let arg_live_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
             let frame = frame_anchor.live();
             let lineno = unsafe { (*frame).get_last_lineno() };
@@ -1864,13 +1881,17 @@ impl ExecutionContext {
                 // executioncontext.py:382-385 space.call_function(w_callback, frame, w_event, w_arg)
                 let _trace_roots = pyre_object::gc_roots::push_roots();
                 let callback_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_callback);
+                let _ = pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(
+                    callback_live_slot,
+                ));
                 let frame_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(wrap_trace_frame(frame));
+                let _ = pyre_object::gc_roots::pin_root(wrap_trace_frame(frame_anchor.live()));
                 let event_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(event));
                 let arg_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_arg);
+                let _ = pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(
+                    arg_live_slot,
+                ));
                 let call_result = crate::call::call_function_impl_result(
                     pyre_object::gc_roots::shadow_stack_get(callback_slot),
                     &[
@@ -1883,7 +1904,10 @@ impl ExecutionContext {
                 // `frame.f_trace = local` / `frame.f_lineno = N` setattrs
                 // already landed on the frame's getsets — no writeback pass.
                 let w_result = call_result?;
+                let result_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(w_result);
                 let frame = frame_anchor.live();
+                let w_result = pyre_object::gc_roots::shadow_stack_get(result_slot);
                 if w_result != pyre_object::w_none() {
                     unsafe {
                         (*frame).getorcreatedebug(init_lineno).w_f_trace = w_result;
@@ -3223,6 +3247,10 @@ impl UserDelAction {
             }
             return;
         }
+        if unsafe { pyre_object::memoryview::is_w_memoryview(current()) } {
+            unsafe { crate::builtins::memoryview_finalize(current()) };
+            return;
+        }
         if let Some(hooks) = crate::importing::optional_module_hooks()
             && let Some(calls_python) = (hooks.cffi_finalizer_kind)(current())
         {
@@ -3273,13 +3301,15 @@ impl UserDelAction {
                 report_error(self.base.space, &error, &where_desc, pyre_object::w_none());
                 crate::eval::set_in_flight_exception(pyre_object::PY_NULL);
             }
-            // pyframe.py:75-76/276-279 stores this back-reference as
-            // `f_generator_wref` in translated PyPy.  The collector has
-            // already declared `current()` dead, so clear pyre's raw
-            // representation before the finalizer queue releases its last
-            // temporary root.  Explicit `frame.clear()` also calls
-            // `generator_finalize`, but must retain this association while
-            // its still-live generator owns the frame.
+            // `f_generator_nowref` (`initialize_as_generator` /
+            // `get_generator`) is a strong edge. The walkers forward the
+            // slot, so this comparison sees the updated address rather
+            // than the pre-collection pointer. The collector has already
+            // declared `current()` dead; clear the edge before the
+            // finalizer queue releases its last temporary root. Explicit
+            // `frame.clear()` also calls `generator_finalize`, but must
+            // retain this association while its still-live generator owns
+            // the frame.
             let frame =
                 unsafe { pyre_object::generator::w_generator_get_frame(current()) } as *mut PyFrame;
             if !frame.is_null() && unsafe { (*frame).f_generator_nowref == current() } {
@@ -3290,8 +3320,14 @@ impl UserDelAction {
         let Some(w_type) = crate::typedef::r#type(current()) else {
             return;
         };
-        let Some(w_del) =
-            (unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__del__") })
+        // A heap type is born old and does not move
+        // (`try_gc_alloc_stable_raw`), but `lookup_in_type` /
+        // `begin_finalizer` / the `__del__` call all collect, so the type sits
+        // on the same shadow stack as the receiver rather than in a raw local.
+        let _ = pyre_object::gc_roots::pin_root(w_type.as_ptr());
+        let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_type = || pyre_object::gc_roots::shadow_stack_get(type_slot);
+        let Some(w_del) = (unsafe { crate::baseobjspace::lookup_in_type(w_type(), "__del__") })
         else {
             return;
         };
@@ -3306,9 +3342,9 @@ impl UserDelAction {
         let del = || pyre_object::gc_roots::shadow_stack_get(del_slot);
         // pyre's combined helper cannot distinguish get-vs-call errors;
         // report through the call arm (executioncontext.py:680-690).
-        if let Err(error) = unsafe {
-            crate::baseobjspace::get_and_call_function(del(), current(), w_type.as_ptr(), &[])
-        } {
+        if let Err(error) =
+            unsafe { crate::baseobjspace::get_and_call_function(del(), current(), w_type(), &[]) }
+        {
             // PyPy executioncontext.py:680-690 passes an empty `where` and
             // the `__del__` descriptor to `write_unraisable`.  Python 3.14's
             // `_PyErr_FormatUnraisable` gives this finalizer case a more
@@ -3336,7 +3372,15 @@ impl AsyncActionOps for UserDelAction {
     ) -> Result<AsyncActionControl, crate::PyError> {
         if self.collect_oldgen_before_run {
             self.collect_oldgen_before_run = false;
-            pyre_object::gc_hook::try_gc_collect_oldgen();
+            // `f().cr_frame` schedules this for the next opcode, after
+            // LOAD_ATTR has popped the temporary coroutine. That coroutine is
+            // nursery-born and registered only as a young finalizer, so the
+            // oldgen-only major never sees it and the "never awaited" warning
+            // waits for a later collection. Generation 2 is the full pass:
+            // the minor promotes the young finalizer, and the major queues it
+            // once nothing else reaches it. This is the same opcode-boundary
+            // collection `run_failed_attr_finalizers` already runs.
+            pyre_object::gc_hook::try_gc_collect(2);
         }
         self._run_finalizers();
         Ok(AsyncActionControl::Continue)

@@ -133,11 +133,14 @@ fn primitive_cache() -> &'static Mutex<HashMap<&'static str, usize>> {
 }
 
 /// `UniqueCache.ctvoid`.
-static VOID_TYPE: OnceLock<usize> = OnceLock::new();
+static VOID_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 /// `UniqueCache.ctvoidp`.
-static VOID_POINTER_TYPE: OnceLock<usize> = OnceLock::new();
+static VOID_POINTER_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 /// `UniqueCache.ctchara`.
-static CHAR_ARRAY_TYPE: OnceLock<usize> = OnceLock::new();
+static CHAR_ARRAY_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `newtype.py _new_primitive_type`.
 pub fn new_primitive_type(name: &str) -> Result<PyObjectRef, PyError> {
@@ -216,7 +219,7 @@ fn wchar_is_signed() -> bool {
 
 /// `newtype.py new_void_type`.
 pub fn new_void_type() -> PyObjectRef {
-    *VOID_TYPE.get_or_init(|| {
+    VOID_TYPE.get_or_init(|| {
         let obj = ctypeobj::new_ctype(
             ctypeobj::KIND_VOID,
             -1,
@@ -227,31 +230,28 @@ pub fn new_void_type() -> PyObjectRef {
             -1,
             0,
         );
-        ctypeobj::root_forever(obj);
-        obj as usize
-    }) as PyObjectRef
+        obj
+    })
 }
 
 /// `newtype.py _new_voidp_type`.
 pub fn new_voidp_type() -> Result<PyObjectRef, PyError> {
-    if let Some(&cached) = VOID_POINTER_TYPE.get() {
-        return Ok(cached as PyObjectRef);
+    if let Some(cached) = VOID_POINTER_TYPE.get() {
+        return Ok(cached);
     }
     let obj = new_pointer_type(new_void_type())?;
-    ctypeobj::root_forever(obj);
-    Ok(*VOID_POINTER_TYPE.get_or_init(|| obj as usize) as PyObjectRef)
+    Ok(VOID_POINTER_TYPE.get_or_init(|| obj))
 }
 
 /// `newtype.py _new_chara_type`.
 pub fn new_chara_type() -> Result<PyObjectRef, PyError> {
-    if let Some(&cached) = CHAR_ARRAY_TYPE.get() {
-        return Ok(cached as PyObjectRef);
+    if let Some(cached) = CHAR_ARRAY_TYPE.get() {
+        return Ok(cached);
     }
     let w_char = new_primitive_type("char")?;
     let w_charp = new_pointer_type(w_char)?;
     let obj = new_array_type(w_charp, -1)?;
-    ctypeobj::root_forever(obj);
-    Ok(*CHAR_ARRAY_TYPE.get_or_init(|| obj as usize) as PyObjectRef)
+    Ok(CHAR_ARRAY_TYPE.get_or_init(|| obj))
 }
 
 /// `newtype.py _new_pointer_type` — `W_CType._pointer_type`'s memo, which
@@ -469,16 +469,17 @@ fn complete_sflags(mut sflags: i64) -> i64 {
 /// not ported yet, so the class lives here until it has an owner to publish
 /// it from; it is the object identity that matters, and there is one.
 pub fn ffi_error() -> PyObjectRef {
-    static FFI_ERROR: OnceLock<usize> = OnceLock::new();
-    *FFI_ERROR.get_or_init(|| {
+    static FFI_ERROR: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    FFI_ERROR.get_or_init(|| {
         let w_exception = pyre_interpreter::builtins::lookup_exc_class("Exception")
             .expect("Exception must be installed before _cffi_backend init");
         pyre_interpreter::builtins::make_exc_type(
             "ffi.error",
             pyre_interpreter::builtins::exc_exception_new,
             w_exception,
-        ) as usize
-    }) as PyObjectRef
+        )
+    })
 }
 
 /// `newtype.py new_struct_type`.

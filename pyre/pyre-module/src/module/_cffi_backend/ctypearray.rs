@@ -44,11 +44,12 @@ pub fn new_cdata_iter(w_cdata: PyObjectRef) -> Result<PyObjectRef, PyError> {
     }))
 }
 
-static CDATA_ITER_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static CDATA_ITER_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `_cffi_backend.__CData_iterator`.
 pub fn cdata_iter_type() -> PyObjectRef {
-    *CDATA_ITER_TYPE_OBJ.get_or_init(|| {
+    CDATA_ITER_TYPE_OBJ.get_or_init(|| {
         let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend.__CData_iterator",
             init_cdata_iter_type,
@@ -59,8 +60,8 @@ pub fn cdata_iter_type() -> PyObjectRef {
             unsafe { &*<W_CDataIter as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,
         );
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn init_cdata_iter_type(ns: PyObjectRef) {

@@ -1954,9 +1954,21 @@ fn wtf8_idx_window(
     obj: PyObjectRef,
     args: &[PyObjectRef],
 ) -> Result<Option<(usize, usize)>, crate::PyError> {
-    let cp_len = unsafe { pyre_object::w_str_len(obj) } as i64;
-    let w_start = if args.len() >= 3 { args[2] } else { w_none() };
-    let w_end = if args.len() >= 4 { args[3] } else { w_none() };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+    let args_base = pyre_object::gc_roots::pin_roots(args);
+    let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let cp_len = unsafe { pyre_object::w_str_len(obj()) } as i64;
+    let w_start = if args.len() >= 3 {
+        pyre_object::gc_roots::shadow_stack_get(args_base + 2)
+    } else {
+        w_none()
+    };
+    let w_end = if args.len() >= 4 {
+        pyre_object::gc_roots::shadow_stack_get(args_base + 3)
+    } else {
+        w_none()
+    };
     let (start, end) = crate::sliceobject::unwrap_start_stop(cp_len, w_start, w_end)?;
     if start > cp_len {
         return Ok(None);
@@ -1965,6 +1977,7 @@ fn wtf8_idx_window(
     if start > end {
         return Ok(None);
     }
+    let obj = obj();
     let byte_start = unsafe { pyre_object::w_str_index_to_byte(obj, start as usize) };
     let byte_end = unsafe { pyre_object::w_str_index_to_byte(obj, end as usize) };
     Ok(Some((byte_start, byte_end)))
@@ -5850,16 +5863,27 @@ fn str_unwrap_and_search(
     args: &[PyObjectRef],
     forward: bool,
 ) -> Result<Option<i64>, crate::PyError> {
-    let obj = args[0];
-    let length = unsafe { pyre_object::w_str_len(obj) } as i64;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let obj = || pyre_object::gc_roots::shadow_stack_get(base);
+    let length = unsafe { pyre_object::w_str_len(obj()) } as i64;
 
-    let w_start = if args.len() >= 3 { args[2] } else { w_none() };
-    let w_end = if args.len() >= 4 { args[3] } else { w_none() };
+    let w_start = if args.len() >= 3 {
+        pyre_object::gc_roots::shadow_stack_get(base + 2)
+    } else {
+        w_none()
+    };
+    let w_end = if args.len() >= 4 {
+        pyre_object::gc_roots::shadow_stack_get(base + 3)
+    } else {
+        w_none()
+    };
     let (start, end) = crate::sliceobject::unwrap_start_stop(length, w_start, w_end)?;
 
     // `_search` (`unicodeobject.py:1290`): the two code point bounds become
     // byte offsets through `_index_to_byte`, and the byte offset the search
     // lands on comes back through `_byte_to_index`.
+    let obj = obj();
     let start_index = if start == 0 {
         0
     } else if start > length {
@@ -5881,7 +5905,15 @@ fn str_unwrap_and_search(
     } else {
         SearchMode::RFind
     };
-    let res = unsafe { search_elidable(obj, args[1], start_index, end_index, mode) };
+    let res = unsafe {
+        search_elidable(
+            obj,
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            start_index,
+            end_index,
+            mode,
+        )
+    };
     Ok(if res < 0 {
         None
     } else {
@@ -5896,14 +5928,24 @@ pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     require_str_sub(args, "count")?;
     // Operands read as WTF-8 so lone surrogates do not panic; the optional
     // start / end arguments bound the count window over the code points.
-    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-    let sub = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
-    let Some((byte_start, byte_end)) = wtf8_idx_window(args[0], args)? else {
+    // Bound conversion runs `__index__` and can collect, so copy the
+    // payloads after the window is known rather than holding interior
+    // `&str` views across that allocation.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let Some((byte_start, byte_end)) =
+        wtf8_idx_window(pyre_object::gc_roots::shadow_stack_get(base), args)?
+    else {
         return Ok(w_int_new(0));
     };
+    let s = unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base)) }
+        .to_wtf8_buf();
+    let sub =
+        unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 1)) }
+            .to_wtf8_buf();
     let window = rustpython_wtf8::Wtf8::from_bytes(&s.as_bytes()[byte_start..byte_end])
         .expect("code-point boundary slice is valid WTF-8");
-    Ok(w_int_new(wtf8_count(window, sub) as i64))
+    Ok(w_int_new(wtf8_count(window, &sub) as i64))
 }
 
 /// PyPy: unicodeobject.py descr_index
@@ -6878,11 +6920,10 @@ pub(crate) fn dict_store_checked(
 /// rooted across the hash and reloaded, matching the add path
 /// (`builtin_set_add_items`).
 ///
-/// The set is rooted too, but only pinned: an old-gen allocation keeps its
-/// address across a collection, so there is nothing to reload — what it needs
-/// is to stay reachable.  `CONTAINS_OP` pops the container off the operand
+/// The set is rooted too: `CONTAINS_OP` pops the container off the operand
 /// stack before dispatching here, so on `x in {...}` the hash below runs with
-/// nothing else referring to the set at all.
+/// nothing else referring to the set at all.  The body relocates, so the
+/// probe reloads it after `__hash__`.
 unsafe fn set_lookup_checked(
     set: PyObjectRef,
     item: PyObjectRef,
@@ -6893,7 +6934,6 @@ unsafe fn set_lookup_checked(
 ) -> Result<bool, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::pin_roots(&[item, set]);
-    let set = pyre_object::gc_roots::shadow_stack_get(sp + 1);
     let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(sp))
         .map_err(|err| {
             crate::baseobjspace::wrap_set_element_hash_error(
@@ -6905,7 +6945,8 @@ unsafe fn set_lookup_checked(
         pyre_object::gc_roots::shadow_stack_get(sp),
         hash,
     );
-    probe(set, key).map_err(|_| crate::baseobjspace::take_pending_hash_error())
+    probe(pyre_object::gc_roots::shadow_stack_get(sp + 1), key)
+        .map_err(|_| crate::baseobjspace::take_pending_hash_error())
 }
 
 /// Remove an element from a set, hashing it through the protocol.

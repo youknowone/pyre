@@ -484,9 +484,79 @@ pub(crate) fn divmod_projection_residual_path(segments: &[String]) -> Option<Vec
     )
 }
 
+/// `descroperation::bigint_divrem_returns_lhs_remainder(&RBigInt, &RBigInt)
+/// -> bool` is the host form of `rbigint._divrem`'s `(NULLRBIGINT, a)`
+/// early-return test that `long_mod` and `integer_divmod_pair` consult before
+/// reusing the dividend's payload. Retarget it to the elidable
+/// `jit_bigint_divrem_returns_lhs_remainder` so the two operands reach the
+/// residual as the GC references they are; the boolean result stays in the
+/// integer bank like the RBigInt comparisons.
+pub(crate) fn divrem_lhs_remainder_residual_path(segments: &[String]) -> Option<Vec<String>> {
+    if segments.last().map(String::as_str) != Some("bigint_divrem_returns_lhs_remainder") {
+        return None;
+    }
+    if !segments
+        .iter()
+        .rev()
+        .skip(1)
+        .take(2)
+        .eq(["descroperation", "objspace"])
+    {
+        return None;
+    }
+    Some(
+        [
+            crate::runtime_names::crates::INTERPRETER,
+            "objspace",
+            "descroperation",
+            "jit_bigint_divrem_returns_lhs_remainder",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_the_divrem_lhs_remainder_host_form_only_in_descroperation() {
+        assert_eq!(
+            divrem_lhs_remainder_residual_path(&segs(&[
+                "pyre_interpreter",
+                "objspace",
+                "descroperation",
+                "bigint_divrem_returns_lhs_remainder",
+            ])),
+            Some(segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "jit_bigint_divrem_returns_lhs_remainder",
+            ])),
+        );
+        // The residual itself and a same-named function elsewhere keep their
+        // own bodies.
+        assert_eq!(
+            divrem_lhs_remainder_residual_path(&segs(&[
+                "pyre_interpreter",
+                "objspace",
+                "descroperation",
+                "jit_bigint_divrem_returns_lhs_remainder",
+            ])),
+            None,
+        );
+        assert_eq!(
+            divrem_lhs_remainder_residual_path(&segs(&[
+                "pyre_object",
+                "longobject",
+                "bigint_divrem_returns_lhs_remainder",
+            ])),
+            None,
+        );
+    }
 
     fn segs(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| part.to_string()).collect()

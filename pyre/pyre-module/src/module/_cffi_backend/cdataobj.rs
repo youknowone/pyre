@@ -634,11 +634,12 @@ fn release_buffer_export(w_cdata: PyObjectRef) -> Result<(), PyError> {
 
 // ── the Python type ─────────────────────────────────────────────────────
 
-static CDATA_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static CDATA_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `_cffi_backend._CDataBase`.
 pub fn cdata_type() -> PyObjectRef {
-    *CDATA_TYPE_OBJ.get_or_init(|| {
+    CDATA_TYPE_OBJ.get_or_init(|| {
         let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend._CDataBase",
             init_cdata_type,
@@ -649,8 +650,8 @@ pub fn cdata_type() -> PyObjectRef {
             unsafe { &*<W_CData as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,
         );
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 const CDATA_DOC: &str = "The internal base type for CData objects.  Use FFI.CData to access it.  Always check with isinstance(): subtypes are sometimes returned on CPython, for performance reasons.";

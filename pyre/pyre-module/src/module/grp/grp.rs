@@ -6,16 +6,17 @@
 /// `lib_pypy/grp.py class struct_group(metaclass=structseqtype)`
 /// — process-wide cached subclass-of-tuple type so every getgrgid /
 /// getgrnam / getgrall call materialises into the same structseq.
-static STRUCT_GROUP_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static STRUCT_GROUP_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 #[cfg(unix)]
 fn struct_group_type() -> pyre_object::PyObjectRef {
-    *STRUCT_GROUP_TYPE.get_or_init(|| {
+    STRUCT_GROUP_TYPE.get_or_init(|| {
         pyre_interpreter::_structseq::make_struct_seq(
             "grp.struct_group",
             &["gr_name", "gr_passwd", "gr_gid", "gr_mem"],
-        ) as usize
-    }) as pyre_object::PyObjectRef
+        )
+    })
 }
 
 /// grp module — `lib_pypy/grp.py` (PyPy keeps it app-level via

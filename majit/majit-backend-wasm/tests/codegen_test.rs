@@ -8564,10 +8564,11 @@ fn interior_field_ops_compile() {
 }
 
 /// A ref-typed SETINTERIORFIELD_GC that the GC rewrite did not lower is
-/// declined. Codegen returns `BackendError::Unsupported` instead of storing
-/// the pointer. `build_module_default` turns that error into `.expect`, so
-/// this test matches the error directly.
+/// declined. Codegen must not store the pointer itself.
 #[test]
+#[should_panic(
+    expected = "wasm codegen: SetinteriorfieldGc must have been lowered by rewrite_ops_for_gc"
+)]
 fn setinteriorfield_gc_ref_without_rewrite_is_rejected() {
     use majit_ir::descr::{
         ArrayDescr, FieldDescr, SimpleArrayDescr, SimpleFieldDescr, SimpleInteriorFieldDescr,

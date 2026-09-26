@@ -202,13 +202,11 @@ pub fn try_typed_items_block_layout(cap: usize) -> Option<Layout> {
     Layout::from_size_align(total, std::mem::align_of::<TypedItemsBlock>()).ok()
 }
 
-/// Allocate a scalar GcArray in the no-collect moving nursery.
+/// Allocate a scalar GcArray via `malloc_fast` / `collect_and_reserve`.
 ///
-/// This is the `rbigint._digits` allocation shape. Bigint arithmetic may hold
-/// several unboxed Rust `RBigInt` handles at once, so the allocator must not
-/// trigger a collection while those raw digit pointers are live. The completed
-/// result's digit edge is explicitly rooted when its RBigInt payload is boxed
-/// by `alloc_rbigint_nursery_collecting`. Once a backend owns the heap,
+/// This is the `rbigint._digits` allocation shape. Live unboxed `RBigInt`
+/// handles across this call must sit in `RBigIntGcRoot`, matching the
+/// translator's `_digits` shadow-stack slots. Once a backend owns the heap,
 /// allocation failure must remain a failure: a raw fallback would leave
 /// `RBigInt._digits` pointing outside the managed heap even though its
 /// descriptor traces that field as `GcArray(Signed)`.
@@ -263,18 +261,24 @@ pub unsafe fn try_alloc_typed_items_block_nursery(
         );
         // `GcArray(Signed)` / `GcArray(Float)` bodies: no finalizer, not a
         // WEAKREF, so `gct_fv_gc_malloc` (`framework.py`) reaches
-        // `malloc_fast`.
-        //
-        // The twin taken here is the non-collecting one, and that is a
-        // deviation, not a spelling: `malloc_fast` is a copy of
-        // `malloc_fixedsize` (`framework.py:366-373`), whose nursery bump
-        // reaches `collect_and_reserve` on overflow
-        // (`incminimark.py`). Collecting here would move digit blocks
-        // out from under the unboxed `RBigInt` handles the arithmetic graphs
-        // hold across their allocations, and nothing roots those, so this
-        // spills to old-gen instead. `rbigint::gc::format_recursion_safepoint`
-        // records what that costs the one caller that has paid it.
-        let raw = unsafe { majit_gc::alloc_fast_nursery_typed(tid, layout.size()) }.0 as *mut u8;
+        // `malloc_fast`. That is a copy of `malloc_fixedsize` whose
+        // nursery bump reaches `collect_and_reserve` on overflow.
+        // `malloc_fast(typeid, size)` takes no root: the livevars belong to
+        // the caller's `gc_push_roots`, so the root span here is empty. Live
+        // unboxed `RBigInt` handles must sit in `RBigIntGcRoot` across this
+        // call, the same way the translator puts `_digits` on the shadow
+        // stack.
+        let mut needs_write_barrier = false;
+        let raw = unsafe {
+            majit_gc::alloc_fast_nursery_collecting_typed_roots(
+                tid,
+                layout.size(),
+                std::ptr::NonNull::<majit_ir::GcRef>::dangling().as_ptr(),
+                0,
+                &mut needs_write_barrier,
+            )
+        }
+        .0 as *mut u8;
         if raw.is_null() {
             return None;
         }

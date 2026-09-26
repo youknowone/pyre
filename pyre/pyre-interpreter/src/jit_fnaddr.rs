@@ -2566,6 +2566,22 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::may_ignore_finalizer",
         crate::executioncontext::may_ignore_finalizer,
     );
+    // `rgc.FinalizerQueue.register_finalizer` is `@jit.dont_look_inside`
+    // too; the same publication makes its residual call real.
+    pa1(
+        &mut entries,
+        "pyre_interpreter::executioncontext::register_finalizer",
+        "pyre_interpreter::register_finalizer",
+        crate::executioncontext::register_finalizer,
+    );
+    // `gc.collect`'s finalizer drain, residual for the reason given at
+    // `module::gc::run_finalizers_now`.
+    pa0(
+        &mut entries,
+        "pyre_interpreter::module::gc::run_finalizers_now",
+        "pyre_interpreter::run_finalizers_now",
+        crate::module::gc::run_finalizers_now,
+    );
     pa0(
         &mut entries,
         "pyre_object::object_array::itemsblock_gc_enabled",
@@ -4114,9 +4130,9 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
 
     // `w_type` / `w_object` — the `type` / `object` typeobject accessors
-    // read the `W_TYPE_TYPEOBJECT` / `W_OBJECT_TYPEOBJECT` `OnceLock<usize>`
-    // slots set once at startup.  Both carry `#[dont_look_inside]` (the
-    // `OnceLock::get` read has no registry-resolvable accessor graph), so
+    // read the space's `w_type` / `w_object` attributes set once at
+    // startup.  Both carry `#[dont_look_inside]` (the attribute read has
+    // no registry-resolvable accessor graph), so
     // the codewriter classifies the calls `Residual` and needs these
     // bindings to bake real funcptrs instead of `symbolic_fnaddr_for_path`
     // hashes.  Callers spell them `crate::typedef::w_type()`, the sole
@@ -6553,6 +6569,34 @@ mod tests {
             expected
         );
         assert_eq!(bindings["pyre_interpreter::may_ignore_finalizer"], expected);
+    }
+
+    /// `rgc.py` keeps `FinalizerQueue.register_finalizer` opaque with
+    /// `@jit.dont_look_inside`, so both resolver spellings bind the helper.
+    #[test]
+    fn jit_trace_fnaddrs_covers_register_finalizer() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = crate::executioncontext::register_finalizer as *const () as usize as i64;
+
+        assert_eq!(
+            bindings["pyre_interpreter::executioncontext::register_finalizer"],
+            expected
+        );
+        assert_eq!(bindings["pyre_interpreter::register_finalizer"], expected);
+    }
+
+    /// The finalizer drain `bytearray_check_exports` and `gc.collect` reach
+    /// is a residual call, so both resolver spellings bind the helper.
+    #[test]
+    fn jit_trace_fnaddrs_covers_run_finalizers_now() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = crate::module::gc::run_finalizers_now as *const () as usize as i64;
+
+        assert_eq!(
+            bindings["pyre_interpreter::module::gc::run_finalizers_now"],
+            expected
+        );
+        assert_eq!(bindings["pyre_interpreter::run_finalizers_now"], expected);
     }
 
     /// `is_pyframe_operand_stack_accessor` must recognise the funcptr the

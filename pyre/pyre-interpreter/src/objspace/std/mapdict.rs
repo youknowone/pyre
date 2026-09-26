@@ -3190,11 +3190,10 @@ pub trait MapdictObject {
 /// `*const MapNode`; `storage` is a heap `Vec<PyObjectRef>` (null =
 /// `None`, the `_mapdict_init_empty` empty state, mapdict.py).
 /// Remember an instance that may now hold a young attribute value, mirroring
-/// `dict_write_barrier` (dictmultiobject.rs). RPython's GC inserts the
-/// barrier implicitly at `self.storage[index] = value` (mapdict.py);
-/// Remember the instance so a minor traces `object_object_custom_trace`
-/// (the storage pointer and every slot). The storage block is also a
-/// pointer array (`W_MAPDICT_STORAGE_GC_TYPE_ID`, `items_have_gc_ptrs`);
+/// `dict_write_barrier` (dictmultiobject.rs). The storage block is remembered
+/// separately by [`mapdict_storage_write_barrier`], which every caller runs
+/// next: a compiled `SETARRAYITEM` names the array, and an old block's
+/// contents are scanned only when that block is on the remembered set.
 /// `setarrayitem_gc` barriers that array, so the interpreter store does
 /// too — otherwise the block stays TRACK-set and a non-moving major's
 /// `debug_check_not_white` sees black storage → white nursery values.
@@ -3227,11 +3226,13 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         }
     }
     fn _mapdict_write_storage(&mut self, storageindex: usize, value: PyObjectRef) {
-        // mapdict.py _mapdict_write_storage. The instance is the remembered-set root: the
-        // collector reaches the (non-moving, stable) storage block only through
-        // this instance's `object_object_custom_trace`, which walks the block's
-        // boxed slots in place, so remembering the instance keeps a young value
-        // stored into an old-gen instance's block forwarded on a minor GC.
+        // mapdict.py. The instance is the remembered-set root: the
+        // collector reaches the storage block (nursery-born by
+        // `alloc_mapdict_storage_block`) only through this instance's
+        // `object_object_custom_trace`, which forwards the `storage` word and
+        // walks the block's boxed slots in place, so remembering the instance
+        // keeps a young value stored into an old-gen instance's block
+        // forwarded on a minor GC.
         //
         // RPython's GC transform emits the barrier before the pointer store.
         // Publish both operands first because a foreign mutator's collection
@@ -3332,6 +3333,18 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         unsafe {
             let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
             let old = owner.storage;
+            let old_slot = pyre_object::gc_roots::shadow_stack_len();
+            if !old.is_null() {
+                let _ = pyre_object::gc_roots::pin_root(old as PyObjectRef);
+            }
+            // `pin_root` is a safepoint. mapdict.py re-reads storage after an
+            // allocating call; capacity and the in-place write use that block.
+            let old = if old.is_null() {
+                old
+            } else {
+                pyre_object::gc_roots::shadow_stack_get(old_slot)
+                    as *mut pyre_object::object_array::ItemsBlock
+            };
             let old_cap = pyre_object::object_array::items_block_capacity(old);
             let block = if needed <= old_cap {
                 old
@@ -3351,7 +3364,13 @@ impl MapdictObject for pyre_object::W_ObjectObject {
             instance_write_barrier(owner as *mut Self as PyObjectRef);
             let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
             mapdict_storage_write_barrier(owner.storage);
-            if !std::ptr::eq(owner.storage, old) {
+            let old = if old.is_null() {
+                old
+            } else {
+                pyre_object::gc_roots::shadow_stack_get(old_slot)
+                    as *mut pyre_object::object_array::ItemsBlock
+            };
+            if !std::ptr::eq(block, old) {
                 pyre_object::object_array::dealloc_instance_items_block(old);
             }
         }
@@ -3376,6 +3395,10 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         unsafe {
             let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
             let old = owner.storage;
+            let old_slot = pyre_object::gc_roots::shadow_stack_len();
+            if !old.is_null() {
+                let _ = pyre_object::gc_roots::pin_root(old as PyObjectRef);
+            }
             let cap = storage
                 .len()
                 .max(pyre_object::object_array::items_block_capacity(old));
@@ -3388,6 +3411,12 @@ impl MapdictObject for pyre_object::W_ObjectObject {
             instance_write_barrier(owner as *mut Self as PyObjectRef);
             let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
             mapdict_storage_write_barrier(owner.storage);
+            let old = if old.is_null() {
+                old
+            } else {
+                pyre_object::gc_roots::shadow_stack_get(old_slot)
+                    as *mut pyre_object::object_array::ItemsBlock
+            };
             pyre_object::object_array::dealloc_instance_items_block(old);
         }
     }
@@ -3548,6 +3577,18 @@ impl MapdictObject for MapdictCarrier {
             let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
             let mut carrier = mapdict_carrier(owner);
             let old = carrier.storage();
+            let old_slot = pyre_object::gc_roots::shadow_stack_len();
+            if !old.is_null() {
+                let _ = pyre_object::gc_roots::pin_root(old as PyObjectRef);
+            }
+            // `pin_root` is a safepoint. mapdict.py re-reads storage after an
+            // allocating call; capacity and the in-place write use that block.
+            let old = if old.is_null() {
+                old
+            } else {
+                pyre_object::gc_roots::shadow_stack_get(old_slot)
+                    as *mut pyre_object::object_array::ItemsBlock
+            };
             let old_cap = pyre_object::object_array::items_block_capacity(old);
             let block = if needed <= old_cap {
                 old
@@ -3569,7 +3610,13 @@ impl MapdictObject for MapdictCarrier {
             let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
             carrier = mapdict_carrier(owner);
             mapdict_storage_write_barrier(carrier.storage());
-            if !std::ptr::eq(carrier.storage(), old) {
+            let old = if old.is_null() {
+                old
+            } else {
+                pyre_object::gc_roots::shadow_stack_get(old_slot)
+                    as *mut pyre_object::object_array::ItemsBlock
+            };
+            if !std::ptr::eq(block, old) {
                 pyre_object::object_array::dealloc_instance_items_block(old);
             }
             self.obj = owner;
@@ -3583,6 +3630,10 @@ impl MapdictObject for MapdictCarrier {
             let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
             let mut carrier = mapdict_carrier(owner);
             let old = carrier.storage();
+            let old_slot = pyre_object::gc_roots::shadow_stack_len();
+            if !old.is_null() {
+                let _ = pyre_object::gc_roots::pin_root(old as PyObjectRef);
+            }
             let cap = storage
                 .len()
                 .max(pyre_object::object_array::items_block_capacity(old));
@@ -3597,6 +3648,12 @@ impl MapdictObject for MapdictCarrier {
             let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
             carrier = mapdict_carrier(owner);
             mapdict_storage_write_barrier(carrier.storage());
+            let old = if old.is_null() {
+                old
+            } else {
+                pyre_object::gc_roots::shadow_stack_get(old_slot)
+                    as *mut pyre_object::object_array::ItemsBlock
+            };
             pyre_object::object_array::dealloc_instance_items_block(old);
             self.obj = owner;
         }
@@ -5908,10 +5965,9 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
         }
         // Both forms are needed, unlike in `list_object_custom_trace`, which
         // picks one: handing over the field slot only forwards the block
-        // pointer, and the block is `alloc_stable`, so a minor never descends
-        // into it to reach the values.  Walking the items here is what keeps
-        // an attribute value alive; a list's items block can be young, which
-        // is what makes the either/or correct there and wrong here.
+        // pointer. A young block is then scanned by its own walker; an
+        // old-gen spill is not entered by a minor, so walking the items
+        // here keeps an attribute value alive.
         //
         // The block's own tid registers `items_have_gc_ptrs`, which is not a
         // reason to drop this walk: a declared walker is not a guarantee that
@@ -5938,15 +5994,15 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
 /// `W_Random`; instance `map`+`storage`, `mapdict.py`).
 ///
 /// `storage` is a GC-managed leaf block (`W_MAPDICT_STORAGE_GC_TYPE_ID`,
-/// allocated stable and non-moving by `alloc_mapdict_storage_block`), so the
-/// collector reaches its slots only through this trace:
+/// nursery-born by `alloc_mapdict_storage_block`), so the collector reaches
+/// its slots only through this trace:
 /// [`instance_walk_boxed_storage`] forwards the `storage` reference itself and
 /// then every slot in `0..capacity` in place.  It consults no map — an
 /// unboxed longlong attribute stores the erased `GC_INT_ARRAY` block
 /// (`erase_unboxed`, `mapdict.py/612`), which is an ordinary GC reference
 /// like every boxed slot (`mapdict.py/447` `erase_item`), so no slot has
-/// to be skipped.  The block itself never moves; only the slot contents are
-/// relocated.
+/// to be skipped.  A minor that moves a young block rewrites the forwarded
+/// `storage` word here.
 ///
 /// `ob_header.w_class` is the instance's class reachability edge — the
 /// equivalent of PyPy reaching the class through the traced
@@ -5954,12 +6010,8 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
 /// Pyre stores the class in the inline header word
 /// (`objectobject.rs`'s `W_ObjectObject`, `typeptr` in `rclass.py`), so it
 /// must be forwarded here or an instance whose class is reachable only
-/// through it would have that class reclaimed once heap types become
-/// GC-managed.  Inert while heap types remain `malloc_typed`
-/// Box-immortal — the visitor's `is_in_nursery` / `is_managed_heap_object`
-/// guard skips the non-managed type pointer — exactly as
-/// `generator_object_custom_trace` forwards `pycode` ahead of the
-/// code-object migration.
+/// through it would have that class reclaimed: heap types are GC-managed
+/// (`try_gc_alloc_stable_raw`).
 ///
 /// # Safety
 /// `obj_addr` must point to a live object with the mapdict prefix.

@@ -2495,9 +2495,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         // forwarded — `remove_constptrs_in` rewrites it to a `LoadFromGcTable`
         // at emit and `gcreftracer` keeps the table slot current at run — and
         // the window before that, while `write_residual_call_result_to_dst`
-        // holds the `OpRef` in the walker's `registers_r`, is what the
-        // `active_sym_registers` root area covers.  So a class attribute
-        // allocated in the nursery folds like any other object.
+        // holds the `OpRef` in the walker's `registers_r`, is what
+        // `InlineRegisterBankGuard` (`miframe_registers`) walks.  So a class
+        // attribute allocated in the nursery folds like any other object.
         walker_guard_mapdict_instance_shape(
             ctx,
             op_pc,
@@ -2832,7 +2832,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     // so a hot `math.sqrt(x)` loop drops its per-iteration LOAD_ATTR may-force
     // residual and the `math.sqrt` callable becomes a trace constant.  A rebind
     // of the attribute bumps the module dict `version` and fails the guard.
-    // All resolution below is read-only; a missing / movable / non-canonical
+    // All resolution below is read-only; a missing / non-canonical
     // shape falls through to the residual with no IR emitted.  An exact
     // `module` `w_class` excludes a module subclass with a custom
     // `__getattribute__`; a module-level PEP 562 `__getattr__` is irrelevant
@@ -2851,10 +2851,16 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         }
     {
         let w_dict = unsafe { pyre_object::w_module_get_w_dict(concrete_obj) };
-        if !w_dict.is_null() && !majit_gc::can_move(majit_ir::GcRef(w_dict as usize)) {
+        if !w_dict.is_null() {
             if let Some(slot) = crate::state::module_dict_cell_slot_direct(w_dict, name) {
                 if let Some(stored) = crate::state::module_dict_cell_value_direct(w_dict, slot) {
-                    if mutable_cell_or_immovable(stored) {
+                    if !stored.is_null() {
+                        // The first binding of a module name is the raw object
+                        // (`write_cell` StoreBare), which is nursery-born for a
+                        // function.  `emit_namespace_cell_fold` records that
+                        // GCREF as a `ConstPtr` the active-trace walk, resume
+                        // pools and gcref table forward; movability does not
+                        // decide the fold.  Same as `emit_module_dict_cell_fold`.
                         // Pin the receiver to THIS module so the baked dict
                         // address is correct: a constant receiver is already
                         // pinned; a non-constant one gets a `guard_value`.
@@ -6726,11 +6732,10 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     if w_builtins.is_null() {
         return Ok(None);
     }
-    for baked in [w_builtins, w_name, w_qualname] {
-        if majit_gc::can_move(majit_ir::GcRef(baked as usize)) {
-            return Ok(None);
-        }
-    }
+    // `w_builtins` / `w_name` / `w_qualname` are recorded as `ConstPtr`
+    // arguments of the MAKE_FUNCTION body below.  Those slots are forwarded
+    // by `walk_const_ptr_refs` and loaded from the gcref table at run;
+    // movability does not decide the fold.
 
     // commit to the fold: emit IR (no further declines)
     // The only mutable input: `globals['__builtins__']` may be rebound after
@@ -18193,6 +18198,20 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
 
+    // `abort/` in a helper body is an un-lowered `OpKind` — the same class
+    // as a symbolic residual (`try_execute_residual_call_via_executor` →
+    // `OrthodoxSubWalkTraceUnsupported`). Propagating `AbortMarkerReached`
+    // kills the enclosing portal/bridge walk; the fold contract
+    // (`try_walker_orthodox_list_append` / `_opcode`) is to residualize
+    // the helper instead, matching `inline_call.rs` rolling a declined
+    // descent back to the ordinary residual.
+    let walk_result = match walk_result {
+        Err(DispatchError::AbortMarkerReached { pc }) => {
+            Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 })
+        }
+        other => other,
+    };
+
     Ok((walk_result?, walk_start))
 }
 
@@ -23258,9 +23277,8 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
 /// delete there.
 ///
 /// Returns `Ok(false)` — the caller then keeps the live residual — for a name
-/// still present in the module dict, a missing or non-module builtin, an
-/// unfoldable builtins slot (absent / null / `IntMutableCell` / movable
-/// non-cell), or a movable builtins dict.
+/// still present in the module dict, a missing or non-module builtin, or an
+/// unfoldable builtins slot (absent / null / `IntMutableCell`).
 fn emit_builtins_cell_fold<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -23294,9 +23312,6 @@ fn emit_builtins_cell_fold<Sym: WalkSym>(
     if b_stored.is_null() || unsafe { pyre_object::celldict::is_int_mutable_cell(b_stored) } {
         return Ok(false);
     }
-    if !mutable_cell_or_immovable(b_stored) {
-        return Ok(false);
-    }
     // Guard (a): the name must stay ABSENT from the module dict so the lookup
     // keeps falling through to builtins.  `celldict.py getdictvalue_no_unwrapping`
     // reads `version?` on every lookup.  A new-key insert (`_setitem_str_cell_known`)
@@ -23313,10 +23328,9 @@ fn emit_builtins_cell_fold<Sym: WalkSym>(
     // Guard (b): the builtins value for `name` must be unchanged.  The
     // `emit_namespace_cell_fold` below records a `QUASIIMMUT_FIELD` on the
     // builtins dict + the elidable cell lookup, so a rebind/del of the
-    // builtin bumps the builtins-dict `version` and fails the loop.
-    if majit_gc::can_move(majit_ir::GcRef(w_builtin_dict as usize)) {
-        return Ok(false);
-    }
+    // builtin bumps the builtins-dict `version` and fails the loop.  The
+    // baked `ConstPtr`s that fold emits are forwarded; movability does not
+    // decide it.
     if !emit_namespace_cell_fold(
         ctx,
         op_pc,
@@ -23442,27 +23456,6 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
     )
 }
 
-/// A module-dict slot may be baked when it is a mutable cell or cannot move.
-///
-/// `ObjectMutableCell` / `IntMutableCell` are nursery objects
-/// (`ObjectMutableCell.__init__`). The fold records them with
-/// `TraceCtx::const_ref`; `remove_constptrs_in` rewrites that `ConstPtr`
-/// to `LoadFromGcTable`. Any other movable value stays on the residual.
-fn mutable_cell_or_immovable(stored: pyre_object::PyObjectRef) -> bool {
-    if stored.is_null() {
-        return false;
-    }
-    if pyre_object::tagged_int::CAN_BE_TAGGED
-        && unsafe { pyre_object::tagged_int::is_tagged_int(stored) }
-    {
-        return !majit_gc::can_move(majit_ir::GcRef(stored as usize));
-    }
-    if unsafe { pyre_object::celldict::is_mutable_cell(stored) } {
-        return true;
-    }
-    !majit_gc::can_move(majit_ir::GcRef(stored as usize))
-}
-
 /// StoreName/StoreGlobal: descend `typeobject.py write_cell` for an
 /// in-place cell.  A replacing write (new cell, version bump) stays on
 /// the residual so `mutated()` still runs.
@@ -23506,11 +23499,6 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
         return Ok(false);
     };
     if stored.is_null() {
-        return Ok(false);
-    }
-    // A nursery `ObjectMutableCell` / `IntMutableCell` still folds: the bake
-    // below is `const_ref` (`ConstPtr` → `LoadFromGcTable`).
-    if !mutable_cell_or_immovable(stored) {
         return Ok(false);
     }
     let Some(majit_ir::Value::Ref(majit_ir::GcRef(p))) = ctx.trace_ctx.box_value(value_opref)

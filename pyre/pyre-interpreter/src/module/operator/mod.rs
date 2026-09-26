@@ -243,8 +243,9 @@ crate::py_module! {
         "not_"     / 1 = |args| Ok(w_bool_from(!is_true(args[0])?)),
         // interp_operator.py truth
         "truth"    / 1 = |args| Ok(w_bool_from(is_true(args[0])?)),
-        "is_"      / 2 = |args| Ok(w_bool_from(std::ptr::eq(args[0], args[1]))),
-        "is_not"   / 2 = |args| Ok(w_bool_from(!std::ptr::eq(args[0], args[1]))),
+        // interp_operator.py `is_` / `is_not`: `space.is_` / `space.not_(space.is_)`.
+        "is_"      / 2 = |args| Ok(crate::baseobjspace::is_(args[0], args[1])),
+        "is_not"   / 2 = |args| Ok(w_bool_from(!crate::baseobjspace::is_w(args[0], args[1]))),
         "is_none"     / 1 = |args| Ok(w_bool_from(std::ptr::eq(args[0], w_none()))),
         "is_not_none" / 1 = |args| Ok(w_bool_from(!std::ptr::eq(args[0], w_none()))),
         "contains" / 2 = |args| Ok(w_bool_from(contains(args[0], args[1])?)),

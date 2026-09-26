@@ -621,6 +621,41 @@ impl SpaceCallable<SpaceHandle> for SpaceCacheClass {
     }
 }
 
+/// One `space.w_*` attribute of an object space: written while the space
+/// initializes, then rewritten only by the collector through
+/// [`ObjSpace::walk_cache_roots`].
+pub struct SpaceAttr(std::cell::UnsafeCell<PyObjectRef>);
+
+// Written once during space initialization, then only by the collector.
+unsafe impl Sync for SpaceAttr {}
+unsafe impl Send for SpaceAttr {}
+
+impl SpaceAttr {
+    pub const fn new() -> Self {
+        Self(std::cell::UnsafeCell::new(std::ptr::null_mut()))
+    }
+
+    /// The attribute, or null before the space set it.
+    #[inline]
+    pub fn get(&self) -> PyObjectRef {
+        unsafe { *self.0.get() }
+    }
+
+    /// `setattr(space, 'w_' + name, w_obj)`. The space is prebuilt, so the
+    /// store is a prebuilt-family store (`remember_young_pointer`).
+    fn set(&self, w_obj: PyObjectRef) {
+        unsafe { *self.0.get() = w_obj };
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    }
+
+    fn walk(&self, forward: &mut dyn FnMut(&mut PyObjectRef)) {
+        let slot = unsafe { &mut *self.0.get() };
+        if !slot.is_null() {
+            forward(slot);
+        }
+    }
+}
+
 /// baseobjspace.py ObjSpace.__init__: own InternalSpaceCache, whose callable
 /// keys construct per-space caches. The process-wide instance is a prebuilt
 /// static (`OBJECT_SPACE`); isolated test spaces keep an `Arc`.
@@ -630,6 +665,15 @@ pub struct ObjSpace {
     class_dict_strategy: crate::objspace::std::classdict::ClassDictStrategy,
     gateway_cache: crate::gateway::GatewayCache,
     type_cache: crate::objspace::std::typeobject::TypeCache,
+    /// `space.w_object` and `space.w_type`: `StdObjSpace.initialize` does
+    /// `setattr(self, 'w_' + typedef.name, w_type)` for each builtin type.
+    w_object: SpaceAttr,
+    w_type: SpaceAttr,
+    /// `space.w_BaseException` and `space.w_TypeError`:
+    /// `ObjSpace.export_builtin_exceptions` does
+    /// `setattr(self, "w_" + excname, w_exc)`.
+    w_base_exception: SpaceAttr,
+    w_type_error: SpaceAttr,
 }
 
 impl ObjSpace {
@@ -644,6 +688,10 @@ impl ObjSpace {
         ),
         gateway_cache: crate::gateway::GatewayCache::new(SpaceHandle::ProcessWide),
         type_cache: crate::objspace::std::typeobject::TypeCache::new(SpaceHandle::ProcessWide),
+        w_object: SpaceAttr::new(),
+        w_type: SpaceAttr::new(),
+        w_base_exception: SpaceAttr::new(),
+        w_type_error: SpaceAttr::new(),
     };
 
     pub fn sys_state(&self) -> &crate::module::sys::state::SysState {
@@ -662,6 +710,47 @@ impl ObjSpace {
         &self.type_cache
     }
 
+    /// `space.w_object`; null before `init_typeobjects` sets it.
+    pub fn w_object(&self) -> PyObjectRef {
+        self.w_object.get()
+    }
+
+    /// `space.w_type`; null before `init_typeobjects` sets it.
+    pub fn w_type(&self) -> PyObjectRef {
+        self.w_type.get()
+    }
+
+    /// `space.w_BaseException`; null before the exception is registered.
+    pub fn w_base_exception(&self) -> PyObjectRef {
+        self.w_base_exception.get()
+    }
+
+    /// `space.w_TypeError`; null before the exception is registered.
+    pub fn w_type_error(&self) -> PyObjectRef {
+        self.w_type_error.get()
+    }
+
+    /// The `setattr(self, 'w_' + typedef.name, w_type)` of
+    /// `StdObjSpace.initialize` for `object` and `type`.
+    pub(crate) fn set_w_object(&self, w_object: PyObjectRef) {
+        self.w_object.set(w_object);
+    }
+
+    pub(crate) fn set_w_type(&self, w_type: PyObjectRef) {
+        self.w_type.set(w_type);
+    }
+
+    /// `export_builtin_exceptions`: `setattr(self, "w_" + excname, w_exc)`
+    /// for the exceptions the space reads by attribute.
+    pub(crate) fn export_builtin_exception(&self, excname: &str, w_exc: PyObjectRef) {
+        let attr = match excname {
+            "BaseException" => &self.w_base_exception,
+            "TypeError" => &self.w_type_error,
+            _ => return,
+        };
+        attr.set(w_exc);
+    }
+
     pub fn new() -> std::sync::Arc<Self> {
         let space = std::sync::Arc::new_cyclic(|space| Self {
             fromcache: InternalSpaceCache::new(SpaceHandle::Isolated(space.clone())),
@@ -673,6 +762,10 @@ impl ObjSpace {
             type_cache: crate::objspace::std::typeobject::TypeCache::new(SpaceHandle::Isolated(
                 space.clone(),
             )),
+            w_object: SpaceAttr::new(),
+            w_type: SpaceAttr::new(),
+            w_base_exception: SpaceAttr::new(),
+            w_type_error: SpaceAttr::new(),
         });
         OBJECT_SPACE_ROOTS
             .lock()
@@ -690,6 +783,10 @@ impl ObjSpace {
     pub fn walk_cache_roots(&self, forward: &mut dyn FnMut(&mut PyObjectRef)) {
         self.gateway_cache.walk_roots(forward);
         self.type_cache.walk_roots(forward);
+        self.w_object.walk(forward);
+        self.w_type.walk(forward);
+        self.w_base_exception.walk(forward);
+        self.w_type_error.walk(forward);
         self.fromcache.visit_values_mut(|cache| match cache {
             SpaceCacheInstance::ClassDictStrategy(cache) => cache.walk_roots(forward),
             SpaceCacheInstance::SysState(cache) => cache.walk_roots(forward),
@@ -920,26 +1017,21 @@ pub unsafe fn exception_is_valid_class_w(w_cls: PyObjectRef) -> bool {
     issubtype_w(w_cls, base_exc)
 }
 
-/// Canonical `BaseException` from `EXC_CLASS_REGISTRY`, cached after the
-/// first successful lookup.  The registry is populated once at
-/// `make_exc_type` and the class object is immortal, so the pointer is
-/// stable for the process lifetime.
+/// `space.w_BaseException`, set when `make_exc_type` registers the class
+/// (`export_builtin_exceptions`); `None` before that.
 fn cached_base_exception() -> Option<PyObjectRef> {
-    static BASE_EXC: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    if let Some(&base_exc) = BASE_EXC.get() {
-        return Some(base_exc as PyObjectRef);
+    let base_exc = object_space().w_base_exception();
+    if base_exc.is_null() {
+        None
+    } else {
+        Some(base_exc)
     }
-    let base_exc = crate::builtins::lookup_exc_class("BaseException")?;
-    Some(*BASE_EXC.get_or_init(|| base_exc as usize) as PyObjectRef)
 }
 
+/// `space.w_TypeError`, set the same way as [`cached_base_exception`].
 fn cached_type_error() -> Option<PyObjectRef> {
-    static TYPE_ERROR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    if let Some(&cls) = TYPE_ERROR.get() {
-        return Some(cls as PyObjectRef);
-    }
-    let cls = crate::builtins::lookup_exc_class("TypeError")?;
-    Some(*TYPE_ERROR.get_or_init(|| cls as usize) as PyObjectRef)
+    let cls = object_space().w_type_error();
+    if cls.is_null() { None } else { Some(cls) }
 }
 
 /// pypy/interpreter/baseobjspace.py `exception_getclass`.
@@ -1385,16 +1477,27 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
         // `p_recursive_isinstance_w` fall-through below; that slot is the one
         // that calls back into `p_recursive_isinstance_type_w`, so the two
         // paths agree.
-        if let Some(cls_type) = crate::typedef::r#type(classinfo)
+        let _isinstance_roots = pyre_object::gc_roots::push_roots();
+        let isinstance_base = pyre_object::gc_roots::pin_roots(&[obj, classinfo]);
+        let obj = || pyre_object::gc_roots::shadow_stack_get(isinstance_base);
+        let classinfo = || pyre_object::gc_roots::shadow_stack_get(isinstance_base + 1);
+        if let Some(cls_type) = crate::typedef::r#type(classinfo())
             && let Some(check) = lookup_in_type(cls_type.as_ptr(), "__instancecheck__")
         {
             // abstractinst.py:122 `space.get_and_call_function(w_check,
             // w_klass_or_tuple, w_obj)` — bind the descriptor to
             // `classinfo` before calling with `obj`.
-            let result = get_and_call_function(check, classinfo, cls_type.as_ptr(), &[obj])?;
+            let check_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(check);
+            let result = get_and_call_function(
+                pyre_object::gc_roots::shadow_stack_get(check_slot),
+                classinfo(),
+                cls_type.as_ptr(),
+                &[obj()],
+            )?;
             return is_true(result);
         }
-        p_recursive_isinstance_w(obj, classinfo)
+        p_recursive_isinstance_w(obj(), classinfo())
     }
 }
 
@@ -1453,16 +1556,27 @@ pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, 
         // abstractinst.py:190-196 — `__subclasscheck__` override.
         // Same `lookup_in_type(type(classinfo), …)` rationale as
         // `isinstance` above.
-        if let Some(cls_type) = crate::typedef::r#type(classinfo)
+        let _issubclass_roots = pyre_object::gc_roots::push_roots();
+        let issubclass_base = pyre_object::gc_roots::pin_roots(&[derived, classinfo]);
+        let derived = || pyre_object::gc_roots::shadow_stack_get(issubclass_base);
+        let classinfo = || pyre_object::gc_roots::shadow_stack_get(issubclass_base + 1);
+        if let Some(cls_type) = crate::typedef::r#type(classinfo())
             && let Some(check) = lookup_in_type(cls_type.as_ptr(), "__subclasscheck__")
         {
             // abstractinst.py:195 `space.get_and_call_function(w_check,
             // w_klass_or_tuple, w_derived)` — bind the descriptor to
             // `classinfo` before calling with `derived`.
-            let result = get_and_call_function(check, classinfo, cls_type.as_ptr(), &[derived])?;
+            let check_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(check);
+            let result = get_and_call_function(
+                pyre_object::gc_roots::shadow_stack_get(check_slot),
+                classinfo(),
+                cls_type.as_ptr(),
+                &[derived()],
+            )?;
             return is_true(result);
         }
-        p_recursive_issubclass_w(derived, classinfo)
+        p_recursive_issubclass_w(derived(), classinfo())
     }
 }
 
@@ -1601,9 +1715,23 @@ pub fn is_true(obj: PyObjectRef) -> Result<bool, PyError> {
 /// formatter (`__majit_stringbuilder_new`).
 #[majit_macros::dont_look_inside]
 pub(crate) fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
-    if let Some(w_type) = crate::typedef::r#type(obj) {
+    // `__bool__` / `__len__` run arbitrary Python. Pin the operand so a
+    // collecting dunder cannot leave this function holding a from-space word.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    if let Some(w_type) =
+        crate::typedef::r#type(unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) })
+    {
         if let Some(w_descr) = unsafe { lookup_in_type(w_type.as_ptr(), "__bool__") } {
-            let w_res = unsafe { get_and_call_function(w_descr, obj, w_type.as_ptr(), &[]) }?;
+            let w_res = unsafe {
+                get_and_call_function(
+                    w_descr,
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    w_type.as_ptr(),
+                    &[],
+                )
+            }?;
             // The only instances of bool are `w_False` / `w_True`, so any
             // other box is the TypeError, and what it names is the type of
             // what `__bool__` RETURNED.  The docstring above transcribes
@@ -1619,7 +1747,14 @@ pub(crate) fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
             return Err(bool_must_return_bool(w_res));
         }
         if let Some(w_descr) = unsafe { lookup_in_type(w_type.as_ptr(), "__len__") } {
-            let w_res = unsafe { get_and_call_function(w_descr, obj, w_type.as_ptr(), &[]) }?;
+            let w_res = unsafe {
+                get_and_call_function(
+                    w_descr,
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    w_type.as_ptr(),
+                    &[],
+                )
+            }?;
             let w_index = space_index(w_res)?;
             return Ok(_check_len_result(w_index)? != 0);
         }
@@ -1920,6 +2055,12 @@ fn is_native_coroutine(w_obj: PyObjectRef) -> bool {
 /// `context`: 0 = plain `await`, 1 = `__aenter__`, 2 = `__aexit__` — only the
 /// missing-`__await__` error message differs.
 pub fn get_awaitable_iter(w_obj: PyObjectRef, context: u32) -> PyResult {
+    // `generator.py get_awaitable_iter` keeps `w_obj` live across the
+    // `__await__` lookup and call; both can collect.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     if is_coroutine(w_obj) {
         // GET_AWAITABLE: re-awaiting a native coroutine that is already
         // suspended at an `await` raises (`_PyGen_yf(coro) != NULL`). A native
@@ -1959,6 +2100,7 @@ pub fn get_awaitable_iter(w_obj: PyObjectRef, context: u32) -> PyResult {
         };
         return Err(PyError::type_error(msg));
     };
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let w_type = crate::typedef::r#type(w_obj).map_or(w_obj, |p| p.as_ptr());
     let w_res = unsafe { get_and_call_function(w_await, w_obj, w_type, &[]) }?;
     if is_coroutine(w_res) {
@@ -2546,6 +2688,10 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 
 #[inline(never)]
 unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    let _obj_roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let is_bytes = pyre_object::bytesobject::is_bytes(obj);
     if is_slice(index) {
         // stringmethods.py / bytearrayobject.py `descr_getitem`: unpack the
@@ -2553,18 +2699,12 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         // mutate a bytearray), then use `adjust_indices`' explicit slice
         // length.  Iterating by that count also avoids overflowing on the
         // final `start + step` for a step near `sys.maxsize`.
-        let (rs, rp, st) = {
-            // `slice_unpack` runs each component's `__index__`; the operand is
-            // rooted for that window and neither `bytes` nor `bytearray`
-            // moves.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            crate::sliceobject::slice_unpack(
-                w_slice_get_start(index),
-                w_slice_get_stop(index),
-                w_slice_get_step(index),
-            )?
-        };
+        let (rs, rp, st) = crate::sliceobject::slice_unpack(
+            w_slice_get_start(index),
+            w_slice_get_stop(index),
+            w_slice_get_step(index),
+        )?;
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
@@ -2601,18 +2741,12 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
     // `descr_getitem`: getindex_w(index, IndexError, "byte") — coercion
     // inlined for the same rtyper reason as `getitem_list`.
+    let mut obj = obj;
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = {
-            // `__index__` is user code: `BINARY_SUBSCR` pops the receiver
-            // before dispatching here, so nothing else roots it across the
-            // call. A bytes-like operand never moves, so the root is for liveness alone
-            // and the address in hand stays correct.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            space_index(index)?
-        };
+        let indexed = space_index(index)?;
+        obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -2834,16 +2968,18 @@ unsafe fn getitem_range(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         return range_compute_slice(obj, index);
     }
     // `_compute_item` — `space.index(w_index)` then bounds-check.
-    let w_index = {
-        // `_compute_item` runs `__index__`, which is user code; the range is
-        // popped off the operand stack before this dispatch, so it needs the
-        // root to survive a collection there.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let _ = pyre_object::gc_roots::pin_root(obj);
-        space_index(index)?
-    };
-    let idx = pyre_object::range_obj_to_bigint(w_index);
-    match pyre_object::w_range_compute_item(obj, &idx) {
+    // `space.index` runs `__index__` and `range_obj_to_bigint` / `fromint`
+    // allocate.  The range and the converted index have to come back off
+    // the shadow stack (`functional.py _compute_item`); dropping the pin
+    // before `w_range_compute_item` leaves `self` as a from-space word.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, index]);
+    let w_index = space_index(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
+    let _ = pyre_object::gc_roots::pin_root(w_index);
+    let w_index_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let idx =
+        pyre_object::range_obj_to_bigint(pyre_object::gc_roots::shadow_stack_get(w_index_slot));
+    match pyre_object::w_range_compute_item(pyre_object::gc_roots::shadow_stack_get(base), &idx) {
         Some(v) => Ok(v),
         None => Err(PyError::new(
             PyErrorKind::IndexError,
@@ -2860,21 +2996,25 @@ unsafe fn compute_slice_indices3_big(
 ) -> Result<(BigInt, BigInt, BigInt), PyError> {
     use num_traits::{One, Zero};
     let _roots = pyre_object::gc_roots::push_roots();
-    let slice = pyre_object::gc_roots::pin_root(slice);
-    let slice_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let slice_slot = pyre_object::gc_roots::pin_roots(&[slice]);
     // `space.index` below can invoke arbitrary Python. RPython's GC transform
     // keeps both the slice object and incoming rbigint live across every
-    // callback.
+    // callback.  The start/stop/step field pointers are the same class as
+    // `range_hash_method`: pin them before `fromint`.
     let length = RBigIntGcRoot::new(length.translated_alias());
     let zero = BigInt::zero();
     let one = BigInt::one();
     let w_step = w_slice_get_step(pyre_object::gc_roots::shadow_stack_get(slice_slot));
+    let step_slot = pyre_object::gc_roots::pin_roots(&[w_step]);
+    let w_step = pyre_object::gc_roots::shadow_stack_get(step_slot);
     // RPython's stack map roots each of these unboxed rbigint values while
     // the following slice component's `space.index()` can call Python.
     let step = RBigIntGcRoot::new(if is_none(w_step) {
         one.translated_alias()
     } else {
-        let s = pyre_object::range_obj_to_bigint(space_index(w_step)?);
+        let s = pyre_object::range_obj_to_bigint(space_index(
+            pyre_object::gc_roots::shadow_stack_get(step_slot),
+        )?);
         if s.is_zero() {
             return Err(PyError::new(
                 PyErrorKind::ValueError,
@@ -2885,6 +3025,8 @@ unsafe fn compute_slice_indices3_big(
     });
     let negative_step = *step < zero;
     let w_start = w_slice_get_start(pyre_object::gc_roots::shadow_stack_get(slice_slot));
+    let start_slot = pyre_object::gc_roots::pin_roots(&[w_start]);
+    let w_start = pyre_object::gc_roots::shadow_stack_get(start_slot);
     let start = RBigIntGcRoot::new(if is_none(w_start) {
         if negative_step {
             &*length - &one
@@ -2892,7 +3034,9 @@ unsafe fn compute_slice_indices3_big(
             zero.translated_alias()
         }
     } else {
-        let st = pyre_object::range_obj_to_bigint(space_index(w_start)?);
+        let st = pyre_object::range_obj_to_bigint(space_index(
+            pyre_object::gc_roots::shadow_stack_get(start_slot),
+        )?);
         if st < zero {
             let st = st + &*length;
             if st < zero {
@@ -2915,6 +3059,8 @@ unsafe fn compute_slice_indices3_big(
         }
     });
     let w_stop = w_slice_get_stop(pyre_object::gc_roots::shadow_stack_get(slice_slot));
+    let stop_slot = pyre_object::gc_roots::pin_roots(&[w_stop]);
+    let w_stop = pyre_object::gc_roots::shadow_stack_get(stop_slot);
     let stop = RBigIntGcRoot::new(if is_none(w_stop) {
         if negative_step {
             one.neg()
@@ -2922,7 +3068,9 @@ unsafe fn compute_slice_indices3_big(
             length.translated_alias()
         }
     } else {
-        let sp = pyre_object::range_obj_to_bigint(space_index(w_stop)?);
+        let sp = pyre_object::range_obj_to_bigint(space_index(
+            pyre_object::gc_roots::shadow_stack_get(stop_slot),
+        )?);
         if sp < zero {
             let sp = sp + &*length;
             if sp < zero {
@@ -2955,35 +3103,55 @@ unsafe fn compute_slice_indices3_big(
 /// a slice of `obj` denotes.
 unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
-    let obj = pyre_object::gc_roots::pin_root(obj);
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let len_b = pyre_object::range_obj_to_bigint(pyre_object::w_range_length(obj));
-    let (sl_start, sl_stop, sl_step) = compute_slice_indices3_big(slice, &len_b)?;
+    // `fromint` of `w_length` collects; the slice is a nursery object whose
+    // start/stop/step words would otherwise be from-space by the time
+    // `compute_slice_indices3` reads them (`functional.py _compute_slice`).
+    let base = pyre_object::gc_roots::pin_roots(&[obj, slice]);
+    let len_obj = pyre_object::w_range_length(pyre_object::gc_roots::shadow_stack_get(base));
+    let len_slot = pyre_object::gc_roots::pin_roots(&[len_obj]);
+    let len_b = pyre_object::range_obj_to_bigint(pyre_object::gc_roots::shadow_stack_get(len_slot));
+    let (sl_start, sl_stop, sl_step) =
+        compute_slice_indices3_big(pyre_object::gc_roots::shadow_stack_get(base + 1), &len_b)?;
     let sl_start = RBigIntGcRoot::new(sl_start);
     let sl_stop = RBigIntGcRoot::new(sl_stop);
     let sl_step = RBigIntGcRoot::new(sl_step);
     let (rstart, _rstop, rstep) =
-        pyre_object::w_range_fields(pyre_object::gc_roots::shadow_stack_get(obj_slot));
-    let rstart_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(rstart));
-    let rstep_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(rstep));
-    let substart = RBigIntGcRoot::new(&*rstart_b + &*sl_start * &*rstep_b);
+        pyre_object::w_range_fields(pyre_object::gc_roots::shadow_stack_get(base));
+    let field_base = pyre_object::gc_roots::pin_roots(&[rstart, rstep]);
+    let rstart_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(
+        pyre_object::gc_roots::shadow_stack_get(field_base),
+    ));
+    let rstep_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(
+        pyre_object::gc_roots::shadow_stack_get(field_base + 1),
+    ));
+    // Each product collects, so it is computed before `rstart_b` is read for
+    // the sum.
+    let start_offset = &*sl_start * &*rstep_b;
+    let substart = RBigIntGcRoot::new(&*rstart_b + &start_offset);
     let substep = RBigIntGcRoot::new(&*rstep_b * &*sl_step);
     // Compute and root every unboxed output before the first wrapping
     // allocation, which may collect.
-    let substop = RBigIntGcRoot::new(&*rstart_b + &*sl_stop * &*rstep_b);
+    let stop_offset = &*sl_stop * &*rstep_b;
+    let substop = RBigIntGcRoot::new(&*rstart_b + &stop_offset);
     let _roots = pyre_object::gc_roots::push_roots();
     let w_substart = pyre_object::range_bigint_to_obj(substart.translated_alias());
-    let w_substart = pyre_object::gc_roots::pin_root(w_substart);
+    let _ = pyre_object::gc_roots::pin_root(w_substart);
+    let substart_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_substep = pyre_object::range_bigint_to_obj(substep.translated_alias());
-    let w_substep = pyre_object::gc_roots::pin_root(w_substep);
+    let _ = pyre_object::gc_roots::pin_root(w_substep);
+    let substep_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // functional.py:523-526 tests `if w_stop`, i.e. whether the wrapped
     // pointer exists, not whether its integer payload is zero.  The wrapped
     // result of compute_slice_indices3 is always present, so compute the stop
     // lane even when its value is 0 (notably for `r[-1:-3:-1]`).
     let w_substop = pyre_object::range_bigint_to_obj(substop.translated_alias());
-    let w_substop = pyre_object::gc_roots::pin_root(w_substop);
+    let _ = pyre_object::gc_roots::pin_root(w_substop);
+    let substop_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     Ok(pyre_object::w_range_new(
-        w_substart, w_substop, w_substep, false,
+        pyre_object::gc_roots::shadow_stack_get(substart_slot),
+        pyre_object::gc_roots::shadow_stack_get(substop_slot),
+        pyre_object::gc_roots::shadow_stack_get(substep_slot),
+        false,
     ))
 }
 
@@ -3007,10 +3175,15 @@ pub(crate) fn range_count_method(args: &[PyObjectRef]) -> PyResult {
     let needle = args[1];
     unsafe {
         if range_integer_fast_path(needle) {
-            let item = pyre_object::range_obj_to_bigint(needle);
-            return Ok(w_int_new(
-                pyre_object::w_range_contains_bigint(obj, &item) as i64
-            ));
+            // `fromint` of a machine-int needle collects.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&[obj, needle]);
+            let item =
+                pyre_object::range_obj_to_bigint(pyre_object::gc_roots::shadow_stack_get(base + 1));
+            return Ok(w_int_new(pyre_object::w_range_contains_bigint(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                &item,
+            ) as i64));
         }
     }
     // `space.sequence_count(self, w_item)` — elementwise scan of the whole
@@ -3031,12 +3204,24 @@ pub(crate) fn range_index_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         // int / bool / long needle → O(1) `(value - start) // step`.
         if range_integer_fast_path(needle) {
-            let item = pyre_object::range_obj_to_bigint(needle);
-            if pyre_object::w_range_contains_bigint(obj, &item) {
-                return Ok(pyre_object::w_range_index_of(obj, &item));
+            // `fromint` of a machine-int needle and `w_range_contains_bigint`
+            // collect; the range, the needle and `item` are reloaded after.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&[obj, needle]);
+            let item = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            ));
+            if pyre_object::w_range_contains_bigint(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                &item,
+            ) {
+                return Ok(pyre_object::w_range_index_of(
+                    pyre_object::gc_roots::shadow_stack_get(base),
+                    &item,
+                ));
             }
             return Err(PyError::value_error(crate::display::wtf8_format!(
-                crate::display::py_repr_wtf8(needle)?,
+                crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 1))?,
                 " is not in range"
             )));
         }
@@ -3181,12 +3366,25 @@ pub(crate) fn range_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// None)`) ranges so equal ranges hash equal.
 pub(crate) fn range_hash_method(args: &[PyObjectRef]) -> PyResult {
     use num_traits::Zero;
-    let (start, _stop, step) = unsafe { pyre_object::w_range_fields(args[0]) };
-    let len_obj = unsafe { pyre_object::w_range_length(args[0]) };
-    let len = unsafe { pyre_object::range_obj_to_bigint(len_obj) };
+    // `range_obj_to_bigint` / `w_range_length` allocate (`fromint`).
+    // `args` is a gateway copy; start/step/len_obj have to be shadow-stack
+    // slots so `w_tuple_new` does not store from-space words.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let range = || pyre_object::gc_roots::shadow_stack_get(base);
+    let (start, _stop, step) = unsafe { pyre_object::w_range_fields(range()) };
+    let field_base = pyre_object::gc_roots::pin_roots(&[start, step]);
+    let len_obj = unsafe { pyre_object::w_range_length(range()) };
+    let len_slot = pyre_object::gc_roots::pin_roots(&[len_obj]);
+    let len = unsafe {
+        pyre_object::range_obj_to_bigint(pyre_object::gc_roots::shadow_stack_get(len_slot))
+    };
+    let start = pyre_object::gc_roots::shadow_stack_get(field_base);
+    let step = pyre_object::gc_roots::shadow_stack_get(field_base + 1);
+    let len_obj = pyre_object::gc_roots::shadow_stack_get(len_slot);
     let items = if len.is_zero() {
         vec![len_obj, w_none(), w_none()]
-    } else if len == BigInt::from(1) {
+    } else if len.int_eq(1) {
         vec![len_obj, start, w_none()]
     } else {
         vec![len_obj, start, step]
@@ -3650,7 +3848,11 @@ pub(crate) fn list_reverse_iter_length_hint_method(args: &[PyObjectRef]) -> PyRe
 pub(crate) fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let (current, remaining, step) = pyre_object::w_range_iter_fields(args[0]);
-        let stop = RBigIntGcRoot::new(BigInt::from(current) + BigInt::from(remaining) * step);
+        let current_b = RBigIntGcRoot::new(BigInt::from(current));
+        let remaining_b = RBigIntGcRoot::new(BigInt::from(remaining));
+        let step_b = RBigIntGcRoot::new(BigInt::from(step));
+        let product = RBigIntGcRoot::new(remaining_b.mul(&*step_b));
+        let stop = RBigIntGcRoot::new(current_b.add(&*product));
         // Python evaluates and keeps all three wrapped arguments before
         // W_Range construction. Mirror the GC transform's root slots between
         // those allocating expressions.
@@ -3694,13 +3896,29 @@ pub(crate) fn range_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
 /// len*step`), `(iter, (range,), None)`.
 pub(crate) fn long_range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
+        // `range_obj_to_bigint` of a machine int collects; the four fields
+        // come back off the shadow stack.
+        let _field_roots = pyre_object::gc_roots::push_roots();
         let (start, step, len, index) = pyre_object::w_long_range_iter_fields(args[0]);
-        let start_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(start));
-        let step_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(step));
-        let len_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(len));
-        let index_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(index));
-        let current = RBigIntGcRoot::new(&*start_b + &*index_b * &*step_b);
-        let stop = RBigIntGcRoot::new(&*start_b + &*len_b * &*step_b);
+        let field_base = pyre_object::gc_roots::pin_roots(&[start, step, len, index]);
+        let start_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(
+            pyre_object::gc_roots::shadow_stack_get(field_base),
+        ));
+        let step_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(
+            pyre_object::gc_roots::shadow_stack_get(field_base + 1),
+        ));
+        let len_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(
+            pyre_object::gc_roots::shadow_stack_get(field_base + 2),
+        ));
+        let index_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(
+            pyre_object::gc_roots::shadow_stack_get(field_base + 3),
+        ));
+        // Each product collects, so it is computed before `start_b` is read
+        // for the sum.
+        let index_offset = &*index_b * &*step_b;
+        let current = RBigIntGcRoot::new(&*start_b + &index_offset);
+        let len_offset = &*len_b * &*step_b;
+        let stop = RBigIntGcRoot::new(&*start_b + &len_offset);
         let _roots = pyre_object::gc_roots::push_roots();
         let w_current = pyre_object::range_bigint_to_obj(current.translated_alias());
         let _ = pyre_object::gc_roots::pin_root(w_current);
@@ -3776,20 +3994,36 @@ pub(crate) fn range_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
                     object_functionstr_type_name(args[1])
                 )));
             }
-            let mut state = pyre_object::range_obj_to_bigint(args[1]);
-            if state < BigInt::zero() {
-                state = BigInt::zero();
+            // `range_obj_to_bigint` of a machine int and the subtraction
+            // collect; the iterator and its fields come back off the shadow
+            // stack.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let iter_slot = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+            let mut state = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(
+                pyre_object::gc_roots::shadow_stack_get(iter_slot + 1),
+            ));
+            if *state < BigInt::zero() {
+                state.set(BigInt::zero());
             }
-            let (_start, _step, len_obj, index_obj) =
-                pyre_object::w_long_range_iter_fields(args[0]);
-            let len = pyre_object::range_obj_to_bigint(len_obj);
-            let index = pyre_object::range_obj_to_bigint(index_obj);
-            let remaining = &len - &index;
-            if state > remaining {
-                state = remaining;
+            let (_start, _step, len_obj, index_obj) = pyre_object::w_long_range_iter_fields(
+                pyre_object::gc_roots::shadow_stack_get(iter_slot),
+            );
+            let field_base = pyre_object::gc_roots::pin_roots(&[len_obj, index_obj]);
+            let len = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(
+                pyre_object::gc_roots::shadow_stack_get(field_base),
+            ));
+            let index = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(
+                pyre_object::gc_roots::shadow_stack_get(field_base + 1),
+            ));
+            let remaining = RBigIntGcRoot::new(len.sub(&*index));
+            if *state > *remaining {
+                state.set((*remaining).clone());
             }
-            let new_index = pyre_object::range_bigint_to_obj(index + state);
-            pyre_object::w_long_range_iter_set_index(args[0], new_index);
+            let new_index = pyre_object::range_bigint_to_obj(index.add(&*state));
+            pyre_object::w_long_range_iter_set_index(
+                pyre_object::gc_roots::shadow_stack_get(iter_slot),
+                new_index,
+            );
         }
     }
     Ok(w_none())
@@ -4882,6 +5116,8 @@ pub(crate) unsafe fn getindex_w_written(w_obj: PyObjectRef) -> Result<i64, PyErr
 
 #[inline(never)]
 unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+    let mut obj = obj;
+    let mut index = index;
     let mut value = value;
     if is_slice(index) {
         return setitem_bytearray_slice(obj, index, value);
@@ -4897,17 +5133,11 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = {
-            // `STORE_SUBSCR` pops all three operands before dispatching here.
-            // The bytearray needs the root to stay alive across this
-            // `__index__`; the assigned value additionally gets read back,
-            // since the caller may have written a movable object.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let base = pyre_object::gc_roots::pin_roots(&[obj, value]);
-            let indexed = space_index(index)?;
-            value = pyre_object::gc_roots::shadow_stack_get(base + 1);
-            indexed
-        };
+        // `STORE_SUBSCR` pops all three operands before dispatching here.
+        // Each `__index__` can collect; restore the receiver (and the
+        // assigned value) so the later `w_bytearray_len` / store hit the
+        // forwarded header.
+        let indexed = pyre_object::with_roots!(obj, index, value => space_index(index)?);
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -4931,13 +5161,7 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     let v = if is_int(value) {
         w_int_get_value(value)
     } else {
-        let indexed = {
-            // The value's own `__index__` runs Python too, and the bytearray
-            // written below is still unrooted at this point.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            space_index(value)?
-        };
+        let indexed = pyre_object::with_roots!(obj, value => space_index(value)?);
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -5001,6 +5225,7 @@ pub(crate) unsafe fn byte_w(value: PyObjectRef, noun: &str) -> Result<u8, PyErro
 /// otherwise an iterable of ints is range-checked element-wise.  A `str` or
 /// non-iterable source is rejected.
 unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError> {
+    let mut value = value;
     if let Some(src) = crate::typedef::buffer_as_bytes_like(value)? {
         return Ok(pyre_object::bytesobject::bytes_like_data(src).to_vec());
     }
@@ -5021,7 +5246,7 @@ unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError
     // infinite iterator that yields a bad byte still fails immediately).  A
     // source with no `__iter__` is the non-iterable "cannot convert" case; an
     // error raised *by* `__iter__`/`__next__` propagates unchanged.
-    let it = match crate::baseobjspace::iter(value) {
+    let it = match pyre_object::with_roots!(value => crate::baseobjspace::iter(value)) {
         Ok(it) => it,
         Err(e) => {
             if lookup(value, "__iter__").is_none() {
@@ -5033,10 +5258,14 @@ unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError
             return Err(e);
         }
     };
+    let mut it = it;
     let mut out = Vec::new();
     loop {
-        match crate::baseobjspace::next(it) {
-            Ok(w_item) => out.push(byte_w(w_item, "byte")?),
+        match pyre_object::with_roots!(it => crate::baseobjspace::next(it)) {
+            Ok(w_item) => {
+                let mut w_item = w_item;
+                out.push(pyre_object::with_roots!(it, w_item => byte_w(w_item, "byte"))?);
+            }
             Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
         }
@@ -5062,19 +5291,19 @@ unsafe fn setitem_bytearray_slice(
     // Both steps run Python — draining an arbitrary iterable source, then
     // every slice component's `__index__` — and `STORE_SUBSCR` popped the
     // receiver and the slice before dispatching here, so root them across the
-    // pair. A bytearray does not move; the root is for liveness alone.
-    let (sequence2, rs, rp, st) = {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::pin_roots(&[obj, index]);
-        let sequence2 = bytearray_assign_source(value)?;
-        let index = pyre_object::gc_roots::shadow_stack_get(base + 1);
-        let (rs, rp, st) = crate::sliceobject::slice_unpack(
+    // pair and reload the receiver after those callbacks. The RHS is rooted
+    // too: `bytearray_assign_source` calls `iter` / `next` on it.
+    let mut obj = obj;
+    let mut index = index;
+    let mut value = value;
+    let sequence2 = pyre_object::with_roots!(obj, index, value => bytearray_assign_source(value)?);
+    let (rs, rp, st) = pyre_object::with_roots!(obj, index => {
+        crate::sliceobject::slice_unpack(
             w_slice_get_start(index),
             w_slice_get_stop(index),
             w_slice_get_step(index),
-        )?;
-        (sequence2, rs, rp, st)
-    };
+        )
+    })?;
     let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
     let (start, stop, step, slicelength) =
         crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
@@ -5082,7 +5311,7 @@ unsafe fn setitem_bytearray_slice(
     // `_check_exports` is skipped for an equal-length write, so `m[0:2] = b'ZZ'`
     // remains legal while a buffer is exported but `m[0:1] = b'ZZZ'` is not.
     if sequence2.len() as i64 != slicelength {
-        crate::builtins::bytearray_check_exports(obj)?;
+        pyre_object::with_roots!(obj => crate::builtins::bytearray_check_exports(obj))?;
     }
     let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
     let old_size = vec.len();
@@ -7375,6 +7604,8 @@ pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     // captured here.
     let _roots = pyre_object::gc_roots::push_roots();
     let operands = pyre_object::gc_roots::pin_roots(&[obj, w_name]);
+    let obj = pyre_object::gc_roots::shadow_stack_get(operands);
+    let w_name = pyre_object::gc_roots::shadow_stack_get(operands + 1);
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     let result = if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
         // `getattr_str_impl` rather than `getattr_str`: this entry point already
@@ -7382,13 +7613,24 @@ pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
         // directly instead of letting `enrich_attribute_error_str` allocate a
         // fresh one, matching the `w_name`-taking `DescrOperation.getattr`.
         getattr_str_impl(
-            obj,
-            unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name) },
+            pyre_object::gc_roots::shadow_stack_get(operands),
+            unsafe {
+                pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(
+                    pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                        operands + 1,
+                    )),
+                )
+            },
             true,
             false,
         )
     } else {
-        unsafe { getattr_surrogate(obj, w_name, name) }
+        unsafe {
+            getattr_surrogate(
+                pyre_object::gc_roots::shadow_stack_get(operands),
+                pyre_object::gc_roots::shadow_stack_get(operands + 1),
+            )
+        }
     };
     result.map_err(|mut err| {
         err.enrich_attribute_error(
@@ -7409,16 +7651,33 @@ pub fn lookup_attr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
             crate::type_methods::arg_type_name(w_name)
         )));
     }
+    // Same livevar shape as `getattr`: a user `__getattribute__` collects, so
+    // the receiver, the wrapped name, and the WTF-8 view derived from it must
+    // be published and re-read rather than passed as the entry natives.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let operands = pyre_object::gc_roots::pin_roots(&[obj, w_name]);
+    let w_name = pyre_object::gc_roots::shadow_stack_get(operands + 1);
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
         getattr_str_impl(
-            obj,
-            unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name) },
+            pyre_object::gc_roots::shadow_stack_get(operands),
+            unsafe {
+                pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(
+                    pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                        operands + 1,
+                    )),
+                )
+            },
             true,
             true,
         )
     } else {
-        unsafe { getattr_surrogate(obj, w_name, name) }
+        unsafe {
+            getattr_surrogate(
+                pyre_object::gc_roots::shadow_stack_get(operands),
+                pyre_object::gc_roots::shadow_stack_get(operands + 1),
+            )
+        }
     }
 }
 
@@ -7464,12 +7723,25 @@ pub fn delattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
 /// generic-instance tail: terminal `__dict__` read, then the
 /// `__getattr__` hook on miss.  (A surrogate cannot match any of
 /// `getattr_str`'s builtin-type special-cases, all valid identifiers.)
-unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) -> PyResult {
+unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     unsafe {
-        if pyre_object::is_exact_type(obj, &pyre_object::descriptor::SUPER_TYPE) {
-            return super_getattribute(obj, w_name);
+        // `get_and_call_function` / `__getattr__` run Python. The caller's
+        // pin does not rewrite these natives (`eq_w` / `is_w`); publish
+        // both and reload after every collecting step. The WTF-8 view is
+        // re-derived from the live name, not kept as a borrow into the
+        // pre-move buffer.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_name);
+        let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let w_name = || pyre_object::gc_roots::shadow_stack_get(name_slot);
+        let name = || pyre_object::w_str_get_wtf8(w_name());
+        if pyre_object::is_exact_type(obj(), &pyre_object::descriptor::SUPER_TYPE) {
+            return super_getattribute(obj(), w_name());
         }
-        if let Some(w_type) = crate::typedef::r#type(obj)
+        if let Some(w_type) = crate::typedef::r#type(obj())
             && let Some(slot) = getattribute_if_not_from_object(w_type.as_ptr())
         {
             // DescrOperation._handle_getattribute calls the receiver's slot
@@ -7477,7 +7749,7 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
             // attribute name's encoding. Keep getattr_str_impl's existing
             // owner admission: builtin forwarding slots must not recurse
             // through this object-space entry point.
-            let owner_dispatches_getattribute = is_instance(obj)
+            let owner_dispatches_getattribute = is_instance(obj())
                 || lookup_where_with_method_cache(w_type.as_ptr(), "__getattribute__").is_some_and(
                     |(owner, found)| {
                         std::ptr::eq(found, slot)
@@ -7485,23 +7757,23 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
                                 || pyre_object::w_type_dispatches_own_getattribute(owner))
                     },
                 );
-            if !owner_dispatches_getattribute && pyre_object::descriptor::is_super(obj) {
-                return match super_getattribute(obj, w_name) {
+            if !owner_dispatches_getattribute && pyre_object::descriptor::is_super(obj()) {
+                return match super_getattribute(obj(), w_name()) {
                     Ok(value) => Ok(value),
                     Err(err) if err.kind == PyErrorKind::AttributeError => {
-                        instance_getattr_hook_or_err_wtf8(w_type.as_ptr(), obj, w_name, err)
+                        instance_getattr_hook_or_err_wtf8(w_type.as_ptr(), obj(), w_name(), err)
                     }
                     Err(err) => Err(err),
                 };
             }
             if owner_dispatches_getattribute {
-                match get_and_call_function(slot, obj, w_type.as_ptr(), &[w_name]) {
+                match get_and_call_function(slot, obj(), w_type.as_ptr(), &[w_name()]) {
                     Ok(value) => return Ok(value),
                     Err(err) if err.kind == PyErrorKind::AttributeError => {
                         return instance_getattr_hook_or_err_wtf8(
                             w_type.as_ptr(),
-                            obj,
-                            w_name,
+                            obj(),
+                            w_name(),
                             err,
                         );
                     }
@@ -7509,7 +7781,7 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
                 }
             }
         }
-        match object_getattribute_surrogate(obj, w_name, name) {
+        match object_getattribute_surrogate(obj(), w_name(), name()) {
             Ok(v) => Ok(v),
             Err(mut e) => {
                 // descroperation.py `_handle_getattribute`: only an
@@ -7526,14 +7798,14 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
                 // AttributeError — falls through to the class-level `__getattr__`
                 // on the module's type (descroperation.py:242-245), matching the
                 // non-surrogate path's `module_getattr_fallback`.
-                if is_module(obj) {
-                    let w_dict = pyre_object::w_module_get_w_dict(obj);
+                if is_module(obj()) {
+                    let w_dict = pyre_object::w_module_get_w_dict(obj());
                     let mut from_hook = false;
                     if !w_dict.is_null()
                         && let Some(mod_getattr) = finditem_str(w_dict, "__getattr__")?
                         && !mod_getattr.is_null()
                     {
-                        match crate::call::call_function_impl_result(mod_getattr, &[w_name]) {
+                        match crate::call::call_function_impl_result(mod_getattr, &[w_name()]) {
                             Ok(v) => return Ok(v),
                             Err(e2) if e2.kind == crate::PyErrorKind::AttributeError => {
                                 e = e2;
@@ -7546,7 +7818,7 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
                     // `__getattr__` claimed. A lone surrogate is still the
                     // attribute name (`text_w`).
                     if !from_hook {
-                        e = unsafe { module_miss_error(obj, name) }?;
+                        e = unsafe { module_miss_error(obj(), name()) }?;
                     }
                 }
                 // `space.lookup(w_obj, '__getattr__')` walks `type(w_obj)` —
@@ -7557,11 +7829,11 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
                 // staticmethod / classmethod / custom-descriptor `__getattr__`
                 // is handled.  The hook's result or its own exception is final.
                 let w_objtype =
-                    crate::typedef::r#type(obj).map_or(std::ptr::null_mut(), |p| p.as_ptr());
+                    crate::typedef::r#type(obj()).map_or(std::ptr::null_mut(), |p| p.as_ptr());
                 if !w_objtype.is_null()
                     && let Some(getattr_fn) = lookup_in_type_where(w_objtype, "__getattr__")
                 {
-                    return get_and_call_function(getattr_fn, obj, w_objtype, &[w_name]);
+                    return get_and_call_function(getattr_fn, obj(), w_objtype, &[w_name()]);
                 }
                 Err(e)
             }
@@ -7579,21 +7851,16 @@ unsafe fn instance_getattr_hook_or_err_wtf8(
     w_name: PyObjectRef,
     err: PyError,
 ) -> PyResult {
-    if let Some(hook) = lookup_in_type_where(w_type, "__getattr__") {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(obj);
-        let type_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_type);
-        let hook_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(hook);
-        let name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_name);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_type, obj, w_name]);
+    if let Some(hook) =
+        lookup_in_type_where(pyre_object::gc_roots::shadow_stack_get(base), "__getattr__")
+    {
         return get_and_call_function(
-            pyre_object::gc_roots::shadow_stack_get(hook_slot),
-            pyre_object::gc_roots::shadow_stack_get(obj_slot),
-            pyre_object::gc_roots::shadow_stack_get(type_slot),
-            &[pyre_object::gc_roots::shadow_stack_get(name_slot)],
+            hook,
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            pyre_object::gc_roots::shadow_stack_get(base),
+            &[pyre_object::gc_roots::shadow_stack_get(base + 2)],
         );
     }
     Err(err)
@@ -8363,32 +8630,37 @@ unsafe fn type_getattr_hook_or_err(
 /// shape: explicit annotations and the lazy cache belong to this type's own
 /// namespace and are never inherited from a base class.
 pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
+    // `w_dict_new` / `__annotate__` can collect. The type is an old-gen
+    // heap object; keep the caller's handle in the shadow stack and
+    // re-read it after those allocations (`framework.py` stack map).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+
     // `type.__annotations__` is the getset descriptor implementing this
     // operation, not annotations owned by the static builtin `type` itself.
     // Static builtin types cannot acquire annotations, so reject them before
     // consulting their namespace.  Heap types below may have an explicit
     // class-body entry with this name.
-    if !unsafe { pyre_object::w_type_is_cpython_heaptype(obj) } {
+    if !unsafe { pyre_object::w_type_is_cpython_heaptype(obj()) } {
         return Err(PyError::attribute_error(format!(
             "type object '{}' has no attribute '__annotations__'",
-            unsafe { w_type_get_name(obj) },
+            unsafe { w_type_get_name(obj()) },
         )));
     }
 
-    if let Some(value) = crate::type_dict_lookup(obj, "__annotations__") {
+    if let Some(value) = crate::type_dict_lookup(obj(), "__annotations__") {
         return Ok(value);
     }
-    if let Some(value) = crate::type_dict_lookup(obj, "__annotations_cache__") {
+    if let Some(value) = crate::type_dict_lookup(obj(), "__annotations_cache__") {
         return Ok(value);
     }
 
     // The callable is reached through `getattr(type, '__annotate__')`, so an
     // annotation-free class picks up the `__annotate_func__ = None` entry
     // `type_get_annotate` stamps on the miss.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(obj);
-    let annotate_fn = type_get_annotate(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+    let annotate_fn = type_get_annotate(obj())?;
     let annotate_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(annotate_fn);
     let annotations = if callable_w(pyre_object::gc_roots::shadow_stack_get(annotate_slot)) {
@@ -8408,14 +8680,8 @@ pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
     } else {
         pyre_object::w_dict_new()
     };
-    crate::type_dict_store(
-        pyre_object::gc_roots::shadow_stack_get(obj_slot),
-        "__annotations_cache__",
-        annotations,
-    );
-    pyre_object::gc_hook::try_gc_write_barrier(
-        pyre_object::gc_roots::shadow_stack_get(obj_slot) as *mut u8
-    );
+    crate::type_dict_store(obj(), "__annotations_cache__", annotations);
+    pyre_object::gc_hook::try_gc_write_barrier(obj() as *mut u8);
     Ok(annotations)
 }
 
@@ -13847,7 +14113,16 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
     // raises AttributeError rather than resolving a descriptor setter.
     // descroperation.py setattr — space.lookup for __setattr__ through MRO,
     // then get_and_call_function which applies descriptor binding.
+    // A user `__setattr__` (and `object_setattr`'s dict allocation) can
+    // collect; keep the receiver and the value in the livevar set and
+    // reload them at the call, the same way `gct_fv_gc_malloc` would.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(value);
     unsafe {
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
             // objspace.py:721-723 — dispatch only to a non-default
@@ -13856,13 +14131,10 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
             // `object.__setattr__` → `object_setattr` (wired from `typedef.rs`),
             // so skipping the descriptor call is equivalent).
             if let Some(sa) = setattr_if_not_from_object(w_type) {
-                let _name_roots = pyre_object::gc_roots::push_roots();
-                let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(obj);
+                // The name box allocation collects: `sa` joins the livevar
+                // set across it.
                 let sa_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(sa);
-                let value_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(value);
                 let name_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
                 return crate::call::call_function_impl_result(
@@ -13882,15 +14154,12 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
             // __setattr__; only a real override (≠ object.__setattr__)
             // needs invoking — the default terminal path is object_setattr.
             if let Some(sa) = setattr_if_not_from_object(w_type.as_ptr()) {
-                let _name_roots = pyre_object::gc_roots::push_roots();
-                let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(obj);
+                // The name box allocation collects: `sa` and `w_type` join
+                // the livevar set across it.
                 let sa_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(sa);
                 let type_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(w_type.as_ptr());
-                let value_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(value);
                 let name_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
                 return get_and_call_function(
@@ -13906,7 +14175,11 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
             }
         }
     }
-    object_setattr(obj, name, value)
+    object_setattr(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        name,
+        pyre_object::gc_roots::shadow_stack_get(value_slot),
+    )
 }
 
 /// Trace-time stability predicate for the walker's immutable-type
@@ -15795,39 +16068,46 @@ pub fn call_args_and_c_profile_args(
 /// either the attribute lookup or the call itself raises — same bare-
 /// PyObjectRef contract as `call_function_impl_raw`.
 pub fn call_method(obj: PyObjectRef, methname: &str, args: &[PyObjectRef]) -> PyObjectRef {
-    match method_descriptor_shortcut(obj, methname) {
-        Ok(Some(w_descr)) => {
-            // `callmethod.py` — `space.call_function(w_descr, w_obj, *arg_w)`.
-            // `Arguments.prepend` builds the receiver-first list upstream; the
-            // vector below is that list, filled from the published slots so a
-            // collection inside the fill cannot leave a pre-move address in it.
-            let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.publish(&[w_descr, obj]);
-            let arg_base = roots.publish(args);
-            // `publish` writes the raw words; the set is only complete once
-            // both slices are on the stack, which is why the forwarding query
-            // runs here rather than per slice.
-            roots.normalize(base, 2 + args.len());
-            let mut call_args = Vec::with_capacity(1 + args.len());
-            call_args.push(roots.get(base + 1));
-            for i in 0..args.len() {
-                call_args.push(roots.get(arg_base + i));
-            }
-            call_function(roots.get(base), &call_args)
-        }
-        Ok(None) => match getattr_str(obj, methname) {
-            // `callmethod.py` — `w_meth = space.getattr(w_obj, w_name)`.
-            Ok(method) => call_function(method, args),
-            Err(e) => {
-                crate::call::set_call_error(e);
-                pyre_object::PY_NULL
-            }
-        },
+    // The receiver and the arguments are livevars across the lookup, which
+    // can run app-level code (`getdictvalue`, `__getattribute__`) and so
+    // collect: publish both slices before the one normalizing query, then
+    // read them back from their slots.
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.publish(&[obj]);
+    let arg_base = roots.publish(args);
+    roots.normalize(obj_slot, 1 + args.len());
+    let w_descr = match method_descriptor_shortcut(roots.get(obj_slot), methname) {
+        Ok(Some(w_descr)) => w_descr,
+        Ok(None) => pyre_object::PY_NULL,
         Err(e) => {
             crate::call::set_call_error(e);
-            pyre_object::PY_NULL
+            return pyre_object::PY_NULL;
         }
+    };
+    // `callmethod.py call_method_opt` — the fast path is
+    // `space.call_function(w_descr, w_obj, *arg_w)`; `Arguments.prepend`
+    // builds the receiver-first list upstream. Otherwise `w_meth =
+    // space.getattr(w_obj, w_name)` is called with the arguments alone.
+    let prepend_receiver = !w_descr.is_null();
+    let w_callable = if prepend_receiver {
+        w_descr
+    } else {
+        match getattr_str(roots.get(obj_slot), methname) {
+            Ok(method) => method,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                return pyre_object::PY_NULL;
+            }
+        }
+    };
+    let mut call_args = Vec::with_capacity(prepend_receiver as usize + args.len());
+    if prepend_receiver {
+        call_args.push(roots.get(obj_slot));
     }
+    for i in 0..args.len() {
+        call_args.push(roots.get(arg_base + i));
+    }
+    call_function(w_callable, &call_args)
 }
 
 /// `callmethod.py call_method_opt`, for the callers that propagate a
@@ -15837,21 +16117,29 @@ pub fn call_method_result(
     methname: &str,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, PyError> {
-    if let Some(w_descr) = method_descriptor_shortcut(obj, methname)? {
-        let roots = pyre_object::gc_roots::push_roots();
-        let base = roots.publish(&[w_descr, obj]);
-        let arg_base = roots.publish(args);
-        // See `call_method`: one query for the whole published set.
-        roots.normalize(base, 2 + args.len());
-        let mut call_args = Vec::with_capacity(1 + args.len());
-        call_args.push(roots.get(base + 1));
-        for i in 0..args.len() {
-            call_args.push(roots.get(arg_base + i));
-        }
-        return crate::call::call_function_impl_result(roots.get(base), &call_args);
+    // Same livevar set and call shape as `call_method`.
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.publish(&[obj]);
+    let arg_base = roots.publish(args);
+    roots.normalize(obj_slot, 1 + args.len());
+    let w_descr = match method_descriptor_shortcut(roots.get(obj_slot), methname)? {
+        Some(w_descr) => w_descr,
+        None => pyre_object::PY_NULL,
+    };
+    let prepend_receiver = !w_descr.is_null();
+    let w_callable = if prepend_receiver {
+        w_descr
+    } else {
+        getattr_str(roots.get(obj_slot), methname)?
+    };
+    let mut call_args = Vec::with_capacity(prepend_receiver as usize + args.len());
+    if prepend_receiver {
+        call_args.push(roots.get(obj_slot));
     }
-    let method = getattr_str(obj, methname)?;
-    crate::call::call_function_impl_result(method, args)
+    for i in 0..args.len() {
+        call_args.push(roots.get(arg_base + i));
+    }
+    crate::call::call_function_impl_result(w_callable, &call_args)
 }
 
 /// `callmethod.py call_method_opt:134-142` — the descriptor a method call may
@@ -15893,10 +16181,14 @@ fn method_descriptor_shortcut(
     }
     // `callmethod.py` — `w_value = w_obj.getdictvalue(space, methname)`;
     // an instance entry of that name is the bound-method path's answer.
+    // `getdictvalue` can run app-level code, so the descriptor is pinned
+    // across it.
+    let roots = pyre_object::gc_roots::push_roots();
+    let descr_slot = roots.pin_roots(&[w_descr]);
     if getdictvalue(obj, methname)?.is_some() {
         return Ok(None);
     }
-    Ok(Some(w_descr))
+    Ok(Some(roots.get(descr_slot)))
 }
 
 /// PyPy: baseobjspace.py `call_function`.
@@ -17748,7 +18040,9 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             if let Some(w_iter) = builtin_iter_override(obj, &pyre_object::TUPLE_TYPE)? {
                 return Ok(w_iter);
             }
-            return Ok(pyre_object::w_tuple_iter_new(obj));
+            return Ok(pyre_object::w_tuple_iter_new(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            ));
         }
         if pyre_object::is_generic_alias(obj) {
             // CPython 3.14 `ga_iter`: the iterator retains the unstarred alias
@@ -17765,6 +18059,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             // Code-point count (not byte count) seeds the sequence
             // iterator, read straight from the cached length so a
             // lone-surrogate backing does not panic.
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let len = w_str_len(obj);
             return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
@@ -17784,6 +18079,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             // single item is consumed, freeze a bytearray against
             // mid-iteration mutation, and report the list rather than the
             // bytes in `__reduce__`.
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let len = pyre_object::bytesobject::bytes_like_len(obj);
             return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
@@ -17823,7 +18119,9 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             if let Some(w_iter) = builtin_iter_override(obj, base)? {
                 return Ok(w_iter);
             }
-            return Ok(pyre_object::w_set_iter_new(obj));
+            return Ok(pyre_object::w_set_iter_new(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            ));
         }
         if pyre_object::is_set_iterator(obj) {
             return Ok(obj);
@@ -17853,7 +18151,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             {
                 return Ok(w_iter);
             }
-            return Ok(obj);
+            return Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         }
         // CPython 3.14 batched is likewise self-iterating while permitting a
         // heap subtype to replace `__iter__`.
@@ -17863,7 +18161,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             {
                 return Ok(w_iter);
             }
-            return Ok(obj);
+            return Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         }
         // PyPy W_Product.iter_w returns self, with normal heap-subtype
         // override dispatch.
@@ -17873,7 +18171,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             {
                 return Ok(w_iter);
             }
-            return Ok(obj);
+            return Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         }
         if pyre_object::interp_itertools::is_combinations(obj) {
             if let Some(w_iter) =
@@ -17881,16 +18179,18 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             {
                 return Ok(w_iter);
             }
-            return Ok(obj);
+            return Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         }
         if pyre_object::interp_itertools::is_combinations_with_replacement(obj) {
             let exact =
                 get_instantiate(&pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE);
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             if !std::ptr::eq((*obj).w_class, exact)
                 && let Some((src, method)) =
                     lookup_where_with_method_cache((*obj).w_class, "__iter__")
                 && !std::ptr::eq(src, exact)
             {
+                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 if is_none(method) {
                     return Err(PyError::type_error(format!(
                         "'{}' object is not iterable",
@@ -17900,7 +18200,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                 let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
                 return iter_check_is_iterator(w_iter);
             }
-            return Ok(obj);
+            return Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         }
         if pyre_object::interp_itertools::is_permutations(obj) {
             if let Some(w_iter) =
@@ -17908,7 +18208,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             {
                 return Ok(w_iter);
             }
-            return Ok(obj);
+            return Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         }
         if pyre_object::interp_itertools::is_groupby(obj) {
             if let Some(w_iter) =
@@ -17916,7 +18216,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             {
                 return Ok(w_iter);
             }
-            return Ok(obj);
+            return Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         }
         // itertools native iterators — iter_w returns self.
         // PyPy: W_Count.iter_w / W_Repeat.iter_w / W_TakeWhile.iter_w /
@@ -18437,17 +18737,44 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //             raise OperationError(self.space.w_StopIteration, self.space.w_None)
         //         return w_obj
         if pyre_object::interp_itertools::is_takewhile(obj) {
-            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_TakeWhile);
-            if it.stopped {
+            // `space.next`, `call_function`, and `is_true`/`__bool__` all run
+            // Python and can move the takewhile and the yielded item. Pin both
+            // and write `stopped` through the re-read owner.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            if (*(w_self as *const pyre_object::interp_itertools::W_TakeWhile)).stopped {
                 return Err(PyError::stop_iteration());
             }
-            let w_obj = next(it.w_iterable)?;
-            let w_bool = crate::call::call_function_impl_result(it.w_predicate, &[w_obj])?;
-            if !is_true(w_bool)? {
-                it.stopped = true;
+            let w_iterable =
+                (*(w_self as *const pyre_object::interp_itertools::W_TakeWhile)).w_iterable;
+            let w_obj = {
+                let _iter_roots = pyre_object::gc_roots::push_roots();
+                let _ = pyre_object::gc_roots::pin_root(w_iterable);
+                let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                next(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?
+            };
+            let _r = pyre_object::gc_roots::push_roots();
+            let _ = pyre_object::gc_roots::pin_root(w_obj);
+            let w_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_predicate = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                as *const pyre_object::interp_itertools::W_TakeWhile))
+                .w_predicate;
+            let _ = pyre_object::gc_roots::pin_root(w_predicate);
+            let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_bool = crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(predicate_slot),
+                &[pyre_object::gc_roots::shadow_stack_get(w_obj_slot)],
+            )?;
+            let _ = pyre_object::gc_roots::pin_root(w_bool);
+            let bool_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            if !is_true(pyre_object::gc_roots::shadow_stack_get(bool_slot))? {
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                (*(w_self as *mut pyre_object::interp_itertools::W_TakeWhile)).stopped = true;
                 return Err(PyError::stop_iteration());
             }
-            return Ok(w_obj);
+            return Ok(pyre_object::gc_roots::shadow_stack_get(w_obj_slot));
         }
         // itertools.dropwhile — interp_itertools.py W_DropWhile.next_w
         //
@@ -18463,20 +18790,54 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //                     break
         //         return w_obj
         if pyre_object::interp_itertools::is_dropwhile(obj) {
-            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_DropWhile);
-            let w_obj = if it.started {
-                next(it.w_iterable)?
-            } else {
-                loop {
-                    let w_obj = next(it.w_iterable)?;
-                    let w_bool = crate::call::call_function_impl_result(it.w_predicate, &[w_obj])?;
-                    if !is_true(w_bool)? {
-                        it.started = true;
-                        break w_obj;
-                    }
+            // Same livevar set as `W_TakeWhile.next_w`: pin the owner and every
+            // yielded item that lives across `next` / the predicate / `is_true`,
+            // and write `started` through the re-read owner.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            if (*(w_self as *const pyre_object::interp_itertools::W_DropWhile)).started {
+                let w_iterable =
+                    (*(w_self as *const pyre_object::interp_itertools::W_DropWhile)).w_iterable;
+                let w_obj = {
+                    let _iter_roots = pyre_object::gc_roots::push_roots();
+                    let _ = pyre_object::gc_roots::pin_root(w_iterable);
+                    let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    next(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?
+                };
+                return Ok(w_obj);
+            }
+            loop {
+                let w_iterable = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                    as *const pyre_object::interp_itertools::W_DropWhile))
+                    .w_iterable;
+                let w_obj = {
+                    let _iter_roots = pyre_object::gc_roots::push_roots();
+                    let _ = pyre_object::gc_roots::pin_root(w_iterable);
+                    let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    next(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?
+                };
+                let _r = pyre_object::gc_roots::push_roots();
+                let _ = pyre_object::gc_roots::pin_root(w_obj);
+                let w_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let w_predicate = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                    as *const pyre_object::interp_itertools::W_DropWhile))
+                    .w_predicate;
+                let _ = pyre_object::gc_roots::pin_root(w_predicate);
+                let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let w_bool = crate::call::call_function_impl_result(
+                    pyre_object::gc_roots::shadow_stack_get(predicate_slot),
+                    &[pyre_object::gc_roots::shadow_stack_get(w_obj_slot)],
+                )?;
+                let _ = pyre_object::gc_roots::pin_root(w_bool);
+                let bool_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                if !is_true(pyre_object::gc_roots::shadow_stack_get(bool_slot))? {
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    (*(w_self as *mut pyre_object::interp_itertools::W_DropWhile)).started = true;
+                    return Ok(pyre_object::gc_roots::shadow_stack_get(w_obj_slot));
                 }
-            };
-            return Ok(w_obj);
+            }
         }
         // itertools.filterfalse — W_Filter.next_w (functional.py) with
         // reverse=True; the trailing _filter_jitdriver loop applies the
@@ -18492,17 +18853,42 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //         if pred ^ self.reverse:
         //             return w_obj
         if pyre_object::interp_itertools::is_filterfalse(obj) {
-            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_FilterFalse);
+            // `W_Filter.next_w` with `reverse=True`. Pin the filterfalse and
+            // the yielded item across `next` / the predicate / `is_true`.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             loop {
-                let w_obj = next(it.w_iterable)?;
-                let pred = if it.w_predicate.is_null() {
-                    is_true(w_obj)?
+                let w_iterable = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                    as *const pyre_object::interp_itertools::W_FilterFalse))
+                    .w_iterable;
+                let w_obj = {
+                    let _iter_roots = pyre_object::gc_roots::push_roots();
+                    let _ = pyre_object::gc_roots::pin_root(w_iterable);
+                    let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    next(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?
+                };
+                let _r = pyre_object::gc_roots::push_roots();
+                let _ = pyre_object::gc_roots::pin_root(w_obj);
+                let w_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let w_predicate = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                    as *const pyre_object::interp_itertools::W_FilterFalse))
+                    .w_predicate;
+                let pred = if w_predicate.is_null() {
+                    is_true(pyre_object::gc_roots::shadow_stack_get(w_obj_slot))?
                 } else {
-                    let w_pred = crate::call::call_function_impl_result(it.w_predicate, &[w_obj])?;
-                    is_true(w_pred)?
+                    let _ = pyre_object::gc_roots::pin_root(w_predicate);
+                    let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    let w_pred = crate::call::call_function_impl_result(
+                        pyre_object::gc_roots::shadow_stack_get(predicate_slot),
+                        &[pyre_object::gc_roots::shadow_stack_get(w_obj_slot)],
+                    )?;
+                    let _ = pyre_object::gc_roots::pin_root(w_pred);
+                    let pred_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    is_true(pyre_object::gc_roots::shadow_stack_get(pred_slot))?
                 };
                 if !pred {
-                    return Ok(w_obj);
+                    return Ok(pyre_object::gc_roots::shadow_stack_get(w_obj_slot));
                 }
             }
         }
@@ -19427,17 +19813,29 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let w_initial =
                 (*(w_self as *const pyre_object::interp_itertools::W_Accumulate)).w_initial;
             if !pyre_object::is_none(w_initial) {
-                pyre_object::interp_itertools::w_accumulate_set_total(w_self, w_initial);
+                let _ = pyre_object::gc_roots::pin_root(w_initial);
+                let initial_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                pyre_object::interp_itertools::w_accumulate_set_total(
+                    w_self,
+                    pyre_object::gc_roots::shadow_stack_get(initial_slot),
+                );
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 pyre_object::interp_itertools::w_accumulate_set_initial(
                     w_self,
                     pyre_object::w_none(),
                 );
-                return Ok(w_initial);
+                return Ok(pyre_object::gc_roots::shadow_stack_get(initial_slot));
             }
 
             let w_iterable =
                 (*(w_self as *const pyre_object::interp_itertools::W_Accumulate)).w_iterable;
-            let w_value = next(w_iterable)?;
+            let w_value = {
+                let _iter_roots = pyre_object::gc_roots::push_roots();
+                let _ = pyre_object::gc_roots::pin_root(w_iterable);
+                let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                next(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?
+            };
             let w_value = pyre_object::gc_roots::pin_root(w_value);
             let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
@@ -19445,7 +19843,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             if w_total.is_null() {
                 let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
                 pyre_object::interp_itertools::w_accumulate_set_total(w_self, w_value);
-                return Ok(w_value);
+                return Ok(pyre_object::gc_roots::shadow_stack_get(value_slot));
             }
 
             let _ = pyre_object::gc_roots::pin_root(w_total);
@@ -19469,9 +19867,14 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     ],
                 )?
             };
+            let _ = pyre_object::gc_roots::pin_root(w_total);
+            let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            pyre_object::interp_itertools::w_accumulate_set_total(w_self, w_total);
-            return Ok(w_total);
+            pyre_object::interp_itertools::w_accumulate_set_total(
+                w_self,
+                pyre_object::gc_roots::shadow_stack_get(result_slot),
+            );
+            return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
         }
         // itertools.zip_longest — interp_itertools.py W_ZipLongest.next_w.
         // Each source remains live and is advanced once per output tuple;
@@ -19497,7 +19900,15 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let w_obj = if pyre_object::is_none(w_iter) {
                     state.w_fillvalue
                 } else {
-                    match next(w_iter) {
+                    // Pin the source iterator in a nested bracket so it does
+                    // not sit among the yielded-item slots counted below.
+                    let next_result = {
+                        let _iter_roots = pyre_object::gc_roots::push_roots();
+                        let _ = pyre_object::gc_roots::pin_root(w_iter);
+                        let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                        next(pyre_object::gc_roots::shadow_stack_get(iter_slot))
+                    };
+                    match next_result {
                         Ok(w_obj) => w_obj,
                         Err(e) if e.matches_stop_iteration() => {
                             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
@@ -19649,8 +20060,14 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     0,
                 )
                 .unwrap();
-                let item = next(iterator)?;
-                return Ok(pyre_object::w_tuple_new(vec![item]));
+                let _ = pyre_object::gc_roots::pin_root(iterator);
+                let iterator_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let item = next(pyre_object::gc_roots::shadow_stack_get(iterator_slot))?;
+                let _ = pyre_object::gc_roots::pin_root(item);
+                let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                return Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::gc_roots::shadow_stack_get(item_slot),
+                ]));
             }
             if length == 2 {
                 let iterator0 = pyre_object::w_list_getitem(
@@ -19819,7 +20236,13 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //                 self.saved_w.append(w_obj)
         //         return w_obj
         if pyre_object::interp_itertools::is_cycle(obj) {
-            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_Cycle);
+            // `space.next` and `saved.append` both allocate. Pin the cycle and
+            // the yielded item, and write `index` through the re-read owner.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let it = &*(w_self as *const pyre_object::interp_itertools::W_Cycle);
             // Cycling pass (index > 0): replay `saved` after the source ended.
             if it.index > 0 {
                 let n = pyre_object::w_list_len(it.saved) as i64;
@@ -19829,27 +20252,49 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 if it.index < n {
                     let w_obj = pyre_object::w_list_getitem(it.saved, it.index)
                         .expect("cycle saved index in range");
-                    it.index += 1;
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    (*(w_self as *mut pyre_object::interp_itertools::W_Cycle)).index += 1;
                     return Ok(w_obj);
                 }
                 // `IndexError` — wrap to the start; index left at 1 so the
                 // next call reads `saved[1]`.
-                it.index = 1;
-                return Ok(pyre_object::w_list_getitem(it.saved, 0).expect("cycle saved non-empty"));
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                (*(w_self as *mut pyre_object::interp_itertools::W_Cycle)).index = 1;
+                let saved = (*(w_self as *const pyre_object::interp_itertools::W_Cycle)).saved;
+                return Ok(pyre_object::w_list_getitem(saved, 0).expect("cycle saved non-empty"));
             }
             // First pass (index == 0): pull from the source, saving each.
-            match next(it.w_iterable) {
+            let w_iterable =
+                (*(w_self as *const pyre_object::interp_itertools::W_Cycle)).w_iterable;
+            let next_result = {
+                let _iter_roots = pyre_object::gc_roots::push_roots();
+                let _ = pyre_object::gc_roots::pin_root(w_iterable);
+                let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                next(pyre_object::gc_roots::shadow_stack_get(iterable_slot))
+            };
+            match next_result {
                 Ok(w_obj) => {
-                    pyre_object::w_list_append(it.saved, w_obj);
-                    return Ok(w_obj);
+                    let _ = pyre_object::gc_roots::pin_root(w_obj);
+                    let w_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    let saved = (*(w_self as *const pyre_object::interp_itertools::W_Cycle)).saved;
+                    let _ = pyre_object::gc_roots::pin_root(saved);
+                    let saved_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    pyre_object::w_list_append(
+                        pyre_object::gc_roots::shadow_stack_get(saved_slot),
+                        pyre_object::gc_roots::shadow_stack_get(w_obj_slot),
+                    );
+                    return Ok(pyre_object::gc_roots::shadow_stack_get(w_obj_slot));
                 }
                 Err(e) if e.matches_stop_iteration() => {
-                    it.index = 1;
-                    if pyre_object::w_list_len(it.saved) == 0 {
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    (*(w_self as *mut pyre_object::interp_itertools::W_Cycle)).index = 1;
+                    let saved = (*(w_self as *const pyre_object::interp_itertools::W_Cycle)).saved;
+                    if pyre_object::w_list_len(saved) == 0 {
                         return Err(PyError::stop_iteration());
                     }
                     return Ok(
-                        pyre_object::w_list_getitem(it.saved, 0).expect("cycle saved non-empty")
+                        pyre_object::w_list_getitem(saved, 0).expect("cycle saved non-empty")
                     );
                 }
                 Err(e) => return Err(e),
@@ -19893,18 +20338,21 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     // StopIteration from `w_iterables` means the outer
                     // iterator is exhausted — `_handle_error` sets
                     // `w_iterables = None` before re-raising.
-                    let w_iterable = match next(w_iterables) {
-                        Ok(w) => w,
-                        Err(e) if e.matches_stop_iteration() => {
-                            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                            pyre_object::interp_itertools::w_chain_set_iterables(
-                                w_self,
-                                std::ptr::null_mut(),
-                            );
-                            return Err(e);
-                        }
-                        Err(e) => return Err(e),
-                    };
+                    let _ = pyre_object::gc_roots::pin_root(w_iterables);
+                    let iterables_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    let w_iterable =
+                        match next(pyre_object::gc_roots::shadow_stack_get(iterables_slot)) {
+                            Ok(w) => w,
+                            Err(e) if e.matches_stop_iteration() => {
+                                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                                pyre_object::interp_itertools::w_chain_set_iterables(
+                                    w_self,
+                                    std::ptr::null_mut(),
+                                );
+                                return Err(e);
+                            }
+                            Err(e) => return Err(e),
+                        };
                     let w_it_result = {
                         let _iter_roots = pyre_object::gc_roots::push_roots();
                         let _ = pyre_object::gc_roots::pin_root(w_iterable);
@@ -19932,7 +20380,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 }
                 let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 let w_it = pyre_object::interp_itertools::w_chain_get_it(w_self);
-                match next(w_it) {
+                let _ = pyre_object::gc_roots::pin_root(w_it);
+                let it_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                match next(pyre_object::gc_roots::shadow_stack_get(it_slot)) {
                     Ok(w_obj) => return Ok(w_obj),
                     Err(e) if e.matches_stop_iteration() => {
                         // Sub-iterator exhausted — advance to the next iterable.
@@ -20075,11 +20525,24 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // this call's result.
         if pyre_object::operation::is_callable_iterator(obj) {
             use pyre_object::operation as ci;
-            let callable = ci::w_callable_iterator_get_callable(obj);
+            // The zero-arg callable, sentinel `__eq__`, and `is_true` all run
+            // Python. Pin the iterator and every GC local that lives across
+            // those calls; latch `it_callable` through the re-read owner.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let callable = ci::w_callable_iterator_get_callable(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            );
             if callable.is_null() {
                 return Err(PyError::stop_iteration());
             }
-            let result = match crate::call::call_function_impl_result(callable, &[]) {
+            let _ = pyre_object::gc_roots::pin_root(callable);
+            let callable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let result = match crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(callable_slot),
+                &[],
+            ) {
                 Ok(r) => r,
                 Err(e) if e.matches_stop_iteration() => {
                     // `calliter_iternext`: when the callable itself raises
@@ -20088,24 +20551,47 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     // StopIteration is cleared and replaced with a bare one —
                     // its value/message does not leak to the consumer.
                     let _ = e;
-                    ci::w_callable_iterator_set_callable(obj, pyre_object::PY_NULL);
+                    ci::w_callable_iterator_set_callable(
+                        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                        pyre_object::PY_NULL,
+                    );
                     return Err(PyError::stop_iteration());
                 }
                 Err(e) => return Err(e),
             };
+            let _ = pyre_object::gc_roots::pin_root(result);
+            let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             // Re-check `it_callable` after the call: the callable may have
             // re-entered `next()` on this same iterator and latched it to
             // `PY_NULL`, exhausting it; discard the result and stay stopped
             // rather than comparing a stale value to the sentinel.
-            if ci::w_callable_iterator_get_callable(obj).is_null() {
+            if ci::w_callable_iterator_get_callable(pyre_object::gc_roots::shadow_stack_get(
+                obj_slot,
+            ))
+            .is_null()
+            {
                 return Err(PyError::stop_iteration());
             }
-            let sentinel = ci::w_callable_iterator_get_sentinel(obj);
-            if is_true(compare(result, sentinel, CompareOp::Eq)?)? {
-                ci::w_callable_iterator_set_callable(obj, pyre_object::PY_NULL);
+            let sentinel = ci::w_callable_iterator_get_sentinel(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            );
+            let _ = pyre_object::gc_roots::pin_root(sentinel);
+            let sentinel_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_eq = compare(
+                pyre_object::gc_roots::shadow_stack_get(result_slot),
+                pyre_object::gc_roots::shadow_stack_get(sentinel_slot),
+                CompareOp::Eq,
+            )?;
+            let _ = pyre_object::gc_roots::pin_root(w_eq);
+            let eq_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            if is_true(pyre_object::gc_roots::shadow_stack_get(eq_slot))? {
+                ci::w_callable_iterator_set_callable(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    pyre_object::PY_NULL,
+                );
                 return Err(PyError::stop_iteration());
             }
-            return Ok(result);
+            return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
         }
         if pyre_object::functional::is_enumerate(obj) {
             use pyre_object::functional as eo;
@@ -20118,7 +20604,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let w_index_slot = eo::w_enumerate_get_w_index(obj);
             let mut w_iter_or_list = eo::w_enumerate_get_iter_or_list(obj);
-            let mut w_item: PyObjectRef = pyre_object::PY_NULL;
+            let mut result_item_slot: Option<usize> = None;
             let w_index: PyObjectRef;
             if w_index_slot.is_null() {
                 // i64 fast-path branch.
@@ -20132,8 +20618,14 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         eo::w_enumerate_set_iter_or_list(obj, pyre_object::PY_NULL);
                         return Err(PyError::stop_iteration());
                     }
-                    w_item = pyre_object::w_list_getitem(w_iter_or_list, index).unwrap_or(PY_NULL);
-                    eo::w_enumerate_set_index(obj, index + 1);
+                    let w_item =
+                        pyre_object::w_list_getitem(w_iter_or_list, index).unwrap_or(PY_NULL);
+                    let _ = pyre_object::gc_roots::pin_root(w_item);
+                    result_item_slot = Some(pyre_object::gc_roots::shadow_stack_len() - 1);
+                    eo::w_enumerate_set_index(
+                        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                        index + 1,
+                    );
                 } else if w_iter_or_list.is_null() {
                     // `:295-296` — slot cleared after a previous
                     // list-getitem stop.
@@ -20188,8 +20680,10 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             }
             let _ = pyre_object::gc_roots::pin_root(w_index);
             let result_index_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            if w_item.is_null() {
-                // Re-read slot — list fast-path already set w_item;
+            let result_item_slot = if let Some(slot) = result_item_slot {
+                slot
+            } else {
+                // Re-read slot — list fast-path already set the item;
                 // otherwise we need to pull from the iterator.
                 let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 w_iter_or_list = eo::w_enumerate_get_iter_or_list(obj);
@@ -20198,11 +20692,13 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 }
                 let _ = pyre_object::gc_roots::pin_root(w_iter_or_list);
                 let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                w_item = next(pyre_object::gc_roots::shadow_stack_get(iter_slot))?;
-            }
+                let w_item = next(pyre_object::gc_roots::shadow_stack_get(iter_slot))?;
+                let _ = pyre_object::gc_roots::pin_root(w_item);
+                pyre_object::gc_roots::shadow_stack_len() - 1
+            };
             return Ok(pyre_object::w_tuple_new(vec![
                 pyre_object::gc_roots::shadow_stack_get(result_index_slot),
-                w_item,
+                pyre_object::gc_roots::shadow_stack_get(result_item_slot),
             ]));
         }
         // `pypy/module/__builtin__/functional.py descr_next
@@ -20338,11 +20834,17 @@ unsafe fn property_copy(
     let w_type = crate::typedef::r#type(prop)
         .map(|p| p.as_ptr())
         .unwrap_or_else(|| crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE));
+    // `W_Property._copy` calls the subclass constructor, then reads
+    // `self.w_name`. `gct_direct_call` / `get_livevars_for_roots` reloads
+    // `self` after that call.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let prop_slot = pyre_object::gc_roots::pin_roots(&[prop]);
     let w_res = crate::call::call_function_impl_result(w_type, &[getter, setter, deleter, w_doc])?;
-    // descriptor.py `if isinstance(w_res, W_Property): w_res.w_name
-    // = self.w_name` — the copy keeps the source's name.
+    // `isinstance(w_res, W_Property)` then `w_res.w_name = self.w_name`.
     if is_property(w_res) {
-        let w_name = pyre_object::descriptor::w_property_get_name(prop);
+        let w_name = pyre_object::descriptor::w_property_get_name(
+            pyre_object::gc_roots::shadow_stack_get(prop_slot),
+        );
         if !w_name.is_null() {
             pyre_object::descriptor::w_property_set_name(w_res, w_name);
         }
@@ -20357,21 +20859,33 @@ unsafe fn property_no_accessor(
     obj: PyObjectRef,
     kind: &str,
 ) -> Result<crate::PyError, crate::PyError> {
-    let qualname = match crate::typedef::r#type(obj) {
-        Some(w_type) => match getattr_str(w_type.as_ptr(), "__qualname__") {
+    // `W_Property._properror` reads `type(w_obj).__qualname__`, then `self`.
+    // The qualname lookup can run Python; reload both afterwards
+    // (`get_livevars_for_roots`).
+    let w_type_ptr =
+        crate::typedef::r#type(obj).map_or(std::ptr::null_mut(), |w_type| w_type.as_ptr());
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[prop, w_type_ptr]);
+    let qualname = if w_type_ptr.is_null() {
+        unsafe { (*(*obj).ob_type).name.to_string() }
+    } else {
+        match getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            "__qualname__",
+        ) {
             // A `__qualname__` holding a lone surrogate is ordinary Python, and
             // this message is only ever displayed, so escape what has no `&str`
-            // form rather than aborting. The escape is visible where CPython
-            // shows the raw surrogate — `PyError::message` is a `String`, so
+            // form rather than aborting. The escape is visible where the raw
+            // surrogate would be shown — `PyError::message` is a `String`, so
             // the exact spelling waits on that field becoming WTF-8.
             Ok(q) if !q.is_null() && is_str(q) => unsafe { crate::display::py_str_display(q) },
-            _ => pyre_object::w_type_get_name(w_type.as_ptr()).to_string(),
-        },
-        None => (*(*obj).ob_type).name.to_string(),
+            _ => pyre_object::w_type_get_name(pyre_object::gc_roots::shadow_stack_get(base + 1))
+                .to_string(),
+        }
     };
-    // CPython 3.14 property_name: an explicitly assigned/set_name value wins;
-    // otherwise fall back to fget.__name__.  PyPy's object-resident name slot
-    // shape is retained; only the 3.14 lookup extension is added.
+    // An explicitly assigned/set_name value wins; otherwise fall back to
+    // `fget.__name__`. The name stays on the property object.
+    let prop = pyre_object::gc_roots::shadow_stack_get(base);
     let mut w_name = pyre_object::descriptor::w_property_get_name(prop);
     if w_name.is_null() {
         let fget = w_property_get_fget(prop);
@@ -20517,8 +21031,10 @@ pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
 ///
 /// Ordinary completion leaves finalization on the collector's own schedule.
 /// An explicit close first asks whether the graph behind the references being
-/// cleared contains a pending finalizer; only that case pays the non-moving
-/// major needed to reproduce CPython's prompt refcount boundary.
+/// cleared contains a pending finalizer; only that case pays the full
+/// collection (`incminimark.collect(2)`) needed to discover nursery-born
+/// `hasuserdel` instances and reproduce the prompt refcount boundary of 3.14
+/// `gen_close`.
 pub unsafe fn generator_frame_is_finished(
     gen_obj: PyObjectRef,
     frame: &mut crate::pyframe::PyFrame,
@@ -20574,20 +21090,19 @@ pub(crate) fn take_pending_close_finalizer() -> bool {
     unsafe { (*ec).pending_close_finalizer.replace(false) }
 }
 
-/// CPython 3.14 `gen_close` / `_PyFrame_ClearExceptCode`: releasing the
-/// generator frame is an observable refcount boundary, so an object whose
-/// last reference was a frame local runs `__del__` before the following
-/// opcode.  PyPy's `GeneratorIterator.frame_is_finished` only drops
-/// `self.frame` and lets its tracing GC discover the local later.  Keep that
-/// frame-clearing shape, then run the existing non-moving reachability pass
-/// and drain its queue before returning to the caller.  Deferring this through
-/// `UserDelAction.fire()` is too late: a test method can read the class flag in
-/// the very next opcode.  The non-moving collector follows `do_collect_full`'s
-/// explicit-collection shape — finish an older incremental cycle, then take a
-/// fresh root snapshot — so the pass observes the frame release even when a
-/// major was already in progress.  The released-frame graph census avoids
-/// paying for a collection when no application callback could be observed,
-/// while following container edges so an indirect `__del__` is not missed.
+/// 3.14 `gen_close` / `_PyFrame_ClearExceptCode`: releasing the generator
+/// frame is an observable refcount boundary, so an object whose last
+/// reference was a frame local runs `__del__` before the following opcode.
+/// PyPy's `GeneratorIterator.frame_is_finished` only drops `self.frame` and
+/// lets its tracing GC discover the local later.  Keep that frame-clearing
+/// shape, then run a full collection (`incminimark.collect(2)`: a minor
+/// collection, the rest of any major cycle already in progress, then a
+/// complete major) and drain the finalizer queue before returning to the
+/// caller.  Deferring this through `UserDelAction.fire()` is too late: a test
+/// method can read the class flag in the very next opcode.  The released-frame
+/// graph census avoids paying for a collection when no application callback
+/// could be observed, while following container edges so an indirect
+/// `__del__` is not missed.
 ///
 /// The PyPy load-bearing-hint census around `GeneratorIterator` finds only
 /// `_immutable_fields_ = ['pycode']` and `rgc.may_ignore_finalizer(self)`;
@@ -20598,7 +21113,11 @@ pub(crate) fn generator_close_finalizer_boundary(released_graph_has_finalizer: b
     }
     let action = crate::executioncontext::space_user_del_action();
     if !action.is_null() {
-        pyre_object::gc_hook::try_gc_collect_oldgen();
+        // Nursery-born `hasuserdel` instances are invisible to
+        // `try_gc_collect_oldgen` (`run_failed_attr_finalizers`).
+        // `incminimark.collect(2)` is the same full pass `gc.collect`
+        // uses to promote young finalizers and then queue the dead ones.
+        pyre_object::gc_hook::try_gc_collect(2);
         unsafe { (*action)._run_finalizers() };
     }
 }
@@ -21134,14 +21653,44 @@ pub(crate) fn resume_yield_from(
 ) -> Result<Option<PyObjectRef>, PyError> {
     debug_assert!(!w_yf.is_null());
 
+    // `pyframe.py resume_execute_frame` clears `w_yielding_from` before
+    // `next_yield_from`, where the frame, the delegate, the sent value and a
+    // thrown `OperationError` are GC locals across the delegate call. Here
+    // they are native copies, and every delegate call below collects.
+    let anchor = crate::eval::FrameAnchor::new(frame);
+    // The whole livevar set (delegate, sent value, thrown exception, throw
+    // arguments) is published before one normalizing pass, and every arm
+    // reads it back from the slots: the pass returns the live words, and a
+    // native copy taken before entry can still name a nursery object that a
+    // foreign collection forwarded (`gc_sync::foreign_mutator_seen`).
+    let roots = pyre_object::gc_roots::push_roots();
+    let yf_slot = roots.publish(&[w_yf, w_arg]);
+    let arg_slot = yf_slot + 1;
+    let exc_slot = operr
+        .as_ref()
+        .and_then(|err| err.publish_exc_object(&roots));
+    let throw_slot = throw_args.map(|(args, argc)| (roots.publish(&args), argc));
+    roots.normalize(yf_slot, pyre_object::gc_roots::shadow_stack_len() - yf_slot);
+
     let result = match operr {
-        Some(err) if err.kind == PyErrorKind::GeneratorExit => {
-            close_yield_from(w_yf)?;
-            frame.w_yielding_from = pyre_object::PY_NULL;
+        Some(mut err) if err.kind == PyErrorKind::GeneratorExit => {
+            close_yield_from(roots.get(yf_slot))?;
+            err.reload_exc_object(&roots, exc_slot);
+            unsafe { (*anchor.live()).w_yielding_from = pyre_object::PY_NULL };
             return Err(err);
         }
-        Some(err) => throw_yield_from(w_yf, err, throw_args),
-        None if unsafe { pyre_object::is_none(w_arg) } => {
+        Some(mut err) => {
+            err.reload_exc_object(&roots, exc_slot);
+            let throw_args = throw_slot.map(|(base, argc)| {
+                (
+                    [roots.get(base), roots.get(base + 1), roots.get(base + 2)],
+                    argc,
+                )
+            });
+            throw_yield_from(roots.get(yf_slot), err, throw_args)
+        }
+        None if unsafe { pyre_object::is_none(roots.get(arg_slot)) } => {
+            let w_yf = roots.get(yf_slot);
             if unsafe { pyre_object::generator::is_generator_or_coroutine(w_yf) } {
                 generator_send_ex(w_yf, w_none(), None, None, false)
             } else {
@@ -21149,17 +21698,18 @@ pub(crate) fn resume_yield_from(
             }
         }
         None => {
-            let send = getattr_str(w_yf, "send")?;
-            crate::call::call_function_impl_result(send, &[w_arg])
+            let send = getattr_str(roots.get(yf_slot), "send")?;
+            crate::call::call_function_impl_result(send, &[roots.get(arg_slot)])
         }
     };
 
+    let frame = unsafe { &mut *anchor.live() };
     match result {
         Ok(value) => {
             // pyopcode.py `next_yield_from`: publish the delegate
             // only after its call has yielded.  While the delegate is
             // executing, `gi_yieldfrom` must therefore remain None.
-            frame.w_yielding_from = w_yf;
+            frame.w_yielding_from = roots.get(yf_slot);
             if pyre_object::gc_hook::try_gc_owns_object(
                 frame as *mut crate::pyframe::PyFrame as *mut u8,
             ) {
@@ -21193,26 +21743,57 @@ fn throw_yield_from(
             return generator_send_ex(w_yf, w_none(), Some(err), throw_args, false);
         }
     }
-    let throw = match getattr_str(w_yf, "throw") {
+    // `getattr` and the following call run Python. The delegate, the original
+    // throw arguments and the thrown carrier are native copies;
+    // `OperationError` would be traced. Publish all of them, then normalize
+    // the range once, before `getattr`.
+    let roots = pyre_object::gc_roots::push_roots();
+    let yf_slot = roots.publish(&[w_yf]);
+    let mut exc_slot = err.publish_exc_object(&roots);
+    let pinned_args = throw_args.map(|(args, argc)| (roots.publish(&args), argc));
+    roots.normalize(yf_slot, pyre_object::gc_roots::shadow_stack_len() - yf_slot);
+    let throw = match getattr_str(roots.get(yf_slot), "throw") {
         Ok(method) => method,
-        Err(attr_err) if attr_err.kind == PyErrorKind::AttributeError => return Err(err),
+        Err(attr_err) if attr_err.kind == PyErrorKind::AttributeError => {
+            err.reload_exc_object(&roots, exc_slot);
+            return Err(err);
+        }
         Err(attr_err) => return Err(attr_err),
     };
-    if let Some((args, argc)) = throw_args {
+    err.reload_exc_object(&roots, exc_slot);
+    let throw_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(throw);
+    if let Some((args_base, argc)) = pinned_args {
         // PEP 380 delegation forwards exactly the original positional throw
         // arguments, rather than a synthesized exception instance.  The
         // producer validates `argc` as 1..=3; spell those fixed call shapes
         // directly so translation does not detour through Rust's opaque
         // `<[T; 3]>::index(&args, ..argc)` helper.
+        let throw = roots.get(throw_slot);
+        let arg0 = roots.get(args_base);
+        let arg1 = roots.get(args_base + 1);
+        let arg2 = roots.get(args_base + 2);
         return match argc {
-            1 => crate::call::call_function_impl_result(throw, &[args[0]]),
-            2 => crate::call::call_function_impl_result(throw, &[args[0], args[1]]),
-            _ => crate::call::call_function_impl_result(throw, &args),
+            1 => crate::call::call_function_impl_result(throw, &[arg0]),
+            2 => crate::call::call_function_impl_result(throw, &[arg0, arg1]),
+            _ => crate::call::call_function_impl_result(throw, &[arg0, arg1, arg2]),
         };
     }
-    let w_exc = err.to_exc_object();
-    let w_type = crate::typedef::r#type(w_exc).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-    crate::call::call_function_impl_result(throw, &[w_type, w_exc])
+    if exc_slot.is_none() {
+        let w_exc = err.to_exc_object();
+        err.exc_object = w_exc;
+        exc_slot = err.pin_exc_object(&roots);
+    }
+    err.reload_exc_object(&roots, exc_slot);
+    let w_type =
+        crate::typedef::r#type(err.exc_object).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_type);
+    err.reload_exc_object(&roots, exc_slot);
+    crate::call::call_function_impl_result(
+        roots.get(throw_slot),
+        &[roots.get(type_slot), err.exc_object],
+    )
 }
 
 /// Run a delegated iterator's close operation.  A generator close is kept
@@ -21227,12 +21808,15 @@ fn close_yield_from(w_yf: PyObjectRef) -> PyResult {
 fn finish_yield_from(frame: &mut crate::pyframe::PyFrame, err: PyError) -> Result<(), PyError> {
     use crate::bytecode::Instruction;
 
+    // `getattr` collects, which moves a nursery frame.
+    let anchor = crate::eval::FrameAnchor::new(frame);
     let value = if !err.exc_object.is_null() && unsafe { pyre_object::is_exception(err.exc_object) }
     {
         getattr_str(err.exc_object, "value").unwrap_or_else(|_| w_none())
     } else {
         w_none()
     };
+    let frame = unsafe { &mut *anchor.live() };
     frame.pushvalue(value);
 
     let code = frame.code();
@@ -21502,11 +22086,23 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
             "throw expected at most 3 arguments, got {given}"
         )));
     }
-    let gen_obj = args[0];
-    let w_type = args[1];
-    let w_val = crate::type_methods::arg_or_none(args, 2);
-    let w_tb = crate::type_methods::arg_or_none(args, 3);
     let argc = given;
+    // `warn_category`, `normalize_exception` and `generator_close_iter` all
+    // collect. The generator and the throw operands have to live on slots
+    // for that window; `prepare_frame_resume_for_dispatch` then getattr's
+    // through the generator's frame.
+    let _throw_roots = pyre_object::gc_roots::push_roots();
+    let throw_base = pyre_object::gc_roots::pin_roots(&[
+        args[0],
+        args[1],
+        crate::type_methods::arg_or_none(args, 2),
+        crate::type_methods::arg_or_none(args, 3),
+    ]);
+    let reload = |i: usize| pyre_object::gc_roots::shadow_stack_get(throw_base + i);
+    let gen_obj = reload(0);
+    let w_type = reload(1);
+    let w_val = reload(2);
+    let w_tb = reload(3);
 
     // Python 3.14 deprecates only the legacy three-argument spelling; the
     // one- and two-argument forms retain their existing semantics.
@@ -21517,6 +22113,10 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
             2,
         )?;
     }
+    let gen_obj = reload(0);
+    let w_type = reload(1);
+    let w_val = reload(2);
+    let w_tb = reload(3);
 
     // generator.py `throw` — validate the traceback before the
     // exception class/instance, then normalize an OperationError.  Usage
@@ -21552,36 +22152,51 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
 
     let mut operr = crate::error::ExceptionNormalization::new(w_type, w_val);
     operr._application_traceback = traceback;
-    let err = match operr.normalize_exception(w_none()) {
-        Ok(w_value) => unsafe { PyError::from_exc_object(w_value) },
+    // generator.py `throw`: `normalize_exception` yields `w_value`, then a
+    // `GeneratorExit` into a delegating generator runs `_gen_close_iter`
+    // before `send_error`. That close calls `try_gc_collect(2)`. Upstream
+    // `OperationError` is a GC object, so `w_value` moves with it. Pin the
+    // instance on this bracket and build the carrier from the slot after
+    // the close.
+    let value_slot = match operr.normalize_exception(w_none()) {
+        Ok(w_value) => {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = _throw_roots.pin_root(w_value);
+            slot
+        }
         Err(err) => {
             return generator_send_ex(
-                gen_obj,
+                reload(0),
                 w_none(),
                 Some(err),
-                Some(([w_type, w_val, w_tb], argc)),
+                Some(([reload(1), reload(2), reload(3)], argc)),
                 false,
             );
         }
     };
-    // generator.py `throw`: a GeneratorExit into a delegating generator
-    // closes the yield-from iterator first (`_gen_close_iter`).
-    if err.kind == PyErrorKind::GeneratorExit && !generator_get_delegate(gen_obj).is_null() {
-        if let Err(e) = generator_close_iter(gen_obj) {
+    let gen_obj = reload(0);
+    let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+    let thrown_kind = unsafe { PyError::from_exc_object(w_value) }.kind;
+    if thrown_kind == PyErrorKind::GeneratorExit && !generator_get_delegate(gen_obj).is_null() {
+        if let Err(e) = generator_close_iter(gen_obj, true) {
+            // `reload` does not allocate. `e` is consumed by `generator_send_ex`;
+            // the resume pins that carrier across the calls that collect.
             return generator_send_ex(
-                gen_obj,
+                reload(0),
                 w_none(),
                 Some(e),
-                Some(([w_type, w_val, w_tb], argc)),
+                Some(([reload(1), reload(2), reload(3)], argc)),
                 false,
             );
         }
     }
+    let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+    let err = unsafe { PyError::from_exc_object(w_value) };
     generator_send_ex(
-        gen_obj,
+        reload(0),
         w_none(),
         Some(err),
-        Some(([w_type, w_val, w_tb], argc)),
+        Some(([reload(1), reload(2), reload(3)], argc)),
         false,
     )
 }
@@ -21628,14 +22243,32 @@ fn gen_close_iter(w_yf: PyObjectRef, prompt_finalizers: bool) -> PyResult {
 }
 
 /// generator.py `_gen_close_iter`.
-fn generator_close_iter(gen_obj: PyObjectRef) -> PyResult {
+///
+/// `prompt_finalizers` follows [`generator_close_impl`]: true only at an
+/// explicit app-level `close()` / `throw(GeneratorExit)` boundary. A
+/// `_finalize_` drain already owns the queue; forwarding `true` into the
+/// yield-from delegate would start a nested reachability pass and drain
+/// once per remaining unreachable chain.
+fn generator_close_iter(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResult {
     unsafe {
         use pyre_object::generator::*;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let gen_slot = pyre_object::gc_roots::shadow_stack_len();
+        let gen_obj = pyre_object::gc_roots::pin_root(gen_obj);
         debug_assert!(!w_generator_is_running(gen_obj));
+        let yf_slot = pyre_object::gc_roots::shadow_stack_len();
         let w_yf = generator_get_delegate(gen_obj);
+        let _ = pyre_object::gc_roots::pin_root(w_yf);
+        // `_gen_close_iter` clears the delegate and sets `running` on the live
+        // generator, read back from its slot.
+        let gen_obj = pyre_object::gc_roots::shadow_stack_get(gen_slot);
         generator_set_delegate(gen_obj, PY_NULL);
         w_generator_set_running(gen_obj, true);
-        let result = gen_close_iter(w_yf, true);
+        let result = gen_close_iter(
+            pyre_object::gc_roots::shadow_stack_get(yf_slot),
+            prompt_finalizers,
+        );
+        let gen_obj = pyre_object::gc_roots::shadow_stack_get(gen_slot);
         w_generator_set_running(gen_obj, false);
         result
     }
@@ -21650,6 +22283,7 @@ fn generator_close_iter(gen_obj: PyObjectRef) -> PyResult {
 /// enters the finalizer queue once per unreachable generator chain.  Let the
 /// outer PyPy-shaped queue loop own that case.
 fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResult {
+    let mut gen_obj = gen_obj;
     unsafe {
         use pyre_object::generator::*;
         if w_generator_is_exhausted(gen_obj) {
@@ -21660,7 +22294,9 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
             if frame_ptr.is_null() {
                 w_generator_set_exhausted(gen_obj);
             } else {
-                generator_frame_is_finished(gen_obj, &mut *frame_ptr, prompt_finalizers);
+                pyre_object::with_roots!(gen_obj => {
+                    generator_frame_is_finished(gen_obj, &mut *frame_ptr, prompt_finalizers);
+                });
             }
             let released_graph_has_finalizer = take_pending_close_finalizer();
             generator_close_finalizer_boundary(prompt_finalizers && released_graph_has_finalizer);
@@ -21674,11 +22310,13 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
     let err = if generator_get_delegate(gen_obj).is_null() {
         PyError::new(PyErrorKind::GeneratorExit, String::new())
     } else {
-        generator_close_iter(gen_obj)
+        pyre_object::with_roots!(gen_obj => generator_close_iter(gen_obj, prompt_finalizers))
             .err()
             .unwrap_or_else(|| PyError::new(PyErrorKind::GeneratorExit, String::new()))
     };
-    let sent = generator_send_ex(gen_obj, w_none(), Some(err), None, true);
+    let sent = pyre_object::with_roots!(gen_obj => {
+        generator_send_ex(gen_obj, w_none(), Some(err), None, true)
+    });
     // Taken unconditionally, so a census no arm below spends cannot be read by
     // a later close.  `generator_send_ex` records one whenever it closes,
     // while only an explicit app-level `close()` may spend it: inside
@@ -21704,14 +22342,18 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
             // GeneratorExit is caught and the generator executes `return x`.
             let w_exc = e.to_exc_object();
             let _roots = pyre_object::gc_roots::push_roots();
-            let w_exc = pyre_object::gc_roots::pin_root(w_exc);
-            let value = getattr_str(w_exc, "value").or_else(|_| Ok(w_none()));
+            let w_exc_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_exc);
+            let value = getattr_str(pyre_object::gc_roots::shadow_stack_get(w_exc_slot), "value")
+                .unwrap_or_else(|_| w_none());
+            let value_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(value);
             // The StopIteration has been consumed at this Rust-level catch;
             // unlike a Python handler, no PUSH_EXC_INFO will clear the
             // temporary propagation root for us.
             crate::eval::set_in_flight_exception(PY_NULL);
             generator_close_finalizer_boundary(released_graph_has_finalizer);
-            value
+            Ok(pyre_object::gc_roots::shadow_stack_get(value_slot))
         }
         Err(e) if e.kind == PyErrorKind::GeneratorExit => {
             // generator.py:265 `except OperationError as e` consumes the
@@ -21793,8 +22435,15 @@ fn async_generator_init_hooks(async_gen: PyObjectRef) -> PyResult {
 
 pub(crate) fn async_generator_anext_method(args: &[PyObjectRef]) -> PyResult {
     let async_gen = args.first().copied().unwrap_or(PY_NULL);
-    async_generator_init_hooks(async_gen)?;
-    let awaitable = pyre_object::generator::w_async_gen_asend_new(async_gen, w_none());
+    // `init_hooks` may call `firstiter`, which collects. Reload `self`
+    // before `AsyncGenASend(self, ...)` (`generator.py descr__anext__`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::pin_roots(&[async_gen]);
+    async_generator_init_hooks(pyre_object::gc_roots::shadow_stack_get(slot))?;
+    let awaitable = pyre_object::generator::w_async_gen_asend_new(
+        pyre_object::gc_roots::shadow_stack_get(slot),
+        w_none(),
+    );
     crate::executioncontext::register_finalizer(awaitable);
     Ok(awaitable)
 }
@@ -21802,8 +22451,13 @@ pub(crate) fn async_generator_anext_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn async_generator_asend_method(args: &[PyObjectRef]) -> PyResult {
     let async_gen = args.first().copied().unwrap_or(PY_NULL);
     let value = crate::type_methods::arg_or_none(args, 1);
-    async_generator_init_hooks(async_gen)?;
-    let awaitable = pyre_object::generator::w_async_gen_asend_new(async_gen, value);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::pin_roots(&[async_gen, value]);
+    async_generator_init_hooks(pyre_object::gc_roots::shadow_stack_get(slot))?;
+    let awaitable = pyre_object::generator::w_async_gen_asend_new(
+        pyre_object::gc_roots::shadow_stack_get(slot),
+        pyre_object::gc_roots::shadow_stack_get(slot + 1),
+    );
     crate::executioncontext::register_finalizer(awaitable);
     Ok(awaitable)
 }
@@ -21820,6 +22474,15 @@ pub(crate) fn async_generator_athrow_method(args: &[PyObjectRef]) -> PyResult {
             "athrow expected at most 3 arguments, got {given}"
         )));
     }
+    // The warning runs Python and `init_hooks` may call `firstiter`; both
+    // collect, so the receiver and the arguments are pinned before either.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::pin_roots(&[
+        args[0],
+        args[1],
+        crate::type_methods::arg_or_none(args, 2),
+        crate::type_methods::arg_or_none(args, 3),
+    ]);
     // CPython 3.14: match generator.throw() and deprecate the legacy
     // (type, value, traceback) spelling while retaining PyPy's state machine.
     if given == 3 {
@@ -21829,13 +22492,12 @@ pub(crate) fn async_generator_athrow_method(args: &[PyObjectRef]) -> PyResult {
             2,
         )?;
     }
-    let async_gen = args[0];
-    async_generator_init_hooks(async_gen)?;
+    async_generator_init_hooks(pyre_object::gc_roots::shadow_stack_get(slot))?;
     let awaitable = pyre_object::generator::w_async_gen_athrow_new(
-        async_gen,
-        args[1],
-        crate::type_methods::arg_or_none(args, 2),
-        crate::type_methods::arg_or_none(args, 3),
+        pyre_object::gc_roots::shadow_stack_get(slot),
+        pyre_object::gc_roots::shadow_stack_get(slot + 1),
+        pyre_object::gc_roots::shadow_stack_get(slot + 2),
+        pyre_object::gc_roots::shadow_stack_get(slot + 3),
     );
     crate::executioncontext::register_finalizer(awaitable);
     Ok(awaitable)
@@ -21843,9 +22505,15 @@ pub(crate) fn async_generator_athrow_method(args: &[PyObjectRef]) -> PyResult {
 
 pub(crate) fn async_generator_aclose_method(args: &[PyObjectRef]) -> PyResult {
     let async_gen = args.first().copied().unwrap_or(PY_NULL);
-    async_generator_init_hooks(async_gen)?;
-    let awaitable =
-        pyre_object::generator::w_async_gen_athrow_new(async_gen, PY_NULL, w_none(), w_none());
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::pin_roots(&[async_gen]);
+    async_generator_init_hooks(pyre_object::gc_roots::shadow_stack_get(slot))?;
+    let awaitable = pyre_object::generator::w_async_gen_athrow_new(
+        pyre_object::gc_roots::shadow_stack_get(slot),
+        PY_NULL,
+        w_none(),
+        w_none(),
+    );
     crate::executioncontext::register_finalizer(awaitable);
     Ok(awaitable)
 }
@@ -21864,38 +22532,78 @@ fn async_gen_unwrap_value(async_gen: PyObjectRef, value: PyObjectRef) -> PyResul
 
 fn async_gen_asend_do_send(awaitable: PyObjectRef, mut arg: PyObjectRef) -> PyResult {
     use pyre_object::generator::*;
+    // Same livevar set as `async_gen_athrow_do_send`: `generator_send_ex`
+    // runs the nested frame, so `self` and `async_gen` relocate and must
+    // be reloaded before `ag_running` is cleared.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let awaitable_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(awaitable);
+    let arg_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(arg);
+    let awaitable = pyre_object::gc_roots::shadow_stack_get(awaitable_slot);
     let (async_gen, initial_value, state) = {
         let payload = AsyncGenASend::from_obj(awaitable)
             .ok_or_else(|| PyError::type_error("invalid async_generator_asend receiver"))?;
         (payload.async_gen, payload.w_value_to_send, payload.state)
     };
+    let async_gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(async_gen);
+    let initial_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(initial_value);
     if state == ASYNC_GEN_STATE_CLOSED {
         return Err(PyError::runtime_error(
             "cannot reuse already awaited __anext__()/asend()",
         ));
     }
     if state == ASYNC_GEN_STATE_INIT {
-        if unsafe { is_none(arg) } {
-            arg = initial_value;
+        if unsafe { is_none(pyre_object::gc_roots::shadow_stack_get(arg_slot)) } {
+            arg = pyre_object::gc_roots::shadow_stack_get(initial_slot);
+        } else {
+            arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
         }
-        AsyncGenASend::from_obj(awaitable)
+        AsyncGenASend::from_obj(pyre_object::gc_roots::shadow_stack_get(awaitable_slot))
             .expect("validated async_generator_asend")
             .state = ASYNC_GEN_STATE_ITER;
-        if unsafe { w_async_generator_is_running(async_gen) } {
-            AsyncGenASend::from_obj(awaitable)
+        if unsafe {
+            w_async_generator_is_running(pyre_object::gc_roots::shadow_stack_get(async_gen_slot))
+        } {
+            AsyncGenASend::from_obj(pyre_object::gc_roots::shadow_stack_get(awaitable_slot))
                 .expect("validated async_generator_asend")
                 .state = ASYNC_GEN_STATE_CLOSED;
             return Err(PyError::runtime_error(
                 "anext(): asynchronous generator is already running",
             ));
         }
-        unsafe { w_async_generator_set_running(async_gen, true) };
+        unsafe {
+            w_async_generator_set_running(
+                pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+                true,
+            )
+        };
+    } else {
+        arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
     }
-    let result = generator_send_ex(async_gen, arg, None, None, false)
-        .and_then(|value| async_gen_unwrap_value(async_gen, value));
+    let result = generator_send_ex(
+        pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+        arg,
+        None,
+        None,
+        false,
+    )
+    .and_then(|value| {
+        async_gen_unwrap_value(
+            pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+            value,
+        )
+    });
     if result.is_err() {
-        unsafe { w_async_generator_set_running(async_gen, false) };
-        AsyncGenASend::from_obj(awaitable)
+        unsafe {
+            w_async_generator_set_running(
+                pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+                false,
+            )
+        };
+        AsyncGenASend::from_obj(pyre_object::gc_roots::shadow_stack_get(awaitable_slot))
             .expect("validated async_generator_asend")
             .state = ASYNC_GEN_STATE_CLOSED;
     }
@@ -21915,11 +22623,17 @@ pub(crate) fn async_gen_asend_send_method(args: &[PyObjectRef]) -> PyResult {
 
 pub(crate) fn async_gen_asend_close_method(args: &[PyObjectRef]) -> PyResult {
     let awaitable = args.first().copied().unwrap_or(PY_NULL);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let awaitable_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(awaitable);
+    let awaitable = pyre_object::gc_roots::shadow_stack_get(awaitable_slot);
     let (async_gen, state) = {
         let payload = pyre_object::generator::AsyncGenASend::from_obj(awaitable)
             .ok_or_else(|| PyError::type_error("invalid async_generator_asend receiver"))?;
         (payload.async_gen, payload.state)
     };
+    let async_gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(async_gen);
     pyre_object::generator::AsyncGenASend::from_obj(awaitable)
         .expect("validated async_generator_asend")
         .state = pyre_object::generator::ASYNC_GEN_STATE_CLOSED;
@@ -21927,13 +22641,18 @@ pub(crate) fn async_gen_asend_close_method(args: &[PyObjectRef]) -> PyResult {
         return Ok(w_none());
     }
     let result = generator_send_ex(
-        async_gen,
+        pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
         w_none(),
         Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
         None,
         true,
     );
-    unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, false) };
+    unsafe {
+        pyre_object::generator::w_async_generator_set_running(
+            pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+            false,
+        )
+    };
     match result {
         Ok(_) => Err(PyError::runtime_error("coroutine ignored GeneratorExit")),
         Err(err)
@@ -21952,11 +22671,18 @@ pub(crate) fn async_gen_asend_close_method(args: &[PyObjectRef]) -> PyResult {
 
 pub(crate) fn async_gen_asend_throw_method(args: &[PyObjectRef]) -> PyResult {
     let awaitable = args.first().copied().unwrap_or(PY_NULL);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let awaitable_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(awaitable);
+    let arg_base = pyre_object::gc_roots::pin_roots(args.get(1..).unwrap_or(&[]));
+    let awaitable = pyre_object::gc_roots::shadow_stack_get(awaitable_slot);
     let (async_gen, state) = {
         let payload = pyre_object::generator::AsyncGenASend::from_obj(awaitable)
             .ok_or_else(|| PyError::type_error("invalid async_generator_asend receiver"))?;
         (payload.async_gen, payload.state)
     };
+    let async_gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    let async_gen = pyre_object::gc_roots::pin_root(async_gen);
     if state == pyre_object::generator::ASYNC_GEN_STATE_CLOSED {
         return Err(PyError::runtime_error(
             "cannot reuse already awaited __anext__()/asend()",
@@ -21976,16 +22702,30 @@ pub(crate) fn async_gen_asend_throw_method(args: &[PyObjectRef]) -> PyResult {
         }
         unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, true) };
     }
-    let mut forwarded = Vec::with_capacity(args.len());
-    forwarded.push(async_gen);
-    forwarded.extend_from_slice(args.get(1..).unwrap_or(&[]));
-    let result = generator_throw_method(&forwarded)
-        .and_then(|value| async_gen_unwrap_value(async_gen, value));
+    let extra = args.len().saturating_sub(1);
+    let mut forwarded = Vec::with_capacity(1 + extra);
+    forwarded.push(pyre_object::gc_roots::shadow_stack_get(async_gen_slot));
+    for i in 0..extra {
+        forwarded.push(pyre_object::gc_roots::shadow_stack_get(arg_base + i));
+    }
+    let result = generator_throw_method(&forwarded).and_then(|value| {
+        async_gen_unwrap_value(
+            pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+            value,
+        )
+    });
     if result.is_err() {
-        unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, false) };
-        pyre_object::generator::AsyncGenASend::from_obj(awaitable)
-            .expect("validated async_generator_asend")
-            .state = pyre_object::generator::ASYNC_GEN_STATE_CLOSED;
+        unsafe {
+            pyre_object::generator::w_async_generator_set_running(
+                pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+                false,
+            )
+        };
+        pyre_object::generator::AsyncGenASend::from_obj(pyre_object::gc_roots::shadow_stack_get(
+            awaitable_slot,
+        ))
+        .expect("validated async_generator_asend")
+        .state = pyre_object::generator::ASYNC_GEN_STATE_CLOSED;
     }
     result
 }
@@ -22060,6 +22800,9 @@ fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResul
         unsafe { w_async_generator_set_running(async_gen, true) };
     }
     let closing = exc_type.is_null();
+    let async_gen = pyre_object::gc_roots::shadow_stack_get(async_gen_slot);
+    let awaitable = pyre_object::gc_roots::shadow_stack_get(awaitable_slot);
+    let arg = pyre_object::gc_roots::shadow_stack_get(awaitable_slot + 1);
     let result = if throwing {
         if closing {
             generator_send_ex(
@@ -22085,13 +22828,21 @@ fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResul
                     "async generator ignored GeneratorExit",
                 ))
             } else {
-                async_gen_unwrap_value(async_gen, value)
+                async_gen_unwrap_value(
+                    pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+                    value,
+                )
             }
         }
         Err(err) => async_gen_athrow_handle_error(closing, err),
     };
     if result.is_err() {
-        unsafe { w_async_generator_set_running(async_gen, false) };
+        unsafe {
+            w_async_generator_set_running(
+                pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+                false,
+            )
+        };
         let awaitable = pyre_object::gc_roots::shadow_stack_get(awaitable_slot);
         AsyncGenAThrow::from_obj(awaitable)
             .expect("validated async_generator_athrow")
@@ -22113,11 +22864,19 @@ pub(crate) fn async_gen_athrow_send_method(args: &[PyObjectRef]) -> PyResult {
 
 pub(crate) fn async_gen_athrow_close_method(args: &[PyObjectRef]) -> PyResult {
     let awaitable = args.first().copied().unwrap_or(PY_NULL);
+    // Same livevar set as `async_gen_asend_close_method`: `generator_send_ex`
+    // runs the nested frame, so `self` and `async_gen` relocate.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let awaitable_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(awaitable);
+    let awaitable = pyre_object::gc_roots::shadow_stack_get(awaitable_slot);
     let (async_gen, state) = {
         let payload = pyre_object::generator::AsyncGenAThrow::from_obj(awaitable)
             .ok_or_else(|| PyError::type_error("invalid async_generator_athrow receiver"))?;
         (payload.async_gen, payload.state)
     };
+    let async_gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(async_gen);
     pyre_object::generator::AsyncGenAThrow::from_obj(awaitable)
         .expect("validated async_generator_athrow")
         .state = pyre_object::generator::ASYNC_GEN_STATE_CLOSED;
@@ -22125,13 +22884,18 @@ pub(crate) fn async_gen_athrow_close_method(args: &[PyObjectRef]) -> PyResult {
         return Ok(w_none());
     }
     let result = generator_send_ex(
-        async_gen,
+        pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
         w_none(),
         Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
         None,
         true,
     );
-    unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, false) };
+    unsafe {
+        pyre_object::generator::w_async_generator_set_running(
+            pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+            false,
+        )
+    };
     match result {
         Ok(_) => Err(PyError::runtime_error("coroutine ignored GeneratorExit")),
         Err(err)
@@ -22150,6 +22914,13 @@ pub(crate) fn async_gen_athrow_close_method(args: &[PyObjectRef]) -> PyResult {
 
 pub(crate) fn async_gen_athrow_throw_method(args: &[PyObjectRef]) -> PyResult {
     let awaitable = args.first().copied().unwrap_or(PY_NULL);
+    // `generator_throw_method` runs the nested frame. Root the awaitable
+    // and the generator, then reload both after the resume
+    // (`generator.py AsyncGenAThrow.throw`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let awaitable_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(awaitable);
+    let awaitable = pyre_object::gc_roots::shadow_stack_get(awaitable_slot);
     let (async_gen, closing, state) = {
         let payload = pyre_object::generator::AsyncGenAThrow::from_obj(awaitable)
             .ok_or_else(|| PyError::type_error("invalid async_generator_athrow receiver"))?;
@@ -22159,6 +22930,8 @@ pub(crate) fn async_gen_athrow_throw_method(args: &[PyObjectRef]) -> PyResult {
             payload.state,
         )
     };
+    let async_gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    let async_gen = pyre_object::gc_roots::pin_root(async_gen);
     if state == pyre_object::generator::ASYNC_GEN_STATE_CLOSED {
         return Err(PyError::runtime_error(
             "cannot reuse already awaited aclose()/athrow()",
@@ -22178,18 +22951,31 @@ pub(crate) fn async_gen_athrow_throw_method(args: &[PyObjectRef]) -> PyResult {
         }
         unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, true) };
     }
+    let throw_base = pyre_object::gc_roots::pin_roots(args.get(1..).unwrap_or(&[]));
     let mut forwarded = Vec::with_capacity(args.len());
-    forwarded.push(async_gen);
-    forwarded.extend_from_slice(args.get(1..).unwrap_or(&[]));
+    forwarded.push(pyre_object::gc_roots::shadow_stack_get(async_gen_slot));
+    for i in 0..args.len().saturating_sub(1) {
+        forwarded.push(pyre_object::gc_roots::shadow_stack_get(throw_base + i));
+    }
     let result = match generator_throw_method(&forwarded) {
-        Ok(value) => async_gen_unwrap_value(async_gen, value),
+        Ok(value) => async_gen_unwrap_value(
+            pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+            value,
+        ),
         Err(err) => async_gen_athrow_handle_error(closing, err),
     };
     if result.is_err() {
-        unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, false) };
-        pyre_object::generator::AsyncGenAThrow::from_obj(awaitable)
-            .expect("validated async_generator_athrow")
-            .state = pyre_object::generator::ASYNC_GEN_STATE_CLOSED;
+        unsafe {
+            pyre_object::generator::w_async_generator_set_running(
+                pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+                false,
+            )
+        };
+        pyre_object::generator::AsyncGenAThrow::from_obj(
+            pyre_object::gc_roots::shadow_stack_get(awaitable_slot),
+        )
+        .expect("validated async_generator_athrow")
+        .state = pyre_object::generator::ASYNC_GEN_STATE_CLOSED;
     }
     result
 }
@@ -22447,6 +23233,15 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
     // without re-entering override dispatch.  Override targets are never a
     // dict-proxy / dict-view / range, so this precedes the unwrap below.
     unsafe {
+        // Exact builtins never collect in `subclass_special_override`. Pin
+        // only on the subclass/override arm, matching `compare`.
+        if is_exact_builtin_instance(haystack) {
+            return contains_slot(haystack, needle);
+        }
+        let _contains_roots = pyre_object::gc_roots::push_roots();
+        let contains_base = pyre_object::gc_roots::pin_roots(&[haystack, needle]);
+        let haystack = pyre_object::gc_roots::shadow_stack_get(contains_base);
+        let needle = pyre_object::gc_roots::shadow_stack_get(contains_base + 1);
         if (is_list(haystack)
             || is_tuple(haystack)
             || is_str(haystack)
@@ -22460,11 +23255,19 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             if is_none(method) {
                 return Err(not_container_error(haystack));
             }
-            let result = get_and_call_function(method, haystack, w_type, &[needle])?;
+            let result = get_and_call_function(
+                method,
+                pyre_object::gc_roots::shadow_stack_get(contains_base),
+                w_type,
+                &[pyre_object::gc_roots::shadow_stack_get(contains_base + 1)],
+            )?;
             return is_true(result);
         }
+        return contains_slot(
+            pyre_object::gc_roots::shadow_stack_get(contains_base),
+            pyre_object::gc_roots::shadow_stack_get(contains_base + 1),
+        );
     }
-    contains_slot(haystack, needle)
 }
 
 /// The builtin `__contains__` slot body: membership dispatch by concrete
@@ -22618,14 +23421,14 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
             match kind {
                 pyre_object::dictmultiobject::DictViewKind::Keys => {
                     // `w_dict_lookup_checked` runs the key's `__eq__` and may
-                    // collect; `needle` is a raw local read again on the error
-                    // path, so pin it across the probe.
+                    // collect; `needle` and the source dict are raw locals.
                     let _roots = pyre_object::gc_roots::push_roots();
-                    let needle_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(needle);
+                    let pair = pyre_object::gc_roots::pin_roots(&[needle, dict]);
+                    let needle_slot = pair;
+                    let dict_slot = pair + 1;
                     return match unsafe {
                         pyre_object::dictmultiobject::w_dict_lookup_checked(
-                            dict,
+                            pyre_object::gc_roots::shadow_stack_get(dict_slot),
                             pyre_object::gc_roots::shadow_stack_get(needle_slot),
                         )
                     } {
@@ -22636,27 +23439,40 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                     };
                 }
                 pyre_object::dictmultiobject::DictViewKind::Items => {
-                    if !is_tuple(needle) || w_tuple_len(needle) != 2 {
+                    // Specialised `_ii` boxes through `w_int_new`.  Pin the
+                    // needle, the source dict, and the first box before the
+                    // second getitem.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let pair0 = pyre_object::gc_roots::pin_roots(&[needle, dict]);
+                    let needle_slot = pair0;
+                    let dict_slot = pair0 + 1;
+                    if !is_tuple(pyre_object::gc_roots::shadow_stack_get(needle_slot))
+                        || w_tuple_len(pyre_object::gc_roots::shadow_stack_get(needle_slot)) != 2
+                    {
                         return Ok(false);
                     }
-                    let k = match w_tuple_getitem(needle, 0) {
+                    let k = match w_tuple_getitem(
+                        pyre_object::gc_roots::shadow_stack_get(needle_slot),
+                        0,
+                    ) {
                         Some(k) => k,
                         None => return Ok(false),
                     };
-                    let want = match w_tuple_getitem(needle, 1) {
+                    let pair = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(k);
+                    let want = match w_tuple_getitem(
+                        pyre_object::gc_roots::shadow_stack_get(needle_slot),
+                        1,
+                    ) {
                         Some(v) => v,
                         None => return Ok(false),
                     };
-                    // `w_dict_lookup_checked` runs the key's `__eq__` and may
-                    // collect; `k` (error path) and `want` (success path) are
-                    // raw locals read after the probe, so pin them across it.
-                    let _roots = pyre_object::gc_roots::push_roots();
-                    let pair = pyre_object::gc_roots::pin_roots(&[k, want]);
+                    let _ = pyre_object::gc_roots::pin_root(want);
                     let k_slot = pair;
                     let want_slot = pair + 1;
                     return match unsafe {
                         pyre_object::dictmultiobject::w_dict_lookup_checked(
-                            dict,
+                            pyre_object::gc_roots::shadow_stack_get(dict_slot),
                             pyre_object::gc_roots::shadow_stack_get(k_slot),
                         )
                     } {
@@ -22702,8 +23518,16 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
     unsafe {
         if pyre_object::is_w_range(haystack) {
             if range_integer_fast_path(needle) {
-                let item = pyre_object::range_obj_to_bigint(needle);
-                return Ok(pyre_object::w_range_contains_bigint(haystack, &item));
+                // `fromint` of a machine-int needle collects.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let base = pyre_object::gc_roots::pin_roots(&[haystack, needle]);
+                let item = pyre_object::range_obj_to_bigint(
+                    pyre_object::gc_roots::shadow_stack_get(base + 1),
+                );
+                return Ok(pyre_object::w_range_contains_bigint(
+                    pyre_object::gc_roots::shadow_stack_get(base),
+                    &item,
+                ));
             }
             // `space.sequence_contains` — elementwise scan.
             return sequence_contains(haystack, needle);
@@ -22854,6 +23678,10 @@ pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
 ///   `self.is_w(w_obj1, w_obj2) or self.is_true(self.eq(w_obj1, w_obj2))`.
 /// A raising `__eq__` or a raising `__bool__` on its result propagates.
 pub fn eq_w(a: PyObjectRef, b: PyObjectRef) -> Result<bool, PyError> {
+    // `is_w` of exact builtins is a field load (intval / bits / empty
+    // unique-ified containers) and does not collect. `compare` publishes
+    // only on the override arm that can collect, so the exact-builtin
+    // `int == int` / `str == str` walk stays pin-free (`compare`).
     if is_w(a, b) {
         return Ok(true);
     }
@@ -22916,6 +23744,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
         // `DELETE_SUBSCR` pops both operands before dispatching here, so the
         // container below is a bare address for the rest of this function.
         let mut obj = obj;
+        let mut index = index;
         if is_list(obj) {
             if is_slice(index) {
                 let (raw_start, raw_stop, step) = {
@@ -23023,18 +23852,24 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
         if pyre_object::bytearrayobject::is_bytearray(obj) {
             // `descr_delitem` refuses any deletion (single or slice — every
             // delete shrinks the buffer) while an export is outstanding.
-            crate::builtins::bytearray_check_exports(obj)?;
+            // The check collects when an export is live, so the index moves
+            // with the bytearray.
+            pyre_object::with_roots!(obj, index => {
+                crate::builtins::bytearray_check_exports(obj)
+            })?;
             if is_slice(index) {
                 let (rs, rp, st) = {
-                    // Rooted for the components' `__index__` calls; a
-                    // bytearray does not move, so this is liveness alone.
+                    // Each slice component runs `__index__`; a nursery
+                    // bytearray moves under that callback.
                     let _roots = pyre_object::gc_roots::push_roots();
-                    let _ = pyre_object::gc_roots::pin_root(obj);
-                    crate::sliceobject::slice_unpack(
+                    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+                    let unpacked = crate::sliceobject::slice_unpack(
                         w_slice_get_start(index),
                         w_slice_get_stop(index),
                         w_slice_get_step(index),
-                    )?
+                    )?;
+                    obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    unpacked
                 };
                 let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
                 let (start, stop, step, slicelength) =
@@ -23073,8 +23908,10 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
             }
             let i = {
                 let _roots = pyre_object::gc_roots::push_roots();
-                let _ = pyre_object::gc_roots::pin_root(obj);
-                subscript_index_w("bytearray", index)?
+                let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+                let i = subscript_index_w("bytearray", index)?;
+                obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                i
             };
             let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
             let idx = if i < 0 { len + i } else { i };

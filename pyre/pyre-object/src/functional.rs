@@ -1,7 +1,7 @@
 //! `pypy/module/__builtin__/functional.py` line-by-line ports for built-in iterator functionals.
 
 use crate::pyobject::*;
-use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntGcRoot};
+use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntGcRoot, live_rbigint};
 use pyre_macros::pyre_class;
 
 // ── functional.rs ─────────────────────────────────────────────
@@ -947,18 +947,37 @@ pub fn w_range_new(
     promote_step: bool,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    let start = crate::gc_roots::pin_root(start);
-    let stop = crate::gc_roots::pin_root(stop);
-    let step = crate::gc_roots::pin_root(step);
+    let _ = crate::gc_roots::pin_root(start);
+    let start_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let _ = crate::gc_roots::pin_root(stop);
+    let stop_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let _ = crate::gc_roots::pin_root(step);
+    let step_slot = crate::gc_roots::shadow_stack_len() - 1;
+    // `RBigInt::fromint` / `RBigInt::new` allocate a nursery `Digits`
+    // payload (`rbigint.py fromint`), so each conversion can collect.
+    // Reload every bound from its shadow-stack slot before the next
+    // `range_obj_to_bigint` — the Rust locals above are not rewritten.
     let length = unsafe {
-        let len_big = range_length_big(
-            &range_obj_to_bigint(start),
-            &range_obj_to_bigint(stop),
-            &range_obj_to_bigint(step),
-        );
+        let start_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            start_slot,
+        )));
+        let stop_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            stop_slot,
+        )));
+        let step_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            step_slot,
+        )));
+        let len_big = range_length_big(&start_b, &stop_b, &step_b);
         range_bigint_to_obj(len_big)
     };
+    // `range_bigint_to_obj` is `w_int_new` / `w_long_new` and may collect.
+    // The three bounds live on the shadow stack (`expand_pop_roots` /
+    // `gc_restore_root`); the Rust locals do not, so an old-gen store of
+    // those copies would remember a nursery interior.
     let length = crate::gc_roots::pin_root(length);
+    let start = crate::gc_roots::shadow_stack_get(start_slot);
+    let stop = crate::gc_roots::shadow_stack_get(stop_slot);
+    let step = crate::gc_roots::shadow_stack_get(step_slot);
     W_Range::allocate_stable(W_Range {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -975,10 +994,16 @@ pub fn w_range_new(
 /// Convenience constructor wrapping three machine-int bounds.  The explicit
 /// step spells `promote_step = false`, matching `range(start, stop, step)`.
 pub fn w_range_new_i64(start: i64, stop: i64, step: i64) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let _ = crate::gc_roots::pin_root(crate::intobject::w_int_new(start));
+    let start_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let _ = crate::gc_roots::pin_root(crate::intobject::w_int_new(stop));
+    let stop_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let step = crate::gc_roots::pin_root(crate::intobject::w_int_new(step));
     w_range_new(
-        crate::intobject::w_int_new(start),
-        crate::intobject::w_int_new(stop),
-        crate::intobject::w_int_new(step),
+        crate::gc_roots::shadow_stack_get(start_slot),
+        crate::gc_roots::shadow_stack_get(stop_slot),
+        step,
         false,
     )
 }
@@ -1040,10 +1065,11 @@ pub unsafe fn range_obj_to_bigint(obj: PyObjectRef) -> BigInt {
 
 /// Wrap a `BigInt` as a machine int when it fits, otherwise a long.
 pub fn range_bigint_to_obj(value: BigInt) -> PyObjectRef {
+    let value = RBigIntGcRoot::new(value);
     if crate::longobject::jit_bigint_to_i64_fits(&value) != 0 {
         crate::intobject::w_int_new(crate::longobject::jit_bigint_to_i64_value(&value))
     } else {
-        crate::longobject::w_long_new(value)
+        crate::longobject::w_long_new(value.translated_alias())
     }
 }
 
@@ -1178,19 +1204,33 @@ pub unsafe fn w_range_reversed(obj: PyObjectRef) -> PyObjectRef {
                 }
             }
         }
+        // `range_obj_to_bigint` of a machine int and each boxing collect;
+        // the fields and the boxed last item come back off the shadow stack.
+        let _roots = crate::gc_roots::push_roots();
         let (start, _stop, step) = w_range_fields(obj);
         let len_obj = w_range_length(obj);
-        let start_b = range_obj_to_bigint(start);
-        let step_b = range_obj_to_bigint(step);
-        let len_b = range_obj_to_bigint(len_obj);
-        let lastitem = &start_b + (&len_b - BigInt::one()) * &step_b;
-        let _roots = crate::gc_roots::push_roots();
-        let len_obj = crate::gc_roots::pin_root(len_obj);
+        let field_base = crate::gc_roots::pin_roots(&[start, step, len_obj]);
+        let start_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            field_base,
+        )));
+        let step_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            field_base + 1,
+        )));
+        let len_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            field_base + 2,
+        )));
+        let adj = RBigIntGcRoot::new(len_b.int_sub(1));
+        let product = RBigIntGcRoot::new(adj.mul(&*step_b));
+        let lastitem = start_b.add(&*product);
         let w_lastitem = range_bigint_to_obj(lastitem);
-        let w_lastitem = crate::gc_roots::pin_root(w_lastitem);
-        let w_negstep = range_bigint_to_obj(-step_b);
-        let w_negstep = crate::gc_roots::pin_root(w_negstep);
-        w_long_range_iter_new(w_lastitem, w_negstep, len_obj)
+        let lastitem_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(w_lastitem);
+        let w_negstep = range_bigint_to_obj(step_b.neg());
+        w_long_range_iter_new(
+            crate::gc_roots::shadow_stack_get(lastitem_slot),
+            w_negstep,
+            crate::gc_roots::shadow_stack_get(field_base + 2),
+        )
     }
 }
 
@@ -1202,16 +1242,35 @@ pub unsafe fn w_range_reversed(obj: PyObjectRef) -> PyObjectRef {
 /// `obj` must point to a valid `W_Range`.
 pub unsafe fn w_range_compute_item(obj: PyObjectRef, index: &BigInt) -> Option<PyObjectRef> {
     unsafe {
+        // `fromint` of length / start / step allocates.  Pin the range and
+        // its field pointers and re-read them, the same shape as
+        // `range_hash_method` (`functional.py _compute_item` / `_compute_item0`).
+        // `index` is rooted before the first of them.
+        let mut idx = RBigIntGcRoot::new(index.translated_alias());
+        let _roots = crate::gc_roots::push_roots();
+        let obj = crate::gc_roots::pin_root(obj);
+        let obj_slot = crate::gc_roots::shadow_stack_len() - 1;
         let (start, _stop, step) = w_range_fields(obj);
-        let len_b = range_obj_to_bigint(w_range_length(obj));
-        let mut idx = index.translated_alias();
-        if idx < BigInt::zero() {
-            idx = &idx + &len_b;
+        let field_base = crate::gc_roots::pin_roots(&[start, step]);
+        let len_obj = w_range_length(crate::gc_roots::shadow_stack_get(obj_slot));
+        let len_slot = crate::gc_roots::pin_roots(&[len_obj]);
+        let len_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            len_slot,
+        )));
+        if idx.int_lt(0) {
+            idx = RBigIntGcRoot::new(idx.add(&*len_b));
         }
-        if idx >= len_b || idx < BigInt::zero() {
+        if *idx >= *len_b || idx.int_lt(0) {
             return None;
         }
-        let value = range_obj_to_bigint(start) + idx * range_obj_to_bigint(step);
+        let start_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            field_base,
+        )));
+        let step_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            field_base + 1,
+        )));
+        let product = RBigIntGcRoot::new(idx.mul(&*step_b));
+        let value = start_b.add(&*product);
         Some(range_bigint_to_obj(value))
     }
 }
@@ -1222,23 +1281,35 @@ pub unsafe fn w_range_compute_item(obj: PyObjectRef, index: &BigInt) -> Option<P
 /// `obj` must point to a valid `W_Range`.
 pub unsafe fn w_range_contains_bigint(obj: PyObjectRef, item: &BigInt) -> bool {
     unsafe {
+        // `range_obj_to_bigint` of a machine int collects; `item` and the
+        // fields are rooted before the first conversion.
+        let item = live_rbigint(item);
+        let _roots = crate::gc_roots::push_roots();
         let (start, stop, step) = w_range_fields(obj);
-        let start_b = range_obj_to_bigint(start);
-        let stop_b = range_obj_to_bigint(stop);
-        let step_b = range_obj_to_bigint(step);
-        if step_b > BigInt::zero() {
+        let field_base = crate::gc_roots::pin_roots(&[start, stop, step]);
+        let start_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            field_base,
+        )));
+        let stop_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            field_base + 1,
+        )));
+        let step_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            field_base + 2,
+        )));
+        if *step_b > BigInt::zero() {
             // positive steps: start <= ob < stop
-            if !(start_b <= *item && *item < stop_b) {
+            if !(*start_b <= *item && *item < *stop_b) {
                 return false;
             }
         } else {
             // negative steps: stop < ob <= start
-            if !(stop_b < *item && *item <= start_b) {
+            if !(*stop_b < *item && *item <= *start_b) {
                 return false;
             }
         }
         // The stride must not invalidate membership.
-        ((item - &start_b) % &step_b).is_zero()
+        let diff = RBigIntGcRoot::new(item.sub(&*start_b));
+        (&*diff % &*step_b).is_zero()
     }
 }
 
@@ -1249,8 +1320,20 @@ pub unsafe fn w_range_contains_bigint(obj: PyObjectRef, item: &BigInt) -> bool {
 /// `obj` must point to a valid `W_Range`.
 pub unsafe fn w_range_index_of(obj: PyObjectRef, item: &BigInt) -> PyObjectRef {
     unsafe {
+        // `range_obj_to_bigint` of a machine int collects; `item` and the
+        // fields are rooted before the first conversion.
+        let item = live_rbigint(item);
+        let _roots = crate::gc_roots::push_roots();
         let (start, _stop, step) = w_range_fields(obj);
-        let value = (item - range_obj_to_bigint(start)) / range_obj_to_bigint(step);
+        let field_base = crate::gc_roots::pin_roots(&[start, step]);
+        let start_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            field_base,
+        )));
+        let step_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            field_base + 1,
+        )));
+        let diff = RBigIntGcRoot::new(item.sub(&*start_b));
+        let value = &*diff / &*step_b;
         range_bigint_to_obj(value)
     }
 }
@@ -1264,23 +1347,46 @@ pub unsafe fn w_range_index_of(obj: PyObjectRef, item: &BigInt) -> PyObjectRef {
 /// `a` and `b` must point to valid `W_Range` objects.
 pub unsafe fn w_range_eq(a: PyObjectRef, b: PyObjectRef) -> bool {
     unsafe {
-        let la = range_obj_to_bigint(w_range_length(a));
-        let lb = range_obj_to_bigint(w_range_length(b));
-        if la != lb {
+        // functional.py W_Range.descr_eq: `space.eq_w` on length / start /
+        // step collects (`rbigint.py fromint` allocates Digits).
+        // gct_fv_gc_malloc reloads `self` / `w_other` and the field
+        // pointers; pin them for the native path.
+        let _roots = crate::gc_roots::push_roots();
+        let base = crate::gc_roots::pin_roots(&[a, b]);
+        let la = RBigIntGcRoot::new(range_obj_to_bigint(w_range_length(
+            crate::gc_roots::shadow_stack_get(base),
+        )));
+        let lb = RBigIntGcRoot::new(range_obj_to_bigint(w_range_length(
+            crate::gc_roots::shadow_stack_get(base + 1),
+        )));
+        if *la != *lb {
             return false;
         }
-        let (astart, _astop, astep) = w_range_fields(a);
-        let (bstart, _bstop, bstep) = w_range_fields(b);
-        if la == BigInt::from(0) {
+        let (astart, _astop, astep) = w_range_fields(crate::gc_roots::shadow_stack_get(base));
+        let (bstart, _bstop, bstep) = w_range_fields(crate::gc_roots::shadow_stack_get(base + 1));
+        if la.int_eq(0) {
             return true;
         }
-        if range_obj_to_bigint(astart) != range_obj_to_bigint(bstart) {
+        let field_base = crate::gc_roots::pin_roots(&[astart, astep, bstart, bstep]);
+        let astart_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            field_base,
+        )));
+        let bstart_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            field_base + 2,
+        )));
+        if *astart_b != *bstart_b {
             return false;
         }
-        if la == BigInt::one() {
+        if la.int_eq(1) {
             return true;
         }
-        range_obj_to_bigint(astep) == range_obj_to_bigint(bstep)
+        let astep_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            field_base + 1,
+        )));
+        let bstep_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            field_base + 3,
+        )));
+        *astep_b == *bstep_b
     }
 }
 
@@ -1302,15 +1408,25 @@ pub fn range_length(start: i64, stop: i64, step: i64) -> i64 {
 
 /// Bignum `compute_range_length` — always non-negative.
 pub fn range_length_big(start: &BigInt, stop: &BigInt, step: &BigInt) -> BigInt {
+    let start = RBigIntGcRoot::new(start.translated_alias());
+    let stop = RBigIntGcRoot::new(stop.translated_alias());
+    let step = RBigIntGcRoot::new(step.translated_alias());
     let zero = BigInt::zero();
     if *step > zero {
         if *start < *stop {
-            (stop - start - BigInt::one()) / step + BigInt::one()
+            let diff = RBigIntGcRoot::new(stop.sub(&*start));
+            let adj = RBigIntGcRoot::new(diff.sub(&BigInt::one()));
+            let q = RBigIntGcRoot::new(&*adj / &*step);
+            q.add(&BigInt::one())
         } else {
             BigInt::zero()
         }
     } else if *start > *stop {
-        (start - stop - BigInt::one()) / (-step) + BigInt::one()
+        let diff = RBigIntGcRoot::new(start.sub(&*stop));
+        let adj = RBigIntGcRoot::new(diff.sub(&BigInt::one()));
+        let neg_step = RBigIntGcRoot::new(step.neg());
+        let q = RBigIntGcRoot::new(&*adj / &*neg_step);
+        q.add(&BigInt::one())
     } else {
         BigInt::zero()
     }
@@ -1339,11 +1455,16 @@ pub fn w_long_range_iter_new(
     len: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    let start = crate::gc_roots::pin_root(start);
-    let step = crate::gc_roots::pin_root(step);
-    let len = crate::gc_roots::pin_root(len);
-    let index = crate::intobject::w_int_new(0);
-    let index = crate::gc_roots::pin_root(index);
+    let _ = crate::gc_roots::pin_root(start);
+    let start_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let _ = crate::gc_roots::pin_root(step);
+    let step_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let _ = crate::gc_roots::pin_root(len);
+    let len_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let index = crate::gc_roots::pin_root(crate::intobject::w_int_new(0));
+    let start = crate::gc_roots::shadow_stack_get(start_slot);
+    let step = crate::gc_roots::shadow_stack_get(step_slot);
+    let len = crate::gc_roots::shadow_stack_get(len_slot);
     W_LongRangeIterator::allocate_stable(W_LongRangeIterator {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -1370,12 +1491,13 @@ pub unsafe fn is_long_range_iter(obj: PyObjectRef) -> bool {
 pub unsafe fn w_long_range_iter_len(obj: PyObjectRef) -> BigInt {
     unsafe {
         let it = obj as *const W_LongRangeIterator;
-        let len = range_obj_to_bigint((*it).len);
-        let rem = len - range_obj_to_bigint((*it).index);
-        if rem < BigInt::from(0) {
+        let len = RBigIntGcRoot::new(range_obj_to_bigint((*it).len));
+        let index = RBigIntGcRoot::new(range_obj_to_bigint((*it).index));
+        let rem = RBigIntGcRoot::new(len.sub(&*index));
+        if rem.int_lt(0) {
             BigInt::from(0)
         } else {
-            rem
+            rem.translated_alias()
         }
     }
 }
@@ -1412,7 +1534,9 @@ pub unsafe fn w_long_range_iter_set_index(obj: PyObjectRef, index: PyObjectRef) 
 pub unsafe fn w_long_range_iter_has_next(obj: PyObjectRef) -> bool {
     unsafe {
         let it = obj as *const W_LongRangeIterator;
-        range_obj_to_bigint((*it).index) < range_obj_to_bigint((*it).len)
+        let index = RBigIntGcRoot::new(range_obj_to_bigint((*it).index));
+        let len = RBigIntGcRoot::new(range_obj_to_bigint((*it).len));
+        *index < *len
     }
 }
 
@@ -1424,23 +1548,24 @@ pub unsafe fn w_long_range_iter_has_next(obj: PyObjectRef) -> bool {
 pub unsafe fn w_long_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
     unsafe {
         let it = obj as *mut W_LongRangeIterator;
-        let index = range_obj_to_bigint((*it).index);
-        let len = range_obj_to_bigint((*it).len);
-        if index >= len {
+        let index = RBigIntGcRoot::new(range_obj_to_bigint((*it).index));
+        let len = RBigIntGcRoot::new(range_obj_to_bigint((*it).len));
+        if *index >= *len {
             return None;
         }
-        let start = range_obj_to_bigint((*it).start);
-        let step = range_obj_to_bigint((*it).step);
+        let start = RBigIntGcRoot::new(range_obj_to_bigint((*it).start));
+        let step = RBigIntGcRoot::new(range_obj_to_bigint((*it).step));
         // `w_result = self.w_index * self.w_step + self.w_start`, then
         // `self.w_index = self.w_index + 1` (wrapped, arbitrary precision).
         // `next_index` is wrapped before `value`; that first allocation may
         // collect while the computed item exists only as an unboxed rbigint.
         // RPython's GC transform roots this local automatically.
-        let value = RBigIntGcRoot::new(start + index.translated_alias() * step);
+        let product = RBigIntGcRoot::new(index.mul(&*step));
+        let value = RBigIntGcRoot::new(start.add(&*product));
         let _roots = crate::gc_roots::push_roots();
         let _ = crate::gc_roots::pin_root(obj);
         let iter_slot = crate::gc_roots::shadow_stack_len() - 1;
-        let next_index = range_bigint_to_obj(index + BigInt::from(1));
+        let next_index = range_bigint_to_obj(index.int_add(1));
         let next_index = crate::gc_roots::pin_root(next_index);
         let it = crate::gc_roots::shadow_stack_get(iter_slot) as *mut W_LongRangeIterator;
         (*it).index = next_index;

@@ -16,80 +16,106 @@
 
 use super::*;
 use majit_gc::GcAllocOutcome;
+use std::cell::UnsafeCell;
 
-/// GC-transformed residual body for `rbigint.add` on movable payloads.
+// ---- RBigIntGcRoot ----
+/// Host-side, by-value `RBigInt` whose `_digits` edge lives in a fixed
+/// owner-root slot for the guard's lifetime.
 ///
-/// The JIT stack map keeps the payload objects alive, while this generated
-/// boundary supplies the two live payload objects to the collecting list
-/// malloc inside `_x_add`/`_x_sub`; ordinary payload tracing updates their
-/// `_digits` edges.
-/// That is the `push_roots(livevars)` bracket which RPython inserts around the
-/// allocation after translating `rbigint.py:add`.
-#[inline]
-pub unsafe fn add_payloads_collecting(a: *const RBigInt, b: *const RBigInt) -> RBigInt {
-    let mut roots = [majit_ir::GcRef::NULL; 2];
-    unsafe { (&*a).add_with_gc_roots(&*b, Some(&mut roots)) }
-}
-
-/// GC-transformed residual body for `rbigint.sub` on movable payloads.
-#[inline]
-pub unsafe fn sub_payloads_collecting(a: *const RBigInt, b: *const RBigInt) -> RBigInt {
-    let mut roots = [majit_ir::GcRef::NULL; 2];
-    unsafe { (&*a).sub_with_gc_roots(&*b, Some(&mut roots)) }
-}
-
-/// GC-transformed residual body for `rbigint.mul` on movable payloads.
-#[inline]
-pub unsafe fn mul_payloads_collecting(a: *const RBigInt, b: *const RBigInt) -> RBigInt {
-    let mut roots = [majit_ir::GcRef::NULL; 2];
-    unsafe { (&*a).mul_with_gc_roots(&*b, Some(&mut roots)) }
-}
-
-/// GC-transformed residual body for `rbigint.and_` on movable payloads.
-#[inline]
-pub unsafe fn and_payloads_collecting(a: *const RBigInt, b: *const RBigInt) -> RBigInt {
-    let mut roots = [majit_ir::GcRef::NULL; 2];
-    unsafe { (&*a).and_with_gc_roots(&*b, Some(&mut roots)) }
-}
-
-/// GC-transformed residual body for `rbigint.or_` on movable payloads.
-#[inline]
-pub unsafe fn or_payloads_collecting(a: *const RBigInt, b: *const RBigInt) -> RBigInt {
-    let mut roots = [majit_ir::GcRef::NULL; 2];
-    unsafe { (&*a).or_with_gc_roots(&*b, Some(&mut roots)) }
-}
-
-/// GC-transformed residual body for `rbigint.xor` on movable payloads.
-#[inline]
-pub unsafe fn xor_payloads_collecting(a: *const RBigInt, b: *const RBigInt) -> RBigInt {
-    let mut roots = [majit_ir::GcRef::NULL; 2];
-    unsafe { (&*a).xor_with_gc_roots(&*b, Some(&mut roots)) }
-}
-
-// RBigIntGcRoot
-/// Address-stable GC root for a host-side, by-value `RBigInt`.
+/// RPython's GC transform gives a local that is live across several
+/// collecting calls a *fixed* frame slot (`gc_save_root` /
+/// `gc_restore_root` into the same index). The LIFO shadow stack is only
+/// the `push_roots` / `pop_roots` bump around one call
+/// (`framework.py`); `CurrentFrameGuard` and the JIT `FrameRoot` truncate
+/// that stack with `pop_to`. A long-lived RAII handle therefore cannot
+/// share it: a nested frame that pops, or `release` compacting a hole,
+/// would hand the index to a later push and `Deref` would reload that
+/// later value as `_digits`.
 ///
-/// RPython's GC transform puts an `rbigint` local's `_digits` edge in the
-/// shadow stack whenever that local is live across a call that can collect.
-/// Rust locals have no generated stack map, so interpreter-level consumers
-/// that retain an unboxed `RBigInt` across a Python callback use this exact
-/// analogue.  The `Box` is required: moving this guard must not move the slot
-/// registered with MiniMark.
+/// [`majit_gc::shadow_stack::acquire_owner_root`] is that fixed-slot vector.
+/// Replacing a live guard (`z = RBigIntGcRoot::new(...)`) acquires a new
+/// slot and drops the old one; in-place replacement of the handle must
+/// go through [`RBigIntGcRoot::set`] so the same slot names the new
+/// digit array. Assignment through [`DerefMut`] updates only the local
+/// `_digits` pointer and leaves `_size` paired with the previous array —
+/// as does a `&mut self` method that installs one, which is why
+/// `_normalize` is reached through [`RBigIntGcRoot::normalize`].
 pub struct RBigIntGcRoot {
-    value: Box<RBigInt>,
-    slot: *mut majit_ir::GcRef,
-    registered: bool,
+    // Interior mutability: a minor collection rewrites the owner-root
+    // entry, and `Deref` copies that forwarded `_digits` pointer back into
+    // the handle. The collector would do the same to a generated frame slot.
+    value: UnsafeCell<RBigInt>,
+    slot: usize,
+    /// `slot` indexes the acquiring thread's owner-root vector, the way a
+    /// shadow-stack slot belongs to the frame's own thread. Without this
+    /// marker the guard is auto-`Send` (`RBigInt` is), and dropping it on
+    /// another thread would release that thread's slot.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+/// Root a *borrowed* handle whose owner already keeps the original local
+/// live. Clone shares the digit array; the clone's `_digits` pointer is what
+/// the collector updates. An *owned* local that is read after the next
+/// collecting call must move into [`RBigIntGcRoot::new`] instead — a clone
+/// here leaves the caller's pointer at the pre-move address.
+pub fn live_rbigint(value: &RBigInt) -> RBigIntGcRoot {
+    RBigIntGcRoot::new(value.clone())
 }
 
 impl RBigIntGcRoot {
     pub fn new(value: RBigInt) -> Self {
-        let mut value = Box::new(value);
-        let slot = (&mut value._digits as *mut *mut TypedItemsBlock).cast::<majit_ir::GcRef>();
-        let registered = unsafe { majit_gc::gc_add_root(slot) };
+        let slot =
+            majit_gc::shadow_stack::acquire_owner_root(majit_ir::GcRef(value._digits as usize));
         Self {
-            value,
+            value: UnsafeCell::new(value),
             slot,
-            registered,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    /// Replace the handle and republish `_digits` on the same owner-root
+    /// slot. Assignment through [`DerefMut`] cannot update that slot, and
+    /// the next collection would keep the previous array instead of the new
+    /// one — `_size` then describes a digit block the slot no longer names.
+    pub fn set(&mut self, value: RBigInt) {
+        majit_gc::shadow_stack::set_owner_root(self.slot, majit_ir::GcRef(value._digits as usize));
+        *self.value.get_mut() = value;
+    }
+
+    /// `RBigInt::_normalize` on a rooted handle, republishing the digit
+    /// array that store may install.
+    ///
+    /// `rbigint.py` `_normalize` assigns `NULLDIGITS` when the value
+    /// collapses to zero. There `self.digits` is a field of the object the
+    /// frame slot names, so the store *is* what the next read sees. Here the
+    /// handle is by value and the slot holds its `_digits` edge alone: a
+    /// store through [`DerefMut`] reaches only the handle, and the next
+    /// [`Deref`] reloads the slot over it — restoring the array the value no
+    /// longer describes, which by then nothing roots. Publish it on the slot,
+    /// the way `framework.py` `gc_save_root` re-saves a live local after a
+    /// store.
+    pub fn normalize(&mut self) {
+        let slot = self.slot;
+        self.reload_digits();
+        let value = self.value.get_mut();
+        value._normalize();
+        majit_gc::shadow_stack::set_owner_root(slot, majit_ir::GcRef(value._digits as usize));
+    }
+
+    fn reload_digits(&self) {
+        // The collector rewrites the owner-root entry in place. Copy that
+        // forwarded pointer back into the by-value handle so subsequent
+        // digit reads do not follow the vacated nursery copy.
+        //
+        // Store only when the slot moved. Two `Deref`s in one expression
+        // (`a.mul(&a)`) have no collecting call between them, so the second
+        // one then leaves the cell untouched while the first borrow is live.
+        let forwarded = majit_gc::shadow_stack::get_owner_root(self.slot).0 as *mut TypedItemsBlock;
+        let value = self.value.get();
+        unsafe {
+            if (*value)._digits != forwarded {
+                (*value)._digits = forwarded;
+            }
         }
     }
 }
@@ -98,21 +124,21 @@ impl std::ops::Deref for RBigIntGcRoot {
     type Target = RBigInt;
 
     fn deref(&self) -> &Self::Target {
-        &self.value
+        self.reload_digits();
+        unsafe { &*self.value.get() }
     }
 }
 
 impl std::ops::DerefMut for RBigIntGcRoot {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.value
+        self.reload_digits();
+        self.value.get_mut()
     }
 }
 
 impl Drop for RBigIntGcRoot {
     fn drop(&mut self) {
-        if self.registered {
-            majit_gc::gc_remove_root(self.slot);
-        }
+        majit_gc::shadow_stack::release_owner_root(self.slot);
     }
 }
 
@@ -274,50 +300,6 @@ fn alloc_rbigint_nursery_collecting_impl(
 #[inline]
 pub fn alloc_rbigint_nursery_collecting(value: RBigInt) -> *mut RBigInt {
     alloc_rbigint_nursery_collecting_impl(value, true)
-}
-
-/// Let the collector reclaim the conversion's temporaries before the nursery
-/// is exhausted.
-///
-/// `rbigint.py`'s loop reaches `x.divmod(...)` on every iteration,
-/// and upstream that is an ordinary malloc: `[NULLDIGIT] * size` lowers to
-/// `ll_newlist`, the inlined `malloc_fast` copy of `malloc_fixedsize`
-/// (framework.py:366-373), whose nursery bump reaches `collect_and_reserve`
-/// the moment it overflows (incminimark.py). So the quotients and
-/// remainders of earlier iterations — dead the moment the next one starts —
-/// never leave the nursery.
-///
-/// pyre spells that same allocation as `Digits::new`, which routes to
-/// `alloc_fast_nursery_typed` — `malloc_fast`'s *non*-collecting twin. It has
-/// to: a collection there would move digit blocks out from under the unboxed
-/// `RBigInt` handles every arithmetic graph in this file holds across it, and
-/// nothing roots them. It spills to old-gen instead, so a long conversion
-/// fills the nursery once and then promotes every later block, and the next
-/// allocation *after* the conversion pays for all of them in one collection.
-///
-/// Routing `Digits::new` to the collecting allocator is what would close this
-/// deviation outright, and it is not a change this function makes: it would
-/// oblige every caller in the file to root what it holds.
-///
-/// Minting one payload through the collecting allocator restores the upstream
-/// shape at the one point in that loop where the frame's only live edge is
-/// already rooted. The bump fails exactly when the nursery is exhausted, which
-/// is exactly when spilling would otherwise begin; the collection that follows
-/// hands the loop a fresh nursery, so at most one iteration's blocks can be
-/// promoted instead of the whole conversion's.
-///
-/// The minted handle is immediately dead. That is the point: it is a request
-/// for the collection, not a value.
-///
-/// # Safety
-///
-/// The caller must keep every `RBigInt` it holds live across this call rooted
-/// — `x` in the two `_format_recursive_*` graphs is held in an
-/// [`RBigIntGcRoot`] for exactly this reason — and must not read an `&RBigInt`
-/// derived before the call afterwards.
-#[inline]
-pub unsafe fn format_recursion_safepoint(rooted: &RBigInt) {
-    let _ = alloc_rbigint_clone_nursery_collecting(rooted.clone());
 }
 
 /// Allocate the fresh translated GC handle required by `RBigInt::clone`.

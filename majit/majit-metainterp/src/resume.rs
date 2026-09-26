@@ -8544,7 +8544,7 @@ impl Drop for DeadFrameRefRoots {
 /// Drop runs on ordinary return, `?` propagation, and panic unwind, so the
 /// `virtuals_cache` / `registers_r` slices never outlive the construction
 /// window in the GC root set.
-struct ResumeRefRootsScope {
+pub struct ResumeRefRootsScope {
     base_depth: usize,
 }
 
@@ -8562,7 +8562,7 @@ impl Drop for ResumeRefRootsScope {
     }
 }
 
-fn prepare_resume_heap_with_roots<'a>(
+pub fn prepare_resume_heap_with_roots<'a>(
     resumereader: &mut ResumeDataDirectReader<'a>,
     rd_virtuals: Option<&'a [VirtualInfo]>,
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,

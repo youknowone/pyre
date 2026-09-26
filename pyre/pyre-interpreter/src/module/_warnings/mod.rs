@@ -859,7 +859,7 @@ pub fn state_is_readable() -> bool {
 /// warning it raises takes the unfiltered stderr fallback, for the whole
 /// process rather than for the window the fallback was written for.
 ///
-/// Goes through `create_builtin_module`, so the module lands in `sys.modules`
+/// Goes through `getbuiltinmodule`, so the module lands in `sys.modules`
 /// and a later `import _warnings` binds this one.  A private second namespace
 /// would carry a second `filters` list, and the interpreter would keep
 /// matching against the one the application never touched.
@@ -874,7 +874,7 @@ pub fn install_state() {
     if TRIED.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    let _ = crate::importing::create_builtin_module("_warnings", std::ptr::null());
+    let _ = crate::importing::getbuiltinmodule("_warnings", false, true, std::ptr::null());
 }
 
 /// `interp_warnings.do_warn` — the interpreter-level entry point.

@@ -9,7 +9,6 @@
 use super::pyobject::{self, CPyObject, REFCNT_FROM_PYPY, REFCNT_IMMORTAL};
 use pyre_object::{PY_NULL, PyObjectRef};
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
-use std::sync::OnceLock;
 
 /// `PyVarObject` — a `PyObject` with the variable-part length.
 #[repr(C)]
@@ -2706,24 +2705,28 @@ pub(super) fn new_method_descriptor(
 }
 
 fn descriptor_type(
-    cell: &OnceLock<usize>,
+    cell: &pyre_object::gc_roots::RootedOnceRef,
     name: &'static str,
     init: fn(PyObjectRef),
 ) -> PyObjectRef {
-    *cell.get_or_init(|| {
+    cell.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type(name, |ns| {
             init(ns);
             super::methodobject::install_attribute_fence(ns);
         });
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
-static METHOD_DESCRIPTOR_TYPE: OnceLock<usize> = OnceLock::new();
-static CLASSMETHOD_DESCRIPTOR_TYPE: OnceLock<usize> = OnceLock::new();
-static MEMBER_DESCRIPTOR_TYPE: OnceLock<usize> = OnceLock::new();
-static GETSET_DESCRIPTOR_TYPE: OnceLock<usize> = OnceLock::new();
+static METHOD_DESCRIPTOR_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
+static CLASSMETHOD_DESCRIPTOR_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
+static MEMBER_DESCRIPTOR_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
+static GETSET_DESCRIPTOR_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `methodobject.py:W_PyCMethodObject` — a `tp_methods` row.
 ///
@@ -4481,7 +4484,7 @@ fn is_descriptor_carrier(w_type: PyObjectRef) -> bool {
             &GETSET_DESCRIPTOR_TYPE,
         ]
         .into_iter()
-        .any(|cell| cell.get() == Some(&(w_type as usize)))
+        .any(|cell| cell.get() == Some(w_type))
 }
 
 /// Whether `w_type` is `wrapper_descriptor`, whose blocks carry a slot and the

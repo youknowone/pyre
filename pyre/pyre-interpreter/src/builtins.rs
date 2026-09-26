@@ -1,5 +1,5 @@
 use crate::locals_w;
-use majit_rlib::rbigint::RBigInt as BigInt;
+use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntGcRoot};
 use num_traits::ToPrimitive;
 
 use crate::{
@@ -145,37 +145,54 @@ pub unsafe fn buffer_export_decref(obj: PyObjectRef) {
 
 /// `_check_exports` — reject a size-changing mutation of a bytearray while a
 /// buffer export (a live memoryview) is outstanding.
-pub(crate) unsafe fn bytearray_check_exports(mut obj: PyObjectRef) -> Result<(), crate::PyError> {
-    if unsafe { pyre_object::bytearrayobject::w_bytearray_exports(obj) } > 0 {
-        // A tracing collector does not reclaim an expression-temporary
-        // `memoryview` at the end of the statement as CPython's refcounting
-        // does.  Make non-moving major progress before rejecting the resize:
-        // dead stable-allocated views run `memoryview_object_destructor` and
-        // release their backing export, while a live view remains counted.
-        //
-        // The collector reads `PyFrame.valuestackdepth` to exclude popped
-        // operand slots.  When this check is reached from assembler that
-        // virtualizable field is still register-resident, so materialize the
-        // current red frame first.  This is the explicit counterpart of
-        // RPython `rvirtualizable.py hook_access_field`: an opaque
-        // consumer which reads a redirected field receives
-        // `force_virtualizable_if_necessary` before the read.
-        crate::executioncontext::force_frame(crate::eval::current_frame());
-        // `collect_oldgen` is essential here: this check must not move `obj`.
-        // It can still sweep an unregistered object, so publish `obj` for the
-        // mark walk and mirror framework.py's pop-roots reload before reading
-        // the export count again.
-        pyre_object::with_roots!(obj =>
-            pyre_object::gc_hook::try_gc_collect_oldgen()
-        );
+///
+/// Returns the live bytearray. A minor moves a nursery object; callers that
+/// mutate after this check have to use the returned address.
+pub(crate) unsafe fn bytearray_check_exports(
+    obj: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    if unsafe { pyre_object::bytearrayobject::w_bytearray_exports(obj) } == 0 {
+        return Ok(obj);
     }
+    // The collector reads `PyFrame.valuestackdepth` to exclude popped
+    // operand slots.  When this check is reached from assembler that
+    // virtualizable field is still register-resident, so materialize the
+    // current red frame first.  This is the explicit counterpart of
+    // RPython `rvirtualizable.py hook_access_field`: an opaque
+    // consumer which reads a redirected field receives
+    // `force_virtualizable_if_necessary` before the read.
+    crate::executioncontext::force_frame(crate::eval::current_frame());
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    // `W_MemoryView` is nursery-born. A dead view's export is released by
+    // `W_MemoryView._finalize_`, which a collection only queues. A traced
+    // caller does not fill the nursery on the way here, so a dead young
+    // view is the common case and the minor runs before the old-gen sweep.
+    // The minor moves `obj`; `slot` is the reload.
+    pyre_object::gc_hook::try_gc_collect(0);
+    let obj = pyre_object::gc_roots::shadow_stack_get(slot);
+    if unsafe { pyre_object::bytearrayobject::w_bytearray_exports(obj) } > 0 {
+        // A view that survived an earlier minor sits on
+        // `old_objects_with_destructors`. `do_collect_oldgen_nonmoving`
+        // runs those destructors and does not move `obj`.
+        pyre_object::gc_hook::try_gc_collect_oldgen();
+    }
+    let obj = pyre_object::gc_roots::shadow_stack_get(slot);
+    if unsafe { pyre_object::bytearrayobject::w_bytearray_exports(obj) } > 0 {
+        // A dead view releases its export in `W_MemoryView._finalize_`,
+        // which the collections above only queue. Drain the queue the way
+        // `gc.collect()` does after its collection.
+        crate::module::gc::run_finalizers_now();
+    }
+    let obj = pyre_object::gc_roots::shadow_stack_get(slot);
     if unsafe { pyre_object::bytearrayobject::w_bytearray_exports(obj) } > 0 {
         return Err(crate::PyError::new(
             crate::PyErrorKind::BufferError,
             "Existing exports of data: object cannot be re-sized",
         ));
     }
-    Ok(())
+    Ok(obj)
 }
 
 /// Wrap native per-dimension extents (a `shape` or `strides`) into a fresh
@@ -219,6 +236,7 @@ unsafe fn w_memoryview_copy_derived(mv_src: PyObjectRef) -> PyObjectRef {
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
         backing_exports_incref(pyre_object::memoryview::w_memoryview_view(mv).backing());
+        memoryview_register_finalizer(mv);
         mv
     }
 }
@@ -243,6 +261,7 @@ unsafe fn w_memoryview_readonly_derived(mv_src: PyObjectRef) -> PyObjectRef {
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
         backing_exports_incref(pyre_object::memoryview::w_memoryview_view(mv).backing());
+        memoryview_register_finalizer(mv);
         mv
     }
 }
@@ -271,6 +290,7 @@ unsafe fn w_memoryview_cast_1d(mv_src: PyObjectRef, fmt: &str, itemsize: i64) ->
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
         backing_exports_incref(pyre_object::memoryview::w_memoryview_view(mv).backing());
+        memoryview_register_finalizer(mv);
         mv
     }
 }
@@ -329,6 +349,7 @@ unsafe fn w_memoryview_cast_nd(
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
         backing_exports_incref(pyre_object::memoryview::w_memoryview_view(mv).backing());
+        memoryview_register_finalizer(mv);
         mv
     }
 }
@@ -402,6 +423,7 @@ unsafe fn w_memoryview_new_plain(
         };
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        memoryview_register_finalizer(mv);
         mv
     }
 }
@@ -431,6 +453,7 @@ pub(crate) fn w_memoryview_new_simple_with_owner(
         };
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        memoryview_register_finalizer(mv);
         mv
     }
 }
@@ -503,6 +526,7 @@ unsafe fn w_memoryview_new_mmap(
         // `close`/`resize` hand straight back to the kernel, so the window
         // must keep it from being unmapped while this view can still read it.
         pyre_object::buffer::external_buffer_acquire(r_obj);
+        memoryview_register_finalizer(mv);
         mv
     }
 }
@@ -666,6 +690,7 @@ unsafe fn w_memoryview_new_python_buffer(
         let r_wrapper = pyre_object::gc_roots::shadow_stack_get(wrapper_slot);
         let copied = w_memoryview_view(r_ret).clone_with_obj(r_wrapper);
         w_memoryview_set_view(outer, bufferview_alloc(copied));
+        memoryview_register_finalizer(outer);
         Ok(outer)
     }
 }
@@ -714,13 +739,29 @@ fn w_memoryview_new_with_flags_impl(
         ));
     }
     use pyre_object::memoryview::*;
+    // `lookup("__buffer__")`, `mmap_type()`, and `cdata_type()` are
+    // first-use constructors and can collect. Pin the exporter for the
+    // whole probe chain and reload it at each call.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[w_obj]);
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     if let Some(target) = crate::module::__pypy__::interp_buffer::forwarded_exporter(w_obj) {
         return w_memoryview_new_with_flags_impl(target?, flags, allow_python_slot);
     }
     unsafe {
-        if allow_python_slot && let Some(w_descr) = memoryview_python_buffer_descr(w_obj) {
-            return w_memoryview_new_python_buffer(w_obj, w_descr, flags);
+        let w_descr = if allow_python_slot {
+            memoryview_python_buffer_descr(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+        } else {
+            None
+        };
+        if let Some(w_descr) = w_descr {
+            return w_memoryview_new_python_buffer(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                w_descr,
+                flags,
+            );
         }
+        let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         if is_w_memoryview(w_obj) {
             memoryview_check_released(w_obj)?;
             if w_memoryview_restricted(w_obj) {
@@ -763,21 +804,32 @@ fn w_memoryview_new_with_flags_impl(
                 length: length as i64,
             };
             w_memoryview_set_view(mv, bufferview_alloc(view));
+            memoryview_register_finalizer(mv);
             return Ok(mv);
         }
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        if let Some(view) = pyre_object::buffer::external_buffer_view(w_obj) {
+        if let Some(view) = pyre_object::buffer::external_buffer_view(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        ) {
             let (address, length, readonly) = view.map_err(crate::PyError::value_error)?;
-            return Ok(w_memoryview_new_mmap(w_obj, address, length, readonly));
+            return Ok(w_memoryview_new_mmap(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                address,
+                length,
+                readonly,
+            ));
         }
         if let Some(hooks) = crate::importing::optional_module_hooks()
             && let Some((backing_obj, offset, byte_len, fmt, itemsize, shape)) =
-                (hooks.ctypes_buffer_view)(w_obj)
+                (hooks.ctypes_buffer_view)(pyre_object::gc_roots::shadow_stack_get(obj_slot))
         {
             use pyre_object::buffer::Buffer;
             use pyre_object::bufferview::BufferView;
             let _roots = pyre_object::gc_roots::push_roots();
-            let sp = pyre_object::gc_roots::pin_roots(&[w_obj, backing_obj]);
+            let sp = pyre_object::gc_roots::pin_roots(&[
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                backing_obj,
+            ]);
             let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&fmt));
             let shape_i64 = shape.iter().map(|&dim| dim as i64).collect::<Vec<_>>();
             let mut strides = vec![0i64; shape.len()];
@@ -812,6 +864,7 @@ fn w_memoryview_new_with_flags_impl(
             };
             let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
             pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+            memoryview_register_finalizer(mv);
             return Ok(mv);
         }
         #[cfg(all(
@@ -819,20 +872,25 @@ fn w_memoryview_new_with_flags_impl(
             not(feature = "sandbox"),
             any(target_os = "macos", target_os = "linux")
         ))]
-        if let Some(view) = crate::cpyext::buffer::buffer_view(w_obj, flags) {
+        if let Some(view) = crate::cpyext::buffer::buffer_view(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            flags,
+        ) {
             return view;
         }
-        let (fmt, itemsize, readonly, byte_len) = match memoryview_buffer_params(w_obj) {
-            Some(p) => p,
-            None => {
-                let tname = crate::typedef::r#type(w_obj)
-                    .map(|t| pyre_object::w_type_get_name(t.as_ptr()))
-                    .unwrap_or("object");
-                return Err(crate::PyError::type_error(format!(
-                    "memoryview: a bytes-like object is required, not '{tname}'"
-                )));
-            }
-        };
+        let (fmt, itemsize, readonly, byte_len) =
+            match memoryview_buffer_params(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
+                Some(p) => p,
+                None => {
+                    let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    let tname = crate::typedef::r#type(w_obj)
+                        .map(|t| pyre_object::w_type_get_name(t.as_ptr()))
+                        .unwrap_or("object");
+                    return Err(crate::PyError::type_error(format!(
+                        "memoryview: a bytes-like object is required, not '{tname}'"
+                    )));
+                }
+            };
         if flags & 0x0001 != 0 && readonly {
             return Err(crate::PyError::new(
                 crate::PyErrorKind::BufferError,
@@ -843,11 +901,66 @@ fn w_memoryview_new_with_flags_impl(
         // a `SimpleView`, an array.array a `RawBufferView` (readonly follows the
         // backing kind).
         Ok(w_memoryview_new_plain(
-            w_obj,
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
             &fmt,
             itemsize,
             byte_len as i64,
         ))
+    }
+}
+
+/// `objspace.py newmemoryview`: `if owns_export and view.needs_release():
+/// mv.register_finalizer(space)`.  A view whose release has no side effect
+/// (a `bytes` exporter) registers nothing.  An owner that is a
+/// `_buffer_wrapper` always needs its release: it ends the export the wrapper
+/// holds on the memoryview `__buffer__` returned.
+///
+/// # Safety
+/// `mv` must be a `W_MemoryView` whose view is set.
+pub(crate) unsafe fn memoryview_register_finalizer(mv: PyObjectRef) {
+    use pyre_object::memoryview::*;
+    unsafe {
+        if !w_memoryview_owns_export(mv) {
+            return;
+        }
+        let view = w_memoryview_view(mv);
+        if is_w_buffer_wrapper(view.w_obj()) || view.backing().needs_release() {
+            crate::executioncontext::register_finalizer(mv);
+        }
+    }
+}
+
+/// `W_MemoryView._finalize_`: `if self.view is not None:
+/// self._release_underlying(None)`.  With no space, `_release_underlying`
+/// consults no `__release_buffer__` and calls `view.releasebuffer()`; then the
+/// view is gone.  The exporter is still reachable here because the finalizer
+/// queue kept this memoryview alive, so the release reaches its current
+/// address.
+///
+/// # Safety
+/// `mv` must be a `W_MemoryView`.
+pub(crate) unsafe fn memoryview_finalize(mv: PyObjectRef) {
+    use pyre_object::memoryview::*;
+    unsafe {
+        if (*(mv as *const W_MemoryView)).view.is_null() {
+            return;
+        }
+        if w_memoryview_owns_export(mv) {
+            let owner = w_memoryview_obj(mv);
+            if is_w_buffer_wrapper(owner) {
+                // `bufferwrapper_releasebuf` with no space: end the returned
+                // memoryview's export and drop the wrapper edges.  The
+                // returned view releases its own backing export.
+                let returned = w_buffer_wrapper_mv(owner);
+                if !returned.is_null() {
+                    w_memoryview_exports_decref(returned);
+                }
+                w_buffer_wrapper_clear(owner);
+            } else {
+                w_memoryview_view(mv).backing().release_export();
+            }
+        }
+        w_memoryview_set_released(mv);
     }
 }
 
@@ -1160,6 +1273,7 @@ unsafe fn memoryview_slice_view(
         // path.  `Buffer::sub` never nests, so one parent peel is sufficient.
         backing_exports_incref(snapshot.backing());
         w_memoryview_set_view(sliced, bufferview_alloc(snapshot));
+        memoryview_register_finalizer(sliced);
         let _ = pyre_object::gc_roots::pin_root(sliced);
 
         let r_index = pyre_object::gc_roots::shadow_stack_get(sp + 1);
@@ -2063,7 +2177,7 @@ fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // both the live and released labels.
     Ok(w_str_new_managed(&format!(
         "<{label} at {}>",
-        crate::display::repr_addr(mv as usize)
+        crate::display::repr_gc_addr(mv)
     )))
 }
 
@@ -2245,10 +2359,14 @@ unsafe fn memoryview_release_buffer_wrapper(wrapper: PyObjectRef) {
                 memoryview_call_python_release_unraisable(r_obj, r_mv, descr);
             }
         } else if !w_memoryview_released(r_mv) {
+            // The Python release override runs app-level code and collects,
+            // and so can a C exporter's `bf_releasebuffer`: the view is a
+            // livevar across each and is read back from its slot after it.
             memoryview_release_native_python_slot(r_obj, r_mv);
+            let r_mv = pyre_object::gc_roots::shadow_stack_get(sp + 1);
             let backing = w_memoryview_backing(r_mv);
             let _ = release_native_backing(r_mv, backing);
-            w_memoryview_set_released(r_mv);
+            w_memoryview_set_released(pyre_object::gc_roots::shadow_stack_get(sp + 1));
         }
         w_buffer_wrapper_clear(pyre_object::gc_roots::shadow_stack_get(sp));
     }
@@ -2280,34 +2398,45 @@ pub(crate) fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
             // `_release_underlying`.  A slice / copy (`owns_export == false`)
             // shares the export and must not release it.
             if pyre_object::memoryview::w_memoryview_owns_export(mv) {
-                let owner = pyre_object::memoryview::w_memoryview_obj(mv);
-                let backing = pyre_object::memoryview::w_memoryview_backing(mv);
+                // The exporter hooks below run app-level code and collect: the
+                // view, its owner and its backing are livevars across them and
+                // are read back from their slots after each one.
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.pin_roots(&[
+                    mv,
+                    pyre_object::memoryview::w_memoryview_obj(mv),
+                    pyre_object::memoryview::w_memoryview_backing(mv),
+                ]);
+                let mv = || roots.get(base);
+                let owner = || roots.get(base + 1);
+                let backing = || roots.get(base + 2);
                 // Mark the view released before invoking the exporter hook so a
                 // re-entrant release is a no-op, but keep the view box until
                 // the hook returns: it is handed this memoryview and reads the
                 // backing back off it to identify the export it is undoing.
-                pyre_object::memoryview::w_memoryview_mark_released(mv);
-                let released = if pyre_object::memoryview::is_w_buffer_wrapper(owner) {
-                    memoryview_release_buffer_wrapper(owner);
+                pyre_object::memoryview::w_memoryview_mark_released(mv());
+                let released = if pyre_object::memoryview::is_w_buffer_wrapper(owner()) {
+                    memoryview_release_buffer_wrapper(owner());
                     Ok(())
                 } else {
                     // `slot_bf_releasebuffer`: call a Python override with a
                     // restricted snapshot, then unconditionally invoke the
                     // first native base release slot.
-                    memoryview_release_native_python_slot(owner, mv);
-                    if release_native_backing(mv, backing) {
+                    memoryview_release_native_python_slot(owner(), mv());
+                    if release_native_backing(mv(), backing()) {
                         Ok(())
                     } else {
-                        match crate::baseobjspace::lookup(backing, "__release_buffer__") {
-                            Some(release_fn) => {
-                                crate::call::call_function_impl_result(release_fn, &[backing, mv])
-                                    .map(|_| ())
-                            }
+                        match crate::baseobjspace::lookup(backing(), "__release_buffer__") {
+                            Some(release_fn) => crate::call::call_function_impl_result(
+                                release_fn,
+                                &[backing(), mv()],
+                            )
+                            .map(|_| ()),
                             None => Ok(()),
                         }
                     }
                 };
-                pyre_object::memoryview::w_memoryview_drop_view(mv);
+                pyre_object::memoryview::w_memoryview_drop_view(mv());
                 released?;
             } else {
                 pyre_object::memoryview::w_memoryview_set_released(mv);
@@ -2579,7 +2708,9 @@ fn memoryview_from_flags(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `memoryview.hex` — the view's bytes as a hex string, reusing the
 /// bytes `hex(sep, bytes_per_sep)` formatter on a gathered copy.
 fn memoryview_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mv_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mv = pyre_object::gc_roots::pin_root(args.first().copied().unwrap_or(w_none()));
     let w_bytes = unsafe {
         memoryview_check_released(mv)?;
         pyre_object::bytesobject::w_bytes_from_bytes(&memoryview_gather_bytes(mv))
@@ -2591,8 +2722,14 @@ fn memoryview_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // export count while separator coercion may run arbitrary Python code.
     // All pyre memoryview formats accepted here are gathered from the same
     // live view, so retain the identical release guard across the formatter.
-    unsafe { pyre_object::memoryview::w_memoryview_exports_incref(mv) };
+    // The bytes allocation above collects, so the view comes from its slot.
+    unsafe {
+        pyre_object::memoryview::w_memoryview_exports_incref(
+            pyre_object::gc_roots::shadow_stack_get(mv_slot),
+        )
+    };
     let result = crate::typedef::bytes_method_hex(&fwd);
+    let mv = pyre_object::gc_roots::shadow_stack_get(mv_slot);
     unsafe { pyre_object::memoryview::w_memoryview_exports_decref(mv) };
     result
 }
@@ -2629,9 +2766,13 @@ unsafe fn memoryview_hash_value(mv: PyObjectRef) -> Result<i64, crate::PyError> 
             // temporary export.  The digest is deliberately discarded; the
             // call validates hashability and, crucially, prevents a
             // re-entrant `mv.release()` from freeing the bytes being hashed.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let mv_slot = pyre_object::gc_roots::shadow_stack_len();
+            let mv = pyre_object::gc_roots::pin_root(mv);
             let backing = pyre_object::memoryview::w_memoryview_obj(mv);
             pyre_object::memoryview::w_memoryview_exports_incref(mv);
             let backing_hash = crate::baseobjspace::hash_w_strict(backing);
+            let mv = pyre_object::gc_roots::shadow_stack_get(mv_slot);
             pyre_object::memoryview::w_memoryview_exports_decref(mv);
             backing_hash?;
             // `compute_hash(self.view.as_str())` — the same content digest the
@@ -4881,23 +5022,23 @@ pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     Ok(w_none())
 }
 
-/// `space.index` re-wraps a result whose type is not exactly `int` (a
-/// bool, or a strict int subclass) as a plain int (descroperation.py
-/// `index`).  A range stores its bounds wrapped, so normalize each here —
-/// otherwise `range(True).stop` would expose `True` instead of `1`.
+/// `functional.py W_Range.descr_new` stores `space.index` of each bound.
+/// `descroperation.py index` returns the operand when `type(w) is int`;
+/// `W_LongObject` is that type (`W_AbstractIntObject`), so a bignum bound
+/// is the original ref — `range(i).stop is i` with `i = 2**64`.  A bool
+/// is not `int` and is rewrapped; an exact machine int already is.
 ///
 /// # Safety
 /// `obj` must be a valid object.
 unsafe fn range_index_bound(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let w = crate::baseobjspace::space_index(obj)?;
     // `is_int` is true for a bool, so bool has to be tested first or a `True`
-    // bound would be preserved as `True`. A plain int is already the wrapping
-    // this returns, so it passes straight through; everything else keeps the
-    // narrowing a machine-word-sized long depends on -- the stored width is
-    // what makes `iter()` pick `rangeiterator` over `longrange_iterator`.
+    // bound would be preserved as `True`. Exact `int` / `long` pass through
+    // (`space.index` of `W_AbstractIntObject`). Anything else is a subclass
+    // `index` rewrapped as a plain int.
     if pyre_object::is_bool(w) {
         Ok(w_int_new(pyre_object::w_bool_get_value(w) as i64))
-    } else if pyre_object::is_int(w) {
+    } else if pyre_object::is_int(w) || pyre_object::is_long(w) {
         Ok(w)
     } else if let Some(value) = pyre_object::range_obj_as_i64(w) {
         Ok(w_int_new(value))
@@ -7730,7 +7871,7 @@ fn os_error_build(
         pyre_object::interp_exceptions::w_exception_args_new((0..args.len()).map(arg).collect());
     let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     unsafe { interp_exceptions::w_exception_set_args(exc, args_list) };
-    exc
+    pyre_object::gc_roots::shadow_stack_get(exc_slot)
 }
 
 /// `Py_IS_TYPE(self, BlockingIOError)` — the exact-type test `_init_error`
@@ -10261,8 +10402,12 @@ pub fn make_exc_type_with_init(
                             // can run Python.  A `str` a program builds mints
                             // through the collecting constructor and so
                             // relocates, so it is pinned across that whole
-                            // window and read back at the append.
+                            // window and read back at the append.  The
+                            // receiver relocates too: `__getattr__` /
+                            // `__setattr__` are collection points.
                             let _roots = pyre_object::gc_roots::push_roots();
+                            let self_slot = pyre_object::gc_roots::shadow_stack_len();
+                            let _ = pyre_object::gc_roots::pin_root(w_self);
                             let note_slot = pyre_object::gc_roots::shadow_stack_len();
                             let _ = pyre_object::gc_roots::pin_root(w_note);
                             // The exception itself is nursery-allocated, so
@@ -10289,9 +10434,9 @@ pub fn make_exc_type_with_init(
                             // the store rather than reusing the word the
                             // constructor answered.
                             let notes_slot = pyre_object::gc_roots::shadow_stack_len();
-                            let notes = match existing {
+                            match existing {
                                 Some(v) if unsafe { crate::baseobjspace::isinstance_list_w(v) } => {
-                                    v
+                                    let _ = pyre_object::gc_roots::pin_root(v);
                                 }
                                 Some(_) => {
                                     return Err(crate::PyError::type_error(
@@ -10307,12 +10452,11 @@ pub fn make_exc_type_with_init(
                                         "__notes__",
                                         pyre_object::gc_roots::shadow_stack_get(notes_slot),
                                     )?;
-                                    pyre_object::gc_roots::shadow_stack_get(notes_slot)
                                 }
                             };
                             unsafe {
                                 pyre_object::w_list_append(
-                                    notes,
+                                    pyre_object::gc_roots::shadow_stack_get(notes_slot),
                                     pyre_object::gc_roots::shadow_stack_get(note_slot),
                                 )
                             };
@@ -10684,12 +10828,13 @@ enum ExceptionGroupCondition {
     Class(PyObjectRef),
     Callable(PyObjectRef),
     /// `app_group.py _exception_group_projection`'s `resultset`, which upstream
-    /// keeps as an `identity_dict` of the leaf objects.  A Python list of those
-    /// leaves is the same identity set: the walk between collecting them and
-    /// testing the last child runs arbitrary Python (`derive`, a metaclass
-    /// `__instancecheck__`, a callable condition), so the container must be a
-    /// GC object whose items the collector forwards.  A bare address set
-    /// would drop a nursery-allocated leaf the moment `derive` collected.
+    /// keeps as an `identity_dict` of the leaf objects. A list is the same
+    /// single heap object: `collect_leaves` appends through `w_list_append`
+    /// (write-barriered) and a nested `isinstance` / `derive` collection
+    /// forwards the list rather than a `RootedItems` index run. Nested
+    /// `RootedItems` brackets steal those slots (`RootedItems` one-set rule)
+    /// so `matches` would read the original group and `split` would keep every
+    /// leaf. `except_star_projection_gc_roots` is the guard.
     Identity(PyObjectRef),
 }
 
@@ -10704,12 +10849,17 @@ impl ExceptionGroupCondition {
                 let result = crate::call::call_function_impl_result(callable, &[exc])?;
                 crate::baseobjspace::is_true(result)
             }
-            Self::Identity(leaves) => {
-                let items = crate::baseobjspace::fixedview(leaves, -1)?;
-                Ok(items.iter().any(|&leaf| std::ptr::eq(leaf, exc)))
-            }
+            Self::Identity(leaves) => Ok(exception_group_list_contains_ptr(leaves, exc)),
         }
     }
+}
+
+fn exception_group_list_contains_ptr(w_list: PyObjectRef, item: PyObjectRef) -> bool {
+    let n = unsafe { pyre_object::w_list_len(w_list) };
+    (0..n).any(|i| {
+        unsafe { pyre_object::w_list_getitem(w_list, i as i64) }
+            .is_some_and(|elt| std::ptr::eq(elt, item))
+    })
 }
 
 fn exception_group_condition(
@@ -10851,11 +11001,9 @@ fn live_exception_group_condition(
                 cond_slot.expect("callable condition is pinned"),
             ))
         }
-        ExceptionGroupCondition::Identity(_) => {
-            ExceptionGroupCondition::Identity(pyre_object::gc_roots::shadow_stack_get(
-                cond_slot.expect("identity condition is pinned"),
-            ))
-        }
+        ExceptionGroupCondition::Identity(_) => ExceptionGroupCondition::Identity(
+            pyre_object::gc_roots::shadow_stack_get(cond_slot.expect("identity set is pinned")),
+        ),
     }
 }
 
@@ -10883,6 +11031,7 @@ fn exception_group_subgroup_inner(
     for i in 0..n_children {
         let exc = child(i);
         if crate::baseobjspace::isinstance(exc, base_group)? {
+            let exc = child(i);
             let subgroup = exception_group_subgroup_inner(exc, &live_condition())?;
             if !unsafe { pyre_object::is_none(subgroup) } {
                 selected.push(subgroup);
@@ -10933,6 +11082,7 @@ fn exception_group_split_inner(
     for i in 0..n_children {
         let exc = child(i);
         if crate::baseobjspace::isinstance(exc, base_group)? {
+            let exc = child(i);
             let (yes, no) = exception_group_split_inner(exc, &live_condition())?;
             if !unsafe { pyre_object::is_none(yes) } {
                 matching_at.push(kept.len());
@@ -10950,27 +11100,25 @@ fn exception_group_split_inner(
             kept.push(child(i));
         }
     }
-    // Reload each side from the pinned slots at the moment it is derived.
-    // `derive` collects, so a one-shot `take()` before both calls would
-    // hand the second side the pre-collect addresses of its children.
-    let side = |at: &[usize]| -> Vec<PyObjectRef> { at.iter().map(|&i| kept.get(i)).collect() };
-    // Deriving one side allocates, so the group derived for the other side is
-    // pinned across it.
+    // `app_group.py` `split` walks `self.exceptions` and derives each
+    // side from the live list. Do not `take()` the rooted items: the
+    // first `derive` can collect, and a snapshot Vec would then be stale.
     let mut derived = pyre_object::gc_roots::RootedItems::new();
     let yes = if matching_at.is_empty() {
         pyre_object::w_none()
     } else {
-        exception_group_derive_and_copy(w_self(), side(&matching_at))?
+        let items: Vec<PyObjectRef> = matching_at.iter().map(|&i| kept.get(i)).collect();
+        exception_group_derive_and_copy(w_self(), items)?
     };
     derived.push(yes);
     let no = if nonmatching_at.is_empty() {
         pyre_object::w_none()
     } else {
-        exception_group_derive_and_copy(w_self(), side(&nonmatching_at))?
+        let items: Vec<PyObjectRef> = nonmatching_at.iter().map(|&i| kept.get(i)).collect();
+        exception_group_derive_and_copy(w_self(), items)?
     };
     derived.push(no);
-    let sides = derived.take();
-    Ok((sides[0], sides[1]))
+    Ok((derived.get(0), derived.get(1)))
 }
 
 /// `ceval.c _PyEval_ExceptionGroupMatch`, answering `CHECK_EG_MATCH`.
@@ -10985,27 +11133,53 @@ pub(crate) fn exception_group_match(
     w_exc: PyObjectRef,
     w_type: PyObjectRef,
 ) -> Result<(PyObjectRef, PyObjectRef, bool), crate::PyError> {
-    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
-    if crate::eval::check_exc_match_against(w_exc, w_type) {
-        if crate::baseobjspace::isinstance(w_exc, base_group)? {
-            return Ok((w_exc, pyre_object::w_none(), false));
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[
+        w_exc,
+        w_type,
+        lookup_exc_class("BaseExceptionGroup").unwrap(),
+    ]);
+    let w_exc = || pyre_object::gc_roots::shadow_stack_get(base);
+    let w_type = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let base_group = || pyre_object::gc_roots::shadow_stack_get(base + 2);
+    if crate::eval::check_exc_match_against(w_exc(), w_type()) {
+        if crate::baseobjspace::isinstance(w_exc(), base_group())? {
+            return Ok((w_exc(), pyre_object::w_none(), false));
         }
         let message = unsafe { pyre_object::w_str_new("") };
-        let exceptions = pyre_object::w_tuple_new(vec![w_exc]);
-        let group = exception_group_new(&[base_group, message, exceptions])?;
+        let message_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(message);
+        let exceptions = pyre_object::w_tuple_new(vec![w_exc()]);
+        let exceptions_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(exceptions);
+        let group = exception_group_new(&[
+            base_group(),
+            pyre_object::gc_roots::shadow_stack_get(message_slot),
+            pyre_object::gc_roots::shadow_stack_get(exceptions_slot),
+        ])?;
         return Ok((group, pyre_object::w_none(), true));
     }
-    if crate::baseobjspace::isinstance(w_exc, base_group)? {
+    if crate::baseobjspace::isinstance(w_exc(), base_group())? {
         // Partial match: call the (overridable) `split` method and validate it
         // returns a 2-tuple of (match, rest).
-        let split = crate::baseobjspace::getattr_str(w_exc, "split")?;
-        let pair = crate::call::call_function_impl_result(split, &[w_type])?;
-        if !unsafe { pyre_object::is_tuple(pair) } {
-            let name = crate::baseobjspace::object_functionstr_type_name(pair);
+        let split = crate::baseobjspace::getattr_str(w_exc(), "split")?;
+        let split_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(split);
+        let pair = crate::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(split_slot),
+            &[w_type()],
+        )?;
+        let pair_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pair);
+        if !unsafe { pyre_object::is_tuple(pyre_object::gc_roots::shadow_stack_get(pair_slot)) } {
+            let name = crate::baseobjspace::object_functionstr_type_name(
+                pyre_object::gc_roots::shadow_stack_get(pair_slot),
+            );
             return Err(crate::PyError::type_error(format!(
                 "split must return a tuple, not {name}"
             )));
         }
+        let pair = pyre_object::gc_roots::shadow_stack_get(pair_slot);
         let n = unsafe { pyre_object::w_tuple_len(pair) };
         if n < 2 {
             return Err(crate::PyError::type_error(format!(
@@ -11018,7 +11192,7 @@ pub(crate) fn exception_group_match(
         let rest = unsafe { pyre_object::w_tuple_getitem(pair, 1) }.unwrap();
         return Ok((matching, rest, false));
     }
-    Ok((pyre_object::w_none(), w_exc, false))
+    Ok((pyre_object::w_none(), w_exc(), false))
 }
 
 fn exception_group_notes(w_exc: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
@@ -11049,8 +11223,13 @@ fn exception_group_same_metadata(
     w_left: PyObjectRef,
     w_right: PyObjectRef,
 ) -> Result<bool, crate::PyError> {
-    let left_notes = exception_group_notes(w_left)?;
-    let right_notes = exception_group_notes(w_right)?;
+    // `_is_same_exception_metadata` reads `__notes__` through getattr, which
+    // can collect; both operands stay on the shadow stack so the later raw
+    // traceback/cause/context slot compares still name the same objects.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_left, w_right]);
+    let left_notes = exception_group_notes(pyre_object::gc_roots::shadow_stack_get(base))?;
+    let right_notes = exception_group_notes(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
     if !match (left_notes, right_notes) {
         (Some(left), Some(right)) => std::ptr::eq(left, right),
         (None, None) => true,
@@ -11060,46 +11239,58 @@ fn exception_group_same_metadata(
     }
     Ok(unsafe {
         exception_group_meta_ref_eq(
-            pyre_object::interp_exceptions::w_exception_get_traceback(w_left),
-            pyre_object::interp_exceptions::w_exception_get_traceback(w_right),
+            pyre_object::interp_exceptions::w_exception_get_traceback(
+                pyre_object::gc_roots::shadow_stack_get(base),
+            ),
+            pyre_object::interp_exceptions::w_exception_get_traceback(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            ),
         ) && exception_group_meta_ref_eq(
-            pyre_object::interp_exceptions::w_exception_get_cause(w_left),
-            pyre_object::interp_exceptions::w_exception_get_cause(w_right),
+            pyre_object::interp_exceptions::w_exception_get_cause(
+                pyre_object::gc_roots::shadow_stack_get(base),
+            ),
+            pyre_object::interp_exceptions::w_exception_get_cause(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            ),
         ) && exception_group_meta_ref_eq(
-            pyre_object::interp_exceptions::w_exception_get_context(w_left),
-            pyre_object::interp_exceptions::w_exception_get_context(w_right),
+            pyre_object::interp_exceptions::w_exception_get_context(
+                pyre_object::gc_roots::shadow_stack_get(base),
+            ),
+            pyre_object::interp_exceptions::w_exception_get_context(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            ),
         )
     })
 }
 
 fn exception_group_collect_leaves(
     w_exc: PyObjectRef,
-    leaves: &mut Vec<usize>,
+    w_leaves: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     if unsafe { pyre_object::is_none(w_exc) } {
         return Ok(());
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_exc, w_leaves]);
+    let w_exc = || pyre_object::gc_roots::shadow_stack_get(base);
+    let w_leaves = || pyre_object::gc_roots::shadow_stack_get(base + 1);
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
-    if crate::baseobjspace::isinstance(w_exc, base_group)? {
-        let (_, exceptions) = exception_group_fields(w_exc)?;
-        let (children_base, n_children) = pin_exception_group_children(exceptions);
-        for i in 0..n_children {
+    if crate::baseobjspace::isinstance(w_exc(), base_group)? {
+        let (_, exceptions) = exception_group_fields(w_exc())?;
+        let children = unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) };
+        let kids = pyre_object::gc_roots::pin_roots(&children);
+        for i in 0..children.len() {
             exception_group_collect_leaves(
-                pyre_object::gc_roots::shadow_stack_get(children_base + i),
-                leaves,
+                pyre_object::gc_roots::shadow_stack_get(kids + i),
+                w_leaves(),
             )?;
         }
-    } else if unsafe { pyre_object::is_exception(w_exc) } {
-        if !leaves
-            .iter()
-            .any(|&slot| std::ptr::eq(pyre_object::gc_roots::shadow_stack_get(slot), w_exc))
-        {
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_exc);
-            leaves.push(slot);
+    } else if unsafe { pyre_object::is_exception(w_exc()) } {
+        if !exception_group_list_contains_ptr(w_leaves(), w_exc()) {
+            unsafe { pyre_object::w_list_append(w_leaves(), w_exc()) };
         }
     } else {
-        let name = crate::baseobjspace::object_functionstr_type_name(w_exc);
+        let name = crate::baseobjspace::object_functionstr_type_name(w_exc());
         return Err(crate::PyError::type_error(format!(
             "expected BaseException, got {name}"
         )));
@@ -11117,27 +11308,18 @@ fn exception_group_projection(
     // before `exception_group_split_inner`.
     let group_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_group);
-    let keep_base = pyre_object::gc_roots::shadow_stack_len();
-    for &w_exc in keep {
-        let _ = pyre_object::gc_roots::pin_root(w_exc);
-    }
-    let mut leaves = Vec::new();
+    let keep_base = pyre_object::gc_roots::pin_roots(keep);
+    let leaves_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(Vec::new()));
     for i in 0..keep.len() {
         exception_group_collect_leaves(
             pyre_object::gc_roots::shadow_stack_get(keep_base + i),
-            &mut leaves,
+            pyre_object::gc_roots::shadow_stack_get(leaves_slot),
         )?;
     }
-    let items: Vec<PyObjectRef> = leaves
-        .iter()
-        .copied()
-        .map(pyre_object::gc_roots::shadow_stack_get)
-        .collect();
-    let list_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(items));
     let (matching, _) = exception_group_split_inner(
         pyre_object::gc_roots::shadow_stack_get(group_slot),
-        &ExceptionGroupCondition::Identity(pyre_object::gc_roots::shadow_stack_get(list_slot)),
+        &ExceptionGroupCondition::Identity(pyre_object::gc_roots::shadow_stack_get(leaves_slot)),
     )?;
     Ok(matching)
 }
@@ -11510,6 +11692,7 @@ fn register_exc_class(name: &'static str, cls: PyObjectRef) -> PyObjectRef {
     // Both of these are first-writer-wins on their own, so a second thread
     // arriving at the same class repeats them rather than racing them.
     crate::typedef::stamp_exception_method_owners(canonical, name);
+    crate::baseobjspace::object_space().export_builtin_exception(name, canonical);
     if let Some(kind) = pyre_object::interp_exceptions::exc_kind_from_name(name) {
         let by_kind = pyre_object::interp_exceptions::register_exc_class_for_kind(kind, canonical);
         debug_assert_eq!(by_kind, canonical);
@@ -12077,14 +12260,14 @@ pub(crate) fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
 /// becomes its ASCII digit and non-ASCII whitespace becomes a space, so
 /// `int("４２")` and `float("١٫٥")`-style inputs parse.  An all-ASCII string
 /// is returned untouched.
-fn unicode_to_decimal_w(
-    w_unistr: PyObjectRef,
-) -> Result<std::borrow::Cow<'static, str>, crate::PyError> {
+fn unicode_to_decimal_w(w_unistr: PyObjectRef) -> Result<String, crate::PyError> {
     let utf8 = unsafe { w_str_get_wtf8(w_unistr) };
     if let Ok(s) = utf8.as_str()
         && s.is_ascii()
     {
-        return Ok(std::borrow::Cow::Borrowed(s));
+        // Copy off the nursery unicode buffer. A borrowed `&str` is not
+        // forwarded when a later digit allocation collects.
+        return Ok(s.to_string());
     }
 
     // unicodeobject.py `_unicode_to_decimal_w`: iterate the internal UTF-8
@@ -12124,7 +12307,7 @@ fn unicode_to_decimal_w(
         };
         out.push(ch);
     }
-    Ok(std::borrow::Cow::Owned(out))
+    Ok(out)
 }
 
 /// `wrap_parsestringerror(space, e, w_source)` — report the original Python
@@ -12170,6 +12353,10 @@ pub(crate) fn parse_int_from_str(
     let source_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_source);
     let w_source = || pyre_object::gc_roots::shadow_stack_get(source_slot);
+    // NumberStringParser stores an interior `&str`. Digit allocation can
+    // collect and move a nursery unicode buffer; parse from a Rust copy.
+    let owned = s.to_string();
+    let s = owned.as_str();
     // rarithmetic.py `string_to_int` first handles short, plain
     // decimal strings without constructing a NumberStringParser.
     const OVF_DIGITS: usize = 19; // len(str(sys.maxint)) on pyre's i64 target
@@ -16761,17 +16948,34 @@ fn source_as_str(
     filename: &rustpython_wtf8::Wtf8,
     flags: &mut i64,
 ) -> Result<String, crate::PyError> {
+    // pyopcode.py source_as_str: encode() / buffer_w collect, and
+    // gct_fv_gc_malloc reloads `w_source`. The native path has to pin it.
+    let _source_roots = pyre_object::gc_roots::push_roots();
+    let source_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(source);
+    let source = pyre_object::gc_roots::shadow_stack_get(source_slot);
     let text_source = unsafe { pyre_object::is_str(source) };
     let bytes = unsafe {
         if text_source {
             // A text source is encoded strictly and coding-cookie detection is
             // disabled, matching PyPy's unicode branch.
             *flags |= PYCF_IGNORE_COOKIE;
-            crate::type_methods::encode_object(source, "utf-8", "strict")?
-        } else if pyre_object::bytesobject::is_bytes(source) {
-            pyre_object::bytesobject::bytes_like_data(source).to_vec()
+            crate::type_methods::encode_object(
+                pyre_object::gc_roots::shadow_stack_get(source_slot),
+                "utf-8",
+                "strict",
+            )?
+        } else if pyre_object::bytesobject::is_bytes(pyre_object::gc_roots::shadow_stack_get(
+            source_slot,
+        )) {
+            pyre_object::bytesobject::bytes_like_data(pyre_object::gc_roots::shadow_stack_get(
+                source_slot,
+            ))
+            .to_vec()
         } else {
-            let buffer = match crate::baseobjspace::simple_buffer_bytes(source) {
+            let buffer = match crate::baseobjspace::simple_buffer_bytes(
+                pyre_object::gc_roots::shadow_stack_get(source_slot),
+            ) {
                 Ok(Some(buffer)) => buffer,
                 Ok(None) => {
                     return Err(crate::PyError::type_error(format!(
@@ -16850,8 +17054,25 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         ],
         "compile",
     )?;
+    // compiling.py compile: `space.isinstance_w(w_source, W_AST)` and
+    // `source_as_str` run after fsencode / gettypeobject / encode, all of
+    // which collect. `w_source` is a gateway local; gct_fv_gc_malloc reloads
+    // it. The native path imports `_ast` for the same type probe, which is
+    // another collection, so pin source / filename / mode from here.
+    let _compile_roots = pyre_object::gc_roots::push_roots();
+    let compile_base = pyre_object::gc_roots::pin_roots(&[
+        source,
+        filename_obj,
+        mode_obj,
+        kwargs.unwrap_or(pyre_object::PY_NULL),
+    ]);
+    let reload = |i: usize| pyre_object::gc_roots::shadow_stack_get(compile_base + i);
+    let kwargs = || {
+        let w = reload(3);
+        if w.is_null() { None } else { Some(w) }
+    };
     // `compiling.py:12-13 unwrap_spec(filename='fsencode', mode='text')`.
-    let filename_bytes = crate::gateway::fsencode_bytes_w(filename_obj)?;
+    let filename_bytes = crate::gateway::fsencode_bytes_w(reload(1))?;
     // The code object spells its filename as `newfilename` does
     // (`objspace.py:438`), i.e. the filesystem decode of these bytes. Take that
     // decode here, where the caller that supplied the bytes is still on the
@@ -16861,13 +17082,13 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     crate::gateway::fsdecode_filename_checked(&filename_bytes)?;
     let filename_text = crate::gateway::fsdecode_filename_wtf8(&filename_bytes);
     let (filename, filename_bytes) = crate::pycode::split_code_filename_bytes(filename_bytes, None);
-    let mode = crate::baseobjspace::text_w(mode_obj)?;
+    let mode = crate::baseobjspace::text_w(reload(2))?;
     // flags / optimize are positional-or-keyword ints.
-    let mut flags = match bind_pos_or_kw(pos, kwargs, 3, "flags", "compile", 4)? {
+    let mut flags = match bind_pos_or_kw(pos, kwargs(), 3, "flags", "compile", 4)? {
         Some(v) => crate::baseobjspace::gateway_int_w(v)?,
         None => 0,
     };
-    let dont_inherit = match bind_pos_or_kw(pos, kwargs, 4, "dont_inherit", "compile", 5)? {
+    let dont_inherit = match bind_pos_or_kw(pos, kwargs(), 4, "dont_inherit", "compile", 5)? {
         // [3.14-spec] PyPy's unwrap_spec still requires an integer here, but
         // CPython `builtin_compile_impl` accepts any truth-testable object.
         // `test_compile_filename_refleak` makes the difference observable with
@@ -16876,13 +17097,13 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         Some(v) => crate::baseobjspace::is_true(v)?,
         None => false,
     };
-    let mut optimize = match bind_pos_or_kw(pos, kwargs, 5, "optimize", "compile", 6)? {
+    let mut optimize = match bind_pos_or_kw(pos, kwargs(), 5, "optimize", "compile", 6)? {
         Some(v) => crate::baseobjspace::gateway_int_w(v)?,
         None => -1,
     };
     // PyPy `PythonAstCompiler.compile_to_ast` passes this keyword-only value
     // through `CompileInfo.feature_version` to the parser.
-    let feature_version = match kwarg_get(kwargs, "_feature_version") {
+    let feature_version = match kwarg_get(kwargs(), "_feature_version") {
         Some(value) => {
             let value = crate::baseobjspace::gateway_int_w(value)?;
             i64::from(i32::try_from(value).map_err(|_| {
@@ -16970,14 +17191,26 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         0,
         crate::call::take_last_exec_ctx(),
     )?;
-    let ast_type = crate::baseobjspace::getattr_str(ast_module, "AST")?;
-    let source_is_ast = unsafe { crate::baseobjspace::isinstance_w(source, ast_type) };
+    let ast_mod_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ast_module);
+    let ast_type = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(ast_mod_slot),
+        "AST",
+    )?;
+    let ast_type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ast_type);
+    let source_is_ast = unsafe {
+        crate::baseobjspace::isinstance_w(
+            reload(0),
+            pyre_object::gc_roots::shadow_stack_get(ast_type_slot),
+        )
+    };
     let source_str = if source_is_ast {
         None
     } else {
         Some(
             source_as_str(
-                source,
+                reload(0),
                 "compile",
                 "string, bytes or AST",
                 &filename_text,
@@ -17022,7 +17255,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             // `PyAst_CheckMode` asserts because this path supplies func_type's
             // mode 3 to its 0..=2 table, so there is no successful 3.14
             // observable that displaces the PyPy owner path.
-            Ok(source)
+            Ok(reload(0))
         } else if func_type_mode {
             crate::module::_ast::convert::parse_func_type_to_object(
                 source_str
@@ -17036,7 +17269,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             // for plain ONLY_AST.  PyPy `compile_to_ast` returns its input
             // object unchanged; the observable 3.14 copy/TypeError wins here.
             crate::module::_ast::convert::preprocess_object_to_object(
-                source,
+                reload(0),
                 "",
                 mode,
                 opts,
@@ -17100,7 +17333,13 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 crate::syntax_warnings::SourceCompileError::Warning(error) => error,
             })
     } else {
-        crate::module::_ast::convert::compile_object(source, &filename, &filename_text, mode, opts)
+        crate::module::_ast::convert::compile_object(
+            reload(0),
+            &filename,
+            &filename_text,
+            mode,
+            opts,
+        )
     }
     .map_err(|error| {
         replace_compile_syntax_error_filename(error, &filename, filename_bytes.as_deref())
@@ -17192,17 +17431,24 @@ pub fn exec_or_eval(
     is_eval: bool,
     closure: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // compiling.py eval: `compiler.compile` collects, then
+    // `space.contains_w(w_globals, "__builtins__")` reads the same locals.
+    // gct_fv_gc_malloc reloads `w_prog` / `w_globals` / `w_locals`; pin them
+    // (and the closure) for the native path before source_as_str / compile.
+    let _ns_roots = pyre_object::gc_roots::push_roots();
+    let ns_base = pyre_object::gc_roots::pin_roots(&[source, globals_arg, locals_arg, closure]);
+    let reload_ns = |i: usize| pyre_object::gc_roots::shadow_stack_get(ns_base + i);
     // Resolve a runnable code object: accept a precompiled W_Code or
     // compile a str on the fly.  `source_is_code` records whether the
     // original argument was already a code object (vs a compiled str /
     // bytes) — the closure validation below branches on it.
     let (code_obj_ref, source_is_code) = unsafe {
-        if !source.is_null() && crate::is_code(source) {
-            (source, true)
+        if !reload_ns(0).is_null() && crate::is_code(reload_ns(0)) {
+            (reload_ns(0), true)
         } else {
             let mut flags = PYCF_SOURCE_IS_UTF8;
             let mut source = source_as_str(
-                source,
+                reload_ns(0),
                 if is_eval { "eval" } else { "exec" },
                 "string, bytes or code",
                 rustpython_wtf8::Wtf8::new("<string>"),
@@ -17252,8 +17498,13 @@ pub fn exec_or_eval(
     let code_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(code_obj_ref);
     let raw_code = unsafe {
-        crate::w_code_get_ptr(code_obj_ref as pyre_object::PyObjectRef) as *const crate::CodeObject
+        crate::w_code_get_ptr(
+            pyre_object::gc_roots::shadow_stack_get(code_slot) as pyre_object::PyObjectRef
+        ) as *const crate::CodeObject
     };
+    let globals_arg = reload_ns(1);
+    let locals_arg = reload_ns(2);
+    let closure = reload_ns(3);
 
     // pypy/interpreter/eval.py Code.exec_code keeps w_globals and
     // w_locals as separate dict references — STORE_GLOBAL writes to
@@ -17320,9 +17571,17 @@ pub fn exec_or_eval(
         if w_builtin.is_null() || w_globals.is_null() {
             return Ok(());
         }
-        let key = pyre_object::unicodeobject::intern_str_value("__builtins__");
-        if !crate::baseobjspace::contains(w_globals, key)? {
-            crate::baseobjspace::setitem(w_globals, key, w_builtin)?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[w_globals, w_builtin]);
+        let key_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::intern_str_value(
+            "__builtins__",
+        ));
+        let w_globals = || pyre_object::gc_roots::shadow_stack_get(base);
+        let w_builtin = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+        let key = || pyre_object::gc_roots::shadow_stack_get(key_slot);
+        if !crate::baseobjspace::contains(w_globals(), key())? {
+            crate::baseobjspace::setitem(w_globals(), key(), w_builtin())?;
         }
         Ok(())
     }
@@ -17352,9 +17611,23 @@ pub fn exec_or_eval(
         if w_builtin.is_null() || w_globals.is_null() {
             return Ok(());
         }
-        let key = pyre_object::unicodeobject::intern_str_value("__builtins__");
-        let setdefault = crate::baseobjspace::getattr_str(w_globals, "setdefault")?;
-        crate::call_and_check(setdefault, &[key, w_builtin])?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[w_globals, w_builtin]);
+        let key_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::intern_str_value(
+            "__builtins__",
+        ));
+        let setdefault = crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            "setdefault",
+        )?;
+        crate::call_and_check(
+            setdefault,
+            &[
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            ],
+        )?;
         Ok(())
     }
 
@@ -19000,20 +19273,30 @@ pub fn hash_value(mut obj: PyObjectRef) -> i64 {
                 pyre_object::w_range_length(pyre_object::gc_roots::shadow_stack_get(obj_slot));
             let (start, _stop, step) =
                 pyre_object::w_range_fields(pyre_object::gc_roots::shadow_stack_get(obj_slot));
-            let len_b = pyre_object::range_obj_to_bigint(w_len);
+            // `range_obj_to_bigint` of a machine int collects; the length and
+            // the fields are pinned before it.
+            let field_base = pyre_object::gc_roots::pin_roots(&[w_len, start, step]);
+            let len_b = pyre_object::range_obj_to_bigint(pyre_object::gc_roots::shadow_stack_get(
+                field_base,
+            ));
             let none = w_none();
-            let (a, b) = if len_b == BigInt::from(0) {
+            let (a, b) = if len_b.int_eq(0) {
                 (none, none)
-            } else if len_b == BigInt::from(1) {
-                (start, none)
+            } else if len_b.int_eq(1) {
+                (
+                    pyre_object::gc_roots::shadow_stack_get(field_base + 1),
+                    none,
+                )
             } else {
-                (start, step)
+                (
+                    pyre_object::gc_roots::shadow_stack_get(field_base + 1),
+                    pyre_object::gc_roots::shadow_stack_get(field_base + 2),
+                )
             };
-            let field_base = pyre_object::gc_roots::pin_roots(&[w_len, a, b]);
             let tup = pyre_object::w_tuple_new(vec![
                 pyre_object::gc_roots::shadow_stack_get(field_base),
-                pyre_object::gc_roots::shadow_stack_get(field_base + 1),
-                pyre_object::gc_roots::shadow_stack_get(field_base + 2),
+                a,
+                b,
             ]);
             return hash_value(tup);
         }
@@ -19108,8 +19391,9 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // insufficient, floats are rejected, and an arbitrarily large int reaches
     // the range check rather than overflowing a host machine word.  This is
     // the target-version difference from PyPy's `@unwrap_spec(code=int)`.
-    let val = index_to_bigint(args[0])?;
-    if val < BigInt::from(0) || val > BigInt::from(0x10ffff_u32) {
+    let val = RBigIntGcRoot::new(index_to_bigint(args[0])?);
+    // Compare through `int_*` so the bound is not a collecting `fromint`.
+    if val.int_lt(0) || val.int_gt(0x10ffff) {
         return Err(crate::PyError::value_error(
             "chr() arg not in range(0x110000)",
         ));
@@ -19686,20 +19970,25 @@ pub fn sort_list_in_place(
         // for the whole operation, so user code cannot alter this sorting
         // slice through the visible list.
         //
-        // `descr_sort` snapshots via `getitems()` (`we_are_jitted` selects
-        // the copy that keeps identity-bearing boxes explicit) and holds
-        // that snapshot in `sorter.list`. The copy is a bare Vec, so
-        // publish every word then normalize once (`pin_roots`) before any
-        // later allocation can move a still-unpublished sibling.
+        // `descr_sort` snapshots via `getitems()` and holds that snapshot in
+        // `sorter.list`.  Pin each getitem result before the next box, then
+        // TimSort only moves integer indices.
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         let saved_allocated = pyre_object::listobject::w_list_allocated(list);
-        let saved = pyre_object::listobject::w_list_items_copy_as_vec_mode(
-            list,
-            majit_metainterp::jit::we_are_jitted(),
-        );
+        // Snapshot through getitem + pin, not a bare Vec: integer/float/range
+        // strategies box each element (`getitems_copy`), and a Rust Vec of
+        // those boxes is invisible to the collector.  `listsort.py` TimSort
+        // plus `descr_sort`'s `sorter.list` are GC objects; the shadow stack
+        // is the equivalent registered area, re-read after every `lt`.
+        let saved_len = pyre_object::listobject::w_list_len(list);
         let _roots = pyre_object::gc_roots::push_roots();
-        let item_base = pyre_object::gc_roots::pin_roots(&saved);
-        let saved_len = saved.len();
+        let item_base = pyre_object::gc_roots::shadow_stack_len();
+        for i in 0..saved_len {
+            let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
+            let item = pyre_object::listobject::w_list_getitem(list, i as i64)
+                .unwrap_or(pyre_object::PY_NULL);
+            let _ = pyre_object::gc_roots::pin_root(item);
+        }
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         pyre_object::listobject::w_list_clear(list);
         // CPython 3.14 list_sort_impl detaches ob_item and marks `allocated`
@@ -20004,16 +20293,17 @@ pub fn file_wrapper_type() -> PyObjectRef {
     // A Python type is process-global, exactly as PyPy's W_TypeObject is.
     // Storing it in TLS would manufacture one incompatible TextIOWrapper type
     // per host thread and break cross-thread isinstance/type identity.
-    static FILE_WRAPPER_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *FILE_WRAPPER_TYPE.get_or_init(|| {
+    static FILE_WRAPPER_TYPE: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    FILE_WRAPPER_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("_io.TextIOWrapper", init_file_wrapper_type);
         // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
         // TextIOWrapper heap spec.  This legacy wrapper accessor must publish
         // the same owner as `_io::textio::type_object`.
         crate::typedef::mark_cpython_heap_type(tp, true);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 /// PyPy: pypy/module/_io/interp_iobase.py W_IOBase.
@@ -23741,45 +24031,58 @@ fn round_receiver(args: &[PyObjectRef], slot: bool) -> Result<PyObjectRef, crate
             // `intobject.py` answers both the absent-ndigits and the
             // non-negative-ndigits case with `self.int(space)`, so a subclass
             // receiver (`bool` included) is rounded to its base type.
-            let nd = match ndigits {
-                Some(nd) if !pyre_object::is_none(*nd) => index_to_bigint(*nd)?,
+            // `space.is_none(w_ndigits)` is answered before `space.index` is
+            // reached, so the absent-ndigits arm allocates nothing.
+            let nd_obj = match ndigits {
+                Some(nd) if !pyre_object::is_none(*nd) => *nd,
                 _ => return Ok(crate::baseobjspace::int_as_base(obj)),
             };
+            // `space.index`, `rbigint.fromint` and `pow` all allocate while
+            // the receiver is still read afterwards. `descr_round` keeps both
+            // live (`gct_direct_call` / `get_livevars_for_roots`).
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&[obj, nd_obj]);
+            let obj = || pyre_object::gc_roots::shadow_stack_get(base);
+            let nd_obj = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+            let nd = RBigIntGcRoot::new(index_to_bigint(nd_obj())?);
             if nd.get_sign() >= 0 {
-                return Ok(crate::baseobjspace::int_as_base(obj));
+                return Ok(crate::baseobjspace::int_as_base(obj()));
             }
-            let owned_a;
-            let a = if is_long(obj) {
-                w_long_get_value(obj)
+            let a = if is_long(obj()) {
+                RBigIntGcRoot::new(w_long_get_value(obj()).translated_alias())
             } else {
-                owned_a = BigInt::from(w_int_get_value(obj));
-                &owned_a
+                RBigIntGcRoot::new(BigInt::from(w_int_get_value(obj())))
             };
-            let exponent = nd.neg();
-            let b = BigInt::from(10)
-                .pow(&exponent, None)
-                .map_err(|_| crate::PyError::memory_error("exponent too large"))?;
+            let exponent = RBigIntGcRoot::new(nd.neg());
+            let b = RBigIntGcRoot::new(
+                BigInt::from(10)
+                    .pow(&exponent, None)
+                    .map_err(|_| crate::PyError::memory_error("exponent too large"))?,
+            );
             // `_PyLong_DivmodNear`: q = round(a / b) ties-to-even,
             // result = q * b.  Floor division gives 0 <= r < b.
             let (q, r) = a
                 .divmod(&b)
                 .expect("round's positive power-of-ten divisor is nonzero");
-            let two_r = &r * BigInt::from(2);
-            let q_even = (&q % BigInt::from(2)) == BigInt::from(0);
-            let q = if two_r < b {
+            let q = RBigIntGcRoot::new(q);
+            let r = RBigIntGcRoot::new(r);
+            let two = RBigIntGcRoot::new(BigInt::fromint(2));
+            let two_r = RBigIntGcRoot::new(r.mul(&two));
+            let q_even = q.r#mod(&two).map(|v| v.is_zero()).unwrap_or(false);
+            let q = if two_r.lt(&b) {
                 q
-            } else if two_r > b {
-                q + 1
+            } else if two_r.gt(&b) {
+                RBigIntGcRoot::new(q.int_add(1))
             } else if q_even {
                 q
             } else {
-                q + 1
+                RBigIntGcRoot::new(q.int_add(1))
             };
-            let result = q * b;
+            let result = RBigIntGcRoot::new(q.mul(&b));
             return if pyre_object::jit_bigint_to_i64_fits(&result) != 0 {
                 Ok(w_int_new(pyre_object::jit_bigint_to_i64_value(&result)))
             } else {
-                Ok(w_long_new(result))
+                Ok(w_long_new(result.translated_alias()))
             };
         }
     }

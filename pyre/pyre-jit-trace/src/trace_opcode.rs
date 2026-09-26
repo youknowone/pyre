@@ -3130,12 +3130,28 @@ impl MIFrame {
             .virtualizable_info()
             .map(|info| info.num_static_extra_boxes)
             .unwrap_or(0);
+        // `popvalue_maybe_none` nulls every popped slot, so `read_boxes`
+        // wraps None for index >= valuestackdepth. Encode that CONST_NULL
+        // here: a leftover TAGBOX would name a jitframe slot that is dead
+        // in compiled code and missing from the COND_CALL gcmap, and
+        // `write_from_resume_data_partial` would copy the stale word into
+        // the type-9 array. `close_loop_args_at` already force-nulls the
+        // same JUMP tail.
+        let live_array_depth = pre_opcode_vsd.map(|v| v as usize);
         for i in 0..full_array_len {
             // virtualizable_boxes layout:
             //   [field0, ..., fieldN, arr[0..M], vable_ref]
             // so array slot `i` lives at `num_static + i`. The trailing
             // `vable_ref` is at `virtualizable_boxes[-1]` and NEVER covers
             // an array slot — skip it via `.get()`.
+            if live_array_depth.is_some_and(|vsd| i >= vsd) {
+                boxes.push(Self::opref_to_snapshot_tagged_for_slot(
+                    OpRef::NONE,
+                    ctx,
+                    Some(array_item_type),
+                ));
+                continue;
+            }
             let opref = ctx
                 .virtualizable_box_at(num_static + i)
                 .unwrap_or(OpRef::NONE);

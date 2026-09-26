@@ -1310,7 +1310,9 @@ pub struct PyFrame {
     /// Virtualizable token — set by JIT when this frame is virtualized.
     /// 0 = not virtualized, nonzero = pointer to JIT state.
     pub vable_token: usize,
-    /// PyPy: `f_generator_nowref = None`.
+    /// `f_generator_nowref` — strong edge to the generator.
+    /// `initialize_as_generator` stores it when `rweakref` is off;
+    /// `get_generator` returns it. An ordinary traced instance attribute.
     pub f_generator_nowref: PyObjectRef,
     /// PyPy: `w_yielding_from = None`.
     pub w_yielding_from: PyObjectRef,
@@ -1456,6 +1458,8 @@ unsafe fn alloc_frame_locals_array(
                 items.add(i).write(fill);
             }
         }
+        // Nursery-full spill is old-gen; remember young `fill` values.
+        remember_frame_locals_array(arr);
         return arr;
     }
     unsafe { alloc_fixed_array_with_header(len, fill) }
@@ -2065,6 +2069,18 @@ pub fn unregister_frame_locals_slot(frame_ptr: *mut PyFrame) {
     pyre_object::gc_hook::try_gc_remove_root(slot);
 }
 
+/// Write `locals_cells_stack_w` through a pointer. A by-value
+/// `frame.locals_cells_stack_w =` is a non-deref virtualizable-field
+/// projection, which `vable-projection-census` allows only on
+/// `FrameBox::new`. `inline(never)` keeps the deref in this function's
+/// LLBC so the census does not attribute it to the caller.
+#[inline(never)]
+unsafe fn store_locals_cells_stack_w(frame_ptr: *mut PyFrame, array: *mut FixedObjectArray) {
+    unsafe {
+        (*frame_ptr).locals_cells_stack_w = array;
+    }
+}
+
 #[inline]
 fn remember_frame_debug_data(debugdata: *mut FrameDebugData) {
     if pyre_object::gc_hook::try_gc_owns_object(debugdata as *mut u8) {
@@ -2080,10 +2096,14 @@ unsafe fn clone_debugdata_ptr(
         if ptr.is_null() {
             std::ptr::null_mut()
         } else if allocation == FrameLocalsArrayAllocation::OldGenGc {
-            let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
+            let _roots = pyre_object::gc_roots::push_roots();
+            let src_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(ptr as pyre_object::PyObjectRef);
+            let raw = pyre_object::gc_hook::try_gc_alloc_nursery_raw(
                 FRAME_DEBUG_DATA_GC_TYPE_ID,
                 std::mem::size_of::<FrameDebugData>(),
             );
+            let ptr = pyre_object::gc_roots::shadow_stack_get(src_slot) as *mut FrameDebugData;
             if !raw.is_null() {
                 std::ptr::write(raw as *mut FrameDebugData, (*ptr).clone());
                 // The clone may carry young locals / trace callback refs.
@@ -3799,7 +3819,7 @@ impl PyFrame {
             let frame_anchor = crate::eval::FrameAnchor::new(self);
             let allocation = unsafe { (*frame_anchor.live()).aux_allocation() };
             let raw = if allocation == FrameLocalsArrayAllocation::OldGenGc {
-                pyre_object::gc_hook::try_gc_alloc_stable_raw(
+                pyre_object::gc_hook::try_gc_alloc_nursery_raw(
                     FRAME_DEBUG_DATA_GC_TYPE_ID,
                     std::mem::size_of::<FrameDebugData>(),
                 ) as *mut FrameDebugData
@@ -3822,7 +3842,13 @@ impl PyFrame {
                 raw
             };
             unsafe { (*frame_anchor.live()).debugdata = debugdata };
-            let debugdata = unsafe { (*frame_anchor.live()).debugdata };
+            // Old-gen frame → nursery `debugdata` is an old-to-young
+            // field store (`incminimark.py write_barrier`). Remembering
+            // only the payload leaves the frame off
+            // `old_objects_pointing_to_young`.
+            let live_frame = frame_anchor.live() as *mut Self;
+            pyre_object::gc_hook::try_gc_write_barrier(live_frame as *mut u8);
+            let debugdata = unsafe { (*live_frame).debugdata };
             remember_frame_debug_data(debugdata);
             return unsafe { &mut *debugdata };
         }
@@ -3997,6 +4023,12 @@ impl PyFrame {
             "PyFrame::__init__: initialize_frame_scopes raised — caller should use createframe",
         );
         remember_frame_locals_array(self.locals_cells_stack_w);
+        // Old-gen frame → nursery locals array is an old-to-young field
+        // store (`incminimark.py write_barrier`). Remembering only the
+        // array leaves the frame off `old_objects_pointing_to_young`.
+        if pyre_object::gc_hook::try_gc_owns_object(self as *mut PyFrame as *mut u8) {
+            pyre_object::gc_hook::try_gc_write_barrier(self as *mut PyFrame as *mut u8);
+        }
     }
 
     /// PyPy-compatible `__repr__`.
@@ -4387,15 +4419,22 @@ impl PyFrame {
         // Root the fresh globals across the `__name__` store; the frame
         // construction below roots them again for its own span.
         let _root = pyre_object::gc_roots::push_roots();
-        let w_globals = pyre_object::gc_roots::pin_root(w_globals);
+        let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_globals);
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new("__main__"));
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                w_globals,
+                pyre_object::gc_roots::shadow_stack_get(globals_slot),
                 "__name__",
-                pyre_object::w_str_new("__main__"),
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
             );
         }
-        Self::new_with_context_and_globals(code, execution_context, w_globals)
+        Self::new_with_context_and_globals(
+            code,
+            execution_context,
+            pyre_object::gc_roots::shadow_stack_get(globals_slot),
+        )
     }
 
     /// `new_with_context` over a globals dict the caller already owns.
@@ -4415,7 +4454,7 @@ impl PyFrame {
         // frame's debug data, and both locations root it once they return.
         let _root = pyre_object::gc_roots::push_roots();
         let w_globals = pyre_object::gc_roots::pin_root(w_globals);
-        let w_code = crate::box_code_object(code);
+        let w_code = pyre_object::gc_roots::pin_root(crate::box_code_object(code));
         let ctx_ptr = Rc::into_raw(execution_context);
         crate::createframe_obj(w_code as *const (), w_globals, ctx_ptr, None)
     }
@@ -5053,7 +5092,23 @@ impl PyFrame {
         // handling RecursionError and every newly entered Python frame is
         // still guarded.
         crate::stack_check::drain_jit_pending_exception()?;
+        // `stack_check`'s overflow arm allocates `RecursionError` while a
+        // thrown `OperationError` is still the argument. `OperationError`
+        // (`error.py`) is a GC object. Pin the native carrier only when this
+        // entry holds one, and write the slot back before the resume reads it.
+        let operr_pin = operr.as_ref().and_then(|err| {
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = err.pin_exc_object(&roots)?;
+            Some((roots, slot))
+        });
         crate::stack_check::stack_check()?;
+        let mut operr = operr;
+        if let Some((roots, slot)) = &operr_pin
+            && let Some(err) = operr.as_mut()
+        {
+            err.reload_exc_object(roots, Some(*slot));
+        }
+        drop(operr_pin);
         crate::eval::eval_frame_plain_with_resume(self, w_inputvalue, operr, None)
     }
 
@@ -5111,7 +5166,20 @@ impl PyFrame {
         resume: &mut crate::call::FrameResumeArgs,
     ) -> crate::PyResult {
         crate::stack_check::drain_jit_pending_exception()?;
+        // Same carrier pin as `execute_frame`: the overflow arm allocates
+        // before `eval_frame_plain_with_resume` takes `operr`.
+        let operr_pin = resume.operr.as_ref().and_then(|err| {
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = err.pin_exc_object(&roots)?;
+            Some((roots, slot))
+        });
         crate::stack_check::stack_check()?;
+        if let Some((roots, slot)) = &operr_pin
+            && let Some(err) = resume.operr.as_mut()
+        {
+            err.reload_exc_object(roots, Some(*slot));
+        }
+        drop(operr_pin);
         crate::eval::eval_frame_plain_with_resume(
             self,
             resume.w_inputvalue.take(),
@@ -6351,13 +6419,14 @@ impl PyFrame {
         _roots.normalize(locals_idx, 1);
 
         {
-            // Populate the freshly-allocated array via its mutable slice.
-            let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
-
             // Bind positional arguments directly -- no intermediate Vec.
+            // Reload the array after each collecting call (`w_cell_new`);
+            // `set_ref` is `setarrayitem_gc` so an old spill remembers young
+            // children.
             let nargs = args.len().min(num_locals);
             for i in 0..nargs {
-                arr[i] = _roots.get(args_base + i);
+                let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
+                arr.set_ref(i, _roots.get(args_base + i));
             }
 
             // Each cellvar that also appears in varnames shares its
@@ -6374,22 +6443,22 @@ impl PyFrame {
                 };
                 let cell = pyre_object::w_cell_new(PY_NULL, family);
                 let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
-                arr[num_locals + i] = cell;
+                arr.set_ref(num_locals + i, cell);
             }
             let closure = _roots.get(root_base + 2);
             if !closure.is_null() {
                 let nfreevars = code_ref.freevars.len();
-                let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
                 for i in 0..nfreevars {
                     let cell = unsafe { w_tuple_getitem(closure, i as i64).unwrap() };
-                    arr[num_locals + npure + i] = cell;
+                    let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
+                    arr.set_ref(num_locals + npure + i, cell);
                 }
             }
         }
 
-        // Stable frame-locals arrays are filled before their owning frame is
-        // published. Reload after the cell allocations: the pin slot is the
-        // only root until the frame stores the array.
+        // Reload after the cell allocations: the pin slot is the only root
+        // until the frame stores the array. A nursery-full spill is old-gen
+        // and may hold young cells, so it joins the remembered set.
         let locals_cells_stack_w = _roots.get(locals_idx) as *mut FixedObjectArray;
         remember_frame_locals_array(locals_cells_stack_w);
 
@@ -6437,6 +6506,14 @@ impl PyFrame {
             // `STORE_NAME`s land in a throwaway mapping instead of `globals`.
             frame.bind_unoptimized_locals_scope();
             frame.init_cells();
+        }
+        // `bind_unoptimized_locals_scope` allocates the class-body mapping, and
+        // this aggregate's fields are native copies no collection rewrites.
+        // Store through a pointer so the write is not a non-deref
+        // virtualizable-field projection (`vable-projection-census` allows
+        // those only on `FrameBox::new`).
+        unsafe {
+            store_locals_cells_stack_w(&mut frame, _roots.get(locals_idx) as *mut FixedObjectArray);
         }
         frame
     }

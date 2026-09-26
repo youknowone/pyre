@@ -1876,6 +1876,12 @@ mod ssl_socket_methods {
         // than through the socket's Python `send`, so the whole queue costs
         // one released region instead of one per record.
         if let Some((transport, fd)) = pump_transport(socket)? {
+            // The released run lets another thread collect, so the transport
+            // is rooted and read back after it.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let transport_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(transport);
+            let transport = || unsafe { pyre_object::gc_roots::shadow_stack_get(transport_slot) };
             let backend = socket.backend;
             loop {
                 match pump(backend, fd, &mut [], PumpGoal::Flush, &mut socket.record) {
@@ -1884,8 +1890,8 @@ mod ssl_socket_methods {
                         pyre_interpreter::module::signal::interp_signal::checksignals_now()?
                     }
                     PumpExit::Failed { write, code }
-                        if wait_for_transport(transport, fd, write, code)? => {}
-                    exit => return Err(pump_error(transport, backend, exit)),
+                        if wait_for_transport(transport(), fd, write, code)? => {}
+                    exit => return Err(pump_error(transport(), backend, exit)),
                 }
             }
         }
@@ -1898,12 +1904,18 @@ mod ssl_socket_methods {
                 return Ok(());
             }
             // The callbacks above ran Python, so the transport is read back
-            // after them.
-            let transport = transport_socket(socket)?;
-            let fd = crate::module::_socket::interp_socket::socket_fd(transport)?;
-            crate::module::_socket::interp_socket::socket_wait_for_data(transport, fd, true)?;
+            // after them; the wait releases the GIL, so it is rooted across it.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let transport_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(transport_socket(socket)?);
+            let transport = || unsafe { pyre_object::gc_roots::shadow_stack_get(transport_slot) };
+            let fd = crate::module::_socket::interp_socket::socket_fd(transport())?;
+            crate::module::_socket::interp_socket::socket_wait_for_data(transport(), fd, true)?;
             let sent = match crate::module::_socket::interp_socket::socket_send_bytes(
-                transport, fd, &data, 0,
+                transport(),
+                fd,
+                &data,
+                0,
             ) {
                 Ok(sent) => sent,
                 Err(error) if is_blocking_error(&error) => {
@@ -2171,9 +2183,10 @@ mod ssl_socket_methods {
         if !unsafe { is_none(context.msg_callback) } {
             return Ok(None);
         }
-        let transport = transport_socket(socket)?;
-        let fd = crate::module::_socket::interp_socket::socket_fd(transport)?;
-        Ok(Some((transport, fd)))
+        let fd = crate::module::_socket::interp_socket::socket_fd(transport_socket(socket)?)?;
+        // Reading the descriptor can materialise the socket's dict, so the
+        // transport is read back after it.
+        Ok(Some((transport_socket(socket)?, fd)))
     }
 
     /// The callback-aware counterpart of [`pump`], which returns to the
@@ -2203,13 +2216,17 @@ mod ssl_socket_methods {
             return Ok(());
         }
 
-        let transport = transport_socket(socket)?;
-        let fd = crate::module::_socket::interp_socket::socket_fd(transport)?;
-        crate::module::_socket::interp_socket::socket_wait_for_data(transport, fd, false)?;
+        // The wait releases the GIL, so the transport is rooted across it.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let transport_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(transport_socket(socket)?);
+        let transport = || unsafe { pyre_object::gc_roots::shadow_stack_get(transport_slot) };
+        let fd = crate::module::_socket::interp_socket::socket_fd(transport())?;
+        crate::module::_socket::interp_socket::socket_wait_for_data(transport(), fd, false)?;
         let mut buf = vec![0u8; 32 * 1024];
         let want = socket.record.want().min(buf.len());
         let read = match crate::module::_socket::interp_socket::socket_recv_bytes(
-            transport,
+            transport(),
             fd,
             &mut buf[..want],
             0,
@@ -2458,6 +2475,13 @@ mod ssl_socket_methods {
                 } else {
                     None
                 } {
+                    // The released run lets another thread collect, so the
+                    // transport is rooted and read back after it.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let transport_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(transport);
+                    let transport =
+                        || unsafe { pyre_object::gc_roots::shadow_stack_get(transport_slot) };
                     if pump_buffer.is_empty() {
                         pump_buffer.resize(32 * 1024, 0u8);
                     }
@@ -2482,7 +2506,7 @@ mod ssl_socket_methods {
                             continue;
                         }
                         PumpExit::Failed { write, code }
-                            if wait_for_transport(transport, fd, write, code)? =>
+                            if wait_for_transport(transport(), fd, write, code)? =>
                         {
                             continue;
                         }
@@ -2493,7 +2517,7 @@ mod ssl_socket_methods {
                             let _ = flush_transport(self);
                             return tls_result(Err(error));
                         }
-                        exit => return Err(pump_error(transport, self.backend, exit)),
+                        exit => return Err(pump_error(transport(), self.backend, exit)),
                     }
                 }
                 flush_transport(self)?;
@@ -2592,7 +2616,14 @@ mod ssl_socket_methods {
                 // plaintext drain, the transport read and the record parsing
                 // all run in the released region, so a caller waiting for the
                 // peer is parked in `recv` rather than holding the
-                // interpreter between them.
+                // interpreter between them.  The released run lets another
+                // thread collect, so the transport is rooted and read back
+                // after it.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let transport_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(transport);
+                let transport =
+                    || unsafe { pyre_object::gc_roots::shadow_stack_get(transport_slot) };
                 let mut buf = vec![0u8; 32 * 1024];
                 let backend = self.backend;
                 loop {
@@ -2619,7 +2650,7 @@ mod ssl_socket_methods {
                             pyre_interpreter::module::signal::interp_signal::checksignals_now()?
                         }
                         PumpExit::Failed { write, code }
-                            if wait_for_transport(transport, fd, write, code)? => {}
+                            if wait_for_transport(transport(), fd, write, code)? => {}
                         PumpExit::Rejected(error) => {
                             // rustls may have queued the fatal alert describing
                             // this protocol error. Send it before unwinding so
@@ -2627,7 +2658,7 @@ mod ssl_socket_methods {
                             let _ = flush_transport(self);
                             return tls_result(Err(error));
                         }
-                        exit => return Err(pump_error(transport, self.backend, exit)),
+                        exit => return Err(pump_error(transport(), self.backend, exit)),
                     }
                 }
             } else {
@@ -2869,6 +2900,13 @@ mod ssl_socket_methods {
             // before the peer can send its answer.  Drive this through the
             // same released transport loop as SSL_read/SSL_do_handshake.
             if let Some((transport, fd)) = pump_transport(self)? {
+                // The released run lets another thread collect, so the
+                // transport is rooted and read back after it.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let transport_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(transport);
+                let transport =
+                    || unsafe { pyre_object::gc_roots::shadow_stack_get(transport_slot) };
                 let mut buf = vec![0u8; 32 * 1024];
                 loop {
                     match pump(
@@ -2886,12 +2924,12 @@ mod ssl_socket_methods {
                             pyre_interpreter::module::signal::interp_signal::checksignals_now()?
                         }
                         PumpExit::Failed { write, code }
-                            if wait_for_transport(transport, fd, write, code)? => {}
+                            if wait_for_transport(transport(), fd, write, code)? => {}
                         PumpExit::Rejected(error) => {
                             let _ = flush_transport(self);
                             return tls_result(Err(error));
                         }
-                        exit => return Err(pump_error(transport, self.backend, exit)),
+                        exit => return Err(pump_error(transport(), self.backend, exit)),
                     }
                 }
             } else if unsafe { is_none(self.incoming) } {

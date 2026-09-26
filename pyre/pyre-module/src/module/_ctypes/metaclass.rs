@@ -20,7 +20,6 @@ use super::type_ns_store;
 use majit_rlib::rbigint::RBigInt as BigInt;
 use pyre_object::PyObjectRef;
 use rustpython_host_env::ctypes as host_ctypes;
-use std::sync::OnceLock;
 
 type PyResult = Result<PyObjectRef, pyre_interpreter::PyError>;
 
@@ -49,9 +48,10 @@ fn make_ctypes_metatype(name: &str, init: impl FnOnce(PyObjectRef)) -> PyObjectR
 
 macro_rules! cached_type {
     ($cell:ident, $f:ident, $build:expr) => {
-        static $cell: OnceLock<usize> = OnceLock::new();
+        static $cell: pyre_object::gc_roots::RootedOnceRef =
+            pyre_object::gc_roots::RootedOnceRef::new();
         pub(super) fn $f() -> PyObjectRef {
-            *$cell.get_or_init(|| $build() as usize) as PyObjectRef
+            $cell.get_or_init($build)
         }
     };
 }
@@ -1301,7 +1301,7 @@ fn cfield_new(
     put("byte_offset", pyre_object::w_int_new(offset as i64));
     put("size", pyre_object::w_int_new(size as i64));
     put("byte_size", pyre_object::w_int_new(size as i64));
-    let bit_size = BigInt::from(size) * BigInt::from(8u8);
+    let bit_size = BigInt::from(size).int_mul(8);
     put("bit_size", pyre_object::longobject::w_long_new(bit_size));
     put("bit_offset", pyre_object::w_int_new(0));
     put("is_bitfield", pyre_object::w_bool_from(false));

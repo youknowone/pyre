@@ -160,11 +160,36 @@ fn rewire_one_option_try_site(
             ));
         }
     };
-    assert_single_pred(graph, b, &name)?;
     assert_block_pure_besides(graph, b, &[branch_idx], "branch", &name)?;
 
-    // Its single predecessor is A, the block whose exit forwards `opt` into B.
-    let (a, opt_a) = single_predecessor_carrying(graph, b, &opt_b, &name)?;
+    // One predecessor: A produced `opt` and forwarded it into B. Several
+    // predecessors: `checked_*` already built Some and None and joined them
+    // on this block (`emit_sum_variant_dynamic` sends both arms at the
+    // original continuation). The joined Option is B's inputarg, so the
+    // switch belongs on B itself.
+    let pred_count = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.exits.iter())
+        .filter(|link| link.target.0 == b)
+        .count();
+    let opt_var = match &opt_b {
+        LinkArg::Value(var) => var.clone(),
+        other => {
+            return Err(format!(
+                "{name}: branch receiver is {other:?}, expected a forwarded value"
+            ));
+        }
+    };
+    let (a, opt_a) = if pred_count == 1 {
+        single_predecessor_carrying(graph, b, &opt_var, &name)?
+    } else if graph.blocks[b].inputargs.iter().any(|var| var == &opt_var) {
+        (b, opt_var)
+    } else {
+        return Err(format!(
+            "{name}: branch block {b} has {pred_count} predecessors and the Option is not its inputarg"
+        ));
+    };
 
     let cf = site.branch_result_var.clone();
     let (c, cf_c) =
@@ -217,7 +242,8 @@ fn rewire_one_option_try_site(
                 continue_specs.push(ContinueArg::Const(Constant::new(ConstValue::Int(0))));
             }
             LinkArg::Value(v) => {
-                let v_a = back_substitute(graph, &[(a, b), (b, c)], v, &name)?;
+                let chain: &[(usize, usize)] = if a == b { &[(b, c)] } else { &[(a, b), (b, c)] };
+                let v_a = back_substitute(graph, chain, v, &name)?;
                 if !some_sources.contains(&v_a) {
                     some_sources.push(v_a.clone());
                 }
@@ -233,6 +259,12 @@ fn rewire_one_option_try_site(
     }
 
     // All structural validation passed; mutate the graph.
+
+    // The joined case switches in the branch block, so the residual call
+    // would otherwise stay on the live path.
+    if a == b {
+        graph.blocks[b].operations.remove(branch_idx);
+    }
 
     let (some_bb, some_inputs) = graph.create_block_with_arg_vars(some_sources.len());
     let (none_bb, _none_inputs) = graph.create_block_with_arg_vars(0);

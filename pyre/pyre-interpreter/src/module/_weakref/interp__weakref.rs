@@ -13,14 +13,12 @@ use crate::{PyError, make_builtin_function, make_builtin_function_with_arity};
 use pyre_object::*;
 use rustpython_wtf8::Wtf8Buf;
 
-use std::sync::OnceLock;
-
-// Type objects belong to the process-wide object space, not to an OS thread.
-// Store their addresses as `usize` because `PyObjectRef` is a raw pointer and
-// therefore cannot itself be held by a `Sync` static.
-static WEAKREF_TYPE: OnceLock<usize> = OnceLock::new();
-static PROXY_TYPE: OnceLock<usize> = OnceLock::new();
-static CALLABLE_PROXY_TYPE: OnceLock<usize> = OnceLock::new();
+static WEAKREF_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
+static PROXY_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
+static CALLABLE_PROXY_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 // ── Instance attribute names ──────────────────────────────────────────
 //
@@ -343,7 +341,7 @@ fn init_weakref_type(ns: PyObjectRef) {
 }
 
 pub fn weakref_type() -> PyObjectRef {
-    *WEAKREF_TYPE.get_or_init(|| {
+    WEAKREF_TYPE.get_or_init(|| {
         // CPython exposes `_weakref.ref` as `weakref.ReferenceType`.
         // The dotted builtin name supplies the public module while the type
         // metadata getters expose the final component as the bare name.
@@ -358,8 +356,8 @@ pub fn weakref_type() -> PyObjectRef {
         // now, exactly as `py_class_typed!` and `getset_descriptor_type` do,
         // so W_Weakref::allocate_stable stamps the live ReferenceType class.
         pyre_object::set_instantiate(&pyre_object::weakref::WEAKREF_LAYOUT_TYPE, tp);
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 /// pypy/module/_weakref/interp__weakref.py W_Proxy.typedef
@@ -410,7 +408,7 @@ fn init_proxy_type(ns: PyObjectRef) {
 /// built type object (same shape as [`crate::typedef::w_type`]).
 #[majit_macros::dont_look_inside]
 pub fn proxy_type() -> PyObjectRef {
-    *PROXY_TYPE.get_or_init(|| {
+    PROXY_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "weakref.ProxyType",
             init_proxy_type,
@@ -421,8 +419,8 @@ pub fn proxy_type() -> PyObjectRef {
             pyre_object::w_type_set_hasdict(tp, true);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 /// pypy/module/_weakref/interp__weakref.py W_CallableProxy.typedef
@@ -481,7 +479,7 @@ fn init_callable_proxy_type(ns: PyObjectRef) {
 /// `dont_look_inside` for the same reason as [`proxy_type`].
 #[majit_macros::dont_look_inside]
 pub fn callable_proxy_type() -> PyObjectRef {
-    *CALLABLE_PROXY_TYPE.get_or_init(|| {
+    CALLABLE_PROXY_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "weakref.CallableProxyType",
             init_callable_proxy_type,
@@ -492,8 +490,8 @@ pub fn callable_proxy_type() -> PyObjectRef {
             pyre_object::w_type_set_hasdict(tp, true);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 // ── WeakrefLifeline ───────────────────────────────────────────────────
@@ -882,7 +880,7 @@ pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if w_obj.is_null() || unsafe { pyre_object::is_none(w_obj) } {
         return Ok(pyre_object::w_str_new_managed(&format!(
             "<{type_name} at {}; dead>",
-            crate::display::repr_addr(pyre_object::gc_roots::shadow_stack_get(self_slot) as usize)
+            crate::display::repr_gc_addr(pyre_object::gc_roots::shadow_stack_get(self_slot))
         )));
     }
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -904,17 +902,16 @@ pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         }
     };
     // The state also carries the referent's own address, which `getrepr`
-    // does not.
+    // does not. Both ids are taken from the rooted words: the first hash
+    // allocates a shadow and can move the other object.
+    let self_addr =
+        crate::display::repr_gc_addr(pyre_object::gc_roots::shadow_stack_get(self_slot));
+    let obj_addr = crate::display::repr_gc_addr(pyre_object::gc_roots::shadow_stack_get(obj_slot));
     Ok(pyre_object::w_str_from_wtf8_managed(
         crate::display::wtf8_format!(
-            format!(
-                "<{type_name} at {}; to '",
-                crate::display::repr_addr(
-                    pyre_object::gc_roots::shadow_stack_get(self_slot) as usize
-                ),
-            ),
+            format!("<{type_name} at {self_addr}; to '"),
             objtype_name,
-            format!("' at {}", crate::display::repr_addr(w_obj as usize),),
+            format!("' at {obj_addr}"),
             name,
             ">",
         ),

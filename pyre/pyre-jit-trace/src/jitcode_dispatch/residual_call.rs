@@ -3223,9 +3223,9 @@ fn carrier_stack_box_for_ref_arg<Sym: WalkSym>(
     }
     let consts = ctx.inline_callee_consts?;
     let color = ctx.registers_r.iter().position(|value| value == arg)?;
-    let raw_code =
-        unsafe { pyre_interpreter::w_code_get_ptr(consts.w_code as pyre_object::PyObjectRef) }
-            as *const pyre_interpreter::CodeObject;
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(ctx.inline_w_code() as pyre_object::PyObjectRef)
+    } as *const pyre_interpreter::CodeObject;
     if raw_code.is_null() {
         return None;
     }
@@ -6595,8 +6595,8 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
     // stage — the active-trace walk, the retrace and resume-data pools, and
     // `remove_constptrs_in`, which turns each one into a `LoadFromGcTable`
     // whose slot is a root — and the window before that, while the mint sits
-    // in the walker's own `registers_r` bank, is covered by the
-    // `active_sym_registers` root area.  The only other address this fold
+    // in the walker's own `registers_r` bank, is covered by
+    // `InlineRegisterBankGuard` (`miframe_registers`).  The only other address this fold
     // bakes is the family's, and a family is a `Box::into_raw` leak outside
     // the collector entirely.
     let owner = ctx.trace_ctx.const_ref(family as i64);

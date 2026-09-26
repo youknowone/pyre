@@ -122,7 +122,8 @@ pub fn store_singleton(gc: Box<MiniMarkGC>) {
     // no concurrent access.
     unsafe {
         *GC_STORE.0.get() = Some(gc);
-        crate::publish_singleton_nursery(&**(*GC_STORE.0.get()).as_ref().unwrap());
+        let installed = (*GC_STORE.0.get()).as_ref().unwrap();
+        crate::publish_singleton_nursery(&**installed);
     }
     GC_INITIALIZED.store(true, Ordering::Release);
 }
@@ -151,7 +152,8 @@ pub fn replace_singleton_leaking_old(gc: Box<MiniMarkGC>) {
             std::mem::forget(old);
         }
         *GC_STORE.0.get() = Some(gc);
-        crate::publish_singleton_nursery(&**(*GC_STORE.0.get()).as_ref().unwrap());
+        let installed = (*GC_STORE.0.get()).as_ref().unwrap();
+        crate::publish_singleton_nursery(&**installed);
     }
     GC_INITIALIZED.store(true, Ordering::Release);
 }

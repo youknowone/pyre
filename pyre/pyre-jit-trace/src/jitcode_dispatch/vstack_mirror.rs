@@ -321,7 +321,7 @@ fn loadconst_operand_ref<Sym: WalkSym>(
             unsafe { (*frame).pycode as usize }
         }
     } else {
-        ctx.inline_callee_consts.map_or(0, |consts| consts.w_code)
+        ctx.inline_w_code()
     };
     let w_const = if w_code == 0 || w_code == usize::MAX {
         // Malformed/test-only walks have no enclosing PyCode. Keep the

@@ -101,6 +101,13 @@ pub const W_TUPLE_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObject>();
 pub const W_TUPLE_USER_GC_TYPE_ID: u32 = 187;
 pub const W_TUPLE_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObjectUser>();
 
+impl crate::lltype::GcType for W_TupleObject {
+    fn type_id() -> u32 {
+        W_TUPLE_GC_TYPE_ID
+    }
+    const SIZE: usize = W_TUPLE_OBJECT_SIZE;
+}
+
 impl crate::lltype::GcType for W_TupleObjectUser {
     #[inline(always)]
     fn type_id() -> u32 {
@@ -184,20 +191,17 @@ pub unsafe fn w_tuple_setitem_unchecked(
     index: usize,
     value: PyObjectRef,
 ) -> Option<PyObjectRef> {
-    let roots = crate::gc_roots::push_roots();
-    let base = roots.base();
-    let _ = roots.pin_root(obj);
-    let _ = roots.pin_root(value);
-    crate::gc_hook::try_gc_write_barrier_managed(roots.get(base) as *mut u8);
-    let obj = roots.get(base);
-    let value = roots.get(base + 1);
     let (items, len) = w_tuple_object_items_ptr_len(obj)?;
     if index >= len {
         return None;
     }
-    let slot = (items as *mut PyObjectRef).add(index);
-    let previous = *slot;
-    *slot = value;
+    let previous = *items.add(index);
+    // `setarrayitem_gc`: the slot belongs to the `wrappeditems` array, a GC
+    // object of its own, so that array is the holder `write_barrier`
+    // remembers.  Remembering the tuple leaves an old array's young element
+    // off `old_objects_pointing_to_young`.
+    let block = (*(obj as *const W_TupleObject)).wrappeditems;
+    crate::object_array::items_block_set_ref(block, index, value);
     Some(previous)
 }
 
@@ -241,6 +245,8 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
 /// (`pypy/objspace/std/specialisedtupleobject.py`), except that
 /// Python 3.14's pointer identity requires exact float references to remain
 /// boxed. Other arities use the array-backed `W_TupleObject`.
+/// Empty tuples allocate like any other arity; `W_AbstractTupleObject.is_w`
+/// / `immutable_unique_id` give `() is ()` without a process-global object.
 ///
 /// Residualized: tuple construction drives the moving collector through
 /// `push_roots` / `pin_root` / `try_gc_alloc_nursery_raw` shadow-stack
@@ -389,42 +395,11 @@ fn w_tuple_new_array_backed_impl(
         Some(crate::gc_roots::shadow_stack_len() - 1)
     };
 
-    // pop_roots: read the relocated item pointers back out of the shadow
-    // stack, then build the items block. On the Phase L2 nursery path
-    // (`MAJIT_GC_ITEMSBLOCK`) the block itself is GC-managed and is the
-    // last allocation here, so it stays put until `wrappeditems` is set;
-    // `alloc_tuple_items_block_gc` re-pins the relocated values across its
-    // own (collecting) block malloc. Gate off it is the std::alloc block.
-    // Fixed-arity helpers top out at 8; longer tuples fall back to a Vec.
-    const STACK_CAP: usize = 8;
-    let mut stack_buf = [PY_NULL; STACK_CAP];
-    let heap_buf: Vec<PyObjectRef>;
-    let relocated: &[PyObjectRef] = if len <= STACK_CAP {
-        for i in 0..len {
-            stack_buf[i] = crate::gc_roots::shadow_stack_get(save_point + i);
-        }
-        &stack_buf[..len]
-    } else {
-        heap_buf = (0..len)
-            .map(|i| crate::gc_roots::shadow_stack_get(save_point + i))
-            .collect();
-        &heap_buf
-    };
-    let mut items_block = unsafe { alloc_tuple_items_block_gc(relocated) };
-    // `alloc_tuple_items_block_gc` roots the fresh block only inside its own
-    // `push_roots` frame, which it pops on return, so from here the block is a
-    // livevar of *this* frame across the barrier below. That barrier is a
-    // `gc_op`: it leaves RUNNING before taking `gc_mutex` (`gc_sync.rs`) and
-    // roots only the object it is handed, so a foreign collector runs there
-    // with the block reachable from nowhere. Inert for a null or std::alloc
-    // block, as in `w_list_new_with_strategy`.
-    let block_root: Option<usize> = if items_block.is_null() {
-        None
-    } else {
-        let s = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(items_block as PyObjectRef);
-        Some(s)
-    };
+    // pop_roots: fill the items block from the item slots, which a
+    // collection during the block malloc rewrites in place. A `Vec`
+    // snapshot taken here would still hold pre-move addresses across that
+    // allocation. Gate off it is the std::alloc block.
+    let items_block = unsafe { alloc_tuple_items_block_gc(save_point, len) };
     let raw = raw_slot
         .map(crate::gc_roots::shadow_stack_get)
         .unwrap_or(std::ptr::null_mut()) as *mut u8;
@@ -450,22 +425,10 @@ fn w_tuple_new_array_backed_impl(
         // landing in that window reclaims the block and poisons the nursery
         // under it, leaving `wrappeditems` dangling for good.
         crate::gc_hook::try_gc_write_barrier_managed(raw);
-        // Take the block from its published slot rather than from the word
-        // held across the barrier: the slot is the one authority a promotion
-        // rewrites, and the tuple's own `wrappeditems` is still null, so no
-        // collection could have forwarded that slot for us.
-        if let Some(s) = block_root {
-            items_block = crate::gc_roots::shadow_stack_get(s) as *mut ItemsBlock;
-        }
-        // The shell is a livevar across that same call for the same reason, so
-        // re-read it out of its slot too rather than keeping the word held
-        // across the barrier.
-        let raw = raw_slot
-            .map(crate::gc_roots::shadow_stack_get)
-            .unwrap_or(std::ptr::null_mut()) as *mut u8;
         // The header went in before the root was published; only the items
-        // block is still outstanding. Nothing below can collect, so the
-        // remembered tuple keeps the block from here on.
+        // block is still outstanding. The store below is the old-to-young
+        // edge (`setfield_gc`: barrier, then the field). The barrier is not a
+        // collection point, so `raw` and `items_block` are still current.
         let header = header();
         unsafe {
             write_tuple_layout(

@@ -466,10 +466,14 @@ pub fn malloc_typed<T: GcType>(value: T) -> *mut T {
 /// straight to memory at construction.
 ///
 /// Hence the restriction to payloads holding no reference at all: `None`,
-/// `True`, `False`, `NotImplemented`, `Ellipsis`. A box with reference fields
-/// must use [`malloc_typed`] and be reached through the raw-root walkers
-/// instead; `majit_gc::header::alloc_with_gc_header_immortal` records the
-/// measured failure that follows from stamping one anyway.
+/// `True`, `False`, `NotImplemented`, `Ellipsis`, and to a box whose
+/// constructor runs a write barrier on the whole box before anything can
+/// collect and whose every later reference store is barriered, which is the
+/// builtin `Function` (`function_new_impl`): that barrier ends
+/// `GCFLAG_NO_HEAP_PTRS` with the construction-time fields covered. Any other
+/// box with reference fields must use [`malloc_typed`] and be reached through
+/// the raw-root walkers instead; `majit_gc::header::alloc_with_gc_header_immortal`
+/// records the measured failure that follows from stamping one anyway.
 #[inline]
 pub fn malloc_typed_immortal<T: GcType>(value: T) -> *mut T {
     debug_assert_eq!(

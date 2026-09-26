@@ -4,7 +4,7 @@
 //!
 //! All functions delegate to `pymath::math` for CPython-exact results.
 
-use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntError, RBigIntGcRoot};
+use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntError, RBigIntGcRoot, live_rbigint};
 use pyre_object::*;
 
 /// Infallible f64 extraction with a `0.0` fallback for a non-convertible
@@ -1110,9 +1110,29 @@ fn loghelper(w_x: PyObjectRef, base: f64) -> Result<f64, pyre_interpreter::PyErr
             // logarithm of that conversion and answers as the float beside it
             // does.  Only a value that overflows falls back to the scaled
             // double, whose top bits are all the logarithm can be read from.
+            //
+            // `_AsDouble` collects (`rshift` / `lshift`), so `w_x` is a
+            // livevar across it.
+            let roots = pyre_object::gc_roots::push_roots();
+            let x_slot = roots.base();
+            let _ = roots.pin_root(w_x);
             return match num.tofloat() {
                 Ok(x) => Ok(log_of_double(x, base)),
-                Err(_) => num.log(base).map_err(map_rbigint_err),
+                Err(_) => {
+                    // `_log_any` reaches for `space.bigint_w(w_x)` only after
+                    // the overflow, on the rooted `w_x`, and reads the payload
+                    // the wrapper stores by then; the borrow above names the
+                    // payload from before the collection.  A value the stack
+                    // handles hold cannot overflow a `float`, so only a long
+                    // arrives here with a payload that moved.
+                    let w_x = roots.get(x_slot);
+                    let num = if pyre_object::is_long(w_x) {
+                        pyre_object::w_long_get_value(w_x)
+                    } else {
+                        num
+                    };
+                    num.log(base).map_err(map_rbigint_err)
+                }
             };
         }
     }
@@ -1329,7 +1349,7 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
             pyre_interpreter::baseobjspace::object_functionstr_type_name(args[0])
         )));
     }
-    let n_big = get_bigint(args[0])?;
+    let n_big = RBigIntGcRoot::new(get_bigint(args[0])?);
     if n_big.int_lt(0) {
         return Err(pyre_interpreter::PyError::value_error(
             "factorial() not defined for negative values",
@@ -1356,30 +1376,39 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
             return result;
         }
         let mid = ((low + high) >> 1) | 1;
-        fac_odd(low, mid, gap).mul(&fac_odd(mid, high, gap))
+        let left = RBigIntGcRoot::new(fac_odd(low, mid, gap));
+        // `fac_odd` collects, so it runs before `left` is read for the call.
+        let right = fac_odd(mid, high, gap);
+        left.mul(&right)
     }
     fn fac1(x: i64, gap: i64) -> (BigInt, BigInt, i64) {
         if x <= 2 {
             return (BigInt::one(), BigInt::one(), x - 1);
         }
         let x2 = x >> 1;
-        let (f, mut g, shift) = fac1(x2, gap);
-        g = g.mul(&fac_odd((x2 + 1) | 1, x + 1, gap));
-        (f.mul(&g), g, shift + x2)
+        let (f, g, shift) = fac1(x2, gap);
+        let f = RBigIntGcRoot::new(f);
+        let g = RBigIntGcRoot::new(g);
+        // `fac_odd` collects, so it runs before `g` is read for the call.
+        let odd = fac_odd((x2 + 1) | 1, x + 1, gap);
+        let g = RBigIntGcRoot::new(g.mul(&odd));
+        (f.mul(&g), (*g).clone(), shift + x2)
     }
 
     let result = if n <= 100 {
-        let mut result = BigInt::one();
+        let mut result = RBigIntGcRoot::new(BigInt::one());
         let mut i = 2;
         while i <= n {
-            result = result.int_mul(i);
+            result = RBigIntGcRoot::new(result.int_mul(i));
             i += 1;
         }
-        result
+        (*result).clone()
     } else {
         let gap = 100.max(n >> 7);
         let (result, _, shift) = fac1(n, gap);
-        result.lshift(shift).map_err(map_rbigint_err)?
+        RBigIntGcRoot::new(result)
+            .lshift(shift)
+            .map_err(map_rbigint_err)?
     };
     Ok(bigint_to_pyint(&result))
 }
@@ -1461,10 +1490,14 @@ pub fn gcd(args: &[PyObjectRef]) -> PyResult {
         return Ok(w_int_new(majit_rlib::rbigint::gcd_binary(a, b)));
     }
     // RPython's GC transform roots this running rbigint across the next
-    // argument's potentially user-defined `__index__` call.
+    // argument's potentially user-defined `__index__` call. Convert the
+    // argument first so the reload of `result` happens after that
+    // collection, then `set` so the owner-root slot names the new digits
+    // — `*result =` through DerefMut leaves the slot on the previous array.
     let mut result = RBigIntGcRoot::new(BigInt::zero());
     for &arg in args {
-        *result = result.gcd(&get_bigint(arg)?).map_err(map_rbigint_err)?;
+        let value = RBigIntGcRoot::new(get_bigint(arg)?);
+        result.set(result.gcd(&value).map_err(map_rbigint_err)?);
     }
     Ok(bigint_to_pyint(&result))
 }
@@ -1482,20 +1515,22 @@ pub fn lcm(args: &[PyObjectRef]) -> PyResult {
         // is zero: `math_lcm_impl` only short-circuits the arithmetic, so
         // `math.lcm(0, 1.5)` still raises TypeError.  `app_math.lcm` returns
         // early instead and skips the remaining conversions.
-        let value = get_bigint(arg)?;
+        let value = RBigIntGcRoot::new(get_bigint(arg)?);
         if result.is_zero() {
             continue;
         }
         if value.is_zero() {
-            *result = BigInt::zero();
+            result.set(BigInt::zero());
             continue;
         }
         let divisor = result.gcd(&value).map_err(map_rbigint_err)?;
-        *result = result
-            .floordiv(&divisor)
-            .map_err(map_rbigint_err)?
-            .mul(&value)
-            .abs();
+        result.set(
+            result
+                .floordiv(&divisor)
+                .map_err(map_rbigint_err)?
+                .mul(&value)
+                .abs(),
+        );
     }
     let result = result.abs();
     Ok(bigint_to_pyint(&result))
@@ -1503,8 +1538,9 @@ pub fn lcm(args: &[PyObjectRef]) -> PyResult {
 
 /// `w_int_new` when the value fits an i64, else `w_long_new`.
 fn bigint_to_pyint(b: &BigInt) -> PyObjectRef {
-    if jit_bigint_to_i64_fits(b) != 0 {
-        w_int_new(jit_bigint_to_i64_value(b))
+    let b = live_rbigint(b);
+    if jit_bigint_to_i64_fits(&b) != 0 {
+        w_int_new(jit_bigint_to_i64_value(&b))
     } else {
         w_long_new(b.translated_alias())
     }
@@ -1578,7 +1614,7 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
     // `n` is an unboxed rbigint local across `index(k)`, exactly the kind of
     // local rooted automatically by RPython's GC transform.
     let n_big = RBigIntGcRoot::new(get_bigint(args[0])?);
-    let k_big = get_bigint(args[1])?;
+    let k_big = RBigIntGcRoot::new(get_bigint(args[1])?);
 
     if n_big.int_lt(0) {
         return Err(pyre_interpreter::PyError::value_error(
@@ -1595,29 +1631,34 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
         return Ok(w_int_new(0));
     }
 
-    let n_minus_k = &*n_big - &k_big;
-    let k = if n_minus_k.lt(&k_big) {
+    let n_minus_k = &*n_big - &*k_big;
+    let k = RBigIntGcRoot::new(if n_minus_k.lt(&*k_big) {
         n_minus_k
     } else {
-        k_big
-    };
+        k_big.translated_alias()
+    });
     if k.is_zero() {
         return Ok(w_int_new(1));
     }
 
     // pypy/module/math/app_math.py:comb — preserve its occasional fraction
     // reduction, including a bigint loop index.
-    let mut numerator = n_big.translated_alias();
-    let mut denominator = BigInt::one();
-    let mut i = BigInt::one();
+    let mut numerator = RBigIntGcRoot::new(n_big.translated_alias());
+    let mut denominator = RBigIntGcRoot::new(BigInt::one());
+    let mut i = RBigIntGcRoot::new(BigInt::one());
     while i.lt(&k) {
-        numerator = numerator.mul(&n_big.sub(&i));
-        denominator = denominator.mul(&i.int_add(1));
+        // Each factor collects, so it is computed before the product's
+        // receiver is read.
+        let factor = n_big.sub(&i);
+        numerator = RBigIntGcRoot::new(numerator.mul(&factor));
+        let factor = i.int_add(1);
+        denominator = RBigIntGcRoot::new(denominator.mul(&factor));
         if i.int_and_(15).is_zero() {
-            numerator = numerator.floordiv(&denominator).map_err(map_rbigint_err)?;
-            denominator = BigInt::one();
+            numerator =
+                RBigIntGcRoot::new(numerator.floordiv(&denominator).map_err(map_rbigint_err)?);
+            denominator = RBigIntGcRoot::new(BigInt::one());
         }
-        i = i.int_add(1);
+        i = RBigIntGcRoot::new(i.int_add(1));
     }
     Ok(bigint_to_pyint(
         &numerator.floordiv(&denominator).map_err(map_rbigint_err)?,
@@ -1687,30 +1728,40 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
             return Ok(w_int_new(0));
         }
     }
-    let k = k_big.unwrap_or_else(|| n_big.translated_alias());
+    let k = RBigIntGcRoot::new(k_big.unwrap_or_else(|| n_big.translated_alias()));
 
     fn product_range(low: &BigInt, high: &BigInt, gap: &BigInt) -> Result<BigInt, RBigIntError> {
-        if low.add(gap).ge(high) {
-            let mut result = BigInt::one();
-            let mut i = low.translated_alias();
-            while i.lt(high) {
-                result = result.mul(&i);
-                i = i.int_add(1);
+        let low = live_rbigint(low);
+        let high = live_rbigint(high);
+        let gap = live_rbigint(gap);
+        if low.add(&*gap).ge(&*high) {
+            let mut result = RBigIntGcRoot::new(BigInt::one());
+            let mut i = RBigIntGcRoot::new(low.translated_alias());
+            while i.lt(&*high) {
+                result = RBigIntGcRoot::new(result.mul(&i));
+                i = RBigIntGcRoot::new(i.int_add(1));
             }
-            return Ok(result);
+            return Ok((*result).clone());
         }
-        let mid = low.add(high).rshift(1, false)?;
-        Ok(product_range(low, &mid, gap)?.mul(&product_range(&mid, high, gap)?))
+        let sum = RBigIntGcRoot::new(low.add(&*high));
+        let mid = RBigIntGcRoot::new(sum.rshift(1, false)?);
+        let left = RBigIntGcRoot::new(product_range(&*low, &mid, &*gap)?);
+        let right = RBigIntGcRoot::new(product_range(&mid, &*high, &*gap)?);
+        Ok(left.mul(&right))
     }
 
-    let low = n_big.sub(&k).int_add(1);
-    let high = n_big.int_add(1);
+    let low = {
+        let diff = RBigIntGcRoot::new(n_big.sub(&k));
+        RBigIntGcRoot::new(diff.int_add(1))
+    };
+    let high = RBigIntGcRoot::new(n_big.int_add(1));
     let result = if k.int_le(100) {
-        product_range(&low, &high, &BigInt::fromint(100))
+        let gap = RBigIntGcRoot::new(BigInt::fromint(100));
+        product_range(&low, &high, &gap)
     } else {
-        let shifted = k.rshift(7, false).map_err(map_rbigint_err)?;
+        let shifted = RBigIntGcRoot::new(k.rshift(7, false).map_err(map_rbigint_err)?);
         let gap = if shifted.int_lt(100) {
-            BigInt::fromint(100)
+            RBigIntGcRoot::new(BigInt::fromint(100))
         } else {
             shifted
         };
@@ -1726,7 +1777,7 @@ pub fn isqrt(args: &[PyObjectRef]) -> PyResult {
             "isqrt() takes exactly 1 argument",
         ));
     }
-    let n = get_bigint(args[0])?;
+    let n = RBigIntGcRoot::new(get_bigint(args[0])?);
     let value = n.isqrt().map_err(|_| {
         pyre_interpreter::PyError::value_error("isqrt() argument must be nonnegative")
     })?;
@@ -1986,7 +2037,7 @@ pub fn ldexp(args: &[PyObjectRef]) -> PyResult {
     // Besides preserving callback order, this avoids retaining an unboxed
     // exponent rbigint across x.__float__.
     let x = try_get_double(args[0])?;
-    let exp_big = get_bigint(args[1])?;
+    let exp_big = RBigIntGcRoot::new(get_bigint(args[1])?);
     // Short-circuit special cases so an overflowing exponent doesn't
     // mask inf/nan propagation.
     if x.is_nan() {
@@ -2050,7 +2101,7 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
     {
         Some(s) => {
             use num_traits::ToPrimitive;
-            let b = get_bigint(s)?;
+            let b = RBigIntGcRoot::new(get_bigint(s)?);
             if b.int_lt(0) {
                 return Err(pyre_interpreter::PyError::value_error(
                     "steps must be a non-negative integer",

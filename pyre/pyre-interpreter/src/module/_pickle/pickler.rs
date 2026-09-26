@@ -1229,10 +1229,12 @@ fn fast_save_enter(ctx: &mut PickleCtx, obj_slot: usize) -> Result<Option<usize>
     });
     if is_cycle {
         ctx.fast_nesting -= 1;
+        let type_name = crate::baseobjspace::object_functionstr_type_name(w_cur);
+        let w_cur = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         return Err(PyError::value_error(format!(
             "fast mode: can't pickle cyclic objects including object type {} at {}",
-            crate::baseobjspace::object_functionstr_type_name(w_cur),
-            crate::display::repr_addr(w_cur as usize),
+            type_name,
+            crate::display::repr_gc_addr(w_cur),
         )));
     }
     ctx.fast_memo.entry(h).or_default().push(obj_slot);

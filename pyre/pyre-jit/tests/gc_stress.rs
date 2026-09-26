@@ -39,6 +39,130 @@ use pyre_jit::eval::{eval_with_jit, init_jit_hooks, reset_gc_fresh_for_test};
 
 static GC_STRESS_SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+/// Nursery-born rbigint digits move; every long op that allocates while
+/// still reading an operand must have that operand on the shadow stack.
+#[test]
+fn long_ops_keep_operands_across_collecting_digit_allocs() {
+    const CHILD: &str = "PYRE_LONG_OPS_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "long_ops_keep_operands_across_collecting_digit_allocs",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated long-op GC-root regression");
+        assert!(
+            output.status.success(),
+            "long op lost an operand across a collecting alloc:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+LEFT = 10 ** 50 + 7
+RIGHT = 10 ** 25 + 3
+EXPECTED_TRUEDIV = LEFT / RIGHT
+EXPECTED_FLOORDIV = LEFT // RIGHT
+EXPECTED_MOD = LEFT % RIGHT
+EXPECTED_DIVMOD = divmod(LEFT, RIGHT)
+EXPECTED_POWMOD = pow(LEFT, 5, RIGHT)
+EXPECTED_LSHIFT = LEFT << 7
+EXPECTED_RSHIFT = LEFT >> 7
+EXPECTED_FLOAT = float(LEFT)
+EXPECTED_HASH = hash(LEFT)
+EXPECTED_STR = str(LEFT)
+
+def check_once():
+    assert LEFT / RIGHT == EXPECTED_TRUEDIV
+    assert LEFT // RIGHT == EXPECTED_FLOORDIV
+    assert LEFT % RIGHT == EXPECTED_MOD
+    assert divmod(LEFT, RIGHT) == EXPECTED_DIVMOD
+    assert pow(LEFT, 5, RIGHT) == EXPECTED_POWMOD
+    assert (LEFT << 7) == EXPECTED_LSHIFT
+    assert (LEFT >> 7) == EXPECTED_RSHIFT
+    assert float(LEFT) == EXPECTED_FLOAT
+    assert hash(LEFT) == EXPECTED_HASH
+    assert str(LEFT) == EXPECTED_STR
+
+i = 0
+while i < 80:
+    check_once()
+    _ = [0] * 32
+    i = i + 1
+
+def f_truediv_long(n):
+    big = 1 << 200
+    s = 0.0
+    i = 1
+    while i <= n:
+        s += big / (big + i)
+        i += 1
+    return s
+
+got = int(round(f_truediv_long(5000) * 1e6))
+assert got == 5000000000, got
+"#,
+        "long_ops_gc_roots.py",
+        "long-op operand roots",
+        "long ops must keep both operands alive across Digits::new",
+    );
+}
+
+/// `math.log10` of a long that does not fit in a float. `tofloat` collects
+/// and moves the payload; the logarithm must re-read it afterwards.
+#[test]
+fn log10_rereads_long_payload_after_tofloat() {
+    const CHILD: &str = "PYRE_LOG10_LONG_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "log10_rereads_long_payload_after_tofloat",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated log10 GC-root regression");
+        assert!(
+            output.status.success(),
+            "log10 read a moved long payload:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+import math
+# Each iteration builds a fresh young payload and takes the overflow arm on
+# the next statement, so a payload the conversion moves is read back while it
+# is still young.
+# The scaled-double arm is not correctly rounded, so compare with a
+# tolerance: a payload read after it moved is an exception or a value that
+# is wrong by orders of magnitude, never by an ulp.
+ln10 = math.log(10.0)
+for e in range(309, 1200):
+    value = 10 ** e
+    got = math.log10(value)
+    assert abs(got - e) < 1e-9, (e, got)
+    got = math.log(value)
+    assert abs(got - e * ln10) < 1e-6, (e, got)
+"#,
+        "log10_long_gc.py",
+        "log10 long payload",
+        "math.log10 must re-read a long after tofloat collects",
+    );
+}
+
 /// `ResumeGuardForcedDescr.handle_async_forcing` runs before the residual
 /// returns. Its virtualizable image must not read the pending return value
 /// from a register home that compiled code has not written yet.
@@ -1416,6 +1540,50 @@ while i < 60:
     );
 }
 
+/// Tracing `a ^ b` with a raising `__eq__` used to SIGSEGV in
+/// `array_sanity_load`: the walker presented a non-array GCREF to
+/// `do_getarrayitem_gc_r`, `bhimpl_arraylen_gc` read the first payload
+/// word (a pointer) as the length, and the item load used that as an
+/// index. `executor.py` only ever runs on the live array box.
+#[test]
+fn set_symdiff_raising_eq_survives_tracing_sanity_load() {
+    run_on_worker(
+        r#"
+class Boom:
+    def __init__(self, key, explode=False):
+        self.key = key
+        self.explode = explode
+    def __hash__(self):
+        return 7
+    def __eq__(self, other):
+        if self.explode or getattr(other, "explode", False):
+            raise ValueError("boom in __eq__")
+        return self.key == other.key
+
+def run_symdiff(a, b):
+    return a ^ b
+
+i = 0
+while i < 1700:
+    assert run_symdiff({1, 2, 3}, {2, 3, 4}) == {1, 4}
+    i += 1
+
+j = 0
+while j < 80:
+    raised = False
+    try:
+        run_symdiff({Boom(1), Boom(2)}, {Boom(1, explode=True)})
+    except ValueError:
+        raised = True
+    assert raised
+    j += 1
+"#,
+        "<set_symdiff_raising_eq_gc_stress>",
+        "set symdiff raising-eq tracing sanity load",
+        "set symdiff raising __eq__ crashed the tracer array sanity load",
+    );
+}
+
 /// `PyCode.co_consts_w` owns the one wrapped object for each constant index
 /// (`pycode.py`, `pyopcode.py:498-499`). A large integer constant is a  allow-line-citation
 /// managed `W_LongObject`; the Box-immortal PyCode therefore has to expose the
@@ -1562,6 +1730,58 @@ assert hits == 60, hits
         "<list_contains_gc_rooting>",
         "list-contains scan callback-root checks",
         "list contains callback GC rooting program failed",
+    );
+}
+
+/// Integer-strategy `list_eq` / `_compare_unwrappeditems` boxes each element
+/// through `w_int_new`.  The second getitem is a collecting malloc, so the
+/// first box has to be on the shadow stack before that call, and `list.sort`
+/// of tuples has to pin each getitem result the same way (`descr_sort`
+/// `sorter.list`).
+#[test]
+fn list_richcompare_and_sort_boxes_survive_sibling_getitem() {
+    const CHILD: &str = "PYRE_LIST_RICHCOMPARE_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "list_richcompare_and_sort_boxes_survive_sibling_getitem",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "65536")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated list richcompare GC-root regression");
+        assert!(
+            output.status.success(),
+            "list compare/sort lost a boxed element across a sibling getitem:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+def check():
+    assert [1] < [2]
+    assert [1] == [1]
+    assert [2, 1] > [2, 0]
+    assert max([1], [2]) == [2]
+    assert min([3, 1], [3, 0]) == [3, 0]
+    xs = [(2, 1), (1, 2), (1, 1)]
+    xs.sort()
+    assert xs == [(1, 1), (1, 2), (2, 1)]
+
+i = 0
+while i < 80:
+    check()
+    _ = [0] * 32
+    i = i + 1
+"#,
+        "<list_richcompare_gc_rooting>",
+        "list richcompare/sort box-root checks",
+        "list richcompare/sort GC rooting program failed",
     );
 }
 
@@ -1777,6 +1997,803 @@ while i < 40:
     );
 }
 
+/// Builtin iterator `next_w` arms hold the yielded item (and the iterator
+/// itself) across a collecting predicate / `is_true` / `append`. A young
+/// element that moves during that call must be reloaded from the shadow stack
+/// before it is returned and stored. Covers takewhile / dropwhile /
+/// filterfalse plus the other callback-style arms that share the hole.
+#[test]
+fn iterator_next_w_operands_survive_allocating_predicates() {
+    run_on_worker(
+        r#"
+from itertools import (
+    takewhile, dropwhile, filterfalse, cycle, accumulate, chain, compress,
+    starmap, zip_longest,
+)
+
+class Young:
+    def __init__(self, v):
+        self.v = v
+    def __bool__(self):
+        junk = [0] * 16
+        return self.v != 0
+    def __eq__(self, other):
+        junk = [0] * 16
+        return isinstance(other, Young) and self.v == other.v
+
+def allocating_pred(x):
+    junk = [0] * 32
+    return x.v < 8
+
+def allocating_odd(x):
+    junk = [0] * 32
+    return x.v % 2 == 0
+
+def allocating_add(a, b):
+    junk = [0] * 16
+    return Young(a.v + b.v)
+
+def drain(it):
+    out = []
+    while True:
+        try:
+            out.append(next(it))
+        except StopIteration:
+            return out
+
+i = 0
+while i < 40:
+    src = [Young(j) for j in range(12)]
+    tw = drain(takewhile(allocating_pred, src))
+    assert [x.v for x in tw] == [0, 1, 2, 3, 4, 5, 6, 7], [x.v for x in tw]
+
+    src = [Young(j) for j in range(12)]
+    dw = drain(dropwhile(allocating_pred, src))
+    assert [x.v for x in dw] == [8, 9, 10, 11], [x.v for x in dw]
+
+    src = [Young(j) for j in range(8)]
+    ff = drain(filterfalse(allocating_odd, src))
+    assert [x.v for x in ff] == [1, 3, 5, 7], [x.v for x in ff]
+
+    src = [Young(j) for j in range(6)]
+    fl = drain(filter(allocating_odd, src))
+    assert [x.v for x in fl] == [0, 2, 4], [x.v for x in fl]
+
+    src = [Young(j) for j in range(4)]
+    en = drain(enumerate(src))
+    assert [(idx, x.v) for idx, x in en] == [(0, 0), (1, 1), (2, 2), (3, 3)], [
+        (idx, x.v) for idx, x in en
+    ]
+
+    src = [Young(j) for j in range(3)]
+    cy = cycle(src)
+    got = []
+    k = 0
+    while k < 7:
+        got.append(next(cy).v)
+        k += 1
+    assert got == [0, 1, 2, 0, 1, 2, 0], got
+
+    n = [0]
+    def counting():
+        junk = [0] * 16
+        n[0] += 1
+        return Young(n[0])
+    sentinel = Young(4)
+    ci = drain(iter(counting, sentinel))
+    assert [x.v for x in ci] == [1, 2, 3], [x.v for x in ci]
+
+    src = [Young(j) for j in range(1, 5)]
+    ac = drain(accumulate(src, allocating_add))
+    assert [x.v for x in ac] == [1, 3, 6, 10], [x.v for x in ac]
+
+    z = drain(zip([Young(1)], [Young(2), Young(3)]))
+    assert len(z) == 1 and z[0][0].v == 1 and z[0][1].v == 2
+
+    z1 = drain(zip([Young(9)]))
+    assert len(z1) == 1 and z1[0][0].v == 9
+
+    ch = drain(chain([Young(1), Young(2)], [Young(3)]))
+    assert [x.v for x in ch] == [1, 2, 3], [x.v for x in ch]
+
+    co = drain(compress([Young(1), Young(2), Young(3)], [Young(1), Young(0), Young(1)]))
+    assert [x.v for x in co] == [1, 3], [x.v for x in co]
+
+    sm = drain(starmap(allocating_add, [(Young(1), Young(2)), (Young(3), Young(4))]))
+    assert [x.v for x in sm] == [3, 7], [x.v for x in sm]
+
+    zl = drain(zip_longest([Young(1)], [Young(2), Young(3)], fillvalue=Young(0)))
+    assert [tuple(x.v for x in t) for t in zl] == [(1, 2), (0, 3)]
+
+    junk = [Young(i) for _ in range(32)]
+    i += 1
+"#,
+        "<iterator_next_w_gc_rooting>",
+        "iterator next_w callback-root checks",
+        "iterator next_w operands did not survive allocating predicates",
+    );
+}
+
+/// `_k_mul` / `_x_mul` allocate the result digit array while the operand
+/// handles still hold `_digits` by value. Those edges have to live on
+/// owner-root slots across that malloc, otherwise a later pin publishes the
+/// from-space address (`minor_root` GC BUG) or `_normalize` reads zeros and
+/// the product collapses to 0.
+#[test]
+fn karatsuba_mul_keeps_operand_digits_across_collecting_allocs() {
+    const CHILD: &str = "PYRE_KARATSUBA_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "karatsuba_mul_keeps_operand_digits_across_collecting_allocs",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated karatsuba GC-root regression");
+        assert!(
+            output.status.success(),
+            "karatsuba mul/pow lost a digit array across a collecting alloc:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+i = 0
+while i < 8:
+    x = 10 ** 800
+    assert x != 0
+    assert str(x) == "1" + "0" * 800
+    y = (10 ** 40) * (10 ** 40)
+    assert y == 10 ** 80
+    junk = [0] * 32
+    i = i + 1
+"#,
+        "<karatsuba_mul_gc_rooting>",
+        "karatsuba operand-digit roots",
+        "karatsuba operands did not survive collecting digit allocs",
+    );
+}
+
+/// `compiling.py compile` reloads `w_source` after `source_as_str` / the
+/// AST type probe collect. The native path imports `_ast` for that probe,
+/// so the source/filename/mode locals have to live on slots or
+/// `isinstance_w` reads a from-space word (address 0x2).
+#[test]
+fn compile_keeps_source_across_ast_import() {
+    const CHILD: &str = "PYRE_COMPILE_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "compile_keeps_source_across_ast_import",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated compile GC-root regression");
+        assert!(
+            output.status.success(),
+            "compile() lost its source across a collecting _ast import:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+src = "x = 1\n"
+i = 0
+while i < 8:
+    junk = [0] * 64
+    code = compile(src, "<stress>", "exec")
+    ns = {}
+    exec(code, ns)
+    assert ns["x"] == 1
+    try:
+        compile("if:\n", "<bad>", "exec")
+        raise AssertionError("expected SyntaxError")
+    except SyntaxError as e:
+        assert e.lineno == 1
+    i = i + 1
+"#,
+        "<compile_source_gc_rooting>",
+        "compile source roots",
+        "compile() source did not survive collecting _ast import",
+    );
+}
+
+/// `functional.py W_Range.descr_eq` runs `space.eq_w` on length / start /
+/// step, and `rbigint.py fromint` allocates Digits. The two range objects
+/// and their field pointers have to live on slots across those mallocs.
+#[test]
+fn range_eq_keeps_operands_across_collecting_fromint() {
+    const CHILD: &str = "PYRE_RANGE_EQ_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "range_eq_keeps_operands_across_collecting_fromint",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated range-eq GC-root regression");
+        assert!(
+            output.status.success(),
+            "range == lost an operand across a collecting fromint:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+i = 0
+while i < 8:
+    junk = [0] * 64
+    a = range(2, 10, 3)
+    b = range(2, 10, 3)
+    assert a == b
+    c = range(0, 10 ** 40, 1)
+    d = range(0, 10 ** 40, 1)
+    assert c == d
+    assert range(1, 5) != range(1, 6)
+    i = i + 1
+"#,
+        "<range_eq_gc_rooting>",
+        "range eq roots",
+        "range == operands did not survive collecting fromint",
+    );
+}
+
+/// `typeobject.py W_TypeObject.ready` allocates a weakref per base, and
+/// `__build_class__` holds the `__classcell__` across that plus
+/// `__set_name__`. Without those slots, `super()` in a method reads an
+/// empty cell (`NameError: __class__`) or `w_type_ready` walks poison.
+#[test]
+fn classcell_survives_ready_weakref_alloc() {
+    const CHILD: &str = "PYRE_CLASSCELL_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "classcell_survives_ready_weakref_alloc",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated classcell GC-root regression");
+        assert!(
+            output.status.success(),
+            "classcell / type.ready lost a livevar across weakref alloc:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+i = 0
+while i < 8:
+    junk = [0] * 64
+    class Meta(type):
+        def __new__(mcs, name, bases, ns):
+            return super().__new__(mcs, name, bases, ns)
+    class C(metaclass=Meta):
+        def ident(self):
+            return super() is not None
+    assert C().ident() is True
+    i = i + 1
+"#,
+        "<classcell_gc_rooting>",
+        "classcell roots",
+        "classcell did not survive type.ready weakref alloc",
+    );
+}
+
+/// Host `RBigInt` is a by-value `{_digits,_size}` handle. Boxing
+/// (`W_LongObject(num)`), mixed long/int arithmetic, 3-arg `pow` inverse,
+/// `chr`, `slice.indices`, and `math.isqrt` all allocate digits while a
+/// handle is still live; those edges have to sit on owner-root slots and
+/// be re-read before the store into a new payload.
+#[test]
+fn rbigint_handles_survive_boxing_and_digit_allocs() {
+    const CHILD: &str = "PYRE_RBIGINT_HANDLE_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rbigint_handles_survive_boxing_and_digit_allocs",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated rbigint-handle GC-root regression");
+        assert!(
+            output.status.success(),
+            "rbigint handle lost _digits across a collecting alloc:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+import math
+i = 0
+while i < 8:
+    junk = [0] * 32
+    x = 10 ** 80 + 7
+    y = x + 3
+    assert y - x == 3
+    assert x * 2 == x + x
+    assert pow(5, -1, 13) == 8
+    assert pow(3, 4, -8) == -7
+    i = 0
+    while i < 20:
+        junk = [0] * 32
+        assert pow(i % 7, 13, 1000) == pow(i % 7, 13) % 1000
+        i = i + 1
+    s = "1"
+    i = 0
+    while i < 40:
+        junk = [0] * 32
+        s = s + "9"
+        n = int(s)
+        assert str(n) == s
+        i = i + 1
+    assert chr(0x10ffff) == "\U0010ffff"
+    assert slice(1, 10, 2).indices(20) == (1, 10, 2)
+    root = math.isqrt(x)
+    assert root * root <= x < (root + 1) * (root + 1)
+    i = i + 1
+"#,
+        "<rbigint_handle_gc_rooting>",
+        "rbigint handle roots",
+        "rbigint handles did not survive boxing / digit allocs",
+    );
+}
+
+/// `_x_add`/`_x_mul` fill used to treat a stack handle address as a GC
+/// livevar. After a collecting digit malloc the next `pow`/`isqrt`/`divmod`
+/// step then read a from-space `_digits` (poisoned size / exponent) and
+/// either looped in GC or returned a wrong value.
+#[test]
+fn rbigint_pow_isqrt_divmod_survive_tiny_nursery() {
+    const CHILD: &str = "PYRE_RBIGINT_POW_ISQRT_DIVMOD_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rbigint_pow_isqrt_divmod_survive_tiny_nursery",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated pow/isqrt/divmod GC-root regression");
+        assert!(
+            output.status.success(),
+            "pow/isqrt/divmod lost a handle across a collecting alloc:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+import math
+BIG = (1 << 200) + 12345
+expected_pow3 = 1
+j = 0
+while j < 80:
+    expected_pow3 = expected_pow3 * 3
+    j = j + 1
+i = 0
+while i < 8:
+    junk = [0] * 32
+    assert pow(0, 10 ** 80) == 0
+    assert pow(1, 10 ** 80) == 1
+    assert pow(-1, 10 ** 80) == 1
+    assert pow(3, 80) == expected_pow3
+    assert pow(5, 13, 1000) == 125
+    assert pow(3, 40, -8) == -7
+    n = BIG + i
+    q, r = divmod(n, 97 + (i & 7))
+    assert q * (97 + (i & 7)) + r == n
+    q2, r2 = divmod(n, 1000003)
+    assert q2 * 1000003 + r2 == n
+    root = math.isqrt(n)
+    assert root * root <= n < (root + 1) * (root + 1)
+    i = i + 1
+"#,
+        "<rbigint_pow_isqrt_divmod_gc_rooting>",
+        "rbigint pow/isqrt/divmod roots",
+        "pow/isqrt/divmod did not survive collecting digit allocs",
+    );
+}
+
+/// Gateway `args` is a stack copy. `__index__` on a bound can collect, so
+/// the receiver and the other bound have to be shadow-stack slots, not
+/// that copy — same shape as `list_method_pop` / `index_bounds_not_none`.
+#[test]
+fn gateway_index_args_survive_collect() {
+    const CHILD: &str = "PYRE_GATEWAY_INDEX_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "gateway_index_args_survive_collect",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated gateway-index GC-root regression");
+        assert!(
+            output.status.success(),
+            "gateway index args lost a livevar across __index__:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+class Idx:
+    def __init__(self, n):
+        self.n = n
+    def __index__(self):
+        junk = [0] * 64
+        return self.n
+i = 0
+while i < 8:
+    junk = [0] * 32
+    buf = bytearray(b"abcdefgh")
+    assert buf.pop(Idx(2)) == 99
+    text = "abcdefgh" * 4
+    assert text.find("c", Idx(2)) == 2
+    assert text.count("a", Idx(2)) == 3
+    raw = b"abcdefgh" * 4
+    assert raw.find(b"c", Idx(2)) == 2
+    i = i + 1
+"#,
+        "<gateway_index_gc_rooting>",
+        "gateway index roots",
+        "gateway index args did not survive collecting __index__",
+    );
+}
+
+/// Pattern.match/search `pos`/`endpos` run `__index__` after gathering a
+/// buffer subject into fresh bytes. The gateway `args` copy and the
+/// gathered payload have to be shadow-stack slots (`index_bounds_not_none`).
+#[test]
+fn sre_buffer_subject_survives_bound_conversion() {
+    const CHILD: &str = "PYRE_SRE_BUFFER_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sre_buffer_subject_survives_bound_conversion",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated sre-buffer GC-root regression");
+        assert!(
+            output.status.success(),
+            "sre buffer subject lost across collecting __index__:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+import re
+class Idx:
+    def __init__(self, n):
+        self.n = n
+    def __index__(self):
+        junk = [0] * 64
+        return self.n
+i = 0
+while i < 8:
+    junk = [0] * 32
+    data = bytearray(b"ab12cd34")
+    found = re.compile(rb"\d+").search(memoryview(data), Idx(0), Idx(len(data)))
+    assert found is not None and found.group() == b"12"
+    i = i + 1
+"#,
+        "<sre_buffer_gc_rooting>",
+        "sre buffer subject roots",
+        "sre buffer subject did not survive collecting __index__",
+    );
+}
+
+/// `W_Range.descr_getitem` / `_compute_slice`: `fromint` of length and
+/// slice bounds collect, so the range, the slice, and start/stop/step
+/// field pointers have to be shadow-stack slots (`functional.py
+/// _compute_item` / `_compute_slice`).
+#[test]
+fn range_getitem_slice_survives_fromint() {
+    const CHILD: &str = "PYRE_RANGE_GETITEM_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "range_getitem_slice_survives_fromint",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated range-getitem GC-root regression");
+        assert!(
+            output.status.success(),
+            "range getitem/slice lost a livevar across fromint:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+class Idx:
+    def __init__(self, n):
+        self.n = n
+    def __index__(self):
+        junk = [0] * 64
+        return self.n
+i = 0
+while i < 8:
+    junk = [0] * 32
+    r = range(20)
+    assert r[Idx(7)] == 7
+    assert list(r[Idx(2):Idx(10):Idx(2)]) == [2, 4, 6, 8]
+    i = i + 1
+"#,
+        "<range_getitem_gc_rooting>",
+        "range getitem roots",
+        "range getitem/slice did not survive collecting fromint",
+    );
+}
+
+/// `unicode_decode_error` mints encoding/object/reason then allocates the
+/// exception. `RootedItems::take` copies those slots; stores after that
+/// malloc have to re-read them (`W_UnicodeDecodeError.descr_init`).
+#[test]
+fn unicode_decode_error_fields_survive_wrapper_alloc() {
+    const CHILD: &str = "PYRE_UNICODE_DECODE_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unicode_decode_error_fields_survive_wrapper_alloc",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated unicode-decode GC-root regression");
+        assert!(
+            output.status.success(),
+            "UnicodeDecodeError fields lost across wrapper malloc:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+i = 0
+while i < 8:
+    junk = [0] * 32
+    try:
+        b"\xff".decode("utf-8")
+    except UnicodeDecodeError as e:
+        s = str(e)
+        assert "utf-8" in s
+        assert e.encoding == "utf-8"
+    i = i + 1
+"#,
+        "<unicode_decode_gc_rooting>",
+        "unicode decode error roots",
+        "UnicodeDecodeError fields did not survive wrapper malloc",
+    );
+}
+
+/// `build_class` holds the metaclass across `__prepare__` / getattr / call.
+/// A callee pin does not rewrite the caller's natives.
+#[test]
+fn build_class_metaclass_survives_prepare() {
+    const CHILD: &str = "PYRE_BUILD_CLASS_METACLASS_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "build_class_metaclass_survives_prepare",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated build-class metaclass GC-root regression");
+        assert!(
+            output.status.success(),
+            "metaclass lost across __prepare__:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+class Prepare(type):
+    @classmethod
+    def __prepare__(mcls, name, bases, **kwds):
+        junk = [0] * 64
+        return dict(prepared=True)
+    def __new__(mcls, name, bases, ns, **kwds):
+        junk = [0] * 64
+        return super().__new__(mcls, name, bases, ns)
+class Built(metaclass=Prepare):
+    seen = prepared
+assert Built.seen is True
+"#,
+        "<build_class_metaclass_gc_rooting>",
+        "build_class metaclass roots",
+        "metaclass did not survive collecting __prepare__",
+    );
+}
+
+/// OSError construction mints the wrapper then `args_new`; the exception
+/// must be reloaded from its slot before `w_exception_set_args`.
+#[test]
+fn os_error_args_survive_wrapper_alloc() {
+    const CHILD: &str = "PYRE_OS_ERROR_ARGS_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "os_error_args_survive_wrapper_alloc",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated OSError GC-root regression");
+        assert!(
+            output.status.success(),
+            "OSError args lost across wrapper malloc:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+i = 0
+while i < 8:
+    junk = [0] * 32
+    try:
+        raise OSError(2, "nope", "file")
+    except OSError as e:
+        assert e.errno == 2
+        assert e.strerror == "nope"
+        assert e.filename == "file"
+    i = i + 1
+"#,
+        "<os_error_gc_rooting>",
+        "OSError args roots",
+        "OSError fields did not survive wrapper malloc",
+    );
+}
+
+/// `W_Range.descr_new` stores `space.index` of each bound. A bignum stop
+/// is already an `int` (`W_LongObject`), so the range must keep that ref.
+#[test]
+fn range_keeps_original_long_bound() {
+    const CHILD: &str = "PYRE_RANGE_LONG_BOUND_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "range_keeps_original_long_bound", "--nocapture"])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated range long-bound identity regression");
+        assert!(
+            output.status.success(),
+            "range lost the original long bound:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+i = 2 ** 64
+j = 0
+while j < 8:
+    junk = [0] * 32
+    r = range(i)
+    assert r.stop is i
+    j = j + 1
+"#,
+        "<range_long_bound_identity>",
+        "range long bound identity",
+        "range(i).stop is not i after a collecting alloc",
+    );
+}
+
+/// Marshal of a tuple constant converts each element through
+/// `obj_to_bigint`, which allocates digit arrays and can collect. The
+/// tuple (and nested tuples) must be reloaded from the shadow stack
+/// between those conversions.
+#[test]
+fn marshal_tuple_constants_survive_collecting_int_conversion() {
+    const CHILD: &str = "PYRE_OBJ_TO_CONSTANT_DATA_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "marshal_tuple_constants_survive_collecting_int_conversion",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "4096")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated obj_to_constant_data GC-root regression");
+        assert!(
+            output.status.success(),
+            "tuple constant conversion lost its container:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+import marshal
+T = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, (11, 12), 13)
+src = compile("x = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, (11, 12), 13)", "<t>", "exec")
+payload = marshal.dumps(src)
+i = 0
+while i < 16:
+    code = marshal.loads(payload)
+    assert T in code.co_consts
+    i = i + 1
+"#,
+        "<obj_to_constant_data_tuple>",
+        "obj_to_constant_data tuple roots",
+        "marshal.loads lost a tuple constant across a collecting int conversion",
+    );
+}
+
 /// `virtualizable.py` makes `TOKEN_TRACING_RESCALL` the address of a
 /// prebuilt GC object, so the sentinel has to belong to the heap that is
 /// current when a traced slot holds it. `reset_gc_fresh_for_test` builds a
@@ -1818,4 +2835,460 @@ fn tracing_sentinel_is_reminted_for_a_rebuilt_heap() {
         })
         .expect("spawn worker thread");
     handle.join().expect("worker thread panicked");
+}
+
+/// `setobject.py` `W_BaseSetObject.clear` installs a fresh storage box and
+/// leaves `d = self.unerase(w_set.sstorage)` iterating the detached one.
+/// Young keys in that box are reachable only through the box's own trace
+/// plus the write barrier on the box. A minor that runs inside the probing
+/// `__eq__` used to move those keys and the next compare read the corpse.
+#[test]
+fn set_update_traces_storage_orphaned_by_eq_clear() {
+    const CHILD: &str = "PYRE_SET_ORPHAN_STORAGE_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "set_update_traces_storage_orphaned_by_eq_clear",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYRE_JIT", "0")
+            .env("PYPY_GC_NURSERY", "1048576")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated set orphan-storage regression");
+        assert!(
+            output.status.success(),
+            "set update lost a key in a storage box detached by clear:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+class Bad:
+    def __init__(self, n):
+        self.n = n
+    def __hash__(self):
+        return 0
+    def __eq__(self, other):
+        global armed, left, junk
+        if armed and isinstance(other, Bad):
+            armed = False
+            left.clear()
+            i = 0
+            while i < 4000:
+                junk.append([i, i, i])
+                i += 1
+        return self is other
+
+armed = False
+junk = []
+left = set()
+right = set()
+i = 0
+while i < 30:
+    left.add(Bad(i))
+    right.add(Bad(1000 + i))
+    i += 1
+armed = True
+left |= right
+assert len(left) == 0, len(left)
+assert len(right) == 30, len(right)
+"#,
+        "<set_orphan_storage>",
+        "set storage box orphaned by clear",
+        "set update crashed or kept elements after clear inside __eq__",
+    );
+}
+
+/// A builtin `Function` materialises `__name__` on first read and stores the
+/// fresh string into itself. Held only by a managed list (the original a
+/// `mock.patch` saves), no raw-root walk reaches the builtin, so only the
+/// barrier on the box can record that store. Before the builtin carried the
+/// prebuilt header, the next minor left `w_name` naming a moved string.
+#[test]
+fn builtin_name_cached_on_a_builtin_held_only_by_a_list() {
+    const CHILD: &str = "PYRE_BUILTIN_NAME_CACHE_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "builtin_name_cached_on_a_builtin_held_only_by_a_list",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYRE_JIT", "0")
+            .env("PYPY_GC_NURSERY", "1048576")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated builtin __name__ cache regression");
+        assert!(
+            output.status.success(),
+            "a builtin's cached __name__ went stale after a minor:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+import math
+holder = [math.gcd]
+math.gcd = None
+name = holder[0].__name__
+del name
+junk = []
+i = 0
+while i < 20000:
+    junk.append([i, i])
+    i += 1
+junk = None
+i = 0
+while i < 5:
+    assert holder[0].__name__ == "gcd", holder[0].__name__
+    junk = [[j] for j in range(20000)]
+    i += 1
+"#,
+        "builtin_name_cache.py",
+        "builtin __name__ cache checks",
+        "a builtin's cached __name__ went stale after a minor",
+    );
+}
+
+/// An `rbigint` handle keeps its digit array by value, so a handle read after
+/// a call that allocates digits must be rooted across it. `left.mul(&w5pow(..))`
+/// derefs its receiver before the argument runs; `divmod(-a, b)` keeps `q`
+/// and `r` across `invert`; the `i64::MIN` operand fallbacks build it with
+/// `fromint` after `self` is read. Each read a moved digit array.
+#[test]
+fn rbigint_handles_stay_rooted_across_digit_allocations() {
+    const CHILD: &str = "PYRE_RBIGINT_ROOTS_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rbigint_handles_stay_rooted_across_digit_allocations",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYRE_JIT", "0")
+            .env("PYPY_GC_NURSERY", "1048576")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated rbigint rooting regression");
+        assert!(
+            output.status.success(),
+            "an rbigint handle read a moved digit array:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+import sys
+sys.set_int_max_str_digits(0)
+digits = '8' * 40000
+n = int(digits)
+assert n % 1000 == 888
+assert str(n) == digits
+m = -9223372036854775808
+x = 10 ** 400 + 12345
+i = 0
+while i < 200:
+    assert x * m == -(x << 63)
+    assert x + m == x - (1 << 63)
+    assert (x & m) == x - (x % (1 << 63))
+    assert (x | m) == -((1 << 63) - (x % (1 << 63)))
+    assert x % m == -((1 << 63) - x % (1 << 63))
+    i += 1
+a = 3 ** 6000 + 7
+b = 7 ** 1100 + 1
+j = 0
+while j < 20:
+    q, r = divmod(-a, b)
+    assert q * b + r == -a and 0 <= r < b
+    j += 1
+"#,
+        "rbigint_roots.py",
+        "rbigint rooting checks",
+        "an rbigint handle read a moved digit array",
+    );
+}
+
+/// `f_generator_nowref` is the strong edge `initialize_as_generator` stores
+/// when `rweakref` is off. `get_generator` reads that slot. Dropping every
+/// other strong reference and collecting must forward it; a skipped slot
+/// still names the nursery address, which `MAJIT_GC_NURSERY_POISON` fills
+/// with `0xAA`.
+#[test]
+fn generator_backlink_survives_minor_after_external_refs_drop() {
+    const CHILD: &str = "PYRE_GENERATOR_BACKLINK_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "generator_backlink_survives_minor_after_external_refs_drop",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .env("MAJIT_GC_NURSERY_POISON", "1")
+            .output()
+            .expect("run isolated generator-backlink regression");
+        assert!(
+            output.status.success(),
+            "frame backlink read freed generator memory:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+import gc
+
+def g():
+    yield 1
+
+gen = g()
+frame = gen.gi_frame
+frames = [frame]
+del gen
+del frame
+gc.collect()
+frame = frames[0]
+owner = frame.f_generator
+assert owner is not None, owner
+assert owner.gi_frame is frame
+assert owner.gi_code.co_name == "g"
+"#,
+        "generator_backlink.py",
+        "generator backlink",
+        "f_generator must follow the generator across a minor collection",
+    );
+}
+
+/// `W_Property.init` copies the new property into a raw local, then
+/// `space.findattr(w_fget, '__doc__')` runs Python. A getter whose
+/// `__getattribute__` collects forwards the caller's root and leaves that
+/// local in from-space; the following doc store must reload it.
+#[test]
+fn property_init_doc_reloads_after_getter_getattribute() {
+    const CHILD: &str = "PYRE_PROPERTY_INIT_DOC_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "property_init_doc_reloads_after_getter_getattribute",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .env("MAJIT_GC_NURSERY_POISON", "1")
+            .output()
+            .expect("run isolated property-init doc regression");
+        assert!(
+            output.status.success(),
+            "property init stored __doc__ through a moved property:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+import gc
+
+class Getter:
+    def __getattribute__(self, name):
+        gc.collect()
+        junk = [object() for _ in range(64)]
+        if name == "__doc__":
+            return "captured-doc"
+        return object.__getattribute__(self, name)
+    def __call__(self, obj):
+        return 1
+
+g = Getter()
+p = property(g)
+assert p.__doc__ == "captured-doc", p.__doc__
+assert p.fget is g
+"#,
+        "property_init_doc.py",
+        "property init doc",
+        "property.__init__ must store a getter doc on the live property",
+    );
+}
+
+/// `W_Property.descr_isabstract` calls `space.isabstractmethod_w` on each
+/// accessor. The first call can collect; the next accessor is read from
+/// `self` afterwards.
+#[test]
+fn property_isabstract_reloads_between_accessors() {
+    const CHILD: &str = "PYRE_PROPERTY_ISABSTRACT_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "property_isabstract_reloads_between_accessors",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .env("MAJIT_GC_NURSERY_POISON", "1")
+            .output()
+            .expect("run isolated property-isabstract regression");
+        assert!(
+            output.status.success(),
+            "property.__isabstractmethod__ read a moved property:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+import gc
+
+class Flag:
+    def __init__(self, value):
+        self.value = value
+    def __getattribute__(self, name):
+        gc.collect()
+        junk = [object() for _ in range(40)]
+        if name == "__isabstractmethod__":
+            return object.__getattribute__(self, "value")
+        return object.__getattribute__(self, name)
+
+p = property(Flag(False), Flag(True))
+assert p.__isabstractmethod__ is True
+"#,
+        "property_isabstract.py",
+        "property isabstract",
+        "descr_isabstract must re-read self between accessor probes",
+    );
+}
+
+/// `W_Property._properror` reads `type(w_obj).__qualname__`, then the
+/// property's name. The qualname lookup can collect.
+#[test]
+fn property_no_accessor_reloads_after_qualname() {
+    const CHILD: &str = "PYRE_PROPERTY_NO_ACCESSOR_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "property_no_accessor_reloads_after_qualname",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .env("MAJIT_GC_NURSERY_POISON", "1")
+            .output()
+            .expect("run isolated property-no-accessor regression");
+        assert!(
+            output.status.success(),
+            "missing-accessor error read a moved property:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+import gc
+
+class Meta(type):
+    def __getattribute__(self, name):
+        if name == "__qualname__":
+            gc.collect()
+            junk = [object() for _ in range(40)]
+            return "QualC"
+        return type.__getattribute__(self, name)
+
+class C(metaclass=Meta):
+    pass
+
+p = property()
+try:
+    p.__get__(C())
+except AttributeError as e:
+    msg = str(e)
+    assert "QualC" in msg, msg
+else:
+    raise AssertionError("expected AttributeError")
+"#,
+        "property_no_accessor.py",
+        "property no accessor",
+        "_properror must re-read the property after __qualname__",
+    );
+}
+
+/// `bufferwrapper_releasebuf`, native-subclass arm: the Python
+/// `__release_buffer__` override runs with the returned memoryview as a
+/// livevar, then the native backing is released through that view. An
+/// override that collects forwards the view; the release must read it back
+/// from its root rather than through the pre-callback address, which
+/// `MAJIT_GC_NURSERY_POISON` fills with `0xAA`.
+#[test]
+fn memoryview_buffer_wrapper_release_reloads_after_override() {
+    const CHILD: &str = "PYRE_MEMORYVIEW_WRAPPER_RELEASE_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "memoryview_buffer_wrapper_release_reloads_after_override",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .env("MAJIT_GC_NURSERY_POISON", "1")
+            .output()
+            .expect("run isolated memoryview wrapper-release regression");
+        assert!(
+            output.status.success(),
+            "buffer-wrapper release read a moved memoryview:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+import gc
+
+released = []
+
+class B(bytearray):
+    def __buffer__(self, flags):
+        return super().__buffer__(flags)
+    def __release_buffer__(self, view):
+        released.append(view.readonly)
+        gc.collect()
+        junk = [object() for _ in range(40)]
+
+i = 0
+while i < 20:
+    b = B(b"abcd")
+    m = memoryview(b)
+    assert m[0] == 97
+    m.release()
+    b.append(101)
+    assert bytes(b) == b"abcde", bytes(b)
+    i += 1
+assert released
+"#,
+        "memoryview_wrapper_release.py",
+        "memoryview wrapper release",
+        "bufferwrapper_releasebuf must re-read the view after __release_buffer__",
+    );
 }

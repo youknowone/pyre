@@ -5592,6 +5592,34 @@ impl TraceCtx {
             );
         }
         if nonstandard {
+            // `_do_getarrayitem_gc_any` returns the heapcache box on a hit and
+            // records nothing. A fresh `GetarrayitemGcR` is what
+            // `optimize_getarrayitem_gc` folds onto the virtual array's entry
+            // item, discarding the store the cache is holding.
+            let record_descr = self.vable_array_record_descr(&fdescr);
+            if let Some(base) = self.heapcache_getfield_cached(vable_opref, record_descr.index())
+                && let Some(elem) = self.heapcache_getarrayitem(base, index, adescr.index())
+            {
+                self.profiler().count_ops(
+                    OpCode::GetarrayitemGcR,
+                    crate::pyjitpl::counters::HEAPCACHED_OPS,
+                );
+                let cached = self.box_value(elem);
+                // `_do_getarrayitem_gc_any` sanity check: the current array
+                // value must be what the cache thinks it is.
+                if let Some(Value::Ref(base_ref)) = self.concrete_of_opref(base)
+                    && let Some(base_ptr) = live_gc_ptr(base_ref)
+                    && let Some(cached) = cached
+                {
+                    let resvalue =
+                        self.array_sanity_load(base_ptr, index_runtime_value, &adescr, Type::Ref);
+                    assert!(
+                        resvalue.is_none_or(|v| v == cached),
+                        "assertion in GETARRAYITEM_GC_R failed: {resvalue:?} != {cached:?}"
+                    );
+                }
+                return (elem, cached);
+            }
             let fwd = self.nonstandard_vable_element_concrete(
                 vable_opref,
                 &fdescr,
@@ -7693,6 +7721,51 @@ mod tests {
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].opcode, OpCode::GetarrayitemGcI);
+    }
+
+    #[test]
+    fn nonstandard_getarrayitem_after_store_does_not_reread() {
+        let info = make_test_vable_info_with_array();
+        let fd = info.array_pointer_field_descr(0);
+        let adesc = info.array_item_descr(0);
+        let mut recorder = Trace::new();
+        let portal = recorder.record_input_arg(Type::Ref);
+        let callee = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let stored = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            portal,
+            ph(Type::Ref),
+            &[box_pc, stored],
+            &[ph(Type::Int), ph(Type::Ref)],
+            &[1],
+        );
+        let index = ctx.const_int(0);
+        ctx.vable_setarrayitem_checked(
+            true,
+            0,
+            callee,
+            index,
+            0,
+            fd.clone(),
+            adesc.clone(),
+            stored,
+            ph(Type::Ref),
+            false,
+        );
+        let (got, _) = ctx.vable_getarrayitem_ref_checked(true, 0, callee, index, 0, fd, adesc);
+        assert_eq!(got, stored);
+        let ops = take_all_ops(ctx);
+        assert!(
+            ops.iter().all(|op| op.opcode != OpCode::GetarrayitemGcR),
+            "heapcache hit must not record GETARRAYITEM_GC_R: {ops:?}"
+        );
     }
 
     #[test]

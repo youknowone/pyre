@@ -1676,6 +1676,58 @@ pub unsafe fn is_ellipsis(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &ELLIPSIS_TYPE) }
 }
 
+/// `W_IntObject.is_w` / `W_AbstractIntObject.is_w` (intobject.py).
+///
+/// `ObjSpace.is_w` calls `w_two.is_w(w_one)`. A machine int compares
+/// `intval` with `int_w` of the other operand; `OverflowError` from a long
+/// that does not fit means they are not identical. A long has no override,
+/// so it compares `bigint_w` of both. A machine int equals a long exactly
+/// when `rbigint.int_eq` says so, and that comparison does not allocate
+/// while the machine word is inside `int_in_valid_range`. `i64::MIN` is
+/// the one value outside that range; the bigint built for it is rooted
+/// across, and the long is reloaded before the compare.
+///
+/// Two machine ints never build a bigint. `W_LongObject` shares the `int`
+/// `w_class`, so `is_exact_type(..., INT_TYPE)` is true for it; the long
+/// is told apart by `is_long` (`LONG_TYPE`), not by that gate.
+fn abstract_int_is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
+    unsafe {
+        let one_long = int_operand_is_long(w_one);
+        let two_long = int_operand_is_long(w_two);
+        if !one_long && !two_long {
+            return crate::intobject::w_int_get_value(w_one)
+                == crate::intobject::w_int_get_value(w_two);
+        }
+        if one_long && two_long {
+            return crate::longobject::w_long_get_value(w_one)
+                .eq(crate::longobject::w_long_get_value(w_two));
+        }
+        let (long_obj, intval) = if one_long {
+            (w_one, crate::intobject::w_int_get_value(w_two))
+        } else {
+            (w_two, crate::intobject::w_int_get_value(w_one))
+        };
+        if majit_rlib::rbigint::int_in_valid_range(intval) {
+            return crate::longobject::w_long_get_value(long_obj).int_eq(intval);
+        }
+        let _roots = crate::gc_roots::push_roots();
+        let long_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(long_obj);
+        let built = majit_rlib::rbigint::RBigInt::from(intval);
+        let long_obj = crate::gc_roots::shadow_stack_get(long_slot);
+        crate::longobject::w_long_get_value(long_obj).eq(&built)
+    }
+}
+
+/// A `W_LongObject` among the exact-`int` pair. A tagged immediate is a
+/// machine int and must not be read as a header.
+fn int_operand_is_long(obj: PyObjectRef) -> bool {
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return false;
+    }
+    unsafe { is_long(obj) }
+}
+
 /// `baseobjspace.py` `ObjSpace.is_w`. Dispatches the per-type `is_w`
 /// overrides `W_AbstractIntObject.is_w`, `W_BoolObject.is_w`,
 /// `W_FloatObject.is_w`, `W_AbstractTupleObject.is_w`,
@@ -1704,11 +1756,7 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         if crate::pyobject::is_exact_type(w_one, &crate::pyobject::INT_TYPE)
             && crate::pyobject::is_exact_type(w_two, &crate::pyobject::INT_TYPE)
         {
-            // `space.bigint_w(self).eq(space.bigint_w(w_other))`
-            // (intobject.py `W_AbstractIntObject.is_w`). A `W_LongObject` stores a `BigInt`
-            // pointer, so it must be read as a bigint, not as an i64.
-            return crate::functional::range_obj_to_bigint(w_one)
-                == crate::functional::range_obj_to_bigint(w_two);
+            return abstract_int_is_w(w_one, w_two);
         }
         // `W_FloatObject.is_w` (floatobject.py): two plain
         // `float`s are identical when their bit patterns are equal

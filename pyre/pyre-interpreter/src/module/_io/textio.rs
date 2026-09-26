@@ -4,7 +4,7 @@
 //! `W_TextIOWrapper`.  In particular, the buffer and the
 //! ZERO/OK/DETACHED state are not instance-dict side data.
 
-use majit_rlib::rbigint::RBigInt;
+use majit_rlib::rbigint::{RBigInt, RBigIntGcRoot};
 use pyre_object::*;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
@@ -61,30 +61,28 @@ impl PositionCookie {
     }
 
     fn pack(&self) -> RBigInt {
-        let mut result = RBigInt::from(self.start_pos);
-        result = result.or_(
-            &RBigInt::from(self.dec_flags)
-                .lshift(Self::BITS as i64)
-                .expect("native-word shift"),
-        );
-        result = result.or_(
-            &RBigInt::from(self.bytes_to_feed)
-                .lshift((Self::BITS * 2) as i64)
-                .expect("native-word shift"),
-        );
-        result = result.or_(
-            &RBigInt::from(self.chars_to_skip)
-                .lshift((Self::BITS * 3) as i64)
-                .expect("native-word shift"),
-        );
+        // Each shifted term collects, so it is computed before `result` is
+        // read for the `or_`.
+        let mut result = RBigIntGcRoot::new(RBigInt::from(self.start_pos));
+        let term = RBigInt::from(self.dec_flags)
+            .lshift(Self::BITS as i64)
+            .expect("native-word shift");
+        result.set(result.or_(&term));
+        let term = RBigInt::from(self.bytes_to_feed)
+            .lshift((Self::BITS * 2) as i64)
+            .expect("native-word shift");
+        result.set(result.or_(&term));
+        let term = RBigInt::from(self.chars_to_skip)
+            .lshift((Self::BITS * 3) as i64)
+            .expect("native-word shift");
+        result.set(result.or_(&term));
         if self.need_eof {
-            result = result.or_(
-                &RBigInt::one()
-                    .lshift((Self::BITS * 4) as i64)
-                    .expect("native-word shift"),
-            );
+            let term = RBigInt::one()
+                .lshift((Self::BITS * 4) as i64)
+                .expect("native-word shift");
+            result.set(result.or_(&term));
         }
-        result
+        result.translated_alias()
     }
 
     fn to_object(&self) -> PyObjectRef {
@@ -1678,16 +1676,18 @@ impl W_TextIOWrapper {
             if position.tobool() {
                 return Err(super::unsupported("can't do nonzero end-relative seeks"));
             }
+            // `flush`, `decoder.reset()` and `encoder_reset` call Python, so
+            // `w_position` and the buffer's `seek` result are rooted across
+            // them and read back from their slots.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let pos_slot = pyre_object::gc_roots::pin_roots(&[w_position]);
             super::call_method_result(self.self_obj(), "flush", &[])?;
             self.decoded.reset();
             self.snapshot = None;
             if !self.w_decoder.is_null() {
                 super::call_method_result(self.w_decoder, "reset", &[])?;
             }
-            let pos_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_position);
-            let whence_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_int_new(whence));
+            let whence_slot = pyre_object::gc_roots::pin_roots(&[w_int_new(whence)]);
             let result = self.call_buffer(
                 "seek",
                 &[
@@ -1695,11 +1695,14 @@ impl W_TextIOWrapper {
                     pyre_object::gc_roots::shadow_stack_get(whence_slot),
                 ],
             )?;
+            let result_slot = pyre_object::gc_roots::pin_roots(&[result]);
             if !self.w_encoder.is_null() {
-                let at_start = crate::builtins::space_index_w(result)? == 0;
+                let at_start = crate::builtins::space_index_w(
+                    pyre_object::gc_roots::shadow_stack_get(result_slot),
+                )? == 0;
                 self.encoder_reset(at_start)?;
             }
-            return Ok(result);
+            return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
         } else if whence != 0 {
             return Err(crate::PyError::value_error(format!(
                 "invalid whence ({whence}, should be 0, 1 or 2)"

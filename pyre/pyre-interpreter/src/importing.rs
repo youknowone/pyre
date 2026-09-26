@@ -634,6 +634,10 @@ pub(crate) struct BuiltinModuleDef {
     /// their historical immortal holder; opt in only after that module's
     /// state and cached references have been audited.
     collectible: bool,
+    /// `space.builtin_modules[name]`: the module built the first time
+    /// `getbuiltinmodule` names it, 0 before. A builtin module does not move,
+    /// and `walk_process_import_roots` marks it.
+    w_mod: usize,
 }
 
 struct ImportRootArea {
@@ -650,7 +654,7 @@ struct ImportRootArea {
 // module's contents until the module is first imported, and (2)
 // evaluating each interpleveldef/appleveldef until the corresponding
 // attribute is first accessed.  Pyre achieves (1) directly: this
-// registry stores `name → init` and `load_builtin_module` runs `init`
+// registry stores `name → init` and `new_builtin_module` runs `init`
 // on demand at first import, never at interpreter startup.  (2) has no
 // counterpart and is deliberately not ported: pyre's interpleveldefs are
 // compile-time `const` / function-pointer expressions (not interp-eval
@@ -671,6 +675,7 @@ pub fn register_builtin_module(
             init,
             startup: None,
             collectible: false,
+            w_mod: 0,
         },
     );
 }
@@ -687,6 +692,7 @@ pub fn register_collectible_builtin_module(
             init,
             startup: None,
             collectible: true,
+            w_mod: 0,
         },
     );
 }
@@ -705,6 +711,7 @@ pub fn register_builtin_module_with_startup(
             init,
             startup: Some(startup),
             collectible: false,
+            w_mod: 0,
         },
     );
 }
@@ -1611,24 +1618,74 @@ unsafe fn untraced_mixed_module_function(value: PyObjectRef) -> bool {
     carrier && !pyre_object::gc_hook::try_gc_owns_object(value as *mut u8)
 }
 
-/// Try to load a builtin module by name.
+/// `baseobjspace.py getbuiltinmodule`.
 ///
-/// PyPy equivalent: `find_module()` → C_BUILTIN path →
-/// `getbuiltinmodule()` → `Module.__init__` + `startup()`.
+/// `Ok(None)` is "no builtin by that name", which upstream raises as a
+/// `SystemError`: pyre's importers screen the name against the registry
+/// first, and `_imp.create_builtin` reports it as `None`.
+pub(crate) fn getbuiltinmodule(
+    name: &str,
+    force_init: bool,
+    reuse: bool,
+    execution_context: *const PyExecutionContext,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    if !force_init {
+        debug_assert!(reuse);
+        if let Some(w_mod) = sys_modules_entry(name) {
+            return Ok(Some(w_mod));
+        }
+    }
+    // If the module is a builtin but not yet imported,
+    // retrieve it and initialize it
+    let Some(w_mod) = builtin_modules_get(name, execution_context)? else {
+        return Ok(None);
+    };
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    let _ = pin_root(w_mod);
+    // Add the module to sys.modules and initialize the module. The
+    // order is important to avoid recursions.
+    if !reuse && unsafe { pyre_object::w_module_startup_called(w_mod) } {
+        // create a copy of the module.  (see issue1514) eventlet
+        // patcher relies on this behaviour.
+        let copy_slot = shadow_stack_len();
+        let _ = pin_root(pyre_object::w_module_new_managed(name));
+        set_sys_module(name, shadow_stack_get(copy_slot));
+        // A startup that raised left no saved dict; `update(None)` raises.
+        let w_initialdict =
+            unsafe { pyre_object::w_module_get_initialdict(shadow_stack_get(mod_slot)) };
+        let w_initialdict = if w_initialdict.is_null() {
+            pyre_object::w_none()
+        } else {
+            w_initialdict
+        };
+        crate::baseobjspace::call_method_result(
+            unsafe { pyre_object::w_module_get_w_dict(shadow_stack_get(copy_slot)) },
+            "update",
+            &[w_initialdict],
+        )?;
+        return Ok(Some(shadow_stack_get(copy_slot)));
+    }
+    set_sys_module(name, shadow_stack_get(mod_slot));
+    mixedmodule_init(name, shadow_stack_get(mod_slot), execution_context)?;
+    Ok(Some(shadow_stack_get(mod_slot)))
+}
+
+/// `space.builtin_modules[name]`.
 ///
-/// PyPy `pypy/objspace/std/dictmultiobject.py` allocates a
-/// `W_ModuleDictObject` for every module via
-/// `allocate_and_init_instance(module=True)`. Pyre mirrors that here:
-/// the initializer writes directly into a rooted, non-moving module dict.
-///
-/// `Ok(None)` is "no builtin by that name"; an `Err` is an initializer that
-/// ran and raised.  A module whose namespace comes from a bundled app-level
-/// source fails the way any module body can -- the source's own imports
-/// resolve through the running `sys.modules`, which the program owns -- and
-/// that belongs to the import which asked for the module, not to the process.
-pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
-    // The registry key outlives the module, which is what lets the sweep below
-    // hand the name to `BuiltinCode.module` without copying it.
+/// The `builtins` entry is `space.builtin`: every frame falls back to the
+/// execution context's module for `LOAD_GLOBAL`, so `import builtins` binds
+/// that one. Every other entry is built by [`new_builtin_module`] the first
+/// time it is named and kept in [`BUILTIN_MODULES`].
+fn builtin_modules_get(
+    name: &str,
+    execution_context: *const PyExecutionContext,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    if name == "builtins" && !execution_context.is_null() {
+        return Ok(Some(unsafe { (*execution_context).get_builtin() }));
+    }
     let (static_name, module_def) = {
         let table = BUILTIN_MODULES.lock();
         let Some((static_name, def)) = table.get_key_value(name) else {
@@ -1636,11 +1693,123 @@ pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, cra
         };
         (*static_name, *def)
     };
+    if module_def.w_mod != 0 {
+        return Ok(Some(module_def.w_mod as PyObjectRef));
+    }
+    let w_mod = new_builtin_module(static_name, module_def)?;
+    // An initializer that named this module again has installed one already,
+    // and that one stays the entry.
+    let mut table = BUILTIN_MODULES.lock();
+    let entry = table
+        .get_mut(static_name)
+        .expect("a registered builtin module stays registered");
+    if entry.w_mod == 0 {
+        entry.w_mod = w_mod as usize;
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    }
+    Ok(Some(entry.w_mod as PyObjectRef))
+}
+
+/// `mixedmodule.py MixedModule.init`: called each time the module is imported
+/// or reloaded.
+fn mixedmodule_init(
+    name: &str,
+    w_mod: PyObjectRef,
+    execution_context: *const PyExecutionContext,
+) -> Result<(), crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    let _ = pin_root(w_mod);
+    let w_initialdict = unsafe { pyre_object::w_module_get_initialdict(w_mod) };
+    if !w_initialdict.is_null() {
+        // the module was already imported.  Refresh its content with
+        // the saved dict.
+        crate::baseobjspace::call_method_result(
+            unsafe { pyre_object::w_module_get_w_dict(shadow_stack_get(mod_slot)) },
+            "update",
+            &[w_initialdict],
+        )?;
+    }
+    if unsafe { pyre_object::w_module_get_initialdict(shadow_stack_get(mod_slot)) }.is_null() {
+        module_init(name, shadow_stack_get(mod_slot), execution_context)?;
+        if unsafe { pyre_object::w_module_get_initialdict(shadow_stack_get(mod_slot)) }.is_null() {
+            save_module_content_for_future_reload(shadow_stack_get(mod_slot))?;
+        }
+    }
+    Ok(())
+}
+
+/// `module.py Module.init`: the first call runs `startup()`.
+fn module_init(
+    name: &str,
+    w_mod: PyObjectRef,
+    execution_context: *const PyExecutionContext,
+) -> Result<(), crate::PyError> {
+    if !unsafe { pyre_object::w_module_startup_called(w_mod) } {
+        unsafe { pyre_object::w_module_set_startup_called(w_mod) };
+        let startup = BUILTIN_MODULES.lock().get(name).and_then(|d| d.startup);
+        if let Some(startup) = startup {
+            startup(w_mod, execution_context)?;
+        }
+    }
+    Ok(())
+}
+
+/// `mixedmodule.py save_module_content_for_future_reload`: save the current
+/// dictionary in `w_initialdict`, for future reloads.
+fn save_module_content_for_future_reload(w_mod: PyObjectRef) -> Result<(), crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    let _ = pin_root(w_mod);
+    let w_initialdict = crate::baseobjspace::call_method_result(
+        unsafe { pyre_object::w_module_get_w_dict(w_mod) },
+        "copy",
+        &[],
+    )?;
+    unsafe { pyre_object::w_module_set_initialdict(shadow_stack_get(mod_slot), w_initialdict) };
+    Ok(())
+}
+
+/// `module.py init_extra_module_attrs`.
+fn init_extra_module_attrs(w_dict: PyObjectRef) {
+    for extra in ["__package__", "__loader__", "__spec__"] {
+        if unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, extra) }.is_none() {
+            crate::module_ns_store(w_dict, extra, pyre_object::w_none());
+        }
+    }
+}
+
+/// `MixedModule.__init__` for a registered builtin, which `install()` puts in
+/// `space.builtin_modules`. It runs the first time [`builtin_modules_get`]
+/// names the module, not when the space is built. The initializer fills the
+/// namespace the way forcing every interpleveldef loader does
+/// (`MixedModule.getdict`), so the module comes back no longer `lazy`.
+///
+/// Every module gets a `W_ModuleDictObject`
+/// (`dictmultiobject.py allocate_and_init_instance(module=True)`), and the
+/// initializer writes directly into that rooted, non-moving dict.
+///
+/// An `Err` is an initializer that ran and raised.  A module whose namespace
+/// comes from a bundled app-level source fails the way any module body can --
+/// the source's own imports resolve through the running `sys.modules`, which
+/// the program owns -- and that belongs to the import which asked for the
+/// module, not to the process.
+fn new_builtin_module(
+    name: &'static str,
+    module_def: BuiltinModuleDef,
+) -> Result<PyObjectRef, crate::PyError> {
     let w_dict = pyre_object::dictmultiobject::w_module_dict_new();
     let _roots = pyre_object::gc_roots::push_roots();
     let save_point = pyre_object::gc_roots::shadow_stack_len();
     let w_dict = pyre_object::gc_roots::pin_root(w_dict);
-    let name_obj = pyre_object::w_str_new_managed(name);
+    // Immortal builtin functions stamp this as `w_module`. A nursery
+    // string in that slot is reached only by `walk_raw_function_roots`,
+    // which clean minors skip, so intern it the way `w(modulename)` does.
+    let name_obj = pyre_object::unicodeobject::intern_str_value(name);
     let _ = pyre_object::gc_roots::pin_root(name_obj);
     // Set __name__ (PyPy: Module.__init__ sets __name__)
     crate::module_ns_store(
@@ -1648,6 +1817,7 @@ pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, cra
         "__name__",
         pyre_object::gc_roots::shadow_stack_get(save_point + 1),
     );
+    init_extra_module_attrs(w_dict);
     // Run module-specific initializer (PyPy: interpleveldefs)
     (module_def.init)(w_dict)?;
     // One flag for the holder and the module object. Before `sys.modules`
@@ -1703,7 +1873,9 @@ pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, cra
             // a registration table already stamped its own functions, so this
             // only reaches the hand-built namespaces. A managed copy shares
             // `func.code`, so this stamps that code when init did not.
-            crate::gateway::with_module(static_name, value);
+            // The registry key outlives the module, which is what lets this
+            // hand the name to `BuiltinCode.module` without copying it.
+            crate::gateway::with_module(name, value);
         }
     }
     // `mixedmodule.py:192-193` — a module def that names no `__doc__` still
@@ -1733,7 +1905,7 @@ pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, cra
             unsafe { crate::function::builtin_function_set_module_obj(value, module) };
         }
     }
-    // `pypy/interpreter/baseobjspace.py:647` installs the self
+    // `baseobjspace.py make_builtins` installs the self
     // reference `space.builtin.w_dict['__builtins__'] = space.builtin`
     // so user code can reach the builtins module through
     // `import builtins; builtins.__builtins__`.  The pyre split
@@ -1745,48 +1917,7 @@ pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, cra
     if name == "builtins" {
         crate::module_ns_store(w_dict, "__builtins__", module);
     }
-    Ok(Some(module))
-}
-
-/// Build a builtin module for `_imp.create_builtin`, then run its `startup`
-/// hook. App-level `module_from_spec` stamps import metadata afterwards
-/// (`_bootstrap.py`), so this entry point must not pre-fill it.
-pub(crate) fn create_builtin_module(
-    name: &str,
-    execution_context: *const PyExecutionContext,
-) -> Result<Option<PyObjectRef>, crate::PyError> {
-    // `import builtins` must resolve to `space.builtin`, the one Module every
-    // frame uses for its LOAD_GLOBAL fallback. Historically a fresh
-    // `load_builtin_module` reran `install_default_builtins`, minted a second
-    // exception hierarchy, and overwrote the name→class registry. The
-    // process-global get-or-mint registry now prevents that identity
-    // clobbering even on another fresh-dictionary path, while this guard still
-    // preserves the builtins Module identity.
-    if name == "builtins" && !execution_context.is_null() {
-        let module = unsafe { (*execution_context).get_builtin() };
-        set_sys_module(name, module);
-        seed_create_builtin_attrs(module);
-        return Ok(Some(module));
-    }
-    let _roots = pyre_object::gc_roots::push_roots();
-    let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    let Some(module) = load_builtin_module(name)? else {
-        return Ok(None);
-    };
-    let _ = pyre_object::gc_roots::pin_root(module);
-    set_sys_module(name, pyre_object::gc_roots::shadow_stack_get(module_slot));
-    let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
-    startup_builtin_module_impl(name, module, execution_context, false)?;
-    seed_create_builtin_attrs(pyre_object::gc_roots::shadow_stack_get(module_slot));
-    Ok(Some(pyre_object::gc_roots::shadow_stack_get(module_slot)))
-}
-
-fn seed_create_builtin_attrs(module: PyObjectRef) {
-    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
-    if !w_dict.is_null() {
-        crate::module_ns_store(w_dict, "__loader__", pyre_object::w_none());
-        crate::module_ns_store(w_dict, "__spec__", pyre_object::w_none());
-    }
+    Ok(module)
 }
 
 /// Set a builtin module's `__spec__`/`__loader__`/`__package__` from the
@@ -2060,36 +2191,6 @@ fn fix_up_source_module_spec(
     _cpathname: Option<&str>,
 ) -> Result<bool, crate::PyError> {
     Ok(false)
-}
-
-fn startup_builtin_module(
-    name: &str,
-    module: PyObjectRef,
-    execution_context: *const PyExecutionContext,
-) -> Result<(), crate::PyError> {
-    startup_builtin_module_impl(name, module, execution_context, true)
-}
-
-fn startup_builtin_module_impl(
-    name: &str,
-    module: PyObjectRef,
-    execution_context: *const PyExecutionContext,
-    stamp_spec: bool,
-) -> Result<(), crate::PyError> {
-    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
-
-    let _roots = push_roots();
-    let mod_slot = shadow_stack_len();
-    let _ = pin_root(module);
-
-    let startup = BUILTIN_MODULES.lock().get(name).and_then(|d| d.startup);
-    if let Some(startup) = startup {
-        startup(shadow_stack_get(mod_slot), execution_context)?;
-    }
-    if stamp_spec {
-        set_builtin_module_spec(name, shadow_stack_get(mod_slot))?;
-    }
-    Ok(())
 }
 
 /// Initialize sys.path with the directory containing the main script.
@@ -3368,16 +3469,13 @@ pub fn importlib_bootstrap_external_module() -> Option<PyObjectRef> {
 /// that lives on the `_io` module object and nowhere else, so a program that
 /// never imported `_io` would otherwise not be able to open a text file.
 pub fn get_builtin_module(name: &str) -> Option<PyObjectRef> {
-    if let Some(module) = check_sys_modules(name) {
-        return Some(module);
-    }
     // Minting runs the module's `startup` hook, which is handed the execution
     // context and may import through it — `array`'s registers the type with
     // `_collections_abc.MutableSequence`.  The live context is what
     // `getbuiltinmodule` would have run under anyway, so it is what this
     // reader hands over rather than a null nothing on that path may
     // dereference.
-    create_builtin_module(name, crate::call::getexecutioncontext())
+    getbuiltinmodule(name, false, true, crate::call::getexecutioncontext())
         .ok()
         .flatten()
 }
@@ -3402,7 +3500,7 @@ pub fn get_interpreter_sys_module() -> Option<PyObjectRef> {
 /// reads both from there rather than through a mapping the program owns.
 /// The module this returns is the registry's, not
 /// `ExecutionContext::get_builtin()`'s -- the two are the split described at
-/// `create_builtin_module`, and finalization wants the one whose dict
+/// `builtin_modules_get`, and finalization wants the one whose dict
 /// `sys.modules` published.
 pub fn get_interpreter_builtins_module() -> Option<PyObjectRef> {
     sys_modules_registry_get("builtins")
@@ -3557,6 +3655,7 @@ unsafe fn walk_bound_module_dicts(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
             let module = &mut *(module as *mut pyre_object::module::Module);
             visitor(&mut module.w_name);
             visitor(&mut module.w_dict);
+            visitor(&mut module.w_initialdict);
             let w_dict = module.w_dict;
             pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
         }
@@ -3647,6 +3746,16 @@ pub(crate) unsafe fn walk_process_import_roots(visitor: &mut dyn FnMut(&mut PyOb
     if !w_import.is_null() {
         visitor(&mut w_import);
         DEFAULT_IMPORTLIB_IMPORT.store(w_import as usize, Ordering::Release);
+    }
+    // `space.builtin_modules`. An immortal module's fields are walked above,
+    // since `getbuiltinmodule` binds it in `sys.modules` before anything
+    // else; a managed one is traced through its own fields.
+    for def in BUILTIN_MODULES.lock().values_mut() {
+        if def.w_mod != 0 {
+            let mut w_mod = def.w_mod as PyObjectRef;
+            visitor(&mut w_mod);
+            def.w_mod = w_mod as usize;
+        }
     }
 }
 
@@ -4644,13 +4753,17 @@ fn load_source_module(
             (crate::box_code_object(code), cache_key.is_some())
         }
     };
-    // The whole unit was named by this path, so recurse through the eager
-    // nested PyCode constants like PyPy `update_code_filenames`.
-    unsafe { crate::pycode::set_compilation_unit_filename_bytes(w_code, filename_bytes) };
-    // Root before any allocation (fresh_module_globals, the cache write) can
-    // collect the freshly boxed code out from under us.
+    // Root before `update_code_filenames` / later allocations can collect.
+    // `set_compilation_unit_filename_bytes` walks nested codes and may
+    // allocate; the pin is the shadow-stack livevar `gctransform` keeps
+    // across `importing.py update_code_filenames`.
     let code_slot = roots.base();
     let _ = roots.pin_root(w_code);
+    // The whole unit was named by this path, so recurse through the eager
+    // nested PyCode constants like PyPy `update_code_filenames`.
+    unsafe {
+        crate::pycode::set_compilation_unit_filename_bytes(roots.get(code_slot), filename_bytes)
+    };
     if let (true, Some(key)) = (store, cache_key) {
         crate::module::imp::interp_imp::frozen_cache_store(key, &source, roots.get(code_slot));
     }
@@ -5138,26 +5251,17 @@ fn load_part(
     // the fully-qualified name.
     let full_is_builtin = BUILTIN_MODULES.lock().contains_key(modulename);
     if full_is_builtin {
-        // `pypy/interpreter/module.py Module.__init__` keeps a single
-        // `Module` per imported module name; `space.builtin` IS the
-        // module returned by `import builtins`.  Pyre's
-        // `ExecutionContext::get_builtin()` lazily caches the Module
-        // wrapping `self.builtins_module` — route the "builtins" case
-        // through it so identity equality holds against `space.builtin`.
-        let m = if modulename == "builtins" && !execution_context.is_null() {
-            unsafe { (*execution_context).get_builtin() }
-        } else {
-            load_builtin_module(modulename)?.ok_or_else(|| {
-                crate::PyError::new(
-                    crate::PyErrorKind::ImportError,
-                    format!("builtin module '{modulename}' failed to initialize"),
-                )
-            })?
-        };
-        set_sys_module(modulename, m);
-        startup_builtin_module(modulename, m, execution_context)?;
-        // `startup_builtin_module` runs app-level spec construction that can
-        // collect and relocate `m`; re-read the live pointer from sys.modules.
+        // `interp_imp.py create_builtin` for a name `sys.modules` does not
+        // hold, then the spec `module_from_spec` stamps.
+        let m = getbuiltinmodule(modulename, true, false, execution_context)?.ok_or_else(|| {
+            crate::PyError::new(
+                crate::PyErrorKind::ImportError,
+                format!("builtin module '{modulename}' failed to initialize"),
+            )
+        })?;
+        set_builtin_module_spec(modulename, m)?;
+        // The spec runs app-level code, which can rebind the name; re-read
+        // the live entry from sys.modules.
         let m = check_sys_modules(modulename).unwrap_or(m);
         return Ok(Some(m));
     }
@@ -5269,24 +5373,19 @@ fn load_part(
             load_namespace_package(modulename, &dirs, execution_context)?
         }
         FindInfo::Builtin => {
-            // Same builtins-identity path as the full_is_builtin branch
-            // above: route `import builtins` through `EC.get_builtin()`
-            // so `import builtins is space.builtin` holds.
-            let m = if partname == "builtins" && !execution_context.is_null() {
-                unsafe { (*execution_context).get_builtin() }
-            } else {
-                load_builtin_module(partname)?.ok_or_else(|| {
+            // Same `create_builtin` as the full_is_builtin branch above; a
+            // builtin is found only for a top-level name, so `partname` is
+            // `modulename`.
+            let m =
+                getbuiltinmodule(partname, true, false, execution_context)?.ok_or_else(|| {
                     crate::PyError::new(
                         crate::PyErrorKind::ImportError,
                         format!("builtin module '{modulename}' failed to initialize"),
                     )
-                })?
-            };
-            // Store builtin modules in cache immediately
-            set_sys_module(modulename, m);
-            startup_builtin_module(partname, m, execution_context)?;
-            // `startup_builtin_module` may collect and relocate `m`; re-read
-            // the live pointer from sys.modules.
+                })?;
+            set_builtin_module_spec(partname, m)?;
+            // The spec runs app-level code, which can rebind the name; re-read
+            // the live entry from sys.modules.
             check_sys_modules(modulename).unwrap_or(m)
         }
     };
@@ -5486,14 +5585,36 @@ pub fn import_name(
     w_fromlist: PyObjectRef,
     w_flag: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // `lookup_dunder_import` reads the builtin dict and can collect.
+    // The three incoming GCREFs are native copies the collector does
+    // not update, so they live on the shadow stack across that lookup
+    // (`pyopcode.py IMPORT_NAME` livevars).
+    let _import_name_roots = pyre_object::gc_roots::push_roots();
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_modulename);
+    let fromlist_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_fromlist);
+    let flag_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_flag);
     let w_import = lookup_dunder_import(frame)?;
-
+    let import_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_import);
     let w_locals = import_locals(frame);
+    let locals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_locals);
     let w_globals = frame.get_w_globals();
+    let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_globals);
     crate::call::call_args_in_frame(
         frame,
-        w_import,
-        &[w_modulename, w_globals, w_locals, w_fromlist, w_flag],
+        pyre_object::gc_roots::shadow_stack_get(import_slot),
+        &[
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+            pyre_object::gc_roots::shadow_stack_get(globals_slot),
+            pyre_object::gc_roots::shadow_stack_get(locals_slot),
+            pyre_object::gc_roots::shadow_stack_get(fromlist_slot),
+            pyre_object::gc_roots::shadow_stack_get(flag_slot),
+        ],
     )
 }
 
@@ -6009,9 +6130,13 @@ fn dunder_import_inner(
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
     // Captured before any Python can run below (`is_true` may call a
-    // `__bool__`).  The fast path below does not pin: `interp___import__`
-    // has no shadow stack, and a pin is an effect in front of `_gcd_import`.
+    // `__bool__`).  `gcd_import_fast` can collect; the caller's natives
+    // (`w_fromlist` / `w_mod` / globals / locals / name) are not rewritten
+    // by that callee.
     let fromlist_missing = w_fromlist.is_null() || unsafe { is_none(w_fromlist) };
+    let _import_roots = pyre_object::gc_roots::push_roots();
+    let import_base = pyre_object::gc_roots::pin_roots(&[w_name, w_globals, w_locals, w_fromlist]);
+    let reload_import = |index: usize| pyre_object::gc_roots::shadow_stack_get(import_base + index);
 
     if level == 0 {
         // `interp_import.py:66-92` — the fast path is only for absolute
@@ -6020,19 +6145,22 @@ fn dunder_import_inner(
         // imports whatever the list adds.  No import lock is taken here:
         // `interp_import.py:19` records that CPython's fast path does not
         // take one either.
-        let w_mod = if w_name.is_null() {
+        let w_mod = if reload_import(0).is_null() {
             gcd_import_fast(name)?
         } else {
-            gcd_import_fast_w(name, w_name)?
+            gcd_import_fast_w(name, reload_import(0))?
         };
         if let Some(w_mod) = w_mod {
+            let w_mod_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_mod);
+            let w_mod = || pyre_object::gc_roots::shadow_stack_get(w_mod_slot);
             // `interp_import.py interp___import__` — the list is tested once
             // the cache hit is in hand, and a dotted name's head is resolved
             // only inside the empty-list arm.  Resolving it ahead of the test
             // would run `gcd_import_fast` on the head, whose `__spec__` and
             // `_initializing` reads can run a module's own Python; neither
             // importer runs that for a non-empty list.
-            let have_fromlist = !fromlist_missing && is_true_import(w_fromlist)?;
+            let have_fromlist = !fromlist_missing && is_true_import(reload_import(3))?;
             if !have_fromlist {
                 // `name.find(".")` / `name[:dotindex]` residualise as
                 // `find` / `__getslice_rangeto`.  Keep that arm off the
@@ -6041,9 +6169,9 @@ fn dunder_import_inner(
                 // only the empty-fromlist dotted name needs.
                 return dunder_import_absolute_head(
                     name,
-                    w_mod,
-                    w_globals,
-                    w_locals,
+                    w_mod(),
+                    reload_import(1),
+                    reload_import(2),
                     execution_context,
                 );
             }
@@ -6053,8 +6181,8 @@ fn dunder_import_inner(
             // and is the `__majit_stringbuilder_new` descent wall).  A
             // non-module with a fromlist is FastPathGiveUp, same cut as
             // `gcd_import_cache_probe`.
-            if unsafe { pyre_object::is_module(w_mod) } {
-                let dict = unsafe { pyre_object::w_module_get_w_dict(w_mod) };
+            if unsafe { pyre_object::is_module(w_mod()) } {
+                let dict = unsafe { pyre_object::w_module_get_w_dict(w_mod()) };
                 let w_path = if dict.is_null() {
                     pyre_object::PY_NULL
                 } else {
@@ -6064,7 +6192,7 @@ fn dunder_import_inner(
                     return Err(take_published_residual_error());
                 }
                 if dict.is_null() || w_path.is_null() {
-                    return Ok(w_mod);
+                    return Ok(w_mod());
                 }
                 // Pin + `_handle_fromlist` allocate and call Python.
                 // After the red `sys.modules` pointer the scan cannot
@@ -6073,10 +6201,10 @@ fn dunder_import_inner(
                 // otherwise decline a cached `from math import pi`).
                 return dunder_import_package_fromlist(
                     name,
-                    w_mod,
-                    w_globals,
-                    w_locals,
-                    w_fromlist,
+                    w_mod(),
+                    reload_import(1),
+                    reload_import(2),
+                    reload_import(3),
                     fromlist_missing,
                     level,
                     execution_context,
@@ -6091,9 +6219,9 @@ fn dunder_import_inner(
     // bootstrap into the look-inside body.
     dunder_import_slow(
         name,
-        w_globals,
-        w_locals,
-        w_fromlist,
+        reload_import(1),
+        reload_import(2),
+        reload_import(3),
         fromlist_missing,
         level,
         execution_context,

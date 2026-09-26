@@ -329,6 +329,12 @@ fn dispatch_convert_from_to(
         (InstanceRepr, InstanceRepr) => {
             super::rclass::pair_instance_instance_convert_from_to(r_from, r_to, v, llops)
         }
+        // rgcref.py — `pairtype(GCRefRepr, Repr).convert_from_to` for a
+        // Gc-opaque pointer the annotator merged into the classdef-less
+        // top instance.
+        (PtrRepr, InstanceRepr) => {
+            super::rclass::pair_opaque_ptr_instance_convert_from_to(r_from, r_to, v, llops)
+        }
         // rbool.py __extend__ — bool participates in IntegerRepr's MRO but
         // carries explicit primitive casts for the common Bool edges.
         (BoolRepr, FloatRepr) => {
