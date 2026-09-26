@@ -1131,6 +1131,31 @@ fn real_main() {
                     // in `_unpackiterable_unknown_length` at source level.
                     split_portal: false,
                 },
+                majit_translate::JitDriverSpec {
+                    // `generator.py` `generatorentry_driver`. Greens `pycode`,
+                    // reds `gen`/`w_arg`, no virtualizable. The portal is the
+                    // source-level cut at `split_before_jit_merge_point`:
+                    // `generatorentry_portal` starts at the marker.
+                    portal: majit_translate::CallPath::from_segments([
+                        "baseobjspace",
+                        "generatorentry_portal",
+                    ]),
+                    portal_runner: Some(majit_translate::CallPath::from_segments([
+                        "eval",
+                        "ll_generatorentry_portal_runner_shim",
+                    ])),
+                    greens: vec!["pycode".to_string()],
+                    reds: vec!["gen".to_string(), "w_arg".to_string()],
+                    green_kinds: vec![majit_ir::Type::Ref],
+                    red_kinds: vec![majit_ir::Type::Ref, majit_ir::Type::Ref],
+                    autoreds: false,
+                    virtualizables: vec![],
+                    red_types: vec![],
+                    // Already cut at the marker in `generatorentry_portal`.
+                    // `split_before_jit_merge_point` cannot cross the
+                    // closures in `generator_send_ex`.
+                    split_portal: false,
+                },
             ],
             // pyre production registers no trait-dispatch families (#346).
             register_trait_families: Vec::new(),
@@ -1163,11 +1188,15 @@ fn real_main() {
     // crate's ctor.
     #[cfg(feature = "full")]
     pyre_module::register();
-    let fnaddr_bindings = pyre_interpreter::jit_trace_fnaddrs();
+    let mut fnaddr_bindings = pyre_interpreter::jit_trace_fnaddrs();
     // This build script is the host, so it reads the linkme slice. The
     // wasm guest fills the same set from constructors. A missing row
     // here means the build-dep was dropped and every moved builtin
     // residualises at `no jitcode for address`.
+    // `dont_look_inside` residuals the portal walk still executes.
+    // Unbound, each one is a symbolic path hash and
+    // `refuse_reachable_symbolic_residuals` aborts the trace.
+    fnaddr_bindings.extend(pyre_interpreter::baseobjspace::generatorentry_fnaddrs());
     #[cfg(feature = "full")]
     if !fnaddr_bindings
         .iter()

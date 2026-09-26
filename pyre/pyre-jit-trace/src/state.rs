@@ -7403,6 +7403,20 @@ impl PyreJitState {
         descriptor
     }
 
+    /// `generator.py` `generatorentry_driver`: greens `pycode`, reds `gen`
+    /// and `w_arg`, no virtualizable. No `can_enter_jit` in the source, so
+    /// `no_loop_header` stays set and the enter lives at the portal entry.
+    pub fn generatorentry_driver_descriptor() -> JitDriverStaticData {
+        let mut descriptor = JitDriverStaticData::new(
+            vec![("pycode", Type::Ref)],
+            vec![("gen", Type::Ref), ("w_arg", Type::Ref)],
+        );
+        descriptor.name = "generatorentry".into();
+        descriptor.no_loop_header = true;
+        descriptor.frame_value_count_fn = Some(build_time_frame_value_count_at);
+        descriptor
+    }
+
     fn execution_context_as_usize(&self) -> usize {
         self.execution_context
     }

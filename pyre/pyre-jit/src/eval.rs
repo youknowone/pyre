@@ -5164,6 +5164,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // registers its own under its own index.
     majit_metainterp::blackhole::register_portal_runner_hook(0, pyre_portal_runner);
     majit_metainterp::blackhole::register_portal_runner_hook(1, unpackiterable_portal_runner);
+    majit_metainterp::blackhole::register_portal_runner_hook(2, generatorentry_portal_runner);
     // pypy/module/pypyjit/interp_jit.py PyPyJitDriver(..., is_recursive=True).
     // Drives MetaInterp.is_main_jitcode() / is_portal_jitcode dispatch
     // — without this flag the recursive-portal bookkeeping stays
@@ -5209,6 +5210,15 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // `do_recursive_call` will not jump here.
     jd1.portal_runner_adr = ll_unpackiterable_portal_runner_shim as *const () as i64;
     d.meta_interp_mut().register_jitdriver_sd(jd1);
+    // generator.py `generatorentry_driver`: greens `pycode`, reds `gen`/`w_arg`,
+    // no virtualizable. Registered immediately after jd1 so it is
+    // `jitdrivers_sd[2]`. No `can_enter_jit` in the source, so
+    // `no_loop_header` is set on the descriptor and the enter is this
+    // registration's portal entry.
+    let mut jd2 = pyre_jit_trace::state::PyreJitState::generatorentry_driver_descriptor();
+    jd2.result_type = majit_ir::Type::Ref;
+    jd2.portal_runner_adr = ll_generatorentry_portal_runner_shim as *const () as i64;
+    d.meta_interp_mut().register_jitdriver_sd(jd2);
     // `warmspot.py metainterp_sd.finish_setup(codewriter)` always installs
     // the assembler's opcode ids and liveness stream before either tracing or
     // blackhole execution.  Every translated jitcode carries those ids: jd1's
@@ -7099,18 +7109,542 @@ fn unpack_merge_point_jit(
     drive_unpack_iterable_trace(green_key, greenkey, w_iterator, items);
 }
 
+/// `generator.py` `get_printable_location_genentry`.
+fn get_printable_location_genentry(pycode: pyre_object::PyObjectRef) -> String {
+    let mut code_name = "<unknown>".to_string();
+    if !pycode.is_null() {
+        let code_ptr = unsafe { pyre_interpreter::pycode::w_code_get_ptr(pycode) };
+        if !code_ptr.is_null() {
+            let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
+            code_name = code.obj_name.to_string();
+        }
+    }
+    format!("{code_name} <generator>")
+}
+
 /// `generatorentry_driver.jit_merge_point` runtime hook.
-/// `warmspot.py rewrite_can_enter_jits` inserts `can_enter_jit` at a
-/// portal that has none; this is that insert. The translator already
-/// treats `GeneratorEntryJitDriver::jit_merge_point` as
-/// `BC_JIT_MERGE_POINT`. Driving a dedicated portal is the next peel;
-/// this hook is the merge-point so `caro_no_merge_entry` is not the
-/// only door.
+///
+/// `warmspot.py` `rewrite_can_enter_jits` inserts `can_enter_jit` at a
+/// portal that has none in source. The interpreter reaches `send_ex`
+/// while jitted (`we_are_jitted` and `should_not_inline`); this hook is
+/// that enter. A trace already in progress belongs to the caller — the
+/// walker records `CALL_ASSEMBLER` there instead of nesting a second
+/// `MetaInterp`. With no extracted portal jitcode the enter returns and
+/// `send_ex` continues in the interpreter.
 fn genentry_merge_point_jit(
-    _gen: pyre_object::PyObjectRef,
-    _w_arg: pyre_object::PyObjectRef,
+    w_gen: pyre_object::PyObjectRef,
+    w_arg: pyre_object::PyObjectRef,
+    pycode: pyre_object::PyObjectRef,
+) -> Option<Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError>> {
+    if w_gen.is_null() || pycode.is_null() {
+        return None;
+    }
+    let tracing = {
+        let (driver, _) = driver_pair();
+        driver.meta_interp().is_tracing()
+    };
+    if tracing {
+        return None;
+    }
+    let Some(_canonical) = pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
+        "baseobjspace::generatorentry_portal",
+    ) else {
+        if std::env::var_os("PYRE_JD2_DEBUG").is_some() {
+            eprintln!("[jd2] no portal jitcode");
+        }
+        return None;
+    };
+    // The resume pc is not a green. `pycode` plus the driver index keys
+    // the loop (`warmstate.py JitCell`); jd0's `(pycode, 0, false)` cell
+    // is a different key. The red frame's `last_instr` distinguishes yields.
+    let green_key = genentry_resolved_cell_key(pycode);
+    // `JitCell.is_compiled` excludes the `compile_tmp_callback` token.
+    // A compiled cell enters on every call. A temporary cell keeps
+    // counting (`maybe_compile_and_run`).
+    let compiled = {
+        let (driver, _) = driver_pair();
+        driver.meta_interp().jitcell_is_compiled(green_key)
+    };
+    if !compiled && !genentry_counter_tick(green_key) {
+        return None;
+    }
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[generatorentry] {}",
+            get_printable_location_genentry(pycode)
+        );
+    }
+    let driven = drive_generatorentry_trace(green_key, pycode, w_gen, w_arg);
+    // The note is scoped to the walk: whatever it recorded is either
+    // consumed by the abort fallback or dropped here.
+    pyre_interpreter::call::genentry_resume_note_reset();
+    driven
+}
+
+/// Cell key for `jitdrivers_sd[2]`. Resolved on the process warmstate,
+/// the table `jitcell_is_compiled` / `force_start_tracing` /
+/// `run_compiled_detailed_with_values` read (`warmstate.py JitCell`).
+fn genentry_resolved_cell_key(pycode: pyre_object::PyObjectRef) -> u64 {
+    let (driver, _) = driver_pair();
+    pyre_jit_trace::genentry_state::genentry_resolved_cell_key(
+        driver.meta_interp_mut().warm_state_mut(),
+        pycode,
+    )
+}
+
+/// Crossings of one jd2 cell before `generatorentry` drives a trace.
+/// `warmstate.py` `JitCounter` on `jd.warmstate`: slot 2 has its own
+/// timetable (`warm_state_for_driver`), so alternating generators do not
+/// reset each other and jd0's back-edge counter is left alone.
+fn genentry_counter_tick(green_key: u64) -> bool {
+    let (driver, _) = driver_pair();
+    let warm = driver.meta_interp_mut().warm_state_for_driver(2);
+    let increment = warm.counter.compute_threshold(jd1_trace_threshold());
+    warm.counter.tick(green_key, increment)
+}
+
+/// Enter the `generatorentry` portal. The extracted jitcode is
+/// `baseobjspace::generatorentry_portal`. A session that is already
+/// tracing is the caller's; this returns without nesting. The machine
+/// walk from `jit_merge_point` runs `generator_send_ex_body` through the
+/// generator frame to the yield, which finishes with the yielded value.
+///
+/// `send_ex` has no back edge. `CloseLoop` is kept so a merge-point
+/// `goto` still compiles. `RunCompiled` enters the assembler here
+/// (`execute_assembler`); `StartedTracing` returns the value the walk
+/// already produced.
+fn drive_generatorentry_trace(
+    green_key: u64,
+    pycode: pyre_object::PyObjectRef,
+    w_gen: pyre_object::PyObjectRef,
+    w_arg: pyre_object::PyObjectRef,
+) -> Option<Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError>> {
+    use majit_metainterp::BackEdgeAction;
+
+    let dbg = std::env::var_os("PYRE_JD2_DEBUG").is_some();
+    pyre_interpreter::call::genentry_resume_note_arm();
+    let _exc_scope = crate::call_jit::ResidualExceptionScope::park(dbg);
+    pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+    let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
+        "baseobjspace::generatorentry_portal",
+    ) {
+        Some(jc) => jc,
+        None => {
+            if dbg {
+                eprintln!("[jd2] portal_jitcode_for_key returned None");
+            }
+            return None;
+        }
+    };
+    let jitcode = majit_metainterp::JitCode::from_canonical((*canonical).clone());
+    {
+        let index = jitcode.try_index().unwrap_or(0);
+        let payload = std::sync::Arc::new(pyre_jit_trace::PyJitCode::from_core_degenerate(
+            std::sync::Arc::new(jitcode.clone()),
+            std::ptr::null(),
+            /* has_abort */ false,
+        ));
+        pyre_jit_trace::state::install_build_time_jitcode_at(index, payload);
+    }
+
+    let tracing = {
+        let (driver, _) = driver_pair();
+        driver.meta_interp().is_tracing()
+    };
+    if tracing {
+        if dbg {
+            eprintln!("[jd2] bail: meta.is_tracing()");
+        }
+        return None;
+    }
+
+    let live_values = pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg);
+    let action = {
+        let (driver, _) = driver_pair();
+        let meta = driver.meta_interp_mut();
+        let mut descriptor =
+            pyre_jit_trace::genentry_state::GenEntryJitState::generatorentry_driver_descriptor();
+        descriptor.index = jitcode.jitdriver_sd();
+        // `(0, 0)` keeps `force_start_tracing` on the u64 cell key.
+        // A non-zero code pointer rebinds through `with_typed_decision_key`
+        // to jd0's `(next_instr, is_being_profiled, pycode)` cell.
+        meta.force_start_tracing(green_key, (0, 0), Some(descriptor), &live_values)
+    };
+    if dbg {
+        let name = match action {
+            BackEdgeAction::Interpret => "Interpret",
+            BackEdgeAction::StartedTracing => "StartedTracing",
+            BackEdgeAction::AlreadyTracing => "AlreadyTracing",
+            BackEdgeAction::RunCompiled => "RunCompiled",
+        };
+        eprintln!("[jd2] force_start_tracing -> {name}");
+    }
+    // `maybe_compile_and_run` raises `EnterJitAssembler` once the cell
+    // has a real procedure token. Run that loop and resume its guards
+    // before the portal body.
+    if matches!(action, BackEdgeAction::RunCompiled) {
+        return run_compiled_generatorentry(green_key, &live_values, dbg);
+    }
+    if !matches!(action, BackEdgeAction::StartedTracing) {
+        return None;
+    }
+    let (driver, _) = driver_pair();
+    let meta = driver.meta_interp_mut();
+    // `JitDriver::force_start_tracing` opens the frontend envelope that
+    // `compile_finish_from_active_session` drains. `MetaInterp::force_start_tracing`
+    // only arms the tracer; without this the finish compile hits the
+    // session-absent no-op and the cell keeps its `compile_tmp_callback` token.
+    {
+        use majit_metainterp::JitState;
+        let trace_meta = pyre_jit_trace::genentry_state::GenEntryJitState { pycode }
+            .build_meta(0, &pyre_jit_trace::state::PyreEnv);
+        meta.begin_trace_session(trace_meta);
+    }
+
+    let green_args = [(majit_metainterp::JitArgKind::Ref, pycode as usize as i64)];
+    let red_args = [
+        (
+            majit_metainterp::JitArgKind::Ref,
+            majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
+            w_gen as usize as i64,
+        ),
+        (
+            majit_metainterp::JitArgKind::Ref,
+            majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+            w_arg as usize as i64,
+        ),
+    ];
+    let mut sym = pyre_jit_trace::genentry_state::GenEntrySym {
+        pycode,
+        r#gen: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
+        w_arg: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+    };
+    let header_pc = {
+        use majit_metainterp::JitCodeSym;
+        sym.loop_header_pc()
+    };
+    let drove = meta.with_trace_ctx_and_token_resolver(
+        |ctx,
+         resolve_token,
+         recursive_target,
+         recursive_decision,
+         recursive_exec,
+         recursive_exec_ref,
+         recursive_exec_float,
+         recursive_exec_void| {
+            let runtime = majit_metainterp::ClosureRuntimeWithResolver::new(
+                |_pc: usize| 0usize,
+                resolve_token,
+                recursive_target,
+                recursive_decision,
+                recursive_exec,
+                recursive_exec_ref,
+                recursive_exec_float,
+                recursive_exec_void,
+            );
+            majit_metainterp::trace_jitcode_from_merge_point(
+                ctx,
+                &mut sym,
+                &jitcode,
+                header_pc,
+                &runtime,
+                &green_args,
+                &red_args,
+            )
+        },
+    );
+    if dbg {
+        eprintln!("[jd2] trace_jitcode action={drove:?}");
+    }
+
+    use majit_metainterp::{JitState, TraceAction};
+    // The walk executed the resume concretely. The yielded ref is the
+    // FINISH result; the portal runner returns it and does not run the
+    // body again. An exception FINISH, including StopIteration, is `Err`.
+    let produced: Option<Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError>> =
+        match &drove {
+            Some(TraceAction::Finish {
+                finish_args,
+                exit_with_exception: false,
+                ..
+            }) => {
+                let value = finish_args
+                    .first()
+                    .and_then(|op| meta.trace_ctx()?.concrete_of_opref(*op));
+                match value {
+                    Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) if ptr != 0 => {
+                        Some(Ok(ptr as pyre_object::PyObjectRef))
+                    }
+                    // A null or non-ref FINISH is a terminal state. `None`
+                    // would make the portal call `generator_send_ex_body` again.
+                    _ => Some(Err(genentry_invalid_finish())),
+                }
+            }
+            Some(TraceAction::Finish {
+                exit_with_exception: true,
+                exc_value,
+                ..
+            }) => Some(Err(portal_error_from_exc_ref(*exc_value).unwrap_or_else(
+                // The walk already ran the resume; `None` would run the
+                // body again through the portal.
+                genentry_exception_exit_without_exception,
+            ))),
+            _ => None,
+        };
+    let jump_args = match &drove {
+        Some(TraceAction::CloseLoop) => {
+            Some(pyre_jit_trace::genentry_state::GenEntryJitState::collect_jump_args(&sym))
+        }
+        Some(TraceAction::CloseLoopWithArgs { jump_args, .. }) => Some(jump_args.clone()),
+        _ => None,
+    };
+    if let Some(jump_args) = jump_args {
+        let trace_meta = pyre_jit_trace::genentry_state::GenEntryJitState { pycode }
+            .build_meta(header_pc, &pyre_jit_trace::state::PyreEnv);
+        let outcome = meta.compile_loop(&jump_args, trace_meta);
+        if dbg {
+            eprintln!("[jd2] compile_loop outcome={outcome:?}");
+        }
+    } else if let Some(TraceAction::Finish {
+        finish_args,
+        finish_arg_types,
+        exit_with_exception,
+        exc_value: _,
+    }) = drove
+    {
+        if exit_with_exception {
+            crate::call_jit::drain_backend_jit_exc();
+        }
+        match meta.compile_finish_from_active_session(
+            &finish_args,
+            finish_arg_types,
+            exit_with_exception,
+        ) {
+            Ok(()) => {
+                if meta.is_tracing() {
+                    meta.abort_trace(false);
+                }
+                if dbg {
+                    eprintln!(
+                        "[jd2] compile_finish ok exit_with_exception={exit_with_exception} \
+                         still_tracing={}",
+                        meta.is_tracing(),
+                    );
+                }
+            }
+            Err(stb) => {
+                if dbg {
+                    eprintln!("[jd2] compile_finish aborted reason={}", stb.reason);
+                }
+                meta.aborted_tracing(stb.reason);
+            }
+        }
+    } else {
+        // `trace_jitcode_from_merge_point` records and executes. A symbolic
+        // residual (`core::ptr::const_ptr::read`) aborts after
+        // `w_generator_set_running` has already run. Returning `None` makes
+        // `generatorentry_ll_portal_runner` call `generatorentry_portal`
+        // again from the merge point, which raises "already executing".
+        // `run_blackhole_interp_to_cancel_tracing` refuses
+        // `symbolic_residual_abort` (the failed instruction has no
+        // blackhole continuation). Undo the flag and the EC link the walk
+        // published, then finish the body once in the interpreter.
+        meta.abort_trace(false);
+        if dbg {
+            eprintln!("[jd2] abort_trace");
+        }
+        return Some(finish_generatorentry_after_walk_abort(pycode, w_gen, w_arg));
+    }
+    produced
+}
+
+fn genentry_invalid_finish() -> pyre_interpreter::error::PyError {
+    pyre_interpreter::error::PyError::runtime_error("generatorentry finish value is not a ref")
+}
+
+fn genentry_exception_exit_without_exception() -> pyre_interpreter::error::PyError {
+    pyre_interpreter::error::PyError::runtime_error(
+        "generatorentry exception exit carries no exception",
+    )
+}
+
+/// Interpreter finish after a jd2 walk abort that already published
+/// `w_generator_set_running`.
+fn finish_generatorentry_after_walk_abort(
     _pycode: pyre_object::PyObjectRef,
-) {
+    w_gen: pyre_object::PyObjectRef,
+    w_arg: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError> {
+    // Open the root bracket before reading `running`. A collection during
+    // the walk updates the caller's root slots and leaves these locals stale.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    if !w_gen.is_null() {
+        let _ = pyre_object::gc_roots::pin_root(w_gen);
+    }
+    let arg_slot = pyre_object::gc_roots::shadow_stack_len();
+    if !w_arg.is_null() {
+        let _ = pyre_object::gc_roots::pin_root(w_arg);
+    }
+    let live_gen = if w_gen.is_null() {
+        w_gen
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(gen_slot)
+    };
+    let live_arg = if w_arg.is_null() {
+        w_arg
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(arg_slot)
+    };
+    // `generator_invoke_execute_frame`'s finally already cleared `running`
+    // and recorded the yield or the exception. Resuming again would run
+    // the body twice.
+    if let Some(done) = pyre_interpreter::call::genentry_body_result_for(live_gen) {
+        return done;
+    }
+    // The `ptr::read` residual aborts after `w_generator_set_running` and
+    // before that finally. Drop the flag and the EC link, then finish
+    // `_send_ex` once. The merge-point hook is not on this path.
+    unsafe {
+        if pyre_object::generator::w_generator_is_running(live_gen) {
+            pyre_object::generator::w_generator_set_running(live_gen, false);
+            let ec = pyre_interpreter::call::getexecutioncontext()
+                as *mut pyre_interpreter::PyExecutionContext;
+            if !ec.is_null() && (*ec).current_gen_or_coroutine == live_gen {
+                (*ec).pop_gen_or_coroutine(live_gen);
+            }
+        }
+    }
+    pyre_interpreter::generator_send_ex_body(live_gen, live_arg, None, None, false)
+}
+
+/// Exception word from a jd2 FINISH, including `StopIteration`.
+fn portal_error_from_exc_ref(exc: i64) -> Option<pyre_interpreter::error::PyError> {
+    if exc == 0 {
+        return None;
+    }
+    Some(unsafe {
+        pyre_interpreter::error::PyError::from_exc_object(exc as pyre_object::PyObjectRef)
+    })
+}
+
+/// `execute_assembler` for a compiled `generatorentry` cell.
+///
+/// Guard exits resume through `resume_in_blackhole`. `ContinueRunningNormally`
+/// re-enters. A finish ref is the yielded value. `ExitFrameWithExceptionRef`
+/// is the portal error, `StopIteration` included.
+fn run_compiled_generatorentry(
+    green_key: u64,
+    live_values: &[majit_ir::Value],
+    dbg: bool,
+) -> Option<Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError>> {
+    let mut live_values = live_values.to_vec();
+    loop {
+        let extracted = {
+            let (driver, _) = driver_pair();
+            let meta = driver.meta_interp_mut();
+            meta.run_compiled_detailed_with_values(green_key, &live_values)
+                .map(|r| {
+                    (
+                        r.is_finish,
+                        r.is_exit_frame_with_exception,
+                        r.fail_index,
+                        r.exit_layout.as_ref().is_some_and(|l| l.storage.is_some()),
+                        majit_metainterp::raw_exit_values(&r.typed_values),
+                        r.exit_layout.clone(),
+                        r.exception.exc_value,
+                    )
+                })
+        };
+        let Some((
+            is_finish,
+            is_exception_exit,
+            fail_index,
+            has_storage,
+            mut values,
+            exit_layout,
+            guard_exc,
+        )) = extracted
+        else {
+            if dbg {
+                eprintln!("[jd2] run_compiled: no loop");
+            }
+            return None;
+        };
+        if is_finish {
+            if dbg {
+                eprintln!("[jd2] run_compiled finish exc={is_exception_exit}");
+            }
+            if is_exception_exit {
+                let word = values.first().copied().unwrap_or(0);
+                if let Some(err) = portal_error_from_exc_ref(word) {
+                    return Some(Err(err));
+                }
+                if let Err(err) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
+                    return Some(Err(err));
+                }
+                // An exception exit that carries no exception is an invalid
+                // finish; `None` would resume the generator a second time.
+                return Some(Err(genentry_exception_exit_without_exception()));
+            }
+            let word = values.first().copied().unwrap_or(0);
+            if word == 0 {
+                return Some(Err(genentry_invalid_finish()));
+            }
+            return Some(Ok(word as pyre_object::PyObjectRef));
+        }
+        if fail_index == u32::MAX || !has_storage {
+            if dbg {
+                eprintln!("[jd2] run_compiled no resume fail_index={fail_index}");
+            }
+            return None;
+        }
+        // A non-StopIteration guard exit still has to run the portal
+        // jitcode's `catch_exception` / `finally` (`blackhole.py`
+        // `resume_in_blackhole`) so `running` and the EC link are cleared.
+        let bh = resume_in_blackhole_from_exit_layout(
+            &mut values,
+            exit_layout
+                .as_deref()
+                .expect("a guard exit carrying resume storage carries its layout"),
+            guard_exc,
+            true,
+            None,
+        );
+        match bh {
+            crate::call_jit::BlackholeResult::ContinueRunningNormally { red_ref, .. } => {
+                if dbg {
+                    eprintln!("[jd2] run_compiled continue");
+                }
+                if red_ref.len() >= 2 {
+                    live_values = pyre_jit_trace::genentry_state::genentry_live_values(
+                        red_ref[0], red_ref[1],
+                    );
+                }
+                continue;
+            }
+            crate::call_jit::BlackholeResult::ExitFrameWithExceptionRef(err) => {
+                if dbg {
+                    eprintln!("[jd2] run_compiled exc");
+                }
+                return Some(Err(err));
+            }
+            crate::call_jit::BlackholeResult::BailToInterpreter => {
+                if dbg {
+                    eprintln!("[jd2] run_compiled bail");
+                }
+                return None;
+            }
+            // `blackhole.py` `DoneWithThisFrame*`: box via `take_pyresult`.
+            // `None` would re-enter `generatorentry_portal` and resume again.
+            done @ (crate::call_jit::BlackholeResult::DoneWithThisFrameRef(_)
+            | crate::call_jit::BlackholeResult::DoneWithThisFrameVoid
+            | crate::call_jit::BlackholeResult::DoneWithThisFrameInt(_)
+            | crate::call_jit::BlackholeResult::DoneWithThisFrameFloat(_)) => {
+                return done.take_pyresult();
+            }
+        }
+    }
 }
 
 /// The exception a jd1 drain exit escapes with, as a `PyError`, unless it is the
@@ -8639,6 +9173,82 @@ pub extern "C" fn ll_unpackiterable_portal_runner_shim(
             pyre_interpreter::stack_check::park_jit_pending_error(err);
             0
         }
+    }
+}
+
+/// `warmspot.py ll_portal_runner` for `generatorentry_driver`.
+fn generatorentry_ll_portal_runner(
+    pycode: pyre_object::PyObjectRef,
+    w_gen: pyre_object::PyObjectRef,
+    w_arg: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError> {
+    // `ll_portal_runner` calls `maybe_compile_and_run` before `portal_ptr`.
+    // `send_ex` only reaches its own merge-point hook when `we_are_jitted`
+    // is set, and this runner is a normal call out of `CALL_ASSEMBLER`.
+    // A trace already in progress belongs to the caller.
+    let tracing = {
+        let (driver, _) = driver_pair();
+        driver.meta_interp().is_tracing()
+    };
+    if !tracing && let Some(result) = genentry_merge_point_jit(w_gen, w_arg, pycode) {
+        return result;
+    }
+    pyre_interpreter::generatorentry_portal(pycode, w_gen, w_arg)
+}
+
+/// C ABI of [`generatorentry_ll_portal_runner`].
+#[majit_macros::jit_may_force]
+pub extern "C" fn ll_generatorentry_portal_runner_shim(pycode: i64, w_gen: i64, w_arg: i64) -> i64 {
+    match generatorentry_ll_portal_runner(
+        pycode as pyre_object::PyObjectRef,
+        w_gen as pyre_object::PyObjectRef,
+        w_arg as pyre_object::PyObjectRef,
+    ) {
+        Ok(result) => {
+            // `compile_tmp_callback` is `CALL` + `GUARD_NO_EXCEPTION` +
+            // `FINISH`. The caller's loop records the same
+            // `GuardNoException` after `CallAssemblerR` to that token.
+            // A yield that returns `Ok` must leave the backend exception
+            // cell empty; a stale cell fails that guard on every later
+            // send and the caller's loop deopts once per iteration.
+            crate::call_jit::clear_residual_call_exception();
+            result as i64
+        }
+        Err(mut err) => {
+            // `GUARD_NO_EXCEPTION` after `CALL_ASSEMBLER` reads the backend
+            // exception cells (`publish_residual_call_exception`). Parking
+            // only in the interpreter pending slot leaves that guard green
+            // and the null result fails the following `GuardTrue`.
+            let exc = err.to_exc_object();
+            crate::call_jit::publish_residual_call_exception(exc as i64);
+            0
+        }
+    }
+}
+
+/// `warmspot.py handle_jitexception` for `generatorentry_driver`.
+///
+/// Greens are one ref (`pycode`). Reds are `gen` and `w_arg`.
+fn generatorentry_portal_runner(
+    exc: &majit_metainterp::jitexc::JitException,
+) -> Result<
+    (majit_metainterp::blackhole::BhReturnType, i64),
+    majit_metainterp::blackhole::PortalRunnerFailure,
+> {
+    use majit_metainterp::blackhole::{BhReturnType, PortalRunnerFailure};
+    use majit_metainterp::jitexc::JitException;
+
+    let JitException::ContinueRunningNormally(args) = exc else {
+        return Ok((BhReturnType::Void, 0));
+    };
+    let pycode = args.green_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let w_gen = args.red_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let w_arg = args.red_ref.get(1).copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    match pyre_interpreter::generatorentry_portal(pycode, w_gen, w_arg) {
+        Ok(result) => Ok((BhReturnType::Ref, result as i64)),
+        Err(mut err) => Err(PortalRunnerFailure::jit(
+            JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(err.to_exc_object() as usize)),
+        )),
     }
 }
 

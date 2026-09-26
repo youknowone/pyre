@@ -251,9 +251,6 @@ const MAJIT_ONLY: &[&str] = &[
 const PYRE_ONLY: &[&str] = &[
     // The walker's own abort marker.
     "abort/>r",
-    // Pointer/integer casts.
-    "cast_int_to_ptr/i>r",
-    "cast_ptr_to_int/r>i",
     // The float and pure array reads.
     "getarrayitem_gc_f/rid>f",
     "getarrayitem_gc_f_pure/rid>f",

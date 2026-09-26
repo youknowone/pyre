@@ -13993,6 +13993,14 @@ impl<M: Clone> MetaInterp<M> {
         self.warm_state.get_compiled(green_key)
     }
 
+    /// `JitCell.is_compiled`: a procedure token that is not the
+    /// `compile_tmp_callback` temporary (`JC_TEMPORARY`).
+    pub fn jitcell_is_compiled(&self, green_key: u64) -> bool {
+        self.warm_state
+            .cell_by_key(green_key)
+            .is_some_and(|cell| cell.is_compiled())
+    }
+
     /// Return the owning `Arc<JitCellToken>` for the compiled loop at
     /// `green_key`, matching `compile.py isinstance(descr, JitCellToken)`
     /// identity. Used by `direct_assembler_call` to thread the same Arc
@@ -19588,16 +19596,61 @@ impl<M: Clone> MetaInterp<M> {
     /// token Arc to carry in the descr, or `None` when the real
     /// portal driver metadata is unavailable or `compile_tmp_callback` fails.
     ///
-    /// `greenboxes` carries the portal greens in `build_portal_calldescr`
-    /// declaration order (`[next_instr, is_being_profiled, pycode]`);
-    /// `red_arg_types` the reds (`[frame, ec]` → `[Ref, Ref]`).
+    /// `greenboxes` carries `target_sd`'s greens in its declaration order and
+    /// `red_arg_types` its reds' types; for the portal driver that is
+    /// `[next_instr, is_being_profiled, pycode]` / `[frame, ec]` → `[Ref, Ref]`
+    /// (`build_portal_calldescr`), for a registered driver whatever its
+    /// `jit_merge_point` spec names.
+    fn assembler_token_arc_for_driver(
+        &mut self,
+        target_sd: &crate::jitdriver::JitDriverStaticData,
+        green_key: u64,
+        greenboxes: &[Value],
+        red_arg_types: &[Type],
+        log_tag: &str,
+    ) -> Option<Arc<JitCellToken>> {
+        // `compile.py:187` parity: an already-compiled loop token wins.
+        if let Some(arc) = self.get_loop_token_arc(green_key) {
+            return Some(arc);
+        }
+        if target_sd.portal_runner_adr == 0 {
+            return None;
+        }
+        // warmstate.py:714-723 — cell has no procedure_token yet, so synthesise
+        // one via `compile_tmp_callback`. The temporary callback token is a
+        // distinct object from any later real-loop token (`compile.py:1101-
+        // 1150`).
+        let token_number = self.warm_state.alloc_token_number();
+        let backend = &mut self.backend;
+        match self.warm_state.get_assembler_token(green_key, |memmgr| {
+            compile::compile_tmp_callback(
+                backend,
+                target_sd,
+                token_number,
+                green_key,
+                greenboxes,
+                red_arg_types,
+                Some(memmgr),
+            )
+        }) {
+            Ok(token) => Some(token),
+            Err(err) => {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][{log_tag}] compile_tmp_callback failed for key={green_key}: {err:?}"
+                    );
+                }
+                None
+            }
+        }
+    }
+
     pub fn get_or_make_portal_assembler_token_arc(
         &mut self,
         green_key: u64,
         greenboxes: &[Value],
         red_arg_types: &[Type],
     ) -> Option<Arc<JitCellToken>> {
-        // `compile.py:187` parity: an already-compiled loop token wins.
         // Resolved before the portal-driver lookup — an installed token does
         // not need the portal staticdata.
         if let Some(arc) = self.get_loop_token_arc(green_key) {
@@ -19611,33 +19664,39 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .position(|jd| jd.num_greens() > 0)?;
         let target_sd = self.staticdata.jitdrivers_sd.get(idx).cloned()?;
-        // warmstate.py:714-723 — cell has no procedure_token yet, so synthesise
-        // one via `compile_tmp_callback`. The temporary callback token is a
-        // distinct object from any later real-loop token (`compile.py:1101-
-        // 1150`).
-        let token_number = self.warm_state.alloc_token_number();
-        let backend = &mut self.backend;
-        match self.warm_state.get_assembler_token(green_key, |memmgr| {
-            compile::compile_tmp_callback(
-                backend,
-                &target_sd,
-                token_number,
-                green_key,
-                greenboxes,
-                red_arg_types,
-                Some(memmgr),
-            )
-        }) {
-            Ok(token) => Some(token),
-            Err(err) => {
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit][walker-ca] compile_tmp_callback failed for key={green_key}: {err:?}"
-                    );
-                }
-                None
-            }
+        self.assembler_token_arc_for_driver(
+            &target_sd,
+            green_key,
+            greenboxes,
+            red_arg_types,
+            "walker-ca",
+        )
+    }
+
+    /// `warmstate.py` `get_assembler_token` for one registered driver.
+    ///
+    /// [`Self::get_or_make_portal_assembler_token_arc`] always selects the
+    /// first driver that has greens. `generatorentry` is a later slot; its
+    /// temporary body has to call that slot's `portal_runner_adr`
+    /// (`compile.py` `compile_tmp_callback`).
+    pub fn get_or_make_jitdriver_assembler_token_arc(
+        &mut self,
+        jd_index: usize,
+        green_key: u64,
+        greenboxes: &[Value],
+        red_arg_types: &[Type],
+    ) -> Option<Arc<JitCellToken>> {
+        if let Some(arc) = self.get_loop_token_arc(green_key) {
+            return Some(arc);
         }
+        let target_sd = self.staticdata.jitdrivers_sd.get(jd_index).cloned()?;
+        self.assembler_token_arc_for_driver(
+            &target_sd,
+            green_key,
+            greenboxes,
+            red_arg_types,
+            "jd-ca",
+        )
     }
 
     /// pyjitpl.py `MetaInterp.vable_and_vrefs_before_residual_call`.

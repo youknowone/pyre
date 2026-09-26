@@ -86,6 +86,11 @@ pub struct JitCallTarget {
     /// preserve `errno`, `winerror`, etc. carry one of the
     /// `RFFI_ERR_*` flags (`rffi.py:121-167`).
     pub save_err: i32,
+    /// Funcaddr before it is narrowed to `*const ()`. A symbolic hash
+    /// carries bits above a wasm32 pointer, so the later
+    /// `is_symbolic_fnaddr` check reads this word. Zero means the
+    /// pointer itself is the address.
+    pub fnaddr_word: i64,
 }
 
 impl JitCallTarget {
@@ -95,6 +100,31 @@ impl JitCallTarget {
             concrete_ptr,
             effect_info_slot: crate::call_descr::EffectInfoSlot::CanRaise,
             save_err: 0,
+            fnaddr_word: 0,
+        }
+    }
+
+    /// Pair both pointers with the full funcaddr word. The pointer
+    /// narrowing drops bits above `usize` on wasm32; `fnaddr_word`
+    /// keeps the symbolic-hash tag for `is_symbolic_fnaddr`.
+    pub fn from_fnaddr(funcptr: i64) -> Self {
+        let ptr = funcptr as *const ();
+        Self {
+            trace_ptr: ptr,
+            concrete_ptr: ptr,
+            effect_info_slot: crate::call_descr::EffectInfoSlot::CanRaise,
+            save_err: 0,
+            fnaddr_word: funcptr,
+        }
+    }
+
+    /// Word `is_symbolic_fnaddr` must see. A recorded funcaddr wins
+    /// over the narrowed pointer.
+    pub fn fnaddr_for_symbolic_check(self, concrete_ptr: *const ()) -> i64 {
+        if self.fnaddr_word != 0 {
+            self.fnaddr_word
+        } else {
+            concrete_ptr as i64
         }
     }
 
@@ -113,6 +143,7 @@ impl JitCallTarget {
             concrete_ptr,
             effect_info_slot,
             save_err: 0,
+            fnaddr_word: 0,
         }
     }
 
@@ -131,6 +162,7 @@ impl JitCallTarget {
             concrete_ptr,
             effect_info_slot,
             save_err,
+            fnaddr_word: 0,
         }
     }
 }

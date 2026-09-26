@@ -263,50 +263,34 @@ fn detached_recursion_state_set(depth: usize, accounted: usize) {
 
 /// Read `(py_recursion_depth, accounted_activation)` from `home`.
 ///
-/// Reached through field addresses rather than through `as_ref` / `as_mut`:
-/// the plain evaluator mints a `&mut PyExecutionContext` over this same
-/// context and keeps it live for the whole activation (`eval.rs`, the
-/// `execution_context` that spans `enter` to `leave`), while anything nested
-/// inside that activation -- `enter_native_dispatch`, a re-entered frame --
-/// reaches this pair.  A whole-context reference minted here would alias that
-/// one; a raw field access borrows no more than the field it names.
+/// PyPy reads these slots straight off the live execution context
+/// (`executioncontext.py ExecutionContext`). A `(*home).field` projection is
+/// the shape `rewrite_op_getfield` already lowers to `getfield_raw_i` (the
+/// same raw integer field load as `profilefunc`). `(&raw const
+/// (*home).field).read()` is not that load: the codewriter leaves it as
+/// `const_ptr::<Impl>::read`, a symbolic residual the portal walk cannot
+/// execute.
 #[inline]
 fn recursion_state_get(home: RecursionHome) -> (usize, usize) {
     if home.is_null() {
         detached_recursion_state_get()
     } else {
-        // PyPy reads recursion state directly from the live execution
-        // context (`executioncontext.py ExecutionContext`). Keep the field
-        // access visible to source translation; `raw_ptr::as_ref` would
-        // introduce a Rust-only `Option` call between the context and its
-        // fields. Use field addresses rather than `&*home`: the evaluator
-        // already holds `&mut PyExecutionContext` across this call.
-        unsafe {
-            (
-                (&raw const (*home).py_recursion_depth).read(),
-                (&raw const (*home).accounted_activation).read(),
-            )
-        }
+        unsafe { ((*home).py_recursion_depth, (*home).accounted_activation) }
     }
 }
 
 /// Write `(py_recursion_depth, accounted_activation)` back to `home`.
 ///
-/// Same field-address treatment as [`recursion_state_get`], for the same
-/// reason -- and the write half is the one that matters, since a second
-/// mutable reference is what invalidates the evaluator's own.
+/// Twin of [`recursion_state_get`]: a field store, so `rewrite_op_setfield`
+/// emits `setfield_raw_i` instead of residualising `mut_ptr::<Impl>::write`.
 #[inline]
 fn recursion_state_set(home: RecursionHome, depth: usize, accounted: usize) {
     if home.is_null() {
         detached_recursion_state_set(depth, accounted);
     } else {
-        // Write-side twin of `recursion_state_get`: field addresses, not a
-        // whole-context `&mut`, so this does not alias the evaluator's
-        // live reference. The execution-context fields remain the
-        // translated state.
         unsafe {
-            (&raw mut (*home).py_recursion_depth).write(depth);
-            (&raw mut (*home).accounted_activation).write(accounted);
+            (*home).py_recursion_depth = depth;
+            (*home).accounted_activation = accounted;
         }
     }
 }
@@ -449,12 +433,34 @@ pub fn enter_runtime_thread() {
 /// Respects the force-plain-eval mode.
 #[inline]
 pub fn get_eval_fn() -> EvalFn {
-    let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
-    if plain_mode {
-        eval_frame_plain
+    // The thread-local read stays in `is_force_plain_eval`. Inlined here it
+    // is a call whose target is the `FORCE_PLAIN_EVAL` static, a symbolic
+    // path the portal walk cannot execute.
+    //
+    // Both arms produce the address word and one transmute follows: a
+    // function item in one arm and a transmuted word in the other merge as
+    // `Ptr(Func) ∪ Integer`, which the annotator has no arm for.
+    let addr = if is_force_plain_eval() {
+        plain_eval_fn_addr()
     } else {
-        EVAL_OVERRIDE.get().copied().unwrap_or(eval_frame_plain)
-    }
+        // `EVAL_OVERRIDE` is a `OnceLock` static. Reading it in the portal
+        // graph is a symbolic path. The word comes back from a residual
+        // and is the registered eval function.
+        current_eval_fn_addr()
+    };
+    unsafe { std::mem::transmute::<usize, EvalFn>(addr) }
+}
+
+/// Address of `eval_frame_plain`, the evaluator "force plain eval" selects.
+#[majit_macros::dont_look_inside]
+pub fn plain_eval_fn_addr() -> usize {
+    eval_frame_plain as usize
+}
+
+/// Address of the process eval function (`EVAL_OVERRIDE`, else plain).
+#[majit_macros::dont_look_inside]
+pub fn current_eval_fn_addr() -> usize {
+    EVAL_OVERRIDE.get().copied().unwrap_or(eval_frame_plain) as usize
 }
 
 /// Execute a newly-created frame through the process-selected evaluator using
@@ -562,17 +568,106 @@ pub fn unpack_merge_point(greenkey: PyObjectRef, w_iterator: PyObjectRef, items:
 /// jd `generatorentry_driver` (`generator.py`): greens=`pycode`,
 /// reds=`gen`, `w_arg`. Called from `send_ex` when `we_are_jitted()`
 /// and `should_not_inline(pycode)`.
-type GenEntryMergeFn = fn(w_gen: PyObjectRef, w_arg: PyObjectRef, pycode: PyObjectRef);
+type GenEntryMergeFn = fn(
+    w_gen: PyObjectRef,
+    w_arg: PyObjectRef,
+    pycode: PyObjectRef,
+) -> Option<Result<PyObjectRef, crate::PyError>>;
 static GENENTRY_MERGE_HOOK: OnceLock<GenEntryMergeFn> = OnceLock::new();
 
 pub fn register_genentry_merge_hook(f: GenEntryMergeFn) {
     let _ = GENENTRY_MERGE_HOOK.set(f);
 }
 
+/// `None` means the warm state stayed in the interpreter (`maybe_compile_and_run`
+/// returned without raising). `Some` is the portal result: the trace or the
+/// compiled assembler already resumed the generator.
 #[inline]
-pub fn genentry_merge_point(w_gen: PyObjectRef, w_arg: PyObjectRef, pycode: PyObjectRef) {
-    if let Some(f) = GENENTRY_MERGE_HOOK.get() {
-        f(w_gen, w_arg, pycode);
+pub fn genentry_merge_point(
+    w_gen: PyObjectRef,
+    w_arg: PyObjectRef,
+    pycode: PyObjectRef,
+) -> Option<Result<PyObjectRef, crate::PyError>> {
+    GENENTRY_MERGE_HOOK
+        .get()
+        .and_then(|f| f(w_gen, w_arg, pycode))
+}
+
+/// Clear the note and disarm it: a jd2 walk has finished, or its
+/// abort fallback consumed the note.
+pub fn genentry_resume_note_reset() {
+    let ec = getexecutioncontext() as *mut crate::PyExecutionContext;
+    if ec.is_null() {
+        return;
+    }
+    unsafe {
+        (*ec).genentry_note_armed = false;
+        (*ec).genentry_note_finished = false;
+        (*ec).genentry_note_is_err = false;
+        (*ec).genentry_note_gen = pyre_object::PY_NULL;
+        (*ec).genentry_note_word = pyre_object::PY_NULL;
+    }
+}
+
+/// Arm the note before a jd2 walk: the next resume that returns records
+/// itself. Outside a walk the note stays empty.
+pub fn genentry_resume_note_arm() {
+    genentry_resume_note_reset();
+    let ec = getexecutioncontext() as *mut crate::PyExecutionContext;
+    if ec.is_null() {
+        return;
+    }
+    unsafe {
+        (*ec).genentry_note_armed = true;
+    }
+}
+
+/// `generator_invoke_execute_frame` finally: the frame body returned and
+/// `w_generator_set_running(..., false)` has run. `word` is the yielded ref,
+/// or the exception object when `is_err`. A no-op unless a jd2 walk armed
+/// the note.
+pub fn genentry_resume_note_finish(w_gen: PyObjectRef, is_err: bool, word: u64) {
+    let ec = getexecutioncontext() as *mut crate::PyExecutionContext;
+    if ec.is_null() {
+        return;
+    }
+    unsafe {
+        if !(*ec).genentry_note_armed {
+            return;
+        }
+        (*ec).genentry_note_gen = w_gen;
+        (*ec).genentry_note_word = word as PyObjectRef;
+        (*ec).genentry_note_is_err = is_err;
+        (*ec).genentry_note_finished = true;
+    }
+}
+
+/// The note for `gen`, if that generator's frame body already returned.
+/// Consuming it clears the note, so the result is not held past this call.
+pub fn genentry_body_result_for(w_gen: PyObjectRef) -> Option<Result<PyObjectRef, crate::PyError>> {
+    let ec = getexecutioncontext() as *mut crate::PyExecutionContext;
+    if ec.is_null() {
+        return None;
+    }
+    unsafe {
+        if !(*ec).genentry_note_finished {
+            return None;
+        }
+        if (*ec).genentry_note_gen != w_gen {
+            return None;
+        }
+        let word = (*ec).genentry_note_word;
+        let is_err = (*ec).genentry_note_is_err;
+        genentry_resume_note_reset();
+        if is_err {
+            if word.is_null() {
+                return Some(Err(crate::PyError::runtime_error(
+                    "generatorentry resume produced no exception",
+                )));
+            }
+            return Some(Err(crate::PyError::from_exc_object(word)));
+        }
+        Some(Ok(word))
     }
 }
 
@@ -723,6 +818,10 @@ impl Drop for ForcePlainEvalGuard {
 }
 
 /// Check if force-plain-eval mode is active.
+///
+/// `dont_look_inside`: the `FORCE_PLAIN_EVAL` thread-local `.with` read has
+/// no extractable graph, same as `take_last_exec_ctx`.
+#[majit_macros::dont_look_inside]
 pub fn is_force_plain_eval() -> bool {
     FORCE_PLAIN_EVAL.with(|c| c.get() > 0)
 }

@@ -4209,9 +4209,8 @@ impl JitCodeBuilder {
             args,
             calldescr,
         );
-        let funcptr = funcptr as *const ();
         self.call_descr_to_call_target
-            .insert(calldescr_idx, JitCallTarget::new(funcptr, funcptr));
+            .insert(calldescr_idx, JitCallTarget::from_fnaddr(funcptr));
     }
 
     /// Generic canonical `*_v` emission body shared by `residual_call`,
@@ -5023,9 +5022,8 @@ impl JitCodeBuilder {
             dst,
             JitArgKind::Int,
         );
-        let funcptr = funcptr as *const ();
         self.call_descr_to_call_target
-            .insert(calldescr_idx, JitCallTarget::new(funcptr, funcptr));
+            .insert(calldescr_idx, JitCallTarget::from_fnaddr(funcptr));
     }
 
     #[allow(dead_code)]
@@ -5048,9 +5046,8 @@ impl JitCodeBuilder {
             dst,
             JitArgKind::Ref,
         );
-        let funcptr = funcptr as *const ();
         self.call_descr_to_call_target
-            .insert(calldescr_idx, JitCallTarget::new(funcptr, funcptr));
+            .insert(calldescr_idx, JitCallTarget::from_fnaddr(funcptr));
     }
 
     #[allow(dead_code)]
@@ -5062,9 +5059,8 @@ impl JitCodeBuilder {
         dst: u16,
     ) {
         let calldescr_idx = self.emit_canonical_call_typed_irf_f(funcptr, args, calldescr, dst);
-        let funcptr = funcptr as *const ();
         self.call_descr_to_call_target
-            .insert(calldescr_idx, JitCallTarget::new(funcptr, funcptr));
+            .insert(calldescr_idx, JitCallTarget::from_fnaddr(funcptr));
     }
 
     // `CALL_ASSEMBLER` is a trace IR op (`history.rs`, pyjitpl
