@@ -11907,7 +11907,10 @@ unsafe fn type_attr_stored_is_cell_w(
     w_name: PyObjectRef,
     version_tag: u64,
 ) -> bool {
-    debug_assert_ne!(version_tag, 0, "an uncacheable type has no method-cache entry");
+    debug_assert_ne!(
+        version_tag, 0,
+        "an uncacheable type has no method-cache entry"
+    );
     let value = unsafe { _pure_lookup_where_with_method_cache(w_type, w_name, version_tag) };
     !value.is_null() && unsafe { pyre_object::celldict::is_mutable_cell(value) }
 }

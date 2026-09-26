@@ -6729,8 +6729,8 @@ mod tests {
             bindings["pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w"],
             expected,
         );
-        let drop_expected = pyre_object::gc_roots::root_scope_drop_in_place_jit_abi as *const ()
-            as usize as i64;
+        let drop_expected =
+            pyre_object::gc_roots::root_scope_drop_in_place_jit_abi as *const () as usize as i64;
         assert_eq!(
             bindings["gc_roots::RootScope::drop_in_place"],
             drop_expected,
