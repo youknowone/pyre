@@ -5746,8 +5746,8 @@ pub unsafe fn w_module_dict_values_inner(obj: PyObjectRef) -> Vec<PyObjectRef> {
 /// Keys that carry a lone surrogate (not valid UTF-8) are skipped:
 /// the remaining `&str`-keyed consumers (dict_storage_store, module
 /// `__dir__`, builtins-module iteration) cannot yet represent a
-/// surrogate key, so skipping them here avoids the [`w_str_get_value`]
-/// panic.  The keyword-argument ABI no longer uses this helper — it
+/// surrogate key, so skipping them here avoids a UTF-8 view of WTF-8
+/// storage.  The keyword-argument ABI no longer uses this helper — it
 /// threads the byte-ish key through [`w_dict_str_entries_wtf8`].
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
