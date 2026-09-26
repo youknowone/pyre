@@ -1211,85 +1211,18 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // Without this, every impl method built by the MIR driver looks
         // like a free function to the canonical registration loop and
         // the impl-key return-type / hint registrations get dropped.
-        let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
-        let trait_impl_id = trait_impl_id_for_fundecl(fd);
-        let graph = if let Some(owner) = &self_ty_root {
-            let source_identity = match trait_impl_id {
-                Some(impl_id) => format!("{module_path}::{owner}::<Impl#{impl_id}>::{name}"),
-                None => format!("{module_path}::{owner}::{name}"),
-            };
-            graph
-                .with_owner_root(owner.clone())
-                .with_source_identity(source_identity)
-        } else {
-            graph.with_source_identity(fn_path.clone())
-        };
-        let graph = graph.with_fun_decl_id(fd.def_id);
-        // Surface trait identity for trait-impl methods so the
-        // canonical registration loop can call `register_trait_method`
-        // instead of routing through `extract_trait_impls`.  Inherent
-        // impls leave `trait_root = None`; trait-impl methods carry the
-        // trait's leaf name.
-        //
-        // Two sources feed `trait_root`:
-        //   1. trait-impl bodies — penultimate NameSeg is `Impl{Trait:id}`
-        //      indirecting through `trait_impls`.  `trait_impl_trait_path_for_fundecl`
-        //      reads the id; `trait_qualified` keeps the full path so
-        //      the unique-impl map can key on trait identity.
-        //   2. trait-default bodies — Charon emits these as bare
-        //      functions inside the trait's namespace; the penultimate
-        //      NameSeg is `Ident{TraitLeaf}` with no `Impl` segment.
-        //      Detect by matching the parent ident against
-        //      `known_trait_names` (which derive_program_metadata seeds
-        //      with both qualified path and bare leaf).
-        let trait_qualified = trait_impl_trait_path_for_fundecl(llbc, fd);
-        let trait_root = trait_qualified
-            .as_ref()
-            .and_then(|p| p.rsplit("::").next())
-            .map(str::to_string)
-            .or_else(|| trait_default_owner_for_fundecl(fd, &known_trait_names));
-        let gcref_result = gc_root_gcref_result_path(&fn_path);
-        let returns_objectptr =
-            output_type_is_objectptr(&fd.signature.output, llbc) && !gcref_result;
-        // `dont_look_inside` / `elidable` callees and every trait-method
-        // member of an indirect-call row stamp FUNC.RESULT.  RPython's
-        // `FunctionReprBase.call` reads that row from `FuncType.RESULT`.
-        // Left `None`, pyre maps it to `Void`, so a callee whose body
-        // produces a scalar disagrees with the call's `result_ty`.
-        // A `repr(transparent)` scalar wrapper is that word: the same
-        // token an opaque callee gets, including an inherent constructor
-        // that is not itself a trait method.
-        // Aggregate `"ref"` results stay unstamped — the call-signature
-        // validator skips a missing declaration, and a struct name is not
-        // a register class.
-        let stamp_return_token = dont_look_inside.contains(&fn_path)
-            || elidable_residual.contains(&fn_path)
-            || trait_root.is_some();
-        let signature_token = if gcref_result {
-            Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
-        } else {
-            dont_look_inside_return_token(&fd.signature.output, llbc, static_addrs.error_carrier)
-        };
-        let return_type = if gcref_result || stamp_return_token {
-            signature_token
-        } else if signature_token.as_deref().is_some_and(scalar_result_token) {
-            signature_token
-        } else {
-            None
-        };
-        functions.push(crate::front::semantic::SemanticFunction {
-            name,
+        functions.push(semantic_function_from_lowered(
+            llbc,
+            fd,
             graph,
-            return_type,
-            self_ty_root,
-            trait_impl_id,
-            fun_decl_id: Some(fd.def_id),
+            name,
             module_path,
-            hints: Vec::new(),
-            trait_root,
-            trait_qualified,
-            returns_objectptr,
-        });
+            &fd.signature,
+            &known_trait_names,
+            &dont_look_inside,
+            &elidable_residual,
+            static_addrs.error_carrier,
+        ));
     }
     // `specialize.py` `cachedgraph` keys one graph per instantiation. The
     // walk above enqueues each concrete call; lowering a copy enqueues the
@@ -1336,73 +1269,25 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         ) else {
             continue;
         };
-        let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
-        let trait_impl_id = trait_impl_id_for_fundecl(fd);
         let stripped = strip_crate_prefix(&fd.item_meta.name_path());
         let module_path = stripped
             .rsplit_once("::")
             .map(|(module, _)| module.to_string())
             .unwrap_or_default();
         let name = req.leaf;
-        let segments = spec_segments(llbc, fd, &name);
-        graph.name = segments.join("::");
-        let source_identity = match (&self_ty_root, trait_impl_id) {
-            (Some(owner), Some(impl_id)) => {
-                format!("{module_path}::{owner}::<Impl#{impl_id}>::{name}")
-            }
-            (Some(owner), None) => format!("{module_path}::{owner}::{name}"),
-            _ => graph.name.clone(),
-        };
-        let graph = if let Some(owner) = &self_ty_root {
-            graph
-                .with_owner_root(owner.clone())
-                .with_source_identity(source_identity)
-        } else {
-            graph.with_source_identity(source_identity)
-        };
-        let graph = graph.with_fun_decl_id(fd.def_id);
-        let trait_qualified = trait_impl_trait_path_for_fundecl(llbc, fd);
-        let trait_root = trait_qualified
-            .as_ref()
-            .and_then(|p| p.rsplit("::").next())
-            .map(str::to_string)
-            .or_else(|| trait_default_owner_for_fundecl(fd, &known_trait_names));
-        let fn_path = if module_path.is_empty() {
-            name.clone()
-        } else {
-            format!("{module_path}::{name}")
-        };
-        let gcref_result = gc_root_gcref_result_path(&fn_path);
-        let returns_objectptr =
-            output_type_is_objectptr(&signature.output, llbc) && !gcref_result;
-        let stamp_return_token = dont_look_inside.contains(&fn_path)
-            || elidable_residual.contains(&fn_path)
-            || trait_root.is_some();
-        let signature_token = if gcref_result {
-            Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
-        } else {
-            dont_look_inside_return_token(&signature.output, llbc, static_addrs.error_carrier)
-        };
-        let return_type = if gcref_result || stamp_return_token {
-            signature_token
-        } else if signature_token.as_deref().is_some_and(scalar_result_token) {
-            signature_token
-        } else {
-            None
-        };
-        functions.push(crate::front::semantic::SemanticFunction {
-            name,
+        graph.name = spec_segments(llbc, fd, &name).join("::");
+        functions.push(semantic_function_from_lowered(
+            llbc,
+            fd,
             graph,
-            return_type,
-            self_ty_root,
-            trait_impl_id,
-            fun_decl_id: Some(fd.def_id),
+            name,
             module_path,
-            hints: Vec::new(),
-            trait_root,
-            trait_qualified,
-            returns_objectptr,
-        });
+            &signature,
+            &known_trait_names,
+            &dont_look_inside,
+            &elidable_residual,
+            static_addrs.error_carrier,
+        ));
     }
     // `specialize.py default_specialize` runs while the annotator walks
     // calls; on this path the whole function set has to exist first, so it
@@ -1487,6 +1372,88 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         foreign_opaque_method_externals: Vec::new(),
         atomic_load_decls,
     })
+}
+
+/// One lowered body as a `SemanticFunction`. `name` is the bare leaf or
+/// the specialized leaf; `signature` is the declaration signature or the
+/// substituted copy. Both loops register through this function.
+fn semantic_function_from_lowered(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    graph: crate::model::FunctionGraph,
+    name: String,
+    module_path: String,
+    signature: &majit_charon_reader::ullbc::Signature,
+    known_trait_names: &std::collections::HashSet<String>,
+    dont_look_inside: &std::collections::HashSet<String>,
+    elidable_residual: &std::collections::HashSet<String>,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+) -> crate::front::semantic::SemanticFunction {
+    let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
+    let trait_impl_id = trait_impl_id_for_fundecl(fd);
+    let fn_path = if module_path.is_empty() {
+        name.clone()
+    } else {
+        format!("{module_path}::{name}")
+    };
+    let source_identity = match (&self_ty_root, trait_impl_id) {
+        (Some(owner), Some(impl_id)) => {
+            format!("{module_path}::{owner}::<Impl#{impl_id}>::{name}")
+        }
+        (Some(owner), None) => format!("{module_path}::{owner}::{name}"),
+        _ => fn_path.clone(),
+    };
+    let graph = if let Some(owner) = &self_ty_root {
+        graph
+            .with_owner_root(owner.clone())
+            .with_source_identity(source_identity)
+    } else {
+        graph.with_source_identity(source_identity)
+    };
+    let graph = graph.with_fun_decl_id(fd.def_id);
+    // Trait-impl methods carry the trait leaf so registration calls
+    // `register_trait_method`. Inherent impls leave `trait_root` empty.
+    // Trait-default bodies match the parent ident against `known_trait_names`.
+    let trait_qualified = trait_impl_trait_path_for_fundecl(llbc, fd);
+    let trait_root = trait_qualified
+        .as_ref()
+        .and_then(|p| p.rsplit("::").next())
+        .map(str::to_string)
+        .or_else(|| trait_default_owner_for_fundecl(fd, known_trait_names));
+    let gcref_result = gc_root_gcref_result_path(&fn_path);
+    let returns_objectptr = output_type_is_objectptr(&signature.output, llbc) && !gcref_result;
+    // `dont_look_inside` / `elidable` callees and every trait-method
+    // member of an indirect-call row stamp FUNC.RESULT.
+    // A `repr(transparent)` scalar wrapper is that word.
+    // Aggregate `"ref"` results stay unstamped.
+    let stamp_return_token = dont_look_inside.contains(&fn_path)
+        || elidable_residual.contains(&fn_path)
+        || trait_root.is_some();
+    let signature_token = if gcref_result {
+        Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
+    } else {
+        dont_look_inside_return_token(&signature.output, llbc, error_carrier)
+    };
+    let return_type = if gcref_result || stamp_return_token {
+        signature_token
+    } else if signature_token.as_deref().is_some_and(scalar_result_token) {
+        signature_token
+    } else {
+        None
+    };
+    crate::front::semantic::SemanticFunction {
+        name,
+        graph,
+        return_type,
+        self_ty_root,
+        trait_impl_id,
+        fun_decl_id: Some(fd.def_id),
+        module_path,
+        hints: Vec::new(),
+        trait_root,
+        trait_qualified,
+        returns_objectptr,
+    }
 }
 
 fn should_lower_module(
