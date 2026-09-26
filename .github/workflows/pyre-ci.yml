@@ -1088,10 +1088,8 @@ jobs:
         include:
         - backend: dynasm
           label: dynasm
-          only: --dynasm-only
         - backend: cranelift
           label: cranelift
-          only: --cranelift-only
     env:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.
@@ -1257,10 +1255,14 @@ jobs:
       # its whole history that way: thirteen real parity failures sat unseen
       # until one run happened to get past check.py. The job still fails on
       # either — this only stops one from hiding the other.
-      if: ${{ !cancelled() }}
+      #
+      # dynasm only: the cranelift binary is the core build, which has no
+      # `pyre-module`, and these suites import its stdlib modules. The same
+      # holds for the two suite steps below.
+      if: ${{ !cancelled() && contains(matrix.backend, 'dynasm') }}
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
-      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/parity_tests/run.py ${{ matrix.only }}
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/parity_tests/run.py --dynasm-only
     - name: Run pyre/extra_tests/snippets (gated subset)
       # The snippet corpus is mostly imported from RustPython and is not all
       # green, so only the scripts declaring `# pyre-check: gate=1` run here —
@@ -1271,10 +1273,10 @@ jobs:
       # asserting the same thing cannot notice.
       #
       # Same `!cancelled()` reasoning as the parity step above.
-      if: ${{ !cancelled() }}
+      if: ${{ !cancelled() && contains(matrix.backend, 'dynasm') }}
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
-      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/run.py --gated-only ${{ matrix.only }}
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/run.py --gated-only --dynasm-only
     - name: Run pyre/extra_tests/cpyext
       # check.py's dynasm build carries `cpyext` (pyre/check.py backend table
       # "extra": [..., "dynasm,cpyext"]), and these were previously one Rust
@@ -1287,9 +1289,10 @@ jobs:
       # runs; the rest of the tree needs pytest surface, third-party packages,
       # or PyPy modules that are not here. Windows selects nothing today and
       # the runner exits 0 saying so.
+      if: contains(matrix.backend, 'dynasm')
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
-      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/upstream/run.py ${{ matrix.only }}
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/upstream/run.py --dynasm-only
     - name: JIT structural stats vs committed baseline (Linux, informational)
       # Diff each benchmark's [jit-stats] counters against the committed
       # pyre/bench/<name>.<backend>.jitstats baselines. The counters are decided
@@ -1424,13 +1427,12 @@ jobs:
     strategy:
       # Both backends in one job rather than one job each: see the runner-second
       # measurements on `&pyre-check-backends`. The single entry keeps
-      # `matrix.backend` / `matrix.label` / `matrix.only` defined for the shared
+      # `matrix.backend` and `matrix.label` defined for the shared
       # steps, and the steps that name one backend are gated on Linux anyway.
       matrix:
         include:
         - backend: dynasm,cranelift
           label: dynasm+cranelift
-          only: ""
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
@@ -1445,14 +1447,13 @@ jobs:
       # dynasm alone here. cranelift keeps its own ubuntu leg and rides the
       # collapsed macOS job, so what this drops is cranelift on a Windows host,
       # and what it saves is this job's second release build. The single entry
-      # keeps `matrix.backend` / `matrix.label` / `matrix.only` defined for the
+      # keeps `matrix.backend` and `matrix.label` defined for the
       # shared steps, and the steps that name one backend are gated on Linux
       # anyway.
       matrix:
         include:
         - backend: dynasm
           label: dynasm
-          only: --dynasm-only
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
