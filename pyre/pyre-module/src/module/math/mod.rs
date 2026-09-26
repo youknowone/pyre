@@ -17,65 +17,30 @@ pyre_interpreter::py_module! {
         "nan" => pyre_object::floatobject::w_float_new(pymath::math::NAN),
     },
     module_functions: {
-        // Trigonometric
-        "sin"   / 1 = m::sin,
-        "cos"   / 1 = m::cos,
-        "tan"   / 1 = m::tan,
-        "asin"  / 1 = m::asin,
-        "acos"  / 1 = m::acos,
-        "atan"  / 1 = m::atan,
-        "atan2" / 2 = m::atan2,
-        "sinh"  / 1 = m::sinh,
-        "cosh"  / 1 = m::cosh,
-        "tanh"  / 1 = m::tanh,
-        "asinh" / 1 = m::asinh,
-        "acosh" / 1 = m::acosh,
-        "atanh" / 1 = m::atanh,
+        // Trigonometric. The one- and two-argument float builtins are
+        // installed in `extra_init` as `__majit_wrap_math_*`.
 
-        // Exponential / logarithmic
-        // `sqrt` is installed in `extra_init` as `__majit_wrap_math_sqrt`.
-        "cbrt"  / 1 = m::cbrt,
-        "exp"   / 1 = m::exp,
-        "exp2"  / 1 = m::exp2,
-        "expm1" / 1 = m::expm1,
-        "log"   / * = m::log,
+        // Exponential / logarithmic. sqrt/cbrt/log/log1p/exp/exp2/expm1/pow
+        // are installed in `extra_init`.
         "log2"  / 1 = m::log2,
         "log10" / 1 = m::log10,
-        "log1p" / 1 = m::log1p,
-        "pow"   / 2 = m::pow,
 
-        // Gamma / error
-        "erf"    / 1 = m::erf,
-        "erfc"   / 1 = m::erfc,
-        "gamma"  / 1 = m::gamma,
-        "lgamma" / 1 = m::lgamma,
+        // Gamma / error. erf/erfc/gamma/lgamma are installed in `extra_init`.
 
-        // Rounding / truncation
-        "floor" / 1 = m::floor,
-        "ceil"  / 1 = m::ceil,
-        "trunc" / 1 = m::trunc,
+        // Rounding / truncation: floor/ceil/trunc are installed in `extra_init`.
 
-        // Floating-point manipulation
-        "fabs"      / 1 = m::fabs,
-        "fmod"      / 2 = m::fmod,
-        "copysign"  / 2 = m::copysign,
-        "remainder" / 2 = m::remainder,
-        "frexp"     / 1 = m::frexp,
-        "ldexp"     / 2 = m::ldexp,
+        // Floating-point manipulation. `fabs`, `ulp`, `frexp`, `ldexp`,
+        // `fmod`, `copysign` and `remainder` are installed in `extra_init`.
         "modf"      / 1 = m::modf,
         "nextafter" / * = m::nextafter,
-        "ulp"       / 1 = m::ulp,
         "fma"       / 3 = m::fma,
 
-        // Classification
+        // Classification. `isclose` is installed in `extra_init`.
         "isinf"    / 1 = m::isinf,
         "isnan"    / 1 = m::isnan,
         "isfinite" / 1 = m::isfinite,
-        "isclose"  / * = m::isclose,
 
-        // Conversion
-        "degrees" / 1 = m::degrees,
-        "radians" / 1 = m::radians,
+        // Conversion. `degrees` and `radians` are installed in `extra_init`.
 
         // Multi-dimensional
         "hypot" / * = m::hypot,
@@ -92,20 +57,75 @@ pyre_interpreter::py_module! {
         "lcm"   / * = m::lcm,
         "comb"  / 2 = m::comb,
         "perm"  / * = m::perm,
-        "isqrt" / 1 = m::isqrt,
+        // `isqrt` is installed in `extra_init`.
     },
     extra_init: |ns| {
         // Module builtin, not a method descriptor: `BuiltinCode.func` is the
         // gateway itself so builtin-call descent walks it.
+        let install = |name: &'static str, func: pyre_interpreter::BuiltinCodeFn| {
+            pyre_interpreter::module_ns_store(
+                ns,
+                name,
+                pyre_interpreter::make_module_builtin_function_with_arity(name, func, 1),
+            );
+        };
+        install("sqrt", m::__majit_wrap_math_sqrt);
+        install("sin", m::__majit_wrap_math_sin);
+        install("cos", m::__majit_wrap_math_cos);
+        install("tan", m::__majit_wrap_math_tan);
+        install("asin", m::__majit_wrap_math_asin);
+        install("acos", m::__majit_wrap_math_acos);
+        install("atan", m::__majit_wrap_math_atan);
+        install("tanh", m::__majit_wrap_math_tanh);
+        install("asinh", m::__majit_wrap_math_asinh);
+        install("acosh", m::__majit_wrap_math_acosh);
+        install("atanh", m::__majit_wrap_math_atanh);
+        install("log1p", m::__majit_wrap_math_log1p);
+        install("cbrt", m::__majit_wrap_math_cbrt);
+        install("erf", m::__majit_wrap_math_erf);
+        install("erfc", m::__majit_wrap_math_erfc);
+        install("ulp", m::__majit_wrap_math_ulp);
+        install("degrees", m::__majit_wrap_math_degrees);
+        install("radians", m::__majit_wrap_math_radians);
+        install("fabs", m::__majit_wrap_math_fabs);
+        install("exp", m::__majit_wrap_math_exp);
+        install("exp2", m::__majit_wrap_math_exp2);
+        install("expm1", m::__majit_wrap_math_expm1);
+        install("sinh", m::__majit_wrap_math_sinh);
+        install("cosh", m::__majit_wrap_math_cosh);
+        install("gamma", m::__majit_wrap_math_gamma);
+        install("lgamma", m::__majit_wrap_math_lgamma);
+        install("floor", m::__majit_wrap_math_floor);
+        install("ceil", m::__majit_wrap_math_ceil);
+        install("trunc", m::__majit_wrap_math_trunc);
+        // `frexp` stays on the walker fold `math_frexp`: its gateway would
+        // root the mantissa box across the exponent box, and a root bracket
+        // does not lower in a walked body.
+        install("frexp", m::frexp);
+        install("isqrt", m::__majit_wrap_math_isqrt);
+        // Optional base, or keyword tolerances: not a fixed arity-1 builtin.
         pyre_interpreter::module_ns_store(
             ns,
-            "sqrt",
-            pyre_interpreter::make_module_builtin_function_with_arity(
-                "sqrt",
-                m::__majit_wrap_math_sqrt,
-                1,
-            ),
+            "log",
+            pyre_interpreter::make_module_builtin_function("log", m::__majit_wrap_math_log),
         );
-        m::register_jit_builtin_wrappers(ns);
+        pyre_interpreter::module_ns_store(
+            ns,
+            "isclose",
+            pyre_interpreter::make_module_builtin_function("isclose", m::__majit_wrap_math_isclose),
+        );
+        let install2 = |name: &'static str, func: pyre_interpreter::BuiltinCodeFn| {
+            pyre_interpreter::module_ns_store(
+                ns,
+                name,
+                pyre_interpreter::make_module_builtin_function_with_arity(name, func, 2),
+            );
+        };
+        install2("pow", m::__majit_wrap_math_pow);
+        install2("fmod", m::__majit_wrap_math_fmod);
+        install2("copysign", m::__majit_wrap_math_copysign);
+        install2("remainder", m::__majit_wrap_math_remainder);
+        install2("atan2", m::__majit_wrap_math_atan2);
+        install2("ldexp", m::__majit_wrap_math_ldexp);
     },
 }
