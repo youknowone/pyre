@@ -2952,8 +2952,11 @@ impl<'a> RegAlloc<'a> {
             | GuardKind::Overflow
             | GuardKind::NotInvalidated
             | GuardKind::FutureCondition
-            | GuardKind::NotForced
             | GuardKind::AlwaysFails => self.consider_guard_no_args_j2(fail_args, i, output),
+            GuardKind::NotForced if op.opcode == OpCode::GuardNotForced2 => {
+                self.consider_guard_not_forced_2_j2(fail_args, i, output)
+            }
+            GuardKind::NotForced => self.consider_guard_no_args_j2(fail_args, i, output),
             GuardKind::Exception => {
                 self.consider_guard_exception_j2(args, fail_args, op, i, output)
             }

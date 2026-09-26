@@ -2962,7 +2962,7 @@ mod tests {
         rd_consts.push(majit_ir::Const::Int(123_456_789));
         let rd_consts_len = rd_consts.len();
 
-        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_int_rc(1)];
         let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 1)]);
         let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Ref, Type::Int]);
         if let Some(fd) = descr.as_fail_descr() {
@@ -3009,10 +3009,10 @@ mod tests {
     #[test]
     fn test_build_guard_metadata_prefers_explicit_fail_arg_types_over_stale_inputarg_types() {
         let inputargs = vec![
-            InputArg::new_ref(0),
-            InputArg::new_ref(1),
-            InputArg::new_ref(2),
-            InputArg::new_ref(3),
+            InputArg::new_ref_rc(0),
+            InputArg::new_ref_rc(1),
+            InputArg::new_ref_rc(2),
+            InputArg::new_ref_rc(3),
         ];
         let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Ref, 0)]);
         let fail_arg_types = vec![Type::Ref, Type::Ref, Type::Int, Type::Int];
@@ -3050,7 +3050,7 @@ mod tests {
             rooted_inputarg_operand(Type::Int, 0),
             rooted_inputarg_operand(Type::Ref, 1),
         ]);
-        let types = exit_types_for_guard_or_finish(&guard, false, &[] as &[InputArg]);
+        let types = exit_types_for_guard_or_finish::<InputArgRc>(&guard, false, &[]);
         assert_eq!(&types[..], &[Type::Int, Type::Ref]);
     }
 
@@ -3178,7 +3178,7 @@ mod tests {
 
     #[test]
     fn test_build_guard_metadata_restamps_frontend_source_op_index() {
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let value = rooted_inputarg_operand(Type::Int, 0);
         let prefix = Op::new(OpCode::SameAsI, std::slice::from_ref(&value));
         let descr = make_fail_descr_with_index(0, 1);

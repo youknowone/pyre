@@ -3356,11 +3356,10 @@ impl Backend for DynasmBackend {
         // grab_exc_value (llmodel.py): read jf_guard_exc off the deadframe
         // tip before the libc jitframe chain is freed (same as execute_token).
         let exception_value = GcRef(unsafe { (*result_jf).jf_guard_exc });
+        let savedata = GcRef(unsafe { (*result_jf).jf_savedata });
         let guard_value_operand = majit_backend::guard_value_counter_slot(descr_fd)
             .map(|slot| unsafe { crate::llmodel::get_int_value_direct(result_jf, slot) as i64 });
 
-        // No deadframe is built on this path. A collector frame becomes
-        // unreachable here; a host frame's chain is freed.
         if !gc_object {
             unsafe { majit_backend::libc_deadframe::free_jitframe_chain(jf_ptr) };
         }
@@ -3369,7 +3368,7 @@ impl Backend for DynasmBackend {
             outputs,
             typed_outputs,
             exit_layout,
-            savedata: None,
+            savedata: (!savedata.is_null()).then_some(savedata),
             exception_value,
             fail_index: descr_fd.fail_index_per_trace(),
             trace_id: descr_fd.trace_id(),

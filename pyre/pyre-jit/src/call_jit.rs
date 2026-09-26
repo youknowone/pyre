@@ -2805,7 +2805,6 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             Some(vrefinfo_dyn), // resume.py blackhole_from_resumedata metainterp_sd.virtualref_info
             vinfo_arg, // resume.py blackhole_from_resumedata self.jitdriver_sd.virtualizable_info
             None,      // resume.py blackhole_from_resumedata greenfield_info unused in pyre
-            None,      // heap PyFrame identity remains the live TAGBOX
             all_virtuals, // resume.py blackhole_from_resumedata GUARD_NOT_FORCED cache
             &allocator,
         )
@@ -4866,6 +4865,16 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                     exit_layout.is_traced_ref_slot(index)
                 })
             };
+            // compile.py ResumeGuardForcedDescr.handle_fail reads
+            // `cpu.get_savedata_ref(deadframe)` after the bridge attempt.
+            // `dead_frame_from_ran_frame` already copied `jf_savedata`;
+            // root that copy across the same window.
+            let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+            let _savedata_root = unsafe {
+                majit_metainterp::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| {
+                    savedata.is_some()
+                })
+            };
             let attempt =
                 try_compile_ca_bridge(&descr_arc, &raw_values, guard_value_operand, guard_exc);
             if attempt.terminal_declined {
@@ -4922,7 +4931,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 &exit_layout,
                 guard_exc,
                 false,
-                descr_arc.is_guard_forced().then_some(savedata).flatten(),
+                savedata,
             );
             handle_blackhole_result(bh, green_key).unwrap_or(0)
         }
@@ -7959,7 +7968,7 @@ pub fn cranelift_resumedata_deopt(
     }
     let vinfo_arg: Option<&dyn resume::VirtualizableInfo> =
         if novable { None } else { Some(vinfo_dyn) };
-    reader.consume_vref_and_vable(Some(vrefinfo_dyn), vinfo_arg, None, None);
+    reader.consume_vref_and_vable(Some(vrefinfo_dyn), vinfo_arg, None);
 
     // 7. resume.py:1339 jitcodes[jitcode_pos] lookup — same shape as
     //    blackhole_resume_via_rd_numb's resolve_jitcode,

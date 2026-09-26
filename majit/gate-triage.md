@@ -327,13 +327,6 @@ cover the condition they diagnose.
 - What it does: Names one fixed step of a compiled entry — `guard`, `heap`, `flags`, `attach`, `descr` or `arc` — that the cranelift entry repeats `frame_build_repeats()` times beside the frame build, so the entry probe's frame-build column reads that step's per-entry cost as a delta against a run with the variable unset. Unset or any other value repeats nothing. Read once and latched. Off the probe feature the accessor is never called.
 - Retirement condition: with the probe feature — it is an instrument on a feature that ships nothing.
 
-### `MAJIT_LEAF3_PROV`
-
-- Read sites: 1 — `majit/majit-metainterp/src/resume.rs`
-- Accessor: `leaf3_prov_enabled()`
-- What it does: Emits the resume tag, value, and null status of the virtualizable identity slot consumed by `consume_vable_info()`.
-- Retirement condition: Remove after the unseeded-snapshot route into `_number_boxes()` is rejected or proven unreachable.
-
 ### `MAJIT_LLBC_EXTRACTION`
 
 - Read sites: 2 — `pyre/pyre-jit-trace/build.rs`

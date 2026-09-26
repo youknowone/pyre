@@ -10964,8 +10964,15 @@ where
                 } else {
                     0
                 };
+                // A typed descr (`type_id != 0`) has a GC header and
+                // tracing layout. `alloc_oldgen_typed` returning 0 is a
+                // failed allocation; raw storage would drop both. Abort
+                // the trace. The raw fallback stays only for an untyped
+                // descr (`type_id == 0`).
                 let array_ptr = if gc_ptr != 0 {
                     gc_ptr as i64
+                } else if type_id != 0 {
+                    return TraceAction::Abort;
                 } else {
                     let layout = std::alloc::Layout::from_size_align(payload, 8)
                         .expect("BC_NEW_ARRAY: invalid array layout");

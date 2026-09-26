@@ -1081,11 +1081,24 @@ impl Trace {
         start_fresh: u32,
     ) -> Option<(Vec<OpRc>, Vec<InputArgRc>, Vec<Option<Operand>>)> {
         let trb = self.trb.as_ref()?;
+        // ByteTraceIter still seeds from `InputArg` (opencoder Trace.inputargs).
+        // Types and values come off the same InputArgRc boxes.
+        let live_plain: Vec<InputArg> = live_inputargs
+            .iter()
+            .map(|ia| {
+                let ia = ia.as_ref();
+                let plain = InputArg::from_type(ia.tp.get(), ia.index);
+                if let Some(value) = ia.get_value() {
+                    plain.set_value(value);
+                }
+                plain
+            })
+            .collect();
         let mut iter = crate::opencoder::ByteTraceIter::new_with_inputargs(
             trb,
             trb._start as usize,
             trb._pos,
-            live_inputargs,
+            &live_plain,
             start_fresh,
         );
         let mut ops = Vec::with_capacity(self.slots.len());

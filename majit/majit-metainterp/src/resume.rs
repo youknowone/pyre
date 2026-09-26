@@ -85,21 +85,6 @@ pub const NULLREF: i16 = ((-1i32 << 2) | TAGCONST as i32) as i16;
 pub const UNINITIALIZED_TAG: i16 = ((-2i32 << 2) | TAGCONST as i32) as i16;
 pub const TAG_CONST_OFFSET: i32 = 0;
 
-/// Whether the leaf-3 identity-slot census is armed (`MAJIT_LEAF3_PROV=1`).
-///
-/// Cached: the census sits on the resume path, which runs once per deopt, and
-/// a per-call `var()` would fold the probe's own cost into what it measures.
-/// Shape borrowed from `crate::stall_window`/`step_limit` — this file reads no
-/// other environment variable, so there is no local idiom to match.
-///
-/// Default OFF, unlike those two: this one prints per call, so a default-on
-/// would bury every other diagnostic in the corpus.
-fn leaf3_prov_enabled() -> bool {
-    static ARMED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("MAJIT_LEAF3_PROV").is_ok_and(|v| v == "1"));
-    *ARMED
-}
-
 /// Ordered livebox map: canonical box (`Rc::ptr_eq`) → i16 tag.
 ///
 /// `ResumeDataLoopMemo._number_boxes` / `_number_virtuals`: RPython uses
@@ -5999,7 +5984,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             None, // all_virtuals
             &NullAllocator,
         );
@@ -6046,7 +6030,7 @@ mod tests {
             None,
             &NullAllocator,
         );
-        reader.consume_vref_and_vable(None, Some(&TestVirtualizableInfo), None, None);
+        reader.consume_vref_and_vable(None, Some(&TestVirtualizableInfo), None);
     }
 
     /// resume.py:1368-1375 / compile.py:956-963 — the GUARD_NOT_FORCED resume
@@ -6104,7 +6088,6 @@ mod tests {
                 None,
                 Some(&TestVirtualizableInfo),
                 None,
-                None,
                 all_virtuals,
                 &NullAllocator,
             )
@@ -6124,82 +6107,10 @@ mod tests {
         assert_eq!(bh.position, 0);
     }
 
-    /// `next_ref_for_resume_slot` recognizes the virtualizable by
-    /// the TAGGED VALUE of the vable identity, and `NULLREF` is not an identity.
-    ///
-    /// `_number_boxes` writes `NULLREF` for every snapshot box whose OpRef is
-    /// `None`, so it is the encoding shared by every absent ref in the resume.
-    /// The vable identity is written that way exactly when the host folds its
-    /// virtualizable out of the backend failargs — which is the case
-    /// `identity_override` exists to serve. Two slots both spelled `NULLREF`
-    /// are both null; they are not the same object. Substituting the
-    /// virtualizable for one hands a live frame pointer to a register the
-    /// program left empty, and the blackhole then reads a frame where the
-    /// bytecode expects null.
-    ///
-    /// The tag itself is reader-global, not section-local: `decode_ref`
-    /// resolves against `consts`, `virtuals` and `deadframe`, and `count` is
-    /// read once when the reader is built. So this needs no second section —
-    /// one frame with one null ref register exhibits it.
-    /// Measured when this fixture landed: the control arm passes (r0 is
-    /// seeded, and null) and the subject arm reads `0xABCD`, the override, out
-    /// of a register whose resume item was `NULLREF`.
-    ///
-    /// Reachability, as far as it is settled. A writers census of the identity
-    /// slot found two ways it could be `NULLREF`, and they do not have the same
-    /// status:
-    ///
-    /// - via `get_box_replacement(..).is_none()` — impossible. The production
-    ///   `BoxEnv` resolves through `get_replacement_opref`, which returns its
-    ///   argument when the walk finds no producer, so it yields `NONE` only
-    ///   when handed `NONE`, which `_number_boxes` tests one line earlier.
-    /// - via `raw_opref.is_none()` — open. `build_vable_snapshot_boxes` cannot
-    ///   emit it (it asserts the identity is typed), but that guards snapshot
-    ///   construction, and `TreeLoop::cut_trace_from_with_consts` rewrites the
-    ///   finished snapshot afterwards, mapping unmapped pre-cut refs to `NONE`
-    ///   over `vable_boxes` too. Its seed-or-cancel check walks the snapshots
-    ///   of the post-cut ops while the rewrite walks every snapshot, so a
-    ///   snapshot no post-cut op names is rewritten with nothing able to cancel
-    ///   the compilation.
-    ///
-    /// Whether such a snapshot is then read at resume is a runtime question the
-    /// census cannot answer. The committed corpus observes only `TAGBOX(0)`;
-    /// whether `NULLREF` is unrepresentable here or merely unobserved is not
-    /// established.
-    ///
-    /// Read the denominator before the ratio. 2999 of those 3298 come from
-    /// **one** crate, `dualtape` — so the unanimity is not eight crates
-    /// agreeing, it is one crate plus 299 observations. Four of the twelve
-    /// (`braininterp`, `cel`, `tiny2`, `tiny3`) never reach this function at
-    /// all, so the population that can produce evidence is 8 of 12, not 12.
-    ///
-    /// And the probe reports the slot's VALUE, not its PROVENANCE. A zero is
-    /// equally consistent with "the unseeded-snapshot route ran and never
-    /// yielded `NULLREF`" and with "the route never ran here". The writers
-    /// census established the route exists; this establishes only that its
-    /// observable precondition did not occur in this corpus.
-    ///
-    /// `override=yes` on 3298/3298, so the assert below is evaluated on every
-    /// one of them — it is exercised, not merely present.
-    ///
-    /// `consume_vable_info` now asserts the identity is not `NULLREF` when an
-    /// override is supplied, so the aliasing encoding is refused rather than
-    /// resolved to a wrong slot.
-    ///
-    /// Run against the landed assert: the subject arm trips it in
-    /// `consume_vable_info` rather than reaching the `0xABCD` read. So the
-    /// refusal is on the path this encoding builds — reached and load-bearing,
-    /// which a compile cannot establish — and the outcome splits cleanly in
-    /// two. [`a_null_ref_register_is_seeded_when_no_identity_override_is_supplied`]
-    /// pins that the guard stays silent without an override;
-    /// [`a_null_ref_identity_is_refused_when_an_override_is_supplied`] pins that
-    /// it fires with one.
-    ///
-    /// Split rather than converted to one `#[should_panic]`: that attribute is
-    /// satisfied by EITHER arm panicking, so the control — the half proving the
-    /// guard does not over-fire — could die of an unrelated cause with the test
-    /// still green, under a name that still claims both directions.
-    fn leaf3_resume_null_identity(identity_override: Option<i64>) -> (i64, i64) {
+    /// `resume.py` `decode_ref` leaves a `NULLREF` register null.
+    /// `consume_vable_info` reads the virtualizable with `next_ref` and does
+    /// not reuse that word for any other resume slot.
+    fn leaf3_resume_null_identity() -> (i64, i64) {
         use crate::blackhole::BlackholeInterpBuilder;
         use crate::jitcode::JitCodeBuilder;
         use crate::jitcode::insns::{BC_ABORT, BC_CATCH_EXCEPTION, BC_LIVE, BC_RVMPROF_CODE};
@@ -6250,7 +6161,6 @@ mod tests {
             None, // vrefinfo
             Some(&TestVirtualizableInfo),
             None, // ginfo
-            identity_override,
             None, // all_virtuals
             &NullAllocator,
         );
@@ -6267,24 +6177,9 @@ mod tests {
     /// written are the same observation.
     #[test]
     fn a_null_ref_register_is_seeded_when_no_identity_override_is_supplied() {
-        let (virtualizable_ptr, r0) = leaf3_resume_null_identity(None);
+        let (virtualizable_ptr, r0) = leaf3_resume_null_identity();
         assert_eq!(virtualizable_ptr, 0, "NULLREF identity decodes to null");
         assert_eq!(r0, 0, "control: r0 is seeded, and null");
-    }
-
-    /// SUBJECT. `r0` holds `NULLREF`, the same spelling the folded-out identity
-    /// uses, so matching the override by tag would hand a live frame pointer to
-    /// a register the program left empty. `consume_vable_info` refuses the
-    /// encoding instead.
-    ///
-    /// `expected` is load-bearing: a bare `#[should_panic]` is satisfied by ANY
-    /// panic, including one from a fixture that stopped building the encoding
-    /// correctly and died in setup. The substring pins WHICH refusal fired.
-    #[test]
-    #[should_panic(expected = "virtualizable identity encoded as NULLREF")]
-    fn a_null_ref_identity_is_refused_when_an_override_is_supplied() {
-        const OVERRIDE: i64 = 0xABCD;
-        leaf3_resume_null_identity(Some(OVERRIDE));
     }
 
     /// resume.py `_prepare_virtuals` resets `virtuals_cache` to zeros.
@@ -6624,14 +6519,6 @@ pub struct ResumeDataDirectReader<'a> {
     /// Stored so the caller (blackhole_from_resumedata) can access it
     /// after consume_vref_and_vable completes.
     pub virtualizable_ptr: i64,
-
-    /// Resume-data tag for the virtualizable identity consumed at
-    /// resume.py. RPython later decodes the same tag through
-    /// `_callback_r`/`write_a_ref` into blackhole registers; when majit's
-    /// state-field JIT supplies a host-stack identity override, the same
-    /// override must be used for that register seed too.
-    virtualizable_identity_tagged: Option<i16>,
-    virtualizable_identity_override: Option<i64>,
 }
 
 /// resume.py:1433-1456 CPU allocation interface for virtual materialization.
@@ -7460,8 +7347,6 @@ impl<'a> ResumeDataDirectReader<'a> {
             allocator,
             all_liveness,
             virtualizable_ptr: 0,
-            virtualizable_identity_tagged: None,
-            virtualizable_identity_override: None,
         }
     }
 
@@ -7826,11 +7711,6 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     fn next_ref_for_resume_slot(&mut self) -> i64 {
         let tagged = self.resumecodereader.next_item() as i16;
-        if self.virtualizable_identity_override.is_some()
-            && self.virtualizable_identity_tagged == Some(tagged)
-        {
-            return self.virtualizable_ptr;
-        }
         // resume.py decode_ref `TAGBOX`: the payload is a deadframe index.
         if (tagged as u16) & TAGMASK as u16 == TAGBOX as u16 {
             let mut idx = (tagged >> 2) as i32;
@@ -8195,100 +8075,11 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// resume.py consume_vable_info
-    pub fn consume_vable_info(
-        &mut self,
-        vinfo: &dyn VirtualizableInfo,
-        vable_size: i32,
-        identity_override: Option<i64>,
-    ) {
-        // resume.py:1403
+    /// resume.py `consume_vable_info`
+    pub fn consume_vable_info(&mut self, vinfo: &dyn VirtualizableInfo, vable_size: i32) {
+        // resume.py consume_vable_info: virtualizable = self.next_ref()
         assert!(vable_size > 0);
-        // The vable section is encoded identity-FIRST: the snapshot writer
-        // (`_list_of_boxes_virtualizable`, opencoder.py) reorders
-        // `[field0..fieldN, vable]` to `[vable, field0..fieldN]` so the resume
-        // reader can pull the virtualizable out before its field payload. So
-        // the identity is the first of the `vable_size` items and the field
-        // payload the remaining `vable_size - 1`, read sequentially.
-        // resume.py virtualizable = self.next_ref()
-        //
-        // Consume the encoded identity even when a host supplies an override:
-        // it occupies one resume-data item and keeps the reader aligned for
-        // the field payload. Heap virtualizables (PyFrame) use this live
-        // TAGBOX exactly as RPython does. The state-field macro JIT opts in
-        // to `identity_override` because its host-stack `&state` is folded out
-        // of backend failargs; at deopt it must use the current call's address,
-        // never a trace-time pointer or an unrelated deadframe slot.
-        let tagged_identity = self.resumecodereader.next_item() as i16;
-        let encoded_identity = self.decode_ref(tagged_identity);
-        let virtualizable = identity_override.unwrap_or(encoded_identity);
-        // MAJIT_LEAF3_PROV census. The assert below refuses ONE value on ONE
-        // arm; this reports the whole distribution on every call, because
-        // "NULLREF cannot occur here" and "NULLREF was not observed here" are
-        // the two readings a silent run is consistent with, and they have
-        // opposite consequences. Placed before the branch deliberately: a
-        // census that only sees the override calls cannot measure the
-        // population the override calls are drawn from.
-        if leaf3_prov_enabled() {
-            let tag_name = match (tagged_identity & TAGMASK as i16) as u8 {
-                TAGCONST => "TAGCONST",
-                TAGINT => "TAGINT",
-                TAGBOX => "TAGBOX",
-                _ => "TAGVIRTUAL",
-            };
-            eprintln!(
-                "[leaf3-prov] identity tagged={} tag={} val={} nullref={} override={}",
-                tagged_identity,
-                tag_name,
-                tagged_identity >> 2,
-                if tagged_eq(tagged_identity, NULLREF) {
-                    "yes"
-                } else {
-                    "no"
-                },
-                if identity_override.is_some() {
-                    "yes"
-                } else {
-                    "no"
-                },
-            );
-        }
-        if identity_override.is_some() {
-            // `next_ref_for_resume_slot` routes a ref register to the override
-            // by comparing its tag against `virtualizable_identity_tagged`. That
-            // is only an identity test while the identity's tag is unique to it:
-            // `NULLREF` is the shared "no box here" encoding, so an identity
-            // recorded as `NULLREF` would claim every null ref register in the
-            // frame and hand each one the virtualizable pointer.
-            //
-            // `_number_boxes` emits `NULLREF` for a snapshot box whose `OpRef`
-            // is `NONE`, and `TreeLoop::cut_trace_from_with_consts` maps an
-            // unmapped pre-cut ref to `NONE` over `vable_boxes` as well as the
-            // frame sections. Its seed-or-cancel guard walks the snapshots of
-            // the post-cut ops, so a snapshot no post-cut op names is remapped
-            // without ever being able to cancel the compilation — the two loops
-            // iterate different populations. Refuse the aliasing encoding here
-            // rather than resolve a wrong slot silently.
-            //
-            // This BOUNDS the defect rather than closing it. It refuses the
-            // identity encoding it can name; the unseeded-snapshot case just
-            // described, which is the only remaining route, is still defaulted
-            // rather than refused. `NONE` there is a well-formed value standing
-            // in for an answer nobody computed, and that is precisely why
-            // nothing downstream can catch it — it is indistinguishable from
-            // the `NONE` that legitimately encodes a genuinely absent box.
-            assert!(
-                !tagged_eq(tagged_identity, NULLREF),
-                "virtualizable identity encoded as NULLREF while an identity \
-                 override is supplied: the tag is shared with every null ref \
-                 register, so the override cannot be matched to one slot"
-            );
-            self.virtualizable_identity_tagged = Some(tagged_identity);
-            self.virtualizable_identity_override = identity_override;
-        } else {
-            self.virtualizable_identity_tagged = None;
-            self.virtualizable_identity_override = None;
-        }
+        let virtualizable = self.next_ref();
         self.virtualizable_ptr = if virtualizable == 0 {
             0
         } else {
@@ -8311,7 +8102,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             }
         }
         vinfo.push_resume_ref_roots(self.virtualizable_ptr);
-        // resume.py:1406: assert vinfo.get_total_size(virtualizable) == vable_size - 1
+        // resume.py: assert vinfo.get_total_size(virtualizable) == vable_size - 1
         let expected = vinfo.get_total_size(self.virtualizable_ptr) as i32;
         assert!(
             expected == vable_size - 1,
@@ -8320,11 +8111,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             expected,
             vable_size - 1
         );
-        // resume.py:1407
         vinfo.reset_token_gcref(self.virtualizable_ptr);
-        // resume.py:1408 write_from_resume_data_partial reads the field
-        // payload from the remaining `vable_size - 1` items, leaving the reader
-        // positioned just past the vable section for the vref/frame chain.
         vinfo.write_from_resume_data_partial(self.virtualizable_ptr, self);
     }
 
@@ -8334,7 +8121,6 @@ impl<'a> ResumeDataDirectReader<'a> {
         vrefinfo: Option<&dyn VRefInfo>,
         vinfo: Option<&dyn VirtualizableInfo>,
         ginfo: Option<&dyn GreenfieldInfo>,
-        identity_override: Option<i64>,
     ) {
         // resume.py:1425
         let vable_size = self.resumecodereader.next_item();
@@ -8342,7 +8128,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         if self.resume_after_guard_not_forced != 2 {
             // resume.py:1427-1428
             if let Some(vi) = vinfo {
-                self.consume_vable_info(vi, vable_size, identity_override);
+                self.consume_vable_info(vi, vable_size);
             }
             // resume.py:1429-1430
             if ginfo.is_some() {
@@ -8860,7 +8646,6 @@ pub fn blackhole_from_resumedata<'a>(
     vrefinfo: Option<&dyn VRefInfo>,
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
-    virtualizable_identity_override: Option<i64>,
     // resume.py `blackhole_from_resumedata(..., all_virtuals=None)`.
     // `Some` only when resuming from a GUARD_NOT_FORCED whose
     // `handle_async_forcing` already materialized the virtuals
@@ -8918,7 +8703,7 @@ pub fn blackhole_from_resumedata<'a>(
     };
 
     // resume.py:1325
-    resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo, virtualizable_identity_override);
+    resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);
     drop(_cc_guard);
 
     // consume_vable_info rooted `virtualizable_ptr` before restoring any
@@ -9036,7 +8821,7 @@ pub fn force_from_resumedata<'a>(
         prepare_resume_heap_with_roots(&mut resumereader, rd_virtuals, rd_guard_pendingfields);
     resumereader.handling_async_forcing();
     // resume.py:1350
-    resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo, None);
+    resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);
     // resume.py:1404 the virtualizable the vable section just named. The scope
     // above roots `virtuals_ptr_cache` only, not this field, so nothing would
     // forward the reader's slot in place — read it before `force_all_virtuals`
