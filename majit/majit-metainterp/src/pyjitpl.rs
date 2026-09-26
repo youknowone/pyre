@@ -9231,6 +9231,11 @@ impl<M: Clone> MetaInterp<M> {
         // entry contract is `start_state.renamed_inputargs`, body LABEL is
         // `loop_info.label_op`). `emit_op` still rewrites residual body
         // LABEL args that share Box identity with a stripped inputarg.
+        // compile.py send_loop_to_backend: forget_optimization_info on the
+        // operations and inputargs before the virtualizable reload rewrites
+        // them through `_forwarded`.
+        forget_optimization_info(&compiled_ops);
+        forget_optimization_info(&inputargs);
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut compiled_ops,
@@ -9268,8 +9273,6 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
         let compile_start = Instant::now();
-        forget_optimization_info(&compiled_ops);
-        forget_optimization_info(&inputargs);
         // compile.py do_compile_loop: log_trace(MARK_TRACE_OPT).write(...)
         crate::rjitlog::write_trace(
             crate::rjitlog::MARK_TRACE_OPT,
@@ -10725,6 +10728,11 @@ impl<M: Clone> MetaInterp<M> {
         // the heap object at entry.
         let mut inputargs = inputargs;
         let mut combined_ops = combined_ops;
+        // compile.py send_loop_to_backend: forget_optimization_info on the
+        // operations and inputargs before the virtualizable reload rewrites
+        // them through `_forwarded`.
+        forget_optimization_info(&combined_ops);
+        forget_optimization_info(&inputargs);
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut combined_ops,
@@ -10772,8 +10780,6 @@ impl<M: Clone> MetaInterp<M> {
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_start = Instant::now();
-        forget_optimization_info(&combined_ops);
-        forget_optimization_info(&inputargs);
         // compile.py do_compile_loop: log_trace(MARK_TRACE_OPT).write(...)
         crate::rjitlog::write_trace(
             crate::rjitlog::MARK_TRACE_OPT,
@@ -11868,6 +11874,11 @@ impl<M: Clone> MetaInterp<M> {
         // virtualizable inputarg at trace-start (captured above via
         // `ctx.initial_inputarg_consts` + `ctx.constants.get_value`), i.e.
         // RPython's `orig_inpargs[idx].getref_base()`.
+        // compile.py send_loop_to_backend: forget_optimization_info on the
+        // operations and inputargs before the virtualizable reload rewrites
+        // them through `_forwarded`.
+        forget_optimization_info(&optimized_ops);
+        forget_optimization_info(&inputargs);
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut optimized_ops,
@@ -11891,8 +11902,6 @@ impl<M: Clone> MetaInterp<M> {
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_start = Instant::now();
-        forget_optimization_info(&optimized_ops);
-        forget_optimization_info(&inputargs);
         // compile.py do_compile_loop: log_trace(MARK_TRACE_OPT).write(...)
         crate::rjitlog::write_trace(
             crate::rjitlog::MARK_TRACE_OPT,
@@ -12341,6 +12350,11 @@ impl<M: Clone> MetaInterp<M> {
         // entry. Without this, the vable inputarg contract differs from
         // the unrolled loop path and guard-failure recovery cannot restore
         // the heap array slots.
+        // compile.py send_loop_to_backend: forget_optimization_info on the
+        // operations and inputargs before the virtualizable reload rewrites
+        // them through `_forwarded`.
+        forget_optimization_info(&compiled_ops);
+        forget_optimization_info(&inputargs);
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut compiled_ops,
@@ -12363,8 +12377,6 @@ impl<M: Clone> MetaInterp<M> {
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_start = Instant::now();
-        forget_optimization_info(&compiled_ops);
-        forget_optimization_info(&inputargs);
         // compile.py do_compile_loop: log_trace(MARK_TRACE_OPT).write(...)
         crate::rjitlog::write_trace(
             crate::rjitlog::MARK_TRACE_OPT,
@@ -15659,6 +15671,11 @@ impl<M: Clone> MetaInterp<M> {
         // reds-only input contract as ordinary root loops.  Compiling the
         // optimizer's expanded input list directly makes execute_token pass
         // two red values to a loop expecting dozens of frame-field slots.
+        // compile.py send_loop_to_backend: forget_optimization_info on the
+        // operations and inputargs before the virtualizable reload rewrites
+        // them through `_forwarded`.
+        forget_optimization_info(&optimized_ops);
+        forget_optimization_info(&entry_inputargs);
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut entry_inputargs,
             &mut optimized_ops,
@@ -15732,8 +15749,6 @@ impl<M: Clone> MetaInterp<M> {
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_start = Instant::now();
-        forget_optimization_info(&optimized_ops);
-        forget_optimization_info(&entry_inputargs);
         // compile.py do_compile_loop: log_trace(MARK_TRACE_OPT).write(...)
         crate::rjitlog::write_trace(
             crate::rjitlog::MARK_TRACE_OPT,
