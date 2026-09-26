@@ -990,10 +990,10 @@ unsafe fn module_dict_object_custom_trace(
         }
     }
     // Delegate to the shared module-dict walk so this (GC-managed dict)
-    // path and `walk_pyframe_roots`' Box-immortal path forward exactly
-    // the same movable slots — including unwrapping the Box-immortal
-    // MutableCells to reach the inner `w_value`, which a bare cell-pointer
-    // visit (the slot itself never moves) would miss.
+    // path and `walk_pyframe_roots` forward the same slots. A collector-owned
+    // `MutableCell` is visited as the slot; the collector traces `w_value`
+    // through the cell type's pointer offsets and forwards the cell when
+    // it moves.
     let mut forward = |slot: &mut pyre_object::PyObjectRef| {
         f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     };
@@ -2908,11 +2908,17 @@ fn build_gc() -> Box<MiniMarkGC> {
     // wrapped value could be reclaimed while a still-installed
     // cell holds the pointer.  Mirrors `Cell`'s
     // `contents` registration (`nestedscope.rs`'s `Cell`).
-    let w_object_mutable_cell_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-        std::mem::size_of::<pyre_object::celldict::ObjectMutableCell>(),
-        object_tid,
-        pyre_object::celldict::W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS.to_vec(),
-    ));
+    // `typeobject.py MutableCell(W_Root)` assigns no typedef, so
+    // `referents.py try_cast_gcref_to_w_root` returns None and the
+    // inspector looks through the cell.
+    let w_object_mutable_cell_tid = gc.register_type(
+        TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_object::celldict::ObjectMutableCell>(),
+            object_tid,
+            pyre_object::celldict::W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS.to_vec(),
+        )
+        .without_app_level_typedef(),
+    );
     debug_assert_eq!(
         w_object_mutable_cell_tid,
         pyre_object::celldict::W_OBJECT_MUTABLE_CELL_GC_TYPE_ID,
@@ -2926,10 +2932,13 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::celldict::OBJECT_MUTABLE_CELL_TYPE as *const _ as usize,
         w_object_mutable_cell_tid,
     );
-    let w_int_mutable_cell_tid = gc.register_type(TypeInfo::object_subclass(
-        std::mem::size_of::<pyre_object::celldict::IntMutableCell>(),
-        object_tid,
-    ));
+    let w_int_mutable_cell_tid = gc.register_type(
+        TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::celldict::IntMutableCell>(),
+            object_tid,
+        )
+        .without_app_level_typedef(),
+    );
     debug_assert_eq!(
         w_int_mutable_cell_tid,
         pyre_object::celldict::W_INT_MUTABLE_CELL_GC_TYPE_ID,
@@ -2967,11 +2976,17 @@ fn build_gc() -> Box<MiniMarkGC> {
     // Weakref struct itself survives across collections; the
     // weakptr inside the Weakref is invalidated separately by the
     // collector's invalidate_*_weakrefs hooks.
-    let gc_weakref_box_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-        std::mem::size_of::<pyre_object::weakref::GcWeakrefBox>(),
-        object_tid,
-        pyre_object::weakref::GC_WEAKREF_BOX_GC_PTR_OFFSETS.to_vec(),
-    ));
+    // `new_pytype("__GcWeakrefBox")` is not a typedef, so
+    // `try_cast_gcref_to_w_root` rejects the box the same way it
+    // rejects `MutableCell`.
+    let gc_weakref_box_tid = gc.register_type(
+        TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_object::weakref::GcWeakrefBox>(),
+            object_tid,
+            pyre_object::weakref::GC_WEAKREF_BOX_GC_PTR_OFFSETS.to_vec(),
+        )
+        .without_app_level_typedef(),
+    );
     debug_assert_eq!(
         gc_weakref_box_tid,
         pyre_object::weakref::GC_WEAKREF_BOX_GC_TYPE_ID,
@@ -5126,15 +5141,10 @@ fn build_jit_driver_pair() -> JitDriverPair {
     d.set_vtable_offset(Some(pyre_object::pyobject::OB_TYPE_OFFSET));
     // resume.py:1367 — BlackholeAllocator for virtual materialization.
     d.register_blackhole_allocator(PyreBlackholeAllocator);
-    // `dispatch_bytecode` (pyopcode.py) stamps `last_instr` before each
-    // opcode, so a running frame always answers `f_lineno` — and every
-    // traceback taken off it — for the instruction it is on. That store is a
-    // source-level one upstream and rides in the jitcode; this codewriter
-    // unrolls the bytecode, so the same store would need one int pool
-    // constant per instruction. The blackhole publishes it at the `-live-`
-    // marker instead, and clears the Ref registers the marker leaves out —
-    // the marker is the one program point that names the live set.
-    majit_metainterp::blackhole::register_live_marker_hook(pyre_jit_trace::state::on_live_marker);
+    // `bhimpl_live` only records the marker pc. At the next collection
+    // `walk_bh_regs` drops Ref registers that marker does not name
+    // (`cleanup_registers` runs only at `release_interp`).
+    majit_gc::shadow_stack::register_bh_live_refs(pyre_jit_trace::state::retain_live_ref_registers);
     // warmspot.py handle_jitexception_from_blackhole parity:
     // portal_runner is called when ContinueRunningNormally is raised
     // at a recursive portal level during blackhole execution.

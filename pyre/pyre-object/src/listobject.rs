@@ -2240,6 +2240,253 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
     raw as PyObjectRef
 }
 
+/// `listobject.py AbstractUnwrappedStrategy.getslice`: `step == 1` copies
+/// `l[start:stop]`; any other step fills by index. Every slot of the stepped
+/// arm is written, so the strategy `_none_value` seed is not observable.
+fn copy_unwrapped_range<T: Copy>(
+    src: &[T],
+    start: i64,
+    stop: i64,
+    step: i64,
+    length: i64,
+) -> Vec<T> {
+    if step == 1 && start >= 0 && start <= stop {
+        let start = start as usize;
+        let stop = stop as usize;
+        debug_assert!(stop <= src.len());
+        return src[start..stop].to_vec();
+    }
+    let mut out = Vec::with_capacity(length as usize);
+    let mut index = start;
+    for _ in 0..length {
+        out.push(src[index as usize]);
+        index += step;
+    }
+    out
+}
+
+/// `W_ListObject.from_storage_and_strategy`: a fresh list header whose
+/// strategy object is the one that produced `storage`. Typed strategies keep
+/// `length == 0` and a null object `items` block; only Object storage fills
+/// those two fields.
+unsafe fn w_list_from_storage_and_strategy(
+    strategy: ListStrategy,
+    object_items: Vec<PyObjectRef>,
+    mut int_items: IntArray,
+    mut float_items: FloatArray,
+    mut bytes_items: BytesArray,
+    mut ascii_items: UnicodeArray,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let items_base = crate::gc_roots::pin_roots(&object_items);
+    let object_items: Vec<PyObjectRef> = (0..object_items.len())
+        .map(|i| crate::gc_roots::shadow_stack_get(items_base + i))
+        .collect();
+    let int_slot = int_items.pin_block();
+    let float_slot = float_items.pin_block();
+    let bytes_slot = bytes_items.pin_block();
+    let ascii_slot = ascii_items.pin_block();
+    let stored = match strategy {
+        ListStrategy::Object => object_items.len(),
+        ListStrategy::Integer | ListStrategy::IntOrFloat => int_items.len(),
+        ListStrategy::Float => float_items.len(),
+        ListStrategy::Bytes => bytes_items.len(),
+        ListStrategy::Ascii => ascii_items.len(),
+        ListStrategy::Empty
+        | ListStrategy::Size
+        | ListStrategy::SimpleRange
+        | ListStrategy::Range => 0,
+    };
+    let (length, mut items_block) = if strategy == ListStrategy::Object {
+        (object_items.len(), alloc_list_items_block_gc(&object_items))
+    } else {
+        (0usize, std::ptr::null_mut())
+    };
+    let block_root = if !items_block.is_null() {
+        let slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(items_block as PyObjectRef);
+        Some(slot)
+    } else {
+        None
+    };
+    if let Some(slot) = block_root {
+        items_block = crate::gc_roots::shadow_stack_get(slot) as *mut ItemsBlock;
+    }
+    int_items.reload_block(int_slot);
+    float_items.reload_block(float_slot);
+    bytes_items.reload_block(bytes_slot);
+    ascii_items.reload_block(ascii_slot);
+    let mut allocation_root = match strategy {
+        ListStrategy::Object => items_block as *mut u8,
+        ListStrategy::Integer | ListStrategy::IntOrFloat => int_items.block as *mut u8,
+        ListStrategy::Float => float_items.block as *mut u8,
+        ListStrategy::Bytes => bytes_items.block as *mut u8,
+        ListStrategy::Ascii => ascii_items.block as *mut u8,
+        ListStrategy::Empty
+        | ListStrategy::Size
+        | ListStrategy::SimpleRange
+        | ListStrategy::Range => std::ptr::null_mut(),
+    };
+    let mut needs_write_barrier = true;
+    let raw = crate::gc_hook::try_gc_alloc_collecting_rooted(
+        W_LIST_GC_TYPE_ID,
+        W_LIST_OBJECT_SIZE,
+        &mut allocation_root,
+        &mut needs_write_barrier,
+    );
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
+        .allocated_or_abort(W_LIST_OBJECT_SIZE)
+        .unwrap_or(std::ptr::null_mut());
+    int_items.reload_block(int_slot);
+    float_items.reload_block(float_slot);
+    bytes_items.reload_block(bytes_slot);
+    ascii_items.reload_block(ascii_slot);
+    if let Some(slot) = block_root {
+        items_block = crate::gc_roots::shadow_stack_get(slot) as *mut ItemsBlock;
+    }
+    let header = PyObject {
+        ob_type: &LIST_TYPE as *const PyType,
+        w_class: get_instantiate(&LIST_TYPE),
+    };
+    let obj = if raw.is_null() {
+        Box::into_raw(Box::new(W_ListObject {
+            ob_header: header,
+            allocated: stored as isize,
+            length: list_length_cell(length),
+            items: items_block,
+            strategy,
+            int_items,
+            float_items,
+            bytes_items,
+            ascii_items,
+            w_slots: PY_NULL,
+        })) as PyObjectRef
+    } else {
+        std::ptr::write(
+            raw as *mut W_ListObject,
+            W_ListObject {
+                ob_header: header,
+                allocated: stored as isize,
+                length: list_length_cell(length),
+                items: items_block,
+                strategy,
+                int_items,
+                float_items,
+                bytes_items,
+                ascii_items,
+                w_slots: PY_NULL,
+            },
+        );
+        raw as PyObjectRef
+    };
+    if matches!(
+        strategy,
+        ListStrategy::Object | ListStrategy::Bytes | ListStrategy::Ascii
+    ) && needs_write_barrier
+    {
+        list_write_barrier_impl(obj, true);
+    }
+    obj
+}
+
+/// `listobject.py W_ListObject.getslice` → `strategy.getslice`.
+///
+/// `AbstractUnwrappedStrategy.getslice` keeps the receiver's strategy.
+/// `EmptyListStrategy.getslice` / `SizeListStrategy` return a fresh empty
+/// list. `BaseRangeListStrategy.getslice` materialises to integer storage
+/// and delegates.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`. `start`/`stop`/`step`/`length`
+/// are the normalized `W_SliceObject.adjust_indices` result.
+pub unsafe fn w_list_getslice(
+    obj: PyObjectRef,
+    start: i64,
+    stop: i64,
+    step: i64,
+    length: i64,
+) -> PyObjectRef {
+    let strategy = (*(obj as *const W_ListObject)).strategy;
+    match strategy {
+        ListStrategy::Empty | ListStrategy::Size => w_list_new(Vec::new()),
+        ListStrategy::SimpleRange | ListStrategy::Range => {
+            let obj = w_list_materialize_range(obj);
+            w_list_getslice(obj, start, stop, step, length)
+        }
+        ListStrategy::Integer | ListStrategy::IntOrFloat => {
+            let values = {
+                let list = &*(obj as *const W_ListObject);
+                copy_unwrapped_range(list.int_items.as_slice(), start, stop, step, length)
+            };
+            w_list_from_storage_and_strategy(
+                strategy,
+                Vec::new(),
+                IntArray::from_vec(values),
+                FloatArray::empty(),
+                BytesArray::empty(),
+                UnicodeArray::empty(),
+            )
+        }
+        ListStrategy::Float => {
+            let values = {
+                let list = &*(obj as *const W_ListObject);
+                copy_unwrapped_range(list.float_items.as_slice(), start, stop, step, length)
+            };
+            w_list_from_storage_and_strategy(
+                strategy,
+                Vec::new(),
+                IntArray::empty(),
+                FloatArray::from_vec(values),
+                BytesArray::empty(),
+                UnicodeArray::empty(),
+            )
+        }
+        ListStrategy::Bytes => {
+            let values = {
+                let list = &*(obj as *const W_ListObject);
+                copy_unwrapped_range(list.bytes_items.as_slice(), start, stop, step, length)
+            };
+            w_list_from_storage_and_strategy(
+                strategy,
+                Vec::new(),
+                IntArray::empty(),
+                FloatArray::empty(),
+                BytesArray::from_vec(values),
+                UnicodeArray::empty(),
+            )
+        }
+        ListStrategy::Ascii => {
+            let values = {
+                let list = &*(obj as *const W_ListObject);
+                copy_unwrapped_range(list.ascii_items.as_slice(), start, stop, step, length)
+            };
+            w_list_from_storage_and_strategy(
+                strategy,
+                Vec::new(),
+                IntArray::empty(),
+                FloatArray::empty(),
+                BytesArray::empty(),
+                UnicodeArray::from_vec(values),
+            )
+        }
+        ListStrategy::Object => {
+            let values = {
+                let list = &*(obj as *const W_ListObject);
+                let all = list.object_to_vec();
+                copy_unwrapped_range(&all, start, stop, step, length)
+            };
+            w_list_from_storage_and_strategy(
+                strategy,
+                values,
+                IntArray::empty(),
+                FloatArray::empty(),
+                BytesArray::empty(),
+                UnicodeArray::empty(),
+            )
+        }
+    }
+}
+
 /// Read one app-level `__slots__` entry from a `list` subclass.
 ///
 /// PyPy's `BaseUserClassMapdict.getslotvalue` indexes the instance-owned
@@ -6152,6 +6399,23 @@ mod tests {
             assert_eq!(w_list_len(list), 3);
             let value = w_list_getitem(list, 2).unwrap();
             assert!(crate::pyobject::is_float(value));
+        }
+    }
+
+    #[test]
+    fn test_integer_getslice_keeps_unboxed_storage() {
+        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        unsafe {
+            let sliced = w_list_getslice(list, 0, 2, 1, 2);
+            assert!(w_list_uses_int_storage(sliced));
+            assert_eq!(w_list_len(sliced), 2);
+            assert_eq!(w_int_get_value(w_list_getitem(sliced, 0).unwrap()), 1);
+            assert_eq!(w_int_get_value(w_list_getitem(sliced, 1).unwrap()), 2);
+            let stepped = w_list_getslice(list, 2, -1, -1, 3);
+            assert!(w_list_uses_int_storage(stepped));
+            assert_eq!(w_list_len(stepped), 3);
+            assert_eq!(w_int_get_value(w_list_getitem(stepped, 0).unwrap()), 3);
+            assert_eq!(w_int_get_value(w_list_getitem(stepped, 2).unwrap()), 1);
         }
     }
 

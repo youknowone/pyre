@@ -438,8 +438,17 @@ pub struct TypeInfo {
     /// is omitted from app-level `gc.get_objects()` enumeration.  This models
     /// 3.11+ interpreter frames: owning coroutine/traceback objects expose
     /// their relevant edges, while an unmaterialized execution frame is not
-    /// itself reported as an app-level referrer.
+    /// itself reported as an app-level referrer.  The frame still has a
+    /// typedef, so `referents._list_w_obj_referents` stops on it.
     pub hide_from_app_level_inspector: bool,
+    /// `referents.py try_cast_gcref_to_w_root` returns None for a `W_Root`
+    /// whose typedef is null (`MutableCell`, `WeakrefLifeline`).  Such an
+    /// instance is not an app-level object: `gc.get_objects` omits it and
+    /// `get_rpy_roots` / `get_rpy_referents` wrap the raw gcref, while
+    /// `_list_w_obj_referents` looks through it to the value it holds.
+    /// Distinct from `hide_from_app_level_inspector`, which still stops the
+    /// referents walk.
+    pub has_no_typedef: bool,
     /// One frontend-owned GC edge in the common OBJECT header that keeps
     /// runtime class metadata alive but is not an app-level referent.  PyPy's
     /// RPython objects carry their class in the non-GC `typeptr`; pyre's
@@ -511,6 +520,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -539,6 +549,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -613,6 +624,15 @@ impl TypeInfo {
         self
     }
 
+    /// Mark an OBJECT-layout `W_Root` that has no typedef.
+    /// `referents.py try_cast_gcref_to_w_root` rejects it, so app-level
+    /// inspection expands the instance instead of stopping on it, and
+    /// `gc.get_objects` does not list it.
+    pub fn without_app_level_typedef(mut self) -> Self {
+        self.has_no_typedef = true;
+        self
+    }
+
     /// Mark the frontend's managed mirror of RPython's non-GC type pointer.
     /// This changes app-level inspection only; ordinary GC tracing continues
     /// to visit the edge.
@@ -645,6 +665,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -679,6 +700,7 @@ impl TypeInfo {
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -712,6 +734,7 @@ impl TypeInfo {
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -743,6 +766,7 @@ impl TypeInfo {
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: Some(parent_typeid),
             subclassrange_min: 0,
@@ -783,6 +807,7 @@ impl TypeInfo {
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: Some(parent_typeid),
             subclassrange_min: 0,
@@ -813,6 +838,7 @@ impl TypeInfo {
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: Some(parent_typeid),
             subclassrange_min: 0,
@@ -840,6 +866,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -906,6 +933,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -933,6 +961,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -976,6 +1005,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -1019,6 +1049,11 @@ impl TypeInfo {
         }
 
         // Variable-part GC pointer items.
+        // Callers reject a forwarded header before this load: its type id
+        // is outside the table (`FORWARDED_MARKER`), so `debug_check_*`
+        // returns first. `_get_size_for_typeid` reads the length raw once
+        // the address is the live object; `get_possibly_forwarded_type_id`
+        // is what substitutes the copy, and that already happened.
         if self.items_have_gc_ptrs && self.item_size > 0 {
             let length = unsafe { *((obj_addr + self.length_offset) as *const usize) };
             let items_start = obj_addr + self.size;
@@ -1094,6 +1129,18 @@ impl TypeRegistry {
             }
             info.gc_ptr_offsets = offsets;
             info.has_gc_ptrs = !info.gc_ptr_offsets.is_empty() || info.items_have_gc_ptrs;
+        }
+        // `offsets_to_gc_pointers` only records offsets inside the fixed
+        // part. An offset at or past `size` is the variable part (or a
+        // field list borrowed from another object) and `mark_object`'s
+        // `major_fixed_field` loop would dereference it.
+        for &offset in &info.gc_ptr_offsets {
+            assert!(
+                offset < info.size,
+                "TypeRegistry::register gc_ptr offset {offset} is past fixed size {} \
+                 (gctypelayout.offsets_to_gc_pointers)",
+                info.size
+            );
         }
         self.entries.push(info);
         // No row address is published until `freeze_types`; fill it there once
@@ -1588,6 +1635,13 @@ mod tests {
         let info = TypeInfo::varsize(8, 8, 0, true, Vec::new());
         assert_eq!(info.total_instance_size(10), 88); // 8 + 8*10
         assert_eq!(info.total_instance_size(0), 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "gc_ptr offset 8 is past fixed size 8")]
+    fn register_rejects_gc_ptr_offset_past_fixed_size() {
+        let mut reg = TypeRegistry::new();
+        let _ = reg.register(TypeInfo::with_gc_ptrs(8, vec![8]));
     }
 
     #[test]

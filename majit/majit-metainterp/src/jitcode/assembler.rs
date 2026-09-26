@@ -1419,15 +1419,22 @@ impl JitCodeBuilder {
         field_idx: u16,
         value: i64,
     ) {
-        let const_idx = self.add_const_i(value);
+        // `setfield_vable_i` is not in `USE_C_FORM` (`assembler.py`), so a
+        // constant value would take a `constants_i` slot. One slot per
+        // Python instruction (`dispatch_bytecode` `last_instr`) overflows
+        // `check_result`'s 256-wide int index space. The immediate form
+        // writes the u32 inline and shares the `VableField` descr with
+        // `setfield_vable_i/rid`. Blackhole `handler_setfield_vable_i_imm`
+        // and the walker's `setfield_vable_i_imm/rddd` arm execute it as
+        // `_opimpl_setfield_vable`.
+        let imm = u32::try_from(value)
+            .unwrap_or_else(|_| panic!("setfield_vable_i immediate {value} does not fit in u32"));
         self.touch_ref_reg(vable_reg);
         let field_descr = self.add_vable_field_descr(field_idx);
-        self.write_insn("setfield_vable_i/rid");
+        self.write_insn("setfield_vable_i_imm/rddd");
         self.push_reg_u8(vable_reg, "setfield_vable_i base");
-        let src_offset = self.code.len();
-        self.push_u8(0);
-        self.const_patches_u8
-            .push((src_offset, ConstKind::Int, const_idx));
+        self.push_u16(imm as u16);
+        self.push_u16((imm >> 16) as u16);
         self.push_u16(field_descr);
     }
 
@@ -6077,12 +6084,11 @@ impl JitCodeBuilder {
             || total_i > 256
             || total_r > 256
             || total_f > 256
-            // A resume frame records its jitcode `pc` as a single SHORT
-            // (`resumecode.py` `append_int` casts through `rffi.SHORT`), so
-            // a jitcode whose byte length cannot be addressed by an i16 pc
-            // would overflow the resume numbering.  Decline it like the
+            // `assembler.py` `fix_labels`: `assert 0 <= target <= 0xFFFF`.
+            // A position past that unsigned 16-bit range cannot be named as
+            // a jump target or as a resume pc. Decline it like the
             // register/const ceilings above; the interpreter keeps running it.
-            || self.code.len() > i16::MAX as usize
+            || self.code.len() > u16::MAX as usize
         {
             return None;
         }
@@ -6345,6 +6351,7 @@ impl JitCodeBuilder {
                 | i::BC_GETFIELD_VABLE_R
                 | i::BC_GETFIELD_VABLE_F
                 | i::BC_SETFIELD_VABLE_I
+                | i::BC_SETFIELD_VABLE_I_IMM
                 | i::BC_SETFIELD_VABLE_R
                 | i::BC_SETFIELD_VABLE_F
                 | i::BC_GETARRAYITEM_VABLE_I
@@ -8379,6 +8386,24 @@ mod tests {
     fn try_finish_accepts_last_two_byte_descr_slot() {
         let builder = fill_descr_pool(u16::MAX as usize + 1);
         assert!(builder.try_finish().is_some());
+    }
+
+    /// `fix_labels` names a target with two unsigned bytes
+    /// (`assert 0 <= target <= 0xFFFF`). A body longer than `i16::MAX`
+    /// is still addressable.
+    #[test]
+    fn try_finish_accepts_code_longer_than_i16() {
+        let mut builder = JitCodeBuilder::new();
+        builder.code.resize(i16::MAX as usize + 1, 0);
+        assert!(builder.try_finish().is_some());
+    }
+
+    /// One byte past the unsigned label target. `fix_labels` cannot name it.
+    #[test]
+    fn try_finish_declines_code_past_u16_label_target() {
+        let mut builder = JitCodeBuilder::new();
+        builder.code.resize(u16::MAX as usize + 1, 0);
+        assert!(builder.try_finish().is_none());
     }
 
     /// One entry past the operand width. Upstream aborts translation with

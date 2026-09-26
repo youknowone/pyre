@@ -7230,9 +7230,8 @@ thread_local! {
     /// `write_cell` via `try_execute_residual_call_via_executor`); a
     /// non-commit walk restores each cell's prior `intvalue` in reverse push
     /// order so the legacy replay re-applies the store against the pre-walk
-    /// heap.  Cells are immovable (`malloc_typed`; the fold's `can_move`
-    /// gate) and stay reachable from their module dict slot, so entries need
-    /// no GC-root forwarding.
+    /// heap.  The cell is a nursery object (`ObjectMutableCell.__init__`),
+    /// so each entry is a GC root via [`fbw_store_journal_root_walker`].
     static FBW_CELL_STORE_JOURNAL: std::cell::RefCell<Vec<FbwCellStore>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
@@ -7798,6 +7797,23 @@ fn portal_vable_bookkeeping_anchor(
             // The int vable fields are `last_instr` (0) and `valuestackdepth`
             // (2), both reassigned by the rebuild; a non-`VableField` descr is
             // not frame bookkeeping.
+            "setfield_vable_i_imm/rddd" => {
+                // opcode, frame reg, u32 immediate, little-endian descr index.
+                let Some((&lo, &hi)) = code.get(op.pc + 6).zip(code.get(op.pc + 7)) else {
+                    return false;
+                };
+                let descr_index = lo as usize | ((hi as usize) << 8);
+                if !matches!(
+                    perfn_descrs.get(descr_index),
+                    Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(descr))
+                        if matches!(
+                            descr.as_ref(),
+                            majit_jitcode::jitcode::BhDescr::VableField { .. }
+                        )
+                ) {
+                    return false;
+                }
+            }
             "setfield_vable_i/rid" => {
                 let Some((&lo, &hi)) = code.get(op.pc + 3).zip(code.get(op.pc + 4)) else {
                     return false;
@@ -7941,10 +7957,9 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     for (_slot, value) in abort_overrides.iter_mut() {
         visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
     }
-    // Cell-store journal: the cell is immovable (`malloc_typed`) so no
-    // forwarding happens, but a mid-walk rebind can drop the module dict's
-    // only reference — rooting it keeps the rollback's `intvalue` restore
-    // from writing into a freed block.
+    // Cell-store journal: the cell is nursery-allocated and a mid-walk
+    // rebind can drop the module dict's only reference.  Forwarding the
+    // slot keeps the rollback's restore on the live object.
     let cell_stores = unsafe { &mut *(*area.cell_stores).as_ptr() };
     for entry in cell_stores.iter_mut() {
         match entry {
@@ -12732,6 +12747,7 @@ fn handle<Sym: WalkSym>(
         // `setfield_vable_i/rid`, `setfield_vable_r/rrd`,
         // `setfield_vable_f/rfd` — value bank differs, no dst byte.
         "setfield_vable_i/rid" => setfield_vable_via_metainterp(code, op, ctx, 'i'),
+        "setfield_vable_i_imm/rddd" => setfield_vable_int_imm(code, op, ctx),
         "setfield_vable_r/rrd" => setfield_vable_via_metainterp(code, op, ctx, 'r'),
         "setfield_vable_f/rfd" => setfield_vable_via_metainterp(code, op, ctx, 'f'),
         // Virtualizable array reads/writes + length. RPython

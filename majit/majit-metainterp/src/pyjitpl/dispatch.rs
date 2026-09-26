@@ -4984,6 +4984,29 @@ where
                 };
                 self.set_float_reg(dest, Some(op), Some(reg_concrete));
             }
+            jitcode::insns::BC_SETFIELD_VABLE_I_IMM => {
+                let (opcode_pc, vable_reg, field_idx, imm) = {
+                    let frame = self.frames.current_mut();
+                    let opcode_pc = frame.code_cursor - 1;
+                    let (vable_reg, field_idx, imm) = frame.read_vable_setfield_imm();
+                    (opcode_pc, vable_reg, field_idx, imm)
+                };
+                let Some((vable_opref, fielddescr)) =
+                    self.vable_field_descr(ctx, vable_reg, field_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let guards_before = ctx.num_guards();
+                let imm_box = ctx.const_int(imm);
+                let write = ctx.vable_setfield(
+                    opcode_pc,
+                    vable_opref,
+                    fielddescr,
+                    imm_box,
+                    Some(Value::Int(imm)),
+                );
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
+            }
             jitcode::insns::BC_SETFIELD_VABLE_I => {
                 let (opcode_pc, vable_reg, field_idx, src) = {
                     let frame = self.frames.current_mut();

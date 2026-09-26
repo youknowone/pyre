@@ -9149,40 +9149,49 @@ impl CodeWriter {
                     let (instruction, op_arg) = arg_state.get(code_unit);
                     let mut exception_edge_handled = false;
 
-                    // pyframe.py pushvalue/popvalue_maybe_none parity:
-                    // RPython's push/pop each write `self.valuestackdepth = depth +/- 1`.
-                    // On the JIT, these map to per-push `setfield_vable_i`. pyre's
-                    // codewriter stores stack values in typed registers rather than
-                    // the `locals_cells_stack_w` array, so we cannot emit a vable
-                    // setitem for each push. As the coarsest RPython-compatible
-                    // approximation we flush `valuestackdepth` once at opcode entry,
-                    // reflecting the pre-opcode stack depth — which is what the
-                    // interpreter's `target_depth` (`eval.rs`) uses when an exception
-                    // handler unwinds the frame.
-                    //
-                    // `dispatch_bytecode` (pyopcode.py) DOES write `last_instr` once
-                    // per opcode, and that write is part of the traced portal, so
-                    // upstream's jitcode carries it and the blackhole replays it.
-                    // pyre cannot mirror it here: upstream's `next_instr` is a live
-                    // RPython variable, while this codewriter unrolls the bytecode
-                    // per PC, so the same store needs one distinct int pool constant
-                    // per PC and `assembler.py check_result`'s 256-entry
-                    // `num_regs_i + constants_i` cap rejects any function past a few
-                    // hundred instructions.  Convergence path: a value operand that
-                    // encodes the immediate inline instead of through the per-kind
-                    // pool, after which this becomes an unconditional per-PC store.
-                    // Until then the jitcode carries the store only at the frame
-                    // exits (`ReturnValue`, `emit_abort_permanent!`) and the raises
-                    // that resume in the interpreter.  A frame observed MID-replay
-                    // — through a callee's `sys._getframe` or a traceback — is
-                    // answered instead by the blackhole, which publishes the
-                    // coordinate at each `-live-` marker it passes; the levels that
-                    // still go unpublished are the inlined non-portal callees,
-                    // whose `frame_var` aliases the outermost frame.
-                    // pyframe.py: valuestackdepth is written per-push/per-pop
-                    // via setfield_vable_i (jtransform.py), NOT once at opcode
-                    // entry. The per-push/per-pop emit_vsd! calls below mirror that.
-                    // (The old single-entry flush is removed.)
+                    // `dispatch_bytecode` (pyopcode.py) writes
+                    // `self.last_instr = intmask(next_instr)` before every opcode.
+                    // That store is a `setfield_vable_i` of the standard virtualizable
+                    // (`_opimpl_setfield_vable`): compiled code only updates
+                    // `virtualizable_boxes`, and the blackhole replays it like any
+                    // other op. The value is the trivia-normalized opcode PC, the
+                    // coordinate `skip_python_trivia_forward` names. Trivia units
+                    // (`Cache` / `ExtendedArg` / `NotTaken` / `Resume` / `Nop`) are
+                    // not instruction starts. The immediate is inline
+                    // (`setfield_vable_i_imm/rddd`) so a per-instruction constant
+                    // does not consume a `constants_i` slot
+                    // (`assembler.py` `check_result`).
+                    {
+                        let at_instruction_start = !matches!(
+                            pyre_interpreter::decode_instruction_at(code, py_pc),
+                            None | Some((
+                                Instruction::Cache
+                                    | Instruction::ExtendedArg
+                                    | Instruction::NotTaken
+                                    | Instruction::Resume { .. }
+                                    | Instruction::Nop,
+                                _
+                            ))
+                        );
+                        if at_instruction_start {
+                            let norm = pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(
+                                code, py_pc,
+                            );
+                            let v_li: super::flow::FlowValue =
+                                super::flow::Constant::signed(norm as i64).into();
+                            record_graph_op(
+                                &current_block.block(),
+                                "setfield_vable_i",
+                                vable_setfield_int_graph_args(
+                                    frame_var.into(),
+                                    v_li.into(),
+                                    VABLE_LAST_INSTR_FIELD_IDX,
+                                ),
+                                None,
+                                py_pc as i64,
+                            );
+                        }
+                    }
 
                     // Snapshot the entry stack for `emit_abort_permanent!`.  The
                     // marker resumes the interpreter AT this opcode, so what it
@@ -9811,11 +9820,8 @@ impl CodeWriter {
                             // very failure this store exists to remove.
                             // Declining leaves the caller's own coordinate
                             // intact.  The inlined callee's own frame stays
-                            // unpublished, the same inner-level gap the
-                            // `-live-` marker hook declines on
-                            // (`publish_last_instr_at_live_marker` resolves the
-                            // frame from the replaying level's own portal red
-                            // and requires a code-object match).
+                            // unpublished during a resume that aliases
+                            // `frame_var` to the outermost frame.
                             if is_true_portal {
                                 let v_li: super::flow::FlowValue =
                                     super::flow::Constant::signed(py_pc as i64).into();

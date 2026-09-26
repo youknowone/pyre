@@ -41,6 +41,14 @@ pub const BC_ARRAYLEN_GC: u8 = 1;
 /// `goto_if_not_int_is_true`. Takes slot 2 (was free; `BC_ARRAYLEN_VABLE`
 /// is pinned at byte 74 in the vable group).
 pub const BC_INT_IS_TRUE: u8 = 2;
+/// Inline-immediate `setfield_vable_i`. `setfield_vable_i` is not in
+/// `USE_C_FORM` (`assembler.py`), so a constant value takes a pool slot
+/// and `check_result` rejects `num_regs_i + len(constants_i) > 256`.
+/// One constant per Python instruction (`dispatch_bytecode`'s
+/// `last_instr = intmask(next_instr)`) overflows that cap. Payload is
+/// `r` + u16 lo + u16 hi + `d` (the same `VableField` descr as
+/// `setfield_vable_i/rid`); the value is the u32 `lo | (hi << 16)`.
+pub const BC_SETFIELD_VABLE_I_IMM: u8 = 32;
 pub const BC_GETINTERIORFIELD_GC_I: u8 = 3;
 pub const BC_GETINTERIORFIELD_GC_R: u8 = 4;
 pub const BC_GETINTERIORFIELD_GC_F: u8 = 5;
@@ -1383,6 +1391,8 @@ pub fn extension_insns() -> IndexMap<&'static str, u8> {
     // materialises it as a value.  See [`BC_ARRAYBASE_VABLE`] for why
     // producing it is by definition an escape.
     m.insert("arraybase_vable/rdd>i", BC_ARRAYBASE_VABLE);
+    // Inline u32 immediate for `setfield_vable_i`. See `BC_SETFIELD_VABLE_I_IMM`.
+    m.insert("setfield_vable_i_imm/rddd", BC_SETFIELD_VABLE_I_IMM);
     m
 }
 

@@ -880,6 +880,60 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// `setfield_vable_i_imm/rddd`: `_opimpl_setfield_vable` with a u32 immediate
+/// instead of an int register. Same standard-vable box update, no recorded
+/// op (`pyjitpl.py` `_opimpl_setfield_vable`).
+pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let lo = code[op.pc + 2] as u32 | ((code[op.pc + 3] as u32) << 8);
+    let hi = code[op.pc + 4] as u32 | ((code[op.pc + 5] as u32) << 8);
+    let imm = (lo | (hi << 16)) as i64;
+    let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
+    if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
+        let descr = read_descr(code, op, 5, ctx)?;
+        if let (Some(field_index), Some(shadow)) = (
+            ctx.trace_ctx
+                .virtualizable_info()
+                .and_then(|info| info.static_field_by_descr(&descr)),
+            ctx.frame_state.borrow().callee_shadow.as_ref(),
+        ) {
+            if let Some(frame) = durable_resume_frame(ctx, shadow.concrete_frame) {
+                fbw_arm_durable_frame_undo(frame);
+            }
+            crate::state::store_live_frame_static_int(shadow.concrete_frame, field_index, imm);
+        }
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    let obj = read_ref_reg_raw(code, op, 0, ctx)?;
+    if obj.is_none() {
+        return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
+    }
+    let descr = read_descr(code, op, 5, ctx)?;
+    let concrete = Some(Value::Int(imm));
+    let inline_field_index = ctx
+        .trace_ctx
+        .virtualizable_info()
+        .and_then(|info| info.static_field_by_descr(&descr));
+    let guards_before = ctx.trace_ctx.num_guards();
+    let write = with_replace_frames(ctx, |ctx| {
+        ctx.trace_ctx
+            .vable_setfield(op.pc, obj, descr, OpRef::ConstInt(imm), concrete)
+    });
+    if let (Some(frame), Some(field_index)) =
+        (current_inline_vable_target(ctx, obj), inline_field_index)
+    {
+        if let Some(frame) = durable_resume_frame(ctx, frame) {
+            fbw_arm_durable_frame_undo(frame);
+        }
+        crate::state::store_live_frame_static_int(frame, field_index, imm);
+    }
+    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, write)?;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
 /// Resolve the `(fdescr, adescr)` virtualizable-array descr pair from a
 /// `(VableArray, Array)` jitcode descr-pool pair.
 ///

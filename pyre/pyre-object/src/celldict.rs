@@ -133,12 +133,14 @@ impl crate::lltype::GcType for IntMutableCell {
     const SIZE: usize = W_INT_MUTABLE_CELL_OBJECT_SIZE;
 }
 
-/// `typeobject.py:27-28 ObjectMutableCell.__init__`.
+/// `typeobject.py ObjectMutableCell.__init__`.
 ///
-/// The cell is an ordinary GC object: old-gen so a trace can bake its
-/// address, traced through `W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS`.
+/// An ordinary nursery instance (`W_Root`). A trace that promotes the cell
+/// records a `ConstPtr`; `remove_constptrs_in` rewrites that to
+/// `LoadFromGcTable` and `gcreftracer` updates the slot when the cell moves.
+/// `w_value` is traced through `W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS`.
 pub fn w_object_mutable_cell_new(w_value: PyObjectRef) -> PyObjectRef {
-    crate::lltype::malloc_typed_stable(ObjectMutableCell {
+    crate::lltype::malloc_typed_managed(ObjectMutableCell {
         ob_header: PyObject {
             ob_type: &OBJECT_MUTABLE_CELL_TYPE as *const PyType,
             w_class: get_instantiate(&OBJECT_MUTABLE_CELL_TYPE),
@@ -147,9 +149,12 @@ pub fn w_object_mutable_cell_new(w_value: PyObjectRef) -> PyObjectRef {
     }) as PyObjectRef
 }
 
-/// `typeobject.py:38-39 IntMutableCell.__init__`.
+/// `typeobject.py IntMutableCell.__init__`.
+///
+/// Same nursery placement as [`w_object_mutable_cell_new`]. The unboxed
+/// `intvalue` is not a GC pointer.
 pub fn w_int_mutable_cell_new(intvalue: i64) -> PyObjectRef {
-    crate::lltype::malloc_typed_stable(IntMutableCell {
+    crate::lltype::malloc_typed_managed(IntMutableCell {
         ob_header: PyObject {
             ob_type: &INT_MUTABLE_CELL_TYPE as *const PyType,
             w_class: get_instantiate(&INT_MUTABLE_CELL_TYPE),

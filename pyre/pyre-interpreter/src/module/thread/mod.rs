@@ -1994,20 +1994,49 @@ fn spawn_thread(
     if parent_ec.is_null() {
         return Err(crate::PyError::runtime_error("no execution context"));
     }
+    // RPython roots every live GC local for the whole function, so
+    // `setup_threads` cannot collect past `w_callable`. Publish every
+    // pointer we already hold before the first query (`pin_roots`): a query
+    // after the first pin is a safepoint.
+    let roots = pyre_object::gc_roots::push_roots();
+    let nargs = positional.len();
+    let mut head = Vec::with_capacity(nargs + 3);
+    head.push(callable);
+    head.extend_from_slice(&positional);
+    let kw_at = kwargs.map(|kw| {
+        let index = head.len();
+        head.push(kw);
+        index
+    });
+    let handle_at = handle.map(|handle| {
+        let index = head.len();
+        head.push(handle);
+        index
+    });
+    let callable_i = roots.publish(&head);
+    roots.normalize(callable_i, head.len());
+    let args_base = callable_i + 1;
+    let none = w_none();
+    let kw_i = if let Some(offset) = kw_at {
+        callable_i + offset
+    } else {
+        let index = roots.publish(&[none]);
+        roots.normalize(index, 1);
+        index
+    };
+    let handle_i = if let Some(offset) = handle_at {
+        callable_i + offset
+    } else {
+        let index = roots.publish(&[none]);
+        roots.normalize(index, 1);
+        index
+    };
+
     // os_thread.py `start_new_thread` begins with `setup_threads(space)`.
     gil::setup_threads(unsafe { &mut *(parent_ec as *mut crate::PyExecutionContext) });
 
     // `Bootstrapper.acquire` then stores `w_callable` and `args` on the
     // global bootstrapper. The tuple is the traced stand-in for those fields.
-    let roots = pyre_object::gc_roots::push_roots();
-    let callable_i = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(callable);
-    let args_base = roots.pin_roots(&positional);
-    let nargs = positional.len();
-    let kw_i = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(kwargs.unwrap_or_else(w_none));
-    let handle_i = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(handle.unwrap_or_else(w_none));
     // A contended wait releases the GIL, so every input is rooted before it.
     let boot_gen = acquire_bootstrap_lock();
     let mut arg_items = Vec::with_capacity(nargs);
@@ -2106,16 +2135,28 @@ fn spawn_thread(
             crate::call::enter_runtime_thread();
             // Register before reading `BOOTSTRAP_PAYLOAD`: a collection moves
             // the tuple and `walk_thread_roots` writes the new address back.
+            // `gc_thread_start` before `Bootstrapper.bootstrap` reads
+            // `w_callable`: the stack area has to exist before the load.
             ensure_runtime_thread();
-            let payload = BOOTSTRAP_PAYLOAD.swap(0, Ordering::AcqRel) as PyObjectRef;
-            release_bootstrap_if_owner(bootstrap.0.epoch);
+            let payload = BOOTSTRAP_PAYLOAD.load(Ordering::Acquire) as PyObjectRef;
             if payload.is_null() {
+                release_bootstrap_if_owner(bootstrap.0.epoch);
                 bootstrap.fail("can't start new thread".to_string());
                 return;
             }
             let worker_roots = pyre_object::gc_roots::push_roots();
-            let payload_i = pyre_object::gc_roots::shadow_stack_len();
-            let _ = worker_roots.pin_root(payload);
+            // One publish of the global word and every field copied out of it,
+            // then one normalize. `pin_root` per field queries after the first
+            // write; that query is a safepoint, and a foreign collection
+            // forwards the payload tuple without rewriting the still-unpublished
+            // `callable` local. `Bootstrapper.release` runs only after those
+            // words are on this thread's shadow stack.
+            let payload_i = worker_roots.publish(&[payload]);
+            worker_roots.normalize(payload_i, 1);
+            // `w_none` builds its immortal on first use. Do that before the
+            // field copies: a collection there would move them while they
+            // still live only in locals.
+            let none = w_none();
             let payload = worker_roots.get(payload_i);
             let callable = unsafe { w_tuple_getitem(payload, 0).unwrap_or(PY_NULL) };
             let args_tuple = unsafe { w_tuple_getitem(payload, 1).unwrap_or(PY_NULL) };
@@ -2126,27 +2167,25 @@ fn spawn_thread(
             } else {
                 unsafe { w_tuple_len(args_tuple) }
             };
-            let has_kwargs = !kwargs_obj.is_null() && kwargs_obj != w_none();
-            let has_handle = !handle_obj.is_null() && handle_obj != w_none();
-            let args_tuple_i = pyre_object::gc_roots::shadow_stack_len();
-            let _ = worker_roots.pin_root(args_tuple);
-            let worker_base = pyre_object::gc_roots::shadow_stack_len();
-            let _ = worker_roots.pin_root(callable);
+            let has_kwargs = !kwargs_obj.is_null() && kwargs_obj != none;
+            let has_handle = !handle_obj.is_null() && handle_obj != none;
+            let mut fields =
+                Vec::with_capacity(2 + nargs + usize::from(has_kwargs) + usize::from(has_handle));
+            fields.push(args_tuple);
+            fields.push(callable);
             for i in 0..nargs {
-                let args_tuple = worker_roots.get(args_tuple_i);
-                let item = unsafe { w_tuple_getitem(args_tuple, i as i64).unwrap_or(PY_NULL) };
-                let _ = worker_roots.pin_root(item);
+                fields.push(unsafe { w_tuple_getitem(args_tuple, i as i64).unwrap_or(PY_NULL) });
             }
             if has_kwargs {
-                let payload = worker_roots.get(payload_i);
-                let kwargs_obj = unsafe { w_tuple_getitem(payload, 2).unwrap_or(PY_NULL) };
-                let _ = worker_roots.pin_root(kwargs_obj);
+                fields.push(kwargs_obj);
             }
             if has_handle {
-                let payload = worker_roots.get(payload_i);
-                let handle_obj = unsafe { w_tuple_getitem(payload, 3).unwrap_or(PY_NULL) };
-                let _ = worker_roots.pin_root(handle_obj);
+                fields.push(handle_obj);
             }
+            let args_tuple_i = worker_roots.publish(&fields);
+            let worker_base = args_tuple_i + 1;
+            worker_roots.normalize(args_tuple_i, fields.len());
+            release_bootstrap_if_owner(bootstrap.0.epoch);
 
             let mut ec = Box::new(unsafe {
                 (*(parent_ec_addr as *const crate::PyExecutionContext)).clone_for_thread()

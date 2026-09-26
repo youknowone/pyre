@@ -2395,9 +2395,10 @@ pub unsafe fn w_module_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<P
 /// for every live frame's globals and builtins so the real storage stays
 /// forwarded across collection.  No-op for non-module dicts.
 ///
-/// `visitor` receives each movable value slot; `walk_module_value_slot`
-/// unwraps `MutableCell`s (themselves Box-immortal) to forward the inner
-/// `w_value` rather than the stable cell pointer.
+/// `visitor` receives each movable value slot. `walk_module_value_slot`
+/// visits a collector-owned `MutableCell` as the slot (its `w_value` is
+/// traced through the cell type's pointer offsets) and, for a cell outside
+/// the heap, visits the inner `w_value` in place.
 ///
 /// # Safety
 /// `obj` must be a valid `PyObjectRef` (null tolerated).  `visitor` must

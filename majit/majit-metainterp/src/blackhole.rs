@@ -312,6 +312,12 @@ pub struct BlackholeInterpreter {
     pub jitcode: std::sync::Arc<JitCode>,
     /// Current bytecode position (program counter).
     pub position: usize,
+    /// Jitcode pc of the last `-live-` marker this frame executed.
+    /// `usize::MAX` when none has run since `setposition` / `release_interp`.
+    /// `walk_bh_regs` reads it at collection time and roots only the marker's
+    /// live Ref registers (`liveness.py`). `bhimpl_live` itself only records
+    /// this and skips `OFFSET_SIZE`.
+    last_live_pc: usize,
     /// Caller frame in the blackhole frame chain.
     pub nextblackholeinterp: Option<Box<BlackholeInterpreter>>,
     /// Whether `acquire_interp` registered this interpreter's traced fields
@@ -604,6 +610,7 @@ impl Default for BlackholeInterpreter {
             tmpreg_f: 0,
             jitcode: EMPTY_JITCODE.with(std::sync::Arc::clone),
             position: 0,
+            last_live_pc: usize::MAX,
             nextblackholeinterp: None,
             rooted: false,
             back: None,
@@ -676,6 +683,7 @@ impl BlackholeInterpreter {
         self.position = position;
         self.last_opcode_position = position;
         self.entry_position = position;
+        self.last_live_pc = usize::MAX;
     }
 
     /// `blackhole.py setposition`'s per-bank half:
@@ -1102,6 +1110,16 @@ impl BlackholeInterpreter {
     /// hook's register clear and a resume's register seeding read one source.
     pub fn get_current_position_info(&self) -> usize {
         self.jitcode.get_live_vars_info(self.position, self.op_live)
+    }
+
+    /// Jitcode pc of the last `-live-` marker, if this frame has executed one
+    /// since it was seated. Collection uses it; `bhimpl_live` only stores it.
+    pub fn last_live_marker_pc(&self) -> Option<usize> {
+        if self.last_live_pc == usize::MAX {
+            None
+        } else {
+            Some(self.last_live_pc)
+        }
     }
 
     /// Result register of the call this frame is resuming after.
@@ -1825,11 +1843,15 @@ impl BlackholeInterpreter {
             let mut frame = Some(&mut *self);
             while let Some(f) = frame {
                 if !f.rooted {
-                    majit_gc::shadow_stack::push_bh_regs(
-                        &mut f.registers_r,
-                        &mut f.tmpreg_r,
-                        &mut f.exception_last_value,
-                    );
+                    let ctx = f as *mut BlackholeInterpreter;
+                    unsafe {
+                        majit_gc::shadow_stack::push_bh_regs_with_live(
+                            &mut (*ctx).registers_r,
+                            &mut (*ctx).tmpreg_r,
+                            &mut (*ctx).exception_last_value,
+                            ctx as *const (),
+                        );
+                    }
                 }
                 frame = f.nextblackholeinterp.as_deref_mut();
             }
@@ -2017,7 +2039,6 @@ impl BlackholeInterpreter {
         // and increments it past the opcode before the inlined handler
         // (`opcode = ord(code[position]); position += 1`).
         let mut position = self.position;
-        let live_hook_absent = LIVE_MARKER_HOOK.get().is_none();
         // SAFETY: `self.jitcode` / `registers_*` are not reseated by an
         // inlined handler. INLINE_CALL and the function-pointer fallback
         // refresh the register pointers below.
@@ -2062,7 +2083,9 @@ impl BlackholeInterpreter {
             // mid-node PC.
             if !trace {
                 match opcode {
-                    jitcode::insns::BC_LIVE if live_hook_absent => {
+                    jitcode::insns::BC_LIVE => {
+                        // `bhimpl_live`: remember the marker, skip `OFFSET_SIZE`.
+                        self.last_live_pc = pos_before;
                         position += majit_jitcode::liveness::OFFSET_SIZE;
                         continue;
                     }
@@ -3192,12 +3215,14 @@ impl BlackholeInterpBuilder {
         // The interpreter is a GC object upstream, so its ref-holding
         // fields are traced for as long as it exists. The box gives them
         // a fixed address; `Drop` unregisters.
+        let ctx = &mut *bh as *mut BlackholeInterpreter;
         unsafe {
-            majit_gc::shadow_stack::register_bh_interp(
-                &mut bh.registers_r,
-                &mut bh.tmpreg_r,
-                &mut bh.exception_last_value,
-                &mut bh.virtualizable_ptr,
+            majit_gc::shadow_stack::register_bh_interp_with_live(
+                &mut (*ctx).registers_r,
+                &mut (*ctx).tmpreg_r,
+                &mut (*ctx).exception_last_value,
+                &mut (*ctx).virtualizable_ptr,
+                ctx as *const (),
             );
         }
         bh.rooted = true;
@@ -3248,6 +3273,7 @@ impl BlackholeInterpBuilder {
         interp.virtualizable_ptr = 0;
         interp.virtualizable_info = std::ptr::null();
         interp.virtualizable_stack_base = 0;
+        interp.last_live_pc = usize::MAX;
         // Same footing: the layout describes the register file of the machine
         // this run resumed, so it must not outlive it.  A stale one does not
         // fail loudly — `StateFieldLayout::default()` is all-zero and the
@@ -4728,6 +4754,21 @@ mod tests {
                 std::sync::Arc::ptr_eq(&reused.dispatch_table, &table),
                 "a pooled interp already holds this builder's dispatch table"
             );
+        }
+
+        #[test]
+        fn unresolved_call_and_vtable_bail_set_abort_permanent_bail() {
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            let err = super::super::reject_unresolved_call(&mut bh, 0);
+            assert!(matches!(err, DispatchError::LeaveFrame));
+            assert!(bh.aborted && bh.abort_permanent_bail);
+
+            bh.aborted = false;
+            bh.abort_permanent_bail = false;
+            let err = super::super::handler_vtable_method_ptr_bail(&mut bh, &[], 0);
+            assert!(matches!(err, Err(DispatchError::LeaveFrame)));
+            assert!(bh.aborted && bh.abort_permanent_bail);
         }
 
         #[test]
@@ -8079,50 +8120,17 @@ fn portal_substitution_report(bh: &BlackholeInterpreter, jd_index: usize, regist
     );
 }
 
-/// Called at every `-live-` marker, i.e. once per source-level instruction the
-/// blackhole replays. Arguments are the interpreter and the marker's own
-/// bytecode position.
-///
-/// RPython's `bhimpl_live` is a plain no-op, and it can be: the frame fields
-/// its interpreter writes per instruction (`dispatch_bytecode`'s
-/// `self.last_instr = intmask(next_instr)`) are ordinary source-level stores,
-/// so they are compiled into the jitcode and the blackhole replays them like
-/// any other operation. A consumer whose jitcode cannot carry such a store —
-/// because the value is a distinct compile-time constant per instruction and
-/// `check_result`'s 256-entry per-kind cap rejects one pool entry per
-/// instruction — registers this hook and writes the field itself.
-/// The hook also owns the register file, because the marker names the live
-/// set: `cleanup_registers` (`blackhole.py`) clears `registers_r` "to
-/// avoid keeping references alive", but it only runs at `release_interp`
-/// (`blackhole.py:253`), so a register whose live range ended keeps its
-/// object for the rest of the run. RPython is insulated by liverange-based
-/// colouring reusing that register almost immediately
-/// (`rpython/tool/algo/regalloc.py:28-75`); a codewriter whose colours are
-/// not reused that densely needs the same clear at marker granularity.
-pub type LiveMarkerHook = fn(&mut BlackholeInterpreter, usize);
-
-static LIVE_MARKER_HOOK: std::sync::OnceLock<LiveMarkerHook> = std::sync::OnceLock::new();
-
-/// Install the [`LiveMarkerHook`]. First registration wins; later calls are
-/// ignored, so a consumer may call it from every driver install path.
-pub fn register_live_marker_hook(hook: LiveMarkerHook) {
-    let _ = LIVE_MARKER_HOOK.set(hook);
-}
-
-/// Handler for `live/` — liveness marker. Argcodes: empty, but the assembler
-/// emits a 2-byte offset after the opcode. Skip those 2 bytes.
-/// RPython blackhole.py (inside _get_method for `-live-` ops).
+/// Handler for `live/` — `bhimpl_live` (`blackhole.py`): record the marker's
+/// jitcode pc and skip `OFFSET_SIZE` bytes. Precise Ref liveness is applied
+/// at the next collection (`walk_bh_regs`), not here.
 fn handler_live(
     bh: &mut BlackholeInterpreter,
     _code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    if let Some(hook) = LIVE_MARKER_HOOK.get() {
-        // `position` is past the opcode byte; the marker op starts one earlier.
-        hook(bh, position - 1);
-    }
-    // Skip the 2-byte liveness offset (RPython: OFFSET_SIZE = 2).
-    Ok(position + 2)
+    // `position` is past the opcode byte; the marker op starts one earlier.
+    bh.last_live_pc = position - 1;
+    Ok(position + majit_jitcode::liveness::OFFSET_SIZE)
 }
 
 /// Handler for `goto/L` — unconditional jump. Argcodes: `L` (2-byte label).
@@ -10026,7 +10034,11 @@ fn reject_unresolved_call(bh: &mut BlackholeInterpreter, func: i64) -> DispatchE
             .map(str::to_owned)
             .unwrap_or_else(|| format!("fnaddr {func:#x}")),
     );
+    // `convert_and_run_from_pyjitpl` turns every abort into one resume.
+    // Consumers accept that resume only when `abort_permanent_bail` is set
+    // (`bhimpl_abort_permanent` is the other producer of this pair).
     bh.aborted = true;
+    bh.abort_permanent_bail = true;
     DispatchError::LeaveFrame
 }
 
@@ -10895,6 +10907,10 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         majit_jitcode::insns::BC_SETFIELD_VABLE_I,
     );
     insns.insert(
+        "setfield_vable_i_imm/rddd".to_string(),
+        majit_jitcode::insns::BC_SETFIELD_VABLE_I_IMM,
+    );
+    insns.insert(
         "setfield_vable_r/rrd".to_string(),
         majit_jitcode::insns::BC_SETFIELD_VABLE_R,
     );
@@ -11722,6 +11738,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getfield_vable_r/rd>r", handler_getfield_vable_r);
     builder.wire_handler("getfield_vable_f/rd>f", handler_getfield_vable_f);
     builder.wire_handler("setfield_vable_i/rid", handler_setfield_vable_i);
+    builder.wire_handler("setfield_vable_i_imm/rddd", handler_setfield_vable_i_imm);
     builder.wire_handler("setfield_vable_r/rrd", handler_setfield_vable_r);
     builder.wire_handler("setfield_vable_f/rfd", handler_setfield_vable_f);
     builder.wire_handler("getarrayitem_vable_i/ridd>i", handler_getarrayitem_vable_i);
@@ -11987,19 +12004,21 @@ fn handler_guard_class_r(
     bh.registers_r[code[p + 1] as usize] = typeptr;
     Ok(p + 2)
 }
-/// Safe fallback for the obsolete pyre-only named vtable lookup.
+/// Fallback for the obsolete pyre-only named vtable lookup.
 ///
 /// PyPy's `ClassRepr.getclsfield` emits an ordinary field read; it never tries
 /// to resolve `(trait, method)` strings in the blackhole.  If an old frozen
 /// graph or the still-conservative abstract-trait path reaches this opcode, no
-/// faithful pointer can be manufactured from its descriptor.  Hand execution
-/// back to the source interpreter like the other unsupported-op markers.
+/// faithful pointer can be manufactured from its descriptor.
+/// `convert_and_run_from_pyjitpl` resumes from one abort, and the resume
+/// consumers require `abort_permanent_bail` (`bhimpl_abort_permanent`).
 fn handler_vtable_method_ptr_bail(
     bh: &mut BlackholeInterpreter,
     _code: &[u8],
     _p: usize,
 ) -> Result<usize, DispatchError> {
     bh.aborted = true;
+    bh.abort_permanent_bail = true;
     Err(DispatchError::LeaveFrame)
 }
 
@@ -12366,6 +12385,26 @@ fn handler_setfield_vable_i(
     let value = bh.registers_i[code[p + 1] as usize];
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
+    let cpu = bh.cpu();
+    cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
+    Ok(p)
+}
+
+/// `setfield_vable_i_imm/rddd`: same `_opimpl_setfield_vable` store as
+/// `handler_setfield_vable_i`, with the int value inline as a u32
+/// (`lo` + `hi`) instead of an `i` register. Layout: 1B base, 2B lo,
+/// 2B hi, 2B `VableField` descr.
+fn handler_setfield_vable_i_imm(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_r[code[p] as usize];
+    let lo = code[p + 1] as u32 | ((code[p + 2] as u32) << 8);
+    let hi = code[p + 3] as u32 | ((code[p + 4] as u32) << 8);
+    let value = (lo | (hi << 16)) as i64;
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (descr, p) = read_descr_vable_field(bh, code, p + 5);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
     Ok(p)

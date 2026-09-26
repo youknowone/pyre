@@ -1292,6 +1292,11 @@ struct BhRegsEntry {
     regs_len: usize,
     tmpreg_ptr: *mut i64,
     exc_ptr: *mut i64,
+    /// Owning `BlackholeInterpreter`, or null when the bank has no marker
+    /// to filter against. The collector calls [`BH_LIVE_REFS`] with it
+    /// before visiting, so dead Ref registers are cleared at collection
+    /// time rather than at every `-live-`.
+    live_ctx: *const (),
 }
 
 /// The traced fields of one pooled blackhole interpreter (`blackhole.py
@@ -1304,6 +1309,28 @@ struct BhInterpEntry {
     tmpreg_ptr: *mut i64,
     exc_ptr: *mut i64,
     vable_ptr: *mut i64,
+    live_ctx: *const (),
+}
+
+/// Zeroes Ref registers the frame's last `-live-` marker does not name.
+/// Installed by the embedder; a null ctx means root the whole bank.
+pub type BhLiveRefsFn = unsafe fn(*const (), *mut i64, usize);
+
+static BH_LIVE_REFS: std::sync::OnceLock<BhLiveRefsFn> = std::sync::OnceLock::new();
+
+/// Install the collection-time Ref liveness filter. First registration wins.
+pub fn register_bh_live_refs(f: BhLiveRefsFn) {
+    let _ = BH_LIVE_REFS.set(f);
+}
+
+fn apply_bh_live_refs(ctx: *const (), regs: *mut i64, len: usize) {
+    if ctx.is_null() {
+        return;
+    }
+    let Some(f) = BH_LIVE_REFS.get().copied() else {
+        return;
+    };
+    unsafe { f(ctx, regs, len) };
 }
 
 // Same thread-local discipline as `BhRegsEntry`.
@@ -1324,6 +1351,21 @@ unsafe impl Send for BhRegsEntry {}
 /// # Safety
 /// `regs` must remain alive and pinned until pop.
 pub unsafe fn push_bh_regs(regs: &mut [i64], tmpreg: &mut i64, exc: &mut i64) -> usize {
+    unsafe { push_bh_regs_with_live(regs, tmpreg, exc, std::ptr::null()) }
+}
+
+/// [`push_bh_regs`] plus the interpreter pointer collection uses to apply
+/// the last `-live-` marker's Ref liveness before rooting the bank.
+///
+/// # Safety
+/// `regs` must remain alive and pinned until pop. `live_ctx` must remain
+/// valid for the same window, or be null.
+pub unsafe fn push_bh_regs_with_live(
+    regs: &mut [i64],
+    tmpreg: &mut i64,
+    exc: &mut i64,
+    live_ctx: *const (),
+) -> usize {
     BH_REGS_STACK.with(|ss| {
         let mut ss = ss.borrow_mut();
         let depth = ss.len();
@@ -1334,6 +1376,7 @@ pub unsafe fn push_bh_regs(regs: &mut [i64], tmpreg: &mut i64, exc: &mut i64) ->
             regs_len: regs.len(),
             tmpreg_ptr: tmpreg as *mut i64,
             exc_ptr: exc as *mut i64,
+            live_ctx,
         });
         depth
     })
@@ -1353,12 +1396,29 @@ pub unsafe fn register_bh_interp(
     exc: *mut i64,
     vable: *mut i64,
 ) {
+    unsafe { register_bh_interp_with_live(regs, tmpreg, exc, vable, std::ptr::null()) }
+}
+
+/// [`register_bh_interp`] plus the interpreter pointer for collection-time
+/// Ref liveness. `live_ctx` stays valid until `unregister_bh_interp`.
+///
+/// # Safety
+/// Every pointer must stay valid, at a fixed address, until
+/// `unregister_bh_interp(regs)` runs on this thread. `live_ctx` may be null.
+pub unsafe fn register_bh_interp_with_live(
+    regs: *mut Vec<i64>,
+    tmpreg: *mut i64,
+    exc: *mut i64,
+    vable: *mut i64,
+    live_ctx: *const (),
+) {
     BH_INTERP_ROOTS.with(|roots| {
         roots.borrow_mut().push(BhInterpEntry {
             regs,
             tmpreg_ptr: tmpreg,
             exc_ptr: exc,
             vable_ptr: vable,
+            live_ctx,
         });
     });
 }
@@ -1380,6 +1440,7 @@ pub fn unregister_bh_interp(regs: *const Vec<i64>) {
 /// unregistered.
 unsafe fn visit_bh_interp_entry(entry: &BhInterpEntry, visitor: &mut dyn FnMut(&mut GcRef)) {
     let regs = unsafe { &mut *entry.regs };
+    apply_bh_live_refs(entry.live_ctx, regs.as_mut_ptr(), regs.len());
     for slot in regs.iter_mut() {
         let gcref = unsafe { &mut *(slot as *mut i64 as *mut GcRef) };
         visitor(gcref);
@@ -1409,6 +1470,7 @@ pub fn walk_bh_regs(mut visitor: impl FnMut(&mut GcRef)) {
             // the call stack above us (we are inside its run() body via a
             // collecting call). The Vec<i64> backing storage is pinned for
             // the lifetime of that frame.
+            apply_bh_live_refs(entry.live_ctx, entry.regs_ptr, entry.regs_len);
             let slots = unsafe { std::slice::from_raw_parts_mut(entry.regs_ptr, entry.regs_len) };
             for slot in slots.iter_mut() {
                 let gcref = unsafe { &mut *(slot as *mut i64 as *mut GcRef) };
@@ -1453,6 +1515,7 @@ pub fn walk_all_bh_regs(mut visitor: impl FnMut(&mut GcRef)) {
         // pinned until its owning blackhole frame pops the entry after resume.
         let entries = unsafe { &*(*mutator.bh_regs_stack).as_ptr() };
         for entry in entries.iter() {
+            apply_bh_live_refs(entry.live_ctx, entry.regs_ptr, entry.regs_len);
             let slots = unsafe { std::slice::from_raw_parts_mut(entry.regs_ptr, entry.regs_len) };
             for slot in slots.iter_mut() {
                 let gcref = unsafe { &mut *(slot as *mut i64 as *mut GcRef) };
