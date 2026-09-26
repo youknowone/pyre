@@ -236,7 +236,7 @@ impl PackSet {
                         // schedule.py: rightmost_match_leftmost
                         let rightmost = *self.packs[i].members.last().unwrap_or(&usize::MAX);
                         let leftmost = *self.packs[j].members.first().unwrap_or(&usize::MAX);
-                        // schedule.py:937-941: accumulating pack constraints
+                        // schedule.py: accumulating pack constraints
                         let accum_ok = if self.packs[i].is_accumulating {
                             self.packs[j].is_accumulating
                                 && self.packs[i].position == self.packs[j].position
@@ -735,7 +735,7 @@ impl VectorLoop {
     /// op.set_forwarded(VectorizationInfo(op))`). PyPy stores it on
     /// `op._forwarded`; pyre's flat-OpRef operands keep the per-op vecinfo
     /// in the scheduler's pos-keyed store, so `state` carries it. INT_SIGNEXT
-    /// reads arg1's constant through `constant_of` (resoperation.py:181).
+    /// reads arg1's constant through `constant_of` (resoperation.py).
     pub fn setup_vectorization(
         &self,
         state: &mut VecScheduleState,
@@ -760,13 +760,13 @@ impl VectorLoop {
     ///
     /// `jitcell_token`: when supplied, allocate fresh `TargetToken`s for
     ///   `self.label` (`reset_label_token` true) and `self.prefix_label` /
-    ///   `self.jump`, mirroring `vector.py:62-79`. When `None`, the descr
+    ///   `self.jump`, mirroring `vector.py`. When `None`, the descr
     ///   block is skipped — equivalent to RPython's `if jitcell_token:` guard.
-    /// `reset_label_token`: vector.py:64 — choose between minting a new
+    /// `reset_label_token`: vector.py — choose between minting a new
     ///   `TargetToken` for the label (true) or pulling the existing jump
     ///   descr (false).
     /// `label`: include `self.label` at the front. When false, follow
-    ///   `vector.py:87-90` and clear the vectorize-time scratch
+    ///   `vector.py` and clear the vectorize-time scratch
     ///   (`set_forwarded(None)` upstream) from every emitted prefix op plus
     ///   the jump. That scratch lives in the scheduler's pos-keyed forwarded
     ///   store (`state`), not on the permanent `Op.vecinfo`, so the
@@ -1123,7 +1123,7 @@ pub struct VectorizingOptimizer {
     body_ops: Vec<Op>,
     /// Whether we're inside a Label..Jump loop body.
     in_loop: bool,
-    /// schedule.py:669: label inputargs — populated on Label entry.
+    /// schedule.py: label inputargs — populated on Label entry.
     label_args: Vec<OpRef>,
     /// The loop LABEL op, held (not emitted) from the Label entry until the
     /// Jump so the streaming path can build a VectorLoop and let post_schedule/
@@ -1270,7 +1270,7 @@ impl VectorizingOptimizer {
         self.find_adjacent_memory_refs(&graph, loop_, &mut sched_state);
 
         // vector.py: extend and combine — combine_packset raises
-        // NotAVectorizeableLoop on an empty packset (vector.py:468-470).
+        // NotAVectorizeableLoop on an empty packset (vector.py).
         self.extend_packset(&graph, &mut sched_state);
         self.combine_packset()?;
 
@@ -1403,7 +1403,7 @@ impl VectorizingOptimizer {
                         // Bind the renamed args (e.g. accumulation-renamed vec
                         // ops) to their producers already in `oplist`.
                         sched_state.rebind_op_args(&member_op);
-                        // schedule.py:677-680: packed members are emitted via
+                        // schedule.py: packed members are emitted via
                         // mark_emitted(node, unpack=False) — renamed but NOT
                         // recorded in `seen`. They live only in box_to_vbox
                         // (turn_into_vector → setvector_of_box) so a later
@@ -1431,7 +1431,7 @@ impl VectorizingOptimizer {
         // vector.py schedule(): `walk_and_emit` then, only when the
         // cost model is profitable, `post_schedule()`. An unprofitable loop
         // returns *before* post_schedule, so loop_ is never mutated by it.
-        // vector.py:256-258 then raises NotAProfitableLoop on the same check;
+        // vector.py then raises NotAProfitableLoop on the same check;
         // run_optimization collapses both into this single early Err.
         if !sched_state.costmodel.profitable() {
             return Err(VectorizeError::NotProfitable);
@@ -1492,7 +1492,7 @@ impl VectorizingOptimizer {
         // TODO: thread jitcell_token through when optimize_vector is wired to the
         // compiler; None here skips the descr/token wiring (faithful for the
         // currently-disconnected compile path). `label=false` matches RPython's
-        // default (the vector.py:271 call omits the `label` argument).
+        // default (the vector.py call omits the `label` argument).
         let ops = loop_.finaloplist(None, false, false, &mut sched_state);
         Ok((ops, gso_consts))
     }
@@ -1533,7 +1533,7 @@ impl VectorizingOptimizer {
     fn copy_guard_descr(renamer: &Renamer, copied_op: &mut Op) {
         // vector.py: descr.clone() — already cloned by copy_resop
         // vector.py: failargs = renamer.rename_failargs(copied_op, clone=True)
-        // renamer.py:40: args[i] = rename_map.get(arg, arg) — a hit installs the
+        // renamer.py: args[i] = rename_map.get(arg, arg) — a hit installs the
         // BOUND renamed box, a miss KEEPS the original box object. lookup_box
         // returns the bound Operand on a hit (Some) and None on a miss; the miss
         // arm keeps `orig`'s live-producer Operand. No `from_opref`, so no
@@ -1749,7 +1749,7 @@ impl VectorizingOptimizer {
         // vector.py:516: state.prepare() — handled by caller
         // vector.py:517-518: scheduler.walk_and_emit(state) — scheduling
         //   is done inline in run_optimization via schedule_operations
-        // vector.py:520: state.post_schedule() — handled by caller
+        // vector.py: state.post_schedule() — handled by caller
     }
 
     /// vector.py: analyse_index_calculations — move guarding
@@ -1912,7 +1912,7 @@ impl VectorizingOptimizer {
         let mut sched_state = VecScheduleState::new(start_pos);
         // vector.py loop.setup_vectorization() — stamps
         // VectorizationInfo on each op. INT_SIGNEXT reads arg1's const
-        // value for bytesize (resoperation.py:181); the constant_of
+        // value for bytesize (resoperation.py); the constant_of
         // resolver feeds that through so the inline vecinfo slot matches
         // PyPy's VectorizationInfo(op) constructor.
         loop_.setup_vectorization(&mut sched_state, &constant_of);
@@ -2067,7 +2067,7 @@ impl VectorizingOptimizer {
                         // Bind the renamed args (e.g. accumulation-renamed vec
                         // ops) to their producers already in `oplist`.
                         sched_state.rebind_op_args(&member_op);
-                        // schedule.py:677-680: packed members are emitted via
+                        // schedule.py: packed members are emitted via
                         // mark_emitted(node, unpack=False) — renamed but NOT
                         // recorded in `seen`. They live only in box_to_vbox
                         // (turn_into_vector → setvector_of_box) so a later
@@ -2177,7 +2177,7 @@ impl VectorLoop {
     /// vector.py: unroll_loop_iterations — unroll the loop body
     /// `count` times with proper renaming.
     ///
-    /// `align_unroll_once` (vector.py:273) requests one extra alignment
+    /// `align_unroll_once` (vector.py) requests one extra alignment
     /// unroll. When set: `count` is bumped by one before the unroll runs;
     /// after the first iteration a fresh `LABEL` is materialised and
     /// installed as `self.label`; the *original* body is moved to
@@ -2345,10 +2345,10 @@ impl VectorLoop {
 // They are placed here because they are called from the vectorizer's
 // scheduling logic in try_vectorize / run_optimization.
 
-/// schedule.py:638-658: pre_emit_guard_accum — guard accumulation stitching.
+/// schedule.py: pre_emit_guard_accum — guard accumulation stitching.
 /// For guard ops, scan failargs for accumulation variables. When found:
-///   - attach AccumInfo to the guard descriptor (schedule.py:654-655)
-///   - replace the failarg with the renamed seed (schedule.py:656-657)
+///   - attach AccumInfo to the guard descriptor (schedule.py)
+///   - replace the failarg with the renamed seed (schedule.py)
 fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
     if !op.opcode.is_guard() {
         return;
@@ -2375,7 +2375,7 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
                         scalar: OpRef::NONE,
                     });
                 }
-                // schedule.py:656-657: failargs[i] = renamer.rename_map.get(seed,
+                // schedule.py: failargs[i] = renamer.rename_map.get(seed,
                 // seed) — a rename hit installs the bound renamed producer, a miss
                 // keeps the seed box. lookup_box returns the bound renamed Operand
                 // (Some) or None; on a miss bind the seed to a producer-carrying
@@ -2408,7 +2408,7 @@ pub(crate) fn ensure_args_unpacked(
     op: &mut Op,
     seen: &mut IndexSet<OpRef>,
 ) {
-    // schedule.py:702-706: unpack immediate-use args
+    // schedule.py: unpack immediate-use args
     for j in 0..op.num_args() {
         let arg = op.arg(j).to_opref();
         if arg.is_constant() || seen.contains(&arg) {
@@ -2429,7 +2429,7 @@ pub(crate) fn ensure_args_unpacked(
             op.setarg(j, state.bound_arg_boxref(unpacked));
         }
     }
-    // schedule.py:708-716: unpack guard failargs
+    // schedule.py: unpack guard failargs
     if op.opcode.is_guard()
         && let Some(mut fail_args) = op.getfailargs()
     {
@@ -2495,7 +2495,7 @@ impl Optimization for VectorizingOptimizer {
                 };
                 // Pristine copies for the non-vectorized restore path. Mirrors
                 // optimize_vector's `version = info.snapshot(loop)` + restore on
-                // bail (vector.py:134,158,163). NOT clone_loop() — that renames
+                // bail (vector.py). NOT clone_loop() — that renames
                 // boxes; the snapshot must keep the original op identities so
                 // post-loop references stay valid.
                 let orig_label = label.clone();
@@ -2731,7 +2731,7 @@ mod tests {
 
     // ── post_schedule tests (schedule.py) ──
 
-    /// schedule.py:762-779: invariant ops are routed into loop.prefix and the
+    /// schedule.py: invariant ops are routed into loop.prefix and the
     /// invariant vector var is appended to a fresh prefix_label and jump.
     #[test]
     fn test_post_schedule_routes_invariants_to_prefix() {
@@ -2780,7 +2780,7 @@ mod tests {
         st.invariant_vector_vars.insert(seed_vec);
 
         // The scheduled body lives in oplist; the base post_schedule
-        // (schedule.py:116) moves it into loop_.operations.
+        // (schedule.py) moves it into loop_.operations.
         st.oplist = body.iter().cloned().map(OpRc::new).collect();
 
         let mut seen: IndexSet<OpRef> = vloop
@@ -2791,14 +2791,14 @@ mod tests {
             .collect();
         st.post_schedule(&mut vloop, &mut seen);
 
-        // schedule.py:766: prefix == the three invariant ops, in insertion order.
+        // schedule.py: prefix == the three invariant ops, in insertion order.
         assert_eq!(vloop.prefix.len(), 3);
         assert_eq!(vloop.prefix[0].opcode, OpCode::VecI);
         assert_eq!(vloop.prefix[1].opcode, OpCode::VecIntXor);
         assert_eq!(vloop.prefix[2].opcode, OpCode::VecPackI);
         assert!(st.invariant_oplist.is_empty()); // drained into prefix
 
-        // schedule.py:773: prefix_label carries label args + the invariant var.
+        // schedule.py: prefix_label carries label args + the invariant var.
         let pl_args = vloop
             .prefix_label
             .as_ref()
@@ -2808,7 +2808,7 @@ mod tests {
         assert_eq!(pl_args.len(), 3); // i0, i1, seed_vec
         assert_eq!(pl_args[2].to_opref(), seed_vec);
 
-        // schedule.py:779: jump rebuilt with the extra invariant var.
+        // schedule.py: jump rebuilt with the extra invariant var.
         let j_args = vloop.jump.getarglist_copy();
         assert_eq!(vloop.jump.opcode, OpCode::Jump);
         assert_eq!(j_args.len(), 3);
@@ -2935,7 +2935,7 @@ mod tests {
         assert!(matches!((label_pos, jump_pos), (Some(l), Some(j)) if l < j));
     }
 
-    /// schedule.py:765 + 718-732: a packed scalar result that is loop-carried by
+    /// schedule.py + 718-732: a packed scalar result that is loop-carried by
     /// the `Jump` must be unpacked. `turn_into_vector` records the packed member
     /// only in `box_to_vbox`; PyPy's pack branch (`mark_emitted(node,
     /// unpack=False)`) never adds it to `seen`. post_schedule's
@@ -3059,7 +3059,7 @@ mod tests {
     /// the vectorizer packs, schedules profitably, and carries through
     /// `post_schedule` into GuardStrengthenOpt. First fixture that drives the
     /// standalone `optimize_vector` pipeline all the way to the gso step
-    /// (vector.py:259), exercising the increment-1 wiring end to end.
+    /// (vector.py), exercising the increment-1 wiring end to end.
     #[test]
     fn test_optimize_vector_packs_adjacent_loads_through_gso() {
         use majit_ir::{Type, make_array_descr};

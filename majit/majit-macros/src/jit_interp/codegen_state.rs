@@ -484,7 +484,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! { #len_value_name: i64, }
         })
         .collect();
-    // `virtualizable.py:139-144` names the virtualizable once, so one OpRef
+    // `virtualizable.py load_list_of_boxes` names the virtualizable once, so one OpRef
     // slot serves every `[.. ; virt]` array on the state.
     let sym_vable_identity_fields: TokenStream = if has_vable_identity {
         quote! {
@@ -884,7 +884,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // `vable_getarrayitem_*` reaches every element from this base through the
     // storage each field registered, and all `[.. ; virt]` arrays share it.
     // Emitting it once
-    // is `virtualizable.py:139-144`; the lengths stay off the red vector
+    // is `virtualizable.py load_list_of_boxes`; the lengths stay off the red vector
     // (`virtualizable.py:150-153` reads them off the live object).
     let extract_vable_identity_part: TokenStream = if has_vable_identity {
         quote! { values.push(self as *const Self as i64); }
@@ -1211,7 +1211,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     .map(|i| {
                         // Array-typed sym storage is the i64 register
                         // bank; each cell mints `InputArgInt`
-                        // (resoperation.py:719) consistent with the
+                        // (resoperation.py) consistent with the
                         // scalar i64 sym above and the typed inputarg
                         // produced by `TraceCtx::new`.
                         majit_ir::OpRef::input_arg_int((__offset + i) as u32)
@@ -1233,7 +1233,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // as every other inputarg.  The array elements that follow are carried by
     // `virtualizable_boxes`, so this is the last header slot — which makes the
     // loop's entry contract the same shape as a guard's vable section
-    // (`resume.py:1404` + `virtualizable.py:139-144`) and therefore the same
+    // (`resume.py:1404` + `virtualizable.py load_list_of_boxes`) and therefore the same  allow-line-citation
     // shape a bridge entering that loop presents.
     let create_sym_vable_identity_init: TokenStream = if has_vable_identity {
         quote! {
@@ -1565,7 +1565,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // `JitCodeSym::loop_carried_boxes` (the merge-point registration, i.e. a
     // later cross-loop cut's LABEL). RPython gets that agreement for free —
     // `reached_loop_header` builds one list and passes it to both — and
-    // asserts it at pyjitpl.py:3020. Two independent constructions here is
+    // asserts it at pyjitpl.py. Two independent constructions here is
     // what made every purely-virt-array interpreter's nested loop decline on
     // `jump.numargs() != label.numargs()` (compile.py:334).
     //
@@ -1579,7 +1579,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // So the element block is a strict SUFFIX of the reds, exactly as upstream
     // builds it: `live_arg_boxes = greenboxes + redboxes` and then
     // `live_arg_boxes += self.virtualizable_boxes; live_arg_boxes.pop()`
-    // (pyjitpl.py:2981-2989) — `+=` appends, so no element can precede a red.
+    // (pyjitpl.py) — `+=` appends, so no element can precede a red.
     // Splicing the elements before the ref/float scalars (as this did until
     // the order was unified) leaves the JUMP and the Label at the SAME arity
     // with different slot meanings, so `jump.numargs() == label.numargs()`
@@ -2713,7 +2713,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             /// RPython `warmspot.py:281-289`'s `make_jitcodes() →
             /// finish_setup(codewriter)` lifecycle reduced to the
             /// canonical-entry slice for state-field JIT
-            /// (`pyjitpl.py:2264 self.liveness_info = "".join(
+            /// (`pyjitpl.py self.liveness_info = "".join(
             /// asm.all_liveness)`).  Builds a fresh `Assembler`,
             /// registers the canonical
             /// `(live_i, live_r, live_f)` triple via
@@ -2746,7 +2746,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 driver: &mut majit_metainterp::JitDriver<#state_type>,
             ) {
                 // RPython `codewriter.py` calls `CallControl.__init__`
-                // (`call.py:46-47`) before `assemble()` produces the jitcodes
+                // (`call.py`) before `assemble()` produces the jitcodes
                 // that read `jitdriver_sd.index`. Pyre's analog: stamp the
                 // descriptor onto the driver before the dispatch JitCode
                 // build below reads jdindex via
@@ -2892,7 +2892,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     // `canonical_liveness_offset`.
                     let _ = __asm.ensure_canonical_liveness_offset();
                     driver.install_canonical_liveness(&__asm);
-                    // PyPy `make_jitcodes()` / `pyjitpl.py:2255
+                    // PyPy `make_jitcodes()` / `pyjitpl.py finish_setup
                     // finish_setup()` only install completed jitcodes —
                     // there is no path where a body that the codewriter
                     // failed to lower lands as a successfully-installed
@@ -2902,7 +2902,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     // `register_dispatch_jitcode` to match that
                     // lifecycle.  Successful builds (`Some(jc)`) install
                     // unconditionally per PyPy
-                    // `pypy/module/pypyjit/interp_jit.py:82-94`.
+                    // `pypy/module/pypyjit/interp_jit.py`.
                     if let Some(__dispatch_jc) = __dispatch_jc_opt {
                         driver.register_dispatch_jitcode(__dispatch_jc);
                     }
@@ -3258,7 +3258,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 })
             }
 
-            // ── Part B (bridge sym seeding) — resume.py:1042/1054 setup_bridge_sym
+            // ── Part B (bridge sym seeding) — resume.py rebuild_from_resumedata/1054 setup_bridge_sym
             //    + consume_boxes parity for the JitDriver state.  Seeds each red
             //    slot's symbolic OpRef + concrete shadow from the guard's decoded
             //    resume frame so the bridge specializes its guards on the real
@@ -3357,7 +3357,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                         rd_virtuals.map_or(0, |v| v.len()),
                     );
                 }
-                // resume.py:993-1007 — materialize the guard's virtuals + replay
+                // resume.py _prepare_pendingfields — materialize the guard's virtuals + replay
                 // its deferred heap writes as bridge-entry NEW/SETFIELD_GC ops so
                 // the compiled bridge observes the heap state the blackhole deopt
                 // would rebuild. A push/dup whose node is virtualized-and-elided
@@ -3498,7 +3498,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                             }
                         }
                         RebuiltValue::Virtual(__vidx) => {
-                            // resume.py:945-956 getvirtual — materialize the
+                            // resume.py getvirtual_ptr getvirtual — materialize the
                             // virtual as bridge NEW/SETFIELD_GC ops and bind the
                             // state field to its OpRef. Symbolic only; the concrete
                             // int shadow needs backend/callinfocollection.
@@ -3568,7 +3568,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                             }
                         }
                         RebuiltValue::Virtual(__vidx) => {
-                            // resume.py:945-956 getvirtual — materialize the
+                            // resume.py getvirtual_ptr getvirtual — materialize the
                             // virtual and bind the ref state field to its OpRef.
                             let __op = majit_metainterp::materialize_bridge_virtual(
                                 ctx, *__vidx, rd_virtuals, resume_data, &mut __bridge_cache,

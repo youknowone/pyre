@@ -167,7 +167,7 @@ impl W_UnicodeObject {
     }
 }
 
-/// The translated user-subclass layout selected by `typedef.py:174-227`.
+/// The translated user-subclass layout selected by `typedef.py _getusercls`.
 /// The builtin string payload stays unchanged; the generated user class adds
 /// `MapdictStorageMixin` after it.
 #[repr(C)]
@@ -381,7 +381,7 @@ pub fn w_str_from_wtf8(value: Wtf8Buf) -> PyObjectRef {
 }
 
 /// Box one code point as a one-character `str`, `rutf8.unichr_as_utf8`
-/// (`rutf8.py:40`) under `_getitem_result` (`unicodeobject.py`).
+/// (`rutf8.py`) under `_getitem_result` (`unicodeobject.py`).
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
 /// [`w_str_new`] twin: the body encodes into a fresh `Wtf8Buf` and runs the
@@ -516,7 +516,7 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
 /// Allocate a dynamic exact string at a terminal, GC-safe return site.
 ///
 /// PyPy's `StdObjSpace.newutf8` constructs an ordinary movable
-/// `W_UnicodeObject` (`objspace.py:391-394`).  Most interpreter callers still
+/// `W_UnicodeObject` (`objspace.py`).  Most interpreter callers still
 /// need the born-old stepping stone in [`w_str_from_wtf8_managed`] until their
 /// Rust-stack live references have explicit roots.  A caller that has consumed
 /// all of its Python operands can use this direct translated allocation shape:
@@ -915,7 +915,7 @@ pub fn interned_size_immortal() -> usize {
 ///
 /// Reads the process-global intern table the tracer cannot model; the JIT
 /// residualises the call instead of tracing into it (`@dont_look_inside`,
-/// `rlib/jit.py:139`), the `box_str`/`pin_root` twin.
+/// `rlib/jit.py`), the `box_str`/`pin_root` twin.
 #[majit_macros::dont_look_inside]
 pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
     let mut table = STRING_INTERN_TABLE.lock();

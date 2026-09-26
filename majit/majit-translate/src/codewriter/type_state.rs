@@ -8,7 +8,7 @@
 //! (`rpython/flowspace/model.py Variable.__slots__ = [..., "concretetype"]`;
 //! `:355 Constant.__slots__ = ["concretetype"]`) — set inline by the
 //! rtyper via `RPythonTyper.setconcretetype()`
-//! (`rpython/rtyper/rtyper.py:258 v.concretetype = ...`).  Pyre
+//! (`rpython/rtyper/rtyper.py v.concretetype = ...`).  Pyre
 //! reproduces this through `FunctionGraph::set_concretetype_of_inline`
 //! writes followed by `FunctionGraph::concretetype_of(&v)` reads
 //! (which routes to the backing `Variable.concretetype` cell).  No

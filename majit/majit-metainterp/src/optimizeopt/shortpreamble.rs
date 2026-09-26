@@ -90,7 +90,7 @@ pub struct ShortPreamble {
     /// through unchanged. This map is therefore empty on production paths.
     pub constants: majit_ir::ConstMap<majit_ir::Const>,
     /// RPython parity: PtrInfo for each inputarg, from Phase 1 export.
-    /// shortpreamble.py:414-425: preamble_op.set_forwarded(info)
+    /// shortpreamble.py __init__: preamble_op.set_forwarded(info)
     /// Used by inline_short_preamble to propagate PtrInfo to jump_args
     /// so guards added by use_box are eliminated as redundant.
     pub inputarg_infos: Vec<Option<crate::optimizeopt::info::PtrInfo>>,
@@ -333,7 +333,7 @@ pub struct PreambleOp {
     /// Carried as an [`majit_ir::OpRc`] so the exported entry, the derived
     /// `ProducedShortOp.preamble_op`, and replay-arg operands can share one
     /// object across the export/import boundary (upstream `preamble_op` is
-    /// one ResOperation object, shortpreamble.py:283-296).
+    /// one ResOperation object, shortpreamble.py).
     pub op: majit_ir::OpRc,
     /// The original short operation before `add_op_to_short` remaps its
     /// arguments into the short-preamble namespace.  Upstream carries this as
@@ -498,7 +498,7 @@ pub struct ShortBoxes {
     /// each renamed `AbstractInputArg` alive so producer-shaped consumers can
     /// bind that position to `Operand::InputArg` / a bound operand view — the
     /// analog of `TraceIterator.inputargs` rooting the outer-trace inputargs
-    /// (opencoder.py:250-273).
+    /// (opencoder.py).
     short_inputarg_refs: Vec<majit_ir::InputArgRc>,
     /// shortpreamble.py `box = label_args[i]` — the ORIGINAL label-arg
     /// references, kept so `potential_ops`/lookups resolve a label arg by
@@ -750,7 +750,7 @@ impl ShortBoxes {
         // combined list it OVERWRITES: the LAST slot's `ShortInputArg`
         // survives and `produce_arg` returns `short_inputargs[LAST]`, leaving
         // the FIRST slot's renamed box a dead Label arg — never produced,
-        // never given info (shortpreamble.py:414-417 sets info only on
+        // never given info (shortpreamble.py sets info only on
         // produced boxes). pyre mirrors that by stamping `label_arg_idx =
         // live_slot` (this call's slot) on the `potential_ops` entry below;
         // the later duplicate call overwrites with its later slot, so
@@ -772,7 +772,7 @@ impl ShortBoxes {
             std::slice::from_ref(&arg_res),
         );
         // `ProducedShortOp` stores an OpRc, so the fresh renamed InputArg
-        // that shortpreamble.py:257 carries as `preamble_op` is stood in for
+        // that shortpreamble.py carries as `preamble_op` is stood in for
         // by this non-emitted SAME_AS. The stand-in stays at the ORIGINAL
         // label box: exported entries carry original positions, and the
         // rename is applied at import, where `produce_arg` maps the entry to
@@ -837,7 +837,7 @@ impl ShortBoxes {
                 // renamed)`), so produce_arg returns the renamed
                 // short_inputargs box for this slot — the export-time
                 // rename. (`existing.res` is the ORIGINAL box, kept only
-                // as the info-lookup key, shortpreamble.py:417.)
+                // as the info-lookup key, shortpreamble.py.)
                 if existing.kind == PreambleOpKind::InputArg {
                     let label_arg_idx = existing.label_arg_idx;
                     return Some(self.renamed_short_inputarg(label_arg_idx));
@@ -863,7 +863,7 @@ impl ShortBoxes {
         if self.potential_op_oprefs.contains(&opref) {
             // shortpreamble.py `r = self.add_op_to_short(...);
             // return r.preamble_op`. ShortInputArg returns the RENAMED
-            // short_inputargs box for the slot (shortpreamble.py:257
+            // short_inputargs box for the slot (shortpreamble.py
             // `ShortInputArg(box, renamed)`), same as the
             // `produced_short_boxes` hit.
             let produced = self.materialize_one(ctx, opref)?;
@@ -1341,7 +1341,7 @@ impl CompoundOp {
 pub struct ProducedShortOp {
     /// The short op classification.
     pub kind: PreambleOpKind,
-    /// `short_op.res` (shortpreamble.py:58/110/151/224) — the result operand
+    /// `short_op.res` (shortpreamble.py __init__/110/151/224) — the result operand
     /// this short op produces. `add_preamble_op` reads it back as the
     /// `PreambleOp.op` operand (upstream `produce_op` passes `self.res`).
     /// Always a producer-bound / const operand (`materialize_operand_at` on
@@ -1723,7 +1723,7 @@ impl ProducedShortOp {
             crate::optimizeopt::ImportedShortPureArg::OpRef(r) => r,
             crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
         };
-        // shortpreamble.py:62-75 keeps two distinct Boxes: `self.res` is
+        // shortpreamble.py produce_op keeps two distinct Boxes: `self.res` is
         // body-visible, while `preamble_op` is the freshly replayed GETFIELD
         // result.  `result_opref` belongs only to that replay operation.
         //
@@ -1737,7 +1737,7 @@ impl ProducedShortOp {
             *result_map.get(&source)?
         };
         let _ = result_type;
-        // `info.py:212-214` indexes `_fields` by the field's position in its
+        // `info.py getfield` indexes `_fields` by the field's position in its
         // parent struct, so the seed has to carry the slot index every reader
         // resolves a getfield with, not the descr's own index. A pyre field
         // descr's `index()` is a tagged layout hash of offset/size/type, which
@@ -1816,7 +1816,7 @@ impl ProducedShortOp {
                 info.set_preamble_field(descr_idx, pop_for_field);
             }
         });
-        // shortpreamble.py:62-75 keeps `self.res` (the body-visible Box)
+        // shortpreamble.py produce_op keeps `self.res` (the body-visible Box)
         // distinct from `preamble_op` (the replayed GETFIELD result). The
         // builder later appends the former to LABEL.used_boxes and the latter
         // to the preamble JUMP. Forwarding them here erases the replay result:
@@ -2015,7 +2015,7 @@ impl ProducedShortOp {
             crate::optimizeopt::ImportedShortPureArg::Const(majit_ir::Value::Int(v), _) => v,
             _ => return None,
         };
-        // shortpreamble.py:152-159 stores `self.res` as the body-visible Box
+        // shortpreamble.py produce_op stores `self.res` as the body-visible Box
         // and the replay call separately in PreambleOp.
         let result_opref = *result_map.get(&source)?;
         let _ = result_type;
@@ -2581,7 +2581,7 @@ pub struct ExtendedShortPreambleBuilder {
     /// surface), like the deferred vectorizer maps.
     produced_short_boxes: IndexMap<OpRef, ProducedShortOp>,
     short_inputargs: Vec<OpRef>,
-    /// shortpreamble.py:460: self.short = short — single ops list (base + JUMP sentinel)
+    /// shortpreamble.py setup: self.short = short — single ops list (base + JUMP sentinel)
     short: Vec<Op>,
     /// Tracks which OpRefs are already in `short` (for dedup).
     short_results: IndexSet<OpRef>,
@@ -2703,7 +2703,7 @@ impl ExtendedShortPreambleBuilder {
     /// Upstream's `setup` (shortpreamble.py) is three field
     /// assignments and cannot fail, because the filtering happened at EXPORT:
     /// `produce_arg` returning None makes `add_op_to_short` return None and
-    /// THAT ONE short_op is left out (shortpreamble.py:283-296, 311-341). The
+    /// THAT ONE short_op is left out (shortpreamble.py, 311-341). The
     /// loop below reproduces that per-op drop here, where pyre first learns an
     /// arg is unresolvable — its short boxes are exported against one
     /// label-arg set and replayed against another.
@@ -2831,7 +2831,7 @@ impl ExtendedShortPreambleBuilder {
                 // An OVF PRODUCER carries a guard positionally rather than in
                 // its own arg list, so the `is_guard()` arm cannot see it.
                 // Upstream never separates the two: `use_box`
-                // (shortpreamble.py:398-400) SYNTHESIZES the
+                // (shortpreamble.py) SYNTHESIZES the
                 // `GUARD_NO_OVERFLOW` immediately after appending an
                 // `is_ovf()` op, so an orphan cannot exist. Pyre stores them
                 // as two entries — `extract_short_preamble` admits an
@@ -2844,7 +2844,7 @@ impl ExtendedShortPreambleBuilder {
                 // `last_emitted_operation`, and either kills the guard
                 // outright, or — if an unrelated ovf op happens to precede it
                 // — mis-attaches and registers that op's inverse pure
-                // operations (intbounds.py:222-228) as facts. Either way the
+                // operations (intbounds.py) as facts. Either way the
                 // body's assumptions enter unchecked, which is the same class
                 // the `is_guard()` arm above closes.
                 //
@@ -3095,7 +3095,7 @@ impl ExtendedShortPreambleBuilder {
         if let Some(produced) = self.produced_short_boxes.get(&lookup_key).cloned() {
             self.add_tracked_preamble_op(resolved_op, &produced);
         } else {
-            // shortpreamble.py:465-476: same pattern via replay_op.
+            // shortpreamble.py add_preamble_op: same pattern via replay_op.
             let replay_op = &preamble_op.preamble_op;
             if !self
                 .recorded_canonical_results
@@ -3493,7 +3493,7 @@ pub(crate) fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
 /// `short_inputargs` box in its args. The only exported entries that still
 /// reference an original label box are the `ShortInputArg` `SameAs*`
 /// stand-ins, and those are never emitted (`produce_op` returns None for
-/// `InputArg`, shortpreamble.py:233-234) nor read by any import consumer:
+/// `InputArg`, shortpreamble.py) nor read by any import consumer:
 /// `result_map` and the `produce_op` loop skip `InputArg`, the builder
 /// init skips entries with no `result_map` slot, and `use_box_recursive`'s
 /// arg recursion is rename-invariant for the `SameAs` self-reference. So
@@ -3518,7 +3518,7 @@ pub(crate) fn produced_short_boxes_from_exported_boxes(
                 preamble_op.pos().get(),
                 ProducedShortOp {
                     kind: entry.kind.clone(),
-                    // shortpreamble.py:58/110 short_op.res — the exported
+                    // shortpreamble.py __init__/110 short_op.res — the exported
                     // entry carries the Phase-1 res operand across the
                     // boundary; it already holds the live producer / const
                     // operand (#173 roots the producer, never position-only).

@@ -75,7 +75,7 @@ pub unsafe extern "C" fn PyBytes_FromStringAndSize(
         (*raw).ob_refcnt = 1;
         (*raw).ob_pyre_link = pyre_object::PY_NULL;
         (*raw).ob_type = ob_type;
-        // `pyobject.py:108` sets `c_ob_size` as it allocates, so `Py_SIZE`
+        // `pyobject.py` sets `c_ob_size` as it allocates, so `Py_SIZE`
         // answers the requested length while C is still writing the buffer.
         (*(raw as *mut CPyVarObject)).ob_size = size;
     }

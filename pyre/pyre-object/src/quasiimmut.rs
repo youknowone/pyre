@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 /// `GUARD_NOT_INVALIDATED` generation owned by that token.
 ///
 /// Upstream reaches an instance twice — `QuasiImmutDescr.__init__` binds it
-/// while recording (`pyjitpl.py:1081`) and `compile.py:204-207` registers the
+/// while recording (`pyjitpl.py`) and `compile.py:204-207` registers the  allow-line-citation
 /// finished loop on that same object — so the instance outlives the field slot
 /// that published it. It is shared through an [`Arc`] here for that reason, so
 /// the methods take `&self` and reach the list through a lock.
@@ -195,7 +195,7 @@ impl QuasiImmutField {
 
     /// Whether any read has been recorded since the last invalidation — the
     /// `if not qmut_ptr` test that guards `_invalidate_now`'s body
-    /// (quasiimmut.py:41). Lock-free so it can stay inside a trace.
+    /// (quasiimmut.py). Lock-free so it can stay inside a trace.
     #[inline]
     pub fn is_installed(&self) -> bool {
         !self.ptr.load(Ordering::Acquire).is_null()
@@ -206,7 +206,7 @@ impl QuasiImmutField {
     ///
     /// Upstream calls this while RECORDING the read: `pyjitpl.py:1081` builds a
     /// `QuasiImmutDescr`, whose `__init__` `bh_setfield_gc_r`s a fresh instance
-    /// into the hidden field (`quasiimmut.py:26`) and keeps it as
+    /// into the hidden field (`quasiimmut.py`) and keeps it as
     /// `self.qmut`. That binding is what `heap.py OptHeap.optimize_QUASIIMMUT_FIELD is_still_valid_for` and
     /// `compile.py register_loop_token` both read later; pyre returns it
     /// for the same two consumers.
@@ -357,7 +357,7 @@ mod tests {
         assert!(live.load(Ordering::Acquire));
     }
 
-    /// `quasiimmut.py:72-82` — an object recompiled against many times and never
+    /// `quasiimmut.py register_loop_token` — an object recompiled against many times and never
     /// mutated must not grow an unbounded watcher list.
     #[test]
     fn register_compresses_dead_loop_tokens() {

@@ -20,7 +20,7 @@ use crate::error::PyError;
 
 /// Resolved app-level handles, indexed `[reduce_1, reduce_2,
 /// get_slotvalues]`.  PyPy resolves these once via `app.interphook`
-/// (objectobject.py:88-90); pyre resolves them on first use into a
+/// (objectobject.py); pyre resolves them on first use into a
 /// thread-local cache.
 const REDUCE_1: usize = 0;
 const REDUCE_2: usize = 1;

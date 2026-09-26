@@ -103,7 +103,7 @@ where
     V: UnionFindInfo,
 {
     /// RPython `UnionFind.__init__(self, info_factory=None)`
-    /// (unionfind.py:7-11).
+    /// (unionfind.py).
     pub fn new<F>(info_factory: F) -> Self
     where
         F: Fn(&K) -> V + 'static,
@@ -122,7 +122,7 @@ where
     }
 
     /// RPython `UnionFind.__iter__(self)` / `UnionFind.keys(self)`
-    /// (unionfind.py:25-29).
+    /// (unionfind.py).
     pub fn keys(&self) -> impl Iterator<Item = &K> {
         self.link_to_parent.keys()
     }

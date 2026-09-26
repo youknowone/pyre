@@ -1,8 +1,8 @@
-# `sys._getframe` emits the `sys._getframe` audit event (`vm.py:51`), and the
+# `sys._getframe` emits the `sys._getframe` audit event (`vm.py`), and the
 # constant-depth walker fold that answers the call without running the body has
 # to answer for it too.
 #
-# `AuditHolder`'s hook list is quasi-immutable (`vm.py:439 _immutable_fields_ =
+# `AuditHolder`'s hook list is quasi-immutable (`vm.py _immutable_fields_ =
 # ['hooks_w?[:]']`), so the fold bakes "no hook installed" behind a
 # `guard_not_invalidated` rather than re-reading it, and `addaudithook` revokes
 # every loop that baked it.

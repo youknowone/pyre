@@ -297,7 +297,7 @@ pub(crate) fn with_dynasm_active_gc_mut<R>(
 }
 
 /// `cpu.gc_ll_descr`: the installed collector, or [`HostHeapGc`] —
-/// `get_ll_description(None)` (gc.py:653) picks the Boehm descr when no
+/// `get_ll_description(None)` (gc.py) picks the Boehm descr when no
 /// framework GC is configured, and this is that descr. Same three-way
 /// routing as [`with_dynasm_active_gc_mut`], with the host descr in place of
 /// `None`.
@@ -321,7 +321,7 @@ struct RanFrame {
     num_slots: usize,
 }
 
-/// `gc_ll_descr.malloc_jitframe(frame_info)` (`llmodel.py:298`) for a
+/// `gc_ll_descr.malloc_jitframe(frame_info)` (`llmodel.py`) for a
 /// compiled entry.
 ///
 /// Input refs take explicit owner-root slots across a possible collection,
@@ -574,7 +574,7 @@ pub(crate) fn dynasm_nursery_recycle_window_addr() -> usize {
 }
 
 /// Per-backend `CPU.load_supported_factors` (rewrite.py:1124 /
-/// x86/runner.py:31 / llmodel.py:39). x86 addressing scales natively by
+/// x86/runner.py / llmodel.py:39). x86 addressing scales natively by  allow-line-citation
 /// 1/2/4/8, aarch64 has no scaled store form and always expects factor 1.
 #[cfg(target_arch = "x86_64")]
 fn gc_store_supported_factors() -> &'static [i64] {
@@ -796,7 +796,7 @@ fn dynasm_alloc_young_nonmoving_typed(type_id: u32, size: usize) -> GcRef {
 }
 
 /// Allocate the struct a `bh_new` / `bh_new_with_vtable` descr describes
-/// (`llmodel.py:775-786`).
+/// (`llmodel.py`).
 ///
 /// A GC-managed struct (real `type_id`) MUST be allocated through the GC so the
 /// collector can trace its pointer fields: a resume-materialized virtual (e.g.
@@ -1646,7 +1646,7 @@ pub extern "C" fn dynasm_write_barrier(obj_ptr: u64) {
 /// `gc.py get_write_barrier_fn` resolves to
 /// `framework.py:538-544 gcdata.gc.remember_young_pointer`, whose own comment
 /// is "We know that 'addr_struct' has GCFLAG_TRACK_YOUNG_PTRS so far"
-/// (`incminimark.py:1538-1546`) — the inline test already made that true, so
+/// (`incminimark.py`) — the inline test already made that true, so
 /// the helper neither repeats it nor guards. The base here is whatever the GC
 /// rewriter emitted `COND_CALL_GC_WB` for, which is a collector-allocated
 /// object with a real header.
@@ -1716,7 +1716,7 @@ pub unsafe extern "C" fn dynasm_realloc_frame(
     };
     // `frame.jf_forward = new_frame` is a GC-pointer store on the old
     // frame. `realloc_frame` documents this caller-side barrier, matching
-    // the framework transform around llmodel.py:141.
+    // the framework transform around llmodel.py.
     with_gc_ll_descr(|gc| jitframe_write_barrier(gc, old_jf));
     if crate::majit_log_enabled() {
         eprintln!(
@@ -1772,7 +1772,7 @@ pub struct DynasmBackend {
     /// Arch-specific per-CPU state PyPy keeps on `Assembler386` /
     /// `AssemblerARM64` (e.g. `self.malloc_slowpath`,
     /// `self.propagate_exception_path` at `assembler.py:63,344` and
-    /// `aarch64/assembler.py:577`).  PyPy's assembler is one-per-CPU;
+    /// `aarch64/assembler.py`).  PyPy's assembler is one-per-CPU;
     /// pyre's `Asm` is per-`compile_loop`/`compile_bridge`, so the
     /// per-CPU stash lives here instead.  See
     /// `crate::x86::cpu_ext::X86CpuExt` /
@@ -1934,12 +1934,12 @@ impl DynasmBackend {
         <Self as Backend>::set_propagate_exception_descr(self, propagate);
         // `pyjitpl.py self.cpu.setup_once()` parity — production
         // reaches `cpu.setup_once()` via `MetaInterpStaticData::_setup_once`
-        // (`pyjitpl.py:2292-2303`) on first JIT entry, AFTER every descr
+        // (`pyjitpl.py`) on first JIT entry, AFTER every descr
         // setter has run.  Backend-only tests bypass the metainterp gate,
         // so call `setup_once` here directly once the descrs are in place
         // — analogous to PyPy test helpers that explicitly call
         // `cpu.setup_once()` after manual descr attachment (e.g.
-        // `rpython/jit/backend/ppc/test/test_regalloc_3.py:10`).
+        // `rpython/jit/backend/ppc/test/test_regalloc_3.py`).
         <Self as Backend>::setup_once(self);
     }
 
@@ -1983,7 +1983,7 @@ impl DynasmBackend {
     /// token.
     ///
     /// Lifetime root: `token.compiled_loop_token.asmmemmgr_gcreftracers`
-    /// (`model.py:294`, `llsupport/assembler.py:190-194`
+    /// (`model.py:294`, `llsupport/assembler.py get_asmmemmgr_gcreftracers`  allow-line-citation
     /// `get_asmmemmgr_gcreftracers`).  Pushes one tracer per
     /// `register_fail_descrs` call mirroring
     /// `assembler.py:822 gcreftracers.append(tracer)`; the tracer owns
@@ -1997,7 +1997,7 @@ impl DynasmBackend {
     ) {
         // `assembler.py:820-823` parity: each call appends one tracer.
         // `clt.asmmemmgr_gcreftracers` is the sole lifetime root for the
-        // baked descrs (`model.py:294` / `llmodel.py:252-268
+        // baked descrs (`model.py` / `llmodel.py free_loop_and_bridges
         // free_loop_and_bridges`).  The cells' addresses are baked into
         // machine code, so the tracer must keep the same `Box`es alive —
         // clone the `Arc`, not the cells.
@@ -2474,11 +2474,11 @@ impl DynasmBackend {
         });
     }
 
-    /// `rpython/jit/backend/llsupport/llmodel.py:534-537`
+    /// `rpython/jit/backend/llsupport/llmodel.py get_baseofs_of_frame_field`
     /// `get_baseofs_of_frame_field(self)` — offset from a `JITFRAME` base
     /// to the first frame-array item. Used by `_set_initial_bindings`
     /// (regalloc.py:865) and `update_frame_info` (model.py) for
-    /// `jfi_frame_size` accounting (jitframe.py:19-22).
+    /// `jfi_frame_size` accounting (jitframe.py).
     fn get_baseofs_of_frame_field() -> i64 {
         crate::jitframe::FIRST_ITEM_OFFSET as i64
     }
@@ -2635,7 +2635,7 @@ impl DynasmBackend {
         // address with `llop.threadlocalref_addr` before the call. The compiled
         // prologue (gen_shadowstack_header) / epilogue
         // (gen_footer_shadowstack) push/pop the jf_ptr onto the shadow
-        // stack inline, matching aarch64/assembler.py:1422/1438 — no
+        // stack inline, matching aarch64/assembler.py/1438 — no
         // manual push_jf/pop_jf_to around the call.
         let func: unsafe extern "C" fn(*mut JitFrame, *const i64) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
@@ -2976,7 +2976,7 @@ impl Backend for DynasmBackend {
         //
         // PyPy's lifecycle binds `propagate_exception_descr` before
         // `cpu.setup_once()` (`pyjitpl.py` precedes
-        // `pyjitpl.py:2292-2303`) and never swaps it afterwards.
+        // `pyjitpl.py`) and never swaps it afterwards.
         // Pyre upholds the same invariant: a *different* `Arc`
         // arriving after the propagate / malloc trampolines have
         // already baked the previous descr pointer would leave
@@ -3183,7 +3183,7 @@ impl Backend for DynasmBackend {
             );
         }
 
-        // llmodel.py:252 asmmemmgr_blocks parity: store the entire
+        // llmodel.py free_loop_and_bridges asmmemmgr_blocks parity: store the entire
         // bridge CompiledCode on the owning loop token. This keeps
         // both the arena-backed mapped code AND the fail_descrs
         // (DescrRef) alive. Recovery stubs embed raw pointers to
@@ -3817,7 +3817,7 @@ impl Backend for DynasmBackend {
         descr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
         // llmodel.py: ofs, size, sign = self.unpack_arraydescr_size(descr)
-        // ofs == 0 always for raw lengthless arrays (llmodel.py:749 assert)
+        // ofs == 0 always for raw lengthless arrays (llmodel.py assert)
         let size = descr.as_itemsize();
         let sign = descr.is_item_signed();
         // llmodel.py: return self.read_int_at_mem(addr, offset, size, sign)
@@ -3833,7 +3833,7 @@ impl Backend for DynasmBackend {
         descr: &majit_jitcode::jitcode::BhDescr,
     ) {
         // llmodel.py: ofs, size, _ = self.unpack_arraydescr_size(descr)
-        // ofs == 0 always for raw lengthless arrays (llmodel.py:741 assert)
+        // ofs == 0 always for raw lengthless arrays (llmodel.py assert)
         let size = descr.as_itemsize();
         // llmodel.py: self.write_int_at_mem(addr, offset, size, newvalue)
         self.write_int_at_mem(addr, offset, size, newvalue);
@@ -3865,7 +3865,7 @@ impl Backend for DynasmBackend {
     /// `llmodel.py bh_getfield_gc_i` →
     /// `read_int_at_mem(struct, ofs, size, sign)`.  Threads the per-field
     /// `(offset, size, sign)` tuple from `BhDescr.unpack_fielddescr_size`
-    /// to the size dispatch in `llmodel.py:467-478`.
+    /// to the size dispatch in `llmodel.py`.
     fn bh_getfield_gc_i(
         &self,
         struct_ptr: i64,
@@ -4204,7 +4204,7 @@ impl Backend for DynasmBackend {
 
     /// `pyjitpl.py self.cpu.setup_once()` parity, dispatched by
     /// `MetaInterpStaticData::_setup_once` under the
-    /// `globaldata.initialized` gate (`pyjitpl.py:2292-2303`).  All
+    /// `globaldata.initialized` gate (`pyjitpl.py`).  All
     /// per-CPU descrs (notably `propagate_exception_descr` via
     /// `set_propagate_exception_descr`) must already be installed
     /// when this runs; the helpers we materialise here bake those
@@ -5374,10 +5374,10 @@ mod tests {
 //
 // Token semantics come from `symbolic.get_array_token(rstr.STR/UNICODE, ...)`
 // and `symbolic.get_field_token(rstr.STR/UNICODE, 'hash', ...)` (see
-// `rpython/jit/backend/llsupport/symbolic.py:7,29`). The layout encoded by
+// `rpython/jit/backend/llsupport/symbolic.py`). The layout encoded by
 // `rstr.STR.become(GcStruct('rpy_string', ('hash', Signed), ('chars',
 // Array(Char, hints={'extra_item_after_alloc': 1}))))`
-// (`rpython/rtyper/lltypesystem/rstr.py:1226`) is:
+// (`rpython/rtyper/lltypesystem/rstr.py`) is:
 //
 //   [ hash (WORD) | chars.length (WORD) | chars[0..n] | +1 extra null ]
 //

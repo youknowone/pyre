@@ -23,7 +23,7 @@ def main():
 
 
 # UNARY_NEGATIVE on INT_MIN: -INT_MIN overflows the machine-int range, so
-# descr_neg (intobject.py:628) takes the long branch and returns 2**63 as a
+# descr_neg (intobject.py) takes the long branch and returns 2**63 as a
 # W_LongObject.  The codewriter inline-call walks that overflow arm of `neg`,
 # so the compiled loop must agree with the long result rather than wrapping
 # back to INT_MIN.  The promoted long crosses the loop header as an argument

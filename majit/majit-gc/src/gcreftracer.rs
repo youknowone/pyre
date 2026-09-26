@@ -6,17 +6,17 @@
 //! Instead of baking the raw `GcRef` value as a machine-code immediate
 //! (which a moving GC cannot find or update), the backend bakes the
 //! address of a per-loop array of reference slots and emits a
-//! `LoadFromGcTable(index)` load (`x86/assembler.py:1545`
+//! `LoadFromGcTable(index)` load (`x86/assembler.py _addr_from_gc_table`
 //! `genop_load_from_gc_table`). Each slot is a GC root: the collector
 //! forwards it in place during a collection step, so the next load
 //! observes the relocated object.
 //!
 //! Upstream models the array with a `GCREFTRACER` `GcStruct`
-//! (`gcreftracer.py:7-11`) carrying `array_base_addr` + `array_length`,
+//! (`gcreftracer.py`) carrying `array_base_addr` + `array_length`,
 //! registered with the GC via a custom trace hook
 //! (`register_custom_trace_hook`, `gcreftracer.py`) and *reached* by
 //! the collector through the loop token's `asmmemmgr_gcreftracers`, which
-//! in RPython is a GC-managed list (`x86/assembler.py:823`,
+//! in RPython is a GC-managed list (`x86/assembler.py`,
 //! `model.py:294`) so the tracer header sits in the live object graph.
 //!
 //! pyre has the custom-trace-hook facility — `TypeInfo::custom_trace`
@@ -215,7 +215,7 @@ impl GcTable {
         unsafe { *((self.array_base_addr + i * WORD) as *const GcRef) }
     }
 
-    /// Forward every slot in place. `gcreftracer.py:13-23`
+    /// Forward every slot in place. `gcreftracer.py gcrefs_trace`
     /// `gcrefs_trace`: each `array_base_addr + i*WORD` slot is handed to
     /// the GC as a root; writing back through the visitor forwards the
     /// constant if the moving GC relocated the referenced object.

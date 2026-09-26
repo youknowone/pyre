@@ -37,7 +37,7 @@ pub struct W_Decompress {
     backend: *mut Mutex<backend::Decompressor>,
 }
 
-/// PyPy `interp_zlib.py:419 ZlibDecompressor` object-owned buffered stream.
+/// PyPy `interp_zlib.py default_buffer_size ZlibDecompressor` object-owned buffered stream.
 // CPython 3.14's ZlibDecompressorType spec adds IMMUTABLETYPE, unlike the two
 // public stream types above.
 #[pyre_interpreter::pyre_class("zlib._ZlibDecompressor", cpython_heaptype)]

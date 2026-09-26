@@ -138,7 +138,7 @@ impl Random {
 pub struct W_Random {
     /// PyPy composes `MapdictStorageMixin` into a native-layout object when
     /// `space.allocate_instance(W_Random, w_subtype)` allocates a Python
-    /// subclass (`objspace.py:485-487`, `mapdict.py:907-910`).  Keep the same
+    /// subclass (`objspace.py:485-487`, `mapdict.py`).  Keep the same  allow-line-citation
     /// `[PyObject | map | storage]` prefix as `W_ObjectObject`, so the shared
     /// mapdict implementation can operate on both layouts.  The builtin
     /// `_random.Random` itself simply retains the empty/null state.
@@ -228,7 +228,7 @@ impl W_Random {
         #[default(pyre_object::w_none())] w_n: PyObjectRef,
     ) -> Result<(), crate::PyError> {
         // None: seed from os.urandom(8); fall back to a time-based int only
-        // when urandom raises (interp_random.py:28). Under sandbox the entropy
+        // when urandom raises (interp_random.py). Under sandbox the entropy
         // comes from the trusted controller, not host getrandom.
         let w_n = if unsafe { is_none(w_n) } {
             #[cfg(not(feature = "sandbox"))]

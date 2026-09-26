@@ -38,7 +38,7 @@ fn elidable_canary_macro_advertises_extern_c_trampoline() {
     // `call_policy_byte.rs`'s `INT_ELIDABLE_CANNOT_RAISE = 19`.
     // Also confirms the 4-tuple's trace_target slot points at the
     // macro-emitted `extern "C" fn(i64, i64) -> i64` wrapper — PyPy
-    // `getfunctionptr` (`call.py:174`) parity.
+    // `getfunctionptr` (`call.py get_jitcode_calldescr`) parity.
     let (policy, _, trace_target, concrete_target, _, _) =
         __majit_call_policy_elidable_canary_mul();
     assert_eq!(
@@ -106,7 +106,7 @@ fn elidable_canary_traces_to_call_pure_i_when_args_not_all_const() {
     ctx.ensure_ops_materialized();
     let ops = ctx.ops();
 
-    // pyjitpl.py:3577-3579 — original CallI cut, CallPureI re-recorded.
+    // pyjitpl.py record_result_of_call_pure — original CallI cut, CallPureI re-recorded.
     assert!(
         ops.iter().any(|op| op.opcode == OpCode::CallPureI),
         "trace must contain CallPureI after record_result_of_call_pure patch; got opcodes {:?}",

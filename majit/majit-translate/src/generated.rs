@@ -18,7 +18,7 @@
 //! `OpKind`, no new jitcode-keying schemas. The pipeline this module
 //! drives is exactly the canonical
 //! `analyze_multiple_pipeline_with_modules` (`crate::analyze_multiple_pipeline_with_modules`) —
-//! i.e. the same entry point `rpython/jit/codewriter/codewriter.py:33
+//! i.e. the same entry point `rpython/jit/codewriter/codewriter.py
 //! transform_func_to_jitcode` is wrapped by in the tests.
 //!
 //! ## What this module provides
@@ -190,14 +190,14 @@ fn build() -> AllJitCodes {
     // jitdriver / portal / oopspec metadata, then calls
     // `grab_initial_jitcodes` + `drain_pending_graphs` through
     // `make_jitcodes`. The output mirrors RPython
-    // `call.py:87 self.jitcodes` (dict) + `call.py:88 self.all_jitcodes`
+    // `call.py self.jitcodes` (dict) + `call.py self.all_jitcodes`
     // (list).
     //
     // KNOWN DEVIATION: this path uses the
     // symbolic `JitCode.fnaddr` fallback at
     // `crate::call::symbolic_fnaddr_for_path`, NOT upstream's real
     // `getfunctionptr(graph)` surface (`rpython/jit/codewriter/
-    // call.py:181-187`).
+    // call.py`).
     //
     // The blocker is wider than "need a binding table":
     //

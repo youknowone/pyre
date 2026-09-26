@@ -52,7 +52,7 @@ impl majit_jitcode::codewriter::call::GreenFieldInfoHandle for GreenFieldInfo {
 }
 
 impl GreenFieldInfo {
-    /// greenfield.py:2-19 — direct constructor analog.  Pyre supplies
+    /// greenfield.py __init__ — direct constructor analog.  Pyre supplies
     /// `red_index` + `green_fields` precomputed (the matching
     /// `objname` consistency check happens at the caller, mirroring
     /// the `assert len(seen) == 1` upstream).

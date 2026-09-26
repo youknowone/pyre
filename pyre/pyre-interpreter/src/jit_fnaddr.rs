@@ -3231,7 +3231,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         float_array_push,
     );
     // The same resume needs the jitcode *shells* it inline-calls to carry a
-    // real address: `blackhole.py:1300-1317 bhimpl_inline_call_*` calls
+    // real address: `blackhole.py bhimpl_inline_call_ir_v bhimpl_inline_call_*` calls
     // `cpu.bh_call_*(adr2int(jitcode.fnaddr), ...)`, so a shell minted with
     // `symbolic_fnaddr_for_path` is uncallable the same way.  `w_list_append`
     // is the fold's descended body and `w_list_len` its length probe.
@@ -4788,7 +4788,7 @@ fn merge_macro_helper_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
 
 /// Build-time addresses of the prebuilt static `PyType` singletons that
 /// pyre source carries through the flowgraph as opaque `LOAD_GLOBAL`
-/// constants (`flowcontext.py:856` pushes the per-module-globals entry
+/// constants (`flowcontext.py` pushes the per-module-globals entry
 /// as `Constant(value)`).  The codewriter bakes each into
 /// `JitCode.constants_i` as a build-time `ConstValue::Int(addr)`.
 ///

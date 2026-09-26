@@ -1,11 +1,11 @@
 //! `lltype.malloc` parity API — unified allocation lowering for pyre objects.
 //!
 //! Mirrors RPython's `lltype.malloc(T, flavor='gc')`
-//! (`rpython/rtyper/lltypesystem/lltype.py:2192`), the user-facing
+//! (`rpython/rtyper/lltypesystem/lltype.py`), the user-facing
 //! allocation primitive used throughout PyPy's interpreter
 //! (`pypy/objspace/std/intobject.py wrapint` etc.). In RPython's
 //! translation pipeline, every `lltype.malloc(T)` call is rewritten by
-//! the GC transform (`rpython/memory/gctransform/framework.py:803-853
+//! the GC transform (`rpython/memory/gctransform/framework.py gct_fv_gc_malloc
 //! gct_fv_gc_malloc`) into a managed allocation surrounded by
 //! `push_roots` / `pop_roots`:
 //!
@@ -21,7 +21,7 @@
 //! consumes; PyPy interpreter source-level constructors like
 //! `pypy/objspace/std/intobject.py wrapint` are plain
 //! `W_IntObject(x)` calls and `lltype.malloc` only emerges from the
-//! rtyping stage `rpython/rtyper/rclass.py:731`) so that:
+//! rtyping stage `rpython/rtyper/rclass.py new_instance`) so that:
 //!
 //! 1. Object constructors are single allocation calls without
 //!    per-callsite TLS hooks or conditional branches.

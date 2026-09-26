@@ -21,7 +21,7 @@ use crate::jitframe::JitFrame;
 /// Concrete data stored in DeadFrame by a backend whose frames live off the
 /// GC heap.
 ///
-/// **THE DEADFRAME IS THE JITFRAME.** `llmodel.py:240-250` obtains it by
+/// **THE DEADFRAME IS THE JITFRAME.** `llmodel.py grab_exc_value` obtains it by
 /// `lltype.cast_opaque_ptr(jitframe.JITFRAMEPTR, deadframe)` and reads
 /// `jf_guard_exc` / `jf_savedata` straight off it; `llmodel.py:298` allocates
 /// exactly one `malloc_jitframe` per `execute_token`, and `:328` returns that

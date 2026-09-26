@@ -4,7 +4,7 @@
 //! Upstream's rbigint names no malloc, no root, and no write barrier: the GC
 //! transform inserts shadow-stack pushes and barriers into the final graphs
 //! (`rpython/memory/gctransform/framework.py`), two pipeline stages after the
-//! codewriter (`rpython/translator/driver.py:348` vs `:408`). pyre's binary is
+//! codewriter (`rpython/translator/driver.py` vs `:408`). pyre's binary is
 //! produced by rustc, which has no such stage, so this code is written by hand
 //! — but it is written *here*, in the layer that corresponds to the one that
 //! generates it, and not in the port of the algorithm file.
@@ -283,7 +283,7 @@ pub fn alloc_rbigint_nursery_collecting(value: RBigInt) -> *mut RBigInt {
 /// and upstream that is an ordinary malloc: `[NULLDIGIT] * size` lowers to
 /// `ll_newlist`, the inlined `malloc_fast` copy of `malloc_fixedsize`
 /// (framework.py:366-373), whose nursery bump reaches `collect_and_reserve`
-/// the moment it overflows (incminimark.py:676-680). So the quotients and
+/// the moment it overflows (incminimark.py). So the quotients and
 /// remainders of earlier iterations — dead the moment the next one starts —
 /// never leave the nursery.
 ///

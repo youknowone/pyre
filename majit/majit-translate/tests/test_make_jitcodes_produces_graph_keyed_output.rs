@@ -16,9 +16,9 @@
 //!   that turns one FunctionGraph into one JitCode.
 //! - `rpython/jit/codewriter/call.py CallControl.__init__ self.jitcodes = {}` — the
 //!   graph-keyed dict that `AllJitCodes::by_path` mirrors.
-//! - `rpython/jit/codewriter/call.py:88 self.all_jitcodes = []` — the
+//! - `rpython/jit/codewriter/call.py self.all_jitcodes = []` — the
 //!   alloc-order list that `AllJitCodes::in_order` mirrors, with the
-//!   `all_jitcodes[i].index == i` invariant from `codewriter.py:80`.
+//!   `all_jitcodes[i].index == i` invariant from `codewriter.py`.
 //!
 //! ## What this test anchors
 //!

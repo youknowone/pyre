@@ -6,7 +6,7 @@
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
 
-/// Compiled regular expression object (interp_sre.py:147).
+/// Compiled regular expression object (interp_sre.py W_SRE_Pattern).
 ///
 /// `code`/`code_len` stand in for `srepat.code =
 /// rsre_core.CompiledPattern(code, flags)` (interp_sre.py:635): pyre
@@ -22,7 +22,7 @@ pub struct W_SRE_Pattern {
     /// interp_sre.py `srepat.code` (see type doc).
     pub code: *const u32,
     pub code_len: usize,
-    /// interp_sre.py:637 `srepat.num_groups`.
+    /// interp_sre.py SRE_Pattern__new__ `srepat.num_groups`.
     pub num_groups: i64,
     /// interp_sre.py:638 `srepat.w_groupindex`.
     pub w_groupindex: PyObjectRef,
@@ -31,7 +31,7 @@ pub struct W_SRE_Pattern {
 }
 
 /// Allocate a `W_SRE_Pattern` — `SRE_Pattern__new__` field stamping
-/// (interp_sre.py:624-639).
+/// (interp_sre.py).
 pub fn w_sre_pattern_new(
     w_pattern: PyObjectRef,
     flags: i64,
@@ -104,7 +104,7 @@ pub struct W_SRE_Match {
 }
 
 /// Allocate a `W_SRE_Match` — `W_SRE_Match.__init__` field stamping
-/// (interp_sre.py:678-682) plus the eager span flattening described on
+/// (interp_sre.py) plus the eager span flattening described on
 /// the type.
 pub fn w_sre_match_new(
     w_srepat: PyObjectRef,

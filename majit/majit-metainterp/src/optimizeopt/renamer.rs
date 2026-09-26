@@ -13,7 +13,7 @@ use majit_ir::operand::Operand;
 
 /// renamer.py: Renamer — maps old OpRefs to new OpRefs during unrolling.
 ///
-/// RPython `rename_map` maps box→box (`renamer.py:5`): the value IS the
+/// RPython `rename_map` maps box→box (`renamer.py`): the value IS the
 /// renamed-to box OBJECT, and `rename` does `op.setarg(i, rename_map.get(arg,
 /// arg))` — a BOUND box. pyre's `Op.args` carry `Operand`, which sheds a bound
 /// box (`Operand::Op` / `Operand::InputArg`) but mints a position-only
@@ -167,7 +167,7 @@ impl Renamer {
     /// renamer.py: rename_rd_snapshot — recursively rename snapshot boxes.
     /// In RPython, snapshots are nested MIFrame structures. In majit, resume data
     /// uses rd_numb (compact varint encoding), so this is a no-op for now,
-    /// matching RPython's own TODO comment at renamer.py:27.
+    /// matching RPython's own TODO comment at renamer.py.
     pub fn rename_rd_snapshot(&self, _rd_numb: &Option<Vec<u8>>) -> Option<Vec<u8>> {
         // RPython: TODO op.rd_snapshot = self.rename_rd_snapshot(op.rd_snapshot, clone=True)
         // Not yet implemented in RPython's vector optimizer either.

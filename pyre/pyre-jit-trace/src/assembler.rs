@@ -14,9 +14,9 @@
 //! the opcode table is still majit's fixed adapter table rather than
 //! RPython's dense `Assembler.write_insn()`-grown dict.
 //!
-//! Reference: `rpython/jit/codewriter/assembler.py:19-32`,
+//! Reference: `rpython/jit/codewriter/assembler.py`,
 //! `rpython/jit/codewriter/assembler.py` (`_encode_liveness`),
-//! `rpython/jit/metainterp/pyjitpl.py:2264`
+//! `rpython/jit/metainterp/pyjitpl.py`
 //! (`self.liveness_info = "".join(asm.all_liveness)`).
 
 use std::cell::RefCell;
@@ -72,7 +72,7 @@ impl AssemblerState {
         //
         // `assembler.py Assembler.__init__ self.insns = {}` continues the same way. The
         // build-time jitcodes' `-live-` markers carry the canonical opcode
-        // byte, and `blackhole.py:55-61` recovers it as `asm.insns['live/']`;
+        // byte, and `blackhole.py` recovers it as `asm.insns['live/']`;
         // starting empty leaves `MetaInterpStaticData.op_live` at its unset
         // sentinel, and `can_decode_live_vars` then hunts for that sentinel as
         // a marker byte and declines every build-time resume.
@@ -121,7 +121,7 @@ thread_local! {
     /// `CodeWriter`. Accessed from `pyre_jit_trace::state::intern_liveness`
     /// and from the first-use initializer that wires `setup_insns`.
     ///
-    /// `rpython/jit/codewriter/codewriter.py:20-23` puts the Assembler
+    /// `rpython/jit/codewriter/codewriter.py` puts the Assembler
     /// on the CodeWriter. pyre would normally do the same, but the
     /// reader side (blackhole / resume in `pyre_jit_trace`) cannot
     /// depend on `pyre_jit`, so the single authoritative Assembler
@@ -161,7 +161,7 @@ pub fn num_liveness_ops() -> usize {
 /// Publish the writer-side `Assembler`'s latest snapshot to the
 /// blackhole-reader thread-local. `pyre_jit::Assembler` owns the
 /// canonical per-instance state (line-by-line with
-/// `rpython/jit/codewriter/assembler.py:19-32`); this is only the
+/// `rpython/jit/codewriter/assembler.py`); this is only the
 /// pyre-layering bridge so the blackhole in this lower crate can read
 /// without a circular dep on `pyre_jit`. Not a second source of truth
 /// — every publish replaces the mirror entirely.

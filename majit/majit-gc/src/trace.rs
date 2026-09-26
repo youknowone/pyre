@@ -50,9 +50,9 @@ pub struct VarSizeTypeInfoLayout {
 /// One `rclass.CLASSTYPE` entry of the materialized type-info group.
 ///
 /// RPython's `GcLLDescr_framework.add_vtable_after_typeinfo`
-/// (gctypelayout.py:359-374) appends the vtable struct directly after
+/// (gctypelayout.py) appends the vtable struct directly after
 /// each `TYPE_INFO` entry. `genop_guard_guard_subclass`
-/// (x86/assembler.py:1968-1969) then addresses `subclassrange_min` as
+/// (x86/assembler.py) then addresses `subclassrange_min` as
 /// `base + (typeid << shift_by) + sizeof_ti + offset2` — i.e. "skip
 /// past the TYPE_INFO to read the CLASSTYPE that follows it".
 ///
@@ -115,7 +115,7 @@ impl TypeInfoLayout {
     /// `T_IS_WEAKREF` (gctypelayout.py).
     pub const T_IS_WEAKREF: usize = 0x080000;
     /// `T_IS_RPYTHON_INSTANCE` — the type is a subclass of OBJECT
-    /// (gctypelayout.py:196). Stored in `infobits` and tested by
+    /// (gctypelayout.py). Stored in `infobits` and tested by
     /// `genop_guard_guard_is_object` via the byte mask returned by
     /// `gc_ll_descr.get_translated_info_for_guard_is_object`
     /// (gc.py:603-622).
@@ -268,7 +268,7 @@ pub fn encode_type_shape(info: &TypeInfo, index: u32) -> usize {
         // jitframe.py registers JITFRAME via custom_trace and is also
         // T_HAS_GCPTR by virtue of holding GC refs the tracer
         // discovers; mark T_HAS_GCPTR so q_has_gcptr returns True for
-        // it (gctypelayout.py:81-83).
+        // it (gctypelayout.py).
         infobits |= TypeInfoLayout::T_HAS_GCPTR;
     }
     // `encode_type_shape` varsize encoding.
@@ -312,7 +312,7 @@ pub fn encode_type_shape(info: &TypeInfo, index: u32) -> usize {
 }
 
 /// One element of a `TotalOrderSymbolic.orderwitness` list
-/// (rtyper/normalizecalls.py:302-354). RPython mixes Python ints
+/// (rtyper/normalizecalls.py). RPython mixes Python ints
 /// (the `_unique_cdef_id` of each MRO entry) with the float
 /// `MAX = 1E100` sentinel that's appended to the maxid witness, and
 /// relies on tuple comparison treating any int as smaller than `MAX`.
@@ -330,7 +330,7 @@ enum WitnessElement {
 /// Registry mapping type IDs to their type descriptors and object sizes.
 ///
 /// Mirrors RPython's `gctypelayout.TypeLayoutBuilder` and the surrounding
-/// `type_info_group` machinery (gctypelayout.py:300-400). The translator
+/// `type_info_group` machinery (gctypelayout.py). The translator
 /// adds members during the "build types" phase and freezes the table
 /// before any compiled code runs; majit reproduces the same lifecycle
 /// with `register` (matches `gctypelayout.add_vtable_after_typeinfo`)
@@ -395,7 +395,7 @@ pub type CustomTraceFn = unsafe fn(obj_addr: usize, f: &mut dyn FnMut(*mut GcRef
 /// so a payload owning non-GC heap memory (for example a boxed buffer view)
 /// gets its drop glue run instead of leaking. As in
 /// incminimark's `deal_with_young/old_objects_with_destructors`
-/// (incminimark.py:2884-2912), a destructor "just" runs and does not
+/// (incminimark.py deal_with_young_objects_with_destructors), a destructor "just" runs and does not
 /// resurrect the object.
 ///
 /// `obj_addr` is the object payload start (post-header), the same
@@ -1244,11 +1244,11 @@ impl TypeRegistry {
     }
 
     /// `gctypelayout.encode_type_shapes_now` parity
-    /// (gctypelayout.py:393-398): freezes the registry so subsequent
+    /// (gctypelayout.py): freezes the registry so subsequent
     /// `register_type` calls panic and assigns each registered classdef
     /// type its preorder `subclassrange_{min,max}`.
     ///
-    /// The bounds come from `rtyper/normalizecalls.py:373-389
+    /// The bounds come from `rtyper/normalizecalls.py assign_inheritance_ids
     /// assign_inheritance_ids`: each class is sorted lexicographically
     /// by reversed MRO (witness), and its position in that sorted list
     /// becomes the preorder index. The exclusive upper bound is the
@@ -1410,7 +1410,7 @@ impl TypeRegistry {
         // Assign preorder values. minid = index of the Min peer,
         // maxid = index of the Max peer. The exclusive bound matches
         // RPython's int_between (a <= b < c) semantics from
-        // rclass.py:1133-1137.
+        // rclass.py ll_issubclass.
         for (idx, peer) in peers.iter().enumerate() {
             let owner = peer.owner as usize;
             if peer.is_max {

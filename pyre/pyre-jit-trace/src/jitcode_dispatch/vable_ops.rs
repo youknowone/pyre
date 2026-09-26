@@ -598,7 +598,7 @@ fn durable_resume_frame<Sym: WalkSym>(
 /// target index first and updates `valuestackdepth` afterward.  This ordering is
 /// emitted by `emit_pushvalue_ref_const!` / `emit_popvalue_ref!` and lets the
 /// generic vable-store handler distinguish a live NULL push from clearing a
-/// dead slot without weakening flush validation. pyjitpl.py:1193,1245
+/// dead slot without weakening flush validation. pyjitpl.py
 /// `virtualizable_boxes[index] = valuebox` stores one Box carrying both identity
 /// and concrete value, so it needs no separate marker; pyre keeps the halves
 /// apart and marks the shadow slot beside the trace instead.
@@ -1027,7 +1027,7 @@ pub(crate) fn vable_array_descrs_from_jitcode<Sym: WalkSym>(
 /// the minimal one `TraceCtx::promote_int` produces without an `MIFrameStack`.
 /// The hoist moves the promote to the caller, not ahead of the branch that
 /// selects it: `_get_arrayitem_vable_index` is reached only from the standard
-/// leg of `_opimpl_get|setarrayitem_vable` (pyjitpl.py:1229, :1244), so both
+/// leg of `_opimpl_get|setarrayitem_vable` (pyjitpl.py, :1244), so both
 /// call sites run `TraceCtx::nonstandard_virtualizable` first and skip this
 /// promote on the non-standard leg.
 ///

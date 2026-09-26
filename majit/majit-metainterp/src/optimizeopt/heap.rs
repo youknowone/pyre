@@ -229,7 +229,7 @@ impl CachedField {
     /// PyPy iterates `cached_infos` and writes
     /// `opinfo._fields[descr.get_index()] = None`. The Rust port walks
     /// `cached_structs`, resolves each opref through `box._forwarded`
-    /// OR `ctx.const_infos` (the latter mirrors `info.py:715-726
+    /// OR `ctx.const_infos` (the latter mirrors `info.py make_guards
     /// ConstPtrInfo._get_info` which routes constant bases through
     /// `optheap.const_infos[gcref]`), and calls
     /// `info.clear_field(descr_idx)`.
@@ -294,7 +294,7 @@ impl CachedField {
         field_idx: u32,
         ctx: &mut OptContext,
     ) -> Option<crate::optimizeopt::info::FieldEntry> {
-        // info.py:212-214: return self._fields[fielddescr.get_index()]
+        // info.py getfield: return self._fields[fielddescr.get_index()]
         let struct_box = ctx.get_box_replacement_operand_opt(struct_opref);
         if let Some(info) = struct_box.as_ref().and_then(Operand::ptr_info)
             && let Some(entry) = info.getfield(field_idx)
@@ -409,7 +409,7 @@ impl CachedField {
     fn put_field_back_to_info(&mut self, op: &Op, ctx: &mut OptContext) {
         // info.py opinfo.setfield(descr, struct, op, optheap, cf=self)
         // PyPy: `setfield(..., cf=cf)` calls `cf.register_info(struct, self)`
-        // (info.py:209-210). The Rust port performs both halves here.
+        // (info.py). The Rust port performs both halves here.
         let descr_idx = op
             .getdescr()
             .as_ref()
@@ -896,7 +896,7 @@ pub struct OptHeap {
     ///
     /// PyPy stores the *array descr object* directly and resolves
     /// `arraydescr.ei_index` inside `effectinfo.check_write_descr_array(arraydescr)`
-    /// at invalidation time (`effectinfo.py:220-222`).  Pyre keeps the
+    /// at invalidation time (`effectinfo.py`).  Pyre keeps the
     /// `DescrRef` alive on the value side so the same lazy resolution can
     /// happen via `descr.get_ei_index()` at `force_from_effectinfo`.
     /// The map key is the descriptor object's identity; `descr.index()` is
@@ -1067,7 +1067,7 @@ impl OptHeap {
     /// Compute the `PtrInfo._fields` slot for a field descriptor.
     ///
     /// RPython uses `descr.get_index()` only for `info._fields[index]`
-    /// (`info.py:203-214`).  In majit this is `FieldDescr::index_in_parent`
+    /// (`info.py`).  In majit this is `FieldDescr::index_in_parent`
     /// when a parent SizeDescr is available; older/simple descriptors fall
     /// back to their `Descr::index()`.
     ///
@@ -1152,7 +1152,7 @@ impl OptHeap {
     /// Same as [`field_effect_index`] for the array namespace
     /// (`effectinfo.py add_array` writes `ei_index` onto the
     /// array descr; `compute_bitstrings` re-stamps in-place per
-    /// `effectinfo.py:526 descr.ei_index = …`).
+    /// `effectinfo.py descr.ei_index = …`).
     #[allow(dead_code)]
     fn array_effect_index(descr: &DescrRef) -> u32 {
         descr.get_ei_index()
@@ -1188,7 +1188,7 @@ impl OptHeap {
     /// into a container, append to `_get_deps(box)` if both are
     /// unescaped; otherwise escape the value immediately.
     fn escape_from_write(&mut self, ctx: &OptContext, container: OpRef, value: OpRef) {
-        // heapcache.py:224-229: if both box and fieldbox are unescaped,
+        // heapcache.py _escape_from_write: if both box and fieldbox are unescaped,
         // record the dependency; otherwise escape the fieldbox (the value).
         // `is_unescaped`/`escape_box` are no-ops for Const operands, so a
         // constant value never escapes the container and a constant
@@ -1354,7 +1354,7 @@ impl OptHeap {
     /// before they ever reach this fn. A virtual rhs is left virtual
     /// here: force_lazy_set never forces its rhs, and the queued op
     /// carries it to `Optimizer::emit_operation`, whose force_box loop
-    /// (optimizer.py:641-665) is the single force point that appends
+    /// (optimizer.py) is the single force point that appends
     /// the materialization directly ahead of the store.
     fn emit_lazy_setfield(op: &majit_ir::OpRc, ctx: &mut OptContext) {
         // Resolve forwarding and route after heap
@@ -1544,7 +1544,7 @@ impl OptHeap {
             // heap.py: cf.force_lazy_set(self, descr) →
             // _lazy_set = None, invalidate, emit_extra(op, emit=False),
             // then put_field_back_to_info restores the cache.
-            // optimizer.py:651-652 setarg loop parity.
+            // optimizer.py setarg loop parity.
             for arg_i in 0..op.num_args() {
                 op.setarg(arg_i, ctx.resolve_operand_operand(&op.arg(arg_i)));
             }
@@ -2095,7 +2095,7 @@ impl OptHeap {
     /// Instead of invalidating all caches, only force/invalidate
     /// fields and arrays that the call may read or write.
     fn force_from_effectinfo(&mut self, op: &Op, ctx: &mut OptContext) {
-        // heapcache.py:259-293: escape call arguments first
+        // heapcache.py mark_escaped_varargs: escape call arguments first
         self.mark_escaped_varargs(op, ctx);
 
         let __descr_arc_ei = op.getdescr();
@@ -2143,7 +2143,7 @@ impl OptHeap {
             // A descr whose `ei_index` is still the sentinel is NOT special-
             // cased here, matching `heap.py:537-553`. Upstream leaves the
             // sentinel on any descr that no EffectInfo's raw set names —
-            // `effectinfo.py:495-496` stamps `sys.maxint` on every descr in
+            // `effectinfo.py` stamps `sys.maxint` on every descr in
             // `all_descrs` and only `:524-526` renumbers the ones that appear
             // in some `_readonly_descrs_*` / `_write_descrs_*`, which
             // `test_effectinfo.py` pins with `f3descr`. A sentinel
@@ -2151,7 +2151,7 @@ impl OptHeap {
             // because of the OTHER half of the contract: a call whose write
             // set was never computed is `EF_RANDOM_EFFECTS`
             // (`graphanalyze.py top_result()` →
-            // `effectinfo.py:285-292`) and never reaches this function at all
+            // `effectinfo.py`) and never reaches this function at all
             // — `heap.py` routes it to `clean_caches`. pyre upholds the
             // same contract at `call_descr.rs default_effect_info()`; keeping
             // a descr-side guard here instead would be papering over any call
@@ -2239,9 +2239,9 @@ impl OptHeap {
 
         // heap.py: invalidate cached_dict_reads via corresponding_array_descrs.
         // PyPy `effectinfo.check_write_descr_array(arraydescr)` reads
-        // `arraydescr.ei_index` (`effectinfo.py:220-222`); pyre's lift
+        // `arraydescr.ei_index` (`effectinfo.py`); pyre's lift
         // resolves `descr.get_ei_index()` directly per
-        // `effectinfo.py:526 descr.ei_index = …` in-place stamp.
+        // `effectinfo.py descr.ei_index = …` in-place stamp.
         let array_ids_to_clear: Vec<usize> = self
             .corresponding_array_descrs
             .iter()
@@ -3585,7 +3585,7 @@ impl OptHeap {
             //
             // PyPy heap.py does NOT cache RAW_LOAD/RAW_STORE. Raw
             // pointer arithmetic over `VirtualRawBuffer` /
-            // `VirtualRawSlice` is handled by virtualize.py:358-385.
+            // `VirtualRawSlice` is handled by virtualize.py optimize_RAW_LOAD_I.
             // RAW_STORE is also listed in `emitting_operation`'s "no
             // effect on GC struct" list (heap.py:442). The shared exemption in
             // handle_side_effects makes this fallthrough match
@@ -3696,7 +3696,7 @@ impl Optimization for OptHeap {
         };
         if let Some(emit_op) = postpone {
             self.postponed_op = Some(emit_op);
-            // optimizer.py:84-87 — postponed ops do NOT call
+            // optimizer.py emit — postponed ops do NOT call
             // Optimization.emit, so line 86's `last_emitted_operation = op`
             // does NOT fire. Leave `last_emitted_removed` intact so a
             // GUARD_NO_EXCEPTION trailing a folded DICT_LOOKUP that came
@@ -4301,7 +4301,7 @@ mod tests {
         }
         // The declared `offset()` already places this descr at slot `index` of
         // `test_parent_descr()`; `index_in_parent` must agree, because
-        // `info.py:212-214 _fields[fielddescr.get_index()]` indexes the
+        // `info.py getfield _fields[fielddescr.get_index()]` indexes the
         // struct's PtrInfo by it. Leaving the trait default (0) made every
         // fixture descr claim slot 0 of the SAME parent, so two distinct
         // descrs aliased one PtrInfo field slot — a layout no real struct can
@@ -4695,7 +4695,7 @@ mod tests {
 
     /// Call descriptor with default EffectInfo (non-random, non-elidable).
     /// Test helper for "residual call with unknown heap effects". Mirrors
-    /// PyPy `effectinfo.MOST_GENERAL` (`effectinfo.py:271-273`):
+    /// PyPy `effectinfo.MOST_GENERAL` (`effectinfo.py`):
     /// `extraeffect=EF_RANDOM_EFFECTS`, all six raw sets `None`, all six
     /// bitstrings `None`, `can_invalidate=True`. Production sites and
     /// tests use this whenever no analyzer info is available — invalidation
@@ -4705,7 +4705,7 @@ mod tests {
     /// random-effects branch. The previous saturated-bitstring fallback
     /// (`CanRaise + raw=Some(empty) + bitstring=Some(0xff;8)`) was a
     /// pyre-only shape PyPy never produces — `effectinfo_from_writeanalyze`
-    /// (`effectinfo.py:285`) force-promotes top_set inputs to RandomEffects
+    /// (`effectinfo.py`) force-promotes top_set inputs to RandomEffects
     /// before constructing the EI.
     fn plain_call_descr(idx: u32) -> DescrRef {
         Arc::new(majit_ir::SimpleCallDescr::new(
@@ -8138,7 +8138,7 @@ mod tests {
 
     /// `resoperation.py` lists `ARRAYLEN_GC` inside the
     /// `_ALWAYS_PURE_FIRST.._ALWAYS_PURE_LAST` band; CSE of always-pure
-    /// ops is `optimizeopt/pure.py:316`'s `_pure_operations[opnum]`
+    /// ops is `optimizeopt/pure.py`'s `_pure_operations[opnum]`
     /// table, not heap.py.  This test wires `OptPure` to confirm the
     /// dedup path; running with `OptHeap` alone would (correctly) leave
     /// both reads in place — heap.py has no parallel cache.

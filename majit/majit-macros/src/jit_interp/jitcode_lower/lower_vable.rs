@@ -270,7 +270,7 @@ impl<'c> Lowerer<'c> {
     /// `program[<index>]`.  Mirrors the dispatch-top opcode fetch
     /// (`try_lower_opcode_fetch_stmt`) so the same `getarrayitem_gc_i_pure`
     /// is emitted for operand reads inside opcode arm bodies.  RPython
-    /// `pyopcode.py:171 ord(co_code[next_instr])`: the bytecode array and
+    /// `pyopcode.py ord(co_code[next_instr])`: the bytecode array and
     /// `pc` are green, so the optimizer constant-folds the load.
     ///
     /// The env parameter name is the macro convention `program`, matching
@@ -901,7 +901,7 @@ impl<'c> Lowerer<'c> {
 
     // ── conditional_call / record_known_result JIT op emission ──────
 
-    /// RPython jtransform.py:832 `getfield_vable_*`.
+    /// RPython jtransform.py rewrite_op_getfield `getfield_vable_*`.
     ///
     /// Recognizes `frame.field` where `frame` is the virtualizable variable
     /// and `field` is a declared virtualizable scalar field.
@@ -1235,7 +1235,7 @@ impl<'c> Lowerer<'c> {
         // `offset_of!` -- so rebinding it here moves all of them onto the
         // declaring struct together, which is what gives one physical field
         // one descriptor across every struct that embeds it.
-        // `rclass.py:987-1001` recurses to `self.rbase` for exactly this, and
+        // `rclass.py getfield` recurses to `self.rbase` for exactly this, and
         // its `cast_pointer` costs nothing at runtime (`jtransform.py`
         // lowers it to `same_as`): the base register is unchanged, because an
         // inlined base is required to start at offset 0.
@@ -1425,7 +1425,7 @@ impl<'c> Lowerer<'c> {
         // `offset_of!` -- so rebinding it here moves all of them onto the
         // declaring struct together, which is what gives one physical field
         // one descriptor across every struct that embeds it.
-        // `rclass.py:987-1001` recurses to `self.rbase` for exactly this, and
+        // `rclass.py getfield` recurses to `self.rbase` for exactly this, and
         // its `cast_pointer` costs nothing at runtime (`jtransform.py`
         // lowers it to `same_as`): the base register is unchanged, because an
         // inlined base is required to start at offset 0.
@@ -1594,7 +1594,7 @@ impl<'c> Lowerer<'c> {
         // `offset_of!` -- so rebinding it here moves all of them onto the
         // declaring struct together, which is what gives one physical field
         // one descriptor across every struct that embeds it.
-        // `rclass.py:987-1001` recurses to `self.rbase` for exactly this, and
+        // `rclass.py getfield` recurses to `self.rbase` for exactly this, and
         // its `cast_pointer` costs nothing at runtime (`jtransform.py`
         // lowers it to `same_as`): the base register is unchanged, because an
         // inlined base is required to start at offset 0.
@@ -2065,7 +2065,7 @@ impl<'c> Lowerer<'c> {
         // `offset_of!` -- so rebinding it here moves all of them onto the
         // declaring struct together, which is what gives one physical field
         // one descriptor across every struct that embeds it.
-        // `rclass.py:987-1001` recurses to `self.rbase` for exactly this, and
+        // `rclass.py getfield` recurses to `self.rbase` for exactly this, and
         // its `cast_pointer` costs nothing at runtime (`jtransform.py`
         // lowers it to `same_as`): the base register is unchanged, because an
         // inlined base is required to start at offset 0.
@@ -2222,7 +2222,7 @@ impl<'c> Lowerer<'c> {
         // `offset_of!` -- so rebinding it here moves all of them onto the
         // declaring struct together, which is what gives one physical field
         // one descriptor across every struct that embeds it.
-        // `rclass.py:987-1001` recurses to `self.rbase` for exactly this, and
+        // `rclass.py getfield` recurses to `self.rbase` for exactly this, and
         // its `cast_pointer` costs nothing at runtime (`jtransform.py`
         // lowers it to `same_as`): the base register is unchanged, because an
         // inlined base is required to start at offset 0.

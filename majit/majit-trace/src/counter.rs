@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// 5-way associative cache indexed by _get_index(hash), matched by
 /// _get_subhash(hash). MRU promotion via _swap.
 ///
-/// counter.py:82 DEFAULT_SIZE = 2048
+/// counter.py DEFAULT_SIZE = 2048
 pub const DEFAULT_SIZE: usize = 2048;
 
 /// counter.py ENTRY: 5 (f32 time, u16 subhash) pairs per bucket.
@@ -115,7 +115,7 @@ impl JitCounter {
     /// ```
     ///
     /// Public because the timetable is not the only table this indexes:
-    /// `counter.py:239-240` reads the celltable through the same call, and the
+    /// `counter.py` reads the celltable through the same call, and the
     /// two tables must agree about which entry a hash names.
     #[inline(always)]
     pub fn _get_index(&self, hash: u64) -> usize {

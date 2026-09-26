@@ -1374,7 +1374,7 @@ def _parse_jit_stats(snapshot):
 # `effectinfo.py:492-494` builds its sets out of the descr objects `cpu.*descrof`
 # just created in the same process, so no member of a raw set can fail to
 # resolve — and it expresses this class of condition with a plain `assert`
-# (`descr.py:47`, `effectinfo.py:486,525`). Pyre resolves the sets across a
+# (`descr.py`, `effectinfo.py:486,525`). Pyre resolves the sets across a  allow-line-citation
 # build-time/runtime split where all three are reachable in principle and the
 # runtime answer is a sound degradation rather than a crash, so the assertion is
 # expressed as a counter that must not rise off zero. A field absent from a
@@ -1397,7 +1397,7 @@ def _parse_jit_stats(snapshot):
 # exist today and a rise means a new one.
 #
 # `field_pos_spec_misplaced` and `field_pos_attached_misplaced` are the same kind
-# of assertion one layer down: a field descr's `index_in_parent` (`descr.py:228`)
+# of assertion one layer down: a field descr's `index_in_parent` (`descr.py`)
 # must name the slot its own parent puts the field in, which upstream gets for
 # free because `heaptracker.py:60-72` and `:96-112` are one walker. Both are
 # counted where the producer's number is still readable — before

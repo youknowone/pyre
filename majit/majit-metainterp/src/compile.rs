@@ -843,7 +843,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
 
         // RPython Box.type parity: each fail-arg's type is `livebox.type`,
         // captured at numbering time inside `store_final_boxes_in_guard`
-        // (resume.py:520, optimizer.py:728). majit stores that snapshot on
+        // (resume.py _add_pending_fields, optimizer.py). majit stores that snapshot on
         // the descr's `fail_arg_types()` (post-numbering, post-virtual-
         // materialization) and mirrors it to `op.fail_arg_types` for
         // sharing-path guards (`optimizeopt/mod.rs`'s `emit_guard_operation`).
@@ -989,12 +989,12 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
                 };
             // Collect slots from ALL frames for virtual target_slot lookup.
             // RPython resolves virtuals across the entire frame stack, not
-            // just the innermost frame (resume.py:1410).
+            // just the innermost frame (resume.py load_next_value_of_type).
             let frame_slots: Vec<ExitValueSourceLayout> = frames_layout
                 .iter()
                 .flat_map(|frame| frame.slots.iter().cloned())
                 .collect();
-            // resume.py:576-860 parity: resolve fieldnums tags for recovery.
+            // resume.py AbstractVirtualInfo parity: resolve fieldnums tags for recovery.
             // Follow `descr.prev` so sharing-path guards see the donor's
             // const pool (compile.py get_resumestorage).
             let rd_consts_arc = op.resolved_rd_consts();
@@ -1178,7 +1178,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
                                 // decoder.concat_strings(left, right); funcptr
                                 // resolved at materialization via
                                 // `callinfocollection.funcptr_for_oopspec(...)`
-                                // (resume.py:1467-1468 / 1494-1495).
+                                // (resume.py / 1494-1495).
                                 majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums, .. }
                                 | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums, .. } => {
                                     let is_unicode = matches!(
@@ -1197,7 +1197,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
                                 // resume.py VUniSliceInfo —
                                 // decoder.slice_string(largerstr, start, length);
                                 // funcptr resolved via callinfocollection at
-                                // materialization (resume.py:1477-1478 / 1504-1505).
+                                // materialization (resume.py / 1504-1505).
                                 majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums, .. }
                                 | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums, .. } => {
                                     let is_unicode = matches!(
@@ -1896,7 +1896,7 @@ pub(crate) fn normalize_closing_jump_args(
     ops
 }
 
-/// `rpython/jit/metainterp/compile.py:425-461`
+/// `rpython/jit/metainterp/compile.py patch_new_loop_to_load_virtualizable_fields`
 /// `patch_new_loop_to_load_virtualizable_fields`.
 ///
 /// ```python
@@ -1949,7 +1949,7 @@ pub(crate) fn normalize_closing_jump_args(
 /// `entry_prefix_len` is `compile.py i = jitdriver_sd.num_red_args`: the
 /// number of leading inputargs that survive the truncation, and the position
 /// the field reconstruction starts from. Upstream can spell it as the red-arg
-/// count because upstream's entry contract IS the red list — `warmstate.py:387
+/// count because upstream's entry contract IS the red list — `warmstate.py execute_assembler
 /// execute_assembler` is called with the reds, and the virtualizable is one of
 /// them. A caller whose entry contract is not a red list (one flat slot per
 /// declared state field, with the virtualizable occupying a single slot among
@@ -2423,7 +2423,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
 
 /// RPython dependency.py requires GUARD_(NO_)OVERFLOW to be scheduled only
 /// when there is a live preceding INT_*_OVF operation to consume.
-/// intbounds.py:231-242: optimizer raises InvalidLoop for stray overflow
+/// intbounds.py optimize_GUARD_OVERFLOW: optimizer raises InvalidLoop for stray overflow
 /// guards. This function is a post-optimization safety net: if any stray
 /// guard survived, strip it to prevent backend panic.
 pub(crate) fn strip_stray_overflow_guards(ops: Vec<majit_ir::OpRc>) -> Vec<majit_ir::OpRc> {
@@ -2441,7 +2441,7 @@ pub(crate) fn strip_stray_overflow_guards(ops: Vec<majit_ir::OpRc>) -> Vec<majit
                 if pending_ovf {
                     result.push(op);
                 }
-                // else: stray guard — strip it (intbounds.py:231 InvalidLoop
+                // else: stray guard — strip it (intbounds.py optimize_GUARD_OVERFLOW InvalidLoop
                 // should have caught it; this is a safety net).
                 pending_ovf = false;
             }
@@ -2531,7 +2531,7 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
     }
 }
 
-// `rpython/jit/metainterp/compile.py:623-674` — finish/propagate descrs.
+// `rpython/jit/metainterp/compile.py _DoneWithThisFrameDescr` — finish/propagate descrs.
 //
 // These are ported as backend-agnostic `FailDescr` impls in the
 // shared backend crate so `compile_tmp_callback` and
@@ -2619,7 +2619,7 @@ pub fn compile_tmp_callback(
     // upstream (`warmspot.py:1010-1012` sets the address before any tmp_callback
     // can fire); `portal_calldescr.is_none()` means
     // `MetaInterpStaticData::finish_setup_descrs_for_jitdrivers` (pyjitpl.rs:
-    // 12336-12338, mirroring `pyjitpl.py:2274-2281` + `warmspot.py:1013-1017`)
+    // 12336-12338, mirroring `pyjitpl.py` + `warmspot.py:1013-1017`)  allow-line-citation
     // never ran for this driver, so `funcbox` would dereference a null portal
     // address and the resulting tmp callback would jump to 0x0. `debug_assert!`
     // catches the misuse in dev/test builds (the bench harness runs in dev
@@ -2720,7 +2720,7 @@ pub fn compile_tmp_callback(
     // pyre layout: the CALL op's `args` slots reference `OpRef` numbers.
     // InputArgs occupy `0..num_inputs` and are minted via
     // `InputArg::opref()` so they carry RPython-parity InputArg{Int,
-    // Float,Ref} variants (resoperation.py:719/727/739). Constants
+    // Float,Ref} variants (resoperation.py InputArgInt/727/739). Constants
     // (funcbox + greens) carry their value inline on the OpRef
     // variant (history.py/268/314 `Const{Int,Float,Ptr}.value`).
     // `compile.py:1126` funcbox = ConstInt(adr2int(k)) — `ConstInt.value`
@@ -2740,7 +2740,7 @@ pub fn compile_tmp_callback(
         callargs_box.push(Operand::from_opref(g_ref));
     }
     // Red args — bound to the inputarg objects themselves
-    // (resoperation.py:719/727/739 InputArg{Int,Float,Ref}).
+    // (resoperation.py InputArgInt/727/739 InputArg{Int,Float,Ref}).
     for ia in inputargs.iter() {
         callargs_box.push(Operand::from_bound_inputarg(ia));
     }
@@ -5097,7 +5097,7 @@ impl FailDescr for ResumeGuardCopiedDescr {
         unsafe { *self.adr_jump_offset.get() = offset };
     }
     /// `store_info_on_descr` writes `guardtok.faildescr.rd_locs`
-    /// (`llsupport/assembler.py:279`), so a backend that emits machine code for
+    /// (`llsupport/assembler.py`), so a backend that emits machine code for
     /// this guard leaves its own physical positions here.  The frontend's
     /// identity-with-holes layout is resume data instead, and
     /// `_copy_resume_data_from` never runs `store_final_boxes_in_guard` on a
@@ -6746,7 +6746,7 @@ mod fail_descr_tests {
 
     /// `handle_guard_failure` arms `seen_loop_header_for_jdindex` from
     /// `isinstance(key, ResumeAtPositionDescr)` where `key =
-    /// resumedescr.get_resumestorage()` (pyjitpl.py:2917 / :2941), so a copied
+    /// resumedescr.get_resumestorage()` (pyjitpl.py / :2941), so a copied
     /// guard sharing a short-preamble donor answers yes even though the copied
     /// descr is not itself a `ResumeAtPositionDescr`.  One hop reaches the
     /// donor for every copied descr; the sibling test below pins the

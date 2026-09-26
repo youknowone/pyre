@@ -12,11 +12,11 @@ use crate::value::{GcRef, Type, Value};
 
 /// Index into an operation list, used as a reference to an operation's
 /// result. Variant-tagged enum mirroring RPython's `AbstractValue` class
-/// hierarchy (resoperation.py:29 + history.py:182).
+/// hierarchy (resoperation.py + history.py:182).  allow-line-citation
 ///
 /// Each typed variant carries the same raw u32 encoding shape (`CONST_BIT`
 /// set for `Const*`, plain `pos` for `InputArg*` / `*Op`). The variant
-/// tag IS the `box.type` (history.py:220 / resoperation.py:1693
+/// tag IS the `box.type` (history.py:220 / resoperation.py  allow-line-citation
 /// `opclasses[opnum].type`); flat-OpRef encoding picks up Box-class
 /// identity from the enum discriminant.
 ///
@@ -68,7 +68,7 @@ pub enum OpRef {
     /// Backend regalloc scratch box — RPython `TempVar()` /
     /// `TempInt()` parity (`rpython/jit/backend/llsupport/regalloc.py`,
     /// `x86/regalloc.py:470,514,521,605`,
-    /// `aarch64/regalloc.py:990`). Each call to
+    /// `aarch64/regalloc.py`). Each call to
     /// `RegAlloc::fresh_temp_var()` allocates a fresh `TempVar`
     /// carrying a unique counter; the raw payload lives in the
     /// reserved range `[SENTINEL_BASE, u32::MAX - 1]` so it does not
@@ -231,11 +231,11 @@ impl OpRef {
     /// Mirrors RPython `AbstractValue.type` — the type embedded in the
     /// variant tag for `Const{Int,Float,Ptr}`, `InputArg{Int,Float,Ref}`,
     /// and the `{Int,Float,Ref,Void}Op` mixins (history.py:220 / 261 /
-    /// 307, resoperation.py:567 / 589 / 615 / 260). `None` returns
+    /// 307, resoperation.py / 589 / 615 / 260). `None` returns
     /// `None`.
     ///
     /// `TempVar` also returns `None`: RPython's `TempVar`
-    /// (`backend/llsupport/regalloc.py:18`) extends `AbstractResOpOrInputArg`
+    /// (`backend/llsupport/regalloc.py`) extends `AbstractResOpOrInputArg`
     /// without a `.type` attribute, and `_check_type` at
     /// `regalloc.py` exempts it via `isinstance(v, TempVar)`. A
     /// `TempVar` reaching `.ty()` should fall through to the regalloc-side
@@ -320,7 +320,7 @@ impl OpRef {
     // Each factory produces the matching enum variant carrying the
     // raw u32 encoding. These are the canonical OpRef
     // construction entry points; the variant tag IS the RPython Box
-    // class identity (history.py:182 / resoperation.py:29).
+    // class identity (history.py:182 / resoperation.py).  allow-line-citation
 
     /// resoperation.py `InputArgInt` — `type = 'i'`.
     pub const fn input_arg_int(pos: u32) -> OpRef {
@@ -402,7 +402,7 @@ impl OpRef {
     }
 
     /// Allocate a typed `InputArg*` OpRef from a position. The type tag
-    /// picks the matching variant (resoperation.py:719/727/739).
+    /// picks the matching variant (resoperation.py InputArgInt/727/739).
     /// `Type::Void` is rejected — RPython has no Void inputarg class.
     pub fn input_arg_typed(pos: u32, tp: Type) -> OpRef {
         match tp {
@@ -415,7 +415,7 @@ impl OpRef {
 
     /// Build the `[InputArg*(0), InputArg*(1), ...]` vector for a trace
     /// whose inputarg types are `types`.  Position is the slot index.
-    /// resoperation.py:719/727/739 InputArg{Int,Ref,Float}: RPython has
+    /// resoperation.py InputArgInt/727/739 InputArg{Int,Ref,Float}: RPython has
     /// no InputArgVoid class.
     ///
     /// # Panics
@@ -435,9 +435,9 @@ impl OpRef {
     }
 
     /// Allocate a typed `*Op` OpRef from a position. The type tag picks
-    /// the matching mixin variant (resoperation.py:564-638).
+    /// the matching mixin variant (resoperation.py IntOp).
     /// `Type::Void` lands on `VoidOp` — `AbstractResOp.type = 'v'`
-    /// (resoperation.py:260), the default for ops with no result-type
+    /// (resoperation.py), the default for ops with no result-type
     /// mixin.
     pub const fn op_typed(pos: u32, tp: Type) -> OpRef {
         match tp {
@@ -449,7 +449,7 @@ impl OpRef {
     }
 
     /// RPython `TempVar()` / `TempInt()` parity
-    /// (`rpython/jit/backend/llsupport/regalloc.py:18-23`,
+    /// (`rpython/jit/backend/llsupport/regalloc.py`,
     /// `x86/regalloc.py:470,514,521,605`,
     /// `aarch64/regalloc.py`). Upstream `TempVar.__init__` is
     /// `pass`, so each instance is a fresh Python object with unique
@@ -594,7 +594,7 @@ impl OpRef {
 
 // `#[derive(PartialEq, Eq, Hash)]` on `OpRef` enforces RPython's
 // disjoint `Const` / `InputArg` / `ResOp` sub-hierarchies
-// (resoperation.py:29, history.py:182): two variants compare unequal
+// (resoperation.py AbstractValue, history.py:182): two variants compare unequal  allow-line-citation
 // even when raw payloads coincide (`ConstInt(x) != ConstFloat(x) !=
 // IntOp(x)`). Mirrors `AbstractValue.same_box` (resoperation.py
 // `self is other`) and `ConstInt.same_constant` (history.py).
@@ -713,7 +713,7 @@ impl AbstractValue {
     }
 }
 
-/// resume.py:576-860: virtual object serialization for rd_virtuals.
+/// resume.py AbstractVirtualInfo: virtual object serialization for rd_virtuals.
 ///
 /// Each variant corresponds to a concrete virtual type in RPython's
 /// resume.py AbstractVirtualStructInfo.fielddescrs parity.
@@ -805,7 +805,7 @@ pub enum RdVirtualInfo {
         field_types: Vec<u8>,
         /// descr.py ArrayDescr.basesize — fixed header before array items.
         base_size: usize,
-        /// llmodel.py:648: arraydescr.itemsize — bytes per struct element.
+        /// llmodel.py bh_setinteriorfield_gc_i: arraydescr.itemsize — bytes per struct element.
         item_size: usize,
         /// llmodel.py:649: fielddescr.offset — per-field byte offset within struct.
         field_offsets: Vec<usize>,
@@ -819,7 +819,7 @@ pub enum RdVirtualInfo {
         func: i64,
         size: usize,
         /// resume.py:696: self.offsets — byte offsets of stored values.
-        /// Signed because rawbuffer.py:14 stores offsets as RPython
+        /// Signed because rawbuffer.py __init__ stores offsets as RPython
         /// unbounded ints; with `index < 0`, `basesize + itemsize*index`
         /// is negative.
         offsets: Vec<i64>,
@@ -830,7 +830,7 @@ pub enum RdVirtualInfo {
     },
     /// resume.py: VRawSliceInfo
     VRawSliceInfo {
-        /// info.py:460: signed slice base — `optimize_INT_ADD` folds the
+        /// info.py __init__: signed slice base — `optimize_INT_ADD` folds the
         /// addend as a signed `getint()`.
         offset: i64,
         fieldnums: Vec<i16>,
@@ -844,7 +844,7 @@ pub enum RdVirtualInfo {
     /// strings. `fieldnums = [left, right]`. The OS_STR_CONCAT funcptr
     /// is resolved at materialization time via
     /// `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT)`
-    /// (resume.py:1467-1468); the variant carries no funcptr itself.
+    /// (resume.py); the variant carries no funcptr itself.
     VStrConcatInfo {
         fieldnums: Vec<i16>,
     },
@@ -1234,7 +1234,7 @@ pub trait BoxEnv {
 
 /// Shared-identity handle to an `Op`.
 ///
-/// Mirrors RPython's object-identity model: `resoperation.py:250
+/// Mirrors RPython's object-identity model: `resoperation.py AbstractResOp
 /// AbstractResOp` instances are plain Python objects, so every consumer
 /// (`history.py TreeLoop.operations`, `optimizer.py trace.next()`,
 /// short preamble export, resume metadata, backend input lists) reaches
@@ -1539,7 +1539,7 @@ impl From<Op> for OpRc {
 /// A single IR operation.
 ///
 /// Mirrors `rpython/jit/metainterp/resoperation.py` `AbstractResOp`.
-/// The `_forwarded` slot (`resoperation.py:233-242
+/// The `_forwarded` slot (`resoperation.py
 /// AbstractResOpOrInputArg._forwarded`) lives directly on this struct in
 /// the [`forwarded`](Op::forwarded) field, matching RPython's
 /// object-identity model: every consumer holding the same `Rc<Op>` reads
@@ -3837,7 +3837,7 @@ impl Drop for Op {
 }
 
 impl VectorizationInfo {
-    /// resoperation.py:156-162: default values
+    /// resoperation.py VectorizationInfo: default values
     pub fn new() -> Self {
         VectorizationInfo {
             datatype: '\0',
@@ -4934,7 +4934,7 @@ impl OpCode {
     }
 
     /// resoperation.py `CastOp`/`SignExtOp` mixin attachment
-    /// (`resoperation.py:1682-1685`). Returns true exactly for the opcodes
+    /// (`resoperation.py`). Returns true exactly for the opcodes
     /// in `_cast_ops` (`resoperation.py`).
     pub fn is_typecast(self) -> bool {
         matches!(
@@ -4955,7 +4955,7 @@ impl OpCode {
     /// resoperation.py `CastOp.cast_types`. Returns
     /// `(cls_casts[0], cls_casts[2])` — the (from_type, to_type) pair from
     /// `_cast_ops` (`resoperation.py`). Defaults to `('\0','\0')`
-    /// (resoperation.py:264) for non-typecast opcodes.
+    /// (resoperation.py) for non-typecast opcodes.
     pub fn cast_types(self) -> (char, char) {
         match self {
             OpCode::CastFloatToInt | OpCode::VecCastFloatToInt => ('f', 'i'),
@@ -4968,9 +4968,9 @@ impl OpCode {
     }
 
     /// resoperation.py `CastOp.cast_to_bytesize` — returns
-    /// `cls_casts[3]`.  The base table at `resoperation.py:1177-1188`
+    /// `cls_casts[3]`.  The base table at `resoperation.py`
     /// stores 4 for the float↔int casts; the non-x86 override at
-    /// `resoperation.py:1190-1196` upgrades `CAST_FLOAT_TO_INT` /
+    /// `resoperation.py` upgrades `CAST_FLOAT_TO_INT` /
     /// `VEC_CAST_FLOAT_TO_INT` (and the corresponding `cast_from`
     /// bytesize of `CAST_INT_TO_FLOAT` / `VEC_CAST_INT_TO_FLOAT`) to 8
     /// on architectures whose `platform.machine()` does not start with
@@ -6808,7 +6808,7 @@ mod tests {
     #[test]
     fn opref_typed_variants_disjoint_from_none() {
         // Variant-aware Eq: `OpRef::None` and any typed variant are
-        // disjoint identities. RPython parity (resoperation.py:38
+        // disjoint identities. RPython parity (resoperation.py same_box
         // same_box: self is other) — Python `None` vs a Box object are
         // never identical.
         let none = OpRef::NONE;
@@ -8397,7 +8397,7 @@ mod tests {
 
     #[test]
     fn typed_input_arg_constructors_keep_variant_distinct() {
-        // resoperation.py:719/727/739 `InputArg{Int,Float,Ref}` are
+        // resoperation.py InputArgInt/727/739 `InputArg{Int,Float,Ref}` are
         // disjoint Box classes; the enum discriminant rejects
         // cross-variant identity even at matching raw payloads.
         for pos in [0u32, 1, 7, 100] {

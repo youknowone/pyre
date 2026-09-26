@@ -1,5 +1,5 @@
 # pyre-check: gate=1
-# pyopcode.py:1034-1037 — tuple form, any non-exception entry
+# pyopcode.py — tuple form, any non-exception entry
 # raises TypeError. `except (ValueError, 42):` must trigger the
 # gate even though `ValueError` itself is valid.
 try:

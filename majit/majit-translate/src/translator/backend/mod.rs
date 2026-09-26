@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use crate::translator::tool::taskengine::TaskError;
 
 /// Sum type for the two builder shapes that `task_database_c` can pick
-/// between. Upstream `driver.py:419-432` writes either
+/// between. Upstream `driver.py` writes either
 /// `CStandaloneBuilder(...)` or `CLibraryBuilder(...)` into `self.cbuilder`
 /// — one Python attribute can hold either subclass via duck typing.
 /// Rust requires a sum type for the same slot.
@@ -47,7 +47,7 @@ impl CBuilderRef {
     ///
     /// Threads the subclass `getentrypointptr()` callback into
     /// [`genc::CBuilder::build_database_with`] so the dispatch lands at
-    /// the upstream `genc.py:110` position — after gcpolicy /
+    /// the upstream `genc.py` position — after gcpolicy /
     /// exctransformer / DB construction / gc_startup_code, before
     /// secondary entry points and exports/startup walks.
     pub fn build_database(&self) -> Result<database::LowLevelDatabase, TaskError> {
@@ -119,7 +119,7 @@ impl CBuilderRef {
     }
 
     /// Upstream `cbuilder.targetdir` written by `generate_source`
-    /// (`genc.py:187`). Read by `task_source_c` `:459`.
+    /// (`genc.py`). Read by `task_source_c` `:459`.
     pub fn targetdir(&self) -> Option<PathBuf> {
         match self {
             CBuilderRef::Standalone(b) => b.base.targetdir.borrow().clone(),

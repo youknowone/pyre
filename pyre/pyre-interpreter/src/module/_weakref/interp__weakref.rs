@@ -498,7 +498,7 @@ pub fn callable_proxy_type() -> PyObjectRef {
 
 // ── WeakrefLifeline ───────────────────────────────────────────────────
 //
-// pypy/module/_weakref/interp__weakref.py:19-153
+// pypy/module/_weakref/interp__weakref.py
 //
 // class WeakrefLifeline(W_Root):
 //     cached_weakref  = None
@@ -553,7 +553,7 @@ fn enable_callbacks(self_lifeline: PyObjectRef) {
         return;
     }
     unsafe { pyre_object::weakref::w_weakref_lifeline_set_has_callbacks(self_lifeline) };
-    // interp__weakref.py:107 — the lifeline, not its referent, owns the
+    // interp__weakref.py enable_callbacks — the lifeline, not its referent, owns the
     // finalizer. This preserves the collector's ordering for referents that
     // are themselves part of cyclic trash.
     crate::executioncontext::register_finalizer(self_lifeline);
@@ -733,7 +733,7 @@ pub fn make_proxy_with_callback(
 
 // ── W_WeakrefBase / W_Weakref ─────────────────────────────────────────
 //
-// pypy/module/_weakref/interp__weakref.py:158-205
+// pypy/module/_weakref/interp__weakref.py
 //
 // class W_WeakrefBase(W_Root):
 //     def __init__(self, space, w_obj, w_callable):
@@ -760,7 +760,7 @@ pub fn W_Weakref_new(
         w_subtype
     };
     // `W_Weakref` (interp__weakref.py) / `descr__new__weakref`
-    // (interp__weakref.py:259-269): the three fields are interpreter-owned, so
+    // (interp__weakref.py): the three fields are interpreter-owned, so
     // every subtype keeps the builtin payload. Its Python-level `__dict__` and
     // slots use the same tagged carrier as other builtin subclasses.
     let exact_type = std::ptr::eq(actual_type, weakref_type());
@@ -1534,7 +1534,7 @@ pub fn is_w_abstract_proxy(obj: PyObjectRef) -> bool {
 
 // ── proxy_typedef_dict / callable_proxy_typedef_dict ──────────────────
 //
-// pypy/module/_weakref/interp__weakref.py:356-402
+// pypy/module/_weakref/interp__weakref.py
 //
 // ```python
 // proxy_typedef_dict = {}
@@ -1903,7 +1903,7 @@ pub fn proxy_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     crate::baseobjspace::compare(w_obj0, w_obj1, crate::baseobjspace::CompareOp::Ne)
 }
 
-// pypy/interpreter/baseobjspace.py:2127-2128 isinstance/issubtype rows
+// pypy/interpreter/baseobjspace.py truncatedint_w isinstance/issubtype rows
 // — single special method so `forcing_count = 1`. The wrapper hands
 // off to `space.isinstance(forced_self, w_obj1)` /
 // `space.issubtype(forced_self, w_obj1)`, which is the descroperation
@@ -2443,7 +2443,7 @@ fn register_proxy_typedef_dict(ns: PyObjectRef) {
             make_builtin_function_with_arity("__delete__", proxy_delete, 2),
         )
     };
-    // baseobjspace.py:2127-2128 isinstance / issubtype rows.
+    // baseobjspace.py truncatedint_w isinstance / issubtype rows.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -2780,7 +2780,7 @@ mod tests {
     /// `isinstance(obj, Checker())` where `Checker` defines
     /// `__instancecheck__`. Verifies the override path fires for
     /// non-proxy user instances acting as classinfo —
-    /// pypy/module/__builtin__/abstractinst.py:117-124.
+    /// pypy/module/__builtin__/abstractinst.py.
     #[test]
     fn test_isinstance_user_instancecheck_override() {
         crate::typedef::init_typeobjects();

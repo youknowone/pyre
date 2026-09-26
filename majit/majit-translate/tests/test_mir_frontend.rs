@@ -1420,7 +1420,7 @@ fn a_scalar_element_indexes_to_an_int_banked_array_read() {
 /// asserted together: never peeling types the first `Ref`; peeling only the
 /// `?`-desugaring shells types the second `Ref`, because `Bound` is not one;
 /// peeling every borrowed primitive types the third `Unsigned`.
-/// `jtransform.py:330-337` deletes every cast between integer primitives —
+/// `jtransform.py rewrite_op_cast_bool_to_int` deletes every cast between integer primitives —
 /// `rewrite_op_cast_char_to_int`, `cast_int_to_uint`, `cast_uint_to_int` and
 /// the rest are each `pass` — because the two share one register kind. A
 /// numeric `From` reaches the same conversion through a call, and `core`

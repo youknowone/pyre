@@ -83,7 +83,7 @@ pub const FLAG_STORE: i64 = 1;
 pub const DICT_INITSIZE: i64 = 16;
 
 /// RPython `class OrderedDictRepr(AbstractDictRepr)`
-/// (`lltypesystem/rordereddict.py:173`).
+/// (`lltypesystem/rordereddict.py`).
 #[derive(Debug)]
 #[allow(non_snake_case)]
 pub struct OrderedDictRepr {
@@ -177,7 +177,7 @@ impl OrderedDictRepr {
     }
 
     /// RPython `OrderedDictRepr.ll_newdict = staticmethod(ll_newdict)`
-    /// (`rordereddict.py:1169`), reached from `rdict.rtype_newdict`
+    /// (`rordereddict.py`), reached from `rdict.rtype_newdict`
     /// (`rdict.py:60-65`):
     ///
     /// ```python
@@ -228,7 +228,7 @@ impl OrderedDictRepr {
     /// `return ll_dict_lookup(d, key, hash, store_flag, T)`) is genuinely
     /// live for that case and unported here. Plain (`not custom_eq_hash`)
     /// dicts route entirely through `self.base.key_repr.get_ll_eq_function`
-    /// instead (`rordereddict.py:220-222`) — see
+    /// instead (`rordereddict.py`) — see
     /// [`build_ll_dict_lookup_helper_graph`]'s doc comment for how that
     /// `d.keyeq` value (e.g. `StringRepr::ll_streq` for str keys, `None` for
     /// identity keys) is wired into the direct-compare fallback.
@@ -630,7 +630,7 @@ impl OrderedDictRepr {
         let grow_const = sub_helper_funcptr_constant(rtyper, &grow_fn)?;
 
         // _ll_dict_setitem_lookup_done(d, key, value, hash, i)
-        // (rordereddict.py:675-711).
+        // (rordereddict.py).
         let lookup_done_fn = {
             let dict_ptr = dict_ptr.clone();
             let entries_ptr = entries_ptr.clone();
@@ -725,7 +725,7 @@ impl OrderedDictRepr {
         let write_indexes_const = sub_helper_funcptr_constant(rtyper, &write_indexes_fn)?;
 
         // ll_dict_delete_by_entry_index(d, hash, locate_index, replace_with, T)
-        // (rordereddict.py:1123-1144).
+        // (rordereddict.py).
         let delete_by_entry_fn = {
             let dict_ptr = dict_ptr.clone();
             let write_indexes_const = write_indexes_const.clone();
@@ -750,7 +750,7 @@ impl OrderedDictRepr {
         let delete_by_entry_const = sub_helper_funcptr_constant(rtyper, &delete_by_entry_fn)?;
 
         // ll_call_delete_by_entry_index(d, hash, i, replace_with)
-        // (rordereddict.py:582-597) — FUNC_* dispatch collapses to a single
+        // (rordereddict.py) — FUNC_* dispatch collapses to a single
         // delete helper call for the same width-collapse reason as
         // ll_call_insert_clean_function.
         let call_delete_fn = {
@@ -1059,7 +1059,7 @@ impl Repr for OrderedDictRepr {
     /// `ll_dict_bool(d)` (`rordereddict.py`) is `bool(d) and
     /// d.num_live_items != 0` — the explicit `bool(d)` guard lets a None-typed
     /// dict read False without dereferencing, so this overrides the
-    /// `int_is_true(len)` default (`rmodel.py:199-207`) which would deref the
+    /// `int_is_true(len)` default (`rmodel.py`) which would deref the
     /// possibly-null receiver.
     fn rtype_bool(&self, hop: &HighLevelOp) -> RTypeResult {
         let v_dict = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
@@ -1077,7 +1077,7 @@ impl Repr for OrderedDictRepr {
     }
 
     /// RPython `OrderedDictRepr.make_iterator_repr(self, *variant)`
-    /// (`rordereddict.py:282-283`):
+    /// (`rordereddict.py`):
     ///
     /// ```python
     /// def make_iterator_repr(self, *variant):
@@ -1108,7 +1108,7 @@ impl Repr for OrderedDictRepr {
     }
 
     /// RPython `pairtype(OrderedDictRepr, rmodel.Repr).rtype_getitem`
-    /// (`rordereddict.py:441-447`):
+    /// (`rordereddict.py`):
     ///
     /// ```python
     /// def rtype_getitem((r_dict, r_key), hop):
@@ -1170,7 +1170,7 @@ impl Repr for OrderedDictRepr {
     }
 
     /// RPython `pairtype(OrderedDictRepr, rmodel.Repr).rtype_setitem`
-    /// (`rordereddict.py:448-455`):
+    /// (`rordereddict.py`):
     ///
     /// ```python
     /// def rtype_setitem((r_dict, r_key), hop):
@@ -1204,7 +1204,7 @@ impl Repr for OrderedDictRepr {
     }
 
     /// RPython `pairtype(OrderedDictRepr, rmodel.Repr).rtype_delitem`
-    /// (`rordereddict.py:449-454`):
+    /// (`rordereddict.py`):
     ///
     /// ```python
     /// def rtype_delitem((r_dict, r_key), hop):
@@ -1230,7 +1230,7 @@ impl Repr for OrderedDictRepr {
     }
 
     /// RPython `OrderedDictRepr.rtype_method_get` / `rtype_method_setdefault`
-    /// (`rordereddict.py:285-301`).
+    /// (`rordereddict.py`).
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
         match method_name {
             // `is_null` is the lltype `_ptr` nullity probe on the dict
@@ -1302,7 +1302,7 @@ impl Repr for OrderedDictRepr {
             }
             // RPython `OrderedDictRepr.rtype_method_iterkeys`/
             // `rtype_method_itervalues`/`rtype_method_iteritems`
-            // (`rordereddict.py:342-352`):
+            // (`rordereddict.py`):
             //
             // ```python
             // def rtype_method_iterkeys(self, hop):
@@ -1480,7 +1480,7 @@ pub(crate) fn build_ll_dict_bool_helper_graph(
 }
 
 /// Synthesise `ll_newdict(DICT) -> Ptr(DICT)`
-/// (`rordereddict.py:1160-1169` + `:509-518`):
+/// (`rordereddict.py` + `:509-518`):
 ///
 /// ```python
 /// def ll_newdict(DICT):
@@ -1504,7 +1504,7 @@ pub(crate) fn build_ll_dict_bool_helper_graph(
 /// rather than threading a `Void` const through `gendirectcall`).
 ///
 /// `_ll_empty_array` is a `@specialize.memo()` prebuilt zero-length array
-/// upstream (`rordereddict.py:1155-1158`), shared across every empty dict of
+/// upstream (`rordereddict.py`), shared across every empty dict of
 /// a given specialization. This port allocates a fresh `malloc_varsize(...,
 /// 0)` entries array per call instead of sharing one prebuilt instance — the
 /// memo-sharing is deferred (no local prebuilt-const cache mechanism exists
@@ -1766,7 +1766,7 @@ fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
 }
 
 /// Synthesise `ll_dict_lookup(d, key, hash, store_flag, T) -> Signed`
-/// (`rordereddict.py:1038-1106`), the open-addressing perturb-probe that
+/// (`rordereddict.py`), the open-addressing perturb-probe that
 /// every dict access routes through.
 ///
 /// ```python
@@ -1823,7 +1823,7 @@ fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
 /// not — see `rint.py:627`/`_rweakkeydict.py:107` for the two upstream cases
 /// that do, both out of scope). `d.keyeq` is `eq_fn_const` — `None` for
 /// identity keys (int/bool/char/unichar/instance-without-`__eq__`, matching
-/// `get_ll_eq_function() -> None`, `rordereddict.py:150-157`), or the key
+/// `get_ll_eq_function() -> None`, `rordereddict.py`), or the key
 /// repr's `get_ll_eq_function()` result for keys with real structural
 /// equality (`Some(ll_streq)` for str). When `eq_fn_const` is `Some`, a
 /// direct-compare miss falls through to `direct_call(eq_fn_const,
@@ -3214,7 +3214,7 @@ pub(crate) fn build_ll_ensure_indexes_helper_graph(
 }
 
 /// Synthesise `ll_call_lookup_function(d, key, hash, flag) -> Signed`
-/// (`rordereddict.py:46-65`):
+/// (`rordereddict.py`):
 ///
 /// ```python
 /// def ll_call_lookup_function(d, key, hash, flag):
@@ -3539,7 +3539,7 @@ pub(crate) fn build_ll_dict_contains_helper_graph(
 }
 
 /// RPython `pairtype(OrderedDictRepr, rmodel.Repr).rtype_contains`
-/// (`rordereddict.py:464-467`):
+/// (`rordereddict.py`):
 ///
 /// ```python
 /// def rtype_contains((r_dict, r_key), hop):
@@ -3873,7 +3873,7 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
 }
 
 /// Synthesise `ll_call_insert_clean_function(d, hash, i)`
-/// (`rordereddict.py:565-580`):
+/// (`rordereddict.py`):
 ///
 /// ```python
 /// def ll_call_insert_clean_function(d, hash, i):
@@ -3941,7 +3941,7 @@ pub(crate) fn build_ll_call_insert_clean_function_helper_graph(
 }
 
 /// Synthesise `ll_call_delete_by_entry_index(d, hash, i, replace_with)`
-/// (`rordereddict.py:582-597`):
+/// (`rordereddict.py`):
 ///
 /// ```python
 /// def ll_call_delete_by_entry_index(d, hash, i, replace_with):
@@ -3952,7 +3952,7 @@ pub(crate) fn build_ll_call_insert_clean_function_helper_graph(
 ///     elif fun == FUNC_LONG: ll_dict_delete_by_entry_index(..., TYPE_LONG)
 /// ```
 ///
-/// rordereddict.py:586-593 — the `FUNC_*` dispatch collapses to one
+/// rordereddict.py — the `FUNC_*` dispatch collapses to one
 /// `ll_dict_delete_by_entry_index` call because all `DICTINDEX_*` aliases are
 /// currently `Ptr(GcArray(Unsigned))`; same #148-width deviation as
 /// [`build_ll_call_insert_clean_function_helper_graph`].
@@ -4015,7 +4015,7 @@ pub(crate) fn build_ll_call_delete_by_entry_index_helper_graph(
 }
 
 /// Synthesise `ll_dict_delete_by_entry_index(d, hash, locate_index,
-/// replace_with, T)` (`rordereddict.py:1123-1144`):
+/// replace_with, T)` (`rordereddict.py`):
 ///
 /// ```python
 /// locate_value = locate_index + VALID_OFFSET
@@ -6634,7 +6634,7 @@ pub(crate) fn build_ll_dict_get_helper_graph(
 }
 
 /// Synthesise `ll_dict_setdefault(dict, key, default)`
-/// (`rordereddict.py:1291-1298`).
+/// (`rordereddict.py`).
 #[expect(
     clippy::too_many_arguments,
     reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -6770,7 +6770,7 @@ pub(crate) fn build_ll_dict_setdefault_helper_graph(
 }
 
 /// Synthesise `_ll_dict_setitem_lookup_done(d, key, value, hash, i)`
-/// (`rordereddict.py:675-711`):
+/// (`rordereddict.py`):
 ///
 /// ```python
 /// def _ll_dict_setitem_lookup_done(d, key, value, hash, i):
@@ -8232,7 +8232,7 @@ pub fn get_ll_dictiter(DICTPTR: LowLevelType) -> LowLevelType {
 }
 
 /// RPython `class DictIteratorRepr(AbstractDictIteratorRepr)`
-/// (`lltypesystem/rordereddict.py:1192`).
+/// (`lltypesystem/rordereddict.py`).
 ///
 /// Upstream stores the whole `r_dict` (`DictIteratorRepr.__init__`,
 /// `:1206-1215`) and reaches `r_dict.recast_key`/`recast_value` through it.
@@ -8703,7 +8703,7 @@ mod tests {
 
     /// `ll_dictiter` mints a fresh `dictiter{dict, index}`: `iter.dict = d`
     /// and `iter.index = d.lookup_function_no >> FUNC_SHIFT`
-    /// (`rordereddict.py:1218-1223`) — no constant-zero index (unlike
+    /// (`rordereddict.py`) — no constant-zero index (unlike
     /// `ll_listiter`), since `_ll_dictnext`'s popitem(last=False)
     /// fast-forward hack stashes a resume offset in `lookup_function_no`.
     #[test]
@@ -10570,7 +10570,7 @@ mod tests {
     /// `_ll_dict_setitem_lookup_done` chain fused into a single
     /// `ll_dict_setitem` `direct_call`, and threads
     /// `hop.exception_cannot_occur()` (the non-`custom_eq_hash` branch,
-    /// `rordereddict.py:448-455`).
+    /// `rordereddict.py`).
     #[test]
     fn ordereddictrepr_rtype_setitem_int_key_emits_direct_call_chain() {
         use crate::translator::rtyper::rtyper::LowLevelOpList;

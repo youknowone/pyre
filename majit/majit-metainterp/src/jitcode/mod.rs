@@ -40,7 +40,7 @@ pub use majit_jitcode::jitcode::enumerate_vars;
 
 // Runtime descr pool types — RPython
 // `BlackholeInterpBuilder.descrs` / `BlackholeInterpreter.descrs`
-// (`blackhole.py:103`, `blackhole.py:288`).
+// (`blackhole.py`, `blackhole.py`).
 //
 // RPython keeps the descr pool on the blackhole interpreter, NOT on
 // the JitCode object.  In majit the canonical
@@ -55,7 +55,7 @@ pub use majit_jitcode::jitcode::enumerate_vars;
 // of which has a representation in the codewriter source layer.
 
 /// Trace-side function target descriptor for `BC_CALL_*` /
-/// `BC_RESIDUAL_CALL_*`.  RPython `blackhole.py:1225-1256` reads the
+/// `BC_RESIDUAL_CALL_*`.  RPython `blackhole.py bhimpl_residual_call_r_i` reads the
 /// callee function address from an int register (`i` argcode) and the
 /// calling convention from a descr (`d` argcode); pyre bundles the
 /// trace-side and concrete (non-JIT) function pointers into a single
@@ -81,10 +81,10 @@ pub struct JitCallTarget {
     /// (funcptr, save_err)`.  Read at descr-build time by
     /// `codewriter/call.py getcalldescr` to populate
     /// `EffectInfo.call_release_gil_target = (realfuncaddr, tgt_saveerr)`
-    /// (`effectinfo.py:114, 197`).  `RFFI_ERR_NONE = 0` matches the
+    /// (`effectinfo.py, 197`).  `RFFI_ERR_NONE = 0` matches the
     /// `llexternal` default (`rffi.py`); release-gil callees that
     /// preserve `errno`, `winerror`, etc. carry one of the
-    /// `RFFI_ERR_*` flags (`rffi.py:121-167`).
+    /// `RFFI_ERR_*` flags (`rffi.py`).
     pub save_err: i32,
     /// Funcaddr before it is narrowed to `*const ()`. A symbolic hash
     /// carries bits above a wasm32 pointer, so the later
@@ -149,7 +149,7 @@ impl JitCallTarget {
 
     /// Construct a release-gil target carrying the wrapper callable's
     /// `_call_aroundstate_target_ = (funcptr, save_err)` decoration
-    /// (`rffi.py:228`).  `effect_info_slot` is unused by release-gil
+    /// (`rffi.py`).  `effect_info_slot` is unused by release-gil
     /// dispatchers but kept for the dedup key triple.
     pub fn with_save_err(
         trace_ptr: *const (),
@@ -214,7 +214,7 @@ impl JitArgKind {
 
     /// Map a [`majit_ir::Type`] to its `JitArgKind`.  RPython encodes
     /// the same mapping inline in `_build_allboxes` per
-    /// `pyjitpl.py:1969-1989` (`history.INT`/`history.REF`/`history.FLOAT`
+    /// `pyjitpl.py` (`history.INT`/`history.REF`/`history.FLOAT`
     /// chars + `'S'` single-float / `'L'` long-long aliases).  Pyre's
     /// `Type::Void` has no JitArgKind because void calls carry no
     /// argbox.
@@ -300,7 +300,7 @@ pub enum RuntimeBhDescr {
     /// identically through [`Self::as_jitcode_owned`].
     JitCodeBackEdge(std::sync::Weak<JitCode>),
     /// Target function for `BC_CALL_*` / `BC_RESIDUAL_CALL_*`.
-    /// RPython `blackhole.py:1225-1256` reads the function address
+    /// RPython `blackhole.py bhimpl_residual_call_r_i` reads the function address
     /// from an int register (`i` argcode) and the calling convention
     /// from a descr (`d` argcode); pyre keeps the two together in
     /// `JitCallTarget` because the runtime emitter wires trace-side
@@ -526,7 +526,7 @@ pub trait RuntimeDescrTable: Sync {
     /// `build_jitcode_registry` rather than silently misnumbered. Doing so also
     /// requires one `Arc` per jitcode index shared by every descr naming it:
     /// minting a fresh shell per descr breaks the identity
-    /// `codewriter.py:80 all_jitcodes[jitcode.index] is jitcode` asserts.
+    /// `codewriter.py all_jitcodes[jitcode.index] is jitcode` asserts.
     fn jitcodes(&self) -> &'static [std::sync::Arc<JitCode>] {
         &[]
     }
@@ -606,7 +606,7 @@ pub struct JitCodeExecState {
     /// would deliver it).  `register_dispatch_jitcode` reads this
     /// field to validate the green/red list counts against the
     /// declared `JitDriverDescriptor` schema without re-scanning the
-    /// bytecode — RPython `blackhole.py:107-156` argcode-based decode
+    /// bytecode — RPython `blackhole.py handler` argcode-based decode
     /// parity, no payload-byte collision risk.
     pub jit_merge_point_offset: Option<usize>,
     /// The body addresses portal identity slots through
@@ -654,7 +654,7 @@ pub struct JitCode {
     core: majit_jitcode::jitcode::JitCode,
     /// Per-jitcode descr pool — pyre's analog of
     /// `BlackholeInterpBuilder.descrs` (RPython
-    /// `blackhole.py:103`).  Empty for build-time canonical jitcodes
+    /// `blackhole.py`).  Empty for build-time canonical jitcodes
     /// (descrs resolved through the global `ALL_DESCRS` table); the
     /// `JitCodeBuilder` populates this during runtime per-CodeObject
     /// emission.
@@ -704,7 +704,7 @@ unsafe impl Sync for JitCode {}
 impl JitCode {
     /// Construct a fresh runtime jitcode wrapping a canonical
     /// `majit_jitcode::jitcode::JitCode::new(name)` core with an
-    /// empty descr pool.  RPython `jitcode.py:14-20`
+    /// empty descr pool.  RPython `jitcode.py`
     /// `JitCode.__init__(name, fnaddr=None, calldescr=None, called_from=None)`.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -961,7 +961,7 @@ pub trait JitCodeRuntimeExt {
 
 impl JitCode {
     /// Resolve `BC_CALL_*` / `BC_RESIDUAL_CALL_*` function-target
-    /// descr.  Mirrors RPython `blackhole.py:1225-1256` where the
+    /// descr.  Mirrors RPython `blackhole.py bhimpl_residual_call_r_i` where the
     /// calling-convention descr travels through `descrs[idx]`; pyre
     /// additionally bundles the trace and concrete fn pointers in
     /// the `Call` variant because the call encoding pre-dates the
@@ -1466,7 +1466,7 @@ mod tests {
             "wellknown_bh_insns must keep the canonical goto/L spelling",
         );
         // Canonical RPython `conditional_call_*` / `record_known_result_*`
-        // keys (`blackhole.py:1258-1296` + `:621-630`) are pinned at the
+        // keys (`blackhole.py bhimpl_conditional_call_ir_v` + `:621-630`) are pinned at the
         // distinct bytes [`BC_CONDITIONAL_CALL_*`] / [`BC_RECORD_KNOWN_RESULT_*`].
         // The pyre-only helper-side proc-macro adapter keys
         // `cond_call_*_ext/P` / `record_known_result_*_ext/P` reuse the

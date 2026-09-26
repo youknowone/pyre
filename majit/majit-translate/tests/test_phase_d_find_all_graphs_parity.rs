@@ -3,14 +3,14 @@
 //! Verifies that `CallControl::find_all_graphs` + `DefaultJitPolicy`
 //! behave as RPython specifies when fed the pyre-interpreter source:
 //!
-//! 1. portal graph is in candidates (call.py:65
+//! 1. portal graph is in candidates (call.py
 //!    `candidate_graphs = set(todo)`).
 //! 2. Graphs reachable via `direct_call` from the portal — including
-//!    every `opcode_*` helper — become candidates (call.py:75-88 BFS).
+//!    every `opcode_*` helper — become candidates (call.py BFS).
 //! 3. Graphs registered as `builtin_targets` are **not** followed —
-//!    they stay at the residual-call boundary (call.py:104-105
+//!    they stay at the residual-call boundary (call.py
 //!    `getattr(targetgraph.func, 'oopspec')` → `builtin`, skipped in
-//!    call.py:82 `if kind != "regular": continue`).
+//!    call.py `if kind != "regular": continue`).
 //!
 //! ## RPython references
 //!
@@ -123,7 +123,7 @@ fn find_all_graphs_does_not_follow_builtin_targets() {
 fn find_all_graphs_does_not_follow_portal_recursive_edges() {
     // RPython call.py `jitdriver_sd_from_portal_runner_ptr` —
     // a call to the portal itself classifies as `recursive`, which
-    // call.py:82 skips. The portal remains a candidate (via the seed)
+    // call.py skips. The portal remains a candidate (via the seed)
     // but is not re-visited.
     let portal_path = CallPath::from_segments(["portal"]);
 
@@ -241,7 +241,7 @@ fn find_all_graphs_does_not_follow_close_stack_targets() {
 #[test]
 fn find_all_graphs_leaves_unregistered_targets_as_residual() {
     // Phase D.2 parity contract: upstream `PyPyJitPolicy.look_inside_function`
-    // (`pypy/module/pypyjit/policy.py:25-39`) excludes per-module by name
+    // (`pypy/module/pypyjit/policy.py`) excludes per-module by name
     // (`pypy.interpreter.astcompiler.*`, `rpython.rlib.rlocale`, …) so
     // those functions become residual calls even when the BFS would
     // otherwise follow them. Pyre uses a different but structurally

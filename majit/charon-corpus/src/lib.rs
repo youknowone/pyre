@@ -311,7 +311,7 @@ pub struct HostRegistry {
 /// Call through the registered callback. `front::mir` lowers this to
 /// `OpKind::IndirectCall { graphs: None }` — `indirect_call` with an
 /// unknown PBC family, which `guess_call_kind` answers `residual` for
-/// (`call.py:105`/`137`, `jtransform.py:410-412`). The `__dyn_call`
+/// (`call.py`, `jtransform.py rewrite_op_indirect_call`). The `__dyn_call`
 /// placeholder it used to reach is an unregistered synthetic path with no
 /// continuation.
 #[inline(never)]

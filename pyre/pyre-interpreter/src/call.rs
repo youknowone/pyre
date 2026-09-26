@@ -520,7 +520,7 @@ pub fn set_jit_param(name: &str, value: i64) {
 // `rlib/jit.py set_user_param` — the positional-string form
 // (`"name=value,…"`, `"off"`, `"default"`) that `pypyjit.set_param(str)`
 // routes through. The JIT owns the authoritative parser, so this forwards the
-// whole string and returns `Err(())` on a malformed string (rlib/jit.py:853).
+// whole string and returns `Err(())` on a malformed string (rlib/jit.py).
 type SetJitParamStringFn = fn(text: &str) -> Result<(), ()>;
 static SET_JIT_PARAM_STRING_HOOK: OnceLock<SetJitParamStringFn> = OnceLock::new();
 
@@ -1257,7 +1257,7 @@ fn call_user_function_with_eval(
 /// reaches a `jit_merge_point` (`execute_frame` does) the JIT is entered
 /// normally. "Opaque to the trace" does not mean "the JIT is off inside":
 /// upstream has no flag that disables it for the extent of a residual call.
-/// `bhimpl_recursive_call_*` (`blackhole.py:1095-1132`) is not the only way
+/// `bhimpl_recursive_call_*` (`blackhole.py`) is not the only way
 /// to reach the portal — it is the path the codewriter emits when the callee
 /// is *statically* the portal graph.
 ///
@@ -1275,7 +1275,7 @@ fn call_user_function_with_eval(
 /// `gettopframe_raw` is `force_vref`: forcing a vref that carries
 /// `TOKEN_TRACING_RESCALL` across a residual clears the token, which
 /// `tracing_after_residual_call` reads back as "the callee escaped this
-/// frame" (`virtualref.py:161-167`).  The recorded escape then materializes
+/// frame" (`virtualref.py`).  The recorded escape then materializes
 /// the caller frame on every execution of the compiled trace.
 ///
 /// The caller-side `FrameLocalsRoot` is skipped for the same reason it is in
@@ -1354,7 +1354,7 @@ pub fn call_user_function_resolved(
 /// so even a no-keyword call must materialize the (possibly empty) tail
 /// slots the `#[pyre_function]` wrapper reads.  Non-variadic builtins keep
 /// the raw `func(args)` fast path.
-/// GenericAlias.__call__ (`_pypy_generic_alias.py:43-46`) — after calling
+/// GenericAlias.__call__ (`_pypy_generic_alias.py`) — after calling
 /// `__origin__`, set `result.__orig_class__ = self`.  This is wrapped in
 /// `try: ... except (AttributeError, TypeError): pass`, so only those two
 /// errors are swallowed; anything else propagates.
@@ -1594,7 +1594,7 @@ fn c_profile_frame(profile_frame: *mut PyFrame) -> *mut PyFrame {
 /// PyPy does not recursively feed a bound `_Method` back through the generic
 /// callable dispatcher.  `Method.call_args` delegates to
 /// `space.call_obj_args`, whose Function fast path calls the function
-/// directly (`baseobjspace.py:1204-1211`).  Keeping this leaf separate lets
+/// directly (`baseobjspace.py`).  Keeping this leaf separate lets
 /// the method arm below preserve that shape instead of retaining a second
 /// large generic-dispatch Rust frame for every Python method call.
 fn call_function_carrier_with_mode(
@@ -1606,7 +1606,7 @@ fn call_function_carrier_with_mode(
 ) -> PyResult {
     match classify_callable(callable)? {
         CallableKind::Builtin => {
-            // baseobjspace.py:1243 — `if frame.get_is_being_profiled() and
+            // baseobjspace.py call_valuestack — `if frame.get_is_being_profiled() and
             // is_builtin_code(w_func): ... return self.call_args_and_c_profile(...)`
             // The `is_builtin_code(w_func)` check is structurally implicit
             // here: `classify_callable` already selected the builtin arm
@@ -1639,7 +1639,7 @@ fn call_function_carrier_with_mode(
     }
 }
 
-/// [`call_function_ex_in_ctx`] reached from a frame — the `pyopcode.py:1429
+/// [`call_function_ex_in_ctx`] reached from a frame — the `pyopcode.py CALL_FUNCTION_EX
 /// CALL_FUNCTION_EX` shape, whose else-branch is the frameless
 /// `space.call_args(w_function, args)`.  Installs the caller `FrameLocalsRoot`
 /// the way [`call_callable`] does.
@@ -2450,7 +2450,7 @@ fn call_non_function_callable_with_mode(
         );
     }
 
-    // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
+    // GenericAlias.__call__ (`_pypy_generic_alias.py`) —
     // `self.__origin__(*args, **kwargs)`, then best-effort
     // `result.__orig_class__ = self`.
     if unsafe { pyre_object::is_generic_alias(callable) } {
@@ -4224,7 +4224,7 @@ fn call_with_kwargs_in_ctx_impl(
         return call_with_kwargs_in_ctx(execution_context, call_fn, &call_args, &current_kwargs());
     }
 
-    // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
+    // GenericAlias.__call__ (`_pypy_generic_alias.py`) —
     // `self.__origin__(*args, **kwargs)`, then best-effort
     // `result.__orig_class__ = self`.
     if unsafe { pyre_object::is_generic_alias(callable) } {
@@ -4446,7 +4446,7 @@ pub fn call_function_impl_result(
         // ClassMethod has no descr_call (function.py; CPython 3.14
         // `PyClassMethod_Type.tp_call = 0`), so a raw wrapper falls through
         // to the ordinary not-callable error.
-        // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
+        // GenericAlias.__call__ (`_pypy_generic_alias.py`) —
         // `self.__origin__(*args, **kwargs)`, then best-effort
         // `result.__orig_class__ = self`.  Resolved here because the call
         // path does not consult a typedef `__call__` for builtin W_Roots.
@@ -4889,19 +4889,19 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
         },
     );
     frame.fix_array_ptrs();
-    // `function.py:79-83 Function.call_args` delegates every application-level
-    // function to `PyCode.funcrun` (`pycode.py:270-280`), which builds the
-    // frame and calls `PyFrame.run` (`pyframe.py:251-256`); that reaches
+    // `function.py Function.call_args` delegates every application-level
+    // function to `PyCode.funcrun` (`pycode.py`), which builds the
+    // frame and calls `PyFrame.run` (`pyframe.py`); that reaches
     // `execute_frame`, whose dispatch loop carries `jit_merge_point`
-    // (`interp_jit.py:81-99`, `pypyjitdriver`, `is_recursive=True`).  Nothing
+    // (`interp_jit.py`, `pypyjitdriver`, `is_recursive=True`).  Nothing
     // on that chain is conditional.
     //
-    // `_compute_flatcall` (`pycode.py:256-268`) decides only which of two
+    // `_compute_flatcall` (`pycode.py`) decides only which of two
     // arms fills the arguments: `fast_natural_arity` selects `_flat_pycall`,
     // which writes the slots directly and returns `new_frame.run`
     // (`function.py:206-214`), and the function it rejects — a positional
     // argument that is also a cellvar among them — falls back to
-    // `self.call_args(args)` (`function.py:203`) and its
+    // `self.call_args(args)` (`function.py`) and its
     // `Arguments.parse_into_scope`.  Both arms end at the same
     // `PyFrame.run`, so the shortcut buys argument matching and nothing else.
     //
@@ -5017,7 +5017,7 @@ fn call_metaclass_with_kwargs(
         // compiling.py:215-221 — `space.call_args(w_meta, Arguments(name,
         // bases, ns, **kwds))`; a non-type metaclass receives the
         // class-definition keywords too, and `call_args`
-        // (descroperation.py:189) takes no frame.
+        // (descroperation.py) takes no frame.
         let kwds: Vec<(Wtf8Buf, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs) } {
             unsafe { pyre_object::w_dict_str_entries_wtf8(kwargs) }
         } else {

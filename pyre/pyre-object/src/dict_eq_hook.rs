@@ -27,7 +27,7 @@ use std::cell::Cell;
 /// probe; the concrete `PyError` rides the interpreter pending slot.
 pub type EqWHookFn = unsafe fn(a: PyObjectRef, b: PyObjectRef) -> bool;
 
-/// `pypy/interpreter/baseobjspace.py:840-845 W_ObjectSpace.hash_w`
+/// `pypy/interpreter/baseobjspace.py is_none W_ObjectSpace.hash_w`
 /// signature: returns the `__hash__` digest as `i64` (matching
 /// CPython `Py_hash_t`).  On error (unhashable type, user `__hash__`
 /// raised, etc.) the hook calls [`signal_hash_error`] and returns 0;
@@ -40,13 +40,13 @@ pub type HashWHookFn = unsafe fn(obj: PyObjectRef) -> i64;
 /// str-keyed dict GET probe (`getitem_str`) land in the same bucket an
 /// `object_key_for(w_str_new(key))` would, without materializing the
 /// throwaway str — matching PyPy's string-strategy `getitem_str`
-/// (`dictmultiobject.py:1216-1218`), which hashes the raw RPython str.
+/// (`dictmultiobject.py`), which hashes the raw RPython str.
 /// `ptr`/`len` describe a valid WTF-8 range for the duration of the call;
 /// the `(ptr, len)` ABI keeps the residual fnaddr FFI-clean (a `&[u8]` fat
 /// pointer is not).  Str hashing never fails, so there is no error channel.
 pub type HashStrHookFn = unsafe fn(ptr: *const u8, len: usize) -> i64;
 
-/// `pypy/objspace/std/typeobject.py:353-371
+/// `pypy/objspace/std/typeobject.py compares_by_identity
 /// W_TypeObject.compares_by_identity` trampoline.  Walks the type's
 /// MRO via `lookup_in_type('__eq__')` / `('__hash__')` and compares
 /// against the object-default to decide if identity comparison is
@@ -184,7 +184,7 @@ pub extern "C" fn take_eq_error() -> bool {
 /// callback cannot abort an `IndexMap` scan, but suppressing further
 /// user `__eq__` calls means no extra comparison runs and the FIRST
 /// exception is the one retained — matching `r_dict(space.eq_w, ...)`
-/// which raises at the first comparison (`dictmultiobject.py:1209`).
+/// which raises at the first comparison (`dictmultiobject.py`).
 /// `dont_look_inside`: thread-local read, residualizes via the
 /// registered fnaddr (the `take_eq_error` twin).
 #[majit_macros::dont_look_inside]

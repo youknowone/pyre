@@ -1,6 +1,6 @@
 //! C-ABI call stub dispatch shared between backends.
 //!
-//! `bh_call_i_dispatch` mirrors `rpython/jit/backend/llsupport/llmodel.py:816 call_stub_i`:
+//! `bh_call_i_dispatch` mirrors `rpython/jit/backend/llsupport/llmodel.py bh_call_i call_stub_i`:
 //! it materializes a typed `extern "C" fn` from a raw funcptr and forwards
 //! arguments in the calldescr declaration order preserved by `arg_classes`.
 //! `bh_call_f_dispatch` and `bh_call_v_dispatch` are the float-returning and
@@ -420,7 +420,7 @@ fn unsupported_call_sig(classes: &[ArgClass]) -> ! {
 
 call_sig_table!(define_call_sig_stubs);
 
-/// llmodel.py:816 call_stub_i: ABI-correct dispatch in calldescr declaration
+/// llmodel.py bh_call_i call_stub_i: ABI-correct dispatch in calldescr declaration
 /// order.
 ///
 /// Safety: `func` must be a valid function pointer matching `classes`, i.e. an
@@ -1098,7 +1098,7 @@ mod tests {
         }
     }
 
-    /// The four `return_type` literals `llmodel.py:816/822/828/835` pass, each
+    /// The four `return_type` literals `llmodel.py bh_call_i/822/828/835` pass, each
     /// against every result class `type_to_argclass` can produce. `'L'` and
     /// `'S'` ride along with the float and int sets the way upstream spells
     /// them (`history.FLOAT + 'L'`, `history.INT + 'S'`).

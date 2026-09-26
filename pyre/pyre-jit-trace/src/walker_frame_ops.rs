@@ -69,7 +69,7 @@ pub trait WalkerFrameOps {
     /// `get_opref_type` lookup which doesn't need write access.
     fn ctx(&self) -> &TraceCtx;
 
-    /// `pyjitpl.py:177-220` `Box.type` parity — return the OpRef's
+    /// `pyjitpl.py get_list_of_active_boxes` `Box.type` parity — return the OpRef's
     /// intrinsic type (Const kind, recorded result_type, or PtrInfo
     /// virtualized).  Default impl reads `ctx.get_opref_type`; impls
     /// override only if they carry a faster cached lookup.

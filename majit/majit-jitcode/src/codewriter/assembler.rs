@@ -310,7 +310,7 @@ impl Assembler {
     /// `encode_liveness` of each kind, exactly mirroring upstream
     /// `assembler.py:241-247` byte order.  The returned offset is
     /// finally written via `liveness::encode_offset` (parity with
-    /// `liveness.py:127-131`).
+    /// `liveness.py`).
     pub fn _encode_liveness(
         &mut self,
         live_i: &[u8],
@@ -505,7 +505,7 @@ impl Assembler {
     /// `JitCodeBuilder` emits BC_* directly), so the canonical entries
     /// — `live/`, `catch_exception/L`, `*_return/*` — are populated
     /// here at install time so `MetaInterpStaticData::setup_insns`
-    /// (`pyjitpl.py:2227-2243`) can do the dynamic
+    /// (`pyjitpl.py`) can do the dynamic
     /// `insns.get(name)` lookup instead of a parallel hardcoded
     /// `BC_*` seeding block.
     pub fn register_insn(&mut self, name: &str, opnum: u8) {
@@ -686,7 +686,7 @@ impl Assembler {
 /// PyPy keys the EI factory cache on the raw `frozenset[Descr]`
 /// readonly/write sets, NOT on the `bitstring_*` fields.  The
 /// bitstrings are setup-time derived state (`compute_bitstrings`
-/// at `effectinfo.py:528`), so the same logical EI must hit the
+/// at `effectinfo.py`), so the same logical EI must hit the
 /// same cache slot before AND after compaction.  Pyre's lift
 /// projects the `Vec<DescrRef>` raw sets to `Arc::as_ptr` ptr-id
 /// `Vec<usize>` for `Hash`/`Eq` — direct lift of PyPy's
@@ -738,7 +738,7 @@ impl EffectInfoStructuralKey {
 ///
 /// `effectinfo.rs`'s `analyze_external_call` states the rule and names its
 /// upstream source:
-/// `effectinfo.py:149-162` makes the six raw sets `None` **iff** the EI is
+/// `effectinfo.py` makes the six raw sets `None` **iff** the EI is
 /// `EF_RANDOM_EFFECTS`. So the population partitions in two, and the third
 /// class below is unrepresentable rather than merely rare.
 ///
@@ -896,7 +896,7 @@ pub enum AssemblerDescrKey {
         is_item_signed: bool,
         // `ei_index` deliberately omitted from the identity tuple —
         // upstream `gccache._cache_array[ARRAY_OR_STRUCT]`
-        // (`descr.py:348-360`) keys on the lltype itself, and
+        // (`descr.py get_array_descr`) keys on the lltype itself, and
         // `compute_bitstrings` (`effectinfo.py`) later assigns the
         // index slot as a derived attribute that multiple descrs are
         // free to share.

@@ -134,7 +134,7 @@ pub(crate) fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType
 
 // There is no callee-block pre-seed.  The orthodox path
 // `pycall -> recursivecall -> addpendingblock` from
-// description.py:283-305 / annrpython.py:315-336 is reachable
+// description.py / annrpython.py is reachable
 // through the `simple_call_SomeObject` registration; the
 // program-wide `compute_at_fixpoint` loop discovers callees from
 // subject call sites without any pre-seed.
@@ -221,7 +221,7 @@ impl Drop for LegacyAnnotationGuard {
 /// Skip-classified graphs.  The legacy-baseline diff inside
 /// `dual_gate_check_with_registry` still runs while the transition is
 /// active; `Match` means the real path succeeded and matched the legacy
-/// baseline when that baseline could be produced. PyPy `codewriter.py:33`
+/// baseline when that baseline could be produced. PyPy `codewriter.py transform_graph_to_jitcode`
 /// consumes the rtyper-produced graph directly, with no dual-gate
 /// equivalent; pyre's `Skip` arm is transitional scaffolding that
 /// retires once every category in
@@ -237,7 +237,7 @@ pub(crate) enum DualGateOutcome {
     /// state — divergence routes the graph through
     /// `Skip("dual-gate divergence: ...")` so the codewriter falls
     /// back to the legacy walker output for the affected graph.  PyPy
-    /// `codewriter.py:33` consumes the rtyper-produced graph
+    /// `codewriter.py transform_graph_to_jitcode` consumes the rtyper-produced graph
     /// directly with no comparison stage; the legacy-baseline diff
     /// is pyre-only scaffolding that retires once the legacy walker
     /// itself retires.
@@ -279,7 +279,7 @@ pub(crate) enum DualGateOutcome {
 /// against a pre-populated `CallRegistry` so graphs with
 /// `OpKind::Call::FunctionPath` callsites resolve through the upstream
 /// `Constant(<function>) -> getdesc -> FunctionDesc` chain
-/// (`bookkeeper.py:353-409`).  Production callers
+/// (`bookkeeper.py`).  Production callers
 /// (codewriter.rs `transform_graph_to_jitcode`) build the registry
 /// once per `CallControl` (program-wide) and reuse across every
 /// dual-gated graph.
@@ -393,7 +393,7 @@ pub(crate) fn dual_gate_check_with_registry(
 ///
 /// `specialize_more_blocks` mutates callee graphs in place: it
 /// registers each graph in `annotator.fixed_graphs` at its first
-/// specialized block (rtyper.py:268) and rewrites block operations to
+/// specialized block (rtyper.py) and rewrites block operations to
 /// LL form. When the subject then fails, `AddedBlocksGuard` evicts the
 /// scope's blocks and clears their annotations — but the callee's
 /// `FunctionDesc.cache` (and any calltable row built during the scope)
@@ -733,13 +733,13 @@ fn reachable_defined_vars(graph: &LegacyGraph) -> std::collections::HashSet<Vari
 /// The colored positions:
 /// - op operands (`serialize_op`/`flatten_list`, `flatten.py`),
 /// - the block `exitswitch` (`goto_if_not` / `switch`,
-///   `flatten.py:259/265`, including fused compare operands),
+///   `flatten.py/265`, including fused compare operands),
 /// - operands forwarded on a Link into the `exceptblock` — the raise
 ///   value colored by `make_return`'s 2-arg arm (`flatten.py`).
 ///
 /// A var forwarded only into the `returnblock` is *not* included: the
 /// 1-arg return arm emits `void_return` without coloring when the kind
-/// is void (`flatten.py:135-136`), which is exactly the sound dropped-unit
+/// is void (`flatten.py`), which is exactly the sound dropped-unit
 /// case the refinement targets.
 #[expect(
     clippy::mutable_key_type,
@@ -1645,8 +1645,8 @@ const UNPORTED_CATEGORIES: &[(&[&str], &str)] = &[
     // is ported.
     (&["rtyper_makerepr — port"], "unported-repr-family"),
     // TODO(annotator-fixpoint-fail-loud) — STRICT-PARITY REGRESSION
-    // vs main / PyPy.  `bookkeeper.py:108-127` propagates fixpoint
-    // exceptions uncaught and `annrpython.py:643` lets
+    // vs main / PyPy.  `bookkeeper.py compute_at_fixpoint` propagates fixpoint
+    // exceptions uncaught and `annrpython.py consider_op` lets
     // `AnnotatorError` reach the caller; absorbing the four
     // patterns below is a deviation that hides real
     // annotator/rtyper parity gaps as "known unported".  Direct
@@ -1697,7 +1697,7 @@ const UNPORTED_CATEGORIES: &[(&[&str], &str)] = &[
     // The union fallback marker — no arm handles this pair.  Upstream
     // RAISES for the pairs that reach here: `pair(SomeObject, SomeObject)
     // .union()` raises (binaryop.py), `pair(SomePtr, SomeObject)`
-    // raises (llannotation.py:118-120).  So a hit is a pyre PRODUCER
+    // raises (llannotation.py).  So a hit is a pyre PRODUCER
     // divergence — a boxed `*mut PyObject` lifted as `SomePtr` where
     // RPython carries `SomeInstance`, making a `SomeInstance ∪ SomePtr`
     // phi RPython never constructs — not a missing union handler.  Skip
@@ -1787,7 +1787,7 @@ const UNPORTED_CATEGORIES: &[(&[&str], &str)] = &[
     // (`flowspace_adapter.rs:821 SyntheticTransparentCtor` arm),
     // routing through the existing `is_class()` arm in
     // [`crate::annotator::bookkeeper::Bookkeeper::immutablevalue_hostobject`]
-    // (`bookkeeper.py:315-316` parity).  No production emit-site of
+    // (`bookkeeper.py` parity).  No production emit-site of
     // `HostObject::new_opaque` remains in `front/`/`translator/rtyper/`,
     // so any future `immutablevalue(HostObject` failure is a real
     // parity bug — let it surface as a dual-gate divergence panic.
@@ -1838,12 +1838,12 @@ const UNPORTED_CATEGORIES: &[(&[&str], &str)] = &[
     // parity-correct: RPython's default `noneify` raises `UnionError`
     // (model.py:121-122) and `SomePtr` defines no override, while
     // `pair(SomePtr, SomeObject).union` raises too
-    // (llannotation.py:119-120) — so this Skip catches a *correct*
+    // (llannotation.py) — so this Skip catches a *correct*
     // raise, it does not paper over a wrong annotation rule.  The
     // only divergence is upstream of the merge: RPython spells a null
     // pointer as `lltype.nullptr(T)`, which annotates as a
     // (null-valued) `SomePtr`, so `pair(SomePtr, SomePtr).union`
-    // (llannotation.py:94-98) keeps it in the pointer lattice and
+    // (llannotation.py) keeps it in the pointer lattice and
     // `noneify` is never reached.  Pyre's `front::mir` still lowers
     // some Rust null/`Option<*T>` shapes to a `SomeNone` rather than
     // a typed null `SomePtr` (the same null-pointer-typing gap
@@ -1930,7 +1930,7 @@ const UNPORTED_CATEGORIES: &[(&[&str], &str)] = &[
 /// reads an object struct field, so typed-Ref ClassDef projection
 /// (the object-pointer epic) moves none of them.
 ///
-/// PyPy `bookkeeper.py:108-127` propagates fixpoint failures uncaught;
+/// PyPy `bookkeeper.py` propagates fixpoint failures uncaught;
 /// pyre's dual-gate Skip defers exactly the categories enumerated
 /// above. Once every category is implemented, every message returns
 /// `None`, the legacy walker fallback at
@@ -1955,7 +1955,7 @@ pub(crate) fn unported_category(msg: &str) -> Option<&'static str> {
     // directly.  Only the `same_as` identity / source-type-unknown
     // fallback remains on the `OpKind::UnaryOp` route, dispatched by
     // `RPythonTyper::translate_operation` to `rbuiltin::rtype_same_as`
-    // (verbatim port of `rtyper.py:478-481`).  `normalize_unary_op_name`
+    // (verbatim port of `rtyper.py`).  `normalize_unary_op_name`
     // accepts `same_as` straight through; any residual fail-loud
     // surfaces as a dual-gate divergence panic — the parity-correct
     // outcome.
@@ -2027,7 +2027,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // from one another at the callsite.
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
     // Dedupe by canonical path — RPython `Bookkeeper.getdesc(pyobj)`
-    // (`bookkeeper.py:353-409`) returns the *same* FunctionDesc for
+    // (`bookkeeper.py`) returns the *same* FunctionDesc for
     // any reference to the same callable, keyed by `Constant(pyobj)`
     // identity. This port's `function_graphs: HashMap<CallPath, FunctionGraph>`
     // can carry the same callable under multiple keys (`lib.rs`
@@ -2192,7 +2192,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // selected above can be keyed by the bare leaf even though the graph
         // retains its exact source callable identity.  RPython attaches
         // `_signature_` to that callable object, not to one spelling of its
-        // import path (`bookkeeper.py:353-409`, `description.py:234-244`).
+        // import path (`bookkeeper.py getdesc`, `description.py:234-244`).  allow-line-citation
         // Recover the same fact from `FunctionGraph.source_identity` here;
         // this keeps a foreign same-leaf function distinct while ensuring
         // every alias of the real materializer shares the semantic result.
@@ -2294,7 +2294,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // generic "missing code object" message
     // (`translator/translator.rs:439`).  This keeps the lazy-failure
     // *point of observation* aligned with upstream
-    // `description.py:228` while preserving pyre's eager prefill
+    // `description.py` while preserving pyre's eager prefill
     // shape for the success path.  Without per-entry error capture a
     // single bad leaf (e.g. `function_write_barrier`'s unregistered
     // `try_gc_write_barrier` callee) would mask its own diagnosis
@@ -2604,7 +2604,7 @@ fn source_graph_func(graph: &LegacyGraph) -> GraphFunc {
 /// here carries exactly that shape via `binding(arg)` reading
 /// `v.annotation` directly (`annrpython.py`).
 ///
-/// Mirrors how `description.py:193-203` test fixtures build a
+/// Mirrors how `description.py __init__` test fixtures build a
 /// `FunctionDesc` with a minimal `PyGraph` body — the upstream
 /// equivalent is `Translator._prebuilt_graphs[entry_point] = pygraph`
 /// where `pygraph` is hand-constructed without going through
@@ -3301,7 +3301,7 @@ pub(crate) fn register_foreign_opaque_method_externals(
 ///
 /// The upstream
 /// `Constant(<function>) -> getdesc -> FunctionDesc` chain
-/// (`bookkeeper.py:353-409`) is unreachable from this entry because
+/// (`bookkeeper.py`) is unreachable from this entry because
 /// pyre's surface DSL has no Python callable object to resolve;
 /// production callers that need free function calls must build a
 /// pre-populated registry (one entry per reachable `FunctionPath`,
@@ -3418,13 +3418,13 @@ fn drive_subject(
     // seeded for this subject and roll them back if any stays in the
     // `None` (False) sentinel state. Mirrors `complete_helpers`'s
     // `saved = self.added_blocks; self.added_blocks = {}` prologue
-    // (annrpython.py:113-114); the guard restores the previous tracker
+    // (annrpython.py); the guard restores the previous tracker
     // when this function returns.
     let _subject_block_scope = annotator.enter_added_blocks_scope();
     // Queue `graph.startblock` onto the orthodox `addpendingblock`
     // queue, mirroring how callees enter through
     // `pycall -> recursivecall -> addpendingblock`
-    // (`description.py:283-305`, `annrpython.py:315-336`).
+    // (`description.py`, `annrpython.py`).
     // `addpendingblock` (`annrpython.rs:1245-1302`) writes
     // `Variable.annotation` for each inputarg via
     // `bindinputargs.setbinding`, inserts `all_blocks[startblock]`
@@ -3522,7 +3522,7 @@ fn drive_subject(
         .complete_pending_blocks()
         .map_err(|err| TyperError::message(format!("complete_pending_blocks failed: {err}")))?;
     // Orthodox `complete()` blocked-annotation guard
-    // (annrpython.py:243-255): a block that stayed in the `None` (False)
+    // (annrpython.py): a block that stayed in the `None` (False)
     // sentinel state after the fixpoint drain is permanently
     // `BlockedInference`. Upstream `complete()` raises here, before
     // `simplify`/`compute_at_fixpoint`. The dual-gate calls
@@ -3536,9 +3536,9 @@ fn drive_subject(
 
     // Populate per-callsite call-family / calltable state
     // by walking the seeded blocks' call_ops.  `compute_at_fixpoint`
-    // (`bookkeeper.py:108-118`, pyre `bookkeeper.rs:627-648`) drains
+    // (`bookkeeper.py`, pyre `bookkeeper.rs:627-648`) drains
     // `annotator.call_sites()` through `consider_call_site`
-    // (`bookkeeper.py:152-166`, pyre `bookkeeper.rs:675`); each
+    // (`bookkeeper.py`, pyre `bookkeeper.rs:675`); each
     // `simple_call(callable_const, *args)` op resolves the callable
     // to a `SomePBC` (via `immutablevalue_hostobject` for the
     // pre-registered `HostObject::UserFunction`), then records the
@@ -3553,7 +3553,7 @@ fn drive_subject(
     // before specialize looks them up.
     //
     // Errors propagate verbatim — upstream
-    // `bookkeeper.py:108-118` runs the call-site walk without a
+    // `bookkeeper.py` runs the call-site walk without a
     // `try`/`except`, so a failed `consider_call_site` terminates
     // `simplify` and unwinds out of the annotator driver.  Pyre's
     // port surfaces the same condition through `?`-propagation
@@ -3566,7 +3566,7 @@ fn drive_subject(
     // ── Step 3 — incremental rtyper drive ──────────────────────────
     //
     // Lifecycle mapping vs upstream `RPythonTyper.specialize(self,
-    // dont_simplify_again=False)` (rtyper.py:178-189):
+    // dont_simplify_again=False)` (rtyper.py):
     //
     //   1. `if not dont_simplify_again: self.annotator.simplify()`
     //      — pyre per-subject flow keeps the annotator-wide
@@ -4425,7 +4425,7 @@ fn run_phase_b_rtype_isolated(
 /// (`flowspace_adapter.rs`), and RPython's rtyper treats `same_as` as an
 /// internal rename.  Its JIT codewriter then returns `None` from
 /// `rewrite_op_hint` specifically to force `op.result` equal to `op.args[0]`
-/// (`rpython/jit/codewriter/jtransform.py:608-614`).  The typed graph can
+/// (`rpython/jit/codewriter/jtransform.py`).  The typed graph can
 /// therefore contain only the operand representative while the legacy graph
 /// still names the result.  Restoring that alias in the existing adapter map
 /// preserves the one upstream value; it does not invent a type or suppress a
@@ -4471,7 +4471,7 @@ fn reconcile_elided_hint_results(legacy: &LegacyGraph, value_to_var: &mut Legacy
 ///
 /// RPython `remove_identical_vars_SSA` unions an input with its incoming
 /// value when every `phi_arg` has the same union-find representative
-/// (`rpython/translator/simplify.py:548-601`).  A one-predecessor phi is the
+/// (`rpython/translator/simplify.py`).  A one-predecessor phi is the
 /// common case.  `join_blocks` performs the same rename while merging a
 /// linear edge (`simplify.py:271-315`).  The adapter map predates those
 /// mutations, so its original inputarg twin may remain untyped even though
@@ -5793,7 +5793,7 @@ mod tests {
 
     /// Build `start(v1) -> exceptblock(v1)` — `v1` is forwarded as the
     /// exceptblock raise operand, which `make_return`'s 2-arg arm colors
-    /// unconditionally (`flatten.py:143`).  Publish `legacy_kind` onto
+    /// unconditionally (`flatten.py`).  Publish `legacy_kind` onto
     /// `v1` and diff against a `real_state` typing it `real_kind`.
     fn diff_single_raise_operand(
         legacy_kind: ConcreteType,
@@ -7400,7 +7400,7 @@ mod tests {
         // the lifted callee `FunctionGraph` must live in the session
         // `translator.graphs`.  Upstream reaches that state because
         // `buildgraph -> buildflowgraph` appends every graph
-        // (`translator.py:61`); pyre's lazy-lift prefills
+        // (`translator.py`); pyre's lazy-lift prefills
         // `FunctionDesc.cache` via `lift_callee_to_pygraph` +
         // `prefill_default_cache`, bypassing `buildflowgraph`, so the
         // graph would otherwise never enter `translator.graphs`.

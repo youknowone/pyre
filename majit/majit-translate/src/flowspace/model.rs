@@ -186,7 +186,7 @@ enum HostObjectKind {
     /// (`SyntheticTransparentCtor`).  Its `class_obj` is the canonical class
     /// object used for annotation and field identity, while the wrapper tells
     /// the rtyper to perform only `rtype_new_instance` — RPython's allocation
-    /// step before optional `__init__` dispatch (`rpbc.py:1020-1067`).
+    /// step before optional `__init__` dispatch (`rpbc.py`).
     ///
     /// This is not a second class identity.  `Bookkeeper::getdesc` unwraps it
     /// to `class_obj`, so constructed values retain the same ClassDef as field
@@ -258,7 +258,7 @@ enum HostObjectKind {
     /// Python `weakref.ref(obj)`. Upstream `bookkeeper.immutablevalue`
     /// dereferences the weakref via `x()` and routes the referent
     /// (or `None` for dead weakrefs) through the SomeWeakRef path
-    /// (bookkeeper.py:299-306). `referent=None` models a dead
+    /// (bookkeeper.py). `referent=None` models a dead
     /// weakref whose target has been garbage-collected.
     Weakref { referent: Option<HostObject> },
     /// Host-side native callable — wraps a Rust closure that represents
@@ -1406,7 +1406,7 @@ fn host_descriptor_get(
 /// Rust equivalent of upstream Python `getattr(obj, name)` applied to
 /// a flow-space / annotator constant — the single code path shared
 /// between `flowspace::operation::GetAttr.constfold` (operation.py)
-/// and `unaryop::OpKind::GetAttr` (unaryop.py:215-229) for constant
+/// and `unaryop::OpKind::GetAttr` (unaryop.py) for constant
 /// receivers. The divergence lives only at the wrap step: flowspace
 /// re-wraps with `const(result)`; the annotator re-wraps with
 /// `bookkeeper.immutablevalue(result)`.
@@ -1796,7 +1796,7 @@ impl HostEnv {
         ] {
             self.insert_builtin(name, HostObject::new_builtin_callable(name));
         }
-        // RPython-only print helpers — upstream `specialcase.py:76-96`.
+        // RPython-only print helpers — upstream `specialcase.py rpython_print_item`.
         for name in [
             "rpython_print_item",
             "rpython_print_end",
@@ -1805,7 +1805,7 @@ impl HostEnv {
             self.insert_builtin(name, HostObject::new_builtin_callable(name));
         }
         // Class-method qualnames used by `@typer_for(<class>.__init__)`
-        // decorators upstream (rbuiltin.py:264-305).  Pyre encodes them
+        // decorators upstream (rbuiltin.py).  Pyre encodes them
         // as single-string qualname builtins instead of resolving via
         // descriptor lookup.  `EnvironmentError.__init__` (rbuiltin.py)
         // is omitted — its body uses `r_self.setfield(v_self, 'errno', ...)`
@@ -1885,7 +1885,7 @@ impl HostEnv {
         // Upstream `r_uint` is the class object created via
         // `build_int('r_uint', False, LONG_BIT)` (rarithmetic.py),
         // dispatched via `ForTypeEntry(extregistry.ExtRegistryEntry)`
-        // (rarithmetic.py:572-582).  The HostObject registered here is
+        // (rarithmetic.py).  The HostObject registered here is
         // the carrier the extregistry entry keys on; the bootstrap
         // [`crate::translator::rtyper::extregistry::register_r_uint`]
         // call wires `ExtRegistryEntry::ForType` so `compute_result_\
@@ -1968,7 +1968,7 @@ impl HostEnv {
 
         // `rpython.rtyper.lltypesystem.lltype` — typing-time callables that
         // RPython routes through `@typer_for(lltype.<name>)` decorators
-        // (rbuiltin.py:412-415).  `front::mir` synthesises most
+        // (rbuiltin.py).  `front::mir` synthesises most
         // `lltype.*` ops directly while lowering (no HostObject lookup
         // in the production dispatch), so these entries currently exist
         // only to make the BUILTIN_TYPER registry structurally match
@@ -2026,7 +2026,7 @@ impl HostEnv {
             HostObject::new_builtin_callable("lltype.cast_primitive"),
         );
         // `lltype.cast_ptr_to_int` / `cast_int_to_ptr` — registered upstream
-        // at `rpython/rtyper/lltypesystem/lltype.py:2367-2382` via the
+        // at `rpython/rtyper/lltypesystem/lltype.py` via the
         // `ann_cast_ptr_to_int` / `ann_cast_int_to_ptr` annotator hooks plus
         // `BUILTIN_TYPER` entries in `rbuiltin.py`. `front::mir` projects a
         // Charon `Ref ↔ Int` cast payload onto these `cast_ptr_to_int` /
@@ -4513,7 +4513,7 @@ pub struct GraphFunc {
     pub relax_sig_check: Option<bool>,
     /// Upstream function attribute set by
     /// `ExtEnterLeaveMarker.compute_result_annotation` at
-    /// `rpython/rlib/jit.py:916-921`:
+    /// `rpython/rlib/jit.py`:
     ///
     /// ```python
     /// try:
@@ -4533,7 +4533,7 @@ pub struct GraphFunc {
     ///
     /// RPython distinguishes literal `True` from the truthy string `'try'`:
     /// both select the candidate at zero cost, but only literal `True` makes
-    /// an unsuccessful inline fatal (`inline.py:703-709`).
+    /// an unsuccessful inline fatal (`inline.py`).
     pub _always_inline_: AlwaysInline,
     /// Upstream `func._dont_inline_` (read off the live Python
     /// callable via `getattr(funcobj._callable, '_dont_inline_',
@@ -4747,7 +4747,7 @@ pub struct FunctionGraph {
     /// backend after a graph has been processed (see
     /// `rpython/translator/c/funcgen.py`). The
     /// `backend_optimizations` entry asserts it is `False`
-    /// (`all.py:48`); the local port carries the same flag so the
+    /// (`all.py`); the local port carries the same flag so the
     /// assert can be enforced even though the C backend write site
     /// has not landed yet.
     pub _seen_by_the_backend: std::cell::Cell<bool>,

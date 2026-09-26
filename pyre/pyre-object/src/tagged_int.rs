@@ -24,7 +24,7 @@
 
 use crate::pyobject::PyObjectRef;
 
-/// `rpython/rtyper/lltypesystem/rtagged.py:64-96` static `can_be_tagged`
+/// `rpython/rtyper/lltypesystem/rtagged.py gettype_from_unboxed` static `can_be_tagged`
 /// gate, collapsed to the single runtime `int` class. Off, mirroring
 /// `rpython/config/translationoption.py taggedpointers` left off. When
 /// enabled, every consumer chokepoint takes the `& 1` tag precheck and the

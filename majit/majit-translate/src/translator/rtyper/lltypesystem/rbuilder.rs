@@ -2636,7 +2636,7 @@ pub fn build_ll_append_charpsize_helper_graph(
 ///
 /// `jit.we_are_jitted()` rtypes to the identity-bearing symbolic
 /// `Constant(ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID), Bool)`
-/// (`jit.py:397-406`), emitted here as the branch exitswitch.
+/// (`jit.py`), emitted here as the branch exitswitch.
 /// `replace_we_are_jitted` folds it to `false` on the interpreter
 /// path and `jtransform` folds it to `true` on the JIT path.
 /// `ll_jit_append` / `_ll_append` are `direct_call` callee consts.
@@ -2913,7 +2913,7 @@ pub fn build_ll_jit_append_helper_graph(
 /// ```
 ///
 /// `jit.conditional_call(cond, func, *args)` rtypes to the single
-/// `jit_conditional_call` op (`jit.py:1377-1394`); the op is complete
+/// `jit_conditional_call` op (`jit.py`); the op is complete
 /// on its own (the backend performs the guarded call), so no
 /// `we_are_jitted()` wrapper is emitted — same shape as
 /// [`build_ll_strhash_helper_graph`]'s `jit_conditional_call_value`.
@@ -5533,7 +5533,7 @@ fn array_ptr_lltype(item_lltype: &LowLevelType) -> LowLevelType {
 /// branch) is deferred as a translation-time concern, mirroring
 /// [`build_ll_arraycopy_helper_graph`](../../rlist.rs) which lowers the
 /// sibling `rgc.ll_arraycopy` to the same bare element loop and defers its
-/// `raw_memcopy` fast path (`rgc.py:403-411`); the `itemoffsetof` / `sizeof`
+/// `raw_memcopy` fast path (`rgc.py`); the `itemoffsetof` / `sizeof`
 /// / `cast_ptr_to_adr` / `raw_memclear` address machinery has no
 /// construction-side surface here.
 pub fn build_ll_arrayclear_helper_graph(
@@ -6576,7 +6576,7 @@ fn rtype_builder_bool(
 }
 
 /// RPython `AbstractStringBuilderRepr.rtyper_new(self, hop)`
-/// (`rtyper/rbuilder.py:8-13`):
+/// (`rtyper/rbuilder.py`):
 ///
 /// ```python
 /// def rtyper_new(self, hop):
@@ -6763,7 +6763,7 @@ impl UnicodeBuilderRepr {
     }
 
     /// RPython `AbstractStringBuilderRepr.rtyper_new(self, hop)`
-    /// (`rtyper/rbuilder.py:8-13`), inherited by `UnicodeBuilderRepr`.
+    /// (`rtyper/rbuilder.py`), inherited by `UnicodeBuilderRepr`.
     pub fn rtyper_new(&self, hop: &HighLevelOp) -> RTypeResult {
         rtype_builder_new(
             hop,

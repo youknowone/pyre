@@ -1277,7 +1277,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
 
     /// LOAD_ATTR non-method branch threaded with the bytecode `nameindex` for
-    /// the interpreter mapdict attribute cache (pyopcode.py:1024-1027). The
+    /// the interpreter mapdict attribute cache (pyopcode.py). The
     /// default ignores `nameindex` and runs the uncached path, so MIFrame and
     /// the JIT tracer keep identical behavior; PyFrame overrides it to consult
     /// `pycode._mapdict_caches[nameindex]` (only under `not we_are_jitted()`).
@@ -1326,7 +1326,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
 
     /// STORE_ATTR threaded with the bytecode `nameindex` for the interpreter
-    /// mapdict attribute cache (pyopcode.py:917-926). The default ignores
+    /// mapdict attribute cache (pyopcode.py). The default ignores
     /// `nameindex` and runs the uncached path; PyFrame overrides it to consult
     /// `pycode._mapdict_caches[nameindex]` (only under `not we_are_jitted()`).
     fn store_attr_cached(&mut self, name: &str, _nameindex: usize) -> Result<(), PyError>

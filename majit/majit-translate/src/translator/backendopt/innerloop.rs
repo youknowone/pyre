@@ -41,12 +41,12 @@ pub struct Loop {
 }
 
 /// `find_inner_loops(graph, check_exitswitch_type=None)` at
-/// `innerloop.py:17-120`.
+/// `innerloop.py`.
 ///
 /// Enumerate what look like the innermost loops of the graph. Returns a
 /// list of non-overlapping [`Loop`] instances.
 ///
-/// The heuristic (`innerloop.py:21-39`): of the cycles found, prefer the
+/// The heuristic (`innerloop.py`): of the cycles found, prefer the
 /// one with more variables that stay constant across the whole cycle
 /// (an inner loop sits inside loops with fewer constants), breaking ties
 /// toward fewer blocks; the head is the first `Bool`-switching two-exit

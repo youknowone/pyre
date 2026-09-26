@@ -1,7 +1,7 @@
 //! `pypyjit` module — PyPy: pypy/module/pypyjit/
 //!
 //! Exposes `set_param`, the runtime JIT-parameter control from
-//! `interp_jit.py:138-167`. The JIT itself lives in the higher `pyre-jit`
+//! `interp_jit.py`. The JIT itself lives in the higher `pyre-jit`
 //! crate, so this routes through the `SET_JIT_PARAM_STRING_HOOK` /
 //! `SET_JIT_PARAM_HOOK` that pyre-jit registers at boot (`call.rs`). Because
 //! the hooks are in-process function pointers rather than an env lever, a

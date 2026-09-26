@@ -469,7 +469,7 @@ pub enum DescrOperand {
 /// AbstractDescr` on a residual call. Upstream's calldescr carries both
 /// the flavor (EffectInfo) and the ordered arg-types used by `bh_call_*`
 /// to rebuild the C-function parameter list from `args_i` / `args_r` /
-/// `args_f` pools (`rpython/jit/backend/llsupport/llmodel.py:816-839
+/// `args_f` pools (`rpython/jit/backend/llsupport/llmodel.py bh_call_i
 /// bh_call_*` + `calldescr.call_stub_*`). pyre needs both pieces at
 /// dispatch time.
 ///
@@ -501,7 +501,7 @@ pub struct CallDescrStub {
     /// the descr-side answer against the opname-tail-derived `ResKind`
     /// it would have computed independently — RPython's invariant is
     /// that the two MUST agree per `descr.create_call_stub` /
-    /// `descr.result_type` round-trip in `descr.py:670-674`.
+    /// `descr.result_type` round-trip in `descr.py`.
     pub result_kind: Option<Kind>,
     /// True when a void-recorded residual call targets an `extern "C"`
     /// helper that returns an ignored machine word.  The opname tail and
@@ -542,7 +542,7 @@ impl Descr for CallDescrStub {
 ///
 /// The cache lives on the active [`super::codewriter::CodeWriter`]
 /// instance (per-instance like RPython's
-/// `gc_ll_descr.gc_cache._cache_call`, `backend/llsupport/descr.py:14`),
+/// `gc_ll_descr.gc_cache._cache_call`, `backend/llsupport/descr.py GcCache`),
 /// reached via the thread-local `CodeWriter::instance()` singleton.
 /// Each entry shares its `Arc` across the inline SSARepr emitter
 /// (the `build_*_residual_call_*_insn` family below) and the graph-side
@@ -669,7 +669,7 @@ pub fn intern_call_descr_stub(
 /// `extraeffect` the producer used when registering the helper.
 ///
 /// **Panics for `MayForce` and `ReleaseGil`** — mirroring
-/// `jtransform.py:1677` (`assert not
+/// `jtransform.py` (`assert not
 /// calldescr.get_extra_info().check_forces_virtual_or_virtualizable()`)
 /// and `pyjitpl.py do_conditional_call`'s identical assertion.
 /// Those flavors carry runtime-resolved EI fields.  Code paths that
@@ -735,7 +735,7 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
 /// `generate_last_exc` emits a `last_exception` Insn that produces the
 /// type via TLS, so eliding the `type` HLOp itself is safe (the
 /// Variable's color stays allocated and gets written by
-/// `last_exception` at the catch landing).  Upstream `rclass.py:828
+/// `last_exception` at the catch landing).  Upstream `rclass.py
 /// rtype_type` rewrites this to `getfield_gc_r(v, '__class__')` —
 /// pyre's runtime exception model bakes type into per-subclass
 /// `W_TypeObject`, so the
@@ -743,18 +743,18 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
 ///
 /// `getattr` is NOT in this set: the LoadAttr arm records the 4-arg
 /// rtyper-surrogate shape that [`lower_getattr_hlop_to_insn`] lowers
-/// to the `load_attr_fn` residual call (upstream `rclass.py:838
+/// to the `load_attr_fn` residual call (upstream `rclass.py
 /// rtype_getattr` would rewrite the HLOp post-rtyping; pyre's lowering
 /// arm is the surrogate for that pass).
 ///
 /// `setattr` — emitted by `codewriter.rs::emit_frontend_setattr`
-/// mirroring `flowcontext.py:1031-1036 op.setattr(w_obj,
+/// mirroring `flowcontext.py STORE_ATTR op.setattr(w_obj,
 /// w_attributename, w_newvalue)`.  Same shape as `getattr`: the
 /// `StoreAttr` arm (codewriter.rs) pairs it with an inline
 /// `emit_abort_permanent!`, so the compiled trace bails to the
 /// interpreter at the `abort_permanent` Insn canonical already emits.
 /// A literal `setattr` Insn would be unreachable at runtime and
-/// undispatchable by the assembler.  Upstream `rclass.py:859
+/// undispatchable by the assembler.  Upstream `rclass.py
 /// rtype_setattr` rewrites to `setfield_gc(v, descr, w_value)` after
 /// rtyping; pyre's lack of rtyping keeps the HLOp unmodified.
 fn is_pyre_canonical_elidable_hlop(opname: &str) -> bool {
@@ -766,7 +766,7 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
     match flavor {
         // `EffectInfo::MOST_GENERAL` — the callee has no analyzed
         // graph, which is `graphanalyze.py`'s `top_result()`
-        // and `effectinfo.py:285-292`'s `EF_RANDOM_EFFECTS` promotion,
+        // and `effectinfo.py`'s `EF_RANDOM_EFFECTS` promotion,
         // not the `graphanalyze.py analyze_external_call`
         // `bottom_result()` reserved for external C functions.
         CallFlavor::Plain => majit_metainterp::default_effect_info(),
@@ -781,7 +781,7 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         // (non-elidable + `_canraise(op) == False`). Same
         // analyzer-empty external-call shape as `Plain`, just with
         // `extraeffect=CannotRaise` so `check_can_raise()`
-        // (`effectinfo.py:236 extraeffect > EF_CANNOT_RAISE`) returns
+        // (`effectinfo.py extraeffect > EF_CANNOT_RAISE`) returns
         // false and the walker omits the trailing `GUARD_NO_EXCEPTION`.
         CallFlavor::PlainCannotRaise => majit_metainterp::cannot_raise_effect_info(),
         // `EF_CANNOT_RAISE` + analyzer-confirmed "no heap touched".
@@ -808,7 +808,7 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         //
         // Nothing is lost by the promotion: `EF_RANDOM_EFFECTS` (7) is
         // `>=` `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` (6) at
-        // `effectinfo.py:249-250`, so `check_forces_virtual_or_
+        // `effectinfo.py`, so `check_forces_virtual_or_
         // virtualizable()` still holds and `pyjitpl.py:2007-2008` still
         // selects the `CALL_MAY_FORCE_*` opcode with its vable/vref
         // preparation. The added effect is `heap.py:460`'s
@@ -897,7 +897,7 @@ pub fn unresolved_release_gil_effect_info_for_via_target() -> majit_ir::EffectIn
 /// `random_effects` upgrade for release-gil callees), which makes
 /// `check_forces_virtual_or_virtualizable()` (`>= 6`) also return
 /// true on those EI values.  The early `is_call_release_gil()` check
-/// keeps the dispatch branch aligned with `pyjitpl.py:2063`, where the
+/// keeps the dispatch branch aligned with `pyjitpl.py`, where the
 /// release-gil sub-case is selected inside the outer forces branch.
 pub fn dispatch_kind_for_effect_info(ei: &majit_ir::EffectInfo) -> CallFlavor {
     use majit_ir::ExtraEffect;
@@ -941,7 +941,7 @@ pub fn dispatch_kind_for_effect_info(ei: &majit_ir::EffectInfo) -> CallFlavor {
 pub enum CallFlavor {
     /// Plain residual call to a callee no analyzer has looked at.
     /// Resolves to `EffectInfo::MOST_GENERAL` (`EF_RANDOM_EFFECTS`,
-    /// `effectinfo.py:271-273`), the `graphanalyze.py:109-112`
+    /// `effectinfo.py`), the `graphanalyze.py:109-112`  allow-line-citation
     /// no-graph `top_result()` outcome. Producers that know more pick
     /// one of the flavors below.
     Plain,
@@ -975,7 +975,7 @@ pub enum CallFlavor {
     /// `EffectInfo::const_new(CannotRaise, None)` — `extraeffect=CannotRaise`,
     /// every six `_*_descrs_*` raw set + `*_descrs_*` bitstring =
     /// `Some(Vec::new())`, `can_collect=true`. This is the PyPy
-    /// `effectinfo.py:293-299` else-branch shape (analyzer-empty
+    /// `effectinfo.py` else-branch shape (analyzer-empty
     /// `effects` is `bottom_result()` per `graphanalyze.py`, not
     /// `top_set`), distinct from `MOST_GENERAL`. Producers that can
     /// additionally prove "no heap touched + no GC" should use
@@ -1261,7 +1261,7 @@ pub struct GraphFlattener<'a> {
     ///
     /// `enforce_input_args` reads `self.graph.startblock.inputargs`
     /// (`flatten.py`) and `generate_ssa_form` recurses from
-    /// `self.graph.startblock` (`flatten.py:104`).
+    /// `self.graph.startblock` (`flatten.py`).
     graph: &'a super::flow::FunctionGraph,
     /// `rpython/jit/codewriter/flatten.py self.regallocs = regallocs`.
     ///
@@ -1279,11 +1279,11 @@ pub struct GraphFlattener<'a> {
     /// cpu)` threads the LLGraphCPU through so `make_exception_link`
     /// can read `self.cpu.rtyper.exceptiondata.
     /// get_standard_ll_exc_instance_by_class(OverflowError)` on the
-    /// `handling_ovf=True` arm (`flatten.py:166-170`).  Pyre stores it
+    /// `handling_ovf=True` arm (`flatten.py`).  Pyre stores it
     /// as a borrow; production callers thread `CodeWriter::cpu()`
     /// (`codewriter.rs`).  Test fixtures that do not exercise
     /// the overflow path leave it `None`, matching upstream's
-    /// `cpu=None` default at `flatten.py:64`.
+    /// `cpu=None` default at `flatten.py`.
     cpu: Option<&'a super::cpu::Cpu>,
     /// `rpython/jit/codewriter/flatten.py:80
     /// self._include_all_exc_links = _include_all_exc_links`.
@@ -1366,7 +1366,7 @@ impl<'a> GraphFlattener<'a> {
     ///
     /// Production callers thread `CodeWriter::cpu()` so
     /// `make_exception_link`'s `handling_ovf=True` arm can fetch the
-    /// `OverflowError` exception instance (`flatten.py:166-170`).
+    /// `OverflowError` exception instance (`flatten.py`).
     pub fn with_cpu(mut self, cpu: &'a super::cpu::Cpu) -> Self {
         self.cpu = Some(cpu);
         self
@@ -2094,7 +2094,7 @@ impl<'a> GraphFlattener<'a> {
         let Some(super::flow::ExitSwitch::Value(exitswitch)) = exitswitch else {
             // RPython `flatten.py:282-309 insert_switch_exits` is only
             // called via `insert_exits` when the block already has a
-            // Variable exitswitch (`flatten.py:107-115` dispatch by
+            // Variable exitswitch (`flatten.py` dispatch by
             // `exits.len()` + `exitswitch.concretetype`).  A None
             // exitswitch on a multi-exit block is a malformed graph
             // shape upstream would never produce; fail loud so the
@@ -2304,7 +2304,7 @@ impl<'a> GraphFlattener<'a> {
         }
     }
 
-    /// `rpython/jit/codewriter/flatten.py:88-100
+    /// `rpython/jit/codewriter/flatten.py enforce_input_args
     /// GraphFlattener.enforce_input_args` — rotate `self.regallocs[kind]`
     /// inputarg colors into `0..n-1` via `swapcolors`.
     pub fn enforce_input_args(&mut self) {
@@ -2325,7 +2325,7 @@ impl<'a> GraphFlattener<'a> {
             // and `make_return` handles both shapes.  Any other arg
             // count is a walker non-orthodoxy that fails fail-loud
             // inside `make_return` (upstream raises `Exception("?")` at
-            // `flatten.py:145`).  Pyre keeps the upstream behavior:
+            // `flatten.py`).  Pyre keeps the upstream behavior:
             // delegate to `make_return` directly.
             let args = block.borrow().inputargs.clone();
             self.make_return(&args);
@@ -2344,7 +2344,7 @@ impl<'a> GraphFlattener<'a> {
         // at entry, then ops via `serialize_op`, then `insert_exits`.
         // No per-PC anchors, no `-live-` interleaving — those come
         // from `insert_exits`' canraise path (`flatten.py`,
-        // `flatten.py:285`) and from the liveness post-pass
+        // `flatten.py`) and from the liveness post-pass
         // (`liveness.py:11-12`).  Pyre's earlier per-PC PA + `-live-`
         // interleaving here was a pyre-only adaptation for runtime
         // PC dispatch via per-PC `Insn::Label("pc{N}")`; that runtime
@@ -2640,7 +2640,7 @@ fn regalloc_color(
 /// The canonical lowering driver never emits the indirect call that is
 /// upstream's only `may_call_jitcodes=True` caller, so the residual gate
 /// is exactly `calldescr_canraise` = `effect_info.check_can_raise(false)`
-/// (`call.py calldescr_canraise` -> `effectinfo.py:232
+/// (`call.py calldescr_canraise` -> `effectinfo.py
 /// check_can_raise`), read off the trailing `CallDescrStub` operand.
 pub(super) fn insn_needs_trailing_live(insn: &Insn) -> bool {
     let Insn::Op { opname, args, .. } = insn else {
@@ -3083,7 +3083,7 @@ pub fn flatten_graph_for_test_with_lowering<'a>(
 /// Constructs the `SSARepr` internally, derives `get_register` from
 /// `regallocs[kind].getcolor(v)` (`flatten.py`), and threads
 /// `cpu` through `make_exception_link` for `handling_ovf=True` reraise
-/// targets (`flatten.py:166-170`).
+/// targets (`flatten.py`).
 ///
 /// **`LoweringContext` derivation.**
 /// Upstream's `flatten_graph` does not take a `LoweringContext` because
@@ -3375,7 +3375,7 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
 /// Per-CodeWriter context that the pre-rtype HLOp lowering arms read
 /// to reconstruct the inline-equivalent `residual_call_*` Insn.
 /// Mirrors how RPython's `flatten_graph(graph, regallocs)`
-/// (`flatten.py:60`) threads per-graph data through the
+/// (`flatten.py`) threads per-graph data through the
 /// `GraphFlattener`; pyre's pass is per-CodeWriter, but the threading
 /// shape is identical.
 ///
@@ -3402,7 +3402,7 @@ pub struct LoweringContext {
     /// `truth_fn` has signature `(ref) → int` and no scalar Int
     /// `op_val` argument.  Flavor = `MayForce` (truth_fn delegates
     /// to `opcode_ops::truth_value(obj)` which invokes Python
-    /// `__bool__` / `__len__` per PyPy `descroperation.py:265` and
+    /// `__bool__` / `__len__` per PyPy `descroperation.py` and
     /// may run user code that observes virtualizables — matches the
     /// `MayForce` bind site in `register_helper_fn_pointers` and the SSA
     /// helper at flatten.rs:`build_residual_call_r_i_insn_from_
@@ -3425,19 +3425,19 @@ pub struct LoweringContext {
     /// and bare 2-arg `getattr` HLOps pass through.
     pub getattr_fn_idx: u16,
     /// `load_name_fn` descrs-pool index.  LOAD_NAME family (single
-    /// HLOp opname `load_name`, the `pyopcode.py:945` frame-receiver
+    /// HLOp opname `load_name`, the `pyopcode.py` frame-receiver
     /// shape) lowers to `residual_call_ir_r` (`ListI([namei])` +
     /// `ListR([frame, w_name])`, Ref result) via
     /// [`lower_load_name_hlop_to_insn`].
     pub load_name_fn_idx: u16,
     /// `store_name_fn` descrs-pool index.  STORE_NAME family (single
-    /// HLOp opname `store_name`, the `pyopcode.py:855` frame-receiver
+    /// HLOp opname `store_name`, the `pyopcode.py` frame-receiver
     /// shape) lowers to `residual_call_r_v` (three Ref inputs `[frame,
     /// w_name, value]`, void result) via
     /// [`lower_store_name_hlop_to_insn`].
     pub store_name_fn_idx: u16,
     /// `store_global_fn` descrs-pool index.  STORE_GLOBAL family (single
-    /// HLOp opname `store_global`, the `pyopcode.py:567` frame-receiver
+    /// HLOp opname `store_global`, the `pyopcode.py` frame-receiver
     /// shape) lowers to `residual_call_r_v` (three Ref inputs `[frame,
     /// w_name, value]`, void result) via
     /// [`lower_store_global_hlop_to_insn`].
@@ -3470,7 +3470,7 @@ pub struct LoweringContext {
     /// source.  BUILD_TUPLE records the rtyped `pyopcode.py`
     /// shape on the graph — `new_array_clear` + argc ×
     /// `setarrayitem_gc_r` (the `@jit.unroll_safe` `popvalues` list
-    /// build, `pyframe.py:408-419`) + one `newtuple_from_array` call
+    /// build, `pyframe.py`) + one `newtuple_from_array` call
     /// (`objspace.py:332` `newtuple(list_w)`) — and
     /// [`lower_tuple_build_hlop_to_insn`] reads this index for the
     /// call op.  No arity cap: the length travels as the
@@ -3481,7 +3481,7 @@ pub struct LoweringContext {
     /// CallFlavor::Plain)` descrs-pool index.  BUILD_LIST records the
     /// `pyopcode.py` shape on the graph — `new_array_clear` + argc ×
     /// `setarrayitem_gc_r` (the `@jit.unroll_safe` `popvalues_mutable`
-    /// list build, `pyframe.py:408-419`) + one `newlist_from_array`
+    /// list build, `pyframe.py _new_popvalues`) + one `newlist_from_array`
     /// call (`newlist(list_w)`) — and [`lower_tuple_build_hlop_to_insn`]
     /// reads this index for the call op.  No arity cap: the length
     /// travels as the
@@ -4542,7 +4542,7 @@ where
         CallFlavor::Plain,
         true,
         // Tagged so the walker can run the `jit_force_quasi_immutable` test
-        // (`pyjitpl.py:1094-1118`) before executing the delete — `delitem_str`
+        // (`pyjitpl.py opimpl_jit_force_quasi_immutable`) before executing the delete — `delitem_str`
         // calls `mutated()` on a successful removal.
         majit_ir::RuntimeHelperKind::DeleteName,
     ))
@@ -4846,7 +4846,7 @@ pub fn pyobject_gcarray_bh_descr() -> BhDescr {
 }
 
 /// Lower the BUILD_TUPLE-family graph ops to their Insn shapes.
-/// The walker records the rtyped `pyopcode.py:995-998` body on the
+/// The walker records the rtyped `pyopcode.py` body on the
 /// graph and each op lowers 1:1:
 ///
 /// - `new_array_clear(Const(length)) → array` — the forced
@@ -5321,7 +5321,7 @@ pub fn build_one_int_one_ref_fn_residual_call_ir_r_insn(
 }
 
 /// Construct the BUILD_SLICE helper call.  Mirrors
-/// `pypy/interpreter/pyopcode.py:1463-1472`: argc is 2 or 3, start/stop are
+/// `pypy/interpreter/pyopcode.py`: argc is 2 or 3, start/stop are
 /// refs, and step is either a ref (argc=3) or an ignored int dummy (argc=2).
 pub fn build_build_slice_fn_residual_call_ir_r_insn(
     build_slice_fn_idx: u16,
@@ -5455,7 +5455,7 @@ pub fn build_truth_fn_residual_call_r_i_insn(
 /// invokes Python `__bool__` / `__len__` and may run arbitrary user
 /// code that observes (and therefore forces) virtualizables, matching
 /// the `MayForce` binding in `register_helper_fn_pointers` and PyPy
-/// `descroperation.py:265`.  ResKind = Int → kinds `"r"` + reskind
+/// `descroperation.py is_true`.  ResKind = Int → kinds `"r"` + reskind
 /// `'i'` → opname `"residual_call_r_i"`.
 ///
 /// Inline arg order produced here with empty
@@ -7825,7 +7825,7 @@ fn build_residual_call_r_v_insn_from_operands(
 /// `[ConstInt(fn_idx), ListI([ConstInt(idx)]), ListR([Reg(pycode)]),
 /// Descr] → Reg(Ref, dst)`.
 ///
-/// LoadConst has no frontend HLOp: `flowcontext.py:841-843` pushes a
+/// LoadConst has no frontend HLOp: `flowcontext.py` pushes a
 /// Constant into the graph shadow.  This helper is the walker/backend
 /// adaptation that materializes that value from pyre's runtime CodeObject.
 pub fn build_load_const_fn_residual_call_ir_r_insn(
@@ -8031,7 +8031,7 @@ mod tests {
         //
         // The `MayForce` semantics survive the merge: `EF_RANDOM_EFFECTS`
         // (7) `>=` `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` (6) at
-        // `effectinfo.py:249-250`, so `pyjitpl.py:2007-2008` still selects
+        // `effectinfo.py check_forces_virtual_or_virtualizable`, so `pyjitpl.py:2007-2008` still selects  allow-line-citation
         // `CALL_MAY_FORCE_*` with its vable/vref preparation.
         let plain_ei = effect_info_for_call_flavor(CallFlavor::Plain);
         let may_force_ei = effect_info_for_call_flavor(CallFlavor::MayForce);
@@ -8158,7 +8158,7 @@ mod tests {
         // so `check_can_raise(false)` reads False, matching
         // `PlainCannotRaiseNoHeap`. The two flavors differ only in the
         // analyzer-confirmed empty raw-set/`can_collect=false` shape;
-        // both drop `GUARD_NO_EXCEPTION` per `effectinfo.py:236`.
+        // both drop `GUARD_NO_EXCEPTION` per `effectinfo.py`.
         let ei = effect_info_for_call_flavor(CallFlavor::PlainCannotRaise);
         assert!(
             !ei.check_can_raise(false),
@@ -8195,7 +8195,7 @@ mod tests {
 
     #[test]
     fn label_equality_follows_name() {
-        // RPython `flatten.py:17-18` eq compares `.name`.
+        // RPython `flatten.py __eq__` eq compares `.name`.
         assert_eq!(Label::new("foo"), Label::new("foo"));
         assert_ne!(Label::new("foo"), Label::new("bar"));
     }
@@ -9516,7 +9516,7 @@ mod tests {
         // false, Some(&cpu))`.  The `handling_ovf=true` arm of
         // `make_exception_link` reaches `cpu.rtyper.exceptiondata.
         // get_standard_ll_exc_instance_by_class("OverflowError")` per
-        // flatten.py:166-170 — when the exceptiondata has been
+        // flatten.py — when the exceptiondata has been
         // pre-resolved via `resolve_standard_exception_pointers`, the
         // returned Constant carries `Signed(pointer)` with `Kind::Ref`
         // (rtyped form) and `flatten_constant_operand` lowers it to
@@ -10727,7 +10727,7 @@ mod tests {
     fn build_load_const_fn_with_const_pycode_uses_const_ref_in_listr() {
         // `_with_const_pycode` variant: same shape as the register form, but
         // the single `ListR` element is `ConstRef(pycode_const)` instead of a
-        // `Register`.  pyframe.py:509-510 promote-to-constant semantics —
+        // `Register`.  pyframe.py getcode promote-to-constant semantics —
         // non-portal callee emit sites can pass the callee's own
         // `PyCode` pointer directly without a portal vable getfield.
         let pycode_const: i64 = 0x1234_5678_dead_beefu64 as i64;
@@ -10982,7 +10982,7 @@ mod tests {
         // `_with_const_pycode` variant: same shape as the register form, but
         // the middle `ListR` element is `ConstRef(pycode_const)` instead of a
         // `Register`.  ns_reg and frame_reg remain register operands —
-        // pyframe.py:509-510 promote-to-constant applies to `self.pycode`
+        // pyframe.py getcode promote-to-constant applies to `self.pycode`
         // only; `self.w_globals` and the optional `get_builtin()` fallback
         // frame are not promoted.
         let pycode_const: i64 = 0x1234_5678_dead_beefu64 as i64;
@@ -11120,7 +11120,7 @@ mod tests {
         // BINARY_OP records `MayForce`, LoadGlobal records `Plain`.
         // Neither callee was write-analyzed, so both resolve to
         // `EffectInfo::MOST_GENERAL` (`graphanalyze.py:109-112`
-        // `top_result()` → `effectinfo.py:285-292`) and share
+        // `top_result()` → `effectinfo.py`) and share
         // `ExtraEffect::RandomEffects`. What still separates the two
         // descrs is the `runtime_helper` tag the walker dispatches on.
         let bin = build_binary_op_residual_call_ir_r_insn(7, 0, 1, 2, 3);
@@ -11712,7 +11712,7 @@ mod tests {
 
     // `_ovf` popline rewrite + handling_ovf=true reraise.
     //
-    // Tests for `rpython/jit/codewriter/flatten.py:120-204`:
+    // Tests for `rpython/jit/codewriter/flatten.py`:
     //   * `make_bytecode_block` `_ovf` validity check (lines 120-125)
     //   * `insert_exits` `_ovf` tail rewrite (lines 191-204) routed
     //     through `flatten_ovf_canraise`.
@@ -11835,7 +11835,7 @@ mod tests {
             _ => unreachable!(),
         }
         // The handling_ovf=true arm of make_exception_link emits
-        // `raise ConstRef(OverflowError)` (see flatten.py:165-170).
+        // `raise ConstRef(OverflowError)` (see flatten.py).
         let raise = ssarepr.insns.iter().find_map(|insn| match insn {
             Insn::Op { opname, args, .. } if opname == "raise" => Some(args),
             _ => None,
@@ -11924,7 +11924,7 @@ mod tests {
 
     #[test]
     fn flatten_graph_canonical_four_arg_entry_works_without_lowering_ctx() {
-        // `flatten.py:63-70` orthodox 4-arg entry.  No
+        // `flatten.py flatten_graph` orthodox 4-arg entry.  No
         // `lowering_ctx` parameter; `cpu=None` so dispatcher is
         // disabled and pre-rtype HLOp opnames passthrough.
         use crate::jit::flow::{Block, FunctionGraph};
@@ -11956,7 +11956,7 @@ mod tests {
 
     #[test]
     fn flatten_graph_with_regallocs_canonical_entry_returns_ssarepr() {
-        // `flatten.py:63-70` orthodox entry.
+        // `flatten.py flatten_graph` orthodox entry.
         // Build a trivial portal-like graph with a single
         // `loop_header` op (passthrough family — no LoweringContext
         // arm needs to fire) and verify the canonical entry returns a

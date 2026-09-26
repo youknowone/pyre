@@ -188,7 +188,7 @@ fn dict_backing_or_type_error(
 }
 
 /// `interp_dict.py reversed_dict` — `W_DictMultiObject.descr_reversed`
-/// (`dictmultiobject.py:207`): a reverse iterator over the dict keys, resolved
+/// (`dictmultiobject.py`): a reverse iterator over the dict keys, resolved
 /// through the backing dict so a subclass `__reversed__` is bypassed.
 fn reversed_dict(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let backing = dict_backing_or_type_error(args[0], "reversed_dict")?;
@@ -201,7 +201,7 @@ fn reversed_dict(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
 }
 
 /// `interp_dict.py move_to_end` — `W_DictMultiObject.nondescr_move_to_end`
-/// (`dictmultiobject.py:221`): move an existing key to the back (`last`, the
+/// (`dictmultiobject.py`): move an existing key to the back (`last`, the
 /// default) or front of the insertion order.  `@unwrap_spec(last=bool)`: `last`
 /// may be supplied positionally or by keyword and is coerced by truthiness.
 fn move_to_end(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {

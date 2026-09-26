@@ -1417,7 +1417,7 @@ while i < 60:
 }
 
 /// `PyCode.co_consts_w` owns the one wrapped object for each constant index
-/// (`pycode.py:126`, `pyopcode.py:498-499`). A large integer constant is a
+/// (`pycode.py`, `pyopcode.py:498-499`). A large integer constant is a  allow-line-citation
 /// managed `W_LongObject`; the Box-immortal PyCode therefore has to expose the
 /// filled slot to the raw-root walker across both interpreter and JIT loads.
 #[test]

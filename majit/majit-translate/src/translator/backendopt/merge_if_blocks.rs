@@ -62,7 +62,7 @@ fn is_chain_block(block: &BlockRef, first: bool) -> bool {
 }
 
 /// Mirror of upstream's "the constant is hashable" filter at
-/// `merge_if_blocks.py:24-30`. Python's `hash(value)` raises
+/// `merge_if_blocks.py`. Python's `hash(value)` raises
 /// `TypeError` on `list` / `dict` / `set` and on tuples that
 /// transitively contain an unhashable element. Tuples of hashable
 /// values (the realistic shape in eq-chain constants) hash fine
@@ -102,7 +102,7 @@ fn is_falsy(value: &ConstValue) -> bool {
 }
 
 /// RPython `merge_chain(chain, checkvar, varmap, graph)`
-/// (`merge_if_blocks.py:33-61`).
+/// (`merge_if_blocks.py`).
 ///
 /// * `chain` — list of `(block, case_const)` pairs, in chain order.
 /// * `checkvar` — the Variable that the first block compares against
@@ -425,7 +425,7 @@ fn add_to_varmap(varmap: &mut HashMap<Variable, LinkArg>, var: &LinkArg, newvar:
 }
 
 /// RPython `merge_if_blocks(graph, verbose=True)` at
-/// `merge_if_blocks.py:124-132`.
+/// `merge_if_blocks.py`.
 ///
 /// `verbose` mirrors upstream's `verbose=True` keyword. Upstream
 /// uses it to choose between `log("merging blocks in %s" %

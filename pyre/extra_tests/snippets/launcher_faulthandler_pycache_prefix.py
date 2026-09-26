@@ -85,7 +85,7 @@ assert state() == (False, None)
 # -- faulthandler
 # `run_command_line` installs nothing at all unless `'faulthandler' in
 # sys.builtin_module_names`, and that guard is not decoration: pypy drops the
-# module from `working_modules` on Windows (`pypy/config/pypyoption.py:78`), so
+# module from `working_modules` on Windows (`pypy/config/pypyoption.py`), so
 # on that one pairing every spelling below is a no-op by upstream's own rule
 # rather than by a divergence.  Taking the guard here keeps the lane asserting
 # something on that build instead of skipping it, and costs nothing where the

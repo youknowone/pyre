@@ -2320,7 +2320,7 @@ pub fn parse_to_object_with_opts(
     feature_version: i64,
 ) -> crate::PyResult {
     // The tokenizer sees a source whose line terminators are all `\n`
-    // (`pytokenizer.py:654-662`), so the same rewrite runs here; the nodes and
+    // (`pytokenizer.py universal_newline`), so the same rewrite runs here; the nodes and
     // the text `module_to_object` slices segments out of then agree.
     let source = &*crate::compile::universal_newline(source);
     // A comment leaves no node behind, so a `type_comments=True` parse reads
@@ -3879,7 +3879,7 @@ impl Converter<'_> {
     }
 
     /// The literal an `=` conversion echoes.  `fstring_find_expr`
-    /// (fstring.py:279) takes it as one slice of the source, from the start of
+    /// (fstring.py) takes it as one slice of the source, from the start of
     /// the expression through the `=` and the whitespace after it; the parser
     /// here hands over that frame as the text on either side of the
     /// expression, so the slice is put back together from the two.
@@ -4034,7 +4034,7 @@ impl Converter<'_> {
         Ok(match value {
             ast::Number::Int(value) => {
                 // Ruff's Int stores an overflowing non-decimal literal by
-                // its original token spelling.  PyPy astbuilder.py:4-67
+                // its original token spelling.  PyPy astbuilder.py parse_number
                 // routes that spelling through `_string_to_int_or_long`
                 // with the token's radix instead of decimal int().
                 let spelling = value.to_string();
@@ -4432,7 +4432,7 @@ fn class_name(object: PyObjectRef) -> &'static str {
 }
 
 /// A value of a `JoinedStr` under construction.  `add_constant_string`
-/// (fstring.py:23) folds a piece into the `Constant` before it, keeping that
+/// (fstring.py) folds a piece into the `Constant` before it, keeping that
 /// node's start and taking the new end, and an empty piece is dropped
 /// (`f_string_to_ast_node`, fstring.py); what the parser kept apart -- an
 /// implicit concatenation, the text an `=` conversion echoes -- therefore

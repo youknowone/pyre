@@ -70,17 +70,17 @@ fn w_long64(buf: &mut Vec<u8>, x: i64) {
     w_long(buf, x >> 32);
 }
 
-/// rmarshal.py:129-131
+/// rmarshal.py dump_none
 pub fn dump_none(buf: &mut Vec<u8>) {
     buf.push(TYPE_NONE);
 }
 
-/// rmarshal.py:140-145
+/// rmarshal.py dump_bool
 pub fn dump_bool(buf: &mut Vec<u8>, x: bool) {
     buf.push(if x { TYPE_TRUE } else { TYPE_FALSE });
 }
 
-/// rmarshal.py:157-164 (client) / _marshal.py:108-116 (controller).
+/// rmarshal.py dump_int (client) / _marshal.py (controller).
 pub fn dump_int(buf: &mut Vec<u8>, x: i64, flavor: IntFlavor) {
     match flavor {
         IntFlavor::Rmarshal => {
@@ -111,7 +111,7 @@ pub fn dump_string(buf: &mut Vec<u8>, s: &[u8]) {
 /// byte.
 ///
 /// The wire field is `'f'` + one length byte + an ASCII float that the peer
-/// parses back with `float()` (`rmarshal.py:215-221` / `_marshal.py:...`). The
+/// parses back with `float()` (`rmarshal.py` / `_marshal.py:...`). The
 /// single length byte caps the text at 255 chars, so `%.17g` is the right
 /// choice: it always round-trips and stays compact (it uses an exponent for
 /// large/small magnitudes), unlike a plain decimal expansion. The controller
@@ -219,7 +219,7 @@ fn pack_g(buf: &mut Vec<u8>, v: f64) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Source of more bytes when the loader runs out. `rmarshal.Loader.need_more_data`
-/// (`rmarshal.py:292`) errors; `rsandbox.FdLoader` (`rsandbox.py`) reads the
+/// (`rmarshal.py`) errors; `rsandbox.FdLoader` (`rsandbox.py`) reads the
 /// pipe. Returning an empty `Vec` signals EOF.
 pub trait NeedMore {
     fn need_more(&mut self) -> SandboxResult<Vec<u8>>;
@@ -298,7 +298,7 @@ impl<N: NeedMore> Loader<N> {
         Ok(())
     }
 
-    // rmarshal.py:312-317
+    // rmarshal.py readchr
     fn readchr(&mut self) -> SandboxResult<u8> {
         self.ensure(self.pos + 1)?;
         let c = self.buf[self.pos];
@@ -306,7 +306,7 @@ impl<N: NeedMore> Loader<N> {
         Ok(c)
     }
 
-    // rmarshal.py:319-323
+    // rmarshal.py peekchr
     fn peekchr(&mut self) -> SandboxResult<u8> {
         self.ensure(self.pos + 1)?;
         Ok(self.buf[self.pos])

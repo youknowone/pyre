@@ -3,14 +3,14 @@
 //! **A JIT-enabled RPython build cannot be translated without a GC**, so
 //! neither should this crate run without one. `--gc=none` and `--gc=ref` are
 //! real translation options (`translationoption.py:65-82`), but they select a
-//! `gctransformer` of `"none"`/`"ref"`, and `gc.py:653-662 get_ll_description`
+//! `gctransformer` of `"none"`/`"ref"`, and `gc.py get_ll_description`
 //! resolves `GcLLDescr_<gctransformer>` against a module defining only
-//! `GcLLDescr_boehm` (`gc.py:151`) and `GcLLDescr_framework` (`gc.py:313`);
+//! `GcLLDescr_boehm` (`gc.py`) and `GcLLDescr_framework` (`gc.py`);
 //! anything else raises `NotImplementedError("GC transformer %r not supported
 //! by the JIT backend")`. Both descrs that do exist inherit `malloc_jitframe`
-//! from the base `GcLLDescription` (`gc.py:132-135`), where it is
+//! from the base `GcLLDescription` (`gc.py`), where it is
 //! `jitframe.JITFRAME.allocate` and so `lltype.malloc(JITFRAME,
-//! frame_info.jfi_frame_depth)` (`jitframe.py:50`) — a GC allocation, with no
+//! frame_info.jfi_frame_depth)` (`jitframe.py`) — a GC allocation, with no
 //! arm anywhere that puts a JITFRAME somewhere else. The matcher's own `Regex`
 //! nodes are GC objects too. Running majit's side of the comparison with no
 //! collector at all made the JIT take a fallback path that no translatable
@@ -46,7 +46,7 @@ pub fn install() {
     INSTALLED.get_or_init(|| {
         majit_gc::gc_sync::store_singleton(Box::new(majit_gc::collector::MiniMarkGC::new()));
         majit_gc::gc_sync::register_thread();
-        // `jitframe.py:49` `rgc.register_custom_trace_hook(JITFRAME, ...)` and
+        // `jitframe.py` `rgc.register_custom_trace_hook(JITFRAME, ...)` and
         // the descr-owned id every backend allocates its frames under
         // (`pyjitpl.rs register_active_backend_jitframe_gc_type`, which is
         // `eval.rs`'s own registration).

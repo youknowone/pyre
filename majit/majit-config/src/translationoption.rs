@@ -113,7 +113,7 @@ fn desc(d: OptionDescription) -> Child {
 //     "translation", "Translation Options", [...])`
 
 /// Port of upstream `translation_optiondescription` at
-/// `translationoption.py:44-282`. Every leaf option / nested
+/// `translationoption.py`. Every leaf option / nested
 /// description mirrors upstream's entry line-for-line; ordering is
 /// preserved so reviewers can diff the two files.
 fn translation_optiondescription() -> OptionDescription {

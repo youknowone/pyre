@@ -234,7 +234,7 @@ pub unsafe fn walk_signal_handler_roots_area(
 
 /// `@unwrap_spec(signum=int)` — coerce the signal-number argument to an
 /// `i32`.  The gateway `int` converter is `space.gateway_int_w`
-/// (`gateway.py:646-665` → `int_w(allow_conversion=True)`), which runs
+/// (`gateway.py` → `int_w(allow_conversion=True)`), which runs
 /// `__index__`/`__int__` and accepts `int` subclasses, so route through
 /// the matching helper rather than an exact-tag check.
 /// The unwrapped value stays machine-word wide, as the RPython `int` it

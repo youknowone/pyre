@@ -155,7 +155,7 @@ struct MetaInterpStaticData {
     /// `state::bytecode_for_address`) and from future callers that
     /// hold a `&mut MetaInterpStaticData` directly.
     canonical: majit_metainterp::MetaInterpStaticData,
-    /// Translated-mode `pyjitpl.py:2326-2342 indirectcall_dict` values for
+    /// Translated-mode `pyjitpl.py bytecode_for_address indirectcall_dict` values for
     /// frozen source-translation targets. The artifact-level dictionary maps
     /// fnaddr to dense index without decoding bodies; this owner memoizes only
     /// bodies actually requested, preserving upstream's stable JitCode object
@@ -283,7 +283,7 @@ impl MetaInterpStaticData {
         // `finish_setup_done` flag above this block keeps subsequent
         // calls idempotent. Bitstring writes land directly on each
         // descr's `ei_index` slot via `effectinfo::compute_bitstrings`
-        // (`effectinfo.py:526 descr.ei_index = …`); no process-global
+        // (`effectinfo.py descr.ei_index = …`); no process-global
         // side table.
         //
         // This staticdata is not the one the tracing `MetaInterp` owns —
@@ -438,7 +438,7 @@ impl MetaInterpStaticData {
             .rposition(|jitcode| unsafe { jitcode.raw_code() as usize } == raw_key)
     }
 
-    /// codewriter.py:67-68 / call.py:155-172 adapter: install or return the
+    /// codewriter.py:67-68 / call.py get_jitcode adapter: install or return the  allow-line-citation
     /// trace-side wrapper for `code`. When `supplied` is present it is the
     /// populated PyJitCode Arc from CodeWriter's pending-graph drain; otherwise
     /// this creates the same empty skeleton shape as CallControl.get_jitcode()
@@ -548,7 +548,7 @@ impl MetaInterpStaticData {
 ///
 /// Writes land on `AssemblerState` (the writer side); `MetaInterpStaticData`
 /// receives a fresh snapshot via the final `METAINTERP_SD.liveness_info`
-/// assignment — matching `pyjitpl.py:2264`'s
+/// assignment — matching `pyjitpl.py`'s
 /// `self.liveness_info = "".join(asm.all_liveness)` after each append.
 pub fn intern_liveness(live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> Option<u16> {
     use crate::assembler::ASSEMBLER_STATE;
@@ -697,10 +697,10 @@ pub fn blackhole_control_opcodes() -> (i32, i32, i32) {
     })
 }
 
-/// pyjitpl.py:2248-2249 module-level entry point for
+/// pyjitpl.py setup_indirectcalltargets module-level entry point for
 /// `MetaInterpStaticData::setup_indirectcalltargets`.
 ///
-/// RPython sets this at `pyjitpl.py:2262` during
+/// RPython sets this at `pyjitpl.py` during
 /// `finish_setup(codewriter, optimizer)` by piping
 /// `codewriter.assembler.indirectcalltargets` straight through.  pyre's
 /// codewriter driver calls this after every `Assembler::assemble`
@@ -715,11 +715,11 @@ pub fn setup_indirectcalltargets(targets: Vec<std::sync::Arc<majit_metainterp::j
     METAINTERP_SD.with(|r| r.borrow_mut().setup_indirectcalltargets(targets));
 }
 
-/// pyjitpl.py:2326-2343 module-level entry point for
+/// pyjitpl.py bytecode_for_address module-level entry point for
 /// `MetaInterpStaticData::bytecode_for_address`.
 ///
 /// RPython calls this from `MIFrame.do_residual_or_indirect_call`
-/// (`pyjitpl.py:2174-2186`) to check whether a `funcbox.getaddr()`
+/// (`pyjitpl.py`) to check whether a `funcbox.getaddr()`
 /// Const corresponds to a known indirect-call target.  pyre's tracer
 /// consumer routes through here.
 pub fn bytecode_for_address(
@@ -794,7 +794,7 @@ fn ensure_finish_setup() {
     });
 }
 
-/// pyjitpl.py:74: frame.jitcode — resolve the JitCode for the frame's code
+/// pyjitpl.py setup: frame.jitcode — resolve the JitCode for the frame's code
 /// object through the writer-side CallControl.get_jitcode path.
 pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     ensure_finish_setup();
@@ -1277,7 +1277,7 @@ pub unsafe fn retain_live_ref_registers(ctx: *const (), regs: *mut i64, len: usi
 ///
 /// `RAISE_VARARGS 0` and `RERAISE` both use RaiseWithExplicitTraceback.
 /// FOR_ITER's exception-match mismatch arm re-raises the value its own
-/// `catch_exception` caught — `pyopcode.py:1310` re-raises `e` untouched. It
+/// `catch_exception` caught — `pyopcode.py` re-raises `e` untouched. It
 /// keeps this frame's existing node only when the `space.next` residual
 /// attached that node; an inlined `__next__` instead leaves the callee's node
 /// at the chain head.
@@ -1788,7 +1788,7 @@ pub fn resolve_bridge_walk_entry_at(jitcode_index: i32, carried_jitcode_pc: i32)
 /// `virtualizable_boxes` layout the tracing-time vable mirror expects
 /// and hand it to `TraceCtx::init_virtualizable_boxes`. Used by both
 /// the root portal seed (`initialize_sym`) and the bridge entry rebuild
-/// (`setup_bridge_sym`). Matches RPython `virtualizable.py:139
+/// (`setup_bridge_sym`). Matches RPython `virtualizable.py
 /// load_list_of_boxes`, producing `[static_fields..., array_items...,
 /// vable_box]` (the trailing `vable_box` is appended by
 /// `init_virtualizable_boxes`).
@@ -1801,7 +1801,7 @@ pub fn resolve_bridge_walk_entry_at(jitcode_index: i32, carried_jitcode_pc: i32)
 /// * `array_items` — pre-resolved OpRefs for the heap-side
 ///   `locals_cells_stack_w` array. Entries past `array_len` are ignored;
 ///   short lists are padded with a shared const-NULL Ref so the vable
-///   mirror covers every interpreter-visible slot (virtualizable.py:109
+///   mirror covers every interpreter-visible slot (virtualizable.py
 ///   `assert len(boxes) == i + 1`).
 /// * `array_len` — the runtime PyFrame's
 ///   `locals_cells_stack_w.len()`; `init_virtualizable_boxes` stores this
@@ -2015,7 +2015,7 @@ pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
 ///
 /// This helper mirrors what production code does:
 ///   1. `setup_kind_register_banks` to size the three banks +
-///      copy-constants per `pyjitpl.py:97-119`.
+///      copy-constants per `pyjitpl.py`.
 ///   2. Place each `(stack_depth, opref)` at the semantic frame-mirror
 ///      slot `registers_r[nlocals + depth]`. Production guard capture
 ///      then materializes the color-indexed Ref bank from the same
@@ -2819,7 +2819,7 @@ impl ConcreteValue {
     /// `None` when there is no valid heap pointer to record.
     ///
     /// `locals_cells_stack_w` is declared as a W_Root array
-    /// (virtualizable.py:86-98), so slots mirror RPython `Box(W_Root)` —
+    /// (virtualizable.py read_boxes), so slots mirror RPython `Box(W_Root)` —
     /// `read_boxes` / `write_boxes` always see real boxed W_Root values.
     /// Pyre's lazy boxing means `wrapint` / `wrapfloat` emit a
     /// `NewWithVtable` OpRef without eagerly allocating a `W_IntObject` /
@@ -2959,14 +2959,14 @@ pub struct PyreSym {
     #[vable(nlocals)]
     pub(crate) nlocals: usize,
     /// Bridge-specific override for the locals slice of registers_r.
-    /// resume.py:1042 parity: when set, init_symbolic uses these OpRefs
+    /// resume.py rebuild_from_resumedata parity: when set, init_symbolic uses these OpRefs
     /// (mapped from RebuiltValue::Box(n) in rebuild_from_resumedata) instead
     /// of the vable_array_base-based layout. This ensures bridge traces see
     /// frame locals as symbolic InputArgs, not concrete values.
     pub(crate) bridge_local_oprefs: crate::jitcode_dispatch::RegisterList,
     /// Bridge-specific override for the kept operand-stack slice of
     /// registers_r ([nlocals..nlocals+stack_only], semantic-slot == color
-    /// in that prefix). resume.py:1042 parity: setup_bridge_sym resolves
+    /// in that prefix). resume.py rebuild_from_resumedata parity: setup_bridge_sym resolves
     /// the live operand-stack temps from the guard's resume data; this
     /// preserves them so init_symbolic (which runs AFTER setup_bridge_sym
     /// in pyre's bridge launcher) does not clobber the rebuilt stack tail
@@ -3019,13 +3019,13 @@ pub struct PyreSym {
     /// opcode handlers via guard_class + getfield_gc_pure_i/_f, not at
     /// the virtualizable slot level.
     pub(crate) bridge_local_types: Option<Vec<Type>>,
-    // virtualizable.py:86-93: ALL static fields in declared order.
+    // virtualizable.py read_boxes: ALL static fields in declared order.
     // RPython's unroll_static_fields includes every field from
     // _virtualizable_; ALL must be inputarg (not info_only). The `type`
     // tag below mirrors pyframe.py's static-field declared types so the
     // macro mints `OpRef::input_arg_int/ref` matching the RPython
     // `InputArgInt`/`InputArgRef` class for that slot
-    // (resoperation.py:719/739).
+    // (resoperation.py/739).
     #[vable(inputarg, type = int)]
     pub(crate) vable_last_instr: OpRef,
     #[vable(inputarg, type = ref)]
@@ -3071,7 +3071,7 @@ pub struct PyreSym {
     // instead of reading from an external PyFrame snapshot.
     pub(crate) concrete_locals: Vec<ConcreteValue>,
     pub concrete_stack: Vec<ConcreteValue>,
-    /// pyjitpl.py:74: frame.jitcode — JitCode reference.
+    /// pyjitpl.py setup: frame.jitcode — JitCode reference.
     /// Provides both .code (CodeObject*) and .index (snapshot encoding).
     pub(crate) jitcode: *const JitCode,
     /// Namespace for global lookups (W_DictObject / W_ModuleDictObject).
@@ -3461,7 +3461,7 @@ pub struct MIFrame {
     /// `get_list_of_active_boxes`, the Python pc of the CALL whose
     /// post-residual-call `-live-`/`catch_exception` this frame must read
     /// liveness at (so encode and the marker-routed blackhole resume share
-    /// the one `-live-` the way `pyjitpl.py:194-195 pc=self.pc` does).
+    /// the one `-live-` the way `pyjitpl.py pc=self.pc` does).
     /// `None` keeps the legacy `fallthrough_pc` liveness.
     pub residual_call_pc: Option<usize>,
     /// Resume-marker twin for the loop-close guards' snapshot word.
@@ -3689,7 +3689,7 @@ pub(crate) fn int_gcarray_descr() -> DescrRef {
 }
 
 /// `Ptr(GcArray(OBJECTPTR))` — `W_ObjectObject.storage`, the mapdict
-/// attribute-value block (`mapdict.py:910` `self.storage`).
+/// attribute-value block (`mapdict.py _mapdict_init_empty` `self.storage`).
 ///
 /// Structurally the same `ItemsBlock` as [`pyobject_gcarray_descr`], with its
 /// own `W_MAPDICT_STORAGE_GC_TYPE_ID` and one property the allocation shape
@@ -3740,7 +3740,7 @@ pub(crate) fn float_gcarray_descr() -> DescrRef {
 ///
 /// All `PyFrame` field descriptors point at this SizeDescr via
 /// `FieldDescr.parent_descr` so the optimizer's `ensure_ptr_info_arg0`
-/// (`optimizer.py:478-484`) can dispatch the GETFIELD/SETFIELD branch
+/// (`optimizer.py`) can dispatch the GETFIELD/SETFIELD branch
 /// to `InstancePtrInfo` / `StructPtrInfo`. Also handed to
 /// `VirtualizableInfo::set_parent_descr` so virtualizable field
 /// descriptors share the same parent.
@@ -3766,7 +3766,7 @@ pub(crate) fn wrapint(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
 ///
 /// * `find_biggest_function()` named an inlined callee — the trace is long
 ///   because of THAT function, so it alone is disabled and the root is merely
-///   asked to retrace (pyjitpl.py:2822-2831).  The root is NOT force-finished
+///   asked to retrace (pyjitpl.py).  The root is NOT force-finished
 ///   and NOT marked dont-trace-here, and no bridge segmenting is enabled: the
 ///   next attempt is expected to fit once the callee stops being inlined.
 /// * no callee named — `prepare_trace_segmenting` (pyjitpl.py): the
@@ -3775,11 +3775,11 @@ pub(crate) fn wrapint(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
 ///
 /// Both arguments are read straight off the walk's `TraceCtx`:
 ///
-/// * `merge_key` — `if self.current_merge_points:` (pyjitpl.py:2827, 2839). A
+/// * `merge_key` — `if self.current_merge_points:` (pyjitpl.py, 2839). A
 ///   loop's outermost green key; `None` while tracing a bridge, which has no
 ///   merge point to boost.
 /// * `source_token` — `if not isinstance(self.resumekey, ResumeFromInterpDescr):`
-///   (pyjitpl.py:2849). A bridge has no room in its `ResumeGuardDescr` for the
+///   (pyjitpl.py). A bridge has no room in its `ResumeGuardDescr` for the
 ///   segmenting bit, so upstream sets it on the source `JitCellToken` instead,
 ///   where it applies to every bridge off that token. Marking the root green key
 ///   for a bridge would leave the real culprit untouched and let the same
@@ -3807,7 +3807,7 @@ pub(crate) fn note_root_trace_too_long(
         if let Some((jd_no, huge_key)) = huge_fn.clone() {
             // pyjitpl.py:2821-2822 `jd_sd.warmstate.disable_noninlinable_function(
             // greenkey_of_huge_function)`. Upstream's `dont_trace_here`
-            // (warmstate.py:679-687) is handed the greens and reaches its cell
+            // (warmstate.py) is handed the greens and reaches its cell
             // through `ensure_jit_cell_at_key`, so take the typed door when
             // the log carried one — the hash form files a comparekey-less cell
             // that no later typed lookup can match.
@@ -4007,7 +4007,7 @@ pub(crate) fn try_trace_const_boxed_int(
 /// length per array, so RPython keeps a per-box `heapc_deps[0]` slot. pyre
 /// stores list/bytes/tuple lengths as plain struct fields, so the cached
 /// value lives in `HeapCache.heap_cache[descr] -> CacheEntry`
-/// (heapcache.py:172).  `opimpl_getfield_gc_i` already does that lookup,
+/// (heapcache.py).  `opimpl_getfield_gc_i` already does that lookup,
 /// so this helper is now just a thin alias kept for source-stability
 /// with the call sites.
 #[allow(dead_code)]
@@ -4029,7 +4029,7 @@ pub(crate) fn trace_arraylen_gc(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef)
 /// `list_length`, typed list `int_items.len`).
 pub(crate) fn opimpl_arraylen_gc(ctx: &mut TraceCtx, array: OpRef, descr: DescrRef) -> OpRef {
     if let Some(cached) = ctx.heap_cache().arraylen(array) {
-        // pyjitpl.py:889-893 `_opimpl_arraylen_gc` cache hit:
+        // pyjitpl.py opimpl_getinteriorfield_gc_i `_opimpl_arraylen_gc` cache hit:
         //     if length is not None:
         //         self.metainterp.staticdata.profiler.count_ops(rop.ARRAYLEN_GC, Counters.HEAPCACHED_OPS)
         //         return lengthbox
@@ -4156,7 +4156,7 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         );
         return cached;
     }
-    // pyjitpl.py:1074-1089: quasi-immutable field handling.
+    // pyjitpl.py opimpl_record_quasiimmut_field: quasi-immutable field handling.
     // Record the field as quasi-immut known so subsequent reads skip
     // the QUASIIMMUT_FIELD op. Emit GUARD_NOT_INVALIDATED if needed.
     // NOTE: GuardNotInvalidated is NOT emitted here — it requires
@@ -4550,7 +4550,7 @@ pub(crate) fn trace_array_getitem_value(ctx: &mut TraceCtx, array: OpRef, index:
 /// Helper: project (array, index) operands and dispatch
 /// `array_sanity_load` to recover the executor-returned payload for
 /// the fresh GetarrayitemGc<I|R|F> result.  Mirrors
-/// `rpython/jit/metainterp/executor.py:117` `do_getarrayitem_gc_*`
+/// `rpython/jit/metainterp/executor.py do_getarrayitem_gc_i` `do_getarrayitem_gc_*`
 /// which reads `arraybox.getref_base()` / `indexbox.getint()` from
 /// the Box directly — pyre's `box_value` exposes the same chain (Const
 /// pool / standard-virtualizable shadow / `opref_concrete` stamp) so
@@ -5004,7 +5004,7 @@ pub(crate) fn store_live_frame_static_int(vable_ptr: usize, field_index: usize, 
 
 /// pyframe.py:107-110: `locals_cells_stack_w` length =
 /// `co_nlocals + ncellvars + nfreevars + co_stacksize`. Returns the
-/// full heap-side array length (matching `virtualizable.py:86-99
+/// full heap-side array length (matching `virtualizable.py read_boxes
 /// read_boxes` which iterates `len(lst)` over the full array).
 pub(crate) fn concrete_frame_array_len(frame: usize) -> Option<usize> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
@@ -5214,10 +5214,10 @@ impl majit_ir::QuasiImmutHandle for RecordedQuasiImmut {
 /// `pyjitpl.py:1081 QuasiImmutDescr(cpu, structbox.getref_base(), fielddescr,
 /// mutatefielddescr)` — the descr a recorded `QUASIIMMUT_FIELD` carries.
 ///
-/// Building it is what resolves the instance (`quasiimmut.py:124
+/// Building it is what resolves the instance (`quasiimmut.py
 /// get_current_qmut_instance`), so it exists for the rest of the recording,
 /// which is what arms `opimpl_jit_force_quasi_immutable`'s `mutatebox.nonnull()`
-/// (`pyjitpl.py:1112`) for a write reached later in that same trace. The
+/// (`pyjitpl.py`) for a write reached later in that same trace. The
 /// instance rides on the descr from here to `heap.py OptHeap.optimize_QUASIIMMUT_FIELD is_still_valid_for`
 /// and `compile.py register_loop_token`, so neither has to walk from
 /// the struct back to the hidden `mutate_*` slot a second time.
@@ -6555,7 +6555,7 @@ pub(crate) fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
 /// `elif not we_are_translated()` debug wipe is upstream-only
 /// (translation-time fill of stale slots with `missing`); pyre always
 /// runs the translated path. `MIFrame.setup` can be re-invoked on
-/// `free_frames_list` reused frames (`pyjitpl.py:2471`), and each call
+/// `free_frames_list` reused frames (`pyjitpl.py`), and each call
 /// re-mints `ConstClass(constants[i])` unconditionally — the fill loop
 /// here matches that.
 ///
@@ -6564,7 +6564,7 @@ pub(crate) fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
 /// 1. Grow-in-place via `resize(num_regs_and_consts, NONE)` instead of
 ///    full replacement `[missing] * num_regs_and_consts` (the
 ///    `if registers is None or len(registers) < ...` arm at
-///    `pyjitpl.py:109`). Convergence is blocked by Adaptation 2 below:
+///    `pyjitpl.py`). Convergence is blocked by Adaptation 2 below:
 ///    callers like `trace_opcode.rs` push callee args into
 ///    `sym.registers_r[0..args.len()]` BEFORE invoking this helper, and
 ///    a full replacement would zero those slots. Migrating to
@@ -6587,7 +6587,7 @@ pub(crate) fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
 ///    constant — instead of upstream's `ConstPtrJitCode` subclass
 ///    (`history.py`) that carries an `opencoder_index = -1`
 ///    cache field. Upstream uses that field to fast-path the trace
-///    encoder's pointer dedup at `opencoder.py:583-601
+///    encoder's pointer dedup at `opencoder.py _cached_const_ptr
 ///    _cached_const_ptr` (over its `_refs_dict`). Pyre lacks the
 ///    per-instance cache: every `ctx.const_ref(val)` mints a fresh
 ///    inline constant OpRef (`TraceCtx::const_ref` returns an
@@ -6693,7 +6693,7 @@ impl PyreSym {
                 pyre_interpreter::eval::get_current_exception(),
             )),
             current_exc_box: OpRef::NONE,
-            // RPython pyjitpl.py:74-78 init: registers_X[i] = CONST_NULL for
+            // RPython pyjitpl.py setup init: registers_X[i] = CONST_NULL for
             // i in num_regs. Sized lazily here — `setup_kind_register_banks`
             // resizes `registers_i` / `registers_f` once the owning JitCode is
             // bound. `registers_r` continues to be driven by the existing
@@ -6723,7 +6723,7 @@ impl PyreSym {
     /// (`history.py:220/261/307`). Per-value dedup, where it exists
     /// upstream, lives in the resume memo
     /// (`resume.rs::ResumeDataLoopMemo`'s `large_ints` / `refs` fields,
-    /// per `resume.py:148-181`), not in the constant pool. Re-entering
+    /// per `resume.py`), not in the constant pool. Re-entering
     /// this helper therefore overwrites the trailing slots with freshly
     /// minted OpRefs across all three banks, matching `copy_constants`
     /// overwrite semantics line-by-line.
@@ -6734,7 +6734,7 @@ impl PyreSym {
     /// `num_regs_and_consts_r` already in use for `registers_i` /
     /// `registers_f`.
     ///
-    /// This helper ports the full upstream `pyjitpl.py:74-90
+    /// This helper ports the full upstream `pyjitpl.py
     /// MIFrame.setup` body (resize + `copy_constants`).  Pyre still keeps
     /// `registers_r` as the semantic frame mirror for stack/local writes;
     /// guard capture materializes the post-regalloc-color Ref bank from
@@ -6901,7 +6901,7 @@ impl PyreSym {
             // pyre-jit's `eval.rs`), while the resume payload still carries the
             // root depth; heap state is rebuilt from
             // resume boxes, never the reverse (rebuild_state_after_failure,
-            // pyjitpl.py:3424-3461).
+            // pyjitpl.py).
             self.valuestackdepth
         } else {
             concrete_stack_depth(concrete_frame).unwrap_or(nlocals)
@@ -6913,7 +6913,7 @@ impl PyreSym {
         } else {
             frame_locals_cells_stack_array(ctx, self.frame)
         };
-        // RPython pyjitpl.py:74-78 init analogue for the local-slot view
+        // RPython pyjitpl.py setup init analogue for the local-slot view
         // of registers_r. The bridge override / vable inputarg / NONE
         // shape is the per-trace seed; subsequent load_local_value /
         // store_local_value updates the per-color slot directly.
@@ -6932,7 +6932,7 @@ impl PyreSym {
                 vec![OpRef::NONE; nlocals]
             },
         );
-        // RPython resume.py:1042 parity: bridge traces enter with the
+        // RPython resume.py rebuild_from_resumedata parity: bridge traces enter with the
         // failing guard's saved boxes, NOT with the loop's full
         // virtualizable inputarg layout. Each `bridge_local_oprefs[i]`
         // points at the bridge inputarg slot the rebuilt frame placed in
@@ -7925,7 +7925,7 @@ impl PyreJitState {
             return false;
         };
         // Heap is the single source of truth — no state-backed fields to
-        // flush.  Only the vable_token needs resetting (virtualizable.py:218
+        // flush.  Only the vable_token needs resetting (virtualizable.py clear_vable_token
         // force_now: set vable_token to TOKEN_NONE).
         unsafe {
             info.reset_vable_token(frame_ptr);
@@ -7942,7 +7942,7 @@ impl PyreJitState {
 /// Decode one inlined-callee resume frame
 /// (`resume_data.frames[i]`, `i >= 1`) into a [`ReconstructRecipe`] for the
 /// multi-frame bridge carrier. Mirrors the per-bank `consume_boxes` decode
-/// `setup_bridge_sym` runs for the portal frame (resume.py:1054) but writes a
+/// `setup_bridge_sym` runs for the portal frame (resume.py) but writes a
 /// fresh recipe instead of the root `sym`, and emits NO trace IR (the
 /// forward-call guard_value / callee-frame helper / no-exception guard belong
 /// to a call with a LIVE caller; a reconstructed suspended frame has none).
@@ -8233,7 +8233,7 @@ fn reconstruct_inline_recipe(
     if !code_ref.cellvars.is_empty() {
         decline!("FreshCellvars");
     }
-    // pyframe.py:128-132 get_w_globals_storage(): the reconstructed callee frame's
+    // pyframe.py get_w_globals get_w_globals_storage(): the reconstructed callee frame's
     // globals come from its own pycode (`assemble_bridge_inline_pending`
     // resolves them the same way via `recover_inline_callee_globals`). If the
     // callee code never ran under known globals (no live wrapper recovers a
@@ -8244,7 +8244,7 @@ fn reconstruct_inline_recipe(
     }
     let frame_nlocals = code_ref.varnames.len();
     // PyPy's MIFrame register prefix and PyFrame's physical stack base include
-    // cell/freevar slots (`pyframe.py:107-111`). All semantic slot/color maps
+    // cell/freevar slots (`pyframe.py`). All semantic slot/color maps
     // below are keyed to that full prefix, so treat it as the recipe's
     // historical `nlocals` value. This is what keeps LOAD_DEREF attached to
     // the reconstructed callee frame rather than collapsing onto its caller.
@@ -8330,7 +8330,7 @@ fn reconstruct_inline_recipe(
     //
     // The int/float banks decode COLOR-indexed and STAY that way, unlike the
     // Ref bank which is inverted to `locals_cells_stack_w` slots below.  That
-    // array is a W_Root array (virtualizable.py:86-98), so an unboxed temp has
+    // array is a W_Root array (virtualizable.py read_boxes), so an unboxed temp has
     // no slot to invert a color into; it has no home outside the register file
     // in the first place, which is exactly how `registers_i` holds it upstream.
     // `PyreSym::registers_i` is likewise read by color (trace_opcode.rs), and
@@ -9115,7 +9115,7 @@ fn prepare_bridge_pending_fields(
             // resume.py _prepare_pendingfields op-emission: replay the
             // decoded write as a bridge-entry SETFIELD_GC / SETARRAYITEM_GC and
             // seed the heapcache after recording so a later same-slot get folds
-            // against it. The pending target is always non-virtual (resume.py:441
+            // against it. The pending target is always non-virtual (resume.py
             // asserts only the fieldbox is virtual), so the bridge-body read hits
             // the plain get heapcache path with no on-hit sanity load, and the
             // replayed store runs at bridge entry before any body op.
@@ -9177,7 +9177,7 @@ fn decode_tagged_concrete(
             storage.rd_consts()[ci].as_raw_i64()
         }
         TAGVIRTUAL => {
-            // resume.py:278-284 nested virtuals are numbered negatively;
+            // resume.py assign_number_to_virtual nested virtuals are numbered negatively;
             // getvirtual resolves them via Python negative list indexing
             // into rd_virtuals (resume.py:951-954).
             let vidx = if val < 0 {
@@ -9404,7 +9404,7 @@ fn setarrayitem_concrete_from_tagged(
     }
 }
 
-/// resume.py:1543-1552 BlackholeResumeDataReader.setinteriorfield_{int,
+/// resume.py setrawbuffer_item BlackholeResumeDataReader.setinteriorfield_{int,
 /// ref,float}: dispatch on the `InteriorFieldDescr.fielddescr` type to
 /// `cpu.bh_setinteriorfield_gc_{i,r,f}`.
 fn setinteriorfield_concrete_from_tagged(
@@ -9506,8 +9506,8 @@ fn bh_call_r_for_oopspec(
 /// `BridgeVirtualCache.concrete_ptr_cache` so shared/recursive virtuals
 /// allocate exactly once.
 ///
-/// resume.py:618-760 polymorphic dispatch by RdVirtualInfo variant.
-/// BlackholeResumeDataReader (resume.py:1430-1460) routes each kind
+/// resume.py polymorphic dispatch by RdVirtualInfo variant.
+/// BlackholeResumeDataReader (resume.py) routes each kind
 /// through the CPU backend: bh_new_with_vtable, bh_new, bh_new_array,
 /// bh_newstr, bh_newunicode, bh_call_i/r.
 fn materialize_concrete_virtual_ptr(
@@ -9565,7 +9565,7 @@ fn materialize_concrete_virtual_ptr(
             // resume.py:620 cache BEFORE filling fields (circular ref safe)
             cache.set_concrete_ptr(vidx, gcref);
             // resume.py setfields — range(len(fielddescrs)), index
-            // fieldnums[i]. The len-equality assert (resume.py:606) is in
+            // fieldnums[i]. The len-equality assert (resume.py) is in
             // debug_prints, not this allocate path: a short fieldnums raises
             // IndexError here, a longer one is ignored.
             for i in 0..fielddescrs.len() {
@@ -9607,7 +9607,7 @@ fn materialize_concrete_virtual_ptr(
             let gcref = majit_ir::GcRef(ptr as usize);
             cache.set_concrete_ptr(vidx, gcref);
             // resume.py setfields — range(len(fielddescrs)), index
-            // fieldnums[i]. The len-equality assert (resume.py:606) is in
+            // fieldnums[i]. The len-equality assert (resume.py) is in
             // debug_prints, not this allocate path: a short fieldnums raises
             // IndexError here, a longer one is ignored.
             for i in 0..fielddescrs.len() {
@@ -9841,7 +9841,7 @@ fn materialize_concrete_virtual_ptr(
             } else {
                 majit_ir::descr::OopSpecIndex::UniConcat
             };
-            // resume.py:1462-1497 DirectReader concat_* resolves funcptr
+            // resume.py concat_strings DirectReader concat_* resolves funcptr
             // via callinfocollection.funcptr_for_oopspec, not a placeholder.
             let gcref = bh_call_r_for_oopspec(
                 backend,
@@ -9899,7 +9899,7 @@ fn materialize_concrete_virtual_ptr(
             } else {
                 majit_ir::descr::OopSpecIndex::UniSlice
             };
-            // resume.py:1472-1507 DirectReader slice_* passes stop =
+            // resume.py slice_string DirectReader slice_* passes stop =
             // start + length to the funcptr resolved from callinfocollection.
             let gcref = bh_call_r_for_oopspec(
                 backend,
@@ -9968,7 +9968,7 @@ fn materialize_concrete_virtual_int(
             let cic = callinfocollection.expect("allocate_raw_buffer: callinfocollection is None");
             // resume.py:1455: calldescr, _ = cic.callinfo_for_oopspec(
             //   OS_RAW_MALLOC_VARSIZE_CHAR). callinfo_for_oopspec returns
-            // (None, 0) on a missing entry (effectinfo.py:444-447) — no
+            // (None, 0) on a missing entry (effectinfo.py) — no
             // lookup-time check; the calldescr is used directly.
             let (calldescr, _) =
                 cic.callinfo_for_oopspec(majit_ir::descr::OopSpecIndex::RawMallocVarsizeChar);
@@ -9999,7 +9999,7 @@ fn materialize_concrete_virtual_int(
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                     continue;
                 }
-                // resume.py:1543 assert not descr.is_array_of_pointers()
+                // resume.py setrawbuffer_item assert not descr.is_array_of_pointers()
                 assert!(
                     descrs[i].item_type != 0,
                     "setrawbuffer_item: pointer arraydescr in raw buffer"
@@ -10078,7 +10078,7 @@ fn materialize_concrete_virtual_int(
 /// ResumeGuardExcDescr analog for bridge walks.
 ///
 /// `setup_bridge_sym` runs after guard-failure resume has rebuilt the live
-/// frame. Per `pyjitpl.py:3125-3173`, only a
+/// frame. Per `pyjitpl.py _prepare_exception_resumption`, only a
 /// ResumeGuardExcDescr/ResumeGuardCopiedExcDescr source guard carries the
 /// pending exception into bridge tracing. Non-exception guards do not seed
 /// standing exception state, and operand-stack values are never scanned to
@@ -10518,7 +10518,7 @@ impl JitState for PyreJitState {
         //   [vable_ptr, static_fields..., array_items...].
         let vvals = &resume_data.virtualizable_values;
         // Resume virtualizable payload mirrors RPython
-        // opencoder.py:718-725 + virtualizable.py:139-154:
+        // opencoder.py _list_of_boxes_virtualizable + virtualizable.py load_list_of_boxes:
         //   [vable, vable_static_fields..., array_items...]
         // Non-vable extra reds (e.g. `ec`) are root inputargs, not part of
         // this payload, so the boundary is NUM_VABLE_SCALARS, not
@@ -10623,7 +10623,7 @@ impl JitState for PyreJitState {
         let mut bridge_registers_r = vec![OpRef::NONE; bridge_reg_len];
         // RPython parity: after A.1 the guard-recovery path calls
         // `synchronize_virtualizable()` / `write_boxes()`
-        // (pyjitpl.py:3430) before `start_bridge_tracing`, so the
+        // (pyjitpl.py) before `start_bridge_tracing`, so the
         // physical vable image the tracer is about to read is already
         // resume-data-complete. The
         // bridge register file is therefore expected to be fully
@@ -10662,7 +10662,7 @@ impl JitState for PyreJitState {
         // mirror is slot-indexed and authoritative.  The Int and Float banks
         // (`sym.registers_i` / `sym.registers_f`) are pure scalar register reds
         // with no operand-stack slot mirror, so they reconstruct concrete at the
-        // consume stage directly — matching `resume.py:1052-1055
+        // consume stage directly — matching `resume.py
         // rebuild_from_resumedata` → `consume_boxes(f.get_current_position_info(),
         // registers_i, registers_r, registers_f)`, which fills all three banks
         // uniformly at the guard's resume position.  A resolved `-live-`
@@ -10821,7 +10821,7 @@ impl JitState for PyreJitState {
                 stack_only,
             );
         }
-        // virtualizable.py:86-98 + pyjitpl.py synchronize_virtualizable:
+        // virtualizable.py read_boxes + pyjitpl.py synchronize_virtualizable:
         // the frame's `locals_cells_stack_w` array (the vable image) is the
         // authoritative post-guard source for the frame's locals. At an
         // arbitrary interior resume pc a local slot's jitcode color may hold
@@ -11180,7 +11180,7 @@ impl JitState for PyreJitState {
         // local prefix with a shared const-NULL OpRef so every
         // interpreter-visible slot has a tracing-time mirror (matches
         // the portal path above).
-        // pyframe.py:107-110 + pyjitpl.py:3437: the virtualizable shape
+        // pyframe.py:107-110 + pyjitpl.py: the virtualizable shape  allow-line-citation
         // committed at portal-entry time (`nlocals + ncells +
         // max_stackdepth` array slots) does not change at guard-failure
         // resume; `rebuild_state_after_failure` writes the resume blob
@@ -11418,7 +11418,7 @@ impl JitState for PyreJitState {
             // pyjitpl.py:3438 / resume.py:1397: continue_tracing is called
             // unconditionally for every (vref, real_object) pair. The
             // is_virtual_ref(vref) guard (virtualref.py) and the
-            // `assert real_object` invariant (virtualref.py:125, ported as
+            // `assert real_object` invariant (virtualref.py, ported as
             // debug_assert!) both live inside continue_tracing itself
             // (in `virtualref.rs`) — the outer virt_ptr guard masked
             // exactly the case RPython asserts on, so do not pre-gate here.
@@ -11622,7 +11622,7 @@ impl JitState for PyreJitState {
             virtualizable_values: vable_values,
             virtualref_values: vref_values,
             storage: Some(storage.clone()),
-            // resume.py:1042 num_failargs from rd_numb header. Used by
+            // resume.py rebuild_from_resumedata num_failargs from rd_numb header. Used by
             // bridge virtual materialization (resume.py decode_box
             // negative-index normalization: `num + len(liveboxes)`).
             num_failargs,
@@ -11858,7 +11858,7 @@ impl JitState for PyreJitState {
         true
     }
 
-    /// blackhole.py:1333 parity: push outer frame for chain.
+    /// blackhole.py bhimpl_getarrayitem_gc_r parity: push outer frame for chain.
     /// Multi-frame recovery handled by blackhole chain in call_jit.rs
     /// which receives all frame sections in the typed vector.
     fn push_caller_frame(
@@ -11896,7 +11896,7 @@ impl JitState for PyreJitState {
         if info.array_fields.is_empty() {
             return Some(Vec::new());
         }
-        // virtualizable.py:86 parity: full array length read from the
+        // virtualizable.py read_boxes parity: full array length read from the
         // live heap object (`lst = getattr(virtualizable, fieldname);
         // append(len(lst))`). Upstream has no fallback — if the heap
         // isn't readable here, return `None` so the caller skips.
@@ -12106,7 +12106,7 @@ impl PyreJitState {
 /// Allocates `descr.size()` bytes aligned to 8, seeds the PyObject header
 /// (`ob_type = descr.vtable()`, `w_class = get_instantiate(vtable)`), then
 /// replays each traced field using the FieldDescr's byte offset/size/type
-/// from the SizeDescr's `all_fielddescrs()` table (resume.py:597-603
+/// from the SizeDescr's `all_fielddescrs()` table (resume.py
 /// setfields loop — `decoder.setfield(struct, num, descr)`).
 ///
 /// The vtable source is the descr itself — there is no `type_id` special-casing,
@@ -12142,13 +12142,13 @@ fn materialize_virtual_object(
         // Seed `w_class` from the type's cached instantiate pointer.  This
         // has no upstream counterpart: `OBJECT` carries the single field
         // `typeptr` (rclass.py) and `new_instance` stores only that
-        // one word (rclass.py:742-743), while `instantiate` is a slot in
+        // one word (rclass.py), while `instantiate` is a slot in
         // `OBJECT_VTABLE` (rclass.py), i.e. per class, never per
         // instance.  `heaptracker.py:66-69` skips exactly the name
         // `typeptr` and recurses into every other field of a nested header
         // struct, so upstream a second header word would be an ordinary
         // traced field — as the Python-level class is for user subclasses
-        // (`mapdict.py:751-752`, reached through the ordinary `map` field).
+        // (`mapdict.py getclass`, reached through the ordinary `map` field).
         // Tracing may therefore overwrite this via an explicit
         // `SetfieldGc(w_class)`, and the field replay below takes precedence.
         //
@@ -12800,7 +12800,7 @@ mod tests {
 
     /// Install the real `hash_w` and `hash_str` on this test thread so
     /// object/str-keyed dicts built while running interpreted Python bucket
-    /// through the single hash path (`baseobjspace.py:840-845`).  These tests
+    /// through the single hash path (`baseobjspace.py is_none`).  These tests
     /// don't go through `init_jit_hooks`, which installs the hooks at boot for
     /// the pyrex binary; the thread-local cell must be set on the test thread.
     #[allow(dead_code)]
@@ -12832,9 +12832,9 @@ mod tests {
     /// post-`make_jitcodes` state, so we install a minimal assembled
     /// jitcode with a `live/` anchor at offset 0 — every can-raise
     /// CALL_* in the tracer now emits an inline `GuardNoException`
-    /// (pyjitpl.py:2082) whose resumedata snapshot routes through
+    /// (pyjitpl.py) whose resumedata snapshot routes through
     /// `get_list_of_active_boxes` → `JitCode::get_live_vars_info`
-    /// (jitcode.py:80-93), so the test fixture must satisfy that
+    /// (jitcode.py), so the test fixture must satisfy that
     /// liveness lookup.
     fn install_test_jitcode(code: &CodeObject, code_ref: *const ()) {
         install_test_jitcode_with_liveness(code, code_ref, &[0, 0, 0], 1);
@@ -13845,7 +13845,7 @@ mod tests {
         let recorder = ctx.into_recorder();
         // A boxed W_Int reads its immutable payload with the plain
         // GetfieldGcI (purity re-derived from the descr by OptHeap). The
-        // lowbit tag-discrimination guard (rtagged.py:155) is elided because
+        // lowbit tag-discrimination guard (rtagged.py ll_unboxed_getclass) is elided because
         // `obj` is a Const (pyjitpl.py generate_guard const-skip), so no
         // guard is emitted at all.
         let payload_op = recorder
@@ -14105,7 +14105,7 @@ mod tests {
         state.set_valuestackdepth(2);
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
 
-        // virtualizable.py:86 parity: full array length, not valuestackdepth.
+        // virtualizable.py read_boxes parity: full array length, not valuestackdepth.
         assert_eq!(
             <PyreJitState as JitState>::virtualizable_array_lengths(
                 &state,
@@ -14380,7 +14380,7 @@ mod tests {
         let mut ctx = TraceCtx::for_test_types(&input_types);
         // Slots 0 (frame) and 1 (ec) are both Ref-typed per `input_types`
         // — production `init_vable_indices` mints typed `InputArgRef`
-        // variants here (resoperation.py:739, `virtualizable_gen.rs`'s
+        // variants here (resoperation.py, `virtualizable_gen.rs`'s
         // `inputargs`), so variant-aware Eq (`OpRef`'s `PartialEq`) requires
         // the matching `OpRef::input_arg_ref` shape.
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
@@ -14844,7 +14844,7 @@ pub struct PendingInlineFrame {
     /// range(len(gk)): if not gk[i].same_constant(greenboxes[i])`
     /// without the hash-collision risk a u64-only comparison carries.
     pub green_key_raw: (usize, usize),
-    /// opencoder.py:819-834: accumulated parent frame chain.
+    /// opencoder.py capture_resumedata: accumulated parent frame chain.
     pub parent_frames: Vec<ResumeFrameState>,
     pub nargs: usize,
     pub caller_result_stack_idx: Option<usize>,
@@ -14861,7 +14861,7 @@ pub struct PendingInlineFrame {
 }
 
 /// Reify one Ref-bank recipe slot as the boxed `W_Root` pointer that
-/// `locals_cells_stack_w` (a W_Root array, virtualizable.py:86-98) must
+/// `locals_cells_stack_w` (a W_Root array, virtualizable.py read_boxes) must
 /// hold. `reconstruct_inline_recipe` gates int/float banks out of multi-
 /// frame recipes, so a live slot is always `Value::Ref` (the decoded box,
 /// possibly null) and a dead slot is `Value::Void`; the int/float arms only
@@ -14921,7 +14921,7 @@ pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object:
 /// call; a reconstructed suspended frame is simply pushed.
 ///
 /// The callee frame's globals come from its OWN pycode (`recipe.code_ptr`),
-/// matching `pyframe.py:128-132 get_w_globals_storage()` where a frame's globals
+/// matching `pyframe.py get_w_globals_storage()` where a frame's globals
 /// derive from its promoted pycode rather than the caller; a cross-module
 /// inlined callee's LOAD_GLOBAL then resolves against the callee module's
 /// namespace. `execution_context` is the per-thread singleton and comes from
@@ -14948,7 +14948,7 @@ pub(crate) fn assemble_bridge_inline_pending(
     // preserves the recursion-depth / inline-position identity.
     let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
 
-    // pyframe.py:128-132 get_w_globals_storage(): a frame's globals come from its OWN
+    // pyframe.py get_w_globals get_w_globals_storage(): a frame's globals come from its OWN
     // pycode (`jit.promote(self.pycode).w_globals`), not the caller. Resolve
     // the callee's globals OBJECT for `recipe.code_ptr` — the same
     // `pycode.w_globals` the callee module exposes through its function's
@@ -14958,7 +14958,7 @@ pub(crate) fn assemble_bridge_inline_pending(
     // object, so this is non-null here.
     let w_globals = recover_inline_callee_globals(recipe.code_ptr);
 
-    // resume.py:1042-1057 newframe + reload: the decoded boxes are reloaded
+    // resume.py rebuild_from_resumedata newframe + reload: the decoded boxes are reloaded
     // into the symbolic frame below. `setup_reconstructed_callee_frame`
     // supplies the matching recording-time PyFrame for residual execution.
     // Symbolic side: mirror the FAST branch field-for-field.
@@ -15467,8 +15467,8 @@ impl Drop for MetainterpSdGuard {
 
 #[cfg(test)]
 mod indirectcalltargets_tests {
-    //! Line-by-line parity tests for `pyjitpl.py:2248-2249` and
-    //! `pyjitpl.py:2326-2343`.  Tests exercise the local
+    //! Line-by-line parity tests for `pyjitpl.py setup_indirectcalltargets` and
+    //! `pyjitpl.py bytecode_for_address`.  Tests exercise the local
     //! `MetaInterpStaticData` methods directly — independent of the
     //! thread-local `METAINTERP_SD` singleton so concurrent callers
     //! (and unrelated tests that use the thread-local) do not alias.
@@ -15497,7 +15497,7 @@ mod indirectcalltargets_tests {
         assert!(sd.bytecode_for_address(0xdeadbeef).is_none());
     }
 
-    /// `pyjitpl.py:2326-2343` hit path: registered fnaddrs resolve to
+    /// `pyjitpl.py bytecode_for_address` hit path: registered fnaddrs resolve to
     /// their JitCode.
     #[test]
     fn bytecode_for_address_returns_jitcode_when_registered() {

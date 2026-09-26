@@ -23,7 +23,7 @@
 //! - `record_exact_value(v, c)` → RECORD_EXACT_VALUE IR op
 
 // ── DEBUG_ELIDABLE_FUNCTIONS ──
-// rlib/jit.py:11
+// rlib/jit.py
 
 /// rlib/jit.py — enables runtime consistency checks on elidable functions.
 pub const DEBUG_ELIDABLE_FUNCTIONS: bool = false;
@@ -34,7 +34,7 @@ pub const DEBUG_ELIDABLE_FUNCTIONS: bool = false;
 //                   Rust users should write `#[elidable]` directly.
 
 // ── hint ──
-// rlib/jit.py:80-97
+// rlib/jit.py
 
 /// Hint for the JIT.
 ///
@@ -88,18 +88,18 @@ pub fn hint_no_access_directly<T>(x: T) -> T {
 
 /// Declare that the virtualizable was just allocated, so storing
 /// directly on it is what is wanted — `Frame.__init__` is the motivating
-/// case (`pypy/interpreter/pyframe.py:99`).  Its redirected fields are
+/// case (`pypy/interpreter/pyframe.py`).  Its redirected fields are
 /// not under the virtualizable protocol yet, so the codewriter leaves
 /// them as ordinary struct fields instead of lowering them to
 /// `getfield_vable_*` / `setfield_vable_*` and instead of admitting an
 /// array field to `vable_array_vars`
-/// (`rpython/jit/codewriter/jtransform.py:990-993`).
+/// (`rpython/jit/codewriter/jtransform.py`).
 ///
 /// Upstream this hint "has to come with access_directly=True"
-/// (`rlib/jit.py:92-93`, asserted at `rlib/jit.py:313`), because there
+/// (`rlib/jit.py`, asserted at `rlib/jit.py`), because there
 /// the two flags ride one `SomeInstance` and `access_directly` is what
 /// suppresses the `jit_force_virtualizable` call
-/// (`rpython/rtyper/rvirtualizable.py:68-69`).  Pyre dispatches one
+/// (`rpython/rtyper/rvirtualizable.py`).  Pyre dispatches one
 /// helper per kwarg and has no `hook_access_field`, so this helper alone
 /// carries the whole suppression; pair it with [`hint_access_directly`]
 /// to keep the call sites readable as the upstream pair.
@@ -128,7 +128,7 @@ pub fn hint_force_virtualizable<T>(x: T) -> T {
 }
 
 // ── promote ──
-// rlib/jit.py:100-124
+// rlib/jit.py
 
 /// Promotes a variable in a trace to a constant.
 ///
@@ -158,7 +158,7 @@ pub fn promote<T: Copy>(x: T) -> T {
 }
 
 // ── promote_string ──
-// rlib/jit.py:127
+// rlib/jit.py
 
 /// Promote a string by value (not by pointer).
 ///
@@ -169,7 +169,7 @@ pub fn promote_string<T: Copy>(x: T) -> T {
 }
 
 // ── promote_unicode ──
-// rlib/jit.py:130
+// rlib/jit.py
 
 /// Promote a unicode string by value (not by pointer).
 ///
@@ -180,24 +180,24 @@ pub fn promote_unicode<T: Copy>(x: T) -> T {
 }
 
 // ── dont_look_inside, look_inside, unroll_safe, loop_invariant ──
-// rlib/jit.py:133, 142, 151, 162
+// rlib/jit.py, 142, 151, 162
 //
 // These are decorators in RPython, implemented as proc macro attributes
 // in majit-macros: #[dont_look_inside], #[unroll_safe], #[loop_invariant].
 // `look_inside` is deprecated in RPython; no majit equivalent needed.
 
 // ── _get_args ──
-// rlib/jit.py:172
+// rlib/jit.py
 //
 // In RPython `_get_args(func)` extracts parameter names for elidable_promote
 // and look_inside_iff code generation. In majit, both proc macros collect
 // parameters from `ItemFn::sig.inputs` inline; no separate helper needed.
 
 // ── elidable_promote, purefunction_promote, look_inside_iff, oopspec, not_in_trace ──
-// rlib/jit.py:180, 203, 208, 250, 260 — all proc macros in majit-macros.
+// rlib/jit.py, 203, 208, 250, 260 — all proc macros in majit-macros.
 
 // ── isconstant ──
-// rlib/jit.py:271-279
+// rlib/jit.py
 
 /// While tracing, returns whether or not the value is currently known to be
 /// constant. This is not perfect, values can become constant later. Mostly for
@@ -205,14 +205,14 @@ pub fn promote_unicode<T: Copy>(x: T) -> T {
 ///
 /// This is for advanced usage only.
 ///
-/// rlib/jit.py:271
+/// rlib/jit.py
 #[inline(always)]
 pub fn isconstant<T: ?Sized>(_value: &T) -> bool {
     false
 }
 
 // ── isvirtual ──
-// rlib/jit.py:283-292
+// rlib/jit.py
 
 /// Returns if this value is virtual, while tracing. Can be wrong in both
 /// directions. It tries to be conservative by default, but can also sometimes
@@ -220,18 +220,18 @@ pub fn isconstant<T: ?Sized>(_value: &T) -> bool {
 ///
 /// This is for advanced usage only.
 ///
-/// rlib/jit.py:283
+/// rlib/jit.py
 #[inline(always)]
 pub fn isvirtual<T: ?Sized>(_value: &T) -> bool {
     false
 }
 
 // ── loop_unrolling_heuristic ──
-// rlib/jit.py:295-301
+// rlib/jit.py
 
 /// In which cases iterating over items of lst can be unrolled.
 ///
-/// rlib/jit.py:295
+/// rlib/jit.py loop_unrolling_heuristic
 #[inline(always)]
 pub fn loop_unrolling_heuristic<T>(lst: &[T], size: usize, cutoff: usize) -> bool {
     // rlib/jit.py — `size == 0 or (isconstant(size) and (isvirtual(lst) or size <= cutoff))`
@@ -240,12 +240,12 @@ pub fn loop_unrolling_heuristic<T>(lst: &[T], size: usize, cutoff: usize) -> boo
 }
 
 // ── we_are_jitted ──
-// rlib/jit.py:355-358
+// rlib/jit.py
 
 /// Considered as true during tracing and blackholing,
 /// so its consequences are reflected into jitted code.
 ///
-/// rlib/jit.py:355. `inline(never)` so the call survives to
+/// rlib/jit.py. `inline(never)` so the call survives to
 /// `fold_we_are_jitted_calls` (`jtransform.py` `_we_are_jitted`).
 #[inline(never)]
 pub fn we_are_jitted() -> bool {
@@ -253,7 +253,7 @@ pub fn we_are_jitted() -> bool {
 }
 
 // ── _we_are_jitted ──
-// rlib/jit.py:360-361
+// rlib/jit.py
 
 /// rlib/jit.py — `_we_are_jitted = CDefinedIntSymbolic('0 /* we are not jitted here */', default=0)`
 ///
@@ -263,52 +263,52 @@ pub fn we_are_jitted() -> bool {
 pub const _we_are_jitted: i32 = 0;
 
 // ── _get_virtualizable_token ──
-// rlib/jit.py:363-369
+// rlib/jit.py
 
 /// An obscure API to get vable token. Used by _vmprof.
 ///
-/// rlib/jit.py:363 — returns null GCREF pointer for untranslated/non-virtualizable frames.
+/// rlib/jit.py _get_virtualizable_token — returns null GCREF pointer for untranslated/non-virtualizable frames.
 #[inline(always)]
 pub fn _get_virtualizable_token<T>(_frame: &T) -> *mut () {
     std::ptr::null_mut()
 }
 
 // ── current_trace_length ──
-// rlib/jit.py:408-414
+// rlib/jit.py
 
 /// During JIT tracing, returns the current trace length (as a constant).
 /// If not tracing, returns -1.
 ///
-/// rlib/jit.py:409
+/// rlib/jit.py current_trace_length
 #[inline(always)]
 pub fn current_trace_length() -> i64 {
     -1
 }
 
 // ── jit_debug ──
-// rlib/jit.py:416-421
+// rlib/jit.py
 
 /// When JITted, cause an extra operation JIT_DEBUG to appear in
 /// the graphs.  Should not be left after debugging.
 ///
-/// rlib/jit.py:417
+/// rlib/jit.py jit_debug
 #[inline(always)]
 pub fn jit_debug(_string: &str, _arg1: i64, _arg2: i64, _arg3: i64, _arg4: i64) {}
 
 // ── assert_green ──
-// rlib/jit.py:423-428
+// rlib/jit.py
 
 /// Very strong assert: checks that 'value' is a green
 /// (a JIT compile-time constant).
 ///
-/// rlib/jit.py:425
+/// rlib/jit.py assert_green
 #[inline(always)]
 pub fn assert_green<T>(_value: &T) {}
 
 // ── AssertGreenFailed ──
-// rlib/jit.py:430-431
+// rlib/jit.py
 
-/// rlib/jit.py:430
+/// rlib/jit.py AssertGreenFailed
 #[derive(Debug)]
 pub struct AssertGreenFailed;
 
@@ -321,20 +321,20 @@ impl std::fmt::Display for AssertGreenFailed {
 impl std::error::Error for AssertGreenFailed {}
 
 // ── jit_callback ──
-// rlib/jit.py:434-457
+// rlib/jit.py
 
 /// Use as a decorator for C callback functions, to insert a
 /// jitdriver.jit_merge_point() at the start.  Only for callbacks
 /// that typically invoke more app-level Python code.
 ///
-/// rlib/jit.py:434
+/// rlib/jit.py
 ///
 /// In majit, this concept maps to `#[jit_interp]` on the callback wrapper.
 /// No standalone runtime helper is required; left as documentation for parity.
 pub const fn jit_callback(_name: &'static str) {}
 
 // ── virtual_ref ──
-// rlib/jit.py:463-473
+// rlib/jit.py
 
 /// Creates a 'vref' object that contains a reference to 'x'.  Calls
 /// to virtual_ref/virtual_ref_finish must be properly nested.  The idea
@@ -343,7 +343,7 @@ pub const fn jit_callback(_name: &'static str) {}
 /// object can escape at any point in time.  If at runtime it is
 /// dereferenced, it returns 'x', which is then forced.
 ///
-/// rlib/jit.py:465
+/// rlib/jit.py
 #[inline(always)]
 pub fn virtual_ref<T>(x: &T) -> DirectJitVRef<T> {
     // rlib/jit.py — DirectJitVRef.__init__: assert x is not None
@@ -357,11 +357,11 @@ pub fn virtual_ref<T>(x: &T) -> DirectJitVRef<T> {
 }
 
 // ── virtual_ref_finish ──
-// rlib/jit.py:475-480
+// rlib/jit.py
 
 /// See docstring in virtual_ref(x).
 ///
-/// rlib/jit.py:477
+/// rlib/jit.py
 #[inline(always)]
 pub fn virtual_ref_finish<T>(vref: &mut DirectJitVRef<T>, x: &T) {
     // rlib/jit.py:479 — keepalive_until_here(x); otherwise the whole function
@@ -370,12 +370,12 @@ pub fn virtual_ref_finish<T>(vref: &mut DirectJitVRef<T>, x: &T) {
 }
 
 // ── non_virtual_ref ──
-// rlib/jit.py:482-485
+// rlib/jit.py
 
 /// Creates a 'vref' that just returns x when called; nothing more special.
 /// Used for None or for frames outside JIT scope.
 ///
-/// rlib/jit.py:482
+/// rlib/jit.py non_virtual_ref
 #[inline(always)]
 pub fn non_virtual_ref<T>(x: &T) -> DirectVRef<T> {
     DirectVRef {
@@ -385,12 +385,12 @@ pub fn non_virtual_ref<T>(x: &T) -> DirectVRef<T> {
 }
 
 // ── InvalidVirtualRef ──
-// rlib/jit.py:487-491
+// rlib/jit.py
 
 /// Raised if we try to call a non-forced virtualref after the call to
 /// virtual_ref_finish.
 ///
-/// rlib/jit.py:487
+/// rlib/jit.py
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidVirtualRef;
 
@@ -405,7 +405,7 @@ impl std::error::Error for InvalidVirtualRef {}
 // rlib/jit.py:493
 
 // ── DirectVRef ──
-// rlib/jit.py:495-515
+// rlib/jit.py
 
 /// rlib/jit.py:498 — _state field
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -454,7 +454,7 @@ impl<T> DirectVRef<T> {
 }
 
 // ── DirectJitVRef ──
-// rlib/jit.py:517-520
+// rlib/jit.py
 
 /// rlib/jit.py — `class DirectJitVRef(DirectVRef)`
 ///
@@ -478,7 +478,7 @@ impl<T> DirectJitVRef<T> {
 }
 
 // ── _virtual_ref_finish ──
-// rlib/jit.py:522-524
+// rlib/jit.py
 
 /// rlib/jit.py — `def _virtual_ref_finish(vref, x):`
 ///
@@ -495,7 +495,7 @@ fn _virtual_ref_finish<T>(vref: &mut DirectJitVRef<T>, x: &T) {
 }
 
 // ── vref_None ──
-// rlib/jit.py:554
+// rlib/jit.py
 
 /// Pre-made vref for null/absent frames.
 ///
@@ -506,11 +506,11 @@ pub const VREF_NONE: DirectVRef<()> = DirectVRef {
 };
 
 // ── JitHintError ──
-// rlib/jit.py:559-560
+// rlib/jit.py
 
 /// Inconsistency in the JIT hints.
 ///
-/// rlib/jit.py:559
+/// rlib/jit.py JitHintError
 #[derive(Debug)]
 pub struct JitHintError(pub String);
 
@@ -523,13 +523,13 @@ impl std::fmt::Display for JitHintError {
 impl std::error::Error for JitHintError {}
 
 // ── ENABLE_ALL_OPTS ──
-// rlib/jit.py:562-563
+// rlib/jit.py
 
 /// rlib/jit.py:562
 pub const ENABLE_ALL_OPTS: &str = "intbounds:rewrite:virtualize:string:pure:earlyforce:heap:unroll";
 
 // ── PARAMETER_DOCS ──
-// rlib/jit.py:565-586
+// rlib/jit.py
 
 /// Documentation strings for each JIT parameter.
 ///
@@ -571,7 +571,7 @@ pub fn parameter_doc(name: &str) -> &'static str {
 }
 
 // ── PARAMETERS ──
-// rlib/jit.py:588-605
+// rlib/jit.py
 
 /// Default JIT parameters.
 ///
@@ -628,7 +628,7 @@ pub enum EnableOpts {
 }
 
 // ── unroll_parameters ──
-// rlib/jit.py:606
+// rlib/jit.py
 
 /// rlib/jit.py — `unroll_parameters = unrolling_iterable(PARAMETERS.items())`
 ///
@@ -654,12 +654,12 @@ pub const UNROLL_PARAMETERS: &[(&str, i64)] = &[
 ];
 
 // ── JitDriver ──
-// rlib/jit.py:610+
+// rlib/jit.py+
 //
 // Implemented in `majit-metainterp/src/jitdriver.rs` as `JitDriver<State>`.
 
 // ── _set_param ──
-// rlib/jit.py:812-816
+// rlib/jit.py
 
 /// rlib/jit.py — `def _set_param(driver, name, value)`
 ///
@@ -688,21 +688,21 @@ fn _set_param(params: &mut JitParameters, name: &str, value: i64) -> Result<(), 
 }
 
 // ── set_param ──
-// rlib/jit.py:818-822
+// rlib/jit.py
 
 /// Set a JIT parameter by name.
 ///
-/// rlib/jit.py:819 — raises ValueError on unknown name.
+/// rlib/jit.py set_param — raises ValueError on unknown name.
 pub fn set_param(params: &mut JitParameters, name: &str, value: i64) -> Result<(), JitHintError> {
     _set_param(params, name, value)
 }
 
 // ── set_param_to_default ──
-// rlib/jit.py:824-827
+// rlib/jit.py
 
 /// Set a JIT parameter to its default value.
 ///
-/// rlib/jit.py:825
+/// rlib/jit.py set_param_to_default
 pub fn set_param_to_default(params: &mut JitParameters, name: &str) -> Result<(), JitHintError> {
     for (n, default) in UNROLL_PARAMETERS {
         if *n == name {
@@ -713,13 +713,13 @@ pub fn set_param_to_default(params: &mut JitParameters, name: &str) -> Result<()
 }
 
 // ── TraceLimitTooHigh ──
-// rlib/jit.py:829-833
+// rlib/jit.py
 
 /// This is raised when the trace limit is too high for the chosen
 /// opencoder model, recompile your interpreter with 'big' as
 /// jit_opencoder_model.
 ///
-/// rlib/jit.py:829
+/// rlib/jit.py TraceLimitTooHigh
 #[derive(Debug)]
 pub struct TraceLimitTooHigh;
 
@@ -732,7 +732,7 @@ impl std::fmt::Display for TraceLimitTooHigh {
 impl std::error::Error for TraceLimitTooHigh {}
 
 // ── set_user_param ──
-// rlib/jit.py:836-874
+// rlib/jit.py
 
 /// The driver argument of `rlib/jit.py set_user_param`, specialized to the
 /// parameter storage or live driver receiving the calls. Rust represents the
@@ -761,7 +761,7 @@ impl JitParameterTarget for JitParameters {
 /// disable the JIT.  For programmatic setting of parameters, use
 /// directly `set_param`.
 ///
-/// rlib/jit.py:836
+/// rlib/jit.py
 pub fn set_user_param(
     driver: &mut impl JitParameterTarget,
     text: &str,
@@ -817,14 +817,14 @@ pub fn set_user_param(
 }
 
 // ── AsmInfo, JitDebugInfo, JitHookInterface ──
-// rlib/jit.py:1063, 1077, 1113
+// rlib/jit.py, 1077, 1113
 //
 // `AsmInfo` is implemented in `majit-backend/src/lib.rs`. `JitDebugInfo` and
 // `JitHookInterface` are debug-introspection interfaces that are not yet
 // wired to user code in majit (hooks fire through compile/bridge paths).
 
 // ── record_exact_class ──
-// rlib/jit.py:1181-1189
+// rlib/jit.py
 
 /// Assure the JIT that value is an instance of cls. This is a precise
 /// class check, like a guard_class.
@@ -908,7 +908,7 @@ pub fn record_exact_class<V: RecordExactClassValue>(value: V, cls: usize) {
 
 /// Assure the JIT that value is not None.
 ///
-/// rtyper/debug.py:23-26 — `assert x is not None; return x`
+/// rtyper/debug.py ll_assert_not_none — `assert x is not None; return x`
 ///
 /// In Rust there is no Python `None` per se; the `Option<&T>` / `Option<Box<T>>`
 /// shape is the closest analog, and `Option::expect("ll_assert_not_none")`
@@ -922,7 +922,7 @@ pub fn assert_not_none<T>(x: Option<T>) -> T {
 }
 
 // ── _jit_record_known_result ──
-// rlib/jit.py:1220-1221
+// rlib/jit.py
 
 /// Marker, special-cased by jtransform during JIT compilation.
 ///
@@ -942,18 +942,18 @@ pub fn _jit_record_known_result<T>(_known_result: T, _func_result: T) {
 // Rust lacks `*args`; see `record_known_result!`.
 
 // ── record_known_result ──
-// rlib/jit.py:1224-1239
+// rlib/jit.py
 //
 // RPython: `record_known_result(result, func, *args)`
 // Rust doesn't have *args; use the `record_known_result!` macro in lib.rs
 // which accepts any arity via variadic macro pattern.
 
 // ── record_exact_value ──
-// rlib/jit.py:1260-1265
+// rlib/jit.py
 
 /// Assure the JIT that value is the same as const_value.
 ///
-/// rlib/jit.py:1260 — `assert value == const_value; return const_value`
+/// rlib/jit.py record_exact_value — `assert value == const_value; return const_value`
 #[inline(always)]
 pub fn record_exact_value<T: Copy + PartialEq + std::fmt::Debug>(value: T, const_value: T) -> T {
     debug_assert_eq!(
@@ -964,7 +964,7 @@ pub fn record_exact_value<T: Copy + PartialEq + std::fmt::Debug>(value: T, const
 }
 
 // ── conditional_call ──
-// rlib/jit.py:1297-1316
+// rlib/jit.py
 //
 // RPython: `conditional_call(condition, function, *args)`
 //   → rtyper `jit_conditional_call(cond, funcptr, arg1, arg2, ...)` llop
@@ -986,7 +986,7 @@ pub fn record_exact_value<T: Copy + PartialEq + std::fmt::Debug>(value: T, const
 ///     function(*args)
 /// ```
 ///
-/// rlib/jit.py:1301-1316 — non-JIT runtime helper.
+/// rlib/jit.py conditional_call — non-JIT runtime helper.
 ///
 /// For JIT-compiled `#[jit_interp]` functions, use `conditional_call!` macro
 /// which takes `(condition, func_path, args...)` matching RPython's
@@ -999,7 +999,7 @@ pub fn conditional_call<F: FnOnce()>(condition: bool, function: F) {
 }
 
 // ── conditional_call_elidable ──
-// rlib/jit.py:1318-1359
+// rlib/jit.py
 //
 // Same as conditional_call: use `conditional_call_elidable!` macro for JIT.
 // The closure-based function below is a non-JIT runtime helper only.
@@ -1009,7 +1009,7 @@ pub fn conditional_call<F: FnOnce()>(condition: bool, function: F) {
 
 /// Trait expressing "falsy for `conditional_call_elidable`".
 ///
-/// rlib/jit.py:1350-1357:
+/// rlib/jit.py:
 /// - If `value` is int: falsy iff `value == 0`
 /// - Else (pointer/list/object): falsy iff `not value`
 pub trait JitCondFalsy {
@@ -1051,7 +1051,7 @@ impl<T> JitCondFalsy for Option<T> {
 }
 
 // ── conditional_call_elidable ──
-// rlib/jit.py:1321-1359
+// rlib/jit.py
 
 /// Does the same as:
 ///
@@ -1071,7 +1071,7 @@ impl<T> JitCondFalsy for Option<T> {
 /// we don't assume this function won't change anything observable.
 /// This is useful for caches.
 ///
-/// rlib/jit.py:1322 — non-JIT runtime helper.
+/// rlib/jit.py — non-JIT runtime helper.
 ///
 /// For JIT-compiled `#[jit_interp]` functions, use `conditional_call_elidable!` macro
 /// which takes `(value, func_path, args...)` matching RPython's `(value, function, *args)`.

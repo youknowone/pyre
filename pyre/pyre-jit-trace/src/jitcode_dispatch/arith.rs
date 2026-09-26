@@ -7,7 +7,7 @@
 //! The `handle` dispatch arms for the `int_*` / `float_*` / `ptr_*`
 //! opcode families funnel into these kind-parameterized recorders --
 //! the Rust analogue of the exec-generated `opimpl_*` loops in
-//! `pyjitpl.py:279-368`: read the operand register(s), record the
+//! `pyjitpl.py`: read the operand register(s), record the
 //! `OpCode`, write the recorder result into the destination bank.
 
 use super::*;

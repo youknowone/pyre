@@ -541,7 +541,7 @@ fn helper_call_target_fn_name(path: &Path) -> syn::Result<Ident> {
 /// * `_jit_loop_invariant_` — `rlib/jit.py` `@loop_invariant`.
 /// * `_jit_unroll_safe_` — `rlib/jit.py` `@unroll_safe`.
 ///
-/// `_call_aroundstate_target_` (`rffi.py:228`) is emitted separately
+/// `_call_aroundstate_target_` (`rffi.py`) is emitted separately
 /// in `expand_call_surface_attr` because it carries a 2-tuple
 /// `(funcptr, save_err)` rather than a bool.
 ///
@@ -1393,7 +1393,7 @@ fn helper_policy_tokens_for_fn(
             "jit_may_force" => quote! {
                 (#REF_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
-            // RPython `resoperation.py:1238-1248` has
+            // RPython `resoperation.py call_release_gil_for_descr` has
             // CALL_RELEASE_GIL_I/F/N only; ref-return release-gil calls
             // assert instead of producing CALL_RELEASE_GIL_R.
             "jit_release_gil" => unsupported,
@@ -1403,7 +1403,7 @@ fn helper_policy_tokens_for_fn(
             // Same restriction as ref-return helpers: explicit wrapped float
             // policies consume these targets directly, but inferred value-call
             // lowering cannot model the static float result bank.  RPython
-            // `resoperation.py:1238-1248` keeps `CALL_RELEASE_GIL_F` so
+            // `resoperation.py call_release_gil_for_descr` keeps `CALL_RELEASE_GIL_F` so
             // float release-gil helpers are legal — the wrapped lowering
             // at `jitcode_lower.rs::ReleaseGilFloatWrapped` reads
             // `__save_err` from this 6th tuple slot to thread the
@@ -1442,7 +1442,7 @@ fn emit_helper_policy_fn(
     // the type is how a caller ends up destructuring the wrong shape.
     // The trailing `i32` carries the wrapper
     // callable's `_call_aroundstate_target_[1]` (`save_err`) per
-    // `rffi.py:228`; non-`release_gil` policies emit `0i32`
+    // `rffi.py`; non-`release_gil` policies emit `0i32`
     // (`RFFI_ERR_NONE`, `rffi.py`).
     Ok(quote! {
         #[doc(hidden)]
@@ -1716,7 +1716,7 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// weight is about twice its op count and the default
 /// `DEFL_INLINE_THRESHOLD = 32.4` buys on the order of sixteen operations —
 /// described at
-/// `config/translationoption.py:11-12` as "just enough to inline
+/// `config/translationoption.py` as "just enough to inline
 /// add__Int_Int() and just small enough to prevent inlining of some rlist
 /// functions". Elidable bodies are not that size: of the 126 non-test sites
 /// this expansion covers, 54 are in `descroperation.rs` and 25 in
@@ -1734,7 +1734,7 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// (`rpython/jit/codewriter/effectinfo.py:21`), matching `call.py:297
 /// getcalldescr` where `_canraise(op) == True`.  Use
 /// `#[elidable_cannot_raise]` / `#[elidable_or_memerror]` for the
-/// other two branches of `call.py:292-299`'s 3-way pick.
+/// other two branches of `call.py`'s 3-way pick.
 #[proc_macro_attribute]
 pub fn elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_elidable_attribute(item, "elidable")
@@ -1742,7 +1742,7 @@ pub fn elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Deprecated alias for `#[elidable]`.
 ///
-/// `rlib/jit.py:75-78`:
+/// `rlib/jit.py`:
 /// ```python
 /// def purefunction(*args, **kwargs):
 ///     """Deprecated, use elidable instead."""
@@ -2127,9 +2127,9 @@ pub fn jit_may_force(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Mark a function as a release-GIL call surface.
 ///
 /// Optional `save_err = N` argument mirrors `rffi.llexternal(...,
-/// save_err=N)` (`rffi.py:80`); the parsed integer flows into the
+/// save_err=N)` (`rffi.py`); the parsed integer flows into the
 /// policy tuple's `save_err` slot, matching the second element of
-/// `_call_aroundstate_target_ = (funcptr, save_err)` (`rffi.py:228`).
+/// `_call_aroundstate_target_ = (funcptr, save_err)` (`rffi.py`).
 /// Default is `RFFI_ERR_NONE = 0` (`rffi.py`).
 #[proc_macro_attribute]
 pub fn jit_release_gil(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -2682,7 +2682,7 @@ pub fn not_in_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Deprecated alias for `#[elidable_promote]`.
 ///
-/// `rlib/jit.py:203-205`:
+/// `rlib/jit.py`:
 /// ```python
 /// def purefunction_promote(*args, **kwargs):
 ///     """Deprecated, use elidable_promote instead."""
@@ -2816,7 +2816,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // `rlib/jit.py elidable(func)` — the ORIGINAL `func` is what
     // receives `_elidable_function_ = True`; `result` (the returned
-    // wrapper, see jit.py:198-201) does NOT carry the attribute.  In
+    // wrapper, see jit.py) does NOT carry the attribute.  In
     // pyre's layout `func` becomes the hidden `_orig_<NAME>_unlikely_
     // name` and the wrapper takes the decorated name, so the const
     // lives on the renamed original.  Emitted at the user-facing `vis`
@@ -3027,7 +3027,7 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(non_upper_case_globals)]
         const #trampoline_opaque_marker: bool = false;
 
-        // rlib/jit.py:240-244 — the decorated name becomes the dispatch wrapper
+        // rlib/jit.py f — the decorated name becomes the dispatch wrapper
         // def f(*args):
         //     if not we_are_jitted() or predicate(*args):
         //         return func(*args)
@@ -3243,7 +3243,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         // `all_liveness` byte stream and dedup against the same cache.
         // RPython parity: `rpython/jit/codewriter/assembler.py` is a
         // single object that assembles every JitCode in the program
-        // (`call.py:174-189`), so liveness offsets are always relative
+        // (`call.py get_jitcode_calldescr`), so liveness offsets are always relative
         // to one shared table.
         #[doc(hidden)]
         #vis fn #helper_with_asm_name(
@@ -3526,7 +3526,7 @@ fn jit_attr_name(attr: &syn::Attribute) -> Option<String> {
 /// `CallControl::register_macro_impl_helper_trace_fnaddr` qualifies.
 /// RPython parity:
 /// `getfunctionptr(graph)`
-/// (call.py:174-187) does not distinguish free fns from methods; pyre
+/// (call.py) does not distinguish free fns from methods; pyre
 /// keys methods by the `[impl_type_joined, method]` 2-segment CallPath
 /// (lib.rs), so the macro emits exactly that.
 struct DiscoveredHelper {
@@ -3574,7 +3574,7 @@ fn impl_type_path_segments(ty: &syn::Type) -> Option<Vec<Ident>> {
 /// allows `S::f as fn(&S)`, `S::g as fn(&mut S)`, `S::h as fn(S)` to
 /// coerce to plain function pointers (verified with rustc), and RPython
 /// upstream treats `getfunctionptr(graph)` uniformly across free fns and
-/// methods (`call.py:174-187`).
+/// methods (`call.py get_jitcode_calldescr`).
 fn discover_helpers(items: &[syn::Item]) -> Vec<DiscoveredHelper> {
     let mut discovered = Vec::new();
     for item in items {

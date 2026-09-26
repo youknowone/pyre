@@ -74,7 +74,7 @@ pub use majit_jitcode::codewriter::jtransform::canonical_array_type_id;
 /// the same length-prefixed GcArray identities the front stamps on
 /// bytes-block chars, string arrays, and int/float list items. Other
 /// `[T]` / `[T; N]` spellings stay headerless — they are item runs,
-/// not those wrappers. descr.py:348-362: `nolength` is a property of
+/// not those wrappers. descr.py get_array_descr: `nolength` is a property of
 /// the ARRAY lltype, so one identity never answers both ways.
 pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
     let Some(s) = array_type_id else {

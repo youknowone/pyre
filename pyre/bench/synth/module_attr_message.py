@@ -2,7 +2,7 @@
 # `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
 # rather than any generated code, and reads whatever the host's process
 # spawn cost happens to be that run. The jitstats baselines gate it.
-# module.py:143-162 — a module attribute miss with no module-level __getattr__
+# module.py — a module attribute miss with no module-level __getattr__
 # reports the module's __name__ in the AttributeError message.
 
 import sys

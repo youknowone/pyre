@@ -48,7 +48,7 @@ use super::rtyper::{GenopResult, HighLevelOp};
 /// the Rust port currently consults.
 #[derive(Clone, Debug)]
 pub enum ExtRegistryEntry {
-    /// Upstream `lltype.py:1513-1518`:
+    /// Upstream `lltype.py _ptrEntry`:
     ///
     /// ```python
     /// class _ptrEntry(ExtRegistryEntry):
@@ -61,7 +61,7 @@ pub enum ExtRegistryEntry {
     /// The `Option<_ptr>` holds the value-level instance when the
     /// entry was constructed via [`lookup`]; `None` when constructed
     /// via [`lookup_type`] (matching upstream `Entry(tp)` /
-    /// `Entry(type=tp, instance=None)` at extregistry.py:124-126).
+    /// `Entry(type=tp, instance=None)` at extregistry.py).
     /// Upstream `_ptrEntry.compute_annotation` reads `self.instance`,
     /// so the type-level path raises `AssertionError` upstream — the
     /// Rust [`Self::compute_annotation`] surfaces the same failure as
@@ -85,10 +85,10 @@ pub enum ExtRegistryEntry {
         instance: Option<HostObject>,
         annotation: RegisteredAnnotation,
     },
-    /// Upstream `rpython/rtyper/extfunc.py:92-102`
+    /// Upstream `rpython/rtyper/extfunc.py ExtFuncEntry`
     /// `class ExtFuncEntry(ExtRegistryEntry)`.
     ExternalFunction(super::extfunc::ExtFuncEntry),
-    /// Upstream `rpython/rlib/jit.py:881-1006`:
+    /// Upstream `rpython/rlib/jit.py ExtEnterLeaveMarker`:
     ///
     /// ```python
     /// class ExtEnterLeaveMarker(ExtRegistryEntry):
@@ -99,7 +99,7 @@ pub enum ExtRegistryEntry {
     ///
     /// Upstream registers two bound methods to a single `_about_`
     /// tuple, dispatched inside `compute_result_annotation` via
-    /// `self.instance.__name__` (jit.py:889). Rust has no native bound
+    /// `self.instance.__name__` (jit.py). Rust has no native bound
     /// methods, so [`JitMarkerKind`] discriminates which member of
     /// the upstream tuple this entry stands for. The driver metadata
     /// (`greens` / `reds` / hooks) is reachable via `meta` so
@@ -109,14 +109,14 @@ pub enum ExtRegistryEntry {
         meta: Arc<JitDriverMeta>,
         marker_kind: JitMarkerKind,
     },
-    /// Upstream `rpython/rlib/jit.py:1008-1023`:
+    /// Upstream `rpython/rlib/jit.py ExtLoopHeader`:
     ///
     /// ```python
     /// class ExtLoopHeader(ExtRegistryEntry):
     ///     # _about_ = self.loop_header (bound method)
     /// ```
     LoopHeader { meta: Arc<JitDriverMeta> },
-    /// Upstream `rpython/rlib/rarithmetic.py:572-582`:
+    /// Upstream `rpython/rlib/rarithmetic.py ForTypeEntry`:
     ///
     /// ```python
     /// class ForTypeEntry(extregistry.ExtRegistryEntry):
@@ -137,7 +137,7 @@ pub enum ExtRegistryEntry {
     /// per model.py:222), so no separate `unsigned` carrier is needed
     /// here — that would duplicate state RPython does not.
     ForType { instance: HostObject },
-    /// Upstream `rpython/rlib/nonconst.py:34-42`:
+    /// Upstream `rpython/rlib/nonconst.py EntryNonConstant`:
     ///
     /// ```python
     /// class EntryNonConstant(ExtRegistryEntry):
@@ -151,7 +151,7 @@ pub enum ExtRegistryEntry {
     ///         return hop.inputarg(hop.r_result, arg=0)
     /// ```
     NonConstant,
-    /// Upstream `rpython/rlib/jit.py:396-406`:
+    /// Upstream `rpython/rlib/jit.py Entry`:
     ///
     /// ```python
     /// class Entry(ExtRegistryEntry):
@@ -173,7 +173,7 @@ pub enum ExtRegistryEntry {
     /// (`annotator/builtin.rs`, `majit_metainterp_bool_flag` →
     /// `SomeBool`), which `Bookkeeper.immutablevalue_hostobject`
     /// resolves and returns *before* the `extregistry.is_registered`
-    /// fall-through (bookkeeper.py:309-314). So this entry only ever
+    /// fall-through (bookkeeper.py). So this entry only ever
     /// fires on the rtyper's `findbltintyper` → `specialize_call`
     /// path; its `compute_annotation` is unreachable in practice and
     /// fails closed to surface a bypassed early-return loudly.
@@ -291,7 +291,7 @@ where
 /// upstream `extregistry.lookup(const)` remap.
 ///
 /// RPython `ExtRegistryEntry.__hash__` / `__eq__`
-/// (extregistry.py:43-48) key on `(self.__class__, self.type,
+/// (extregistry.py) key on `(self.__class__, self.type,
 /// self.instance)`. Rust has one enum variant per entry subclass, so
 /// the variant tag supplies `self.__class__`; these fields carry the
 /// type/instance identities.
@@ -321,7 +321,7 @@ pub enum ExtRegistryEntryKey {
         instance_identity: usize,
     },
     /// Singleton key for the `we_are_jitted` `_about_` entry
-    /// (rlib/jit.py:396). No per-instance identity — the variant tag
+    /// (rlib/jit.py). No per-instance identity — the variant tag
     /// alone supplies `self.__class__` and there is no `self.instance`.
     WeAreJitted,
     JitForceVirtualizable,
@@ -332,7 +332,7 @@ pub enum ExtRegistryEntryKey {
     Float2LongLong,
     LongLong2Float,
     /// Singleton key for the `NonConstant` `_about_` entry
-    /// (rlib/nonconst.py:34). No per-instance identity.
+    /// (rlib/nonconst.py). No per-instance identity.
     NonConstant,
 }
 
@@ -378,7 +378,7 @@ impl ExtRegistryEntry {
     }
 
     /// RPython `ExtRegistryEntry.compute_annotation_bk(self, bk)`
-    /// (extregistry.py:54-56). Stashes the bookkeeper on `self` and
+    /// (extregistry.py). Stashes the bookkeeper on `self` and
     /// dispatches to `compute_annotation`. The Rust port forwards the
     /// bookkeeper into `compute_annotation` directly via the same `&Rc`
     /// — no per-entry mutable state needed.
@@ -390,7 +390,7 @@ impl ExtRegistryEntry {
     }
 
     /// RPython `ExtRegistryEntry.compute_annotation(self)`
-    /// (extregistry.py:58-67). Subclass override per variant.
+    /// (extregistry.py). Subclass override per variant.
     pub fn compute_annotation(&self) -> Result<SomeValue, AnnotatorError> {
         match self {
             // upstream lltype.py:1517-1518:
@@ -432,7 +432,7 @@ impl ExtRegistryEntry {
             ExtRegistryEntry::ExternalFunction(entry) => {
                 Ok(SomeValue::ExternalFunction(entry.compute_annotation(false)))
             }
-            // upstream extregistry.py:58-67 base implementation —
+            // upstream extregistry.py compute_annotation base implementation —
             // marker subclasses do not override `compute_annotation`,
             // so the base returns
             // `SomeBuiltin(self.compute_result_annotation,
@@ -458,7 +458,7 @@ impl ExtRegistryEntry {
                 None,
                 Some(crate::rlib::jit::LOOP_HEADER_METHOD_NAME.to_string()),
             ))),
-            // upstream extregistry.py:58-67 base implementation —
+            // upstream extregistry.py compute_annotation base implementation —
             // `ForTypeEntry` inherits `compute_annotation` returning
             // `SomeBuiltin(self.compute_result_annotation,
             //              methodname=getattr(self.instance, '__name__', None))`.
@@ -487,7 +487,7 @@ impl ExtRegistryEntry {
             // entry (`majit_metainterp_bool_flag`) serves on the normal
             // `immutablevalue_hostobject` path, which returns before the
             // `extregistry.is_registered` fall-through
-            // (bookkeeper.py:309-314).  Returning it here keeps the
+            // (bookkeeper.py).  Returning it here keeps the
             // entry a faithful port for any path that consults it.
             ExtRegistryEntry::WeAreJitted => Ok(SomeValue::Bool(Default::default())),
             // `VirtualizableInstanceRepr.hook_access_field` emits a Void
@@ -517,7 +517,7 @@ impl ExtRegistryEntry {
             // `longlong2float.float2longlong` `BUILTIN_ANALYZERS` entry
             // (`float2longlong_analyzer`), which `immutablevalue_hostobject`
             // resolves before the `extregistry.is_registered` fall-through
-            // (bookkeeper.py:309-314). This entry only fires on the rtyper
+            // (bookkeeper.py). This entry only fires on the rtyper
             // path; returning the same `SomeInteger(r_int64)` result that
             // `Float2LongLongEntry.compute_result_annotation` produces keeps
             // it a faithful port for any path that consults it.
@@ -545,14 +545,14 @@ impl ExtRegistryEntry {
     }
 
     /// RPython `ExtEnterLeaveMarker.compute_result_annotation(self,
-    /// **kwds_s)` (rlib/jit.py:886-923) takes the keyword annotation
+    /// **kwds_s)` (rlib/jit.py) takes the keyword annotation
     /// map; the Rust port passes it as an explicit
     /// `HashMap<String, SomeValue>`. Variants that do not consume
     /// kwds delegate to [`Self::compute_annotation_bk`].
     ///
     /// `kwds_s` keys carry the upstream `'s_'` prefix so the cache
     /// shape under `Bookkeeper._jit_annotation_cache` is line-by-line
-    /// with upstream (rlib/jit.py:895
+    /// with upstream (rlib/jit.py
     /// `expected = ['s_' + name for name ...]`).
     pub fn compute_annotation_with_kwds(
         &self,
@@ -624,7 +624,7 @@ impl ExtRegistryEntry {
                 "'ExtRegistryEntry' object has no attribute 'specialize_call'",
             )),
             // Marker variants override `specialize_call` upstream
-            // (rlib/jit.py:952-1006 + 1016-1023) — but the upstream
+            // (rlib/jit.py + 1016-1023) — but the upstream
             // `entry.specialize_call` attribute returns a *bound
             // method* whose `self` carries `meta` / `marker_kind`.
             // Rust's `BuiltinTyperFn` is a capture-free function
@@ -694,7 +694,7 @@ impl ExtRegistryEntry {
             ExtRegistryEntry::Float2LongLong => {
                 Ok(super::rbuiltin::rtype_float2longlong as BuiltinTyperFn)
             }
-            // `rlib/longlong2float.py:95-98` — inverse bitcast.
+            // `rlib/longlong2float.py` — inverse bitcast.
             ExtRegistryEntry::LongLong2Float => {
                 Ok(super::rbuiltin::rtype_longlong2float as BuiltinTyperFn)
             }
@@ -716,7 +716,7 @@ impl ExtRegistryEntry {
     ///             r_green = hop.args_r[i]
     ///             v_green = hop.inputarg(r_green, arg=i)
     ///         else:
-    ///             ...  # dotted greenfield path (rlib/jit.py:965-993)
+    ///             ...  # dotted greenfield path (rlib/jit.py)
     ///         greens_v.append(v_green)
     ///     for name in driver.reds:
     ///         i = kwds_i['i_' + name]
@@ -743,7 +743,7 @@ impl ExtRegistryEntry {
     ///     return hop.genop('jit_marker', vlist, resulttype=lltype.Void)
     /// ```
     ///
-    /// Dotted greenfields (rlib/jit.py:965-993) require the
+    /// Dotted greenfields (rlib/jit.py) require the
     /// `r_red._get_field` walk + `_immutable_field` check + the
     /// `driver.ll_greenfields` registration on the runtime driver.
     /// Until those reprs and the `JitDriverMeta::ll_greenfields` slot
@@ -853,7 +853,7 @@ fn inputarg_for_name(
 }
 
 // RPython stores these as EXT_REGISTRY_BY_VALUE / EXT_REGISTRY_BY_TYPE dicts
-// (extregistry.py:115-116). HashMap is therefore the literal Rust analogue,
+// (extregistry.py). HashMap is therefore the literal Rust analogue,
 // not a side table invented for convenience.
 static HOST_VALUE_REGISTRY: OnceLock<Mutex<HashMap<HostObject, ExtRegistryEntry>>> =
     OnceLock::new();
@@ -885,7 +885,7 @@ pub(crate) fn register_host_value(
 
 /// Register `rarithmetic.r_uint` as an `ExtRegistryEntry::ForType`
 /// value-level entry mirroring upstream `ForTypeEntry(_about_=r_uint)`
-/// (rarithmetic.py:572-582).  Called from `HOST_ENV::populate_host_env`
+/// (rarithmetic.py).  Called from `HOST_ENV::populate_host_env`
 /// so the registration runs once during the first HOST_ENV access; a
 /// duplicate registration call is tolerated since `populate_host_env`
 /// is itself OnceLock-gated.

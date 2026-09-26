@@ -41,7 +41,7 @@ pub fn restartable_point(auto: Option<&str>) -> Result<(), TaskError> {
 }
 
 /// Port of upstream `restartable_point_fork(auto=None, extra_msg=None)`
-/// (`unixcheckpoint.py:7-66`).
+/// (`unixcheckpoint.py`).
 pub fn restartable_point_fork(
     auto: Option<&str>,
     extra_msg: Option<&str>,

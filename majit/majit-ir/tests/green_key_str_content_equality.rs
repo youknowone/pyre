@@ -1,6 +1,6 @@
 //! Content equality + content hash for `GreenType::Str` greens
 //! routes through pyre's `default_str_eq` / `default_str_hash` slot ABI
-//! decoder (`warmstate.py:108-128 lltype.Ptr STR/UNICODE` parity).
+//! decoder (`warmstate.py equal_whatever lltype.Ptr STR/UNICODE` parity).
 //!
 //! `equal_whatever` / `hash_whatever`'s frontend-agnostic fallback is
 //! pointer equality / `value as u64` (safe for any frontend's slot

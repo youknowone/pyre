@@ -3,7 +3,7 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 #[cfg(unix)]
-/// `lib_pypy/grp.py:14-20 class struct_group(metaclass=structseqtype)`
+/// `lib_pypy/grp.py class struct_group(metaclass=structseqtype)`
 /// — process-wide cached subclass-of-tuple type so every getgrgid /
 /// getgrnam / getgrall call materialises into the same structseq.
 static STRUCT_GROUP_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -24,7 +24,7 @@ fn struct_group_type() -> pyre_object::PyObjectRef {
 ///
 /// getgrgid / getgrnam / getgrall return a `grp.struct_group`
 /// structseq (subclass of tuple) with named fields `gr_name`,
-/// `gr_passwd`, `gr_gid`, `gr_mem` per `lib_pypy/grp.py:14-20`.
+/// `gr_passwd`, `gr_gid`, `gr_mem` per `lib_pypy/grp.py`.
 #[cfg(unix)]
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     #[cfg(feature = "host_env")]
@@ -49,7 +49,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         pyre_interpreter::_structseq::new_instance(struct_group_type(), fields.take())
     }
 
-    // `lib_pypy/grp.py:14-20 class struct_group` — exposed as
+    // `lib_pypy/grp.py class struct_group` — exposed as
     // `grp.struct_group`; every result type uses this same class.
     pyre_interpreter::module_ns_store(ns, "struct_group", struct_group_type());
     pyre_interpreter::module_ns_store(

@@ -491,7 +491,7 @@ pub unsafe extern "C" fn PyCMethod_New(
     super::object::result(new_pycfunction_in_class(method, receiver, module, class))
 }
 
-/// `methodobject.py:155 PyCMethod_GetClass(op)` — the class a `METH_METHOD`
+/// `methodobject.py call_noargs PyCMethod_GetClass(op)` — the class a `METH_METHOD`
 /// definition was declared in, borrowed, and NULL for one that is not.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCMethod_GetClass(

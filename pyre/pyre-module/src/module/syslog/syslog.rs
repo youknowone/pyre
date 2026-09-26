@@ -3,7 +3,7 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 
-/// `lib_pypy/syslog.py:35-44` — process-global tracking of whether
+/// `lib_pypy/syslog.py` — process-global tracking of whether
 /// `openlog()` has been called so the first `syslog()` can auto-open with
 /// the default libc ident (NULL → program name).
 #[cfg(all(unix, feature = "host_env"))]
@@ -90,7 +90,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
                 let msg = pyre_interpreter::baseobjspace::str_utf8_w(msg_obj)?;
                 if let Ok(cmsg) = std::ffi::CString::new(msg) {
-                    // `lib_pypy/syslog.py:42-44` — auto-call openlog() with
+                    // `lib_pypy/syslog.py` — auto-call openlog() with
                     // a NULL ident (libc falls back to argv[0]) so the
                     // first syslog() call delivers correctly even when the
                     // caller skipped openlog().

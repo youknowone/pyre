@@ -63,7 +63,7 @@ pub const PY_OBJECT_ARRAY_GC_TYPE_ID: u32 = 9;
 // `gc.register_type` returns those two here.
 
 /// GC type id for the `W_ObjectObject.storage` block — the mapdict instance
-/// attribute-value array (`mapdict.py:910` `self.storage`, a
+/// attribute-value array (`mapdict.py _mapdict_init_empty` `self.storage`, a
 /// `Ptr(GcArray(OBJECTPTR))`). Distinct from `PY_OBJECT_ARRAY_GC_TYPE_ID` (9,
 /// list/tuple items) so the block keeps its own identity even though every slot
 /// is now a reference: a boxed attribute's value, or an
@@ -443,7 +443,7 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
 
 // ─── mapdict instance-storage block: stable GcArray(OBJECTPTR) ────────────
 //
-// `W_ObjectObject.storage` (`mapdict.py:910` `self.storage`) is a
+// `W_ObjectObject.storage` (`mapdict.py _mapdict_init_empty` `self.storage`) is a
 // `Ptr(GcArray(OBJECTPTR))`. It carries the same inline-traced shape as
 // list/tuple item blocks (`PY_OBJECT_ARRAY_GC_TYPE_ID`) — every slot is a
 // reference — under its own tid (`W_MAPDICT_STORAGE_GC_TYPE_ID`) and differs
@@ -492,7 +492,7 @@ pub unsafe fn alloc_instance_items_block(values: &[PyObjectRef], cap: usize) -> 
 /// the owning instance rooted, installs and barriers the new block, then
 /// deallocates `old`; dropping it here would introduce a GC operation while the
 /// fresh block is not yet reachable from its owner. `old` may be null.
-/// mapdict.py:942-959 `_add_attr` grow-by-one.
+/// mapdict.py _set_mapdict_increase_storage1 `_add_attr` grow-by-one.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -1485,7 +1485,7 @@ pub enum ArrayKind {
     Struct,
 }
 
-/// resume.py:1444-1447, llmodel.py:788-790 — API alias.
+/// resume.py allocate_array, llmodel.py bh_new_array — API alias.
 /// RPython: `bh_new_array_clear = bh_new_array` (llmodel.py).
 /// Upstream both call `gc_malloc_array` which allocates a zero-filled
 /// varsize block. Ref/int/float slots are word-sized.
@@ -1551,7 +1551,7 @@ pub unsafe fn gc_typed_array_items_base(array: *mut GcTypedArray) -> *mut u8 {
     unsafe { (array as *mut u8).add(GC_TYPED_ARRAY_ITEMS_OFFSET) }
 }
 
-/// llmodel.py:596-619 bh_get/setarrayitem_gc_* access the raw byte
+/// llmodel.py bh_getarrayitem_gc_r bh_get/setarrayitem_gc_* access the raw byte
 /// offset with no bounds check — a null array or out-of-range index
 /// never occurs in correct jitcode. Panic loudly instead of reading
 /// or writing out of bounds.
@@ -1623,7 +1623,7 @@ pub fn setarrayitem_float(array: *mut GcTypedArray, index: usize, value: f64) {
 
 /// resume.py setinteriorfield(i, array, num, fielddescrs[j]) parity.
 /// resume.py ResumeDataDirectReader: dispatch on descr type.
-/// llmodel.py:648-665: byte offset = elem_idx * item_size + field_offset.
+/// llmodel.py bh_setinteriorfield_gc_i: byte offset = elem_idx * item_size + field_offset.
 ///
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,

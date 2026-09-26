@@ -6,7 +6,7 @@
 # ratio is not a measurement: the ceiling is twice the slowest the macos
 # runner and this machine observe (7.8x), rounded up. It read 5, a blanket
 # value from the sweep that first gave every fixture a ceiling.
-# descroperation.py:88 vs :234 — the bare object.__getattribute__ slot raises
+# descroperation.py descr__getattribute__ vs :234 — the bare object.__getattribute__ slot raises
 # AttributeError on miss and does NOT consult __getattr__; normal attribute
 # access (space.getattr) does.  Holds for instance and class/metaclass
 # receivers alike.

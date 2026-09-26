@@ -2,7 +2,7 @@
 # guard at that position fails repeatedly and the bridge grown there closes with
 # a virtual state matching no existing target. That makes the optimizer ask for a
 # retrace (`compile.py:1085 retrace_needed`), and `retrace_limit` is what lets
-# one be BUILT: it defaults to 0 (`rpython/rlib/jit.py:595`), so no other fixture
+# one be BUILT: it defaults to 0 (`rpython/rlib/jit.py`), so no other fixture
 # in this corpus reaches `compile_retrace` at all.
 #
 # It covers a retrace that is ASSEMBLED: `retrace_needed` -> `cut_retrace_from`

@@ -269,7 +269,7 @@ pub unsafe fn try_alloc_typed_items_block_nursery(
         // deviation, not a spelling: `malloc_fast` is a copy of
         // `malloc_fixedsize` (`framework.py:366-373`), whose nursery bump
         // reaches `collect_and_reserve` on overflow
-        // (`incminimark.py:676-680`). Collecting here would move digit blocks
+        // (`incminimark.py`). Collecting here would move digit blocks
         // out from under the unboxed `RBigInt` handles the arithmetic graphs
         // hold across their allocations, and nothing roots those, so this
         // spills to old-gen instead. `rbigint::gc::format_recursion_safepoint`
@@ -338,7 +338,7 @@ pub unsafe fn try_alloc_typed_items_block_nursery_rooted(
 
 /// `rgc.ll_arrayclear(l.ll_items())` — zero every item of a freshly allocated
 /// block, the second half of `ll_alloc_and_set(LIST, count, 0)`
-/// (rtyper/rlist.py:494-503).
+/// (rtyper/rlist.py).
 ///
 /// # Safety
 /// `block` must be a live items block.

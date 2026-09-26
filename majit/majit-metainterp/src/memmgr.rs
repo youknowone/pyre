@@ -1,7 +1,7 @@
 //! `rpython/jit/metainterp/memmgr.py` parity.
 //!
 //! `MemoryManager` is the **sole long-living strong reference** to
-//! compiled `JitCellToken` objects (`memmgr.py:9-12`):
+//! compiled `JitCellToken` objects (`memmgr.py`):
 //!
 //! > All the long-lived references to LoopToken are weakrefs (see
 //! > JitCell in warmstate.py), apart from the 'alive_loops' set in
@@ -36,7 +36,7 @@ use majit_backend::JitCellToken;
 
 /// `memmgr.py` `class MemoryManager`. Pyre also pins the
 /// retrace/unroll parameters here, mirroring RPython's lazy attribute
-/// writes via `warmstate.py:299-320 set_param_*`. RPython treats them
+/// writes via `warmstate.py set_param_retrace_limit set_param_*`. RPython treats them
 /// as Python `int` attributes; pyre declares them as typed fields and
 /// initializes them to the `rlib/jit.py PARAMETERS` defaults.
 pub struct MemoryManager {
@@ -47,12 +47,12 @@ pub struct MemoryManager {
     pub max_age: i64,
     /// `memmgr.py:39` `self.next_check = r_int64(-1)`.  Generation
     /// at which `_kill_old_loops_now` next fires; `-1` means
-    /// "eviction disabled" (`memmgr.py:43-44`).
+    /// "eviction disabled" (`memmgr.py`).
     pub next_check: i64,
     /// `memmgr.py` `self.check_frequency = -1`.  Number of
     /// generations between successive `_kill_old_loops_now` sweeps.
     /// `-1` is "uninitialized"; `set_max_age` derives a real value
-    /// (`int(sqrt(max_age))` by default per `memmgr.py:47-48`).
+    /// (`int(sqrt(max_age))` by default per `memmgr.py`).
     pub check_frequency: i64,
     /// How many times this manager has let go of loops: each
     /// `_kill_old_loops_now` that evicted something, and each
@@ -94,7 +94,7 @@ impl MemoryManager {
     /// `memmgr.py` `MemoryManager.__init__`. Note RPython splits
     /// init from `set_max_age`; pyre takes `max_age` upfront for
     /// ergonomics — `set_max_age` later overwrites it just like the
-    /// upstream call sequence at `warmspot.py:118` /
+    /// upstream call sequence at `warmspot.py` /
     /// `set_user_param('loop_longevity=...')`.
     pub fn new(max_age: i64) -> Self {
         let mut mgr = MemoryManager {
@@ -208,7 +208,7 @@ impl MemoryManager {
     ///
     /// The return value is a `Vec<Arc<JitCellToken>>` rather than
     /// `Vec<u64>` (green_keys) so the caller can match by **token-object
-    /// identity** (`Arc::ptr_eq`) — mirroring `memmgr.py:73`'s
+    /// identity** (`Arc::ptr_eq`) — mirroring `memmgr.py`'s
     /// `del self.alive_loops[looptoken]`, which keys on the looptoken
     /// itself.  Returning green_keys would let an evicted stale
     /// looptoken kick out the *current* compiled token at the same

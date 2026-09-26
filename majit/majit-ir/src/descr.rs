@@ -49,7 +49,7 @@ use parking_lot::RwLock;
 /// The struct-array interior cycle (last row) mirrors PyPy's
 /// `arraydescr.all_interiorfielddescrs = descrs` +
 /// `InteriorFieldDescr.arraydescr = arraydescr`
-/// (`descr.py:372-375` + `descr.py:388-391`).  Python tolerates it via
+/// (`descr.py` + `descr.py`).  Python tolerates it via
 /// cycle-collecting GC; Rust's `Arc` does not.  In practice the descr
 /// graph is process-lifetime pinned by `GcCache._cache_size` /
 /// `_cache_array` / `_cache_interiorfield` (descr.rs) — the
@@ -70,7 +70,7 @@ use parking_lot::RwLock;
 /// every `{:?}` that reached a struct-array descr, including
 /// `format_assembler`'s `EffectInfo` render.  `SimpleInteriorFieldDescr`
 /// therefore has a hand-written `Debug` that prints `array_descr` as an
-/// identity summary, matching `descr.py:420-421
+/// identity summary, matching `descr.py
 /// InteriorFieldDescr.repr_of_descr`, which never follows
 /// `self.arraydescr`.  A future reader added to this graph has to make
 /// the same choice at the same edge.
@@ -81,7 +81,7 @@ use parking_lot::RwLock;
 /// * `optimize_setfield_gc`, `optimize_getfield_gc`, and
 ///   `resolve_array_source` read `op.descr.as_field_descr()?.offset()`
 ///   and `.is_typeptr()` directly (RPython `op.getdescr().offset` /
-///   `heaptracker.py:66 name == 'typeptr'` parity).
+///   `heaptracker.py name == 'typeptr'` parity).
 /// * `optimize_(get|set)interiorfield_gc` extract the inner
 ///   `FieldDescr` via `as_interior_field_descr().field_descr()`
 ///   (`descr.py InteriorFieldDescr.__init__` parity) — they no
@@ -89,17 +89,17 @@ use parking_lot::RwLock;
 /// * `VirtualizableFieldState.fields` is now keyed by
 ///   `FieldDescr::index_in_parent()` (RPython
 ///   `info.AbstractStructPtrInfo._fields[fielddescr.get_index()]`,
-///   `info.py:203-206`) instead of the packed
+///   `info.py`) instead of the packed
 ///   `FIELD_DESCR_TAG | offset << 4 | size << 1 | type_bits` u32.
 ///   The synthetic fallback at `init` assigns `1 + field_idx_in_vinfo`
 ///   for static slots and `1 + num_static + array_idx` for array
-///   slots, matching `virtualizable.py:71-72 build_field_descr`.
+///   slots, matching `virtualizable.py build_field_descr`.
 /// * The pyre-only `FieldIndexDescr`, `make_field_index_descr`,
 ///   `virtualizable_field_index`, `extract_field_offset`,
 ///   `descr_index` helper, and `debug_assert_no_typeptr_in_virtual_fields`
 ///   are deleted.  The typeptr-exclusion invariant is enforced at
 ///   `optimize_setfield_gc`'s typeptr fold (RPython
-///   `heaptracker.py:66-67`), not by a runtime assert.
+///   `heaptracker.py`), not by a runtime assert.
 /// * `VirtualRefInfo`'s pyre-only `descr_virtual_token: u32` /
 ///   `descr_forced: u32` / `descr_size: u32` placeholders and the
 ///   matching `virtualref.rs` `VREF_FIELD_*` packed constants are
@@ -261,7 +261,7 @@ pub fn descr_instance_ptr(descr: &DescrRef) -> usize {
 /// we use opaque u64 handles assigned by the host/translator, so two
 /// distinct type definitions always get distinct keys even if they
 /// share a name or layout. For call descriptors, PyPy uses a
-/// structural tuple key (descr.py:665).
+/// structural tuple key (descr.py).
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum LLType {
     /// descr.py:109: cache[STRUCT].
@@ -274,8 +274,8 @@ pub enum LLType {
     /// descr.py:665: (arg_classes, result_type, result_signed,
     ///   RESULT_ERASED, extrainfo).
     /// Two calls with the same signature and canonical EffectInfo identity
-    /// share one CallDescr. `effectinfo.py:147-148` interns the EI before
-    /// `descr.py:665` places that object in this tuple.
+    /// share one CallDescr. `effectinfo.py` interns the EI before
+    /// `descr.py` places that object in this tuple.
     Func {
         arg_classes: String,
         result_type: Type,
@@ -289,7 +289,7 @@ pub enum LLType {
         /// descr.py:662: result_size = symbolic.get_size(RESULT_ERASED, tsc)
         result_size: usize,
         /// `descr.py:665` stores the canonical `EffectInfo` object in the key.
-        /// `effectinfo.py:147-148` interns ordinary EIs process-globally, so
+        /// `effectinfo.py` interns ordinary EIs process-globally, so
         /// object identity carries all six raw sets without copying them into
         /// every call-cache key. Release-gil EIs receive a fresh canonical
         /// cell and therefore a fresh identity as well.
@@ -367,7 +367,7 @@ pub fn path_hash_for_gc_kind(s: &str, is_gc_managed: bool) -> u64 {
 /// `path_hash` sibling that drops the leading `<crate>::` segment from
 /// `module_path` before hashing.  PyPy/RPython has no notion of a crate
 /// boundary — `lltype.Struct` identity is keyed on the Python module
-/// path alone (`descr.py:105 cache[STRUCT]`).  A consumer's
+/// path alone (`descr.py get_size_descr cache[STRUCT]`).  A consumer's
 /// `module_path!()` macro produces the full `crate::module::sub::...`
 /// form, whereas the analyzer-side
 /// `majit_translate::module_path::module_path_from_source_file` (and the
@@ -665,7 +665,7 @@ pub fn canonical_struct_name(name: &str) -> String {
 /// opposed to the bare `Tuple` root?
 ///
 /// `TupleRepr` creates a distinct `GcStruct` per item shape
-/// (`rtyper/rtuple.py:115-125`), so `(A,)` and `(A, B)` are different
+/// (`rtyper/rtuple.py`), so `(A,)` and `(A, B)` are different
 /// low-level struct objects.  Charon spells that synthetic identity as
 /// `Tuple<T, ...>` because Rust's built-in tuple has no nominal `TypeDecl`,
 /// which makes it the one generic spelling that must NOT collapse onto its
@@ -1161,7 +1161,7 @@ pub fn census_mint_index_provenance(claimed: bool) {
 /// `expected` is the slot of the attached parent's `all_fielddescrs` that this
 /// field's own offset occupies; `actual` is the `index_in_parent`
 /// (`descr.py:228`) the producer stamped on it. Upstream cannot disagree —
-/// `heaptracker.py:60-72` and `:96-112` are one walker — so every disagreement
+/// `heaptracker.py` and `:96-112` are one walker — so every disagreement
 /// is a descr declaring itself to be at a slot its parent fills with a
 /// different field.
 ///
@@ -1261,7 +1261,7 @@ pub struct GcCache {
     /// itself (no separate layoutbuilder object) — analyzer-side
     /// SizeDescr + ArrayDescr cache-miss-mint each pull one tid from
     /// this counter via the matching `init_*_descr` hook, mirroring
-    /// PyPy's structure.  Tid 0 is reserved (`gctypelayout.py:328-331`
+    /// PyPy's structure.  Tid 0 is reserved (`gctypelayout.py`
     /// "don't use typeid 0, may help debugging").
     next_type_id: u32,
 }
@@ -1516,7 +1516,7 @@ impl GcCache {
     }
 }
 
-// descr.py:105-127, 218-239, 256-267, 348-378, 647-675:
+// descr.py get_size_descr, 218-239, 256-267, 348-378, 647-675:
 // get_size_descr, get_field_descr, get_field_arraylen_descr,
 // get_array_descr, get_call_descr are methods on GcCache (see below).
 // PyPy passes `gccache` as the first argument to these free functions;
@@ -1527,12 +1527,12 @@ impl GcCache {
     ///
     /// `key`: LLType::Struct — STRUCT identity (no vtable in key).
     /// `vtable` is a payload/assertion parameter, not part of the key.
-    /// `immutable_flag`: descr.py:112 heaptracker.is_immutable_struct(STRUCT).
+    /// `immutable_flag`: descr.py heaptracker.is_immutable_struct(STRUCT).
     ///
     /// The numeric `tid` stamped on the returned SizeDescr is allocated
     /// by `init_size_descr` from the shared `next_type_id` counter
     /// (analog of `TypeLayoutBuilder.get_type_id` in
-    /// `gctypelayout.py:333-357`).  Caller does not supply it.  This
+    /// `gctypelayout.py`).  Caller does not supply it.  This
     /// guarantees dense, collision-free tids per distinct key regardless
     /// of how the caller derived the `LLType::Struct(u64)` identity.
     pub fn get_size_descr(
@@ -1795,9 +1795,9 @@ impl GcCache {
     ///
     /// `get_size_descr` returns on cache hit (`descr.py`), so whoever
     /// publishes a key FIRST decides what every later consumer sees. Upstream
-    /// that is harmless because `descr.py:111-127` is the only producer and it
+    /// that is harmless because `descr.py` is the only producer and it
     /// always builds the full `SizeDescr` before inserting. A pyre mint that
-    /// publishes a caller-sized, vtable-less shell — a shape `descr.py:111-116`
+    /// publishes a caller-sized, vtable-less shell — a shape `descr.py`
     /// cannot produce — therefore silently outranks the real layout a later
     /// producer would have installed.
     ///
@@ -2132,7 +2132,7 @@ impl GcCache {
     /// descr.py get_field_descr(gccache, STRUCT, fieldname).
     ///
     /// `struct_key`: LLType::Struct — the owning type identity.
-    /// `index_in_parent`: descr.py:228 heaptracker.get_fielddescr_index_in(STRUCT, fieldname).
+    /// `index_in_parent`: descr.py heaptracker.get_fielddescr_index_in(STRUCT, fieldname).
     ///   The structural slot number within the parent struct's field list.
     ///   Caller must provide it: `heaptracker::get_fielddescr_index_in` runs
     ///   in `majit-translate`, one crate above this one. `None` is a caller that
@@ -2143,7 +2143,7 @@ impl GcCache {
     ///
     /// descr.py: parent_descr = get_size_descr(gccache, STRUCT, vtable).
     /// Looked up from _cache_size[STRUCT]. Caller must ensure get_size_descr
-    /// was called first (matches RPython's call at descr.py:238).
+    /// was called first (matches RPython's call at descr.py).
     ///
     /// `display_name`: descr.py `'%s.%s' % (STRUCT._name, fieldname)`.
     /// Callers that know the owning struct's source name pass the full
@@ -2456,7 +2456,7 @@ impl GcCache {
         // `ImmutableRank::is_quasi_immutable` and threads the boolean
         // through here so `jtransform.rewrite_op_getfield` emits the
         // `record_quasiimmut_field` guard before the pure read
-        // (`jtransform.py:895-903`).
+        // (`jtransform.py`).
         fd = fd.with_quasi_immutable(is_quasi_immutable);
         // descr.py: fielddescr.parent_descr = get_size_descr(gccache, STRUCT, vtable)
         if let Some(ref p) = parent {
@@ -2505,8 +2505,8 @@ impl GcCache {
     /// `item_type`: IR-level element type (for ArrayDescr::item_type()).
     /// `nolength`: descr.py ARRAY_INSIDE._hints.get('nolength', False).
     /// `length_offset`: offset of the length field (only used when !nolength).
-    /// `is_pure`: descr.py:364 bool(ARRAY_INSIDE._immutable_field(None)).
-    /// `concrete_type`: descr.py:366-370 '\x00' or 'f' for Float/SingleFloat.
+    /// `is_pure`: descr.py bool(ARRAY_INSIDE._immutable_field(None)).
+    /// `concrete_type`: descr.py '\x00' or 'f' for Float/SingleFloat.
     #[expect(
         clippy::too_many_arguments,
         reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
@@ -2564,7 +2564,7 @@ impl GcCache {
     /// `tid` stamped on the cached `SizeDescr` (`gc.py:536-542` descr.tid),
     /// or `None` when the key was never minted.  The blackhole/resume
     /// allocation path holds only the `cache_key` (path_hash) that the
-    /// `BhDescr` serialized (`descr.py:108-118` structural identity) and must
+    /// `BhDescr` serialized (`descr.py` structural identity) and must
     /// recover the real GC tid the header write needs, without minting a
     /// fresh descr the way `get_size_descr` would.  A real dense tid never
     /// keys a `_cache_size` slot, so a miss reports the value was already a
@@ -2614,8 +2614,8 @@ impl GcCache {
     /// `get_field_descr(REALARRAY.OF, name)` inside the cache-miss arm.
     ///
     /// `arrayfieldname` is `""` (empty string) for the GcArray-of-Structs
-    /// case (`descr.py:431-432 if arrayfieldname is None: REALARRAY = ARRAY`).
-    /// The non-empty case (`descr.py:433-434` GcStruct containing an
+    /// case (`descr.py if arrayfieldname is None: REALARRAY = ARRAY`).
+    /// The non-empty case (`descr.py` GcStruct containing an
     /// inlined GcArray) is the only other PyPy variant; pyre carries the
     /// same `(LLType, String, String)` key shape so both variants share
     /// the same cache layout.
@@ -2651,7 +2651,7 @@ impl GcCache {
 
     /// descr.py get_call_descr(gccache, ARGS, RESULT, extrainfo).
     ///
-    /// descr.py:665: key = (arg_classes, result_type, result_signed,
+    /// descr.py: key = (arg_classes, result_type, result_signed,
     ///   RESULT_ERASED, extrainfo)
     pub fn get_call_descr(
         &mut self,
@@ -2737,7 +2737,7 @@ impl GcCache {
         // analyzer-side one (`majit-translate`
         // `bh_size_spec_from_callcontrol`) is longer by exactly the header
         // words at offsets 0 and 8 — and `heaptracker.py:60-71
-        // all_fielddescrs`, the list `descr.py:125-126` assigns onto the
+        // all_fielddescrs`, the list `descr.py` assigns onto the
         // cached descr, skips `typeptr` and `c__pad*` outright while the GC
         // header is not part of the lltype STRUCT at all. Upstream's
         // positional list is therefore the header-free one, which is what the
@@ -2753,7 +2753,7 @@ impl GcCache {
         // gates `gen_initialize_vtable` on `vtable != 0`) over zeroed nursery
         // memory, so the fresh object reads back with a null `ob_type`.
         //
-        // Upstream has no upgrade rule to arbitrate at all: `descr.py:105-127
+        // Upstream has no upgrade rule to arbitrate at all: `descr.py
         // get_size_descr` takes the vtable as a parameter, mints once per
         // STRUCT, and assigns `all_fielddescrs` onto that one owner;
         // `gc.py init_size_descr` stamps the tid on it. Two producers
@@ -2908,7 +2908,7 @@ impl GcCache {
     }
 
     /// Keyed sibling of [`Self::register_external_array`] — also
-    /// populates `_cache_array[key]`.  Mirrors `descr.py:348-378
+    /// populates `_cache_array[key]`.  Mirrors `descr.py get_array_descr
     /// get_array_descr` cache-miss `cache[ARRAY_OR_STRUCT] = arraydescr`.
     pub fn register_keyed_array(&mut self, key: LLType, descr: DescrRef) {
         self._cache_array.entry(key).or_insert(descr);
@@ -2962,9 +2962,9 @@ impl GcCache {
     /// get_interiorfield_descr` cache-miss
     /// `cache[(ARRAY, name, arrayfieldname)] = interiorfielddescr`.
     /// `arrayfieldname == ""` denotes PyPy `arrayfieldname=None`
-    /// (the GcArray-of-Structs case, `descr.py:431-432`); a
+    /// (the GcArray-of-Structs case, `descr.py`); a
     /// non-empty string denotes the GcStruct-containing-inlined-GcArray
-    /// case (`descr.py:433-434`).
+    /// case (`descr.py`).
     pub fn register_keyed_interiorfield(
         &mut self,
         array_key: LLType,
@@ -2980,7 +2980,7 @@ impl GcCache {
     /// Keyed call-descr interning for production factories outside
     /// `get_call_descr`.
     ///
-    /// This is the direct Rust lift of `descr.py:666-673`:
+    /// This is the direct Rust lift of `descr.py`:
     /// `_cache_call[key]` is owned by `GcCache`, and a miss both stores
     /// the descriptor in the keyed map and appends it to the call group
     /// iteration order used by `setup_descrs()`.  The concrete descriptor
@@ -3057,7 +3057,7 @@ impl GcCache {
 
     /// Per-category counts for diagnostics / tests.  Tuple order:
     /// `(sizes, fields, arrays, arraylens, calls, interiorfields)`,
-    /// matching PyPy `descr.py:25-47` group iteration order.
+    /// matching PyPy `descr.py setup_descrs` group iteration order.
     pub fn category_counts(&self) -> (usize, usize, usize, usize, usize, usize) {
         (
             self._cache_size.len() + self._external_size_order.len(),
@@ -3663,7 +3663,7 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
 
     /// `effectinfo.py` `descr.ei_index = sys.maxint` — initial sentinel
     /// before `compute_bitstrings` partitions descrs into (eisetr, eisetw)
-    /// equivalence classes (`effectinfo.py:524-526`). Concrete field /
+    /// equivalence classes (`effectinfo.py`). Concrete field /
     /// array / interiorfield descrs override this to expose their
     /// `AtomicU32` storage; other descrs (calldescr, sizedescr, faildescr…)
     /// keep the trait default and never participate in bitstring
@@ -3925,7 +3925,7 @@ pub trait QuasiImmutLoopToken: Send + Sync + std::fmt::Debug {
 /// The instance itself belongs to the interpreter, which owns the hidden
 /// `mutate_<name>` field it hangs off; majit only ever asks it the two
 /// questions upstream asks: whether it is still the field's current instance
-/// (`quasiimmut.py:152`), and to record a finished loop (`:72-75`).
+/// (`quasiimmut.py`), and to record a finished loop (`:72-75`).
 pub trait QuasiImmutHandle: Send + Sync + std::fmt::Debug {
     /// `quasiimmut.py` — the `qmut is not self.qmut` test, answered by
     /// the recorded instance rather than by re-reading the field.
@@ -4095,7 +4095,7 @@ pub trait FailDescr: Descr {
     ///
     /// Default impl panics: matches RPython's
     /// `assert isinstance(descr, ResumeGuardDescr)` at
-    /// optimizer.py:724 — non-guard descrs must never reach
+    /// optimizer.py — non-guard descrs must never reach
     /// `store_final_boxes_in_guard`. Callers in non-guard paths must
     /// not invoke this method.
     fn set_fail_arg_types(&self, _types: Vec<Type>) {
@@ -4646,7 +4646,7 @@ pub trait FailDescr: Descr {
     /// pack `type_tag | (index << ST_SHIFT)` into status.
     fn make_a_counter_per_value(&self, _index: u32, _type_tag: u64) {}
 
-    /// history.py:143-147 / schedule.py:654-655 — attach vector resume info
+    /// history.py:143-147 / schedule.py — attach vector resume info  allow-line-citation
     /// to a guard descriptor. Non-guard fail descriptors ignore this.
     ///
     /// Upstream shape (history.py:143-147):
@@ -4689,9 +4689,9 @@ pub trait FailDescr: Descr {
 /// so deoptimization can reconstruct vector accumulators.
 ///
 /// Two distinct OpRefs following RPython's separation:
-///   - `variable`: resume.py:29/47 — the original scalar accumulator box
+///   - `variable`: resume.py/47 — the original scalar accumulator box
 ///     (used for type inference; getoriginal() returns it).
-///   - `location`: resume.py:28 — the register/SSA location where the
+///   - `location`: resume.py — the register/SSA location where the
 ///     accumulated vector lives. regalloc.py:350 sets accuminfo.location;
 ///     the backend reads it for extractlane + reduction at guard exit.
 ///
@@ -4731,7 +4731,7 @@ pub struct AccumInfo {
 /// only the `instance_clone` self-reference at resume.py). The type
 /// is preserved here for line-by-line structural parity with
 /// `resume.py`; same cross-cutting pattern as `RawStructPtrInfo`
-/// (info.py:452-457). Should a future vector pass introduce a
+/// (info.py). Should a future vector pass introduce a
 /// producer, the call sites should mirror RPython's `AccumInfo`
 /// handling (linked-list `prev` chain + `attach_vector_info`).
 #[allow(dead_code)]
@@ -5031,7 +5031,7 @@ pub trait FieldDescr: Descr {
     }
 
     /// `descr.py FieldDescr.flag` — `get_type_flag(FIELDTYPE)`
-    /// (`descr.py:240-252`).
+    /// (`descr.py`).
     ///
     /// The default reconstructs the classification from the IR type the way
     /// `get_type_flag` does, which is exact for the pointer / float / integer
@@ -5074,7 +5074,7 @@ pub trait FieldDescr: Descr {
     /// descr.py: FieldDescr.get_parent_descr() — backreference to the
     /// SizeDescr of the containing struct/object. Required by
     /// `OptContext::ensure_ptr_info_arg0` to dispatch Instance vs Struct
-    /// PtrInfo per `optimizer.py:478-484`. Default returns `None`; field
+    /// PtrInfo per `optimizer.py`. Default returns `None`; field
     /// descriptors that don't carry a backreference fall through to the
     /// generic path and the Rust port's `ensure_ptr_info_arg0` panics
     /// rather than installing a malformed PtrInfo.
@@ -5233,7 +5233,7 @@ impl ArrayFlag {
             Type::Ref => ArrayFlag::Pointer,
             Type::Float => ArrayFlag::Float,
             // RPython: default for unresolved integer type is FLAG_UNSIGNED
-            // (descr.py:254). Callers with concrete type info should use
+            // (descr.py). Callers with concrete type info should use
             // get_type_flag() for FLAG_SIGNED/FLAG_UNSIGNED distinction.
             Type::Int => ArrayFlag::Unsigned,
             Type::Void => ArrayFlag::Void,
@@ -5650,7 +5650,7 @@ pub struct SimpleFieldDescr {
     /// RPython `rpython/rtyper/rclass.py` `IR_QUASIIMMUTABLE[_ARRAY]` rank.
     /// Consumed by `FieldDescr::is_quasi_immutable()` (trait default overridden
     /// below) so `rewrite_op_getfield` can emit the `record_quasiimmut_field`
-    /// guard pair from `rpython/jit/codewriter/jtransform.py:895-903`.
+    /// guard pair from `rpython/jit/codewriter/jtransform.py`.
     is_quasi_immutable: bool,
     /// descr.py: FieldDescr.flag — type classification from get_type_flag().
     /// FLAG_POINTER, FLAG_FLOAT, FLAG_SIGNED, FLAG_UNSIGNED, FLAG_STRUCT, FLAG_VOID.
@@ -5675,10 +5675,10 @@ pub struct SimpleFieldDescr {
     /// descr.py FieldDescr.parent_descr — backreference to the SizeDescr
     /// of the containing struct/object. Required by
     /// `OptContext::ensure_ptr_info_arg0` to dispatch Instance vs Struct
-    /// PtrInfo per `optimizer.py:478-484`. Stored as `Weak` to break the
+    /// PtrInfo per `optimizer.py`. Stored as `Weak` to break the
     /// SizeDescr → FieldDescr → SizeDescr Arc cycle introduced by
     /// `make_simple_descr_group`. Interior-mutable because
-    /// `descr.py:238` updates the single parent backreference while the
+    /// `descr.py` updates the single parent backreference while the
     /// field Arc is shared by `(STRUCT, fieldname)`.
     pub parent_descr: RwLock<Option<Weak<dyn Descr>>>,
     /// pyjitpl.py `vinfo = fielddescr.get_vinfo()` — backref to
@@ -5800,7 +5800,7 @@ impl SimpleFieldDescr {
     /// Whether this descr already describes the field a `get_field_descr`
     /// caller is asking for.
     ///
-    /// `descr.py:218-239` derives every one of these from `(STRUCT,
+    /// `descr.py` derives every one of these from `(STRUCT,
     /// fieldname)` itself — `symbolic.get_field_token`, `get_type_flag`,
     /// `STRUCT._hints['_immutable_fields_']`,
     /// `heaptracker.get_fielddescr_index_in` — so a cache hit there cannot
@@ -5872,7 +5872,7 @@ impl SimpleFieldDescr {
     }
 
     /// RPython: FieldDescr(name, offset, size, flag, index_in_parent, is_pure).
-    /// `name` format: `"STRUCT.fieldname"` (descr.py:227).
+    /// `name` format: `"STRUCT.fieldname"` (descr.py).
     /// `flag`: descr.py get_type_flag(FIELDTYPE).
     #[expect(
         clippy::too_many_arguments,
@@ -6041,7 +6041,7 @@ impl SimpleFieldDescr {
     /// Builder: attach the owning `VirtualizableInfo` backreference that
     /// `FieldDescr::get_vinfo()` returns. `vinfo` is stored as a `Weak`
     /// reference; upgrades succeed for as long as the owning vinfo Arc
-    /// is alive. Upstream: pyjitpl.py:1148-1149 `fielddescr.get_vinfo()`.
+    /// is alive. Upstream: pyjitpl.py emit_force_virtualizable `fielddescr.get_vinfo()`.
     pub fn with_vinfo(mut self, vinfo: Weak<dyn VinfoMarker>) -> Self {
         self.vinfo = Some(vinfo);
         self
@@ -6310,7 +6310,7 @@ impl SimpleSizeDescr {
     /// above this one (`majit-translate codewriter::heaptracker`), so
     /// callers thread `all_fielddescrs` in via this builder; the
     /// `gc_fielddescrs` subset is derived by filtering on
-    /// `FieldDescr::is_pointer_field()` (heaptracker.py:70).
+    /// `FieldDescr::is_pointer_field()` (heaptracker.py).
     pub fn with_all_fielddescrs(mut self, all_fielddescrs: Vec<Arc<dyn FieldDescr>>) -> Self {
         // `gc_fielddescrs` is `all_fielddescrs(only_gc=True)`: a pointer
         // field inside the fixed part. An inlined array is not a `Ptr`
@@ -6428,11 +6428,11 @@ pub struct SimpleFieldDescrSpec {
     pub field_size: usize,
     pub field_type: Type,
     pub is_immutable: bool,
-    /// RPython `rpython/rtyper/rclass.py:644-678` — rank
+    /// RPython `rpython/rtyper/rclass.py _parse_field_list` — rank
     /// `IR_QUASIIMMUTABLE` / `IR_QUASIIMMUTABLE_ARRAY`.  Flipped by
     /// `rewrite_op_getfield` consumers to emit
     /// `record_quasiimmut_field` before the pure read
-    /// (`rpython/jit/codewriter/jtransform.py:895-903`).
+    /// (`rpython/jit/codewriter/jtransform.py`).
     pub is_quasi_immutable: bool,
     /// descr.py: FieldDescr.flag — get_type_flag(FIELDTYPE).
     pub flag: ArrayFlag,
@@ -6465,7 +6465,7 @@ pub struct SimpleDescrGroup {
 /// or `get_field_descr(...)` callers (analyzer-side `cc.fielddescrof`,
 /// other runtime mint paths) see the same `Arc<dyn Descr>` instead of
 /// minting duplicates — restoring PyPy's `cpu.fielddescrof` per-
-/// `(STRUCT, name)` identity (`descr.py:218-239`).  First-write wins;
+/// `(STRUCT, name)` identity (`descr.py`).  First-write wins;
 /// the keyed map preserves the original Arc across redundant register
 /// calls.
 pub fn make_simple_descr_group_keyed(
@@ -7363,7 +7363,7 @@ pub fn memcpy_fn_addr() -> i64 {
 /// so every caller (`GcRewriterImpl::new` per-backend, optimizer
 /// virtualstate import, …) sees the same `DescrRef`.
 ///
-/// llsupport/gc.py:33-37 `self.fielddescr_vtable = get_field_descr(
+/// llsupport/gc.py `self.fielddescr_vtable = get_field_descr(
 /// self, rclass.OBJECT, 'typeptr')`. FieldDescr describing the
 /// `typeptr` slot at the head of every `rclass.OBJECT` (offset 0,
 /// `Signed` size). Consumed by `rewrite.py:482-484` to stamp the
@@ -7638,7 +7638,7 @@ pub struct SimpleFailDescr {
     fail_arg_types: Vec<Type>,
     is_finish: bool,
     trace_id: u64,
-    /// schedule.py:654: vector accumulation info attached during vectorization.
+    /// schedule.py: vector accumulation info attached during vectorization.
     vector_info: std::cell::UnsafeCell<Option<Box<AccumInfo>>>,
 }
 
@@ -9108,7 +9108,7 @@ pub fn make_array_descr(base_size: usize, item_size: usize, item_type: Type) -> 
     ))
 }
 
-/// Create an array descriptor with explicit signedness (`descr.py:241-254
+/// Create an array descriptor with explicit signedness (`descr.py get_type_flag
 /// get_type_flag`).  Like [`make_array_descr`] but lets the caller force
 /// `ArrayFlag::Signed` for `Type::Int` arrays — the default
 /// (`from_item_type` second arg `is_struct=false`) maps `Int → Unsigned`
@@ -9183,7 +9183,7 @@ pub fn make_array_descr_full(
 /// the caller passes a pre-built `FieldDescr` for `nolength=False`
 /// arrays (the upstream `get_field_arraylen_descr` shape) and `None`
 /// for `ARRAY._hints['nolength']` shapes.  `is_pure` mirrors
-/// `descr.py:288 self._is_pure = ARRAY._hints.get('immutable',
+/// `descr.py self._is_pure = ARRAY._hints.get('immutable',
 /// False)` — drives the optimizer's pure-array fold.
 ///
 /// `ei_index` mirrors `effectinfo.py compute_bitstrings()`:
@@ -9193,7 +9193,7 @@ pub fn make_array_descr_full(
 /// reads the same bitstring slot the producer wrote.
 /// `u32::MAX` is the unset sentinel.
 ///
-/// `interior_field_descrs` mirrors `descr.py:372-375 arraydescr.
+/// `interior_field_descrs` mirrors `descr.py arraydescr.
 /// all_interiorfielddescrs` — every interior FieldDescr must carry
 /// the SAME `arraydescr` Arc identity the array itself uses.  Pyre's
 /// `SimpleArrayDescr::set_all_interiorfielddescrs` writes through a
@@ -9206,7 +9206,7 @@ pub fn make_array_descr_full(
 ///   at the array length field's `FieldDescr` for arrays whose
 ///   `ARRAY._hints.get('nolength')` is false.  `None` for fixed-size
 ///   buffers (pyre's `program: &[u8]` opcode-fetch path).
-/// - `is_pure`: `descr.py:288 self._is_pure = ARRAY._hints.get(
+/// - `is_pure`: `descr.py self._is_pure = ARRAY._hints.get(
 ///   'immutable', False)` — set on `Ptr(rstr.STR)` /
 ///   `Ptr(rstr.UNICODE)` and any `lltype.Array(... hints={'immutable':
 ///   True})`.  Drives the optimizer's pure-array fold.

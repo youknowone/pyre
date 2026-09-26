@@ -13,7 +13,7 @@
 //! totals via [`JitProfiler::snapshot`] which itself is `Relaxed`.
 //!
 //! The `t1` / `current` event stack mirrors PyPy's `self.t1`/`self.current`
-//! instance fields (`jitprof.py:56,60`) — held behind a per-`JitProfiler`
+//! instance fields (`jitprof.py`) — held behind a per-`JitProfiler`
 //! `Mutex<TimingState>` so concurrent threads sharing the profiler via
 //! `Arc` serialize on the same lock the GIL gives PyPy.
 
@@ -142,7 +142,7 @@ struct TimingState {
     t1: Option<Instant>,
     /// `self.current` (`jitprof.py:60,69`) — nested event stack.  Each
     /// entry is a `Counters.*` id matching the matching `_start(event)`
-    /// push at `jitprof.py:81`.
+    /// push at `jitprof.py`.
     current: Vec<i32>,
     /// Set to the thread that first pushes onto an empty stack; cleared
     /// once the stack drains back to empty.  Same-thread re-entry is
@@ -158,7 +158,7 @@ struct TimingState {
 /// jitprof.py `Profiler` — every `Counters.*` slot is one
 /// `AtomicUsize`, plus the standalone `calls` counter that
 /// `count_ops` increments on the CALL_*+RECORDED_OPS path
-/// (jitprof.py:121-122).
+/// (jitprof.py).
 ///
 /// `field_for_kind` maps a `Counters.*` id (see `pyjitpl::counters`) to
 /// the matching `AtomicUsize`; unknown ids are silently ignored,
@@ -225,14 +225,14 @@ pub struct JitProfiler {
     pub backend_time_ns: AtomicU64,
     /// jit.py `Counters.OPS` — every executed op
     /// (`execute_and_record_varargs` / `execute_and_record`,
-    /// pyjitpl.py:2629/2645).
+    /// pyjitpl.py/2645).
     pub ops: AtomicUsize,
     /// jit.py `Counters.HEAPCACHED_OPS` — folded-away ops that the
     /// heapcache resolved without recording (pyjitpl.py:388/397/562/...).
     pub heapcached_ops: AtomicUsize,
     /// jit.py `Counters.RECORDED_OPS` — ops that survived the
     /// heapcache and reached `_record_helper` / `_record_helper_varargs`
-    /// (pyjitpl.py:2658/2669).
+    /// (pyjitpl.py/2669).
     pub recorded_ops: AtomicUsize,
     /// jit.py `Counters.GUARDS` — guards counted by the trace
     /// recorder (pyjitpl.py:2581).
@@ -276,7 +276,7 @@ pub struct JitProfiler {
     /// jit.py `Counters.NVREUSED`.
     pub nvreused: AtomicUsize,
     /// jitprof.Profiler.calls — `count_ops` increments this when the op
-    /// is a CALL_* and `kind == RECORDED_OPS` (jitprof.py:121-122).
+    /// is a CALL_* and `kind == RECORDED_OPS` (jitprof.py).
     pub calls: AtomicUsize,
     /// pyjitpl.py `_setup_once` guard — `if not
     /// self.profiler.initialized: self.profiler.start(); ...
@@ -345,7 +345,7 @@ impl JitProfiler {
             // `TOTAL_FREED_*`) live on the per-instance `cpu_tracker`
             // Arc bound to the backend's `CpuTotalTracker` — they
             // survive `Profiler.start()` (which only resets
-            // `self.counters` and `self.calls`, jitprof.py:55-61).
+            // `self.counters` and `self.calls`, jitprof.py).
         ] {
             field.store(0, Ordering::Relaxed);
         }
@@ -587,7 +587,7 @@ impl JitProfiler {
     /// [`CpuTotalTracker`] so the profiler and backend share one
     /// counter sink.  `MetaInterp::new` calls this once the backend is
     /// available, mirroring PyPy where `Profiler` reads through
-    /// `self.cpu.tracker` (jitprof.py:105-106) — `self.cpu` being the
+    /// `self.cpu.tracker` (jitprof.py) — `self.cpu` being the
     /// backend's `AbstractCPU` instance, not a process global.
     pub fn set_cpu_tracker(&self, tracker: Arc<CpuTotalTracker>) {
         let mut slot = self.cpu_tracker.lock();
@@ -653,7 +653,7 @@ impl JitProfiler {
         }
     }
 
-    /// Panic-safe RAII pairing matching `pyjitpl.py:2884-2898 / 2914-2935`:
+    /// Panic-safe RAII pairing matching `pyjitpl.py compile_and_run_once / 2914-2935`:
     ///
     /// ```python
     /// debug_start('jit-tracing')      # outer
@@ -869,7 +869,7 @@ impl Drop for TracingOpenRollback {
 }
 
 /// Which scope is the outer one — tracing wraps `debug_start` around
-/// the profiler call (`pyjitpl.py:2884-2898`), backend wraps the
+/// the profiler call (`pyjitpl.py compile_and_run_once`), backend wraps the
 /// profiler call around `debug_start` (`compile.py:532-546`).
 /// [`ProfilerEventGuard::drop`] dispatches the LIFO close order based
 /// on this flag so each callsite matches its PyPy counterpart exactly.
@@ -937,7 +937,7 @@ fn is_cpu_tracker_kind(kind: i32) -> bool {
 }
 
 /// Route `Counters.TOTAL_COMPILED_*` / `Counters.TOTAL_FREED_*` ids
-/// (jit.py:1438-1441) to the matching field on a
+/// (jit.py) to the matching field on a
 /// [`CpuTotalTracker`].  Mirrors `jitprof.py:105-106`:
 ///
 /// ```python
@@ -1100,7 +1100,7 @@ mod tests {
 
     #[test]
     fn count_ops_increments_kind_bucket_and_calls_only_on_call_recorded_ops() {
-        // jitprof.py:118-122 contract: counters[kind] += 1, and if the op
+        // jitprof.py count_ops contract: counters[kind] += 1, and if the op
         // is a CALL_* AND kind == RECORDED_OPS, calls += 1.  Other
         // (kind, opnum) combinations leave `calls` untouched.
         let prof = JitProfiler::default();

@@ -11,7 +11,7 @@
 //! ## Dependency-blocked paths
 //!
 //! * `immutablevalue(HostObject)` — the `extregistry.is_registered(x)`
-//!   branch (bookkeeper.py:312-314) is wired in
+//!   branch (bookkeeper.py) is wired in
 //!   [`Self::immutablevalue_hostobject`] via
 //!   [`crate::translator::rtyper::extregistry::is_registered`]; per-entry
 //!   value-level coverage extends as registrations land.
@@ -20,7 +20,7 @@
 //!   `SomeValue::call()` for `Builtin(_)` dispatches through
 //!   [`super::builtin::call_builtin`]. Only registered builtins route
 //!   through `SomeBuiltin`, matching upstream
-//!   `bookkeeper.py:309-311`.
+//!   `bookkeeper.py`.
 //! * `classpbc_attr_families` / `all_specializations` — not yet
 //!   mirrored on the Rust bookkeeper; reachable only from rtyper-phase
 //!   consumers.
@@ -220,7 +220,7 @@ pub struct Bookkeeper {
     pub(crate) dictdefs: RefCell<HashMap<Option<PositionKey>, DictDef>>,
     /// RPython `self.descs = {}` (bookkeeper.py). Maps
     /// `Constant(pyobj)` to a FunctionDesc / ClassDesc / FrozenDesc /
-    /// MethodDesc / MethodOfFrozenDesc per bookkeeper.py:353-409. The
+    /// MethodDesc / MethodOfFrozenDesc per bookkeeper.py getdesc. The
     /// Rust port keys directly on [`HostObject`] (which already has
     /// `Arc::ptr_eq` identity) via [`DescEntry`].
     /// `IndexMap`, not `HashMap`: `normalize_class_pbcs` iterates
@@ -237,7 +237,7 @@ pub struct Bookkeeper {
     /// RPython `self.methoddescs = {}` (bookkeeper.py). Keyed by
     /// `(funcdesc, originclassdef, selfclassdef, name, flags)` tuple
     /// so repeated `getmethoddesc(...)` calls with the same inputs
-    /// share identity, per bookkeeper.py:431-442.
+    /// share identity, per bookkeeper.py.
     pub(crate) methoddescs: RefCell<HashMap<MethodDescKey, Rc<RefCell<MethodDesc>>>>,
     /// RPython `self.frozenpbc_attr_families = UnionFind(FrozenAttrFamily)`
     /// (bookkeeper.py:63).
@@ -303,7 +303,7 @@ pub struct Bookkeeper {
     ///
     /// One entry per memo-specialised function, keyed by the funcdesc's
     /// pointer identity (upstream keys by the `funcdesc` object itself,
-    /// specialize.py:285). Each value is the
+    /// specialize.py). Each value is the
     /// `UnionFind(compute_one_result)` upstream uses (specialize.py) —
     /// the families of argument tuples that can be called together, merged
     /// on `union`, with each result living in its
@@ -321,7 +321,7 @@ pub struct Bookkeeper {
     /// RPython `self.needs_generic_instantiate = {}` (bookkeeper.py).
     ///
     /// Populated by `merge_classpbc_getattr_into_classdef`
-    /// (normalizecalls.py:260-262) for every class-PBC call family that
+    /// (normalizecalls.py) for every class-PBC call family that
     /// spans more than one class — `ClassesPBCRepr.call()` needs the
     /// generic instantiator. Drained by
     /// `create_instantiate_functions` (normalizecalls.py).
@@ -467,7 +467,7 @@ pub(crate) enum EmulatedPbcCallKey {
 }
 
 /// RPython `Bookkeeper.pbc_call`'s `emulated` parameter
-/// (bookkeeper.py:512-531). Encodes the Python-side three-state
+/// (bookkeeper.py). Encodes the Python-side three-state
 /// polymorphism (`None` / `True` / `<position_key>`) as a Rust enum:
 ///
 /// * `None` — real call: use `self.position_key`; pull
@@ -928,7 +928,7 @@ impl Bookkeeper {
     }
 
     /// RPython `Bookkeeper.check_no_flags_on_instances(self)`
-    /// (bookkeeper.py:120-150) — post-annotation sanity check invoked
+    /// (bookkeeper.py) — post-annotation sanity check invoked
     /// by `RPythonAnnotator.validate()`.
     ///
     /// Upstream body:
@@ -970,7 +970,7 @@ impl Bookkeeper {
     }
 
     /// RPython `Bookkeeper.compute_at_fixpoint(self)`
-    /// (bookkeeper.py:108-118) — invoked at the tail of
+    /// (bookkeeper.py) — invoked at the tail of
     /// `RPythonAnnotator.simplify()`.
     ///
     /// ```python
@@ -993,7 +993,7 @@ impl Bookkeeper {
     /// parity-faithful.
     ///
     /// Errors from `consider_call_site` propagate verbatim: upstream
-    /// `bookkeeper.py:108-118` runs both inner loops without a
+    /// `bookkeeper.py` runs both inner loops without a
     /// `try`/`except`, so a raised exception terminates
     /// `compute_at_fixpoint` and unwinds out of
     /// `RPythonAnnotator.simplify`.  Pyre's port mirrors this with
@@ -1024,7 +1024,7 @@ impl Bookkeeper {
     }
 
     /// RPython `Bookkeeper.consider_call_site(self, call_op)`
-    /// (bookkeeper.py:152-166).
+    /// (bookkeeper.py).
     ///
     /// ```python
     /// def consider_call_site(self, call_op):
@@ -1064,7 +1064,7 @@ impl Bookkeeper {
         // Vec<Option<SomeValue>>` carries None unchanged so downstream
         // `pbc_call → FunctionDesc.pycall → recursivecall` can route
         // through unbound positions exactly as upstream
-        // `description.py:283-305` does (each unbound position skips
+        // `description.py` does (each unbound position skips
         // its `binding_join` until the fixpoint round populates it).
         let mut args_s: Vec<Option<SomeValue>> = call_op
             .args
@@ -1099,7 +1099,7 @@ impl Bookkeeper {
     }
 
     /// RPython `Bookkeeper.getattr_locations(self, clsdesc, attrname)`
-    /// (bookkeeper.py:498-500).
+    /// (bookkeeper.py).
     ///
     /// ```python
     /// def getattr_locations(self, clsdesc, attrname):
@@ -1143,7 +1143,7 @@ impl Bookkeeper {
     }
 
     /// RPython `Bookkeeper.record_getattr(self, clsdesc, attrname)`
-    /// (bookkeeper.py:502-504).
+    /// (bookkeeper.py).
     ///
     /// ```python
     /// def record_getattr(self, clsdesc, attrname):
@@ -1191,7 +1191,7 @@ impl Bookkeeper {
     }
 
     /// RPython `Bookkeeper.update_attr(self, clsdef, attrdef)`
-    /// (bookkeeper.py:506-510).
+    /// (bookkeeper.py).
     ///
     /// ```python
     /// def update_attr(self, clsdef, attrdef):
@@ -1264,7 +1264,7 @@ impl Bookkeeper {
     /// bookkeeper's current position. Upstream stores flags inside the
     /// `listitem.__dict__`; Rust carries the `range_step` flag
     /// explicitly (the only non-default flag any caller passes — see
-    /// bookkeeper.py:193-195).
+    /// bookkeeper.py).
     ///
     /// The current position — including `None` — is used as the cache
     /// key directly, matching upstream's `self.listdefs[self.position_
@@ -1307,7 +1307,7 @@ impl Bookkeeper {
     }
 
     /// RPython `Bookkeeper.getdictdef(is_r_dict=False,
-    /// force_non_null=False, simple_hash_eq=False)` (bookkeeper.py:198-207).
+    /// force_non_null=False, simple_hash_eq=False)` (bookkeeper.py).
     ///
     /// `None` position caches just like `Some(pk)`, matching upstream's
     /// `self.dictdefs[self.position_key]` indexing. See [`Self::
@@ -1463,7 +1463,7 @@ impl Bookkeeper {
     /// specializer from `AnnotatorPolicy.get_specializer(tag)`. When the
     /// specializer is `memo`, return a [`DescEntry::Memo`] wrapping the
     /// `FunctionDesc` (upstream `if specializer is memo: return MemoDesc(
-    /// ...)`, bookkeeper.py:419-425); otherwise a [`DescEntry::Function`].
+    /// ...)`, bookkeeper.py); otherwise a [`DescEntry::Function`].
     pub(crate) fn newfuncdesc(
         self: &Rc<Self>,
         pyfunc: &HostObject,
@@ -1551,7 +1551,7 @@ impl Bookkeeper {
     }
 
     /// RPython `Bookkeeper.getmethoddesc(funcdesc, originclassdef,
-    /// selfclassdef, name, flags={})` (bookkeeper.py:431-442).
+    /// selfclassdef, name, flags={})` (bookkeeper.py).
     ///
     /// Caches MethodDescs by the `(funcdesc-id, origindef-id,
     /// selfdef-id, name, flags)` tuple — upstream's Python tuple hash
@@ -1708,7 +1708,7 @@ impl Bookkeeper {
     }
 
     /// RPython `Bookkeeper.get_classpbc_attr_families(attrname)`
-    /// (bookkeeper.py:447-456).
+    /// (bookkeeper.py).
     ///
     /// ```python
     /// def get_classpbc_attr_families(self, attrname):
@@ -1810,11 +1810,11 @@ impl Bookkeeper {
     /// `PyFrame` / `W_DictObject` Rust structs are ports of RPython
     /// classes (`W_Root` subclasses), so their annotation is
     /// `SomeInstance(classdef)` — `InstanceRepr._setup_repr`
-    /// (`rclass.py:501-509`) later lowers `classdef.attrs` into
+    /// (`rclass.py`) later lowers `classdef.attrs` into
     /// `Ptr(GcStruct(OBJECT, inst_<field>...))`.  RPython derives a
     /// `ClassDef` ONLY by class-object identity
     /// (`getuniqueclassdef(cls)` -> `getdesc(cls)` -> id() key,
-    /// `bookkeeper.py:339-345`, `uid.py:24-48`); there is no
+    /// `bookkeeper.py`, `uid.py`); there is no
     /// name->classdef path.  Pyre mirrors this by resolving the
     /// type-root string to a host class OBJECT exactly once
     /// ([`Self::intern_class_by_qualname`]), then routing through the
@@ -1880,7 +1880,7 @@ impl Bookkeeper {
             let host = self.intern_class_by_qualname(&n);
             // Materialise the classdef lineage base-most first:
             // `getdesc` and `ClassDef::new` each recurse into their
-            // base (classdesc.py:559 / :672) and both memoise, so
+            // base (classdesc.py / :672) and both memoise, so
             // pre-seeding every base keeps the native recursion depth
             // at one frame even when the embedded-header chain is
             // registry-deep (same worklist discipline as `graph`).
@@ -1961,7 +1961,7 @@ impl Bookkeeper {
     }
 
     /// TODO: no upstream equivalent.  The closest thing upstream,
-    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py:168-172`,
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py`,
     /// `:353-363`), keys identity on the Python object; pyre has no such
     /// object and keys on a qualname.
     /// Resolve the subclass `ClassDef` for one variant of a Rust enum —
@@ -2221,7 +2221,7 @@ impl Bookkeeper {
     }
 
     /// TODO: no upstream equivalent.  The closest thing upstream,
-    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py:168-172`,
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py`,
     /// `:353-363`), keys identity on the Python object; pyre has no such
     /// object and keys on a qualname.
     /// Project one struct's registry rows into its `ClassDef.attrs`
@@ -2437,7 +2437,7 @@ impl Bookkeeper {
     ///
     /// This is the incremental equivalent of RPython's global ordering:
     /// annotation finishes before `InstanceRepr._setup_repr` reads attrs
-    /// (`rpython/rtyper/rclass.py:487-518`).  It does not add a union rule or
+    /// (`rpython/rtyper/rclass.py`).  It does not add a union rule or
     /// synthesize a missing rtype field; it seeds the concrete constructor
     /// identity before the shared repr can be cached.
     fn project_enum_variant_payload_field_type(self: &Rc<Self>, field_ty: &str) -> SomeValue {
@@ -2464,7 +2464,7 @@ impl Bookkeeper {
     }
 
     /// TODO: no upstream equivalent.  The closest thing upstream,
-    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py:168-172`,
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py`,
     /// `:353-363`), keys identity on the Python object; pyre has no such
     /// object and keys on a qualname.
     /// Resolve a struct type-root name to its canonical host class
@@ -2494,7 +2494,7 @@ impl Bookkeeper {
     /// one struct intern to one `HostObject` — name strings are a
     /// resolution input, never the identity itself
     /// (`getuniqueclassdef(cls)` keys by class object,
-    /// bookkeeper.py:168).  Crate-included `::` names and dotted
+    /// bookkeeper.py).  Crate-included `::` names and dotted
     /// constructor qualnames shed exactly one local-crate segment and
     /// converge on the crate-relative key before this walk; a bare leaf
     /// whose origin was tombstoned by
@@ -2615,7 +2615,7 @@ impl Bookkeeper {
     }
 
     /// TODO: no upstream equivalent.  The closest thing upstream,
-    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py:168-172`,
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py`,
     /// `:353-363`), keys identity on the Python object; pyre has no such
     /// object and keys on a qualname.
     /// [`Self::intern_class_by_qualname`] with explicit `__bases__` for
@@ -2663,7 +2663,7 @@ impl Bookkeeper {
     }
 
     /// TODO: no upstream equivalent.  The closest thing upstream,
-    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py:168-172`,
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py`,
     /// `:353-363`), keys identity on the Python object; pyre has no such
     /// object and keys on a qualname.
     /// True when type-root `root` OWNS a field named `name`, or when any
@@ -2794,7 +2794,7 @@ impl Bookkeeper {
             // the registered-struct arm below produces `Impossible` and
             // blocks `ConstantData::Str.value`.
             // `BytesBlock` is pyre's concrete storage port of RPython `STR`:
-            // a `hash` header (`STR.become(GcStruct('rpy_string', ('hash', Signed), ...)`, `rstr.py:1226-1228`) followed by the `chars` array, whose length is the array's own length word.
+            // a `hash` header (`STR.become(GcStruct('rpy_string', ('hash', Signed), ...)`, `rstr.py`) followed by the `chars` array, whose length is the array's own length word.
             // `bytes_block_chars` folds the Rust raw-slice view back to this
             // owner, so the owner must carry the same `SomeString` annotation
             // as the slice it represents, not a nominal Rust-struct class.
@@ -3036,7 +3036,7 @@ impl Bookkeeper {
     }
 
     /// RPython `Bookkeeper.new_exception(self, exc_classes)`
-    /// (bookkeeper.py:174-176).
+    /// (bookkeeper.py).
     ///
     /// ```python
     /// def new_exception(self, exc_classes):
@@ -3056,7 +3056,7 @@ impl Bookkeeper {
     }
 
     /// RPython `Bookkeeper.pbc_call(self, pbc, args, emulated=None)`
-    /// (bookkeeper.py:512-537).
+    /// (bookkeeper.py).
     ///
     /// ```python
     /// def pbc_call(self, pbc, args, emulated=None):
@@ -3405,7 +3405,7 @@ impl Bookkeeper {
     }
 
     /// RPython `Bookkeeper.emulate_pbc_call(self, unique_key, pbc,
-    /// args_s, replace=[], callback=None)` (bookkeeper.py:539-572).
+    /// args_s, replace=[], callback=None)` (bookkeeper.py).
     ///
     /// ```python
     /// def emulate_pbc_call(self, unique_key, pbc, args_s,
@@ -3706,7 +3706,7 @@ impl Bookkeeper {
 
     /// Narrow dispatch for the `ConstValue::HostObject` arm of
     /// [`Self::immutablevalue`]. Mirrors upstream
-    /// `bookkeeper.py:309-333` — builtin-analyser / callable / class /
+    /// `bookkeeper.py` — builtin-analyser / callable / class /
     /// frozen fallbacks.
     ///
     /// The user-function and class branches now route through
@@ -3864,7 +3864,7 @@ impl Bookkeeper {
         // whose qualname is not registered in `BUILTIN_ANALYZERS`
         // (e.g. the bare `std.ptr.eq` / `std.mem.align_of` /
         // `std.alloc.dealloc` host stubs published by
-        // `HostEnv::bootstrap`).  Mirrors upstream `bookkeeper.py:317-331`
+        // `HostEnv::bootstrap`).  Mirrors upstream `bookkeeper.py`
         // `elif callable(x): result = SomePBC([self.getdesc(x)])`:
         // PyPy doesn't distinguish "analyzer-backed builtin" from
         // "bare-stub callable" at the immutablevalue boundary — both
@@ -3935,7 +3935,7 @@ impl Default for Bookkeeper {
 /// crate-included `pyre_object::unicodeobject::W_UnicodeObject`,
 /// crate-relative `unicodeobject::W_UnicodeObject`, and a dotted constructor
 /// qualname.  RPython keys all reads and constructors on the one live class
-/// object (`bookkeeper.py:361-363` — `obj_key = Constant(pyobj)`), so normalize
+/// object (`bookkeeper.py` — `obj_key = Constant(pyobj)`), so normalize
 /// dots and strip one crate prefix only when StructId resolution proves that
 /// both spellings denote the same declaration.
 ///
@@ -4417,7 +4417,7 @@ pub fn ishashable(_x: &HostObject) -> bool {
 
 /// RAII guard returned by [`Bookkeeper::at_position`]. Mirrors the
 /// upstream `@contextmanager` exit — calls [`Bookkeeper::leave`] on
-/// drop unless the fast-path at bookkeeper.py:99-101 skipped the
+/// drop unless the fast-path at bookkeeper.py skipped the
 /// initial enter.
 pub(crate) struct PositionGuard {
     bk: Rc<Bookkeeper>,
@@ -5447,7 +5447,7 @@ mod tests {
         // `intern_enum_variant_host`) and the discriminant-NARROWING path
         // (`getuniqueclassdef_for_enum_variant`) must resolve the SAME
         // class object — RPython's single-class-per-variant identity
-        // (`ClassDesc.getuniqueclassdef`, `classdesc.py:699-702`) — and it
+        // (`ClassDesc.getuniqueclassdef`, `classdesc.py`) — and it
         // must carry the variant's payload
         // attr.  Before the unification the ctor minted a dotted-qualname
         // sibling classdef with no payload attrs.

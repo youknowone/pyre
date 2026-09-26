@@ -212,7 +212,7 @@ pub unsafe fn w_cell_set(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*cell).contents = value }
     // The cell is an old-gen (`try_gc_alloc_stable`) object; storing a
     // possibly-nursery `value` into it needs the incminimark write barrier
-    // (incminimark.py:1495) so the next minor collection scans the cell and
+    // (incminimark.py write_barrier_from_array) so the next minor collection scans the cell and
     // relocates the young value held only by `contents`.
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }

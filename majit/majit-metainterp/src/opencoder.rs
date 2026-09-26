@@ -16,7 +16,7 @@ fn u16_to_opcode(v: u16) -> OpCode {
     unsafe { std::mem::transmute(v) }
 }
 
-// ── Signed varint encoding (opencoder.py:59-89) ──
+// ── Signed varint encoding (opencoder.py encode_varint_signed) ──
 //
 // Literal port of rpython/jit/metainterp/opencoder.py encode_varint_signed
 // / decode_varint_signed. Either 2 bytes or 4 bytes, chosen by range:
@@ -594,7 +594,7 @@ where
             // identities when a raw op slot collides with an inputarg or
             // earlier phase-local box. The ResOp class (`opclasses[opnum]`
             // / cls()) is intrinsically typed via the IntOp/FloatOp/RefOp
-            // mixin (resoperation.py:564-638); pyre uses
+            // mixin (resoperation.py); pyre uses
             // `opcode.result_type()`.
             let fresh = OpRef::op_typed(self._fresh, src.opcode.result_type());
             self._fresh += 1;
@@ -613,7 +613,7 @@ where
             // the raw trace position counter. The op is not cached
             // (RPython doesn't cache void results either), so later args
             // never reference it. `AbstractResOp.type = 'v'`
-            // (resoperation.py:260) → VoidOp variant.
+            // (resoperation.py) → VoidOp variant.
             let f = OpRef::void_op(self._fresh);
             self._fresh += 1;
             res.pos().set(f);
@@ -931,7 +931,7 @@ impl<'a> ByteTraceIter<'a> {
     /// `pub(crate)` because `SnapshotIterator::get` / `unpack_array`
     /// (opencoder.py) dispatch through `main_iter._untag`.
     pub(crate) fn _untag(&mut self, tagged: i64) -> Operand {
-        // RPython opencoder.py:321-322 uses arithmetic shift on a
+        // RPython opencoder.py _untag uses arithmetic shift on a
         // Python int; in Rust we preserve sign by going through i64
         // rather than u32 for the value.
         let tag = (tagged & TAG_MASK as i64) as u8;
@@ -995,7 +995,7 @@ impl<'a> Iterator for ByteTraceIter<'a> {
             let tagged = self._next();
             args.push(self._untag(tagged));
         }
-        // opencoder.py:409-424 `opwithdescr` branch.  Guards thread the
+        // opencoder.py __init__ `opwithdescr` branch.  Guards thread the
         // snapshot index into `rd_resume_position` but emit `descr=None`
         // at the Op level; every other descr-bearing op resolves its
         // descr via `metainterp_sd.all_descrs` (global slot, index <
@@ -1045,7 +1045,7 @@ impl<'a> Iterator for ByteTraceIter<'a> {
         // opencoder.py:373-374 `cls = opclasses[opnum]; res = cls()` —
         // the ResOp class is intrinsically typed via the IntOp/FloatOp/
         // RefOp mixin (resoperation.py) or the AbstractResOp
-        // default `'v'` (resoperation.py:260). pyre routes through
+        // default `'v'` (resoperation.py). pyre routes through
         // `op_typed` which lands on the matching variant.
         let fresh_pos = OpRef::op_typed(self._fresh, opcode.result_type());
         self._fresh += 1;
@@ -1054,7 +1054,7 @@ impl<'a> Iterator for ByteTraceIter<'a> {
         // fresh op IS the cached box object, so a later TAGBOX arg binds
         // to this exact `Rc` (`from_bound_op` → `Operand::Op`).
         let op: majit_ir::OpRc = OpRc::new(op);
-        // opencoder.py:429-431 — cache non-void result at `_index`, bump.
+        // opencoder.py combine_uint — cache non-void result at `_index`, bump.
         if opcode.result_type() != Type::Void {
             let slot = self._index as usize;
             if slot >= self._cache.len() {
@@ -1089,7 +1089,7 @@ impl Trace {
 ///
 /// Layout at offset `array_idx`:
 /// `[length:varint][box0:varint][box1:varint]...`. `array_idx == 0`
-/// always decodes to the empty iterator (opencoder.py:465
+/// always decodes to the empty iterator (opencoder.py
 /// `BoxArrayIter.BOXARRAYITER0`; also opencoder.py
 /// `new_array(0) -> 0`).
 pub struct BoxArrayIter<'a> {
@@ -1100,7 +1100,7 @@ pub struct BoxArrayIter<'a> {
     /// decoded array length, captured at construction. `remaining`
     /// counts down as `next()` consumes items, while `total_length`
     /// keeps the original count so `SnapshotIterator.size`
-    /// (opencoder.py:210) can read it back without re-decoding.
+    /// (opencoder.py) can read it back without re-decoding.
     pub total_length: i64,
 }
 
@@ -1155,7 +1155,7 @@ impl ExactSizeIterator for BoxArrayIter<'_> {}
 /// Yields byte offsets of each parent snapshot record (in the
 /// `[jitcode][pc][array][prev]` layout written by `_encode_snapshot`).
 /// The top snapshot's leading `vable_array_index` /
-/// `vref_array_index` are extracted in `new()` (opencoder.py:150-151)
+/// `vref_array_index` are extracted in `new()` (opencoder.py)
 /// and exposed as struct fields.
 pub struct TopDownSnapshotIterator<'a> {
     snapshot_data: &'a [u8],
@@ -1580,7 +1580,7 @@ pub struct Trace {
     /// opencoder.py:488 self._snapshot_array_data — byte chain encoding
     /// the box arrays referenced by snapshots. Index 0 is reserved for
     /// the empty (length 0) array — `append_snapshot_array_data_int(0)`
-    /// is called in the constructor (opencoder.py:489).
+    /// is called in the constructor (opencoder.py).
     pub _snapshot_array_data: Vec<u8>,
     /// opencoder.py:478 self._total_snapshots — monotonic snapshot
     /// counter; bumped in `create_snapshot` / `create_top_snapshot`.
@@ -1751,7 +1751,7 @@ impl Trace {
     /// history.py `length`: number of non-inputarg ops recorded so far.
     /// = `_count - max_num_inputargs`. Compared against
     /// `warmstate.trace_limit` by `MetaInterp.blackhole_if_trace_too_long`
-    /// (pyjitpl.py:2791).
+    /// (pyjitpl.py).
     pub fn num_ops(&self) -> usize {
         (self._count - self.max_num_inputargs) as usize
     }
@@ -1919,7 +1919,7 @@ impl Trace {
     /// while recording — any `append_int` that saw a value outside
     /// `[MIN_VALUE, MAX_VALUE]` trips it (opencoder.py). This
     /// mirrors RPython's `raise SwitchToBlackhole(Counters.ABORT_TOO_LONG)`
-    /// path (opencoder.py:548-549) and lets the caller route into the
+    /// path (opencoder.py) and lets the caller route into the
     /// blackhole.
     ///
     /// On success, clears the `_bigints_dict` / `_refs_dict` dedup
@@ -2031,7 +2031,7 @@ impl Trace {
     ///
     /// Mirrors RPython's `isinstance(box, Const|AbstractResOp)` chain.
     /// `ConstInt` further splits on the SMALL_INT range
-    /// (opencoder.py:605-608 vs 609-622).
+    /// (opencoder.py vs 609-622).
     pub(crate) fn _encode(&mut self, b: Box) -> i64 {
         match b {
             // opencoder.py:605-608 ConstInt within SMALL_INT range.
@@ -2049,7 +2049,7 @@ impl Trace {
         }
     }
 
-    // ── Snapshot writers (opencoder.py:712-817) ──
+    // ── Snapshot writers (opencoder.py _list_of_boxes) ──
 
     /// opencoder.py new_array(lgt).
     ///
@@ -2156,7 +2156,7 @@ impl Trace {
     /// INVARIANT: the last 2 bytes of `_snapshot_data` must be the
     /// signed-varint encoding of `SNAPSHOT_PREV_NEEDS_PATCHING` (-3).
     /// `-3` fits in 2 bytes (RPython literally asserts the bytes
-    /// `'}' '\xff'` at opencoder.py:813-814). We assert the same.
+    /// `'}' '\xff'` at opencoder.py). We assert the same.
     #[allow(dead_code)]
     pub(crate) fn snapshot_add_prev(&mut self, prev: i32) {
         debug_assert!(self._snapshot_data.len() >= 2, "snapshot_data too short");
@@ -2176,7 +2176,7 @@ impl Trace {
         self.append_snapshot_data_int(prev as i64);
     }
 
-    // ── Snapshot chain entry points (opencoder.py:767-843) ──
+    // ── Snapshot chain entry points (opencoder.py create_top_snapshot) ──
 
     /// opencoder.py create_top_snapshot(frame, vable_boxes,
     /// vref_boxes, after_residual_call, is_last).
@@ -2287,7 +2287,7 @@ impl Trace {
     /// an overlapping borrow on `metainterp_sd` during the write).
     ///
     /// `in_a_call` is forced to `false` at the topmost frame — the
-    /// RPython invariant at opencoder.py:769.
+    /// RPython invariant at opencoder.py.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
@@ -2679,7 +2679,7 @@ impl Trace {
     /// from `_encode_descr` (Phase B4); guards pass 0 to get a
     /// placeholder that `capture_resumedata` patches to the snapshot
     /// index (Phase B5/B7). Bumps `_count` unconditionally and `_index`
-    /// only for non-void ops (opencoder.py:661).
+    /// only for non-void ops (opencoder.py).
     pub(crate) fn _op_end(&mut self, opcode: OpCode, descr_index: i64, _old_pos: usize) {
         if opcode.has_descr() {
             self.append_int(descr_index);
@@ -2712,7 +2712,7 @@ impl Trace {
     /// opencoder.py record_op(opnum, argboxes, descr=None).
     ///
     /// Returns the pre-bump `_index` — the box position that THIS op's
-    /// result will occupy if it is non-void (opencoder.py:665 `pos =
+    /// result will occupy if it is non-void (opencoder.py `pos =
     /// self._index`). Each `Box` is passed through `_encode` to
     /// produce the wire-format tagged value. `descr=None` emits the
     /// 0-placeholder (guards and no-descr ops); `Some(&descr)` routes
@@ -2918,9 +2918,9 @@ impl Trace {
     /// `_snapshot_array_data` and returns `liveranges[v] =
     /// last_use_index` for every raw trace position `v` (opencoder.py:
     /// 855 `index = t._count`; walk via `next_element_update_live_range`
-    /// at opencoder.py:340-360). Guard fail-arg equivalents come from
+    /// at opencoder.py). Guard fail-arg equivalents come from
     /// the attached snapshot chain through `update_liveranges`
-    /// (opencoder.py:239-247).
+    /// (opencoder.py).
     #[allow(dead_code)]
     pub(crate) fn get_live_ranges(&self) -> Vec<usize> {
         let mut liveranges = vec![0usize; self._index as usize];
@@ -2993,11 +2993,11 @@ impl Trace {
     /// *certainly* dead before step `x`. Collisions (multiple values
     /// dying at the same step) are resolved by linear probing forward
     /// through `deadranges` — the nested `insert(ranges, pos, v)`
-    /// helper at opencoder.py:865-871.
+    /// helper at opencoder.py.
     ///
     /// Result is memoized in `_deadranges = (self._count, deadranges)`
     /// and returned unchanged across calls until `_count` advances
-    /// (opencoder.py:873-875, 883).
+    /// (opencoder.py, 883).
     #[allow(dead_code)]
     pub(crate) fn get_dead_ranges(&mut self) -> Vec<usize> {
         // opencoder.py:873-875 cache hit path.
@@ -3619,10 +3619,10 @@ mod tests {
     #[test]
     fn test_trace_record_buffer_initial_state_b1() {
         // Phase B1 smoke test: `Trace::new(max_num_inputargs)` seeds the
-        // counters per opencoder.py:497-500 (all four — including
+        // counters per opencoder.py (all four — including
         // `_pos` — equal `max_num_inputargs`) and reserves
         // `snapshot_array_data` index 0 for the empty-length array
-        // (opencoder.py:489 + :728-733).
+        // (opencoder.py + :728-733).
         let buf = TraceRecordBuffer::new(3, empty_sd());
         assert_eq!(buf.max_num_inputargs, 3);
         assert_eq!(buf._count, 3);
@@ -4113,7 +4113,7 @@ mod tests {
 
     /// Phase B11: `tracing_done()` returns `Err(AbortReason::TooLong)`
     /// iff `tag_overflow` was tripped while recording, and clears the
-    /// dedup dictionaries on success (opencoder.py:546-562).
+    /// dedup dictionaries on success (opencoder.py).
     #[test]
     fn test_tracing_done_clears_dicts_b11() {
         let mut buf = TraceRecordBuffer::new(0, empty_sd());
@@ -4394,7 +4394,7 @@ mod tests {
     }
 
     /// Phase B3 smoke test: fixed-arity record_op* does NOT write a
-    /// count varint (opencoder.py:642-650), only the opnum byte + args.
+    /// count varint (opencoder.py), only the opnum byte + args.
     /// Variadic record_op writes opnum + count + args. _count bumps
     /// once per call; _index bumps only for non-void results.
     #[test]
@@ -4742,7 +4742,7 @@ mod tests {
     /// `SnapshotIterator`: an empty top snapshot
     /// (`create_empty_top_snapshot`, jitcode_index == -1) has an empty
     /// framestack and `size == vable.total_length + vref.total_length + 3`.
-    /// Mirrors opencoder.py:212-213 early-return branch.
+    /// Mirrors opencoder.py early-return branch.
     #[test]
     fn test_snapshot_iterator_empty_top() {
         let mut buf = TraceRecordBuffer::new(2, empty_sd());

@@ -200,7 +200,7 @@ pub mod pyframe;
 pub mod test_hooks {
     use pyre_object::PyObjectRef;
 
-    /// `baseobjspace.py:840-845 hash_w` — the single hash entry point,
+    /// `baseobjspace.py is_none hash_w` — the single hash entry point,
     /// mirrored for tests via `builtins::try_hash_value`.  On error it
     /// records the pending exception the same way the production
     /// trampoline does (`pyre-jit::eval`'s `pyre_object_hash_w_trampoline`).
@@ -1063,7 +1063,7 @@ pub use pyre_object::lltype::PyreClassPyTypeOf;
 /// entry is a `(type, parent)` tuple consumed by the JIT registration
 /// loop in `pyre/pyre-jit/src/eval.rs`. The parent feeds
 /// `TypeInfo::object_subclass` so `assign_inheritance_ids`
-/// (normalizecalls.py:373-389) computes the right preorder bounds.
+/// (normalizecalls.py) computes the right preorder bounds.
 ///
 /// These live here rather than in `pyre_object::pyobject` because
 /// `pyre-object` cannot depend on `pyre-interpreter`.

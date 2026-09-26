@@ -1,7 +1,7 @@
 //! Regression test: pyre's `JitState` impl must declare multi-frame restore
 //! support so the metainterp dispatch arms / helper guard-fail path that
 //! recover a chain of caller frames are reached at run time
-//! (`blackhole.py:1800` parity).
+//! (`blackhole.py` parity).
 //!
 //! Removing the override on `PyreJitState` would silently fall back to the
 //! trait default (`false`) and break multi-frame resume without any test

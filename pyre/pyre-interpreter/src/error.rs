@@ -651,14 +651,14 @@ pub enum PyErrorKind {
     AssertionError,
     /// Raised by `_weakref` when a proxy is dereferenced after the
     /// referent has been collected.
-    /// pypy/module/_weakref/interp__weakref.py:347
+    /// pypy/module/_weakref/interp__weakref.py
     /// `oefmt(space.w_ReferenceError, "weakly referenced object no longer exists")`.
     ReferenceError,
     /// BaseException subclass — raised inside generators by gen.close().
     /// Not a subclass of Exception, so `except Exception` does not catch it.
     GeneratorExit,
     RecursionError,
-    /// Internal parity marker for pypy/interpreter/pycode.py:25
+    /// Internal parity marker for pypy/interpreter/pycode.py BytecodeCorruption
     /// `BytecodeCorruption`. This should not be raised as a user-level
     /// Python exception; it signals malformed bytecode in the interpreter.
     BytecodeCorruption,
@@ -708,7 +708,7 @@ pub enum PyErrorKind {
     UnicodeError,
     UnicodeDecodeError,
     UnicodeEncodeError,
-    /// `pypy/module/exceptions/interp_exceptions.py:426
+    /// `pypy/module/exceptions/interp_exceptions.py W_UnicodeTranslateError
     /// W_UnicodeTranslateError` — subclass of UnicodeError.
     /// Identity-only port: dedicated PyErrorKind / ExcKind / PyType
     /// so render_exception preserves the class.  W_UnicodeTranslateError's
@@ -755,7 +755,7 @@ impl PyError {
         }
     }
 
-    /// `pypy/interpreter/pyopcode.py:1303-1316` tests iterator exhaustion with
+    /// `pypy/interpreter/pyopcode.py FOR_ITER` tests iterator exhaustion with
     /// a Python-level MRO match. A flat `PyErrorKind` tag cannot express
     /// multiple inheritance, so only exact-tagged errors use the free fast
     /// path. An internally built error has no cached exception object and can
@@ -825,7 +825,7 @@ impl PyError {
         err
     }
 
-    /// PyPy `error.py:725-737 enrich_attribute_error` / CPython 3.14
+    /// PyPy `error.py enrich_attribute_error` / CPython 3.14
     /// `_PyObject_SetAttributeErrorContext`: an `AttributeError` escaping a
     /// public attribute lookup gets the receiver and requested name when (and
     /// only when) neither slot was already supplied by an inner lookup or by
@@ -1719,7 +1719,7 @@ impl PyError {
     /// upgrade-to-exception-instance path: when the OperationError
     /// carries a raw message (the `oefmt` shape), the materialised
     /// exception instance gets `args = (msg,)` per
-    /// `pypy/module/exceptions/interp_exceptions.py:123-124
+    /// `pypy/module/exceptions/interp_exceptions.py
     /// W_BaseException.descr_init` — `self.args_w = args_w`.  Pyre
     /// stores `args_w` as a `W_ListObject`, so we stamp a one-element
     /// list `[msg_str]` here so `str(e)` and `repr(e)` and
@@ -2270,7 +2270,7 @@ impl PyError {
         } else {
             crate::display::wtf8_format!("Exception ignored in: ", where_desc)
         };
-        // vm.py:19-25 also carries `extra_line`; pyre's hook-args
+        // vm.py UnraisableHookArgs also carries `extra_line`; pyre's hook-args
         // structseq targets the 5-field shape, so only the default printer
         // receives the Rust-side extra line.
         let mut hook_fields = pyre_object::gc_roots::RootedItems::new();
@@ -2546,7 +2546,7 @@ impl PyError {
             ExcKind::UnicodeError => PyErrorKind::UnicodeError,
             ExcKind::UnicodeDecodeError => PyErrorKind::UnicodeDecodeError,
             ExcKind::UnicodeEncodeError => PyErrorKind::UnicodeEncodeError,
-            // `pypy/module/exceptions/interp_exceptions.py:426`
+            // `pypy/module/exceptions/interp_exceptions.py W_UnicodeTranslateError`
             // W_UnicodeTranslateError — subclass of UnicodeError.
             ExcKind::UnicodeTranslateError => PyErrorKind::UnicodeTranslateError,
             ExcKind::SystemExit => PyErrorKind::SystemExit,
@@ -4462,7 +4462,7 @@ pub fn eprint_exception(err: &PyError, include_traceback: bool) {
 /// `app_main.py handle_sys_exit` — `exitcode = e.code`; `None` exits
 /// 0; otherwise `int(exitcode)`, and a value `int()` rejects is printed to
 /// stderr with exit status 1. `e.code` itself is `args[0]` for a 1-arg raise
-/// and the whole args tuple otherwise (`interp_exceptions.py:993-998
+/// and the whole args tuple otherwise (`interp_exceptions.py descr_init
 /// W_SystemExit.descr_init`). A `SystemExit` with no object behind it has no
 /// `code` attribute beyond the class default `None`, i.e. a success exit.
 ///

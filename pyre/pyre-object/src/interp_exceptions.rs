@@ -55,7 +55,7 @@ pub static EXC_UNICODE_DECODE_ERROR_TYPE: PyType =
     crate::pyobject::new_pytype("UnicodeDecodeError");
 pub static EXC_UNICODE_ENCODE_ERROR_TYPE: PyType =
     crate::pyobject::new_pytype("UnicodeEncodeError");
-/// PyPy `pypy/module/exceptions/interp_exceptions.py:426
+/// PyPy `pypy/module/exceptions/interp_exceptions.py W_UnicodeTranslateError
 /// W_UnicodeTranslateError = _new_exception('UnicodeTranslateError',
 /// W_UnicodeError, ...)` — subclass of UnicodeError.  A dedicated PyType
 /// + ExcKind for isinstance / `ob_type` discrimination, with the 4-arg
@@ -155,7 +155,7 @@ pub enum ExcKind {
     NotImplementedError = 14,
     AssertionError = 15,
     /// Raised by `_weakref` when a proxy is dereferenced after the
-    /// referent has been collected — pypy/module/_weakref/interp__weakref.py:347
+    /// referent has been collected — pypy/module/_weakref/interp__weakref.py
     /// `oefmt(space.w_ReferenceError, "weakly referenced object no longer exists")`.
     /// `interp__weakref::force` raises the hyphenated `proxy_check_ref`
     /// wording instead.
@@ -193,7 +193,7 @@ pub enum ExcKind {
     /// — intermediate parent for UnicodeDecodeError and
     /// UnicodeEncodeError.
     UnicodeError = 27,
-    /// `pypy/module/exceptions/interp_exceptions.py:426
+    /// `pypy/module/exceptions/interp_exceptions.py W_UnicodeTranslateError
     /// W_UnicodeTranslateError = _new_exception('UnicodeTranslateError',
     /// W_UnicodeError, ...)`.  A dedicated kind so `ob_type` and
     /// `isinstance` discriminate it correctly, with the 4-arg
@@ -2265,7 +2265,7 @@ pub unsafe fn w_exception_kind_byte(obj: PyObjectRef) -> u8 {
 ///
 /// `blackhole.py _exit_frame_with_exception` casts its value to
 /// GCREF and every later classification runs through a genuine class lookup
-/// (`bh_classof` / `space.exception_match`, i.e. the `rclass.py:1133-1137`
+/// (`bh_classof` / `space.exception_match`, i.e. the `rclass.py ll_issubclass`
 /// subclass ranges).  Pyre reads a `#[repr(u8)]` tag out of the object
 /// instead, which turns a bad value into an out-of-range index into a
 /// bounds-check-free jump table (`ExcKind::MAX_DISCRIMINANT`).  This restores

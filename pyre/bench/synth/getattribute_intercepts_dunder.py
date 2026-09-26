@@ -2,7 +2,7 @@
 # `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
 # rather than any generated code, and reads whatever the host's process
 # spawn cost happens to be that run. The jitstats baselines gate it.
-# descroperation.py:87 — a user-defined __getattribute__ slot intercepts EVERY
+# descroperation.py Object — a user-defined __getattribute__ slot intercepts EVERY
 # attribute access, including the name '__getattribute__' itself; there is no
 # special-casing that bypasses the custom slot for dunder names.
 

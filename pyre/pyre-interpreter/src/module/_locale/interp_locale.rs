@@ -166,7 +166,7 @@ struct LocaleConvData {
 /// Build the `localeconv()` result dict.  String fields decode the host
 /// bytes via `charp2uni` (utf-8 + surrogateescape, `interp_locale.py`);
 /// grouping lists already carry the trailing 0 that `_w_copy_grouping`
-/// appends to a non-empty grouping (`interp_locale.py:36-40`).
+/// appends to a non-empty grouping (`interp_locale.py`).
 fn localeconv_to_dict(c: &LocaleConvData) -> pyre_object::PyObjectRef {
     // A `dict` header moves, and each of the eighteen insertions below
     // allocates: the value, the key string `w_dict_setitem_str` builds, and

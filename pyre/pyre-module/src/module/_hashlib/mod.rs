@@ -501,7 +501,7 @@ pub unsafe fn w_hmac_dealloc(obj: PyObjectRef) {
 mod hmac_class {
     use super::*;
 
-    // lib_pypy/_hashlib/__init__.py:232: `class HMAC(HASH)`.  HMAC keeps its
+    // lib_pypy/_hashlib/__init__.py: `class HMAC(HASH)`.  HMAC keeps its
     // own native payload layout, but its Python type relationship is the same
     // TypeDef inheritance PyPy exposes.
     #[pyre_interpreter::pyre_methods(base = hash_state_class::type_object())]
@@ -604,7 +604,7 @@ fn resolve_hmac_digestmod(
         match pyre_interpreter::baseobjspace::getattr_str(digestmod, "__name__") {
             Ok(name) => name,
             // PyPy's structural rule is to accept every object that exposes
-            // `__name__` (lib_pypy/_hashlib/__init__.py:547-554).  CPython
+            // `__name__` (lib_pypy/_hashlib/__init__.py).  CPython
             // 3.14 additionally normalizes a missing name to the module's
             // public UnsupportedDigestmodError; preserve both without
             // restricting the accepted object type again.
@@ -894,7 +894,7 @@ fn scrypt_kdf(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyE
 
     // RFC 7914's dominant allocation is V[N] with 128*r-byte entries. OpenSSL
     // also needs B[p] and a working block.  PyPy passes maxmem=0 through to
-    // EVP_PBE_scrypt (lib_pypy/_hashlib/__init__.py:430-433), where OpenSSL
+    // EVP_PBE_scrypt (lib_pypy/_hashlib/__init__.py), where OpenSSL
     // applies its private 32 MiB default.  The Rust backend has no such layer,
     // so spell out that same default here rather than treating zero as
     // unlimited memory.

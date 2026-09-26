@@ -1467,7 +1467,7 @@ impl LowererConfig {
     /// Callers rebind their struct path through this before building the field
     /// key, so the declaration lookup, the type id, and every compile-time
     /// witness (`size_of`, `offset_of!`) move together onto the declaring
-    /// struct. That is the whole of the cast: `jtransform.py:254
+    /// struct. That is the whole of the cast: `jtransform.py rewrite_op_cast_pointer
     /// rewrite_op_cast_pointer` lowers `cast_pointer` to `same_as`, so no
     /// operation is emitted and the base pointer is unchanged — which holds
     /// only because an inlined base is required to start at offset 0.
@@ -1490,7 +1490,7 @@ impl LowererConfig {
     /// struct's positional field list, so an outer struct's list begins with
     /// the base's own fields and its own fields are numbered after them. That
     /// numbering is load-bearing twice over: `get_fielddescr_index_in`
-    /// (`heaptracker.py:97`) assigns `index_in_parent` from it, and the
+    /// (`heaptracker.py`) assigns `index_in_parent` from it, and the
     /// per-object field cache slots by that index. Without the base's entries
     /// an outer struct's first own field takes slot 0 — the slot the base's
     /// first field already occupies for the same object.
@@ -1520,7 +1520,7 @@ impl LowererConfig {
             }
             remaining -= 1;
             let base_field = syn::Ident::new(base_field, proc_macro2::Span::call_site());
-            // `lltype.py:296-305` admits an inlined substructure only at
+            // `lltype.py _first_struct` admits an inlined substructure only at
             // `_names[0]`, and the offsets below assume it: a redirected access
             // keeps the outer pointer in its register and offsets by the
             // field's place within the base, which names the right word only
@@ -1932,7 +1932,7 @@ pub(super) enum ControlFlowClass {
 
 /// TODO: no upstream counterpart.
 ///
-/// `rpython/jit/codewriter/liveness.py:82-116`'s `-live-` is always
+/// `rpython/jit/codewriter/liveness.py remove_repeated_live`'s `-live-` is always
 /// unconditional; `jtransform.py:311-312` decides whether to emit one at
 /// translation time from `calldescr_canraise(calldescr)`, which is
 /// statically known once the calldescr is built.  pyre's macro expansion
@@ -1946,7 +1946,7 @@ pub(super) enum ControlFlowClass {
 /// siblings' reads is safe); a run consisting entirely of conditional
 /// markers stays unmerged so that each marker's BC_LIVE captures only
 /// its own alive set when its condition holds — unioning them would
-/// over-capture vs PyPy's per-site `liveness.py:111-115`
+/// over-capture vs PyPy's per-site `liveness.py`
 /// `liveset.update(live[1:])` (which only sees `-live-`s that actually
 /// exist).  Convergence path: once the ann/rtyper EffectInfo
 /// infrastructure (Tasks #146/#235) exposes the helper's analyzer

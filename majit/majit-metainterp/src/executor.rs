@@ -397,7 +397,7 @@ pub fn execute_varargs<M: Clone>(
     // wrapper can run BH_LAST_EXC_VALUE transcription regardless of
     // which arm fires.
     let result = (|| -> i64 {
-        // COND_CALL / COND_CALL_VALUE_* layout (pyjitpl.py:2128-2151):
+        // COND_CALL / COND_CALL_VALUE_* layout (pyjitpl.py do_conditional_call):
         //   argboxes[0] = condbox / valuebox
         //   argboxes[1] = funcbox
         //   argboxes[2..] = call args
@@ -455,7 +455,7 @@ pub fn execute_varargs<M: Clone>(
     //      `last_exc_value` AND clears `class_of_last_exc_is_const`,
     //      so a stale `True` from a prior GUARD_EXCEPTION cannot make
     //      `handle_possible_exception` treat the new exception's
-    //      class as constant (pyjitpl.py:2745-2755).
+    //      class as constant (pyjitpl.py).
     //   2. Override the returned value with the type's neutral zero —
     //      `make_result_of_lastop` (`pyjitpl/frame.rs`) snapshots the
     //      concrete result *before* `handle_possible_exception` runs,
@@ -771,7 +771,7 @@ pub fn execute_nonspec_const(
         // `protect_speculative_array` validated the gcref + tid; the
         // arraydescr is expected to carry a `len_descr` (registered
         // by the backend's array metadata), so a missing one is a
-        // bug — fail-loud per `llmodel.py:585 assert isinstance(...)`.
+        // bug — fail-loud per `llmodel.py assert isinstance(...)`.
         if let (Value::Ref(array), Some(d)) = (a, descr)
             && let Some(ad) = d.as_array_descr()
             && opnum == OpCode::ArraylenGc
@@ -842,7 +842,7 @@ pub fn execute_nonspec_const(
         //   `cpu.bh_getarrayitem_gc_*(array, index, ad)`.
         // `protect_speculative_array` + the array-bounds check at
         // `optimizer.py:865-867` validated the gcref/index pre-fold;
-        // unsupported `item_size` matches `llmodel.py:478`'s
+        // unsupported `item_size` matches `llmodel.py`'s
         // NotImplementedError, fail-loud via `unreachable!()`.
         if let (Value::Ref(array), Value::Int(index), Some(d)) = (argboxes[0], argboxes[1], descr)
             && let Some(ad) = d.as_array_descr()
@@ -888,7 +888,7 @@ pub fn execute_nonspec_const(
 
     // ── arity == 3 row of EXECUTE_BY_NUM_ARGS ──
     if arity == 3 {
-        // executor.py `do_int_between` -> blackhole.py:560
+        // executor.py `do_int_between` -> blackhole.py bhimpl_int_between
         // `bhimpl_int_between(a, b, c): return a <= b < c`.
         if let (Value::Int(a), Value::Int(b), Value::Int(c)) =
             (argboxes[0], argboxes[1], argboxes[2])
@@ -952,8 +952,8 @@ pub fn execute_cast_const_row(opcode: OpCode, arg: majit_ir::Value) -> ConstFold
         // `assembler.py:1528-1529 genop_cast_ptr_to_int =
         // _genop_same_as` / `genop_cast_int_to_ptr = _genop_same_as`.
         // PyPy treats both casts as raw identity at every level:
-        // backend, executor, and test_lltype.py:693-701 /
-        // runner_test.py:1957-1966 expect
+        // backend, executor, and test_lltype.py test_odd_ints /
+        // runner_test.py test_cast_int_to_ptr expect
         // `cast_int_to_ptr(21) → cast_ptr_to_int == 21`.
         (OpCode::CastPtrToInt, Value::Ref(r)) => ConstFold::Folded(Value::Int(r.0 as i64)),
         (OpCode::CastIntToPtr, Value::Int(i)) => ConstFold::Folded(Value::Ref(GcRef(i as usize))),
@@ -999,7 +999,7 @@ pub fn execute_pure_call(
 /// for callers that do not hold a `MetaInterp` (record-time concrete
 /// execution of residual_calls).
 ///
-/// PyPy upstream (`rpython/jit/metainterp/pyjitpl.py:1995-2126`
+/// PyPy upstream (`rpython/jit/metainterp/pyjitpl.py`
 /// `do_residual_call`) calls `executor.execute_varargs(opnum,
 /// argboxes, descr, exc=can_raise, pure=is_elidable)` for every
 /// residual_call regardless of EI branch — concrete execution always

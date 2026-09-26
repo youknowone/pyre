@@ -2,7 +2,7 @@
 //!
 //! ## Role
 //!
-//! Upstream RPython's `rpython/annotator/bookkeeper.py:353-409
+//! Upstream RPython's `rpython/annotator/bookkeeper.py getdesc
 //! Bookkeeper.getdesc` looks up or creates a `FunctionDesc` keyed by
 //! Python object identity (`id(pyobj)`).  The bookkeeper hosts the
 //! `descs: dict[id, Desc]` map so any annotator pass can resolve a
@@ -18,7 +18,7 @@
 //! `(host_object, function_desc)` pair is pre-registered in
 //! `Bookkeeper.descs` keyed by the host's Arc identity.  When
 //! `getdesc` later looks up the host object, it short-circuits at
-//! the cache lookup at upstream `bookkeeper.py:362-364`
+//! the cache lookup at upstream `bookkeeper.py`
 //! (`try: return self.descs[obj_key]; except KeyError: ...`) and
 //! returns the descriptor constructed through
 //! `Bookkeeper::newfuncdesc_with_signature`. This is the native-source
@@ -592,7 +592,7 @@ impl CallRegistry {
     /// First call constructs both from `self.bookkeeper`; subsequent
     /// calls return the cached pair, mirroring RPython's
     /// `Translator.buildannotator()` / `:buildrtyper()` cache
-    /// (`translator.py:69-83 — assert self.annotator is None;
+    /// (`translator.py — assert self.annotator is None;
     /// self.annotator = RPythonAnnotator(self, ...)`).  The
     /// `RPythonTyper::initialize_exceptiondata()` setup runs on
     /// construction so the first per-session caller does not need to
@@ -712,7 +712,7 @@ impl CallRegistry {
     /// First checks the canonical `entries` map; if that misses,
     /// resolves through `aliases` to the canonical key and re-reads.
     /// Mirrors RPython `Bookkeeper.getdesc(pyobj)`'s "obj_key direct
-    /// lookup" plus alias indirection (`bookkeeper.py:362-364`).
+    /// lookup" plus alias indirection (`bookkeeper.py`).
     pub fn lookup(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
         if let Some(entry) = self.entries.borrow().get(key) {
             return Some(entry.clone());
@@ -908,13 +908,13 @@ impl CallRegistry {
     /// 4. inserts `DescEntry::function(fd)` into `bookkeeper.descs`
     ///    keyed by `host_object`'s Arc identity so any later
     ///    `bookkeeper.getdesc(host_object)` short-circuits at the
-    ///    cache lookup at upstream `bookkeeper.py:362-364`
+    ///    cache lookup at upstream `bookkeeper.py`
     ///    (`try: return self.descs[obj_key]; except KeyError`).
     ///
     /// Subsequent callers receive the same `Rc<FunctionEntry>`
     /// (identity-cached, matching upstream `Bookkeeper.getdesc`'s
     /// "create once, share thereafter" contract at
-    /// `bookkeeper.py:362-364`).
+    /// `bookkeeper.py`).
     ///
     /// Re-registration with a *different* `Signature` panics — upstream
     /// `description.py FunctionDesc.__init__` binds the signature
@@ -1051,7 +1051,7 @@ impl CallRegistry {
     /// Register `alias_key` as an alternate spelling of `canonical_key`.
     ///
     /// RPython's `Bookkeeper.descs` is keyed by `Constant(<callable>)`
-    /// identity (`bookkeeper.py:353`) — the same Python function
+    /// identity (`bookkeeper.py`) — the same Python function
     /// object always yields the same `FunctionDesc` regardless of
     /// which `crate::foo` / `foo` addressing alias the caller spelled.
     /// Pyre's storage is keyed by `FunctionPathKey`, so when the
@@ -1061,7 +1061,7 @@ impl CallRegistry {
     /// (otherwise the same callable acquires two `HostObject` Arc
     /// identities and two `FunctionDesc`s, which breaks upstream's
     /// "create once, share thereafter" contract at
-    /// `bookkeeper.py:362-364`).
+    /// `bookkeeper.py`).
     ///
     /// `canonical_key` MUST already be registered (typically via
     /// [`Self::get_or_register`]).  Panics if the key is unknown, if
@@ -1109,8 +1109,8 @@ impl CallRegistry {
     // consumer was `seed_callee_blocks`, which itself was a
     // workaround for the missing `simple_call_SomeObject` dispatch.
     // RPython's annotator discovers callee bodies through `pycall ->
-    // recursivecall -> addpendingblock` (description.py:283-305,
-    // annrpython.py:315-336); pyre now matches that via Step 2's
+    // recursivecall -> addpendingblock` (description.py,
+    // annrpython.py); pyre now matches that via Step 2's
     // dispatch registration.  Callers that need a callee's PyGraph
     // walk through `registry.lookup(key).function_desc.borrow().
     // cache.borrow()` directly.
@@ -1404,7 +1404,7 @@ mod tests {
         let key = FunctionPathKey::from_segments(["foo"]);
         registry.get_or_register(key.clone(), signature(&["x"]));
         // Second registration with a different signature must surface
-        // the conflict — upstream description.py:205 binds the
+        // the conflict — upstream description.py buildgraph binds the
         // signature to the underlying Python function once at
         // FunctionDesc creation time; pyre's adapter cannot silently
         // route the second caller through the first caller's signature.

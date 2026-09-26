@@ -1796,7 +1796,7 @@ extern "C" fn ffi_maybe_force(force_token: i64, flag: i64) -> i64 {
     flag * 2
 }
 
-/// OBJECTPTR layout: typeptr at offset 0 (pyjitpl.py:3119-3123).
+/// OBJECTPTR layout: typeptr at offset 0 (pyjitpl.py raise_if_successful).
 #[repr(C)]
 struct FakeExcObject {
     typeptr: usize,

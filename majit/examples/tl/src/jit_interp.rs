@@ -2,7 +2,7 @@
 ///
 /// RPython parity: tl.py JitDriver(greens=['pc','code'], reds=['inputarg','stack'],
 /// virtualizables=['stack']). Stack._virtualizable_ = ['stackpos', 'stack[*]']
-/// at tl.py:14 maps directly to `state_fields = { stackpos: int, stack: [int; virt] }`.
+/// at tl.py maps directly to `state_fields = { stackpos: int, stack: [int; virt] }`.
 ///
 /// Greens: [pc, code]
 /// Reds:   [inputarg, stackpos, stack]  (inputarg is a function parameter — red by nature)
@@ -42,7 +42,7 @@ pub static LAST_ALWAYS_FAILS: core::sync::atomic::AtomicBool =
 /// `_canraise`, and `roll` writes `self.stack[...]`, a field `tl.py`
 /// declares in `Stack._virtualizable_ = ['stackpos', 'stack[*]']` — so the
 /// analyzer picks `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` there. `@dont_look_inside`
-/// only clears `_jit_look_inside_` (`rlib/jit.py:132`); it does not change the
+/// only clears `_jit_look_inside_` (`rlib/jit.py`); it does not change the
 /// effect row. pyre runs no analyzer over this helper, so the row is declared:
 /// `#[dont_look_inside]` would assert `EF_CAN_RAISE` with an empty write set
 /// this raw-pointer mutation of the virtualizable array has not earned.
@@ -105,7 +105,7 @@ impl BytecodeExt for [u8] {
 
 /// tl.py Stack object. `_virtualizable_ = ['stackpos', 'stack[*]']`.
 /// tl.py `Stack(size)` — `size` is the bytecode length; the caller
-/// (`interp_eval`) passes `len(code)`. See tl.py:120.
+/// (`interp_eval`) passes `len(code)`. See tl.py.
 struct TlState {
     stackpos: i64,
     stack: VirtArray<i64>,

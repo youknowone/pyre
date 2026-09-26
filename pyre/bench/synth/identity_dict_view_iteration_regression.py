@@ -14,7 +14,7 @@
 # (`DictStrategy::nth_item`); the default answers by materialising the whole
 # `items()` and taking `.nth(index)`.  `IdentityDictStrategy` -- what a dict
 # switches to when its keys compare by identity, i.e. any ordinary instance
-# (`identitydict.py:12-83`, selected at `dictmultiobject.py:725-730`) -- had no
+# (`identitydict.py`, selected at `dictmultiobject.py`) -- had no
 # override, so one walk of an `n`-entry dict built and threw away `n` vectors of
 # `n` pairs.
 #

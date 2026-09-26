@@ -10,7 +10,7 @@
 //! values are gone — the dual emitter was collapsed into the
 //! single walker-local `SSARepr`.
 //!
-//! Reference: `rpython/jit/codewriter/codewriter.py:33-73`.
+//! Reference: `rpython/jit/codewriter/codewriter.py`.
 //!
 //! Portal `jit_merge_point` emission now runs through the graph layer:
 //! `codewriter.rs::portal_jit_merge_point_graph_args` builds the
@@ -65,9 +65,9 @@ impl SSAReprEmitter {
     }
 
     /// Stage `(fnaddr, calldescr)` from `CallControl::get_jitcode_calldescr`
-    /// (`call.py:167`) so the values land on the constructed `JitCode`
+    /// (`call.py`) so the values land on the constructed `JitCode`
     /// **before** `Assembler::assemble` runs `set_body`.  RPython
-    /// `call.py:167-169` builds `JitCode(name, fnaddr, calldescr)` ahead of
+    /// `call.py` builds `JitCode(name, fnaddr, calldescr)` ahead of
     /// `assembler.assemble(...)`; pyre stages on the builder so
     /// `JitCodeBuilder::finish()` can stamp the body atomically.
     pub fn set_fnaddr_and_calldescr(

@@ -8,7 +8,7 @@
 /// lockf(fd, cmd, len=0, start=0, whence=0).  Backed by
 /// `rustpython_host_env::fcntl`.  `ioctl` is still limited to the
 /// integer-argument form; its buffer form needs writable-buffer acquisition
-/// and `mutate_flag` handling from `interp_fcntl.py:252-300`.
+/// and `mutate_flag` handling from `interp_fcntl.py`.
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     pyre_interpreter::module_ns_store(
         ns,
@@ -346,7 +346,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         // expose (F_GETSIG/F_SETSIG/F_GETLK64/F_SETLK64/F_SETLKW64/
         // F_EXLCK/F_SHLCK/LOCK_MAND/LOCK_READ/LOCK_WRITE/LOCK_RW/DN_*)
         // come straight from Linux <fcntl.h>, matching the hardcoded
-        // overrides at `interp_fcntl.py:48-52`.
+        // overrides at `interp_fcntl.py`.
         #[cfg(target_os = "linux")]
         {
             cst!("F_SETLEASE", host_fcntl::F_SETLEASE);

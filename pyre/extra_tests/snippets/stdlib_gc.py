@@ -10,7 +10,7 @@ class Index:
 
 
 # The generation argument is bound and integer-unwrapped, and every value is
-# accepted -- `interp_gc.py:7-26 collect` ignores it.  Which generation an
+# accepted -- `interp_gc.py collect` ignores it.  Which generation an
 # integer selects is an engineering choice and follows upstream, so no value is
 # rejected and `bench/synth/gc_pypy_frontend.py` pins that against the pypy
 # oracle.  The return value is a spec axis and is an int.

@@ -22,7 +22,7 @@ use majit_ir::{GcRef, OpCode};
 /// ContinueRunningNormally(gi, gr, gf, ri, rr, rf).
 ///
 /// Corresponds to ContinueRunningNormally(gi, gr, gf, ri, rr, rf)
-/// in jitexc.py:53 — the typed portal args, NOT live locals.
+/// in jitexc.py — the typed portal args, NOT live locals.
 pub type MergePointArgs = crate::jitexc::ContinueRunningNormallyArgs;
 
 /// Exception state tracked during blackhole execution.
@@ -381,11 +381,11 @@ pub struct BlackholeInterpreter {
     /// Pointer to the VirtualizableInfo describing field offsets.
     /// Used by vable bytecodes to compute memory offsets.
     pub virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
-    /// blackhole.py:1095-1099 / warmspot.py:1010-1013 — per-jitdriver
+    /// blackhole.py get_portal_runner / warmspot.py:1010-1013 — per-jitdriver  allow-line-citation
     /// static data indexed by `jdindex`.  Each entry carries the
     /// portal_runner_ptr, mainjitcode.calldescr and result_type that
     /// `get_portal_runner` and the jitcode::BC_RECURSIVE_CALL dispatch consult
-    /// (blackhole.py:1080-1093 selects `bhimpl_recursive_call_{v,i,r,f}`
+    /// (blackhole.py selects `bhimpl_recursive_call_{v,i,r,f}`
     /// from `sd.jitdrivers_sd[jdindex].result_type`).
     ///
     /// Replaces the prior single-driver flat fields
@@ -588,7 +588,7 @@ impl Default for BlackholeInterpreter {
     /// `clone_context_from` when this frame has no
     /// `inline_callee_scratch` to reuse yet.  The 6 builder-shared fields stay at
     /// `u8::MAX` / empty until either `acquire_interp` populates them
-    /// (RPython `blackhole.py:284-289` parity) or
+    /// (RPython `blackhole.py` parity) or
     /// `clone_context_from(parent)` copies them from a parent
     /// interpreter.
     fn default() -> Self {
@@ -824,7 +824,7 @@ impl BlackholeInterpreter {
     /// `BlackholeInterpreter` the same `dispatch_table` (so a nested
     /// `BC_INLINE_CALL` byte routes through the same handler) plus the
     /// CPU/descrs/op_* slots the wired handlers would consult.  pyre-only:
-    /// RPython `bhimpl_inline_call_*` (blackhole.py:1279-1320) does not
+    /// RPython `bhimpl_inline_call_*` (blackhole.py) does not
     /// allocate a callee interpreter; it calls `cpu.bh_call_*(jitcode.fnaddr,
     /// ...)` directly because RPython's inline_call jitcode carries a
     /// native entry point.  pyre's sub-jitcodes are byte-interpreted, so
@@ -922,7 +922,7 @@ impl BlackholeInterpreter {
         (fnptr, jd.mainjitcode_calldescr.clone())
     }
 
-    /// `blackhole.py:1102-1132` — the four `bhimpl_recursive_call_{i,r,f,v}`
+    /// `blackhole.py bhimpl_recursive_call_i` — the four `bhimpl_recursive_call_{i,r,f,v}`
     /// share one prologue: resolve the driver's portal runner, then merge
     /// greens and reds per kind (`greens_i + reds_i`, ...) into the
     /// `bh_call_*` argument banks.
@@ -1427,7 +1427,7 @@ impl BlackholeInterpreter {
     /// raises `LeaveFrame`.
     ///
     /// `opcode` selects how the jdindex byte is decoded
-    /// (blackhole.py:113-123): `BC_JIT_MERGE_POINT` reads it as a
+    /// (blackhole.py): `BC_JIT_MERGE_POINT` reads it as a
     /// `registers_i` pool slot index (`'i'` argcode); `BC_JIT_MERGE_POINT_C`
     /// reads it as a raw signed byte (`'c'` argcode, assembler.py:312
     /// `USE_C_FORM`).
@@ -1495,7 +1495,7 @@ impl BlackholeInterpreter {
         let result_type = self.jitdrivers_sd[jdindex].result_type;
         // The portal runner is published behind an `extern "C"` boundary and
         // cannot unwind, so a raise inside it arrives in `BH_LAST_EXC_VALUE`
-        // instead of out of the call — where `blackhole.py:351-360`'s blanket
+        // instead of out of the call — where `blackhole.py run`'s blanket
         // `except Exception` catches upstream's real unwind and hands it to
         // `handle_exception_in_frame`.  Clear the cell before the call and test
         // it after, the protocol `check_residual_call_exception_after`
@@ -1597,7 +1597,7 @@ impl BlackholeInterpreter {
             // An unrooted local in that window is left pointing at the
             // pre-move address.  `route_to_catch` clears the
             // cell only *after* the record for the same reason
-            // (blackhole.py:407 parity); `exception_last_value` is a
+            // (blackhole.py parity); `exception_last_value` is a
             // `walk_bh_regs` root, so writing it first keeps the value covered
             // across the handoff.
             self.exception_last_value = exc;
@@ -1662,7 +1662,7 @@ impl BlackholeInterpreter {
 
     /// Dispatch the in-frame `catch_exception/L` at `catch_pos`: stash the
     /// exception in `exception_last_value`, jump to the handler label, and
-    /// clear the residual-call TLS slot (blackhole.py:407 parity — once the
+    /// clear the residual-call TLS slot (blackhole.py parity — once the
     /// handler runs, a later opcode reading `BH_LAST_EXC_VALUE` without
     /// issuing a new call must not pick up this already-caught exception).
     fn route_to_catch(&mut self, catch_pos: usize, exc_value: i64) -> bool {
@@ -2417,7 +2417,7 @@ impl BlackholeInterpreter {
     }
 }
 
-// bhimpl_*_call_* family (blackhole.py:1095-1320)
+// bhimpl_*_call_* family (blackhole.py get_portal_runner)
 //
 // These methods mirror RPython's blackhole call dispatch table. Each
 // variant unpacks one of the three calling-convention shapes
@@ -2449,7 +2449,7 @@ impl BlackholeInterpreter {
 
     // ── bhimpl_residual_call_* (blackhole.py:1224-1255) ──
 
-    /// blackhole.py:1225-1226
+    /// blackhole.py bhimpl_residual_call_r_i
     pub fn bhimpl_residual_call_r_i(
         &self,
         func: i64,
@@ -2693,13 +2693,13 @@ impl BlackholeInterpreter {
             .bh_call_v(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr);
     }
 
-    // ── bhimpl_recursive_call_{i,f,v} (blackhole.py:1102-1132) ──
+    // ── bhimpl_recursive_call_{i,f,v} (blackhole.py bhimpl_recursive_call_i) ──
     //
     // The `_r` variant already lives further up in this file (line ~1165),
     // pre-existing pyre code that uses `jdindex` + `get_portal_runner`.
     // The remaining three follow the same pattern for parity.
 
-    /// blackhole.py:1102-1108
+    /// blackhole.py bhimpl_recursive_call_i
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
@@ -2905,7 +2905,7 @@ impl BlackholeInterpBuilder {
     /// consulting a synthetic global `wellknown_bh_insns()` table.
     /// Callers with a real assembler `insns` dict should still use
     /// `setup_insns`, which also fills `_insns` and `dispatch_table`
-    /// exactly like `blackhole.py:66-100`.
+    /// exactly like `blackhole.py`.
     pub fn setup_cached_control_opcodes(
         &mut self,
         op_live: i32,
@@ -3162,7 +3162,7 @@ impl BlackholeInterpBuilder {
 
     /// Wire a handler for a specific opname/argcodes key into the dispatch table.
     ///
-    /// RPython `blackhole.py:76-80`: iterates `_insns` and calls
+    /// RPython `blackhole.py`: iterates `_insns` and calls
     /// `_get_method(name, argcodes)` for each. In Rust we wire specific
     /// opnames one by one during Phase D migration. Returns false if
     /// the opname is not present in the insns table.
@@ -3372,7 +3372,7 @@ fn handle_jitexception_dispatch(
 ///
 /// Handle a JitException at a recursive portal level.
 /// warmspot.py: result = handle_jitexception(e)
-/// warmspot.py:1041-1050: bhcaller._setup_return_value_{i,r,f}(result)
+/// warmspot.py: bhcaller._setup_return_value_{i,r,f}(result)
 ///
 /// Returns Ok(()) on success (return value set in bhcaller), or the
 /// `JitException` this level could not absorb: `ExitFrameWithExceptionRef`,
@@ -3723,7 +3723,7 @@ pub fn run_forever_with_portal(
                         // (`_handle_jitexception_in_portal` →
                         // warmspot.py:1041-1050), so the frame is finished.
                         // Fall through to the shared release + step below —
-                        // blackhole.py:1759-1760 sit outside the `try`, so
+                        // blackhole.py sit outside the `try`, so
                         // they run on this arm too.  Re-entering `new_bh`
                         // instead would execute its tail a second time and
                         // overwrite the installed result.
@@ -4090,7 +4090,7 @@ mod tests {
         match opcode {
             // intmask(a OP b) — blackhole.py. INT_*_OVF run the same
             // wrapping body in the blackhole; overflow detection is the
-            // separate `int_*_jump_if_ovf` bytecode (blackhole.py:478-497).
+            // separate `int_*_jump_if_ovf` bytecode (blackhole.py).
             OpCode::IntAdd | OpCode::IntAddOvf => bhimpl_int_add(a, b),
             OpCode::IntSub | OpCode::IntSubOvf => bhimpl_int_sub(a, b),
             OpCode::IntMul | OpCode::IntMulOvf => bhimpl_int_mul(a, b),
@@ -5201,7 +5201,7 @@ mod tests {
         /// A pooled interp must not carry the previous run's frame identity.
         ///
         /// `acquire_interp` refreshes only the six builder-shared fields
-        /// (`blackhole.py:284-289`), and `blackhole_from_resumedata` assigns
+        /// (`blackhole.py`), and `blackhole_from_resumedata` assigns
         /// neither `virtualizable_ptr` nor `virtualizable_info` — the guard
         /// path sets them afterwards, and deliberately does not for a
         /// `novable` resume ("leave both the pointer and the vinfo handle
@@ -5528,7 +5528,7 @@ mod tests {
         /// iteration whose `JitException` was resolved at a recursive
         /// portal level, not only after a plain return.
         ///
-        /// `blackhole.py:1752-1760`:
+        /// `blackhole.py`:
         ///
         /// ```python
         /// while True:
@@ -5543,10 +5543,10 @@ mod tests {
         ///
         /// The release + step sit BELOW the `try`, so they run on both
         /// arms.  `_handle_jitexception` returns the portal frame
-        /// (`blackhole.py:1780`) after
+        /// (`blackhole.py`) after
         /// `_handle_jitexception_in_portal` has already installed the
         /// re-entered portal's result as the CALLER's return value
-        /// (`blackhole.py:1772` → `warmspot.py:1039-1050`), so that
+        /// (`blackhole.py` → `warmspot.py handle_jitexception_from_blackhole`), so that
         /// frame is finished and the loop must continue in its caller.
         ///
         /// The chain here is `inner -> caller`.  `inner` carries the
@@ -5558,7 +5558,7 @@ mod tests {
         /// frame that DOES have a caller — the recursive-portal arm.
         /// Re-entering `inner` instead would run its tail a second time
         /// and overwrite the portal runner's result with `inner`'s own.
-        /// `blackhole.py:1764-1769`: the walk up the chain stops at the frame
+        /// `blackhole.py`: the walk up the chain stops at the frame
         /// whose jitcode names a jitdriver, and a bottommost such frame
         /// publishes its terminal image before the exception propagates.
         ///
@@ -5614,7 +5614,7 @@ mod tests {
         /// `pyopcode.py handle_operation_error` stores
         /// `frame_finished_execution = True` on the no-handler propagation out
         /// of a frame, and the walk to the recursive portal
-        /// (`blackhole.py:1764`) discards exactly such frames.  The `Ok` arm's
+        /// (`blackhole.py`) discards exactly such frames.  The `Ok` arm's
         /// twin store lives in `run_forever_with_portal`, which never sees a
         /// level this walk released, so a frame left by an exception would read
         /// back as still executing and refuse `frame.clear()`.
@@ -5677,7 +5677,7 @@ mod tests {
             inner_jitcode.set_jitdriver_sd(0);
 
             // `_setup_return_value_i` writes `registers_i[code[position-1]]`
-            // (`blackhole.py:1655`), so the caller resumes at an
+            // (`blackhole.py`), so the caller resumes at an
             // `int_return` whose preceding byte is the `int_copy`
             // destination register 0.
             let mut caller_b = JitCodeBuilder::default();
@@ -5859,7 +5859,7 @@ mod tests {
 
         /// `bhimpl_jit_merge_point`'s recursive-portal branch
         /// (`blackhole.py`) and `get_portal_runner`
-        /// (`blackhole.py:1096`) both index `jitdrivers_sd[jdindex]`
+        /// (`blackhole.py`) both index `jitdrivers_sd[jdindex]`
         /// unchecked.  Upstream can, because the table hangs off
         /// `self.builder.metainterp_sd`: one table, reached by every frame of
         /// a chain through its builder back-reference.  A pool-owned Rust
@@ -6463,7 +6463,7 @@ mod tests {
         /// pipeline end-to-end without depending on SSARepr assembly.
         ///
         /// RPython equivalent: the setup_insns + dispatch_loop closure + bhimpl
-        /// flow described in blackhole.py:52-103 and 452-460.
+        /// flow described in blackhole.py and 452-460.
         #[test]
         fn test_orthodox_dispatch_loop_int_add() {
             // Build a minimal insns dict (as if the assembler had produced it).
@@ -6709,7 +6709,7 @@ mod tests {
         #[test]
         fn wire_bhimpl_handlers_leaves_mixed_ref_int_int_ops_unwired() {
             // RPython blackhole integer arithmetic is `@arguments("i", "i",
-            // returns="i")` (blackhole.py:458+). Ref/int-mixed `int_*`
+            // returns="i")` (blackhole.py+). Ref/int-mixed `int_*`
             // opnames are kind-flow bugs, not alternate blackhole surfaces.
             let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
             let fake_opnames = [
@@ -7087,7 +7087,7 @@ pub extern "C" fn _ll_2_int_mod(x: i64, y: i64) -> i64 {
 
 /// RPython `support.py _ll_1_cast_uint_to_float(x)` —
 /// `r_uint(x)`-domain `float(x)` (matching `op_cast_uint_to_float`
-/// at `opimpl.py:393-395`).  `_do_builtin_call` re-routes
+/// at `opimpl.py`).  `_do_builtin_call` re-routes
 /// `cast_uint_to_float` through this helper so blackhole sees a
 /// `direct_call` instead of a bare `cast_uint_to_float` opname.
 /// Mirror of `opimpl.rs::op_cast_uint_to_float`'s u64-domain
@@ -7118,7 +7118,7 @@ pub extern "C" fn _ll_1_cast_float_to_uint(f: f64) -> i64 {
 /// runtime and const-fold agree.  Refuses to fold on NaN / inf
 /// (RPython `OverflowError` / `ValueError`); callers must filter.
 pub fn cast_float_to_uint(f: f64) -> i64 {
-    // `opimpl.py:432-434` routes through `long(f)` which raises
+    // `opimpl.py op_cast_float_to_uint` routes through `long(f)` which raises
     // `OverflowError` / `ValueError` on NaN / inf — there is no
     // upstream guard outside this helper that filters non-finite
     // values, so reproduce the fail-loud here unconditionally (not
@@ -7181,7 +7181,7 @@ pub fn cast_float_to_uint(f: f64) -> i64 {
 // `<kind>_guard_value` arm, and direct `hint_promote_string` /
 // `hint_promote_unicode` calls fail loud in
 // `codewriter/jtransform.rs`, mirroring upstream's
-// `jit.py:619/636` concretetype assertions.
+// `jit.py/636` concretetype assertions.
 
 /// blackhole.py `bhimpl_int_and(a, b): return a & b`.
 fn bhimpl_int_and(a: i64, b: i64) -> i64 {
@@ -7413,7 +7413,7 @@ fn handler_abort_result_marker_i(
 /// when the state has one, contributes exactly ONE slot — its identity —
 /// however many `[.. ; virt]` arrays it declares. `virtualizable.py:150-153`
 /// reads each array's length off the live object, so a length is never a box,
-/// and `virtualizable.py:139-144` names the virtualizable once.
+/// and `virtualizable.py load_list_of_boxes` names the virtualizable once.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StateFieldLayout {
     pub num_scalars: usize,
@@ -7591,7 +7591,7 @@ impl StateFieldLayout {
     }
 
     /// Flat slot of the virtualizable identity, which follows every scalar and
-    /// every flattened array element — `virtualizable.py:139-144` names the
+    /// every flattened array element — `virtualizable.py load_list_of_boxes` names the
     /// virtualizable exactly once, however many `[.. ; virt]` arrays the state
     /// declares.  `None` when the state has no virtualizable.
     pub fn vable_identity_slot(&self) -> Option<usize> {
@@ -7604,7 +7604,7 @@ impl StateFieldLayout {
 // Rust-port `state_fields`, which ARE the jitdriver reds.  PyPy reds are the
 // blackhole frame's int registers (`blackhole.py:300-302`), seeded by the
 // resume reader via `setarg_i` (`blackhole.py`) and read/written by the
-// register-addressed dispatch opcodes (`blackhole.py:193/223`).  These
+// register-addressed dispatch opcodes (`blackhole.py/223`).  These
 // handlers move between the canonical red register slots: `field_idx` /
 // `array_idx` are section-relative logical indices that
 // `StateFieldLayout` maps to the flat slot the seed populated.
@@ -7865,7 +7865,7 @@ bhhandler_i_i!(handler_int_copy, bhimpl_int_same_as);
 // `int_copy/c>i` — `c`-argcode source: `int_copy` is in USE_C_FORM
 // (`assembler.py:312`), so a small ConstInt is one inline signed byte
 // (`assembler.py:99-107` short branch) read via `signedord`
-// (`blackhole.py:123`) instead of a `registers_i` pool slot. `dst` is the
+// (`blackhole.py`) instead of a `registers_i` pool slot. `dst` is the
 // next byte. `bhimpl_int_copy` is the identity, so the byte value is the
 // stored result.
 fn handler_int_copy_c(
@@ -8168,7 +8168,7 @@ fn handler_int_return(
 
 /// Handler for `int_return/c` — USE_C_FORM short source (`assembler.py`):
 /// `int_return` reads its value from one inline signed byte (`signedord`,
-/// `blackhole.py:123`) rather than a `registers_i` slot.  Identical frame
+/// `blackhole.py`) rather than a `registers_i` slot.  Identical frame
 /// teardown to `handler_int_return`.
 fn handler_int_return_c(
     bh: &mut BlackholeInterpreter,
@@ -8987,7 +8987,7 @@ fn handler_unreachable(
 }
 
 //
-// RPython blackhole.py:1432-1481: bhimpl_getfield_gc_*/setfield_gc_*
+// RPython blackhole.py bhimpl_getfield_gc_i: bhimpl_getfield_gc_*/setfield_gc_*
 // These call `cpu.bh_getfield_gc_i(struct_ptr, descr)` etc.
 // The 'd' argcode is a 2-byte descriptor index into `bh.descrs`.
 // In pyre, descrs[index] resolves to a field offset (usize).
@@ -9357,7 +9357,7 @@ fn handler_setfield_gc_i(
 }
 // `setfield_gc_i/rcd` — USE_C_FORM short value (`assembler.py`):
 // the stored int is one inline signed byte read via `signedord`
-// (`blackhole.py:123`) in place of a `registers_i` slot; the struct ref
+// (`blackhole.py`) in place of a `registers_i` slot; the struct ref
 // and descr are unchanged from the `rid` form.
 fn handler_setfield_gc_i_c(
     bh: &mut BlackholeInterpreter,
@@ -9684,7 +9684,7 @@ fn handler_new_array_clear_c(
     Ok(pos + 1)
 }
 
-// String operations (`blackhole.py:1200-1283`)
+// String operations (`blackhole.py bhimpl_getlistitem_gc_r`)
 fn handler_strlen(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -9844,7 +9844,7 @@ bhhandler_v_v!(
 );
 
 // @arguments("cpu", "r", "i", "d", returns="X")
-// Interior GC fields (`blackhole.py:1411-1429`)
+// Interior GC fields (`blackhole.py`)
 fn handler_getinteriorfield_gc_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -10288,7 +10288,7 @@ fn handler_residual_call_r_v(
 
 // A1-A8: every BC_* emitted by pyre now follows the canonical
 // RPython argcode contract (1-byte register operands per
-// `blackhole.py:107`).  All `*_u16_ext` width adapters have been
+// `blackhole.py handler`).  All `*_u16_ext` width adapters have been
 // retired; canonical `handler_*` decoders own every dispatch slot.
 
 /// Build a strict `BlackholeInterpBuilder` for pyre's blackhole resume path.
@@ -10719,7 +10719,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // insns map, so a deopt through a `switch/id` op landed on the
     // unwired-opcode placeholder. RPython's setup_insns binds every opname.
     insns.insert("switch/id".to_string(), majit_jitcode::insns::BC_SWITCH);
-    // GC heap field load/store — `blackhole.py:1432-1481 bhimpl_
+    // GC heap field load/store — `blackhole.py bhimpl_getfield_gc_i bhimpl_
     // {get,set}field_gc_{i,r,f}`.  `handler_{get,set}field_gc_*` are wired
     // in `wire_bhimpl_handlers` and the canonical bytes exist in
     // `wellknown_bh_insns`, but the whole family was absent from this
@@ -11142,7 +11142,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // The remaining opnames the build-time `pipeline.insns` records as
     // actually emitted (`build_emitted_insns()`) that this curated set did not
     // cover.  Upstream never has this gap: `setup_insns(asm.insns)`
-    // (`blackhole.py:58-59`) registers exactly what the assembler emitted, so
+    // (`blackhole.py`) registers exactly what the assembler emitted, so
     // its table spans the reachable bytecode universe by construction.  Here a
     // missing entry is a live `dispatch_step` unwired-opcode panic that fires
     // only once a forward resume happens to land on the byte.
@@ -11461,7 +11461,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     //     (`jtransform.py def rewrite_op_cast_bool_to_int(self, op): pass`,
     //     mirrored at `codewriter/jtransform.rs` `same_as`-family arm).
     //   * `cast_bool_to_float` → `cast_int_to_float`
-    //     (`jtransform.py:1592` rename pass).
+    //     (`jtransform.py` rename pass).
     //   * `float_is_true` → `float_ne(x, 0.0)`
     //     (`jtransform.py`, mirrored in `jtransform.rs`'s `optimize_block`).
     // Adding backend opcodes for these would diverge from upstream's
@@ -11492,7 +11492,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
         handler_goto_if_not_ptr_nonzero,
     );
     // `bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not` alias
-    // (`blackhole.py:913`) — both opcode bytes route to the same body.
+    // (`blackhole.py`) — both opcode bytes route to the same body.
     builder.wire_handler("goto_if_not_int_is_true/iL", handler_goto_if_not);
     builder.wire_handler(
         "goto_if_exception_mismatch/iL",
@@ -11500,7 +11500,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     );
     builder.wire_handler("unreachable/", handler_unreachable);
 
-    // Field operations (blackhole.py:1432-1481).
+    // Field operations (blackhole.py bhimpl_getfield_gc_i).
     //
     // Canonical `/rd>X` and `/rXd` are the RPython-exact keys.
     // `bhimpl_getfield_gc_*` takes the struct in the Ref bank
@@ -11557,7 +11557,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("new_array/cd>r", handler_new_array_c);
     builder.wire_handler("new_array_clear/id>r", handler_new_array_clear);
     builder.wire_handler("new_array_clear/cd>r", handler_new_array_clear_c);
-    // String operations (blackhole.py:1200-1283)
+    // String operations (blackhole.py bhimpl_getlistitem_gc_r)
     builder.wire_handler("strlen/r>i", handler_strlen);
     builder.wire_handler("strgetitem/ri>i", handler_strgetitem);
     builder.wire_handler("strgetitem/rc>i", handler_strgetitem_c);
@@ -11724,7 +11724,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     );
     builder.wire_handler("debug_fatalerror/r", handler_debug_fatalerror);
 
-    // Cast ptr<->int (blackhole.py:603-610)
+    // Cast ptr<->int (blackhole.py bhimpl_cast_ptr_to_int)
     builder.wire_handler("cast_ptr_to_int/r>i", handler_cast_ptr_to_int);
     builder.wire_handler("cast_int_to_ptr/i>r", handler_cast_int_to_ptr);
 
@@ -12028,7 +12028,7 @@ fn handler_record_quasiimmut_field(
     p: usize,
 ) -> Result<usize, DispatchError> {
     // RPython `bhimpl_record_quasiimmut_field` is a no-op during blackhole
-    // execution (`blackhole.py:1539 pass`); the metainterp consumes the two
+    // execution (`blackhole.py pass`); the metainterp consumes the two
     // descriptors during tracing instead.  Skip past `r` (1 byte) +
     // `d` (2 bytes) + `d` (2 bytes) to reach the next opcode.
     let p = p + 1; // r
@@ -12338,7 +12338,7 @@ fn handler_current_trace_length(
 //          return cpu.bh_getfield_gc_*(struct, fielddescr)
 // pyre: read_descr_vable_field resolves VableField.index → byte offset via VirtualizableInfo.
 
-// Virtualizable field operations (`blackhole.py:1446-1495`)
+// Virtualizable field operations (`blackhole.py bhimpl_getfield_vable_i`)
 fn handler_getfield_vable_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -13040,7 +13040,7 @@ fn handler_raw_store_i(
     let offset = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_i[code[p + 2] as usize];
     let (descr, p) = read_descr(bh, code, p + 3);
-    // blackhole.py:1505-1506: cpu.bh_raw_store_i(addr, offset, newvalue, arraydescr)
+    // blackhole.py bhimpl_raw_store_i: cpu.bh_raw_store_i(addr, offset, newvalue, arraydescr)
     let cpu = bh.cpu();
     cpu.bh_raw_store_i(addr, offset, value, descr);
     Ok(p)
@@ -13246,7 +13246,7 @@ fn handler_setlistitem_gc_f(
 /// `blackhole.py:150-157` resolves `'d'` and `'j'` out of the *same* `descrs`
 /// table and differs only in the trailing check — `if argtype == 'j': assert
 /// isinstance(value, JitCode)` — because upstream's `JitCode` is itself an
-/// `AbstractDescr` (`jitcode.py:9`). pyre's runtime pool models that with
+/// `AbstractDescr` (`jitcode.py`). pyre's runtime pool models that with
 /// `RuntimeBhDescr::JitCode(Arc<JitCode>)`, so this reads the entry as a
 /// jitcode and takes `fnaddr` / `calldescr` off the object, exactly as
 /// `bhimpl_inline_call_*` does (`blackhole.py:1280`).
@@ -13298,7 +13298,7 @@ fn read_inline_call_jitcode(
 /// code address.
 ///
 /// Upstream never has to ask: `CallControl.get_jitcode` binds
-/// `llmemory.cast_ptr_to_adr(getfunctionptr(graph))` (`call.py:181-183`) for
+/// `llmemory.cast_ptr_to_adr(getfunctionptr(graph))` (`call.py`) for
 /// every jitcode it mints, so `jitcode.fnaddr` is always a linker-resolved
 /// address in the same binary as the metainterp. pyre runs its codewriter in
 /// `pyre-jit-trace/build.rs`, a different process, and substitutes a
@@ -14701,7 +14701,7 @@ fn decode_return_slot_at(code: &[u8], cursor: &mut usize) -> Option<usize> {
 /// Returns (fnptr, calldescr) from jitdrivers_sd[jdindex].
 /// pyre: uses portal_runner_ptr directly (single jitdriver).
 ///
-/// RPython `blackhole.py:1101-1132`:
+/// RPython `blackhole.py`:
 /// ```python
 /// def bhimpl_recursive_call_i(self, jdindex, greens_i, greens_r, greens_f,
 ///                                            reds_i, reds_r, reds_f):

@@ -5,7 +5,7 @@ use pyre_object::{PY_NULL, PyObjectRef};
 use std::ffi::{c_char, c_int};
 
 /// The namespace a name lookup running here would fall back to —
-/// `eval.py:32-45 PyEval_GetBuiltins`.
+/// `eval.py PyEval_GetBuiltins`.
 ///
 /// Borrowed, as `result_borrowed=True` says: what keeps it alive is the frame
 /// the namespace was read off, or the `builtins` module itself.

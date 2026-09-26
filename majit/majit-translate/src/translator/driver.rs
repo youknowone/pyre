@@ -165,7 +165,7 @@ impl ProfInstrument {
 
 // Upstream `:13-14 secondary_entrypoints, annotated_jit_entrypoints`.
 //
-// `rpython/rlib/entrypoint.py:1` declares
+// `rpython/rlib/entrypoint.py` declares
 // `secondary_entrypoints = {"main": []}` and `:8 annotated_jit_entrypoints = []`
 // as module-level mutable globals. The port keeps the same shape via
 // process-local `OnceLock<RefCell<...>>` slots so callers can mutate
@@ -186,7 +186,7 @@ impl ProfInstrument {
 pub type EntryPointSpec = (Rc<dyn Any>, Vec<Rc<dyn Any>>);
 
 /// Carrier for the `libdef` argument upstream `setup_library(self,
-/// libdef, …)` reads at `driver.py:212-216`. Upstream's `libdef` is a
+/// libdef, …)` reads at `driver.py`. Upstream's `libdef` is a
 /// duck-typed object supplied by carbonpython (the only consumer per
 /// the upstream `# Used by carbon python only.` comment at `:213`); it
 /// carries a `.functions` attribute that the driver assigns to
@@ -237,7 +237,7 @@ pub fn secondary_entrypoints_get(key: &str) -> Option<Vec<EntryPointSpec>> {
 
 /// Typed registration helper mirroring upstream
 /// `secondary_entrypoints.setdefault(key, []).append((func, argtypes))`
-/// at `entrypoint.py:1` (the only mutator in upstream's import path).
+/// at `entrypoint.py` (the only mutator in upstream's import path).
 ///
 /// `func` is a [`HostObject`] — the only callable shape `task_annotate`
 /// at `:308-312` knows how to feed to `annotator.build_types`. Each
@@ -1529,7 +1529,7 @@ impl TranslationDriver {
         crate::translator::goal::unixcheckpoint::restartable_point(Some("run"))?;
         // Upstream `:374-376`: `from rpython.jit.tl import jittest;
         // jittest.jittest(self)`. The `jittest.jittest` body lives at
-        // `rpython/jit/tl/jittest.py:26-38` and itself calls
+        // `rpython/jit/tl/jittest.py` and itself calls
         // `LLInterpreter(driver.translator.rtyper)` +
         // `apply_jit(jitpolicy, interp, graph, LLGraphCPU)` from
         // `warmspot`. Both `apply_jit` (cross-crate to majit-metainterp)
@@ -1906,7 +1906,7 @@ impl TranslationDriver {
         // Upstream `:551-553`: `v = interp.eval_graph(graph, get_llinterp_args())`.
         // Use a placeholder graph until `getuniquegraph` lands; the
         // shell still surfaces the leaf-level TaskError citing
-        // `llinterp.py:84`.
+        // `llinterp.py`.
         let placeholder_graph: Rc<dyn Any> = Rc::new(());
         self.extra
             .borrow()
@@ -2183,7 +2183,7 @@ impl TaskEngineHooks for DriverHooks {
         let mut instrument = false;
         let mut res: TaskOutput = None;
         // Upstream `:275-278`: PROFILE branch. DEFERRED — `_profile`
-        // surfaces a TaskError citing `driver.py:253` when reached; the
+        // surfaces a TaskError citing `driver.py` when reached; the
         // `PROFILE` set is empty by default so the branch is
         // unreachable in practice.
         let in_profile = profile_contains(goal);
@@ -2240,7 +2240,7 @@ impl TaskEngineHooks for DriverHooks {
     ///
     /// Upstream raises `func.task_earlycheck(self)`'s exception
     /// unwrapped — the engine's first event loop at
-    /// `taskengine.py:108-109` has no try/except so the raise
+    /// `taskengine.py` has no try/except so the raise
     /// propagates straight out of `_execute`. The Rust port returns
     /// the error so [`SimpleTaskEngine::execute`] can `?`-propagate
     /// it identically (the trait's signature was widened from
@@ -2601,10 +2601,10 @@ mod tests {
             .task_database_c()
             .expect_err("standalone C backend still needs the entrypoint wrapper leaf");
         // `CBuilder.build_database` enters the real body via enum
-        // subclass dispatch. Upstream `genc.py:92` calls
+        // subclass dispatch. Upstream `genc.py` calls
         // `translator.getexceptiontransformer()` BEFORE
         // `self.getentrypointptr()` (`:110`), so without an rtyper the
-        // first failure surface is `translator.py:88 ValueError: no
+        // first failure surface is `translator.py ValueError: no
         // rtyper`. The test pins that ordering.
         assert!(
             err.message.contains("translator.py:88"),
@@ -2621,7 +2621,7 @@ mod tests {
     #[test]
     fn shutil_copy_round_trip_in_tempdir() {
         // Mirrors `test_shutil_copy` at upstream
-        // `test_driver.py:124-131`. Upstream uses pytest's per-session
+        // `test_driver.py`. Upstream uses pytest's per-session
         // `udir.join(...)`; the Rust port uses `tempfile::TempDir` for
         // the equivalent isolation so concurrent invocations cannot
         // race on a shared path under `std::env::temp_dir()`.

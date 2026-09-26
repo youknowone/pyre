@@ -6,7 +6,7 @@
 # frame that is still RUNNING; this one guards the frame the exception left.
 #
 # `dispatch_bytecode` (pyopcode.py) stamps `last_instr` before every opcode, so
-# `pyopcode.py:147-148 handle_operation_error` always builds its traceback node
+# `pyopcode.py handle_operation_error` always builds its traceback node
 # while the frame holds the instruction that raised, and `tb_frame.f_lasti`
 # answers for it forever after.  A frame the walker seeded for an inlined callee
 # takes no such store: the walk emits no per-opcode `last_instr` for a frame that

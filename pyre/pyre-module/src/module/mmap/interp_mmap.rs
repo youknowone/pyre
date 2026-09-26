@@ -20,7 +20,7 @@
 use rustpython_host_env::mmap as host_mmap;
 
 /// The live mapping one object owns.  A Windows `mmap(…, tagname=…)` goes
-/// through `CreateFileMappingW`/`MapViewOfFile` (`rmmap.py:999-1004`) rather
+/// through `CreateFileMappingW`/`MapViewOfFile` (`rmmap.py`) rather
 /// than memmap2, so the two mapping flavours share one type.
 #[cfg(any(unix, windows))]
 enum MappedObj {
@@ -69,7 +69,7 @@ impl MappedObj {
 ///
 /// `mapped` is `None` only while a resize holds no mapping: Windows'
 /// `SetEndOfFile` fails with ERROR_USER_MAPPED_FILE while any view of the file
-/// is open, so the old view must go before the file grows.  `rmmap.py:602-651`
+/// is open, so the old view must go before the file grows.  `rmmap.py`
 /// clears `self.data` across the same window.
 #[cfg(any(unix, windows))]
 struct NativeMMap {
@@ -1006,7 +1006,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
 
     // `interp_mmap.py readline` — read bytes from current pos until
     // the first '\n' (inclusive); if absent, read to end.  Mirrors
-    // `rmmap.py:421-432`.
+    // `rmmap.py`.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -1578,7 +1578,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     // ftruncate the backing fd (if any) to `offset + newsize`, then
     // mremap(MREMAP_MAYMOVE).  Platforms without mremap (e.g. macOS)
     // raise SystemError to match PyPy's RValueError→SystemError
-    // translation at `interp_mmap.py:155-157`.  Read-only / copy
+    // translation at `interp_mmap.py`.  Read-only / copy
     // mappings reject with TypeError.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -1662,7 +1662,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     };
 }
 
-/// `rmmap.py:589-601` — ftruncate the backing fd (if any) to `offset +
+/// `rmmap.py resize` — ftruncate the backing fd (if any) to `offset +
 /// newsize`, then remap.  host_env's `MappedFile` (memmap2) cannot mremap in
 /// place, so the mapping is re-created at the new size.  A file-backed map is
 /// re-mapped from the (ftruncated) fd, an anonymous map is remade and the
@@ -2102,7 +2102,7 @@ fn mmap_construct(
 // `interp_mmap.py mmap(fileno, length, tagname, access, offset)` —
 // the Windows constructor names a mapping object where POSIX passes
 // flags/prot, and the mapping's protection comes from `access` alone
-// (`rmmap.py:900-914`).
+// (`rmmap.py`).
 #[cfg(windows)]
 fn mmap_construct(
     cls: pyre_object::PyObjectRef,
@@ -2226,7 +2226,7 @@ fn mmap_construct(
             // file to it, so a length past EOF is how the mapping is extended
             // on this platform.  `rmmap.py` rejects it with "mmap
             // length is greater than file size" instead; the run fails on that
-            // at `lib-python/3/test/test_mmap.py:202-209`, which calls
+            // at `lib-python/3/test/test_mmap.py`, which calls
             // `mmap(fileno(), mapsize + 1)` and, on `sys.platform` starting
             // with "win", turns a ValueError into
             // `self.fail("Opening mmap with size+1 should work on Windows.")`.

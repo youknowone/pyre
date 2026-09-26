@@ -88,7 +88,7 @@ impl crate::jitcode::SsaReprDump for SSARepr {
 /// `format.py format_assembler(ssarepr)`.  Per-arg kinds for
 /// `OpKind::Call` argument lists resolve via `getkind(v.concretetype)`
 /// read directly from each operand `Variable`'s `concretetype` cell
-/// (`flowspace/model.py:280` `__slots__ = [..., "concretetype"]`); no
+/// (`flowspace/model.py` `__slots__ = [..., "concretetype"]`); no
 /// side-table is consulted.
 ///
 /// **PRE-EXISTING-ADAPTATION** — upstream's `SSARepr` already holds
@@ -981,7 +981,7 @@ mod tests {
 
     #[test]
     fn format_residual_call_emits_descr_and_listofkind() {
-        // jtransform.py:414-435 + format.py:27,32-33.
+        // jtransform.py rewrite_call + format.py:27,32-33.  allow-line-citation
         use crate::call::CallDescriptor;
         use crate::flowspace::model::Variable;
         use crate::model::{CallFuncPtr, CallTarget, OpKind, SpaceOperation};
@@ -1014,7 +1014,7 @@ mod tests {
             text.contains("residual_call_ir_i "),
             "expected residual_call_ir_i in: {text}"
         );
-        // jtransform.py:456-462 emits funcptr as args[0], calldescr via
+        // jtransform.py handle_residual_call emits funcptr as args[0], calldescr via
         // SpaceOperation.descr.  Pyre carries the funcptr identity on
         // descriptor.target and renders it as `$<* function 'name'>`
         // mirroring format.py Ptr-to-Struct repr.

@@ -3,7 +3,7 @@
 # parity-tests reason: pyre specialises the SystemExit constructor in traced
 # code, so `code` is written by trace IR rather than by the runtime __init__.
 
-# `interp_exceptions.py:993-998 W_SystemExit.descr_init`: no argument leaves
+# `interp_exceptions.py W_SystemExit.descr_init`: no argument leaves
 # `code` at the class default, one argument becomes `code` verbatim, and
 # several become the args tuple. A constructor specialisation that emits the
 # `code` store itself has to reproduce all three, for the builtin and for a

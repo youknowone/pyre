@@ -102,7 +102,7 @@ pub fn trace_unbox_int(
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
     // GUARD_CLASS(box, cls): guard takes object box directly,
-    // backend loads typeptr at offset 0 (llgraph/runner.py:1245).
+    // backend loads typeptr at offset 0 (llgraph/runner.py execute_guard_class).
     // Callers that route through `trace_unbox_int_with_resume_descr`
     // already emit the GuardClass via
     // `frame.generate_guard` — by the time control reaches here,
@@ -135,7 +135,7 @@ pub fn trace_box_int(
     // Inline W_Int allocation so OptVirtualize can see the object shape
     // and fold later GetfieldRawI(intval) reads back to `value`.
     // RPython parity: NEW_WITH_VTABLE (not NEW) for classes with vtable.
-    // jtransform.py:908-911 parity: typeptr setfield filtered in trace.
+    // jtransform.py rewrite_op_setfield parity: typeptr setfield filtered in trace.
     // rewrite.py:479-484 GC rewriter emits vtable via fielddescr_vtable.
     let obj = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
     // pyjitpl.py `execute_new_with_vtable` stamps BOTH halves —

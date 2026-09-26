@@ -14,7 +14,7 @@
 //! ```
 //!
 //! The promote lives on the first line of `_get_arrayitem_vable_index`
-//! (`pyjitpl.py:1205`), which only the STANDARD leg reaches. The non-standard
+//! (`pyjitpl.py`), which only the STANDARD leg reaches. The non-standard
 //! leg goes to an ordinary `getfield_gc_r` + `getarrayitem_gc_*` with the index
 //! box exactly as it stands.
 //!

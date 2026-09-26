@@ -304,7 +304,7 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
     // virtualizable payloads are [vable, vable_scalars..., array...].
     //
     // Each slot mints the typed `OpRef::input_arg_*` variant matching its
-    // RPython `InputArg{Int,Ref,Float}` class (resoperation.py:719/727/739).
+    // RPython `InputArg{Int,Ref,Float}` class (resoperation.py InputArgInt/727/739).
     // The earlier `#[vable(inputarg)]` validator rejects fields without an
     // explicit `type = ...`, so `inputarg_type` is `Some` here.
     let init_inputarg_fields: Vec<TokenStream> = inputarg_fields
@@ -348,7 +348,7 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
             /// `1` for resume virtualizable payloads
             /// (`[vable, vable_scalars..., array...]`). The frame/vable
             /// identity in slot 0 is consumed by the caller and left
-            /// untouched here, matching virtualizable.py:139-154.
+            /// untouched here, matching virtualizable.py load_list_of_boxes.
             pub fn restore_inputarg_oprefs(
                 &mut self,
                 oprefs: &[majit_ir::OpRef],

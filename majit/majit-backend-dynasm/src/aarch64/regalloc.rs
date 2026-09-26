@@ -31,13 +31,13 @@ fn check_imm_box(arg: OpRef) -> bool {
     }
 }
 
-/// aarch64/registers.py:14
+/// aarch64/registers.py
 ///   `all_regs = registers[:14] + [x19, x20]`
 pub fn all_core_regs() -> Vec<RegLoc> {
     registers::ALL_REGS.to_vec()
 }
 
-/// aarch64/registers.py:43
+/// aarch64/registers.py
 ///   `caller_resp = argument_regs + [x8, x9, x10, x11, x12, x13]`
 ///
 /// In RPython, `save_around_call_regs` is the AAPCS64 caller-saved

@@ -81,7 +81,7 @@ fn assert0() -> [u8; 6] {
 /// line and no columns, as `codeobject.c linetable` spells it.
 const ASSERT0_LINETABLE: [u8; 2] = [(1 << 7) | (13 << 3) | (3 - 1), 0];
 
-/// `funcobject.py:198 PyCode_NewEmpty(filename, funcname, firstlineno)` — a
+/// `funcobject.py PyCode_NewEmpty(filename, funcname, firstlineno)` — a
 /// code object with the given source location and a body that raises
 /// `AssertionError`.
 #[unsafe(no_mangle)]

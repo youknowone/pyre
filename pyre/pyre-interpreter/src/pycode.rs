@@ -364,7 +364,7 @@ impl<'a> LineTableReader<'a> {
     }
 }
 
-/// pycode.py:683-695 — decode one CPython-3.11 varint at `i`.
+/// pycode.py _decode_varint — decode one CPython-3.11 varint at `i`.
 ///
 /// Returns `(value, new_i)`. Reads 6 bits per byte, MSB first. Bit 6
 /// (0x40) is the continuation flag; bit 7 (0x80) is the start-of-entry
@@ -544,7 +544,7 @@ pub struct PyCode {
     /// already the exact UTF-8 spelling, avoiding an allocation for compiled
     /// source paths and ordinary filename replacements.
     ///
-    /// Do not add the derived `pycode.py:136 w_filename` cache without giving
+    /// Do not add the derived `pycode.py w_filename` cache without giving
     /// the slot everything `w_globals` gets. The filesystem decode hands back a
     /// movable managed string, so a retained slot has to be visited by a managed
     /// wrapper's own custom trace and forwarded by `eval::walk_raw_code_roots`
@@ -624,7 +624,7 @@ pub struct PyCode {
     /// `pycode.py self._globals_caches = [None] * len(self.co_names_w)`.
     ///
     /// Per-name slot for `LOAD_GLOBAL_cached` / `STORE_GLOBAL_cached`
-    /// (`celldict.py:292,321,335,353`).  Stores a weak reference to
+    /// (`celldict.py`).  Stores a weak reference to
     /// the `GlobalCache` resolved on the first miss, so subsequent
     /// hits bypass the `mstrategy.get_global_cache(varname)` string
     /// lookup.
@@ -639,12 +639,12 @@ pub struct PyCode {
     /// len(co_names_w)`.
     ///
     /// Per-name slot for the `LOAD_ATTR_caching` / `STORE_ATTR_caching` inline
-    /// attribute cache (`mapdict.py:1480/1574`).  A `None` slot is PyPy's
+    /// attribute cache (`mapdict.py/1574`).  A `None` slot is PyPy's
     /// `INVALID_CACHE_ENTRY` (mapdict.py); a `Some` holds the immortal map
     /// node + attribute node + `version_tag` last resolved for this slot, so a
     /// monomorphic re-read skips the type lookup + map walk.  The
     /// LOAD_METHOD fill additionally stores a movable `w_method`
-    /// reference (mapdict.py:1418), forwarded during collection by
+    /// reference (mapdict.py), forwarded during collection by
     /// `walk_mapdict_method_cache_gc`; the other fields are immortal
     /// node pointers and need no walking.
     ///
@@ -1127,8 +1127,8 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// `w_code_new(code_ptr)` is the `hidden_applevel=False` default
 /// shorthand; callers who need the flag set (mirroring PyPy's
 /// `BuiltinCode` (gateway.py) / `ApplevelClass`
-/// (gateway.py:1355) / `_continuation` entrypoint dummy
-/// (interp_continuation.py:195)) construct via this entry point.
+/// (gateway.py) / `_continuation` entrypoint dummy
+/// (interp_continuation.py)) construct via this entry point.
 ///
 /// # Safety
 /// `code_ptr` must be a valid pointer to a permanently-live `CodeObject`,
@@ -1353,7 +1353,7 @@ fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) ->
 
 /// pypy/interpreter/pycode.py `PyCode.__init__` shorthand —
 /// equivalent to PyPy `hidden_applevel=False` default
-/// (pycode.py:111).  Most user-level pycode constructions take this
+/// (pycode.py).  Most user-level pycode constructions take this
 /// path; only the gateway / continuation / `__pypy__.hidden_applevel`
 /// surfaces flip the flag to `True`.
 ///
@@ -1748,7 +1748,7 @@ unsafe fn w_code_copy_const_slots(dst: PyObjectRef, src: PyObjectRef) {
 }
 
 /// The keyword-only fields `code.replace` accepts, in the order
-/// `pypy/interpreter/pycode.py:77-81` reconstructs the code object.
+/// `pypy/interpreter/pycode.py` reconstructs the code object.
 const REPLACE_KWARGS: [&str; 18] = [
     "co_argcount",
     "co_posonlyargcount",
@@ -2702,7 +2702,7 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         ));
     }
     // `replace` is keyword-only (`__args__.topacked()` asserts no positional
-    // args at pycode.py:548-549).
+    // args at pycode.py).
     if pos.len() > 1 {
         return Err(crate::PyError::type_error(
             "replace() takes no positional arguments",
@@ -3050,7 +3050,7 @@ pub(crate) fn decode_code_units(
 /// A `tuple` `co_consts` field → the compiler `Constants` backing table.
 ///
 /// PyPy stores the supplied wrapped objects directly in `co_consts_w`
-/// (`pycode.py:126`).  Pyre's compiler table still needs one entry per wrapped
+/// (`pycode.py`).  Pyre's compiler table still needs one entry per wrapped
 /// object so bytecode indices remain valid, but it is not the semantic owner:
 /// values the compiler enum cannot represent use `None` only as an unobserved
 /// shape placeholder.  `w_code_fill_consts_from_tuple` immediately installs
@@ -3904,7 +3904,7 @@ pub fn instruction_can_start_a_line(code: &crate::CodeObject, pc: usize) -> bool
 /// refreshes the mapping from its live `pycode` field. The collector destructor
 /// removes every other mapping before its pointer can dangle.
 ///
-/// Process-global, not per-thread: `pycode.py:159` keeps `w_globals` on the
+/// Process-global, not per-thread: `pycode.py` keeps `w_globals` on the
 /// shared `PyCode` instance, and a code object stamped on one thread must be
 /// recoverable from every thread that later runs it — a thread-local map made
 /// the JIT's `recover_inline_callee_globals` answer `PY_NULL` there and
@@ -4647,7 +4647,7 @@ pub fn walk_w_globals_stamped_code_roots(forward: &mut dyn FnMut(&mut PyObjectRe
 
 /// Forward every filled `entry.w_method` slot during collection — the
 /// faithful equivalent of the GC tracing PyPy's `CacheEntry.w_method`
-/// (mapdict.py:1418) gets through its GC-managed holder.  The cached
+/// (mapdict.py) gets through its GC-managed holder.  The cached
 /// map/attr node pointers are immortal interned nodes and the
 /// `version_tag` is a `u64`, so `w_method` is the entry's only movable
 /// reference.

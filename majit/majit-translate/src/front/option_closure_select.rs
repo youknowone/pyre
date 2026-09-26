@@ -112,7 +112,7 @@ pub(crate) struct ClosureSelectSite {
     /// `ValueType::Ref(None)` preserves only the register bank; the source
     /// class is required when the synthesized `(x,)` writer recreates the
     /// field annotation consumed by `InstanceRepr._setup_repr`
-    /// (`rpython/rtyper/rclass.py:501-509`).
+    /// (`rpython/rtyper/rclass.py`).
     pub payload_class_root: Option<String>,
     /// The type the closure's `call_once` returns, projected to a
     /// [`ValueType`]: `U` for `map`, `Option<U>` for `and_then`, `T` for

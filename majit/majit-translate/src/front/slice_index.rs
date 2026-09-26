@@ -8,14 +8,14 @@
 //! matching the existing RangeTo marker split.
 //!
 //! No arm carries an `end <= len` proof, and upstream asks for none:
-//! `ll_listslice_startstop` (`rpython/rtyper/rlist.py:893-903`) CLAMPS an
+//! `ll_listslice_startstop` (`rpython/rtyper/rlist.py`) CLAMPS an
 //! oversized stop (`if stop > length: stop = length`) and states the rest as
 //! `ll_assert`s, which translate out.  Non-negativity is proven one layer up,
-//! in the annotator (`check_negative_slice`, `rpython/annotator/unaryop.py:437-443`),
+//! in the annotator (`check_negative_slice`, `rpython/annotator/unaryop.py`),
 //! and pyre's port raises there identically.  A `Range { start, end }` is the
 //! direct Rust spelling of what PyPy writes as `buffer[start:end]`
 //! (`RStringIO.read`, `rpython/rlib/rStringIO.py:148`;
-//! `BufferedMixin._raw_write`, `pypy/module/_io/interp_bufferedio.py:456`),
+//! `BufferedMixin._raw_write`, `pypy/module/_io/interp_bufferedio.py`),
 //! so it is admitted on the same terms.  The frontend likewise strips
 //! Rust's implicit range assertions as `TermKind::Assert`, following
 //! `backendopt/removeassert.py`; retaining an extra proof only for the opaque
@@ -46,7 +46,7 @@
 //! `front::range_iter` sees for a `Range { start, end }` for-loop.
 //!
 //! RPython models `l[start:]` as a **copy**: the annotator's `getslice`
-//! handler (`unaryop.py:420-423`) returns a fresh `listdef.offspring`, and the
+//! handler (`unaryop.py`) returns a fresh `listdef.offspring`, and the
 //! rtyper lowers it through `AbstractBaseListRepr.rtype_getslice`
 //! (`rlist.py`) to a `gendirectcall` of `ll_listslice_startonly`.
 //! There is no borrowed-view concept upstream. This pass reroutes the residual
@@ -296,7 +296,7 @@ fn rewire_one_slice_index_site(
     // unsigned/nonnegative annotation even when computed; the marker expands
     // only in the rtyper flowspace adapter. Nothing more is asked, because upstream
     // asks nothing more: `ll_listslice_startstop`
-    // (`rpython/rtyper/rlist.py:893-903`) clamps an oversized stop and states
+    // (`rpython/rtyper/rlist.py`) clamps an oversized stop and states
     // `start <= length` / `stop >= start` as `ll_assert`s.  The one extra
     // check below is `MinusOne`, whose end must really be
     // `sub(ArrayLen(slice), 1)` — that is the shape recognition itself, not a

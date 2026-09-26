@@ -23,13 +23,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// RPython `class AnsiLogger(object)` (`ansi_print.py`).
 ///
 /// Output shape `[name:subname] text` matches `_make_method` at
-/// `ansi_print.py:17-30` for the non-TTY branch. The Rust port keeps
+/// `ansi_print.py` for the non-TTY branch. The Rust port keeps
 /// `name` as a `&'static str` because every call site so far names a
 /// channel via a string literal (`"backendopt"`, `"c"`, …).
 ///
 /// `output_disabled` is an `AtomicBool` rather than `bool` so that
 /// upstream's runtime monkeypatch shape (`log.output_disabled = True`
-/// at `rpython/rtyper/llinterp.py:25`,
+/// at `rpython/rtyper/llinterp.py`,
 /// `rpython/rtyper/test/test_llinterp.py:20-22`,
 /// `rpython/memory/test/gc_test_base.py:38-41`,
 /// `rpython/tool/test/test_ansi_print.py:95`) is reachable when
@@ -65,7 +65,7 @@ impl AnsiLogger {
     }
 
     /// Common emission path matching `_make_method`'s body at
-    /// `ansi_print.py:17-30`. `subname_with_colon` is `""` for
+    /// `ansi_print.py`. `subname_with_colon` is `""` for
     /// upstream entries whose `_make_method` first argument is the
     /// empty string (`__call__`, `event`, `red`, `bold`, `timeout`)
     /// and `":<methodname>"` for the rest.

@@ -40,7 +40,7 @@
 //!   is the same thing.
 //!
 //! * `intersection(s1, s2)` / `difference(s1, s2)` double-dispatch
-//!   registries (annotator/model.py:127-135) become free functions in
+//!   registries (annotator/model.py) become free functions in
 //!   A4.6 with a single `match (SomeValue, SomeValue)` body.
 
 use core::fmt;
@@ -236,7 +236,7 @@ pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
 /// dotted-only strip answered `false` for
 /// `("pyre_object::m::T", "m::T")` while the intern maps both to `m::T`.
 /// Upstream keys identity on the object in one place
-/// (`bookkeeper.py:361-363`), so one derivation is the shape to hold.
+/// (`bookkeeper.py`), so one derivation is the shape to hold.
 ///
 /// Caution carried forward: collapsing an `ob_header`-bearing `W_*` struct
 /// EARLY — that is, keying `struct_root_classes` on the collapse — starved its
@@ -513,7 +513,7 @@ pub struct SomeInteger {
     /// `SomeBool(SomeInteger)` and its only multi-way narrowing comes
     /// from boolean `is`/`isinstance`/comparison ops. The exitswitch
     /// consumer reads it generically — `getattr(annotation,
-    /// "knowntypedata", {})` (annrpython.py:566) — so an integer
+    /// "knowntypedata", {})` (annrpython.py) — so an integer
     /// discriminant `SwitchInt` carries its per-case constraints here.
     pub knowntypedata: Option<KnownTypeData>,
 }
@@ -811,7 +811,7 @@ impl SomeStringBuilder {
     }
 
     /// `method_append_slice(self, s_str, s_start, s_end)`
-    /// (rstring.py:896-901) → `s_None`.
+    /// (rstring.py) → `s_None`.
     pub fn method_append_slice(
         &self,
         s_str: &SomeValue,
@@ -825,7 +825,7 @@ impl SomeStringBuilder {
     }
 
     /// `method_append_multiple_char(self, s_char, s_times)`
-    /// (rstring.py:903-906) → `s_None`.
+    /// (rstring.py) → `s_None`.
     pub fn method_append_multiple_char(
         &self,
         s_char: &SomeValue,
@@ -837,7 +837,7 @@ impl SomeStringBuilder {
     }
 
     /// `method_append_charpsize(self, s_ptr, s_size)`
-    /// (rstring.py:908-911) → `s_None`.
+    /// (rstring.py) → `s_None`.
     pub fn method_append_charpsize(&self, s_ptr: &SomeValue, s_size: &SomeValue) -> SomeValue {
         assert!(matches!(s_ptr, SomeValue::Ptr(_)));
         assert!(matches!(s_size, SomeValue::Integer(_)));
@@ -891,7 +891,7 @@ impl SomeUnicodeBuilder {
     }
 
     /// `method_append_slice(self, s_str, s_start, s_end)`
-    /// (rstring.py:936-941) → `s_None`.
+    /// (rstring.py) → `s_None`.
     pub fn method_append_slice(
         &self,
         s_str: &SomeValue,
@@ -908,7 +908,7 @@ impl SomeUnicodeBuilder {
     }
 
     /// `method_append_multiple_char(self, s_char, s_times)`
-    /// (rstring.py:943-946) → `s_None`.
+    /// (rstring.py) → `s_None`.
     pub fn method_append_multiple_char(
         &self,
         s_char: &SomeValue,
@@ -920,7 +920,7 @@ impl SomeUnicodeBuilder {
     }
 
     /// `method_append_charpsize(self, s_ptr, s_size)`
-    /// (rstring.py:948-951) → `s_None`.
+    /// (rstring.py) → `s_None`.
     pub fn method_append_charpsize(&self, s_ptr: &SomeValue, s_size: &SomeValue) -> SomeValue {
         assert!(matches!(s_ptr, SomeValue::Ptr(_)));
         assert!(matches!(s_size, SomeValue::Integer(_)));
@@ -1362,7 +1362,7 @@ pub struct SomeInstance {
     /// `BTreeMap<String, bool>` — `BTreeMap` so the field stays
     /// `Eq`-comparable through a stable iteration order. Upstream
     /// non-boolean flag payloads (None sentinels observed only at
-    /// classdesc.py:336) will widen this value type when the bookkeeper
+    /// classdesc.py lookup_filter) will widen this value type when the bookkeeper
     /// lands.
     pub flags: std::collections::BTreeMap<String, bool>,
 }
@@ -1654,7 +1654,7 @@ impl SomePBC {
     pub fn simplify(&mut self) -> Result<(), AnnotatorError> {
         // upstream: `kind.simplify_desc_set(self.descriptions)` —
         // polymorphic dispatch on `type(desc)`. Desc.simplify_desc_set
-        // (description.py:180-182) is the staticmethod no-op base;
+        // (description.py) is the staticmethod no-op base;
         // MethodDesc overrides it (description.py).
         let kind = self.get_kind()?;
         if self.descriptions.len() > 1 {
@@ -1684,7 +1684,7 @@ impl SomePBC {
     /// ```
     ///
     /// Kind dispatch routes through the staticmethod on each Desc
-    /// subclass (description.py:357-363 / 458-465 / 627-634, and
+    /// subclass (description.py / 458-465 / 627-634, and
     /// classdesc.py's ClassDesc.consider_call_site). Rust port
     /// dispatches via variant match: FunctionDesc is fully ported;
     /// Method / Class / Frozen / MethodOfFrozen keep structural
@@ -1989,7 +1989,7 @@ impl SomeBuiltinMethod {
     }
 
     /// RPython `SomeBuiltinMethod.call(self, args, implicit_init=False)`
-    /// (unaryop.py:961-967). Returns `None` for a void analyser (a method
+    /// (unaryop.py). Returns `None` for a void analyser (a method
     /// body that falls off the end), `Some(_)` otherwise.
     pub fn call(
         &self,
@@ -2302,7 +2302,7 @@ impl SomeValueTag {
 
 impl SomeValue {
     /// RPython `getattr(annotation, "knowntypedata", {})`
-    /// (annrpython.py:566) — the exitswitch consumer reads branch
+    /// (annrpython.py) — the exitswitch consumer reads branch
     /// constraints generically, without type-checking the annotation.
     /// `SomeBool` always carries it after a comparison; an integer
     /// discriminant `SomeInteger` carries per-case constraints once a
@@ -2561,7 +2561,7 @@ impl SomeValue {
 
     /// RPython `SomeObject.call(self, args, implicit_init=False)` and the
     /// `SomeBuiltinMethod` / `SomePBC` / `SomeNone` overrides
-    /// (unaryop.py:237-238, 961-967, 985-987, 1011-1012).
+    /// (unaryop.py, 961-967, 985-987, 1011-1012).
     ///
     /// Returns `Ok(None)` for a void result — a builtin method analyser
     /// whose body falls off the end (`unaryop.py simple_call`
@@ -2609,7 +2609,7 @@ impl SomeValue {
                 // through `call_builtin`; each analyser body unwraps via
                 // [`builtin::arg_at`] at the touch site, panicking with
                 // the analyser name + slot index at the same iteration
-                // upstream would raise (`unaryop.py:940` bind-then-body
+                // upstream would raise (`unaryop.py` bind-then-body
                 // sequence).
                 // upstream `model.py:1184 kwds_s['s_'+key] = s_value`
                 // — passes the value through unchanged (None or
@@ -2623,7 +2623,7 @@ impl SomeValue {
                     .collect();
                 // upstream `SomeBuiltin.analyser` is the bound method
                 // `entry.compute_result_annotation` for builtins
-                // produced via `extregistry.py:62-67` —
+                // produced via `extregistry.py` —
                 // `SomeBuiltin(self.compute_result_annotation, ...)`.
                 // Rust splits dispatch in two: the registered
                 // `BUILTIN_ANALYZERS` table covers the `bookkeeper.py`
@@ -2933,7 +2933,7 @@ pub(crate) fn s_str0() -> SomeValue {
 ///
 /// `block` carries the `__annotator_block` debug attribute that upstream
 /// attaches at `rpython/annotator/annrpython.py:402` so
-/// `rpython/tool/error.py:143` can render a "Processing block:" section
+/// `rpython/tool/error.py` can render a "Processing block:" section
 /// when the annotator aborts. Only the pointer identity is kept (as a
 /// `usize`) so the error stays `Send` for `panic_any`; a full block
 /// lookup can go through the translator's block table when
@@ -2984,7 +2984,7 @@ impl Eq for AnnotatorError {}
 impl fmt::Display for AnnotatorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Line-by-line port of `AnnotatorError.__str__`
-        // (`rpython/annotator/model.py:719-725`):
+        // (`rpython/annotator/model.py`):
         //
         //     def __str__(self):
         //         s = "\n\n%s" % self.msg
@@ -3121,7 +3121,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // SomeImpossibleValue is the bottom element: `impossible ∪ X = X`.
         (SomeValue::Impossible, other) | (other, SomeValue::Impossible) => Ok(other.clone()),
 
-        // SomeInteger ∪ SomeInteger — binaryop.py:178-202 signedness-
+        // SomeInteger ∪ SomeInteger — binaryop.py union signedness-
         // proof dispatch. Direct port of the upstream body:
         //
         //     if int1.unsigned == int2.unsigned:
@@ -3334,7 +3334,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // keeps only flags that agree on both sides.
         (SomeValue::Instance(a), SomeValue::Instance(b)) => {
             let can_be_none = a.can_be_none || b.can_be_none;
-            // binaryop.py:666-672 unions two SomeInstances through
+            // binaryop.py union unions two SomeInstances through
             // `commonbase(classdef1, classdef2)`.  The `classdef is
             // None` case is a special case that yields `basedef = None`;
             // when BOTH sides carry a classdef and `commonbase` returns
@@ -3483,7 +3483,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             Ok(SomeValue::Address(SomeAddress::new()))
         }
 
-        // llannotation.py:28-31 — `pair(SomeTypedAddressAccess,
+        // llannotation.py __extend__ — `pair(SomeTypedAddressAccess,
         // SomeTypedAddressAccess).union()`:
         //   `assert s_taa1.type == s_taa2.type; return s_taa1`.
         (SomeValue::TypedAddressAccess(a), SomeValue::TypedAddressAccess(b)) => {
@@ -3907,7 +3907,7 @@ impl std::error::Error for HarmlesslyBlocked {}
 /// (`AnnotatorError` / `HarmlesslyBlocked`, both `Exception` subclasses)
 /// and they propagate up through the same call stack. Rust functions
 /// that can raise *either* (e.g. `ClassDef.s_getattr` at
-/// classdesc.py:168-187 — which raises `HarmlesslyBlocked` in the
+/// classdesc.py — which raises `HarmlesslyBlocked` in the
 /// enforced-attrs branch) return this union so the flowin loop can
 /// discriminate them without collapsing `HarmlesslyBlocked` into a
 /// generic `AnnotatorError`.
@@ -5146,7 +5146,7 @@ mod tests {
     #[test]
     fn union_instances_with_no_common_base_raises() {
         // Two standalone classes carry classdefs and share no base.
-        // binaryop.py:666-672 raises UnionError when both sides have a
+        // binaryop.py union raises UnionError when both sides have a
         // classdef and `commonbase` returns None — it does NOT widen
         // unrelated classdefs to the classdef-less top.
         let a = SomeValue::Instance(SomeInstance::new(
@@ -5315,7 +5315,7 @@ mod tests {
     fn union_typed_address_access_requires_matching_type() {
         use crate::translator::rtyper::lltypesystem::llmemory::SomeTypedAddressAccess;
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-        // llannotation.py:28-31 — same access type unions to s_taa1.
+        // llannotation.py __extend__ — same access type unions to s_taa1.
         let signed =
             SomeValue::TypedAddressAccess(SomeTypedAddressAccess::new(LowLevelType::Signed));
         let signed2 =
@@ -5403,7 +5403,7 @@ mod tests {
 
     #[test]
     fn bool_union_merges_knowntypedata_and_agreeing_const() {
-        // binaryop.py:298-306. A refinement-carrying non-constant bool
+        // binaryop.py union. A refinement-carrying non-constant bool
         // must contain a constant bool carrying the same refinement —
         // union() has to reproduce the merged knowntypedata, not drop
         // it, or setbinding's contains check fails on reflow.

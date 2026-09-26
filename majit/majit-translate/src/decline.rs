@@ -9,9 +9,9 @@
 //!
 //! Upstream does not stop translation either, but it carries the reason as
 //! a value: `_handle_list_call` raises `NotSupported(prefix + oopspec_name)`
-//! (`rpython/jit/codewriter/jtransform.py:1796`), naming the shape it
+//! (`rpython/jit/codewriter/jtransform.py`), naming the shape it
 //! refused, and `rewrite_op_direct_call` catches it and falls through to a
-//! residual call (`jtransform.py:512-520`).  The refusal is equally silent
+//! residual call (`jtransform.py`).  The refusal is equally silent
 //! at the end — but at the point of refusal the reason existed.  This module
 //! does NOT turn any decline into an error — every gate keeps its exact
 //! current control flow — it only records the reason where it still exists,

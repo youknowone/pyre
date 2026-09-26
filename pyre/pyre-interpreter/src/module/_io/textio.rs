@@ -517,7 +517,7 @@ impl W_TextIOWrapper {
         }
     }
 
-    /// Record `self` in the remembered set (incminimark.py:1495
+    /// Record `self` in the remembered set (incminimark.py write_barrier_from_array
     /// `write_barrier_from_array`).  An already-old wrapper is NOT scanned by a
     /// minor collection unless the barrier ran since the previous one, so a
     /// reference field storing a fresh (nursery) object has to be published
@@ -992,7 +992,7 @@ impl W_TextIOWrapper {
             // With a null codec the only fallible step `attach_buffer` reaches
             // is `buffer.seekable()`, and a descriptor the host refused to open
             // arrives as no buffer at all.  `create_stdio`
-            // (`app_main.py:495-497`) propagates such a failure, but this runs
+            // (`app_main.py`) propagates such a failure, but this runs
             // inside `sys` module creation — there is no interpreter to raise
             // into yet, and the streams have to exist for one to start.  Finish
             // the two fields the early return skipped rather than leaving them
@@ -1166,7 +1166,7 @@ impl W_TextIOWrapper {
         // The rest of the `descr_init` tail `allocate_stdio` also had to defer:
         // the seekable/telling pair and the `read1` probe both call into the
         // buffer, which is why they wait for the same moment the codec does.
-        // `interp_textio.py:601-610` runs them in this order, after the codec.
+        // `interp_textio.py` runs them in this order, after the codec.
         if let Ok(w_seekable) = super::call_method_result(payload.w_buffer, "seekable", &[])
             && let Ok(seekable) = crate::baseobjspace::is_true(w_seekable)
         {

@@ -16,7 +16,7 @@ pub enum CallEffectKind {
     /// `Elidable` and `Residual` are shorthands for two whole rows; this arm
     /// carries the row itself, which is what a callee with **no graph** needs.
     /// It is upstream's `analyze_external_call` answer — the middle arm of
-    /// `graphanalyze.py:93-130` — reached through the only channel this side
+    /// `graphanalyze.py` — reached through the only channel this side
     /// has for it: a spelling-keyed table, not a source attribute.
     ///
     /// `#[allow(dead_code)]` because **no row uses this arm yet.** The rows
@@ -48,7 +48,7 @@ pub enum CallEffectKind {
 ///
 /// The converse must stay writable. `elidable` **plus a concrete benign
 /// row** is legal upstream and is the whole point: `random_effects_on_gcobjs`
-/// derives from `invoke_around_handlers or has_callback` (`rffi.py:130-175`),
+/// derives from `invoke_around_handlers or has_callback` (`rffi.py`),
 /// i.e. "can release the GIL or can run a callback". A primitive like
 /// `core::ptr::null` does neither. A type that forbade elidable-with-a-row
 /// would delete the population this arm exists to serve, at compile time,

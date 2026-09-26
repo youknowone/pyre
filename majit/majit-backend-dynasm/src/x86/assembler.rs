@@ -365,7 +365,7 @@ pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
 /// `propagate_exception_descr` is read from `cpu_handle` and baked
 /// as an i64 immediate into `[rbp + JF_DESCR_OFS]`.  Caller must
 /// guarantee the descr is installed (`MetaInterp::finish_setup`,
-/// `pyjitpl.py:2283`) before invoking this builder; the build asserts
+/// `pyjitpl.py`) before invoking this builder; the build asserts
 /// otherwise.  PyPy itself would silently bake 0 in this case (and
 /// fail at `handle_fail` dispatch time); pyre prefers a build-time
 /// fail-fast for the same invariant.
@@ -878,7 +878,7 @@ pub struct Assembler386<'a> {
     /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
     /// `None` corresponds to RPython's gcremovetypeptr config.
     vtable_offset: Option<usize>,
-    /// llsupport/gc.py:563 vtable→typeid table, materialized by the runner
+    /// llsupport/gc.py get_typeid_from_classptr_if_gcremovetypeptr vtable→typeid table, materialized by the runner
     /// via gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr. Used by
     /// the gcremovetypeptr branch of `_cmp_guard_class`.
     classptr_to_typeid: IndexMap<i64, u32>,
@@ -1080,7 +1080,7 @@ impl CompiledCode {
 /// per method so the lint still reports anything else in this `impl` that
 /// stops being reached.
 impl<'a> Assembler386<'a> {
-    /// rpython/jit/metainterp/history.py:220 `box.type` parity.
+    /// rpython/jit/metainterp/history.py is_constant `box.type` parity.
     /// Single source of truth: `op.type_` for ops, `inputarg.tp` for
     /// inputargs, the `Const` variant tag for constants.
     ///
@@ -3077,7 +3077,7 @@ impl<'a> Assembler386<'a> {
             // is_add=False)`: when `result_loc is arglocs[0]` emit
             // `SUB dst, src` in place; otherwise the regalloc routed
             // through `_consider_lea` (consider_int_sub at
-            // x86/regalloc.py:575) and produced a fresh result register,
+            // x86/regalloc.py) and produced a fresh result register,
             // and we must emit `LEA result_loc, [arglocs[0] - delta]`
             // — never `SUB dst, src`, which would corrupt `dst`'s stale
             // value (the bug seen in fannkuch as `q.int_items.ptr - 1`
@@ -3475,7 +3475,7 @@ impl<'a> Assembler386<'a> {
             // `assembler.py genop_cast_ptr_to_int = _genop_same_as`
             // / `:1529 genop_cast_int_to_ptr = _genop_same_as`.  PyPy's
             // x86 backend treats both casts as plain `mov` — the
-            // AddressAsInt low-bit tag is a `blackhole.py:603-610`
+            // AddressAsInt low-bit tag is a `blackhole.py bhimpl_cast_ptr_to_int`
             // interpreter-side software invariant, not a backend
             // codegen step.  Tagging at codegen would fold a fake odd
             // pointer back into the raw aligned-pointer space and
@@ -4080,7 +4080,7 @@ impl<'a> Assembler386<'a> {
                     ),
                 }
             }
-            // Structural adaptation: PyPy's llsupport/rewrite.py:132-154
+            // Structural adaptation: PyPy's llsupport/rewrite.py
             // normally lowers SETARRAYITEM_* to GC_STORE(_INDEXED), but
             // pyre's CI also exercises direct backend emission paths before
             // that rewrite has run.
@@ -6466,7 +6466,7 @@ impl<'a> Assembler386<'a> {
         } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
             // Finish/Jump carry no failargs; their result kind comes from
             // the argument boxes, whose types are fixed at construction
-            // (resoperation.py:719/727/739).  When neither a fail descr nor
+            // (resoperation.py InputArgInt/727/739).  When neither a fail descr nor
             // a preset fail_arg_types list supplies them, infer from the
             // arglist so the FINISH's done_with_this_frame_descr kind
             // matches the caller's CALL_ASSEMBLER result kind (a Void
@@ -7156,7 +7156,7 @@ impl<'a> Assembler386<'a> {
     /// [resloc, size, sign, saveerr, func, args...] for CALL_RELEASE_GIL.
     ///
     /// Register-bound arg moves go through `remap_frame_layout_mixed`
-    /// (a parallel-move algorithm) mirroring x86/callbuilder.py:584
+    /// (a parallel-move algorithm) mirroring x86/callbuilder.py prepare_arguments
     /// `prepare_arguments` → `remap_frame_layout`.  Emitting them naively
     /// in source order broke Win64 where two args could map to the same
     /// dst-then-src register (e.g. arg0 → rcx clobbering Reg(rcx) before
@@ -7555,7 +7555,7 @@ impl<'a> Assembler386<'a> {
     ///   4. Path B (fast): MOV result, [frame + ofs]
     ///   5. join paths
     ///
-    /// llsupport/assembler.py `call_assembler` + x86/assembler.py:2267
+    /// llsupport/assembler.py `call_assembler` + x86/assembler.py
     /// `_call_assembler_emit_call` parity. Line-by-line port:
     /// 1. simple_call(target, [jf, threadlocal_loc])
     /// 2. CMP [eax + jf_descr_ofs], done_descr_imm
@@ -7747,7 +7747,7 @@ impl<'a> Assembler386<'a> {
     ///
     /// PyPy emits a barrier only for Ref-typed values, and `rgc.needs_write_barrier`
     /// returns false for NULL constants and true for non-NULL constants
-    /// (rpython/rlib/rgc.py:285-297).  The normal rewriter path already performs
+    /// (rpython/rlib/rgc.py).  The normal rewriter path already performs
     /// this check; this is the direct-backend fallback for unre-written tests.
     fn setarrayitem_value_needs_write_barrier(&self, value: OpRef, value_loc: &Loc) -> bool {
         if matches!(value_loc, Loc::Reg(val) if val.is_xmm) {
@@ -7929,7 +7929,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// _build_wb_slowpath parity: save all GPR + XMM regs, call helper, restore.
-    /// x86/assembler.py:2331-2370 + 2417 (XMM variant).
+    /// x86/assembler.py + 2417 (XMM variant).
     fn emit_wb_helper_call_x86(&mut self, loc_base: crate::regloc::RegLoc, helper: i64) {
         // Save all caller-saved GPRs
         dynasm!(self.mc ; .arch x64
@@ -8883,7 +8883,7 @@ impl<'a> Assembler386<'a> {
         };
         let (scale_start, scale_size) = (scale_start.value, scale_size.value);
 
-        // x86/regalloc.py:1436-1503 + assembler.py:2694-2725.  Materialize
+        // x86/regalloc.py consider_zero_array + assembler.py:2694-2725.  Materialize  allow-line-citation
         // the effective address in r11, PyPy's reserved x86-64 scratch GPR.
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         self.regalloc_mov(base_loc, &Loc::Reg(crate::regloc::X86_64_SCRATCH_REG));

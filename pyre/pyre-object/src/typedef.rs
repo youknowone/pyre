@@ -3,7 +3,7 @@
 //! PyPy stores `fget` / `fset` / `fdel` / `doc` / `reqcls` /
 //! `use_closure` / `name` as instance fields on the GetSetProperty
 //! object itself — `class GetSetProperty(W_Root): _immutable_fields_
-//! = [...]` (typedef.py:312-326).  Pyre previously emulated this with
+//! = [...]` (typedef.py).  Pyre previously emulated this with
 //! a process-global `RwLock<HashMap<usize, GetSetFields>>` keyed by
 //! descriptor pointer; that side table was a pure adaptation with no
 //! RPython justification (and quietly leaked entries when descriptors
@@ -288,7 +288,7 @@ pub struct GetSetProperty {
 /// so the descriptor is fully initialised before the first reader.
 ///
 /// `name` may be `PY_NULL`, in which case the caller is responsible
-/// for substituting `'<generic property>'` (matching `typedef.py:336
+/// for substituting `'<generic property>'` (matching `typedef.py
 /// self.name = name if name is not None else '<generic property>'`);
 /// pyre's call sites pass an already-resolved name to keep the
 /// allocation hot path branchless.
@@ -489,7 +489,7 @@ pub const MEMBER_COMPLEX_IMAG: u32 = MEMBER_DIRECT_FLAG | 7;
 /// `descrobject.c descr_members`, shared by every descriptor type: the owning
 /// class (`PyDescrObject.d_type`) and the attribute name (`d_name`), both
 /// read-only.  PyPy publishes the same two values as GetSetProperty
-/// (`typedef.py:470-472`, `:538-539`); the descriptor kind is the 3.14
+/// (`typedef.py`, `:538-539`); the descriptor kind is the 3.14
 /// difference.  The descriptor payloads here — GetSetProperty, Member and the
 /// Function carrier — do not share a header, so the reader dispatches on the
 /// receiver instead of reading one fixed offset.
@@ -708,7 +708,7 @@ pub unsafe fn w_member_set_cls(obj: PyObjectRef, w_cls: PyObjectRef) {
 
 /// `typedef.py Member.index` — the slot index (`base_nslots + position`),
 /// used by the LOAD_ATTR/STORE_ATTR cache to form the `SLOTS_STARTING_FROM +
-/// index` attrkind (mapdict.py:1520).
+/// index` attrkind (mapdict.py).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.

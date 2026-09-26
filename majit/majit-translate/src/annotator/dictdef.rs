@@ -13,7 +13,7 @@
 //!   `DictKey` / `DictValue` here become zero-sized namespaces for the
 //!   subclass's `__init__` / `merge` associated functions, matching
 //!   the upstream class shape at the call-site level. The `patch()`
-//!   overrides (dictdef.py:15-17, 70-72) retarget the appropriate slot
+//!   overrides (dictdef.py, 70-72) retarget the appropriate slot
 //!   on the containing `DictDef` via
 //!   [`super::listdef::ItemOwner::DictKey`] /
 //!   [`super::listdef::ItemOwner::DictValue`] variants consulted by
@@ -40,7 +40,7 @@ pub struct DictKey;
 
 impl DictKey {
     /// RPython `DictKey.__init__(bookkeeper, s_value, is_r_dict=False)`
-    /// (dictdef.py:11-13). Returns the underlying `ListItem` wrapped in
+    /// (dictdef.py). Returns the underlying `ListItem` wrapped in
     /// a shared cell, ready for storage in `DictDef.dictkey`.
     #[expect(
         clippy::new_ret_no_self,
@@ -101,7 +101,7 @@ impl DictKey {
     }
 
     /// RPython `DictKey.update_rdict_annotations(s_eqfn, s_hashfn,
-    /// other=None)` (dictdef.py:35-41).
+    /// other=None)` (dictdef.py).
     pub fn update_rdict_annotations(
         self_li: &Rc<RefCell<ListItem>>,
         s_eqfn: SomeValue,
@@ -124,7 +124,7 @@ impl DictKey {
         // upstream: `self.emulate_rdict_calls(other=other)` (dictdef.py
         // tail). Performs two `bookkeeper.emulate_pbc_call` dispatches —
         // one for eq, one for hash — and validates the return annotations
-        // against `s_Bool` / `SomeInteger` (dictdef.py:56-66), raising
+        // against `s_Bool` / `SomeInteger` (dictdef.py), raising
         // `AnnotatorError` on mismatch.
         Self::emulate_rdict_calls(self_li)
     }
@@ -244,7 +244,7 @@ impl DictValue {
     /// Upstream has no `DictValue.merge` — it inherits
     /// [`ListItem::merge`]. Thin forwarding wrapper preserves the
     /// call-site parity of `self.dictvalue.merge(other.dictvalue)`
-    /// (dictdef.py:107).
+    /// (dictdef.py).
     pub fn merge(
         self_li: &Rc<RefCell<ListItem>>,
         other_li: &Rc<RefCell<ListItem>>,
@@ -301,7 +301,7 @@ impl DictDef {
     /// RPython `DictDef.__init__(bookkeeper=None,
     /// s_key=s_ImpossibleValue, s_value=s_ImpossibleValue,
     /// is_r_dict=False, force_non_null=False, simple_hash_eq=False)`
-    /// (dictdef.py:81-91).
+    /// (dictdef.py).
     pub fn new(
         bookkeeper: Option<Rc<Bookkeeper>>,
         s_key: SomeValue,
@@ -413,7 +413,7 @@ impl DictDef {
     /// RPython `DictDef.generalize_key(s_key)` (dictdef.py).
     ///
     /// Routes through [`DictKey::generalize`] so the subclass override
-    /// (dictdef.py:29-33) fires: when widening a r_dict key cell
+    /// (dictdef.py) fires: when widening a r_dict key cell
     /// actually updates it, the eq/hash emulate-pbc callback must run
     /// to re-validate custom eq/hash annotations. Calling
     /// `ListItem::generalize` directly would bypass that path.
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn generalize_key_routes_through_dictkey_override_on_rdict() {
-        // upstream dictdef.py:29-33 — on an r_dict (custom_eq_hash=true),
+        // upstream dictdef.py generalize — on an r_dict (custom_eq_hash=true),
         // when generalize actually widens the key type, emulate_rdict_
         // calls must fire. The test passes a SomeInteger as s_eqfn which
         // `bookkeeper.emulate_pbc_call` rejects ("expects SomePBC"),
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn generalize_key_on_plain_dict_does_not_trip_rdict_stub() {
-        // upstream dictdef.py:29-33 — custom_eq_hash=false path skips
+        // upstream dictdef.py generalize — custom_eq_hash=false path skips
         // emulate_rdict_calls entirely. Same widening on a plain dict
         // succeeds.
         let dd = DictDef::new(

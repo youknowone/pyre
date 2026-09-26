@@ -11,7 +11,7 @@
 //! ## Deviations from upstream (parity rule #1)
 //!
 //! * **Dispatch shape.** Upstream uses `@FlowContext.opcode('LOAD_FAST')`
-//!   decorator-based per-opcode methods (`flowcontext.py:279` onward).
+//!   decorator-based per-opcode methods (`flowcontext.py` onward).
 //!   Rust has no runtime class decorator, so opcode dispatch collapses
 //!   into a single `match instruction { … }` inside
 //!   `FlowContext::handle_bytecode`. The arms remain in upstream
@@ -542,7 +542,7 @@ pub struct EggBlock {
     /// typed value here: `guessbool` assigns a `bool`
     /// (`flowcontext.py`), while `guessexception` assigns
     /// `None` or an exception class Constant
-    /// (`flowcontext.py:139-141`). Rust closes the union by storing
+    /// (`flowcontext.py`). Rust closes the union by storing
     /// the value as an `Option<Hlvalue>` — `None` mirrors Python
     /// `None`, `Some(Constant(Bool(_)))` covers the `guessbool` case,
     /// and `Some(Constant(ExceptionClass(_)))` covers the
@@ -1075,7 +1075,7 @@ impl FlowContext {
         self.appcall(callee, args_w)
     }
 
-    /// upstream `rpython/flowspace/flowcontext.py:658-663` —
+    /// upstream `rpython/flowspace/flowcontext.py import_name` —
     /// `FlowContext.import_name`. Line-by-line:
     ///
     /// ```python
@@ -1127,7 +1127,7 @@ impl FlowContext {
         }
     }
 
-    /// upstream `rpython/flowspace/flowcontext.py:673-680` —
+    /// upstream `rpython/flowspace/flowcontext.py import_from` —
     /// `FlowContext.import_from`. Line-by-line:
     ///
     /// ```python
@@ -2094,7 +2094,7 @@ impl FlowContext {
         result
     }
 
-    /// upstream `rpython/flowspace/flowcontext.py:569-589` — line-by-line.
+    /// upstream `rpython/flowspace/flowcontext.py exception_match` — line-by-line.
     ///
     /// ```python
     /// def exception_match(self, w_exc_type, w_check_class):
@@ -2760,7 +2760,7 @@ impl FlowContext {
                     }
                 }
                 Instruction::ImportName { .. } => {
-                    // upstream `flowcontext.py:665-671`:
+                    // upstream `flowcontext.py IMPORT_NAME`:
                     //     modulename = self.getname_u(nameindex)
                     //     glob = self.w_globals.value
                     //     fromlist = self.popvalue().value
@@ -2772,7 +2772,7 @@ impl FlowContext {
                     // `func.__globals__` dict, read (never written) during
                     // flow analysis. Route through `live_globals()` for the
                     // function's own frozen globals snapshot
-                    // (`flowcontext.py:284`).
+                    // (`flowcontext.py`).
                     let w_fromlist = self.pop_hlvalue()?;
                     let w_level = self.pop_hlvalue()?;
                     let w_modulename = self.getname_w(oparg as usize)?;
@@ -2841,7 +2841,7 @@ impl FlowContext {
                     Ok(None)
                 }
                 Instruction::ImportFrom { .. } => {
-                    // upstream `flowcontext.py:682-685`:
+                    // upstream `flowcontext.py IMPORT_FROM`:
                     //     w_name = self.getname_w(nameindex)
                     //     w_module = self.peekvalue()
                     //     self.pushvalue(self.import_from(w_module, w_name))

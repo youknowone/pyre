@@ -368,7 +368,7 @@ pub struct CallAssemblerCalleeLocs {
     /// rewrite.py:669 — ptr2int(loop_token.compiled_loop_token.frame_info).
     /// Raw address of the callee's JitFrameInfo struct.
     pub frame_info_ptr: usize,
-    /// pyjitpl.py:3605 — jd.index_of_virtualizable.
+    /// pyjitpl.py direct_call_may_force — jd.index_of_virtualizable.
     /// Index into the original arglist of the virtualizable box.
     /// -1 if no virtualizable.
     pub index_of_virtualizable: i32,
@@ -412,7 +412,7 @@ pub struct GcRewriterImpl {
     /// `True` the helper emits a single `LOAD_EFFECTIVE_ADDRESS`; when
     /// `False` it expands to `(INT_LSHIFT?) + INT_ADD + INT_ADD`.
     pub supports_load_effective_address: bool,
-    /// llsupport/gc.py:30-34 `malloc_zero_filled` parity.
+    /// llsupport/gc.py __init__ `malloc_zero_filled` parity.
     ///
     /// `true` when the allocation path itself guarantees zero-filled
     /// payload bytes. Production backends set this to `false` whenever a
@@ -551,7 +551,7 @@ pub struct JitFrameDescrs {
 }
 
 impl JitFrameDescrs {
-    /// llmodel.py:80-90 + llmodel.py:97-104 — itemsize of the per-arg-type
+    /// llmodel.py + llmodel.py getarraydescr_for_frame — itemsize of the per-arg-type
     /// frame arraydescr (signedarraydescr / refarraydescr / floatarraydescr),
     /// read via getarraydescr_for_frame + unpack_arraydescr_size.
     ///
@@ -3288,7 +3288,7 @@ impl GcRewriterImpl {
 
         // rewrite.py — emit_setfield(frame, ConstInt(llfi),
         // descr=descrs.jf_frame_info). jf_frame_info is Ptr(JITFRAMEINFO)
-        // (jitframe.py:63) so the field size is the pointer width, which
+        // (jitframe.py) so the field size is the pointer width, which
         // in majit's layout coincides with sign_size.
         self.emit_setfield_raw(
             frame.clone(),
@@ -6418,7 +6418,7 @@ mod tests {
 
     // ── COPYSTRCONTENT → LEA × 2 + CALL_N(memcpy) ──
     //
-    // rpython/jit/backend/llsupport/test/test_rewrite.py:1460-1469
+    // rpython/jit/backend/llsupport/test/test_rewrite.py test_rewrite_copystrcontents
     // `test_rewrite_copystrcontents`.
     #[test]
     fn test_rewrite_copystrcontents() {
@@ -6547,7 +6547,7 @@ mod tests {
 
     // ── COPYSTRCONTENT without LEA → INT_ADD × 4 + CALL_N ──
     //
-    // rpython/jit/backend/llsupport/test/test_rewrite.py:1471-1483
+    // rpython/jit/backend/llsupport/test/test_rewrite.py test_rewrite_copystrcontents_without_load_effective_address
     // `test_rewrite_copystrcontents_without_load_effective_address`.
     #[test]
     fn test_rewrite_copystrcontents_without_load_effective_address() {
@@ -6609,7 +6609,7 @@ mod tests {
 
     // ── COPYUNICODECONTENT without LEA → LSHIFT + INT_ADD + INT_ADD per side + LSHIFT(len) + CALL_N ──
     //
-    // rpython/jit/backend/llsupport/test/test_rewrite.py:1497-1512
+    // rpython/jit/backend/llsupport/test/test_rewrite.py test_rewrite_copyunicodecontents_without_load_effective_address
     // `test_rewrite_copyunicodecontents_without_load_effective_address`.
     #[test]
     fn test_rewrite_copyunicodecontents_without_load_effective_address() {

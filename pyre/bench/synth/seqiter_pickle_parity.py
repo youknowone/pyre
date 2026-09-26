@@ -6,7 +6,7 @@
 # (iterobject.py descr_reduce / descr_setstate):
 #   * a live cursor reduces to `(iter, (seq,), index)`;
 #   * an exhausted cursor (`w_seq is None`) reduces to `_empty_iterable` =
-#     `(iter, ((),))` (iterobject.py:251-253), so it restores empty;
+#     `(iter, ((),))` (iterobject.py), so it restores empty;
 #   * `__setstate__` restores the index only while the sequence is still live.
 # A negative restored index DIVERGES (3.14 leaves the iterator exhausted; PyPy
 # clamps the index to 0) so it is exercised only in the implementation, not

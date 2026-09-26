@@ -423,7 +423,7 @@ macro_rules! type_mirrors {
             let bound: &[(*mut CPyTypeObject, PyObjectRef)] = &[
                 $( (&raw mut $symbol, $resolve), )*
             ];
-            // `api.py:1500-1502 attach_all` links every static before any of
+            // `api.py attach_all` links every static before any of
             // them is filled: filling one resolves its base's mirror, and a
             // base that is about to be bound a few entries later would
             // otherwise have a second block synthesized for it.
@@ -556,7 +556,7 @@ use super::address_table::{AddressTable, hold};
 static TYPE_NAMES: AddressTable<NameTable> =
     AddressTable::new(NameTable::with_hasher(std::hash::BuildHasherDefault::new()));
 
-/// `typeobject.py:708-722 type_dealloc` — release what a synthesized mirror's
+/// `typeobject.py type_dealloc` — release what a synthesized mirror's
 /// own fields hold, and the string behind `tp_name`.
 ///
 /// The table above is what says a dying block is a type mirror this layer
@@ -807,7 +807,7 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
             | heaptype
             | static_builtin
             | immutabletype;
-        // `typeobject.py:777-778 type_attach`.  A `tp_new` written for C ends
+        // `typeobject.py type_attach`.  A `tp_new` written for C ends
         // in `t->tp_alloc(t, 0)`, with `t` the type being built rather than
         // the one that declared the constructor, so a class derived in Python
         // from a C type is handed to a C allocator and has to carry the pair.
@@ -872,7 +872,7 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
     let base = base_mirror(w_type);
     unsafe {
         (*mirror).tp_base = base;
-        // `typeobject.py:825-827`, the same rule `inherit_special` states as
+        // `typeobject.py`, the same rule `inherit_special` states as
         // "if tp_basicsize is zero or too low, we copy it from the base": what
         // sizes an instance is the most derived struct in the chain, and only
         // the base knows how large that is.
@@ -902,7 +902,7 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
 }
 
 /// The mirror of the base whose instance layout `w_type` extends —
-/// `typeobject.py:903-906 best_base`, which is not `__bases__[0]` when more
+/// `typeobject.py best_base`, which is not `__bases__[0]` when more
 /// than one base is a type.
 ///
 /// The reference this takes is the one `tp_base` holds; [`forget_type_links`]
@@ -2266,11 +2266,11 @@ fn fill_interpreter_slots(mirror: *mut CPyTypeObject, w_type: PyObjectRef) {
     }
 }
 
-/// `typeobject.py:1065-1092 finish_type_2` — the half of the fill that reads
+/// `typeobject.py finish_type_2` — the half of the fill that reads
 /// the base's own slots.
 ///
 /// Deferred past the static bindings at startup for the reason
-/// `api.py:1509-1513 attach_all` defers it: a base bound a few entries later in
+/// `api.py attach_all` defers it: a base bound a few entries later in
 /// the same table has nothing in its slots yet.
 ///
 /// Idempotent, so the deferred drain may reach a mirror the lazy path already
@@ -2278,7 +2278,7 @@ fn fill_interpreter_slots(mirror: *mut CPyTypeObject, w_type: PyObjectRef) {
 pub(super) fn finish_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyObjectRef) {
     let base = unsafe { (*mirror).tp_base };
     inherit_mirror_slots(mirror, base);
-    // `typeobject.py:838-844 type_attach`.  A constructor is inherited from
+    // `typeobject.py type_attach`.  A constructor is inherited from
     // the base for every type but one derived directly from `object` and not
     // written in Python, which is `object`'s own `tp_new` and nothing else.
     if unsafe { (*mirror).tp_new.is_null() } && !base.is_null() {
@@ -2334,7 +2334,7 @@ fn inherit_vectorcall(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
     }
 }
 
-/// `typeobject.py:945-996 inherit_slots` — what a mirror takes from its base.
+/// `typeobject.py inherit_slots` — what a mirror takes from its base.
 ///
 /// Narrower than the [`inherit_slots`] `PyType_Ready` runs: the slots left out
 /// here are the ones a type's own Python-level methods answer for, and copying
@@ -2440,7 +2440,7 @@ fn inherit_mirror_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
 
 /// `true` when `tp` is a type whose storage is the mirror layer's to release —
 /// the predicate `type_dealloc` and `_dealloc` both branch on
-/// (`typeobject.py:716`, `object.py:72`).
+/// (`typeobject.py:716`, `object.py`).  allow-line-citation
 pub(super) fn is_heap_type(tp: *mut CPyTypeObject) -> bool {
     !tp.is_null() && unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) }
 }

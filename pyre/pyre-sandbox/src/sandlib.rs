@@ -30,7 +30,7 @@ const FD_RANGE_END: i32 = 50;
 const MAX_READ: usize = 256 * 1024;
 
 /// The static shape of a successful reply, mirroring `sandlib.write_message`'s
-/// `resulttype` parameter (`sandlib.py:37-66`).
+/// `resulttype` parameter (`sandlib.py`).
 pub enum Reply {
     /// Marshalled with the normal `_marshal` codec.
     Value(MarshalValue),
@@ -136,7 +136,7 @@ impl SandboxPolicy {
         self.input_log = Some(file);
     }
 
-    // ── path resolution (sandlib.py:417-437) ─────────────────────────────────
+    // ── path resolution (sandlib.py translate_path) ─────────────────────────────────
 
     // sandlib.py `translate_path`.
     fn translate_path(&self, vpath: &str) -> SandboxResult<(FsNode, String)> {
@@ -192,7 +192,7 @@ impl SandboxPolicy {
         Err(SandboxError::Os(libc::EMFILE))
     }
 
-    // ── dispatch (sandlib.py:276-284) ────────────────────────────────────────
+    // ── dispatch (sandlib.py handle_message) ────────────────────────────────────────
 
     /// Dispatch a marshalled request to the matching `do_*` handler. Rejects any
     /// fnname containing `"__"` first (`sandlib.py:277`), so only the curated
@@ -243,7 +243,7 @@ impl SandboxPolicy {
     // ── VirtualizedSandboxedProc handlers ────────────────────────────────────
 
     // sandlib.py `do_ll_os__ll_os_open`, with the `VirtualizedSocketProc`
-    // `tcp://` override (sandlib.py:554) folded in when `allow_net` is set.
+    // `tcp://` override (sandlib.py) folded in when `allow_net` is set.
     fn do_open(&mut self, args: &[MarshalValue]) -> SandboxResult<Reply> {
         let vpath = arg_path(args, 0)?;
         // sandlib.py:555: sockets are checked before the read-only flag gate,
@@ -290,7 +290,7 @@ impl SandboxPolicy {
     fn do_read(&mut self, args: &[MarshalValue], console: &mut Console) -> SandboxResult<Reply> {
         let fd = arg_int(args, 0)? as i32;
         let size = arg_int(args, 1)?;
-        // sandlib.py:566-567: a `tcp://` fd recv's one chunk from the stream.
+        // sandlib.py do_ll_os__ll_os_read: a `tcp://` fd recv's one chunk from the stream.
         if let Some(stream) = self.sockets.get_mut(&fd) {
             if size < 0 {
                 return Err(SandboxError::Os(libc::EINVAL));
@@ -350,7 +350,7 @@ impl SandboxPolicy {
     fn do_write(&mut self, args: &[MarshalValue], console: &mut Console) -> SandboxResult<Reply> {
         let fd = arg_int(args, 0)? as i32;
         let data = arg_bytes(args, 1)?;
-        // sandlib.py:572-574: a `tcp://` fd send's the payload down the stream.
+        // sandlib.py do_ll_os__ll_os_write: a `tcp://` fd send's the payload down the stream.
         if let Some(stream) = self.sockets.get_mut(&fd) {
             let sent = stream.write(&data).map_err(|_| SandboxError::Io)?;
             return Ok(Reply::Value(MarshalValue::Int(sent as i64)));
@@ -549,7 +549,7 @@ impl SandboxPolicy {
         Ok(Reply::Value(MarshalValue::None))
     }
 
-    // ── the request/reply loop (sandlib.py:222-268) ──────────────────────────
+    // ── the request/reply loop (sandlib.py handle_until_return) ──────────────────────────
 
     /// Read marshalled `(fnname, args)` requests from `child_stdout`, dispatch
     /// them, and marshal replies to `child_stdin`, until the child closes its
@@ -630,7 +630,7 @@ fn protocol_io_error(e: SandboxError) -> io::Error {
     }
 }
 
-// sandlib.py:258-259 reply framing + sandlib.py:37-66 resulttype encoding.
+// sandlib.py reply framing + sandlib.py write_message resulttype encoding.
 fn encode_reply(out: &mut Vec<u8>, reply: &Reply) {
     match reply {
         Reply::Value(v) => dump_value(out, v, IntFlavor::Marshal),

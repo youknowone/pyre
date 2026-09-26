@@ -90,7 +90,7 @@ pub(super) fn trap<T>(result: Result<T, crate::PyError>) -> Option<T> {
 /// C-visible `PyStopIterationObject`, the twin of the struct in
 /// `include/pyre3.14t/pyerrors.h`.
 ///
-/// The fields are `pyerrors.py:24 PyStopIterationObjectFields`: the header and
+/// The fields are `pyerrors.py PyStopIterationObjectFields`: the header and
 /// `value`, with none of the exception words a runtime that keeps its
 /// exceptions as C structs would have between them.  An extension reads the
 /// rest through `PyException_GetTraceback` and its neighbours, so there is
@@ -136,7 +136,7 @@ fn stopiteration_class() -> PyObjectRef {
 }
 
 /// What `tp_basicsize` a synthesized mirror of `w_type` carries —
-/// `pyerrors.py:31-35 basestruct=PyStopIterationObject.TO` for `StopIteration`
+/// `pyerrors.py basestruct=PyStopIterationObject.TO` for `StopIteration`
 /// and the classes derived from it, and 0 for every other type, which asks for
 /// the plain header.
 ///
@@ -155,7 +155,7 @@ pub(super) fn basicsize(w_type: PyObjectRef) -> isize {
 }
 
 /// Fill a freshly allocated mirror of `w_obj` when `w_obj` is a
-/// `StopIteration` — `pyerrors.py:37-43 stopiteration_attach`.
+/// `StopIteration` — `pyerrors.py stopiteration_attach`.
 ///
 /// The value is a snapshot: a later `e.value = x` reaches the attribute and
 /// not this word, which is the same bargain upstream states at the assignment.

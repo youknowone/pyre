@@ -64,7 +64,7 @@ pub const TAGVIRTUAL: u8 = 3;
 /// offset here (a non-negative value), and both the box-count liveness
 /// query and the blackhole `setposition` resolve directly off it,
 /// bypassing `pc_map` — the direct `setposition(jitcode, pc)` shape
-/// (`pyjitpl.py:2610-2624`) without the pc round-trip.  The Python `pc`
+/// (`pyjitpl.py`) without the pc round-trip.  The Python `pc`
 /// word stays populated for interpreter re-entry / `last_instr`.
 pub const NO_JITCODE_PC: i32 = -1;
 
@@ -257,10 +257,10 @@ pub enum ResumeVirtualLayoutSummary {
         element_fields: Vec<Vec<(u32, ResumeValueLayoutSummary)>>,
     },
     RawBuffer {
-        /// resume.py:694: self.func
+        /// resume.py __init__: self.func
         func: i64,
         size: usize,
-        /// resume.py:695: self.offsets — signed (rawbuffer.py:14).
+        /// resume.py: self.offsets — signed (rawbuffer.py __init__).
         offsets: Vec<i64>,
         /// resume.py:697: self.descrs
         descrs: Vec<crate::ArrayDescrInfo>,
@@ -278,7 +278,7 @@ pub enum ResumeVirtualLayoutSummary {
     },
     /// `resume.py VStrConcatInfo` — virtual string concat. OS_STR_CONCAT
     /// funcptr is resolved at materialization via
-    /// `callinfocollection.funcptr_for_oopspec(...)` (resume.py:1467-1468),
+    /// `callinfocollection.funcptr_for_oopspec(...)` (resume.py),
     /// not stored on the summary.
     StrConcat {
         left: ResumeValueLayoutSummary,
@@ -286,7 +286,7 @@ pub enum ResumeVirtualLayoutSummary {
     },
     /// `resume.py VStrSliceInfo` — virtual slice of a larger string.
     /// OS_STR_SLICE funcptr resolved via callinfocollection at
-    /// materialization (resume.py:1477-1478).
+    /// materialization (resume.py).
     StrSlice {
         source: ResumeValueLayoutSummary,
         start: ResumeValueLayoutSummary,
@@ -298,14 +298,14 @@ pub enum ResumeVirtualLayoutSummary {
     },
     /// `resume.py VUniConcatInfo` — unicode counterpart.
     /// OS_UNI_CONCAT funcptr resolved via callinfocollection
-    /// (resume.py:1494-1495).
+    /// (resume.py).
     UniConcat {
         left: ResumeValueLayoutSummary,
         right: ResumeValueLayoutSummary,
     },
     /// `resume.py VUniSliceInfo` — unicode counterpart.
     /// OS_UNI_SLICE funcptr resolved via callinfocollection
-    /// (resume.py:1504-1505).
+    /// (resume.py).
     UniSlice {
         source: ResumeValueLayoutSummary,
         start: ResumeValueLayoutSummary,
@@ -321,7 +321,7 @@ pub const NULLREF: i16 = ((-1i32 << 2) | TAGCONST as i32) as i16;
 pub const UNINITIALIZED_TAG: i16 = ((-2i32 << 2) | TAGCONST as i32) as i16;
 pub const TAG_CONST_OFFSET: i32 = 0;
 
-/// resume.py:106-109
+/// resume.py untag
 pub fn untag(value: i16) -> (i32, u8) {
     let widened = value as i32;
     let tagbits = (widened & TAGMASK as i32) as u8;
@@ -345,7 +345,7 @@ pub enum RebuiltValue {
     /// (Int/Float/Ref), matching RPython's `decode_box` which returns a
     /// `ConstInt`/`ConstFloat`/`ConstPtr` regardless of whether the value
     /// came from the inline TAGINT encoding or the TAGCONST pool
-    /// (resume.py:1250-1270).
+    /// (resume.py).
     Const(crate::Const),
     /// TAGVIRTUAL(n): virtual object index n.
     Virtual(usize),
@@ -415,7 +415,7 @@ pub fn decode_tagged_value(
             // resume.py decode_box(num, kind) parity — pull the
             // box's `.type` from the parent guard's fail_arg_types,
             // which `_number_boxes` populated when encoding via
-            // `env.get_type(opref)`. resume.py:1264 asserts
+            // `env.get_type(opref)`. resume.py asserts
             // `box.type == kind`; a missing entry means the
             // fail_arg_types vector is shorter than the encoded box
             // count (encoder/decoder disagreement), which must fail
@@ -457,7 +457,7 @@ pub fn decode_tagged_value(
 /// `(jitcode_index, pc)` are consumed as a single frame (callers that only
 /// ever see single-frame data).
 ///
-/// `fail_arg_types`: parent guard's per-failarg type vector. resume.py:1245
+/// `fail_arg_types`: parent guard's per-failarg type vector. resume.py
 /// `decode_box(num, kind)` parity — TAGBOX values use this to fill in their
 /// kind so the resulting `RebuiltValue::Box` carries its own type and
 /// downstream consumers don't need a parallel side channel.

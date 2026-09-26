@@ -15,9 +15,9 @@
 //!                   assemble
 //!
 //! The `FunctionGraph` layer makes **link.args ↔ target.inputargs**
-//! available to the regalloc (`rpython/tool/algo/regalloc.py:79-112`
+//! available to the regalloc (`rpython/tool/algo/regalloc.py coalesce_variables`
 //! `coalesce_variables` coalesces those pairs) and to `insert_renamings`
-//! (`rpython/jit/codewriter/flatten.py:306-334` emits `%s_copy` /
+//! (`rpython/jit/codewriter/flatten.py` emits `%s_copy` /
 //! `%s_push` / `%s_pop` when the pairs are not already coalesced).
 //!
 //! This module is the RPython-orthodox replacement surface, and it is now
@@ -36,7 +36,7 @@
 //! `link.args ↔ target.inputargs` from the graph directly (replacing the
 //! former SSARepr-level `ref_copy` scanner in `regalloc.rs`), and
 //! `insert_renamings` emits the `%s_copy` / `%s_push` / `%s_pop` moves
-//! (`rpython/jit/codewriter/flatten.py:306-334`) rather than the walker's
+//! (`rpython/jit/codewriter/flatten.py`) rather than the walker's
 //! old explicit `obj_tmp*` cycle pre-breaking. The data types preserve the
 //! same core object shape (Variable, Constant, Link, Block, FunctionGraph,
 //! including the special return/except blocks and link exception extras).
@@ -702,7 +702,7 @@ impl BlockRef {
     /// values within a single CodeWriter run.  Used by
     /// `flatten::block_label_name` to derive upstream-orthodox per-
     /// block `Label(block)` names from the implicit Python object
-    /// identity `rpython/jit/codewriter/flatten.py:116` relies on.
+    /// identity `rpython/jit/codewriter/flatten.py` relies on.
     pub fn as_ptr_addr(&self) -> usize {
         Rc::as_ptr(&self.0) as usize
     }

@@ -1293,7 +1293,7 @@ fn analyze_pipeline_from_module_paths(
             // impl when the trait method has NO default body, and the
             // `trait_method_overrides` lookup inside the default-body
             // registration prefers the unique override over the default
-            // (`classdesc.py:749` — a concrete override shadows the
+            // (`classdesc.py` — a concrete override shadows the
             // trait default in the MRO walk).
             (Some(owner), Some(trait_leaf)) => {
                 concrete_trait_methods.push((
@@ -1406,7 +1406,7 @@ fn analyze_pipeline_from_module_paths(
     // RPython: symbolic.get_field_token / get_size — resolve struct layouts
     // through the LayoutProvider. If no provider is given, use the heuristic
     // (type-string-based approximation of #[repr(C)] layout).
-    // `_immutable_fields_` is declared on the class (`rclass.py:644-678`
+    // `_immutable_fields_` is declared on the class (`rclass.py _parse_field_list`
     // reads it off the class object, which has exactly one identity), but
     // `struct_fields` carries several spellings of the same struct —
     // `PyType` and `pyre_object::pyobject::PyType` both resolve to one
@@ -1789,7 +1789,7 @@ fn analyze_pipeline_from_module_paths(
                     None => graph,
                 };
                 call_control.register_trait_method(&method.name, trait_root, impl_type, graph);
-                // Parity with upstream `rpython/annotator/classdesc.py:749
+                // Parity with upstream `rpython/annotator/classdesc.py lookup
                 // lookup` MRO walk: a trait default body is the
                 // "base-class method" for every impl that does not
                 // override it. Rust-idiomatic call sites emit the call
@@ -2378,19 +2378,19 @@ fn analyze_pipeline_from_module_paths(
     // source can carry a declaration across, so it is written here — the same
     // place upstream writes the one declaration it cannot derive either
     // (`random_effects_on_gcobjs=True` at the `llexternal` callsite,
-    // `_rffi_stacklet.py:49-51`).
+    // `_rffi_stacklet.py`).
     //
     // `mark_canmallocgc`, not `mark_external_gc_effects`: random effects
     // additionally answer `RandomEffectsAnalyzer` True, which upstream never
-    // does for an allocation (`effectinfo.py:417-418`) and which would make
+    // does for an allocation (`effectinfo.py`) and which would make
     // every elidable caller of a bigint allocator a contradiction
     // (`assert not (elidable_function and random_effects_on_gcobjs)`,
-    // `rffi.py:160`).
+    // `rffi.py`).
     //
     // Every entry below reaches a collection on its slow path: the
     // `*_collecting_*` allocators run a minor collection when the nursery
     // cannot satisfy the request, and the `collect_*` entries are requested
-    // collections outright (`lloperation.py:480-481` marks both `gc__collect`
+    // collections outright (`lloperation.py` marks both `gc__collect`
     // and `gc__collect_step` `canmallocgc=True`).  Their non-collecting twins
     // (`alloc_fast_nursery_typed`, `alloc_nursery_headerless_no_collect`, …)
     // are deliberately absent: they spill to old-gen instead of collecting.
@@ -2719,7 +2719,7 @@ fn make_jitcodes(
     // `Arc<JitCode>` shells live in `CallControl::jitcodes`; the drain loop
     // commits each shell's body via `JitCode::set_body`. After all phases,
     // `collect_jitcodes_in_alloc_order` materialises the `all_jitcodes[]`
-    // vector with `all_jitcodes[i].index == i` (RPython codewriter.py:80
+    // vector with `all_jitcodes[i].index == i` (RPython codewriter.py
     // invariant).
     call_control.set_struct_storage(&pipeline_config.transform.struct_storage);
     let mut codewriter = codewriter::CodeWriter::new();
@@ -2732,7 +2732,7 @@ fn make_jitcodes(
     // can perform the install without depending on majit-metainterp
     // (the concrete `VirtualRefInfo` lives there).  The runtime path
     // through `MetaInterpStaticData::finish_setup` reads the handle
-    // back at `pyjitpl.py:2267 self.virtualref_info = codewriter.
+    // back at `pyjitpl.py self.virtualref_info = codewriter.
     // callcontrol.virtualref_info` parity, so this site is the
     // codewrite-time anchor for that read.
     codewriter.setup_vrefinfo(
@@ -2741,7 +2741,7 @@ fn make_jitcodes(
     );
 
     // RPython grab_initial_jitcodes + drain portals and their callees.
-    // RPython call.py:145-148.
+    // RPython call.py.
     call_control.grab_initial_jitcodes();
     prof.mark("  grab_initial_jitcodes");
     // Two-phase rtyper prepass: annotate-all → rtype-all over the portal closure

@@ -3,8 +3,8 @@
 # Self-checking regression guard for the operands `exec` / `eval` thread from
 # the code object's construction to the frame that runs it.
 #
-# `pyopcode.py:773-774` plants `__builtins__` with
-# `space.call_method(w_globals, 'setdefault', ...)` and `compiling.py:109-110`
+# `pyopcode.py` plants `__builtins__` with
+# `space.call_method(w_globals, 'setdefault', ...)` and `compiling.py`
 # with `space.contains_w` + `space.setitem_str`, all dispatched on the caller's
 # own mapping so a dict subclass's override wins.  That override is user
 # Python, so it can collect -- and at that point `exec_or_eval` is still

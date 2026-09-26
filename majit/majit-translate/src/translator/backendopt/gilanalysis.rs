@@ -17,7 +17,7 @@
 //! The transitive call-graph walk is supplied by
 //! [`super::graphanalyze::BoolGraphAnalyzer`] — an alias for
 //! `GraphAnalyzer<bool, _>`. [`GilAnalyzer`] is the corresponding
-//! subclass at `gilanalysis.py:7-27`, overriding
+//! subclass at `gilanalysis.py`, overriding
 //! `analyze_simple_operation` / `analyze_external_call` to always
 //! return `False` and `analyze_direct_call` to short-circuit on the
 //! per-`func` `_gctransformer_hint_close_stack_` /
@@ -33,7 +33,7 @@ use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;
 
 /// `class GilAnalyzer(graphanalyze.BoolGraphAnalyzer)` at
-/// `gilanalysis.py:7-27`.
+/// `gilanalysis.py`.
 ///
 /// The name is intentionally historical. Upstream's class asks
 /// "can this path release the GIL?". In pyre's freethreaded runtime
@@ -133,7 +133,7 @@ impl<'t> GraphAnalyzer<bool, ()> for GilAnalyzer<'t> {
 }
 
 /// RPython `gilanalysis.analyze(graphs, translator)` at
-/// `gilanalysis.py:29-51`.
+/// `gilanalysis.py`.
 ///
 /// Iterates each graph. When `func._no_release_gil_` is set,
 /// constructs a [`GilAnalyzer`] and runs `analyze_direct_call`

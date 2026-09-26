@@ -54,7 +54,7 @@ pub struct CBuilder {
     /// `CStandaloneBuilder` and `CLibraryBuilder`.
     pub split: bool,
     /// Dynamic subclass slot read by `build_database` as
-    /// `self.standalone` at `genc.py:93`. Upstream defines it on
+    /// `self.standalone` at `genc.py`. Upstream defines it on
     /// subclasses; Rust stores the current subclass value here.
     pub standalone: bool,
 
@@ -75,7 +75,7 @@ pub struct CBuilder {
     /// `self.gchooks = gchooks` (`:76`).
     pub gchooks: Option<Rc<dyn Any>>,
     /// `self.eci = self.get_eci()` (`:77`). Upstream `get_eci`
-    /// (`genc.py:80-84`) returns an `ExternalCompilationInfo` filled
+    /// (`genc.py`) returns an `ExternalCompilationInfo` filled
     /// with `include_dirs=[pypy_include_dir]` (and `revdb` when
     /// `reverse_debugger` is on). The slot stays opaque because the C
     /// backend still stores heterogeneous values through Python object
@@ -140,7 +140,7 @@ impl CBuilder {
     }
 
     /// Upstream `CBuilder.DEBUG_DEFINES` class-level constant at
-    /// `genc.py:171-173`. Used by `task_source_c` when the
+    /// `genc.py`. Used by `task_source_c` when the
     /// `c_debug_defines` extra option is on.
     pub fn debug_defines() -> std::collections::HashMap<String, String> {
         let mut d = std::collections::HashMap::new();
@@ -436,7 +436,7 @@ impl CBuilder {
     }
 
     /// Port of upstream `CBuilder.get_gcpolicyclass(self)` at
-    /// `genc.py:161-167`:
+    /// `genc.py`:
     /// ```python
     /// if self.gcpolicy is None:
     ///     name = self.config.translation.gctransformer
@@ -536,10 +536,10 @@ impl std::fmt::Debug for CBuilder {
 }
 
 /// Port of upstream `cbuild.ExternalCompilationInfo` at
-/// `rpython/translator/tool/cbuild.py:11-250`.
+/// `rpython/translator/tool/cbuild.py`.
 ///
 /// Upstream has thirteen tuple attributes in `_ATTRIBUTES`
-/// (`cbuild.py:13-17`) plus the two extra attributes
+/// (`cbuild.py`) plus the two extra attributes
 /// `use_cpp_linker` and `platform` (`:19`). Rust stores the same data
 /// in owned vectors and an optional opaque platform key.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -563,7 +563,7 @@ pub struct ExternalCompilationInfo {
 
 impl ExternalCompilationInfo {
     /// Upstream `ExternalCompilationInfo.merge(*ecis)` at
-    /// `cbuild.py:214-250`. All attributes are de-duplicated in first
+    /// `cbuild.py`. All attributes are de-duplicated in first
     /// occurrence order except `compile_extra` and `link_extra`, where
     /// duplicates are explicitly preserved (`_DUPLICATES_OK`).
     pub fn merge(&self, others: &[&ExternalCompilationInfo]) -> Result<Self, TaskError> {
@@ -680,7 +680,7 @@ fn config_string(config: &Rc<Config>, path: &str) -> Result<String, TaskError> {
 }
 
 /// Port of upstream `class CStandaloneBuilder(CBuilder)` at
-/// `genc.py:237-510`.
+/// `genc.py`.
 ///
 /// Adds the standalone-only slots `executable_name` (`:240`),
 /// `shared_library_name` (`:241`), `_entrypoint_wrapper` (`:242`) and

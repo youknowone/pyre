@@ -22,7 +22,7 @@
 //!   freestanding [`rtype_is_None`] helper used to be the entire surface
 //!   while the dispatcher was unported; it is still public so callers
 //!   that already hold concrete reprs can skip the double-dispatch.
-//! * The `SmallFunctionSetPBCRepr` branch (rnone.py:76-82) is wired
+//! * The `SmallFunctionSetPBCRepr` branch (rnone.py) is wired
 //!   through [`super::pairtype::ReprClassId::SmallFunctionSetPBCRepr`]
 //!   plus [`Repr::pbc_s_pbc`] — `can_be_None` true emits
 //!   `char_eq(v1, '\000')`, false folds to `inputconst(Bool, False)`.
@@ -249,7 +249,7 @@ pub(crate) fn build_ll_none_hash_helper_graph(
 }
 
 /// RPython `rtype_is_None(robj1, rnone2, hop, pos=0)`
-/// (`rnone.py:66-84`).
+/// (`rnone.py`).
 ///
 /// ```python
 /// def rtype_is_None(robj1, rnone2, hop, pos=0):
@@ -324,7 +324,7 @@ pub fn rtype_is_None(
 
     // upstream: `elif robj1 == none_repr: return inputconst(Bool, True)`.
     // Upstream relies on `is`-based comparison (`r is none_repr`,
-    // `rnone.py:74`). Pyre can't use Arc::ptr_eq here because the
+    // `rnone.py`). Pyre can't use Arc::ptr_eq here because the
     // signature takes `&dyn Repr` (no Arc handle surfaces at the
     // helpers' API boundary); the class-id tag is the equivalent
     // identity comparison since `NoneRepr` is instantiated only via
@@ -446,7 +446,7 @@ pub fn pair_any_none_rtype_is_(
     }
     // The second side of the pair must be a NoneRepr — fetch the
     // singleton since the NoneRepr type itself carries no per-instance
-    // state the helper needs (`rnone.py:66-84` uses only `rnone2` as
+    // state the helper needs (`rnone.py` uses only `rnone2` as
     // a type tag, never reads its fields).
     let none_side = none_repr();
     let _ = r2; // keeps signature parity with upstream pairtype helper
@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn setup_on_none_repr_reaches_finished_state() {
-        // rmodel.py:35-59 state machine — NoneRepr inherits the default
+        // rmodel.py setup state machine — NoneRepr inherits the default
         // `_setup_repr` (no-op) so `setup()` should transition directly
         // NOTINITIALIZED → FINISHED.
         let r = NoneRepr::new();

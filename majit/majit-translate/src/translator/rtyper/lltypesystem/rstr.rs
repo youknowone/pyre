@@ -1094,7 +1094,7 @@ pub(crate) fn build_ll_str2unicode_helper_graph(name: &str) -> Result<PyGraph, T
 
 /// Synthesise the lltypesystem half of
 /// `AbstractUniCharRepr.ll_str(ch) -> str(unicode(ch))`
-/// (`rtyper/rstr.py:560-562`).
+/// (`rtyper/rstr.py`).
 ///
 /// Upstream goes through the default unicode-to-byte-string encoding
 /// path. For a single `UniChar`, that is an ASCII check followed by a
@@ -1215,7 +1215,7 @@ pub(crate) fn build_ll_unichr2str_helper_graph(name: &str) -> Result<PyGraph, Ty
 
 /// Build a standalone `Ptr(GcArray(Char))` lltype — the `CHAR_ARRAY =
 /// GcArray(Char)` scratch buffer and the `hex_chars` digit table both
-/// have this shape (`lltypesystem/ll_str.py:5,42`).
+/// have this shape (`lltypesystem/ll_str.py`).
 fn char_gcarray_ptr_lltype() -> LowLevelType {
     LowLevelType::Ptr(Box::new(Ptr {
         TO: PtrTarget::Array(Array::new(LowLevelType::Char)),
@@ -1224,7 +1224,7 @@ fn char_gcarray_ptr_lltype() -> LowLevelType {
 
 /// Materialise the immortal `hex_chars = malloc(Array(Char), 16,
 /// immortal=True)` table whose entries are `"%x" % i`
-/// (`lltypesystem/ll_str.py:42-45`).
+/// (`lltypesystem/ll_str.py`).
 fn hex_chars_constant() -> Result<Hlvalue, TyperError> {
     let array_lltype = LowLevelType::Array(Box::new(Array::new(LowLevelType::Char)));
     let ptr = malloc(array_lltype, Some(16), MallocFlavor::Gc, true)
@@ -1288,8 +1288,8 @@ fn hex_chars_constant() -> Result<Hlvalue, TyperError> {
 /// `uint_and` / `uint_rshift`; literal digit/prefix/sign chars are produced
 /// with `cast_int_to_char` of their ASCII codes. `signed_input` selects the
 /// specialisation: `true` materialises the Signed one (full `if i < 0` sign
-/// branch, ll_str.py:52-55); `false` the Unsigned one (`r_uint` input, sign
-/// branch pruned) used by the `raddress.py:39` address path.
+/// branch, ll_str.py); `false` the Unsigned one (`r_uint` input, sign
+/// branch pruned) used by the `raddress.py` address path.
 pub(crate) fn build_ll_int2hex_helper_graph(
     name: &str,
     signed_input: bool,
@@ -1325,7 +1325,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
     // address path needs the `r_uint` (Unsigned) specialisation, in which
     // `if i < 0` is provably false and the whole sign branch is pruned.
     // `signed_input=true` materialises the Signed specialisation (full sign
-    // branch, ll_str.py:52-55); `false` materialises the Unsigned one.
+    // branch, ll_str.py); `false` materialises the Unsigned one.
     let i_lltype = if signed_input {
         LowLevelType::Signed
     } else {
@@ -4181,7 +4181,7 @@ pub(crate) fn build_ll_int_helper_graph(
 }
 
 /// Synthesise the helper graph for `LLHelpers.ll_str_is_true`
-/// (`rtyper/rstr.py:944-947`):
+/// (`rtyper/rstr.py`):
 ///
 /// ```python
 /// @classmethod
@@ -4350,7 +4350,7 @@ pub(crate) fn build_ll_str_string_helper_graph(
 }
 
 /// Synthesise the helper graph for `LLHelpers.ll_streq`
-/// (`rtyper/lltypesystem/rstr.py:604-620`):
+/// (`rtyper/lltypesystem/rstr.py`):
 ///
 /// ```python
 /// @staticmethod
@@ -4752,7 +4752,7 @@ pub(crate) fn build_ll_streq_helper_graph(
 }
 
 /// Synthesise the helper graph for `LLHelpers.ll_strcmp`
-/// (`rtyper/lltypesystem/rstr.py:579-599`):
+/// (`rtyper/lltypesystem/rstr.py`):
 ///
 /// ```python
 /// @staticmethod
@@ -5260,7 +5260,7 @@ pub(crate) fn build_ll_strcmp_helper_graph(
 }
 
 /// Synthesise the helper graph for `LLHelpers.ll_startswith`
-/// (`rtyper/lltypesystem/rstr.py:622-637`):
+/// (`rtyper/lltypesystem/rstr.py`):
 ///
 /// ```python
 /// @staticmethod
@@ -5538,7 +5538,7 @@ pub(crate) fn build_ll_startswith_helper_graph(
 }
 
 /// Synthesise the helper graph for `LLHelpers.ll_endswith`
-/// (`rtyper/lltypesystem/rstr.py:645-661`):
+/// (`rtyper/lltypesystem/rstr.py`):
 ///
 /// ```python
 /// @staticmethod
@@ -5846,7 +5846,7 @@ pub(crate) fn build_ll_endswith_helper_graph(
 }
 
 /// Synthesise the helper graph for `LLHelpers.ll_startswith_char`
-/// (`rtyper/lltypesystem/rstr.py:639-643`):
+/// (`rtyper/lltypesystem/rstr.py`):
 ///
 /// ```python
 /// @staticmethod
@@ -5875,7 +5875,7 @@ pub(crate) fn build_ll_startswith_char_helper_graph(
 }
 
 /// Synthesise the helper graph for `LLHelpers.ll_endswith_char`
-/// (`rtyper/lltypesystem/rstr.py:663-667`):
+/// (`rtyper/lltypesystem/rstr.py`):
 ///
 /// ```python
 /// @staticmethod
@@ -6057,7 +6057,7 @@ fn build_ll_startsendswith_char_helper_graph(
 }
 
 /// Synthesise the helper graph for `_hash_string`
-/// (`rpython/rlib/objectmodel.py:596-618`):
+/// (`rpython/rlib/objectmodel.py`):
 ///
 /// ```python
 /// @specialize.ll()
@@ -6380,7 +6380,7 @@ pub(crate) fn build_hash_string_helper_graph(
 }
 
 /// Synthesise the helper graph for `ll_hash_string`
-/// (`rpython/rlib/objectmodel.py:620-621`):
+/// (`rpython/rlib/objectmodel.py`):
 ///
 /// ```python
 /// def ll_hash_string(ll_s):
@@ -6464,7 +6464,7 @@ pub(crate) fn build_ll_hash_string_helper_graph(
 }
 
 /// Synthesise the helper graph for `LLHelpers._ll_strhash`
-/// (`rtyper/lltypesystem/rstr.py:402-414`):
+/// (`rtyper/lltypesystem/rstr.py`):
 ///
 /// ```python
 /// @staticmethod
@@ -6614,7 +6614,7 @@ pub(crate) fn build_ll_strhash_internal_helper_graph(
 }
 
 /// Synthesise the helper graph for `LLHelpers.ll_strhash`
-/// (`rtyper/lltypesystem/rstr.py:394-400`):
+/// (`rtyper/lltypesystem/rstr.py`):
 ///
 /// ```python
 /// @staticmethod
@@ -6816,7 +6816,7 @@ pub(crate) fn build_ll_strfasthash_helper_graph(
 }
 
 /// Synthesise the helper graph for `LLHelpers.ll_find_char`
-/// (`rtyper/lltypesystem/rstr.py:670-680`):
+/// (`rtyper/lltypesystem/rstr.py`):
 ///
 /// ```python
 /// @staticmethod
@@ -6856,7 +6856,7 @@ pub(crate) fn build_ll_find_char_helper_graph(
 }
 
 /// Synthesise the helper graph for `LLHelpers.ll_rfind_char`
-/// (`rtyper/lltypesystem/rstr.py:682-693`):
+/// (`rtyper/lltypesystem/rstr.py`):
 ///
 /// ```python
 /// @staticmethod
@@ -7199,7 +7199,7 @@ fn build_ll_findlike_char_helper_graph(
 }
 
 /// Synthesise the helper graph for `LLHelpers.ll_count_char`
-/// (`rtyper/lltypesystem/rstr.py:695-706`):
+/// (`rtyper/lltypesystem/rstr.py`):
 ///
 /// ```python
 /// @staticmethod
@@ -7482,7 +7482,7 @@ pub(crate) fn build_ll_count_char_helper_graph(
 }
 
 /// Synthesise the helper graph for `LLHelpers.ll_stritem_nonneg`
-/// (`rtyper/lltypesystem/rstr.py:354-360`):
+/// (`rtyper/lltypesystem/rstr.py`):
 ///
 /// ```python
 /// @staticmethod
@@ -7576,7 +7576,7 @@ pub(crate) fn build_ll_stritem_nonneg_helper_graph(
 }
 
 /// Synthesise the helper graph for `AbstractLLHelpers.ll_stritem`
-/// (`rtyper/rstr.py:955-959`):
+/// (`rtyper/rstr.py`):
 ///
 /// ```python
 /// @classmethod
@@ -8002,7 +8002,7 @@ pub(crate) fn build_ll_string_isxxx_helper_graph(
 }
 
 /// Synthesise `LLHelpers.ll_upper` / `LLHelpers.ll_lower`
-/// (`lltypesystem/rstr.py:511-535`):
+/// (`lltypesystem/rstr.py`):
 ///
 /// ```python
 /// def ll_upper(s):
@@ -8307,7 +8307,7 @@ pub(crate) fn build_ll_string_casefold_helper_graph(
 }
 
 /// Synthesise `LLHelpers.ll_replace_chr_chr`
-/// (`lltypesystem/rstr.py:1032-1045`):
+/// (`lltypesystem/rstr.py`):
 ///
 /// ```python
 /// def ll_replace_chr_chr(s, c1, c2):
@@ -8629,7 +8629,7 @@ pub(crate) fn build_ll_replace_chr_chr_helper_graph(
 }
 
 /// Synthesise the helper graph for `AbstractLLHelpers.ll_stritem_nonneg_checked`
-/// (`rtyper/rstr.py:950-953`):
+/// (`rtyper/rstr.py`):
 ///
 /// ```python
 /// @classmethod
@@ -8790,7 +8790,7 @@ pub(crate) fn build_ll_stritem_nonneg_checked_helper_graph(
 }
 
 /// Synthesise the helper graph for `AbstractLLHelpers.ll_stritem_checked`
-/// (`rtyper/rstr.py:962-967`):
+/// (`rtyper/rstr.py`):
 ///
 /// ```python
 /// @classmethod
@@ -9074,7 +9074,7 @@ pub(crate) fn build_ll_stritem_checked_helper_graph(
 }
 
 /// Synthesise the helper graph for `LLHelpers.ll_strconcat`
-/// (`rtyper/lltypesystem/rstr.py:425-444`):
+/// (`rtyper/lltypesystem/rstr.py`):
 ///
 /// ```python
 /// @staticmethod
@@ -9255,7 +9255,7 @@ pub(crate) fn build_ll_strconcat_helper_graph(
 
 /// `LLHelpers._ll_stringslice` plus the three wrappers selected by
 /// `AbstractStringRepr.rtype_getslice` (`rstr.py`,
-/// `lltypesystem/rstr.py:844-876`).  The start/stop wrapper preserves the
+/// `lltypesystem/rstr.py`).  The start/stop wrapper preserves the
 /// identity-bearing `jit.we_are_jitted()` branch: the JIT arm clamps
 /// `stop > len`, while the no-JIT arm returns `s1` for `[0:>=len]`.
 pub(crate) fn build_ll_stringslice_helper_graph(
@@ -9355,7 +9355,7 @@ pub(crate) fn build_ll_stringslice_helper_graph(
             ptr_lltype,
         ),
         SliceKind::StartStop => {
-            // lltypesystem/rstr.py:862-871 preserves both arms of
+            // lltypesystem/rstr.py ll_stringslice_startstop preserves both arms of
             // `jit.we_are_jitted()`: the JIT arm clamps only `stop > len`,
             // while the no-JIT arm returns `s1` unchanged for `[0:>=len]`.
             let call_s = variable_with_lltype("s1", ptr_lltype.clone());
@@ -9835,7 +9835,7 @@ mod tests {
     }
 
     /// `llstr` fills `chars[i]` with the Latin-1 embedding of each
-    /// byte (`mallocstr` + per-index store, annlowlevel.py:469-475);
+    /// byte (`mallocstr` + per-index store, annlowlevel.py);
     /// every byte value must round-trip.
     #[test]
     fn llstr_preserves_byte_contents() {
@@ -10282,7 +10282,7 @@ mod tests {
     /// `ll_strlen` synthesised against `Ptr(STR)` produces a single
     /// startblock with `getsubstruct('chars')` then `getarraysize`,
     /// and returns `Signed`. Mirrors upstream
-    /// `lltypesystem/rstr.py:351-352`:
+    /// `lltypesystem/rstr.py`:
     /// `def ll_strlen(s): return len(s.chars)`.
     /// `getsubstruct` (not `getfield`) is the correct lltype op for
     /// the inline composite `chars` field — see `rmodel.rs`

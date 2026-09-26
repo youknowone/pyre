@@ -1,11 +1,11 @@
 # A loop body fat enough that one traced iteration runs past `trace_limit`, so
 # the trace overflows before it can close. `blackhole_if_trace_too_long`
-# (`pyjitpl.py:2812-2830`) finds no inlinable huge function here, so it calls
-# `prepare_trace_segmenting` (`pyjitpl.py:2831-2859`), which marks the green key
+# (`pyjitpl.py`) finds no inlinable huge function here, so it calls
+# `prepare_trace_segmenting` (`pyjitpl.py`), which marks the green key
 # with the force-finish flag and asks for the next iteration to be traced again.
 #
 # On that retry the marked key is supposed to CUT: once the trace passes 0.8x
-# `trace_limit` at a `jit_merge_point`, `pyjitpl.py:1617-1620` appends
+# `trace_limit` at a `jit_merge_point`, `pyjitpl.py` appends
 # `GUARD_ALWAYS_FAILS`, compiles what it has, and blackholes with
 # `ABORT_SEGMENTED_TRACE`. The cut arm is what turns the key's forever-retracing
 # into compiled code.

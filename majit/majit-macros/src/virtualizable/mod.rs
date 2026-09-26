@@ -441,7 +441,7 @@ fn generate_layout_helpers(
 
     // ── restore_values helper ──
     // Use set_ accessors to write through to heap / host-side state. Vable
-    // inputargs route to heap (source of truth, virtualizable.py:101-107);
+    // inputargs route to heap (source of truth, virtualizable.py write_boxes);
     // extra reds route to plain host-side fields on the state struct.
     let restore_scalars: Vec<TokenStream> = all_scalars
         .iter()
@@ -488,7 +488,7 @@ fn generate_layout_helpers(
         /// `len(VABLEINFO.static_field_descrs) + 1` (frame ptr + N
         /// `_virtualizable_` scalars from `interp_jit.py`). RPython
         /// derives the count dynamically by iterating
-        /// `range(len(self.static_field_descrs))` (`virtualizable.py:86`);
+        /// `range(len(self.static_field_descrs))` (`virtualizable.py read_boxes`);
         /// pyre crystallises it at proc-macro expansion time so the flat
         /// index arithmetic in trace/state code stays monomorphic.
         ///
@@ -500,7 +500,7 @@ fn generate_layout_helpers(
 
         /// Number of vable static fields (`_virtualizable_` declarations).
         ///
-        /// `virtualizable.py:86 unroll_static_fields` length, excluding the
+        /// `virtualizable.py read_boxes unroll_static_fields` length, excluding the
         /// frame pointer and any `extra_reds` red inputargs. Stable across
         /// JitDriver red-wiring changes; use this when iterating
         /// `VABLEINFO.static_field_descrs` or computing offsets that pertain
@@ -618,7 +618,7 @@ fn generate_layout_helpers(
         /// Writes `state.frame`, `state.<inputarg>...` from `raw[0..]`.
         /// Returns the index of the first array slot in `raw`.
         ///
-        /// virtualizable.py:126-137 parity: all entries must be present.
+        /// virtualizable.py write_from_resume_data_partial parity: all entries must be present.
         pub fn virt_restore_scalars_raw(
             state: &mut #state_type,
             raw: &[i64],

@@ -1,5 +1,5 @@
 //! Port of the `BoolGraphAnalyzer` subclasses in
-//! `rpython/jit/codewriter/effectinfo.py:401-418`.
+//! `rpython/jit/codewriter/effectinfo.py VirtualizableAnalyzer`.
 //!
 //! The `EffectInfo` data class itself lives in `majit-ir`
 //! (`majit/majit-ir/src/effectinfo.rs`) per the IR-extraction
@@ -15,7 +15,7 @@
 //! [`VirtualizableAnalyzer`] and [`QuasiImmutAnalyzer`] are pure
 //! `analyze_simple_operation` opname checks; both inherit the default
 //! `analyze_external_call` (`bottom_result()` = `False`,
-//! `graphanalyze.py:60-69`). [`RandomEffectsAnalyzer`]
+//! `graphanalyze.py`). [`RandomEffectsAnalyzer`]
 //! (`effectinfo.py`) overrides `analyze_external_call` to read
 //! `funcobj.random_effects_on_gcobjs` off the flowspace funcobj attrs —
 //! the same attribute mirror `collectanalyze::CollectAnalyzer` reads —
@@ -40,7 +40,7 @@ pub use majit_ir::{
 };
 
 /// `class VirtualizableAnalyzer(BoolGraphAnalyzer)` at
-/// `effectinfo.py:401-404`.
+/// `effectinfo.py`.
 pub struct VirtualizableAnalyzer<'t> {
     translator: &'t TranslationContext,
     /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py`).
@@ -76,7 +76,7 @@ impl<'t> GraphAnalyzer<bool, ()> for VirtualizableAnalyzer<'t> {
 }
 
 /// `class QuasiImmutAnalyzer(BoolGraphAnalyzer)` at
-/// `effectinfo.py:406-408`.
+/// `effectinfo.py`.
 pub struct QuasiImmutAnalyzer<'t> {
     translator: &'t TranslationContext,
     /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py`).
@@ -109,7 +109,7 @@ impl<'t> GraphAnalyzer<bool, ()> for QuasiImmutAnalyzer<'t> {
 }
 
 /// `class RandomEffectsAnalyzer(BoolGraphAnalyzer)` at
-/// `effectinfo.py:410-418`.
+/// `effectinfo.py`.
 pub struct RandomEffectsAnalyzer<'t> {
     translator: &'t TranslationContext,
     /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py`).
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn random_effects_simple_operation_always_false() {
-        // effectinfo.py:417-418 — random effects arise only from external
+        // effectinfo.py analyze_simple_operation — random effects arise only from external
         // calls, never from a plain operation.
         let translator = TranslationContext::new();
         let mut analyzer = RandomEffectsAnalyzer::new(&translator);

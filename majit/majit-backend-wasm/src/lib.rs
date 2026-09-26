@@ -1650,7 +1650,7 @@ fn wasm_collect_generation(generation: i64) {
 
 fn wasm_collect_step() -> majit_gc::GcStepTransition {
     with_wasm_active_gc_mut(|gc| gc.collect_step()).unwrap_or(majit_gc::GcStepTransition {
-        // `rgc.py:20-31`: SCANNING on both sides would never report completion.
+        // `rgc.py collect_step`: SCANNING on both sides would never report completion.
         old_state: majit_gc::GcStepTransition::STATE_MARKING,
         new_state: majit_gc::GcStepTransition::STATE_SCANNING,
     })
@@ -2663,7 +2663,7 @@ fn wasm_gc_varsize_layout(addr: usize) -> Option<majit_gc::GcVarSizeLayout> {
 }
 
 pub struct WasmBackend {
-    /// `rpython/jit/backend/model.py:28-29 self.tracker =
+    /// `rpython/jit/backend/model.py __init__ self.tracker =
     /// CPUTotalTracker()` parity — per-instance `cpu.tracker`
     /// exposed via [`majit_backend::Backend::cpu_tracker`].
     cpu_tracker: std::sync::Arc<majit_backend::CpuTotalTracker>,
@@ -4929,7 +4929,7 @@ impl majit_backend::Backend for WasmBackend {
         "wasm"
     }
 
-    // ── Blackhole allocation (llmodel.py:775-790) ──
+    // ── Blackhole allocation (llmodel.py bh_new) ──
     //
     // The blackhole interpreter materializes virtuals (e.g. a virtualized
     // `W_IntObject` loop variable forced at loop exit) through these. Without
@@ -6275,7 +6275,7 @@ impl majit_backend::Backend for WasmBackend {
 
         let guard_exit_count = codegen::guard_exit_count(inputargs, ops);
         let base = 0u32;
-        // `rpython/jit/backend/model.py:145`: a bridge compiled after an
+        // `rpython/jit/backend/model.py invalidate_loop`: a bridge compiled after an
         // invalidation starts valid; only a later invalidation may kill its
         // `GUARD_NOT_INVALIDATED` operations.
         let bridge_flag = original_token.mint_bridge_invalidation_flag();
@@ -6940,7 +6940,7 @@ impl majit_backend::Backend for WasmBackend {
         // A validated wasm module's code is immutable, so
         // GUARD_NOT_INVALIDATED loads a live flag instead of having its
         // instruction bytes patched in place — the same shape the llgraph
-        // backend uses (`llgraph/runner.py:375` sets `trace.invalid` across
+        // backend uses (`llgraph/runner.py invalidate_loop` sets `trace.invalid` across
         // `_llgraph_alltraces`). `model.py:145` covers the loop AND its
         // attached bridges, each of which reads its own generation flag, so
         // this must go through `invalidate` rather than store to the root

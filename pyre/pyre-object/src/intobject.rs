@@ -17,7 +17,7 @@ pub struct W_IntObject {
     pub intval: i64,
 }
 
-/// The translated user-subclass layout selected by `typedef.py:174-227`.
+/// The translated user-subclass layout selected by `typedef.py _getusercls`.
 /// `W_IntObject` remains the base payload; `MapdictStorageMixin` contributes
 /// its fields only to the generated user class.
 #[repr(C)]
@@ -114,7 +114,7 @@ static SMALL_INTS: LazyLock<PrebuiltInts> = LazyLock::new(|| {
 /// (`instantiate(W_IntObject)` upstream).
 ///
 /// Upstream's two arms then join on a shared `w_res.intval = x`
-/// (`intobject.py:917-921`) which rewrites the payload of a *prebuilt* entry
+/// (`intobject.py`) which rewrites the payload of a *prebuilt* entry
 /// too. `PREBUILT[x - lower]` already holds `x`, so that store changes no
 /// value; its own comment calls it "an obscure hack to help the CPU cache",
 /// there to pull the field into cache before the caller reads it. The
@@ -130,9 +130,9 @@ static SMALL_INTS: LazyLock<PrebuiltInts> = LazyLock::new(|| {
 /// Traced, not residualised, and `#[inline]` — `wrapint` carries no
 /// `@dont_look_inside` and its own comment reads "this whole function is
 /// getting inlined into every caller so keeping the branching to a minimum
-/// is a good idea" (intobject.py:908-910). The allocation upstream is
+/// is a good idea" (intobject.py). The allocation upstream is
 /// `instantiate(W_IntObject)` followed by `w_res.intval = x`
-/// (intobject.py:913-920): alloc-then-init, which the rtyper lowers to the
+/// (intobject.py): alloc-then-init, which the rtyper lowers to the
 /// `new_with_vtable` + payload `setfield_gc` pair the optimizer can
 /// virtualize where the box does not escape. The stack-built
 /// `malloc_typed(W_IntObject { .. })` spelling below is the Rust form of the
@@ -152,7 +152,7 @@ static SMALL_INTS: LazyLock<PrebuiltInts> = LazyLock::new(|| {
 /// which carries `W_INT_GC_TYPE_ID` +
 /// `W_INT_OBJECT_SIZE` via the [`crate::lltype::GcType`] impl above —
 /// the Rust analog of `gct_fv_gc_malloc`'s compile-time `c_type_id`
-/// / `c_size` (`rpython/memory/gctransform/framework.py:807-811`).
+/// / `c_size` (`rpython/memory/gctransform/framework.py`).
 /// `malloc_typed` prepends a `GcHeader` (`alloc_with_gc_header`) but
 /// allocates outside the collector's heap, so the box carries a readable
 /// type id while staying off the sweep set; future GC integration
@@ -347,7 +347,7 @@ pub extern "C" fn jit_w_small_int_const(value: i64) -> i64 {
 
 /// True iff `value` falls inside the prebuilt-int cache range AND
 /// the cache is enabled. Mirrors PyPy's `wrapint` in-range branch
-/// (`intobject.py:891-895`).
+/// (`intobject.py`).
 #[inline]
 pub fn w_int_small_cached(value: i64) -> bool {
     WITHPREBUILTINT && (PREBUILTINTFROM..PREBUILTINTTO).contains(&value)

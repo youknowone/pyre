@@ -1,6 +1,6 @@
 //! Canonical opcode-name table for jitcode bytecode dispatch.
 //!
-//! RPython parity: `rpython/jit/codewriter/assembler.py:21,221`
+//! RPython parity: `rpython/jit/codewriter/assembler.py __init__`
 //! `Assembler.insns` lives in the same module as `Assembler`. Pyre's
 //! mechanical mirror of `rpython/jit/codewriter/` is split between
 //! `majit/majit-translate/src/codewriter/` (the graph-reading half) and
@@ -29,7 +29,7 @@
 
 use indexmap::IndexMap;
 
-// Canonical RPython keys filling free low bytes (`blackhole.py:1149-1525`).
+// Canonical RPython keys filling free low bytes (`blackhole.py bhimpl_check_neg_index`).
 // One byte per `(opname, argcodes)` per `assembler.py:221
 // setdefault(key, len(self.insns))` — alias-shared bytes would violate the
 // 1:1 invariant that `pyjitpl.py setup_insns` enforces.
@@ -137,7 +137,7 @@ pub const BC_INLINE_CALL: u8 = 17;
 /// RPython `flatten.py` `opname = 'goto_if_not'` — the canonical
 /// boolean-exitswitch branch.  `blackhole.py bhimpl_goto_if_not`
 /// is the handler shared with the
-/// [`BC_GOTO_IF_NOT_INT_IS_TRUE`] alias per `blackhole.py:913
+/// [`BC_GOTO_IF_NOT_INT_IS_TRUE`] alias per `blackhole.py
 /// bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`.  Slot 18
 /// (formerly `BC_RESIDUAL_CALL_VOID`, freed by the call-family
 /// canonical migration) now houses this canonical key so each
@@ -146,8 +146,8 @@ pub const BC_INLINE_CALL: u8 = 17;
 pub const BC_GOTO_IF_NOT: u8 = 18;
 pub const BC_MOVE_I: u8 = 21;
 // Canonical RPython keys taking previously-freed slots 22-26 and 28-31
-// (`blackhole.py:1149-1525` + `blackhole.py:1257-1296` conditional/known
-// result + `blackhole.py:621-630` record_known_result + raw/indexed
+// (`blackhole.py bhimpl_check_neg_index` + `blackhole.py` conditional/known
+// result + `blackhole.py bhimpl_record_known_result_i_ir_v` record_known_result + raw/indexed
 // loads + bounds check).  Each `(opname, argcodes)` gets a distinct
 // byte per `assembler.py:221 setdefault()` semantics.
 pub const BC_RAW_LOAD_I: u8 = 20;
@@ -171,7 +171,7 @@ pub const BC_MOVE_F: u8 = 33;
 // the may_force policy now rides on
 // `EffectInfo.extraeffect = EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` carried
 // by the canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_{I,R,F}` family
-// (`effectinfo.py:201`).
+// (`effectinfo.py`).
 // slot 41 (formerly BC_CALL_MAY_FORCE_VOID) freed — same
 // EffectInfo-carries-policy rationale as above; see slots 38..=40.
 // slot 42 (formerly BC_CALL_RELEASE_GIL_INT) freed
@@ -227,12 +227,12 @@ pub const BC_REF_RETURN: u8 = 76;
 pub const BC_RAISE: u8 = 77;
 /// blackhole.py bhimpl_reraise: re-raise exception_last_value.
 pub const BC_RERAISE: u8 = 78;
-// RPython jtransform.py:1685 — conditional_call_ir_v
+// RPython jtransform.py rewrite_op_jit_conditional_call — conditional_call_ir_v
 pub const BC_COND_CALL_VOID: u8 = 79;
-// RPython jtransform.py:1687 — conditional_call_value_ir_i / conditional_call_value_ir_r
+// RPython jtransform.py rewrite_op_jit_conditional_call_value — conditional_call_value_ir_i / conditional_call_value_ir_r
 pub const BC_COND_CALL_VALUE_INT: u8 = 80;
 pub const BC_COND_CALL_VALUE_REF: u8 = 81;
-// RPython jtransform.py:292 — record_known_result_i_ir_v / record_known_result_r_ir_v
+// RPython jtransform.py rewrite_op_jit_record_known_result — record_known_result_i_ir_v / record_known_result_r_ir_v
 pub const BC_RECORD_KNOWN_RESULT_INT: u8 = 82;
 pub const BC_RECORD_KNOWN_RESULT_REF: u8 = 83;
 /// pyjitpl.py opimpl_int_guard_value: promote int to constant via GUARD_VALUE.
@@ -362,7 +362,7 @@ pub const BC_INSTANCE_PTR_EQ: u8 = 153;
 pub const BC_INSTANCE_PTR_NE: u8 = 154;
 pub const BC_PTR_ISZERO: u8 = 155;
 pub const BC_PTR_NONZERO: u8 = 156;
-// Unary ptr nullity exitswitch specialisations — `blackhole.py:937-944`
+// Unary ptr nullity exitswitch specialisations — `blackhole.py bhimpl_goto_if_not_ptr_iszero`
 // `bhimpl_goto_if_not_ptr_{iszero,nonzero}`.
 pub const BC_GOTO_IF_NOT_PTR_ISZERO: u8 = 157;
 pub const BC_GOTO_IF_NOT_PTR_NONZERO: u8 = 158;
@@ -395,7 +395,7 @@ pub const BC_INT_RETURN: u8 = 148;
 pub const BC_FLOAT_RETURN: u8 = 149;
 pub const BC_VOID_RETURN: u8 = 150;
 
-// `getfield_gc_*` / `setfield_gc_*` — RPython `blackhole.py:1432-1481`
+// `getfield_gc_*` / `setfield_gc_*` — RPython `blackhole.py bhimpl_getfield_gc_i`
 // `bhimpl_getfield_gc_{i,r,f}` + `bhimpl_setfield_gc_{i,r,f}` —
 // descr-keyed instance field load/store on the GC heap.  Pyre emits
 // these at build time from the assembler so the bytes are pinned
@@ -407,7 +407,7 @@ pub const BC_SETFIELD_GC_I: u8 = 172;
 pub const BC_SETFIELD_GC_R: u8 = 173;
 
 // `getarrayitem_gc_*` / `setarrayitem_gc_*` — RPython
-// `blackhole.py:1330-1422`.  `bhimpl_getarrayitem_gc_{i,r,f}` defines
+// `blackhole.py bhimpl_getarrayitem_gc_i`.  `bhimpl_getarrayitem_gc_{i,r,f}` defines
 // the `rid` (ref + int_idx + descr) argcode shape; array indices are
 // always int-classified, so the index operand always lands in the `i`
 // register bank.
@@ -418,7 +418,7 @@ pub const BC_SETARRAYITEM_GC_F: u8 = 178;
 pub const BC_GETARRAYITEM_GC_I: u8 = 197;
 pub const BC_GETARRAYITEM_GC_F: u8 = 198;
 
-// `float_*` comparison ops — RPython `blackhole.py:721-746`
+// `float_*` comparison ops — RPython `blackhole.py bhimpl_float_lt`
 // `bhimpl_float_{lt,le,eq,ne,gt,ge}` — float comparisons returning int.
 pub const BC_FLOAT_EQ: u8 = 179;
 pub const BC_FLOAT_NE: u8 = 180;
@@ -428,7 +428,7 @@ pub const BC_FLOAT_GT: u8 = 182;
 // `cast_*_to_*` conversion ops — RPython `bhimpl_cast_ptr_to_int`
 // (`blackhole.py`), `bhimpl_cast_int_to_ptr`
 // (`blackhole.py`), `bhimpl_cast_int_to_float`
-// (`blackhole.py:811-816`).
+// (`blackhole.py`).
 pub const BC_CAST_INT_TO_FLOAT: u8 = 183;
 pub const BC_CAST_INT_TO_PTR: u8 = 184;
 pub const BC_CAST_PTR_TO_INT: u8 = 185;
@@ -477,7 +477,7 @@ pub const BC_ARRAYBASE_VABLE: u8 = 234;
 // the case table.
 pub const BC_SWITCH: u8 = 186;
 
-// `inline_call_{r,ir,irf}_{i,r,v,f}` — RPython `blackhole.py:1279-1320`
+// `inline_call_{r,ir,irf}_{i,r,v,f}` — RPython `blackhole.py bhimpl_inline_call_r_i`
 // `bhimpl_inline_call_*` — inlined helper-jitcode dispatch.  The argcode
 // suffix encodes which kind families the helper takes (R/IR/IRF) and
 // what kind it returns (i/r/v/f).
@@ -492,14 +492,14 @@ pub const BC_INLINE_CALL_IRF_R: u8 = 194;
 pub const BC_INLINE_CALL_IRF_I: u8 = 202;
 pub const BC_INLINE_CALL_IRF_V: u8 = 203;
 
-// Float `<=` / `>=` comparisons — RPython `blackhole.py:726-749`
+// Float `<=` / `>=` comparisons — RPython `blackhole.py bhimpl_float_le`
 // `bhimpl_float_{le,ge}` (le @726, ge @746).  `BC_FLOAT_LE` /
 // `BC_FLOAT_GE` join the existing `BC_FLOAT_{EQ,NE,LT,GT}` quartet at
 // 179-182.
 pub const BC_FLOAT_LE: u8 = 204;
 pub const BC_FLOAT_GE: u8 = 205;
 
-// `setfield_gc_f/rfd` — RPython `blackhole.py:1481`
+// `setfield_gc_f/rfd` — RPython `blackhole.py bhimpl_setfield_gc_f`
 // `bhimpl_setfield_gc_f`.  Float-result sibling of
 // `bhimpl_setfield_gc_{i,r}` which already pin `BC_SETFIELD_GC_{I,R}`
 // at 172-173; deferred until now because pyre's float-field stores
@@ -537,7 +537,7 @@ pub const BC_INT_BETWEEN: u8 = 213;
 // `@arguments("cpu", "i", "d", returns="r")` gives canonical key
 // `new_array_clear/id>r`.  Pyre emits this from the BUILD_TUPLE
 // `popvalues` unroll (`pyre-jit/src/jit/codewriter.rs` — the
-// `pyframe.py:408-419` fixed-size items-array allocation).
+// `pyframe.py` fixed-size items-array allocation).
 pub const BC_NEW_ARRAY_CLEAR: u8 = 214;
 
 // `c`-argcode forms (`assembler.py emit_const(allow_short=
@@ -584,7 +584,7 @@ pub const BC_SETARRAYITEM_GC_I_C: u8 = 227;
 
 // `raw_store_i/iiid` — `blackhole.py bhimpl_raw_store_i`
 // (`@arguments("cpu", "i", "i", "i", "d")`): raw address + byte offset +
-// int value + `arraydescrof(rffi.CArray(T))` (`jtransform.py:1156-1163
+// int value + `arraydescrof(rffi.CArray(T))` (`jtransform.py rewrite_op_raw_store
 // rewrite_op_raw_store`).  Sibling of the read-side `BC_RAW_LOAD_I` (20);
 // takes the next free byte.
 pub const BC_RAW_STORE_I: u8 = 228;
@@ -611,7 +611,7 @@ pub const BC_ABORT_RESULT_R: u8 = 195;
 // aborts the frame rather than manufacturing a pointer).
 pub const BC_VTABLE_METHOD_PTR: u8 = 196;
 
-// `record_quasiimmut_field/rdd` — RPython `blackhole.py:1538-1545`
+// `record_quasiimmut_field/rdd` — RPython `blackhole.py bhimpl_record_quasiimmut_field`
 // `bhimpl_record_quasiimmut_field`.  Records that a quasi-immutable
 // struct field has been read so the optimizer can install a
 // `QUASIIMMUT_FIELD` guard before the corresponding `getfield_gc_*`.
@@ -811,7 +811,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // rationale.
 
     // Virtualizable operations — RPython canonical argcode shapes from
-    // blackhole.py:1374-1409 and :1446-1495.  The legacy helper-side
+    // blackhole.py bhimpl_getarrayitem_vable_i and :1446-1495.  The legacy helper-side
     // `JitCodeBuilder::vable_*` methods still emit their old compact
     // payloads for the state-field macro path; Pyre's SSA assembler uses
     // the `*_with_base` methods that match these keys byte-for-byte.
@@ -837,7 +837,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("goto/L", BC_JUMP);
     // loop_header takes a single int constant operand (the jitdriver index).
     // RPython jtransform.py handle_jit_marker__loop_header emits
-    // SpaceOperation('loop_header', [c_index], None); blackhole.py:1063
+    // SpaceOperation('loop_header', [c_index], None); blackhole.py bhimpl_loop_header
     // bhimpl_loop_header(jdindex) is @arguments("i").
     m.insert("loop_header/i", BC_LOOP_HEADER);
     m.insert("raise/r", BC_RAISE);
@@ -859,7 +859,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // slot index) otherwise. Both forms reach the same
     // `bhimpl_jit_merge_point` (blackhole.py) because the
     // `@arguments("i", ...)` decoder dispatches on the runtime argcode
-    // (blackhole.py:113-123 `argtype == 'i'` branch).
+    // (blackhole.py `argtype == 'i'` branch).
     m.insert("jit_merge_point/cIRFIRF", BC_JIT_MERGE_POINT_C);
     m.insert("jit_merge_point/iIRFIRF", BC_JIT_MERGE_POINT);
     // RPython `blackhole.py:1240-1255` `bhimpl_residual_call_{r,ir,irf}_v`.
@@ -877,7 +877,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("residual_call_ir_r/iIRd>r", BC_RESIDUAL_CALL_IR_R);
     m.insert("residual_call_irf_r/iIRFd>r", BC_RESIDUAL_CALL_IRF_R);
     m.insert("residual_call_irf_f/iIRFd>f", BC_RESIDUAL_CALL_IRF_F);
-    // jtransform.py:292-313 / 1672-1688 conditional/known-result family
+    // jtransform.py rewrite_op_jit_record_known_result / 1672-1688 conditional/known-result family
     // intentionally omitted. The helper-side `BC_COND_CALL_*` /
     // `BC_RECORD_KNOWN_RESULT_*` adapters encode argc + per-arg kind tags
     // in a flat payload, which is not line-by-line compatible with the
@@ -895,7 +895,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // registered separately as `inline_call_nested_ext/P` in
     // `extension_insns()`.
 
-    // jtransform.py:196 / flatten.py:247 — fused `goto_if_not_<op>_<type>`.
+    // jtransform.py optimize_goto_if_not / flatten.py:247 — fused `goto_if_not_<op>_<type>`.  allow-line-citation
     // Argcodes follow assembler.py: two registers + label.
     m.insert("goto_if_not_int_lt/iiL", BC_GOTO_IF_NOT_INT_LT);
     m.insert("goto_if_not_int_le/iiL", BC_GOTO_IF_NOT_INT_LE);
@@ -971,7 +971,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("instance_ptr_ne/rr>i", BC_INSTANCE_PTR_NE);
     m.insert("ptr_iszero/r>i", BC_PTR_ISZERO);
     m.insert("ptr_nonzero/r>i", BC_PTR_NONZERO);
-    // Per-opname float primitives — `blackhole.py:696-723`
+    // Per-opname float primitives — `blackhole.py bhimpl_float_add`
     // `bhimpl_float_{add,sub,mul,truediv,neg,abs}`.
     m.insert("float_add/ff>f", BC_FLOAT_ADD);
     m.insert("float_sub/ff>f", BC_FLOAT_SUB);
@@ -1018,7 +1018,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("goto_if_not/iL", BC_GOTO_IF_NOT);
     m.insert("goto_if_not_int_is_true/iL", BC_GOTO_IF_NOT_INT_IS_TRUE);
 
-    // GC heap field load/store — `blackhole.py:1432-1481` `bhimpl_
+    // GC heap field load/store — `blackhole.py bhimpl_getfield_gc_i` `bhimpl_
     // {get,set}field_gc_{i,r,f}`.  Argcodes: `rd` (struct ref + descr)
     // for gets, `r{i,r,f}d` (struct ref + value reg + descr) for sets.
     m.insert("getfield_gc_i/rd>i", BC_GETFIELD_GC_I);
@@ -1041,14 +1041,14 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("getfield_gc_r_pure/rd>r", BC_GETFIELD_GC_R_PURE);
     m.insert("getfield_gc_f_pure/rd>f", BC_GETFIELD_GC_F_PURE);
 
-    // GC heap array element load/store — `blackhole.py:1330-1422`.
+    // GC heap array element load/store — `blackhole.py bhimpl_getarrayitem_gc_i`.
     // `bhimpl_getarrayitem_gc_{i,r,f}` register only the canonical `rid`
     // (ref + int_idx + descr) shape; array indices are always int-classified,
     // and the assembler enforces the int-index argcode at emit time
     // (`assembler.rs` `OpKind::ArrayRead`/`ArrayWrite`).
     // Setters are 4-byte payloads `ri{i,r,f}d` per
     // `bhimpl_setarrayitem_gc_{i,r,f}(cpu, array, index, newvalue,
-    // arraydescr)` (`blackhole.py:1351-1359`): array (Ref), index (Int),
+    // arraydescr)` (`blackhole.py bhimpl_setarrayitem_gc_i`): array (Ref), index (Int),
     // newvalue ({Int,Ref,Float}), arraydescr.
     m.insert("getarrayitem_gc_r/rid>r", BC_GETARRAYITEM_GC_R_RID);
     m.insert("setarrayitem_gc_i/riid", BC_SETARRAYITEM_GC_I);
@@ -1091,21 +1091,21 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("strgetitem/ri>i", BC_STRGETITEM);
     m.insert("strgetitem/rc>i", BC_STRGETITEM_C);
 
-    // Interior-field load — `blackhole.py:1412-1418`
+    // Interior-field load — `blackhole.py bhimpl_getinteriorfield_gc_i`
     // `bhimpl_getinteriorfield_gc_{i,r,f}`
     // (`@arguments("cpu", "r", "i", "d", returns="i"|"r"|"f")`).
     m.insert("getinteriorfield_gc_i/rid>i", BC_GETINTERIORFIELD_GC_I);
     m.insert("getinteriorfield_gc_r/rid>r", BC_GETINTERIORFIELD_GC_R);
     m.insert("getinteriorfield_gc_f/rid>f", BC_GETINTERIORFIELD_GC_F);
 
-    // List item load — `blackhole.py:1196-1207`
+    // List item load — `blackhole.py bhimpl_getlistitem_gc_i`
     // `bhimpl_getlistitem_gc_{i,r,f}`
     // (`@arguments("cpu", "r", "i", "d", "d", returns="i"|"r"|"f")`).
     m.insert("getlistitem_gc_i/ridd>i", BC_GETLISTITEM_GC_I);
     m.insert("getlistitem_gc_r/ridd>r", BC_GETLISTITEM_GC_R);
     m.insert("getlistitem_gc_f/ridd>f", BC_GETLISTITEM_GC_F);
 
-    // Quasi-immutable record — `blackhole.py:1538-1545`
+    // Quasi-immutable record — `blackhole.py bhimpl_record_quasiimmut_field`
     // `bhimpl_record_quasiimmut_field`.  Argcodes `rdd`: struct ref +
     // field descr + mutate descr (no result).
     m.insert("record_quasiimmut_field/rdd", BC_RECORD_QUASIIMMUT_FIELD);
@@ -1116,7 +1116,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // `cls` constant (vtable pointer carried through the int bank).
     // `record_exact_class` is a no-op at
     // blackhole resume; `assert_not_none` checks the concrete ref just
-    // like `blackhole.py:613`.  The trace-time dispatcher routes them through
+    // like `blackhole.py bhimpl_assert_not_none`.  The trace-time dispatcher routes them through
     // `TraceCtx::trace_assert_not_none` /
     // `TraceCtx::trace_record_exact_class`, which gate on
     // `heap_cache.is_nullity_known` / `is_class_known` and bump
@@ -1132,7 +1132,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("guard_class/r>i", BC_GUARD_CLASS);
     m.insert("guard_class/r>r", BC_GUARD_CLASS_R);
 
-    // Float comparisons — `blackhole.py:721-746`
+    // Float comparisons — `blackhole.py bhimpl_float_lt`
     // `bhimpl_float_{lt,le,eq,ne,gt,ge}` — float pair → int (0/1).
     m.insert("float_eq/ff>i", BC_FLOAT_EQ);
     m.insert("float_ne/ff>i", BC_FLOAT_NE);
@@ -1162,7 +1162,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // Argcodes `id`: int discriminator + descr selecting the case table.
     m.insert("switch/id", BC_SWITCH);
 
-    // Inlined helper-jitcode dispatch — `blackhole.py:1279-1320`
+    // Inlined helper-jitcode dispatch — `blackhole.py bhimpl_inline_call_r_i`
     // `bhimpl_inline_call_*`.  Argcodes encode (a) which kind families
     // the helper takes after the descr — `R` (ref-only), `IR`
     // (int+ref), `IRF` (int+ref+float) — and (b) the helper's return
@@ -1179,7 +1179,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("inline_call_irf_f/dIRF>f", BC_INLINE_CALL_IRF_F);
     m.insert("inline_call_irf_v/dIRF", BC_INLINE_CALL_IRF_V);
 
-    // List construction — `blackhole.py:1161-1194`
+    // List construction — `blackhole.py bhimpl_newlist`
     // `bhimpl_newlist{,_clear,_hint}`
     // (`@arguments("cpu", "i", "d", "d", "d", "d", returns="r")`):
     // length + 4 descrs (struct + length + items + array) → ref result.
@@ -1197,7 +1197,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("new_array/id>r", BC_NEW_ARRAY);
     m.insert("new_array_clear/id>r", BC_NEW_ARRAY_CLEAR);
 
-    // Raw memory load — `blackhole.py:1512-1518`
+    // Raw memory load — `blackhole.py bhimpl_raw_load_i`
     // `bhimpl_raw_load_{i,f}` (`@arguments("cpu", "i", "i", "d",
     // returns="i"|"f")`): addr + offset + arraydescr.
     m.insert("raw_load_i/iid>i", BC_RAW_LOAD_I);
@@ -1211,19 +1211,19 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("raw_store_i/iiid", BC_RAW_STORE_I);
     m.insert("raw_store_f/iifd", BC_RAW_STORE_F);
 
-    // GC indexed load — `blackhole.py:1519-1525`
+    // GC indexed load — `blackhole.py bhimpl_gc_load_indexed_i`
     // `bhimpl_gc_load_indexed_{i,f}` (`@arguments("cpu", "r", "i", "i",
     // "i", "i", returns="i"|"f")`): base ref + index + scale + base_ofs +
     // bytes.
     m.insert("gc_load_indexed_i/riiii>i", BC_GC_LOAD_INDEXED_I);
     m.insert("gc_load_indexed_f/riiii>f", BC_GC_LOAD_INDEXED_F);
 
-    // Negative-index normalisation — `blackhole.py:1149-1158`
+    // Negative-index normalisation — `blackhole.py bhimpl_check_neg_index`
     // `bhimpl_check_neg_index` (`@arguments("cpu", "r", "i", "d",
     // returns="i")`): array ref + index + arraydescr → wrapped index.
     m.insert("check_neg_index/rid>i", BC_CHECK_NEG_INDEX);
 
-    // Conditional residual call — `blackhole.py:1258-1296`
+    // Conditional residual call — `blackhole.py bhimpl_conditional_call_ir_v`
     // `bhimpl_conditional_call_ir_v` (`@arguments("cpu", "i", "i", "I",
     // "R", "d")`) is fired iff the int `condition` is non-zero;
     // `bhimpl_conditional_call_value_ir_{i,r}` returns the `value`
@@ -1239,7 +1239,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
         BC_CONDITIONAL_CALL_VALUE_IR_R,
     );
 
-    // Record-known-result — `blackhole.py:621-630`
+    // Record-known-result — `blackhole.py bhimpl_record_known_result_i_ir_v`
     // `bhimpl_record_known_result_{i,r}_ir_v`
     // (`@arguments("cpu", "i"|"r", "i", "I", "R", "d")`): tells the
     // tracer that the helper's result equals the pre-supplied operand,
@@ -1356,12 +1356,12 @@ pub fn extension_insns() -> IndexMap<&'static str, u8> {
     //     conditional call directly, mirroring upstream
     //     `bhimpl_conditional_call_ir_v` /
     //     `bhimpl_conditional_call_value_ir_{i,r}`
-    //     (`blackhole.py:1257-1276`).
+    //     (`blackhole.py`).
     //   * `record_known_result_*_ext` (`blackhole.rs`'s
     //     `handler_record_known_result_*_ext`)
     //     are no-ops that skip the operand bytes, mirroring the
     //     `pass`-bodied `bhimpl_record_known_result_{i,r}_ir_v`
-    //     (`blackhole.py:621-628`).
+    //     (`blackhole.py`).
     //
     // Producers: `majit-macros/src/jit_interp/jitcode_lower/`,
     // `pyre/pyre-jit/src/jit/assembler.rs`.

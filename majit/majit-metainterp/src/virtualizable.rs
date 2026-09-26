@@ -166,7 +166,7 @@ pub struct VirtualizableInfo {
     /// `array_pointer_field_descr`. Set by the host runtime via
     /// `set_parent_descr` so `OptContext::ensure_ptr_info_arg0` can
     /// dispatch the GETFIELD/SETFIELD branch on `parent_descr.is_object()`
-    /// (`optimizer.py:478-484`). When `None` the descriptor methods fall
+    /// (`optimizer.py`). When `None` the descriptor methods fall
     /// back to bare layout — only safe for code paths that bypass
     /// `ensure_ptr_info_arg0`.
     pub parent_descr: Option<DescrRef>,
@@ -418,7 +418,7 @@ impl VirtualizableInfo {
         vinfo: Option<Weak<dyn majit_ir::descr::VinfoMarker>>,
     ) {
         // virtualizable.py:28: self.vable_token_descr = cpu.fielddescrof(VTYPE, 'vable_token')
-        // descr.py:214-215 + heaptracker.py:97: index_in_parent counts
+        // descr.py get_index + heaptracker.py get_fielddescr_index_in: index_in_parent counts
         // non-void, non-typeptr fields in struct declaration order.
         // Layout: [typeptr, vable_token(0), static_0(1), ..., array_ptr_0(n+1), ...]
         self.vable_token_descr = Some(Self::build_field_descr(
@@ -1276,7 +1276,7 @@ impl VirtualizableInfo {
                     // The ref may be nursery-young while the virtualizable is
                     // old-gen and runs detached from the walked frame chain;
                     // upstream's write_boxes stores run under the translated
-                    // write barrier (virtualizable.py:101-113), so arm the
+                    // write barrier (virtualizable.py), so arm the
                     // object in the remembered set here.
                     if majit_gc::gc_owns_object(obj_ptr as usize) {
                         majit_gc::gc_write_barrier(majit_ir::GcRef(obj_ptr as usize));
@@ -1898,7 +1898,7 @@ mod tests {
 
     #[test]
     fn finalize_arc_stamps_vinfo_backref_on_field_descrs() {
-        // pyjitpl.py:1148-1149 parity — after `finalize_arc`, every
+        // pyjitpl.py emit_force_virtualizable parity — after `finalize_arc`, every
         // field descriptor returned by the vinfo (vable_token_descr +
         // static + array) must answer `get_vinfo() == Some(info)`.
         let mut info = VirtualizableInfo::new(24);
@@ -3337,7 +3337,7 @@ pub(crate) unsafe fn bhimpl_arraybase_vable(
 }
 
 /// Read a value from a virtualizable array item.
-/// blackhole.py:1374-1387 bhimpl_getarrayitem_vable_* parity.
+/// blackhole.py bhimpl_getarrayitem_vable_i bhimpl_getarrayitem_vable_* parity.
 pub(crate) unsafe fn vable_read_array_item(
     vable_ptr: *const u8,
     array: &VableArrayInfo,
@@ -3348,7 +3348,7 @@ pub(crate) unsafe fn vable_read_array_item(
         // `size_of::<usize>()` (4 bytes on wasm32) while an `i64` payload
         // array is a fixed 8, regardless of word width.
         let item_size = array.item_size;
-        // `bhimpl_getarrayitem_vable_*` (`blackhole.py:1374-1387`) takes the
+        // `bhimpl_getarrayitem_vable_*` (`blackhole.py bhimpl_getarrayitem_vable_i`) takes the
         // index with argcode `i` and hands it to `bh_getarrayitem_gc_*`
         // SIGNED.  The operand is an interpreter register, so a stale or
         // clobbered one arrives here as any `i64`; casting it to `usize` turns
@@ -3444,7 +3444,7 @@ pub(crate) unsafe fn vable_array_write_base(
 }
 
 /// Write a value to a virtualizable array item.
-/// blackhole.py:1390-1403 bhimpl_setarrayitem_vable_* parity.
+/// blackhole.py bhimpl_setarrayitem_vable_i bhimpl_setarrayitem_vable_* parity.
 pub(crate) unsafe fn vable_write_array_item(
     vable_ptr: *mut u8,
     array: &VableArrayInfo,
@@ -3452,7 +3452,7 @@ pub(crate) unsafe fn vable_write_array_item(
     value: i64,
 ) {
     unsafe {
-        // `bhimpl_setarrayitem_vable_*` (`blackhole.py:1390-1403`) takes the
+        // `bhimpl_setarrayitem_vable_*` (`blackhole.py bhimpl_setarrayitem_vable_i`) takes the
         // index with argcode `i` and hands it to `bh_setarrayitem_gc_*`
         // SIGNED, exactly as the read path does.  Casting a clobbered
         // register to `usize` turns a negative index into a huge offset and

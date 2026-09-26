@@ -241,7 +241,7 @@ pub(super) fn annotate_live_markers_with_liveness(op_metadata: &mut [OpMeta]) {
 /// `inline_prebuild` carries any nested-helper prebuild tokens that
 /// were aggregated during lowering.  Emit the current body's own
 /// `-live-` triples first, then nested helper prebuilds: RPython
-/// `codewriter.py:74-80` assembles the caller graph that discovered
+/// `codewriter.py make_jitcodes` assembles the caller graph that discovered
 /// an inline callee before draining the pending callee graph queued by
 /// `call.py get_jitcode`.
 pub(super) fn liveness_prebuild_tokens(
@@ -353,7 +353,7 @@ pub(super) fn remove_repeated_live(
         // becomes unconditional.  When every marker is conditional, fall
         // back to keeping them unmerged — each emits its own BC_LIVE
         // only when its own condition holds, matching PyPy's per-site
-        // alive-set capture (at the cost of skipping `liveness.py:82`'s
+        // alive-set capture (at the cost of skipping `liveness.py`'s
         // dedup, which `production` doesn't trigger anyway because the
         // lowerer emits at most one marker per call/guard site).
         if markers
@@ -423,7 +423,7 @@ pub(super) fn remove_repeated_live(
 /// `install_canonical_liveness` at install time.
 ///
 /// Each register index must fit in `u8` per RPython
-/// `rpython/jit/codewriter/assembler.py:225` — the bitset encoder
+/// `rpython/jit/codewriter/assembler.py` — the bitset encoder
 /// only addresses 0..=255 (8 register-bytes × 8 bits). The typed
 /// `Register::new` constructor asserts this bound at every
 /// emit site, so by the time the walker hands us a `BTreeSet<Register>`

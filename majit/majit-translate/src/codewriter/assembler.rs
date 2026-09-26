@@ -595,7 +595,7 @@ impl AssemblerEncode for Assembler {
 
             // RPython `flatten.py` `emitline("unreachable")` →
             // single-byte opcode for `bhimpl_unreachable`
-            // (`blackhole.py:962-964`). Mirrors the
+            // (`blackhole.py`). Mirrors the
             // `assembler.py:140-159` general opcode path: a fresh
             // `startposition = len(self.code)` is recorded before the
             // opcode byte goes in so the `_check_no_branch_to_inside_an_op`
@@ -659,7 +659,7 @@ impl AssemblerEncode for Assembler {
                 // build-time gate at `flatten.py:248`.  Pyre routes
                 // every Variable-cond exitswitch installation through
                 // `FunctionGraph::set_branch` (model.rs), which appends
-                // a `bool` UnaryOp (flowcontext.py:756
+                // a `bool` UnaryOp (flowcontext.py POP_JUMP_IF_FALSE
                 // `Variable.bool().eval(self)`) so the rtyper lowers
                 // the cond to a Bool register before flatten emits.
                 // Fail loud if a non-Int slips through — mirrors
@@ -803,7 +803,7 @@ impl AssemblerEncode for Assembler {
             //
             // Upstream's source operand (`v`) can be either a `Register`
             // or a `Constant` (`getcolor` returns the Constant as-is at
-            // flatten.py:382-384); in both cases the `assembler.py:164-174`
+            // flatten.py); in both cases the `assembler.py:164-174`  allow-line-citation
             // single-byte encoder shares the argcode kind letter and
             // disambiguates register vs constant at decode time via
             // `byte >= count_regs[kind]`.
@@ -927,7 +927,7 @@ impl AssemblerEncode for Assembler {
                 state.code.push(opnum);
             }
             // RPython `flatten.py` `make_return` 2-inputarg case
-            // plus the `flatten.py:166-173` overflow reraise.  Both paths
+            // plus the `flatten.py` overflow reraise.  Both paths
             // funnel through `raise/r` — `RegOrConst::Reg` is the raised
             // exception value's Register, `RegOrConst::Const` is the
             // standard OverflowError instance.  Blackhole:
@@ -1250,7 +1250,7 @@ impl AssemblerEncode for Assembler {
                 // Result
                 // RPython `residual_call_r_r` / `residual_call_r_i` /
                 // `residual_call_r_v` are *different* bhimpls
-                // (`blackhole.py:1225-1231`): the `_r` / `_i` / `_v`
+                // (`blackhole.py bhimpl_residual_call_r_i`): the `_r` / `_i` / `_v`
                 // suffix encodes the actual result kind. When pyre's
                 // rtyper (`translator::rtyper::legacy_resolve::resolve_types`)
                 // upgrades a call result's concrete type to `Signed`
@@ -1528,7 +1528,7 @@ impl AssemblerEncode for Assembler {
             }
             // RPython `new_array_clear(v_length, arraydescr)` — the cleared
             // fixed-size array allocation `do_fixed_newlist_clear` emits
-            // (`jtransform.py:1858-1863`).  `bhimpl_new_array_clear`
+            // (`jtransform.py`).  `bhimpl_new_array_clear`
             // (`blackhole.py`, `@arguments("cpu", "i", "d",
             // returns="r")`) gives the canonical key `new_array_clear/id>r`:
             // length (Int) + arraydescr + ref result.  The arraydescr is the
@@ -1817,7 +1817,7 @@ impl AssemblerEncode for Assembler {
             // `record_quasiimmut_field(v_inst, fielddescr, mutatefielddescr)`
             // — a register followed by two descrs.  The blackhole counterpart
             // `bhimpl_record_quasiimmut_field(struct, fielddescr,
-            // mutatefielddescr)` (`rpython/jit/metainterp/blackhole.py:1537-1539`)
+            // mutatefielddescr)` (`rpython/jit/metainterp/blackhole.py`)
             // expects argcodes `rdd`.
             OpKind::RecordQuasiImmutField {
                 base,
@@ -2229,7 +2229,7 @@ impl AssemblerEncode for Assembler {
             // + int result. The descr is `arraydescrof(ARRAY)` with a
             // length word (`jtransform.py rewrite_op_getarraysize`); a
             // `nolength` ARRAY has `lendescr is None` and blackhole
-            // `bh_arraylen_gc` panics (llmodel.py:585).
+            // `bh_arraylen_gc` panics (llmodel.py).
             OpKind::ArrayLen {
                 base,
                 array_type_id,
@@ -2311,7 +2311,7 @@ impl AssemblerEncode for Assembler {
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
                 // RPython `bhimpl_getfield_vable_{i,r,f}` canonical keys
-                // (blackhole.py:1446-1458) match on the RESULT register
+                // (blackhole.py bhimpl_getfield_vable_i) match on the RESULT register
                 // kind. See FieldRead above for the Void/State/Unknown
                 // rationale — the pyre-only declared ty can be Void
                 // while the SSA result register is always i/r/f.
@@ -2371,7 +2371,7 @@ impl AssemblerEncode for Assembler {
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
                 // RPython `bhimpl_setfield_vable_{i,r,f}` canonical keys
-                // (blackhole.py:1485-1495) match on the VALUE register's
+                // (blackhole.py bhimpl_setfield_vable_i) match on the VALUE register's
                 // kind. Same rationale as setfield_gc_*.
                 let opname = format!("setfield_vable_{value_kind}");
                 let key = format!("{opname}/{argcodes}");
@@ -2796,9 +2796,9 @@ impl AssemblerEncode for Assembler {
     /// Variable has exactly one `(kind, color)` via
     /// `getkind(v.concretetype)` + `regallocs[kind]`.  This helper
     /// reads the declared kind directly from `Variable.concretetype`
-    /// (`rtyper.py:258 v.concretetype = ...`) and looks up the color
+    /// (`rtyper.py setconcretetype v.concretetype = ...`) and looks up the color
     /// strictly in `regallocs[kind].coloring[var]` (orthodox per
-    /// `tool/algo/regalloc.py:31 coloring: dict[Variable, int]`) —
+    /// `tool/algo/regalloc.py coloring: dict[Variable, int]`) —
     /// a hard panic on miss.
     ///
     /// When the kind cannot be derived (test fixtures whose Variables
@@ -3406,10 +3406,10 @@ impl AssemblerEncode for Assembler {
 ///
 /// The result kind is a signature input, not just the suffix after it: a
 /// float result forces `irf` even with no float argument
-/// (`test_jtransform.py:356` `if RESTYPE == lltype.Float: with_f = True`).
+/// (`test_jtransform.py` `if RESTYPE == lltype.Float: with_f = True`).
 /// Without that a `&self -> f64` shape (empty `args_i`/`args_f`, single
 /// `args_r`, `result_kind='f'`) would map to a pyre-only `_r_f` handler with
-/// no RPython `bhimpl_*_r_f` counterpart (`blackhole.py:1224,1278` only has
+/// no RPython `bhimpl_*_r_f` counterpart (`blackhole.py` only has
 /// `_r_{i,r,v}` / `_ir_*` / `_irf_*`).
 ///
 /// The emitter and the text formatter (`codewriter::format`) both spell the
@@ -3607,7 +3607,7 @@ fn value_type_to_field_flag(ty: &crate::model::ValueType) -> majit_ir::descr::Ar
 
 fn value_type_to_ir_type_for_descr(ty: &crate::model::ValueType) -> majit_ir::value::Type {
     match ty {
-        // `getkind(BOOL_TYPE)` returns `'int'` (`lloperation.py:108`);
+        // `getkind(BOOL_TYPE)` returns `'int'` (`lloperation.py _freeze_`);
         // `getkind(Unsigned) == 'int'` per `lltype.py` — descriptor IR
         // type tracks the register class so Bool/Unsigned alias to Int
         // rather than falling into the wildcard Ref branch.
@@ -3629,7 +3629,7 @@ fn value_type_to_ir_type_for_descr(ty: &crate::model::ValueType) -> majit_ir::va
 /// wasm32 descr.
 ///
 /// The two deliberately still differ on `f32`.  `get_type_flag` follows
-/// `descr.py:254` and lands SingleFloat int-banked
+/// `descr.py` and lands SingleFloat int-banked
 /// (`ArrayFlag::Unsigned` / `Type::Int`), then restores the `'f'` width
 /// marker via `concrete_type` on the ArrayDescr it builds
 /// (`call.rs` `elem_ref == Some("f32")`).  `BhDescr::Array` carries no
@@ -4171,7 +4171,7 @@ fn bh_all_field_specs_for_struct_into(
         for fl in &layout.fields {
             // Header words are skipped against the owner that declares them,
             // which is the nested owner once the walk has descended. They are
-            // not part of the positional census (`heaptracker.py:51`), so a
+            // not part of the positional census (`heaptracker.py all_fielddescrs`), so a
             // list that keeps them numbers every following field two slots
             // past where `get_fielddescr_index_in` puts it — and the index a
             // descr is minted with is then a position in a different list
@@ -4504,7 +4504,7 @@ fn fielddescrof(
         // Only the byte offset is available here — reaching this arm means the
         // name lookup above already missed — and offset is not an identity: a
         // flattened inline aggregate shares an address with its first leaf
-        // (`heaptracker.py:68-69`).  So resolve only when exactly one field sits
+        // (`heaptracker.py`).  So resolve only when exactly one field sits
         // there, and otherwise leave the caller's number rather than name a
         // sibling.
         //
@@ -4659,7 +4659,7 @@ fn heuristic_field_layout(
 }
 
 /// `cpu.arraydescrof(rffi.CArray(T))` for a raw element access
-/// (`jtransform.py:1156-1171`): no length header, non-GC, item width and
+/// (`jtransform.py rewrite_op_raw_store`): no length header, non-GC, item width and
 /// signedness explicit because [`crate::model::ValueType`] collapses widths.
 fn raw_carray_descrof(
     ty: &crate::model::ValueType,
@@ -4899,7 +4899,7 @@ fn vable_arraydescrof(
 /// operand's repr at rtyper time:
 ///
 /// - `IntegerRepr.rtype_bool` → `genop("int_is_true", ...)`
-///   (`rint.py:200-205`)
+///   (`rint.py`)
 /// - `PtrRepr.rtype_bool` → `genop("ptr_nonzero", ...)`
 ///   (`rmodel.py::PtrRepr.rtype_bool`)
 /// - `FloatRepr.rtype_bool` → `genop("float_ne", ..., 0.0)`
@@ -4932,7 +4932,7 @@ fn op_kind_to_opname_with_kinds(kind: &crate::model::OpKind, operand_kinds: &str
             // both surfaces, so an `f` operand reaching here means
             // the rewrite was skipped.  Fail loud rather than emit
             // a `float_is_true` opname the backend does not register
-            // (`rpython/jit/codewriter/jtransform.py:1627` is
+            // (`rpython/jit/codewriter/jtransform.py` is
             // unconditional, so pyre matches that invariant here).
             "f" => unreachable!(
                 "OpKind::UnaryOp {{ op: \"bool\", .. }} over an `f` operand must be \
@@ -5087,7 +5087,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // `jtransform.py:814-817` — one opname with no kind suffix: a
         // length is a `Signed` whatever the element kind is.
         OpKind::VableArrayLen { .. } => "arraylen_vable".into(),
-        // RPython `blackhole.py:500` canonical opnames for bitwise ints are
+        // RPython `blackhole.py bhimpl_int_and` canonical opnames for bitwise ints are
         // `int_and` / `int_or` / `int_xor`. When an `OpKind::BinOp.op`
         // arrives spelled with Rust's `syn::BinOp` trait names
         // (`bitand`/`bitor`/`bitxor`) for source faithfulness, rename them
@@ -5097,7 +5097,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             "bitand" => "int_and".into(),
             "bitor" => "int_or".into(),
             "bitxor" => "int_xor".into(),
-            // RPython `jtransform.py:1243-1255` produces these opnames as-is —
+            // RPython `jtransform.py rewrite_op_ptr_eq` produces these opnames as-is —
             // do not prefix with `int_`.
             "ptr_eq" | "ptr_ne" | "instance_ptr_eq" | "instance_ptr_ne" => op.clone(),
             // jtransform-rewritten float operands carry the full RPython
@@ -5181,7 +5181,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::RecordKnownResult { result_kind, .. } => {
             format!("record_known_result_{result_kind}")
         }
-        // jtransform.py:1665-1688 — conditional_call ops
+        // jtransform.py _rewrite_op_cond_call — conditional_call ops
         OpKind::ConditionalCall { .. } => "conditional_call".into(),
         OpKind::ConditionalCallValue { result_kind, .. } => {
             format!("conditional_call_value_{result_kind}")
@@ -7460,7 +7460,7 @@ mod tests {
 
     /// `rewrite_op_getarraysize` always emits `arraylen_gc`. A `nolength`
     /// ARRAY has no length word; shipping that opcode lets blackhole
-    /// `bh_arraylen_gc` panic at run time (`llmodel.py:585`).
+    /// `bh_arraylen_gc` panic at run time (`llmodel.py`).
     #[test]
     #[should_panic(expected = "arraylen_gc requires ArrayDescr.lendescr")]
     fn assemble_arraylen_rejects_a_headerless_descr() {

@@ -12,7 +12,7 @@
 //!   including readonly/non-readonly attr iteration, `prepare_method`,
 //!   `extra_access_sets`, and field reordering by `attr_reverse_size`.
 //! * `getclassrepr` / `getinstancerepr` / `buildinstancerepr`
-//!   (rclass.py:67-119) — both `classdef is None` and
+//!   (rclass.py) — both `classdef is None` and
 //!   `classdef != None` arms dispatch. `getclassrepr` caches through
 //!   upstream's `classdef.repr` slot, and `getinstancerepr` reads
 //!   `_alloc_flavor_` through `classdesc.get_param(...)`.
@@ -21,7 +21,7 @@
 //!
 //! * `_check_for_immutable_hints` (rclass.py),
 //!   `special_memory_pressure` + `mutate_*` quasi-immutable fields
-//!   (rclass.py:534-546). Phase R2-D, gated on `classdesc.get_param`
+//!   (rclass.py). Phase R2-D, gated on `classdesc.get_param`
 //!   / bookkeeper `memory_pressure_types`.
 //!
 //! Phase R3 landed (`ClassRepr.init_vtable` at [`ClassRepr::init_vtable`]
@@ -30,7 +30,7 @@
 //! `getvtable` at line 1023, `getruntime` at line 1042) — full
 //! `lltype.malloc(immortal=True)` / `attachRuntimeTypeInfo` /
 //! `RuntimeTypeInfo` wiring is in place; the `RootClassRepr.init_vtable`
-//! override (rclass.py:435-437) is at line 1682.
+//! override (rclass.py) is at line 1682.
 
 #![allow(
     non_camel_case_types,
@@ -45,7 +45,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// RPython `flags={}` keyword argument threaded through
 /// `InstanceRepr.{getfield,setfield}` (rclass.py / :1002) and the
 /// `hook_access_field` / `hook_setfield` virtualizable hooks
-/// (rclass.py:712-715). Default empty maps to upstream's `{}` literal;
+/// (rclass.py). Default empty maps to upstream's `{}` literal;
 /// `_jit_virtualizable_2_` instance reprs read keys like `'access_directly'`
 /// and `'fresh_virtualizable'` from this dict.
 pub(crate) type Flags = HashMap<String, ConstValue>;
@@ -111,7 +111,7 @@ pub(crate) fn class_get_method_ptr(
     };
     graph.blocks[block_id.0].operations.insert(op_index, op);
     // RPython parity: every Variable carries `concretetype` inline
-    // (`rtyper.py:258 v.concretetype = ...`).  Write through the
+    // (`rtyper.py setconcretetype v.concretetype = ...`).  Write through the
     // backing cell so downstream consumers see Signed.
     FunctionGraph::set_concretetype_of_inline(&funcptr_var, ConcreteType::Signed);
     funcptr_var
@@ -208,7 +208,7 @@ pub fn alloc_array_name(name: &str) -> Result<_ptr, String> {
 /// module-level types (`OBJECT_VTABLE` / `CLASSTYPE` / `OBJECT` /
 /// `OBJECTPTR`) in a single `LazyLock` body, mirroring upstream's
 /// mutable-ForwardReference + post-hoc `become()` ordering
-/// (rclass.py:160-174).
+/// (rclass.py).
 ///
 /// Cycle topology:
 ///
@@ -324,7 +324,7 @@ static OBJECT_FAMILY: LazyLock<ObjectFamilyTypes> = LazyLock::new(|| {
 });
 
 /// RPython module-level `OBJECT_VTABLE = lltype.ForwardReference()` resolved
-/// via `.become(Struct('object_vtable', ...))` (rclass.py:160, 167-174).
+/// via `.become(Struct('object_vtable', ...))` (rclass.py, 167-174).
 ///
 /// All 5 head fields land — `subclassrange_min`/`max`, `rtti`, `name`,
 /// and `instantiate: Ptr(FuncType([], OBJECTPTR))`. The instantiate
@@ -340,7 +340,7 @@ pub static OBJECT_VTABLE: LazyLock<LowLevelType> =
 pub static CLASSTYPE: LazyLock<LowLevelType> = LazyLock::new(|| OBJECT_FAMILY.classtype.clone());
 
 /// RPython `OBJECT = GcStruct('object', ('typeptr', CLASSTYPE),
-/// hints={...}, rtti=True)` (rclass.py:162-165). `rtti=True` funnels
+/// hints={...}, rtti=True)` (rclass.py). `rtti=True` funnels
 /// through `RttiStruct._install_extras` and mints a
 /// `RuntimeTypeInfo` opaque stored on `_runtime_type_info`, so
 /// `getRuntimeTypeInfo(OBJECT)` succeeds once R3 consumers
@@ -351,7 +351,7 @@ pub static OBJECT: LazyLock<LowLevelType> = LazyLock::new(|| OBJECT_FAMILY.objec
 pub static OBJECTPTR: LazyLock<LowLevelType> = LazyLock::new(|| OBJECT_FAMILY.objectptr.clone());
 
 /// RPython `NONGCOBJECT = Struct('nongcobject', ('typeptr', CLASSTYPE))`
-/// (rclass.py:176).
+/// (rclass.py).
 pub static NONGCOBJECT: LazyLock<LowLevelType> = LazyLock::new(|| {
     LowLevelType::Struct(Box::new(Struct::new(
         "nongcobject",
@@ -543,7 +543,7 @@ fn class_attr_family_key(
 }
 
 /// RPython `OBJECT_BY_FLAVOR[LLFLAVOR[gcflavor]]` (rclass.py,
-/// consumed at rclass.py:472). Returns the underlying `LowLevelType` for
+/// consumed at rclass.py). Returns the underlying `LowLevelType` for
 /// the root `object_type` of an `InstanceRepr` with `classdef is None`.
 pub(crate) fn object_by_flavor(flavor: Flavor) -> LowLevelType {
     match flavor {
@@ -723,7 +723,7 @@ pub struct Entry;
 /// to the
 /// [`crate::translator::rtyper::lltypesystem::lltype::LowLevelValue`]
 /// shape that [`_ptr::setattr`](crate::translator::rtyper::lltypesystem::lltype::_ptr::setattr)
-/// consumes for vtable slot writes (rclass.py:321 `setattr(vtable,
+/// consumes for vtable slot writes (rclass.py `setattr(vtable,
 /// mangled_name, llvalue)`).
 ///
 /// Upstream Python performs no explicit conversion — the `Constant`
@@ -772,7 +772,7 @@ pub(crate) fn constant_to_lowlevel_value(
 ///
 /// Readonly class attrs populate `clsfields` / `allmethods`, and
 /// `extra_access_sets` populate `pbcfields`, matching the attr walk in
-/// rclass.py:252-271. Method-valued attrs flow through
+/// rclass.py. Method-valued attrs flow through
 /// `prepare_method()` before repr lookup so method-descriptor PBCs are
 /// rewritten to function PBCs like upstream.
 #[derive(Debug)]
@@ -829,7 +829,7 @@ pub struct ClassRepr {
 
 impl ClassRepr {
     /// RPython `ClassRepr.__init__(self, rtyper, classdef)`
-    /// (rclass.py:192-196).
+    /// (rclass.py).
     ///
     /// Allocates a fresh `ForwardReference` for the vtable container and
     /// stores `Ptr(self.vtable_type)` as the Repr's low-level type. The
@@ -932,7 +932,7 @@ impl ClassRepr {
     }
 
     /// RPython `ClassRepr.setup_vtable(self, vtable, r_parentcls)`
-    /// (rclass.py:307-336).
+    /// (rclass.py).
     ///
     /// ```python
     /// def setup_vtable(self, vtable, r_parentcls):
@@ -964,7 +964,7 @@ impl ClassRepr {
     /// ```
     ///
     /// `vtable` points at the vtable sub-struct for the level
-    /// `r_parentcls` describes (rclass.py:298-304 walks the super chain
+    /// `r_parentcls` describes (rclass.py walks the super chain
     /// via [`Self::init_vtable`]). Upstream calls `setattr` on the
     /// live `_struct` container; the Rust port routes through
     /// [`_ptr::setattr`] after mapping the converted
@@ -1349,7 +1349,7 @@ impl ClassRepr {
     }
 
     /// RPython `ClassRepr.fromtypeptr(self, vcls, llops)`
-    /// (rclass.py:362-369).
+    /// (rclass.py).
     ///
     /// ```python
     /// def fromtypeptr(self, vcls, llops):
@@ -1378,7 +1378,7 @@ impl ClassRepr {
     }
 
     /// RPython `ClassRepr.getclsfield(self, vcls, attr, llops)`
-    /// (rclass.py:371-381).
+    /// (rclass.py).
     ///
     /// ```python
     /// def getclsfield(self, vcls, attr, llops):
@@ -1426,7 +1426,7 @@ impl ClassRepr {
     }
 
     /// RPython `ClassRepr.setclsfield(self, vcls, attr, vvalue, llops)`
-    /// (rclass.py:383-393).
+    /// (rclass.py).
     ///
     /// ```python
     /// def setclsfield(self, vcls, attr, vvalue, llops):
@@ -1472,7 +1472,7 @@ impl ClassRepr {
     }
 
     /// RPython `ClassRepr.getpbcfield(self, vcls, access_set, attr,
-    /// llops)` (rclass.py:395-401).
+    /// llops)` (rclass.py).
     ///
     /// ```python
     /// def getpbcfield(self, vcls, access_set, attr, llops):
@@ -1535,7 +1535,7 @@ impl ClassRepr {
     ///
     /// Both branches dispatch to a low-level helper graph minted via
     /// [`RPythonTyper::lowlevel_helper_function`]: `ll_issubclass`
-    /// (rclass.py:1133-1137) for the variable case and
+    /// (rclass.py) for the variable case and
     /// `ll_issubclass_const` (rclass.py) for the constant
     /// case. The helper bodies emit a single `int_between` op against
     /// `cls.subclassrange_min` / `cls.subclassrange_max`.
@@ -1711,7 +1711,7 @@ impl Repr for ClassRepr {
     /// dispatches `r.rtype_issubtype(hop)`. Without this override the
     /// trait default would surface `MissingRTypeOperation`. Forwards
     /// to the inherent [`ClassRepr::rtype_issubtype`] which mirrors
-    /// upstream rclass.py:403-414.
+    /// upstream rclass.py.
     fn rtype_issubtype(&self, hop: &crate::translator::rtyper::rtyper::HighLevelOp) -> RTypeResult {
         ClassRepr::rtype_issubtype(self, hop)
     }
@@ -1906,7 +1906,7 @@ impl Repr for ClassRepr {
 /// and the Repr `setup()` entry-point, both of which are awkward to
 /// reach through the public `Arc<dyn Repr>`. The enum branches mirror
 /// upstream's class hierarchy (`ClassRepr` vs its `RootClassRepr`
-/// subclass at rclass.py:420) without requiring runtime type reflection.
+/// subclass at rclass.py) without requiring runtime type reflection.
 #[derive(Clone, Debug)]
 pub(crate) enum ClassReprArc {
     Root(Arc<RootClassRepr>),
@@ -2193,7 +2193,7 @@ impl Repr for RootClassRepr {
     /// `RPythonTyper.translate_op_issubtype` (rtyper.py)
     /// dispatches `r.rtype_issubtype(hop)`. Upstream's
     /// `RootClassRepr` inherits the body from `AbstractClassRepr`
-    /// (rclass.py:403-414); the Rust port forwards through the shared
+    /// (rclass.py); the Rust port forwards through the shared
     /// [`rtype_issubtype_helper`] free fn so both ClassRepr and
     /// RootClassRepr surface the same op.
     fn rtype_issubtype(&self, hop: &crate::translator::rtyper::rtyper::HighLevelOp) -> RTypeResult {
@@ -2279,10 +2279,10 @@ impl Repr for RootClassRepr {
 /// R2-C brings in the attrs iteration for `readonly = False` instance
 /// attributes: `fields` / `allinstancefields` populate via
 /// `rtyper.getrepr(attrdef.s_value)` + `mangled_name = 'inst_' + name`
-/// (rclass.py:503-509), and the `object_type` Struct body includes the
+/// (rclass.py), and the `object_type` Struct body includes the
 /// `(mangled_name, r.lowleveltype)` pairs alongside `('super',
 /// rbase.object_type)`. The `special_memory_pressure` /
-/// `mutate_<name>` quasi-immutable fields (rclass.py:534-546), the
+/// `mutate_<name>` quasi-immutable fields (rclass.py), the
 /// `_check_for_immutable_hints` branch (rclass.py), and the
 /// `rtti=True` kwarg (rclass.py `attachRuntimeTypeInfo` side
 /// effect) remain R2-D / R3 scope.
@@ -2295,10 +2295,10 @@ pub struct InstanceRepr {
     /// `object_type = OBJECT_BY_FLAVOR[...]` directly.
     classdef: Option<Rc<RefCell<ClassDef>>>,
     /// RPython `self.object_type = OBJECT_BY_FLAVOR[LLFLAVOR[gcflavor]]`
-    /// when classdef is None (rclass.py:472), otherwise a fresh
-    /// `ForwardReference` (rclass.py:474-475). The FR target resolves
+    /// when classdef is None (rclass.py), otherwise a fresh
+    /// `ForwardReference` (rclass.py). The FR target resolves
     /// during `_setup_repr` once the `MkStruct('name', ('super',
-    /// rbase.object_type), ...)` body is built (rclass.py:548-554).
+    /// rbase.object_type), ...)` body is built (rclass.py).
     object_type: LowLevelType,
     /// RPython `self.lowleveltype = Ptr(self.object_type)` (rclass.py).
     lowleveltype: LowLevelType,
@@ -2325,7 +2325,7 @@ pub struct InstanceRepr {
     allinstancefields: RefCell<HashMap<String, (String, Arc<dyn Repr>)>>,
     /// RPython `self.immutable_field_set = set()` (rclass.py) for
     /// classdef=None, overwritten by `_check_for_immutable_hints` for
-    /// classdef!=None (rclass.py:576). R2-C keeps it as an empty set —
+    /// classdef!=None (rclass.py). R2-C keeps it as an empty set —
     /// the immutable-hint derivation lands in R2-D.
     #[allow(dead_code)]
     immutable_field_set: RefCell<HashSet<String>>,
@@ -2349,10 +2349,10 @@ pub struct InstanceRepr {
 
 impl InstanceRepr {
     /// RPython `InstanceRepr.__init__(self, rtyper, classdef,
-    /// gcflavor='gc')` (rclass.py:468-478).
+    /// gcflavor='gc')` (rclass.py).
     ///
-    /// Covers both branches: `classdef is None` (rclass.py:471-472) and
-    /// `classdef is not None` (rclass.py:473-475). In the latter case a
+    /// Covers both branches: `classdef is None` (rclass.py) and
+    /// `classdef is not None` (rclass.py). In the latter case a
     /// fresh `ForwardReference` / `GcForwardReference` is allocated with
     /// its `Arc<Mutex<_>>` target shared into the `lowleveltype` Ptr, so
     /// [`InstanceRepr::_setup_repr`] can resolve it once.
@@ -2499,7 +2499,7 @@ impl InstanceRepr {
     }
 
     /// RPython `InstanceRepr.hook_access_field(self, vinst, cname,
-    /// llops, flags)` (rclass.py:712-713):
+    /// llops, flags)` (rclass.py):
     ///
     /// ```python
     /// def hook_access_field(self, vinst, cname, llops, flags):
@@ -2542,7 +2542,7 @@ impl InstanceRepr {
     }
 
     /// RPython `InstanceRepr.hook_setfield(self, vinst, fieldname,
-    /// llops)` (rclass.py:715-718):
+    /// llops)` (rclass.py):
     ///
     /// ```python
     /// def hook_setfield(self, vinst, fieldname, llops):
@@ -2570,7 +2570,7 @@ impl InstanceRepr {
     }
 
     /// RPython `InstanceRepr.is_quasi_immutable(self, fieldname)`
-    /// (rclass.py:720-729):
+    /// (rclass.py):
     ///
     /// ```python
     /// def is_quasi_immutable(self, fieldname):
@@ -2605,7 +2605,7 @@ impl InstanceRepr {
     }
 
     /// RPython `InstanceRepr.getfield(self, vinst, attr, llops,
-    /// force_cast=False, flags={})` (rclass.py:987-1000):
+    /// force_cast=False, flags={})` (rclass.py):
     ///
     /// ```python
     /// def getfield(self, vinst, attr, llops, force_cast=False, flags={}):
@@ -2678,7 +2678,7 @@ impl InstanceRepr {
     }
 
     /// RPython `InstanceRepr.setfield(self, vinst, attr, vvalue, llops,
-    /// force_cast=False, flags={})` (rclass.py:1002-1017):
+    /// force_cast=False, flags={})` (rclass.py):
     ///
     /// ```python
     /// def setfield(self, vinst, attr, vvalue, llops, force_cast=False, flags={}):
@@ -2752,7 +2752,7 @@ impl InstanceRepr {
     }
 
     /// RPython `InstanceRepr.new_instance(self, llops,
-    /// classcallhop=None, nonmovable=False)` (rclass.py:731-770):
+    /// classcallhop=None, nonmovable=False)` (rclass.py):
     ///
     /// ```python
     /// def new_instance(self, llops, classcallhop=None, nonmovable=False):
@@ -2779,7 +2779,7 @@ impl InstanceRepr {
     /// the `__class__` `setfield` and the class-level defaults loop.
     /// `classcallhop` is unused in this base body, exactly as upstream —
     /// its only consumer is the `TaggedInstanceRepr` override
-    /// (`lltypesystem/rtagged.py:30-38`), unported.
+    /// (`lltypesystem/rtagged.py`), unported.
     pub fn new_instance(
         self: &Arc<Self>,
         llops: &mut LowLevelOpList,
@@ -2984,7 +2984,7 @@ impl InstanceRepr {
     /// ```
     ///
     /// Used by `convert_const` when delegating to a subclass `InstanceRepr`
-    /// (rclass.py:788-790): the subclass produces a pointer typed at the
+    /// (rclass.py): the subclass produces a pointer typed at the
     /// subclass's `lowleveltype`; this helper casts it back up to the
     /// owning `InstanceRepr`'s `lowleveltype`.
     pub fn upcast(&self, result: &_ptr) -> Result<_ptr, TyperError> {
@@ -3027,7 +3027,7 @@ impl InstanceRepr {
     }
 
     /// RPython `InstanceRepr.initialize_prebuilt_data(self, value,
-    /// classdef, result)` (rclass.py:947-975).
+    /// classdef, result)` (rclass.py).
     ///
     /// Recursive helper that walks the `rbase` chain (each level
     /// addressed via the per-step `path` of `"super"` segments,
@@ -3132,12 +3132,12 @@ impl InstanceRepr {
                             //         llattrvalue = r.convert_desc_or_const(attrvalue)
                             //
                             // `ClassDictEntry::Constant(c)` ↔ upstream
-                            // `Constant(value)` (classdesc.py:601,634), and
+                            // `Constant(value)` (classdesc.py), and
                             // `ClassDictEntry::Desc(d)` ↔ upstream
-                            // `funcdesc` stored verbatim (classdesc.py:612).
+                            // `funcdesc` stored verbatim (classdesc.py).
                             // Both arms project cleanly into `DescOrConst`,
                             // matching upstream `convert_desc_or_const`
-                            // (rmodel.py:111-118).
+                            // (rmodel.py).
                             match super::super::super::annotator::classdesc::ClassDesc::read_attribute(
                                 &classdesc, name,
                             ) {
@@ -3199,7 +3199,7 @@ impl InstanceRepr {
     }
 
     /// RPython `InstanceRepr.convert_const_exact(self, value)`
-    /// (rclass.py:794-802):
+    /// (rclass.py):
     ///
     /// ```python
     /// def convert_const_exact(self, value):
@@ -3286,7 +3286,7 @@ impl InstanceRepr {
     }
 
     /// RPython `InstanceRepr.get_reusable_prebuilt_instance(self)`
-    /// (rclass.py:804-813):
+    /// (rclass.py):
     ///
     /// ```python
     /// def get_reusable_prebuilt_instance(self):
@@ -3450,7 +3450,7 @@ impl InstanceRepr {
 }
 
 /// Build the `(object_type, lowleveltype)` pair for an InstanceRepr
-/// per rclass.py:471-477.
+/// per rclass.py.
 fn build_instance_types(
     classdef: Option<&Rc<RefCell<ClassDef>>>,
     gcflavor: Flavor,
@@ -3663,11 +3663,11 @@ impl Repr for InstanceRepr {
         // (unaryop.rs `ptr_method_is_null`; receivers that upstream
         // keeps as `SomePtr` are carried as `SomeInstance` by pyre's
         // pointer erasure). Mirror `PtrRepr.rtype_getattr`'s
-        // ADT-method pass-through (rptr.py:44-46 `if isinstance(
+        // ADT-method pass-through (rptr.py `if isinstance(
         // hop.s_result, SomeLLADTMeth): return hop.inputarg(
         // hop.r_result, arg=0)`): the bound method is represented as
         // its receiver (`BuiltinMethodRepr.lowleveltype ==
-        // self_repr.lowleveltype`, rbuiltin.py:120), so getattr
+        // self_repr.lowleveltype`, rbuiltin.py), so getattr
         // forwards the receiver value unchanged and
         // `BuiltinMethodRepr.rtype_simple_call` dispatches the call
         // back through `rtype_method` below.
@@ -3729,7 +3729,7 @@ impl Repr for InstanceRepr {
         // upstream: `if attr in self.allinstancefields:`
         //          `return self.getfield(vinst, attr, hop.llops,
         //                                flags=hop.args_s[0].flags)`
-        // (rclass.py:847-849).
+        // (rclass.py).
         let has_field = self.allinstancefields.borrow().contains_key(&attr);
         if has_field {
             let flags = {
@@ -3818,7 +3818,7 @@ impl Repr for InstanceRepr {
         // an unpopulated `allinstancefields`, a mangled-name mismatch, or a
         // >2-variant enum erased to a bare pointer — must fall through to the
         // `getclsfield` path below and surface a `TyperError`, matching
-        // upstream (rclass.py:855-857 raises on a missing field), rather than
+        // upstream (rclass.py raises on a missing field), rather than
         // fabricating a 0/1 value.
         let receiver_is_nullable_instance = {
             let args_s = hop.args_s.borrow();
@@ -3859,7 +3859,7 @@ impl Repr for InstanceRepr {
         // upstream: `else:`
         //          `vcls = self.getfield(vinst, '__class__', hop.llops)`
         //          `return self.rclass.getclsfield(vcls, attr, hop.llops)`
-        // (rclass.py:855-857).
+        // (rclass.py).
         let mut llops = hop.llops.borrow_mut();
         let flags = Flags::default();
         let v_cls = self_arc.getfield(vinst, "__class__", &mut llops, false, &flags)?;
@@ -4147,7 +4147,7 @@ impl Repr for InstanceRepr {
     /// ```
     ///
     /// For the root `object` repr, `self.classdef` is `None`.
-    /// RPython `rclass.py:786-790` delegates in that arm because
+    /// RPython `rclass.py` delegates in that arm because
     /// `classdesc.py` makes `classdef.commonbase(None) == None`.
     ///
     /// The `classdef == self.classdef` exact-match arm dispatches into
@@ -4391,7 +4391,7 @@ impl Repr for InstanceRepr {
     }
 }
 
-// rclass.py:67-88, 91-119, 439-440 — module-level accessors.
+// rclass.py getclassrepr, 91-119, 439-440 — module-level accessors.
 
 /// RPython `get_type_repr(rtyper)` (`rclass.py`).
 ///
@@ -4468,7 +4468,7 @@ pub(crate) fn getclassrepr_arc(
 }
 
 /// RPython `getinstancerepr(rtyper, classdef, default_flavor='gc')`
-/// (`rclass.py:76-88`).
+/// (`rclass.py`).
 ///
 /// ```python
 /// def getinstancerepr(rtyper, classdef, default_flavor='gc'):
@@ -4486,7 +4486,7 @@ pub(crate) fn getclassrepr_arc(
 /// ```
 ///
 /// RPython `externalvsinternal(rtyper, item_repr, gcref=False)`
-/// (rmodel.py:417-429).
+/// (rmodel.py).
 ///
 /// ```python
 /// def externalvsinternal(rtyper, item_repr, gcref=False):
@@ -4512,7 +4512,7 @@ pub(crate) fn getclassrepr_arc(
 /// introducing a module-level cycle. Callers in `rtuple.rs` /
 /// follow-on `rlist.rs` import this directly from `rclass`.
 ///
-/// `gcref=True` arm (rmodel.py:422-424) routes through
+/// `gcref=True` arm (rmodel.py) routes through
 /// `lltypesystem.rgcref.GCRefRepr.make`, matching upstream's generic
 /// GCREF storage for GC pointer items in containers.
 #[expect(
@@ -4575,7 +4575,7 @@ pub fn getinstancerepr(
 }
 
 /// RPython `rtype_new_instance(rtyper, classdef, llops,
-/// classcallhop=None, nonmovable=False)` (rclass.py:1078-1081):
+/// classcallhop=None, nonmovable=False)` (rclass.py):
 ///
 /// ```python
 /// def rtype_new_instance(rtyper, classdef, llops, classcallhop=None,
@@ -4596,7 +4596,7 @@ pub fn rtype_new_instance(
 }
 
 /// RPython `InstanceRepr.has_special_memory_pressure(self, tp)`
-/// (rclass.py:480-485):
+/// (rclass.py):
 ///
 /// ```python
 /// def has_special_memory_pressure(self, tp):
@@ -4620,7 +4620,7 @@ fn has_special_memory_pressure(tp: &LowLevelType) -> bool {
 }
 
 /// RPython `pairtype(InstanceRepr, InstanceRepr).convert_from_to((r_ins1,
-/// r_ins2), v, llops)` (rclass.py:1035-1055):
+/// r_ins2), v, llops)` (rclass.py):
 ///
 /// ```python
 /// def convert_from_to((r_ins1, r_ins2), v, llops):
@@ -4687,7 +4687,7 @@ pub(super) fn pair_instance_instance_convert_from_to(
 }
 
 /// RPython `pairtype(InstanceRepr, InstanceRepr).rtype_is_`
-/// (rclass.py:1057-1068):
+/// (rclass.py):
 ///
 /// ```python
 /// def rtype_is_((r_ins1, r_ins2), hop):
@@ -4779,7 +4779,7 @@ pub(super) fn pair_instance_instance_rtype_ne(
 }
 
 /// RPython `buildinstancerepr(rtyper, classdef, gcflavor='gc')`
-/// (`rclass.py:91-119`).
+/// (`rclass.py`).
 ///
 pub fn buildinstancerepr(
     rtyper: &Rc<RPythonTyper>,

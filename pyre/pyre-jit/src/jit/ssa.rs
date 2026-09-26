@@ -16,7 +16,7 @@ use super::flow::{
 
 /// One unification opportunity: a block input paired with the per-incoming-link
 /// actuals at that position.  RPython stores this as a flat list
-/// `[block, inputvar, *linkvars]` (`ssa.py:65`); the Rust port names the parts.
+/// `[block, inputvar, *linkvars]` (`ssa.py merge_identical_phi_nodes`); the Rust port names the parts.
 struct Opportunity {
     block: BlockRef,
     inputvar: FlowValue,

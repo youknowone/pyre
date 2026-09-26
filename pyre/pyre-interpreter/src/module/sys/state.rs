@@ -12,11 +12,11 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 /// Default recursion limit, matching CPython / PyPy. `Module.__init__`
 /// sets `self.recursionlimit = 1000` in the PyPy tree
-/// (`pypy/module/sys/moduledef.py:25`).
+/// (`pypy/module/sys/moduledef.py`).
 pub const DEFAULT_RECURSION_LIMIT: i32 = 1000;
 
 /// Hard upper bound for `sys.setrecursionlimit`, matching the silent
-/// clamp at `pypy/module/sys/vm.py:82-87`.
+/// clamp at `pypy/module/sys/vm.py`.
 pub const MAX_RECURSION_LIMIT: i32 = 1_000_000;
 
 /// `space.sys.recursionlimit` parity. `sys.setrecursionlimit` writes

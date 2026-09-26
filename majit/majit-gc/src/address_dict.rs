@@ -20,7 +20,7 @@ const SPREAD_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
 impl AddressHasher {
     /// `mangle_hash` states its own purpose: an aligned address has zeros in
     /// its *trailing* bits, so a table that indexes on those bits alone would
-    /// pile every key into the same bucket (`rpython/memory/support.py:10-14`).
+    /// pile every key into the same bucket (`rpython/memory/support.py`).
     /// `lldict` reuses `rdict`, which consumes the hash only that way, so the
     /// xor-shift is the whole job there.
     ///

@@ -163,7 +163,7 @@ fn build() -> Option<(i32, usize)> {
 
     let resume_pc = builder.current_pos();
     // `-live-` operands are 2-byte offsets into the ONE shared
-    // `MetaInterpStaticData.liveness_info` pool (`pyjitpl.py:2264`), so the
+    // `MetaInterpStaticData.liveness_info` pool (`pyjitpl.py`), so the
     // triple is interned there rather than in a private assembler buffer.
     let liveness_offset = crate::state::intern_liveness(&[], &[INSTANCE_REG as u8], &[])?;
     let live_patch = builder.live_placeholder();

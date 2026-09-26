@@ -28,7 +28,7 @@ pub struct NumRegs {
 /// `assembler.py` `class Assembler(object)`.
 ///
 /// Writer-side state, per-instance, matching `Assembler.__init__`
-/// (rpython/jit/codewriter/assembler.py:19-32) line-by-line. A fresh
+/// (rpython/jit/codewriter/assembler.py) line-by-line. A fresh
 /// `Assembler::new()` produces independent `all_liveness` /
 /// `all_liveness_positions` / `num_liveness_ops` /
 /// `indirectcalltargets`; upstream does the same — each `CodeWriter`
@@ -128,16 +128,16 @@ impl Assembler {
     }
 
     /// `assembler.py:19-32` `Assembler()` as `CodeWriter.__init__` builds it
-    /// (codewriter.py:21), for a codewriter that continues the build-time
+    /// (codewriter.py), for a codewriter that continues the build-time
     /// drain rather than starting a fresh one.
     ///
-    /// Upstream has one `Assembler` per program and `codewriter.py:73-86
+    /// Upstream has one `Assembler` per program and `codewriter.py
     /// make_jitcodes` runs every pending graph through it, so `all_liveness`
     /// is a single offset space. pyre assembles the extracted interpreter
     /// graphs in `build.rs` and the Python-bytecode graphs at runtime; the
     /// build-time offsets are baked into those jitcodes' `-live-` operands,
     /// and a resume decodes them against `metainterp_sd.liveness_info`
-    /// (`resume.py:1022`). Seeding the buffer with the build-time bytes is
+    /// (`resume.py`). Seeding the buffer with the build-time bytes is
     /// what keeps that one offset space: the baked offsets stay addressable
     /// and `_encode_liveness` hands out positions strictly above them.
     ///
@@ -263,7 +263,7 @@ impl Assembler {
     /// callinfocollection is empty (see
     /// [`super::call::CallInfoCollection`]) and the iteration is a
     /// no-op. The slot is preserved so `make_jitcodes` calls through
-    /// at exactly the same point as `codewriter.py:85`.
+    /// at exactly the same point as `codewriter.py`.
     pub fn finished(&mut self, callinfocollection: &super::call::CallInfoCollection) {
         let _ = callinfocollection;
         pyre_jit_trace::assembler::publish_state_from(
@@ -670,7 +670,7 @@ fn use_c_form(opname: &str) -> bool {
 /// call. **Do not wire this into production paths.** RPython's
 /// `CodeWriter` holds a single `Assembler` whose `all_liveness`,
 /// `all_liveness_positions`, and `num_liveness_ops` accumulate across
-/// every JitCode compiled in the session (`codewriter.py:19-22` /
+/// every JitCode compiled in the session (`codewriter.py` /
 /// `pyjitpl.py:2264`). A fresh `Assembler` per call splits the
 /// global liveness table and breaks that invariant.
 ///
@@ -986,7 +986,7 @@ fn dispatch_op(
             state.builder.goto_if_exception_mismatch(vtable, label_id);
         }
         "jit_merge_point" => {
-            // Upstream-orthodox 7-arg shape (jtransform.py:1690-1712 +
+            // Upstream-orthodox 7-arg shape (jtransform.py handle_jit_marker__jit_merge_point +
             // jtransform.py make_three_lists):
             //   [jd_index_const, greens_i, greens_r, greens_f,
             //    reds_i, reds_r, reds_f]
@@ -1156,7 +1156,7 @@ fn dispatch_op(
         // ops are emitted directly through the JitCodeBuilder rather than
         // routed through the SSARepr dispatch table.
         //
-        // RPython opname parity (jtransform.py:844-927, blackhole.py:1446-1493):
+        // RPython opname parity (jtransform.py:844-927, blackhole.py bhimpl_getfield_vable_i):  allow-line-citation
         // `kind = getkind(...)[0]` in jtransform.py forces single-char
         // suffix everywhere — `getfield_vable_i` / `_r` / `_f` and
         // `setfield_vable_i` / `_r` / `_f`. pyre's JitCodeBuilder methods
@@ -1574,7 +1574,7 @@ fn dispatch_op(
         // `walker_emit_int_div_domain_guards`' zero and `INT_MIN / -1`
         // `guard_false` pair from the `_ovf_zer` wrapper.
         // Per-OpCode opname dispatch for integer / float primitives —
-        // RPython `rpython/jit/metainterp/blackhole.py:459-723` defines
+        // RPython `rpython/jit/metainterp/blackhole.py bhimpl_int_add` defines
         // one `bhimpl_*` per opname; `assembler.py:162-222` routes each
         // via its own insns key. The SSARepr layer carries the
         // canonical opname so pyre dispatch picks the matching
@@ -2004,7 +2004,7 @@ fn dispatch_residual_call(
     );
 
     // Derive the dispatch branch
-    // from `stub.effect_info`. Mirrors `pyjitpl.py:1995-2126
+    // from `stub.effect_info`. Mirrors `pyjitpl.py do_residual_call
     // do_residual_call`'s precedence — the optimizer upstream picks
     // `call_may_force` / `call_release_gil` / `call_loopinvariant` /
     // `call_pure` from the same effectinfo bits, so pyre's pre-baked
@@ -2052,7 +2052,7 @@ fn dispatch_residual_call(
     // (`majit-metainterp/src/pyjitpl/dispatch.rs`) reads
     // `effectinfo.check_is_elidable()` and routes the result through
     // `record_result_of_call_pure` mirroring `pyjitpl.py`.
-    // ReleaseGil + Ref still panics per `resoperation.py:1243-1244 # no
+    // ReleaseGil + Ref still panics per `resoperation.py # no
     // such thing`.
     match (dispatch_kind, reskind) {
         (CallFlavor::ReleaseGil, ResKind::Ref) => {
@@ -2785,7 +2785,7 @@ mod tests {
         // Portal A — small jdindex ConstInt(0) lowers to `c` argcode
         // (insn_key arg[0] match: -128..=127 → 'c'). One
         // `jit_merge_point` per portal jitcode mirrors
-        // `jtransform.py:1690-1712` (which emits exactly one
+        // `jtransform.py handle_jit_marker__jit_merge_point` (which emits exactly one
         // `jit_merge_point` per portal); the assembler accumulates
         // both shapes across separate `assemble` calls.
         let mut portal_small = SSARepr::new("portal_small");
@@ -3630,7 +3630,7 @@ mod tests {
     // ported into `dispatch_op`, add a positive test that confirms its
     // descr lands on `BlackholeInterpBuilder.descrs` and that
     // `SwitchDictDescr._labels` → `BhDescr::Switch.dict` round-trips via
-    // the shared pool at `fix_labels()` time (blackhole.py:102-103).
+    // the shared pool at `fix_labels()` time (blackhole.py).
 
     /// `assembler.py:208-209` parity:
     /// ```python
@@ -3710,7 +3710,7 @@ mod tests {
 
         // `assembler.py:24` persists `indirectcalltargets` across every
         // `assemble()` call — the CodeWriter holds a single Assembler and
-        // the set accumulates for the whole build (codewriter.py:19-22).
+        // the set accumulates for the whole build (codewriter.py).
         assert_eq!(assembler.indirectcalltargets.len(), 3);
     }
 }

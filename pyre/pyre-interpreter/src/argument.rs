@@ -47,7 +47,7 @@ use crate::error::type_name_of;
 /// instantiates the `%s` substitution at raise time; if
 /// `object_functionstr` itself raises an async OperationError
 /// (SystemExit / KeyboardInterrupt via `findattr`'s
-/// `baseobjspace.py:881-884` re-raise), the async error preempts the
+/// `baseobjspace.py` re-raise), the async error preempts the
 /// TypeError and propagates as the actual exception PyPy raises.
 /// Pyre mirrors this by returning the async `PyError` verbatim
 /// instead of building the TypeError prefix.
@@ -83,7 +83,7 @@ pub fn raise_type_error(
 /// ```
 ///
 /// PyPy: `w_other.eq_w(w_key)` is the typed unicode method
-/// `pypy/objspace/std/unicodeobject.py:348-351`:
+/// `pypy/objspace/std/unicodeobject.py`:
 ///
 /// ```python
 /// def eq_w(self, w_other):
@@ -1963,7 +1963,7 @@ mod tests {
         assert_eq!(err.message_text(), "7 needs an iterable");
     }
 
-    /// pypy/interpreter/argument.py:534-552 single-missing positional case.
+    /// pypy/interpreter/argument.py getmsg single-missing positional case.
     #[test]
     fn arg_err_missing_one_positional() {
         let err = ArgErr::Missing {
@@ -2312,7 +2312,7 @@ mod tests {
         }
     }
 
-    /// pypy/interpreter/argument.py:464-501 `match_keywords` matches
+    /// pypy/interpreter/argument.py _match_keywords `match_keywords` matches
     /// keyword names against argnames + writes mapping.
     #[test]
     fn match_keywords_assigns_index() {

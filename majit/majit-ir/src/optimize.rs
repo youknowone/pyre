@@ -37,7 +37,7 @@ impl std::error::Error for SpeculativeError {}
 /// Used by `PtrInfo::getnullness` and `IntBound::getnullness` to
 /// report whether a slot is known null, known non-null, or unknown.
 /// Matches the upstream integer enum values exactly so majit code
-/// can be ported line-by-line from `optimizer.py:127` / `rewrite.py:496-503`
+/// can be ported line-by-line from `optimizer.py` / `rewrite.py:496-503`  allow-line-citation
 /// `_optimize_nullness` switches.
 pub const INFO_NULL: i8 = 0;
 pub const INFO_NONNULL: i8 = 1;

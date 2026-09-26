@@ -133,14 +133,14 @@ pub struct MIFrame {
     pub return_r: Option<usize>,
     pub return_f: Option<usize>,
     /// pyjitpl.py `MIFrame.greenkey` — set when this frame is a
-    /// recursive portal call (pyjitpl.py:80).
+    /// recursive portal call (pyjitpl.py).
     pub greenkey: Option<super::PortalGreenKey>,
     /// pyjitpl.py:91 `self._result_argcode = 'v'`.
     ///
     /// Single-byte argcode of the *previous* opimpl's result type
     /// (`b'i'` / `b'r'` / `b'f'` / `b'v'`).  Updated by call-recording
     /// opimpls before they advance the pc; consulted by `_try_tco`
-    /// (pyjitpl.py:1281) to decide whether the call's result type
+    /// (pyjitpl.py) to decide whether the call's result type
     /// matches a following `*_return` opcode.  Initialized to `b'v'`
     /// because a fresh frame's "previous opimpl" is the implicit
     /// frame setup (returns void).
@@ -183,7 +183,7 @@ impl MIFrame {
         // `MetaInterp::newframe`, `interpret`,
         // `trace_jitcode`, and inline-call dispatch should call
         // `MIFrame::setup(...)` below, which mirrors the rest of
-        // `pyjitpl.py:74-95`.
+        // `pyjitpl.py`.
         //
         // RPython `pyjitpl.py` `MIFrame.setup`:
         //   self.registers_i = [None] * jitcode.num_regs_and_consts_i()
@@ -761,7 +761,7 @@ impl MIFrame {
     /// `clear_result_register` selects the in_a_call clear strategy.
     /// When `true` the branch mints `history.CONST_FALSE` / `CONST_NULL`
     /// / `history.CONST_FZERO` inline-Const OpRefs and writes them into
-    /// the cleared register slot exactly as pyjitpl.py:188-192 does.
+    /// the cleared register slot exactly as pyjitpl.py does.
     /// Tests that only care about the snapshot output may pass `false` —
     /// the fallback path then substitutes `Box::Const*(0)` directly into
     /// the snapshot array (byte-identical to the structural path) but
@@ -971,7 +971,7 @@ impl MIFrame {
     /// Side-table snapshot counterpart of
     /// [`Self::get_list_of_active_boxes`].
     ///
-    /// This follows the same pyjitpl.py:177-234 control flow but returns
+    /// This follows the same pyjitpl.py control flow but returns
     /// `recorder::SnapshotTagged` entries for the legacy `TraceCtx`
     /// snapshot side table instead of writing opencoder byte arrays.
     pub fn get_list_of_active_snapshot_boxes(
@@ -1247,7 +1247,7 @@ impl MIFrame {
     ///             registers[i] = newbox
     /// ```
     ///
-    /// pyjitpl.py:240 dispatches on `oldbox.type` — `'i'` / `'r'` / `'f'`
+    /// pyjitpl.py dispatches on `oldbox.type` — `'i'` / `'r'` / `'f'`
     /// pick the matching register bank, the `else` arm is `assert 0,
     /// oldbox`. Pyre's OpRef does not carry a type tag at the call
     /// boundary, so the bank is selected by an explicit `oldbox_type`
@@ -1262,7 +1262,7 @@ impl MIFrame {
             Type::Int => &mut self.int_regs,
             Type::Float => &mut self.float_regs,
             Type::Ref => &mut self.ref_regs,
-            // pyjitpl.py:236-244 `else: assert 0, oldbox` — RPython rejects
+            // pyjitpl.py replace_active_box_in_frame `else: assert 0, oldbox` — RPython rejects
             // any box whose `type` attribute is not 'i' / 'r' / 'f'.
             // Mirroring that assertion strength keeps the contract: the
             // caller must resolve a typed Box; passing a Void-typed
@@ -1558,7 +1558,7 @@ mod tests {
     /// path) pushes live int / ref / float registers onto the trace's
     /// `_snapshot_array_data` in declaration order, returning the
     /// `new_array` offset. Tests with `after_residual_call=true` so the
-    /// LIVE op sits exactly at `self.pc` (pyjitpl.py:194-195).
+    /// LIVE op sits exactly at `self.pc` (pyjitpl.py).
     #[test]
     fn get_list_of_active_boxes_populates_trace_snapshot_array() {
         use crate::opencoder::{Box as OpBox, TraceRecordBuffer};
@@ -1882,7 +1882,7 @@ mod tests {
 
         frame.cleanup_registers();
 
-        // pyjitpl.py:121-127: int and float slots are untouched.
+        // pyjitpl.py cleanup_registers: int and float slots are untouched.
         assert_eq!(frame.int_regs[0], Some(OpRef::int_op(1)));
         assert_eq!(frame.int_values[0], Some(11));
         assert_eq!(frame.float_regs[0], Some(OpRef::float_op(3)));
@@ -2032,7 +2032,7 @@ mod tests {
     fn make_result_of_lastop_panics_on_recorded_resulttype_mismatch() {
         // Same writer setup as the matching variant — but the reader
         // passes `Ref` against a recorded `'i'`, which fires the
-        // RPython `pyjitpl.py:264` assertion port.
+        // RPython `pyjitpl.py` assertion port.
         use crate::JitCallArg;
         let mut builder = JitCodeBuilder::new();
         let fn_idx = builder.add_fn_ptr(std::ptr::dangling::<()>());

@@ -80,7 +80,7 @@ impl CannotInline {
 }
 
 /// `class CanRaise(object): def __init__(self, can_raise)` at
-/// `inline.py:18-20`. Upstream stores a single `bool` and uses the
+/// `inline.py`. Upstream stores a single `bool` and uses the
 /// instance as a sentinel returned by `collect_called_graphs` when
 /// the callee is opaque (e.g. `op.args[0]` of a `direct_call` whose
 /// `_obj` lookup failed).
@@ -132,7 +132,7 @@ impl PartialEq for CalledThing {
 }
 
 /// Predicate matcher passed to `iter_callsites(graph, calling_what)`
-/// at `inline.py:42-55`. Upstream accepts:
+/// at `inline.py`. Upstream accepts:
 ///
 /// * `None` — match every direct_call.
 /// * a `FunctionGraph` — match calls whose resolved callee
@@ -355,7 +355,7 @@ fn callable_name_matches(op: &SpaceOperation, name: &str) -> bool {
 }
 
 /// `does_raise_directly(graph, raise_analyzer)` at
-/// `inline.py:109-122`.
+/// `inline.py`.
 ///
 /// > this function checks, whether graph contains operations which
 /// > can raise and which are not exception guarded
@@ -390,7 +390,7 @@ pub fn does_raise_directly(graph: &GraphRef, raise_analyzer: &mut RaiseAnalyzer<
 }
 
 /// `any_call_to_raising_graphs(from_graph, translator,
-/// raise_analyzer)` at `inline.py:124-142`.
+/// raise_analyzer)` at `inline.py`.
 pub fn any_call_to_raising_graphs(
     from_graph: &GraphRef,
     translator: &TranslationContext,
@@ -471,7 +471,7 @@ fn op_weight(opname: &str) -> i64 {
 }
 
 /// `block_weight(block, weights=OP_WEIGHTS)` at
-/// `inline.py:478-488`.
+/// `inline.py`.
 ///
 /// ```python
 /// def block_weight(block, weights=OP_WEIGHTS):
@@ -580,7 +580,7 @@ pub enum InlinableCallerEntry {
 }
 
 /// `inlinable_static_callers(graphs, store_calls=False,
-/// ok_to_call=None)` at `inline.py:546-567`.
+/// ok_to_call=None)` at `inline.py`.
 ///
 /// ```python
 /// def inlinable_static_callers(graphs, store_calls=False, ok_to_call=None):
@@ -924,7 +924,7 @@ pub enum InlineFuncTarget {
 }
 
 /// Cache key for upstream `BaseInliner._passon_vars` at
-/// `inline.py:241-246`. The dict is keyed by either a `Block`
+/// `inline.py`. The dict is keyed by either a `Block`
 /// (the common case) or an `int` (fallback used inside
 /// `generic_exception_matching` at `:362`).
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1535,7 +1535,7 @@ impl<'t> BaseInliner<'t> {
     }
 
     /// `inline_once(self, block, index_operation)` at
-    /// `inline.py:193-210`.
+    /// `inline.py`.
     ///
     /// Resets per-call state, captures the call op + callee graph,
     /// performs the exception-guarded check, and dispatches to
@@ -1661,7 +1661,7 @@ impl<'t> BaseInliner<'t> {
     }
 
     /// `do_inline(self, block, index_operation)` at
-    /// `inline.py:392-430`.
+    /// `inline.py`.
     ///
     /// Splits the host block at `index_operation`, copies the
     /// callee's start block, threads call args through the
@@ -1865,7 +1865,7 @@ impl<'t> BaseInliner<'t> {
     }
 
     /// `rewire_exceptblock(self, afterblock)` at
-    /// `inline.py:298-308`. Dispatcher between guarded and
+    /// `inline.py`. Dispatcher between guarded and
     /// non-guarded variants.
     fn rewire_exceptblock(&mut self, afterblock: &crate::flowspace::model::BlockRef) {
         let graph_to_inline = self
@@ -1893,7 +1893,7 @@ impl<'t> BaseInliner<'t> {
     }
 
     /// `rewire_exceptblock_no_guard(self, afterblock,
-    /// copiedexceptblock)` at `inline.py:310-324`.
+    /// copiedexceptblock)` at `inline.py`.
     ///
     /// For each entry-link of the inlined exceptblock, rewire the
     /// corresponding link in the *copied* graph to bypass
@@ -1995,7 +1995,7 @@ impl<'t> BaseInliner<'t> {
     }
 
     /// `Inliner.__init__(translator, graph, inline_func,
-    /// lltype_to_classdef, ...)` at `inline.py:439-459`.
+    /// lltype_to_classdef, ...)` at `inline.py`.
     ///
     /// ```python
     /// class Inliner(BaseInliner):
@@ -2135,7 +2135,7 @@ pub fn inline_function<'t>(
 }
 
 /// `simple_inline_function(translator, inline_func, graph)` at
-/// `inline.py:82-86`.
+/// `inline.py`.
 ///
 /// ```python
 /// def simple_inline_function(translator, inline_func, graph):
@@ -2176,7 +2176,7 @@ pub fn simple_inline_function(
 // `auto_inline_graphs` (`:715-731`).
 
 /// `instrument_inline_candidates(graphs, threshold)` at
-/// `inline.py:569-602`.
+/// `inline.py`.
 ///
 /// ```python
 /// def instrument_inline_candidates(graphs, threshold):
@@ -2328,7 +2328,7 @@ pub fn instrument_inline_candidates(
 }
 
 /// Heap entry for [`auto_inlining`] mirroring upstream's
-/// `(weight, -len(callers), graph)` tuple at `inline.py:624` /
+/// `(weight, -len(callers), graph)` tuple at `inline.py` /
 /// `:647` / `:700`. Upstream's `heapq` is a min-heap; pyre uses
 /// `BinaryHeap` (max-heap) wrapped in `Reverse` to recover min-first
 /// ordering. The third tie-breaker is graph identity — pyre orders
@@ -2367,7 +2367,7 @@ impl Ord for AutoInliningHeapEntry {
 
 /// `auto_inlining(translator, threshold, callgraph=None,
 /// call_count_pred=None, heuristic=inlining_heuristic)` at
-/// `inline.py:608-713`.
+/// `inline.py`.
 ///
 /// Heap-driven driver that repeatedly picks the lowest-weight graph
 /// from the call graph and inlines it into every parent that still
@@ -2679,7 +2679,7 @@ pub fn auto_inlining(
 
 /// `auto_inline_graphs(translator, graphs, threshold,
 /// call_count_pred=None, heuristic=inlining_heuristic,
-/// inline_graph_from_anywhere=False)` at `inline.py:715-731`.
+/// inline_graph_from_anywhere=False)` at `inline.py`.
 ///
 /// ```python
 /// def auto_inline_graphs(translator, graphs, threshold, call_count_pred=None,

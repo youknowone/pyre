@@ -14,7 +14,7 @@ use majit_ir::{GcRef, Op, OpCode, OpRc, OpRef, Value};
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
-/// pure.py:104,204-210: extra_call_pure entry.
+/// pure.py: extra_call_pure entry.
 /// RPython stores AbstractResOp (or PreambleOp) directly in the list.
 /// isinstance(old_op, PreambleOp) check → force_op_from_preamble → replace.
 #[derive(Clone, Debug)]
@@ -49,7 +49,7 @@ impl PureOpKey<Operand> {
     }
 }
 
-/// pure.py:213: known_result_call_pure entry.
+/// pure.py: known_result_call_pure entry.
 /// RPython stores the full RECORD_KNOWN_RESULT op and compares by descr +
 /// _same_args(known_op, query_op, 1, start_index). We pre-extract the
 /// fields to avoid storing a dummy PureOpKey with an opcode.
@@ -252,7 +252,7 @@ impl RecentPureOps {
             if k.descr_identity != descr_identity {
                 continue;
             }
-            // pure.py:62 — box0.same_box(get_box_replacement(op.getarg(0)))
+            // pure.py — box0.same_box(get_box_replacement(op.getarg(0)))
             if same_box(arg0, &k.args[0]) {
                 return result.as_direct().map(|r| (k.opcode, r));
             }
@@ -477,7 +477,7 @@ pub struct OptPure {
     /// RPython lookup: descr + _same_args(known_op, op, 1, start_index).
     /// We store (descr_identity, args_from_1, result) — no opcode comparison.
     known_result_call_pure: Vec<KnownResultEntry>,
-    /// pure.py:104: extra_call_pure — CALL_PURE results from the previous
+    /// pure.py: extra_call_pure — CALL_PURE results from the previous
     /// loop iteration and preamble import. May contain PreambleOp entries
     /// (RPython isinstance check → force_op_from_preamble → replace in-place).
     extra_call_pure: Vec<ExtraCallPureEntry>,
@@ -716,7 +716,7 @@ impl OptPure {
         &self.call_pure_positions
     }
 
-    /// pure.py:211-220 — check known_result_call_pure for a matching call.
+    /// pure.py — check known_result_call_pure for a matching call.
     ///
     /// RPython iterates known_result_call_pure and compares:
     ///   `op.getdescr() is not known_result_op.getdescr()` → descr check
@@ -804,7 +804,7 @@ impl OptPure {
 
     /// Hand a released `postponed_op` to the passes AFTER OptPure.
     ///
-    /// pure.py:139-155 releases the postponed OVF op as the
+    /// pure.py releases the postponed OVF op as the
     /// `DefaultOptimizationResult.op`, so `send_extra_operation`
     /// (optimizer.py) carries it to `opt.next_optimization` —
     /// OptEarlyForce and then OptHeap — exactly like any other op OptPure
@@ -835,7 +835,7 @@ impl OptPure {
             return false;
         }
         for (j, i) in (start_index2..).zip(start_index1..op1_args.len()) {
-            // pure.py:240-247 — same_box(op1_args[i], op2_args[j])
+            // pure.py — same_box(op1_args[i], op2_args[j])
             // applies `get_box_replacement` to both sides, then dispatches
             // identity vs Const value equality (`history.py`).
             if !ctx.same_box(op1_args[i], op2_args[j]) {
@@ -860,7 +860,7 @@ impl OptPure {
         start_index: usize,
         ctx: &OptContext,
     ) -> bool {
-        // pure.py:250-251: descr identity check.
+        // pure.py: descr identity check.
         if op_descr_identity != old_op_descr_identity {
             return false;
         }
@@ -872,7 +872,7 @@ impl OptPure {
         if op.opcode.result_type() != old_op_opcode.result_type() {
             return false;
         }
-        // pure.py:254: old_start_index = OpHelpers.is_cond_call_value(old_op.opnum)
+        // pure.py: old_start_index = OpHelpers.is_cond_call_value(old_op.opnum)
         let old_start_index = if old_op_opcode.is_cond_call_value() {
             1
         } else {
@@ -983,7 +983,7 @@ impl Optimization for OptPure {
         // trace — so this reset is defensive rather than load-bearing.
         //
         // Consuming it on a removal is what upstream does too: the callback
-        // rides on the result object `emit_result` built (pure.py:30-33), and
+        // rides on the result object `emit_result` built (pure.py), and
         // that object stays in `opt_results` whatever a later pass decides. It
         // then appends `len(_newoperations) - 1`, which for a removed call
         // names a different op — an exposure both implementations carry.
@@ -1050,7 +1050,7 @@ impl Optimization for OptPure {
                 }
                 // Record and emit both the OVF op and the guard.
                 self.cache.borrow_mut().insert(key, postponed.pos().get());
-                // pure.py:321-322 walks `_newoperations` for is_ovf followed
+                // pure.py walks `_newoperations` for is_ovf followed
                 // by GUARD_NO_OVERFLOW; do not keep a parallel candidate list.
                 self.emit_postponed_downstream(postponed, ctx);
                 return OptimizationResult::PassOn; // guard passes through
@@ -1088,7 +1088,7 @@ impl Optimization for OptPure {
         }
 
         if op.opcode.is_always_pure() {
-            // pure.py:121-136:
+            // pure.py:
             //     for i in range(op.numargs()):
             //         if self.get_constant_box(op.getarg(i)) is None:
             //             break
@@ -1102,7 +1102,7 @@ impl Optimization for OptPure {
                     .is_some()
             });
             if all_args_const {
-                // Upstream `pure.py:130-136 for...else:` calls
+                // Upstream `pure.py for...else:` calls
                 // `optimizer.constant_fold(op)` unconditionally and
                 // feeds the result straight into `make_constant`.
                 // Pyre's `constant_fold` now narrows to two
@@ -1110,7 +1110,7 @@ impl Optimization for OptPure {
                 //   1. `protect_speculative_operation`'s
                 //      `supports_guard_gc_type == false` gate on
                 //      memory-reading folds (mod.rs).  Upstream's
-                //      comment at `optimizer.py:822-825` skips
+                //      comment at `optimizer.py` skips
                 //      unrolling in that mode; pyre's
                 //      `constant_fold` runs outside unroll too, so
                 //      the fold itself must decline.
@@ -1163,7 +1163,7 @@ impl Optimization for OptPure {
             let start_index: usize = if op.opcode.is_cond_call_value() { 1 } else { 0 };
             let op_descr_identity = op.getdescr().as_ref().map(majit_ir::descr::descr_identity);
 
-            // pure.py:191-196: _can_optimize_call_pure(op, start_index=1).
+            // pure.py: _can_optimize_call_pure(op, start_index=1).
             if let Some(value) = self.lookup_call_pure_result(op, start_index, ctx) {
                 let b = ctx.materialize_operand_at(op.pos().get());
                 ctx.make_constant_box(&b, value);
@@ -1171,7 +1171,7 @@ impl Optimization for OptPure {
                 return OptimizationResult::Remove;
             }
 
-            // pure.py:200-203: iterate call_pure_positions, try
+            // pure.py: iterate call_pure_positions, try
             // optimize_call_pure_old with adjusted start_index.
             for &pos in &self.call_pure_positions {
                 if let Some(old_op) = ctx.new_operations.get(pos) {
@@ -1199,7 +1199,7 @@ impl Optimization for OptPure {
                     }
                 }
             }
-            // pure.py:204-210: iterate extra_call_pure entries.
+            // pure.py: iterate extra_call_pure entries.
             //   if isinstance(old_op, PreambleOp):
             //       old_op = self.optimizer.force_op_from_preamble(old_op)
             //       self.extra_call_pure[i] = old_op
@@ -1254,7 +1254,7 @@ impl Optimization for OptPure {
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
-            // pure.py:211-220: known_result_call_pure.
+            // pure.py: known_result_call_pure.
             if let Some(result_ref) = self.lookup_known_result(op, start_index, ctx) {
                 let b_old = Operand::from_bound_op(op_rc);
                 let b_result = ctx.get_box_replacement_operand(result_ref);
@@ -1272,7 +1272,7 @@ impl Optimization for OptPure {
             // the one-shot instead and record the true index in
             // `propagate_postprocess`, mirroring the callback's post-emit fire.
             self.pending_call_pure_position = true;
-            // pure.py:225,227 route the emitted op through `self.emit`, i.e.
+            // pure.py route the emitted op through `self.emit`, i.e.
             // the passes downstream of OptPure (earlyforce, heap). Returning
             // `Replace` continues the op through those remaining passes, so
             // OptHeap.emit() still runs — flushing any postponed comparison op
@@ -1280,11 +1280,11 @@ impl Optimization for OptPure {
             // skip OptHeap, stranding a postponed comparison whose result this
             // call consumes past its own definition (regalloc def-after-use).
             if start_index == 0 {
-                // pure.py:222-225: replace CALL_PURE with CALL.
+                // pure.py: replace CALL_PURE with CALL.
                 let new_op = self.demote_call_pure(op);
                 return OptimizationResult::Replace(new_op);
             } else {
-                // pure.py:226-227: COND_CALL_VALUE is NOT demoted.
+                // pure.py: COND_CALL_VALUE is NOT demoted.
                 return OptimizationResult::Replace(op.clone());
             }
         }
@@ -1896,7 +1896,7 @@ mod tests {
     #[test]
     fn test_call_pure_r_demoted() {
         // CallPureR / CallR carry RPython `RefOp.type = 'r'` parity
-        // (resoperation.py:638): the result is a Ref-typed Box, and
+        // (resoperation.py): the result is a Ref-typed Box, and
         // the function-pointer arg is also Ref-typed.
         let mut b = crate::history::test_support::TraceBuilder::new();
         let funcptr = b.input(Type::Ref, 0);
@@ -2291,7 +2291,7 @@ mod tests {
     #[test]
     fn test_call_pure_f_n_demoted() {
         // CallPureF / CallF carry RPython `FloatOp.type = 'f'` parity
-        // (resoperation.py:589). CallPureN / CallN are void-result —
+        // (resoperation.py). CallPureN / CallN are void-result —
         // `AbstractResOp.type = 'v'` (resoperation.py) — and pyre
         // mints them as `OpRef::VoidOp(pos)` whose `ty()` is
         // `Some(Type::Void)`.
@@ -2711,7 +2711,7 @@ mod tests {
         );
     }
 
-    /// pure.py:62 / :72-74 same_box semantics for constant args.
+    /// pure.py / :72-74 same_box semantics for constant args.
     /// history.py / :251 — `same_box(a, b) == same_constant(a, b)`
     /// for Const subclasses, so cache hits are value-equality. With
     /// inline `ConstInt.value`, two `make_constant_int(5)` calls return
@@ -2828,7 +2828,7 @@ mod tests {
         pass.set_extra_call_pure(vec![(args.clone(), OpRef::int_op(50))]);
 
         // extra_call_pure entries are searched via optimize_call_pure_old
-        // in the CALL_PURE handler (pure.py:204-210), not via
+        // in the CALL_PURE handler (pure.py), not via
         // lookup_known_result (which only searches known_result_call_pure).
         let key = super::PureOpKey {
             opcode: OpCode::CallPureI,
@@ -2855,7 +2855,7 @@ mod tests {
         let b101 = ctx.materialize_operand_at(OpRef::int_op(101));
         let b999 = ctx.materialize_operand_at(OpRef::int_op(999));
 
-        // pure.py:214: self.known_result_call_pure.append(op)
+        // pure.py: self.known_result_call_pure.append(op)
         pass.known_result_call_pure.push(super::KnownResultEntry {
             descr_identity: None,
             args: vec![OpRef::int_op(100), OpRef::int_op(101)],
@@ -3065,7 +3065,7 @@ mod tests {
         let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
 
-        // Only `_newoperations` (pure.py:317) makes the producer a candidate.
+        // Only `_newoperations` (pure.py) makes the producer a candidate.
         ctx.push_new_operation(OpRc::new(op.clone()));
         pass.propagate_postprocess(&op, &mut ctx);
 
@@ -3127,7 +3127,7 @@ mod tests {
             }
             other => panic!("expected demoted call routed via Replace, got {other:?}"),
         };
-        // pure.py:323-338 reads the demoted CALL out of `_newoperations`
+        // pure.py reads the demoted CALL out of `_newoperations`
         // at `call_pure_positions`.
         ctx.push_new_operation(OpRc::new(emitted.clone()));
         pass.propagate_postprocess(&emitted, &mut ctx);

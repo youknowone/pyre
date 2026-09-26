@@ -31,19 +31,19 @@
 //!
 //! * Remaining `pairtype(IntegerRepr, IntegerRepr)` helpers outside the
 //!   currently landed arithmetic/comparison/direct-call subset
-//!   (`rint.py:200-614`), e.g. `divmod` and low-level helper execution
+//!   (`rint.py`), e.g. `divmod` and low-level helper execution
 //!   details that require the wider rtyper/annlowlevel port.
 //! * Full exception-class matching for `_rtype_call_helper` and
 //!   `rtype_chr` / `rtype_unichr` (`has_implicit_exception(ValueError)`,
 //!   `ZeroDivisionError`, etc.) — the method structure is in place, but
-//!   `rtyper.py:713-729` still needs `exceptiondata.py` parity.
+//!   `rtyper.py` still needs `exceptiondata.py` parity.
 //! * `rtype_hex` / `rtype_oct` / `rtype_bin` (`rint.py`) — require
 //!   `lltypesystem/ll_str.py` (`ll_int2hex/oct/bin`).
 //! * `ll_str` / `ll_hash_int` / `ll_hash_long_long` / `ll_eq_shortint`
-//!   (`rint.py:149-152,619-627`) — land with `rdict.py` (needs
+//!   (`rint.py`) — land with `rdict.py` (needs
 //!   `get_ll_{eq,hash}_function`) + `annlowlevel.llstr`.
 //! * `get_ll_{eq,ge,gt,lt,le,hash,fasthash,dummyval}_function`
-//!   (`rint.py:39-64`) — require trait slots absent from pyre's `Repr`.
+//!   (`rint.py`) — require trait slots absent from pyre's `Repr`.
 
 #![allow(non_camel_case_types)]
 
@@ -231,7 +231,7 @@ impl Repr for IntegerRepr {
     ///
     /// Pyre maps `Bool` through the same primitive cast: `True` becomes
     /// integer `1`, `False` becomes integer `0`. The `Symbolic` branch
-    /// (rint.py:26-27 `if isinstance(value, objectmodel.Symbolic): return
+    /// (rint.py `if isinstance(value, objectmodel.Symbolic): return
     /// value`) carries `llmemory` address offsets through unchanged; the
     /// concrete byte size is resolved only at code emission.
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
@@ -559,7 +559,7 @@ pub fn unsigned_repr() -> Arc<IntegerRepr> {
 }
 
 /// RPython `signedlonglong_repr = getintegerrepr(SignedLongLong, 'llong_')`
-/// (`rint.py:194`).
+/// (`rint.py`).
 pub fn signedlonglong_repr() -> Arc<IntegerRepr> {
     static REPR: OnceLock<Arc<IntegerRepr>> = OnceLock::new();
     REPR.get_or_init(|| {
@@ -585,7 +585,7 @@ pub fn signedlonglonglong_repr() -> Arc<IntegerRepr> {
 }
 
 /// RPython `unsignedlonglong_repr = getintegerrepr(UnsignedLongLong, 'ullong_')`
-/// (`rint.py:197`).
+/// (`rint.py`).
 pub fn unsignedlonglong_repr() -> Arc<IntegerRepr> {
     static REPR: OnceLock<Arc<IntegerRepr>> = OnceLock::new();
     REPR.get_or_init(|| {
@@ -1227,7 +1227,7 @@ pub fn ll_check_unichr(n: i64) -> Result<(), TyperError> {
 }
 
 /// RPython `_integer_reprs = {}` + `getintegerrepr(lltype, prefix=None)`
-/// (`rint.py:176-183`).
+/// (`rint.py`).
 ///
 /// Returns the cached singleton for each lltype. The standard integer
 /// lltypes use their module-level singleton accessors, and any other
@@ -1422,7 +1422,7 @@ mod tests {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
 
-        // rint.py:202-213 — word-sized inputs promoted for an rbigint
+        // rint.py convert_from_to — word-sized inputs promoted for an rbigint
         // LONG_TYPE/ULONG_TYPE operation go through the generic
         // `cast_primitive` arm with the exact 128-bit result lltype.
         for (from, to, source_lltype, expected_lltype) in [
@@ -1459,7 +1459,7 @@ mod tests {
             );
         }
 
-        // rint.py:314-338 — arithmetic itself selects the result repr's
+        // rint.py _rtype_template — arithmetic itself selects the result repr's
         // `lllong_` / `ulllong_` prefix, never the word-sized `int_` family.
         for (known, repr, expected_opname) in [
             (
@@ -1585,7 +1585,7 @@ mod tests {
         );
     }
 
-    /// rint.py:50-54 — wider widths emit a single `cast_*_to_int` op.
+    /// rint.py get_ll_hash_function — wider widths emit a single `cast_*_to_int` op.
     #[test]
     fn integer_repr_get_ll_hash_function_unsigned_emits_cast_uint_to_int() {
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -1658,7 +1658,7 @@ mod tests {
             .expect("second getrepr(SomeInteger Int)");
         assert!(Arc::ptr_eq(&r, &r2));
 
-        // rint.py:190-191 — key is `(class, knowntype)`; r_uint keys
+        // rint.py rtyper_makekey — key is `(class, knowntype)`; r_uint keys
         // resolve to the distinct `unsigned_repr` singleton.
         let s_uint = SomeValue::Integer(SomeInteger::new(false, true));
         let r_uint = rtyper.getrepr(&s_uint).expect("getrepr(SomeInteger Ruint)");
@@ -1739,7 +1739,7 @@ mod tests {
 
     #[test]
     fn rtype_abs_ovf_signed_uses_ll_int_abs_ovf_direct_call() {
-        // rint.py:100-105 + rint.py:344-387.
+        // rint.py rtype_abs_ovf + rint.py _rtype_call_helper.
         use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
 
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -1781,7 +1781,7 @@ mod tests {
 
     #[test]
     fn rtype_neg_ovf_unsigned_delegates_to_unsigned_neg_without_exception() {
-        // rint.py:123-130 — unsigned neg_ovf is supported and becomes
+        // rint.py rtype_neg_ovf — unsigned neg_ovf is supported and becomes
         // the same `0 - x` lowering as rtype_neg.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
@@ -1813,7 +1813,7 @@ mod tests {
 
     #[test]
     fn rtype_chr_emits_cast_int_to_char_like_rint() {
-        // rint.py:67-74. With no exceptionlinks, has_implicit_exception
+        // rint.py rtype_chr. With no exceptionlinks, has_implicit_exception
         // returns false and the check helper is not emitted.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));

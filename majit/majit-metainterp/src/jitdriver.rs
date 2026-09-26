@@ -930,7 +930,7 @@ fn kind_counts(vars: &[JitDriverVar], kind: VarKind) -> (usize, usize, usize) {
 /// (codegen / `declare_schema` drift would otherwise silently
 /// install a misshaped dispatch JitCode).
 ///
-/// Translation-time assertion surface — `pyjitpl.py:1530
+/// Translation-time assertion surface — `pyjitpl.py verify_green_args
 /// verify_green_args` + `warmspot.py make_args_specification`
 /// fail loudly when the dispatch JitCode's `BC_JIT_MERGE_POINT`
 /// payload disagrees with the driver schema.  Pyre keeps the same
@@ -955,7 +955,7 @@ where
     // into a body record it at the position they reserve for the opcode:
     // `JitCodeBuilder::jit_merge_point` on the proc-macro route, and
     // `Assembler::encode_op`'s `JitMergePoint` arm on the LLBC one.  No
-    // byte-stream scan — mirrors RPython `blackhole.py:107-156` argcode-based
+    // byte-stream scan — mirrors RPython `blackhole.py handler` argcode-based
     // decode (operand bytes that happen to equal `BC_JIT_MERGE_POINT(_C)`
     // cannot trigger a false-positive payload validation).  Pre-Merge-
     // Point body-local lets and other lowerer-emitted prefix opcodes
@@ -1188,7 +1188,7 @@ fn build_jitcode_registry(
 /// `compile.py:431` truncates `loop.inputargs` to `jitdriver_sd.num_red_args`
 /// and `compile.py:429` reads the virtualizable out of that prefix by
 /// `index_of_virtualizable`. Both spellings work upstream because the compiled
-/// entry is invoked with exactly the jitdriver's reds (`warmstate.py:387
+/// entry is invoked with exactly the jitdriver's reds (`warmstate.py execute_assembler
 /// execute_assembler`) and the virtualizable is one of them
 /// (`warmspot.py jd.index_of_virtualizable = jitdriver.reds.index(vname)`).
 ///
@@ -1268,7 +1268,7 @@ pub struct JitDriverStaticData {
     ///
     /// Address of the portal_runner C function — the funcbox for
     /// `do_recursive_call`'s residual CALL_ASSEMBLER op
-    /// (pyjitpl.py:1428-1429).
+    /// (pyjitpl.py).
     pub portal_runner_adr: i64,
     /// jitdriver.py:16 + warmspot.py:520-545 `jd.virtualizable_info`.
     ///
@@ -1287,7 +1287,7 @@ pub struct JitDriverStaticData {
     ///
     /// Per-driver `GreenFieldInfo` populated when `jd.jitdriver.greens`
     /// contains a dotted name.  Read by `_do_jit_force_virtual`
-    /// (pyjitpl.py:2156) — the bail check fires when both this slot
+    /// (pyjitpl.py) — the bail check fires when both this slot
     /// and `virtualizable_info` are None.
     pub greenfield_info: Option<crate::greenfield::GreenFieldInfo>,
     /// jitdriver.py:28 + warmspot.py:529/538 `jd.index_of_virtualizable`.
@@ -1332,7 +1332,7 @@ pub struct JitDriverStaticData {
     ///
     /// `warmspot.py:558` sets True when the codewriter has not emitted a
     /// `loop_header` op for this driver — read by `MIFrame.opimpl_jit_
-    /// merge_point` (`pyjitpl.py:1571-1574`) to skip the implicit
+    /// merge_point` (`pyjitpl.py`) to skip the implicit
     /// `can_enter_jit` check at the merge point.
     ///
     /// Default `false` matches upstream's "attribute absent until
@@ -1589,7 +1589,7 @@ impl JitDriverStaticData {
     /// Upstream-canonical name; alias of [`Self::num_greens`]. Matches
     /// `warmspot.py` `jd.num_green_args = len(jd._green_args_spec)`
     /// callers (`compile.py` `compile_tmp_callback`,
-    /// `pyjitpl.py:1530-1535` green-constant assertion).
+    /// `pyjitpl.py verify_green_args` green-constant assertion).
     pub fn num_green_args(&self) -> usize {
         self.num_greens()
     }
@@ -1841,7 +1841,7 @@ pub struct JitDriver<S: JitState> {
     /// Upstream needs no such flag: `reached_loop_header`
     /// (pyjitpl.py) re-attempts `compile_trace` on every loop-header
     /// visit while `not self.partial_trace`, and never writes `self.resumekey`
-    /// outside session start (pyjitpl.py:2905 / 2939). majit latches the
+    /// outside session start (pyjitpl.py / 2939). majit latches the
     /// declined attempt instead, so the latch needs storage of its own --
     /// clearing `bridge_info` to express it also destroys the class that
     /// `compile.py resumekey.compile_and_attach` dispatches on.
@@ -2229,7 +2229,7 @@ impl<S: JitState> JitDriver<S> {
     /// by the macro-generated `__JitMeta::install_canonical_liveness`.
     /// `__trace_<fn>` clones this singleton for every trace iteration;
     /// resume-side `resolve_jitcode` closures clone it for the root frame
-    /// (`resume.py:1338-1340`).
+    /// (`resume.py`).
     ///
     /// RPython parity: `metainterp_sd.jitcodes[portal_jd.index]` global
     /// registry slot assignment, scoped to the per-`#[jit_interp]` driver.
@@ -2290,7 +2290,7 @@ impl<S: JitState> JitDriver<S> {
         //
         // Both directions, as upstream sets them: the driver's static data owns
         // the portal JitCode, and the portal JitCode names its driver back.
-        // `call.py:46-47 jd.index = idx` is this driver's own slot — the macro's
+        // `call.py jd.index = idx` is this driver's own slot — the macro's
         // install pipeline runs `ensure_descriptor_registered` before reaching
         // here, so it is assigned. Fall back to the single-portal slot 0 only
         // when a consumer skipped that step.
@@ -2301,7 +2301,7 @@ impl<S: JitState> JitDriver<S> {
         }
         let portal_jd_index = self.index().unwrap_or(0);
         // The back-pointer is what makes this jitcode a *portal* jitcode to
-        // every reader of `JitCode::jitdriver_sd`: `pyjitpl.py:2451
+        // every reader of `JitCode::jitdriver_sd`: `pyjitpl.py is_main_jitcode
         // is_main_jitcode`, `pyjitpl.py _try_tco`'s portal-frame opt-out,
         // and `blackhole.py:1764`'s walk up a blackhole chain, which without it
         // runs off the bottom of a `#[jit_interp]` frontend's chain instead of
@@ -2335,7 +2335,7 @@ impl<S: JitState> JitDriver<S> {
 
     /// pyjitpl.py:3294 `self.jitdriver_sd.mainjitcode` — this driver's portal
     /// JitCode. Returns `None` until `register_dispatch_jitcode` has been
-    /// called; upstream has no such window, since `call.py:145-148` assigns
+    /// called; upstream has no such window, since `call.py grab_initial_jitcodes` assigns
     /// every driver's `mainjitcode` before the metainterp ever runs.
     pub fn dispatch_jitcode(&self) -> Option<&std::sync::Arc<crate::jitcode::JitCode>> {
         self.meta.mainjitcode_of(self.portal_jd_index?)
@@ -2650,7 +2650,7 @@ impl<S: JitState> JitDriver<S> {
     /// [`JitDriver::ensure_descriptor_registered`] once per consumer
     /// startup, before the dispatch JitCode body is built (which bakes
     /// `jd.index` into `BC_JIT_MERGE_POINT` / `BC_LOOP_HEADER` payloads —
-    /// see `jtransform.py:1704, :1716`).
+    /// see `jtransform.py, :1716`).
     pub fn register_descriptor(&mut self, jd: JitDriverStaticData) -> usize {
         self.register_descriptor_with_index(jd, None)
     }
@@ -3132,7 +3132,7 @@ impl<S: JitState> JitDriver<S> {
             // "declined before running anything" and sends the caller to the
             // source-pc handoff: the chain has already executed the aborted
             // opcodes' tails against the real heap, so that handoff would run
-            // them twice.  Upstream cannot reach this — `blackhole.py:1799
+            // them twice.  Upstream cannot reach this — `blackhole.py
             // convert_and_run_from_pyjitpl` does not return, it propagates the
             // exception out to `warmspot.py handle_jitexception` — so
             // ending the dispatch loop is the closest non-replaying answer.
@@ -3669,7 +3669,7 @@ impl<S: JitState> JitDriver<S> {
     /// ```
     ///
     /// Split out of the `TraceAction::SegmentedLoop` arm so the arm can host
-    /// the bridge else-arm (pyjitpl.py:1665-1668) beside it without the two
+    /// the bridge else-arm (pyjitpl.py) beside it without the two
     /// compiles pushing the shared handoff and blackhole tail apart.
     fn compile_segmented_loop(&mut self, meta: S::Meta) {
         let Some(green_key) = self.meta.compile_simple_loop(meta) else {
@@ -3694,7 +3694,7 @@ impl<S: JitState> JitDriver<S> {
                  compiled_loops has the new CompiledEntry",
             )
             .live_token();
-        // `warmstate.py:339-348` redirect+record_jump_to chain routed
+        // `warmstate.py attach_procedure_to_interp` redirect+record_jump_to chain routed
         // through MetaInterp's caller-side helper.  Skip the redirect when
         // MemoryManager has already evicted the freshly-installed token
         // (rare; eviction is independent of this insertion path).
@@ -3864,7 +3864,7 @@ impl<S: JitState> JitDriver<S> {
                 TraceAction::Continue => {}
                 TraceAction::CompileTrace => {
                     // Successful compile-into-existing-target: raise_if_successful()
-                    // raises ContinueRunningNormally (pyjitpl.py:3095-3123), which
+                    // raises ContinueRunningNormally (pyjitpl.py), which
                     // bypasses the `except SwitchToBlackhole` handler, so only the
                     // successful live history teardown runs — `aborted_tracing`
                     // accounting is NOT reached on success (the loop/bridge counter
@@ -3930,7 +3930,7 @@ impl<S: JitState> JitDriver<S> {
                     // not native `state`), before `compile_loop` drains the ctx. The
                     // macro hook writes them into native `state` so the compiled loop
                     // resumes at S_{k+1} instead of re-executing the peeled iteration
-                    // (pyjitpl.py:2982-2989 live_arg_boxes += virtualizable_boxes).
+                    // (pyjitpl.py live_arg_boxes += virtualizable_boxes).
                     // `None` when the state has no virtualizable array.
                     let virt_elems = self
                         .meta
@@ -3939,7 +3939,7 @@ impl<S: JitState> JitDriver<S> {
                     if let Some(elems) = virt_elems {
                         self.meta.single_pass_virt_array_values = Some(elems);
                     }
-                    // pyjitpl.py:2974-2989: `live_arg_boxes` is built ONCE, here at
+                    // pyjitpl.py reached_loop_header: `live_arg_boxes` is built ONCE, here at
                     // the top of `reached_loop_header`, and every consumer below
                     // reads that same list — the bridge's closing JUMP
                     // (line 2988 `compile_trace`), the merge-point scan
@@ -4005,7 +4005,7 @@ impl<S: JitState> JitDriver<S> {
                                     // `remove_consts_and_duplicates_untyped` takes
                                     // `&mut [OpRef]`, so it substitutes SameAs ops
                                     // in place and cannot shorten the list
-                                    // (pyjitpl.py:2958-2964 assigns `boxes[i]`).
+                                    // (pyjitpl.py remove_consts_and_duplicates assigns `boxes[i]`).
                                     assert!(
                                         n <= boxes.len(),
                                         "virtualizable element block ({n}) is not a suffix \
@@ -4380,7 +4380,7 @@ impl<S: JitState> JitDriver<S> {
                                         // `ResumeFromInterpDescr(original_greenkey)`
                                         // and pyjitpl.py:2939 `= resumedescr` — both
                                         // at session start. `retrace_needed`
-                                        // (pyjitpl.py:2438-2442) sets only
+                                        // (pyjitpl.py) sets only
                                         // `partial_trace` / `retracing_from` /
                                         // `exported_state` / `heapcache.reset()`, so
                                         // the resumekey a guard-originated session
@@ -4394,7 +4394,7 @@ impl<S: JitState> JitDriver<S> {
                                         // Only the CLASS survives, not the
                                         // attempt: upstream closes this gate
                                         // through `partial_trace`
-                                        // (pyjitpl.py:3003), which
+                                        // (pyjitpl.py), which
                                         // `retrace_needed` always arms because
                                         // compile.py:1079 calls it
                                         // unconditionally. majit calls it only
@@ -4445,7 +4445,7 @@ impl<S: JitState> JitDriver<S> {
                             // No targets: consume bridge_info, fall through to
                             // compile_loop (pyjitpl.py). The resumekey
                             // survives because upstream never clears it in this
-                            // region (pyjitpl.py:2979-3060); only the attempt latch
+                            // region (pyjitpl.py); only the attempt latch
                             // is set.
                             crate::mc_diag_bump(51); // bridge_no_targets_close
                             self.bridge_attempt_declined = true;
@@ -4856,7 +4856,7 @@ impl<S: JitState> JitDriver<S> {
                     // (`pyjitpl/dispatch.rs`'s `run_one_step`) into the same
                     // helper, matching the
                     // `except SwitchToBlackhole as stb: self.aborted_tracing`
-                    // shape at pyjitpl.py:2491.
+                    // shape at pyjitpl.py.
                     if let Err(stb) = self.meta.compile_finish_from_active_session(
                         &finish_args,
                         finish_arg_types,
@@ -4876,7 +4876,7 @@ impl<S: JitState> JitDriver<S> {
                     //               metainterp, metainterp.resumekey, [exception_box])
                     //           if target_token is not token: compile.giveup()
                     // then leaves through one shared
-                    // pyjitpl.py:1673 SwitchToBlackhole(ABORT_SEGMENTED_TRACE).
+                    // pyjitpl.py SwitchToBlackhole(ABORT_SEGMENTED_TRACE).
                     // `create_segmented_trace` made that choice while it still
                     // held the `TraceCtx`; the box it carries is the FINISH
                     // operand the bridge arm still has to record.
@@ -4920,13 +4920,13 @@ impl<S: JitState> JitDriver<S> {
                         //
                         // The flag this arm answers to was already being armed
                         // with nothing to act on it: `prepare_trace_segmenting`
-                        // (pyjitpl.py:2849-2857) sets FORCE_BRIDGE_SEGMENTING on
+                        // (pyjitpl.py) sets FORCE_BRIDGE_SEGMENTING on
                         // the source loop token, `start_retrace_from_guard`
                         // reads it back into `force_finish_trace`
                         // (compile.py:725-731), and the bridge then ran on to
                         // the ordinary over-limit abort — the retracing-forever
                         // outcome the flag is set to prevent.  Upstream's own
-                        // note at pyjitpl.py:2854: "creating a segmented bridge
+                        // note at pyjitpl.py: "creating a segmented bridge
                         // is generally quite safe".
                         Some(exception_box) => {
                             // Read before the compile drains the tracer: the
@@ -5100,7 +5100,7 @@ impl<S: JitState> JitDriver<S> {
                             }
                         },
                     };
-                    // pyjitpl.py:2949-2956
+                    // pyjitpl.py run_blackhole_interp_to_cancel_tracing
                     // run_blackhole_interp_to_cancel_tracing: a fresh trace has
                     // executed its portal body forward with real residual heap
                     // effects.  Before dropping that live frame, publish its
@@ -5440,10 +5440,10 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// This is upstream's split: `get_uhash(*greenargs)` hashes the greens in
     /// place on every back edge, and the greens are stored on the cell only
-    /// when one is installed (warmstate.py:584-604).
+    /// when one is installed (warmstate.py).
     ///
     /// Not `#[cold]`: this is the interpreter's per-iteration door, and the
-    /// empty-chain arm (`warmstate.py:465-469`) is the common path. The
+    /// empty-chain arm (`warmstate.py`) is the common path. The
     /// compiled-entry / tracing-start bodies stay in `back_edge_internal`,
     /// which is `#[inline(never)]` so they do not land in the dispatch loop.
     #[inline]
@@ -6533,7 +6533,7 @@ impl<S: JitState> JitDriver<S> {
         // entry could decide about one cell's token and run another's.
         //
         // The token itself is bound here rather than only tested, and travels
-        // to the run below as an argument. `warmstate.py:483` reads
+        // to the run below as an argument. `warmstate.py` reads
         // `procedure_token = cell.get_procedure_token()` once per
         // `maybe_compile_and_run` and `:509-511` carries it out through
         // `raise EnterJitAssembler(procedure_token, *execute_args)`; the
@@ -6986,7 +6986,7 @@ impl<S: JitState> JitDriver<S> {
             // past the end of the list it was handed.
             // The descriptor the entry decided on is the one the exit
             // syncs through — resolved once above and carried here rather
-            // than asked for again. `warmstate.py:483/509-511` reads the
+            // than asked for again. `warmstate.py/509-511` reads the
             // cell once per `maybe_compile_and_run` and carries the read
             // out to the executor for the same reason; the driver's static
             // data is a configuration-time constant (see
@@ -7121,7 +7121,7 @@ impl<S: JitState> JitDriver<S> {
         // resume defects from the blackhole path.
         //
         // Pending-field guards bridge through setup_bridge_sym's
-        // pending-field prologue (resume.py:993-1007).
+        // pending-field prologue (resume.py _prepare_pendingfields).
         let should_bridge = must_compile
             && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
             && !no_bridge_enabled()
@@ -7219,7 +7219,7 @@ impl<S: JitState> JitDriver<S> {
             // JitCode singleton (RPython's `metainterp_sd.jitcodes`
             // for the portal jitdriver slot); sub-frames index into
             // the parent's `descrs` array per `BC_INLINE_CALL`'s
-            // `j` argcode (`blackhole.py:150-157`).
+            // `j` argcode (`blackhole.py`).
             //
             // The snapshot's root `jitcode_index` is unused once
             // the dispatch singleton is registered — the closure
@@ -7270,7 +7270,7 @@ impl<S: JitState> JitDriver<S> {
             // `blackhole_from_resumedata` below acquires one interpreter
             // per resumed frame, and every frame that still has a caller
             // takes `bhimpl_jit_merge_point`'s recursive-portal branch
-            // (blackhole.py:1079-1093), which indexes `jitdrivers_sd`
+            // (blackhole.py), which indexes `jitdrivers_sd`
             // directly.  The lease is thread-local and carries whatever
             // the previous resume left on it, so seed the table here
             // instead of depending on that.
@@ -7373,7 +7373,7 @@ impl<S: JitState> JitDriver<S> {
                 }
                 let exc =
                     crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(guard_exc);
-                // Drive the reconstructed frame chain (blackhole.py:1752
+                // Drive the reconstructed frame chain (blackhole.py _run_forever
                 // `_run_forever`): each completed sub-frame passes its
                 // return value to its caller (resume_mainloop did the
                 // `setup_return_value_*` copy), then we descend to the
@@ -7386,7 +7386,7 @@ impl<S: JitState> JitDriver<S> {
                 // those are only the declared subset, so the structural
                 // equivalent for majit's live `state` struct is to restore
                 // the terminal frame's full register bank
-                // (resume.py:1028-1038 seeded it in slot order) and resume
+                // (resume.py _callback_i seeded it in slot order) and resume
                 // at the CRN green pc.
                 let mut cur_exc = exc;
                 let outcome = loop {
@@ -8271,7 +8271,7 @@ impl<S: JitState> JitDriver<S> {
 
         // Refresh the trace-entry vable heap pointer so `initialize_virtualizable`
         // reads array lengths directly from the concrete virtualizable object
-        // (pyjitpl.py:3326 `vinfo.read_boxes(cpu, virtualizable, startindex)`).
+        // (pyjitpl.py `vinfo.read_boxes(cpu, virtualizable, startindex)`).
         // `VirtualizableInfo.name` is the canonical identifier declared via
         // `virtualizable!(name = "...")`, so we can feed it straight to the
         // interpreter hooks without going through the descriptor.
@@ -8998,7 +8998,7 @@ impl<S: JitState> JitDriver<S> {
     /// frontend `compiled_loops` meta (`get_compiled_meta`).
     ///
     /// `has_compiled_loop` is true whenever the cell's procedure token has a
-    /// compiled backend body (`warmstate.py:482-511` gates entry on code
+    /// compiled backend body (`warmstate.py` gates entry on code
     /// presence). That includes a `compile_tmp_callback` token
     /// (`compile.py:1101-1150`): a CALL_ASSEMBLER fallback stub with a real
     /// body but NO frontend meta, since MetaInterp never inserts it into
@@ -9173,7 +9173,7 @@ impl<S: JitState> JitDriver<S> {
     /// [`Self::back_edge`].
     ///
     /// Not `#[cold]`: this is the interpreter's per-call door, and the
-    /// empty-chain arm (`warmstate.py:465-469` with
+    /// empty-chain arm (`warmstate.py` with
     /// `increment_function_threshold`) is the common path. Compiled-entry
     /// / tracing-start / chained-resolve bodies stay in
     /// `function_entry_internal`, which is `#[inline(never)]` so they do
@@ -9653,7 +9653,7 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Resolve a portal CALL_ASSEMBLER target through an installed loop token
-    /// or an RPython tmp callback (`warmstate.py:714-723`,
+    /// or an RPython tmp callback (`warmstate.py get_assembler_token`,
     /// `compile.py:1101-1150`). The pending token remains only a
     /// trace-in-progress marker for inline decisions.
     pub fn get_or_make_portal_assembler_token_arc(
@@ -10085,10 +10085,10 @@ impl<S: JitState> JitDriver<S> {
         //   * `ResumeDataResult.virtualref_values` (vref pair stream) is
         //     restored into `TraceCtx.virtualref_boxes` and each pair fires
         //     `vrefinfo.continue_tracing(vref, virtual)`
-        //     (`virtualref.py:122-129`) inside
+        //     (`virtualref.py`) inside
         //     `pyre-jit-trace::state::setup_bridge_sym` — matches the
         //     `consume_virtualref_info` half of `consume_vref_and_vable`
-        //     (resume.py:1389-1397).
+        //     (resume.py).
         //   * `ResumeDataResult.virtualizable_values` (vable scalar +
         //     array stream) is restored into `sym` via
         //     `seed_virtualizable_boxes`, populating
@@ -10274,7 +10274,7 @@ impl<S: JitState> JitDriver<S> {
         // skip-once below sends it past the crossing it was meant to take.
         //
         // The flag is one-shot on both sides: the merge point resets it to
-        // -1 (pyjitpl.py:1562) after consuming it, so only the FIRST crossing
+        // -1 (pyjitpl.py) after consuming it, so only the FIRST crossing
         // is forced. `compile_trace`'s sibling read of the same descr class
         // (`inline_short_preamble = False`, compile.py) lives at
         // `pyjitpl.rs`'s bridge compile entry.
@@ -10318,14 +10318,14 @@ impl<S: JitState> JitDriver<S> {
             let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
             meta.portal_call_depth
         }));
-        // resume.py:1042 parity: map frame locals to bridge InputArg OpRefs
+        // resume.py rebuild_from_resumedata parity: map frame locals to bridge InputArg OpRefs
         // so bridge tracing sees locals as symbolic variables, not concrete values.
         // resume.py getvirtual_ptr parity: when frame.values contains
         // RebuiltValue::Virtual entries, setup_bridge_sym must emit
         // NEW_WITH_VTABLE/SETFIELD_GC ops via the active trace ctx so the
         // bridge has fresh local instances instead of stale vable-array reads.
         if let Some(ref bfm) = resume_data_result {
-            // bridgeopt.py:124 / resume.py:1260 parity: `Box(n, tp)` in
+            // bridgeopt.py deserialize_optimizer_knowledge / resume.py:1260 parity: `Box(n, tp)` in  allow-line-citation
             // `rd_numb` indexes the guard's encoder-time liveboxes, whose
             // runtime values are the backend's raw deadframe (the guard's
             // `fail_args` image). `extract_live` returns the virtualizable
@@ -10457,7 +10457,7 @@ impl<S: JitState> JitDriver<S> {
         // is available; the bridge path should not synthesize a separate
         // header-shaped meta layer.
         //
-        // Constants are NOT injected into the pool up-front: resume.py:1245
+        // Constants are NOT injected into the pool up-front: resume.py
         // `decode_box` returns live ConstInt/ConstPtr boxes at the moment
         // each tagged value is read, so majit's parity path registers each
         // constant via `ctx.const_int/const_ref/const_float` inside
@@ -11086,7 +11086,7 @@ mod tests {
         // shared with every other test in this binary, so a concurrent bump can
         // only inflate the delta — the assertion below is a lower bound.
         //
-        // Cold edges (`warmstate.py:465-469`) tick and return without entering
+        // Cold edges (`warmstate.py`) tick and return without entering
         // this door, so only the overflow that starts tracing is counted.
         let before = crate::mc_diag(61);
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
@@ -12999,7 +12999,7 @@ mod tests {
         token.set_compiled(Box::new(()));
         // `compile.py` — `compile_tmp_callback` registers the token
         // with `MemoryManager` before `get_assembler_token` installs it. The
-        // cell keeps only a weak handle (`warmstate.py:188`), so without this
+        // cell keeps only a weak handle (`warmstate.py`), so without this
         // the token dies here and the cell reads back as "never compiled".
         driver
             .meta

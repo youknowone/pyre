@@ -393,7 +393,7 @@ impl Const {
 /// Mirrors rpython/jit/metainterp/resoperation.py AbstractInputArg
 /// (`InputArgInt` / `InputArgFloat` / `InputArgRef` at lines 719/727/739).
 ///
-/// The `_forwarded` slot (`resoperation.py:235`) is the `forwarded`
+/// The `_forwarded` slot (`resoperation.py`) is the `forwarded`
 /// field below — the canonical per-identity forwarding host. A bound
 /// operand routes `set_forwarded_*` / `get_forwarded` to this field;
 /// there is no Box-side mirror.
@@ -464,7 +464,7 @@ impl InputArg {
     }
 
     pub fn from_type(tp: Type, index: u32) -> Self {
-        // `InputArg*` has no Void encoding (resoperation.py:719/727/739
+        // `InputArg*` has no Void encoding (resoperation.py InputArgInt/727/739
         // — only `InputArgInt`/`InputArgFloat`/`InputArgRef`); fail at
         // construction so `opref()` can't be reached with a Void slot.
         assert!(
@@ -481,7 +481,7 @@ impl InputArg {
 
     /// `Rc`-wrapped variants of the typed factories, matching PyPy's
     /// `InputArgInt(index)` / `InputArgFloat(index)` / `InputArgRef(index)`
-    /// at `resoperation.py:719/727/739`. Every call yields a fresh
+    /// at `resoperation.py/727/739`. Every call yields a fresh
     /// identity (no interning), so two `new_*_rc` results compare equal
     /// only when both `tp` and `index` match — identity is shared only
     /// when callers `Rc::clone` the same handle.
@@ -844,7 +844,7 @@ pub fn green_type_to_ir(g: GreenType) -> Type {
 /// cast through `usize` (per-occurrence `Box::leak`).  The IR layer keeps
 /// no assumption about that ABI; frontends register their decoders via
 /// [`set_str_resolver`] / [`set_unicode_resolver`] at startup, mirroring
-/// RPython's `warmstate.py:108-128` indirection through
+/// RPython's `warmstate.py equal_whatever` indirection through
 /// `rstr.LLHelpers.ll_streq` / `ll_strhash` (which is itself a function
 /// pointer the frontend produces for its own STR/UNICODE layout).
 pub type StrEqFn = fn(i64, i64) -> bool;
@@ -1349,18 +1349,18 @@ fn hash_whatever_missing_unicode() -> ! {
 }
 
 /// Seed of `JitCell.get_uhash` — `x = r_uint(-1888132534)`
-/// (warmstate.py:586).
+/// (warmstate.py).
 pub const GREEN_UHASH_SEED: u64 = (-1888132534_i64) as u64;
 
 /// Multiplier of `JitCell.get_uhash` — `x = (x ^ y) * r_uint(1405695061)`
-/// (warmstate.py:591).
+/// (warmstate.py).
 pub const GREEN_UHASH_MULT: u64 = 1405695061;
 
 /// One `get_uhash` fold step over a single green.
 ///
 /// Upstream never materialises the greens: `get_uhash(*greenargs)` unrolls
 /// over `green_args_name_spec`, which is fixed per JitCell class at
-/// translation time (warmstate.py:584-593). A caller that likewise knows its
+/// translation time (warmstate.py). A caller that likewise knows its
 /// greens statically folds with this instead of building a [`GreenKey`] —
 /// [`pypyjit_greenkey_uhash`] for pyre's fixed portal tuple, and the
 /// `#[jit_interp]` macro, whose green count and types are known at expansion

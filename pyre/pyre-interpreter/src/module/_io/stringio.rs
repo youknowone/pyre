@@ -57,7 +57,7 @@ impl W_StringIO {
 
     fn check_closed(&self) -> Result<(), crate::PyError> {
         if self.closed {
-            // interp_stringio.py:234-238.
+            // interp_stringio.py _check_closed.
             Err(crate::PyError::value_error("I/O operation on closed file"))
         } else {
             Ok(())
@@ -124,7 +124,7 @@ impl W_StringIO {
     }
 
     fn init_newline(slot: usize, w_newline: PyObjectRef) -> Result<(), crate::PyError> {
-        // interp_stringio.py:141-174.
+        // interp_stringio.py _init_newline.
         let newline = if unsafe { pyre_object::is_none(w_newline) } {
             None
         } else if unsafe { crate::baseobjspace::isinstance_str_w(w_newline) } {
@@ -172,7 +172,7 @@ impl W_StringIO {
     }
 
     fn decode_string(slot: usize, w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        // interp_stringio.py:243-262. Calls are kept at object level so the
+        // interp_stringio.py _decode_string. Calls are kept at object level so the
         // app-level IncrementalNewlineDecoder owns translation and seennl.
         if !unsafe { crate::baseobjspace::isinstance_str_w(w_obj) } {
             return Err(crate::PyError::type_error(format!(
@@ -288,7 +288,7 @@ impl W_StringIO {
     }
 
     fn write(&mut self, w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
-        // interp_stringio.py:264-296.
+        // interp_stringio.py write_w.
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = self.pin_self();
         let _ = pyre_object::gc_roots::pin_root(w_obj);
@@ -313,7 +313,7 @@ impl W_StringIO {
         &mut self,
         #[default(pyre_object::w_none())] w_size: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
-        // interp_stringio.py:306-327 plus interp_iobase.py `convert_size`.
+        // interp_stringio.py read_w plus interp_iobase.py `convert_size`.
         self.check_closed()?;
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = self.pin_self();
@@ -340,7 +340,7 @@ impl W_StringIO {
         &mut self,
         #[default(pyre_object::w_none())] w_limit: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
-        // interp_stringio.py:329-401.
+        // interp_stringio.py readline_w.
         self.check_closed()?;
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = self.pin_self();
@@ -439,7 +439,7 @@ impl W_StringIO {
         &mut self,
         #[default(pyre_object::w_none())] w_size: PyObjectRef,
     ) -> Result<i64, crate::PyError> {
-        // interp_stringio.py:424-439 plus interp_iobase.py `convert_size`.
+        // interp_stringio.py truncate_w plus interp_iobase.py `convert_size`.
         self.check_closed()?;
         let current = self.pos;
         let _roots = pyre_object::gc_roots::push_roots();
@@ -463,7 +463,7 @@ impl W_StringIO {
     }
 
     fn getvalue(&self) -> Result<PyObjectRef, crate::PyError> {
-        // interp_stringio.py:441-448.
+        // interp_stringio.py getvalue_w.
         self.check_closed()?;
         Ok(self.string_from_range(0, self.len()))
     }
@@ -484,7 +484,7 @@ impl W_StringIO {
     }
 
     fn close(&mut self) {
-        // interp_stringio.py:462-464.
+        // interp_stringio.py close_w.
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = self.pin_self();
         let buffer = pyre_object::interp_array::w_array_new(b'w', 4);
@@ -520,7 +520,7 @@ impl W_StringIO {
     }
 
     fn __getstate__(&self) -> Result<PyObjectRef, crate::PyError> {
-        // interp_stringio.py:190-200.
+        // interp_stringio.py descr_getstate.
         self.check_closed()?;
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
@@ -551,7 +551,7 @@ impl W_StringIO {
     }
 
     fn __setstate__(&mut self, w_state: PyObjectRef) -> Result<(), crate::PyError> {
-        // interp_stringio.py:202-232, including acceptance of future state
+        // interp_stringio.py descr_setstate, including acceptance of future state
         // tuples longer than four items.
         self.check_closed()?;
         if !unsafe { pyre_object::is_tuple(w_state) }

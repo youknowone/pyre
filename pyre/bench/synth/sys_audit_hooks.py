@@ -16,7 +16,7 @@
 #     be: a hook is installed for the life of the interpreter and the first one
 #     that raises masks every hook behind it, so reaching the propagating branch
 #     needs the hook set cleared between cases.  Upstream's own facility for
-#     that (`__pypy__._testing_clear_audithooks`, `interp_magic.py:292`) refuses
+#     that (`__pypy__._testing_clear_audithooks`, `interp_magic.py`) refuses
 #     to run once translated, so no app-level program on a built interpreter
 #     can get there.  The refusal below raises from app code, so it carries a
 #     real exception object and takes `error_is_exception`'s isinstance arm;

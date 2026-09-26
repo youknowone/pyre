@@ -8,7 +8,7 @@
 //!
 //! RPython's `liveness.py` works on an untyped list of Python tuples. The
 //! pyre port walks the typed `Insn` enum instead, but the ordering, case
-//! analysis, and set-update semantics reproduce `liveness.py:19-116`
+//! analysis, and set-update semantics reproduce `liveness.py`
 //! line-for-line.
 
 use std::collections::{HashMap, HashSet};
@@ -289,7 +289,7 @@ fn _compute_liveness_must_continue(
 /// element appearing in a `-live-` tuple after the opname slot — that
 /// includes `Register` objects (always expanded by
 /// `_compute_liveness_must_continue`) and `TLabel` objects (the
-/// `labels` list preserved at `liveness.py:44-52`). Rust needs a single
+/// `labels` list preserved at `liveness.py`). Rust needs a single
 /// hashable type to back the same `HashSet` semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum LiveItem {

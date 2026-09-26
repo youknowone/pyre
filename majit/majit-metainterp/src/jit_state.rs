@@ -122,7 +122,7 @@ pub struct ResumeDataResult {
     /// `storage.rd_consts()` directly; no owned copy lives on this
     /// struct.
     pub storage: Option<std::sync::Arc<crate::resume::ResumeStorage>>,
-    /// resume.py:1042 num_failargs read from rd_numb header.
+    /// resume.py rebuild_from_resumedata num_failargs read from rd_numb header.
     /// Needed by `materialize_bridge_virtual` to translate negative TAGBOX
     /// numbers in `rd_virtuals` fieldnums (resume.py decode_box:
     /// Python-style negative indexing into the parent guard's liveboxes
@@ -415,7 +415,7 @@ pub trait JitState: Sized {
     ) {
     }
 
-    /// resume.py:1042 parity: set up bridge-specific symbolic local mapping.
+    /// resume.py rebuild_from_resumedata parity: set up bridge-specific symbolic local mapping.
     /// Called after rebuild_from_resumedata to map frame locals to bridge
     /// InputArg OpRefs. In RPython, MIFrame.registers are populated with
     /// InputArg/Const boxes from rebuild; this is the Rust equivalent.
@@ -1012,7 +1012,7 @@ pub trait JitState: Sized {
     /// Returns `Arc<VirtualizableInfo>` so the field descriptors built
     /// by `finalize_arc` can carry the vinfo backref that
     /// `FieldDescr::get_vinfo()` returns at `emit_force_virtualizable`
-    /// time (pyjitpl.py:1148-1149).
+    /// time (pyjitpl.py).
     #[allow(non_snake_case)]
     fn __build_virtualizable_info()
     -> Option<std::sync::Arc<crate::virtualizable::VirtualizableInfo>> {

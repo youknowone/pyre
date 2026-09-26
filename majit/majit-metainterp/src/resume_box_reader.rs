@@ -4,9 +4,9 @@
 //! resume.py runs virtual rematerialization through a single
 //! `AbstractVirtualInfo.allocate(decoder, index)` (resume.py) that is
 //! polymorphic over the `decoder`: `ResumeDataDirectReader` (blackhole — real
-//! `cpu.bh_new`, resume.py:1437-1442) writes memory, while
+//! `cpu.bh_new`, resume.py) writes memory, while
 //! `ResumeDataBoxReader` (tracing/bridge — `metainterp.execute_new_with_vtable`,
-//! resume.py:1111-1115) records NEW/SETFIELD ops into the trace. The direct
+//! resume.py) records NEW/SETFIELD ops into the trace. The direct
 //! flavour lives in `resume.rs` (`VirtualInfoBlackholeExt::allocate`); this
 //! module is the box-reader flavour, shared by every `JitState` consumer whose
 //! `setup_bridge_sym` must re-materialize the guard's virtuals and replay its
@@ -281,7 +281,7 @@ fn emit_stroruni_oopspec_call(
     let mut call_args = Vec::with_capacity(1 + args.len());
     call_args.push(func_const);
     call_args.extend_from_slice(args);
-    // resume.py:1143-1160 `execute_and_record_varargs(CALL_R, ...)`.
+    // resume.py concat_strings `execute_and_record_varargs(CALL_R, ...)`.
     ctx.profiler()
         .count_ops(majit_ir::OpCode::CallR, crate::counters::OPS);
     ctx.profiler()
@@ -392,7 +392,7 @@ pub fn decode_fieldnum(
             }
         }
         TAGVIRTUAL => {
-            // resume.py:278-284 nested virtuals are numbered negatively;
+            // resume.py assign_number_to_virtual nested virtuals are numbered negatively;
             // getvirtual resolves them via Python negative list indexing
             // into rd_virtuals (resume.py:951-954).
             let vidx = if val < 0 {
@@ -555,7 +555,7 @@ pub fn materialize_bridge_virtual(
     // an out-of-range virtual number is a bug, not a silent NONE fallback.
     let entry = &virtuals[vidx];
 
-    // resume.py:612-760 dispatch by virtual kind.
+    // resume.py VirtualInfo dispatch by virtual kind.
     // RPython: rd_virtuals[index].allocate(self, index) — polymorphic on
     // the AbstractVirtualInfo subclass. Rust equivalent: match on
     // RdVirtualInfo enum variant.
@@ -578,7 +578,7 @@ pub fn materialize_bridge_virtual(
         cache: &mut BridgeVirtualCache<'_>,
     ) -> bool {
         // resume.py setfields — range(len(fielddescrs)), index
-        // fieldnums[i]. The len-equality assert (resume.py:606) is in
+        // fieldnums[i]. The len-equality assert (resume.py) is in
         // debug_prints, not this allocate path: a short fieldnums raises
         // IndexError here, a longer one is ignored.
         for i in 0..fielddescrs.len() {
@@ -606,7 +606,7 @@ pub fn materialize_bridge_virtual(
             // stable_field_index.
             let field_descr =
                 majit_ir::descr::field_descr_from_parent_by_offset(&parent_descr, fd_info.offset);
-            // resume.py:1111-1122 materializer operations use
+            // resume.py allocate_with_vtable materializer operations use
             // `execute_and_record`.
             ctx.profiler()
                 .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
@@ -941,7 +941,7 @@ pub fn materialize_bridge_virtual(
             //   execute_and_record_varargs(rop.CALL_I, [ConstInt(func), ConstInt(size)], calldescr)
             let func_ref = ctx.const_int(*func);
             let size_ref = ctx.const_int(*size as i64);
-            // resume.py:1124-1126: calldescr comes from the shared
+            // resume.py allocate_raw_buffer: calldescr comes from the shared
             // callinfocollection, not a freshly minted synthetic descr. The
             // func is NOT taken from callinfo_for_oopspec (resume.py:1127-1130:
             // several malloc variants share the oopspec), so only the calldescr
@@ -957,7 +957,7 @@ pub fn materialize_bridge_virtual(
                 .clone();
             // resume.py:1126: calldescr, _ = cic.callinfo_for_oopspec(
             //   OS_RAW_MALLOC_VARSIZE_CHAR). callinfo_for_oopspec returns
-            // (None, 0) on a missing entry (effectinfo.py:444-447) — no
+            // (None, 0) on a missing entry (effectinfo.py) — no
             // lookup-time check; the calldescr is used directly.
             let (calldescr, _) =
                 cic.callinfo_for_oopspec(majit_ir::descr::OopSpecIndex::RawMallocVarsizeChar);

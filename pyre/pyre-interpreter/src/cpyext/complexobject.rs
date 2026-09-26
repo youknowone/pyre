@@ -17,7 +17,7 @@ pub struct CPyComplex {
     pub imag: c_double,
 }
 
-/// `PyComplexObject` — `complexobject.py:19-21 PyComplexObjectFields`.
+/// `PyComplexObject` — `complexobject.py PyComplexObjectFields`.
 #[repr(C)]
 pub struct CPyComplexObject {
     pub ob_base: CPyObject,
@@ -39,7 +39,7 @@ fn complex_type() -> PyObjectRef {
 }
 
 /// What `tp_basicsize` a synthesized mirror of `w_type` carries —
-/// `complexobject.py:26-29 basestruct=PyComplexObject.TO` for `complex` and
+/// `complexobject.py basestruct=PyComplexObject.TO` for `complex` and
 /// the classes derived from it, and 0 for every other type, which asks for the
 /// plain header.
 pub(super) fn basicsize(w_type: PyObjectRef) -> isize {
@@ -53,7 +53,7 @@ pub(super) fn basicsize(w_type: PyObjectRef) -> isize {
     }
 }
 
-/// Fill a freshly allocated mirror — `complexobject.py:31-39 complex_attach`.
+/// Fill a freshly allocated mirror — `complexobject.py complex_attach`.
 pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
     let tp = unsafe { (*raw).ob_type };
     // Almost every block is smaller than this one, and that is one load.

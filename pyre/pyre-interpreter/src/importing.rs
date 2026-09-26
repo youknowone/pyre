@@ -646,7 +646,7 @@ struct ImportRootArea {
 // PyPy equivalent: space.builtin_modules dict + MixedModule.interpleveldefs
 //
 // Lazy loading (MixedModule.buildloaders / getdictvalue,
-// `mixedmodule.py:84-193`): PyPy defers two things — (1) creating a
+// `mixedmodule.py`): PyPy defers two things — (1) creating a
 // module's contents until the module is first imported, and (2)
 // evaluating each interpleveldef/appleveldef until the corresponding
 // attribute is first accessed.  Pyre achieves (1) directly: this
@@ -752,7 +752,7 @@ pub fn builtin_module_names() -> Vec<&'static str> {
 /// the alias arms (`"builtins"` → `__builtin__`), explicit-path arms
 /// (`importlib.machinery` → a non-default init fn), or the
 /// `#[cfg(unix)]` gating that `resource` / `fcntl` / `syslog` require.
-// PyPy `baseobjspace.py:626-683 make_builtins` is `@not_rpython`: this table
+// PyPy `baseobjspace.py make_builtins` is `@not_rpython`: this table
 // and each MixedModule constructor are assembled while the object space is
 // initialised, before translated execution begins.
 #[majit_macros::not_rpython]
@@ -791,7 +791,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!("_thread"(thread));
     pyre_install_module!(itertools);
     pyre_install_module!(_codecs);
-    // PyPy `_codecs/moduledef.py:87-100 Module.__init__` performs this beside
+    // PyPy `_codecs/moduledef.py Module.__init__` performs this beside
     // MixedModule installation, not inside the translated CodecState ctor.
     crate::module::_codecs::register_builtin_error_handlers();
     // moduledef.py: `applevel_name = os.name` installs the one posix module
@@ -1117,7 +1117,7 @@ pub(crate) fn multiarch() -> &'static str {
 }
 
 /// Whether this build has an extension loader — the predicate `create_dynamic`
-/// is gated on (`imp/interp_imp.py:49-51`), and therefore the one that decides
+/// is gated on (`imp/interp_imp.py`), and therefore the one that decides
 /// whether `_imp.extension_suffixes()` answers anything.  A build that cannot
 /// load an extension must not name the files one would be compiled against.
 pub(crate) const fn extension_loader_present() -> bool {
@@ -1616,7 +1616,7 @@ unsafe fn untraced_mixed_module_function(value: PyObjectRef) -> bool {
 /// PyPy equivalent: `find_module()` → C_BUILTIN path →
 /// `getbuiltinmodule()` → `Module.__init__` + `startup()`.
 ///
-/// PyPy `pypy/objspace/std/dictmultiobject.py:60-69` allocates a
+/// PyPy `pypy/objspace/std/dictmultiobject.py` allocates a
 /// `W_ModuleDictObject` for every module via
 /// `allocate_and_init_instance(module=True)`. Pyre mirrors that here:
 /// the initializer writes directly into a rooted, non-moving module dict.
@@ -1750,7 +1750,7 @@ pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, cra
 
 /// Build a builtin module for `_imp.create_builtin`, then run its `startup`
 /// hook. App-level `module_from_spec` stamps import metadata afterwards
-/// (`_bootstrap.py:822`), so this entry point must not pre-fill it.
+/// (`_bootstrap.py`), so this entry point must not pre-fill it.
 pub(crate) fn create_builtin_module(
     name: &str,
     execution_context: *const PyExecutionContext,
@@ -4325,7 +4325,7 @@ fn parse_source_module(
 // PyPy equivalent: importing.py `exec_code_module(space, w_mod, code_w,
 //                                  pathname, cpathname, write_paths=True)`
 //
-// Mirrors `pypy/module/imp/importing.py:269-300` line-by-line:
+// Mirrors `pypy/module/imp/importing.py` line-by-line:
 //   w_dict = space.getattr(w_mod, '__dict__')                       # ns
 //   space.call_method(w_dict, 'setdefault',
 //                     '__builtins__', space.builtin)
@@ -4407,10 +4407,10 @@ fn exec_code_module(
     // importing.py:300 code_w.exec_code(space, w_dict, w_dict) → eval.py
     // Code.exec_code → space.createframe(...) + frame.run().  Surface
     // initialize_frame_scopes' freevar/closure mismatch (TypeError /
-    // ValueError per pyframe.py:242-253) as PyError so the importer
+    // ValueError per pyframe.py) as PyError so the importer
     // reports it instead of panicking.  Route through run_with_jit so the
     // GENERATOR / COROUTINE / ASYNC_GENERATOR dispatch in
-    // pyframe.py:268-273 holds for the import path too, and so an imported
+    // pyframe.py holds for the import path too, and so an imported
     // module's top-level hot loop reaches the JIT portal.
     let mut frame =
         crate::pyframe::createframe_obj(w_code as *const (), w_globals, execution_context, None)?;
@@ -4668,7 +4668,7 @@ fn load_source_module(
     // here would be redundant.
     //
     // `__file__`/`__cached__` setting moved into `exec_code_module`
-    // (`importing.py:284-285`) so the per-module attribute seeding
+    // (`importing.py`) so the per-module attribute seeding
     // mirrors the PyPy call order.
     //
     // `__package__` is set by PyPy `interp_imp._prepare_module`

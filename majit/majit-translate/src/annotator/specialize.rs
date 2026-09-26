@@ -5,7 +5,7 @@
 //! (`MemoTable`, `memo`, `all_values`, `cartesian_product`) lands here
 //! incrementally; this first slice ports the two pure helpers
 //! `all_values` (specialize.py) and `cartesian_product`
-//! (specialize.py:314-320), which carry no bookkeeper back-references
+//! (specialize.py), which carry no bookkeeper back-references
 //! and are exercised directly by unit tests.
 
 use std::cell::{Cell, RefCell};
@@ -190,7 +190,7 @@ pub fn maybe_star_args(
 }
 
 /// RPython `specialize_argvalue(funcdesc, args_s, *argindices)`
-/// (specialize.py:329-344).
+/// (specialize.py).
 pub fn specialize_argvalue(
     funcdesc: &FunctionDesc,
     args_s: &[Option<SomeValue>],
@@ -200,7 +200,7 @@ pub fn specialize_argvalue(
 }
 
 /// RPython `specialize_arg_or_var(funcdesc, args_s, *argindices)`
-/// (specialize.py:346-354).
+/// (specialize.py).
 pub fn specialize_arg_or_var(
     funcdesc: &FunctionDesc,
     args_s: &[Option<SomeValue>],
@@ -210,7 +210,7 @@ pub fn specialize_arg_or_var(
 }
 
 /// RPython `specialize_argtype(funcdesc, args_s, *argindices)`
-/// (specialize.py:356-358).
+/// (specialize.py).
 pub fn specialize_argtype(
     funcdesc: &FunctionDesc,
     args_s: &[Option<SomeValue>],
@@ -220,7 +220,7 @@ pub fn specialize_argtype(
 }
 
 /// RPython `specialize_arglistitemtype(funcdesc, args_s, i)`
-/// (specialize.py:360-366).
+/// (specialize.py).
 pub fn specialize_arglistitemtype(
     funcdesc: &FunctionDesc,
     args_s: &[Option<SomeValue>],
@@ -230,7 +230,7 @@ pub fn specialize_arglistitemtype(
 }
 
 /// RPython `specialize_call_location(funcdesc, args_s, op)`
-/// (specialize.py:368-370).
+/// (specialize.py).
 pub fn specialize_call_location(
     funcdesc: &FunctionDesc,
     args_s: &[Option<SomeValue>],
@@ -270,7 +270,7 @@ pub struct MemoTable {
 
 impl MemoTable {
     /// RPython `MemoTable.__init__(funcdesc, args, value)`
-    /// (specialize.py:105-109).
+    /// (specialize.py).
     pub fn new(
         funcdesc_name: String,
         funcdesc_defaults: Vec<Constant>,
@@ -336,7 +336,7 @@ impl MemoTable {
     /// `exitswitch` on the arg; PBC set with all-constant results →
     /// `getattr($memofield, ...)` after storing each constant via
     /// `desc.create_new_attribute`. The `store = nextfns` branch
-    /// (specialize.py:223-242 — a PBC arg followed by further varying
+    /// (specialize.py — a PBC arg followed by further varying
     /// args whose results are not all constant) stores subhelper
     /// *callables* in the memo fields: each subhelper is emitted as a
     /// standalone prebuilt [`FunctionGraph`] (see
@@ -470,7 +470,7 @@ impl MemoTable {
 }
 
 /// Bundles the read-only inputs threaded through `make_subhelper`'s
-/// recursion (specialize.py:165-247) so the block-tree synthesis can
+/// recursion (specialize.py) so the block-tree synthesis can
 /// stay a set of `&self` methods.
 struct MemoSynth<'a> {
     bookkeeper: &'a Rc<Bookkeeper>,
@@ -607,7 +607,7 @@ impl MemoSynth<'_> {
         // upstream: `descs = [bookkeeper.getdesc(pbc) for pbc in
         // nextargvalues]`. `create_new_attribute` is defined on both
         // FrozenDesc and ClassDesc, so a memo argument set of frozen
-        // PBCs *or* classes is accepted (specialize.py:218-219).
+        // PBCs *or* classes is accepted (specialize.py).
         let mut descs = Vec::with_capacity(values.len());
         for v in &values {
             let host = match v {
@@ -690,11 +690,11 @@ impl MemoSynth<'_> {
     /// RPython's `make_subhelper` always returns a *function*; the
     /// block-tree port inlines those functions wherever the dispatch
     /// folds into a block, but the `store = nextfns` branch
-    /// (specialize.py:223-242) stores the subhelper *callables* in the
+    /// (specialize.py) stores the subhelper *callables* in the
     /// PBC memo fields and calls the `getattr` result. A shared block
     /// tree has no callable to store, so each such subhelper is emitted
     /// here as its own [`FunctionGraph`] wrapped in a [`GraphFunc`],
-    /// registered as a prebuilt graph (translator.py:50-52) so the
+    /// registered as a prebuilt graph (translator.py __init__) so the
     /// funcdesc's `buildgraph` returns it instead of flowing absent
     /// bytecode, and appended to the translator graph list. The returned
     /// [`HostObject`] is the callable PBC stored in the memo field.
@@ -731,7 +731,7 @@ impl MemoSynth<'_> {
 
         // A `GraphFunc` plus a synthetic `HostCode` so `newfuncdesc`
         // derives the subhelper signature (`argnames[firstarg:]`) when
-        // the call site is annotated (bookkeeper.py:418).
+        // the call site is annotated (bookkeeper.py).
         let mut func = GraphFunc::new(
             &full_name,
             Constant::new(ConstValue::Dict(Default::default())),
@@ -755,7 +755,7 @@ impl MemoSynth<'_> {
             .try_annotator()
             .ok_or_else(|| AnnotatorError::new("memo finish: annotator not attached"))?;
         // translator.py: `buildflowgraph` returns a prebuilt graph
-        // as-is; translator.py:60 would otherwise append it to the graph
+        // as-is; translator.py would otherwise append it to the graph
         // list, so register it there here too.
         annotator
             .translator
@@ -838,7 +838,7 @@ impl SharedUnionFindInfo for MemoTable {
 
 /// One `Bookkeeper.all_specializations[funcdesc]` entry: the
 /// `UnionFind(compute_one_result)` family of argument tuples
-/// (specialize.py:298) plus a per-family latch for the host-call error.
+/// (specialize.py) plus a per-family latch for the host-call error.
 ///
 /// The UnionFind info factory has an infallible `Fn(&K) -> V` signature,
 /// so the `compute_one_result` host call (`func(*args)`) cannot return a
@@ -1121,7 +1121,7 @@ mod tests {
 
     /// `finish` on a one-bool-arg table synthesises a single dispatch
     /// block: `exitswitch` on the arg, with a False exit and a True exit,
-    /// each returning the precomputed constant (specialize.py:189-205).
+    /// each returning the precomputed constant (specialize.py).
     #[test]
     fn finish_bool_arg_builds_exitswitch_dispatch() {
         let (_ann, bk) = ann_bk();
@@ -1197,7 +1197,7 @@ mod tests {
     }
 
     /// `finish` is idempotent-guarded: a second call once `graph` is set
-    /// reports the "already finished" invariant (specialize.py:131).
+    /// reports the "already finished" invariant (specialize.py).
     #[test]
     fn finish_twice_errors() {
         let (_ann, bk) = ann_bk();
@@ -1214,7 +1214,7 @@ mod tests {
     }
 
     /// `finish` on a `[PBC-set, bool]` table takes the `store = nextfns`
-    /// branch (specialize.py:223-242): after fixing the PBC argument the
+    /// branch (specialize.py): after fixing the PBC argument the
     /// remaining bool dispatch is not constant, so each PBC member's memo
     /// field holds a standalone subhelper *callable* (registered as a
     /// prebuilt graph), and the top dispatch reads the field with

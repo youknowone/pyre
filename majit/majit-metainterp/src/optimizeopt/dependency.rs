@@ -239,7 +239,7 @@ impl Path {
 
 static IMAGINARY_NODE_INDEX: AtomicI32 = AtomicI32::new(987_654_321);
 
-/// dependency.py:131-300: A node in the dependency graph.
+/// dependency.py Node: A node in the dependency graph.
 /// Each node wraps one operation and maintains forward/backward dependency edges.
 #[derive(Clone, Debug)]
 pub struct Node {
@@ -419,7 +419,7 @@ pub struct DependencyGraph {
 }
 
 impl DependencyGraph {
-    /// dependency.py:556-572: Build a dependency graph from loop operations.
+    /// dependency.py __init__: Build a dependency graph from loop operations.
     /// Uses DefTracker and IntegralForwardModification for precise analysis.
     pub fn build(ops: &[Op], constant_of: &dyn Fn(OpRef) -> Option<i64>) -> Self {
         let nodes: Vec<Node> = ops
@@ -1009,7 +1009,7 @@ pub(crate) fn schedule_operations(graph: &DependencyGraph) -> Vec<usize> {
 
     // Compute in-degrees from deps. `deps`/`users` are keyed by node position,
     // so `in_degree` is indexed by position too — an imaginary node's `idx`
-    // field is a synthetic sentinel (dependency.py:395-403), not its position.
+    // field is a synthetic sentinel (dependency.py ImaginaryNode), not its position.
     let mut in_degree = vec![0usize; n];
     for (i, node) in graph.nodes.iter().enumerate() {
         in_degree[i] = node.deps.len();
@@ -1045,7 +1045,7 @@ pub(crate) fn schedule_operations(graph: &DependencyGraph) -> Vec<usize> {
 
 // ── dependency.py: IndexVar ──────────────────────────
 
-/// dependency.py:981-1093: Linear combination of an index variable.
+/// dependency.py IndexVar: Linear combination of an index variable.
 /// Represents `var * (coefficient_mul / coefficient_div) + constant`.
 #[derive(Clone, Debug)]
 pub struct IndexVar {
@@ -1054,7 +1054,7 @@ pub struct IndexVar {
     /// The BOUND operand for `var`, captured from the real op arg at build time
     /// so `get_operations` can carry `var` as `Operand::Op`/`InputArg` instead
     /// of a position-only box. RPython's IndexVar holds the box object
-    /// (`dependency.py:983 self.var`); pyre's flat-OpRef `var` loses the
+    /// (`dependency.py self.var`); pyre's flat-OpRef `var` loses the
     /// producer, so the operand is captured alongside. `None` when no bound
     /// operand was available at construction (e.g. a synthetic-result var) —
     /// then `get_operations` binds a synthetic producer via `bound_from_opref`.
@@ -1110,12 +1110,12 @@ impl IndexVar {
         }
     }
 
-    /// dependency.py:1042-1044
+    /// dependency.py same_variable
     pub fn same_variable(&self, other: &IndexVar) -> bool {
         self.var == other.var
     }
 
-    /// dependency.py:1046-1058
+    /// dependency.py same_mulfactor
     pub fn same_mulfactor(&self, other: &IndexVar) -> bool {
         if self.coefficient_mul == other.coefficient_mul
             && self.coefficient_div == other.coefficient_div
@@ -1132,12 +1132,12 @@ impl IndexVar {
         false
     }
 
-    /// dependency.py:1060-1063
+    /// dependency.py constant_diff
     pub fn constant_diff(&self, other: &IndexVar) -> i64 {
         self.constant - other.constant
     }
 
-    /// dependency.py:1030-1033
+    /// dependency.py is_identity
     pub fn is_identity(&self) -> bool {
         self.coefficient_mul == 1 && self.coefficient_div == 1 && self.constant == 0
     }
@@ -1168,7 +1168,7 @@ impl IndexVar {
         self.var
     }
 
-    /// dependency.py:1035-1040
+    /// dependency.py clone
     pub fn clone_var(&self) -> Self {
         IndexVar {
             var: self.var,
@@ -1304,7 +1304,7 @@ impl IndexVar {
 
 // ── dependency.py: MemoryRef ────────────────────────
 
-/// dependency.py:1140-1220: A memory reference to an array object.
+/// dependency.py MemoryRef: A memory reference to an array object.
 /// Tracks the array pointer, descriptor, and index variable (linear
 /// combination) for adjacent-memory analysis.
 #[derive(Clone, Debug)]
@@ -1329,7 +1329,7 @@ impl MemoryRef {
         }
     }
 
-    /// dependency.py:1158-1167: symmetric adjacency check
+    /// dependency.py is_adjacent_to: symmetric adjacency check
     pub fn is_adjacent_to(&self, other: &MemoryRef) -> bool {
         if !self.same_array(other) {
             return false;
@@ -1348,7 +1348,7 @@ impl MemoryRef {
             == 0
     }
 
-    /// dependency.py:1169-1178: asymmetric adjacency (self is after other)
+    /// dependency.py is_adjacent_after: asymmetric adjacency (self is after other)
     pub fn is_adjacent_after(&self, other: &MemoryRef) -> bool {
         if !self.same_array(other) {
             return false;
@@ -1409,7 +1409,7 @@ impl MemoryRef {
 
 // ── dependency.py: Dependency (rich edge) ─────────────
 
-/// dependency.py:412-471: A dependency edge in the graph.
+/// dependency.py Dependency: A dependency edge in the graph.
 /// Carries which args caused the dependency and whether it's a failarg dep.
 #[derive(Clone, Debug)]
 pub struct Dependency {
@@ -1463,7 +1463,7 @@ impl Dependency {
 
 // ── dependency.py: DefTracker ─────────────────────────
 
-/// dependency.py:473-535: Tracks definitions of OpRefs during
+/// dependency.py DefTracker: Tracks definitions of OpRefs during
 /// dependency graph construction. Maps each OpRef to the node(s)
 /// that define it, enabling def-use chain queries.
 pub struct DefTracker {
@@ -1481,7 +1481,7 @@ impl DefTracker {
         }
     }
 
-    /// dependency.py:479-480
+    /// dependency.py add_non_pure
     pub fn add_non_pure(&mut self, node_idx: usize) {
         self.non_pure.push(node_idx);
     }
@@ -1503,7 +1503,7 @@ impl DefTracker {
             .unwrap_or_default()
     }
 
-    /// dependency.py:494-495
+    /// dependency.py is_defined
     pub fn is_defined(&self, arg: OpRef) -> bool {
         self.defs.contains_key(&arg)
     }
@@ -1533,7 +1533,7 @@ impl DefTracker {
 
 // ── dependency.py: IntegralForwardModification ────────
 
-/// dependency.py:877-978: Calculates integral modifications on integer
+/// dependency.py IntegralForwardModification: Calculates integral modifications on integer
 /// boxes. Propagates INT_ADD/INT_SUB/INT_MUL through IndexVar linear
 /// combinations, and recognizes array access patterns for MemoryRef.
 pub struct IntegralForwardModification<'a> {

@@ -121,7 +121,7 @@ KNOWN_SKIPS = {
     # opts out everywhere, which is a fact about the build rather than about
     # one host.
     "test.test_interpreters": "package skips itself on a free-threaded build (Py_GIL_DISABLED)",
-    # `test/test_types.py:13` imports `_datetime` at module scope. PyPy reaches
+    # `test/test_types.py` imports `_datetime` at module scope. PyPy reaches
     # `datetime` through its pure-Python implementation and ships no `_datetime`
     # extension module, so that import cannot succeed here without the stub
     # `AGENTS.md` rules out; the module stays blocked on a decision about the
@@ -949,7 +949,7 @@ def run_module(binary: Path, module: str, mode: str, timeout: int,
                 module_env = env.copy()
             module_env.pop("MAJIT_STATS", None)
         if mode == "script" and module == "test.test_regrtest":
-            # libregrtest/setup.py:88-96 `setup_process` keeps a non-ASCII
+            # libregrtest/setup.py `setup_process` keeps a non-ASCII
             # environment value present for every test process.  Script mode
             # deliberately bypasses that setup, but test_regrtest verifies the
             # runner-owned invariant itself, so reproduce the same environment

@@ -198,7 +198,7 @@ fn callee_rca_virtual_state_summary(
 
 /// Root any GcRef payload reachable from a single `_forwarded` slot (the
 /// `AbstractInputArg.forwarded` / `AbstractResOp.forwarded` host,
-/// resoperation.py:233-242 / :700). PyPy's Python GC walks `_forwarded`
+/// resoperation.py / :700). PyPy's Python GC walks `_forwarded`
 /// transitively; pyre pins each GcRef on the shadow stack instead.
 /// Used by `ExportedState::root_all_gcrefs` to keep
 /// `PtrInfo::Constant` / `Const::Ref` payloads live across GC pauses.
@@ -264,7 +264,7 @@ fn refresh_forwarded_const_ref(
 /// `pyjitpl.py compile_trace`'s `live_arg_boxes[num_green_args:]` —
 /// `runtime_boxes` are the original boxes, InputArg and Op alike.
 /// `generate_guards` reads them via `getint`/`getref_base` /
-/// `get_runtime_field` (virtualstate.py:48-55, :493). A raw OpRef does
+/// `get_runtime_field` (virtualstate.py, :493). A raw OpRef does
 /// not carry `_resint`/`_resref`, so materialize each stamped value as
 /// an inline Const — the same recovery `closing_jump_runtime_boxes`
 /// already performs for bridges. InputArg values live on
@@ -723,7 +723,7 @@ impl UnrollOptimizer {
     /// Hand `optimizer`'s resume memo to the metainterpreter's root area for
     /// the rest of this compile.
     ///
-    /// optimizer.py:732 gives every `Optimizer` its own `ResumeDataLoopMemo`,
+    /// optimizer.py gives every `Optimizer` its own `ResumeDataLoopMemo`,
     /// and `store_final_boxes_in_guard` fills that memo's `rd_consts` with live
     /// GCREFs as it numbers each guard. RPython reaches them through the
     /// optimizer the compiling frame holds; here the walker reaches only what
@@ -969,11 +969,11 @@ impl UnrollOptimizer {
             // sequence is bit-identical to the input — this wrap is a
             // structural alignment with RPython's `trace.get_iter()`
             // call site, not a functional change.
-            // opencoder.py:264 `inputarg_from_tp(arg.type)` — fresh inputargs
+            // opencoder.py `inputarg_from_tp(arg.type)` — fresh inputargs
             // are typed via `self.trace_inputargs`, the recorder-supplied
             // Box list (length must equal `num_inputs`). Derive the &[Type]
             // surface TraceIterator expects from each Box's variant tag
-            // (resoperation.py:719/727/739).
+            // (resoperation.py/727/739).
             debug_assert_eq!(self.trace_inputargs.len(), num_inputs);
             let p1_inputarg_types: Vec<majit_ir::Type> = self
                 .trace_inputargs
@@ -1249,10 +1249,10 @@ impl UnrollOptimizer {
         // Phase 2 (peeled-loop pass) runtime value seed.
         // The remap is deferred until after the Phase 2 `TraceIterator`
         // builds its `_cache`, because both inputargs AND body op results
-        // are reminted to fresh OpRefs (opencoder.py:259-267 / :399-401).
+        // are reminted to fresh OpRefs (opencoder.py / :399-401).
         // Using the iterator's `_cache` as the lookup table is the
         // RPython-orthodox equivalent of Box identity parallelism between
-        // `boxes` and `runtime_boxes` (virtualstate.py:646-648): each
+        // `boxes` and `runtime_boxes` (virtualstate.py generate_guards): each
         // Phase 1 raw position maps to the same Phase 2 box the iterator
         // allocated for it.  See the remap block after `p2_cache` is
         // built below.
@@ -1273,7 +1273,7 @@ impl UnrollOptimizer {
         opt_p2.call_pure_results = self.call_pure_results.clone();
         // RPython: same Optimizer instance keeps patchguardop across phases.
         // Phase 1 processes GUARD_FUTURE_CONDITION (from close_loop_args_at)
-        // which sets patchguardop. optimizer.py:294 parity — no synthetic
+        // which sets patchguardop. optimizer.py parity — no synthetic
         // fallback; the actual GFC provides rd_resume_position.
         opt_p2.patchguardop = self.phase1_patchguardop.clone();
         // gcreftracer.py parity: root GcRef values on the shadow stack.
@@ -1655,7 +1655,7 @@ impl UnrollOptimizer {
                     //
                     // Route through `force_box_for_end_of_preamble` (the
                     // per-box type-gating wrapper) rather than the inner
-                    // dispatcher, matching optimizer.py:306-319.
+                    // dispatcher, matching optimizer.py.
                     let resolved_jump_args: Vec<OpRef> = body_jump_args
                         .iter()
                         .map(|&arg| final_ctx.get_replacement_opref(arg))
@@ -1820,7 +1820,7 @@ impl UnrollOptimizer {
         // original box, not the renamed one — otherwise a distinct renamed
         // identity yields None and the loop-carried info (e.g. KnownClass)
         // is dropped. A dead duplicate slot's box carries no info
-        // (shortpreamble.py:414-417), so its None is correct.
+        // (shortpreamble.py __init__), so its None is correct.
         if let Some(ref final_ctx) = opt_p2.final_ctx {
             let mut infos = Vec::with_capacity(initial_sp.inputargs.len());
             for (i, inputarg) in initial_sp.inputargs.iter().enumerate() {
@@ -1932,7 +1932,7 @@ impl UnrollOptimizer {
                         seen_used.insert(ub);
                         current_label_args.push(ub);
                     } else {
-                        // shortpreamble.py:343-350 inputarg_from_tp parity:
+                        // shortpreamble.py create_short_inputargs inputarg_from_tp parity:
                         // when the short preamble needs a fresh label slot,
                         // PyPy creates a new typed InputArg from the source
                         // box's `.type`. Carry that into duplicate used_box
@@ -1941,7 +1941,7 @@ impl UnrollOptimizer {
                         //
                         // history.py:220 `box.type` is the authoritative
                         // source. Variant tag is the primary line-by-line
-                        // equivalent (resoperation.py:29
+                        // equivalent (resoperation.py
                         // `AbstractValue.type`); legacy untyped paths fall
                         // through to Phase 2's `final_ctx.opref_type` and
                         // the recorder's `trace_inputargs`.
@@ -2003,7 +2003,7 @@ impl UnrollOptimizer {
             // jump_to_existing_trace, NOT the peeled body's own jump arglist.
             // `runtime_boxes[i]` is read un-forwarded via `getint`/`getref_base`
             // (the box's own observed value), while `boxes[i]` (= forwarded body
-            // jump args) drives the virtual-state match (virtualstate.py:646
+            // jump args) drives the virtual-state match (virtualstate.py generate_guards
             // reads them as parallel-but-distinct lists).
             //
             // `exported_runtime_boxes` is the recorded JUMP arglist threaded
@@ -2586,7 +2586,7 @@ pub struct ExportedState {
     /// `partial_trace.inputargs` (compile.py:362, history.py:509).
     /// Keeps the preamble's `AbstractInputArg` instances alive so that
     /// `compile_retrace`'s `optimize_peeled_loop` reads `_forwarded` off
-    /// the same objects (resoperation.py:700
+    /// the same objects (resoperation.py
     /// `AbstractInputArg._forwarded`). Each entry is `Rc::clone` cheap;
     /// the vec is bounded by `ExportedState` lifetime. Populated only by
     /// `export_state_with_bounds`.
@@ -2596,7 +2596,7 @@ pub struct ExportedState {
     /// follow-up `compile_retrace` spawns a fresh optimizer that only
     /// sees the imported `ExportedState`, so the OpRc identities the
     /// preamble mutated `_forwarded` on must travel through here
-    /// (resoperation.py:233-242 `_forwarded` host).
+    /// (resoperation.py `_forwarded` host).
     pub(crate) partial_trace_operations: Vec<majit_ir::OpRc>,
     /// #173 producer-rooting: keeps the Phase-1 producer `Op` that each
     /// exported short-box `res` is bound to (`res.bound_op()`) alive into
@@ -3067,7 +3067,7 @@ impl ExportedState {
     /// `Rc`); GcRef updates have to replace the entire `Rc` with a fresh
     /// one because the inner enum is immutable.
     ///
-    /// **Aliasing preservation**: RPython virtualstate.py:712-728
+    /// **Aliasing preservation**: RPython virtualstate.py
     /// `VirtualStateConstructor.create_state` caches by Python object
     /// identity, so a GC pause never breaks the "two aliased jump args
     /// share one VirtualStateInfo" invariant. Rust's `Rc<...>` is immutable
@@ -3082,7 +3082,7 @@ impl ExportedState {
         use crate::optimizeopt::info::PtrInfo;
         use crate::optimizeopt::virtualstate::{VirtualStateInfo, VirtualStateInfoNode};
         use std::rc::Rc;
-        // virtualstate.py:712 cache parity: snapshot original Rc identities
+        // virtualstate.py create_state cache parity: snapshot original Rc identities
         // so we can re-share post-update slots that aliased pre-GC.
         let original_ptrs: Vec<usize> = self
             .virtual_state
@@ -3560,7 +3560,7 @@ impl OptUnroll {
         // (compile.py:362) identity carriage: snapshot the InputArgRc /
         // OpRc lists the preamble pass mutated `_forwarded` on. A later
         // `compile_retrace` reads `Op.forwarded` / `InputArg.forwarded`
-        // directly off the same objects (resoperation.py:233-242 / :700),
+        // directly off the same objects (resoperation.py AbstractResOpOrInputArg / :700),
         // the PyPy-orthodox identity carry.
         //
         // Walk `ctx.inputargs` (the canonical inputarg-order OpRef list)
@@ -4065,7 +4065,7 @@ impl OptUnroll {
                         .short_preamble_producer
                         .take()
                         .expect("identity gate requires a short-preamble producer");
-                    // shortpreamble.py:283-296 / 311-341 parity:
+                    // shortpreamble.py produce_arg / 311-341 parity:
                     // setup() returns false when an op references an
                     // unresolvable Phase 1 OpRef. Treat this exactly
                     // like RPython's "produce_arg returned None →
@@ -4266,7 +4266,7 @@ impl OptUnroll {
                 // RPython: jump_arg Box inherits info via identity.
                 // In majit, propagate PtrInfo from short_inputarg (which
                 // has info from Phase 1 export) to the resolved jump_arg.
-                // shortpreamble.py:414-425 parity: propagate PtrInfo from
+                // shortpreamble.py __init__ parity: propagate PtrInfo from
                 // Phase 1 export to jump_args so guards are redundant.
                 let resolved_has_info = ctx
                     .get_box_replacement_operand_opt(jump_arg)
@@ -5565,7 +5565,7 @@ fn assemble_peeled_trace_with_jump_args(
     // Collect preamble-defined OpRefs BEFORE adding extra label args,
     // so we can filter out virtual remnants (removed New ops).
     //
-    // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: preamble-defined
+    // resoperation.py InputArgInt/727/739 InputArg{Int,Ref,Float}: preamble-defined
     // inputargs carry `box.type` intrinsically (history.py:220). Mint
     // typed variants from `inputarg_types` so this set's OpRefs match the
     // typed mints used at trace start / Phase 2 import under variant-aware
@@ -5574,7 +5574,7 @@ fn assemble_peeled_trace_with_jump_args(
         let mut s: indexmap::IndexSet<OpRef> = (0..body_num_inputs)
             .map(|i| {
                 let pos = inputarg_base + i as u32;
-                // history.py:220 box.type / resoperation.py:719/727/739
+                // history.py:220 box.type / resoperation.py InputArgInt/727/739  allow-line-citation
                 // InputArgInt/Float/Ref invariant: every label / inputarg
                 // carries a value-box class. RPython has no InputArgVoid;
                 // a missing type at this site is a structural bookkeeping
@@ -6141,7 +6141,7 @@ fn assemble_peeled_trace_with_jump_args(
                 // Pad if JUMP is shorter than the target label.
                 while jump_args.len() < target_label_args.len() {
                     let extra_idx = jump_args.len().saturating_sub(target_base_len);
-                    // shortpreamble.py:465-476
+                    // shortpreamble.py add_preamble_op
                     // ExtendedShortPreambleBuilder.add_preamble_op:
                     //
                     //   self.label_args.append(op)
@@ -8727,7 +8727,7 @@ mod tests {
         assert_eq!(ctx2.imported_short_pure_ops.len(), 1);
         // RPython parity: extra_same_as is populated lazily by add_preamble_op
         // (called from optimizer.force_box's potential_extra_ops.pop path).
-        // shortpreamble.py:432-440 record the SameAs Box at use-box time, not
+        // shortpreamble.py record the SameAs Box at use-box time, not
         // at produce_op time — verify the lazy population fires.
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let _ = optimizer.force_box(forced, &mut ctx2);
@@ -10225,7 +10225,7 @@ mod tests {
     /// the guards `generate_guards` produced, which upstream can do because
     /// `reached_loop_header` emits a GUARD_FUTURE_CONDITION before the closing
     /// JUMP of every trace that reaches it — a bridge included
-    /// (pyjitpl.py:2991-2993). pyre records that GFC only on the loop path, so
+    /// (pyjitpl.py). pyre records that GFC only on the loop path, so
     /// a bridge arrives here with whatever `optimize_bridge` could synthesize
     /// from its own body guards, and a bridge with no such guard arrives with
     /// none. Skip the target token instead of dereferencing.
@@ -10244,7 +10244,7 @@ mod tests {
         // The incoming state knows nothing statically; the target demands a
         // narrow bound and the concrete runtime value falls inside it, which is
         // virtualstate.py:493-498's runtime fallback — it manufactures
-        // INT_GE/INT_LE + GUARD_TRUE pairs (intutils.py:1264
+        // INT_GE/INT_LE + GUARD_TRUE pairs (intutils.py make_guards
         // `IntBound.make_guards`) rather than rejecting the target.
         let incoming = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
         let runtime_box = OpRef::const_int(5);

@@ -1,7 +1,7 @@
 //! Interpreter-level list helpers that need access to `space.eq_w`.
 //!
 //! PyPy equivalent: method bodies on `ListStrategy.find_or_count`
-//! (`pypy/objspace/std/listobject.py:941`) and the descr callers that
+//! (`pypy/objspace/std/listobject.py`) and the descr callers that
 //! propagate exceptions from `space.eq_w`. The raw list container
 //! (`W_ListObject`) and typed fast paths live in
 //! `pyre-object::listobject`; the generic `__eq__` loop lives here where

@@ -78,7 +78,7 @@ impl RegisterHints {
     /// import time the way Python can.
     fn dispatch(&self, opcode: OpCode, longevity: &mut LifetimeManager, op: &Op, position: i32) {
         match opcode {
-            // reghint.py:43-45
+            // reghint.py consider_int_neg
             OpCode::IntNeg | OpCode::IntInvert => {
                 self.consider_int_neg(longevity, op, position);
             }
@@ -99,7 +99,7 @@ impl RegisterHints {
             OpCode::IntAdd | OpCode::NurseryPtrIncrement => {
                 self.consider_int_add(longevity, op, position);
             }
-            // reghint.py:88-93
+            // reghint.py consider_int_sub
             OpCode::IntSub => {
                 self.consider_int_sub(longevity, op, position);
             }
@@ -224,7 +224,7 @@ impl RegisterHints {
     }
 
     /// reghint.py `consider_int_lshift` (shared with rshift /
-    /// uint_rshift per aliases at reghint.py:114-115).
+    /// uint_rshift per aliases at reghint.py).
     ///
     /// Shift amount must go in ecx (x86 `shl`/`shr` only accept cl).
     /// Fix `ecx` for `y` at this position, and bias the result to

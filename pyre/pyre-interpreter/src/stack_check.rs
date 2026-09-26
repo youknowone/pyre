@@ -35,7 +35,7 @@
 //!
 //! [`stack_check`] is the Rust-side inline fast path. The JIT prologue
 //! emits the equivalent inline sequence directly (see
-//! `rpython/jit/backend/x86/assembler.py:1080
+//! `rpython/jit/backend/x86/assembler.py _call_header_with_stack_check
 //! _call_header_with_stack_check`).
 
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering};
@@ -552,7 +552,7 @@ pub extern "C" fn pyre_stack_check_slowpath_for_backend(current: usize) -> u8 {
     r
 }
 
-/// Cranelift-callable one-shot probe combining the rstack.py:42 fast
+/// Cranelift-callable one-shot probe combining the rstack.py stack_check fast
 /// path and the stack.c:25 slowpath into a single `extern "C"`
 /// function. Cranelift's IR does not expose a "read current SP"
 /// intrinsic, so it calls this helper instead of emitting the inline
@@ -727,7 +727,7 @@ pub fn set_recursion_limit(new_limit: i32) -> Result<(), PyError> {
     // 0.001 * 163840))`.  Both of pyre's root stacks are sized off it: the
     // jitframe one compiled code pushes to, and the interpreter's `push_roots`
     // stack, which holds a slot per pinned livevar across a recursive call.
-    // The allocation is eager (`shadowstack.py:351-364` resizes on the spot),
+    // The allocation is eager (`shadowstack.py` resizes on the spot),
     // and the `MAX_RECURSION_LIMIT` clamp above is the only thing bounding it:
     // `vm.py:83-88` adds that same 10**6 ceiling precisely "because huge values
     // cause huge shadowstacks to be allocated (or MemoryErrors)".  A tighter

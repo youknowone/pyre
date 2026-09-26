@@ -2272,7 +2272,7 @@ impl HomeLiveness {
 ///   `push_gcmap_for_call_release_gil` is unconditional; `emit`'s own
 ///   docstring reads "not for CALL_RELEASE_GIL". The bit describes the callee,
 ///   while another thread may collect for the span the GIL is released.
-/// - `COND_CALL_VALUE` — `x86/regalloc.py:952-1011` builds the gcmap with
+/// - `COND_CALL_VALUE` — `x86/regalloc.py consider_cond_call` builds the gcmap with
 ///   `get_gcmap()` and reads no effect info at all.
 ///
 /// A call carrying no call descr also keeps its reloads: this narrows a
@@ -3842,7 +3842,7 @@ pub struct CaInlineParams {
 
 /// Inline nursery-bump fast-path parameters for post-rewrite
 /// `CallMallocNursery*` ops (rewrite.py's malloc fast path over the
-/// gc.py:525-531 `get_nursery_free_addr`/`get_nursery_top_addr` surface,
+/// gc.py `get_nursery_free_addr`/`get_nursery_top_addr` surface,
 /// which the x86 backend lowers as `malloc_cond`: load free, bump, compare
 /// top, call the slow path only on overflow). `None` keeps every allocation
 /// on the `wasm_jit_alloc` helper call.
@@ -10576,7 +10576,7 @@ fn emit_guard_false(
 /// `llsupport/regalloc.py next_op_can_accept_cc` — the comparison at `i`
 /// may hand its condition straight to the op at `i + 1` instead of
 /// materialising a boolean, when that op is the condition's only reader. x86
-/// leaves the condition in the flags (`x86/regalloc.py:265
+/// leaves the condition in the flags (`x86/regalloc.py force_allocate_reg_or_cc
 /// force_allocate_reg_or_cc`, ported to the dynasm sibling at
 /// `next_op_can_accept_cc` in `majit-backend-dynasm/src/regalloc.rs`); wasm's
 /// operand stack plays that role — [`push_cond`]'s i32 stays on the stack and
@@ -10667,7 +10667,7 @@ fn next_ovf_guard(ops: &[Op], i: usize) -> Option<&Op> {
 /// The spill belongs in this arm rather than in one shared exit handler after
 /// the trace. x86/assembler.py `write_pending_failure_recoveries` can
 /// place its recovery stubs after the hot code because `GuardToken.fail_locs`
-/// (llsupport/assembler.py:24) freezes the register or stack location the
+/// (llsupport/assembler.py) freezes the register or stack location the
 /// allocator gave each fail argument *at the guard*, so a stub reads a fixed
 /// home and nothing keeps the value live past its own guard. Wasm has no way
 /// to record such a location: the allocator is the engine's, and it derives
@@ -12144,7 +12144,7 @@ fn push_cond(
 }
 
 /// Push whether a fused GuardTrue/GuardFalse fails. Native backends invert the
-/// integer condition code in place (`x86/assembler.py:1778-1784`); spelling the
+/// integer condition code in place (`x86/assembler.py genop_guard_guard_true`); spelling the
 /// inverse Wasm comparison directly avoids materialising `cmp; i32.eqz` at the
 /// hot guard site. Float ordered comparisons deliberately keep `i32.eqz`:
 /// their apparent inverse is not equivalent for NaN/unordered operands.

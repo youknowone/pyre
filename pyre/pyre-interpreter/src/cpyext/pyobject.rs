@@ -557,7 +557,7 @@ pub(super) unsafe fn realize(raw: *mut CPyObject) {
 /// Null once the collector has cleared the link, and null while the mirror's
 /// deallocator runs: `tp_dealloc` calling back into an API that would rebuild
 /// the interpreter object is what upstream fatally errors on
-/// (`pyobject.py:310-327`), because the object it would hand back is being
+/// (`pyobject.py`), because the object it would hand back is being
 /// freed.  Returning null makes the caller take its own not-found path instead.
 ///
 /// # Safety

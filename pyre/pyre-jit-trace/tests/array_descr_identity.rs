@@ -85,7 +85,7 @@ fn object_pointer_slices_have_no_headerless_descr() {
 
 /// `arraylen_gc` is `rewrite_op_getarraysize` → `cpu.arraydescrof(ARRAY)`.
 /// A pool entry with `len_offset is None` is the `nolength=True` shape;
-/// blackhole `bh_arraylen_gc` then panics (`llmodel.py:585`). The
+/// blackhole `bh_arraylen_gc` then panics (`llmodel.py`). The
 /// assembler must not emit that opcode against such a descr.
 #[test]
 fn arraylen_gc_descrs_carry_lendescr() {

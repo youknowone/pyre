@@ -238,7 +238,7 @@ impl IntBound {
     /// ```
     ///
     /// Returns RPython's `INFO_NULL` / `INFO_NONNULL` / `INFO_UNKNOWN`
-    /// (info.py:13-15) so callers can compare directly against the
+    /// (info.py) so callers can compare directly against the
     /// upstream constants without remapping.
     pub fn getnullness(&self) -> i8 {
         if self.known_gt_const(0) || self.known_lt_const(0) || self.tvalue != 0 {

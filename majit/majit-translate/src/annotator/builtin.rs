@@ -120,7 +120,7 @@ pub(crate) fn arg_at<'a>(
 
 // (Retired 2026-05-12, strict-parity pass.)  The
 // `args_s_concrete_or_panic` eager-prefix helper was a deviation
-// from `unaryop.py:940 simple_call_SomeBuiltin`'s bind-then-body
+// from `unaryop.py call simple_call_SomeBuiltin`'s bind-then-body
 // sequence (upstream's analyser body raises `AttributeError` on the
 // FIRST slot touch, not at a blanket prefix unwrap).  Every
 // `builtin_*` analyser in this file now uses [`arg_at`] at the touch
@@ -129,7 +129,7 @@ pub(crate) fn arg_at<'a>(
 // buffer.  Rtyper-phase callers (`SomePtr.call` / `SomeLLPtr.call`)
 // touch each slot via `annotation_to_lltype` in a list comprehension
 // — those now drive `arg_at` per iteration to mirror upstream
-// `lltype.py:1573-1574` AttributeError semantics.
+// `lltype.py` AttributeError semantics.
 
 /// Process-wide `BUILTIN_ANALYZERS` table, lazily populated on first
 /// access by [`register_builtins`]. Mirrors upstream's module-level
@@ -145,7 +145,7 @@ fn analyzers() -> &'static HashMap<String, BuiltinAnalyzer> {
 /// `True` iff the given qualname has a registered analyser.
 ///
 /// Mirrors upstream's `x in BUILTIN_ANALYZERS` membership test at
-/// `bookkeeper.py:309` and `classdesc.py:632`.
+/// `bookkeeper.py` and `classdesc.py:632`.  allow-line-citation
 pub(crate) fn is_registered(qualname: &str) -> bool {
     analyzers().contains_key(qualname)
 }
@@ -182,7 +182,7 @@ fn allowed_kwds(qualname: &str) -> &'static [&'static str] {
 }
 
 /// Upstream `SomeBuiltin.call(self, args)` dispatcher
-/// (unaryop.py:940-946).
+/// (unaryop.py).
 ///
 /// ```python
 /// def call(self, args, implicit_init=False):
@@ -661,7 +661,7 @@ pub fn builtin_range(
 ) -> Result<SomeValue, AnnotatorError> {
     // Arity check fires first per `builtin.py:49-84` shape; per-slot
     // access defers through `arg_at` so a `None` slot surfaces as
-    // "unannotated arg" at the touch site (matching `unaryop.py:940
+    // "unannotated arg" at the touch site (matching `unaryop.py call
     // simple_call_SomeBuiltin`'s bind-then-body sequence) instead of
     // the entry-point prefix unwrap.
     let (s_start, s_stop, s_step) = match args_s.len() {
@@ -820,7 +820,7 @@ pub fn builtin_reversed(
 /// reduces to:
 ///
 /// * constant immutable receivers → `SomeBool(bool(s_obj.const))`
-/// * empty-tuple literal `()` → `SomeBool(False)` (unaryop.py:347-351)
+/// * empty-tuple literal `()` → `SomeBool(False)` (unaryop.py)
 /// * everything else → unrefined `SomeBool()`
 ///
 /// Knowntypedata propagation (`SomeObject._propagate_knowntypedata`) is
@@ -1507,8 +1507,8 @@ fn cast_address_intrinsic(
 /// The MIR front has already recovered a logical list-items array from the
 /// raw pointers before emitting this call, so the receiver arrives as the
 /// list, matching the list-taking spelling `rlist.ll_arraymove`
-/// (`rpython/rtyper/rlist.py:561-564`) rather than the ll-items one
-/// (`rgc.ll_arraymove`, `rpython/rlib/rgc.py:415-418`), which takes
+/// (`rpython/rtyper/rlist.py`) rather than the ll-items one
+/// (`rgc.ll_arraymove`, `rpython/rlib/rgc.py`), which takes
 /// `lst.ll_items()`.
 ///
 /// The declared signature is the whole surface, and both spellings declare
@@ -1551,7 +1551,7 @@ fn ll_arraymove_intrinsic(
 /// `SomeInstance(classdef)` for that root so the field read resolves;
 /// the rtyper lowers the call to a `cast_pointer` (rclass
 /// `pairtype(InstanceRepr, InstanceRepr).convert_from_to`,
-/// rclass.py:1035 — its `r_ins1.classdef is None` arm already emits the
+/// rclass.py — its `r_ins1.classdef is None` arm already emits the
 /// root→concrete cast).  `args[0]` is the pointer operand; `args[1]` is
 /// the constant root name.
 ///
@@ -1567,7 +1567,7 @@ fn ll_arraymove_intrinsic(
 /// `SomeAddress`), which is what the GCREF and `GcArray` boundaries hand in,
 /// is narrowed to the root's projected annotation instead — carrying the
 /// operand's nullability, since `cast_opaque_ptr` answers
-/// `nullptr(PTRTYPE.TO)` for a null (`lltype.py:1008-1010`).
+/// `nullptr(PTRTYPE.TO)` for a null (`lltype.py`).
 fn cast_instance_intrinsic(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1610,7 +1610,7 @@ fn cast_instance_intrinsic(
     // Nullability travels with the value, not with the target spelling: a
     // downcast of a nullable pointer is itself nullable, and a null operand
     // is a legal one — `cast_opaque_ptr` answers `nullptr(PTRTYPE.TO)` for it
-    // (`lltype.py:1008-1010`).  Computed here so the target-spelling arms
+    // (`lltype.py`).  Computed here so the target-spelling arms
     // below cannot bypass it the way the block further down already honours
     // it for the instance case.
     let operand_can_be_none = match operand {
@@ -1627,10 +1627,10 @@ fn cast_instance_intrinsic(
     };
     // The symmetric external-item boundary rlist uses: a GCREF read from
     // `GcArray(GCREF)` becomes its concrete external pointer (StringRepr
-    // here).  `AbstractBaseListRepr.recast` (`rpython/rtyper/rlist.py:67-68`)
+    // here).  `AbstractBaseListRepr.recast` (`rpython/rtyper/rlist.py`)
     // is the external/internal convert, and the GCREF half of it is
     // `pairtype(GCRefRepr, Repr).convert_from_to`
-    // (`rpython/rtyper/lltypesystem/rgcref.py:61-65`), which genops
+    // (`rpython/rtyper/lltypesystem/rgcref.py`), which genops
     // `cast_opaque_ptr`.  The synthetic marker carries that target spelling;
     // return the projected string for any GC pointer source, while an
     // already-string source is the identity.
@@ -1700,7 +1700,7 @@ fn cast_instance_intrinsic(
             // operand unchanged when its variant matches the model, the
             // same operand-agnostic pass-through the erasure twin
             // `cast_address_intrinsic` already performs.  `convert_from_to`
-            // (rclass.py:1035) constrains only the destination repr, not
+            // (rclass.py) constrains only the destination repr, not
             // the operand shape.  A genuine variant mismatch is still a
             // producer bug, surfaced with the root that was expected.
             if projected.tag() == other.tag() {
@@ -2003,7 +2003,7 @@ fn primitive_integer_conversion(
 }
 
 /// Upstream `ann_cast_ptr_to_int(s_ptr)`
-/// (rpython/rtyper/lltypesystem/lltype.py:2367-2369).
+/// (rpython/rtyper/lltypesystem/lltype.py).
 ///
 /// ```python
 /// @analyzer_for(cast_ptr_to_int)
@@ -2050,7 +2050,7 @@ fn lltype_direct_ptradd(
 }
 
 /// Upstream `ann_cast_int_to_ptr(PtrT, s_int)`
-/// (rpython/rtyper/lltypesystem/lltype.py:2379-2382).
+/// (rpython/rtyper/lltypesystem/lltype.py).
 ///
 /// ```python
 /// @analyzer_for(cast_int_to_ptr)
@@ -2269,7 +2269,7 @@ fn malloc_typed_alloc(
 ///
 /// Like [`malloc_typed_alloc`], the result models the freshly-allocated
 /// object by its value/instance shape, not `ann_malloc`'s `SomePtr(Ptr(T))`
-/// (lltype.py:2242): the allocation feeds the boxing / `NewWithVtable` path
+/// (lltype.py): the allocation feeds the boxing / `NewWithVtable` path
 /// that consumes the object directly, so a `SomePtr` wrapper here would
 /// diverge from the established `malloc_typed` result modeling.
 fn malloc_raw_alloc(
@@ -2347,7 +2347,7 @@ fn r_dict_helper(
     }
     // upstream `_r_dict_helper` binds these positions first; the body
     // touches `s_eqfn`/`s_hashfn` immediately so the per-touch `arg_at`
-    // unwrap fires here (matching `unaryop.py:940 simple_call_
+    // unwrap fires here (matching `unaryop.py call simple_call_
     // SomeBuiltin`'s bind-then-body sequence).
     let s_eqfn = arg_at(args_s, 0, analyser).clone();
     let s_hashfn = arg_at(args_s, 1, analyser).clone();
@@ -2539,7 +2539,7 @@ fn host_hasattr(
 /// mirroring `annmodel.union(*s_values)` being called with the unpacked
 /// `*s_values` tuple.  Each slot is unwrapped via [`arg_at`] at touch
 /// time so an unannotated slot surfaces at the first iteration that
-/// reads it — matching `unaryop.py:940 simple_call_SomeBuiltin`'s
+/// reads it — matching `unaryop.py call simple_call_SomeBuiltin`'s
 /// bind-then-body sequence rather than an entry-point eager prefix
 /// unwrap.
 fn union_many(s_values: &[Option<SomeValue>], analyser: &str) -> Result<SomeValue, AnnotatorError> {
@@ -2556,7 +2556,7 @@ fn union_many(s_values: &[Option<SomeValue>], analyser: &str) -> Result<SomeValu
 ///
 /// Delegates to [`super::unaryop::container_getanyitem`], the shared
 /// port of upstream `container.getanyitem(position, *variant)`
-/// (unaryop.py:341-342 / :402-403 / :480-500 / :664-665). The caller
+/// (unaryop.py / :402-403 / :480-500 / :664-665). The caller
 /// passes the iterator's `s_container` plus the variant string from
 /// `SomeIterator.variant` (upstream's `*variant` tuple), matching the
 /// logic in `unaryop.rs::someiterator_next` without requiring a live

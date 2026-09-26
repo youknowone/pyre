@@ -2,7 +2,7 @@
 # pyre-check: selfcheck-compiles=main
 # Self-checking regression guard for the cost of walking a MODULE dict's view.
 #
-# `celldict.py:188-192 getiterkeys`/`getitervalues` are lazy iterators upstream.
+# `celldict.py getiterkeys`/`getitervalues` are lazy iterators upstream.
 # Pyre's dict-view iterator cannot hold one — the GC-object layout has no slot
 # for it — so it keeps an integer cursor and asks the strategy for the `index`-th
 # entry per step (`DictStrategy::nth_item`).  The trait default answers that by

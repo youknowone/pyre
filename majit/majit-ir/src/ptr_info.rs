@@ -80,7 +80,7 @@ fn descr_field_len(descr: Option<&DescrRef>) -> usize {
 /// allocations are not optimized.
 ///
 /// Used by `virtualize.py:28` (NEW_ARRAY size gate) and
-/// `info.py:561` (per-element initialization gate).
+/// `info.py` (per-element initialization gate).
 pub fn reasonable_array_index(index: i64) -> bool {
     (0..=150_000).contains(&index)
 }
@@ -155,7 +155,7 @@ pub struct StrPtrInfo {
     /// through `StrPtrInfo(AbstractVirtualPtrInfo)` (vstring.py).
     /// Lifted into `AbstractVirtualPtrInfo` per RPython `_attrs_`
     /// inheritance contract; `make_virtual_info` dedups across finish()
-    /// calls by comparing fieldnums (resume.py:309-314).
+    /// calls by comparing fieldnums (resume.py).
     pub avpi: AbstractVirtualPtrInfo,
 }
 
@@ -289,7 +289,7 @@ pub struct InstancePtrInfo {
     /// Known class, as the immortal vtable address (`ConstInt(ptr2int(typeptr))`,
     /// model.py:199-201) — a plain integer, not a traced `GcRef`.
     pub known_class: Option<i64>,
-    /// info.py:175 _fields — cached field values.
+    /// info.py AbstractStructPtrInfo _fields — cached field values.
     /// RPython stores both normal Boxes and PreambleOp sentinels in the
     /// same list. Four inline slots keep the 16→32→64 grow off the heap.
     pub fields: CachedFieldList,
@@ -319,7 +319,7 @@ pub struct ArrayPtrInfo {
     pub descr: DescrRef,
     /// Known bounds on the array length.
     pub lenbound: IntBound,
-    /// info.py:579 _items — cached item values for constant indices.
+    /// info.py getitem _items — cached item values for constant indices.
     /// RPython stores both normal Boxes and PreambleOp sentinels.
     pub items: Vec<FieldEntry>,
     /// info.py:91-92
@@ -399,7 +399,7 @@ pub struct RawBufferPtrInfo {
     pub buffer: RawBuffer,
     /// info.py:91-92
     pub last_guard_pos: i32,
-    /// info.py:420: calldescr for CALL_I(func, size) raw malloc.
+    /// info.py _force_elements: calldescr for CALL_I(func, size) raw malloc.
     /// Saved from the original CALL_I op during virtualization.
     pub calldescr: Option<DescrRef>,
     /// info.py `_cached_vinfo` — see AbstractVirtualPtrInfo.
@@ -407,7 +407,7 @@ pub struct RawBufferPtrInfo {
 }
 
 impl RawBufferPtrInfo {
-    /// virtualize.py:52-58 creates RawBufferPtrInfo(cpu, func, size),
+    /// virtualize.py make_virtual_raw_memory creates RawBufferPtrInfo(cpu, func, size),
     /// whose constructor initializes `self.buffer = RawBuffer(cpu, None)`.
     pub fn new(func: i64, size: usize, calldescr: Option<DescrRef>) -> Self {
         Self {
@@ -500,7 +500,7 @@ pub enum PtrInfo {
     /// `make_constant_class` results — class set, no descr, no fields —
     /// are also stored here as `Instance(descr=None, known_class=Some(...))`,
     /// matching PyPy's `info.InstancePtrInfo(None, class_const)` factory
-    /// at optimizer.py:147.
+    /// at optimizer.py.
     Instance(InstancePtrInfo),
     /// Non-virtual GC struct with cached field info.
     /// info.py: StructPtrInfo (is_virtual = False)
@@ -533,7 +533,7 @@ pub enum PtrInfo {
     Str(StrPtrInfo),
 }
 
-/// vstring.py:207-208 / 255-257 / 319-324: enumerate the child OpRefs that
+/// vstring.py _visitor_walk_recursive / 255-257 / 319-324: enumerate the child OpRefs that
 /// each `StrPtrInfo` variant registers via `_visitor_walk_recursive`.  Used
 /// by the generic walkers (`PtrInfo::visitor_walk_recursive`, `num_fields`)
 /// so Str-typed virtuals participate in GC rooting and resume encoding.
@@ -672,7 +672,7 @@ impl PtrInfo {
         PtrInfo::NonNull { last_guard_pos: -1 }
     }
 
-    // ── info.py:100-118: last_guard_pos methods ──
+    // ── info.py get_last_guard: last_guard_pos methods ──
 
     /// info.py: get_last_guard
     pub fn get_last_guard_pos(&self) -> Option<usize> {

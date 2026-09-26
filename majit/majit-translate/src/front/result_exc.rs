@@ -432,9 +432,9 @@ pub(crate) fn lower_result_exc_returns(
     //
     // Upstream carries the reason as a value in the equivalent position:
     // `_handle_list_call` raises `NotSupported(prefix + oopspec_name)`
-    // (`rpython/jit/codewriter/jtransform.py:1796`), naming the shape it
+    // (`rpython/jit/codewriter/jtransform.py`), naming the shape it
     // refused, before `rewrite_op_direct_call` catches it and falls through
-    // to a residual call (`jtransform.py:512-520`).  The fail-safe residual
+    // to a residual call (`jtransform.py`).  The fail-safe residual
     // is the same here — this only records the reason before it is
     // discarded, so the refusal stays countable.
     let outcome = lower_result_exc_returns_inner(graph, tail_forwarded_returns, spec);
@@ -1316,7 +1316,7 @@ pub(crate) struct RewireOutcome {
 /// RPython never materialises either shell at this boundary: for the motivating
 /// gateway, PyPy's `W_IOBase.writelines_w(self, space, w_lines)` receives the
 /// value directly and raises on the graph exception edge
-/// (`pypy/module/_io/interp_iobase.py:303-323`).  The MIR frontend records the
+/// (`pypy/module/_io/interp_iobase.py`).  The MIR frontend records the
 /// owners while the concrete `Option<T>` / closure / `Result<T, E>` types are
 /// still available, then [`rewire_option_ok_or_else_try_sites`] restores that
 /// same value-or-raise graph shape after lowering.
@@ -1427,8 +1427,8 @@ pub(crate) fn rewire_result_exc_call_sites(
 /// only as an ordinary scoped Result call would leave the foreign method as a
 /// residual.  RPython's flow graph has neither shell: it carries the value on
 /// the normal edge and the exception object on the exceptional edge
-/// (`rpython/translator/exceptiontransform.py:212-242`,
-/// `rpython/jit/codewriter/jtransform.py:406-469`).
+/// (`rpython/translator/exceptiontransform.py transform_completely`,
+/// `rpython/jit/codewriter/jtransform.py rewrite_op_direct_call`).
 ///
 /// The ordinary `?` matcher validates before its sole fallible mutation (the
 /// positional payload collapse).  The Option splice begins only after that

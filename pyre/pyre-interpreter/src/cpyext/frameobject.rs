@@ -23,7 +23,7 @@ use std::hash::BuildHasherDefault;
 /// C-visible `PyFrameObject`, the twin of `struct _frame` in
 /// `include/pyre3.14t/frameobject.h`.
 ///
-/// Field order is `frameobject.py:18-23 PyFrameObjectFields`.
+/// Field order is `frameobject.py PyFrameObjectFields`.
 #[repr(C)]
 pub struct CPyFrameObject {
     pub ob_base: CPyObject,
@@ -83,7 +83,7 @@ fn is_frame(w_obj: PyObjectRef) -> bool {
 }
 
 /// What `tp_basicsize` a synthesized mirror of `w_type` carries —
-/// `frameobject.py:29 basicstruct=PyFrameObject.TO` for the frame type, and
+/// `frameobject.py basicstruct=PyFrameObject.TO` for the frame type, and
 /// the `PyObject`-sized default for every other type this runtime defines.
 pub(super) fn basicsize(w_type: PyObjectRef) -> isize {
     let frame_type = frame_type();
@@ -124,7 +124,7 @@ fn fields(raw: *mut CPyObject) -> Option<*mut CPyFrameObject> {
 }
 
 /// Fill a freshly allocated mirror of `w_obj` when `w_obj` is a frame —
-/// `frameobject.py:35-49 frame_attach`.
+/// `frameobject.py frame_attach`.
 ///
 /// Reached from `pyobject::ensure_mirror`, so an extension handed a frame this
 /// runtime is executing reads the same fields as one it built itself.
@@ -189,7 +189,7 @@ pub(super) fn forget_block(raw: *mut CPyObject) {
 }
 
 /// Build the interpreter frame a mirror [`PyFrame_New`] handed out stands for
-/// — `frameobject.py:62-77 frame_realize`.
+/// — `frameobject.py frame_realize`.
 ///
 /// Reached from `pyobject::realize`, so the frame is built at the first point
 /// something reads the mirror as a value.  What C wrote up to then is what it
@@ -249,7 +249,7 @@ pub(super) fn realize_pending(raw: *mut CPyObject) {
     );
 }
 
-/// `frameobject.py:80-89 PyFrame_New` — a frame the caller fills in and hands
+/// `frameobject.py PyFrame_New` — a frame the caller fills in and hands
 /// to [`super::pytraceback::PyTraceBack_Here`].
 ///
 /// The frame itself is not built here: `locals` is routinely NULL and the line
@@ -298,7 +298,7 @@ pub unsafe extern "C" fn PyFrame_New(
     py_frame
 }
 
-/// `frameobject.py:92-100 PyTraceBack_Here` — prepend `frame` to the pending
+/// `frameobject.py PyTraceBack_Here` — prepend `frame` to the pending
 /// exception's traceback.
 ///
 /// `-1` for no pending exception is upstream's answer and CPython's: there is

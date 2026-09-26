@@ -10,7 +10,7 @@
 /// FrontendOps and provides `record_nospec` / `record_same_as` lives in
 /// `history.rs` as `impl TraceCtx`.  Pyre callers reach the recorder via
 /// `MetaInterp.history.record*` mirroring
-/// `pyjitpl.py:2455+ self.history.record2(...)`.
+/// `pyjitpl.py+ self.history.record2(...)`.
 use crate::opencoder::{Box as OcBox, TraceRecordBuffer};
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
@@ -63,9 +63,9 @@ pub struct TracePosition {
     /// opencoder.py:498 `self._index` — count of box-yielding (non-void)
     /// ops; equals `_count` in `recorder::Trace`.
     pub _index: u32,
-    /// opencoder.py:567 `len(self._snapshot_data)`.
+    /// opencoder.py cut_point `len(self._snapshot_data)`.
     pub snapshot_data_len: usize,
-    /// opencoder.py:567 `len(self._snapshot_array_data)`.
+    /// opencoder.py cut_point `len(self._snapshot_array_data)`.
     pub snapshot_array_data_len: usize,
     /// pyre-only: `Trace::guard_count` at the cut point, so
     /// [`Trace::cut`] restores it without rescanning `ops`.  RPython keeps
@@ -205,7 +205,7 @@ pub struct SnapshotFrame {
     pub boxes: Vec<SnapshotTagged>,
 }
 
-/// opencoder.py:603 trace-snapshot encode parity: tagged reference to a
+/// opencoder.py _encode trace-snapshot encode parity: tagged reference to a
 /// live value at a recorder snapshot site.  The recorder only sees Box
 /// (live in deadframe fail_args) and Const (compile-time constant)
 /// payloads; TAGVIRTUAL belongs to the resume-numbering layer
@@ -231,7 +231,7 @@ pub enum SnapshotTagged {
     /// `opref.ty()`.
     Box(majit_ir::OpRef, majit_ir::Type),
     /// Compile-time constant value with type.
-    /// RPython resume.py:157: Const boxes carry their type (INT/REF/FLOAT)
+    /// RPython resume.py getconst: Const boxes carry their type (INT/REF/FLOAT)
     /// for correct TAGINT/TAGCONST encoding in rd_numb.
     Const(i64, majit_ir::Type),
 }
@@ -1453,7 +1453,7 @@ impl Trace {
     ///
     /// One helper call can emit more than one guard: a vable array access
     /// promotes the `isstandard` PTR_EQ in `_nonstandard_virtualizable`
-    /// (`pyjitpl.py:1135-1138`) and then the index in
+    /// (`pyjitpl.py`) and then the index in
     /// `_get_arrayitem_vable_index` (`:1201-1216`).  Upstream captures resume
     /// data inside each `implement_guard_value`, so both are stamped; a caller
     /// that only reaches the guards after the helper returns walks back over

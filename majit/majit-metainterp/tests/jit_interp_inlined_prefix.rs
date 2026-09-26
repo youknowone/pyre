@@ -2,7 +2,7 @@
 //! structs that embed it.
 //!
 //! `rclass.py:548` builds every instance struct as `MkStruct(name, ('super',
-//! rbase.object_type), *own_fields)`, and `rclass.py:987-1001
+//! rbase.object_type), *own_fields)`, and `rclass.py getfield
 //! InstanceRepr.getfield` resolves a field against the repr that OWNS it,
 //! recursing to `self.rbase` with `force_cast=True` when it is not its own.
 //! `jtransform.py:881` therefore always reads the descr off the declaring
@@ -139,7 +139,7 @@ fn the_embedding_structs_keep_their_own_sizes() {
     assert_eq!(std::mem::size_of::<PrefixedWithTail>(), 24);
     assert_eq!(std::mem::offset_of!(PrefixedWithTail, extra), 16);
     // The offset every redirected access assumes, and the one the expansion
-    // asserts for itself — `lltype.py:296-305` admits an inlined substructure
+    // asserts for itself — `lltype.py _first_struct` admits an inlined substructure
     // only as the leading field.
     assert_eq!(std::mem::offset_of!(Prefixed, base), 0);
     assert_eq!(std::mem::offset_of!(PrefixedWithTail, base), 0);

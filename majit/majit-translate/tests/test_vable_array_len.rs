@@ -299,7 +299,7 @@ fn address_of_the_vable_array_slot_is_marked_not_a_read() {
 /// read that escapes its block trips `_check_no_vable_array`, and a read
 /// consumed in place but marked `taken_by_address` silently lowers to
 /// `getarrayitem_gc`.  `fast2locals` is the graph a policy that admitted
-/// loops would open first (`pyframe.py:539` decorates it `@jit.unroll_safe`),
+/// loops would open first (`pyframe.py` decorates it `@jit.unroll_safe`),
 /// so it is where both have to hold.
 #[test]
 fn every_vable_array_read_in_fast2locals_is_consumed_in_its_block() {

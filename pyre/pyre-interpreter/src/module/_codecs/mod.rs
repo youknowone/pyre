@@ -597,7 +597,7 @@ fn surrogateescape_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 // PyPy `pypy/module/_codecs/interp_codecs.py:560-568` marks this module-startup
-// registry population `@not_rpython`: `moduledef.py:87-100` calls it while the
+// registry population `@not_rpython`: `moduledef.py` calls it while the
 // MixedModule is installed, not from the translated `CodecState` constructor.
 // `importing::install_builtin_modules` is pyre's matching host-only install
 // phase and calls this function after registering `_codecs`.

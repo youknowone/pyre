@@ -1415,7 +1415,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         // returns a remainder with the sign of the divisor (`3 % -2
         // == -1`, not `1`). Float mod delegates to `float_py_mod`
         // matching upstream `descr_mod`
-        // (`pypy/objspace/std/floatobject.py:543`), which uses
+        // (`pypy/objspace/std/floatobject.py`), which uses
         // `math_fmod` plus the sign-of-denominator correction and
         // `copysign(0.0, y)` signed-zero output.
         (OpKind::Mod, [a, b]) => coerce_arith(a, b).and_then(|p| match p {
@@ -1740,7 +1740,7 @@ pub(crate) fn float_py_mod(x: f64, y: f64) -> f64 {
 
 /// Python `float // float` floor-div result. Line-by-line port of the
 /// `floordiv` half of `_divmod_w` at
-/// `pypy/objspace/std/floatobject.py:824-859`, including the snap-to-
+/// `pypy/objspace/std/floatobject.py`, including the snap-to-
 /// nearest-integer pass at `:850-857` that corrects the fp-precision
 /// wobble in `(x - mod) / y` (mathematically integral, but the
 /// approximation may land just below or above the true value).
@@ -2096,7 +2096,7 @@ fn cross_type_ordering(a: &ConstValue, b: &ConstValue) -> bool {
     }
 }
 
-// Dispatcher plumbing (operation.py:66-300 + pairtype.py:75-96).
+// Dispatcher plumbing (operation.py:66-300 + pairtype.py).  allow-line-citation
 //
 // Upstream `class SingleDispatchMixin` / `class DoubleDispatchMixin`
 // store the registration table on the HLOperation subclass itself
@@ -2213,7 +2213,7 @@ pub enum CanOnlyThrow {
     List(Vec<BuiltinException>),
     /// `can_only_throw = lambda *args: [...]` — upstream line 841
     /// `return can_only_throw(*args)` branch. Returns `None` to mirror
-    /// `_dict_can_only_throw_*` helpers (binaryop.py:527-535) that
+    /// `_dict_can_only_throw_*` helpers (binaryop.py _dict_can_only_throw_keyerror) that
     /// defer to `op.canraise` for r_dict's unrestricted throw set.
     #[expect(
         clippy::type_complexity,
@@ -2347,7 +2347,7 @@ impl HLOperation {
         // walks `type(None).__mro__` so unbound args reach a
         // SomeObject-tagged spec.  `simple_call`
         // (`operation.py:663` `simple_call_SomeObject`) and
-        // `unaryop.py:114 immutablevalue` also tolerate None mid-
+        // `unaryop.py immutablevalue` also tolerate None mid-
         // fixpoint.  Pyre's `Vec<SomeValue>` shape forces eager
         // unwrap before dispatch and raises "unbound argument"; this
         // closes off the Option<SomeValue> propagation epic at
@@ -3392,7 +3392,7 @@ mod tests {
 
     #[test]
     fn constfold_int_float_compare_handles_mantissa_boundary() {
-        // Port test for `pypy/objspace/std/floatobject.py:103-148
+        // Port test for `pypy/objspace/std/floatobject.py make_compare_func
         // make_compare_func`'s bigint-aware Int↔Float compare. f64
         // mantissa is 53 bits; `Int(2^53 + 1)` rounds to `2^53` under
         // naive `as f64` cast, which would misclassify `Int(2^53 + 1)
@@ -3871,7 +3871,7 @@ mod tests {
 
     #[test]
     fn constfold_float_mod_signed_zero_matches_pypy() {
-        // Line-by-line port test for `pypy/objspace/std/floatobject.py:543-563
+        // Line-by-line port test for `pypy/objspace/std/floatobject.py descr_mod
         // descr_mod`'s signed-zero handling. The naive `x - y * (x /
         // y).floor()` produces `+0.0` regardless of denominator sign;
         // upstream uses `mod = math.copysign(0.0, y)` so an exact

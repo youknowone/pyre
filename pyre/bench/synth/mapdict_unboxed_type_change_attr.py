@@ -1,7 +1,7 @@
 # pyre-check: max-pypy-ratio=25
 # Changing an unboxed int or float slot to the other type creates a boxed map;
 # the promoted-map guard must deopt before the old raw-storage read or write is
-# reused for the new representation (mapdict.py:577-584, 600-619, 905-916).
+# reused for the new representation (mapdict.py, 600-619, 905-916).
 #
 # The three backends record the same counters here. `ALLOW_UNBOXING_INTS` holds
 # on every target, so `run_int`'s slot is unboxed and its read folds under the

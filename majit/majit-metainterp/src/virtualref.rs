@@ -70,7 +70,7 @@ pub struct ObjectHeader {
 ///
 /// Both fields are traced GC slots. `virtual_token` contains null, the
 /// prebuilt `JITFRAME_DUMMY`, or a JITFRAME GCREF, matching
-/// `virtualref.py:17-20` and `virtualizable.py:326-330`.
+/// `virtualref.py` and `virtualizable.py:326-330`.  allow-line-citation
 #[repr(C)]
 pub struct JitVirtualRef {
     /// `('super', rclass.OBJECT)` — typeptr slot at offset 0.
@@ -86,7 +86,7 @@ pub struct JitVirtualRef {
 /// real OBJECT_VTABLE pointer; the comparison `header.typeptr ==
 /// JIT_VIRTUAL_REF_VTABLE` is the structural equivalent of
 /// upstream's `inst.typeptr == self.jit_virtual_ref_vtable`.
-// `virtualref.py:21-23` allocates an OBJECT_VTABLE pointer, so its translated
+// `virtualref.py` allocates an OBJECT_VTABLE pointer, so its translated
 // identity occupies one target word rather than an unconditional u64.
 pub const JIT_VIRTUAL_REF_VTABLE: usize = 0x4A56_5221; // "JVR!"
 
@@ -128,9 +128,9 @@ pub unsafe fn vref_forced(ptr: *const u8) -> *mut u8 {
 
 /// `rpython/rlib/jit.py class InvalidVirtualRef(Exception)` —
 /// `force_virtual` raises this when `virtual_token == TOKEN_NONE`
-/// but `forced` is null (`virtualref.py:174-176`).  Pyre's single
+/// but `forced` is null (`virtualref.py`).  Pyre's single
 /// canonical definition lives in `crate::jit::InvalidVirtualRef`
-/// (mirrors `virtualref.py:9 from rpython.rlib.jit import
+/// (mirrors `virtualref.py from rpython.rlib.jit import
 /// InvalidVirtualRef`); re-exported here for convenience.
 pub use crate::jit::InvalidVirtualRef;
 
@@ -363,7 +363,7 @@ impl VirtualRefInfo {
     ///
     /// Returns `Err(InvalidVirtualRef)` when `virtual_token ==
     /// TOKEN_NONE` and `forced` is null — the vref was tracked but
-    /// never properly initialised (`virtualref.py:174-176`).
+    /// never properly initialised (`virtualref.py`).
     ///
     /// `force_now` mirrors upstream's
     /// `ResumeGuardForcedDescr.force_now(cpu, token)` contract
@@ -382,7 +382,7 @@ impl VirtualRefInfo {
     /// JIT frame performs during `cpu.force(token)` —
     /// `vref.virtual_token` becomes `TOKEN_NONE` and `vref.forced`
     /// becomes the materialised object.  The post-call assertions
-    /// (`virtualref.py:172-173`) verify these writebacks; pyre
+    /// (`virtualref.py`) verify these writebacks; pyre
     /// mirrors them as `debug_assert!`s after `force_now` returns.
     ///
     /// TODO (dependency injection).  Upstream
@@ -745,7 +745,7 @@ mod tests {
 
     /// Sanity: a real `JitVirtualRef` IS recognised by
     /// `is_virtual_ref` and the tracing helpers DO mutate it
-    /// (`virtualref.py:103-105` happy path).
+    /// (`virtualref.py` happy path).
     #[test]
     fn tracing_before_residual_call_mutates_real_vref() {
         let info = VirtualRefInfo::new();

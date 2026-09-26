@@ -362,14 +362,14 @@ impl Operand {
     }
 
     /// Wrap a bound op as `Operand::Op` (`Rc::clone`, cheap). The successor
-    /// (`resoperation.py:250`) — no `box_cache` memoization, the `Rc`
+    /// (`resoperation.py AbstractResOp`) — no `box_cache` memoization, the `Rc`
     /// itself IS the stable identity.
     pub fn from_bound_op(op: &OpRc) -> Operand {
         Operand::Op(op.clone())
     }
 
     /// Wrap a bound input arg as `Operand::InputArg` (`Rc::clone`). Successor
-    /// (`resoperation.py:699`).
+    /// (`resoperation.py AbstractInputArg`).
     pub fn from_bound_inputarg(ia: &InputArgRc) -> Operand {
         Operand::InputArg(ia.clone())
     }
@@ -484,7 +484,7 @@ impl Operand {
         }
     }
 
-    /// `resoperation.py:233 _pos` accessor: the pool index for `Op` /
+    /// `resoperation.py AbstractResOpOrInputArg _pos` accessor: the pool index for `Op` /
     /// `InputArg`; `Const` / `None` have no canonical position.
     pub fn position(&self) -> Option<u32> {
         match self.view() {
@@ -737,7 +737,7 @@ impl Operand {
 
     /// `optimizer.py:394 op.set_forwarded(newop)` — `Op` target. Routes to
     /// [`ForwardingHost::set_forwarded_op`], which carries the
-    /// `resoperation.py:241` self-cycle assert. Const has no `_forwarded`
+    /// `resoperation.py` self-cycle assert. Const has no `_forwarded`
     /// slot (`AbstractValue` invariant).
     pub fn set_forwarded_op(&self, target: &OpRc) {
         assert!(
@@ -794,9 +794,9 @@ impl Operand {
         self.with_forwarding_host("clear_forwarded", |h| h.clear_forwarded());
     }
 
-    /// `optimizer.py:99-113 getptrinfo` reader: the inner `PtrInfo` when
+    /// `optimizer.py getintbound getptrinfo` reader: the inner `PtrInfo` when
     /// `_forwarded` is `Info(OpInfo::Ptr(_))`, else `None`. Does not walk the
-    /// chain (`optimizer.py:99-113 getptrinfo`).
+    /// chain (`optimizer.py getintbound getptrinfo`).
     pub fn ptr_info(&self) -> Option<PtrInfoBorrow> {
         self.read_forwarding_host(None, |h| h.ptr_info())
     }
@@ -869,7 +869,7 @@ impl Operand {
 impl PartialEq for Operand {
     /// Object identity — pure `Rc::ptr_eq`
     /// (`forwarding.rs`): `AbstractValue` defines no `__eq__`
-    /// (`resoperation.py:29-39`), so every plain box-keyed dict keys by `is`.
+    /// (`resoperation.py`), so every plain box-keyed dict keys by `is`.
     /// `Op` / `InputArg` / `Const` each carry an `Rc`, so `==` is `ptr_eq` on
     /// that producer/const handle; two `none()` sentinels match (Python's
     /// singleton `None`). Equal-valued constants minted separately are NOT

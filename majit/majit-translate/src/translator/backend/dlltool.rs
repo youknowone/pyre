@@ -40,7 +40,7 @@
 //!         return self.so_name
 //! ```
 //!
-//! (`rpython/translator/c/dlltool.py:1-41`.)
+//! (`rpython/translator/c/dlltool.py`.)
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -55,7 +55,7 @@ use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;
 
 /// Port of `class CLibraryBuilder(CBuilder)` at
-/// `dlltool.py:7-40`.
+/// `dlltool.py`.
 #[derive(Clone)]
 pub struct CLibraryBuilder {
     /// Inherited `CBuilder` state. `:8-9` flip the class-level

@@ -21,7 +21,7 @@
 //!   as [`WriteEffects`] (`Top` sentinel + `HashSet<Effect>`). Both
 //!   `LowLevelType` and `ConstValue` implement `Eq + Hash`, so the
 //!   `HashSet` reproduces `frozenset`'s order-insensitive equality and
-//!   automatic dedup exactly (`writeanalyze.py:5-6`).
+//!   automatic dedup exactly (`writeanalyze.py`).
 //! * Upstream's `graphinfo` is either `None` or a `FreshMallocs`. The
 //!   `GraphAnalyzer` trait threads a concrete `I: GraphInfo`, so the
 //!   port uses `I = Option<FreshMallocs>`: `None` is upstream's `None`
@@ -29,7 +29,7 @@
 //!   `Some(fm)` is `compute_graph_info`'s `FreshMallocs(graph)`.
 
 // `TYPE` field/binding names mirror upstream's effect-tuple element
-// names (`writeanalyze.py:53` `op.args[0].concretetype` slot, llmemory
+// names (`writeanalyze.py analyze_simple_operation` `op.args[0].concretetype` slot, llmemory
 // `ofs.TYPE`); keep the upstream spelling rather than snake_case.
 #![allow(non_snake_case)]
 
@@ -327,7 +327,7 @@ fn arg_concretetype(op: &SpaceOperation, i: usize) -> LowLevelType {
 /// The `AddressOffset` carried by an offset constant's value. Upstream's
 /// `_get_effect_for_offset` `assert False`s on anything that is not a
 /// known offset subclass; a non-offset value here is that same fail-loud
-/// case (`writeanalyze.py:117`).
+/// case (`writeanalyze.py`).
 fn as_address_offset(v: &ConstValue) -> &AddressOffset {
     match v {
         ConstValue::AddressOffset(ofs) => ofs,
@@ -393,7 +393,7 @@ trait WriteAnalyzerMethods {
     }
 
     /// `_get_effect_for_offset(self, ofs, prefix='')`
-    /// (`writeanalyze.py:86-112`). `read` selects the `'read'` prefix.
+    /// (`writeanalyze.py`). `read` selects the `'read'` prefix.
     fn get_effect_for_offset(&self, ofs: &AddressOffset, read: bool) -> Effect {
         match ofs {
             // `if isinstance(ofs, llmemory.CompositeOffset):`.
@@ -445,10 +445,10 @@ trait WriteAnalyzerMethods {
     }
 
     /// `WriteAnalyzer.analyze_simple_operation(self, op, graphinfo)`
-    /// (`writeanalyze.py:53-73`). Named distinctly from the trait method
+    /// (`writeanalyze.py`). Named distinctly from the trait method
     /// so `ReadWriteAnalyzer` can issue the upstream
     /// `WriteAnalyzer.analyze_simple_operation(self, op, graphinfo)`
-    /// super-call (`writeanalyze.py:169`).
+    /// super-call (`writeanalyze.py`).
     fn write_analyze_simple_operation(
         &self,
         op: &SpaceOperation,
@@ -527,7 +527,7 @@ fn arg_value(op: &SpaceOperation, i: usize) -> ConstValue {
 }
 
 /// `class WriteAnalyzer(graphanalyze.GraphAnalyzer)` at
-/// `writeanalyze.py:13-119`.
+/// `writeanalyze.py`.
 pub struct WriteAnalyzer<'t> {
     translator: &'t TranslationContext,
     /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py`).
@@ -620,7 +620,7 @@ impl<'t> GraphAnalyzer<WriteEffects, Option<FreshMallocs>> for ReadWriteAnalyzer
     }
 
     /// `analyze_simple_operation(self, op, graphinfo)`
-    /// (`writeanalyze.py:156-167`).
+    /// (`writeanalyze.py`).
     fn analyze_simple_operation(
         &mut self,
         op: &SpaceOperation,
@@ -772,7 +772,7 @@ mod tests {
 
     /// A `gc_store_indexed` whose offset arg is not an `AddressOffset`
     /// fails loud — upstream `_get_effect_for_offset` `assert False`s
-    /// (`writeanalyze.py:117`) rather than returning an empty set.
+    /// (`writeanalyze.py`) rather than returning an empty set.
     #[test]
     #[should_panic(expected = "implement me")]
     fn gc_store_indexed_non_offset_fails_loud() {

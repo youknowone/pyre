@@ -392,7 +392,7 @@ mod jit_module {
     // whose name could collide with an inherent method (or with another
     // trait's method), the macro must emit `<Type as Trait>::method` to
     // keep the fnaddr cast unambiguous. RPython `getfunctionptr(graph)`
-    // (call.py:174) does not need this because it uses graph identity;
+    // (call.py get_jitcode_calldescr) does not need this because it uses graph identity;
     // pyre's Rust-layer registry does need it.
     pub trait NameCollider {
         fn conflict(&self) -> i64;
@@ -828,7 +828,7 @@ mod jit_module {
         // alias.  `jit.py elidable(func)` puts `_elidable_function_ =
         // True` on the ORIGINAL `func` — which pyre stores as the hidden
         // `_orig_<NAME>_unlikely_name` — and NOT on the wrapper `result`
-        // returned at `jit.py:201`.
+        // returned at `jit.py`.
         assert!(std::hint::black_box(
             _elidable_function__orig_purefunction_promote_helper_unlikely_name
         ));
@@ -903,7 +903,7 @@ mod jit_module {
 }
 
 mod jit_struct {
-    //! Smoke tests for `#[jit_struct]` — descr.py:105-127 / :218-239 auto-discovery.
+    //! Smoke tests for `#[jit_struct]` — descr.py get_size_descr / :218-239 auto-discovery.
 
     use majit_ir::descr::{Descr, GcCache, LLType};
     use majit_ir::value::Type;

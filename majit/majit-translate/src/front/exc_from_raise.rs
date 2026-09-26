@@ -5,7 +5,7 @@
 //! The authoritative reference implementation is
 //! `flowspace::flowcontext::FlowContext::exc_from_raise`
 //! (`majit-translate/src/flowspace/flowcontext.rs`), which is a
-//! line-by-line port of upstream `rpython/flowspace/flowcontext.py:600`:
+//! line-by-line port of upstream `rpython/flowspace/flowcontext.py`:
 //!
 //! ```python
 //! def exc_from_raise(self, w_arg1, w_arg2):
@@ -69,7 +69,7 @@
 //!
 //! The Rust macro → RPython exception class mapping is an adapter
 //! decision (mirroring upstream's per-bytecode adapter at
-//! `flowcontext.py:2861 Instruction::RaiseVarargs`, which maps
+//! `flowcontext.py Instruction::RaiseVarargs`, which maps
 //! `BareRaise` / `Raise` / `RaiseCause` to the canonical `(w_arg1,
 //! w_arg2)` input of `exc_from_raise`).  Keeping the version- /
 //! host-specific wiring out of this helper means `front::mir` lowering

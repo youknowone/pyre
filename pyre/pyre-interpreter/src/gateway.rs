@@ -2507,7 +2507,7 @@ fn path_or_fd_w(
             (b".".to_vec(), obj_slot, -1, false)
         } else if pyre_object::bytesobject::is_bytes(obj) {
             // Only `bytes` itself. `_unwrap_path`'s buffer arm
-            // (`interp_posix.py:188-198`) takes any readable buffer and reports
+            // (`interp_posix.py`) takes any readable buffer and reports
             // it as deprecated; 3.14 completed that deprecation, so a
             // `bytearray` is now turned away by the same message every other
             // rejected type gets.
@@ -2736,7 +2736,7 @@ mod tests {
         );
     }
 
-    /// pypy/interpreter/signature.py:33-46 accessor parity:
+    /// pypy/interpreter/signature.py num_argnames accessor parity:
     /// `def f(a, b, /, c, d, *args, e, f, **kwargs): ...`
     /// → argnames=[a,b,c,d,e,f], varargname=args, kwargname=kwargs,
     /// posonlyargcount=2, kwonlyargcount=2.

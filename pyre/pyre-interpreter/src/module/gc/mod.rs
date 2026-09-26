@@ -1597,7 +1597,7 @@ crate::py_module! {
     },
     functions: {
         "disable_finalizers" / 0 = |_| {
-            // `interp_gc.py:85-89`: this lock is recursive and deliberately
+            // `interp_gc.py disable_finalizers`: this lock is recursive and deliberately
             // independent of gc.isenabled().
             if let Some(action) = user_del_action() {
                 disable_finalizers(action);
@@ -1654,7 +1654,7 @@ crate::py_module! {
             // referents.py get_referrers: list every app-level object,
             // then keep the ones whose direct referents include an argument.
             //
-            // The argument scan at `referents.py:166-168` has no `break`, and
+            // The argument scan at `referents.py` has no `break`, and
             // the multiplicity that follows from that is the contract: an
             // object referring to the same argument twice is reported once
             // (the membership test collapses it), but one that refers to two
@@ -1824,7 +1824,7 @@ crate::py_module! {
             Ok(w_bool_from(eligible && tracked))
         },
         "get_rpy_memory_usage" / 1 = |args| {
-            // referents.py:97-104 / inspector.py:76-77.  The size is just the
+            // referents.py get_rpy_memory_usage / inspector.py get_rpy_memory_usage.  The size is just the
             // translated object itself: no GC header and no reachable
             // internal storage.
             let _roots = pyre_object::gc_roots::push_roots();
@@ -1837,7 +1837,7 @@ crate::py_module! {
             Ok(w_int_new(size as i64))
         },
         "get_rpy_type_index" / 1 = |args| {
-            // referents.py:106-115: a positive index into the translated
+            // referents.py get_rpy_type_index: a positive index into the translated
             // type-info group (index zero is the upstream dummy member).
             let _roots = pyre_object::gc_roots::push_roots();
             let obj_slot = pyre_object::gc_roots::shadow_stack_len();

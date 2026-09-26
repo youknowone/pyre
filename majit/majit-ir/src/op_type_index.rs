@@ -26,7 +26,7 @@ pub struct OpTypeIndex<'a, T: AsRef<Op> = Op, A: AsRef<InputArg> = InputArg> {
     inputarg_pos: Cow<'a, PosIndex>,
     /// `op.pos().get().raw()` -> slice index in ops, skipping Void/None ops.
     /// Raw uniqueness is enforced at build time per RPython Box identity
-    /// (Box `is` semantics in `rpython/jit/metainterp/resoperation.py:38`).
+    /// (Box `is` semantics in `rpython/jit/metainterp/resoperation.py same_box`).
     op_pos: Cow<'a, PosIndex>,
 }
 
@@ -50,7 +50,7 @@ pub const NO_POS: u32 = u32::MAX;
 /// that term — the length is the trace's own raw span and nothing else.
 ///
 /// RPython keeps no positional side table at all: `box.type` lives on the box
-/// (`history.py:182`, `resoperation.py:29`) and the backends key their own
+/// (`history.py:182`, `resoperation.py AbstractValue`) and the backends key their own  allow-line-citation
 /// tables by box identity (`llsupport/regalloc.py` `longevity`,
 /// `aarch64/assembler.py` `loc`). This is the identity-keyed lookup those
 /// dicts provide, without a hash.
@@ -208,7 +208,7 @@ impl<'a, T: AsRef<Op>, A: AsRef<InputArg>> OpTypeIndex<'a, T, A> {
         pos
     }
 
-    /// `box.type` lookup. resoperation.py:29 / history.py:182: a typed
+    /// `box.type` lookup. resoperation.py AbstractValue / history.py:182: a typed  allow-line-citation
     /// Box carries its `.type` on the object itself, and pyre encodes
     /// that on the `OpRef` variant tag (`ConstInt`/`ConstPtr`/`ConstFloat`,
     /// `InputArg{Int,Ref,Float}`, `{Int,Float,Ref,Void}Op`). The tag IS
@@ -233,7 +233,7 @@ impl<'a, T: AsRef<Op>, A: AsRef<InputArg>> OpTypeIndex<'a, T, A> {
     }
 
     fn opref_type_at_or_after(&self, opref: OpRef, _op_index: Option<usize>) -> Option<Type> {
-        // history.py:182 / resoperation.py:29: `box.type` lives on the Box
+        // history.py:182 / resoperation.py AbstractValue: `box.type` lives on the Box  allow-line-citation
         // object itself; pyre's typed OpRef variants carry the matching
         // type tag intrinsically, so the tag IS the answer. The only
         // tag-less oprefs are `OpRef::None` and `TempVar` — neither is a

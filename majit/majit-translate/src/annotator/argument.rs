@@ -258,7 +258,7 @@ impl ArgumentsForTranslation {
         // unbound caller arg surfaces as `scope_w[i] = None`, matching
         // RPython where `annotator.annotation(arg) is None` flows
         // through to the callee's startblock binding (`description.py:
-        // 283-305`, `annrpython.py:315-336`).
+        // 283-305`, `annrpython.py`).
         let take = num_args.min(co_argcount);
         scope_w[..take].clone_from_slice(&args_w[..take]);
         let input_argcount = take;
@@ -428,7 +428,7 @@ impl ArgumentsForTranslation {
     /// `scope_w = [None] * scopelen; ...; return scope_w`).  None slots
     /// reach `setbinding` as "unresolved cell" — `bindinputargs` skips
     /// `setbinding` for them so the corresponding `Variable.annotation`
-    /// stays `None`, mirroring `annrpython.py:422-427` where upstream
+    /// stays `None`, mirroring `annrpython.py` where upstream
     /// `setbinding(a, None)` either writes None (fresh variable) or no-
     /// ops because `unionof(None, None)` collapses.
     pub fn match_signature(
@@ -521,7 +521,7 @@ impl ArgumentsForTranslation {
     }
 
     /// RPython `CallSpec.fromshape(cls, shape, data_w)`
-    /// (flowspace/argument.py:116), re-implemented over
+    /// (flowspace/argument.py), re-implemented over
     /// `Option<SomeValue>` for [`complex_args`].  `data_w` is the flat
     /// positional+keyword+stararg buffer; every slot may be `None`
     /// (unbound caller arg, mirroring `annotator.annotation(v) is None`)
@@ -566,7 +566,7 @@ pub fn simple_args(args_s: Vec<SomeValue>) -> ArgumentsForTranslation {
 
 /// RPython `simple_args(args_s)` parity entry that preserves
 /// `Option<SomeValue>` (`None` = unbound caller arg, mirroring
-/// `annotator.annotation(v) is None` at `bookkeeper.py:152` /
+/// `annotator.annotation(v) is None` at `bookkeeper.py consider_call_site` /
 /// `unaryop.py:114`).
 pub(crate) fn simple_args_opt(args_s: Vec<Option<SomeValue>>) -> ArgumentsForTranslation {
     ArgumentsForTranslation::new(args_s, None, None)

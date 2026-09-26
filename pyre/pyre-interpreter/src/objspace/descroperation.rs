@@ -73,7 +73,7 @@ fn bigint_mod_inverse(base: &BigInt, modulus: &BigInt) -> Result<BigInt, PyError
 }
 
 /// `rbigint.add_int_int_bigint_result`, the sum half of `_make_ovf2long`
-/// (intobject.py:509-514).  The overflow recovery takes two Signed words and
+/// (intobject.py).  The overflow recovery takes two Signed words and
 /// reaches the exact bigint sum in one elidable call, with no rbigint
 /// allocated for either operand; the MIR front retargets this seam to
 /// `jit_bigint_add_int_int` the way [`bigint_lshift_int_int_result`] is
@@ -234,7 +234,7 @@ fn bigint_lshift_count(a: &BigInt, shift: i64) -> Result<BigInt, PyError> {
 
 /// Machine-int-specialized counterpart of [`bigint_lshift_count`].
 ///
-/// intobject.py:861-868 calls
+/// intobject.py calls
 /// `rbigint.lshift_int_int_bigint_result(a, b)` directly on two Signed words.
 /// Rust exposes its implicit MemoryError as `Result`; the MIR front retargets
 /// this exact carrier to `jit_bigint_lshift_int_int_result`, preserving the
@@ -1953,7 +1953,7 @@ unsafe fn int_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // `checked_shl` checks only the count, so verify the arithmetic result by
     // shifting it back. The overflow recovery is the exact
     // `rbigint.lshift_int_int_bigint_result` helper used at
-    // intobject.py:861-868.
+    // intobject.py.
     // RPython's target constant `LONG_BIT` is 64 for pyre's i64 word.
     if vb < 64 {
         let shifted = va << vb;
@@ -3681,7 +3681,7 @@ pub(crate) enum SeqBase {
 /// descroperation.py `binop_impl` shortcut — the builtin sequence
 /// fast path (`str`/`list`/`tuple` concat) bypasses `__op__`/`__rop__`
 /// dispatch unless one operand is a subclass that actually overrides the
-/// forward or reflected special method (descroperation.py:664 "unicode +
+/// forward or reflected special method (descroperation.py "unicode +
 /// string subclass").  Returns `false` when no override exists so the
 /// caller concatenates directly — this also avoids re-entering the
 /// builtin `__add__` slot, which would recurse back into `add`.
@@ -5598,7 +5598,7 @@ pub(crate) fn ternary_builtin_type_error(
 }
 
 /// 3-arg `pow(a, b, c)` dispatch. PyPy 3.11's
-/// `pypy/objspace/descroperation.py:441` tries only the base's `__pow__`;
+/// `pypy/objspace/descroperation.py` tries only the base's `__pow__`;
 /// Python 3.14 changed this to offer the exponent's `__rpow__` the modulus
 /// too (`Objects/typeobject.c:slot_nb_power`).
 pub fn pow3(mut base: PyObjectRef, mut exp: PyObjectRef, mut modulus: PyObjectRef) -> PyResult {

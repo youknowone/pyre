@@ -314,7 +314,7 @@
 //! measured against a binary built from the same tree:
 //!
 //! * **The blackhole byte-interpreted `shift`.** `bhimpl_inline_call_*`
-//!   (`blackhole.py:1278-1319`) runs `cpu.bh_call_X(adr2int(jitcode.fnaddr),
+//!   (`blackhole.py`) runs `cpu.bh_call_X(adr2int(jitcode.fnaddr),
 //!   ...)`: upstream's blackhole calls a callee, it does not interpret it.
 //!   `#[jit_inline]` staged its helper jitcode with `fnaddr = 0`, so the whole
 //!   ported `bhimpl_inline_call_*` family was unreachable and every deopt
@@ -1198,9 +1198,9 @@ mod tests {
     /// pinned here:
     ///
     /// * `stats.get_all_loops()` counts LOOPS. `send_loop_to_backend` calls
-    ///   `add_new_loop` (compile.py:550); `send_bridge_to_backend` does not.
+    ///   `add_new_loop` (compile.py); `send_bridge_to_backend` does not.
     ///   Read as "loops and bridges" it reports 1 for a run that compiled 9.
-    /// * `warmspot.py:112` pins `set_param_trace_eagerness(2)` "for tests",
+    /// * `warmspot.py` pins `set_param_trace_eagerness(2)` "for tests",
     ///   against the `rlib/jit.py` PARAMETERS default of 200 that a translated
     ///   PyPy and majit both use. At 2 the same run compiles 1407 bridges.
     ///

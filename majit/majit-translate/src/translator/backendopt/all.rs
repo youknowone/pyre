@@ -16,7 +16,7 @@ use crate::translator::translator::TranslationContext;
 
 /// Port of upstream `backend_optimizations(translator, graphs=None,
 /// secondary=False, inline_graph_from_anywhere=False, **kwds)` at
-/// `all.py:35-130`.
+/// `all.py`.
 ///
 /// `kwds` is `Vec<(String, OptionValue)>` rather than `HashMap` so the
 /// caller's `**kwds` order is preserved through the
@@ -269,11 +269,11 @@ pub fn backend_optimizations(
 
 /// RPython `inline_malloc_removal_phase(config, translator, graphs,
 /// inline_threshold, inline_heuristic, call_count_pred=None,
-/// inline_graph_from_anywhere=False)` at `all.py:138-164`.
+/// inline_graph_from_anywhere=False)` at `all.py`.
 ///
 /// `call_count_pred` is the predicate `auto_inline_graphs` consults
 /// when an `instrument_count`-tagged op selects the
-/// profile-based-inline path (`inline.py:176-182`). Upstream's only
+/// profile-based-inline path (`inline.py`). Upstream's only
 /// `call_count_pred=...` caller is `backend_optimizations`'s
 /// `profile_based_inline` branch (`:106-113`); pyre's wrapper wires
 /// the parameter through verbatim so callers can opt-in once
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn backendopt_runs_to_terminal_gilanalysis() {
-        // Upstream `all.py:35-130` runs the full pipeline. The
+        // Upstream `all.py backend_optimizations` runs the full pipeline. The
         // local port has `inline` / `mallocs` /
         // `profile_based_inline` gated off via config kwds in
         // `ported_only_kwds`; every other pass — including

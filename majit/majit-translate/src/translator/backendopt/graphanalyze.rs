@@ -11,7 +11,7 @@
 //! Cycles are tolerated through [`DependencyTracker`], which uses
 //! [`crate::tool::algo::unionfind::UnionFind`] to merge the analysis
 //! result of every graph in a strongly-connected component (matching
-//! upstream `graphanalyze.py:210-258`).
+//! upstream `graphanalyze.py`).
 
 use crate::flowspace::model::{
     BlockRef, ConstValue, GraphKey, GraphRef, Hlvalue, LinkRef, SpaceOperation,
@@ -83,12 +83,12 @@ pub trait AnalyzerResult: Clone + 'static {
     fn finalize_builder(result: Self) -> Self;
 
     /// `join_two_results(result1, result2)`
-    /// (`graphanalyze.py:42-44`).
+    /// (`graphanalyze.py`).
     fn join_two_results(result1: Self, result2: Self) -> Self;
 }
 
 /// Boolean lattice for [`BoolGraphAnalyzer`] subclasses
-/// (`graphanalyze.py:261-284`). `False` is the bottom; `True` is the
+/// (`graphanalyze.py`). `False` is the bottom; `True` is the
 /// top and short-circuits every walk.
 impl AnalyzerResult for bool {
     fn bottom_result() -> Self {
@@ -121,7 +121,7 @@ impl AnalyzerResult for bool {
 }
 
 /// Per-graph metadata cached by [`GraphAnalyzer::compute_graph_info`]
-/// (`graphanalyze.py:76-77`). The default is `None` for every graph;
+/// (`graphanalyze.py`). The default is `None` for every graph;
 /// subclasses override to populate the slot. Pyre's `bool` lattice
 /// passes through `()` because no concrete subclass uses graph info
 /// today.
@@ -148,12 +148,12 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     }
 
     /// `analyze_simple_operation(op, graphinfo)`
-    /// (`graphanalyze.py:46-47`). No default — every concrete
+    /// (`graphanalyze.py`). No default — every concrete
     /// analyzer overrides this with the per-op verdict.
     fn analyze_simple_operation(&mut self, op: &SpaceOperation, graphinfo: &I) -> R;
 
     /// `analyze_external_call(funcobj, seen)`
-    /// (`graphanalyze.py:60-69`):
+    /// (`graphanalyze.py`):
     ///
     /// ```python
     /// def analyze_external_call(self, funcobj, seen=None):
@@ -170,7 +170,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     ///
     /// Like upstream, this receives the unwrapped `funcobj` (`_func`):
     /// `analyze`'s `direct_call` arm performs the `op.args[0].value._obj`
-    /// unwrap once (`graphanalyze.py:96`) and hands the result here, so
+    /// unwrap once (`graphanalyze.py`) and hands the result here, so
     /// the method surface matches `analyze_external_call(self, funcobj,
     /// seen)`.
     fn analyze_external_call(
@@ -184,7 +184,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     /// `analyze_exceptblock(block, seen)`
     /// (`graphanalyze.py`). Default is `bottom_result()`.
     /// Subclasses (e.g. `canraise.RaiseAnalyzer.analyze_exceptblock`
-    /// at `canraise.py:25 = None`) keep the upstream `block` parameter
+    /// at `canraise.py = None`) keep the upstream `block` parameter
     /// so the surface stays compatible with the caller in
     /// [`framework_analyze_direct_call`] and with the
     /// `analyze_exceptblock_in_graph` default below.
@@ -197,7 +197,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     }
 
     /// `analyze_exceptblock_in_graph(graph, block, seen)`
-    /// (`graphanalyze.py:54-55`). Upstream default routes through
+    /// (`graphanalyze.py`). Upstream default routes through
     /// [`Self::analyze_exceptblock`] — subclasses override this hook
     /// directly when they need the enclosing graph (canraise's
     /// `analyze_exceptblock_in_graph` at `canraise.py` walks
@@ -239,7 +239,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     /// `analyze_direct_call`'s `indirect_call` arm can resolve
     /// `Constant(graphs, Void)` keys back to graphs. Mirrors
     /// upstream's reliance on the implicit `self.translator` field
-    /// (`graphanalyze.py:11-12`).
+    /// (`graphanalyze.py`).
     fn translator(&self) -> &TranslationContext;
 
     /// Reach into the analyzer's internal `_analyzed_calls`
@@ -368,7 +368,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     }
 
     /// `analyze_direct_call(graph, seen)`
-    /// (`graphanalyze.py:139-177`). Subclasses that need to wrap
+    /// (`graphanalyze.py`). Subclasses that need to wrap
     /// the framework body (e.g. flag-based short-circuit before
     /// the recursive walk, mirroring upstream's `super().analyze_direct_call`
     /// idiom) call [`framework_analyze_direct_call`] directly.
@@ -381,7 +381,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     }
 
     /// `analyze_indirect_call(graphs, seen)`
-    /// (`graphanalyze.py:179-188`). Same super-call escape hatch as
+    /// (`graphanalyze.py`). Same super-call escape hatch as
     /// [`Self::analyze_direct_call`].
     fn analyze_indirect_call(
         &mut self,
@@ -418,10 +418,10 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
 }
 
 /// Framework body of `analyze_direct_call`
-/// (`graphanalyze.py:139-177`), exposed as a free function so
+/// (`graphanalyze.py`), exposed as a free function so
 /// subclass overrides can call it like upstream's
 /// `BoolGraphAnalyzer.analyze_direct_call(self, ...)` super-call
-/// (`gilanalysis.py:20-21`). Rust traits cannot have a `super` keyword;
+/// (`gilanalysis.py`). Rust traits cannot have a `super` keyword;
 /// the free function plays the same role.
 pub fn framework_analyze_direct_call<A, R, I>(
     analyzer: &mut A,
@@ -496,7 +496,7 @@ where
 }
 
 /// Framework body of `analyze_indirect_call`
-/// (`graphanalyze.py:179-188`).
+/// (`graphanalyze.py`).
 pub fn framework_analyze_indirect_call<A, R, I>(
     analyzer: &mut A,
     graphs: &[GraphRef],
@@ -534,7 +534,7 @@ where
 ///     return result
 /// ```
 ///
-/// Upstream (`graphanalyze.py:62-68`) resolves the callback graphs through the
+/// Upstream (`graphanalyze.py`) resolves the callback graphs through the
 /// annotator bookkeeper: `for function in funcobj._callbacks.callbacks:
 /// bk.getdesc(function).getgraphs()`. Pyre normalises `_callbacks` at the
 /// `_func.attrs` mirror (the same mirror that carries `external` / `canraise`

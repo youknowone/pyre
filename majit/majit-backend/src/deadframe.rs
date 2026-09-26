@@ -2,9 +2,9 @@
 //!
 //! `llmodel.py return ll_frame` — the deadframe IS the JitFrame. Values
 //! stay in `jf_frame[]` and are never copied out: `get_int_value(deadframe,
-//! index)` (`llmodel.py:437-451`) casts the opaque deadframe back to a
+//! index)` (`llmodel.py`) casts the opaque deadframe back to a
 //! JITFRAMEPTR and reads `jf_frame[index]` in place, and `get_latest_descr`
-//! (`llmodel.py:411-419`) does the same for `jf_descr`.
+//! (`llmodel.py`) does the same for `jf_descr`.
 
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -460,7 +460,7 @@ pub fn frame_build_passes() -> u64 {
 /// A root slot is that place. `shadowstack.py` (`push_stack` /
 /// `pop_stack`) names a root by its POSITION on a per-thread stack rather than
 /// by the address of the variable holding it, and `walk_stack_root`
-/// (`shadowstack.py:44-70`) reads each live slot and stores the forwarded
+/// (`shadowstack.py`) reads each live slot and stores the forwarded
 /// address back into the slot it walked. Addressing by position is what makes
 /// the holder's own address irrelevant, so this frame can be returned by value
 /// instead of being pinned behind a per-exit heap allocation.
@@ -611,7 +611,7 @@ pub struct JitFrameDeadFrame {
     /// The fail descriptor for this exit.  Stored as `DescrRef`
     /// (`Arc<dyn Descr>`) so the deadframe carries the same Arc identity
     /// the metainterp stamps onto `op.descr` — matching `frame.jf_descr =
-    /// descr` (llmodel.py:270) line-by-line.
+    /// descr` (llmodel.py force) line-by-line.
     pub fail_descr: ExitDescr,
     /// Original attached `jf_descr` identity for finish exits emitted by
     /// the metainterp (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`).

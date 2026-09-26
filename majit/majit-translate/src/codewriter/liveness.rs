@@ -29,7 +29,7 @@ use crate::regalloc::RegAllocator;
 /// `getcolor`; pyre still walks the conversion here at the liveness
 /// boundary because `FlatOp::Op` carries the pre-flatten
 /// `SpaceOperation` whose operand reads are kind-driven.
-/// RPython liveness.py:19-23.
+/// RPython liveness.py.
 ///
 /// Operand kinds read through `Variable.concretetype` directly via
 /// `variable_to_register`, so this entry no longer needs the
@@ -199,7 +199,7 @@ fn compute_liveness_pass(
     // `def_value` and `use_value` route a `FlatOp::Op`-side
     // [`Variable`] through regalloc to its [`Register`] before
     // joining the alive set.  Void / unallocated values are silently
-    // dropped (RPython's `flatten.py:325 if v.concretetype is not
+    // dropped (RPython's `flatten.py if v.concretetype is not
     // lltype.Void` makes the same filter at flatten time).
     let def_value = |alive: &mut HashSet<Register>, var: &crate::flowspace::model::Variable| {
         if let Some(r) = variable_to_register(var, regallocs) {

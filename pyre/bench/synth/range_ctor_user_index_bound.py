@@ -1,6 +1,6 @@
 # `range()` with a bound whose type supplies `__index__`.
 # `functional.py:461-474 W_Range.descr_new` converts each bound with
-# `space.index`, and `descroperation.py:599-620 _index` carries no JIT hints,
+# `space.index`, and `descroperation.py _index` carries no JIT hints,
 # so the user method is traced into like any other call. The bound is live
 # rather than trace-constant, which is what puts the emitted
 # `compute_range_length` (functional.py:42-53) on the recorded path: the

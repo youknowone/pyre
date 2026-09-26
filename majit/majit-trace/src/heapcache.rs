@@ -20,7 +20,7 @@ use majit_ir::{EffectInfo, ExtraEffect, GcRef, OpCode, OpRef, Type};
 /// The trait is defined here (not in `majit-ir`) because `majit-trace`
 /// is the lowest crate that needs the predicate (for the
 /// `_unique_const_heuristic` ConstPtr canonicalisation,
-/// heapcache.py:96-104) and the implementation lives in `majit-metainterp`
+/// heapcache.py) and the implementation lives in `majit-metainterp`
 /// (`history::ConstOprefOracle`).  `&dyn SameConstantOracle`
 /// keeps the heapcache layer agnostic of the oracle's representation.
 /// The `field_index` that stands for a descr no numberer ever reached.
@@ -101,7 +101,7 @@ pub const HF_VERSION_MAX: u32 = 0xffff_ffff - HF_VERSION_INC;
 const _HF_VERSION_INC: u32 = HF_VERSION_INC;
 const _HF_VERSION_MAX: u32 = HF_VERSION_MAX;
 
-// RPython `heapcache.py:27-41` defines module-level helpers
+// RPython `heapcache.py add_flags` defines module-level helpers
 // `add_flags`, `remove_flags`, `test_flags` that mutate per-op storage
 // (`ref_frontend_op._heapc_flags`). pyre routes the same logic through
 // `HeapCache::_set_flag` / `_remove_flag` / `_check_flag` because pyre's
@@ -113,7 +113,7 @@ const _HF_VERSION_MAX: u32 = HF_VERSION_MAX;
 ///
 /// `cache_anything` / `cache_seen_allocation` store the cached
 /// fieldbox as a bare [`OpRef`] — the Box identity itself.  RPython
-/// `heapcache.py:60-95 cache_anything[box] = valuebox` stores a Box
+/// `heapcache.py cache_anything[box] = valuebox` stores a Box
 /// object (carrying both identity and value); pyre carries the same
 /// fact through `OpRef` + the frontend object's `value`
 /// (`Op` / `InputArg` `value: Cell<Option<Value>>`).  Cache-hit sanity
@@ -322,7 +322,7 @@ impl FieldUpdater {
         self.currfieldbox
     }
 
-    /// heapcache.py:139-140
+    /// heapcache.py getfield_now_known
     ///
     /// ```text
     ///  def getfield_now_known(self, fieldbox):
@@ -339,7 +339,7 @@ impl FieldUpdater {
         cache.heap_cache.insert(descr_index, entry);
     }
 
-    /// heapcache.py:142-143
+    /// heapcache.py setfield
     ///
     /// ```text
     ///  def setfield(self, fieldbox):
@@ -388,7 +388,7 @@ pub struct HeapCache {
     /// same descr is touched repeatedly across many frames.
     heap_cache: vecset::VecMap<u32, CacheEntry>,
     /// heapcache.py: `cached_arrayitems` — nested map descr → ConstInt-index → CacheEntry.
-    /// heapcache.py:557 `cache.get(index, None)` — array cache keyed by
+    /// heapcache.py `cache.get(index, None)` — array cache keyed by
     /// the `ConstInt.getint()` value, not the index Box's identity. Two
     /// distinct ConstInt boxes carrying the same `i64` index land in the
     /// same slot, matching the upstream lookup semantics. `i64` indices
@@ -528,7 +528,7 @@ impl HeapCache {
     }
 
     /// RPython: update_version(ref_frontend_op)
-    /// heapcache.py:199-209
+    /// heapcache.py
     ///
     /// ```text
     ///  def update_version(self, ref_frontend_op):
@@ -670,7 +670,7 @@ impl HeapCache {
         Some(deps)
     }
 
-    /// heapcache.py:224-229
+    /// heapcache.py _escape_from_write
     ///
     /// ```text
     ///  def _escape_from_write(self, box, fieldbox):
@@ -778,7 +778,7 @@ impl HeapCache {
     ///
     /// `effectinfo` + `const_value` carry the upstream
     /// `descr.get_extra_info()` lookups; the closure returns the
-    /// `ConstInt.getint()` value (heapcache.py:274-276 / :284-286).
+    /// `ConstInt.getint()` value (heapcache.py / :284-286).
     pub fn mark_escaped_varargs<F: Fn(OpRef) -> Option<i64>>(
         &mut self,
         opnum: OpCode,
@@ -868,13 +868,13 @@ impl HeapCache {
     /// ```
     ///
     /// The `upd.setfield` body is `cache.do_write_with_aliasing(ref_box,
-    /// fieldbox)` (heapcache.py:142-143), which handles
+    /// fieldbox)` (heapcache.py), which handles
     /// `_unique_const_heuristic`, `_clear_cache_on_write`, and the dict
     /// insertion in one step.  Aliasing semantics:
     /// `_clear_cache_on_write(seen_alloc)` clears `cache_anything` and,
     /// when `seen_alloc` is false (the target may alias anything else),
     /// also clears `cache_seen_allocation`, matching
-    /// heapcache.py:70-77.
+    /// heapcache.py.
     pub fn setfield_cached(
         &mut self,
         obj: OpRef,
@@ -927,14 +927,14 @@ impl HeapCache {
         // back-reference (`CacheEntry.heapcache`): the entries are removed
         // so each `invalidate_unescaped` call receives a fresh `&HeapCache`
         // to run the version-gated `is_unescaped(ref_box)` check
-        // (heapcache.py:127-130 / 457-460) without the borrow checker
+        // (heapcache.py / 457-460) without the borrow checker
         // tripping over `entry` and `self.heap_cache` simultaneously.
         let mut heap_cache = std::mem::take(&mut self.heap_cache);
         for entry in heap_cache.values_mut() {
             entry.invalidate_unescaped(self);
         }
         self.heap_cache = heap_cache;
-        // heapcache.py:542-552: iterate cached_arrayitems and invalidate
+        // heapcache.py getarrayitem: iterate cached_arrayitems and invalidate
         // per-CacheEntry entries whose box is no longer unescaped.
         let mut heap_array_cache = std::mem::take(&mut self.heap_array_cache);
         for caches in heap_array_cache.values_mut() {
@@ -945,7 +945,7 @@ impl HeapCache {
         self.heap_array_cache = heap_array_cache;
     }
 
-    /// heapcache.py:502-506
+    /// heapcache.py new
     ///
     /// ```text
     ///  def new(self, box):
@@ -1005,7 +1005,7 @@ impl HeapCache {
         self.arraylen_now_known(opref, lengthbox);
     }
 
-    /// heapcache.py:485-486
+    /// heapcache.py is_known_nonstandard_virtualizable
     ///
     /// ```text
     ///  def is_known_nonstandard_virtualizable(self, box):
@@ -1016,7 +1016,7 @@ impl HeapCache {
             || self._check_flag(opref, HeapFlags::SEEN_ALLOCATION)
     }
 
-    /// heapcache.py:488-491
+    /// heapcache.py nonstandard_virtualizables_now_known
     ///
     /// ```text
     ///  def nonstandard_virtualizables_now_known(self, box):
@@ -1055,7 +1055,7 @@ impl HeapCache {
         }
     }
 
-    /// heapcache.py:470-473
+    /// heapcache.py class_now_known
     ///
     /// ```text
     ///  def class_now_known(self, box):
@@ -1101,7 +1101,7 @@ impl HeapCache {
     }
 
     /// Get the known class of an object, if available.
-    /// Mirrors heapcache.py:467 — only valid when the version is current,
+    /// Mirrors heapcache.py is_class_known — only valid when the version is current,
     /// because the side `known_class` Vec may hold stale entries from
     /// before the last `reset_keep_likely_virtuals`.
     pub fn get_known_class(&self, opref: OpRef) -> Option<i64> {
@@ -1203,7 +1203,7 @@ impl HeapCache {
         // SETARRAYITEM_GC: box=args[0], fieldbox=args[2]. The dependency
         // is recorded only when both are unescaped; in every other case
         // — including container unescaped but value already escaped —
-        // the value escapes (heapcache.py:224-229 `elif fieldbox is not
+        // the value escapes (heapcache.py `elif fieldbox is not
         // None: self._escape_box(fieldbox)`).
         if opcode == OpCode::SetfieldGc && args.len() >= 2 {
             self._escape_from_write(args[0], args[1]);
@@ -1283,7 +1283,7 @@ impl HeapCache {
         self.clear_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value);
     }
 
-    /// heapcache.py:312-336
+    /// heapcache.py clear_caches_not_necessary
     ///
     /// ```text
     ///  def clear_caches_not_necessary(self, opnum, descr):
@@ -1366,7 +1366,7 @@ impl HeapCache {
         const_value: F,
     ) {
         self.need_guard_not_invalidated = true;
-        // RPython `heapcache.py:341-345`:
+        // RPython `heapcache.py clear_caches_varargs`:
         //     if (OpHelpers.is_plain_call(opnum) or
         //         OpHelpers.is_call_loopinvariant(opnum) or
         //         OpHelpers.is_cond_call_value(opnum) or
@@ -1474,7 +1474,7 @@ impl HeapCache {
             return;
         }
         // `invalidate_caches_varargs` will re-issue `mark_escaped_varargs`
-        // (matching upstream's double-call shape at heapcache.py:215-216);
+        // (matching upstream's double-call shape at heapcache.py);
         // do NOT also call `mark_escaped` for non-CALL_N argboxes here —
         // upstream `invalidate_caches` (heapcache.py) ONLY does
         // the `mark_escaped` for the SETFIELD/SETARRAYITEM special cases
@@ -1678,9 +1678,9 @@ impl HeapCache {
     /// `_clear_caches_arrayop` accepts a const-resolution closure so
     /// production callers from `invalidate_caches_varargs` reach the
     /// per-index copy branch of `_clear_caches_arrayop_with_consts`
-    /// (heapcache.py:393).  When the closure returns `None` for any
+    /// (heapcache.py).  When the closure returns `None` for any
     /// index/length operand, the branch falls through to whole-descr
-    /// clearing as upstream does (heapcache.py:438).
+    /// clearing as upstream does (heapcache.py).
     pub fn _clear_caches_arrayop<F: Fn(OpRef) -> Option<i64>>(
         &mut self,
         source_box: OpRef,
@@ -1850,7 +1850,7 @@ impl HeapCache {
         }
     }
 
-    // ── Quasi-immutable tracking (heapcache.py:604-627) ──
+    // ── Quasi-immutable tracking (heapcache.py is_quasi_immut_known) ──
 
     /// The `quasiimmut_seen_refs` key: `box.getref_base()`
     /// (heapcache.py:609/622).  Upstream reads the raw GC pointer off the
@@ -1860,7 +1860,7 @@ impl HeapCache {
         obj.inline_const_bits().unwrap_or(0) as usize
     }
 
-    /// heapcache.py:604-613
+    /// heapcache.py is_quasi_immut_known
     ///
     /// ```text
     ///  def is_quasi_immut_known(self, fielddescr, box):
@@ -1879,7 +1879,7 @@ impl HeapCache {
     /// `_clear_cache_on_write` and `_invalidate_unescaped` clear them
     /// alongside the value caches.  That lifetime is load-bearing: a
     /// residual call goes through `clear_caches_varargs`
-    /// (heapcache.py:341-370), which both arms
+    /// (heapcache.py), which both arms
     /// `need_guard_not_invalidated` and drops the "already marked" bit, so
     /// the next read of the field re-emits `QUASIIMMUT_FIELD` and that op
     /// in turn emits the second `GUARD_NOT_INVALIDATED`.
@@ -1897,7 +1897,7 @@ impl HeapCache {
         false
     }
 
-    /// heapcache.py:615-627
+    /// heapcache.py quasi_immut_now_known
     ///
     /// ```text
     ///  def quasi_immut_now_known(self, fielddescr, box):
@@ -1931,7 +1931,7 @@ impl HeapCache {
 
     // ── Nullity tracking (heapcache.py nullity_now_known / is_nullity_known) ──
 
-    /// heapcache.py:480-483
+    /// heapcache.py nullity_now_known
     ///
     /// ```text
     ///  def nullity_now_known(self, box):
@@ -2454,7 +2454,7 @@ mod tests {
         );
     }
 
-    /// heapcache.py:70-77 — when the write target is seen-allocated but
+    /// heapcache.py _clear_cache_on_write — when the write target is seen-allocated but
     /// some other cached box is not, the non-seen-alloc entry lives in
     /// `cache_anything` and is dropped by `_clear_cache_on_write` even
     /// though the target itself is in `cache_seen_allocation`.
@@ -2716,7 +2716,7 @@ mod tests {
         assert_eq!(cache.is_nullity_known(obj, |_| None), Some(false));
     }
 
-    /// heapcache.py:604-627 — the mark is per (fielddescr, box), and a
+    /// heapcache.py is_quasi_immut_known — the mark is per (fielddescr, box), and a
     /// constant receiver keys on `getref_base()`, so two distinct `ConstPtr`
     /// `OpRef`s naming the same object share it while a different object or a
     /// different descr does not.
@@ -2738,7 +2738,7 @@ mod tests {
     /// heapcache.py `invalidate_unescaped` clears
     /// `quasiimmut_seen{,_refs}` — the lifetime that makes the second
     /// `GUARD_NOT_INVALIDATED` possible.  `clear_caches_varargs`
-    /// (heapcache.py:341-370) runs this for every general call while also
+    /// (heapcache.py) runs this for every general call while also
     /// arming `need_guard_not_invalidated`, so the next read of the field
     /// re-emits `QUASIIMMUT_FIELD` and that op emits the guard.
     ///
@@ -2864,7 +2864,7 @@ mod tests {
         // call_loopinvariant_now_known(allboxes, descr, None).
         cache.call_loopinvariant_now_known_void(descr_index, arg0_int);
 
-        // heapcache.py:629-634: subsequent lookup returns None — the
+        // heapcache.py call_loopinvariant_known_result: subsequent lookup returns None — the
         // (descr, arg0) slot is still owned but its result is None,
         // so `if res is not None: return res` short-circuit misses.
         assert_eq!(

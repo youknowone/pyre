@@ -41,7 +41,7 @@ impl PartialEq for IdentityKey {
 impl Eq for IdentityKey {}
 
 /// `IdentityDictStrategy` backing — erased identity-keyed `{}`
-/// (`identitydict.py:30`). GC-managed storage box (mirrors the other
+/// (`identitydict.py`). GC-managed storage box (mirrors the other
 /// dict strategies; see `dictmultiobject::ObjectDictStorage`).
 pub type IdentityDictStorage = crate::rordereddict::RDict<IdentityKey, PyObjectRef>;
 
@@ -403,7 +403,7 @@ impl DictStrategy for IdentityDictStrategy {
     /// minor collection keeps each identity key's referent alive.
     ///
     /// Hash is now stable across GC moves via `gc_identity_hash`
-    /// (shadow-based, minimark.py:1900-1915), so no rehash is needed.
+    /// (shadow-based, minimark.py id_or_identityhash), so no rehash is needed.
     /// Trace key and value pointers so the GC updates them in place.
     unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
         let entries = identity_storage_mut(w_dict);

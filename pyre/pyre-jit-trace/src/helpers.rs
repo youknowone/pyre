@@ -36,7 +36,7 @@ pub fn emit_trace_call_int_typed(
     // pyjitpl.py do_residual_call parity: thread the
     // codewriter-analyzed `EffectInfo` through `record_nospec`. The
     // codewriter's `CallControl::getcalldescr`
-    // (`majit-translate/src/codewriter/call.rs`) ports call.py:210-335
+    // (`majit-translate/src/codewriter/call.rs`) ports call.py
     // including the raise / random-effects / write / collect /
     // virtualizable / quasi-immut analyzers; the gap is the trace-side
     // plumbing — pyre-jit-trace helpers live outside the codewriter
@@ -71,7 +71,7 @@ pub fn emit_trace_call_float_typed(
 /// trace to `CallPureI`.
 ///
 /// `concrete_arg_values` follows `_build_allboxes`
-/// (`pyjitpl.py:1960-1993`): the funcbox's concrete value sits in slot 0
+/// (`pyjitpl.py`): the funcbox's concrete value sits in slot 0
 /// and the per-argument concrete values follow.  Direct trace-emit paths
 /// have no jitcode-dispatch frame-operand-fetch, so the caller supplies
 /// the values directly.
@@ -202,7 +202,7 @@ pub extern "C" fn jit_dict_value_at(dict: i64, index: i64, key: i64, hash: i64) 
 
 /// Force a frame's `f_backref` vref word to the concrete frame behind it —
 /// the callee of the residual `jit_force_virtual` the constant-depth
-/// `sys._getframe` fold emits per hop (`pyjitpl.py:2153-2172
+/// `sys._getframe` fold emits per hop (`pyjitpl.py _do_jit_force_virtual
 /// _do_jit_force_virtual`).
 ///
 /// `executioncontext::force_vref` cannot be the callee directly:
@@ -377,7 +377,7 @@ unsafe fn is_mapdict_carrier(w_obj: PyObjectRef) -> bool {
 
 /// `mapdict.py getdictvalue` residual: the instance-dict shadowing
 /// read the `LOAD_METHOD` fast path performs after the type lookup
-/// (`callmethod.py:66 w_value = w_obj.getdictvalue(space, name)`), to make
+/// (`callmethod.py w_value = w_obj.getdictvalue(space, name)`), to make
 /// sure no instance attribute shadows the class method.  Returns the
 /// shadowing value or `PY_NULL` when the attribute is absent from the
 /// instance dict.
@@ -425,7 +425,7 @@ pub extern "C" fn jit_mapdict_read(w_obj: i64, storageindex: i64) -> i64 {
 
 /// Non-forcing boxed write for an existing mapdict attribute.  The guarded
 /// instance class and exact map pin the storage index, and a boxed slot accepts
-/// the incoming object reference directly (mapdict.py:446-447).  A torn
+/// the incoming object reference directly (mapdict.py).  A torn
 /// recording with a null/non-carrier receiver is a defensive no-op.
 pub extern "C" fn jit_mapdict_boxed_write(w_obj: i64, storageindex: i64, value: i64) {
     let w_obj = w_obj as PyObjectRef;
@@ -539,7 +539,7 @@ pub extern "C" fn jit_mapdict_unboxed_read_f(w_obj: i64, storageindex: i64, list
 /// Non-forcing raw write for a mapdict unboxed attribute.  The full-body
 /// walker has already guarded the receiver's instance class and exact map,
 /// and proved that the incoming value is an integer, so this is only the
-/// same-type longlong-list update (mapdict.py:615-619).  A torn recording can
+/// same-type longlong-list update (mapdict.py).  A torn recording can
 /// reach the wrapper with a null/non-carrier receiver; keep that defensive
 /// path a no-op.
 pub extern "C" fn jit_mapdict_unboxed_write_raw(
@@ -596,7 +596,7 @@ pub extern "C" fn jit_mapdict_unboxed_write_f(
 ///
 /// `effect_info`: these helpers write the heap (namespace cells, list
 /// storage), so the caller must supply the effect — normally
-/// `EffectInfo::MOST_GENERAL` (`graphanalyze.py:60
+/// `EffectInfo::MOST_GENERAL` (`graphanalyze.py analyze_external_call
 /// analyze_external_call` top for an unanalyzed external writer).  The
 /// opcode-default empty write set would let optheap CSE a getfield
 /// across the call: `acc = acc + a; acc = acc + b` at module level then
@@ -644,7 +644,7 @@ pub fn emit_trace_bool_value_from_truth(ctx: &mut TraceCtx, truth: OpRef, negate
     // `space.newbool` selects the `w_True` / `w_False` singleton: it cannot
     // raise, so the residual is EF_CANNOT_RAISE (no trailing GuardNoException).
     //
-    // This residual is the fallback, not the port.  `baseobjspace.py:895-900`
+    // This residual is the fallback, not the port.  `baseobjspace.py`
     // is plain RPython, so a walk that can capture a resume image traces the
     // `if b:` itself — `walker_newbool_guarded` emits the truth guard and hands
     // back the prebuilt singleton as a constant, and no box op exists at all.
@@ -815,7 +815,7 @@ pub fn emit_exception_new_inline(
 /// optimizer virtualize the method away when it is immediately consumed by
 /// the following `CALL` — the shape PyPy gets for free by tracing through
 /// `space.getattr` (its LOAD_METHOD emits no ops at all in a steady-state
-/// loop; `pypy/objspace/std/callmethod.py:25-80`).
+/// loop; `pypy/objspace/std/callmethod.py`).
 pub fn emit_bound_method_inline(
     ctx: &mut TraceCtx,
     w_function: OpRef,
@@ -1546,7 +1546,7 @@ pub fn emit_promote_empty_list_inline(
 ///
 /// `jtransform.py rewrite_op_setfield` skips the typeptr
 /// setfield (the backend writes typeptr inside `new_with_vtable` per
-/// `llmodel.py:778-782`); `rewrite.py handle_malloc_operation`
+/// `llmodel.py bh_new_with_vtable`); `rewrite.py handle_malloc_operation`
 /// emits the vtable setfield via `fielddescr_vtable` during the GC
 /// rewrite pass.
 pub fn emit_box_slice_inline(
@@ -1581,7 +1581,7 @@ pub fn emit_box_float_inline(
     size_descr: majit_ir::DescrRef,
     floatval_descr: majit_ir::DescrRef,
 ) -> OpRef {
-    // jtransform.py:908-911 parity: typeptr setfield filtered in trace.
+    // jtransform.py rewrite_op_setfield parity: typeptr setfield filtered in trace.
     let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
     ctx.heap_cache_mut().new_object(new_op);
     note_class_word_after_new(ctx, new_op, &size_descr);
@@ -1656,7 +1656,7 @@ pub fn emit_box_float_inline(
 /// followed by the closure's existing cell objects. The frame is
 /// the callee MIFrame's `frame` red —
 /// `_opimpl_inline_call*` / `perform_call`+`setup_call` push a fresh MIFrame
-/// per inlined call (`pyjitpl.py:2445-2476,1862-1874`) — the app-level frame
+/// per inlined call (`pyjitpl.py`) — the app-level frame
 /// emitted here has no upstream counterpart at that point, because upstream
 /// gets one from tracing the interpreter's own frame construction.  The box
 /// stays virtual on the hot path (the optimizer folds

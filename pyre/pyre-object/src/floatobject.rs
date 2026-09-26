@@ -42,11 +42,11 @@ impl crate::lltype::GcType for W_FloatObject {
 /// Routes through [`crate::lltype::malloc_typed`], the
 /// typed unified allocation lowering that mirrors RPython's
 /// `lltype.malloc(W_FloatObject)`
-/// (`rpython/rtyper/lltypesystem/lltype.py:2192`). PyPy's
-/// `pypy/objspace/std/floatobject.py:299 newfloat` produces the
+/// (`rpython/rtyper/lltypesystem/lltype.py`). PyPy's
+/// `pypy/objspace/std/floatobject.py newfloat` produces the
 /// same shape: a single allocation call that the GC transform stage
 /// eventually rewrites into managed alloc + push/pop_roots
-/// (`rpython/memory/gctransform/framework.py:803-853`). The typed
+/// (`rpython/memory/gctransform/framework.py`). The typed
 /// variant carries `W_FLOAT_GC_TYPE_ID` and `W_FLOAT_OBJECT_SIZE`
 /// via the [`crate::lltype::GcType`] impl so the future managed
 /// allocator can read them without a runtime registry lookup,

@@ -56,7 +56,7 @@ const OK_OPERATIONS: &[&str] = &[
 ];
 
 /// `class FinalizerAnalyzer(graphanalyze.BoolGraphAnalyzer)` at
-/// `finalizer.py:19-64`.
+/// `finalizer.py`.
 pub struct FinalizerAnalyzer<'t> {
     translator: &'t TranslationContext,
     /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py`).
@@ -88,7 +88,7 @@ impl<'t> FinalizerAnalyzer<'t> {
     }
 
     /// `analyze_light_finalizer(self, graph)` at
-    /// `finalizer.py:29-41`.
+    /// `finalizer.py`.
     ///
     /// ```python
     /// def analyze_light_finalizer(self, graph):

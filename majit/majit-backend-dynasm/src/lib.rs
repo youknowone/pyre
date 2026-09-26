@@ -39,7 +39,7 @@ pub mod aarch64;
 #[cfg(target_arch = "x86_64")]
 pub mod x86;
 
-// ── llmodel.py:194-199 JIT exception state ──
+// ── llmodel.py _store_exception JIT exception state ──
 // RPython stores exception state in thread-local (GIL-protected) globals.
 // Cranelift uses JIT_EXC_VALUE / JIT_EXC_TYPE atomics (compiler.rs).
 // Dynasm uses the same pattern for structural equivalence.
@@ -248,7 +248,7 @@ use std::sync::OnceLock;
 /// stub staged into `jf_guard_exc`, read off the jitframe before it is
 /// freed.  The grab itself does not write the slot upstream — clearing
 /// `jf_guard_exc` is emitted code's job (`_restore_exception`,
-/// x86/assembler.py:1855-1857).  `blackhole.py:1794
+/// x86/assembler.py).  `blackhole.py
 /// _prepare_resume_from_failure` hands it to the resumed frame so an
 /// exception guard unwinds into its handler instead of resuming the
 /// no-exception continuation.  `0` = no pending exception.

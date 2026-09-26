@@ -1,7 +1,7 @@
 //! Synthetic CPU shim for pyre's runtime per-CodeObject jitcodes.
 //!
 //! RPython's `cpu.bh_call_*` (see
-//! `rpython/jit/backend/model.py:266-273` and `rpython/jit/metainterp/blackhole.py:1225-1319`
+//! `rpython/jit/backend/model.py bh_call_i` and `rpython/jit/metainterp/blackhole.py bhimpl_residual_call_r_i`
 //! for both `bhimpl_residual_call_*` and `bhimpl_inline_call_*`) receives a real
 //! function address (`adr2int(jitcode.fnaddr)`) and dispatches to native code.
 //!
@@ -161,8 +161,8 @@ impl crate::Backend for SyntheticCpu {
         unreachable!("SyntheticCpu does not own loops; invalidate_loop unreachable")
     }
 
-    /// `rpython/jit/backend/model.py:266-273` declares `bh_call_*` on every
-    /// `AbstractCPU`; `rpython/jit/metainterp/blackhole.py:1225-1319` shows
+    /// `rpython/jit/backend/model.py bh_call_i` declares `bh_call_*` on every
+    /// `AbstractCPU`; `rpython/jit/metainterp/blackhole.py bhimpl_residual_call_r_i` shows
     /// `bhimpl_residual_call_*` and `bhimpl_inline_call_*` both routing
     /// through `cpu.bh_call_*`.
     ///

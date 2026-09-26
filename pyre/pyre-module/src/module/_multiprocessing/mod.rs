@@ -10,7 +10,7 @@
 //! `W_SemLock`'s fields (`interp_semaphore.py`) live in the instance
 //! dict rather than a typed payload: `handle`, `kind`, `maxvalue` and `name`
 //! are the values behind the `GetSetProperty`s of
-//! `interp_semaphore.py:593-599`, and `count`/`last_tid` are the recursion
+//! `interp_semaphore.py`, and `count`/`last_tid` are the recursion
 //! bookkeeping `_ismine` reads.  A dict-backed field is also readable as a
 //! plain attribute, which is wider than the typedef; the alternative — a
 //! handle-keyed side table — has no upstream counterpart.
@@ -61,7 +61,7 @@ fn semlock_get_handle(obj: PyObjectRef) -> SemRaw {
     core::ptr::null_mut()
 }
 
-/// Read one of the integer fields of `interp_semaphore.py:458-466`.  A missing
+/// Read one of the integer fields of `interp_semaphore.py W_SemLock`.  A missing
 /// or non-int entry reads as 0, which only happens on an instance whose dict a
 /// caller has torn up.
 #[cfg(all(any(unix, windows), feature = "host_env"))]

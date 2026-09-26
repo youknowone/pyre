@@ -14,7 +14,7 @@
 //!     return func
 //! ```
 //!
-//! (`rpython/rlib/entrypoint.py:10-12`.)
+//! (`rpython/rlib/entrypoint.py`.)
 
 use std::sync::atomic::Ordering;
 

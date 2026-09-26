@@ -21,7 +21,7 @@ struct ResOpMemo {
 }
 
 impl ResOpMemo {
-    // graphpage.py:69 keys `memo` by box object (resoperation.py:373-381 names
+    // graphpage.py:69 keys `memo` by box object (resoperation.py repr_short names  allow-line-citation
     // by object identity). This viewer runs post-optimization on owned `Op`
     // values, where args are `Operand`s but a result is only its `op.pos`
     // `OpRef` (no producer `Rc` to key on). `OpRef` is the identity both sides

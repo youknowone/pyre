@@ -2,11 +2,11 @@
 //!
 //! Mirrors:
 //!
-//!   * `rpython/jit/codewriter/regalloc.py:6-8
+//!   * `rpython/jit/codewriter/regalloc.py perform_register_allocation
 //!     perform_register_allocation(graph, kind)` — thin 2-arg wrapper.
 //!     Pyre's analog is `perform_register_allocation(graph, kind)`
 //!     below.
-//!   * `rpython/tool/algo/regalloc.py:8-15
+//!   * `rpython/tool/algo/regalloc.py
 //!     perform_register_allocation(graph, consider_var, ListOfKind)`:
 //!     ```python
 //!     regalloc = RegAllocator(graph, consider_var, ListOfKind)
@@ -31,7 +31,7 @@
 //! The chordal coloring algorithm itself is shared with
 //! `majit-translate`'s flow-graph regalloc through
 //! `majit_jitcode::tool::algo::color::DependencyGraph::find_node_coloring`
-//! (line-by-line port of `rpython/tool/algo/color.py:31-85`).
+//! (line-by-line port of `rpython/tool/algo/color.py`).
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -93,7 +93,7 @@ impl GraphAllocationResult {
     }
 }
 
-/// Field names follow `rpython/tool/algo/regalloc.py:21-24` —
+/// Field names follow `rpython/tool/algo/regalloc.py __init__` —
 /// `self.graph = graph` (py:22), `self.consider_var = consider_var`
 /// (py:23 — pyre uses a `kind: Kind` filter because `Kind` is a closed
 /// enum), `_depgraph` (`make_dependencies`, py:77), `_unionfind`
@@ -415,7 +415,7 @@ impl<'a> RegAllocator<'a> {
 }
 
 /// `rpython/jit/codewriter/regalloc.py perform_register_allocation(graph, kind)`
-/// — thin wrapper over `rpython/tool/algo/regalloc.py:8-15
+/// — thin wrapper over `rpython/tool/algo/regalloc.py
 /// perform_register_allocation(graph, consider_var, ListOfKind=())`.
 ///
 /// Pyre bakes `consider_var` into the single `kind` filter because
@@ -551,7 +551,7 @@ pub fn perform_register_allocation_with_pairs(
 }
 
 /// Apply PyPy's `_try_coalesce` interference check
-/// (`rpython/tool/algo/regalloc.py:98-112`, the `v0 not in
+/// (`rpython/tool/algo/regalloc.py`, the `v0 not in
 /// dg.neighbours[w0]` guard at py:105) to a candidate list of coalesce
 /// pairs and return only the pairs PyPy would accept.
 ///
@@ -681,7 +681,7 @@ pub fn perform_register_allocation_all_kinds_with_pairs(
 /// of kind `K` whose current color in `regallocs[K]` does not equal
 /// the next "real" color for that kind (`0, 1, 2, ...` per appearance),
 /// invokes `swapcolors(realcol, curcol)` over the entire
-/// `coloring` map (`rpython/tool/algo/regalloc.py:138-143`).
+/// `coloring` map (`rpython/tool/algo/regalloc.py`).
 ///
 /// Upstream `flatten_graph` runs this immediately after
 /// `regallocs[kind] = perform_register_allocation(graph, kind)` and

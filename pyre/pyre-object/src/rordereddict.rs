@@ -7,7 +7,7 @@
 //! are tombstones rather than holes.
 //!
 //! The consequence that matters is [`RDict::remove`].  `ll_dict_delitem`
-//! (rordereddict.py:855) writes [`DELETED`] into the one index slot that named
+//! (rordereddict.py) writes [`DELETED`] into the one index slot that named
 //! the entry and marks the entry dead; no other entry moves, so a delete is
 //! O(1) and draining a dict is linear.  Entries are compacted only where
 //! upstream compacts them — `ll_dict_remove_deleted_items` (803), reached from
@@ -33,17 +33,17 @@ use std::hash::{BuildHasher, Hash, Hasher};
 /// An index slot naming no entry, and one whose entry has been deleted.
 ///
 /// `FREE` ends a probe; `DELETED` does not, because the key being looked for
-/// may have been stored past it (rordereddict.py:1029-1031).
+/// may have been stored past it (rordereddict.py).
 pub const FREE: u32 = 0;
 /// See [`FREE`].
 pub const DELETED: u32 = 1;
 /// The bias an entry number carries inside the index table, so that entry 0 is
-/// distinguishable from [`FREE`] (rordereddict.py:1033).
+/// distinguishable from [`FREE`] (rordereddict.py).
 pub const VALID_OFFSET: u32 = 2;
 
-/// `DICT_INITSIZE` (rordereddict.py:1152).
+/// `DICT_INITSIZE` (rordereddict.py).
 const DICT_INITSIZE: usize = 16;
-/// `PERTURB_SHIFT` (rordereddict.py:1021).
+/// `PERTURB_SHIFT` (rordereddict.py).
 const PERTURB_SHIFT: u32 = 5;
 
 /// Walk live `d.entries` slots with `ll_getitem_fast`, not
@@ -277,7 +277,7 @@ impl<Q: ?Sized + Eq, K: ?Sized + Borrow<Q>> Equivalent<K> for Q {
 /// See the module docs.
 pub struct RDict<K, V, S = RandomState> {
     /// `d.indexes`.  A power of two, or empty before the first insert
-    /// (`ll_dict_create_initial_index`, rordereddict.py:718).  Upstream picks
+    /// (`ll_dict_create_initial_index`, rordereddict.py).  Upstream picks
     /// a byte/short/int/long element width from the entry count; a single
     /// `u32` covers every dict that fits in memory here.
     indexes: Vec<u32>,
@@ -322,7 +322,7 @@ impl<K, V, S: Default> Default for RDict<K, V, S> {
 impl<K, V, S> RDict<K, V, S> {
     /// Sized for `capacity` entries without a reindex, which is what
     /// `_ll_dict_resize_to` would have picked once they were all in
-    /// (rordereddict.py:735).  Sizing only the entry array would leave the
+    /// (rordereddict.py).  Sizing only the entry array would leave the
     /// index table to grow from `DICT_INITSIZE`, reindexing the whole run of a
     /// strategy switch several times over.
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self {
@@ -393,7 +393,7 @@ impl<K, V, S> RDict<K, V, S> {
     }
 
     /// The first live slot at or after `from`, which is `_ll_dictnext`'s scan
-    /// (rordereddict.py:1373): "while i < num_ever_used_items: if
+    /// (rordereddict.py): "while i < num_ever_used_items: if
     /// entries.valid(i)".  A cursor stays valid across an unrelated delete
     /// because nothing renumbers; it goes stale only when [`Self::generation`]
     /// moves.
@@ -415,7 +415,7 @@ impl<K, V, S> RDict<K, V, S> {
     /// `d.num_ever_used_items` — one past the highest slot ever filled, and so
     /// the bound of a slot walk.  Dead slots below it read as `None`.
     #[inline]
-    /// `_ll_dictnext` (rordereddict.py:1373) — the entry at or after `from`,
+    /// `_ll_dictnext` (rordereddict.py) — the entry at or after `from`,
     /// paired with the slot holding it.
     pub fn next_entry(&self, from: usize) -> Option<(usize, &K, &V)> {
         let slot = self.next_valid_slot(from)?;
@@ -542,7 +542,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         state.finish()
     }
 
-    /// `ll_dict_lookup(d, key, hash, FLAG_LOOKUP)` (rordereddict.py:1038).
+    /// `ll_dict_lookup(d, key, hash, FLAG_LOOKUP)` (rordereddict.py).
     ///
     /// Returns the slot holding `key`.
     ///
@@ -602,7 +602,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     ///
     /// `Ok` is the slot already holding the key, `Err` the index slot a new
     /// entry should claim — the first [`DELETED`] one seen, else the [`FREE`]
-    /// one that ended the probe (rordereddict.py:1110-1117).
+    /// one that ended the probe (rordereddict.py).
     ///
     /// Carries [`Self::lookup`]'s note on a comparison that mutates the dict.
     fn lookup_for_store<Q>(&self, hash: u64, key: &Q) -> Result<usize, usize>
@@ -654,7 +654,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         self.set_index_at(i, slot + VALID_OFFSET);
     }
 
-    /// `ll_dict_reindex` (rordereddict.py:1000).
+    /// `ll_dict_reindex` (rordereddict.py).
     fn reindex(&mut self, new_size: usize) {
         debug_assert!(new_size.is_power_of_two());
         self.indexes = vec![FREE; new_size];
@@ -743,7 +743,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         self.lookup(hash, key)
     }
 
-    /// `ll_dict_setitem_with_hash` (rordereddict.py:668) — probe, then hand the
+    /// `ll_dict_setitem_with_hash` (rordereddict.py) — probe, then hand the
     /// probe's answer to [`Self::setitem_lookup_done`].
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let hash = self.hash_of(&key);
@@ -766,7 +766,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     ///
     /// The `i < 0` arm of `_ll_dict_setitem_lookup_done` entered without a
     /// preceding `FLAG_STORE` probe: with no index slot to reuse, placement
-    /// goes through `ll_call_insert_clean_function` (rordereddict.py:699),
+    /// goes through `ll_call_insert_clean_function` (rordereddict.py),
     /// which probes on the digest alone.
     ///
     /// A caller that is wrong about absence gets a second entry under the same
@@ -782,7 +782,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         self.setitem_lookup_done(hash, None, key, value);
     }
 
-    /// The `i < 0` arm of `_ll_dict_setitem_lookup_done` (rordereddict.py:675):
+    /// The `i < 0` arm of `_ll_dict_setitem_lookup_done` (rordereddict.py):
     /// grow or compact, then claim an index slot for a fresh entry.
     /// `index_slot` is the one a `FLAG_STORE` probe ended on, `None` when the
     /// caller never probed.
@@ -841,7 +841,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         self.set_index_at(i, DELETED);
     }
 
-    /// `ll_dict_pop` (rordereddict.py:1497).  Order-preserving and O(1): the
+    /// `ll_dict_pop` (rordereddict.py).  Order-preserving and O(1): the
     /// name says `remove` and not `shift_remove` because nothing shifts.
     pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
@@ -892,7 +892,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         (entry.key, entry.value)
     }
 
-    /// `ll_dict_popitem` (rordereddict.py:1488) — the last live pair.
+    /// `ll_dict_popitem` (rordereddict.py) — the last live pair.
     pub fn pop(&mut self) -> Option<(K, V)> {
         let mut slot = self.entries.len();
         loop {
@@ -906,7 +906,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         }
     }
 
-    /// `move_to_end` (pypy/objspace/std/dictmultiobject.py:598) for a slot the
+    /// `move_to_end` (pypy/objspace/std/dictmultiobject.py) for a slot the
     /// caller already located.  Answers whether anything moved: a key already
     /// at the wanted end is a no-op, and the caller must not bump its
     /// iterator-invalidation state for one.
@@ -979,7 +979,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     }
 }
 
-/// `_overallocate_entries_len` (rordereddict.py:745) — "the growth pattern is:
+/// `_overallocate_entries_len` (rordereddict.py) — "the growth pattern is:
 /// 0, 8, 17, 27, 38, 50, 64, 80, 98, ...".
 fn overallocate_entries_len(baselen: usize) -> usize {
     baselen + (baselen >> 3) + 8

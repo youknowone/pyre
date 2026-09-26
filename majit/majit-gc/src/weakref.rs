@@ -28,11 +28,11 @@
 use majit_ir::GcRef;
 
 /// `WEAKREF = lltype.GcStruct("weakref", ("weakptr", llmemory.Address))`
-/// (gctypelayout.py:587).
+/// (gctypelayout.py).
 ///
 /// `#[repr(C)]` so `weakptr` sits at offset 0 of the payload, matching
 /// the `weakptr_offset = llmemory.offsetof(WEAKREF, "weakptr")` the
-/// framework reads (gctypelayout.py:592).
+/// framework reads (gctypelayout.py).
 #[repr(C)]
 pub struct Weakref {
     pub weakptr: GcRef,
@@ -42,7 +42,7 @@ pub struct Weakref {
 pub const SIZEOF_WEAKREF: usize = std::mem::size_of::<Weakref>();
 
 /// `weakptr_offset = llmemory.offsetof(WEAKREF, "weakptr")`
-/// (gctypelayout.py:592). The framework GC reads / writes the weakptr
+/// (gctypelayout.py). The framework GC reads / writes the weakptr
 /// slot at this offset off the WEAKREF payload base, and the JIT
 /// lowering of `weakref_deref` emits a single load at this offset.
 pub const WEAKPTR_OFFSET: usize = std::mem::offset_of!(Weakref, weakptr);

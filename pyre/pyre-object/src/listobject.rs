@@ -1141,7 +1141,7 @@ fn all_floats(items: &[PyObjectRef]) -> bool {
         .all(|&item| unsafe { is_float_strategy_item(item) })
 }
 
-// rpython/rlib/longlong2float.py:90-150.  Keep these bit operations local to
+// rpython/rlib/longlong2float.py.  Keep these bit operations local to
 // IntOrFloatListStrategy: the signed-longlong storage representation is part
 // of the upstream strategy, not a general numeric coercion.
 const INT_OR_FLOAT_INT_HIGH_WORD: u32 = 0xffff_fffe;
@@ -6229,7 +6229,7 @@ mod tests {
     #[test]
     fn integer_strategy_oopspec_tags_present() {
         // The `#[oopspec(...)]` attribute emits the spec string for the
-        // codewriter's `_handle_list_call` to decode (rlib/jit.py:250 parity).
+        // codewriter's `_handle_list_call` to decode (rlib/jit.py parity).
         assert_eq!(oopspec_ll_list_int_length, "list.int_len(l)");
         assert_eq!(
             oopspec_ll_list_int_getitem_fast,

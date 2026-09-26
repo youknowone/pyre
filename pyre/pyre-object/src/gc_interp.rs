@@ -21,9 +21,9 @@
 //! safepoint (loop top, where the only live refs are in the frame and reachable
 //! through the registered `pyframe` root walker). When to collect is not
 //! decided here: the safepoint asks the collector's own `threshold_reached`
-//! (incminimark.py:1288-1290), which weighs everything the collector is
+//! (incminimark.py), which weighs everything the collector is
 //! responsible for against the threshold `set_major_threshold_from`
-//! (incminimark.py:575-594) derived from the last major's survivors. Upstream
+//! (incminimark.py) derived from the last major's survivors. Upstream
 //! asks that question in the allocator; pyre asks it here because here is where
 //! it can act on the answer.
 //!
@@ -151,7 +151,7 @@ static COLLECT_STATE: AtomicU8 = AtomicU8::new(0);
 /// costs a thread-local borrow — or, with no backend GC box installed, a
 /// `gc_op` compare-and-exchange — which is too much to spend on every bytecode
 /// dispatch. At a few tens of bytes allocated per dispatch the interval spans
-/// far less than `min_heap_size` (incminimark.py:307), the smallest threshold
+/// far less than `min_heap_size` (incminimark.py), the smallest threshold
 /// the collector will ever set, so no answer is reached late enough to matter.
 const POLL_INTERVAL: u32 = 1024;
 
@@ -250,7 +250,7 @@ fn enabled_from_env(value: Option<&OsStr>) -> bool {
 /// (`majit_gc::collector::set_deferred_major_request_probe`).
 ///
 /// `gc.disable()` is among the questions. This is the automatic path, the one
-/// `incminimark.py:831-832` returns from while the flag is clear; only an
+/// `incminimark.py` returns from while the flag is clear; only an
 /// explicit `gc.collect()` carries `force_enabled` past it. The collection this
 /// safepoint runs is `do_collect_oldgen_nonmoving`, which drives a full cycle
 /// whatever the flag says, so the flag has to be read here or a
@@ -288,7 +288,7 @@ pub fn would_collect() -> bool {
 /// being collected.
 ///
 /// Born-old allocations ask it in the allocator too, as `external_malloc`
-/// (incminimark.py:987-994) does, and hand the answer here through the
+/// (incminimark.py) does, and hand the answer here through the
 /// eval-breaker word (`majit_gc::collector::take_deferred_major_request`).
 /// That path is what reaches compiled code: a trace runs its loop without
 /// returning to this dispatch loop, so a poll placed here alone is never

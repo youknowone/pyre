@@ -46,7 +46,7 @@ pub type TLabel = Label;
 ///
 /// Each `(src, dst)` entry maps to one `%s_copy src -> dst` operation
 /// emitted by `insert_renamings`; `(src, None)` maps to `%s_push src`
-/// and `(None, dst)` maps to `%s_pop -> dst` (flatten.py:326-335).
+/// and `(None, dst)` maps to `%s_pop -> dst` (flatten.py).
 ///
 /// `T: Eq + Clone + Hash` so the algorithm works for any register
 /// representation — RPython uses `Register` objects keyed by identity,

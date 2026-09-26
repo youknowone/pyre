@@ -53,7 +53,7 @@ pub struct FlattenRecursion<E> {
 
 impl<E> FlattenRecursion<E> {
     /// RPython `FlattenRecursion.__init__(self): self.later = None`
-    /// (flattenrec.py:15-16).
+    /// (flattenrec.py).
     pub fn new() -> Self {
         FlattenRecursion {
             later: RefCell::new(None),
@@ -61,7 +61,7 @@ impl<E> FlattenRecursion<E> {
     }
 
     /// RPython `FlattenRecursion.__call__(self, func, *args, **kwds)`
-    /// (flattenrec.py:18-31).
+    /// (flattenrec.py).
     pub fn call(&self, func: DeferredCall<E>) -> Result<(), E> {
         // upstream: `if self.later is not None: self.later.append(...)`.
         let is_outer = self.later.borrow().is_none();

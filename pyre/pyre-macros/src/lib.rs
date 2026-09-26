@@ -1642,7 +1642,7 @@ impl syn::parse::Parse for PyreMethodsAttrs {
 }
 
 // PyPy `interp_attrproperty('state', cls=W_X, wrapfn=newint)`
-// (`typedef.py:485`) is the read-only-field exposure helper.  The
+// (`typedef.py`) is the read-only-field exposure helper.  The
 // `#[getter]` / `#[setter]` machinery below covers the exact same
 // ground in one line per slot — `#[getter] fn state(&self) -> i64
 // { self.state as i64 }` — without a separate alias.  Documented
@@ -1984,7 +1984,7 @@ fn expand_pyre_methods(
                 // Method dispatch passes `(self,)`+args; GetSetProperty
                 // dispatch passes `(descriptor_self, w_obj,…)` so the
                 // actual `self` slides one slot right.  Mirrors
-                // `typedef.py:312-325` fget_unwrap_spec.
+                // `typedef.py` fget_unwrap_spec.
                 let self_idx: usize = match &kind {
                     MethodKind::Getter(..) | MethodKind::Setter(..) | MethodKind::Deleter(..) => 1,
                     _ => 0,

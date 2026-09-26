@@ -2,7 +2,7 @@
 //! the result-kind tags that drive client-side decoding.
 //!
 //! The error codes are the contract between `rsandbox.reraise_error`
-//! (`rpython/translator/sandbox/rsandbox.py:90-108`) and `sandlib.write_exception`
+//! (`rpython/translator/sandbox/rsandbox.py`) and `sandlib.write_exception`
 //! / `EXCEPTION_TABLE` (`rpython/translator/sandbox/sandlib.py`). The two
 //! tables MUST stay in sync; they are unified here.
 

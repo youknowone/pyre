@@ -1,6 +1,6 @@
 //! Port of `rpython/translator/goal/query.py` — 116-LOC sanity-check
 //! generators consumed by `TranslationDriver.sanity_check_annotation`
-//! (`driver.py:330-337`).
+//! (`driver.py`).
 //!
 //! Upstream provides four generators / helpers:
 //!

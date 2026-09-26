@@ -215,7 +215,7 @@ pub fn perform_normalizations(annotator: &RPythonAnnotator) -> Result<(), Annota
 /// `Skip`). Numbering that subclass too needs the two-phase rtype/emit
 /// prepass that resolves every id before any constant is baked.
 /// RPython `merge_classpbc_getattr_into_classdef(annotator)`
-/// (normalizecalls.py:208-235).
+/// (normalizecalls.py).
 ///
 /// ```python
 /// def merge_classpbc_getattr_into_classdef(annotator):
@@ -419,7 +419,7 @@ pub fn assign_inheritance_ids(annotator: &RPythonAnnotator) {
     // lexicographic reversed-MRO witness, and a marker's position in the
     // sorted list IS its id.  This is upstream's `compute_fn` body verbatim
     // — `peers.sort()` then `for i, peer in enumerate(peers): peer.value = i`
-    // (normalizecalls.py:342-354).  The sorted marker list is exactly the
+    // (normalizecalls.py).  The sorted marker list is exactly the
     // upstream `peers`; the id is read straight off the enumeration index,
     // so there is no separate id table.  Re-deriving the full set on each
     // call makes a later-discovered subclass nest into its parent's
@@ -561,7 +561,7 @@ pub fn get_unique_cdef_id(classdef: &Rc<RefCell<ClassDef>>) -> usize {
 }
 
 /// RPython `normalize_calltable(annotator, callfamily)`
-/// (normalizecalls.py:23-42).
+/// (normalizecalls.py).
 ///
 /// ```python
 /// def normalize_calltable(annotator, callfamily):
@@ -654,7 +654,7 @@ pub fn normalize_calltable(
 }
 
 /// RPython `raise_call_table_too_complex_error(callfamily, annotator)`
-/// (normalizecalls.py:44-76).
+/// (normalizecalls.py).
 ///
 /// Called when a single call family carries rows with differing
 /// `CallShape`s — the PBC dispatcher cannot bridge them, so the
@@ -739,7 +739,7 @@ pub fn raise_call_table_too_complex_error(
 }
 
 /// RPython `normalize_calltable_row_signature(annotator, shape, row)`
-/// (normalizecalls.py:78-154).
+/// (normalizecalls.py).
 ///
 /// Returns `true` if the row was rewritten (triggering
 /// `callfamily.normalized = False` re-check upstream).
@@ -906,7 +906,7 @@ pub fn normalize_calltable_row_signature(
 }
 
 /// RPython `normalize_calltable_row_annotation(annotator, graphs)`
-/// (normalizecalls.py:156-204).
+/// (normalizecalls.py).
 ///
 /// Returns `true` if any graph's argument or return binding was
 /// widened (triggering the outer `while True` to re-run).
@@ -1026,7 +1026,7 @@ pub fn normalize_calltable_row_annotation(
 }
 
 /// RPython `create_instantiate_functions(annotator)`
-/// (normalizecalls.py:266-273).
+/// (normalizecalls.py).
 ///
 /// ```python
 /// def create_instantiate_functions(annotator):
@@ -1064,7 +1064,7 @@ pub fn create_instantiate_functions(annotator: &RPythonAnnotator) -> Result<(), 
 }
 
 /// RPython `create_instantiate_function(annotator, classdef)`
-/// (normalizecalls.py:275-295).
+/// (normalizecalls.py).
 ///
 /// ```python
 /// def create_instantiate_function(annotator, classdef):

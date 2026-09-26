@@ -195,7 +195,7 @@ pub fn emit_commit_io(ctx: &mut TraceCtx) {
     // stdout (`io_buffer_commit`); no allocation that can `MemoryError`,
     // no Python-level dispatch that can raise. `EF_CANNOT_RAISE` lets
     // `do_residual_call` skip the trailing `GUARD_NO_EXCEPTION`
-    // (`pyjitpl.py:2111-2115`).
+    // (`pyjitpl.py`).
     let descr = make_call_descr_with_effect(&[], Type::Void, CANNOT_RAISE_NO_HEAP_EFFECT_INFO);
     ctx.record_op_with_descr(OpCode::CallN, &[func_ref], descr);
 }

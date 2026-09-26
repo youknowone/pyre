@@ -25,8 +25,8 @@
 //! references the same unit variant resolves to the *same* prebuilt
 //! `HostObject` Arc — mirroring `InstanceRepr.get_reusable_prebuilt_instance`
 //! caching on the per-rtyper `instance_reprs` map
-//! (`rpython/rtyper/rclass.py:804`, used from
-//! `rpython/rtyper/rpbc.py:1026`).  The assembler's `emit_const_r`
+//! (`rpython/rtyper/rclass.py`, used from
+//! `rpython/rtyper/rpbc.py`).  The assembler's `emit_const_r`
 //! dedupes the ref-bank constant pool by `obj.identity_id()`, so
 //! cross-graph identity sharing collapses the constant pool to a
 //! single slot per variant.

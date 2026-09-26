@@ -623,7 +623,7 @@ pub fn rtype_builtin_enumerate(_hop: &HighLevelOp) -> RTypeResult {
 ///             self.lowleveltype = self.RANGEST
 /// ```
 ///
-/// where (`lltypesystem/rrange.py:51-57`):
+/// where (`lltypesystem/rrange.py`):
 ///
 /// ```python
 /// self.RANGE = Ptr(GcStruct("range", ("start", Signed), ("stop", Signed),
@@ -831,7 +831,7 @@ impl Repr for AbstractRangeRepr {
     }
 
     /// RPython `RangeRepr.make_iterator_repr(self, variant=None)`
-    /// (`lltypesystem/rrange.py:63-67`):
+    /// (`lltypesystem/rrange.py`):
     ///
     /// ```python
     /// def make_iterator_repr(self, variant=None):
@@ -1870,7 +1870,7 @@ fn rangeitem_helper(
 }
 
 /// RPython `class RangeIteratorRepr(AbstractRangeIteratorRepr)`
-/// (`rrange.py:145-156` + `lltypesystem/rrange.py:85-97`), covering both
+/// (`rrange.py:145-156` + `lltypesystem/rrange.py`), covering both  allow-line-citation
 /// the constant-step (`step != 0`, `RANGEITER`) and variable-step
 /// (`step == 0`, `RANGESTITER`) shapes.
 ///
@@ -1884,7 +1884,7 @@ fn rangeitem_helper(
 ///             self.lowleveltype = r_rng.RANGESTITER
 /// ```
 ///
-/// where (`lltypesystem/rrange.py:58`) `RANGEITER = Ptr(GcStruct("range",
+/// where (`lltypesystem/rrange.py`) `RANGEITER = Ptr(GcStruct("range",
 /// ("next", Signed), ("stop", Signed)))`. Like
 /// [`super::rtuple::Length1TupleIteratorRepr`], pyre collapses the
 /// abstract/concrete split into one concrete repr.
@@ -1909,7 +1909,7 @@ pub struct RangeIteratorRepr {
     /// `iter.step`) and the `RANGESTITER` iter struct shape.
     step: i64,
     /// `self.lowleveltype = r_rng.RANGEITER` / `RANGESTITER`
-    /// (`lltypesystem/rrange.py:41,58`) — `Ptr(GcStruct("range", ("next",
+    /// (`lltypesystem/rrange.py`) — `Ptr(GcStruct("range", ("next",
     /// Signed), ("stop", Signed)[, ("step", Signed)]))`. The `step` field
     /// is present only for the variable-step `RANGESTITER`.
     lowleveltype: LowLevelType,
@@ -2105,7 +2105,7 @@ impl Repr for RangeIteratorRepr {
 }
 
 /// Synthesise the `ll_rangeiter` helper graph
-/// (`lltypesystem/rrange.py:91-97`):
+/// (`lltypesystem/rrange.py`):
 ///
 /// ```python
 /// def ll_rangeiter(ITERPTR, rng):
@@ -2285,7 +2285,7 @@ fn emit_void_setfield(block: &BlockRef, l: &Variable, field: &str, value: Hlvalu
 }
 
 /// Synthesise the `ll_newrange(RANGE, start, stop)` helper graph
-/// (`lltypesystem/rrange.py:70-74`):
+/// (`lltypesystem/rrange.py`):
 ///
 /// ```python
 /// def ll_newrange(RANGE, start, stop):
@@ -2340,7 +2340,7 @@ pub(crate) fn build_ll_newrange_helper_graph(
 }
 
 /// Synthesise the `ll_newrangest(start, stop, step)` helper graph
-/// (`lltypesystem/rrange.py:77-83`):
+/// (`lltypesystem/rrange.py`):
 ///
 /// ```python
 /// def ll_newrangest(start, stop, step):
@@ -3578,7 +3578,7 @@ mod tests {
 
     /// Variable-step `ll_rangeiter` additionally copies `iter.step =
     /// rng.step` (the `if ITERPTR.TO is RANGESTITER` branch,
-    /// lltypesystem/rrange.py:95-96), so the block carries a third
+    /// lltypesystem/rrange.py), so the block carries a third
     /// `getfield` + `setfield` pair.
     #[test]
     fn build_ll_rangeiter_helper_graph_variable_step_copies_step_field() {

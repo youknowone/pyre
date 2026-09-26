@@ -48,7 +48,7 @@ pub struct OldGen {
     /// membership and the records are two structures here.
     young_rawmalloced_objects: Vec<RawMallocedObject>,
     young_rawmalloced_payloads: AddressSet,
-    /// incminimark.py:2688-2694 `raw_malloc_might_sweep`.  At sweep
+    /// incminimark.py start_free_rawmalloc_objects `raw_malloc_might_sweep`.  At sweep
     /// preparation the old rawmalloc stack is swapped into this one, isolating
     /// it from rawmalloc allocations made by minors between sweep steps.
     raw_malloc_might_sweep: Vec<RawMallocedObject>,
@@ -171,10 +171,10 @@ impl OldGen {
         Some(header_ptr)
     }
 
-    /// incminimark.py:1075-1078, the `alloc_young` arm of `external_malloc`.
+    /// incminimark.py, the `alloc_young` arm of `external_malloc`.
     ///
     /// Upstream's `alloc_young` also *forces* the rawmalloc branch — an object
-    /// taken from the `ArenaCollection` must be old (incminimark.py:999-1000
+    /// taken from the `ArenaCollection` must be old (incminimark.py
     /// `and not alloc_young`), because the arena's sweep is the major's and it
     /// has no per-object free — so this entry point never consults
     /// `SMALL_REQUEST_THRESHOLD`.
@@ -251,7 +251,7 @@ impl OldGen {
         self.poison_on_alloc = on;
     }
 
-    /// incminimark.py:1219-1221, the second half of `is_young_object`.
+    /// incminimark.py, the second half of `is_young_object`.
     #[inline]
     /// Whether the young raw-malloced generation is empty.
     ///
@@ -354,7 +354,7 @@ impl OldGen {
         self.rawmalloced_peak_size
     }
 
-    /// incminimark.py:1270-1286 memory-stat helpers.
+    /// incminimark.py get_total_memory_alloced memory-stat helpers.
     pub(crate) fn total_allocated_bytes(&self) -> usize {
         self.ac.total_memory_alloced + self.rawmalloced_total_size
     }
@@ -393,7 +393,7 @@ impl OldGen {
             self.raw_malloc_might_sweep.is_empty(),
             "raw_malloc_might_sweep must be empty"
         );
-        // incminimark.py:1312-1313 `debug_check_consistency` asserts
+        // incminimark.py `debug_check_consistency` asserts
         // `not self.young_rawmalloced_objects` here, on the premise that every
         // major runs a minor first and that minor's last act empties the list.
         // Pyre has one major for which the premise is false by design —
@@ -449,7 +449,7 @@ impl OldGen {
         // Read the diagnostic gate once, outside the per-block callback:
         // `gc_lifetime_log_enabled` is a `LazyLock`, so its acquire load
         // cannot be hoisted out of the loop the closure inlines into.
-        // `_free_if_unvisited` (incminimark.py:2650-2656) is a flag test, a
+        // `_free_if_unvisited` (incminimark.py) is a flag test, a
         // flag clear and a return.
         let log_free = crate::gc_lifetime_log_enabled();
         self.ac.mass_free_incremental(
@@ -539,7 +539,7 @@ impl OldGen {
     ///
     /// Upstream never asks whether an address belongs to its heap at all —
     /// RPython's type system settles it, so `visit` reads header flags
-    /// straight off the child (incminimark.py:2793-2798).  pyre's hybrid heap
+    /// straight off the child (incminimark.py).  pyre's hybrid heap
     /// has to ask, and the answer for an off-GC or arena address is "no", so
     /// make that answer a load and a test rather than a hash of the whole set.
     #[inline]
@@ -706,7 +706,7 @@ mod tests {
         assert_eq!(oldgen.rawmalloc_sweep_candidate_count(), 3);
         assert_eq!(oldgen.active_rawmalloc_count(), 0);
 
-        // incminimark.py:2688-2694: allocations made after the swap land in
+        // incminimark.py start_free_rawmalloc_objects: allocations made after the swap land in
         // the fresh active stack and are not swept in this cycle.
         let fresh = oldgen.alloc(size);
         let fresh_payload = fresh as usize + GcHeader::SIZE;

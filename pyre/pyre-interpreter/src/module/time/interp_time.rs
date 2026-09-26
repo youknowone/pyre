@@ -275,7 +275,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `nanosleep` is a `releasegil=True` external (interp_time.py), so
     // only the blocking call itself runs outside the free-threaded GC's STW
     // RUNNING census.  `checksignals` runs with the GIL re-acquired
-    // (interp_time.py:707), i.e. with the mutator back in the census — so the
+    // (interp_time.py), i.e. with the mutator back in the census — so the
     // guard is scoped to each call, not to the whole retry loop.  A Python
     // signal handler running outside the census would trip the running-mutator
     // assertions on its first allocation or blocking call.

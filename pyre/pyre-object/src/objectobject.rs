@@ -4,7 +4,7 @@
 //!
 //! An instance holds a pointer to its W_TypeObject (class) in `ob_header.w_class`.
 //! Per-instance attributes live in the mapdict `map`+`storage` pair
-//! (`mapdict.py:907-910`), matching PyPy's instance attribute layout.
+//! (`mapdict.py _set_mapdict_map`), matching PyPy's instance attribute layout.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -29,12 +29,12 @@ use crate::pyobject::*;
 /// `pyre-object` must not depend on; the interpreter side casts it back).
 /// This mirrors the `W_DictObject.dstorage: *mut u8` erasure. A null
 /// `map`/`storage` is the `_mapdict_init_empty` state with `storage =
-/// None` (`mapdict.py:908-910`); the real terminator is installed by the
+/// None` (`mapdict.py`); the real terminator is installed by the
 /// mapdict layer on first attribute access.
 #[repr(C)]
 pub struct W_ObjectObject {
     pub ob_header: PyObject,
-    /// `self.map` (`mapdict.py:907`) — the interned map node's address held as
+    /// `self.map` (`mapdict.py _set_mapdict_map`) — the interned map node's address held as
     /// a raw word, not a pointer.  Map nodes are interned, shared per type and
     /// never freed, so the GC neither owns nor traces this slot
     /// (`object_object_custom_trace` walks only `storage`).  A pointer-typed
@@ -42,7 +42,7 @@ pub struct W_ObjectObject {
     /// which is what the JIT reserves for GC references; the word spelling
     /// keeps the one field on one kind.  Cast to `MapRef` at each use.
     pub map: usize,
-    /// `self.storage` (`mapdict.py:910`) — a `Ptr(GcArray(OBJECTPTR))` block of
+    /// `self.storage` (`mapdict.py _mapdict_init_empty`) — a `Ptr(GcArray(OBJECTPTR))` block of
     /// attribute values (`ItemsBlock`, tagged `W_MAPDICT_STORAGE_GC_TYPE_ID`).
     /// null = `None`, the `_mapdict_init_empty` empty state (`mapdict.py`).
     /// The block is a mixed boxed/unboxed array; the mapdict layer
@@ -144,7 +144,7 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
 /// turn needs every allocation site to root the raw pointers it holds.
 fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
     // `mapdict.py user_setup` → `_mapdict_init_empty(
-    // w_subtype.terminator)` (`mapdict.py:908-910`): the instance map is
+    // w_subtype.terminator)` (`mapdict.py`): the instance map is
     // the owning type's terminator from construction, and `storage = None`.
     //
     // Reading it before allocation rather than installing it on first

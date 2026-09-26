@@ -5039,7 +5039,7 @@ fn enabled_guard_gc_type_info() -> codegen::GuardGcTypeInfo {
     // four-word VARSIZE_TYPE_INFO/CLASSTYPE union tail).
     // shift_by = log2(64) = 6, sizeof_ti = rffi.sizeof(TYPE_INFO) = 32.
     // gc.py _setup_guard_is_object: T_IS_RPYTHON_INSTANCE
-    // = 0x100000 (gctypelayout.py:196), packed little-endian into a
+    // = 0x100000 (gctypelayout.py), packed little-endian into a
     // Signed word — byte at offset +2 carries the flag, mask = 0x10.
     codegen::GuardGcTypeInfo {
         supports_guard_gc_type: true,

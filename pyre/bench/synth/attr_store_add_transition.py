@@ -10,7 +10,7 @@
 # cpython >5s (it already timed out) vs pyre 0.20s, and it is not gated on — only pypy is.
 # STORE_ATTR that ADDS an attribute not yet in the instance's map: the
 # `map -> PlainAttribute` transition plus the grow-by-one storage rewrite
-# (mapdict.py:942-959 `_set_mapdict_increase_storage1`).  The values are
+# (mapdict.py `_set_mapdict_increase_storage1`).  The values are
 # strings so every slot stays boxed, which is the shape the JIT emits inline;
 # an unboxed slot keeps the general residual.
 #
@@ -47,7 +47,7 @@ class Either:
 
 def edges():
     out = []
-    # `_reorder_and_add` (mapdict.py:204-258): both orders off one class, so
+    # `_reorder_and_add` (mapdict.py): both orders off one class, so
     # the second instance finds the attribute above its own map.
     for first in (0, 1):
         obj = Either()

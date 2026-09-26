@@ -409,7 +409,7 @@ unsafe fn w_memoryview_new_plain(
 /// Build the `BytesIOView` returned by `W_BytesIO.getbuffer_w`
 /// (`interp_bytesio.py`): its `BytesIOBuffer` reads the bytearray
 /// backing, while `BytesIOView.__init__` reports the `W_BytesIO` as `.obj`
-/// (`interp_bytesio.py:52-62`).
+/// (`interp_bytesio.py`).
 pub(crate) fn w_memoryview_new_simple_with_owner(
     w_backing: PyObjectRef,
     w_obj: PyObjectRef,
@@ -3213,7 +3213,7 @@ fn install_builtin_text_signatures(ns: PyObjectRef) {
 }
 
 pub fn install_default_builtins(ns: PyObjectRef) {
-    // The `Module` class docstring at `pypy/module/__builtin__/moduledef.py:9`,
+    // The `Module` class docstring at `pypy/module/__builtin__/moduledef.py`,
     // which `MixedModule.get__doc__` publishes as this module's `__doc__`.
     // Seeded here rather than in the module def because the execution
     // context builds this namespace directly, and the module `import
@@ -4083,7 +4083,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     });
     crate::module_ns_get_or_insert_with(ns, "__import__", || {
         // `moduledef.py:78-87 startup` — "Copy our __import__ to builtins".
-        // `baseobjspace.py:730` keeps that same object as
+        // `baseobjspace.py` keeps that same object as
         // `space.w_default_importlib_import`.
         let w_import =
             make_module_builtin_function("__import__", __majit_wrap_builtin_dunder_import);
@@ -4882,7 +4882,7 @@ pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 }
 
 /// `space.index` re-wraps a result whose type is not exactly `int` (a
-/// bool, or a strict int subclass) as a plain int (descroperation.py:622
+/// bool, or a strict int subclass) as a plain int (descroperation.py
 /// `index`).  A range stores its bounds wrapped, so normalize each here —
 /// otherwise `range(True).stop` would expose `True` instead of `1`.
 ///
@@ -5041,7 +5041,7 @@ pub fn is_builtin_locals_function(callable: PyObjectRef) -> bool {
 /// True iff `callable` is the builtin `vars` function object.
 ///
 /// `vars()` with no argument is `locals()` (`app_inspect.py` →
-/// `interp_inspect.py:7-11`), so the walker recognizes both under one fold.
+/// `interp_inspect.py`), so the walker recognizes both under one fold.
 pub fn is_builtin_vars_function(callable: PyObjectRef) -> bool {
     is_builtin_code_function(callable, builtin_vars)
 }
@@ -9123,7 +9123,7 @@ pub(crate) fn unicode_error_index_w(w_value: PyObjectRef) -> Result<i64, crate::
         .map_err(|_| crate::PyError::overflow_error("Python int too large to convert to C ssize_t"))
 }
 
-/// `pypy/module/exceptions/interp_exceptions.py:433-445
+/// `pypy/module/exceptions/interp_exceptions.py descr_init
 /// W_UnicodeTranslateError.descr_init` —
 ///
 /// ```python
@@ -9202,7 +9202,7 @@ fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
     Ok(pyre_object::w_none())
 }
 
-/// `pypy/module/exceptions/interp_exceptions.py:1041-1059
+/// `pypy/module/exceptions/interp_exceptions.py descr_init
 /// W_UnicodeDecodeError.descr_init` — `(w_encoding, w_object, w_start,
 /// w_end, w_reason)`.  `w_object` may be `bytearray`; PyPy coerces it
 /// via `space.newbytes(space.charbuf_w(w_object))` before storing.
@@ -9303,7 +9303,7 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
     Ok(pyre_object::w_none())
 }
 
-/// `pypy/module/exceptions/interp_exceptions.py:1159-1173
+/// `pypy/module/exceptions/interp_exceptions.py descr_init
 /// W_UnicodeEncodeError.descr_init` — `(w_encoding, w_object, w_start,
 /// w_end, w_reason)`.  Encoding errors require `w_object` to be a
 /// `str` (`space.realutf8_w`).
@@ -9829,7 +9829,7 @@ fn exception_overridetypedef(
 /// Variant of `make_exc_type` that also installs a per-class `__init__`
 /// descriptor.  Used for the three Unicode*Error subclasses whose PyPy
 /// `descr_init` does typed slot stamping after `__new__`'s raw
-/// `args_w` capture (`interp_exceptions.py:433-445`, `:1041-1059`,
+/// `args_w` capture (`interp_exceptions.py`, `:1041-1059`,
 /// `:1159-1173`).  Without this split, every direct
 /// `UnicodeDecodeError.__new__(cls, *args)` call would inherit the
 /// typechecking that PyPy keeps confined to `descr_init` — see
@@ -10335,7 +10335,7 @@ pub fn make_exc_type_with_init(
                     make_builtin_function_with_arity("__setstate__", base_exception_setstate, 2),
                 );
             }
-            // `interp_exceptions.py:379-397` — ImportError overrides reduce
+            // `interp_exceptions.py descr_reduce` — ImportError overrides reduce
             // and setstate to carry the `name`/`path`/`name_from` slots.
             // ModuleNotFoundError (built via `make_exc_type`) inherits these
             // through the MRO.
@@ -10365,7 +10365,7 @@ pub fn make_exc_type_with_init(
                     make_builtin_function_with_arity("__reduce__", attribute_error_reduce, 1),
                 );
             }
-            // `interp_exceptions.py:655-665` — OSError overrides reduce to
+            // `interp_exceptions.py descr_reduce` — OSError overrides reduce to
             // re-append the filename(s); its subclasses inherit it.
             if name == "OSError" {
                 type_ns_store(
@@ -11288,7 +11288,7 @@ fn exception_group_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let message = unsafe { pyre_object::w_str_get_wtf8(message) }.to_wtf8_buf();
     let count = unsafe { pyre_object::w_tuple_len(exceptions) };
     let suffix = if count == 1 { "" } else { "s" };
-    // `app_group.py:88-90` interpolates `self.message` into the result, and a
+    // `app_group.py __str__` interpolates `self.message` into the result, and a
     // `str` carrying an unpaired surrogate interpolates as itself.  Building
     // the result through `to_string_lossy` instead turned that surrogate into
     // U+FFFD, so `str(group)` answered a different string than `group.message`
@@ -11313,7 +11313,7 @@ fn exception_group_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let message_repr = unsafe { crate::display::py_repr_wtf8(message())? };
     let saved =
         unsafe { pyre_object::interp_exceptions::w_exception_get_group_exceptions_repr(w_self()) };
-    // `app_group.py:92-93` interpolates the two `!r` results into the result
+    // `app_group.py __repr__` interpolates the two `!r` results into the result
     // verbatim, so a `__repr__` that answers a lone surrogate carries it
     // through.  Every piece here is WTF-8 for that reason: `w_str_get_value`
     // on the saved spelling would panic outright on such a surrogate, and the
@@ -11684,7 +11684,7 @@ pub fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             )));
         };
         // `descr_decode` reads an omitted encoding as utf-8
-        // (stringmethods.py:200-201).  This positional shape cannot skip the
+        // (stringmethods.py).  This positional shape cannot skip the
         // slot when `errors` follows it, so spell the default out: `decode`
         // refuses a literal `None` there like any other non-str.  The default
         // is a prebuilt: `w_str_new` is immortal, so wrapping it per call
@@ -11937,7 +11937,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // Python 3.14 difference: the deprecated `__trunc__` delegation in
         // this PyPy source was removed from `int()` after Python 3.11.  Our
         // language target is 3.14, so proceed directly to `__index__`.
-        // intobject.py:1015: space.lookup(w_value, '__index__')
+        // intobject.py: space.lookup(w_value, '__index__')
         if unsafe { crate::baseobjspace::lookup(obj, "__index__") }.is_some() {
             // intobject.py:1016: w_obj = space.index(w_value)
             let w_obj = crate::baseobjspace::space_index(obj)?;
@@ -17336,7 +17336,7 @@ pub fn exec_or_eval(
         //   space.call_method(w_globals, 'setdefault',
         //                     '__builtins__', self.get_builtin())
         // — `self` is the caller frame, so `get_builtin()` returns the
-        // builtin picked at caller-frame creation (`pyframe.py:115-116`),
+        // builtin picked at caller-frame creation (`pyframe.py`),
         // not the EC's default.  When the caller frame's picked builtin
         // is unavailable (e.g. exec called from outside any frame), fall
         // through to the EC default.  The receiver is the ORIGINAL
@@ -17403,7 +17403,7 @@ pub fn exec_or_eval(
     //
     // eval() takes no closure parameter; the eval-side error for a code
     // object that carries free variables comes from initialize_frame_scopes
-    // (pyframe.py:242-246 "directly executed code object may not contain free
+    // (pyframe.py "directly executed code object may not contain free
     // variables") when createframe runs below with no outer_func.
     // `inject_closure` records that a validated closure must be bound into the
     // frame; the `outer_func` carrier is built just before createframe so it
@@ -17558,7 +17558,7 @@ pub fn exec_or_eval(
     // omits both globals and locals, exec falls back to caller globals
     // (already wired above) AND caller `getdictscope()`.  When the
     // caller omits ONLY locals, locals collapse to globals (PyPy
-    // `pyopcode.py:2010-2013`), which the existing same-storage shape
+    // `pyopcode.py`), which the existing same-storage shape
     // below covers via the `is_none_or_null(locals_arg)` skip.
     //
     // Resolve the implicit caller-locals only when globals_arg is also
@@ -17609,7 +17609,7 @@ pub fn exec_or_eval(
     };
     // eval.py Code.exec_code → space.createframe(...) + frame.run().
     // For eval() with a code object that carries freevars, `outer_func` is
-    // None so createframe surfaces pyframe.py:242-246's TypeError "directly
+    // None so createframe surfaces pyframe.py's TypeError "directly
     // executed code object may not contain free variables" — exec()'s
     // closure-mismatch TypeError was already raised above.
     let mut frame = match crate::createframe_obj(
@@ -17680,7 +17680,7 @@ pub fn exec_or_eval(
     // STORE_GLOBAL / DELETE_GLOBAL writes during the run land on the
     // storage proxy and back-mirror to the dict object, so the user dict
     // and the frame's globals stay one and the same throughout the run
-    // (pyopcode.py:771-776 parity — no entry/exit drain needed).
+    // (pyopcode.py parity — no entry/exit drain needed).
     let result = frame.run_with_jit();
 
     let _ = raw_code; // keep raw_code alive until after exec for safety.
@@ -18079,7 +18079,7 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             return builtin_sorted(&[result]);
         }
     }
-    // `GenericAlias.__dir__` (`_pypy_generic_alias.py:85`) merges the alias's
+    // `GenericAlias.__dir__` (`_pypy_generic_alias.py`) merges the alias's
     // own attribute names with `dir(__origin__)`.
     if unsafe { pyre_object::is_generic_alias(obj) } {
         return crate::_pypy_generic_alias::dir_list(obj);
@@ -18193,7 +18193,7 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // implements through `id_or_identityhash` (incminimark.py) so
     // nursery moves preserve it.  The address-valued function is a
     // different one — `current_object_addr_as_int`
-    // (objectmodel.py:584-590), whose docstring exists to say the value
+    // (objectmodel.py), whose docstring exists to say the value
     // "can change over time for moving GCs".  A list and a dict header do
     // move, so answering with the raw pointer would give such an object two
     // different ids over its lifetime, and every structure keyed on `id()`
@@ -18388,7 +18388,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             return Ok(frozenset_hash_from_storage(obj));
         }
         if pyre_object::is_generic_alias(obj) {
-            // GenericAlias.__hash__ (`_pypy_generic_alias.py:82`) —
+            // GenericAlias.__hash__ (`_pypy_generic_alias.py`) —
             // `hash(self.__origin__) ^ hash(self.__args__)`.  Routed through
             // `try_hash_value` so an unhashable element in `__args__`
             // surfaces its TypeError instead of being swallowed.
@@ -19018,7 +19018,7 @@ pub fn hash_value(mut obj: PyObjectRef) -> i64 {
             return hash_value(tup);
         }
         if pyre_object::is_generic_alias(obj) {
-            // GenericAlias.__hash__ (`_pypy_generic_alias.py:82`) —
+            // GenericAlias.__hash__ (`_pypy_generic_alias.py`) —
             // `hash(self.__origin__) ^ hash(self.__args__)`.  Resolved
             // here because `hash_w` does not consult a typedef `__hash__`
             // for builtin W_Roots.
@@ -22392,7 +22392,7 @@ fn builtin_open_impl(
     // binary line buffering. Hand that exact str/bytes result to `W_FileIO`.
     // `_open` never probes `__index__` here: `pypy/module/_io/interp_io.py`
     // routes every non-str/bytes/int argument straight to `fspath`, matching
-    // the pinned CPython fallback (`lib-python/3/_pyio.py:194`, `if not
+    // the pinned CPython fallback (`lib-python/3/_pyio.py`, `if not
     // isinstance(file, int): file = os.fspath(file)`). An object that defines
     // both `__index__` and `__fspath__` must resolve through `__fspath__`
     // only, same as main before this file did any PathLike resolution here.
@@ -23738,7 +23738,7 @@ fn round_receiver(args: &[PyObjectRef], slot: bool) -> Result<PyObjectRef, crate
             // `10 ** -ndigits` and divmod-near.  Converting ndigits to an
             // index-sized Rust word or formatting the operand merely to count
             // decimal digits both diverge from that consumer shape.
-            // `intobject.py:167,174` answers both the absent-ndigits and the
+            // `intobject.py` answers both the absent-ndigits and the
             // non-negative-ndigits case with `self.int(space)`, so a subclass
             // receiver (`bool` included) is rounded to its base type.
             let nd = match ndigits {

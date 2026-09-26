@@ -5,7 +5,7 @@
 # cpython 1.00s vs pyre 0.07s (14x), and it is not gated on — only pypy is.
 # A loop that defines a function in its own body and calls it.
 #
-# `pyopcode.py:1457 MAKE_FUNCTION` runs `function.py:47-57 Function.__init__`
+# `pyopcode.py MAKE_FUNCTION` runs `function.py:47-57 Function.__init__`  allow-line-citation
 # per execution, so `grab` is a fresh object every iteration.  Nothing here
 # escapes it: the call is inlined and the object is dead by the next
 # `MAKE_FUNCTION`.  Building the function inline — `NewWithVtable` plus one

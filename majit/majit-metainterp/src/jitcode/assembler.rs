@@ -98,7 +98,7 @@ pub(crate) fn scalar_size(ty: majit_ir::value::Type) -> usize {
 /// The offset arm is deliberately narrow. Offset is NOT an identity: measured on
 /// this tree, 7 of 1714 submitted field specs sit at an offset another field of
 /// the same parent also occupies (a flattened inline aggregate and its first
-/// leaf share an address, `heaptracker.py:68-69`). Resolving against an
+/// leaf share an address, `heaptracker.py`). Resolving against an
 /// ambiguous offset would silently name a sibling, so this returns `None` and
 /// leaves the caller's number alone — the same refusal `descr.rs
 /// find_index_in_parent` documents for the runtime lookup, for the same reason.
@@ -168,7 +168,7 @@ pub struct JitCodeBuilder {
     /// Used by `loop_header` / `jit_merge_point` jdindex emission, where
     /// the operand byte must hold a single `num_regs_X + pool_idx`
     /// register-file index (upstream `@arguments("i")` —
-    /// `blackhole.py:1062,1066`). `patch_const_u8_refs()` rewrites each
+    /// `blackhole.py`). `patch_const_u8_refs()` rewrites each
     /// placeholder once `num_regs_X` is final and asserts the slot fits
     /// in u8.
     const_patches_u8: Vec<(usize, ConstKind, u16)>,
@@ -250,7 +250,7 @@ pub struct JitCodeBuilder {
     /// `set_calldescr` so `finish()` can stamp it into the body atomically;
     /// the post-assemble `body_mut().calldescr = ...` write the previous
     /// implementation used violated the upstream order
-    /// (`call.py:167-169` constructs `JitCode(name, fnaddr, calldescr)`
+    /// (`call.py` constructs `JitCode(name, fnaddr, calldescr)`
     /// before `assembler.assemble`).
     calldescr: majit_jitcode::jitcode::BhCallDescr,
     /// Set by [`Self::start_instr`] when the body emits an opcode whose answer
@@ -354,7 +354,7 @@ impl JitCodeBuilder {
     }
 
     /// Stage the calldescr returned by `get_jitcode_calldescr`
-    /// (`call.py:167`) so `finish()` can stamp it into the body alongside
+    /// (`call.py`) so `finish()` can stamp it into the body alongside
     /// the bytecode/constants pool, matching the upstream
     /// `JitCode(name, fnaddr, calldescr)` constructor order.
     pub fn set_calldescr(&mut self, calldescr: majit_jitcode::jitcode::BhCallDescr) {
@@ -895,7 +895,7 @@ impl JitCodeBuilder {
     ///
     /// `index_in_parent` is the field's rank by byte offset, not its order
     /// in the incoming slice.  `heaptracker.get_fielddescr_index_in`
-    /// (`descr.py:228`) derives the index from the STRUCT's own field list,
+    /// (`descr.py`) derives the index from the STRUCT's own field list,
     /// a stable per-type property; the caller's slice comes from a Rust
     /// struct literal whose source order may differ from (and vary between
     /// literals of) the declared layout.  Sorting by offset gives every
@@ -1007,7 +1007,7 @@ impl JitCodeBuilder {
     }
 
     /// Build a scalar `Field` descr (one machine word) for a plain
-    /// getfield_gc/setfield_gc operand.  `blackhole.py:1432-1481`
+    /// getfield_gc/setfield_gc operand.  `blackhole.py bhimpl_getfield_gc_i`
     /// resolves the `d` argcode to a FieldDescr carrying the byte
     /// offset; the flag/sign follow the field kind.
     fn add_scalar_field_descr(&mut self, offset: usize, field_type: majit_ir::value::Type) -> u16 {
@@ -1047,7 +1047,7 @@ impl JitCodeBuilder {
     /// Build a `Field` descr for a `setfield_gc_*` on a struct whose
     /// `new` already registered its layout under `type_id`.  Mirrors
     /// `descr.py get_field_descr`: the descr carries
-    /// `index_in_parent` (`descr.py:228`) and `parent_descr =
+    /// `index_in_parent` (`descr.py`) and `parent_descr =
     /// get_size_descr(STRUCT)` (`descr.py`).  The optimizer's
     /// `optimize_setfield_gc` (`optimizeopt/virtualize.rs`) requires
     /// the parent SizeDescr to virtualize the field; a missing
@@ -1083,7 +1083,7 @@ impl JitCodeBuilder {
         //
         // The offset remains the fallback for a caller that has no name (`""`),
         // and it is not an identity: a flattened layout puts an inline
-        // aggregate and its first leaf at one address (`heaptracker.py:68-69`).
+        // aggregate and its first leaf at one address (`heaptracker.py`).
         // Where the offset names two fields, take the unresolved fallback
         // rather than the first of them.  A guessed NAME is the damaging half:
         // it becomes the descr's `_cache_field` key downstream, so naming the
@@ -1096,7 +1096,7 @@ impl JitCodeBuilder {
         let (index_in_parent, name) = slot
             .map(|idx| (Some(idx), parent_spec.all_fielddescrs[idx].name.clone()))
             .unwrap_or((None, String::new()));
-        // The registered layout is the record of what `descr.py:218-239
+        // The registered layout is the record of what `descr.py get_field_descr
         // get_field_descr` derives from FIELDTYPE, so a field it names supplies
         // its own width and signedness.  The IR bank the access lands in
         // cannot: every integer read arrives here as `Type::Int` whether the
@@ -1943,7 +1943,7 @@ impl JitCodeBuilder {
     ///             [descr_idx lo u8][descr_idx hi u8][dst u8]`.
     ///
     /// Used by the dispatch JitCode body to encode `let opcode = program[pc]`
-    /// (pyopcode.py:171 `ord(co_code[next_instr])`).
+    /// (pyopcode.py `ord(co_code[next_instr])`).
     /// `blackhole.py` `bhimpl_strlen`: `[string_reg][dst]`, `strlen/r>i`.
     ///
     /// Records `OpCode::Strlen` on `rstr.STR` (hash, length, chars). No descr
@@ -2033,7 +2033,7 @@ impl JitCodeBuilder {
     ///
     /// Deduped: multiple calls with the same shape return the same index.
     ///
-    /// `itemsize=1` mirrors RPython `pypy/interpreter/pyopcode.py:171`
+    /// `itemsize=1` mirrors RPython `pypy/interpreter/pyopcode.py`
     /// `ord(co_code[next_instr])` byte-load semantics. `is_item_signed=false`
     /// because `ord()` yields a non-negative `0..=255` integer (zero-extend
     /// to `i64`, never sign-extend); the `u8` SUB-INTERVAL property must
@@ -2137,7 +2137,7 @@ impl JitCodeBuilder {
 
     /// Emit `raw_load_i/iid>i` (`blackhole.py bhimpl_raw_load_i`):
     /// read an int from raw memory at `registers_i[base_reg] +
-    /// registers_i[ea_reg]` (byte offset) into `dst`.  `jtransform.py:1165-1171
+    /// registers_i[ea_reg]` (byte offset) into `dst`.  `jtransform.py rewrite_op_raw_load
     /// rewrite_op_raw_load` lowers a `raw_storage_getitem` to this op with an
     /// `arraydescrof(rffi.CArray(T))` descr (`add_raw_int_array_descr`).
     ///
@@ -2483,7 +2483,7 @@ impl JitCodeBuilder {
         self.push_u16(descr_idx);
     }
 
-    /// RPython `blackhole.py:459-521` `bhimpl_int_*` per-opname handlers:
+    /// RPython `blackhole.py bhimpl_int_add` `bhimpl_int_*` per-opname handlers:
     /// each primitive has its own insn_id in `BlackholeInterpBuilder.insns`
     /// (`blackhole.py setup_insns`). Emits via `write_insn` with
     /// the canonical `opname/ii>i` key so the opcode byte comes from the
@@ -2512,7 +2512,7 @@ impl JitCodeBuilder {
             OpCode::IntLe => "int_le/ii>i",
             OpCode::IntGt => "int_gt/ii>i",
             OpCode::IntGe => "int_ge/ii>i",
-            // Unsigned integer primitives — RPython `blackhole.py:471,521,571-582`.
+            // Unsigned integer primitives — RPython `blackhole.py bhimpl_uint_mul_high`.
             OpCode::UintRshift => "uint_rshift/ii>i",
             OpCode::UintMulHigh => "uint_mul_high/ii>i",
             OpCode::UintLt => "uint_lt/ii>i",
@@ -2768,7 +2768,7 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
-    /// RPython `blackhole.py:591-596` unary ptr nullity checks returning int.
+    /// RPython `blackhole.py bhimpl_ptr_iszero` unary ptr nullity checks returning int.
     /// Byte layout `[src][dst]` per canonical `bhhandler_r_i!` decoder.
     pub fn ptr_iszero(&mut self, dst: u16, src: u16) {
         self.touch_reg(dst);
@@ -2904,7 +2904,7 @@ impl JitCodeBuilder {
         self.push_label_ref(label);
     }
 
-    // blackhole.py:752-798 float variants — same semantics, float regs.
+    // blackhole.py bhimpl_goto_if_not_float_lt float variants — same semantics, float regs.
     pub fn goto_if_not_float_lt(&mut self, a: u16, b: u16, label: u16) {
         self.touch_float_reg(a);
         self.touch_float_reg(b);
@@ -2993,7 +2993,7 @@ impl JitCodeBuilder {
     }
 
     // blackhole.py `bhimpl_goto_if_not_int_is_zero(a, target, pc)`:
-    // fall through iff `not a` (a == 0), else take the target. jtransform.py:1212
+    // fall through iff `not a` (a == 0), else take the target. jtransform.py _rewrite_equality
     // `_rewrite_equality` rewrites `int_eq(x, 0)` → `int_is_zero(x)` so
     // flatten.py:247 specialises the bool exitswitch into this unary form.
     pub fn goto_if_not_int_is_zero(&mut self, a: u16, label: u16) {
@@ -3010,8 +3010,8 @@ impl JitCodeBuilder {
 
     /// RPython jtransform.py handle_jit_marker__loop_header emits
     /// `SpaceOperation('loop_header', [c_index], None)` with
-    /// `Constant(jd.index, lltype.Signed)`. blackhole.py:1063
-    /// bhimpl_loop_header(jdindex) is a no-op; pyjitpl.py:1527
+    /// `Constant(jd.index, lltype.Signed)`. blackhole.py bhimpl_loop_header
+    /// bhimpl_loop_header(jdindex) is a no-op; pyjitpl.py opimpl_loop_header
     /// opimpl_loop_header records the jitdriver index for the trace.
     ///
     /// `@arguments("i")` (blackhole.py) parity: jdindex is encoded
@@ -3234,7 +3234,7 @@ impl JitCodeBuilder {
     /// jdindex is emitted per assembler.py USE_C_FORM rules —
     /// `'c'` (raw signed byte) when fitting in `i8`, otherwise `'i'`
     /// (constants-pool slot). The blackhole `@arguments("i", ...)`
-    /// decoder (blackhole.py:113-123) interprets the byte per the
+    /// decoder (blackhole.py) interprets the byte per the
     /// runtime argcode.
     ///
     /// jtransform.py:1704 emits `Constant(self.portal_jd.index,
@@ -3461,7 +3461,7 @@ impl JitCodeBuilder {
         }
     }
 
-    /// Constant-operand form of `ref_return`. `flatten.py:130-146
+    /// Constant-operand form of `ref_return`. `flatten.py make_return
     /// make_return` emits `ref_return` with `getcolor(v)`, and
     /// `flatten.py getcolor` passes a `Constant` through
     /// unchanged; `assembler.py emit_const` then encodes it as
@@ -3501,7 +3501,7 @@ impl JitCodeBuilder {
         self.push_u8(src as u8);
     }
 
-    /// Constant-operand form of `emit_raise`. `flatten.py:148-176
+    /// Constant-operand form of `emit_raise`. `flatten.py make_link
     /// make_exception_link` / `make_return` reraise paths emit `raise`
     /// with `getcolor(exc_value)`, which is a `Constant` for a fixed
     /// exception instance (e.g. the overflow reraise). Encodes it via
@@ -3538,7 +3538,7 @@ impl JitCodeBuilder {
     /// the operand byte.  Tracing dispatcher routes
     /// through `TraceCtx::trace_assert_not_none(opref)` which gates on
     /// `heap_cache.is_nullity_known` and bumps `HEAPCACHED_OPS` on
-    /// cache hit per pyjitpl.py:387-388.
+    /// cache hit per pyjitpl.py.
     pub fn assert_not_none(&mut self, src: u16) {
         self.write_insn("assert_not_none/r");
         self.push_reg_u8(src, "assert_not_none");
@@ -3551,7 +3551,7 @@ impl JitCodeBuilder {
     /// advances past the two operand bytes).  Tracing dispatcher routes
     /// through `TraceCtx::trace_record_exact_class(opref, cls_const)`
     /// which gates on `heap_cache.is_class_known` and bumps
-    /// `HEAPCACHED_OPS` on cache hit per pyjitpl.py:396-397.  Argcodes
+    /// `HEAPCACHED_OPS` on cache hit per pyjitpl.py.  Argcodes
     /// `ri` mirrors `blackhole.py @arguments("r", "i")`.
     pub fn record_exact_class(&mut self, src: u16, cls: u16) {
         self.write_insn("record_exact_class/ri");
@@ -4130,7 +4130,7 @@ impl JitCodeBuilder {
         // descriptor effects before recording the call, so the descr must
         // carry the callee's own classification —
         // `effect_info_for_target`. `check_can_raise()`
-        // (`effectinfo.py:236 extraeffect > EF_CANNOT_RAISE`) holds for
+        // (`effectinfo.py extraeffect > EF_CANNOT_RAISE`) holds for
         // every row it can return, so the walker keeps emitting
         // `GUARD_NO_EXCEPTION`.
         let effect_info = self.effect_info_for_target(fn_ptr_idx);
@@ -4161,7 +4161,7 @@ impl JitCodeBuilder {
     }
 
     /// Emit a void residual call whose `void_word_abi` flag retains an ignored
-    /// machine-word result. `descr.py:647` gives `lltype.Void` descriptors
+    /// machine-word result. `descr.py get_call_descr` gives `lltype.Void` descriptors
     /// `result_size = 0`, so it has no counterpart for a semantically void
     /// helper that physically returns a word. `pyre-jit/src/jit/codewriter.rs`
     /// (`CodeWriter::intern_call_descr_stub`) sets it for
@@ -4357,7 +4357,7 @@ impl JitCodeBuilder {
                 // RPython `effectinfo.py MOST_GENERAL` parity:
                 // release-gil callees default to RandomEffects with
                 // `can_invalidate=true` so the heapcache `clear_caches`
-                // path fires (heapcache.py:343-353) instead of only
+                // path fires (heapcache.py) instead of only
                 // the escape-based fallback. effectinfo.py:149-155
                 // keeps every readonly/write descr set None for
                 // `EF_RANDOM_EFFECTS`. `(1, 0)` is the unresolved
@@ -4368,7 +4368,7 @@ impl JitCodeBuilder {
                 // substitute both the real
                 // `_call_aroundstate_target_[0]` (`rffi.py:228`)
                 // address and the wrapper's `save_err` flag bits
-                // (`rffi.py:62-71`).
+                // (`rffi.py`).
                 call_release_gil_target: (1, 0),
                 ..majit_ir::descr::EffectInfo::MOST_GENERAL
             },
@@ -4477,7 +4477,7 @@ impl JitCodeBuilder {
     }
 
     /// Sibling of `emit_canonical_call_void` for the non-void result
-    /// shapes. RPython `blackhole.py:1228-1252`
+    /// shapes. RPython `blackhole.py bhimpl_residual_call_r_r`
     /// `bhimpl_residual_call_{r,ir,irf}_{i,r,f}`. The encoding mirrors
     /// the void form with one trailing `dst:u8` byte appended after
     /// the calldescr operand (consumed by handlers
@@ -4578,7 +4578,7 @@ impl JitCodeBuilder {
 
     /// Int-result sibling of
     /// [`Self::residual_call_void_canonical_via_target`].
-    /// `bhimpl_residual_call_{r,ir,irf}_i` (`blackhole.py:1225-1247`)
+    /// `bhimpl_residual_call_{r,ir,irf}_i` (`blackhole.py bhimpl_residual_call_r_i`)
     /// dispatches via `cpu.bh_call_i` and writes the result into
     /// `bh.registers_i[dst]`.
     #[allow(dead_code)]
@@ -4622,7 +4622,7 @@ impl JitCodeBuilder {
     }
 
     /// ref-result sibling.  `bhimpl_residual_call_{r,ir,irf}_r`
-    /// (`blackhole.py:1228-1250`) dispatches via `cpu.bh_call_r`.
+    /// (`blackhole.py bhimpl_residual_call_r_r`) dispatches via `cpu.bh_call_r`.
     #[allow(dead_code)]
     pub fn residual_call_ref_canonical_via_target(
         &mut self,
@@ -4664,7 +4664,7 @@ impl JitCodeBuilder {
     }
 
     /// Float-result emission body.  `bhimpl_residual_call_irf_f` is the
-    /// only float-result variant per `resoperation.py:1238-1248`, so
+    /// only float-result variant per `resoperation.py call_release_gil_for_descr`, so
     /// the opcode is fixed — but the handler at
     /// `handler_residual_call_irf_f` (`blackhole.rs`) always reads
     /// `read_list_f` after `read_list_r`, so the layout MUST emit an
@@ -4726,13 +4726,13 @@ impl JitCodeBuilder {
         // `emit_canonical_call_typed` (line 1951) already records this for
         // `_i` / `_r` / `_f` (non-IRF) result variants — float-on-IRF must
         // do the same so `MIFrame::make_result_of_lastop`
-        // (`pyjitpl.py:260-265`) reads the correct kind back.
+        // (`pyjitpl.py`) reads the correct kind back.
         self.record_resulttype('f');
         calldescr_idx
     }
 
     /// float-result sibling.  Always uses `IRF_F` per
-    /// `resoperation.py:1238-1248` ("no such thing" `R_F` / `IR_F`)
+    /// `resoperation.py call_release_gil_for_descr` ("no such thing" `R_F` / `IR_F`)
     /// and goes through `Self::emit_canonical_call_typed_irf_f` so
     /// the F list count byte is always present.
     #[allow(dead_code)]
@@ -5136,7 +5136,7 @@ impl JitCodeBuilder {
         );
     }
 
-    // ── conditional_call / record_known_result (jtransform.py:1665-1688, 292-313) ──
+    // ── conditional_call / record_known_result (jtransform.py _rewrite_op_cond_call, 292-313) ──
     //
     // `rewrite_call(..., force_ir=True)` always emits `iiIRd` / `riIRd`
     // (`condition`/`value` + funcptr + I list + R list + calldescr). The
@@ -5339,7 +5339,7 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
-    /// `flatten.py` `self.emitline('int_push', v)` / `blackhole.py:662-663`
+    /// `flatten.py` `self.emitline('int_push', v)` / `blackhole.py bhimpl_int_push`
     /// `bhimpl_int_push(a)` — save `src` into the int-kind scratch slot.
     pub fn push_i(&mut self, src: u16) {
         self.touch_reg(src);
@@ -5347,7 +5347,7 @@ impl JitCodeBuilder {
         self.push_u8(src as u8);
     }
 
-    /// `flatten.py` `self.emitline('int_pop', "->", w)` / `blackhole.py:672-673`
+    /// `flatten.py` `self.emitline('int_pop', "->", w)` / `blackhole.py bhimpl_int_pop`
     /// `bhimpl_int_pop()` — load `dst` from the int-kind scratch slot.
     pub fn pop_i(&mut self, dst: u16) {
         self.touch_reg(dst);
@@ -5403,7 +5403,7 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
-    /// `flatten.py` `self.emitline('ref_push', v)` / `blackhole.py:665-666`
+    /// `flatten.py` `self.emitline('ref_push', v)` / `blackhole.py bhimpl_ref_push`
     /// `bhimpl_ref_push(a)` — save `src` into the ref-kind scratch slot.
     pub fn push_r(&mut self, src: u16) {
         self.touch_ref_reg(src);
@@ -5411,7 +5411,7 @@ impl JitCodeBuilder {
         self.push_u8(src as u8);
     }
 
-    /// `flatten.py` `self.emitline('ref_pop', "->", w)` / `blackhole.py:675-676`
+    /// `flatten.py` `self.emitline('ref_pop', "->", w)` / `blackhole.py bhimpl_ref_pop`
     /// `bhimpl_ref_pop()` — load `dst` from the ref-kind scratch slot.
     pub fn pop_r(&mut self, dst: u16) {
         self.touch_ref_reg(dst);
@@ -5500,7 +5500,7 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
-    /// `flatten.py` `self.emitline('float_push', v)` / `blackhole.py:668-669`
+    /// `flatten.py` `self.emitline('float_push', v)` / `blackhole.py bhimpl_float_push`
     /// `bhimpl_float_push(a)` — save `src` into the float-kind scratch slot.
     pub fn push_f(&mut self, src: u16) {
         self.touch_float_reg(src);
@@ -5508,7 +5508,7 @@ impl JitCodeBuilder {
         self.push_u8(src as u8);
     }
 
-    /// `flatten.py` `self.emitline('float_pop', "->", w)` / `blackhole.py:678-679`
+    /// `flatten.py` `self.emitline('float_pop', "->", w)` / `blackhole.py bhimpl_float_pop`
     /// `bhimpl_float_pop()` — load `dst` from the float-kind scratch slot.
     pub fn pop_f(&mut self, dst: u16) {
         self.touch_float_reg(dst);
@@ -5564,7 +5564,7 @@ impl JitCodeBuilder {
         );
     }
 
-    /// RPython `blackhole.py:696-719` `bhimpl_float_{add,sub,mul,truediv}`
+    /// RPython `blackhole.py bhimpl_float_add` `bhimpl_float_{add,sub,mul,truediv}`
     /// per-opname handlers. `float_floordiv` / `float_mod` have no direct
     /// RPython `bhimpl_*` — those lower to a residual call at the
     /// codewriter layer, never reaching a jitcode bytecode.
@@ -5837,9 +5837,9 @@ impl JitCodeBuilder {
     /// distinct entries; in practice the same helper is registered with
     /// a single classification and the dedup matches the `add_call_target`
     /// path verbatim.  `save_err` defaults to `0` (`RFFI_ERR_NONE`,
-    /// `rffi.py:80`); release-gil callees use [`Self::add_call_target_with_save_err`]
+    /// `rffi.py`); release-gil callees use [`Self::add_call_target_with_save_err`]
     /// to thread the wrapper's `_call_aroundstate_target_[1]`
-    /// (`rffi.py:228`) into the dedup key.
+    /// (`rffi.py`) into the dedup key.
     pub fn add_call_target_with_slot(
         &mut self,
         trace_ptr: *const (),
@@ -5852,7 +5852,7 @@ impl JitCodeBuilder {
     /// `add_call_target_with_slot` variant for release-gil callees:
     /// records the wrapper callable's
     /// `_call_aroundstate_target_ = (funcptr, save_err)` decoration
-    /// (`rffi.py:228`).  The `(trace_ptr, concrete_ptr, slot,
+    /// (`rffi.py`).  The `(trace_ptr, concrete_ptr, slot,
     /// save_err)` tuple is the dedup key — same callee registered with
     /// two different `save_err` values produces two distinct entries
     /// because the recorded `EffectInfo.call_release_gil_target`
@@ -6144,7 +6144,7 @@ impl JitCodeBuilder {
             // `None`. Wrap in `Some(...)` so the upstream None sentinel
             // is reserved for hand-built helper jitcodes that bypass the
             // builder (matching `JitCode.setup(..., startpoints=None,
-            // alllabels=None)` defaults at jitcode.py:24).
+            // alllabels=None)` defaults at jitcode.py).
             startpoints: Some(self.startpoints),
             alllabels: Some(self.alllabels),
             resulttypes,
@@ -6181,7 +6181,7 @@ impl JitCodeBuilder {
             // Propagate the captured `BC_JIT_MERGE_POINT(_C)` opcode
             // offset so `register_dispatch_jitcode` validates the payload
             // by direct seek instead of byte-stream scan
-            // (blackhole.py:107-156 argcode-based decode parity).
+            // (blackhole.py handler argcode-based decode parity).
             jit_merge_point_offset: self.jit_merge_point_offset,
             reads_identity_slots: self.reads_identity_slots,
         };
@@ -6270,13 +6270,13 @@ impl JitCodeBuilder {
     /// * the virtualizable getters/setters, which carry an obligation the
     ///   function they were lowered from does not: every one of them begins
     ///   `fielddescr.get_vinfo().clear_vable_token(vable)`
-    ///   (`blackhole.py:1374-1386 bhimpl_getarrayitem_vable_*`, mirrored by
+    ///   (`blackhole.py bhimpl_getarrayitem_vable_i bhimpl_getarrayitem_vable_*`, mirrored by
     ///   `vable_clear_token_and_get_vinfo`), and `clear_vable_token`
-    ///   (`virtualizable.py:218-222`) FORCES a virtualizable that still holds
+    ///   (`virtualizable.py`) FORCES a virtualizable that still holds
     ///   a token. Both blackholes then read the heap, so the field value would
     ///   agree — it is the forcing that a native entry would skip, leaving the
     ///   token standing. (Serving them out of `virtualizable_boxes` is the
-    ///   METAINTERP's behaviour, `pyjitpl.py:1167-1245
+    ///   METAINTERP's behaviour, `pyjitpl.py opimpl_getfield_vable_i
     ///   opimpl_getfield_vable_*`, not the blackhole's.);
     /// * `jit_merge_point` and `call_assembler`/`recursive_call`, which do not
     ///   return to the caller but raise a JitException the C-level call in
@@ -6653,7 +6653,7 @@ impl JitCodeBuilder {
     /// of one descr disagreeing: the field is declared to sit at slot `i` of a
     /// list whose slot `i` is a different offset.
     ///
-    /// The key is the FIELD NAME, `heaptracker.py:60-72
+    /// The key is the FIELD NAME, `heaptracker.py
     /// get_fielddescr_index_in(STRUCT, fieldname)`, whenever the mint recorded
     /// one.  Offset is not an identity: measured on this tree, 7 of 1714
     /// submitted field specs sit at an offset another field of the same parent
@@ -6671,7 +6671,7 @@ impl JitCodeBuilder {
     /// `add_struct_field_descr`'s `unwrap_or((0, String::new()))`.  Those are
     /// the inline aggregates the flattened layout only covers through their
     /// leaves (`ob_header`, `int_items`, an enum's `__pos_0`), which
-    /// `heaptracker.py:68-69` mints no descr for at all.
+    /// `heaptracker.py` mints no descr for at all.
     fn patch_field_descr_parents(&mut self) {
         for entry in &mut self.descrs {
             let RuntimeBhDescr::Descr(descr) = entry else {
@@ -6805,7 +6805,7 @@ impl JitCodeBuilder {
 
     /// 1-byte counterpart of `patch_const_refs`. `loop_header/i` and
     /// `jit_merge_point/iIRFIRF` jdindex bytes (`@arguments("i")`,
-    /// blackhole.py:1062,1066) carry a single register-index byte.
+    /// blackhole.py) carry a single register-index byte.
     /// Asserts the resolved slot fits in u8 — overflow means the portal
     /// has more than 255 int registers + constants combined, which
     /// would also break the broader 1-byte register encoding.
@@ -6840,7 +6840,7 @@ impl JitCodeBuilder {
 /// the macro emits a wrapper where `func_ptr` IS the C address.  The
 /// emit-side wrappers seed `call_release_gil_target: (1, 0)` purely
 /// to flip `EffectInfo::is_call_release_gil()` (`majit-ir`'s `effectinfo.rs`,
-/// `effectinfo.py:255-257`) on while the real address is unknown until
+/// `effectinfo.py`) on while the real address is unknown until
 /// `descrs[fn_ptr_idx]` resolves.  This helper substitutes the
 /// resolved `target.concrete_ptr` into that sentinel slot so the
 /// descr's IR carries `(real_addr, saveerr=0)`.
@@ -6857,8 +6857,8 @@ impl JitCodeBuilder {
 ///
 /// Resolve the `(realfuncaddr, save_err)` pair on a release-gil EI.
 ///
-/// `effectinfo.py:114, 197 call_release_gil_target = (target_fn_addr,
-/// save_err)` mirrors `rffi.py:228 _call_aroundstate_target_ =
+/// `effectinfo.py, 197 call_release_gil_target = (target_fn_addr,
+/// save_err)` mirrors `rffi.py _call_aroundstate_target_ =
 /// (funcptr, save_err)` — both halves come from the
 /// `@llexternal(... save_err=...)` registration on the wrapper.  The
 /// outer `call_release_gil_*_canonical_via_target` sites lack a
@@ -6867,7 +6867,7 @@ impl JitCodeBuilder {
 /// `emit_canonical_call_*_via_target` with the descr-resolved target,
 /// substitutes both halves verbatim.  The `save_err` argument carries
 /// the `JitCallTarget::save_err` field set by the macro DSL's
-/// `#[jit_release_gil(save_err = N)]` attribute (`rffi.py:62-71` flag
+/// `#[jit_release_gil(save_err = N)]` attribute (`rffi.py` flag
 /// bits, default `RFFI_ERR_NONE = 0`).
 fn resolve_call_release_gil_target(
     mut effect_info: majit_ir::descr::EffectInfo,
@@ -6879,7 +6879,7 @@ fn resolve_call_release_gil_target(
     // carries `_NO_CALL_RELEASE_GIL_TARGET = (0, 0)` for them).
     // Match the sentinel `1` exclusively so descrs with an already-
     // resolved `(tgt_func, saveerr)` from `_call_aroundstate_target_`
-    // (`call.py:252-258`) are preserved.
+    // (`call.py`) are preserved.
     if effect_info.call_release_gil_target.0 == 1 {
         effect_info.call_release_gil_target = (realfuncaddr as usize as u64, save_err);
     }
@@ -6931,7 +6931,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
         ) => {
             // `ei_index` is intentionally NOT part of the identity
             // tuple — upstream `gccache._cache_array[ARRAY_OR_STRUCT]`
-            // (`descr.py:348-360`) keys on the lltype itself, and
+            // (`descr.py get_array_descr`) keys on the lltype itself, and
             // `compute_bitstrings` (`effectinfo.py`) later assigns
             // the index slot as a derived attribute that multiple
             // descrs are free to share.
@@ -7765,7 +7765,7 @@ mod tests {
 
     #[test]
     fn residual_call_float_canonical_always_uses_irf_even_for_int_only_args() {
-        // Per `resoperation.py:1238-1248`, float-result residual_calls
+        // Per `resoperation.py call_release_gil_for_descr`, float-result residual_calls
         // only have an IRF form — the R / IR shapes are "no such thing".
         // `emit_canonical_call_typed_irf_f` therefore always emits all
         // three (count, regs) pairs, even when a list is empty, so the

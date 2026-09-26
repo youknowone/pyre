@@ -841,12 +841,12 @@ pub trait GcAllocator: Send {
     /// collector without card marking wants.
     fn writebarrier_before_move(&mut self, _obj: GcRef) {}
 
-    /// `llop.shrink_array(Bool, p, smallerlength)`, incminimark.py:1160-1182.
+    /// `llop.shrink_array(Bool, p, smallerlength)`, incminimark.py.
     ///
     /// Record in place that a varsize object is shorter than it was.  The
     /// default declines, which is a complete answer: `rgc.ll_shrink_array`
     /// allocates a smaller object and copies whenever the GC says no
-    /// (`rgc.py:475-478`), so a collector that cannot resize anything is
+    /// (`rgc.py`), so a collector that cannot resize anything is
     /// served by that path alone.
     fn shrink_array(&mut self, _addr: usize, _smaller_length: usize) -> bool {
         false
@@ -894,7 +894,7 @@ pub trait GcAllocator: Send {
     /// and exactly one major-collection state transition, independently of
     /// the automatic-collection enabled flag.
     ///
-    /// The default is `rgc.py:20-31`'s non-incremental answer: a collector
+    /// The default is `rgc.py`'s non-incremental answer: a collector
     /// with no state machine does the whole collection at once and reports
     /// `_encode_states(1, 0)`, a transition [`GcStepTransition::is_done`]
     /// accepts. Reporting the starting state on both sides would instead say
@@ -1314,12 +1314,12 @@ pub trait GcAllocator: Send {
     fn register_vtable_for_type(&mut self, _vtable: usize, _type_id: u32) {}
 
     /// `gctypelayout.encode_type_shapes_now` parity
-    /// (gctypelayout.py:393-398): closes the type-registration phase.
+    /// (gctypelayout.py): closes the type-registration phase.
     /// After freeze, `register_type` is forbidden, the
     /// `type_info_group` base address is stable, and every
     /// `is_object` type's `subclassrange_{min,max}` reflects the
     /// preorder of its inheritance chain (`assign_inheritance_ids`,
-    /// rtyper/normalizecalls.py:373-389).
+    /// rtyper/normalizecalls.py).
     ///
     /// Backends call this from `set_gc_allocator` so the embedded
     /// codegen-time pointers and bounds are immutable thereafter.
@@ -1364,7 +1364,7 @@ pub trait GcAllocator: Send {
     /// Tell the descr which registered type is `JITFRAME`.
     ///
     /// `jitframe.py` declares `JITFRAME` as a static `GcStruct` and
-    /// `GcLLDescription.malloc_jitframe` (gc.py:132) allocates it by that
+    /// `GcLLDescription.malloc_jitframe` (gc.py) allocates it by that
     /// name; the descr never has to be told. Here the shape is registered on
     /// the collector at frontend build time (`jitframe_type_info()`), so the
     /// id it received is handed to the descr once, right after that
@@ -1379,7 +1379,7 @@ pub trait GcAllocator: Send {
     /// for an allocator with no type table.
     ///
     /// `None` is what makes a frame a host-heap block rather than a GC
-    /// object: `GcLLDescr_boehm` (gc.py:151) is the closest upstream shape,
+    /// object: `GcLLDescr_boehm` (gc.py) is the closest upstream shape,
     /// a non-moving descr whose frames need no root slot and no barrier. The
     /// backends read this through `majit_backend::jitframe::malloc_jitframe`
     /// and never branch on it themselves.
@@ -1392,10 +1392,10 @@ pub trait GcAllocator: Send {
     /// it to `True`. Relayed to `cpu.supports_guard_gc_type` via
     /// `llmodel.py:63`. Gates the backend's `genop_guard_guard_gc_type`,
     /// `genop_guard_guard_is_object`, and `genop_guard_guard_subclass`
-    /// (x86/assembler.py:1896, 1925, 1946 `assert`) and
+    /// (x86/assembler.py, 1925, 1946 `assert`) and
     /// `ConstPtrInfo.get_known_class(cpu)` at info.py. The default
     /// `false` matches `AbstractCPU.supports_guard_gc_type` in
-    /// `rpython/jit/backend/model.py:21` and keeps backends without an
+    /// `rpython/jit/backend/model.py` and keeps backends without an
     /// installed TYPE_INFO table from emitting the guards.
     fn supports_guard_gc_type(&self) -> bool {
         false
@@ -1477,8 +1477,8 @@ pub trait GcAllocator: Send {
     /// Byte offset of the `subclassrange_min` field inside
     /// `rclass.CLASSTYPE`. `genop_guard_guard_subclass` uses it twice:
     /// once to read the subclassrange minimum from the object's
-    /// vtable (x86/assembler.py:1956) and once to locate the same
-    /// field inside a `TYPE_INFO` entry (x86/assembler.py:1968-1969).
+    /// vtable (x86/assembler.py) and once to locate the same
+    /// field inside a `TYPE_INFO` entry (x86/assembler.py).
     ///
     /// Default panics — same rationale as the other TYPE_INFO helpers.
     fn subclassrange_min_offset(&self) -> usize {
@@ -1509,7 +1509,7 @@ pub trait GcAllocator: Send {
     /// Companion to `subclass_range` keyed by typeid instead of
     /// classptr. Used by the executor's `GuardSubclass` arm after it
     /// resolves `value.typeptr` via `get_actual_typeid`
-    /// (llgraph/runner.py:1271-1281). Default `None`.
+    /// (llgraph/runner.py). Default `None`.
     fn typeid_subclass_range(&self, _typeid: u32) -> Option<(i64, i64)> {
         None
     }
@@ -1525,7 +1525,7 @@ pub trait GcAllocator: Send {
 
     /// Companion to `check_is_object` keyed by typeid. Returns
     /// whether the typeid carries `T_IS_RPYTHON_INSTANCE` in its
-    /// TYPE_INFO entry (gctypelayout.py:642). Default `None`.
+    /// TYPE_INFO entry (gctypelayout.py). Default `None`.
     fn typeid_is_object(&self, _typeid: u32) -> Option<bool> {
         None
     }
@@ -2017,7 +2017,7 @@ pub trait GcRewriter: Send {
 // ─────────────────────────────────────────────────────────────────────
 //
 // The metainterp / optimizer layer needs a backend-agnostic way to query
-// the current CPU's GC type registry (llmodel.py:541-546
+// the current CPU's GC type registry (llmodel.py check_is_object
 // `cpu.check_is_object(gcptr)`). In RPython the optimizer reaches it via
 // `self.optimizer.cpu`, which holds a reference to the backend-provided
 // CPU object. majit has no such field; instead the live backends register
@@ -2060,12 +2060,12 @@ pub type SubclassRangeFn = fn(classptr: usize) -> Option<(i64, i64)>;
 /// `execute_guard_subclass` without going through a vtable pointer —
 /// managed objects carry only a typeid in their GC header, and the
 /// TYPE_INFO table already stores the preorder bounds in its paired
-/// `CLASSTYPE` entry (gctypelayout.py:359-374).
+/// `CLASSTYPE` entry (gctypelayout.py add_vtable_after_typeinfo).
 pub type TypeidSubclassRangeFn = fn(typeid: u32) -> Option<(i64, i64)>;
 
 /// Process-global callback that answers `rclass.OBJECT`-layout queries
 /// by typeid — "does this typeid carry `T_IS_RPYTHON_INSTANCE` in its
-/// TYPE_INFO entry" (gctypelayout.py:642). The executor's
+/// TYPE_INFO entry" (gctypelayout.py). The executor's
 /// `GuardIsObject` arm calls this after resolving the object's typeid
 /// via the `get_actual_typeid` seam, avoiding a second indirection
 /// through `check_is_object` (which would re-resolve the typeid).
@@ -2075,7 +2075,7 @@ pub type TypeidIsObjectFn = fn(typeid: u32) -> Option<bool>;
 pub type IsRegisteredTypeIdFn = fn(typeid: u32) -> bool;
 
 /// Process-global callback that answers `rgc.can_move(gcref)`
-/// (rpython/rlib/rgc.py:229) for the currently active backend's GC. The
+/// (rpython/rlib/rgc.py) for the currently active backend's GC. The
 /// const-baking site (`x86/regalloc.py convert_to_imm`) consults
 /// this before baking a `ConstPtr` immediate.
 pub type CanMoveFn = fn(GcRef) -> bool;
@@ -2288,7 +2288,7 @@ pub fn taggedpointers_enabled() -> bool {
 /// gc.py `gc_ll_descr.get_actual_typeid(gcptr)` shim.
 /// Delegates to the active backend's installed callback; returns
 /// `None` when no backend is installed, which mirrors
-/// `llgraph/runner.py:1263-1269` skip semantics (the interpretive
+/// `llgraph/runner.py` skip semantics (the interpretive
 /// guard treats an unresolved object as passing).
 pub fn get_actual_typeid(gcref: GcRef) -> Option<u32> {
     if gcref.is_null() {
@@ -2303,7 +2303,7 @@ pub fn get_actual_typeid(gcref: GcRef) -> Option<u32> {
 /// `rgc.can_move(gcref)` shim (rpython/rlib/rgc.py). Delegates to the
 /// active backend's installed callback. Returns `false` for null pointers
 /// and when no backend is installed — i.e. a non-moving / absent GC, where
-/// every object address is stable (rgc.py:231 "with non-moving GCs, it is
+/// every object address is stable (rgc.py "with non-moving GCs, it is
 /// always False").
 pub fn can_move(gcref: GcRef) -> bool {
     if gcref.is_null() {
@@ -2396,7 +2396,7 @@ pub fn subclass_range(classptr: usize) -> Option<(i64, i64)> {
 
 /// Companion to `subclass_range` keyed by typeid instead of classptr.
 /// Resolves `value.typeptr.subclassrange_min/max` from
-/// llgraph/runner.py:1271-1281 when the executor only has a typeid in
+/// llgraph/runner.py execute_guard_subclass when the executor only has a typeid in
 /// hand (e.g. after calling `get_actual_typeid` on an object whose
 /// classptr is known only to the GC). Returns `None` when no backend
 /// is installed.
@@ -2633,7 +2633,7 @@ pub fn set_active_alloc_nursery_typed(hook: Option<AllocNurseryTypedFn>) {
 /// Upstream has neither state: the GC is a prebuilt constant
 /// (`rpython/memory/gctransform/framework.py:254`) and a nursery that cannot
 /// satisfy a request reaches `collect_and_reserve`
-/// (`rpython/memory/gc/incminimark.py:981-985`), which raises MemoryError.
+/// (`rpython/memory/gc/incminimark.py`), which raises MemoryError.
 pub fn gc_allocator_installed() -> bool {
     ACTIVE_ALLOC_NURSERY_TYPED.get().is_some()
 }
@@ -2643,7 +2643,7 @@ pub fn gc_allocator_installed() -> bool {
 /// `malloc_fixedsize` (incminimark.py) has neither state. The GC is a
 /// prebuilt constant (framework.py:254), so a route always exists, and a
 /// nursery that cannot satisfy the request reaches `collect_and_reserve`
-/// (incminimark.py:981-985), which raises MemoryError rather than handing a
+/// (incminimark.py), which raises MemoryError rather than handing a
 /// null back. Both states are this port's own, and they are not
 /// interchangeable:
 ///
@@ -3120,7 +3120,7 @@ pub fn collect_step() -> GcStepTransition {
     )
 }
 
-/// Active-backend trampoline for `rpython/rlib/rgc.py:1224
+/// Active-backend trampoline for `rpython/rlib/rgc.py do_get_objects
 /// do_get_objects`. The generation values are CPython 3.14's public
 /// `gc.get_objects` convention. The backend must invoke the visitor while its
 /// inspection pause is still held.
@@ -3139,7 +3139,7 @@ pub fn get_objects(generation: i8, visitor: GetObjectsVisitorFn) {
     }
 }
 
-/// Active-backend trampoline for `pypy/module/gc/referents.py:53-78
+/// Active-backend trampoline for `pypy/module/gc/referents.py _list_w_obj_referents
 /// _list_w_obj_referents`. Same rooting contract as [`get_objects`]: the
 /// backend invokes the visitor while its inspection pause is still held.
 pub type GetReferentsFn = fn(GcRef, GetObjectsVisitorFn);
@@ -3458,7 +3458,7 @@ pub fn active_jit_backend_memory_stats() -> (usize, usize) {
 }
 
 /// Process-global callback reporting the active GC's `major_threshold_reached`
-/// (incminimark.py:1288-1290). The interpreter GC safepoint
+/// (incminimark.py threshold_reached). The interpreter GC safepoint
 /// (`pyre_object::gc_interp`) collects when this says the collector wants a
 /// major, instead of keeping a second, poorer model of heap growth beside the
 /// collector's own.
@@ -3579,7 +3579,7 @@ pub fn gc_owns_object(addr: usize) -> bool {
 ///
 /// `false` when no backend has installed a hook, or when the object is one its
 /// GC declines to resize.  `rgc.ll_shrink_array` treats that answer as
-/// "allocate a smaller object and copy into it" (`rgc.py:475-478`), and so must
+/// "allocate a smaller object and copy into it" (`rgc.py`), and so must
 /// every caller here.
 pub fn gc_shrink_array(addr: usize, smaller_length: usize) -> bool {
     // A residual call copies its argument out of the jitframe before it enters
@@ -4108,7 +4108,7 @@ pub fn gc_set_enabled(enabled: bool) {
 
 /// rgc.isenabled — read the flag [`gc_set_enabled`] writes.
 ///
-/// `incminimark.py:831-832` is the only reader that matters: the automatic
+/// `incminimark.py` is the only reader that matters: the automatic
 /// major-progress path returns early while it is clear, and an explicit
 /// `gc.collect()` passes `force_enabled` to get past it.
 pub fn gc_isenabled() -> bool {

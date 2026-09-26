@@ -654,8 +654,8 @@ pub fn init_typeobjects() {
         // public contract.  Its OrderedDict views therefore use the 3.14
         // `_collections_abc` bases in `app_odict.py`.
         // dict_keys / dict_items get the SetLikeDictView surface
-        // per dictmultiobject.py:1802-1829 / 1773-1800; dict_values
-        // stops at the common slots per dictmultiobject.py:1831-1840
+        // per dictmultiobject.py / 1773-1800; dict_values
+        // stops at the common slots per dictmultiobject.py
         // (values views are intentionally NOT set-like).
         let dict_keys_type =
             new_typeobject_with_base("dict_keys", init_dict_view_keys_type, object_type);
@@ -688,7 +688,7 @@ pub fn init_typeobjects() {
             dict_items_type as usize,
         );
 
-        // traceback — `pypy/interpreter/pytraceback.py:17-101
+        // traceback — `pypy/interpreter/pytraceback.py PyTraceback
         // PyTraceback.typedef`.  Read-only-ish: `tb_next` accepts a
         // chain rewrite, `tb_lineno` / `tb_lasti` are read+write to
         // mirror PyPy's getsetters.  `acceptable_as_base_class=False`
@@ -1004,7 +1004,7 @@ pub fn init_typeobjects() {
         // gives the shared runtime type the canonical name/module
         // `typing.Union`. PyPy: _pypy_generic_alias.py UnionType,
         // bases=(object,).
-        // `__slots__` includes `__weakref__` (`_pypy_generic_alias.py:247`),
+        // `__slots__` includes `__weakref__` (`_pypy_generic_alias.py`),
         // so a union is weak-referenceable.
         let union_type = new_typeobject_with_base("typing.Union", init_union_type, object_type);
         unsafe {
@@ -1019,7 +1019,7 @@ pub fn init_typeobjects() {
 
         // types.GenericAlias — PyPy: _pypy_generic_alias.py GenericAlias,
         // bases=(object,).  `__slots__` includes `__weakref__`
-        // (`_pypy_generic_alias.py:17`), so an alias is weak-referenceable.
+        // (`_pypy_generic_alias.py`), so an alias is weak-referenceable.
         let generic_alias_type = new_typeobject_with_base(
             "types.GenericAlias",
             crate::_pypy_generic_alias::init_generic_alias_type,
@@ -3866,7 +3866,7 @@ fn module_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// module.py `Module.descr_module__dir__`.
 fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__dir__", true)?;
-    // module.py:164 — deliberately perform ordinary attribute lookup rather
+    // module.py descr_module__dir__ — deliberately perform ordinary attribute lookup rather
     // than reading `self.w_dict`: a ModuleType subclass may shadow
     // `__dict__`, in which case the resulting non-dict is a TypeError.
     // The mapping is a `dict` and moves, and the `__dir__` probe below runs
@@ -8785,7 +8785,7 @@ fn init_dict_type(ns: PyObjectRef) {
 /// `__repr__`) directly through baseobjspace + display arms keyed on
 /// the view's PyType, so dispatch works without typedef registration.
 /// Common slots shared across all three dict_view typedefs per
-/// `dictmultiobject.py:1773-1788 / 1802-1813 / 1831-1840`:
+/// `dictmultiobject.py / 1802-1813 / 1831-1840`:
 /// `__iter__`, `__len__`, `__reversed__`, `__repr__`, `mapping`.
 /// `dict_values` stops here; `dict_keys` / `dict_items` extend with
 /// the SetLikeDictView surface in
@@ -9343,7 +9343,7 @@ fn init_pytraceback_type(ns: PyObjectRef) {
 /// through a null / already-freed receiver returns `None` rather than
 /// dereferencing.  `f_lineno`'s setter is [`PyFrame::fset_f_lineno`],
 /// which validates the line-jump via `mark_stacks`; the read-only getsets
-/// and `f_trace*` setters mirror `pyframe.py:641-806` directly.
+/// and `f_trace*` setters mirror `pyframe.py` directly.
 fn init_frame_type(ns: PyObjectRef) {
     use crate::pyframe::PyFrame;
 
@@ -9399,7 +9399,7 @@ fn init_frame_type(ns: PyObjectRef) {
         )
     };
 
-    // f_back — read-only; the next non-hidden frame (pyframe.py:767).
+    // f_back — read-only; the next non-hidden frame (pyframe.py fget_f_back).
     let back_getter = make_builtin_function_with_arity(
         "f_back",
         crate::pyframe::__majit_wrap_descr_typecheck_fget_f_back,
@@ -9430,7 +9430,7 @@ fn init_frame_type(ns: PyObjectRef) {
         )
     };
 
-    // f_lasti — read-only bytecode offset (pyframe.py:770).  Both
+    // f_lasti — read-only bytecode offset (pyframe.py fget_f_lasti).  Both
     // adaptations live on the wrapper; see
     // [`crate::pyframe::__majit_wrap_descr_typecheck_fget_f_lasti`].
     let lasti_getter = make_builtin_function_with_arity(
@@ -9446,7 +9446,7 @@ fn init_frame_type(ns: PyObjectRef) {
         )
     };
 
-    // f_builtins — read-only builtin dict (pyframe.py:761).
+    // f_builtins — read-only builtin dict (pyframe.py fget_f_builtins).
     let builtins_getter = make_builtin_function_with_arity(
         "f_builtins",
         crate::pyframe::__majit_wrap_descr_typecheck_fget_f_builtins,
@@ -9492,7 +9492,7 @@ fn init_frame_type(ns: PyObjectRef) {
         )
     };
 
-    // f_trace — read/write/delete (pyframe.py:773-785).
+    // f_trace — read/write/delete (pyframe.py fget_f_trace).
     let trace_getter = make_builtin_function_with_arity(
         "f_trace",
         crate::pyframe::__majit_wrap_descr_typecheck_fget_f_trace,
@@ -9516,7 +9516,7 @@ fn init_frame_type(ns: PyObjectRef) {
         )
     };
 
-    // f_trace_lines — read/write bool (pyframe.py:787-791).
+    // f_trace_lines — read/write bool (pyframe.py fget_f_trace_lines).
     let trace_lines_getter = make_builtin_function_with_arity(
         "f_trace_lines",
         crate::pyframe::__majit_wrap_descr_typecheck_fget_f_trace_lines,
@@ -11391,7 +11391,7 @@ fn init_slice_type(ns: PyObjectRef) {
     };
 }
 
-/// `UnionType.__getitem__` (`_pypy_generic_alias.py:312`) — substitute the
+/// `UnionType.__getitem__` (`_pypy_generic_alias.py`) — substitute the
 /// free parameters with `items`, then fold the substituted members back into
 /// a union with `|`.
 fn union_getitem(args: &[PyObjectRef]) -> crate::PyResult {
@@ -11465,7 +11465,7 @@ fn union_class_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     crate::_pypy_generic_alias::union_from_items(&items)
 }
 
-/// `UnionType.__repr__` (`_pypy_generic_alias.py:286-287`).
+/// `UnionType.__repr__` (`_pypy_generic_alias.py`).
 ///
 /// The display slot already renders unions correctly, but the method must
 /// also be present when accessed explicitly as `union.__repr__()`.  Keeping
@@ -11482,7 +11482,7 @@ fn union_repr_method(args: &[PyObjectRef]) -> crate::PyResult {
     }))
 }
 
-/// `UnionType.__hash__` (`_pypy_generic_alias.py:275`).
+/// `UnionType.__hash__` (`_pypy_generic_alias.py`).
 fn union_hash_method(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     if !unsafe { pyre_object::is_union(self_) } {
@@ -11571,7 +11571,7 @@ fn union_name_getter(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn init_union_type(ns: PyObjectRef) {
-    // `_pypy_generic_alias.py:241-246 UnionType` docstring, plus CPython
+    // `_pypy_generic_alias.py UnionType` docstring, plus CPython
     // 3.14's three read-only identity getsets on union instances.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -11695,7 +11695,7 @@ fn init_union_type(ns: PyObjectRef) {
         )
     };
     // UnionType.__parameters__ — the slot stored at construction from the raw
-    // constructor operands (`_pypy_generic_alias.py:264`
+    // constructor operands (`_pypy_generic_alias.py`
     // `self.__parameters__ = _collect_parameters(args)`).
     let params_getter = make_builtin_function_with_arity(
         "__parameters__",
@@ -11716,7 +11716,7 @@ fn init_union_type(ns: PyObjectRef) {
             make_getset_descriptor(params_getter),
         )
     };
-    // `_pypy_generic_alias.py:275`: `hash(frozenset(self.__args__))`.
+    // `_pypy_generic_alias.py`: `hash(frozenset(self.__args__))`.
     // Hashing is intentionally deferred until `hash(union)` so unions may
     // contain classes with an unhashable metaclass and fail at the same point
     // as CPython/PyPy.
@@ -11779,7 +11779,7 @@ fn init_union_type(ns: PyObjectRef) {
             ),
         )
     };
-    // UnionType.__getitem__ (`_pypy_generic_alias.py:312`) — substitute the
+    // UnionType.__getitem__ (`_pypy_generic_alias.py`) — substitute the
     // free parameters with `items`, then fold the results back into a union
     // with `|`.
     unsafe {
@@ -11846,7 +11846,7 @@ fn init_union_type(ns: PyObjectRef) {
         )
     };
     // UnionType.__eq__ — `set(self.__args__) == set(other.__args__)`
-    // (`_pypy_generic_alias.py:270`).
+    // (`_pypy_generic_alias.py`).
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -12632,7 +12632,7 @@ fn make_getset_property(
 }
 
 /// `GetSetProperty(fget, fset, fdel)` with explicit `name` — see
-/// `make_getset_descriptor_named` for the typedef.py:58 motivation.
+/// `make_getset_descriptor_named` for the typedef.py motivation.
 pub fn make_getset_property_named(
     fget: pyre_object::PyObjectRef,
     fset: pyre_object::PyObjectRef,
@@ -13009,7 +13009,7 @@ fn init_type_type(ns: PyObjectRef) {
     };
     // `type[int]` builds a GenericAlias, but `type` carries no
     // `__class_getitem__` in its dict — `descroperation.getitem` special-cases
-    // `is_w(w_obj, w_type)` (`descroperation.py:362`).  The wiring lives in
+    // `is_w(w_obj, w_type)` (`descroperation.py`).  The wiring lives in
     // `baseobjspace::getitem_type`, so `hasattr(type, "__class_getitem__")`
     // stays False to match.
     // `typeobject.py descr__init__` reads nothing; the class was
@@ -14316,10 +14316,10 @@ fn function_receiver(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate:
 fn init_function_type_common(ns: PyObjectRef) {
     // `pypy/interpreter/typedef.py __doc__ = getset_func_doc` —
     // `getset_func_doc = GetSetProperty(Function.fget_func_doc,
-    // fset_func_doc, fdel_func_doc)` (typedef.py:758-760) lives on
+    // fset_func_doc, fdel_func_doc)` (typedef.py) lives on
     // `Function.typedef`'s rawdict so it is inherited by
     // `BuiltinFunction.typedef` via `**Function.typedef.rawdict`
-    // (typedef.py:899).  Registering the descriptor here mirrors that
+    // (typedef.py).  Registering the descriptor here mirrors that
     // shape so `del f.__doc__` on a user-defined function reaches the
     // typedef `__delete__` slot (and through it
     // `function_del_doc`'s sticky-None write — function.py:455-457),
@@ -14632,7 +14632,7 @@ fn init_function_type_common(ns: PyObjectRef) {
     // `typedef.py __globals__ = interp_attrproperty_w('w_func_globals',
     // cls=Function)` — read-only canonical W_DictObject view of the
     // function's globals storage.  `interp_attrproperty_w`
-    // (`typedef.py:465-474`) fetches the attribute and substitutes
+    // (`typedef.py`) fetches the attribute and substitutes
     // `space.w_None` when the slot is `None`.  pyre's
     // `function_get_globals_obj` returns `PY_NULL` for builtins
     // allocated with a null storage pointer (`gateway.rs`'s
@@ -20050,7 +20050,7 @@ fn int_cpython_digit_count(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
 
 /// `intobject.py W_IntObject.descr_bit_length` /
 /// `longobject.py W_AbstractLongObject.descr_bit_length`, exposed through
-/// `interpindirect2app` (`intobject.py:1171`).
+/// `interpindirect2app` (`intobject.py`).
 ///
 /// This must be a named gateway wrapper, not an `init_int_type` closure:
 /// RPython's `BuiltinCode.func` is a PBC containing the generated interp2app
@@ -20315,7 +20315,7 @@ fn init_int_type(ns: PyObjectRef) {
                     .transpose()?
                     .unwrap_or(false);
                 // `rbigint.tobytes` skips its final sign-fit check when
-                // `nbytes == 0` (rbigint.py:450), and `-1` is the one value
+                // `nbytes == 0` (rbigint.py), and `-1` is the one value
                 // whose two's complement emits no bytes at all, so it falls
                 // through as `b''`.  `_PyLong_AsByteArray` rejects every
                 // nonzero value that does not fit the requested width.
@@ -22262,7 +22262,7 @@ fn init_object_type(ns: PyObjectRef) {
             ),
         )
     };
-    // objectobject.py:321 / typedef :451-458 — all four ordering methods
+    // objectobject.py descr_richcompare / typedef :451-458 — all four ordering methods
     // return NotImplemented and leave reflected comparison / TypeError to the
     // object space.
     for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
@@ -23927,7 +23927,7 @@ fn empty_bytes_like(recv: PyObjectRef) -> PyObjectRef {
 /// `ll_stringslice_startstop` carries the shortcut; a one-bound `s[start:]`
 /// resolves to `ll_stringslice_startonly` (rstr.py), which always
 /// builds a fresh string.  `descr_removeprefix`'s `selfval[len(prefix):]`
-/// (stringmethods.py:879) is one of those, so it allocates even for an empty
+/// (stringmethods.py) is one of those, so it allocates even for an empty
 /// prefix and does not come here.  Check which helper the upstream arm
 /// resolves to before routing a new call site through this function.
 fn cut_bytes_like(recv: PyObjectRef, piece: &[u8]) -> PyObjectRef {
@@ -25898,7 +25898,7 @@ pub fn unicode_encode_error(
     }
 }
 
-/// unicodehelper.py:15-22 — strict errorhandler raises UnicodeDecodeError
+/// unicodehelper.py raise_unicode_exception_decode — strict errorhandler raises UnicodeDecodeError
 fn utf8_strict_handler(
     data: &[u8],
     start: usize,

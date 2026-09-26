@@ -74,7 +74,7 @@ pub struct TaskRegistration {
     /// must execute before this task.
     pub deps: Vec<String>,
     /// Upstream `task.task_title` consulted by `TranslationDriver._do`
-    /// (`driver.py:263`). Human-readable progress label; the engine
+    /// (`driver.py`). Human-readable progress label; the engine
     /// itself only propagates it.
     pub title: String,
     /// Upstream `task.task_idempotent` consulted by
@@ -90,7 +90,7 @@ pub struct TaskRegistration {
 type PlanKey = (Vec<String>, Vec<String>);
 
 /// Port of upstream's nested `consider(subgoal)` inside `_plan`
-/// (`taskengine.py:41-50`):
+/// (`taskengine.py`):
 ///
 /// ```python
 /// def consider(subgoal):
@@ -172,7 +172,7 @@ fn consider(
     Ok(())
 }
 
-/// Port of `rpython/translator/tool/taskengine.py:1-14
+/// Port of `rpython/translator/tool/taskengine.py SimpleTaskEngine
 /// SimpleTaskEngine` state.
 ///
 /// Upstream is a class whose subclasses inherit its methods. Rust
@@ -261,7 +261,7 @@ impl SimpleTaskEngine {
     }
 
     /// Upstream `SimpleTaskEngine._plan(goals, skip)` at
-    /// `taskengine.py:16-82`. Topologically sorts the subset of tasks
+    /// `taskengine.py`. Topologically sorts the subset of tasks
     /// needed to reach `goals`, respecting declared `task_deps` and
     /// applying the `?` / `??` suffix sigils on optional / suggested
     /// dependencies:
@@ -368,7 +368,7 @@ impl SimpleTaskEngine {
     }
 
     /// Upstream `SimpleTaskEngine._depending_on(goal)` at
-    /// `taskengine.py:84-89`. Returns every task whose `task_deps`
+    /// `taskengine.py`. Returns every task whose `task_deps`
     /// contains `goal`. Used by `_depending_on_closure` to propagate
     /// `disable()` effects.
     pub fn _depending_on(&self, goal: &str) -> Vec<String> {
@@ -422,7 +422,7 @@ impl SimpleTaskEngine {
 
 /// Override hooks for [`SimpleTaskEngine::execute`]. Port of upstream
 /// `_do` / `_event` / `_error` methods on `SimpleTaskEngine` at
-/// `taskengine.py:123-130`.
+/// `taskengine.py`.
 ///
 /// Upstream relies on Python's MRO so that when
 /// `SimpleTaskEngine._execute` calls `self._do(...)`, the call
@@ -436,8 +436,8 @@ impl SimpleTaskEngine {
 /// - `_event(kind, goal)` / `_error(goal)` are no-ops.
 ///
 /// `_event` returns `Result<(), TaskError>` so the upstream
-/// `taskengine.py:109` / `:112` plain calls — which raise unwrapped on
-/// `task_earlycheck` failure inside `driver.py:611-612` — propagate
+/// `taskengine.py` / `:112` plain calls — which raise unwrapped on
+/// `task_earlycheck` failure inside `driver.py` — propagate
 /// instead of being silently swallowed. The default impl returns
 /// `Ok(())`, matching upstream's `def _event(self, kind, goal, taskcallable)
 /// : pass` body.
@@ -466,7 +466,7 @@ impl TaskEngineHooks for DefaultHooks {}
 
 impl SimpleTaskEngine {
     /// Upstream `SimpleTaskEngine._execute(goals, *args, **kwds)` at
-    /// `taskengine.py:103-121`. Runs the plan for `goals` in order,
+    /// `taskengine.py`. Runs the plan for `goals` in order,
     /// calling `hooks._event("planned"/"pre"/"post", goal)` around each
     /// `hooks._do(goal, callable)`. Returns the result of the LAST
     /// `_do` call (upstream behaviour: `res = None` then repeatedly
@@ -490,7 +490,7 @@ impl SimpleTaskEngine {
         // Upstream `taskengine.py` lets a `_event` raise
         // bubble straight out of `_execute` (no try/except wraps the
         // first loop), so any error returned by the planned-phase
-        // earlycheck (`driver.py:611-612`) must propagate here.
+        // earlycheck (`driver.py`) must propagate here.
         for goal in &plan {
             hooks._event("planned", goal)?;
         }
@@ -769,7 +769,7 @@ mod tests {
 
     #[test]
     fn depending_on_lists_direct_dependents() {
-        // Upstream `taskengine.py:84-89`.
+        // Upstream `taskengine.py _depending_on`.
         let e = SimpleTaskEngine::new();
         e.register_task("a", noop_callable(), vec![], "a", false);
         e.register_task("b", noop_callable(), vec!["a".to_string()], "b", false);
@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn depending_on_closure_is_transitive() {
-        // Upstream `taskengine.py:91-101` — closes over
+        // Upstream `taskengine.py _depending_on_closure` — closes over
         // `_depending_on` repeatedly.
         let e = SimpleTaskEngine::new();
         e.register_task("a", noop_callable(), vec![], "a", false);

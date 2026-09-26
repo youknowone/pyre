@@ -141,7 +141,7 @@ impl Repr for FloatRepr {
     /// ```
     ///
     /// Synthesizes the multi-block `_hash_float(f) -> Signed` helper
-    /// graph porting `rlib/objectmodel.py:623-647`. See
+    /// graph porting `rlib/objectmodel.py`. See
     /// [`build_ll_hash_float_helper_graph`] for the layout.
     fn get_ll_hash_function(
         &self,
@@ -290,7 +290,7 @@ pub fn float_repr() -> Arc<FloatRepr> {
 ///
 /// - **start**: `diff = float_sub(f, f); isfin = float_eq(diff, 0.0)`.
 ///   `(f - f) == 0.0` is the JIT-friendly `isfinite(f)` shape from
-///   `ll_math.py:106-111`. exitswitch on `isfin`: True →
+///   `ll_math.py`. exitswitch on `isfin`: True →
 ///   `block_finite`, False → `block_not_finite`.
 /// - **block_not_finite**: `is_self = float_eq(f, f)` distinguishes
 ///   `inf` from `NaN` (NaN ≠ NaN). exitswitch: True → `block_inf`,

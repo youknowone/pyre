@@ -195,7 +195,7 @@ impl Repr for FixedSizeListRepr {
     /// shared with the resized list through [`list_rtype_getitem`]: the
     /// nonneg + `dum_nocheck` fast path collapses through
     /// `ll_getitem_foldable_nonneg` → `ll_fixed_getitem_fast(l, index)` →
-    /// `l[index]` (`lltypesystem/rlist.py:402-405`) to the bare
+    /// `l[index]` (`lltypesystem/rlist.py`) to the bare
     /// `getarrayitem` on the `Ptr(GcArray)` receiver, while the
     /// negative-index (`ll_fixed_getitem`) and `checkidx`
     /// (IndexError-raising `ll_fixed_getitem_*_checked`) helpers fold / window
@@ -1066,7 +1066,7 @@ pub fn ll_mul_loop() -> Result<(), TyperError> {
 }
 
 /// Synthesise `LLHelpers`-style `ll_fixed_length`
-/// (`lltypesystem/rlist.py:395-396`):
+/// (`lltypesystem/rlist.py`):
 ///
 /// ```python
 /// def ll_fixed_length(l):
@@ -1118,7 +1118,7 @@ pub(crate) fn build_ll_fixed_length_helper_graph(
 }
 
 /// RPython `class ListRepr(AbstractListRepr, BaseListRepr)`
-/// (`lltypesystem/rlist.py:107-133`):
+/// (`lltypesystem/rlist.py`):
 ///
 /// ```python
 /// def _setup_repr(self):
@@ -1836,7 +1836,7 @@ pub(crate) fn build_ll_fixed_setitem_fast_helper_graph(
 }
 
 /// Synthesise the resized-list `ll_getitem_fast`
-/// (`lltypesystem/rlist.py:259-262`):
+/// (`lltypesystem/rlist.py`):
 ///
 /// ```python
 /// def ll_getitem_fast(l, index):
@@ -1905,7 +1905,7 @@ pub(crate) fn build_ll_getitem_fast_helper_graph(
 }
 
 /// Synthesise the resized-list `ll_setitem_fast`
-/// (`lltypesystem/rlist.py:264-267`):
+/// (`lltypesystem/rlist.py`):
 ///
 /// ```python
 /// def ll_setitem_fast(l, index, item):
@@ -2660,7 +2660,7 @@ fn build_ll_arraycopy_helper_graph(
 }
 
 /// Synthesise the general `rgc.ll_arraycopy(source, dest, source_start,
-/// dest_start, length)` (`rpython/rlib/rgc.py:365`) as an element loop:
+/// dest_start, length)` (`rpython/rlib/rgc.py`) as an element loop:
 ///
 /// ```python
 /// def ll_arraycopy(source, dest, source_start, dest_start, length):
@@ -2675,7 +2675,7 @@ fn build_ll_arraycopy_helper_graph(
 /// general form offsets both ends — `ll_extend` copies the source into
 /// `l1.items[len1 ..]`, so `dest_start = len1`.
 ///
-/// The element loop below IS upstream's `rpython/rlib/rgc.py:398-403`, the
+/// The element loop below IS upstream's `rpython/rlib/rgc.py`, the
 /// arm reached when `gc_writebarrier_before_copy` answers False and the
 /// bulk `raw_memcopy` is therefore not expressible.  Upstream emits no
 /// barrier on that arm either — the call exists only to decide between the
@@ -3163,7 +3163,7 @@ pub(crate) fn build_ll_arraymove_helper_graph(
 }
 
 /// Synthesise `_ll_list_resize_ge` fused with `_ll_list_resize_hint_really`
-/// (`lltypesystem/rlist.py:280-310` + `:200-239`), specialised to the
+/// (`lltypesystem/rlist.py` + `:200-239`), specialised to the
 /// grow-only `append` path (`overallocate=True`, `newsize > before_len > 0`
 /// or `before_len == 0`):
 ///
@@ -5285,7 +5285,7 @@ fn rtype_bltn_list_via_ll_copy(
 ///     return hop.gendirectcall(ll_listslice, cRESLIST, v_lst, *vlist)
 /// ```
 ///
-/// `hop.r_result` is `listdef.offspring` (unaryop.py:420-423), a fresh list
+/// `hop.r_result` is `listdef.offspring` (unaryop.py getslice), a fresh list
 /// whose repr is `FixedSizeListRepr` when the slice is never resized and
 /// `ListRepr` otherwise; the receiver's `source_layout` likewise varies. Mints
 /// `ll_arraycopy` (general 5-arg), `ll_newlist`, and the per-`kind`
@@ -5312,7 +5312,7 @@ fn rtype_getslice_via_ll_listslice(
     let items_ptr = items_array_ptr_lltype(&item_lltype);
 
     // ll_arraycopy(src, dst, src_start, dst_start, length) — general 5-arg
-    // (rgc.py:365): a slice copies from `src_start = start != 0`, so the
+    // (rgc.py): a slice copies from `src_start = start != 0`, so the
     // start=0 specialisation used by `ll_copy` does not fit.
     let arraycopy = {
         let item = item_lltype.clone();
@@ -6716,7 +6716,7 @@ fn list_rtype_setitem(
 }
 
 /// RPython `class ListIteratorRepr(AbstractListIteratorRepr)`
-/// (`lltypesystem/rlist.py:453-461`):
+/// (`lltypesystem/rlist.py`):
 ///
 /// ```python
 /// class ListIteratorRepr(AbstractListIteratorRepr):
@@ -9238,7 +9238,7 @@ mod tests {
     }
 
     /// `ListIteratorRepr`'s lowleveltype is `Ptr(GcStruct("listiter",
-    /// ("list", LIST), ("index", Signed)))` (`lltypesystem/rlist.py:455-458`).
+    /// ("list", LIST), ("index", Signed)))` (`lltypesystem/rlist.py`).
     #[test]
     fn list_iterator_repr_lltype_is_ptr_gcstruct_list_index() {
         let rtyper = fresh_rtyper();
@@ -9269,7 +9269,7 @@ mod tests {
 
     /// `SomeIterator(SomeList)` routes through `SomeIterator.rtyper_makerepr`
     /// → `r_container.make_iterator_repr()` → `ListIteratorRepr`
-    /// (`rmodel.py:274-282`).
+    /// (`rmodel.py`).
     #[test]
     fn makerepr_somelist_iterator_routes_to_list_iterator_repr() {
         let rtyper = fresh_rtyper_live();
@@ -9288,7 +9288,7 @@ mod tests {
     }
 
     /// `ll_listiter` body is `malloc(listiter)` → `setfield(iter, "list",
-    /// lst)` → `setfield(iter, "index", 0)` (`lltypesystem/rlist.py:470-474`).
+    /// lst)` → `setfield(iter, "index", 0)` (`lltypesystem/rlist.py`).
     #[test]
     fn build_ll_listiter_helper_emits_malloc_then_two_setfields() {
         let rtyper = fresh_rtyper();
@@ -9321,7 +9321,7 @@ mod tests {
 
     /// `iter(list)` rtypes through the default `Repr.rtype_iter`
     /// (`make_iterator_repr().newiter(hop)`) to a `direct_call(ll_listiter,
-    /// v_lst)` (`rmodel.py:229-231` + `rlist.py:439-442`).
+    /// v_lst)` (`rmodel.py` + `rlist.py:439-442`).  allow-line-citation
     #[test]
     fn fixed_size_list_iter_emits_direct_call_to_ll_listiter() {
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -9396,7 +9396,7 @@ mod tests {
 
     /// `ll_listnext` over a fixed list: startblock bounds-checks via
     /// `getfield`/`getfield`/`getarraysize`/`int_lt` and the continue block
-    /// `int_add`/`setfield`/`getarrayitem` (`lltypesystem/rlist.py:476-482`).
+    /// `int_add`/`setfield`/`getarrayitem` (`lltypesystem/rlist.py`).
     /// The out-of-bounds exit links to the graph's `exceptblock`.
     #[test]
     fn build_ll_listnext_helper_fixed_bounds_checks_and_getarrayitem() {
@@ -9471,7 +9471,7 @@ mod tests {
     }
 
     /// `ll_listnext_foldable` over an unmutated fixed list reads the element via
-    /// the PURE `getarrayitem_pure` (`lltypesystem/rlist.py:484-491` →
+    /// the PURE `getarrayitem_pure` (`lltypesystem/rlist.py` →
     /// `ll_getitem_foldable_nonneg`), so the trace optimizer can fold / CSE the
     /// load across iterations.
     #[test]

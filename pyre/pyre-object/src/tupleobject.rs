@@ -54,7 +54,7 @@ pub const TUPLE_HASH_UNSET: i64 = -1;
 
 /// Python tuple object — array-backed default representation.
 ///
-/// Layout mirrors `pypy/objspace/std/tupleobject.py:376-390` after
+/// Layout mirrors `pypy/objspace/std/tupleobject.py W_TupleObject` after
 /// RPython translation:
 /// `{wrappeditems: Ptr(GcArray(OBJECTPTR)), _hash_cache: Signed}`.
 /// `_immutable_fields_ = ['wrappeditems[*]']` is reflected via
@@ -78,7 +78,7 @@ pub struct W_TupleObject {
     pub w_dict: PyObjectRef,
 }
 
-/// The translated user-subclass layout selected by `typedef.py:174-227`.
+/// The translated user-subclass layout selected by `typedef.py _getusercls`.
 /// The builtin tuple payload stays unchanged; the generated user class adds
 /// `MapdictStorageMixin` after it.
 #[repr(C)]
@@ -238,7 +238,7 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
 /// Allocate a new tuple from a Vec of items.
 ///
 /// Arity-2 tuples are routed through `makespecialisedtuple2`
-/// (`pypy/objspace/std/specialisedtupleobject.py:161-167`), except that
+/// (`pypy/objspace/std/specialisedtupleobject.py`), except that
 /// Python 3.14's pointer identity requires exact float references to remain
 /// boxed. Other arities use the array-backed `W_TupleObject`.
 ///
@@ -302,7 +302,7 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
 }
 
 /// Build the array-backed layout used by a tuple user subclass. This is the
-/// allocation half of `typedef.py:174-227`: the base tuple fields keep their
+/// allocation half of `typedef.py _getusercls`: the base tuple fields keep their
 /// offsets and the generated user class alone receives mapdict storage.
 #[majit_macros::dont_look_inside]
 pub fn w_tuple_subclass_new_array_backed(
@@ -593,7 +593,7 @@ pub unsafe fn w_tuple_set_cached_hash(obj: PyObjectRef, hash: i64) {
     }
 }
 
-/// `pypy/objspace/std/specialisedtupleobject.py:169-179
+/// `pypy/objspace/std/specialisedtupleobject.py makespecialisedtuple2
 /// makespecialisedtuple2`. Picks the most specific variant for two
 /// args; falls through to `Cls_oo` when neither operand qualifies for
 /// the int-int / float-float fast paths.
@@ -651,7 +651,7 @@ pub unsafe fn is_plain_float_strict(obj: PyObjectRef) -> bool {
 /// Supports negative indexing. Returns None if out of bounds. For
 /// `Cls_ii` / `Cls_ff` the unboxed payload is wrapped via
 /// `w_int_new` / `w_float_new` (mirrors
-/// `specialisedtupleobject.py:138-141 wraps[i](self.space, value)`).
+/// `specialisedtupleobject.py wraps[i](self.space, value)`).
 ///
 /// # Safety
 /// `obj` must point to a valid tuple of any of the four variants.
