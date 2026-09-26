@@ -3057,6 +3057,18 @@ impl Trace {
         deadranges
     }
 
+    /// `_refs[index]` at the address the GC holds now.
+    ///
+    /// `_refs` is a GC-traced list, so a read always sees the moved object.
+    /// The raw words here are refreshed only at the tracing GC boundary;
+    /// after tracing ends the owner root is the authoritative copy.
+    pub(crate) fn current_ref(&self, index: usize) -> u64 {
+        if index == 0 {
+            return 0;
+        }
+        self.rooted_refs[index - 1].get().0 as u64
+    }
+
     /// Rust adaptation: mirror pointer moves performed by the GC back
     /// into `_refs`. The owner roots hold the authoritative post-move
     /// pointer for each entry pushed by `_encode_ptr`; copy those

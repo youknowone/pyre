@@ -593,6 +593,12 @@ pub struct Optimizer {
     /// Phase-1 `_forwarded` it carries is the authoritative one. Consumed
     /// (`take`) by the run.
     pub explicit_input_ops_seed: Option<Vec<majit_ir::OpRc>>,
+    /// optimizer.py `self.inputargs`: the box objects of the trace being
+    /// optimized (`trace.get_iter().inputargs`), not only their positions.
+    /// A box that only a guard snapshot names is still this object, so
+    /// `import_state` forwards the same box `ResumeDataLoopMemo.number`
+    /// reads through `_cache`. Consumed by the run.
+    pub(crate) trace_inputarg_boxes: Vec<majit_ir::InputArgRc>,
 }
 
 /// Lower a typed-`Value` constants pool into the dense
@@ -1589,6 +1595,7 @@ impl Optimizer {
             cpu: crate::cpu::default_cpu(),
             emitted_operations: indexmap::IndexSet::with_hasher(rustc_hash::FxBuildHasher),
             explicit_input_ops_seed: None,
+            trace_inputarg_boxes: Vec::new(),
         }
     }
 
@@ -1636,6 +1643,7 @@ impl Optimizer {
         self.opt_guards_shared_emitted = 0;
         self.emitted_operations.clear();
         self.explicit_input_ops_seed = None;
+        self.trace_inputarg_boxes.clear();
         self.resumedata_memo.borrow_mut().recycle_for_next_compile();
         for pass in &mut self.passes {
             pass.reset_between_compiles();
@@ -3131,6 +3139,9 @@ impl Optimizer {
         //    (history.py:220 box.type parity).
         // optimizer.py `self.inputargs = inputargs` parity.
         ctx.inputargs = self.trace_inputargs.clone();
+        for ia in std::mem::take(&mut self.trace_inputarg_boxes) {
+            ctx.inputarg_refs.entry(ia.index).or_insert(ia);
+        }
         // The `&[Op]` wrap carries the fixture's InputArg objects. Install
         // those before `ensure_inputarg_bindings` mints a second host per
         // slot (`or_insert` / same-type keep).
@@ -3214,6 +3225,13 @@ impl Optimizer {
             .flat_map(|boxes| boxes.iter().map(|boxref| boxref.opref()))
             .filter(|opref| !opref.is_none() && !opref.is_constant())
             .map(|opref| opref.raw())
+            .max()
+            .into_iter()
+            .chain(
+                self.byte_bridge_resume
+                    .as_ref()
+                    .and_then(|feed| feed.max_box_position()),
+            )
             .max()
             .unwrap_or(0);
         let next_after = max_input.max(max_snapshot).saturating_add(1);
@@ -7437,6 +7455,39 @@ mod tests {
         assert!(
             result.last().is_some_and(|op| op.opcode == OpCode::Finish),
             "FINISH must remain in the optimized ops, got {result:?}"
+        );
+    }
+
+    /// A guard snapshot can name an inputarg that no operation reads.
+    /// `ResumeDataLoopMemo.number` resolves it through the trace's own box
+    /// (`TraceIterator._cache`), so the optimizer must bind that same object
+    /// rather than mint a second one that `import_state` would forward
+    /// instead.
+    #[test]
+    fn trace_inputarg_boxes_bind_an_inputarg_no_operation_reads() {
+        use crate::history::test_support::TraceBuilder;
+        let mut opt = Optimizer::default_pipeline();
+        let mut b = TraceBuilder::new();
+        let x = b.input(Type::Int, 0);
+        let y = b.input(Type::Int, 1);
+        b.op(OpCode::Finish, std::slice::from_ref(&x));
+        let (ops, inputs) = b.build();
+        let x_box = x.bound_inputarg().expect("x is an inputarg");
+        let y_box = y.bound_inputarg().expect("y is an inputarg");
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputarg_boxes = vec![x_box.clone(), y_box.clone()];
+        opt.snapshot_boxes = seed_empty_guard_snapshots_oprc(&ops);
+        opt.optimize_with_constants_and_inputs_oprc(
+            &ops,
+            &mut majit_ir::ConstMap::default(),
+            inputs.len(),
+        )
+        .expect("test: unexpected InvalidLoop");
+        let ctx = opt.final_ctx.as_ref().expect("optimize stores its context");
+        let bound = ctx.inputarg_refs.get(&1).expect("y is bound");
+        assert!(
+            majit_ir::InputArgRc::ptr_eq(bound, &y_box),
+            "the unread inputarg must stay the trace's own box"
         );
     }
 

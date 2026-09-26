@@ -1074,6 +1074,38 @@ fn snapshot_maps_from_ctx(
     snapshot_map_from_trace_snapshots(ctx.snapshots(), constants, &inputargs)
 }
 
+/// `ResumeDataLoopMemo.number` source for an optimizer that walks the
+/// recorded operations themselves (`SimpleCompileData`, the no-unroll
+/// retry): each recorded position is its own box in `_cache`.
+fn recorder_self_feed(
+    recorder: &crate::recorder::Trace,
+    inputargs: &[majit_ir::InputArgRc],
+    ops: &[OpRc],
+) -> crate::recorder::ByteBridgeResume {
+    let mut cache: Vec<Option<majit_ir::operand::Operand>> = Vec::new();
+    let mut put = |pos: usize, operand| {
+        if cache.len() <= pos {
+            cache.resize(pos + 1, None);
+        }
+        cache[pos] = Some(operand);
+    };
+    for inputarg in inputargs {
+        put(
+            inputarg.index as usize,
+            majit_ir::operand::Operand::from_bound_inputarg(inputarg),
+        );
+    }
+    for op in ops {
+        if op.result_type() != majit_ir::Type::Void {
+            put(
+                op.pos().get().raw() as usize,
+                majit_ir::operand::Operand::from_bound_op(op),
+            );
+        }
+    }
+    crate::recorder::ByteBridgeResume::from_recorder(recorder, cache)
+}
+
 fn snapshot_map_from_byte_recorder(
     recorder: &crate::recorder::Trace,
     constants: &mut majit_ir::ConstMap<majit_ir::Value>,
@@ -8265,15 +8297,14 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
-        // resume.py ResumeDataLoopMemo.number reads encoded arrays directly.
-        // The materialized cut adapter still needs snapshots to remap their
-        // box namespace; an uncut trace can build the final maps immediately.
-        let byte_snapshot_maps = {
+        // resume.py ResumeDataLoopMemo.number walks `trace.get_snapshot_iter`
+        // for each guard that survives optimization. The materialized cut
+        // adapter still needs snapshots to remap their box namespace.
+        let number_from_recorder = {
             let ctx = self.compile_tracing.as_mut().unwrap();
-            (cross_loop_cut.is_none() && ctx.recorder.has_byte_buffer())
-                .then(|| snapshot_maps_from_ctx(ctx, &mut constants))
+            cross_loop_cut.is_none() && ctx.recorder.has_byte_buffer()
         };
-        let snapshots = if byte_snapshot_maps.is_some() {
+        let snapshots = if number_from_recorder {
             Vec::new()
         } else {
             self.compile_tracing.as_mut().unwrap().take_snapshots()
@@ -8298,8 +8329,14 @@ impl<M: Clone> MetaInterp<M> {
         let mut ctx = self.compile_tracing.take().unwrap();
         let mut recorder = ctx.recorder;
         // Only the materialized cut/legacy path needs TreeLoop snapshots.
-        // Uncut byte snapshots already live in the final maps above.
-        let mut trace = recorder.get_trace();
+        // An uncut byte trace keeps its recorder until optimize has numbered
+        // every guard; `snapshot_recorder` is not moved again, so the
+        // pointers the optimizers hold stay valid.
+        let (mut trace, snapshot_recorder) = if number_from_recorder {
+            (recorder.to_tree_loop(), Some(recorder))
+        } else {
+            (recorder.get_trace(), None)
+        };
         if !snapshots.is_empty() {
             trace.snapshots = snapshots;
         }
@@ -8510,13 +8547,14 @@ impl<M: Clone> MetaInterp<M> {
             mut snapshot_vable_map,
             mut snapshot_vref_map,
             mut snapshot_frame_pcs,
-        ) = byte_snapshot_maps.unwrap_or_else(|| {
-            snapshot_map_from_trace_snapshots(
-                &trace_snapshots,
-                &mut constants,
-                preamble_data.base.inputargs(),
-            )
-        });
+        ) = snapshot_map_from_trace_snapshots(
+            &trace_snapshots,
+            &mut constants,
+            preamble_data.base.inputargs(),
+        );
+        unroll_opt.snapshot_recorder = snapshot_recorder
+            .as_ref()
+            .map(|recorder| recorder as *const crate::recorder::Trace);
         // history.py/261/307 — `Const{Int,Float,Ptr}.type` is an
         // intrinsic attribute on the Box itself, so no raw-u32 type
         // side-table propagation is needed; callers recover the type
@@ -8693,6 +8731,7 @@ impl<M: Clone> MetaInterp<M> {
                         // `Rc<Op>`), so producer lookup resolves identity.
                         simple_opt.explicit_input_ops_seed =
                             Some(preamble_data.base.operations().to_vec());
+                        simple_opt.trace_inputarg_boxes = trace.inputargs.clone();
                         // Consumed here and nowhere else, so the operations move
                         // into their `Rc`s instead of being copied into them.
                         // Unroll's TraceIterator allocates fresh operations
@@ -8700,6 +8739,10 @@ impl<M: Clone> MetaInterp<M> {
                         // are still the original trace.
                         let retry_ops: Vec<majit_ir::OpRc> =
                             preamble_data.base.operations().to_vec();
+                        simple_opt.byte_bridge_resume =
+                            snapshot_recorder.as_ref().map(|recorder| {
+                                recorder_self_feed(recorder, &trace.inputargs, &retry_ops)
+                            });
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 simple_opt.run_optimize_from_inputs(
@@ -11546,13 +11589,25 @@ impl<M: Clone> MetaInterp<M> {
         self.jitlog_start_new_trace(true, green_key, &jd_name);
         // resume.py ResumeDataLoopMemo.number consumes the encoded snapshot
         // arrays without a materialized intermediate. Taking the parked ctx
-        // ends walk_active_trace_refs coverage; compile_snapshot_refs roots
-        // the final maps below, before optimization can invoke the GC.
+        // ends walk_active_trace_refs coverage; the recorder's `_refs` stay
+        // rooted by their owner roots, and compile_snapshot_refs roots the
+        // list recorder's maps below, before optimization can invoke the GC.
         let mut ctx = self.compile_tracing.take().unwrap();
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
-        let snapshot_maps = snapshot_maps_from_ctx(&mut ctx, &mut constants);
+        let number_from_recorder = ctx.recorder.has_byte_buffer();
+        let snapshot_maps = if number_from_recorder {
+            Default::default()
+        } else {
+            snapshot_maps_from_ctx(&mut ctx, &mut constants)
+        };
         let recorder = ctx.recorder;
-        let trace = recorder.get_trace();
+        // `snapshot_recorder` stays put until the optimizer has numbered
+        // every guard; the feed holds a pointer to it.
+        let (trace, snapshot_recorder) = if number_from_recorder {
+            (recorder.to_tree_loop(), Some(recorder))
+        } else {
+            (recorder.get_trace(), None)
+        };
         let SimpleCompileViews {
             data: simple_data,
             trace_ops,
@@ -11606,6 +11661,10 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
+        optimizer.trace_inputarg_boxes = trace.inputargs.clone();
+        optimizer.byte_bridge_resume = snapshot_recorder
+            .as_ref()
+            .map(|recorder| recorder_self_feed(recorder, &trace.inputargs, &trace.ops));
 
         // Dumped before the call, not after: `Optimizer::propagate_from_pass_range`
         // resolves each argument in place on the op it is handed
@@ -12069,12 +12128,21 @@ impl<M: Clone> MetaInterp<M> {
             .call_pure_results
             .clone();
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
-        // resume.py ResumeDataLoopMemo.number reads byte arrays directly;
-        // keep only the final maps that the optimizer consumes and roots.
+        // resume.py ResumeDataLoopMemo.number walks the encoded snapshot
+        // of each surviving guard; only the list recorder needs maps.
         let mut ctx = self.compile_tracing.take().unwrap();
-        let snapshot_maps = snapshot_maps_from_ctx(&mut ctx, &mut constants);
+        let number_from_recorder = ctx.recorder.has_byte_buffer();
+        let snapshot_maps = if number_from_recorder {
+            Default::default()
+        } else {
+            snapshot_maps_from_ctx(&mut ctx, &mut constants)
+        };
         let recorder = ctx.recorder;
-        let trace = recorder.get_trace();
+        let (trace, snapshot_recorder) = if number_from_recorder {
+            (recorder.to_tree_loop(), Some(recorder))
+        } else {
+            (recorder.get_trace(), None)
+        };
         let SimpleCompileViews {
             data: simple_data,
             trace_ops,
@@ -12131,6 +12199,10 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
+        optimizer.trace_inputarg_boxes = trace.inputargs.clone();
+        optimizer.byte_bridge_resume = snapshot_recorder
+            .as_ref()
+            .map(|recorder| recorder_self_feed(recorder, &trace.inputargs, &trace.ops));
 
         // compile.py SimpleCompileData.optimize_trace → MARK_TRACE + optimize_loop.
         // compile_simple_loop / _create_segmented_trace_and_blackhole do
@@ -15482,6 +15554,7 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
             .collect();
+        optimizer.trace_inputarg_boxes = bridge_inputargs.to_vec();
 
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
         // constant pool merge. Const objects flow via rd_consts + fresh
@@ -16285,6 +16358,7 @@ impl<M: Clone> MetaInterp<M> {
         // `renamed_inputargs` OpRefs that carry their type intrinsically
         // (history.py:220 InputArg{Int,Ref,Float}.type Box parity).
         optimizer.trace_inputargs = bridge_inputarg_types;
+        optimizer.trace_inputarg_boxes = bridge_inputargs.to_vec();
 
         // RPython-orthodox: no source→bridge constant_types merge.
         // bridgeopt.py / unroll.py do not copy the source loop's constant

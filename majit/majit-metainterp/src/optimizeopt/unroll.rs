@@ -383,6 +383,11 @@ pub struct UnrollOptimizer {
     pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
+    /// `trace` in `optimize_preamble` / `optimize_peeled_loop`: the byte
+    /// recorder whose `get_snapshot_iter` numbers each surviving guard.
+    /// Each phase installs it over its own `TraceIterator._cache`.
+    /// The caller keeps the recorder alive across `optimize_trace*`.
+    pub(crate) snapshot_recorder: Option<*const crate::recorder::Trace>,
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     /// Threaded through inner Optimizer instances for inline registration.
     pub all_descrs: std::sync::Arc<Vec<majit_ir::descr::DescrRef>>,
@@ -607,6 +612,7 @@ impl UnrollOptimizer {
             snapshot_vable_boxes: Vec::new(),
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: SnapshotFramePcs::new(),
+            snapshot_recorder: None,
             all_descrs: std::sync::Arc::new(Vec::new()),
             quasi_immutable_deps: Vec::new(),
             trace_inputargs: Vec::new(),
@@ -999,6 +1005,14 @@ impl UnrollOptimizer {
                 p1_ops_in.push(op);
             }
             let p1_iter_fresh_hw = p1_iter._fresh;
+            opt_p1.trace_inputarg_boxes = p1_iter.inputargs.clone();
+            if let Some(recorder) = self.snapshot_recorder {
+                // SAFETY: the caller keeps the recorder alive across optimize.
+                opt_p1.byte_bridge_resume = Some(crate::recorder::ByteBridgeResume::from_recorder(
+                    unsafe { &*recorder },
+                    std::mem::take(&mut p1_iter._cache),
+                ));
+            }
             // compile.py `PreambleCompileData(trace, jumpargs, ...)` —
             // the recorded JUMP arglist is the preamble's `runtime_boxes`
             // (live_arg_boxes captured at the merge point). Capture it into a
@@ -1378,6 +1392,7 @@ impl UnrollOptimizer {
             p2_ops_in.push(op);
         }
         let p2_high_water = iter._fresh;
+        opt_p2.trace_inputarg_boxes = iter.inputargs.clone();
         let p2_cache = iter._cache;
         // opencoder.py `_get(self, i)` parity. `p2_cache[raw_pos]`
         // holds the fresh per-iteration box for every Phase 1 input/op
@@ -1457,6 +1472,13 @@ impl UnrollOptimizer {
             &mut opt_p2.snapshot_vable_boxes,
             &mut opt_p2.snapshot_vref_boxes,
         ]));
+        if let Some(recorder) = self.snapshot_recorder {
+            // SAFETY: the caller keeps the recorder alive across optimize.
+            opt_p2.byte_bridge_resume = Some(crate::recorder::ByteBridgeResume::from_recorder(
+                unsafe { &*recorder },
+                p2_cache,
+            ));
+        }
         // Phase 1's emitted ops are already in Phase 1's emitted
         // namespace `[num_inputs..next_global_opref)`. Phase 2 body may
         // reference these via `imported_label_args`. They are NOT in the
