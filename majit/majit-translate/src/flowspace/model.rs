@@ -2355,12 +2355,6 @@ impl HostEnv {
             HostObject::new_builtin_callable("core.ptr.null_mut"),
         );
         core_ptr.module_set("null", HostObject::new_builtin_callable("core.ptr.null"));
-        // Null `Option<fn>` — `SomePtr(FuncType)`, not `null_mut`'s
-        // classdef-less instance. See `fn_null_constant`.
-        core_ptr.module_set(
-            "null_fn",
-            HostObject::new_builtin_callable("core.ptr.null_fn"),
-        );
         // `std::ptr::eq` re-exports `core::ptr::eq`; MIR lowering normalises
         // the call to the canonical `["core", "ptr", "eq"]` FunctionPath
         // (e.g. `py_type_check`'s `std::ptr::eq((*obj).ob_type, …)`).  Bind
