@@ -1232,6 +1232,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         let Some(req) = spec.borrow_mut().pop() else {
             break;
         };
+        let spec_name = req.leaf.clone();
         let Some(fd) = llbc.fn_by_id(req.fn_id) else {
             continue;
         };
@@ -1242,6 +1243,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             &req.types,
             &req.const_generics,
         ) else {
+            skipped.push((spec_name, "no substituted unstructured body".into()));
             continue;
         };
         let signature = crate::front::clause_spec::substituted_signature(
@@ -1253,7 +1255,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         let accum = AccumulatorFacts::build(llbc, &body);
         let builder_mode = accum.has_builder;
         let mut atomic_reasons = Vec::new();
-        let Ok(mut graph) = lower_unstructured_with_static_addrs_and_attrs(
+        let mut graph = match lower_unstructured_with_static_addrs_and_attrs(
             llbc,
             fd,
             &body,
@@ -1267,8 +1269,16 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             &mut atomic_reasons,
             Some(&spec),
             true,
-        ) else {
-            continue;
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                let msg = e.to_string();
+                if let Some(reason) = atomic_reasons.first() {
+                    atomic_load_decls.push(declined_atomic_load_fun_decl(llbc, fd, reason.clone()));
+                }
+                skipped.push((spec_name, msg));
+                continue;
+            }
         };
         let stripped = strip_crate_prefix(&fd.item_meta.name_path());
         let (module_path, bare_leaf) = match stripped.rsplit_once("::") {
