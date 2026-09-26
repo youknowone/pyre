@@ -1740,8 +1740,8 @@ fn jit_str_search_bounds(
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_int_str(v: i64) -> i64 {
     let payload = crate::lowlevel_string::jit_ll_int2dec(v);
-    let length = crate::lowlevel_string::bh_lowlevel_string_len(payload);
-    w_str_from_storage_and_length(payload as *mut UnicodeValueStorage, length) as i64
+    let length = crate::lowlevel_string::bh_lowlevel_string_len(payload as i64);
+    w_str_from_storage_and_length(payload, length) as i64
 }
 
 /// `unicodeobject.py next_codepoint_pos_dont_look_inside` — `@jit.elidable`.

@@ -404,10 +404,11 @@ pub fn ll_stringslice_startstop(
 }
 
 /// `ll_str.py ll_int2dec` — `@jit.elidable` decimal render of a Signed
-/// into a fresh rstr `STR`.  `descr_repr` (intobject.py) wraps the
-/// result with `space.newutf8(res, len(res))`.
+/// into a fresh rstr `STR`, returned as the `Ptr(STR)` it is.
+/// `descr_repr` (intobject.py) wraps the result with
+/// `space.newutf8(res, len(res))`.
 #[majit_macros::elidable]
-pub extern "C" fn jit_ll_int2dec(val: i64) -> i64 {
+pub extern "C" fn jit_ll_int2dec(val: i64) -> *mut crate::unicodeobject::Utf8Str {
     let sign = usize::from(val < 0);
     let mut uval = if val < 0 {
         (val as u64).wrapping_neg()
@@ -447,7 +448,7 @@ pub extern "C" fn jit_ll_int2dec(val: i64) -> i64 {
             j += 1;
         }
     }
-    out
+    out as *mut crate::unicodeobject::Utf8Str
 }
 
 pub extern "C" fn jit_ll_shrink_array(buf: i64, new_len: i64) -> i64 {
@@ -530,7 +531,7 @@ mod tests {
     #[test]
     fn jit_ll_int2dec_renders_signed_decimal() {
         for val in [0i64, 1, -1, 10, -10, i64::MIN, i64::MAX] {
-            let buf = jit_ll_int2dec(val);
+            let buf = jit_ll_int2dec(val) as i64;
             assert_ne!(buf, 0);
             let expected = val.to_string();
             assert_eq!(bh_lowlevel_string_len(buf), expected.len());
@@ -545,7 +546,7 @@ mod tests {
 
     #[test]
     fn jit_ll_str_mul_repeats_and_clamps_negative() {
-        let one = jit_ll_int2dec(0);
+        let one = jit_ll_int2dec(0) as i64;
         // `0` renders as `"0"` — one char, used as the fill.
         assert_eq!(bh_lowlevel_string_len(one), 1);
         let four = jit_ll_str_mul(one, 4);

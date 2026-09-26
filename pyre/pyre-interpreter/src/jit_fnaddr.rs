@@ -1426,6 +1426,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::baseobjspace::delitem",
         crate::opcode_ops::jit_baseobjspace_delitem,
     );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::type_methods::format_simple_w",
+        crate::opcode_ops::jit_type_methods_format_simple_w,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::runtime_ops::convert_value",
+        crate::opcode_ops::jit_runtime_ops_convert_value,
+    );
     cpa2(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_getitem",
@@ -5870,6 +5880,14 @@ mod tests {
             (
                 "pyre_interpreter::runtime_ops::is_op",
                 crate::opcode_ops::jit_runtime_ops_is_op as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::type_methods::format_simple_w",
+                crate::opcode_ops::jit_type_methods_format_simple_w as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::runtime_ops::convert_value",
+                crate::opcode_ops::jit_runtime_ops_convert_value as *const () as usize as i64,
             ),
         ] {
             assert_eq!(bindings.get(path), Some(&expected), "missing {path}");

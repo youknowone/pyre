@@ -6192,10 +6192,14 @@ where
 }
 
 /// Lower the FORMAT_SIMPLE pyre HLOp `format_simple(value)` → `result: Ref`
-/// to `residual_call_r_r(ConstInt(format_simple_fn_idx), ListR([value]),
-/// Descr) → reg`.  `bh_format_simple_fn(value)` formats with the empty spec
-/// (`f"{x}"` → `str(value)`); a user `__format__` may force virtualizables
-/// → `MayForce`.
+/// to `inline_call_r_r(JitCode, ListR([value])) → reg`, the
+/// `jtransform.py handle_regular_call` shape of `pyopcode.py FORMAT_VALUE`'s
+/// `space.format(w_value, space.newtext(''))`
+/// (`type_methods::format_simple_w`).  A build whose body
+/// `fully_bound_callee_body` declines keeps the
+/// `residual_call_r_r(ConstInt(format_simple_fn_idx), ListR([value]), Descr)`
+/// fallback; `bh_format_simple_fn(value)` formats with the empty spec and a
+/// user `__format__` may force virtualizables → `MayForce`.
 ///
 /// Returns `None` for non-`format_simple` opnames so the caller can fall
 /// through to other lowering arms.
@@ -6217,6 +6221,11 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
+    if let Some(insn) =
+        build_orthodox_inline_call_r_r(inline_call_targets::FORMAT_SIMPLE_W, value.clone(), dst_reg)
+    {
+        return Some(insn);
+    }
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.format_simple_fn_idx,
         vec![value],
@@ -6498,6 +6507,10 @@ mod inline_call_targets {
     pub const NOT: &str = "pyre_interpreter::baseobjspace::not_";
     /// IS_OP — `lower_compare_op_hlop_to_insn`.
     pub const IS_OP: &str = "pyre_interpreter::runtime_ops::is_op";
+    /// FORMAT_SIMPLE — `lower_format_simple_hlop_to_insn`.
+    pub const FORMAT_SIMPLE_W: &str = "pyre_interpreter::type_methods::format_simple_w";
+    /// CONVERT_VALUE — `lower_convert_value_hlop_to_insn`.
+    pub const CONVERT_VALUE: &str = "pyre_interpreter::runtime_ops::convert_value";
 }
 
 /// The body of a fixed callee path whose host addresses this build has fully
@@ -7038,12 +7051,17 @@ where
 }
 
 /// Lower the CONVERT_VALUE pyre HLOp `convert_value(value, conv)` →
-/// `result: Ref` to `residual_call_ir_r(ConstInt(convert_value_fn_idx),
-/// ListI([conv]), ListR([value]), Descr) → reg`, the single-Ref sibling of
-/// [`lower_getattr_hlop_to_insn`].  `conv` is a compile-time
-/// `runtime_ops::convert_value_code`; `bh_convert_value_fn(value, conv)`
-/// runs str/repr/ascii (a user `__str__` / `__repr__` may force
-/// virtualizables → `MayForce`).
+/// `result: Ref` to `inline_call_ir_r(JitCode, ListI([conv]),
+/// ListR([value])) → reg` of `runtime_ops::convert_value`, the
+/// `jtransform.py handle_regular_call` shape of `pyopcode.py FORMAT_VALUE`'s
+/// `space.str` / `space.repr` / `ascii_from_object` conversion.  `conv` is a
+/// compile-time `runtime_ops::convert_value_code`.  A build whose body
+/// `fully_bound_callee_body` declines keeps the
+/// `residual_call_ir_r(ConstInt(convert_value_fn_idx), ListI([conv]),
+/// ListR([value]), Descr)` fallback, the single-Ref sibling of
+/// [`lower_getattr_hlop_to_insn`]; `bh_convert_value_fn(value, conv)` runs
+/// str/repr/ascii (a user `__str__` / `__repr__` may force virtualizables →
+/// `MayForce`).
 ///
 /// Returns `None` for non-`convert_value` opnames so the caller can fall
 /// through to other lowering arms.
@@ -7066,8 +7084,15 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
+    if let Some(insn) = build_orthodox_inline_call_ir_r(
+        inline_call_targets::CONVERT_VALUE,
+        vec![Operand::ConstInt(conv)],
+        vec![value.clone()],
+        dst_reg,
+    ) {
+        return Some(insn);
+    }
     let mut effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
-    // Recognition tag for the walker's exact-int / exact-str `!s` fold.
     effect_info.runtime_helper = majit_ir::RuntimeHelperKind::ConvertValue;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
@@ -13176,6 +13201,28 @@ mod tests {
             &mut lower_constant,
         )
         .expect("1-arg format_simple lowering must succeed");
+        if bound_inline_call_target(super::inline_call_targets::FORMAT_SIMPLE_W) {
+            // `inline_call_r_r(format_simple_w, ListR([value])) → reg`.
+            match insn {
+                Insn::Op {
+                    opname,
+                    args,
+                    result,
+                } => {
+                    assert_eq!(opname, "inline_call_r_r");
+                    assert!(
+                        matches!(&args[1], Operand::ListOfKind(list)
+                            if list.kind == Kind::Ref
+                                && matches!(&list.content[..], [Operand::Register(r)] if r.index == 101)),
+                        "ListR = [value], got {:?}",
+                        args[1]
+                    );
+                    assert_eq!(result.map(|r| r.index), Some(102));
+                }
+                _ => panic!("expected Insn::Op, got {insn:?}"),
+            }
+            return;
+        }
         match insn {
             Insn::Op {
                 opname,
@@ -13731,6 +13778,19 @@ mod tests {
         assert_unary_hlop_call_tail(op_name, &args, result);
     }
 
+    /// Whether this build carries `canonical_path`'s body fully bound, read
+    /// from the callee registry and the body scan rather than from
+    /// `fully_bound_callee_body` (see [`assert_unary_lowering_inlines_bound_body`]).
+    fn bound_inline_call_target(canonical_path: &'static str) -> bool {
+        pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+        pyre_jit_trace::jitcode_runtime::pathed_runtime_jitcode_cached(canonical_path).is_some_and(
+            |jitcode| {
+                jitcode.startpoints.is_some()
+                    && jitcode.reachable_symbolic_residuals().targets.is_empty()
+            },
+        )
+    }
+
     /// A single-Ref unary HLOp whose callee body this build carries fully
     /// bound emits the canonical `inline_call_r_r` naming that body; one whose
     /// body is absent or still unbound keeps the residual fallback.
@@ -13952,6 +14012,35 @@ mod tests {
             &mut lower_constant,
         )
         .expect("2-arg convert_value lowering must succeed");
+        if bound_inline_call_target(super::inline_call_targets::CONVERT_VALUE) {
+            // `inline_call_ir_r(convert_value, ListI([conv]), ListR([value])) → reg`.
+            match insn {
+                Insn::Op {
+                    opname,
+                    args,
+                    result,
+                } => {
+                    assert_eq!(opname, "inline_call_ir_r");
+                    assert!(
+                        matches!(&args[1], Operand::ListOfKind(list)
+                            if list.kind == Kind::Int
+                                && matches!(&list.content[..], [Operand::ConstInt(1)])),
+                        "ListI = [conv], got {:?}",
+                        args[1]
+                    );
+                    assert!(
+                        matches!(&args[2], Operand::ListOfKind(list)
+                            if list.kind == Kind::Ref
+                                && matches!(&list.content[..], [Operand::Register(r)] if r.index == 101)),
+                        "ListR = [value], got {:?}",
+                        args[2]
+                    );
+                    assert_eq!(result.map(|r| r.index), Some(102));
+                }
+                _ => panic!("expected Insn::Op, got {insn:?}"),
+            }
+            return;
+        }
         match insn {
             Insn::Op {
                 opname,

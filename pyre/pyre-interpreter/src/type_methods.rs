@@ -3772,8 +3772,8 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, c
 /// `format_simple`.  A user `__format__` reached that way is handed a real
 /// empty `str`, since its second parameter is a string.
 pub fn format_w(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let spec_is_str = !w_spec.is_null() && unsafe { is_str(w_spec) };
-    let spec_is_empty = !spec_is_str || unsafe { pyre_object::w_str_get_wtf8(w_spec) }.is_empty();
+    let spec_is_empty =
+        w_spec.is_null() || unsafe { !is_str(w_spec) || pyre_object::w_str_len(w_spec) == 0 };
 
     // The empty-spec fast paths of `format_value_dispatch`: an exact `str` or
     // `int` cannot carry a `__format__` override, so resolve and call nothing.
@@ -3800,6 +3800,42 @@ pub fn format_w(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, cr
             // `intobject.py descr_str`.
             return Ok(unsafe { pyre_object::descr_str(val) });
         }
+    }
+    format_w_slow(val, w_spec)
+}
+
+/// `pyopcode.py FORMAT_VALUE` without a spec: `space.format(w_value,
+/// space.newtext(''))`, the [`format_w`] of an empty spec.
+///
+/// FORMAT_SIMPLE lowers to an `inline_call` of this body, so the JIT traces
+/// the empty-spec arms for an exact `str` / `int` and keeps every other shape
+/// behind the `dont_look_inside` [`format_simple_slow`].
+pub fn format_simple_w(val: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    if unsafe { pyre_object::is_exact_type(val, &pyre_object::STR_TYPE) } {
+        return Ok(val);
+    }
+    if unsafe {
+        pyre_object::py_type_check(val, &pyre_object::INT_TYPE)
+            && pyre_object::is_exact_builtin_instance(val)
+    } {
+        return Ok(unsafe { pyre_object::descr_str(val) });
+    }
+    format_simple_slow(val)
+}
+
+/// [`format_simple_w`] for every shape its `str` / `int` arms do not answer.
+#[majit_macros::dont_look_inside]
+fn format_simple_slow(val: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    format_w_slow(val, pyre_object::PY_NULL)
+}
+
+/// [`format_w`] for every shape its empty-spec `str` / `int` arms do not
+/// answer: a long, a `__format__` dispatch, and the spec parser.
+fn format_w_slow(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let spec_is_str = !w_spec.is_null() && unsafe { is_str(w_spec) };
+    let spec_is_empty = !spec_is_str || unsafe { pyre_object::w_str_get_wtf8(w_spec) }.is_empty();
+
+    if spec_is_empty {
         if unsafe {
             pyre_object::py_type_check(val, &pyre_object::LONG_TYPE)
                 && pyre_object::is_exact_builtin_instance(val)
