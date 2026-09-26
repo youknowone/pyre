@@ -371,7 +371,7 @@ impl PreambleOp {
         sb: &mut ShortBoxes,
         ctx: &mut crate::optimizeopt::OptContext,
     ) -> Option<ProducedShortOp> {
-        let preamble_op = match &self.kind {
+        let mut preamble_op = match &self.kind {
             PreambleOpKind::InputArg | PreambleOpKind::Guard => (*self.op).clone(),
             PreambleOpKind::Heap => {
                 // shortpreamble.py HeapOp.add_op_to_short:
@@ -437,6 +437,15 @@ impl PreambleOp {
                 self.op.copy_and_change(opnum, Some(&args), None)
             }
         };
+        // shortpreamble.py `copy_and_change` returns a new ResOperation, so
+        // `preamble_op` is not `short_op.res`. pyre's `copy_and_change` copies
+        // `pos`; mint a distinct replay result. `res` stays the body box and
+        // is the only `produced_short_boxes` key. Guards later name this
+        // replay op (`make_guards(preamble_op)`), not the export-time box.
+        if !matches!(self.kind, PreambleOpKind::InputArg | PreambleOpKind::Guard) {
+            let fresh = ctx.alloc_op_position_typed(preamble_op.result_type());
+            preamble_op.pos().set(fresh);
+        }
         Some(ProducedShortOp {
             kind: self.kind.clone(),
             // shortpreamble.py/85/170 `ProducedShortOp(self, ...)` —
@@ -1601,8 +1610,11 @@ impl ProducedShortOp {
         // lookups read it directly via `OpRef::ty()` or the producing
         // SAME_AS body op's `op.type_` once it lands in
         // `new_operations`.
+        // shortpreamble.py PureOp.produce_op keys `opt.pure` by `self.res`
+        // (the body operation). `preamble_op` args are replay ops and must
+        // not be the cache key, or the peeled body no longer matches.
         let args = self
-            .preamble_op
+            .source_op
             .getarglist()
             .iter()
             .map(|arg| {
@@ -1614,8 +1626,11 @@ impl ProducedShortOp {
                     produced_results,
                     imported_constants,
                 )
+                .unwrap_or(crate::optimizeopt::ImportedShortPureArg::OpRef(
+                    arg.to_opref(),
+                ))
             })
-            .collect::<Option<Vec<_>>>()?;
+            .collect::<Vec<_>>();
         // shortpreamble.py: PureOp.produce_op routes through
         // `optpure.pure(...)` (or `extra_call_pure` for calls). majit's
         // staging list `imported_short_pure_ops` covers both; the optimizer
@@ -1636,8 +1651,8 @@ impl ProducedShortOp {
             Some(p) => {
                 debug_assert_eq!(
                     p.preamble_op.pos().get(),
-                    result_opref,
-                    "builder replay pos diverged from produce_pure replay rule"
+                    self.preamble_op.pos().get(),
+                    "builder replay pos diverged from the add_op_to_short replay op"
                 );
                 crate::optimizeopt::ImportedShortPureOp {
                     opcode,
@@ -1645,7 +1660,8 @@ impl ProducedShortOp {
                     args,
                     result: result_opref,
                     pop: crate::optimizeopt::info::PreambleOp {
-                        op: ctx.materialize_operand_at(source),
+                        // shortpreamble.py `PreambleOp(self.res, preamble_op)`.
+                        op: self.res.clone(),
                         invented_name: self.invented_name,
                         preamble_op: p.preamble_op.clone(),
                         same_as_source: self.same_as_source.clone(),
@@ -1725,17 +1741,16 @@ impl ProducedShortOp {
         };
         // shortpreamble.py produce_op keeps two distinct Boxes: `self.res` is
         // body-visible, while `preamble_op` is the freshly replayed GETFIELD
-        // result.  `result_opref` belongs only to that replay operation.
+        // result.
         //
         // A const-result entry arrives on the separate const channel, which
         // never registers a `result_map` slot: `produced_const_ops` minted the
-        // replay position itself and `source` already names it.
-        let const_res = self.res.to_opref().is_constant();
-        let result_opref = if const_res {
-            source
-        } else {
-            *result_map.get(&source)?
-        };
+        // replay position itself and `source` already names it. A non-const
+        // entry must still have a phase-2 body slot. The replay result is
+        // `preamble_op.pos`, not that slot.
+        if !self.res.to_opref().is_constant() {
+            result_map.get(&source)?;
+        }
         let _ = result_type;
         // `info.py getfield` indexes `_fields` by the field's position in its
         // parent struct, so the seed has to carry the slot index every reader
@@ -1768,7 +1783,7 @@ impl ProducedShortOp {
         // remains distinct. Seed info at the replay slot so
         // `take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos)`
         // reads it back, matching `preamble_op.set_forwarded(info)`.
-        getfield_op.pos().set(result_opref);
+        getfield_op.pos().set(self.preamble_op.pos().get());
         // shortpreamble.py `PreambleOp(self.res, preamble_op, ...)` —
         // the stored replay is the builder's object (one ResOperation per
         // short box); see produce_pure for the threading rationale.
@@ -1779,22 +1794,16 @@ impl ProducedShortOp {
             .map(|p| {
                 debug_assert_eq!(
                     p.preamble_op.pos().get(),
-                    result_opref,
-                    "builder replay pos diverged from produce_heap_field rule"
+                    self.preamble_op.pos().get(),
+                    "builder replay pos diverged from the add_op_to_short replay op"
                 );
                 p.preamble_op
             })
             .unwrap_or_else(|| OpRc::new(getfield_op.clone()));
         let pop = crate::optimizeopt::info::PreambleOp {
-            // PreambleOp.op carries the Box itself (shortpreamble.py).
-            // shortpreamble.py `PreambleOp(self.res, ...)`: for a const
-            // entry the body-visible Box is the Const, which has no position
-            // to materialize an operand at.
-            op: if const_res {
-                self.res.clone()
-            } else {
-                ctx.materialize_operand_at(source)
-            },
+            // shortpreamble.py `PreambleOp(self.res, preamble_op)`: `op` is
+            // the body box, `preamble_op` is the replay getfield.
+            op: self.res.clone(),
             invented_name: self.invented_name,
             preamble_op: replay_rc,
             same_as_source: self.same_as_source.clone(),
@@ -1884,13 +1893,11 @@ impl ProducedShortOp {
         // shortpreamble.py:80-85 preserves the same source/replay Box
         // distinction for GETARRAYITEM, and the same const-channel rule as
         // `produce_heap_field`: no `result_map` slot, `source` is the replay
-        // position `produced_const_ops` minted.
-        let const_res = self.res.to_opref().is_constant();
-        let result_opref = if const_res {
-            source
-        } else {
-            *result_map.get(&source)?
-        };
+        // position `produced_const_ops` minted. A non-const entry must still
+        // have a phase-2 body slot.
+        if !self.res.to_opref().is_constant() {
+            result_map.get(&source)?;
+        }
         let _ = result_type;
         let obj_resolved = ctx.get_replacement_opref(obj);
         // shortpreamble.py:68-71 applies to both getfield and
@@ -1916,9 +1923,8 @@ impl ProducedShortOp {
             &[source_obj.clone(), self.source_op.arg(1)],
         );
         source_getarrayitem_op.setdescr(descr.clone());
-        // The replay GETARRAYITEM owns `result_opref`; `source` stays the
-        // body-visible Box.
-        getarrayitem_op.pos().set(result_opref);
+        // The replay GETARRAYITEM keeps the result minted by add_op_to_short.
+        getarrayitem_op.pos().set(self.preamble_op.pos().get());
         // shortpreamble.py `PreambleOp(self.res, preamble_op, ...)` —
         // stored replay is the builder's object; see produce_pure.
         let replay_rc = ctx
@@ -1928,20 +1934,15 @@ impl ProducedShortOp {
             .map(|p| {
                 debug_assert_eq!(
                     p.preamble_op.pos().get(),
-                    result_opref,
-                    "builder replay pos diverged from produce_heap_array_item rule"
+                    self.preamble_op.pos().get(),
+                    "builder replay pos diverged from the add_op_to_short replay op"
                 );
                 p.preamble_op
             })
             .unwrap_or_else(|| OpRc::new(getarrayitem_op.clone()));
         let pop = crate::optimizeopt::info::PreambleOp {
-            // PreambleOp.op carries the Box itself (shortpreamble.py).
-            // Same const-entry rule as `produce_heap_field`.
-            op: if const_res {
-                self.res.clone()
-            } else {
-                ctx.materialize_operand_at(source)
-            },
+            // shortpreamble.py `PreambleOp(self.res, preamble_op)`.
+            op: self.res.clone(),
             invented_name: self.invented_name,
             preamble_op: replay_rc,
             same_as_source: self.same_as_source.clone(),
@@ -2374,13 +2375,22 @@ impl ShortPreambleBuilder {
             return None;
         }
         for arg in produced.preamble_op.getarglist().iter() {
-            // shortpreamble.py:288 isinstance(arg, Const) → skip
+            // shortpreamble.py:288 isinstance(arg, Const) → skip.
+            // `produce_arg` stored the producer's replay op, and the map
+            // is keyed by `short_op.res`, so this lookup hits only when
+            // the arg box is that res. A miss leaves ordering to the
+            // outer create_short_boxes walk, which emits deps first.
             if arg.to_opref().is_constant() {
                 continue;
             }
-            // shortpreamble.py `if op in self.produced_short_boxes`:
-            // the dependency check is by the arg Box identity.
-            if self.produced_short_boxes.get(arg).is_some() {
+            if self
+                .produced_short_boxes
+                .get(arg)
+                .is_some_and(|p| p.kind == PreambleOpKind::InputArg)
+            {
+                continue;
+            }
+            if self.produced_short_boxes.contains_key(arg) {
                 let _ = self.use_box_recursive(arg, visiting);
             }
         }
@@ -2409,18 +2419,10 @@ impl ShortPreambleBuilder {
         arg_guards: &[Op],
         result_guards: &[Op],
     ) {
-        #[cfg(debug_assertions)]
-        if let Some((_, produced)) = self
-            .produced_short_boxes
-            .iter()
-            .find(|(_, p)| p.preamble_op.pos().get() == source)
-        {
-            debug_assert!(
-                OpRc::ptr_eq(&produced.preamble_op, preamble_op),
-                "use_box pop replay diverged from builder entry at {source:?}"
-            );
-        }
-        #[cfg(not(debug_assertions))]
+        // shortpreamble.py `use_box(box, preamble_op)`: `preamble_op` is the
+        // replay op created by `add_op_to_short`. Its args are already
+        // `produce_arg` results, and `make_guards` was called on this same
+        // op, so guard args name the replay result. No second lookup.
         let _ = source;
         self.state
             .use_box(preamble_op, &IndexSet::new(), arg_guards, result_guards);
@@ -2428,10 +2430,9 @@ impl ShortPreambleBuilder {
 
     /// shortpreamble.py:284-285 `op in self.produced_short_boxes`.
     ///
-    /// This is the SOLE corpus-live lookup of any `produced_short_boxes` map
-    /// (the ExtendedShortPreambleBuilder lookups never execute; this builder's
-    /// `use_box_recursive`/`add_preamble_op` lookups never execute either —
-    /// measured over the full bench corpus). The live callers reuse the
+    /// `use_box` also looks a dependency arg up here so the producer is
+    /// appended before the consumer (`AbstractShortPreambleBuilder.use_box`).
+    /// The live callers reuse the
     /// builder's replay Rc during `produce_pure`/`produce_heap_field`/
     /// `produce_heap_array_item` re-export (pure.rs/shortpreamble.rs, via
     /// `OptContext.imported_short_preamble_builder`).
@@ -2977,7 +2978,6 @@ impl ExtendedShortPreambleBuilder {
             return true;
         }
         if self.short_results.contains(&arg)
-            || inputargs_set.contains(&arg)
             || self.known_constants.contains(&arg)
             || constants_set.contains(&arg.raw())
         {
@@ -2992,6 +2992,22 @@ impl ExtendedShortPreambleBuilder {
         // vestige of an earlier export that keyed by something other than the
         // replay pos; it can never fire now (key == pos by construction).
         let dep = self.produced_short_boxes.get(&arg).cloned();
+        // A produced short box is a short-op result. It can also sit on the
+        // loop LABEL as a `used_box` (`unroll.py` `finalize_short_preamble`
+        // appends `sb.used_boxes` to `label_op`). That label slot is not a
+        // short inputarg: `inline_short_preamble` maps only
+        // `short_inputargs` onto `args + virtuals` (`unroll.py`
+        // `inline_short_preamble`). Treating the used box as already
+        // satisfied skips its producer, and `_map_args` then misses the
+        // consumer's arg. `short_jump_args` (the short preamble JUMP) is a
+        // different list of the same length as `used_boxes`; it is not a
+        // tail of `jump_args`, so the producer has to be replayed.
+        let produced_replay = dep
+            .as_ref()
+            .is_some_and(|dep| dep.kind != PreambleOpKind::InputArg);
+        if !produced_replay && inputargs_set.contains(&arg) {
+            return true;
+        }
         let Some(dep) = dep else {
             // Tripwire: a reverse `preamble_op.pos == arg` entry must not exist
             // when the direct lookup misses — that would mean some insert path
@@ -4582,13 +4598,16 @@ mod tests {
         assert_eq!(short[1].opcode, OpCode::IntAddOvf);
         assert_eq!(short[2].opcode, OpCode::GuardNoOverflow);
         assert_eq!(short[3].opcode, OpCode::Jump);
+        // shortpreamble.py `short_preamble_jump` carries `preamble_op`,
+        // the replay result, not `used_boxes` (the body box int_op(10)).
+        assert_ne!(used.pos().get(), OpRef::int_op(10));
         assert_eq!(
             short[3]
                 .getarglist()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            vec![OpRef::int_op(10)]
+            vec![used.pos().get()]
         );
     }
 
@@ -4763,5 +4782,137 @@ mod tests {
                 .phase1_inputargs,
             Some(vec![current])
         );
+    }
+
+    /// `GetfieldGcR` of a `CALL_PURE` result that is also a loop-label
+    /// `used_box`. `jump_args` is only `args + virtuals` (`unroll.py`
+    /// `inline_short_preamble`); `used_boxes` are not a tail of that list.
+    /// `setup` must replay the producer so `_map_args` finds the getfield arg.
+    #[test]
+    fn setup_replays_call_pure_before_getfield_of_used_box() {
+        use crate::optimizeopt::optimizer::Optimizer;
+        use crate::optimizeopt::unroll::OptUnroll;
+        use majit_ir::descr::make_call_descr;
+        use majit_ir::{EffectInfo, ExtraEffect, OopSpecIndex, Value};
+
+        let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(32, &[Type::Int]);
+        let i0 = OpRef::input_arg_int(0);
+        let mut call = Op::new(
+            OpCode::CallR,
+            &[
+                Operand::const_from_value(Value::Int(0x1000)),
+                ctx.materialize_operand_at(i0),
+                Operand::const_from_value(Value::Int(1)),
+            ],
+        );
+        call.setdescr(make_call_descr(
+            vec![Type::Int, Type::Int, Type::Int],
+            Type::Ref,
+            EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None),
+        ));
+        call.pos().set(OpRef::ref_op(72));
+        let mut getfield = Op::with_descr(
+            OpCode::GetfieldGcR,
+            &[ctx.materialize_operand_at(OpRef::ref_op(72))],
+            majit_ir::make_field_descr(0, 8, Type::Ref, majit_ir::ArrayFlag::Pointer),
+        );
+        getfield.pos().set(OpRef::ref_op(77));
+
+        let mut sb = ShortBoxes::with_label_args(&[i0]);
+        sb.add_short_input_arg(&mut ctx, i0, Type::Int);
+        sb.add_potential_op(&mut ctx, None, call, PreambleOpKind::Pure);
+        sb.add_potential_op(&mut ctx, None, getfield, PreambleOpKind::Heap);
+        let produced = sb.produced_ops(&mut ctx);
+        let call_prod = produced
+            .iter()
+            .find(|(_, pop)| pop.preamble_op.opcode == OpCode::CallPureR)
+            .expect("PureOp.add_op_to_short records CALL_PURE_R")
+            .1
+            .clone();
+        let getfield_prod = produced
+            .iter()
+            .find(|(_, pop)| pop.preamble_op.opcode == OpCode::GetfieldGcR)
+            .expect("heap getfield")
+            .1
+            .clone();
+        let call_pos = call_prod.preamble_op.pos().get();
+        assert_ne!(
+            call_pos,
+            call_prod.res.to_opref(),
+            "replay op is not the export-time call box"
+        );
+        assert_ne!(
+            getfield_prod.preamble_op.pos().get(),
+            getfield_prod.res.to_opref(),
+            "replay getfield is not the export-time box"
+        );
+        assert_eq!(getfield_prod.preamble_op.arg(0).to_opref(), call_pos);
+        let short_inputargs = sb.create_short_inputargs(&[i0]);
+        let built = build_short_preamble_from_produced_boxes(&[i0], &short_inputargs, &produced);
+        let built_ops: Vec<OpCode> = built.ops.iter().map(|entry| entry.op.opcode).collect();
+        let call_at = built_ops
+            .iter()
+            .position(|op| *op == OpCode::CallPureR)
+            .expect("short preamble replays CALL_PURE_R");
+        let getfield_at = built_ops
+            .iter()
+            .position(|op| *op == OpCode::GetfieldGcR)
+            .expect("short preamble replays the getfield");
+        assert!(
+            call_at < getfield_at,
+            "use_box appends the producer before GetfieldGcR, got {built_ops:?}"
+        );
+
+        let entries: Vec<(Operand, ProducedShortOp)> = produced
+            .iter()
+            .map(|(_, pop)| (pop.res.clone(), pop.clone()))
+            .collect();
+        let builder = ShortPreambleBuilder::new(&[i0], &entries, &short_inputargs);
+        let mut ext = ExtendedShortPreambleBuilder::new(
+            crate::history::TargetToken::new_loop(1).as_jump_target_descr(),
+            &builder,
+        );
+        // Serialized short ops omit the producer. The loop label carries it
+        // as a used_box, which is not a short inputarg.
+        let stored = ShortPreamble {
+            ops: vec![ShortPreambleOp {
+                op: (*getfield_prod.preamble_op).clone(),
+                arg_mapping: Vec::new(),
+                fail_arg_mapping: Vec::new(),
+            }],
+            inputargs: short_inputargs.clone(),
+            used_boxes: vec![call_pos],
+            jump_args: vec![getfield_prod.preamble_op.pos().get()],
+            exported_state: None,
+            constants: majit_ir::ConstMap::default(),
+            inputarg_infos: Vec::new(),
+            phase1_inputargs: None,
+        };
+        let label_args = vec![i0, call_pos];
+        assert!(
+            ext.setup(&stored, &label_args, &mut ctx),
+            "producer is in produced_short_boxes, so the getfield stays"
+        );
+        let replayed: Vec<OpCode> = (0..ext.short_ops_len())
+            .map(|i| ext.short_op(i).unwrap().opcode)
+            .collect();
+        assert_eq!(replayed, vec![OpCode::CallPureR, OpCode::GetfieldGcR]);
+
+        ctx.activate_short_preamble_producer(ext);
+        let jump_arg = OpRef::int_op(3);
+        ctx.materialize_operand_at(jump_arg);
+        let mut optimizer = Optimizer::new();
+        let extra = OptUnroll::inline_short_preamble(
+            &[jump_arg],
+            &[jump_arg],
+            &stored,
+            &mut optimizer,
+            &mut ctx,
+        );
+        assert!(
+            ctx.take_invalid_loop().is_none(),
+            "GetfieldGcR(call result) must map through the replayed CALL_PURE_R"
+        );
+        assert_eq!(extra.len(), 1);
     }
 }

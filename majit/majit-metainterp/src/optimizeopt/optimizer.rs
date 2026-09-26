@@ -2105,15 +2105,13 @@ impl Optimizer {
                     )?)
                 };
                 let preamble_op = produced.preamble_op.clone();
-                // For ShortInputArg, RPython keeps two identities:
-                // short_op.res is the original label Box and
-                // preamble_op is the fresh renamed InputArg.  Preserve
-                // the renamed replay position. Other short-op kinds
-                // replay into the canonical result position; the const
-                // channel keeps the fresh replay position minted by
-                // produced_const_ops.
-                if let Some(replay_result) = replay_result {
-                    preamble_op.pos().set(replay_result);
+                // shortpreamble.py keeps two boxes: `short_op.res` (body) and
+                // `preamble_op` (replay). `add_op_to_short` already minted the
+                // replay result. `exported_short_box_replay_result` only
+                // decides whether a forwarded-to-Const entry is kept; it must
+                // not be written onto `preamble_op.pos`.
+                if replay_result.is_none() && !const_group {
+                    return None;
                 }
                 // optimizer.py force_box loop parity.
                 //
