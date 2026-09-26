@@ -1856,8 +1856,8 @@ unsafe fn interned_co_name(w_name: PyObjectRef) -> PyObjectRef {
     {
         return w_name;
     }
-    pyre_object::unicodeobject::intern_str_value(unsafe {
-        pyre_object::unicodeobject::w_str_get_value(w_name)
+    pyre_object::unicodeobject::intern_wtf8_value(unsafe {
+        pyre_object::unicodeobject::w_str_get_wtf8(w_name)
     })
 }
 
