@@ -7600,32 +7600,21 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             pyre_object::interp_exceptions::w_exception_set_syntax_lineno(w_self, details[1]);
             pyre_object::interp_exceptions::w_exception_set_syntax_offset(w_self, details[2]);
             pyre_object::interp_exceptions::w_exception_set_syntax_text(w_self, details[3]);
-            if details.len() >= 6 {
-                pyre_object::interp_exceptions::w_exception_set_syntax_end_lineno(
-                    w_self, details[4],
-                );
-                pyre_object::interp_exceptions::w_exception_set_syntax_end_offset(
-                    w_self, details[5],
-                );
-            } else {
-                // CPython 3.14 clears both end positions when a repeated
-                // `__init__` call supplies the four-field details form.
-                pyre_object::interp_exceptions::w_exception_set_syntax_end_lineno(
-                    w_self,
-                    pyre_object::w_none(),
-                );
-                pyre_object::interp_exceptions::w_exception_set_syntax_end_offset(
-                    w_self,
-                    pyre_object::w_none(),
-                );
-            }
-            if details.len() == 7 {
-                // Only a supplied seventh field writes `_metadata`: the
-                // details parse clears the two end positions up front but
-                // leaves this one, so a re-`__init__` with a shorter tuple
-                // keeps whatever was stored.
-                pyre_object::interp_exceptions::w_exception_set_syntax_metadata(w_self, details[6]);
-            }
+            // `SyntaxError_init` parses the details into locals and then
+            // `Py_XSETREF`s every field, so an optional one the tuple omitted
+            // overwrites its slot instead of leaving it: a repeated `__init__`
+            // with a shorter details form clears both end positions *and*
+            // `_metadata`.  A call that supplies no details form at all does not
+            // reach here and keeps all three.
+            let optional = |index: usize| {
+                details
+                    .get(index)
+                    .copied()
+                    .unwrap_or_else(pyre_object::w_none)
+            };
+            pyre_object::interp_exceptions::w_exception_set_syntax_end_lineno(w_self, optional(4));
+            pyre_object::interp_exceptions::w_exception_set_syntax_end_offset(w_self, optional(5));
+            pyre_object::interp_exceptions::w_exception_set_syntax_metadata(w_self, optional(6));
         }
     }
     let args_list = pyre_object::interp_exceptions::w_exception_args_new(
