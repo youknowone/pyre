@@ -2944,6 +2944,11 @@ unsafe fn pin_free_builtin_eq(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
 
 /// `tupleobject.py _compare_tuples` /
 /// `W_TupleObject._descr_eq` — `@jit.look_inside_iff(_unroll_condition_cmp)`.
+///
+/// `inline(never)` keeps the iterating body out of [`compare_slot`].
+/// `policy.py look_inside_graph` only enters a loop-free graph, and
+/// `int_lt` / `_float_lt` are reached through that graph.
+#[inline(never)]
 #[majit_macros::look_inside_iff(tuple_compare_iff)]
 fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObjectRef, PyError> {
     // `_descr_eq` returns as soon as one `eq_w` fails. When every item is
@@ -6815,11 +6820,11 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // over the two `_utf8` payloads) are loop-free too and must live here,
     // or the leaf is only reachable from [`compare_slot_rest`] and never
     // becomes a jitcode.  Every layout that iterates stays in
-    // [`compare_slot_rest`].
-    // Tuple comparison stays there: the container cycle's stack check is the
-    // first thing `compare_slot_rest` does, and a tuple arm ahead of that
-    // check would recurse through `compare_tuples` with no guard.  Short
-    // tuple equality is folded in the tracer instead.
+    // [`compare_slot_rest`], except exact tuples: [`compare_tuples`] is
+    // `@jit.look_inside_iff(tuple_compare_iff)` (`_unroll_condition_cmp`),
+    // and that callee is only minted when this loop-free graph calls it.
+    // The container cycle's stack check runs before that call. Nested
+    // tuples re-enter [`compare`] without a Python frame.
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return match op {
@@ -6905,6 +6910,10 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) == 0,
             }));
         }
+        if is_tuple(a) && is_tuple(b) {
+            crate::stack_check::stack_check()?;
+            return compare_tuples(a, b, op);
+        }
     }
     compare_slot_rest(a, b, op)
 }
@@ -6966,12 +6975,6 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
                 CompareOp::Eq => diff == 0,
                 CompareOp::Ne => diff != 0,
             }));
-        }
-        // Tuple lexicographic comparison — PyPy: tupleobject.py descr_lt / _eq / etc.
-        // Kept behind this function's stack check: nested tuples re-enter
-        // `compare` → `compare_slot` → here, and that is the container cycle.
-        if is_tuple(a) && is_tuple(b) {
-            return compare_tuples(a, b, op);
         }
         // dict equality — `pypy/objspace/std/dictmultiobject.py
         // W_DictMultiObject.descr_eq` is order-independent: same length

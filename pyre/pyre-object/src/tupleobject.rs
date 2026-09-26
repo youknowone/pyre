@@ -784,9 +784,13 @@ pub const UNROLL_CUTOFF: usize = 10;
 
 /// `W_TupleObject._unroll_condition` —
 /// `jit.loop_unrolling_heuristic(self.wrappeditems, self.length(), UNROLL_CUTOFF)`.
+///
+/// `lst` is the tuple, so `isvirtual` sees that object. Passing `&len`
+/// would probe the address of the length local.
 pub fn unroll_condition(obj: PyObjectRef) -> bool {
     let len = unsafe { w_tuple_len(obj) };
-    majit_rlib::jit::loop_unrolling_heuristic(&len, len, UNROLL_CUTOFF)
+    let tuple = unsafe { &*obj };
+    majit_rlib::jit::loop_unrolling_heuristic(tuple, len, UNROLL_CUTOFF)
 }
 
 /// Snapshot the tuple's items as an owned `Vec<PyObjectRef>`.
