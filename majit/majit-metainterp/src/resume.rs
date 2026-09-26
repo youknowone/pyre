@@ -4586,8 +4586,6 @@ impl ResumeDataLoopMemo {
     ///   Heap field triples and known-class info for bridge compilation.
     ///
     /// Returns `(rd_numb, rd_consts, rd_virtuals, liveboxes)`.
-    /// `resume.py` `_number_boxes` keeps `numb_state.liveboxes` and reads
-    /// `box.type` off each box. There is no type dict.
     #[expect(
         clippy::type_complexity,
         reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"

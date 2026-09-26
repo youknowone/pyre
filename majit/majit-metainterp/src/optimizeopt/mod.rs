@@ -7228,7 +7228,7 @@ impl OptContext {
             op.set_rd_resume_position(self.new_operations[idx].rd_resume_position());
             // bridgeopt.py parity: fail_arg_types carry the types the
             // serializer used when writing the class-knowledge bitfield in
-            // rd_numb (`box.type` on each live box). A
+            // rd_numb. A
             // shared guard's rd_numb encodes the donor's livebox type
             // layout, so the sharer must inherit fail_arg_types too —
             // otherwise `deserialize_optimizer_knowledge` (`bridgeopt.rs`)
