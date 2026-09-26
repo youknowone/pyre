@@ -6948,6 +6948,30 @@ impl<S: JitState> JitDriver<S> {
             }
         }
 
+        if result.is_finish && result.is_exit_frame_with_exception {
+            // compile.py `ExitFrameWithExceptionDescrRef.handle_fail`:
+            // `value = cpu.get_ref_value(deadframe, 0)` and raise
+            // `jitexc.ExitFrameWithExceptionRef(value)`, which the portal
+            // runner re-raises as the portal's own exception. It is not a
+            // return value, so nothing is published on the finish latch;
+            // the exception goes to the same interpreter hook the blackhole
+            // `_exit_frame_with_exception` arms use.
+            let exc = match result.typed_values.first() {
+                Some(Value::Ref(exc)) => *exc,
+                other => panic!("exit-with-exception FINISH carried {other:?}, not a Ref"),
+            };
+            self.sync_after(state, compiled_meta, vable, None);
+            let Some(resume_pc) = state.deliver_blackhole_exception(exc) else {
+                eprintln!(
+                    "[jit] exception escaped the compiled portal and this interpreter has \
+                     no `deliver_blackhole_exception` — ending the dispatch loop"
+                );
+                self.meta.single_pass_finish = true;
+                return Some(usize::MAX);
+            };
+            return Some(resume_pc);
+        }
+
         if result.is_finish {
             // compile.py `_DoneWithThisFrameDescr.final_descr = True`:
             // the compiled run ended in FINISH, so the traced function has
