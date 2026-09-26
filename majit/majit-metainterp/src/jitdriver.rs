@@ -2806,6 +2806,17 @@ impl<S: JitState> JitDriver<S> {
         self.meta.backend_mut().set_vtable_offset(offset);
     }
 
+    /// `AbstractLLCPU.subclassrange_min_offset`, beside [`Self::set_vtable_offset`].
+    pub fn set_subclassrange_min_offset(&mut self, offset: Option<usize>) {
+        majit_backend::set_cpu_subclassrange_min_offset(offset);
+        #[cfg(all(
+            feature = "dynasm",
+            not(feature = "cranelift"),
+            not(target_arch = "wasm32")
+        ))]
+        self.meta.backend_mut().set_subclassrange_min_offset(offset);
+    }
+
     /// PyPy JitDriver(is_recursive=True).
     /// Enables max_unroll_recursion for recursive portal calls.
     pub fn set_is_recursive(&mut self, value: bool) {

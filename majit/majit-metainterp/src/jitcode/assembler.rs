@@ -2352,6 +2352,76 @@ impl JitCodeBuilder {
         self.push_reg_u8(dst, "new_array_clear dst");
     }
 
+    /// `new_array/id>r` (`blackhole.py` `bhimpl_new_array`).
+    ///
+    /// `jtransform.py` `rewrite_op_malloc_varsize` emits this when the
+    /// element is not a pointer or struct and the malloc is not `zero`.
+    /// Encoding matches [`Self::new_array_clear`]: length register, array
+    /// descr, destination ref.
+    pub fn new_array(&mut self, dst: u16, length_reg: u16, descr_idx: u16) {
+        self.touch_int_reg_or_pool_slot(length_reg);
+        self.touch_ref_reg(dst);
+        self.write_insn("new_array/id>r");
+        self.push_reg_u8(length_reg, "new_array length");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "new_array dst");
+    }
+
+    /// `arraylen_gc/rd>i` (`blackhole.py` `bhimpl_arraylen_gc`).
+    ///
+    /// The length word is the descr's `lendescr` (`descr.py`
+    /// `get_field_arraylen_descr`), not a separate struct field.
+    pub fn arraylen_gc(&mut self, dst: u16, array_reg: u16, descr_idx: u16) {
+        self.touch_ref_reg(array_reg);
+        self.touch_int_reg_or_pool_slot(dst);
+        self.write_insn("arraylen_gc/rd>i");
+        self.push_reg_u8(array_reg, "arraylen_gc array");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "arraylen_gc dst");
+    }
+
+    /// Array descr for `malloc_varsize` of a `GcArray`, including one
+    /// inlined after a header (`descr.py` `get_array_descr`).
+    ///
+    /// `base_size` is the offset of element 0 (`offset_of!(Header, items)`
+    /// for the `Elem in Header` shape). `len_offset` is the length word
+    /// (`get_field_arraylen_descr`). `is_gc_managed` stays false: the
+    /// pointer addresses the payload, and a `GUARD_GC_TYPE` would read a
+    /// header the concrete block does not carry in front of that pointer.
+    /// `type_id` is still stamped so the allocator can write a type word
+    /// ahead of the payload (`bh_new_array`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_gc_varsize_array_descr(
+        &mut self,
+        base_size: usize,
+        len_offset: usize,
+        itemsize: usize,
+        is_array_of_pointers: bool,
+        is_item_signed: bool,
+        type_id: u64,
+    ) -> u16 {
+        let item_type = if is_array_of_pointers {
+            majit_ir::value::Type::Ref
+        } else {
+            majit_ir::value::Type::Int
+        };
+        self.add_array_descr(CanonicalBhDescr::Array {
+            base_size,
+            itemsize,
+            len_offset: Some(len_offset),
+            type_id,
+            gc_type_id: 0,
+            item_type,
+            is_array_of_pointers,
+            is_array_of_structs: false,
+            is_item_signed,
+            is_gc_managed: false,
+            ei_index: u32::MAX,
+            array_type_id: None,
+            interior_fields: Vec::new(),
+        })
+    }
+
     /// Emit `newlist_clear/idddd>r` (`handler_newlist_clear`,
     /// `blackhole.py:1173-1180`): the compound resizable-list allocation
     /// `do_resizable_newlist_clear` emits.  ONE opcode carrying the

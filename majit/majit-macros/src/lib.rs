@@ -337,8 +337,9 @@ fn rewrite_jit_inline_ref_param_fields(
             // `let x = StructType { f0: v0, f1: v1 }` where StructType is
             // in `struct_allocs` → `let x = allocator_func(v0, v1)`. This
             // must run before `record_ref_field_local`/the default visitor
-            // descend, so `x` stays a plain (non-ref) local bound to the
-            // allocator call's usize result rather than a ref-field local.
+            // descend. The allocator returns `*mut Struct`, so `x` is that
+            // pointer: record the pointee or a later `x.field` / `x.field[i]`
+            // cannot see the layout.
             if let syn::Stmt::Local(local) = stmt
                 && let Some(init) = &mut local.init
                 && let syn::Expr::Struct(s) = &*init.expr
@@ -352,6 +353,10 @@ fn rewrite_jit_inline_ref_param_fields(
                 if let Some(alloc_func) = self.struct_allocs.get(&segs).cloned() {
                     let field_args: Vec<syn::Expr> =
                         s.fields.iter().map(|f| f.expr.clone()).collect();
+                    if let syn::Pat::Ident(pat_ident) = &local.pat {
+                        self.local_ref_types
+                            .insert(pat_ident.ident.to_string(), s.path.clone());
+                    }
                     *init.expr = syn::parse_quote! {
                         #alloc_func(#(#field_args),*)
                     };
@@ -365,6 +370,33 @@ fn rewrite_jit_inline_ref_param_fields(
         }
 
         fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
+            // Nested `struct_allocs` literals (`items: CelItemsBlock { .. }`
+            // inside `W_ListObject { .. }`) rewrite to the concrete
+            // allocator too. Visit fields first so an inner literal is
+            // already a call when it becomes an argument.
+            if let syn::Expr::Struct(struct_expr) = expr {
+                let segs: Vec<String> = struct_expr
+                    .path
+                    .segments
+                    .iter()
+                    .map(|seg| seg.ident.to_string())
+                    .collect();
+                let alloc_func = self.struct_allocs.get(&segs).cloned();
+                syn::visit_mut::visit_expr_mut(self, expr);
+                if let Some(alloc_func) = alloc_func
+                    && let syn::Expr::Struct(struct_expr) = expr
+                {
+                    let field_args: Vec<syn::Expr> = struct_expr
+                        .fields
+                        .iter()
+                        .map(|field| field.expr.clone())
+                        .collect();
+                    *expr = syn::parse_quote! {
+                        #alloc_func(#(#field_args),*)
+                    };
+                }
+                return;
+            }
             // Array element WRITE: `<base>.<array_field>[<idx>] = <rhs>`.
             // Must precede the plain-field arms: the field itself holds the
             // buffer BASE POINTER, so letting the default visitor rewrite

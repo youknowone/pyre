@@ -22,6 +22,45 @@ use std::collections::HashSet;
 
 use crate::{GcRewriter, WriteBarrierDescr};
 
+fn boehm_malloc_fn() -> Option<usize> {
+    let addr = crate::malloc_fixedsize_addr();
+    if addr == 0 { None } else { Some(addr) }
+}
+
+fn boehm_malloc_fixedsize_descr() -> DescrRef {
+    use std::sync::{Arc, OnceLock};
+    static DESCR: OnceLock<DescrRef> = OnceLock::new();
+    DESCR
+        .get_or_init(|| {
+            Arc::new(majit_ir::descr::SimpleCallDescr::new(
+                0x5000_0011,
+                vec![Type::Int],
+                Type::Ref,
+                false,
+                std::mem::size_of::<usize>(),
+                majit_ir::EffectInfo::MOST_GENERAL,
+            ))
+        })
+        .clone()
+}
+
+fn boehm_malloc_array_descr() -> DescrRef {
+    use std::sync::{Arc, OnceLock};
+    static DESCR: OnceLock<DescrRef> = OnceLock::new();
+    DESCR
+        .get_or_init(|| {
+            Arc::new(majit_ir::descr::SimpleCallDescr::new(
+                0x5000_0012,
+                vec![Type::Int, Type::Int, Type::Int, Type::Int],
+                Type::Ref,
+                false,
+                std::mem::size_of::<usize>(),
+                majit_ir::EffectInfo::MOST_GENERAL,
+            ))
+        })
+        .clone()
+}
+
 fn mk_op(opcode: OpCode, args: &[Operand]) -> Op {
     Op::new(opcode, args)
 }
@@ -1832,6 +1871,27 @@ impl GcRewriterImpl {
         result_pos: OpRef,
         st: &mut RewriteState<'_>,
     ) -> Operand {
+        // rewrite.py `gen_boehm_malloc_array` when `malloc_fn_ptr` is published.
+        if boehm_malloc_fn().is_some() {
+            let ad = arraydescr
+                .as_array_descr()
+                .expect("gen_malloc_array descr must be ArrayDescr");
+            let len_descr = ad.len_descr();
+            let length_ofs = len_descr.map_or(self.standard_array_length_ofs, |fd| fd.offset());
+            let fn_ref = st.const_int(crate::boehm_malloc_array as *const () as usize as i64);
+            return self.gen_call_malloc_gc(
+                &[
+                    fn_ref,
+                    st.const_int(ad.base_size() as i64),
+                    v_num_elem,
+                    st.const_int(ad.item_size() as i64),
+                    st.const_int(length_ofs as i64),
+                ],
+                result_pos,
+                boehm_malloc_array_descr(),
+                st,
+            );
+        }
         let ad = arraydescr
             .as_array_descr()
             .expect("gen_malloc_array descr must be ArrayDescr");
@@ -1943,6 +2003,19 @@ impl GcRewriterImpl {
         result_pos: OpRef,
         st: &mut RewriteState<'_>,
     ) -> Operand {
+        // rewrite.py `gen_malloc_fixedsize` Boehm arm: `CALL_R(malloc_fn_ptr, size)`.
+        if let Some(addr) = boehm_malloc_fn() {
+            let fn_ref = st.const_int(addr as i64);
+            let size_ref = st.const_int(size as i64);
+            let result = self.gen_call_malloc_gc(
+                &[fn_ref, size_ref],
+                result_pos,
+                boehm_malloc_fixedsize_descr(),
+                st,
+            );
+            st.remember_wb(&result);
+            return result;
+        }
         debug_assert_eq!(
             size & (std::mem::size_of::<usize>() - 1),
             0,

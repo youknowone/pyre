@@ -1,6 +1,125 @@
 use super::lower_value::struct_type_id_tokens;
 use super::*;
 
+/// Length field of a varsize header (`descr.py` `get_field_arraylen_descr`).
+///
+/// Prefer the names a `GcArray` length word actually uses. A header with
+/// a single `int_fields` entry uses that entry.
+pub(super) fn varsize_length_field_name(
+    config: &LowererConfig,
+    header: &syn::Path,
+) -> Option<String> {
+    let last = header.segments.last()?.ident.to_string();
+    let prefix = format!("{last}::");
+    let names: Vec<String> = config
+        .int_fields
+        .keys()
+        .filter_map(|key| key.strip_prefix(&prefix).map(|rest| rest.to_string()))
+        .collect();
+    for prefer in ["capacity", "length", "len"] {
+        if names.iter().any(|name| name == prefer) {
+            return Some(prefer.to_string());
+        }
+    }
+    if names.len() == 1 {
+        return Some(names[0].clone());
+    }
+    // A header declared only through `array_fields` still has a length
+    // word. `capacity` is the name `GcArray` headers use when `int_fields`
+    // does not name it (`rewrite_op_getarraysize`).
+    if struct_is_array_header(config, header) {
+        return Some("capacity".to_string());
+    }
+    None
+}
+
+fn struct_is_array_header(config: &LowererConfig, header: &syn::Path) -> bool {
+    let last = header.segments.last().map(|seg| &seg.ident);
+    config
+        .array_headers
+        .values()
+        .any(|path| path.segments.last().map(|seg| &seg.ident) == last)
+}
+
+/// `rewrite_op_getarraysize`: a read of the header's length word is
+/// `arraylen_gc`, including when that word is not listed in `int_fields`.
+pub(super) fn is_varsize_length_member(
+    config: &LowererConfig,
+    header: &syn::Path,
+    member: &str,
+) -> bool {
+    if !struct_is_array_header(config, header) {
+        return false;
+    }
+    if varsize_length_field_name(config, header).as_deref() == Some(member) {
+        return true;
+    }
+    matches!(member, "capacity" | "length" | "len")
+}
+
+/// `rewrite_op_malloc_varsize`: pointer and struct elements are cleared.
+/// An integer element type (`i64`, `usize`, …) is `new_array`.
+pub(super) fn header_items_are_pointers(config: &LowererConfig, header: &syn::Path) -> bool {
+    const INTS: &[&str] = &[
+        "i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize", "bool",
+    ];
+    let last = header
+        .segments
+        .last()
+        .map(|seg| seg.ident.to_string())
+        .unwrap_or_default();
+    let mut saw = false;
+    let mut primitive = false;
+    for (key, header_path) in &config.array_headers {
+        let header_last = header_path
+            .segments
+            .last()
+            .map(|seg| seg.ident.to_string())
+            .unwrap_or_default();
+        if header_last != last {
+            continue;
+        }
+        saw = true;
+        if let Some((_, _, elem)) = config.array_fields.get(key) {
+            let elem_last = elem
+                .segments
+                .last()
+                .map(|seg| seg.ident.to_string())
+                .unwrap_or_default();
+            if INTS.contains(&elem_last.as_str()) {
+                primitive = true;
+            }
+        }
+    }
+    saw && !primitive
+}
+
+/// `descr.py` `get_array_descr` for a `GcArray` or an array inlined after
+/// `header`: basesize is `offset_of!(Header, items)`, lendescr offset is
+/// the length field.
+pub(super) fn gc_varsize_descr_tokens(config: &LowererConfig, header: &syn::Path) -> TokenStream {
+    let len_name =
+        varsize_length_field_name(config, header).unwrap_or_else(|| "capacity".to_string());
+    let len_ident = syn::Ident::new(&len_name, proc_macro2::Span::call_site());
+    let pointers = header_items_are_pointers(config, header);
+    let (itemsize, is_signed) = if pointers {
+        (quote! { ::core::mem::size_of::<usize>() }, quote! { false })
+    } else {
+        (quote! { ::core::mem::size_of::<i64>() }, quote! { true })
+    };
+    let type_id = struct_type_id_tokens(header, true);
+    quote! {
+        __builder.add_gc_varsize_array_descr(
+            ::core::mem::offset_of!(#header, items),
+            ::core::mem::offset_of!(#header, #len_ident),
+            #itemsize,
+            #pointers,
+            #is_signed,
+            #type_id,
+        )
+    }
+}
+
 impl<'c> Lowerer<'c> {
     /// The virtualizable object in an access.
     ///
@@ -1278,6 +1397,26 @@ impl<'c> Lowerer<'c> {
         }
         let base_reg = base.reg;
         let result_reg = self.alloc_reg();
+        if is_varsize_length_member(config, &struct_path, &member_name) {
+            let descr_tokens = gc_varsize_descr_tokens(config, &struct_path);
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![Register::ref_(base_reg)],
+                    vec![Register::int(result_reg)],
+                ),
+                quote! {
+                    let __descr_idx = #descr_tokens;
+                    __builder.arraylen_gc(#result_reg, #base_reg, __descr_idx);
+                },
+            );
+            return Some(Binding {
+                reg: result_reg,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            });
+        }
         if is_ref_field {
             // Ref-kind field → getfield_gc_r, result is a ref binding.
             self.emit_op(
@@ -1510,6 +1649,28 @@ impl<'c> Lowerer<'c> {
                 kind: BindingKind::Ref,
                 depends_on_stack: false,
                 struct_type: ref_field_entry.map(|(_, _, pointee_path)| pointee_path.clone()),
+            })
+        } else if is_varsize_length_member(config, &struct_path, &member_name) {
+            // The length word of a varsize block is `arraylen_gc`
+            // (`opimpl_arraylen_gc`), so a virtual `new_array` folds it.
+            // A `getfield` of that word would not see `VArrayValue`.
+            let descr_tokens = gc_varsize_descr_tokens(config, &struct_path);
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![Register::ref_(base_reg)],
+                    vec![Register::int(result_reg)],
+                ),
+                quote! {
+                    let __descr_idx = #descr_tokens;
+                    __builder.arraylen_gc(#result_reg, #base_reg, __descr_idx);
+                },
+            );
+            Some(Binding {
+                reg: result_reg,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
             })
         } else {
             self.emit_op(
@@ -1809,7 +1970,19 @@ impl<'c> Lowerer<'c> {
         if let Some(header) = header {
             // Pointer elements living after `header.items`. The base
             // register is the header, so the descr's base_size is that
-            // field's offset rather than zero.
+            // field's offset rather than zero. The length offset is the
+            // header's lendescr (`get_array_descr`).
+            let descr_tokens = self
+                .config
+                .map(|config| gc_varsize_descr_tokens(config, &header))
+                .unwrap_or_else(|| {
+                    quote! {
+                        __builder.add_ptr_array_descr(
+                            ::core::mem::offset_of!(#header, items),
+                            ::core::option::Option::None,
+                        )
+                    }
+                });
             self.emit_op(
                 OpMeta::linear(
                     OpKind::Vable,
@@ -1817,10 +1990,7 @@ impl<'c> Lowerer<'c> {
                     vec![Register::ref_(result_reg)],
                 ),
                 quote! {
-                    let __descr_idx = __builder.add_ptr_array_descr(
-                        ::core::mem::offset_of!(#header, items),
-                        ::core::option::Option::None,
-                    );
+                    let __descr_idx = #descr_tokens;
                     __builder.getarrayitem_gc_r(
                         #result_reg as u16,
                         #buffer_reg as u16,
@@ -1910,6 +2080,17 @@ impl<'c> Lowerer<'c> {
         let index_reg = index.reg;
         let value_reg = value.reg;
         if let Some(header) = header {
+            let descr_tokens = self
+                .config
+                .map(|config| gc_varsize_descr_tokens(config, &header))
+                .unwrap_or_else(|| {
+                    quote! {
+                        __builder.add_ptr_array_descr(
+                            ::core::mem::offset_of!(#header, items),
+                            ::core::option::Option::None,
+                        )
+                    }
+                });
             self.emit_op(
                 OpMeta::linear(
                     OpKind::Vable,
@@ -1921,10 +2102,7 @@ impl<'c> Lowerer<'c> {
                     vec![],
                 ),
                 quote! {
-                    let __descr_idx = __builder.add_ptr_array_descr(
-                        ::core::mem::offset_of!(#header, items),
-                        ::core::option::Option::None,
-                    );
+                    let __descr_idx = #descr_tokens;
                     __builder.setarrayitem_gc_r(
                         #buffer_reg as u16,
                         #index_reg as u16,

@@ -932,6 +932,9 @@ pub struct Assembler386<'a> {
     /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
     /// `None` corresponds to RPython's gcremovetypeptr config.
     vtable_offset: Option<usize>,
+    /// `AbstractLLCPU.subclassrange_min_offset`. `None` keeps the
+    /// TYPE_INFO arm of `genop_guard_guard_subclass`.
+    subclassrange_min_offset: Option<usize>,
     /// llsupport/gc.py get_typeid_from_classptr_if_gcremovetypeptr vtable→typeid table, materialized by the runner
     /// via gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr. Used by
     /// the gcremovetypeptr branch of `_cmp_guard_class`.
@@ -1166,6 +1169,7 @@ impl<'a> Assembler386<'a> {
         header_pc: u64,
         constants: majit_ir::ConstMap<majit_ir::Const>,
         vtable_offset: Option<usize>,
+        subclassrange_min_offset: Option<usize>,
         classptr_to_typeid: IndexMap<i64, u32>,
         guard_gc_type_info: Option<GuardGcTypeInfo>,
         classptr_to_subclass_range: IndexMap<i64, (i64, i64)>,
@@ -1202,6 +1206,7 @@ impl<'a> Assembler386<'a> {
             compiled_target_tokens: Vec::new(),
             unrelocated_jump_target: None,
             vtable_offset,
+            subclassrange_min_offset,
             classptr_to_typeid,
             guard_gc_type_info,
             classptr_to_subclass_range,
@@ -5279,6 +5284,33 @@ impl<'a> Assembler386<'a> {
 
     /// x86/assembler.py `genop_guard_guard_subclass`.
     fn emit_guard_subclass(&mut self, obj_loc: &Loc, class_loc: &Loc, tmp_loc: &Loc) {
+        // `cpu.vtable_offset` is set and no TYPE_INFO table is installed.
+        // `offset2` is `cpu.subclassrange_min_offset`; `check_min` /
+        // `check_max` are `vtable_ptr.subclassrange_min/max`.
+        if self.guard_gc_type_info.is_none()
+            && let (Some(vtable_offset), Some(range_off)) =
+                (self.vtable_offset, self.subclassrange_min_offset)
+        {
+            let (Loc::Reg(obj), Loc::Immed(classptr) | Loc::ImmedFloat(classptr), Loc::Reg(tmp)) =
+                (obj_loc, class_loc, tmp_loc)
+            else {
+                panic!(
+                    "GUARD_SUBCLASS expects [Reg object, Immed classptr, Reg tmp] \
+                     like x86/assembler.py:1947"
+                );
+            };
+            let (check_min, check_max) =
+                majit_backend::read_vtable_subclass_range(classptr.value, range_off);
+            let offset = vtable_offset as i32;
+            let offset2 = range_off as i32;
+            dynasm!(self.mc ; .arch x64
+                ; mov Rq(tmp.value), [Rq(obj.value) + offset]
+                ; mov Rq(tmp.value), [Rq(tmp.value) + offset2]
+            );
+            self.emit_sub_imm64(tmp.value, check_min);
+            self.emit_cmp_imm64(tmp.value, check_max - check_min);
+            return;
+        }
         let info = self.require_guard_gc_type_info("GUARD_SUBCLASS");
         let (Loc::Reg(obj), Loc::Immed(classptr) | Loc::ImmedFloat(classptr), Loc::Reg(tmp)) =
             (obj_loc, class_loc, tmp_loc)

@@ -10953,91 +10953,94 @@ where
                 self.log_bytecode_abort("BC_ABORT_PERMANENT");
                 return TraceAction::AbortPermanent;
             }
-            // `opimpl_new_array` / `opimpl_new_array_clear`: one
-            // `_opimpl_new_array` parameterised by opnum. The codewriter
-            // emits both into a dispatched JitCode (`new_array/id>r`,
-            // `new_array_clear/id>r`). The `cd>r` const-length form is
-            // decoded by the string-key walker; this dispatcher reads
-            // a length register.
+            // `jtransform.py` `rewrite_op_malloc_varsize` → `new_array` /
+            // `new_array_clear`. A `#[jit_inline]` varsize literal emits the
+            // byte; record `OpCode::NewArray{,Clear}` so `optimize_NEW_ARRAY`
+            // can keep the block virtual, and allocate the live payload the
+            // rest of this trace reads (`bhimpl_new_array{,_clear}`).
             jitcode::insns::BC_NEW_ARRAY | jitcode::insns::BC_NEW_ARRAY_CLEAR => {
                 let clear = bytecode == jitcode::insns::BC_NEW_ARRAY_CLEAR;
-                let (length_reg, descr_idx, dest, base_size, itemsize, len_offset, type_id) = {
+                let (length_reg, array_descr_idx, dest) = {
                     let frame = self.frames.current_mut();
-                    let length_reg = frame.next_u8() as usize;
-                    let descr_idx = frame.next_u16() as usize;
-                    let dest = frame.next_u8() as usize;
-                    let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
-                        panic!("BC_NEW_ARRAY: descrs[{descr_idx}] is not a BhDescr entry")
+                    frame.read_new_array()
+                };
+                let (array_base_size, array_itemsize, array_len_offset, array_type_id) = {
+                    let frame = self.frames.current_mut();
+                    let bh = frame.runtime_bh_descr(array_descr_idx).unwrap_or_else(|| {
+                        panic!("BC_NEW_ARRAY: descrs[{array_descr_idx}] is not a BhDescr entry")
                     });
                     let (base_size, itemsize, _signed) = bh.unpack_arraydescr_size();
                     (
-                        length_reg,
-                        descr_idx,
-                        dest,
                         base_size,
                         itemsize,
                         bh.array_len_offset(),
                         bh.resolve_gc_tid(),
                     )
                 };
-                let Some(array_descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
+                let Some(array_descr) = self.dispatch_array_descr_ref(ctx, array_descr_idx) else {
                     return TraceAction::Abort;
                 };
                 let (length_opref, length_val) = self.read_int_reg(length_reg);
                 let length_count =
                     usize::try_from(length_val).expect("BC_NEW_ARRAY: negative array length");
-                let payload = itemsize
+                let array_payload = array_itemsize
                     .checked_mul(length_count)
-                    .and_then(|var| base_size.checked_add(var))
-                    .expect("BC_NEW_ARRAY: size overflow")
-                    .max(1);
-                let gc_ptr = if type_id != 0 {
-                    majit_gc::alloc_oldgen_typed(type_id, payload).0
+                    .and_then(|var| array_base_size.checked_add(var))
+                    .expect("BC_NEW_ARRAY: array size overflow");
+                let array_payload = array_payload.max(1);
+                // Same no-collect rule as `BC_NEW`: the register bank is not
+                // a root set. Old-gen is non-moving; an untyped descr falls
+                // through to the host allocator, which still zeroes when
+                // `clear` is set and writes the length word.
+                let array_gc_ptr = if array_type_id != 0 {
+                    majit_gc::alloc_oldgen_typed(array_type_id, array_payload).0
                 } else {
                     0
                 };
-                // A typed descr (`type_id != 0`) has a GC header and
-                // tracing layout. `alloc_oldgen_typed` returning 0 is a
-                // failed allocation; raw storage would drop both. Abort
-                // the trace. The raw fallback stays only for an untyped
-                // descr (`type_id == 0`).
-                let array_ptr = if gc_ptr != 0 {
-                    gc_ptr as i64
-                } else if type_id != 0 {
+                // A typed descr (`array_type_id != 0`) has a GC header and a
+                // tracing layout; `alloc_oldgen_typed` returning 0 is a failed
+                // allocation, and host storage would drop both. Abort the trace.
+                let array_ptr = if array_gc_ptr != 0 {
+                    array_gc_ptr as i64
+                } else if array_type_id != 0 {
                     return TraceAction::Abort;
+                } else if let Some(ptr) = host_malloc_fixedsize(array_payload) {
+                    ptr as i64
                 } else {
-                    let layout = std::alloc::Layout::from_size_align(payload, 8)
+                    let layout = std::alloc::Layout::from_size_align(array_payload, 8)
                         .expect("BC_NEW_ARRAY: invalid array layout");
-                    unsafe {
-                        if clear {
-                            std::alloc::alloc_zeroed(layout) as i64
-                        } else {
-                            std::alloc::alloc(layout) as i64
+                    unsafe { std::alloc::alloc_zeroed(layout) as i64 }
+                };
+                if array_ptr != 0 {
+                    if clear {
+                        unsafe {
+                            std::ptr::write_bytes(array_ptr as *mut u8, 0, array_payload);
                         }
                     }
-                };
-                if array_ptr != 0
-                    && let Some(len_ofs) = len_offset
-                {
-                    unsafe { *((array_ptr as *mut u8).add(len_ofs) as *mut i64) = length_val };
+                    if let Some(len_ofs) = array_len_offset {
+                        unsafe {
+                            *((array_ptr as *mut u8).add(len_ofs) as *mut usize) =
+                                length_val as usize;
+                        }
+                    }
                 }
-                let opcode = if clear {
+                let kind = if clear {
                     OpCode::NewArrayClear
                 } else {
                     OpCode::NewArray
                 };
-                ctx.profiler().count_ops(opcode, crate::counters::OPS);
+                ctx.profiler().count_ops(kind, crate::counters::OPS);
                 ctx.profiler()
-                    .count_ops(opcode, crate::counters::RECORDED_OPS);
-                let abox = if clear {
+                    .count_ops(kind, crate::counters::RECORDED_OPS);
+                let abox_op = if clear {
                     ctx.record_new_array_clear(length_opref, array_descr)
                 } else {
                     ctx.record_new_array(length_opref, array_descr)
                 };
-                ctx.set_opref_concrete(abox, Value::Ref(majit_ir::GcRef(array_ptr as usize)));
+                ctx.set_opref_concrete(abox_op, Value::Ref(majit_ir::GcRef(array_ptr as usize)));
                 ctx.heap_cache_mut()
-                    .new_array(abox, length_opref, length_opref.is_constant());
-                self.set_ref_reg(dest, Some(abox), Some(array_ptr));
+                    .new_array(abox_op, length_opref, length_opref.is_constant());
+                self.set_ref_reg(dest, Some(abox_op), Some(array_ptr));
             }
             jitcode::insns::BC_NEWLIST_CLEAR => {
                 // opimpl_newlist_clear (pyjitpl.py): decompose ONE

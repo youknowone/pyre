@@ -766,6 +766,77 @@ impl<'c> Lowerer<'c> {
         inner_segs == base_segs || inner_segs.last() == base_segs.last()
     }
 
+    /// This struct is the header of an `Elem in Header` array
+    /// (`array_fields`), so a literal of it is `malloc_varsize`.
+    ///
+    /// Returns the header path the descr is built from (basesize =
+    /// `offset_of!(Header, items)`, lendescr = the header's length field).
+    fn varsize_header(&self, struct_path: &syn::Path) -> Option<syn::Path> {
+        let config = self.config?;
+        let segs = super::canonical_path_segments(struct_path);
+        let last = segs.last()?;
+        config
+            .array_headers
+            .values()
+            .find(|header| {
+                let header_segs = super::canonical_path_segments(header);
+                header_segs == segs || header_segs.last() == Some(last)
+            })
+            .cloned()
+    }
+
+    /// `jtransform.py` `rewrite_op_malloc_varsize`: pointer elements and a
+    /// zeroed block are `new_array_clear`; a non-pointer block that is not
+    /// zeroed is `new_array`. The length argument is the header's length
+    /// field (`descr.py` `get_field_arraylen_descr`).
+    fn emit_varsize_array(
+        &mut self,
+        struct_path: &syn::Path,
+        header: &syn::Path,
+        fields: &[(syn::Path, syn::Member, Binding)],
+        depends_on_stack: bool,
+    ) -> Option<Binding> {
+        let config = self.config?;
+        let len_name = super::lower_vable::varsize_length_field_name(config, header)?;
+        let length = fields.iter().find(|(_, member, value)| {
+            named_member(member).as_deref() == Some(len_name.as_str())
+                && matches!(value.kind, BindingKind::Int)
+        })?;
+        let length_reg = length.2.reg;
+        let pointer_items = super::lower_vable::header_items_are_pointers(config, header);
+        // `rewrite_op_malloc_varsize`: a pointer or struct element is
+        // `new_array_clear`. A primitive element is `new_array` unless the
+        // malloc asked for `zero` (the empty `items: []` of a pointer
+        // block is the clear arm above).
+        let result_reg = self.alloc_reg();
+        let descr = super::lower_vable::gc_varsize_descr_tokens(config, header);
+        let op_tokens = if pointer_items {
+            quote! {
+                let __descr_idx = #descr;
+                __builder.new_array_clear(#result_reg, #length_reg, __descr_idx);
+            }
+        } else {
+            quote! {
+                let __descr_idx = #descr;
+                __builder.new_array(#result_reg, #length_reg, __descr_idx);
+            }
+        };
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::New,
+                vec![Register::int(length_reg)],
+                vec![Register::ref_(result_reg)],
+            ),
+            op_tokens,
+        );
+        Some(Binding {
+            reg: result_reg,
+            kind: BindingKind::Ref,
+            depends_on_stack,
+            struct_type: Some(struct_path.clone()),
+        })
+    }
+
     /// Lower a struct literal `Path { f0: v0, f1: v1, .. }` to a JIT
     /// allocation plus per-field stores: `new` (size from `size_of`) then
     /// `setfield_gc_<kind>` at each field's `offset_of`.  Mirrors
@@ -807,6 +878,7 @@ impl<'c> Lowerer<'c> {
         let mut vtable: Option<TokenStream> = None;
         let mut value_fields: Vec<(syn::Path, syn::Member, Binding)> = Vec::new();
         let mut depends_on_stack = false;
+        let varsize = self.varsize_header(struct_path);
         for (owner, member, expr) in &flat {
             if Self::is_typeptr_member(member)
                 && let Some(tokens) = Self::const_vtable_tokens(expr)
@@ -817,11 +889,20 @@ impl<'c> Lowerer<'c> {
                 vtable = Some(tokens);
                 continue;
             }
+            // The inlined `items` array is the varsize payload, not a
+            // field store. `rewrite_op_malloc_varsize` consumes the
+            // length and emits `new_array` / `new_array_clear`.
+            if varsize.is_some() && named_member(member).as_deref() == Some("items") {
+                continue;
+            }
             let value = self.lower_value_expr(expr)?;
             depends_on_stack |= value.depends_on_stack;
             value_fields.push((owner.clone(), member.clone(), value));
         }
         let fields = value_fields;
+        if let Some(header) = varsize {
+            return self.emit_varsize_array(struct_path, &header, &fields, depends_on_stack);
+        }
         // Same id a later `getfield` mints (`struct_gc_kind_is_managed`), so
         // the virtual's slot and the read name one descriptor.
         let gc_managed = self
@@ -3521,6 +3602,74 @@ mod tests {
         assert!(emitted.contains("setfield_gc_r"));
         assert!(emitted.contains("offset_of"));
         assert!(emitted.contains("size_of"));
+    }
+
+    fn varsize_config(element: &str) -> LowererConfig {
+        let element_type: syn::Path = syn::parse_str(element).unwrap();
+        let items = crate::jit_interp::ArrayFieldEntry {
+            struct_type: syn::parse_quote!(Items),
+            field: syn::parse_quote!(items),
+            element_type,
+            header: Some(syn::parse_quote!(Items)),
+        };
+        let capacity = crate::jit_interp::IntFieldEntry {
+            struct_type: syn::parse_quote!(Items),
+            field: syn::parse_quote!(capacity),
+            int_type: syn::parse_quote!(i64),
+        };
+        LowererConfig::inline_helper(&[], &[items], &[capacity], &[], &[], &[], &[], &[])
+    }
+
+    #[test]
+    fn pointer_varsize_literal_lowers_to_new_array_clear() {
+        // `rewrite_op_malloc_varsize`: pointer elements are `new_array_clear`.
+        // The descr carries the header's item offset and length offset
+        // (`get_array_descr`).
+        let config = varsize_config("Cell");
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer
+            .bindings
+            .insert("n".to_string(), binding(1, BindingKind::Int));
+        let expr: Expr = syn::parse_str("Items { capacity: n, items: [] }").unwrap();
+        let result = lowerer.lower_value_expr(&expr).expect("varsize lowers");
+        assert!(matches!(result.kind, BindingKind::Ref));
+        assert!(result.struct_type.is_some());
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(
+            emitted.contains("new_array_clear"),
+            "pointer varsize must be new_array_clear, got {emitted}"
+        );
+        assert!(emitted.contains("add_gc_varsize_array_descr"));
+        assert!(!emitted.contains("new_struct"));
+    }
+
+    #[test]
+    fn int_varsize_literal_lowers_to_new_array() {
+        // A primitive element is `new_array`, not `new_array_clear`.
+        let config = varsize_config("i64");
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer
+            .bindings
+            .insert("n".to_string(), binding(1, BindingKind::Int));
+        let expr: Expr = syn::parse_str("Items { capacity: n, items: [] }").unwrap();
+        lowerer.lower_value_expr(&expr).expect("varsize lowers");
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(
+            emitted.contains("new_array"),
+            "int varsize must be new_array, got {emitted}"
+        );
+        assert!(
+            !emitted.contains("new_array_clear"),
+            "int varsize must not clear, got {emitted}"
+        );
     }
 
     #[test]

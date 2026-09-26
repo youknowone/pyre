@@ -2515,6 +2515,36 @@ pub fn malloc_fixedsize_addr() -> usize {
     MALLOC_FIXEDSIZE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `GcLLDescr_boehm.malloc_array`: one call allocates through
+/// `malloc_fn_ptr`, then stores the length at `lendescr`. The host
+/// already returned zeroed memory, so this does not clear again.
+pub extern "C" fn boehm_malloc_array(
+    basesize: usize,
+    num_elem: usize,
+    itemsize: usize,
+    ofs_length: usize,
+) -> *mut u8 {
+    let addr = malloc_fixedsize_addr();
+    if addr == 0 {
+        return core::ptr::null_mut();
+    }
+    let Some(var_bytes) = itemsize.checked_mul(num_elem) else {
+        return core::ptr::null_mut();
+    };
+    let Some(total) = basesize.checked_add(var_bytes) else {
+        return core::ptr::null_mut();
+    };
+    let func: extern "C" fn(usize) -> *mut u8 = unsafe { core::mem::transmute(addr) };
+    let res = func(total.max(1));
+    if res.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        *res.add(ofs_length).cast::<usize>() = num_elem;
+    }
+    res
+}
+
 // ── Host-side nursery allocation hook ───────────────────────────────
 //
 // Separate from `ActiveGcGuardHooks` because allocation is not a

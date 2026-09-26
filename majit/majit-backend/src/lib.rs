@@ -135,6 +135,9 @@ pub use finish_descrs::{
 };
 pub use jitframe::JitFrameInfo;
 pub use llmodel::{FailArgSource, get_int_value, get_int_value_direct};
+pub use model::{
+    cpu_subclassrange_min_offset, read_vtable_subclass_range, set_cpu_subclassrange_min_offset,
+};
 pub use rd_payload::RdPayload;
 pub use resume_guard_descr::{
     BridgeDispatchCells, ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT, STATUS_SHIFT_MASK,

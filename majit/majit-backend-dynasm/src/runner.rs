@@ -1425,6 +1425,33 @@ fn dynasm_alloc_varsize_typed_and_set_len(
     )
 }
 
+fn dynasm_fixedsize_hook_varsize(
+    base_size: usize,
+    item_size: usize,
+    length_ofs: usize,
+    length: usize,
+) -> Option<u64> {
+    let addr = majit_gc::malloc_fixedsize_addr();
+    if addr == 0 {
+        return None;
+    }
+    let Some(var_bytes) = item_size.checked_mul(length) else {
+        return Some(0);
+    };
+    let Some(payload_size) = base_size.checked_add(var_bytes) else {
+        return Some(0);
+    };
+    let func: extern "C" fn(usize) -> *mut u8 = unsafe { std::mem::transmute(addr) };
+    let ptr = func(payload_size.max(1));
+    if ptr.is_null() {
+        return Some(0);
+    }
+    unsafe {
+        *ptr.add(length_ofs).cast::<usize>() = length;
+    }
+    Some(ptr as u64)
+}
+
 fn dynasm_alloc_varsize_typed_and_set_len_maybe_clear(
     type_id: u32,
     base_size: usize,
@@ -1452,6 +1479,14 @@ fn dynasm_alloc_varsize_typed_and_set_len_maybe_clear(
         }
     });
     result.unwrap_or_else(|| {
+        // `GcLLDescr.malloc_fixedsize` when the portal published one
+        // (`set_malloc_fixedsize`). The block is the caller's heap, not a
+        // libc array: length is still stamped at `lendescr`.
+        if let Some(hooked) =
+            dynasm_fixedsize_hook_varsize(base_size, item_size, length_ofs, length)
+        {
+            return hooked;
+        }
         let raw = dynasm_raw_varsize_alloc_typed_and_set_len(
             type_id, base_size, item_size, length_ofs, length,
         );
@@ -1821,6 +1856,10 @@ pub struct DynasmBackend {
     /// llmodel.py:64-69 self.vtable_offset — byte offset of the typeptr
     /// field inside instance objects. None when gcremovetypeptr is enabled.
     vtable_offset: Option<usize>,
+    /// `llmodel.py` `AbstractLLCPU.subclassrange_min_offset`, from
+    /// `rclass.OBJECT_VTABLE`. Byte offset of `subclassrange_min` inside
+    /// the class object. `None` until the portal configures it.
+    subclassrange_min_offset: Option<usize>,
     /// `compile.py:665` `setattr(cpu, name, descr)` per-cpu attachments,
     /// held in a heap-pinned `Arc<CpuDescrCell>` so the
     /// pointer baked into the CALL_ASSEMBLER helper call site
@@ -1940,6 +1979,7 @@ impl DynasmBackend {
             next_header_pc: 0,
             constants: majit_ir::ConstMap::default(),
             vtable_offset: None,
+            subclassrange_min_offset: None,
             descr_attachments: Arc::new(crate::guard::CpuDescrCell::default()),
             done_int_cell: std::sync::atomic::AtomicUsize::new(0),
             arch_cpu_ext: ArchCpuExt::new(asm_memory_manager),
@@ -2309,6 +2349,13 @@ impl DynasmBackend {
     /// llmodel.py:64-69 self.vtable_offset configuration.
     pub fn set_vtable_offset(&mut self, offset: Option<usize>) {
         self.vtable_offset = offset;
+    }
+
+    /// `AbstractLLCPU.subclassrange_min_offset`. Published for
+    /// `optimizer.py` `_check_subclass` as well as this CPU's assembler.
+    pub fn set_subclassrange_min_offset(&mut self, offset: Option<usize>) {
+        self.subclassrange_min_offset = offset;
+        majit_backend::set_cpu_subclassrange_min_offset(offset);
     }
 
     /// llsupport/gc.py GcLLDescr_framework
@@ -2887,6 +2934,7 @@ impl Backend for DynasmBackend {
             header_pc,
             const_pool,
             self.vtable_offset,
+            self.subclassrange_min_offset,
             typeid_table,
             guard_gc_type_info,
             subclass_range_table,
@@ -3149,6 +3197,7 @@ impl Backend for DynasmBackend {
             0,
             const_pool,
             self.vtable_offset,
+            self.subclassrange_min_offset,
             typeid_table,
             guard_gc_type_info,
             subclass_range_table,

@@ -64,6 +64,18 @@ fn raise_invalid_loop(msg: &'static str, op: &Op, ctx: &OptContext) -> Optimizat
 /// Answers `None` when either class has no recorded range, which decides
 /// nothing: a caller must keep its guard rather than read that as a pass.
 fn check_subclass(vtable1: i64, vtable2: i64) -> Option<bool> {
+    // optimizer.py `_check_subclass`: read `subclassrange_min` / `max` off
+    // the class constants when `cpu.subclassrange_min_offset` is set.
+    // The span includes `max`; no real class is numbered with that value.
+    if let Some(offset) = majit_backend::cpu_subclassrange_min_offset() {
+        if vtable1 == 0 || vtable2 == 0 {
+            return None;
+        }
+        let (known_min, _) = majit_backend::read_vtable_subclass_range(vtable1, offset);
+        let (expected_min, expected_max) =
+            majit_backend::read_vtable_subclass_range(vtable2, offset);
+        return Some(expected_min <= known_min && known_min <= expected_max);
+    }
     let (known_min, _) = majit_gc::subclass_range(vtable1 as usize)?;
     let (expected_min, expected_max) = majit_gc::subclass_range(vtable2 as usize)?;
     Some(expected_min <= known_min && known_min <= expected_max)
@@ -2501,6 +2513,44 @@ mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
+
+    #[test]
+    fn check_subclass_reads_cpu_subclassrange_fields() {
+        #[repr(C)]
+        struct Class {
+            subclassrange_min: i64,
+            subclassrange_max: i64,
+        }
+        let parent = Class {
+            subclassrange_min: 0,
+            subclassrange_max: 4,
+        };
+        let child = Class {
+            subclassrange_min: 2,
+            subclassrange_max: 3,
+        };
+        let other = Class {
+            subclassrange_min: 10,
+            subclassrange_max: 11,
+        };
+        let prev = majit_backend::cpu_subclassrange_min_offset();
+        majit_backend::set_cpu_subclassrange_min_offset(Some(0));
+        assert_eq!(
+            check_subclass(
+                &child as *const Class as i64,
+                &parent as *const Class as i64
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            check_subclass(
+                &other as *const Class as i64,
+                &parent as *const Class as i64
+            ),
+            Some(false)
+        );
+        majit_backend::set_cpu_subclassrange_min_offset(prev);
+    }
 
     /// Producer-position trace spec. A consumer's `args` name the result
     /// positions of earlier producers in the same spec slice, so no op-arg
