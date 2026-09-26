@@ -1142,6 +1142,50 @@ impl TraceCtx {
         Some(Value::Ref(majit_ir::GcRef(ptr as usize)))
     }
 
+    /// `executor.py` `do_newstr` concrete execution for `pyjitpl.py
+    /// opimpl_newstr`: `cpu.bh_newstr(length)`.  Same rooting contract as
+    /// [`Self::execute_new_allocation`]: the caller stamps the result onto
+    /// the recorded `NEWSTR` before any GC allocation.
+    pub fn execute_newstr(&self, length: i64) -> Option<Value> {
+        let cpu = unsafe { &*self.cpu? };
+        if length < 0 {
+            return None;
+        }
+        let ptr = cpu.bh_newstr(length);
+        if ptr == 0 {
+            return None;
+        }
+        Some(Value::Ref(majit_ir::GcRef(ptr as usize)))
+    }
+
+    /// `executor.py` `do_strsetitem` concrete execution for `pyjitpl.py
+    /// opimpl_strsetitem`: `cpu.bh_strsetitem(string, index, newchar)`.
+    pub fn execute_strsetitem(&self, string: i64, index: i64, newchar: i64) -> bool {
+        let Some(cpu) = self.cpu.map(|cpu| unsafe { &*cpu }) else {
+            return false;
+        };
+        cpu.bh_strsetitem(string, index, newchar);
+        true
+    }
+
+    /// `executor.py` `do_copystrcontent` concrete execution for `pyjitpl.py
+    /// opimpl_copystrcontent`: `cpu.bh_copystrcontent(src, dst, srcstart,
+    /// dststart, length)`.
+    pub fn execute_copystrcontent(
+        &self,
+        src: i64,
+        dst: i64,
+        srcstart: i64,
+        dststart: i64,
+        length: i64,
+    ) -> bool {
+        let Some(cpu) = self.cpu.map(|cpu| unsafe { &*cpu }) else {
+            return false;
+        };
+        cpu.bh_copystrcontent(src, dst, srcstart, dststart, length);
+        true
+    }
+
     /// `executor.py:200 do_getfield_raw_{i,r,f}` analog — read a raw
     /// field at `struct_ptr + descr.offset` via `cpu.bh_getfield_raw_*`.
     /// Distinct from [`Self::field_sanity_load`] which dispatches the GC
@@ -1421,6 +1465,18 @@ impl TraceCtx {
         };
         self.heap_cache
             .invalidate_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value)
+    }
+
+    /// `heapcache.py invalidate_caches(opnum, descr, *argboxes)`, the call
+    /// `pyjitpl.py _record_helper` makes before recording a fixed-arity op.
+    pub fn heapcache_invalidate_caches(&mut self, opnum: majit_ir::OpCode, argboxes: &[OpRef]) {
+        let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
+        let const_value = |opref: OpRef| match opref.inline_const_to_value() {
+            Some(Value::Int(n)) => Some(n),
+            _ => None,
+        };
+        self.heap_cache
+            .invalidate_caches(opnum, None, argboxes, oracle, const_value)
     }
 
     /// pyjitpl.py:1087 parity: check if a quasi-immut guard is pending.

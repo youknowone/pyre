@@ -805,13 +805,39 @@ pub(crate) fn guard_class_record<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// How `strgetitem` encodes its index operand.
+/// The box and live value of the int operand at `operand_offset`.
 ///
-/// `ri>i` reads an i-bank register; `rc>i` is the `USE_C_FORM` sibling
-/// (`assembler.py`) whose index is one inline signed byte.
-pub(crate) enum StrGetitemIndex {
-    Reg,
-    Const,
+/// An `i` argcode reads an i-bank register; `c` is the `USE_C_FORM`
+/// sibling (`assembler.py`) whose value is one inline signed byte
+/// (`signedord`, `blackhole.py`).
+fn int_operand<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Result<(OpRef, Option<i64>), DispatchError> {
+    if op.argcodes.as_bytes().get(operand_offset) == Some(&b'c') {
+        let n = code[op.pc + 1 + operand_offset] as i8 as i64;
+        return Ok((OpRef::ConstInt(n), Some(n)));
+    }
+    let boxed = read_int_reg(code, op, operand_offset, ctx)?;
+    let value = match boxed.inline_const_to_value() {
+        Some(majit_ir::Value::Int(n)) => Some(n),
+        _ => ctx
+            .trace_ctx
+            .box_value(boxed)
+            .and_then(|value| match value {
+                majit_ir::Value::Int(n) => Some(n),
+                _ => None,
+            }),
+    }
+    .or_else(
+        || match read_int_reg_concrete(code, op, operand_offset, ctx) {
+            ConcreteValue::Int(n) => Some(n),
+            _ => None,
+        },
+    );
+    Ok((boxed, value))
 }
 
 /// `pyjitpl.py opimpl_strlen` — `return self.execute(rop.STRLEN, strbox)`.
@@ -852,31 +878,10 @@ pub(crate) fn opimpl_strgetitem<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_, Sym>,
-    index_kind: StrGetitemIndex,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let string = read_ref_reg(code, op, 0, ctx)?;
-    let index = match index_kind {
-        StrGetitemIndex::Reg => read_int_reg(code, op, 1, ctx)?,
-        StrGetitemIndex::Const => OpRef::ConstInt(code[op.pc + 2] as i8 as i64),
-    };
+    let (index, index_value) = int_operand(code, op, 1, ctx)?;
     let cpu = crate::pyre_cpu::shared();
-    let index_value = match index.inline_const_to_value() {
-        Some(majit_ir::Value::Int(n)) => Some(n),
-        _ => ctx
-            .trace_ctx
-            .box_value(index)
-            .and_then(|value| match value {
-                majit_ir::Value::Int(n) => Some(n),
-                _ => None,
-            }),
-    }
-    .or_else(|| match index_kind {
-        StrGetitemIndex::Reg => match read_int_reg_concrete(code, op, 1, ctx) {
-            ConcreteValue::Int(n) => Some(n),
-            _ => None,
-        },
-        StrGetitemIndex::Const => Some(code[op.pc + 2] as i8 as i64),
-    });
     let resvalue = concrete_ref_operand_ptr(code, op, 0, string, ctx)
         .zip(index_value)
         .and_then(|(ptr, index_value)| {
@@ -894,5 +899,125 @@ pub(crate) fn opimpl_strgetitem<Sym: WalkSym>(
     let dst = code[op.pc + 3] as usize;
     let concrete = concrete_from_recorded_opref(ctx, result);
     write_int_reg(ctx, op.pc, dst, result, concrete)?;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// Whether `[start, start + length)` lies inside the live STR at `string`,
+/// the range `llmodel.py bh_strsetitem` / `bh_copystrcontent` assume.
+fn str_range_in_bounds(string: i64, start: i64, length: i64) -> bool {
+    let len = pyre_object::lowlevel_string::bh_lowlevel_string_len(string) as i64;
+    start >= 0 && length >= 0 && start.checked_add(length).is_some_and(|stop| stop <= len)
+}
+
+/// `pyjitpl.py opimpl_newstr` — `return self.execute(rop.NEWSTR, lengthbox)`.
+///
+/// Operand layout `i>r` / `c>r`: 1B length (i-reg or signed immediate) +
+/// 1B r-dst.  `executor.execute` allocates the STR through
+/// `cpu.bh_newstr`; the recorded op's value cell roots it.
+pub(crate) fn opimpl_newstr<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let (length, length_value) = int_operand(code, op, 0, ctx)?;
+    let cpu = crate::pyre_cpu::shared();
+    let resvalue = length_value.and_then(|n| ctx.trace_ctx.execute_newstr(n));
+    ctx.trace_ctx
+        .heapcache_invalidate_caches(OpCode::Newstr, &[length]);
+    let result = ctx.trace_ctx.execute_and_record(
+        Some(cpu.as_ref()),
+        OpCode::Newstr,
+        None,
+        &[length],
+        resvalue,
+        0,
+    );
+    let dst = code[op.pc + 2] as usize;
+    let concrete = match resvalue {
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) => {
+            ConcreteValue::Ref(ptr as pyre_object::PyObjectRef)
+        }
+        _ => ConcreteValue::Null,
+    };
+    write_ref_reg(ctx, op.pc, dst, result, concrete)?;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// `pyjitpl.py opimpl_strsetitem` —
+/// `return self.execute(rop.STRSETITEM, strbox, indexbox, newcharbox)`.
+///
+/// Operand layout `rii` and its `c` forms: 1B r-reg(string) + index +
+/// newchar.  The store runs when every operand is live.  Only a buffer
+/// still being filled is ever stored into (`rstr.py` strings are immutable
+/// once built), and the store is idempotent, so the interpreter repeating
+/// it after the walk writes the same byte.
+pub(crate) fn opimpl_strsetitem<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let string = read_ref_reg(code, op, 0, ctx)?;
+    let (index, index_value) = int_operand(code, op, 1, ctx)?;
+    let (newchar, newchar_value) = int_operand(code, op, 2, ctx)?;
+    if let Some(ptr) = concrete_ref_operand_ptr(code, op, 0, string, ctx)
+        && let (Some(index_value), Some(newchar_value)) = (index_value, newchar_value)
+        && str_range_in_bounds(ptr, index_value, 1)
+        && (0..=0xff).contains(&newchar_value)
+    {
+        ctx.trace_ctx
+            .execute_strsetitem(ptr, index_value, newchar_value);
+    }
+    let args = [string, index, newchar];
+    ctx.trace_ctx
+        .heapcache_invalidate_caches(OpCode::Strsetitem, &args);
+    let cpu = crate::pyre_cpu::shared();
+    ctx.trace_ctx
+        .execute_and_record(Some(cpu.as_ref()), OpCode::Strsetitem, None, &args, None, 0);
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// `pyjitpl.py opimpl_copystrcontent` — `return self.execute(
+/// rop.COPYSTRCONTENT, srcbox, dstbox, srcstartbox, dststartbox,
+/// lengthbox)`.
+///
+/// Operand layout `rriii` and its `c` forms.  The copy runs under the same
+/// rule as [`opimpl_strsetitem`].
+pub(crate) fn opimpl_copystrcontent<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let src = read_ref_reg(code, op, 0, ctx)?;
+    let dst = read_ref_reg(code, op, 1, ctx)?;
+    let (srcstart, srcstart_value) = int_operand(code, op, 2, ctx)?;
+    let (dststart, dststart_value) = int_operand(code, op, 3, ctx)?;
+    let (length, length_value) = int_operand(code, op, 4, ctx)?;
+    if let Some(src_ptr) = concrete_ref_operand_ptr(code, op, 0, src, ctx)
+        && let Some(dst_ptr) = concrete_ref_operand_ptr(code, op, 1, dst, ctx)
+        && let (Some(srcstart_value), Some(dststart_value), Some(length_value)) =
+            (srcstart_value, dststart_value, length_value)
+        && str_range_in_bounds(src_ptr, srcstart_value, length_value)
+        && str_range_in_bounds(dst_ptr, dststart_value, length_value)
+    {
+        ctx.trace_ctx.execute_copystrcontent(
+            src_ptr,
+            dst_ptr,
+            srcstart_value,
+            dststart_value,
+            length_value,
+        );
+    }
+    let args = [src, dst, srcstart, dststart, length];
+    ctx.trace_ctx
+        .heapcache_invalidate_caches(OpCode::Copystrcontent, &args);
+    let cpu = crate::pyre_cpu::shared();
+    ctx.trace_ctx.execute_and_record(
+        Some(cpu.as_ref()),
+        OpCode::Copystrcontent,
+        None,
+        &args,
+        None,
+        0,
+    );
     Ok((DispatchOutcome::Continue, op.next_pc))
 }

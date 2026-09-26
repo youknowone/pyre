@@ -2982,6 +2982,35 @@ fn run_hint_step_full(
     regs_f: &mut [OpRef],
     descr_pool: &[DescrRef],
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
+    with_hint_walk_context(
+        tc,
+        regs_r,
+        concrete_r,
+        regs_i,
+        concrete_i,
+        regs_f,
+        descr_pool,
+        |wc| step(code, 0, wc),
+    )
+}
+
+/// Run `run` against the walk context [`run_hint_step_full`] builds, then
+/// copy the register banks back.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one parameter per register bank the walk context carries; \
+              bundling them would hide which bank a test leaves empty"
+)]
+fn with_hint_walk_context<R>(
+    tc: &mut TraceCtx,
+    regs_r: &mut [OpRef],
+    concrete_r: &mut [ConcreteValue],
+    regs_i: &mut [OpRef],
+    concrete_i: &mut [ConcreteValue],
+    regs_f: &mut [OpRef],
+    descr_pool: &[DescrRef],
+    run: impl FnOnce(&mut WalkContext<'_, '_, crate::state::PyreSym>) -> R,
+) -> R {
     // Guard-emitting arms need a resolvable outer resume coordinate for the
     // snapshot; record-only arms ignore these two fields.
     let outer_jitcode_index = test_outer_resume_jitcode_index();
@@ -3027,7 +3056,7 @@ fn run_hint_step_full(
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let result = step(code, 0, &mut wc);
+    let result = run(&mut wc);
     regs_f.copy_from_slice(&wc.registers_f.to_vec());
     regs_i.copy_from_slice(&wc.registers_i.to_vec());
     regs_r.copy_from_slice(&wc.registers_r.to_vec());
@@ -9907,6 +9936,147 @@ fn strlen_and_strgetitem_keys_have_walker_arms() {
                 .is_none_or(|e| !matches!(e, DispatchError::UnsupportedOpname { .. })),
             "{key} must have a walker arm, got {err:?}"
         );
+    }
+}
+
+/// Dispatch `key` through [`handle`] with `operands` as its operand bytes.
+/// A key no built JitCode emits has no byte in the insns table to step.
+fn run_keyed_step(
+    key: &'static str,
+    operands: &[u8],
+    tc: &mut TraceCtx,
+    regs_r: &mut [OpRef],
+    regs_i: &mut [OpRef],
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let (opname, argcodes) = key.split_once('/').expect("opname/argcodes key");
+    let code: Vec<u8> = std::iter::once(0).chain(operands.iter().copied()).collect();
+    let op = DecodedOp {
+        key,
+        opname,
+        argcodes,
+        pc: 0,
+        next_pc: code.len(),
+    };
+    let mut concrete_r = vec![ConcreteValue::Null; regs_r.len()];
+    with_hint_walk_context(
+        tc,
+        regs_r,
+        &mut concrete_r,
+        regs_i,
+        &mut [],
+        &mut [],
+        &[],
+        |wc| handle(&op, &code, wc),
+    )
+}
+
+#[test]
+fn newstr_strsetitem_copystrcontent_record_their_operands() {
+    // `pyjitpl.py opimpl_newstr` / `opimpl_strsetitem` /
+    // `opimpl_copystrcontent`: each form records its op over the decoded
+    // operands, `c` bytes as ConstInt.
+    let mut tc = fresh_trace_ctx();
+    let r = [
+        tc.record_op(majit_ir::OpCode::IntAdd, &[]),
+        tc.record_op(majit_ir::OpCode::IntAdd, &[]),
+    ];
+    let i = [
+        tc.record_op(majit_ir::OpCode::IntAdd, &[]),
+        tc.record_op(majit_ir::OpCode::IntAdd, &[]),
+        tc.record_op(majit_ir::OpCode::IntAdd, &[]),
+    ];
+    let c = OpRef::ConstInt;
+    use majit_ir::OpCode::{Copystrcontent, Newstr, Strsetitem};
+    let cases: Vec<(&'static str, Vec<u8>, majit_ir::OpCode, Vec<OpRef>)> = vec![
+        ("newstr/i>r", vec![0, 0], Newstr, vec![i[0]]),
+        ("newstr/c>r", vec![5, 0], Newstr, vec![c(5)]),
+        (
+            "strsetitem/rii",
+            vec![0, 0, 1],
+            Strsetitem,
+            vec![r[0], i[0], i[1]],
+        ),
+        (
+            "strsetitem/rci",
+            vec![0, 3, 1],
+            Strsetitem,
+            vec![r[0], c(3), i[1]],
+        ),
+        (
+            "strsetitem/ric",
+            vec![0, 0, 97],
+            Strsetitem,
+            vec![r[0], i[0], c(97)],
+        ),
+        (
+            "strsetitem/rcc",
+            vec![0, 3, 97],
+            Strsetitem,
+            vec![r[0], c(3), c(97)],
+        ),
+        (
+            "copystrcontent/rriii",
+            vec![0, 1, 0, 1, 2],
+            Copystrcontent,
+            vec![r[0], r[1], i[0], i[1], i[2]],
+        ),
+        (
+            "copystrcontent/rrcii",
+            vec![0, 1, 4, 1, 2],
+            Copystrcontent,
+            vec![r[0], r[1], c(4), i[1], i[2]],
+        ),
+        (
+            "copystrcontent/rrici",
+            vec![0, 1, 0, 4, 2],
+            Copystrcontent,
+            vec![r[0], r[1], i[0], c(4), i[2]],
+        ),
+        (
+            "copystrcontent/rriic",
+            vec![0, 1, 0, 1, 4],
+            Copystrcontent,
+            vec![r[0], r[1], i[0], i[1], c(4)],
+        ),
+        (
+            "copystrcontent/rrcci",
+            vec![0, 1, 4, 5, 2],
+            Copystrcontent,
+            vec![r[0], r[1], c(4), c(5), i[2]],
+        ),
+        (
+            "copystrcontent/rrcic",
+            vec![0, 1, 4, 1, 6],
+            Copystrcontent,
+            vec![r[0], r[1], c(4), i[1], c(6)],
+        ),
+        (
+            "copystrcontent/rricc",
+            vec![0, 1, 0, 5, 6],
+            Copystrcontent,
+            vec![r[0], r[1], i[0], c(5), c(6)],
+        ),
+        (
+            "copystrcontent/rrccc",
+            vec![0, 1, 4, 5, 6],
+            Copystrcontent,
+            vec![r[0], r[1], c(4), c(5), c(6)],
+        ),
+    ];
+    for (key, operands, opcode, args) in cases {
+        let mut regs_r = r;
+        let mut regs_i = i;
+        let (outcome, next_pc) = run_keyed_step(key, &operands, &mut tc, &mut regs_r, &mut regs_i)
+            .unwrap_or_else(|err| panic!("{key} must dispatch, got {err:?}"));
+        assert_eq!(outcome, DispatchOutcome::Continue, "{key}");
+        assert_eq!(next_pc, operands.len() + 1, "{key}");
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, opcode, "{key}");
+        let recorded: Vec<OpRef> = last.getarglist().iter().map(|a| a.to_opref()).collect();
+        assert_eq!(recorded, args, "{key}");
+        if opcode == Newstr {
+            assert_ne!(regs_r[0], r[0], "{key} writes its dst register");
+        }
     }
 }
 
