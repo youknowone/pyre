@@ -115,29 +115,35 @@ pub fn with_writable<F: FnOnce()>(addr: *mut u8, len: usize, f: F) {
 ///
 /// Upstream aarch64 brackets the same walk with `rmmap.enter_assembler_writing()`
 /// / `leave_assembler_writing()`; [`with_writable`] is that bracket.  One
-/// naturally-aligned four-byte store per site and nothing else, so a thread
-/// executing the loop reads either the placeholder or the finished branch:
-/// on x86-64 the four bytes are the `JMP rel32` displacement, on aarch64 they
-/// are the whole `B imm26` instruction word, one of the encodings the
-/// architecture names as safe to modify while another PE executes it.
+/// naturally-aligned store per site and nothing else, so a thread executing
+/// the loop reads either the placeholder or the finished branch: on x86-64 the
+/// eight bytes are the `NOP` the guard emitted and the `JMP rel32` replacing
+/// it, on aarch64 the four bytes are the whole `B imm26` instruction word, one
+/// of the encodings the architecture names as safe to modify while another PE
+/// executes it.
 ///
 /// The store is what has to be indivisible; the page being RW around it is a
 /// property of [`with_writable`] itself, shared with the bridge attachment in
 /// `patch_jump_for_descr`, which patches live code the same way.
 pub fn write_invalidate_positions(positions: &[majit_backend::InvalidatePosition]) {
+    #[cfg(target_arch = "x86_64")]
+    type Word = std::sync::atomic::AtomicU64;
+    #[cfg(not(target_arch = "x86_64"))]
+    type Word = std::sync::atomic::AtomicU32;
+    let width = std::mem::size_of::<Word>();
     for position in positions {
         debug_assert_eq!(
-            position.addr % 4,
+            position.addr % width,
             0,
             "invalidate position {:#x} is not word-aligned; the store would not be atomic",
             position.addr
         );
-        with_writable(position.addr as *mut u8, 4, || unsafe {
+        with_writable(position.addr as *mut u8, width, || unsafe {
             // Require one indivisible word store even when LLVM knows more
             // about the instruction bytes than the native code reader does.
             // The cache flush in with_writable publishes it to instruction fetch.
-            std::sync::atomic::AtomicU32::from_ptr(position.addr as *mut u32)
-                .store(position.word, std::sync::atomic::Ordering::Relaxed);
+            Word::from_ptr(position.addr as *mut _)
+                .store(position.word as _, std::sync::atomic::Ordering::Relaxed);
         });
     }
 }
