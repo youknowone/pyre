@@ -11577,7 +11577,10 @@ pub fn lookup_exc_class_obj(w_name: PyObjectRef) -> PyObjectRef {
     if w_name.is_null() {
         return pyre_object::PY_NULL;
     }
-    let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) };
+    // No exception class is named by a lone surrogate.
+    let Some(name) = (unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) }) else {
+        return pyre_object::PY_NULL;
+    };
     lookup_exc_class(name).unwrap_or(pyre_object::PY_NULL)
 }
 

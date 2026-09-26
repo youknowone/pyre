@@ -12134,7 +12134,8 @@ pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> Wtf8Buf {
     let module = lookup_in_type_where(
         w_type,
         pyre_object::unicodeobject::box_str_constant(Wtf8::new("__module__")),
-    ).filter(|m| is_str(*m));
+    )
+    .filter(|m| is_str(*m));
     match module {
         Some(m) => {
             let module = unsafe { w_str_get_wtf8(m) };

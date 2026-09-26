@@ -557,7 +557,10 @@ pub unsafe fn _getdictvalue_no_unwrapping_pure_w(
     version_tag: u64,
 ) -> PyObjectRef {
     let _ = version_tag;
-    let key = unsafe { crate::unicodeobject::w_str_get_value(w_key) };
+    // Module storage is keyed by `&str`; a lone-surrogate name is never in it.
+    let Some(key) = (unsafe { crate::unicodeobject::w_str_get_value_opt(w_key) }) else {
+        return std::ptr::null_mut();
+    };
     unsafe { crate::dictmultiobject::w_module_dict_module_storage(w_dict).get(key) }
         .unwrap_or(std::ptr::null_mut())
 }
