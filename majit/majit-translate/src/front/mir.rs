@@ -18316,12 +18316,9 @@ impl<'a> Lowering<'a> {
                         self.exchange_deref_word(mir_bb, &place, args[1].clone())?
                     {
                         old
-                    } else if let Some(old) = self.exchange_deref_aggregate(
-                        mir_bb,
-                        &place,
-                        args[1].clone(),
-                        address,
-                    )? {
+                    } else if let Some(old) =
+                        self.exchange_deref_aggregate(mir_bb, &place, args[1].clone(), address)?
+                    {
                         old
                     } else {
                         return Ok(false);
@@ -18346,11 +18343,13 @@ impl<'a> Lowering<'a> {
                     (self.bare_deref_place(&slot0), self.bare_deref_place(&slot1))
                     && self.move_plan(&place0.ty).is_some()
                 {
-                    let Some(old0) = self.read_moved_aggregate(mir_bb, &place0, address0.clone())?
+                    let Some(old0) =
+                        self.read_moved_aggregate(mir_bb, &place0, address0.clone())?
                     else {
                         return Ok(false);
                     };
-                    let Some(old1) = self.read_moved_aggregate(mir_bb, &place1, address1.clone())?
+                    let Some(old1) =
+                        self.read_moved_aggregate(mir_bb, &place1, address1.clone())?
                     else {
                         return Ok(false);
                     };

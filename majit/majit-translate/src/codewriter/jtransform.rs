@@ -11813,17 +11813,19 @@ mod tests {
             .push_op_var(graph.startblock, OpKind::ConstInt(0), true)
             .unwrap();
         let word = crate::layout::target_word_size();
-        graph.blocks[graph.startblock.0].operations.push(SpaceOperation {
-            result: None,
-            kind: OpKind::RawStore {
-                base: addr.clone(),
-                offset: zero.clone(),
-                value: ptr.clone(),
-                item_ty: ValueType::Ref(None),
-                itemsize: word,
-                is_item_signed: false,
-            },
-        });
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::RawStore {
+                    base: addr.clone(),
+                    offset: zero.clone(),
+                    value: ptr.clone(),
+                    item_ty: ValueType::Ref(None),
+                    itemsize: word,
+                    is_item_signed: false,
+                },
+            });
         let _loaded = graph
             .push_op_var(
                 graph.startblock,
@@ -11882,7 +11884,9 @@ mod tests {
             "the address is rewrite_op_getsubstruct's int_add; ops={ops:?}"
         );
 
-        let load = ops.iter().find(|op| matches!(&op.kind, OpKind::RawLoad { .. }));
+        let load = ops
+            .iter()
+            .find(|op| matches!(&op.kind, OpKind::RawLoad { .. }));
         let load = load.expect("raw_load");
         let loaded_int = load.result.clone().expect("raw_load result");
         assert_eq!(

@@ -485,15 +485,13 @@ mod tests {
             "header-view from_raw_parts must be gone"
         );
         assert!(
-            g.blocks[a.0].operations.iter().all(|op| {
-                !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as")
-            }),
+            g.blocks[a.0]
+                .operations
+                .iter()
+                .all(|op| { !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as") }),
             "the slice is the header, with no same_as copy"
         );
-        assert_eq!(
-            g.blocks[a.0].exits[0].args[0].as_variable(),
-            Some(&header)
-        );
+        assert_eq!(g.blocks[a.0].exits[0].args[0].as_variable(), Some(&header));
     }
 
     #[test]
@@ -541,14 +539,12 @@ mod tests {
         assert_eq!(rewire_from_raw_parts_sites(&mut g), 1);
         assert!(!residual_from_raw_parts(&g));
         assert!(
-            g.blocks[a.0].operations.iter().all(|op| {
-                !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as")
-            })
+            g.blocks[a.0]
+                .operations
+                .iter()
+                .all(|op| { !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as") })
         );
-        assert_eq!(
-            g.blocks[a.0].exits[0].args[0].as_variable(),
-            Some(&header)
-        );
+        assert_eq!(g.blocks[a.0].exits[0].args[0].as_variable(), Some(&header));
     }
 
     #[test]
@@ -740,10 +736,7 @@ mod tests {
             3,
             "header must be threaded onto the unique predecessor edge"
         );
-        assert_eq!(
-            frp.exits[0].args[0].as_variable(),
-            Some(&frp.inputargs[2])
-        );
+        assert_eq!(frp.exits[0].args[0].as_variable(), Some(&frp.inputargs[2]));
     }
 
     #[test]
