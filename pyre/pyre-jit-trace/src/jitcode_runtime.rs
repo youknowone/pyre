@@ -1482,16 +1482,18 @@ fn register_synthetic_struct_tids() {
 /// decodes off 2.6 MB of embedded records.  Two things to know before taking
 /// that on.
 ///
-/// **It is a first-JIT cost, not a startup one.**  This function is reachable
+/// **This rehydrate is a first-JIT cost, not a startup one.**  It is reachable
 /// only through `ensure_finish_setup`, and every caller of that sits on a JIT
 /// path — [`crate::state::intern_liveness`],
 /// [`crate::state::liveness_info_snapshot`], [`crate::state::op_live`],
 /// [`crate::state::blackhole_control_opcodes`],
 /// [`crate::state::setup_indirectcalltargets`],
 /// [`crate::state::bytecode_for_address`].  An interpreter that never traces
-/// never runs it.  Kind-0 descr minting is the same first-JIT pass
-/// ([`materialize_gccache_owned_descrs`]), which is easy to mistake for a
-/// startup cost when reading an allocation census.
+/// never runs it.  Kind-0 minting is not in that set:
+/// [`materialize_gccache_owned_descrs`] runs from `init_jit_hooks` before
+/// user code when the JIT is on.  Moving it onto the first trace makes
+/// `frame_chain` allocate about 1.8 TiB.  The call below is the `Once`
+/// hitting an already-published table, then the EffectInfo and Call passes.
 ///
 /// **Its size is not currently measured, and two obvious instruments cannot
 /// measure it.**  Allocation here is mmap-backed, so `malloc_history` / `heap`

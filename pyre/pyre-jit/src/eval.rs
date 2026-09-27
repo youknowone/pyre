@@ -8170,8 +8170,8 @@ pub fn init_jit_hooks() {
     // `GcLLDescr_framework.init_size_descr` publishes Size tids before the
     // translated program runs. Doing it on the first trace instead makes
     // `frame_chain` allocate ~1.8 TiB and Windows exits 3221226505.
-    // `PYRE_JIT=0` / `PYRE_NO_JIT` never need the table. The decode runs on
-    // a fresh stack; the close hook still covers a trace that wins the race.
+    // `PYRE_JIT=0` / `PYRE_NO_JIT` never need the table. Boot decodes on
+    // this stack; the close hook uses a fresh stack if a trace wins the race.
     if env_var_os("PYRE_NO_JIT").is_none() && env_var("PYRE_JIT").as_deref() != Some("0") {
         pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs_on_caller_stack();
     }
