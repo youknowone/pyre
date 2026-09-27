@@ -3382,7 +3382,9 @@ impl<'a> Transformer<'a> {
             // `mod` is handled separately: RPython does not provide
             // `float_mod` (`rpython/rtyper/lltypesystem/lloperation.py`
             // "don't implement float_mod, use math.fmod instead"), so
-            // `%` over floats lowers to a residual `ll_math_fmod` call.
+            // `%` over floats lowers to a residual call of the C `fmod`
+            // llexternal `ll_math::math_fmod`, which is what Rust's `%` over
+            // two `f64`s computes.
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
@@ -3507,7 +3509,7 @@ impl<'a> Transformer<'a> {
                 let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, lhs);
                 let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(graph, rhs);
                 ops.extend(rhs_ops);
-                let target = CallTarget::function_path(["ll_math_fmod"]);
+                let target = CallTarget::function_path(["ll_math", "math_fmod"]);
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 ops.push(funcptr_op);
                 ops.push(SpaceOperation {
@@ -12971,7 +12973,7 @@ mod tests {
     }
 
     #[test]
-    fn transform_graph_lowers_float_mod_to_ll_math_fmod_residual_call() {
+    fn transform_graph_lowers_float_mod_to_math_fmod_residual_call() {
         let mut graph = FunctionGraph::new("float_mod");
         let lhs_var = graph
             .push_op_var(
@@ -13031,7 +13033,10 @@ mod tests {
             other => panic!("expected cast_int_to_float, got {other:?}"),
         };
         let expected_fnaddr =
-            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["ll_math_fmod"]));
+            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path([
+                "ll_math",
+                "math_fmod",
+            ]));
         assert!(matches!(&ops[3].kind, OpKind::ConstInt(fnaddr) if *fnaddr == expected_fnaddr));
         match &ops[4].kind {
             OpKind::CallResidual {

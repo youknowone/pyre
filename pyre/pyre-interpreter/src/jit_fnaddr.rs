@@ -3573,10 +3573,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         for (module_path, root_path, f) in binary {
             cpa2(&mut entries, module_path, root_path, f);
         }
-        // `%` over two floats: `lloperation.py` has no `float_mod`, so the
-        // codewriter lowers it to a residual call of this name carrying the
-        // C `fmod` signature rather than the raising wrapper's.
-        cp2(&mut entries, "ll_math_fmod", m::math_fmod);
     }
 
     if let Some(hooks) = crate::importing::optional_module_hooks() {
@@ -5691,7 +5687,7 @@ mod tests {
     }
 
     /// The `ll_math.py` C llexternals are core: float `**` and `%` call
-    /// `math_pow` / `ll_math_fmod` with no `math` module linked, and a missing
+    /// `math_pow` / `math_fmod` with no `math` module linked, and a missing
     /// address leaves the float `**` descent unable to record its call.
     #[test]
     fn jit_trace_fnaddrs_covers_ll_math_llexternals_without_optional_modules() {
@@ -5716,7 +5712,6 @@ mod tests {
                 "the crate-root {leaf} alias must resolve to the same address"
             );
         }
-        assert_eq!(bindings.get("ll_math_fmod"), bindings.get("math_fmod"));
     }
 
     #[test]

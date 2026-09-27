@@ -233,7 +233,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                             // `blackhole.py bhimpl_float_eq`).
                             // `mod` is also Float when a Float operand is
                             // present, but jtransform lowers it to the
-                            // residual `ll_math_fmod` helper rather than a
+                            // residual `ll_math::math_fmod` call rather than a
                             // non-RPython `float_mod` opcode.
                             let is_compare =
                                 matches!(opname.as_str(), "lt" | "le" | "gt" | "ge" | "eq" | "ne");

@@ -61,7 +61,7 @@ math_unary! {
 
 /// `math_fmod = llexternal('fmod', ...)`. Also what `%` over two floats
 /// lowers to: `lloperation.py` has no `float_mod`, so the codewriter emits a
-/// residual call of `ll_math_fmod` carrying this C signature.
+/// residual call of this llexternal.
 pub extern "C" fn math_fmod(x: f64, y: f64) -> f64 {
     x % y
 }
