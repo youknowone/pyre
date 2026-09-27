@@ -60,11 +60,13 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, pyre_interpreter::PyError
                     return Ok(floatobject::w_float_get_value(result));
                 }
             }
-            // descroperation.py:891 — a non-float result (including int/long)
-            // is rejected rather than coerced.
-            let result_type = unsafe { pyre_object::type_name_of(result) };
+            // A non-float result (including int/long) is rejected rather than
+            // coerced, and `_PyNumber_Float` names the receiver's class beside
+            // it, unquoted, the way the deprecation above does.
+            let value_type = pyre_interpreter::type_methods::arg_type_name(obj);
+            let result_type = pyre_interpreter::type_methods::arg_type_name(result);
             return Err(pyre_interpreter::PyError::type_error(format!(
-                "__float__ returned non-float (type '{result_type}')",
+                "{value_type}.__float__ returned non-float (type {result_type})",
             )));
         }
         Ok(None) => {}

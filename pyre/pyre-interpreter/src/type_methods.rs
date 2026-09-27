@@ -4514,7 +4514,7 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
                 Ok(crate::baseobjspace::str_utf8_w(o)?.to_string())
             }
             Some(o) => {
-                let tname = unsafe { pyre_object::type_name_of(o) };
+                let tname = crate::error::type_name_of(o);
                 Err(crate::PyError::type_error(format!(
                     "expected str, got {tname} object"
                 )))

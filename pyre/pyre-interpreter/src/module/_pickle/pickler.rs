@@ -1574,7 +1574,7 @@ fn save_reduce_value(
     } else {
         Err(pickling_error(format!(
             "__reduce__ must return a string or tuple, not {}",
-            unsafe { pyre_object::type_name_of(w_rv) }
+            crate::error::type_name_of(w_rv)
         )))
     };
     result.map_err(|err| {
@@ -3319,13 +3319,13 @@ fn save_reduce(
     if !crate::baseobjspace::callable_w(rv_get(0)) {
         return Err(pickling_error(format!(
             "first item of the tuple returned by __reduce__ must be callable, not {}",
-            unsafe { pyre_object::type_name_of(rv_get(0)) }
+            crate::error::type_name_of(rv_get(0))
         )));
     }
     if !unsafe { pyre_object::is_tuple(rv_get(1)) } {
         return Err(pickling_error(format!(
             "second item of the tuple returned by __reduce__ must be a tuple, not {}",
-            unsafe { pyre_object::type_name_of(rv_get(1)) }
+            crate::error::type_name_of(rv_get(1))
         )));
     }
 
@@ -3341,19 +3341,19 @@ fn save_reduce(
     if has_listitems && crate::baseobjspace::findattr_result(rv_get(3), "__next__")?.is_none() {
         return Err(pickling_error(format!(
             "fourth item of the tuple returned by __reduce__ must be an iterator, not {}",
-            unsafe { pyre_object::type_name_of(rv_get(3)) }
+            crate::error::type_name_of(rv_get(3))
         )));
     }
     if has_dictitems && crate::baseobjspace::findattr_result(rv_get(4), "__next__")?.is_none() {
         return Err(pickling_error(format!(
             "fifth item of the tuple returned by __reduce__ must be an iterator, not {}",
-            unsafe { pyre_object::type_name_of(rv_get(4)) }
+            crate::error::type_name_of(rv_get(4))
         )));
     }
     if has_state_setter && !crate::baseobjspace::callable_w(rv_get(5)) {
         return Err(pickling_error(format!(
             "sixth item of the tuple returned by __reduce__ must be callable, not {}",
-            unsafe { pyre_object::type_name_of(rv_get(5)) }
+            crate::error::type_name_of(rv_get(5))
         )));
     }
 
@@ -3387,13 +3387,13 @@ fn save_reduce(
         if !unsafe { pyre_object::is_tuple(args_get(1)) } {
             return Err(pickling_error(format!(
                 "second argument to __newobj_ex__() must be a tuple, not {}",
-                unsafe { pyre_object::type_name_of(args_get(1)) }
+                crate::error::type_name_of(args_get(1))
             )));
         }
         if !unsafe { pyre_object::is_dict(args_get(2)) } {
             return Err(pickling_error(format!(
                 "third argument to __newobj_ex__() must be a dict, not {}",
-                unsafe { pyre_object::type_name_of(args_get(2)) }
+                crate::error::type_name_of(args_get(2))
             )));
         }
         if let Some(slot) = w_obj_slot {

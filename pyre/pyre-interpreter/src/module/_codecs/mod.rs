@@ -166,6 +166,17 @@ fn wrong_exception_type(w_exc: PyObjectRef) -> crate::PyError {
     ))
 }
 
+/// `_PyUnicodeError_GetParams`'s complaint when the `object` slot holds the
+/// wrong kind: bytes for a decode error, text for the other two.
+///
+/// One owner for the wording, because the handler bodies read the slot again
+/// without converting and must answer the same thing the shared validator does.
+fn object_attribute_type_error(expected: &str) -> crate::PyError {
+    crate::PyError::type_error(format!(
+        "UnicodeError 'object' attribute must be a {expected}"
+    ))
+}
+
 /// The one reader every handler goes through, `_PyUnicodeError_GetParams`.
 ///
 /// It type-checks the argument before anything else, then reads `object`,
@@ -198,10 +209,11 @@ fn check_exception(w_exc: PyObjectRef) -> Result<CodecException, crate::PyError>
         unsafe { crate::baseobjspace::isinstance_str_w(w_obj) }
     };
     if !obj_ok {
-        let expected = if obj_is_bytes { "bytes" } else { "string" };
-        return Err(crate::PyError::type_error(format!(
-            "UnicodeError 'object' attribute must be a {expected}"
-        )));
+        return Err(object_attribute_type_error(if obj_is_bytes {
+            "bytes"
+        } else {
+            "string"
+        }));
     }
     // Both indices are plain machine words on the exception, zero until a
     // constructor writes them, and a slot holding something that is not an
@@ -394,8 +406,12 @@ fn backslashreplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
                 .collect::<String>()
         }
         Some(pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError) => {
+            // `check_exception` reads this slot and refuses a decode error whose
+            // `object` is not bytes, so this cannot fire.  It stands because the
+            // read below is unchecked, and it answers what the shared validator
+            // answers rather than a wording neither upstream has.
             if !unsafe { pyre_object::is_bytes(exc.w_obj) } {
-                return Err(crate::PyError::type_error("wrong exception"));
+                return Err(object_attribute_type_error("bytes"));
             }
             let data = unsafe { w_bytes_data(exc.w_obj) };
             let end = exc.end.min(data.len());
@@ -512,8 +528,12 @@ fn surrogatepass_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         }
         Some(pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError) => {
             let (byte_len, encoding) = exception_encoding(&exc)?;
+            // `check_exception` reads this slot and refuses a decode error whose
+            // `object` is not bytes, so this cannot fire.  It stands because the
+            // read below is unchecked, and it answers what the shared validator
+            // answers rather than a wording neither upstream has.
             if !unsafe { pyre_object::is_bytes(exc.w_obj) } {
-                return Err(crate::PyError::type_error("wrong exception"));
+                return Err(object_attribute_type_error("bytes"));
             }
             let data = unsafe { w_bytes_data(exc.w_obj) };
             if exc.start + byte_len > data.len() {
@@ -567,8 +587,12 @@ fn surrogateescape_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             ))
         }
         Some(pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError) => {
+            // `check_exception` reads this slot and refuses a decode error whose
+            // `object` is not bytes, so this cannot fire.  It stands because the
+            // read below is unchecked, and it answers what the shared validator
+            // answers rather than a wording neither upstream has.
             if !unsafe { pyre_object::is_bytes(exc.w_obj) } {
-                return Err(crate::PyError::type_error("wrong exception"));
+                return Err(object_attribute_type_error("bytes"));
             }
             let data = unsafe { w_bytes_data(exc.w_obj) };
             let mut replacement = Wtf8Buf::new();

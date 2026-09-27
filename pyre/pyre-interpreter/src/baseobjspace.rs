@@ -2227,7 +2227,7 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "'{}' object is not subscriptable",
-            pyre_object::type_name_of(obj),
+            crate::error::type_name_of(obj),
         )))
     }
 }
@@ -4598,7 +4598,7 @@ pub(crate) fn setitem_slot(obj: PyObjectRef, index: PyObjectRef, value: PyObject
         }
         Err(PyError::type_error(format!(
             "'{}' object does not support item assignment",
-            pyre_object::type_name_of(obj),
+            crate::error::type_name_of(obj),
         )))
     }
 }
@@ -13157,7 +13157,7 @@ pub(crate) unsafe fn member_typecheck_error(
         "descriptor '{}' for '{}' objects doesn't apply to a '{}' object",
         pyre_object::w_member_get_name(descr),
         pyre_object::w_type_get_name(w_cls),
-        pyre_object::type_name_of(obj),
+        crate::error::type_name_of(obj),
     ))
 }
 
@@ -13520,7 +13520,7 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         if !is_type(w_newcls) {
             return Err(crate::PyError::type_error(format!(
                 "__class__ must be set to a class, not '{}' object",
-                pyre_object::type_name_of(w_newcls),
+                crate::error::type_name_of(w_newcls),
             )));
         }
         // objectobject.py:146-147 — get the old class
@@ -14162,7 +14162,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                     return Err(PyError::type_error(format!(
                         "can only assign string to {}.__qualname__, not '{}'",
                         w_type_get_name(obj),
-                        pyre_object::type_name_of(value)
+                        crate::error::type_name_of(value)
                     )));
                 }
                 crate::builtins::check_surrogate(value)?;
@@ -16429,7 +16429,7 @@ pub fn float_w(obj: PyObjectRef) -> Result<f64, PyError> {
     if unsafe { pyre_object::is_float(w_result) } {
         return Ok(unsafe { pyre_object::w_float_get_value(w_result) });
     }
-    Err(unsafe { PyError::from_exc_object(float_w_returned_non_float(w_result)) })
+    Err(unsafe { PyError::from_exc_object(float_w_returned_non_float(obj, w_result)) })
 }
 
 /// `DescrOperation.float` — `oefmt(space.w_TypeError, "must be real
@@ -16451,10 +16451,14 @@ pub(crate) fn float_w_must_be_real(obj: PyObjectRef) -> PyObjectRef {
 /// `DescrOperation.float` — `oefmt(space.w_TypeError, "__float__ returned
 /// non-float (type '%T')", w_result)`, shaped as
 /// [`float_w_must_be_real`].
+///
+/// `_PyNumber_Float` names the receiver's class first and quotes neither
+/// name, which is the answer 3.14.6 gives; the text cited above is PyPy's.
 #[majit_macros::dont_look_inside]
-pub(crate) fn float_w_returned_non_float(w_result: PyObjectRef) -> PyObjectRef {
+pub(crate) fn float_w_returned_non_float(obj: PyObjectRef, w_result: PyObjectRef) -> PyObjectRef {
     PyError::type_error(format!(
-        "__float__ returned non-float (type '{}')",
+        "{}.__float__ returned non-float (type {})",
+        object_functionstr_type_name(obj),
         object_functionstr_type_name(w_result)
     ))
     .to_exc_object()

@@ -6276,7 +6276,7 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
         }
     }
 
-    let mut err = pyre_interpreter::PyError::name_error_with_name(
+    let mut err = pyre_interpreter::PyError::oefmt_name_error_text(
         format!("name '{varname}' is not defined"),
         varname,
     );

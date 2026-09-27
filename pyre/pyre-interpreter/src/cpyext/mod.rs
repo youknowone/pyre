@@ -441,7 +441,7 @@ fn extension_import_error(message: String, name: &str, path: &Path) -> crate::Py
     let _ = roots.pin_root(pyre_object::w_str_new_managed(name));
     let path_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(crate::gateway::fsdecode_os_str(path.as_os_str()));
-    crate::PyError::import_error_name_path(
+    crate::PyError::new_import_error(
         message,
         pyre_object::gc_roots::shadow_stack_get(name_slot),
         pyre_object::gc_roots::shadow_stack_get(path_slot),

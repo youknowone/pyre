@@ -3069,7 +3069,7 @@ impl NamespaceOpcodeHandler for PyFrame {
             }
         }
         // `pyopcode.py _load_global_failed`: NameError.
-        Err(PyError::name_error_with_name(
+        Err(PyError::oefmt_name_error_text(
             format!("name '{name}' is not defined"),
             name,
         ))
@@ -3229,7 +3229,7 @@ pub unsafe fn delete_name_w(frame: &mut PyFrame, w_name: PyObjectRef) -> Result<
             let w_name = roots.get(name_slot);
             match unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) } {
                 Some(name) => {
-                    PyError::name_error_with_name(format!("name '{name}' is not defined"), name)
+                    PyError::oefmt_name_error_text(format!("name '{name}' is not defined"), name)
                 }
                 None => {
                     let text = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_name) };
@@ -5158,7 +5158,7 @@ impl OpcodeStepExecutor for PyFrame {
                             return Self::push_anchored(&anchor, value);
                         }
                     }
-                    return Err(PyError::name_error_with_name(
+                    return Err(PyError::oefmt_name_error_text(
                         format!("name '{name}' is not defined"),
                         name,
                     ));
@@ -5364,7 +5364,7 @@ impl OpcodeStepExecutor for PyFrame {
         };
         crate::baseobjspace::delitem(roots.get(locals_slot), key).map_err(|err| {
             if matches!(err.kind, PyErrorKind::KeyError) {
-                PyError::name_error_with_name(format!("name '{name}' is not defined"), name)
+                PyError::oefmt_name_error_text(format!("name '{name}' is not defined"), name)
             } else {
                 err
             }
@@ -5430,7 +5430,7 @@ impl OpcodeStepExecutor for PyFrame {
             None
         };
         let Some(bc) = bc else {
-            return Err(PyError::name_error_with_name(
+            return Err(PyError::oefmt_name_error_text(
                 "__build_class__ not found",
                 "__build_class__",
             ));
@@ -6257,7 +6257,7 @@ mod tests {
         // first `to_exc_object()` materialises it. The write-once memo
         // (`get_w_value`, error.py) must then return that same instance on
         // every later call instead of allocating a fresh one.
-        let mut err = PyError::name_error_with_name("name 'x' is not defined", "x");
+        let mut err = PyError::oefmt_name_error_text("name 'x' is not defined", "x");
         assert!(err.exc_object.is_null(), "raw-message error starts lazy");
         let first = err.to_exc_object();
         assert!(!first.is_null());

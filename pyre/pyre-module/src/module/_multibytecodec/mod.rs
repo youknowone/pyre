@@ -406,7 +406,7 @@ fn codec_errors_arg(
         return Ok("strict".to_string());
     }
     if unsafe { !pyre_object::is_str(w_errors) } {
-        let got = unsafe { pyre_object::type_name_of(w_errors) };
+        let got = pyre_interpreter::error::type_name_of(w_errors);
         return Err(pyre_interpreter::PyError::type_error(format!(
             "{entry_point}() argument 'errors' must be str or None, not {got}"
         )));

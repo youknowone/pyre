@@ -3265,7 +3265,7 @@ pub fn deref_unbound_error(code: &CodeObject, idx: usize) -> crate::PyError {
         format!("cannot access local variable '{name}' where it is not associated with a value")
     };
     if is_free {
-        crate::PyError::name_error_with_name(message, name)
+        crate::PyError::oefmt_name_error_text(message, name)
     } else {
         crate::PyError::unbound_local_error(message)
     }

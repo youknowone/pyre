@@ -2162,7 +2162,7 @@ impl ObjectConverter {
             } else {
                 Err(crate::PyError::type_error(format!(
                     "got an invalid type in Constant: {}",
-                    pyre_object::type_name_of(object)
+                    crate::error::type_name_of(object)
                 )))
             }
         }

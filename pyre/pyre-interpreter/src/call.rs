@@ -4056,11 +4056,13 @@ fn call_with_kwargs_in_ctx_impl(
         }
         // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
         // PyPy: boolobject.py descr_new uses @unwrap_spec (positional only).
-        // The `function`, `memoryview`, deque iterator, and constructors
-        // whose `__new__`/`__init__` Signature binds keywords (`cdata=`
-        // on `_cffi_backend.buffer`, `format=` on `_lzma`, `ident=` on
-        // `select.kevent`) are non-acceptable-as-base too. Route those
-        // through `__new__` / `__init__`.
+        // The `function`, `memoryview`, `traceback`, deque iterator, and
+        // constructors whose `__new__`/`__init__` Signature binds keywords
+        // (`cdata=` on `_cffi_backend.buffer`, `format=` on `_lzma`, `ident=`
+        // on `select.kevent`) are non-acceptable-as-base too. Route those
+        // through `__new__` / `__init__`.  `traceback` and `memoryview` bind
+        // the keywords in the body instead of through a `Signature`, so the
+        // marker dict has to reach `__new__` rather than be refused here.
         let accepts_keywords_despite_nonbase = std::ptr::eq(
             current_type(),
             crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
@@ -4073,6 +4075,9 @@ fn call_with_kwargs_in_ctx_impl(
         ) || std::ptr::eq(
             current_type(),
             crate::module::_collections::deque_rev_iter::public_type(),
+        ) || std::ptr::eq(
+            current_type(),
+            crate::typedef::gettypeobject(&crate::pytraceback::PYTRACEBACK_TYPE),
         ) || type_new_accepts_keywords(current_type())
             || crate::_structseq::is_structseq_type(current_type());
         if !kwargs.is_empty()

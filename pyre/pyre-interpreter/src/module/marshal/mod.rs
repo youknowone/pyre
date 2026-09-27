@@ -354,7 +354,7 @@ fn write_object(
         if incomplete {
             return Err(PyError::value_error(format!(
                 "cannot marshal recursion {} objects",
-                unsafe { pyre_object::type_name_of(obj) }
+                crate::error::type_name_of(obj)
             )));
         }
         out.write_u8(b'r');

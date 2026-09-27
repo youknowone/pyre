@@ -647,7 +647,7 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
         if !unsafe { arr::is_array(w_value) } {
             return Err(PyError::type_error(format!(
                 "can only assign array (not \"{}\") to array slice",
-                unsafe { pyre_object::type_name_of(w_value) }
+                crate::error::type_name_of(w_value)
             )));
         }
         let tc = unsafe { arr::w_array_typecode(obj) };
@@ -1769,7 +1769,7 @@ fn array_add_method(args: &[PyObjectRef]) -> PyResult {
     if !unsafe { arr::is_array(b) } {
         return Err(PyError::type_error(format!(
             "can only append array (not \"{}\") to array",
-            unsafe { pyre_object::type_name_of(b) }
+            crate::error::type_name_of(b)
         )));
     }
     let tc = unsafe { arr::w_array_typecode(a) };
@@ -1795,7 +1795,7 @@ fn array_iadd_method(args: &[PyObjectRef]) -> PyResult {
     if !unsafe { arr::is_array(b) } {
         return Err(PyError::type_error(format!(
             "can only extend array with array (not \"{}\")",
-            unsafe { pyre_object::type_name_of(b) }
+            crate::error::type_name_of(b)
         )));
     }
     if unsafe { arr::w_array_typecode(b) } != unsafe { arr::w_array_typecode(a) } {
@@ -2085,7 +2085,7 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
     if !unsafe { pyre_object::bytesobject::is_bytes_like(args[3]) } {
         return Err(PyError::type_error(format!(
             "fourth argument should be bytes, not {}",
-            unsafe { pyre_object::type_name_of(args[3]) }
+            crate::error::type_name_of(args[3])
         )));
     }
     let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(args[3]) }.to_vec();

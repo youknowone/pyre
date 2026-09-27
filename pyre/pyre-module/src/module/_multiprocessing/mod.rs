@@ -688,13 +688,7 @@ fn semlock_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpret
     let value = pyre_interpreter::builtins::space_index_w(scope[1])?;
     let maxvalue = pyre_interpreter::builtins::space_index_w(scope[2])?;
     if !unsafe { is_str(scope[3]) } {
-        // `_PyArg_BadArgument` renders the None singleton as `None` rather
-        // than as its class name.
-        let type_name = if unsafe { is_none(scope[3]) } {
-            "None"
-        } else {
-            unsafe { pyre_object::type_name_of(scope[3]) }
-        };
+        let type_name = pyre_interpreter::type_methods::clinic_arg_type_name(scope[3]);
         return Err(pyre_interpreter::PyError::type_error(format!(
             "SemLock() argument 'name' must be str, not {type_name}"
         )));
