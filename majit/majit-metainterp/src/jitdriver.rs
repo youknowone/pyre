@@ -2147,6 +2147,28 @@ enum SteadyCompiledEntry {
     Done(Option<usize>),
 }
 
+/// Answer of [`JitDriver::function_entry_runner`].
+///
+/// `warmspot.py ll_portal_runner` calls `maybe_compile_and_run` before the
+/// portal body. `warmstate.py execute_assembler` returns a
+/// `DoneWithThisFrameDescrInt` / `DoneWithThisFrameDescrRef` result straight
+/// out of that runner. [`FunctionEntryRunner::Finished`] is that word (an
+/// int, or a ref address stored as `i64`). [`FunctionEntryRunner::Resume`]
+/// and [`FunctionEntryRunner::Run`] still enter the portal body; those arms
+/// keep the finish latch the inline door drains.
+pub enum FunctionEntryRunner {
+    Finished(i64),
+    Resume(usize),
+    Run,
+}
+
+fn map_runner_resume(resume: Option<usize>) -> FunctionEntryRunner {
+    match resume {
+        Some(pc) => FunctionEntryRunner::Resume(pc),
+        None => FunctionEntryRunner::Run,
+    }
+}
+
 /// `warmstate.py` `maybe_compile_and_run` before it builds assembler args.
 ///
 /// [`BackEdgeWarmth::Interpret`] is the not-found arm after `jitcounter.tick`
@@ -9312,23 +9334,66 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) -> Option<usize> {
+        match self.function_entry_runner(green_key_hash, make_green_key, target_pc, state, env) {
+            FunctionEntryRunner::Finished(value) => {
+                self.meta.back_edge_finish_word = Some(value);
+                Some(target_pc)
+            }
+            FunctionEntryRunner::Resume(pc) => Some(pc),
+            FunctionEntryRunner::Run => None,
+        }
+    }
+
+    /// `warmspot.py ll_portal_runner`: the door in front of the portal body.
+    ///
+    /// Same decisions as [`Self::function_entry_structured`]. The raw compiled
+    /// fast path (`warmstate.py execute_assembler`,
+    /// `DoneWithThisFrameDescrInt` / `DoneWithThisFrameDescrRef`) returns
+    /// [`FunctionEntryRunner::Finished`] and does not write
+    /// `back_edge_finish_word`. Tracing, blackhole, the general case and the
+    /// typed entry still publish that latch; the runner drains it the way the
+    /// inline door does.
+    #[inline]
+    pub fn function_entry_runner(
+        &mut self,
+        green_key_hash: u64,
+        make_green_key: impl Fn() -> GreenKey,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) -> FunctionEntryRunner {
         if std::mem::replace(&mut self.function_entry_suppressed, false) {
-            return None;
+            return FunctionEntryRunner::Run;
         }
         if self.meta.is_tracing() {
-            return None;
+            return FunctionEntryRunner::Run;
         }
-        match self.enter_compiled_function_entry(green_key_hash, target_pc, state, env) {
-            SteadyCompiledEntry::Done(resume) => return resume,
+        // The raw fast path writes the word here instead of
+        // `back_edge_finish_word`, so `execute_assembler`'s register return
+        // shape stays intact (`Done(Option<usize>)` still fits one word).
+        let mut direct_word = None;
+        let entry = self.enter_compiled_function_entry(
+            green_key_hash,
+            target_pc,
+            state,
+            env,
+            &mut direct_word,
+        );
+        if let Some(value) = direct_word {
+            return FunctionEntryRunner::Finished(value);
+        }
+        match entry {
+            SteadyCompiledEntry::Done(Some(pc)) => return FunctionEntryRunner::Resume(pc),
+            SteadyCompiledEntry::Done(None) => return FunctionEntryRunner::Run,
             SteadyCompiledEntry::NeedsInternal => {
-                return self.function_entry_internal(
+                return map_runner_resume(self.function_entry_internal(
                     green_key_hash,
                     make_green_key,
                     target_pc,
                     state,
                     env,
                     false,
-                );
+                ));
             }
             SteadyCompiledEntry::Miss => {}
         }
@@ -9339,9 +9404,16 @@ impl<S: JitState> JitDriver<S> {
             state,
             env,
         ) {
-            return handled;
+            return map_runner_resume(handled);
         }
-        self.function_entry_internal(green_key_hash, make_green_key, target_pc, state, env, false)
+        map_runner_resume(self.function_entry_internal(
+            green_key_hash,
+            make_green_key,
+            target_pc,
+            state,
+            env,
+            false,
+        ))
     }
 
     /// Sole compiled cell for `hash`, when no confirm hook is installed.
@@ -9391,6 +9463,7 @@ impl<S: JitState> JitDriver<S> {
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
+        direct_word: &mut Option<i64>,
     ) -> SteadyCompiledEntry {
         let Some((cell_key, token)) = self.compiled_function_token(green_key_hash) else {
             return SteadyCompiledEntry::Miss;
@@ -9445,8 +9518,10 @@ impl<S: JitState> JitDriver<S> {
         if let Some(value) = finished {
             self.entry_scratch_out(scratch);
             self.meta.back_edge_finish = None;
-            self.meta.back_edge_finish_word = Some(value);
-            return SteadyCompiledEntry::Done(Some(target_pc));
+            // `ll_portal_runner` returns `execute_assembler`'s fast-path word
+            // without the latch.
+            *direct_word = Some(value);
+            return SteadyCompiledEntry::Done(None);
         }
         self.enter_compiled_general_case(cell_key, target_pc, state, env, scratch)
     }

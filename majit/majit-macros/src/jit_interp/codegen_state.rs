@@ -2136,19 +2136,52 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         };
     let fill_entry_raw_reds_override: TokenStream = if steady_entry_without_meta {
         if arrays.is_empty() {
+            // A separate `extend_from_slice` of a fixed word list lowers to a
+            // handful of stores when this function is outlined. Inlined into
+            // `enter_compiled_function_entry` that call becomes
+            // `Vec::extend_from_slice`'s memmove. Spell the spare-capacity
+            // arm as stores so the inline form keeps the outlined fast path.
+            let raw_vable_expr: TokenStream = if has_vable_identity {
+                quote! { self as *const Self as i64 }
+            } else {
+                quote! {}
+            };
+            let raw_words: Vec<TokenStream> = raw_int_words
+                .iter()
+                .cloned()
+                .chain(has_vable_identity.then(|| raw_vable_expr))
+                .chain(raw_ref_words.iter().cloned())
+                .chain(raw_float_words.iter().cloned())
+                .collect();
+            let raw_count = raw_words.len();
+            let raw_writes: Vec<TokenStream> = raw_words
+                .iter()
+                .enumerate()
+                .map(|(index, word)| {
+                    quote! { __dst.add(#index).write(#word); }
+                })
+                .collect();
             quote! {
+                #[inline]
                 fn fill_entry_raw_reds(&self, out: &mut ::std::vec::Vec<i64>) -> bool {
-                    out.extend_from_slice(&[
-                        #(#raw_int_words,)*
-                        #raw_vable_word
-                        #(#raw_ref_words,)*
-                        #(#raw_float_words,)*
-                    ]);
+                    let __len = out.len();
+                    if out.capacity().wrapping_sub(__len) >= #raw_count {
+                        unsafe {
+                            let __dst = out.as_mut_ptr().add(__len);
+                            #(#raw_writes)*
+                            out.set_len(__len + #raw_count);
+                        }
+                    } else {
+                        out.extend_from_slice(&[
+                            #(#raw_words),*
+                        ]);
+                    }
                     true
                 }
             }
         } else {
             quote! {
+                #[inline]
                 fn fill_entry_raw_reds(&self, out: &mut ::std::vec::Vec<i64>) -> bool {
                     #fill_entry_raw_static_prefix
                     #(#raw_array_pushes)*
