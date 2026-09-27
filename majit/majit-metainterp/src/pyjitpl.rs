@@ -6247,15 +6247,20 @@ impl<M: Clone> MetaInterp<M> {
             return BackEdgeAction::AlreadyTracing;
         }
 
-        // Force-start via the typed greenkey when the raw (code, pc) is
-        // present so the cell carries a `comparekey` like the back-edge
-        // path; synthetic (0, 0) call sites keep the legacy u64 path.
-        let hot = match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-            self.warm_state.force_start_tracing_for_key(key)
-        }) {
-            Some(h) => h,
-            None => self.warm_state.force_start_tracing(green_key),
-        };
+        // warmstate.py bound_reached: `cell = JitCell(*greenargs)`, so the
+        // cell carries a `comparekey`. The driver's own greens come first;
+        // without them the typed greenkey is rebuilt from the raw (code, pc),
+        // and synthetic (0, 0) call sites keep the legacy u64 path. A cell
+        // installed from the hash alone is one no typed lookup can match, so
+        // the next typed writer of the same greens mints a sibling and the
+        // two halves of one loop land on different cells.
+        let hot = match green_key_values.as_ref() {
+            Some(key) => Some(self.warm_state.force_start_tracing_for_key(key)),
+            None => Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                self.warm_state.force_start_tracing_for_key(key)
+            }),
+        }
+        .unwrap_or_else(|| self.warm_state.force_start_tracing(green_key));
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
@@ -6267,10 +6272,13 @@ impl<M: Clone> MetaInterp<M> {
                 // to `make_green_key(green_key_raw)`, which a minted cell key
                 // does not, so feeding a resolved key back in fails that
                 // assertion on exactly the chained-cell case this supports.
-                let green_key = Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-                    self.warm_state.cell_key_for(key)
-                })
-                .flatten()
+                let green_key = match green_key_values.as_ref() {
+                    Some(key) => self.warm_state.cell_key_for(key),
+                    None => Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                        self.warm_state.cell_key_for(key)
+                    })
+                    .flatten(),
+                }
                 .unwrap_or(green_key);
                 // warmstate.py bound_reached: jitcounter.decay_all_counters()
                 self.warm_state.decay_counters();
@@ -29907,6 +29915,37 @@ mod tests {
         assert!(
             meta.warm_state.lookup_chain_with_key(&key).is_some(),
             "force-started cell must carry a typed comparekey"
+        );
+    }
+
+    #[test]
+    fn bound_reached_installs_the_cell_under_the_drivers_own_greens() {
+        // A driver with no `(code, pc)` pair hands its greens to
+        // `bound_reached`; the cell it installs must carry them as its
+        // `comparekey`, so a later typed writer of the same greens finds that
+        // cell instead of minting a sibling beside a comparator-less one.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let key = majit_ir::GreenKey::with_types(vec![18, 18, 1, 0, 0], vec![Type::Int; 5]);
+        let green_key = key.get_uhash();
+        meta.bound_reached(
+            green_key,
+            (0, 18),
+            Some(key.clone()),
+            None,
+            &[Value::Int(0)],
+        );
+        assert!(meta.tracing.is_some(), "bound_reached must start tracing");
+
+        assert_eq!(
+            meta.warm_state.cell_key_for(&key),
+            Some(green_key),
+            "the started cell must be the typed cell of these greens"
+        );
+        assert_eq!(
+            meta.warm_state.ensure_cell_key(&key),
+            green_key,
+            "a typed writer of the same greens must land on that cell"
         );
     }
 
