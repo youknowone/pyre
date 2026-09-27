@@ -1353,8 +1353,26 @@ fn rehydrated_call_descr_ref(bh: majit_jitcode::jitcode::BhCallDescr) -> majit_i
 /// so the registry is still open when the tids are registered. CallDescr
 /// restoration stays on the first slot lookup.
 pub fn materialize_gccache_owned_descrs() {
+    materialize_gccache_owned_descrs_with(true);
+}
+
+/// Boot publication. `init_jit_hooks` runs this before user code, so the
+/// caller stack is the process stack and a helper thread is only join
+/// latency. The close hook keeps [`materialize_gccache_owned_descrs`],
+/// which leaves the recursive `CALL_ASSEMBLER` stack.
+pub fn materialize_gccache_owned_descrs_on_caller_stack() {
+    materialize_gccache_owned_descrs_with(false);
+}
+
+fn materialize_gccache_owned_descrs_with(off_caller_stack: bool) {
     static ONCE: Once = Once::new();
-    ONCE.call_once(decode_kind0_descrs_off_caller_stack);
+    ONCE.call_once(|| {
+        if off_caller_stack {
+            decode_kind0_descrs_off_caller_stack();
+        } else {
+            decode_kind0_descrs();
+        }
+    });
     // The decode `Once` may have run before a collector existed. Register
     // once the live collector is installed; a second call is a no-op.
     register_synthetic_struct_tids();

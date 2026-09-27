@@ -8173,7 +8173,7 @@ pub fn init_jit_hooks() {
     // `PYRE_JIT=0` / `PYRE_NO_JIT` never need the table. The decode runs on
     // a fresh stack; the close hook still covers a trace that wins the race.
     if env_var_os("PYRE_NO_JIT").is_none() && env_var("PYRE_JIT").as_deref() != Some("0") {
-        pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
+        pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs_on_caller_stack();
     }
     // `warmstate.py JitCell.__init__` stores every green as an ordinary field
     // on a GC object, so a Ref green is both owned and forwarded with the
