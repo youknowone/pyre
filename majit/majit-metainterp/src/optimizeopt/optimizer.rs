@@ -2963,9 +2963,8 @@ impl Optimizer {
         ctx.skip_flush_mode = self.skip_flush;
         ctx.building_bridge = self.building_bridge;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
-        // Seed the canonical `find_producer_op` surface (`input_ops`) with
-        // the input ops' producers so they resolve directly; `find_producer_op`
-        // matches by full OpRef (collision-safe) and consults this store last.
+        // Seed `input_ops` with the input ops' producers, whose operands
+        // carry the InputArg objects `ensure_inputarg_bindings` reuses.
         // When the caller threads the canonical `Rc<Op>` slice
         // (`input_ops_from_ops`, e.g. `TreeLoop.ops` at the loop-finish /
         // simple-loop sites), take them directly. Otherwise (fresh-Rc `&[Op]`
@@ -2999,11 +2998,6 @@ impl Optimizer {
             // `bind_input_resops` / emit), so the store is empty here.
             Vec::new()
         };
-        // `input_ops` is now fully seeded for this OptContext's lifetime;
-        // index it so `find_producer_op`'s lowest-priority lookup is O(1)
-        // instead of a full rfind over the recorder trace (O(n^2) over the
-        // whole optimization pass on large traces).
-        ctx.rebuild_input_ops_index();
         ctx.string_length_resolver = self.string_length_resolver.clone();
         ctx.string_content_resolver = self.string_content_resolver.clone();
         ctx.string_constant_alloc = self.string_constant_alloc.clone();

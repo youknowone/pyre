@@ -1406,9 +1406,9 @@ pub struct OptContext {
     // Vec-backed `get` is O(n), making the box-numbering O(n^2) on very
     // large traces, where it can dominate the whole compile time.
     // `IndexMap` keeps the same insertion-ordered `values()` semantics the
-    // earlier container guaranteed but resolves `get` in O(1).  Same O(1)
-    // acceleration rationale as `input_ops_index`; no PyPy counterpart
-    // (upstream keys producers on `box._forwarded`, not a positional map).
+    // earlier container guaranteed but resolves `get` in O(1).  No PyPy
+    // counterpart (upstream keys producers on `box._forwarded`, not a
+    // positional map).
     pub(crate) resop_refs: OpRefFxIndexMap<majit_ir::resoperation::OpRc>,
     /// Live synthetic stand-ins (mint_synthetic_resop / bind_input_resops
     /// products) that have NOT been superseded by an `emit` at their
@@ -1451,41 +1451,17 @@ pub struct OptContext {
     /// `rebuild_phase1_emit_ops_index`. Without it, `find_producer_op` scans
     /// the full cross-phase carry (tens of thousands of ops on a
     /// whole-program loop) per live
-    /// box of every Phase 2 guard, the dominant O(n^2) compile cost. Same
-    /// derived-index rationale as `input_ops_index` (no PyPy counterpart:
-    /// upstream keys producers on `box._forwarded`, not a positional map).
+    /// box of every Phase 2 guard, the dominant O(n^2) compile cost. No PyPy
+    /// counterpart: upstream keys producers on `box._forwarded`, not a
+    /// positional map.
     pub(crate) phase1_emit_ops_index: FxHashMap<OpRef, majit_ir::OpRc>,
     /// Recorder trace ops that carry the input operands' producer `Op`
-    /// (e.g. the `IntLt`/immutable `GetfieldGcI` operands of a recorded loop),
-    /// shared by `Rc` with the canonical stores but absent from
-    /// `new_operations` / `phase1_emit_ops` / `resop_refs`. Seeded at
-    /// optimizer setup from the recorder's `Rc<Op>` slice (`TreeLoop.ops`
-    /// at the loop-finish / simple-loop sites, or the Phase-2 threaded
-    /// `explicit_input_ops_seed`). `find_producer_op` consults this as the
-    /// lowest-priority store so a later emission at the same position always
-    /// wins.
+    /// (e.g. the `IntLt`/immutable `GetfieldGcI` operands of a recorded loop).
+    /// Seeded at optimizer setup from the recorder's `Rc<Op>` slice
+    /// (`TreeLoop.ops` at the loop-finish / simple-loop sites, or the Phase-2
+    /// threaded `explicit_input_ops_seed`). `ensure_inputarg_bindings` reads
+    /// the InputArg objects their operands carry.
     pub(crate) input_ops: Vec<majit_ir::OpRc>,
-    /// `pos -> producer` index over `input_ops`, mirroring the `rfind`
-    /// (last-occurrence-wins) lookup in `find_producer_op`. `input_ops` is
-    /// seeded once at optimizer setup and never mutated afterwards, so this
-    /// is rebuilt in lockstep with the seeding assignment via
-    /// `rebuild_input_ops_index`. Eliminates the O(n) scan of the full
-    /// recorder trace that `find_producer_op` otherwise performs on every
-    /// miss of the higher-priority stores (the dominant O(n^2) cost on very
-    /// large traces).
-    ///
-    /// No PyPy counterpart: upstream keys producer information on the box
-    /// itself (`box._forwarded` / `PtrInfo`, `optimizer.py`), so a
-    /// positional producer scan never exists there. Pyre's flat
-    /// `OpRef(u32)` has no such per-box slot, so `find_producer_op` scans
-    /// by position; this map is a pure O(1) acceleration of that scan, not
-    /// a new data model. Permitted under the AGENTS.md HashMap rule (3)
-    /// because it is a derived index — its sole invariant is that
-    /// `get(pos)` equals `input_ops.iter().rfind(|o| o.pos == pos)`
-    /// (last occurrence wins), enforced by rebuilding forward (a later
-    /// `insert` at the same key overwrites the earlier) and covered by
-    /// `input_ops_index_last_occurrence_wins`.
-    pub(crate) input_ops_index: FxHashMap<OpRef, majit_ir::OpRc>,
     /// optimizer.py:644,679 _last_guard_op — index of the last guard in
     /// new_operations that had full resume data built. Consecutive guards
     /// share resume data via _copy_resume_data_from (ResumeGuardCopiedDescr).
@@ -2339,7 +2315,6 @@ impl OptContext {
             phase1_emit_ops: Vec::new(),
             phase1_emit_ops_index: FxHashMap::default(),
             input_ops: Vec::with_capacity(estimated_ops),
-            input_ops_index: FxHashMap::with_capacity_and_hasher(estimated_ops, Default::default()),
             last_guard_idx: None,
             guard_chain_broken: false,
             last_seen_snapshot_pos: None,
@@ -2524,30 +2499,7 @@ impl OptContext {
         if let Some(op) = self.phase1_emit_ops_index.get(&opref).cloned() {
             return Some(op);
         }
-        if let Some(op) = self.resop_refs.get(&opref).cloned() {
-            return Some(op);
-        }
-        // Lowest-priority store: the recorder's input ops (seeded at setup
-        // from the recorder's `Rc<Op>` slice). Full-OpRef match (collision-safe)
-        // so a type-tagged value never aliases a different one at the same raw.
-        // Consulted last so any live emission / synthetic above wins.
-        //
-        // `input_ops_index` mirrors the `input_ops.iter().rfind(...)` scan
-        // (last-occurrence-wins) in O(1); `input_ops` is set once at setup so
-        // the index stays consistent for the OptContext's lifetime.
-        self.input_ops_index.get(&opref).cloned()
-    }
-
-    /// Rebuild `input_ops_index` from the current `input_ops`. Must be called
-    /// after the one-shot `input_ops` seeding assignment at optimizer setup.
-    /// Forward iteration with `insert` makes the last occurrence at each
-    /// position win, matching the `rfind` the index replaces.
-    pub(crate) fn rebuild_input_ops_index(&mut self) {
-        self.input_ops_index.clear();
-        self.input_ops_index.reserve(self.input_ops.len());
-        for op in &self.input_ops {
-            self.input_ops_index.insert(op.pos().get(), op.clone());
-        }
+        self.resop_refs.get(&opref).cloned()
     }
 
     /// Append an emitted op and mirror it into `new_operations_index` so
@@ -3053,7 +3005,6 @@ impl OptContext {
             phase1_emit_ops: Vec::new(),
             phase1_emit_ops_index: FxHashMap::default(),
             input_ops: Vec::with_capacity(estimated_ops),
-            input_ops_index: FxHashMap::with_capacity_and_hasher(estimated_ops, Default::default()),
             last_guard_idx: None,
             guard_chain_broken: false,
             last_seen_snapshot_pos: None,
@@ -3146,8 +3097,6 @@ impl OptContext {
         self.phase1_emit_ops_index.clear();
         self.input_ops.clear();
         self.input_ops.reserve(estimated_ops);
-        self.input_ops_index.clear();
-        self.input_ops_index.reserve(estimated_ops);
         self.last_guard_idx = None;
         self.guard_chain_broken = false;
         self.last_seen_snapshot_pos = None;
@@ -10032,49 +9981,11 @@ pub(crate) fn seed_empty_guard_snapshots(ops: &[Op]) -> (Vec<Op>, SnapshotBoxes)
 }
 
 #[cfg(test)]
-mod input_ops_index_tests {
+mod opt_context_pos_tests {
     use super::*;
     use majit_ir::OpRef;
     use majit_ir::resoperation::{Op, OpCode};
     use std::rc::Rc;
-
-    fn op_at(pos: OpRef) -> majit_ir::OpRc {
-        let op = Op::new(OpCode::SameAsI, &[]);
-        op.pos().set(pos);
-        OpRc::new(op)
-    }
-
-    /// `input_ops_index` is a derived O(1) acceleration of
-    /// `input_ops.iter().rfind(|o| o.pos == pos)`. Its sole invariant is
-    /// that when two seeded producers share a position, the LATER one wins —
-    /// matching the `rfind` it replaces and `find_producer_op`'s "a later
-    /// emission at the same position always wins" priority. The forward
-    /// rebuild guarantees this because a later `insert` at the same key
-    /// overwrites the earlier.
-    #[test]
-    fn input_ops_index_last_occurrence_wins() {
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 0, 0, 0);
-        // A position outside any higher-priority store (new_operations,
-        // phase1_emit_ops, resop_refs are all empty here) so the lookup
-        // falls through to input_ops_index.
-        let pos = OpRef::int_op(100);
-        let first = op_at(pos);
-        let last = op_at(pos);
-        ctx.input_ops = vec![first.clone(), last.clone()];
-        ctx.rebuild_input_ops_index();
-
-        let producer = ctx
-            .find_producer_op(pos)
-            .expect("a producer must be found at the seeded position");
-        assert!(
-            OpRc::ptr_eq(&producer, &last),
-            "the last occurrence at a shared position must win"
-        );
-        assert!(
-            !OpRc::ptr_eq(&producer, &first),
-            "the earlier occurrence must be shadowed by the later one"
-        );
-    }
 
     /// `make_constant` stores an i32 ConstInt as `Forwarded::SmallConst`.
     /// `allocate_next_pos_raw` must treat that as a claimed position.
