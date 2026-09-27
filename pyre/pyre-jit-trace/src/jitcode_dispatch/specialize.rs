@@ -19984,15 +19984,9 @@ fn walker_contains_descent_callback_free(
                 && pyre_object::is_int(needle)
         };
     }
-    // Exact `set` of plain ints: `descr_contains` hashes with the int
-    // digest and probes with `int_eq`.  No stored element runs a user
-    // `__eq__` / `__hash__`.  A subclass set or a non-int needle stays
-    // on the residual.
-    if exact(haystack, &pyre_object::setobject::SET_TYPE) {
-        return unsafe {
-            pyre_object::listobject::is_plain_int1(needle) && pyre_object::is_int(needle)
-        };
-    }
+    // A `set` stays on the residual even for a plain int needle: its single
+    // object strategy can hold a user object whose `__hash__` collides with
+    // the needle's, and the same-hash probe then runs that object's `__eq__`.
     false
 }
 
