@@ -608,3 +608,13 @@ pub fn store_held_int(cell: &mut HeldUnion, value: i64) {
 pub fn replace_held_union(slot: &mut HeldUnion, new: HeldUnion) -> HeldUnion {
     std::mem::replace(slot, new)
 }
+
+/// The enum sits inline at field 0. Assigning a whole value must move the
+/// live variant's fields into that slot. A store of the temporary's address
+/// overwrites the discriminant byte.
+pub struct HeldCell(pub HeldUnion);
+
+#[inline(never)]
+pub fn store_held_cell(slot: &mut HeldCell, value: i64) {
+    slot.0 = HeldUnion::Int(value);
+}

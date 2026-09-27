@@ -1839,6 +1839,46 @@ fn store_through_union_int_is_setfield_not_deref_write() {
     );
 }
 
+/// `slot.0 = HeldUnion::Int(value)` moves the enum into the inline field.
+/// The field is not a pointer, so the graph has no `HeldCell.__pos_0` store
+/// of the temporary's address.
+#[test]
+fn store_inline_enum_field_moves_the_variant() {
+    use majit_translate::model::{ExitSwitch, OpKind};
+    let llbc = load_corpus();
+    let graph = lower_function(llbc, "store_held_cell").unwrap_or_else(|e| panic!("{e}"));
+    let mut writes = Vec::new();
+    let mut switches = 0usize;
+    for block in &graph.blocks {
+        if matches!(block.exitswitch, Some(ExitSwitch::Value(_))) {
+            switches += 1;
+        }
+        for op in &block.operations {
+            if let OpKind::FieldWrite { field, .. } = &op.kind {
+                writes.push((
+                    field.name.clone(),
+                    field.owner_root.clone().unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    assert!(switches >= 1, "inline enum move has no discriminant switch, writes={writes:?}");
+    assert!(
+        writes.iter().all(|(_, owner)| !owner.contains("HeldCell")),
+        "inline enum field stored as one HeldCell word: {writes:?}"
+    );
+    assert!(
+        writes.iter().any(|(name, owner)| name == "__discriminant" && owner.contains("HeldUnion")),
+        "missing discriminant move, writes={writes:?}"
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|(name, owner)| name == "__pos_0" && owner.contains("HeldUnion::Int")),
+        "missing Int payload move, writes={writes:?}"
+    );
+}
+
 /// A whole `HeldUnion` move switches on `__discriminant`. The `Ref`
 /// payload is read only in its own arm, so an `Int` value is never
 /// loaded as a reference.

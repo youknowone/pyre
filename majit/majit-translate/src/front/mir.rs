@@ -8014,6 +8014,19 @@ impl<'a> Lowering<'a> {
             }
             ProjectionElem::Tagged(v) => {
                 if let Some(field_payload) = v.as_object().and_then(|m| m.get("Field")) {
+                    // A multi-word inline field is the aggregate, not a
+                    // pointer. Storing the temporary's address into the
+                    // first word overwrites the discriminant.
+                    if self.struct_field_offset_from_payload(field_payload) == Some(0) {
+                        if let Some(plan) = self.move_plan(dest_ty) {
+                            if !plan.arms.is_empty() {
+                                if let LinkArg::Value(src) = &value {
+                                    self.write_aggregate_into(mir_bb, &base, &plan, src)?;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
                     // Resolve the field through its TypeDecl exactly
                     // like the read side (`resolve_place` Field arm):
                     // the descriptor must carry the same
@@ -18691,61 +18704,52 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    /// Whole-enum move: switch on `__discriminant`, then copy that
-    /// variant's fields. `new_value` stores into `place`; `None` reads
-    /// `place` and returns the join phi.
-    fn copy_enum_switch(
+    /// Move `src` into `slot` when `slot` is the address of an inline
+    /// aggregate at offset 0 (`Dynamic.__pos_0`, `HeldCell.0`).
+    fn write_aggregate_into(
         &mut self,
         mir_bb: usize,
-        place: &Place,
+        slot: &Variable,
         plan: &MovePlan,
-        new_value: Option<Variable>,
-    ) -> Result<Option<Variable>, LowerError> {
+        src: &Variable,
+    ) -> Result<(), LowerError> {
+        if plan.arms.is_empty() {
+            for span in &plan.spans {
+                let part = self.emit_span_read(mir_bb, src, span);
+                self.emit_span_write(mir_bb, slot, span, part);
+            }
+            return Ok(());
+        }
+        self.store_enum_variant(mir_bb, slot, src, plan)
+    }
+
+    /// Switch on `__discriminant` and copy that variant's fields into
+    /// `slot`. One builder for an inline field store and for
+    /// `copy_enum_switch`'s store.
+    fn store_enum_variant(
+        &mut self,
+        mir_bb: usize,
+        slot: &Variable,
+        src: &Variable,
+        plan: &MovePlan,
+    ) -> Result<(), LowerError> {
         let discr = plan
             .spans
             .first()
             .expect("enum move plan carries __discriminant");
         let head = self.block_id[mir_bb];
-        let slot = self.deref_base(mir_bb, place)?;
-        let src = new_value.clone().unwrap_or_else(|| slot.clone());
-        let tag = self.emit_span_read(mir_bb, &src, discr);
-        let (join, phi) = if new_value.is_none() {
-            let (join, vars) = self.graph.create_block_with_arg_vars(1);
-            (
-                join,
-                Some(vars.into_iter().next().expect("enum move phi")),
-            )
-        } else {
-            (self.graph.create_block(), None)
-        };
+        let tag = self.emit_span_read(mir_bb, src, discr);
+        let join = self.graph.create_block();
         let mut links = Vec::with_capacity(plan.arms.len());
         for arm in &plan.arms {
             let arm_bb = self.graph.create_block();
             self.block_id[mir_bb] = arm_bb;
-            if new_value.is_none() {
-                let mut parts = Vec::with_capacity(1 + arm.spans.len());
-                parts.push(tag.clone());
-                for span in &arm.spans {
-                    parts.push(self.emit_span_read(mir_bb, &src, span));
-                }
-                let mut spans = Vec::with_capacity(parts.len());
-                spans.push(discr.clone());
-                spans.extend(arm.spans.iter().cloned());
-                let agg_plan = MovePlan {
-                    ctor_id: plan.ctor_id,
-                    spans,
-                    arms: Vec::new(),
-                };
-                let agg = self.emit_span_aggregate(mir_bb, &agg_plan, &parts);
-                self.graph.set_goto(arm_bb, join, vec![agg]);
-            } else {
-                for span in &arm.spans {
-                    let part = self.emit_span_read(mir_bb, &src, span);
-                    self.emit_span_write(mir_bb, &slot, span, part);
-                }
-                self.emit_span_write(mir_bb, &slot, discr, tag.clone());
-                self.graph.set_goto(arm_bb, join, Vec::new());
+            for span in &arm.spans {
+                let part = self.emit_span_read(mir_bb, src, span);
+                self.emit_span_write(mir_bb, slot, span, part);
             }
+            self.emit_span_write(mir_bb, slot, discr, tag.clone());
+            self.graph.set_goto(arm_bb, join, Vec::new());
             links.push(
                 Link::from_variables(
                     &self.graph,
@@ -18760,7 +18764,90 @@ impl<'a> Lowering<'a> {
         self.graph.block_mut(head).exitswitch = Some(ExitSwitch::Value(tag));
         self.graph.closeblock(head, links);
         self.block_id[mir_bb] = join;
-        Ok(phi)
+        Ok(())
+    }
+
+    fn struct_field_offset_from_payload(&self, payload: &serde_json::Value) -> Option<u64> {
+        let arr = payload.as_array()?;
+        if arr.len() != 2 {
+            return None;
+        }
+        let container = arr[0].as_object()?;
+        let adt = container.get("Adt")?.as_array()?;
+        if adt.get(1).and_then(serde_json::Value::as_u64).is_some() {
+            return None;
+        }
+        let head = adt.first()?;
+        let type_id = match head.as_u64() {
+            Some(id) => id,
+            None => head.get("id")?.get("Adt")?.as_u64()?,
+        };
+        let field_idx = arr[1].as_u64()? as usize;
+        let td = self.llbc.type_by_id(type_id)?;
+        let target = std::env::var("TARGET").unwrap_or_default();
+        td.layout_for_target(&target)?
+            .struct_field_offset(field_idx)
+    }
+
+    /// Whole-enum move: switch on `__discriminant`, then copy that
+    /// variant's fields. `new_value` stores into `place`; `None` reads
+    /// `place` and returns the join phi.
+    fn copy_enum_switch(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+        plan: &MovePlan,
+        new_value: Option<Variable>,
+    ) -> Result<Option<Variable>, LowerError> {
+        if new_value.is_some() {
+            let slot = self.deref_base(mir_bb, place)?;
+            let src = new_value.expect("enum store has a source");
+            self.store_enum_variant(mir_bb, &slot, &src, plan)?;
+            return Ok(None);
+        }
+        let discr = plan
+            .spans
+            .first()
+            .expect("enum move plan carries __discriminant");
+        let head = self.block_id[mir_bb];
+        let slot = self.deref_base(mir_bb, place)?;
+        let tag = self.emit_span_read(mir_bb, &slot, discr);
+        let (join, vars) = self.graph.create_block_with_arg_vars(1);
+        let phi = vars.into_iter().next().expect("enum move phi");
+        let mut links = Vec::with_capacity(plan.arms.len());
+        for arm in &plan.arms {
+            let arm_bb = self.graph.create_block();
+            self.block_id[mir_bb] = arm_bb;
+            let mut parts = Vec::with_capacity(1 + arm.spans.len());
+            parts.push(tag.clone());
+            for span in &arm.spans {
+                parts.push(self.emit_span_read(mir_bb, &slot, span));
+            }
+            let mut spans = Vec::with_capacity(parts.len());
+            spans.push(discr.clone());
+            spans.extend(arm.spans.iter().cloned());
+            let agg_plan = MovePlan {
+                ctor_id: plan.ctor_id,
+                spans,
+                arms: Vec::new(),
+            };
+            let agg = self.emit_span_aggregate(mir_bb, &agg_plan, &parts);
+            self.graph.set_goto(arm_bb, join, vec![agg]);
+            links.push(
+                Link::from_variables(
+                    &self.graph,
+                    Vec::new(),
+                    arm_bb,
+                    Some(ExitCase::Const(ConstValue::Int(arm.discr))),
+                )
+                .with_prevblock(head)
+                .with_llexitcase_from_exitcase(),
+            );
+        }
+        self.graph.block_mut(head).exitswitch = Some(ExitSwitch::Value(tag));
+        self.graph.closeblock(head, links);
+        self.block_id[mir_bb] = join;
+        Ok(Some(phi))
     }
 
     fn deref_base(&mut self, mir_bb: usize, place: &Place) -> Result<Variable, LowerError> {
