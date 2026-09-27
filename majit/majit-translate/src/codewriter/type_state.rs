@@ -242,20 +242,55 @@ pub(crate) fn promote_gc_field_bases(
                 }
                 OpKind::VableFieldRead { base, .. }
                 | OpKind::VableFieldWrite { base, .. }
-                | OpKind::ArrayRead { base, .. }
-                | OpKind::ArrayWrite { base, .. }
-                | OpKind::ArrayLen { base, .. }
                 | OpKind::VableArrayRead { base, .. }
                 | OpKind::VableArrayWrite { base, .. }
                 | OpKind::VableArrayLen { base, .. } => (base, true),
+                // `nolength` is a raw items region (`ARRAY._gckind == 'raw'`).
+                // Its base is the address integer (`getkind` → int). Promoting
+                // that address to `GcRef` puts an `int_add` result in the ref
+                // bank (`int_add/ii>r`), which no blackhole handler has.
+                // A length-prefixed array is the GC family and stays `GcRef`.
+                OpKind::ArrayRead { base, nolength, .. }
+                | OpKind::ArrayWrite { base, nolength, .. }
+                | OpKind::ArrayLen { base, nolength, .. } => (base, !nolength),
                 _ => continue,
             };
             if !force_gc {
                 continue;
             }
+            // An `int_add` / `cast_ptr_to_int` result is an address integer.
+            // `getkind` of that value is int. Rebanking it as `GcRef` because
+            // a later `setarrayitem` uses it as the base emits `int_add/ii>r`.
+            if integer_address_value(graph, base) {
+                continue;
+            }
             stamp_gc_ref_base(base, &graph.name);
         }
     }
+}
+
+fn integer_address_value(
+    graph: &FunctionGraph,
+    base: &crate::flowspace::model::Variable,
+) -> bool {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(base) {
+                continue;
+            }
+            return match &op.kind {
+                OpKind::BinOp { result_ty, .. } => {
+                    matches!(
+                        result_ty,
+                        ValueType::Int | ValueType::Unsigned | ValueType::Bool
+                    )
+                }
+                OpKind::UnaryOp { op, .. } => op == "cast_ptr_to_int",
+                _ => false,
+            };
+        }
+    }
+    false
 }
 
 fn stamp_gc_ref_base(base: &crate::flowspace::model::Variable, graph_name: &str) {
@@ -365,6 +400,53 @@ mod tests {
             FunctionGraph::concretetype_of(&base),
             ConcreteType::GcRef,
             "a GC ArrayRead base that arrived as Signed must be published as GcRef"
+        );
+    }
+
+    #[test]
+    fn promote_gc_field_bases_leaves_a_raw_nolength_array_address_signed() {
+        let mut graph = FunctionGraph::new("raw_array_address");
+        let ptr = push_input(&mut graph, "ptr", ValueType::Ref(None));
+        let offset = push_input(&mut graph, "off", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&ptr, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&offset, ConcreteType::Signed);
+        let addr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: ptr,
+                    rhs: offset,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&addr, ConcreteType::Signed);
+        let index = push_input(&mut graph, "i", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&index, ConcreteType::Signed);
+        let value = push_input(&mut graph, "v", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&value, ConcreteType::Signed);
+        graph.block_mut(graph.startblock).operations.push(
+            crate::model::SpaceOperation {
+                result: None,
+                kind: OpKind::ArrayWrite {
+                    base: addr.clone(),
+                    index,
+                    value: crate::model::LinkArg::Value(value),
+                    item_ty: ValueType::Int,
+                    array_type_id: Some("[u8]".into()),
+                    nolength: false,
+                },
+            },
+        );
+
+        promote_gc_field_bases(&graph, None);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&addr),
+            ConcreteType::Signed,
+            "a raw nolength array address stays an int so int_add is ii>i"
         );
     }
 
