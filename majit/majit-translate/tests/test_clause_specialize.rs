@@ -35,7 +35,7 @@ fn rdict_string_and_objectkey_instantiations_resolve_distinct_eq() {
     let specialized: Vec<_> = program
         .functions
         .iter()
-        .filter(|f| f.name.contains("__s"))
+        .filter(|f| f.name.contains("__spec_"))
         .collect();
     assert!(
         specialized.len() >= 2,
@@ -130,10 +130,11 @@ fn mk_i64_and_string_spec_graphs_have_int_and_ref_returns() {
     assert_eq!(kinds, vec!["Int", "Ref"]);
 }
 
-/// `fn eqv<Q: Eq, K: Borrow<Q>>` at `Q = K = String` aliases
-/// `Borrow::borrow` and calls the `String` eq impl.
+/// `fn eqv<Q: Eq, K: Borrow<Q>>` at `Q = str`, `K = StrKey` (the module
+/// dict key) calls `StrKey`'s own `borrow` impl, not the `Borrow::borrow`
+/// trait method, and compares with the `str` eq.
 #[test]
-fn string_eqv_spec_aliases_borrow_and_calls_string_eq() {
+fn str_key_eqv_spec_calls_the_str_key_borrow_and_str_eq() {
     let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[llbc],
@@ -148,27 +149,33 @@ fn string_eqv_spec_aliases_borrow_and_calls_string_eq() {
     let eqv: Vec<_> = program
         .functions
         .iter()
-        .filter(|f| f.name.contains("equivalent__s") && graph_calls_str_eq(&f.graph))
+        .filter(|f| f.name.contains("equivalent__spec_") && graph_calls_str_eq(&f.graph))
         .collect();
     assert!(
         !eqv.is_empty(),
-        "no String equivalent copy; specs: {:?}",
+        "no str equivalent copy; specs: {:?}",
         program
             .functions
             .iter()
-            .filter(|f| f.name.contains("__s"))
+            .filter(|f| f.name.contains("__spec_"))
             .map(|f| f.name.as_str())
             .collect::<Vec<_>>()
     );
     for spec in &eqv {
         assert!(
-            !graph_calls_borrow(&spec.graph),
-            "{} still calls Borrow::borrow",
+            graph_calls_path(&spec.graph, &["celldict", "StrKey", "borrow"]),
+            "{} does not call StrKey::borrow: {:?}",
+            spec.name,
+            op_kinds(&spec.graph)
+        );
+        assert!(
+            !graph_calls_trait_borrow(&spec.graph),
+            "{} still calls the Borrow::borrow trait method",
             spec.name
         );
         assert!(
             graph_calls_string_eq_impl(&spec.graph),
-            "{} does not call the String eq impl",
+            "{} does not call the str eq",
             spec.name
         );
     }
@@ -359,7 +366,7 @@ fn call_leaf_is_borrow(segments: &[String]) -> bool {
     segments.last().map(String::as_str) == Some("borrow")
 }
 
-fn graph_calls_borrow(graph: &majit_translate::model::FunctionGraph) -> bool {
+fn graph_calls_path(graph: &majit_translate::model::FunctionGraph, path: &[&str]) -> bool {
     graph
         .blocks
         .iter()
@@ -368,21 +375,31 @@ fn graph_calls_borrow(graph: &majit_translate::model::FunctionGraph) -> bool {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 ..
-            } => call_leaf_is_borrow(segments),
+            } => segments.iter().map(String::as_str).eq(path.iter().copied()),
+            _ => false,
+        })
+}
+
+/// A `borrow` call still dispatched through the trait: a `Method` call,
+/// or a path whose owner is the `Borrow` trait.
+fn graph_calls_trait_borrow(graph: &majit_translate::model::FunctionGraph) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| match &op.kind {
             OpKind::Call {
-                target:
-                    CallTarget::Method {
-                        name,
-                        resolved_path,
-                        ..
-                    },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } => {
-                name == "borrow"
-                    || resolved_path
-                        .as_ref()
-                        .is_some_and(|path| call_leaf_is_borrow(&path.segments))
+                call_leaf_is_borrow(segments)
+                    && segments.len() >= 2
+                    && segments[segments.len() - 2] == "Borrow"
             }
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "borrow",
             _ => false,
         })
 }
@@ -402,7 +419,7 @@ fn graph_calls_string_eq_impl(graph: &majit_translate::model::FunctionGraph) -> 
                     && segments[segments.len() - 3] == "traits"
                     && segments[segments.len() - 2] == "<Impl>"
                     && (segments[segments.len() - 1] == "eq"
-                        || segments[segments.len() - 1].starts_with("eq__s"))
+                        || segments[segments.len() - 1].starts_with("eq__spec_"))
             }
             OpKind::BinOp { op, .. } if op == "eq" => true,
             _ => false,

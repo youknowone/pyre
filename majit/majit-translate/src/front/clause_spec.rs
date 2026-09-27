@@ -11,7 +11,7 @@
 //! impl reads that impl's `implied_trait_refs`. The unspecialized body
 //! is left unchanged.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use majit_charon_reader::ullbc::{Signature, TyRef};
 use majit_charon_reader::{FunDecl, Llbc, Unstructured};
@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 /// One specialized copy waiting to be lowered.
+#[derive(Clone)]
 pub(crate) struct SpecRequest {
     pub fn_id: u64,
     /// Last path segment. Carries the full instantiation key because a
@@ -35,7 +36,9 @@ pub(crate) struct SpecRequest {
 /// cache: a key is recorded once, when the call is first seen.
 pub(crate) struct SpecQueue {
     pending: VecDeque<SpecRequest>,
-    seen: HashSet<String>,
+    /// First request that claimed each leaf. A later request for the same
+    /// leaf is the same instantiation; a different one is a name collision.
+    seen: HashMap<String, SpecRequest>,
     /// `def_id`s whose body contains a depth-0 `Clause`.
     clause_body: std::collections::HashMap<u64, bool>,
 }
@@ -44,7 +47,7 @@ impl SpecQueue {
     pub(crate) fn new() -> Self {
         Self {
             pending: VecDeque::new(),
-            seen: HashSet::new(),
+            seen: HashMap::new(),
             clause_body: std::collections::HashMap::new(),
         }
     }
@@ -69,9 +72,20 @@ impl SpecQueue {
     }
 
     pub(crate) fn enqueue(&mut self, req: SpecRequest) -> bool {
-        if !self.seen.insert(req.leaf.clone()) {
+        if let Some(first) = self.seen.get(&req.leaf) {
+            if first.fn_id != req.fn_id
+                || first.trait_refs != req.trait_refs
+                || first.types != req.types
+                || first.const_generics != req.const_generics
+            {
+                panic!(
+                    "specialized leaf {} claimed by a different instantiation",
+                    req.leaf
+                );
+            }
             return false;
         }
+        self.seen.insert(req.leaf.clone(), req.clone());
         self.pending.push_back(req);
         true
     }
@@ -146,54 +160,63 @@ pub(crate) fn concrete_trait_refs(generics: &Value, llbc: &Llbc) -> Option<Vec<V
     Some(refs.clone())
 }
 
-/// `name__s<fn>_<impl ids>_<type keys>[_c<const keys>]`. Distinct from the
-/// bare leaf and from every other instantiation of the same `fn`.
+/// `{leaf}__spec_{readable}_{hash}`. `FunctionDesc.cachedgraph` names the
+/// copy `name__valid_identifier(nameof(key))` from the key's names.
+/// `readable` is those type-argument leaves; `hash` is FNV-1a of the
+/// function path, trait refs, types and const generics, so the spelling
+/// carries no extraction-local id.
 pub(crate) fn spec_leaf(leaf: &str, fn_id: u64, generics: &Value, llbc: &Llbc) -> String {
-    let impls = generics
+    let fn_name = llbc
+        .fn_by_id(fn_id)
+        .map(|fd| fd.item_meta.name_path())
+        .unwrap_or_else(|| leaf.to_string());
+    let trait_refs = generics
         .get("trait_refs")
         .and_then(Value::as_array)
         .map(|refs| {
             refs.iter()
-                .map(|tref| match ref_class(tref, llbc, 0) {
-                    RefClass::TraitImpl => trait_impl_id(tref, llbc, 0)
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| "x".to_string()),
-                    _ => "b".to_string(),
-                })
+                .map(|tref| spec_trait_ref_name(tref, llbc))
                 .collect::<Vec<_>>()
-                .join("_")
         })
         .unwrap_or_default();
     let types = generics
         .get("types")
         .and_then(Value::as_array)
-        .map(|types| types.iter().map(type_key).collect::<Vec<_>>().join("_"))
-        .unwrap_or_default();
-    let consts = generics
-        .get("const_generics")
-        .and_then(Value::as_array)
-        .filter(|consts| !consts.is_empty())
-        .map(|consts| {
-            let keys = consts.iter().map(type_key).collect::<Vec<_>>().join("_");
-            format!("_c{keys}")
+        .map(|types| {
+            types
+                .iter()
+                .map(|ty| spec_type_name(ty, llbc, 0))
+                .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    format!("{leaf}__s{fn_id}_{impls}_{types}{consts}")
+    let const_generics = generics
+        .get("const_generics")
+        .and_then(Value::as_array)
+        .map(|consts| {
+            consts
+                .iter()
+                .map(|cg| spec_const_name(cg, llbc, 0))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let key = canon_key(&fn_name, &trait_refs, &types, &const_generics);
+    let hash = fnv1a64(key.as_bytes());
+    let readable = readable_type_leaves(&types);
+    if readable.is_empty() {
+        format!("{leaf}__spec_{hash:016x}")
+    } else {
+        format!("{leaf}__spec_{readable}_{hash:016x}")
+    }
 }
 
-/// The leaf `spec_leaf` was given: a specialized graph is a copy of the
+/// The leaf `spec_leaf` was given. A specialized graph is a copy of the
 /// same function (`FunctionDesc.cachedgraph`), so a pass that recognizes a
-/// callee by its leaf sees through the `__s<fn>_…` key.
+/// callee by its leaf sees through the `__spec_` marker.
 pub(crate) fn unspecialized_leaf(leaf: &str) -> &str {
-    let Some(at) = leaf.rfind("__s") else {
-        return leaf;
-    };
-    let rest = &leaf[at + 3..];
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    if digits == 0 || !rest[digits..].starts_with('_') {
-        return leaf;
+    match leaf.find("__spec_") {
+        Some(at) => &leaf[..at],
+        None => leaf,
     }
-    &leaf[..at]
 }
 
 /// `generics.types` / `generics.const_generics` when neither list contains
@@ -565,31 +588,513 @@ fn substitute_clauses(v: &mut Value, llbc: &Llbc, trait_refs: &[Value]) {
     }
 }
 
-fn type_key(v: &Value) -> String {
-    if let Some(id) = v
-        .as_object()
-        .and_then(|obj| obj.get("Deduplicated"))
-        .and_then(Value::as_u64)
-    {
-        return format!("d{id}");
+/// Charon type expression spelled from declaration names. Extraction-local
+/// ids are followed (`Deduplicated`, `HashConsedValue`) or replaced by
+/// `name_path`, never printed.
+pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
+    if depth > 32 {
+        return "deep".to_string();
     }
-    if let Some(id) = v
-        .as_object()
-        .and_then(|obj| obj.get("HashConsedValue"))
-        .and_then(Value::as_array)
-        .and_then(|arr| arr.first())
-        .and_then(Value::as_u64)
+    if let Some(obj) = v.as_object()
+        && obj.len() == 1
     {
-        return format!("d{id}");
+        if let Some(id) = obj.get("Deduplicated").and_then(Value::as_u64) {
+            return match llbc.dedup_body(id) {
+                Some(body) => spec_type_name(body, llbc, depth + 1),
+                None => "?dedup".to_string(),
+            };
+        }
+        if let Some(arr) = obj.get("HashConsedValue").and_then(Value::as_array)
+            && arr.len() == 2
+        {
+            return spec_type_name(&arr[1], llbc, depth + 1);
+        }
     }
     if let Some(index) = v.pointer("/TypeVar/Bound/1").and_then(Value::as_u64) {
         return format!("v{index}");
     }
-    let text = v.to_string();
-    let hash = text.bytes().fold(0u64, |acc, byte| {
-        acc.wrapping_mul(31).wrapping_add(u64::from(byte))
+    if let Some(index) = type_var_index(v) {
+        return format!("v{index}");
+    }
+    let Some(obj) = v.as_object() else {
+        return canonical_type_json(v, llbc, depth);
+    };
+    if let Some(lit) = obj.get("Literal") {
+        return spec_literal(lit);
+    }
+    if let Some(r) = obj.get("Ref") {
+        return spec_ref(r, llbc, depth);
+    }
+    if let Some(rp) = obj.get("RawPtr") {
+        return spec_raw_ptr(rp, llbc, depth);
+    }
+    if let Some(adt) = obj.get("Adt").and_then(Value::as_object) {
+        return spec_adt(adt, llbc, depth);
+    }
+    if let Some(arr) = obj.get("Array").and_then(Value::as_array) {
+        return spec_array_pair(arr, llbc, depth);
+    }
+    if let Some(elem) = obj.get("Slice") {
+        return format!("[{}]", spec_type_name(elem, llbc, depth + 1));
+    }
+    if let Some(fnptr) = obj.get("FnPtr") {
+        return spec_fn_ptr(fnptr, llbc, depth);
+    }
+    canonical_type_json(v, llbc, depth)
+}
+
+fn spec_const_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
+    if let Some(n) = scalar_decimal(v) {
+        return n;
+    }
+    spec_type_name(v, llbc, depth)
+}
+
+fn spec_trait_ref_name(v: &Value, llbc: &Llbc) -> String {
+    match ref_class(v, llbc, 0) {
+        RefClass::TraitImpl => {
+            let Some(resolved) = resolve_trait_ref(v, llbc, 0) else {
+                return "x".to_string();
+            };
+            let Some(id) = trait_impl_id(&resolved, llbc, 0) else {
+                return "x".to_string();
+            };
+            render_trait_impl(llbc, id).unwrap_or_else(|| "x".to_string())
+        }
+        RefClass::Clause | RefClass::Other => "b".to_string(),
+    }
+}
+
+/// `impl_trait`: the trait's `name_path` and its `<types>`. Self is one of
+/// those generics.
+fn render_trait_impl(llbc: &Llbc, impl_id: u64) -> Option<String> {
+    let row = llbc.trait_impls_raw().get(impl_id as usize)?;
+    let impl_trait = row.get("impl_trait")?;
+    let trait_id = impl_trait.get("id")?.as_u64()?;
+    let name = llbc.trait_by_id(trait_id)?.item_meta.name_path();
+    let types = impl_trait
+        .pointer("/generics/types")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|ty| spec_type_name(ty, llbc, 0))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let consts = impl_trait
+        .pointer("/generics/const_generics")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|cg| spec_const_name(cg, llbc, 0))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(format!("{name}{}", angle_args(&types, &consts)))
+}
+
+fn spec_literal(lit: &Value) -> String {
+    if let Some(atom) = lit.as_str() {
+        return match atom {
+            "Bool" => "bool".to_string(),
+            "Char" => "char".to_string(),
+            other => format!("lit_{other}"),
+        };
+    }
+    if let Some(obj) = lit.as_object() {
+        if let Some(int) = obj
+            .get("Int")
+            .or_else(|| obj.get("UInt"))
+            .or_else(|| obj.get("Integer"))
+            .and_then(Value::as_str)
+        {
+            return int.to_ascii_lowercase();
+        }
+        if let Some(float) = obj.get("Float").and_then(Value::as_str) {
+            return match float {
+                "F16" => "f16".to_string(),
+                "F32" => "f32".to_string(),
+                "F64" => "f64".to_string(),
+                "F128" => "f128".to_string(),
+                other => format!("float_{other}"),
+            };
+        }
+    }
+    lit.to_string()
+}
+
+fn spec_ref(r: &Value, llbc: &Llbc, depth: usize) -> String {
+    let (ty, kind) = if let Some(arr) = r.as_array() {
+        (arr.get(1), arr.get(2).and_then(Value::as_str))
+    } else if let Some(obj) = r.as_object() {
+        (
+            obj.get("ty"),
+            obj.get("kind").and_then(Value::as_str),
+        )
+    } else {
+        return canonical_type_json(r, llbc, depth);
+    };
+    let Some(ty) = ty else {
+        return "ref".to_string();
+    };
+    let inner = spec_type_name(ty, llbc, depth + 1);
+    if kind.is_some_and(|k| k.eq_ignore_ascii_case("Mut")) {
+        format!("&mut {inner}")
+    } else {
+        format!("&{inner}")
+    }
+}
+
+fn spec_raw_ptr(rp: &Value, llbc: &Llbc, depth: usize) -> String {
+    let (ty, kind) = if let Some(arr) = rp.as_array().filter(|arr| arr.len() == 2) {
+        (arr.first(), arr.get(1).and_then(Value::as_str))
+    } else if let Some(obj) = rp.as_object() {
+        (
+            obj.get("ty").or_else(|| obj.get("inner")),
+            obj.get("kind")
+                .or_else(|| obj.get("mutability"))
+                .and_then(Value::as_str),
+        )
+    } else {
+        return canonical_type_json(rp, llbc, depth);
+    };
+    let Some(ty) = ty else {
+        return "rawptr".to_string();
+    };
+    let inner = spec_type_name(ty, llbc, depth + 1);
+    if kind.is_some_and(|k| k.eq_ignore_ascii_case("Mut")) {
+        format!("*mut {inner}")
+    } else {
+        format!("*const {inner}")
+    }
+}
+
+fn spec_adt(
+    adt: &serde_json::Map<String, Value>,
+    llbc: &Llbc,
+    depth: usize,
+) -> String {
+    let types = generic_items(adt, "types")
+        .into_iter()
+        .map(|ty| spec_type_name(ty, llbc, depth + 1))
+        .collect::<Vec<_>>();
+    let consts = generic_items(adt, "const_generics")
+        .into_iter()
+        .map(|cg| spec_const_name(cg, llbc, depth + 1))
+        .collect::<Vec<_>>();
+    let id = adt.get("id");
+    if let Some(atom) = id.and_then(Value::as_str) {
+        if atom == "Tuple" {
+            return match types.as_slice() {
+                [] => "()".to_string(),
+                [one] => format!("({one},)"),
+                many => format!("({})", many.join(",")),
+            };
+        }
+        return format!("adt_{atom}{}", angle_args(&types, &consts));
+    }
+    if let Some(id_obj) = id.and_then(Value::as_object) {
+        if let Some(def_id) = id_obj.get("Adt").and_then(Value::as_u64) {
+            let name = llbc
+                .type_by_id(def_id)
+                .map(|td| td.item_meta.name_path())
+                .unwrap_or_else(|| "?adt".to_string());
+            return format!("{name}{}", angle_args(&types, &consts));
+        }
+        if let Some(builtin) = id_obj.get("Builtin") {
+            return spec_builtin(builtin, &types, &consts);
+        }
+    }
+    canonical_type_json(&Value::Object(adt.clone()), llbc, depth)
+}
+
+fn spec_builtin(builtin: &Value, types: &[String], consts: &[String]) -> String {
+    let name = builtin.as_str().or_else(|| {
+        builtin
+            .as_object()
+            .and_then(|map| map.keys().next().map(String::as_str))
     });
-    format!("h{hash:x}")
+    match name {
+        Some("Box") => format!("Box{}", angle_args(types, consts)),
+        Some("Slice") => match types.first() {
+            Some(inner) => format!("[{inner}]"),
+            None => "slice".to_string(),
+        },
+        Some("Str") => "str".to_string(),
+        Some("Array") => {
+            let elem = types.first().map(String::as_str).unwrap_or("");
+            let len = consts.first().map(String::as_str).unwrap_or("N");
+            format!("[{elem};{len}]")
+        }
+        Some(other) => format!("builtin_{other}{}", angle_args(types, consts)),
+        None => format!("builtin{}", angle_args(types, consts)),
+    }
+}
+
+fn spec_array_pair(arr: &[Value], llbc: &Llbc, depth: usize) -> String {
+    if arr.len() == 2 {
+        let elem = spec_type_name(&arr[0], llbc, depth + 1);
+        let len = spec_const_name(&arr[1], llbc, depth + 1);
+        format!("[{elem};{len}]")
+    } else {
+        canonical_type_json(&Value::Array(arr.to_vec()), llbc, depth)
+    }
+}
+
+fn spec_fn_ptr(fnptr: &Value, llbc: &Llbc, depth: usize) -> String {
+    let Some(sig) = fnptr
+        .get("skip_binder")
+        .unwrap_or(fnptr)
+        .as_object()
+    else {
+        return "fn".to_string();
+    };
+    let inputs = sig
+        .get("inputs")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|ty| spec_type_name(ty, llbc, depth + 1))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let output = sig
+        .get("output")
+        .map(|ty| spec_type_name(ty, llbc, depth + 1))
+        .unwrap_or_else(|| "()".to_string());
+    if sig.get("is_unsafe").and_then(Value::as_bool) == Some(true) {
+        format!("unsafe fn({inputs}) -> {output}")
+    } else {
+        format!("fn({inputs}) -> {output}")
+    }
+}
+
+fn generic_items<'a>(
+    adt: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Vec<&'a Value> {
+    adt.get("generics")
+        .and_then(Value::as_object)
+        .and_then(|generics| generics.get(key))
+        .and_then(Value::as_array)
+        .map(|items| items.iter().collect())
+        .unwrap_or_default()
+}
+
+fn angle_args(types: &[String], consts: &[String]) -> String {
+    if types.is_empty() && consts.is_empty() {
+        return String::new();
+    }
+    let mut args = types.to_vec();
+    args.extend(consts.iter().cloned());
+    format!("<{}>", args.join(","))
+}
+
+fn scalar_decimal(v: &Value) -> Option<String> {
+    fn from_scalar(scalar: &Value) -> Option<String> {
+        let obj = scalar.as_object()?;
+        for key in ["Unsigned", "Signed"] {
+            let parts = obj.get(key)?.as_array()?;
+            let n = parts.last()?;
+            if let Some(text) = n.as_str() {
+                return Some(text.to_string());
+            }
+            if let Some(n) = n.as_u64() {
+                return Some(n.to_string());
+            }
+        }
+        None
+    }
+    if let Some(scalar) = v.get("Scalar") {
+        return from_scalar(scalar);
+    }
+    if let Some(scalar) = v.pointer("/Value/Scalar") {
+        return from_scalar(scalar);
+    }
+    if let Some(scalar) = v.pointer("/kind/Literal/Scalar") {
+        return from_scalar(scalar);
+    }
+    v.pointer("/kind/Value/Scalar").and_then(from_scalar)
+}
+
+fn canonical_type_json(v: &Value, llbc: &Llbc, depth: usize) -> String {
+    resolve_decl_ids(v, llbc, depth).to_string()
+}
+
+/// Compact JSON with `Deduplicated` / `HashConsedValue` followed and every
+/// ADT, trait, impl and fun id replaced by that declaration's `name_path`.
+fn resolve_decl_ids(v: &Value, llbc: &Llbc, depth: usize) -> Value {
+    if depth > 64 {
+        return Value::String("deep".into());
+    }
+    if let Some(obj) = v.as_object()
+        && obj.len() == 1
+    {
+        if let Some(id) = obj.get("Deduplicated").and_then(Value::as_u64) {
+            return match llbc.dedup_body(id) {
+                Some(body) => resolve_decl_ids(body, llbc, depth + 1),
+                None => Value::String("?dedup".into()),
+            };
+        }
+        if let Some(arr) = obj.get("HashConsedValue").and_then(Value::as_array)
+            && arr.len() == 2
+        {
+            return resolve_decl_ids(&arr[1], llbc, depth + 1);
+        }
+        if let Some(id) = obj.get("Adt").and_then(Value::as_u64) {
+            return Value::String(type_path(llbc, id));
+        }
+        if let Some(id) = obj.get("Fun").and_then(Value::as_u64) {
+            return Value::String(fun_path(llbc, id));
+        }
+    }
+    match v {
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| resolve_decl_ids(item, llbc, depth + 1))
+                .collect(),
+        ),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, child) in map {
+                let replaced = match key.as_str() {
+                    "TraitImpl" => resolve_trait_impl_value(child, llbc, depth),
+                    "id" if child.as_u64().is_some() => {
+                        Value::String(decl_path(llbc, child.as_u64().unwrap()))
+                    }
+                    "Adt" if child.as_u64().is_some() => {
+                        Value::String(type_path(llbc, child.as_u64().unwrap()))
+                    }
+                    "Fun" | "Regular" if child.as_u64().is_some() => {
+                        Value::String(fun_path(llbc, child.as_u64().unwrap()))
+                    }
+                    "Trait" if child.as_u64().is_some() => {
+                        let id = child.as_u64().unwrap();
+                        Value::String(
+                            llbc.trait_by_id(id)
+                                .map(|td| td.item_meta.name_path())
+                                .or_else(|| render_trait_impl(llbc, id))
+                                .unwrap_or_else(|| "?".to_string()),
+                        )
+                    }
+                    "trait_decl_id" if child.as_u64().is_some() => Value::String(
+                        llbc.trait_by_id(child.as_u64().unwrap())
+                            .map(|td| td.item_meta.name_path())
+                            .unwrap_or_else(|| "?".to_string()),
+                    ),
+                    _ => resolve_decl_ids(child, llbc, depth + 1),
+                };
+                out.insert(key.clone(), replaced);
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
+}
+
+fn type_path(llbc: &Llbc, id: u64) -> String {
+    llbc.type_by_id(id)
+        .map(|td| td.item_meta.name_path())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn fun_path(llbc: &Llbc, id: u64) -> String {
+    llbc.fn_by_id(id)
+        .map(|fd| fd.item_meta.name_path())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn decl_path(llbc: &Llbc, id: u64) -> String {
+    if let Some(td) = llbc.trait_by_id(id) {
+        return td.item_meta.name_path();
+    }
+    if let Some(td) = llbc.type_by_id(id) {
+        return td.item_meta.name_path();
+    }
+    if let Some(fd) = llbc.fn_by_id(id) {
+        return fd.item_meta.name_path();
+    }
+    render_trait_impl(llbc, id).unwrap_or_else(|| "?".to_string())
+}
+
+fn canon_key(fn_name: &str, traits: &[String], types: &[String], consts: &[String]) -> String {
+    let mut out = String::new();
+    let fn_part = [fn_name.to_string()];
+    push_group(&mut out, "fn", &fn_part);
+    push_group(&mut out, "tr", traits);
+    push_group(&mut out, "ty", types);
+    push_group(&mut out, "cg", consts);
+    out
+}
+
+fn resolve_trait_impl_value(v: &Value, llbc: &Llbc, depth: usize) -> Value {
+    let Some(obj) = v.as_object() else {
+        return resolve_decl_ids(v, llbc, depth + 1);
+    };
+    let mut out = serde_json::Map::new();
+    for (key, child) in obj {
+        if key == "id" && let Some(id) = child.as_u64() {
+            let name = render_trait_impl(llbc, id).unwrap_or_else(|| "?".to_string());
+            out.insert(key.clone(), Value::String(name));
+            continue;
+        }
+        out.insert(key.clone(), resolve_decl_ids(child, llbc, depth + 1));
+    }
+    Value::Object(out)
+}
+
+fn push_group(out: &mut String, label: &str, parts: &[String]) {
+    out.push_str(label);
+    out.push('#');
+    out.push_str(&parts.len().to_string());
+    for part in parts {
+        out.push('\u{1f}');
+        out.push_str(&part.len().to_string());
+        out.push(':');
+        out.push_str(part);
+    }
+    out.push('\u{1e}');
+}
+
+fn readable_type_leaves(rendered: &[String]) -> String {
+    if rendered.is_empty() {
+        return String::new();
+    }
+    let joined = rendered
+        .iter()
+        .map(|name| type_leaf(name))
+        .collect::<Vec<_>>()
+        .join("_");
+    if joined.is_empty() {
+        return String::new();
+    }
+    let mut readable = crate::tool::sourcetools::valid_identifier(&joined);
+    readable.truncate(48);
+    readable
+}
+
+/// Last path segment of a rendered type, with a trailing generic list dropped.
+fn type_leaf(rendered: &str) -> String {
+    let segment = rendered.rsplit("::").next().unwrap_or(rendered);
+    match segment.find('<') {
+        Some(at) => segment[..at].to_string(),
+        None => segment.to_string(),
+    }
+}
+
+/// 64-bit FNV-1a. Not `DefaultHasher`: the seed must not depend on the process.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100000001b3);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -623,7 +1128,12 @@ mod tests {
     fn spec_leaf_without_const_generics_keeps_its_name() {
         let llbc = empty_llbc();
         let generics = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
-        assert_eq!(spec_leaf("f", 7, &generics, &llbc), "f__s7__");
+        let name = spec_leaf("f", 7, &generics, &llbc);
+        assert!(name.starts_with("f__spec_"), "{name}");
+        let hash = name.strip_prefix("f__spec_").unwrap();
+        assert_eq!(hash.len(), 16, "{name}");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+        assert_eq!(name, spec_leaf("f", 7, &generics, &llbc));
     }
 
     #[test]
@@ -631,8 +1141,69 @@ mod tests {
         let llbc = empty_llbc();
         let generics = json!({"regions": [], "types": [], "const_generics": [usize_const("4")], "trait_refs": []});
         let leaf = spec_leaf("zero_division", 42, &generics, &llbc);
+        assert!(leaf.starts_with("zero_division__spec_"), "{leaf}");
         assert_eq!(unspecialized_leaf(&leaf), "zero_division");
         assert_eq!(unspecialized_leaf("zero_division"), "zero_division");
         assert_eq!(unspecialized_leaf("a__sb_c"), "a__sb_c");
+    }
+
+    /// The same instantiation through a `Deduplicated` id and inline is one leaf.
+    #[test]
+    fn spec_leaf_dedup_matches_inline_body() {
+        let inline = json!({"Literal": {"Int": "I64"}});
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [{
+                    "def_id": 1,
+                    "item_meta": {
+                        "name": [{"Ident": ["fixture", 0]}, {"Ident": ["f", 0]}],
+                        "span": {"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}},
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [],
+                        "output": {"HashConsedValue": [7, inline]}
+                    },
+                    "body": null
+                }],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        let dedup = json!({"Deduplicated": 7});
+        assert_eq!(
+            spec_type_name(&inline, &llbc, 0),
+            spec_type_name(&dedup, &llbc, 0)
+        );
+        let inline_g = json!({"types": [inline], "trait_refs": [], "const_generics": []});
+        let dedup_g = json!({"types": [dedup], "trait_refs": [], "const_generics": []});
+        assert_eq!(
+            spec_leaf("f", 1, &inline_g, &llbc),
+            spec_leaf("f", 1, &dedup_g, &llbc)
+        );
+    }
+
+    /// `&T` stays distinct from `T`.
+    #[test]
+    fn spec_leaf_keeps_ref_distinct_from_referent() {
+        let llbc = empty_llbc();
+        let ty = json!({"Literal": {"Int": "I64"}});
+        let shared = json!({"Ref": ["Erased", ty, "Shared"]});
+        let bare = json!({"types": [ty], "trait_refs": [], "const_generics": []});
+        let reference = json!({"types": [shared], "trait_refs": [], "const_generics": []});
+        assert_ne!(
+            spec_type_name(&ty, &llbc, 0),
+            spec_type_name(&shared, &llbc, 0)
+        );
+        assert_ne!(
+            spec_leaf("f", 7, &bare, &llbc),
+            spec_leaf("f", 7, &reference, &llbc)
+        );
     }
 }
