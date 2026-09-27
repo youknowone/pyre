@@ -9350,40 +9350,53 @@ impl<S: JitState> JitDriver<S> {
             ));
         }
         let mut scratch = self.take_entry_scratch();
-        // `execute_assembler` does not look up `CompiledEntry`. The cell
-        // already holds the procedure token. Meta is only for a state whose
-        // reds or `is_compatible` actually read it.
-        let compatible = if state.fill_entry_reds_without_meta(&mut scratch.live_values) {
-            true
-        } else {
-            let Some(meta) = self.meta.get_compiled_meta(cell_key) else {
-                self.entry_scratch_out(scratch);
-                return SteadyCompiledEntry::NeedsInternal;
+        // `warmstate.py maybe_compile_and_run` unspecializes reds to words and
+        // `llmodel.py execute_token` stores them by the token's kinds. A state
+        // that cannot produce the words hands the backend typed reds.
+        let raw_entry = state.fill_entry_raw_reds(&mut scratch.raw);
+        if !raw_entry {
+            // `execute_assembler` does not look up `CompiledEntry`. The cell
+            // already holds the procedure token. Meta is only for a state whose
+            // reds or `is_compatible` actually read it.
+            let compatible = if state.fill_entry_reds_without_meta(&mut scratch.live_values) {
+                true
+            } else {
+                let Some(meta) = self.meta.get_compiled_meta(cell_key) else {
+                    self.entry_scratch_out(scratch);
+                    return SteadyCompiledEntry::NeedsInternal;
+                };
+                let compatible = state.is_compatible(meta);
+                if compatible {
+                    state.extract_live_values_into(
+                        meta,
+                        &mut scratch.live_values,
+                        &mut scratch.raw,
+                        &mut scratch.types,
+                    );
+                }
+                compatible
             };
-            let compatible = state.is_compatible(meta);
-            if compatible {
-                state.extract_live_values_into(
-                    meta,
-                    &mut scratch.live_values,
-                    &mut scratch.raw,
-                    &mut scratch.types,
-                );
+            if !compatible {
+                self.entry_scratch_out(scratch);
+                self.meta.invalidate_loop(cell_key);
+                return SteadyCompiledEntry::Done(None);
             }
-            compatible
-        };
-        if !compatible {
-            self.entry_scratch_out(scratch);
-            self.meta.invalidate_loop(cell_key);
-            return SteadyCompiledEntry::Done(None);
         }
         // `execute_assembler` receives the unspecialized reds.
         // `patch_new_loop_to_load_virtualizable_fields` truncates the
         // loop's inputargs to that prefix, so a patched entry's
-        // `inputarg_types` match the reds already in `live_values`. A
-        // longer list was not patched and still needs the extension in
-        // `back_edge_resolved`.
-        let need = token.inputarg_types().len();
-        if need > scratch.live_values.len() {
+        // `inputarg_types` match the reds already filled. A longer list was
+        // not patched and still needs the extension in `back_edge_resolved`,
+        // which reads typed reds.
+        let have = if raw_entry {
+            scratch.raw.len()
+        } else {
+            scratch.live_values.len()
+        };
+        if token.inputarg_types().len() > have {
+            if raw_entry {
+                let _ = state.fill_entry_reds_without_meta(&mut scratch.live_values);
+            }
             self.entry_scratch_out(scratch);
             return SteadyCompiledEntry::Done(self.back_edge_resolved(
                 cell_key,
@@ -9398,14 +9411,22 @@ impl<S: JitState> JitDriver<S> {
         // virtualizable = args[index_of_virtualizable];
         // vinfo.clear_vable_token(virtualizable)`. Nothing else — no
         // descriptor walk, no field export.
-        self.clear_entry_vable_token(&scratch.live_values);
+        if raw_entry {
+            self.clear_entry_vable_token_raw(&scratch.raw);
+        } else {
+            self.clear_entry_vable_token(&scratch.live_values);
+        }
         if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
             hook(cell_key, target_pc);
         }
-        if let Some(value) = self
-            .meta
-            .poll_raw_int_finish(&token, cell_key, &scratch.live_values)
-        {
+        let finished = if raw_entry {
+            self.meta
+                .poll_raw_int_finish_raw(&token, cell_key, &scratch.raw)
+        } else {
+            self.meta
+                .poll_raw_int_finish(&token, cell_key, &scratch.live_values)
+        };
+        if let Some(value) = finished {
             self.entry_scratch_out(scratch);
             self.meta.back_edge_finish = None;
             self.meta.back_edge_finish_word = Some(value);
@@ -9460,6 +9481,32 @@ impl<S: JitState> JitDriver<S> {
         }
         unsafe {
             crate::virtualizable::bh_clear_vable_token(info, *addr as *mut u8);
+        }
+    }
+
+    /// [`Self::clear_entry_vable_token`] for an `unspecialize_value` word.
+    ///
+    /// The word at `index_of_virtualizable` is the virtualizable address
+    /// (`warmstate.py execute_assembler` `args[index_of_virtualizable]`).
+    fn clear_entry_vable_token_raw(&self, raw: &[i64]) {
+        let Some(descriptor) = self.descriptor.as_ref() else {
+            return;
+        };
+        let index = descriptor.index_of_virtualizable;
+        if index < 0 {
+            return;
+        }
+        let Some(info) = self.meta.virtualizable_info() else {
+            return;
+        };
+        let Some(&word) = raw.get(index as usize) else {
+            return;
+        };
+        if word == 0 {
+            return;
+        }
+        unsafe {
+            crate::virtualizable::bh_clear_vable_token(info, word as usize as *mut u8);
         }
     }
 

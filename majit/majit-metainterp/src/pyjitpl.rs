@@ -13621,6 +13621,34 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// [`Self::poll_raw_int_finish`] for `unspecialize_value` words.
+    ///
+    /// `llmodel.py execute_token` writes each word by `token.inputarg_types()`;
+    /// [`Backend::execute_token_done_int_raw`] is that store.
+    #[inline]
+    pub fn poll_raw_int_finish_raw(
+        &mut self,
+        procedure_token: &std::sync::Arc<JitCellToken>,
+        green_key: u64,
+        raw_reds: &[i64],
+    ) -> Option<i64> {
+        Self::prepare_compiled_run_io();
+        match self
+            .backend
+            .execute_token_done_int_raw(procedure_token, raw_reds)
+        {
+            Ok(value) => {
+                Self::finish_compiled_run_io();
+                Some(value)
+            }
+            Err(frame) => {
+                let result = self.consume_executed_frame(green_key, None, frame);
+                self.raw_int_fallback = Some(result);
+                None
+            }
+        }
+    }
+
     /// Attach resume data to a specific guard in a compiled loop.
     ///
     /// `resume.py rebuild_from_resumedata` consumes this storage at

@@ -3037,6 +3037,17 @@ fn checked_unicode_char(value: i64) -> u32 {
     value as u32
 }
 
+/// One `unspecialize_value` word, tagged by `llmodel.py execute_token`'s
+/// `kinds` entry.
+pub fn value_from_unspecialized_word(word: i64, kind: Type) -> Value {
+    match kind {
+        Type::Ref => Value::Ref(GcRef(word as usize)),
+        Type::Float => Value::Float(f64::from_bits(word as u64)),
+        Type::Void => Value::Void,
+        Type::Int => Value::Int(word),
+    }
+}
+
 /// The backend trait — implemented by Cranelift (or other code generators).
 ///
 /// Mirrors rpython/jit/backend/model.py AbstractCPU.
@@ -3310,6 +3321,35 @@ pub trait Backend: Send {
             return Ok(value);
         }
         Err(frame)
+    }
+
+    /// `llmodel.py make_execute_token` / `execute_token`: `args` are the
+    /// `unspecialize_value` words `warmstate.py maybe_compile_and_run` built,
+    /// stored by `token.inputarg_types()` (`set_int_value` / `set_ref_value` /
+    /// `set_float_value`). The default rebuilds those `Value`s — at most eight
+    /// stay on the stack — and calls [`Backend::execute_token_done_int`].
+    fn execute_token_done_int_raw(
+        &self,
+        token: &JitCellToken,
+        args: &[i64],
+    ) -> Result<i64, DeadFrame> {
+        let kinds = token.inputarg_types();
+        let n = args.len();
+        let mut stack = [Value::Void; 8];
+        if n <= stack.len() {
+            for (i, slot) in stack[..n].iter_mut().enumerate() {
+                let kind = kinds.get(i).copied().unwrap_or(Type::Int);
+                *slot = value_from_unspecialized_word(args[i], kind);
+            }
+            return self.execute_token_done_int(token, &stack[..n]);
+        }
+        let values: Vec<Value> = (0..n)
+            .map(|i| {
+                let kind = kinds.get(i).copied().unwrap_or(Type::Int);
+                value_from_unspecialized_word(args[i], kind)
+            })
+            .collect();
+        self.execute_token_done_int(token, &values)
     }
 
     /// Execute compiled code starting at a backend-specific dispatch key.

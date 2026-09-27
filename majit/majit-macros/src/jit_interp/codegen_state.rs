@@ -2072,6 +2072,96 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     } else {
         quote! {}
     };
+    // Same words as `fill_entry_reds_without_meta`, as `unspecialize_value`
+    // results: Int is the value, Ref is the address, Float is `to_bits()`.
+    // Static runs are one `extend_from_slice`; a flattened array's length is
+    // read off the state, so those elements stay a loop.
+    let raw_int_words: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { self.#fname as i64 }
+        })
+        .collect();
+    let raw_array_pushes: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! {
+                for elem in &self.#fname {
+                    out.push(*elem as i64);
+                }
+            }
+        })
+        .collect();
+    let raw_vable_word: TokenStream = if has_vable_identity {
+        quote! { self as *const Self as i64, }
+    } else {
+        quote! {}
+    };
+    let raw_ref_words: Vec<TokenStream> = ref_scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { self.#fname as i64 }
+        })
+        .collect();
+    let raw_float_words: Vec<TokenStream> = float_scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { (self.#fname as f64).to_bits() as i64 }
+        })
+        .collect();
+    let fill_entry_raw_static_prefix: TokenStream = if scalars.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            out.extend_from_slice(&[
+                #(#raw_int_words,)*
+            ]);
+        }
+    };
+    let fill_entry_raw_static_suffix: TokenStream =
+        if !has_vable_identity && ref_scalars.is_empty() && float_scalars.is_empty() {
+            quote! {}
+        } else {
+            quote! {
+                out.extend_from_slice(&[
+                    #raw_vable_word
+                    #(#raw_ref_words,)*
+                    #(#raw_float_words,)*
+                ]);
+            }
+        };
+    let fill_entry_raw_reds_override: TokenStream = if compat_checks.is_empty()
+        && (num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0)
+    {
+        if arrays.is_empty() {
+            quote! {
+                fn fill_entry_raw_reds(&self, out: &mut ::std::vec::Vec<i64>) -> bool {
+                    out.extend_from_slice(&[
+                        #(#raw_int_words,)*
+                        #raw_vable_word
+                        #(#raw_ref_words,)*
+                        #(#raw_float_words,)*
+                    ]);
+                    true
+                }
+            }
+        } else {
+            quote! {
+                fn fill_entry_raw_reds(&self, out: &mut ::std::vec::Vec<i64>) -> bool {
+                    #fill_entry_raw_static_prefix
+                    #(#raw_array_pushes)*
+                    #fill_entry_raw_static_suffix
+                    true
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
     let live_value_types_override: TokenStream =
         if num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0 {
             quote! {
@@ -3142,6 +3232,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
             #extract_live_values_into_override
             #fill_entry_reds_without_meta_override
+            #fill_entry_raw_reds_override
 
             fn create_sym(meta: &#meta_ty, header_pc: usize) -> #sym_ty {
                 let mut __offset: usize = 0;

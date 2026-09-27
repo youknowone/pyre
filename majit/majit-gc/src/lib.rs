@@ -3661,6 +3661,7 @@ pub fn set_active_gc_id_or_identityhash(hook: Option<GcIdOrIdentityHashFn>) {
 
 /// Return a GC-move-stable address for identity hashing.
 /// Falls back to `addr` when no backend is installed.
+#[inline]
 pub fn gc_id_or_identityhash(addr: usize) -> usize {
     match ACTIVE_GC_ID_OR_IDENTITYHASH.get() {
         Some(f) => f(addr),

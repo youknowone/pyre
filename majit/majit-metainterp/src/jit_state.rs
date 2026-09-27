@@ -307,6 +307,15 @@ pub trait JitState: Sized {
         false
     }
 
+    /// `warmstate.py maybe_compile_and_run`: the reds as `unspecialize_value`
+    /// words, in inputarg order. `false` when the state cannot produce them
+    /// without the compiled meta (same condition as
+    /// `fill_entry_reds_without_meta`).
+    fn fill_entry_raw_reds(&self, out: &mut Vec<i64>) -> bool {
+        let _ = out;
+        false
+    }
+
     /// Append-to-buffer form of [`Self::extract_live`], for
     /// [`Self::extract_live_values_into`] implementations.
     fn extract_live_into(&self, meta: &Self::Meta, out: &mut Vec<i64>) {

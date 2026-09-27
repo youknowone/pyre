@@ -342,6 +342,35 @@ fn release_done_int_frame(token: &JitCellToken, ran: &RanFrame) {
 
 type EntryArgRoots = smallvec::SmallVec<[majit_gc::shadow_stack::OwnerRootGuard; 4]>;
 
+/// Arguments of one `llmodel.py execute_token` call.
+///
+/// `Typed` is the `Value` vector the general entry still carries. `Raw` is
+/// the `unspecialize_value` words `warmstate.py maybe_compile_and_run` built;
+/// the no-collector store writes each word with `set_int_value`.
+#[derive(Copy, Clone)]
+enum EntryWords<'a> {
+    Typed(&'a [Value]),
+    Raw(&'a [i64]),
+}
+
+impl std::fmt::Debug for EntryWords<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Typed(args) => std::fmt::Debug::fmt(args, f),
+            Self::Raw(args) => std::fmt::Debug::fmt(args, f),
+        }
+    }
+}
+
+impl EntryWords<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Typed(args) => args.len(),
+            Self::Raw(args) => args.len(),
+        }
+    }
+}
+
 /// The frame `make_execute_token` returns, before it is wrapped as a deadframe.
 struct RanFrame {
     head: *mut JitFrame,
@@ -2611,6 +2640,18 @@ impl DynasmBackend {
     /// compiled buffer is only for the debug dumps, which are off on a
     /// steady run.
     fn run_compiled_frame(&self, token: &JitCellToken, args: &[Value]) -> RanFrame {
+        self.run_compiled_entry(token, EntryWords::Typed(args))
+    }
+
+    /// [`Self::run_compiled_frame`] for `unspecialize_value` words when no
+    /// collector is installed. The caller converts to `Value`s first when
+    /// `majit_gc::collector_installed()` is set, so this store never roots.
+    fn run_compiled_frame_raw(&self, token: &JitCellToken, args: &[i64]) -> RanFrame {
+        debug_assert!(!majit_gc::collector_installed());
+        self.run_compiled_entry(token, EntryWords::Raw(args))
+    }
+
+    fn run_compiled_entry(&self, token: &JitCellToken, args: EntryWords<'_>) -> RanFrame {
         let diag = exec_diag_enabled();
         let compiled = diag.then(|| Self::get_compiled(token));
         let entry = match compiled {
@@ -2643,44 +2684,66 @@ impl DynasmBackend {
         // by construction, so every input slot fits.  Assert it (release):
         // dropping the `.max(64)` cushion removes the silent-OOB mask, so a
         // depth/arg mismatch must surface loudly instead of corrupting.
+        let n_args = args.len();
         assert!(
-            num_slots >= Self::input_slot(args.len()),
+            num_slots >= Self::input_slot(n_args),
             "execute_token: frame depth {num_slots} < input top {} for {} args",
-            Self::input_slot(args.len()),
-            args.len()
+            Self::input_slot(n_args),
+            n_args
         );
         let frame_bytes = JitFrame::alloc_size(num_slots);
         // No collector: `malloc_jitframe` is a host block and the input refs
         // are not forwarded. Skip the empty root vector. The steady
         // finish-with-an-int case reuses the token's parked frame
         // (`llmodel.py execute_token` bump) instead of a TLS free list.
-        let (jf_ptr, gc_object, arg_roots) = if majit_gc::collector_installed() {
-            let (ptr, gc_object, roots) = alloc_entry_jitframe(frame_bytes, args);
-            (ptr, gc_object, Some(roots))
-        } else if let Some(ptr) = token.take_entry_frame(frame_bytes) {
-            unsafe { reuse_off_gc_jitframe(ptr) };
-            (ptr, false, None)
-        } else {
-            (malloc_host_jitframe(frame_bytes), false, None)
+        // `EntryWords::Raw` is only used on that path: a collector converts
+        // the words back to `Value`s and takes `EntryWords::Typed`.
+        let (jf_ptr, gc_object, arg_roots) = match args {
+            EntryWords::Typed(values) if majit_gc::collector_installed() => {
+                let (ptr, gc_object, roots) = alloc_entry_jitframe(frame_bytes, values);
+                (ptr, gc_object, Some(roots))
+            }
+            _ => {
+                if let Some(ptr) = token.take_entry_frame(frame_bytes) {
+                    unsafe { reuse_off_gc_jitframe(ptr) };
+                    (ptr, false, None)
+                } else {
+                    (malloc_host_jitframe(frame_bytes), false, None)
+                }
+            }
         };
         unsafe { JitFrame::init(jf_ptr, fi_ptr, num_slots) };
 
-        let mut ref_index = 0;
-        for (i, arg) in args.iter().enumerate() {
-            let raw = match arg {
-                Value::Int(v) => *v,
-                Value::Ref(r) => {
-                    let current = match arg_roots.as_ref() {
-                        Some(roots) => roots.get(ref_index).map_or(*r, |root| root.get()),
-                        None => *r,
+        match args {
+            EntryWords::Typed(values) => {
+                let mut ref_index = 0;
+                for (i, arg) in values.iter().enumerate() {
+                    let raw = match arg {
+                        Value::Int(v) => *v,
+                        Value::Ref(r) => {
+                            let current = match arg_roots.as_ref() {
+                                Some(roots) => roots.get(ref_index).map_or(*r, |root| root.get()),
+                                None => *r,
+                            };
+                            ref_index += 1;
+                            current.0 as i64
+                        }
+                        Value::Float(f) => f.to_bits() as i64,
+                        Value::Void => 0,
                     };
-                    ref_index += 1;
-                    current.0 as i64
+                    unsafe {
+                        crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), raw as isize)
+                    };
                 }
-                Value::Float(f) => f.to_bits() as i64,
-                Value::Void => 0,
-            };
-            unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), raw as isize) };
+            }
+            // `llmodel.py execute_token`: each word is already the frame slot.
+            EntryWords::Raw(words) => {
+                for (i, &word) in words.iter().enumerate() {
+                    unsafe {
+                        crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), word as isize)
+                    };
+                }
+            }
         }
         // These roots exist only to span the collecting frame allocation.
         // Once the forwarded refs are in the frame, keeping their owner-root
@@ -2691,18 +2754,19 @@ impl DynasmBackend {
         // false test and does not call into the loggers.
         if diag && majit_ir::debug::have_debug_prints() {
             let _s = majit_ir::debug::scope("jit-running");
-            for (i, arg) in args.iter().enumerate() {
+            for i in 0..n_args {
                 let raw = unsafe {
                     crate::llmodel::get_int_value_direct(jf_ptr, Self::input_slot(i)) as i64
                 };
-                majit_ir::debug::debug_print(&format!(
-                    "  arg[{i}] = {:#018x} ({arg:?})",
-                    raw as u64
-                ));
+                let rendered = match args {
+                    EntryWords::Typed(values) => format!("{raw:#018x} ({:?})", values[i]),
+                    EntryWords::Raw(words) => format!("{raw:#018x} ({:?})", words[i]),
+                };
+                majit_ir::debug::debug_print(&format!("  arg[{i}] = {rendered}"));
             }
             majit_ir::debug::debug_print(&format!(
                 "execute_token: entry={entry:?} jf_ptr={jf_ptr:?} num_args={} num_slots={num_slots} code_len={}",
-                args.len(),
+                n_args,
                 compiled.unwrap().buffer.len()
             ));
         }
@@ -2828,6 +2892,27 @@ impl DynasmBackend {
                 LibcJitFrameDeadFrame::owning(ran.head, ran.tip, ran.num_slots, descr, None)
             })
         }
+    }
+
+    /// `DoneWithThisFrameDescrInt.get_result` on a frame
+    /// `make_execute_token` just returned. A collector frame, or any other
+    /// descr, becomes the deadframe the general path reads.
+    fn done_int_from_ran(&self, token: &JitCellToken, ran: RanFrame) -> Result<i64, DeadFrame> {
+        if !ran.gc_object {
+            let descr_raw = unsafe { crate::llmodel::get_latest_descr(ran.tip) };
+            if self.finish_is_done_int(descr_raw) {
+                // `get_int_value(deadframe, 0)`. That descr's `rd_locs` stays
+                // empty (`set_rd_locs` is resume-guard only), so the word
+                // `genop_finish` stored is `jf_frame[0]`.
+                let value = unsafe {
+                    let tip = JitFrame::resolve(ran.tip);
+                    crate::llmodel::get_int_value_direct(tip, 0) as i64
+                };
+                release_done_int_frame(token, &ran);
+                return Ok(value);
+            }
+        }
+        Err(self.deadframe_from_run(token, ran))
     }
 
     /// `jf_descr` equals the `DoneWithThisFrameDescrInt` cell
@@ -3373,22 +3458,33 @@ impl Backend for DynasmBackend {
         args: &[Value],
     ) -> Result<i64, DeadFrame> {
         let ran = self.run_compiled_frame(token, args);
-        if !ran.gc_object {
-            let descr_raw = unsafe { crate::llmodel::get_latest_descr(ran.tip) };
-            if self.finish_is_done_int(descr_raw) {
-                // `DoneWithThisFrameDescrInt.get_result` →
-                // `get_int_value(deadframe, 0)`. That descr's `rd_locs` stays
-                // empty (`set_rd_locs` is resume-guard only), so the word
-                // `genop_finish` stored is `jf_frame[0]`.
-                let value = unsafe {
-                    let tip = JitFrame::resolve(ran.tip);
-                    crate::llmodel::get_int_value_direct(tip, 0) as i64
-                };
-                release_done_int_frame(token, &ran);
-                return Ok(value);
-            }
+        self.done_int_from_ran(token, ran)
+    }
+
+    /// `llmodel.py execute_token` with `unspecialize_value` words.
+    ///
+    /// No collector: write each word with `set_int_value`. A collector keeps
+    /// today's `Value` entry, rebuilding tags from `token.inputarg_types()`.
+    #[inline]
+    fn execute_token_done_int_raw(
+        &self,
+        token: &JitCellToken,
+        args: &[i64],
+    ) -> Result<i64, DeadFrame> {
+        if majit_gc::collector_installed() {
+            let kinds = token.inputarg_types();
+            let values: smallvec::SmallVec<[Value; 8]> = args
+                .iter()
+                .enumerate()
+                .map(|(i, &word)| {
+                    let kind = kinds.get(i).copied().unwrap_or(Type::Int);
+                    majit_backend::value_from_unspecialized_word(word, kind)
+                })
+                .collect();
+            return self.execute_token_done_int(token, &values);
         }
-        Err(self.deadframe_from_run(token, ran))
+        let ran = self.run_compiled_frame_raw(token, args);
+        self.done_int_from_ran(token, ran)
     }
 
     /// Override execute_token_ints_raw to return the FULL jitframe
