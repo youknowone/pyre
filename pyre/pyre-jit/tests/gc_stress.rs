@@ -3310,7 +3310,7 @@ fn memoryview_derived_views_share_the_root_export() {
     run_on_worker(
         r#"
 import gc
-import weakref
+import _weakref
 
 class MyObject:
     pass
@@ -3323,7 +3323,7 @@ m = memoryview(b)[:7][1:]
 o = MyObject()
 b.m = m
 b.o = o
-wr = weakref.ref(o)
+wr = _weakref.ref(o)
 b = m = o = None
 gc.collect()
 assert wr() is None
