@@ -13,7 +13,7 @@ crate::pyre_module_init!(interp_posix);
 #[cfg(not(target_arch = "wasm32"))]
 pub use interp_posix::{W_DirEntry, W_ScandirIterator};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(unix)]
 pub(crate) use interp_posix::reinit_fork_tables_after_fork;
 
 // wasm32 has no operating system to wrap: the only filesystem the guest can

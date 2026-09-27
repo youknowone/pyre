@@ -2094,7 +2094,8 @@ mod ssl_socket_methods {
     /// reaching here.
     fn pump_error(
         transport: PyObjectRef,
-        _backend: *const pyre_native::ssl::TlsConnection,
+        #[cfg_attr(not(windows), allow(unused_variables))]
+        backend: *const pyre_native::ssl::TlsConnection,
         exit: PumpExit,
     ) -> pyre_interpreter::PyError {
         match exit {
