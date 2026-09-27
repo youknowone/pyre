@@ -11122,7 +11122,7 @@ fn exception_group_list_contains_ptr(w_list: PyObjectRef, item: PyObjectRef) -> 
     })
 }
 
-fn exception_group_condition(
+fn exception_group_get_condition_filter(
     mut w_condition: PyObjectRef,
 ) -> Result<ExceptionGroupCondition, crate::PyError> {
     let mut base_exc = lookup_exc_class("BaseException").unwrap();
@@ -11182,7 +11182,7 @@ fn exception_group_copy_attrs(
     Ok(())
 }
 
-fn exception_group_derive_and_copy(
+fn exception_group_derive_and_copy_attrs(
     w_self: PyObjectRef,
     exceptions: Vec<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -11279,6 +11279,16 @@ fn live_exception_group_condition(
     }
 }
 
+/// `app_group.py subgroup`.
+///
+/// Upstream returns `self` twice: once when the condition matches the group
+/// itself, and once at the end when no child was filtered out — the arm its own
+/// comment marks as "this is the difference to split!".  3.14's
+/// `exceptiongroup_subgroup` keeps only the first: an unfiltered subgroup is
+/// still rebuilt through `derive`, so `eg.subgroup(cond) is eg` is False and a
+/// `BaseExceptionGroup` subclass answers `ExceptionGroup` rather than itself.
+/// Identity is observable, so the second arm is not taken here.  `split` never
+/// had it on either side.
 fn exception_group_subgroup_inner(
     w_self: PyObjectRef,
     condition: &ExceptionGroupCondition,
@@ -11299,7 +11309,6 @@ fn exception_group_subgroup_inner(
     let (children_base, n_children) = pin_exception_group_children(exceptions);
     let child = |i| pyre_object::gc_roots::shadow_stack_get(children_base + i);
     let mut selected = pyre_object::gc_roots::RootedItems::new();
-    let mut modified = false;
     for i in 0..n_children {
         let exc = child(i);
         if crate::baseobjspace::isinstance(exc, base_group)? {
@@ -11308,21 +11317,18 @@ fn exception_group_subgroup_inner(
             if !unsafe { pyre_object::is_none(subgroup) } {
                 selected.push(subgroup);
             }
-            if !std::ptr::eq(subgroup, child(i)) {
-                modified = true;
-            }
         } else if live_condition().matches(child(i))? {
             selected.push(child(i));
-        } else {
-            modified = true;
         }
     }
-    if !modified {
-        Ok(w_self())
-    } else if selected.is_empty() {
+    // Upstream tracks whether the walk dropped anything and hands back `self`
+    // when it did not.  `exceptiongroup_subgroup` derives either way, which is
+    // what the identity and the answered class are measured against, so the
+    // `modified` flag has no reader here.
+    if selected.is_empty() {
         Ok(pyre_object::w_none())
     } else {
-        exception_group_derive_and_copy(w_self(), selected.take())
+        exception_group_derive_and_copy_attrs(w_self(), selected.take())
     }
 }
 
@@ -11382,14 +11388,14 @@ fn exception_group_split_inner(
         pyre_object::w_none()
     } else {
         let items: Vec<PyObjectRef> = matching_at.iter().map(|&i| kept.get(i)).collect();
-        exception_group_derive_and_copy(w_self(), items)?
+        exception_group_derive_and_copy_attrs(w_self(), items)?
     };
     derived.push(yes);
     let no = if nonmatching_at.is_empty() {
         pyre_object::w_none()
     } else {
         let items: Vec<PyObjectRef> = nonmatching_at.iter().map(|&i| kept.get(i)).collect();
-        exception_group_derive_and_copy(w_self(), items)?
+        exception_group_derive_and_copy_attrs(w_self(), items)?
     };
     derived.push(no);
     Ok((derived.get(0), derived.get(1)))
@@ -11493,7 +11499,7 @@ fn exception_group_meta_ref_eq(w_left: PyObjectRef, w_right: PyObjectRef) -> boo
     }
 }
 
-fn exception_group_same_metadata(
+fn exception_group_is_same_exception_metadata(
     w_left: PyObjectRef,
     w_right: PyObjectRef,
 ) -> Result<bool, crate::PyError> {
@@ -11537,7 +11543,7 @@ fn exception_group_same_metadata(
     })
 }
 
-fn exception_group_collect_leaves(
+fn exception_group_collect_eg_leafs(
     w_exc: PyObjectRef,
     w_leaves: PyObjectRef,
 ) -> Result<(), crate::PyError> {
@@ -11554,7 +11560,7 @@ fn exception_group_collect_leaves(
         let children = unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) };
         let kids = pyre_object::gc_roots::pin_roots(&children);
         for i in 0..children.len() {
-            exception_group_collect_leaves(
+            exception_group_collect_eg_leafs(
                 pyre_object::gc_roots::shadow_stack_get(kids + i),
                 w_leaves(),
             )?;
@@ -11586,7 +11592,7 @@ fn exception_group_projection(
     let leaves_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(Vec::new()));
     for i in 0..keep.len() {
-        exception_group_collect_leaves(
+        exception_group_collect_eg_leafs(
             pyre_object::gc_roots::shadow_stack_get(keep_base + i),
             pyre_object::gc_roots::shadow_stack_get(leaves_slot),
         )?;
@@ -11634,7 +11640,7 @@ pub(crate) fn exception_group_prep_reraise_star(
     for i in 0..n {
         let w_exc = exc_at(i);
         if !unsafe { pyre_object::is_none(w_exc) } {
-            if exception_group_same_metadata(
+            if exception_group_is_same_exception_metadata(
                 w_exc,
                 pyre_object::gc_roots::shadow_stack_get(orig_slot),
             )? {
@@ -11700,7 +11706,8 @@ fn exception_group_subgroup(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         ));
     }
     let mut w_self = args[0];
-    let condition = pyre_object::with_roots!(w_self => exception_group_condition(args[1]))?;
+    let condition =
+        pyre_object::with_roots!(w_self => exception_group_get_condition_filter(args[1]))?;
     exception_group_subgroup_inner(w_self, &condition)
 }
 
@@ -11711,7 +11718,8 @@ fn exception_group_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         ));
     }
     let mut w_self = args[0];
-    let condition = pyre_object::with_roots!(w_self => exception_group_condition(args[1]))?;
+    let condition =
+        pyre_object::with_roots!(w_self => exception_group_get_condition_filter(args[1]))?;
     let (yes, no) = exception_group_split_inner(w_self, &condition)?;
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[yes, no]);
