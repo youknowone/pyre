@@ -1,5 +1,9 @@
-//! Forward/reverse byte search of `rpython/rlib/rstring.py`
-//! (`_search_normal`), shared by `str` and `bytes`.
+//! `rpython/rlib/rstring.py`: the forward/reverse byte search
+//! (`_search_normal`), shared by `str` and `bytes`, and the `StringBuilder`
+//! value.
+
+use crate::rbuilder::rbuilder_runtime;
+use crate::unicodeobject::UnicodeValueStorage;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
@@ -542,6 +546,42 @@ pub fn search_normal(
             }
         }
         -1
+    }
+}
+
+/// `rstring.py` `StringBuilder`.
+///
+/// Holds the GC reference of the rtyped `STRINGBUILDER` GcStruct
+/// (`rbuilder.py`). The translator annotates a value of this type as
+/// `SomeStringBuilder` and lowers `new` / `append` / `build` to
+/// `StringBuilderRepr`'s `ll_new` / `ll_append` / `ll_build`; the method
+/// bodies are the untranslated implementation, so they are `not_rpython`.
+pub struct StringBuilder(i64);
+
+impl StringBuilder {
+    /// `StringBuilder(init_size)`.
+    #[inline]
+    #[majit_macros::not_rpython]
+    pub fn new(init_size: i64) -> Self {
+        Self(rbuilder_runtime::ll_new(
+            init_size,
+            rbuilder_runtime::STR_ITEM_SIZE,
+        ))
+    }
+
+    /// `StringBuilder.append(s)`.
+    #[inline]
+    #[majit_macros::not_rpython]
+    pub fn append(&mut self, s: *mut UnicodeValueStorage) {
+        rbuilder_runtime::ll_append(self.0, s as i64);
+    }
+
+    /// `StringBuilder.build()` — the rstr `STR` payload.
+    #[inline]
+    #[majit_macros::not_rpython]
+    pub fn build(&mut self) -> *mut UnicodeValueStorage {
+        rbuilder_runtime::ll_build(self.0, rbuilder_runtime::STR_ITEM_SIZE)
+            as *mut UnicodeValueStorage
     }
 }
 

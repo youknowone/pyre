@@ -8748,7 +8748,11 @@ impl<'a> Lowering<'a> {
             // itself. Aliasing the dest local to the referent Variable
             // keeps the IR small, treating `&x` as a same-Variable copy.
             Rvalue::Ref { place, .. } => {
-                let projection = Self::place_ref_is_address_of(&place);
+                // A `StringBuilder` is a GC reference (`STRINGBUILDERPTR`):
+                // `&mut self._s` is the `getfield` of that reference, not the
+                // address of an inline substructure.
+                let projection = Self::place_ref_is_address_of(&place)
+                    && !tyref_is_string_builder(&place.ty, self.llbc);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
@@ -13825,6 +13829,51 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     self.local_var[dest_local] = Some(self.emit_unit(bb_id));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `rstring.py` `StringBuilder(size)`, `.append(s)` and
+                // `.build()` are `SomeStringBuilder` operations
+                // (`rtyper/rbuilder.py` `AbstractStringBuilderRepr`), wherever
+                // the builder lives: a local or an instance attribute such as
+                // `rutf8.py` `Utf8StringBuilder._s`.
+                if let Some(method) = string_builder_method_leaf(self.llbc, &reg) {
+                    let (marker, result_ty, concrete) = match method {
+                        "new" => (
+                            crate::runtime_names::shims::STRINGBUILDER_NEW,
+                            ValueType::Ref(None),
+                            crate::model::ConcreteType::Unknown,
+                        ),
+                        "append" => (
+                            crate::runtime_names::shims::STRINGBUILDER_APPEND,
+                            ValueType::Void,
+                            crate::model::ConcreteType::Void,
+                        ),
+                        _ => (
+                            crate::runtime_names::shims::STRINGBUILDER_BUILD,
+                            ValueType::Ref(None),
+                            crate::model::ConcreteType::Unknown,
+                        ),
+                    };
+                    let res = self.graph.alloc_value_var_with_type(concrete);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![marker.to_string()],
+                                fun_decl_id: None,
+                            },
+                            args: crate::model::call_args(args.clone()),
+                            result_ty,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(if method == "append" {
+                        self.emit_unit(bb_id)
+                    } else {
+                        res
+                    });
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -26568,6 +26617,22 @@ fn str_builder_ctor_leaf(llbc: &Llbc, reg: &RegularCall) -> Option<&'static str>
     owner_accepted(deref_impl_owner_leaf(llbc, fd).as_deref()).then_some(leaf)
 }
 
+/// The `rstring.py` `StringBuilder` method a call resolves to — `new`,
+/// `append` or `build` on [`STRING_BUILDER_PATH`] — or `None`.
+fn string_builder_method_leaf(llbc: &Llbc, reg: &RegularCall) -> Option<&'static str> {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    let fd = llbc.fn_by_id(*id)?;
+    let leaf = match fd.item_meta.name_path().rsplit("::").next()? {
+        "new" => "new",
+        "append" => "append",
+        "build" => "build",
+        _ => return None,
+    };
+    (impl_owner_path(llbc, fd)? == STRING_BUILDER_PATH).then_some(leaf)
+}
+
 /// If `reg` is a functional-concat string append, its `(accumulator, piece)`
 /// argument positions.  `push` / `push_str` / `push_wtf8` (on `String` /
 /// `Wtf8Buf`) take the accumulator as `&mut self` (arg 0) and the appended
@@ -31023,6 +31088,12 @@ fn fundecl_fn_item_segments(llbc: &Llbc, fd: &FunDecl) -> Vec<String> {
 /// Returns `None` when the owner cannot be resolved, in which case the
 /// caller keeps the ordinary thin-pointer treatment.
 fn deref_impl_owner_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
+    let path = impl_owner_path(llbc, fd)?;
+    Some(path.rsplit("::").next().unwrap_or(&path).to_string())
+}
+
+/// The full `name_path` of the ADT whose inherent or trait impl owns `fd`.
+fn impl_owner_path(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
     let segs = &fd.item_meta.name;
     let last_idx = segs
         .iter()
@@ -31035,9 +31106,7 @@ fn deref_impl_owner_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
         _ => return None,
     };
     let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, impl_payload)?;
-    let td = llbc.type_by_id(adt_def_id)?;
-    let path = td.item_meta.name_path();
-    Some(path.rsplit("::").next().unwrap_or(&path).to_string())
+    Some(llbc.type_by_id(adt_def_id)?.item_meta.name_path())
 }
 
 /// Collect, from the lowered MIR,
@@ -32644,6 +32713,11 @@ fn tyref_to_value_type_with(
     if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
         return inner;
     }
+    // `rstring.py` `StringBuilder` is `SomeStringBuilder`, not the word its
+    // one-field Rust struct wraps; checked before the transparent peel.
+    if tyref_is_string_builder(ty, llbc) {
+        return ValueType::StringBuilder;
+    }
     // A transparent one-field struct has the same low-level value shape as
     // its field. Charon records the representation in `TypeDecl.layout`, so
     // preserve the field's register bank instead of treating the wrapper as
@@ -33461,6 +33535,11 @@ fn tyref_to_attr_value_type_with(
     if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
         return inner;
     }
+    // `rutf8.py` `Utf8StringBuilder._s` is a `StringBuilder` instance
+    // attribute: seed it `SomeStringBuilder`, matching the value site.
+    if tyref_is_string_builder(ty, llbc) {
+        return ValueType::StringBuilder;
+    }
     if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc, tombstoned) {
         return inner;
     }
@@ -33577,6 +33656,21 @@ fn tyref_is_string_adt(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
 }
+
+/// Whether a `TyRef` resolves (behind the usual wrappers) to `rstring.py`'s
+/// `StringBuilder`, spelled `pyre_object::rstring::StringBuilder`: a
+/// `SomeStringBuilder` value (`STRINGBUILDERPTR`), whatever word the Rust
+/// struct holds. A borrow of it is the same builder.
+fn tyref_is_string_builder(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| td.item_meta.name_path() == STRING_BUILDER_PATH)
+}
+
+/// The `name_path` of `rstring.py`'s `StringBuilder` in pyre-object.
+const STRING_BUILDER_PATH: &str = "pyre_object::rstring::StringBuilder";
 
 /// Whether a `TyRef` resolves (behind `Ref`/dedup/hash-cons wrappers) to
 /// the `str` builtin — the unsized string slice (`{"Builtin": "Str"}`).
@@ -57352,6 +57446,74 @@ mod tests {
             ),
             "the `str` residual result is SomeString"
         );
+    }
+
+    /// `rutf8.py` `Utf8StringBuilder` keeps an `rstring.py` `StringBuilder`
+    /// in `_s`.  `new` / `append_utf8` / `build` are the `SomeStringBuilder`
+    /// operations (`__majit_stringbuilder_*`) on that attribute, and the
+    /// receiver `self._s` is the `getfield` of the builder reference, not the
+    /// address of an inline substructure.  Ignored by default (loads the real
+    /// LLBC).
+    #[test]
+    #[ignore]
+    fn utf8_string_builder_methods_lower_to_string_builder_markers() {
+        use crate::runtime_names::shims::{
+            STRINGBUILDER_APPEND, STRINGBUILDER_BUILD, STRINGBUILDER_NEW,
+        };
+        let path = format!(
+            "{}/../../build/llbc/pyre-object.ullbc",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        for (method, marker) in [
+            ("new", STRINGBUILDER_NEW),
+            ("append_utf8", STRINGBUILDER_APPEND),
+            ("build", STRINGBUILDER_BUILD),
+        ] {
+            let name = format!("pyre_object::rutf8::<Impl>::{method}");
+            let graph = super::lower_function(&llbc, &name).expect("lower Utf8StringBuilder");
+            let ops: Vec<&SpaceOperation> = graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .collect();
+            let marker_args: Vec<&Vec<LinkArg>> = ops
+                .iter()
+                .filter_map(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        args,
+                        ..
+                    } if segments.len() == 1 && segments[0] == marker => Some(args),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(marker_args.len(), 1, "{name} calls {marker} once");
+            let s_reads: Vec<&SpaceOperation> = ops
+                .iter()
+                .copied()
+                .filter(
+                    |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "_s"),
+                )
+                .collect();
+            assert!(
+                s_reads.iter().all(|op| !matches!(&op.kind,
+                    OpKind::FieldRead { field, .. } if field.taken_by_address)),
+                "{name}: `self._s` is not taken by address"
+            );
+            if method != "new" {
+                let receiver = match marker_args[0].first() {
+                    Some(LinkArg::Value(v)) => v.id(),
+                    other => panic!("{name}: {marker} receiver {other:?}"),
+                };
+                assert!(
+                    s_reads
+                        .iter()
+                        .any(|op| op.result.as_ref().map(|v| v.id()) == Some(receiver)),
+                    "{name}: the {marker} receiver is the `self._s` getfield"
+                );
+            }
+        }
     }
 
     /// `get_w_locals` is `getdebug_data().map_or(PY_NULL, |data| data.w_locals)`

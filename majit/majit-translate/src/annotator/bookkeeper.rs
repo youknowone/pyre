@@ -2784,6 +2784,11 @@ impl Bookkeeper {
             .trim_start_matches("*const ")
             .trim_start_matches("*mut ")
             .trim();
+        // `rstring.py` `StringBuilder` (`pyre_object::rstring`): the
+        // `rutf8.py` `Utf8StringBuilder._s` attribute is `SomeStringBuilder`.
+        if stripped == "StringBuilder" || stripped.ends_with("rstring::StringBuilder") {
+            return SomeValue::StringBuilder(super::model::SomeStringBuilder::new());
+        }
         match stripped {
             "i8" | "i16" | "i32" | "i64" | "isize" => {
                 return super::model::s_int();
