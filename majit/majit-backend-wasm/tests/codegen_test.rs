@@ -9815,9 +9815,8 @@ fn gc_rewrite_bare_load_store_execute_with_dynamic_offset() {
 
 #[test]
 fn gc_store_halfword_at_negative_offset_uses_store16() {
-    // wasm32 NPI flags clear: GcStore offset -6, width 2. Negative
-    // offsets cannot use MemArg, so the address is folded; width 2 is
-    // i64.store16 (same path as gen_initialize_tid's HALFWORD tid).
+    // GcStore offset -6, width 2. Negative offsets cannot use MemArg, so
+    // the address is folded; width 2 is i64.store16.
     let inputargs = vec![
         InputArg::from_type_rc(Type::Ref, 0),
         InputArg::from_type_rc(Type::Int, 1),
