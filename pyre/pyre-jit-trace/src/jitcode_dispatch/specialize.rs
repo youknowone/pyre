@@ -20931,7 +20931,7 @@ pub(crate) fn try_walker_specialize_compare_op_str<Sym: WalkSym>(
     };
     // Read the ordering before the residual runs: both operands are exact
     // `str`, so nothing here can run Python code or move an object.
-    let ordering = pyre_object::unicodeobject::jit_str_compare(lhs_obj as i64, rhs_obj as i64);
+    let ordering = pyre_object::unicodeobject::jit_str_compare(lhs_obj, rhs_obj);
     let folded = majit_metainterp::eval_binop_i(cmp, ordering, 0);
 
     // The authentic answer, from the same may-force path the generic leg

@@ -6360,7 +6360,7 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             // `W_UnicodeObject.descr_lt` answers from one `_utf8` ordering
             // (`ll_unicode_cmp`). `jit_str_compare` is that ordering on WTF-8
             // bytes, which matches code-point order including lone surrogates.
-            let diff = pyre_object::unicodeobject::jit_str_compare(a as i64, b as i64);
+            let diff = pyre_object::unicodeobject::jit_str_compare(a, b);
             return Ok(w_bool_from(match op {
                 CompareOp::Lt => diff < 0,
                 CompareOp::Le => diff <= 0,
