@@ -163,6 +163,8 @@ pub struct AnalysisCache {
     can_invalidate: AnalyzedCalls,
     /// `collect_analyzer` (collectanalyze.py) — can this call trigger GC?
     can_collect: AnalyzedCalls,
+    /// `readwrite_analyzer` (writeanalyze.py `ReadWriteAnalyzer`).
+    readwrite: ReadWriteAnalyzedCalls,
 }
 
 impl Default for AnalysisCache {
@@ -174,75 +176,79 @@ impl Default for AnalysisCache {
             random_effects: new_analyzed_calls(),
             can_invalidate: new_analyzed_calls(),
             can_collect: new_analyzed_calls(),
+            readwrite: UnionFind::new(|_| Dependency::new(ReadWriteEffects::bottom_result())),
         }
     }
 }
 
-/// RPython: readwrite_analyzer.analyze(op) return value.
-///
-/// Represents the set of read/write effects collected from graph traversal.
-/// RPython uses a set of tuples like `("struct", T, fieldname)` and
-/// `compute_bitstrings(all_descrs)` (`effectinfo.py`) materializes
-/// the EffectInfo bitstrings at the end via
-/// `bitstring.make_bitstring([descr.ei_index for descr in set])`.  Pyre
-/// telescopes that pipeline by collecting the per-descr `ei_index`
-/// values directly (DescrIndexRegistry already holds them); each `Vec<u32>`
-/// is the running equivalent of one of PyPy's `_readonly_*`/`_write_*`
-/// frozensets, deduped + sorted at conversion time.  Storing as `Vec<u32>`
-/// rather than `u64` removes the 64-descr ceiling so bitstrings scale
-/// with the global descr count, matching PyPy's arbitrary-length
-/// `bitstring.py make_bitstring` output.
-#[derive(Clone)]
-pub struct WriteAnalysis {
-    pub read_fields: Vec<u32>,
-    pub write_fields: Vec<u32>,
-    pub read_arrays: Vec<u32>,
-    pub write_arrays: Vec<u32>,
-    pub read_interiorfields: Vec<u32>,
-    pub write_interiorfields: Vec<u32>,
-    /// `effectinfo.py` `readonly_descrs_fields = []`
-    /// populated via `add_struct → cpu.fielddescrof(T, fieldname)` from
-    /// `("readstruct", T, fieldname)` tuples.
-    pub field_read_descrs: Vec<(
-        majit_ir::descr::DescrRef,
-        Option<majit_ir::effectinfo::DescrSetMember>,
-    )>,
-    /// `effectinfo.py` `write_descrs_fields = []` from
-    /// `("struct", T, fieldname)` tuples.
-    pub field_write_descrs: Vec<(
-        majit_ir::descr::DescrRef,
-        Option<majit_ir::effectinfo::DescrSetMember>,
-    )>,
-    /// `effectinfo.py` `readonly_descrs_interiorfields = []`
-    /// populated via `add_interiorfield → cpu.interiorfielddescrof(T,
-    /// fieldname)` from `("readinteriorfield", T, fieldname)` tuples.
-    pub interior_read_descrs: Vec<(
-        majit_ir::descr::DescrRef,
-        Option<majit_ir::effectinfo::DescrSetMember>,
-    )>,
-    /// `effectinfo.py` `write_descrs_interiorfields = []`
-    /// from `("interiorfield", T, fieldname)` tuples.
-    pub interior_write_descrs: Vec<(
-        majit_ir::descr::DescrRef,
-        Option<majit_ir::effectinfo::DescrSetMember>,
-    )>,
-    /// `effectinfo.py` `readonly_descrs_arrays = []` populated
-    /// via `add_array → cpu.arraydescrof(ARRAY)` from `("readarray", T)`
-    /// tuples (plus `("readinteriorfield", T, _)` tuples synthesised into
-    /// `("readarray", T)` at `effectinfo.py`).
-    pub array_read_descrs: Vec<(
-        majit_ir::descr::DescrRef,
-        Option<majit_ir::effectinfo::DescrSetMember>,
-    )>,
-    /// `effectinfo.py` `write_descrs_arrays = []` mirror of
-    /// the read side, populated from `("array", T)` tuples (plus
-    /// `("interiorfield", T, _)` synthesised into `("array", T)`).
-    pub array_write_descrs: Vec<(
-        majit_ir::descr::DescrRef,
-        Option<majit_ir::effectinfo::DescrSetMember>,
-    )>,
-    /// RPython: `effects is top_set` — unanalyzable (random effects).
-    pub is_top: bool,
+/// The first element of one `writeanalyze.py` effect tuple.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RwTag {
+    /// `("struct", T, fieldname)`.
+    Struct,
+    /// `("readstruct", T, fieldname)`.
+    ReadStruct,
+    /// `("array", T)`.
+    Array,
+    /// `("readarray", T)`.
+    ReadArray,
+    /// `("interiorfield", T, fieldname)`.
+    InteriorField,
+    /// `("readinteriorfield", T, fieldname)`.
+    ReadInteriorField,
+}
+
+/// One effect tuple's identity. `index` is the `DescrIndexRegistry` slot
+/// of `(T, fieldname)` / `ARRAY`, so two tuples naming the same
+/// `(T, fieldname)` share it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RwKey {
+    tag: RwTag,
+    index: u32,
+}
+
+/// The rest of an effect tuple: what `add_struct` / `add_array` /
+/// `add_interiorfield` (`effectinfo.py`) hand to `cpu.*descrof`.
+#[derive(Clone, Debug)]
+pub enum RwOperand {
+    Field {
+        owner_root: Option<String>,
+        owner_id: Option<majit_ir::descr::StructId>,
+        name: String,
+    },
+    Array {
+        array_type_id: Option<String>,
+        ir_type: majit_ir::value::Type,
+        len_offset: Option<usize>,
+    },
+    InteriorField {
+        array_type_id: Option<String>,
+        field_name: String,
+        len_offset: Option<usize>,
+    },
+}
+
+/// `readwrite_analyzer.analyze(op)` result (`writeanalyze.py`): `top_set`,
+/// or a set of effect tuples. The set keeps insertion order, and the first
+/// operand stored for a key stays.
+#[derive(Clone, Debug)]
+pub enum ReadWriteEffects {
+    Top,
+    Set(std::sync::Arc<indexmap::IndexMap<RwKey, RwOperand>>),
+}
+
+impl ReadWriteEffects {
+    fn insert(&mut self, key: RwKey, operand: RwOperand) {
+        if let Self::Set(set) = self {
+            std::sync::Arc::make_mut(set).entry(key).or_insert(operand);
+        }
+    }
+
+    fn singleton(key: RwKey, operand: RwOperand) -> Self {
+        let mut result = Self::bottom_result();
+        result.insert(key, operand);
+        result
+    }
 }
 
 type EffectDescr = (
@@ -250,94 +256,20 @@ type EffectDescr = (
     Option<majit_ir::effectinfo::DescrSetMember>,
 );
 
-fn extend_indices(dest: &mut Vec<u32>, src: &[u32]) {
-    if dest.is_empty() {
-        dest.extend_from_slice(src);
-        return;
-    }
-    for idx in src {
-        if !dest.contains(idx) {
-            dest.push(*idx);
-        }
-    }
-}
-
-fn extend_descrs(dest: &mut Vec<EffectDescr>, src: Vec<EffectDescr>) {
-    for item in src {
-        let idx = item.0.index();
-        if dest.iter().any(|have| have.0.index() == idx) {
-            continue;
-        }
-        dest.push(item);
-    }
-}
-
-/// `add_to_result` / `join_two_results` (`writeanalyze.py`).
-///
-/// Index and descr vectors keep the first-seen order of a seen-set
-/// walk: a graph already accounted for contributes nothing the second
-/// time. `top_set` swallows the other side.
-fn merge_write_analysis(into: &mut WriteAnalysis, other: WriteAnalysis) {
-    if into.is_top || other.is_top {
-        *into = WriteAnalysis::top_result();
-        return;
-    }
-    extend_indices(&mut into.read_fields, &other.read_fields);
-    extend_indices(&mut into.write_fields, &other.write_fields);
-    extend_indices(&mut into.read_arrays, &other.read_arrays);
-    extend_indices(&mut into.write_arrays, &other.write_arrays);
-    extend_indices(&mut into.read_interiorfields, &other.read_interiorfields);
-    extend_indices(&mut into.write_interiorfields, &other.write_interiorfields);
-    extend_descrs(&mut into.field_read_descrs, other.field_read_descrs);
-    extend_descrs(&mut into.field_write_descrs, other.field_write_descrs);
-    extend_descrs(&mut into.interior_read_descrs, other.interior_read_descrs);
-    extend_descrs(&mut into.interior_write_descrs, other.interior_write_descrs);
-    extend_descrs(&mut into.array_read_descrs, other.array_read_descrs);
-    extend_descrs(&mut into.array_write_descrs, other.array_write_descrs);
-}
-
-impl AnalyzerResult for WriteAnalysis {
+impl AnalyzerResult for ReadWriteEffects {
     /// `bottom_result` (`writeanalyze.py`): `empty_set`.
     fn bottom_result() -> Self {
-        Self {
-            read_fields: Vec::new(),
-            write_fields: Vec::new(),
-            read_arrays: Vec::new(),
-            write_arrays: Vec::new(),
-            read_interiorfields: Vec::new(),
-            write_interiorfields: Vec::new(),
-            field_read_descrs: Vec::new(),
-            field_write_descrs: Vec::new(),
-            interior_read_descrs: Vec::new(),
-            interior_write_descrs: Vec::new(),
-            array_read_descrs: Vec::new(),
-            array_write_descrs: Vec::new(),
-            is_top: false,
-        }
+        Self::Set(std::sync::Arc::default())
     }
 
     /// `top_result` (`writeanalyze.py`): `top_set`.
     fn top_result() -> Self {
-        Self {
-            read_fields: Vec::new(),
-            write_fields: Vec::new(),
-            read_arrays: Vec::new(),
-            write_arrays: Vec::new(),
-            read_interiorfields: Vec::new(),
-            write_interiorfields: Vec::new(),
-            field_read_descrs: Vec::new(),
-            field_write_descrs: Vec::new(),
-            interior_read_descrs: Vec::new(),
-            interior_write_descrs: Vec::new(),
-            array_read_descrs: Vec::new(),
-            array_write_descrs: Vec::new(),
-            is_top: true,
-        }
+        Self::Top
     }
 
     /// `is_top_result` (`writeanalyze.py`): `result is top_set`.
     fn is_top_result(result: &Self) -> bool {
-        result.is_top
+        matches!(result, Self::Top)
     }
 
     /// `result_builder` (`writeanalyze.py`): `set()`.
@@ -346,13 +278,24 @@ impl AnalyzerResult for WriteAnalysis {
     }
 
     /// `add_to_result` (`writeanalyze.py`).
-    fn add_to_result(mut result: Self, other: Self) -> Self {
-        merge_write_analysis(&mut result, other);
-        result
+    fn add_to_result(result: Self, other: Self) -> Self {
+        match (result, other) {
+            (Self::Top, _) | (_, Self::Top) => Self::Top,
+            (Self::Set(mut set), Self::Set(other)) => {
+                if set.is_empty() {
+                    return Self::Set(other);
+                }
+                let into = std::sync::Arc::make_mut(&mut set);
+                for (key, operand) in other.iter() {
+                    into.entry(*key).or_insert_with(|| operand.clone());
+                }
+                Self::Set(set)
+            }
+        }
     }
 
-    /// `finalize_builder` (`writeanalyze.py`). The builder is already
-    /// the deduped effect set, so freezing is the identity.
+    /// `finalize_builder` (`writeanalyze.py`): `frozenset(result)`. The
+    /// `Arc` is the frozen set: every later merge copies it on write.
     fn finalize_builder(result: Self) -> Self {
         result
     }
@@ -363,52 +306,14 @@ impl AnalyzerResult for WriteAnalysis {
     }
 }
 
-/// One local op the read/write walk replays. Field and array indices are
-/// assigned at replay time, in the same DFS order as a fresh graph scan.
-/// Array identity and call targets are resolved then too: both read the
-/// call-control registries, which can still gain a graph after the first
-/// time this one is reached.
-enum ReadWriteReplayOp {
-    FieldRead {
-        owner_root: Option<String>,
-        owner_id: Option<majit_ir::descr::StructId>,
-        name: String,
-    },
-    FieldWrite {
-        owner_root: Option<String>,
-        owner_id: Option<majit_ir::descr::StructId>,
-        name: String,
-    },
-    ArrayRead {
-        base: crate::flowspace::model::Variable,
-        item_ty: crate::model::ValueType,
-        array_type_id: Option<String>,
-        nolength: bool,
-    },
-    ArrayWrite {
-        base: crate::flowspace::model::Variable,
-        item_ty: crate::model::ValueType,
-        array_type_id: Option<String>,
-        nolength: bool,
-    },
-    InteriorRead {
-        base: crate::flowspace::model::Variable,
-        field_name: String,
-        array_type_id: Option<String>,
-    },
-    InteriorWrite {
-        base: crate::flowspace::model::Variable,
-        field_name: String,
-        array_type_id: Option<String>,
-    },
-    Call(CallTarget),
-    /// `None` is an unknown indirect family (`top_set`).
-    Indirect(Option<Vec<CallPath>>),
-}
+/// `readwrite_analyzer._analyzed_calls`, keyed by the graph a path names.
+type ReadWriteAnalyzedCalls = UnionFind<GraphKey, Dependency<ReadWriteEffects>>;
 
-/// What `producer_array_identity` reads off a result. The answer is still
-/// computed at lookup from `CallControl`, because field types and callee
-/// return types can change after the graph is scanned.
+/// `DependencyTracker(self.readwrite_analyzer)` (`call.py` `seen_rw`).
+type ReadWriteTracker = DependencyTracker<ReadWriteEffects, GraphKey>;
+
+/// What `resolve_array_identity` reads off a result, standing in for
+/// `op.args[0].concretetype`.
 enum ValueProducer {
     Field {
         owner_root: Option<String>,
@@ -422,20 +327,68 @@ enum ValueProducer {
     },
 }
 
-/// Local ops of one graph, scanned once. `value_producers` / `phi_sources`
-/// keep the shape `resolve_array_identity` reads off the live graph.
-struct ReadWriteReplay {
-    ops: Vec<ReadWriteReplayOp>,
+/// `compute_graph_info(graph)` of the read/write analyzer: the per-graph
+/// facts `analyze_simple_operation` reads. `value_producers` /
+/// `phi_sources` give each array operand its ARRAY type.
+struct ReadWriteGraphInfo {
     value_producers: HashMap<crate::flowspace::model::Variable, ValueProducer>,
     phi_sources: HashMap<crate::flowspace::model::Variable, Option<LinkArg>>,
 }
 
-impl Default for ReadWriteReplay {
-    fn default() -> Self {
+impl ReadWriteGraphInfo {
+    fn new(graph: &FunctionGraph) -> Self {
+        let mut value_producers: HashMap<crate::flowspace::model::Variable, ValueProducer> =
+            HashMap::new();
+        for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+            let Some(var) = op.result.as_ref() else {
+                continue;
+            };
+            // `producer_array_identity` returns `None` for every other kind,
+            // including `ArrayRead` with no `array_type_id` and `Input`, the
+            // same answer as a missing key. A later ignored result clears an
+            // earlier kept one so last-insert still wins.
+            let kept = match &op.kind {
+                OpKind::FieldRead { field, .. } => Some(ValueProducer::Field {
+                    owner_root: field.owner_root.clone(),
+                    name: field.name.clone(),
+                }),
+                OpKind::ArrayRead {
+                    array_type_id: Some(array_type_id),
+                    ..
+                } => Some(ValueProducer::Array {
+                    array_type_id: array_type_id.clone(),
+                }),
+                OpKind::Call { target, .. } => Some(ValueProducer::Call {
+                    target: target.clone(),
+                }),
+                _ => None,
+            };
+            match kept {
+                Some(kind) => {
+                    value_producers.insert(var.clone(), kind);
+                }
+                None => {
+                    value_producers.remove(var);
+                }
+            }
+        }
+        let mut phi_sources: HashMap<crate::flowspace::model::Variable, Option<LinkArg>> =
+            HashMap::new();
+        for block in &graph.blocks {
+            for link in &block.exits {
+                if let Some(target_block) = graph.blocks.get(link.target.0) {
+                    for (target_arg, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+                        phi_sources
+                            .entry(target_arg.clone())
+                            .and_modify(|entry| *entry = None)
+                            .or_insert_with(|| Some(src.clone()));
+                    }
+                }
+            }
+        }
         Self {
-            ops: Vec::new(),
-            value_producers: HashMap::new(),
-            phi_sources: HashMap::new(),
+            value_producers,
+            phi_sources,
         }
     }
 }
@@ -1679,21 +1632,12 @@ pub struct CallControl {
     /// (`effectinfo.py compute_bitstrings`).  Lives on `CallControl`
     /// (not `AnalysisCache`) so the bytecode emit path
     /// (`assembler.rs::arraydescrof`) and the writeanalyze walker
-    /// (`collect_readwrite_effects`) consult a single source of truth — two
+    /// (`readwrite_simple_operation`) consult a single source of truth — two
     /// independent registries would assign different indices to the
     /// same `(item_ty, array_type_id)` pair and alias distinct ARRAY
     /// identities onto each other at `force_from_effectinfo`
     /// (`heap.py:540-560`, `heap.rs`'s `array_effect_index`).
     pub descr_indices: DescrIndexRegistry,
-
-    /// Local read/write ops of one graph, scanned once. Later queries
-    /// replay this list with a fresh `seen` set, so descr-mint side
-    /// effects stay in the same DFS order as a walk of the live graph.
-    /// Keyed by [`GraphKey`] (resolved through `path_to_key`): every alias
-    /// spelling of one source funcobj shares the entry, and a mutation of
-    /// that graph drops exactly that entry. A graph that is not registered
-    /// yet is left out of the map.
-    readwrite_replay: std::cell::RefCell<HashMap<GraphKey, std::sync::Arc<ReadWriteReplay>>>,
 
     /// The effect analyzers' `_analyzed_calls` results. `call.py`
     /// builds `raise_analyzer`, `virtualizable_analyzer`,
@@ -2195,7 +2139,7 @@ impl StructLayout {
 #[derive(Default)]
 pub struct DescrIndexRegistry {
     /// Interior-mutable so that both the writeanalyze walker
-    /// (`collect_readwrite_effects`) and the bytecode emit path
+    /// (`readwrite_simple_operation`) and the bytecode emit path
     /// (`assembler.rs::arraydescrof`) can publish ei_index through
     /// `&CallControl` without threading a `&mut` borrow through
     /// `getcalldescr(&self, …)` and `assemble_with_callcontrol`.
@@ -2339,7 +2283,6 @@ impl CallControl {
             has_libffi_call: false,
             callinfocollection: majit_ir::CallInfoCollection::new(),
             descr_indices: DescrIndexRegistry::default(),
-            readwrite_replay: std::cell::RefCell::new(HashMap::new()),
             analysis_cache: AnalysisCache::default(),
             struct_size_log: std::cell::RefCell::new(None),
             field_footprint: std::cell::RefCell::new(FieldDescrofMemoEntry::default()),
@@ -3563,14 +3506,6 @@ impl CallControl {
             graph.func.merge_from(&pending);
         }
         self.function_graphs.insert(path.clone(), graph);
-        // A new key has no replay yet. An overwrite merges into the slot
-        // this path now names (`GraphStore::insert`): that shared graph is
-        // the one whose replay is stale, including every alias already
-        // pointing at the same key. A previous key this path left behind
-        // is not modified.
-        if let Some(key) = self.function_graphs.key_for(&path) {
-            self.readwrite_replay.borrow_mut().remove(&key);
-        }
     }
 
     /// Read the [`FuncEffects`](crate::model::FuncEffects) for `path`:
@@ -4456,7 +4391,6 @@ impl CallControl {
     /// argument (`op.args = [c_funcptr, op.args[0]]`). The residual
     /// helper is already `executioncontext::jit_force_virtualizable`.
     fn replace_force_virtualizable_with_call(&mut self) -> usize {
-        self.readwrite_replay.borrow_mut().clear();
         let mut count = 0;
         for graph in self.function_graphs.values_mut() {
             for block in &mut graph.blocks {
@@ -4645,7 +4579,6 @@ impl CallControl {
     /// and the recursive effect analyzers inspect the registered source graph
     /// first and would read `graphs: None` as an unknown family/top result.
     fn materialize_deferred_indirect_families(&mut self) {
-        self.readwrite_replay.borrow_mut().clear();
         let trait_method_impls = &self.trait_method_impls;
         let function_graphs = &mut self.function_graphs;
         for graph in function_graphs.values_mut() {
@@ -5769,11 +5702,6 @@ impl CallControl {
         op_idx: usize,
         resolved: CallPath,
     ) {
-        // Replay is keyed by the shared graph, so every alias of this
-        // caller drops together. The stamp mutates that one graph.
-        if let Some(key) = self.function_graphs.key_for(caller) {
-            self.readwrite_replay.borrow_mut().remove(&key);
-        }
         let Some(graph) = self.function_graphs.get_mut(caller) else {
             return;
         };
@@ -8038,15 +7966,8 @@ impl CallControl {
             ),
         };
         let effects = match shape {
-            CallShape::Direct(target) => {
-                analyze_readwrite(target, &self.function_graphs, self, &self.descr_indices)
-            }
-            CallShape::Indirect(graphs) => analyze_readwrite_indirect_family(
-                graphs,
-                &self.function_graphs,
-                self,
-                &self.descr_indices,
-            ),
+            CallShape::Direct(target) => self.cached_readwrite(target, cache),
+            CallShape::Indirect(graphs) => self.cached_readwrite_family(graphs, cache),
         };
         let can_collect = match shape {
             CallShape::Direct(target) => self.cached_can_collect(target, cache),
@@ -8063,7 +7984,7 @@ impl CallControl {
             CallShape::Indirect(_) => EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
         };
         let effectinfo = effectinfo_from_writeanalyze(
-            effects,
+            &effects,
             extraeffect,
             oopspecindex,
             can_invalidate,
@@ -8154,91 +8075,268 @@ impl Default for CallControl {
     }
 }
 
-// ── readwrite_analyzer / collect_analyzer (effectinfo.py effectinfo_from_writeanalyze) ──
+// ── readwrite_analyzer (writeanalyze.py ReadWriteAnalyzer) ──
 //
 // RPython: self.readwrite_analyzer.analyze(op, self.seen_rw) → effects
-// RPython: self.collect_analyzer.analyze(op, self.seen_gc) → can_collect
 // Then: effectinfo_from_writeanalyze(effects, cpu, ..., can_collect)
 
-/// RPython: readwrite_analyzer.analyze(op, self.seen_rw).
-///
-/// Traverses the call graph to collect read/write effects as a WriteAnalysis.
-/// This is the Rust equivalent of RPython's ReadWriteAnalyzer producing a
-/// set of ("struct"/"array"/"interiorfield", T, fieldname) tuples.
-/// Each graph's local ops are scanned once; every query still walks the
-/// closure so descr-mint side effects match a fresh seen-set DFS.
-fn analyze_readwrite(
-    target: &CallTarget,
-    function_graphs: &GraphStore,
-    cc: &CallControl,
-    descr_indices: &DescrIndexRegistry,
-) -> WriteAnalysis {
-    let Some(path) = cc.target_to_path(target) else {
-        return WriteAnalysis::bottom_result();
-    };
-    let mut analysis = WriteAnalysis::bottom_result();
-    let mut minted = MintedDescrs::default();
-    let mut seen = rustc_hash::FxHashSet::default();
-    let mut is_top = false;
-    apply_readwrite_replay(
-        &path,
-        function_graphs,
-        cc,
-        descr_indices,
-        &mut seen,
-        &mut analysis,
-        &mut minted,
-        &mut is_top,
-    );
-    analysis.is_top = is_top;
-    analysis
-}
-
-/// RPython `readwrite_analyzer.analyze(op, seen)` for `indirect_call`.
-///
-/// Unknown families (`graphs=None`) are `top_set`; known families are the
-/// union of every member graph's effects (`analyze_indirect_call`).
-fn analyze_readwrite_indirect_family(
-    graphs: Option<&[CallPath]>,
-    function_graphs: &GraphStore,
-    cc: &CallControl,
-    descr_indices: &DescrIndexRegistry,
-) -> WriteAnalysis {
-    let Some(graphs) = graphs else {
-        return WriteAnalysis::top_result();
-    };
-    let mut analysis = WriteAnalysis::bottom_result();
-    let mut minted = MintedDescrs::default();
-    let mut seen = rustc_hash::FxHashSet::default();
-    let mut is_top = false;
-    for path in graphs {
-        apply_readwrite_replay(
-            path,
-            function_graphs,
-            cc,
-            descr_indices,
-            &mut seen,
-            &mut analysis,
-            &mut minted,
-            &mut is_top,
-        );
-        if is_top {
-            break;
+impl CallControl {
+    /// `readwrite_analyzer.analyze(op, self.seen_rw)` (`call.py`
+    /// `getcalldescr`) for a `direct_call`.
+    fn cached_readwrite(&self, target: &CallTarget, cache: &mut AnalysisCache) -> ReadWriteEffects {
+        match self.target_to_path(target) {
+            Some(path) => {
+                self.analyze_readwrite(&path, &mut ReadWriteTracker::new(), &mut cache.readwrite)
+            }
+            None => ReadWriteEffects::bottom_result(),
         }
     }
-    analysis.is_top = is_top;
-    analysis
-}
 
-//
-// In RPython, the ReadWriteAnalyzer produces a set of tuples like:
-//   ("struct", T, fieldname), ("readstruct", T, fieldname),
-//   ("array", T), ("readarray", T), etc.
-// These are converted to field/array descriptor bitsets.
-//
-// In majit, we scan the callee graph's ops directly for
-// FieldRead/FieldWrite/ArrayRead/ArrayWrite and collect their
-// descriptor indices into EffectInfo's bitset fields.
+    /// `readwrite_analyzer.analyze(op, self.seen_rw)` for an
+    /// `indirect_call`: `graphs is None` is `top_result()`.
+    fn cached_readwrite_family(
+        &self,
+        graphs: Option<&[CallPath]>,
+        cache: &mut AnalysisCache,
+    ) -> ReadWriteEffects {
+        match graphs {
+            Some(graphs) => self.analyze_readwrite_indirect(
+                graphs,
+                &mut ReadWriteTracker::new(),
+                &mut cache.readwrite,
+            ),
+            None => ReadWriteEffects::top_result(),
+        }
+    }
+
+    /// `analyze_direct_call(graph, seen)` (graphanalyze.py) of the
+    /// read/write analyzer.
+    fn analyze_readwrite(
+        &self,
+        path: &CallPath,
+        seen: &mut ReadWriteTracker,
+        analyzed: &mut ReadWriteAnalyzedCalls,
+    ) -> ReadWriteEffects {
+        // `analyze_external_call`: a funcobj without a graph has no
+        // `_callbacks` here, so `bottom_result()`.
+        let (Some(key), Some(graph)) = (
+            self.function_graphs.key_for(path),
+            self.function_graphs.get(path),
+        ) else {
+            return ReadWriteEffects::bottom_result();
+        };
+        if !seen.enter(key.clone(), analyzed) {
+            return seen.get_cached_result(key, analyzed);
+        }
+        let graphinfo = ReadWriteGraphInfo::new(graph);
+        let mut result = ReadWriteEffects::result_builder();
+        'blocks: for block in &graph.blocks {
+            for op in &block.operations {
+                // graphanalyze.py `analyze(op, seen, graphinfo)`.
+                let effects = match &op.kind {
+                    OpKind::Call { target, .. } => match self.target_to_path(target) {
+                        Some(callee) => self.analyze_readwrite(&callee, seen, analyzed),
+                        None => ReadWriteEffects::bottom_result(),
+                    },
+                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                        Some(graphs) => self.analyze_readwrite_indirect(graphs, seen, analyzed),
+                        None => ReadWriteEffects::top_result(),
+                    },
+                    kind => self.readwrite_simple_operation(kind, &graphinfo),
+                };
+                result = ReadWriteEffects::add_to_result(result, effects);
+                if ReadWriteEffects::is_top_result(&result) {
+                    break 'blocks;
+                }
+            }
+        }
+        let result = ReadWriteEffects::finalize_builder(result);
+        seen.leave_with(key, result.clone(), analyzed);
+        result
+    }
+
+    /// `analyze_indirect_call(graphs, seen)` (graphanalyze.py).
+    fn analyze_readwrite_indirect(
+        &self,
+        graphs: &[CallPath],
+        seen: &mut ReadWriteTracker,
+        analyzed: &mut ReadWriteAnalyzedCalls,
+    ) -> ReadWriteEffects {
+        let mut result = ReadWriteEffects::result_builder();
+        for graph in graphs {
+            result = ReadWriteEffects::add_to_result(
+                result,
+                self.analyze_readwrite(graph, seen, analyzed),
+            );
+            if ReadWriteEffects::is_top_result(&result) {
+                break;
+            }
+        }
+        ReadWriteEffects::finalize_builder(result)
+    }
+
+    /// `ReadWriteAnalyzer.analyze_simple_operation` (writeanalyze.py),
+    /// with the write half of `WriteAnalyzer.analyze_simple_operation`.
+    fn readwrite_simple_operation(
+        &self,
+        kind: &OpKind,
+        graphinfo: &ReadWriteGraphInfo,
+    ) -> ReadWriteEffects {
+        match kind {
+            // `getfield` / `setfield`.
+            OpKind::FieldRead { field, .. } => {
+                self.readwrite_struct_result(RwTag::ReadStruct, field)
+            }
+            OpKind::FieldWrite { field, .. } => self.readwrite_struct_result(RwTag::Struct, field),
+            // `getarrayitem` / `setarrayitem`.
+            OpKind::ArrayRead {
+                base,
+                item_ty,
+                array_type_id,
+                nolength,
+                ..
+            } => self.readwrite_array_result(
+                RwTag::ReadArray,
+                base,
+                item_ty,
+                array_type_id,
+                *nolength,
+                graphinfo,
+            ),
+            OpKind::ArrayWrite {
+                base,
+                item_ty,
+                array_type_id,
+                nolength,
+                ..
+            } => self.readwrite_array_result(
+                RwTag::Array,
+                base,
+                item_ty,
+                array_type_id,
+                *nolength,
+                graphinfo,
+            ),
+            // `getinteriorfield` / `setinteriorfield`.
+            OpKind::InteriorFieldRead {
+                base,
+                field,
+                array_type_id,
+                ..
+            } => self.readwrite_interiorfield_result(
+                RwTag::ReadInteriorField,
+                base,
+                &field.name,
+                array_type_id,
+                graphinfo,
+            ),
+            OpKind::InteriorFieldWrite {
+                base,
+                field,
+                array_type_id,
+                ..
+            } => self.readwrite_interiorfield_result(
+                RwTag::InteriorField,
+                base,
+                &field.name,
+                array_type_id,
+                graphinfo,
+            ),
+            _ => ReadWriteEffects::bottom_result(),
+        }
+    }
+
+    /// `frozenset([(tag, op.args[0].concretetype, op.args[1].value)])`.
+    fn readwrite_struct_result(
+        &self,
+        tag: RwTag,
+        field: &crate::model::FieldDescriptor,
+    ) -> ReadWriteEffects {
+        let index = self
+            .descr_indices
+            .field_index(&field.owner_root, &field.name);
+        ReadWriteEffects::singleton(
+            RwKey { tag, index },
+            RwOperand::Field {
+                owner_root: field.owner_root.clone(),
+                owner_id: field.owner_id,
+                name: field.name.clone(),
+            },
+        )
+    }
+
+    /// `_array_result(op.args[0].concretetype)`.
+    fn readwrite_array_result(
+        &self,
+        tag: RwTag,
+        base: &crate::flowspace::model::Variable,
+        item_ty: &crate::model::ValueType,
+        array_type_id: &Option<String>,
+        nolength: bool,
+        graphinfo: &ReadWriteGraphInfo,
+    ) -> ReadWriteEffects {
+        let resolved_id = resolve_array_identity(
+            base,
+            array_type_id,
+            &graphinfo.value_producers,
+            &graphinfo.phi_sources,
+            self,
+        )
+        .or_else(|| array_type_id.clone());
+        let headerless =
+            nolength || crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref());
+        let len_offset = if headerless { None } else { Some(0) };
+        let index = self.descr_indices.array_index(
+            value_type_discriminant(item_ty),
+            &resolved_id,
+            len_offset,
+        );
+        ReadWriteEffects::singleton(
+            RwKey { tag, index },
+            RwOperand::Array {
+                array_type_id: resolved_id,
+                ir_type: effect_array_ir_type(item_ty),
+                len_offset,
+            },
+        )
+    }
+
+    /// `_interiorfield_result(op.args[0].concretetype, name)`.
+    fn readwrite_interiorfield_result(
+        &self,
+        tag: RwTag,
+        base: &crate::flowspace::model::Variable,
+        field_name: &str,
+        array_type_id: &Option<String>,
+        graphinfo: &ReadWriteGraphInfo,
+    ) -> ReadWriteEffects {
+        let resolved_id = resolve_array_identity(
+            base,
+            array_type_id,
+            &graphinfo.value_producers,
+            &graphinfo.phi_sources,
+            self,
+        )
+        .or_else(|| array_type_id.clone());
+        let len_offset =
+            if crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref()) {
+                None
+            } else {
+                Some(0)
+            };
+        let index = self
+            .descr_indices
+            .interiorfield_index(&resolved_id, field_name);
+        ReadWriteEffects::singleton(
+            RwKey { tag, index },
+            RwOperand::InteriorField {
+                array_type_id: resolved_id,
+                field_name: field_name.to_string(),
+                len_offset,
+            },
+        )
+    }
+}
 
 /// `effectinfo.py` `effectinfo_from_writeanalyze`: a top set or
 /// `EF_RANDOM_EFFECTS` keeps every descr list `None` and forces
@@ -8323,52 +8421,231 @@ fn canonicalize_keyed_descrs(
     Some((descrs, keys))
 }
 
+/// `add_struct` (`effectinfo.py`): `cpu.fielddescrof(T, fieldname)`.
+fn add_struct(
+    indices: &mut Vec<u32>,
+    descrs: &mut Vec<EffectDescr>,
+    index: u32,
+    operand: &RwOperand,
+    cc: &CallControl,
+) {
+    let RwOperand::Field {
+        owner_root,
+        owner_id,
+        name,
+    } = operand
+    else {
+        unreachable!("struct effect {operand:?} carries no field");
+    };
+    indices.push(index);
+    if let Some(owner) = owner_root.as_deref()
+        && let Some((descr, key)) = cc.fielddescrof_keyed(index, owner, *owner_id, name)
+    {
+        descrs.push((descr, Some(key)));
+    }
+}
+
+/// `add_array` (`effectinfo.py`): `cpu.arraydescrof(ARRAY)`.
+fn add_array(
+    indices: &mut Vec<u32>,
+    descrs: &mut Vec<EffectDescr>,
+    index: u32,
+    operand: &RwOperand,
+    cc: &CallControl,
+) {
+    let RwOperand::Array {
+        array_type_id,
+        ir_type,
+        len_offset,
+    } = operand
+    else {
+        unreachable!("array effect {operand:?} carries no array");
+    };
+    indices.push(index);
+    descrs.push(cc.arraydescrof_keyed(index, array_type_id, *ir_type, *len_offset));
+}
+
+/// `add_interiorfield` (`effectinfo.py`):
+/// `cpu.interiorfielddescrof(T, fieldname)`.
+fn add_interiorfield(
+    indices: &mut Vec<u32>,
+    descrs: &mut Vec<EffectDescr>,
+    index: u32,
+    operand: &RwOperand,
+    cc: &CallControl,
+) {
+    let RwOperand::InteriorField {
+        array_type_id,
+        field_name,
+        ..
+    } = operand
+    else {
+        unreachable!("interiorfield effect {operand:?} carries no interior field");
+    };
+    indices.push(index);
+    if let Some((descr, key)) = cc.interiorfielddescrof_keyed(index, array_type_id, field_name) {
+        descrs.push((descr, Some(key)));
+    }
+}
+
 pub fn effectinfo_from_writeanalyze(
-    effects: WriteAnalysis,
+    effects: &ReadWriteEffects,
     extraeffect: ExtraEffect,
     oopspecindex: OopSpecIndex,
     can_invalidate: bool,
     can_collect: bool,
     extradescrs: Option<Vec<DescrRef>>,
     callee_path: &str,
-    _cc: &CallControl,
+    cc: &CallControl,
     call_release_gil_target: (u64, i32),
 ) -> EffectInfo {
-    // `effectinfo_from_writeanalyze`: top_set or EF_RANDOM_EFFECTS ⇒ every
-    // descr list is None and extraeffect is EF_RANDOM_EFFECTS. can_collect
-    // is True (the same function: forces ⇒ can_collect, and random
-    // effects are above that threshold).
-    if effects.is_top || extraeffect == ExtraEffect::RandomEffects {
-        return effectinfo_random_effects(
-            oopspecindex,
-            extradescrs.clone(),
-            can_invalidate,
-            call_release_gil_target,
+    let effects = match effects {
+        ReadWriteEffects::Set(effects) if extraeffect != ExtraEffect::RandomEffects => effects,
+        // `effectinfo_from_writeanalyze`: top_set or EF_RANDOM_EFFECTS ⇒
+        // every descr list is None and extraeffect is EF_RANDOM_EFFECTS.
+        // can_collect is True (the same function: forces ⇒ can_collect,
+        // and random effects are above that threshold).
+        _ => {
+            return effectinfo_random_effects(
+                oopspecindex,
+                extradescrs.clone(),
+                can_invalidate,
+                call_release_gil_target,
+            );
+        }
+    };
+
+    // a read or a write to an interiorfield, inside an array of structs, is
+    // additionally recorded as a read or write of the array itself
+    let mut extraef: Vec<(RwKey, RwOperand)> = Vec::new();
+    for (key, operand) in effects.iter() {
+        let tag = match key.tag {
+            RwTag::InteriorField => RwTag::Array,
+            RwTag::ReadInteriorField => RwTag::ReadArray,
+            _ => continue,
+        };
+        let RwOperand::InteriorField {
+            array_type_id,
+            len_offset,
+            ..
+        } = operand
+        else {
+            unreachable!("interiorfield effect {operand:?} carries no interior field");
+        };
+        let index = cc.descr_indices.array_index(
+            value_type_discriminant(&crate::model::ValueType::Ref(None)),
+            array_type_id,
+            *len_offset,
         );
+        let val = RwKey { tag, index };
+        if !effects.contains_key(&val) {
+            extraef.push((
+                val,
+                RwOperand::Array {
+                    array_type_id: array_type_id.clone(),
+                    ir_type: majit_ir::value::Type::Ref,
+                    len_offset: *len_offset,
+                },
+            ));
+        }
     }
+    // preserve order in the added effects issue #2984
+    let extraef_keys: rustc_hash::FxHashSet<RwKey> = extraef.iter().map(|(key, _)| *key).collect();
+    let in_effects = |key: RwKey| effects.contains_key(&key) || extraef_keys.contains(&key);
 
-    // effectinfo.py:345-360: readonly = reads that have NO corresponding write.
-    // PyPy semantics: `tupw not in effects` — set difference at the per-tuple
-    // level.  Pyre operates on the descr-index lift of the same sets.
-    let readonly_descrs_fields = subtract_index_set(&effects.read_fields, &effects.write_fields);
-    let readonly_descrs_arrays = subtract_index_set(&effects.read_arrays, &effects.write_arrays);
-    let readonly_descrs_interiorfields =
-        subtract_index_set(&effects.read_interiorfields, &effects.write_interiorfields);
-
-    let mut write_descrs_fields = effects.write_fields;
-    let mut write_descrs_arrays = effects.write_arrays;
-    let mut write_descrs_interiorfields = effects.write_interiorfields;
-    let field_read_descrs_raw = effects.field_read_descrs;
-    let mut field_write_descrs = effects.field_write_descrs;
-    let interior_read_descrs_raw = effects.interior_read_descrs;
-    let mut interior_write_descrs = effects.interior_write_descrs;
-    let array_read_descrs_raw = effects.array_read_descrs;
-    let mut array_write_descrs = effects.array_write_descrs;
-    // Sort + dedupe the write sets so the raw `_*_descrs_*` slot we hand
-    // to `compute_bitstrings` matches PyPy's `frozenset[Descr]` semantics
-    // (canonical, no duplicates). `subtract_index_set` already does this
-    // for the readonly sets; the write paths feed straight from the
-    // analyzer.
+    let mut readonly_descrs_fields = Vec::new();
+    let mut write_descrs_fields = Vec::new();
+    let mut readonly_descrs_arrays = Vec::new();
+    let mut write_descrs_arrays = Vec::new();
+    let mut readonly_descrs_interiorfields = Vec::new();
+    let mut write_descrs_interiorfields = Vec::new();
+    let mut field_read_descrs_raw = Vec::new();
+    let mut field_write_descrs = Vec::new();
+    let mut array_read_descrs_raw = Vec::new();
+    let mut array_write_descrs = Vec::new();
+    let mut interior_read_descrs_raw = Vec::new();
+    let mut interior_write_descrs = Vec::new();
+    let all_effects = effects
+        .iter()
+        .map(|(key, operand)| (*key, operand))
+        .chain(extraef.iter().map(|(key, operand)| (*key, operand)));
+    for (key, operand) in all_effects {
+        let index = key.index;
+        match key.tag {
+            RwTag::Struct => add_struct(
+                &mut write_descrs_fields,
+                &mut field_write_descrs,
+                index,
+                operand,
+                cc,
+            ),
+            RwTag::ReadStruct => {
+                if !in_effects(RwKey {
+                    tag: RwTag::Struct,
+                    index,
+                }) {
+                    add_struct(
+                        &mut readonly_descrs_fields,
+                        &mut field_read_descrs_raw,
+                        index,
+                        operand,
+                        cc,
+                    );
+                }
+            }
+            RwTag::InteriorField => add_interiorfield(
+                &mut write_descrs_interiorfields,
+                &mut interior_write_descrs,
+                index,
+                operand,
+                cc,
+            ),
+            RwTag::ReadInteriorField => {
+                if !in_effects(RwKey {
+                    tag: RwTag::InteriorField,
+                    index,
+                }) {
+                    add_interiorfield(
+                        &mut readonly_descrs_interiorfields,
+                        &mut interior_read_descrs_raw,
+                        index,
+                        operand,
+                        cc,
+                    );
+                }
+            }
+            RwTag::Array => add_array(
+                &mut write_descrs_arrays,
+                &mut array_write_descrs,
+                index,
+                operand,
+                cc,
+            ),
+            RwTag::ReadArray => {
+                if !in_effects(RwKey {
+                    tag: RwTag::Array,
+                    index,
+                }) {
+                    add_array(
+                        &mut readonly_descrs_arrays,
+                        &mut array_read_descrs_raw,
+                        index,
+                        operand,
+                        cc,
+                    );
+                }
+            }
+        }
+    }
+    // Sort + dedupe the index lists so the bitstrings match PyPy's
+    // `frozenset[Descr]` semantics (canonical, no duplicates):
+    // `extraef` can name one array twice.
+    readonly_descrs_fields.sort_unstable();
+    readonly_descrs_fields.dedup();
+    readonly_descrs_arrays.sort_unstable();
+    readonly_descrs_arrays.dedup();
+    readonly_descrs_interiorfields.sort_unstable();
+    readonly_descrs_interiorfields.dedup();
     write_descrs_fields.sort_unstable();
     write_descrs_fields.dedup();
     write_descrs_arrays.sort_unstable();
@@ -8563,24 +8840,6 @@ pub fn effectinfo_from_writeanalyze(
     }
 }
 
-/// `effectinfo.py:345-360` set difference (`tupw not in effects`).
-///
-/// Returns the deduped sorted list of indices in `read` that have no
-/// matching entry in `write`.  PyPy's reference implementation works on
-/// frozensets of descr objects; pyre operates on the descr-index lift
-/// already produced by `DescrIndexRegistry`.
-fn subtract_index_set(read: &[u32], write: &[u32]) -> Vec<u32> {
-    let write_set: std::collections::HashSet<u32> = write.iter().copied().collect();
-    let mut diff: Vec<u32> = read
-        .iter()
-        .copied()
-        .filter(|idx| !write_set.contains(idx))
-        .collect();
-    diff.sort_unstable();
-    diff.dedup();
-    diff
-}
-
 /// RPython: `op.args[0].concretetype` — resolve full ARRAY identity.
 ///
 /// Returns the full ARRAY type string (e.g. `"Vec<Point>"`, `"Vec<i64>"`),
@@ -8718,313 +8977,6 @@ pub(crate) fn extract_element_type_from_str(type_str: &str) -> Option<String> {
     None
 }
 
-/// Transitive read/write effect collection.
-///
-/// Each graph is scanned once into a replay list. Every query walks that
-/// list with a fresh `seen` set and one shared descr-dedup accumulator —
-/// the same cut as a walk of the live graph — so the first `fielddescrof`
-/// / `arraydescrof` / `interiorfielddescrof` of each index still happens
-/// on the first DFS visit, and a later query repeats the mints that walk
-/// repeated.
-/// The `index()` of every descr already in each `WriteAnalysis` descr
-/// list, so a push tests membership without scanning the list.
-#[derive(Default)]
-struct MintedDescrs {
-    field_read: rustc_hash::FxHashSet<u32>,
-    field_write: rustc_hash::FxHashSet<u32>,
-    array_read: rustc_hash::FxHashSet<u32>,
-    array_write: rustc_hash::FxHashSet<u32>,
-    interior_read: rustc_hash::FxHashSet<u32>,
-    interior_write: rustc_hash::FxHashSet<u32>,
-}
-
-fn apply_readwrite_replay(
-    path: &CallPath,
-    function_graphs: &GraphStore,
-    cc: &CallControl,
-    descr_indices: &DescrIndexRegistry,
-    seen: &mut rustc_hash::FxHashSet<CallPath>,
-    acc: &mut WriteAnalysis,
-    minted: &mut MintedDescrs,
-    is_top: &mut bool,
-) {
-    if *is_top {
-        return;
-    }
-    if !seen.insert(path.clone()) {
-        return;
-    }
-    let replay = readwrite_replay_ops(path, function_graphs, cc);
-    for op in &replay.ops {
-        match op {
-            ReadWriteReplayOp::FieldRead {
-                owner_root,
-                owner_id,
-                name,
-            } => push_field_effect(
-                &mut acc.read_fields,
-                &mut acc.field_read_descrs,
-                &mut minted.field_read,
-                descr_indices,
-                cc,
-                owner_root,
-                *owner_id,
-                name,
-            ),
-            ReadWriteReplayOp::FieldWrite {
-                owner_root,
-                owner_id,
-                name,
-            } => push_field_effect(
-                &mut acc.write_fields,
-                &mut acc.field_write_descrs,
-                &mut minted.field_write,
-                descr_indices,
-                cc,
-                owner_root,
-                *owner_id,
-                name,
-            ),
-            ReadWriteReplayOp::ArrayRead {
-                base,
-                item_ty,
-                array_type_id,
-                nolength,
-            } => {
-                let resolved_id = resolve_array_identity(
-                    base,
-                    array_type_id,
-                    &replay.value_producers,
-                    &replay.phi_sources,
-                    cc,
-                )
-                .or_else(|| array_type_id.clone());
-                let headerless = *nolength
-                    || crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref());
-                let len_offset = if headerless { None } else { Some(0) };
-                push_array_effect(
-                    &mut acc.read_arrays,
-                    &mut acc.array_read_descrs,
-                    &mut minted.array_read,
-                    descr_indices,
-                    cc,
-                    &resolved_id,
-                    item_ty,
-                    len_offset,
-                );
-            }
-            ReadWriteReplayOp::ArrayWrite {
-                base,
-                item_ty,
-                array_type_id,
-                nolength,
-            } => {
-                let resolved_id = resolve_array_identity(
-                    base,
-                    array_type_id,
-                    &replay.value_producers,
-                    &replay.phi_sources,
-                    cc,
-                )
-                .or_else(|| array_type_id.clone());
-                let headerless = *nolength
-                    || crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref());
-                let len_offset = if headerless { None } else { Some(0) };
-                push_array_effect(
-                    &mut acc.write_arrays,
-                    &mut acc.array_write_descrs,
-                    &mut minted.array_write,
-                    descr_indices,
-                    cc,
-                    &resolved_id,
-                    item_ty,
-                    len_offset,
-                );
-            }
-            ReadWriteReplayOp::InteriorRead {
-                base,
-                field_name,
-                array_type_id,
-            } => {
-                let resolved_id = resolve_array_identity(
-                    base,
-                    array_type_id,
-                    &replay.value_producers,
-                    &replay.phi_sources,
-                    cc,
-                )
-                .or_else(|| array_type_id.clone());
-                let len_offset =
-                    if crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref()) {
-                        None
-                    } else {
-                        Some(0)
-                    };
-                push_interior_effect(
-                    &mut acc.read_interiorfields,
-                    &mut acc.interior_read_descrs,
-                    &mut minted.interior_read,
-                    &mut acc.read_arrays,
-                    &mut acc.array_read_descrs,
-                    &mut minted.array_read,
-                    descr_indices,
-                    cc,
-                    &resolved_id,
-                    field_name,
-                    len_offset,
-                );
-            }
-            ReadWriteReplayOp::InteriorWrite {
-                base,
-                field_name,
-                array_type_id,
-            } => {
-                let resolved_id = resolve_array_identity(
-                    base,
-                    array_type_id,
-                    &replay.value_producers,
-                    &replay.phi_sources,
-                    cc,
-                )
-                .or_else(|| array_type_id.clone());
-                let len_offset =
-                    if crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref()) {
-                        None
-                    } else {
-                        Some(0)
-                    };
-                push_interior_effect(
-                    &mut acc.write_interiorfields,
-                    &mut acc.interior_write_descrs,
-                    &mut minted.interior_write,
-                    &mut acc.write_arrays,
-                    &mut acc.array_write_descrs,
-                    &mut minted.array_write,
-                    descr_indices,
-                    cc,
-                    &resolved_id,
-                    field_name,
-                    len_offset,
-                );
-            }
-            // A direct call does not stop the caller when the callee is
-            // `top_set`. Later calls in this graph see `is_top` at entry
-            // and return; later field ops in this graph still mint.
-            ReadWriteReplayOp::Call(target) => {
-                if let Some(callee) = cc.target_to_path(target) {
-                    apply_readwrite_replay(
-                        &callee,
-                        function_graphs,
-                        cc,
-                        descr_indices,
-                        seen,
-                        acc,
-                        minted,
-                        is_top,
-                    );
-                }
-            }
-            ReadWriteReplayOp::Indirect(None) => {
-                *is_top = true;
-                return;
-            }
-            ReadWriteReplayOp::Indirect(Some(graphs)) => {
-                for callee in graphs {
-                    apply_readwrite_replay(
-                        callee,
-                        function_graphs,
-                        cc,
-                        descr_indices,
-                        seen,
-                        acc,
-                        minted,
-                        is_top,
-                    );
-                    if *is_top {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn push_field_effect(
-    indices: &mut Vec<u32>,
-    descrs: &mut Vec<EffectDescr>,
-    minted: &mut rustc_hash::FxHashSet<u32>,
-    descr_indices: &DescrIndexRegistry,
-    cc: &CallControl,
-    owner_root: &Option<String>,
-    owner_id: Option<majit_ir::descr::StructId>,
-    name: &str,
-) {
-    let idx = descr_indices.field_index(owner_root, name);
-    indices.push(idx);
-    if let Some(owner) = owner_root.as_deref()
-        && !minted.contains(&idx)
-        && let Some(descr) = cc.fielddescrof_keyed(idx, owner, owner_id, name)
-    {
-        minted.insert(descr.0.index());
-        descrs.push((descr.0, Some(descr.1)));
-    }
-}
-
-fn push_array_effect(
-    indices: &mut Vec<u32>,
-    descrs: &mut Vec<EffectDescr>,
-    minted: &mut rustc_hash::FxHashSet<u32>,
-    descr_indices: &DescrIndexRegistry,
-    cc: &CallControl,
-    resolved_id: &Option<String>,
-    item_ty: &crate::model::ValueType,
-    len_offset: Option<usize>,
-) {
-    let idx = descr_indices.array_index(value_type_discriminant(item_ty), resolved_id, len_offset);
-    indices.push(idx);
-    if !minted.contains(&idx) {
-        let descr =
-            cc.arraydescrof_keyed(idx, resolved_id, effect_array_ir_type(item_ty), len_offset);
-        minted.insert(descr.0.index());
-        descrs.push(descr);
-    }
-}
-
-fn push_interior_effect(
-    interior_indices: &mut Vec<u32>,
-    interior_descrs: &mut Vec<EffectDescr>,
-    interior_minted: &mut rustc_hash::FxHashSet<u32>,
-    array_indices: &mut Vec<u32>,
-    array_descrs: &mut Vec<EffectDescr>,
-    array_minted: &mut rustc_hash::FxHashSet<u32>,
-    descr_indices: &DescrIndexRegistry,
-    cc: &CallControl,
-    resolved_id: &Option<String>,
-    field_name: &str,
-    len_offset: Option<usize>,
-) {
-    let ifield_idx = descr_indices.interiorfield_index(resolved_id, field_name);
-    interior_indices.push(ifield_idx);
-    if !interior_minted.contains(&ifield_idx)
-        && let Some(descr) = cc.interiorfielddescrof_keyed(ifield_idx, resolved_id, field_name)
-    {
-        interior_minted.insert(descr.0.index());
-        interior_descrs.push((descr.0, Some(descr.1)));
-    }
-    let arr_idx = descr_indices.array_index(
-        value_type_discriminant(&crate::model::ValueType::Ref(None)),
-        resolved_id,
-        len_offset,
-    );
-    array_indices.push(arr_idx);
-    if !array_minted.contains(&arr_idx) {
-        let descr =
-            cc.arraydescrof_keyed(arr_idx, resolved_id, majit_ir::value::Type::Ref, len_offset);
-        array_minted.insert(descr.0.index());
-        array_descrs.push(descr);
-    }
-}
-
 fn effect_array_ir_type(item_ty: &crate::model::ValueType) -> majit_ir::value::Type {
     match item_ty {
         crate::model::ValueType::Int
@@ -9048,157 +9000,6 @@ fn effect_array_ir_type(item_ty: &crate::model::ValueType) -> majit_ir::value::T
                  (history.py:62)"
             )
         }
-    }
-}
-
-fn readwrite_replay_ops(
-    path: &CallPath,
-    function_graphs: &GraphStore,
-    cc: &CallControl,
-) -> std::sync::Arc<ReadWriteReplay> {
-    // A graph registered later must still be walked. Caching the miss
-    // would freeze an empty op list for every later query. The key is the
-    // shared funcobj, so an alias analysed after a sibling hits the same
-    // entry and a mutation of that funcobj drops it for every alias.
-    let Some(key) = function_graphs.key_for(path) else {
-        return std::sync::Arc::new(ReadWriteReplay::default());
-    };
-    if let Some(hit) = cc.readwrite_replay.borrow().get(&key) {
-        return std::sync::Arc::clone(hit);
-    }
-    let Some(graph) = function_graphs.get(path) else {
-        return std::sync::Arc::new(ReadWriteReplay::default());
-    };
-    let built = std::sync::Arc::new(build_readwrite_replay(graph));
-    cc.readwrite_replay
-        .borrow_mut()
-        .insert(key, std::sync::Arc::clone(&built));
-    built
-}
-
-fn build_readwrite_replay(graph: &FunctionGraph) -> ReadWriteReplay {
-    let mut value_producers: HashMap<crate::flowspace::model::Variable, ValueProducer> =
-        HashMap::new();
-    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
-        let Some(var) = op.result.as_ref() else {
-            continue;
-        };
-        // `producer_array_identity` returns `None` for every other kind,
-        // including `ArrayRead` with no `array_type_id` and `Input`, the
-        // same answer as a missing key. A later ignored result clears an
-        // earlier kept one so last-insert still wins. `Call` keeps only
-        // `target`; the lookup reads the callee return type from `cc`.
-        let kept = match &op.kind {
-            OpKind::FieldRead { field, .. } => Some(ValueProducer::Field {
-                owner_root: field.owner_root.clone(),
-                name: field.name.clone(),
-            }),
-            OpKind::ArrayRead {
-                array_type_id: Some(array_type_id),
-                ..
-            } => Some(ValueProducer::Array {
-                array_type_id: array_type_id.clone(),
-            }),
-            OpKind::Call { target, .. } => Some(ValueProducer::Call {
-                target: target.clone(),
-            }),
-            _ => None,
-        };
-        match kept {
-            Some(kind) => {
-                value_producers.insert(var.clone(), kind);
-            }
-            None => {
-                value_producers.remove(var);
-            }
-        }
-    }
-    let mut phi_sources: HashMap<crate::flowspace::model::Variable, Option<LinkArg>> =
-        HashMap::new();
-    for block in &graph.blocks {
-        for link in &block.exits {
-            if let Some(target_block) = graph.blocks.get(link.target.0) {
-                for (target_arg, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-                    phi_sources
-                        .entry(target_arg.clone())
-                        .and_modify(|entry| *entry = None)
-                        .or_insert_with(|| Some(src.clone()));
-                }
-            }
-        }
-    }
-    let mut ops = Vec::new();
-    for block in &graph.blocks {
-        for op in &block.operations {
-            match &op.kind {
-                OpKind::FieldRead { field, .. } => ops.push(ReadWriteReplayOp::FieldRead {
-                    owner_root: field.owner_root.clone(),
-                    owner_id: field.owner_id,
-                    name: field.name.clone(),
-                }),
-                OpKind::FieldWrite { field, .. } => ops.push(ReadWriteReplayOp::FieldWrite {
-                    owner_root: field.owner_root.clone(),
-                    owner_id: field.owner_id,
-                    name: field.name.clone(),
-                }),
-                OpKind::ArrayRead {
-                    base,
-                    item_ty,
-                    array_type_id,
-                    nolength,
-                    ..
-                } => ops.push(ReadWriteReplayOp::ArrayRead {
-                    base: base.clone(),
-                    item_ty: item_ty.clone(),
-                    array_type_id: array_type_id.clone(),
-                    nolength: *nolength,
-                }),
-                OpKind::ArrayWrite {
-                    base,
-                    item_ty,
-                    array_type_id,
-                    nolength,
-                    ..
-                } => ops.push(ReadWriteReplayOp::ArrayWrite {
-                    base: base.clone(),
-                    item_ty: item_ty.clone(),
-                    array_type_id: array_type_id.clone(),
-                    nolength: *nolength,
-                }),
-                OpKind::InteriorFieldRead {
-                    base,
-                    field,
-                    array_type_id,
-                    ..
-                } => ops.push(ReadWriteReplayOp::InteriorRead {
-                    base: base.clone(),
-                    field_name: field.name.clone(),
-                    array_type_id: array_type_id.clone(),
-                }),
-                OpKind::InteriorFieldWrite {
-                    base,
-                    field,
-                    array_type_id,
-                    ..
-                } => ops.push(ReadWriteReplayOp::InteriorWrite {
-                    base: base.clone(),
-                    field_name: field.name.clone(),
-                    array_type_id: array_type_id.clone(),
-                }),
-                OpKind::Call { target, .. } => {
-                    ops.push(ReadWriteReplayOp::Call(target.clone()));
-                }
-                OpKind::IndirectCall { graphs, .. } => {
-                    ops.push(ReadWriteReplayOp::Indirect(graphs.clone()));
-                }
-                _ => {}
-            }
-        }
-    }
-    ReadWriteReplay {
-        ops,
-        value_producers,
-        phi_sources,
     }
 }
 
@@ -14667,21 +14468,32 @@ mod tests {
         cc.register_function_graph(CallPath::from_segments([name]), graph);
     }
 
-    fn rw_of(cc: &CallControl, name: &str) -> WriteAnalysis {
-        analyze_readwrite(
-            &CallTarget::function_path([name]),
-            &cc.function_graphs,
-            cc,
-            &cc.descr_indices,
-        )
+    fn rw_of(cc: &CallControl, cache: &mut AnalysisCache, name: &str) -> ReadWriteEffects {
+        cc.cached_readwrite(&CallTarget::function_path([name]), cache)
     }
 
-    /// Each query walks with a fresh `seen` set. `field_index` keeps the
-    /// first assignment, so a later query replays those indices in that
-    /// query's own DFS order.
+    fn is_top(effects: &ReadWriteEffects) -> bool {
+        ReadWriteEffects::is_top_result(effects)
+    }
+
+    /// The `("struct", T, fieldname)` indices of `effects`, in set order.
+    fn write_fields(effects: &ReadWriteEffects) -> Vec<u32> {
+        match effects {
+            ReadWriteEffects::Top => Vec::new(),
+            ReadWriteEffects::Set(set) => set
+                .keys()
+                .filter(|key| key.tag == RwTag::Struct)
+                .map(|key| key.index)
+                .collect(),
+        }
+    }
+
+    /// Every graph a walk enters keeps its set in `_analyzed_calls`; a
+    /// later query of a callee returns that set without walking it again.
     #[test]
     fn readwrite_effects_are_cached_per_graph() {
         let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
         rw_register(&mut cc, "d", vec![rw_write_field("D", "d")]);
         rw_register(&mut cc, "b", vec![rw_write_field("B", "b"), rw_call("d")]);
         rw_register(&mut cc, "c", vec![rw_write_field("C", "c"), rw_call("d")]);
@@ -14691,39 +14503,42 @@ mod tests {
             vec![rw_write_field("A", "a"), rw_call("b"), rw_call("c")],
         );
 
-        // First DFS: A's write, then b (B, then d's D), then c (C; d skipped).
-        let a = rw_of(&cc, "a");
-        assert!(!a.is_top);
-        assert_eq!(a.write_fields, vec![0, 1, 2, 3]);
-        assert_eq!(rw_of(&cc, "b").write_fields, vec![1, 2]);
-        assert_eq!(rw_of(&cc, "d").write_fields, vec![2]);
-        assert_eq!(rw_of(&cc, "c").write_fields, vec![3, 2]);
-        assert_eq!(rw_of(&cc, "a").write_fields, vec![0, 1, 2, 3]);
+        // A's write, then b (B, then d's D), then c (C, then d's cached D).
+        let a = rw_of(&cc, &mut cache, "a");
+        assert!(!is_top(&a));
+        assert_eq!(write_fields(&a), vec![0, 1, 2, 3]);
+        for name in ["a", "b", "c", "d"] {
+            let key = cc
+                .function_graphs
+                .key_for(&CallPath::from_segments([name]))
+                .unwrap();
+            assert!(cache.readwrite.contains(&key), "{name} was entered");
+        }
+        assert_eq!(write_fields(&rw_of(&cc, &mut cache, "b")), vec![1, 2]);
+        assert_eq!(write_fields(&rw_of(&cc, &mut cache, "d")), vec![2]);
+        assert_eq!(write_fields(&rw_of(&cc, &mut cache, "c")), vec![3, 2]);
+        assert_eq!(write_fields(&rw_of(&cc, &mut cache, "a")), vec![0, 1, 2, 3]);
 
-        let family = analyze_readwrite_indirect_family(
+        let family = cc.cached_readwrite_family(
             Some(&[
                 CallPath::from_segments(["b"]),
                 CallPath::from_segments(["c"]),
             ]),
-            &cc.function_graphs,
-            &cc,
-            &cc.descr_indices,
+            &mut cache,
         );
-        assert!(!family.is_top);
-        assert_eq!(family.write_fields, vec![1, 2, 3]);
+        assert!(!is_top(&family));
+        assert_eq!(write_fields(&family), vec![1, 2, 3]);
 
-        let unknown =
-            analyze_readwrite_indirect_family(None, &cc.function_graphs, &cc, &cc.descr_indices);
-        assert!(unknown.is_top);
-        assert!(unknown.write_fields.is_empty());
+        let unknown = cc.cached_readwrite_family(None, &mut cache);
+        assert!(is_top(&unknown));
     }
 
-    /// Two alias paths name one graph. Analysing through B fills the shared
-    /// replay; stamping the method resolution through A mutates that graph,
-    /// so the next analysis through B must walk the updated call.
+    /// Two alias paths name one graph, so they share one `_analyzed_calls`
+    /// entry: the method resolution stamped through A is what B reads.
     #[test]
-    fn readwrite_replay_invalidates_every_alias_of_a_mutated_graph() {
+    fn readwrite_aliases_share_one_analyzed_graph() {
         let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
         rw_register(&mut cc, "leaf", vec![rw_write_field("Leaf", "x")]);
 
         let caller = || {
@@ -14745,36 +14560,42 @@ mod tests {
         cc.register_function_graph(alias_a.clone(), caller());
         cc.register_function_graph(alias_b.clone(), caller());
 
-        assert!(
-            rw_of(&cc, "alias_b").write_fields.is_empty(),
-            "the unresolved method is not followed"
+        assert_eq!(
+            cc.function_graphs.key_for(&alias_a),
+            cc.function_graphs.key_for(&alias_b)
         );
         cc.stamp_method_resolved_path(&alias_a, 0, 0, CallPath::from_segments(["leaf"]));
         assert_eq!(
-            rw_of(&cc, "alias_b").write_fields,
+            write_fields(&rw_of(&cc, &mut cache, "alias_b")),
             vec![0],
             "alias B observes the stamp applied through alias A"
         );
+        let key = cc.function_graphs.key_for(&alias_a).unwrap();
+        assert!(cache.readwrite.contains(&key));
+        assert_eq!(write_fields(&rw_of(&cc, &mut cache, "alias_a")), vec![0]);
     }
 
-    /// A cycle stops when `seen` already holds the graph. The root's
-    /// order is its DFS order; the other member is reachable.
+    /// Entering a graph already on the stack unions the cycle
+    /// (`DependencyTracker.enter`); the cycle's shared `Dependency` then
+    /// holds both members' effects.
     #[test]
     fn readwrite_cycle_unions_both_graphs() {
         let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
         rw_register(&mut cc, "p", vec![rw_write_field("P", "p"), rw_call("q")]);
         rw_register(&mut cc, "q", vec![rw_write_field("Q", "q"), rw_call("p")]);
 
-        let p = rw_of(&cc, "p");
-        assert_eq!(p.write_fields, vec![0, 1]);
-        let mut q_fields = rw_of(&cc, "q").write_fields;
+        let p = rw_of(&cc, &mut cache, "p");
+        assert_eq!(write_fields(&p), vec![0, 1]);
+        let mut q_fields = write_fields(&rw_of(&cc, &mut cache, "q"));
         q_fields.sort_unstable();
         assert_eq!(q_fields, vec![0, 1]);
 
         let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
         rw_register(&mut cc, "p", vec![rw_write_field("P", "p"), rw_call("q")]);
         rw_register(&mut cc, "q", vec![rw_write_field("Q", "q"), rw_call("p")]);
-        assert_eq!(rw_of(&cc, "q").write_fields, vec![0, 1]);
+        assert_eq!(write_fields(&rw_of(&cc, &mut cache, "q")), vec![0, 1]);
     }
 
     /// `indirect_call` with `graphs=None` is `top_set`. A later query of
@@ -14782,6 +14603,7 @@ mod tests {
     #[test]
     fn readwrite_unknown_indirect_is_top_and_cached() {
         let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
         rw_register(
             &mut cc,
             "t",
@@ -14794,19 +14616,20 @@ mod tests {
             }],
         );
         rw_register(&mut cc, "u", vec![rw_write_field("U", "u"), rw_call("t")]);
-        assert!(rw_of(&cc, "u").is_top);
-        assert!(rw_of(&cc, "t").is_top);
-        assert!(rw_of(&cc, "u").is_top);
+        assert!(is_top(&rw_of(&cc, &mut cache, "u")));
+        assert!(is_top(&rw_of(&cc, &mut cache, "t")));
+        assert!(is_top(&rw_of(&cc, &mut cache, "u")));
 
         let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
         rw_register(
             &mut cc,
             "m",
             vec![rw_write_field("M", "m"), rw_call("missing")],
         );
-        let m = rw_of(&cc, "m");
-        assert!(!m.is_top);
-        assert_eq!(m.write_fields, vec![0]);
+        let m = rw_of(&cc, &mut cache, "m");
+        assert!(!is_top(&m));
+        assert_eq!(write_fields(&m), vec![0]);
     }
 
     /// A layout registered after the first mint has to be visible on the
@@ -14860,28 +14683,12 @@ mod tests {
         assert!(after.cache_hit_offset > before.cache_hit_offset);
     }
 
-    /// Replacing the graph stored under a path drops the replay of the
-    /// previous body.
+    /// `find_all_graphs` fills a deferred indirect family before any
+    /// analysis, so the call is the union of its members, not `top_set`.
     #[test]
-    fn readwrite_reregistered_graph_drops_cached_effects() {
+    fn readwrite_materialized_indirect_family_unions_members() {
         let mut cc = CallControl::new();
-        rw_register(&mut cc, "g", vec![rw_write_field("G", "slot")]);
-        assert_eq!(rw_of(&cc, "g").write_fields, vec![0]);
-        cc.register_function_graph(
-            CallPath::from_segments(["g"]),
-            FunctionGraph::new("g_replacement"),
-        );
-        let again = rw_of(&cc, "g");
-        assert!(!again.is_top);
-        assert!(again.write_fields.is_empty());
-    }
-
-    /// An indirect call cached while `graphs` is still `None` is `top_set`.
-    /// Filling the family afterwards unions the members instead of replaying
-    /// that top result.
-    #[test]
-    fn readwrite_materialized_indirect_family_replaces_cached_top() {
-        let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
         let mut impl_graph = FunctionGraph::new("impl_m");
         let entry = impl_graph.startblock;
         impl_graph.push_op_var(entry, rw_write_field("Impl", "slot"), false);
@@ -14900,10 +14707,9 @@ mod tests {
             false,
         );
         cc.register_function_graph(CallPath::from_segments(["caller"]), caller);
-        assert!(rw_of(&cc, "caller").is_top);
         cc.find_all_graphs_for_tests();
-        let again = rw_of(&cc, "caller");
-        assert!(!again.is_top);
-        assert_eq!(again.write_fields, vec![0]);
+        let effects = rw_of(&cc, &mut cache, "caller");
+        assert!(!is_top(&effects));
+        assert_eq!(write_fields(&effects), vec![0]);
     }
 }
