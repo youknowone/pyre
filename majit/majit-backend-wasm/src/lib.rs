@@ -5219,10 +5219,9 @@ impl majit_backend::Backend for WasmBackend {
         if let Some(clt) = token.compiled_loop_token() {
             let baseofs = (majit_gc::header::GcHeader::SIZE
                 + majit_backend::jitframe::FIRST_ITEM_OFFSET) as i64;
-            let depth = frame.ca_frame_bytes as usize / std::mem::size_of::<isize>();
             clt.frame_info
                 .lock()
-                .update_frame_depth(baseofs, depth as i64);
+                .update_frame_depth(baseofs, frame.ca_frame_depth() as i64);
         }
         // A general CALL_ASSEMBLER enters the real compiled token selected by
         // the descr.  While this loop is pending, PyPy puts a separately

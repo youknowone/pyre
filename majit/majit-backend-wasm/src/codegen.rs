@@ -569,6 +569,21 @@ impl FrameGeometry {
         self.tail_base != 0
     }
 
+    /// Frame depth, in Signed items, that `compile_loop` installs on the
+    /// token's `frame_info`. A CALL_ASSEMBLER caller allocates the callee frame
+    /// from it and stores the arguments at `_ll_initial_locs` before the
+    /// callee's `_check_frame_depth` runs, so a tailed geometry covers the
+    /// whole tail; otherwise the callee frame is the homes prefix
+    /// (`ca_frame_bytes`).
+    pub const fn ca_frame_depth(self) -> usize {
+        let bytes = if self.has_tail() {
+            self.frame_bytes
+        } else {
+            self.ca_frame_bytes
+        };
+        bytes as usize / std::mem::size_of::<isize>()
+    }
+
     /// Signed item count `JitFrame::init` stores as `jf_frame.length`.
     pub const fn signed_item_count(self) -> usize {
         self.frame_bytes as usize / std::mem::size_of::<isize>()
@@ -13023,6 +13038,24 @@ mod tests {
 
     /// A second extend keeps every offset the first tail published. Tail
     /// value, force, and home words of the grown geometry do not alias.
+    #[test]
+    fn ca_frame_depth_covers_tail_initial_locs() {
+        let source = FrameGeometry::compact(8, 4, 1);
+        assert_eq!(
+            source.ca_frame_depth(),
+            source.ca_frame_bytes as usize / std::mem::size_of::<isize>()
+        );
+        let tailed = source.extend(11, source.ordinary_home_slots());
+        assert!(tailed.has_tail());
+        let items_bytes = (tailed.ca_frame_depth() * std::mem::size_of::<isize>()) as u64;
+        for k in 0..tailed.value_slots as u64 {
+            assert!(
+                tailed.spill_slot_ofs(k) + SLOT_SIZE <= items_bytes,
+                "initial loc {k} past the CALL_ASSEMBLER frame"
+            );
+        }
+    }
+
     #[test]
     fn second_extend_keeps_published_tail_offsets() {
         let source = FrameGeometry::compact(8, 4, 1);
