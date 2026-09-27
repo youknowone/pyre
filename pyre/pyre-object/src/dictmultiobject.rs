@@ -90,6 +90,68 @@ impl PartialEq for ObjectKey {
 
 impl Eq for ObjectKey {}
 
+impl crate::rordereddict::EntryDummy for ObjectKey {
+    fn dummy() -> Self {
+        Self {
+            hash: 0,
+            obj: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// `BytesDictStrategy` key: the `str` the `W_BytesObject` holds.
+///
+/// `unerase` yields that block; `wrap` builds a `bytes` object on it
+/// (`w_bytes_from_block`) instead of copying the characters.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct BytesKey(pub *mut crate::bytesobject::BytesBlock);
+
+impl BytesKey {
+    /// The block's `chars`, the same slice `[u8]` hashing and equality see.
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe { crate::bytesobject::bytes_block_chars(self.0) }
+    }
+}
+
+impl std::hash::Hash for BytesKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_bytes().hash(state);
+    }
+}
+
+impl PartialEq for BytesKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for BytesKey {}
+
+impl std::borrow::Borrow<[u8]> for BytesKey {
+    #[inline]
+    fn borrow(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl crate::rordereddict::EntryDummy for BytesKey {
+    fn dummy() -> Self {
+        Self(std::ptr::null_mut())
+    }
+}
+
+impl std::fmt::Debug for BytesKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_null() {
+            return f.write_str("BytesKey(null)");
+        }
+        std::fmt::Debug::fmt(self.as_bytes(), f)
+    }
+}
+
 /// Hash adapter for an `r_dict` key whose Python hash was already computed.
 ///
 /// `rordereddict` feeds that cached integer directly into its table, and so
@@ -1054,9 +1116,10 @@ pub unsafe fn w_dict_int_storage_mut<'a>(obj: PyObjectRef) -> &'a mut IntDictSto
 /// Typed accessor for `BytesDictStrategy.unerase(w_dict.dstorage)` —
 /// `dictmultiobject.py BytesDictStrategy.erase/unerase` pair
 /// produced by `rerased.new_erasing_pair("bytes")`.  Returns the
-/// native `IndexMap<Vec<u8>, PyObjectRef>` backing — insertion-ordered
+/// native `RDict<BytesKey, PyObjectRef>` backing — insertion-ordered
 /// hash bucket matching PyPy `Dict[str, W_Root]` (RPython resolves to
-/// an order-preserving hash table at translation time).
+/// an order-preserving hash table at translation time). The key is the
+/// `BytesBlock` `unerase` returns, not a copy of its characters.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` whose strategy is
@@ -1154,13 +1217,14 @@ pub type IntKeyHash = std::hash::BuildHasherDefault<IntKeyHasher>;
 pub type BytesKeyHash = std::hash::BuildHasherDefault<crate::unicodeobject::Fnv1aHasher>;
 pub type IntDictStorage = crate::rordereddict::RDict<i64, PyObjectRef, IntKeyHash>;
 /// `BytesDictStrategy` backing — erased `Dict[str, W_Root]`
-/// (`dictmultiobject.py`).
+/// (`dictmultiobject.py`). `unerase` yields [`BytesKey`], the block the
+/// wrapped `bytes` object holds.
 ///
 /// Digested with FNV-1a rather than `RandomState`, for the reason
 /// [`crate::celldict::ModuleDictEntries`] gives: a translated `str` key carries
-/// `ll_strhash` memoized in its header, and an owned `Vec<u8>` has nowhere to
-/// memoize, so a cryptographic hash would be recomputed on every probe.
-pub type BytesDictStorage = crate::rordereddict::RDict<Vec<u8>, PyObjectRef, BytesKeyHash>;
+/// `ll_strhash` memoized in its header, and [`BytesKey`] hashes the block's
+/// bytes on each probe (`BytesBlock` keeps no hash slot).
+pub type BytesDictStorage = crate::rordereddict::RDict<BytesKey, PyObjectRef, BytesKeyHash>;
 
 macro_rules! dict_storage_gc_type_id {
     ($atomic:ident, $setter:ident, $getter:ident, $ty:ty, $doc:literal) => {
@@ -2479,7 +2543,11 @@ pub unsafe fn w_module_dict_walk_gc_cells(
         }
     } else {
         let storage = &mut *(md.dstorage as *mut crate::celldict::ModuleDictStorage);
-        for value in storage.iter_values_mut() {
+        for (key, value) in storage.entries.iter_mut() {
+            // `ModuleDictStrategy` keys are the `str` block. The block does
+            // not move; the visit keeps it alive.
+            let key_ptr = key as *const crate::celldict::StrKey as *mut crate::celldict::StrKey;
+            visitor(&mut *(std::ptr::addr_of_mut!((*key_ptr).0) as *mut PyObjectRef));
             crate::celldict::walk_module_value_slot(value, visitor);
         }
         w_module_dict_module_strategy_mut(obj).walk_cache_cells(visitor);
@@ -4423,7 +4491,10 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
 /// # Safety
 /// `dict` must point to a valid `W_DictObject` whose `dstorage` is an
 /// `RDict<K, PyObjectRef, S>`.
-unsafe fn typed_move_to_end<K: std::hash::Hash + Eq, S: std::hash::BuildHasher>(
+unsafe fn typed_move_to_end<
+    K: std::hash::Hash + Eq + crate::rordereddict::EntryDummy,
+    S: std::hash::BuildHasher,
+>(
     dict: *mut W_DictObject,
     k: &K,
     last: bool,
@@ -4523,7 +4594,7 @@ pub unsafe fn w_dict_move_to_end_checked(
 
     // Typed stores reorder in place, preserving the strategy — the
     // `AbstractTypedStrategy.move_to_end` fast path (`dictmultiobject.py`).
-    // Int and Bytes keep their native `IndexMap<i64>` / `IndexMap<Vec<u8>>`
+    // Int and Bytes keep their native `RDict<i64>` / `RDict<BytesKey>`
     // storage; the lookup compares native keys, so it is callback-free and
     // needs no reentrant fallback.  A foreign-type key cannot be present in a
     // typed store, so it falls through to the object-strategy path below.
@@ -4536,8 +4607,8 @@ pub unsafe fn w_dict_move_to_end_checked(
         ));
     }
     if kind == StrategyKind::Bytes && crate::is_exact_type(key, &crate::bytesobject::BYTES_TYPE) {
-        let k = crate::w_bytes_data(key).to_vec();
-        return Ok(typed_move_to_end::<Vec<u8>, BytesKeyHash>(
+        let k = BytesKey(crate::w_bytes_block(key) as *mut crate::bytesobject::BytesBlock);
+        return Ok(typed_move_to_end::<BytesKey, BytesKeyHash>(
             obj as *mut W_DictObject,
             &k,
             last,
@@ -5367,7 +5438,7 @@ pub unsafe fn w_dict_store_bytes_strategy(obj: PyObjectRef, key: PyObjectRef, va
     dict_write_barrier(obj);
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut BytesDictStorage);
-    let k = crate::w_bytes_data(key).to_vec();
+    let k = BytesKey(crate::w_bytes_block(key) as *mut crate::bytesobject::BytesBlock);
     if entries.insert(k, value).is_none() {
         dict.keys_version = dict.keys_version.wrapping_add(1);
     }
@@ -5443,7 +5514,7 @@ pub unsafe fn w_dict_items_bytes_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef,
     // which is exactly how many root slots the loop publishes.
     let mut next = 0;
     while let Some(i) = entries.next_valid_slot(next) {
-        let w_key = crate::w_bytes_from_bytes(entries.get_slot(i).unwrap().0.as_slice());
+        let w_key = crate::w_bytes_from_block(entries.get_slot(i).unwrap().0.0);
         roots.publish(&[w_key, *entries.get_slot(i).unwrap().1]);
         next = i + 1;
     }
@@ -5463,12 +5534,12 @@ pub unsafe fn w_dict_nth_item_bytes_strategy(
     lock_dict_refs!(_dict_guard, obj);
     let entries = w_dict_bytes_storage(obj);
     let (k, v) = entries.get_slot(index)?;
-    let key_bytes = k.clone();
-    // Wrapping the key collects, and `value` is a bare local by then.
+    let block = k.0;
+    // `wrap` allocates, and `value` is a bare local by then.
     let roots = crate::gc_roots::push_roots();
     let value_slot = roots.base();
     let _ = roots.pin_root(*v);
-    let w_key = crate::w_bytes_from_bytes(key_bytes.as_slice());
+    let w_key = crate::w_bytes_from_block(block);
     Some((w_key, roots.get(value_slot)))
 }
 
@@ -5505,7 +5576,7 @@ pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) {
     // A slot is not a position, as in [`w_dict_switch_int_to_object_strategy`].
     let mut next = 0;
     while let Some(i) = old.next_valid_slot(next) {
-        let w_key = crate::w_bytes_from_bytes(old.get_slot(i).unwrap().0.as_slice());
+        let w_key = crate::w_bytes_from_block(old.get_slot(i).unwrap().0.0);
         let object_key = object_key_for(w_key);
         let v = *old.get_slot(i).unwrap().1;
         hashes.push(object_key.hash);
@@ -6739,8 +6810,8 @@ pub trait DictStrategy {
     /// shape — every strategy shares that layout until Slices D3/D4
     /// migrate Int/Bytes/Unicode/Kwargs to native typed storages,
     /// where they override `walk_gc_refs` to walk i64-keyed pairs
-    /// (skipping the i64 half), `Vec<u8>`-keyed pairs (likewise),
-    /// or parallel `keys`/`values` arrays.
+    /// (skipping the i64 half), `BytesKey` pairs (the block and the
+    /// value), or parallel `keys`/`values` arrays.
     ///
     /// # Safety
     /// `w_dict` must be a valid PyObjectRef pointing at a W_DictObject
@@ -7572,9 +7643,8 @@ impl DictStrategy for ObjectDictStrategy {
 ///
 /// Bytes-keyed dict storage — `is_correct_type` returns true only for
 /// W_BytesObject keys; mixed keys force `switch_to_object_strategy`
-/// per `dictmultiobject.py`.  Native `Vec<(Vec<u8>, PyObjectRef)>`
-/// backing (Slice D4) — the unified-shape adaptation has been
-/// retired.
+/// per `dictmultiobject.py`.  Native `RDict<BytesKey, PyObjectRef>`
+/// backing — `unerase` is the block, `wrap` shares it.
 pub struct BytesDictStrategy;
 
 impl DictStrategy for BytesDictStrategy {
@@ -7583,19 +7653,19 @@ impl DictStrategy for BytesDictStrategy {
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.switch_to_object_strategy`
-    /// instantiation for BytesDictStrategy — `wrap = newbytes` (`:1234`).
-    /// Walks the typed `IndexMap<Vec<u8>, _>`, rebuilds
-    /// `IndexMap<ObjectKey, _>` with each `Vec<u8>` wrapped via
-    /// `w_bytes_from_bytes`, drops the typed box.
+    /// instantiation for BytesDictStrategy — `wrap` shares the unwrapped
+    /// `str` (`w_bytes_from_block`). Walks the typed `RDict<BytesKey, _>`,
+    /// rebuilds `RDict<ObjectKey, _>`, drops the typed box.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
         crate::dictmultiobject::w_dict_switch_bytes_to_object_strategy(w_dict);
     }
 
     /// `dictmultiobject.py get_empty_storage` — erased `{}`
     /// with `mark_dict_non_null` hint.  Pyre stores the typed map as
-    /// `IndexMap<Vec<u8>, PyObjectRef>`: a hash bucket for O(1) lookup
-    /// that also preserves insertion order (CPython 3.7+ / PyPy3 dict
-    /// semantics).  GC-managed box (`setfield_gc` on reassign).
+    /// `RDict<BytesKey, PyObjectRef>`: a hash bucket for O(1) lookup
+    /// that also preserves insertion order.  GC-managed box
+    /// (`setfield_gc` on reassign). The key is the block `unwrap` reads
+    /// off the `bytes` object.
     fn get_empty_storage(&self) -> *mut u8 {
         crate::gc_storage::gc_alloc_storage_box(
             crate::dictmultiobject::BytesDictStorage::new(),
@@ -7700,7 +7770,7 @@ impl DictStrategy for BytesDictStrategy {
         let _roots = crate::gc_roots::push_roots();
         let value_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(value);
-        let w_key = crate::w_bytes_from_bytes(key.as_slice());
+        let w_key = crate::w_bytes_from_block(key.0);
         let value = crate::gc_roots::shadow_stack_get(value_slot);
         Some((w_key, value))
     }
@@ -7717,31 +7787,34 @@ impl DictStrategy for BytesDictStrategy {
     }
 
     /// `dictmultiobject.py listview_bytes` — `self.unerase
-    /// (w_dict.dstorage).keys()`.  Returns the native `Vec<Vec<u8>>`
-    /// of keys directly from the typed storage.
+    /// (w_dict.dstorage).keys()`.  Copies each block's characters out;
+    /// the stored key stays the block `unerase` holds.
     #[expect(
         clippy::not_unsafe_ptr_arg_deref,
         reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
     )]
     fn listview_bytes(&self, w_dict: PyObjectRef) -> Option<Vec<Vec<u8>>> {
         let entries = unsafe { crate::dictmultiobject::w_dict_bytes_storage(w_dict) };
-        Some(entries.keys().cloned().collect())
+        Some(entries.keys().map(|key| key.as_bytes().to_vec()).collect())
     }
 
-    /// PyPy traces `Dict[str (bytes), W_Root]` only over the value
-    /// side (`rerased.new_erasing_pair("bytes")` + auto-generated GC
-    /// walker); the Vec<u8> key half is plain bytes and carries no
-    /// PyObjectRef.
+    /// `BytesDictStrategy` storage is `Dict[str, W_Root]`. `unerase`
+    /// yields the block the key `str` is; both that block and the value
+    /// are GC refs. The block does not move, and the visit keeps it alive.
     unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
         let entries = crate::dictmultiobject::w_dict_bytes_storage_mut(w_dict);
-        for value in entries.values_mut() {
+        for (key, value) in entries.iter_mut() {
+            let key_ptr = key as *const crate::dictmultiobject::BytesKey
+                as *mut crate::dictmultiobject::BytesKey;
+            visitor(std::ptr::addr_of_mut!((*key_ptr).0) as *mut PyObjectRef);
             visitor(value as *mut PyObjectRef);
         }
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.copy` — clone
-    /// the typed `IndexMap<Vec<u8>, PyObjectRef>` backing and wrap
-    /// with the same BytesDictStrategy.
+    /// the typed `RDict<BytesKey, PyObjectRef>` backing and wrap
+    /// with the same BytesDictStrategy. Cloning copies the block
+    /// pointer (`wrap` shares the `str`).
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
         let storage = &*(dict.dstorage as *const crate::dictmultiobject::BytesDictStorage);

@@ -796,14 +796,18 @@ unsafe fn object_dict_storage_custom_trace(
     }
 }
 
-/// Module-dict `dstorage` is the same dicttable shape keyed by owned
-/// `String`s: only the value slots are GC references.
+/// Module-dict `dstorage` is the same dicttable shape. `ModuleDictStrategy`
+/// keys are the unwrapped `str` block, and values are cells or `W_Root`.
+/// Both are GC refs. The block does not move; the visit keeps it alive.
 unsafe fn module_dict_storage_custom_trace(
     obj_addr: usize,
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
     let storage = &mut *(obj_addr as *mut pyre_object::celldict::ModuleDictStorage);
-    for value in storage.iter_values_mut() {
+    for (key, value) in storage.entries.iter_mut() {
+        let key_ptr =
+            key as *const pyre_object::celldict::StrKey as *mut pyre_object::celldict::StrKey;
+        f(std::ptr::addr_of_mut!((*key_ptr).0) as *mut majit_ir::GcRef);
         let mut forward = |slot: &mut pyre_object::PyObjectRef| {
             f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
         };
@@ -848,13 +852,18 @@ unsafe fn int_dict_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     }
 }
 
-/// `rerased.new_erasing_pair("bytes")`: only values are GC refs.
+/// `rerased.new_erasing_pair("bytes")`: `BytesDictStrategy` keys are the
+/// `str` block `unerase` yields, and values are `W_Root`. Both are GC refs.
+/// The block does not move; the visit keeps it alive.
 unsafe fn bytes_dict_storage_custom_trace(
     obj_addr: usize,
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
     let storage = &mut *(obj_addr as *mut pyre_object::dictmultiobject::BytesDictStorage);
-    for value in storage.values_mut() {
+    for (key, value) in storage.iter_mut() {
+        let key_ptr = key as *const pyre_object::dictmultiobject::BytesKey
+            as *mut pyre_object::dictmultiobject::BytesKey;
+        f(std::ptr::addr_of_mut!((*key_ptr).0) as *mut majit_ir::GcRef);
         f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     }
 }

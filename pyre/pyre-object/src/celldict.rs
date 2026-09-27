@@ -482,15 +482,68 @@ pub struct ModuleDictStorage {
     pub entries: ModuleDictEntries,
 }
 
+/// `ModuleDictStrategy` key: the unwrapped `str` (`Utf8Str`).
+///
+/// The block is the same payload `W_UnicodeObject.value` points at, allocated
+/// by `alloc_utf8_payload` (`managed` so the collector owns the leaf).
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct StrKey(pub *mut crate::unicodeobject::Utf8Str);
+
+impl StrKey {
+    /// The block's UTF-8 characters, the same slice `str` hashing and
+    /// equality see.
+    pub fn as_str(&self) -> &str {
+        // Keys are stored from a `&str`, so the payload is UTF-8. A null
+        // dummy (a cleared slot) reads as empty.
+        unsafe { std::str::from_utf8_unchecked(crate::unicodeobject::utf8_payload_bytes(self.0)) }
+    }
+}
+
+impl std::hash::Hash for StrKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl PartialEq for StrKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for StrKey {}
+
+impl std::borrow::Borrow<str> for StrKey {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl crate::rordereddict::EntryDummy for StrKey {
+    fn dummy() -> Self {
+        Self(std::ptr::null_mut())
+    }
+}
+
+impl std::fmt::Debug for StrKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
 /// The entry table `ModuleDictStorage` holds.
 ///
-/// Keyed by the owned name and hashed with
+/// Keyed by the unwrapped `str` (`ModuleDictStrategy`) and hashed with
 /// [`crate::dictmultiobject::StrKeyBuildHasher`] rather than Rust's default
 /// `RandomState`: upstream's storage is a plain `{}` over RPython strings,
 /// whose hash is a cheap chain cached on the string object, so a probe on a
 /// global's name costs one load there.
 pub type ModuleDictEntries =
-    crate::rordereddict::RDict<String, PyObjectRef, crate::dictmultiobject::StrKeyBuildHasher>;
+    crate::rordereddict::RDict<StrKey, PyObjectRef, crate::dictmultiobject::StrKeyBuildHasher>;
 
 /// The per-name `GlobalCache` registry (`celldict.py self.caches`).
 ///
@@ -522,8 +575,8 @@ pub fn module_dict_storage_gc_type_id() -> u32 {
 /// `self.unerase(w_dict.dstorage).get(key)`.
 ///
 /// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
-/// `ll_dict_lookup` (`rordereddict.py`).  Keys are owned `String`s, so no
-/// user `__eq__` or `__hash__` runs inside the probe.
+/// `ll_dict_lookup` (`rordereddict.py`).  Keys are unwrapped `str` blocks, so
+/// no user `__eq__` or `__hash__` runs inside the probe.
 fn module_dict_entries_get_iff(entries: &ModuleDictEntries, key: &str) -> bool {
     majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(key)
 }
@@ -554,7 +607,13 @@ pub fn module_dict_entries_insert(
     key: &str,
     w_value: PyObjectRef,
 ) -> Option<PyObjectRef> {
-    entries.insert(key.to_string(), w_value)
+    // An existing name keeps its block. Allocating before the probe would
+    // mint a `STR` the overwrite then drops.
+    if let Some(slot) = entries.get_mut(key) {
+        return Some(crate::rordereddict::replace_value(slot, w_value));
+    }
+    let block = crate::unicodeobject::alloc_utf8_payload(key.as_bytes(), true);
+    entries.insert(StrKey(block), w_value)
 }
 
 impl ModuleDictStorage {
@@ -1421,7 +1480,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         let (key, cell) = storage.entries.pop()?;
         strategy.mutated();
         crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
-        Some((_wrapkey(&key), unwrap_cell(cell)))
+        Some((_wrapkey(key.as_str()), unwrap_cell(cell)))
     }
 
     /// `celldict.py getiterreversed` — reverse iteration
@@ -1439,7 +1498,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             .entries
             .iter()
             .rev()
-            .map(|(k, &cell)| (_wrapkey(k), unwrap_cell(cell)))
+            .map(|(k, &cell)| (_wrapkey(k.as_str()), unwrap_cell(cell)))
             .collect()
     }
 
@@ -1481,7 +1540,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             if unwrapped.is_null() {
                 continue;
             }
-            let key_obj = _wrapkey(key);
+            let key_obj = _wrapkey(key.as_str());
             crate::dictmultiobject::w_dict_store(new_dict, key_obj, unwrapped);
         }
         new_dict

@@ -56,6 +56,7 @@ pub mod pyobject;
 pub mod quasiimmut;
 pub mod rbuilder;
 pub mod rordereddict;
+pub mod rstring;
 pub mod rutf8;
 pub mod setobject;
 pub mod sliceobject;
