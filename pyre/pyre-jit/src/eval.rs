@@ -8150,11 +8150,11 @@ pub fn init_jit_hooks() {
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).
     init_gc_subsystem();
-    // Kind-0 descrs stay off `PYRE_JIT=0` / `PYRE_NO_JIT`. When the JIT is
-    // on, decode them before user code runs. The close hook still runs the
-    // same function before `freeze_types`; doing that decode first from
-    // inside `frame_chain`'s recursive `CALL_ASSEMBLER` makes Windows ask
-    // for a garbage-sized allocation and exit 3221226505.
+    // `GcLLDescr_framework.init_size_descr` publishes Size tids before the
+    // translated program runs. Doing it on the first trace instead makes
+    // `frame_chain` allocate ~1.8 TiB and Windows exits 3221226505.
+    // `PYRE_JIT=0` / `PYRE_NO_JIT` never need the table. The decode runs on
+    // a fresh stack; the close hook still covers a trace that wins the race.
     if env_var_os("PYRE_NO_JIT").is_none() && env_var("PYRE_JIT").as_deref() != Some("0") {
         pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
     }
