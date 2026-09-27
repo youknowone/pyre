@@ -420,6 +420,22 @@ impl<'a> RawDescrPool<'a> {
         }
     }
 
+    /// Name of the jitcode an `inline_call` operand's `jitcode_index()`
+    /// names.  A per-fn pool numbers its own slots, so the index is an
+    /// `ALL_JITCODES` index only under the global pool; reading a per-fn
+    /// slot number through `get_jitcode_ref_by_index` names an unrelated
+    /// jitcode.
+    pub(crate) fn inline_callee_name(self, jitcode_index: usize) -> Option<&'a str> {
+        match self {
+            Self::Global => crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index)
+                .map(|jc| jc.name.as_str()),
+            Self::PerFn(descrs) => descrs
+                .get(jitcode_index)
+                .and_then(|descr| descr.as_jitcode())
+                .map(|jc| jc.name()),
+        }
+    }
+
     fn runtime_jitcode_at(
         self,
         idx: usize,

@@ -6135,7 +6135,13 @@ pub(crate) fn inline_call_specialized_plain_numeric_binop(
     // declines a body the walker will specialize.
     let tag = match int_concretes.first() {
         Some(ConcreteValue::Int(tag)) => *tag,
-        _ => super::specialize::binary_op_tag_for_helper_index(sub_index?, &int_concretes)?,
+        // `callee_descr_refs` carries no pool; the scan reads the index as an
+        // `ALL_JITCODES` index, as it did before the pool-aware lookup.
+        _ => super::specialize::binary_op_tag_for_helper_index(
+            super::RawDescrPool::Global,
+            sub_index?,
+            &int_concretes,
+        )?,
     };
     use pyre_interpreter::bytecode::BinaryOperator;
     match pyre_interpreter::runtime_ops::binary_op_from_tag(tag) {

@@ -8450,16 +8450,19 @@ pub(crate) fn jitcode_name_is_binary_value_from_tag(name: &str) -> bool {
 /// check then skipped descent so a declined sub-walk residualized
 /// `CallMayForce` (`binary_value_from_tag`) on fib bridges.
 pub(crate) fn jitcode_is_binary_value_from_tag(
+    pool: super::RawDescrPool<'_>,
     sub_index: usize,
     sub_body: &super::SubJitCodeBody,
 ) -> bool {
-    if crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
-        .is_some_and(|jc| jitcode_name_is_binary_value_from_tag(&jc.name))
+    if pool
+        .inline_callee_name(sub_index)
+        .is_some_and(jitcode_name_is_binary_value_from_tag)
     {
         return true;
     }
     crate::jitcode_runtime::pathed_jitcode_cached(BINARY_OP_DESCENT.path).is_some_and(|jc| {
-        jc.index() == sub_index || std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr())
+        (matches!(pool, super::RawDescrPool::Global) && jc.index() == sub_index)
+            || std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr())
     })
 }
 
@@ -8468,12 +8471,11 @@ pub(crate) fn jitcode_is_binary_value_from_tag(
 /// stamp the helper resume word still emits `int_add` instead of
 /// `CallMayForce` (`binary_value_from_tag`).
 pub(crate) fn binary_op_tag_for_helper_index(
+    pool: super::RawDescrPool<'_>,
     sub_index: usize,
     int_concretes: &[ConcreteValue],
 ) -> Option<i64> {
-    let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)?
-        .name
-        .as_str();
+    let name = pool.inline_callee_name(sub_index)?;
     if jitcode_name_is_binary_value_from_tag(name) {
         return match int_concretes.first() {
             Some(ConcreteValue::Int(tag)) => Some(*tag),
