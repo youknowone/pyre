@@ -332,12 +332,12 @@ fn exec_diag_enabled() -> bool {
 /// (`llmodel.py execute_token` does not free). A chain, or a slot that
 /// already holds a frame, is freed: those blocks are still referenced
 /// or are a second live frame.
-fn release_done_int_frame(token: &JitCellToken, ran: &RanFrame) {
-    let single = ran.tip == ran.head && unsafe { (*ran.head).jf_forward.is_null() };
-    if single && token.park_entry_frame(ran.head) {
+fn release_done_int_frame(token: &JitCellToken, head: *mut JitFrame, tip: *mut JitFrame) {
+    let single = tip == head && unsafe { (*head).jf_forward.is_null() };
+    if single && token.park_entry_frame(head) {
         return;
     }
-    unsafe { free_jitframe_chain(ran.head) };
+    unsafe { free_jitframe_chain(head) };
 }
 
 type EntryArgRoots = smallvec::SmallVec<[majit_gc::shadow_stack::OwnerRootGuard; 4]>;
@@ -2908,11 +2908,54 @@ impl DynasmBackend {
                     let tip = JitFrame::resolve(ran.tip);
                     crate::llmodel::get_int_value_direct(tip, 0) as i64
                 };
-                release_done_int_frame(token, &ran);
+                release_done_int_frame(token, ran.head, ran.tip);
                 return Ok(value);
             }
         }
         Err(self.deadframe_from_run(token, ran))
+    }
+
+    /// Collector and diag entries keep the layered `execute_token` path.
+    #[cold]
+    #[inline(never)]
+    fn execute_token_done_int_raw_general(
+        &self,
+        token: &JitCellToken,
+        args: &[i64],
+    ) -> Result<i64, DeadFrame> {
+        if majit_gc::collector_installed() {
+            let kinds = token.inputarg_types();
+            let values: smallvec::SmallVec<[Value; 8]> = args
+                .iter()
+                .enumerate()
+                .map(|(i, &word)| {
+                    let kind = kinds.get(i).copied().unwrap_or(Type::Int);
+                    majit_backend::value_from_unspecialized_word(word, kind)
+                })
+                .collect();
+            return self.execute_token_done_int(token, &values);
+        }
+        let ran = self.run_compiled_frame_raw(token, args);
+        self.done_int_from_ran(token, ran)
+    }
+
+    /// Any exit other than `DoneWithThisFrameDescrInt` builds the deadframe.
+    #[cold]
+    #[inline(never)]
+    fn raw_entry_deadframe(
+        &self,
+        token: &JitCellToken,
+        head: *mut JitFrame,
+        tip: *mut JitFrame,
+        num_slots: usize,
+    ) -> DeadFrame {
+        let ran = RanFrame {
+            head,
+            tip,
+            gc_object: false,
+            num_slots,
+        };
+        self.deadframe_from_run(token, ran)
     }
 
     /// `jf_descr` equals the `DoneWithThisFrameDescrInt` cell
@@ -3461,30 +3504,58 @@ impl Backend for DynasmBackend {
         self.done_int_from_ran(token, ran)
     }
 
-    /// `llmodel.py execute_token` with `unspecialize_value` words.
-    ///
-    /// No collector: write each word with `set_int_value`. A collector keeps
-    /// today's `Value` entry, rebuilding tags from `token.inputarg_types()`.
+    /// `llmodel.py execute_token` allocates the frame, stores the words, and
+    /// calls. `warmstate.py execute_assembler` reads `get_latest_descr` and,
+    /// for `DoneWithThisFrameDescrInt`, returns `get_result` (slot 0).
     #[inline]
     fn execute_token_done_int_raw(
         &self,
         token: &JitCellToken,
         args: &[i64],
     ) -> Result<i64, DeadFrame> {
-        if majit_gc::collector_installed() {
-            let kinds = token.inputarg_types();
-            let values: smallvec::SmallVec<[Value; 8]> = args
-                .iter()
-                .enumerate()
-                .map(|(i, &word)| {
-                    let kind = kinds.get(i).copied().unwrap_or(Type::Int);
-                    majit_backend::value_from_unspecialized_word(word, kind)
-                })
-                .collect();
-            return self.execute_token_done_int(token, &values);
+        if majit_gc::collector_installed() || exec_diag_enabled() {
+            return self.execute_token_done_int_raw_general(token, args);
         }
-        let ran = self.run_compiled_frame_raw(token, args);
-        self.done_int_from_ran(token, ran)
+        let entry = token.ll_function_addr() as *const u8;
+        let clt = unsafe { &*token.compiled_loop_token_ptr() };
+        let (fi_ptr, num_slots) = {
+            let info = unsafe { &*clt.frame_info.data_ptr() };
+            (
+                info as *const majit_backend::JitFrameInfo,
+                info.depth() as usize,
+            )
+        };
+        assert!(
+            num_slots >= Self::input_slot(args.len()),
+            "execute_token: frame depth {num_slots} < input top {} for {} args",
+            Self::input_slot(args.len()),
+            args.len()
+        );
+        let frame_bytes = JitFrame::alloc_size(num_slots);
+        let jf_ptr = match token.take_entry_frame(frame_bytes) {
+            Some(p) => {
+                unsafe { reuse_off_gc_jitframe(p) };
+                p
+            }
+            None => malloc_host_jitframe(frame_bytes),
+        };
+        unsafe { JitFrame::init(jf_ptr, fi_ptr, num_slots) };
+        for (i, &word) in args.iter().enumerate() {
+            unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), word as isize) };
+        }
+        let func: unsafe extern "C" fn(*mut JitFrame, *const i64) -> *mut JitFrame =
+            unsafe { std::mem::transmute(entry) };
+        let tip = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
+        let descr_raw = unsafe { crate::llmodel::get_latest_descr(tip) };
+        if self.finish_is_done_int(descr_raw) {
+            let value = unsafe {
+                let tip = JitFrame::resolve(tip);
+                crate::llmodel::get_int_value_direct(tip, 0) as i64
+            };
+            release_done_int_frame(token, jf_ptr, tip);
+            return Ok(value);
+        }
+        Err(self.raw_entry_deadframe(token, jf_ptr, tip, num_slots))
     }
 
     /// Override execute_token_ints_raw to return the FULL jitframe
