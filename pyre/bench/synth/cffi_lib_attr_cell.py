@@ -1,5 +1,5 @@
 # pyre-check: skip-cpython
-# pyre-check: skip-backends=wasm
+# pyre-check: skip-backends=wasm,cranelift
 # pyre-check: skip-platforms=win32
 # `optind` is a libc `int` on unix. Windows has no such export, so pypy
 # exits 1 during dlopen and the oracle never starts.
@@ -7,7 +7,8 @@
 # host's python3 cannot import it, so pypy alone is the oracle here. The module
 # is absent on wasm32 altogether -- the fold arm itself is
 # `#[cfg(not(target_arch = "wasm32"))]` -- so that backend is skipped rather
-# than left to fail on the import.
+# than left to fail on the import. cranelift runs the core build, which has no
+# `pyre-module` and so no `_cffi_backend`.
 #
 # No `max-pypy-ratio`: absence exempts the fixture from the ratio gate, which
 # is what this file wants. Every leg's wall-clock is dominated by the libffi
