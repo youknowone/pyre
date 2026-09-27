@@ -801,11 +801,15 @@ unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<
             Ok(cformat_rbigint(spec, &value)?.into_bytes())
         }
         CFormatType::Float(_) => {
+            // `float_w` collects (`__float__`, a long's `tofloat`); the error
+            // names the operand read back from its slot.
+            let roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = roots.pin_roots(&[obj]);
             let value = crate::baseobjspace::float_w(obj).map_err(|e| {
                 if e.kind == PyErrorKind::TypeError {
                     PyError::type_error(format!(
                         "float argument required, not {}",
-                        crate::baseobjspace::object_functionstr_type_name(obj)
+                        crate::baseobjspace::object_functionstr_type_name(roots.get(obj_slot))
                     ))
                 } else {
                     e
