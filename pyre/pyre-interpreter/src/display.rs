@@ -877,8 +877,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
         // a static type, so it survives the moves the object itself makes.
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(obj);
-        let mut obj = obj;
+        let mut obj = pyre_object::gc_roots::pin_root(obj);
         // The formatting below is keyed on the payload layout, which a
         // `_getusercls` class shares with the builtin it was made from.
         let tp = pyre_object::pyobject::layout_base((*obj).ob_type);

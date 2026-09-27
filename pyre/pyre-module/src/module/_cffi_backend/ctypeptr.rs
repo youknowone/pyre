@@ -319,9 +319,10 @@ pub(crate) fn pointer_newp_with_allocator(
         )));
     }
     let roots = pyre_object::gc_roots::push_roots();
-    let init_slot = roots.base();
-    let _ = roots.pin_root(w_init);
-    let cdata_slot = init_slot + 1;
+    let init_slot = roots.pin_roots(&[w_init, w_ctype, w_item]);
+    let ctype_slot = init_slot + 1;
+    let item_slot = init_slot + 2;
+    let cdata_slot = init_slot + 3;
     if item.is_struct_or_union() {
         // `newp` on a struct-or-union pointer hands back a co-owner of the
         // cdata that really holds the struct, so `p[0]` is that object.
@@ -340,17 +341,22 @@ pub(crate) fn pointer_newp_with_allocator(
             }
             varsize_length = datasize;
         }
-        let w_structobj =
-            super::allocator::allocate(allocator.as_deref_mut(), datasize, w_item, varsize_length)?;
+        let w_structobj = super::allocator::allocate(
+            allocator.as_deref_mut(),
+            datasize,
+            roots.get(item_slot),
+            varsize_length,
+        )?;
         let struct_slot = cdata_slot;
         let _ = roots.pin_root(w_structobj);
         let ptr = cdataobj::cdata_arg(roots.get(struct_slot))?.ptr;
-        let w_cdata = cdataobj::new_cdata_ptr_to_struct(ptr, w_ctype, roots.get(struct_slot));
+        let w_cdata =
+            cdataobj::new_cdata_ptr_to_struct(ptr, roots.get(ctype_slot), roots.get(struct_slot));
         let ptr_slot = struct_slot + 1;
         let _ = roots.pin_root(w_cdata);
         if !unsafe { pyre_object::pyobject::is_none(roots.get(init_slot)) } {
             let cdata = cdataobj::cdata_arg(roots.get(ptr_slot))?;
-            let item = ctypeobj::ctype_arg(w_item)?;
+            let item = ctypeobj::ctype_arg(roots.get(item_slot))?;
             unsafe {
                 ctypeobj::convert_from_object(item, cdata.ptr, roots.get(init_slot))?;
             }
@@ -361,7 +367,12 @@ pub(crate) fn pointer_newp_with_allocator(
         // Room for the null character `newp` always adds.
         datasize *= 2;
     }
-    let w_cdata = super::allocator::allocate(allocator.as_deref_mut(), datasize, w_ctype, -1)?;
+    let w_cdata = super::allocator::allocate(
+        allocator.as_deref_mut(),
+        datasize,
+        roots.get(ctype_slot),
+        -1,
+    )?;
     let _ = roots.pin_root(w_cdata);
     let w_init = roots.get(init_slot);
     if !unsafe { pyre_object::pyobject::is_none(w_init) } {
@@ -381,8 +392,9 @@ pub fn array_newp(
 ) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(w_ctype)?;
     let roots = pyre_object::gc_roots::push_roots();
-    let init_slot = roots.base();
-    let _ = roots.pin_root(w_init);
+    let init_slot = roots.pin_roots(&[w_init, w_allocator, w_ctype]);
+    let allocator_slot = init_slot + 1;
+    let ctype_slot = init_slot + 2;
     let (w_init, datasize, length) = if ct.size < 0 {
         let (w_init, length) = new_array_length(ct, roots.get(init_slot))?;
         let item = item_of(ct)?;
@@ -391,12 +403,12 @@ pub fn array_newp(
     } else {
         (roots.get(init_slot), ct.size, ct.length)
     };
-    let init_slot2 = init_slot + 1;
+    let init_slot2 = init_slot + 3;
     let _ = roots.pin_root(w_init);
     let w_cdata = super::allocator::allocate(
-        super::allocator::W_Allocator::from_obj(w_allocator),
+        super::allocator::W_Allocator::from_obj(roots.get(allocator_slot)),
         datasize,
-        w_ctype,
+        roots.get(ctype_slot),
         length,
     )?;
     let cdata_slot = init_slot2 + 1;

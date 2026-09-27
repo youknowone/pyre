@@ -606,7 +606,9 @@ fn simple_init_stginfo(mut cls: PyObjectRef) -> PyResult {
         // left to right, so reading the slot inline with an allocating value
         // expression would hand the store a pre-move address.
         let roots = pyre_object::gc_roots::push_roots();
-        let ns_slot = roots.base();
+        let cls_slot = roots.base();
+        let _ = roots.pin_root(cls);
+        let ns_slot = cls_slot + 1;
         let _ = roots.pin_root(pyre_object::w_dict_new());
         let w_tc = pyre_object::w_str_new(&tc);
         unsafe {
@@ -616,10 +618,13 @@ fn simple_init_stginfo(mut cls: PyObjectRef) -> PyResult {
                 "_swappedbytes_",
                 pyre_object::w_bool_from(true),
             );
-            pyre_object::w_dict_setitem_str(roots.get(ns_slot), "_ctypes_native_peer", cls);
+            pyre_object::w_dict_setitem_str(
+                roots.get(ns_slot),
+                "_ctypes_native_peer",
+                roots.get(cls_slot),
+            );
         }
-        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(cls);
+        let cls = roots.get(cls_slot);
         let bases = unsafe { pyre_object::typeobject::w_type_get_bases(cls) };
         let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
         let w_name = pyre_object::w_str_new(name);
@@ -941,10 +946,22 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
     // stored back on the class, so it is pinned here and read back at that
     // store.
     let fields_roots = pyre_object::gc_roots::push_roots();
-    let fields_slot = fields_roots.base();
-    let fields = fields_roots.pin_root(fields);
-    let entries = field_entries(fields)?;
-    let anonymous = anonymous_names(cls)?;
+    let fields_slot = fields_roots.pin_roots(&[
+        fields,
+        cls,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        cached_pointer_type.unwrap_or(pyre_object::PY_NULL),
+    ]);
+    let cls_slot = fields_slot + 1;
+    let bi_slot = fields_slot + 2;
+    let ftype_slot = fields_slot + 3;
+    let info_slot = fields_slot + 4;
+    let pointer_type_slot = fields_slot + 5;
+    let cls = || fields_roots.get(cls_slot);
+    let entries = field_entries(fields_roots.get(fields_slot))?;
+    let anonymous = anonymous_names(cls())?;
 
     for name in &anonymous {
         let Some(entry) = entries.iter().find(|entry| &entry.name == name) else {
@@ -960,12 +977,13 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
     }
 
     let is_swapped =
-        unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }.is_some();
-    let pack = usize_attr(cls, "_pack_", 0);
-    let forced = align_attr(cls)?;
+        unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls(), "_swappedbytes_") }
+            .is_some();
+    let pack = usize_attr(cls(), "_pack_", 0);
+    let forced = align_attr(cls())?;
     if pack > 0
         && !cfg!(windows)
-        && unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_layout_") }.is_none()
+        && unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls(), "_layout_") }.is_none()
     {
         pyre_interpreter::warn::warn_deprecation(
             "_pack_ without explicit _layout_ uses deprecated MSVC layout",
@@ -976,20 +994,23 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
     // elsewhere) or one that would embed itself by value cannot define fields.
     // Checking up front keeps a rejected `_fields_` from leaving half-installed
     // descriptors and a final flag behind.
-    if stginfo::stginfo_of(cls).is_some_and(stginfo::stginfo_is_final)
-        || entries.iter().any(|entry| entry.ty == cls)
+    if stginfo::stginfo_of(cls()).is_some_and(stginfo::stginfo_is_final)
+        || entries.iter().any(|entry| entry.ty == cls())
     {
         return Err(pyre_interpreter::PyError::attribute_error(
             "Structure or union cannot contain itself",
         ));
     }
 
-    let (base_size, base_length, mut max_align) = match first_base_stginfo(cls) {
-        Some(bi) => (
-            stginfo::stginfo_size(bi),
-            stginfo::stginfo_length(bi),
-            stginfo::stginfo_align(bi).max(forced),
-        ),
+    let (base_size, base_length, mut max_align) = match first_base_stginfo(cls()) {
+        Some(bi) => {
+            fields_roots.set(bi_slot, bi);
+            (
+                stginfo::stginfo_size(fields_roots.get(bi_slot)),
+                stginfo::stginfo_length(fields_roots.get(bi_slot)),
+                stginfo::stginfo_align(fields_roots.get(bi_slot)).max(forced),
+            )
+        }
         None => (0usize, 0usize, forced),
     };
     // A union inherits its base's footprint as a floor, so a derived union with
@@ -1009,24 +1030,25 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
         Vec::with_capacity(entries.len());
     for entry in &entries {
         let name = &entry.name;
-        let ftype = entry.ty;
+        fields_roots.set(ftype_slot, entry.ty);
+        let ftype = || fields_roots.get(ftype_slot);
         if is_swapped
-            && (proto_kind(ftype) == ParamFunc::Pointer
-                || cdata::type_code_of(ftype)
+            && (proto_kind(ftype()) == ParamFunc::Pointer
+                || cdata::type_code_of(ftype())
                     .is_some_and(|code| matches!(code.as_str(), "u" | "P" | "z" | "Z" | "O")))
         {
             return Err(pyre_interpreter::PyError::type_error(format!(
                 "This type does not support other endian: {name}",
             )));
         }
-        let size = stginfo::field_size_of(ftype).ok_or_else(|| {
+        let size = stginfo::field_size_of(ftype()).ok_or_else(|| {
             pyre_interpreter::PyError::type_error(format!("field '{name}' has no size"))
         })?;
-        let align = stginfo::field_align_of(ftype).unwrap_or(1).max(1);
+        let align = stginfo::field_align_of(ftype()).unwrap_or(1).max(1);
         let eff = if pack > 0 { pack.min(align) } else { align };
         max_align = max_align.max(eff);
 
-        if let Some(fi) = stginfo::stginfo_of(ftype)
+        if let Some(fi) = stginfo::stginfo_of(ftype())
             && stginfo::stginfo_flags(fi)
                 & (stginfo::TYPEFLAG_ISPOINTER | stginfo::TYPEFLAG_HASPOINTER)
                 != 0
@@ -1042,7 +1064,7 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
                 continue;
             }
             let reuse = active_bits.filter(|(active_ty, active_size, _, used)| {
-                *active_ty == ftype && *active_size == size && *used + bits <= size * 8
+                *active_ty == ftype() && *active_size == size && *used + bits <= size * 8
             });
             let (field_offset, used) = if let Some((_, _, at, used)) = reuse {
                 (at, used)
@@ -1059,7 +1081,7 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
             } else {
                 size * 8 - used - bits
             };
-            active_bits = Some((ftype, size, field_offset, used + bits));
+            active_bits = Some((ftype(), size, field_offset, used + bits));
             pending.push((field_offset, size, align, Some((bits, bit_offset))));
         } else {
             active_bits = None;
@@ -1092,9 +1114,10 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
         let cf = cfield_new(&entry.name, entry.ty, field_offset, size, index);
         // The descriptor's `dict` moves and each insertion allocates both the
         // value and the key string, so the word is read back out of a root
-        // slot with the value already built.  `cf` does not move but is
-        // unreferenced until `set_type_attr` below, so it takes one pin.
+        // slot with the value already built.  `cf` is unreferenced until
+        // `set_type_attr` below, so it takes one pin.
         let roots = pyre_object::gc_roots::push_roots();
+        let cf_slot = roots.base();
         let cf = roots.pin_root(cf);
         let d_slot = roots.base() + 1;
         let _ = roots.pin_root(pyre_interpreter::baseobjspace::getdict_native(cf));
@@ -1117,7 +1140,7 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
         {
             put("is_anonymous", pyre_object::w_bool_from(true));
         }
-        set_type_attr(cls, &entry.name, cf);
+        set_type_attr(cls(), &entry.name, roots.get(cf_slot));
     }
     for name in &anonymous {
         let (index, entry) = entries
@@ -1125,7 +1148,7 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
             .enumerate()
             .find(|(_, entry)| &entry.name == name)
             .expect("anonymous fields validated above");
-        promote_anonymous_fields(cls, entry.ty, pending[index].0)?;
+        promote_anonymous_fields(cls(), entry.ty, pending[index].0)?;
     }
 
     let mut flags = stginfo::DICTFLAG_FINAL;
@@ -1148,14 +1171,16 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
     data.length = base_length + entries.len();
     data.flags = flags;
     data.big_endian = is_swapped ^ cfg!(target_endian = "big");
-    let new_info = stginfo::stginfo_new(data);
+    fields_roots.set(info_slot, stginfo::stginfo_new(data));
+    let w = fields_roots.get(pointer_type_slot);
+    let cached_pointer_type = if w.is_null() { None } else { Some(w) };
     if let Some(pointer_type) = cached_pointer_type {
-        stginfo::stginfo_set_pointer_type(new_info, pointer_type);
+        stginfo::stginfo_set_pointer_type(fields_roots.get(info_slot), pointer_type);
     }
-    stginfo::stginfo_set(cls, new_info);
+    stginfo::stginfo_set(cls(), fields_roots.get(info_slot));
 
     // Store the raw `_fields_` so the metaclass getset can return it.
-    set_type_attr(cls, "_fields_", fields_roots.get(fields_slot));
+    set_type_attr(cls(), "_fields_", fields_roots.get(fields_slot));
     Ok(pyre_object::w_none())
 }
 
@@ -1297,20 +1322,22 @@ fn cfield_new(
     // value, the key string `w_dict_setitem_str` builds, and the dict's own
     // storage when it grows.  A minor collection anywhere in that run
     // relocates the dict, so the word is read back out of a root slot for
-    // each insertion.  `inst` does not move, but nothing else references it
-    // while the run allocates, so it takes one pin for liveness.
+    // each insertion.
     let roots = pyre_object::gc_roots::push_roots();
+    let inst_slot = roots.base();
     let inst = roots.pin_root(inst);
-    // The dict lands in the slot after `inst`.
-    let d_slot = roots.base() + 1;
+    let proto_slot = inst_slot + 1;
+    let _ = roots.pin_root(proto);
+    // The dict lands in the slot after `proto`.
+    let d_slot = inst_slot + 2;
     let _ = roots.pin_root(pyre_interpreter::baseobjspace::getdict_native(inst));
     let put = |key: &str, value: PyObjectRef| {
         // SAFETY: the slot holds the instance dict pinned above.
         unsafe { pyre_object::w_dict_setitem_str(roots.get(d_slot), key, value) };
     };
     put("name", pyre_object::w_str_new(name));
-    put("proto", proto);
-    put("type", proto);
+    put("proto", roots.get(proto_slot));
+    put("type", roots.get(proto_slot));
     put("offset", pyre_object::w_int_new(offset as i64));
     put("byte_offset", pyre_object::w_int_new(offset as i64));
     put("size", pyre_object::w_int_new(size as i64));
@@ -1321,7 +1348,7 @@ fn cfield_new(
     put("is_bitfield", pyre_object::w_bool_from(false));
     put("is_anonymous", pyre_object::w_bool_from(false));
     put("index", pyre_object::w_int_new(index as i64));
-    inst
+    roots.get(inst_slot)
 }
 
 fn cf_obj(cfield: PyObjectRef, key: &str) -> PyObjectRef {
@@ -1841,12 +1868,12 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
     for &arg in args {
         let _ = roots.pin_root(arg);
     }
-    let obj = args[0];
+    let obj = || roots.get(args_slot);
     let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
     let pos_len = pos.len();
     // The keyword carrier, when present, is the trailing argument.
     let kw_slot = kwargs.map(|_| args_slot + args.len() - 1);
-    let cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    let cls = unsafe { pyre_object::w_instance_get_type(obj()) };
     let names = field_names_base_first(cls);
 
     if pos_len > names.len() {
@@ -1855,7 +1882,11 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     for i in 0..pos_len {
-        pyre_interpreter::baseobjspace::setattr_str(obj, &names[i], roots.get(args_slot + 1 + i))?;
+        pyre_interpreter::baseobjspace::setattr_str(
+            obj(),
+            &names[i],
+            roots.get(args_slot + 1 + i),
+        )?;
     }
 
     if let Some(kw_slot) = kw_slot {
@@ -1868,7 +1899,8 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
             let _ = roots.pin_root(key_obj);
             let _ = roots.pin_root(val);
         }
-        for (i, &(key_obj, _)) in items.iter().enumerate() {
+        for i in 0..items.len() {
+            let key_obj = roots.get(items_slot + i * 2);
             if !unsafe { pyre_object::is_str(key_obj) } {
                 continue;
             }
@@ -1885,7 +1917,7 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
                 )));
             }
             pyre_interpreter::baseobjspace::setattr_str(
-                obj,
+                obj(),
                 &key,
                 roots.get(items_slot + i * 2 + 1),
             )?;
@@ -2041,24 +2073,30 @@ fn array_type_from_ctype(elem: PyObjectRef, n: usize) -> PyResult {
     // allocates throughout — so both words live in root slots and are read
     // back at every use.
     let roots = pyre_object::gc_roots::push_roots();
-    let cache_slot = roots.base();
+    let elem_slot = roots.base();
+    let elem = roots.pin_root(elem);
+    let cache_slot = elem_slot + 1;
     let cached = pyre_interpreter::type_dict_lookup(elem, ARRAY_TYPE_CACHE_KEY);
     let _ = roots.pin_root(cached.unwrap_or_else(pyre_object::w_dict_new));
     if cached.is_none()
-        && pyre_interpreter::type_dict_store(elem, ARRAY_TYPE_CACHE_KEY, roots.get(cache_slot))
+        && pyre_interpreter::type_dict_store(
+            roots.get(elem_slot),
+            ARRAY_TYPE_CACHE_KEY,
+            roots.get(cache_slot),
+        )
     {
-        pyre_object::gc_hook::try_gc_write_barrier(elem as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(roots.get(elem_slot) as *mut u8);
     }
     if let Some(found) = unsafe { pyre_object::w_dict_getitem(roots.get(cache_slot), n as i64) } {
         return Ok(found);
     }
-    let name = format!("{}_Array_{}", type_name(elem), n);
+    let name = format!("{}_Array_{}", type_name(roots.get(elem_slot)), n);
     let ns_roots = pyre_object::gc_roots::push_roots();
     let ns_slot = ns_roots.base();
     let _ = ns_roots.pin_root(pyre_object::w_dict_new());
     let w_length = pyre_object::w_int_new(n as i64);
     unsafe {
-        pyre_object::w_dict_setitem_str(ns_roots.get(ns_slot), "_type_", elem);
+        pyre_object::w_dict_setitem_str(ns_roots.get(ns_slot), "_type_", roots.get(elem_slot));
         pyre_object::w_dict_setitem_str(ns_roots.get(ns_slot), "_length_", w_length);
     }
     let bases = ns_roots.pin_root(pyre_object::w_tuple_new(vec![array_type()]));

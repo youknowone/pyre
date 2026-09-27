@@ -3111,6 +3111,8 @@ fn new_typeobject_with_metatype_and_layout(
     // word handed over is stored in the new type, but this frame's copy is
     // pre-move, so the probes below take a fresh read.
     let type_obj = new_builtin_typeobject(name, bases, ns as *mut u8, layout_pytype, w_metatype);
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let type_obj = pyre_object::gc_roots::pin_root(type_obj);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
 
     // typeobject.py setup_builtin_type:
@@ -3194,7 +3196,7 @@ fn new_typeobject_with_metatype_and_layout(
     // `_type_new` (typeobject.py:970) does for a heap type — so a builtin
     // shows up in `base.__subclasses__()` too.
     unsafe { pyre_object::typeobject::w_type_ready(type_obj) };
-    type_obj
+    pyre_object::gc_roots::shadow_stack_get(type_slot)
 }
 
 /// Create a named builtin type inheriting from multiple `bases`.
@@ -3264,6 +3266,8 @@ pub(crate) fn make_builtin_type_with_bases_and_layout_owner(
         unsafe { (*typedef).instance_type },
         PY_NULL,
     );
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let type_obj = pyre_object::gc_roots::pin_root(type_obj);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
 
     unsafe {
@@ -3302,7 +3306,7 @@ pub(crate) fn make_builtin_type_with_bases_and_layout_owner(
     // multi-base builtin such as `io.UnsupportedOperation(OSError, ValueError)`
     // reaches both `OSError.__subclasses__()` and `ValueError.__subclasses__()`.
     unsafe { pyre_object::typeobject::w_type_ready(type_obj) };
-    type_obj
+    pyre_object::gc_roots::shadow_stack_get(type_slot)
 }
 
 /// Create a named builtin type inheriting from `object`.
@@ -3878,7 +3882,9 @@ fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     // Python, so it is pinned where the lookup produces it and read back for
     // the listing that follows the probe.
     let roots = pyre_object::gc_roots::push_roots();
-    let dict_slot = roots.base();
+    let module_slot = roots.base();
+    let module = roots.pin_root(module);
+    let dict_slot = module_slot + 1;
     let _ = roots.pin_root(crate::baseobjspace::getattr_str(module, "__dict__")?);
     let w_dict = roots.get(dict_slot);
     if w_dict.is_null()
@@ -3889,7 +3895,7 @@ fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             }))
     {
         return Err(crate::PyError::type_error(crate::display::wtf8_format!(
-            unsafe { crate::display::py_repr_wtf8(module)? },
+            unsafe { crate::display::py_repr_wtf8(roots.get(module_slot))? },
             ".__dict__ is not a dictionary"
         )));
     }
@@ -18480,12 +18486,14 @@ fn staticmethod_wrapped_attr_get(obj: PyObjectRef, name: &str) -> crate::PyResul
     // string, so it rides a slot too and is read back at the store and at the
     // return.
     let roots = pyre_object::gc_roots::push_roots();
-    let dict_slot = roots.base();
+    let sm_slot = roots.base();
+    let sm = roots.pin_root(sm);
+    let dict_slot = sm_slot + 1;
     let _ = roots.pin_root(unsafe { pyre_object::function::w_staticmethod_getdict(sm) });
     if let Some(value) = crate::baseobjspace::finditem_str(roots.get(dict_slot), name)? {
         return Ok(value);
     }
-    let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
+    let function = unsafe { pyre_object::function::w_staticmethod_get_func(roots.get(sm_slot)) };
     let value_slot = dict_slot + 1;
     let _ = roots.pin_root(crate::baseobjspace::getattr_str(function, name)?);
     let key = pyre_object::intern_str_value(name);
@@ -18810,12 +18818,14 @@ fn classmethod_isabstract(args: &[PyObjectRef]) -> crate::PyResult {
 fn classmethod_wrapped_attr_get(obj: PyObjectRef, name: &str) -> crate::PyResult {
     let cm = classmethod_require(obj, name)?;
     let roots = pyre_object::gc_roots::push_roots();
-    let dict_slot = roots.base();
+    let cm_slot = roots.base();
+    let cm = roots.pin_root(cm);
+    let dict_slot = cm_slot + 1;
     let _ = roots.pin_root(unsafe { pyre_object::function::w_classmethod_getdict(cm) });
     if let Some(value) = crate::baseobjspace::finditem_str(roots.get(dict_slot), name)? {
         return Ok(value);
     }
-    let function = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
+    let function = unsafe { pyre_object::function::w_classmethod_get_func(roots.get(cm_slot)) };
     let value_slot = dict_slot + 1;
     let _ = roots.pin_root(crate::baseobjspace::getattr_str(function, name)?);
     let key = pyre_object::intern_str_value(name);
@@ -26453,7 +26463,7 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
         .get(1)
         .copied()
         .or_else(|| crate::builtins::kwarg_get(kwargs, "encoding"));
-    let w_errors = pos
+    let mut w_errors = pos
         .get(2)
         .copied()
         .or_else(|| crate::builtins::kwarg_get(kwargs, "errors"));
@@ -26477,11 +26487,16 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
         )));
     }
     // Copy encoding/errors and the payload off the objects before the
-    // decoder allocates. Do not pin here: leftover-17's pin set on this
-    // path broke JIT startpoints.
+    // decoder allocates.
     let encoding = match w_encoding {
         Some(e) if unsafe { pyre_object::is_str(e) } => {
-            crate::baseobjspace::str_utf8_w(e)?.to_string()
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.pin_roots(&[w_errors.unwrap_or(pyre_object::PY_NULL)]);
+            let r = crate::baseobjspace::str_utf8_w(e);
+            let w = roots.get(base);
+            w_errors = if w.is_null() { None } else { Some(w) };
+            drop(roots);
+            r?.to_string()
         }
         _ => "utf-8".to_string(),
     };

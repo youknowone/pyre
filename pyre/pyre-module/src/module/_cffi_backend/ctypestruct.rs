@@ -345,8 +345,10 @@ pub unsafe fn convert_struct_from_object(
     let roots = pyre_object::gc_roots::push_roots();
     let ob_slot = roots.base();
     let _ = roots.pin_root(w_ob);
-    let is_seq =
-        unsafe { pyre_object::pyobject::is_list(w_ob) || pyre_object::pyobject::is_tuple(w_ob) };
+    let is_seq = unsafe {
+        pyre_object::pyobject::is_list(roots.get(ob_slot))
+            || pyre_object::pyobject::is_tuple(roots.get(ob_slot))
+    };
     if is_seq {
         let items = pyre_interpreter::baseobjspace::unpackiterable(roots.get(ob_slot), -1)?;
         let items_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -377,7 +379,7 @@ pub unsafe fn convert_struct_from_object(
         }
         return Ok(optvarsize);
     }
-    if unsafe { pyre_object::pyobject::is_dict(w_ob) } {
+    if unsafe { pyre_object::pyobject::is_dict(roots.get(ob_slot)) } {
         let keys = pyre_interpreter::baseobjspace::fixedview(roots.get(ob_slot), -1)?;
         let keys_slot = pyre_object::gc_roots::shadow_stack_len();
         for &key in &keys {

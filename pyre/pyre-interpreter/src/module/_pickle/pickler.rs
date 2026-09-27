@@ -267,11 +267,11 @@ fn add_pickle_object_note(
     role: &rustpython_wtf8::Wtf8,
 ) -> PyError {
     let _roots = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_exc = err.to_exc_object();
     let _ = pyre_object::gc_roots::pin_root(w_exc);
     let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let _ = pyre_object::gc_roots::pin_root(w_obj);
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     if let Ok(type_name) = pickle_type_name(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
         let w_note = pyre_object::w_str_from_wtf8_managed(crate::display::wtf8_format!(

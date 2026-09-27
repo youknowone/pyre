@@ -144,12 +144,14 @@ fn parse_filter_spec(spec: PyObjectRef) -> Result<backend::FilterSpec, pyre_inte
     // result names a filter is the dispatch's answer below, not this one's;
     // only a width the type cannot hold is an overflow here.
     let w_index = pyre_interpreter::baseobjspace::space_index(w_id)?;
+    let index_slot = shadow_stack_len();
+    let w_index = pin_root(w_index);
     let negative =
         || pyre_interpreter::PyError::value_error("cannot convert negative integer to unsigned");
     let id = match pyre_interpreter::baseobjspace::int_w(w_index) {
         Ok(value) => u64::try_from(value).map_err(|_| negative())?,
         Err(error) if error.kind == pyre_interpreter::PyErrorKind::OverflowError => {
-            let big = unsafe { pyre_object::w_long_get_value(w_index) };
+            let big = unsafe { pyre_object::w_long_get_value(shadow_stack_get(index_slot)) };
             if big.get_sign() < 0 {
                 return Err(negative());
             }

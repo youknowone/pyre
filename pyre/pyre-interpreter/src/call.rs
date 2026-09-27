@@ -6160,7 +6160,7 @@ fn build_class_inner(
             .map(pyre_object::gc_roots::shadow_stack_get)
             .unwrap_or(body_ns);
         let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_ns);
+        let w_ns = pyre_object::gc_roots::pin_root(w_ns);
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         // A plain class body now writes directly into class_ns, preserving the
         // `__classdict__` closure identity.  Only a distinct custom prepared
@@ -6881,9 +6881,11 @@ fn type_descr_call_with_mode(
     // typeobject.py:726 — `w_newfunc = space.get(w_newdescr, space.w_None,
     // w_type=self)`.  A descriptor with no __get__ (`get` → None) is its own
     // bound value, matching `space.get`'s `if w_get is None: return w_descr`.
+    let new_descr_slot = pyre_object::gc_roots::shadow_stack_len();
+    let new_descr = pyre_object::gc_roots::pin_root(new_descr);
     let new_fn =
         unsafe { crate::baseobjspace::get(new_descr, pyre_object::PY_NULL, current_type())? }
-            .unwrap_or(new_descr);
+            .unwrap_or(pyre_object::gc_roots::shadow_stack_get(new_descr_slot));
     // typeobject.py — `space.call_obj_args(w_newfunc, self, __args__)`.
     let mut new_args = Vec::with_capacity(1 + args.len());
     new_args.push(current_type());
@@ -6926,9 +6928,11 @@ fn type_descr_call_with_mode(
                 std::ptr::null_mut(),
             )?
         } else {
+            let init_descr_slot = pyre_object::gc_roots::shadow_stack_len();
+            let init_descr = pyre_object::gc_roots::pin_root(init_descr);
             let init_fn =
                 unsafe { crate::baseobjspace::get(init_descr, current_instance(), w_insttype)? }
-                    .unwrap_or(init_descr);
+                    .unwrap_or(pyre_object::gc_roots::shadow_stack_get(init_descr_slot));
             // Binding the descriptor allocates, so the arguments are reloaded
             // after it rather than before.
             let mut init_args = Vec::with_capacity(args.len());

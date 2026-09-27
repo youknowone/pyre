@@ -769,6 +769,7 @@ pub fn W_Weakref_new(
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_obj);
     let _ = pyre_object::gc_roots::pin_root(w_callable);
+    let _ = pyre_object::gc_roots::pin_root(actual_type);
     let w_obj_weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(
         pyre_object::gc_roots::shadow_stack_get(root_base),
     );
@@ -780,14 +781,17 @@ pub fn W_Weakref_new(
         pyre_object::PY_NULL
     };
     let weakref = pyre_object::weakref::w_weakref_object_new(
-        pyre_object::gc_roots::shadow_stack_get(root_base + 2),
+        pyre_object::gc_roots::shadow_stack_get(root_base + 3),
         callable,
         pyre_object::PY_NULL,
     );
     if exact_type {
         weakref
     } else {
-        crate::typedef::tag_subclass_instance(weakref, actual_type)
+        crate::typedef::tag_subclass_instance(
+            weakref,
+            pyre_object::gc_roots::shadow_stack_get(root_base + 2),
+        )
     }
 }
 
@@ -1012,8 +1016,10 @@ pub fn descr_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let h = pyre_object::w_int_new(crate::baseobjspace::hash_w_strict(
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
     )?);
+    let h_slot = pyre_object::gc_roots::shadow_stack_len();
+    let h = pyre_object::gc_roots::pin_root(h);
     weakref_set_hash(current_self(), h);
-    Ok(h)
+    Ok(pyre_object::gc_roots::shadow_stack_get(h_slot))
 }
 
 /// pypy/module/_weakref/interp__weakref.py descr_call

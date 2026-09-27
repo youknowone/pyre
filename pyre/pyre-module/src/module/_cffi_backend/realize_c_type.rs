@@ -390,6 +390,8 @@ impl W_RawFuncType {
             return Ok(());
         }
         let (mut fargs, mut fret, ellipsis, abi) = raw.unpack(roots.get(ffi_slot))?;
+        let fret_slot = ffi_slot + 1;
+        let _ = roots.pin_root(fret);
         let mut locs = vec![0u8; fargs.len()];
         for i in 0..fargs.len() {
             let ct = ctypeobj::ctype_arg(fargs[i])?;
@@ -398,6 +400,7 @@ impl W_RawFuncType {
                 locs[i] = b'A';
             }
         }
+        fret = roots.get(fret_slot);
         let fret_ct = ctypeobj::ctype_arg(fret)?;
         if fret_ct.is_struct_or_union() || fret_ct.kind == ctypeobj::KIND_PRIM_COMPLEX {
             fret = newtype::new_pointer_type(fret)?;
@@ -578,6 +581,8 @@ fn realize_c_struct_or_union(w_ffi: PyObjectRef, sindex: isize) -> Result<PyObje
         }
         x
     };
+    let x_slot = ffi_slot + 1;
+    let x = roots.pin_root(x);
     set_cached_type(ffi_arg(roots.get(ffi_slot))?, type_index, x);
     if lazy && signed_size(s.size) == -2 {
         if let Err(error) = do_realize_lazy_struct(x) {
@@ -589,7 +594,7 @@ fn realize_c_struct_or_union(w_ffi: PyObjectRef, sindex: isize) -> Result<PyObje
             return Err(error);
         }
     }
-    Ok(x)
+    Ok(roots.get(x_slot))
 }
 
 /// `_realize_c_enum`.

@@ -1354,6 +1354,8 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
     };
 
     let _roots = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
     let vars_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
     let prefix_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1540,7 +1542,7 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
         }
     }
     crate::module_ns_store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "build_time_vars",
         pyre_object::gc_roots::shadow_stack_get(vars_slot),
     );
@@ -1656,7 +1658,7 @@ pub(crate) fn getbuiltinmodule(
     let _ = pin_root(w_mod);
     // Add the module to sys.modules and initialize the module. The
     // order is important to avoid recursions.
-    if !reuse && unsafe { pyre_object::w_module_startup_called(w_mod) } {
+    if !reuse && unsafe { pyre_object::w_module_startup_called(shadow_stack_get(mod_slot)) } {
         // create a copy of the module.  (see issue1514) eventlet
         // patcher relies on this behaviour.
         let copy_slot = shadow_stack_len();
@@ -1731,7 +1733,8 @@ fn mixedmodule_init(
     let _roots = push_roots();
     let mod_slot = shadow_stack_len();
     let _ = pin_root(w_mod);
-    let w_initialdict = unsafe { pyre_object::w_module_get_initialdict(w_mod) };
+    let w_initialdict =
+        unsafe { pyre_object::w_module_get_initialdict(shadow_stack_get(mod_slot)) };
     if !w_initialdict.is_null() {
         // the module was already imported.  Refresh its content with
         // the saved dict.
@@ -1775,7 +1778,7 @@ fn save_module_content_for_future_reload(w_mod: PyObjectRef) -> Result<(), crate
     let mod_slot = shadow_stack_len();
     let _ = pin_root(w_mod);
     let w_initialdict = crate::baseobjspace::call_method_result(
-        unsafe { pyre_object::w_module_get_w_dict(w_mod) },
+        unsafe { pyre_object::w_module_get_w_dict(shadow_stack_get(mod_slot)) },
         "copy",
         &[],
     )?;
@@ -5663,7 +5666,13 @@ fn absolute_import(
     // Otherwise, return the first (top-level) module.
     if !w_fromlist.is_null() && !unsafe { is_none(w_fromlist) } {
         // `from X.Y import Z` → return the leaf module (Y)
-        if let Some(cached) = modules_cached(modulename) {
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.pin_roots(&[first.unwrap_or(pyre_object::PY_NULL)]);
+        let cached = modules_cached(modulename);
+        let w = roots.get(base);
+        first = if w.is_null() { None } else { Some(w) };
+        drop(roots);
+        if let Some(cached) = cached {
             return Ok(cached);
         }
     }
@@ -6566,15 +6575,20 @@ pub(crate) fn dunder_import_package_fromlist(
 ) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
+    let fromlist_is_null = w_fromlist.is_null();
     let _roots = push_roots();
     let mod_slot = shadow_stack_len();
     let _ = pin_root(w_mod);
     let fromlist_slot = shadow_stack_len();
-    let _ = pin_root(if w_fromlist.is_null() {
+    let _ = pin_root(if fromlist_is_null {
         pyre_object::w_none()
     } else {
         w_fromlist
     });
+    let globals_slot = shadow_stack_len();
+    let _ = pin_root(w_globals);
+    let locals_slot = shadow_stack_len();
+    let _ = pin_root(w_locals);
     if let Some(w_handled) =
         handle_fromlist_fast(shadow_stack_get(mod_slot), shadow_stack_get(fromlist_slot))?
     {
@@ -6604,9 +6618,13 @@ pub(crate) fn dunder_import_package_fromlist(
     // reports rather than answering from the native handler.
     dunder_import_slow(
         name,
-        w_globals,
-        w_locals,
-        w_fromlist,
+        shadow_stack_get(globals_slot),
+        shadow_stack_get(locals_slot),
+        if fromlist_is_null {
+            pyre_object::PY_NULL
+        } else {
+            shadow_stack_get(fromlist_slot)
+        },
         fromlist_missing,
         level,
         execution_context,
@@ -6631,9 +6649,11 @@ pub(crate) fn dunder_import_slow(
 ) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
+    let globals_is_null = w_globals.is_null();
+    let fromlist_is_null = w_fromlist.is_null();
     let _roots = push_roots();
     let globals_slot = shadow_stack_len();
-    let _ = pin_root(if w_globals.is_null() {
+    let _ = pin_root(if globals_is_null {
         pyre_object::w_none()
     } else {
         w_globals
@@ -6645,7 +6665,7 @@ pub(crate) fn dunder_import_slow(
         w_locals
     });
     let fromlist_slot = shadow_stack_len();
-    let _ = pin_root(if w_fromlist.is_null() {
+    let _ = pin_root(if fromlist_is_null {
         pyre_object::w_none()
     } else {
         w_fromlist
@@ -6658,12 +6678,12 @@ pub(crate) fn dunder_import_slow(
     if matches!(name, "_frozen_importlib" | "_frozen_importlib_external") {
         return importhook(
             Wtf8::new(name),
-            if w_globals.is_null() {
+            if globals_is_null {
                 pyre_object::PY_NULL
             } else {
                 shadow_stack_get(globals_slot)
             },
-            if w_fromlist.is_null() {
+            if fromlist_is_null {
                 pyre_object::PY_NULL
             } else {
                 shadow_stack_get(fromlist_slot)
@@ -6718,12 +6738,12 @@ pub(crate) fn dunder_import_slow(
     }
     importhook(
         Wtf8::new(name),
-        if w_globals.is_null() {
+        if globals_is_null {
             pyre_object::PY_NULL
         } else {
             shadow_stack_get(globals_slot)
         },
-        if w_fromlist.is_null() {
+        if fromlist_is_null {
             pyre_object::PY_NULL
         } else {
             shadow_stack_get(fromlist_slot)
@@ -6806,6 +6826,7 @@ pub fn call_dunder_import(
 ) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
+    let fromlist_is_null = w_fromlist.is_null();
     let _roots = push_roots();
     // Pinned before the binding is read: reading it is a `getattr` on a module,
     // which can run a module-level `__getattr__`, and the caller's raw
@@ -6823,7 +6844,7 @@ pub fn call_dunder_import(
         w_locals
     });
     let fromlist_slot = shadow_stack_len();
-    let _ = pin_root(if w_fromlist.is_null() {
+    let _ = pin_root(if fromlist_is_null {
         pyre_object::w_none()
     } else {
         w_fromlist
@@ -6839,7 +6860,7 @@ pub fn call_dunder_import(
         w_name,
         shadow_stack_get(globals_slot),
         shadow_stack_get(locals_slot),
-        if w_fromlist.is_null() {
+        if fromlist_is_null {
             pyre_object::PY_NULL
         } else {
             shadow_stack_get(fromlist_slot)
