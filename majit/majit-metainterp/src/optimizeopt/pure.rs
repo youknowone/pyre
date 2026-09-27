@@ -1434,8 +1434,8 @@ impl Optimization for OptPure {
                         .get(i + 1)
                         .is_some_and(|next| next.opcode == OpCode::GuardNoOverflow));
             if hoist {
-                let op = (*ctx.new_operations[i]).clone();
-                sb.add_pure_op(ctx, op);
+                let op = ctx.new_operations[i].clone();
+                sb.add_pure_op(ctx, &op);
             }
         }
         for &i in &self.call_pure_positions {
@@ -1454,7 +1454,7 @@ impl Optimization for OptPure {
             if !Self::call_pure_can_raise(op_rc.as_ref()) {
                 debug_assert!(op_rc.opcode.is_call());
                 if !op_rc.opcode.is_cond_call_value() {
-                    sb.add_pure_op(ctx, (*op_rc).clone());
+                    sb.add_pure_op(ctx, &op_rc);
                 }
             }
         }
@@ -3234,8 +3234,11 @@ mod tests {
             other => panic!("expected OptRewrite to emit demoted call, got {other:?}"),
         };
         assert_eq!(demoted.opcode, OpCode::CallI);
+        // The driver runs OptRewrite's postprocess on the emitted call.
+        let demoted_rc = OpRc::new(demoted.clone());
+        rewrite.propagate_postprocess(&demoted, &demoted_rc, &mut ctx);
         // OptPure sees the demoted CallI
-        let result = pass.propagate_forward(&demoted, &OpRc::new(demoted.clone()), &mut ctx);
+        let result = pass.propagate_forward(&demoted, &demoted_rc, &mut ctx);
         match result {
             OptimizationResult::Emit(emitted) => assert_eq!(emitted.opcode, OpCode::CallI),
             OptimizationResult::PassOn => {} // PassOn is also acceptable

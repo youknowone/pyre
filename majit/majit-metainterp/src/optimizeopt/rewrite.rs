@@ -139,7 +139,10 @@ pub struct OptRewrite {
     loop_invariant_results: indexmap::IndexMap<i64, LoopInvariantEntry>,
     /// rewrite.py:40: loop_invariant_producer — maps func_ptr → emitted Call op.
     /// Used by produce_potential_short_preamble_ops (rewrite.py).
-    loop_invariant_producer: indexmap::IndexMap<i64, Op>,
+    loop_invariant_producer: indexmap::IndexMap<i64, OpRc>,
+    /// rewrite.py `CallLoopinvariantOptimizationResult` — the key its
+    /// `_callback` records once the rewritten call has been emitted.
+    pending_loopinvariant_key: Option<i64>,
 }
 
 impl OptRewrite {
@@ -147,6 +150,7 @@ impl OptRewrite {
         OptRewrite {
             loop_invariant_results: indexmap::IndexMap::new(),
             loop_invariant_producer: indexmap::IndexMap::new(),
+            pending_loopinvariant_key: None,
         }
     }
 
@@ -2265,11 +2269,9 @@ impl Optimization for OptRewrite {
                     // Cache miss: demote and record result
                     self.loop_invariant_results
                         .insert(func_val, LoopInvariantEntry::Direct(op.pos().get()));
-                    // rewrite.py: _callback records producer op
-                    let call_opcode = OpCode::call_for_type(op.result_type());
-                    let producer = op.copy_and_change(call_opcode, None, None);
-                    producer.pos().set(op.pos().get());
-                    self.loop_invariant_producer.insert(func_val, producer);
+                    // rewrite.py `CallLoopinvariantOptimizationResult`:
+                    // `_callback` records the emitted producer.
+                    self.pending_loopinvariant_key = Some(func_val);
                 }
                 let call_opcode = OpCode::call_for_type(op.result_type());
                 let new_op = op.copy_and_change(call_opcode, None, None);
@@ -2401,6 +2403,7 @@ impl Optimization for OptRewrite {
         // emit_operation — no per-pass setup needed.
         self.loop_invariant_results.clear();
         self.loop_invariant_producer.clear();
+        self.pending_loopinvariant_key = None;
     }
 
     fn name(&self) -> &'static str {
@@ -2431,7 +2434,12 @@ impl Optimization for OptRewrite {
     /// the same value and the constant is correct for all of them. PyPy's
     /// stable-Box vs majit's stable-OpRef yield the same observable
     /// behavior.
-    fn propagate_postprocess(&mut self, op: &Op, _op_rc: &OpRc, ctx: &mut OptContext) {
+    fn propagate_postprocess(&mut self, op: &Op, op_rc: &OpRc, ctx: &mut OptContext) {
+        // rewrite.py `CallLoopinvariantOptimizationResult._callback`:
+        // `loop_invariant_producer[key] = self.optimizer.getlastop()`.
+        if let Some(key) = self.pending_loopinvariant_key.take() {
+            self.loop_invariant_producer.insert(key, op_rc.clone());
+        }
         match op.opcode {
             OpCode::GuardTrue => {
                 ctx.make_constant_arg(&op.arg(0), majit_ir::Value::Int(1));
@@ -2469,7 +2477,7 @@ impl Optimization for OptRewrite {
         ctx: &mut OptContext,
     ) {
         for (_, op) in &self.loop_invariant_producer {
-            sb.add_loopinvariant_op(ctx, op.clone());
+            sb.add_loopinvariant_op(ctx, op);
         }
     }
 

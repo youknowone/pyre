@@ -453,19 +453,20 @@ impl CachedField {
                 .as_ref()
                 .and_then(Operand::ptr_info)
                 .and_then(|info| info.getfield(descr_idx))
-                .map(|entry| entry.as_seen_opref())
+                .map(|entry| entry.as_seen_operand())
                 .or_else(|| {
                     let parent_descr = descr.as_field_descr().and_then(|fd| fd.get_parent_descr());
                     structbox_box
                         .as_ref()
                         .and_then(|b| ctx.get_const_info_mut_box(b, parent_descr))
                         .and_then(|info| info.getfield(descr_idx))
-                        .map(|entry| entry.as_seen_opref())
+                        .map(|entry| entry.as_seen_operand())
                 }) {
                 Some(v) if !v.is_none() => v,
                 _ => continue,
             };
-            let cached_val = ctx.get_replacement_opref(cached_val);
+            let cached_box = ctx.resolve_operand_operand(&cached_val);
+            let cached_val = cached_box.to_opref();
             if cached_val.is_none() {
                 continue;
             }
@@ -479,7 +480,7 @@ impl CachedField {
                 descr.clone(),
             );
             op.pos().set(cached_val);
-            sb.add_heap_op(ctx, op);
+            sb.add_heap_op(ctx, cached_box, op);
         }
     }
 }
@@ -710,18 +711,19 @@ impl ArrayCachedItem {
                 .as_ref()
                 .and_then(Operand::ptr_info)
                 .and_then(|info| info.getitem(self.index as usize))
-                .map(|entry| entry.as_seen_opref())
+                .map(|entry| entry.as_seen_operand())
                 .or_else(|| {
                     arraybox_box
                         .as_ref()
                         .and_then(|b| ctx.get_const_info_array_mut_box(b, descr.clone()))
                         .and_then(|info| info.getitem(self.index as usize))
-                        .map(|entry| entry.as_seen_opref())
+                        .map(|entry| entry.as_seen_operand())
                 }) {
                 Some(v) if !v.is_none() => v,
                 _ => continue,
             };
-            let cached_val = ctx.get_replacement_opref(cached_val);
+            let cached_box = ctx.resolve_operand_operand(&cached_val);
+            let cached_val = cached_box.to_opref();
             if cached_val.is_none() {
                 continue;
             }
@@ -735,7 +737,7 @@ impl ArrayCachedItem {
             let idx_b = ctx.materialize_operand_at(idx_ref);
             let mut op = Op::with_descr(opcode, &[arraybox_b, idx_b], descr.clone());
             op.pos().set(cached_val);
-            sb.add_heap_op(ctx, op);
+            sb.add_heap_op(ctx, cached_box, op);
         }
     }
 }
