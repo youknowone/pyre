@@ -393,25 +393,27 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
         }
         None
     };
-    let mut eval_hook_graphs = llbcs
-        .iter()
-        .find_map(|llbc| {
-            let paths = llbc.eval_hook_graphs();
-            (!paths.is_empty()).then_some(paths)
-        })
-        .unwrap_or_default();
-    if eval_hook_graphs.is_empty() {
-        for llbc in llbcs {
-            for path in discover_eval_hook_graphs(llbc) {
-                if !eval_hook_graphs.contains(&path) {
-                    eval_hook_graphs.push(path);
-                }
+    // Union of each artefact's published list, or the family discovered
+    // in that artefact when nothing has been published yet. The first
+    // nonempty list is not the whole set: a later crate can publish or
+    // discover paths the earlier one never saw.
+    let mut eval_hook_graphs = Vec::new();
+    for llbc in llbcs {
+        let published = llbc.eval_hook_graphs();
+        let paths = if published.is_empty() {
+            discover_eval_hook_graphs(llbc)
+        } else {
+            published
+        };
+        for path in paths {
+            if !eval_hook_graphs.contains(&path) {
+                eval_hook_graphs.push(path);
             }
         }
     }
     if !eval_hook_graphs.is_empty() {
         for llbc in llbcs {
-            if llbc.eval_hook_graphs().is_empty() {
+            if llbc.eval_hook_graphs() != eval_hook_graphs {
                 llbc.set_eval_hook_graphs(eval_hook_graphs.clone());
             }
         }
@@ -25638,19 +25640,14 @@ pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
 
 /// `register_eval_override`'s parameter type: the `EvalFn` pointer.
 ///
-/// The name is the one anchor. Every later test compares dedup ids of
-/// that parameter, not a rendered signature.
+/// Resolved once per artefact, from every `FunDecl` including an external
+/// one. Call sites compare that cached dedup id.
 fn eval_fn_type_id(llbc: &Llbc) -> Option<u64> {
-    let registrar = llbc.iter_local_fns().find(|fd| {
-        fd.item_meta
-            .name_path()
-            .ends_with("::call::register_eval_override")
-    })?;
-    tyref_dedup_id(registrar.signature.inputs.first()?)
+    llbc.eval_fn_type_id()
 }
 
 fn registrar_fun_ids(llbc: &Llbc) -> Vec<u64> {
-    llbc.iter_local_fns()
+    llbc.iter_fun_decls()
         .filter(|fd| {
             fd.item_meta
                 .name_path()

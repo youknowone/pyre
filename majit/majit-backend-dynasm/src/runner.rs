@@ -839,7 +839,11 @@ fn bh_alloc_struct(sizedescr: &majit_jitcode::jitcode::BhDescr) -> *mut libc::c_
     // block for a typed descr loses the GC header and tracing layout.
     // A process with no collector (grain) has no header to lose: the blackhole
     // still has to run the `new` and continue to the next `jit_merge_point`.
-    if type_id != 0 && !sizedescr.is_headerless() && majit_gc::gc_sync::is_initialized() {
+    // A collector installed through the thread's GC box (`set_gc_allocator`)
+    // without the `gc_sync` singleton is still a collector: its NULL is the
+    // OOM result above, not a missing allocator.
+    let collector_installed = majit_gc::gc_sync::is_initialized() || majit_gc::gc_box_installed();
+    if type_id != 0 && !sizedescr.is_headerless() && collector_installed {
         return std::ptr::null_mut();
     }
     let ptr = unsafe { libc::malloc(size) };

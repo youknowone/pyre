@@ -10852,15 +10852,23 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // Labels this compile actually emitted. The seeded previous
                 // loop stays reachable through the JUMP (`record_jump_to`),
-                // not by republishing its labels as this token's scan list.
-                // No new label: keep the previous scan list so a later
-                // retrace can still see those candidates.
+                // not by republishing its labels as this token's entry.
+                // `compile_retrace` installs a trace that ends in a JUMP to
+                // the previous `TargetToken`; it does not re-emit that
+                // LABEL. No new label: keep the previous list only as the
+                // optimizer scan state a later retrace seeds, and leave
+                // `front_entry_index` unset so the host does not dispatch
+                // on a LABEL this function never emitted.
+                let front_entry_index = if minted_label_tokens.is_empty() {
+                    None
+                } else {
+                    Self::front_entry_index_for(&minted_label_tokens)
+                };
                 let front_target_tokens = if minted_label_tokens.is_empty() {
                     prior_front_target_tokens
                 } else {
                     minted_label_tokens
                 };
-                let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
                 token.set_retraced_count(unroll_opt.retraced_count);
                 self.note_compiled_loops_changed();
                 self.compiled_loops.insert(
@@ -18453,17 +18461,42 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// `resume.py` `rebuild_from_resumedata` for a bridge that already
-    /// decoded its sections. Same portal frame per section as
-    /// [`Self::rebuild_portal_framestack_from_resume`], then
-    /// `consume_boxes` into that frame's registers.
+    /// decoded its sections. `newframe(jitcodes[jitcode_pos])` per section,
+    /// then `consume_boxes` into that frame's registers.
     pub fn rebuild_portal_framestack_from_resumedata(
         &mut self,
         mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
         frames: &[majit_ir::resumedata::RebuiltFrame],
         fail_values: &[i64],
     ) {
-        let resume_pcs: Vec<i32> = frames.iter().map(|frame| frame.pc).collect();
-        self.rebuild_portal_framestack_from_resume(mainjitcode, &resume_pcs);
+        // `rebuild_from_resumedata`: `jitcode = staticdata.jitcodes[jitcode_pos]`,
+        // then `newframe(jitcode)` and `setup_resume_at_op(pc)`. Each section
+        // carries its own jitcode; the portal jitcode is only the empty-stack
+        // stand-in `initialize_state_from_start` uses.
+        self.portal_call_depth = -1;
+        self.framestack = crate::pyjitpl::MIFrameStack::empty();
+        self.call_ids.clear();
+        self.current_call_id = 0;
+        let jitcodes = std::sync::Arc::clone(&self.staticdata);
+        if frames.is_empty() {
+            let _ = self.newframe(mainjitcode, None);
+        } else {
+            for section in frames {
+                // `staticdata.jitcodes[jitcode_pos]`. A missing entry still
+                // builds the frame rather than dropping the section.
+                let jitcode = usize::try_from(section.jitcode_index)
+                    .ok()
+                    .and_then(|pos| jitcodes.jitcodes.get(pos).cloned())
+                    .unwrap_or_else(|| mainjitcode.clone());
+                let frame_index = self.newframe(jitcode, None);
+                let Ok(pc) = usize::try_from(section.pc) else {
+                    continue;
+                };
+                if let Some(frame) = self.framestack.frames.get_mut(frame_index) {
+                    frame.setup_resume_at_op(pc);
+                }
+            }
+        }
         self.consume_portal_resume_boxes(frames, fail_values);
     }
 
@@ -18479,9 +18512,12 @@ impl<M: Clone> MetaInterp<M> {
         frames: &[majit_ir::resumedata::RebuiltFrame],
         fail_values: &[i64],
     ) {
-        let op_live = self.staticdata.op_live as u8;
-        let liveness = self.staticdata.liveness_info.clone();
-        let registered = self.jitcodes().to_vec();
+        // `rebuild_from_resumedata` reads `metainterp.staticdata` directly.
+        // One `Arc` clone releases the borrow; the slices stay on that owner.
+        let staticdata = std::sync::Arc::clone(&self.staticdata);
+        let op_live = staticdata.op_live as u8;
+        let liveness = staticdata.liveness_info.as_slice();
+        let registered = staticdata.jitcodes.as_slice();
         let n = self.framestack.frames.len().min(frames.len());
         for i in 0..n {
             let section = &frames[i];
