@@ -2300,6 +2300,38 @@ mod tests {
         );
     }
 
+    /// A carrier forwarded beside `__pos_0` into a slot no block ever reads
+    /// is a dead chain: it is pruned and the enumerate fold goes ahead.
+    #[test]
+    fn rewrite_prunes_enumerate_payload_forwarded_into_a_dead_slot() {
+        let (mut g, opt, _) = build_enumerate_diamond();
+        let some = g
+            .blocks
+            .iter()
+            .position(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__pos_0")
+                })
+            })
+            .expect("some arm");
+        let carrier = g.blocks[some].inputargs[0].clone();
+        let (tail, _tail_args) = g.create_block_with_arg_vars(1);
+        g.set_return(tail, None);
+        let some_id = g.blocks[some].id;
+        g.set_goto(some_id, tail, vec![carrier]);
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Ref(None))]);
+        assert_eq!(rewritten, 1, "a dead forward of the carrier must not decline");
+        assert!(
+            g.block(tail).inputargs.is_empty(),
+            "the dead slot is pruned from the successor"
+        );
+        assert!(
+            g.blocks[some].exits.iter().all(|link| link.args.is_empty()),
+            "the forwarding link drops the pruned slot"
+        );
+        assert_eq!(count_calls(&g, is_enumerate_ctor_target), 0);
+    }
+
     /// A trailing recast is accepted only when it recasts the collect result.
     #[test]
     fn rewrite_declines_recast_of_a_different_value_after_collect() {

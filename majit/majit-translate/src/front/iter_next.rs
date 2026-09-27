@@ -516,6 +516,27 @@ pub(crate) fn collect_transitive_dead_slots(
     Ok(set)
 }
 
+/// Every slot `carrier` is forwarded into from `block`'s exits, closed over
+/// its onward forwards, when the whole chain is dead.  The enumerate Some arm
+/// reads its payload through `__pos_0`; a copy of the Option threaded on
+/// through never-read slots is the same Rust SSA-merge artifact the None arm
+/// prunes, and packing `(count, item)` leaves it with no value to carry.
+fn forwarded_dead_slots(
+    graph: &FunctionGraph,
+    block: usize,
+    carrier: &Variable,
+) -> Result<Vec<(usize, usize)>, String> {
+    let mut set: Vec<(usize, usize)> = Vec::new();
+    for link in &graph.blocks[block].exits {
+        for (j, arg) in link.args.iter().enumerate() {
+            if matches!(arg, LinkArg::Value(v) if v == carrier) {
+                set.extend(collect_transitive_dead_slots(graph, link.target.0, j)?);
+            }
+        }
+    }
+    Ok(set)
+}
+
 /// The typed `StopIteration` exitcase the `next` block's break link
 /// carries — the handler analogue of [`crate::model::exception_exitcase`]
 /// (`Exception` catch-all), narrowed to the single exception the loop
@@ -1091,6 +1112,9 @@ fn rewire_one_next_site(
              the adapter packs (i, item) onto __pos_0"
         ));
     }
+    // Slots of a dead chain the Some arm forwards the payload into; pruned
+    // together with the None arm's chain below.
+    let mut some_dead: Vec<(usize, usize)> = Vec::new();
     // `pack_enumerate_payload` collapses this read after the graph has
     // already been rewritten. Accept only a `__pos_0` read of the payload
     // slot, or a slot nothing reads (`for _ in ...enumerate()`). Any other
@@ -1130,10 +1154,16 @@ fn rewire_one_next_site(
                     .iter()
                     .any(|arg| matches!(arg, LinkArg::Value(v) if v == &carrier))
             });
-            if uses != 0 || forwarded {
+            if uses != 0 {
                 return Err(format!(
                     "{name}: enumerate Some arm uses the payload outside a __pos_0 read"
                 ));
+            }
+            if forwarded {
+                some_dead =
+                    forwarded_dead_slots(graph, some_target.0, &carrier).map_err(|reason| {
+                        format!("{name}: enumerate Some arm forwards a live payload — {reason}")
+                    })?;
             }
         } else if pos0_at
             .iter()
@@ -1165,10 +1195,16 @@ fn rewire_one_next_site(
                     some_target.0,
                     &carrier,
                 );
-            if other_operand || switched || (forwarded && !packed_forward) {
+            if other_operand || switched {
                 return Err(format!(
                     "{name}: enumerate Some arm uses the payload outside a __pos_0 read"
                 ));
+            }
+            if forwarded && !packed_forward {
+                some_dead =
+                    forwarded_dead_slots(graph, some_target.0, &carrier).map_err(|reason| {
+                        format!("{name}: enumerate Some arm forwards a live payload — {reason}")
+                    })?;
             }
         }
     }
@@ -1204,6 +1240,16 @@ fn rewire_one_next_site(
         for (b, s) in set {
             dead.entry(b).or_default().insert(s);
         }
+    }
+    // A's new normal link is built from `normal_args`, which keeps every
+    // Some-target slot, so the Some target itself must not lose one.
+    if some_dead.iter().any(|&(b, _)| b == some_target.0) {
+        return Err(format!(
+            "{name}: enumerate Some arm's dead payload chain re-enters the Some target"
+        ));
+    }
+    for (b, s) in some_dead {
+        dead.entry(b).or_default().insert(s);
     }
 
     // Generalized arity guard: removing slot `s` from a block also drops arg
