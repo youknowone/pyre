@@ -6855,6 +6855,8 @@ fn drive_portal_metatrace(
     let pycode = unsafe { &*live_frame }.pycode as usize as i64;
     let ec = pyre_interpreter::call::getexecutioncontext();
     let mut jit_state = build_jit_state(unsafe { &*live_frame }, info);
+    // Before the walk records a field descr. See `publish_kind0_descrs_before_trace`.
+    publish_kind0_descrs_before_trace();
     driver.force_start_tracing(green_key, loop_header_pc, &mut jit_state, env);
     let meta = driver.meta_interp_mut();
     if !meta.is_tracing() {
@@ -7256,6 +7258,7 @@ fn drive_generatorentry_trace(
         // `(0, 0)` keeps `force_start_tracing` on the u64 cell key.
         // A non-zero code pointer rebinds through `with_typed_decision_key`
         // to jd0's `(next_instr, is_being_profiled, pycode)` cell.
+        publish_kind0_descrs_before_trace();
         meta.force_start_tracing(green_key, (0, 0), Some(descriptor), &live_values)
     };
     if dbg {
@@ -7774,6 +7777,7 @@ fn drive_unpack_iterable_trace(
     // green key can go on to own a second cell in the same bucket, with its own
     // token and flags. `green_key` is `make_green_key` at `(greenkey_raw, 0)` (above),
     // so the pair reconstructs the identical hash.
+    publish_kind0_descrs_before_trace();
     let action = meta.force_start_tracing(
         green_key,
         (greenkey_raw as usize, 0),
@@ -8162,19 +8166,25 @@ fn drive_unpack_iterable_trace(
 /// calls this once at boot so user code that touches `sys.settrace`
 /// before its first JIT-traced bytecode still routes through to the
 /// real `WarmState::set_param("trace_limit", 10000)`.
+/// `GcLLDescr_framework.init_size_descr` publishes Size tids before any
+/// trace. The runtime stand-in runs at the first trace entry, on a fresh
+/// stack, before that walk records a descr. Doing it from inside the walk
+/// makes `frame_chain` allocate ~1.8 TiB. A process that never traces does
+/// not pay the bincode.
+fn publish_kind0_descrs_before_trace() {
+    pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
+}
+
 pub fn init_jit_hooks() {
     // Phase A: build the GC and install it into the backend + pyre-object
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).
     init_gc_subsystem();
-    // `GcLLDescr_framework.init_size_descr` publishes Size tids before the
-    // translated program runs. Doing it on the first trace instead makes
-    // `frame_chain` allocate ~1.8 TiB and Windows exits 3221226505.
-    // `PYRE_JIT=0` / `PYRE_NO_JIT` never need the table. Boot decodes on
-    // this stack; the close hook uses a fresh stack if a trace wins the race.
-    if env_var_os("PYRE_NO_JIT").is_none() && env_var("PYRE_JIT").as_deref() != Some("0") {
-        pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs_on_caller_stack();
-    }
+    // Kind-0 descrs are not published here. `init_size_descr` runs at
+    // translation; the runtime stand-in is the first `force_start_tracing`,
+    // before that walk records a descr. Publishing them on this boot path
+    // makes `python -c ''` pay the bincode. Publishing them from inside the
+    // walk makes `frame_chain` allocate ~1.8 TiB.
     // `warmstate.py JitCell.__init__` stores every green as an ordinary field
     // on a GC object, so a Ref green is both owned and forwarded with the
     // cell. Pyre's Rust-owned BaseJitCell uses fixed owner-root slots for the
@@ -11403,9 +11413,11 @@ fn compile_and_run_once(
     let mut jit_state = build_jit_state(frame_root.frame(), info);
     match start {
         CompileOnceStart::BackEdge => {
+            publish_kind0_descrs_before_trace();
             driver.bound_reached(green_key, target_pc, &mut jit_state, env);
         }
         CompileOnceStart::FunctionEntry => {
+            publish_kind0_descrs_before_trace();
             driver.force_start_tracing(green_key, target_pc, &mut jit_state, env);
         }
     }

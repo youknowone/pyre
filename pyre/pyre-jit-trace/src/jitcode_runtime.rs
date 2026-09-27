@@ -1345,10 +1345,11 @@ fn rehydrated_call_descr_ref(bh: majit_jitcode::jitcode::BhCallDescr) -> majit_i
 /// `GcLLDescr_framework.init_size_descr` asks `TypeLayoutBuilder.get_type_id`
 /// for those ids during translation, against Size objects already in
 /// `GcCache`. pyre cannot embed the collector ids in the executable.
-/// `init_jit_hooks` publishes every kind-0 slot before user code when the
-/// JIT is on; `PYRE_JIT=0` never calls this. Leaving Field slots until the
-/// first trace makes `frame_chain` allocate about 1.8 TiB (Windows exit
-/// 3221226505). Field minting publishes the parent Size `init_size_descr`
+/// The first `force_start_tracing` / `bound_reached` publishes every kind-0
+/// slot before that walk records a descr. A process that never traces does
+/// not call this. Publishing from inside the walk makes `frame_chain`
+/// allocate about 1.8 TiB (Windows exit 3221226505). Field minting publishes
+/// the parent Size `init_size_descr`
 /// reads. `set_type_registry_close_hook` runs this before `freeze_types`,
 /// so the registry is still open when the tids are registered. CallDescr
 /// restoration stays on the first slot lookup.
