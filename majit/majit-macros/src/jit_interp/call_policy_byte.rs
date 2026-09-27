@@ -28,8 +28,8 @@
 //! `__majit_call_policy_<name>()` accessor).
 //!
 //! The mapping (`call.py` extraeffect ↔ pyre byte) is per result kind:
-//! - **Void** (`bytes 1, 9, 13, 17, 28`)
-//! - **Int** (`bytes 2-4, 10, 14, 18-20, 29`)
+//! - **Void** (`bytes 1, 9, 17, 28`; slot 13 is reserved)
+//! - **Int** (`bytes 2-4, 10, 18-20, 29`; slot 14 is reserved)
 //! - **Ref** (`bytes 21-27, 30`)
 //! - **Float**: inferred path returns `0` (UNSUPPORTED) because static
 //!   float result-kind cannot be recovered; explicit
@@ -58,8 +58,10 @@ pub(crate) const VOID_DONT_LOOK_INSIDE: u8 = 1;
 /// `#[jit_may_force]` void — `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`.
 pub(crate) const VOID_MAY_FORCE: u8 = 9;
 
-/// `#[jit_release_gil]` void — `EF_RANDOM_EFFECTS`.
-pub(crate) const VOID_RELEASE_GIL: u8 = 13;
+// Reserved policy-byte slots 13 (void) and 14 (int). They were the
+// macro-DSL `#[jit_release_gil]` bytes (`VOID_RELEASE_GIL` /
+// `INT_RELEASE_GIL`). Later bytes keep their numbers. `llexternal`
+// fills `EffectInfo.call_release_gil_target` instead.
 
 /// `#[jit_loop_invariant]` void — `EF_LOOPINVARIANT`.
 pub(crate) const VOID_LOOP_INVARIANT: u8 = 17;
@@ -84,9 +86,6 @@ pub(crate) const INT_INLINE: u8 = 4;
 
 /// `#[jit_may_force]` int.
 pub(crate) const INT_MAY_FORCE: u8 = 10;
-
-/// `#[jit_release_gil]` int.
-pub(crate) const INT_RELEASE_GIL: u8 = 14;
 
 /// `#[jit_loop_invariant]` int.
 pub(crate) const INT_LOOP_INVARIANT: u8 = 18;

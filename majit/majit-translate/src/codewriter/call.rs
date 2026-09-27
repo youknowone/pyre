@@ -6601,18 +6601,16 @@ impl CallControl {
         // `call.py` `getcalldescr`: `tgt_func = llmemory.cast_ptr_to_adr(tgt_func)`.
         // A `register_macro_helper_trace_fnaddr` hit is that address. A miss
         // is `symbolic_fnaddr_for_path` of the funcptr, rewritten later by
-        // `rewrite_call_release_gil_target`. The `(1, 0)` sentinel is only
-        // `#[jit_release_gil]`, whose callee is already the raw function.
+        // `rewrite_call_release_gil_target`.
         let symbolic = CallPath::from_segments(tgt_path.split("::").filter(|seg| !seg.is_empty()));
         if symbolic.segments.is_empty() {
             panic!("getcalldescr: _call_aroundstate_target_ for {path} has no funcptr path");
         }
         let tgt_func = self
             .registered_fnaddr_for_aroundstate_identity(identity)
-            .filter(|&addr| addr != 0 && addr != 1)
+            .filter(|&addr| addr != 0)
             .map(|addr| addr as u64)
             .unwrap_or_else(|| symbolic_fnaddr_for_path(&symbolic) as u64);
-        debug_assert_ne!(tgt_func, 1);
         (tgt_func, save_err)
     }
 
@@ -8012,8 +8010,7 @@ impl CallControl {
         // `llmemory.cast_ptr_to_adr(tgt_func)`.  The translator has the
         // funcptr's path / `link_name`.  A `register_macro_helper_trace_fnaddr`
         // binding supplies the address; a miss records
-        // `symbolic_fnaddr_for_path` of that funcptr.  `#[jit_release_gil]`
-        // still uses the `(1, 0)` sentinel on its own descrs.
+        // `symbolic_fnaddr_for_path` of that funcptr.
         let call_release_gil_target = match shape {
             CallShape::Direct(target) => self.call_release_gil_target_for(target),
             CallShape::Indirect(_) => EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,

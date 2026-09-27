@@ -617,8 +617,6 @@ pub(crate) enum CallPolicyKind {
     ResidualVoidCannotRaiseWrapped,
     MayForceVoid,
     MayForceVoidWrapped,
-    ReleaseGilVoid,
-    ReleaseGilVoidWrapped,
     LoopInvariantVoid,
     LoopInvariantVoidWrapped,
     ResidualInt,
@@ -632,8 +630,6 @@ pub(crate) enum CallPolicyKind {
     ResidualIntCannotRaiseWrapped,
     MayForceInt,
     MayForceIntWrapped,
-    ReleaseGilInt,
-    ReleaseGilIntWrapped,
     LoopInvariantInt,
     LoopInvariantIntWrapped,
     // `EF_ELIDABLE_CAN_RAISE` (call.py:297). Default elidable variant —
@@ -668,10 +664,6 @@ pub(crate) enum CallPolicyKind {
     /// (mirrors the existing `ResidualRefWrapped`-only shape).
     ResidualRefCannotRaiseWrapped,
     MayForceRefWrapped,
-    // ReleaseGilRefWrapped intentionally absent: resoperation.py:1243-1244
-    // (`# no such thing`) excludes CALL_RELEASE_GIL_R from the upstream
-    // opcode table, so a `'release_gil_ref_wrapped'` policy could only
-    // emit an IR op the optimizer/backend cannot consume.
     LoopInvariantRefWrapped,
     ElidableRefWrapped,
     ElidableRefCannotRaiseWrapped,
@@ -681,7 +673,6 @@ pub(crate) enum CallPolicyKind {
     /// Mirrors `ResidualIntCannotRaiseWrapped` / `ResidualRefCannotRaiseWrapped`.
     ResidualFloatCannotRaiseWrapped,
     MayForceFloatWrapped,
-    ReleaseGilFloatWrapped,
     LoopInvariantFloatWrapped,
     ElidableFloatWrapped,
     ElidableFloatCannotRaiseWrapped,
@@ -717,8 +708,6 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "residual_void_cannot_raise_wrapped" => CallPolicyKind::ResidualVoidCannotRaiseWrapped,
         "may_force_void" => CallPolicyKind::MayForceVoid,
         "may_force_void_wrapped" => CallPolicyKind::MayForceVoidWrapped,
-        "release_gil_void" => CallPolicyKind::ReleaseGilVoid,
-        "release_gil_void_wrapped" => CallPolicyKind::ReleaseGilVoidWrapped,
         "loopinvariant_void" => CallPolicyKind::LoopInvariantVoid,
         "loopinvariant_void_wrapped" => CallPolicyKind::LoopInvariantVoidWrapped,
         "residual_int" => CallPolicyKind::ResidualInt,
@@ -727,8 +716,6 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "residual_int_cannot_raise_wrapped" => CallPolicyKind::ResidualIntCannotRaiseWrapped,
         "may_force_int" => CallPolicyKind::MayForceInt,
         "may_force_int_wrapped" => CallPolicyKind::MayForceIntWrapped,
-        "release_gil_int" => CallPolicyKind::ReleaseGilInt,
-        "release_gil_int_wrapped" => CallPolicyKind::ReleaseGilIntWrapped,
         "loopinvariant_int" => CallPolicyKind::LoopInvariantInt,
         "loopinvariant_int_wrapped" => CallPolicyKind::LoopInvariantIntWrapped,
         // `call.py _canraise(op)` 3-way pick on the elidable
@@ -747,8 +734,6 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "residual_ref_wrapped" => CallPolicyKind::ResidualRefWrapped,
         "residual_ref_cannot_raise_wrapped" => CallPolicyKind::ResidualRefCannotRaiseWrapped,
         "may_force_ref_wrapped" => CallPolicyKind::MayForceRefWrapped,
-        // "release_gil_ref_wrapped" intentionally rejected per
-        // resoperation.py:1243-1244 — see CallPolicyKind comment.
         "loopinvariant_ref_wrapped" => CallPolicyKind::LoopInvariantRefWrapped,
         "elidable_ref_wrapped" => CallPolicyKind::ElidableRefWrapped,
         "elidable_ref_cannot_raise_wrapped" => CallPolicyKind::ElidableRefCannotRaiseWrapped,
@@ -756,7 +741,6 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "residual_float_wrapped" => CallPolicyKind::ResidualFloatWrapped,
         "residual_float_cannot_raise_wrapped" => CallPolicyKind::ResidualFloatCannotRaiseWrapped,
         "may_force_float_wrapped" => CallPolicyKind::MayForceFloatWrapped,
-        "release_gil_float_wrapped" => CallPolicyKind::ReleaseGilFloatWrapped,
         "loopinvariant_float_wrapped" => CallPolicyKind::LoopInvariantFloatWrapped,
         "elidable_float_wrapped" => CallPolicyKind::ElidableFloatWrapped,
         "elidable_float_cannot_raise_wrapped" => CallPolicyKind::ElidableFloatCannotRaiseWrapped,

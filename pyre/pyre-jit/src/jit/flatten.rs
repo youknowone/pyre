@@ -842,45 +842,14 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         CallFlavor::PureOrMemerror => majit_metainterp::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
         CallFlavor::PureCanRaise => majit_metainterp::ELIDABLE_EFFECT_INFO,
         // Release-gil cannot be encoded by this generic flavor mapper:
-        // PyPy's `call.py:252-258` stores the real `(target_fn_addr,
-        // save_err)` in the EffectInfo at descr creation time.  Pyre's
-        // via-target lowering may use a temporary sentinel, but that
-        // must be requested explicitly through
-        // `unresolved_release_gil_effect_info_for_via_target()` so the
-        // sentinel cannot escape from general `CallFlavor` conversion.
+        // `call.py` `getcalldescr` stores the real `(target_fn_addr,
+        // save_err)` from `_call_aroundstate_target_` in the EffectInfo at
+        // descr creation time; a flavor alone cannot name that funcptr.
         CallFlavor::ReleaseGil => panic!(
             "effect_info_for_call_flavor: ReleaseGil requires the resolved \
-             (target_fn_addr, save_err) pair from `call.py:252-258 \
-             _call_aroundstate_target_`; use \
-             `unresolved_release_gil_effect_info_for_via_target` only for \
-             residual_call via-target lowering that immediately flows \
-             through `resolve_call_release_gil_target`."
+             (target_fn_addr, save_err) pair from `call.py` `getcalldescr` \
+             `_call_aroundstate_target_`"
         ),
-    }
-}
-
-/// Release-gil EffectInfo seed for residual-call via-target lowering only.
-///
-/// PyPy stores a real `(target_fn_addr, save_err)` in
-/// `EffectInfo.call_release_gil_target` when the calldescr is created
-/// (`call.py:252-258`).  Pyre's `CallDescrStub` path does not know the
-/// concrete target until `JitCodeBuilder` resolves `descrs[fn_ptr_idx]`,
-/// so this helper returns a non-zero `(1, 0)` sentinel solely for
-/// `resolve_call_release_gil_target` to replace before materializing the
-/// final calldescr.  Do not use it for cached/interned descriptors that
-/// can bypass that resolver.
-pub fn unresolved_release_gil_effect_info_for_via_target() -> majit_ir::EffectInfo {
-    use majit_ir::EffectInfo;
-    // PyPy `effectinfo.py:149-155`: every six raw `_*_descrs_*` set
-    // MUST be None when extraeffect=RandomEffects. The previous shape
-    // explicitly set the bitstrings to None but inherited the raw sets
-    // from `..EffectInfo::default()` (= `Some(Vec::new())`), violating
-    // the invariant. Cloning `MOST_GENERAL` and overlaying the
-    // `(target_fn_addr, save_err)` sentinel keeps RandomEffects+raw=None+
-    // bitstring=None consistent.
-    EffectInfo {
-        call_release_gil_target: (1, 0),
-        ..EffectInfo::MOST_GENERAL.clone()
     }
 }
 
@@ -8010,13 +7979,6 @@ mod tests {
             majit_metainterp::effect_info_for_slot(slot),
             effect_info_for_call_flavor(CallFlavor::Plain)
         );
-    }
-
-    #[test]
-    fn unresolved_release_gil_effect_info_routes_to_release_gil_dispatch() {
-        let ei = unresolved_release_gil_effect_info_for_via_target();
-        assert_eq!(dispatch_kind_for_effect_info(&ei), CallFlavor::ReleaseGil);
-        assert_eq!(ei.call_release_gil_target, (1, 0));
     }
 
     #[test]

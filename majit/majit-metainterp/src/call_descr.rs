@@ -539,12 +539,9 @@ pub const LOOPINVARIANT_EFFECT_INFO: EffectInfo =
 ///
 /// `MayForce` (`EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`) and `ReleaseGil`
 /// (`EF_RANDOM_EFFECTS` + non-zero `call_release_gil_target`) are
-/// deliberately omitted — those EI values carry runtime-resolved
-/// `target.concrete_ptr` / `save_err` slots that the const factory at
-/// `jitcode/assembler.rs:emit_canonical_call_*_via_target` constructs
-/// inline.  Adding them here would require duplicating the
-/// `(1, 0)` sentinel + `resolve_call_release_gil_target` substitution,
-/// which is out of scope for the slot enum.
+/// deliberately omitted. `getcalldescr` fills `call_release_gil_target`
+/// from `_call_aroundstate_target_`; a const slot cannot name that
+/// funcptr.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum EffectInfoSlot {
     /// `EF_CAN_RAISE` — `call.py elif self._canraise(op):`

@@ -68,10 +68,9 @@ use quote::{ToTokens, format_ident, quote};
 use super::call_policy_byte::{
     INT_DONT_LOOK_INSIDE, INT_DONT_LOOK_INSIDE_CANNOT_RAISE, INT_ELIDABLE,
     INT_ELIDABLE_CANNOT_RAISE, INT_ELIDABLE_OR_MEMERROR, INT_INLINE, INT_LOOP_INVARIANT,
-    INT_MAY_FORCE, INT_RELEASE_GIL, REF_DONT_LOOK_INSIDE, REF_DONT_LOOK_INSIDE_CANNOT_RAISE,
-    REF_ELIDABLE, REF_ELIDABLE_CANNOT_RAISE, REF_ELIDABLE_OR_MEMERROR, REF_LOOP_INVARIANT,
-    REF_MAY_FORCE, VOID_DONT_LOOK_INSIDE, VOID_DONT_LOOK_INSIDE_CANNOT_RAISE, VOID_LOOP_INVARIANT,
-    VOID_MAY_FORCE, VOID_RELEASE_GIL,
+    INT_MAY_FORCE, REF_DONT_LOOK_INSIDE, REF_DONT_LOOK_INSIDE_CANNOT_RAISE, REF_ELIDABLE,
+    REF_ELIDABLE_CANNOT_RAISE, REF_ELIDABLE_OR_MEMERROR, REF_LOOP_INVARIANT, REF_MAY_FORCE,
+    VOID_DONT_LOOK_INSIDE, VOID_DONT_LOOK_INSIDE_CANNOT_RAISE, VOID_LOOP_INVARIANT, VOID_MAY_FORCE,
 };
 use super::codegen_trace::{
     block_contains_match, find_dispatch_match, find_portal_loop, is_assert_not_none_call_path,
@@ -498,11 +497,11 @@ impl CondCallEffectSlot {
     /// `CallPolicyKind`.  Used by the `*Wrapped` lowering arms so the
     /// registered call-target descr carries the real effect classification
     /// (`call.py getcalldescr`) rather than a blanket `CanRaise`.
-    /// Falls back to `CanRaise` for `MayForce` / `ReleaseGil` / `Inline*`
-    /// kinds whose conditional-call slot is `None` in
-    /// `call_policy_effect_slot`; the actual call surface dispatches them
-    /// through dedicated `call_may_force_*` / `call_release_gil_*` /
-    /// inline-helper paths that ignore the registered slot.
+    /// Falls back to `CanRaise` for `MayForce` / `Inline*` kinds whose
+    /// conditional-call slot is `None` in `call_policy_effect_slot`; the
+    /// actual call surface dispatches them through dedicated
+    /// `call_may_force_*` / inline-helper paths that ignore the registered
+    /// slot.
     pub(super) fn for_wrapped_kind(kind: crate::jit_interp::CallPolicyKind) -> TokenStream {
         call_policy_effect_slot(kind)
             .map(|slot| slot.token())
@@ -518,8 +517,7 @@ impl CondCallEffectSlot {
         quote! {
             match __policy {
                 #VOID_DONT_LOOK_INSIDE | #INT_DONT_LOOK_INSIDE | #REF_DONT_LOOK_INSIDE
-                | #VOID_MAY_FORCE | #INT_MAY_FORCE | #REF_MAY_FORCE
-                | #VOID_RELEASE_GIL | #INT_RELEASE_GIL => {
+                | #VOID_MAY_FORCE | #INT_MAY_FORCE | #REF_MAY_FORCE => {
                     majit_metainterp::EffectInfoSlot::CanRaise
                 }
                 #VOID_DONT_LOOK_INSIDE_CANNOT_RAISE
@@ -611,11 +609,6 @@ pub(super) fn call_policy_effect_slot(
         | K::MayForceIntWrapped
         | K::MayForceRefWrapped
         | K::MayForceFloatWrapped
-        | K::ReleaseGilVoid
-        | K::ReleaseGilVoidWrapped
-        | K::ReleaseGilInt
-        | K::ReleaseGilIntWrapped
-        | K::ReleaseGilFloatWrapped
         | K::InlineInt
         | K::InlineRef
         | K::InlineFloat
@@ -634,7 +627,7 @@ pub(super) fn call_policy_effect_slot(
 /// `jtransform.py:480-482` appends it after every `inline_call_*`.  The
 /// inline arms emit their own trailing marker (`inline_call_tokens`'
 /// `post_live`), so inline kinds return `false`; otherwise the calldescr's
-/// can-raise classification decides.  MayForce / ReleaseGil have no
+/// can-raise classification decides.  MayForce has no
 /// conditional-call slot but force / may raise, so they keep the marker.
 pub(super) fn explicit_call_emits_post_live(kind: crate::jit_interp::CallPolicyKind) -> bool {
     if binding_kind_for_inline_policy(kind).is_some()
@@ -665,8 +658,6 @@ pub(super) fn call_policy_result_kind(
         | K::ResidualVoidCannotRaiseWrapped
         | K::MayForceVoid
         | K::MayForceVoidWrapped
-        | K::ReleaseGilVoid
-        | K::ReleaseGilVoidWrapped
         | K::LoopInvariantVoid
         | K::LoopInvariantVoidWrapped
         | K::InlineVoid
@@ -679,8 +670,6 @@ pub(super) fn call_policy_result_kind(
         | K::ResidualIntCannotRaiseWrapped
         | K::MayForceInt
         | K::MayForceIntWrapped
-        | K::ReleaseGilInt
-        | K::ReleaseGilIntWrapped
         | K::LoopInvariantInt
         | K::LoopInvariantIntWrapped
         | K::ElidableInt
@@ -708,7 +697,6 @@ pub(super) fn call_policy_result_kind(
         K::ResidualFloatWrapped
         | K::ResidualFloatCannotRaiseWrapped
         | K::MayForceFloatWrapped
-        | K::ReleaseGilFloatWrapped
         | K::LoopInvariantFloatWrapped
         | K::ElidableFloatWrapped
         | K::ElidableFloatCannotRaiseWrapped
@@ -725,12 +713,10 @@ pub(super) fn call_policy_is_wrapped(kind: crate::jit_interp::CallPolicyKind) ->
         K::ResidualVoidWrapped
             | K::ResidualVoidCannotRaiseWrapped
             | K::MayForceVoidWrapped
-            | K::ReleaseGilVoidWrapped
             | K::LoopInvariantVoidWrapped
             | K::ResidualIntWrapped
             | K::ResidualIntCannotRaiseWrapped
             | K::MayForceIntWrapped
-            | K::ReleaseGilIntWrapped
             | K::LoopInvariantIntWrapped
             | K::ElidableIntWrapped
             | K::ElidableIntCannotRaiseWrapped
@@ -746,7 +732,6 @@ pub(super) fn call_policy_is_wrapped(kind: crate::jit_interp::CallPolicyKind) ->
             | K::ResidualFloatWrapped
             | K::ResidualFloatCannotRaiseWrapped
             | K::MayForceFloatWrapped
-            | K::ReleaseGilFloatWrapped
             | K::LoopInvariantFloatWrapped
             | K::ElidableFloatWrapped
             | K::ElidableFloatCannotRaiseWrapped
@@ -809,12 +794,12 @@ pub(super) fn inferred_conditional_call_policy_check(func_args_empty: bool) -> T
             // Void-return but rejected by jtransform.py:1677's
             // `check_forces_virtual_or_virtualizable` gate or by the
             // release-gil structural surface.
-            #VOID_MAY_FORCE | #VOID_RELEASE_GIL => panic!(
-                "conditional_call! cannot dispatch MayForce / ReleaseGil callees",
+            #VOID_MAY_FORCE => panic!(
+                "conditional_call! cannot dispatch MayForce callees",
             ),
             // PyPy `call.py:getcalldescr` checks actual return type before
             // effect flags; `conditional_call!` is the void-result opcode.
-            #INT_DONT_LOOK_INSIDE | #INT_ELIDABLE | #INT_MAY_FORCE | #INT_RELEASE_GIL
+            #INT_DONT_LOOK_INSIDE | #INT_ELIDABLE | #INT_MAY_FORCE
             | #INT_LOOP_INVARIANT | #INT_ELIDABLE_CANNOT_RAISE | #INT_ELIDABLE_OR_MEMERROR
             | #INT_DONT_LOOK_INSIDE_CANNOT_RAISE | #REF_DONT_LOOK_INSIDE_CANNOT_RAISE
             | #REF_ELIDABLE | #REF_ELIDABLE_CANNOT_RAISE | #REF_ELIDABLE_OR_MEMERROR
@@ -851,13 +836,13 @@ pub(super) fn inferred_conditional_call_value_policy_check(
                     #INT_DONT_LOOK_INSIDE | #INT_ELIDABLE | #INT_ELIDABLE_CANNOT_RAISE
                     | #INT_ELIDABLE_OR_MEMERROR | #INT_DONT_LOOK_INSIDE_CANNOT_RAISE => {},
                     #loop_invariant_arm,
-                    #INT_MAY_FORCE | #INT_RELEASE_GIL => panic!(
-                        "conditional_call_elidable! cannot dispatch MayForce / ReleaseGil callees",
+                    #INT_MAY_FORCE => panic!(
+                        "conditional_call_elidable! cannot dispatch MayForce callees",
                     ),
                     // VOID_DONT_LOOK_INSIDE_CANNOT_RAISE (28) and
                     // REF_DONT_LOOK_INSIDE_CANNOT_RAISE (30) are wrong
                     // result kind for the int value branch.
-                    #VOID_DONT_LOOK_INSIDE | #VOID_MAY_FORCE | #VOID_RELEASE_GIL
+                    #VOID_DONT_LOOK_INSIDE | #VOID_MAY_FORCE
                     | #VOID_LOOP_INVARIANT | #VOID_DONT_LOOK_INSIDE_CANNOT_RAISE
                     | #REF_DONT_LOOK_INSIDE_CANNOT_RAISE | #REF_ELIDABLE
                     | #REF_ELIDABLE_CANNOT_RAISE | #REF_ELIDABLE_OR_MEMERROR
@@ -894,7 +879,7 @@ pub(super) fn inferred_conditional_call_value_policy_check(
                     // INT_DONT_LOOK_INSIDE_CANNOT_RAISE (29) are wrong
                     // result kind for the ref value branch.
                     #VOID_DONT_LOOK_INSIDE | #INT_DONT_LOOK_INSIDE | #INT_ELIDABLE
-                    | #VOID_MAY_FORCE | #INT_MAY_FORCE | #VOID_RELEASE_GIL | #INT_RELEASE_GIL
+                    | #VOID_MAY_FORCE | #INT_MAY_FORCE
                     | #VOID_DONT_LOOK_INSIDE_CANNOT_RAISE | #INT_DONT_LOOK_INSIDE_CANNOT_RAISE
                     | #VOID_LOOP_INVARIANT | #INT_LOOP_INVARIANT | #INT_ELIDABLE_CANNOT_RAISE
                     | #INT_ELIDABLE_OR_MEMERROR => panic!(
@@ -919,11 +904,11 @@ pub(super) fn inferred_record_known_result_policy_check(result_kind: BindingKind
                 #INT_ELIDABLE | #INT_ELIDABLE_CANNOT_RAISE | #INT_ELIDABLE_OR_MEMERROR => {},
                 // INT_DONT_LOOK_INSIDE_CANNOT_RAISE (29): int residual
                 // EF_CANNOT_RAISE — not elidable, rejected here.
-                #INT_DONT_LOOK_INSIDE | #INT_MAY_FORCE | #INT_RELEASE_GIL | #INT_LOOP_INVARIANT
+                #INT_DONT_LOOK_INSIDE | #INT_MAY_FORCE | #INT_LOOP_INVARIANT
                 | #INT_DONT_LOOK_INSIDE_CANNOT_RAISE => panic!(
                     "record_known_result! requires an elidable helper policy",
                 ),
-                #VOID_DONT_LOOK_INSIDE | #VOID_MAY_FORCE | #VOID_RELEASE_GIL
+                #VOID_DONT_LOOK_INSIDE | #VOID_MAY_FORCE
                 | #VOID_LOOP_INVARIANT | #VOID_DONT_LOOK_INSIDE_CANNOT_RAISE
                 | #REF_DONT_LOOK_INSIDE_CANNOT_RAISE | #REF_ELIDABLE
                 | #REF_ELIDABLE_CANNOT_RAISE | #REF_ELIDABLE_OR_MEMERROR
@@ -945,7 +930,7 @@ pub(super) fn inferred_record_known_result_policy_check(result_kind: BindingKind
                     "record_known_result! requires an elidable helper policy",
                 ),
                 #VOID_DONT_LOOK_INSIDE | #INT_DONT_LOOK_INSIDE | #INT_ELIDABLE
-                | #VOID_MAY_FORCE | #INT_MAY_FORCE | #VOID_RELEASE_GIL | #INT_RELEASE_GIL
+                | #VOID_MAY_FORCE | #INT_MAY_FORCE
                 | #VOID_DONT_LOOK_INSIDE_CANNOT_RAISE | #INT_DONT_LOOK_INSIDE_CANNOT_RAISE
                 | #VOID_LOOP_INVARIANT | #INT_LOOP_INVARIANT | #INT_ELIDABLE_CANNOT_RAISE
                 | #INT_ELIDABLE_OR_MEMERROR => panic!(

@@ -201,12 +201,12 @@ static FNADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|| {
 ///
 /// `call.py` `getcalldescr` stores `llmemory.cast_ptr_to_adr(tgt_func)`,
 /// the raw funcptr, not the `ccall_*` wrapper. A translate-time miss is
-/// `symbolic_fnaddr_for_path` of that funcptr. `0` and the `#[jit_release_gil]`
-/// sentinel `1` are left alone. Anything else that this process cannot map
-/// through `jit_trace_fnaddrs` panics with the path.
+/// `symbolic_fnaddr_for_path` of that funcptr. `0` is left alone. Anything
+/// else that this process cannot map through `jit_trace_fnaddrs` panics
+/// with the path.
 pub fn rewrite_call_release_gil_target(effect_info: &mut majit_ir::EffectInfo) {
     let addr = effect_info.call_release_gil_target.0;
-    if addr == 0 || addr == 1 {
+    if addr == 0 {
         return;
     }
     effect_info.call_release_gil_target.0 = release_gil_runtime_addr(addr);
