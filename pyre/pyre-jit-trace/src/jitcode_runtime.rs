@@ -1354,26 +1354,12 @@ fn rehydrated_call_descr_ref(bh: majit_jitcode::jitcode::BhCallDescr) -> majit_i
 /// so the registry is still open when the tids are registered. CallDescr
 /// restoration stays on the first slot lookup.
 pub fn materialize_gccache_owned_descrs() {
-    materialize_gccache_owned_descrs_with(true);
-}
-
-/// Boot publication. `init_jit_hooks` runs this before user code, so the
-/// caller stack is the process stack and a helper thread is only join
-/// latency. The close hook keeps [`materialize_gccache_owned_descrs`],
-/// which leaves the recursive `CALL_ASSEMBLER` stack.
-pub fn materialize_gccache_owned_descrs_on_caller_stack() {
-    materialize_gccache_owned_descrs_with(false);
-}
-
-fn materialize_gccache_owned_descrs_with(off_caller_stack: bool) {
     static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        if off_caller_stack {
-            decode_kind0_descrs_off_caller_stack();
-        } else {
-            decode_kind0_descrs();
-        }
-    });
+    // Always a fresh stack. The first caller is `force_start_tracing` /
+    // `bound_reached`, which for `frame_chain` is already inside recursive
+    // `CALL_ASSEMBLER`. `init_size_descr` itself is translation-time and
+    // does not run on that stack.
+    ONCE.call_once(decode_kind0_descrs_off_caller_stack);
     // The decode `Once` may have run before a collector existed. Register
     // once the live collector is installed; a second call is a no-op.
     register_synthetic_struct_tids();
@@ -1490,11 +1476,14 @@ fn register_synthetic_struct_tids() {
 /// [`crate::state::blackhole_control_opcodes`],
 /// [`crate::state::setup_indirectcalltargets`],
 /// [`crate::state::bytecode_for_address`].  An interpreter that never traces
-/// never runs it.  Kind-0 minting is not in that set:
-/// [`materialize_gccache_owned_descrs`] runs from `init_jit_hooks` before
-/// user code when the JIT is on.  Moving it onto the first trace makes
-/// `frame_chain` allocate about 1.8 TiB.  The call below is the `Once`
-/// hitting an already-published table, then the EffectInfo and Call passes.
+/// never runs it.  Kind-0 minting is the same shape:
+/// [`materialize_gccache_owned_descrs`] runs from the first
+/// `force_start_tracing` / `bound_reached`, on a fresh stack, before that
+/// walk records a descr.  `init_jit_hooks` does not call it, so
+/// `python -c ''` does not pay the bincode.  Publishing from inside the walk
+/// makes `frame_chain` allocate about 1.8 TiB.  The call below is the `Once`
+/// hitting an already-published table when the trace entry ran first, then
+/// the EffectInfo and Call passes.
 ///
 /// **Its size is not currently measured, and two obvious instruments cannot
 /// measure it.**  Allocation here is mmap-backed, so `malloc_history` / `heap`

@@ -8156,6 +8156,15 @@ fn drive_unpack_iterable_trace(
     }
 }
 
+/// `GcLLDescr_framework.init_size_descr` publishes Size tids before any
+/// trace. The runtime stand-in runs at the first trace entry, on a fresh
+/// stack, before that walk records a descr. Doing it from inside the walk
+/// makes `frame_chain` allocate ~1.8 TiB. A process that never traces does
+/// not pay the bincode.
+fn publish_kind0_descrs_before_trace() {
+    pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
+}
+
 /// Eagerly register pyre-jit's hooks into pyre-interpreter so callers
 /// like `sys.settrace` see the JIT side from the very first user call,
 /// not only after the first JIT-eligible eval.  Idempotent (the
@@ -8166,15 +8175,6 @@ fn drive_unpack_iterable_trace(
 /// calls this once at boot so user code that touches `sys.settrace`
 /// before its first JIT-traced bytecode still routes through to the
 /// real `WarmState::set_param("trace_limit", 10000)`.
-/// `GcLLDescr_framework.init_size_descr` publishes Size tids before any
-/// trace. The runtime stand-in runs at the first trace entry, on a fresh
-/// stack, before that walk records a descr. Doing it from inside the walk
-/// makes `frame_chain` allocate ~1.8 TiB. A process that never traces does
-/// not pay the bincode.
-fn publish_kind0_descrs_before_trace() {
-    pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
-}
-
 pub fn init_jit_hooks() {
     // Phase A: build the GC and install it into the backend + pyre-object
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
@@ -8270,11 +8270,12 @@ const _: () = assert!(
 /// computed-once lifetime rather than scanning on every Python call.
 fn cached_unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
     let key = code as *const _ as usize;
-    let callcontrol = crate::jit::codewriter::CodeWriter::instance().callcontrol();
-    if let Some(&raw) = callcontrol.graph_jit_shapes.get(&key) {
-        // Match on the discriminants themselves so the decode is the inverse of
-        // the `shape as u8` encode below by construction, rather than by a
-        // hand-kept numbering the compiler never checks.
+    // Assembler overflow is recorded on the writer after a drain fails.
+    // Reading it must not construct the writer: `CodeWriter::new` decodes
+    // the build-time liveness stream, and this gate runs on cold frames.
+    if let Some(raw) = crate::jit::codewriter::CodeWriter::existing()
+        .and_then(|writer| writer.callcontrol().graph_jit_shapes.get(&key).copied())
+    {
         const NONE: u8 = UnsupportedJitShape::None as u8;
         const CURRENT_FRAME_ONLY: u8 = UnsupportedJitShape::CurrentFrameOnly as u8;
         const NESTED_BREAK_BRIDGE_RESUME: u8 = UnsupportedJitShape::NestedBreakBridgeResume as u8;
@@ -8287,9 +8288,7 @@ fn cached_unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> Unsuppor
             _ => unreachable!("invalid cached UnsupportedJitShape discriminant"),
         };
     }
-    let (shape, _census_key) = unsupported_jit_shape(code);
-    callcontrol.graph_jit_shapes.insert(key, shape as u8);
-    shape
+    unsupported_jit_shape(code).0
 }
 
 /// True when `code` holds more than one `FOR_ITER` and at least one of them
@@ -8845,7 +8844,7 @@ fn eval_with_jit_inner(
     // `ConstEncodingOverflow` is not a defect at all (the frame genuinely
     // cannot be encoded), so one key per shape cannot rank them. The key comes
     // from the memoized `unsupported_jit_shape`, read only on the decline path
-    // so the `graph_jit_shapes` fast path stays a single map hit.
+    // so the shape-cache fast path stays a single map hit.
     // Declining is per-frame: nested callees stay JIT-eligible.
     match jit_shape {
         UnsupportedJitShape::None => {}
@@ -10248,9 +10247,9 @@ fn maybe_compile_and_run(
     // callee with no compiled loop (`compile_tmp_callback` bakes
     // `portal_runner_adr` as the callee body, and the `!is_resolved`
     // CALL_ASSEMBLER force leg calls the same shim).  The classification is
-    // cached per code object in `CallControl.graph_jit_shapes`, so consulting
-    // it here is a pointer-keyed lookup rather than the constant-tree plus
-    // whole-bytecode walk that used to run on every back-edge.
+    // cached per code object, so consulting it here is a pointer-keyed
+    // lookup rather than the constant-tree plus whole-bytecode walk that
+    // used to run on every back-edge.
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     if cached_unsupported_jit_shape(code) != UnsupportedJitShape::None {
         pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
@@ -11873,8 +11872,8 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // and the `!is_resolved` CALL_ASSEMBLER force leg calls the same shim — and
     // the counter tick below starts a trace for such a frame.  Consult the
     // frame-shape gate here as well.  The classification is cached per code
-    // object in `CallControl.graph_jit_shapes`, so this is a pointer-keyed
-    // lookup, not the whole-frame scan that charged every Python call.
+    // object, so this is a pointer-keyed lookup, not the whole-frame scan
+    // that charged every Python call.
     if cached_unsupported_jit_shape(code) != UnsupportedJitShape::None {
         pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
         return None;
