@@ -5193,20 +5193,10 @@ fn build_jit_driver_pair() -> JitDriverPair {
     jd2.portal_runner_adr = ll_generatorentry_portal_runner_shim as *const () as i64;
     jd2.handle_jitexc_from_bh = Some(generatorentry_portal_runner);
     d.meta_interp_mut().register_jitdriver_sd(jd2);
-    // `warmspot.py metainterp_sd.finish_setup(codewriter)` always installs
-    // the assembler's opcode ids and liveness stream before either tracing or
-    // blackhole execution.  Every translated jitcode carries those ids: jd1's
-    // merge-point walk reads them while taking snapshots, and jd0's
-    // tracing-abort adoption copies them into each BlackholeInterpreter so a
-    // residual-call exception recognizes its following `live/` /
-    // `catch_exception/L`.  Leaving the default jd0 staticdata at the sentinel
-    // value 255 made a caught exception escape whenever that adoption path ran.
-    // Install the one build-time table unconditionally, before any trace clones
-    // the staticdata Arc, exactly where upstream runs finish_setup.
-    d.meta_interp_mut().install_liveness_from_build_parts(
-        pyre_jit_trace::jitcode_runtime::insns_opname_to_byte(),
-        pyre_jit_trace::jitcode_runtime::all_liveness(),
-    );
+    // `finish_setup` installs opcode ids and `all_liveness` before a trace
+    // clones `staticdata`. That install waits for the first trace
+    // (`install_build_time_liveness_before_trace`). Doing it here decodes
+    // `liveness.bin` on the cold portal tick `python -c ''` pays.
     // `jtransform.py` `_handle_stroruni_call` / `_handle_oopspec_call`
     // adds `OS_STR_CONCAT` to `callinfocollection`.  The walker records
     // `jit_ll_strconcat` itself, so seed the same row for
@@ -6866,6 +6856,7 @@ fn drive_portal_metatrace(
     let mut jit_state = build_jit_state(unsafe { &*live_frame }, info);
     // Before the walk records a field descr. See `publish_kind0_descrs_before_trace`.
     publish_kind0_descrs_before_trace();
+    install_build_time_liveness_before_trace(driver.meta_interp_mut());
     driver.force_start_tracing(green_key, loop_header_pc, &mut jit_state, env);
     let meta = driver.meta_interp_mut();
     if !meta.is_tracing() {
@@ -7268,6 +7259,7 @@ fn drive_generatorentry_trace(
         // A non-zero code pointer rebinds through `with_typed_decision_key`
         // to jd0's `(next_instr, is_being_profiled, pycode)` cell.
         publish_kind0_descrs_before_trace();
+        install_build_time_liveness_before_trace(meta);
         meta.force_start_tracing(green_key, (0, 0), Some(descriptor), &live_values)
     };
     if dbg {
@@ -7787,6 +7779,7 @@ fn drive_unpack_iterable_trace(
     // token and flags. `green_key` is `make_green_key` at `(greenkey_raw, 0)` (above),
     // so the pair reconstructs the identical hash.
     publish_kind0_descrs_before_trace();
+    install_build_time_liveness_before_trace(meta);
     let action = meta.force_start_tracing(
         green_key,
         (greenkey_raw as usize, 0),
@@ -8171,6 +8164,27 @@ fn drive_unpack_iterable_trace(
 /// `force_start_tracing` / `bound_reached`. After boot it is a `Once` no-op.
 fn publish_kind0_descrs_before_trace() {
     pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
+}
+
+/// `pyjitpl.py finish_setup`: opcode ids and `all_liveness` before a trace
+/// clones `staticdata`. `op_live` starts at `-1`. A later trace skips this;
+/// `Arc::get_mut` would fail once a clone exists.
+///
+/// jd1's merge-point walk reads the ids while taking snapshots, and a
+/// tracing abort copies them into each `BlackholeInterpreter` so a
+/// residual-call exception recognizes the following `live/` /
+/// `catch_exception/L`. Leaving the sentinel in place made that exception
+/// escape.
+fn install_build_time_liveness_before_trace(
+    meta: &mut majit_metainterp::MetaInterp<crate::jit::state::PyreMeta>,
+) {
+    if meta.staticdata.op_live >= 0 {
+        return;
+    }
+    meta.install_liveness_from_build_parts(
+        pyre_jit_trace::jitcode_runtime::insns_opname_to_byte(),
+        pyre_jit_trace::jitcode_runtime::all_liveness(),
+    );
 }
 
 /// Eagerly register pyre-jit's hooks into pyre-interpreter so callers
@@ -11424,13 +11438,13 @@ fn compile_and_run_once(
     }
 
     let mut jit_state = build_jit_state(frame_root.frame(), info);
+    publish_kind0_descrs_before_trace();
+    install_build_time_liveness_before_trace(driver.meta_interp_mut());
     match start {
         CompileOnceStart::BackEdge => {
-            publish_kind0_descrs_before_trace();
             driver.bound_reached(green_key, target_pc, &mut jit_state, env);
         }
         CompileOnceStart::FunctionEntry => {
-            publish_kind0_descrs_before_trace();
             driver.force_start_tracing(green_key, target_pc, &mut jit_state, env);
         }
     }
@@ -14924,6 +14938,7 @@ mod tests {
     #[test]
     fn driver_finish_setup_installs_blackhole_control_opcodes() {
         let (driver, _) = driver_pair();
+        install_build_time_liveness_before_trace(driver.meta_interp_mut());
         let staticdata = &driver.meta_interp().staticdata;
         let insns = pyre_jit_trace::jitcode_runtime::insns_opname_to_byte();
 
