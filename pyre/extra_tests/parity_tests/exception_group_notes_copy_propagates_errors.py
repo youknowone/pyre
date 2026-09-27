@@ -92,4 +92,4 @@ assert taken.__notes__ is not original.__notes__
 taken.__notes__.append("n2")
 assert original.__notes__ == ["n1"]
 
-print("ok")
+print("OK")

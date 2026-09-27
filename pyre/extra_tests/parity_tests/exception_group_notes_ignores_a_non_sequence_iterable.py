@@ -48,4 +48,4 @@ assert not hasattr(no, "__notes__")
 # A mapping defines `__getitem__` but is not a sequence: also ignored.
 assert not hasattr(partial({"k": "v"}).subgroup(ValueError), "__notes__")
 
-print("ok")
+print("OK")

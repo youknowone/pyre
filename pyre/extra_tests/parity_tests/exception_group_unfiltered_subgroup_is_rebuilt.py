@@ -72,4 +72,4 @@ noted.add_note("n1")
 assert noted.subgroup(ValueError).__notes__ == ["n1"]
 assert noted.subgroup(ValueError).__notes__ is not noted.__notes__
 
-print("ok")
+print("OK")
