@@ -2037,7 +2037,9 @@ def synth_skip_backends(path):
     `run_bench(skip_backends=...)` already does.
 
     This is not a way to park a failure: the header line must be followed by
-    a comment saying which mechanism is missing.
+    a comment saying which mechanism is missing. A `pyre-module` module the
+    binary was built without is not a backend mechanism; that fixture says
+    `requires-modules=` instead (`synth_requires_modules`).
 
     The exemption covers a backend's *execution* only. It deliberately does
     NOT cover the three baseline-failure paths below (cpython crash, pypy
@@ -2051,6 +2053,42 @@ def synth_skip_backends(path):
         ALL_BACKENDS,
         "backend",
         "synthetic backend exemption",
+    )
+
+
+# The builtin modules `pyre-module` owns, one per entry under its `module/`
+# directory. A binary built without that crate (`build-jit-core.sh`, the
+# cranelift leg) has none of them.
+PYRE_MODULE_NAMES = tuple(
+    sorted(
+        entry.stem
+        for entry in (
+            Path(__file__).resolve().parent / "pyre-module" / "src" / "module"
+        ).iterdir()
+        if entry.is_dir() or (entry.suffix == ".rs" and entry.stem != "mod")
+    )
+)
+
+
+def synth_requires_modules(path):
+    """Read the `pyre-module` modules a fixture imports from its header:
+        # pyre-check: requires-modules=math
+
+    Whether a binary has them depends on how it was built, not on its
+    backend, so `Check._fixture_skips` asks each binary's
+    `sys.builtin_module_names` and skips the fixture only where a named
+    module is missing. The same fixture runs on every backend built with
+    `pyre-module`.
+
+    A name must be one `pyre-module` owns: a misspelt one would be missing
+    from every binary and would silently skip the fixture everywhere.
+    """
+    return _header_name_list(
+        path,
+        "# pyre-check: requires-modules=",
+        PYRE_MODULE_NAMES,
+        "pyre-module module",
+        "synthetic module requirement",
     )
 
 
@@ -2509,6 +2547,7 @@ def synth_fixture_headers(path):
     headers = {
         "selfcheck": selfcheck,
         "skip_backends": synth_skip_backends(path),
+        "requires_modules": synth_requires_modules(path),
         "skip_platforms": synth_skip_platforms(path),
         "spec_folds": synth_spec_folds(path),
     }
@@ -3593,6 +3632,10 @@ class Check:
         self.pass_count = {}
         self.fail_count = {}
         self.pyre = {}
+        # backend -> frozenset of its binary's `sys.builtin_module_names`, or
+        # None when the probe failed. Filled on first use by
+        # `_builtin_modules`.
+        self.builtin_modules = {}
         # baseline interpreter -> measured empty-program user-CPU startup (s).
         # Populated by measure_startups(); missing key => 0.0 (no subtraction).
         # Read through `_startup_key`, which maps every pyre backend to pypy.
@@ -3663,6 +3706,54 @@ class Check:
 
     def _pyre(self, backend):
         return self.pyre.get(backend, "")
+
+    def _builtin_modules(self, backend):
+        """The backend binary's `sys.builtin_module_names`, probed once.
+
+        None when the probe itself fails: the fixtures that asked are then
+        run rather than skipped, so a binary that cannot start is reported
+        by them instead of hidden behind a skip.
+        """
+        if backend not in self.builtin_modules:
+            with tempfile.TemporaryDirectory() as tmp:
+                probe = Path(tmp) / "builtin_modules.py"
+                probe.write_text(
+                    "import sys\nprint(' '.join(sys.builtin_module_names))\n",
+                    encoding="utf-8",
+                )
+                output, _, code, _ = run_timed(
+                    [self._pyre(backend), str(probe)],
+                    timeout_s=scaled_timeout(30, self._timeout_scale(backend)),
+                    env=pyre_env(),
+                )
+            self.builtin_modules[backend] = (
+                frozenset(output.split()) if code == 0 else None
+            )
+        return self.builtin_modules[backend]
+
+    def _fixture_skips(self, header):
+        """{backend: reason} for every enabled backend a fixture skips.
+
+        The reason is empty for a `skip-backends=` exemption and names the
+        missing modules for a `requires-modules=` one.
+        """
+        skips = {backend: "" for backend in header["skip_backends"]}
+        required = header["requires_modules"]
+        for backend in ALL_BACKENDS:
+            if not required or backend in skips or not self.enabled(backend):
+                continue
+            present = self._builtin_modules(backend)
+            if present is None:
+                continue
+            missing = [name for name in required if name not in present]
+            if missing:
+                skips[backend] = f"no {', '.join(missing)}"
+        return skips
+
+    @staticmethod
+    def _print_skip(backend, reason):
+        sys.stdout.write(f"    {backend:<10s}")
+        print(dim(f"skip ({reason})" if reason else "skip"))
 
     def _timeout_scale(self, backend):
         if backend == "dynasm" and self.args.dynasm_timeout_scale is not None:
@@ -5083,7 +5174,7 @@ class Check:
 
     # ── self-checking regression guard ──
 
-    def run_selfcheck(self, name, script, timeout, expect="PASS", skip_backends=(),
+    def run_selfcheck(self, name, script, timeout, expect="PASS", skip_backends=None,
                       require_jit=True, spec_folds=(), want_compiles=()):
         """Run a self-checking regression script on each enabled backend.
 
@@ -5092,9 +5183,10 @@ class Check:
         guards whose signal is an asserted invariant, not byte-identical
         output, so they cannot go through `run_bench` or synthetic parity.
 
-        *skip_backends* names backends the guard does not apply to (e.g. a
-        `time`-module timing guard cannot run on the wasm guest, which has no
-        `time` module).
+        *skip_backends* maps each backend the guard does not apply to onto
+        the reason printed beside its `skip` (e.g. a `time`-module timing
+        guard cannot run on the wasm guest, which has no `time` module); see
+        `_fixture_skips`.
 
         With *require_jit* the run must also have compiled every
         `(arm, name)` in *want_compiles*. A self-asserted invariant is
@@ -5120,6 +5212,7 @@ class Check:
         without the census the fixture passes just as well with the fold gone,
         which is the one failure it exists to catch.
         """
+        skip_backends = skip_backends or {}
         print(f"  {name}")
         if spec_folds and not self._check_spec_folds(
             name, script, spec_folds, timeout, "-", "-", skip_backends,
@@ -5129,8 +5222,7 @@ class Check:
             if not self.enabled(backend):
                 continue
             if backend in skip_backends:
-                sys.stdout.write(f"    {backend:<10s}")
-                print(dim("skip"))
+                self._print_skip(backend, skip_backends[backend])
                 self._append_comparison(backend, name, "-", "-", "skip")
                 continue
             effective_timeout = scaled_timeout(timeout, self._timeout_scale(backend))
@@ -5298,8 +5390,8 @@ class Check:
         and which one that is is not known until the line above. A caller that
         hands over its own already-scaled figure squares the scale.
 
-        *skip_backends* is the fixture's `# pyre-check: skip-backends=` list;
-        the census never runs on a backend the fixture opts out of.
+        *skip_backends* holds the backends `_fixture_skips` opts the fixture
+        out of; the census never runs on one of them.
         """
         sys.stdout.write(f"    {'folds':<10s}")
         sys.stdout.flush()
@@ -5348,7 +5440,7 @@ class Check:
         effective_timeout = scaled_timeout(timeout, self.args.timeout_scale)
         max_pypy_ratio = headers["max_pypy_ratio"]
         max_rss_mb = headers["max_rss_mb"]
-        skip_backends = headers["skip_backends"]
+        skip_backends = self._fixture_skips(headers)
         skip_cpython = headers["skip_cpython"]
         no_cpython = headers["no_cpython"]
         spec_folds = headers["spec_folds"]
@@ -5452,10 +5544,10 @@ class Check:
                 continue
             # `# pyre-check: skip-backends=` — the fixture guards a mechanism
             # this backend does not implement, so running it here would only
-            # restate that gap.
+            # restate that gap. `# pyre-check: requires-modules=` — this
+            # backend's binary was built without a module the fixture imports.
             if backend in skip_backends:
-                sys.stdout.write(f"    {backend:<10s}")
-                print(dim("skip"))
+                self._print_skip(backend, skip_backends[backend])
                 self._append_comparison(backend, name, t_cpython, t_pypy, "skip")
                 continue
             # wasm carries no perf-ratio gate, matching `run_bench` (which has no
@@ -5496,7 +5588,7 @@ class Check:
                     f"synth/{path.stem}",
                     str(path),
                     self.args.synthetic_timeout,
-                    skip_backends=header["skip_backends"],
+                    skip_backends=self._fixture_skips(header),
                     require_jit=not header["interpreted"],
                     spec_folds=header["spec_folds"],
                     want_compiles=header["want_compiles"],

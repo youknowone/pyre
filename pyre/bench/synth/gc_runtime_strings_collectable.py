@@ -1,6 +1,5 @@
 # pyre-check: no-cpython
-# pyre-check: skip-backends=cranelift
-# cranelift runs the core build, which has no `pyre-module` and so no `unicodedata`.
+# pyre-check: requires-modules=unicodedata
 
 import array
 import contextvars

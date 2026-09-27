@@ -17,4 +17,7 @@ python3 pyre/scripts/extract-llbc.py majit-rlib pyre-object pyre-interpreter pyr
 if [ "$MODE" = check ]; then
     exec cargo check -p pyrex --bin pyre-dynasm --no-default-features --features dynasm,mimalloc
 fi
+# check.py stamps the binaries it builds; this one is built outside it, so a
+# stamp left by an earlier check.py build would make `--build no` refuse it.
+rm -f target/release/pyre-dynasm.inputs
 exec cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm,mimalloc
