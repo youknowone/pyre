@@ -14059,21 +14059,11 @@ pub(crate) fn try_walker_specialize_int_call<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 3 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(arg_obj),
-    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    let Some((concrete_callable, [arg_obj, _])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 1)
     else {
         return Ok(None);
     };
-    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
-        return Ok(None);
-    }
     let int_type_obj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     if !std::ptr::eq(concrete_callable, int_type_obj) {
         return Ok(None);
@@ -14103,16 +14093,7 @@ pub(crate) fn try_walker_specialize_int_call<Sym: WalkSym>(
     }
     let result_value = unsafe { pyre_object::w_int_get_value(boxed_result) };
 
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     let arg_op = r_args[2];
     let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
     let raw_float = walker_unbox_float(ctx, op.pc, arg_op, float_type_addr)?;
