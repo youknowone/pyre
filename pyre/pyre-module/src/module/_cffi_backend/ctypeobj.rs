@@ -956,10 +956,11 @@ fn ctype_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 fn ctype_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_self = args[0];
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.base();
+    let self_slot = roots.pin_roots(&[w_self]);
+    let base = self_slot + 1;
     let mut count = 0;
     for name in ATTRIBUTE_NAMES {
-        if pyre_interpreter::baseobjspace::getattr_str(w_self, name).is_ok() {
+        if pyre_interpreter::baseobjspace::getattr_str(roots.get(self_slot), name).is_ok() {
             let _ = roots.pin_root(pyre_object::w_str_new(name));
             count += 1;
         }

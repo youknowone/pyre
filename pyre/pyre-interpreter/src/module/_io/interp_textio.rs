@@ -1116,7 +1116,7 @@ impl W_TextIOWrapper {
             return Ok(());
         }
         let _roots = pyre_object::gc_roots::push_roots();
-        let _ = pyre_object::gc_roots::pin_root(stream);
+        let stream = pyre_object::gc_roots::pin_root(stream);
         let stream_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let payload = unsafe { &mut *(stream as *mut Self) };
         // The buffer is read below for the probes `descr_init` runs against it,

@@ -1803,8 +1803,11 @@ mod local_class {
                 (*this).last_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
             }
             pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
-            drop(roots);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            let obj = pyre_object::gc_roots::pin_root(obj);
             register_local_in_current_ec(obj);
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            drop(roots);
             Ok(obj)
         }
 

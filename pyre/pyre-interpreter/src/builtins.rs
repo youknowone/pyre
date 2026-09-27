@@ -4639,16 +4639,32 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let sep_val = unsafe { pyre_object::w_dict_getitem_str(kwargs, "sep") };
         // The type check is up front; the str() rendering happens at write
         // time so a raising `__str__` leaves the preceding output in place.
-        let end_obj = print_sep_check(end_val, "end")?;
-        let sep_obj = print_sep_check(sep_val, "sep")?;
+        let mut end_obj = print_sep_check(end_val, "end")?;
+        let mut sep_obj = print_sep_check(sep_val, "sep")?;
         // `file=None` (or absent) uses the native stdout path; any other
         // object is written through its `write` / `flush` methods.
-        let file_obj = match unsafe { pyre_object::w_dict_getitem_str(kwargs, "file") } {
+        let mut file_obj = match unsafe { pyre_object::w_dict_getitem_str(kwargs, "file") } {
             Some(f) if !unsafe { pyre_object::is_none(f) } => Some(f),
             _ => None,
         };
         let flush = match unsafe { pyre_object::w_dict_getitem_str(kwargs, "flush") } {
-            Some(f) => crate::baseobjspace::is_true(f)?,
+            Some(f) => {
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.pin_roots(&[
+                    end_obj.unwrap_or(pyre_object::PY_NULL),
+                    sep_obj.unwrap_or(pyre_object::PY_NULL),
+                    file_obj.unwrap_or(pyre_object::PY_NULL),
+                ]);
+                let r = crate::baseobjspace::is_true(f);
+                let w = roots.get(base);
+                end_obj = if w.is_null() { None } else { Some(w) };
+                let w = roots.get(base + 1);
+                sep_obj = if w.is_null() { None } else { Some(w) };
+                let w = roots.get(base + 2);
+                file_obj = if w.is_null() { None } else { Some(w) };
+                drop(roots);
+                r?
+            }
             None => false,
         };
         (&args[..args.len() - 1], end_obj, sep_obj, file_obj, flush)
@@ -6617,17 +6633,11 @@ pub(crate) fn type_dict_set_doc(w_type: PyObjectRef) {
 /// such as `typing.Protocol` mistake it for a user-declared member.
 pub(crate) fn type_new_take_qualname(w_type: PyObjectRef, ns: PyObjectRef) -> crate::PyResult {
     // The lookup and the delete each intern `__qualname__`, so the moving
-    // namespace is read back out of a root slot for both.  `w_type` and the
-    // string value do not move, and the dict holds the value until the delete.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(ns);
-    let Some(value) = (unsafe {
-        pyre_object::w_dict_getitem_str(
-            pyre_object::gc_roots::shadow_stack_get(ns_slot),
-            "__qualname__",
-        )
-    }) else {
+    // namespace is read back out of a root slot for both.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[ns, w_type, pyre_object::PY_NULL]);
+    let Some(value) = (unsafe { pyre_object::w_dict_getitem_str(roots.get(base), "__qualname__") })
+    else {
         return Ok(pyre_object::w_none());
     };
     if !unsafe { pyre_object::is_str(value) } {
@@ -6636,13 +6646,11 @@ pub(crate) fn type_new_take_qualname(w_type: PyObjectRef, ns: PyObjectRef) -> cr
             crate::type_methods::arg_type_name(value),
         )));
     }
+    roots.set(base + 2, value);
     check_surrogate(value)?;
     unsafe {
-        pyre_object::w_type_set_qualname(w_type, value);
-        pyre_object::w_dict_delitem_str_no_proxy(
-            pyre_object::gc_roots::shadow_stack_get(ns_slot),
-            "__qualname__",
-        );
+        pyre_object::w_type_set_qualname(roots.get(base + 1), roots.get(base + 2));
+        pyre_object::w_dict_delitem_str_no_proxy(roots.get(base), "__qualname__");
     }
     Ok(pyre_object::w_none())
 }
@@ -10640,15 +10648,8 @@ pub fn make_exc_type_with_init(
                             // receiver relocates too: `__getattr__` /
                             // `__setattr__` are collection points.
                             let _roots = pyre_object::gc_roots::push_roots();
-                            let self_slot = pyre_object::gc_roots::shadow_stack_len();
-                            let _ = pyre_object::gc_roots::pin_root(w_self);
-                            let note_slot = pyre_object::gc_roots::shadow_stack_len();
-                            let _ = pyre_object::gc_roots::pin_root(w_note);
-                            // The exception itself is nursery-allocated, so
-                            // it relocates across the same window and is
-                            // read back for the store.
-                            let self_slot = pyre_object::gc_roots::shadow_stack_len();
-                            let _ = pyre_object::gc_roots::pin_root(w_self);
+                            let self_slot = pyre_object::gc_roots::pin_roots(&[w_self, w_note]);
+                            let note_slot = self_slot + 1;
                             // `interp_exceptions.py:240-254` — lazy
                             // list allocation on first call; if the
                             // attribute is already set but NOT a list,
@@ -11312,7 +11313,9 @@ fn exception_group_split_inner(
         return Ok((w_self(), pyre_object::w_none()));
     }
     let (_, exceptions) = exception_group_fields(w_self())?;
-    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    let base_group_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(lookup_exc_class("BaseExceptionGroup").unwrap());
+    let base_group = || pyre_object::gc_roots::shadow_stack_get(base_group_slot);
     // Either side can hold a freshly derived subgroup while a later child is
     // still recursing and allocating, so every kept child is pinned as it
     // arrives; both sides share one bracket, because two open brackets pin onto
@@ -11327,7 +11330,7 @@ fn exception_group_split_inner(
     let mut nonmatching_at = Vec::new();
     for i in 0..n_children {
         let exc = child(i);
-        if crate::baseobjspace::isinstance(exc, base_group)? {
+        if crate::baseobjspace::isinstance(exc, base_group())? {
             let exc = child(i);
             let (yes, no) = exception_group_split_inner(exc, &live_condition())?;
             if !unsafe { pyre_object::is_none(yes) } {
@@ -11648,7 +11651,8 @@ pub(crate) fn exception_group_prep_reraise_star(
         let _ = pyre_object::gc_roots::pin_root(item);
     }
     let raised_n = raised.len();
-    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    let base_group_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(lookup_exc_class("BaseExceptionGroup").unwrap());
     let list = pyre_object::w_list_new(
         (0..raised_n)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(raised_base + i))
@@ -11657,7 +11661,11 @@ pub(crate) fn exception_group_prep_reraise_star(
     // `w_list_new` collects; the message is allocated after it so no
     // unrooted local crosses that collection.
     let message = unsafe { pyre_object::w_str_new("") };
-    exception_group_new(&[base_group, message, list])
+    exception_group_new(&[
+        pyre_object::gc_roots::shadow_stack_get(base_group_slot),
+        message,
+        list,
+    ])
 }
 
 fn exception_group_subgroup(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -13447,7 +13455,7 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         let _ = pyre_object::gc_roots::pin_root(arg);
     }
     let w_self = pyre_object::descriptor::w_super_new(PY_NULL, PY_NULL, PY_NULL);
-    let _ = pyre_object::gc_roots::pin_root(w_self);
+    let w_self = pyre_object::gc_roots::pin_root(w_self);
     let mut args_w = [PY_NULL; 2];
     for (i, arg) in args_w[..args.len()].iter_mut().enumerate() {
         *arg = unsafe { pyre_object::gc_roots::shadow_stack_get(save_point + i) };
@@ -13511,8 +13519,9 @@ pub(crate) fn super_descr_init(
     } else {
         w_obj_or_type
     };
-    let _ = pyre_object::gc_roots::pin_root(w_starttype);
-    let _ = pyre_object::gc_roots::pin_root(w_obj_or_type);
+    let operands = pyre_object::gc_roots::pin_roots(&[w_starttype, w_obj_or_type]);
+    let w_starttype = pyre_object::gc_roots::shadow_stack_get(operands);
+    let w_obj_or_type = pyre_object::gc_roots::shadow_stack_get(operands + 1);
     let w_type = if w_obj_or_type.is_null() {
         PY_NULL
     } else {
@@ -13728,11 +13737,12 @@ pub(crate) fn super_check(
         return Ok(obj_type);
     }
     let _roots = pyre_object::gc_roots::push_roots();
-    let save_point = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(start_type);
-    let _ = pyre_object::gc_roots::pin_root(obj_or_type);
+    let save_point = pyre_object::gc_roots::pin_roots(&[start_type, obj_or_type]);
     unsafe {
-        match crate::baseobjspace::getattr_str(obj_or_type, "__class__") {
+        match crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(save_point + 1),
+            "__class__",
+        ) {
             Ok(apparent_type) => {
                 let start_type = pyre_object::gc_roots::shadow_stack_get(save_point);
                 if pyre_object::is_type(apparent_type)
@@ -18514,7 +18524,7 @@ unsafe fn classdir_recurse(w_cls: PyObjectRef, names_slot: usize) -> Result<(), 
     // receiver is published rather than carried in a Rust local.
     let _roots = pyre_object::gc_roots::push_roots();
     let cls_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_cls);
+    let w_cls = pyre_object::gc_roots::pin_root(w_cls);
     // getattr(klass, '__dict__', None): names.update(ns).  This is deliberately
     // iterable-driven, not dict-only: app-level PyPy accepts any iterable here.
     match crate::baseobjspace::getattr_str(w_cls, "__dict__") {
@@ -23545,7 +23555,13 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if fd < 0 {
             return Err(crate::PyError::value_error("negative file descriptor"));
         }
-        let stat_atopen = fileio_validate_fd(fd, path_obj)?;
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.pin_roots(&[closefd_obj.unwrap_or(pyre_object::PY_NULL)]);
+        let stat_atopen = fileio_validate_fd(fd, path_obj);
+        let w = roots.get(base);
+        let closefd_obj = if w.is_null() { None } else { Some(w) };
+        drop(roots);
+        let stat_atopen = stat_atopen?;
         fileio_set_binary_mode(fd);
         let closefd = match closefd_obj {
             Some(value) => crate::baseobjspace::is_true(value)?,
@@ -24885,7 +24901,7 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     let (pos, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(kwargs, &["real", "imag"], "complex")?;
     let w_real = resolve_pos_or_kw(pos.first().copied(), kwargs, "real", "complex", 1)?;
-    let w_imag = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "imag", "complex", 2)?;
+    let mut w_imag = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "imag", "complex", 2)?;
     let simple_single_positional = pos.len() == 1 && !has_real_kwargs(kwargs);
 
     // `complex.__new__`: an exact complex passed as the sole argument is
@@ -24950,10 +24966,16 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             // conversion protocol.  The single-positional conversion path is
             // intentionally exempt.
             if !simple_single_positional && has_complex_protocol && !has_real_protocol {
-                crate::warn::warn_deprecation(&format!(
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.pin_roots(&[w_imag.unwrap_or(pyre_object::PY_NULL)]);
+                let r = crate::warn::warn_deprecation(&format!(
                     "complex() argument 'real' must be a real number, not {}",
                     crate::type_methods::arg_type_name(a)
-                ))?;
+                ));
+                let w = roots.get(base);
+                w_imag = if w.is_null() { None } else { Some(w) };
+                drop(roots);
+                r?;
             }
             real_was_complex = has_complex_protocol;
             value

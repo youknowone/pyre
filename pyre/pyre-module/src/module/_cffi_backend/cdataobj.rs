@@ -1148,10 +1148,9 @@ fn cdata_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // The index's `__index__` is arbitrary Python, so the value being stored
     // has to be read back out of its slot afterwards.
     let roots = pyre_object::gc_roots::push_roots();
-    let value_slot = roots.base();
-    let _ = roots.pin_root(w_value);
+    let value_slot = roots.pin_roots(&[w_value, w_self]);
     let i = pyre_interpreter::baseobjspace::getindex_w(w_index)?;
-    let cdata = cdata_arg(w_self)?;
+    let cdata = cdata_arg(roots.get(value_slot + 1))?;
     let ct = check_subscript_index(cdata, i)?;
     let item = ctypeobj::ctype_at(ct.ctitem)
         .ok_or_else(|| PyError::system_error("indexed ctype without an item type"))?;
@@ -1220,13 +1219,15 @@ fn getslicearg(
     // Each bound's `__index__` is arbitrary Python, so all three components
     // are pinned before the first conversion runs.
     let roots = pyre_object::gc_roots::push_roots();
-    let start_slot = roots.base();
-    unsafe {
-        let _ = roots.pin_root(pyre_object::sliceobject::w_slice_get_start(w_slice));
-        let _ = roots.pin_root(pyre_object::sliceobject::w_slice_get_stop(w_slice));
-        let _ = roots.pin_root(pyre_object::sliceobject::w_slice_get_step(w_slice));
-    }
-    let (stop_slot, step_slot) = (start_slot + 1, start_slot + 2);
+    let start_slot = unsafe {
+        roots.pin_roots(&[
+            pyre_object::sliceobject::w_slice_get_start(w_slice),
+            pyre_object::sliceobject::w_slice_get_stop(w_slice),
+            pyre_object::sliceobject::w_slice_get_step(w_slice),
+            w_self,
+        ])
+    };
+    let (stop_slot, step_slot, self_slot) = (start_slot + 1, start_slot + 2, start_slot + 3);
     if unsafe { pyre_object::pyobject::is_none(roots.get(start_slot)) } {
         return Err(PyError::index_error("slice start must be specified"));
     }
@@ -1241,7 +1242,7 @@ fn getslicearg(
     if start > stop {
         return Err(PyError::index_error("slice start > stop"));
     }
-    let cdata = cdata_arg(w_self)?;
+    let cdata = cdata_arg(roots.get(self_slot))?;
     let ct = cdata.ctype_ref()?;
     // `W_CType._check_slice_index` and the overrides of it.
     let w_ctptr = match ct.kind {

@@ -2234,7 +2234,7 @@ pub fn handle_exception_with_context(
             let saved_trace = frame.get_w_f_trace();
             let _trace_roots = pyre_object::gc_roots::push_roots();
             let saved_trace_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(saved_trace);
+            let saved_trace = pyre_object::gc_roots::pin_root(saved_trace);
             if !saved_trace.is_null() {
                 frame.getorcreatedebug(-1).w_f_trace = pyre_object::PY_NULL;
             }

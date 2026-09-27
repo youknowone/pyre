@@ -192,8 +192,9 @@ fn ssl_error(message: impl Into<String>) -> pyre_interpreter::PyError {
             w_int_new(0),
             pyre_object::gc_roots::shadow_stack_get(message_slot),
         ]) {
-            set_library_reason(exc, &message);
-            err.exc_object = exc;
+            let exc_slot = pyre_object::gc_roots::pin_roots(&[exc]);
+            set_library_reason(pyre_object::gc_roots::shadow_stack_get(exc_slot), &message);
+            err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         }
     }
     err
@@ -1025,9 +1026,28 @@ mod context_methods {
                 3,
             )?;
             pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, KEYWORDS, "load_cert_chain")?;
-            let cert_path = fs_path(cert)?;
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.pin_roots(&[
+                key.unwrap_or(pyre_object::PY_NULL),
+                password.unwrap_or(pyre_object::PY_NULL),
+            ]);
+            let cert_path = fs_path(cert);
+            let w = roots.get(base);
+            let key = if w.is_null() { None } else { Some(w) };
+            let w = roots.get(base + 1);
+            let mut password = if w.is_null() { None } else { Some(w) };
+            drop(roots);
+            let cert_path = cert_path?;
             let key_path = match key {
-                Some(value) if !unsafe { is_none(value) } => fs_path(value)?,
+                Some(value) if !unsafe { is_none(value) } => {
+                    let roots = pyre_object::gc_roots::push_roots();
+                    let base = roots.pin_roots(&[password.unwrap_or(pyre_object::PY_NULL)]);
+                    let key_path = fs_path(value);
+                    let w = roots.get(base);
+                    password = if w.is_null() { None } else { Some(w) };
+                    drop(roots);
+                    key_path?
+                }
                 _ => cert_path.clone(),
             };
             // OpenSSL asks its callback only after parsing discovers an
@@ -1097,21 +1117,38 @@ mod context_methods {
                 "load_verify_locations",
             )?;
             let cafile = cafile.filter(|value| !unsafe { is_none(*value) });
-            let capath = capath.filter(|value| !unsafe { is_none(*value) });
-            let cadata = cadata.filter(|value| !unsafe { is_none(*value) });
+            let mut capath = capath.filter(|value| !unsafe { is_none(*value) });
+            let mut cadata = cadata.filter(|value| !unsafe { is_none(*value) });
             if cafile.is_none() && capath.is_none() && cadata.is_none() {
                 return Err(pyre_interpreter::PyError::type_error(
                     "cafile, capath and cadata cannot be all omitted",
                 ));
             }
             if let Some(cafile) = cafile {
-                let path = fs_path(cafile)?;
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.pin_roots(&[
+                    capath.unwrap_or(pyre_object::PY_NULL),
+                    cadata.unwrap_or(pyre_object::PY_NULL),
+                ]);
+                let path = fs_path(cafile);
+                let w = roots.get(base);
+                capath = if w.is_null() { None } else { Some(w) };
+                let w = roots.get(base + 1);
+                cadata = if w.is_null() { None } else { Some(w) };
+                drop(roots);
+                let path = path?;
                 native_result(unsafe {
                     pyre_native::ssl::context_load_verify_file(self.backend, &path)
                 })?;
             }
             if let Some(capath) = capath {
-                let path = fs_path(capath)?;
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.pin_roots(&[cadata.unwrap_or(pyre_object::PY_NULL)]);
+                let path = fs_path(capath);
+                let w = roots.get(base);
+                cadata = if w.is_null() { None } else { Some(w) };
+                drop(roots);
+                let path = path?;
                 if !path.is_dir() {
                     return Err(pyre_interpreter::PyError::os_error_with_errno(
                         libc::ENOENT,
@@ -2298,18 +2335,17 @@ mod ssl_socket_methods {
                 ));
             }
             let _sni_roots = pyre_object::gc_roots::push_roots();
-            let owner_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(owner);
+            let owner_slot = pyre_object::gc_roots::pin_roots(&[owner, initial_context, callback]);
+            let context_slot = owner_slot + 1;
+            let callback_slot = owner_slot + 2;
             let name_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(unsafe {
                 pyre_native::ssl::connection_server_name(backend)
                     .map(|name| w_str_new_managed(&name))
                     .unwrap_or_else(w_none)
             });
-            let context_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(initial_context);
             let result = match pyre_interpreter::call::call_function_impl_result(
-                callback,
+                pyre_object::gc_roots::shadow_stack_get(callback_slot),
                 &[
                     pyre_object::gc_roots::shadow_stack_get(owner_slot),
                     pyre_object::gc_roots::shadow_stack_get(name_slot),
@@ -2321,7 +2357,7 @@ mod ssl_socket_methods {
                     error.write_unraisable(
                         w_none(),
                         rustpython_wtf8::Wtf8::new("in SNI callback"),
-                        callback,
+                        pyre_object::gc_roots::shadow_stack_get(callback_slot),
                     );
                     return reject_sni(unsafe { &mut *socket }, 40, "CALLBACK_FAILED");
                 }
@@ -2336,7 +2372,7 @@ mod ssl_socket_methods {
                         error.write_unraisable(
                             w_none(),
                             rustpython_wtf8::Wtf8::new("in SNI callback"),
-                            callback,
+                            pyre_object::gc_roots::shadow_stack_get(callback_slot),
                         );
                         return reject_sni(unsafe { &mut *socket }, 80, "CALLBACK_FAILED");
                     }
@@ -3160,7 +3196,13 @@ fn txt2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErro
             "txt2obj() takes 1 or 2 arguments",
         ));
     }
-    let value = pyre_interpreter::baseobjspace::str_utf8_w(positional[0])?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let value = pyre_interpreter::baseobjspace::str_utf8_w(positional[0]);
+    let w = roots.get(base);
+    let kwargs = if w.is_null() { None } else { Some(w) };
+    drop(roots);
+    let value = value?;
     let name_arg =
         pyre_interpreter::builtins::bind_pos_or_kw(positional, kwargs, 1, "name", "txt2obj", 2)?;
     pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, &["name"], "txt2obj")?;

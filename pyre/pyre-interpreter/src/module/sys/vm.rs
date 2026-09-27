@@ -4371,18 +4371,30 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         unbuffered || to_stderr || crate::importing::host::os::isatty(fd),
         unbuffered,
     );
-    crate::baseobjspace::setdictvalue_native(stream, "name", w_str_new(name));
+    let _ = pyre_object::gc_roots::pin_root(stream);
+    let stream_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_name = w_str_new(name);
+    crate::baseobjspace::setdictvalue_native(
+        pyre_object::gc_roots::shadow_stack_get(stream_slot),
+        "name",
+        w_name,
+    );
     // `pylifecycle.c init_set_builtins_open`/`init_sys_streams`: stderr uses the
     // `backslashreplace` handler so traceback printing never fails on a lone
     // surrogate; stdout/stdin default to `strict`.
+    let w_mode = w_str_new(if writable { "w" } else { "r" });
     crate::baseobjspace::setdictvalue_native(
-        stream,
+        pyre_object::gc_roots::shadow_stack_get(stream_slot),
         "mode",
-        w_str_new(if writable { "w" } else { "r" }),
+        w_mode,
     );
-    crate::baseobjspace::setdictvalue_native(stream, "closed", w_bool_from(false));
     crate::baseobjspace::setdictvalue_native(
-        stream,
+        pyre_object::gc_roots::shadow_stack_get(stream_slot),
+        "closed",
+        w_bool_from(false),
+    );
+    crate::baseobjspace::setdictvalue_native(
+        pyre_object::gc_roots::shadow_stack_get(stream_slot),
         "buffer",
         pyre_object::gc_roots::shadow_stack_get(buffer_slot),
     );
@@ -4533,7 +4545,11 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             Err(reject_non_str(args))
         })
     };
-    crate::baseobjspace::setdictvalue_native(stream, "write", write_fn);
+    crate::baseobjspace::setdictvalue_native(
+        pyre_object::gc_roots::shadow_stack_get(stream_slot),
+        "write",
+        write_fn,
+    );
     // `flush` stands in for `TextIOWrapper.flush`, which starts at
     // `CHECK_CLOSED`, so the descriptor picks the stream to ask -- a bare `fn`
     // pointer carries no captures, the way `fileno` below selects one per
@@ -4552,7 +4568,11 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             flush_std_descriptors()
         }),
     };
-    crate::baseobjspace::setdictvalue_native(stream, "flush", flush_fn);
+    crate::baseobjspace::setdictvalue_native(
+        pyre_object::gc_roots::shadow_stack_get(stream_slot),
+        "flush",
+        flush_fn,
+    );
     // PyPy's W_TextIOWrapper.isatty_w delegates to its live buffer, which in
     // turn delegates to the raw descriptor.  Do not install an instance
     // override here: after forkpty changes fd 0 into the slave terminal, the
@@ -4573,12 +4593,16 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             Ok(w_int_new(1))
         }),
     };
-    crate::baseobjspace::setdictvalue_native(stream, "fileno", fileno_fn);
+    crate::baseobjspace::setdictvalue_native(
+        pyre_object::gc_roots::shadow_stack_get(stream_slot),
+        "fileno",
+        fileno_fn,
+    );
     // A buffered layer delegates the query that names its own direction down to
     // the raw descriptor, which refuses once the stream is closed, and answers
     // the opposite one with a constant `False` that closing does not turn into
     // an error.  Only the matching query takes the check.
-    let (writable_fn, readable_fn) = match fd {
+    let (writable_fn, mut readable_fn) = match fd {
         0 => (
             crate::make_builtin_function("writable", |_| Ok(w_bool_from(false))),
             crate::make_builtin_function("readable", |_| {
@@ -4601,9 +4625,17 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             crate::make_builtin_function("readable", |_| Ok(w_bool_from(false))),
         ),
     };
-    crate::baseobjspace::setdictvalue_native(stream, "writable", writable_fn);
-    crate::baseobjspace::setdictvalue_native(stream, "readable", readable_fn);
-    stream
+    pyre_object::with_roots!(readable_fn => crate::baseobjspace::setdictvalue_native(
+        pyre_object::gc_roots::shadow_stack_get(stream_slot),
+        "writable",
+        writable_fn,
+    ));
+    crate::baseobjspace::setdictvalue_native(
+        pyre_object::gc_roots::shadow_stack_get(stream_slot),
+        "readable",
+        readable_fn,
+    );
+    pyre_object::gc_roots::shadow_stack_get(stream_slot)
 }
 
 #[cfg(test)]

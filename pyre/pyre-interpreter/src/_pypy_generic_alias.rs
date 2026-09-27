@@ -439,8 +439,8 @@ fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     // indices rather than values — the same shape `push_newarg` uses above —
     // and `items` is read back before each element fetch.
     let _roots = pyre_object::gc_roots::push_roots();
-    let items_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(items);
+    let items_slot = pyre_object::gc_roots::pin_roots(&[items, pyre_object::PY_NULL]);
+    let subargs_slot = items_slot + 1;
     let items = || pyre_object::gc_roots::shadow_stack_get(items_slot);
     let n = unsafe { w_tuple_len(items()) };
     let mut newarg_slots: Vec<usize> = Vec::new();
@@ -465,8 +465,7 @@ fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         let do_unpack = if unsafe { pyre_object::is_none(subargs) } {
             false
         } else {
-            let subargs_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(subargs);
+            pyre_object::gc_roots::shadow_stack_set(subargs_slot, subargs);
             let ends_ellipsis = crate::baseobjspace::is_true(
                 pyre_object::gc_roots::shadow_stack_get(subargs_slot),
             )? && {
@@ -484,7 +483,9 @@ fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
             // `newargs.extend(subargs)` — any iterable, not just a tuple.
             // Publish the collected members in one go: `collect_iterable`'s own
             // scope has popped, so its Vec is untraced from here on.
-            let members = crate::builtins::collect_iterable(subargs)?;
+            let members = crate::builtins::collect_iterable(
+                pyre_object::gc_roots::shadow_stack_get(subargs_slot),
+            )?;
             let member_base = pyre_object::gc_roots::pin_roots(&members);
             for index in 0..members.len() {
                 newarg_slots.push(member_base + index);
@@ -1622,11 +1623,13 @@ pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, 
         if n == 1 {
             crate::display::wtf8_format!("[], ", result_repr)
         } else {
-            let first = w_tuple_getitem(current_args(), 0).unwrap();
-            if is_ellipsis(first) {
+            let first_slot =
+                pyre_object::gc_roots::pin_roots(&[w_tuple_getitem(current_args(), 0).unwrap()]);
+            let first = || pyre_object::gc_roots::shadow_stack_get(first_slot);
+            if is_ellipsis(first()) {
                 crate::display::wtf8_format!("..., ", result_repr)
-            } else if n == 2 && (is_param_spec(first)? || is_typing_generic_alias(first)?) {
-                crate::display::wtf8_format!(repr_item(first)?, ", ", result_repr)
+            } else if n == 2 && (is_param_spec(first())? || is_typing_generic_alias(first())?) {
+                crate::display::wtf8_format!(repr_item(first())?, ", ", result_repr)
             } else {
                 let mut params = Vec::with_capacity(n - 1);
                 for i in 0..n - 1 {

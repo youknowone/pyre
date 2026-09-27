@@ -266,12 +266,12 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
     store_funcptr_addr(pyre_object::gc_roots::shadow_stack_get(obj_slot), addr)?;
-    if !callback.is_null() {
+    if let Some(callback_slot) = callback_slot {
         let current_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let d = pyre_interpreter::baseobjspace::getdict_native(current_obj);
         let _ = pyre_object::gc_roots::pin_root(d);
         let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let callback = pyre_object::gc_roots::shadow_stack_get(callback_slot.unwrap());
+        let callback = pyre_object::gc_roots::shadow_stack_get(callback_slot);
         unsafe {
             pyre_object::w_dict_setitem_str(
                 pyre_object::gc_roots::shadow_stack_get(dict_slot),
@@ -1575,8 +1575,13 @@ fn build_callargs(
         inoutmask: 0,
         numretvals: 0,
     };
-    let (Some(paramflags), Some(argtypes)) = (instance_get(self_obj, PARAMFLAGS_KEY), argtypes)
-    else {
+    let roots = pyre_object::gc_roots::push_roots();
+    let kwargs_slot = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let paramflags = instance_get(self_obj, PARAMFLAGS_KEY);
+    let w = roots.get(kwargs_slot);
+    let kwargs = if w.is_null() { None } else { Some(w) };
+    drop(roots);
+    let (Some(paramflags), Some(argtypes)) = (paramflags, argtypes) else {
         return Ok(plain(passed.to_vec()));
     };
     if argtypes.is_empty() || !unsafe { pyre_object::is_tuple(paramflags) } {

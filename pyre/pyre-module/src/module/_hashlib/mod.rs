@@ -765,9 +765,14 @@ fn pbkdf2_hmac(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::Py
         .ok_or_else(|| unsupported_digestmod("unsupported hash type"))?;
     let password = pyre_object::with_roots!(iterations, salt => read_hash_buffer(password))?;
     let salt = pyre_object::with_roots!(iterations => read_hash_buffer(salt))?;
-    let iterations = pyre_interpreter::baseobjspace::int_w(
-        pyre_interpreter::baseobjspace::space_index(iterations)?,
-    )?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[dklen.unwrap_or(pyre_object::PY_NULL)]);
+    let iterations = pyre_interpreter::baseobjspace::space_index(iterations)
+        .and_then(pyre_interpreter::baseobjspace::int_w);
+    let w = roots.get(base);
+    let dklen = if w.is_null() { None } else { Some(w) };
+    drop(roots);
+    let iterations = iterations?;
     let iterations = usize::try_from(iterations)
         .ok()
         .filter(|&value| value > 0)
@@ -836,9 +841,23 @@ fn scrypt_kdf(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyE
     };
     let n = pyre_object::with_roots!(p_obj, r_obj => index(n_obj))?;
     let r = pyre_object::with_roots!(p_obj => index(r_obj))?;
-    let p = index(p_obj)?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let p = index(p_obj);
+    let w = roots.get(base);
+    let mut kwargs = if w.is_null() { None } else { Some(w) };
+    drop(roots);
+    let p = p?;
     let maxmem = match pyre_interpreter::builtins::kwarg_get(kwargs, "maxmem") {
-        Some(obj) => index(obj)?,
+        Some(obj) => {
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+            let maxmem = index(obj);
+            let w = roots.get(base);
+            kwargs = if w.is_null() { None } else { Some(w) };
+            drop(roots);
+            maxmem?
+        }
         None => 0,
     };
     let dklen = match pyre_interpreter::builtins::kwarg_get(kwargs, "dklen") {
@@ -943,9 +962,8 @@ fn blake2_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyE
         let _ = gc_roots::pin_root(arg);
     }
     let arg = |index| gc_roots::shadow_stack_get(base + index);
-    let name_obj = arg(0);
-    check_digest_name(name_obj)?;
-    let requested = unsafe { w_str_get_wtf8(name_obj) };
+    check_digest_name(arg(0))?;
+    let requested = unsafe { w_str_get_wtf8(arg(0)) };
     let name = match requested.as_bytes() {
         b"blake2b" => "blake2b",
         b"blake2s" => "blake2s",
