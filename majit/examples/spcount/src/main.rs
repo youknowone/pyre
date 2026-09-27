@@ -33,8 +33,12 @@ const TOUCH: u8 = 30; // residual: side-effecting, result-neutral stack touch
 static TOUCH_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Side-effecting residual, `@dont_look_inside` — the JIT does not trace into
-/// it; it emits a residual CALL. `#[dont_look_inside]` is non-elidable and may
-/// raise, so the optimizer keeps the call. It is result-neutral (its only
+/// it; it emits a residual CALL. It is non-elidable, so the optimizer keeps the
+/// call. `calls` declares it `residual_void_cannot_raise`: its body raises
+/// nothing and writes no GC object, which is the effect info
+/// `effectinfo.py effectinfo_from_writeanalyze` computes for it. Left
+/// undeclared, a macro residual is `EF_RANDOM_EFFECTS` and forces the
+/// virtualizable stack around every call. It is result-neutral (its only
 /// observable effect is the counted call), so the computed sum is independent
 /// of how many times `touch` runs and the call count alone is the
 /// double-execution detector. The argument is the scalar `stackpos` — a
@@ -62,6 +66,7 @@ struct StackState {
     state = StackState,
     env = Bytecode,
     auto_calls = true,
+    calls = { touch => residual_void_cannot_raise },
     greens = [pc, program],
     state_fields = {
         stackpos: int,
@@ -477,10 +482,13 @@ mod tests {
             shape.why_not().unwrap_or("closes a loop")
         );
 
+        // 15 = preamble and body of `touch` as a cannot-raise residual: no
+        // `GUARD_NO_EXCEPTION` follows either `CALL_N`, and no virtualizable
+        // write-back surrounds it.
         assert_eq!(
-            ops_after, 17,
+            ops_after, 15,
             "compiled loop body is {ops_after} ops across {compiles} compile(s), \
-             not the pinned 17 — a value of 1 means the body is a bare \
+             not the pinned 15 — a value of 1 means the body is a bare \
              `Finish()`, i.e. a dispatch that lowered nothing at all"
         );
 
