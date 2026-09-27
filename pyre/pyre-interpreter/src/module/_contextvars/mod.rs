@@ -543,16 +543,17 @@ pyre_interpreter::py_module! {
         },
     },
     extra_init: |ns| {
-        let context_var = pyre_interpreter::module_ns_get(ns, "ContextVar")
+        let mut ns = ns;
+        let mut context_var = pyre_interpreter::module_ns_get(ns, "ContextVar")
             .expect("_contextvars.ContextVar must be installed first");
-        pyre_interpreter::importing::appleveldef_install_seeded(
+        pyre_object::with_roots!(context_var, ns => pyre_interpreter::importing::appleveldef_install_seeded(
             ns,
             include_str!("_contextvars_app.py"),
             "_contextvars_app.py",
             "_contextvars",
             &["Context"],
             &[("ContextVar", context_var)],
-        )?;
+        ))?;
         let context = pyre_interpreter::module_ns_get(ns, "Context")
             .expect("_contextvars.Context must be installed by appleveldefs");
         // [3.14-spec] PyPy keeps Context as the ordinary app-level class in

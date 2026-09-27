@@ -471,18 +471,20 @@ fn pointer_set_type(args: &[PyObjectRef]) -> PyResult {
             "set_type() requires a ctypes type",
         ));
     }
-    let pointer_cls = args[0];
-    let proto = args[1];
+    let mut pointer_cls = args[0];
+    let mut proto = args[1];
     let mut data = StgInfoData::new(
         host_ctypes::pointer_size(),
         host_ctypes::simple_type_align("P").unwrap_or(host_ctypes::pointer_size()),
         ParamFunc::Pointer,
     );
-    data.element_size = stginfo::field_size_of(proto).unwrap_or(0);
+    data.element_size =
+        pyre_object::with_roots!(pointer_cls, proto => stginfo::field_size_of(proto)).unwrap_or(0);
     data.length = 1;
     data.proto = Some(proto);
     data.flags |= stginfo::TYPEFLAG_ISPOINTER;
-    stginfo::stginfo_set(pointer_cls, stginfo::stginfo_new(data));
+    let info = pyre_object::with_roots!(pointer_cls, proto => stginfo::stginfo_new(data));
+    stginfo::stginfo_set(pointer_cls, info);
     set_type_attr(pointer_cls, "_type_", proto);
     if let Some(info) = stginfo::stginfo_of(proto) {
         stginfo::stginfo_set_pointer_type(info, pointer_cls);
@@ -548,7 +550,7 @@ fn cfuncptrtype_init(args: &[PyObjectRef]) -> PyResult {
 /// off the class where it was set, so the carrier is here for the questions
 /// every other ctypes type answers out of one: how wide a field of this type
 /// is, and what a `POINTER` to it or an array of it is built over.
-fn funcptr_init_stginfo(cls: PyObjectRef) -> PyResult {
+fn funcptr_init_stginfo(mut cls: PyObjectRef) -> PyResult {
     let psize = host_ctypes::pointer_size();
     // `paramfunc` names the shape a carrier is read as, and a function pointer
     // is none of the five this build reads -- an argument of one is settled by
@@ -557,7 +559,8 @@ fn funcptr_init_stginfo(cls: PyObjectRef) -> PyResult {
     data.length = 1;
     data.flags |= stginfo::TYPEFLAG_ISPOINTER;
     data.format = Some("X{}".to_string());
-    stginfo::stginfo_set(cls, stginfo::stginfo_new(data));
+    let info = pyre_object::with_roots!(cls => stginfo::stginfo_new(data));
+    stginfo::stginfo_set(cls, info);
     Ok(pyre_object::w_none())
 }
 
@@ -566,7 +569,7 @@ fn cuniontype_init(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// `PyCSimpleType` layout: validate `_type_` and build a simple `StgInfo`.
-fn simple_init_stginfo(cls: PyObjectRef) -> PyResult {
+fn simple_init_stginfo(mut cls: PyObjectRef) -> PyResult {
     // No `_type_` at all: `_SimpleCData` itself and abstract intermediates.
     let Some(declared) = cdata::declared_type_str(cls) else {
         return Ok(pyre_object::w_none());
@@ -585,7 +588,8 @@ fn simple_init_stginfo(cls: PyObjectRef) -> PyResult {
     if host_ctypes::simple_type_is_pointer(&tc) {
         data.flags |= stginfo::TYPEFLAG_ISPOINTER;
     }
-    stginfo::stginfo_set(cls, stginfo::stginfo_new(data));
+    let info = pyre_object::with_roots!(cls => stginfo::stginfo_new(data));
+    stginfo::stginfo_set(cls, info);
 
     let endian_capable = matches!(
         tc.as_str(),
@@ -715,8 +719,8 @@ fn anonymous_names(cls: PyObjectRef) -> Result<Vec<String>, pyre_interpreter::Py
 /// Anonymous carrier fields are skipped while their contents are recursively
 /// promoted, exactly as `PyCStructUnionType_update_stginfo` does.
 fn promote_anonymous_fields(
-    cls: PyObjectRef,
-    proto: PyObjectRef,
+    mut cls: PyObjectRef,
+    mut proto: PyObjectRef,
     base_offset: usize,
 ) -> Result<(), pyre_interpreter::PyError> {
     let anonymous = anonymous_names(proto)?;
@@ -724,26 +728,29 @@ fn promote_anonymous_fields(
         .ok_or_else(|| {
             pyre_interpreter::PyError::attribute_error("anonymous field has no _fields_")
         })?;
-    for entry in field_entries(fields)? {
+    for entry in pyre_object::with_roots!(cls, proto => field_entries(fields))? {
         let name = entry.name;
-        let child_proto = entry.ty;
-        let child = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(proto, &name) }
+        let mut child_proto = entry.ty;
+        let mut child = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(proto, &name) }
             .ok_or_else(|| {
                 pyre_interpreter::PyError::attribute_error(format!(
                     "type has no attribute '{name}'"
                 ))
             })?;
-        let offset = base_offset + cf_usize(child, "offset");
+        let offset = base_offset
+            + pyre_object::with_roots!(child, child_proto, cls, proto => cf_usize(child, "offset"));
         if anonymous.iter().any(|anon| anon == &name) {
-            promote_anonymous_fields(cls, child_proto, offset)?;
+            pyre_object::with_roots!(cls, proto => promote_anonymous_fields(cls, child_proto, offset))?;
         } else {
-            let promoted = cfield_new(
+            let byte_size = pyre_object::with_roots!(child, child_proto, cls, proto => cf_usize(child, "byte_size"));
+            let index = pyre_object::with_roots!(child, child_proto, cls, proto => cf_usize(child, "index"));
+            let promoted = pyre_object::with_roots!(child, cls, proto => cfield_new(
                 &name,
                 child_proto,
                 offset,
-                cf_usize(child, "byte_size"),
-                cf_usize(child, "index"),
-            );
+                byte_size,
+                index,
+            ));
             // The promoted field's `dict` moves and each copied entry
             // allocates the key string, so the word is read back out of a
             // root slot on every iteration.  `promoted` does not move but is
@@ -781,7 +788,7 @@ fn field_entries(fields: PyObjectRef) -> Result<Vec<FieldEntry>, pyre_interprete
         pyre_interpreter::PyError::type_error("_fields_ must be a sequence of 2-tuples")
     })?;
     let mut out = Vec::with_capacity(items.len());
-    for it in items {
+    for mut it in items {
         if !unsafe { pyre_object::is_tuple(it) } {
             return Err(pyre_interpreter::PyError::type_error(
                 "_fields_ entries must be tuples",
@@ -799,7 +806,7 @@ fn field_entries(fields: PyObjectRef) -> Result<Vec<FieldEntry>, pyre_interprete
             ));
         }
         let name = unsafe { pyre_object::w_tuple_getitem(it, 0) }.unwrap_or(pyre_object::PY_NULL);
-        let ty = unsafe { pyre_object::w_tuple_getitem(it, 1) }.unwrap_or(pyre_object::PY_NULL);
+        let mut ty = unsafe { pyre_object::w_tuple_getitem(it, 1) }.unwrap_or(pyre_object::PY_NULL);
         if name.is_null() || !unsafe { pyre_object::is_str(name) } {
             return Err(pyre_interpreter::PyError::type_error(
                 "field name must be a string",
@@ -810,9 +817,11 @@ fn field_entries(fields: PyObjectRef) -> Result<Vec<FieldEntry>, pyre_interprete
                 "field type must be a ctypes type",
             ));
         }
-        let name = pyre_interpreter::baseobjspace::str_utf8_w(name)?.to_string();
+        let name =
+            pyre_object::with_roots!(it, ty => pyre_interpreter::baseobjspace::str_utf8_w(name))?
+                .to_string();
         let bits = if n == 3 {
-            let value =
+            let mut value =
                 unsafe { pyre_object::w_tuple_getitem(it, 2) }.unwrap_or(pyre_object::PY_NULL);
             if value.is_null()
                 || !unsafe { pyre_object::is_int(value) || pyre_object::is_long(value) }
@@ -831,8 +840,11 @@ fn field_entries(fields: PyObjectRef) -> Result<Vec<FieldEntry>, pyre_interprete
                     type_name(ty),
                 )));
             }
-            let size = stginfo::field_size_of(ty).unwrap_or(0);
-            let width = pyre_interpreter::baseobjspace::int_w(value).unwrap_or(-1);
+            let size =
+                pyre_object::with_roots!(ty, value => stginfo::field_size_of(ty)).unwrap_or(0);
+            let width =
+                pyre_object::with_roots!(ty => pyre_interpreter::baseobjspace::int_w(value))
+                    .unwrap_or(-1);
             if width <= 0 || width as usize > size.saturating_mul(8) {
                 return Err(pyre_interpreter::PyError::value_error(format!(
                     "number of bits invalid for bit field '{name}'",
@@ -869,20 +881,21 @@ fn seq_items(obj: PyObjectRef) -> Option<Vec<PyObjectRef>> {
 
 /// Mark a field type's `StgInfo` FINAL (creating a minimal one if absent), so
 /// it cannot later gain `_fields_`.
-fn mark_type_final(ty: PyObjectRef, size: usize, align: usize) {
+fn mark_type_final(mut ty: PyObjectRef, size: usize, align: usize) {
     match stginfo::stginfo_of(ty) {
         Some(info) => stginfo::stginfo_mark_final(info),
         None => {
             let mut data = StgInfoData::new(size, align, ParamFunc::Simple);
             data.flags |= stginfo::DICTFLAG_FINAL;
-            stginfo::stginfo_set(ty, stginfo::stginfo_new(data));
+            let info = pyre_object::with_roots!(ty => stginfo::stginfo_new(data));
+            stginfo::stginfo_set(ty, info);
         }
     }
 }
 
 /// Compute the layout for a struct (`is_union=false`) or union, installing the
 /// `CField` descriptors and the class `StgInfo`.  Port of `process_fields`.
-fn struct_union_init_stginfo(cls: PyObjectRef, is_union: bool) -> PyResult {
+fn struct_union_init_stginfo(mut cls: PyObjectRef, is_union: bool) -> PyResult {
     // `_fields_` directly in the new class dict → process it; else clone the
     // first base's StgInfo (or a default).
     let own_fields = pyre_interpreter::type_dict_lookup(cls, "_fields_")
@@ -896,21 +909,21 @@ fn struct_union_init_stginfo(cls: PyObjectRef, is_union: bool) -> PyResult {
                 ParamFunc::Struct
             };
             match first_base_stginfo(cls) {
-                Some(base_info) => {
-                    let mut data = StgInfoData::new(
-                        stginfo::stginfo_size(base_info),
-                        stginfo::stginfo_align(base_info),
-                        paramfunc,
-                    );
-                    data.length = stginfo::stginfo_length(base_info);
+                Some(mut base_info) => {
+                    let size = pyre_object::with_roots!(base_info, cls => stginfo::stginfo_size(base_info));
+                    let align = pyre_object::with_roots!(base_info, cls => stginfo::stginfo_align(base_info));
+                    let mut data = StgInfoData::new(size, align, paramfunc);
+                    data.length = pyre_object::with_roots!(base_info, cls => stginfo::stginfo_length(base_info));
                     // Cleared FINAL / pointer_type on the clone; mark base FINAL.
-                    stginfo::stginfo_set(cls, stginfo::stginfo_new(data));
+                    let info =
+                        pyre_object::with_roots!(base_info, cls => stginfo::stginfo_new(data));
+                    stginfo::stginfo_set(cls, info);
                     stginfo::stginfo_mark_final(base_info);
                 }
-                None => stginfo::stginfo_set(
-                    cls,
-                    stginfo::stginfo_new(StgInfoData::new(0, 1, paramfunc)),
-                ),
+                None => {
+                    let info = pyre_object::with_roots!(cls => stginfo::stginfo_new(StgInfoData::new(0, 1, paramfunc)));
+                    stginfo::stginfo_set(cls, info)
+                }
             }
             Ok(pyre_object::w_none())
         }
@@ -1201,14 +1214,14 @@ fn no_storage_info(cls: PyObjectRef) -> pyre_interpreter::PyError {
 }
 
 fn pointer_type_get(args: &[PyObjectRef]) -> PyResult {
-    let cls = args[1];
+    let mut cls = args[1];
     // `ctype_get_pointer_type` splits the two absences: a class with no
     // storage info at all is the `TypeError` above, and one whose
     // `pointer_type` is unset names itself with `%R`.
     let Some(info) = stginfo::stginfo_of(cls) else {
         return Err(no_storage_info(cls));
     };
-    if let Some(pt) = stginfo::stginfo_pointer_type(info) {
+    if let Some(pt) = pyre_object::with_roots!(cls => stginfo::stginfo_pointer_type(info)) {
         return Ok(pt);
     }
     let rendered = unsafe { pyre_interpreter::display::py_repr_wtf8(cls) }?;
@@ -1253,19 +1266,20 @@ fn fields_get(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn fields_set(args: &[PyObjectRef]) -> PyResult {
-    let cls = args[1];
-    let value = args[2];
-    let Some(info) = stginfo::stginfo_of(cls) else {
+    let mut cls = args[1];
+    let mut value = args[2];
+    let Some(mut info) = stginfo::stginfo_of(cls) else {
         return Err(pyre_interpreter::PyError::type_error(
             "ctypes state is not initialized",
         ));
     };
-    if stginfo::stginfo_is_final(info) {
+    if pyre_object::with_roots!(cls, info, value => stginfo::stginfo_is_final(info)) {
         return Err(pyre_interpreter::PyError::attribute_error(
             "_fields_ is final",
         ));
     }
-    let is_union = stginfo::stginfo_paramfunc(info) == ParamFunc::Union;
+    let is_union = pyre_object::with_roots!(cls, value => stginfo::stginfo_paramfunc(info))
+        == ParamFunc::Union;
     process_fields(cls, value, is_union)
 }
 
@@ -1361,9 +1375,9 @@ fn native_uint_to_bytes(value: u64, size: usize) -> Vec<u8> {
 
 /// The storage kind of a field's `proto`.  A type with no `StgInfo` of its own
 /// is simple when it names a `_type_` code, and nothing otherwise.
-fn proto_kind(proto: PyObjectRef) -> ParamFunc {
+fn proto_kind(mut proto: PyObjectRef) -> ParamFunc {
     if let Some(info) = stginfo::stginfo_of(proto) {
-        let pf = stginfo::stginfo_paramfunc(info);
+        let pf = pyre_object::with_roots!(proto => stginfo::stginfo_paramfunc(info));
         if pf != ParamFunc::Other {
             return pf;
         }
@@ -1385,8 +1399,8 @@ fn field_needs_swap(obj: PyObjectRef, proto: PyObjectRef, size: usize) -> bool {
 }
 
 fn cfield_get(args: &[PyObjectRef]) -> PyResult {
-    let cfield = args[0];
-    let obj = args.get(1).copied().unwrap_or_else(pyre_object::w_none);
+    let mut cfield = args[0];
+    let mut obj = args.get(1).copied().unwrap_or_else(pyre_object::w_none);
     // Accessed on the class (`Point.x`) → return the descriptor itself.
     if obj.is_null() || unsafe { pyre_object::is_none(obj) } {
         return Ok(cfield);
@@ -1396,16 +1410,16 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
             "not a ctypes instance",
         ));
     }
-    let proto = cf_obj(cfield, "proto");
-    let offset = cf_usize(cfield, "offset");
-    let size = cf_usize(cfield, "byte_size");
-    let index = cf_usize(cfield, "index");
+    let mut proto = pyre_object::with_roots!(cfield, obj => cf_obj(cfield, "proto"));
+    let offset = pyre_object::with_roots!(cfield, obj, proto => cf_usize(cfield, "offset"));
+    let size = pyre_object::with_roots!(cfield, obj, proto => cf_usize(cfield, "byte_size"));
+    let index = pyre_object::with_roots!(cfield, obj, proto => cf_usize(cfield, "index"));
 
-    match proto_kind(proto) {
+    match pyre_object::with_roots!(cfield, obj, proto => proto_kind(proto)) {
         ParamFunc::Simple => {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| pyre_interpreter::PyError::type_error("field has no '_type_'"))?;
-            let all = cdata::cdata_bytes(obj)
+            let all = pyre_object::with_roots!(cfield, obj, proto => cdata::cdata_bytes(obj))
                 .ok_or_else(|| pyre_interpreter::PyError::type_error("instance has no buffer"))?;
             let start = offset.min(all.len());
             let end = (offset + size).min(all.len());
@@ -1413,8 +1427,8 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
             if field_needs_swap(obj, proto, size) {
                 field_bytes.reverse();
             }
-            if cf_bool(cfield, "is_bitfield") {
-                let bits = cf_usize(cfield, "bit_size");
+            if pyre_object::with_roots!(cfield => cf_bool(cfield, "is_bitfield")) {
+                let bits = pyre_object::with_roots!(cfield => cf_usize(cfield, "bit_size"));
                 let shift = cf_usize(cfield, "bit_offset");
                 let mask = if bits >= 64 {
                     u64::MAX
@@ -1436,7 +1450,7 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
         }
         ParamFunc::Array => {
             let element = stginfo::stginfo_of(proto).and_then(stginfo::stginfo_proto);
-            let all = cdata::cdata_bytes(obj)
+            let all = pyre_object::with_roots!(obj, proto => cdata::cdata_bytes(obj))
                 .ok_or_else(|| pyre_interpreter::PyError::type_error("instance has no buffer"))?;
             let start = offset.min(all.len());
             let end = (offset + size).min(all.len());
@@ -1462,33 +1476,36 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn cfield_set(args: &[PyObjectRef]) -> PyResult {
-    let cfield = args[0];
-    let obj = args[1];
-    let value = args[2];
+    let mut cfield = args[0];
+    let mut obj = args[1];
+    let mut value = args[2];
     if !cdata::is_cdata_instance(obj) {
         return Err(pyre_interpreter::PyError::type_error(
             "not a ctypes instance",
         ));
     }
-    let proto = cf_obj(cfield, "proto");
-    let offset = cf_usize(cfield, "offset");
-    let size = cf_usize(cfield, "byte_size");
-    let index = cf_usize(cfield, "index");
+    let mut proto = pyre_object::with_roots!(cfield, obj, value => cf_obj(cfield, "proto"));
+    let offset = pyre_object::with_roots!(cfield, obj, proto, value => cf_usize(cfield, "offset"));
+    let size = pyre_object::with_roots!(cfield, obj, proto, value => cf_usize(cfield, "byte_size"));
+    let index = pyre_object::with_roots!(cfield, obj, proto, value => cf_usize(cfield, "index"));
 
-    match proto_kind(proto) {
+    match pyre_object::with_roots!(cfield, obj, proto, value => proto_kind(proto)) {
         ParamFunc::Simple => {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| pyre_interpreter::PyError::type_error("field has no '_type_'"))?;
-            if cf_bool(cfield, "is_bitfield") {
-                let bits = cf_usize(cfield, "bit_size");
-                let shift = cf_usize(cfield, "bit_offset");
+            if pyre_object::with_roots!(cfield, obj, proto, value => cf_bool(cfield, "is_bitfield"))
+            {
+                let bits = pyre_object::with_roots!(cfield, obj, proto, value => cf_usize(cfield, "bit_size"));
+                let shift =
+                    pyre_object::with_roots!(obj, proto, value => cf_usize(cfield, "bit_offset"));
                 let mask = if bits >= 64 {
                     u64::MAX
                 } else {
                     (1u64 << bits) - 1
                 };
-                let integer = pyre_interpreter::baseobjspace::int_w(value)? as u64;
-                let mut storage = cdata::cdata_bytes(obj)
+                let integer = pyre_object::with_roots!(obj, proto => pyre_interpreter::baseobjspace::int_w(value))?
+                    as u64;
+                let mut storage = pyre_object::with_roots!(obj, proto => cdata::cdata_bytes(obj))
                     .unwrap_or(&[])
                     .get(offset..offset.saturating_add(size))
                     .unwrap_or(&[])
@@ -1540,9 +1557,11 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                 false
             };
             let bytes = if direct {
-                cdata::cdata_bytes(value).unwrap_or(&[]).to_vec()
+                pyre_object::with_roots!(obj, value => cdata::cdata_bytes(value))
+                    .unwrap_or(&[])
+                    .to_vec()
             } else if array_decay {
-                let addr = cdata::cdata_addr(value)
+                let addr = pyre_object::with_roots!(obj, value => cdata::cdata_addr(value))
                     .ok_or_else(|| pyre_interpreter::PyError::type_error("incompatible types"))?;
                 host_ctypes::simple_storage_value_to_bytes_endian(
                     "P",
@@ -1552,11 +1571,11 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
             } else {
                 return Err(pyre_interpreter::PyError::type_error("incompatible types"));
             };
-            cdata::cdata_write(obj, offset, &bytes[..size.min(bytes.len())]);
+            pyre_object::with_roots!(obj, value => cdata::cdata_write(obj, offset, &bytes[..size.min(bytes.len())]));
             let keep = if array_decay {
                 value
             } else {
-                cdata::objects_for_keep(value)
+                pyre_object::with_roots!(obj => cdata::objects_for_keep(value))
             };
             cdata::keep_ref(obj, &index.to_string(), keep);
             Ok(pyre_object::w_none())
@@ -1589,7 +1608,7 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                             "unicode string expected",
                         ));
                     }
-                    let mut field = cdata::cdata_bytes(obj)
+                    let mut field = pyre_object::with_roots!(obj, value => cdata::cdata_bytes(obj))
                         .unwrap_or(&[])
                         .get(offset..offset.saturating_add(size))
                         .unwrap_or(&[])
@@ -1603,25 +1622,25 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                     Ok(pyre_object::w_none())
                 }
                 _ => {
-                    let array_value = if unsafe {
+                    let mut array_value = if unsafe {
                         pyre_interpreter::baseobjspace::isinstance_w(value, proto)
                     } {
                         value
                     } else if unsafe { pyre_object::is_tuple(value) } {
                         let values = seq_items(value).unwrap_or_default();
-                        pyre_interpreter::call::type_call_instantiate(proto, &values).map_err(
+                        pyre_object::with_roots!(obj => pyre_interpreter::call::type_call_instantiate(proto, &values)).map_err(
                             |error| pyre_interpreter::PyError::runtime_error(error.message_wtf8()),
                         )?
                     } else {
                         return Err(pyre_interpreter::PyError::type_error("incompatible types"));
                     };
-                    let source = cdata::cdata_bytes(array_value).unwrap_or(&[]).to_vec();
-                    cdata::cdata_write(obj, offset, &source[..source.len().min(size)]);
-                    cdata::keep_ref(
-                        obj,
-                        &index.to_string(),
-                        cdata::objects_for_keep(array_value),
-                    );
+                    let source = pyre_object::with_roots!(array_value, obj => cdata::cdata_bytes(array_value))
+                        .unwrap_or(&[])
+                        .to_vec();
+                    pyre_object::with_roots!(array_value, obj => cdata::cdata_write(obj, offset, &source[..source.len().min(size)]));
+                    let keep =
+                        pyre_object::with_roots!(obj => cdata::objects_for_keep(array_value));
+                    cdata::keep_ref(obj, &index.to_string(), keep);
                     Ok(pyre_object::w_none())
                 }
             }
@@ -1633,10 +1652,13 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
             }
             // Snapshot the source: `s.f = s.f` aliases the destination buffer,
             // and `cdata_write`'s `copy_from_slice` assumes non-overlap.
-            let src = cdata::cdata_bytes(value).unwrap_or(&[]).to_vec();
+            let src = pyre_object::with_roots!(obj, value => cdata::cdata_bytes(value))
+                .unwrap_or(&[])
+                .to_vec();
             let n = size.min(src.len());
-            cdata::cdata_write(obj, offset, &src[..n]);
-            cdata::keep_ref(obj, &index.to_string(), cdata::objects_for_keep(value));
+            pyre_object::with_roots!(obj, value => cdata::cdata_write(obj, offset, &src[..n]));
+            let keep = pyre_object::with_roots!(obj => cdata::objects_for_keep(value));
+            cdata::keep_ref(obj, &index.to_string(), keep);
             Ok(pyre_object::w_none())
         }
         _ => Err(pyre_interpreter::PyError::type_error(
@@ -1646,17 +1668,18 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn cfield_repr(args: &[PyObjectRef]) -> PyResult {
-    let cfield = args[0];
-    let proto = cf_obj(cfield, "proto");
+    let mut cfield = args[0];
+    let proto = pyre_object::with_roots!(cfield => cf_obj(cfield, "proto"));
     let tyname = if !proto.is_null() && unsafe { pyre_object::is_type(proto) } {
         unsafe { pyre_object::typeobject::w_type_get_name(proto) }.to_string()
     } else {
         "?".to_string()
     };
+    let offset = pyre_object::with_roots!(cfield => cf_usize(cfield, "offset"));
     let s = format!(
         "<Field type={}, ofs={}, size={}>",
         tyname,
-        cf_usize(cfield, "offset"),
+        offset,
         cf_usize(cfield, "size"),
     );
     Ok(pyre_object::w_str_new_managed(&s))
@@ -1680,9 +1703,9 @@ fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
             "CField is not intended to be used directly",
         ));
     }
-    let name_obj =
+    let mut name_obj =
         get("name", 1)?.ok_or_else(|| pyre_interpreter::PyError::type_error("missing name"))?;
-    let proto =
+    let mut proto =
         get("type", 2)?.ok_or_else(|| pyre_interpreter::PyError::type_error("missing type"))?;
     let byte_size = get("byte_size", 3)?
         .map(pyre_interpreter::baseobjspace::int_w)
@@ -1701,14 +1724,15 @@ fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
             "invalid CField arguments",
         ));
     }
-    let expected = stginfo::field_size_of(proto)
+    let expected = pyre_object::with_roots!(name_obj, proto => stginfo::field_size_of(proto))
         .ok_or_else(|| pyre_interpreter::PyError::type_error("type has no size"))?;
     if byte_size < 0 || byte_size as usize != expected {
         return Err(pyre_interpreter::PyError::value_error(
             "byte_size does not match type size",
         ));
     }
-    let field_name = pyre_interpreter::baseobjspace::str_utf8_w(name_obj)?;
+    let field_name =
+        pyre_object::with_roots!(proto => pyre_interpreter::baseobjspace::str_utf8_w(name_obj))?;
     let field = cfield_new(
         field_name,
         proto,
@@ -1762,16 +1786,16 @@ fn structure_new(args: &[PyObjectRef]) -> PyResult {
             "Structure.__new__ requires a type",
         ));
     }
-    let cls = args[0];
+    let mut cls = args[0];
     if unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_abstract_") }.is_some() {
         return Err(pyre_interpreter::PyError::type_error("abstract class"));
     }
-    let info = stginfo::stginfo_of(cls)
+    let mut info = stginfo::stginfo_of(cls)
         .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
-    let size = stginfo::stginfo_size(info);
-    stginfo::stginfo_mark_final(info);
-    let obj = pyre_object::w_instance_new(cls);
-    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
+    let size = pyre_object::with_roots!(cls, info => stginfo::stginfo_size(info));
+    pyre_object::with_roots!(cls => stginfo::stginfo_mark_final(info));
+    let mut obj = pyre_object::w_instance_new(cls);
+    let d = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::getdict_native(obj));
     if d.is_null() {
         return Err(pyre_interpreter::PyError::type_error(
             "ctypes instance has no dict",
@@ -1918,7 +1942,7 @@ fn carraytype_init(args: &[PyObjectRef]) -> PyResult {
 
 /// `PyCArrayType` layout: resolve `_length_` + `_type_` and build the array
 /// `StgInfo` (`size = element_size * length`, align = element align).
-fn array_init_stginfo(cls: PyObjectRef) -> PyResult {
+fn array_init_stginfo(mut cls: PyObjectRef) -> PyResult {
     let length = match own_dict_get(cls, "_length_") {
         Some(v) => {
             if !unsafe { pyre_object::is_int(v) || pyre_object::is_long(v) } {
@@ -1945,7 +1969,7 @@ fn array_init_stginfo(cls: PyObjectRef) -> PyResult {
             n as usize
         }
         None => match first_base_stginfo(cls) {
-            Some(bi) => stginfo::stginfo_length(bi),
+            Some(bi) => pyre_object::with_roots!(cls => stginfo::stginfo_length(bi)),
             None => {
                 return Err(pyre_interpreter::PyError::attribute_error(
                     "class must define a '_length_' attribute",
@@ -1954,7 +1978,7 @@ fn array_init_stginfo(cls: PyObjectRef) -> PyResult {
         },
     };
 
-    let elem = match own_dict_get(cls, "_type_") {
+    let mut elem = match own_dict_get(cls, "_type_") {
         Some(t) => {
             if !unsafe { pyre_object::is_type(t) } {
                 return Err(pyre_interpreter::PyError::type_error(
@@ -1973,9 +1997,11 @@ fn array_init_stginfo(cls: PyObjectRef) -> PyResult {
         },
     };
 
-    let elem_size = stginfo::field_size_of(elem)
+    let elem_size = pyre_object::with_roots!(cls, elem => stginfo::field_size_of(elem))
         .ok_or_else(|| pyre_interpreter::PyError::type_error("_type_ must have storage info"))?;
-    let elem_align = stginfo::field_align_of(elem).unwrap_or(1).max(1);
+    let elem_align = pyre_object::with_roots!(cls, elem => stginfo::field_align_of(elem))
+        .unwrap_or(1)
+        .max(1);
     if elem_size != 0 && (length > usize::MAX / elem_size || elem_size * length > i64::MAX as usize)
     {
         return Err(pyre_interpreter::PyError::overflow_error("array too large"));
@@ -1986,12 +2012,14 @@ fn array_init_stginfo(cls: PyObjectRef) -> PyResult {
     data.element_size = elem_size;
     data.proto = Some(elem);
     if let Some(ei) = stginfo::stginfo_of(elem)
-        && stginfo::stginfo_flags(ei) & (stginfo::TYPEFLAG_ISPOINTER | stginfo::TYPEFLAG_HASPOINTER)
+        && pyre_object::with_roots!(cls, elem => stginfo::stginfo_flags(ei))
+            & (stginfo::TYPEFLAG_ISPOINTER | stginfo::TYPEFLAG_HASPOINTER)
             != 0
     {
         data.flags |= stginfo::TYPEFLAG_HASPOINTER;
     }
-    stginfo::stginfo_set(cls, stginfo::stginfo_new(data));
+    let info = pyre_object::with_roots!(cls, elem => stginfo::stginfo_new(data));
+    stginfo::stginfo_set(cls, info);
 
     set_type_attr(cls, "_type_", elem);
     set_type_attr(cls, "_length_", pyre_object::w_int_new(length as i64));
@@ -2052,13 +2080,15 @@ struct ArrayMeta {
 
 fn array_meta(obj: PyObjectRef) -> Result<ArrayMeta, pyre_interpreter::PyError> {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    let info = stginfo::stginfo_of(cls)
+    let mut info = stginfo::stginfo_of(cls)
         .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
-    let proto = stginfo::stginfo_proto(info)
+    let mut proto = pyre_object::with_roots!(info => stginfo::stginfo_proto(info))
         .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
+    let length = pyre_object::with_roots!(info, proto => stginfo::stginfo_length(info));
+    let element_size = pyre_object::with_roots!(proto => stginfo::stginfo_element_size(info));
     Ok(ArrayMeta {
-        length: stginfo::stginfo_length(info),
-        element_size: stginfo::stginfo_element_size(info),
+        length,
+        element_size,
         proto,
     })
 }
@@ -2069,13 +2099,13 @@ fn array_new(args: &[PyObjectRef]) -> PyResult {
             "Array.__new__ requires a type",
         ));
     }
-    let cls = args[0];
+    let mut cls = args[0];
     let info = stginfo::stginfo_of(cls)
         .filter(|&i| stginfo::stginfo_proto(i).is_some())
         .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
-    let size = stginfo::stginfo_size(info);
-    let obj = pyre_object::w_instance_new(cls);
-    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
+    let size = pyre_object::with_roots!(cls => stginfo::stginfo_size(info));
+    let mut obj = pyre_object::w_instance_new(cls);
+    let d = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::getdict_native(obj));
     if d.is_null() {
         return Err(pyre_interpreter::PyError::type_error(
             "ctypes instance has no dict",
@@ -2098,16 +2128,16 @@ fn array_init(args: &[PyObjectRef]) -> PyResult {
             "__init__ requires self",
         ));
     }
-    let obj = args[0];
+    let mut obj = args[0];
     let (pos, _kw) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
-    let meta = array_meta(obj)?;
+    let meta = pyre_object::with_roots!(obj => array_meta(obj))?;
     if pos.len() > meta.length {
         return Err(pyre_interpreter::PyError::index_error(
             "too many initializers",
         ));
     }
     for (i, &val) in pos.iter().enumerate() {
-        array_set_index(obj, &meta, i, val)?;
+        pyre_object::with_roots!(obj => array_set_index(obj, &meta, i, val))?;
     }
     Ok(pyre_object::w_none())
 }
@@ -2128,9 +2158,9 @@ fn normalize_index(mut i: i64, length: usize) -> Result<usize, pyre_interpreter:
 }
 
 fn array_getitem(args: &[PyObjectRef]) -> PyResult {
-    let obj = args[0];
-    let key = args[1];
-    let meta = array_meta(obj)?;
+    let mut obj = args[0];
+    let mut key = args[1];
+    let meta = pyre_object::with_roots!(key, obj => array_meta(obj))?;
     if unsafe { pyre_object::is_int(key) } {
         let idx = normalize_index(unsafe { pyre_object::w_int_get_value(key) }, meta.length)?;
         return array_get_index(obj, &meta, idx);
@@ -2143,9 +2173,9 @@ fn array_getitem(args: &[PyObjectRef]) -> PyResult {
     ))
 }
 
-fn array_get_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize) -> PyResult {
+fn array_get_index(mut obj: PyObjectRef, meta: &ArrayMeta, idx: usize) -> PyResult {
     let offset = idx * meta.element_size;
-    match proto_kind(meta.proto) {
+    match pyre_object::with_roots!(obj => proto_kind(meta.proto)) {
         ParamFunc::Simple => {
             let tc = cdata::type_code_of(meta.proto)
                 .ok_or_else(|| pyre_interpreter::PyError::type_error("element has no '_type_'"))?;
@@ -2165,10 +2195,10 @@ fn array_get_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize) -> PyResult {
 }
 
 fn array_setitem(args: &[PyObjectRef]) -> PyResult {
-    let obj = args[0];
-    let key = args[1];
-    let value = args[2];
-    let meta = array_meta(obj)?;
+    let mut obj = args[0];
+    let mut key = args[1];
+    let mut value = args[2];
+    let meta = pyre_object::with_roots!(key, obj, value => array_meta(obj))?;
     if unsafe { pyre_object::is_int(key) } {
         let idx = normalize_index(unsafe { pyre_object::w_int_get_value(key) }, meta.length)?;
         return array_set_index(obj, &meta, idx, value);
@@ -2181,9 +2211,14 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
     ))
 }
 
-fn array_set_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize, value: PyObjectRef) -> PyResult {
+fn array_set_index(
+    mut obj: PyObjectRef,
+    meta: &ArrayMeta,
+    idx: usize,
+    mut value: PyObjectRef,
+) -> PyResult {
     let offset = idx * meta.element_size;
-    match proto_kind(meta.proto) {
+    match pyre_object::with_roots!(obj, value => proto_kind(meta.proto)) {
         ParamFunc::Simple => {
             let tc = cdata::type_code_of(meta.proto)
                 .ok_or_else(|| pyre_interpreter::PyError::type_error("element has no '_type_'"))?;
@@ -2207,10 +2242,13 @@ fn array_set_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize, value: PyObje
             }
             // Snapshot the source: `a[i] = a[i]` aliases the destination
             // buffer, and `cdata_write`'s `copy_from_slice` assumes non-overlap.
-            let src = cdata::cdata_bytes(value).unwrap_or(&[]).to_vec();
+            let src = pyre_object::with_roots!(obj, value => cdata::cdata_bytes(value))
+                .unwrap_or(&[])
+                .to_vec();
             let n = meta.element_size.min(src.len());
-            cdata::cdata_write(obj, offset, &src[..n]);
-            cdata::keep_ref(obj, &idx.to_string(), cdata::objects_for_keep(value));
+            pyre_object::with_roots!(obj, value => cdata::cdata_write(obj, offset, &src[..n]));
+            let keep = pyre_object::with_roots!(obj => cdata::objects_for_keep(value));
+            cdata::keep_ref(obj, &idx.to_string(), keep);
             Ok(pyre_object::w_none())
         }
         _ => Err(pyre_interpreter::PyError::type_error(
@@ -2240,8 +2278,8 @@ fn slice_index_list(
     Ok(out)
 }
 
-fn array_get_slice(obj: PyObjectRef, meta: &ArrayMeta, slice: PyObjectRef) -> PyResult {
-    let idxs = slice_index_list(slice, meta.length)?;
+fn array_get_slice(mut obj: PyObjectRef, meta: &ArrayMeta, slice: PyObjectRef) -> PyResult {
+    let idxs = pyre_object::with_roots!(obj => slice_index_list(slice, meta.length))?;
     // Character arrays slice to bytes/str; other elements slice to a list.
     let tc = cdata::type_code_of(meta.proto);
     if tc.as_deref() == Some("c") {
@@ -2256,7 +2294,7 @@ fn array_get_slice(obj: PyObjectRef, meta: &ArrayMeta, slice: PyObjectRef) -> Py
         let mut value = String::new();
         for i in idxs {
             let offset = i * meta.element_size;
-            let all = cdata::cdata_bytes(obj).unwrap_or(&[]);
+            let all = pyre_object::with_roots!(obj => cdata::cdata_bytes(obj)).unwrap_or(&[]);
             let end = (offset + meta.element_size).min(all.len());
             if let host_ctypes::DecodedValue::String(s) =
                 host_ctypes::decode_type_code("u", &all[offset.min(end)..end])
@@ -2270,18 +2308,18 @@ fn array_get_slice(obj: PyObjectRef, meta: &ArrayMeta, slice: PyObjectRef) -> Py
     // are pinned as they arrive.
     let mut items = pyre_object::gc_roots::RootedItems::new();
     for i in idxs {
-        items.push(array_get_index(obj, meta, i)?);
+        items.push(pyre_object::with_roots!(obj => array_get_index(obj, meta, i))?);
     }
     Ok(pyre_object::w_list_new(items.take()))
 }
 
 fn array_set_slice(
-    obj: PyObjectRef,
+    mut obj: PyObjectRef,
     meta: &ArrayMeta,
     slice: PyObjectRef,
-    value: PyObjectRef,
+    mut value: PyObjectRef,
 ) -> PyResult {
-    let idxs = slice_index_list(slice, meta.length)?;
+    let idxs = pyre_object::with_roots!(obj, value => slice_index_list(slice, meta.length))?;
     // `Array_ass_subscript` reads the right-hand side through
     // `PySequence_Length` and then `PySequence_GetItem` per index, so any
     // sequence will do — an `array.array`, a `range`, a `memoryview`, a class
@@ -2295,7 +2333,9 @@ fn array_set_slice(
     // pyre reads the length and the item through `__len__` / `__getitem__`
     // where upstream uses the sequence-only pair, so a mapping of the matching
     // size reaches the item read rather than that refusal.
-    let other_len = pyre_interpreter::baseobjspace::len_w(value).unwrap_or(-1);
+    let other_len =
+        pyre_object::with_roots!(obj, value => pyre_interpreter::baseobjspace::len_w(value))
+            .unwrap_or(-1);
     if other_len != idxs.len() as i64 {
         return Err(pyre_interpreter::PyError::value_error(
             "Can only assign sequence of same size",
@@ -2373,13 +2413,13 @@ fn char_array_get_value(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn char_array_set_value(args: &[PyObjectRef]) -> PyResult {
-    let obj = args[1];
+    let mut obj = args[1];
     let value = args[2];
     if !unsafe { pyre_object::is_bytes(value) } {
         return Err(pyre_interpreter::PyError::type_error("bytes expected"));
     }
     let src = unsafe { pyre_object::bytesobject::w_bytes_data(value) };
-    let size = cdata::cdata_len(obj).unwrap_or(0);
+    let size = pyre_object::with_roots!(obj => cdata::cdata_len(obj)).unwrap_or(0);
     if src.len() > size {
         return Err(pyre_interpreter::PyError::value_error(
             "byte string too long",
@@ -2401,12 +2441,12 @@ fn char_array_get_raw(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn char_array_set_raw(args: &[PyObjectRef]) -> PyResult {
-    let obj = args[1];
+    let mut obj = args[1];
     let value = args[2];
     let source = pyre_interpreter::typedef::buffer_as_bytes_like(value)?
         .ok_or_else(|| pyre_interpreter::PyError::type_error("bytes-like object expected"))?;
     let src = unsafe { pyre_object::bytesobject::bytes_like_data(source) };
-    let size = cdata::cdata_len(obj).unwrap_or(0);
+    let size = pyre_object::with_roots!(obj => cdata::cdata_len(obj)).unwrap_or(0);
     if src.len() > size {
         return Err(pyre_interpreter::PyError::value_error(
             "byte string too long",
@@ -2444,7 +2484,7 @@ fn wchar_array_get_value(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn wchar_array_set_value(args: &[PyObjectRef]) -> PyResult {
-    let obj = args[1];
+    let mut obj = args[1];
     let value = args[2];
     if !unsafe { pyre_object::is_str(value) } {
         return Err(pyre_interpreter::PyError::type_error(
@@ -2452,10 +2492,12 @@ fn wchar_array_set_value(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let text = unsafe { pyre_object::w_str_get_wtf8(value) };
-    let size = cdata::cdata_len(obj).unwrap_or(0);
+    let size = pyre_object::with_roots!(obj => cdata::cdata_len(obj)).unwrap_or(0);
     // PyCArray_set_value overwrites the characters and one terminator only;
     // bytes after that terminator retain their previous values.
-    let mut bytes = cdata::cdata_bytes(obj).unwrap_or(&[]).to_vec();
+    let mut bytes = pyre_object::with_roots!(obj => cdata::cdata_bytes(obj))
+        .unwrap_or(&[])
+        .to_vec();
     bytes.resize(size, 0);
     host_ctypes::write_wchar_array_value(&mut bytes, text)
         .map_err(|_| pyre_interpreter::PyError::value_error("string too long"))?;
@@ -2475,11 +2517,11 @@ fn cpointertype_init(args: &[PyObjectRef]) -> PyResult {
 
 /// `PyCPointerType` layout: pointer-sized `StgInfo` with `ISPOINTER`, and
 /// memoise the pointer type on the pointed-to type (`POINTER` identity).
-fn pointer_init_stginfo(cls: PyObjectRef) -> PyResult {
+fn pointer_init_stginfo(mut cls: PyObjectRef) -> PyResult {
     let proto = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_type_") }
         .filter(|&t| !t.is_null() && unsafe { pyre_object::is_type(t) });
     if let Some(p) = proto
-        && stginfo::field_size_of(p).is_none()
+        && pyre_object::with_roots!(cls => stginfo::field_size_of(p)).is_none()
     {
         return Err(pyre_interpreter::PyError::type_error(
             "_type_ must have storage info",
@@ -2491,16 +2533,24 @@ fn pointer_init_stginfo(cls: PyObjectRef) -> PyResult {
     data.flags |= stginfo::TYPEFLAG_ISPOINTER;
     data.proto = proto;
     data.format = Some(match proto {
-        Some(p) if stginfo::field_size_of(p).unwrap_or(0) > 0 => {
+        Some(mut p)
+            if pyre_object::with_roots!(cls => stginfo::field_size_of(p)).unwrap_or(0) > 0 =>
+        {
             let shape = {
                 let mut dims = Vec::new();
                 let mut current = p;
-                while let Some(info) = stginfo::stginfo_of(current) {
-                    if stginfo::stginfo_paramfunc(info) != ParamFunc::Array {
+                while let Some(mut info) = stginfo::stginfo_of(current) {
+                    if pyre_object::with_roots!(cls, info, p => stginfo::stginfo_paramfunc(info))
+                        != ParamFunc::Array
+                    {
                         break;
                     }
-                    dims.push(stginfo::stginfo_length(info));
-                    let Some(next) = stginfo::stginfo_proto(info) else {
+                    dims.push(
+                        pyre_object::with_roots!(cls, info, p => stginfo::stginfo_length(info)),
+                    );
+                    let Some(next) =
+                        pyre_object::with_roots!(cls, p => stginfo::stginfo_proto(info))
+                    else {
                         break;
                     };
                     current = next;
@@ -2519,19 +2569,25 @@ fn pointer_init_stginfo(cls: PyObjectRef) -> PyResult {
                         .join(",")
                 )
             };
-            format!("&{prefix}{}", cdata::ctype_pep3118_format(p, None))
+            format!(
+                "&{prefix}{}",
+                pyre_object::with_roots!(cls => cdata::ctype_pep3118_format(p, None))
+            )
         }
         _ => "&B".to_string(),
     });
-    stginfo::stginfo_set(cls, stginfo::stginfo_new(data));
+    let info = pyre_object::with_roots!(cls => stginfo::stginfo_new(data));
+    stginfo::stginfo_set(cls, info);
 
-    if let Some(p) = proto {
+    if let Some(mut p) = proto {
         let pinfo = match stginfo::stginfo_of(p) {
             Some(i) => i,
             None => {
-                let size = stginfo::field_size_of(p).unwrap_or(0);
-                let align = stginfo::field_align_of(p).unwrap_or(1);
-                let info = stginfo::stginfo_new(StgInfoData::new(size, align, ParamFunc::Simple));
+                let size =
+                    pyre_object::with_roots!(cls, p => stginfo::field_size_of(p)).unwrap_or(0);
+                let align =
+                    pyre_object::with_roots!(cls, p => stginfo::field_align_of(p)).unwrap_or(1);
+                let info = pyre_object::with_roots!(cls, p => stginfo::stginfo_new(StgInfoData::new(size, align, ParamFunc::Simple)));
                 stginfo::stginfo_set(p, info);
                 info
             }
@@ -2556,8 +2612,8 @@ fn pointer_new(args: &[PyObjectRef]) -> PyResult {
             "Cannot create instance: has no _type_",
         ));
     }
-    let obj = pyre_object::w_instance_new(cls);
-    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
+    let mut obj = pyre_object::w_instance_new(cls);
+    let d = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::getdict_native(obj));
     if d.is_null() {
         return Err(pyre_interpreter::PyError::type_error(
             "ctypes instance has no dict",
@@ -2592,7 +2648,7 @@ fn pointer_init(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// Store `value`'s buffer address in the pointer and keep `value` alive.
-fn pointer_set_contents(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+fn pointer_set_contents(mut obj: PyObjectRef, mut value: PyObjectRef) -> PyResult {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let proto = stginfo::stginfo_of(cls)
         .and_then(stginfo::stginfo_proto)
@@ -2602,37 +2658,41 @@ fn pointer_set_contents(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
     if !cdata::is_cdata_instance(value)
         || !unsafe { pyre_interpreter::baseobjspace::isinstance_w(value, proto) }
     {
+        let proto_name = pyre_object::with_roots!(value => type_name(proto));
         return Err(pyre_interpreter::PyError::type_error(format!(
             "expected {} instead of {}",
-            type_name(proto),
+            proto_name,
             type_name(unsafe { pyre_object::w_instance_get_type(value) })
         )));
     }
-    let addr = cdata::cdata_addr(value)
+    let addr = pyre_object::with_roots!(obj, value => cdata::cdata_addr(value))
         .ok_or_else(|| pyre_interpreter::PyError::type_error("target has no buffer"))?;
     let bytes = host_ctypes::simple_storage_value_to_bytes_endian(
         "P",
         host_ctypes::SimpleStorageValue::Pointer(addr),
         false,
     );
-    cdata::cdata_write(obj, 0, &bytes);
+    pyre_object::with_roots!(obj, value => cdata::cdata_write(obj, 0, &bytes));
     cdata::keep_ref(obj, "1", value);
     Ok(pyre_object::w_none())
 }
 
 fn contents_get(args: &[PyObjectRef]) -> PyResult {
-    let obj = args[1];
+    let mut obj = args[1];
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    let proto = stginfo::stginfo_of(cls)
+    let mut proto = stginfo::stginfo_of(cls)
         .and_then(stginfo::stginfo_proto)
         .ok_or_else(|| pyre_interpreter::PyError::type_error("has no _type_"))?;
-    let ptr = host_ctypes::read_pointer_from_buffer(cdata::cdata_bytes(obj).unwrap_or(&[]));
+    let ptr = host_ctypes::read_pointer_from_buffer(
+        pyre_object::with_roots!(obj, proto => cdata::cdata_bytes(obj)).unwrap_or(&[]),
+    );
     if ptr == 0 {
         return Err(pyre_interpreter::PyError::value_error(
             "NULL pointer access",
         ));
     }
-    let size = stginfo::field_size_of(proto).unwrap_or_else(host_ctypes::pointer_size);
+    let size = pyre_object::with_roots!(obj, proto => stginfo::field_size_of(proto))
+        .unwrap_or_else(host_ctypes::pointer_size);
     Ok(cdata::make_at_address(proto, ptr, size, obj))
 }
 
@@ -2642,23 +2702,26 @@ fn contents_set(args: &[PyObjectRef]) -> PyResult {
 
 /// `(proto, element_size, ptr_value)` for a pointer instance.
 fn pointer_meta(
-    obj: PyObjectRef,
+    mut obj: PyObjectRef,
 ) -> Result<(PyObjectRef, usize, usize), pyre_interpreter::PyError> {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    let proto = stginfo::stginfo_of(cls)
+    let mut proto = stginfo::stginfo_of(cls)
         .and_then(stginfo::stginfo_proto)
         .ok_or_else(|| pyre_interpreter::PyError::type_error("has no _type_"))?;
-    let element_size = stginfo::field_size_of(proto).unwrap_or_else(host_ctypes::pointer_size);
-    let ptr = host_ctypes::read_pointer_from_buffer(cdata::cdata_bytes(obj).unwrap_or(&[]));
+    let element_size = pyre_object::with_roots!(obj, proto => stginfo::field_size_of(proto))
+        .unwrap_or_else(host_ctypes::pointer_size);
+    let ptr = host_ctypes::read_pointer_from_buffer(
+        pyre_object::with_roots!(proto => cdata::cdata_bytes(obj)).unwrap_or(&[]),
+    );
     Ok((proto, element_size, ptr))
 }
 
 fn pointer_getitem(args: &[PyObjectRef]) -> PyResult {
-    let obj = args[0];
+    let mut obj = args[0];
     let key = args[1];
     if unsafe { pyre_object::is_slice(key) } {
-        let start_obj = unsafe { pyre_object::sliceobject::w_slice_get_start(key) };
-        let stop_obj = unsafe { pyre_object::sliceobject::w_slice_get_stop(key) };
+        let mut start_obj = unsafe { pyre_object::sliceobject::w_slice_get_start(key) };
+        let mut stop_obj = unsafe { pyre_object::sliceobject::w_slice_get_stop(key) };
         let step_obj = unsafe { pyre_object::sliceobject::w_slice_get_step(key) };
         if unsafe { pyre_object::is_none(stop_obj) } {
             return Err(pyre_interpreter::PyError::value_error(
@@ -2668,7 +2731,7 @@ fn pointer_getitem(args: &[PyObjectRef]) -> PyResult {
         let step = if unsafe { pyre_object::is_none(step_obj) } {
             1
         } else {
-            pyre_interpreter::sliceobject::eval_slice_index(step_obj)?
+            pyre_object::with_roots!(obj, start_obj, stop_obj => pyre_interpreter::sliceobject::eval_slice_index(step_obj))?
         };
         if step == 0 {
             return Err(pyre_interpreter::PyError::value_error(
@@ -2678,15 +2741,15 @@ fn pointer_getitem(args: &[PyObjectRef]) -> PyResult {
         let start = if unsafe { pyre_object::is_none(start_obj) } {
             if step < 0 { -1 } else { 0 }
         } else {
-            pyre_interpreter::sliceobject::eval_slice_index(start_obj)?
+            pyre_object::with_roots!(obj, stop_obj => pyre_interpreter::sliceobject::eval_slice_index(start_obj))?
         };
-        let stop = pyre_interpreter::sliceobject::eval_slice_index(stop_obj)?;
+        let stop = pyre_object::with_roots!(obj => pyre_interpreter::sliceobject::eval_slice_index(stop_obj))?;
         // Each element is freshly allocated and the next index allocates again,
         // so they are pinned as they arrive.
         let mut values = pyre_object::gc_roots::RootedItems::new();
         let mut index = start;
         while if step > 0 { index < stop } else { index > stop } {
-            values.push(pointer_get_index(obj, index as isize)?);
+            values.push(pyre_object::with_roots!(obj => pointer_get_index(obj, index as isize))?);
             index = index.saturating_add(step);
         }
         return Ok(pyre_object::w_list_new(values.take()));
@@ -2699,15 +2762,15 @@ fn pointer_getitem(args: &[PyObjectRef]) -> PyResult {
     pointer_get_index(obj, unsafe { pyre_object::w_int_get_value(key) } as isize)
 }
 
-fn pointer_get_index(obj: PyObjectRef, index: isize) -> PyResult {
-    let (proto, element_size, ptr) = pointer_meta(obj)?;
+fn pointer_get_index(mut obj: PyObjectRef, index: isize) -> PyResult {
+    let (mut proto, element_size, ptr) = pyre_object::with_roots!(obj => pointer_meta(obj))?;
     if ptr == 0 {
         return Err(pyre_interpreter::PyError::value_error(
             "NULL pointer access",
         ));
     }
     let addr = host_ctypes::pointer_item_address(ptr, index, element_size);
-    match proto_kind(proto) {
+    match pyre_object::with_roots!(obj, proto => proto_kind(proto)) {
         ParamFunc::Simple => {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| pyre_interpreter::PyError::type_error("element has no '_type_'"))?;
@@ -2719,15 +2782,16 @@ fn pointer_get_index(obj: PyObjectRef, index: isize) -> PyResult {
 }
 
 fn pointer_setitem(args: &[PyObjectRef]) -> PyResult {
-    let obj = args[0];
-    let key = args[1];
-    let value = args[2];
+    let mut obj = args[0];
+    let mut key = args[1];
+    let mut value = args[2];
     if !unsafe { pyre_object::is_int(key) } {
         return Err(pyre_interpreter::PyError::type_error(
             "Pointer indices must be integer",
         ));
     }
-    let (proto, element_size, ptr) = pointer_meta(obj)?;
+    let (mut proto, element_size, ptr) =
+        pyre_object::with_roots!(key, obj, value => pointer_meta(obj))?;
     if ptr == 0 {
         return Err(pyre_interpreter::PyError::value_error(
             "NULL pointer access",
@@ -2735,7 +2799,7 @@ fn pointer_setitem(args: &[PyObjectRef]) -> PyResult {
     }
     let index = unsafe { pyre_object::w_int_get_value(key) } as isize;
     let addr = host_ctypes::pointer_item_address(ptr, index, element_size);
-    match proto_kind(proto) {
+    match pyre_object::with_roots!(obj, proto, value => proto_kind(proto)) {
         ParamFunc::Simple => {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| pyre_interpreter::PyError::type_error("element has no '_type_'"))?;

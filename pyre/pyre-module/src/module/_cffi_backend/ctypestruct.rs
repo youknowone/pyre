@@ -337,10 +337,10 @@ pub unsafe fn convert_from_object(
 pub unsafe fn convert_struct_from_object(
     ct: &W_CType,
     cdata: *mut u8,
-    w_ob: PyObjectRef,
+    mut w_ob: PyObjectRef,
     optvarsize: i64,
 ) -> Result<i64, PyError> {
-    ct.force_lazy_struct()?;
+    pyre_object::with_roots!(w_ob => ct.force_lazy_struct())?;
     let mut optvarsize = optvarsize;
     let roots = pyre_object::gc_roots::push_roots();
     let ob_slot = roots.base();
@@ -468,8 +468,10 @@ fn fields_dict_items(ct: &W_CType) -> Result<Vec<(String, PyObjectRef)>, PyError
     }
     let keys = pyre_interpreter::baseobjspace::fixedview(ct.fields_dict, -1)?;
     let mut out = Vec::with_capacity(keys.len());
-    for w_key in keys {
-        let name = pyre_interpreter::baseobjspace::text_w(w_key)?.to_string();
+    for mut w_key in keys {
+        let name =
+            pyre_object::with_roots!(w_key => pyre_interpreter::baseobjspace::text_w(w_key))?
+                .to_string();
         let w_value = pyre_interpreter::baseobjspace::getitem(ct.fields_dict, w_key)?;
         out.push((name, w_value));
     }
@@ -479,8 +481,8 @@ fn fields_dict_items(ct: &W_CType) -> Result<Vec<(String, PyObjectRef)>, PyError
 /// The name a completed struct's field dict knows this field by.  A nested
 /// anonymous struct splices its fields in under those names, and a field the
 /// dict never recorded — an anonymous bitfield — keeps none.
-pub fn name_of_field(ct: &W_CType, w_field: PyObjectRef) -> Result<Option<String>, PyError> {
-    for (name, w_value) in fields_dict_items(ct)? {
+pub fn name_of_field(ct: &W_CType, mut w_field: PyObjectRef) -> Result<Option<String>, PyError> {
+    for (name, w_value) in pyre_object::with_roots!(w_field => fields_dict_items(ct))? {
         if w_value == w_field {
             return Ok(Some(name));
         }

@@ -194,7 +194,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     // (PyPy unpacks via Python iteration; pyre's surface
                     // covers the two concrete sequence shapes callers
                     // actually use).
-                    let (w_soft, w_hard) = unsafe {
+                    let (w_soft, mut w_hard) = unsafe {
                         if pyre_object::is_tuple(args[1]) && pyre_object::w_tuple_len(args[1]) == 2
                         {
                             (
@@ -214,7 +214,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             ));
                         }
                     };
-                    let soft = pyre_interpreter::baseobjspace::int_w(w_soft)? as libc::rlim_t;
+                    let soft = pyre_object::with_roots!(w_hard => pyre_interpreter::baseobjspace::int_w(w_soft))? as libc::rlim_t;
                     let hard = pyre_interpreter::baseobjspace::int_w(w_hard)? as libc::rlim_t;
                     let rl = libc::rlimit {
                         rlim_cur: soft,

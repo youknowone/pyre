@@ -353,16 +353,21 @@ fn init_compress_type(ns: PyObjectRef) {
 }
 
 fn compress_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let cls = args.first().copied().unwrap_or_else(compress_type);
-    let level = int_or_default(args.get(1).copied().unwrap_or(PY_NULL), -1)? as i32;
-    let method = int_or_default(args.get(2).copied().unwrap_or(PY_NULL), 8)? as i32;
-    let wbits = to_wbits(int_or_default(
+    let mut cls = args.first().copied().unwrap_or_else(compress_type);
+    let level = pyre_object::with_roots!(cls => int_or_default(args.get(1).copied().unwrap_or(PY_NULL), -1))?
+        as i32;
+    let method = pyre_object::with_roots!(cls => int_or_default(args.get(2).copied().unwrap_or(PY_NULL), 8))?
+        as i32;
+    let wbits = to_wbits(pyre_object::with_roots!(cls => int_or_default(
         args.get(3).copied().unwrap_or(PY_NULL),
         backend::MAX_WBITS as i64,
-    )?);
-    let mem_level = int_or_default(args.get(4).copied().unwrap_or(PY_NULL), 8)? as i32;
-    let strategy = int_or_default(args.get(5).copied().unwrap_or(PY_NULL), 0)? as i32;
-    let zdict = zdict_or_none(args.get(6).copied().unwrap_or(PY_NULL))?;
+    ))?);
+    let mem_level = pyre_object::with_roots!(cls => int_or_default(args.get(4).copied().unwrap_or(PY_NULL), 8))?
+        as i32;
+    let strategy = pyre_object::with_roots!(cls => int_or_default(args.get(5).copied().unwrap_or(PY_NULL), 0))?
+        as i32;
+    let zdict =
+        pyre_object::with_roots!(cls => zdict_or_none(args.get(6).copied().unwrap_or(PY_NULL)))?;
     make_compress_for(cls, level, method, wbits, mem_level, strategy, zdict)
 }
 
@@ -640,12 +645,13 @@ fn init_decompress_type(ns: PyObjectRef) {
 }
 
 fn decompress_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let cls = args.first().copied().unwrap_or_else(decompress_type);
-    let wbits = to_wbits(int_or_default(
+    let mut cls = args.first().copied().unwrap_or_else(decompress_type);
+    let wbits = to_wbits(pyre_object::with_roots!(cls => int_or_default(
         args.get(1).copied().unwrap_or(PY_NULL),
         backend::MAX_WBITS as i64,
-    )?);
-    let zdict = zdict_or_none(args.get(2).copied().unwrap_or(PY_NULL))?;
+    ))?);
+    let zdict =
+        pyre_object::with_roots!(cls => zdict_or_none(args.get(2).copied().unwrap_or(PY_NULL)))?;
     make_decompress_for(cls, wbits, zdict)
 }
 
@@ -945,9 +951,9 @@ pyre_interpreter::py_module! {
             #[default(w_none())]
             level: PyObjectRef,
             #[default(w_none())]
-            wbits: PyObjectRef,
+            mut wbits: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let level = int_or_default(level, -1)? as i32;
+            let level = pyre_object::with_roots!(wbits => int_or_default(level, -1))? as i32;
             let wbits = to_wbits(int_or_default(wbits, backend::MAX_WBITS as i64)?);
             let out = backend::compress(&data, level, wbits)
                 .map_err(|e| oneshot_init_error(e, "Bad compression level"))?;
@@ -960,9 +966,9 @@ pyre_interpreter::py_module! {
             #[default(w_none())]
             wbits: PyObjectRef,
             #[default(w_none())]
-            bufsize: PyObjectRef,
+            mut bufsize: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let wbits = to_wbits(int_or_default(wbits, backend::MAX_WBITS as i64)?);
+            let wbits = to_wbits(pyre_object::with_roots!(bufsize => int_or_default(wbits, backend::MAX_WBITS as i64))?);
             let bufsize = int_or_default(bufsize, backend::DEF_BUF_SIZE as i64)?;
             if bufsize < 0 {
                 return Err(pyre_interpreter::PyError::value_error("bufsize must be non-negative"));
@@ -976,17 +982,17 @@ pyre_interpreter::py_module! {
         // initialization options are passed through to deflateInit2.
         fn compressobj(
             #[default(w_none())] level: PyObjectRef,
-            #[default(w_none())] method: PyObjectRef,
-            #[default(w_none())] wbits: PyObjectRef,
-            #[default(w_none())] memLevel: PyObjectRef,
-            #[default(w_none())] strategy: PyObjectRef,
-            #[default(w_none())] zdict: PyObjectRef,
+            #[default(w_none())] mut method: PyObjectRef,
+            #[default(w_none())] mut wbits: PyObjectRef,
+            #[default(w_none())] mut memLevel: PyObjectRef,
+            #[default(w_none())] mut strategy: PyObjectRef,
+            #[default(w_none())] mut zdict: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let level = int_or_default(level, -1)? as i32;
-            let method = int_or_default(method, 8)? as i32;
-            let wbits = to_wbits(int_or_default(wbits, backend::MAX_WBITS as i64)?);
-            let mem_level = int_or_default(memLevel, 8)? as i32;
-            let strategy = int_or_default(strategy, 0)? as i32;
+            let level = pyre_object::with_roots!(memLevel, method, strategy, wbits, zdict => int_or_default(level, -1))? as i32;
+            let method = pyre_object::with_roots!(memLevel, strategy, wbits, zdict => int_or_default(method, 8))? as i32;
+            let wbits = to_wbits(pyre_object::with_roots!(memLevel, strategy, zdict => int_or_default(wbits, backend::MAX_WBITS as i64))?);
+            let mem_level = pyre_object::with_roots!(strategy, zdict => int_or_default(memLevel, 8))? as i32;
+            let strategy = pyre_object::with_roots!(zdict => int_or_default(strategy, 0))? as i32;
             make_compress(
                 level,
                 method,
@@ -999,9 +1005,9 @@ pyre_interpreter::py_module! {
         // interp_zlib.py `Decompress___new__(wbits, w_zdict)`.
         fn decompressobj(
             #[default(w_none())] wbits: PyObjectRef,
-            #[default(w_none())] zdict: PyObjectRef,
+            #[default(w_none())] mut zdict: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let wbits = to_wbits(int_or_default(wbits, backend::MAX_WBITS as i64)?);
+            let wbits = to_wbits(pyre_object::with_roots!(zdict => int_or_default(wbits, backend::MAX_WBITS as i64))?);
             make_decompress(wbits, zdict_or_none(zdict)?)
         }
     },

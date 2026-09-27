@@ -483,11 +483,11 @@ impl W_BufferedWriter {
 
     fn seek(
         &mut self,
-        w_pos: PyObjectRef,
-        #[default(pyre_object::w_int_new(0))] w_whence: PyObjectRef,
+        mut w_pos: PyObjectRef,
+        #[default(pyre_object::w_int_new(0))] mut w_whence: PyObjectRef,
     ) -> Result<i64, crate::PyError> {
-        self.check_closed("seek of closed file")?;
-        let pos = crate::builtins::space_index_w(w_pos)?;
+        pyre_object::with_roots!(w_pos, w_whence => self.check_closed("seek of closed file"))?;
+        let pos = pyre_object::with_roots!(w_whence => crate::builtins::space_index_w(w_pos))?;
         let whence = crate::builtins::space_index_w(w_whence)?;
         if !(0..=2).contains(&whence) {
             return Err(crate::PyError::value_error(format!(
@@ -559,9 +559,9 @@ impl W_BufferedWriter {
 
     fn truncate(
         &mut self,
-        #[default(pyre_object::w_none())] w_size: PyObjectRef,
+        #[default(pyre_object::w_none())] mut w_size: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
-        self.check_closed("truncate of closed file")?;
+        pyre_object::with_roots!(w_size => self.check_closed("truncate of closed file"))?;
         self.with_lock(|this| {
             this.flush_unlocked()?;
             this.abs_pos = -1;

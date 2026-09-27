@@ -339,8 +339,8 @@ impl W_Unpickler {
     /// hook). Emits the `pickle.find_class` audit event.
     fn find_class(
         &self,
-        w_module: PyObjectRef,
-        w_name: PyObjectRef,
+        mut w_module: PyObjectRef,
+        mut w_name: PyObjectRef,
     ) -> Result<PyObjectRef, PyError> {
         // `find_class` is public; reject non-str args before the unchecked
         // `w_str_get_value` reinterpret cast (a non-str would be UB).
@@ -356,9 +356,9 @@ impl W_Unpickler {
         let module = unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_module) };
         let name = unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) };
         let (Some(module), Some(name)) = (module, name) else {
-            audit_find_class_objects(w_module, w_name)?;
+            pyre_object::with_roots!(w_module, w_name => audit_find_class_objects(w_module, w_name))?;
             let module_obj = if let Some(module) = module {
-                import_module(module)?
+                pyre_object::with_roots!(w_name => import_module(module))?
             } else {
                 let modules = crate::importing::sys_modules_dict();
                 unsafe { pyre_object::w_dict_lookup(modules, w_module) }.ok_or_else(|| {
@@ -758,8 +758,9 @@ fn load_next_buffer(slot: usize) -> Result<(), PyError> {
 /// `load_readonly_buffer` (READONLY_BUFFER) — replace the top buffer with a
 /// read-only memoryview onto it.
 fn load_readonly_buffer(slot: usize) -> Result<(), PyError> {
-    let w_buf = top(slot, "READONLY_BUFFER")?;
-    let w_mv = call_fn(memoryview_type()?, &[w_buf])?;
+    let mut w_buf = top(slot, "READONLY_BUFFER")?;
+    let w_memoryview = pyre_object::with_roots!(w_buf => memoryview_type())?;
+    let w_mv = call_fn(w_memoryview, &[w_buf])?;
     let w_readonly = call_meth(w_mv, "toreadonly", &[])?;
     // Replace the top of the stack (`stack[-1] = w_readonly`).
     pop(slot)?;
@@ -1130,8 +1131,8 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             push(slot, list_copy(items));
         }
         x if x == op::APPEND => {
-            let value = pop(slot)?;
-            let w_list = top(slot, "APPEND")?;
+            let mut value = pop(slot)?;
+            let w_list = pyre_object::with_roots!(value => top(slot, "APPEND"))?;
             call_meth(w_list, "append", &[value])?;
         }
         x if x == op::APPENDS => {
@@ -1180,14 +1181,14 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             push(slot, w_dict);
         }
         x if x == op::SETITEM => {
-            let value = pop(slot)?;
-            let key = pop(slot)?;
-            let w_dict = top(slot, "SETITEM")?;
+            let mut value = pop(slot)?;
+            let mut key = pop(slot)?;
+            let w_dict = pyre_object::with_roots!(key, value => top(slot, "SETITEM"))?;
             crate::baseobjspace::setitem(w_dict, key, value)?;
         }
         x if x == op::SETITEMS => {
-            let items = pop_mark(slot)?;
-            let w_dict = top(slot, "SETITEMS")?;
+            let mut items = pop_mark(slot)?;
+            let w_dict = pyre_object::with_roots!(items => top(slot, "SETITEMS"))?;
             dict_update_from_pairs(w_dict, items)?;
         }
         // ── set / frozenset ───────────────────────────────────────────
@@ -1296,8 +1297,8 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             get_extension(slot, code)?;
         }
         x if x == op::REDUCE => {
-            let w_args = pop(slot)?;
-            let w_func = top(slot, "REDUCE")?;
+            let mut w_args = pop(slot)?;
+            let w_func = pyre_object::with_roots!(w_args => top(slot, "REDUCE"))?;
             let _roots = pyre_object::gc_roots::push_roots();
             let _ = pyre_object::gc_roots::pin_root(w_args);
             let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -1390,8 +1391,8 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             push(slot, w_obj);
         }
         x if x == op::BUILD => {
-            let w_state = pop(slot)?;
-            let w_inst = top(slot, "BUILD")?;
+            let mut w_state = pop(slot)?;
+            let w_inst = pyre_object::with_roots!(w_state => top(slot, "BUILD"))?;
             build_instance(w_inst, w_state)?;
         }
         // ── memo ──────────────────────────────────────────────────────
@@ -1464,13 +1465,15 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             if n == 0 {
                 return Err(unpickling_error("OBJ opcode with empty stack"));
             }
-            let w_cls = unsafe { pyre_object::listobject::w_list_getitem(args, 0).unwrap() };
+            let mut w_cls = unsafe { pyre_object::listobject::w_list_getitem(args, 0).unwrap() };
             let rest: Vec<PyObjectRef> = (1..n)
                 .map(|i| unsafe {
                     pyre_object::listobject::w_list_getitem(args, i as i64).unwrap()
                 })
                 .collect();
-            let v = instantiate(w_cls, pyre_object::listobject::w_list_new(rest))?;
+            let w_rest =
+                pyre_object::with_roots!(w_cls => pyre_object::listobject::w_list_new(rest));
+            let v = instantiate(w_cls, w_rest)?;
             push(slot, v);
         }
         _ => {
@@ -1743,8 +1746,8 @@ fn audit_find_class_objects(w_module: PyObjectRef, w_name: PyObjectRef) -> Resul
 /// `get_extension` (EXT1 / EXT2 / EXT4) — resolve a `copyreg` extension code
 /// to its registered global via `_extension_cache` / `_inverted_registry`.
 fn get_extension(slot: usize, code: i64) -> Result<(), PyError> {
-    let copyreg = import_module("copyreg")?;
-    let cache = crate::baseobjspace::getattr_str(copyreg, "_extension_cache")?;
+    let mut copyreg = import_module("copyreg")?;
+    let cache = pyre_object::with_roots!(copyreg => crate::baseobjspace::getattr_str(copyreg, "_extension_cache"))?;
     if let Some(obj) = unsafe { pyre_object::w_dict_lookup(cache, pyre_object::w_int_new(code)) } {
         push(slot, obj);
         return Ok(());
@@ -1914,9 +1917,9 @@ fn persistent_load(slot: usize, w_pid: PyObjectRef) -> Result<PyObjectRef, PyErr
 /// `_instantiate` — build an old-style INST / OBJ instance. With args, or a
 /// non-type class, or a `__getinitargs__`, call the class; otherwise build
 /// via `__new__` without invoking `__init__`.
-fn instantiate(w_cls: PyObjectRef, w_args: PyObjectRef) -> Result<PyObjectRef, PyError> {
+fn instantiate(mut w_cls: PyObjectRef, mut w_args: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let n = unsafe { pyre_object::listobject::w_list_len(w_args) };
-    let has_getinitargs = crate::baseobjspace::findattr_result(w_cls, "__getinitargs__")?.is_some();
+    let has_getinitargs = pyre_object::with_roots!(w_args, w_cls => crate::baseobjspace::findattr_result(w_cls, "__getinitargs__"))?.is_some();
     let is_type = unsafe { pyre_object::typeobject::is_type(w_cls) };
     if n > 0 || !is_type || has_getinitargs {
         let args: Vec<PyObjectRef> = (0..n)
@@ -1929,7 +1932,7 @@ fn instantiate(w_cls: PyObjectRef, w_args: PyObjectRef) -> Result<PyObjectRef, P
 }
 
 /// `cls.__new__(cls, *args)`.
-fn new_instance(w_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+fn new_instance(mut w_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if !unsafe { pyre_object::typeobject::is_type(w_cls) } {
         let message = format!(
             "NEWOBJ class argument must be a type, not {}",
@@ -1937,7 +1940,8 @@ fn new_instance(w_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef,
         );
         return Err(unpickling_error(&message));
     }
-    let w_new = crate::baseobjspace::getattr_str(w_cls, "__new__")?;
+    let w_new =
+        pyre_object::with_roots!(w_cls => crate::baseobjspace::getattr_str(w_cls, "__new__"))?;
     let mut call_args = vec![w_cls];
     call_args.extend_from_slice(args);
     call_fn(w_new, &call_args)

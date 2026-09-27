@@ -295,7 +295,7 @@ unsafe fn convert_result(
 unsafe fn convert_from_object_fficallback(
     fresult: &W_CType,
     mut ll_res: *mut u8,
-    w_res: PyObjectRef,
+    mut w_res: PyObjectRef,
 ) -> Result<(), PyError> {
     if fresult.kind == ctypeobj::KIND_VOID {
         if unsafe { !pyre_object::is_none(w_res) } {
@@ -308,7 +308,9 @@ unsafe fn convert_from_object_fficallback(
     let small_result = fresult.size >= 0 && (fresult.size as usize) < SIZE_OF_FFI_ARG;
     if small_result && fresult.has(ctypeobj::CTypeFlags::PRIMITIVE_INTEGER) {
         if fresult.kind == ctypeobj::KIND_PRIM_SIGNED && !fresult.has(ctypeobj::CTypeFlags::ENUM) {
-            unsafe { ctypeobj::convert_from_object(fresult, ll_res as usize, w_res)? };
+            unsafe {
+                pyre_object::with_roots!(w_res => ctypeobj::convert_from_object(fresult, ll_res as usize, w_res))?
+            };
             let value = super::misc::as_long(w_res)?;
             return unsafe {
                 super::misc::write_raw_signed_data(ll_res as usize, value, SIZE_OF_FFI_ARG as i64)

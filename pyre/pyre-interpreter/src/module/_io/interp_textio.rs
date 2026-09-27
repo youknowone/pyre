@@ -527,7 +527,7 @@ impl W_TextIOWrapper {
     }
 
     /// PyPy `W_TextIOWrapper._set_encoder_decoder`.
-    fn set_encoder_decoder(&mut self, codec: PyObjectRef) -> Result<(), crate::PyError> {
+    fn set_encoder_decoder(&mut self, mut codec: PyObjectRef) -> Result<(), crate::PyError> {
         self.w_encoder = PY_NULL;
         self.w_decoder = PY_NULL;
 
@@ -535,28 +535,26 @@ impl W_TextIOWrapper {
             return Ok(());
         }
 
-        if crate::baseobjspace::is_true(super::call_method_result(self.w_buffer, "readable", &[])?)?
-        {
-            let mut decoder =
-                super::call_method_result(codec, "incrementaldecoder", &[self.w_errors])?;
+        let w_readable = pyre_object::with_roots!(codec => super::call_method_result(self.w_buffer, "readable", &[]))?;
+        if pyre_object::with_roots!(codec => crate::baseobjspace::is_true(w_readable))? {
+            let mut decoder = pyre_object::with_roots!(codec => super::call_method_result(codec, "incrementaldecoder", &[self.w_errors]))?;
             if self.readuniversal {
-                let io = crate::importing::get_builtin_module("_io").ok_or_else(|| {
+                let io = pyre_object::with_roots!(codec, decoder => crate::importing::get_builtin_module("_io")).ok_or_else(|| {
                     crate::PyError::runtime_error("_io module is not initialized")
                 })?;
-                let decoder_type =
-                    crate::baseobjspace::getattr_str(io, "IncrementalNewlineDecoder")?;
-                decoder = crate::call::call_function_impl_result(
+                let decoder_type = pyre_object::with_roots!(codec, decoder => crate::baseobjspace::getattr_str(io, "IncrementalNewlineDecoder"))?;
+                decoder = pyre_object::with_roots!(codec => crate::call::call_function_impl_result(
                     decoder_type,
                     &[decoder, w_bool_from(self.readtranslate)],
-                )?;
+                ))?;
             }
             self.w_decoder = decoder;
             // `writable` below runs arbitrary Python and can collect.
             self.publish_refs();
         }
 
-        if crate::baseobjspace::is_true(super::call_method_result(self.w_buffer, "writable", &[])?)?
-        {
+        let w_writable = pyre_object::with_roots!(codec => super::call_method_result(self.w_buffer, "writable", &[]))?;
+        if pyre_object::with_roots!(codec => crate::baseobjspace::is_true(w_writable))? {
             self.w_encoder =
                 super::call_method_result(codec, "incrementalencoder", &[self.w_errors])?;
             self.publish_refs();
@@ -899,12 +897,12 @@ impl W_TextIOWrapper {
     #[allow(clippy::too_many_arguments)]
     fn attach_buffer(
         &mut self,
-        buffer: PyObjectRef,
+        mut buffer: PyObjectRef,
         encoding: &str,
         errors: &str,
         newline: PyObjectRef,
         newline_value: Option<&str>,
-        codec: PyObjectRef,
+        mut codec: PyObjectRef,
         line_buffering: bool,
         write_through: bool,
     ) -> Result<(), crate::PyError> {
@@ -930,8 +928,8 @@ impl W_TextIOWrapper {
         self.chunk_size = 8192;
         self.b2cratio = 0.0;
         self.set_newline(newline_value);
-        self.has_read1 = crate::baseobjspace::getattr_str(buffer, "read1").is_ok();
-        self.set_encoder_decoder(codec)?;
+        self.has_read1 = pyre_object::with_roots!(buffer, codec => crate::baseobjspace::getattr_str(buffer, "read1")).is_ok();
+        pyre_object::with_roots!(buffer => self.set_encoder_decoder(codec))?;
         self.seekable_flag =
             crate::baseobjspace::is_true(super::call_method_result(buffer, "seekable", &[])?)?;
         self.telling = self.seekable_flag;
@@ -1192,12 +1190,12 @@ impl W_TextIOWrapper {
 
     fn __init__(
         &mut self,
-        buffer: PyObjectRef,
-        #[default(pyre_object::w_none())] encoding: PyObjectRef,
-        #[default(pyre_object::w_none())] errors: PyObjectRef,
-        #[default(pyre_object::w_none())] newline: PyObjectRef,
-        #[default(pyre_object::w_bool_from(false))] line_buffering: PyObjectRef,
-        #[default(pyre_object::w_bool_from(false))] write_through: PyObjectRef,
+        mut buffer: PyObjectRef,
+        #[default(pyre_object::w_none())] mut encoding: PyObjectRef,
+        #[default(pyre_object::w_none())] mut errors: PyObjectRef,
+        #[default(pyre_object::w_none())] mut newline: PyObjectRef,
+        #[default(pyre_object::w_bool_from(false))] mut line_buffering: PyObjectRef,
+        #[default(pyre_object::w_bool_from(false))] mut write_through: PyObjectRef,
     ) -> Result<(), crate::PyError> {
         // Every argument is converted before the body runs, in the order the
         // signature gives them: `encoding` and `newline` are accepted only as
@@ -1212,12 +1210,12 @@ impl W_TextIOWrapper {
         } else {
             "locale"
         };
-        let encoding_text = Self::checked_text0(encoding, unspecified, "encoding")?;
+        let encoding_text = pyre_object::with_roots!(buffer, encoding, errors, line_buffering, newline, write_through => Self::checked_text0(encoding, unspecified, "encoding"))?;
         if !unsafe { pyre_object::is_none(newline) || pyre_object::is_str(newline) } {
             return Err(crate::PyError::type_error("illegal newline type"));
         }
-        let line_buffering = crate::baseobjspace::is_true(line_buffering)?;
-        let write_through = crate::baseobjspace::is_true(write_through)?;
+        let line_buffering = pyre_object::with_roots!(buffer, encoding, errors, newline, write_through => crate::baseobjspace::is_true(line_buffering))?;
+        let write_through = pyre_object::with_roots!(buffer, encoding, errors, newline => crate::baseobjspace::is_true(write_through))?;
 
         // PyPy starts every initialization attempt in STATE_ZERO.  A failed
         // reinitialization must leave all I/O operations uninitialized.
@@ -1233,13 +1231,14 @@ impl W_TextIOWrapper {
         if unsafe { pyre_object::is_none(encoding) }
             && crate::importing::warn_default_encoding_flag()
         {
-            crate::warn::warn_category("'encoding' argument not specified", "EncodingWarning", 1)?;
+            pyre_object::with_roots!(buffer, errors, newline => crate::warn::warn_category("'encoding' argument not specified", "EncodingWarning", 1))?;
         }
-        let errors = Self::checked_text0(errors, "strict", "errors")?;
-        Self::io_check_errors(&errors)?;
+        let errors = pyre_object::with_roots!(buffer, newline => Self::checked_text0(errors, "strict", "errors"))?;
+        pyre_object::with_roots!(buffer, newline => Self::io_check_errors(&errors))?;
         let newline_value = Self::unwrap_newline(newline)?;
         let encoding = Self::resolve_locale_encoding(encoding_text);
-        let codec = Self::lookup_text_codec(&encoding)?;
+        let codec =
+            pyre_object::with_roots!(buffer, newline => Self::lookup_text_codec(&encoding))?;
 
         self.attach_buffer(
             buffer,
@@ -1255,14 +1254,14 @@ impl W_TextIOWrapper {
 
     fn read(
         &mut self,
-        #[default(pyre_object::w_none())] w_size: PyObjectRef,
+        #[default(pyre_object::w_none())] mut w_size: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
-        self.check_closed()?;
-        self.ensure_read_decoder()?;
+        pyre_object::with_roots!(w_size => self.check_closed())?;
+        pyre_object::with_roots!(w_size => self.ensure_read_decoder())?;
         if self.w_decoder.is_null() {
             return Err(super::unsupported("not readable"));
         }
-        self.write_flush()?;
+        pyre_object::with_roots!(w_size => self.write_flush())?;
         match Self::size_limit(w_size)? {
             None => self.read_all(),
             Some(size) => self.read_n(size),
@@ -1271,14 +1270,14 @@ impl W_TextIOWrapper {
 
     fn readline(
         &mut self,
-        #[default(pyre_object::PY_NULL)] w_size: PyObjectRef,
+        #[default(pyre_object::PY_NULL)] mut w_size: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
-        self.check_closed()?;
-        self.ensure_read_decoder()?;
+        pyre_object::with_roots!(w_size => self.check_closed())?;
+        pyre_object::with_roots!(w_size => self.ensure_read_decoder())?;
         if self.w_decoder.is_null() {
             return Err(super::unsupported("not readable"));
         }
-        self.write_flush()?;
+        pyre_object::with_roots!(w_size => self.write_flush())?;
         // PyPy `W_TextIOWrapper.readline_w` keeps the interp2app default as
         // the untranslated null sentinel and rejects only an explicit None.
         if !w_size.is_null() && unsafe { pyre_object::is_none(w_size) } {
@@ -1332,8 +1331,8 @@ impl W_TextIOWrapper {
         Ok(())
     }
 
-    fn write(&mut self, text: PyObjectRef) -> Result<i64, crate::PyError> {
-        self.check_closed()?;
+    fn write(&mut self, mut text: PyObjectRef) -> Result<i64, crate::PyError> {
+        pyre_object::with_roots!(text => self.check_closed())?;
         if self.w_encoder.is_null() {
             return Err(super::unsupported("not writable"));
         }
@@ -1655,10 +1654,10 @@ impl W_TextIOWrapper {
 
     fn seek(
         &mut self,
-        cookie: PyObjectRef,
+        mut cookie: PyObjectRef,
         #[default(0i64)] whence: i64,
     ) -> Result<PyObjectRef, crate::PyError> {
-        self.check_closed()?;
+        pyre_object::with_roots!(cookie => self.check_closed())?;
         if !self.seekable_flag {
             return Err(super::unsupported("underlying stream is not seekable"));
         }
@@ -1670,7 +1669,7 @@ impl W_TextIOWrapper {
                 return Err(super::unsupported("can't do nonzero cur-relative seeks"));
             }
             w_position = super::call_method_result(self.self_obj(), "tell", &[])?;
-            let indexed = crate::baseobjspace::space_index(w_position)?;
+            let indexed = pyre_object::with_roots!(w_position => crate::baseobjspace::space_index(w_position))?;
             position = unsafe { crate::builtins::obj_to_bigint(indexed) };
         } else if whence == 2 {
             if position.tobool() {
@@ -1709,16 +1708,17 @@ impl W_TextIOWrapper {
             )));
         }
 
-        let position_cookie = PositionCookie::unpack(position)?;
-        super::call_method_result(self.self_obj(), "flush", &[])?;
-        let start = crate::objspace::descroperation::bigint_result(RBigInt::from(
+        let position_cookie =
+            pyre_object::with_roots!(w_position => PositionCookie::unpack(position))?;
+        pyre_object::with_roots!(w_position => super::call_method_result(self.self_obj(), "flush", &[]))?;
+        let start = pyre_object::with_roots!(w_position => crate::objspace::descroperation::bigint_result(RBigInt::from(
             position_cookie.start_pos,
-        ));
-        self.call_buffer("seek", &[start])?;
+        )));
+        pyre_object::with_roots!(w_position => self.call_buffer("seek", &[start]))?;
         self.decoded.reset();
         self.snapshot = None;
         if !self.w_decoder.is_null() {
-            self.decoder_setstate(&position_cookie)?;
+            pyre_object::with_roots!(w_position => self.decoder_setstate(&position_cookie))?;
         }
 
         if position_cookie.chars_to_skip != 0 {
@@ -1771,17 +1771,17 @@ impl W_TextIOWrapper {
         }
 
         if !self.w_encoder.is_null() {
-            self.encoder_reset(position_cookie.start_pos == 0 && position_cookie.dec_flags == 0)?;
+            pyre_object::with_roots!(w_position => self.encoder_reset(position_cookie.start_pos == 0 && position_cookie.dec_flags == 0))?;
         }
         Ok(w_position)
     }
 
     fn truncate(
         &self,
-        #[default(pyre_object::w_none())] size: PyObjectRef,
+        #[default(pyre_object::w_none())] mut size: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
-        self.check_closed()?;
-        super::call_method_result(self.self_obj(), "flush", &[])?;
+        pyre_object::with_roots!(size => self.check_closed())?;
+        pyre_object::with_roots!(size => super::call_method_result(self.self_obj(), "flush", &[]))?;
         if unsafe { pyre_object::is_none(size) } {
             self.call_buffer("truncate", &[])
         } else {
@@ -1792,10 +1792,10 @@ impl W_TextIOWrapper {
     fn reconfigure(
         &mut self,
         #[default(pyre_object::w_none())] encoding: PyObjectRef,
-        #[default(pyre_object::w_none())] errors: PyObjectRef,
-        #[default(pyre_object::PY_NULL)] newline: PyObjectRef,
-        #[default(pyre_object::w_none())] line_buffering: PyObjectRef,
-        #[default(pyre_object::w_none())] write_through: PyObjectRef,
+        #[default(pyre_object::w_none())] mut errors: PyObjectRef,
+        #[default(pyre_object::PY_NULL)] mut newline: PyObjectRef,
+        #[default(pyre_object::w_none())] mut line_buffering: PyObjectRef,
+        #[default(pyre_object::w_none())] mut write_through: PyObjectRef,
     ) -> Result<(), crate::PyError> {
         self.check_attached()?;
         if self.decoded.text.is_some()
@@ -1811,14 +1811,14 @@ impl W_TextIOWrapper {
         let new_encoding = if unsafe { pyre_object::is_none(encoding) } {
             None
         } else {
-            let value = Self::checked_text(encoding, "", "encoding")?;
+            let value = pyre_object::with_roots!(errors, line_buffering, newline, write_through => Self::checked_text(encoding, "", "encoding"))?;
             Some(Self::resolve_locale_encoding(value))
         };
         let new_errors = if unsafe { pyre_object::is_none(errors) } {
             None
         } else {
-            let value = Self::checked_text0(errors, "", "errors")?;
-            Self::io_check_errors(&value)?;
+            let value = pyre_object::with_roots!(line_buffering, newline, write_through => Self::checked_text0(errors, "", "errors"))?;
+            pyre_object::with_roots!(line_buffering, newline, write_through => Self::io_check_errors(&value))?;
             Some(value)
         };
         let new_newline = if newline.is_null() {
@@ -1832,12 +1832,18 @@ impl W_TextIOWrapper {
         let new_line_buffering = if unsafe { pyre_object::is_none(line_buffering) } {
             None
         } else {
-            Some(crate::builtins::space_index_w(line_buffering)? != 0)
+            Some(
+                pyre_object::with_roots!(newline, write_through => crate::builtins::space_index_w(line_buffering))?
+                    != 0,
+            )
         };
         let new_write_through = if unsafe { pyre_object::is_none(write_through) } {
             None
         } else {
-            Some(crate::builtins::space_index_w(write_through)? != 0)
+            Some(
+                pyre_object::with_roots!(newline => crate::builtins::space_index_w(write_through))?
+                    != 0,
+            )
         };
         // The incremental newline decoder captures its translation at build
         // time, so a newline change must rebuild the codec whenever it flips
@@ -1856,7 +1862,7 @@ impl W_TextIOWrapper {
             let encoding = if let Some(encoding) = new_encoding.as_deref() {
                 encoding
             } else {
-                crate::baseobjspace::str_utf8_w(self.w_encoding)?
+                pyre_object::with_roots!(newline => crate::baseobjspace::str_utf8_w(self.w_encoding))?
             };
             // CPython 3.14's TextIOWrapper reconfigure path reaches codec
             // lookup with this value (test_io:test_reconfigure_errors), where
@@ -1868,14 +1874,14 @@ impl W_TextIOWrapper {
                     format!("unknown encoding: {encoding}"),
                 ));
             }
-            Some(Self::lookup_text_codec(encoding)?)
+            Some(pyre_object::with_roots!(newline => Self::lookup_text_codec(encoding))?)
         } else {
             None
         };
 
         // CPython 3.14 `_textiowrapper_writeflush`: every reconfiguration
         // first commits pending output, even when every option is omitted.
-        super::call_method_result(self.self_obj(), "flush", &[])?;
+        pyre_object::with_roots!(newline => super::call_method_result(self.self_obj(), "flush", &[]))?;
         if let Some(value) = new_newline.as_ref() {
             self.w_newline = newline;
             self.set_newline(value.as_deref());
@@ -2041,7 +2047,7 @@ impl W_TextIOWrapper {
 
     fn __repr__(&self) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
         self.check_init()?;
-        let self_obj = self.self_obj();
+        let mut self_obj = self.self_obj();
         let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
             return Err(crate::PyError::runtime_error(
                 "reentrant call inside TextIOWrapper.__repr__",
@@ -2051,10 +2057,12 @@ impl W_TextIOWrapper {
         let typename = crate::type_methods::arg_type_name(self_obj);
         let mut fields = rustpython_wtf8::Wtf8Buf::new();
         if self.state != STATE_DETACHED
-            && let Ok(name) = crate::baseobjspace::getattr_str(self.w_buffer, "name")
+            && let Ok(name) = pyre_object::with_roots!(self_obj => crate::baseobjspace::getattr_str(self.w_buffer, "name"))
         {
             fields.push_str(" name=");
-            fields.push_wtf8(&unsafe { crate::display::py_repr_wtf8(name)? });
+            fields.push_wtf8(&unsafe {
+                pyre_object::with_roots!(self_obj => crate::display::py_repr_wtf8(name))?
+            });
         }
         if let Ok(mode) = crate::baseobjspace::getattr_str(self_obj, "mode") {
             fields.push_str(" mode=");

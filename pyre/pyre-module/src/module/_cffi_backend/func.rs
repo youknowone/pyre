@@ -163,9 +163,9 @@ pub fn typeof_(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `func.py sizeof` — a cdata reports what it owns, a ctype its own size.
 pub fn sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_obj = args[0];
+    let mut w_obj = args[0];
     let (size, name) = if W_CData::from_obj(w_obj).is_some() {
-        let size = cdataobj::cdata_sizeof(w_obj)?;
+        let size = pyre_object::with_roots!(w_obj => cdataobj::cdata_sizeof(w_obj))?;
         let ct = ctypeobj::ctype_at(cdataobj::cdata_arg(w_obj)?.ctype)
             .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
         (size, ct.name())
@@ -209,7 +209,10 @@ pub fn string(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `func.py unpack`.
 pub fn unpack(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    cdataobj::unpack(args[0], pyre_interpreter::baseobjspace::int_w(args[1])?)
+    let mut w_cdata = args[0];
+    let length =
+        pyre_object::with_roots!(w_cdata => pyre_interpreter::baseobjspace::int_w(args[1]))?;
+    cdataobj::unpack(w_cdata, length)
 }
 
 /// `func.py typeoffsetof`.
@@ -586,14 +589,13 @@ pub fn complete_struct_or_union(args: &[PyObjectRef]) -> Result<PyObjectRef, PyE
             None => Ok(default),
         }
     };
-    newtype::complete_struct_or_union(
-        a[0],
-        a[1],
-        int_arg(3, -1)?,
-        int_arg(4, -1)?,
-        int_arg(5, 0)?,
-        int_arg(6, 0)?,
-    )?;
+    let mut w_ctype = a[0];
+    let mut w_fields = a[1];
+    let totalsize = pyre_object::with_roots!(w_ctype, w_fields => int_arg(3, -1))?;
+    let totalalignment = pyre_object::with_roots!(w_ctype, w_fields => int_arg(4, -1))?;
+    let sflags = pyre_object::with_roots!(w_ctype, w_fields => int_arg(5, 0))?;
+    let pack = pyre_object::with_roots!(w_ctype, w_fields => int_arg(6, 0))?;
+    newtype::complete_struct_or_union(w_ctype, w_fields, totalsize, totalalignment, sflags, pack)?;
     Ok(pyre_object::w_none())
 }
 

@@ -265,7 +265,7 @@ pub unsafe fn convert_array_from_object(
 }
 
 /// `W_CTypePtrOrArray.cast`.
-pub fn cast(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyError> {
+pub fn cast(mut w_ctype: PyObjectRef, mut w_ob: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(w_ctype)?;
     if ct.size < 0 {
         return Err(PyError::type_error(format!(
@@ -275,7 +275,7 @@ pub fn cast(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyEr
     }
     // `W_CTypePointer.cast`: casting a stream to a `FILE *` opens one over it.
     if ct.has(ctypeobj::CTypeFlags::FILE_PTR) {
-        let file = prepare_file(w_ob)?;
+        let file = pyre_object::with_roots!(w_ctype, w_ob => prepare_file(w_ob))?;
         if !file.is_null() {
             return Ok(cdataobj::new_cdata(file as usize, w_ctype));
         }
@@ -285,7 +285,7 @@ pub fn cast(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyEr
     {
         source.ptr
     } else {
-        misc::as_unsigned_long(w_ob, false)? as usize
+        pyre_object::with_roots!(w_ctype => misc::as_unsigned_long(w_ob, false))? as usize
     };
     Ok(cdataobj::new_cdata(value, w_ctype))
 }
@@ -411,10 +411,14 @@ pub fn array_newp(
 }
 
 /// `W_CTypeArray.get_new_array_length`.
-pub fn new_array_length(ct: &W_CType, w_value: PyObjectRef) -> Result<(PyObjectRef, i64), PyError> {
+pub fn new_array_length(
+    ct: &W_CType,
+    mut w_value: PyObjectRef,
+) -> Result<(PyObjectRef, i64), PyError> {
     unsafe {
         if pyre_object::pyobject::is_list(w_value) || pyre_object::pyobject::is_tuple(w_value) {
-            let length = pyre_interpreter::runtime_ops::sequence_len(w_value)? as i64;
+            let length = pyre_object::with_roots!(w_value => pyre_interpreter::runtime_ops::sequence_len(w_value))?
+                as i64;
             return Ok((w_value, length));
         }
         if pyre_object::bytesobject::is_bytes(w_value) {
@@ -485,8 +489,8 @@ pub fn add(w_ctype: PyObjectRef, cdata: *mut u8, i: i64) -> Result<PyObjectRef, 
 }
 
 /// `W_CTypePtrOrArray.string`.
-pub fn string(w_cdata: PyObjectRef, maxlen: i64) -> Result<PyObjectRef, PyError> {
-    let cdata = cdataobj::cdata_arg(w_cdata)?;
+pub fn string(mut w_cdata: PyObjectRef, maxlen: i64) -> Result<PyObjectRef, PyError> {
+    let cdata = pyre_object::with_roots!(w_cdata => cdataobj::cdata_arg(w_cdata))?;
     let ct = ctypeobj::ctype_at(cdata.ctype)
         .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
     let item = item_of(ct)?;
@@ -610,7 +614,7 @@ pub fn item_of(ct: &W_CType) -> Result<&'static mut W_CType, PyError> {
 pub unsafe fn pointer_convert_argument_from_object(
     ct: &W_CType,
     cdata: *mut u8,
-    w_ob: PyObjectRef,
+    mut w_ob: PyObjectRef,
 ) -> Result<bool, PyError> {
     use super::ctypefunc::{MUSTFREE_FREE, MUSTFREE_NOTHING, set_mustfree_flag};
 
@@ -647,7 +651,9 @@ pub unsafe fn pointer_convert_argument_from_object(
             // of because the collector may move them.
             return unsafe { accept_movable_str(ct, cdata, w_ob) };
         }
-        result = unsafe { prepare_pointer_call_argument(ct, cdata, w_ob)? };
+        result = unsafe {
+            pyre_object::with_roots!(w_ob => prepare_pointer_call_argument(ct, cdata, w_ob))?
+        };
     }
     if result == MUSTFREE_NOTHING {
         unsafe { pointer_convert_from_object(ct, cdata, w_ob)? };
@@ -704,14 +710,15 @@ fn must_be_string_of_zero_or_one(value: &[u8]) -> Result<(), PyError> {
 unsafe fn prepare_pointer_call_argument(
     ct: &W_CType,
     cdata: *mut u8,
-    w_init: PyObjectRef,
+    mut w_init: PyObjectRef,
 ) -> Result<u8, PyError> {
     use super::ctypefunc::{MUSTFREE_FREE, MUSTFREE_NOTHING};
 
     let item = item_of(ct)?;
     let length = unsafe {
         if pyre_object::pyobject::is_list(w_init) || pyre_object::pyobject::is_tuple(w_init) {
-            pyre_interpreter::runtime_ops::sequence_len(w_init)? as i64
+            pyre_object::with_roots!(w_init => pyre_interpreter::runtime_ops::sequence_len(w_init))?
+                as i64
         } else if pyre_object::bytesobject::is_bytes(w_init) {
             // From a string, we add the null terminator.
             pyre_object::bytesobject::w_bytes_data(w_init).len() as i64 + 1
@@ -803,11 +810,11 @@ fn held_file(w_fileobj: PyObjectRef) -> Option<usize> {
 
 /// `W_CTypePointer.prepare_file` — a stream answers with the C `FILE` over
 /// it, and anything else with a null pointer.
-fn prepare_file(w_ob: PyObjectRef) -> Result<*mut c_void, PyError> {
-    if !pyre_interpreter::baseobjspace::isinstance(
+fn prepare_file(mut w_ob: PyObjectRef) -> Result<*mut c_void, PyError> {
+    if !pyre_object::with_roots!(w_ob => pyre_interpreter::baseobjspace::isinstance(
         w_ob,
         pyre_interpreter::module::_io::io_base_type(),
-    )? {
+    ))? {
         return Ok(std::ptr::null_mut());
     }
     prepare_file_argument(w_ob)
@@ -865,8 +872,8 @@ fn prepare_file_argument(w_fileobj: PyObjectRef) -> Result<*mut c_void, PyError>
 }
 
 /// `CffiFileObj.close`, which `W_IOBase.close_w` runs before its flush.
-pub fn close_cffi_fileobj(w_fileobj: PyObjectRef) {
-    let Some(address) = held_file(w_fileobj) else {
+pub fn close_cffi_fileobj(mut w_fileobj: PyObjectRef) {
+    let Some(address) = pyre_object::with_roots!(w_fileobj => held_file(w_fileobj)) else {
         return;
     };
     lock_open_files().remove(&address);
