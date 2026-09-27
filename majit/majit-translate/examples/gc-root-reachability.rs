@@ -584,6 +584,32 @@ fn main() {
                 }
             }
         }
+        // Why the unread brackets went unread.  Behind an env var for the same
+        // reason as the nested-scope census: the gate matches this output by
+        // regex.
+        if let Ok(path) = std::env::var("GC_OPAQUE_JSON") {
+            for (reason, n) in &stats.opaque_by_reason {
+                println!("           unread because {reason}: {n} call(s)");
+            }
+            let mut out = String::new();
+            for (func, file, reason, calls) in &stats.opaque_bodies {
+                let row = serde_json::json!({
+                    "func": func, "file": file, "reason": reason, "calls": calls,
+                });
+                out.push_str(&row.to_string());
+                out.push('\n');
+            }
+            match write_rows(&path, &out, &mut opened) {
+                Ok(()) => println!(
+                    "       wrote {} unread bracket body/bodies to {path}",
+                    stats.opaque_bodies.len()
+                ),
+                Err(e) => {
+                    println!("       FAILED to write {path}: {e}");
+                    write_failed = true;
+                }
+            }
+        }
         if let Ok(path) = std::env::var("GC_SHORT_BRACKETS_JSON") {
             let mut out = String::new();
             for sb in &stats.short_brackets {

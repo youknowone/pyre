@@ -123,6 +123,12 @@ pub struct ScanStats {
     /// Locals summed over [`Self::bodies_with_movable_args`], so a body that
     /// contributes one argument is told apart from one that contributes twenty.
     pub movable_arg_locals: usize,
+    /// [`Self::withheld_contents_opaque`] split by the first reason the body's
+    /// pinned set went unread.
+    pub opaque_by_reason: std::collections::BTreeMap<&'static str, usize>,
+    /// One entry per body with unread contents: function, file, first
+    /// reason, and how many withheld calls it cost.
+    pub opaque_bodies: Vec<(String, String, &'static str, usize)>,
 }
 
 /// A pin whose argument the body goes on to read.
@@ -836,7 +842,13 @@ pub fn scan(
         if has_nested_scopes {
             stats.bodies_with_nested_scopes += 1;
         }
-        let mut opaque_contents = unparsed_terms || unparsed_stmts;
+        let mut opaque_reason: Option<&'static str> = if unparsed_terms {
+            Some("unparsed-terminator")
+        } else if unparsed_stmts {
+            Some("unparsed-statement")
+        } else {
+            None
+        };
         let mut saw_pin_call = false;
         let mut term_pins: Vec<HashSet<u64>> = vec![HashSet::new(); n];
         // The locals a pin was *handed*, as distinct from the word it hands
@@ -863,7 +875,7 @@ pub fn scan(
                 // These overwrite an existing coloured slot.  Without a
                 // slot→root map, retaining the old root or replacing the
                 // wrong one could both claim false coverage.
-                opaque_contents = true;
+                opaque_reason.get_or_insert("slot-set");
                 continue;
             }
             // Reading a slot back yields the word the slot holds now, which
@@ -904,7 +916,7 @@ pub fn scan(
             if pinned.is_empty() {
                 // A pin that named nothing we could resolve is a pin we do not
                 // understand, not one that pinned nothing.
-                opaque_contents = true;
+                opaque_reason.get_or_insert("pin-names-nothing");
             }
             term_pins[b] = pinned;
         }
@@ -916,13 +928,13 @@ pub fn scan(
             (term_closes_root_scope[b] && (closed_scope[b].is_none() || stack_at[b].is_none()))
                 || (!term_pins[b].is_empty() && owner_at[b].is_none())
         }) {
-            opaque_contents = true;
+            opaque_reason.get_or_insert("scope-owner-ambiguous");
         }
         if !bracket_blocks.is_empty() && !saw_pin_call {
             // A scope is open and nothing in this body names what went into
             // it: the pins run behind a helper that holds the scope itself,
             // as `RootedItems` does.  An unread set, not an empty one.
-            opaque_contents = true;
+            opaque_reason.get_or_insert("no-pin-in-body");
         }
 
         let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -1302,8 +1314,20 @@ pub fn scan(
                 // questions, and only the first was ever asked.  Grade the
                 // second here so a bracket that pins the wrong set stops
                 // reading as coverage.
-                if opaque_contents || !reachable.contains(&b) {
+                if opaque_reason.is_some() || !reachable.contains(&b) {
                     stats.withheld_contents_opaque += 1;
+                    let reason = opaque_reason.unwrap_or("unreachable-block");
+                    *stats.opaque_by_reason.entry(reason).or_default() += 1;
+                    let fname = fd.item_meta.name_path();
+                    match stats.opaque_bodies.last_mut() {
+                        Some(last) if last.0 == fname => last.3 += 1,
+                        _ => stats.opaque_bodies.push((
+                            fname,
+                            llbc.file_path(at.file_id).unwrap_or_default().to_string(),
+                            reason,
+                            1,
+                        )),
+                    }
                     if has_nested_scopes {
                         stats.withheld_opaque_from_nested += 1;
                     }
