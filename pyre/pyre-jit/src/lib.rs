@@ -171,6 +171,7 @@ mod tests {
     /// `jit_exc_raise`). The pending slot stays empty: `park_jit_pending_error`
     /// is its only producer.
     #[test]
+    #[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
     fn stack_overflow_probe_raises_into_backend_exception_cells() {
         use pyre_interpreter::stack_check;
         use pyre_object::interp_exceptions::{ExcKind, w_exception_kind_checked};
@@ -232,6 +233,7 @@ mod tests {
     /// `pos_exc_value` the registered raiser wrote. Each backend keeps its
     /// own cell; `store_jit_exception` writes every backend that this build
     /// compiled in.
+    #[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
     fn backend_exception_value() -> i64 {
         #[cfg(target_arch = "wasm32")]
         {
@@ -245,12 +247,9 @@ mod tests {
         {
             return majit_backend_cranelift::jit_exc_value_peek();
         }
-        #[cfg(not(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift")))]
-        {
-            0
-        }
     }
 
+    #[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
     fn clear_backend_exception_cells() {
         #[cfg(target_arch = "wasm32")]
         majit_backend_wasm::jit_exc_clear();
