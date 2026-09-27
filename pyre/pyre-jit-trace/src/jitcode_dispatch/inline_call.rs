@@ -15885,6 +15885,11 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             Ok(outcome)
         }
         Err(error) => {
+            // The callee pc is not a coordinate of this frame.
+            // `convert_and_run_from_pyjitpl` resumes every frame
+            // `aborted_tracing` captured; a single-frame adopt of the
+            // caller is not that resume.
+            ctx.session.borrow_mut().crossed_inline_subwalk = true;
             if fbw_debug_abort_enabled() {
                 eprintln!(
                     "[subwalk-propagate] jitcode_pc={pc} effects={} unjournaled={} err={error:?}",

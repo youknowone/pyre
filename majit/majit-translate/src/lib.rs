@@ -249,6 +249,7 @@ fn build_semantic_program_via_active_frontend(
             let mut immutable_fields = std::collections::HashMap::new();
             let mut unsafe_fn_stubs = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
+            let mut eval_hook_graphs = Vec::new();
             for p in &paths {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
@@ -275,6 +276,11 @@ fn build_semantic_program_via_active_frontend(
                 ) {
                     immutable_fields.entry(k).or_insert(v);
                 }
+                for path in front::mir::discover_eval_hook_graphs(&llbc) {
+                    if !eval_hook_graphs.contains(&path) {
+                        eval_hook_graphs.push(path);
+                    }
+                }
             }
             discovered.sort_by(|a, b| a.0.cmp(&b.0));
             discovered.dedup();
@@ -289,6 +295,9 @@ fn build_semantic_program_via_active_frontend(
             for (ord, p) in paths.iter().enumerate() {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
+                if !eval_hook_graphs.is_empty() {
+                    llbc.set_eval_hook_graphs(eval_hook_graphs.clone());
+                }
                 llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_cross);
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_impl_by_ord[ord]);

@@ -11697,6 +11697,7 @@ fn locals_expansion_cut_if_too_long<Sym: WalkSym>(
         ctx.trace_ctx.current_merge_points_first_green_key_pair(),
         ctx.trace_ctx.resumekey_original_loop_token().cloned(),
     );
+    ctx.session.borrow_mut().trace_too_long = true;
     Err(DispatchError::TraceTooLong { pc, ops })
 }
 

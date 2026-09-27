@@ -10380,65 +10380,21 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(trace_ops, &constants));
         }
 
-        // compile.py: optimize using UnrolledLoopData with start_state.
-        //
-        // Upstream seeds candidate visibility unconditionally.
-        // `compile.py:355-356` resolves `loop_jitcell_token =
-        // metainterp.get_procedure_token(greenkey)` before any resumekey
-        // is consulted, `:359` records the closing JUMP under that token,
-        // and `unroll.py:321-325` walks its whole `target_tokens` list.
-        // `unroll.py:297`
-        // `jitcelltoken.target_tokens.append(target_token)` then adds the
-        // retrace's own token to that same list, so the accumulation
-        // happens inside the optimizer, not in either `compile_and_attach`
-        // arm; the resumekey is first read at `:393`. The arm without one
-        // is in fact the arm that wants those candidates most:
-        // `compile.py:1007-1009` describes what it installs as "a bridge
-        // going from the interpreter to previously-compiled code ... not a
-        // loop at all but ends in a jump to the target loop".
-        //
-        // Emptying the seed on that arm is therefore a deliberate
-        // deviation, not a port. It is deliberate because pyre does not
-        // implement that install: the minting arm replaces the front door
-        // with a standalone artifact, and the close gate in
-        // `jump_to_existing_trace_impl` admits a foreign target only when
-        // it belongs to the artifact this compile attaches to — which on
-        // this arm is none, so every seeded candidate is inadmissible
-        // however it got here. A seed can thus never buy an admitted
-        // close. Its only live consumers are the loop that rebinds each
-        // token through `set_original_jitcell_token` and the
-        // republication that hands them on as the next entry's
-        // `front_target_tokens` — the route by which a retired loop lends
-        // its labels to the loop that replaced it.
-        //
-        // Two further consumers change with it, and are meant to. The
-        // virtual-state pick falls back to the exported state rather than
-        // a prior token's, and the `jump_to_preamble` fallback targets
-        // this compile's own token rather than the prior preamble. Both
-        // follow from the same install semantics: a replacement front door
-        // has no business reusing the state of a close it will never make.
-        //
-        // The binding, not the seed argument, is emptied: on the minting
-        // arm it also feeds the ownership rebind and the republication
-        // fallback further down, and that fallback fires precisely when
-        // the optimizer produced no tokens of its own. Both arms still
-        // drain the park, but only nominally — this function has already
-        // required a live `compiled_loops` entry, and the park is filled
-        // only when no such entry exists, so the `or_else` can drain
-        // nothing a live entry does not already shadow.
-        let prior_front_target_tokens = {
-            let prior_front_target_tokens = self
-                .compiled_loops
-                .get(&green_key)
-                .map(|compiled| compiled.front_target_tokens.clone())
-                .or_else(|| self.pending_preamble_tokens.swap_remove(&green_key))
-                .unwrap_or_default();
-            if retrace_resumekey.is_some() {
-                prior_front_target_tokens
-            } else {
-                Vec::new()
-            }
-        };
+        // `compile.py` `compile_retrace` resolves `loop_jitcell_token` with
+        // `get_procedure_token(greenkey)` and records the closing JUMP under
+        // that token before the resumekey is read. `unroll.py`
+        // `_jump_to_existing_trace` walks that token's `target_tokens`.
+        // `ResumeFromInterpDescr.compile_and_attach` then installs a new
+        // token whose trace is not a loop: it ends in a jump to the previous
+        // loop. Both arms seed those candidates. `record_loop_or_bridge`
+        // keeps a foreign JUMP target alive on the token this compile
+        // installs (`record_jump_to`).
+        let prior_front_target_tokens = self
+            .compiled_loops
+            .get(&green_key)
+            .map(|compiled| compiled.front_target_tokens.clone())
+            .or_else(|| self.pending_preamble_tokens.swap_remove(&green_key))
+            .unwrap_or_default();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.enable_opts = self.warm_state.get_enable_opts().to_vec();
         unroll_opt.supports_efficient_uint_mul_high =
@@ -10452,17 +10408,19 @@ impl<M: Clone> MetaInterp<M> {
         );
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().clone();
         unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
-        // `AbstractResumeGuardDescr.compile_and_attach`, `compile.py`,
-        // installs a retrace grown from a guard failure under
-        // `resumekey_original_loop_token`, so a close onto one of that token's
-        // target tokens stays inside a single live code buffer and may be
-        // admitted. The arm without a resumekey seeds nothing, so it has no
-        // candidate to admit.
+        // A guard-failure retrace attaches beside the guard's owning token
+        // (`ResumeGuardDescr.compile_and_attach`). Without a resumekey the
+        // closing JUMP's descr is `loop_jitcell_token` itself
+        // (`compile_retrace`), so that token is the artifact whose
+        // `target_tokens` a close may enter. `record_jump_to` then keeps
+        // the target alive after this compile mints its own installation
+        // token.
         unroll_opt.attach_jitcell_token_number = retrace_resumekey
             .as_ref()
             .and_then(|bridge| bridge.source_descr.as_fail_descr())
             .and_then(majit_backend::descr_owning_jct)
-            .map(|source_jct| source_jct.number);
+            .map(|source_jct| source_jct.number)
+            .or(Some(loop_jitcell_token.number));
         unroll_opt.retraced_count = loop_jitcell_token.get_retraced_count();
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
@@ -10775,18 +10733,27 @@ impl<M: Clone> MetaInterp<M> {
             Ok(_) => {
                 self.last_compiled_artifact_token = Some(token.clone());
                 self.assign_guard_hashes(&combined_ops);
-                // `compile.py` `propagate_original_jitcell_token(new_loop)`,
-                // whose body at `:463-468` walks the trace's LABELs and sets
-                // each `TargetToken.original_jitcell_token` to the token this
-                // compile installs under. Both `compile_and_attach` arms run
-                // it (`:806` and `:1014`), so re-stamping is upstream's own
-                // step on this path, not a consequence of minting.
-                //
-                // Their descrs are mirrored onto `JitCellToken.target_tokens`
-                // for `has_compiled_targets` (`pyjitpl.py`); see the
-                // note there about upstream leaving the minted token's list
-                // empty on this arm.
-                for target_token in &unroll_opt.target_tokens {
+                // `compile.py` `propagate_original_jitcell_token` walks LABEL
+                // descrs only. The seeded `target_tokens` also hold the
+                // previous loop's labels, which this trace may JUMP to;
+                // rebinding those would drop their owner, and
+                // `record_loop_or_bridge` would then not `record_jump_to`
+                // the token whose machine code the JUMP still enters.
+                let minted_label_tokens: Vec<_> = unroll_opt
+                    .target_tokens
+                    .iter()
+                    .filter(|target_token| {
+                        let descr = target_token.as_jump_target_descr();
+                        combined_ops.iter().any(|op| {
+                            op.opcode == majit_ir::OpCode::Label
+                                && op.getdescr().is_some_and(|candidate| {
+                                    std::sync::Arc::ptr_eq(&candidate, &descr)
+                                })
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                for target_token in &minted_label_tokens {
                     target_token.set_original_jitcell_token(&token);
                     token.record_target_token(target_token.as_jump_target_descr());
                 }
@@ -10883,10 +10850,15 @@ impl<M: Clone> MetaInterp<M> {
                         "@@@SPDIAG FINISH-compile compiled_loops.insert green_key={green_key}"
                     );
                 }
-                let front_target_tokens = if unroll_opt.target_tokens.is_empty() {
+                // Labels this compile actually emitted. The seeded previous
+                // loop stays reachable through the JUMP (`record_jump_to`),
+                // not by republishing its labels as this token's scan list.
+                // No new label: keep the previous scan list so a later
+                // retrace can still see those candidates.
+                let front_target_tokens = if minted_label_tokens.is_empty() {
                     prior_front_target_tokens
                 } else {
-                    unroll_opt.target_tokens.clone()
+                    minted_label_tokens
                 };
                 let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
                 token.set_retraced_count(unroll_opt.retraced_count);
@@ -18446,7 +18418,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Pyre's inlined Python frames share the portal jitcode, so each section
     /// is a portal frame and `portal_call_depth` counts them. The pc is still
     /// per section: leaving every frame at 0 resumes the callee at the
-    /// caller's entry.
+    /// caller's entry. Register fill is [`Self::consume_portal_resume_boxes`].
     pub fn rebuild_portal_framestack_from_resume(
         &mut self,
         mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
@@ -18467,8 +18439,92 @@ impl<M: Clone> MetaInterp<M> {
                 continue;
             };
             if let Some(frame) = self.framestack.frames.get_mut(frame_index) {
-                // resume.py: `f.setup_resume_at_op(pc)` — body is `self.pc = pc`.
+                // resume.py `MIFrame.setup_resume_at_op`: `self.pc = pc`.
                 frame.setup_resume_at_op(pc);
+            }
+        }
+    }
+
+    /// `resume.py` `rebuild_from_resumedata` for a bridge that already
+    /// decoded its sections. Same portal frame per section as
+    /// [`Self::rebuild_portal_framestack_from_resume`], then
+    /// `consume_boxes` into that frame's registers.
+    pub fn rebuild_portal_framestack_from_resumedata(
+        &mut self,
+        mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
+        frames: &[majit_ir::resumedata::RebuiltFrame],
+        fail_values: &[i64],
+    ) {
+        let resume_pcs: Vec<i32> = frames.iter().map(|frame| frame.pc).collect();
+        self.rebuild_portal_framestack_from_resume(mainjitcode, &resume_pcs);
+        self.consume_portal_resume_boxes(frames, fail_values);
+    }
+
+    /// `resume.py` `ResumeDataBoxReader.consume_boxes`: pair each section's
+    /// rebuilt values with that jitcode's live registers and store the box.
+    ///
+    /// A count mismatch leaves the frame's registers unset. Pairing them
+    /// anyway would write a value into a different register than
+    /// `enumerate_vars` named. A virtual stays unset; the guard-resume walk
+    /// allocates it through `materialize_bridge_virtual`.
+    fn consume_portal_resume_boxes(
+        &mut self,
+        frames: &[majit_ir::resumedata::RebuiltFrame],
+        fail_values: &[i64],
+    ) {
+        let op_live = self.staticdata.op_live as u8;
+        let liveness = self.staticdata.liveness_info.clone();
+        let registered = self.jitcodes().to_vec();
+        let n = self.framestack.frames.len().min(frames.len());
+        for i in 0..n {
+            let section = &frames[i];
+            // A negative pc is not a jitcode position (`setup_resume_at_op`
+            // leaves the frame at 0). Pairing values against pc 0 would
+            // write them into the wrong registers.
+            let Ok(pc) = usize::try_from(section.pc) else {
+                continue;
+            };
+            let jitcode = registered
+                .get(section.jitcode_index as usize)
+                .cloned()
+                .unwrap_or_else(|| self.framestack.frames[i].jitcode.clone());
+            let indices =
+                crate::resume::read_frame_liveness_reg_indices(&jitcode, pc, op_live, &liveness);
+            if indices.total_len() != section.values.len() {
+                continue;
+            }
+            let mut order = Vec::with_capacity(indices.total_len());
+            for index in indices.int {
+                order.push((majit_ir::Type::Int, index as usize));
+            }
+            for index in indices.ref_ {
+                order.push((majit_ir::Type::Ref, index as usize));
+            }
+            for index in indices.float {
+                order.push((majit_ir::Type::Float, index as usize));
+            }
+            let frame = &mut self.framestack.frames[i];
+            for (slot, value) in order.into_iter().zip(section.values.iter()) {
+                let Some((opref, bits)) = crate::resume::resume_register_box(value, fail_values)
+                else {
+                    continue;
+                };
+                let (bank, index) = slot;
+                match bank {
+                    majit_ir::Type::Int if index < frame.int_regs.len() => {
+                        frame.int_regs[index] = Some(opref);
+                        frame.int_values[index] = Some(bits);
+                    }
+                    majit_ir::Type::Ref if index < frame.ref_regs.len() => {
+                        frame.ref_regs[index] = Some(opref);
+                        frame.ref_values[index] = Some(bits);
+                    }
+                    majit_ir::Type::Float if index < frame.float_regs.len() => {
+                        frame.float_regs[index] = Some(opref);
+                        frame.float_values[index] = Some(bits);
+                    }
+                    _ => {}
+                }
             }
         }
     }

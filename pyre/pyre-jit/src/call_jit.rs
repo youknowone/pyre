@@ -3877,17 +3877,21 @@ pub fn trace_and_compile_from_bridge(
     // encoded section, no greenkey. The portal jitcode is the Python
     // driver's mainjitcode for every inlined user function.
     if let Some(portal) = pyre_jit_trace::jitcode_runtime::portal_metainterp_jitcode() {
+        // resume.py `rebuild_from_resumedata` reads one section at a time:
+        // `newframe`, `setup_resume_at_op(pc)`, then `consume_boxes`.
+        // Outermost first. Clone the sections before the meta borrow.
+        let resume_frames = {
+            let (driver, _) = crate::eval::driver_pair();
+            driver
+                .resume_data_result
+                .as_ref()
+                .map(|result| result.frames.clone())
+                .unwrap_or_default()
+        };
         let (driver, _) = crate::eval::driver_pair();
-        // resume.py rebuild_from_resumedata reads one pc per section and
-        // calls setup_resume_at_op on that frame. Outermost first.
-        let resume_pcs: Vec<i32> = driver
-            .resume_data_result
-            .as_ref()
-            .map(|r| r.frames.iter().map(|frame| frame.pc).collect())
-            .unwrap_or_default();
         driver
             .meta_interp_mut()
-            .rebuild_portal_framestack_from_resume(portal, &resume_pcs);
+            .rebuild_portal_framestack_from_resumedata(portal, &resume_frames, raw_values);
     }
     // `_prepare_exception_resumption` (pyjitpl.py) +
     // `prepare_resume_from_failure` (pyjitpl.py) parity: for exception

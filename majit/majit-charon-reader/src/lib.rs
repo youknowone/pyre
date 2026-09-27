@@ -74,6 +74,12 @@ pub struct Llbc {
     /// the lowering already loads with `global_by_id`; it is not a path
     /// string and not a thread-local.
     foldable_const_lits: parking_lot::RwLock<Vec<(u64, String)>>,
+    /// Crate-stripped call paths of the prebuilt eval hook.
+    /// `register_eval_override`'s function argument plus the function
+    /// `plain_eval_fn_addr` casts. Empty until the translator publishes
+    /// the set harvested across the linked artefacts. Not a path-keyed
+    /// map: membership is a short ordered list.
+    eval_hook_graphs: parking_lot::RwLock<Vec<String>>,
     /// Trait-decl id → associated-type bindings of its unique impl.
     /// `trait_impls` is immutable after parse, so the map is built once.
     /// See [`TraitAssocIndex`].
@@ -224,6 +230,7 @@ impl Llbc {
             dedup_body,
             transparent_scalar_kinds: parking_lot::RwLock::new(Vec::new()),
             foldable_const_lits: parking_lot::RwLock::new(Vec::new()),
+            eval_hook_graphs: parking_lot::RwLock::new(Vec::new()),
             trait_assoc_index: std::sync::OnceLock::new(),
         })
     }
@@ -260,6 +267,19 @@ impl Llbc {
             ),
             Err(index) => lits.insert(index, (def_id, encoded)),
         }
+    }
+
+    /// Publish the prebuilt eval-hook family harvested from the linked
+    /// artefacts. Later readers see this list; an empty publish clears it.
+    pub fn set_eval_hook_graphs(&self, paths: Vec<String>) {
+        *self.eval_hook_graphs.write() = paths;
+    }
+
+    /// Crate-stripped paths of `register_eval_override`'s target and of
+    /// `plain_eval_fn_addr`'s function, when the translator has published
+    /// them. Empty before that publish.
+    pub fn eval_hook_graphs(&self) -> Vec<String> {
+        self.eval_hook_graphs.read().clone()
     }
 
     /// The folded initializer stored on `def_id`, if this artefact has one.

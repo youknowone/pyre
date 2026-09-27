@@ -508,6 +508,18 @@ fn p2_drain_abort() -> TraceAction {
     TraceAction::Abort
 }
 
+/// `pyjitpl.py` `raise SwitchToBlackhole(ABORT_TOO_LONG)`.
+/// `full_body_walk_trace` and the bridge-carrier drain share this signal:
+/// `note_root_trace_too_long` already ran `blackhole_if_trace_too_long`'s
+/// `find_biggest_function` / `prepare_trace_segmenting` arms, and the
+/// driver counts whatever reason this action carries.
+fn abort_too_long_action() -> TraceAction {
+    TraceAction::SwitchToBlackhole(majit_metainterp::SwitchToBlackhole {
+        reason: majit_metainterp::counters::ABORT_TOO_LONG,
+        raising_exception: false,
+    })
+}
+
 pub fn take_fbw_bridge_declined() -> bool {
     FBW_BRIDGE_DECLINED.with(|c| c.replace(false))
 }
@@ -2359,6 +2371,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // Clearing first keeps the same protection against a stale stash while
     // leaving whatever the adopt installs intact.
     crate::jitcode_dispatch::fbw_finish_payload_reset();
+    let crossed_inline_subwalk = session.borrow().crossed_inline_subwalk;
     let adopted = crate::jitcode_dispatch::fbw_executed_effect_count() != effects_at_entry
         && try_adopt_blackhole(
             flush_committed,
@@ -2366,6 +2379,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             cf_addr,
             live_root_addr,
             WalkEndCommitLeg::CarrierAbort,
+            crossed_inline_subwalk,
         );
     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
         eprintln!(
@@ -2401,6 +2415,22 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // cursors back on the same condition.
         crate::jitcode_dispatch::fbw_store_journal_rollback();
         crate::jitcode_dispatch::fbw_bridge_iter_journal_rollback();
+    }
+    // An inlined `TraceTooLong` is `SwitchToBlackhole(ABORT_TOO_LONG)` on
+    // the outer walk (`full_body_walk_trace`). The carrier drain used to
+    // drop that `Result` and return `Abort`, which the driver counted as
+    // `AbortReason::Generic` (`mc_diag` 71) because the discarded trace is
+    // no longer `is_too_long`. The raise already ran
+    // `note_root_trace_too_long`.
+    if session.borrow().trace_too_long
+        || matches!(
+            walk,
+            Some(Err(
+                crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
+            ))
+        )
+    {
+        return abort_too_long_action();
     }
     p2_drain_abort()
 }
@@ -3105,6 +3135,7 @@ fn try_adopt_single_frame_blackhole(
     cf_addr: usize,
     live_root_addr: usize,
     commit_leg: WalkEndCommitLeg,
+    crossed_inline_subwalk: bool,
 ) -> bool {
     macro_rules! sfdbg {
         ($($a:tt)*) => {
@@ -3112,6 +3143,16 @@ fn try_adopt_single_frame_blackhole(
                 eprintln!("[s1-adopt] {}", format!($($a)*));
             }
         };
+    }
+    // `aborted_tracing` hands every framestack frame to
+    // `convert_and_run_from_pyjitpl`. An error that crossed an inline
+    // sub-walk still names the callee pc, while the latched image is the
+    // caller at the call and its banks were not written for that call.
+    // Decline into entry replay before anything runs.
+    if crossed_inline_subwalk {
+        sfdbg!("decline leg={commit_leg:?} crossed-inline-subwalk");
+        crate::jitcode_dispatch::reset_single_frame_blackhole();
+        return false;
     }
     // A zero-effect overlong walk deliberately permits entry replay even when
     // no blackhole image was representable. Only an effectful TraceTooLong
@@ -4338,6 +4379,7 @@ fn try_adopt_blackhole(
     cf_addr: usize,
     live_root_addr: usize,
     commit_leg: WalkEndCommitLeg,
+    crossed_inline_subwalk: bool,
 ) -> bool {
     try_adopt_multi_frame_blackhole(flush_committed, ctx, cf_addr, live_root_addr, commit_leg)
         || try_adopt_single_frame_blackhole(
@@ -4346,6 +4388,7 @@ fn try_adopt_blackhole(
             cf_addr,
             live_root_addr,
             commit_leg,
+            crossed_inline_subwalk,
         )
 }
 
@@ -5171,6 +5214,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         // forward abort has already distinguished an outside mark from a mark
         // inside its discarded attempt.
         let live_root_addr = sym.live_vable_frame_addr();
+        let crossed_inline_subwalk = session.borrow().crossed_inline_subwalk;
         let trace_too_long_adopted = matches!(
             &walk_result,
             Err(crate::jitcode_dispatch::DispatchError::TraceTooLong { .. })
@@ -5180,6 +5224,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             cf_addr,
             live_root_addr,
             WalkEndCommitLeg::TraceTooLong,
+            crossed_inline_subwalk,
         );
         // A successful segment cut arrives as `Ok`; a cut whose guard snapshot
         // could not be represented arrives as the dedicated `Err` below so the
@@ -5200,6 +5245,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             cf_addr,
             live_root_addr,
             WalkEndCommitLeg::SegmentTrace,
+            crossed_inline_subwalk,
         );
         if segment_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] adopted ABORT_SEGMENTED_TRACE forward resume");
@@ -5244,6 +5290,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 cf_addr,
                 live_root_addr,
                 WalkEndCommitLeg::WalkAbort,
+                crossed_inline_subwalk,
             );
         if walk_abort_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] adopted WALK_ABORT forward resume");
@@ -5259,6 +5306,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 cf_addr,
                 live_root_addr,
                 WalkEndCommitLeg::VableEscape,
+                crossed_inline_subwalk,
             );
         let mut escape_pc_adopted = false;
         // What a VableEscape whose adopt did not commit must do once the walk
@@ -7150,12 +7198,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 );
             }
             match e {
-                DE::TraceTooLong { .. } => TraceAction::SwitchToBlackhole(
-                    majit_metainterp::SwitchToBlackhole {
-                        reason: majit_metainterp::counters::ABORT_TOO_LONG,
-                        raising_exception: false,
-                    },
-                ),
+                DE::TraceTooLong { .. } => abort_too_long_action(),
                 // A kept-stack branch guard whose not-taken arm reads an
                 // unrestorable boxed Ref register is a structural abort.
                 // Keeping the permanent mapping is behavior-neutral: a plain

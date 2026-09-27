@@ -6317,31 +6317,18 @@ impl TraceCtx {
     /// num_green_args)` — the loop header the trace is closing ON, read from
     /// the greens it closes WITH.
     ///
-    /// `close_greens` is `live_arg_boxes[:num_green_args]` for the close the
-    /// walk just performed; its first green is the guest pc, which is what
-    /// [`MergePoint::header_pc`] records. `header_pc` is the header the walk
-    /// last registered and a close on a different loop leaves it stale, so
-    /// merge-point matching has to go through here rather than read it
-    /// directly. Falls back to `header_pc` when the walk recorded no close
-    /// greens (nothing to compare against, so the session's own header is
-    /// the only candidate).
+    /// The guest pc is `close_green_pc`, the same value
+    /// `close_green_key` hashes. It is not `close_greens.0[0]` (that bank
+    /// is the remaining int greens) and not the trace-start `header_pc`,
+    /// which a close on another loop leaves stale. `same_greenkey` always
+    /// reads the closing boxes; slot 56 counts a close that never recorded
+    /// a pc, where the session header is the only value left.
     pub fn close_header_pc(&self) -> usize {
-        match self
-            .close_greens
-            .as_ref()
-            .and_then(|greens| greens.0.first().copied())
-        {
-            Some(pc) => pc as usize,
-            None => {
-                // `pyjitpl.py same_greenkey(original_boxes,
-                // live_arg_boxes, num_green_args)` always compares the actual
-                // closing boxes; upstream has no header-pc fallback. Slot 56
-                // counts every firing so a corpus reading 0 can promote this
-                // fallback to a `debug_assert!`.
-                crate::mc_diag_bump(56);
-                self.header_pc
-            }
+        if let Some(pc) = self.close_green_pc {
+            return pc as usize;
         }
+        crate::mc_diag_bump(56);
+        self.header_pc
     }
 
     /// Hash-only [`Self::find_merge_point_same_greenkey`]. `header_pc` does
