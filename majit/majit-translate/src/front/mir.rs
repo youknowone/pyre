@@ -6899,6 +6899,10 @@ impl<'a> Lowering<'a> {
                 self.block_entry_local_var[bb] = PackedLocalRow::pack(&self.local_var);
             }
             self.lower_block(bb)?;
+            // A whole-enum move closes this MIR block's head with a
+            // discriminant switch and leaves the real terminator on the
+            // join. Successors are that join's exits.
+            let bb_id = self.block_id[bb];
             let mut ex = self.getstate();
             // Scrub phantom locals before threading.  A slot bound to a
             // Variable that is neither an inputarg nor an op result of this
@@ -6939,7 +6943,7 @@ impl<'a> Lowering<'a> {
                 if tgt == returnblock || tgt == exceptblock {
                     continue;
                 }
-                let tmir = block_to_mir[tgt.0];
+                let tmir = block_to_mir.get(tgt.0).copied().unwrap_or(usize::MAX);
                 if tmir == usize::MAX {
                     continue;
                 }
@@ -7037,7 +7041,7 @@ impl<'a> Lowering<'a> {
                 if tgt == returnblock || tgt == exceptblock {
                     continue;
                 }
-                let tmir = block_to_mir[tgt.0];
+                let tmir = block_to_mir.get(tgt.0).copied().unwrap_or(usize::MAX);
                 if tmir == usize::MAX {
                     continue;
                 }
@@ -18504,6 +18508,15 @@ impl<'a> Lowering<'a> {
         place: &Place,
         new_value: Variable,
     ) -> Result<Option<Variable>, LowerError> {
+        if new_value.is_none()
+            && self
+                .move_plan(&place.ty)
+                .is_some_and(|plan| !plan.arms.is_empty())
+        {
+            // `mem::take` would store `T::default()`. An enum's default is
+            // one variant, not a zero of every overlapping payload.
+            return Ok(None);
+        }
         let Some(old) = self.read_moved_aggregate(mir_bb, place)? else {
             return Ok(None);
         };
@@ -18521,6 +18534,9 @@ impl<'a> Lowering<'a> {
         let Some(plan) = self.move_plan(&place.ty) else {
             return Ok(None);
         };
+        if !plan.arms.is_empty() {
+            return self.copy_enum_switch(mir_bb, place, &plan, None);
+        }
         let base = self.deref_base(mir_bb, place)?;
         let mut parts = Vec::with_capacity(plan.spans.len());
         for span in &plan.spans {
@@ -18538,12 +18554,88 @@ impl<'a> Lowering<'a> {
         let Some(plan) = self.move_plan(&place.ty) else {
             return Ok(false);
         };
+        if !plan.arms.is_empty() {
+            self.copy_enum_switch(mir_bb, place, &plan, Some(value.clone()))?;
+            return Ok(true);
+        }
         let base = self.deref_base(mir_bb, place)?;
         for span in &plan.spans {
             let part = self.emit_span_read(mir_bb, value, span);
             self.emit_span_write(mir_bb, &base, span, part);
         }
         Ok(true)
+    }
+
+    /// Whole-enum move: switch on `__discriminant`, then copy that
+    /// variant's fields. `new_value` stores into `place`; `None` reads
+    /// `place` and returns the join phi.
+    fn copy_enum_switch(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+        plan: &MovePlan,
+        new_value: Option<Variable>,
+    ) -> Result<Option<Variable>, LowerError> {
+        let discr = plan
+            .spans
+            .first()
+            .expect("enum move plan carries __discriminant");
+        let head = self.block_id[mir_bb];
+        let slot = self.deref_base(mir_bb, place)?;
+        let src = new_value.clone().unwrap_or_else(|| slot.clone());
+        let tag = self.emit_span_read(mir_bb, &src, discr);
+        let (join, phi) = if new_value.is_none() {
+            let (join, vars) = self.graph.create_block_with_arg_vars(1);
+            (
+                join,
+                Some(vars.into_iter().next().expect("enum move phi")),
+            )
+        } else {
+            (self.graph.create_block(), None)
+        };
+        let mut links = Vec::with_capacity(plan.arms.len());
+        for arm in &plan.arms {
+            let arm_bb = self.graph.create_block();
+            self.block_id[mir_bb] = arm_bb;
+            if new_value.is_none() {
+                let mut parts = Vec::with_capacity(1 + arm.spans.len());
+                parts.push(tag.clone());
+                for span in &arm.spans {
+                    parts.push(self.emit_span_read(mir_bb, &src, span));
+                }
+                let mut spans = Vec::with_capacity(parts.len());
+                spans.push(discr.clone());
+                spans.extend(arm.spans.iter().cloned());
+                let agg_plan = MovePlan {
+                    ctor_id: plan.ctor_id,
+                    spans,
+                    arms: Vec::new(),
+                };
+                let agg = self.emit_span_aggregate(mir_bb, &agg_plan, &parts);
+                self.graph.set_goto(arm_bb, join, vec![agg]);
+            } else {
+                for span in &arm.spans {
+                    let part = self.emit_span_read(mir_bb, &src, span);
+                    self.emit_span_write(mir_bb, &slot, span, part);
+                }
+                self.emit_span_write(mir_bb, &slot, discr, tag.clone());
+                self.graph.set_goto(arm_bb, join, Vec::new());
+            }
+            links.push(
+                Link::from_variables(
+                    &self.graph,
+                    Vec::new(),
+                    arm_bb,
+                    Some(ExitCase::Const(ConstValue::Int(arm.discr))),
+                )
+                .with_prevblock(head)
+                .with_llexitcase_from_exitcase(),
+            );
+        }
+        self.graph.block_mut(head).exitswitch = Some(ExitSwitch::Value(tag));
+        self.graph.closeblock(head, links);
+        self.block_id[mir_bb] = join;
+        Ok(phi)
     }
 
     fn deref_base(&mut self, mir_bb: usize, place: &Place) -> Result<Variable, LowerError> {
@@ -18604,46 +18696,56 @@ impl<'a> Lowering<'a> {
                 if spans.is_empty() {
                     return None;
                 }
-                Some(MovePlan { ctor_id: id, spans })
+                Some(MovePlan {
+                    ctor_id: id,
+                    spans,
+                    arms: Vec::new(),
+                })
             }
             TypeDeclKind::Enum(variants) => {
                 let name_path = td.item_meta.name_path();
                 let leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
                 let canon = strip_crate_prefix(&name_path);
                 let base_id = majit_ir::descr::StructId::from_canonical(&canon);
-                let mut candidates: Vec<MoveSpan> = Vec::new();
-                if let (Some(offset), Some(int_ty)) =
+                // A union payload has no single kind (`rclass.py` never
+                // bit-copies a pointer into an int). The move is a switch
+                // on `__discriminant` and a typed copy of the live variant.
+                let (Some(disc_offset), Some(int_ty)) =
                     (layout.discriminant_offset(), layout.discriminant_int_type())
-                {
-                    let itemsize = int_type_byte_width(int_ty) as usize;
-                    if itemsize == 0 || itemsize > 8 {
-                        return None;
-                    }
-                    let signed = int_ty.starts_with('i');
-                    let item_ty = if signed {
-                        ValueType::Int
-                    } else {
-                        ValueType::Unsigned
-                    };
-                    // `getfield` of `__discriminant`. `raw_load` requires an
-                    // int-kind address; the slot is a reference.
-                    candidates.push(MoveSpan {
-                        offset,
-                        bytes: itemsize,
-                        kind: SpanKind::Field {
-                            name: "__discriminant".to_string(),
-                            owner: leaf.clone(),
-                            owner_id: base_id,
-                            ty: item_ty,
-                        },
-                    });
+                else {
+                    return None;
+                };
+                let itemsize = int_type_byte_width(int_ty) as usize;
+                if itemsize == 0 || itemsize > 8 {
+                    return None;
                 }
+                let signed = int_ty.starts_with('i');
+                let item_ty = if signed {
+                    ValueType::Int
+                } else {
+                    ValueType::Unsigned
+                };
+                let discr = MoveSpan {
+                    offset: disc_offset,
+                    bytes: itemsize,
+                    kind: SpanKind::Field {
+                        name: "__discriminant".to_string(),
+                        owner: leaf.clone(),
+                        owner_id: base_id,
+                        ty: item_ty,
+                    },
+                };
+                let mut arms = Vec::with_capacity(variants.len());
                 for (vidx, variant) in variants.iter().enumerate() {
+                    let Some(discr_value) = variant.discriminant_i64() else {
+                        return None;
+                    };
                     let variant_owner = format!("{leaf}::{}", variant.name);
                     let variant_id = majit_ir::descr::StructId::from_canonical(&format!(
                         "{canon}::{}",
                         variant.name
                     ));
+                    let mut candidates: Vec<MoveSpan> = Vec::new();
                     for (i, field) in variant.fields.iter().enumerate() {
                         let Some(offset) = layout.field_offset(vidx, i) else {
                             return None;
@@ -18671,28 +18773,36 @@ impl<'a> Lowering<'a> {
                             },
                         });
                     }
-                }
-                candidates.sort_by(|left, right| {
-                    left.offset
-                        .cmp(&right.offset)
-                        .then(right.bytes.cmp(&left.bytes))
-                });
-                let mut spans: Vec<MoveSpan> = Vec::new();
-                for candidate in candidates {
-                    let start = candidate.offset;
-                    let end = start + candidate.bytes as u64;
-                    let overlaps = spans.iter().any(|kept| {
-                        let kept_end = kept.offset + kept.bytes as u64;
-                        start < kept_end && kept.offset < end
+                    candidates.sort_by(|left, right| {
+                        left.offset
+                            .cmp(&right.offset)
+                            .then(right.bytes.cmp(&left.bytes))
                     });
-                    if !overlaps {
-                        spans.push(candidate);
+                    let mut arm_spans: Vec<MoveSpan> = Vec::new();
+                    for candidate in candidates {
+                        let start = candidate.offset;
+                        let end = start + candidate.bytes as u64;
+                        let overlaps = arm_spans.iter().any(|kept| {
+                            let kept_end = kept.offset + kept.bytes as u64;
+                            start < kept_end && kept.offset < end
+                        });
+                        if !overlaps {
+                            arm_spans.push(candidate);
+                        }
                     }
+                    arms.push(EnumMoveArm {
+                        discr: discr_value,
+                        spans: arm_spans,
+                    });
                 }
-                if spans.is_empty() {
+                if arms.is_empty() {
                     return None;
                 }
-                Some(MovePlan { ctor_id: id, spans })
+                Some(MovePlan {
+                    ctor_id: id,
+                    spans: vec![discr],
+                    arms,
+                })
             }
             _ => None,
         }
@@ -31320,8 +31430,17 @@ enum MemSlot {
 struct MovePlan {
     ctor_id: u64,
     spans: Vec<MoveSpan>,
+    /// Empty for a struct. An enum move switches on `spans`' discriminant
+    /// and copies `arms` (one live variant).
+    arms: Vec<EnumMoveArm>,
 }
 
+struct EnumMoveArm {
+    discr: i64,
+    spans: Vec<MoveSpan>,
+}
+
+#[derive(Clone)]
 struct MoveSpan {
     offset: u64,
     /// Physical width. Overlap uses this, not the JIT field's word size.
@@ -31329,6 +31448,7 @@ struct MoveSpan {
     kind: SpanKind,
 }
 
+#[derive(Clone)]
 enum SpanKind {
     /// Named field. `getfield_gc` / `setfield_gc`.
     Field {
@@ -34056,9 +34176,18 @@ fn type_node_box_pointee<'l>(
 /// pointer.  Kept separate from the Option recognizer so real-artefact tests
 /// can pin Charon's Box spelling directly.
 fn type_node_is_thin_box(node: &serde_json::Value, llbc: &Llbc) -> bool {
-    type_node_box_pointee(node, llbc)
-        .and_then(|pointee| strip_ty_wrappers(pointee, llbc))
-        .and_then(adt_node_def_id)
+    let Some(pointee) = type_node_box_pointee(node, llbc) else {
+        return false;
+    };
+    let Some(peeled) = strip_ty_wrappers(pointee, llbc) else {
+        return false;
+    };
+    // `Box<i64>`'s pointee is a literal, not an ADT. A sized literal is one
+    // pointer word, the same as `Box<Struct>` whose layout size is known.
+    if json_ty_literal_byte_size(peeled).is_some() {
+        return true;
+    }
+    adt_node_def_id(peeled)
         .and_then(|def_id| llbc.type_by_id(def_id))
         .and_then(|td| td.layout_for_target(&std::env::var("TARGET").unwrap_or_default()))
         .and_then(|layout| layout.size)

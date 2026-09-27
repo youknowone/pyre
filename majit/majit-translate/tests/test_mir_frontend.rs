@@ -1838,3 +1838,61 @@ fn store_through_union_int_is_setfield_not_deref_write() {
         "expected HeldUnion::Int.__pos_0 setfield, writes={writes:?}\n{ssa_dump}"
     );
 }
+
+/// A whole `HeldUnion` move switches on `__discriminant`. The `Ref`
+/// payload is read only in its own arm, so an `Int` value is never
+/// loaded as a reference.
+#[test]
+fn whole_enum_move_switches_per_variant() {
+    use majit_translate::model::{ExitSwitch, OpKind};
+    let llbc = load_corpus();
+    let graph = lower_function(llbc, "replace_held_union").unwrap_or_else(|e| panic!("{e}"));
+    let mut switch_blocks = Vec::new();
+    let mut ref_blocks = Vec::new();
+    let mut int_blocks = Vec::new();
+    for block in &graph.blocks {
+        if matches!(block.exitswitch, Some(ExitSwitch::Value(_))) {
+            switch_blocks.push(block.id);
+        }
+        for op in &block.operations {
+            if let OpKind::FieldRead { field, ty, .. } = &op.kind {
+                if field.name != "__pos_0" {
+                    continue;
+                }
+                let owner = field.owner_root.clone().unwrap_or_default();
+                if owner.contains("HeldUnion::Ref") {
+                    assert!(
+                        matches!(ty, majit_translate::model::ValueType::Ref(_)),
+                        "Ref payload read as {ty:?}"
+                    );
+                    ref_blocks.push(block.id);
+                }
+                if owner.contains("HeldUnion::Int") {
+                    assert!(
+                        matches!(
+                            ty,
+                            majit_translate::model::ValueType::Int
+                                | majit_translate::model::ValueType::Unsigned
+                        ),
+                        "Int payload read as {ty:?}"
+                    );
+                    int_blocks.push(block.id);
+                }
+            }
+        }
+    }
+    assert!(
+        !switch_blocks.is_empty(),
+        "whole-enum move has no discriminant switch"
+    );
+    assert!(!ref_blocks.is_empty(), "no HeldUnion::Ref.__pos_0 read");
+    assert!(!int_blocks.is_empty(), "no HeldUnion::Int.__pos_0 read");
+    assert!(
+        ref_blocks.iter().all(|block| !switch_blocks.contains(block)),
+        "Ref payload read sits on the switch block: ref={ref_blocks:?} switch={switch_blocks:?}"
+    );
+    assert!(
+        ref_blocks.iter().all(|block| !int_blocks.contains(block)),
+        "Ref and Int payloads are read in one block: ref={ref_blocks:?} int={int_blocks:?}"
+    );
+}
