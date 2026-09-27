@@ -295,9 +295,9 @@ fn ga_call(args: &[PyObjectRef]) -> crate::PyResult {
 
 /// `GenericAlias.__getattribute__` (`_pypy_generic_alias.py`).
 fn ga_getattribute(args: &[PyObjectRef]) -> crate::PyResult {
-    let self_ = self_alias(args)?;
+    let mut self_ = self_alias(args)?;
     let name_obj = args.get(1).copied().unwrap_or_else(w_none);
-    let name = crate::baseobjspace::text_w(name_obj)?;
+    let name = pyre_object::with_roots!(self_ => crate::baseobjspace::text_w(name_obj))?;
     if !is_attr_exception(name) && !is_attr_blocked(name) {
         let origin = unsafe { w_generic_alias_get_origin(self_) };
         crate::baseobjspace::getattr_str(origin, name)
@@ -329,19 +329,19 @@ fn ga_dir(args: &[PyObjectRef]) -> crate::PyResult {
 
 /// `GenericAlias.__eq__` (`_pypy_generic_alias.py`).
 fn ga_eq(args: &[PyObjectRef]) -> crate::PyResult {
-    let self_ = args.first().copied().unwrap_or_else(w_none);
-    let other = args.get(1).copied().unwrap_or_else(w_none);
+    let mut self_ = args.first().copied().unwrap_or_else(w_none);
+    let mut other = args.get(1).copied().unwrap_or_else(w_none);
     if !unsafe { is_generic_alias(self_) } || !unsafe { is_generic_alias(other) } {
         return Ok(w_not_implemented());
     }
     let eq = unsafe {
-        crate::baseobjspace::eq_w(
+        pyre_object::with_roots!(self_, other => crate::baseobjspace::eq_w(
             w_generic_alias_get_origin(self_),
             w_generic_alias_get_origin(other),
-        )? && crate::baseobjspace::eq_w(
+        ))? && pyre_object::with_roots!(self_, other => crate::baseobjspace::eq_w(
             w_generic_alias_get_args(self_),
             w_generic_alias_get_args(other),
-        )? && w_generic_alias_get_unpacked(self_) == w_generic_alias_get_unpacked(other)
+        ))? && w_generic_alias_get_unpacked(self_) == w_generic_alias_get_unpacked(other)
     };
     Ok(w_bool_from(eq))
 }
@@ -805,11 +805,13 @@ pub(crate) fn subs_parameters(
 /// `subs_tvars(obj, params, argitems)` (`_pypy_generic_alias.py`) —
 /// substitute the parameters of a nested generic and re-subscript it.
 fn subs_tvars(
-    obj: PyObjectRef,
-    params: PyObjectRef,
-    argitems: PyObjectRef,
+    mut obj: PyObjectRef,
+    mut params: PyObjectRef,
+    mut argitems: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let subparams = match crate::baseobjspace::getattr_str(obj, "__parameters__") {
+    let subparams = match pyre_object::with_roots!(obj, params, argitems =>
+        crate::baseobjspace::getattr_str(obj, "__parameters__")
+    ) {
         Ok(sub) => sub,
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(obj),
         Err(e) => return Err(e),
@@ -1412,13 +1414,14 @@ fn ga_new(args: &[PyObjectRef]) -> crate::PyResult {
             args.len().saturating_sub(1)
         )));
     }
-    let cls = args[0];
-    let generic_alias_type = crate::typedef::gettypeobject(&pyre_object::GENERIC_ALIAS_TYPE);
+    let mut cls = args[0];
+    let mut generic_alias_type = crate::typedef::gettypeobject(&pyre_object::GENERIC_ALIAS_TYPE);
     // `_pypy_generic_alias.py GenericAlias.__new__` allocates through
     // `super(GenericAlias, cls).__new__(cls)`, preserving a user subtype as
     // the new alias's class while retaining the GenericAlias payload layout.
     crate::typedef::check_user_subclass(generic_alias_type, cls)?;
-    let result = make_generic_alias(args[1], args[2])?;
+    let result =
+        pyre_object::with_roots!(cls, generic_alias_type => make_generic_alias(args[1], args[2]))?;
     if !std::ptr::eq(cls, generic_alias_type) {
         unsafe { (*result).w_class = cls };
         pyre_object::gc_hook::maybe_register_finalizer(result);

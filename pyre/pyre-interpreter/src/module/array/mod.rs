@@ -1654,7 +1654,7 @@ fn array_repr_method(args: &[PyObjectRef]) -> PyResult {
 // `interp_array.py compare_arrays`: compare each element with the requested
 // operation.  In particular, an unordered pair such as NaN is neither less
 // nor greater; treating every non-equal/non-less pair as greater is wrong.
-fn array_richcompare(a: PyObjectRef, b: PyObjectRef, op: u8) -> PyResult {
+fn array_richcompare(mut a: PyObjectRef, mut b: PyObjectRef, op: u8) -> PyResult {
     if !unsafe { arr::is_array(a) } || !unsafe { arr::is_array(b) } {
         return Ok(pyre_object::w_not_implemented());
     }
@@ -1675,16 +1675,20 @@ fn array_richcompare(a: PyObjectRef, b: PyObjectRef, op: u8) -> PyResult {
     // `getarrayitem` and can therefore raise while boxing an invalid scalar.
     let integer_instead_of_char = typecode_a == typecode_b && matches!(typecode_a, b'u' | b'w');
     for i in 0..n {
-        let ea = array_w_getitem(a, i, integer_instead_of_char)?;
-        let eb = array_w_getitem(b, i, integer_instead_of_char)?;
+        let mut ea =
+            pyre_object::with_roots!(a, b => array_w_getitem(a, i, integer_instead_of_char))?;
+        let mut eb =
+            pyre_object::with_roots!(a, b, ea => array_w_getitem(b, i, integer_instead_of_char))?;
         match op {
             0 => {
-                if !crate::baseobjspace::is_true(compare(ea, eb, CompareOp::Eq)?)? {
+                let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Eq))?;
+                if !pyre_object::with_roots!(a, b => crate::baseobjspace::is_true(r))? {
                     return Ok(pyre_object::w_bool_from(false));
                 }
             }
             1 => {
-                if crate::baseobjspace::is_true(compare(ea, eb, CompareOp::Ne)?)? {
+                let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Ne))?;
+                if pyre_object::with_roots!(a, b => crate::baseobjspace::is_true(r))? {
                     return Ok(pyre_object::w_bool_from(true));
                 }
             }
@@ -1694,10 +1698,12 @@ fn array_richcompare(a: PyObjectRef, b: PyObjectRef, op: u8) -> PyResult {
                 } else {
                     CompareOp::Gt
                 };
-                if crate::baseobjspace::is_true(compare(ea, eb, cmp)?)? {
+                let r = pyre_object::with_roots!(a, b, ea, eb => compare(ea, eb, cmp))?;
+                if pyre_object::with_roots!(a, b, ea, eb => crate::baseobjspace::is_true(r))? {
                     return Ok(pyre_object::w_bool_from(true));
                 }
-                if !crate::baseobjspace::is_true(compare(ea, eb, CompareOp::Eq)?)? {
+                let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Eq))?;
+                if !pyre_object::with_roots!(a, b => crate::baseobjspace::is_true(r))? {
                     return Ok(pyre_object::w_bool_from(false));
                 }
             }
@@ -1707,10 +1713,12 @@ fn array_richcompare(a: PyObjectRef, b: PyObjectRef, op: u8) -> PyResult {
                 } else {
                     CompareOp::Ge
                 };
-                if !crate::baseobjspace::is_true(compare(ea, eb, cmp)?)? {
+                let r = pyre_object::with_roots!(a, b, ea, eb => compare(ea, eb, cmp))?;
+                if !pyre_object::with_roots!(a, b, ea, eb => crate::baseobjspace::is_true(r))? {
                     return Ok(pyre_object::w_bool_from(false));
                 }
-                if !crate::baseobjspace::is_true(compare(ea, eb, CompareOp::Eq)?)? {
+                let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Eq))?;
+                if !pyre_object::with_roots!(a, b => crate::baseobjspace::is_true(r))? {
                     return Ok(pyre_object::w_bool_from(true));
                 }
             }
@@ -1866,9 +1874,9 @@ fn array_mul_method(args: &[PyObjectRef]) -> PyResult {
 fn array_imul_method(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "__imul__", false)?;
     check_arity(args, 2, "array.__imul__")?;
-    let obj = args[0];
+    let mut obj = args[0];
     array_check_resize(obj)?;
-    let count = array_repeat_count(args[1])?.max(0) as usize;
+    let count = pyre_object::with_roots!(obj => array_repeat_count(args[1]))?.max(0) as usize;
     let src = unsafe { arr::w_array_bytes(obj) }.to_vec();
     if count == 0 {
         unsafe { arr::w_array_vec_mut(obj) }.clear();
@@ -2046,7 +2054,7 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
             "_array_reconstructor() takes exactly 4 arguments",
         ));
     }
-    let w_cls = args[0];
+    let mut w_cls = args[0];
     if !unsafe { pyre_object::is_type(w_cls) } {
         return Err(PyError::type_error(format!(
             "_array_reconstructor() argument 1 must be type, not {}",
@@ -2054,7 +2062,7 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
         )));
     }
     let array_type = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
-    if !crate::baseobjspace::issubclass(w_cls, array_type)? {
+    if !pyre_object::with_roots!(w_cls => crate::baseobjspace::issubclass(w_cls, array_type))? {
         return Err(PyError::type_error(format!(
             "{} is not a subtype of array.array",
             unsafe { pyre_object::w_type_get_name(w_cls) }
@@ -2075,8 +2083,8 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
     // mformat_code: int in [MACHINE_FORMAT_CODE_MIN, MACHINE_FORMAT_CODE_MAX].
     // The `int` converter takes `PyNumber_Index`, which names the type it
     // could not convert.
-    let w_mformat = crate::baseobjspace::space_index(args[2])?;
-    let mformat = crate::baseobjspace::int_w(w_mformat)?;
+    let w_mformat = pyre_object::with_roots!(w_cls => crate::baseobjspace::space_index(args[2]))?;
+    let mformat = pyre_object::with_roots!(w_cls => crate::baseobjspace::int_w(w_mformat))?;
     if !(0..=21).contains(&mformat) {
         return Err(PyError::value_error(
             "third argument must be a valid machine format code.",
@@ -2127,7 +2135,7 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
         typecode
     };
     let output_typecode_text = (output_typecode as char).to_string();
-    let obj = array_descr_new(&[w_cls, pyre_object::w_str_new_managed(&output_typecode_text)])?;
+    let mut obj = array_descr_new(&[w_cls, pyre_object::w_str_new_managed(&output_typecode_text)])?;
     for chunk in bytes.chunks_exact(source_size) {
         let w_item = if matches!(mformat, 14 | 15) {
             let raw: [u8; 4] = chunk.try_into().unwrap();
@@ -2153,10 +2161,12 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
             } else if raw <= i64::MAX as u64 {
                 pyre_object::w_int_new(raw as i64)
             } else {
-                pyre_object::longobject::w_long_new(BigInt::from(raw))
+                pyre_object::with_roots!(obj =>
+                    pyre_object::longobject::w_long_new(BigInt::from(raw))
+                )
             }
         };
-        array_append_value(obj, w_item)?;
+        pyre_object::with_roots!(obj => array_append_value(obj, w_item))?;
     }
     Ok(obj)
 }

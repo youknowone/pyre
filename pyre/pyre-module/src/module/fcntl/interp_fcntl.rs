@@ -380,12 +380,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // The integer arm comes first, before the argument is ever
                 // looked at as a buffer.
                 if args.len() >= 3 && !unsafe { pyre_object::is_int(args[2]) } {
-                    let arg = args[2];
+                    let mut arg = args[2];
                     // `mutate_arg` defaults true, and is consulted only for an
                     // exporter that is neither `bytes` nor `str` — those two
                     // always take the read-only form however it is set.
                     let mutate = if args.len() >= 4 {
-                        pyre_interpreter::baseobjspace::is_true(args[3])?
+                        pyre_object::with_roots!(arg =>
+                            pyre_interpreter::baseobjspace::is_true(args[3])
+                        )?
                     } else {
                         true
                     };

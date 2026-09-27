@@ -457,9 +457,15 @@ pub fn parse_string_to_type(
 }
 
 /// `W_FFIObject.ffi_type`.
-pub fn ffi_type(w_ffi: PyObjectRef, w_x: PyObjectRef, accept: i64) -> Result<PyObjectRef, PyError> {
+pub fn ffi_type(
+    mut w_ffi: PyObjectRef,
+    w_x: PyObjectRef,
+    accept: i64,
+) -> Result<PyObjectRef, PyError> {
     if accept & ACCEPT_STRING != 0 && unsafe { pyre_object::unicodeobject::is_str(w_x) } {
-        let string = pyre_interpreter::baseobjspace::text_w(w_x)?.to_string();
+        let string =
+            pyre_object::with_roots!(w_ffi => pyre_interpreter::baseobjspace::text_w(w_x))?
+                .to_string();
         let consider = accept & CONSIDER_FN_AS_FNPTR != 0;
         if let Some(found) = get_string_to_type(w_ffi, &string, consider)? {
             return Ok(found);
@@ -897,7 +903,9 @@ fn ffi_release(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 fn ffi_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let a = bind_method(args, "sizeof", &["cdecl"], 1)?;
     let (w_ctype, size) = if let Some(cdata) = W_CData::from_obj(a[1]) {
-        (cdata.ctype, cdataobj::cdata_sizeof(a[1])?)
+        let mut w_ctype = cdata.ctype;
+        let size = pyre_object::with_roots!(w_ctype => cdataobj::cdata_sizeof(a[1]))?;
+        (w_ctype, size)
     } else {
         let w_ctype = ffi_type(a[0], a[1], ACCEPT_ALL)?;
         (w_ctype, ctypeobj::ctype_arg(w_ctype)?.size)

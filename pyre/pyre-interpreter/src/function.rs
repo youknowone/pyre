@@ -2136,7 +2136,7 @@ pub unsafe fn setdict(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate:
 ///   - `PyCode`: docstring is the first const when `code.flags`
 ///     has `HAS_DOCSTRING` set, mirroring `pycode.py
 ///     PyCode.getdocstring`.
-pub fn function_get_doc(obj: PyObjectRef) -> PyObjectRef {
+pub fn function_get_doc(mut obj: PyObjectRef) -> PyObjectRef {
     if obj.is_null() {
         return pyre_object::w_none();
     }
@@ -2146,10 +2146,10 @@ pub fn function_get_doc(obj: PyObjectRef) -> PyObjectRef {
         return cached;
     }
     // Lazy fallback: `code.getdocstring(space)` (function.py).
-    let resolved = code_getdocstring(obj);
+    let resolved = pyre_object::with_roots!(obj => code_getdocstring(obj));
     unsafe {
         function_write_barrier(obj);
-        (*func).w_doc = resolved;
+        (*(obj as *mut Function)).w_doc = resolved;
     }
     resolved
 }
@@ -3650,12 +3650,16 @@ pub unsafe fn descr_method_ne(
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_method_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let obj = require_method(obj, "__repr__")?;
-    let function = unsafe { pyre_object::w_method_get_func(obj) };
-    let instance = unsafe { pyre_object::w_method_get_self(obj) };
-    let w_name = match crate::baseobjspace::getattr_str(function, "__qualname__") {
+    let mut function = unsafe { pyre_object::w_method_get_func(obj) };
+    let mut instance = unsafe { pyre_object::w_method_get_self(obj) };
+    let w_name = match pyre_object::with_roots!(function, instance =>
+        crate::baseobjspace::getattr_str(function, "__qualname__")
+    ) {
         Ok(value) => Some(value),
         Err(err) if err.kind == crate::PyErrorKind::AttributeError => {
-            match crate::baseobjspace::getattr_str(function, "__name__") {
+            match pyre_object::with_roots!(instance =>
+                crate::baseobjspace::getattr_str(function, "__name__")
+            ) {
                 Ok(value) => Some(value),
                 Err(err) if err.kind == crate::PyErrorKind::AttributeError => None,
                 Err(err) => return Err(err),
@@ -3684,14 +3688,14 @@ pub unsafe fn descr_method_getattribute(
     obj: PyObjectRef,
     name: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let obj = require_method(obj, "__getattribute__")?;
+    let mut obj = require_method(obj, "__getattribute__")?;
     if !unsafe { pyre_object::is_str(name) } {
         return Err(crate::PyError::type_error("attribute name must be string"));
     }
     let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name) }) else {
         return Err(crate::PyError::type_error("attribute name must be string"));
     };
-    let function = unsafe { pyre_object::w_method_get_func(obj) };
+    let mut function = unsafe { pyre_object::w_method_get_func(obj) };
     // PyPy's Method.descr_method_getattribute delegates every miss to the
     // wrapped function, so an inherited object.__subclasshook__ keeps the
     // defining qualname.  CPython 3.14 exposes object.__subclasshook__ and
@@ -3701,14 +3705,17 @@ pub unsafe fn descr_method_getattribute(
     // Preserve that selected 3.14 delta without changing ordinary Python
     // classmethods, whose qualname continues to name the defining class.
     if name == "__qualname__"
-        && let Some(qualname) = unsafe { method_class_bound_qualname(obj)? }
+        && let Some(qualname) =
+            unsafe { pyre_object::with_roots!(function, obj => method_class_bound_qualname(obj))? }
     {
         return Ok(qualname);
     }
     // function.py:604-614 — method attributes win, except `__doc__`;
     // an AttributeError falls back to the wrapped function.
     if name != "__doc__" {
-        match crate::baseobjspace::object_getattribute(obj, name) {
+        match pyre_object::with_roots!(function =>
+            crate::baseobjspace::object_getattribute(obj, name)
+        ) {
             Ok(value) => return Ok(value),
             Err(err) if err.kind == crate::PyErrorKind::AttributeError => {}
             Err(err) => return Err(err),
@@ -4207,7 +4214,7 @@ pub fn funccall_valuestack(
 /// `function.py _flat_pycall` is `@jit.unroll_safe`.
 #[majit_macros::unroll_safe]
 fn _flat_pycall(
-    func: PyObjectRef,
+    mut func: PyObjectRef,
     code: PyObjectRef,
     nargs: usize,
     frame: &mut crate::pyframe::PyFrame,
@@ -4225,13 +4232,15 @@ fn _flat_pycall(
     // header-bearing heap frame (write barrier reads a valid header at
     // frame - GC_HEADER_SIZE) rather than a bare interpreter-stack frame.
     let mut new_frame = crate::pyframe::FrameBox::new(
-        match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            code as *const (),
-            &[], // locals filled below directly from stack
-            w_globals,
-            crate::call::getexecutioncontext(),
-            closure,
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
+        match pyre_object::with_roots!(func =>
+            crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+                code as *const (),
+                &[], // locals filled below directly from stack
+                w_globals,
+                crate::call::getexecutioncontext(),
+                closure,
+                crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
+            )
         ) {
             Ok(f) => f,
             Err(e) => {
