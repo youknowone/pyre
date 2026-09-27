@@ -1870,16 +1870,16 @@ impl<'a> Assembler386<'a> {
         match placement {
             AbiArgPlacement::Gpr(dst) => {
                 if src.is_xmm {
-                    dynasm!(self.mc ; .arch x64 ; movq Rq(dst), Rx(src.value));
+                    rx86::movdq_rx(&mut self.mc, dst, src.value);
                 } else {
                     dynasm!(self.mc ; .arch x64 ; mov Rq(dst), Rq(src.value));
                 }
             }
             AbiArgPlacement::Xmm(dst) => {
                 if src.is_xmm {
-                    dynasm!(self.mc ; .arch x64 ; movapd Rx(dst), Rx(src.value));
+                    rx86::movapd_xx(&mut self.mc, dst, src.value);
                 } else {
-                    dynasm!(self.mc ; .arch x64 ; movq Rx(dst), Rq(src.value));
+                    rx86::movdq_xr(&mut self.mc, dst, src.value);
                 }
             }
             AbiArgPlacement::Stack(offset) => {
@@ -1903,7 +1903,7 @@ impl<'a> Assembler386<'a> {
                 } else {
                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                     rx86::mov_rb(&mut self.mc, scratch, offset);
-                    dynasm!(self.mc ; .arch x64 ; movq Rx(dst), Rq(scratch));
+                    rx86::movdq_xr(&mut self.mc, dst, scratch);
                 }
             }
             AbiArgPlacement::Stack(dst_offset) => {
@@ -1926,7 +1926,7 @@ impl<'a> Assembler386<'a> {
             AbiArgPlacement::Xmm(dst) => {
                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                 rx86::mov_ri(&mut self.mc, scratch, val);
-                dynasm!(self.mc ; .arch x64 ; movq Rx(dst), Rq(scratch));
+                rx86::movdq_xr(&mut self.mc, dst, scratch);
             }
             AbiArgPlacement::Stack(offset) => {
                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
@@ -3391,16 +3391,16 @@ impl<'a> Assembler386<'a> {
                     };
                     match op.opcode {
                         OpCode::FloatAdd => {
-                            dynasm!(self.mc ; .arch x64 ; addsd Rx(dst.value), Rx(src_reg.value));
+                            rx86::addsd_xx(&mut self.mc, dst.value, src_reg.value);
                         }
                         OpCode::FloatSub => {
-                            dynasm!(self.mc ; .arch x64 ; subsd Rx(dst.value), Rx(src_reg.value));
+                            rx86::subsd_xx(&mut self.mc, dst.value, src_reg.value);
                         }
                         OpCode::FloatMul => {
-                            dynasm!(self.mc ; .arch x64 ; mulsd Rx(dst.value), Rx(src_reg.value));
+                            rx86::mulsd_xx(&mut self.mc, dst.value, src_reg.value);
                         }
                         OpCode::FloatTrueDiv => {
-                            dynasm!(self.mc ; .arch x64 ; divsd Rx(dst.value), Rx(src_reg.value));
+                            rx86::divsd_xx(&mut self.mc, dst.value, src_reg.value);
                         }
                         _ => {}
                     }
@@ -3418,13 +3418,8 @@ impl<'a> Assembler386<'a> {
                     // for a `+0.0` operand, since `(+0) - (+0)` is positive.
                     let xmm_scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
                     rx86::mov_ri(&mut self.mc, scratch, 0x8000000000000000_u64 as i64);
-                    dynasm!(self.mc ; .arch x64
-                    ; movq Rx(xmm_scratch), Rq(scratch)
-                    );
-                    dynasm!(self.mc ; .arch x64
-                                            ; xorpd Rx(r.value), Rx(xmm_scratch)
-
-                    );
+                    rx86::movdq_xr(&mut self.mc, xmm_scratch, scratch);
+                    rx86::xorpd_xx(&mut self.mc, r.value, xmm_scratch);
                 }
             }
             OpCode::FloatAbs => {
@@ -3434,13 +3429,8 @@ impl<'a> Assembler386<'a> {
                     // scratch, not pool register xmm11.
                     let xmm_scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
                     rx86::mov_ri(&mut self.mc, scratch, 0x7FFFFFFFFFFFFFFF_u64 as i64);
-                    dynasm!(self.mc ; .arch x64
-                    ; movq Rx(xmm_scratch), Rq(scratch)
-                    );
-                    dynasm!(self.mc ; .arch x64
-                                            ; andpd Rx(r.value), Rx(xmm_scratch)
-
-                    );
+                    rx86::movdq_xr(&mut self.mc, xmm_scratch, scratch);
+                    rx86::andpd_xx(&mut self.mc, r.value, xmm_scratch);
                 }
             }
             // ── Float comparisons ──
@@ -3493,7 +3483,7 @@ impl<'a> Assembler386<'a> {
                         OpCode::FloatEq => (a, b, CC_E, true),
                         _ => (a, b, CC_NE, true),
                     };
-                    dynasm!(self.mc ; .arch x64 ; ucomisd Rx(lhs.value), Rx(rhs.value));
+                    rx86::ucomisd_xx(&mut self.mc, lhs.value, rhs.value);
                     if need_parity {
                         self.emit_if_parity_clear_zero_and_carry();
                     }
@@ -3522,12 +3512,13 @@ impl<'a> Assembler386<'a> {
                     // In a loop that reuses the same xmm, this serialises the
                     // conversion against the previous iteration. Break it with a
                     // zeroing idiom (eliminated at register rename, zero latency).
-                    dynasm!(self.mc ; .arch x64 ; pxor Rx(dst.value), Rx(dst.value) ; cvtsi2sd Rx(dst.value), Rq(sr));
+                    rx86::pxor_xx(&mut self.mc, dst.value, dst.value);
+                    rx86::cvtsi2sd_xr(&mut self.mc, dst.value, sr);
                 }
             }
             OpCode::CastFloatToInt => {
                 if let (Some(Loc::Reg(src)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
-                    dynasm!(self.mc ; .arch x64 ; cvttsd2si Rq(dst.value), Rx(src.value));
+                    rx86::cvttsd2si_rx(&mut self.mc, dst.value, src.value);
                 }
             }
             // ── Same-as / identity ──
@@ -3841,7 +3832,7 @@ impl<'a> Assembler386<'a> {
                         let gpr = crate::regloc::X86_64_SCRATCH_REG.value;
                         let xmm = crate::regloc::X86_64_XMM_SCRATCH_REG;
                         rx86::mov_ri(&mut self.mc, gpr, val_imm.value);
-                        dynasm!(self.mc ; .arch x64 ; movq Rx(xmm.value), Rq(gpr));
+                        rx86::movdq_xr(&mut self.mc, xmm.value, gpr);
                         self.emit_op_gcstore_regalloc(base, ofs_loc, &xmm, size);
                     }
                     Loc::Immed(val_imm) | Loc::ImmedFloat(val_imm) => {
@@ -3904,8 +3895,7 @@ impl<'a> Assembler386<'a> {
                             match value_loc {
                                 Loc::Reg(val) if val.is_xmm && size == 4 => {
                                     let scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
-                                    dynasm!(self.mc ; .arch x64
-                                        ; cvtsd2ss Rx(scratch), Rx(val.value));
+                                    rx86::cvtsd2ss_xx(&mut self.mc, scratch, val.value);
                                     rx86::movss_ax(&mut self.mc, addr, scratch);
                                 }
                                 Loc::Reg(val) if val.is_xmm => {
@@ -3921,11 +3911,8 @@ impl<'a> Assembler386<'a> {
                                     let gpr = crate::regloc::X86_64_SCRATCH_REG.value;
                                     let xmm = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
                                     rx86::mov_ri(&mut self.mc, gpr, i.value);
-                                    dynasm!(self.mc ; .arch x64
-                                        ; movq Rx(xmm), Rq(gpr)
-                                        );
-dynasm!(self.mc ; .arch x64
-                                        ; cvtsd2ss Rx(xmm), Rx(xmm));
+                                    rx86::movdq_xr(&mut self.mc, xmm, gpr);
+                                    rx86::cvtsd2ss_xx(&mut self.mc, xmm, xmm);
                                     rx86::movss_ax(&mut self.mc, addr, xmm);
                                 }
                                 Loc::Immed(i) | Loc::ImmedFloat(i) => {
@@ -6953,7 +6940,7 @@ dynasm!(self.mc ; .arch x64
                 } else {
                     rx86::movss_xm(&mut self.mc, dst.value, (base.value, ofs));
                 }
-                dynasm!(self.mc ; .arch x64 ; cvtss2sd Rx(dst.value), Rx(dst.value));
+                rx86::cvtss2sd_xx(&mut self.mc, dst.value, dst.value);
             } else if let Some(r) = ofs_reg {
                 rx86::movsd_xa(
                     &mut self.mc,
@@ -7114,7 +7101,7 @@ dynasm!(self.mc ; .arch x64
         if val.is_xmm {
             if size == 4 {
                 let scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
-                dynasm!(self.mc ; .arch x64 ; cvtsd2ss Rx(scratch), Rx(val.value));
+                rx86::cvtsd2ss_xx(&mut self.mc, scratch, val.value);
                 if let Some(r) = ofs_reg {
                     rx86::movss_ax(
                         &mut self.mc,
@@ -7532,7 +7519,7 @@ dynasm!(self.mc ; .arch x64
     /// input already sits in `resloc`.
     fn genop_math_sqrt(&mut self, result_loc: Option<&Loc>) {
         if let Some(Loc::Reg(r)) = result_loc {
-            dynasm!(self.mc ; .arch x64 ; sqrtsd Rx(r.value), Rx(r.value));
+            rx86::sqrtsd_xx(&mut self.mc, r.value, r.value);
         }
     }
 
@@ -7982,7 +7969,7 @@ dynasm!(self.mc ; .arch x64
         match (result_type, result_loc) {
             (Type::Void, None) => {}
             (Type::Float, Some(Loc::Reg(r))) if r.is_xmm => {
-                dynasm!(self.mc ; .arch x64 ; movq Rx(r.value), rax);
+                rx86::movdq_xr(&mut self.mc, r.value, rx86::EAX);
             }
             (_, Some(Loc::Reg(r))) if !r.is_xmm => {
                 if r.value != crate::regloc::EAX.value {
@@ -9300,7 +9287,7 @@ dynasm!(self.mc ; .arch x64
                     let remaining = nbytes - offset;
                     let current = if remaining >= 16 {
                         if !cleared {
-                            dynasm!(self.mc ; .arch x64 ; xorps Rx(xmm), Rx(xmm));
+                            rx86::xorps_xx(&mut self.mc, xmm, xmm);
                             cleared = true;
                         }
                         rx86::movups_mx(&mut self.mc, (scratch, offset as i32), xmm);
@@ -9352,13 +9339,13 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
             (Loc::Reg(s), Loc::Reg(d)) => {
                 if s.is_xmm && d.is_xmm {
                     // copy 128-bit from -> to
-                    dynasm!(self.mc ; .arch x64 ; movapd Rx(d.value), Rx(s.value));
+                    rx86::movapd_xx(&mut self.mc, d.value, s.value);
                 } else if !s.is_xmm && !d.is_xmm {
                     dynasm!(self.mc ; .arch x64 ; mov Rq(d.value), Rq(s.value));
                 } else if s.is_xmm && !d.is_xmm {
-                    dynasm!(self.mc ; .arch x64 ; movq Rq(d.value), Rx(s.value));
+                    rx86::movdq_rx(&mut self.mc, d.value, s.value);
                 } else {
-                    dynasm!(self.mc ; .arch x64 ; movq Rx(d.value), Rq(s.value));
+                    rx86::movdq_xr(&mut self.mc, d.value, s.value);
                 }
             }
             (Loc::Reg(s), ebp_loc_pat!(e)) => {
@@ -9381,7 +9368,7 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
                 if d.is_xmm {
                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                     rx86::mov_ri(&mut self.mc, scratch, i.value);
-                    dynasm!(self.mc ; .arch x64 ; movq Rx(d.value), Rq(scratch));
+                    rx86::movdq_xr(&mut self.mc, d.value, scratch);
                 } else {
                     rx86::mov_ri(&mut self.mc, d.value, i.value);
                 }

@@ -345,6 +345,15 @@ fn byte_reg(reg: u8) -> u8 {
     reg & !BYTE_REG_FLAG
 }
 
+/// Reg-reg ModRM. `reg` is the ModRM.reg field, `rm` the ModRM.rm field.
+/// The mandatory prefix is emitted before the REX byte (`xmminsn`).
+fn op_rr(mc: &mut Assembler, kind: RexKind, mandatory: u8, opcode: &[u8], reg: u8, rm: u8) {
+    let rex = rex_bit(reg, REX_R) | rex_bit(rm, REX_B);
+    emit_prefix_rex(mc, mandatory, kind, rex);
+    push_bytes(mc, opcode);
+    encode_modrm_reg_reg(mc, reg, rm, 0);
+}
+
 // ---------------------------------------------------------------- MOV
 
 /// `MOV_rm`. Base `rsp` uses `MOV_rs`; base `rbp` uses `MOV_rb`.
@@ -857,6 +866,91 @@ pub(crate) fn movq_mx(mc: &mut Assembler, mem: (u8, i32), src: u8) {
     op_mem(mc, RexKind::Nw, 0x66, &[0x0F, 0xD6], src, mem.0, mem.1);
 }
 
+/// `ADDSD_xx`.
+pub(crate) fn addsd_xx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0xF2, &[0x0F, 0x58], dst, src);
+}
+
+/// `SUBSD_xx`.
+pub(crate) fn subsd_xx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0xF2, &[0x0F, 0x5C], dst, src);
+}
+
+/// `MULSD_xx`.
+pub(crate) fn mulsd_xx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0xF2, &[0x0F, 0x59], dst, src);
+}
+
+/// `DIVSD_xx`.
+pub(crate) fn divsd_xx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0xF2, &[0x0F, 0x5E], dst, src);
+}
+
+/// `UCOMISD_xx`.
+pub(crate) fn ucomisd_xx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0x66, &[0x0F, 0x2E], dst, src);
+}
+
+/// `SQRTSD_xx`.
+pub(crate) fn sqrtsd_xx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0xF2, &[0x0F, 0x51], dst, src);
+}
+
+/// `MOVAPD_xx`.
+pub(crate) fn movapd_xx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0x66, &[0x0F, 0x28], dst, src);
+}
+
+/// `PXOR_xx`.
+pub(crate) fn pxor_xx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0x66, &[0x0F, 0xEF], dst, src);
+}
+
+/// `XORPD_xx`.
+pub(crate) fn xorpd_xx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0x66, &[0x0F, 0x57], dst, src);
+}
+
+/// `ANDPD_xx`.
+pub(crate) fn andpd_xx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0x66, &[0x0F, 0x54], dst, src);
+}
+
+/// `XORPS_xx`.
+pub(crate) fn xorps_xx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0, &[0x0F, 0x57], dst, src);
+}
+
+/// `CVTSD2SS_xx`.
+pub(crate) fn cvtsd2ss_xx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0xF2, &[0x0F, 0x5A], dst, src);
+}
+
+/// `CVTSS2SD_xx`.
+pub(crate) fn cvtss2sd_xx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0xF3, &[0x0F, 0x5A], dst, src);
+}
+
+/// `CVTSI2SD_xr` (`rex_w`).
+pub(crate) fn cvtsi2sd_xr(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::W, 0xF2, &[0x0F, 0x2A], dst, src);
+}
+
+/// `CVTTSD2SI_rx` (`rex_w`).
+pub(crate) fn cvttsd2si_rx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::W, 0xF2, &[0x0F, 0x2C], dst, src);
+}
+
+/// `MOVDQ_xr` (`rex_w`).
+pub(crate) fn movdq_xr(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::W, 0x66, &[0x0F, 0x6E], dst, src);
+}
+
+/// `MOVDQ_rx` (`rex_w`).
+pub(crate) fn movdq_rx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::W, 0x66, &[0x0F, 0x7E], src, dst);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1235,5 +1329,81 @@ mod tests {
                 0xFF,
             ]
         );
+    }
+
+    /// `(low, low)`, `(low, high)`, `(high, low)`, `(high, high)`.
+    fn quad(encode: fn(&mut Assembler, u8, u8)) -> Vec<u8> {
+        enc(|mc| {
+            encode(mc, 1, 0);
+            encode(mc, 1, 8);
+            encode(mc, 9, 0);
+            encode(mc, 9, 8);
+        })
+    }
+
+    /// GPR destination: `(dst, src)` is `(gpr, xmm)` in the same four classes.
+    fn quad_rx(encode: fn(&mut Assembler, u8, u8)) -> Vec<u8> {
+        enc(|mc| {
+            encode(mc, 0, 1);
+            encode(mc, 8, 1);
+            encode(mc, 0, 9);
+            encode(mc, 8, 9);
+        })
+    }
+
+    #[test]
+    fn sse_xx_matches_static_dynasm() {
+        // Static xmm/gpr operands are the shortest form dynasm emits.
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; addsd xmm1, xmm0 ; addsd xmm1, xmm8 ; addsd xmm9, xmm0 ; addsd xmm9, xmm8);
+        assert_same(&quad(addsd_xx), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; subsd xmm1, xmm0 ; subsd xmm1, xmm8 ; subsd xmm9, xmm0 ; subsd xmm9, xmm8);
+        assert_same(&quad(subsd_xx), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; mulsd xmm1, xmm0 ; mulsd xmm1, xmm8 ; mulsd xmm9, xmm0 ; mulsd xmm9, xmm8);
+        assert_same(&quad(mulsd_xx), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; divsd xmm1, xmm0 ; divsd xmm1, xmm8 ; divsd xmm9, xmm0 ; divsd xmm9, xmm8);
+        assert_same(&quad(divsd_xx), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; ucomisd xmm1, xmm0 ; ucomisd xmm1, xmm8 ; ucomisd xmm9, xmm0 ; ucomisd xmm9, xmm8);
+        assert_same(&quad(ucomisd_xx), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; sqrtsd xmm1, xmm0 ; sqrtsd xmm1, xmm8 ; sqrtsd xmm9, xmm0 ; sqrtsd xmm9, xmm8);
+        assert_same(&quad(sqrtsd_xx), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; movapd xmm1, xmm0 ; movapd xmm1, xmm8 ; movapd xmm9, xmm0 ; movapd xmm9, xmm8);
+        assert_same(&quad(movapd_xx), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; pxor xmm1, xmm0 ; pxor xmm1, xmm8 ; pxor xmm9, xmm0 ; pxor xmm9, xmm8);
+        assert_same(&quad(pxor_xx), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; xorpd xmm1, xmm0 ; xorpd xmm1, xmm8 ; xorpd xmm9, xmm0 ; xorpd xmm9, xmm8);
+        assert_same(&quad(xorpd_xx), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; andpd xmm1, xmm0 ; andpd xmm1, xmm8 ; andpd xmm9, xmm0 ; andpd xmm9, xmm8);
+        assert_same(&quad(andpd_xx), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; xorps xmm1, xmm0 ; xorps xmm1, xmm8 ; xorps xmm9, xmm0 ; xorps xmm9, xmm8);
+        assert_same(&quad(xorps_xx), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; cvtsd2ss xmm1, xmm0 ; cvtsd2ss xmm1, xmm8 ; cvtsd2ss xmm9, xmm0 ; cvtsd2ss xmm9, xmm8);
+        assert_same(&quad(cvtsd2ss_xx), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; cvtss2sd xmm1, xmm0 ; cvtss2sd xmm1, xmm8 ; cvtss2sd xmm9, xmm0 ; cvtss2sd xmm9, xmm8);
+        assert_same(&quad(cvtss2sd_xx), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; cvtsi2sd xmm1, rax ; cvtsi2sd xmm1, r8 ; cvtsi2sd xmm9, rax ; cvtsi2sd xmm9, r8);
+        assert_same(&quad(cvtsi2sd_xr), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; movq xmm1, rax ; movq xmm1, r8 ; movq xmm9, rax ; movq xmm9, r8);
+        assert_same(&quad(movdq_xr), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; cvttsd2si rax, xmm1 ; cvttsd2si r8, xmm1 ; cvttsd2si rax, xmm9 ; cvttsd2si r8, xmm9);
+        assert_same(&quad_rx(cvttsd2si_rx), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; movq rax, xmm1 ; movq r8, xmm1 ; movq rax, xmm9 ; movq r8, xmm9);
+        assert_same(&quad_rx(movdq_rx), &finish(d));
     }
 }

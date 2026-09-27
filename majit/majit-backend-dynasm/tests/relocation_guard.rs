@@ -365,7 +365,7 @@ fn no_address_dependent_relocations() {
 
     // An empty result means nothing only if there was assembly to read.
     assert!(
-        bodies > 1000 && statements > bodies,
+        bodies > 500 && statements > bodies,
         "scan read {statements} statements from {bodies} `dynasm!` bodies, \
          far below this backend's emitter — the parse, not the code, is what is empty"
     );
