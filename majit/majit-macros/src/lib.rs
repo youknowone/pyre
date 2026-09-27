@@ -28,7 +28,43 @@ use syn::{
 
 mod jit_interp;
 mod jit_struct;
+mod rffi_expand;
 mod virtualizable;
+
+/// `llexternal` (`rffi.py`): funcptr, `ccall_<name>`, and the forwarding wrapper.
+#[proc_macro]
+pub fn llexternal(input: TokenStream) -> TokenStream {
+    match rffi_expand::expand_llexternal(input.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// `ExternalCompilationInfo` (`cbuild.py`) plus the link directives genc hands
+/// to the linker. Non-empty `library_dirs`, `link_extra`,
+/// `separate_module_sources`, `separate_module_files`, and `compile_extra`
+/// are a compile error.
+#[proc_macro]
+pub fn external_compilation_info(input: TokenStream) -> TokenStream {
+    match rffi_expand::expand_external_compilation_info(input.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Marker for `call_external_function._call_aroundstate_target_ = funcptr, save_err`.
+/// Emits the sibling const `_call_aroundstate_target_<fn>`.
+#[proc_macro_attribute]
+pub fn call_aroundstate_target(attr: TokenStream, item: TokenStream) -> TokenStream {
+    rffi_expand::expand_call_aroundstate_target(attr.into(), item.into()).into()
+}
+
+/// `_gctransformer_hint_close_stack_` (`llexternal`'s `call_external_function`).
+/// Emits the sibling const `_gctransformer_hint_close_stack_<fn>`.
+#[proc_macro_attribute]
+pub fn jit_close_stack(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    rffi_expand::expand_jit_close_stack(item.into()).into()
+}
 
 fn gate_generated_items(
     tokens: proc_macro2::TokenStream,
