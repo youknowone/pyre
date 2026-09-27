@@ -5309,6 +5309,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             &crate::pytraceback::PYTRACEBACK_TYPE as *const _ as i64,
         ),
         (
+            "pyframe::FRAME_TYPE",
+            &crate::pyframe::FRAME_TYPE as *const _ as i64,
+        ),
+        (
             "interp_buffer::PICKLEBUFFER_TYPE",
             &crate::module::__pypy__::interp_buffer::PICKLEBUFFER_TYPE as *const _ as i64,
         ),

@@ -12554,10 +12554,7 @@ mod tests {
     #[test]
     fn concrete_value_preserves_int_subclass_identity() {
         pyre_interpreter::typedef::init_typeobjects();
-        let obj = pyre_object::intobject::w_int_new_unique(7);
-        unsafe {
-            (*obj).w_class = pyre_object::w_none();
-        }
+        let obj = pyre_object::intobject::w_int_subclass_new(7);
 
         assert_eq!(ConcreteValue::from_pyobj(obj), ConcreteValue::Ref(obj));
     }
