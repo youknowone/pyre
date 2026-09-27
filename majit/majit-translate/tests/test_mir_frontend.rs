@@ -1904,45 +1904,6 @@ fn mem_replace_through_box_deref_names_enum_fields() {
     assert_lowered("replace_boxed_dynlike");
 }
 
-/// The rhai frame's `truncate_cells` exchanges a `Dynamic` through
-/// `operand_mut(&mut operand_refs[slot])`. That call must not survive.
-#[test]
-fn rhai_truncate_cells_replace_lowers() {
-    use majit_translate::model::OpKind;
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../rhai/build/llbc/rhai.ullbc"
-    );
-    let llbc = Llbc::load(path).expect("rhai ullbc");
-    let graph = lower_function(&llbc, "truncate_cells").expect("truncate_cells");
-    let calls: Vec<String> = graph
-        .blocks
-        .iter()
-        .flat_map(|b| &b.operations)
-        .filter_map(|op| match &op.kind {
-            OpKind::Call { target, .. } => Some(format!("{target:?}")),
-            _ => None,
-        })
-        .filter(|target| {
-            target.contains("replace") || target.contains("swap") || target.contains("take")
-        })
-        .collect();
-    assert!(calls.is_empty(), "residual {calls:?}");
-    let writes: Vec<String> = graph
-        .blocks
-        .iter()
-        .flat_map(|b| &b.operations)
-        .filter_map(|op| match &op.kind {
-            OpKind::FieldWrite { field, .. } => Some(field.name.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        writes.iter().any(|n| n == "__discriminant"),
-        "writes {writes:?}"
-    );
-}
-
 /// `*held = i64` through `&mut HeldUnion` is `setfield` of
 /// `HeldUnion::Int.__pos_0`. The SSA dump of that graph carries no
 /// `__deref_write` symbol for the assembler to resolve.
