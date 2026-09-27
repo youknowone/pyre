@@ -496,9 +496,7 @@ impl StrKey {
     pub fn as_str(&self) -> &str {
         // Keys are stored from a `&str`, so the payload is UTF-8. A null
         // dummy (a cleared slot) reads as empty.
-        unsafe {
-            std::str::from_utf8_unchecked(crate::unicodeobject::utf8_payload_bytes(self.0))
-        }
+        unsafe { std::str::from_utf8_unchecked(crate::unicodeobject::utf8_payload_bytes(self.0)) }
     }
 }
 

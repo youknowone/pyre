@@ -805,8 +805,8 @@ unsafe fn module_dict_storage_custom_trace(
 ) {
     let storage = &mut *(obj_addr as *mut pyre_object::celldict::ModuleDictStorage);
     for (key, value) in storage.entries.iter_mut() {
-        let key_ptr = key as *const pyre_object::celldict::StrKey
-            as *mut pyre_object::celldict::StrKey;
+        let key_ptr =
+            key as *const pyre_object::celldict::StrKey as *mut pyre_object::celldict::StrKey;
         f(std::ptr::addr_of_mut!((*key_ptr).0) as *mut majit_ir::GcRef);
         let mut forward = |slot: &mut pyre_object::PyObjectRef| {
             f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);

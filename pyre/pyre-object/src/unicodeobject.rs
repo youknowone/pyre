@@ -1636,13 +1636,7 @@ pub extern "C" fn jit_str_count_bounds(
             }
             return w_str_codepoints_in_utf8(s, lo, hi) as i64 + 1;
         }
-        crate::rstring::search_normal(
-            hay,
-            needle,
-            lo,
-            hi,
-            crate::rstring::SearchMode::Count,
-        ) as i64
+        crate::rstring::search_normal(hay, needle, lo, hi, crate::rstring::SearchMode::Count) as i64
     }
 }
 

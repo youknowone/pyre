@@ -764,10 +764,7 @@ fn spec_ref(r: &Value, llbc: &Llbc, depth: usize) -> String {
     let (ty, kind) = if let Some(arr) = r.as_array() {
         (arr.get(1), arr.get(2).and_then(Value::as_str))
     } else if let Some(obj) = r.as_object() {
-        (
-            obj.get("ty"),
-            obj.get("kind").and_then(Value::as_str),
-        )
+        (obj.get("ty"), obj.get("kind").and_then(Value::as_str))
     } else {
         return canonical_type_json(r, llbc, depth);
     };
@@ -806,11 +803,7 @@ fn spec_raw_ptr(rp: &Value, llbc: &Llbc, depth: usize) -> String {
     }
 }
 
-fn spec_adt(
-    adt: &serde_json::Map<String, Value>,
-    llbc: &Llbc,
-    depth: usize,
-) -> String {
+fn spec_adt(adt: &serde_json::Map<String, Value>, llbc: &Llbc, depth: usize) -> String {
     let types = generic_items(adt, "types")
         .into_iter()
         .map(|ty| spec_type_name(ty, llbc, depth + 1))
@@ -879,11 +872,7 @@ fn spec_array_pair(arr: &[Value], llbc: &Llbc, depth: usize) -> String {
 }
 
 fn spec_fn_ptr(fnptr: &Value, llbc: &Llbc, depth: usize) -> String {
-    let Some(sig) = fnptr
-        .get("skip_binder")
-        .unwrap_or(fnptr)
-        .as_object()
-    else {
+    let Some(sig) = fnptr.get("skip_binder").unwrap_or(fnptr).as_object() else {
         return "fn".to_string();
     };
     let inputs = sig
@@ -908,10 +897,7 @@ fn spec_fn_ptr(fnptr: &Value, llbc: &Llbc, depth: usize) -> String {
     }
 }
 
-fn generic_items<'a>(
-    adt: &'a serde_json::Map<String, Value>,
-    key: &str,
-) -> Vec<&'a Value> {
+fn generic_items<'a>(adt: &'a serde_json::Map<String, Value>, key: &str) -> Vec<&'a Value> {
     adt.get("generics")
         .and_then(Value::as_object)
         .and_then(|generics| generics.get(key))
@@ -1073,7 +1059,9 @@ fn resolve_trait_impl_value(v: &Value, llbc: &Llbc, depth: usize) -> Value {
     };
     let mut out = serde_json::Map::new();
     for (key, child) in obj {
-        if key == "id" && let Some(id) = child.as_u64() {
+        if key == "id"
+            && let Some(id) = child.as_u64()
+        {
             let name = render_trait_impl(llbc, id).unwrap_or_else(|| "?".to_string());
             out.insert(key.clone(), Value::String(name));
             continue;

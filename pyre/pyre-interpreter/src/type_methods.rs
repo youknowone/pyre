@@ -5283,7 +5283,6 @@ pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     Ok(w_str_from_wtf8_managed(out))
 }
 
-
 /// Number of non-overlapping occurrences of `needle` in `haystack`,
 /// scanning over the WTF-8 bytes. PyPy's `unicodeobject.py:1116` delegates
 /// to `_utf8.count`; the RPython translation path for non-host strings is

@@ -385,8 +385,7 @@ fn adaptive_find(
             } else {
                 hits += j + 1;
                 if hits > m / 4 && w - i > 2000 {
-                    let (cut, period, gap, is_periodic, table) =
-                        twoway_preprocess(needle, m);
+                    let (cut, period, gap, is_periodic, table) = twoway_preprocess(needle, m);
                     if mode != SearchMode::Count {
                         let res = two_way(
                             value,
@@ -548,7 +547,7 @@ pub fn search_normal(
 
 #[cfg(test)]
 mod tests {
-    use super::{search_normal, SearchMode};
+    use super::{SearchMode, search_normal};
 
     fn naive(hay: &[u8], needle: &[u8], lo: usize, hi: usize, mode: SearchMode) -> isize {
         let hi = hi.min(hay.len());
