@@ -2641,10 +2641,27 @@ impl<'a> AssemblerARM64<'a> {
                 }
             }
             OpCode::IntSignext => {
-                // arglocs = [argloc, numbytes_loc], result_loc = separate reg
-                if let (Some(src), Some(Loc::Reg(r))) = (arglocs.first(), result_loc) {
-                    self.regalloc_mov(src, &Loc::Reg(*r));
-                    // signext handled by assembler based on numbytes
+                // aarch64/opassembler.py `emit_op_int_signext`: SXTB / SXTH / SXTW
+                // for numbytes 1 / 2 / 4. The source is a register; a frame slot
+                // is loaded the same way neighbouring arms read an argloc.
+                let (Some(argloc), Some(numbytes_loc), Some(Loc::Reg(res))) =
+                    (arglocs.first(), arglocs.get(1), result_loc)
+                else {
+                    panic!(
+                        "int_signext: expected [arg, numbytes] and a register result, \
+                         got arglocs={arglocs:?} result={result_loc:?}"
+                    );
+                };
+                let (Loc::Immed(numbytes) | Loc::ImmedFloat(numbytes)) = numbytes_loc else {
+                    panic!("int_signext: numbytes loc must be an immediate, got {numbytes_loc:?}");
+                };
+                let src = self.load_loc_to_reg(argloc, 16);
+                let dst = res.value;
+                match numbytes.value {
+                    1 => dynasm!(self.mc ; .arch aarch64 ; sxtb X(dst), W(src)),
+                    2 => dynasm!(self.mc ; .arch aarch64 ; sxth X(dst), W(src)),
+                    4 => dynasm!(self.mc ; .arch aarch64 ; sxtw X(dst), W(src)),
+                    _ => panic!("bad number of bytes"),
                 }
             }
             // ── Float binary ──
@@ -7104,25 +7121,6 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; umulh x0, x0, x1
         );
-        self.store_rax_to_result(op.pos().get());
-    }
-
-    /// INT_SIGNEXT: sign-extend from num_bytes width to 64 bits.
-    #[allow(dead_code)]
-    fn genop_int_signext(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        let num_bytes = match self.resolve_opref(op.arg(1).to_opref()) {
-            ResolvedArg::Const(v) => v,
-            _ => 8,
-        };
-        let shift = 64 - num_bytes * 8;
-        if shift > 0 && shift < 64 {
-            let sh32 = shift as u32;
-            dynasm!(self.mc ; .arch aarch64
-                ; lsl x0, x0, sh32
-                ; asr x0, x0, sh32
-            );
-        }
         self.store_rax_to_result(op.pos().get());
     }
 

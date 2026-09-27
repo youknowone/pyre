@@ -1323,7 +1323,10 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         };
         let name = req.leaf;
         graph.name = spec_segments(llbc, fd, &name).join("::");
-        functions.push(semantic_function_from_lowered(
+        // `FunctionDesc.cachedgraph` returns the specialized graph of the
+        // same function object, so the copy keeps `_jit_look_inside_`.
+        // `propagate_access_directly` reads that hint off the callee.
+        let mut lowered = semantic_function_from_lowered(
             llbc,
             fd,
             graph,
@@ -1335,7 +1338,13 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             &elidable_residual,
             static_addrs.error_carrier,
             &policy_fn_path,
-        ));
+        );
+        if dont_look_inside.contains(&policy_fn_path)
+            && !lowered.hints.iter().any(|hint| hint == "dont_look_inside")
+        {
+            lowered.hints.push("dont_look_inside".to_string());
+        }
+        functions.push(lowered);
     }
     // `specialize.py default_specialize` runs while the annotator walks
     // calls; on this path the whole function set has to exist first, so it
@@ -17289,6 +17298,11 @@ impl<'a> Lowering<'a> {
         }
         let (fn_id, generics) = crate::front::clause_spec::trait_impl_method(payload, self.llbc)?;
         let fd = self.llbc.fn_by_id(fn_id)?;
+        // No unstructured body: keep the ordinary `CallKind::Trait` route.
+        // A spec path for this method would name a graph nobody registers.
+        if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+            return None;
+        }
         let path = fd.item_meta.name_path();
         let leaf = path.rsplit("::").next().unwrap_or("fn");
         let segments = spec_segments(self.llbc, fd, leaf);
@@ -35377,11 +35391,49 @@ fn resolve_trait_assoc_type_value<'a>(
     assoc: &serde_json::Value,
     llbc: &'a Llbc,
 ) -> Option<&'a serde_json::Value> {
+    // A spec copy's clause substitution leaves a concrete `TraitImpl`
+    // ref. That impl's `types[]` binding wins; `unique_trait_assoc_value`
+    // is only the fallback when the ref is not an impl or the impl has
+    // no binding for `assoc` (two impls then answer `None`).
+    if let Some(impl_id) = traitref_impl_id(traitref, llbc, 0)
+        && let Some(value) = trait_impl_assoc_value(llbc, impl_id, assoc)
+    {
+        return Some(value);
+    }
     let trait_id = traitref_decl_id(traitref, llbc, 0)?;
     // One index per LLBC: the same projection is rendered once per
     // instantiation, and scanning every impl each time is quadratic in
     // the crate.
     llbc.unique_trait_assoc_value(trait_id, assoc)
+}
+
+/// `types[entry].skip_binder.value` of `impl_id` whose `TraitType` kind
+/// selects `assoc`. Same row shape [`Llbc::unique_trait_assoc_value`]
+/// indexes, read off this impl instead of the unique one.
+fn trait_impl_assoc_value<'a>(
+    llbc: &'a Llbc,
+    impl_id: u64,
+    assoc: &serde_json::Value,
+) -> Option<&'a serde_json::Value> {
+    let entries = llbc
+        .trait_impls_raw()
+        .get(impl_id as usize)?
+        .get("types")?
+        .as_array()?;
+    for entry in entries {
+        let Some(kind) = entry
+            .get("kind")
+            .and_then(|kind| kind.get("TraitType"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        if kind.len() != 2 || &kind[1] != assoc {
+            continue;
+        }
+        return entry.get("skip_binder")?.get("value");
+    }
+    None
 }
 
 /// Recover the trait decl id a `TraitRef` names —
@@ -47859,6 +47911,51 @@ mod tests {
             }
         });
         Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    }
+
+    /// Two impls bind the associated type differently. A `TraitImpl` ref
+    /// reads that impl's binding; anything else is not unique.
+    #[test]
+    fn trait_assoc_impl_ref_resolves_its_own_binding() {
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let bool_ty = serde_json::json!({"Literal": "Bool"});
+        let binding = |ty: &serde_json::Value| {
+            serde_json::json!({
+                "kind": {"TraitType": [0, 0]},
+                "skip_binder": {"value": ty}
+            })
+        };
+        let row = |ty: &serde_json::Value| {
+            serde_json::json!({
+                "impl_trait": {"id": 0, "generics": {"types": []}},
+                "types": [binding(ty)],
+                "implied_trait_refs": []
+            })
+        };
+        let impl_ref = |id: u64| {
+            serde_json::json!({
+                "kind": {"TraitImpl": {"id": id, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}},
+                "trait_decl_ref": {"skip_binder": {"id": 0}}
+            })
+        };
+        let llbc = llbc_with_trait_impls(serde_json::json!([row(&i64_ty), row(&bool_ty)]));
+        let assoc = serde_json::json!(0);
+        assert_eq!(
+            super::resolve_trait_assoc_type_value(&impl_ref(0), &assoc, &llbc),
+            Some(&i64_ty)
+        );
+        assert_eq!(
+            super::resolve_trait_assoc_type_value(&impl_ref(1), &assoc, &llbc),
+            Some(&bool_ty)
+        );
+        let clause = serde_json::json!({
+            "kind": {"Clause": {"Bound": [0, 0]}},
+            "trait_decl_ref": {"skip_binder": {"id": 0}}
+        });
+        assert_eq!(
+            super::resolve_trait_assoc_type_value(&clause, &assoc, &llbc),
+            None
+        );
     }
 
     #[test]

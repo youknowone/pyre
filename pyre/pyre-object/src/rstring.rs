@@ -651,4 +651,59 @@ mod tests {
             1
         );
     }
+
+    /// `search_normal` calls `two_way` / `two_way_count` when `mode != RFind`
+    /// and the `default_find` guard is false:
+    /// `n < 2500 || (m < 100 && n < 30000) || m < 6`.
+    /// Haystack windows here have `n >= 30000` and needles have `6 <= m <= 99`,
+    /// so that guard is false, and `(m >> 2) * 3 < (n >> 2)` selects two-way
+    /// (for `m == 99`, `72 < 7500`). `RFind` stays on the reverse scan and is
+    /// still checked against `naive`.
+    #[test]
+    fn two_way_find_rfind_count_match_naive() {
+        const HAY_LEN: usize = 30_000;
+        let periodic = b"abcabcabcabcabcX";
+        let non_periodic = b"abXcdefX";
+        let absent = b"zzzzzz";
+        assert!((6..=99).contains(&periodic.len()));
+        assert!((6..=99).contains(&non_periodic.len()));
+        assert!((6..=99).contains(&absent.len()));
+
+        let mut planted = lcg_hay(1, HAY_LEN);
+        planted[1_000..1_000 + periodic.len()].copy_from_slice(periodic);
+        planted[4_000..4_000 + periodic.len()].copy_from_slice(periodic);
+        planted[8_000..8_000 + non_periodic.len()].copy_from_slice(non_periodic);
+        assert_agree(&planted, periodic, 0, planted.len());
+        assert_agree(&planted, non_periodic, 0, planted.len());
+        assert_agree(&planted, absent, 0, planted.len());
+
+        // `lo != 0` and `hi < len`, with the searched window still `n >= 30000`.
+        let mut wide = lcg_hay(9, HAY_LEN + 200);
+        let lo = 100usize;
+        let hi = lo + HAY_LEN;
+        assert!(hi < wide.len());
+        wide[lo + 500..lo + 500 + periodic.len()].copy_from_slice(periodic);
+        wide[lo - 16..lo - 16 + periodic.len()].copy_from_slice(periodic);
+        assert_agree(&wide, periodic, lo, hi);
+        assert_agree(&wide, absent, lo, hi);
+        assert_agree(&wide, non_periodic, lo, hi);
+
+        for seed in [2u64, 3, 4] {
+            let hay = lcg_hay(seed, HAY_LEN);
+            assert_agree(&hay, periodic, 0, hay.len());
+            assert_agree(&hay, non_periodic, 0, hay.len());
+            assert_agree(&hay, absent, 0, hay.len());
+        }
+    }
+
+    fn lcg_hay(seed: u64, len: usize) -> Vec<u8> {
+        let alphabet = b"abcd";
+        let mut state = seed;
+        let mut hay = Vec::with_capacity(len);
+        for _ in 0..len {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            hay.push(alphabet[((state >> 16) as usize) & 3]);
+        }
+        hay
+    }
 }

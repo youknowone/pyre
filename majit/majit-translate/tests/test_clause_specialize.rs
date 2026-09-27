@@ -70,24 +70,7 @@ fn rdict_string_and_objectkey_instantiations_resolve_distinct_eq() {
 }
 
 fn graph_calls_str_eq(graph: &majit_translate::model::FunctionGraph) -> bool {
-    graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .any(|op| match &op.kind {
-            OpKind::BinOp { op, .. } if op == "eq" => true,
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } => {
-                segments.len() >= 4
-                    && segments[segments.len() - 4] == "str"
-                    && segments[segments.len() - 3] == "traits"
-                    && segments[segments.len() - 2] == "<Impl>"
-                    && segments[segments.len() - 1] == "eq"
-            }
-            _ => false,
-        })
+    graph_calls_string_eq(graph, false)
 }
 
 /// `fn mk<T: Default>() -> T` at `T = i64` and `T = String` is two graphs.
@@ -303,10 +286,16 @@ fn replace_first_arg(graph: &FunctionGraph) -> &majit_translate::flowspace::mode
         .iter()
         .flat_map(|block| &block.operations)
         .find_map(|op| match &op.kind {
-            OpKind::Call { args, .. } if !args.is_empty() => args[0].as_variable(),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.as_slice() == ["fixture", "put"] && !args.is_empty() => {
+                args[0].as_variable()
+            }
             _ => None,
         })
-        .expect("put call")
+        .expect("call fixture::put")
 }
 
 fn non_void_input_kinds(graph: &majit_translate::model::FunctionGraph) -> Vec<&'static str> {
@@ -328,20 +317,35 @@ fn non_void_input_kinds(graph: &majit_translate::model::FunctionGraph) -> Vec<&'
 fn graph_return_kind(graph: &majit_translate::model::FunctionGraph) -> &'static str {
     let mut saw_int = false;
     let mut saw_ref = false;
-    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
-        let ty = match &op.kind {
-            OpKind::Call { result_ty, .. }
-            | OpKind::UnaryOp { result_ty, .. }
-            | OpKind::BinOp { result_ty, .. } => Some(result_ty),
-            OpKind::ConstInt(_) => return "Int",
-            _ => None,
-        };
-        match ty {
-            Some(majit_translate::model::ValueType::Int)
-            | Some(majit_translate::model::ValueType::Unsigned) => saw_int = true,
-            Some(majit_translate::model::ValueType::Ref(_))
-            | Some(majit_translate::model::ValueType::Str) => saw_ref = true,
-            _ => {}
+    let mut saw = false;
+    for block in &graph.blocks {
+        for link in &block.exits {
+            if link.target != graph.returnblock {
+                continue;
+            }
+            for arg in &link.args {
+                saw = true;
+                let kind = match arg.as_variable() {
+                    Some(var) => returned_kind(graph, var),
+                    None => "other",
+                };
+                match kind {
+                    "Int" => saw_int = true,
+                    "Ref" => saw_ref = true,
+                    "Void" => {}
+                    _ => return "mixed",
+                }
+            }
+        }
+    }
+    if !saw {
+        for var in &graph.block(graph.returnblock).inputargs {
+            match returned_kind(graph, var) {
+                "Int" => saw_int = true,
+                "Ref" => saw_ref = true,
+                "Void" => {}
+                _ => return "mixed",
+            }
         }
     }
     if saw_int && !saw_ref {
@@ -351,6 +355,54 @@ fn graph_return_kind(graph: &majit_translate::model::FunctionGraph) -> &'static 
     } else {
         "mixed"
     }
+}
+
+/// Kind of a value that reaches the return block: its producer's type,
+/// or the variable's concretetype when the producer carries none.
+fn returned_kind(
+    graph: &majit_translate::model::FunctionGraph,
+    var: &majit_translate::flowspace::model::Variable,
+) -> &'static str {
+    if let Some(ty) = producer_value_type(graph, var) {
+        return value_type_kind(ty);
+    }
+    match FunctionGraph::concretetype_of(var) {
+        majit_translate::model::ConcreteType::Signed => "Int",
+        majit_translate::model::ConcreteType::GcRef => "Ref",
+        majit_translate::model::ConcreteType::Void => "Void",
+        _ => "other",
+    }
+}
+
+fn value_type_kind(ty: &majit_translate::model::ValueType) -> &'static str {
+    use majit_translate::model::ValueType;
+    match ty {
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool => "Int",
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => "Ref",
+        ValueType::Void => "Void",
+        _ => "other",
+    }
+}
+
+fn producer_value_type<'a>(
+    graph: &'a majit_translate::model::FunctionGraph,
+    var: &majit_translate::flowspace::model::Variable,
+) -> Option<&'a majit_translate::model::ValueType> {
+    graph.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| {
+            if op.result.as_ref() != Some(var) {
+                return None;
+            }
+            match &op.kind {
+                OpKind::Input { ty, .. }
+                | OpKind::Call { result_ty: ty, .. }
+                | OpKind::UnaryOp { result_ty: ty, .. }
+                | OpKind::BinOp { result_ty: ty, .. }
+                | OpKind::FieldRead { ty, .. } => Some(ty),
+                _ => None,
+            }
+        })
+    })
 }
 
 fn op_kinds(graph: &majit_translate::model::FunctionGraph) -> Vec<String> {
@@ -405,6 +457,12 @@ fn graph_calls_trait_borrow(graph: &majit_translate::model::FunctionGraph) -> bo
 }
 
 fn graph_calls_string_eq_impl(graph: &majit_translate::model::FunctionGraph) -> bool {
+    graph_calls_string_eq(graph, true)
+}
+
+/// `eq` on `str` / `String` / `&str`: a call whose target is that impl,
+/// or a `BinOp("eq")` whose operands are typed that way.
+fn graph_calls_string_eq(graph: &majit_translate::model::FunctionGraph, spec_leaf: bool) -> bool {
     graph
         .blocks
         .iter()
@@ -412,18 +470,94 @@ fn graph_calls_string_eq_impl(graph: &majit_translate::model::FunctionGraph) -> 
         .any(|op| match &op.kind {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
+                args,
                 ..
-            } => {
-                segments.len() >= 4
-                    && segments[segments.len() - 4] == "str"
-                    && segments[segments.len() - 3] == "traits"
-                    && segments[segments.len() - 2] == "<Impl>"
-                    && (segments[segments.len() - 1] == "eq"
-                        || segments[segments.len() - 1].starts_with("eq__spec_"))
+            } if string_eq_segments(segments, spec_leaf)
+                || (eq_leaf(segments, spec_leaf)
+                    && args.len() >= 2
+                    && args.iter().take(2).all(|arg| {
+                        arg.as_variable()
+                            .is_some_and(|var| operand_is_string(graph, var))
+                    })) =>
+            {
+                true
             }
-            OpKind::BinOp { op, .. } if op == "eq" => true,
+            OpKind::BinOp { op, lhs, rhs, .. } if op == "eq" => {
+                operand_is_string(graph, lhs) && operand_is_string(graph, rhs)
+            }
             _ => false,
         })
+}
+
+fn eq_leaf(segments: &[String], spec_leaf: bool) -> bool {
+    let Some(leaf) = segments.last().map(String::as_str) else {
+        return false;
+    };
+    leaf == "eq" || (spec_leaf && leaf.starts_with("eq__spec_"))
+}
+
+fn string_eq_segments(segments: &[String], spec_leaf: bool) -> bool {
+    segments.len() >= 4
+        && (segments[segments.len() - 4] == "str" || segments[segments.len() - 4] == "String")
+        && segments[segments.len() - 3] == "traits"
+        && segments[segments.len() - 2] == "<Impl>"
+        && eq_leaf(segments, spec_leaf)
+}
+
+fn operand_is_string(
+    graph: &majit_translate::model::FunctionGraph,
+    var: &majit_translate::flowspace::model::Variable,
+) -> bool {
+    use majit_translate::model::ValueType;
+    match reaching_value_type(graph, var, 0) {
+        Some(ValueType::Str) => true,
+        Some(ValueType::Ref(Some(root))) => string_root(root),
+        _ => false,
+    }
+}
+
+/// Producer type of `var`, or of the link value that reaches it when `var`
+/// is only a block input.
+fn reaching_value_type<'a>(
+    graph: &'a majit_translate::model::FunctionGraph,
+    var: &majit_translate::flowspace::model::Variable,
+    depth: usize,
+) -> Option<&'a majit_translate::model::ValueType> {
+    if depth > 8 {
+        return None;
+    }
+    if let Some(ty) = producer_value_type(graph, var) {
+        return Some(ty);
+    }
+    for block in &graph.blocks {
+        let Some(slot) = block.inputargs.iter().position(|arg| arg == var) else {
+            continue;
+        };
+        for pred in &graph.blocks {
+            for link in &pred.exits {
+                if link.target != block.id {
+                    continue;
+                }
+                let Some(src) = link.args.get(slot).and_then(|arg| arg.as_variable()) else {
+                    continue;
+                };
+                if src == var {
+                    continue;
+                }
+                if let Some(ty) = reaching_value_type(graph, src, depth + 1) {
+                    return Some(ty);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn string_root(root: &str) -> bool {
+    matches!(
+        root.rsplit("::").next().unwrap_or(root),
+        "str" | "String" | "&str"
+    )
 }
 
 fn mk_fixture_llbc() -> String {

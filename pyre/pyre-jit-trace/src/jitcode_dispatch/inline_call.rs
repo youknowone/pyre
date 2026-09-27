@@ -1386,7 +1386,15 @@ fn known_int_result(
         "int_sub/ii>i" => Some(int(0)?.wrapping_sub(int(1)?)),
         "int_mul/ii>i" => Some(int(0)?.wrapping_mul(int(1)?)),
         "int_and/ii>i" => Some(int(0)? & int(1)?),
-        "int_signext/ii>i" => Some(majit_metainterp::support::int_signext(int(0)?, int(1)?)),
+        // `executor.execute_binary_int_const_row` accepts `IntSignext` only for
+        // a byte count in `1..=8`; `support.int_signext` asserts `numbytes > 0`.
+        "int_signext/ii>i" => {
+            let value = int(0)?;
+            let numbytes = int(1)?;
+            (1..=8)
+                .contains(&numbytes)
+                .then(|| majit_metainterp::support::int_signext(value, numbytes))
+        }
         "int_or/ii>i" => Some(int(0)? | int(1)?),
         "int_xor/ii>i" => Some(int(0)? ^ int(1)?),
         "int_neg/i>i" => Some(int(0)?.wrapping_neg()),

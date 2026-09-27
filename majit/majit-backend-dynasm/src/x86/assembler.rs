@@ -3325,10 +3325,52 @@ impl<'a> Assembler386<'a> {
                 }
             }
             OpCode::IntSignext => {
-                // arglocs = [argloc, numbytes_loc], result_loc = separate reg
-                if let (Some(src), Some(Loc::Reg(r))) = (arglocs.first(), result_loc) {
-                    self.regalloc_mov(src, &Loc::Reg(*r));
-                    // signext handled by assembler based on numbytes
+                // x86/assembler.py `genop_int_signext`: numbytes is an immediate,
+                // and 1/2/4 select MOVSX8 / MOVSX16 / MOVSX32 (movsxd).
+                let (Some(argloc), Some(numbytes_loc), Some(Loc::Reg(res))) =
+                    (arglocs.first(), arglocs.get(1), result_loc)
+                else {
+                    panic!(
+                        "int_signext: expected [arg, numbytes] and a register result, \
+                         got arglocs={arglocs:?} result={result_loc:?}"
+                    );
+                };
+                let (Loc::Immed(numbytes) | Loc::ImmedFloat(numbytes)) = numbytes_loc else {
+                    panic!("int_signext: numbytes loc must be an immediate, got {numbytes_loc:?}");
+                };
+                let dst = res.value;
+                match numbytes.value {
+                    1 => match argloc {
+                        Loc::Reg(src) => {
+                            dynasm!(self.mc ; .arch x64 ; movsx Rq(dst), Rb(src.value));
+                        }
+                        ebp_loc_pat!(slot) => {
+                            let ofs = slot.value;
+                            dynasm!(self.mc ; .arch x64 ; movsx Rq(dst), BYTE [rbp + ofs]);
+                        }
+                        other => panic!("int_signext: unhandled arg {other:?}"),
+                    },
+                    2 => match argloc {
+                        Loc::Reg(src) => {
+                            dynasm!(self.mc ; .arch x64 ; movsx Rq(dst), Rw(src.value));
+                        }
+                        ebp_loc_pat!(slot) => {
+                            let ofs = slot.value;
+                            dynasm!(self.mc ; .arch x64 ; movsx Rq(dst), WORD [rbp + ofs]);
+                        }
+                        other => panic!("int_signext: unhandled arg {other:?}"),
+                    },
+                    4 => match argloc {
+                        Loc::Reg(src) => {
+                            dynasm!(self.mc ; .arch x64 ; movsxd Rq(dst), Rd(src.value));
+                        }
+                        ebp_loc_pat!(slot) => {
+                            let ofs = slot.value;
+                            dynasm!(self.mc ; .arch x64 ; movsxd Rq(dst), DWORD [rbp + ofs]);
+                        }
+                        other => panic!("int_signext: unhandled arg {other:?}"),
+                    },
+                    _ => panic!("bad number of bytes"),
                 }
             }
             // ── Float binary ──
@@ -8756,25 +8798,6 @@ rx86::movss_ax(&mut self.mc, base.value, ofs_reg.value, $scale, offset, xmm);
             ; mul rcx
             ; mov rax, rdx
         );
-        self.store_rax_to_result(op.pos().get());
-    }
-
-    /// INT_SIGNEXT: sign-extend from num_bytes width to 64 bits.
-    #[allow(dead_code)]
-    fn genop_int_signext(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        let num_bytes = match self.resolve_opref(op.arg(1).to_opref()) {
-            ResolvedArg::Const(v) => v,
-            _ => 8,
-        };
-        let shift = 64 - num_bytes * 8;
-        if shift > 0 && shift < 64 {
-            let sh = shift as i8;
-            dynasm!(self.mc ; .arch x64
-                ; shl rax, sh
-                ; sar rax, sh
-            );
-        }
         self.store_rax_to_result(op.pos().get());
     }
 

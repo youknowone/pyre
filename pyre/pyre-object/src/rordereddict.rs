@@ -774,7 +774,10 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     {
         let hash = self.hash_of(key);
         let slot = self.lookup(hash, key)?;
-        if !self.entry_valid(slot) {
+        // A callback that reshaped the dict mid-probe leaves `slot` stale;
+        // `callback_free_dict_op!` discards this answer, so the read only
+        // has to stay in bounds (see `lookup`).
+        if slot >= self.entries.len() || !self.entry_valid(slot) {
             return None;
         }
         Some(&self.entry_at(slot).value)
@@ -786,7 +789,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     {
         let hash = self.hash_of(key);
         let slot = self.lookup(hash, key)?;
-        if !self.entry_valid(slot) {
+        if slot >= self.entries.len() || !self.entry_valid(slot) {
             return None;
         }
         Some(&mut self.entry_at_mut(slot).value)

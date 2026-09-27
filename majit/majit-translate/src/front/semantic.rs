@@ -929,17 +929,6 @@ pub(crate) fn propagate_access_directly(
     // function object itself; a crate-stripped path is a weaker key, so a
     // collision has to be refused rather than silently resolved to whichever
     // function was collected last.
-    // Harvested `dont_look_inside` paths name the declaration. A spec
-    // copy shares that `fun_decl_id` and must stay residual too.
-    let mut residual_decls: HashSet<u64> = HashSet::new();
-    for func in functions.iter() {
-        if let Some(id) = func.fun_decl_id
-            && dont_look_inside.contains(&path_of(func))
-        {
-            residual_decls.insert(id);
-        }
-    }
-
     let mut index: HashMap<String, Option<usize>> = HashMap::new();
     for (i, func) in functions.iter().enumerate() {
         index
@@ -997,10 +986,10 @@ pub(crate) fn propagate_access_directly(
                 // the argument neither flags the callee nor travels further
                 // through it.
                 let callee_fn = &functions[callee];
+                // `FunctionDesc.cachedgraph` shares the original function
+                // object, so a spec copy carries the same `_jit_look_inside_`
+                // on `hints`. Ids are per-LLBC and must not key this.
                 if dont_look_inside.contains(&path_of(callee_fn))
-                    || callee_fn
-                        .fun_decl_id
-                        .is_some_and(|id| residual_decls.contains(&id))
                     || callee_fn
                         .hints
                         .iter()
@@ -1762,6 +1751,31 @@ mod tests {
         assert!(
             !fns[1].graph.access_directly,
             "a dont_look_inside callee must never carry the flag"
+        );
+    }
+
+    /// A spec copy is a second graph of the same function
+    /// (`FunctionDesc.cachedgraph`). Its path is the spec leaf, so the
+    /// harvested set does not name it; the copy's own `hints` carry
+    /// `dont_look_inside` and the edge is still dropped.
+    #[test]
+    fn a_spec_copy_of_a_dont_look_inside_helper_stays_residual() {
+        let mut copy = free_fn("helper__spec_i64");
+        copy.fun_decl_id = Some(7);
+        copy.hints.push("dont_look_inside".to_string());
+        let mut fns = vec![
+            caller_hinting_arg0(
+                "dispatch",
+                Some(crate::hints::HintKind::AccessDirectly),
+                &[("helper__spec_i64", 1)],
+            ),
+            copy,
+        ];
+        let opaque: std::collections::HashSet<String> = ["helper".to_string()].into();
+        propagate_access_directly(&mut fns, &opaque, &vable_roots());
+        assert!(
+            !fns[1].graph.access_directly,
+            "a spec copy of a dont_look_inside helper must stay residual"
         );
     }
 
