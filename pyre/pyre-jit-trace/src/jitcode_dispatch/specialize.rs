@@ -7052,9 +7052,8 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     //     SPECIALISED_TUPLE_{II,FF,OO} variants).  Specialised tuples store
     //     `value0`/`value1` inline with no `wrappeditems` block, so a
     //     `getfield(wrappeditems)` on one yields garbage.
-    //   * `w_class == canonical tuple` — a tuple SUBCLASS instance shares the
-    //     payload `ob_type == &TUPLE_TYPE` but retags `w_class` and may
-    //     override `__getitem__`; `baseobjspace::getitem` honours that
+    //   * `w_class == canonical tuple` — a tuple SUBCLASS instance carries
+    //     `TUPLE_USER_TYPE` and may override `__getitem__`; `baseobjspace::getitem` honours that
     //     override (subclass_special_override) so the pure `wrappeditems[i]`
     //     load must NOT be taken for it.
     // A failing gate falls to the generic residual.  The paired runtime

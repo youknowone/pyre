@@ -3986,27 +3986,41 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::pyobject::INT_USER_TYPE as *const _ as usize,
         int_user_tid,
     );
-    let unicode_user_tid = gc.register_type(
-        TypeInfo::with_custom_trace(
-            pyre_object::unicodeobject::W_UNICODE_USER_OBJECT_SIZE,
-            unicode_user_object_custom_trace,
-        )
-        .object_layout_without_subclass_range(),
-    );
+    let unicode_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::unicodeobject::W_UNICODE_USER_OBJECT_SIZE,
+        w_str_tid,
+        unicode_user_object_custom_trace,
+    ));
     debug_assert_eq!(
         unicode_user_tid,
         pyre_object::unicodeobject::W_UNICODE_USER_GC_TYPE_ID
     );
-    let tuple_user_tid = gc.register_type(
-        TypeInfo::with_custom_trace(
-            pyre_object::tupleobject::W_TUPLE_USER_OBJECT_SIZE,
-            tuple_user_object_custom_trace,
-        )
-        .object_layout_without_subclass_range(),
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::STR_USER_TYPE as *const _ as usize,
+        unicode_user_tid,
     );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::STR_USER_TYPE as *const _ as usize,
+        unicode_user_tid,
+    );
+    let tuple_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::tupleobject::W_TUPLE_USER_OBJECT_SIZE,
+        w_tuple_tid,
+        tuple_user_object_custom_trace,
+    ));
     debug_assert_eq!(
         tuple_user_tid,
         pyre_object::tupleobject::W_TUPLE_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::TUPLE_USER_TYPE as *const _ as usize,
+        tuple_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::TUPLE_USER_TYPE as *const _ as usize,
+        tuple_user_tid,
     );
 
     // Register `posix.DirEntry`'s four inline GC edges and

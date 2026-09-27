@@ -232,9 +232,11 @@ pub unsafe fn pytype_has_mapdict_mixin(obj: PyObjectRef) -> bool {
 /// True when `obj`'s Python class is exactly the builtin type for its
 /// layout — i.e. NOT a user subclass.
 ///
-/// A user subclass of a builtin keeps the builtin `ob_type` (and therefore
-/// the builtin struct layout and the `is_int` / `is_list` / … layout
-/// predicates) while `w_class` is retagged to the subclass type object
+/// A user subclass instance of `int`, `str` or `tuple` carries the builtin's
+/// `_getusercls` class as its typeptr, which alone decides exactness. A user
+/// subclass of any other builtin keeps the builtin `ob_type` (and therefore
+/// the builtin struct layout and the `is_list` / … layout predicates) while
+/// `w_class` is retagged to the subclass type object
 /// (`typedef::subclass_to_tag`).  The type-specific fast paths in
 /// `space.is_true` / `eq_w` / `len` / `getitem` / … assume the receiver's
 /// Python class IS the builtin (no overridable special method); for a
@@ -375,9 +377,13 @@ pub static INT_USER_TYPE: PyType = new_user_pytype("int", &INT_TYPE);
 pub static BOOL_TYPE: PyType = new_pytype("bool");
 pub static FLOAT_TYPE: PyType = new_pytype("float");
 pub static COMPLEX_TYPE: PyType = new_pytype("complex");
-pub static STR_TYPE: PyType = new_pytype("str");
+pub static STR_TYPE: PyType = new_pytype_with_user_subclass("str", &STR_USER_TYPE);
+/// `W_UnicodeObjectUser` (`typedef.py _getusercls(W_UnicodeObject)`).
+pub static STR_USER_TYPE: PyType = new_user_pytype("str", &STR_TYPE);
 pub static LIST_TYPE: PyType = new_pytype("list");
-pub static TUPLE_TYPE: PyType = new_pytype("tuple");
+pub static TUPLE_TYPE: PyType = new_pytype_with_user_subclass("tuple", &TUPLE_USER_TYPE);
+/// `W_TupleObjectUser` (`typedef.py _getusercls(W_TupleObject)`).
+pub static TUPLE_USER_TYPE: PyType = new_user_pytype("tuple", &TUPLE_TYPE);
 pub static DICT_TYPE: PyType = new_pytype("dict");
 pub static LONG_TYPE: PyType = new_pytype("int");
 pub static NONE_TYPE: PyType = new_pytype("NoneType");
@@ -775,11 +781,11 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // The two `step == 1` range-iterator shapes, whose ids are explicit.
     (165, Some(0)),
     (166, Some(0)),
-    // 167-169 are `typedef.py` `_getusercls` layouts (int/str/tuple user).
-    // `W_IntObjectUser` is an rclass subclass of `W_IntObject`; the str and
-    // tuple ones have no rclass vtable of their own yet
-    // (`object_layout_without_subclass_range`).
+    // 167-169 are `typedef.py` `_getusercls` layouts (int/str/tuple user),
+    // each an rclass subclass of the builtin it was made from.
     (167, Some(1)),
+    (168, Some(34)),
+    (169, Some(8)),
     // Native-only type IDs 170 and 171 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
@@ -1326,6 +1332,8 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(165, typed::<crate::functional::W_IntRangeStepOneIterator>()),
         subclass_range_alias(166, typed::<crate::functional::W_IntRangeOneArgIterator>()),
         subclass_range_alias(167, &INT_USER_TYPE),
+        subclass_range_alias(168, &STR_USER_TYPE),
+        subclass_range_alias(169, &TUPLE_USER_TYPE),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),
@@ -1580,6 +1588,7 @@ pub unsafe fn is_tuple(obj: PyObjectRef) -> bool {
     };
     unsafe {
         py_type_check(obj, &TUPLE_TYPE)
+            || py_type_check(obj, &TUPLE_USER_TYPE)
             || py_type_check(obj, &SPECIALISED_TUPLE_II_TYPE)
             || py_type_check(obj, &SPECIALISED_TUPLE_FF_TYPE)
             || py_type_check(obj, &SPECIALISED_TUPLE_OO_TYPE)

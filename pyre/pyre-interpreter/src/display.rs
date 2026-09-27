@@ -1407,7 +1407,9 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
         if obj.is_null() {
             return Ok(Wtf8Buf::from_string("NULL".to_string()));
         }
-        let tp = (*obj).ob_type;
+        // Keyed on the payload layout, which a `_getusercls` class shares
+        // with the builtin it was made from.
+        let tp = pyre_object::pyobject::layout_base((*obj).ob_type);
         // For strings, return the value directly (no quotes).
         if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
             if let Some(r) = builtin_subclass_dunder_obj(obj, tp, "__str__")? {

@@ -10272,11 +10272,10 @@ fn walker_guard_class<Sym: WalkSym>(
 
 /// Guard the fixed-layout mapdict-carrier representation, the receiver type's
 /// live Python class, live version tag, and the exact map shape used by the
-/// mapdict attribute folds.  Native builtin subclasses share their `ob_type`
-/// with exact builtin values, so the Python class guard is what proves that a
-/// later receiver still has the wide user layout before either mapdict field
-/// is read. The promoted map identity then pins its storage coordinates
-/// (mapdict.py).
+/// mapdict attribute folds.  The layout guard proves that a later receiver
+/// still has the wide user layout before either mapdict field is read, and
+/// the Python class guard which subclass it is. The promoted map identity then
+/// pins its storage coordinates (mapdict.py).
 fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -10308,10 +10307,10 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     }
 
     // `typedef.py _getusercls` gives a builtin user subclass a generated payload
-    // containing MapdictStorageMixin. The str and tuple ones keep the builtin
-    // `ob_type`, so GuardClass alone cannot separate W_UnicodeObjectUser from
-    // the shorter W_UnicodeObject. Pin `w_class` before loading `map` at the
-    // user offset; an exact builtin or a different subclass exits first.
+    // containing MapdictStorageMixin, and the GuardClass above already
+    // separates it from the shorter builtin payload. Every Python subclass of
+    // one builtin shares that generated class, so pin `w_class` before loading
+    // `map`; a different subclass exits first.
     walker_guard_exact_w_class(ctx, op_pc, obj, w_type)?;
 
     // The instance map pins the storage layout, but class mutation can change
