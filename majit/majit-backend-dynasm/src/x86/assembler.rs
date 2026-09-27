@@ -27,6 +27,7 @@ use majit_ir::{
     TargetArgLoc, Type,
 };
 
+use super::rx86;
 use crate::arch::*;
 use crate::codebuf;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
@@ -308,10 +309,11 @@ pub(crate) fn pop_all_regs_from_jitframe_raw(
 pub(crate) fn emit_footer_shadowstack_raw(asm: &mut Assembler) {
     let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-    dynasm!(asm ; .arch x64
-        ; mov Rq(scratch), QWORD rst
-        ; sub QWORD [Rq(scratch)], 16
+    dynasm!(asm
+            ; .arch x64
+            ; mov Rq(scratch), QWORD rst
     );
+    rx86::sub_mi(asm, scratch, 0, 16);
 }
 
 /// `x86/assembler.py _call_footer` parity (free-fn variant).
@@ -1679,15 +1681,21 @@ impl<'a> Assembler386<'a> {
                 let exc_value_addr = crate::jit_exc_value_addr() as i64;
                 let exc_type_addr = crate::jit_exc_type_addr() as i64;
                 dynasm!(self.mc
-                    ; .arch x64
-                    // Fast path: load end, subtract SP, compare with length.
-                    ; mov Rq(scratch), QWORD addrs.end_adr as i64
-                    ; mov rax, [Rq(scratch)]
-                    ; sub rax, rsp
-                    ; mov Rq(scratch), QWORD addrs.length_adr as i64
-                    ; cmp rax, [Rq(scratch)]
-                    ; jbe =>continue_label
-                    // Slow path: call pyre_stack_too_big_slowpath(rsp).
+                        ; .arch x64
+                                    // Fast path: load end, subtract SP, compare with length.
+                        ; mov Rq(scratch), QWORD addrs.end_adr as i64
+                );
+                rx86::mov_rm(&mut self.mc, 0, scratch, 0);
+                dynasm!(self.mc
+                        ; .arch x64
+                        ; sub rax, rsp
+                        ; mov Rq(scratch), QWORD addrs.length_adr as i64
+                );
+                rx86::cmp_rm(&mut self.mc, 0, scratch, 0);
+                dynasm!(self.mc
+                        ; .arch x64
+                        ; jbe =>continue_label
+                                    // Slow path: call pyre_stack_too_big_slowpath(rsp).
                 );
                 self.emit_abi_int_arg_from_reg(0, 4); // rsp
                 dynasm!(self.mc
@@ -1696,26 +1704,32 @@ impl<'a> Assembler386<'a> {
                 );
                 self.emit_abi_call_reg(scratch);
                 dynasm!(self.mc
-                    ; .arch x64
-                    ; test al, al
-                    ; jz =>continue_label
-                    // x86/assembler.py `_build_stack_check_slowpath`:
-                    // the slowpath raised into pos_exception(); merge with the
-                    // propagate-exception path by moving that value into
-                    // jf_guard_exc and publishing propagate_exception_descr.
-                    ; mov Rq(scratch), QWORD exc_value_addr
-                    ; mov rax, [Rq(scratch)]
-                    ; mov QWORD [Rq(scratch)], 0
-                    ; mov [rbp + JF_GUARD_EXC_OFS], rax
-                    ; mov Rq(scratch), QWORD exc_type_addr
-                    ; mov QWORD [Rq(scratch)], 0
-                    ; mov Rq(scratch), QWORD propagate_descr
-                    ; mov [rbp + JF_DESCR_OFS], Rq(scratch)
-                    // Overflow fallthrough: return rbp as jf_ptr.  Mirrors
-                    // `_call_footer` without `gen_footer_shadowstack` —
-                    // `gen_shadowstack_header` runs after this stack-check
-                    // path, so no shadow-stack entry has been pushed yet.
-                    ; mov rax, rbp
+                        ; .arch x64
+                        ; test al, al
+                        ; jz =>continue_label
+                                    // x86/assembler.py `_build_stack_check_slowpath`:
+                                    // the slowpath raised into pos_exception(); merge with the
+                                    // propagate-exception path by moving that value into
+                                    // jf_guard_exc and publishing propagate_exception_descr.
+                        ; mov Rq(scratch), QWORD exc_value_addr
+                );
+                rx86::mov_rm(&mut self.mc, 0, scratch, 0);
+                rx86::mov_mi(&mut self.mc, scratch, 0, 0);
+                dynasm!(self.mc
+                        ; .arch x64
+                        ; mov [rbp + JF_GUARD_EXC_OFS], rax
+                        ; mov Rq(scratch), QWORD exc_type_addr
+                );
+                rx86::mov_mi(&mut self.mc, scratch, 0, 0);
+                dynasm!(self.mc
+                        ; .arch x64
+                        ; mov Rq(scratch), QWORD propagate_descr
+                        ; mov [rbp + JF_DESCR_OFS], Rq(scratch)
+                                    // Overflow fallthrough: return rbp as jf_ptr.  Mirrors
+                                    // `_call_footer` without `gen_footer_shadowstack` —
+                                    // `gen_shadowstack_header` runs after this stack-check
+                                    // path, so no shadow-stack entry has been pushed yet.
+                        ; mov rax, rbp
                 );
                 // Win64: r13 restored from the +56 slot — see
                 // `_call_header` for why pyre saves r13 even though
@@ -2187,16 +2201,23 @@ impl<'a> Assembler386<'a> {
         let scratch_for_exc = crate::regloc::X86_64_SCRATCH_REG.value;
         let exc_value_addr = crate::jit_exc_value_addr() as i64;
         let exc_type_addr = crate::jit_exc_type_addr() as i64;
-        dynasm!(self.mc ; .arch x64
-            ; mov Rq(scratch_for_exc), QWORD exc_value_addr
-            ; mov Rq(scratch_for_exc), [Rq(scratch_for_exc)]
-            ; mov [rbp + JF_GUARD_EXC_OFS], Rq(scratch_for_exc)
-            ; mov Rq(scratch_for_exc), QWORD exc_type_addr
-            ; mov rbx, [Rq(scratch_for_exc)]
-            ; mov QWORD [Rq(scratch_for_exc)], 0
-            ; mov Rq(scratch_for_exc), QWORD exc_value_addr
-            ; mov QWORD [Rq(scratch_for_exc)], 0
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov Rq(scratch_for_exc), QWORD exc_value_addr
         );
+        rx86::mov_rm(&mut self.mc, scratch_for_exc, scratch_for_exc, 0);
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov [rbp + JF_GUARD_EXC_OFS], Rq(scratch_for_exc)
+                ; mov Rq(scratch_for_exc), QWORD exc_type_addr
+        );
+        rx86::mov_rm(&mut self.mc, 3, scratch_for_exc, 0);
+        rx86::mov_mi(&mut self.mc, scratch_for_exc, 0, 0);
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov Rq(scratch_for_exc), QWORD exc_value_addr
+        );
+        rx86::mov_mi(&mut self.mc, scratch_for_exc, 0, 0);
 
         // assembler.py:150-152 — MOV ARG0 = rbp, ARG1 = depth (from
         // stack in PyPy's shared trampoline; here from a patched imm).
@@ -2247,11 +2268,12 @@ impl<'a> Assembler386<'a> {
         // post-realloc frame on the next minor collection.
         let rst_addr = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        dynasm!(self.mc ; .arch x64
-            ; mov Rq(scratch), QWORD rst_addr
-            ; mov Rq(scratch), [Rq(scratch)]
-            ; mov [Rq(scratch) - 8], rbp
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov Rq(scratch), QWORD rst_addr
         );
+        rx86::mov_rm(&mut self.mc, scratch, scratch, 0);
+        rx86::mov_mr(&mut self.mc, scratch, -8, 5);
 
         // assembler.py:186-187 — pop_gcmap + _pop_all_regs_from_frame.
         self.pop_gcmap();
@@ -2270,14 +2292,18 @@ impl<'a> Assembler386<'a> {
     fn gen_shadowstack_header(&mut self) {
         let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        dynasm!(self.mc ; .arch x64
-            ; mov Rq(scratch), QWORD rst
-            ; mov rax, [Rq(scratch)]    // rax = *rst = top
-            ; mov QWORD [rax], 1        // [top] = 1 (is_minor marker)
-            ; mov [rax + 8], rbp        // [top + WORD] = rbp (jf_ptr)
-            ; add rax, 16               // top += 2*WORD
-            ; mov [Rq(scratch)], rax    // *rst = top
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov Rq(scratch), QWORD rst
         );
+        rx86::mov_rm(&mut self.mc, 0, scratch, 0); //rax = *rst = top
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov QWORD [rax], 1        // [top] = 1 (is_minor marker)
+                ; mov [rax + 8], rbp        // [top + WORD] = rbp (jf_ptr)
+                ; add rax, 16               // top += 2*WORD
+        );
+        rx86::mov_mr(&mut self.mc, scratch, 0, 0); //*rst = top
     }
 
     /// x86/assembler.py `_call_footer_shadowstack` parity:
@@ -3061,8 +3087,9 @@ impl<'a> Assembler386<'a> {
                     (result_loc, arglocs.first(), arglocs.get(1))
                 {
                     match (a0, src) {
-                        (Loc::Reg(a), Loc::Reg(s)) => dynasm!(self.mc ; .arch x64
-                            ; lea Rq(dst.value), [Rq(a.value) + Rq(s.value)]),
+                        (Loc::Reg(a), Loc::Reg(s)) => {
+                            rx86::lea_ra(&mut self.mc, dst.value, a.value, s.value, 1, 0)
+                        }
                         (Loc::Reg(a), Loc::Immed(i) | Loc::ImmedFloat(i))
                         | (Loc::Immed(i) | Loc::ImmedFloat(i), Loc::Reg(a)) => {
                             // The `_consider_lea` route guarantees a fitting
@@ -3072,13 +3099,14 @@ impl<'a> Assembler386<'a> {
                             // one into the scratch register and use the
                             // base+index form.
                             if let Ok(v) = i32::try_from(i.value) {
-                                dynasm!(self.mc ; .arch x64
-                                    ; lea Rq(dst.value), [Rq(a.value) + v])
+                                rx86::lea_rm(&mut self.mc, dst.value, a.value, v);
                             } else {
                                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                                dynasm!(self.mc ; .arch x64
-                                    ; mov Rq(scratch), QWORD i.value
-                                    ; lea Rq(dst.value), [Rq(a.value) + Rq(scratch)])
+                                dynasm!(self.mc
+                                        ; .arch x64
+                                        ; mov Rq(scratch), QWORD i.value
+                                );
+                                rx86::lea_ra(&mut self.mc, dst.value, a.value, scratch, 1, 0);
                             }
                         }
                         (
@@ -3127,8 +3155,7 @@ impl<'a> Assembler386<'a> {
                                     "IntSub LEA requires an immediate \
                                          encodable as signed disp32 after negation",
                                 );
-                                dynasm!(self.mc ; .arch x64
-                                    ; lea Rq(dst.value), [Rq(a.value) + v])
+                                rx86::lea_rm(&mut self.mc, dst.value, a.value, v);
                             }
                             _ => panic!(
                                 "IntSub: result_loc != arglocs[0] requires LEA form \
@@ -3543,20 +3570,20 @@ impl<'a> Assembler386<'a> {
                 let ofs = op.with_field_descr(|fd| fd.offset() as i32).unwrap_or(0);
                 let field_size = op.with_field_descr(|fd| fd.field_size()).unwrap_or(8);
                 if dst.is_xmm {
-                    dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + ofs]);
+                    rx86::movsd_xm(&mut self.mc, dst.value, base.value, ofs);
                 } else {
                     match field_size {
                         1 => {
-                            dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), BYTE [Rq(base.value) + ofs]);
+                            rx86::movzx8_rm(&mut self.mc, dst.value, base.value, ofs);
                         }
                         2 => {
-                            dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), WORD [Rq(base.value) + ofs]);
+                            rx86::movzx16_rm(&mut self.mc, dst.value, base.value, ofs);
                         }
                         4 => {
-                            dynasm!(self.mc ; .arch x64 ; movsxd Rq(dst.value), DWORD [Rq(base.value) + ofs]);
+                            rx86::movsx32_rm(&mut self.mc, dst.value, base.value, ofs);
                         }
                         _ => {
-                            dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(base.value) + ofs]);
+                            rx86::mov_rm(&mut self.mc, dst.value, base.value, ofs);
                         }
                     }
                 }
@@ -3616,9 +3643,9 @@ impl<'a> Assembler386<'a> {
                         }
                     };
                     if base_size != 0 {
-                        dynasm!(self.mc ; .arch x64 ; lea rax, [Rq(base_reg) + Rq(index_reg) + base_size]);
+                        rx86::lea_ra(&mut self.mc, 0, base_reg, index_reg, 1, base_size);
                     } else {
-                        dynasm!(self.mc ; .arch x64 ; lea rax, [Rq(base_reg) + Rq(index_reg)]);
+                        rx86::lea_ra(&mut self.mc, 0, base_reg, index_reg, 1, 0);
                     }
                     if dst.is_xmm {
                         dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [rax]);
@@ -3822,46 +3849,41 @@ impl<'a> Assembler386<'a> {
                             match value_loc {
                                 Loc::Reg(val) if val.is_xmm && size == 4 => {
                                     let scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
-                                    dynasm!(self.mc ; .arch x64
-                                        ; cvtsd2ss Rx(scratch), Rx(val.value)
-                                        ; movss [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rx(scratch));
+                                    dynasm!(self.mc
+        ; .arch x64
+        ; cvtsd2ss Rx(scratch), Rx(val.value)
+);
+rx86::movss_ax(&mut self.mc, base.value, ofs_reg.value, $scale, offset, scratch);
                                 }
                                 Loc::Reg(val) if val.is_xmm => {
-                                    dynasm!(self.mc ; .arch x64
-                                        ; movsd [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rx(val.value));
+                                    rx86::movsd_ax(&mut self.mc, base.value, ofs_reg.value, $scale, offset, val.value);
                                 }
                                 Loc::Reg(val) => match size {
-                                    1 => dynasm!(self.mc ; .arch x64
-                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rb(val.value)),
-                                    2 => dynasm!(self.mc ; .arch x64
-                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rw(val.value)),
-                                    4 => dynasm!(self.mc ; .arch x64
-                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rd(val.value)),
-                                    _ => dynasm!(self.mc ; .arch x64
-                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rq(val.value)),
+                                    1 => rx86::mov8_ar(&mut self.mc, base.value, ofs_reg.value, $scale, offset, val.value),
+                                    2 => rx86::mov16_ar(&mut self.mc, base.value, ofs_reg.value, $scale, offset, val.value),
+                                    4 => rx86::mov32_ar(&mut self.mc, base.value, ofs_reg.value, $scale, offset, val.value),
+                                    _ => rx86::mov_ar(&mut self.mc, base.value, ofs_reg.value, $scale, offset, val.value),
                                 },
                                 Loc::ImmedFloat(i) if size == 4 => {
                                     let gpr = crate::regloc::X86_64_SCRATCH_REG.value;
                                     let xmm = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
-                                    dynasm!(self.mc ; .arch x64
-                                        ; mov Rq(gpr), QWORD i.value
-                                        ; movq Rx(xmm), Rq(gpr)
-                                        ; cvtsd2ss Rx(xmm), Rx(xmm)
-                                        ; movss [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rx(xmm));
+                                    dynasm!(self.mc
+        ; .arch x64
+        ; mov Rq(gpr), QWORD i.value
+        ; movq Rx(xmm), Rq(gpr)
+        ; cvtsd2ss Rx(xmm), Rx(xmm)
+);
+rx86::movss_ax(&mut self.mc, base.value, ofs_reg.value, $scale, offset, xmm);
                                 }
                                 Loc::Immed(i) | Loc::ImmedFloat(i) => {
                                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                                     dynasm!(self.mc ; .arch x64
                                         ; mov Rq(scratch), QWORD i.value);
                                     match size {
-                                        1 => dynasm!(self.mc ; .arch x64
-                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rb(scratch)),
-                                        2 => dynasm!(self.mc ; .arch x64
-                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rw(scratch)),
-                                        4 => dynasm!(self.mc ; .arch x64
-                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rd(scratch)),
-                                        _ => dynasm!(self.mc ; .arch x64
-                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rq(scratch)),
+                                        1 => rx86::mov8_ar(&mut self.mc, base.value, ofs_reg.value, $scale, offset, scratch),
+                                        2 => rx86::mov16_ar(&mut self.mc, base.value, ofs_reg.value, $scale, offset, scratch),
+                                        4 => rx86::mov32_ar(&mut self.mc, base.value, ofs_reg.value, $scale, offset, scratch),
+                                        _ => rx86::mov_ar(&mut self.mc, base.value, ofs_reg.value, $scale, offset, scratch),
                                     }
                                 }
                                 other => panic!(
@@ -3875,32 +3897,23 @@ impl<'a> Assembler386<'a> {
                         () => {{
                             match value_loc {
                                 Loc::Reg(val) if val.is_xmm => {
-                                    dynasm!(self.mc ; .arch x64
-                                        ; movsd [Rq(base.value) + Rq(ofs_reg.value) + offset], Rx(val.value));
+                                    rx86::movsd_ax(&mut self.mc, base.value, ofs_reg.value, 1, offset, val.value);
                                 }
                                 Loc::Reg(val) => match size {
-                                    1 => dynasm!(self.mc ; .arch x64
-                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rb(val.value)),
-                                    2 => dynasm!(self.mc ; .arch x64
-                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rw(val.value)),
-                                    4 => dynasm!(self.mc ; .arch x64
-                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rd(val.value)),
-                                    _ => dynasm!(self.mc ; .arch x64
-                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rq(val.value)),
+                                    1 => rx86::mov8_ar(&mut self.mc, base.value, ofs_reg.value, 1, offset, val.value),
+                                    2 => rx86::mov16_ar(&mut self.mc, base.value, ofs_reg.value, 1, offset, val.value),
+                                    4 => rx86::mov32_ar(&mut self.mc, base.value, ofs_reg.value, 1, offset, val.value),
+                                    _ => rx86::mov_ar(&mut self.mc, base.value, ofs_reg.value, 1, offset, val.value),
                                 },
                                 Loc::Immed(i) | Loc::ImmedFloat(i) => {
                                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                                     dynasm!(self.mc ; .arch x64
                                         ; mov Rq(scratch), QWORD i.value);
                                     match size {
-                                        1 => dynasm!(self.mc ; .arch x64
-                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rb(scratch)),
-                                        2 => dynasm!(self.mc ; .arch x64
-                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rw(scratch)),
-                                        4 => dynasm!(self.mc ; .arch x64
-                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rd(scratch)),
-                                        _ => dynasm!(self.mc ; .arch x64
-                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rq(scratch)),
+                                        1 => rx86::mov8_ar(&mut self.mc, base.value, ofs_reg.value, 1, offset, scratch),
+                                        2 => rx86::mov16_ar(&mut self.mc, base.value, ofs_reg.value, 1, offset, scratch),
+                                        4 => rx86::mov32_ar(&mut self.mc, base.value, ofs_reg.value, 1, offset, scratch),
+                                        _ => rx86::mov_ar(&mut self.mc, base.value, ofs_reg.value, 1, offset, scratch),
                                     }
                                 }
                                 other => panic!(
@@ -4006,42 +4019,90 @@ impl<'a> Assembler386<'a> {
                 macro_rules! emit_load_scaled {
                     ($scale:tt) => {{
                         if dst.is_xmm {
-                            dynasm!(self.mc ; .arch x64
-                                ; movsd Rx(dst.value), [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                            rx86::movsd_xa(
+                                &mut self.mc,
+                                dst.value,
+                                base.value,
+                                ofs_reg.value,
+                                $scale,
+                                offset,
+                            );
                         } else {
                             match size {
                                 1 => {
                                     if sign {
-                                        dynasm!(self.mc ; .arch x64
-                                            ; movsx Rq(dst.value), BYTE [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                        rx86::movsx8_ra(
+                                            &mut self.mc,
+                                            dst.value,
+                                            base.value,
+                                            ofs_reg.value,
+                                            $scale,
+                                            offset,
+                                        );
                                     } else {
-                                        dynasm!(self.mc ; .arch x64
-                                            ; movzx Rq(dst.value), BYTE [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                        rx86::movzx8_ra(
+                                            &mut self.mc,
+                                            dst.value,
+                                            base.value,
+                                            ofs_reg.value,
+                                            $scale,
+                                            offset,
+                                        );
                                     }
                                 }
                                 2 => {
                                     if sign {
-                                        dynasm!(self.mc ; .arch x64
-                                            ; movsx Rq(dst.value), WORD [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                        rx86::movsx16_ra(
+                                            &mut self.mc,
+                                            dst.value,
+                                            base.value,
+                                            ofs_reg.value,
+                                            $scale,
+                                            offset,
+                                        );
                                     } else {
-                                        dynasm!(self.mc ; .arch x64
-                                            ; movzx Rq(dst.value), WORD [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                        rx86::movzx16_ra(
+                                            &mut self.mc,
+                                            dst.value,
+                                            base.value,
+                                            ofs_reg.value,
+                                            $scale,
+                                            offset,
+                                        );
                                     }
                                 }
                                 4 => {
                                     if sign {
-                                        dynasm!(self.mc ; .arch x64
-                                            ; movsxd Rq(dst.value), DWORD [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                        rx86::movsx32_ra(
+                                            &mut self.mc,
+                                            dst.value,
+                                            base.value,
+                                            ofs_reg.value,
+                                            $scale,
+                                            offset,
+                                        );
                                     } else {
-                                        dynasm!(self.mc ; .arch x64
-                                            ; mov Rd(dst.value), [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                        rx86::mov32_ra(
+                                            &mut self.mc,
+                                            dst.value,
+                                            base.value,
+                                            ofs_reg.value,
+                                            $scale,
+                                            offset,
+                                        );
                                     }
                                 }
-                                8 => dynasm!(self.mc ; .arch x64
-                                    ; mov Rq(dst.value), [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]),
-                                other => panic!(
-                                    "load_from_mem: size {other} not in {{1, 2, 4, WORD}}"
+                                8 => rx86::mov_ra(
+                                    &mut self.mc,
+                                    dst.value,
+                                    base.value,
+                                    ofs_reg.value,
+                                    $scale,
+                                    offset,
                                 ),
+                                other => {
+                                    panic!("load_from_mem: size {other} not in {{1, 2, 4, WORD}}")
+                                }
                             }
                         }
                     }};
@@ -4049,42 +4110,90 @@ impl<'a> Assembler386<'a> {
                 macro_rules! emit_load_unscaled {
                     () => {{
                         if dst.is_xmm {
-                            dynasm!(self.mc ; .arch x64
-                                ; movsd Rx(dst.value), [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                            rx86::movsd_xa(
+                                &mut self.mc,
+                                dst.value,
+                                base.value,
+                                ofs_reg.value,
+                                1,
+                                offset,
+                            );
                         } else {
                             match size {
                                 1 => {
                                     if sign {
-                                        dynasm!(self.mc ; .arch x64
-                                            ; movsx Rq(dst.value), BYTE [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                        rx86::movsx8_ra(
+                                            &mut self.mc,
+                                            dst.value,
+                                            base.value,
+                                            ofs_reg.value,
+                                            1,
+                                            offset,
+                                        );
                                     } else {
-                                        dynasm!(self.mc ; .arch x64
-                                            ; movzx Rq(dst.value), BYTE [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                        rx86::movzx8_ra(
+                                            &mut self.mc,
+                                            dst.value,
+                                            base.value,
+                                            ofs_reg.value,
+                                            1,
+                                            offset,
+                                        );
                                     }
                                 }
                                 2 => {
                                     if sign {
-                                        dynasm!(self.mc ; .arch x64
-                                            ; movsx Rq(dst.value), WORD [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                        rx86::movsx16_ra(
+                                            &mut self.mc,
+                                            dst.value,
+                                            base.value,
+                                            ofs_reg.value,
+                                            1,
+                                            offset,
+                                        );
                                     } else {
-                                        dynasm!(self.mc ; .arch x64
-                                            ; movzx Rq(dst.value), WORD [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                        rx86::movzx16_ra(
+                                            &mut self.mc,
+                                            dst.value,
+                                            base.value,
+                                            ofs_reg.value,
+                                            1,
+                                            offset,
+                                        );
                                     }
                                 }
                                 4 => {
                                     if sign {
-                                        dynasm!(self.mc ; .arch x64
-                                            ; movsxd Rq(dst.value), DWORD [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                        rx86::movsx32_ra(
+                                            &mut self.mc,
+                                            dst.value,
+                                            base.value,
+                                            ofs_reg.value,
+                                            1,
+                                            offset,
+                                        );
                                     } else {
-                                        dynasm!(self.mc ; .arch x64
-                                            ; mov Rd(dst.value), [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                        rx86::mov32_ra(
+                                            &mut self.mc,
+                                            dst.value,
+                                            base.value,
+                                            ofs_reg.value,
+                                            1,
+                                            offset,
+                                        );
                                     }
                                 }
-                                8 => dynasm!(self.mc ; .arch x64
-                                    ; mov Rq(dst.value), [Rq(base.value) + Rq(ofs_reg.value) + offset]),
-                                other => panic!(
-                                    "load_from_mem: size {other} not in {{1, 2, 4, WORD}}"
+                                8 => rx86::mov_ra(
+                                    &mut self.mc,
+                                    dst.value,
+                                    base.value,
+                                    ofs_reg.value,
+                                    1,
+                                    offset,
                                 ),
+                                other => {
+                                    panic!("load_from_mem: size {other} not in {{1, 2, 4, WORD}}")
+                                }
                             }
                         }
                     }};
@@ -4149,13 +4258,13 @@ impl<'a> Assembler386<'a> {
 
                     match value_loc {
                         Loc::Reg(val) if val.is_xmm => {
-                            dynasm!(self.mc ; .arch x64 ; movsd [Rq(index_reg)], Rx(val.value));
+                            rx86::movsd_mx(&mut self.mc, index_reg, 0, val.value);
                         }
                         Loc::Reg(val) => match item_size {
-                            1 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rb(val.value)),
-                            2 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rw(val.value)),
-                            4 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rd(val.value)),
-                            _ => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rq(val.value)),
+                            1 => rx86::mov8_mr(&mut self.mc, index_reg, 0, val.value),
+                            2 => rx86::mov16_mr(&mut self.mc, index_reg, 0, val.value),
+                            4 => rx86::mov32_mr(&mut self.mc, index_reg, 0, val.value),
+                            _ => rx86::mov_mr(&mut self.mc, index_reg, 0, val.value),
                         },
                         _ => {
                             dynasm!(self.mc ; .arch x64 ; push rax);
@@ -4165,16 +4274,16 @@ impl<'a> Assembler386<'a> {
                             );
                             match item_size {
                                 1 => {
-                                    dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rb(value_reg))
+                                    rx86::mov8_mr(&mut self.mc, index_reg, 0, value_reg);
                                 }
                                 2 => {
-                                    dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rw(value_reg))
+                                    rx86::mov16_mr(&mut self.mc, index_reg, 0, value_reg);
                                 }
                                 4 => {
-                                    dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rd(value_reg))
+                                    rx86::mov32_mr(&mut self.mc, index_reg, 0, value_reg);
                                 }
                                 _ => {
-                                    dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rq(value_reg))
+                                    rx86::mov_mr(&mut self.mc, index_reg, 0, value_reg);
                                 }
                             }
                             dynasm!(self.mc ; .arch x64 ; pop rax);
@@ -4582,18 +4691,28 @@ impl<'a> Assembler386<'a> {
                     // the trampoline's `SUB rdx, rcx` recovers the
                     // exact byte count `dynasm_nursery_slowpath`
                     // expects (total bytes including header).
-                    dynasm!(self.mc ; .arch x64
-                        ; mov Rq(scratch), QWORD nf_addr as i64
-                        ; mov rcx, [Rq(scratch)]
-                        ; lea rdx, [rcx + Rq(sv) + gc_header_size]
-                        ; mov Rq(scratch), QWORD nt_addr as i64
-                        ; cmp rdx, [Rq(scratch)]
-                        ; ja =>slow_path
-                        ; mov Rq(scratch), QWORD nf_addr as i64
-                        ; mov [Rq(scratch)], rdx
-                        ; mov QWORD [rcx], 0
-                        ; lea Rq(rv), [rcx + gc_header_size]
-                        ; jmp =>done
+                    dynasm!(self.mc
+                            ; .arch x64
+                            ; mov Rq(scratch), QWORD nf_addr as i64
+                    );
+                    rx86::mov_rm(&mut self.mc, 1, scratch, 0);
+                    dynasm!(self.mc
+                            ; .arch x64
+                            ; lea rdx, [rcx + Rq(sv) + gc_header_size]
+                            ; mov Rq(scratch), QWORD nt_addr as i64
+                    );
+                    rx86::cmp_rm(&mut self.mc, 2, scratch, 0);
+                    dynasm!(self.mc
+                            ; .arch x64
+                            ; ja =>slow_path
+                            ; mov Rq(scratch), QWORD nf_addr as i64
+                    );
+                    rx86::mov_mr(&mut self.mc, scratch, 0, 2);
+                    dynasm!(self.mc
+                            ; .arch x64
+                            ; mov QWORD [rcx], 0
+                            ; lea Rq(rv), [rcx + gc_header_size]
+                            ; jmp =>done
                     );
                 }
                 dynasm!(self.mc ; .arch x64 ; =>slow_path);
@@ -4611,10 +4730,11 @@ impl<'a> Assembler386<'a> {
                 // `(rcx=0, rdx=total)` directly — `sub edx, ecx`
                 // recovers `total` for the trampoline either way.
                 if nf_addr == 0 || nt_addr == 0 {
-                    dynasm!(self.mc ; .arch x64
-                        ; xor rcx, rcx
-                        ; lea rdx, [Rq(sv) + gc_header_size]
+                    dynasm!(self.mc
+                            ; .arch x64
+                            ; xor rcx, rcx
                     );
+                    rx86::lea_rm(&mut self.mc, 2, sv, gc_header_size);
                 }
                 if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
                     self.push_gcmap(gcmap as *mut usize);
@@ -4703,25 +4823,35 @@ impl<'a> Assembler386<'a> {
                             panic!("CallMallocNurseryVarsize length is not a value: {other:?}")
                         }
                     }
-                    dynasm!(self.mc ; .arch x64
-                        ; mov Rq(scratch), QWORD max_length as i64
-                        ; cmp rdx, Rq(scratch)
-                        ; ja =>slow_path
-                        ; mov Rq(scratch), QWORD nf_addr as i64
-                        ; mov rcx, [Rq(scratch)]
-                        ; imul rdx, rdx, itemsize as i32
-                        ; add rdx, (base_size + header_size + 7) as i32
-                        ; and rdx, -8
-                        ; add rdx, rcx
-                        ; mov Rq(scratch), QWORD nt_addr as i64
-                        ; cmp rdx, [Rq(scratch)]
-                        ; ja =>slow_path
-                        ; mov Rq(scratch), QWORD nf_addr as i64
-                        ; mov [Rq(scratch)], rdx
-                        ; mov Rq(scratch), QWORD type_id
-                        ; mov [rcx], Rq(scratch)
-                        ; add rcx, header_size as i32
-                        ; jmp =>done
+                    dynasm!(self.mc
+                            ; .arch x64
+                            ; mov Rq(scratch), QWORD max_length as i64
+                            ; cmp rdx, Rq(scratch)
+                            ; ja =>slow_path
+                            ; mov Rq(scratch), QWORD nf_addr as i64
+                    );
+                    rx86::mov_rm(&mut self.mc, 1, scratch, 0);
+                    dynasm!(self.mc
+                            ; .arch x64
+                            ; imul rdx, rdx, itemsize as i32
+                            ; add rdx, (base_size + header_size + 7) as i32
+                            ; and rdx, -8
+                            ; add rdx, rcx
+                            ; mov Rq(scratch), QWORD nt_addr as i64
+                    );
+                    rx86::cmp_rm(&mut self.mc, 2, scratch, 0);
+                    dynasm!(self.mc
+                            ; .arch x64
+                            ; ja =>slow_path
+                            ; mov Rq(scratch), QWORD nf_addr as i64
+                    );
+                    rx86::mov_mr(&mut self.mc, scratch, 0, 2);
+                    dynasm!(self.mc
+                            ; .arch x64
+                            ; mov Rq(scratch), QWORD type_id
+                            ; mov [rcx], Rq(scratch)
+                            ; add rcx, header_size as i32
+                            ; jmp =>done
                     );
                 }
                 dynasm!(self.mc ; .arch x64 ; =>slow_path);
@@ -5150,19 +5280,19 @@ impl<'a> Assembler386<'a> {
             let ofs = vtable_offset as i32;
             match class_loc {
                 Loc::Reg(c) => {
-                    dynasm!(self.mc ; .arch x64
-                        ; cmp QWORD [Rq(obj.value) + ofs], Rq(c.value));
+                    rx86::cmp_mr(&mut self.mc, obj.value, ofs, c.value);
                 }
                 Loc::Immed(i) | Loc::ImmedFloat(i) => {
                     let fits_imm32 = (i.value as i32) as i64 == i.value;
                     if fits_imm32 {
-                        dynasm!(self.mc ; .arch x64
-                            ; cmp QWORD [Rq(obj.value) + ofs], i.value as i32);
+                        rx86::cmp_mi(&mut self.mc, obj.value, ofs, (i.value as i32));
                     } else {
                         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                        dynasm!(self.mc ; .arch x64
-                            ; mov Rq(scratch), QWORD i.value
-                            ; cmp QWORD [Rq(obj.value) + ofs], Rq(scratch));
+                        dynasm!(self.mc
+                                ; .arch x64
+                                ; mov Rq(scratch), QWORD i.value
+                        );
+                        rx86::cmp_mr(&mut self.mc, obj.value, ofs, scratch);
                     }
                 }
                 other => panic!(
@@ -5197,7 +5327,7 @@ impl<'a> Assembler386<'a> {
 
     fn emit_load_gc_typeid_into_reg(&mut self, obj_reg: u8, dst_reg: u8) {
         let tid_ofs = -(majit_gc::header::GcHeader::SIZE as i32);
-        dynasm!(self.mc ; .arch x64 ; mov Rd(dst_reg), [Rq(obj_reg) + tid_ofs]);
+        rx86::mov32_rm(&mut self.mc, dst_reg, obj_reg, tid_ofs);
     }
 
     /// x86/assembler.py `_cmp_guard_gc_type`, adjusted for
@@ -5245,11 +5375,12 @@ impl<'a> Assembler386<'a> {
         let base_type_info = info.base_type_info as i64;
         let infobits_offset = info.infobits_offset as i32;
         let is_object_flag = info.is_object_flag as i8;
-        dynasm!(self.mc ; .arch x64
-            ; mov Rq(scratch), QWORD base_type_info
-            ; add Rq(typeid.value), Rq(scratch)
-            ; test BYTE [Rq(typeid.value) + infobits_offset], is_object_flag
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov Rq(scratch), QWORD base_type_info
+                ; add Rq(typeid.value), Rq(scratch)
         );
+        rx86::test8_mi(&mut self.mc, typeid.value, infobits_offset, is_object_flag);
     }
 
     /// x86/assembler.py `genop_guard_guard_subclass`.
@@ -5269,10 +5400,8 @@ impl<'a> Assembler386<'a> {
         if let Some(vtable_offset) = self.vtable_offset {
             let offset = vtable_offset as i32;
             let offset2 = info.subclassrange_min_offset as i32;
-            dynasm!(self.mc ; .arch x64
-                ; mov Rq(tmp.value), [Rq(obj.value) + offset]
-                ; mov Rq(tmp.value), [Rq(tmp.value) + offset2]
-            );
+            rx86::mov_rm(&mut self.mc, tmp.value, obj.value, offset);
+            rx86::mov_rm(&mut self.mc, tmp.value, tmp.value, offset2);
         } else {
             self.emit_load_gc_typeid_into_reg(obj.value, tmp.value);
             if info.shift_by > 0 {
@@ -5282,11 +5411,12 @@ impl<'a> Assembler386<'a> {
             let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
             let base =
                 (info.base_type_info + info.sizeof_ti + info.subclassrange_min_offset) as i64;
-            dynasm!(self.mc ; .arch x64
-                ; mov Rq(scratch), QWORD base
-                ; add Rq(tmp.value), Rq(scratch)
-                ; mov Rq(tmp.value), [Rq(tmp.value)]
+            dynasm!(self.mc
+                    ; .arch x64
+                    ; mov Rq(scratch), QWORD base
+                    ; add Rq(tmp.value), Rq(scratch)
             );
+            rx86::mov_rm(&mut self.mc, tmp.value, tmp.value, 0);
         }
         self.emit_sub_imm64(tmp.value, check_min);
         self.emit_cmp_imm64(tmp.value, check_max - check_min);
@@ -5339,10 +5469,11 @@ impl<'a> Assembler386<'a> {
             return;
         };
         let exc_type_addr = crate::jit_exc_type_addr() as i64;
-        dynasm!(self.mc ; .arch x64
-            ; mov Rq(tmp.value), QWORD exc_type_addr
-            ; mov Rq(tmp.value), [Rq(tmp.value)]
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov Rq(tmp.value), QWORD exc_type_addr
         );
+        rx86::mov_rm(&mut self.mc, tmp.value, tmp.value, 0);
         self.emit_cmp_reg_loc_i64(tmp.value, expected_loc);
     }
 
@@ -5367,21 +5498,26 @@ impl<'a> Assembler386<'a> {
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         let exc_value_addr = crate::jit_exc_value_addr() as i64;
         let exc_type_addr = crate::jit_exc_type_addr() as i64;
-        dynasm!(self.mc ; .arch x64
-            ; test Rq(reg), Rq(reg)
-            ; jnz =>skip
-            // assembler.py:1836 — MOV tmp, [pos_exc_value]
-            ; mov Rq(scratch), QWORD exc_value_addr
-            ; mov rax, [Rq(scratch)]
-            // assembler.py:1842-1843 — clear both globals.
-            ; mov QWORD [Rq(scratch)], 0
-            ; mov Rq(scratch), QWORD exc_type_addr
-            ; mov QWORD [Rq(scratch)], 0
-            // assembler.py:336-337 — MOV [jf_guard_exc], tmp
-            ; mov [rbp + JF_GUARD_EXC_OFS], rax
-            // assembler.py:339-340 — MOV [jf_descr], descr
-            ; mov Rq(scratch), QWORD propagate_descr
-            ; mov [rbp + JF_DESCR_OFS], Rq(scratch)
+        dynasm!(self.mc
+                ; .arch x64
+                ; test Rq(reg), Rq(reg)
+                ; jnz =>skip
+                    // assembler.py:1836 — MOV tmp, [pos_exc_value]
+                ; mov Rq(scratch), QWORD exc_value_addr
+        );
+        rx86::mov_rm(&mut self.mc, 0, scratch, 0); //assembler.py:1842-1843 — clear both globals.
+        rx86::mov_mi(&mut self.mc, scratch, 0, 0);
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov Rq(scratch), QWORD exc_type_addr
+        );
+        rx86::mov_mi(&mut self.mc, scratch, 0, 0); //assembler.py:336-337 — MOV [jf_guard_exc], tmp
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov [rbp + JF_GUARD_EXC_OFS], rax
+                    // assembler.py:339-340 — MOV [jf_descr], descr
+                ; mov Rq(scratch), QWORD propagate_descr
+                ; mov [rbp + JF_DESCR_OFS], Rq(scratch)
         );
         self._call_footer();
         dynasm!(self.mc ; .arch x64 ; =>skip);
@@ -5397,13 +5533,14 @@ impl<'a> Assembler386<'a> {
             dynasm!(self.mc ; .arch x64 ; mov Rq(scratch), QWORD exc_value_addr);
             match loc {
                 Loc::Reg(dst) => {
-                    dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(scratch)]);
+                    rx86::mov_rm(&mut self.mc, dst.value, scratch, 0);
                 }
                 Loc::Frame(frame) => {
                     let ofs = frame.ebp_loc.value;
-                    dynasm!(self.mc ; .arch x64
-                        ; mov Rq(scratch), [Rq(scratch)]
-                        ; mov [rbp + ofs], Rq(scratch)
+                    rx86::mov_rm(&mut self.mc, scratch, scratch, 0);
+                    dynasm!(self.mc
+                            ; .arch x64
+                            ; mov [rbp + ofs], Rq(scratch)
                     );
                 }
                 other => panic!(
@@ -5412,12 +5549,16 @@ impl<'a> Assembler386<'a> {
                 ),
             }
         }
-        dynasm!(self.mc ; .arch x64
-            ; mov Rq(scratch), QWORD exc_value_addr
-            ; mov QWORD [Rq(scratch)], 0
-            ; mov Rq(scratch), QWORD exc_type_addr
-            ; mov QWORD [Rq(scratch)], 0
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov Rq(scratch), QWORD exc_value_addr
         );
+        rx86::mov_mi(&mut self.mc, scratch, 0, 0);
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov Rq(scratch), QWORD exc_type_addr
+        );
+        rx86::mov_mi(&mut self.mc, scratch, 0, 0);
     }
 
     /// Emit SETcc into a register (zero-extend to 64-bit).
@@ -5918,13 +6059,20 @@ impl<'a> Assembler386<'a> {
             let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
             let exc_value_addr = crate::jit_exc_value_addr() as i64;
             let exc_type_addr = crate::jit_exc_type_addr() as i64;
-            dynasm!(self.mc ; .arch x64
-                ; mov Rq(scratch), QWORD exc_value_addr
-                ; mov rax, [Rq(scratch)]            // rax = *pos_exc_value
-                ; mov QWORD [Rq(scratch)], 0        // *pos_exc_value = 0
-                ; mov Rq(scratch), QWORD exc_type_addr
-                ; mov QWORD [Rq(scratch)], 0        // *pos_exception = 0
-                ; mov [rbp + JF_GUARD_EXC_OFS], rax // jf_guard_exc = excval
+            dynasm!(self.mc
+                    ; .arch x64
+                    ; mov Rq(scratch), QWORD exc_value_addr
+            );
+            rx86::mov_rm(&mut self.mc, 0, scratch, 0); //rax = *pos_exc_value
+            rx86::mov_mi(&mut self.mc, scratch, 0, 0); //*pos_exc_value = 0
+            dynasm!(self.mc
+                    ; .arch x64
+                    ; mov Rq(scratch), QWORD exc_type_addr
+            );
+            rx86::mov_mi(&mut self.mc, scratch, 0, 0); //*pos_exception = 0
+            dynasm!(self.mc
+                    ; .arch x64
+                    ; mov [rbp + JF_GUARD_EXC_OFS], rax // jf_guard_exc = excval
             );
         }
 
@@ -6551,10 +6699,11 @@ impl<'a> Assembler386<'a> {
     fn emit_guard_no_exception_check(&mut self) {
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         let exc_type_addr = crate::jit_exc_type_addr() as i64;
-        dynasm!(self.mc ; .arch x64
-            ; mov Rq(scratch), QWORD exc_type_addr
-            ; cmp QWORD [Rq(scratch)], 0
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov Rq(scratch), QWORD exc_type_addr
         );
+        rx86::cmp_mi(&mut self.mc, scratch, 0, 0);
         self.guard_success_cc = Some(CC_E);
     }
 
@@ -6886,7 +7035,7 @@ impl<'a> Assembler386<'a> {
         if let Loc::Reg(v) = val_loc
             && v.is_xmm
         {
-            dynasm!(self.mc ; .arch x64 ; movsd [Rq(base.value) + ofs], Rx(v.value));
+            rx86::movsd_mx(&mut self.mc, base.value, ofs, v.value);
             return;
         }
         let val_reg = match val_loc {
@@ -6898,10 +7047,10 @@ impl<'a> Assembler386<'a> {
             }
         };
         match field_size {
-            1 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rb(val_reg)),
-            2 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rw(val_reg)),
-            4 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rd(val_reg)),
-            _ => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rq(val_reg)),
+            1 => rx86::mov8_mr(&mut self.mc, base.value, ofs, val_reg),
+            2 => rx86::mov16_mr(&mut self.mc, base.value, ofs, val_reg),
+            4 => rx86::mov32_mr(&mut self.mc, base.value, ofs, val_reg),
+            _ => rx86::mov_mr(&mut self.mc, base.value, ofs, val_reg),
         }
     }
 
@@ -6944,63 +7093,63 @@ impl<'a> Assembler386<'a> {
         if dst.is_xmm {
             if size == 4 {
                 if let Some(r) = ofs_reg {
-                    dynasm!(self.mc ; .arch x64 ; movss Rx(dst.value), [Rq(base.value) + Rq(r.value)]);
+                    rx86::movss_xa(&mut self.mc, dst.value, base.value, r.value, 1, 0);
                 } else {
-                    dynasm!(self.mc ; .arch x64 ; movss Rx(dst.value), [Rq(base.value) + ofs]);
+                    rx86::movss_xm(&mut self.mc, dst.value, base.value, ofs);
                 }
                 dynasm!(self.mc ; .arch x64 ; cvtss2sd Rx(dst.value), Rx(dst.value));
             } else if let Some(r) = ofs_reg {
-                dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + Rq(r.value)]);
+                rx86::movsd_xa(&mut self.mc, dst.value, base.value, r.value, 1, 0);
             } else {
-                dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + ofs]);
+                rx86::movsd_xm(&mut self.mc, dst.value, base.value, ofs);
             }
             return;
         }
         if let Some(r) = ofs_reg {
             match (size, signed) {
                 (1, false) => {
-                    dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), BYTE [Rq(base.value) + Rq(r.value)])
+                    rx86::movzx8_ra(&mut self.mc, dst.value, base.value, r.value, 1, 0);
                 }
                 (1, true) => {
-                    dynasm!(self.mc ; .arch x64 ; movsx Rq(dst.value), BYTE [Rq(base.value) + Rq(r.value)])
+                    rx86::movsx8_ra(&mut self.mc, dst.value, base.value, r.value, 1, 0);
                 }
                 (2, false) => {
-                    dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), WORD [Rq(base.value) + Rq(r.value)])
+                    rx86::movzx16_ra(&mut self.mc, dst.value, base.value, r.value, 1, 0);
                 }
                 (2, true) => {
-                    dynasm!(self.mc ; .arch x64 ; movsx Rq(dst.value), WORD [Rq(base.value) + Rq(r.value)])
+                    rx86::movsx16_ra(&mut self.mc, dst.value, base.value, r.value, 1, 0);
                 }
                 (4, false) => {
-                    dynasm!(self.mc ; .arch x64 ; mov Rd(dst.value), [Rq(base.value) + Rq(r.value)])
+                    rx86::mov32_ra(&mut self.mc, dst.value, base.value, r.value, 1, 0);
                 }
                 (4, true) => {
-                    dynasm!(self.mc ; .arch x64 ; movsxd Rq(dst.value), DWORD [Rq(base.value) + Rq(r.value)])
+                    rx86::movsx32_ra(&mut self.mc, dst.value, base.value, r.value, 1, 0);
                 }
                 _ => {
-                    dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(base.value) + Rq(r.value)])
+                    rx86::mov_ra(&mut self.mc, dst.value, base.value, r.value, 1, 0);
                 }
             }
         } else {
             match (size, signed) {
                 (1, false) => {
-                    dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), BYTE [Rq(base.value) + ofs])
+                    rx86::movzx8_rm(&mut self.mc, dst.value, base.value, ofs);
                 }
                 (1, true) => {
-                    dynasm!(self.mc ; .arch x64 ; movsx Rq(dst.value), BYTE [Rq(base.value) + ofs])
+                    rx86::movsx8_rm(&mut self.mc, dst.value, base.value, ofs);
                 }
                 (2, false) => {
-                    dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), WORD [Rq(base.value) + ofs])
+                    rx86::movzx16_rm(&mut self.mc, dst.value, base.value, ofs);
                 }
                 (2, true) => {
-                    dynasm!(self.mc ; .arch x64 ; movsx Rq(dst.value), WORD [Rq(base.value) + ofs])
+                    rx86::movsx16_rm(&mut self.mc, dst.value, base.value, ofs);
                 }
                 (4, false) => {
-                    dynasm!(self.mc ; .arch x64 ; mov Rd(dst.value), [Rq(base.value) + ofs])
+                    rx86::mov32_rm(&mut self.mc, dst.value, base.value, ofs);
                 }
                 (4, true) => {
-                    dynasm!(self.mc ; .arch x64 ; movsxd Rq(dst.value), DWORD [Rq(base.value) + ofs])
+                    rx86::movsx32_rm(&mut self.mc, dst.value, base.value, ofs);
                 }
-                _ => dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(base.value) + ofs]),
+                _ => rx86::mov_rm(&mut self.mc, dst.value, base.value, ofs),
             }
         }
     }
@@ -7075,14 +7224,12 @@ impl<'a> Assembler386<'a> {
         match ofs_loc {
             Loc::Immed(i) | Loc::ImmedFloat(i) => {
                 let o = i.value as i32;
-                dynasm!(self.mc ; .arch x64
-                    ; mov DWORD [Rq(base.value) + o], lo
-                    ; mov DWORD [Rq(base.value) + o + 4], hi);
+                rx86::mov32_mi(&mut self.mc, base.value, o, lo);
+                rx86::mov32_mi(&mut self.mc, base.value, (o + 4), hi);
             }
             Loc::Reg(ofs_r) => {
-                dynasm!(self.mc ; .arch x64
-                    ; mov DWORD [Rq(base.value) + Rq(ofs_r.value)], lo
-                    ; mov DWORD [Rq(base.value) + Rq(ofs_r.value) + 4], hi);
+                rx86::mov32_ai(&mut self.mc, base.value, ofs_r.value, 1, 0, lo);
+                rx86::mov32_ai(&mut self.mc, base.value, ofs_r.value, 1, 4, hi);
             }
             other => panic!("GcStore imm: ofs_loc must be Loc::Reg or Loc::Immed, got {other:?}",),
         }
@@ -7099,26 +7246,18 @@ impl<'a> Assembler386<'a> {
     ) {
         if let Some(r) = ofs_reg {
             match size {
-                1 => dynasm!(self.mc ; .arch x64
-                    ; mov BYTE [Rq(base.value) + Rq(r.value)], val as i8),
-                2 => dynasm!(self.mc ; .arch x64
-                    ; mov WORD [Rq(base.value) + Rq(r.value)], val as i16),
-                4 => dynasm!(self.mc ; .arch x64
-                    ; mov DWORD [Rq(base.value) + Rq(r.value)], val as i32),
-                8 => dynasm!(self.mc ; .arch x64
-                    ; mov QWORD [Rq(base.value) + Rq(r.value)], val as i32),
+                1 => rx86::mov8_ai(&mut self.mc, base.value, r.value, 1, 0, (val as i8)),
+                2 => rx86::mov16_ai(&mut self.mc, base.value, r.value, 1, 0, (val as i16)),
+                4 => rx86::mov32_ai(&mut self.mc, base.value, r.value, 1, 0, (val as i32)),
+                8 => rx86::mov_ai(&mut self.mc, base.value, r.value, 1, 0, (val as i32)),
                 other => panic!("GcStore imm: unsupported store size {other}"),
             }
         } else {
             match size {
-                1 => dynasm!(self.mc ; .arch x64
-                    ; mov BYTE [Rq(base.value) + ofs], val as i8),
-                2 => dynasm!(self.mc ; .arch x64
-                    ; mov WORD [Rq(base.value) + ofs], val as i16),
-                4 => dynasm!(self.mc ; .arch x64
-                    ; mov DWORD [Rq(base.value) + ofs], val as i32),
-                8 => dynasm!(self.mc ; .arch x64
-                    ; mov QWORD [Rq(base.value) + ofs], val as i32),
+                1 => rx86::mov8_mi(&mut self.mc, base.value, ofs, (val as i8)),
+                2 => rx86::mov16_mi(&mut self.mc, base.value, ofs, (val as i16)),
+                4 => rx86::mov32_mi(&mut self.mc, base.value, ofs, (val as i32)),
+                8 => rx86::mov_mi(&mut self.mc, base.value, ofs, (val as i32)),
                 other => panic!("GcStore imm: unsupported store size {other}"),
             }
         }
@@ -7138,39 +7277,39 @@ impl<'a> Assembler386<'a> {
                 let scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
                 dynasm!(self.mc ; .arch x64 ; cvtsd2ss Rx(scratch), Rx(val.value));
                 if let Some(r) = ofs_reg {
-                    dynasm!(self.mc ; .arch x64 ; movss [Rq(base.value) + Rq(r.value)], Rx(scratch));
+                    rx86::movss_ax(&mut self.mc, base.value, r.value, 1, 0, scratch);
                 } else {
-                    dynasm!(self.mc ; .arch x64 ; movss [Rq(base.value) + ofs], Rx(scratch));
+                    rx86::movss_mx(&mut self.mc, base.value, ofs, scratch);
                 }
             } else if let Some(r) = ofs_reg {
-                dynasm!(self.mc ; .arch x64 ; movsd [Rq(base.value) + Rq(r.value)], Rx(val.value));
+                rx86::movsd_ax(&mut self.mc, base.value, r.value, 1, 0, val.value);
             } else {
-                dynasm!(self.mc ; .arch x64 ; movsd [Rq(base.value) + ofs], Rx(val.value));
+                rx86::movsd_mx(&mut self.mc, base.value, ofs, val.value);
             }
             return;
         }
         if let Some(r) = ofs_reg {
             match size {
                 1 => {
-                    dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + Rq(r.value)], Rb(val.value))
+                    rx86::mov8_ar(&mut self.mc, base.value, r.value, 1, 0, val.value);
                 }
                 2 => {
-                    dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + Rq(r.value)], Rw(val.value))
+                    rx86::mov16_ar(&mut self.mc, base.value, r.value, 1, 0, val.value);
                 }
                 4 => {
-                    dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + Rq(r.value)], Rd(val.value))
+                    rx86::mov32_ar(&mut self.mc, base.value, r.value, 1, 0, val.value);
                 }
                 8 => {
-                    dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + Rq(r.value)], Rq(val.value))
+                    rx86::mov_ar(&mut self.mc, base.value, r.value, 1, 0, val.value);
                 }
                 other => panic!("GcStore: unsupported store size {other}"),
             }
         } else {
             match size {
-                1 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rb(val.value)),
-                2 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rw(val.value)),
-                4 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rd(val.value)),
-                8 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rq(val.value)),
+                1 => rx86::mov8_mr(&mut self.mc, base.value, ofs, val.value),
+                2 => rx86::mov16_mr(&mut self.mc, base.value, ofs, val.value),
+                4 => rx86::mov32_mr(&mut self.mc, base.value, ofs, val.value),
+                8 => rx86::mov_mr(&mut self.mc, base.value, ofs, val.value),
                 other => panic!("GcStore: unsupported store size {other}"),
             }
         }
@@ -7620,14 +7759,21 @@ impl<'a> Assembler386<'a> {
         let recycle_addr = crate::runner::dynasm_nursery_recycle_list_addr();
         if recycle_addr != 0 {
             let rl = recycle_addr as i64;
-            dynasm!(self.mc ; .arch x64
-                ; mov Rq(scratch), QWORD rl
-                ; mov Rq(base_reg), [Rq(scratch)]                   // cell = *recycle_head
-                ; test Rq(base_reg), Rq(base_reg)
-                ; jz =>bump                                         // empty -> bump instead
-                ; mov Rq(new_free_reg), [Rq(base_reg) + 8]          // cell's link word
-                ; mov [Rq(scratch)], Rq(new_free_reg)               // *recycle_head = link
-                ; jmp =>init
+            dynasm!(self.mc
+                    ; .arch x64
+                    ; mov Rq(scratch), QWORD rl
+            );
+            rx86::mov_rm(&mut self.mc, base_reg, scratch, 0); //cell = *recycle_head
+            dynasm!(self.mc
+                    ; .arch x64
+                    ; test Rq(base_reg), Rq(base_reg)
+                    ; jz =>bump                                         // empty -> bump instead
+            );
+            rx86::mov_rm(&mut self.mc, new_free_reg, base_reg, 8); //cell's link word
+            rx86::mov_mr(&mut self.mc, scratch, 0, new_free_reg); //*recycle_head = link
+            dynasm!(self.mc
+                    ; .arch x64
+                    ; jmp =>init
             );
         }
 
@@ -7635,20 +7781,38 @@ impl<'a> Assembler386<'a> {
         // before_call(). Use only those freed registers plus R11, and load
         // value/next before staging nursery slot addresses so their original
         // argloc source registers stay intact for the slow residual call.
-        dynasm!(self.mc ; .arch x64
-            ; =>bump
-            ; mov Rq(scratch), QWORD nf
-            ; mov Rq(base_reg), [Rq(scratch)]                       // base = *nursery_free
-            ; lea Rq(new_free_reg), [Rq(base_reg) + NURSERY_ALLOC_NODE_SIZE]
-            ; mov Rq(scratch), QWORD nt
-            ; cmp Rq(new_free_reg), [Rq(scratch)]
-            ; ja =>slow_path
-            ; mov Rq(scratch), QWORD nf
-            ; mov [Rq(scratch)], Rq(new_free_reg)                   // *nursery_free = base + 16
-            ; =>init
-            ; mov [Rq(base_reg)], Rq(value_reg)                     // value @ base+0
-            ; mov [Rq(base_reg) + 8], Rq(next_reg)                  // next @ base+8
-            ; mov rax, Rq(base_reg)                                 // result = base
+        dynasm!(self.mc
+                ; .arch x64
+                ; =>bump
+                ; mov Rq(scratch), QWORD nf
+        );
+        rx86::mov_rm(&mut self.mc, base_reg, scratch, 0); //base = *nursery_free
+        rx86::lea_rm(
+            &mut self.mc,
+            new_free_reg,
+            base_reg,
+            NURSERY_ALLOC_NODE_SIZE,
+        );
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov Rq(scratch), QWORD nt
+        );
+        rx86::cmp_rm(&mut self.mc, new_free_reg, scratch, 0);
+        dynasm!(self.mc
+                ; .arch x64
+                ; ja =>slow_path
+                ; mov Rq(scratch), QWORD nf
+        );
+        rx86::mov_mr(&mut self.mc, scratch, 0, new_free_reg); //*nursery_free = base + 16
+        dynasm!(self.mc
+                ; .arch x64
+                ; =>init
+        );
+        rx86::mov_mr(&mut self.mc, base_reg, 0, value_reg); //value @ base+0
+        rx86::mov_mr(&mut self.mc, base_reg, 8, next_reg); //next @ base+8
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov rax, Rq(base_reg)                                 // result = base
         );
         if !op.pos().get().is_none() {
             self.store_rax_to_result(op.pos().get());
@@ -7722,17 +7886,24 @@ impl<'a> Assembler386<'a> {
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
 
-        dynasm!(self.mc ; .arch x64
-            ; mov Rq(scratch), QWORD window
-            ; mov Rq(offset_reg), Rq(cell_reg)
-            ; sub Rq(offset_reg), [Rq(scratch)]                     // cell - base
-            ; cmp Rq(offset_reg), [Rq(scratch) + 8]                 // vs width
-            ; jae =>slow_path                                       // outside the window
-            ; mov Rq(scratch), QWORD head
-            ; mov Rq(offset_reg), [Rq(scratch)]                     // old head
-            ; mov [Rq(cell_reg) + 8], Rq(offset_reg)                // cell's link word
-            ; mov [Rq(scratch)], Rq(cell_reg)                       // *recycle_head = cell
-            ; jmp =>done
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov Rq(scratch), QWORD window
+                ; mov Rq(offset_reg), Rq(cell_reg)
+        );
+        rx86::sub_rm(&mut self.mc, offset_reg, scratch, 0); //cell - base
+        rx86::cmp_rm(&mut self.mc, offset_reg, scratch, 8); //vs width
+        dynasm!(self.mc
+                ; .arch x64
+                ; jae =>slow_path                                       // outside the window
+                ; mov Rq(scratch), QWORD head
+        );
+        rx86::mov_rm(&mut self.mc, offset_reg, scratch, 0); //old head
+        rx86::mov_mr(&mut self.mc, cell_reg, 8, offset_reg); //cell's link word
+        rx86::mov_mr(&mut self.mc, scratch, 0, cell_reg); //*recycle_head = cell
+        dynasm!(self.mc
+                ; .arch x64
+                ; jmp =>done
         );
 
         dynasm!(self.mc ; .arch x64 ; =>slow_path);
@@ -8023,18 +8194,14 @@ impl<'a> Assembler386<'a> {
         mask &= 0xFF;
         let byteofs = wb.jit_wb_if_flag_byteofs;
         // x86/assembler.py:2487: TEST byte [base+byteofs], mask
-        dynasm!(self.mc ; .arch x64
-            ; test BYTE [Rq(loc_base.value as u8) + byteofs], mask as i8
-        );
+        rx86::test8_mi(&mut self.mc, loc_base.value as u8, byteofs, (mask as i8));
         let done = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch x64 ; jz =>done);
 
         if card_marking {
             // x86/assembler.py:2398-2408: test GCFLAG_CARDS_SET separately
             let cards_mask = (wb.jit_wb_cards_set_singlebyte as u8) as i8;
-            dynasm!(self.mc ; .arch x64
-                ; test BYTE [Rq(loc_base.value as u8) + byteofs], cards_mask
-            );
+            rx86::test8_mi(&mut self.mc, loc_base.value as u8, byteofs, cards_mask);
             let card_mark = self.mc.new_dynamic_label();
             dynasm!(self.mc ; .arch x64 ; jnz =>card_mark);
 
@@ -8045,9 +8212,10 @@ impl<'a> Assembler386<'a> {
             );
 
             // Re-check CARDS_SET after helper
-            dynasm!(self.mc ; .arch x64
-                ; test BYTE [Rq(loc_base.value as u8) + byteofs], cards_mask
-                ; jz =>done
+            rx86::test8_mi(&mut self.mc, loc_base.value as u8, byteofs, cards_mask);
+            dynasm!(self.mc
+                    ; .arch x64
+                    ; jz =>done
             );
 
             // Inline card bit set (x86/assembler.py WriteBarrierSlowPath parity)
@@ -8105,8 +8273,11 @@ impl<'a> Assembler386<'a> {
                     let byte_ofs =
                         !((byte_index >> 3) as i64) - majit_gc::header::GcHeader::SIZE as i64;
                     let byte_val = 1_i64 << (byte_index & 7);
-                    dynasm!(self.mc ; .arch x64
-                        ; or BYTE [Rq(loc_base.value as u8) + byte_ofs as i32], byte_val as i8
+                    rx86::or8_mi(
+                        &mut self.mc,
+                        loc_base.value as u8,
+                        (byte_ofs as i32),
+                        (byte_val as i8),
                     );
                 }
                 // x86/assembler.py:2387-2388
@@ -8226,13 +8397,17 @@ impl<'a> Assembler386<'a> {
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
 
         // ecx = nursery_free, edx = new nursery_free
-        dynasm!(self.mc ; .arch x64
-            ; mov Rq(scratch), QWORD nf
-            ; mov rcx, [Rq(scratch)]
-            ; lea rdx, [rcx + total_size as i32]
-            ; mov Rq(scratch), QWORD nt
-            ; cmp rdx, [Rq(scratch)]
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov Rq(scratch), QWORD nf
         );
+        rx86::mov_rm(&mut self.mc, 1, scratch, 0);
+        dynasm!(self.mc
+                ; .arch x64
+                ; lea rdx, [rcx + total_size as i32]
+                ; mov Rq(scratch), QWORD nt
+        );
+        rx86::cmp_rm(&mut self.mc, 2, scratch, 0);
 
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
@@ -8243,10 +8418,14 @@ impl<'a> Assembler386<'a> {
         // payload pointer directly into `result_reg` (regalloc forces it
         // to ECX, MALLOC_NURSERY_RESULT) so both paths converge with the
         // payload in the same register.
-        dynasm!(self.mc ; .arch x64
-            ; mov Rq(scratch), QWORD nf
-            ; mov [Rq(scratch)], rdx
-            ; mov QWORD [rcx], 0       // zero GcHeader
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov Rq(scratch), QWORD nf
+        );
+        rx86::mov_mr(&mut self.mc, scratch, 0, 2);
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov QWORD [rcx], 0       // zero GcHeader
         );
         let result_reg_for_payload = match result_loc {
             Some(Loc::Reg(r)) => r.value,
@@ -8354,13 +8533,17 @@ impl<'a> Assembler386<'a> {
                 ; jmp =>slow_path
             );
         } else {
-            dynasm!(self.mc ; .arch x64
-                ; mov Rq(scratch), QWORD nf
-                ; mov rcx, [Rq(scratch)]
-                ; lea rdx, [rcx + size as i32]
-                ; mov Rq(scratch), QWORD nt
-                ; cmp rdx, [Rq(scratch)]
+            dynasm!(self.mc
+                    ; .arch x64
+                    ; mov Rq(scratch), QWORD nf
             );
+            rx86::mov_rm(&mut self.mc, 1, scratch, 0);
+            dynasm!(self.mc
+                    ; .arch x64
+                    ; lea rdx, [rcx + size as i32]
+                    ; mov Rq(scratch), QWORD nt
+            );
+            rx86::cmp_rm(&mut self.mc, 2, scratch, 0);
 
             dynasm!(self.mc ; .arch x64 ; ja =>slow_path);
         }
@@ -8369,10 +8552,11 @@ impl<'a> Assembler386<'a> {
             Some(Loc::Reg(r)) => r.value,
             _ => crate::regloc::ECX.value,
         };
-        dynasm!(self.mc ; .arch x64
-            ; mov Rq(scratch), QWORD nf
-            ; mov [Rq(scratch)], rdx
+        dynasm!(self.mc
+                ; .arch x64
+                ; mov Rq(scratch), QWORD nf
         );
+        rx86::mov_mr(&mut self.mc, scratch, 0, 2);
         if result_reg != crate::regloc::ECX.value {
             dynasm!(self.mc ; .arch x64 ; mov Rq(result_reg), rcx);
         }
@@ -8549,13 +8733,14 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; .arch x64 ; mov Rq(scratch), QWORD exc_type_addr);
         match result_loc {
             Some(Loc::Reg(dst)) => {
-                dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(scratch)]);
+                rx86::mov_rm(&mut self.mc, dst.value, scratch, 0);
             }
             Some(Loc::Frame(frame)) => {
                 let ofs = frame.ebp_loc.value;
-                dynasm!(self.mc ; .arch x64
-                    ; mov Rq(scratch), [Rq(scratch)]
-                    ; mov [rbp + ofs], Rq(scratch)
+                rx86::mov_rm(&mut self.mc, scratch, scratch, 0);
+                dynasm!(self.mc
+                        ; .arch x64
+                        ; mov [rbp + ofs], Rq(scratch)
                 );
             }
             None => {}
@@ -8579,23 +8764,31 @@ impl<'a> Assembler386<'a> {
             dynasm!(this.mc ; .arch x64 ; mov Rq(scratch), QWORD cell_addr);
             match loc {
                 Loc::Reg(src) => {
-                    dynasm!(this.mc ; .arch x64 ; mov [Rq(scratch)], Rq(src.value));
+                    rx86::mov_mr(&mut this.mc, scratch, 0, src.value);
                 }
                 Loc::Frame(frame) => {
                     let ofs = frame.ebp_loc.value;
-                    dynasm!(this.mc ; .arch x64
-                        ; push rax
-                        ; mov rax, [rbp + ofs]
-                        ; mov [Rq(scratch)], rax
-                        ; pop rax
+                    dynasm!(this.mc
+                            ; .arch x64
+                            ; push rax
+                            ; mov rax, [rbp + ofs]
+                    );
+                    rx86::mov_mr(&mut this.mc, scratch, 0, 0);
+                    dynasm!(this.mc
+                            ; .arch x64
+                            ; pop rax
                     );
                 }
                 Loc::Immed(imm) | Loc::ImmedFloat(imm) => {
-                    dynasm!(this.mc ; .arch x64
-                        ; push rax
-                        ; mov rax, QWORD imm.value
-                        ; mov [Rq(scratch)], rax
-                        ; pop rax
+                    dynasm!(this.mc
+                            ; .arch x64
+                            ; push rax
+                            ; mov rax, QWORD imm.value
+                    );
+                    rx86::mov_mr(&mut this.mc, scratch, 0, 0);
+                    dynasm!(this.mc
+                            ; .arch x64
+                            ; pop rax
                     );
                 }
                 other => panic!(
@@ -8898,13 +9091,14 @@ impl<'a> Assembler386<'a> {
         match base {
             Loc::Reg(r) if !r.is_xmm => {
                 if let Ok(d) = i32::try_from(disp) {
-                    dynasm!(self.mc ; .arch x64 ; lea Rq(dst), [Rq(r.value) + d]);
+                    rx86::lea_rm(&mut self.mc, dst, r.value, d);
                 } else {
                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                    dynasm!(self.mc ; .arch x64
-                        ; mov Rq(scratch), QWORD disp
-                        ; lea Rq(dst), [Rq(r.value) + Rq(scratch)]
+                    dynasm!(self.mc
+                            ; .arch x64
+                            ; mov Rq(scratch), QWORD disp
                     );
+                    rx86::lea_ra(&mut self.mc, dst, r.value, scratch, 1, 0);
                 }
             }
             _ => {
@@ -8932,10 +9126,10 @@ impl<'a> Assembler386<'a> {
 
     fn emit_lea_sib(&mut self, dst: u8, base: u8, index: u8, scale: i64, disp: i32) {
         match scale {
-            1 => dynasm!(self.mc ; .arch x64 ; lea Rq(dst), [Rq(base) + Rq(index) + disp]),
-            2 => dynasm!(self.mc ; .arch x64 ; lea Rq(dst), [Rq(base) + Rq(index) * 2 + disp]),
-            4 => dynasm!(self.mc ; .arch x64 ; lea Rq(dst), [Rq(base) + Rq(index) * 4 + disp]),
-            8 => dynasm!(self.mc ; .arch x64 ; lea Rq(dst), [Rq(base) + Rq(index) * 8 + disp]),
+            1 => rx86::lea_ra(&mut self.mc, dst, base, index, 1, disp),
+            2 => rx86::lea_ra(&mut self.mc, dst, base, index, 2, disp),
+            4 => rx86::lea_ra(&mut self.mc, dst, base, index, 4, disp),
+            8 => rx86::lea_ra(&mut self.mc, dst, base, index, 8, disp),
             other => panic!("emit_lea_sib scale must be 1/2/4/8, got {other}"),
         }
     }
@@ -9090,16 +9284,44 @@ impl<'a> Assembler386<'a> {
         match start_loc {
             Loc::Reg(start) => match scale_start {
                 1 => {
-                    dynasm!(self.mc ; .arch x64 ; lea Rq(scratch), [Rq(scratch) + Rq(start.value) + base_size as i32])
+                    rx86::lea_ra(
+                        &mut self.mc,
+                        scratch,
+                        scratch,
+                        start.value,
+                        1,
+                        (base_size as i32),
+                    );
                 }
                 2 => {
-                    dynasm!(self.mc ; .arch x64 ; lea Rq(scratch), [Rq(scratch) + Rq(start.value) * 2 + base_size as i32])
+                    rx86::lea_ra(
+                        &mut self.mc,
+                        scratch,
+                        scratch,
+                        start.value,
+                        2,
+                        (base_size as i32),
+                    );
                 }
                 4 => {
-                    dynasm!(self.mc ; .arch x64 ; lea Rq(scratch), [Rq(scratch) + Rq(start.value) * 4 + base_size as i32])
+                    rx86::lea_ra(
+                        &mut self.mc,
+                        scratch,
+                        scratch,
+                        start.value,
+                        4,
+                        (base_size as i32),
+                    );
                 }
                 8 => {
-                    dynasm!(self.mc ; .arch x64 ; lea Rq(scratch), [Rq(scratch) + Rq(start.value) * 8 + base_size as i32])
+                    rx86::lea_ra(
+                        &mut self.mc,
+                        scratch,
+                        scratch,
+                        start.value,
+                        8,
+                        (base_size as i32),
+                    );
                 }
                 _ => panic!("ZERO_ARRAY invalid start scale {scale_start}"),
             },
@@ -9131,19 +9353,19 @@ impl<'a> Assembler386<'a> {
                             dynasm!(self.mc ; .arch x64 ; xorps Rx(xmm), Rx(xmm));
                             cleared = true;
                         }
-                        dynasm!(self.mc ; .arch x64 ; movups [Rq(scratch) + offset as i32], Rx(xmm));
+                        rx86::movups_mx(&mut self.mc, scratch, (offset as i32), xmm);
                         16
                     } else if remaining >= 8 {
-                        dynasm!(self.mc ; .arch x64 ; mov QWORD [Rq(scratch) + offset as i32], 0);
+                        rx86::mov_mi(&mut self.mc, scratch, (offset as i32), 0);
                         8
                     } else if remaining >= 4 {
-                        dynasm!(self.mc ; .arch x64 ; mov DWORD [Rq(scratch) + offset as i32], 0);
+                        rx86::mov32_mi(&mut self.mc, scratch, (offset as i32), 0);
                         4
                     } else if remaining >= 2 {
-                        dynasm!(self.mc ; .arch x64 ; mov WORD [Rq(scratch) + offset as i32], 0);
+                        rx86::mov16_mi(&mut self.mc, scratch, (offset as i32), 0);
                         2
                     } else {
-                        dynasm!(self.mc ; .arch x64 ; mov BYTE [Rq(scratch) + offset as i32], 0);
+                        rx86::mov8_mi(&mut self.mc, scratch, (offset as i32), 0);
                         1
                     };
                     offset += current;
