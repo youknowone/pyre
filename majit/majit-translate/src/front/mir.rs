@@ -7698,6 +7698,12 @@ impl<'a> Lowering<'a> {
         let (value_local, index_spelling) = index_identity_inputs(&inner, self.llbc);
         let (projection_array_type_id, projection_array_nolength) =
             fixed_array_index_identity(value_local, &index_spelling);
+        // `*p = v` on a `*mut T` is `raw_store` (`rewrite_op_raw_store`).
+        // A `&mut T` is a field or array place, not an integer address.
+        let deref_base_is_raw_ptr = tyref_node(&inner.ty, self.llbc)
+            .and_then(|node| strip_ty_wrappers(node, self.llbc))
+            .and_then(|node| node.as_object())
+            .is_some_and(|obj| obj.contains_key("RawPtr"));
         let base = self.resolve_place(mir_bb, inner)?;
         let bb_id = self.block_id[mir_bb];
         let op = match &elem {
@@ -7819,27 +7825,67 @@ impl<'a> Lowering<'a> {
                             STRING_GCREF_GCARRAY_TYPE_ID,
                         )),
                     }
+                } else if let Some(local) = inner_local
+                    && let Some(referent) = self.atomic_ref_place.get(&local).map(clone_place)
+                {
+                    // `*p = v` where `p` was bound as `&mut place` is that
+                    // place's store: `setfield` / `setarrayitem`
+                    // (`rewrite_op_setfield`), the same place
+                    // `concrete_borrow_place` recovers for `mem::replace`.
+                    let place = self.concrete_borrow_place(referent);
+                    match place.kind {
+                        PlaceKind::Projection(field_inner, elem) => {
+                            let same_deref = matches!(
+                                (&field_inner.kind, &elem),
+                                (PlaceKind::Local(i), ProjectionElem::Atom(name))
+                                    if *i as usize == local && name == "Deref"
+                            );
+                            if !same_deref {
+                                let ty = clone_tyref(&place.ty);
+                                return self.emit_projection_write(
+                                    mir_bb,
+                                    *field_inner,
+                                    elem,
+                                    value,
+                                    &ty,
+                                );
+                            }
+                        }
+                        PlaceKind::Local(i) => {
+                            self.local_var[i as usize] = Some(value_var(&value));
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                    match self.deref_word_store_or_decline(
+                        mir_bb,
+                        bb_id,
+                        inner_local,
+                        base,
+                        value_var(&value),
+                        dest_ty,
+                        deref_base_is_raw_ptr,
+                    )? {
+                        Some(op) => op,
+                        None => return Ok(()),
+                    }
                 } else {
-                    // `*p = val` — no IR-level FieldWrite/ArrayWrite
-                    // fits.  Emit a synthetic 2-arg Call so the write
-                    // remains visible to the downstream side-effect
-                    // tracking.
-                    //
-                    // The write produces no value (`result` below is `None`),
-                    // so the declared result kind must be Void: jtransform's
-                    // `resolve_call_result` reads `result_ty` when the op has
-                    // no result Variable, and a non-void kind there assembles
-                    // a `residual_call_r_<kind>` key with no `>` result tail
-                    // — a malformed opname nothing wires (`getkind(Void)`
-                    // keeps result-less calls on the `residual_call_*_v`
-                    // row).
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath {
-                            segments: vec!["__deref_write".to_string()],
-                            fun_decl_id: None,
-                        },
-                        args: crate::model::call_args(vec![base, value_var(&value)]),
-                        result_ty: ValueType::Void,
+                    // A store this front end cannot name as a field, an
+                    // array element, or a raw word must not become a
+                    // symbolic `__deref_write`: that path has no code
+                    // address. Decline the graph so the caller residualizes
+                    // the helper that contains the store.
+                    match self.deref_word_store_or_decline(
+                        mir_bb,
+                        bb_id,
+                        inner_local,
+                        base,
+                        value_var(&value),
+                        dest_ty,
+                        deref_base_is_raw_ptr,
+                    )? {
+                        Some(op) => op,
+                        None => return Ok(()),
                     }
                 }
             }
@@ -7938,6 +7984,67 @@ impl<'a> Lowering<'a> {
             kind: op,
         });
         Ok(())
+    }
+
+    /// `*p = v` when `p` is not a field or array reborrow.
+    ///
+    /// A multi-word pointee is the field-wise move `exchange_deref_aggregate`
+    /// already emits for `mem::replace` (`rffi.py` `_get_structcopy_fn`).
+    /// A one-word raw pointer is `raw_store` at offset 0
+    /// (`rewrite_op_raw_store`). Anything else declines the graph: a
+    /// symbolic `__deref_write` has no code address.
+    ///
+    /// `Ok(None)` means the field writes were already pushed.
+    fn deref_word_store_or_decline(
+        &mut self,
+        mir_bb: usize,
+        bb_id: BlockId,
+        inner_local: Option<usize>,
+        base: Variable,
+        value: Variable,
+        dest_ty: &TyRef,
+        deref_base_is_raw_ptr: bool,
+    ) -> Result<Option<OpKind>, LowerError> {
+        if let Some(local) = inner_local {
+            let place = Place {
+                kind: PlaceKind::Projection(
+                    Box::new(Place {
+                        kind: PlaceKind::Local(local as u64),
+                        ty: unit_tyref(),
+                    }),
+                    ProjectionElem::Atom("Deref".to_string()),
+                ),
+                ty: clone_tyref(dest_ty),
+            };
+            if self.move_plan(&place.ty).is_some()
+                && self.store_moved_aggregate(mir_bb, &place, &value)?
+            {
+                return Ok(None);
+            }
+        }
+        if deref_base_is_raw_ptr
+            && let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(dest_ty)
+        {
+            let offset = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(offset.clone()),
+                kind: OpKind::ConstInt(0),
+            });
+            return Ok(Some(OpKind::RawStore {
+                base,
+                offset,
+                value,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            }));
+        }
+        let _ = (bb_id, base);
+        Err(LowerError::Unsupported(format!(
+            "bb{mir_bb}: deref store is not a field, array element, or raw word"
+        )))
     }
 
     /// Preserve the declared RPython reference repr of a typed field value.
@@ -18287,7 +18394,8 @@ impl<'a> Lowering<'a> {
     }
 
     /// `&mut *borrow` where `borrow` is itself `&mut place` is that place.
-    /// A bare `Deref` otherwise stays, and lowers as `__deref_write`.
+    /// A bare `Deref` that is not a field, an array element, or a raw word
+    /// declines the graph (`emit_projection_write`).
     fn concrete_borrow_place(&self, mut place: Place) -> Place {
         for _ in 0..8 {
             let PlaceKind::Projection(inner, elem) = &place.kind else {

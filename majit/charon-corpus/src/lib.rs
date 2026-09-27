@@ -556,7 +556,6 @@ pub enum WordUnion {
 pub fn replace_word_union(slot: &mut WordUnion, new: WordUnion) -> WordUnion {
     std::mem::replace(slot, new)
 }
-
 /// A variant field wider than one word. A whole-value move cannot copy it
 /// as a field span, so `move_plan` declines.
 pub enum WidePayload {
@@ -565,5 +564,27 @@ pub enum WidePayload {
 
 #[inline(never)]
 pub fn replace_wide_payload(slot: &mut WidePayload, new: WidePayload) -> WidePayload {
+    std::mem::replace(slot, new)
+}
+
+/// An `i64` payload and a `Box` payload share one word. `*held = value`
+/// writes the integer field; it is not a copy of the reference variant.
+pub enum HeldUnion {
+    Int(i64),
+    Ref(Box<i64>),
+}
+
+#[inline(never)]
+pub fn store_held_int(cell: &mut HeldUnion, value: i64) {
+    let HeldUnion::Int(held) = cell else {
+        return;
+    };
+    *held = value;
+}
+
+/// Whole-value move of the same enum. The live variant's fields are the
+/// ones the copy reads.
+#[inline(never)]
+pub fn replace_held_union(slot: &mut HeldUnion, new: HeldUnion) -> HeldUnion {
     std::mem::replace(slot, new)
 }

@@ -1805,3 +1805,36 @@ fn mem_replace_of_a_multi_word_value_is_field_wise() {
         "a u128 variant field makes move_plan None, so replace stays: {wide_calls:?}"
     );
 }
+
+/// `*held = i64` through `&mut HeldUnion` is `setfield` of
+/// `HeldUnion::Int.__pos_0`. The SSA dump of that graph carries no
+/// `__deref_write` symbol for the assembler to resolve.
+#[test]
+fn store_through_union_int_is_setfield_not_deref_write() {
+    use majit_translate::model::OpKind;
+    let llbc = load_corpus();
+    let graph = lower_function(llbc, "store_held_int").unwrap_or_else(|e| panic!("{e}"));
+    let mut ssa_dump = String::new();
+    let mut writes = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            ssa_dump.push_str(&format!("{:?}\n", op.kind));
+            if let OpKind::FieldWrite { field, .. } = &op.kind {
+                writes.push((field.name.clone(), field.owner_root.clone()));
+            }
+        }
+    }
+    assert!(
+        !ssa_dump.contains("__deref_write"),
+        "deref-write symbol reached the SSA dump:\n{ssa_dump}"
+    );
+    assert!(
+        writes.iter().any(|(name, owner)| {
+            name == "__pos_0"
+                && owner
+                    .as_deref()
+                    .is_some_and(|owner| owner.contains("HeldUnion::Int"))
+        }),
+        "expected HeldUnion::Int.__pos_0 setfield, writes={writes:?}\n{ssa_dump}"
+    );
+}
