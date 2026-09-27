@@ -250,7 +250,7 @@ impl<K, V> DoubleEndedIterator for LiveValuesMut<'_, K, V> {
 
 /// Residual `mem::replace` of an entry value (`ll_dict_setitem` overwrite).
 #[majit_macros::dont_look_inside]
-fn replace_value<V>(slot: &mut V, value: V) -> V {
+pub(crate) fn replace_value<V>(slot: &mut V, value: V) -> V {
     std::mem::replace(slot, value)
 }
 

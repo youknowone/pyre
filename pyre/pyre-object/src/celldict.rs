@@ -612,7 +612,7 @@ pub fn module_dict_entries_insert(
     // An existing name keeps its block. Allocating before the probe would
     // mint a `STR` the overwrite then drops.
     if let Some(slot) = entries.get_mut(key) {
-        return Some(std::mem::replace(slot, w_value));
+        return Some(crate::rordereddict::replace_value(slot, w_value));
     }
     let block = crate::unicodeobject::alloc_utf8_payload(key.as_bytes(), true);
     entries.insert(StrKey(block), w_value)
