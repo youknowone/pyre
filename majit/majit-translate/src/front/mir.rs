@@ -54268,7 +54268,7 @@ mod tests {
 
     #[test]
     fn root_stack_analysis_charges_free_pin_callees_to_the_bracket_around_them() {
-        use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
+        use majit_charon_reader::ullbc::{RegularCall, Unstructured};
         // `capture_set_items` and `w_type_set_bases` call the receiver-free
         // `gc_roots::pin_root` and return with the slot still pushed: the
         // enclosing bracket's close is what rewinds it. A bracket spanning
