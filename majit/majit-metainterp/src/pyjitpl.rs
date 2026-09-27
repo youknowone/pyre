@@ -22949,6 +22949,7 @@ mod metainterp_static_data_tests {
             mainjitcode_loader: None,
             mainjitcode_loaded: std::sync::OnceLock::new(),
             portal_runner_adr: 0,
+            handle_jitexc_from_bh: None,
             virtualizable_info: None,
             greenfield_info: None,
             index_of_virtualizable: -1,

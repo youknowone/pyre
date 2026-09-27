@@ -2840,6 +2840,12 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         std::sync::Arc::from([majit_metainterp::blackhole::BhJitDriverSd {
             result_type: majit_metainterp::blackhole::BhReturnType::Ref,
             portal_runner_ptr: Some(bh_portal_runner_c),
+            handle_jitexc_from_bh: driver
+                .meta_interp()
+                .staticdata
+                .jitdrivers_sd
+                .first()
+                .and_then(|jd| jd.handle_jitexc_from_bh),
             mainjitcode_calldescr: {
                 // `get_portal_runner` returns this descr paired with
                 // `bh_portal_runner_c`, and the blackhole recursive-portal resume

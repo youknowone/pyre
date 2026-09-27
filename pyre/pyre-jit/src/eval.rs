@@ -5136,9 +5136,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // Index 0 is pyre's own `PyPyJitDriver` portal (`interp_jit.py`), the only
     // driver this process installs a Rust-side runner for; a second driver
     // registers its own under its own index.
-    majit_metainterp::blackhole::register_portal_runner_hook(0, pyre_portal_runner);
-    majit_metainterp::blackhole::register_portal_runner_hook(1, unpackiterable_portal_runner);
-    majit_metainterp::blackhole::register_portal_runner_hook(2, generatorentry_portal_runner);
+    // Hooks are `jd.handle_jitexc_from_bh`, set on each driver below.
     // pypy/module/pypyjit/interp_jit.py PyPyJitDriver(..., is_recursive=True).
     // Drives MetaInterp.is_main_jitcode() / is_portal_jitcode dispatch
     // — without this flag the recursive-portal bookkeeping stays
@@ -5158,6 +5156,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     jd.result_type = majit_ir::Type::Ref;
     jd.virtualizable_info = Some(info.clone());
     jd.portal_runner_adr = crate::call_jit::ll_portal_runner_shim as *const () as i64;
+    jd.handle_jitexc_from_bh = Some(pyre_portal_runner);
     // warmstate.py get_unique_id(greenkey) → interp_jit.py get_unique_id.
     jd.get_unique_id = Some(portal_unique_id_from_greens);
     d.meta_interp_mut().register_jitdriver_sd(jd);
@@ -5183,6 +5182,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // / `compile_tmp_callback` read it; unpackiterable is not recursive so
     // `do_recursive_call` will not jump here.
     jd1.portal_runner_adr = ll_unpackiterable_portal_runner_shim as *const () as i64;
+    jd1.handle_jitexc_from_bh = Some(unpackiterable_portal_runner);
     d.meta_interp_mut().register_jitdriver_sd(jd1);
     // generator.py `generatorentry_driver`: greens `pycode`, reds `gen`/`w_arg`,
     // no virtualizable. Registered immediately after jd1 so it is
@@ -5192,6 +5192,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     let mut jd2 = pyre_jit_trace::state::PyreJitState::generatorentry_driver_descriptor();
     jd2.result_type = majit_ir::Type::Ref;
     jd2.portal_runner_adr = ll_generatorentry_portal_runner_shim as *const () as i64;
+    jd2.handle_jitexc_from_bh = Some(generatorentry_portal_runner);
     d.meta_interp_mut().register_jitdriver_sd(jd2);
     // `warmspot.py metainterp_sd.finish_setup(codewriter)` always installs
     // the assembler's opcode ids and liveness stream before either tracing or
