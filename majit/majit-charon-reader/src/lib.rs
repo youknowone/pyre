@@ -80,6 +80,10 @@ pub struct Llbc {
     /// the set harvested across the linked artefacts. Not a path-keyed
     /// map: membership is a short ordered list.
     eval_hook_graphs: parking_lot::RwLock<Vec<String>>,
+    /// Dedup id of `register_eval_override`'s first parameter, resolved
+    /// once from every `FunDecl` this artefact carries (local and
+    /// external). `None` once the scan has finished without a match.
+    eval_fn_type_id: std::sync::OnceLock<Option<u64>>,
     /// Trait-decl id → associated-type bindings of its unique impl.
     /// `trait_impls` is immutable after parse, so the map is built once.
     /// See [`TraitAssocIndex`].
@@ -117,6 +121,14 @@ enum AssocBind {
     /// The first `TraitType` row for this assoc has no value. A later
     /// row does not replace it.
     Absent,
+}
+
+fn tyref_dedup_id(ty: &crate::ullbc::TyRef) -> Option<u64> {
+    match ty {
+        crate::ullbc::TyRef::Dedup { id } => Some(*id),
+        crate::ullbc::TyRef::Inline { value: (id, _) } => Some(*id),
+        crate::ullbc::TyRef::Other(_) => None,
+    }
 }
 
 fn build_trait_assoc_index(rows: &[serde_json::Value]) -> TraitAssocIndex {
@@ -231,6 +243,7 @@ impl Llbc {
             transparent_scalar_kinds: parking_lot::RwLock::new(Vec::new()),
             foldable_const_lits: parking_lot::RwLock::new(Vec::new()),
             eval_hook_graphs: parking_lot::RwLock::new(Vec::new()),
+            eval_fn_type_id: std::sync::OnceLock::new(),
             trait_assoc_index: std::sync::OnceLock::new(),
         })
     }
@@ -280,6 +293,27 @@ impl Llbc {
     /// them. Empty before that publish.
     pub fn eval_hook_graphs(&self) -> Vec<String> {
         self.eval_hook_graphs.read().clone()
+    }
+
+    /// Dedup id of `register_eval_override`'s parameter type.
+    ///
+    /// Scans every `FunDecl` the artefact carries, including an external
+    /// declaration whose body is `Opaque`. The id is computed once.
+    pub fn eval_fn_type_id(&self) -> Option<u64> {
+        *self.eval_fn_type_id.get_or_init(|| {
+            self.file
+                .translated
+                .fun_decls
+                .iter()
+                .flatten()
+                .find(|fd| {
+                    fd.item_meta
+                        .name_path()
+                        .ends_with("::call::register_eval_override")
+                })
+                .and_then(|fd| fd.signature.inputs.first())
+                .and_then(tyref_dedup_id)
+        })
     }
 
     /// The folded initializer stored on `def_id`, if this artefact has one.
@@ -478,7 +512,15 @@ impl Llbc {
     }
 
     /// Iterate over every present `FunDecl` (skipping opaque `null` entries).
+    ///
+    /// Includes external declarations (`is_local == false`, body `Opaque`).
+    /// The name is historical; [`Self::iter_fun_decls`] is the same walk.
     pub fn iter_local_fns(&self) -> impl Iterator<Item = &FunDecl> {
+        self.iter_fun_decls()
+    }
+
+    /// Every `FunDecl` this artefact carries, local or external.
+    pub fn iter_fun_decls(&self) -> impl Iterator<Item = &FunDecl> {
         self.file
             .translated
             .fun_decls
