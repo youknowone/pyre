@@ -35,9 +35,11 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget, Struct};
 use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
 use crate::translator::rtyper::rlist::{
-    ListLayout, ListRepr, build_ll_newlist_helper_graph, build_ll_setitem_fast_helper_graph,
+    ListIteratorRepr, ListLayout, ListRepr, build_ll_newlist_helper_graph,
+    build_ll_setitem_fast_helper_graph,
 };
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
+use crate::translator::rtyper::rtuple::TupleRepr;
 use crate::translator::rtyper::rtyper::{
     ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype,
     exception_args, helper_pygraph_from_graph, variable_with_lltype,
@@ -598,15 +600,182 @@ pub fn ll_rangenext_updown(iter: &mut RangeIter) -> Result<i64, TyperError> {
     }
 }
 
-/// RPython `class EnumerateIteratorRepr(IteratorRepr)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// RPython `class EnumerateIteratorRepr(IteratorRepr)` (`rrange.py`):
+///
+/// ```python
+/// class EnumerateIteratorRepr(IteratorRepr):
+///     def __init__(self, r_baseiter, const_startindex):
+///         self.r_baseiter = r_baseiter
+///         self.lowleveltype = r_baseiter.lowleveltype
+///         if not hasattr(r_baseiter, 'll_getnextindex'):
+///             raise TyperError("not implemented for now: enumerate(x) where x "
+///                              "is not a regular list (got %r)" % (r_baseiter,))
+///         self.ll_getnextindex = r_baseiter.ll_getnextindex
+///         self.const_startindex = const_startindex
+/// ```
+///
+/// Only [`ListIteratorRepr`] carries `ll_getnextindex`, so the `hasattr`
+/// test is a downcast to it.
+#[derive(Debug)]
 pub struct EnumerateIteratorRepr {
+    state: ReprState,
+    pub r_baseiter: Arc<dyn Repr>,
+    lowleveltype: LowLevelType,
     pub const_startindex: Option<i64>,
 }
 
-/// RPython `rtype_builtin_enumerate(hop)`.
-pub fn rtype_builtin_enumerate(_hop: &HighLevelOp) -> RTypeResult {
-    Err(rrange_deferred("rtype_builtin_enumerate"))
+impl EnumerateIteratorRepr {
+    pub fn new(
+        r_baseiter: Arc<dyn Repr>,
+        const_startindex: Option<i64>,
+    ) -> Result<Self, TyperError> {
+        let any_r: &dyn std::any::Any = r_baseiter.as_ref();
+        if any_r.downcast_ref::<ListIteratorRepr>().is_none() {
+            return Err(TyperError::message(format!(
+                "not implemented for now: enumerate(x) where x is not a regular list (got {})",
+                r_baseiter.class_name()
+            )));
+        }
+        let lowleveltype = r_baseiter.lowleveltype().clone();
+        Ok(EnumerateIteratorRepr {
+            state: ReprState::new(),
+            r_baseiter,
+            lowleveltype,
+            const_startindex,
+        })
+    }
+
+    fn base_list_iter(&self) -> &ListIteratorRepr {
+        let any_r: &dyn std::any::Any = self.r_baseiter.as_ref();
+        any_r
+            .downcast_ref::<ListIteratorRepr>()
+            .expect("checked in EnumerateIteratorRepr::new")
+    }
+}
+
+impl Repr for EnumerateIteratorRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &self.lowleveltype
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "EnumerateIteratorRepr"
+    }
+
+    fn repr_class_id(&self) -> super::pairtype::ReprClassId {
+        super::pairtype::ReprClassId::EnumerateIteratorRepr
+    }
+
+    /// RPython `IteratorRepr.rtype_iter(self, hop)` (rmodel.py) —
+    /// `iter(iter(x)) <==> iter(x)`.
+    fn rtype_iter(&self, hop: &HighLevelOp) -> RTypeResult {
+        let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        Ok(Some(vlist[0].clone()))
+    }
+
+    /// RPython `IteratorRepr.rtype_method_next(self, hop)` (rmodel.py).
+    fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
+        match method_name {
+            "next" => self.rtype_next(hop),
+            other => Err(TyperError::message(format!(
+                "missing EnumerateIteratorRepr.rtype_method_{other}"
+            ))),
+        }
+    }
+
+    /// RPython `EnumerateIteratorRepr.rtype_next(self, hop)` (`rrange.py`):
+    ///
+    /// ```python
+    /// def rtype_next(self, hop):
+    ///     v_enumerate, = hop.inputargs(self)
+    ///     v_index = hop.gendirectcall(self.ll_getnextindex, v_enumerate)
+    ///     if self.const_startindex is not None:
+    ///         v_index = hop.llops.genop(
+    ///             "int_add",
+    ///             [v_index, hop.llops.genconst(self.const_startindex)],
+    ///             resulttype=v_index.concretetype)
+    ///     hop2 = hop.copy()
+    ///     hop2.args_r = [self.r_baseiter]
+    ///     r_item_src = self.r_baseiter.external_item_repr
+    ///     r_item_dst = hop.r_result.items_r[1]
+    ///     v_item = self.r_baseiter.rtype_next(hop2)
+    ///     v_item = hop.llops.convertvar(v_item, r_item_src, r_item_dst)
+    ///     return hop.r_result.newtuple(hop.llops, hop.r_result,
+    ///                                  [v_index, v_item])
+    /// ```
+    fn rtype_next(&self, hop: &HighLevelOp) -> RTypeResult {
+        let v_enumerate = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        let r_baseiter = self.base_list_iter();
+        let mut v_index = r_baseiter.gen_ll_getnextindex(hop, v_enumerate[0].clone())?;
+        if let Some(start) = self.const_startindex {
+            v_index = hop
+                .genop(
+                    "int_add",
+                    vec![v_index, signed_const(start)],
+                    GenopResult::LLType(LowLevelType::Signed),
+                )
+                .ok_or_else(|| TyperError::message("int_add produced no result"))?;
+        }
+        let hop2 = hop.copy();
+        *hop2.args_r.borrow_mut() = vec![Some(self.r_baseiter.clone())];
+        let r_item_src = r_baseiter.external_item_repr().clone();
+        let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
+            TyperError::message("EnumerateIteratorRepr.rtype_next: r_result missing")
+        })?;
+        let any_r: &dyn std::any::Any = r_result.as_ref();
+        let r_tuple = any_r.downcast_ref::<TupleRepr>().ok_or_else(|| {
+            TyperError::message("EnumerateIteratorRepr.rtype_next: r_result is not a TupleRepr")
+        })?;
+        let r_item_dst = r_tuple.items_r[1].clone();
+        let v_item = self
+            .r_baseiter
+            .rtype_next(&hop2)?
+            .ok_or_else(|| TyperError::message("base iterator rtype_next returned Void"))?;
+        let v_item =
+            hop.llops
+                .borrow_mut()
+                .convertvar(v_item, r_item_src.as_ref(), r_item_dst.as_ref())?;
+        Ok(Some(TupleRepr::newtuple(
+            &mut hop.llops.borrow_mut(),
+            r_tuple,
+            vec![v_index, v_item],
+        )?))
+    }
+}
+
+/// RPython `rtype_builtin_enumerate(hop)` (`rrange.py`):
+///
+/// ```python
+/// def rtype_builtin_enumerate(hop):
+///     hop.exception_cannot_occur()
+///     hop2 = hop.copy()
+///     hop2.args_r = [hop.args_r[0]]
+///     hop2.args_v = [hop.args_v[0]]
+///     hop2.args_s = [hop.args_s[0]]
+///     return hop.r_result.r_baseiter.newiter(hop2)
+/// ```
+pub fn rtype_builtin_enumerate(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    hop.exception_cannot_occur()?;
+    let hop2 = hop.copy();
+    hop2.args_r.borrow_mut().truncate(1);
+    hop2.args_v.borrow_mut().truncate(1);
+    hop2.args_s.borrow_mut().truncate(1);
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_builtin_enumerate: r_result missing"))?;
+    let any_r: &dyn std::any::Any = r_result.as_ref();
+    let r_enum = any_r
+        .downcast_ref::<EnumerateIteratorRepr>()
+        .ok_or_else(|| {
+            TyperError::message("rtype_builtin_enumerate: r_result is not an EnumerateIteratorRepr")
+        })?;
+    r_enum.r_baseiter.newiter(&hop2)
 }
 
 /// RPython `class AbstractRangeRepr(Repr)` (`rrange.py`), with the
@@ -3821,5 +3990,194 @@ mod tests {
         // `it.next()` method call routes to rtype_next.
         let method_err = iter_repr.rtype_method("unknown_method", &hop);
         assert!(method_err.is_err());
+    }
+
+    fn enumerate_list_iterator(
+        rtyper: &std::rc::Rc<RPythonTyper>,
+        start: Option<i64>,
+    ) -> Arc<dyn Repr> {
+        use crate::annotator::listdef::ListDef;
+        use crate::annotator::model::{SomeInteger, SomeIterator, SomeList, SomeValue};
+        let ldef = ListDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+            false,
+        );
+        let s_iter = SomeValue::Iterator(SomeIterator::new_with_enumerate_start(
+            SomeValue::List(SomeList::new(ldef)),
+            vec!["enumerate".to_string()],
+            start.map(ConstValue::Int),
+        ));
+        crate::translator::rtyper::rmodel::rtyper_makerepr(&s_iter, rtyper)
+            .expect("rtyper_makerepr enumerate iterator")
+    }
+
+    /// The typer holds its annotator weakly: keep both alive.
+    fn live_rtyper() -> (
+        std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        std::rc::Rc<RPythonTyper>,
+    ) {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        (ann, rtyper)
+    }
+
+    /// rmodel.py `SomeIterator.rtyper_makerepr`: the `("enumerate", start)`
+    /// variant wraps the container's plain iterator and shares its
+    /// lowleveltype.
+    #[test]
+    fn makerepr_enumerate_iterator_wraps_the_list_iterator() {
+        let (_ann, rtyper) = live_rtyper();
+        let repr = enumerate_list_iterator(&rtyper, None);
+        assert_eq!(repr.class_name(), "EnumerateIteratorRepr");
+        assert_eq!(repr.repr_class_id(), ReprClassId::EnumerateIteratorRepr);
+        let any_r: &dyn std::any::Any = repr.as_ref();
+        let r_enum = any_r
+            .downcast_ref::<EnumerateIteratorRepr>()
+            .expect("EnumerateIteratorRepr");
+        assert_eq!(r_enum.r_baseiter.class_name(), "ListIteratorRepr");
+        assert_eq!(repr.lowleveltype(), r_enum.r_baseiter.lowleveltype());
+        assert_eq!(r_enum.const_startindex, None);
+    }
+
+    /// rrange.py `EnumerateIteratorRepr.rtype_next`: the index is read
+    /// (`ll_getnextindex`) before the base iterator steps (`ll_listnext`),
+    /// a constant start is added to it, and the pair is packed with
+    /// `newtuple`.
+    #[test]
+    fn enumerate_rtype_next_reads_the_index_before_listnext() {
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rtuple::TupleRepr;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+
+        let (_ann, rtyper) = live_rtyper();
+        let repr = enumerate_list_iterator(&rtyper, Some(1));
+        let r_tuple: Arc<dyn Repr> = Arc::new(
+            TupleRepr::new(
+                &rtyper,
+                vec![
+                    signed_repr() as Arc<dyn Repr>,
+                    signed_repr() as Arc<dyn Repr>,
+                ],
+            )
+            .unwrap(),
+        );
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_iter = Variable::new();
+        v_iter.set_concretetype(Some(repr.lowleveltype().clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(r_tuple.lowleveltype().clone()));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "next".to_string(),
+                vec![Hlvalue::Variable(v_iter)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(repr.clone()));
+        *hop.r_result.borrow_mut() = Some(r_tuple);
+
+        let result = repr
+            .rtype_next(&hop)
+            .unwrap_or_else(|err| panic!("enumerate rtype_next: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        let names: Vec<String> = ops
+            .ops
+            .iter()
+            .map(|op| match (op.opname.as_str(), op.args.first()) {
+                ("direct_call", Some(Hlvalue::Constant(c))) => {
+                    let dbg = format!("{:?}", c.value);
+                    if dbg.contains("ll_getnextindex") {
+                        "ll_getnextindex".to_string()
+                    } else if dbg.contains("ll_listnext") {
+                        "ll_listnext".to_string()
+                    } else {
+                        "direct_call".to_string()
+                    }
+                }
+                (name, _) => name.to_string(),
+            })
+            .collect();
+        let at = |name: &str| names.iter().position(|n| n == name);
+        let getnextindex = at("ll_getnextindex").expect("ll_getnextindex call");
+        let add = at("int_add").expect("constant start added");
+        let listnext = at("ll_listnext").expect("ll_listnext call");
+        assert!(getnextindex < add && add < listnext, "{names:?}");
+        assert!(
+            names[listnext..].iter().any(|n| n == "malloc"),
+            "newtuple after the item: {names:?}"
+        );
+    }
+
+    /// rrange.py `rtype_builtin_enumerate`: `enumerate(lst)` is the base
+    /// list iterator's `newiter` (`ll_listiter`) and cannot raise.
+    #[test]
+    fn rtype_builtin_enumerate_is_the_list_newiter() {
+        use crate::annotator::listdef::ListDef;
+        use crate::annotator::model::{SomeInteger, SomeList, SomeValue};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+
+        let (_ann, rtyper) = live_rtyper();
+        let r_enum = enumerate_list_iterator(&rtyper, None);
+        let s_list = SomeValue::List(SomeList::new(ListDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+            false,
+        )));
+        let r_list = crate::translator::rtyper::rmodel::rtyper_makerepr(&s_list, &rtyper)
+            .expect("list repr");
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_list = Variable::new();
+        v_list.set_concretetype(Some(r_list.lowleveltype().clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(r_enum.lowleveltype().clone()));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call".to_string(),
+                vec![Hlvalue::Variable(v_list.clone())],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v_list));
+        hop.args_s.borrow_mut().push(s_list);
+        hop.args_r.borrow_mut().push(Some(r_list));
+        *hop.r_result.borrow_mut() = Some(r_enum);
+
+        let result = rtype_builtin_enumerate(&hop, &HashMap::new())
+            .unwrap_or_else(|err| panic!("rtype_builtin_enumerate: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+        let last = ops.ops.last().expect("a direct_call op");
+        assert_eq!(last.opname, "direct_call");
+        let Hlvalue::Constant(c) = &last.args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_listiter"));
     }
 }

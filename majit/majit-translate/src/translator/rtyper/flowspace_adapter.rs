@@ -2490,9 +2490,20 @@ pub fn translate_op(
                     // Arc identity that keys `rtype_builtin_range`
                     // (`rrange.py:96-126`), the same discipline the
                     // `__cast_instance_intrinsic` arm above documents.
-                    if segments.len() == 1 && segments[0] == crate::runtime_names::shims::RANGE {
-                        let callable_host = HOST_ENV.lookup_builtin("range").ok_or_else(|| {
-                            TyperError::message("range missing from HOST_ENV bootstrap".to_string())
+                    // `__majit_enumerate(lst)` is the front's spelling of
+                    // `enumerate(lst)` and resolves the same way.
+                    let builtin = match segments.as_slice() {
+                        [leaf] if leaf == crate::runtime_names::shims::RANGE => Some("range"),
+                        [leaf] if leaf == crate::runtime_names::shims::ENUMERATE => {
+                            Some("enumerate")
+                        }
+                        _ => None,
+                    };
+                    if let Some(builtin) = builtin {
+                        let callable_host = HOST_ENV.lookup_builtin(builtin).ok_or_else(|| {
+                            TyperError::message(format!(
+                                "{builtin} missing from HOST_ENV bootstrap"
+                            ))
                         })?;
                         let callable =
                             Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
@@ -7654,6 +7665,49 @@ mod tests {
             &empty_call_registry(),
         )
         .expect_err("a Rust aggregate ctor carries no call operands");
+    }
+
+    #[test]
+    fn translate_op_enumerate_marker_calls_the_enumerate_builtin() {
+        // `__majit_enumerate(lst)` (the front's spelling of
+        // `lst.iter().enumerate()`) → `simple_call(enumerate, lst)`, so
+        // `builtin_enumerate` types it `SomeIterator(s_list, "enumerate")`.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        let lst = Hlvalue::Variable(Variable::new());
+        let result_var = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), lst.clone());
+        value_map.insert(vars[1].clone(), result_var.clone());
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![crate::runtime_names::shims::ENUMERATE.into()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![vars[0].clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__majit_enumerate marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("callable must be ConstValue::HostObject");
+        };
+        assert_eq!(
+            *host,
+            HOST_ENV
+                .lookup_builtin("enumerate")
+                .expect("enumerate builtin")
+        );
+        assert_eq!(translated[0].args[1..], [lst]);
+        assert_eq!(translated[0].result, result_var);
     }
 
     #[test]

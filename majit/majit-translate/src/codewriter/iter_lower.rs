@@ -19,7 +19,11 @@
 //!   `index < len(container)` into a fresh advance block reading
 //!   `container[index]` and stepping `index + 1`;
 //! * range iteration (`ll_rangenext`): the carried value is the range's
-//!   stop, the branch is `index < stop`, and the item is the index.
+//!   stop, the branch is `index < stop`, and the item is the index;
+//! * enumerate iteration (`EnumerateIteratorRepr.rtype_next`, `rrange.py`):
+//!   `x = __majit_enumerate(lst)` feeds the `iter` op, the carried value is
+//!   the list, and the item is the `(index, lst[index])` tuple — the index
+//!   read (`ll_getnextindex`) before the list iterator steps.
 //!
 //! Fail-safe: a site whose surrounding shape is not the plain loop the
 //! front emits (an iterator escaping into another op, a phi slot mixing
@@ -29,12 +33,14 @@
 use std::collections::HashMap;
 
 use crate::codewriter::getslice::{LinkClasses, array_identity_of_base};
+use crate::codewriter::type_state::valuetype_to_concrete;
 use crate::flowspace::model::{ConstValue, Constant, Variable};
 use crate::front::result_exc::op_operand_vars;
 use crate::model::{
-    BlockId, CallTarget, ConcreteType, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind,
-    ValueType,
+    BlockId, CallTarget, ConcreteType, ExitCase, ExitSwitch, FieldDescriptor, FunctionGraph, Link,
+    LinkArg, OpKind, ValueType,
 };
+use crate::runtime_names::shims::{ENUMERATE, RANGE};
 
 /// Scalarise every lowerable iterator site in `graph`, one at a time —
 /// each rewrite invalidates the link classes the next site is judged by.
@@ -56,6 +62,13 @@ enum IterKind {
     },
     /// `__majit_range(start, stop)`: the index is the item.
     Range { start: Variable, stop: Variable },
+    /// `__majit_enumerate(lst)`: the item is the `(index, lst[index])`
+    /// tuple.
+    Enumerate {
+        list: Variable,
+        item_ty: ValueType,
+        array_type_id: Option<String>,
+    },
 }
 
 fn lower_one_site(graph: &mut FunctionGraph) -> bool {
@@ -99,9 +112,9 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
         return Err("iterated container out of scope".into());
     }
 
-    // What the iterator walks: a range marker feeding the constructor in
-    // the same block, else a GC array with a known identity.
-    let range_site = graph.blocks[d]
+    // What the iterator walks: a range or enumerate marker feeding the
+    // constructor in the same block, else a GC array with a known identity.
+    let marker_site = graph.blocks[d]
         .operations
         .iter()
         .enumerate()
@@ -109,18 +122,32 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
             if op.result.as_ref() != Some(&x) {
                 return None;
             }
-            is_marker_call(&op.kind, "__majit_range", 2)
-                .map(|args| (ri, args[0].clone(), args[1].clone()))
+            is_marker_call(&op.kind, RANGE, 2)
+                .or_else(|| is_marker_call(&op.kind, ENUMERATE, 1))
+                .map(|args| (ri, args))
         });
-    let kind = if let Some((_, start, stop)) = &range_site {
-        for v in [start, stop] {
+    let kind = if let Some((_, args)) = &marker_site {
+        for v in args {
             if !in_scope(graph, d, v) {
-                return Err("range bound out of scope".into());
+                return Err("marker operand out of scope".into());
             }
         }
-        IterKind::Range {
-            start: start.clone(),
-            stop: stop.clone(),
+        match args.as_slice() {
+            [start, stop] => IterKind::Range {
+                start: start.clone(),
+                stop: stop.clone(),
+            },
+            [list] => {
+                let Some((item_ty, array_type_id)) = array_identity_of_base(graph, list) else {
+                    return Err("enumerated container has no array identity".into());
+                };
+                IterKind::Enumerate {
+                    list: list.clone(),
+                    item_ty,
+                    array_type_id,
+                }
+            }
+            _ => unreachable!("marker arities are 1 and 2"),
         }
     } else {
         let Some((item_ty, array_type_id)) = array_identity_of_base(graph, &x) else {
@@ -131,9 +158,9 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
             array_type_id,
         }
     };
-    let range_op_idx = range_site.as_ref().map(|(ri, _, _)| *ri);
+    let range_op_idx = marker_site.as_ref().map(|(ri, _)| *ri);
     if range_op_idx.is_some() {
-        // The range value must feed only the constructor: its op is
+        // The marker value must feed only the constructor: its op is
         // deleted alongside the anchor.
         for (bi, block) in graph.blocks.iter().enumerate() {
             for (oi, op) in block.operations.iter().enumerate() {
@@ -155,6 +182,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
     }
     let carried = match &kind {
         IterKind::Range { stop, .. } => stop.clone(),
+        IterKind::Enumerate { list, .. } => list.clone(),
         IterKind::Slice { .. } => x.clone(),
     };
 
@@ -186,6 +214,8 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
         block: usize,
         iter_arg: Variable,
         item: Variable,
+        /// The enumerate `next`'s `(index, item)` tuple class.
+        tuple_owner: Option<String>,
         some_link: Link,
         break_link: Link,
     }
@@ -212,6 +242,18 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
         };
         let iter_arg =
             is_marker_call(&op.kind, "__iter_next", 1).expect("filtered above")[0].clone();
+        let tuple_owner = match &op.kind {
+            OpKind::Call {
+                result_ty: ValueType::Ref(Some(owner)),
+                ..
+            } if owner.starts_with("Tuple<") => Some(owner.clone()),
+            _ => None,
+        };
+        if matches!(kind, IterKind::Enumerate { .. }) && tuple_owner.is_none() {
+            return Err(format!(
+                "enumerate next in block {bi} does not yield a tuple"
+            ));
+        }
         if !matches!(block.exitswitch, Some(ExitSwitch::LastException)) {
             return Err(format!("next block {bi} is not an exception switch"));
         }
@@ -243,6 +285,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
             block: bi,
             iter_arg,
             item,
+            tuple_owner,
             some_link,
             break_link,
         });
@@ -333,7 +376,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
         // the index instead of catching `StopIteration`.
         graph.block_mut(a).operations.pop();
         let bound = match &kind {
-            IterKind::Slice { array_type_id, .. } => {
+            IterKind::Slice { array_type_id, .. } | IterKind::Enumerate { array_type_id, .. } => {
                 let len = push(
                     graph,
                     a,
@@ -428,6 +471,56 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
                     site.item.clone(),
                 );
             }
+            IterKind::Enumerate {
+                item_ty,
+                array_type_id,
+                ..
+            } => {
+                let item = push(
+                    graph,
+                    bp,
+                    OpKind::ArrayRead {
+                        base: map[&site.iter_arg].clone(),
+                        index: bp_idx.clone(),
+                        item_ty: item_ty.clone(),
+                        array_type_id: array_type_id.clone(),
+                        nolength: crate::front::typestr::nolength_from_array_type_id(
+                            array_type_id.as_deref(),
+                        ),
+                        pure: false,
+                    },
+                );
+                FunctionGraph::set_concretetype_of_inline(&item, valuetype_to_concrete(item_ty));
+                let owner = site
+                    .tuple_owner
+                    .clone()
+                    .expect("validated: enumerate next names its tuple");
+                graph.push_op_with_result_var(
+                    bp,
+                    OpKind::Call {
+                        target: CallTarget::synthetic_transparent_ctor(&owner),
+                        args: Vec::new(),
+                        result_ty: ValueType::Ref(Some(owner.clone())),
+                    },
+                    site.item.clone(),
+                );
+                FunctionGraph::set_concretetype_of_inline(&site.item, ConcreteType::GcRef);
+                for (pos, value, ty) in [
+                    ("__pos_0", bp_idx.clone(), ValueType::Unsigned),
+                    ("__pos_1", item, item_ty.clone()),
+                ] {
+                    graph.push_op_var(
+                        bp,
+                        OpKind::FieldWrite {
+                            base: site.item.clone(),
+                            field: FieldDescriptor::new(pos, Some(owner.clone())),
+                            value: LinkArg::Value(value),
+                            ty,
+                        },
+                        false,
+                    );
+                }
+            }
         }
         let one = push(graph, bp, OpKind::ConstInt(1));
         FunctionGraph::set_concretetype_of_inline(&one, ConcreteType::Signed);
@@ -478,7 +571,9 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
     }
     let init_arg = match &kind {
         IterKind::Range { start, .. } => LinkArg::Value(start.clone()),
-        IterKind::Slice { .. } => LinkArg::Const(Constant::new(ConstValue::Int(0))),
+        IterKind::Slice { .. } | IterKind::Enumerate { .. } => {
+            LinkArg::Const(Constant::new(ConstValue::Int(0)))
+        }
     };
     for bi in 0..graph.blocks.len() {
         for li in 0..graph.blocks[bi].exits.len() {
@@ -501,10 +596,10 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
     }
 
     // Retire the constructor: the iterator value becomes the carried
-    // one, and the range marker (whose only consumer was the
+    // one, and the range or enumerate marker (whose only consumer was the
     // constructor) goes with it.
     let removed: Vec<Variable> = match &kind {
-        IterKind::Range { .. } => vec![it.clone(), x.clone()],
+        IterKind::Range { .. } | IterKind::Enumerate { .. } => vec![it.clone(), x.clone()],
         IterKind::Slice { .. } => vec![it.clone()],
     };
     graph
@@ -582,7 +677,8 @@ mod tests {
             .filter(|op| {
                 is_slice_iter_call(&op.kind)
                     || is_marker_call(&op.kind, "__iter_next", 1).is_some()
-                    || is_marker_call(&op.kind, "__majit_range", 2).is_some()
+                    || is_marker_call(&op.kind, RANGE, 2).is_some()
+                    || is_marker_call(&op.kind, ENUMERATE, 1).is_some()
             })
             .count()
     }
@@ -608,11 +704,7 @@ mod tests {
         );
         let zero = push(&mut g, d, OpKind::ConstInt(0));
         let t = g.alloc_value_var();
-        g.push_op_with_result_var(
-            d,
-            call(&["__majit_range"], vec![zero.clone(), n]),
-            t.clone(),
-        );
+        g.push_op_with_result_var(d, call(&[RANGE], vec![zero.clone(), n]), t.clone());
         let it = g.alloc_value_var();
         g.push_op_with_result_var(d, call(&["core", "slice", "iter"], vec![t]), it.clone());
 
@@ -697,6 +789,12 @@ mod tests {
     /// `for &w in args_w { use(w) }` in the front's shape, with a sibling
     /// length read establishing the array identity.
     fn slice_loop_graph() -> (FunctionGraph, BlockId, BlockId) {
+        slice_loop_graph_with(false)
+    }
+
+    /// The same loop over `enumerate(args_w)` when `enumerate`: the
+    /// marker feeds the `iter` op and `next` yields the `(i, w)` tuple.
+    fn slice_loop_graph_with(enumerate: bool) -> (FunctionGraph, BlockId, BlockId) {
         let mut g = FunctionGraph::new("f");
         let d = g.startblock;
         let l = g.alloc_value_var();
@@ -719,10 +817,17 @@ mod tests {
                 nolength: false,
             },
         );
+        let iterated = if enumerate {
+            let e = g.alloc_value_var();
+            g.push_op_with_result_var(d, call(&[ENUMERATE], vec![l.clone()]), e.clone());
+            e
+        } else {
+            l.clone()
+        };
         let it = g.alloc_value_var();
         g.push_op_with_result_var(
             d,
-            call(&["core", "slice", "iter"], vec![l.clone()]),
+            call(&["core", "slice", "iter"], vec![iterated]),
             it.clone(),
         );
 
@@ -730,11 +835,11 @@ mod tests {
         g.set_goto(d, head, vec![l, it]);
         let h_it = head_args[1].clone();
         let item = g.alloc_value_var();
-        g.push_op_with_result_var(
-            head,
-            call(&["__iter_next"], vec![h_it.clone()]),
-            item.clone(),
-        );
+        let mut next = call(&["__iter_next"], vec![h_it.clone()]);
+        if enumerate && let OpKind::Call { result_ty, .. } = &mut next {
+            *result_ty = ValueType::Ref(Some("Tuple<usize,Ptr>".into()));
+        }
+        g.push_op_with_result_var(head, next, item.clone());
         let (body, body_args) = g.create_block_with_arg_vars(3);
         let (done, _) = g.create_block_with_arg_vars(0);
         let some_link = Link::new_mixed(
@@ -783,6 +888,77 @@ mod tests {
             bp.operations
                 .iter()
                 .any(|op| matches!(&op.kind, OpKind::ArrayRead { .. }))
+        );
+    }
+
+    #[test]
+    fn an_enumerate_loop_builds_the_index_item_tuple() {
+        let (mut g, head, body) = slice_loop_graph_with(true);
+        assert_eq!(marker_count(&g), 3);
+        lower_iterators(&mut g);
+        assert_eq!(marker_count(&g), 0);
+
+        let head_block = g.block(head);
+        assert!(matches!(head_block.exitswitch, Some(ExitSwitch::Value(_))));
+        // The carried value is the list itself: its length bounds the index.
+        assert!(
+            head_block
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::ArrayLen { .. }))
+        );
+        assert_eq!(g.block(body).inputargs.len(), 4);
+        let seed = g.block(g.startblock).exits[0].args.last().unwrap();
+        assert!(matches!(seed, LinkArg::Const(c) if c.value == ConstValue::Int(0)));
+        // The advance block reads `lst[index]` and packs `(index, item)`
+        // into the tuple `next` yielded.
+        let bp = g.block(head_block.exits[1].target);
+        let bp_idx = bp.inputargs.last().unwrap().clone();
+        let item = bp
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::ArrayRead { index, .. } if *index == bp_idx => op.result.clone(),
+                _ => None,
+            })
+            .expect("item read at the index");
+        let tuple = bp
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } if name == "Tuple<usize,Ptr>" => op.result.clone(),
+                _ => None,
+            })
+            .expect("tuple ctor");
+        let writes: Vec<(String, Variable)> = bp
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite {
+                    base,
+                    field,
+                    value: LinkArg::Value(v),
+                    ..
+                } if *base == tuple => Some((field.name.clone(), v.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            writes,
+            vec![
+                ("__pos_0".to_string(), bp_idx),
+                ("__pos_1".to_string(), item)
+            ]
+        );
+        // The resume link hands the tuple to the loop body.
+        assert!(
+            bp.exits[0]
+                .args
+                .iter()
+                .any(|a| matches!(a, LinkArg::Value(v) if *v == tuple))
         );
     }
 

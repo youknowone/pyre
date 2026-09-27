@@ -17774,8 +17774,8 @@ impl<'a> Lowering<'a> {
                         TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
                         TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
                     };
-                    // `Option<(usize, I::Item)>` — the inner next yields
-                    // `I::Item`, packed into the tuple on the Some arm.
+                    // `Option<(usize, I::Item)>` — the recorded kind is the
+                    // tuple's item, peeled like `I::next`'s own payload.
                     let body = if enumerate_next {
                         type_decl_ref_generics(body.get("Adt")?.as_object()?, self.llbc)?
                             .get("types")?
@@ -17783,11 +17783,8 @@ impl<'a> Lowering<'a> {
                     } else {
                         body
                     };
-                    let item = iterator_payload_element(
-                        body,
-                        self.llbc,
-                        enumerate_item_peel(enumerate_next, iterator_added_a_reference),
-                    )?;
+                    let item =
+                        iterator_payload_element(body, self.llbc, iterator_added_a_reference)?;
                     serde_json::from_value::<TyRef>(item.clone()).ok()
                 })
                 .map(|ty| tyref_to_value_type_with(&ty, self.llbc, self.tombstoned_leaves))
@@ -37518,19 +37515,6 @@ fn map_collect_payload_value_type(item_ty: &TyRef, llbc: &Llbc, adds_reference: 
     tyref_to_value_type(&TyRef::Other(borrowed), llbc)
 }
 
-/// Plain `next` peels the reference [`iterator_adds_a_reference`] added
-/// ([`iterator_payload_element`]). `Enumerate<I>::next` yields
-/// `(usize, I::Item)` and the loop reads `I::Item` — the borrow, for a
-/// slice iterator — the same bank `pack_enumerate_payload` writes into
-/// `__pos_1`.
-fn enumerate_item_peel(enumerate_next: bool, iterator_added_a_reference: bool) -> bool {
-    if enumerate_next {
-        false
-    } else {
-        iterator_added_a_reference
-    }
-}
-
 fn iterator_adds_a_reference(path: &str) -> bool {
     matches!(
         path,
@@ -46639,11 +46623,13 @@ mod tests {
         );
     }
 
-    /// `Enumerate<slice::Iter<i64>>::next` yields `(usize, &i64)`. The
-    /// loop's `tuple.1` read is that borrow. Peeling to `i64` stores an
-    /// int in the ref field `__pos_1`.
+    /// `Enumerate<slice::Iter<i64>>::next` yields `(usize, &i64)`; the
+    /// `(index, item)` tuple of `enumerate(lst)` holds the list's item repr
+    /// (`EnumerateIteratorRepr.rtype_next` converts to `items_r[1]`), so the
+    /// reference the slice iterator added is peeled exactly as for a plain
+    /// `next`.
     #[test]
-    fn enumerate_slice_iter_next_records_the_borrow_the_loop_reads() {
+    fn enumerate_slice_iter_next_records_the_list_item() {
         let llbc = empty_llbc();
         let borrow = shared_i64();
         let node = match &borrow {
@@ -46654,24 +46640,7 @@ mod tests {
         let peeled = super::iterator_payload_element(&node, &llbc, true)
             .and_then(|item| serde_json::from_value::<TyRef>(item.clone()).ok())
             .map(|ty| tyref_to_value_type(&ty, &llbc));
-        assert_eq!(
-            peeled,
-            Some(ValueType::Int),
-            "the peel itself still yields i64"
-        );
-        assert!(
-            !super::enumerate_item_peel(true, true),
-            "Enumerate::next must not peel I::Item; plain next still peels"
-        );
-        let kept =
-            super::iterator_payload_element(&node, &llbc, super::enumerate_item_peel(true, true))
-                .and_then(|item| serde_json::from_value::<TyRef>(item.clone()).ok())
-                .map(|ty| tyref_to_value_type(&ty, &llbc));
-        assert_eq!(kept, Some(ValueType::Ref(None)));
-        assert!(
-            super::enumerate_item_peel(false, true),
-            "plain slice::Iter::next still peels the reference it added"
-        );
+        assert_eq!(peeled, Some(ValueType::Int));
     }
 
     fn branch_layout(disc_off: u64, payload_off: u64) -> majit_charon_reader::ullbc::TypeLayout {

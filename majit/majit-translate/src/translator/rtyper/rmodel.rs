@@ -2746,6 +2746,9 @@ pub enum ReprKey {
     Iterator {
         container: Box<ReprKey>,
         variant: Vec<String>,
+        /// Upstream's variant tuple carries the constant start of
+        /// `("enumerate", start)`; pyre keeps it beside the variant.
+        enumerate_start: Option<i64>,
     },
     /// RPython `SomeWeakRef.rtyper_makekey = (self.__class__,)`
     /// (rweakref.py:19-20).
@@ -2933,6 +2936,10 @@ pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
         SomeValue::Iterator(s) => ReprKey::Iterator {
             container: Box::new(rtyper_makekey(&s.s_container)),
             variant: s.variant.clone(),
+            enumerate_start: match &s.enumerate_start {
+                Some(crate::flowspace::model::ConstValue::Int(start)) => Some(*start),
+                _ => None,
+            },
         },
         // rweakref.py:19-20 — SomeWeakRef.rtyper_makekey class tag only.
         SomeValue::WeakRef(_) => ReprKey::WeakRef,
@@ -3240,17 +3247,31 @@ pub fn rtyper_makerepr(
         // rmodel.py — SomeIterator.rtyper_makerepr:
         //   r_container = rtyper.getrepr(self.s_container)
         //   if self.variant and self.variant[0] == "enumerate":
-        //       ... EnumerateIteratorRepr  (deferred — rrange.py)
+        //       from rpython.rtyper.rrange import EnumerateIteratorRepr
+        //       r_baseiter = r_container.make_iterator_repr()
+        //       return EnumerateIteratorRepr(r_baseiter, self.variant[1])
         //   return r_container.make_iterator_repr(*self.variant)
         SomeValue::Iterator(s_iter) => {
+            let r_container = rtyper.getrepr(s_iter.s_container.as_ref())?;
+            let foldable = list_container_foldable(s_iter.s_container.as_ref());
             if s_iter.variant.first().map(String::as_str) == Some("enumerate") {
-                Err(TyperError::missing_rtype_operation(
-                    "SomeIterator(enumerate).rtyper_makerepr — port \
-                     rpython/rtyper/rrange.py EnumerateIteratorRepr",
-                ))
+                let r_baseiter = r_container.make_iterator_repr(&[], foldable)?;
+                let const_startindex = match &s_iter.enumerate_start {
+                    None => None,
+                    Some(crate::flowspace::model::ConstValue::Int(start)) => Some(*start),
+                    Some(other) => {
+                        return Err(TyperError::message(format!(
+                            "enumerate(): non-integer constant start {other:?}"
+                        )));
+                    }
+                };
+                Ok(std::sync::Arc::new(
+                    crate::translator::rtyper::rrange::EnumerateIteratorRepr::new(
+                        r_baseiter,
+                        const_startindex,
+                    )?,
+                ) as std::sync::Arc<dyn Repr>)
             } else {
-                let r_container = rtyper.getrepr(s_iter.s_container.as_ref())?;
-                let foldable = list_container_foldable(s_iter.s_container.as_ref());
                 r_container.make_iterator_repr(&s_iter.variant, foldable)
             }
         }

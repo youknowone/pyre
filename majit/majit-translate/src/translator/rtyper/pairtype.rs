@@ -180,6 +180,9 @@ pub enum ReprClassId {
     /// Signed), ("stop", Signed))`). Distinct from `RangeRepr`: an
     /// iterator repr is its own iterator, not the container.
     RangeIteratorRepr,
+    /// `rrange.py EnumerateIteratorRepr(IteratorRepr)` — `enumerate()`
+    /// over a list, sharing the base list iterator's lowleveltype.
+    EnumerateIteratorRepr,
 }
 
 impl ReprClassId {
@@ -248,6 +251,7 @@ impl ReprClassId {
             // the resolution chain collapses to `Self → Repr`.
             ListIteratorRepr => &[ListIteratorRepr, Repr],
             RangeIteratorRepr => &[RangeIteratorRepr, Repr],
+            EnumerateIteratorRepr => &[EnumerateIteratorRepr, Repr],
         }
     }
 }

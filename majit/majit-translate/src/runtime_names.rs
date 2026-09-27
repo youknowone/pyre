@@ -117,6 +117,9 @@ pub(crate) mod shims {
     pub(crate) const CAST_INSTANCE: &str = "__cast_instance_intrinsic";
     pub(crate) const CAST_ADDRESS: &str = "__cast_address_intrinsic";
     pub(crate) const RANGE: &str = "__majit_range";
+    /// `enumerate(lst)`: the front respells `lst.iter().enumerate()` as
+    /// `iter(__majit_enumerate(lst))`.
+    pub(crate) const ENUMERATE: &str = "__majit_enumerate";
     pub(crate) const STRINGBUILDER_NEW: &str = "__majit_stringbuilder_new";
     pub(crate) const STRINGBUILDER_APPEND: &str = "__majit_stringbuilder_append";
     pub(crate) const STRINGBUILDER_BUILD: &str = "__majit_stringbuilder_build";
