@@ -41,7 +41,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(
         ns,
         "template",
-        make_module_builtin_function("template", sre_template),
+        make_module_builtin_function_with_arity("template", sre_template, 2),
     );
     module_ns_store(
         ns,
