@@ -886,19 +886,6 @@ struct IncrementalMarkState {
     /// Mirrors incminimark.py:448,500-504 `gc_increment_step`, whose runtime
     /// default is `nursery_size * 4` when `PYPY_GC_INCREMENT_STEP` is unset.
     mark_budget_per_step: usize,
-    /// Reusable buffer for `mark_object`: the FIXED-part GC pointer offsets of
-    /// the object currently being traced (bounded by the struct's field count),
-    /// copied out so the immutable `self.types` borrow is released before
-    /// greying (which mutates `self.incr_state.gray_stack`). RPython's
-    /// `_collect_obj` visitor pushes straight onto the gray stack; pyre copies
-    /// only the small fixed offsets and streams variable-part items one at a
-    /// time, so a large varsize GC-pointer array is never retained here.
-    mark_offsets: Vec<usize>,
-    /// Reusable `VARSIZE_TYPE_INFO.varofstoptrs` buffer for the same walk.
-    /// Its size is the number of pointer fields in one item, not the array
-    /// length, so major marking still streams items without proportional
-    /// temporary storage.
-    mark_var_offsets: Vec<usize>,
 }
 
 impl IncrementalMarkState {
@@ -913,8 +900,6 @@ impl IncrementalMarkState {
             more_gray_stack: Vec::new(),
             objects_marked: 0,
             mark_budget_per_step,
-            mark_offsets: Vec::new(),
-            mark_var_offsets: Vec::new(),
         }
     }
 }
@@ -5980,26 +5965,53 @@ impl MiniMarkGC {
             self.seed_prebuilt_root(addr);
             i += 1;
         }
-        let mut roots = self.enumerate_labeled_root_walker_values();
+        // Each root source hands its values straight to `seed_major_root`, as
+        // `collect_roots` hands `_collect_ref_stk` to `walk_roots`: upstream
+        // materializes no list of roots, and one built here is a 16-byte write
+        // and a second pass over every root of every major cycle.
+        //
+        // The registered roots are read by index for the reason the prebuilt
+        // loop above is: `seed_major_root` neither registers nor removes a
+        // root, so the list cannot move under the walk.
+        let mut n_roots = 0usize;
+        let mut seed = |gc: &mut Self, gcref: GcRef, site: &'static str| {
+            n_roots += 1;
+            gc.seed_major_root(gcref, site);
+        };
+        let mut i = 0;
+        while i < self.roots.roots.len() {
+            let slot = self.roots.roots[i];
+            seed(self, unsafe { *slot }, "registered_root");
+            i += 1;
+        }
+        Self::walk_stack_shaped_roots(|gcref, site| seed(self, gcref, site));
+        crate::shadow_stack::walk_extra_roots_labeled(|gcref, label| {
+            seed(self, *gcref, label);
+        });
         // Objects already moved to a death queue remain ordinary roots until
         // app-level code pops them. Registered live finalizers are deliberately
         // absent here; incminimark's finalization-order pass decides whether
         // they survive or move to the death queue.
-        roots.extend(
-            self.finalizer_handlers
-                .iter()
-                .flat_map(|handler| handler.deque.iter().copied())
-                .map(|addr| (GcRef(addr), "finalizer_death_queue")),
-        );
-        roots.extend(
-            self.run_old_style_finalizers
-                .iter()
-                .copied()
-                .map(|addr| (GcRef(addr), "old_style_finalizer_death_queue")),
-        );
-        for (gcref, site) in roots {
-            self.seed_major_root(gcref, site);
+        let mut h = 0;
+        while h < self.finalizer_handlers.len() {
+            let mut j = 0;
+            while j < self.finalizer_handlers[h].deque.len() {
+                let addr = self.finalizer_handlers[h].deque[j];
+                seed(self, GcRef(addr), "finalizer_death_queue");
+                j += 1;
+            }
+            h += 1;
         }
+        let mut k = 0;
+        while k < self.run_old_style_finalizers.len() {
+            let addr = self.run_old_style_finalizers[k];
+            seed(self, GcRef(addr), "old_style_finalizer_death_queue");
+            k += 1;
+        }
+        // Monotone, as `enumerate_labeled_root_walker_values` keeps it: the
+        // inspection walks size their snapshot from this hint.
+        self.root_snapshot_capacity
+            .set(self.root_snapshot_capacity.get().max(n_roots));
     }
 
     /// incminimark.py `prebuilt_root_objects.foreach(_collect_obj)`.
@@ -7812,13 +7824,13 @@ impl MiniMarkGC {
     /// Mark a single object: trace its GC pointer fields and push
     /// unmarked children onto the gray stack.
     fn mark_object(&mut self, obj_addr: usize) {
-        // Copy the trace descriptors out of the borrowed `type_info` so the
+        // The scalar trace descriptors are read out of the borrowed
+        // `type_info`, and the two offset tables through raw slices, so the
         // `self.types` borrow is released before greying (which mutates
         // `self.incr_state.gray_stack`). Each child is then streamed straight
-        // to the gray stack — as RPython `_collect_obj` does — so a large
-        // varsize GC-pointer array is never buffered (the gray stack already
-        // retains the live children); only the bounded fixed-field offsets are
-        // copied into the reused `mark_offsets` buffer.
+        // to the gray stack, as `trace` and `_trace_slow_path` stream to
+        // `callback`: both index the type id's offset list in place and copy
+        // nothing out of it.
         // incminimark.py `visit`: `ll_assert(not
         // self.is_in_nursery(obj), "nursery object in 'objects_to_trace'")`.
         debug_assert!(
@@ -7852,10 +7864,16 @@ impl MiniMarkGC {
         }
         let custom_trace;
         let (item_size, length_offset, fixed_size, items_have_gc_ptrs);
-        let mut offsets = std::mem::take(&mut self.incr_state.mark_offsets);
-        let mut var_offsets = std::mem::take(&mut self.incr_state.mark_var_offsets);
-        offsets.clear();
-        var_offsets.clear();
+        // `offsets_to_gc_pointers(typeid)` and
+        // `varsize_offsets_to_gcpointers_in_var_part(typeid)`, read per traced
+        // object. `TypeRegistry::register` builds each entry's offset tables
+        // before it appends the entry and never rewrites a registered one, so
+        // the `Vec<usize>` buffers these name outlive the trace: growing
+        // `TypeRegistry::entries` moves the `TypeInfo` structs, not the
+        // allocations their offset Vecs own.  Holding the slices rather than
+        // copying them per object is what lets `grey_child` take `&mut self`.
+        let offsets: *const [usize];
+        let var_offsets: *const [usize];
         {
             let type_info = self.types.get(type_id);
             custom_trace = type_info.custom_trace;
@@ -7863,11 +7881,12 @@ impl MiniMarkGC {
             length_offset = type_info.length_offset;
             fixed_size = type_info.size;
             items_have_gc_ptrs = type_info.items_have_gc_ptrs;
-            if custom_trace.is_none() {
-                offsets.extend_from_slice(&type_info.gc_ptr_offsets);
-                var_offsets.extend_from_slice(&type_info.var_gc_ptr_offsets);
-            }
+            offsets = &*type_info.gc_ptr_offsets;
+            var_offsets = &*type_info.var_gc_ptr_offsets;
         }
+        // SAFETY: the tables live in `TypeRegistry`, which outlives this call,
+        // and nothing below registers or rewrites a type.
+        let (offsets, var_offsets) = unsafe { (&*offsets, &*var_offsets) };
 
         // custom_trace_hook parity for major GC marking.
         if let Some(trace_fn) = custom_trace {
@@ -7886,7 +7905,7 @@ impl MiniMarkGC {
             }
         } else {
             // Fixed-part fields (count bounded by the struct's GC field count).
-            for &offset in &offsets {
+            for &offset in offsets {
                 let field_ref = unsafe { *((obj_addr + offset) as *const GcRef) };
                 if !field_ref.is_null() {
                     self.grey_child(
@@ -7908,7 +7927,7 @@ impl MiniMarkGC {
                 let items_start = obj_addr + fixed_size;
                 for i in 0..length {
                     let item = items_start + i * item_size;
-                    for &offset in &var_offsets {
+                    for &offset in var_offsets {
                         let slot = item + offset;
                         let field_ref = unsafe { *(slot as *const GcRef) };
                         if !field_ref.is_null() {
@@ -7918,10 +7937,6 @@ impl MiniMarkGC {
                 }
             }
         }
-
-        // Return the (small) offsets buffer for reuse.
-        self.incr_state.mark_offsets = offsets;
-        self.incr_state.mark_var_offsets = var_offsets;
     }
 
     /// incminimark.py:1793-1799 + :2461-2470 — final snapshot-at-the-beginning

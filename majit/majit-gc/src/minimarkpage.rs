@@ -573,12 +573,16 @@ impl ArenaCollection {
     /// the one valid block start from every other address in that range.
     #[inline]
     pub fn contains(&self, addr: usize) -> bool {
+        // The covering bound goes first: it is two loads and rejects every
+        // address outside the arenas, which is what the immortal-table root
+        // walks and the marking of an immortal child ask about. The last-range
+        // cache only ever helps an address that is inside.
+        if addr < self.arena_bound_start || addr >= self.arena_bound_end {
+            return false;
+        }
         let (start, end, arena) = self.last_range_hit.get();
         if addr >= start && addr < end {
             return unsafe { Self::block_is_live(arena, addr) };
-        }
-        if addr < self.arena_bound_start || addr >= self.arena_bound_end {
-            return false;
         }
         let index = self
             .arena_ranges
