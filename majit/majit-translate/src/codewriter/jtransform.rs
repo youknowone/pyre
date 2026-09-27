@@ -1815,6 +1815,34 @@ fn getsubstruct_offset_for_access(
     }
 }
 
+/// Address of a borrow of an inline aggregate wider than one word.
+///
+/// `jtransform.py rewrite_op_getsubstruct` turns that borrow into
+/// `int_add(ptr, offsetof)` when the container's `_gckind` is `raw`, and
+/// raises otherwise. A one-word field is an ordinary load. `vec_part`
+/// already names one word of the aggregate, so it is not this address.
+fn wide_inline_borrow_offset(
+    field: &FieldDescriptor,
+    cc: Option<&crate::call::CallControl>,
+) -> Option<Result<usize, ()>> {
+    if !field.taken_by_address || field.vec_part.is_some() {
+        return None;
+    }
+    let owner = field.owner_root.as_deref()?;
+    let row = cc
+        .and_then(|cc| cc.struct_layout_for(owner))
+        .and_then(|layout| layout.fields.iter().find(|row| row.name == field.name));
+    let word = crate::layout::target_word_size();
+    let wider = field.inline_vec || row.is_some_and(|row| row.size > word);
+    if !wider {
+        return None;
+    }
+    Some(match row {
+        Some(row) => Ok(row.offset),
+        None => Err(()),
+    })
+}
+
 /// Struct name of a VTYPEPTR-shaped lltype (`Ptr(Struct)` / resolved fwd).
 fn lltype_vtype_name(
     ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
@@ -2863,7 +2891,7 @@ impl<'a> Transformer<'a> {
                 rewritten
             }
             OpKind::FieldRead { field, ty, .. } => {
-                self.rewrite_op_getfield(op, field, ty, graph_name)
+                self.rewrite_op_getfield(op, field, ty, graph_name, graph)
             }
             // ── rewrite_op_setfield ──
             OpKind::FieldWrite { field, value, .. }
@@ -4880,6 +4908,7 @@ impl<'a> Transformer<'a> {
         field: &FieldDescriptor,
         ty: &ValueType,
         graph_name: &str,
+        graph: &mut FunctionGraph,
     ) -> RewriteResult {
         // jtransform.py `if self.is_typeptr_getset(op): return
         // self.handle_getfield_typeptr(op)` — checked before anything else,
@@ -4916,8 +4945,72 @@ impl<'a> Transformer<'a> {
                 },
             ]);
         }
-        // `rewrite_op_getsubstruct` applies only to an address-producing
-        // projection.  A by-value Rust field can itself have an inline-struct
+        // `rewrite_op_getsubstruct`: the address of an inlined aggregate
+        // wider than one word. Raw containers become `direct_ptradd`
+        // (`cast_ptr_to_int` + `int_add` + `cast_int_to_ptr`), the same
+        // pointer a `Box<Vec<_>>` field read already is, so a later `buf`
+        // / `len` getfield is an ordinary access on that pointer. A GC
+        // container is refused: emitting the field's first word as a Ref
+        // and then reading `buf` off it is the capacity-word fault.
+        // Retarget (`vec_part`) already selected one word and is not this
+        // address; `wide_inline_borrow_offset` leaves that read alone.
+        if let Some(offset) = wide_inline_borrow_offset(field, self.callcontrol.as_deref()) {
+            let gc = crate::codewriter::type_state::field_owner_is_gc(
+                field,
+                self.callcontrol.as_deref(),
+            );
+            if gc || offset.is_err() {
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::Abort {
+                        kind: crate::model::UnknownKind::UnsupportedExpr {
+                            variant: crate::model::UnsupportedExprKind::RawAddr,
+                        },
+                    },
+                }]);
+            }
+            let offset = offset.expect("raw offset");
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                unreachable!("rewrite_op_getfield called on non-FieldRead op")
+            };
+            if offset == 0 {
+                return RewriteResult::Identity(base.clone());
+            }
+            let (addr, mut ops) = self.coerce_operand_to_int(graph, base);
+            let shift = self.fresh_synthetic_variable_typed(
+                graph,
+                crate::codewriter::type_state::ConcreteType::Signed,
+            );
+            ops.push(SpaceOperation {
+                result: Some(shift.clone()),
+                kind: OpKind::ConstInt(offset as i64),
+            });
+            let sum = self.fresh_synthetic_variable_typed(
+                graph,
+                crate::codewriter::type_state::ConcreteType::Signed,
+            );
+            ops.push(SpaceOperation {
+                result: Some(sum.clone()),
+                kind: OpKind::BinOp {
+                    op: "add".to_string(),
+                    lhs: addr,
+                    rhs: shift,
+                    result_ty: ValueType::Int,
+                },
+            });
+            let result_ty = ValueType::Ref(None);
+            self.stamp_value_kind_from_value_type(graph, op.result.clone(), &result_ty);
+            ops.push(SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::UnaryOp {
+                    op: "cast_int_to_ptr".into(),
+                    operand: sum,
+                    result_ty,
+                },
+            });
+            return RewriteResult::Replace(ops);
+        }
+        // A by-value Rust field can itself have an inline-struct
         // layout (notably a `#[repr(transparent)]` newtype) while the operation
         // is still an ordinary load.  Treating every offset-zero Struct field
         // as getsubstruct aliases the result to the container pointer and
@@ -11358,6 +11451,185 @@ mod tests {
         assert_eq!(
             getsubstruct_offset_for_access(&address, || Some(0)),
             Some(0)
+        );
+    }
+
+    /// `&mut s.tags` on a raw `#[repr(C)]` holder is the address of the
+    /// inline `Vec`, not a load of its capacity word. The index then
+    /// getfields `buf` from that pointer (`rewrite_op_direct_ptradd`,
+    /// `rewrite_op_getsubstruct`). A GC holder declines instead.
+    #[test]
+    fn raw_inline_vec_borrow_is_field_address_not_capacity() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::{FieldDescriptor, VecFieldPart};
+
+        fn holder(owner: &str, gc: bool) -> (CallControl, majit_ir::descr::StructId) {
+            let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+            let mut cc = CallControl::new();
+            cc.set_struct_layout(
+                owner_id,
+                StructLayout {
+                    size: 32,
+                    fields: vec![
+                        StructFieldLayout {
+                            name: "word".into(),
+                            offset: 0,
+                            size: 8,
+                            flag: majit_ir::descr::ArrayFlag::Signed,
+                            field_type: majit_ir::value::Type::Int,
+                            rank: None,
+                        },
+                        StructFieldLayout {
+                            name: "tags".into(),
+                            offset: 8,
+                            size: 24,
+                            flag: majit_ir::descr::ArrayFlag::Struct,
+                            field_type: majit_ir::value::Type::Ref,
+                            rank: None,
+                        },
+                    ],
+                },
+            );
+            let storage = if gc {
+                crate::StructStorageDescriptor::headerless(owner)
+            } else {
+                crate::StructStorageDescriptor::raw(owner)
+            };
+            cc.set_struct_storage(&[storage]);
+            (cc, owner_id)
+        }
+
+        fn graph_for(owner: &str) -> FunctionGraph {
+            let mut graph = FunctionGraph::new("clear_tag");
+            let s = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "s".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(graph.startblock, s.clone());
+            let tags = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::FieldRead {
+                        base: s,
+                        field: FieldDescriptor::new("tags", Some(owner.into()))
+                            .with_taken_by_address(true)
+                            .with_inline_vec(true),
+                        ty: ValueType::Ref(None),
+                        pure: false,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::FieldRead {
+                        base: tags,
+                        field: FieldDescriptor::new("buf", Some("alloc::vec::Vec".into()))
+                            .with_vec_part(VecFieldPart::Buf),
+                        ty: ValueType::Ref(None),
+                        pure: false,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph
+        }
+
+        let owner = "raw_holder::TagHolder";
+        let gc_owner = "gc_holder::TagHolder";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let gc_id = majit_ir::descr::StructId::from_canonical(gc_owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+                (gc_owner.to_string(), Some(gc_id)),
+            ]));
+        let (mut cc, _) = holder(owner, false);
+        let config = GraphTransformConfig::default();
+        let out = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph_for(owner));
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, rhs, .. } if op == "add" && matches!(
+                    ops.iter().find(|c| c.result.as_ref() == Some(rhs)).map(|c| &c.kind),
+                    Some(OpKind::ConstInt(8))
+                )
+            )),
+            "address is base + field offset 8; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, result_ty, .. } if op == "cast_int_to_ptr"
+                    && matches!(result_ty, ValueType::Ref(_))
+            )),
+            "the address stays a Ref, the bank Box<Vec> field reads use"
+        );
+        let buf = ops.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.vec_part == Some(VecFieldPart::Buf)
+            )
+        });
+        let buf_base = match &buf.expect("buf getfield").kind {
+            OpKind::FieldRead { base, .. } => base,
+            _ => unreachable!(),
+        };
+        assert!(
+            ops.iter().any(|op| {
+                op.result.as_ref() == Some(buf_base)
+                    && matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "cast_int_to_ptr")
+            }),
+            "buf is read off the interior pointer, not the capacity word"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "tags" && field.vec_part.is_none()
+            )),
+            "the inline Vec field is not loaded as its first word"
+        );
+
+        let (mut gc_cc, _) = holder(gc_owner, true);
+        let gc_out = Transformer::new(&config)
+            .with_callcontrol(&mut gc_cc)
+            .transform(&graph_for(gc_owner));
+        let gc_ops: Vec<_> = gc_out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            gc_ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Abort { kind: crate::model::UnknownKind::UnsupportedExpr { variant } }
+                    if *variant == crate::model::UnsupportedExprKind::RawAddr
+            )),
+            "a GC base declines the interior address"
+        );
+        assert!(
+            gc_ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "tags"
+            )),
+            "a GC base does not load word 0 of the inline Vec"
         );
     }
 

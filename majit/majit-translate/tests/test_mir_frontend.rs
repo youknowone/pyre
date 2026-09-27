@@ -1896,3 +1896,60 @@ fn whole_enum_move_switches_per_variant() {
         "Ref and Int payloads are read in one block: ref={ref_blocks:?} int={int_blocks:?}"
     );
 }
+
+/// `clear_inline_tag` borrows an inline `Vec<u8>` after a word field.
+/// The index operand is that field, retargeted to the buffer word
+/// (`vec_part = Buf`) or marked as the field's address. It is not a
+/// load of the Vec's first word used as a pointer.
+#[test]
+fn clear_inline_tag_indexes_the_buffer_not_the_capacity_word() {
+    use majit_translate::model::{OpKind, VecFieldPart};
+
+    let llbc = load_corpus();
+    let graph = lower_function(llbc, "clear_inline_tag").expect("lowering");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+    let tags_reads: Vec<_> = ops
+        .iter()
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "tags"
+            )
+        })
+        .collect();
+    assert!(
+        !tags_reads.is_empty(),
+        "expected a tags field read; ops={ops:?}"
+    );
+    assert!(
+        tags_reads.iter().all(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } => {
+                field.vec_part == Some(VecFieldPart::Buf) || field.taken_by_address
+            }
+            _ => false,
+        }),
+        "tags must be the buffer word or its address, not word 0; reads={tags_reads:?}"
+    );
+    for op in &ops {
+        let OpKind::FieldRead { base, field, .. } = &op.kind else {
+            continue;
+        };
+        if field.name != "buf" {
+            continue;
+        }
+        let producer = ops.iter().find(|src| src.result.as_ref() == Some(base));
+        if let Some(src) = producer
+            && let OpKind::FieldRead { field: tags, .. } = &src.kind
+            && tags.name == "tags"
+        {
+            assert!(
+                tags.vec_part == Some(VecFieldPart::Buf) || tags.taken_by_address,
+                "buf read off a capacity-word copy of tags"
+            );
+        }
+    }
+}

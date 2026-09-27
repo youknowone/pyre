@@ -10,6 +10,26 @@
 pub type PyResult<T> = Result<T, &'static str>;
 
 // 1. Straight-line
+/// `#[repr(C)]` holder: one word, then an inline `Vec<u8>`.
+/// `clear_inline_tag` borrows the `Vec` (`s.tags[i]`) the way a frame
+/// reads `operand_tags`.
+#[repr(C)]
+pub struct TagHolder {
+    pub word: i64,
+    pub tags: Vec<u8>,
+}
+
+#[inline(never)]
+pub fn clear_inline_tag(s: &mut TagHolder, i: usize) -> u8 {
+    const N: usize = 8;
+    if i < N && s.tags[i] != 0 {
+        let t = s.tags[i];
+        s.tags[i] = 0;
+        return t;
+    }
+    0
+}
+
 #[inline(never)]
 pub fn straight_line_add(a: i64, b: i64, c: i64) -> i64 {
     let s = a + b;
