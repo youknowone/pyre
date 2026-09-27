@@ -7679,25 +7679,27 @@ impl CallControl {
                              kinds {arg_types:?}",
                         );
                     }
-                    // Project `Result<T, E>` → `T` to match rtyper's
-                    // `op.result.concretetype` shape — see the Direct arm
-                    // above for the full rationale. Source: witness_graph's
-                    // return_type (RPython `funcptr.TO.RESULT`).
+                    // Same conditional as the Direct arm: an unstamped
+                    // `return_type` is not `FUNC.RESULT`. The prebuilt eval
+                    // hook (`register_eval_override`, `plain_eval_fn_addr`)
+                    // returns `PyResult`, which stays unstamped, and mapping
+                    // that absence to `Void` disagrees with the call's `Ref`.
                     let declared = witness_graph.return_type.as_ref();
-                    let effective_declared = declared.map(|declared| {
-                        crate::front::typestr::transparent_result_ok_type(declared)
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| declared.clone())
-                    });
-                    let expected_result =
-                        return_type_string_to_value_type(effective_declared.as_ref());
-                    if result_type != expected_result {
-                        panic!(
-                            "indirect_call in family including {witness_path:?}: \
-                             calling a function with return type \
-                             {expected_result:?}, but the actual return type \
-                             is {result_type:?}",
-                        );
+                    if let Some(declared) = declared {
+                        let effective_declared =
+                            crate::front::typestr::transparent_result_ok_type(declared)
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| declared.clone());
+                        let expected_result =
+                            return_type_string_to_value_type(Some(&effective_declared));
+                        if result_type != expected_result {
+                            panic!(
+                                "indirect_call in family including {witness_path:?}: \
+                                 calling a function with return type \
+                                 {expected_result:?}, but the actual return type \
+                                 is {result_type:?}",
+                            );
+                        }
                     }
                 }
             }

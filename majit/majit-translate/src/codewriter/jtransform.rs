@@ -9183,6 +9183,9 @@ impl<'a> Transformer<'a> {
                 RewriteResult::Replace(ops)
             }
             crate::call::CallKind::Builtin | crate::call::CallKind::Recursive => {
+                // `guess_call_kind` answers `recursive` only for a direct
+                // call whose funcptr is `portal_runner_ptr`. An indirect
+                // family is `regular` or `residual` (`rewrite_op_indirect_call`).
                 unreachable!("indirect calls cannot classify as builtin/recursive")
             }
         }

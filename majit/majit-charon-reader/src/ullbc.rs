@@ -843,6 +843,20 @@ pub enum Operand {
     Const(Value),
 }
 
+/// Regular `Fun` id carried by an `Operand::Const` whose kind is `FnDef`.
+///
+/// The constant schema is `kind.FnDef.kind.Fun.Regular`. Literals,
+/// `VTableRef`, and `TraitConst` are not function items and return `None`.
+pub fn const_fn_def_regular_id(value: &Value) -> Option<u64> {
+    value
+        .get("kind")?
+        .get("FnDef")?
+        .get("kind")?
+        .get("Fun")?
+        .get("Regular")?
+        .as_u64()
+}
+
 // Terminators
 
 #[derive(Debug, Clone, Deserialize)]

@@ -104,6 +104,7 @@ use majit_charon_reader::{
         BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FunDecl, FunId, GlobalDecl,
         NameSeg, Operand, Place, PlaceKind, ProjectionElem, RegularCall, Rvalue, StmtKind,
         SwitchTargets, TermKind, TyRef, TypeDecl, TypeDeclKind, Unstructured,
+        const_fn_def_regular_id,
     },
 };
 
@@ -392,6 +393,29 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
         }
         None
     };
+    let mut eval_hook_graphs = llbcs
+        .iter()
+        .find_map(|llbc| {
+            let paths = llbc.eval_hook_graphs();
+            (!paths.is_empty()).then_some(paths)
+        })
+        .unwrap_or_default();
+    if eval_hook_graphs.is_empty() {
+        for llbc in llbcs {
+            for path in discover_eval_hook_graphs(llbc) {
+                if !eval_hook_graphs.contains(&path) {
+                    eval_hook_graphs.push(path);
+                }
+            }
+        }
+    }
+    if !eval_hook_graphs.is_empty() {
+        for llbc in llbcs {
+            if llbc.eval_hook_graphs().is_empty() {
+                llbc.set_eval_hook_graphs(eval_hook_graphs.clone());
+            }
+        }
+    }
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key combines `self_ty_root` (the impl owner, when known),
     // `module_path`, and `name`.  Without `self_ty_root`, two distinct
@@ -13957,6 +13981,8 @@ impl<'a> Lowering<'a> {
                 // arm could not resolve, keeps the synthetic `__dyn_call`
                 // path with the receiver threaded into `args[0]`.
                 let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc);
+                let eval_hook_graphs =
+                    eval_hook_graphs_for_call(self.llbc, self.body, &dyn_operand);
                 let indirect = self.dyn_indirect_target(&dyn_operand);
                 if let Some((trait_root, method_name)) = indirect {
                     // RPython `ClassRepr.getclsfield` emits the concrete
@@ -13971,6 +13997,24 @@ impl<'a> Lowering<'a> {
                         args,
                         graphs: None,
                         family_key: Some((trait_root, method_name)),
+                        result_ty,
+                    }
+                } else if let Some(graphs) = eval_hook_graphs {
+                    // `register_eval_override`'s function and the `FnDef`
+                    // cast to that parameter's type are one prebuilt
+                    // constant set. `FunctionsPBCRepr` /
+                    // `SmallFunctionSetPBCRepr` (`rpbc.py`) lower it to
+                    // `indirect_call(funcptr, *args, c_graphs)`.
+                    // `guess_call_kind` answers `recursive` only when the
+                    // funcptr is `portal_runner_ptr`; this pointer is not,
+                    // so `rewrite_op_indirect_call` takes
+                    // `handle_regular_indirect_call` or `handle_residual_call`.
+                    let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
+                    OpKind::IndirectCall {
+                        funcptr,
+                        args,
+                        graphs: Some(graphs),
+                        family_key: None,
                         result_ty,
                     }
                 } else if let Some(family) = fn_ptr_family {
@@ -23751,6 +23795,211 @@ enum FnPtrFamily {
     /// collapses canraise / can_invalidate / forces_virtualizable to their
     /// bottom result, which is unsound for a callee this side cannot see.
     Unknown,
+}
+
+/// Crate-stripped paths of the prebuilt eval hook in this artefact.
+///
+/// `register_eval_override`'s `FnDef` argument, then every other `FnDef`
+/// assigned to that parameter's type (the plain evaluator). Callers in
+/// another crate see the registrar as an external `FunDecl`; the
+/// translator unions the lists before lowering.
+pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
+    let Some(eval_ty) = eval_fn_type_id(llbc) else {
+        return Vec::new();
+    };
+    let registrar_ids = registrar_fun_ids(llbc);
+    let mut overrides = Vec::new();
+    let mut plain = Vec::new();
+    for fd in llbc.iter_local_fns() {
+        let Some(body) = fd.unstructured() else {
+            continue;
+        };
+        let mut bound = vec![None; body.locals.locals.len()];
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let Some(fun) = rvalue_fundef(rvalue) else {
+                    continue;
+                };
+                if let PlaceKind::Local(index) = place.kind
+                    && (index as usize) < bound.len()
+                {
+                    bound[index as usize] = Some(fun);
+                }
+                if tyref_dedup_id(&place.ty) == Some(eval_ty) {
+                    push_registered_fun_path(llbc, fun, &mut plain);
+                }
+            }
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref() else {
+                continue;
+            };
+            let CallFunc::Regular(reg) = &call.func else {
+                continue;
+            };
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                continue;
+            };
+            if !registrar_ids.contains(id) {
+                continue;
+            }
+            let Some(arg) = call.args.first() else {
+                continue;
+            };
+            if let Some(fun) = operand_bound_fundef(arg, &bound) {
+                push_registered_fun_path(llbc, fun, &mut overrides);
+            }
+        }
+    }
+    for path in plain {
+        if !overrides.contains(&path) {
+            overrides.push(path);
+        }
+    }
+    overrides
+}
+
+/// `register_eval_override`'s parameter type: the `EvalFn` pointer.
+///
+/// The name is the one anchor. Every later test compares dedup ids of
+/// that parameter, not a rendered signature.
+fn eval_fn_type_id(llbc: &Llbc) -> Option<u64> {
+    let registrar = llbc.iter_local_fns().find(|fd| {
+        fd.item_meta
+            .name_path()
+            .ends_with("::call::register_eval_override")
+    })?;
+    tyref_dedup_id(registrar.signature.inputs.first()?)
+}
+
+fn registrar_fun_ids(llbc: &Llbc) -> Vec<u64> {
+    llbc.iter_local_fns()
+        .filter(|fd| {
+            fd.item_meta
+                .name_path()
+                .ends_with("::call::register_eval_override")
+        })
+        .map(|fd| fd.def_id)
+        .collect()
+}
+
+fn tyref_dedup_id(ty: &TyRef) -> Option<u64> {
+    match ty {
+        TyRef::Dedup { id } => Some(*id),
+        TyRef::Inline { value: (id, _) } => Some(*id),
+        TyRef::Other(_) => None,
+    }
+}
+
+fn push_registered_fun_path(llbc: &Llbc, id: u64, out: &mut Vec<String>) {
+    let Some(fd) = llbc.fn_by_id(id) else {
+        return;
+    };
+    let key = registered_path_for_fun_decl(llbc, fd).canonical_key();
+    if !key.is_empty() && !out.contains(&key) {
+        out.push(key);
+    }
+}
+
+fn rvalue_fundef(rvalue: &Rvalue) -> Option<u64> {
+    match rvalue {
+        Rvalue::Use(operand) | Rvalue::UnaryOp(_, operand) | Rvalue::Cast(_, operand, _) => {
+            operand_fundef(operand)
+        }
+        _ => None,
+    }
+}
+
+fn operand_fundef(operand: &Operand) -> Option<u64> {
+    let Operand::Const(value) = operand else {
+        return None;
+    };
+    const_fn_def_regular_id(value)
+}
+
+fn operand_bound_fundef(operand: &Operand, bound: &[Option<u64>]) -> Option<u64> {
+    if let Some(fun) = operand_fundef(operand) {
+        return Some(fun);
+    }
+    let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+        return None;
+    };
+    let PlaceKind::Local(index) = place.kind else {
+        return None;
+    };
+    bound.get(index as usize).copied().flatten()
+}
+
+/// `get_eval_fn`'s result, or any other value of `register_eval_override`'s
+/// parameter type: the prebuilt family published on `llbc`.
+fn eval_hook_graphs_for_call(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+) -> Option<Vec<crate::parse::CallPath>> {
+    let paths = llbc.eval_hook_graphs();
+    if paths.is_empty() {
+        return None;
+    }
+    if !operand_is_eval_fn(operand, llbc) && !operand_produced_by_get_eval_fn(body, llbc, operand) {
+        return None;
+    }
+    Some(
+        paths
+            .iter()
+            .map(|path| crate::parse::CallPath::from_segments(path.split("::")))
+            .collect(),
+    )
+}
+
+fn operand_is_eval_fn(operand: &Operand, llbc: &Llbc) -> bool {
+    let ty = match operand {
+        Operand::Copy(place) | Operand::Move(place) => &place.ty,
+        Operand::Const(_) => return false,
+    };
+    match (tyref_dedup_id(ty), eval_fn_type_id(llbc)) {
+        (Some(operand_ty), Some(eval_ty)) => operand_ty == eval_ty,
+        _ => false,
+    }
+}
+
+/// The local was produced by a call whose callee returns
+/// `register_eval_override`'s parameter type.
+fn operand_produced_by_get_eval_fn(body: &Unstructured, llbc: &Llbc, operand: &Operand) -> bool {
+    let Some(eval_ty) = eval_fn_type_id(llbc) else {
+        return false;
+    };
+    let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+        return false;
+    };
+    let PlaceKind::Local(local) = place.kind else {
+        return false;
+    };
+    for bb in &body.body {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref() else {
+            continue;
+        };
+        let PlaceKind::Local(dest) = call.dest.kind else {
+            continue;
+        };
+        if dest != local {
+            continue;
+        }
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            continue;
+        };
+        let Some(fd) = llbc.fn_by_id(*id) else {
+            continue;
+        };
+        if tyref_dedup_id(&fd.signature.output) == Some(eval_ty) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Classify a `CallFunc::Dynamic` operand that resolves to a bare
