@@ -69,8 +69,8 @@ pub fn contains_int_list_locked(obj: PyObjectRef, w_item: PyObjectRef) -> Result
 /// Residual entry for [`contains_int_list_locked`].  A stored object's
 /// `__eq__` on the generic fallback can run Python.
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_list_contains_int(haystack: i64, needle: i64) -> i64 {
-    match contains_int_list_locked(haystack as PyObjectRef, needle as PyObjectRef) {
+pub extern "C" fn jit_list_contains_int(haystack: PyObjectRef, needle: PyObjectRef) -> i64 {
+    match contains_int_list_locked(haystack, needle) {
         Ok(found) => i64::from(found),
         Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }

@@ -23154,7 +23154,7 @@ fn contains_list(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyE
         // Call the registered residual, not `contains_int_list_locked`.
         // That helper is `dont_look_inside` and returns `Result`, so the
         // codewriter has no word-ABI target for it; descent would decline.
-        return Ok(crate::listobject::jit_list_contains_int(haystack as i64, needle as i64) != 0);
+        return Ok(crate::listobject::jit_list_contains_int(haystack, needle) != 0);
     }
     Ok(matches!(
         crate::listobject::w_list_find_or_count(haystack, needle, 0, i64::MAX, false)?,

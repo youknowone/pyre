@@ -1587,8 +1587,7 @@ fn exc_info_tuple(include_traceback: bool) -> PyObjectRef {
     let exc = crate::eval::get_sys_exception();
     unsafe {
         if exc.is_null() {
-            crate::runtime_ops::jit_build_tuple_3(w_none() as i64, w_none() as i64, w_none() as i64)
-                as PyObjectRef
+            pyre_object::tupleobject::jit_w_tuple3(w_none(), w_none(), w_none())
         } else {
             let exc_type = crate::baseobjspace::exception_getclass(exc);
             let exc_type = if exc_type.is_null() {
@@ -1603,8 +1602,7 @@ fn exc_info_tuple(include_traceback: bool) -> PyObjectRef {
             } else {
                 w_none()
             };
-            crate::runtime_ops::jit_build_tuple_3(exc_type as i64, exc as i64, w_tb as i64)
-                as PyObjectRef
+            pyre_object::tupleobject::jit_w_tuple3(exc_type, exc, w_tb)
         }
     }
 }
