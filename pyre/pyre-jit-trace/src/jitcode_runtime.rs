@@ -1340,25 +1340,27 @@ fn rehydrated_call_descr_ref(bh: majit_jitcode::jitcode::BhCallDescr) -> majit_i
 }
 
 /// Publish the GcCache-owned (non-call) opcode descrs and stamp synthetic
-/// struct collector tids on the first JIT use.
+/// struct collector tids before user code.
 ///
 /// `GcLLDescr_framework.init_size_descr` asks `TypeLayoutBuilder.get_type_id`
 /// for those ids during translation, against Size objects already in
 /// `GcCache`. pyre cannot embed the collector ids in the executable.
-/// The first `force_start_tracing` / `bound_reached` publishes every kind-0
-/// slot before that walk records a descr. A process that never traces does
-/// not call this. Publishing from inside the walk makes `frame_chain`
-/// allocate about 1.8 TiB (Windows exit 3221226505). Field minting publishes
+/// `init_jit_hooks` publishes every kind-0 slot before user code. Publishing
+/// at the first `force_start_tracing` is too late: Windows `frame_chain`
+/// then allocates about 2.2 TiB (exit 3221226505). `PYRE_JIT=0` /
+/// `PYRE_NO_JIT` skip the boot call. A trace that starts without that boot
+/// still calls this before the walk. Publishing from inside the walk is the
+/// same allocation failure. Field minting publishes
 /// the parent Size `init_size_descr`
 /// reads. `set_type_registry_close_hook` runs this before `freeze_types`,
 /// so the registry is still open when the tids are registered. CallDescr
 /// restoration stays on the first slot lookup.
 pub fn materialize_gccache_owned_descrs() {
     static ONCE: Once = Once::new();
-    // Always a fresh stack. The first caller is `force_start_tracing` /
-    // `bound_reached`, which for `frame_chain` is already inside recursive
-    // `CALL_ASSEMBLER`. `init_size_descr` itself is translation-time and
-    // does not run on that stack.
+    // Always a fresh stack. The boot caller is `init_jit_hooks`, but the
+    // close hook can still run this from inside recursive `CALL_ASSEMBLER`
+    // when a trace wins the race. `init_size_descr` itself is
+    // translation-time and does not run on that stack.
     ONCE.call_once(decode_kind0_descrs_off_caller_stack);
     // The decode `Once` may have run before a collector existed. Register
     // once the live collector is installed; a second call is a no-op.
@@ -1476,14 +1478,11 @@ fn register_synthetic_struct_tids() {
 /// [`crate::state::blackhole_control_opcodes`],
 /// [`crate::state::setup_indirectcalltargets`],
 /// [`crate::state::bytecode_for_address`].  An interpreter that never traces
-/// never runs it.  Kind-0 minting is the same shape:
-/// [`materialize_gccache_owned_descrs`] runs from the first
-/// `force_start_tracing` / `bound_reached`, on a fresh stack, before that
-/// walk records a descr.  `init_jit_hooks` does not call it, so
-/// `python -c ''` does not pay the bincode.  Publishing from inside the walk
-/// makes `frame_chain` allocate about 1.8 TiB.  The call below is the `Once`
-/// hitting an already-published table when the trace entry ran first, then
-/// the EffectInfo and Call passes.
+/// never runs it.  Kind-0 minting is not in that set:
+/// [`materialize_gccache_owned_descrs`] runs from `init_jit_hooks` before
+/// user code when the JIT is on.  Deferring it to the first trace makes
+/// `frame_chain` allocate about 2.2 TiB.  The call below is the `Once`
+/// hitting an already-published table, then the EffectInfo and Call passes.
 ///
 /// **Its size is not currently measured, and two obvious instruments cannot
 /// measure it.**  Allocation here is mmap-backed, so `malloc_history` / `heap`

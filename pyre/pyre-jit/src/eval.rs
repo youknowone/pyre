@@ -8157,10 +8157,9 @@ fn drive_unpack_iterable_trace(
 }
 
 /// `GcLLDescr_framework.init_size_descr` publishes Size tids before any
-/// trace. The runtime stand-in runs at the first trace entry, on a fresh
-/// stack, before that walk records a descr. Doing it from inside the walk
-/// makes `frame_chain` allocate ~1.8 TiB. A process that never traces does
-/// not pay the bincode.
+/// trace. `init_jit_hooks` is that stand-in. Paths that trace without
+/// having run it (a test, the wasm driver) still call this before
+/// `force_start_tracing` / `bound_reached`. After boot it is a `Once` no-op.
 fn publish_kind0_descrs_before_trace() {
     pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
 }
@@ -8180,11 +8179,16 @@ pub fn init_jit_hooks() {
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).
     init_gc_subsystem();
-    // Kind-0 descrs are not published here. `init_size_descr` runs at
-    // translation; the runtime stand-in is the first `force_start_tracing`,
-    // before that walk records a descr. Publishing them on this boot path
-    // makes `python -c ''` pay the bincode. Publishing them from inside the
-    // walk makes `frame_chain` allocate ~1.8 TiB.
+    // `init_size_descr` publishes Size tids before any trace. Doing that
+    // at the first `force_start_tracing` is too late: Windows
+    // `frame_chain` then allocates about 2.2 TiB and exits 3221226505.
+    // Publish the whole kind-0 table here, before user code. `PYRE_JIT=0`
+    // / `PYRE_NO_JIT` never trace, so they skip the bincode. The decode
+    // runs on a fresh stack; a trace that wins the race still hits the
+    // same `Once` from `publish_kind0_descrs_before_trace`.
+    if env_var_os("PYRE_NO_JIT").is_none() && env_var("PYRE_JIT").as_deref() != Some("0") {
+        publish_kind0_descrs_before_trace();
+    }
     // `warmstate.py JitCell.__init__` stores every green as an ordinary field
     // on a GC object, so a Ref green is both owned and forwarded with the
     // cell. Pyre's Rust-owned BaseJitCell uses fixed owner-root slots for the
