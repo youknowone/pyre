@@ -25,7 +25,8 @@ use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation};
 use crate::parse::CallPath;
 use crate::policy::JitPolicy;
-use crate::translator::backendopt::graphanalyze::AnalyzerResult;
+use crate::tool::algo::unionfind::UnionFind;
+use crate::translator::backendopt::graphanalyze::{AnalyzerResult, Dependency, DependencyTracker};
 
 // Decline-census gate names.  Declared in `crate::decline::gate` so a
 // gate name cannot exist without the recorder that consumes it; aliased
@@ -132,18 +133,49 @@ fn raise_class_can_raise(value: RaiseClass, ignore_memoryerror: bool) -> bool {
     }
 }
 
-/// RPython: DependencyTracker equivalent — caches transitive analysis results.
-///
-/// Each analyzer in RPython has its own `seen` set (via `analyze_direct_call`).
-/// We cache the final result per CallPath so repeated queries are O(1).
-#[derive(Default)]
+/// `GraphAnalyzer._analyzed_calls` (graphanalyze.py) of one bool analyzer
+/// over the flat codewriter graph: a `UnionFind` of `Dependency` cells, so
+/// every graph a walk enters keeps its verdict and a call cycle shares one.
+type AnalyzedCalls = UnionFind<CallPath, Dependency<bool>>;
+
+/// `DependencyTracker(self)` (graphanalyze.py), made fresh per top-level
+/// `analyze_direct_call`.
+type CallTracker = DependencyTracker<bool, CallPath>;
+
+/// `GraphAnalyzer.__init__`'s `self._analyzed_calls = UnionFind(lambda graph:
+/// Dependency(self))`.
+fn new_analyzed_calls() -> AnalyzedCalls {
+    UnionFind::new(|_| Dependency::new(bool::bottom_result()))
+}
+
+/// The `_analyzed_calls` of every effect analyzer `CallControl.__init__`
+/// builds (call.py).
 pub struct AnalysisCache {
-    can_raise: HashMap<CallPath, CanRaise>,
-    forces_virtualizable: HashMap<CallPath, bool>,
-    random_effects: HashMap<CallPath, bool>,
-    can_invalidate: HashMap<CallPath, bool>,
-    /// RPython: collect_analyzer (collectanalyze.py) — can this call trigger GC?
-    can_collect: HashMap<CallPath, bool>,
+    /// `raise_analyzer`.
+    can_raise: AnalyzedCalls,
+    /// `raise_analyzer_ignore_memoryerror`.
+    can_raise_ignore_memoryerror: AnalyzedCalls,
+    /// `virtualizable_analyzer`.
+    forces_virtualizable: AnalyzedCalls,
+    /// `randomeffects_analyzer`.
+    random_effects: AnalyzedCalls,
+    /// `quasiimmut_analyzer`.
+    can_invalidate: AnalyzedCalls,
+    /// `collect_analyzer` (collectanalyze.py) — can this call trigger GC?
+    can_collect: AnalyzedCalls,
+}
+
+impl Default for AnalysisCache {
+    fn default() -> Self {
+        Self {
+            can_raise: new_analyzed_calls(),
+            can_raise_ignore_memoryerror: new_analyzed_calls(),
+            forces_virtualizable: new_analyzed_calls(),
+            random_effects: new_analyzed_calls(),
+            can_invalidate: new_analyzed_calls(),
+            can_collect: new_analyzed_calls(),
+        }
+    }
 }
 
 /// RPython: readwrite_analyzer.analyze(op) return value.
@@ -1662,6 +1694,15 @@ pub struct CallControl {
     /// that graph drops exactly that entry. A graph that is not registered
     /// yet is left out of the map.
     readwrite_replay: std::cell::RefCell<HashMap<GraphKey, std::sync::Arc<ReadWriteReplay>>>,
+
+    /// The effect analyzers' `_analyzed_calls` results. `call.py`
+    /// builds `raise_analyzer`, `virtualizable_analyzer`,
+    /// `quasiimmut_analyzer`, `randomeffects_analyzer` and
+    /// `collect_analyzer` once in `CallControl.__init__`, so a callee's
+    /// verdict is computed once for the whole codewriting run, not once per
+    /// graph that calls it. A [`crate::jtransform::Transformer`] borrows
+    /// the cache while it rewrites one graph.
+    pub(crate) analysis_cache: AnalysisCache,
     /// Names passed to `compute_struct_size_with_path` while a
     /// `fielddescrof_concrete` miss is running. `None` when not recording.
     struct_size_log: std::cell::RefCell<Option<Vec<String>>>,
@@ -2299,6 +2340,7 @@ impl CallControl {
             callinfocollection: majit_ir::CallInfoCollection::new(),
             descr_indices: DescrIndexRegistry::default(),
             readwrite_replay: std::cell::RefCell::new(HashMap::new()),
+            analysis_cache: AnalysisCache::default(),
             struct_size_log: std::cell::RefCell::new(None),
             field_footprint: std::cell::RefCell::new(FieldDescrofMemoEntry::default()),
             fielddescrof_memo: std::cell::RefCell::new(HashMap::new()),
@@ -5779,14 +5821,10 @@ impl CallControl {
                 if crate::model::fn_const_segments(target).is_some() {
                     return None;
                 }
-                let path = CallPath::from_segments(segments.iter().map(String::as_str));
-                if self.has_callable_graph(&path) {
-                    return Some(path);
-                }
                 // The spelled path, even when no graph is registered:
                 // `fnaddr_for_target` and oopspec marks key on it.
                 // `graphs_from` still requires `has_callable_graph`.
-                Some(path)
+                Some(CallPath::from_segments(segments.iter().map(String::as_str)))
             }
             CallTarget::Method {
                 name,
@@ -6890,8 +6928,10 @@ impl CallControl {
     // The five `analyze_*` methods below walk
     // `crate::model::FunctionGraph` (the flat codewriter graph), inlining
     // the generic `GraphAnalyzer.analyze_direct_call` traversal
-    // (`graphanalyze.py`) into each per-analysis body with a
-    // bottom-on-cycle `seen` guard. The orthodox versions are
+    // (`graphanalyze.py`) into each per-analysis body. Each body enters
+    // and leaves the analyzer's `DependencyTracker` against that analyzer's
+    // `_analyzed_calls` (`AnalysisCache`), so a verdict outlives the query
+    // that computed it. The orthodox versions are
     // ported over the flowspace graph model: `RaiseAnalyzer`
     // (`backendopt/canraise.rs`), `CollectAnalyzer`
     // (`backendopt/collectanalyze.rs`), and the shared `GraphAnalyzer`
@@ -6914,12 +6954,10 @@ impl CallControl {
     fn analyze_can_raise_impl(
         &self,
         path: &CallPath,
-        seen: &mut HashSet<CallPath>,
+        seen: &mut CallTracker,
+        analyzed: &mut AnalyzedCalls,
         ignore_memoryerror: bool,
     ) -> bool {
-        if !seen.insert(path.clone()) {
-            return false; // cycle → bottom_result
-        }
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             // `canraise.py analyze_external_call`: getattr(fnobj, 'canraise', True)
@@ -6931,118 +6969,133 @@ impl CallControl {
                     .unwrap_or(true);
             }
         };
-        for block in &graph.blocks {
-            // RPython: analyze_simple_operation(op) per operation.
-            // canraise.py: LL_OPERATIONS[op.opname].canraise
-            for op in &block.operations {
-                let op_result = match &op.kind {
-                    OpKind::Call { target, .. } => {
-                        let callee_path = match self.target_to_path(target) {
-                            Some(p) => p,
-                            None => return true, // unresolvable → conservative
-                        };
-                        self.analyze_can_raise_impl(&callee_path, seen, ignore_memoryerror)
-                    }
-                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
-                        None => true, // graphanalyze.py → top_result()
-                        Some(graphs) => {
-                            for callee_path in graphs {
-                                if self.analyze_can_raise_impl(
+        if !seen.enter(path.clone(), analyzed) {
+            return seen.get_cached_result(path.clone(), analyzed);
+        }
+        let result = 'walk: {
+            for block in &graph.blocks {
+                // RPython: analyze_simple_operation(op) per operation.
+                // canraise.py: LL_OPERATIONS[op.opname].canraise
+                for op in &block.operations {
+                    let op_result = match &op.kind {
+                        OpKind::Call { target, .. } => {
+                            let callee_path = match self.target_to_path(target) {
+                                Some(p) => p,
+                                None => break 'walk true, // unresolvable → conservative
+                            };
+                            self.analyze_can_raise_impl(
+                                &callee_path,
+                                seen,
+                                analyzed,
+                                ignore_memoryerror,
+                            )
+                        }
+                        OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                            None => true, // graphanalyze.py → top_result()
+                            Some(graphs) => graphs.iter().any(|callee_path| {
+                                self.analyze_can_raise_impl(
                                     callee_path,
                                     seen,
+                                    analyzed,
                                     ignore_memoryerror,
-                                ) {
-                                    return true;
-                                }
-                            }
-                            false
-                        }
-                    },
-                    other => raise_class_can_raise(op_can_raise(other), ignore_memoryerror),
-                };
-                if op_result {
-                    return true;
+                                )
+                            }),
+                        },
+                        other => raise_class_can_raise(op_can_raise(other), ignore_memoryerror),
+                    };
+                    if op_result {
+                        break 'walk true;
+                    }
                 }
             }
-        }
-        // RPython `backendopt/canraise.py analyze_exceptblock_in_graph`
-        // only applies the re-raise suppression in the ignore-MemoryError
-        // analyzer. The normal analyzer always treats exceptblock exits as
-        // raising.
-        if graph
-            .blocks
-            .iter()
-            .flat_map(|block| block.exits.iter())
-            .any(|link| link.target == graph.exceptblock)
-        {
-            if ignore_memoryerror && exceptblock_is_reraise_of_caught_exception(graph) {
-                return false;
-            }
-            return true;
-        }
-        false
+            // RPython `backendopt/canraise.py analyze_exceptblock_in_graph`
+            // only applies the re-raise suppression in the ignore-MemoryError
+            // analyzer. The normal analyzer always treats exceptblock exits as
+            // raising.
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.exits.iter())
+                .any(|link| link.target == graph.exceptblock)
+                && !(ignore_memoryerror && exceptblock_is_reraise_of_caught_exception(graph))
+        };
+        seen.leave_with(path.clone(), result, analyzed);
+        result
     }
 
     /// RPython: VirtualizableAnalyzer.analyze() (effectinfo.py).
     ///
     /// analyze_simple_operation: op.opname in ('jit_force_virtualizable',
     ///                                         'jit_force_virtual')
-    fn analyze_forces_virtualizable(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
-        if !seen.insert(path.clone()) {
-            return false;
-        }
+    fn analyze_forces_virtualizable(
+        &self,
+        path: &CallPath,
+        seen: &mut CallTracker,
+        analyzed: &mut AnalyzedCalls,
+    ) -> bool {
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             // RPython: external call → analyze_external_call → bottom_result (False).
             // VirtualizableAnalyzer does not override analyze_external_call.
             None => return false,
         };
-        for block in &graph.blocks {
-            for op in &block.operations {
-                match &op.kind {
-                    // RPython: jit_force_virtualizable / jit_force_virtual
-                    // The analyzer runs over the rtyped graph, before
-                    // `jtransform.rewrite_op_jit_force_virtualizable` deletes
-                    // this marker from looked-inside code.  Match the upstream
-                    // opname leaf directly; `VableForce` is retained only for
-                    // already-transformed compatibility graphs.
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments, .. },
-                        ..
-                    } if segments.last().is_some_and(|leaf| {
-                        matches!(
-                            leaf.as_str(),
-                            "jit_force_virtualizable" | "jit_force_virtual"
-                        )
-                    }) =>
-                    {
-                        return true;
-                    }
-                    OpKind::VableForce { .. } => return true,
-                    OpKind::Call { target, .. } => {
-                        let callee_path = match self.target_to_path(target) {
-                            Some(p) => p,
-                            None => continue, // external call → False
-                        };
-                        if self.analyze_forces_virtualizable(&callee_path, seen) {
-                            return true;
+        if !seen.enter(path.clone(), analyzed) {
+            return seen.get_cached_result(path.clone(), analyzed);
+        }
+        let result = 'walk: {
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    match &op.kind {
+                        // RPython: jit_force_virtualizable / jit_force_virtual
+                        // The analyzer runs over the rtyped graph, before
+                        // `jtransform.rewrite_op_jit_force_virtualizable` deletes
+                        // this marker from looked-inside code.  Match the upstream
+                        // opname leaf directly; `VableForce` is retained only for
+                        // already-transformed compatibility graphs.
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments.last().is_some_and(|leaf| {
+                            matches!(
+                                leaf.as_str(),
+                                "jit_force_virtualizable" | "jit_force_virtual"
+                            )
+                        }) =>
+                        {
+                            break 'walk true;
                         }
-                    }
-                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
-                        None => return true, // BoolGraphAnalyzer.top_result()
-                        Some(graphs) => {
-                            for callee_path in graphs {
-                                if self.analyze_forces_virtualizable(callee_path, seen) {
-                                    return true;
-                                }
+                        OpKind::VableForce { .. } => break 'walk true,
+                        OpKind::Call { target, .. } => {
+                            let callee_path = match self.target_to_path(target) {
+                                Some(p) => p,
+                                None => continue, // external call → False
+                            };
+                            if self.analyze_forces_virtualizable(&callee_path, seen, analyzed) {
+                                break 'walk true;
                             }
                         }
-                    },
-                    _ => {}
+                        OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                            None => break 'walk true, // BoolGraphAnalyzer.top_result()
+                            Some(graphs) => {
+                                for callee_path in graphs {
+                                    if self.analyze_forces_virtualizable(
+                                        callee_path,
+                                        seen,
+                                        analyzed,
+                                    ) {
+                                        break 'walk true;
+                                    }
+                                }
+                            }
+                        },
+                        _ => {}
+                    }
                 }
             }
-        }
-        false
+            false
+        };
+        seen.leave_with(path.clone(), result, analyzed);
+        result
     }
 
     /// RPython: RandomEffectsAnalyzer.analyze() (effectinfo.py).
@@ -7065,10 +7118,12 @@ impl CallControl {
     /// In majit: functions without graphs are external calls — returns
     /// True if the external funcobj has `random_effects_on_gcobjs`, False
     /// otherwise.
-    fn analyze_random_effects(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
-        if !seen.insert(path.clone()) {
-            return false; // cycle → bottom_result
-        }
+    fn analyze_random_effects(
+        &self,
+        path: &CallPath,
+        seen: &mut CallTracker,
+        analyzed: &mut AnalyzedCalls,
+    ) -> bool {
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             None => {
@@ -7080,36 +7135,43 @@ impl CallControl {
                     .is_some_and(|f| f.random_effects_on_gcobjs);
             }
         };
+        if !seen.enter(path.clone(), analyzed) {
+            return seen.get_cached_result(path.clone(), analyzed);
+        }
         // RPython: analyze_simple_operation always returns False.
         // Only recursive calls into graphs can propagate random effects.
-        for block in &graph.blocks {
-            for op in &block.operations {
-                match &op.kind {
-                    OpKind::Call { target, .. } => {
-                        let callee_path = match self.target_to_path(target) {
-                            Some(p) => p,
-                            // Unresolvable target = external call → False
-                            None => continue,
-                        };
-                        if self.analyze_random_effects(&callee_path, seen) {
-                            return true;
-                        }
-                    }
-                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
-                        None => return true, // BoolGraphAnalyzer.top_result()
-                        Some(graphs) => {
-                            for callee_path in graphs {
-                                if self.analyze_random_effects(callee_path, seen) {
-                                    return true;
-                                }
+        let result = 'walk: {
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    match &op.kind {
+                        OpKind::Call { target, .. } => {
+                            let callee_path = match self.target_to_path(target) {
+                                Some(p) => p,
+                                // Unresolvable target = external call → False
+                                None => continue,
+                            };
+                            if self.analyze_random_effects(&callee_path, seen, analyzed) {
+                                break 'walk true;
                             }
                         }
-                    },
-                    _ => {}
+                        OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                            None => break 'walk true, // BoolGraphAnalyzer.top_result()
+                            Some(graphs) => {
+                                for callee_path in graphs {
+                                    if self.analyze_random_effects(callee_path, seen, analyzed) {
+                                        break 'walk true;
+                                    }
+                                }
+                            }
+                        },
+                        _ => {}
+                    }
                 }
             }
-        }
-        false
+            false
+        };
+        seen.leave_with(path.clone(), result, analyzed);
+        result
     }
 
     /// RPython: `GraphAnalyzer.explain_analyze_slowly` (graphanalyze.py)
@@ -7239,43 +7301,52 @@ impl CallControl {
     /// In majit: we don't have quasi-immutable ops in the model yet,
     /// so this always returns false. The transitive call check is still
     /// performed for future-proofing.
-    fn analyze_can_invalidate(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
-        if !seen.insert(path.clone()) {
-            return false;
-        }
+    fn analyze_can_invalidate(
+        &self,
+        path: &CallPath,
+        seen: &mut CallTracker,
+        analyzed: &mut AnalyzedCalls,
+    ) -> bool {
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             None => return false, // no graph → cannot invalidate (not conservative here)
         };
-        for block in &graph.blocks {
-            for op in &block.operations {
-                // RPython: jit_force_quasi_immutable → true
-                // majit: no such op yet, but check calls transitively
-                match &op.kind {
-                    OpKind::Call { target, .. } => {
-                        let callee_path = match self.target_to_path(target) {
-                            Some(p) => p,
-                            None => continue,
-                        };
-                        if self.analyze_can_invalidate(&callee_path, seen) {
-                            return true;
-                        }
-                    }
-                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
-                        None => return true, // BoolGraphAnalyzer.top_result()
-                        Some(graphs) => {
-                            for callee_path in graphs {
-                                if self.analyze_can_invalidate(callee_path, seen) {
-                                    return true;
-                                }
+        if !seen.enter(path.clone(), analyzed) {
+            return seen.get_cached_result(path.clone(), analyzed);
+        }
+        let result = 'walk: {
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    // RPython: jit_force_quasi_immutable → true
+                    // majit: no such op yet, but check calls transitively
+                    match &op.kind {
+                        OpKind::Call { target, .. } => {
+                            let callee_path = match self.target_to_path(target) {
+                                Some(p) => p,
+                                None => continue,
+                            };
+                            if self.analyze_can_invalidate(&callee_path, seen, analyzed) {
+                                break 'walk true;
                             }
                         }
-                    },
-                    _ => {}
+                        OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                            None => break 'walk true, // BoolGraphAnalyzer.top_result()
+                            Some(graphs) => {
+                                for callee_path in graphs {
+                                    if self.analyze_can_invalidate(callee_path, seen, analyzed) {
+                                        break 'walk true;
+                                    }
+                                }
+                            }
+                        },
+                        _ => {}
+                    }
                 }
             }
-        }
-        false
+            false
+        };
+        seen.leave_with(path.clone(), result, analyzed);
+        result
     }
 
     /// RPython: CollectAnalyzer (collectanalyze.py).
@@ -7292,10 +7363,12 @@ impl CallControl {
     /// - analyze_external_call (graphanalyze.py): bottom_result() (False).
     /// - _gctransformer_hint_cannot_collect_ (collectanalyze.py):
     ///   functions whose `func.cannot_collect` is set are known not to collect.
-    fn analyze_can_collect(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
-        if !seen.insert(path.clone()) {
-            return false;
-        }
+    fn analyze_can_collect(
+        &self,
+        path: &CallPath,
+        seen: &mut CallTracker,
+        analyzed: &mut AnalyzedCalls,
+    ) -> bool {
         // collectanalyze.py:15: _gctransformer_hint_cannot_collect_ → False
         if self.func_effects(path).is_some_and(|f| f.cannot_collect) {
             return false;
@@ -7325,54 +7398,61 @@ impl CallControl {
                     .is_some_and(|f| f.random_effects_on_gcobjs || f.canmallocgc);
             }
         };
-        for block in &graph.blocks {
-            for op in &block.operations {
-                // collectanalyze.py: analyze_simple_operation
-                // RPython checks: malloc/malloc_varsize with flavor='gc' → True
-                //                 LL_OPERATIONS[op.opname].canmallocgc → True
-                match &op.kind {
-                    // collectanalyze.py — `malloc` / `malloc_varsize`
-                    // with `flavor='gc'`. These four variants are that
-                    // operation on this side of jtransform: `New` and
-                    // `NewWithVtable` are `malloc(GcStruct, flavor='gc')`
-                    // (`rewrite_op_malloc`, jtransform.py),
-                    // `NewArrayClear` is `new_array_clear`
-                    // (jtransform.py), and `NewListClear` allocates
-                    // a GcStruct plus a cleared items array
-                    // (pyjitpl.py opimpl_newlist_clear). This graph model carries no
-                    // `flavor='raw'` allocation, so there is no flavour test
-                    // to make — every allocation op here is a GC one.
-                    OpKind::New { .. }
-                    | OpKind::NewWithVtable { .. }
-                    | OpKind::NewArray { .. }
-                    | OpKind::NewArrayClear { .. }
-                    | OpKind::NewListClear { .. } => return true,
-                    OpKind::Call { target, .. } => {
-                        // graphanalyze.py: analyze_direct_call — recurse
-                        let callee_path = match self.target_to_path(target) {
-                            Some(p) => p,
-                            // graphanalyze.py: external call → bottom_result (False)
-                            None => continue,
-                        };
-                        if self.analyze_can_collect(&callee_path, seen) {
-                            return true;
-                        }
-                    }
-                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
-                        None => return true, // BoolGraphAnalyzer.top_result()
-                        Some(graphs) => {
-                            for callee_path in graphs {
-                                if self.analyze_can_collect(callee_path, seen) {
-                                    return true;
-                                }
+        if !seen.enter(path.clone(), analyzed) {
+            return seen.get_cached_result(path.clone(), analyzed);
+        }
+        let result = 'walk: {
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    // collectanalyze.py: analyze_simple_operation
+                    // RPython checks: malloc/malloc_varsize with flavor='gc' → True
+                    //                 LL_OPERATIONS[op.opname].canmallocgc → True
+                    match &op.kind {
+                        // collectanalyze.py — `malloc` / `malloc_varsize`
+                        // with `flavor='gc'`. These four variants are that
+                        // operation on this side of jtransform: `New` and
+                        // `NewWithVtable` are `malloc(GcStruct, flavor='gc')`
+                        // (`rewrite_op_malloc`, jtransform.py),
+                        // `NewArrayClear` is `new_array_clear`
+                        // (jtransform.py), and `NewListClear` allocates
+                        // a GcStruct plus a cleared items array
+                        // (pyjitpl.py opimpl_newlist_clear). This graph model carries no
+                        // `flavor='raw'` allocation, so there is no flavour test
+                        // to make — every allocation op here is a GC one.
+                        OpKind::New { .. }
+                        | OpKind::NewWithVtable { .. }
+                        | OpKind::NewArray { .. }
+                        | OpKind::NewArrayClear { .. }
+                        | OpKind::NewListClear { .. } => break 'walk true,
+                        OpKind::Call { target, .. } => {
+                            // graphanalyze.py: analyze_direct_call — recurse
+                            let callee_path = match self.target_to_path(target) {
+                                Some(p) => p,
+                                // graphanalyze.py: external call → bottom_result (False)
+                                None => continue,
+                            };
+                            if self.analyze_can_collect(&callee_path, seen, analyzed) {
+                                break 'walk true;
                             }
                         }
-                    },
-                    _ => {}
+                        OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                            None => break 'walk true, // BoolGraphAnalyzer.top_result()
+                            Some(graphs) => {
+                                for callee_path in graphs {
+                                    if self.analyze_can_collect(callee_path, seen, analyzed) {
+                                        break 'walk true;
+                                    }
+                                }
+                            }
+                        },
+                        _ => {}
+                    }
                 }
             }
-        }
-        false
+            false
+        };
+        seen.leave_with(path.clone(), result, analyzed);
+        result
     }
 
     /// Cached version of _canraise for a CallTarget.
@@ -7380,22 +7460,19 @@ impl CallControl {
     /// RPython call.py — `_canraise()` returns the tri-state
     /// `{False, "mem", True}` collapsed here to [`CanRaise`].
     fn cached_can_raise_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> CanRaise {
-        if let Some(&result) = cache.can_raise.get(path) {
-            return result;
-        }
-        let mut seen = HashSet::new();
-        let result = if !self.analyze_can_raise_impl(path, &mut seen, false) {
+        if !self.analyze_can_raise_impl(path, &mut CallTracker::new(), &mut cache.can_raise, false)
+        {
             CanRaise::No
+        } else if self.analyze_can_raise_impl(
+            path,
+            &mut CallTracker::new(),
+            &mut cache.can_raise_ignore_memoryerror,
+            true,
+        ) {
+            CanRaise::Yes
         } else {
-            let mut seen_ignore_memoryerror = HashSet::new();
-            if self.analyze_can_raise_impl(path, &mut seen_ignore_memoryerror, true) {
-                CanRaise::Yes
-            } else {
-                CanRaise::MemoryErrorOnly
-            }
-        };
-        cache.can_raise.insert(path.clone(), result);
-        result
+            CanRaise::MemoryErrorOnly
+        }
     }
 
     fn cached_can_raise(&self, target: &CallTarget, cache: &mut AnalysisCache) -> CanRaise {
@@ -7429,13 +7506,11 @@ impl CallControl {
     /// Cached version of analyze_forces_virtualizable for a CallTarget.
     /// RPython: VirtualizableAnalyzer external calls → bottom_result (False).
     fn cached_forces_virtualizable_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
-        if let Some(&result) = cache.forces_virtualizable.get(path) {
-            return result;
-        }
-        let mut seen = HashSet::new();
-        let result = self.analyze_forces_virtualizable(path, &mut seen);
-        cache.forces_virtualizable.insert(path.clone(), result);
-        result
+        self.analyze_forces_virtualizable(
+            path,
+            &mut CallTracker::new(),
+            &mut cache.forces_virtualizable,
+        )
     }
 
     fn cached_forces_virtualizable(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
@@ -7463,13 +7538,7 @@ impl CallControl {
     /// Cached version of analyze_random_effects for a CallTarget.
     /// RPython: RandomEffectsAnalyzer defaults to False for external calls.
     fn cached_random_effects_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
-        if let Some(&result) = cache.random_effects.get(path) {
-            return result;
-        }
-        let mut seen = HashSet::new();
-        let result = self.analyze_random_effects(path, &mut seen);
-        cache.random_effects.insert(path.clone(), result);
-        result
+        self.analyze_random_effects(path, &mut CallTracker::new(), &mut cache.random_effects)
     }
 
     fn cached_random_effects(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
@@ -7496,13 +7565,7 @@ impl CallControl {
 
     /// Cached version of analyze_can_invalidate for a CallTarget.
     fn cached_can_invalidate_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
-        if let Some(&result) = cache.can_invalidate.get(path) {
-            return result;
-        }
-        let mut seen = HashSet::new();
-        let result = self.analyze_can_invalidate(path, &mut seen);
-        cache.can_invalidate.insert(path.clone(), result);
-        result
+        self.analyze_can_invalidate(path, &mut CallTracker::new(), &mut cache.can_invalidate)
     }
 
     fn cached_can_invalidate(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
@@ -7531,13 +7594,7 @@ impl CallControl {
     /// RPython: collect_analyzer.analyze(op, self.seen_gc) (collectanalyze.py).
     /// graphanalyze.py: analyze_external_call → bottom_result() (False).
     fn cached_can_collect_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
-        if let Some(&result) = cache.can_collect.get(path) {
-            return result;
-        }
-        let mut seen = HashSet::new();
-        let result = self.analyze_can_collect(path, &mut seen);
-        cache.can_collect.insert(path.clone(), result);
-        result
+        self.analyze_can_collect(path, &mut CallTracker::new(), &mut cache.can_collect)
     }
 
     fn cached_can_collect(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
@@ -8121,7 +8178,7 @@ fn analyze_readwrite(
     };
     let mut analysis = WriteAnalysis::bottom_result();
     let mut minted = MintedDescrs::default();
-    let mut seen = HashSet::new();
+    let mut seen = rustc_hash::FxHashSet::default();
     let mut is_top = false;
     apply_readwrite_replay(
         &path,
@@ -8152,7 +8209,7 @@ fn analyze_readwrite_indirect_family(
     };
     let mut analysis = WriteAnalysis::bottom_result();
     let mut minted = MintedDescrs::default();
-    let mut seen = HashSet::new();
+    let mut seen = rustc_hash::FxHashSet::default();
     let mut is_top = false;
     for path in graphs {
         apply_readwrite_replay(
@@ -8686,7 +8743,7 @@ fn apply_readwrite_replay(
     function_graphs: &GraphStore,
     cc: &CallControl,
     descr_indices: &DescrIndexRegistry,
-    seen: &mut HashSet<CallPath>,
+    seen: &mut rustc_hash::FxHashSet<CallPath>,
     acc: &mut WriteAnalysis,
     minted: &mut MintedDescrs,
     is_top: &mut bool,
@@ -11268,9 +11325,8 @@ mod tests {
             let path = CallPath::from_segments(["allocating"]);
             cc.register_function_graph(path.clone(), graph);
 
-            let mut seen = HashSet::new();
             assert!(
-                cc.analyze_can_collect(&path, &mut seen),
+                cc.analyze_can_collect(&path, &mut CallTracker::new(), &mut new_analyzed_calls()),
                 "a graph whose only operation is {label} must analyse as collecting"
             );
         }
@@ -11278,9 +11334,8 @@ mod tests {
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["allocation_free"]);
         cc.register_function_graph(path.clone(), simple_graph("allocation_free"));
-        let mut seen = HashSet::new();
         assert!(
-            !cc.analyze_can_collect(&path, &mut seen),
+            !cc.analyze_can_collect(&path, &mut CallTracker::new(), &mut new_analyzed_calls()),
             "a graph with no allocation and no call must analyse as not collecting"
         );
     }
@@ -11336,23 +11391,20 @@ mod tests {
         };
 
         let cc = build(false);
-        let mut seen = HashSet::new();
         assert!(
-            !cc.analyze_can_collect(&caller, &mut seen),
+            !cc.analyze_can_collect(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
             "an undeclared graph-less callee must answer `false` — otherwise \
              the positive case below would not be attributable to the mark"
         );
 
         let cc = build(true);
-        let mut seen = HashSet::new();
         assert!(
-            cc.analyze_can_collect(&caller, &mut seen),
+            cc.analyze_can_collect(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
             "collectanalyze.py:27-33 — a caller of a graph-less callee declared \
              `canmallocgc` collects"
         );
-        let mut seen = HashSet::new();
         assert!(
-            !cc.analyze_random_effects(&caller, &mut seen),
+            !cc.analyze_random_effects(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
             "effectinfo.py:417-418 — the same allocation answers \
              `RandomEffectsAnalyzer` False, so an elidable caller stays legal"
         );
@@ -11617,7 +11669,11 @@ mod tests {
             graph.set_return(graph.startblock, None);
             let path = CallPath::from_segments(["entry"]);
             cc.register_function_graph(path.clone(), graph);
-            assert!(!cc.analyze_forces_virtualizable(&path, &mut HashSet::new()));
+            assert!(!cc.analyze_forces_virtualizable(
+                &path,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls()
+            ));
         }
     }
 
@@ -12237,7 +12293,7 @@ mod tests {
         assert!(
             cache
                 .can_raise
-                .contains_key(&CallPath::from_segments(["raiser"]))
+                .contains(&CallPath::from_segments(["raiser"]))
         );
 
         let r2 = cc._canraise(&target, &mut cache);
@@ -12360,8 +12416,12 @@ mod tests {
         let path = CallPath::from_segments(["reraise_only"]);
         cc.register_function_graph(path.clone(), reraise_only_graph("reraise_only"));
 
-        let mut seen = HashSet::new();
-        assert!(!cc.analyze_can_raise_impl(&path, &mut seen, true));
+        assert!(!cc.analyze_can_raise_impl(
+            &path,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls(),
+            true
+        ));
     }
 
     /// Graph-model unification (test-only): prove the orthodox

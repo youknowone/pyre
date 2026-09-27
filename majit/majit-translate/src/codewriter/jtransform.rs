@@ -630,8 +630,9 @@ pub struct Transformer<'a> {
     notes: Vec<GraphTransformNote>,
     vable_rewrites: usize,
     calls_classified: usize,
-    /// RPython: DependencyTracker — caches transitive analysis results.
-    /// Shared across all getcalldescr() calls within this transform pass.
+    /// The effect analyzers' `_analyzed_calls`. [`Self::transform`] borrows
+    /// [`crate::call::CallControl::analysis_cache`] into this slot for the
+    /// duration of one graph and hands it back afterwards.
     analysis_cache: crate::call::AnalysisCache,
     /// RPython `Transformer.cpu.rtyper.exceptiondata.fn_exception_match`.
     /// Threaded for `constant_fold_ll_issubclass`; `None` is the
@@ -2013,6 +2014,17 @@ impl<'a> Transformer<'a> {
     /// to hand-set kinds call `FunctionGraph::set_concretetype_of_inline(&var, ct)`
     /// directly.
     pub fn transform(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
+        if let Some(cc) = self.callcontrol.as_deref_mut() {
+            self.analysis_cache = std::mem::take(&mut cc.analysis_cache);
+        }
+        let result = self.transform_body(graph);
+        if let Some(cc) = self.callcontrol.as_deref_mut() {
+            cc.analysis_cache = std::mem::take(&mut self.analysis_cache);
+        }
+        result
+    }
+
+    fn transform_body(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
         let mut rewritten = graph.clone();
         join_blocks(&mut rewritten);
 
