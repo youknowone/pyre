@@ -1390,29 +1390,53 @@ fn decode_kind0_descrs_off_caller_stack() {
 
 fn decode_kind0_descrs() {
     let index = descrs_index();
-    // Every Field of a struct names the same parent layout, which carries
-    // the struct's whole `all_fielddescrs`, and a struct's Fields mostly
-    // sit in consecutive slots.  Reuse the previous slot's layout when it
-    // is the same one: at most one decoded layout is held beyond the slot
-    // that uses it, so the transient stays bounded (see `descr_layout_at`).
-    let mut last_layout: Option<(usize, std::sync::Arc<majit_jitcode::jitcode::BhSizeSpec>)> = None;
+    // Every Field of a struct names the same parent layout, which carries the
+    // struct's whole `all_fielddescrs`, and most kind-0 slots name one.
+    // `descrs_index().parent_layouts` says which before anything is decoded, so
+    // hold each layout for exactly the span of slots that still name it and
+    // decode it once — `GcCache._cache_size` keyed by STRUCT, which
+    // `get_field_descr` hits for every field of the same struct. Reusing only
+    // the immediately preceding slot's layout decoded 1,084 layouts for 758
+    // distinct ones, 354 KB of repeat bincode, because a struct's fields are
+    // not all adjacent. The span bound is what keeps the transient small: 39
+    // layouts and 44 KB of wire bytes are live at the peak, and the last slot
+    // naming a layout drops it (see `descr_layout_at` for why none is kept
+    // past this pass).
+    //
+    // Both tables are indexed by layout, not keyed: the layout space is the
+    // dense `descr_layouts.bin` index, so a slot per layout is smaller than a
+    // map entry and needs no hashing.
+    let n_layouts = descr_layout_offsets().len() - 1;
+    let mut pending = vec![0u32; n_layouts];
+    for (&kind, &layout) in index.kinds.iter().zip(index.parent_layouts.iter()) {
+        if kind == 0 && layout != u32::MAX {
+            pending[layout as usize] += 1;
+        }
+    }
+    let mut layouts: Vec<Option<std::sync::Arc<majit_jitcode::jitcode::BhSizeSpec>>> =
+        vec![None; n_layouts];
     for (i, kind) in index.kinds.iter().copied().enumerate() {
         if kind != 0 {
             continue;
         }
-        let bh = load_descr_with_parent(i, |layout| match &last_layout {
-            Some((last, spec)) if *last == layout => spec.clone(),
-            _ => {
-                let spec = descr_layout_at(layout);
-                last_layout = Some((layout, spec.clone()));
-                spec
-            }
+        let bh = load_descr_with_parent(i, |layout| {
+            layouts[layout]
+                .get_or_insert_with(|| descr_layout_at(layout))
+                .clone()
         });
         debug_assert!(!matches!(
             bh,
             BhDescr::Call { .. } | BhDescr::JitCode { .. }
         ));
         crate::descr::make_descr_from_bh(&bh);
+        let layout = index.parent_layouts[i];
+        if layout != u32::MAX {
+            let remaining = &mut pending[layout as usize];
+            *remaining -= 1;
+            if *remaining == 0 {
+                layouts[layout as usize] = None;
+            }
+        }
     }
 }
 
