@@ -1359,15 +1359,6 @@ impl Bookkeeper {
         if let Some(existing) = self.descs.borrow().get(pyobj) {
             return Ok(existing.clone());
         }
-        // A SyntheticTransparentCtor is a call-site marker around the ONE
-        // canonical class object, not another class.  Reuse the target's
-        // ClassDesc exactly; ClassesPBCRepr later reads the wrapper constant to
-        // select rtype_new_instance without the optional __init__ dispatch.
-        if let Some(class_obj) = pyobj.transparent_class_target() {
-            let entry = self.getdesc(class_obj)?;
-            self.descs.borrow_mut().insert(pyobj.clone(), entry.clone());
-            return Ok(entry);
-        }
         let entry = if pyobj.is_user_function() {
             // upstream `newfuncdesc` already returns a MemoDesc or
             // FunctionDesc per the specializer.
@@ -3850,7 +3841,7 @@ impl Bookkeeper {
         // upstream bookkeeper.py:315-316 — `elif tp is type: result =
         // SomeConstantType(x, self)`. Implemented as a constant
         // SomePBC over the real [`ClassDesc`] returned by [`Self::getdesc`].
-        if obj.is_class() || obj.transparent_class_target().is_some() {
+        if obj.is_class() {
             let entry = self.getdesc(obj)?;
             let mut pbc = SomePBC::new(vec![entry], false);
             pbc.base.const_box = Some(Constant::new(raw.clone()));
