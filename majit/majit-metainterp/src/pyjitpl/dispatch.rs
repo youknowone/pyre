@@ -1672,6 +1672,13 @@ impl Drop for ActiveStandardVirtualizable {
     }
 }
 
+/// `abort/` and `abort/>r` both bail the trace out. The ref-result form
+/// is what the assembler emits when the unsupported op still owns an SSA
+/// result (`insns.rs` `BC_ABORT_RESULT_R`).
+fn trace_abort_bytecode(bytecode: u8) -> bool {
+    bytecode == jitcode::insns::BC_ABORT || bytecode == jitcode::insns::BC_ABORT_RESULT_R
+}
+
 impl<'mi, S, R> JitCodeMachine<'mi, S, R>
 where
     S: JitCodeSym,
@@ -11044,8 +11051,16 @@ where
                 self.pop_exception_frame(ctx);
                 return self.unwind_to_exception_handler(ctx);
             }
-            jitcode::insns::BC_ABORT => {
-                self.log_bytecode_abort("BC_ABORT");
+            jitcode::insns::BC_ABORT | jitcode::insns::BC_ABORT_RESULT_R => {
+                debug_assert!(trace_abort_bytecode(bytecode));
+                // `abort/>r` is the same bailout as `abort/` (`handler_abort_result_marker_r`).
+                // The destination byte is not consumed: the frame is left
+                // immediately, matching the blackhole handler.
+                self.log_bytecode_abort(if bytecode == jitcode::insns::BC_ABORT {
+                    "BC_ABORT"
+                } else {
+                    "BC_ABORT_RESULT_R"
+                });
                 // A helper's `BC_ABORT` is a compile-time "this path cannot
                 // be traced". The reconstructed registers that reached it
                 // will reach it again; retrying rebuilds the same abort.
@@ -11478,7 +11493,6 @@ where
         TraceAction::Continue
     }
 
-    /// `pyjitpl.py` `MIFrame.setup_call` writes the callee's arguments when
     /// `MetaInterp.newframe` creates the frame. A per-arm sub-JitCode also
     /// reads the portal identity slots, which are not inline-call arguments,
     /// so those slots are seeded from `__JitSym` before the frame is pushed
@@ -13692,6 +13706,15 @@ mod tests {
 
     extern "C" fn scale_f64(x: f64, k: i64) -> f64 {
         x * k as f64
+    }
+
+    #[test]
+    fn ref_result_abort_bails_the_trace_like_abort() {
+        assert!(super::trace_abort_bytecode(
+            majit_jitcode::insns::BC_ABORT_RESULT_R
+        ));
+        assert!(super::trace_abort_bytecode(majit_jitcode::insns::BC_ABORT));
+        assert!(!super::trace_abort_bytecode(majit_jitcode::insns::BC_INT_ADD));
     }
 
     #[test]
