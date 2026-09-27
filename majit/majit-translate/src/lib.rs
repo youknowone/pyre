@@ -644,6 +644,7 @@ pub fn analyze_multiple_pipeline_with_modules(
         fnaddr_bindings,
         &[],
         static_addrs,
+        None,
     )
 }
 
@@ -653,6 +654,9 @@ pub fn analyze_multiple_pipeline_with_modules(
 /// `MAJIT_MIR_FRONTEND_LLBC` compatibility environment variable. The supplied
 /// paths are the complete translation input and never fall back to the
 /// environment variable.
+///
+/// `policy` is the target's `jitpolicy` (`driver.py task_pyjitpl_lltype`
+/// hands `self.jitpolicy` to `apply_jit`); `None` is `JitPolicy()`.
 pub fn analyze_multiple_pipeline_from_llbc_with_modules(
     llbc_paths: &[&str],
     module_paths: &[&str],
@@ -661,6 +665,7 @@ pub fn analyze_multiple_pipeline_from_llbc_with_modules(
     vinfo_factory: &VirtualizableInfoFactory<'_>,
     fnaddr_bindings: &FnAddrBindings<'_>,
     static_addrs: HostStaticAddrs<'_>,
+    policy: Option<&mut dyn policy::JitPolicy>,
 ) -> pipeline::ProgramPipelineResult {
     assert!(
         !llbc_paths.is_empty(),
@@ -676,6 +681,7 @@ pub fn analyze_multiple_pipeline_from_llbc_with_modules(
         fnaddr_bindings,
         &[],
         static_addrs,
+        policy,
     )
 }
 
@@ -1053,6 +1059,7 @@ pub fn analyze_helper_pipeline_with_modules(
         fnaddr_bindings,
         impl_fnaddr_bindings,
         static_addrs,
+        None,
     )
 }
 
@@ -1074,6 +1081,7 @@ fn analyze_pipeline_from_module_paths(
     fnaddr_bindings: &FnAddrBindings<'_>,
     impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
     static_addrs: HostStaticAddrs<'_>,
+    policy: Option<&mut dyn policy::JitPolicy>,
 ) -> pipeline::ProgramPipelineResult {
     // Dump the decline census when this run ends — on the normal return
     // AND on the unwind, since a pipeline that panics on an undigestible
@@ -2467,11 +2475,20 @@ fn analyze_pipeline_from_module_paths(
     ] {
         call_control.mark_canmallocgc(parse::CallPath::from_segments(["majit_gc", gc_entry]));
     }
-    let mut policy = policy::DefaultJitPolicy::new();
+    // warmspot.py `WarmRunnerDesc.__init__`: `if policy is None: policy =
+    // JitPolicy()`.
+    let mut default_policy;
+    let policy: &mut dyn policy::JitPolicy = match policy {
+        Some(policy) => policy,
+        None => {
+            default_policy = policy::DefaultJitPolicy::new();
+            &mut default_policy
+        }
+    };
     if helper_roots.is_empty() {
-        call_control.find_all_graphs(&mut policy);
+        call_control.find_all_graphs(policy);
     } else {
-        call_control.find_helper_graphs(&mut policy, helper_roots);
+        call_control.find_helper_graphs(policy, helper_roots);
     }
     prof.mark("  find_all_graphs");
     prof.note(|| {

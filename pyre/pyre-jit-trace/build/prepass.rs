@@ -15,6 +15,8 @@ mod codegen_cache;
 mod llbc_fingerprint;
 #[path = "../src/pypyjit_driver_layout.rs"]
 mod pypyjit_driver_layout;
+#[path = "../../pyre-interpreter/src/module/pypyjit/policy.rs"]
+mod pypyjit_policy;
 #[path = "../src/ullbc_semantic.rs"]
 mod ullbc_semantic;
 #[path = "../src/virtualizable_spec.rs"]
@@ -1328,6 +1330,8 @@ fn real_main() {
     let llbc_path_refs: Vec<&str> = llbc_paths.iter().map(String::as_str).collect();
     let generate_into = |out_dir: &str| {
         majit_ir::descr::reset_field_mint_census();
+        // `targetpypystandalone.py jitpolicy`: `return PyPyJitPolicy(pypy_hooks)`.
+        let mut jitpolicy = pypyjit_policy::PyPyJitPolicy::new();
         let pipeline = majit_translate::analyze_multiple_pipeline_from_llbc_with_modules(
             &llbc_path_refs,
             &module_path_refs,
@@ -1336,6 +1340,7 @@ fn real_main() {
             vinfo_factory,
             &fnaddr_bindings,
             static_addrs,
+            Some(&mut jitpolicy),
         );
 
         // Generate tracing code from the canonical graph-first analysis result.

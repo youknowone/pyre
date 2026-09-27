@@ -1471,6 +1471,7 @@ fn semantic_function_from_lowered(
         graph.with_source_identity(source_identity)
     };
     let mut graph = graph.with_fun_decl_id(fd.def_id);
+    graph.func.module = fundecl_module(fd);
     // Trait-impl methods carry the trait leaf so registration calls
     // `register_trait_method`. Inherent impls leave `trait_root` empty.
     // Trait-default bodies match the parent ident against `known_trait_names`.
@@ -30246,6 +30247,32 @@ fn mark_local_def(local_idx: usize, defs: &mut bit_set::BitSet, n_locals: usize)
 ///
 /// Mirrors the instance method line-for-line; any change here must be
 /// kept in sync with the `&self` version.
+/// `func.__module__` for a lowered function: the crate-qualified leading
+/// module segments of its Charon name, spelled as `module_path!()` spells
+/// them (`pyre_module::module::unicodedata`).
+///
+/// A method's name is `[crate, mod.., <Impl>, method]` and ends its module
+/// at the impl segment; a free function's is `[crate, mod.., fn]` and ends
+/// it at the leaf.  Charon's `Ident` segments do not say whether they name
+/// a module, so an item nested under another `Ident` — a trait default
+/// method, a closure, a fn inside a fn — keeps that enclosing segment.
+/// `JitPolicy.look_inside_function` subclasses test the path by prefix, and
+/// a trailing segment does not move a prefix test.
+fn fundecl_module(fd: &FunDecl) -> Option<String> {
+    let name = &fd.item_meta.name;
+    let mut segs: Vec<&str> = name
+        .iter()
+        .map_while(|seg| match seg {
+            NameSeg::Ident { ident: (s, _) } => Some(s.as_str()),
+            NameSeg::Other(_) => None,
+        })
+        .collect();
+    if segs.len() == name.len() {
+        segs.pop();
+    }
+    (!segs.is_empty()).then(|| segs.join("::"))
+}
+
 fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, String)> {
     let segs = &fd.item_meta.name;
     let last_idx = segs
@@ -57345,6 +57372,48 @@ mod tests {
                 .flat_map(|b| &b.operations)
                 .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
             "{name}: successful get arm must read the guarded item"
+        );
+    }
+
+    /// `func.__module__`: a free function's module ends at its leaf, a
+    /// method's at its impl segment, and the crate stays on the path.
+    #[test]
+    #[ignore]
+    fn fundecl_module_is_the_crate_qualified_defining_module() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-module.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let module_of = |name: &str| {
+            let fd = llbc
+                .iter_local_fns()
+                .find(|fd| fd.item_meta.name_path() == name)
+                .unwrap_or_else(|| panic!("no fun decl {name}"));
+            super::fundecl_module(fd)
+        };
+        assert_eq!(
+            module_of("pyre_module::module::unicodedata::char_and_default").as_deref(),
+            Some("pyre_module::module::unicodedata")
+        );
+        let method = llbc
+            .iter_local_fns()
+            .find(|fd| {
+                fd.item_meta
+                    .name_path()
+                    .starts_with("pyre_module::module::")
+                    && fd
+                        .item_meta
+                        .name
+                        .iter()
+                        .any(|seg| matches!(seg, NameSeg::Other(_)))
+            })
+            .expect("a method under pyre_module::module");
+        let module = super::fundecl_module(method).expect("method module");
+        let name_path = method.item_meta.name_path();
+        assert!(
+            name_path.starts_with(&format!("{module}::<")),
+            "{name_path}: module {module} must end at the impl segment"
         );
     }
 

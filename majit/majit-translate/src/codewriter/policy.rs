@@ -8,32 +8,23 @@
 //! one method.  In Rust we use a trait + state struct so subclasses share
 //! the bookkeeping fields.
 //!
-//! ## Parity shape: allowlist via registration, not blacklist via module name
+//! ## Subclasses
 //!
-//! Upstream `pypy/module/pypyjit/policy.py::PyPyJitPolicy.look_inside_function`
-//! returns `False` for functions whose Python module matches a rejection
-//! list (`pypy.interpreter.astcompiler.*`, `rpython.rlib.rlocale`, …). The
-//! base `JitPolicy.look_inside_function` defaults to `True`; the PyPy
-//! subclass flips that to `False` for the excluded modules. Un-excluded
-//! functions inline; excluded functions stay at the residual-call
-//! boundary.
+//! `pypy/module/pypyjit/policy.py` `PyPyJitPolicy` overrides
+//! `look_inside_function` to reject whole interpreter modules by
+//! `func.__module__`.  Its pyre port lives beside the interpreter
+//! (`pyre-interpreter/src/module/pypyjit/policy.rs`) and reaches the
+//! translator through `analyze_multiple_pipeline_from_llbc_with_modules`'s
+//! `policy` argument, the way `targetpypystandalone.py jitpolicy` hands it to
+//! `apply_jit`.  It reads the module off `graph.func.module`
+//! ([`crate::model::FuncEffects::module`]), which the front end stamps from
+//! each function's Charon name.
 //!
-//! Pyre converges on the same observable behaviour through a different
-//! mechanism: the `JIT_GRAPH_MODULES` whitelist in
-//! `generated.rs` plus `CallControl::register_function_graph` plays the
-//! role of the allowed-module set. A callee whose `CallPath` is not
-//! present in `CallControl::function_graphs` is treated as residual at
-//! BFS time (`call.rs::find_all_graphs_bfs` only pulls callees into
-//! `candidate_graphs` when a matching graph exists).
-//!
-//! Consequence: pyre does **not** need a `PyPyJitPolicy`-style subclass
-//! listing excluded Rust modules. The analysed-source set is the policy;
-//! anything outside it is residual by construction. Per-graph hints
-//! (`_elidable_function_`, `_jit_look_inside_`, `_jit_unroll_safe_`,
-//! `access_directly`) still apply identically to upstream — they filter
-//! allowed graphs further.
-//!
-//! The contract is locked down by
+//! A callee with no registered graph never reaches this policy:
+//! `call.py guess_call_kind` answers `'residual'` for a funcobj without a
+//! graph, and `find_all_graphs` only enqueues callees that have one.  In pyre
+//! that covers every body outside the lowered crate set (Rust stdlib,
+//! unextracted crates).  The contract is pinned by
 //! `tests/test_phase_d_find_all_graphs_parity.rs::
 //! find_all_graphs_leaves_unregistered_targets_as_residual`.
 

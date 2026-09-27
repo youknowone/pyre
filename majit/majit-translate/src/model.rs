@@ -6934,6 +6934,12 @@ pub struct FuncEffects {
     /// portal.  The backend inliner reads this off the function object; it is
     /// separate from JIT policy hints such as `_jit_unroll_safe_`.
     pub dont_inline: bool,
+    /// `func.__module__`, the defining module's path as Rust's
+    /// `module_path!()` spells it (`pyre_module::module::unicodedata`).
+    /// `JitPolicy.look_inside_function` subclasses read it
+    /// (`pypy/module/pypyjit/policy.py` `PyPyJitPolicy`); `None` stands
+    /// for the absent attribute that `func.__module__ or '?'` covers.
+    pub module: Option<String>,
 }
 
 impl Default for FuncEffects {
@@ -6952,6 +6958,7 @@ impl Default for FuncEffects {
             loop_invariant: false,
             close_stack: false,
             dont_inline: false,
+            module: None,
         }
     }
 }
@@ -6981,6 +6988,9 @@ impl FuncEffects {
         self.loop_invariant |= other.loop_invariant;
         self.close_stack |= other.close_stack;
         self.dont_inline |= other.dont_inline;
+        if other.module.is_some() {
+            self.module = other.module.clone();
+        }
     }
 }
 
@@ -8414,6 +8424,7 @@ mod tests {
             loop_invariant: true,
             close_stack: true,
             dont_inline: true,
+            module: Some("m".to_string()),
             ..FuncEffects::default()
         };
 
