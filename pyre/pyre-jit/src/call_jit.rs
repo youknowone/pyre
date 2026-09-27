@@ -2077,7 +2077,6 @@ fn ca_complete_after_bridge_walk(
 fn jit_blackhole_resume_from_guard(
     descr_addr: usize,
     deadframe: *mut majit_backend::jitframe::JitFrame,
-    guard_exc: i64,
 ) -> Option<i64> {
     let ca_adopted_frame = CA_WALK_ADOPTED_FRAME.with(|c| c.replace(0));
     let ca_finished_frame = CA_WALK_FINISHED_FRAME.with(|c| c.replace(0));
@@ -2109,8 +2108,11 @@ fn jit_blackhole_resume_from_guard(
         pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_reset();
         return None;
     }
+    // `llmodel.py grab_exc_value`: read `jf_guard_exc`. The slot stays put;
+    // `jitframe_trace` is the root across this resume.
+    let guard_exc = unsafe { (*deadframe).jf_guard_exc as i64 };
 
-    // compile.py:710-716 `resume_in_blackhole(descr, deadframe)` parity:
+    // compile.py `resume_in_blackhole(descr, deadframe)`:
     // recover the failed descr from `descr_addr` (history.py:125
     // `cpu.get_latest_descr` is the C-ABI carrier) and derive
     // (trace_id, fail_index) from descr identity.  The recovery is
@@ -2217,14 +2219,12 @@ fn jit_blackhole_resume_from_guard(
         // resume.py _prepare_pendingfields(storage.rd_pendingfields):
         // deferred field writes must be replayed before consume_vref_and_vable.
         // blackhole.py `current_exc = _prepare_resume_from_failure(
-        // guard_opnum, deadframe)`. The backend trampoline grabbed
-        // `jf_guard_exc` off the jitframe (`cpu.grab_exc_value`,
-        // llmodel.py) and threaded it through the C-ABI `guard_exc`
-        // parameter, so a GUARD_NO_EXCEPTION / GUARD_EXCEPTION /
-        // GUARD_NOT_FORCED failure inside a CALL_ASSEMBLER-entered
-        // callee delivers its pending exception to the blackhole resume
-        // instead of resuming the no-exception continuation with a NULL
-        // result.
+        // guard_opnum, deadframe)`. `guard_exc` is `cpu.grab_exc_value`
+        // (`llmodel.py`) read off this deadframe above, so a
+        // GUARD_NO_EXCEPTION / GUARD_EXCEPTION / GUARD_NOT_FORCED failure
+        // inside a CALL_ASSEMBLER-entered callee delivers its pending
+        // exception to the blackhole resume instead of resuming the
+        // no-exception continuation with a NULL result.
         // compile.py `ResumeGuardForcedDescr.handle_fail` fishes the
         // cache `handle_async_forcing` saved via `cpu.get_savedata_ref(deadframe)`.
         let savedata = crate::eval::savedata_from_jitframe(deadframe);
@@ -4854,12 +4854,10 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             mut guard_exc,
             savedata,
         } => {
-            // `grab_exc_value` cleared the only root for the pending exception
-            // (dynasm `ca_helper`, llmodel.py); root the bare carrier while
-            // the bridge-compile hook and the blackhole run — both may allocate,
-            // and a moving collection would otherwise leave `guard_exc` stale.
-            // Inert today (wasm host allocations never collect) but keeps the
-            // carrier rooted at parity with dynasm if that invariant changes.
+            // This `guard_exc` is a copy of `grab_exc_value` (`llmodel.py`).
+            // The wasm frame's own slot is not what this function holds, so
+            // root the copy while the bridge-compile hook and the blackhole
+            // run. Inert today (wasm host allocations never collect).
             let _guard_exc_root = BareRefRoot::register(&mut guard_exc);
             let _deadframe_roots = unsafe {
                 majit_metainterp::resume::DeadFrameRefRoots::enter(&mut raw_values, |index| {
