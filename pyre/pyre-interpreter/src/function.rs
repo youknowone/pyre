@@ -853,49 +853,10 @@ pub(crate) fn function_new_impl(
     // construction-time fields. `remember_young_pointer` then puts the box in
     // `old_objects_pointing_to_young` and `prebuilt_root_objects`, so the
     // collector traces it by `FUNCTION_GC_TYPE_ID` whichever holder reaches
-    // it. `walk_raw_function_roots` reaches it only through module dicts,
-    // frames and import roots, which miss a builtin held only by a managed
-    // object (`mock.patch` keeps the original in a `_patch` attribute).
+    // it (`incminimark.py` `prebuilt_root_objects`).
     let obj = pyre_object::lltype::malloc_typed_immortal(function) as PyObjectRef;
     function_write_barrier(obj);
-    register_prebuilt_function_root(obj);
     obj
-}
-
-/// Bootstrap `Function` carriers allocated before the collector hook exists.
-///
-/// `function.py` `Function` is an ordinary GC object, and `function_new_impl`
-/// allocates it that way once `try_gc_alloc_stable_raw` has a hook. This list
-/// is only the `malloc_typed` fallback from that arm — the same insertion-
-/// ordered registry `pycode.rs` `PREBUILT_CODE_ROOTS` keeps for bootstrap code
-/// wrappers. An immortal box is never reclaimed, so entries are not removed.
-static PREBUILT_FUNCTION_ROOTS: std::sync::OnceLock<parking_lot::Mutex<Vec<usize>>> =
-    std::sync::OnceLock::new();
-
-/// Record one pre-hook `Function` carrier as a root of its own fields.
-fn register_prebuilt_function_root(obj: PyObjectRef) {
-    let roots = PREBUILT_FUNCTION_ROOTS.get_or_init(|| parking_lot::Mutex::new(Vec::new()));
-    let mut roots = roots.lock();
-    let identity = obj as usize;
-    if !roots.contains(&identity) {
-        roots.push(identity);
-    }
-}
-
-/// Hand every pre-hook `Function` carrier to `visit`.
-///
-/// Reached only from the collector's root walk, where every mutator is at a
-/// safepoint; that is what makes walking the carriers' fields sound here.
-/// No-op until the first pre-hook carrier registers.
-#[majit_macros::dont_look_inside]
-pub(crate) fn for_each_prebuilt_function_root(visit: &mut dyn FnMut(PyObjectRef)) {
-    let Some(roots) = PREBUILT_FUNCTION_ROOTS.get() else {
-        return;
-    };
-    let roots = roots.lock();
-    for &addr in roots.iter() {
-        visit(addr as PyObjectRef);
-    }
 }
 
 /// function.py — `class FunctionWithFixedCode(Function): can_change_code = False`

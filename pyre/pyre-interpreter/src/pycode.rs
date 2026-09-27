@@ -914,68 +914,6 @@ pub unsafe fn w_code_filename_obj(w_code: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// Bootstrap/prebuilt `PyCode` wrappers that own off-GC `w_globals` and
-/// the `co_consts_w` array pointer.
-///
-/// PyPy's `PyCode` is GC-managed, so ordinary graph tracing reaches these
-/// fields even when a code object is stored directly in a module/container
-/// without first becoming a function or frame. Only wrappers created before
-/// the runtime GC hook is installed stay outside the collector; expose that
-/// fallback family through one small insertion-ordered registry. Ordinary
-/// runtime wrappers are managed objects.
-static PREBUILT_CODE_ROOTS: std::sync::OnceLock<parking_lot::Mutex<Vec<usize>>> =
-    std::sync::OnceLock::new();
-
-fn register_prebuilt_code_root(code: PyObjectRef) {
-    let roots = PREBUILT_CODE_ROOTS.get_or_init(|| parking_lot::Mutex::new(Vec::new()));
-    let mut roots = roots.lock();
-    let identity = code as usize;
-    if !roots.contains(&identity) {
-        roots.push(identity);
-    }
-}
-
-/// Retire a wrapper from the fallback prebuilt-root registry once its managed
-/// old-generation allocation is reclaimed.  The registry also contains the
-/// bootstrap `malloc_typed` family, which never reaches this destructor.
-/// Drop every enrolled wrapper. A test that replaces the GC singleton
-/// must not let the new collector trace codes that name the leaked heap:
-/// nursery-debug rotation reuses arena addresses, so a stale
-/// `co_consts_w` pointer can land in the new nursery.
-pub fn clear_prebuilt_code_roots_for_test() {
-    if let Some(roots) = PREBUILT_CODE_ROOTS.get() {
-        roots.lock().clear();
-    }
-}
-
-fn unregister_prebuilt_code_root(code: PyObjectRef) {
-    let Some(roots) = PREBUILT_CODE_ROOTS.get() else {
-        return;
-    };
-    let mut roots = roots.lock();
-    roots.retain(|&identity| identity != code as usize);
-}
-
-/// Trace every bootstrap/prebuilt code wrapper exactly as PyPy traces every
-/// live GC-managed `PyCode`. Every bootstrap wrapper is registered here, so
-/// the raw walker reports direct fields just like a GC trace callback; it does
-/// not need to recreate the collector's transitive mark walk.
-pub(crate) fn walk_prebuilt_code_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    let Some(roots) = PREBUILT_CODE_ROOTS.get() else {
-        return;
-    };
-    let roots = roots.lock();
-    for &code in roots.iter() {
-        if code == 0 {
-            continue;
-        }
-        // Direct edges, including `co_consts_w`. Skip `is_code` so a
-        // wrapper whose `ob_type` the visitor has not yet forwarded still
-        // has the table visited. Dirty-gated by `walk_global_prebuilt_roots`.
-        unsafe { crate::eval::walk_enrolled_code_roots(code as PyObjectRef, visitor) };
-    }
-}
-
 /// GC type id assigned to `PyCode`.
 ///
 /// `PyCode` is a normal interpreter-level code object in PyPy
@@ -1395,14 +1333,6 @@ fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) ->
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let obj = pyre_object::gc_roots::pin_root(obj);
-    // Only bootstrap wrappers sit outside the collector, and the dirty-gated
-    // `walk_prebuilt_code_roots` reports their fields. A managed
-    // `malloc_typed_stable` PyCode is traced by its TypeInfo; enrolling it
-    // here would keep every `compile()` result alive and starve its
-    // weakref callback (`code_object_weakref`).
-    if !pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
-        register_prebuilt_code_root(obj);
-    }
     // Claim the graph before the fill loop: each nested constant publishes its
     // own wrapper against the same owner, and a wrapper that dies during the
     // loop must not find the count at zero.
@@ -4431,7 +4361,6 @@ fn release_constant_payload(constant: &mut crate::bytecode::ConstantData) {
 pub unsafe fn pycode_destructor(obj_addr: usize) {
     let code = unsafe { &mut *(obj_addr as *mut PyCode) };
     let wrapper = obj_addr as PyObjectRef;
-    unregister_prebuilt_code_root(wrapper);
     {
         let mut wrappers = live_code_wrappers().lock();
         if wrappers.get(&(code.code_ptr as usize)).copied() == Some(wrapper as usize) {
@@ -5319,17 +5248,6 @@ mod tests {
         assert!(
             visited,
             "managed PyCode must expose its co_consts_w array as a root"
-        );
-
-        let mut globally_visited = false;
-        walk_prebuilt_code_roots(&mut |root| {
-            if root.0 == table {
-                globally_visited = true;
-            }
-        });
-        assert!(
-            globally_visited,
-            "a standalone PyCode must remain a root without a function/frame owner"
         );
     }
 

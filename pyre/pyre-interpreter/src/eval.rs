@@ -453,8 +453,7 @@ pub unsafe fn walk_raw_code_roots(
             return;
         }
         // A GC trace callback reports one object's direct edges; the mark
-        // worklist provides the transitive traversal. Bootstrap wrappers are
-        // each registered in PREBUILT_CODE_ROOTS and use the same shape.
+        // worklist provides the transitive traversal.
         walk_enrolled_code_roots(value, visitor);
     }
 }
@@ -462,8 +461,8 @@ pub unsafe fn walk_raw_code_roots(
 /// Report the direct fields of a `PyCode` already known to be a code wrapper.
 ///
 /// [`walk_raw_code_roots`] first asks [`is_code`], which reads `ob_type`.
-/// Enrolled prebuilt roots are code wrappers by construction; skip that
-/// predicate so a wrapper whose `ob_type` word is momentarily unreadable
+/// The collector's type-directed `PyCode` trace names code wrappers by type
+/// id; it skips that predicate so a wrapper whose `ob_type` word is momentarily unreadable
 /// (a just-written stable allocation, a header the visitor has not yet
 /// forwarded) still has `co_consts_w` visited.
 pub unsafe fn walk_enrolled_code_roots(
@@ -1552,10 +1551,6 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     if !scan_prebuilt {
         return;
     }
-    // PyPy's GC reaches standalone code objects through the ordinary object
-    // graph. Pyre's bootstrap wrappers need the equivalent process-global
-    // owner before walking module/type caches below.
-    crate::pycode::walk_prebuilt_code_roots(visitor);
     unsafe {
         {
             let mut forward_declaration = |slot: &mut PyObjectRef| {
@@ -1573,15 +1568,6 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             crate::baseobjspace::walk_object_space_cache_roots(&mut forward_declaration);
             pyre_object::typedef::walk_typedef_roots(&mut forward_declaration);
         }
-        // `function.py` `Function` is a GC object once the collector hook
-        // exists, so a module dict or builtin type dict that holds it is what
-        // marks it. Carriers minted before that hook are `malloc_typed` and
-        // stay off the marker; this list is that fallback family
-        // (`function.rs` `register_prebuilt_function_root`), the same shape as
-        // `walk_prebuilt_code_roots` above.
-        crate::function::for_each_prebuilt_function_root(&mut |func| {
-            walk_raw_function_roots(func, &mut *visitor);
-        });
         let mut forward = |slot: &mut PyObjectRef| {
             visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
             walk_raw_function_roots(*slot, visitor);

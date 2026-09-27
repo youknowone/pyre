@@ -4940,7 +4940,6 @@ fn build_gc_global() {
 pub fn reset_gc_fresh_for_test() {
     let gc = build_gc();
     majit_gc::gc_sync::replace_singleton_leaking_old(gc);
-    pyre_interpreter::pycode::clear_prebuilt_code_roots_for_test();
 }
 
 /// Initialize the GC subsystem independently of the JIT driver.
