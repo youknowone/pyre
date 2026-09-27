@@ -5603,6 +5603,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Prefers the trace-bound `active_jitdriver_sd`; falls back to
     /// scanning `jitdrivers_sd` for callers that read this before any
     /// trace has started (warmspot init, host-side queries).
+    #[inline]
     pub fn virtualizable_info(&self) -> Option<&std::sync::Arc<VirtualizableInfo>> {
         if let Some(idx) = self.active_jitdriver_sd
             && let Some(jd) = self.staticdata.jitdrivers_sd.get(idx)

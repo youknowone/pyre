@@ -1945,6 +1945,23 @@ struct EntryScratch {
     vable_lengths: Vec<usize>,
 }
 
+impl EntryScratch {
+    /// Drop the previous entry's typed buffers.
+    ///
+    /// `execute_assembler`'s raw path writes only the unspecialized red words,
+    /// so [`JitDriver::take_entry_scratch_raw`] leaves these alone. A fill of
+    /// `live_values`, `types`, `vable_static` or `vable_arrays` clears them
+    /// first; `raw` is not touched here.
+    fn clear_typed(&mut self) {
+        self.live_values.clear();
+        self.types.clear();
+        self.vable_static.clear();
+        for array in &mut self.vable_arrays {
+            array.clear();
+        }
+    }
+}
+
 thread_local! {
     /// Per-thread publication of the currently-installed state-field JIT's
     /// flat jitcode registry + packed liveness, read by the stateless global
@@ -8100,6 +8117,19 @@ impl<S: JitState> JitDriver<S> {
         scratch
     }
 
+    /// [`Self::take_entry_scratch`] for the raw red path of
+    /// `execute_assembler`.
+    ///
+    /// `maybe_compile_and_run` unspecializes reds into one word buffer and
+    /// `func_execute_token` reads that buffer. Only `raw` is cleared. A caller
+    /// that fills `live_values`, `types`, `vable_static` or `vable_arrays`
+    /// clears those first via [`EntryScratch::clear_typed`].
+    fn take_entry_scratch_raw(&mut self) -> Box<EntryScratch> {
+        let mut scratch = self.entry_scratch.take().unwrap_or_default();
+        scratch.raw.clear();
+        scratch
+    }
+
     /// Return the buffers [`Self::take_entry_scratch`] handed out.
     fn entry_scratch_out(&mut self, scratch: Box<EntryScratch>) {
         self.entry_scratch = Some(scratch);
@@ -9340,47 +9370,17 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.single_pass_label_entry_key.is_some()
             || !self.meta.cut_compiled_keys.is_empty()
         {
-            return SteadyCompiledEntry::Done(self.back_edge_resolved(
-                cell_key,
-                token,
-                target_pc,
-                state,
-                env,
-                || {},
-            ));
+            return self
+                .enter_compiled_pending_label_or_cut(cell_key, token, target_pc, state, env);
         }
-        let mut scratch = self.take_entry_scratch();
+        let mut scratch = self.take_entry_scratch_raw();
         // `warmstate.py maybe_compile_and_run` unspecializes reds to words and
         // `llmodel.py execute_token` stores them by the token's kinds. A state
-        // that cannot produce the words hands the backend typed reds.
+        // that cannot produce the words takes the typed entry below.
         let raw_entry = state.fill_entry_raw_reds(&mut scratch.raw);
         if !raw_entry {
-            // `execute_assembler` does not look up `CompiledEntry`. The cell
-            // already holds the procedure token. Meta is only for a state whose
-            // reds or `is_compatible` actually read it.
-            let compatible = if state.fill_entry_reds_without_meta(&mut scratch.live_values) {
-                true
-            } else {
-                let Some(meta) = self.meta.get_compiled_meta(cell_key) else {
-                    self.entry_scratch_out(scratch);
-                    return SteadyCompiledEntry::NeedsInternal;
-                };
-                let compatible = state.is_compatible(meta);
-                if compatible {
-                    state.extract_live_values_into(
-                        meta,
-                        &mut scratch.live_values,
-                        &mut scratch.raw,
-                        &mut scratch.types,
-                    );
-                }
-                compatible
-            };
-            if !compatible {
-                self.entry_scratch_out(scratch);
-                self.meta.invalidate_loop(cell_key);
-                return SteadyCompiledEntry::Done(None);
-            }
+            return self
+                .enter_compiled_typed_entry(cell_key, token, target_pc, state, env, scratch);
         }
         // `execute_assembler` receives the unspecialized reds.
         // `patch_new_loop_to_load_virtualizable_fields` truncates the
@@ -9388,15 +9388,101 @@ impl<S: JitState> JitDriver<S> {
         // `inputarg_types` match the reds already filled. A longer list was
         // not patched and still needs the extension in `back_edge_resolved`,
         // which reads typed reds.
-        let have = if raw_entry {
-            scratch.raw.len()
-        } else {
-            scratch.live_values.len()
-        };
+        let have = scratch.raw.len();
         if token.inputarg_types().len() > have {
-            if raw_entry {
-                let _ = state.fill_entry_reds_without_meta(&mut scratch.live_values);
+            return self
+                .enter_compiled_unpatched_reds(cell_key, token, target_pc, state, env, scratch);
+        }
+        // `warmstate.py execute_assembler`: `if vinfo is not None:
+        // virtualizable = args[index_of_virtualizable];
+        // vinfo.clear_vable_token(virtualizable)`. Nothing else — no
+        // descriptor walk, no field export.
+        self.clear_entry_vable_token_raw(&scratch.raw);
+        if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
+            hook(cell_key, target_pc);
+        }
+        let finished = self
+            .meta
+            .poll_raw_int_finish_raw(&token, cell_key, &scratch.raw);
+        if let Some(value) = finished {
+            self.entry_scratch_out(scratch);
+            self.meta.back_edge_finish = None;
+            self.meta.back_edge_finish_word = Some(value);
+            return SteadyCompiledEntry::Done(Some(target_pc));
+        }
+        self.enter_compiled_general_case(cell_key, target_pc, state, env, scratch)
+    }
+
+    /// Pending label or cross-loop cut: `maybe_compile_and_run` cannot enter
+    /// the raw token, so the call goes through `back_edge_resolved`.
+    #[cold]
+    #[inline(never)]
+    fn enter_compiled_pending_label_or_cut(
+        &mut self,
+        cell_key: u64,
+        token: std::sync::Arc<majit_backend::JitCellToken>,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) -> SteadyCompiledEntry {
+        SteadyCompiledEntry::Done(self.back_edge_resolved(
+            cell_key,
+            token,
+            target_pc,
+            state,
+            env,
+            || {},
+        ))
+    }
+
+    /// Typed reds: `fill_entry_raw_reds` declined, so `execute_assembler`'s
+    /// word path does not apply. Meta is read only when the reds or
+    /// `is_compatible` need it; then the same `clear_vable_token`, hook,
+    /// `poll_raw_int_finish` and finish latches as the raw path.
+    #[cold]
+    #[inline(never)]
+    fn enter_compiled_typed_entry(
+        &mut self,
+        cell_key: u64,
+        token: std::sync::Arc<majit_backend::JitCellToken>,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        mut scratch: Box<EntryScratch>,
+    ) -> SteadyCompiledEntry {
+        scratch.clear_typed();
+        // `execute_assembler` does not look up `CompiledEntry`. The cell
+        // already holds the procedure token. Meta is only for a state whose
+        // reds or `is_compatible` actually read it.
+        let compatible = if state.fill_entry_reds_without_meta(&mut scratch.live_values) {
+            true
+        } else {
+            let Some(meta) = self.meta.get_compiled_meta(cell_key) else {
+                self.entry_scratch_out(scratch);
+                return SteadyCompiledEntry::NeedsInternal;
+            };
+            let compatible = state.is_compatible(meta);
+            if compatible {
+                state.extract_live_values_into(
+                    meta,
+                    &mut scratch.live_values,
+                    &mut scratch.raw,
+                    &mut scratch.types,
+                );
             }
+            compatible
+        };
+        if !compatible {
+            self.entry_scratch_out(scratch);
+            self.meta.invalidate_loop(cell_key);
+            return SteadyCompiledEntry::Done(None);
+        }
+        // Same inputarg-length test as the raw path. This arm did not fill
+        // raw words, so `have` is the typed red count. A longer
+        // `inputarg_types` list was not patched and falls back to
+        // `back_edge_resolved` without a second red fill.
+        let have = scratch.live_values.len();
+        if token.inputarg_types().len() > have {
             self.entry_scratch_out(scratch);
             return SteadyCompiledEntry::Done(self.back_edge_resolved(
                 cell_key,
@@ -9407,31 +9493,66 @@ impl<S: JitState> JitDriver<S> {
                 || {},
             ));
         }
-        // `warmstate.py execute_assembler`: `if vinfo is not None:
-        // virtualizable = args[index_of_virtualizable];
-        // vinfo.clear_vable_token(virtualizable)`. Nothing else — no
-        // descriptor walk, no field export.
-        if raw_entry {
-            self.clear_entry_vable_token_raw(&scratch.raw);
-        } else {
-            self.clear_entry_vable_token(&scratch.live_values);
-        }
+        self.clear_entry_vable_token(&scratch.live_values);
         if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
             hook(cell_key, target_pc);
         }
-        let finished = if raw_entry {
-            self.meta
-                .poll_raw_int_finish_raw(&token, cell_key, &scratch.raw)
-        } else {
-            self.meta
-                .poll_raw_int_finish(&token, cell_key, &scratch.live_values)
-        };
+        let finished = self
+            .meta
+            .poll_raw_int_finish(&token, cell_key, &scratch.live_values);
         if let Some(value) = finished {
             self.entry_scratch_out(scratch);
             self.meta.back_edge_finish = None;
             self.meta.back_edge_finish_word = Some(value);
             return SteadyCompiledEntry::Done(Some(target_pc));
         }
+        self.enter_compiled_general_case(cell_key, target_pc, state, env, scratch)
+    }
+
+    /// `inputarg_types` is longer than the unspecialized reds.
+    ///
+    /// The loop was not patched down to that prefix, so
+    /// `back_edge_resolved` extends the typed reds. The discarded fill is
+    /// the same call the raw arm made before handing the token on.
+    #[cold]
+    #[inline(never)]
+    fn enter_compiled_unpatched_reds(
+        &mut self,
+        cell_key: u64,
+        token: std::sync::Arc<majit_backend::JitCellToken>,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        mut scratch: Box<EntryScratch>,
+    ) -> SteadyCompiledEntry {
+        scratch.clear_typed();
+        let _ = state.fill_entry_reds_without_meta(&mut scratch.live_values);
+        self.entry_scratch_out(scratch);
+        SteadyCompiledEntry::Done(self.back_edge_resolved(
+            cell_key,
+            token,
+            target_pc,
+            state,
+            env,
+            || {},
+        ))
+    }
+
+    /// `poll_raw_int_finish` / `poll_raw_int_finish_raw` returned `None`.
+    ///
+    /// The trace already ran; `raw_int_fallback` holds the general-case
+    /// result. `execute_assembler` then takes `handle_fail` via
+    /// `consume_compiled_entry_result`.
+    #[cold]
+    #[inline(never)]
+    fn enter_compiled_general_case(
+        &mut self,
+        cell_key: u64,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        scratch: Box<EntryScratch>,
+    ) -> SteadyCompiledEntry {
         let result = self
             .meta
             .raw_int_fallback
