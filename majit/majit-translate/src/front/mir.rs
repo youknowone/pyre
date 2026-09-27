@@ -8312,6 +8312,16 @@ impl<'a> Lowering<'a> {
                 // rtype_cast_ptr_to_int`); `rptr.py` has only eq/ne.
                 let lhs_kind = self.operand_value_kind(&lhs);
                 let rhs_kind = self.operand_value_kind(&rhs);
+                // Rust `==` / `!=` on raw pointers compares addresses: the
+                // flowspace `is_` (`rptr.py` `rtype_is_` → `ptr_eq`), not the
+                // value `eq` a string operand would dispatch to `ll_streq`.
+                let raw_ref_pointer = |op: &Operand, kind: &Option<ValueType>| {
+                    matches!(op, Operand::Copy(place) | Operand::Move(place)
+                        if tyref_is_raw_pointer(&place.ty, self.llbc))
+                        && kind.as_ref().is_some_and(|k| value_type_bank(k) == 1)
+                };
+                let pointer_identity =
+                    raw_ref_pointer(&lhs, &lhs_kind) && raw_ref_pointer(&rhs, &rhs_kind);
                 let lhs_v = self.resolve_operand(mir_bb, lhs)?;
                 let rhs_v = self.resolve_operand(mir_bb, rhs)?;
                 let mut op_label = binop_label(&op_json)?;
@@ -8391,6 +8401,43 @@ impl<'a> Lowering<'a> {
                 } else {
                     (lhs_v, rhs_v)
                 };
+                if pointer_identity && matches!(op_label.as_str(), "eq" | "ne") {
+                    // `a is not b` has no operation of its own; it is
+                    // `is_(a, b) == False`, the shape `Option::is_some`
+                    // lowers to.
+                    if op_label == "ne" {
+                        let bb_id = self.block_id[mir_bb];
+                        let is_res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        let false_var = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(is_res.clone()),
+                            kind: OpKind::BinOp {
+                                op: "is_".to_string(),
+                                lhs: lhs_v,
+                                rhs: rhs_v,
+                                result_ty: ValueType::Int,
+                            },
+                        });
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(false_var.clone()),
+                            kind: OpKind::ConstBool(false),
+                        });
+                        return Ok((
+                            Some(OpKind::BinOp {
+                                op: "eq".to_string(),
+                                lhs: is_res,
+                                rhs: false_var,
+                                result_ty: ValueType::Int,
+                            }),
+                            res,
+                        ));
+                    }
+                    op_label = "is_".to_string();
+                }
                 Ok((
                     Some(OpKind::BinOp {
                         op: op_label,
@@ -57130,6 +57177,144 @@ mod tests {
         assert!(
             ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq")),
             "the `&Wtf8` comparison lowers to a `BinOp(eq)`"
+        );
+    }
+
+    /// Every variable carrying the result of a `FunctionPath` call whose
+    /// last segment is `name`, followed through identity casts and through
+    /// the links into later blocks.
+    fn call_results_named(graph: &FunctionGraph, name: &str) -> std::collections::HashSet<u64> {
+        let mut ids: std::collections::HashSet<u64> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some(name) => {
+                    op.result.as_ref().map(|v| v.id())
+                }
+                _ => None,
+            })
+            .collect();
+        loop {
+            let mut grew = false;
+            for op in graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+                if let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } = &op.kind
+                    && segments.last().map(String::as_str) == Some("__cast_instance_intrinsic")
+                    && let Some(LinkArg::Value(v)) = args.first()
+                    && ids.contains(&v.id())
+                    && let Some(result) = &op.result
+                {
+                    grew |= ids.insert(result.id());
+                }
+            }
+            for link in graph.blocks.iter().flat_map(|b| b.exits.iter()) {
+                let target = graph.block(link.target);
+                for (arg, input) in link.args.iter().zip(&target.inputargs) {
+                    if let LinkArg::Value(v) = arg
+                        && ids.contains(&v.id())
+                    {
+                        grew |= ids.insert(input.id());
+                    }
+                }
+            }
+            if !grew {
+                return ids;
+            }
+        }
+    }
+
+    /// Rust `==` on two raw pointers compares addresses: the flowspace `is_`
+    /// (`rptr.py` `rtype_is_` → `ptr_eq`), not the value `eq` that an rstr
+    /// operand dispatches to `ll_streq`. `is_w`'s bytes arm compares two
+    /// `w_bytes_block` pointers that way. Ignored by default (loads the real
+    /// LLBC).
+    #[test]
+    #[ignore]
+    fn raw_pointer_eq_lowers_to_is() {
+        let path = format!(
+            "{}/../../build/llbc/pyre-object.ullbc",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph =
+            super::lower_function(&llbc, "pyre_object::pyobject::is_w").expect("lower is_w");
+        let blocks = call_results_named(&graph, "w_bytes_block");
+        let compares: Vec<&str> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::BinOp { op, lhs, rhs, .. }
+                    if blocks.contains(&lhs.id()) && blocks.contains(&rhs.id()) =>
+                {
+                    Some(op.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(compares, ["is_"], "w_bytes_block(a) == w_bytes_block(b)");
+    }
+
+    /// Rust `!=` on two raw pointers is `is_(a, b) == False`: flowspace has
+    /// no `is not` operation. `w_exception_base_defaults` tests
+    /// `w_class != PY_NULL`. Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn raw_pointer_ne_lowers_to_negated_is() {
+        let path = format!(
+            "{}/../../build/llbc/pyre-object.ullbc",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_object::interp_exceptions::w_exception_base_defaults",
+        )
+        .expect("lower w_exception_base_defaults");
+        let classes = call_results_named(&graph, "lookup_exc_class_for_kind");
+        let ops: Vec<&SpaceOperation> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .collect();
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, lhs, .. }
+                if op == "ne" && classes.contains(&lhs.id()))),
+            "w_class != PY_NULL must not stay a value `ne`"
+        );
+        let is_results: std::collections::HashSet<u64> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::BinOp { op: name, lhs, .. }
+                    if name == "is_" && classes.contains(&lhs.id()) =>
+                {
+                    op.result.as_ref().map(|v| v.id())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(is_results.len(), 1, "w_class != PY_NULL starts with is_");
+        let false_consts: std::collections::HashSet<u64> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::ConstBool(false) => op.result.as_ref().map(|v| v.id()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, lhs, rhs, .. }
+                if op == "eq" && is_results.contains(&lhs.id())
+                    && false_consts.contains(&rhs.id()))),
+            "w_class != PY_NULL is eq(is_(w_class, NULL), False)"
         );
     }
 

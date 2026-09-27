@@ -1122,7 +1122,8 @@ fn narrowing_chain_arm_lowers_to_a_direct_call() {
     let mut direct_arm_calls = 0usize;
     let mut dyn_calls = 0usize;
     let mut header_reads = 0usize;
-    let mut identity_eqs = 0usize;
+    let mut identity_tests = 0usize;
+    let mut value_eqs = 0usize;
     for b in &graph.blocks {
         for op in &b.operations {
             match &op.kind {
@@ -1135,7 +1136,8 @@ fn narrowing_chain_arm_lowers_to_a_direct_call() {
                     _ => {}
                 },
                 OpKind::FieldRead { field, .. } if field.name == "ob_type" => header_reads += 1,
-                OpKind::BinOp { op, .. } if op == "eq" => identity_eqs += 1,
+                OpKind::BinOp { op, .. } if op == "is_" => identity_tests += 1,
+                OpKind::BinOp { op, .. } if op == "eq" => value_eqs += 1,
                 _ => {}
             }
         }
@@ -1147,8 +1149,12 @@ fn narrowing_chain_arm_lowers_to_a_direct_call() {
     );
     assert_eq!(header_reads, 2, "both receivers' class words are read");
     assert_eq!(
-        identity_eqs, 2,
+        identity_tests, 2,
         "type(a) is type(b), then the per-class shortcut",
+    );
+    assert_eq!(
+        value_eqs, 0,
+        "a class-word compare is `is_`, not a value `eq`"
     );
 }
 
