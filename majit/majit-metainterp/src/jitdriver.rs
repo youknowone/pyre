@@ -140,6 +140,7 @@ fn build_bh_jitdrivers_sd(
                 result_type,
                 portal_runner_ptr,
                 mainjitcode_calldescr,
+                handle_jitexc_from_bh: jd.handle_jitexc_from_bh,
             }
         })
         .collect()
@@ -1270,6 +1271,10 @@ pub struct JitDriverStaticData {
     /// `do_recursive_call`'s residual CALL_ASSEMBLER op
     /// (pyjitpl.py).
     pub portal_runner_adr: i64,
+    /// warmspot.py `jd.handle_jitexc_from_bh`.
+    /// Copied onto [`crate::blackhole::BhJitDriverSd`] for
+    /// `_handle_jitexception_in_portal`.
+    pub handle_jitexc_from_bh: Option<crate::blackhole::PortalRunnerHook>,
     /// jitdriver.py:16 + warmspot.py:520-545 `jd.virtualizable_info`.
     ///
     /// Per-driver `VirtualizableInfo` populated during warmspot setup
@@ -1471,6 +1476,7 @@ impl JitDriverStaticData {
             mainjitcode_loader: None,
             mainjitcode_loaded: std::sync::OnceLock::new(),
             portal_runner_adr: 0,
+            handle_jitexc_from_bh: None,
             virtualizable_info: None,
             greenfield_info: None,
             index_of_virtualizable: -1,

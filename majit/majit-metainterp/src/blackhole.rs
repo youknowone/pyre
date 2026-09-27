@@ -170,6 +170,10 @@ pub struct BhJitDriverSd {
     /// `jitdriver_sd.mainjitcode.calldescr` — CallDescr of the portal
     /// function returned by `get_portal_runner` for `bh_call_*`.
     pub mainjitcode_calldescr: BhCallDescr,
+    /// warmspot.py `jd.handle_jitexc_from_bh`, one per jitdriver.
+    /// `_handle_jitexception_in_portal` calls it on the driver whose
+    /// `mainjitcode` is this frame's jitcode.
+    pub handle_jitexc_from_bh: Option<PortalRunnerHook>,
 }
 
 /// How [`BlackholeInterpreter::run`]'s dispatch loop stopped.
@@ -1897,97 +1901,9 @@ impl BlackholeInterpreter {
         result
     }
 
-    /// Native-finish only at a node-entry PC. The regex leaf resumes at
-    /// mid-`shift` pc 210; probing `fnaddr` there was a TLS startpoint
-    /// walk on every frame of every character.
+    /// blackhole.py `run`: dispatch from the resume position.
     fn run_after_rooting(&mut self) -> BhRunOutcome {
-        if self.position == 0 {
-            if let Some(outcome) = self.try_native_finish_at_node_entry() {
-                return outcome;
-            }
-        }
         self.run_inner()
-    }
-
-    /// `bhimpl_inline_call_*` for a frame whose resume PC is still the
-    /// helper entry: the remaining body is the whole callee, so one
-    /// `fnaddr` call answers it.
-    fn try_native_finish_at_node_entry(&mut self) -> Option<BhRunOutcome> {
-        if !is_callable_fnaddr(self.jitcode.fnaddr) {
-            return None;
-        }
-        if !native_entry_args_intact(&self.jitcode, self.position) {
-            return None;
-        }
-        let fnaddr = self.jitcode.fnaddr;
-        let (result_type, arg_ptr, arg_len, calldescr) = {
-            let body = self.jitcode.try_body()?;
-            (
-                body.calldescr.result_type,
-                body.calldescr.arg_classes.as_ptr(),
-                body.calldescr.arg_classes.len(),
-                &body.calldescr as *const majit_jitcode::jitcode::BhCallDescr,
-            )
-        };
-        let mut args_i = smallvec::SmallVec::<[i64; 4]>::new();
-        let mut args_r = smallvec::SmallVec::<[i64; 4]>::new();
-        let mut args_f = smallvec::SmallVec::<[i64; 2]>::new();
-        let (mut ni, mut nr, mut nf) = (0usize, 0usize, 0usize);
-        // SAFETY: `self.jitcode` owns the body for the life of this frame.
-        for i in 0..arg_len {
-            let ch = unsafe { *arg_ptr.add(i) };
-            match ch {
-                b'i' => {
-                    args_i.push(*self.registers_i.get(ni)?);
-                    ni += 1;
-                }
-                b'r' => {
-                    args_r.push(*self.registers_r.get(nr)?);
-                    nr += 1;
-                }
-                b'f' => {
-                    args_f.push(*self.registers_f.get(nf)?);
-                    nf += 1;
-                }
-                _ => return None,
-            }
-        }
-        self.last_exc().set(0);
-        let args_root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
-        unsafe {
-            majit_gc::shadow_stack::push_resume_ref_roots(args_r.as_mut_slice());
-        }
-        let outcome = match result_type {
-            'i' => {
-                let result = self.bhimpl_inline_call_irf_i(
-                    fnaddr,
-                    &args_i,
-                    &args_r,
-                    &args_f,
-                    // SAFETY: `self.jitcode` owns the body for the life of this frame.
-                    unsafe { &*calldescr },
-                );
-                match check_residual_call_exception_after(self, self.position) {
-                    Ok(()) => {
-                        self.tmpreg_i = result;
-                        self.return_type = BhReturnType::Int;
-                        Some(BhRunOutcome::LeaveFrame)
-                    }
-                    Err(DispatchError::LeaveFrame) => Some(BhRunOutcome::LeaveFrame),
-                    Err(DispatchError::ContinueRunningNormally(args)) => {
-                        Some(BhRunOutcome::ContinueRunningNormally(args))
-                    }
-                    Err(DispatchError::RaiseException { exc, .. }) => {
-                        self.got_exception = true;
-                        self.exception_last_value = exc;
-                        Some(BhRunOutcome::Exception)
-                    }
-                }
-            }
-            _ => None,
-        };
-        majit_gc::shadow_stack::pop_resume_ref_roots_to(args_root_depth);
-        outcome
     }
 
     fn run_inner(&mut self) -> BhRunOutcome {
@@ -3647,6 +3563,30 @@ fn handle_jitexception(
     };
     // blackhole.py:1780: return blackholeinterp, lle
     Ok((bh, current_exc))
+}
+
+/// blackhole.py `resume_in_blackhole`.
+///
+/// `blackhole_from_resumedata` has already built `blackholeinterp` and
+/// the caller has ended `deadframe`'s live range. `_prepare_resume_from_failure`
+/// is `grab_exc_value`'s result, then `_run_forever`.
+pub fn resume_in_blackhole(
+    builder: &mut BlackholeInterpBuilder,
+    blackholeinterp: Box<BlackholeInterpreter>,
+    deadframe_exc: i64,
+    on_enter_level: Option<&dyn Fn(i64)>,
+    on_leave_level: Option<&dyn Fn(i64)>,
+) -> JitException {
+    let current_exc = BlackholeInterpreter::prepare_resume_from_failure(deadframe_exc);
+    run_forever_with_portal(
+        builder,
+        blackholeinterp,
+        current_exc,
+        None,
+        on_enter_level,
+        on_leave_level,
+        None,
+    )
 }
 
 /// blackhole.py _run_forever
@@ -8006,38 +7946,11 @@ fn bhimpl_jit_leave_portal_frame() {}
 /// blackhole.py `bhimpl_hint_force_virtualizable(r): pass`.
 fn bhimpl_hint_force_virtualizable(_r: i64) {}
 
-/// The interpreter's `portal_runner`, re-entering the portal function when
-/// `ContinueRunningNormally` is raised at a recursive portal level
-/// (`warmspot.py handle_jitexception_from_blackhole`).
+/// `warmspot.py` `jd.handle_jitexc_from_bh`.
 ///
-/// `warmspot.py` `jd.handle_jitexc_from_bh`, one per jitdriver.
+/// Defined beside [`BhJitDriverSd`], which stores one hook per driver.
 pub type PortalRunnerHook =
     fn(&crate::jitexc::JitException) -> Result<(BhReturnType, i64), PortalRunnerFailure>;
-
-/// The registered runners, indexed by `metainterp_sd.jitdrivers_sd` position.
-///
-/// Upstream hangs this callback off the driver itself, so
-/// `_handle_jitexception_in_portal` can pick the one whose `mainjitcode is
-/// self.jitcode`.  Keeping the table beside `BhJitDriverSd` rather than in it
-/// only avoids an initialisation order between the driver table (built once,
-/// lazily) and the consumer's registration; [`portal_dispatch_for`] joins the
-/// two at the point of use, through the same relation upstream tests.
-static PORTAL_RUNNER_HOOKS: std::sync::RwLock<Vec<Option<PortalRunnerHook>>> =
-    std::sync::RwLock::new(Vec::new());
-
-/// Install the [`PortalRunnerHook`] owned by `jitdrivers_sd[jd_index]`.
-///
-/// First registration for an index wins, so a consumer may call it from every
-/// install path for that driver.
-pub fn register_portal_runner_hook(jd_index: usize, hook: PortalRunnerHook) {
-    let mut hooks = PORTAL_RUNNER_HOOKS
-        .write()
-        .expect("portal runner table poisoned");
-    if hooks.len() <= jd_index {
-        hooks.resize(jd_index + 1, None);
-    }
-    hooks[jd_index].get_or_insert(hook);
-}
 
 /// `blackhole.py` `_handle_jitexception_in_portal`:
 ///
@@ -8091,29 +8004,14 @@ fn portal_jd_for(bh: &BlackholeInterpreter) -> Option<usize> {
 fn portal_dispatch_for(
     bh: &BlackholeInterpreter,
 ) -> (Option<PortalRunnerHook>, Option<BhReturnType>) {
-    let hooks = PORTAL_RUNNER_HOOKS
-        .read()
-        .expect("portal runner table poisoned");
-    let any_registered = || hooks.iter().find_map(|slot| *slot);
     let Some(jd_index) = portal_jd_for(bh) else {
-        // No driver claims this jitcode, so there is no owner whose kind could
-        // apply, and this must still hand back the runner it did before the
-        // search existed: returning `None` would not report a missing driver,
-        // it would silently withdraw the portal re-entry.
-        return (any_registered(), None);
+        return (None, None);
     };
-    match hooks.get(jd_index).copied().flatten() {
-        // The owning driver answers both.
-        Some(hook) => (
-            Some(hook),
-            bh.jitdrivers_sd.get(jd_index).map(|jd| jd.result_type),
-        ),
-        // Someone else's runner, and therefore nobody's declared kind.
-        None => {
-            portal_substitution_report(bh, jd_index, hooks.len());
-            (any_registered(), None)
-        }
-    }
+    let Some(jd) = bh.jitdrivers_sd.get(jd_index) else {
+        portal_substitution_report(bh, jd_index, bh.jitdrivers_sd.len());
+        return (None, None);
+    };
+    (jd.handle_jitexc_from_bh, Some(jd.result_type))
 }
 
 /// `MAJIT_BH_PORTAL_SUBST`: name each recursive portal level that re-enters
@@ -13560,6 +13458,11 @@ fn copy_identity_slots_from_parent(
     }
 }
 
+/// Bytecode-only callee: `JitCodeBuilder` sub-jitcodes and translator
+/// graphs absent from `jit_trace_fnaddrs` have no machine entry, so
+/// `bhimpl_inline_call_*`'s `cpu.bh_call_*(jitcode.fnaddr)` cannot run
+/// them. This interpreter is that class, not a second dispatch for a
+/// callable `fnaddr`.
 fn interpret_unresolved_inline_call(
     bh: &mut BlackholeInterpreter,
     handle: &CallDescrHandle,

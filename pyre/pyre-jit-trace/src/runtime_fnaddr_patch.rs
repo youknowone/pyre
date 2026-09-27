@@ -102,6 +102,15 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
         );
         if let Some(&runtime) = correspondence.get(&jc.fnaddr) {
             jc.fnaddr = runtime;
+        } else if majit_jitcode::codewriter::call::is_symbolic_fnaddr(jc.fnaddr) {
+            // `get_jitcode` stores `symbolic_fnaddr_for_path` when the helper
+            // had no bound address in the build-script process. The runtime
+            // process publishes the real address under the same path.
+            if let Some(path) = symbolic_fnaddr_path(jc.fnaddr) {
+                if let Some(runtime) = runtime_fnaddr_by_path(path) {
+                    jc.fnaddr = runtime;
+                }
+            }
         }
         // Some shells reach the persisted table without a committed body
         // (e.g. `Default::default()` placeholders kept for `Arc<JitCode>::
