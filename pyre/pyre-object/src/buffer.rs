@@ -95,20 +95,6 @@ pub fn external_buffer_view(
     unsafe { core::mem::transmute::<usize, ExternalBufferViewFn>(f)(obj) }
 }
 
-/// The window an `External` buffer reads.  A counted exporter (`mmap`) is
-/// read through its live mapping on every access, the way `MMapBuffer`
-/// reaches `W_MMap.mmap`: a view derived from a released memoryview holds no
-/// export of its own, so `close` or `resize` may have unmapped or moved the
-/// window it was built over.  A closed mapping reads as empty.  Any other
-/// owner keeps the window it was built with.
-fn external_live_window(w_obj: PyObjectRef, address: usize, size: usize) -> (usize, usize) {
-    match external_buffer_view(w_obj) {
-        Some(Ok((address, size, _))) => (address, size),
-        Some(Err(_)) => (core::ptr::NonNull::<u8>::dangling().as_ptr() as usize, 0),
-        None => (address, size),
-    }
-}
-
 /// # Safety
 /// `obj` must be the exporter paired with a successful view.
 pub unsafe fn external_buffer_acquire(obj: PyObjectRef) {
@@ -259,7 +245,18 @@ impl Buffer {
                     size,
                     ..
                 } => {
-                    let (address, size) = external_live_window(*w_obj, *address, *size);
+                    // A counted exporter (`mmap`) is read through its live
+                    // mapping on every access, the way `MMapBuffer` reaches
+                    // `W_MMap.mmap`: a view derived from a released memoryview
+                    // holds no export of its own, so `close` or `resize` may
+                    // have unmapped or moved the window it was built over.  A
+                    // closed mapping reads as empty.  Any other owner keeps
+                    // the window it was built with.
+                    let (address, size) = match external_buffer_view(*w_obj) {
+                        Some(Ok((address, size, _))) => (address, size),
+                        Some(Err(_)) => (core::ptr::NonNull::<u8>::dangling().as_ptr() as usize, 0),
+                        None => (*address, *size),
+                    };
                     core::slice::from_raw_parts(address as *const u8, size)
                 }
                 Buffer::Sub {
@@ -303,17 +300,15 @@ impl Buffer {
                 Buffer::Array { w_obj } => {
                     Some(crate::interp_array::w_array_vec_mut(*w_obj).as_mut_slice())
                 }
-                Buffer::External {
-                    w_obj,
-                    address,
-                    size,
-                    readonly,
-                } => {
+                Buffer::External { readonly, .. } => {
                     if *readonly {
                         None
                     } else {
-                        let (address, size) = external_live_window(*w_obj, *address, *size);
-                        Some(core::slice::from_raw_parts_mut(address as *mut u8, size))
+                        let window = self.as_bytes();
+                        Some(core::slice::from_raw_parts_mut(
+                            window.as_ptr() as *mut u8,
+                            window.len(),
+                        ))
                     }
                 }
                 Buffer::Sub {
