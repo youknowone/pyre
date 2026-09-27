@@ -4,7 +4,6 @@
 # done-when.
 # corpus=c63631cace2c58a8 platform=darwin
 two-phase-never-a-subject	eval_loop_jit_portal
-two-phase-never-a-subject	ll_int_abs
 two-phase-never-a-subject	ll_listslice_minusone__ref__majit__object_ref_gcarray
 two-phase-never-a-subject	ll_listslice_startonly__ref
 two-phase-never-a-subject	ll_listslice_startonly__ref__majit__object_ref_gcarray
@@ -150,12 +149,10 @@ two-phase-never-a-subject	pyre_interpreter::baseobjspace::view_as_kwargs
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::w_type_getdictvalue
 two-phase-never-a-subject	pyre_interpreter::builtins::<Impl>::acquire
 two-phase-never-a-subject	pyre_interpreter::builtins::<Impl>::as_mut_slice
-two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_builtin_abs
 two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_builtin_dunder_import
 two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_builtin_isinstance
 two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_builtin_len
 two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_builtin_locals
-two-phase-never-a-subject	pyre_interpreter::builtins::abs_structural
 two-phase-never-a-subject	pyre_interpreter::builtins::acquire_readbuf
 two-phase-never-a-subject	pyre_interpreter::builtins::backing_exports_incref
 two-phase-never-a-subject	pyre_interpreter::builtins::bare_super_frame_layout
@@ -163,8 +160,6 @@ two-phase-never-a-subject	pyre_interpreter::builtins::bare_super_frame_layout_wo
 two-phase-never-a-subject	pyre_interpreter::builtins::base_exception_str_method
 two-phase-never-a-subject	pyre_interpreter::builtins::bind_pos_or_kw
 two-phase-never-a-subject	pyre_interpreter::builtins::buffer_export_incref
-two-phase-never-a-subject	pyre_interpreter::builtins::builtin_abs
-two-phase-never-a-subject	pyre_interpreter::builtins::builtin_abs_obj
 two-phase-never-a-subject	pyre_interpreter::builtins::builtin_float
 two-phase-never-a-subject	pyre_interpreter::builtins::builtin_isinstance
 two-phase-never-a-subject	pyre_interpreter::builtins::builtin_len
@@ -257,7 +252,6 @@ two-phase-never-a-subject	pyre_interpreter::error::<Impl>::normalize_exception
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::os_error_syscall
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::os_error_syscall2
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::os_error_with_errno
-two-phase-never-a-subject	pyre_interpreter::error::<Impl>::record_context
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::render_exception_wtf8
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::set_cause
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::to_exc_object
@@ -265,7 +259,6 @@ two-phase-never-a-subject	pyre_interpreter::error::<Impl>::write_to_sys_stderr
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::write_unraisable
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::write_unraisable_default
 two-phase-never-a-subject	pyre_interpreter::error::<Impl>::write_unraisable_with_traceback
-two-phase-never-a-subject	pyre_interpreter::error::chain_context
 two-phase-never-a-subject	pyre_interpreter::error::emit_report_to_host_stderr
 two-phase-never-a-subject	pyre_interpreter::error::exc_object_class_name
 two-phase-never-a-subject	pyre_interpreter::error::system_error_from_cause
@@ -940,24 +933,6 @@ two-phase-never-a-subject	pyre_interpreter::module::thread::rlock_class::__majit
 two-phase-never-a-subject	pyre_interpreter::module::thread::rlock_class::__majit_wrap_acquire_timed
 two-phase-never-a-subject	pyre_interpreter::module::thread::rlock_class::__majit_wrap_release
 two-phase-never-a-subject	pyre_interpreter::module::time::interp_time::duration_since_epoch
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_float_abs
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_float_erf
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_float_erfc
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_float_fmod
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_float_frexp_mantissa
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_float_gamma
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_float_isclose
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_float_lgamma
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_float_math1
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_float_math2
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_float_remainder
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_float_ulp
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_int_frexp_exponent
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_int_from_ceil
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_int_from_float
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_int_from_floor
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_int_from_trunc
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_int_isqrt
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::add
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::add_impl
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::and_
@@ -966,10 +941,7 @@ two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::bytes_conc
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::bytes_concat_type_error
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::compare
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::compare_slot
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::complex_abs
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::complex_pow
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::complex_quot
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::complex_truediv
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::concat_operand_name
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::float_pow_impl
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::float_pow_inner
@@ -999,7 +971,6 @@ two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::pos
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::pos_inner
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::pow
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::pow_binary
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::real_complex_quot
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::rshift
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::rshift_impl
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::sequence_repeat
@@ -1246,9 +1217,6 @@ two-phase-never-a-subject	pyre_interpreter::shared_opcode::opcode_store_subscr
 two-phase-never-a-subject	pyre_interpreter::type_methods::__majit_wrap_dict_descr_items
 two-phase-never-a-subject	pyre_interpreter::type_methods::__majit_wrap_dict_descr_keys
 two-phase-never-a-subject	pyre_interpreter::type_methods::__majit_wrap_dict_descr_values
-two-phase-never-a-subject	pyre_interpreter::type_methods::__majit_wrap_str_descr_endswith
-two-phase-never-a-subject	pyre_interpreter::type_methods::__majit_wrap_str_descr_startswith
-two-phase-never-a-subject	pyre_interpreter::type_methods::arity_at_least
 two-phase-never-a-subject	pyre_interpreter::type_methods::arity_at_most
 two-phase-never-a-subject	pyre_interpreter::type_methods::arity_exact
 two-phase-never-a-subject	pyre_interpreter::type_methods::builtin_encoder

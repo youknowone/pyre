@@ -1362,9 +1362,7 @@ pub extern "C" fn jit_str_repeat(s: i64, n: i64) -> i64 {
 }
 
 #[majit_macros::elidable]
-pub extern "C" fn jit_str_compare(a: i64, b: i64) -> i64 {
-    let a = a as PyObjectRef;
-    let b = b as PyObjectRef;
+pub extern "C" fn jit_str_compare(a: PyObjectRef, b: PyObjectRef) -> i64 {
     unsafe {
         // WTF-8 byte order matches code point order, so the byte
         // comparison yields the same result as comparing code points.
@@ -1542,10 +1540,10 @@ pub extern "C" fn jit_str_endswith(s: i64, suffix: i64) -> i64 {
 /// `unicodeobject.py descr_contains` is `value.find(sub) >= 0`.
 /// WTF-8 is self-synchronizing, so a byte find is the code-point find.
 #[majit_macros::elidable]
-pub extern "C" fn jit_str_contains(haystack: i64, needle: i64) -> i64 {
+pub extern "C" fn jit_str_contains(haystack: PyObjectRef, needle: PyObjectRef) -> i64 {
     unsafe {
-        let hay = w_str_get_wtf8(haystack as PyObjectRef).as_bytes();
-        let needle = w_str_get_wtf8(needle as PyObjectRef).as_bytes();
+        let hay = w_str_get_wtf8(haystack).as_bytes();
+        let needle = w_str_get_wtf8(needle).as_bytes();
         if needle.is_empty() {
             return 1;
         }
@@ -1558,13 +1556,13 @@ pub extern "C" fn jit_str_contains(haystack: i64, needle: i64) -> i64 {
 /// result comes back through `_byte_to_index`.  Index-table memoization
 /// is the same write `jit_str_getitem` already admits as elidable.
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_str_find(s: i64, sub: i64) -> i64 {
-    jit_str_search_bounds(s as PyObjectRef, sub as PyObjectRef, 0, i64::MAX, true)
+pub extern "C" fn jit_str_find(s: PyObjectRef, sub: PyObjectRef) -> i64 {
+    jit_str_search_bounds(s, sub, 0, i64::MAX, true)
 }
 
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_str_rfind(s: i64, sub: i64) -> i64 {
-    jit_str_search_bounds(s as PyObjectRef, sub as PyObjectRef, 0, i64::MAX, false)
+pub extern "C" fn jit_str_rfind(s: PyObjectRef, sub: PyObjectRef) -> i64 {
+    jit_str_search_bounds(s, sub, 0, i64::MAX, false)
 }
 
 /// `descr_find` after `_convert_idx_params`: the two strings are GC refs
@@ -1969,8 +1967,8 @@ mod tests {
     fn test_jit_str_find_rfind_count_code_point_bounds() {
         let hay = w_str_new("一二三四一二");
         let needle = w_str_new("二");
-        assert_eq!(jit_str_find(hay as i64, needle as i64), 1);
-        assert_eq!(jit_str_rfind(hay as i64, needle as i64), 5);
+        assert_eq!(jit_str_find(hay, needle), 1);
+        assert_eq!(jit_str_rfind(hay, needle), 5);
         assert_eq!(jit_str_count_bounds(hay, needle, 0, i64::MAX), 2);
         assert_eq!(jit_str_count_bounds(hay, needle, 2, 6), 1);
         assert_eq!(jit_str_find_bounds(hay, needle, 2, 6), 5);
@@ -2082,9 +2080,9 @@ mod tests {
         unsafe {
             assert_eq!(w_str_get_wtf8(cat), "abcd");
             assert_eq!(w_str_get_wtf8(rep), "ababab");
-            assert!(jit_str_compare(a as i64, b as i64) < 0);
-            assert_eq!(jit_str_compare(a as i64, a as i64), 0);
-            assert!(jit_str_compare(b as i64, a as i64) > 0);
+            assert!(jit_str_compare(a, b) < 0);
+            assert_eq!(jit_str_compare(a, a), 0);
+            assert!(jit_str_compare(b, a) > 0);
             assert_eq!(jit_str_is_true(a as i64), 1);
             assert_eq!(jit_str_is_true(w_str_new("") as i64), 0);
         }
@@ -2094,17 +2092,17 @@ mod tests {
     fn test_jit_str_contains_matches_descr_contains() {
         let hay = w_str_new("alpha");
         let empty = w_str_new("");
-        assert_eq!(jit_str_contains(hay as i64, w_str_new("a") as i64), 1);
-        assert_eq!(jit_str_contains(hay as i64, w_str_new("z") as i64), 0);
-        assert_eq!(jit_str_contains(hay as i64, w_str_new("ph") as i64), 1);
-        assert_eq!(jit_str_contains(hay as i64, empty as i64), 1);
-        assert_eq!(jit_str_contains(empty as i64, empty as i64), 1);
-        assert_eq!(jit_str_contains(empty as i64, w_str_new("a") as i64), 0);
+        assert_eq!(jit_str_contains(hay, w_str_new("a")), 1);
+        assert_eq!(jit_str_contains(hay, w_str_new("z")), 0);
+        assert_eq!(jit_str_contains(hay, w_str_new("ph")), 1);
+        assert_eq!(jit_str_contains(hay, empty), 1);
+        assert_eq!(jit_str_contains(empty, empty), 1);
+        assert_eq!(jit_str_contains(empty, w_str_new("a")), 0);
         let uni = w_str_new("éèx");
-        assert_eq!(jit_str_contains(uni as i64, w_str_new("è") as i64), 1);
-        assert_eq!(jit_str_contains(uni as i64, w_str_new("x") as i64), 1);
-        assert_eq!(jit_str_contains(uni as i64, w_str_new("éè") as i64), 1);
-        assert_eq!(jit_str_contains(uni as i64, w_str_new("èé") as i64), 0);
+        assert_eq!(jit_str_contains(uni, w_str_new("è")), 1);
+        assert_eq!(jit_str_contains(uni, w_str_new("x")), 1);
+        assert_eq!(jit_str_contains(uni, w_str_new("éè")), 1);
+        assert_eq!(jit_str_contains(uni, w_str_new("èé")), 0);
     }
 
     #[test]
