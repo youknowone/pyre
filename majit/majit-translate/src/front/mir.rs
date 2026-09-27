@@ -8145,7 +8145,7 @@ impl<'a> Lowering<'a> {
                 ty: clone_tyref(dest_ty),
             };
             if self.move_plan(&place.ty).is_some()
-                && self.store_moved_aggregate(mir_bb, &place, &value)?
+                && self.store_moved_aggregate(mir_bb, &place, &value, Some(base.clone()))?
             {
                 return Ok(None);
             }
@@ -18294,11 +18294,16 @@ impl<'a> Lowering<'a> {
             return Ok(false);
         }
         let leaf = name.rsplit("::").next();
+        let arg_address = |this: &Self, index: usize| -> Option<Variable> {
+            let local = arg_locals.get(index).copied().flatten()?;
+            this.local_var.get(local).and_then(|var| var.clone())
+        };
         match leaf {
             Some("replace") if args.len() == 2 => {
                 let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) else {
                     return Ok(false);
                 };
+                let address = arg_address(self, 0);
                 // `*p = new` where `p` is not an `index_mut` alias is one word
                 // at that address: `raw_load` then `raw_store`
                 // (`rewrite_op_raw_load` / `rewrite_op_raw_store`). A
@@ -18311,9 +18316,12 @@ impl<'a> Lowering<'a> {
                         self.exchange_deref_word(mir_bb, &place, args[1].clone())?
                     {
                         old
-                    } else if let Some(old) =
-                        self.exchange_deref_aggregate(mir_bb, &place, args[1].clone())?
-                    {
+                    } else if let Some(old) = self.exchange_deref_aggregate(
+                        mir_bb,
+                        &place,
+                        args[1].clone(),
+                        address,
+                    )? {
                         old
                     } else {
                         return Ok(false);
@@ -18332,18 +18340,22 @@ impl<'a> Lowering<'a> {
                 let Some(slot1) = self.mem_slot(arg_locals.get(1).copied().flatten()) else {
                     return Ok(false);
                 };
+                let address0 = arg_address(self, 0);
+                let address1 = arg_address(self, 1);
                 if let (Some(place0), Some(place1)) =
                     (self.bare_deref_place(&slot0), self.bare_deref_place(&slot1))
                     && self.move_plan(&place0.ty).is_some()
                 {
-                    let Some(old0) = self.read_moved_aggregate(mir_bb, &place0)? else {
+                    let Some(old0) = self.read_moved_aggregate(mir_bb, &place0, address0.clone())?
+                    else {
                         return Ok(false);
                     };
-                    let Some(old1) = self.read_moved_aggregate(mir_bb, &place1)? else {
+                    let Some(old1) = self.read_moved_aggregate(mir_bb, &place1, address1.clone())?
+                    else {
                         return Ok(false);
                     };
-                    if !self.store_moved_aggregate(mir_bb, &place0, &old1)?
-                        || !self.store_moved_aggregate(mir_bb, &place1, &old0)?
+                    if !self.store_moved_aggregate(mir_bb, &place0, &old1, address0)?
+                        || !self.store_moved_aggregate(mir_bb, &place1, &old0, address1)?
                     {
                         return Ok(false);
                     }
@@ -18360,6 +18372,7 @@ impl<'a> Lowering<'a> {
                 let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) else {
                     return Ok(false);
                 };
+                let address = arg_address(self, 0);
                 if let Some(place) = self.bare_deref_place(&slot)
                     && self.move_plan(&place.ty).is_some()
                 {
@@ -18383,7 +18396,9 @@ impl<'a> Lowering<'a> {
                             result_ty,
                         },
                     });
-                    let Some(old) = self.exchange_deref_aggregate(mir_bb, &place, fresh)? else {
+                    let Some(old) =
+                        self.exchange_deref_aggregate(mir_bb, &place, fresh, address)?
+                    else {
                         return Ok(false);
                     };
                     self.local_var[dest_local] = Some(old);
@@ -18637,20 +18652,12 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         place: &Place,
         new_value: Variable,
+        address: Option<Variable>,
     ) -> Result<Option<Variable>, LowerError> {
-        if new_value.is_none()
-            && self
-                .move_plan(&place.ty)
-                .is_some_and(|plan| !plan.arms.is_empty())
-        {
-            // `mem::take` would store `T::default()`. An enum's default is
-            // one variant, not a zero of every overlapping payload.
-            return Ok(None);
-        }
-        let Some(old) = self.read_moved_aggregate(mir_bb, place)? else {
+        let Some(old) = self.read_moved_aggregate(mir_bb, place, address.clone())? else {
             return Ok(None);
         };
-        if !self.store_moved_aggregate(mir_bb, place, &new_value)? {
+        if !self.store_moved_aggregate(mir_bb, place, &new_value, address)? {
             return Ok(None);
         }
         Ok(Some(old))
@@ -18660,14 +18667,15 @@ impl<'a> Lowering<'a> {
         &mut self,
         mir_bb: usize,
         place: &Place,
+        address: Option<Variable>,
     ) -> Result<Option<Variable>, LowerError> {
         let Some(plan) = self.move_plan(&place.ty) else {
             return Ok(None);
         };
         if !plan.arms.is_empty() {
-            return self.copy_enum_switch(mir_bb, place, &plan, None);
+            return self.copy_enum_switch(mir_bb, place, &plan, None, address);
         }
-        let base = self.deref_base(mir_bb, place)?;
+        let base = self.deref_base(mir_bb, place, address)?;
         let mut parts = Vec::with_capacity(plan.spans.len());
         for span in &plan.spans {
             parts.push(self.emit_span_read(mir_bb, &base, span));
@@ -18680,15 +18688,16 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         place: &Place,
         value: &Variable,
+        address: Option<Variable>,
     ) -> Result<bool, LowerError> {
         let Some(plan) = self.move_plan(&place.ty) else {
             return Ok(false);
         };
         if !plan.arms.is_empty() {
-            self.copy_enum_switch(mir_bb, place, &plan, Some(value.clone()))?;
+            self.copy_enum_switch(mir_bb, place, &plan, Some(value.clone()), address)?;
             return Ok(true);
         }
-        let base = self.deref_base(mir_bb, place)?;
+        let base = self.deref_base(mir_bb, place, address)?;
         for span in &plan.spans {
             let part = self.emit_span_read(mir_bb, value, span);
             self.emit_span_write(mir_bb, &base, span, part);
@@ -18790,9 +18799,10 @@ impl<'a> Lowering<'a> {
         place: &Place,
         plan: &MovePlan,
         new_value: Option<Variable>,
+        address: Option<Variable>,
     ) -> Result<Option<Variable>, LowerError> {
         if new_value.is_some() {
-            let slot = self.deref_base(mir_bb, place)?;
+            let slot = self.deref_base(mir_bb, place, address)?;
             let src = new_value.expect("enum store has a source");
             self.store_enum_variant(mir_bb, &slot, &src, plan)?;
             return Ok(None);
@@ -18802,7 +18812,7 @@ impl<'a> Lowering<'a> {
             .first()
             .expect("enum move plan carries __discriminant");
         let head = self.block_id[mir_bb];
-        let slot = self.deref_base(mir_bb, place)?;
+        let slot = self.deref_base(mir_bb, place, address)?;
         let tag = self.emit_span_read(mir_bb, &slot, discr);
         let (join, vars) = self.graph.create_block_with_arg_vars(1);
         let phi = vars.into_iter().next().expect("enum move phi");
@@ -18842,51 +18852,30 @@ impl<'a> Lowering<'a> {
         Ok(Some(phi))
     }
 
-    fn deref_base(&mut self, mir_bb: usize, place: &Place) -> Result<Variable, LowerError> {
+    fn deref_base(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+        address: Option<Variable>,
+    ) -> Result<Variable, LowerError> {
         let PlaceKind::Projection(inner, _) = &place.kind else {
             return Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: aggregate exchange place is not a deref"
             )));
         };
-        // `&*p` aliases `p`. The borrow local is what the edge threads
-        // into the block that calls `mem::replace`; the inner local is
-        // not live there.
+        // `&*p` aliases `p`. The `&mut` argument's own variable is that
+        // address; the inner local is not live in the replace block.
         if let PlaceKind::Local(i) = &inner.kind
             && self
                 .local_var
                 .get(*i as usize)
                 .and_then(|var| var.as_ref())
                 .is_none()
-            && let Some(address) = self.address_of_recorded_deref(*i as usize)
+            && let Some(address) = address
         {
             return Ok(address);
         }
         self.resolve_place(mir_bb, (**inner).clone())
-    }
-
-    /// Variable of a borrow local whose place is `*inner_local`.
-    fn address_of_recorded_deref(&self, inner_local: usize) -> Option<Variable> {
-        for (local, place) in &self.atomic_ref_place {
-            let PlaceKind::Projection(inner, elem) = &place.kind else {
-                continue;
-            };
-            let ProjectionElem::Atom(name) = elem else {
-                continue;
-            };
-            if name != "Deref" {
-                continue;
-            }
-            let PlaceKind::Local(i) = &inner.kind else {
-                continue;
-            };
-            if *i as usize != inner_local {
-                continue;
-            }
-            if let Some(var) = self.local_var.get(*local).and_then(|var| var.clone()) {
-                return Some(var);
-            }
-        }
-        None
     }
 
     /// Charon fields of a multi-word inline value. A transparent newtype
