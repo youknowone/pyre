@@ -1829,7 +1829,10 @@ mod tests {
         let w_class = crate::w_type_new("StrSub", PY_NULL, std::ptr::null_mut());
         let obj = w_str_subclass_from_wtf8(Wtf8Buf::from("abc"), w_class);
         unsafe {
-            assert!(std::ptr::eq((*obj).ob_type, &crate::pyobject::STR_USER_TYPE));
+            assert!(std::ptr::eq(
+                (*obj).ob_type,
+                &crate::pyobject::STR_USER_TYPE
+            ));
             assert!(is_str(obj));
             assert!(!crate::pyobject::is_exact_type(obj, &STR_TYPE));
             assert_eq!(w_str_get_wtf8(obj), "abc");

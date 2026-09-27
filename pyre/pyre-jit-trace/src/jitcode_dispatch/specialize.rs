@@ -19063,12 +19063,12 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         let elem = unsafe { pyre_object::w_float_get_value(value_obj) };
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Float(elem));
-        // A float SUBCLASS instance shares `ob_type == &FLOAT_TYPE` (so it
-        // passes the unbox guard) but retags `w_class`;
-        // `FloatListStrategy.is_correct_type` rejects it, so the interpreter
-        // switches the list to Object storage instead of writing raw f64.
-        // Pin the canonical class the same way the list operand is pinned
-        // above, so such an instance side-exits to the generic residual.
+        // A float subclass instance is `W_FloatObjectUser` (`FLOAT_USER_TYPE`),
+        // so the `FLOAT_TYPE` unbox guard already rejects it.
+        // `FloatListStrategy.is_correct_type` also rejects a retagged
+        // `w_class`. Pin the canonical class the same way the list operand
+        // is pinned above, so such an instance side-exits to the generic
+        // residual.
         walker_guard_exact_w_class(
             ctx,
             op_pc,

@@ -540,9 +540,10 @@ unsafe fn builtin_leaf_repr_string(
 }
 
 /// Dispatch a user-defined `__repr__`/`__str__` override for a builtin leaf
-/// subclass instance.  `int`/`float`/`str`/... keep `ob_type` at the
-/// canonical storage type and carry the Python class in `w_class`, so the
-/// `ob_type`-keyed formatters ignore a subclass override.  Returns `Some`
+/// subclass instance.  `int`/`float`/`str`/... user subclasses carry a
+/// `_getusercls` typeptr. Callers pass `layout_base` of that typeptr, so
+/// the formatters below see the builtin storage type and would ignore a
+/// subclass override.  Returns `Some`
 /// only when the dunder resolves above `object` (whose inherited default
 /// must fall through to the builtin formatting instead of re-entering).
 /// `builtin_subclass_dunder` returning the raw `str` result object so a

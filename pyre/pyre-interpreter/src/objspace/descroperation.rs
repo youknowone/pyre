@@ -960,8 +960,6 @@ pub(crate) fn _truediv(x: i64, y: i64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: value,
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -1714,8 +1712,6 @@ pub(crate) fn _float_add(x: f64, y: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x + y,
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -1727,8 +1723,6 @@ pub(crate) fn _float_sub(x: f64, y: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x - y,
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -1740,8 +1734,6 @@ pub(crate) fn _float_mul(x: f64, y: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x * y,
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -1756,8 +1748,6 @@ pub(crate) fn _float_truediv(x: f64, y: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x / y,
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -5971,8 +5961,6 @@ pub(crate) fn float_pow_impl(x: f64, y: f64) -> PyResult {
                 w_class: get_instantiate(&FLOAT_TYPE),
             },
             floatval: z,
-            w_dict: PY_NULL,
-            w_slots: PY_NULL,
         }) as PyObjectRef),
         // Negative numbers raised to fractional powers become complex.
         Err(FloatPowError::Domain) => unsafe {
@@ -7114,8 +7102,6 @@ pub fn _float_pos(x: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x,
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -7138,8 +7124,6 @@ pub fn _float_sqrt(x: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval,
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -7152,8 +7136,6 @@ pub fn _float_sin(x: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x.sin(),
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -7166,8 +7148,6 @@ pub fn _float_cos(x: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x.cos(),
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -7180,8 +7160,6 @@ pub fn _float_tan(x: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x.tan(),
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -7194,8 +7172,6 @@ pub fn _float_atan(x: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x.atan(),
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -7208,8 +7184,6 @@ pub fn _float_exp(x: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x.exp(),
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -7222,8 +7196,6 @@ pub fn _float_log1p(x: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x.ln_1p(),
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -7236,8 +7208,6 @@ pub fn _float_asin(x: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x.asin(),
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -7253,8 +7223,6 @@ macro_rules! float_math1_leaf {
                     w_class: get_instantiate(&FLOAT_TYPE),
                 },
                 floatval: $compute,
-                w_dict: PY_NULL,
-                w_slots: PY_NULL,
             }) as PyObjectRef)
         }
     };
@@ -7335,8 +7303,6 @@ macro_rules! float_math2_leaf {
                     w_class: get_instantiate(&FLOAT_TYPE),
                 },
                 floatval: $compute,
-                w_dict: PY_NULL,
-                w_slots: PY_NULL,
             }) as PyObjectRef)
         }
     };
@@ -7442,8 +7408,6 @@ pub fn _float_ldexp(x: f64, exp: i64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: ldexp_exact_bits!(x, exp),
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -7484,8 +7448,6 @@ pub fn _float_abs(x: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x.abs(),
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -7510,8 +7472,6 @@ pub(crate) fn _float_neg(x: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: -x,
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 

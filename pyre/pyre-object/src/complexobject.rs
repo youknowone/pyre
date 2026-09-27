@@ -11,10 +11,16 @@ pub struct W_ComplexObject {
     pub ob_header: PyObject,
     pub real: f64,
     pub imag: f64,
-    /// Native-subclass mapdict owner. Exact complex values keep this null.
-    pub w_dict: PyObjectRef,
-    /// Native-subclass `__slots__` storage indexed by `Member.index`.
-    pub w_slots: PyObjectRef,
+}
+
+/// The translated user-subclass layout selected by `typedef.py _getusercls`.
+/// `W_ComplexObject` remains the base payload; `MapdictStorageMixin` contributes
+/// its fields only to the generated user class.
+#[repr(C)]
+pub struct W_ComplexObjectUser {
+    pub base: W_ComplexObject,
+    pub map: usize,
+    pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 /// Field offset of `real` within `W_ComplexObject`.
@@ -22,13 +28,16 @@ pub const COMPLEX_REAL_OFFSET: usize = std::mem::offset_of!(W_ComplexObject, rea
 
 /// Field offset of `imag` within `W_ComplexObject`.
 pub const COMPLEX_IMAG_OFFSET: usize = std::mem::offset_of!(W_ComplexObject, imag);
-pub const COMPLEX_W_DICT_OFFSET: usize = std::mem::offset_of!(W_ComplexObject, w_dict);
-pub const COMPLEX_W_SLOTS_OFFSET: usize = std::mem::offset_of!(W_ComplexObject, w_slots);
 
 /// GC type id assigned to `W_ComplexObject` at JitDriver init time.
 /// Like `W_FLOAT_GC_TYPE_ID`, held as a constant so the allocation hook
 /// can reach it without a back-channel.
 pub const W_COMPLEX_GC_TYPE_ID: u32 = 54;
+/// User-subclass complex layout (`typedef.py` `_getusercls`). Unconditional,
+/// so its tid sits with the other closed ids (171) ahead of the
+/// target-gated tail.
+pub const W_COMPLEX_USER_GC_TYPE_ID: u32 = 171;
+pub const W_COMPLEX_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_ComplexObjectUser>();
 
 /// Fixed payload size for `W_ComplexObject`.
 pub const W_COMPLEX_OBJECT_SIZE: usize = std::mem::size_of::<W_ComplexObject>();
@@ -38,6 +47,14 @@ impl crate::lltype::GcType for W_ComplexObject {
         W_COMPLEX_GC_TYPE_ID
     }
     const SIZE: usize = W_COMPLEX_OBJECT_SIZE;
+}
+
+impl crate::lltype::GcType for W_ComplexObjectUser {
+    #[inline(always)]
+    fn type_id() -> u32 {
+        W_COMPLEX_USER_GC_TYPE_ID
+    }
+    const SIZE: usize = W_COMPLEX_USER_OBJECT_SIZE;
 }
 
 /// Allocate a new W_ComplexObject on the heap.
@@ -53,31 +70,34 @@ pub fn w_complex_new(real: f64, imag: f64) -> PyObjectRef {
         },
         real,
         imag,
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef
 }
 
-/// Allocate a `W_ComplexObject` for a `complex` subclass instance, on the
+/// Allocate a `W_ComplexObjectUser` for a `complex` subclass instance, on the
 /// managed heap so it can be reclaimed. See [`crate::intobject::w_int_subclass_new`]
 /// for why the shared constructor cannot be used.
 pub fn w_complex_subclass_new(real: f64, imag: f64) -> PyObjectRef {
-    let obj = W_ComplexObject {
-        ob_header: PyObject {
-            ob_type: &COMPLEX_TYPE as *const PyType,
-            w_class: get_instantiate(&COMPLEX_TYPE),
+    let obj = W_ComplexObjectUser {
+        base: W_ComplexObject {
+            ob_header: PyObject {
+                ob_type: &crate::pyobject::COMPLEX_USER_TYPE as *const PyType,
+                w_class: get_instantiate(&COMPLEX_TYPE),
+            },
+            real,
+            imag,
         },
-        real,
-        imag,
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
+        map: 0,
+        storage: std::ptr::null_mut(),
     };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_COMPLEX_GC_TYPE_ID, W_COMPLEX_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
+        W_COMPLEX_USER_GC_TYPE_ID,
+        std::mem::size_of::<W_ComplexObjectUser>(),
+    );
     if raw.is_null() {
         crate::lltype::malloc_typed(obj) as PyObjectRef
     } else {
         unsafe {
-            std::ptr::write(raw as *mut W_ComplexObject, obj);
+            std::ptr::write(raw as *mut W_ComplexObjectUser, obj);
         }
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
@@ -102,49 +122,24 @@ pub unsafe fn w_complex_get_imag(obj: PyObjectRef) -> f64 {
     unsafe { (*(obj as *const W_ComplexObject)).imag }
 }
 
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_complex_getdict(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ComplexObject)).w_dict }
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_complex_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
-    unsafe { (*(obj as *mut W_ComplexObject)).w_dict = w_dict };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
-}
-
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_complex_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    let slots = unsafe { (*(obj as *const W_ComplexObject)).w_slots };
-    unsafe { crate::slots::slot_get(slots, index) }
-}
-
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_complex_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    crate::slot_set_direct!(obj, index, value, W_ComplexObject, w_slots)
-}
-
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_complex_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    let slots = unsafe { (*(obj as *const W_ComplexObject)).w_slots };
-    unsafe { crate::slots::slot_del(slots, index) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `typedef.py _getusercls(W_ComplexObject)`: a subclass instance is
+    /// `W_ComplexObjectUser` carrying `COMPLEX_USER_TYPE`.
+    #[test]
+    fn complex_subclass_instance_carries_user_typeptr() {
+        let obj = w_complex_subclass_new(1.0, -2.0);
+        unsafe {
+            assert!(std::ptr::eq(
+                (*obj).ob_type,
+                &crate::pyobject::COMPLEX_USER_TYPE
+            ));
+            assert!(crate::pyobject::is_complex(obj));
+            assert!(!crate::pyobject::is_exact_type(obj, &COMPLEX_TYPE));
+        }
+    }
 
     #[test]
     fn test_complex_create_and_read() {

@@ -232,7 +232,7 @@ pub unsafe fn pytype_has_mapdict_mixin(obj: PyObjectRef) -> bool {
 /// True when `obj`'s Python class is exactly the builtin type for its
 /// layout — i.e. NOT a user subclass.
 ///
-/// A user subclass instance of `int`, `str` or `tuple` carries the builtin's
+/// A user subclass instance of `int`, `float`, `complex`, `str` or `tuple` carries the builtin's
 /// `_getusercls` class as its typeptr, which alone decides exactness. A user
 /// subclass of any other builtin keeps the builtin `ob_type` (and therefore
 /// the builtin struct layout and the `is_list` / … layout predicates) while
@@ -375,8 +375,12 @@ pub static INT_TYPE: PyType = new_pytype_with_user_subclass("int", &INT_USER_TYP
 /// `W_IntObjectUser` (`typedef.py _getusercls(W_IntObject)`).
 pub static INT_USER_TYPE: PyType = new_user_pytype("int", &INT_TYPE);
 pub static BOOL_TYPE: PyType = new_pytype("bool");
-pub static FLOAT_TYPE: PyType = new_pytype("float");
-pub static COMPLEX_TYPE: PyType = new_pytype("complex");
+pub static FLOAT_TYPE: PyType = new_pytype_with_user_subclass("float", &FLOAT_USER_TYPE);
+/// `W_FloatObjectUser` (`typedef.py _getusercls(W_FloatObject)`).
+pub static FLOAT_USER_TYPE: PyType = new_user_pytype("float", &FLOAT_TYPE);
+pub static COMPLEX_TYPE: PyType = new_pytype_with_user_subclass("complex", &COMPLEX_USER_TYPE);
+/// `W_ComplexObjectUser` (`typedef.py _getusercls(W_ComplexObject)`).
+pub static COMPLEX_USER_TYPE: PyType = new_user_pytype("complex", &COMPLEX_TYPE);
 pub static STR_TYPE: PyType = new_pytype_with_user_subclass("str", &STR_USER_TYPE);
 /// `W_UnicodeObjectUser` (`typedef.py _getusercls(W_UnicodeObject)`).
 pub static STR_USER_TYPE: PyType = new_user_pytype("str", &STR_TYPE);
@@ -781,22 +785,25 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // The two `step == 1` range-iterator shapes, whose ids are explicit.
     (165, Some(0)),
     (166, Some(0)),
-    // 167-169 are `typedef.py` `_getusercls` layouts (int/str/tuple user),
-    // each an rclass subclass of the builtin it was made from.
+    // 167-171 are `typedef.py` `_getusercls` layouts
+    // (int/str/tuple/float/complex user), each an rclass subclass of the
+    // builtin it was made from.
     (167, Some(1)),
     (168, Some(34)),
     (169, Some(8)),
-    // Native-only type IDs 170 and 171 represent `posix.DirEntry` and
+    (170, Some(2)),
+    (171, Some(54)),
+    // Native-only type IDs 172 and 173 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (170, Some(0)),
+    (172, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (171, Some(0)),
+    (173, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (172, Some(0)),
+    (174, Some(0)),
     // The classes `pyre-module` registers follow, numbered by `build_gc` in
     // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
@@ -1334,6 +1341,8 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(167, &INT_USER_TYPE),
         subclass_range_alias(168, &STR_USER_TYPE),
         subclass_range_alias(169, &TUPLE_USER_TYPE),
+        subclass_range_alias(170, &FLOAT_USER_TYPE),
+        subclass_range_alias(171, &COMPLEX_USER_TYPE),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),
@@ -1536,7 +1545,7 @@ pub unsafe fn is_bool(obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_float(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &FLOAT_TYPE) }
+    unsafe { py_type_check(obj, &FLOAT_TYPE) || py_type_check(obj, &FLOAT_USER_TYPE) }
 }
 
 #[inline]
@@ -1544,7 +1553,7 @@ pub unsafe fn is_float(obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_complex(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &COMPLEX_TYPE) }
+    unsafe { py_type_check(obj, &COMPLEX_TYPE) || py_type_check(obj, &COMPLEX_USER_TYPE) }
 }
 
 #[inline]

@@ -1286,42 +1286,15 @@ static W_FLOAT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         std::mem::size_of::<W_FloatObject>(),
         W_FLOAT_GC_TYPE_ID,
         &FLOAT_TYPE as *const _ as usize,
-        &[
-            (
-                "floatval",
-                FLOAT_FLOATVAL_OFFSET,
-                8,
-                Type::Float,
-                false,
-                true,
-                false,
-            ),
-            // Native-subclass `__dict__` / `__slots__` GC-pointer slots. The
-            // runtime TypeInfo traces both, so they must enter gc_fielddescrs
-            // for rewrite.py:498-504 to emit the delayed NULL stores that
-            // malloc_zero_filled=false requires; otherwise a NewWithVtable'd
-            // exact float carries uninitialised nursery bytes here and the
-            // collector traces poison. They follow `floatval` so its stable
-            // field index stays 0.
-            (
-                "w_dict",
-                FLOAT_W_DICT_OFFSET,
-                WORD,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            (
-                "w_slots",
-                FLOAT_W_SLOTS_OFFSET,
-                WORD,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-        ],
+        &[(
+            "floatval",
+            FLOAT_FLOATVAL_OFFSET,
+            8,
+            Type::Float,
+            false,
+            true,
+            false,
+        )],
         "W_FloatObject",
         "floatobject::W_FloatObject",
     )
@@ -1349,24 +1322,6 @@ static W_COMPLEX_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| 
                 Type::Float,
                 false,
                 true,
-                false,
-            ),
-            (
-                "w_dict",
-                COMPLEX_W_DICT_OFFSET,
-                WORD,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            (
-                "w_slots",
-                COMPLEX_W_SLOTS_OFFSET,
-                WORD,
-                Type::Ref,
-                false,
-                false,
                 false,
             ),
         ],
@@ -3488,12 +3443,9 @@ pub fn make_array_descr_with_full_id(
 // Range iterator field descriptors.
 
 use pyre_object::complexobject::{
-    COMPLEX_IMAG_OFFSET, COMPLEX_REAL_OFFSET, COMPLEX_W_DICT_OFFSET, COMPLEX_W_SLOTS_OFFSET,
-    W_COMPLEX_GC_TYPE_ID, W_ComplexObject,
+    COMPLEX_IMAG_OFFSET, COMPLEX_REAL_OFFSET, W_COMPLEX_GC_TYPE_ID, W_ComplexObject,
 };
-use pyre_object::floatobject::{
-    FLOAT_FLOATVAL_OFFSET, FLOAT_W_DICT_OFFSET, FLOAT_W_SLOTS_OFFSET, W_FloatObject,
-};
+use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::functional::{
     RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_ONE_ARG_CURRENT_OFFSET, RANGE_ITER_ONE_ARG_STOP_OFFSET,
     RANGE_ITER_REMAINING_OFFSET, RANGE_ITER_STEP_OFFSET, RANGE_ITER_STEP_ONE_CURRENT_OFFSET,
@@ -4638,6 +4590,32 @@ static W_TUPLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
     )
 });
 
+static W_FLOAT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        pyre_object::floatobject::W_FLOAT_USER_OBJECT_SIZE,
+        pyre_object::floatobject::W_FLOAT_USER_GC_TYPE_ID,
+        &pyre_object::pyobject::FLOAT_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::floatobject::W_FloatObjectUser, map),
+        std::mem::offset_of!(pyre_object::floatobject::W_FloatObjectUser, storage),
+        "W_FloatObjectUser",
+        "floatobject::W_FloatObjectUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x30,
+    )
+});
+
+static W_COMPLEX_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        pyre_object::complexobject::W_COMPLEX_USER_OBJECT_SIZE,
+        pyre_object::complexobject::W_COMPLEX_USER_GC_TYPE_ID,
+        &pyre_object::pyobject::COMPLEX_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::complexobject::W_ComplexObjectUser, map),
+        std::mem::offset_of!(pyre_object::complexobject::W_ComplexObjectUser, storage),
+        "W_ComplexObjectUser",
+        "complexobject::W_ComplexObjectUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x40,
+    )
+});
+
 /// `W_ObjectObject.map` (`objectobject.rs`) — the instance shape word,
 /// `self.map` of PyPy's `MapdictStorageMixin` (`mapdict.py`). Read as an
 /// `Int` word so the LOAD_ATTR fast path can `guard_value` it to a constant map
@@ -4669,6 +4647,10 @@ pub fn object_storage_descr() -> DescrRef {
 pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
     if unsafe { pyre_object::is_int(obj) } {
         field_descr_from_group(&W_INT_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::is_float(obj) } {
+        field_descr_from_group(&W_FLOAT_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::is_complex(obj) } {
+        field_descr_from_group(&W_COMPLEX_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::is_str(obj) } {
         field_descr_from_group(&W_UNICODE_USER_DESCR_GROUP, 0)
     } else if unsafe {
@@ -4688,6 +4670,10 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
 pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
     if unsafe { pyre_object::is_int(obj) } {
         field_descr_from_group(&W_INT_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::is_float(obj) } {
+        field_descr_from_group(&W_FLOAT_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::is_complex(obj) } {
+        field_descr_from_group(&W_COMPLEX_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::is_str(obj) } {
         field_descr_from_group(&W_UNICODE_USER_DESCR_GROUP, 1)
     } else if unsafe {
@@ -6486,6 +6472,14 @@ mod tests {
             0x6100_0021
         );
         assert_eq!(
+            W_FLOAT_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0030
+        );
+        assert_eq!(
+            W_COMPLEX_USER_DESCR_GROUP.field_descrs[1].index(),
+            0x6100_0041
+        );
+        assert_eq!(
             W_INT_USER_DESCR_GROUP.field_descrs[1].field_type(),
             Type::Ref
         );
@@ -7938,8 +7932,14 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     ("floatobject::W_FloatObject", || {
         LazyLock::force(&W_FLOAT_DESCR_GROUP);
     }),
+    ("floatobject::W_FloatObjectUser", || {
+        LazyLock::force(&W_FLOAT_USER_DESCR_GROUP);
+    }),
     ("complexobject::W_ComplexObject", || {
         LazyLock::force(&W_COMPLEX_DESCR_GROUP);
+    }),
+    ("complexobject::W_ComplexObjectUser", || {
+        LazyLock::force(&W_COMPLEX_USER_DESCR_GROUP);
     }),
     ("longobject::W_LongObject", || {
         LazyLock::force(&W_LONG_DESCR_GROUP);

@@ -639,7 +639,8 @@ pub unsafe fn w_tuple_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRe
 #[inline]
 unsafe fn w_tuple_getitem_known(obj: PyObjectRef, idx: usize) -> PyObjectRef {
     let ob_type = (*obj).ob_type;
-    if std::ptr::eq(ob_type, &TUPLE_TYPE) || std::ptr::eq(ob_type, &crate::pyobject::TUPLE_USER_TYPE)
+    if std::ptr::eq(ob_type, &TUPLE_TYPE)
+        || std::ptr::eq(ob_type, &crate::pyobject::TUPLE_USER_TYPE)
     {
         let tuple = &*(obj as *const W_TupleObject);
         let base = items_block_items_base(tuple.wrappeditems);
@@ -692,7 +693,8 @@ pub unsafe fn w_tuple_len(obj: PyObjectRef) -> usize {
         return 2;
     }
     debug_assert!(
-        std::ptr::eq(ob_type, &TUPLE_TYPE) || std::ptr::eq(ob_type, &crate::pyobject::TUPLE_USER_TYPE)
+        std::ptr::eq(ob_type, &TUPLE_TYPE)
+            || std::ptr::eq(ob_type, &crate::pyobject::TUPLE_USER_TYPE)
     );
     let tuple = &*(obj as *const W_TupleObject);
     items_block_capacity(tuple.wrappeditems)
@@ -763,11 +765,17 @@ mod tests {
         let w_class = crate::w_type_new("TupleSub", PY_NULL, std::ptr::null_mut());
         let tup = w_tuple_subclass_new_array_backed(vec![w_int_new(4), w_int_new(5)], w_class);
         unsafe {
-            assert!(std::ptr::eq((*tup).ob_type, &crate::pyobject::TUPLE_USER_TYPE));
+            assert!(std::ptr::eq(
+                (*tup).ob_type,
+                &crate::pyobject::TUPLE_USER_TYPE
+            ));
             assert!(is_tuple(tup));
             assert!(!crate::pyobject::is_exact_type(tup, &TUPLE_TYPE));
             assert_eq!(w_tuple_len(tup), 2);
-            assert_eq!(crate::intobject::w_int_get_value(w_tuple_getitem(tup, 1).unwrap()), 5);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_tuple_getitem(tup, 1).unwrap()),
+                5
+            );
             assert_eq!(w_tuple_items_copy_as_vec(tup).len(), 2);
         }
     }

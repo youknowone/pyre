@@ -3534,11 +3534,11 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
         }
         ListStrategy::Float => {
             // `FloatListStrategy.is_correct_type` (listobject.py) is
-            // `type(w_obj) is W_FloatObject` — a strict identity check that
-            // rejects float subclasses (which share `ob_type == &FLOAT_TYPE`
-            // but overwrite `w_class`), matching the Integer arm's
-            // `is_plain_int1`.  A subclass de-specialises to Object storage
-            // rather than being stored unboxed (which would lose its identity).
+            // `type(w_obj) is W_FloatObject`. A float subclass instance is a
+            // `W_FloatObjectUser` (`FLOAT_USER_TYPE`), so `is_plain_float_strict`
+            // rejects it the same way `is_plain_int1` rejects `INT_USER_TYPE`.
+            // A subclass de-specialises to Object storage rather than being
+            // stored unboxed (which would lose its identity).
             if is_float_strategy_item(value) {
                 // ll_append (rtyper/rlist.py): length = ll_length();
                 // _ll_resize_ge(length+1); ll_setitem_fast(length, item).
