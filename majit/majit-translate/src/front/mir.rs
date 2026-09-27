@@ -17364,6 +17364,11 @@ impl<'a> Lowering<'a> {
             && args.len() == 2
             && crate::front::slice_get::is_slice_get_segments(segments)
             && slice_get_index_is_scalar
+            // `first`/`last` carry the mark onto the site and answer a byte
+            // view with `__strlen` plus `__string_byte_getitem`; the scalar
+            // `get` rewriter has neither, so its diamond would read the string
+            // object as a GC array.  Leave the residual call.
+            && !self.slice_receiver_is_string_byte_view(&arg_locals)
             && let Some((item_ty, array_type_id)) = slice_get_element.clone()
             && let Some(site) =
                 self.recognize_slice_get_site(&call.dest.ty, &result_var, item_ty, array_type_id)
@@ -22368,17 +22373,24 @@ impl<'a> Lowering<'a> {
     /// successful arm must emit `__string_byte_getitem`; any other
     /// proven element spelling rides on `array_type_id` the way
     /// [`Self::recognize_slice_get_site`] does.
+    /// Whether the receiver of a recognized slice call is an `as_bytes()` view
+    /// of a string rather than a GC array, i.e. carries a `StringRepr` length
+    /// and a `__string_byte_getitem` element read.
+    fn slice_receiver_is_string_byte_view(&self, arg_locals: &[Option<usize>]) -> bool {
+        arg_locals
+            .first()
+            .copied()
+            .flatten()
+            .is_some_and(|local| self.string_byte_view_locals.contains(&local))
+    }
+
     fn annotate_slice_first_site(
         &self,
         site: &mut crate::front::slice_first::SliceFirstSite,
         arg_locals: &[Option<usize>],
         element: Option<(ValueType, Option<String>)>,
     ) {
-        let string_byte_view = arg_locals
-            .first()
-            .copied()
-            .flatten()
-            .is_some_and(|local| self.string_byte_view_locals.contains(&local));
+        let string_byte_view = self.slice_receiver_is_string_byte_view(arg_locals);
         if string_byte_view {
             site.string_byte_view = true;
             site.array_type_id = None;

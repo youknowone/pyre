@@ -5576,12 +5576,19 @@ pub fn has_real_kwargs(kwargs: Option<PyObjectRef>) -> bool {
 /// (`sum`, `round`, `pow`) count positionals plus this against their limit.
 ///
 /// The marker occupies exactly one entry, so the answer is the dict's length
-/// less that entry: [`split_builtin_kwargs`] hands back a dict only when its
-/// `__pyre_kw__` slot holds the sentinel, and `call_with_kwargs` stores that
-/// key last, so a caller keyword spelled `__pyre_kw__` overwrites the marker
-/// instead of adding a second entry.  `w_dict_len` reads the count off the
-/// strategy; enumerating the entries to filter one name out would build a
-/// `Vec<(Wtf8Buf, PyObjectRef)>` per arity check.
+/// less that entry.  `__pyre_kw__` is one key, so it holds one slot whichever
+/// order the writes happen in, and [`split_builtin_kwargs`] hands back a dict
+/// only when that slot still holds the sentinel.  `w_dict_len` reads the count
+/// off the strategy; enumerating the entries to filter one name out would build
+/// a `Vec<(Wtf8Buf, PyObjectRef)>` per arity check.
+///
+/// A caller keyword spelled `__pyre_kw__` lands in the same slot and
+/// `call_with_kwargs` writes the sentinel over it, so that keyword is lost
+/// before any arity check sees it: `sum([1, 2], **{'__pyre_kw__': 0})` answers
+/// 3 where 3.14.6 and pypy3 both raise, and `dict(**{'__pyre_kw__': 7})`
+/// answers `{}` where both give `{'__pyre_kw__': 7}`.  That is the marker
+/// scheme's own collision, not this count's: filtering the name out of the
+/// entry list reported the same 0.
 ///
 /// The length also needs no key decode, which the entry list does: a key
 /// carrying a lone surrogate has no `&str` view, so counting through

@@ -447,8 +447,9 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
     let len_kind = crate::front::bool_then::slice_len_op(
         slice,
         site.array_type_id.as_deref(),
-        // `get` has no string-byte-view receiver: its element read is always
-        // an `ArrayRead`, where `first`/`last` also serve `as_bytes()` views.
+        // A byte-view receiver never reaches here: the site capture in
+        // `front::mir` declines one, because this rewriter's element read is
+        // always an `ArrayRead` while `first`/`last` also serve `as_bytes()`.
         false,
     );
     graph.block_mut(a_id).operations.push(SpaceOperation {
