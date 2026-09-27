@@ -6475,16 +6475,6 @@ impl CallControl {
         false
     }
 
-    /// `getcalldescr` renders the callee as `segments.join("::")` or
-    /// `indirect[path,path]` before `effectinfo_from_writeanalyze`.
-    fn rendered_callee_marked_cannot_raise(&self, callee_path: &str) -> bool {
-        if callee_path.starts_with("indirect[") {
-            return self.path_or_alias_marked_cannot_raise(&CallPath::from_segments([callee_path]));
-        }
-        let path = CallPath::from_segments(callee_path.split("::").filter(|seg| !seg.is_empty()));
-        !path.segments.is_empty() && self.path_or_alias_marked_cannot_raise(&path)
-    }
-
     fn path_marked_cannot_raise(&self, path: &CallPath) -> bool {
         self.function_graphs
             .get(path)
@@ -7635,7 +7625,6 @@ impl CallControl {
         cache: &mut AnalysisCache,
         extradescrs: Option<Vec<DescrRef>>,
     ) -> CallDescriptor {
-        let caller_supplied_extraeffect = extraeffect.is_some();
         // Extract the direct-call target (if any) and indirect-call family
         // (if any).  Exactly one is Some after the initial dispatch;
         // downstream branches key off this.
@@ -7931,24 +7920,10 @@ impl CallControl {
         }
         let extraeffect = extraeffect.unwrap_or(ExtraEffect::CanRaise);
 
-        // `#[dont_look_inside_cannot_raise]` is a pyre assertion because
-        // `_canraise` / `RandomEffectsAnalyzer` cannot prove a residual
-        // that calls host code is exception-free. Honour it after the
-        // analyzer so `RandomEffects` does not emit GUARD_NO_EXCEPTION.
-        // Elidable assertions stay in the elidable arm (`EF_ELIDABLE_*`).
-        // A caller-supplied extraeffect is kept (call.py getcalldescr
-        // `if extraeffect is None`).
-        let extraeffect = match shape {
-            CallShape::Direct(target)
-                if !elidable
-                    && !loopinvariant
-                    && self.declares_cannot_raise(target)
-                    && !caller_supplied_extraeffect =>
-            {
-                ExtraEffect::CannotRaise
-            }
-            _ => extraeffect,
-        };
+        // call.py:283-284: a true `RandomEffectsAnalyzer` answer is
+        // `EF_RANDOM_EFFECTS` and is not rewritten. A cannot-raise mark
+        // applies only when `extraeffect is None` (the arm above).
+        // `effectinfo_from_writeanalyze` then keeps `None` descr lists.
 
         // RPython call.py:249-251: loopinvariant functions must have no args.
         if loopinvariant && !arg_types.is_empty() {
@@ -8030,7 +8005,7 @@ impl CallControl {
             CallShape::Direct(target) => self.call_release_gil_target_for(target),
             CallShape::Indirect(_) => EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
         };
-        let mut effectinfo = effectinfo_from_writeanalyze(
+        let effectinfo = effectinfo_from_writeanalyze(
             effects,
             extraeffect,
             oopspecindex,
@@ -8041,27 +8016,6 @@ impl CallControl {
             self,
             call_release_gil_target,
         );
-        // `effectinfo_from_writeanalyze` rewrites a top read/write set to
-        // `EF_RANDOM_EFFECTS`.  A `#[dont_look_inside_cannot_raise]`
-        // trampoline's body is that top set (it calls host code the
-        // analyzer cannot see), which would put the residual back at
-        // may-force and a transparent helper walk cannot record it.
-        // One descriptor serves the whole indirect family, so a single
-        // member does not license dropping the exception path the other
-        // targets still need: every resolved member has to carry the
-        // harvested assertion, and an unresolved family carries nothing.
-        let leaf_cannot_raise = match shape {
-            CallShape::Direct(target) => self.declares_cannot_raise(target),
-            CallShape::Indirect(graphs) => graphs.is_some_and(|paths| {
-                !paths.is_empty()
-                    && paths
-                        .iter()
-                        .all(|path| self.path_or_alias_marked_cannot_raise(path))
-            }),
-        };
-        if !elidable && !loopinvariant && !caller_supplied_extraeffect && leaf_cannot_raise {
-            effectinfo.extraeffect = ExtraEffect::CannotRaise;
-        }
 
         // RPython call.py:326-332 post-conditions on elidable / loopinvariant.
         if elidable || loopinvariant {
@@ -8229,66 +8183,37 @@ fn analyze_readwrite_indirect_family(
 // FieldRead/FieldWrite/ArrayRead/ArrayWrite and collect their
 // descriptor indices into EffectInfo's bitset fields.
 
-/// Top-set / unrepresentable descr degradation. An elidable or
-/// loop-invariant effect stays `EF_RANDOM_EFFECTS`; the cannot-raise
-/// mark is the non-elidable assertion and is read off the harvested row.
-fn degraded_extraeffect(
-    extraeffect: ExtraEffect,
-    callee_path: &str,
-    cc: &CallControl,
-) -> ExtraEffect {
-    if matches!(
-        extraeffect,
-        ExtraEffect::ElidableCannotRaise
-            | ExtraEffect::ElidableOrMemoryError
-            | ExtraEffect::ElidableCanRaise
-            | ExtraEffect::LoopInvariant
-    ) {
-        return ExtraEffect::RandomEffects;
-    }
-    if cc.rendered_callee_marked_cannot_raise(callee_path) {
-        ExtraEffect::CannotRaise
-    } else {
-        ExtraEffect::RandomEffects
-    }
-}
-
-/// `None` descr sets are the `EF_RANDOM_EFFECTS` wildcard. A concrete
-/// effect (`CannotRaise` and the rest) has to carry the empty image
-/// `effectinfo.py` builds for a non-top analyzer result, or rehydrate
-/// refuses the embedded effect.
-fn effectinfo_without_named_descrs(
-    extraeffect: ExtraEffect,
+/// `effectinfo.py` `effectinfo_from_writeanalyze`: a top set or
+/// `EF_RANDOM_EFFECTS` keeps every descr list `None` and forces
+/// `extraeffect = EF_RANDOM_EFFECTS`. `None` lists exist only with
+/// random effects (`EffectInfo.__new__`).
+fn effectinfo_random_effects(
     oopspecindex: OopSpecIndex,
     extradescrs: Option<Vec<majit_ir::descr::DescrRef>>,
     can_invalidate: bool,
-    can_collect: bool,
     call_release_gil_target: (u64, i32),
 ) -> EffectInfo {
-    let concrete = extraeffect != ExtraEffect::RandomEffects;
-    let sets = concrete.then_some(Vec::new());
-    let bits = concrete.then_some(Vec::new());
     EffectInfo {
-        extraeffect,
+        extraeffect: ExtraEffect::RandomEffects,
         oopspecindex,
         runtime_helper: majit_ir::RuntimeHelperKind::None,
-        _readonly_descrs_fields: sets.clone(),
-        _write_descrs_fields: sets.clone(),
-        _readonly_descrs_arrays: sets.clone(),
-        _write_descrs_arrays: sets.clone(),
-        _readonly_descrs_interiorfields: sets.clone(),
-        _write_descrs_interiorfields: sets,
-        descr_set_keys: concrete.then_some(majit_ir::effectinfo::DescrSetKeysImage::Empty),
-        readonly_descrs_fields: bits.clone(),
-        write_descrs_fields: bits.clone(),
-        readonly_descrs_arrays: bits.clone(),
-        write_descrs_arrays: bits.clone(),
-        readonly_descrs_interiorfields: bits.clone(),
-        write_descrs_interiorfields: bits,
+        _readonly_descrs_fields: None,
+        _write_descrs_fields: None,
+        _readonly_descrs_arrays: None,
+        _write_descrs_arrays: None,
+        _readonly_descrs_interiorfields: None,
+        _write_descrs_interiorfields: None,
+        descr_set_keys: None,
+        readonly_descrs_fields: None,
+        write_descrs_fields: None,
+        readonly_descrs_arrays: None,
+        write_descrs_arrays: None,
+        readonly_descrs_interiorfields: None,
+        write_descrs_interiorfields: None,
         single_write_descr_array: None,
         extradescrs,
         can_invalidate,
-        can_collect,
+        can_collect: true,
         call_release_gil_target,
     }
 }
@@ -8349,23 +8274,18 @@ pub fn effectinfo_from_writeanalyze(
     can_collect: bool,
     extradescrs: Option<Vec<DescrRef>>,
     callee_path: &str,
-    cc: &CallControl,
+    _cc: &CallControl,
     call_release_gil_target: (u64, i32),
 ) -> EffectInfo {
-    // effectinfo.py:285: if effects is top_set or extraeffect == EF_RANDOM_EFFECTS:
+    // effectinfo.py:285-292: top_set or EF_RANDOM_EFFECTS ⇒ every descr
+    // list is None and extraeffect is EF_RANDOM_EFFECTS. can_collect is
+    // True (effectinfo.py:364-365, forces ⇒ can_collect, and random
+    // effects are above that threshold).
     if effects.is_top || extraeffect == ExtraEffect::RandomEffects {
-        // A `dont_look_inside_cannot_raise` helper's graph is top (it calls
-        // host code).  Publishing that as `EF_RANDOM_EFFECTS` makes the
-        // residual may-force, and a transparent helper walk cannot record it.
-        let extraeffect = degraded_extraeffect(extraeffect, callee_path, cc);
-        // effectinfo.py:286-292: a random effect's descr sets stay `None`.
-        // A concrete effect still needs the empty image.
-        return effectinfo_without_named_descrs(
-            extraeffect,
+        return effectinfo_random_effects(
             oopspecindex,
             extradescrs.clone(),
             can_invalidate,
-            true,
             call_release_gil_target,
         );
     }
@@ -8535,18 +8455,16 @@ pub fn effectinfo_from_writeanalyze(
         write_interior_canon,
     )
     else {
-        let extraeffect = degraded_extraeffect(extraeffect, callee_path, cc);
-        if extraeffect == ExtraEffect::RandomEffects {
-            eprintln!(
-                "[s4c-degrade] {callee_path}: unrepresentable EffectInfo descr set member; using EF_RANDOM_EFFECTS"
-            );
-        }
-        return effectinfo_without_named_descrs(
-            extraeffect,
+        // A missing descr-set member cannot be named. Upstream has no
+        // empty-image stand-in: an unrepresentable write set is the
+        // random-effects wildcard (None lists), not "writes nothing".
+        eprintln!(
+            "[s4c-degrade] {callee_path}: unrepresentable EffectInfo descr set member; using EF_RANDOM_EFFECTS"
+        );
+        return effectinfo_random_effects(
             oopspecindex,
             extradescrs.clone(),
             can_invalidate,
-            true,
             call_release_gil_target,
         );
     };
@@ -11957,9 +11875,10 @@ mod tests {
             "typedef",
             "__majit_call_target_tuple_from_exact_list",
         ]);
-        // The trampoline has a graph whose read/write analysis is top, which
-        // `effectinfo_from_writeanalyze` would otherwise publish as
-        // `EF_RANDOM_EFFECTS`.
+        // The trampoline calls a `random_effects_on_gcobjs` host. Upstream
+        // `effectinfo_from_writeanalyze` publishes that as
+        // `EF_RANDOM_EFFECTS` with `None` descr lists; a cannot-raise mark
+        // does not replace the wildcard with an empty write set.
         let trampoline = CallPath::from_segments([
             "pyre_interpreter",
             "typedef",
@@ -11988,7 +11907,11 @@ mod tests {
                 &mut cache,
                 None,
             );
-            assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
+            assert_eq!(
+                descriptor.extra_info.extraeffect,
+                ExtraEffect::RandomEffects
+            );
+            assert!(descriptor.extra_info._write_descrs_fields.is_none());
         });
     }
 
@@ -12089,7 +12012,17 @@ mod tests {
             &mut cache,
             None,
         );
-        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
+        // `effectinfo.py` `effectinfo_from_writeanalyze`: a top read/write
+        // set is `EF_RANDOM_EFFECTS` with `None` descr lists. A cannot-raise
+        // mark does not turn that wildcard into an empty "writes nothing"
+        // image.
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::RandomEffects
+        );
+        assert!(descriptor.extra_info._write_descrs_fields.is_none());
+        assert!(descriptor.extra_info._readonly_descrs_fields.is_none());
+        assert!(descriptor.extra_info.can_collect);
     }
 
     #[test]
