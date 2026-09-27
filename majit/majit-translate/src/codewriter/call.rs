@@ -8787,7 +8787,10 @@ pub fn effectinfo_from_writeanalyze(
     for (readonly, write) in [
         (&mut readonly_descrs_fields, &write_descrs_fields),
         (&mut readonly_descrs_arrays, &write_descrs_arrays),
-        (&mut readonly_descrs_interiorfields, &write_descrs_interiorfields),
+        (
+            &mut readonly_descrs_interiorfields,
+            &write_descrs_interiorfields,
+        ),
     ] {
         readonly.retain(|index| write.binary_search(index).is_err());
     }
