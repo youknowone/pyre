@@ -1,4 +1,10 @@
-# pyre-check: pypy-diverges: structseqtype.__new__ asserts on a base, and sys.thread_info's repr prints the `name` field where the type name goes ("pthread(...)")
+# pyre-check: pypy-diverges: structseqtype.__new__ asserts on a base, and
+# sys.thread_info's repr prints the `name` field where the type name goes
+# ("pthread(...)").
+# CPython-suite gap: test_structseq never subclasses a structseq type, and
+# test_sys.test_thread_info reads the fields but not the repr.
+# parity-tests reason: both behaviours come from the app-level structseqtype,
+# where PyPy and CPython 3.14 disagree; the assertions pin CPython.
 import os
 import sys
 import time
