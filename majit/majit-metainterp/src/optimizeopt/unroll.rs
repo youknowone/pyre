@@ -4758,46 +4758,25 @@ impl OptUnroll {
                 result_map.insert(*source, result);
             }
         }
-        let mut imported_constants: indexmap::IndexMap<OpRef, OpRef, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         let from_short_boxes = ctx.initialize_imported_short_preamble_builder_from_short_boxes(
             &short_args,
             &exported_state.short_inputargs,
             &exported_state.short_boxes,
             &result_map,
-            &mut imported_constants,
             &exported_state.exported_infos,
         );
         debug_assert!(
             from_short_boxes,
             "initialize_imported_short_preamble_builder_from_short_boxes returned false: \
-             the short-preamble import path failed to handle some entry. \
-             This signals an unresolvable arg classification (Slot/Const/Produced)."
+             a loop-invariant function pointer was not a constant int"
         );
-        // unroll.py:501-502 line-by-line port:
+        // unroll.py `import_state`:
         //
         //   for produced_op in exported_state.short_boxes:
         //       produced_op.produce_op(self, exported_state.exported_infos)
-        //
-        // `produced_results` accumulates `source pos -> replay identity` so
-        // successor entries can resolve `Produced` arg classifications. After
-        // The producer-side `produce_*` methods return
-        // `Some(source)` (Phase 1 OpRef = `self.res`); for invented Pure the
-        // value is the body-visible OpRef per `replay_pos` in
-        // `initialize_imported_short_preamble_builder_from_short_boxes`.
-        let mut produced_results: indexmap::IndexMap<OpRef, OpRef, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         for (_, produced) in &exported_state.short_boxes {
-            let produced_result = produced.produce_op(
-                ctx,
-                optimizer,
-                &exported_state.exported_infos,
-                &exported_state.short_inputargs,
-                &short_args,
-                &result_map,
-                &mut produced_results,
-                &mut imported_constants,
-            );
+            let produced_result =
+                produced.produce_op(ctx, optimizer, &exported_state.exported_infos, &result_map);
             debug_assert!(
                 produced_result.is_some()
                     || matches!(
@@ -4831,16 +4810,8 @@ impl OptUnroll {
         // (unroll.py:33-36 never registers a const PreambleOp in
         // `potential_extra_ops`), so they are replayed here explicitly.
         for (_, produced) in &const_short_boxes {
-            let _ = produced.produce_op(
-                ctx,
-                optimizer,
-                &exported_state.exported_infos,
-                &exported_state.short_inputargs,
-                &short_args,
-                &result_map,
-                &mut produced_results,
-                &mut imported_constants,
-            );
+            let _ =
+                produced.produce_op(ctx, optimizer, &exported_state.exported_infos, &result_map);
         }
     }
 
@@ -8105,22 +8076,26 @@ mod tests {
         // the preview's `create_short_inputargs` mints two Int renames.
         let (short_inputargs, short_inputarg_refs) =
             mint_short_inputargs(&mut ctx, &[Type::Int, Type::Int]);
+        // `produce_pure` copies `res.bound_op()` args. That producer is the
+        // Phase-1 getfield, whose receiver is the const pointer.
+        let const_arg = Operand::from_opref(OpRef::const_ptr(ptr));
+        let getfield = {
+            let mut op = Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[const_arg.clone()],
+                field_descr.clone(),
+            );
+            op.pos().set(OpRef::int_op(11));
+            OpRc::new(op)
+        };
         publish_preview_short_state(
             &mut ctx,
             short_inputargs,
             short_inputarg_refs,
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
-                op: {
-                    let mut op = Op::with_descr(
-                        OpCode::GetfieldGcI,
-                        &[Operand::from_opref(OpRef::const_ptr(ptr))],
-                        field_descr.clone(),
-                    );
-                    op.pos().set(OpRef::int_op(11));
-                    OpRc::new(op)
-                },
+                op: getfield.clone(),
                 source_op: None,
-                res: rooted_resop_operand(Type::Int, 11),
+                res: Operand::from_bound_op(&getfield),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: Some(1),
                 invented_name: false,
@@ -8163,10 +8138,7 @@ mod tests {
             &mut ctx2,
             OpCode::GetfieldGcI,
             Some(field_descr.clone()),
-            vec![crate::optimizeopt::ImportedShortPureArg::Const(
-                Value::Ref(ptr),
-                fresh_const,
-            )],
+            vec![const_arg],
             OpRef::int_op(11),
             OpRef::int_op(11),
             false,
@@ -8190,18 +8162,20 @@ mod tests {
         // the preview's `create_short_inputargs` mints two Int renames.
         let (short_inputargs, short_inputarg_refs) =
             mint_short_inputargs(&mut ctx, &[Type::Int, Type::Int]);
+        let call = {
+            let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
+            op.pos().set(OpRef::int_op(11));
+            OpRc::new(op)
+        };
         publish_preview_short_state(
             &mut ctx,
             short_inputargs,
             short_inputarg_refs,
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
-                op: {
-                    let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
-                    op.pos().set(OpRef::int_op(11));
-                    OpRc::new(op)
-                },
+                // `LoopInvariantOp.produce_op` reads `self.res.getarg(0)`.
+                res: Operand::from_bound_op(&call),
+                op: call,
                 source_op: None,
-                res: rooted_resop_operand(Type::Int, 11),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(1),
                 invented_name: false,
@@ -8264,6 +8238,11 @@ mod tests {
         let source = OpRef::int_op(11);
         let source_box = rooted_resop_operand(Type::Int, 11);
         let phase2_result = OpRef::int_op(3);
+        let call = {
+            let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
+            op.pos().set(source);
+            OpRc::new(op)
+        };
         let exported = ExportedState::new(
             vec![source],
             vec![0],
@@ -8271,13 +8250,10 @@ mod tests {
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
             indexmap::IndexMap::new(),
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
-                op: {
-                    let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
-                    op.pos().set(source);
-                    OpRc::new(op)
-                },
+                // `LoopInvariantOp.produce_op` reads `self.res.getarg(0)`.
+                res: Operand::from_bound_op(&call),
+                op: call,
                 source_op: None,
-                res: source_box.clone(),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(0),
                 invented_name: false,

@@ -876,19 +876,13 @@ pub struct PendingGuardClassPostprocess {
     pub class_val: i64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum ImportedShortPureArg {
-    OpRef(OpRef),
-    /// Const arg with source OpRef for matching in force_preamble_op.
-    /// RPython: Const Box has identity; get_box_replacement returns itself.
-    Const(Value, OpRef),
-}
-
 #[derive(Clone, Debug)]
 pub struct ImportedShortPureOp {
     pub opcode: OpCode,
     pub descr: Option<DescrRef>,
-    pub args: Vec<ImportedShortPureArg>,
+    /// Exporting-phase boxes of the pure op (shortpreamble.py
+    /// `PureOp.produce_op`: `self.res`, or `self.orig_op` when invented).
+    pub args: Vec<majit_ir::operand::Operand>,
     pub result: OpRef,
     /// RPython: PreambleOp stored in pure cache. Used by force_op_from_preamble.
     pub pop: crate::optimizeopt::info::PreambleOp,
@@ -902,10 +896,9 @@ pub struct ImportedShortPureOp {
 impl ImportedShortPureOp {
     /// Construct with auto-generated PreambleOp from fields.
     ///
-    /// `ctx` binds the replay op's operands to their canonical producers
-    /// (`materialize_operand_at`) — shortpreamble.py seeds the replay
-    /// `preamble_op` with the SAME Box objects the body sees, so the
-    /// operands must carry producer identity, not a position-only echo.
+    /// `args` are the exporting phase's boxes. shortpreamble.py
+    /// `PureOp.produce_op` hands that op to the pure cache; the replay op
+    /// is built from those Operands directly.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
@@ -914,24 +907,13 @@ impl ImportedShortPureOp {
         ctx: &mut OptContext,
         opcode: OpCode,
         descr: Option<DescrRef>,
-        args: Vec<ImportedShortPureArg>,
+        args: Vec<majit_ir::operand::Operand>,
         result: OpRef,
         source: OpRef,
         invented_name: bool,
         same_as_source: Option<majit_ir::operand::Operand>,
     ) -> Self {
-        let replay_args: Vec<OpRef> = args
-            .iter()
-            .map(|a| match a {
-                ImportedShortPureArg::OpRef(r) => *r,
-                ImportedShortPureArg::Const(_, src) => *src,
-            })
-            .collect();
-        let replay_arg_boxes: Vec<Operand> = replay_args
-            .iter()
-            .map(|a| ctx.materialize_operand_at(*a))
-            .collect();
-        let mut replay = majit_ir::Op::new(opcode, &replay_arg_boxes);
+        let mut replay = majit_ir::Op::new(opcode, &args);
         // shortpreamble.py PureOp.produce_op constructs TWO distinct
         // RPython Op objects:
         //
@@ -3931,32 +3913,25 @@ impl OptContext {
         self.imported_short_preamble_builder = Some(builder);
     }
 
-    /// shortpreamble.py ShortPreambleBuilder constructor parity.
+    /// shortpreamble.py `ShortPreambleBuilder.__init__` parity.
     ///
-    /// Reads `exported_state.short_boxes` (RPython `ExportedState.short_boxes`)
-    /// directly, classifying each `ProducedShortOp.preamble_op.args` as
-    /// Slot/Const/Produced at consume time and rebuilding the
-    /// `ShortPreambleBuilder` keyed by Phase 2 OpRefs.
-    ///
-    /// Replaces the legacy `_from_exported_ops` function which read the
-    /// `Vec<ExportedShortOp>` enum-serialization path. The new path
-    /// matches RPython literally — no intermediate enum, polymorphism via
-    /// `produce_op`-side data on `ProducedShortOp` itself.
+    /// Reads `exported_state.short_boxes` (`ExportedState.short_boxes`)
+    /// directly and rebuilds the `ShortPreambleBuilder` keyed by Phase 2
+    /// OpRefs. `short_args` is the builder's `label_args`.
     ///
     /// The Phase-2 result OpRef for each entry is read from `result_map`,
-    /// computed before this constructor just as RPython already has the
-    /// target `Box` identities before `ProducedShortOp.produce_op` runs.
-    /// Args are resolved via local `produced_results` (source pos →
-    /// resolved OpRef) and the caller-owned `imported_constants` map
-    /// (source const OpRef → seeded fresh slot), which is reused by the
-    /// following produce-op loop.
+    /// computed before this constructor just as the target `Box` identities
+    /// exist before `ProducedShortOp.produce_op` runs. Replay args stay the
+    /// exported `preamble_op` args (`rebind_arg` rewrites a dependency to the
+    /// replay op minted for it). A loop-invariant func that is not a constant
+    /// int declines the short preamble (`LoopInvariantOp.produce_op` reads
+    /// `self.res.getarg(0).getint()`).
     pub fn initialize_imported_short_preamble_builder_from_short_boxes(
         &mut self,
         short_args: &[OpRef],
         short_inputargs: &[OpRef],
         short_boxes: &[(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)],
         result_map: &indexmap::IndexMap<OpRef, OpRef, rustc_hash::FxBuildHasher>,
-        mut imported_constants: &mut indexmap::IndexMap<OpRef, OpRef, rustc_hash::FxBuildHasher>,
         exported_infos: &indexmap::IndexMap<
             majit_ir::operand::Operand,
             crate::optimizeopt::info::OpInfo,
@@ -4033,8 +4008,6 @@ impl OptContext {
         let mut produced: Vec<(OpRef, ProducedShortOp)> = Vec::with_capacity(short_boxes.len());
         let mut builder_entries: Vec<(majit_ir::operand::Operand, ProducedShortOp)> =
             Vec::with_capacity(short_boxes.len());
-        let mut produced_results: indexmap::IndexMap<OpRef, OpRef, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         // shortpreamble.py:PreambleOp.add_op_to_short — Pure ops whose
         // opcode is a Call get rewritten to the CallPure* equivalent so
         // the short preamble can replay the cached call without
@@ -4059,36 +4032,6 @@ impl OptContext {
                 majit_ir::Type::Void => OpCode::CallLoopinvariantN,
             }
         };
-        // shortpreamble.py `ShortBoxes.produce_arg` — classify an arg
-        // through the shared classifier, then collapse the Slot/Const/
-        // Produced variants down to the Phase-2 OpRef the builder needs.
-        // Sharing the classifier with `ProducedShortOp::produce_op` (which
-        // also dispatches via `classify_short_arg`) keeps the two consume
-        // sites locked to a single rule, mirroring RPython's single
-        // `produce_arg` path.
-        let resolve_arg =
-            |arg: OpRef,
-             ctx: &mut Self,
-             produced_results: &indexmap::IndexMap<OpRef, OpRef, rustc_hash::FxBuildHasher>,
-             imported_constants: &mut indexmap::IndexMap<
-                OpRef,
-                OpRef,
-                rustc_hash::FxBuildHasher,
-            >|
-             -> Option<OpRef> {
-                crate::optimizeopt::shortpreamble::classify_short_arg(
-                    ctx,
-                    arg,
-                    short_inputargs,
-                    short_args,
-                    produced_results,
-                    imported_constants,
-                )
-                .map(|cls| match cls {
-                    crate::optimizeopt::ImportedShortPureArg::OpRef(r) => r,
-                    crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
-                })
-            };
         // shortpreamble.py `produce_arg`: an exported replay-op arg is a
         // Const, a renamed short inputarg, or a dependency's replay op. The
         // first two are carried unchanged; a dependency is rebound to the
@@ -4111,21 +4054,11 @@ impl OptContext {
             // Some ProducedShortOps (PreambleOpKind::Heap with non-getfield /
             // non-getarrayitem opcodes, or other non-emitting entries) have
             // no Phase-2 result. They are no-ops for the imported builder.
-            let result_opref = match result_map.get(source).copied() {
-                Some(r) => r,
-                None => continue,
-            };
+            if result_map.get(source).is_none() {
+                continue;
+            }
             match produced_op.kind {
                 PreambleOpKind::Pure => {
-                    // Every arg must still be bindable in this namespace; a
-                    // miss declines the whole short preamble.
-                    for arg in produced_op.preamble_op.args_slice().iter() {
-                        if resolve_arg(arg.to_opref(), self, &produced_results, imported_constants)
-                            .is_none()
-                        {
-                            return false;
-                        }
-                    }
                     let resolved_arg_boxes: Vec<Operand> = produced_op
                         .preamble_op
                         .args_slice()
@@ -4151,13 +4084,12 @@ impl OptContext {
                         label_arg_idx: produced_op.label_arg_idx,
                     };
                     builder_entries.push((produced_op.res.clone(), new_pop.clone()));
+                    // Exported args name either the entry or its replay op.
+                    let replay = produced_op.preamble_op.pos().get();
                     produced.push((*source, new_pop.clone()));
-                    if *source != result_opref {
-                        produced.push((result_opref, new_pop));
+                    if *source != replay {
+                        produced.push((replay, new_pop));
                     }
-                    // Short-preamble args name the replay op. The pure cache is
-                    // keyed separately from `source_op` (the body operation).
-                    produced_results.insert(*source, produced_op.preamble_op.pos().get());
                 }
                 PreambleOpKind::Heap => {
                     let result_type = produced_op.preamble_op.result_type();
@@ -4165,24 +4097,6 @@ impl OptContext {
                         Some(d) => d,
                         None => continue,
                     };
-                    let object_arg = produced_op.preamble_op.arg(0);
-                    // The receiver must still be bindable in this namespace —
-                    // a miss means the replay cannot be reconstructed and the
-                    // whole short preamble is declined. The emitted op keeps
-                    // `preamble_op`'s own receiver rather than this resolution,
-                    // because resolving it through `short_args` would collapse
-                    // the renamed short-inputarg and `source_op` identities
-                    // (see `obj_b` below).
-                    if resolve_arg(
-                        object_arg.to_opref(),
-                        self,
-                        &produced_results,
-                        imported_constants,
-                    )
-                    .is_none()
-                    {
-                        return false;
-                    }
                     let new_pop = match produced_op.preamble_op.opcode {
                         OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => {
                             let opcode = match result_type {
@@ -4223,23 +4137,9 @@ impl OptContext {
                                 majit_ir::Type::Float => OpCode::GetarrayitemGcF,
                                 majit_ir::Type::Void => return false,
                             };
-                            // shortpreamble.py `g.getarg(1).getint()`:
-                            // pull the integer VALUE through the shared
-                            // `classify_short_arg` rule. `OpRef::raw()` is a
-                            // tagged trace position — not the constant value.
-                            // As with the receiver, this only decides whether
-                            // the index is bindable at all.
-                            let index_arg = produced_op.preamble_op.arg(1);
-                            if resolve_arg(
-                                index_arg.to_opref(),
-                                self,
-                                &produced_results,
-                                imported_constants,
-                            )
-                            .is_none()
-                            {
-                                return false;
-                            }
+                            // shortpreamble.py `HeapOp.produce_op` reads
+                            // `g.getarg(1).getint()` from the original heap op.
+                            // The replay op keeps `preamble_op`'s own index arg.
                             let obj_b = rebind_arg(&produced, produced_op.preamble_op.arg(0));
                             let index_b = rebind_arg(&produced, produced_op.preamble_op.arg(1));
                             let mut op = Op::new(opcode, &[obj_b, index_b]);
@@ -4259,29 +4159,18 @@ impl OptContext {
                         _ => continue,
                     };
                     builder_entries.push((produced_op.res.clone(), new_pop.clone()));
+                    // Exported args name either the entry or its replay op.
+                    let replay = produced_op.preamble_op.pos().get();
                     produced.push((*source, new_pop.clone()));
-                    if *source != result_opref {
-                        produced.push((result_opref, new_pop));
+                    if *source != replay {
+                        produced.push((replay, new_pop));
                     }
-                    // Short-preamble args name the replay op. The pure cache is
-                    // keyed separately from `source_op` (the body operation).
-                    produced_results.insert(*source, produced_op.preamble_op.pos().get());
                 }
                 PreambleOpKind::LoopInvariant => {
                     let result_type = produced_op.preamble_op.result_type();
-                    let Some(func_opref) = resolve_arg(
-                        produced_op.preamble_op.arg(0).to_opref(),
-                        self,
-                        &produced_results,
-                        imported_constants,
-                    ) else {
-                        return false;
-                    };
-                    if self
-                        .get_box_replacement_operand_opt(func_opref)
-                        .and_then(|cb| cb.const_int())
-                        .is_none()
-                    {
+                    // shortpreamble.py `LoopInvariantOp.produce_op` requires
+                    // `getarg(0).getint()`. Read it off the replay op's arg 0.
+                    if produced_op.preamble_op.arg(0).const_int().is_none() {
                         return false;
                     }
                     let func_b = rebind_arg(&produced, produced_op.preamble_op.arg(0));
@@ -4298,22 +4187,18 @@ impl OptContext {
                         label_arg_idx: produced_op.label_arg_idx,
                     };
                     builder_entries.push((produced_op.res.clone(), new_pop.clone()));
+                    // Exported args name either the entry or its replay op.
+                    let replay = produced_op.preamble_op.pos().get();
                     produced.push((*source, new_pop.clone()));
-                    if *source != result_opref {
-                        produced.push((result_opref, new_pop));
+                    if *source != replay {
+                        produced.push((replay, new_pop));
                     }
-                    // Short-preamble args name the replay op. The pure cache is
-                    // keyed separately from `source_op` (the body operation).
-                    produced_results.insert(*source, produced_op.preamble_op.pos().get());
                 }
                 PreambleOpKind::InputArg | PreambleOpKind::Guard => {}
             }
         }
 
-        let mut builder = ShortPreambleBuilder::new(short_args, &builder_entries, short_inputargs);
-        for &opref in imported_constants.values() {
-            builder.note_known_constant(opref);
-        }
+        let builder = ShortPreambleBuilder::new(short_args, &builder_entries, short_inputargs);
         self.imported_short_preamble_builder = Some(builder);
         true
     }

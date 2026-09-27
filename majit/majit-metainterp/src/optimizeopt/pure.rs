@@ -764,11 +764,12 @@ impl OptPure {
     }
 
     /// Store PreambleOp in OptPure for always-pure ops.
-    /// RPython shortpreamble.py: opt.pure(op.getopnum(), PreambleOp(...))
+    /// shortpreamble.py `PureOp.produce_op`: `opt.pure(op.getopnum(), PreambleOp(...))`.
+    /// Key args are each operand's `get_box_replacement(false)`.
     pub fn pure_preamble(
         &mut self,
         opcode: OpCode,
-        args: Vec<OpRef>,
+        args: Vec<Operand>,
         descr_identity: Option<usize>,
         pop: PreambleOp,
         ctx: &mut OptContext,
@@ -777,7 +778,7 @@ impl OptPure {
             opcode,
             args: args
                 .iter()
-                .map(|arg| ctx.materialize_operand_at(*arg).get_box_replacement(false))
+                .map(|arg| arg.get_box_replacement(false))
                 .collect(),
             descr_identity,
         };
@@ -1382,22 +1383,16 @@ impl Optimization for OptPure {
         self.publish_pure_ops(ctx);
         let imported = ctx.imported_short_pure_ops.clone();
         for entry in &imported {
-            let resolved_args: Vec<OpRef> = entry
-                .args
-                .iter()
-                .map(|a| match a {
-                    crate::optimizeopt::ImportedShortPureArg::OpRef(r) => *r,
-                    crate::optimizeopt::ImportedShortPureArg::Const(_v, source) => {
-                        // RPython: Const args have a registered OpRef from
-                        // make_constant. Use the source OpRef for matching.
-                        *source
-                    }
-                })
-                .collect();
             let descr_identity = entry.descr.as_ref().map(majit_ir::descr::descr_identity);
             let pop = entry.pop.clone();
             if entry.opcode.is_call_pure() || entry.opcode.is_call() {
-                // shortpreamble.py: optpure.extra_call_pure.append(PreambleOp(...))
+                // shortpreamble.py `PureOp.produce_op`: extra_call_pure keeps
+                // positional OpRefs resolved from the exporting-phase boxes.
+                let resolved_args: Vec<OpRef> = entry
+                    .args
+                    .iter()
+                    .map(|arg| ctx.resolve_operand_operand(arg).to_opref())
+                    .collect();
                 self.extra_call_pure_preamble(entry.opcode, resolved_args, descr_identity, pop);
             } else if !entry.cache_args.is_empty() {
                 // pure.py RecentPureOps.lookup2 compares
@@ -1411,8 +1406,8 @@ impl Optimization for OptPure {
                     pop,
                 );
             } else {
-                // shortpreamble.py: opt.pure(opnum, PreambleOp(...))
-                self.pure_preamble(entry.opcode, resolved_args, descr_identity, pop, ctx);
+                // shortpreamble.py `PureOp.produce_op`: opt.pure(opnum, PreambleOp)
+                self.pure_preamble(entry.opcode, entry.args.clone(), descr_identity, pop, ctx);
             }
         }
     }
@@ -2932,17 +2927,12 @@ mod tests {
         let const_opref = OpRef::const_int(7);
         let const_box = ctx.materialize_operand_at(const_opref);
         ctx.seed_constant(&const_box.clone(), majit_ir::Value::Int(7));
+        let box0 = ctx.materialize_operand_at(OpRef::int_op(0));
         let imported = crate::optimizeopt::ImportedShortPureOp::new(
             &mut ctx,
             OpCode::IntAdd,
             None,
-            vec![
-                crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef::int_op(0)),
-                crate::optimizeopt::ImportedShortPureArg::Const(
-                    majit_ir::Value::Int(7),
-                    const_opref,
-                ),
-            ],
+            vec![box0, Operand::from_opref(const_opref)],
             OpRef::int_op(2),
             OpRef::int_op(2),
             false,
@@ -2984,17 +2974,12 @@ mod tests {
         let const_opref = OpRef::const_int(7);
         let const_box = ctx.materialize_operand_at(const_opref);
         ctx.seed_constant(&const_box.clone(), majit_ir::Value::Int(7));
+        let arg0 = ctx.materialize_operand_at(OpRef::int_op(0));
         let imported = crate::optimizeopt::ImportedShortPureOp::new(
             &mut ctx,
             OpCode::IntAdd,
             None,
-            vec![
-                crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef::int_op(0)),
-                crate::optimizeopt::ImportedShortPureArg::Const(
-                    majit_ir::Value::Int(7),
-                    const_opref,
-                ),
-            ],
+            vec![arg0.clone(), Operand::from_opref(const_opref)],
             OpRef::int_op(2),
             OpRef::int_op(2),
             false,
@@ -3003,7 +2988,6 @@ mod tests {
         ctx.imported_short_pure_ops.push(imported);
         pass.setup();
         pass.install_preamble_pure_ops(&mut ctx);
-        let arg0 = ctx.materialize_operand_at(OpRef::int_op(0));
         let query = Op::new(OpCode::IntAdd, &[arg0, const_box]);
         assert!(
             pass.recent_ops_has_preamble(&query, &ctx),
@@ -3034,13 +3018,7 @@ mod tests {
             &mut ctx,
             OpCode::CallPureI,
             Some(call_descr.clone()),
-            vec![
-                crate::optimizeopt::ImportedShortPureArg::Const(
-                    majit_ir::Value::Int(0x1234),
-                    const_opref,
-                ),
-                crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef::int_op(0)),
-            ],
+            vec![Operand::from_opref(const_opref), arg0.clone()],
             OpRef::int_op(1),
             OpRef::int_op(1),
             false,
