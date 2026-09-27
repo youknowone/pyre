@@ -11013,12 +11013,16 @@ where
                 } else {
                     0
                 };
-                // A typed descr (`array_type_id != 0`) has a GC header and a
-                // tracing layout; `alloc_oldgen_typed` returning 0 is a failed
-                // allocation, and host storage would drop both. Abort the trace.
+                // Under an installed collector a typed descr
+                // (`array_type_id != 0`) has a GC header and a tracing layout;
+                // `alloc_oldgen_typed` returning 0 is a failed allocation, and
+                // host storage would drop both. Abort the trace. With no
+                // collector nothing traces the block: a published
+                // `malloc_fixedsize` (`GcLLDescr_boehm.malloc_fn_ptr`) or the
+                // host allocator owns it.
                 let array_ptr = if array_gc_ptr != 0 {
                     array_gc_ptr as i64
-                } else if array_type_id != 0 {
+                } else if array_type_id != 0 && majit_gc::collector_installed() {
                     return TraceAction::Abort;
                 } else if let Some(ptr) = host_malloc_fixedsize(array_payload) {
                     ptr as i64
