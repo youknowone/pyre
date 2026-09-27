@@ -327,7 +327,8 @@ macro_rules! py_module {
         ) -> ::std::result::Result<(), $crate::PyError> {
             let _name = $name;
             $($(
-                $crate::module_ns_store(ns, $key, $value);
+                let __w_value = ::pyre_object::with_roots!(ns => $value);
+                $crate::module_ns_store(ns, $key, __w_value);
             )*)?
             // int_constants: integer module constants — PyPy MixedModule
             // `interpleveldefs = {'NAME': 'space.wrap(value)'}` for the
@@ -335,10 +336,9 @@ macro_rules! py_module {
             // is an `i64`-valued expression wrapped via `w_int_new`, saving
             // the per-entry `module_ns_store(ns, k, w_int_new(v))`.
             $($(
-                $crate::module_ns_store(
-                    ns, $int_key,
-                    ::pyre_object::w_int_new($int_value as i64),
-                );
+                let __w_value =
+                    ::pyre_object::with_roots!(ns => ::pyre_object::w_int_new($int_value as i64));
+                $crate::module_ns_store(ns, $int_key, __w_value);
             )*)?
             // exceptions: module-local exception classes — PyPy
             // `new_exception_class("<mod>.Name", base)` (error.py).
@@ -394,38 +394,31 @@ macro_rules! py_module {
                 {
                     #[$crate::pyre_function]
                     fn $ifn_name ( $($ifn_args)* ) $(-> $ifn_ret)? $ifn_body
-                    $crate::module_ns_store(
-                        ns,
-                        stringify!($ifn_name),
-                        $crate::gateway::with_module(
-                            $name,
-                            $crate::make_module_builtin_function_with_arity_and_maybe_sig(
-                                stringify!($ifn_name),
-                                $ifn_name,
-                                ::paste::paste! { [<$ifn_name _pyre_arity>]() },
-                                ::paste::paste! { [<$ifn_name _pyre_sig>]() },
-                            ),
+                    let __w_value = ::pyre_object::with_roots!(ns => $crate::gateway::with_module(
+                        $name,
+                        $crate::make_module_builtin_function_with_arity_and_maybe_sig(
+                            stringify!($ifn_name),
+                            $ifn_name,
+                            ::paste::paste! { [<$ifn_name _pyre_arity>]() },
+                            ::paste::paste! { [<$ifn_name _pyre_sig>]() },
                         ),
-                    );
+                    ));
+                    $crate::module_ns_store(ns, stringify!($ifn_name), __w_value);
                 }
             )*)?
             $($(
-                $crate::module_ns_store(
-                    ns, $fn_key,
-                    $crate::gateway::with_module(
-                        $name,
-                        $crate::py_module_fn!($fn_key, $fn_arity, $fn_path),
-                    ),
-                );
+                let __w_value = ::pyre_object::with_roots!(ns => $crate::gateway::with_module(
+                    $name,
+                    $crate::py_module_fn!($fn_key, $fn_arity, $fn_path),
+                ));
+                $crate::module_ns_store(ns, $fn_key, __w_value);
             )*)?
             $($(
-                $crate::module_ns_store(
-                    ns, $mfn_key,
-                    $crate::gateway::with_module(
-                        $name,
-                        $crate::py_module_module_fn!($mfn_key, $mfn_arity, $mfn_path),
-                    ),
-                );
+                let __w_value = ::pyre_object::with_roots!(ns => $crate::gateway::with_module(
+                    $name,
+                    $crate::py_module_module_fn!($mfn_key, $mfn_arity, $mfn_path),
+                ));
+                $crate::module_ns_store(ns, $mfn_key, __w_value);
             )*)?
             $(
                 {
