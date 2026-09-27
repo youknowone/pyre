@@ -11554,8 +11554,12 @@ fn bridge_with_a_larger_frame_reallocates_and_returns_its_exit_values() {
     let needed_homes = codegen::count_ref_homes(&inputargs, &ops);
     assert!(needed_values > source.value_slots);
     assert!(needed_homes > source.ordinary_home_slots());
-    let frame = source.extend(needed_values, needed_homes);
+    // The stored loop frame is already tailed; this bridge extends it again.
+    let tailed = source.extend(source.value_slots + 1, source.ordinary_home_slots());
+    let frame = tailed.extend(needed_values, needed_homes);
     assert!(frame.has_tail());
+    assert_eq!(frame.tail_base, tailed.tail_base);
+    assert_eq!(frame.spill_slot_ofs(4), tailed.spill_slot_ofs(4));
     let mut ca = codegen::CaParams::default();
     ca.realloc_fn_ptr = 1;
     let inputs = codegen::ModuleBuildInputs {
@@ -11605,10 +11609,22 @@ fn bridge_with_a_larger_frame_reallocates_and_returns_its_exit_values() {
     let mut store = Store::new(&engine, ());
     let memory = Memory::new(&mut store, MemoryType::new(2, None)).expect("memory");
     let source_bytes = source.frame_bytes as usize;
+    let seen_gcmap = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let seen_gcmap_slot = std::sync::Arc::clone(&seen_gcmap);
     let realloc = wasmi::Func::wrap(
         &mut store,
         move |mut caller: wasmi::Caller<'_, ()>, items: i64, depth: i64| -> i64 {
             let old = items as usize;
+            let gcmap_at = old - majit_backend::jitframe::FIRST_ITEM_OFFSET
+                + majit_backend::jitframe::JF_GCMAP_OFS as usize;
+            let mut word = [0u8; 4];
+            memory
+                .read(&caller, gcmap_at, &mut word)
+                .expect("jf_gcmap before realloc");
+            seen_gcmap_slot.store(
+                u32::from_le_bytes(word),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let new_base = 64 * 1024usize;
             let mut buf = vec![0u8; source_bytes];
             memory.read(&caller, old, &mut buf).expect("copy old frame");
@@ -11664,6 +11680,11 @@ fn bridge_with_a_larger_frame_reallocates_and_returns_its_exit_values() {
         .call(&mut store, old_base as i32)
         .expect("bridge runs") as usize;
     assert_ne!(new_base, old_base, "the short frame was reallocated");
+    assert_ne!(
+        seen_gcmap.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "jf_gcmap is stored before wasm_realloc_frame"
+    );
     let read_i64 = |offset: usize| {
         let mut buf = [0u8; 8];
         memory.read(&store, offset, &mut buf).unwrap();
@@ -11746,8 +11767,13 @@ fn tail_fail_args_decode_through_the_deadframe() {
     let needed_values = codegen::frame_value_slots(&inputargs, &[guard.clone()]);
     let needed_homes = codegen::count_ref_homes(&inputargs, &[guard.clone()]);
     assert!(needed_values > source.value_slots);
-    let frame = source.extend(needed_values, needed_homes);
+    // Compile the guard against a geometry that already has a tail.
+    let tailed = source.extend(source.value_slots + 1, needed_homes);
+    let frame = tailed.extend(needed_values, needed_homes);
     assert!(frame.has_tail());
+    assert_eq!(frame.tail_base, tailed.tail_base);
+    assert_eq!(frame.spill_slot_ofs(4), tailed.spill_slot_ofs(4));
+    assert_eq!(frame.force_slot_ofs(4), tailed.force_slot_ofs(4));
     assert!(frame.spill_slot_ofs(4) >= source.frame_bytes as u64);
     assert!(frame.spill_slot_ofs(5) > frame.spill_slot_ofs(4));
     let mut ca = codegen::CaParams::default();

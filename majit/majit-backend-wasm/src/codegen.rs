@@ -455,8 +455,8 @@ pub struct FrameGeometry {
     pub ca_frame_bytes: u32,
     /// Full bytes in the frame layout, including the tail call area. Host entry
     /// frames and every chained bridge use this geometry and allocation size.
-    /// An extended geometry appends its extra value slots and Ref homes after
-    /// this many bytes of the source layout, then stores the grown total here.
+    /// An extended geometry keeps the source bytes through [`Self::tail_base`]
+    /// and stores the grown total here.
     pub frame_bytes: u32,
     /// Value slots addressed at [`FRAME_SLOT_BASE`]. Equals [`Self::value_slots`]
     /// until [`Self::extend`] appends the overflow past [`Self::tail_base`].
@@ -464,10 +464,11 @@ pub struct FrameGeometry {
     /// Ordinary Ref homes addressed at [`Self::home_slot_base`]. Label captures
     /// stay at the end of this prefix; extra ordinary homes go to the tail.
     pub prefix_ordinary_homes: usize,
-    /// Ordinary Ref homes placed after the source `frame_bytes`.
+    /// Ordinary Ref homes past [`Self::prefix_ordinary_homes`], one per tail row.
     pub extra_ordinary_homes: usize,
-    /// Byte offset where an extended geometry's extra slots begin. Zero when
-    /// the geometry is not extended.
+    /// Byte offset of tail row 0. Zero when the geometry is not extended.
+    /// A later [`Self::extend`] keeps this base: row `j` stays three words
+    /// `[value_j, force_j, home_j]`.
     pub tail_base: u64,
 }
 
@@ -535,15 +536,16 @@ impl FrameGeometry {
         }
     }
 
-    /// `assembler.py _check_frame_depth`: keep every offset of `self` and
-    /// place value slots / ordinary Ref homes past this layout in a tail
-    /// after `frame_bytes`. A trace that already fits is returned unchanged.
+    /// `assembler.py _check_frame_depth`: keep every offset of `self`.
+    /// Overflow value slots, force args, and ordinary Ref homes share a
+    /// tail of fixed-stride rows at [`Self::tail_base`]. Row `j` is
+    /// `[value_j, force_j, home_j]`. A second extend keeps `tail_base` and
+    /// the prefix counts, so an index already published does not move.
+    /// A trace that already fits is returned unchanged.
     pub fn extend(self, value_slots: usize, ordinary_homes: usize) -> Self {
         let values = value_slots.max(self.value_slots);
-        let homes = ordinary_homes.max(self.ordinary_home_slots() + self.extra_ordinary_homes);
-        let extra_values = values - self.value_slots;
-        let extra_homes = homes - (self.ordinary_home_slots() + self.extra_ordinary_homes);
-        if extra_values == 0 && extra_homes == 0 {
+        let homes = ordinary_homes.max(self.addressable_ordinary_homes());
+        if values == self.value_slots && homes == self.addressable_ordinary_homes() {
             return self;
         }
         let mut ext = self;
@@ -551,15 +553,13 @@ impl FrameGeometry {
             ext.tail_base = self.frame_bytes as u64;
         }
         ext.value_slots = values;
-        ext.extra_ordinary_homes += extra_homes;
-        // The source force area is `prefix_value_slots` wide and ends at
-        // `ca_frame_bytes`. One force arg per extra value slot keeps a
-        // GUARD_NOT_FORCED failarg past that prefix out of the call area.
-        let extra_force = extra_values;
-        let growth = (extra_values + extra_homes + extra_force) as u64 * SLOT_SIZE;
-        ext.frame_bytes = self
-            .frame_bytes
-            .checked_add(growth as u32)
+        ext.extra_ordinary_homes = homes - self.prefix_ordinary_homes;
+        let extra_values = values - self.prefix_value_slots;
+        let rows = extra_values.max(ext.extra_ordinary_homes) as u64;
+        let growth = 3 * rows * SLOT_SIZE;
+        ext.frame_bytes = u32::try_from(ext.tail_base)
+            .expect("tail_base")
+            .checked_add(u32::try_from(growth).expect("tail growth"))
             .expect("extended frame_bytes");
         ext
     }
@@ -575,71 +575,76 @@ impl FrameGeometry {
     }
 
     /// Fail-arg / input slot `slot`. Indices below the source prefix stay at
-    /// [`FRAME_SLOT_BASE`]; the rest sit in the tail.
+    /// [`FRAME_SLOT_BASE`]; the rest are the value word of tail row
+    /// `slot - prefix_value_slots`.
     pub fn spill_slot_ofs(self, slot: u64) -> u64 {
         let prefix = self.prefix_value_slots as u64;
         if slot < prefix || !self.has_tail() {
             FRAME_SLOT_BASE + slot * SLOT_SIZE
         } else {
-            self.tail_base + (slot - prefix) * SLOT_SIZE
+            self.tail_base + 3 * (slot - prefix) * SLOT_SIZE
         }
     }
 
     /// Physical `jf_frame` item of [`Self::spill_slot_ofs`]: `(offset -
     /// FRAME_SLOT_BASE) / SLOT_SIZE`. Identity when the geometry has no tail,
     /// so a recorded fail location and `FRAME_SLOT_BASE + loc * 8` name the
-    /// same byte the guest stored.
+    /// same byte the guest stored. Tail items are three apart.
     pub fn spill_slot_index(self, slot: u64) -> u64 {
         (self.spill_slot_ofs(slot) - FRAME_SLOT_BASE) / SLOT_SIZE
     }
 
-    /// First tail value slot as a physical item index.
+    /// Physical item of the first tail value word. Later tail values are
+    /// three items apart (`value_tail_index + 3*j`).
     pub fn value_tail_index(self) -> u64 {
         (self.tail_base - FRAME_SLOT_BASE) / SLOT_SIZE
     }
 
     /// GUARD_NOT_FORCED(_2) failarg `slot`. The source reserves
-    /// `prefix_value_slots` words at [`Self::force_slot_base`]; the rest follow
-    /// the value and Ref tails.
+    /// `prefix_value_slots` words at [`Self::force_slot_base`]; the rest are
+    /// the force word of tail row `slot - prefix_value_slots`.
     pub fn force_slot_ofs(self, slot: u64) -> u64 {
         let prefix = self.prefix_value_slots as u64;
         if slot < prefix || !self.has_tail() {
             self.force_slot_base + slot * SLOT_SIZE
         } else {
-            self.force_tail_base() + (slot - prefix) * SLOT_SIZE
+            self.tail_base + (3 * (slot - prefix) + 1) * SLOT_SIZE
         }
     }
 
-    /// First force-tail byte. Zero when [`Self::has_tail`] is false.
+    /// Byte offset of the first tail force word. Zero when [`Self::has_tail`]
+    /// is false. Later force words are three slots apart, matching the
+    /// stride of [`Self::spill_slot_index`].
     pub fn force_tail_base(self) -> u64 {
         if !self.has_tail() {
             return 0;
         }
-        let extra_values = (self.value_slots - self.prefix_value_slots) as u64;
-        self.tail_base + (extra_values + self.extra_ordinary_homes as u64) * SLOT_SIZE
+        self.tail_base + SLOT_SIZE
     }
 
     /// LABEL scalar capture. In-prefix slots keep `slot * SLOT_SIZE`.
+    /// A tail slot is the value word of that row, the same bytes as
+    /// [`Self::spill_slot_ofs`].
     pub fn capture_value_ofs(self, slot: usize) -> u64 {
         let slot = slot as u64;
         let prefix = self.prefix_value_slots as u64;
-        if slot < prefix {
+        if slot < prefix || !self.has_tail() {
             slot * SLOT_SIZE
         } else {
-            self.tail_base + (slot - prefix) * SLOT_SIZE
+            self.spill_slot_ofs(slot)
         }
     }
 
     /// Ordinary Ref home `h`. Homes below the source prefix stay at
-    /// `home_slot_base`; the rest follow the extra value slots in the tail.
-    /// Label captures are not ordinary homes and keep `home_slot_base`.
+    /// `home_slot_base`. Home `h >= prefix_ordinary_homes` is the home word
+    /// of tail row `h - prefix_ordinary_homes`. Label captures are not
+    /// ordinary homes and keep `home_slot_base`.
     pub fn home_ofs(self, h: u64) -> u64 {
         let prefix = self.prefix_ordinary_homes as u64;
         if h < prefix {
             self.home_slot_base + h * SLOT_SIZE
         } else {
-            let extra_values = (self.value_slots - self.prefix_value_slots) as u64;
-            self.tail_base + extra_values * SLOT_SIZE + (h - prefix) * SLOT_SIZE
+            self.tail_base + (3 * (h - prefix) + 2) * SLOT_SIZE
         }
     }
 
@@ -2490,11 +2495,16 @@ fn collecting_call_positions(ops: &[Op], include_ca_collects: bool) -> Vec<usize
 /// `_check_frame_depth` (assembler.py): if `jf_frame.length` is below this
 /// module's item count, `wasm_realloc_frame` grows it and local 0 becomes
 /// the new items base.
+///
+/// `gcmap_ptr` is the parked map of Ref spill slots live at this entry
+/// (`IncreaseStackSlowPath.generate_body` calls `push_gcmap(..., store=True)`
+/// before `CALL(realloc_frame)`). Zero means this entry has no Ref input.
 fn emit_check_frame_depth(
     sink: &mut PeepSink<'_, '_>,
     frame: FrameGeometry,
     realloc_fn_ptr: i64,
     residual_type_base: u32,
+    gcmap_ptr: i64,
 ) {
     let len_size = majit_backend::jitframe::SIZEOFSIGNED as i32;
     sink.local_get(0);
@@ -2504,6 +2514,16 @@ fn emit_check_frame_depth(
     sink.i32_const(frame.signed_item_count() as i32);
     sink.i32_lt_u();
     sink.if_(BlockType::Empty);
+    // IncreaseStackSlowPath.generate_body: push_gcmap(store=True) before
+    // CALL(realloc_frame). Homes are still null; the map names Ref inputs
+    // sitting in their spill slots.
+    if gcmap_ptr != 0 {
+        emit_store_header_word(
+            sink,
+            majit_backend::jitframe::JF_GCMAP_OFS as u64,
+            gcmap_ptr as usize,
+        );
+    }
     sink.local_get(0);
     sink.i64_extend_i32_u();
     sink.i64_const(frame.signed_item_count() as i64);
@@ -5883,7 +5903,8 @@ fn build_function(
         && ca.realloc_fn_ptr != 0
         && let Some(base) = residual_type_base
     {
-        emit_check_frame_depth(&mut sink, frame, ca.realloc_fn_ptr, base);
+        let gcmap_ptr = realloc_entry_gcmap(frame, entry_inputargs, ca.gcmap_sink);
+        emit_check_frame_depth(&mut sink, frame, ca.realloc_fn_ptr, base, gcmap_ptr);
     }
 
     // Bind the folded constants the optimizer left under a plain op position
@@ -11760,6 +11781,24 @@ fn physical_fail_slot(guard: &GuardExit, index: usize) -> Option<usize> {
     guard.fail_locs.get(index).copied().flatten()
 }
 
+/// Gcmap of this entry's Ref inputs at `spill_slot_ofs(k)`, parked on the
+/// module's `LoopAsmResources`. Zero when no input is a Ref.
+fn realloc_entry_gcmap(frame: FrameGeometry, inputargs: &[InputArgRc], sink: usize) -> i64 {
+    let sign = std::mem::size_of::<isize>();
+    let mut indices = Vec::new();
+    for (k, ia) in inputargs.iter().enumerate() {
+        if ia.tp.get() != Type::Ref {
+            continue;
+        }
+        let slot = frame.spill_slot_index(k as u64) as usize;
+        indices.push(((FRAME_SLOT_BASE as usize + slot * 8) / sign) as u32);
+    }
+    if indices.is_empty() {
+        return 0;
+    }
+    crate::release::park_gcmap_raw(sink, gcmap_for_item_indices(&indices)) as i64
+}
+
 fn ref_spill_item_indices(guard: &GuardExit, sign: usize) -> Vec<u32> {
     let mut indices = Vec::new();
     for (i, ty) in guard.fail_arg_types.iter().enumerate() {
@@ -12898,9 +12937,15 @@ mod tests {
             ext.home_ofs(prefix_homes - 1),
             source.home_slot_base + (prefix_homes - 1) * SLOT_SIZE
         );
+        let tail_base = source.frame_bytes as u64;
+        assert_eq!(ext.spill_slot_ofs(8), tail_base);
+        assert_eq!(ext.spill_slot_ofs(9), tail_base + 3 * SLOT_SIZE);
+        assert_eq!(ext.spill_slot_ofs(10), tail_base + 6 * SLOT_SIZE);
+        assert_eq!(ext.force_slot_ofs(8), tail_base + SLOT_SIZE);
+        assert_eq!(ext.home_ofs(prefix_homes), tail_base + 2 * SLOT_SIZE);
+        assert_eq!(ext.home_ofs(prefix_homes + 1), tail_base + 5 * SLOT_SIZE);
         let tail_home = ext.home_ofs(prefix_homes);
         assert!(tail_home >= source.frame_bytes as u64);
-        assert!(tail_home > ext.spill_slot_ofs(10));
         let map = build_home_gcmap(ext, source.ordinary_home_slots() + 2, 1);
         let sign = std::mem::size_of::<isize>();
         let bits = std::mem::size_of::<usize>() * 8;
@@ -12911,6 +12956,53 @@ mod tests {
         assert!(marked(tail_home as usize), "gcmap marks the tail Ref home");
         assert!(marked(ext.home_ofs(prefix_homes + 1) as usize));
         assert!(marked(source.home_slot_base as usize));
+    }
+
+    /// A second extend keeps every offset the first tail published. Tail
+    /// value, force, and home words of the grown geometry do not alias.
+    #[test]
+    fn second_extend_keeps_published_tail_offsets() {
+        let source = FrameGeometry::compact(8, 4, 1);
+        let first = source.extend(11, source.ordinary_home_slots() + 2);
+        let second = first.extend(14, source.ordinary_home_slots() + 5);
+        assert_eq!(second.tail_base, first.tail_base);
+        assert_eq!(second.prefix_value_slots, first.prefix_value_slots);
+        assert_eq!(second.prefix_ordinary_homes, first.prefix_ordinary_homes);
+        for k in 0..first.value_slots as u64 {
+            assert_eq!(
+                second.spill_slot_ofs(k),
+                first.spill_slot_ofs(k),
+                "value {k}"
+            );
+            assert_eq!(
+                second.force_slot_ofs(k),
+                first.force_slot_ofs(k),
+                "force {k}"
+            );
+        }
+        for h in 0..first.addressable_ordinary_homes() as u64 {
+            assert_eq!(second.home_ofs(h), first.home_ofs(h), "home {h}");
+        }
+        let mut offs = Vec::new();
+        let mut push = |ofs: u64| {
+            assert!(!offs.contains(&ofs), "tail offset {ofs:#x} is shared");
+            offs.push(ofs);
+        };
+        let prefix_v = second.prefix_value_slots as u64;
+        let prefix_h = second.prefix_ordinary_homes as u64;
+        for k in prefix_v..second.value_slots as u64 {
+            push(second.spill_slot_ofs(k));
+            push(second.force_slot_ofs(k));
+        }
+        for h in prefix_h..second.addressable_ordinary_homes() as u64 {
+            push(second.home_ofs(h));
+        }
+        let rows = (second.value_slots - second.prefix_value_slots).max(second.extra_ordinary_homes)
+            as u64;
+        assert_eq!(
+            second.frame_bytes as u64,
+            second.tail_base + 3 * rows * SLOT_SIZE
+        );
     }
 
     #[test]

@@ -4809,8 +4809,8 @@ fn force_arg_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize) ->
     };
     // `slot` is the physical value-item index (`spill_slot_index`). Prefix
     // indices are the identity, so `force_args_offset + slot * 8` is
-    // `force_slot_ofs`. A tail index recovers the compact delta from
-    // `value_tail_index` and lands on the force tail.
+    // `force_slot_ofs`. A tail index steps by three from `value_tail_index`;
+    // `force_tail_base` is the first tail force word, three items apart as well.
     let offset =
         if fail_descr.force_tail_base != 0 && slot >= fail_descr.force_prefix_slots as usize {
             let delta = slot - fail_descr.value_tail_index as usize;

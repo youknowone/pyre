@@ -25,10 +25,11 @@ pub struct WasmFailDescr {
     /// ordinary exit slots and CALL_ASSEMBLER owns the dispatch-key slot.
     pub force_args_offset: u32,
     /// `0` when every force arg is `force_args_offset + loc * 8` (no tail, or
-    /// the loc is still the prefix index). Otherwise a physical value index
-    /// at or past `force_prefix_slots` names
-    /// `force_tail_base + (loc - value_tail_index) * 8`, the same bytes
-    /// `FrameGeometry::force_slot_ofs` stored.
+    /// the loc is still the prefix index). Otherwise `force_tail_base` is the
+    /// first tail force word. A physical value index at or past
+    /// `force_prefix_slots` names
+    /// `force_tail_base + (loc - value_tail_index) * 8`: tail value items are
+    /// three apart, and so are the force words beside them.
     pub force_tail_base: u32,
     pub force_prefix_slots: u32,
     pub value_tail_index: u32,
