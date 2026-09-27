@@ -1649,12 +1649,12 @@ impl UnrollOptimizer {
                     //
                     // Route through `force_box_for_end_of_preamble` (the
                     // per-box type-gating wrapper) rather than the inner
-                    // dispatcher, matching optimizer.py.
-                    let resolved_jump_args: Vec<OpRef> = body_jump_args
+                    // dispatcher, matching optimizer.py:306-319.
+                    let resolved_jump_args: Vec<majit_ir::operand::Operand> = body_jump_args
                         .iter()
-                        .map(|&arg| final_ctx.get_replacement_opref(arg))
+                        .filter_map(|&arg| final_ctx.get_box_replacement_operand_opt(arg))
                         .collect();
-                    for &arg in &resolved_jump_args {
+                    for arg in &resolved_jump_args {
                         let _ = opt_p2.force_box_for_end_of_preamble(arg, &mut final_ctx);
                     }
                     let forced_jump_args: Vec<OpRef> = body_jump_args

@@ -2368,19 +2368,19 @@ impl Optimizer {
     /// boxes are returned unchanged.  Callers that previously invoked
     /// `force_at_the_end_of_preamble` directly should route through
     /// this wrapper for RPython structural parity (unroll.py:126-127).
-    pub fn force_box_for_end_of_preamble(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        let resolved = ctx.get_replacement_opref(opref);
-        match ctx.opref_type(resolved) {
+    pub fn force_box_for_end_of_preamble(
+        &mut self,
+        box_: &majit_ir::operand::Operand,
+        ctx: &mut OptContext,
+    ) -> majit_ir::operand::Operand {
+        let resolved = ctx.resolve_operand_operand(box_);
+        match resolved.type_() {
             // optimizer.py:307-313 — `box.type == 'r'` path.
-            Some(majit_ir::Type::Ref) => {
-                let resolved_is_virtual = ctx
-                    .get_box_replacement_operand_opt(opref)
-                    .as_ref()
-                    .is_some_and(|b| ctx.is_virtual(b));
-                if resolved_is_virtual {
-                    return self.force_at_the_end_of_preamble(resolved, ctx);
+            majit_ir::Type::Ref => {
+                if ctx.is_virtual(&resolved) {
+                    return self.force_at_the_end_of_preamble(&resolved, ctx);
                 }
-                opref
+                box_.clone()
             }
             // optimizer.py:314-318 — `box.type == 'i'` path.
             //
@@ -2388,19 +2388,15 @@ impl Optimizer {
             // `PtrInfo::VirtualRawBuffer` in the same `ptr_info` table
             // that Ref boxes use; there is no separate `getrawptrinfo`
             // registry, so the presence check fires on any PtrInfo
-            // attached to an Int-typed OpRef.
-            Some(majit_ir::Type::Int) => {
-                let resolved_has_info = ctx
-                    .get_box_replacement_operand_opt(opref)
-                    .as_ref()
-                    .is_some_and(|b| ctx.has_ptr_info(b));
-                if resolved_has_info {
-                    return self.force_at_the_end_of_preamble(resolved, ctx);
+            // attached to an Int-typed box.
+            majit_ir::Type::Int => {
+                if ctx.has_ptr_info(&resolved) {
+                    return self.force_at_the_end_of_preamble(&resolved, ctx);
                 }
-                opref
+                box_.clone()
             }
             // optimizer.py:319 — fall-through `return box`.
-            _ => opref,
+            _ => box_.clone(),
         }
     }
 
@@ -2408,20 +2404,23 @@ impl Optimizer {
     ///
     /// The exported loop state should record the boxes that survive the end of
     /// the preamble after virtuals have been forced into a loop-carried shape.
-    pub fn force_at_the_end_of_preamble(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
+    pub fn force_at_the_end_of_preamble(
+        &mut self,
+        box_: &majit_ir::operand::Operand,
+        ctx: &mut OptContext,
+    ) -> majit_ir::operand::Operand {
         let mut rec: crate::FxIndexSet<majit_ir::operand::Operand> = crate::FxIndexSet::default();
-        self.force_at_the_end_of_preamble_rec(opref, ctx, &mut rec)
+        self.force_at_the_end_of_preamble_rec(box_, ctx, &mut rec)
     }
 
     fn force_at_the_end_of_preamble_rec(
         &mut self,
-        opref: OpRef,
+        box_: &majit_ir::operand::Operand,
         ctx: &mut OptContext,
         rec: &mut crate::FxIndexSet<majit_ir::operand::Operand>,
-    ) -> OpRef {
-        let resolved = ctx.get_replacement_opref(opref);
-        let resolved_operand = ctx.get_box_replacement_operand_opt(opref);
-        let Some(mut info) = resolved_operand.as_ref().and_then(|o| ctx.peek_ptr_info(o)) else {
+    ) -> majit_ir::operand::Operand {
+        let resolved = ctx.resolve_operand_operand(box_);
+        let Some(mut info) = ctx.peek_ptr_info(&resolved) else {
             return resolved;
         };
 
@@ -2458,20 +2457,14 @@ impl Optimizer {
             // info.py:231 `rec[self] = None` keys the recursion guard by the
             // virtual's PtrInfo object identity; in pyre one virtual head box
             // <-> one PtrInfo, so key by the canonical resolved box.
-            let rec_key = resolved_operand
-                .clone()
-                .expect("virtual PtrInfo implies a resolved operand");
-            if rec.contains(&rec_key) {
+            if rec.contains(&resolved) {
                 return resolved;
             }
-            rec.insert(rec_key);
+            rec.insert(resolved.clone());
             info.force_at_the_end_of_preamble(|child| {
-                let forced = self.force_at_the_end_of_preamble_rec(child.to_opref(), ctx, rec);
-                ctx.materialize_operand_at(forced)
+                self.force_at_the_end_of_preamble_rec(&child, ctx, rec)
             });
-            if let Some(o) = resolved_operand.as_ref() {
-                ctx.set_ptr_info(o, info);
-            }
+            ctx.set_ptr_info(&resolved, info);
             return resolved;
         }
 
@@ -2491,14 +2484,9 @@ impl Optimizer {
         ) {
             let saved = ctx.current_pass_idx;
             ctx.current_pass_idx = ctx.optearlyforce_idx;
-            let result = self.force_box(
-                resolved_operand
-                    .as_ref()
-                    .expect("raw/str virtual info lives on the resolved box"),
-                ctx,
-            );
+            let result = self.force_box(&resolved, ctx);
             ctx.current_pass_idx = saved;
-            return result;
+            return ctx.get_box_replacement_operand(result);
         }
 
         resolved
@@ -3447,8 +3435,8 @@ impl Optimizer {
                 .iter()
                 .map(|arg| arg.get_box_replacement(false).to_opref())
                 .collect();
-            for &resolved in &resolved_args {
-                self.force_box_for_end_of_preamble(resolved, &mut ctx);
+            for arg in terminal_op.args_slice().iter() {
+                self.force_box_for_end_of_preamble(&arg.get_box_replacement(false), &mut ctx);
             }
             // Phase 2: re-resolve after forcing (force may have changed forwarding)
             // and fix Ref→non-Ref type crossings by force_box
@@ -3792,7 +3780,10 @@ impl Optimizer {
                 ctx.preamble_end_args = Some(
                     resolved_args
                         .iter()
-                        .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
+                        .map(|&arg| match ctx.get_box_replacement_operand_opt(arg) {
+                            Some(b) => self.force_box_for_end_of_preamble(&b, &mut ctx).to_opref(),
+                            None => arg,
+                        })
                         .collect(),
                 );
                 // unroll.py: `optimize_bridge` calls `export_state`
@@ -4580,7 +4571,7 @@ impl Optimizer {
         // unroll.py:204-205: force_at_the_end_of_preamble for each jump arg
         let saved_pass_idx = ctx.current_pass_idx;
         ctx.current_pass_idx = ctx.optearlyforce_idx;
-        for &arg in &jump_args {
+        for arg in terminal_jump.args_slice().iter() {
             let _ = self.force_box_for_end_of_preamble(arg, &mut ctx);
         }
         ctx.current_pass_idx = saved_pass_idx;
@@ -7863,16 +7854,16 @@ mod tests {
         // (`inputarg_from_tp` per opencoder.py:259 with all Ref args).
         let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
         let b10 = ctx.materialize_operand_at(OpRef::int_op(10));
+        let b11 = ctx.materialize_operand_at(OpRef::int_op(11));
         ctx.set_ptr_info(
             &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
-                fields: vec![(1, rooted_resop_operand(Type::Int, 11))].into(),
+                fields: vec![(1, b11.clone())].into(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
-        let b11 = ctx.materialize_operand_at(OpRef::int_op(11));
         let b20 = ctx.materialize_operand_at(OpRef::int_op(20));
         ctx.make_equal_to(&b11, &b20);
         let b20 = ctx.materialize_operand_at(OpRef::int_op(20));
@@ -7887,7 +7878,8 @@ mod tests {
         );
 
         let mut opt = Optimizer::new();
-        let result = opt.force_box_for_end_of_preamble(OpRef::int_op(10), &mut ctx);
+        let b10 = ctx.get_box_replacement_operand(OpRef::int_op(10));
+        let result = opt.force_box_for_end_of_preamble(&b10, &mut ctx).to_opref();
 
         // The virtual is forced to a concrete allocation; the returned ref
         // is the allocation's position, which ctx.get_box_replacement(OpRef::int_op(10))

@@ -290,24 +290,21 @@ impl CachedField {
     ///          `if isinstance(res, PreambleOp): ...`
     fn _getfield(
         &self,
-        struct_opref: OpRef,
+        struct_box: &Operand,
         descr: &DescrRef,
         field_idx: u32,
         ctx: &mut OptContext,
     ) -> Option<crate::optimizeopt::info::FieldEntry> {
-        // info.py getfield: return self._fields[fielddescr.get_index()]
-        let struct_box = ctx.get_box_replacement_operand_opt(struct_opref);
-        if let Some(info) = struct_box.as_ref().and_then(Operand::ptr_info)
+        // info.py:212-214: return self._fields[fielddescr.get_index()]
+        let struct_box = ctx.resolve_operand_operand(struct_box);
+        if let Some(info) = struct_box.ptr_info()
             && let Some(entry) = info.getfield(field_idx)
         {
             return Some(entry);
         }
         // info.py ConstPtrInfo.getfield → _get_info(parent_descr, optheap)
-        // Reuse the box resolved above instead of re-resolving struct_opref.
         let parent_descr = descr.as_field_descr().and_then(|fd| fd.get_parent_descr());
-        if let Some(info) = struct_box
-            .as_ref()
-            .and_then(|b| ctx.get_const_info_mut_box(b, parent_descr))
+        if let Some(info) = ctx.get_const_info_mut_box(&struct_box, parent_descr)
             && let Some(entry) = info.getfield(field_idx)
         {
             return Some(entry);
@@ -333,7 +330,8 @@ impl CachedField {
                 ctx.materialize_operand_at(rhs.to_opref()),
             ));
         }
-        self._getfield(struct_opref, descr, field_idx, ctx)
+        let struct_box = ctx.get_box_replacement_operand(struct_opref);
+        self._getfield(&struct_box, descr, field_idx, ctx)
     }
 
     /// heap.py CachedField._cannot_alias_via_classes_or_lengths
@@ -1188,29 +1186,26 @@ impl OptHeap {
     /// heapcache.py `_escape_from_write`: when storing a value
     /// into a container, append to `_get_deps(box)` if both are
     /// unescaped; otherwise escape the value immediately.
-    fn escape_from_write(&mut self, ctx: &OptContext, container: OpRef, value: OpRef) {
-        // heapcache.py _escape_from_write: if both box and fieldbox are unescaped,
+    fn escape_from_write(&mut self, ctx: &OptContext, container: &Operand, value: &Operand) {
+        // heapcache.py:224-229: if both box and fieldbox are unescaped,
         // record the dependency; otherwise escape the fieldbox (the value).
         // `is_unescaped`/`escape_box` are no-ops for Const operands, so a
         // constant value never escapes the container and a constant
         // container still escapes a non-constant value.
         //
-        // heapcache operates on box objects; resolve both operands to their
-        // canonical operand (memoized producer host) so set membership is by
-        // box identity. A position with no canonical box is not a tracked
-        // allocation, so there is nothing to escape or depend on.
-        let Some(value_box) = ctx.get_box_replacement_operand_opt(value) else {
+        // heapcache operates on box objects; resolve both operands through
+        // `get_box_replacement` so set membership is by box identity.
+        if value.is_none() {
             return;
-        };
-        let container_box = ctx.get_box_replacement_operand_opt(container);
-        if container_box.as_ref().is_some_and(|c| self.is_unescaped(c))
-            && self.is_unescaped(&value_box)
-        {
+        }
+        let value_box = ctx.resolve_operand_operand(value);
+        let container_box = ctx.resolve_operand_operand(container);
+        if self.is_unescaped(&container_box) && self.is_unescaped(&value_box) {
             self.heapc_deps
-                .entry(container_box.unwrap())
+                .entry(container_box)
                 .or_default()
                 .push(value_box);
-        } else if !value.is_none() {
+        } else {
             self.escape_box(&value_box);
         }
     }
@@ -2312,7 +2307,8 @@ impl OptHeap {
         // Subsequent passes (intbounds, virtualstate) and the local
         // `setfield` mutation point all read/write that slot via the
         // canonical OpRef.
-        let obj = ctx.get_replacement_opref(raw_obj);
+        let obj_box = ctx.resolve_operand_operand(&op.arg(0));
+        let obj = obj_box.to_opref();
         let _ = ctx.ensure_ptr_info_arg0(op);
         // heap.py `cf = self.field_cache(descr)` — get-or-CREATE
         // (heap.py:392-397), so the aliasing check and the cache consult below
@@ -2361,7 +2357,7 @@ impl OptHeap {
             // RPython falls through here even when lazy_set exists (CANNOT_ALIAS).
             if must_alias_cached.is_none()
                 && !force_lazy
-                && let Some(entry) = cf._getfield(obj, &descr, field_idx, ctx)
+                && let Some(entry) = cf._getfield(&obj_box, &descr, field_idx, ctx)
             {
                 cached_entry = Some(entry);
             }
@@ -2384,7 +2380,7 @@ impl OptHeap {
                     // then walk forwarding for the body replace.
                     let cached = ctx.force_op_from_preamble_op(&pop);
                     ctx.structinfo_setfield(op, field_idx, cached);
-                    let obj_box = ctx.get_box_replacement_operand(obj);
+                    let obj_box = ctx.resolve_operand_operand(&obj_box);
                     self.cached_fields[pos].2.register_info(&obj_box);
                     let b_old = Operand::from_bound_op(op_rc);
                     let b_cached = ctx.get_box_replacement_operand(cached);
@@ -2400,7 +2396,7 @@ impl OptHeap {
                         // per-descr cache sees them, so enlist the object
                         // now; later calls/writes can then invalidate the
                         // mutable public class word normally.
-                        let obj_box = ctx.get_box_replacement_operand(obj);
+                        let obj_box = ctx.resolve_operand_operand(&obj_box);
                         self.cached_fields[pos].2.register_info(&obj_box);
                         let b_old = Operand::from_bound_op(op_rc);
                         let b_cached = ctx.get_box_replacement_operand(cached.to_opref());
@@ -2457,7 +2453,7 @@ impl OptHeap {
         // Check read cache (after import).
         if let Some(entry) = self.cached_fields[pos]
             .2
-            ._getfield(obj, &descr, field_idx, ctx)
+            ._getfield(&obj_box, &descr, field_idx, ctx)
         {
             match entry.kind() {
                 crate::optimizeopt::info::FieldEntryKind::Preamble(pop) => {
@@ -2465,7 +2461,7 @@ impl OptHeap {
                     // forced value back into the struct info.
                     let cached = ctx.force_op_from_preamble_op(&pop);
                     ctx.structinfo_setfield(op, field_idx, cached);
-                    let obj_box = ctx.get_box_replacement_operand(obj);
+                    let obj_box = ctx.resolve_operand_operand(&obj_box);
                     self.cached_fields[pos].2.register_info(&obj_box);
                     let b_old = Operand::from_bound_op(op_rc);
                     let b_cached = ctx.get_box_replacement_operand(cached);
@@ -2474,7 +2470,7 @@ impl OptHeap {
                 }
                 crate::optimizeopt::info::FieldEntryKind::Value(cached) => {
                     if !cached.is_none() {
-                        let obj_box = ctx.get_box_replacement_operand(obj);
+                        let obj_box = ctx.resolve_operand_operand(&obj_box);
                         self.cached_fields[pos].2.register_info(&obj_box);
                         let b_old = Operand::from_bound_op(op_rc);
                         let b_cached = ctx.get_box_replacement_operand(cached.to_opref());
@@ -2488,7 +2484,8 @@ impl OptHeap {
         // Check quasi-immutable cache: if this field was marked by
         // QUASIIMMUT_FIELD, the value is stable (guarded by GUARD_NOT_INVALIDATED).
         // Keyed by the object's canonical box identity.
-        if let Some(qi_obj) = ctx.get_box_replacement_operand_opt(raw_obj) {
+        {
+            let qi_obj = ctx.resolve_operand_operand(&obj_box);
             let qi_key = (qi_obj, descr_id);
             if let Some(qi_cached) = self.quasi_immut_cache.get(&qi_key).copied() {
                 if !qi_cached.is_none() {
@@ -2502,7 +2499,7 @@ impl OptHeap {
                 // the result so it survives calls (unlike normal mutable fields).
                 self.quasi_immut_cache.insert(qi_key, op.pos().get());
                 make_nonnull_box(ctx, &op.arg(0));
-                let obj_box = ctx.get_box_replacement_operand(obj);
+                let obj_box = ctx.resolve_operand_operand(&obj_box);
                 self.cached_fields[pos].2.register_info(&obj_box);
                 ctx.structinfo_setfield(op, field_idx, op.pos().get());
                 return OptimizationResult::PassOn;
@@ -2516,7 +2513,7 @@ impl OptHeap {
         // heap.py optimize_GETFIELD_GC_I default path also marks the base:
         //     self.make_nonnull(op.getarg(0))
         make_nonnull_box(ctx, &op.arg(0));
-        let obj_box = ctx.get_box_replacement_operand(obj);
+        let obj_box = ctx.resolve_operand_operand(&obj_box);
         self.cached_fields[pos].2.register_info(&obj_box);
         // heap.py postprocess_GETFIELD_GC_I: structinfo.setfield(descr, op)
         //
@@ -2569,13 +2566,14 @@ impl OptHeap {
         let raw_obj = op.arg(0).to_opref();
         // heap.py:78 ensure_ptr_info_arg0 — install structinfo as a
         // side effect; canonical OpRef for the cache key.
-        let obj = ctx.get_replacement_opref(raw_obj);
+        let obj_box = ctx.resolve_operand_operand(&op.arg(0));
+        let obj = obj_box.to_opref();
         let _ = ctx.ensure_ptr_info_arg0(op);
         // heapcache.py _escape_from_write — pyre-specific
         // escape tracking outside the do_setfield contract.
-        self.escape_from_write(ctx, obj, op.arg(1).to_opref());
+        self.escape_from_write(ctx, &obj_box, &op.arg(1));
         // heap.py do_setfield line-by-line.
-        self.do_setfield_field(op, op_rc, &descr, obj, ctx)
+        self.do_setfield_field(op, op_rc, &descr, obj, &obj_box, ctx)
     }
 
     /// heap.py `AbstractCachedEntry.do_setfield(optheap, op)`
@@ -2616,6 +2614,7 @@ impl OptHeap {
         op_rc: &majit_ir::OpRc,
         descr: &DescrRef,
         obj: OpRef,
+        obj_box: &Operand,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         // heap.py arg1 = get_box_replacement(self._get_rhs_from_set_op(op))
@@ -2639,7 +2638,7 @@ impl OptHeap {
         // Preamble/Value FieldEntry split).
         if let Some(entry) = self.cached_fields[pos]
             .2
-            ._getfield(obj, descr, field_idx, ctx)
+            ._getfield(obj_box, descr, field_idx, ctx)
         {
             match entry.kind() {
                 crate::optimizeopt::info::FieldEntryKind::Preamble(pop) => {
@@ -3217,9 +3216,7 @@ impl OptHeap {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         // heapcache.py _escape_from_write parity:
-        let array_obj = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
-        let stored_value = op.arg(2).to_opref();
-        self.escape_from_write(ctx, array_obj, stored_value);
+        self.escape_from_write(ctx, &op.arg(0), &op.arg(2));
 
         let key = match Self::arrayitem_key(op, ctx) {
             Some(k) => k,
