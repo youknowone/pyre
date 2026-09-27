@@ -3531,9 +3531,50 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_ll_arraycopy",
         pyre_object::object_array::jit_ll_arraycopy,
     );
-    // `ll_math.py` residuals live in `pyre-module`. The optional-module
-    // hook publishes them under the same `ll_math::math_*` / crate-root
-    // alias paths the front retargets Opaque `f64::{hypot,atan2,…}` to.
+    // `ll_math.py` C llexternals, under the `ll_math::math_*` / crate-root
+    // alias paths the front retargets the Opaque `f64` methods to. Float
+    // `**` and `%` reach them without the `math` module.
+    {
+        use majit_rlib::lltypesystem::module::ll_math as m;
+        let unary: [(&'static str, &'static str, extern "C" fn(f64) -> f64); 22] = [
+            ("ll_math::math_floor", "math_floor", m::math_floor),
+            ("ll_math::math_ceil", "math_ceil", m::math_ceil),
+            ("ll_math::math_log", "math_log", m::math_log),
+            ("ll_math::math_log10", "math_log10", m::math_log10),
+            ("ll_math::math_log1p", "math_log1p", m::math_log1p),
+            ("ll_math::math_exp", "math_exp", m::math_exp),
+            ("ll_math::math_exp2", "math_exp2", m::math_exp2),
+            ("ll_math::math_expm1", "math_expm1", m::math_expm1),
+            ("ll_math::math_sqrt", "math_sqrt", m::math_sqrt),
+            ("ll_math::math_cbrt", "math_cbrt", m::math_cbrt),
+            ("ll_math::math_sin", "math_sin", m::math_sin),
+            ("ll_math::math_cos", "math_cos", m::math_cos),
+            ("ll_math::math_tan", "math_tan", m::math_tan),
+            ("ll_math::math_asin", "math_asin", m::math_asin),
+            ("ll_math::math_acos", "math_acos", m::math_acos),
+            ("ll_math::math_atan", "math_atan", m::math_atan),
+            ("ll_math::math_sinh", "math_sinh", m::math_sinh),
+            ("ll_math::math_cosh", "math_cosh", m::math_cosh),
+            ("ll_math::math_tanh", "math_tanh", m::math_tanh),
+            ("ll_math::math_asinh", "math_asinh", m::math_asinh),
+            ("ll_math::math_acosh", "math_acosh", m::math_acosh),
+            ("ll_math::math_atanh", "math_atanh", m::math_atanh),
+        ];
+        for (module_path, root_path, f) in unary {
+            cpa1(&mut entries, module_path, root_path, f);
+        }
+        let binary: [(&'static str, &'static str, extern "C" fn(f64, f64) -> f64); 5] = [
+            ("ll_math::math_hypot", "math_hypot", m::math_hypot),
+            ("ll_math::math_atan2", "math_atan2", m::math_atan2),
+            ("ll_math::math_copysign", "math_copysign", m::math_copysign),
+            ("ll_math::math_pow", "math_pow", m::math_pow),
+            ("ll_math::math_fmod", "math_fmod", m::math_fmod),
+        ];
+        for (module_path, root_path, f) in binary {
+            cpa2(&mut entries, module_path, root_path, f);
+        }
+    }
+
     if let Some(hooks) = crate::importing::optional_module_hooks() {
         (hooks.publish_fnaddrs)(&mut entries);
     }
@@ -5643,6 +5684,34 @@ mod tests {
             bindings["pyre_object::dictmultiobject::w_dict_len"] as usize
         ));
         assert!(!is_abi_unsound_argument_residual(0));
+    }
+
+    /// The `ll_math.py` C llexternals are core: float `**` and `%` call
+    /// `math_pow` / `math_fmod` with no `math` module linked, and a missing
+    /// address leaves the float `**` descent unable to record its call.
+    #[test]
+    fn jit_trace_fnaddrs_covers_ll_math_llexternals_without_optional_modules() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        for leaf in [
+            "math_pow",
+            "math_fmod",
+            "math_hypot",
+            "math_asin",
+            "math_acosh",
+            "math_expm1",
+            "math_log1p",
+        ] {
+            let module_path = format!("ll_math::{leaf}");
+            assert!(
+                bindings.contains_key(module_path.as_str()),
+                "{module_path} must publish from the core table"
+            );
+            assert_eq!(
+                bindings.get(leaf),
+                bindings.get(module_path.as_str()),
+                "the crate-root {leaf} alias must resolve to the same address"
+            );
+        }
     }
 
     #[test]
