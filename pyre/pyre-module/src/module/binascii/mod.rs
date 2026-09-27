@@ -207,12 +207,12 @@ pyre_interpreter::py_module! {
         fn b2a_qp(
             data: PyObjectRef,
             #[default(w_none())] quotetabs: PyObjectRef,
-            #[default(w_none())] istext: PyObjectRef,
-            #[default(w_none())] header: PyObjectRef,
+            #[default(w_none())] mut istext: PyObjectRef,
+            #[default(w_none())] mut header: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let data = as_buffer_bytes(arg_required(data, "b2a_qp", "data", 1)?)?;
-            let quotetabs = slot_bool(quotetabs, false)?;
-            let istext = slot_bool(istext, true)?;
+            let quotetabs = pyre_object::with_roots!(header, istext => slot_bool(quotetabs, false))?;
+            let istext = pyre_object::with_roots!(header => slot_bool(istext, true))?;
             let header = slot_bool(header, false)?;
             Ok(w_bytes_from_bytes(&transforms::b2a_qp(&data, quotetabs, istext, header)))
         }

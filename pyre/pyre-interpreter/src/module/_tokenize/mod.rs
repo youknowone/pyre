@@ -218,7 +218,7 @@ impl W_TokenizerIter {
                 positional.len()
             )));
         }
-        let readline = positional[0];
+        let mut readline = positional[0];
         if !pyre_interpreter::baseobjspace::callable_w(readline) {
             return Err(pyre_interpreter::PyError::type_error(
                 "source must be callable",
@@ -230,7 +230,8 @@ impl W_TokenizerIter {
                     "tokenizeriter() missing required argument 'extra_tokens' (pos 2)",
                 )
             })?;
-        let extra_tokens = pyre_interpreter::baseobjspace::is_true(w_extra)?;
+        let extra_tokens =
+            pyre_object::with_roots!(readline => pyre_interpreter::baseobjspace::is_true(w_extra))?;
         let encoding = match pyre_interpreter::builtins::kwarg_get(kwargs, "encoding") {
             Some(value) => unsafe {
                 if !is_str(value) {

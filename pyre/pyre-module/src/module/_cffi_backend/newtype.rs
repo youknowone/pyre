@@ -550,7 +550,7 @@ struct FieldDescr {
 
 /// `newtype.py complete_struct_or_union`.
 pub fn complete_struct_or_union(
-    w_ctype: PyObjectRef,
+    mut w_ctype: PyObjectRef,
     w_fields: PyObjectRef,
     totalsize: i64,
     totalalignment: i64,
@@ -575,7 +575,7 @@ pub fn complete_struct_or_union(
 
     // The field descriptors are read out first: each one is a tuple whose
     // unpacking allocates, and nothing below may hold a stale reference.
-    let descrs = read_field_descrs(ct, w_fields)?;
+    let descrs = pyre_object::with_roots!(w_ctype => read_field_descrs(ct, w_fields))?;
 
     let roots = pyre_object::gc_roots::push_roots();
     let list_slot = roots.base();

@@ -640,7 +640,7 @@ fn hmac_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
             })?;
     let msg =
         pyre_interpreter::builtins::bind_pos_or_kw(positional, kwargs, 1, "msg", "hmac_new", 2)?;
-    let digestmod = pyre_interpreter::builtins::bind_pos_or_kw(
+    let mut digestmod = pyre_interpreter::builtins::bind_pos_or_kw(
         positional,
         kwargs,
         2,
@@ -658,9 +658,11 @@ fn hmac_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
         &["key", "msg", "digestmod"],
         "hmac_new",
     )?;
-    let key = read_hash_buffer(key)?;
+    let key = pyre_object::with_roots!(digestmod => read_hash_buffer(key))?;
     let msg = match msg {
-        Some(msg) if unsafe { !is_none(msg) } => read_hash_buffer(msg)?,
+        Some(msg) if unsafe { !is_none(msg) } => {
+            pyre_object::with_roots!(digestmod => read_hash_buffer(msg))?
+        }
         _ => Vec::new(),
     };
     W_Hmac::new(resolve_hmac_digestmod(digestmod)?, &key, &msg)
@@ -683,14 +685,14 @@ fn hmac_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::Py
                     "hmac_digest() missing required argument 'key'",
                 )
             })?;
-    let msg =
+    let mut msg =
         pyre_interpreter::builtins::bind_pos_or_kw(positional, kwargs, 1, "msg", "hmac_digest", 2)?
             .ok_or_else(|| {
                 pyre_interpreter::PyError::type_error(
                     "hmac_digest() missing required argument 'msg'",
                 )
             })?;
-    let digestmod = pyre_interpreter::builtins::bind_pos_or_kw(
+    let mut digestmod = pyre_interpreter::builtins::bind_pos_or_kw(
         positional,
         kwargs,
         2,
@@ -708,8 +710,8 @@ fn hmac_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::Py
         &["key", "msg", "digest"],
         "hmac_digest",
     )?;
-    let key = read_hash_buffer(key)?;
-    let msg = read_hash_buffer(msg)?;
+    let key = pyre_object::with_roots!(digestmod, msg => read_hash_buffer(key))?;
+    let msg = pyre_object::with_roots!(digestmod => read_hash_buffer(msg))?;
     let state = W_Hmac::new(resolve_hmac_digestmod(digestmod)?, &key, &msg)?;
     let state = W_Hmac::from_obj(state).expect("fresh HMAC");
     let digest =
@@ -743,10 +745,10 @@ fn pbkdf2_hmac(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::Py
             ))
         })
     };
-    let hash_name = required(0, "hash_name", 1)?;
-    let password = required(1, "password", 2)?;
-    let salt = required(2, "salt", 3)?;
-    let iterations = required(3, "iterations", 4)?;
+    let mut hash_name = required(0, "hash_name", 1)?;
+    let mut password = required(1, "password", 2)?;
+    let mut salt = required(2, "salt", 3)?;
+    let mut iterations = required(3, "iterations", 4)?;
     let dklen = pyre_interpreter::builtins::bind_pos_or_kw(
         positional,
         kwargs,
@@ -757,12 +759,12 @@ fn pbkdf2_hmac(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::Py
     )?;
     pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, KEYWORDS, "pbkdf2_hmac")?;
 
-    check_digest_name(hash_name)?;
+    pyre_object::with_roots!(hash_name, iterations, password, salt => check_digest_name(hash_name))?;
     let requested = unsafe { w_str_get_wtf8(hash_name) };
     let name = lookup_digest_name(requested.as_bytes())
         .ok_or_else(|| unsupported_digestmod("unsupported hash type"))?;
-    let password = read_hash_buffer(password)?;
-    let salt = read_hash_buffer(salt)?;
+    let password = pyre_object::with_roots!(iterations, salt => read_hash_buffer(password))?;
+    let salt = pyre_object::with_roots!(iterations => read_hash_buffer(salt))?;
     let iterations = pyre_interpreter::baseobjspace::int_w(
         pyre_interpreter::baseobjspace::space_index(iterations)?,
     )?;
@@ -821,18 +823,19 @@ fn scrypt_kdf(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyE
             ))
         })
     };
-    let salt = required("salt")?;
-    let n_obj = required("n")?;
-    let r_obj = required("r")?;
-    let p_obj = required("p")?;
+    let mut salt = required("salt")?;
+    let mut n_obj = required("n")?;
+    let mut r_obj = required("r")?;
+    let mut p_obj = required("p")?;
 
-    let password = read_hash_buffer(password)?;
-    let salt = read_hash_buffer(salt)?;
+    let password =
+        pyre_object::with_roots!(n_obj, p_obj, r_obj, salt => read_hash_buffer(password))?;
+    let salt = pyre_object::with_roots!(n_obj, p_obj, r_obj => read_hash_buffer(salt))?;
     let index = |obj| {
         pyre_interpreter::baseobjspace::int_w(pyre_interpreter::baseobjspace::space_index(obj)?)
     };
-    let n = index(n_obj)?;
-    let r = index(r_obj)?;
+    let n = pyre_object::with_roots!(p_obj, r_obj => index(n_obj))?;
+    let r = pyre_object::with_roots!(p_obj => index(r_obj))?;
     let p = index(p_obj)?;
     let maxmem = match pyre_interpreter::builtins::kwarg_get(kwargs, "maxmem") {
         Some(obj) => index(obj)?,
@@ -1151,11 +1154,11 @@ fn new_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
     )?;
     let name = pyre_interpreter::builtins::bind_pos_or_kw(positional, kwargs, 0, "name", "new", 1)?;
     let data = pyre_interpreter::builtins::bind_pos_or_kw(positional, kwargs, 1, "data", "new", 2)?;
-    let name = name.ok_or_else(|| {
+    let mut name = name.ok_or_else(|| {
         pyre_interpreter::PyError::type_error("new() missing required argument 'name' (pos 1)")
     })?;
     pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, NEW_KEYWORDS, "new")?;
-    check_digest_name(name)?;
+    pyre_object::with_roots!(name => check_digest_name(name))?;
     let string = pyre_interpreter::builtins::kwarg_get(kwargs, "string");
     let usedforsecurity = pyre_interpreter::builtins::kwarg_get(kwargs, "usedforsecurity");
     make_hash(name, data, string, usedforsecurity)

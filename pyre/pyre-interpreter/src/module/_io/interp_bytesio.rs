@@ -226,8 +226,10 @@ impl W_BytesIO {
 
     /// `space.buffer_w(w_data, space.BUF_CONTIG_RO)` — the contiguous
     /// read-only bytes `descr_init` and `write_w` both copy from.
-    fn contiguous_bytes(w_data: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
-        let Some(input) = crate::baseobjspace::simple_buffer_bytes(w_data)? else {
+    fn contiguous_bytes(mut w_data: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+        let Some(input) =
+            pyre_object::with_roots!(w_data => crate::baseobjspace::simple_buffer_bytes(w_data))?
+        else {
             return Err(crate::PyError::type_error(format!(
                 "a bytes-like object is required, not '{}'",
                 crate::type_methods::arg_type_name(w_data)
@@ -536,10 +538,10 @@ impl W_BytesIO {
         ]))
     }
 
-    fn __setstate__(&mut self, w_state: PyObjectRef) -> Result<(), crate::PyError> {
+    fn __setstate__(&mut self, mut w_state: PyObjectRef) -> Result<(), crate::PyError> {
         // interp_bytesio.py:212-227.
         self.check_closed()?;
-        let length = crate::baseobjspace::len_w(w_state)?;
+        let length = pyre_object::with_roots!(w_state => crate::baseobjspace::len_w(w_state))?;
         if length != 3 {
             return Err(crate::PyError::type_error(format!(
                 "{}.__setstate__ argument should be 3-tuple, got {}",
