@@ -656,14 +656,15 @@ favour of the ported optimizer" — is not available as stated. Group by group:
 | frame / execution-context introspection | none at any layer; PyPy forces the virtualizable instead |
 | function-object construction | none |
 | callee inlining (`instance_next`, `kwonly_defaults_inline`) | none as a pass; `MIFrame.opimpl_inline_call` reaches the callee by tracing into it |
-| orthodox descent rows — not folds | the descent itself; the exact count is the symbol-derived 5 above |
+| `_descent` rows — not folds | the descent itself (3 orthodox sub-walks) or the generated gateway shortcut (`builtin_len_descent`); the count is the 4 `_descent` rows above |
 
 The groups are explanatory, not a second manually maintained census. Their
 boundaries contain judgement calls (`set_add_method` may be read as a call or
 a heap mutation, and the `super` rows mix virtual construction with frame
 access), so attaching an independently edited `n` column made the table look
 exact while letting it disagree with `SPEC_FOLD_ROWS`. The reproducible split
-is 66 hand-written rows plus 4 orthodox descent rows, re-derived on 2026-09-26.
+is 66 hand-written rows plus 4 `_descent` rows (3 orthodox sub-walks and one
+gateway shortcut), re-derived on 2026-09-27.
 
 Four groups have only downstream cleanup upstream, three have nothing at all,
 and exactly one has a counterpart that is a pass rather than a consumer. So
