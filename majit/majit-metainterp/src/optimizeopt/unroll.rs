@@ -4188,25 +4188,6 @@ impl OptUnroll {
         // unroll.py inline_short_preamble: the only seed is
         // `mapping[short_inputargs[i]] = jump_args[i]`.
 
-        // RPython keys `mapping` by Box identity: the seeding above binds
-        // each short-preamble INPUT box to its jump arg, and the replay loop
-        // below binds each short-op RESULT box (`mapping[sop] = op`). Those two
-        // key spaces never intersect — a Box is either an input or a produced
-        // result, never both. pyre's flat-OpRef namespace has no such guarantee:
-        // a re-virtualizing ALLOCATION short op (e.g. `NewWithVtable`) can be
-        // assigned a result position that equals a loop-input OpRef (the export
-        // aliases the virtual's materialization onto the label slot that carries
-        // it). If the replay's `mapping.insert(sp_op.pos, ...)` overwrote that
-        // seeded entry, every later short op that reads the input would resolve to
-        // the fresh, field-less allocation instead of the loop-carried box.
-        // Snapshot the seeded input keys so the replay can preserve them for
-        // allocation ops only (the `skip_insert` gate below tests
-        // `is_malloc() && seeded_input_keys.contains(..)`), restoring the RPython
-        // input-vs-result key disjointness. (A colliding non-allocation op is a
-        // real recomputation and must NOT be preserved: its fresh result IS the
-        // correct binding.)
-        let seeded_input_keys: crate::FxIndexSet<OpRef> = mapping.keys().copied().collect();
-
         let mut replay_index = 0;
 
         fn current_short_len(
@@ -4377,34 +4358,10 @@ impl OptUnroll {
                 }
                 let new_ref = ctx.alloc_op_position_typed(new_op.result_type());
                 new_op.pos().set(new_ref);
-                // unroll.py:412-414: mapping[sop] = op; i += 1; send_extra_operation(op)
-                // RPython sets mapping BEFORE send_extra_operation.
-                //
-                // RPython keys `mapping` by Box identity, and a short-op RESULT
-                // Box is never also a short-preamble INPUT Box, so `mapping[sop]
-                // = op` can never overwrite a seeded input → jump_arg entry. In
-                // pyre's flat-OpRef namespace a re-virtualizing ALLOCATION short op
-                // can be exported with a result position that equals a loop-input
-                // OpRef (the virtual's materialization aliases the label slot that
-                // already carries it). Overwriting the seed for such an op would
-                // make every later short op that reads the input resolve to this
-                // fresh, field-less allocation instead of the loop-carried box, so
-                // a `GetfieldGcI` over the aliased input reads an uninitialized
-                // field. Skip the insert ONLY for those allocation ops
-                // (`is_malloc`: New..Newunicode) to preserve the seed. A colliding
-                // NON-allocation op (a pure read/compute whose result pos happens
-                // to alias a seed, e.g. `GetfieldGcI` producing an Int loop
-                // slot) is a genuine recomputation whose fresh result IS the
-                // correct binding — skipping it would strand the slot on the seed's
-                // Ref box and feed a Ref into an Int consumer (getintbound_handle
-                // 'i'-typed assert). Keep the RPython input-vs-result key
-                // disjointness for the allocation case only; the redundant
-                // reconstruction op is left unmapped (dead) and elided by DCE.
-                let skip_insert =
-                    sp_op.opcode.is_malloc() && seeded_input_keys.contains(&sp_op.pos().get());
-                if !skip_insert {
-                    mapping.insert(sp_op.pos().get(), new_ref);
-                }
+                // unroll.py `inline_short_preamble`: mapping[sop] = op, then
+                // send_extra_operation(op). The mapping write happens before
+                // send_extra_operation.
+                mapping.insert(sp_op.pos().get(), new_ref);
                 replay_index += 1;
                 // unroll.py:414 lets send_extra_operation raise InvalidLoop.
                 // This function returns Vec (flag convention, as the arity /
@@ -4723,11 +4680,7 @@ impl OptUnroll {
             let result = match produced.kind {
                 crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
                 | crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant => {
-                    if let Some(slot) = produced.label_arg_idx {
-                        short_args.get(slot).copied()
-                    } else {
-                        Some(ctx.alloc_op_position_typed(result_type))
-                    }
+                    Some(ctx.alloc_op_position_typed(result_type))
                 }
                 crate::optimizeopt::shortpreamble::PreambleOpKind::Heap => {
                     match produced.preamble_op.opcode {
@@ -4750,8 +4703,6 @@ impl OptUnroll {
                 // arms above) have no producer yet; mint their canonical
                 // `SameAs*` stand-in here so a later `get_box_replacement`
                 // resolves them instead of fabricating a position-only box.
-                // Slot-mapped results (`short_args[slot]`) are already bound
-                // inputargs and resolve without minting.
                 if ctx.get_box_replacement_operand_opt(result).is_none() {
                     ctx.mint_box_at(result);
                 }
@@ -8134,12 +8085,17 @@ mod tests {
         // directly.
         let fresh_const = OpRef::const_ptr(ptr);
         assert_eq!(ctx2.get_constant(fresh_const), Some(Value::Ref(ptr)));
+        // A Pure short box gets a fresh replay box (`alloc_op_position_typed`).
+        // `label_arg_idx` does not reuse `short_args[slot]`.
+        assert_eq!(ctx2.imported_short_pure_ops.len(), 1);
+        let result = ctx2.imported_short_pure_ops[0].result;
+        assert_ne!(result, OpRef::int_op(11));
         let expected = crate::optimizeopt::ImportedShortPureOp::new(
             &mut ctx2,
             OpCode::GetfieldGcI,
             Some(field_descr.clone()),
             vec![const_arg],
-            OpRef::int_op(11),
+            result,
             OpRef::int_op(11),
             false,
             None,

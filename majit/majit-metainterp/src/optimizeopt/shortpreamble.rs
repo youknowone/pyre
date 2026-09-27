@@ -558,16 +558,11 @@ impl PotentialShortOp {
                         alt.res = ctx.materialize_operand_at(alias);
                         alt.invented_name = true;
                         // shortpreamble.py `lst[i].short_op.res = new_name`:
-                        // the alias result is now the freshly invented SameAs box,
-                        // not a label arg. `label_arg_idx` was set by
-                        // `lookup_label_arg` from the ORIGINAL result position, so it
-                        // must be cleared to stay consistent with the updated `res`
-                        // (upstream keys slot identity off `short_op.res`, which the
-                        // line above just rebound). Otherwise the import slot-lookup
-                        // (in `unroll.rs`'s `inline_short_preamble`) would map
-                        // this invented alias onto the
-                        // loop-carried `short_args[slot]` instead of minting a fresh
-                        // result, collapsing the extra `same_as` identity.
+                        // the alias result is the freshly invented SameAs box,
+                        // not a label arg. Slot identity belongs only to
+                        // `ShortInputArg`. `label_arg_idx` was stamped from the
+                        // original result position, so clear it on the rebound
+                        // alias (`ShortBoxes.add_op_to_short`).
                         alt.label_arg_idx = None;
                         // shortpreamble.py `ResOperation(opnum, [shortop.res])`
                         // — the alias source is the Box itself; resolve to
@@ -4220,16 +4215,11 @@ mod tests {
 
     #[test]
     fn test_compound_pure_loser_to_short_inputarg_clears_label_arg_idx() {
-        // shortpreamble.py:326-333 — when a Pure alternative loses the compound
-        // tie to the ShortInputArg, its result is rebound to a fresh SameAs box
-        // (`lst[i].short_op.res = new_name`), so the invented alias is no longer
-        // a label arg. pyre's `label_arg_idx` (the position proxy for "res is
-        // label arg N") must be cleared in lockstep; otherwise the import
-        // slot-lookup at unroll.rs (the path-2 Pure|LoopInvariant arm) would map
-        // the invented alias onto the loop-carried `short_args[slot]`, collapsing
-        // the distinct same_as identity into a wrong-result miscompile. (The
-        // sibling Heap-loser test above does NOT exercise this: path-2 ignores
-        // label_arg_idx for the Heap kind.)
+        // shortpreamble.py `ShortBoxes.add_op_to_short` — when a Pure
+        // alternative loses the compound tie to the ShortInputArg, its result
+        // is rebound to a fresh SameAs box (`lst[i].short_op.res = new_name`),
+        // so the invented alias is not a label arg. Slot identity belongs only
+        // to `ShortInputArg`, so `label_arg_idx` is cleared on the alias.
         let mut ctx = crate::optimizeopt::OptContext::new(256);
         let mut sb =
             ShortBoxes::with_label_args(&[OpRef::int_op(10), OpRef::int_op(30), OpRef::int_op(31)]);
@@ -4357,10 +4347,8 @@ mod tests {
         assert_ne!(produced_arg.to_opref(), si[0]);
 
         // `lookup_label_arg` mirrors `potential_ops[box]`'s last-wins overwrite,
-        // resolving the duplicated box to the LAST/live slot. This keeps the
-        // non-InputArg export lookup (optimizer.rs `lookup_label_arg(
-        // canonical_result)`) consistent with the InputArg entry's `live_slot`
-        // above. `rposition`; was `Some(0)` (first) before the fix.
+        // resolving the duplicated box to the LAST/live slot. `rposition`; was
+        // `Some(0)` (first) before the fix.
         assert_eq!(sb.lookup_label_arg(OpRef::ref_op(50)), Some(1));
     }
 

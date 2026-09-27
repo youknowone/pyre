@@ -2057,31 +2057,14 @@ impl Optimizer {
                     }
                     preamble_op.setfailargs(fail_args);
                 }
-                // Resolve the carried slot by entry kind. An InputArg
-                // label arg whose canonical result forwards away is absent
-                // from `short_boxes.label_args`, so a re-lookup of
+                // An InputArg label arg whose canonical result forwards away
+                // is absent from `short_boxes.label_args`, so a re-lookup of
                 // `canonical_result` returns None and the per-slot original
-                // is lost; `produced.label_arg_idx` preserves the original
-                // stamped slot through forwarding (the slot the renamed
+                // is lost. `produced.label_arg_idx` is the slot stamped at
+                // `add_short_input_arg` (the slot the renamed
                 // `short_inputargs[i]` pairs with — consumed by
-                // slot_to_original). For non-InputArg (Pure/LoopInvariant/
-                // Heap) entries the result_map consumer needs the FORWARDED
-                // slot: a Pure/LoopInvariant result proven equal to a label
-                // arg it did not originally occupy must reuse
-                // `short_args[slot]`, which `lookup_label_arg(canonical_
-                // result)` reports (pre-217 forwarded-slot lookup, parity
-                // with upstream Box-identity CompoundOp merge). For a label
-                // arg duplicated across `label_args + virtuals`,
-                // `lookup_label_arg` resolves to the LAST/live slot
-                // (`potential_ops[box]` overwrite), matching the InputArg
-                // branch's `live_slot` and upstream's surviving ShortInputArg.
-                let label_arg_idx = if produced.kind
-                    == crate::optimizeopt::shortpreamble::PreambleOpKind::InputArg
-                {
-                    produced.label_arg_idx
-                } else {
-                    short_boxes.lookup_label_arg(canonical_result)
-                };
+                // `slot_to_original`). Non-InputArg entries keep the same
+                // stamped field; `inline_short_preamble` does not read it.
                 Some(crate::optimizeopt::shortpreamble::PreambleOp {
                     op: preamble_op,
                     source_op: Some(produced.source_op.clone()),
@@ -2091,7 +2074,7 @@ impl Optimizer {
                     // / const operand, so it moves across unchanged.
                     res: produced.res.clone(),
                     kind: produced.kind,
-                    label_arg_idx,
+                    label_arg_idx: produced.label_arg_idx,
                     invented_name: produced.invented_name,
                     same_as_source: produced.same_as_source.clone(),
                 })
