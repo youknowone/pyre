@@ -598,13 +598,11 @@ fn frozen_code(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
     .map_err(|error| {
         crate::builtins::compile_err_to_syntax_error(error, &source, crate::compile::Mode::Exec)
     })?;
-    let w_code = crate::box_code_object(code);
+    let mut w_code = crate::box_code_object(code);
     if let Some(key) = cache_key {
         // `frozen_cache_store` marshals `w_code`, which can allocate and collect;
         // keep the freshly boxed code reachable across that call.
-        let _root = pyre_object::gc_roots::push_roots();
-        let w_code = pyre_object::gc_roots::pin_root(w_code);
-        frozen_cache_store(key, &source, w_code);
+        pyre_object::with_roots!(w_code => frozen_cache_store(key, &source, w_code));
     }
     Ok(w_code)
 }

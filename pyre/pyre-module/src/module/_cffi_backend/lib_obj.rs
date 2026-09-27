@@ -259,12 +259,14 @@ fn build_attr(w_lib: PyObjectRef, w_attr: PyObjectRef) -> Result<Option<PyObject
                         ct.size
                     )));
                 }
+                let ct_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = roots.pin_root(w_ct);
                 let ptr = if g.address.is_null() {
                     cdlopen_fetch(roots.get(lib_slot), attr)?
                 } else {
                     g.address.cast()
                 };
-                cglob::new_glob(attr, w_ct, ptr, std::ptr::null_mut())
+                cglob::new_glob(attr, roots.get(ct_slot), ptr, std::ptr::null_mut())
             }
             parse_c_type::OP_GLOBAL_VAR_F => {
                 let w_ct = realize_c_type::realize_c_type(

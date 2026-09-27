@@ -2457,7 +2457,7 @@ fn format_render(
             // into its own roots) and read `val` back once it returns.
             let inner = pyre_object::gc_roots::push_roots();
             let val_slot = inner.base();
-            let mut val = inner.pin_root(val);
+            let _ = inner.pin_root(val);
             let reloaded: Vec<PyObjectRef> = (0..positional.len())
                 .map(|i| pyre_object::gc_roots::shadow_stack_get(positional_base + i))
                 .collect();
@@ -7008,6 +7008,8 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
     unsafe {
         let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         let dict = pyre_object::interp_exceptions::w_exception_getdict(exc);
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = _roots.pin_root(dict);
         let notes = match w_dict_getitem_str(dict, "__notes__") {
             Some(notes) if crate::baseobjspace::isinstance_list_w(notes) => notes,
             Some(_) => {
@@ -7015,7 +7017,11 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
             }
             None => {
                 let notes = w_list_new(Vec::new());
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(dict, "__notes__", notes);
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                    "__notes__",
+                    notes,
+                );
                 notes
             }
         };
@@ -7071,6 +7077,8 @@ pub fn dict_init_or_update(
         // slotted-dict-subclass support needs intrinsic dict backing.
         return Ok(w_none());
     }
+    let backing_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(backing);
     if kwargs_dict.is_some() {
         let kwargs = pyre_object::gc_roots::shadow_stack_get(root_base + args.len() - 1);
         unsafe {
@@ -7080,7 +7088,7 @@ pub fn dict_init_or_update(
                 {
                     continue;
                 }
-                dict_store_checked(backing, k, v)?;
+                dict_store_checked(pyre_object::gc_roots::shadow_stack_get(backing_slot), k, v)?;
             }
         }
     }

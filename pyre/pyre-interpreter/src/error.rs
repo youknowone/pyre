@@ -1247,9 +1247,7 @@ impl PyError {
         // allocates.
         let _roots = pyre_object::gc_roots::push_roots();
         let key_slot = pyre_object::gc_roots::shadow_stack_len();
-        if !key.is_null() {
-            let _ = pyre_object::gc_roots::pin_root(key);
-        }
+        let _ = pyre_object::gc_roots::pin_root(key);
         let message = if key.is_null() {
             Wtf8Buf::from_string("<null>".to_string())
         } else {
@@ -1262,11 +1260,11 @@ impl PyError {
         // keeps it alive without keeping it in place, and the allocations
         // below can relocate it.
         let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
+        // Reload the key after the repr / exception allocations: the pin
+        // keeps it alive, but a minor collection may have relocated the
+        // young key, leaving the raw local pointing at the old address.
+        let key = pyre_object::gc_roots::shadow_stack_get(key_slot);
         if !key.is_null() {
-            // Reload the key after the repr / exception allocations: the pin
-            // keeps it alive, but a minor collection may have relocated the
-            // young key, leaving this raw local pointing at the old address.
-            let key = pyre_object::gc_roots::shadow_stack_get(key_slot);
             let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![key]);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc(), args_list) };
         }
@@ -1669,17 +1667,11 @@ impl PyError {
         // setters stamp them onto `exc`.
         let _roots = pyre_object::gc_roots::push_roots();
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
-        if !w_name.is_null() {
-            let _ = pyre_object::gc_roots::pin_root(w_name);
-        }
+        let _ = pyre_object::gc_roots::pin_root(w_name);
         let path_slot = pyre_object::gc_roots::shadow_stack_len();
-        if !w_path.is_null() {
-            let _ = pyre_object::gc_roots::pin_root(w_path);
-        }
+        let _ = pyre_object::gc_roots::pin_root(w_path);
         let name_from_slot = pyre_object::gc_roots::shadow_stack_len();
-        if !w_name_from.is_null() {
-            let _ = pyre_object::gc_roots::pin_root(w_name_from);
-        }
+        let _ = pyre_object::gc_roots::pin_root(w_name_from);
         let exc_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ =
             pyre_object::gc_roots::pin_root(w_exception_new_wtf8(ExcKind::ImportError, &message));
@@ -1696,23 +1688,10 @@ impl PyError {
         };
         // Reload name/path after the message allocation: the pins keep them
         // alive, but a minor collection may have relocated the young objects,
-        // leaving these raw locals stale. A null (absent) ref was never pinned,
-        // so it has no slot and stays null.
-        let w_name = if w_name.is_null() {
-            w_name
-        } else {
-            pyre_object::gc_roots::shadow_stack_get(name_slot)
-        };
-        let w_path = if w_path.is_null() {
-            w_path
-        } else {
-            pyre_object::gc_roots::shadow_stack_get(path_slot)
-        };
-        let w_name_from = if w_name_from.is_null() {
-            w_name_from
-        } else {
-            pyre_object::gc_roots::shadow_stack_get(name_from_slot)
-        };
+        // leaving these raw locals stale.
+        let w_name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+        let w_path = pyre_object::gc_roots::shadow_stack_get(path_slot);
+        let w_name_from = pyre_object::gc_roots::shadow_stack_get(name_from_slot);
         unsafe {
             pyre_object::interp_exceptions::w_exception_set_import_msg(exc(), w_msg);
             pyre_object::interp_exceptions::w_exception_set_name(exc(), w_name);
@@ -2808,10 +2787,18 @@ pub fn display_through_traceback_module(exc_value: PyObjectRef, exc_tb: PyObject
     if !exc_tb.is_null()
         && !unsafe { pyre_object::is_none(exc_tb) }
         && unsafe { crate::pytraceback::is_pytraceback(exc_tb) }
-        && unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc_value).is_null() }
+        && unsafe {
+            pyre_object::interp_exceptions::w_exception_get_traceback(
+                pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            )
+            .is_null()
+        }
     {
         unsafe {
-            pyre_object::interp_exceptions::w_exception_set_traceback(exc_value, exc_tb);
+            pyre_object::interp_exceptions::w_exception_set_traceback(
+                pyre_object::gc_roots::shadow_stack_get(exc_slot),
+                exc_tb,
+            );
         }
     }
     let ec = crate::call::getexecutioncontext();
@@ -3752,13 +3739,8 @@ fn exception_suggestion(exc_slot: usize) -> Option<String> {
     let wrong_name = unsafe { pyre_object::w_str_get_value_opt(wrong) }?.to_string();
     let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
-    let tb_slot = if tb.is_null() {
-        None
-    } else {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(tb);
-        Some(slot)
-    };
+    let tb_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(tb);
     let suggestion = match kind {
         ExcKind::AttributeError => {
             let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
@@ -3767,9 +3749,7 @@ fn exception_suggestion(exc_slot: usize) -> Option<String> {
             let obj = pyre_object::gc_roots::pin_root(obj);
             object_dir_strings(obj).and_then(|mut names| {
                 let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                let tb = tb_slot
-                    .map(pyre_object::gc_roots::shadow_stack_get)
-                    .unwrap_or(pyre_object::PY_NULL);
+                let tb = pyre_object::gc_roots::shadow_stack_get(tb_slot);
                 if !wrong_name.starts_with('_') && !traceback_self_is(tb, obj) {
                     names.retain(|name| !name.starts_with('_'));
                 }
@@ -3811,7 +3791,7 @@ fn exception_suggestion(exc_slot: usize) -> Option<String> {
             }
         }
         ExcKind::NameError => {
-            let frame = traceback_last_frame(tb)?;
+            let frame = traceback_last_frame(pyre_object::gc_roots::shadow_stack_get(tb_slot))?;
             let anchor = crate::eval::FrameAnchor::new(unsafe { &mut *frame });
             let mut names = Vec::new();
             if let Ok(locals) = unsafe { &mut *anchor.live() }.getdictscope() {
@@ -4391,13 +4371,18 @@ fn report_through_default_excepthook(failure: &mut PyError) {
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(exc);
-    let w_type = crate::baseobjspace::exception_getclass(exc);
+    let w_type =
+        crate::baseobjspace::exception_getclass(pyre_object::gc_roots::shadow_stack_get(sp));
     let _ = pyre_object::gc_roots::pin_root(if w_type.is_null() {
         pyre_object::w_none()
     } else {
         w_type
     });
-    let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
+    let w_tb = unsafe {
+        pyre_object::interp_exceptions::w_exception_get_traceback(
+            pyre_object::gc_roots::shadow_stack_get(sp),
+        )
+    };
     unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
     let _ = pyre_object::gc_roots::pin_root(if w_tb.is_null() {
         pyre_object::w_none()
@@ -4442,14 +4427,19 @@ pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
     }
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(exc);
-    let w_type = crate::baseobjspace::exception_getclass(exc);
+    let w_type =
+        crate::baseobjspace::exception_getclass(pyre_object::gc_roots::shadow_stack_get(exc_slot));
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(if w_type.is_null() {
         pyre_object::w_none()
     } else {
         w_type
     });
-    let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
+    let w_tb = unsafe {
+        pyre_object::interp_exceptions::w_exception_get_traceback(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+        )
+    };
     unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
     let tb_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(if w_tb.is_null() {

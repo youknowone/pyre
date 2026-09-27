@@ -1023,6 +1023,8 @@ fn encode_sequence(
     level: i64,
 ) -> Result<rustpython_wtf8::Wtf8Buf, PyError> {
     let _roots = gc_roots::push_roots();
+    let self_slot = gc_roots::shadow_stack_len();
+    let _ = gc_roots::pin_root(self_obj);
     // `obj` is the sequence being encoded — a movable header — and the child
     // encoders below run arbitrary Python.  The `map_err` closure must read it
     // back out of the slot; capturing the parameter would name the pre-move
@@ -1032,9 +1034,9 @@ fn encode_sequence(
     let iter = pyre_interpreter::baseobjspace::iter(obj)?;
     let iter_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(iter);
-    let separator_obj = encoder_attr(self_obj, "item_separator")?;
+    let separator_obj = encoder_attr(gc_roots::shadow_stack_get(self_slot), "item_separator")?;
     let separator = require_string(separator_obj)?.to_wtf8_buf();
-    let indent = indent_value(self_obj)?.map(Wtf8::to_wtf8_buf);
+    let indent = indent_value(gc_roots::shadow_stack_get(self_slot))?.map(Wtf8::to_wtf8_buf);
     let child_level = level.max(0) + 1;
     let mut out = rustpython_wtf8::Wtf8Buf::new();
     out.push_char('[');
@@ -1058,15 +1060,16 @@ fn encode_sequence(
                 append_indent(&mut out, indent, child_level);
             }
         }
-        let encoded = encode_child(self_obj, item, child_level).map_err(|err| {
-            add_json_note(
-                err,
-                format!(
-                    "when serializing {} item {item_index}",
-                    short_type_name(gc_roots::shadow_stack_get(obj_slot))
-                ),
-            )
-        })?;
+        let encoded = encode_child(gc_roots::shadow_stack_get(self_slot), item, child_level)
+            .map_err(|err| {
+                add_json_note(
+                    err,
+                    format!(
+                        "when serializing {} item {item_index}",
+                        short_type_name(gc_roots::shadow_stack_get(obj_slot))
+                    ),
+                )
+            })?;
         out.push_wtf8(&encoded);
         item_index += 1;
     }
@@ -1128,6 +1131,8 @@ fn encode_dict(
     // run Python between the two.  Each is pinned where it is produced and read
     // back where it is used.
     let _roots = gc_roots::push_roots();
+    let self_slot = gc_roots::shadow_stack_len();
+    let _ = gc_roots::pin_root(self_obj);
     let obj_slot = gc_roots::shadow_stack_len();
     let obj = gc_roots::pin_root(obj);
     let items = pyre_interpreter::call::call_function_impl_result(
@@ -1136,7 +1141,10 @@ fn encode_dict(
     )?;
     let mut items_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(items);
-    if pyre_interpreter::baseobjspace::is_true(encoder_attr(self_obj, "sort_keys")?)? {
+    if pyre_interpreter::baseobjspace::is_true(encoder_attr(
+        gc_roots::shadow_stack_get(self_slot),
+        "sort_keys",
+    )?)? {
         // `encoder_listencode_dict` builds the list itself and sorts it in
         // place with `PyList_Sort`.  Naming `builtins.sorted` instead resolves
         // through the running `sys.modules`, which a program is entitled to
@@ -1153,9 +1161,17 @@ fn encode_dict(
     let iter = pyre_interpreter::baseobjspace::iter(gc_roots::shadow_stack_get(items_slot))?;
     let iter_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(iter);
-    let item_separator = require_string(encoder_attr(self_obj, "item_separator")?)?.to_wtf8_buf();
-    let key_separator = require_string(encoder_attr(self_obj, "key_separator")?)?.to_wtf8_buf();
-    let indent = indent_value(self_obj)?.map(Wtf8::to_wtf8_buf);
+    let item_separator = require_string(encoder_attr(
+        gc_roots::shadow_stack_get(self_slot),
+        "item_separator",
+    )?)?
+    .to_wtf8_buf();
+    let key_separator = require_string(encoder_attr(
+        gc_roots::shadow_stack_get(self_slot),
+        "key_separator",
+    )?)?
+    .to_wtf8_buf();
+    let indent = indent_value(gc_roots::shadow_stack_get(self_slot))?.map(Wtf8::to_wtf8_buf);
     let child_level = level.max(0) + 1;
     let mut out = rustpython_wtf8::Wtf8Buf::new();
     out.push_char('{');
@@ -1181,7 +1197,11 @@ fn encode_dict(
         let pair_slot = gc_roots::shadow_stack_len();
         let _ = gc_roots::pin_root(pair_items[0]);
         let _ = gc_roots::pin_root(pair_items[1]);
-        let Some(key) = coerce_key(self_obj, gc_roots::shadow_stack_get(pair_slot))? else {
+        let Some(key) = coerce_key(
+            gc_roots::shadow_stack_get(self_slot),
+            gc_roots::shadow_stack_get(pair_slot),
+        )?
+        else {
             continue;
         };
         let _ = gc_roots::pin_root(key);
@@ -1197,13 +1217,13 @@ fn encode_dict(
             }
         }
         encode_string_field(
-            self_obj,
+            gc_roots::shadow_stack_get(self_slot),
             &mut out,
             gc_roots::shadow_stack_get(pair_slot + 2),
         )?;
         out.push_wtf8(&key_separator);
         let encoded = encode_child(
-            self_obj,
+            gc_roots::shadow_stack_get(self_slot),
             gc_roots::shadow_stack_get(pair_slot + 1),
             child_level,
         )

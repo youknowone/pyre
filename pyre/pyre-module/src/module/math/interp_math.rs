@@ -1337,8 +1337,20 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
     // arrives upstream as an already-wrapped float, so converting it can
     // neither raise nor reach `__float__`; `None` stands in for that here and
     // `pymath` supplies the same defaults.
-    let a = try_get_double(pos[0])?;
-    let b = try_get_double(pos[1])?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let a = try_get_double(pos[0]);
+    let w = roots.get(base);
+    let kwargs = if w.is_null() { None } else { Some(w) };
+    drop(roots);
+    let a = a?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let b = try_get_double(pos[1]);
+    let w = roots.get(base);
+    let kwargs = if w.is_null() { None } else { Some(w) };
+    drop(roots);
+    let b = b?;
     let read = |name: &str| -> Result<Option<f64>, pyre_interpreter::PyError> {
         match pyre_interpreter::builtins::kwarg_get(kwargs, name) {
             Some(v) => Ok(Some(try_get_double(v)?)),

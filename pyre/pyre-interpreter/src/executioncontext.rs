@@ -1753,7 +1753,7 @@ impl ExecutionContext {
         &mut self,
         frame: *mut PyFrame,
         event: &str,
-        w_arg: PyObjectRef,
+        mut w_arg: PyObjectRef,
         operr: Option<&mut crate::error::OperationError>,
     ) -> Result<(), crate::PyError> {
         // executioncontext.py:347 if self.is_tracing or frame.hide():
@@ -1776,7 +1776,7 @@ impl ExecutionContext {
         // land there.  Anchor once and re-read where the frame is next used.
         let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
 
-        let space = self.space;
+        let mut space = self.space;
 
         // executioncontext.py:353-356 Tracing cases
         let w_callback = if event == "call" {
@@ -1792,8 +1792,10 @@ impl ExecutionContext {
             let _callback_roots = pyre_object::gc_roots::push_roots();
             let callback_live_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_callback);
-            let arg_live_slot = pyre_object::gc_roots::shadow_stack_len();
+            let w_arg_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_arg);
+            let space_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(space);
             // `executioncontext.py _trace` exception-event branch:
             //   if operr is not None:
             //       w_value = operr.normalize_exception(space)
@@ -1804,7 +1806,7 @@ impl ExecutionContext {
             // Pyre's normalized value owns the authoritative class and
             // traceback slots, so read both from it instead of rebuilding a
             // second interpreter-level exception object.
-            let w_arg = if let Some(operr) = operr {
+            let w_trace_arg = if let Some(operr) = operr {
                 let w_value = operr.normalize_exception(space)?;
                 let w_type = crate::typedef::r#type(w_value)
                     .map_or_else(pyre_object::w_none, |p| p.as_ptr());
@@ -1812,16 +1814,17 @@ impl ExecutionContext {
                 // mark, and the `w_None` for an empty chain.  The normalization
                 // above put the same instance on the carrier, so the carrier
                 // reads it back.
-                let w_traceback = operr.get_w_traceback(space);
+                let w_traceback =
+                    operr.get_w_traceback(pyre_object::gc_roots::shadow_stack_get(space_slot));
                 let mut fields = pyre_object::gc_roots::RootedItems::new();
                 fields.push(w_type);
                 fields.push(w_value);
                 fields.push(w_traceback);
                 pyre_object::tupleobject::w_tuple_new(fields.take())
             } else {
-                pyre_object::gc_roots::shadow_stack_get(arg_live_slot)
+                pyre_object::gc_roots::shadow_stack_get(w_arg_slot)
             };
-            let _ = pyre_object::gc_roots::pin_root(w_arg);
+            let _ = pyre_object::gc_roots::pin_root(w_trace_arg);
             let arg_live_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
             let frame = frame_anchor.live();
@@ -1933,6 +1936,8 @@ impl ExecutionContext {
             if post_had_locals {
                 unsafe { (*frame).locals2fast(false)? };
             }
+            space = pyre_object::gc_roots::shadow_stack_get(space_slot);
+            w_arg = pyre_object::gc_roots::shadow_stack_get(w_arg_slot);
             // executioncontext.py:392-395 — re-raise the callback's
             // exception after restoring trace bookkeeping. Caller chain
             // (call_trace/return_trace/bytecode_trace/exception_trace

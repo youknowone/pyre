@@ -574,7 +574,10 @@ fn ffi_addressof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             offset += realized.1;
         }
     }
+    let ctype_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_ctype);
     let cdata = cdataobj::cdata_arg(roots.get(base + 1))?;
+    w_ctype = roots.get(ctype_slot);
     let ptr = cdata.ptr.wrapping_add_signed(offset as isize);
     let ptr_type = newtype::new_pointer_type(w_ctype)?;
     Ok(cdataobj::new_cdata(ptr, ptr_type))
@@ -730,12 +733,17 @@ fn ffi_from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             roots.get(base + 2),
         )
     };
+    let pair_slot = roots.pin_roots(&[w_ctype, w_buffer]);
     let writable = if roots.get(base + 3).is_null() {
         0
     } else {
         pyre_interpreter::baseobjspace::int_w(roots.get(base + 3))?
     };
-    func::from_buffer(&[w_ctype, w_buffer, pyre_object::w_int_new(writable)])
+    func::from_buffer(&[
+        roots.get(pair_slot),
+        roots.get(pair_slot + 1),
+        pyre_object::w_int_new(writable),
+    ])
 }
 
 fn ffi_from_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
@@ -849,12 +857,18 @@ fn ffi_new_allocator(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     } else {
         roots.get(base + 2)
     };
+    let pair_slot = roots.pin_roots(&[w_alloc, w_free]);
     let clear = if roots.get(base + 3).is_null() {
         true
     } else {
         pyre_interpreter::baseobjspace::int_w(roots.get(base + 3))? != 0
     };
-    allocator::new_allocator(roots.get(base), w_alloc, w_free, clear)
+    allocator::new_allocator(
+        roots.get(base),
+        roots.get(pair_slot),
+        roots.get(pair_slot + 1),
+        clear,
+    )
 }
 
 fn ffi_new_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
@@ -1132,10 +1146,11 @@ fn init_once_slowpath(
     let lock = unsafe { &*once.lock };
     lock.acquire(true);
     let _lock_guard = InitOnceGuard { lock };
-    if let Some(result) = init_once_elidable(roots.get(base), roots.get(base + 2))?
-        && placeholder_index(ffi_arg(roots.get(base))?, result).is_none()
-    {
-        return Ok(result);
+    if let Some(mut result) = init_once_elidable(roots.get(base), roots.get(base + 2))? {
+        let ffi = ffi_arg(roots.get(base))?;
+        if pyre_object::with_roots!(result => placeholder_index(ffi, result)).is_none() {
+            return Ok(result);
+        }
     }
     let result_slot = selected_slot + 1;
     let _ = roots.pin_root(pyre_interpreter::call::call_function_impl_result(
@@ -1157,8 +1172,9 @@ fn ffi_init_once(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     for &value in &a {
         let _ = roots.pin_root(value);
     }
-    if let Some(result) = init_once_elidable(roots.get(base), roots.get(base + 2))? {
-        if placeholder_index(ffi_arg(roots.get(base))?, result).is_none() {
+    if let Some(mut result) = init_once_elidable(roots.get(base), roots.get(base + 2))? {
+        let ffi = ffi_arg(roots.get(base))?;
+        if pyre_object::with_roots!(result => placeholder_index(ffi, result)).is_none() {
             return Ok(result);
         }
     }
@@ -1367,7 +1383,9 @@ fn init_ffi_type(ns: PyObjectRef) {
     store("CData", super::cdataobj::cdata_type());
     store("CType", super::ctypeobj::ctype_type());
     let roots = pyre_object::gc_roots::push_roots();
-    let voidp_slot = roots.base();
+    let ns_slot = roots.base();
+    let _ = roots.pin_root(ns);
+    let voidp_slot = ns_slot + 1;
     let _ = roots.pin_root(newtype::new_voidp_type().expect("void pointer type must build"));
     // `store` inserts into the module dict, which allocates, so the cdata is
     // rooted rather than held only in a Rust local across it.
@@ -1375,6 +1393,10 @@ fn init_ffi_type(ns: PyObjectRef) {
         ctypeobj::cast(roots.get(voidp_slot), pyre_object::w_int_new(0))
             .expect("zero must cast to void pointer"),
     );
+    let ns = roots.get(ns_slot);
+    let store = |name: &str, value: PyObjectRef| unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value)
+    };
     store("NULL", roots.get(voidp_slot + 1));
     store("error", newtype::ffi_error());
     store("buffer", cbuffer::buffer_type());

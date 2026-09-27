@@ -1594,7 +1594,7 @@ fn charmap_decode_impl(
     // are copied out of it up front.
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_mapping);
+    let w_mapping = pyre_object::gc_roots::pin_root(w_mapping);
     let mapping_chars: Option<Vec<_>> = if unsafe { is_str(w_mapping) } {
         Some(
             unsafe { w_str_get_wtf8(w_mapping) }
