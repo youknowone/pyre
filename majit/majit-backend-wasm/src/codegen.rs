@@ -455,7 +455,20 @@ pub struct FrameGeometry {
     pub ca_frame_bytes: u32,
     /// Full bytes in the frame layout, including the tail call area. Host entry
     /// frames and every chained bridge use this geometry and allocation size.
+    /// An extended geometry appends its extra value slots and Ref homes after
+    /// this many bytes of the source layout, then stores the grown total here.
     pub frame_bytes: u32,
+    /// Value slots addressed at [`FRAME_SLOT_BASE`]. Equals [`Self::value_slots`]
+    /// until [`Self::extend`] appends the overflow past [`Self::tail_base`].
+    pub prefix_value_slots: usize,
+    /// Ordinary Ref homes addressed at [`Self::home_slot_base`]. Label captures
+    /// stay at the end of this prefix; extra ordinary homes go to the tail.
+    pub prefix_ordinary_homes: usize,
+    /// Ordinary Ref homes placed after the source `frame_bytes`.
+    pub extra_ordinary_homes: usize,
+    /// Byte offset where an extended geometry's extra slots begin. Zero when
+    /// the geometry is not extended.
+    pub tail_base: u64,
 }
 
 impl FrameGeometry {
@@ -478,6 +491,10 @@ impl FrameGeometry {
             force_slot_base: (MIN_FRAME_BYTES + SLOT_SIZE as usize) as u64,
             ca_frame_bytes: (MIN_FRAME_BYTES * 2 + SLOT_SIZE as usize) as u32,
             frame_bytes: (MIN_FRAME_BYTES * 2 + SLOT_SIZE as usize) as u32,
+            prefix_value_slots: MIN_FRAME_BYTES / 8,
+            prefix_ordinary_homes: 0,
+            extra_ordinary_homes: 0,
+            tail_base: 0,
         }
     }
 
@@ -511,7 +528,86 @@ impl FrameGeometry {
             force_slot_base,
             ca_frame_bytes: ca_frame_bytes as u32,
             frame_bytes: frame_bytes as u32,
+            prefix_value_slots: value_slots,
+            prefix_ordinary_homes: home_slots - label_ref_slots,
+            extra_ordinary_homes: 0,
+            tail_base: 0,
         }
+    }
+
+    /// `assembler.py _check_frame_depth`: keep every offset of `self` and
+    /// place value slots / ordinary Ref homes past this layout in a tail
+    /// after `frame_bytes`. A trace that already fits is returned unchanged.
+    pub fn extend(self, value_slots: usize, ordinary_homes: usize) -> Self {
+        let values = value_slots.max(self.value_slots);
+        let homes = ordinary_homes.max(self.ordinary_home_slots() + self.extra_ordinary_homes);
+        let extra_values = values - self.value_slots;
+        let extra_homes = homes - (self.ordinary_home_slots() + self.extra_ordinary_homes);
+        if extra_values == 0 && extra_homes == 0 {
+            return self;
+        }
+        let mut ext = self;
+        if ext.tail_base == 0 {
+            ext.tail_base = self.frame_bytes as u64;
+        }
+        ext.value_slots = values;
+        ext.extra_ordinary_homes += extra_homes;
+        let growth = (extra_values + extra_homes) as u64 * SLOT_SIZE;
+        ext.frame_bytes = self
+            .frame_bytes
+            .checked_add(growth as u32)
+            .expect("extended frame_bytes");
+        ext
+    }
+
+    /// True when [`Self::extend`] appended a tail past the source layout.
+    pub const fn has_tail(self) -> bool {
+        self.tail_base != 0
+    }
+
+    /// Signed item count `JitFrame::init` stores as `jf_frame.length`.
+    pub const fn signed_item_count(self) -> usize {
+        self.frame_bytes as usize / std::mem::size_of::<isize>()
+    }
+
+    /// Fail-arg / input slot `slot`. Indices below the source prefix stay at
+    /// [`FRAME_SLOT_BASE`]; the rest sit in the tail.
+    pub fn spill_slot_ofs(self, slot: u64) -> u64 {
+        let prefix = self.prefix_value_slots as u64;
+        if slot < prefix {
+            FRAME_SLOT_BASE + slot * SLOT_SIZE
+        } else {
+            self.tail_base + (slot - prefix) * SLOT_SIZE
+        }
+    }
+
+    /// LABEL scalar capture. In-prefix slots keep `slot * SLOT_SIZE`.
+    pub fn capture_value_ofs(self, slot: usize) -> u64 {
+        let slot = slot as u64;
+        let prefix = self.prefix_value_slots as u64;
+        if slot < prefix {
+            slot * SLOT_SIZE
+        } else {
+            self.tail_base + (slot - prefix) * SLOT_SIZE
+        }
+    }
+
+    /// Ordinary Ref home `h`. Homes below the source prefix stay at
+    /// `home_slot_base`; the rest follow the extra value slots in the tail.
+    /// Label captures are not ordinary homes and keep `home_slot_base`.
+    pub fn home_ofs(self, h: u64) -> u64 {
+        let prefix = self.prefix_ordinary_homes as u64;
+        if h < prefix {
+            self.home_slot_base + h * SLOT_SIZE
+        } else {
+            let extra_values = (self.value_slots - self.prefix_value_slots) as u64;
+            self.tail_base + extra_values * SLOT_SIZE + (h - prefix) * SLOT_SIZE
+        }
+    }
+
+    /// Ordinary homes this geometry can address, prefix plus tail.
+    pub const fn addressable_ordinary_homes(self) -> usize {
+        self.ordinary_home_slots() + self.extra_ordinary_homes
     }
 
     /// Low Ref homes available to the trace currently executing on this
@@ -1742,7 +1838,7 @@ impl LabelResumeData {
 
     fn frame_offset(&self, storage: LabelCaptureStorage, frame: FrameGeometry) -> u64 {
         match storage {
-            LabelCaptureStorage::ValueSlot(slot) => slot as u64 * SLOT_SIZE,
+            LabelCaptureStorage::ValueSlot(slot) => frame.capture_value_ofs(slot),
             LabelCaptureStorage::RefSlot(slot) => {
                 frame.home_slot_base + (frame.ordinary_home_slots() + slot) as u64 * SLOT_SIZE
             }
@@ -1771,31 +1867,38 @@ pub fn label_ref_capture_slots(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
 /// later bridge can fit; those unused reserved words stay unmarked so
 /// recycled nursery bytes are not traced. assembler.py writes `jf_gcmap`
 /// for live slots only.
-pub(crate) fn build_home_gcmap(
+pub fn build_home_gcmap(
     frame: FrameGeometry,
     used_ordinary: usize,
     used_labels: usize,
 ) -> Box<[usize]> {
     let sign = std::mem::size_of::<isize>();
     let bits_per_word = std::mem::size_of::<usize>() * 8;
-    let ordinary = used_ordinary.min(frame.ordinary_home_slots());
+    let prefix = frame.prefix_ordinary_homes.min(frame.ordinary_home_slots());
+    let ordinary = used_ordinary.min(frame.addressable_ordinary_homes());
+    let in_prefix = ordinary.min(prefix);
     let label_base = frame.ordinary_home_slots();
     let label_n = used_labels.min(frame.label_ref_slots);
     if ordinary == 0 && label_n == 0 {
         // One empty data word: a non-null jf_gcmap that traces nothing.
         return vec![1usize, 0usize].into_boxed_slice();
     }
-    let last_h = if label_n == 0 {
-        ordinary.saturating_sub(1)
-    } else {
-        label_base + label_n - 1
-    };
-    let last_index = (frame.home_slot_base as usize + last_h * 8) / sign;
+    let mut offsets = Vec::new();
+    for h in 0..in_prefix {
+        offsets.push(frame.home_slot_base as usize + h * 8);
+    }
+    for h in prefix..ordinary {
+        offsets.push(frame.home_ofs(h as u64) as usize);
+    }
+    for h in label_base..label_base + label_n {
+        offsets.push(frame.home_slot_base as usize + h * 8);
+    }
+    let last_index = offsets.iter().copied().max().unwrap_or(0) / sign;
     let num_words = last_index / bits_per_word + 1;
     let mut buf = vec![0usize; 1 + num_words];
     buf[0] = num_words;
-    for h in (0..ordinary).chain(label_base..label_base + label_n) {
-        let index = (frame.home_slot_base as usize + h * 8) / sign;
+    for offset in offsets {
+        let index = offset / sign;
         buf[1 + index / bits_per_word] |= 1usize << (index % bits_per_word);
     }
     buf.into_boxed_slice()
@@ -2346,6 +2449,33 @@ fn collecting_call_positions(ops: &[Op], include_ca_collects: bool) -> Vec<usize
 /// A run pays for the fill's own operands only once it is long enough:
 /// the triple encodes in 7-9 bytes against the fill's 12-15, so a run of one
 /// or two slots stays a store. Both forms write exactly the same bytes.
+/// `_check_frame_depth` (assembler.py): if `jf_frame.length` is below this
+/// module's item count, `wasm_realloc_frame` grows it and local 0 becomes
+/// the new items base.
+fn emit_check_frame_depth(
+    sink: &mut PeepSink<'_, '_>,
+    frame: FrameGeometry,
+    realloc_fn_ptr: i64,
+    residual_type_base: u32,
+) {
+    let len_size = majit_backend::jitframe::SIZEOFSIGNED as i32;
+    sink.local_get(0);
+    sink.i32_const(len_size);
+    sink.i32_sub();
+    sink.i32_load(mem32(0));
+    sink.i32_const(frame.signed_item_count() as i32);
+    sink.i32_lt_u();
+    sink.if_(BlockType::Empty);
+    sink.local_get(0);
+    sink.i64_extend_i32_u();
+    sink.i64_const(frame.signed_item_count() as i64);
+    sink.i32_const(realloc_fn_ptr as i32);
+    sink.call_indirect(0, residual_type_base + 2);
+    sink.i32_wrap_i64();
+    sink.local_set(0);
+    sink.end();
+}
+
 fn emit_null_home_slots(
     sink: &mut PeepSink<'_, '_>,
     frame: FrameGeometry,
@@ -2402,7 +2532,7 @@ fn emit_reload_refs_from_homes(
             continue;
         }
         sink.local_get(0);
-        sink.i64_load(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
+        sink.i64_load(mem64(frame.home_ofs(h as u64)));
         sink.local_set(value_types.local(raw));
     }
 }
@@ -3836,6 +3966,10 @@ pub struct CaParams {
     /// cells (`runner.rs` `AttachedDescrPtrs` captured at entry). `0` is
     /// unattached: direct codegen tests leave the fields at default.
     pub attached: majit_backend::AttachedDescrPtrs,
+    /// `__indirect_function_table` slot of `wasm_realloc_frame`. Zero omits
+    /// `_check_frame_depth` so a frame that already fits stays byte-identical.
+    /// `(i64 items, i64 depth) -> i64` at residual type base + 2.
+    pub realloc_fn_ptr: i64,
 }
 
 /// Per-CALL_ASSEMBLER target dispatch baked into the corresponding wasm arm.
@@ -4856,11 +4990,11 @@ pub fn build_wasm_module(
             crate::release::park_gcmap_raw(ca.gcmap_sink, gcmap_for_item_indices(&indices))
         };
     }
-    let shortage = if num_ref_homes > frame.ordinary_home_slots() {
+    let shortage = if num_ref_homes > frame.addressable_ordinary_homes() {
         Some(super::FrameShortage::new(
             super::FrameShortageKind::OrdinaryRefHomes,
             num_ref_homes,
-            frame.ordinary_home_slots(),
+            frame.addressable_ordinary_homes(),
         ))
     } else {
         label_resume.shortage(*frame)
@@ -4957,6 +5091,14 @@ pub fn build_wasm_module(
         && let Some(max) = residual_max_arity
     {
         Some(max.max(2))
+    } else {
+        residual_max_arity
+    };
+    // `_check_frame_depth` calls `wasm_realloc_frame(items, depth) -> items`,
+    // the same `(i64, i64) -> i64` family as residual arity 2.
+    let emit_frame_realloc = frame.has_tail() && ca.realloc_fn_ptr != 0;
+    let residual_max_arity = if emit_frame_realloc {
+        Some(residual_max_arity.unwrap_or(0).max(2))
     } else {
         residual_max_arity
     };
@@ -5120,7 +5262,7 @@ pub fn build_wasm_module(
     }
     // Shared guard-exit spill functions, declared after every other family so
     // an added arity cannot shift an index a call site already baked.
-    let spill_arities = spill_helper_arities(&guards);
+    let spill_arities = spill_helper_arities(&guards, *frame);
     let mut spill_helper_type_indices: Vec<u32> = Vec::with_capacity(spill_arities.len());
     for &arity in &spill_arities {
         spill_helper_type_indices.push(next_type_idx);
@@ -5336,7 +5478,7 @@ const SPILL_HELPER_FIXED_INSTRS: usize = 40;
 /// count used once never does. An arity admitted here that no exit reaches —
 /// a guard whose region was merged branches instead of spilling — costs its
 /// unused body and nothing else, so the estimate may over-admit safely.
-fn spill_helper_arities(guards: &[GuardExit]) -> Vec<usize> {
+fn spill_helper_arities(guards: &[GuardExit], frame: FrameGeometry) -> Vec<usize> {
     let mut uses: HashMap<usize, usize> = HashMap::new();
     for guard in guards {
         *uses
@@ -5359,6 +5501,11 @@ fn spill_helper_arities(guards: &[GuardExit]) -> Vec<usize> {
     // of the same trace must emit byte-identical modules (`compile_module_cached`
     // keys its host handle on the bytes).
     arities.sort_unstable();
+    // A tail slot is not at `FRAME_SLOT_BASE + i*8`. The shared helper only
+    // writes that prefix, so an arity that reaches the tail stays inline.
+    if frame.has_tail() {
+        arities.retain(|&arity| arity <= frame.prefix_value_slots);
+    }
     arities
 }
 
@@ -5689,6 +5836,16 @@ fn build_function(
     let mut raw_sink = func.instructions();
     let mut sink = PeepSink::new(&mut raw_sink);
 
+    // assembler.py `_check_frame_depth` at bridge / entry-bridge entry.
+    // The depth is a constant of this module; the running length is the
+    // JitFrame `jf_frame` length word immediately before local 0.
+    if frame.has_tail()
+        && ca.realloc_fn_ptr != 0
+        && let Some(base) = residual_type_base
+    {
+        emit_check_frame_depth(&mut sink, frame, ca.realloc_fn_ptr, base);
+    }
+
     // Bind the folded constants the optimizer left under a plain op position
     // (see `unbound_pool_const_seeds`). Emitted before every block so the
     // binding dominates the whole body, including a resume-at-LABEL entry.
@@ -5713,12 +5870,21 @@ fn build_function(
         // grow past a previous floor of zero, so `min > 0` is not the
         // signal — `has_prior` is.
         if ca.home_gcmap_has_prior && used_ordinary > ca.home_gcmap_min_ordinary {
-            emit_null_home_slots(
-                &mut sink,
-                frame,
-                ca.home_gcmap_min_ordinary as u64..used_ordinary as u64,
-                |_| true,
-            );
+            let start = ca.home_gcmap_min_ordinary as u64;
+            let end = used_ordinary as u64;
+            let prefix = frame.prefix_ordinary_homes as u64;
+            if end <= prefix {
+                emit_null_home_slots(&mut sink, frame, start..end, |_| true);
+            } else {
+                if start < prefix {
+                    emit_null_home_slots(&mut sink, frame, start..prefix, |_| true);
+                }
+                for h in start.max(prefix)..end {
+                    sink.local_get(0);
+                    sink.i64_const(0);
+                    sink.i64_store(mem64(frame.home_ofs(h)));
+                }
+            }
         }
         // Re-emission may mark a longer LABEL tail than the previous
         // publication. Those new slots are region-only captures the live
@@ -5877,7 +6043,14 @@ fn build_function(
     // (`recursive_call_frame_relocation` then copied an invalid
     // type_id). The extra store per input Ref is lost in the noise
     // next to the CALL_ASSEMBLER itself.
-    emit_null_home_slots(&mut sink, frame, 0..used_ordinary as u64, |_| true);
+    let ordinary_end = used_ordinary as u64;
+    let home_prefix = frame.prefix_ordinary_homes as u64;
+    emit_null_home_slots(&mut sink, frame, 0..ordinary_end.min(home_prefix), |_| true);
+    for h in home_prefix..ordinary_end {
+        sink.local_get(0);
+        sink.i64_const(0);
+        sink.i64_store(mem64(frame.home_ofs(h)));
+    }
     let label_base = frame.ordinary_home_slots() as u64;
     emit_null_home_slots(
         &mut sink,
@@ -5908,7 +6081,7 @@ fn build_function(
                 sink.f64_reinterpret_i64();
             }
         } else {
-            let offset = FRAME_SLOT_BASE + k as u64 * SLOT_SIZE;
+            let offset = frame.spill_slot_ofs(k as u64);
             sink.local_get(0).i64_load(mem64(offset));
             if value_types.ty(ia.index) == ValType::F64 {
                 sink.f64_reinterpret_i64();
@@ -5918,7 +6091,7 @@ fn build_function(
         if let Some(h) = ref_homes.home_id(ia.index) {
             sink.local_get(0);
             sink.local_get(local_idx);
-            sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
+            sink.i64_store(mem64(frame.home_ofs(h as u64)));
         }
     }
     // assembler.py `push_gcmap`: the map goes up once the slots it marks
@@ -6043,7 +6216,7 @@ fn build_function(
                     sink.local_get(i as u32 + 1);
                 } else {
                     sink.local_get(0);
-                    sink.i64_load(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
+                    sink.i64_load(mem64(frame.spill_slot_ofs(i as u64)));
                 }
                 if value_types.ty(la.raw()) == ValType::F64 {
                     sink.f64_reinterpret_i64();
@@ -6052,7 +6225,7 @@ fn build_function(
                 if let Some(h) = ref_homes.home(*la) {
                     sink.local_get(0);
                     sink.local_get(value_types.local(la.raw()));
-                    sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
+                    sink.i64_store(mem64(frame.home_ofs(h as u64)));
                 }
             }
             // Restore backend-only live-ins after the semantic LABEL args.
@@ -6310,7 +6483,7 @@ fn build_function(
                     for (i, jump_arg) in jump_args.iter().enumerate() {
                         sink.local_get(0); // frame_ptr
                         emit_resolve(&mut sink, constants, value_types, jump_arg.to_opref());
-                        sink.i64_store(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
+                        sink.i64_store(mem64(frame.spill_slot_ofs(i as u64)));
                     }
                     store_dispatch_key(&mut sink);
                     sink.local_get(0); // frame_ptr argument to the loop
@@ -6341,7 +6514,7 @@ fn build_function(
                         } else {
                             emit_resolve(&mut sink, constants, value_types, opref);
                         }
-                        sink.i64_store(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
+                        sink.i64_store(mem64(frame.spill_slot_ofs(i as u64)));
                     }
                     // Peeled: key = label ordinal + 1 lands on that LABEL's
                     // resume loader. Header included. No local label, or a
@@ -6439,7 +6612,7 @@ fn build_function(
                         }
                         sink.local_get(0);
                         sink.local_get(value_types.local(la.raw()));
-                        sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
+                        sink.i64_store(mem64(frame.home_ofs(h as u64)));
                     }
                 }
                 // A region closing at a LABEL it has no `br` to re-enters the
@@ -9603,7 +9776,7 @@ fn build_function(
         if let Some(h) = ref_homes.home(result) {
             sink.local_get(0);
             sink.local_get(value_types.local(result.raw()));
-            sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
+            sink.i64_store(mem64(frame.home_ofs(h as u64)));
         }
     }
 
@@ -10061,7 +10234,7 @@ fn emit_label_capture_restore(
         if let Some(h) = ref_homes.home(r) {
             sink.local_get(0);
             sink.local_get(value_types.local(r.raw()));
-            sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
+            sink.i64_store(mem64(frame.home_ofs(h as u64)));
         }
     }
 }
@@ -10111,7 +10284,7 @@ fn emit_resolve_failarg(
         && let Some(home) = ref_homes.home(opref)
     {
         sink.local_get(0);
-        sink.i64_load(mem64(frame.home_slot_base + home as u64 * SLOT_SIZE));
+        sink.i64_load(mem64(frame.home_ofs(home as u64)));
         return;
     }
     emit_resolve(sink, constants, value_types, opref);
@@ -11042,7 +11215,7 @@ fn emit_guard_inline_bridge_move(
         if let Some(home) = ref_homes.home_id(input.index) {
             sink.local_get(0);
             sink.local_get(value_types.local(input.index));
-            sink.i64_store(mem64(frame.home_slot_base + home as u64 * SLOT_SIZE));
+            sink.i64_store(mem64(frame.home_ofs(home as u64)));
         }
     }
 }
@@ -11186,7 +11359,7 @@ fn emit_force_arm(
         if !arg_ref.is_constant() && undefined == Some(arg_ref.raw()) {
             sink.i64_const(0);
         } else if let Some(home) = ref_homes.home(arg_ref) {
-            let ofs = frame.home_slot_base + home as u64 * SLOT_SIZE;
+            let ofs = frame.home_ofs(home as u64);
             sink.i64_const((ofs as i64) * 2 + 1);
         } else if let Some(g) = arg_ref.as_const_ptr() {
             if g.is_null() {
@@ -11345,7 +11518,7 @@ fn emit_guard_fail_args_spill(
         sink.call(helper);
     } else {
         for (i, &arg_ref) in fail_args.iter().enumerate() {
-            let offset = FRAME_SLOT_BASE + i as u64 * SLOT_SIZE;
+            let offset = frame.spill_slot_ofs(i as u64);
             sink.local_get(0);
             emit_resolve_failarg(
                 sink,
@@ -11362,7 +11535,7 @@ fn emit_guard_fail_args_spill(
         }
     }
     if let Some((operand, slot)) = counter_value_spill(op, &exit_fail_args(op)).zip(counter_slot) {
-        let offset = FRAME_SLOT_BASE + slot * SLOT_SIZE;
+        let offset = frame.spill_slot_ofs(slot);
         sink.local_get(0);
         emit_resolve_failarg(
             sink,
@@ -12648,6 +12821,40 @@ mod tests {
         };
         assert_eq!(inline_region_br_depth(&outside, &dispatch, 0), 4);
         assert_eq!(inline_region_br_depth(&outside, &dispatch, 1), 5);
+    }
+
+    #[test]
+    fn extended_geometry_keeps_source_offsets_and_tails_the_overflow() {
+        let source = FrameGeometry::compact(8, 4, 1);
+        assert_eq!(source.extend(8, source.ordinary_home_slots()), source);
+        let ext = source.extend(11, source.ordinary_home_slots() + 2);
+        assert!(ext.has_tail());
+        assert_eq!(ext.dispatch_key_ofs, source.dispatch_key_ofs);
+        assert_eq!(ext.home_slot_base, source.home_slot_base);
+        assert_eq!(ext.force_slot_base, source.force_slot_base);
+        assert_eq!(ext.call_result_ofs, source.call_result_ofs);
+        assert_eq!(ext.spill_slot_ofs(0), FRAME_SLOT_BASE);
+        assert_eq!(ext.spill_slot_ofs(7), FRAME_SLOT_BASE + 7 * SLOT_SIZE);
+        assert_eq!(ext.spill_slot_ofs(8), source.frame_bytes as u64);
+        let prefix_homes = source.ordinary_home_slots() as u64;
+        assert_eq!(ext.home_ofs(0), source.home_slot_base);
+        assert_eq!(
+            ext.home_ofs(prefix_homes - 1),
+            source.home_slot_base + (prefix_homes - 1) * SLOT_SIZE
+        );
+        let tail_home = ext.home_ofs(prefix_homes);
+        assert!(tail_home >= source.frame_bytes as u64);
+        assert!(tail_home > ext.spill_slot_ofs(10));
+        let map = build_home_gcmap(ext, source.ordinary_home_slots() + 2, 1);
+        let sign = std::mem::size_of::<isize>();
+        let bits = std::mem::size_of::<usize>() * 8;
+        let marked = |offset: usize| {
+            let index = offset / sign;
+            map[1 + index / bits] & (1usize << (index % bits)) != 0
+        };
+        assert!(marked(tail_home as usize), "gcmap marks the tail Ref home");
+        assert!(marked(ext.home_ofs(prefix_homes + 1) as usize));
+        assert!(marked(source.home_slot_base as usize));
     }
 
     #[test]

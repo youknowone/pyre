@@ -2484,8 +2484,16 @@ pub extern "C" fn wasm_jit_ca_pop_frame(_items_base: i64) -> i64 {
 /// Analog of `_reload_frame_if_necessary`; returns the ITEMS base held in the
 /// CA arm's `ca_cfp_local`.
 pub extern "C" fn wasm_jit_ca_reload_frame() -> i64 {
-    majit_gc::shadow_stack::jf_top_ptr().0 as i64
-        + majit_backend::jitframe::FIRST_ITEM_OFFSET as i64
+    let jf = majit_gc::shadow_stack::jf_top_ptr().0 as *mut majit_backend::jitframe::JitFrame;
+    // `_check_frame_depth` may have threaded `jf_forward` without the
+    // shadow slot moving yet. `jitframe_resolve` returns the frame the
+    // callee actually ran on.
+    let jf = if jf.is_null() {
+        jf
+    } else {
+        unsafe { majit_backend::jitframe::JitFrame::resolve(jf) }
+    };
+    jf as i64 + majit_backend::jitframe::FIRST_ITEM_OFFSET as i64
 }
 
 /// Reload the CA caller's frame pointer after the callee-frame allocation.
@@ -2493,8 +2501,107 @@ pub extern "C" fn wasm_jit_ca_reload_frame() -> i64 {
 /// live the caller remains one entry below the shadow-stack top. Returns that
 /// caller's ITEMS base for local 0.
 pub extern "C" fn wasm_jit_ca_reload_caller_frame() -> i64 {
-    majit_gc::shadow_stack::jf_under_top_ptr().0 as i64
-        + majit_backend::jitframe::FIRST_ITEM_OFFSET as i64
+    let jf = majit_gc::shadow_stack::jf_under_top_ptr().0 as *mut majit_backend::jitframe::JitFrame;
+    let jf = if jf.is_null() {
+        jf
+    } else {
+        unsafe { majit_backend::jitframe::JitFrame::resolve(jf) }
+    };
+    jf as i64 + majit_backend::jitframe::FIRST_ITEM_OFFSET as i64
+}
+
+/// `llmodel.py realloc_frame`, called from `_check_frame_depth` when the
+/// running frame's `jf_frame` length is below this module's item count.
+///
+/// `items_base` is wasm local 0 (the `jf_frame` items). The returned items
+/// base belongs to the new frame. GC frames (`wasm_jitframe_tid() != 0`)
+/// are allocated with that type id; host-buffer frames use
+/// `alloc_off_gc_jitframe`. Header fields copied are `jf_frame`,
+/// `jf_savedata`, `jf_guard_exc`, `jf_descr`, `jf_force_descr`, and
+/// `jf_gcmap`. The old frame's `jf_forward` points at the new one, and
+/// the token `frame_info` grows via `update_frame_depth`.
+///
+/// # Safety
+/// `items_base` must be the items pointer of a live `JitFrame`.
+pub unsafe extern "C" fn wasm_realloc_frame(items_base: i64, depth: i64) -> i64 {
+    use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JitFrame, JitFrameInfo};
+    if items_base == 0 || depth <= 0 {
+        return items_base;
+    }
+    let old_jf = (items_base as usize - FIRST_ITEM_OFFSET) as *mut JitFrame;
+    let expected = depth as usize;
+    unsafe {
+        let fi = (*old_jf).jf_frame_info;
+        if !fi.is_null() {
+            let baseofs = (majit_gc::header::GcHeader::SIZE as i64) + FIRST_ITEM_OFFSET as i64;
+            (*(fi as *const JitFrameInfo)).update_frame_depth(baseofs, expected as i64);
+        }
+        let alloc_bytes = JitFrame::alloc_size(expected);
+        let tid = wasm_jitframe_tid();
+        let new_jf = if tid != 0 {
+            let raw = wasm_alloc_oldgen_typed(tid, alloc_bytes);
+            // The module goes on to address the grown layout; returning the
+            // short frame would write past its end.
+            assert_ne!(raw.0, 0, "wasm_realloc_frame: jitframe allocation failed");
+            let new_jf = raw.0 as *mut JitFrame;
+            std::ptr::write_bytes(new_jf as *mut u8, 0, alloc_bytes);
+            new_jf
+        } else {
+            let new_jf = majit_backend::jitframe::alloc_off_gc_jitframe(alloc_bytes);
+            assert!(
+                !new_jf.is_null(),
+                "wasm_realloc_frame: jitframe allocation failed"
+            );
+            new_jf
+        };
+        JitFrame::init(new_jf, fi, expected);
+        (*old_jf).jf_forward = new_jf;
+        let old_len = JitFrame::frame_length(old_jf) as usize;
+        let copy_len = old_len.min(expected);
+        let old_slots = JitFrame::frame_slots_mut(old_jf, old_len);
+        let new_slots = JitFrame::frame_slots_mut(new_jf, expected);
+        for i in 0..copy_len {
+            new_slots[i] = old_slots[i];
+            old_slots[i] = 0;
+        }
+        for slot in &mut new_slots[copy_len..] {
+            *slot = 0;
+        }
+        (*new_jf).jf_savedata = (*old_jf).jf_savedata;
+        (*new_jf).jf_guard_exc = (*old_jf).jf_guard_exc;
+        (*new_jf).jf_descr = (*old_jf).jf_descr;
+        (*new_jf).jf_force_descr = (*old_jf).jf_force_descr;
+        (*new_jf).jf_gcmap = (*old_jf).jf_gcmap;
+        if tid != 0 {
+            wasm_jit_write_barrier(new_jf as i64);
+            wasm_jit_write_barrier(old_jf as i64);
+        } else {
+            majit_gc::shadow_stack::register_libc_jitframe(new_jf as usize);
+        }
+        // assembler.py shadow-stack update after `realloc_frame`: the top
+        // entry must name the frame the trace continues on.
+        retarget_shadow_jf(old_jf, new_jf);
+        (new_jf as usize + FIRST_ITEM_OFFSET) as i64
+    }
+}
+
+/// Rewrite the top jitframe shadow-stack slot when it still names `old`.
+fn retarget_shadow_jf(
+    old: *mut majit_backend::jitframe::JitFrame,
+    new: *mut majit_backend::jitframe::JitFrame,
+) {
+    let top_addr = majit_gc::shadow_stack::get_root_stack_top_addr();
+    let word = std::mem::size_of::<usize>();
+    unsafe {
+        let top = *(top_addr as *const usize);
+        if top < word {
+            return;
+        }
+        let slot = (top - word) as *mut usize;
+        if *slot == old as usize {
+            *slot = new as usize;
+        }
+    }
 }
 
 /// Host-side root-register trampoline.
@@ -2637,6 +2744,26 @@ pub fn set_wasm_jitframe_tid(id: u32) {
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn wasm_jitframe_tid() -> u32 {
     WASM_JITFRAME_TID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Item bytes for one host entry. `frame_info.depth` grows in
+/// `wasm_realloc_frame` via `update_frame_depth`, so a later entry allocates
+/// the enlarged frame up front. A loop that never grew keeps `frame_bytes`.
+fn entry_frame_bytes(token: &JitCellToken, frame_bytes: u32) -> usize {
+    let sign = std::mem::size_of::<isize>();
+    let from_info = token
+        .compiled_loop_token()
+        .map(|clt| clt.frame_info.lock().depth().max(0) as usize * sign)
+        .unwrap_or(0);
+    (frame_bytes as usize).max(from_info)
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn frame_info_ptr(token: &JitCellToken) -> *const majit_backend::jitframe::JitFrameInfo {
+    token
+        .compiled_loop_token()
+        .map(|clt| clt.frame_info.data_ptr() as *const majit_backend::jitframe::JitFrameInfo)
+        .unwrap_or(std::ptr::null())
 }
 
 /// Build a `jf_gcmap` bitmap marking the surviving Ref-home region as the
@@ -4658,29 +4785,17 @@ fn exit_arg_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize) -> 
 /// may belong to a bridge chained past the source loop; the pointer names
 /// that descr. `_compiled_ptr` stays in the trace ABI and is not consulted.
 pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> DeadFrame {
-    let jf = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET)
-        as *mut majit_backend::jitframe::JitFrame;
+    let jf = unsafe {
+        majit_backend::jitframe::JitFrame::resolve(
+            (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET)
+                as *mut majit_backend::jitframe::JitFrame,
+        )
+    };
     let fail_descr = descr_at(unsafe { (*jf).jf_descr })
         .expect("invalid jf_descr from in-guest CA callee frame");
     DeadFrame::Boxed(WasmFrameData::from_live_frame(
         jf, fail_descr, false, true, None,
     ))
-}
-
-/// Reconstruct a [`DeadFrame`] for a frame a FORCE interrupted while its call
-/// is still on the stack, from the coordinate `emit_force_bracket_before_call`
-/// published into it: `frame[0]` the bracketing GUARD_NOT_FORCED's exit index,
-/// `frame[1..]` that guard's fail arguments.
-///
-/// Twin of [`dead_frame_from_ran_frame`] with one difference: a force is not an
-/// exit, so it must not consume the pending-exception cell. `jit_exc_take`
-/// clears what it reads, and the frame this force interrupted goes on running
-/// afterwards -- draining the cell here would lose an exception the trace has
-/// not delivered yet.
-/// The data region of the frame a force token names — the address the trace
-/// itself carries in local 0.
-fn forced_frame_items_base(force_token: GcRef) -> usize {
-    force_token.0 + majit_backend::jitframe::FIRST_ITEM_OFFSET
 }
 
 fn force_arg_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize) -> i64 {
@@ -4716,9 +4831,17 @@ fn decoded_force_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize
     }
 }
 
+/// Reconstruct a [`DeadFrame`] for a frame a FORCE interrupted while its call
+/// is still on the stack. A force is not an exit, so this must not consume
+/// the pending-exception cell. `jitframe_resolve` follows `jf_forward` when
+/// `_check_frame_depth` grew the frame after the token was captured.
 fn dead_frame_from_forced_frame(frame_ptr: usize, fail_descr: Arc<WasmFailDescr>) -> DeadFrame {
-    let jf = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET)
-        as *mut majit_backend::jitframe::JitFrame;
+    let jf = unsafe {
+        majit_backend::jitframe::JitFrame::resolve(
+            (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET)
+                as *mut majit_backend::jitframe::JitFrame,
+        )
+    };
     // The compiled run still owns this frame (it is on the shadow stack).
     // Borrow it: freeing or dropping the GC root here would unroot a frame
     // the call is still using. `read_force` makes get_* decode the force spill.
@@ -4791,21 +4914,30 @@ impl majit_backend::Backend for WasmBackend {
         // runner.rs `force` on the native backends: assert the frame carries the
         // bracket its call published, then mark it so the GUARD_NOT_FORCED
         // waiting past that call deopts instead of running on.
-        let jf = force_token.0 as *mut majit_backend::jitframe::JitFrame;
+        // `jitframe_resolve`: a bridge may have replaced the frame
+        // `FORCE_TOKEN` captured.
+        let jf = unsafe {
+            majit_backend::jitframe::JitFrame::resolve(
+                force_token.0 as *mut majit_backend::jitframe::JitFrame,
+            )
+        };
         let cell = unsafe { (*jf).jf_force_descr };
         assert_ne!(cell, 0, "force: wasm frame carries no force descriptor");
         // assembler.py `force`: publish the armed descr into `jf_descr` so
         // GUARD_NOT_FORCED's `CMP [jf_descr], 0` fails.
         unsafe { (*jf).jf_descr = cell };
         let fail_descr = descr_at(cell).expect("invalid jf_force_descr on a forced wasm frame");
-        let items_base = forced_frame_items_base(force_token);
+        let items_base = jf as usize + majit_backend::jitframe::FIRST_ITEM_OFFSET;
         Some(dead_frame_from_forced_frame(items_base, fail_descr))
     }
 
     fn is_force_token_armed(&self, force_token: GcRef) -> bool {
         force_token.0 != 0
             && unsafe {
-                (*(force_token.0 as *const majit_backend::jitframe::JitFrame)).jf_force_descr
+                let jf = majit_backend::jitframe::JitFrame::resolve(
+                    force_token.0 as *mut majit_backend::jitframe::JitFrame,
+                );
+                (*jf).jf_force_descr
             } != 0
     }
 
@@ -5005,25 +5137,16 @@ impl majit_backend::Backend for WasmBackend {
                         .into(),
                 ));
             };
-            // Same fit test a chained bridge gets against its source frame: the
-            // adopted layout must hold everything this trace spills.
-            if raw_frame_value_slots > target.frame.value_slots
-                || raw_num_ref_homes > target.frame.ordinary_home_slots()
-            {
-                diag_bump(4);
-                return decline_compile_loop(BackendError::Unsupported(format!(
-                    "wasm backend: entry bridge needs values={raw_frame_value_slots}, \
-                     homes={raw_num_ref_homes}; target frozen layout has values={}, homes={}",
-                    target.frame.value_slots,
-                    target.frame.ordinary_home_slots(),
-                )));
-            }
+            // `_check_frame_depth`: a trace that needs more than the target's
+            // frozen layout keeps that layout and appends the overflow.
             Some(target)
         } else {
             None
         };
         let frame = match entry_bridge_target {
-            Some(target) => target.frame,
+            Some(target) => target
+                .frame
+                .extend(raw_frame_value_slots, raw_num_ref_homes),
             None => codegen::FrameGeometry::compact(
                 frozen_slot_count(raw_frame_value_slots.max(FROZEN_CHAIN_VALUE_SLOTS)),
                 frozen_slot_count(raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES)) + label_ref_slots,
@@ -5138,6 +5261,11 @@ impl majit_backend::Backend for WasmBackend {
                 },
             ),
         };
+        if frame.has_tail() {
+            // `fn as usize` is the table index on wasm32. Taking it here keeps
+            // `wasm_realloc_frame` in `__indirect_function_table`.
+            module_inputs.ca.realloc_fn_ptr = wasm_realloc_frame as *const () as usize as i64;
+        }
         let mut asm_resources = release::LoopAsmResources::default();
         asm_resources.exit_cells = Some(std::sync::Arc::clone(&self.exit_cells));
         module_inputs.ca.exit_table_base = asm_resources.alloc_exit_table(guard_exit_count) as u32;
@@ -5645,27 +5773,13 @@ impl majit_backend::Backend for WasmBackend {
             diag_bump(14); // accepted CALL_ASSEMBLER bridge
         }
 
-        // A chained bridge executes in the source token's *same* frame. Its
-        // offsets are frozen when that token is compiled, so accept it only if
-        // its positional spill region and Ref-home region fit exactly within
-        // that layout. Declining here preserves the normal blackhole fallback;
-        // it is never safe to grow an already-allocated CA frame underneath a
-        // later bridge.
+        // A chained bridge executes in the source token's frame. Offsets of
+        // that geometry stay put; slots past it are a tail (`FrameGeometry::extend`)
+        // and `_check_frame_depth` grows the live frame at entry.
         let bridge_value_slots = codegen::frame_value_slots(inputargs, ops);
         let bridge_ref_homes = codegen::count_ref_homes(inputargs, ops);
-        if bridge_value_slots > source_frame.value_slots
-            || bridge_ref_homes > source_frame.ordinary_home_slots()
-        {
-            diag_bump(4);
-            let error = BackendError::Unsupported(format!(
-                "wasm backend: bridge frame needs values={bridge_value_slots}, homes={bridge_ref_homes}; \
-                 source frozen layout has values={}, homes={}",
-                source_frame.value_slots,
-                source_frame.ordinary_home_slots(),
-            ));
-            record_inline_trial_error(&error);
-            return Err(error);
-        }
+        let frozen_frame = source_frame;
+        let source_frame = frozen_frame.extend(bridge_value_slots, bridge_ref_homes);
 
         // A loop-closing bridge (terminal JUMP, no local LABEL) re-enters the
         // source loop through `source_func_handle` — the function entry. For a
@@ -5698,7 +5812,7 @@ impl majit_backend::Backend for WasmBackend {
         let mut resumes_at_loop_header = false;
         if bridge_is_loop_closing {
             let target =
-                resolve_cross_loop_jump_target(ops, Some((source_func_handle, source_frame)));
+                resolve_cross_loop_jump_target(ops, Some((source_func_handle, frozen_frame)));
             if let Some(t) = target {
                 external_jump_key = t.key;
                 external_jump_slot = t.func_handle;
@@ -6213,6 +6327,9 @@ impl majit_backend::Backend for WasmBackend {
             frame: source_frame,
             ca: ca_params,
         };
+        if source_frame.has_tail() {
+            module_inputs.ca.realloc_fn_ptr = wasm_realloc_frame as *const () as usize as i64;
+        }
         module_inputs.ca.exit_table_base = asm_resources.alloc_exit_table(guard_exit_count) as u32;
         module_inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
         // `runner.rs` captures `AttachedDescrPtrs` at `compile_bridge` entry.
@@ -6575,7 +6692,7 @@ impl majit_backend::Backend for WasmBackend {
         // Host entry allocates the complete frozen geometry, including the tail
         // call area. Chained bridges share these exact offsets; only CA callee
         // frames use the smaller homes prefix (`ca_frame_bytes`).
-        let frame_size = (compiled.frame.frame_bytes as usize).div_ceil(8);
+        let frame_size = entry_frame_bytes(token, compiled.frame.frame_bytes).div_ceil(8);
         #[cfg(not(target_arch = "wasm32"))]
         {
             let _ = (frame_size, args, dispatch_key);
@@ -6611,7 +6728,7 @@ impl majit_backend::Backend for WasmBackend {
                 // home the trace has not defined yet reads as null.
                 unsafe {
                     std::ptr::write_bytes(jf as *mut u8, 0, JitFrame::alloc_size(depth));
-                    JitFrame::init(jf, std::ptr::null(), depth);
+                    JitFrame::init(jf, frame_info_ptr(token), depth);
                 }
 
                 // Per-loop gcmap over the surviving Ref-home region. It is
@@ -6644,9 +6761,14 @@ impl majit_backend::Backend for WasmBackend {
 
                 wasm_jit_write_barrier(jf as i64);
                 // Re-read: the barrier can collect and forward the frame.
-                // The exit stored the descr cell in `jf_descr` and its gcmap
-                // in `jf_gcmap` (`generate_quick_failure` / `genop_finish`).
-                let jf = majit_gc::shadow_stack::peek_jf(saved).0 as *mut JitFrame;
+                // `_check_frame_depth` may also have moved execution onto
+                // `jf_forward`; the shadow slot names that frame when the
+                // helper rewrote it, and `jitframe_resolve` covers the rest.
+                let jf = unsafe {
+                    majit_backend::jitframe::JitFrame::resolve(
+                        majit_gc::shadow_stack::peek_jf(saved).0 as *mut JitFrame,
+                    )
+                };
                 let fail_descr = descr_at(unsafe { (*jf).jf_descr })
                     .expect("invalid jf_descr from compiled wasm");
                 let data = WasmFrameData::from_live_frame(jf, fail_descr, false, true, None);
@@ -6682,7 +6804,7 @@ impl majit_backend::Backend for WasmBackend {
             // `Vec` on this stack would free the token's JitFrame.
             let jf = majit_backend::jitframe::alloc_off_gc_jitframe(alloc_size);
             assert!(!jf.is_null(), "wasm host-buffer JitFrame allocation failed");
-            unsafe { majit_backend::jitframe::JitFrame::init(jf, std::ptr::null(), depth) };
+            unsafe { majit_backend::jitframe::JitFrame::init(jf, frame_info_ptr(token), depth) };
             unsafe { (*jf).jf_gcmap = compiled.home_gcmap_ptr.get() as *const u8 };
             let items = (jf as usize + majit_backend::jitframe::FIRST_ITEM_OFFSET) as *mut i64;
             for (i, arg) in args.iter().enumerate() {
@@ -6707,17 +6829,20 @@ impl majit_backend::Backend for WasmBackend {
                     glue::execute(func_handle, items as usize as u32);
                 }
             }
+            let tip = unsafe { majit_backend::jitframe::JitFrame::resolve(jf) };
+            let tip_depth =
+                unsafe { majit_backend::jitframe::JitFrame::frame_length(tip) as usize };
             majit_gc::shadow_stack::pop_jf_to(saved);
             let fail_descr =
-                descr_at(unsafe { (*jf).jf_descr }).expect("invalid jf_descr from compiled wasm");
+                descr_at(unsafe { (*tip).jf_descr }).expect("invalid jf_descr from compiled wasm");
             // FINISH(force_token) parks this JitFrame pointer in the frame.
             // Own the off-GC block so a later `force` does not dereference
             // a freed frame. Fail args stay in the frame.
             let owner = unsafe {
                 majit_backend::libc_deadframe::LibcJitFrameDeadFrame::owning(
                     jf,
-                    jf,
-                    depth,
+                    tip,
+                    tip_depth,
                     majit_backend::deadframe::ExitDescr::owned(
                         fail_descr.clone() as majit_ir::DescrRef
                     ),
@@ -6725,7 +6850,7 @@ impl majit_backend::Backend for WasmBackend {
                 )
             };
             DeadFrame::Boxed(WasmFrameData::from_live_frame(
-                jf,
+                tip,
                 fail_descr,
                 false,
                 false,

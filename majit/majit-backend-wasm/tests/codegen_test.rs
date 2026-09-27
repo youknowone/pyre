@@ -11508,3 +11508,169 @@ fn test_func_sig_codec_golden() {
     );
     assert_eq!(majit_backend_wasm::decode_func_sig(0), None);
 }
+
+/// A bridge whose value slots and Ref homes exceed the source geometry keeps
+/// that geometry, appends the overflow, and `_check_frame_depth` reallocates
+/// before the bridge reads or writes the tail. The host reads the exit words
+/// from the frame the helper returned.
+#[test]
+#[ignore = "runtime integration test: executes a generated module through the indirect-call realloc helper"]
+fn bridge_with_a_larger_frame_reallocates_and_returns_its_exit_values() {
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
+        InputArg::from_type_rc(Type::Ref, 2),
+    ];
+    let add = make_op(
+        OpCode::IntAdd,
+        &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+        OpRef::int_op(3),
+    );
+    let guard = make_guard(
+        OpCode::GuardNotForced,
+        &[],
+        &[OpRef::input_arg_ref(1), OpRef::input_arg_ref(2)],
+    );
+    let finish = Op::new(
+        OpCode::Finish,
+        &[
+            rb(OpRef::int_op(3)),
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::const_int(7)),
+            rb(OpRef::const_int(8)),
+            rb(OpRef::const_int(99)),
+        ],
+    );
+    finish.setfailargs(smallvec![
+        rb(OpRef::int_op(3)),
+        rb(OpRef::input_arg_int(0)),
+        rb(OpRef::const_int(7)),
+        rb(OpRef::const_int(8)),
+        rb(OpRef::const_int(99)),
+    ]);
+    let ops = vec![add, guard, finish];
+    let source = codegen::FrameGeometry::compact(4, 1, 0);
+    let needed_values = codegen::frame_value_slots(&inputargs, &ops);
+    let needed_homes = codegen::count_ref_homes(&inputargs, &ops);
+    assert!(needed_values > source.value_slots);
+    assert!(needed_homes > source.ordinary_home_slots());
+    let frame = source.extend(needed_values, needed_homes);
+    assert!(frame.has_tail());
+    let mut ca = codegen::CaParams::default();
+    ca.realloc_fn_ptr = 1;
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.clone(),
+        ops: ops.clone(),
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        gc_const_keys: Vec::new(),
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame,
+        ca,
+    };
+    let (bytes, _, homes, _) =
+        codegen::build_wasm_module(&inputs).expect("extended bridge compiles");
+    assert!(homes > source.ordinary_home_slots());
+    validate_wasm(&bytes);
+    let map = codegen::build_home_gcmap(frame, homes, 0);
+    let sign = std::mem::size_of::<isize>();
+    let bits = std::mem::size_of::<usize>() * 8;
+    let tail_home = frame.home_ofs(source.ordinary_home_slots() as u64) as usize;
+    let index = tail_home / sign;
+    assert_ne!(
+        map[1 + index / bits] & (1usize << (index % bits)),
+        0,
+        "gcmap marks the tail Ref home"
+    );
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("module");
+    let mut store = Store::new(&engine, ());
+    let memory = Memory::new(&mut store, MemoryType::new(2, None)).expect("memory");
+    let source_bytes = source.frame_bytes as usize;
+    let realloc = wasmi::Func::wrap(
+        &mut store,
+        move |mut caller: wasmi::Caller<'_, ()>, items: i64, depth: i64| -> i64 {
+            let old = items as usize;
+            let new_base = 64 * 1024usize;
+            let mut buf = vec![0u8; source_bytes];
+            memory.read(&caller, old, &mut buf).expect("copy old frame");
+            memory
+                .write(&mut caller, new_base, &buf)
+                .expect("write new frame");
+            let mut len = [0u8; 8];
+            len[..4].copy_from_slice(&(depth as u32).to_le_bytes());
+            memory
+                .write(&mut caller, new_base - sign, &len[..sign.min(8)])
+                .expect("write new length");
+            new_base as i64
+        },
+    );
+    let table = Table::new(
+        &mut store,
+        TableType::new(ValType::FuncRef, 2, None),
+        Val::default(ValType::FuncRef),
+    )
+    .expect("table");
+    table.set(&mut store, 1, Val::from(realloc)).expect("slot");
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    linker
+        .define("env", "__indirect_function_table", table)
+        .unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("instantiate");
+    let old_base = 4096usize;
+    let mut len = [0u8; 8];
+    len[..4].copy_from_slice(&(source.signed_item_count() as u32).to_le_bytes());
+    memory
+        .write(&mut store, old_base - sign, &len[..sign.min(8)])
+        .unwrap();
+    let write_i64 = |store: &mut Store<()>, offset: usize, value: i64| {
+        memory.write(store, offset, &value.to_le_bytes()).unwrap();
+    };
+    write_i64(&mut store, old_base + codegen::FRAME_SLOT_BASE as usize, 41);
+    write_i64(
+        &mut store,
+        old_base + codegen::FRAME_SLOT_BASE as usize + 8,
+        0x1111,
+    );
+    write_i64(
+        &mut store,
+        old_base + codegen::FRAME_SLOT_BASE as usize + 16,
+        0x2222,
+    );
+    let new_base = instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, old_base as i32)
+        .expect("bridge runs") as usize;
+    assert_ne!(new_base, old_base, "the short frame was reallocated");
+    let read_i64 = |offset: usize| {
+        let mut buf = [0u8; 8];
+        memory.read(&store, offset, &mut buf).unwrap();
+        i64::from_le_bytes(buf)
+    };
+    let tail_slot = frame.spill_slot_ofs(4) as usize;
+    assert!(tail_slot >= source.frame_bytes as usize);
+    assert_eq!(read_i64(new_base + tail_slot), 99);
+    assert_eq!(read_i64(new_base + tail_home), 0x2222);
+}
