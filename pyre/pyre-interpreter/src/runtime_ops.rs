@@ -471,10 +471,9 @@ pub enum CallableKind {
 /// `FnOnce::call_once` in front of every dispatch, and a closure has no
 /// lifted counterpart — RPython spells this as a plain conditional.
 pub fn classify_callable(callable: PyObjectRef) -> Result<CallableKind, PyError> {
-    // Drain any pending JIT-prologue overflow first so a backend probe that
-    // already detected an overflow surfaces here as the user-visible
-    // RecursionError.  A fresh check is performed only when a Python frame is
-    // entered (`PyFrame.execute_frame.insert_stack_check_here` in PyPy);
+    // Re-raise an error `park_jit_pending_error` parked (`unpackiterable_driver`)
+    // before dispatching.  A fresh stack check is performed only when a Python
+    // frame is entered (`PyFrame.execute_frame.insert_stack_check_here`);
     // builtin dispatch itself is not a recursive frame entry.
     crate::stack_check::drain_jit_pending_exception()?;
     unsafe {

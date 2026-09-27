@@ -196,11 +196,12 @@ thread_local! {
     /// stable backend-visible cache; the slow path reads this source of truth.
     static TL_REPORT_ERROR: std::cell::Cell<u8> = const { std::cell::Cell::new(1) };
 
-    /// Pending Python exception produced by a JIT prologue stack check
-    /// in the current OS thread. This follows the same ownership model
-    /// as `pypy_threadlocal_s::stack_end`: backend code may enter from
-    /// multiple Rust test threads, but each thread must only surface
-    /// its own prologue overflow.
+    /// Exception parked by [`park_jit_pending_error`] for the current OS
+    /// thread. `unpackiterable_driver` is the producer: its merge-point hook
+    /// returns `()` and the error is re-raised at the next
+    /// [`drain_jit_pending_exception`]. The prologue stack check does not
+    /// write this cell; `stack_check_slowpath` publishes through
+    /// `jit_publish_exception` (`llmodel.py` `_store_exception`).
     static TL_JIT_PENDING_EXCEPTION: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
@@ -229,8 +230,8 @@ pub(crate) mod test_support {
 // `stack_check` forwards reads/writes through
 // `crate::module::sys::state::{recursion_limit, set_recursion_limit}`.
 
-/// Store a pending JIT-prologue overflow exception for the current
-/// thread. A value of 0 means "no pending overflow".
+/// Store the exception [`park_jit_pending_error`] parks for the current
+/// thread. A value of 0 means the slot is empty.
 #[inline]
 fn set_jit_pending_exception(obj: pyre_object::PyObjectRef) {
     TL_JIT_PENDING_EXCEPTION.with(|slot| slot.set(obj as i64));
@@ -524,21 +525,22 @@ pub extern "C" fn pyre_stack_too_big_slowpath(current: usize) -> u8 {
     0
 }
 
-/// Backend-callable slowpath that wraps [`pyre_stack_too_big_slowpath`]
-/// and places a fresh `RecursionError` instance into the pending
-/// exception slot for the current thread when a real overflow is
-/// detected. The dynasm x86/aarch64 inline prologue probes call this
-/// via the address
-/// registered with `register_stack_check_addresses`, so the exception
-/// is constructed atomically with the backend's decision to exit the
-/// prologue with the initial jf_ptr.
+/// Backend-callable slowpath that wraps [`pyre_stack_too_big_slowpath`].
 ///
-/// Matches `rpython/rlib/rstack.py stack_check_slowpath`, which
-/// constructs `_StackOverflow` and raises it into `pos_exception()`
-/// so the assembler's `_build_stack_check_slowpath` wrapper can route
-/// to `propagate_exception_path`. In pyre the "propagate" half is
-/// performed by the glue via [`drain_jit_pending_exception`] on the
-/// way back to the interpreter.
+/// `rpython/rlib/rstack.py` `stack_check_slowpath` raises `_StackOverflow`.
+/// The exception transformer stores that in ExcData (`llmodel.py`
+/// `pos_exception` / `pos_exc_value`). The address registered with
+/// `register_stack_check_addresses` is this function, and the assembler's
+/// `_build_stack_check_slowpath` then jumps to `propagate_exception_path`,
+/// which copies `pos_exc_value` into `jf_guard_exc`
+/// (`compile.py` `PropagateExceptionDescr.handle_fail`).
+///
+/// On overflow, publish the `RecursionError` through
+/// [`crate::runtime_ops::jit_publish_exception`] (`llmodel.py`
+/// `_store_exception`), the same channel residual helpers use. That calls
+/// the raiser `pyre-jit` registers with `register_jit_exc_raiser`, which
+/// writes the backend `pos_exception` / `pos_exc_value` cells. It does not
+/// park the object in [`TL_JIT_PENDING_EXCEPTION`].
 ///
 /// Returns the same 0/1 that [`pyre_stack_too_big_slowpath`] returns,
 /// so the backend can still branch on the result directly.
@@ -547,7 +549,7 @@ pub extern "C" fn pyre_stack_check_slowpath_for_backend(current: usize) -> u8 {
     let r = pyre_stack_too_big_slowpath(current);
     if r != 0 {
         let exc_obj = w_exception_new(ExcKind::RecursionError, "maximum recursion depth exceeded");
-        set_jit_pending_exception(exc_obj);
+        crate::runtime_ops::jit_publish_exception(exc_obj);
     }
     r
 }
@@ -560,9 +562,9 @@ pub extern "C" fn pyre_stack_check_slowpath_for_backend(current: usize) -> u8 {
 /// backends use. Semantically equivalent to the inline probe + slow
 /// path pair — just paid as one function call.
 ///
-/// Returns `1` on real overflow (and stores a `RecursionError` into
-/// the current thread's pending JIT exception slot via
-/// [`pyre_stack_check_slowpath_for_backend`]), `0` otherwise. The
+/// Returns `1` on real overflow (and [`pyre_stack_check_slowpath_for_backend`]
+/// publishes a `RecursionError` into the backend exception cells), `0`
+/// otherwise. The
 /// return type is `i64` rather than `u8` so Cranelift's
 /// `emit_host_call(..., Some(I64))` gets an unambiguous 64-bit
 /// return value in the machine register (the System V AMD64 ABI does
@@ -580,16 +582,11 @@ pub extern "C" fn pyre_stack_check_for_jit_prologue() -> i64 {
     pyre_stack_check_slowpath_for_backend(current) as i64
 }
 
-/// Drain the pending JIT-prologue overflow exception, if any, and
-/// convert it to `PyError`. The slot is thread-local, matching
-/// `pypy_threadlocal_s::stack_end`, so unrelated Rust test threads
-/// cannot claim each other's backend-raised overflow. Called by the
-/// glue at every backend boundary and by the interpreter call
-/// dispatcher so a prologue-detected overflow surfaces as the
-/// user-visible `RecursionError`.
-///
-/// Matches RPython `pos_exception()` → `propagate_exception_path`
-/// unwind semantics.
+/// Drain the exception [`park_jit_pending_error`] parked, if any, and
+/// convert it to `PyError`. The slot is thread-local, so another Rust
+/// test thread cannot claim it. The prologue stack check does not write
+/// this cell; its overflow is already in the backend `pos_exc_value`
+/// (`llmodel.py` `_store_exception`) when `propagate_exception_path` runs.
 #[inline]
 #[majit_macros::dont_look_inside]
 pub fn drain_jit_pending_exception() -> Result<(), PyError> {
@@ -624,19 +621,16 @@ pub fn is_jit_overflow_pending() -> bool {
 /// Park `err` in this thread's pending slot so the next interpreter call
 /// boundary re-raises it through [`drain_jit_pending_exception`].
 ///
-/// The prologue stack check is one producer; the other is a JIT driver whose
-/// compiled loop raised while the Rust caller loop, not a portal runner, owns
-/// the continuation. `warmspot.py:998-1005` re-raises an
-/// `ExitFrameWithExceptionRef` out of `ll_portal_runner` straight into the
-/// portal's caller; pyre's second driver (`unpackiterable_driver`) is entered
-/// from a merge-point hook returning `()`, so the error travels through this
-/// slot instead of a return value. Delivery is at the caller loop's next
-/// dispatch, which for the drain is the `next(w_iterator)` that immediately
-/// follows the hook — before `__next__` re-runs, so no side effect repeats.
+/// `warmspot.py` re-raises an `ExitFrameWithExceptionRef` out of
+/// `ll_portal_runner` straight into the portal's caller. `unpackiterable_driver`
+/// is entered from a merge-point hook returning `()`, so the error travels
+/// through this slot instead of a return value. Delivery is at the caller
+/// loop's next dispatch, which for the drain is the `next(w_iterator)` that
+/// immediately follows the hook — before `__next__` re-runs, so no side
+/// effect repeats.
 ///
-/// Overwrites any slot content: a stack overflow raised while a driver error
-/// is parked (or vice versa) is one thread unwinding for two reasons, and the
-/// caller sees whichever was stored last, as it would with `pos_exception()`.
+/// Overwrites any slot content. The prologue stack check is not a producer:
+/// it publishes through `jit_publish_exception` into `pos_exception`.
 pub fn park_jit_pending_error(mut err: PyError) {
     let obj = err.to_exc_object();
     if !obj.is_null() {
@@ -1024,63 +1018,51 @@ mod tests {
     }
 
     #[test]
-    fn backend_slowpath_raises_into_pending_exception() {
+    fn backend_slowpath_reports_overflow_without_pending_slot() {
         let _g = lock_tests();
         reset_all();
-        // Plant a synthetic high base so the 4-case slowpath reports
-        // a real overflow — verifies the wrapper constructs a fresh
-        // RecursionError and stores it in the current thread's
-        // pending JIT exception slot.
+        // No `register_jit_exc_raiser` in this crate's unit tests, so the
+        // slowpath cannot be observed through backend exception cells.
+        // The contract here is the return value, and that the pending
+        // slot — owned by `park_jit_pending_error` — stays empty.
         let above = current_sp().saturating_add(2 * MAX_STACK_SIZE);
         plant_stack_end(above);
         let result = pyre_stack_check_slowpath_for_backend(current_sp());
         assert_eq!(result, 1, "slowpath must signal overflow");
         assert!(
-            is_jit_overflow_pending(),
-            "slowpath must place exception into the current thread's pending slot"
+            !is_jit_overflow_pending(),
+            "slowpath must not park the overflow in the pending slot"
         );
-        let err = drain_jit_pending_exception().expect_err("pending exception must drain");
-        assert_eq!(err.kind, crate::PyErrorKind::RecursionError);
-        assert!(!is_jit_overflow_pending(), "drain must clear the slot");
         assert!(
             drain_jit_pending_exception().is_ok(),
-            "second drain must be Ok"
+            "pending slot stays empty"
         );
         reset_all();
     }
 
     #[test]
-    fn pending_exception_slot_is_thread_local() {
+    fn backend_slowpath_leaves_pending_slot_empty_on_every_thread() {
         let _g = lock_tests();
         reset_all();
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (drain_tx, drain_rx) = std::sync::mpsc::channel();
         let child = std::thread::spawn(move || {
             reset_stack_base();
             clear_jit_pending_exception();
             let above = current_sp().saturating_add(2 * MAX_STACK_SIZE);
             plant_stack_end(above);
             assert_eq!(pyre_stack_check_slowpath_for_backend(current_sp()), 1);
-            assert!(is_jit_overflow_pending());
-            ready_tx.send(()).expect("notify main thread");
-            drain_rx.recv().expect("wait for main drain attempt");
-            let err =
-                drain_jit_pending_exception().expect_err("child pending exception must remain");
-            assert_eq!(err.kind, crate::PyErrorKind::RecursionError);
             assert!(!is_jit_overflow_pending());
+            assert!(drain_jit_pending_exception().is_ok());
+            ready_tx.send(()).expect("notify main thread");
         });
 
-        ready_rx.recv().expect("wait for child pending exception");
+        ready_rx.recv().expect("wait for child slowpath");
         assert!(
             !is_jit_overflow_pending(),
-            "child thread's pending exception must not be visible in main thread"
+            "slowpath must not park an overflow visible to the main thread"
         );
-        assert!(
-            drain_jit_pending_exception().is_ok(),
-            "main thread must not drain child thread's pending exception"
-        );
-        drain_tx.send(()).expect("release child thread");
+        assert!(drain_jit_pending_exception().is_ok());
         child.join().expect("child thread must finish");
         reset_all();
     }

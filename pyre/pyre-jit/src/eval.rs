@@ -7918,10 +7918,10 @@ fn drive_unpack_iterable_trace(
             );
         }
         // Clear the compiled-side slots so `ln` re-derives its own loop-exit
-        // StopIteration rather than seeing the drain's. Anything else left in
-        // them is a real error (a prologue-overflow `RecursionError` is the only
-        // producer today) and is promoted instead of discarded; an exit that
-        // already picked one keeps it, since that one is the earlier failure.
+        // StopIteration rather than seeing the drain's. A real error already
+        // parked by `park_jit_pending_error` is promoted instead of discarded;
+        // an exit that already picked one keeps it, since that one is the
+        // earlier failure. The prologue stack check does not write this slot.
         if let Err(err) = pyre_interpreter::stack_check::drain_jit_pending_exception()
             && !err.matches_stop_iteration()
         {
@@ -11151,11 +11151,12 @@ fn execute_assembler(
         }
     }
 
-    // rstack.stack_check_slowpath → _StackOverflow parity: drain the
-    // JIT-overflow flag the backend probe records when it trips. The
-    // backend detects the overflow inside compiled code and exits via
-    // the dedicated stack-overflow block; we surface the user-visible
-    // RecursionError here on the way back to the interpreter loop.
+    // Drain the exception `park_jit_pending_error` parked
+    // (`unpackiterable_driver`). A prologue overflow is not in this
+    // slot: `stack_check_slowpath` publishes it through
+    // `jit_publish_exception` into `pos_exception`, and the assembler's
+    // `_build_stack_check_slowpath` carries `pos_exc_value` out through
+    // `propagate_exception_path`.
     if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
         return Some(LoopResult::Done(Err(exc)));
     }
@@ -11741,11 +11742,10 @@ fn bound_reached(
         None
     };
     if let Some(mut outcome) = outcome {
-        // rstack.stack_check_slowpath → _StackOverflow parity: drain
-        // the JIT-overflow flag the backend probe records when it
-        // trips. The backend's prologue exits via the dedicated
-        // stack-overflow block; we surface RecursionError here on the
-        // way back to the interpreter loop.
+        // Drain the exception `park_jit_pending_error` parked
+        // (`unpackiterable_driver`). A prologue overflow is already in
+        // `pos_exc_value` (`jit_publish_exception` /
+        // `_build_stack_check_slowpath`), not in this slot.
         if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
             return Some(LoopResult::Done(Err(exc)));
         }
@@ -12007,9 +12007,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             &env,
             || {},
         );
-        // rstack.stack_check_slowpath → _StackOverflow parity: drain
-        // the JIT-overflow flag the backend probe records when it
-        // trips during compiled execution at function entry.
+        // Drain the exception `park_jit_pending_error` parked
+        // (`unpackiterable_driver`). A prologue overflow is already in
+        // `pos_exc_value` (`jit_publish_exception` /
+        // `_build_stack_check_slowpath`), not in this slot.
         if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
             return Some(Err(exc));
         }

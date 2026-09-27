@@ -1780,33 +1780,6 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     result
 }
 
-/// x86/assembler.py `_build_stack_check_slowpath` parity, for every backend
-/// whose prologue emits the inline probe.
-///
-/// Upstream's slowpath raises into `pos_exception()`, which is exactly the cell
-/// the emitted overflow arm then moves into `jf_guard_exc` before jumping to
-/// `propagate_exception_path`.  pyre's interpreter-level slowpath parks the
-/// `RecursionError` in the thread's pending slot instead — a different cell, and
-/// not one any emitted code reads — so republish it into the backend's
-/// exception cells here.
-///
-/// This is shared rather than per-backend because the emitted store sequence is
-/// the same on both: registering the undrained slowpath leaves `JIT_EXC_VALUE`
-/// at zero, and the prologue then publishes that zero as the overflow's
-/// exception, which the propagate path resolves through its
-/// `memory_error_singleton_ref()` fallback — a `MemoryError` where the program
-/// is owed a `RecursionError`.
-#[cfg(any(feature = "dynasm", feature = "cranelift"))]
-extern "C" fn jit_prologue_stack_check_slowpath(current: usize) -> u8 {
-    let result = pyre_interpreter::stack_check::pyre_stack_check_slowpath_for_backend(current);
-    if result != 0
-        && let Err(mut exc) = pyre_interpreter::stack_check::drain_jit_pending_exception()
-    {
-        store_jit_exception(exc.to_exc_object() as i64);
-    }
-    result
-}
-
 /// Unbox a Ref (PyObjectRef to boxed int) to a raw i64 value.
 /// Used by call_assembler_guard_failure's FALLBACK path when the first
 /// local is a Ref type (boxed int) instead of raw Int.
@@ -1972,10 +1945,15 @@ pub fn install_jit_call_bridge() {
             // parity. Cranelift consumes these addresses to emit the same
             // load/sub/cmp fast path as dynasm, using a stack-slot address as
             // its current-stack approximation and calling slowpath only on miss.
+            // `pyre_stack_check_slowpath_for_backend` raises into pos_exception
+            // (`llmodel.py` `_store_exception`). `_build_stack_check_slowpath`
+            // copies pos_exc_value into jf_guard_exc and jumps to
+            // propagate_exception_path.
             majit_backend_cranelift::register_stack_check_addresses(
                 pyre_interpreter::stack_check::pyre_stack_get_end_adr(),
                 pyre_interpreter::stack_check::pyre_stack_get_length_adr(),
-                jit_prologue_stack_check_slowpath as *const () as usize,
+                pyre_interpreter::stack_check::pyre_stack_check_slowpath_for_backend as *const ()
+                    as usize,
             );
             majit_backend_cranelift::register_prologue_probe_addr(
                 pyre_interpreter::stack_check::pyre_stack_check_for_jit_prologue as *const ()
@@ -1994,10 +1972,15 @@ pub fn install_jit_call_bridge() {
             // rpython/jit/backend/llsupport/llmodel.py insert_stack_check
             // parity. The backend inlines MOV [endaddr]; SUB rsp; CMP [lengthaddr]
             // in every JIT prologue and calls slowpath_addr on miss.
+            // `pyre_stack_check_slowpath_for_backend` raises into pos_exception
+            // (`llmodel.py` `_store_exception`). `_build_stack_check_slowpath`
+            // copies pos_exc_value into jf_guard_exc and jumps to
+            // propagate_exception_path.
             majit_backend_dynasm::register_stack_check_addresses(
                 pyre_interpreter::stack_check::pyre_stack_get_end_adr(),
                 pyre_interpreter::stack_check::pyre_stack_get_length_adr(),
-                jit_prologue_stack_check_slowpath as *const () as usize,
+                pyre_interpreter::stack_check::pyre_stack_check_slowpath_for_backend as *const ()
+                    as usize,
             );
         }
     });
@@ -2100,14 +2083,14 @@ fn jit_blackhole_resume_from_guard(
     let ca_finished_frame = CA_WALK_FINISHED_FRAME.with(|c| c.replace(0));
     let ca_resume_frame = CA_WALK_RESUME_FRAME.with(|c| c.replace(0));
 
-    // rstack.stack_check_slowpath → _StackOverflow parity: drain the
-    // pending JIT-prologue overflow exception when the backend probe
-    // tripped. The blackhole resume path is one of the three
-    // boundaries the user listed (compiled entry / call_assembler /
-    // blackhole resume), so we surface RecursionError here as well as
-    // in eval.rs. We do this BEFORE setting up resume state so deep
-    // recursion through the blackhole interpreter cannot accumulate
-    // further damage.
+    // Drain the exception `park_jit_pending_error` parked
+    // (`unpackiterable_driver`). The prologue stack check is not a
+    // producer of that slot: `stack_check_slowpath` publishes through
+    // `jit_publish_exception` into `pos_exception`, and
+    // `_build_stack_check_slowpath` copies `pos_exc_value` into
+    // `jf_guard_exc` before `propagate_exception_path`. Do this before
+    // resume setup so a parked driver error is not overwritten by the
+    // blackhole walk.
     if let Err(mut exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
         // This callback returns as the result of CALL_ASSEMBLER, whose caller
         // immediately executes GUARD_NO_EXCEPTION.  Publish into the same two
