@@ -483,7 +483,7 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
     let _ = crate::gc_roots::pin_root(value as PyObjectRef);
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(get_instantiate(&STR_TYPE));
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
     let value = crate::gc_roots::shadow_stack_get(value_slot) as *mut UnicodeValueStorage;
     let unicode = W_UnicodeObject {
         ob_header: PyObject {
@@ -667,7 +667,7 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
     let value = alloc_utf8_payload(value.as_bytes(), true);
     let value_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(value as PyObjectRef);
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         W_UNICODE_USER_GC_TYPE_ID,
         W_UNICODE_USER_OBJECT_SIZE,
     );

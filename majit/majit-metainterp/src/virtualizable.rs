@@ -1271,16 +1271,15 @@ impl VirtualizableInfo {
                 // Pointer-width field: 4 bytes on wasm32. Writing 8 bytes
                 // would clobber the adjacent field.
                 Type::Ref => {
-                    let ptr = obj_ptr.add(field.offset) as *mut usize;
-                    *ptr = value as usize;
-                    // The ref may be nursery-young while the virtualizable is
-                    // old-gen and runs detached from the walked frame chain;
-                    // upstream's write_boxes stores run under the translated
-                    // write barrier (virtualizable.py), so arm the
-                    // object in the remembered set here.
+                    // `gc_write_barrier` must run before the store
+                    // (`GcAllocator::write_barrier` calling convention;
+                    // the GC transform emits OP_GC_WRITEBARRIER then
+                    // the field store).
                     if majit_gc::gc_owns_object(obj_ptr as usize) {
                         majit_gc::gc_write_barrier(majit_ir::GcRef(obj_ptr as usize));
                     }
+                    let ptr = obj_ptr.add(field.offset) as *mut usize;
+                    *ptr = value as usize;
                 }
                 _ => {
                     let ptr = obj_ptr.add(field.offset);
@@ -3241,19 +3240,21 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         // hands `setattr` a null and it crashes — but the read still happens.
         for (field_index, field) in self.static_fields.iter().enumerate() {
             let value = reader.next_value_of_type(field.field_type);
+            let vable_ptr = reader.virtualizable_ptr as *mut u8;
             if !vable_ptr.is_null() {
                 unsafe {
                     self.write_field(vable_ptr, field_index, value);
                 }
             }
         }
-        if vable_ptr.is_null() {
+        if reader.virtualizable_ptr == 0 {
             // Matches `get_total_size`, which adds no array length without a
             // virtualizable to measure: there are no array items encoded.
             return;
         }
         // virtualizable.py:134-137: array items
         for array in &self.array_fields {
+            let vable_ptr = reader.virtualizable_ptr as *mut u8;
             let arr_len = unsafe { bhimpl_arraylen_vable(vable_ptr as *const u8, array) };
             // `lst = getattr(virtualizable, ARRAYFIELD)` is bound outside the
             // item loop upstream, where the GC transform roots it and forwards
@@ -3266,6 +3267,11 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
                 .then(|| unsafe { vable_array_write_base(vable_ptr, array) });
             for j in 0..arr_len {
                 let value = reader.next_value_of_type(array.item_type);
+                // `next_ref` / `getvirtual_ptr` can malloc; the GC transform
+                // roots the decoded GCREF local across the store. Re-read
+                // `virtualizable_ptr` after that malloc — it is the live
+                // identity, not a copy taken before `load_next_value_of_type`.
+                let vable_ptr = reader.virtualizable_ptr as *mut u8;
                 let (data_ptr, owner_ptr) =
                     base.unwrap_or_else(|| unsafe { vable_array_write_base(vable_ptr, array) });
                 unsafe {
@@ -3512,13 +3518,10 @@ pub(crate) unsafe fn vable_write_array_item_at(
         if !data_ptr.is_null() {
             let dest = data_ptr.add(index * item_size);
             if array.item_type == Type::Ref {
-                std::ptr::write(dest as *mut usize, value as usize);
                 // `llmodel.py write_ref_at_mem` — "the write barrier is
                 // implied above" — is what every blackhole ref store funnels
-                // through upstream.  The stored ref can be nursery-young while
-                // the array and its owning frame are old-gen, so arm whichever
-                // side the collector owns, exactly as the sibling
-                // `VirtualizableInfo::write_array_item` already does.
+                // through upstream. Arm the owner before the store, matching
+                // `GcAllocator::write_barrier`.
                 if value != 0 {
                     if majit_gc::gc_owns_object(owner_ptr as usize) {
                         majit_gc::gc_write_barrier(majit_ir::GcRef(owner_ptr as usize));
@@ -3526,6 +3529,7 @@ pub(crate) unsafe fn vable_write_array_item_at(
                         majit_gc::gc_write_barrier(majit_ir::GcRef(vable_ptr as usize));
                     }
                 }
+                std::ptr::write(dest as *mut usize, value as usize);
             } else if array.item_type == Type::Float {
                 // `llmodel.py write_float_at_mem` — the f64 bit pattern, which
                 // the caller handed over as one.

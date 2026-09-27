@@ -3961,7 +3961,9 @@ pub trait QuasiImmutHandle: Send + Sync + std::fmt::Debug {
 pub struct QuasiImmutDescr {
     fielddescr: DescrRef,
     /// `quasiimmut.py self.struct = struct` — compared, never dereferenced.
-    struct_ptr: u64,
+    /// Upstream holds a GCREF the collector updates; here
+    /// `walk_const_ptr_refs` forwards the word.
+    struct_ptr: std::sync::atomic::AtomicU64,
     qmut: std::sync::Arc<dyn QuasiImmutHandle>,
     /// `quasiimmut.py self.constantfieldbox`.
     ///
@@ -3982,7 +3984,7 @@ impl QuasiImmutDescr {
     ) -> Self {
         Self {
             fielddescr,
-            struct_ptr,
+            struct_ptr: std::sync::atomic::AtomicU64::new(struct_ptr),
             qmut,
             constantfieldbox: Mutex::new(constantfieldbox),
         }
@@ -3995,7 +3997,7 @@ impl QuasiImmutDescr {
 
     /// `quasiimmut.py self.struct = struct`.
     pub fn struct_ptr(&self) -> u64 {
-        self.struct_ptr
+        self.struct_ptr.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// `quasiimmut.py self.qmut = get_current_qmut_instance(...)`.
@@ -4008,10 +4010,17 @@ impl QuasiImmutDescr {
         *self.constantfieldbox.lock()
     }
 
-    /// Forward a `Value::Ref` captured on this descr after a moving
-    /// collection. `MetaInterp::walk_active_trace_refs` calls this
-    /// through the recorder's slot descrs.
+    /// Forward the `struct` word and a `Value::Ref` captured on this descr
+    /// after a moving collection. `MetaInterp::walk_active_trace_refs` calls
+    /// this through the recorder's slot descrs.
     pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut crate::GcRef)) {
+        let raw = self.struct_ptr();
+        if raw != 0 {
+            let mut gcref = crate::GcRef(raw as usize);
+            visitor(&mut gcref);
+            self.struct_ptr
+                .store(gcref.0 as u64, std::sync::atomic::Ordering::Release);
+        }
         let mut slot = self.constantfieldbox.lock();
         if let Some(crate::Value::Ref(gcref)) = slot.as_mut() {
             visitor(gcref);

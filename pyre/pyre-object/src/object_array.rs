@@ -1,7 +1,8 @@
 use std::alloc::{Layout, alloc, alloc_zeroed, dealloc};
 use std::ops::{Index, IndexMut};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
+use crate::pyobject::PyObject;
 use crate::{PY_NULL, PyObjectRef};
 
 /// Host constructor for a 3.14t length cell. Upstream `l.length`
@@ -175,6 +176,33 @@ pub unsafe fn items_block_items_base(block: *mut ItemsBlock) -> *mut PyObjectRef
         return std::ptr::null_mut();
     }
     unsafe { (block as *mut u8).add(ITEMS_BLOCK_ITEMS_OFFSET) as *mut PyObjectRef }
+}
+
+/// `setarrayitem_gc` for a type-9 `ItemsBlock`: test `TRACK_YOUNG_PTRS`,
+/// `write_barrier` / `remember_young_pointer` while the flag is set, then
+/// the store. A raw write after a barrier that ran in another function
+/// leaves a window in which a collection can consume the remembered-set
+/// entry and reset the flag before the young pointer lands.
+///
+/// # Safety
+/// `block` is a live `ItemsBlock` and `index` is in range.
+#[inline]
+pub unsafe fn items_block_set_ref(block: *mut ItemsBlock, index: usize, value: PyObjectRef) {
+    debug_assert!(!block.is_null(), "setarrayitem_gc on a null ItemsBlock");
+    if value.is_null() {
+        unsafe { *items_block_items_base(block).add(index) = value };
+        return;
+    }
+    let header = unsafe { majit_gc::header::header_of(block as usize) };
+    if unsafe { !(*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
+        unsafe { *items_block_items_base(block).add(index) = value };
+        return;
+    }
+    if unsafe { (*header).is_forwarded() } {
+        stale_array_abort(block as usize, index);
+    }
+    crate::gc_hook::try_gc_write_barrier_managed(block as *mut u8);
+    unsafe { *items_block_items_base(block).add(index) = value };
 }
 
 /// `rgc.ll_arraymove(array, source_start, dest_start, length)` — runtime
@@ -441,22 +469,19 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
     unsafe { dealloc_items_block(block) }
 }
 
-// ─── mapdict instance-storage block: stable GcArray(OBJECTPTR) ────────────
+// ─── mapdict instance-storage block: nursery GcArray(OBJECTPTR) ───────────
 //
 // `W_ObjectObject.storage` (`mapdict.py _mapdict_init_empty` `self.storage`) is a
 // `Ptr(GcArray(OBJECTPTR))`. It carries the same inline-traced shape as
 // list/tuple item blocks (`PY_OBJECT_ARRAY_GC_TYPE_ID`) — every slot is a
 // reference — under its own tid (`W_MAPDICT_STORAGE_GC_TYPE_ID`) and differs
-// only in being allocated `stable` (non-moving old-gen). Stable allocation
-// mirrors the instance's own `try_gc_alloc_stable` (objectobject.rs) and the
-// `TypedItemsBlock` int/float backing blocks: a non-moving block means the
-// instance's `storage` pointer never needs rewriting on a minor GC, and the
-// A stable allocation does not itself start a collection, but it is still a GC
-// operation and can wait behind a collection started by another mutator.
-// Therefore its inputs and fresh result need the same shadow-stack publication
-// as nursery allocation.
+// only in being allocated on the nursery bump (`malloc_varsize`). The
+// instance is already a nursery object; `instance_walk_boxed_storage`
+// rewrites its `storage` slot. A non-moving block was a shortcut so the
+// instance's `storage` pointer never needed rewriting. That is not
+// `mapdict.py`. The nursery bump is `malloc_varsize`.
 
-/// Allocate a fresh stable `ItemsBlock` holding `values` in its first slots and
+/// Allocate a fresh nursery `ItemsBlock` holding `values` in its first slots and
 /// NULL in the rest, tagged `W_MAPDICT_STORAGE_GC_TYPE_ID` (leaf). The map is
 /// the length authority (mapdict.py), so `cap` is an allocation bound
 /// rather than a length; a live instance passes the larger of its current
@@ -502,7 +527,17 @@ pub unsafe fn grow_instance_items_block(
     live_len: usize,
 ) -> *mut ItemsBlock {
     unsafe {
+        let _roots = crate::gc_roots::push_roots();
+        let old_slot = crate::gc_roots::shadow_stack_len();
+        if !old.is_null() {
+            let _ = crate::gc_roots::pin_root(old as PyObjectRef);
+        }
         let fresh = alloc_mapdict_storage_block(new_cap);
+        let old = if old.is_null() {
+            old
+        } else {
+            crate::gc_roots::shadow_stack_get(old_slot) as *mut ItemsBlock
+        };
         let new_base = items_block_items_base(fresh);
         let copy = live_len.min(new_cap);
         if !old.is_null() && copy > 0 {
@@ -511,6 +546,9 @@ pub unsafe fn grow_instance_items_block(
         for i in copy..new_cap {
             *new_base.add(i) = PY_NULL;
         }
+        // Copied slots can be young. A nursery-full `fresh` block is
+        // old-gen with TRACK_YOUNG_PTRS still set.
+        crate::gc_hook::try_gc_write_barrier_managed(fresh as *mut u8);
         fresh
     }
 }
@@ -525,14 +563,15 @@ pub unsafe fn dealloc_instance_items_block(block: *mut ItemsBlock) {
     unsafe { dealloc_items_block(block) }
 }
 
-/// Stable leaf-block allocator for mapdict storage. Routes through
-/// `try_gc_alloc_stable(W_MAPDICT_STORAGE_GC_TYPE_ID, payload)`; the capacity
-/// header is set, items are left uninitialised (the caller writes every slot
-/// before exposing the block). Falls back to `std::alloc` [`alloc_items_block`]
-/// when no GC hook is installed. `cap` may be zero (header-only block).
+/// Nursery leaf-block allocator for mapdict storage (`malloc_varsize`).
+/// `instance_walk_boxed_storage` forwards the instance's `storage` slot
+/// and walks the items. Capacity is set; items are left uninitialised
+/// (the caller writes every slot before exposing the block). Falls back
+/// to `std::alloc` [`alloc_items_block`] when no GC hook is installed.
+/// `cap` may be zero (header-only block).
 unsafe fn alloc_mapdict_storage_block(cap: usize) -> *mut ItemsBlock {
     let payload = ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<PyObjectRef>();
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_MAPDICT_STORAGE_GC_TYPE_ID, payload);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_MAPDICT_STORAGE_GC_TYPE_ID, payload);
     if !raw.is_null() {
         let block = raw as *mut ItemsBlock;
         unsafe { (*block).capacity = cap };
@@ -754,23 +793,25 @@ pub unsafe fn try_grow_list_items_block_gc(
 
 /// Tuple-construction allocator on the Phase L2 nursery path. Exact-size
 /// (`cap == len` — tuples are immutable and every slot is written, no
-/// overallocation). Pins each element across the (collecting) block
-/// allocation and fills from the relocated shadow-stack slots, mirroring
-/// `w_tuple_new_array_backed`'s read-back. Degrades to the `std::alloc`
-/// [`alloc_tuple_items_block`] when the gate is off.
+/// overallocation). Fills from `cap` already-pinned shadow-stack slots at
+/// `save_point`, which the caller must keep live across this call: a
+/// collection during the block malloc rewrites those slots in place, and
+/// the fill reads them back afterwards. A `Vec` of the same words would
+/// still hold pre-move addresses. Degrades to `std::alloc` when the gate
+/// is off, still filling from the slots.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlock {
+pub unsafe fn alloc_tuple_items_block_gc(save_point: usize, cap: usize) -> *mut ItemsBlock {
     if !itemsblock_gc_enabled() {
-        return unsafe { alloc_tuple_items_block(values) };
+        let block = unsafe { alloc_items_block(cap) };
+        if cap > 0 {
+            let dst = unsafe { std::slice::from_raw_parts_mut(items_block_items_base(block), cap) };
+            crate::gc_roots::shadow_stack_copy_range(save_point, dst);
+        }
+        return block;
     }
-    let cap = values.len();
     let _roots = crate::gc_roots::push_roots();
-    let save = crate::gc_roots::shadow_stack_len();
-    for &v in values {
-        let _ = crate::gc_roots::pin_root(v);
-    }
     let block_slot = crate::gc_roots::shadow_stack_len();
     let (block, owns_block) = unsafe { alloc_items_block_gc(cap) };
     let _ = crate::gc_roots::pin_root(block as PyObjectRef);
@@ -778,22 +819,25 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
     // `owns_block` is the placement `try_alloc_items_block_gc` already knew.
     let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
     let base = unsafe { items_block_items_base(block) };
-    // The block may have landed in old-gen (nursery-full fallback) while its
-    // elements are still young. That old→young edge is invisible to a minor
-    // collection unless the block is on the remembered set, so write-barrier
-    // it here. A nursery block carries no TRACK_YOUNG_PTRS and the barrier is
-    // a no-op; an old-gen block is registered so the next minor collection
-    // walks its items (write_barrier_from_array, incminimark.py). Guard
-    // on GC ownership exactly like `list_write_barrier`.
-    if owns_block {
-        crate::gc_hook::try_gc_write_barrier(block as *mut u8);
-    }
     if cap > 0 {
-        // Same block-shaped pop_roots reload as the list constructor above.
+        // pop_roots of the caller's item livevars, not a snapshot taken
+        // before this malloc.
         let dst = unsafe { std::slice::from_raw_parts_mut(base, cap) };
-        crate::gc_roots::shadow_stack_copy_range(save, dst);
+        crate::gc_roots::shadow_stack_copy_range(save_point, dst);
     }
-    block
+    // The block may have landed in old-gen (nursery-full fallback) while
+    // its elements are still young. `write_barrier` /
+    // `remember_young_pointer` is not a collection point, so the fill
+    // can precede it; the managed entry is the one every other typed
+    // array uses after a `setarrayitem` into a `malloc_varsize` block.
+    // A nursery block carries no TRACK_YOUNG_PTRS and the barrier is a
+    // no-op. Guard on GC ownership exactly like `list_write_barrier`.
+    if owns_block {
+        crate::gc_hook::try_gc_write_barrier_managed(
+            crate::gc_roots::shadow_stack_get(block_slot) as *mut u8
+        );
+    }
+    crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock
 }
 
 /// Allocate an exact-`cap` NULL-filled GC-managed `ItemsBlock` of refs for
@@ -853,14 +897,85 @@ unsafe fn alloc_items_block(cap: usize) -> *mut ItemsBlock {
 unsafe fn try_alloc_items_block(cap: usize) -> Option<*mut ItemsBlock> {
     let layout = try_items_block_layout(cap)?;
     unsafe {
-        let raw = alloc(layout);
-        if raw.is_null() {
-            return None;
-        }
-        let block = raw as *mut ItemsBlock;
+        let block = std_alloc_gc_array(layout, false)? as *mut ItemsBlock;
         (*block).capacity = cap;
         Some(block)
     }
+}
+
+/// `gcheaderbuilder.size_gc_header`: the `GcHeader` prefix of a GcArray
+/// block, spelled as the `size_of` / `align_of` the translator folds to a
+/// constant.
+const GC_ARRAY_HEADER_SIZE: usize = std::mem::size_of::<majit_gc::header::GcHeader>();
+const GC_ARRAY_HEADER_ALIGN: usize = std::mem::align_of::<majit_gc::header::GcHeader>();
+
+/// Byte size of the `[GcHeader | payload]` block of a no-hook `std::alloc`
+/// GcArray, or `None` when no layout of the header's alignment describes it:
+/// `Layout::from_size_align` requires the size rounded up to the alignment to
+/// stay within `isize`.
+fn std_gc_array_size(payload: Layout) -> Option<usize> {
+    let size = GC_ARRAY_HEADER_SIZE.checked_add(payload.size())?;
+    let rounded = size.checked_add(GC_ARRAY_HEADER_ALIGN - 1)?;
+    if (rounded as isize) < 0 {
+        None
+    } else {
+        Some(size)
+    }
+}
+
+/// `std::alloc` layout of a GcArray block of `size` bytes, a size
+/// [`std_gc_array_size`] accepted. The block takes the header's alignment: no
+/// GcArray payload is aligned more strictly (asserted below), so the constant
+/// is the maximum of the two.
+fn std_gc_array_layout(size: usize) -> Layout {
+    Layout::from_size_align(size, GC_ARRAY_HEADER_ALIGN).expect("std GcArray layout")
+}
+
+// The payload starts `GcHeader::SIZE` bytes into the allocation, so the header
+// size must keep every block's payload alignment, and the block's alignment is
+// the header's only while no payload needs more.
+const _: () = assert!(
+    GC_ARRAY_HEADER_SIZE == majit_gc::header::GcHeader::SIZE
+        && GC_ARRAY_HEADER_ALIGN == majit_gc::header::GcHeader::ALIGN
+        && GC_ARRAY_HEADER_SIZE % std::mem::align_of::<ItemsBlock>() == 0
+        && GC_ARRAY_HEADER_SIZE % std::mem::align_of::<TypedItemsBlock>() == 0
+        && GC_ARRAY_HEADER_SIZE % std::mem::align_of::<FixedObjectArray>() == 0
+        && std::mem::align_of::<ItemsBlock>() <= GC_ARRAY_HEADER_ALIGN
+        && std::mem::align_of::<TypedItemsBlock>() <= GC_ARRAY_HEADER_ALIGN
+        && std::mem::align_of::<FixedObjectArray>() <= GC_ARRAY_HEADER_ALIGN,
+    "GcHeader must preserve and bound the GcArray payload alignment",
+);
+
+/// The no-hook `std::alloc` fallback for a GcArray: every GcArray carries a GC
+/// header, so the block is `[GcHeader | payload]` with a zeroed header, the
+/// `alloc_fixed_array_with_header` shape. The zero flag word keeps
+/// `TRACK_YOUNG_PTRS` clear, so the inline flag test in `setarrayitem_gc`
+/// (`items_block_set_ref`, [`FixedObjectArray::set_ref`]) takes the plain
+/// store for these blocks with no ownership query. Returns the payload
+/// address, or `None` when the allocator refuses.
+unsafe fn std_alloc_gc_array(payload: Layout, zeroed: bool) -> Option<*mut u8> {
+    let layout = std_gc_array_layout(std_gc_array_size(payload)?);
+    unsafe {
+        let raw = if zeroed {
+            alloc_zeroed(layout)
+        } else {
+            alloc(layout)
+        };
+        if raw.is_null() {
+            return None;
+        }
+        std::ptr::write_bytes(raw, 0, GC_ARRAY_HEADER_SIZE);
+        // `cast_adr_to_ptr(result + size_gc_header)`: the payload address is
+        // header address arithmetic, as `header_of` spells the inverse.
+        Some((raw as usize + GC_ARRAY_HEADER_SIZE) as *mut u8)
+    }
+}
+
+/// Free a block [`std_alloc_gc_array`] returned for the same `payload` layout.
+unsafe fn std_dealloc_gc_array(block: *mut u8, payload: Layout) {
+    let size = std_gc_array_size(payload).expect("std GcArray layout");
+    let header = (block as usize - GC_ARRAY_HEADER_SIZE) as *mut u8;
+    unsafe { dealloc(header, std_gc_array_layout(size)) };
 }
 
 /// The abort an infallible `ItemsBlock` allocation takes, so the fallible
@@ -877,10 +992,9 @@ pub fn items_block_alloc_failed(cap: usize) -> ! {
 /// Deallocate an `ItemsBlock` previously allocated via
 /// [`alloc_items_block`] or [`grow_items_block`]. Phase L2: a
 /// GC-managed block (nursery / old-gen) is reclaimed by the collector
-/// and must never be freed here — its allocation is prefixed by a
-/// `GcHeader` the `std::alloc` layout knows nothing about, so handing
-/// it to `dealloc` would corrupt the allocator. `try_gc_owns_object`
-/// discriminates the two block origins during cutover.
+/// and must never be freed here; only the header-prefixed `std::alloc`
+/// fallback ([`std_alloc_gc_array`]) goes back to the allocator.
+/// `try_gc_owns_object` discriminates the two block origins.
 unsafe fn dealloc_items_block(block: *mut ItemsBlock) {
     if block.is_null() {
         return;
@@ -890,8 +1004,7 @@ unsafe fn dealloc_items_block(block: *mut ItemsBlock) {
     }
     unsafe {
         let cap = (*block).capacity;
-        let layout = items_block_layout(cap);
-        dealloc(block as *mut u8, layout);
+        std_dealloc_gc_array(block as *mut u8, items_block_layout(cap));
     }
 }
 
@@ -1060,11 +1173,7 @@ pub unsafe fn try_alloc_typed_items_block(cap: usize, tid: u32) -> Option<*mut T
         }
     }
     unsafe {
-        let raw = alloc_zeroed(layout);
-        if raw.is_null() {
-            return None;
-        }
-        let block = raw as *mut TypedItemsBlock;
+        let block = std_alloc_gc_array(layout, true)? as *mut TypedItemsBlock;
         (*block).capacity = cap;
         Some(block)
     }
@@ -1129,9 +1238,9 @@ pub unsafe fn try_grow_typed_items_block(
 }
 
 /// Deallocate a `TypedItemsBlock`. No-op on null. A GC-managed block is reclaimed
-/// by the collector and must never be freed here — its allocation is prefixed by
-/// a `GcHeader` the `std::alloc` layout knows nothing about. `try_gc_owns_object`
-/// gates the `std::alloc` free to the gate-off / no-hook fallback blocks.
+/// by the collector and must never be freed here. `try_gc_owns_object` gates the
+/// `std::alloc` free to the gate-off / no-hook fallback blocks
+/// ([`std_alloc_gc_array`]).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -1144,8 +1253,7 @@ pub unsafe fn dealloc_typed_items_block(block: *mut TypedItemsBlock) {
     }
     unsafe {
         let cap = (*block).capacity;
-        let layout = typed_items_block_layout(cap);
-        dealloc(block as *mut u8, layout);
+        std_dealloc_gc_array(block as *mut u8, typed_items_block_layout(cap));
     }
 }
 
@@ -1244,10 +1352,9 @@ impl FixedObjectArray {
     /// Store a GC reference through the host interpreter's equivalent of the
     /// GC transform's `setarrayitem_gc` rewrite.
     ///
-    /// RPython keeps the value live in the translated shadow stack, emits the
-    /// conditional array write barrier, then performs the store.  A raw Rust
-    /// local is not part of that generated root map, so publish it explicitly
-    /// and reload it after the barrier's safepoint before writing the slot.
+    /// `transform_generic_set` emits the inline `TRACK_YOUNG_PTRS` test, the
+    /// conditional array write barrier, then the store. The barrier is not a
+    /// collection point, so `value` needs no root across it.
     #[inline]
     #[expect(
         clippy::not_unsafe_ptr_arg_deref,
@@ -1262,12 +1369,12 @@ impl FixedObjectArray {
             unsafe { self.items_mut_ptr().add(index).write(value) };
             return;
         }
-        // minimark.py `writebarrier_before_copy` / the ordinary
-        // `setarrayitem_gc` rewrite: inspect TRACK_YOUNG_PTRS inline and enter
-        // the collecting slow path only while the old array still needs to be
-        // remembered.  The barrier clears this bit, so every later store into
-        // the same array is a plain write.  Nursery arrays and StdAlloc
-        // fallback arrays also carry a zero flag word and take this arm.
+        // The ordinary `setarrayitem_gc` rewrite: inspect TRACK_YOUNG_PTRS
+        // inline and enter the barrier slow path only while the old array
+        // still needs to be remembered.  The barrier clears this bit, so every
+        // later store into the same array is a plain write.  Nursery arrays and
+        // the header-prefixed `std::alloc` fallback arrays carry a zero flag
+        // word and take this arm.
         let header = unsafe { majit_gc::header::header_of(self as *mut Self as usize) };
         if unsafe { !(*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
             unsafe { self.items_mut_ptr().add(index).write(value) };
@@ -1291,25 +1398,55 @@ impl FixedObjectArray {
         if unsafe { (*header).is_forwarded() } {
             stale_array_abort(self as *mut Self as usize, index);
         }
-        let _roots = crate::gc_roots::push_roots();
-        let root_base = _roots.base();
-        let _ = _roots.pin_root(self as *mut Self as PyObjectRef);
-        let _ = _roots.pin_root(value);
-        let array = _roots.get(root_base) as *mut Self;
-        // Every mutable FixedObjectArray has a real header word: managed frame
-        // locals carry the collector's header, while the StdAlloc snapshot
-        // fallback is deliberately prefixed with a zeroed one
-        // (`alloc_fixed_array_with_header`).  This is therefore the ordinary
-        // RPython `setarrayitem_gc` shape: test the header flag directly and
-        // enter the membership-free slow path only when it is set.  The zeroed
-        // fallback header makes the same call a no-op without an arena lookup.
-        crate::gc_hook::try_gc_write_barrier_managed(array as *mut u8);
-        // The barrier may wait behind a foreign collection. Reload the array
-        // as well as the value before the store: RPython's setarrayitem_gc
-        // keeps both live across the barrier.
-        let array = _roots.get(root_base) as *mut Self;
-        let value = _roots.get(root_base + 1);
-        unsafe { (*array).items_mut_ptr().add(index).write(value) };
+        // incminimark.py `write_barrier` / `remember_young_pointer`:
+        // append to `old_objects_pointing_to_young` and clear
+        // `TRACK_YOUNG_PTRS`. That helper is not a collection point;
+        // `setarrayitem_gc` does not `push_roots` around it. A pin here
+        // used to wait on `try_gc_current_object_address` and consume
+        // the birth remembered-set entry mid-fill, after which later
+        // stores took the no-barrier arm.
+        crate::gc_hook::try_gc_write_barrier_managed(self as *mut Self as *mut u8);
+        unsafe { self.items_mut_ptr().add(index).write(value) };
+    }
+
+    /// Atomic load of slot `index`. The lazy `co_consts_w` first-fill
+    /// pairs this with [`Self::compare_exchange_ref`].
+    #[inline]
+    pub fn load_atomic(&self, index: usize, order: Ordering) -> PyObjectRef {
+        assert!(index < self.len);
+        self.item_atomic_ptr(index).load(order)
+    }
+
+    /// Remember the array, then CAS slot `index`. The barrier is
+    /// `remember_young_pointer` and is not a collection point; it runs
+    /// before the publish so a concurrent minor that already holds the
+    /// table in the remembered set still traces the new young child.
+    #[inline]
+    pub fn compare_exchange_ref(
+        &self,
+        index: usize,
+        current: PyObjectRef,
+        new: PyObjectRef,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<PyObjectRef, PyObjectRef> {
+        assert!(index < self.len);
+        if !new.is_null() {
+            let header = unsafe { majit_gc::header::header_of(self as *const Self as usize) };
+            if unsafe { (*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
+                if unsafe { (*header).is_forwarded() } {
+                    stale_array_abort(self as *const Self as usize, index);
+                }
+                crate::gc_hook::try_gc_write_barrier_managed(self as *const Self as *mut u8);
+            }
+        }
+        self.item_atomic_ptr(index)
+            .compare_exchange(current, new, success, failure)
+    }
+
+    #[inline]
+    fn item_atomic_ptr(&self, index: usize) -> &AtomicPtr<PyObject> {
+        unsafe { &*self.items_ptr().add(index).cast::<AtomicPtr<PyObject>>() }
     }
 
     pub fn to_vec(&self) -> Vec<PyObjectRef> {
@@ -1368,6 +1505,29 @@ impl IndexMut<usize> for FixedObjectArray {
     }
 }
 
+fn mro_block_layout(len: usize) -> Layout {
+    Layout::from_size_align(
+        FIXED_ARRAY_ITEMS_OFFSET + len * std::mem::size_of::<PyObjectRef>(),
+        std::mem::align_of::<FixedObjectArray>(),
+    )
+    .expect("mro block layout")
+}
+
+/// Free an [`alloc_mro_block_gc`] block. A GC-owned block is the collector's;
+/// only the no-hook `std::alloc` fallback is returned to the allocator. No-op
+/// on null.
+/// # Safety
+/// `block` is null or a block [`alloc_mro_block_gc`] returned, not yet freed.
+pub unsafe fn dealloc_mro_block(block: *mut FixedObjectArray) {
+    if block.is_null() || crate::gc_hook::try_gc_owns_object(block as *mut u8) {
+        return;
+    }
+    unsafe {
+        let len = (*block).len;
+        std_dealloc_gc_array(block as *mut u8, mro_block_layout(len));
+    }
+}
+
 /// Allocate a fixed-length `FixedObjectArray` GcArray pre-filled from
 /// `values`, for `W_TypeObject.mro_w` (typeobject.py `mro_w?[*]`, an
 /// immutable `[W_Root]`). The block is `PY_OBJECT_ARRAY_GC_TYPE_ID`
@@ -1396,16 +1556,12 @@ pub unsafe fn alloc_mro_block_gc(values: &[PyObjectRef]) -> *mut FixedObjectArra
     let block = if !raw.is_null() {
         raw as *mut FixedObjectArray
     } else {
-        // Bootstrap / no-hook fallback: a plain `std::alloc` block. It carries
-        // no GcHeader (the collector never observes it — `try_gc_owns_object`
-        // reports false), matching the mapdict-storage fallback contract.
-        let layout = Layout::from_size_align(payload, std::mem::align_of::<FixedObjectArray>())
-            .expect("mro block layout");
-        let mem = unsafe { alloc(layout) };
-        if mem.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        mem as *mut FixedObjectArray
+        // Bootstrap / no-hook fallback: a header-prefixed `std::alloc` block
+        // ([`std_alloc_gc_array`]); the collector does not own it.
+        let layout = mro_block_layout(len);
+        (unsafe { std_alloc_gc_array(layout, false) })
+            .unwrap_or_else(|| std::alloc::handle_alloc_error(layout))
+            as *mut FixedObjectArray
     };
     // The ownership question runs before the elements are written rather than
     // between them and the barrier — see `alloc_list_items_block_gc`.  This
@@ -1697,6 +1853,26 @@ pub fn gcarray_len(array: *const GcTypedArray) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `std_gc_array_size` accepts exactly the sizes `Layout::from_size_align`
+    /// accepts at the header's alignment, so `std_gc_array_layout` never
+    /// reaches its `expect` for an accepted size.
+    #[test]
+    fn std_gc_array_size_matches_layout_bound() {
+        let payload = Layout::from_size_align(24, 8).unwrap();
+        assert_eq!(std_gc_array_size(payload), Some(GC_ARRAY_HEADER_SIZE + 24));
+        assert_eq!(
+            std_gc_array_layout(GC_ARRAY_HEADER_SIZE + 24),
+            Layout::from_size_align(GC_ARRAY_HEADER_SIZE + 24, GC_ARRAY_HEADER_ALIGN).unwrap()
+        );
+        let bound = isize::MAX as usize - (GC_ARRAY_HEADER_ALIGN - 1);
+        let fits = Layout::from_size_align(bound - GC_ARRAY_HEADER_SIZE, 8).unwrap();
+        assert_eq!(std_gc_array_size(fits), Some(bound));
+        assert!(Layout::from_size_align(bound, GC_ARRAY_HEADER_ALIGN).is_ok());
+        let over = Layout::from_size_align(bound - GC_ARRAY_HEADER_SIZE + 1, 1).unwrap();
+        assert_eq!(std_gc_array_size(over), None);
+        assert!(Layout::from_size_align(bound + 1, GC_ARRAY_HEADER_ALIGN).is_err());
+    }
 
     #[test]
     fn gc_typed_array_ref_roundtrip() {

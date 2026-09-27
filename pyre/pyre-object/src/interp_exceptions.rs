@@ -1153,12 +1153,11 @@ pub fn rlist_new(items: Vec<PyObjectRef>) -> PyObjectRef {
         let _ = crate::gc_roots::pin_root(item);
     }
     let n = items.len();
-    let rooted: Vec<PyObjectRef> = (0..n)
-        .map(|i| crate::gc_roots::shadow_stack_get(items_base + i))
-        .collect();
     // Exact-size `malloc(LIST.items.TO, length)`, including 0.
     // `alloc_list_items_block_gc` would clamp empty to `cap.max(1)`.
-    let block = unsafe { crate::object_array::alloc_tuple_items_block_gc(&rooted) };
+    // Fill from the pinned slots, not a Vec snapshot — the block malloc
+    // can collect (`alloc_tuple_items_block_gc`, `w_tuple_new_array_backed`).
+    let block = unsafe { crate::object_array::alloc_tuple_items_block_gc(items_base, n) };
     // `alloc_tuple_items_block_gc` roots the block only inside its own
     // frame, which it pops on return. The header malloc below is a
     // safepoint, so pin the block here and reload it after — the same

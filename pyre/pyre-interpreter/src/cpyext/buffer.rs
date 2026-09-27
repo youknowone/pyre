@@ -382,6 +382,7 @@ fn acquire(
     let carrier = pyre_object::memoryview::bufferview_alloc(built);
     unsafe { pyre_object::memoryview::w_memoryview_set_view(mv, carrier) };
     record_export(carrier as usize, view);
+    unsafe { crate::builtins::memoryview_register_finalizer(mv) };
     Ok(mv)
 }
 

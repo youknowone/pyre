@@ -212,16 +212,13 @@ pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -
     // to mark-sweep. The `w_doc`/`w_name` setters already carry the write
     // barrier (`set_doc`/`set_name`).
     let _roots = crate::gc_roots::push_roots();
-    let save_point = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(fget);
-    let _ = crate::gc_roots::pin_root(fset);
-    let _ = crate::gc_roots::pin_root(fdel);
+    let save_point = crate::gc_roots::pin_roots(&[fget, fset, fdel]);
     let header = PyObject {
         ob_type: &PROPERTY_TYPE as *const PyType,
         w_class: get_instantiate(&PROPERTY_TYPE),
     };
     let raw =
-        crate::gc_hook::try_gc_alloc_stable_raw(W_PROPERTY_GC_TYPE_ID, W_PROPERTY_OBJECT_SIZE);
+        crate::gc_hook::try_gc_alloc_nursery_raw(W_PROPERTY_GC_TYPE_ID, W_PROPERTY_OBJECT_SIZE);
     let fget = crate::gc_roots::shadow_stack_get(save_point);
     let fset = crate::gc_roots::shadow_stack_get(save_point + 1);
     let fdel = crate::gc_roots::shadow_stack_get(save_point + 2);

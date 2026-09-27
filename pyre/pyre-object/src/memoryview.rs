@@ -49,8 +49,9 @@ pub struct W_MemoryView {
     pub restricted: bool,
     /// `owns_export` (`memoryobject.py`).  True for a view built directly over
     /// an exporter (holds one `_exports` count on the backing); false for a
-    /// slice or a copy that shares the original's export.  Only an owning view
-    /// releases the underlying export.
+    /// derived view (slice, copy, cast, `toreadonly`), which `memoryobject.py`
+    /// builds as `W_MemoryView(view, owns_export=False)` and which shares the
+    /// original's export.  Only an owning view releases the underlying export.
     pub owns_export: bool,
 }
 
@@ -101,12 +102,15 @@ pub fn w_memoryview_alloc_header(released: bool, owns_export: bool) -> PyObjectR
         restricted: false,
         owns_export,
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         <W_MemoryView as crate::lltype::GcType>::type_id(),
         <W_MemoryView as crate::lltype::GcType>::SIZE,
     );
     if !raw.is_null() {
         unsafe { std::ptr::write(raw as *mut W_MemoryView, payload) };
+        // Nursery-full spill lands in old-gen with TRACK_YOUNG_PTRS still
+        // set (`spill_to_oldgen_or_null`). `w_class` is an old-gen type.
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     } else {
         crate::lltype::malloc_typed(payload) as PyObjectRef
@@ -346,7 +350,7 @@ pub unsafe fn w_memoryview_set_hash(obj: PyObjectRef, hash: i64) {
 }
 
 /// `owns_export` — whether this view holds an `_exports` count on its backing
-/// (true for a root view over an exporter, false for a slice / copy).
+/// (true for a root view over an exporter, false for a derived view).
 ///
 /// # Safety
 /// `obj` must point to a valid `W_MemoryView`.

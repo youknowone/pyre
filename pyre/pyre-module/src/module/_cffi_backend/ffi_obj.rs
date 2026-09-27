@@ -1177,11 +1177,12 @@ fn ffi_getwinerror(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     }
 }
 
-static FFI_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static FFI_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `_cffi_backend.FFI`.
 pub fn ffi_type_object() -> PyObjectRef {
-    *FFI_TYPE_OBJ.get_or_init(|| {
+    FFI_TYPE_OBJ.get_or_init(|| {
         let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend.FFI",
             init_ffi_type,
@@ -1192,8 +1193,8 @@ pub fn ffi_type_object() -> PyObjectRef {
             unsafe { &*<W_FFIObject as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,
         );
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 /// `W_FFIObject.descr_*.__doc__` — `interp2app` publishes these literals on

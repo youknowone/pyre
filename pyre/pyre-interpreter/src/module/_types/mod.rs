@@ -1,12 +1,6 @@
 //! `_types` native type-object exports.
 
 use pyre_object::*;
-#[cfg(not(all(
-    feature = "cpyext",
-    not(feature = "sandbox"),
-    any(target_os = "macos", target_os = "linux")
-)))]
-use std::sync::OnceLock;
 
 fn store(ns: PyObjectRef, name: &str, ty: PyObjectRef) {
     crate::module_ns_store(ns, name, ty);
@@ -30,8 +24,9 @@ fn capsule_type() -> PyObjectRef {
 /// can produce none: `PyCapsule_Type` has no `tp_new` and no
 /// `Py_TPFLAGS_BASETYPE`, and a capsule only ever comes from `PyCapsule_New`.
 fn capsule_type() -> PyObjectRef {
-    static CAPSULE_TYPE: OnceLock<usize> = OnceLock::new();
-    *CAPSULE_TYPE.get_or_init(|| {
+    static CAPSULE_TYPE: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    CAPSULE_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("PyCapsule", |ns| unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
@@ -47,8 +42,8 @@ fn capsule_type() -> PyObjectRef {
             pyre_object::w_type_set_disallow_instantiation(tp);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 pub fn init(ns: PyObjectRef) -> Result<(), crate::PyError> {

@@ -181,6 +181,23 @@ unsafe fn digits_item(digits: *mut TypedItemsBlock, x: i64) -> *mut Digit {
     }
 }
 
+/// Copy `digits` into a freshly allocated block. An empty source writes the
+/// `NULLDIGIT` sentinel that `rbigint.__init__` stores for `NULLDIGITS`.
+unsafe fn fill_digit_block(block: *mut TypedItemsBlock, digits: &[Digit]) {
+    unsafe {
+        let base = typed_items_block_items_base(block) as *mut Digit;
+        if digits.is_empty() {
+            *base = NULLDIGIT;
+        } else {
+            let mut i = 0;
+            while i < digits.len() {
+                *base.add(i) = digits[i];
+                i += 1;
+            }
+        }
+    }
+}
+
 pub const NULLDIGIT: Digit = 0;
 pub const ONEDIGIT: Digit = 1;
 
@@ -593,6 +610,14 @@ impl RBigInt {
     }
 
     /// rbigint.py `__init__(digits=NULLDIGITS, sign=0, size=0)`.
+    ///
+    /// Adopts `digits` by copying them into a fresh `Digits::new` block.
+    /// `digits` must not alias another bigint's GcArray: that allocation
+    /// can collect and move the source under this slice. Aliasing callers
+    /// use [`RBigInt::new_from_rooted`] so the source handle is re-read
+    /// after the malloc, the way the translator keeps the source on the
+    /// shadow stack. Stack arrays (`fromint`, 1-2 digit `mul` results)
+    /// stay valid across the allocation and pay no heap copy.
     pub fn new(digits: &[Digit], sign: i64, size: i64) -> Self {
         // Upstream calls `_check_digits` only under
         // `if not we_are_translated()`.  The translated constructor relies on
@@ -602,16 +627,31 @@ impl RBigInt {
         let logical_len = if size == 0 { digits.len() as i64 } else { size };
         let block = unsafe { Digits::new(digits.len().max(1)) };
         unsafe {
-            let base = typed_items_block_items_base(block) as *mut Digit;
-            if digits.is_empty() {
-                *base = NULLDIGIT;
-            } else {
-                let mut i = 0;
-                while i < digits.len() {
-                    *base.add(i) = digits[i];
-                    i += 1;
-                }
-            }
+            fill_digit_block(block, digits);
+        }
+        Self {
+            _digits: block,
+            _size: logical_len * sign,
+        }
+    }
+
+    /// `rbigint.__init__` over a slice of a live source whose `_digits`
+    /// slot is already on the shadow stack. `Digits::new` may collect;
+    /// the range is re-derived from `src` afterwards.
+    fn new_from_rooted(
+        src: &RBigIntGcRoot,
+        start: usize,
+        end: usize,
+        sign: i64,
+        size: i64,
+    ) -> Self {
+        debug_assert!(size >= 0);
+        debug_assert!(start <= end);
+        let len = end - start;
+        let logical_len = if size == 0 { len as i64 } else { size };
+        let block = unsafe { Digits::new(len.max(1)) };
+        unsafe {
+            fill_digit_block(block, &src.digits()[start..end]);
         }
         Self {
             _digits: block,
@@ -631,16 +671,34 @@ impl RBigInt {
         let allocation_size = digits.len().max(1);
         let block = unsafe { Digits::try_new(allocation_size) }.ok_or(RBigIntError::Memory)?;
         unsafe {
-            let base = typed_items_block_items_base(block) as *mut Digit;
-            if digits.is_empty() {
-                *base = NULLDIGIT;
-            } else {
-                let mut i = 0;
-                while i < digits.len() {
-                    *base.add(i) = digits[i];
-                    i += 1;
-                }
-            }
+            fill_digit_block(block, digits);
+        }
+        Ok(Self {
+            _digits: block,
+            _size: logical_len.checked_mul(sign).ok_or(RBigIntError::Memory)?,
+        })
+    }
+
+    /// Fallible [`RBigInt::new_from_rooted`].
+    fn try_new_from_rooted(
+        src: &RBigIntGcRoot,
+        start: usize,
+        end: usize,
+        sign: i64,
+        size: i64,
+    ) -> Result<Self, RBigIntError> {
+        debug_assert!(size >= 0);
+        debug_assert!(start <= end);
+        let len = end - start;
+        let logical_len = if size == 0 {
+            i64::try_from(len).map_err(|_| RBigIntError::Memory)?
+        } else {
+            size
+        };
+        let allocation_size = len.max(1);
+        let block = unsafe { Digits::try_new(allocation_size) }.ok_or(RBigIntError::Memory)?;
+        unsafe {
+            fill_digit_block(block, &src.digits()[start..end]);
         }
         Ok(Self {
             _digits: block,
@@ -661,31 +719,53 @@ impl RBigInt {
         }
     }
 
-    /// `[NULLDIGIT] * size` with the GC-transform livevars that
-    /// `gct_fv_gc_malloc` publishes across that malloc.  Reloads `a` and `b`
-    /// from the root span after a moving collection.
-    fn with_size_reloading_operands<'a>(
+    /// `[NULLDIGIT] * size` with operand `_digits` as stack livevars.
+    ///
+    /// The digit-array malloc is the only collecting step; the subsequent
+    /// fill loop only stores into that array. `a`/`b` are by-value handles —
+    /// their addresses are not GC object starts — so the livevars are the
+    /// `GcArray(Signed)` bodies. Reload `_digits` after the malloc and return
+    /// a plain handle for the result; an owner-root `Deref` on every digit
+    /// store is not a livevar.
+    fn with_size_livevars(size: i64, sign: i64, a: &mut RBigInt, b: &mut RBigInt) -> Self {
+        debug_assert!(size >= 0);
+        let mut roots = [majit_ir::GcRef::NULL; 2];
+        Self::with_size_reloading_digits(size, sign, a, b, &mut roots)
+    }
+
+    fn with_size_reloading_digits(
         size: i64,
         sign: i64,
-        a: &mut &'a RBigInt,
-        b: &mut &'a RBigInt,
-        digit_roots: Option<&mut [majit_ir::GcRef]>,
+        a: &mut RBigInt,
+        b: &mut RBigInt,
+        roots: &mut [majit_ir::GcRef],
     ) -> Self {
-        debug_assert!(size >= 0);
-        if let Some(roots) = digit_roots {
-            debug_assert!(roots.len() >= 2);
-            roots[0] = majit_ir::GcRef((*a as *const RBigInt) as usize);
-            roots[1] = majit_ir::GcRef((*b as *const RBigInt) as usize);
-            let block = unsafe { Digits::alloc_and_set_zero_rooted(size as usize, roots) };
-            *a = unsafe { &*(roots[0].0 as *const RBigInt) };
-            *b = unsafe { &*(roots[1].0 as *const RBigInt) };
-            Self {
-                _digits: block,
-                _size: size * sign,
-            }
-        } else {
-            Self::with_size(size, sign)
+        debug_assert!(roots.len() >= 2);
+        roots[0] = majit_ir::GcRef(a._digits as usize);
+        roots[1] = majit_ir::GcRef(b._digits as usize);
+        let block = unsafe { Digits::alloc_and_set_zero_rooted(size as usize, roots) };
+        a._digits = roots[0].0 as *mut _;
+        b._digits = roots[1].0 as *mut _;
+        Self {
+            _digits: block,
+            _size: size * sign,
         }
+    }
+
+    /// Host livevars for `[NULLDIGIT] * size` while two operand handles stay
+    /// live across it and across later collecting calls. The owner-root slots
+    /// keep each handle's `_digits` edge, which is what `gct_fv_gc_malloc`
+    /// reloads into `a`/`b` after that malloc.
+    fn with_size_keeping_handles(
+        size: i64,
+        sign: i64,
+        a: &RBigInt,
+        b: &RBigInt,
+    ) -> (RBigIntGcRoot, RBigIntGcRoot, RBigIntGcRoot) {
+        let a_hold = live_rbigint(a);
+        let b_hold = live_rbigint(b);
+        let z = RBigIntGcRoot::new(Self::with_size(size, sign));
+        (a_hold, b_hold, z)
     }
 
     /// The explicit Rust form of RPython's implicit `gc_malloc_array`
@@ -950,10 +1030,11 @@ impl RBigInt {
         if byteorder != "big" && byteorder != "little" {
             return Err(RBigIntError::InvalidEndianness);
         }
+        let is_big = byteorder == "big";
         if bytes.is_empty() {
             return Ok(Self::zero());
         }
-        let msb = if byteorder == "big" {
+        let msb = if is_big {
             bytes[0]
         } else {
             bytes[bytes.len() - 1]
@@ -978,7 +1059,7 @@ impl RBigInt {
 
         let mut i = 0;
         while i < bytes.len() {
-            let byte = if byteorder == "big" {
+            let byte = if is_big {
                 bytes[bytes.len() - 1 - i]
             } else {
                 bytes[i]
@@ -1003,10 +1084,13 @@ impl RBigInt {
             result.setdigit_uwidedigit(out, accum);
             out += 1;
         }
-        // `digits[:]` in rbigint.py discards the temporary list's spare
-        // capacity.  Keeping `max_digits` as the final GcArray capacity makes
-        // the translated storage shape depend on a reservation detail.
-        result = Self::try_new(&result.digits()[..out as usize], sign, out)?;
+        // `digits[:]` in rbigint.py `frombytes` discards the temporary
+        // list's spare capacity.  Keeping `max_digits` as the final
+        // GcArray capacity makes the translated storage shape depend on a
+        // reservation detail. The source handle stays rooted across the
+        // exact-length `Digits::new`.
+        let sourced = RBigIntGcRoot::new(result);
+        let mut result = Self::try_new_from_rooted(&sourced, 0, out as usize, sign, out)?;
         result._normalize();
         Ok(result)
     }
@@ -1258,7 +1342,9 @@ impl RBigInt {
     #[majit_macros::jit_elidable]
     pub fn int_eq(&self, iother: i64) -> bool {
         if !int_in_valid_range(iother) {
-            return self.eq(&Self::fromint(iother));
+            let this = live_rbigint(self);
+            let other = Self::fromint(iother);
+            return this.eq(&other);
         }
         if self.numdigits() > 1 {
             return false;
@@ -1310,7 +1396,9 @@ impl RBigInt {
     #[majit_macros::jit_elidable]
     pub fn int_lt(&self, iother: i64) -> bool {
         if !int_in_valid_range(iother) {
-            return self.lt(&Self::fromint(iother));
+            let this = live_rbigint(self);
+            let other = Self::fromint(iother);
+            return this.lt(&other);
         }
         _x_int_lt(self, iother, false)
     }
@@ -1323,7 +1411,9 @@ impl RBigInt {
     #[inline]
     pub fn int_le(&self, iother: i64) -> bool {
         if !int_in_valid_range(iother) {
-            return self.le(&Self::fromint(iother));
+            let this = live_rbigint(self);
+            let other = Self::fromint(iother);
+            return this.le(&other);
         }
         _x_int_lt(self, iother, true)
     }
@@ -1355,14 +1445,6 @@ impl RBigInt {
 
     #[majit_macros::jit_elidable]
     pub fn add(&self, other: &Self) -> Self {
-        self.add_with_gc_roots(other, None)
-    }
-
-    /// The body of `rbigint.add`, with the optional live-root vector inserted
-    /// by RPython's GC transform around the digit-list malloc.  Ordinary Rust
-    /// callers take the source-shaped `None` arm; GC-payload residuals supply
-    /// the transformed graph's roots through `rbigint::gc`.
-    fn add_with_gc_roots(&self, other: &Self, digit_roots: Option<&mut [majit_ir::GcRef]>) -> Self {
         let selfsign = self.get_sign();
         let othersign = other.get_sign();
         if selfsign == 0 {
@@ -1372,9 +1454,9 @@ impl RBigInt {
             return self.translated_alias();
         }
         let mut result = if selfsign == othersign {
-            _x_add(self, other, digit_roots)
+            _x_add(self, other)
         } else {
-            _x_sub(other, self, digit_roots)
+            _x_sub(other, self)
         };
         result._set_sign(result.get_sign() * othersign);
         result
@@ -1390,7 +1472,9 @@ impl RBigInt {
             return self.translated_alias();
         }
         if !int_in_valid_range(iother) {
-            return self.add(&Self::fromint(iother));
+            let this = live_rbigint(self);
+            let other = Self::fromint(iother);
+            return this.add(&other);
         }
 
         let othersign = intsign(iother);
@@ -1451,27 +1535,25 @@ impl RBigInt {
 
     #[majit_macros::jit_elidable]
     pub fn sub(&self, other: &Self) -> Self {
-        self.sub_with_gc_roots(other, None)
-    }
-
-    /// GC-transformed twin of `sub`, for the residual payload boundary.
-    fn sub_with_gc_roots(&self, other: &Self, digit_roots: Option<&mut [majit_ir::GcRef]>) -> Self {
         let selfsign = self.get_sign();
         let othersign = other.get_sign();
         if othersign == 0 {
             return self.translated_alias();
         }
         if selfsign == 0 {
-            return Self::new(
-                &other.digits()[..other.numdigits() as usize],
+            let other = live_rbigint(other);
+            return Self::new_from_rooted(
+                &other,
+                0,
+                other.numdigits() as usize,
                 -othersign,
                 other.numdigits(),
             );
         }
         let mut result = if selfsign == othersign {
-            _x_sub(self, other, digit_roots)
+            _x_sub(self, other)
         } else {
-            _x_add(self, other, digit_roots)
+            _x_add(self, other)
         };
         result._set_sign(result.get_sign() * selfsign);
         result
@@ -1481,7 +1563,9 @@ impl RBigInt {
     pub fn int_sub(&self, iother: i64) -> Self {
         let selfsign = self.get_sign();
         if !int_in_valid_range(iother) {
-            return self.sub(&Self::fromint(iother));
+            let this = live_rbigint(self);
+            let other = Self::fromint(iother);
+            return this.sub(&other);
         }
         if iother == 0 {
             return self.translated_alias();
@@ -1508,11 +1592,6 @@ impl RBigInt {
 
     #[majit_macros::jit_elidable]
     pub fn mul(&self, other: &Self) -> Self {
-        self.mul_with_gc_roots(other, None)
-    }
-
-    /// GC-transformed twin of `mul`, for the residual payload boundary.
-    fn mul_with_gc_roots(&self, other: &Self, digit_roots: Option<&mut [majit_ir::GcRef]>) -> Self {
         let mut this = self;
         let mut that = other;
         let mut selfsize = this.numdigits();
@@ -1531,8 +1610,11 @@ impl RBigInt {
         let mut result;
         if selfsize == 1 {
             if this.digit(0) == ONEDIGIT {
-                return Self::new(
-                    &that.digits()[..othersize as usize],
+                let that = live_rbigint(that);
+                return Self::new_from_rooted(
+                    &that,
+                    0,
+                    othersize as usize,
                     selfsign * othersign,
                     othersize,
                 );
@@ -1555,7 +1637,7 @@ impl RBigInt {
                     1,
                 );
             }
-            result = _x_mul(this, that, this.digit(0), digit_roots);
+            result = _x_mul(this, that, this.digit(0));
         } else if USE_KARATSUBA {
             let cutoff = if std::ptr::eq(this, that) {
                 KARATSUBA_SQUARE_CUTOFF
@@ -1563,12 +1645,12 @@ impl RBigInt {
                 KARATSUBA_CUTOFF
             };
             if selfsize <= cutoff {
-                result = _x_mul(this, that, 0, digit_roots);
+                result = _x_mul(this, that, 0);
             } else {
-                result = _k_mul(this, that, digit_roots);
+                result = _k_mul(this, that);
             }
         } else {
-            result = _x_mul(this, that, 0, digit_roots);
+            result = _x_mul(this, that, 0);
         }
         result._set_sign(selfsign * othersign);
         result
@@ -1577,7 +1659,9 @@ impl RBigInt {
     #[majit_macros::jit_elidable]
     pub fn int_mul(&self, iother: i64) -> Self {
         if !int_in_valid_range(iother) {
-            return self.mul(&Self::fromint(iother));
+            let this = live_rbigint(self);
+            let other = Self::fromint(iother);
+            return this.mul(&other);
         }
         let selfsign = self.get_sign();
         if selfsign == 0 || iother == 0 {
@@ -1590,11 +1674,8 @@ impl RBigInt {
             if othersign == 1 {
                 return self.translated_alias();
             }
-            return Self::new(
-                &self.digits()[..asize as usize],
-                selfsign * othersign,
-                asize,
-            );
+            let this = live_rbigint(self);
+            return Self::new_from_rooted(&this, 0, asize as usize, selfsign * othersign, asize);
         } else if asize == 1 {
             let res = self.uwidedigit(0) * digit as UWideDigit;
             let carry = res >> SHIFT;
@@ -1672,7 +1753,9 @@ impl RBigInt {
     #[majit_macros::jit_elidable]
     pub fn int_floordiv(&self, iother: i64) -> Result<Self, RBigIntError> {
         if !int_in_valid_range(iother) {
-            return self.floordiv(&Self::fromint(iother));
+            let this = live_rbigint(self);
+            let other = Self::fromint(iother);
+            return this.floordiv(&other);
         }
         if iother == 0 {
             return Err(RBigIntError::DivisionByZero);
@@ -1719,7 +1802,9 @@ impl RBigInt {
             return Ok(Self::zero());
         }
         if !int_in_valid_range(iother) {
-            return self.r#mod(&Self::fromint(iother));
+            let this = live_rbigint(self);
+            let other = Self::fromint(iother);
+            return this.r#mod(&other);
         }
 
         let digit = iother.abs();
@@ -1760,7 +1845,9 @@ impl RBigInt {
             return Ok(0);
         }
         if !int_in_valid_range(iother) {
-            return self.r#mod(&Self::fromint(iother))?.toint();
+            let this = live_rbigint(self);
+            let other = Self::fromint(iother);
+            return this.r#mod(&other)?.toint();
         }
 
         let digit = iother.abs();
@@ -1794,30 +1881,39 @@ impl RBigInt {
         if selfsign == 0 {
             return Ok((Self::zero(), Self::zero()));
         }
+        let this = live_rbigint(self);
+        let other = live_rbigint(other);
         if other.numdigits() == 1 && !(othersign == -1 && selfsign != othersign) {
             let otherint = other.digit(0) * othersign;
             debug_assert!(int_in_valid_range(otherint));
-            return self.int_divmod(otherint);
+            return this.int_divmod(otherint);
         }
         let div_limit = holder_limit(&HOLDER.DIV_LIMIT);
-        if self.numdigits() * 10 > other.numdigits() * 12 && other.numdigits() > div_limit * 2 {
-            let result = divmod_big(self, other)?;
-            debug_assert!(result.0.mul(other).add(&result.1).eq(self));
-            return Ok(result);
+        if this.numdigits() * 10 > other.numdigits() * 12 && other.numdigits() > div_limit * 2 {
+            let (div, modulo) = divmod_big(&this, &other)?;
+            // The check's `mul` and `add` collect.
+            let div = RBigIntGcRoot::new(div);
+            let modulo = RBigIntGcRoot::new(modulo);
+            debug_assert!(div.mul(&other).add(&modulo).eq(&this));
+            return Ok((div.translated_alias(), modulo.translated_alias()));
         }
-        self._divmod_small(other)
+        this._divmod_small(&other)
     }
 
     fn _divmod_small(&self, other: &Self) -> Result<(Self, Self), RBigIntError> {
-        let (mut div, mut modulo) = _divrem(self, other)?;
+        let this = live_rbigint(self);
+        let other = live_rbigint(other);
+        let (div, modulo) = _divrem(&this, &other)?;
+        let mut div = RBigIntGcRoot::new(div);
+        let mut modulo = RBigIntGcRoot::new(modulo);
         if modulo.get_sign() * other.get_sign() == -1 {
-            modulo = modulo.add(other);
+            modulo = RBigIntGcRoot::new(modulo.add(&other));
             if div.get_sign() == 0 {
-                return Ok((Self::negative_one(), modulo));
+                return Ok((Self::negative_one(), (*modulo).clone()));
             }
-            div = div.int_sub(1);
+            div = RBigIntGcRoot::new(div.int_sub(1));
         }
-        Ok((div, modulo))
+        Ok(((*div).clone(), (*modulo).clone()))
     }
 
     #[majit_macros::jit_elidable]
@@ -1828,10 +1924,13 @@ impl RBigInt {
         let selfsign = self.get_sign();
         let othersign = intsign(iother);
         if !int_in_valid_range(iother) || (othersign == -1 && selfsign != othersign) {
-            return self.divmod(&Self::fromint(iother));
+            let this = live_rbigint(self);
+            let other = Self::fromint(iother);
+            return this.divmod(&other);
         }
         let digit = iother.abs();
-        let (mut div, rem) = _divrem1(self, digit);
+        let (div, rem) = _divrem1(self, digit);
+        let mut div = RBigIntGcRoot::new(div);
         if div._size != 0 {
             div._set_sign(selfsign * othersign);
         }
@@ -1842,12 +1941,13 @@ impl RBigInt {
         if rem != 0 && selfsign * othersign == -1 {
             rem += iother;
             if div.get_sign() == 0 {
-                div = Self::negative_one();
+                div = RBigIntGcRoot::new(Self::negative_one());
             } else {
-                div = div.int_sub(1);
+                div = RBigIntGcRoot::new(div.int_sub(1));
             }
         }
-        Ok((div, Self::fromint(rem)))
+        let rem = Self::fromint(rem);
+        Ok(((*div).clone(), rem))
     }
 
     #[majit_macros::jit_elidable]
@@ -1862,24 +1962,27 @@ impl RBigInt {
             });
         }
 
-        let modulus_owned;
+        // Root every handle this graph rereads after `neg` / `r#mod` /
+        // `_help_mult`. Those are `Digits::new` (`collect_and_reserve`).
+        let this = live_rbigint(self);
+        let other = live_rbigint(other);
+
         let mut negative_output = false;
-        let modulus = if let Some(modulus) = modulus {
+        let modulus_root = if let Some(modulus) = modulus {
             let modulussign = modulus.get_sign();
             if modulussign == 0 {
                 return Err(RBigIntError::ZeroModulus);
             }
-            if modulussign < 0 {
+            Some(if modulussign < 0 {
                 negative_output = true;
-                modulus_owned = modulus.neg();
-                Some(&modulus_owned)
+                RBigIntGcRoot::new(modulus.neg())
             } else {
-                Some(modulus)
-            }
+                live_rbigint(modulus)
+            })
         } else {
             None
         };
-        if let Some(modulus) = modulus {
+        if let Some(modulus) = modulus_root.as_ref() {
             if modulus.numdigits() == 1 && modulus.digit(0) == ONEDIGIT {
                 return Ok(Self::zero());
             }
@@ -1889,20 +1992,21 @@ impl RBigInt {
             return Ok(Self::zero());
         }
 
-        let base_owned;
-        let base = if let Some(modulus) = modulus {
-            if selfsign < 0 || self.numdigits() > modulus.numdigits() {
-                base_owned = self.r#mod(modulus)?;
-                &base_owned
+        // Keep `base` as a guard, not `&*this`. A `&RBigInt` taken out of the
+        // cell is not reloaded after the next collecting `_help_mult`.
+        let base_owned = if let Some(modulus) = modulus_root.as_ref() {
+            if selfsign < 0 || this.numdigits() > modulus.numdigits() {
+                Some(RBigIntGcRoot::new(this.r#mod(modulus)?))
             } else {
-                self
+                None
             }
         } else {
-            self
+            None
         };
+        let base: &RBigIntGcRoot = base_owned.as_ref().unwrap_or(&this);
 
         let mut size_b = other.numdigits();
-        if modulus.is_none() && size_b == 1 {
+        if modulus_root.is_none() && size_b == 1 {
             let digit = other.digit(0);
             if digit == ONEDIGIT {
                 return Ok(base.translated_alias());
@@ -1930,25 +2034,27 @@ impl RBigInt {
             }
         }
 
-        let mut z = Self::one();
+        let mut z = RBigIntGcRoot::new(Self::one());
         if size_b <= FIVEARY_CUTOFF {
             while size_b > 0 {
                 size_b -= 1;
                 let bi = other.udigit(size_b);
                 let mut j = 1_u64 << (SHIFT - 1);
                 while j != 0 {
-                    z = _help_mult(&z, &z, modulus)?;
+                    z = RBigIntGcRoot::new(_help_mult(&z, &z, modulus_root.as_deref())?);
                     if bi & j != 0 {
-                        z = _help_mult(&z, base, modulus)?;
+                        z = RBigIntGcRoot::new(_help_mult(&z, base, modulus_root.as_deref())?);
                     }
                     j >>= 1;
                 }
             }
         } else {
-            let mut table: [RBigInt; 32] = std::array::from_fn(|_| Self::one());
+            let mut table: [RBigIntGcRoot; 32] =
+                std::array::from_fn(|_| RBigIntGcRoot::new(Self::one()));
             let mut i = 1;
             while i < 32 {
-                table[i] = _help_mult(&table[i - 1], base, modulus)?;
+                table[i] =
+                    RBigIntGcRoot::new(_help_mult(&table[i - 1], base, modulus_root.as_deref())?);
                 i += 1;
             }
             const JMAPPING: [i32; 5] = [0, 2, 4, 1, 3];
@@ -1971,19 +2077,29 @@ impl RBigInt {
                 }
                 let mut k = 0;
                 while k < 5 {
-                    z = _help_mult(&z, &z, modulus)?;
+                    z = RBigIntGcRoot::new(_help_mult(&z, &z, modulus_root.as_deref())?);
                     k += 1;
                 }
                 if index != 0 {
-                    z = _help_mult(&z, &table[index as usize], modulus)?;
+                    z = RBigIntGcRoot::new(_help_mult(
+                        &z,
+                        &table[index as usize],
+                        modulus_root.as_deref(),
+                    )?);
                 }
             }
             debug_assert_eq!(j, -5);
         }
         if negative_output && z.get_sign() != 0 {
-            z = z.sub(modulus.expect("negative modulus was normalized"));
+            z = RBigIntGcRoot::new(
+                z.sub(
+                    modulus_root
+                        .as_ref()
+                        .expect("negative modulus was normalized"),
+                ),
+            );
         }
-        Ok(z)
+        Ok(z.translated_alias())
     }
 
     #[majit_macros::jit_elidable]
@@ -1999,24 +2115,23 @@ impl RBigInt {
 
         let selfsign = self.get_sign();
         debug_assert!(iother >= 0);
-        let modulus_owned;
-        let modulus = if let Some(modulus) = modulus {
+        let this = live_rbigint(self);
+        let modulus_root = if let Some(modulus) = modulus {
             let modulussign = modulus.get_sign();
             if modulussign == 0 {
                 return Err(RBigIntError::ZeroModulus);
             }
-            if modulussign < 0 {
+            Some(if modulussign < 0 {
                 negative_output = true;
-                modulus_owned = modulus.neg();
-                Some(&modulus_owned)
+                RBigIntGcRoot::new(modulus.neg())
             } else {
-                Some(modulus)
-            }
+                live_rbigint(modulus)
+            })
         } else {
             None
         };
 
-        if let Some(modulus) = modulus {
+        if let Some(modulus) = modulus_root.as_ref() {
             if modulus.numdigits() == 1 && modulus.digit(0) == ONEDIGIT {
                 return Ok(Self::zero());
             }
@@ -2025,9 +2140,9 @@ impl RBigInt {
         } else if selfsign == 0 {
             return Ok(Self::zero());
         } else if iother == 1 {
-            return Ok(self.translated_alias());
-        } else if self.numdigits() == 1 {
-            let adigit = self.udigit(0);
+            return Ok(this.translated_alias());
+        } else if this.numdigits() == 1 {
+            let adigit = this.udigit(0);
             if adigit == 1 {
                 return Ok(if selfsign == -1 && iother & 1 != 0 {
                     Self::negative_one()
@@ -2042,7 +2157,7 @@ impl RBigInt {
                     .and_then(|value| value.checked_add(exponent_minus_one))
                     .and_then(|value| i64::try_from(value).ok())
                     .ok_or(RBigIntError::Memory)?;
-                let mut ret = self.lshift(shift)?;
+                let mut ret = this.lshift(shift)?;
                 if selfsign == -1 && iother & 1 == 0 {
                     ret._set_sign(1);
                 }
@@ -2050,32 +2165,37 @@ impl RBigInt {
             }
         }
 
-        let base_owned;
-        let base = if let Some(modulus) = modulus {
-            if selfsign < 0 || self.numdigits() > modulus.numdigits() {
-                base_owned = self.r#mod(modulus)?;
-                &base_owned
+        let base_owned = if let Some(modulus) = modulus_root.as_ref() {
+            if selfsign < 0 || this.numdigits() > modulus.numdigits() {
+                Some(RBigIntGcRoot::new(this.r#mod(modulus)?))
             } else {
-                self
+                None
             }
         } else {
-            self
+            None
         };
+        let base: &RBigIntGcRoot = base_owned.as_ref().unwrap_or(&this);
 
-        let mut z = Self::one();
+        let mut z = RBigIntGcRoot::new(Self::one());
         let mut j = 1_i64 << 62;
         while j != 0 {
-            z = _help_mult(&z, &z, modulus)?;
+            z = RBigIntGcRoot::new(_help_mult(&z, &z, modulus_root.as_deref())?);
             if iother & j != 0 {
-                z = _help_mult(&z, base, modulus)?;
+                z = RBigIntGcRoot::new(_help_mult(&z, base, modulus_root.as_deref())?);
             }
             j >>= 1;
         }
 
         if negative_output && z.get_sign() != 0 {
-            z = z.sub(modulus.expect("negative modulus was normalized"));
+            z = RBigIntGcRoot::new(
+                z.sub(
+                    modulus_root
+                        .as_ref()
+                        .expect("negative modulus was normalized"),
+                ),
+            );
         }
-        Ok(z)
+        Ok(z.translated_alias())
     }
 
     #[majit_macros::jit_elidable]
@@ -2116,31 +2236,36 @@ impl RBigInt {
         }
         let mut wordshift = int_other / SHIFT;
         let remshift = int_other % SHIFT;
+        let this = live_rbigint(self);
         if remshift == 0 {
-            let newsize = self
+            let newsize = this
                 .numdigits()
                 .checked_add(wordshift)
                 .ok_or(RBigIntError::Memory)?;
             let mut result = Self::try_with_size(newsize, selfsign)?;
+            // Past the last collecting call: read digits through a plain handle.
+            let this: &RBigInt = &this;
             let mut i = 0;
-            while i < self.numdigits() {
-                result.setdigit(wordshift + i, self.digit(i));
+            while i < this.numdigits() {
+                result.setdigit(wordshift + i, this.digit(i));
                 i += 1;
             }
             return Ok(result);
         }
 
         let hishift = SHIFT - remshift;
-        let oldsize = self.numdigits();
+        let oldsize = this.numdigits();
         let mut newsize = oldsize
             .checked_add(wordshift)
             .and_then(|size| size.checked_add(1))
             .ok_or(RBigIntError::Memory)?;
         let mut z = Self::try_with_size(newsize, selfsign)?;
+        // Past the last collecting call: read digits through a plain handle.
+        let this: &RBigInt = &this;
         let mut j = 0;
         let mut prevdigit = 0_u64;
         while j < oldsize {
-            let digit = self.udigit(j);
+            let digit = this.udigit(j);
             let newdigit = (digit << remshift) | (prevdigit >> hishift);
             z.setdigit_udigit(wordshift, newdigit);
             prevdigit = digit;
@@ -2159,14 +2284,17 @@ impl RBigInt {
     #[inline]
     pub fn lqshift(&self, int_other: i64) -> Self {
         debug_assert!(int_other > 0 && int_other < SHIFT);
-        let oldsize = self.numdigits();
-        let selfsign = self.get_sign();
+        let this = live_rbigint(self);
+        let oldsize = this.numdigits();
+        let selfsign = this.get_sign();
         let mut z = Self::with_size(oldsize + 1, selfsign);
+        // Past the last collecting call: read digits through a plain handle.
+        let this: &RBigInt = &this;
         let hishift = SHIFT - int_other;
         let mut prevdigit = 0_u64;
         let mut i = 0;
         while i < oldsize {
-            let digit = self.udigit(i);
+            let digit = this.udigit(i);
             let newdigit = (digit << int_other) | (prevdigit >> hishift);
             z.setdigit_udigit(i, newdigit);
             prevdigit = digit;
@@ -2226,14 +2354,15 @@ impl RBigInt {
         } else if int_other == 0 {
             return Ok(self.translated_alias());
         }
-        let selfsign = self.get_sign();
+        let this = live_rbigint(self);
+        let selfsign = this.get_sign();
         if selfsign == -1 && !dont_invert {
-            let a = self.invert().rshift(int_other, false)?;
+            let a = this.invert().rshift(int_other, false)?;
             return Ok(a.invert());
         }
 
         let mut wordshift = int_other / SHIFT;
-        let newsize = self.numdigits() - wordshift;
+        let newsize = this.numdigits() - wordshift;
         if newsize <= 0 {
             return Ok(Self::zero());
         }
@@ -2241,11 +2370,13 @@ impl RBigInt {
         let loshift = int_other % SHIFT;
         let hishift = SHIFT - loshift;
         let mut z = Self::with_size(newsize, selfsign);
+        // Past the last collecting call: read digits through a plain handle.
+        let this: &RBigInt = &this;
         let mut i = 0;
         while i < newsize {
-            let mut newdigit = self.digit(wordshift) >> loshift;
+            let mut newdigit = this.digit(wordshift) >> loshift;
             if i + 1 < newsize {
-                newdigit |= self.digit(wordshift + 1).wrapping_shl(hishift as u32);
+                newdigit |= this.digit(wordshift + 1).wrapping_shl(hishift as u32);
             }
             z.setdigit(i, newdigit);
             i += 1;
@@ -2258,21 +2389,24 @@ impl RBigInt {
     #[majit_macros::jit_elidable]
     pub fn rqshift(&self, int_other: i64) -> Self {
         debug_assert!(int_other >= 0);
+        let this = live_rbigint(self);
         let mut wordshift = int_other / SHIFT;
         let loshift = int_other % SHIFT;
-        let newsize = self.numdigits() - wordshift;
+        let newsize = this.numdigits() - wordshift;
         if newsize <= 0 {
             return Self::zero();
         }
         let hishift = SHIFT - loshift;
-        let selfsign = self.get_sign();
+        let selfsign = this.get_sign();
         let mut z = Self::with_size(newsize, selfsign);
+        // Past the last collecting call: read digits through a plain handle.
+        let this: &RBigInt = &this;
         let mut i = 0;
         while i < newsize {
-            let digit = self.udigit(wordshift);
+            let digit = this.udigit(wordshift);
             let mut newdigit = digit >> loshift;
             if i + 1 < newsize {
-                newdigit |= self.udigit(wordshift + 1) << hishift;
+                newdigit |= this.udigit(wordshift + 1) << hishift;
             }
             z.setdigit_udigit(i, newdigit);
             i += 1;
@@ -2341,11 +2475,7 @@ impl RBigInt {
 
     #[majit_macros::jit_elidable]
     pub fn and_(&self, other: &Self) -> Self {
-        self.and_with_gc_roots(other, None)
-    }
-
-    fn and_with_gc_roots(&self, other: &Self, digit_roots: Option<&mut [majit_ir::GcRef]>) -> Self {
-        _bitwise_and(self, other, digit_roots)
+        _bitwise_and(self, other)
     }
 
     #[majit_macros::jit_elidable]
@@ -2355,11 +2485,7 @@ impl RBigInt {
 
     #[majit_macros::jit_elidable]
     pub fn xor(&self, other: &Self) -> Self {
-        self.xor_with_gc_roots(other, None)
-    }
-
-    fn xor_with_gc_roots(&self, other: &Self, digit_roots: Option<&mut [majit_ir::GcRef]>) -> Self {
-        _bitwise_xor(self, other, digit_roots)
+        _bitwise_xor(self, other)
     }
 
     #[majit_macros::jit_elidable]
@@ -2369,11 +2495,7 @@ impl RBigInt {
 
     #[majit_macros::jit_elidable]
     pub fn or_(&self, other: &Self) -> Self {
-        self.or_with_gc_roots(other, None)
-    }
-
-    fn or_with_gc_roots(&self, other: &Self, digit_roots: Option<&mut [majit_ir::GcRef]>) -> Self {
-        _bitwise_or(self, other, digit_roots)
+        _bitwise_or(self, other)
     }
 
     #[majit_macros::jit_elidable]
@@ -2478,18 +2600,21 @@ impl RBigInt {
     }
 
     pub fn gcd(&self, other: &Self) -> Result<Self, RBigIntError> {
-        gcd_lehmer(self.abs(), other.abs())
+        let this = live_rbigint(self);
+        let other = live_rbigint(other);
+        gcd_lehmer(this.abs(), other.abs())
     }
 
     pub fn isqrt(&self) -> Result<Self, RBigIntError> {
-        if self.int_lt(0) {
+        let this = live_rbigint(self);
+        if this.int_lt(0) {
             return Err(RBigIntError::NegativeSquareRoot);
         }
-        if self.int_eq(0) {
+        if this.int_eq(0) {
             return Ok(Self::zero());
         }
-        let c = (self.bit_length()? - 1) / 2;
-        let mut a = Self::one();
+        let c = (this.bit_length()? - 1) / 2;
+        let mut a = RBigIntGcRoot::new(Self::one());
         let mut d = 0;
         let top = bits_in_digit(c as Digit);
         let mut s = top;
@@ -2497,11 +2622,13 @@ impl RBigInt {
             s -= 1;
             let e = d;
             d = c >> s;
-            let shifted_a = a.lshift(d - e - 1)?;
-            let shifted_self = self.rshift(2 * c - e - d + 1, false)?;
-            a = shifted_a.add(&shifted_self.floordiv(&a)?);
+            let shifted_a = RBigIntGcRoot::new(a.lshift(d - e - 1)?);
+            let shifted_self = RBigIntGcRoot::new(this.rshift(2 * c - e - d + 1, false)?);
+            let quot = RBigIntGcRoot::new(shifted_self.floordiv(&a)?);
+            a = RBigIntGcRoot::new(shifted_a.add(&*quot));
         }
-        Ok(a.int_sub(a.mul(&a).gt(self) as i64))
+        let square = RBigIntGcRoot::new(a.mul(&a));
+        Ok(a.int_sub(square.gt(&*this) as i64))
     }
 }
 
@@ -2780,27 +2907,37 @@ macro_rules! impl_rbigint_scalar_ops {
             impl std::ops::Add<$ty> for RBigInt {
                 type Output = RBigInt;
                 fn add(self, other: $ty) -> RBigInt {
-                    RBigInt::add(&self, &RBigInt::from(other))
+                    // `RBigInt::from` collects.
+                    let this = RBigIntGcRoot::new(self);
+                    let other = RBigInt::from(other);
+                    RBigInt::add(&this, &other)
                 }
             }
             impl std::ops::Sub<$ty> for RBigInt {
                 type Output = RBigInt;
                 fn sub(self, other: $ty) -> RBigInt {
-                    RBigInt::sub(&self, &RBigInt::from(other))
+                    // `RBigInt::from` collects.
+                    let this = RBigIntGcRoot::new(self);
+                    let other = RBigInt::from(other);
+                    RBigInt::sub(&this, &other)
                 }
             }
             impl std::ops::Mul<$ty> for RBigInt {
                 type Output = RBigInt;
                 fn mul(self, other: $ty) -> RBigInt {
-                    RBigInt::mul(&self, &RBigInt::from(other))
+                    // `RBigInt::from` collects.
+                    let this = RBigIntGcRoot::new(self);
+                    let other = RBigInt::from(other);
+                    RBigInt::mul(&this, &other)
                 }
             }
             impl std::ops::Rem<$ty> for RBigInt {
                 type Output = RBigInt;
                 fn rem(self, other: $ty) -> RBigInt {
-                    _divrem(&self, &RBigInt::from(other))
-                        .expect("division by zero")
-                        .1
+                    // `RBigInt::from` collects.
+                    let this = RBigIntGcRoot::new(self);
+                    let other = RBigInt::from(other);
+                    _divrem(&this, &other).expect("division by zero").1
                 }
             }
         )*
@@ -3076,11 +3213,14 @@ fn _help_mult(
     y: &RBigInt,
     modulus: Option<&RBigInt>,
 ) -> Result<RBigInt, RBigIntError> {
-    let mut result = x.mul(y);
-    if let Some(modulus) = modulus {
-        result = result.r#mod(modulus)?;
+    let x = live_rbigint(x);
+    let y = live_rbigint(y);
+    let modulus = modulus.map(live_rbigint);
+    let mut result = RBigIntGcRoot::new(x.mul(&y));
+    if let Some(ref modulus) = modulus {
+        result = RBigIntGcRoot::new(result.r#mod(modulus)?);
     }
-    Ok(result)
+    Ok(result.translated_alias())
 }
 
 /// rbigint.py `digits_from_nonneg_long`.
@@ -3174,18 +3314,16 @@ fn args_from_long(value: i128) -> (Vec<Digit>, i64) {
 }
 
 /// rbigint.py `_x_add`.
-fn _x_add<'a>(
-    mut a: &'a RBigInt,
-    mut b: &'a RBigInt,
-    digit_roots: Option<&mut [majit_ir::GcRef]>,
-) -> RBigInt {
+fn _x_add(a: &RBigInt, b: &RBigInt) -> RBigInt {
     let mut size_a = a.numdigits();
     let mut size_b = b.numdigits();
-    if size_a < size_b {
-        std::mem::swap(&mut a, &mut b);
+    let (mut a, mut b) = if size_a < size_b {
         std::mem::swap(&mut size_a, &mut size_b);
-    }
-    let mut z = RBigInt::with_size_reloading_operands(size_a + 1, 1, &mut a, &mut b, digit_roots);
+        (b.translated_alias(), a.translated_alias())
+    } else {
+        (a.translated_alias(), b.translated_alias())
+    };
+    let mut z = RBigInt::with_size_livevars(size_a + 1, 1, &mut a, &mut b);
     let mut i = 0;
     let mut carry = 0_u64;
     while i < size_b {
@@ -3202,13 +3340,16 @@ fn _x_add<'a>(
     }
     z.setdigit_udigit(i, carry);
     z._normalize();
-    z
+    z.translated_alias()
 }
 
 /// rbigint.py `_x_int_add`.
 fn _x_int_add(a: &RBigInt, b: i64) -> RBigInt {
+    let a = live_rbigint(a);
     let size_a = a.numdigits();
     let mut z = RBigInt::with_size(size_a + 1, 1);
+    // Past the last collecting call: read digits through a plain handle.
+    let a: &RBigInt = &a;
     let mut carry = a.udigit(0).wrapping_add(b.unsigned_abs());
     z.setdigit_udigit(0, carry);
     carry >>= SHIFT;
@@ -3225,18 +3366,14 @@ fn _x_int_add(a: &RBigInt, b: i64) -> RBigInt {
 }
 
 /// rbigint.py `_x_sub`.
-fn _x_sub<'a>(
-    mut a: &'a RBigInt,
-    mut b: &'a RBigInt,
-    digit_roots: Option<&mut [majit_ir::GcRef]>,
-) -> RBigInt {
+fn _x_sub(a: &RBigInt, b: &RBigInt) -> RBigInt {
     let mut size_a = a.numdigits();
     let mut size_b = b.numdigits();
     let mut sign = 1;
-    if size_a < size_b {
+    let (mut a, mut b) = if size_a < size_b {
         sign = -1;
-        std::mem::swap(&mut a, &mut b);
         std::mem::swap(&mut size_a, &mut size_b);
+        (b.translated_alias(), a.translated_alias())
     } else if size_a == size_b {
         let mut i = size_a;
         while i > 0 && a.digit(i - 1) == b.digit(i - 1) {
@@ -3247,13 +3384,19 @@ fn _x_sub<'a>(
         }
         if a.digit(i - 1) < b.digit(i - 1) {
             sign = -1;
-            std::mem::swap(&mut a, &mut b);
+            size_a = i;
+            size_b = i;
+            (b.translated_alias(), a.translated_alias())
+        } else {
+            size_a = i;
+            size_b = i;
+            (a.translated_alias(), b.translated_alias())
         }
-        size_a = i;
-        size_b = i;
-    }
+    } else {
+        (a.translated_alias(), b.translated_alias())
+    };
 
-    let mut z = RBigInt::with_size_reloading_operands(size_a, sign, &mut a, &mut b, digit_roots);
+    let mut z = RBigInt::with_size_livevars(size_a, sign, &mut a, &mut b);
     let mut borrow = 0_u64;
     let mut i = 0;
     while i < size_b {
@@ -3270,11 +3413,12 @@ fn _x_sub<'a>(
     }
     debug_assert_eq!(borrow, 0);
     z._normalize();
-    z
+    z.translated_alias()
 }
 
 /// rbigint.py `_x_int_sub`.
 fn _x_int_sub(a: &RBigInt, b: i64) -> RBigInt {
+    let a = live_rbigint(a);
     let size_a = a.numdigits();
     let bdigit = b.unsigned_abs();
     if size_a == 1 {
@@ -3290,6 +3434,8 @@ fn _x_int_sub(a: &RBigInt, b: i64) -> RBigInt {
     }
 
     let mut z = RBigInt::with_size(size_a, 1);
+    // Past the last collecting call: read digits through a plain handle.
+    let a: &RBigInt = &a;
     let mut borrow = a.udigit(0).wrapping_sub(bdigit);
     z.setdigit_udigit(0, borrow);
     borrow = (borrow >> SHIFT) & 1;
@@ -3325,18 +3471,14 @@ const fn make_ptwotable() -> [i64; SHIFT as usize] {
 const PTWOTABLE: [i64; SHIFT as usize] = make_ptwotable();
 
 /// rbigint.py `_x_mul`.
-fn _x_mul<'a>(
-    mut a: &'a RBigInt,
-    mut b: &'a RBigInt,
-    digit: Digit,
-    digit_roots: Option<&mut [majit_ir::GcRef]>,
-) -> RBigInt {
+fn _x_mul(a: &RBigInt, b: &RBigInt, digit: Digit) -> RBigInt {
     let size_a = a.numdigits();
     let size_b = b.numdigits();
 
     if std::ptr::eq(a, b) {
-        let mut z =
-            RBigInt::with_size_reloading_operands(size_a + size_b, 1, &mut a, &mut b, digit_roots);
+        let mut a = a.translated_alias();
+        let mut b = b.translated_alias();
+        let mut z = RBigInt::with_size_livevars(size_a + size_b, 1, &mut a, &mut b);
         let mut i = 0;
         while i < size_a {
             let mut f = a.uwidedigit(i);
@@ -3362,13 +3504,14 @@ fn _x_mul<'a>(
                 carry >>= SHIFT;
             }
             if carry != 0 {
-                z.setdigit_uwidedigit(pz, z.udigit(pz) as UWideDigit + carry);
+                let acc = z.udigit(pz) as UWideDigit + carry;
+                z.setdigit_uwidedigit(pz, acc);
             }
             debug_assert_eq!(carry >> SHIFT, 0);
             i += 1;
         }
         z._normalize();
-        return z;
+        return z.translated_alias();
     } else if digit != 0 {
         if digit & (digit - 1) == 0 {
             return b.lqshift(PTWOTABLE[digit.trailing_zeros() as usize]);
@@ -3376,8 +3519,10 @@ fn _x_mul<'a>(
         return _muladd1(b, digit, 0);
     }
 
-    let mut z =
-        RBigInt::with_size_reloading_operands(size_a + size_b, 1, &mut a, &mut b, digit_roots);
+    // a is not b
+    let mut a = a.translated_alias();
+    let mut b = b.translated_alias();
+    let mut z = RBigInt::with_size_livevars(size_a + size_b, 1, &mut a, &mut b);
     let mut i = 0;
     let size_a1 = size_a - 1;
     let size_b1 = size_b - 1;
@@ -3420,108 +3565,124 @@ fn _x_mul<'a>(
             carry >>= SHIFT;
         }
         if carry != 0 {
-            z.setdigit_uwidedigit(pz, z.udigit(pz) as UWideDigit + carry);
+            let acc = z.udigit(pz) as UWideDigit + carry;
+            z.setdigit_uwidedigit(pz, acc);
         }
     }
     z._normalize();
-    z
+    z.translated_alias()
 }
 
 /// rbigint.py `_kmul_split`.
 fn _kmul_split(n: &RBigInt, size: i64) -> (RBigInt, RBigInt) {
+    let n = live_rbigint(n);
     let size_n = n.numdigits();
     let size_lo = size_n.min(size);
-    let mut lo = if size_lo == 0 {
+    // rbigint.py `_kmul_split` copies `n._digits[:size_lo]` once into the
+    // new rbigint. `RBigInt::new` is that copy (`Digits::new`).
+    let lo = if size_lo == 0 {
         RBigInt::zero()
     } else {
-        RBigInt::new(&n.digits()[..size_lo as usize], 1, size_lo)
+        RBigInt::new_from_rooted(&n, 0, size_lo as usize, 1, size_lo)
     };
-    let mut hi = if size_lo == size_n {
+    // `RBigInt::new` for `hi` can collect; keep `lo._digits` live.
+    let mut lo = RBigIntGcRoot::new(lo);
+    let hi = if size_lo == size_n {
         RBigInt::zero()
     } else {
-        RBigInt::new(
-            &n.digits()[size_lo as usize..size_n as usize],
-            1,
-            size_n - size_lo,
-        )
+        RBigInt::new_from_rooted(&n, size_lo as usize, size_n as usize, 1, size_n - size_lo)
     };
-    lo._normalize();
-    hi._normalize();
-    (hi, lo)
+    let mut hi = RBigIntGcRoot::new(hi);
+    lo.normalize();
+    hi.normalize();
+    ((*hi).clone(), (*lo).clone())
 }
 
 /// rbigint.py `_k_mul`.
-fn _k_mul<'a>(
-    mut a: &'a RBigInt,
-    mut b: &'a RBigInt,
-    digit_roots: Option<&mut [majit_ir::GcRef]>,
-) -> RBigInt {
+fn _k_mul(a: &RBigInt, b: &RBigInt) -> RBigInt {
     let asize = a.numdigits();
     let bsize = b.numdigits();
-    // Collecting malloc of the result buffer.  Recursive `mul` below stays
-    // on the source `None` arm: those intermediates are fresh nursery
-    // objects whose `_digits` are not in this residual's livevar span.
-    let mut ret =
-        RBigInt::with_size_reloading_operands(asize + bsize, 1, &mut a, &mut b, digit_roots);
+    // rbigint.py `_k_mul` keeps `ret`, `a`, `b` as ordinary locals; the GC
+    // transform reloads them after `[NULLDIGIT] * (asize+bsize)` and after
+    // each recursive `mul`. Host handles store `_digits` by value, so that
+    // edge lives on owner-root slots (`with_size_keeping_handles`) and the
+    // result buffer stays rooted across the splits and recursive muls.
+    let same = std::ptr::eq(a, b);
+    let (a, b, mut ret) = RBigInt::with_size_keeping_handles(asize + bsize, 1, a, b);
     let shift = bsize >> 1;
-    let (bh, bl) = _kmul_split(b, shift);
+    let (bh, bl) = _kmul_split(&b, shift);
+    let bh = RBigIntGcRoot::new(bh);
+    let bl = RBigIntGcRoot::new(bl);
 
-    if !std::ptr::eq(a, b) && asize <= shift {
-        let t1 = a.mul(&bl);
-        let mut i = 0;
-        while i < t1.numdigits() {
-            ret.setdigit(i, t1.digit(i));
-            i += 1;
+    if !same && asize <= shift {
+        let t1 = RBigIntGcRoot::new(a.mul(&bl));
+        {
+            // No collecting call inside the copy: plain handles.
+            let (ret, t1): (&mut RBigInt, &RBigInt) = (&mut ret, &t1);
+            let mut i = 0;
+            while i < t1.numdigits() {
+                ret.setdigit(i, t1.digit(i));
+                i += 1;
+            }
         }
-        let t2 = a.mul(&bh);
-        i = ret.numdigits() - shift;
+        let t2 = RBigIntGcRoot::new(a.mul(&bh));
+        let i = ret.numdigits() - shift;
         _v_iadd(&mut ret, shift, i, &t2, t2.numdigits());
-        ret._normalize();
-        return ret;
+        ret.normalize();
+        return ret.translated_alias();
     }
-    let a_parts = if std::ptr::eq(a, b) {
+    let a_parts = if same {
         None
     } else {
-        Some(_kmul_split(a, shift))
+        let (ah, al) = _kmul_split(&a, shift);
+        Some((RBigIntGcRoot::new(ah), RBigIntGcRoot::new(al)))
     };
     let (ah, al) = match &a_parts {
         None => (&bh, &bl),
         Some((ah, al)) => (ah, al),
     };
 
-    let t1 = ah.mul(&bh);
+    let t1 = RBigIntGcRoot::new(ah.mul(&bh));
     debug_assert!(t1.get_sign() >= 0);
     debug_assert!(2 * shift + t1.numdigits() <= ret.numdigits());
-    let mut i = 0;
-    while i < t1.numdigits() {
-        ret.setdigit(2 * shift + i, t1.digit(i));
-        i += 1;
+    {
+        // No collecting call inside the copy: plain handles.
+        let (ret, t1): (&mut RBigInt, &RBigInt) = (&mut ret, &t1);
+        let mut i = 0;
+        while i < t1.numdigits() {
+            ret.setdigit(2 * shift + i, t1.digit(i));
+            i += 1;
+        }
     }
 
-    let t2 = al.mul(&bl);
+    let t2 = RBigIntGcRoot::new(al.mul(&bl));
     debug_assert!(t2.get_sign() >= 0);
     debug_assert!(t2.numdigits() <= 2 * shift);
-    i = 0;
-    while i < t2.numdigits() {
-        ret.setdigit(i, t2.digit(i));
-        i += 1;
+    {
+        // No collecting call inside the copy: plain handles.
+        let (ret, t2): (&mut RBigInt, &RBigInt) = (&mut ret, &t2);
+        let mut i = 0;
+        while i < t2.numdigits() {
+            ret.setdigit(i, t2.digit(i));
+            i += 1;
+        }
     }
 
-    i = ret.numdigits() - shift;
+    let i = ret.numdigits() - shift;
     _v_isub(&mut ret, shift, i, &t2, t2.numdigits());
     _v_isub(&mut ret, shift, i, &t1, t1.numdigits());
 
-    let t1 = _x_add(ah, al, None);
-    let t3 = if std::ptr::eq(a, b) {
+    let t1 = RBigIntGcRoot::new(_x_add(ah, al));
+    let t3 = RBigIntGcRoot::new(if same {
         t1.mul(&t1)
     } else {
-        let t2 = _x_add(&bh, &bl, None);
+        let t2 = RBigIntGcRoot::new(_x_add(&bh, &bl));
         t1.mul(&t2)
-    };
+    });
     debug_assert!(t3.get_sign() >= 0);
     _v_iadd(&mut ret, shift, i, &t3, t3.numdigits());
-    ret._normalize();
-    ret
+    ret.normalize();
+    ret.translated_alias()
 }
 
 /// rbigint.py `_inplace_divrem1`.
@@ -3543,9 +3704,10 @@ fn _inplace_divrem1(pout: &mut RBigInt, pin: &RBigInt, n: Digit) -> Digit {
 #[majit_macros::jit_elidable]
 fn _divrem1(a: &RBigInt, n: Digit) -> (RBigInt, Digit) {
     debug_assert!(n > 0 && n <= MASK as Digit);
+    let a = live_rbigint(a);
     let size = a.numdigits();
     let mut z = RBigInt::with_size(size, 1);
-    let rem = _inplace_divrem1(&mut z, a, n);
+    let rem = _inplace_divrem1(&mut z, &*a, n);
     z._normalize();
     (z, rem)
 }
@@ -3617,8 +3779,11 @@ fn _v_isub(x: &mut RBigInt, xofs: i64, m: i64, y: &RBigInt, n: i64) -> UDigit {
 /// rbigint.py `_muladd1`.
 fn _muladd1(a: &RBigInt, n: Digit, extra: Digit) -> RBigInt {
     debug_assert!(n > 0);
+    let a = live_rbigint(a);
     let size_a = a.numdigits();
     let mut z = RBigInt::with_size(size_a + 1, 1);
+    // Past the last collecting call: read digits through a plain handle.
+    let a: &RBigInt = &a;
     debug_assert_eq!(extra & MASK as Digit, extra);
     let mut carry = _unsigned_widen_digit(extra);
     let mut i = 0;
@@ -3662,16 +3827,18 @@ fn _v_rshift(z: &mut RBigInt, a: &RBigInt, m: i64, d: i64) -> UWideDigit {
 
 /// rbigint.py `_x_divrem`.
 pub(crate) fn _x_divrem(v1: &RBigInt, w1: &RBigInt) -> (RBigInt, RBigInt) {
+    let v1 = live_rbigint(v1);
+    let w1 = live_rbigint(w1);
     let mut size_v = v1.numdigits();
     let size_w = w1.numdigits();
     debug_assert!(size_v >= size_w && size_w > 1);
-    let mut v = RBigInt::with_size(size_v + 1, 1);
-    let mut w = RBigInt::with_size(size_w, 1);
+    let mut v = live_rbigint(&RBigInt::with_size(size_v + 1, 1));
+    let mut w = live_rbigint(&RBigInt::with_size(size_w, 1));
 
     let d = SHIFT - bits_in_digit(w1.digit(size_w - 1));
-    let carry = _v_lshift(&mut w, w1, size_w, d);
+    let carry = _v_lshift(&mut w, &*w1, size_w, d);
     debug_assert_eq!(carry, 0);
-    let carry = _v_lshift(&mut v, v1, size_v, d);
+    let carry = _v_lshift(&mut v, &*v1, size_v, d);
     if carry != 0 || v.digit(size_v - 1) >= w.digit(size_w - 1) {
         v.setdigit_uwidedigit(size_v, carry);
         size_v += 1;
@@ -3684,65 +3851,74 @@ pub(crate) fn _x_divrem(v1: &RBigInt, w1: &RBigInt) -> (RBigInt, RBigInt) {
         // Rust `debug_assert`, which disappears in release builds.
         let carry = _v_rshift(&mut w, &v, size_w, d);
         debug_assert_eq!(carry, 0);
-        w._normalize();
+        w.normalize();
         // rbigint.py deliberately does not return NULLRBIGINT here:
         // callers of this internal division helper may modify the result.
         // Keep both the rbigint value and its digit array fresh.
-        return (RBigInt::new(&[NULLDIGIT], 0, 0), w);
+        return (RBigInt::new(&[NULLDIGIT], 0, 0), w.clone());
     }
-    let mut a = RBigInt::with_size(k, 1);
-    let wm1 = w.widedigit(size_w - 1);
-    let wm2 = w.widedigit(size_w - 2);
-    let mut j = size_v - 1;
-    while k > 0 {
-        k -= 1;
-        let vtop = if j >= size_v { 0 } else { v.widedigit(j) };
-        debug_assert!(vtop <= wm1);
-        let vv = (vtop << SHIFT) | v.widedigit(j - 1);
-        debug_assert!(vv >= 0 && wm1 >= 1);
-        let mut q = vv / wm1;
-        let mut r = vv % wm1;
-        let vj2 = v.digit(j - 2) as WideDigit;
-        while wm2 * q > ((r << SHIFT) | vj2) {
-            q -= 1;
-            r += wm1;
-        }
+    let mut a = live_rbigint(&RBigInt::with_size(k, 1));
+    {
+        // Past the last collecting call: the division loop runs on plain
+        // handles.
+        let v: &mut RBigInt = &mut v;
+        let w: &RBigInt = &w;
+        let a: &mut RBigInt = &mut a;
+        let wm1 = w.widedigit(size_w - 1);
+        let wm2 = w.widedigit(size_w - 2);
+        let mut j = size_v - 1;
+        while k > 0 {
+            k -= 1;
+            let vtop = if j >= size_v { 0 } else { v.widedigit(j) };
+            debug_assert!(vtop <= wm1);
+            let vv = (vtop << SHIFT) | v.widedigit(j - 1);
+            debug_assert!(vv >= 0 && wm1 >= 1);
+            let mut q = vv / wm1;
+            let mut r = vv % wm1;
+            let vj2 = v.digit(j - 2) as WideDigit;
+            while wm2 * q > ((r << SHIFT) | vj2) {
+                q -= 1;
+                r += wm1;
+            }
 
-        let mut zhi = 0_i128;
-        let mut i = 0;
-        while i < size_w {
-            let z = v.widedigit(k + i) + zhi - q * w.widedigit(i);
-            v.setdigit_widedigit(k + i, z);
-            zhi = z >> SHIFT;
-            i += 1;
-        }
-        if vtop + zhi < 0 {
-            let mut carry = 0_u64;
-            i = 0;
+            let mut zhi = 0_i128;
+            let mut i = 0;
             while i < size_w {
-                carry = carry
-                    .wrapping_add(v.udigit(k + i))
-                    .wrapping_add(w.udigit(i));
-                v.setdigit_udigit(k + i, carry);
-                carry >>= SHIFT;
+                let z = v.widedigit(k + i) + zhi - q * w.widedigit(i);
+                v.setdigit_widedigit(k + i, z);
+                zhi = z >> SHIFT;
                 i += 1;
             }
-            q -= 1;
+            if vtop + zhi < 0 {
+                let mut carry = 0_u64;
+                i = 0;
+                while i < size_w {
+                    carry = carry
+                        .wrapping_add(v.udigit(k + i))
+                        .wrapping_add(w.udigit(i));
+                    v.setdigit_udigit(k + i, carry);
+                    carry >>= SHIFT;
+                    i += 1;
+                }
+                q -= 1;
+            }
+            a.setdigit_widedigit(k, q);
+            j -= 1;
         }
-        a.setdigit_widedigit(k, q);
-        j -= 1;
     }
     // Same side-effecting upstream assertion as the k == 0 arm above.
     let carry = _v_rshift(&mut w, &v, size_w, d);
     debug_assert_eq!(carry, 0);
-    a._normalize();
-    w._normalize();
-    (a, w)
+    a.normalize();
+    w.normalize();
+    (a.clone(), w.clone())
 }
 
 /// rbigint.py `_divrem`.
 #[majit_macros::jit_elidable]
 pub fn _divrem(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBigIntError> {
+    let a = live_rbigint(a);
+    let b = live_rbigint(b);
     let size_a = a.numdigits();
     let size_b = b.numdigits();
     if b.get_sign() == 0 {
@@ -3752,13 +3928,12 @@ pub fn _divrem(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBigIntEr
         return Ok((RBigInt::zero(), a.translated_alias()));
     }
     let (mut z, mut rem) = if size_b == 1 {
-        let (z, urem) = _divrem1(a, b.digit(0));
-        (
-            z,
-            RBigInt::new(&[urem as Digit], if urem != 0 { 1 } else { 0 }, 1),
-        )
+        let (z, urem) = _divrem1(&a, b.digit(0));
+        let z = RBigIntGcRoot::new(z);
+        let rem = RBigInt::new(&[urem as Digit], if urem != 0 { 1 } else { 0 }, 1);
+        ((*z).clone(), rem)
     } else {
-        _x_divrem(a, b)
+        _x_divrem(&a, &b)
     };
     if a.get_sign() != b.get_sign() {
         z._set_sign(-z.get_sign());
@@ -3778,11 +3953,9 @@ fn _extract_digits(a: &RBigInt, startindex: i64, numdigits: i64) -> RBigInt {
     if stop == startindex {
         return RBigInt::zero();
     }
-    let mut result = RBigInt::new(
-        &a.digits()[startindex as usize..stop as usize],
-        1,
-        stop - startindex,
-    );
+    let a = live_rbigint(a);
+    let mut result =
+        RBigInt::new_from_rooted(&a, startindex as usize, stop as usize, 1, stop - startindex);
     result._normalize();
     result
 }
@@ -3794,29 +3967,36 @@ fn div2n1n(
     b: &RBigInt,
     n_s: i64,
 ) -> Result<(RBigInt, RBigInt), RBigIntError> {
+    let a_container = live_rbigint(a_container);
+    let b = live_rbigint(b);
     if n_s <= holder_limit(&HOLDER.DIV_LIMIT) {
-        let a = _extract_digits(a_container, a_startindex, 2 * n_s);
+        let a = _extract_digits(&a_container, a_startindex, 2 * n_s);
         if a.get_sign() == 0 {
             return Ok((RBigInt::zero(), RBigInt::zero()));
         }
-        return _divrem(&a, b);
+        return _divrem(&a, &b);
     }
     debug_assert_eq!(n_s & 1, 0);
     let half_n_s = n_s >> 1;
-    let b1 = _extract_digits(b, half_n_s, half_n_s);
-    let b2 = _extract_digits(b, 0, half_n_s);
+    let b1 = RBigIntGcRoot::new(_extract_digits(&b, half_n_s, half_n_s));
+    let b2 = RBigIntGcRoot::new(_extract_digits(&b, 0, half_n_s));
     let (q1, r1) = div3n2n(
-        a_container,
+        &a_container,
         a_startindex + n_s,
-        a_container,
+        &a_container,
         a_startindex + half_n_s,
-        b,
+        &b,
         &b1,
         &b2,
         half_n_s,
     )?;
-    let (q2, r) = div3n2n(&r1, 0, a_container, a_startindex, b, &b1, &b2, half_n_s)?;
-    Ok((_full_digits_lshift_then_or(&q1, half_n_s, &q2)?, r))
+    let q1 = RBigIntGcRoot::new(q1);
+    let r1 = RBigIntGcRoot::new(r1);
+    let (q2, r) = div3n2n(&r1, 0, &a_container, a_startindex, &b, &b1, &b2, half_n_s)?;
+    // `_full_digits_lshift_then_or` collects while `r` is live.
+    let r = RBigIntGcRoot::new(r);
+    let q = _full_digits_lshift_then_or(&q1, half_n_s, &q2)?;
+    Ok((q, r.translated_alias()))
 }
 
 /// rbigint.py `div3n2n`.
@@ -3831,13 +4011,25 @@ fn div3n2n(
     b2: &RBigInt,
     n_s: i64,
 ) -> Result<(RBigInt, RBigInt), RBigIntError> {
-    let (mut q, mut r) = div2n1n(a12_container, a12_startindex, b1, n_s)?;
+    // rbigint.py `div3n2n` keeps a12, a3, b, b1, b2 as ordinary locals
+    // across `div2n1n` and `q*b2`. Host handles store `_digits` by value.
+    let a12_container = live_rbigint(a12_container);
+    let a3_container = live_rbigint(a3_container);
+    let b = live_rbigint(b);
+    let b1 = live_rbigint(b1);
+    let b2 = live_rbigint(b2);
+    let (q, r) = div2n1n(&a12_container, a12_startindex, &b1, n_s)?;
+    let mut q = RBigIntGcRoot::new(q);
+    let mut r = RBigIntGcRoot::new(r);
     if r.get_sign() == 0 {
-        r = _extract_digits(a3_container, a3_startindex, n_s);
+        r = RBigIntGcRoot::new(_extract_digits(&a3_container, a3_startindex, n_s));
     } else {
         let r_size = r.numdigits();
         let combined_size = n_s.checked_add(r_size).ok_or(RBigIntError::Memory)?;
         let mut combined = RBigInt::try_with_size(combined_size, 1)?;
+        // Past the last collecting call: read digits through a plain handle.
+        let a3_container: &RBigInt = &a3_container;
+        let r_digits: &RBigInt = &r;
         let stop = (a3_startindex + n_s).min(a3_container.numdigits());
         let mut source = a3_startindex;
         let mut index = 0;
@@ -3849,22 +4041,23 @@ fn div3n2n(
         index = n_s;
         let mut i = 0;
         while i < r_size {
-            combined.setdigit(index, r.digit(i));
+            combined.setdigit(index, r_digits.digit(i));
             index += 1;
             i += 1;
         }
         combined._normalize();
-        r = combined;
+        r = RBigIntGcRoot::new(combined);
     }
     if q.get_sign() == 0 {
-        return Ok((q, r));
+        return Ok(((*q).clone(), (*r).clone()));
     }
-    r = r.sub(&q.mul(b2));
+    let qb2 = RBigIntGcRoot::new(q.mul(&b2));
+    r = RBigIntGcRoot::new(r.sub(&qb2));
     while r.get_sign() < 0 {
-        q = q.int_sub(1);
-        r = r.add(b);
+        q = RBigIntGcRoot::new(q.int_sub(1));
+        r = RBigIntGcRoot::new(r.add(&b));
     }
-    Ok((q, r))
+    Ok(((*q).clone(), (*r).clone()))
 }
 
 /// rbigint.py `_full_digits_lshift_then_or`.
@@ -3872,10 +4065,15 @@ fn _full_digits_lshift_then_or(a: &RBigInt, n: i64, b: &RBigInt) -> Result<RBigI
     if a.get_sign() == 0 {
         return Ok(b.translated_alias());
     }
+    let a = live_rbigint(a);
+    let b = live_rbigint(b);
     let bdigits = b.numdigits();
     debug_assert!(bdigits <= n);
     let result_size = a.numdigits().checked_add(n).ok_or(RBigIntError::Memory)?;
     let mut result = RBigInt::try_with_size(result_size, 1)?;
+    // Past the last collecting call: read digits through a plain handle.
+    let a: &RBigInt = &a;
+    let b: &RBigInt = &b;
     let mut i = 0;
     while i < bdigits {
         result.setdigit(i, b.digit(i));
@@ -3891,6 +4089,8 @@ fn _full_digits_lshift_then_or(a: &RBigInt, n: i64, b: &RBigInt) -> Result<RBigI
 
 /// rbigint.py `_divmod_fast_pos`.
 fn _divmod_fast_pos(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBigIntError> {
+    let a = live_rbigint(a);
+    let b = live_rbigint(b);
     let n = b.bit_length()?;
     let m = a.bit_length()?;
     if m < n {
@@ -3904,12 +4104,12 @@ fn _divmod_fast_pos(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBig
     let a_shifted;
     let b_shifted;
     let (a, b) = if rest_shift != 0 {
-        a_shifted = a.lshift(rest_shift)?;
-        b_shifted = b.lshift(rest_shift)?;
+        a_shifted = RBigIntGcRoot::new(a.lshift(rest_shift)?);
+        b_shifted = RBigIntGcRoot::new(b.lshift(rest_shift)?);
         debug_assert_eq!(b_shifted.bit_length(), Ok(new_n));
         (&a_shifted, &b_shifted)
     } else {
-        (a, b)
+        (&a, &b)
     };
     let n_s = new_n / SHIFT;
 
@@ -3931,36 +4131,42 @@ fn _divmod_fast_pos(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBig
         // retain their fixed `n_s`-digit width (including leading zero
         // machine digits) for the recursive Burnikel-Ziegler slice offsets.
         let stop = (start + n_s).min(a.numdigits());
-        let digits = &a.digits()[start as usize..stop as usize];
-        let digits_len = i64::try_from(digits.len()).map_err(|_| RBigIntError::Memory)?;
-        a_digits_base_two_pow_n.push(RBigInt::try_new(digits, 1, digits_len)?);
+        let digits_len = stop - start;
+        a_digits_base_two_pow_n.push(RBigIntGcRoot::new(RBigInt::try_new_from_rooted(
+            a,
+            start as usize,
+            stop as usize,
+            1,
+            digits_len,
+        )?));
         start = stop;
     }
     let mut a_digits_index = a_digits_base_two_pow_n.len() as i64 - 1;
     debug_assert!(a_digits_index >= 0);
-    let mut r;
-    if a_digits_base_two_pow_n[a_digits_index as usize].ge(b) {
-        r = RBigInt::zero();
+    let mut r = if a_digits_base_two_pow_n[a_digits_index as usize].ge(b) {
+        RBigIntGcRoot::new(RBigInt::zero())
     } else {
-        r = a_digits_base_two_pow_n[a_digits_index as usize].translated_alias();
+        let value = a_digits_base_two_pow_n[a_digits_index as usize].translated_alias();
         a_digits_index -= 1;
-    }
+        RBigIntGcRoot::new(value)
+    };
 
-    let mut q_digits: Option<RBigInt> = None;
+    let mut q_digits: Option<RBigIntGcRoot> = None;
     let mut q_index_start = a_digits_index * n_s;
     while a_digits_index >= 0 {
-        let arg1 = _full_digits_lshift_then_or(
+        let arg1 = RBigIntGcRoot::new(_full_digits_lshift_then_or(
             &r,
             n_s,
             &a_digits_base_two_pow_n[a_digits_index as usize],
-        )?;
+        )?);
         let (q_digit, next_r) = div2n1n(&arg1, 0, b, n_s)?;
-        r = next_r;
+        let q_digit = RBigIntGcRoot::new(q_digit);
+        r = RBigIntGcRoot::new(next_r);
         if q_digits.is_none() {
             let q_size = q_index_start
                 .checked_add(q_digit.numdigits())
                 .ok_or(RBigIntError::Memory)?;
-            q_digits = Some(RBigInt::try_with_size(q_size, 1)?);
+            q_digits = Some(RBigIntGcRoot::new(RBigInt::try_with_size(q_size, 1)?));
         }
         if let Some(q_digits) = &mut q_digits {
             let mut i = 0;
@@ -3973,28 +4179,39 @@ fn _divmod_fast_pos(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBig
         a_digits_index -= 1;
     }
     if rest_shift != 0 {
-        r = r.rshift(rest_shift, false)?;
+        r = RBigIntGcRoot::new(r.rshift(rest_shift, false)?);
     }
-    let mut q = q_digits.unwrap_or_else(RBigInt::zero);
+    let mut q = q_digits
+        .map(|value| value.translated_alias())
+        .unwrap_or_else(RBigInt::zero);
     q._normalize();
-    r._normalize();
-    Ok((q, r))
+    r.normalize();
+    Ok((q, r.translated_alias()))
 }
 
 /// rbigint.py `divmod_big`.
 pub fn divmod_big(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBigIntError> {
+    let a = live_rbigint(a);
+    let b = live_rbigint(b);
     if b.get_sign() == 0 {
         return Err(RBigIntError::DivisionByZero);
     } else if b.get_sign() < 0 {
         let (q, r) = divmod_big(&a.neg(), &b.neg())?;
         return Ok((q, r.neg()));
     } else if a.get_sign() < 0 {
-        let (q, r) = divmod_big(&a.invert(), b)?;
-        return Ok((q.invert(), b.add(&r.invert())));
+        let (q, r) = divmod_big(&a.invert(), &b)?;
+        // Each `invert` and the `add` collect: `r`, then `q.invert()`, stay
+        // rooted across the next one, and `b` is read only after the last
+        // `invert`, as the translated locals would be.
+        let r = RBigIntGcRoot::new(r);
+        let q = RBigIntGcRoot::new(q.invert());
+        let r_inverted = r.invert();
+        let r = b.add(&r_inverted);
+        return Ok((q.translated_alias(), r));
     } else if a.get_sign() == 0 {
         return Ok((RBigInt::zero(), RBigInt::zero()));
     }
-    _divmod_fast_pos(a, b)
+    _divmod_fast_pos(&a, &b)
 }
 
 /// rbigint.py `_x_int_lt`.
@@ -4059,12 +4276,12 @@ fn _AsDouble(value: &RBigInt) -> Result<f64, RBigIntError> {
     if sign == 0 {
         return Ok(0.0);
     }
-    let n_owned;
+    // `rshift` / `lshift` collect. Keep `n` on the shadow stack so the
+    // subsequent `eq` still reads the live digit array.
     let n = if sign < 0 {
-        n_owned = value.neg();
-        &n_owned
+        RBigIntGcRoot::new(value.neg())
     } else {
-        value
+        live_rbigint(value)
     };
 
     let exp = n.bit_length()?;
@@ -4074,9 +4291,11 @@ fn _AsDouble(value: &RBigInt) -> Result<f64, RBigIntError> {
         q = n.ulonglongmask() << shift as u32;
     } else {
         let shift = (-shift) as u64;
-        let n2 = n.rshift(shift as i64, false)?;
+        let n2 = RBigIntGcRoot::new(n.rshift(shift as i64, false)?);
         q = n2.ulonglongmask();
-        if !n.eq(&n2.lshift(shift as i64)?) {
+        // Shift before `n` is read: `lshift` collects.
+        let shifted = n2.lshift(shift as i64)?;
+        if !n.eq(&shifted) {
             q |= 1;
         }
     }
@@ -4222,6 +4441,12 @@ fn _bigint_true_divide(a: &RBigInt, b: &RBigInt) -> Result<f64, RBigIntError> {
     const MANT_DIG_DIGITS: i64 = DBL_MANT_DIG / SHIFT;
     const MANT_DIG_BITS: i64 = DBL_MANT_DIG % SHIFT;
 
+    // `lshift` / `rshift` / `_divrem` each allocate (`ll_newlist` /
+    // `malloc_fast`). The operands' `_digits` must sit on the shadow stack
+    // for the whole graph, matching the frame slots the GC transform would
+    // emit around those calls.
+    let a = live_rbigint(a);
+    let b = live_rbigint(b);
     let negate = (a.get_sign() < 0) ^ (b.get_sign() < 0);
     if !b.tobool() {
         return Err(RBigIntError::DivisionByZero);
@@ -4260,16 +4485,18 @@ fn _bigint_true_divide(a: &RBigInt, b: &RBigInt) -> Result<f64, RBigIntError> {
     }
     let shift = diff.max(DBL_MIN_EXP) - DBL_MANT_DIG - 2;
     let mut inexact = false;
-    let x;
-    if shift <= 0 {
-        x = a.lshift(-shift)?;
+    let x = if shift <= 0 {
+        RBigIntGcRoot::new(a.lshift(-shift)?)
     } else {
-        x = a.rshift(shift, true)?;
-        if !a.eq(&x.lshift(shift)?) {
+        let x = RBigIntGcRoot::new(a.rshift(shift, true)?);
+        // Shift before `a` is read: `lshift` collects.
+        let shifted = x.lshift(shift)?;
+        if !a.eq(&shifted) {
             inexact = true;
         }
-    }
-    let (x, rem) = _divrem(&x, b)?;
+        x
+    };
+    let (x, rem) = _divrem(&x, &b)?;
     if rem.tobool() {
         inexact = true;
     }
@@ -4612,11 +4839,8 @@ fn _format_recursive_decimal(
     // are forwarded by `walk_rbigint_cache_digit_slots`.
     let mut x = crate::rbigint::gc::RBigIntGcRoot::new(x);
     while i > 0 {
-        // Safety: this frame's only live `RBigInt` is `x`, held in the root
-        // guard above, and nothing reads an `&RBigInt` taken before this point.
-        unsafe { crate::rbigint::gc::format_recursion_safepoint(&x) };
         let (top, low) = x.divmod(&pts[i as usize])?;
-        *x = low;
+        x.set(low);
         if top.tobool() || output.len() as i64 != size_prefix {
             _format_recursive_decimal(
                 top,
@@ -4701,11 +4925,8 @@ fn _format_recursive_general(
     // are forwarded by `walk_rbigint_cache_digit_slots`.
     let mut x = crate::rbigint::gc::RBigIntGcRoot::new(x);
     while i > 0 {
-        // Safety: this frame's only live `RBigInt` is `x`, held in the root
-        // guard above, and nothing reads an `&RBigInt` taken before this point.
-        unsafe { crate::rbigint::gc::format_recursion_safepoint(&x) };
         let (top, low) = x.divmod(&pts[i as usize])?;
-        *x = low;
+        x.set(low);
         if top.tobool() || output.len() as i64 != size_prefix {
             _format_recursive_general(
                 top,
@@ -4810,12 +5031,12 @@ fn _format(
         return _format_base2_notzero(x, digits, prefix, suffix, max_str_digits);
     }
     let negative = x.get_sign() < 0;
-    let x_owned;
+    // `append_square` and the recursive formatter allocate. Keep `x` on the
+    // shadow stack for every `lt` / `divmod` that follows.
     let x = if negative {
-        x_owned = x.neg();
-        &x_owned
+        RBigIntGcRoot::new(x.neg())
     } else {
-        x
+        live_rbigint(x)
     };
     let pcb = get_cached_parts(base);
     let mindigits = pcb.mindigits;
@@ -4829,14 +5050,14 @@ fn _format(
         .last()
         .expect("parts cache starts non-empty")
         .as_ref()
-        .lt(x)
+        .lt(&x)
     {
         pcb.append_square(&pts)?;
         pts = pcb.parts_snapshot();
     }
 
     let mut startindex = 0;
-    while startindex < pts.len() as i64 && pts[startindex as usize].as_ref().lt(x) {
+    while startindex < pts.len() as i64 && pts[startindex as usize].as_ref().lt(&x) {
         stringsize = stringsize.checked_mul(2).ok_or(RBigIntError::Memory)?;
         startindex += 1;
     }
@@ -4892,58 +5113,28 @@ fn _format(
     Ok(output)
 }
 
-/// Holds an inverted operand so its `_digits` stay live across a collecting
-/// `with_size`.  The residual root span names the heap payloads, not these
-/// stack handles; `RBigIntGcRoot` is the `_digits` shadow-stack slot.
-struct BitwiseInvertHold {
-    root: Option<RBigIntGcRoot>,
-    hold: Option<RBigInt>,
-}
-
-fn bitwise_prep_operand<'a>(
-    value: &'a RBigInt,
-    collect: bool,
-    storage: &'a mut BitwiseInvertHold,
-) -> (&'a RBigInt, Digit, bool) {
-    if value.get_sign() < 0 {
-        let inverted = value.invert();
-        if collect {
-            storage.root = Some(RBigIntGcRoot::new(inverted));
-            (
-                storage.root.as_ref().expect("just stored"),
-                MASK as Digit,
-                true,
-            )
-        } else {
-            storage.hold = Some(inverted);
-            (
-                storage.hold.as_ref().expect("just stored"),
-                MASK as Digit,
-                true,
-            )
-        }
+/// The operand prologue of `rbigint.py` `_bitwise`:
+/// `if a.get_sign() < 0: a = a.invert(); maska = MASK`, then the same for
+/// `b`. Each `invert` collects, so the other operand is held on an
+/// owner-root slot across it.
+fn bitwise_prep_operands(a: &RBigInt, b: &RBigInt) -> (RBigIntGcRoot, RBigIntGcRoot, Digit, Digit) {
+    let b = live_rbigint(b);
+    let (a, maska) = if a.get_sign() < 0 {
+        (RBigIntGcRoot::new(a.invert()), MASK as Digit)
     } else {
-        (value, 0, false)
-    }
+        (live_rbigint(a), 0)
+    };
+    let (b, maskb) = if b.get_sign() < 0 {
+        (RBigIntGcRoot::new(b.invert()), MASK as Digit)
+    } else {
+        (b, 0)
+    };
+    (a, b, maska, maskb)
 }
 
 /// rbigint.py `@specialize.arg(1) _bitwise(a, '&', b)`.
-fn _bitwise_and<'a>(
-    orig_a: &'a RBigInt,
-    orig_b: &'a RBigInt,
-    digit_roots: Option<&mut [majit_ir::GcRef]>,
-) -> RBigInt {
-    let collect = digit_roots.is_some();
-    let mut a_storage = BitwiseInvertHold {
-        root: None,
-        hold: None,
-    };
-    let mut b_storage = BitwiseInvertHold {
-        root: None,
-        hold: None,
-    };
-    let (a, mut maska, inverted_a) = bitwise_prep_operand(orig_a, collect, &mut a_storage);
-    let (b, mut maskb, inverted_b) = bitwise_prep_operand(orig_b, collect, &mut b_storage);
+fn _bitwise_and(a: &RBigInt, b: &RBigInt) -> RBigInt {
+    let (a, b, mut maska, mut maskb) = bitwise_prep_operands(a, b);
 
     let mut negz = false;
     let mut op_is_and = true;
@@ -4967,12 +5158,11 @@ fn _bitwise_and<'a>(
     } else {
         size_a.max(size_b)
     };
-    let mut live_a = orig_a;
-    let mut live_b = orig_b;
-    let mut z =
-        RBigInt::with_size_reloading_operands(size_z, 1, &mut live_a, &mut live_b, digit_roots);
-    let a = if inverted_a { a } else { live_a };
-    let b = if inverted_b { b } else { live_b };
+    // `a` and `b` are the livevars across `[NULLDIGIT] * size_z`; the loop
+    // reads the reloaded plain handles.
+    let mut a = a.translated_alias();
+    let mut b = b.translated_alias();
+    let mut z = RBigInt::with_size_livevars(size_z, 1, &mut a, &mut b);
     let mut i = 0;
     while i < size_z {
         let diga = if i < size_a {
@@ -4994,22 +5184,8 @@ fn _bitwise_and<'a>(
 }
 
 /// The `'|'` graph emitted by upstream's `@specialize.arg(1) _bitwise`.
-fn _bitwise_or<'a>(
-    orig_a: &'a RBigInt,
-    orig_b: &'a RBigInt,
-    digit_roots: Option<&mut [majit_ir::GcRef]>,
-) -> RBigInt {
-    let collect = digit_roots.is_some();
-    let mut a_storage = BitwiseInvertHold {
-        root: None,
-        hold: None,
-    };
-    let mut b_storage = BitwiseInvertHold {
-        root: None,
-        hold: None,
-    };
-    let (a, mut maska, inverted_a) = bitwise_prep_operand(orig_a, collect, &mut a_storage);
-    let (b, mut maskb, inverted_b) = bitwise_prep_operand(orig_b, collect, &mut b_storage);
+fn _bitwise_or(a: &RBigInt, b: &RBigInt) -> RBigInt {
+    let (a, b, mut maska, mut maskb) = bitwise_prep_operands(a, b);
 
     let mut negz = false;
     let mut op_is_and = false;
@@ -5033,12 +5209,11 @@ fn _bitwise_or<'a>(
     } else {
         size_a.max(size_b)
     };
-    let mut live_a = orig_a;
-    let mut live_b = orig_b;
-    let mut z =
-        RBigInt::with_size_reloading_operands(size_z, 1, &mut live_a, &mut live_b, digit_roots);
-    let a = if inverted_a { a } else { live_a };
-    let b = if inverted_b { b } else { live_b };
+    // `a` and `b` are the livevars across `[NULLDIGIT] * size_z`; the loop
+    // reads the reloaded plain handles.
+    let mut a = a.translated_alias();
+    let mut b = b.translated_alias();
+    let mut z = RBigInt::with_size_livevars(size_z, 1, &mut a, &mut b);
     let mut i = 0;
     while i < size_z {
         let diga = if i < size_a {
@@ -5060,22 +5235,8 @@ fn _bitwise_or<'a>(
 }
 
 /// The `'^'` graph emitted by upstream's `@specialize.arg(1) _bitwise`.
-fn _bitwise_xor<'a>(
-    orig_a: &'a RBigInt,
-    orig_b: &'a RBigInt,
-    digit_roots: Option<&mut [majit_ir::GcRef]>,
-) -> RBigInt {
-    let collect = digit_roots.is_some();
-    let mut a_storage = BitwiseInvertHold {
-        root: None,
-        hold: None,
-    };
-    let mut b_storage = BitwiseInvertHold {
-        root: None,
-        hold: None,
-    };
-    let (a, mut maska, inverted_a) = bitwise_prep_operand(orig_a, collect, &mut a_storage);
-    let (b, maskb, inverted_b) = bitwise_prep_operand(orig_b, collect, &mut b_storage);
+fn _bitwise_xor(a: &RBigInt, b: &RBigInt) -> RBigInt {
+    let (a, b, mut maska, maskb) = bitwise_prep_operands(a, b);
 
     let mut negz = false;
     if maska != maskb {
@@ -5086,12 +5247,11 @@ fn _bitwise_xor<'a>(
     let size_a = a.numdigits();
     let size_b = b.numdigits();
     let size_z = size_a.max(size_b);
-    let mut live_a = orig_a;
-    let mut live_b = orig_b;
-    let mut z =
-        RBigInt::with_size_reloading_operands(size_z, 1, &mut live_a, &mut live_b, digit_roots);
-    let a = if inverted_a { a } else { live_a };
-    let b = if inverted_b { b } else { live_b };
+    // `a` and `b` are the livevars across `[NULLDIGIT] * size_z`; the loop
+    // reads the reloaded plain handles.
+    let mut a = a.translated_alias();
+    let mut b = b.translated_alias();
+    let mut z = RBigInt::with_size_livevars(size_z, 1, &mut a, &mut b);
     let mut i = 0;
     while i < size_z {
         let diga = if i < size_a {
@@ -5114,15 +5274,19 @@ fn _bitwise_xor<'a>(
 /// rbigint.py
 /// `@specialize.arg(1) _int_bitwise(a, '&', b)`.
 fn _int_bitwise_and(a: &RBigInt, mut b: i64) -> RBigInt {
+    // `_bitwise_and` already roots both operands; this graph's `fromint`
+    // and `with_size` (`ll_newlist` → `malloc_fast`) are the same collecting
+    // allocations, so `a`'s `_digits` sits in `RBigIntGcRoot` here too.
+    let a_live = live_rbigint(a);
     if !int_in_valid_range(b) {
-        return _bitwise_and(a, &RBigInt::fromint(b), None);
+        let other = RBigInt::fromint(b);
+        return _bitwise_and(&a_live, &other);
     }
-    let a_inverted;
-    let (a, mut maska) = if a.get_sign() < 0 {
-        a_inverted = a.invert();
-        (&a_inverted, MASK as Digit)
+    let a_inverted = (a_live.get_sign() < 0).then(|| RBigIntGcRoot::new(a_live.invert()));
+    let mut maska = if a_inverted.is_some() {
+        MASK as Digit
     } else {
-        (a, 0)
+        0
     };
     let mut maskb = if b < 0 {
         b = !b;
@@ -5140,7 +5304,7 @@ fn _int_bitwise_and(a: &RBigInt, mut b: i64) -> RBigInt {
         negz = true;
     }
 
-    let size_a = a.numdigits();
+    let size_a = a_inverted.as_deref().unwrap_or(&a_live).numdigits();
     let size_z = if op_is_and {
         if maska != 0 {
             1
@@ -5153,6 +5317,9 @@ fn _int_bitwise_and(a: &RBigInt, mut b: i64) -> RBigInt {
         size_a
     };
     let mut z = RBigInt::with_size(size_z, 1);
+    // `a = a.invert()` rebinds `a`; the handle is taken after the
+    // collecting malloc so the digit loop reads the forwarded array.
+    let a: &RBigInt = a_inverted.as_deref().unwrap_or(&a_live);
     let mut i = 0;
     while i < size_z {
         let diga = if i < size_a {
@@ -5171,15 +5338,16 @@ fn _int_bitwise_and(a: &RBigInt, mut b: i64) -> RBigInt {
 
 /// The `'|'` graph emitted by upstream's `@specialize.arg(1) _int_bitwise`.
 fn _int_bitwise_or(a: &RBigInt, mut b: i64) -> RBigInt {
+    let a_live = live_rbigint(a);
     if !int_in_valid_range(b) {
-        return _bitwise_or(a, &RBigInt::fromint(b), None);
+        let other = RBigInt::fromint(b);
+        return _bitwise_or(&a_live, &other);
     }
-    let a_inverted;
-    let (a, mut maska) = if a.get_sign() < 0 {
-        a_inverted = a.invert();
-        (&a_inverted, MASK as Digit)
+    let a_inverted = (a_live.get_sign() < 0).then(|| RBigIntGcRoot::new(a_live.invert()));
+    let mut maska = if a_inverted.is_some() {
+        MASK as Digit
     } else {
-        (a, 0)
+        0
     };
     let mut maskb = if b < 0 {
         b = !b;
@@ -5197,7 +5365,7 @@ fn _int_bitwise_or(a: &RBigInt, mut b: i64) -> RBigInt {
         negz = true;
     }
 
-    let size_a = a.numdigits();
+    let size_a = a_inverted.as_deref().unwrap_or(&a_live).numdigits();
     let size_z = if op_is_and {
         if maska != 0 {
             1
@@ -5210,6 +5378,9 @@ fn _int_bitwise_or(a: &RBigInt, mut b: i64) -> RBigInt {
         size_a
     };
     let mut z = RBigInt::with_size(size_z, 1);
+    // `a = a.invert()` rebinds `a`; the handle is taken after the
+    // collecting malloc so the digit loop reads the forwarded array.
+    let a: &RBigInt = a_inverted.as_deref().unwrap_or(&a_live);
     let mut i = 0;
     while i < size_z {
         let diga = if i < size_a {
@@ -5228,15 +5399,16 @@ fn _int_bitwise_or(a: &RBigInt, mut b: i64) -> RBigInt {
 
 /// The `'^'` graph emitted by upstream's `@specialize.arg(1) _int_bitwise`.
 fn _int_bitwise_xor(a: &RBigInt, mut b: i64) -> RBigInt {
+    let a_live = live_rbigint(a);
     if !int_in_valid_range(b) {
-        return _bitwise_xor(a, &RBigInt::fromint(b), None);
+        let other = RBigInt::fromint(b);
+        return _bitwise_xor(&a_live, &other);
     }
-    let a_inverted;
-    let (a, mut maska) = if a.get_sign() < 0 {
-        a_inverted = a.invert();
-        (&a_inverted, MASK as Digit)
+    let a_inverted = (a_live.get_sign() < 0).then(|| RBigIntGcRoot::new(a_live.invert()));
+    let mut maska = if a_inverted.is_some() {
+        MASK as Digit
     } else {
-        (a, 0)
+        0
     };
     let maskb = if b < 0 {
         b = !b;
@@ -5251,9 +5423,12 @@ fn _int_bitwise_xor(a: &RBigInt, mut b: i64) -> RBigInt {
         negz = true;
     }
 
-    let size_a = a.numdigits();
+    let size_a = a_inverted.as_deref().unwrap_or(&a_live).numdigits();
     let size_z = size_a;
     let mut z = RBigInt::with_size(size_z, 1);
+    // `a = a.invert()` rebinds `a`; the handle is taken after the
+    // collecting malloc so the digit loop reads the forwarded array.
+    let a: &RBigInt = a_inverted.as_deref().unwrap_or(&a_live);
     let mut i = 0;
     while i < size_z {
         let diga = if i < size_a {
@@ -5457,7 +5632,7 @@ pub fn parse_digit_string(parser: &mut NumberStringParser<'_>) -> Result<RBigInt
 /// key/value pairs preserves that ownership without introducing a side-table
 /// or process-global map.
 struct FivePowCache {
-    entries: Vec<(i64, RBigInt)>,
+    entries: Vec<(i64, RBigIntGcRoot)>,
 }
 
 impl FivePowCache {
@@ -5480,7 +5655,7 @@ impl FivePowCache {
 
     fn insert(&mut self, key: i64, value: RBigInt) {
         debug_assert!(!self.contains(key));
-        self.entries.push((key, value));
+        self.entries.push((key, RBigIntGcRoot::new(value)));
     }
 }
 
@@ -5496,12 +5671,11 @@ fn _str_to_int_big_w5pow(
     let result = if w <= limit {
         RBigInt::five().int_pow(w, None)?
     } else if w > 0 && mem.contains(w - 1) {
-        mem.get(w - 1)
-            .expect("contains was checked above")
-            .int_mul(5)
+        let prev = RBigIntGcRoot::new(mem.get(w - 1).expect("contains was checked above"));
+        prev.int_mul(5)
     } else {
         let w2 = w >> 1;
-        let smaller = _str_to_int_big_w5pow(w2, mem, limit)?;
+        let smaller = RBigIntGcRoot::new(_str_to_int_big_w5pow(w2, mem, limit)?);
         let larger = _str_to_int_big_w5pow(w - w2, mem, limit)?;
         smaller.mul(&larger)
     };
@@ -5522,10 +5696,13 @@ fn _str_to_int_big_inner10(
         return Ok(_decimalstr_to_bigint(s, a, b));
     }
     let mid = a + (diff + 1) / 2;
-    let right = _str_to_int_big_inner10(s, mid, b, mem, limit)?;
-    let mut left = _str_to_int_big_inner10(s, a, mid, mem, limit)?;
-    left = left.mul(&_str_to_int_big_w5pow(b - mid, mem, limit)?);
-    left = left.lshift(b - mid)?;
+    let right = RBigIntGcRoot::new(_str_to_int_big_inner10(s, mid, b, mem, limit)?);
+    let mut left = RBigIntGcRoot::new(_str_to_int_big_inner10(s, a, mid, mem, limit)?);
+    // A method call derefs its receiver before its argument runs, and
+    // `_str_to_int_big_w5pow` collects: run it first so `left` reloads after.
+    let w5pow = RBigIntGcRoot::new(_str_to_int_big_w5pow(b - mid, mem, limit)?);
+    left = RBigIntGcRoot::new(left.mul(&w5pow));
+    left = RBigIntGcRoot::new(left.lshift(b - mid)?);
     Ok(right.add(&left))
 }
 
@@ -5636,7 +5813,9 @@ fn lehmer_xgcd(mut a: u64, mut b: u64) -> (i128, i128, i128, i128) {
 
 /// rbigint.py `gcd_lehmer`.
 #[majit_macros::jit_elidable]
-fn gcd_lehmer(mut a: RBigInt, mut b: RBigInt) -> Result<RBigInt, RBigIntError> {
+fn gcd_lehmer(a: RBigInt, b: RBigInt) -> Result<RBigInt, RBigIntError> {
+    let mut a = RBigIntGcRoot::new(a);
+    let mut b = RBigIntGcRoot::new(b);
     if a.lt(&b) {
         std::mem::swap(&mut a, &mut b);
     }
@@ -5661,8 +5840,8 @@ fn gcd_lehmer(mut a: RBigInt, mut b: RBigInt) -> Result<RBigInt, RBigIntError> {
             0
         };
         if b_ms >> ((SHIFT + 1) >> 1) == 0 {
-            let remainder = a.r#mod(&b)?;
-            a = b;
+            let remainder = RBigIntGcRoot::new(a.r#mod(&b)?);
+            std::mem::swap(&mut a, &mut b);
             b = remainder;
             continue;
         }
@@ -5673,17 +5852,21 @@ fn gcd_lehmer(mut a: RBigInt, mut b: RBigInt) -> Result<RBigInt, RBigIntError> {
                 .iter()
                 .all(|&v| i64::try_from(v).is_ok())
         );
-        let n_a = a.int_mul(s_new as i64).add(&b.int_mul(t_new as i64)).abs();
-        b = a.int_mul(s_old as i64).add(&b.int_mul(t_old as i64)).abs();
+        let a_s = RBigIntGcRoot::new(a.int_mul(s_new as i64));
+        let b_t = RBigIntGcRoot::new(b.int_mul(t_new as i64));
+        let n_a = RBigIntGcRoot::new(RBigIntGcRoot::new(a_s.add(&*b_t)).abs());
+        let a_s = RBigIntGcRoot::new(a.int_mul(s_old as i64));
+        let b_t = RBigIntGcRoot::new(b.int_mul(t_old as i64));
+        b = RBigIntGcRoot::new(RBigIntGcRoot::new(a_s.add(&*b_t)).abs());
         a = n_a;
         if a.lt(&b) {
             std::mem::swap(&mut a, &mut b);
         }
     }
     if !b.tobool() {
-        return Ok(a);
+        return Ok((*a).clone());
     }
-    a = a.r#mod(&b)?;
+    a = RBigIntGcRoot::new(a.r#mod(&b)?);
     Ok(RBigInt::fromint(gcd_binary(b.toint()?, a.toint()?)))
 }
 
@@ -6105,6 +6288,68 @@ mod tests {
             "_normalize must replace a zero result with upstream NULLDIGITS"
         );
         assert!(one.sub(&one).eq(&zero));
+    }
+
+    #[test]
+    fn test_normalize_on_a_rooted_handle_publishes_the_sentinel() {
+        // `_kmul_split` holds both halves on owner-root slots and normalises
+        // them there. A high half of one zero digit collapses to zero, and
+        // `_normalize` installs the shared zero digit array; the slot has to
+        // carry that store, or the read that follows restores the freshly
+        // allocated block the value no longer describes and nothing roots.
+        let n = RBigInt::new(&[7, NULLDIGIT], 1, 2);
+        let (hi, lo) = _kmul_split(&n, 1);
+        assert_eq!(lo._size, 1);
+        assert_eq!(hi._size, 0);
+        assert_eq!(
+            hi._digits,
+            RBigInt::zero()._digits,
+            "a rooted `_normalize` must leave the zero result on NULLDIGITS"
+        );
+    }
+
+    #[test]
+    fn test_bitwise_zero_result_is_nulldigits() {
+        // `_bitwise` ends with `z._normalize(); return z`: a result that
+        // collapses to zero carries NULLDIGITS, not the block
+        // `[NULLDIGIT] * size_z` allocated for it.
+        let zero_digits = RBigInt::zero()._digits;
+        let one = RBigInt::fromint(1);
+        let two = RBigInt::fromint(2);
+        let big = RBigInt::fromint(1).lshift(200).unwrap();
+        let cases = [
+            ("and", one.and_(&two)),
+            ("and", big.and_(&one)),
+            ("xor", big.xor(&big)),
+            ("or", RBigInt::zero().or_(&RBigInt::zero())),
+        ];
+        for (op, result) in cases {
+            assert_eq!(result._size, 0, "{op}");
+            assert_eq!(
+                result._digits, zero_digits,
+                "a zero `{op}` result must be normalized onto NULLDIGITS"
+            );
+        }
+    }
+
+    #[test]
+    fn test_divmod_fast_pos_zero_remainder_is_nulldigits() {
+        // `_divmod_fast_pos` ends with `r._normalize()` before returning `r`.
+        let b = RBigInt::fromint(3)
+            .pow(&RBigInt::fromint(300), None)
+            .unwrap();
+        let q = RBigInt::fromint(7)
+            .pow(&RBigInt::fromint(200), None)
+            .unwrap();
+        let a = q.mul(&b);
+        let (qq, r) = _divmod_fast_pos(&a, &b).unwrap();
+        assert!(qq.eq(&q));
+        assert_eq!(r._size, 0);
+        assert_eq!(
+            r._digits,
+            RBigInt::zero()._digits,
+            "a zero remainder must be normalized onto NULLDIGITS"
+        );
     }
 
     #[test]
@@ -7492,11 +7737,10 @@ mod tests {
     }
 
     #[test]
-    fn add_sub_mul_and_bitwise_payloads_collecting_match_the_source_bodies() {
-        // Residual `jit_bigint_*` paths enter the GC-transformed bodies so
-        // the digit-list malloc can take `malloc_fast`'s `collect_and_reserve`.
-        // Without a collector the rooted allocator falls back to the ordinary
-        // list malloc; the two bodies must still agree.
+    fn add_sub_mul_and_bitwise_match_i128_arithmetic() {
+        // The residual `jit_bigint_*` paths call these bodies directly on the
+        // operand payloads; the digit-list malloc inside them is the one
+        // collecting call, rooted as `gct_fv_gc_malloc` roots its livevars.
         let pairs = [
             (0_i64, 0_i64),
             (0, 1),
@@ -7511,18 +7755,13 @@ mod tests {
         for (left, right) in pairs {
             let a = RBigInt::fromint(left);
             let b = RBigInt::fromint(right);
-            let added = unsafe { add_payloads_collecting(&a, &b) };
-            assert!(added.eq(&a.add(&b)), "{left} + {right}");
-            let subtracted = unsafe { sub_payloads_collecting(&a, &b) };
-            assert!(subtracted.eq(&a.sub(&b)), "{left} - {right}");
-            let product = unsafe { mul_payloads_collecting(&a, &b) };
-            assert!(product.eq(&a.mul(&b)), "{left} * {right}");
-            let anded = unsafe { and_payloads_collecting(&a, &b) };
-            assert!(anded.eq(&a.and_(&b)), "{left} & {right}");
-            let ored = unsafe { or_payloads_collecting(&a, &b) };
-            assert!(ored.eq(&a.or_(&b)), "{left} | {right}");
-            let xored = unsafe { xor_payloads_collecting(&a, &b) };
-            assert!(xored.eq(&a.xor(&b)), "{left} ^ {right}");
+            let (l, r) = (left as i128, right as i128);
+            assert_eq!(a.add(&b).to_i128(), Some(l + r), "{left} + {right}");
+            assert_eq!(a.sub(&b).to_i128(), Some(l - r), "{left} - {right}");
+            assert_eq!(a.mul(&b).to_i128(), Some(l * r), "{left} * {right}");
+            assert_eq!(a.and_(&b).to_i128(), Some(l & r), "{left} & {right}");
+            assert_eq!(a.or_(&b).to_i128(), Some(l | r), "{left} | {right}");
+            assert_eq!(a.xor(&b).to_i128(), Some(l ^ r), "{left} ^ {right}");
         }
         // Two-limb operands so `_x_add` / `_x_mul` walk more than one digit.
         let a = RBigInt::fromint(i64::MAX)
@@ -7530,11 +7769,12 @@ mod tests {
             .unwrap()
             .int_add(i64::MAX);
         let b = a.translated_alias();
-        assert!(unsafe { add_payloads_collecting(&a, &b) }.eq(&a.add(&b)));
-        assert!(unsafe { sub_payloads_collecting(&a, &b) }.eq(&a.sub(&b)));
-        assert!(unsafe { mul_payloads_collecting(&a, &b) }.eq(&a.mul(&b)));
-        assert!(unsafe { and_payloads_collecting(&a, &b) }.eq(&a.and_(&b)));
-        assert!(unsafe { or_payloads_collecting(&a, &b) }.eq(&a.or_(&b)));
-        assert!(unsafe { xor_payloads_collecting(&a, &b) }.eq(&a.xor(&b)));
+        let a_value = a.to_i128().expect("two-limb operand fits in i128");
+        assert_eq!(a.add(&b).to_i128(), a_value.checked_mul(2));
+        assert_eq!(a.sub(&b).get_sign(), 0);
+        assert!(a.mul(&b).floordiv(&b).unwrap().eq(&a));
+        assert!(a.and_(&b).eq(&a));
+        assert!(a.or_(&b).eq(&a));
+        assert_eq!(a.xor(&b).get_sign(), 0);
     }
 }

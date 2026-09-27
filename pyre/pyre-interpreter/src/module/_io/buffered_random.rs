@@ -712,15 +712,19 @@ impl W_BufferedRandom {
         #[default(DEFAULT_BUFFER_SIZE)] buffer_size: i64,
     ) -> Result<(), crate::PyError> {
         self.state = STATE_ZERO;
-        let readable = super::call_method_result(w_raw, "readable", &[])?;
+        let _raw_roots = pyre_object::gc_roots::push_roots();
+        let raw_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_raw);
+        let w_raw = || pyre_object::gc_roots::shadow_stack_get(raw_slot);
+        let readable = super::call_method_result(w_raw(), "readable", &[])?;
         if !crate::baseobjspace::is_true(readable)? {
             return Err(super::unsupported("File or stream is not readable."));
         }
-        let writable = super::call_method_result(w_raw, "writable", &[])?;
+        let writable = super::call_method_result(w_raw(), "writable", &[])?;
         if !crate::baseobjspace::is_true(writable)? {
             return Err(super::unsupported("File or stream is not writable."));
         }
-        let seekable = super::call_method_result(w_raw, "seekable", &[])?;
+        let seekable = super::call_method_result(w_raw(), "seekable", &[])?;
         if !crate::baseobjspace::is_true(seekable)? {
             return Err(super::unsupported("File or stream is not seekable."));
         }
@@ -729,13 +733,10 @@ impl W_BufferedRandom {
                 "buffer size must be strictly positive",
             ));
         }
-        let _roots = pyre_object::gc_roots::push_roots();
-        let _ = pyre_object::gc_roots::pin_root(w_raw);
-        let raw_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         // `_buffered_init` reports a buffer it cannot allocate as
         // `MemoryError`, and `buffer_size` came from Python.
         let buffer = super::try_new_buffer(buffer_size as usize)?;
-        self.w_raw = pyre_object::gc_roots::shadow_stack_get(raw_slot);
+        self.w_raw = w_raw();
         self.buffer = buffer;
         self.buffer_size = buffer_size;
         self.readable = true;

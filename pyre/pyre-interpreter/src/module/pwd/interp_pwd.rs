@@ -6,11 +6,12 @@
 /// `app_pwd.py class struct_passwd(metaclass=structseqtype)`.
 /// Process-wide cached subclass-of-tuple type so every getpwuid /
 /// getpwnam / getpwall result materialises into the same structseq.
-static STRUCT_PASSWD_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static STRUCT_PASSWD_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 #[cfg(unix)]
 fn struct_passwd_type() -> pyre_object::PyObjectRef {
-    *STRUCT_PASSWD_TYPE.get_or_init(|| {
+    STRUCT_PASSWD_TYPE.get_or_init(|| {
         pyre_interpreter::_structseq::make_struct_seq(
             "pwd.struct_passwd",
             &[
@@ -22,8 +23,8 @@ fn struct_passwd_type() -> pyre_object::PyObjectRef {
                 "pw_dir",
                 "pw_shell",
             ],
-        ) as usize
-    }) as pyre_object::PyObjectRef
+        )
+    })
 }
 
 /// `interp_pwd.py uid_converter` — narrow a python int to `uid_t`.

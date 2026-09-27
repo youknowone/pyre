@@ -169,8 +169,9 @@ fn ffi_arg(w_ffi: PyObjectRef) -> Result<&'static mut W_FFIObject, PyError> {
 
 /// `RealizeCache.get_file_struct`.
 fn get_file_struct() -> PyObjectRef {
-    static FILE_STRUCT: OnceLock<usize> = OnceLock::new();
-    *FILE_STRUCT.get_or_init(|| newtype::new_struct_type("FILE") as usize) as PyObjectRef
+    static FILE_STRUCT: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    FILE_STRUCT.get_or_init(|| newtype::new_struct_type("FILE"))
 }
 
 /// `get_primitive_type`.
@@ -267,10 +268,11 @@ pub struct W_RawFuncType {
     pub nostruct_nargs: i64,
 }
 
-static RAW_FUNC_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static RAW_FUNC_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 fn raw_func_type() -> PyObjectRef {
-    *RAW_FUNC_TYPE_OBJ.get_or_init(|| {
+    RAW_FUNC_TYPE_OBJ.get_or_init(|| {
         let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend.__RawFuncType",
             |_| {},
@@ -285,8 +287,8 @@ fn raw_func_type() -> PyObjectRef {
             pyre_object::w_type_set_disallow_instantiation(tp);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn new_raw_func(opcodes: *mut parse_c_type::OpcodeT, base_index: isize) -> PyObjectRef {

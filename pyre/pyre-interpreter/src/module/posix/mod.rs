@@ -36,8 +36,9 @@ use pyre_object::PyObjectRef;
 /// `st_blksize`/`st_blocks`/`st_rdev` block-device fields are named-only
 /// extras.
 pub(crate) fn stat_result_seq_type() -> PyObjectRef {
-    static STAT_RESULT_SEQ_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *STAT_RESULT_SEQ_TYPE.get_or_init(|| {
+    static STAT_RESULT_SEQ_TYPE: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    STAT_RESULT_SEQ_TYPE.get_or_init(|| {
         crate::_structseq::make_struct_seq_with_extra(
             // Dotted name → `__name__` "stat_result", repr "os.stat_result(...)".
             "os.stat_result",
@@ -100,8 +101,8 @@ pub(crate) fn stat_result_seq_type() -> PyObjectRef {
                 #[cfg(windows)]
                 "st_reparse_tag",
             ],
-        ) as usize
-    }) as PyObjectRef
+        )
+    })
 }
 
 /// A filesystem name reported back to the caller: `bytes` when the path

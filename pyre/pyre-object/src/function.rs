@@ -254,7 +254,7 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
         ob_type: &STATICMETHOD_TYPE as *const PyType,
         w_class: get_instantiate(&STATICMETHOD_TYPE),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         W_STATICMETHOD_GC_TYPE_ID,
         W_STATICMETHOD_OBJECT_SIZE,
     );
@@ -347,12 +347,19 @@ pub unsafe fn w_staticmethod_current_w_function_qmut(
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_staticmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
-        let sm = obj as *mut StaticMethod;
-        if (*sm).w_dict.is_null() {
-            (*sm).w_dict = crate::dictmultiobject::w_dict_new_instance();
+        if (*(obj as *mut StaticMethod)).w_dict.is_null() {
+            // `w_dict_new_instance` collects: the receiver joins the livevar
+            // set across it, then the barrier precedes the field store
+            // (`transform_generic_set`).
+            let _roots = crate::gc_roots::push_roots();
+            let obj_slot = crate::gc_roots::pin_roots(&[obj]);
+            let w_dict = crate::dictmultiobject::w_dict_new_instance();
+            let obj = crate::gc_roots::shadow_stack_get(obj_slot);
             crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+            (*(obj as *mut StaticMethod)).w_dict = w_dict;
+            return w_dict;
         }
-        (*sm).w_dict
+        (*(obj as *mut StaticMethod)).w_dict
     }
 }
 
@@ -439,7 +446,7 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
         ob_type: &CLASSMETHOD_TYPE as *const PyType,
         w_class: get_instantiate(&CLASSMETHOD_TYPE),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         W_CLASSMETHOD_GC_TYPE_ID,
         W_CLASSMETHOD_OBJECT_SIZE,
     );
@@ -531,12 +538,19 @@ pub unsafe fn w_classmethod_current_w_function_qmut(
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_classmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
-        let cm = obj as *mut ClassMethod;
-        if (*cm).w_dict.is_null() {
-            (*cm).w_dict = crate::dictmultiobject::w_dict_new_instance();
+        if (*(obj as *mut ClassMethod)).w_dict.is_null() {
+            // `w_dict_new_instance` collects: the receiver joins the livevar
+            // set across it, then the barrier precedes the field store
+            // (`transform_generic_set`).
+            let _roots = crate::gc_roots::push_roots();
+            let obj_slot = crate::gc_roots::pin_roots(&[obj]);
+            let w_dict = crate::dictmultiobject::w_dict_new_instance();
+            let obj = crate::gc_roots::shadow_stack_get(obj_slot);
             crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+            (*(obj as *mut ClassMethod)).w_dict = w_dict;
+            return w_dict;
         }
-        (*cm).w_dict
+        (*(obj as *mut ClassMethod)).w_dict
     }
 }
 

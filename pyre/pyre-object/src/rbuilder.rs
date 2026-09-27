@@ -232,15 +232,26 @@ pub mod rbuilder_runtime {
     }
 
     #[inline]
+    fn barrier_gc_fields(obj: i64) {
+        if obj != 0 {
+            crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        }
+    }
+
+    #[inline]
     fn alloc_builder(value: StringBuilderBox) -> i64 {
-        let tid = pyre_object::rbuilder::stringbuilder_gc_type_id();
-        pyre_object::gc_storage::gc_alloc_storage_box::<StringBuilderBox>(value, tid) as i64
+        let tid = crate::rbuilder::stringbuilder_gc_type_id();
+        let obj = crate::gc_storage::gc_alloc_storage_box::<StringBuilderBox>(value, tid) as i64;
+        barrier_gc_fields(obj);
+        obj
     }
 
     #[inline]
     fn alloc_piece(value: StringPieceBox) -> i64 {
-        let tid = pyre_object::rbuilder::stringpiece_gc_type_id();
-        pyre_object::gc_storage::gc_alloc_storage_box::<StringPieceBox>(value, tid) as i64
+        let tid = crate::rbuilder::stringpiece_gc_type_id();
+        let obj = crate::gc_storage::gc_alloc_storage_box::<StringPieceBox>(value, tid) as i64;
+        barrier_gc_fields(obj);
+        obj
     }
 
     /// `StringBuilderRepr.ll_new(init_size)` (`rbuilder.py`).
@@ -323,6 +334,7 @@ pub mod rbuilder_runtime {
         b.current_end = needed as i64;
         b.total_size = new_total;
         b.extra_pieces = old_piece;
+        barrier_gc_fields(builder);
     }
 
     /// `rbuilder.py ll_grow_and_append`.
@@ -344,6 +356,7 @@ pub mod rbuilder_runtime {
             let b = unsafe { &mut *(builder as *mut StringBuilderBox) };
             b.total_size = total_size;
             b.extra_pieces = old_piece;
+            barrier_gc_fields(builder);
             return;
         }
 
@@ -433,6 +446,7 @@ pub mod rbuilder_runtime {
         b.current_buf = ll_shrink_array(b.current_buf, final_size as usize, item_size);
         b.current_end = final_size;
         b.total_size = final_size;
+        barrier_gc_fields(builder);
     }
 
     /// `rbuilder.py ll_fold_pieces`: concatenate `current_buf` and the
@@ -454,6 +468,7 @@ pub mod rbuilder_runtime {
             b.current_buf = piece;
             b.current_pos = final_size;
             b.current_end = final_size;
+            barrier_gc_fields(builder);
             return;
         }
         // Allocate the result and copy every piece back-to-front.
@@ -465,6 +480,7 @@ pub mod rbuilder_runtime {
             b.current_buf = result;
             b.current_pos = final_size;
             b.current_end = final_size;
+            barrier_gc_fields(builder);
         }
         let mut piece = current_buf;
         let mut piece_lgt = current_pos;

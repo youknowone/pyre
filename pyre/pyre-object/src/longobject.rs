@@ -191,6 +191,10 @@ pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
     // spelling its allocator branch and aggregate copy in this constructor.
     // `fuse_boxing_alloc` recognizes this GC-flavoured malloc boundary and
     // restores the translated `NewWithVtable` plus ordinary field writes.
+    // The wrapper malloc is the single allocation after the payload is
+    // already a GC object; `gct_fv_gc_malloc` would push `num` as a livevar
+    // here, but a no-collect old-gen bump does not move it. A registry root
+    // (`gc_add_root` / owner-root) on this path is not that livevar.
     crate::lltype::malloc_typed_stable(W_LongObject {
         ob_header: PyObject {
             ob_type: &LONG_TYPE as *const PyType,
@@ -203,26 +207,33 @@ pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
 /// Allocate a new W_LongObject on the heap from a `BigInt` value. The bigint
 /// payload is a fresh nursery object, matching RPython's ordinary GC
 /// allocation. The wrapper itself is born in non-moving old-gen and its
-/// creation barrier records the old→young `LONG_VALUE_OFFSET` edge.
+/// creation barrier records the old→young `LONG_VALUE_OFFSET` edge. The
+/// collecting payload malloc roots the handle's `_digits` slot
+/// (`alloc_fast_nursery_collecting_typed_rooted`); the wrapper malloc does
+/// not collect, so the returned payload pointer needs no second registry.
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`): the body
-/// delegates through `alloc_bigint_nursery -> *mut BigInt`, so tracing into it
-/// leaks the raw `BigInt` pointee into the return model and unifies against the
-/// `w_int_new` fast path as `PyObject ∪ BigInt`. Residualising the whole box
-/// tail models it by signature — a plain `PyObjectRef` GCREF with no
-/// discriminant to erase — the `w_str_new`/`box_bigint_constant` twin.
+/// delegates through `alloc_bigint_nursery_collecting -> *mut BigInt`, so
+/// tracing into it leaks the raw `BigInt` pointee into the return model and
+/// unifies against the `w_int_new` fast path as `PyObject ∪ BigInt`.
+/// Residualising the whole box tail models it by signature — a plain
+/// `PyObjectRef` GCREF with no discriminant to erase — the
+/// `w_str_new`/`box_bigint_constant` twin.
 #[majit_macros::dont_look_inside]
 pub fn w_long_new(value: BigInt) -> PyObjectRef {
-    w_long_from_raw(alloc_bigint_nursery(value))
+    w_long_from_raw(alloc_bigint_nursery_collecting(value))
 }
 
 /// Wrap a fresh rbigint handle without canonicalizing a shallow copy whose
 /// digit array happens to belong to a prebuilt value.
 #[majit_macros::dont_look_inside]
 pub fn w_long_new_fresh_rbigint_handle(value: BigInt) -> PyObjectRef {
-    // No-collect host counterpart of `jit_bigint_clone`: rbigint.neg always
-    // constructs a new handle, including for the prebuilt zero digit array.
-    w_long_from_raw(majit_rlib::rbigint::alloc_rbigint_clone_nursery(value))
+    // Host counterpart of `jit_bigint_clone`: rbigint.neg always constructs
+    // a new handle, including for the prebuilt zero digit array. The clone
+    // allocator roots `_digits` across its own malloc.
+    w_long_from_raw(majit_rlib::rbigint::alloc_rbigint_clone_nursery_collecting(
+        value,
+    ))
 }
 
 /// Create a W_LongObject from an i64 value.
@@ -487,63 +498,96 @@ pub extern "C" fn jit_w_long_toint(obj: i64) -> i64 {
 /// never exposed to Python `is`, so sharing one payload for two equal-input
 /// adds is unobservable.
 /// Wrapper-level (`W_LongObject` operands) variants used for record-time
-/// concrete evaluation and the trait path, which run OUTSIDE a JIT safepoint and
-/// hold the operand wrappers natively — so they allocate via the NO-COLLECT
-/// `alloc_bigint_nursery` (a collection here would move the tracer's operands).
-/// The walker-emitted runtime call uses the collecting payload variants below.
+/// concrete evaluation and the trait path. The digit malloc inside
+/// `rbigint.add`/`sub`/`mul`/`and_`/`or_`/`xor` collects, and those bodies root
+/// the operand digit arrays across it (the `push_roots(livevars)` bracket
+/// around `rbigint.py add`); the result wrapper comes from the no-collect
+/// `alloc_bigint_nursery`. The
+/// operand wrappers are not read after the digit malloc here, so a caller that
+/// holds them natively across this call must root them itself.
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_add_raw(a: i64, b: i64) -> i64 {
     let (a, b) = (a as PyObjectRef, b as PyObjectRef);
     unsafe {
-        let (av, bv) = (w_long_get_value(a), w_long_get_value(b));
-        if av.get_sign() == 0 {
-            return w_long_get_raw_value(b) as i64;
+        let av = w_long_get_raw_value(a);
+        let bv = w_long_get_raw_value(b);
+        if (*av).get_sign() == 0 {
+            return bv as i64;
         }
-        if bv.get_sign() == 0 {
-            return w_long_get_raw_value(a) as i64;
+        if (*bv).get_sign() == 0 {
+            return av as i64;
         }
-        alloc_bigint_nursery(av + bv) as i64
+        // Digit malloc is the collecting call; `_x_add` / `_x_sub` root the
+        // operand digit arrays across it (`push_roots(livevars)`).
+        alloc_bigint_nursery(BigInt::add(&*av, &*bv)) as i64
     }
 }
 
-/// `rbigint.sub` over `W_LongObject` operands (no-collect). See [`jit_w_long_add_raw`].
+/// `rbigint.sub` over `W_LongObject` operands (collecting digit malloc). See
+/// [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_sub_raw(a: i64, b: i64) -> i64 {
     let (a, b) = (a as PyObjectRef, b as PyObjectRef);
     unsafe {
-        if w_long_get_value(b).get_sign() == 0 {
-            return w_long_get_raw_value(a) as i64;
+        let av = w_long_get_raw_value(a);
+        let bv = w_long_get_raw_value(b);
+        if (*bv).get_sign() == 0 {
+            return av as i64;
         }
-        alloc_bigint_nursery(w_long_get_value(a) - w_long_get_value(b)) as i64
+        alloc_bigint_nursery(BigInt::sub(&*av, &*bv)) as i64
     }
 }
 
-/// `rbigint.mul` over `W_LongObject` operands (no-collect). See [`jit_w_long_add_raw`].
+/// `rbigint.mul` over `W_LongObject` operands (collecting digit malloc). See
+/// [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_mul_raw(a: i64, b: i64) -> i64 {
     let (a, b) = (a as PyObjectRef, b as PyObjectRef);
-    unsafe { alloc_bigint_nursery(w_long_get_value(a) * w_long_get_value(b)) as i64 }
+    unsafe {
+        alloc_bigint_nursery(BigInt::mul(
+            &*w_long_get_raw_value(a),
+            &*w_long_get_raw_value(b),
+        )) as i64
+    }
 }
 
-/// `rbigint.and_` over `W_LongObject` operands (no-collect). See [`jit_w_long_add_raw`].
+/// `rbigint.and_` over `W_LongObject` operands (collecting digit malloc). See
+/// [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_and_raw(a: i64, b: i64) -> i64 {
     let (a, b) = (a as PyObjectRef, b as PyObjectRef);
-    unsafe { alloc_bigint_nursery(w_long_get_value(a) & w_long_get_value(b)) as i64 }
+    unsafe {
+        alloc_bigint_nursery(BigInt::and_(
+            &*w_long_get_raw_value(a),
+            &*w_long_get_raw_value(b),
+        )) as i64
+    }
 }
 
-/// `rbigint.or_` over `W_LongObject` operands (no-collect). See [`jit_w_long_add_raw`].
+/// `rbigint.or_` over `W_LongObject` operands (collecting digit malloc). See
+/// [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_or_raw(a: i64, b: i64) -> i64 {
     let (a, b) = (a as PyObjectRef, b as PyObjectRef);
-    unsafe { alloc_bigint_nursery(w_long_get_value(a) | w_long_get_value(b)) as i64 }
+    unsafe {
+        alloc_bigint_nursery(BigInt::or_(
+            &*w_long_get_raw_value(a),
+            &*w_long_get_raw_value(b),
+        )) as i64
+    }
 }
 
-/// `rbigint.xor_` over `W_LongObject` operands (no-collect). See [`jit_w_long_add_raw`].
+/// `rbigint.xor_` over `W_LongObject` operands (collecting digit malloc). See
+/// [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_xor_raw(a: i64, b: i64) -> i64 {
     let (a, b) = (a as PyObjectRef, b as PyObjectRef);
-    unsafe { alloc_bigint_nursery(w_long_get_value(a) ^ w_long_get_value(b)) as i64 }
+    unsafe {
+        alloc_bigint_nursery(BigInt::xor(
+            &*w_long_get_raw_value(a),
+            &*w_long_get_raw_value(b),
+        )) as i64
+    }
 }
 
 /// `rbigint.add`/`sub`/`mul`/`and_`/`or_`/`xor_` (`rpython/rlib/rbigint.py`,
@@ -554,9 +598,9 @@ pub extern "C" fn jit_w_long_xor_raw(a: i64, b: i64) -> i64 {
 /// field read and never reorders this elidable call ahead of the boxing
 /// `setfield_gc` that initializes the fresh result wrapper. Allocates the result
 /// via the COLLECTING nursery. The residual `CallR`'s gcmap roots its operand
-/// payloads in the caller, and `rbigint::gc::add_payloads_collecting` restores
-/// the native callee copies around `_x_add`'s digit-list allocation, matching
-/// RPython's `push_roots(livevars)`. Thus dead bigints are reclaimed by minor
+/// payloads in the caller, and `rbigint.add` roots and reloads the native
+/// callee copies around `_x_add`'s digit-list allocation, matching RPython's
+/// `push_roots(livevars)`. Thus dead bigints are reclaimed by minor
 /// collections instead of accumulating in old-gen. Returns a freshly
 /// heap-allocated `*mut BigInt` (as i64). Allocates → `EF_ELIDABLE_OR_MEMORYERROR`.
 ///
@@ -575,7 +619,7 @@ pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> i64 {
         if (&*b).get_sign() == 0 {
             return a as i64;
         }
-        alloc_bigint_nursery_collecting(majit_rlib::rbigint::add_payloads_collecting(a, b)) as i64
+        alloc_bigint_nursery_collecting(BigInt::add(&*a, &*b)) as i64
     }
 }
 
@@ -589,7 +633,7 @@ pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> i64 {
         if (&*b).get_sign() == 0 {
             return a as i64;
         }
-        alloc_bigint_nursery_collecting(majit_rlib::rbigint::sub_payloads_collecting(a, b)) as i64
+        alloc_bigint_nursery_collecting(BigInt::sub(&*a, &*b)) as i64
     }
 }
 
@@ -597,36 +641,28 @@ pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> i64 {
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_mul(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe {
-        alloc_bigint_nursery_collecting(majit_rlib::rbigint::mul_payloads_collecting(a, b)) as i64
-    }
+    unsafe { alloc_bigint_nursery_collecting(BigInt::mul(&*a, &*b)) as i64 }
 }
 
 /// `rbigint.and_` on bare payloads (collecting). See [`jit_bigint_add`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_and(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe {
-        alloc_bigint_nursery_collecting(majit_rlib::rbigint::and_payloads_collecting(a, b)) as i64
-    }
+    unsafe { alloc_bigint_nursery_collecting(BigInt::and_(&*a, &*b)) as i64 }
 }
 
 /// `rbigint.or_` on bare payloads (collecting). See [`jit_bigint_add`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_or(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe {
-        alloc_bigint_nursery_collecting(majit_rlib::rbigint::or_payloads_collecting(a, b)) as i64
-    }
+    unsafe { alloc_bigint_nursery_collecting(BigInt::or_(&*a, &*b)) as i64 }
 }
 
 /// `rbigint.xor_` on bare payloads (collecting). See [`jit_bigint_add`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_xor(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe {
-        alloc_bigint_nursery_collecting(majit_rlib::rbigint::xor_payloads_collecting(a, b)) as i64
-    }
+    unsafe { alloc_bigint_nursery_collecting(BigInt::xor(&*a, &*b)) as i64 }
 }
 
 /// `rbigint` comparison — returns the sign of `a <=> b` as `-1` / `0` / `1`.

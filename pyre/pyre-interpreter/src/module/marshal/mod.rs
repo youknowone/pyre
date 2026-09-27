@@ -570,6 +570,19 @@ impl Rooted {
     }
 }
 
+/// Drain a decode iterator into live object pointers.
+///
+/// The wire reader yields children lazily (`process_results`): each `next`
+/// may allocate and collect. `Rooted` is a shadow-stack index, so collecting
+/// the slots first keeps every child pinned; the pointers are read only after
+/// the last child exists. Copying `Rooted::get()` while the iterator still
+/// runs leaves earlier addresses in an unrooted `Vec` that a later child
+/// allocation can evacuate.
+fn rooted_ptrs(elements: impl Iterator<Item = Rooted>) -> Vec<PyObjectRef> {
+    let slots: Vec<Rooted> = elements.collect();
+    slots.iter().copied().map(Rooted::get).collect()
+}
+
 /// PyPy `interp_marshal.py FileReader`, with CPython 3.14's
 /// `readinto()` validation when that method is available.
 ///
@@ -847,7 +860,7 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn make_tuple(&self, elements: impl Iterator<Item = Rooted>) -> Rooted {
-        Rooted::new(w_tuple_new(elements.map(Rooted::get).collect()))
+        Rooted::new(w_tuple_new(rooted_ptrs(elements)))
     }
 
     fn make_tuple_placeholder(&self, len: usize) -> Result<Option<Rooted>, wire::MarshalError> {
@@ -884,7 +897,7 @@ impl wire::MarshalBag for PyreMarshalBag {
         &self,
         elements: impl Iterator<Item = Rooted>,
     ) -> Result<Rooted, wire::MarshalError> {
-        Ok(Rooted::new(w_list_new(elements.map(Rooted::get).collect())))
+        Ok(Rooted::new(w_list_new(rooted_ptrs(elements))))
     }
 
     fn make_list_placeholder(&self, len: usize) -> Result<Option<Rooted>, wire::MarshalError> {
@@ -1238,9 +1251,32 @@ crate::py_module! {
             #[kwonly]
             allow_code: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, crate::PyError> {
-            let version = resolve_version(version)?;
-            let allow_code = resolve_allow_code(allow_code)?;
-            let out = marshal_to_bytes(value, version, allow_code)?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let has_version = version.is_some();
+            let has_allow = allow_code.is_some();
+            let mut live = [pyre_object::PY_NULL; 3];
+            live[0] = value;
+            let mut n = 1;
+            if let Some(v) = version {
+                live[n] = v;
+                n += 1;
+            }
+            if let Some(v) = allow_code {
+                live[n] = v;
+                n += 1;
+            }
+            let base = pyre_object::gc_roots::pin_roots(&live[..n]);
+            let version_slot = has_version.then_some(base + 1);
+            let allow_slot = has_allow.then_some(base + 1 + usize::from(has_version));
+            let version =
+                resolve_version(version_slot.map(pyre_object::gc_roots::shadow_stack_get))?;
+            let allow_code =
+                resolve_allow_code(allow_slot.map(pyre_object::gc_roots::shadow_stack_get))?;
+            let out = marshal_to_bytes(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                version,
+                allow_code,
+            )?;
             Ok(bytesobject::w_bytes_from_bytes(&out))
         }
         // interp_marshal.py `loads(w_str)` — `bytes` positional-only,
@@ -1251,8 +1287,20 @@ crate::py_module! {
             #[kwonly]
             allow_code: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, crate::PyError> {
-            let allow_code = resolve_allow_code(allow_code)?;
-            let data = bytes_like(data, "loads")?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let has_allow = allow_code.is_some();
+            let mut live = [pyre_object::PY_NULL; 2];
+            live[0] = data;
+            let mut n = 1;
+            if let Some(v) = allow_code {
+                live[n] = v;
+                n += 1;
+            }
+            let base = pyre_object::gc_roots::pin_roots(&live[..n]);
+            let allow_slot = has_allow.then_some(base + 1);
+            let allow_code =
+                resolve_allow_code(allow_slot.map(pyre_object::gc_roots::shadow_stack_get))?;
+            let data = bytes_like(pyre_object::gc_roots::shadow_stack_get(base), "loads")?;
             unmarshal_bytes(data.as_slice(), allow_code)
         }
         // interp_marshal.py `dump(w_data, w_f, version=Py_MARSHAL_VERSION)`
@@ -1266,11 +1314,39 @@ crate::py_module! {
             #[kwonly]
             allow_code: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, crate::PyError> {
-            let version = resolve_version(version)?;
-            let allow_code = resolve_allow_code(allow_code)?;
-            let out = marshal_to_bytes(value, version, allow_code)?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let has_version = version.is_some();
+            let has_allow = allow_code.is_some();
+            let mut live = [pyre_object::PY_NULL; 4];
+            live[0] = value;
+            live[1] = file;
+            let mut n = 2;
+            if let Some(v) = version {
+                live[n] = v;
+                n += 1;
+            }
+            if let Some(v) = allow_code {
+                live[n] = v;
+                n += 1;
+            }
+            let base = pyre_object::gc_roots::pin_roots(&live[..n]);
+            let version_slot = has_version.then_some(base + 2);
+            let allow_slot = has_allow.then_some(base + 2 + usize::from(has_version));
+            let version =
+                resolve_version(version_slot.map(pyre_object::gc_roots::shadow_stack_get))?;
+            let allow_code =
+                resolve_allow_code(allow_slot.map(pyre_object::gc_roots::shadow_stack_get))?;
+            let out = marshal_to_bytes(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                version,
+                allow_code,
+            )?;
             let bytes = bytesobject::w_bytes_from_bytes(&out);
-            call_method(file, "write", &[bytes])?;
+            call_method(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+                "write",
+                &[bytes],
+            )?;
             Ok(w_none())
         }
         // interp_marshal.py `load(w_f)` reads one value from `f` and
@@ -1282,11 +1358,23 @@ crate::py_module! {
             #[kwonly]
             allow_code: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, crate::PyError> {
-            let allow_code = resolve_allow_code(allow_code)?;
             let _roots = pyre_object::gc_roots::push_roots();
+            let has_allow = allow_code.is_some();
+            let mut live = [pyre_object::PY_NULL; 2];
+            live[0] = file;
+            let mut n = 1;
+            if let Some(v) = allow_code {
+                live[n] = v;
+                n += 1;
+            }
+            let base = pyre_object::gc_roots::pin_roots(&live[..n]);
+            let allow_slot = has_allow.then_some(base + 1);
+            let allow_code =
+                resolve_allow_code(allow_slot.map(pyre_object::gc_roots::shadow_stack_get))?;
             let mut pending_error = None;
             let bag = PyreMarshalBag::new(&mut pending_error);
-            let mut reader = FileReader::new(file, bag.errors)?;
+            let mut reader =
+                FileReader::new(pyre_object::gc_roots::shadow_stack_get(base), bag.errors)?;
             let result = match wire::deserialize_value(&mut reader, bag) {
                 Ok(result) => result,
                 Err(error) => {
