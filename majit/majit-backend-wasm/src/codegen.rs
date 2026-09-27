@@ -552,7 +552,11 @@ impl FrameGeometry {
         }
         ext.value_slots = values;
         ext.extra_ordinary_homes += extra_homes;
-        let growth = (extra_values + extra_homes) as u64 * SLOT_SIZE;
+        // The source force area is `prefix_value_slots` wide and ends at
+        // `ca_frame_bytes`. One force arg per extra value slot keeps a
+        // GUARD_NOT_FORCED failarg past that prefix out of the call area.
+        let extra_force = extra_values;
+        let growth = (extra_values + extra_homes + extra_force) as u64 * SLOT_SIZE;
         ext.frame_bytes = self
             .frame_bytes
             .checked_add(growth as u32)
@@ -574,11 +578,45 @@ impl FrameGeometry {
     /// [`FRAME_SLOT_BASE`]; the rest sit in the tail.
     pub fn spill_slot_ofs(self, slot: u64) -> u64 {
         let prefix = self.prefix_value_slots as u64;
-        if slot < prefix {
+        if slot < prefix || !self.has_tail() {
             FRAME_SLOT_BASE + slot * SLOT_SIZE
         } else {
             self.tail_base + (slot - prefix) * SLOT_SIZE
         }
+    }
+
+    /// Physical `jf_frame` item of [`Self::spill_slot_ofs`]: `(offset -
+    /// FRAME_SLOT_BASE) / SLOT_SIZE`. Identity when the geometry has no tail,
+    /// so a recorded fail location and `FRAME_SLOT_BASE + loc * 8` name the
+    /// same byte the guest stored.
+    pub fn spill_slot_index(self, slot: u64) -> u64 {
+        (self.spill_slot_ofs(slot) - FRAME_SLOT_BASE) / SLOT_SIZE
+    }
+
+    /// First tail value slot as a physical item index.
+    pub fn value_tail_index(self) -> u64 {
+        (self.tail_base - FRAME_SLOT_BASE) / SLOT_SIZE
+    }
+
+    /// GUARD_NOT_FORCED(_2) failarg `slot`. The source reserves
+    /// `prefix_value_slots` words at [`Self::force_slot_base`]; the rest follow
+    /// the value and Ref tails.
+    pub fn force_slot_ofs(self, slot: u64) -> u64 {
+        let prefix = self.prefix_value_slots as u64;
+        if slot < prefix || !self.has_tail() {
+            self.force_slot_base + slot * SLOT_SIZE
+        } else {
+            self.force_tail_base() + (slot - prefix) * SLOT_SIZE
+        }
+    }
+
+    /// First force-tail byte. Zero when [`Self::has_tail`] is false.
+    pub fn force_tail_base(self) -> u64 {
+        if !self.has_tail() {
+            return 0;
+        }
+        let extra_values = (self.value_slots - self.prefix_value_slots) as u64;
+        self.tail_base + (extra_values + self.extra_ordinary_homes as u64) * SLOT_SIZE
     }
 
     /// LABEL scalar capture. In-prefix slots keep `slot * SLOT_SIZE`.
@@ -4718,6 +4756,7 @@ pub fn build_wasm_module(
     };
     let (mut guards, num_vars) = collect_guards_and_vars(analysis_inputargs, analysis_ops);
     park_guard_value_counters(&mut guards, inputargs.len());
+    record_physical_fail_locs(&mut guards, *frame);
 
     // An inlined bridge branches back into the owner with wasm `br`.  The
     // merged stream must therefore contain the local LABEL that opens the
@@ -4955,7 +4994,7 @@ pub fn build_wasm_module(
             if tp == Type::Ref
                 && let Some(home) = ref_homes.home(arg)
             {
-                let offset = frame.home_slot_base as usize + home as usize * SLOT_SIZE as usize;
+                let offset = frame.home_ofs(home as u64) as usize;
                 guard.force_ref_home_indices.push((offset / sign) as u32);
             }
         }
@@ -5417,7 +5456,7 @@ pub fn build_wasm_module(
         &spill_helper_indices,
     )?;
     if label_param_entry {
-        codes.function(&build_label_param_shim(trace_func_idx + 1));
+        codes.function(&build_label_param_shim(*frame, trace_func_idx + 1));
     }
     codes.function(&func);
     for &arity in &spill_arities {
@@ -5429,7 +5468,7 @@ pub fn build_wasm_module(
     Ok((module.finish(), guards, num_ref_homes, used_labels))
 }
 
-fn build_label_param_shim(wide_func_idx: u32) -> Function {
+fn build_label_param_shim(frame: FrameGeometry, wide_func_idx: u32) -> Function {
     let mut func = Function::new(Vec::new());
     let mut raw_sink = func.instructions();
     let mut sink = PeepSink::new(&mut raw_sink);
@@ -5437,7 +5476,8 @@ fn build_label_param_shim(wide_func_idx: u32) -> Function {
     sink.local_get(0);
     for k in 0..crate::FROZEN_LABEL_PARAM_ARITY {
         sink.local_get(0);
-        sink.i64_load(mem64(FRAME_SLOT_BASE + k as u64 * SLOT_SIZE));
+        // The narrow entry reloads what a JUMP stored with `spill_slot_ofs`.
+        sink.i64_load(mem64(frame.spill_slot_ofs(k as u64)));
     }
     sink.return_call(wide_func_idx);
     sink.end();
@@ -11376,7 +11416,7 @@ fn emit_force_arm(
         } else {
             emit_resolve(sink, constants, value_types, arg_ref);
         }
-        sink.i64_store(mem64(frame.force_slot_base + i as u64 * SLOT_SIZE));
+        sink.i64_store(mem64(frame.force_slot_ofs(i as u64)));
     }
     // x86 `store_force_descr`: the guard's descr cell, separate from `jf_descr`.
     // Zero remains the unarmed sentinel. `force` copies this word into `jf_descr`.
@@ -11695,6 +11735,22 @@ fn emit_memory_error_on_truthy(
         sink.unreachable();
     }
     sink.end();
+}
+
+/// `store_info_on_descr`: a fail location is the physical item the guest
+/// stored, so `FRAME_SLOT_BASE + loc * 8` reloads it. A geometry with no
+/// tail leaves the compact index unchanged.
+fn record_physical_fail_locs(guards: &mut [GuardExit], frame: FrameGeometry) {
+    if !frame.has_tail() {
+        return;
+    }
+    for guard in guards {
+        for loc in &mut guard.fail_locs {
+            if let Some(slot) = loc.as_mut() {
+                *slot = frame.spill_slot_index(*slot as u64) as usize;
+            }
+        }
+    }
 }
 
 fn physical_fail_slot(guard: &GuardExit, index: usize) -> Option<usize> {
