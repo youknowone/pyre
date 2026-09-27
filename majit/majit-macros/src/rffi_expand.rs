@@ -239,9 +239,13 @@ impl LlexternalInput {
         let name = &self.name;
         let deriv = self.derivation_consts(has_callback);
         let eci = self.compilation_info.as_ref().map(|eci| {
+            // One module declares several externals (`fcntl_int`, `fcntl_str`,
+            // …) that share an ECI. A fixed const name collides; the name is
+            // the declaration's, the value is still that ECI.
+            let info_name = format_ident!("_COMPILATION_INFO_{}", name);
             quote! {
-                #[allow(dead_code)]
-                const _COMPILATION_INFO: ::majit_rlib::rffi::ExternalCompilationInfo = #eci;
+                #[allow(dead_code, non_upper_case_globals)]
+                const #info_name: ::majit_rlib::rffi::ExternalCompilationInfo = #eci;
             }
         });
 
@@ -339,12 +343,17 @@ impl LlexternalInput {
             } else {
                 quote! {}
             };
+            // The residual callee is `ccall_<name>` (`call_external_function`).
+            // `jit_trace_fnaddrs` must carry that path or the funcbox stays a
+            // symbolic hash and the tracer cannot run the wrapper.
+            let ccall_fnaddr = self.ccall_fnaddr_registration();
             quote! {
                 #deriv
                 #eci
                 #around_assert
                 #funcptr
                 #funcptr_fnaddr
+                #ccall_fnaddr
                 #header
                 #vis unsafe fn #call_name(#(#params),*) -> #result {
                     #body
@@ -468,9 +477,32 @@ impl LlexternalInput {
     /// spelling `harvest_hints_from_llbcs` records for the funcptr.
     fn funcptr_fnaddr_registration(&self) -> TokenStream {
         let fp = format_ident!("__rffi_fp_{}", self.name);
+        self.helper_fnaddr_registration(
+            &fp,
+            &format_ident!("__RFFI_FP_FNADDR_{}", self.name),
+            &format_ident!("__rffi_register_fnaddr_{}", self.name),
+        )
+    }
+
+    /// Publish `ccall_<name>` the same way. The path is
+    /// `module_path!()::ccall_<name>`, the residual callee
+    /// `register_macro_helper_trace_fnaddr` binds.
+    fn ccall_fnaddr_registration(&self) -> TokenStream {
+        let call_name = format_ident!("ccall_{}", self.name);
+        self.helper_fnaddr_registration(
+            &call_name,
+            &format_ident!("__RFFI_CCALL_FNADDR_{}", self.name),
+            &format_ident!("__rffi_register_ccall_fnaddr_{}", self.name),
+        )
+    }
+
+    fn helper_fnaddr_registration(
+        &self,
+        func: &Ident,
+        static_name: &Ident,
+        ctor_name: &Ident,
+    ) -> TokenStream {
         let arity = u8::try_from(self.args.len()).unwrap_or(u8::MAX);
-        let static_name = format_ident!("__RFFI_FP_FNADDR_{}", self.name);
-        let ctor_name = format_ident!("__rffi_register_fnaddr_{}", self.name);
         quote! {
             #[cfg(not(target_arch = "wasm32"))]
             #[::majit_ir::linkme::distributed_slice(::majit_ir::helper_fnaddr::HELPER_FNADDRS)]
@@ -478,16 +510,16 @@ impl LlexternalInput {
             #[allow(non_upper_case_globals)]
             static #static_name: ::majit_ir::helper_fnaddr::HelperFnAddr =
                 ::majit_ir::helper_fnaddr::HelperFnAddr::new(
-                    ::core::concat!(::core::module_path!(), "::", stringify!(#fp)),
-                    #fp as *const (),
+                    ::core::concat!(::core::module_path!(), "::", stringify!(#func)),
+                    #func as *const (),
                     #arity,
                 );
             #[cfg(target_arch = "wasm32")]
             #[::ctor::ctor(unsafe)]
             fn #ctor_name() {
                 ::majit_ir::helper_fnaddr::register(
-                    ::core::concat!(::core::module_path!(), "::", stringify!(#fp)),
-                    #fp as *const (),
+                    ::core::concat!(::core::module_path!(), "::", stringify!(#func)),
+                    #func as *const (),
                     #arity,
                 );
             }

@@ -491,7 +491,11 @@ fn collect_aroundstate_rvalue(
                 collect_aroundstate_operand(llbc, operand, fn_id, save_err);
             }
         }
-        Rvalue::Cast(_, operand, _) => collect_aroundstate_operand(llbc, operand, fn_id, save_err),
+        // `fn_ptr as unsafe extern "C" fn(...)` is `UnaryOp(Cast(FnPtr), FnDef)`,
+        // not a bare `Cast` rvalue. The tuple aggregate then moves that local.
+        Rvalue::UnaryOp(_, operand) | Rvalue::Cast(_, operand, _) => {
+            collect_aroundstate_operand(llbc, operand, fn_id, save_err);
+        }
         _ => {}
     }
 }

@@ -3552,12 +3552,19 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         } else if ctx.fbw_mode.transparent_helper_subwalk
             && call_opcode.is_call_may_force()
             && !records_inside_transparent_helper(addr)
+            && !call_descr.get_extra_info().is_call_release_gil()
         {
             // These helpers are `dont_look_inside_cannot_raise`. Their
             // call descr is still `EF_RANDOM_EFFECTS` because the graph
             // is top, so the opcode is may-force. They do not call back
             // into Python, so the guard the comment above is about does
             // not fail and the call can be recorded.
+            // `pyjitpl.py` `do_residual_call` still runs
+            // `execute_and_record_varargs` on `call_external_function`
+            // (`ccall_*`). `direct_call_release_gil` only rewrites the
+            // recorded op. The wrapper releases the GIL around the C
+            // call, so it does not re-enter Python and `GUARD_NOT_FORCED`
+            // cannot fail for a callback.
             Some(("may-force-in-transparent-helper", addr, 0))
         } else {
             None
