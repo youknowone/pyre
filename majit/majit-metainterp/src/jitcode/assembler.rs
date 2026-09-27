@@ -7265,6 +7265,12 @@ fn resolve_call_release_gil_target(
     // resolved `(tgt_func, saveerr)` from `_call_aroundstate_target_`
     // (`call.py`) are preserved.
     if effect_info.call_release_gil_target.0 == 1 {
+        // `#[jit_release_gil]` only. The translated aroundstate path never
+        // stores `1`; that would rewrite to the residual callee (`ccall_*`).
+        debug_assert!(
+            effect_info.call_release_gil_target.1 == 0,
+            "#[jit_release_gil] sentinel is (1, 0); save_err comes from JitCallTarget"
+        );
         effect_info.call_release_gil_target = (realfuncaddr as usize as u64, save_err);
     }
     effect_info

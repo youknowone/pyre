@@ -1581,6 +1581,7 @@ pub fn rehydrate_build_descr_raw_sets() {
         // publish the object table before any CallDescr asks for an id.
         for i in 0..effect_info_count() {
             let (translated_id, mut effect_info) = load_effect_info(i);
+            crate::runtime_fnaddr_patch::rewrite_call_release_gil_target(&mut effect_info);
             crate::descr::prepare_frozen_effect_info(&mut effect_info);
             majit_ir::effectinfo::intern_translated_effect_info(translated_id, effect_info);
         }
@@ -3266,6 +3267,7 @@ mod tests {
 
         for i in 0..effect_info_count() {
             let (translated_id, mut effect_info) = load_effect_info(i);
+            crate::runtime_fnaddr_patch::rewrite_call_release_gil_target(&mut effect_info);
             crate::descr::prepare_frozen_effect_info(&mut effect_info);
             majit_ir::effectinfo::intern_translated_effect_info(translated_id, effect_info);
         }

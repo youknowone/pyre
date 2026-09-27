@@ -6527,6 +6527,135 @@ impl CallControl {
         self.stamp_graph_hint(&path, "close_stack");
     }
 
+    /// `func._call_aroundstate_target_ = (funcptr, save_err)` (`rffi.py`,
+    /// read by `call.py` `CallControl.getcalldescr`).  `identity` is the
+    /// funcptr path, optionally `path\tlink_name`.  Stored on the funcobj,
+    /// which is where the attribute lives upstream.
+    pub fn mark_call_aroundstate_target(
+        &mut self,
+        path: CallPath,
+        identity: String,
+        save_err: i64,
+    ) {
+        self.func_effects_mut(&path).call_aroundstate_target = Some((identity, save_err));
+        self.stamp_graph_hint(&path, "aroundstate");
+    }
+
+    /// Harvested `aroundstate_target:<save_err>:<identity>` hint.  Returns
+    /// whether `hint` was that token.
+    pub fn mark_aroundstate_hint(&mut self, path: CallPath, hint: &str) -> bool {
+        let Some(rest) = hint.strip_prefix("aroundstate_target:") else {
+            return false;
+        };
+        let Some((save, identity)) = rest.split_once(':') else {
+            panic!("aroundstate_target hint `{hint}` is missing save_err");
+        };
+        let Ok(save_err) = save.parse::<i64>() else {
+            panic!("aroundstate_target hint `{hint}` has an undecodable save_err");
+        };
+        self.mark_call_aroundstate_target(path, identity.to_string(), save_err);
+        true
+    }
+
+    /// `call.py` `getcalldescr`: `assert getattr(funcobj, 'natural_arity', -1) == -1`
+    /// and the same assert on `tgt_func._obj`.
+    fn assert_natural_arity_minus_one(&self, path: &CallPath) {
+        let arity = self
+            .function_graphs
+            .get(path)
+            .and_then(|graph| {
+                graph.hints.iter().find_map(|hint| {
+                    hint.strip_prefix("natural_arity:")
+                        .and_then(|rest| rest.parse::<i64>().ok())
+                })
+            })
+            .unwrap_or(-1);
+        assert!(
+            arity == -1,
+            "JIT backend does not support natural_arity calls, please wrap it in a helper"
+        );
+    }
+
+    /// Direct-call `call_release_gil_target` from
+    /// `func._call_aroundstate_target_` (`call.py` `getcalldescr`).
+    fn call_release_gil_target_for(&self, target: &CallTarget) -> (u64, i32) {
+        let Some(path) = self.resolved_direct_path(target) else {
+            return EffectInfo::_NO_CALL_RELEASE_GIL_TARGET;
+        };
+        self.assert_natural_arity_minus_one(&path);
+        let Some(effects) = self.func_effects_with_crate_alias(&path) else {
+            return EffectInfo::_NO_CALL_RELEASE_GIL_TARGET;
+        };
+        let Some((identity, save_err)) = effects.call_aroundstate_target.as_ref() else {
+            return EffectInfo::_NO_CALL_RELEASE_GIL_TARGET;
+        };
+        let tgt_path = identity.split('\t').next().unwrap_or("");
+        if !tgt_path.is_empty() {
+            self.assert_natural_arity_minus_one(&CallPath::from_segments(
+                tgt_path.split("::").filter(|seg| !seg.is_empty()),
+            ));
+        }
+        let save_err = i32::try_from(*save_err).unwrap_or_else(|_| {
+            panic!("getcalldescr: _call_aroundstate_target_ save_err {save_err} does not fit i32")
+        });
+        // `call.py` `getcalldescr`: `tgt_func = llmemory.cast_ptr_to_adr(tgt_func)`.
+        // A `register_macro_helper_trace_fnaddr` hit is that address. A miss
+        // is `symbolic_fnaddr_for_path` of the funcptr, rewritten later by
+        // `rewrite_call_release_gil_target`. The `(1, 0)` sentinel is only
+        // `#[jit_release_gil]`, whose callee is already the raw function.
+        let symbolic = CallPath::from_segments(tgt_path.split("::").filter(|seg| !seg.is_empty()));
+        if symbolic.segments.is_empty() {
+            panic!("getcalldescr: _call_aroundstate_target_ for {path} has no funcptr path");
+        }
+        let tgt_func = self
+            .registered_fnaddr_for_aroundstate_identity(identity)
+            .filter(|&addr| addr != 0 && addr != 1)
+            .map(|addr| addr as u64)
+            .unwrap_or_else(|| symbolic_fnaddr_for_path(&symbolic) as u64);
+        debug_assert_ne!(tgt_func, 1);
+        (tgt_func, save_err)
+    }
+
+    /// Look up the marker's funcptr in `function_fnaddrs`.  Tries the path
+    /// (crate-stripped and `crate::` alias, the spellings
+    /// `register_macro_helper_trace_fnaddr` binds) and then `link_name`.
+    fn registered_fnaddr_for_aroundstate_identity(&self, identity: &str) -> Option<i64> {
+        let (path, link) = match identity.split_once('\t') {
+            Some((path, link)) => (path, Some(link)),
+            None => (identity, None),
+        };
+        if let Some(addr) = self.registered_fnaddr_for_path_str(path) {
+            return Some(addr);
+        }
+        let link = link.filter(|name| !name.is_empty())?;
+        self.registered_fnaddr_for_path_str(link)
+    }
+
+    fn registered_fnaddr_for_path_str(&self, path: &str) -> Option<i64> {
+        let segments: Vec<&str> = path.split("::").filter(|seg| !seg.is_empty()).collect();
+        if segments.is_empty() {
+            return None;
+        }
+        let exact = CallPath::from_segments(segments.iter().copied());
+        if let Some(&addr) = self.function_fnaddrs.get(&exact) {
+            return Some(addr);
+        }
+        if segments.len() > 1 {
+            let stripped = CallPath::from_segments(segments[1..].iter().copied());
+            if let Some(&addr) = self.function_fnaddrs.get(&stripped) {
+                return Some(addr);
+            }
+            let mut crate_alias = Vec::with_capacity(segments.len());
+            crate_alias.push("crate");
+            crate_alias.extend(segments[1..].iter().copied());
+            let aliased = CallPath::from_segments(crate_alias);
+            if let Some(&addr) = self.function_fnaddrs.get(&aliased) {
+                return Some(addr);
+            }
+        }
+        None
+    }
+
     /// RPython: collectanalyze.py — `funcobj.random_effects_on_gcobjs`.
     /// Mark an external target as having random GC effects.
     pub fn mark_external_gc_effects(&mut self, path: CallPath) {
@@ -7528,22 +7657,18 @@ impl CallControl {
             other => panic!("getcalldescr called on non-call op: {other:?}"),
         };
 
-        // RPython call.py:240-257 direct_call branch: read `_elidable_function_`
-        // / `_jit_loop_invariant_` off the funcobj.  Indirect calls have no
-        // single funcobj so the flags are always false — they are enforced
-        // family-wide below.
+        // RPython `call.py` `CallControl.getcalldescr` direct_call branch:
+        // read `_elidable_function_` / `_jit_loop_invariant_` /
+        // `_call_aroundstate_target_` off the funcobj.  Indirect calls have
+        // no single funcobj so the flags are always false — they are
+        // enforced family-wide below (`_call_aroundstate_target_` is an
+        // error on any family member).
         //
-        // call.py:252-257 also reads
-        // `_call_aroundstate_target_` here and packages it into the
-        // EffectInfo's `call_release_gil_target`.  That direct-call
-        // propagation is intentionally omitted from this translated-graph
-        // calldescr path — pyre's release-GIL surface is driven by the
-        // separate `#[jit_release_gil]` / jit_interp macro pipeline (the
-        // metainterp assembler resolves the target there), and no translated
-        // graph call carries an aroundstate target, so
-        // `effectinfo_from_writeanalyze` hardcodes
-        // `_NO_CALL_RELEASE_GIL_TARGET`.  The indirect family still rejects
-        // aroundstate members below (call.py:271-272).
+        // `call.py` also asserts `natural_arity == -1` on the funcobj and
+        // on `tgt_func._obj` ("JIT backend does not support natural_arity
+        // calls, please wrap it in a helper").  The aroundstate marker is
+        // emitted only for `natural_arity == -1`; a graph that records
+        // `natural_arity:<N>` other than -1 is rejected here.
         let (elidable, loopinvariant) = match shape {
             CallShape::Direct(target) => (self.is_elidable(target), self.is_loopinvariant(target)),
             CallShape::Indirect(_) => (false, false),
@@ -7882,6 +8007,17 @@ impl CallControl {
             CallShape::Direct(target) => self.cached_can_collect(target, cache),
             CallShape::Indirect(graphs) => self.cached_can_collect_family(graphs, cache),
         };
+        // `call.py` `getcalldescr`: `tgt_func, tgt_saveerr =
+        // func._call_aroundstate_target_` then
+        // `llmemory.cast_ptr_to_adr(tgt_func)`.  The translator has the
+        // funcptr's path / `link_name`.  A `register_macro_helper_trace_fnaddr`
+        // binding supplies the address; a miss records
+        // `symbolic_fnaddr_for_path` of that funcptr.  `#[jit_release_gil]`
+        // still uses the `(1, 0)` sentinel on its own descrs.
+        let call_release_gil_target = match shape {
+            CallShape::Direct(target) => self.call_release_gil_target_for(target),
+            CallShape::Indirect(_) => EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+        };
         let mut effectinfo = effectinfo_from_writeanalyze(
             effects,
             extraeffect,
@@ -7891,6 +8027,7 @@ impl CallControl {
             extradescrs,
             &effect_callee,
             self,
+            call_release_gil_target,
         );
         // `effectinfo_from_writeanalyze` rewrites a top read/write set to
         // `EF_RANDOM_EFFECTS`.  A `#[dont_look_inside_cannot_raise]`
@@ -8161,6 +8298,7 @@ pub fn effectinfo_from_writeanalyze(
     extradescrs: Option<Vec<DescrRef>>,
     callee_path: &str,
     cc: &CallControl,
+    call_release_gil_target: (u64, i32),
 ) -> EffectInfo {
     // effectinfo.py:285: if effects is top_set or extraeffect == EF_RANDOM_EFFECTS:
     if effects.is_top || extraeffect == ExtraEffect::RandomEffects {
@@ -8190,7 +8328,7 @@ pub fn effectinfo_from_writeanalyze(
             extradescrs: extradescrs.clone(),
             can_invalidate,
             can_collect: true, // effectinfo.py:364-365: forces → can_collect = True
-            call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+            call_release_gil_target,
         };
     }
 
@@ -8386,7 +8524,7 @@ pub fn effectinfo_from_writeanalyze(
             extradescrs: extradescrs.clone(),
             can_invalidate,
             can_collect: true,
-            call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+            call_release_gil_target,
         };
     };
     EffectInfo {
@@ -8423,7 +8561,7 @@ pub fn effectinfo_from_writeanalyze(
         extradescrs,
         can_invalidate,
         can_collect,
-        call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+        call_release_gil_target,
     }
 }
 
@@ -13378,6 +13516,86 @@ mod tests {
             FunctionGraph::new("ImpureImpl::bar"),
         );
         cc.mark_elidable(CallPath::from_segments(["PureImpl", "bar"]));
+        cc.find_all_graphs_for_tests();
+
+        let family = cc.all_impls_for_indirect("Foo", "bar");
+        let mut cache = AnalysisCache::default();
+        let _ = cc.getcalldescr(
+            &indirect_call_op(Some(family)),
+            vec![Type::Ref],
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+    }
+
+    /// `call.py` `getcalldescr` direct_call: `_call_aroundstate_target_`
+    /// fills `call_release_gil_target` with the funcptr address.  A miss in
+    /// `function_fnaddrs` is `symbolic_fnaddr_for_path` of that funcptr, not
+    /// `1` and not the residual callee.
+    #[test]
+    fn getcalldescr_direct_aroundstate_is_call_release_gil() {
+        use majit_ir::value::Type;
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["posix", "ccall_ioctl"]);
+        register_int_result_graph(&mut cc, path.clone(), simple_graph("ccall_ioctl"));
+        cc.mark_call_aroundstate_target(path.clone(), "posix::ioctl\tioctl".into(), 5);
+        cc.find_all_graphs_for_tests();
+
+        let call = direct_call_op(CallTarget::function_path(["posix", "ccall_ioctl"]));
+        let descr = |cc: &CallControl| {
+            let mut cache = AnalysisCache::default();
+            cc.getcalldescr(
+                &call,
+                Vec::new(),
+                Type::Int,
+                OopSpecIndex::None,
+                None,
+                &mut cache,
+                None,
+            )
+        };
+        cc.register_function_fnaddr(path.clone(), 0x2222);
+        let unresolved = descr(&cc);
+        let funcptr = CallPath::from_segments(["posix", "ioctl"]);
+        let symbolic = symbolic_fnaddr_for_path(&funcptr) as u64;
+        assert!(unresolved.extra_info.is_call_release_gil());
+        assert_eq!(unresolved.extra_info.call_release_gil_target, (symbolic, 5));
+        assert_ne!(symbolic, 1);
+        assert_ne!(symbolic, 0x2222);
+
+        cc.register_macro_helper_trace_fnaddr("fixture::posix::ioctl", 0x1111);
+        let resolved = descr(&cc);
+        assert!(resolved.extra_info.is_call_release_gil());
+        assert_eq!(resolved.extra_info.call_release_gil_target, (0x1111, 5));
+    }
+
+    /// `call.py` `getcalldescr` indirect_call: a family member with
+    /// `_call_aroundstate_target_` is an error.
+    #[test]
+    #[should_panic(expected = "_call_aroundstate_target_")]
+    fn getcalldescr_rejects_aroundstate_indirect_family() {
+        use majit_ir::value::Type;
+        let mut cc = CallControl::new();
+        cc.register_trait_method(
+            "bar",
+            Some("Foo"),
+            "GilImpl",
+            FunctionGraph::new("GilImpl::bar"),
+        );
+        cc.register_trait_method(
+            "bar",
+            Some("Foo"),
+            "PlainImpl",
+            FunctionGraph::new("PlainImpl::bar"),
+        );
+        cc.mark_call_aroundstate_target(
+            CallPath::from_segments(["GilImpl", "bar"]),
+            "posix::ioctl".into(),
+            2,
+        );
         cc.find_all_graphs_for_tests();
 
         let family = cc.all_impls_for_indirect("Foo", "bar");

@@ -1929,6 +1929,9 @@ fn analyze_pipeline_from_module_paths(
             }
             // RPython: hints bound to graph identity.
             for hint in &method.hints {
+                if call_control.mark_aroundstate_hint(path.clone(), hint) {
+                    continue;
+                }
                 match hint.as_str() {
                     "elidable" => call_control.mark_elidable(path.clone()),
                     "elidable_cannot_raise" => {
@@ -2180,6 +2183,9 @@ fn analyze_pipeline_from_module_paths(
         }
         // RPython: hints bound to graph identity.
         for hint in &method_info.hints {
+            if call_control.mark_aroundstate_hint(path.clone(), hint) {
+                continue;
+            }
             match hint.as_str() {
                 "elidable" => call_control.mark_elidable(path.clone()),
                 "elidable_cannot_raise" => call_control.mark_cannot_raise_assertion(path.clone()),
@@ -2244,6 +2250,9 @@ fn analyze_pipeline_from_module_paths(
                 // rlib/jit.py — `@oopspec(spec)` registers func.oopspec = spec.
                 if let Some(spec) = hint.strip_prefix("oopspec:") {
                     call_control.mark_oopspec(p.clone(), spec.to_string());
+                    continue;
+                }
+                if call_control.mark_aroundstate_hint(p.clone(), hint) {
                     continue;
                 }
                 // `support.py argnames = ll_func.__code__.co_varnames[:nb_args]`

@@ -196,6 +196,65 @@ static FNADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|| {
     correspondence
 });
 
+/// Rewrite `EffectInfo.call_release_gil_target.0` from the build-script
+/// address to this process's address.
+///
+/// `call.py` `getcalldescr` stores `llmemory.cast_ptr_to_adr(tgt_func)`,
+/// the raw funcptr, not the `ccall_*` wrapper. A translate-time miss is
+/// `symbolic_fnaddr_for_path` of that funcptr. `0` and the `#[jit_release_gil]`
+/// sentinel `1` are left alone. Anything else that this process cannot map
+/// through `jit_trace_fnaddrs` panics with the path.
+pub fn rewrite_call_release_gil_target(effect_info: &mut majit_ir::EffectInfo) {
+    let addr = effect_info.call_release_gil_target.0;
+    if addr == 0 || addr == 1 {
+        return;
+    }
+    effect_info.call_release_gil_target.0 = release_gil_runtime_addr(addr);
+}
+
+fn release_gil_runtime_addr(addr: u64) -> u64 {
+    let addr_i = addr as i64;
+    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(addr_i) {
+        let path = symbolic_fnaddr_path(addr_i).unwrap_or_else(|| {
+            panic!("call_release_gil_target {addr:#x} is a symbolic fnaddr with no recorded path")
+        });
+        return runtime_addr_for_path(path).unwrap_or_else(|| {
+            panic!("call_release_gil_target path {path} is not in jit_trace_fnaddrs")
+        }) as u64;
+    }
+    if let Some(&runtime) = FNADDR_CORRESPONDENCE.get(&addr_i) {
+        return runtime as u64;
+    }
+    let bindings = build_time_fnaddr_bindings();
+    let Some(path) = bindings
+        .iter()
+        .find(|(_, build)| *build == addr_i)
+        .map(|(path, _)| path.clone())
+    else {
+        panic!("call_release_gil_target address {addr:#x} has no jit_trace_fnaddrs path");
+    };
+    runtime_addr_for_path(&path).unwrap_or_else(|| {
+        panic!("call_release_gil_target path {path} is not in jit_trace_fnaddrs")
+    }) as u64
+}
+
+fn runtime_addr_for_path(path: &str) -> Option<i64> {
+    if let Some(addr) = runtime_fnaddr_by_path(path) {
+        return Some(addr);
+    }
+    // The recorded path is crate-stripped; the runtime table spells the
+    // crate.  Accept the suffix match only when it names one function.
+    let suffix = format!("::{path}");
+    let mut matches = pyre_interpreter::jit_trace_fnaddrs()
+        .into_iter()
+        .filter(|(registered, _)| registered.ends_with(suffix.as_str()));
+    let (first, addr) = matches.next()?;
+    if let Some((second, _)) = matches.next() {
+        panic!("call_release_gil_target path {path} is ambiguous: {first}, {second}");
+    }
+    Some(addr)
+}
+
 /// Build-time `(name, build_addr)` snapshot for the host `PyType` singleton
 /// pointers the codewriter baked into `constants_i` (supplied through
 /// `HostStaticAddrs.pytypes`). Same ASLR hazard + bincode round-trip as

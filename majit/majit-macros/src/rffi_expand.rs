@@ -333,11 +333,18 @@ impl LlexternalInput {
                 quote! { #[::majit_macros::dont_look_inside] }
             };
             let vis = &self.vis;
+            let funcptr_fnaddr = if invoke && self.macro_path.is_none() && self.natural_arity == -1
+            {
+                self.funcptr_fnaddr_registration()
+            } else {
+                quote! {}
+            };
             quote! {
                 #deriv
                 #eci
                 #around_assert
                 #funcptr
+                #funcptr_fnaddr
                 #header
                 #vis unsafe fn #call_name(#(#params),*) -> #result {
                     #body
@@ -452,6 +459,39 @@ impl LlexternalInput {
                 (quote! { #ident: #ty }, ident)
             })
             .unzip()
+    }
+
+    /// Publish the extern funcptr on `HELPER_FNADDRS`, the slice
+    /// `jit_trace_fnaddrs` folds in (`merge_macro_helper_fnaddrs`). The path
+    /// is `module_path!()::__rffi_fp_<name>`, which
+    /// `register_macro_helper_trace_fnaddr` binds under the crate-stripped
+    /// spelling `harvest_hints_from_llbcs` records for the funcptr.
+    fn funcptr_fnaddr_registration(&self) -> TokenStream {
+        let fp = format_ident!("__rffi_fp_{}", self.name);
+        let arity = u8::try_from(self.args.len()).unwrap_or(u8::MAX);
+        let static_name = format_ident!("__RFFI_FP_FNADDR_{}", self.name);
+        let ctor_name = format_ident!("__rffi_register_fnaddr_{}", self.name);
+        quote! {
+            #[cfg(not(target_arch = "wasm32"))]
+            #[::majit_ir::linkme::distributed_slice(::majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+            #[linkme(crate = ::majit_ir::linkme)]
+            #[allow(non_upper_case_globals)]
+            static #static_name: ::majit_ir::helper_fnaddr::HelperFnAddr =
+                ::majit_ir::helper_fnaddr::HelperFnAddr::new(
+                    ::core::concat!(::core::module_path!(), "::", stringify!(#fp)),
+                    #fp as *const (),
+                    #arity,
+                );
+            #[cfg(target_arch = "wasm32")]
+            #[::ctor::ctor(unsafe)]
+            fn #ctor_name() {
+                ::majit_ir::helper_fnaddr::register(
+                    ::core::concat!(::core::module_path!(), "::", stringify!(#fp)),
+                    #fp as *const (),
+                    #arity,
+                );
+            }
+        }
     }
 
     fn funcptr_path(&self) -> TokenStream {

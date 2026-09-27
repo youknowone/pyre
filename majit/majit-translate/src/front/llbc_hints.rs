@@ -1,7 +1,9 @@
 //! Harvest JIT-hint markers from the ullbc surrogate consts the
 //! `majit_macros` proc-macros emit (`_elidable_function_<NAME>`,
 //! `_jit_look_inside_<NAME>`, `_jit_loop_invariant_<NAME>`,
-//! `_jit_unroll_safe_<NAME>`, `_not_rpython_<NAME>`, `oopspec_<NAME>`).
+//! `_jit_unroll_safe_<NAME>`, `_not_rpython_<NAME>`, `oopspec_<NAME>`,
+//! `_gctransformer_hint_close_stack_<NAME>`,
+//! `_call_aroundstate_target_<NAME>`).
 //!
 //! The source attribute (`#[elidable]` / `#[dont_look_inside]` / …) is
 //! consumed by the proc-macro at expansion time and does NOT survive in
@@ -49,6 +51,9 @@ const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
         "_annspecialcase_call_location_",
         &["specialize:call_location"],
     ),
+    // rffi.py `call_external_function._gctransformer_hint_close_stack_ = True`
+    // (`call.py` `guess_call_kind` / `get_jitcode` residual gate).
+    ("_gctransformer_hint_close_stack_", &["close_stack"]),
 ];
 
 /// Build a `{crate_stripped_fn_path → sorted-deduped hints}` map from
@@ -127,6 +132,32 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
                     &mut out,
                     marker_path_to_fn_path(&path, "oopspec_", &function_paths),
                     &format!("oopspec:{spec}"),
+                );
+                continue;
+            }
+            // `#[call_aroundstate_target(funcptr = .., save_err = N)]` emits
+            // `_call_aroundstate_target_<fn> = (funcptr, save_err)`
+            // (`rffi.py` `call_external_function._call_aroundstate_target_`).
+            // The payload is the const's value: the extern funcptr's path
+            // and/or `link_name`, plus `save_err`. `call.py` `getcalldescr`
+            // reads that pair into `EffectInfo.call_release_gil_target`.
+            if leaf.starts_with("_call_aroundstate_target_") {
+                let (identity, save_err) =
+                    decode_aroundstate_marker(llbc, gd).unwrap_or_else(|| {
+                        panic!(
+                            "_call_aroundstate_target_ marker `{path}` has an \
+                         undecodable initializer; the macro emits a \
+                         (funcptr, save_err) tuple, so this signals a Charon \
+                         encoding change"
+                        )
+                    });
+                let fn_path =
+                    marker_path_to_fn_path(&path, "_call_aroundstate_target_", &function_paths);
+                push_hint(&mut out, fn_path.clone(), "aroundstate");
+                push_hint(
+                    &mut out,
+                    fn_path,
+                    &format!("aroundstate_target:{save_err}:{identity}"),
                 );
                 continue;
             }
@@ -404,6 +435,100 @@ fn decode_str_const(llbc: &Llbc, value: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// `_call_aroundstate_target_<fn>` initializer: `(funcptr, save_err: i64)`.
+///
+/// Charon lowers the tuple as an `Aggregate` (or a single const) whose
+/// operands are an `FnDef` of the extern funcptr and a scalar. The funcptr
+/// identity is its crate-stripped path, and `ItemMeta.attr_info.rename`
+/// when that is the `link_name`. The two are joined with a tab so a later
+/// `function_fnaddrs` lookup (`register_macro_helper_trace_fnaddr`) can try
+/// either spelling. `None` means the initializer is present but not that
+/// shape — the caller panics.
+fn decode_aroundstate_marker(llbc: &Llbc, gd: &GlobalDecl) -> Option<(String, i64)> {
+    // Named consts point at their initializer by a `Call` inside `value`.
+    let init_id = marker_init_fun_id(gd)?;
+    let body = llbc.fn_by_id(init_id)?.unstructured()?;
+    let mut fn_id: Option<u64> = None;
+    let mut save_err: Option<i64> = None;
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(_, rvalue)) = stmt.stmt_kind() else {
+                continue;
+            };
+            collect_aroundstate_rvalue(llbc, &rvalue, &mut fn_id, &mut save_err);
+        }
+    }
+    let save_err = save_err?;
+    let fd = llbc.fn_by_id(fn_id?)?;
+    let path = strip_crate_prefix(&fd.item_meta.name_path());
+    let link = fd
+        .item_meta
+        .attr_info
+        .rename
+        .as_deref()
+        .filter(|name| !name.is_empty());
+    let identity = match link {
+        Some(link) if !path.is_empty() => format!("{path}\t{link}"),
+        Some(link) => link.to_string(),
+        None => path,
+    };
+    if identity.is_empty() {
+        return None;
+    }
+    Some((identity, save_err))
+}
+
+fn collect_aroundstate_rvalue(
+    llbc: &Llbc,
+    rvalue: &Rvalue,
+    fn_id: &mut Option<u64>,
+    save_err: &mut Option<i64>,
+) {
+    match rvalue {
+        Rvalue::Use(operand, _) => collect_aroundstate_operand(llbc, operand, fn_id, save_err),
+        Rvalue::Aggregate(_, operands) => {
+            for operand in operands {
+                collect_aroundstate_operand(llbc, operand, fn_id, save_err);
+            }
+        }
+        Rvalue::Cast(_, operand, _) => collect_aroundstate_operand(llbc, operand, fn_id, save_err),
+        _ => {}
+    }
+}
+
+fn collect_aroundstate_operand(
+    llbc: &Llbc,
+    operand: &Operand,
+    fn_id: &mut Option<u64>,
+    save_err: &mut Option<i64>,
+) {
+    let Operand::Const(value) = operand else {
+        return;
+    };
+    if fn_id.is_none() {
+        *fn_id = majit_charon_reader::ullbc::const_fn_def_regular_id(llbc, value);
+    }
+    if save_err.is_none() {
+        *save_err = llbc
+            .const_expr_literal(value)
+            .and_then(|lit| scalar_pair_i64(lit.get("Scalar")?));
+    }
+}
+
+/// `{"Signed": [ty, "n"]}` / `{"Unsigned": [ty, "n"]}`, the `save_err`
+/// half of `_call_aroundstate_target_`.
+fn scalar_pair_i64(scalar: &serde_json::Value) -> Option<i64> {
+    let obj = scalar.as_object()?;
+    ["Signed", "Unsigned"].iter().find_map(|key| {
+        obj.get(*key)?
+            .as_array()?
+            .get(1)?
+            .as_str()?
+            .parse::<i64>()
+            .ok()
+    })
+}
+
 fn decode_bool_const(llbc: &Llbc, value: &serde_json::Value) -> Option<bool> {
     llbc.const_expr_literal(value)?.get("Bool")?.as_bool()
 }
@@ -539,6 +664,42 @@ mod tests {
                 &llbc,
                 &serde_json::json!([{"Bool": true}, {"Deduplicated": 1}])
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn aroundstate_operands_decode_the_funcptr_and_save_err() {
+        // `(funcptr, save_err)`: an `FnDef` const and an `Integer` const,
+        // each in the `[kind, ty]` `ConstantExpr` shape.
+        let llbc = majit_charon_reader::Llbc::from_slice(
+            br#"{"charon_version":"t","has_errors":false,"translated":{"crate_name":"c","fun_decls":[]}}"#,
+        )
+        .unwrap();
+        let ty = serde_json::json!({"Deduplicated": 1});
+        let funcptr = super::Operand::Const(serde_json::json!([
+            {"FnDef": {"kind": {"Fun": 7}}},
+            ty
+        ]));
+        let save_err = super::Operand::Const(serde_json::json!([
+            {"Integer": {"Signed": ["I64", "5"]}},
+            ty
+        ]));
+        let (mut fn_id, mut save) = (None, None);
+        super::collect_aroundstate_operand(&llbc, &funcptr, &mut fn_id, &mut save);
+        super::collect_aroundstate_operand(&llbc, &save_err, &mut fn_id, &mut save);
+        assert_eq!(fn_id, Some(7));
+        assert_eq!(save, Some(5));
+    }
+
+    #[test]
+    fn scalar_pair_i64_reads_signed_and_unsigned() {
+        let signed = serde_json::json!({"Signed": ["I64", "-3"]});
+        let unsigned = serde_json::json!({"Unsigned": ["U32", "4"]});
+        assert_eq!(super::scalar_pair_i64(&signed), Some(-3));
+        assert_eq!(super::scalar_pair_i64(&unsigned), Some(4));
+        assert_eq!(
+            super::scalar_pair_i64(&serde_json::json!({"Bool": true})),
             None
         );
     }
