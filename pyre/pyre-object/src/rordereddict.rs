@@ -19,16 +19,26 @@
 //!
 //! # Slots are not positions
 //!
-//! `entries.len()` is upstream's `num_ever_used_items` and [`RDict::len`] is
-//! `num_live_items`; a tombstone makes them diverge.  Every index this type
-//! hands out or accepts — [`RDict::index_of`], [`RDict::get_slot`],
-//! [`RDict::remove_slot`] — is a **slot**, an index into `entries`, never the
-//! n-th live pair.  Walk a dict with `0..d.entry_slots()` and skip the slots
-//! whose `f_valid` is false, which is what `_ll_dictnext` (1373) does.
+//! `num_ever_used_items` and [`RDict::len`] (`num_live_items`) diverge when a
+//! slot is a tombstone.  `entries` is `DICTENTRYARRAY` (`get_ll_dict`): a
+//! GC array whose `length` is the allocation, null when that length is 0.
+//! Every index this type hands out or accepts — [`RDict::index_of`],
+//! [`RDict::get_slot`], [`RDict::remove_slot`] — is a **slot**, an index into
+//! `entries`, never the n-th live pair.  Walk a dict with `0..d.entry_slots()`
+//! and skip the slots whose `f_valid` is false, which is what `_ll_dictnext`
+//! does.
 
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
+
+pub use crate::rordereddict_entries::{
+    Entry, EntryDummy, GcEntries, GcEntriesType, GcRefOffsets, alloc_entries,
+    entries_allocated_len, entries_item_ptr, set_bytes_key_pyobject_entries_gc_type_id,
+    set_i64_pyobject_entries_gc_type_id, set_identity_key_pyobject_entries_gc_type_id,
+    set_object_key_pyobject_entries_gc_type_id, set_object_key_unit_entries_gc_type_id,
+    set_str_key_pyobject_entries_gc_type_id,
+};
 
 /// An index slot naming no entry, and one whose entry has been deleted.
 ///
@@ -254,49 +264,6 @@ pub(crate) fn replace_value<V>(slot: &mut V, value: V) -> V {
     std::mem::replace(slot, value)
 }
 
-/// One `d.entries` slot — upstream `ENTRY` (`odictentry`): `key`, `value`,
-/// `f_valid` (`ll_valid_from_flag`), and `f_hash` (the cached digest).
-///
-/// Public only because it names the iterator types; nothing outside can read
-/// or build one.
-#[repr(C)]
-#[derive(Clone, Debug)]
-pub struct Entry<K, V> {
-    key: K,
-    value: V,
-    f_valid: bool,
-    f_hash: u64,
-}
-
-/// The value a deleted `ENTRY` slot's key or value is reset to
-/// (`must_clear_key` / `must_clear_value` store `nullptr`), so the slot
-/// keeps nothing alive.
-pub trait EntryDummy {
-    fn dummy() -> Self;
-}
-
-impl EntryDummy for u64 {
-    fn dummy() -> Self {
-        0
-    }
-}
-
-impl EntryDummy for i64 {
-    fn dummy() -> Self {
-        0
-    }
-}
-
-impl EntryDummy for () {
-    fn dummy() -> Self {}
-}
-
-impl EntryDummy for String {
-    fn dummy() -> Self {
-        String::new()
-    }
-}
-
 /// A borrowed key that can be compared against a `K` without building one.
 ///
 /// The same shape as `indexmap::Equivalent`, so a lookup type written for the
@@ -319,11 +286,14 @@ pub struct RDict<K, V, S = RandomState> {
     /// a byte/short/int/long element width from the entry count; a single
     /// `u32` covers every dict that fits in memory here.
     indexes: Vec<u32>,
-    /// `d.entries`.  `len()` is `num_ever_used_items`; a slot whose
-    /// `f_valid` is false is one `entries.valid(i)` answers false for.
-    entries: Vec<Entry<K, V>>,
+    /// `d.entries` (`DICTENTRYARRAY`). Null is `len(d.entries) == 0`.
+    /// [`Self::num_ever_used_items`] is how far a slot walk reads; the array's
+    /// `length` is the allocation.
+    entries: *mut GcEntries<K, V>,
     /// `d.num_live_items`.
     num_live_items: usize,
+    /// `d.num_ever_used_items`.
+    num_ever_used_items: usize,
     /// `d.resize_counter`.  Signed because upstream tests `rc <= 0` after
     /// subtracting (rordereddict.py:684).
     resize_counter: isize,
@@ -345,6 +315,11 @@ pub struct RDict<K, V, S = RandomState> {
     hash_builder: S,
 }
 
+// The entries array is a GC or immortal allocation, not a Rust owner, so the
+// auto traits follow `K`, `V`, and `S` the way the old `Vec<Entry>` did.
+unsafe impl<K: Send, V: Send, S: Send> Send for RDict<K, V, S> {}
+unsafe impl<K: Sync, V: Sync, S: Sync> Sync for RDict<K, V, S> {}
+
 impl<K, V, S: Default> RDict<K, V, S> {
     pub fn new() -> Self {
         Self::with_hasher(S::default())
@@ -363,12 +338,16 @@ impl<K, V, S> RDict<K, V, S> {
     /// (rordereddict.py).  Sizing only the entry array would leave the
     /// index table to grow from `DICT_INITSIZE`, reindexing the whole run of a
     /// strategy switch several times over.
-    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self {
+    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self
+    where
+        (K, V): GcEntriesType,
+    {
         let mut d = Self::with_hasher(hash_builder);
         if capacity == 0 {
             return d;
         }
-        d.entries.reserve(capacity);
+        // `_ll_malloc_entries` for the estimate `ll_newdict_size` allocates.
+        d.entries = alloc_entries::<K, V>(capacity);
         let mut size = DICT_INITSIZE;
         while size <= (capacity + 1) * 2 {
             size *= 2;
@@ -381,8 +360,9 @@ impl<K, V, S> RDict<K, V, S> {
     pub fn with_hasher(hash_builder: S) -> Self {
         Self {
             indexes: Vec::new(),
-            entries: Vec::new(),
+            entries: std::ptr::null_mut(),
             num_live_items: 0,
+            num_ever_used_items: 0,
             resize_counter: 0,
             generation: 0,
             hash_builder,
@@ -400,37 +380,99 @@ impl<K, V, S> RDict<K, V, S> {
         self.num_live_items == 0
     }
 
+    /// `len(d.entries)`. Null is 0.
+    #[inline]
+    fn allocated_len(&self) -> usize {
+        entries_allocated_len(self.entries)
+    }
+
+    #[inline]
+    fn entry_ptr(&self) -> *mut Entry<K, V> {
+        entries_item_ptr(self.entries)
+    }
+
+    /// `setinteriorfield` write barrier on the entries array. The guarded
+    /// form: the array may be a pre-hook immortal allocation.
+    #[inline]
+    fn barrier_entries(&self) {
+        if !self.entries.is_null() {
+            crate::gc_hook::try_gc_write_barrier(self.entries as *mut u8);
+        }
+    }
+
+    /// The `entries` field slot, one GcRef (`d.entries`).
+    #[inline]
+    pub fn entries_slot(&mut self) -> *mut *mut u8 {
+        &raw mut self.entries as *mut *mut u8
+    }
+
     /// `ll_valid_from_flag` (`entries[i].f_valid`).
     #[inline]
     fn entry_valid(&self, slot: usize) -> bool {
-        self.entries[slot].f_valid
+        unsafe { (*self.entry_ptr().add(slot)).f_valid }
     }
 
     /// `ll_getitem_nonneg` / `ll_getitem_fast` on `d.entries`.
     #[inline]
     fn entry_at(&self, slot: usize) -> &Entry<K, V> {
-        &self.entries[slot]
+        unsafe { &*self.entry_ptr().add(slot) }
     }
 
-    /// `ll_setitem_fast` on `d.entries`.
+    /// `ll_setitem_fast` on `d.entries`. The barrier runs before the
+    /// reference is handed out; the caller stores immediately.
     #[inline]
     fn entry_at_mut(&mut self, slot: usize) -> &mut Entry<K, V> {
-        &mut self.entries[slot]
+        self.barrier_entries();
+        unsafe { &mut *self.entry_ptr().add(slot) }
     }
 
-    /// `ll_mark_deleted_in_flag`, then `must_clear_key` / `must_clear_value`:
-    /// `f_valid = False` and the key and value are reset to [`EntryDummy::dummy`].
+    /// `ll_mark_deleted_in_flag`, then `must_clear_key` / `must_clear_value`
+    /// (`_ll_dict_del_entry`): `f_valid = False` and the key and value are
+    /// reset to [`EntryDummy::dummy`].
     #[inline]
     fn mark_deleted(&mut self, slot: usize) -> (K, V)
     where
-        K: EntryDummy,
-        V: EntryDummy,
+        K: EntryDummy + Copy,
+        V: EntryDummy + Copy,
     {
         let e = self.entry_at_mut(slot);
+        let key = e.key;
+        let value = e.value;
         e.f_valid = false;
-        let key = std::mem::replace(&mut e.key, K::dummy());
-        let value = std::mem::replace(&mut e.value, V::dummy());
+        e.key = K::dummy();
+        e.value = V::dummy();
+        e.f_hash = 0;
         (key, value)
+    }
+
+    /// Live prefix `d.entries[0:num_ever_used_items]`.
+    #[inline]
+    fn used_entries(&self) -> &[Entry<K, V>] {
+        let n = self.num_ever_used_items;
+        if n == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.entry_ptr(), n) }
+        }
+    }
+
+    #[inline]
+    fn used_entries_mut(&mut self) -> &mut [Entry<K, V>] {
+        self.barrier_entries();
+        self.used_entries_mut_for_trace()
+    }
+
+    /// The live prefix without the write barrier: the collector rewrites a
+    /// moved reference in place while it traces, and `gc_trace` emits no
+    /// barrier for that write.
+    #[inline]
+    fn used_entries_mut_for_trace(&mut self) -> &mut [Entry<K, V>] {
+        let n = self.num_ever_used_items;
+        if n == 0 {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(self.entry_ptr(), n) }
+        }
     }
 
     /// `ll_getitem_nonneg` on `d.indexes`.
@@ -452,7 +494,7 @@ impl<K, V, S> RDict<K, V, S> {
     /// moves.
     #[inline]
     pub fn next_valid_slot(&self, from: usize) -> Option<usize> {
-        (from..self.entries.len()).find(|&i| self.entry_valid(i))
+        (from..self.num_ever_used_items).find(|&i| self.entry_valid(i))
     }
 
     /// [`Self::next_valid_slot`] descending: the last live slot strictly below
@@ -460,7 +502,7 @@ impl<K, V, S> RDict<K, V, S> {
     /// starts at `usize::MAX`.
     #[inline]
     pub fn prev_valid_slot(&self, before: usize) -> Option<usize> {
-        (0..before.min(self.entries.len()))
+        (0..before.min(self.num_ever_used_items))
             .rev()
             .find(|&i| self.entry_valid(i))
     }
@@ -480,12 +522,12 @@ impl<K, V, S> RDict<K, V, S> {
     }
 
     pub fn entry_slots(&self) -> usize {
-        self.entries.len()
+        self.num_ever_used_items
     }
 
     #[inline]
     pub fn is_valid_slot(&self, slot: usize) -> bool {
-        slot < self.entries.len() && self.entry_valid(slot)
+        slot < self.num_ever_used_items && self.entry_valid(slot)
     }
 
     /// Changes whenever a compaction or reindex moves entries; see the field.
@@ -495,19 +537,17 @@ impl<K, V, S> RDict<K, V, S> {
     }
 
     pub fn capacity(&self) -> usize {
-        self.entries.capacity()
+        self.allocated_len()
     }
 
+    /// `ll_dict_clear`. The old array is left to the collector (`_ll_free_entries`
+    /// is a no-op); the dict holds the empty (null) array.
     pub fn clear(&mut self) {
-        if self.entries.is_empty() {
+        if self.num_ever_used_items == 0 {
             return;
         }
-        // `d.entries = _ll_empty_array(DICT)` — the array is *replaced*, so the
-        // old one becomes garbage.  `Vec::clear` would keep every byte of it,
-        // and nothing downstream shrinks an entries buffer: the compaction
-        // trigger in `setitem_lookup_done` asks `len() == capacity()`, which a
-        // cleared-in-place table answers `0 == old capacity`.
-        self.entries = Vec::new();
+        self.entries = std::ptr::null_mut();
+        self.num_ever_used_items = 0;
         // "we can't remove the index here, because it is possible that crazy
         // Python code calls d.clear() from the method __eq__() called from
         // ll_dict_lookup(d).  Instead, stick to the rule that once a dictionary
@@ -520,7 +560,7 @@ impl<K, V, S> RDict<K, V, S> {
 
     #[inline]
     pub fn get_slot(&self, slot: usize) -> Option<(&K, &V)> {
-        if slot >= self.entries.len() {
+        if slot >= self.num_ever_used_items {
             return None;
         }
         if !self.entry_valid(slot) {
@@ -532,7 +572,7 @@ impl<K, V, S> RDict<K, V, S> {
 
     #[inline]
     pub fn get_slot_mut(&mut self, slot: usize) -> Option<(&K, &mut V)> {
-        if slot >= self.entries.len() {
+        if slot >= self.num_ever_used_items {
             return None;
         }
         if !self.entry_valid(slot) {
@@ -543,43 +583,58 @@ impl<K, V, S> RDict<K, V, S> {
     }
 
     pub fn iter(&self) -> LiveIter<'_, K, V> {
-        LiveIter::new(&self.entries)
+        LiveIter::new(self.used_entries())
     }
 
     /// Pairs with their slot numbers, for a caller that must name an entry
     /// again after the walk.
     pub fn iter_slots(&self) -> LiveSlotIter<'_, K, V> {
         LiveSlotIter {
-            inner: LiveIter::new(&self.entries),
+            inner: LiveIter::new(self.used_entries()),
         }
     }
 
     pub fn iter_mut(&mut self) -> LiveIterMut<'_, K, V> {
-        LiveIterMut::new(&mut self.entries)
+        LiveIterMut::new(self.used_entries_mut())
     }
 
     pub fn keys(&self) -> LiveKeys<'_, K, V> {
         LiveKeys {
-            inner: LiveIter::new(&self.entries),
+            inner: LiveIter::new(self.used_entries()),
         }
     }
 
     pub fn values(&self) -> LiveValues<'_, K, V> {
         LiveValues {
-            inner: LiveIter::new(&self.entries),
+            inner: LiveIter::new(self.used_entries()),
         }
     }
 
     pub fn values_mut(&mut self) -> LiveValuesMut<'_, K, V> {
         LiveValuesMut {
-            inner: LiveIterMut::new(&mut self.entries),
+            inner: LiveIterMut::new(self.used_entries_mut()),
+        }
+    }
+
+    /// [`iter_mut`](Self::iter_mut) for a GC walk that updates references in
+    /// place during a collection. Takes no write barrier; a mutator store
+    /// goes through `iter_mut`.
+    pub fn iter_mut_for_trace(&mut self) -> LiveIterMut<'_, K, V> {
+        LiveIterMut::new(self.used_entries_mut_for_trace())
+    }
+
+    /// [`values_mut`](Self::values_mut) for a GC walk; see
+    /// [`iter_mut_for_trace`](Self::iter_mut_for_trace).
+    pub fn values_mut_for_trace(&mut self) -> LiveValuesMut<'_, K, V> {
+        LiveValuesMut {
+            inner: LiveIterMut::new(self.used_entries_mut_for_trace()),
         }
     }
 
     /// The slot the next insert will fill, i.e. `d.num_ever_used_items`.
     #[inline]
     fn next_slot(&self) -> u32 {
-        self.entries.len() as u32
+        self.num_ever_used_items as u32
     }
 
     #[inline]
@@ -593,7 +648,13 @@ impl<K, V, S> RDict<K, V, S> {
     }
 }
 
-impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
+impl<K, V, S> RDict<K, V, S>
+where
+    K: Hash + Eq + Copy + EntryDummy,
+    V: Copy + EntryDummy,
+    S: BuildHasher,
+    (K, V): GcEntriesType,
+{
     /// `d.keyhash` / `fnkeyhash` (rordereddict.py). The hasher is a
     /// residual: RandomState::build_hasher is not a translation subject.
     #[inline]
@@ -647,7 +708,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
             }
             if index >= VALID_OFFSET {
                 let slot = (index - VALID_OFFSET) as usize;
-                if slot < self.entries.len() && self.entry_valid(slot) {
+                if slot < self.num_ever_used_items && self.entry_valid(slot) {
                     let e = self.entry_at(slot);
                     if e.f_hash == hash && key.equivalent(&e.key) {
                         return Some(slot);
@@ -689,7 +750,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
                 }
             } else {
                 let slot = (index - VALID_OFFSET) as usize;
-                if slot < self.entries.len() && self.entry_valid(slot) {
+                if slot < self.num_ever_used_items && self.entry_valid(slot) {
                     let e = self.entry_at(slot);
                     if e.f_hash == hash && key.equivalent(&e.key) {
                         return Ok(slot);
@@ -719,7 +780,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         debug_assert!(new_size.is_power_of_two());
         self.indexes = vec![FREE; new_size];
         self.resize_counter = (new_size * 2) as isize - (self.num_live_items * 3) as isize;
-        for slot in 0..self.entries.len() {
+        for slot in 0..self.num_ever_used_items {
             if !self.entry_valid(slot) {
                 continue;
             }
@@ -733,17 +794,64 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     /// — drop the
     /// tombstones, renumbering the survivors, then reindex at the same size.
     /// Upstream makes compaction opaque to tracing (not to translation).
+    /// `ll_dict_remove_deleted_items`. Below 25% live, allocate a new array;
+    /// otherwise reuse this one, write the live items down, and zero the tail
+    /// (`must_clear_key` / `must_clear_value`).
     #[majit_macros::dont_look_inside]
-    fn remove_deleted_items(&mut self) {
-        let shrink = self.num_live_items < self.entries.capacity() / 4;
-        self.entries.retain(|e| e.f_valid);
-        debug_assert_eq!(self.entries.len(), self.num_live_items);
-        if shrink {
-            // "At least 75% of the allocated entries are dead, so shrink the
-            // memory allocated as well as doing a compaction."
+    fn remove_deleted_items(&mut self)
+    where
+        K: Copy + EntryDummy,
+        V: Copy + EntryDummy,
+        (K, V): GcEntriesType,
+    {
+        let old_len = self.allocated_len();
+        let shrink = self.num_live_items < old_len / 4;
+        let newitems = if shrink {
+            alloc_entries::<K, V>(overallocate_entries_len(self.num_live_items))
+        } else {
+            // One barrier for the in-place writes (`llop.gc_writebarrier`).
+            self.barrier_entries();
             self.entries
-                .shrink_to(overallocate_entries_len(self.num_live_items));
+        };
+        let src_base = self.entry_ptr();
+        let dst_base = entries_item_ptr(newitems);
+        let isrclimit = self.num_ever_used_items;
+        let mut idst = 0usize;
+        for isrc in 0..isrclimit {
+            let src = unsafe { *src_base.add(isrc) };
+            if !src.f_valid {
+                continue;
+            }
+            if !newitems.is_null() {
+                crate::gc_hook::try_gc_write_barrier(newitems as *mut u8);
+            }
+            unsafe {
+                std::ptr::write(dst_base.add(idst), src);
+            }
+            idst += 1;
         }
+        debug_assert_eq!(self.num_live_items, idst);
+        if newitems == self.entries {
+            let dead = Entry {
+                key: K::dummy(),
+                f_valid: false,
+                value: V::dummy(),
+                f_hash: 0,
+            };
+            while idst < isrclimit {
+                if !newitems.is_null() {
+                    crate::gc_hook::try_gc_write_barrier(newitems as *mut u8);
+                }
+                unsafe {
+                    std::ptr::write(dst_base.add(idst), dead);
+                }
+                idst += 1;
+            }
+        } else {
+            crate::gc_hook::try_gc_write_barrier_managed(newitems as *mut u8);
+            self.entries = newitems;
+        }
+        self.num_ever_used_items = self.num_live_items;
         let size = self.indexes.len();
         self.reindex(size);
     }
@@ -777,7 +885,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         // A callback that reshaped the dict mid-probe leaves `slot` stale;
         // `callback_free_dict_op!` discards this answer, so the read only
         // has to stay in bounds (see `lookup`).
-        if slot >= self.entries.len() || !self.entry_valid(slot) {
+        if slot >= self.num_ever_used_items || !self.entry_valid(slot) {
             return None;
         }
         Some(&self.entry_at(slot).value)
@@ -789,7 +897,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     {
         let hash = self.hash_of(key);
         let slot = self.lookup(hash, key)?;
-        if slot >= self.entries.len() || !self.entry_valid(slot) {
+        if slot >= self.num_ever_used_items || !self.entry_valid(slot) {
             return None;
         }
         Some(&mut self.entry_at_mut(slot).value)
@@ -858,19 +966,9 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     /// caller never probed.
     fn setitem_lookup_done(&mut self, hash: u64, index_slot: Option<usize>, key: K, value: V) {
         let mut reindexed = false;
-        // `if len(d.entries) == d.num_ever_used_items: ll_dict_grow(d)` — the
-        // entries array is full, and `ll_dict_grow` (755) compacts instead of
-        // growing when over half of it is dead.
-        if self.entries.len() == self.entries.capacity() {
-            if self.num_live_items < self.entries.len() / 2 {
-                self.remove_deleted_items();
-                reindexed = true;
-            } else {
-                // `ll_dict_grow` prepares the entries array before the index
-                // is published. Reserve here so the final push cannot allocate.
-                self.entries.reserve(1);
-                self.generation = self.generation.wrapping_add(1);
-            }
+        // `if len(d.entries) == d.num_ever_used_items: ll_dict_grow(d)`.
+        if self.num_ever_used_items == self.allocated_len() {
+            reindexed = self.dict_grow();
         }
         let mut rc = self.resize_counter - 3;
         if rc <= 0 {
@@ -889,13 +987,48 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
             }
         }
         self.resize_counter = rc;
-        self.entries.push(Entry {
-            key,
-            value,
-            f_valid: true,
-            f_hash: hash,
-        });
+        let slot = self.num_ever_used_items;
+        self.barrier_entries();
+        unsafe {
+            std::ptr::write(
+                self.entry_ptr().add(slot),
+                Entry {
+                    key,
+                    f_valid: true,
+                    value,
+                    f_hash: hash,
+                },
+            );
+        }
+        self.num_ever_used_items += 1;
         self.num_live_items += 1;
+    }
+
+    /// `ll_dict_grow`. Returns whether the index was rebuilt (compaction).
+    /// A larger array is `rgc.ll_arraycopy` of `num_ever_used_items` items;
+    /// the old array is left to the collector.
+    fn dict_grow(&mut self) -> bool
+    where
+        K: Copy + EntryDummy,
+        V: Copy + EntryDummy,
+        (K, V): GcEntriesType,
+    {
+        if self.num_live_items < self.num_ever_used_items / 2 {
+            self.remove_deleted_items();
+            return true;
+        }
+        let new_allocated = overallocate_entries_len(self.allocated_len());
+        let newitems = alloc_entries::<K, V>(new_allocated);
+        let n = self.num_ever_used_items;
+        if n > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.entry_ptr(), entries_item_ptr(newitems), n);
+            }
+        }
+        crate::gc_hook::try_gc_write_barrier_managed(newitems as *mut u8);
+        self.entries = newitems;
+        self.generation = self.generation.wrapping_add(1);
+        false
     }
 
     /// `rordereddict.py::ll_dict_delete_by_entry_index` — re-probe from
@@ -947,7 +1080,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         K: EntryDummy,
         V: EntryDummy,
     {
-        if slot >= self.entries.len() {
+        if slot >= self.num_ever_used_items {
             return None;
         }
         if !self.entry_valid(slot) {
@@ -967,13 +1100,16 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         self.num_live_items -= 1;
 
         if self.num_live_items == 0 {
-            self.entries.clear();
-        } else if slot == self.entries.len() - 1 {
-            while self.entries.last().is_some_and(|e| !e.f_valid) {
-                self.entries.pop();
+            // `_ll_dict_del`: the dict is empty. Reset the ever-used count.
+            // The array stays; `ll_dict_clear` is what drops it.
+            self.num_ever_used_items = 0;
+        } else if slot + 1 == self.num_ever_used_items {
+            self.num_ever_used_items -= 1;
+            while self.num_ever_used_items > 0 && !self.entry_valid(self.num_ever_used_items - 1) {
+                self.num_ever_used_items -= 1;
             }
         }
-        if self.num_live_items + DICT_INITSIZE <= self.entries.capacity() / 8 {
+        if self.num_live_items + DICT_INITSIZE <= self.allocated_len() / 8 {
             self.resize();
         }
         (key, value)
@@ -985,7 +1121,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         K: EntryDummy,
         V: EntryDummy,
     {
-        let mut slot = self.entries.len();
+        let mut slot = self.num_ever_used_items;
         loop {
             if slot == 0 {
                 return None;
@@ -1011,7 +1147,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         K: EntryDummy,
         V: EntryDummy,
     {
-        if slot >= self.entries.len() {
+        if slot >= self.num_ever_used_items {
             return false;
         }
         if !self.entry_valid(slot) {
@@ -1019,7 +1155,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         }
         let hash = self.entry_at(slot).f_hash;
         if last {
-            if slot + 1 == self.entries.len() {
+            if slot + 1 == self.num_ever_used_items {
                 return false;
             }
             let (k, v) = self.take_slot(hash, slot);
@@ -1029,12 +1165,16 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
                 return false;
             }
             let (k, v) = self.take_slot(hash, slot);
-            let rest: Vec<(K, V)> = self
-                .entries
-                .drain(..)
-                .filter(|e| e.f_valid)
-                .map(|e| (e.key, e.value))
-                .collect();
+            let mut rest = Vec::with_capacity(self.num_live_items);
+            for i in 0..self.num_ever_used_items {
+                if self.entry_valid(i) {
+                    let e = self.entry_at(i);
+                    rest.push((e.key, e.value));
+                }
+            }
+            // The old array is left to the collector, as `ll_dict_clear` does.
+            self.entries = std::ptr::null_mut();
+            self.num_ever_used_items = 0;
             self.indexes.clear();
             self.num_live_items = 0;
             self.resize_counter = 0;
@@ -1059,10 +1199,24 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         Some(self.move_slot_to_end(slot, last))
     }
 
-    pub fn reserve(&mut self, additional: usize) {
-        let entries_capacity = self.entries.capacity();
-        self.entries.reserve(additional);
-        if self.entries.capacity() != entries_capacity {
+    pub fn reserve(&mut self, additional: usize)
+    where
+        K: Copy,
+        (K, V): GcEntriesType,
+    {
+        let entries_capacity = self.allocated_len();
+        let need = self.num_ever_used_items.saturating_add(additional);
+        if need > entries_capacity {
+            let new_n = need.max(overallocate_entries_len(entries_capacity));
+            let newitems = alloc_entries::<K, V>(new_n);
+            let n = self.num_ever_used_items;
+            if n > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(self.entry_ptr(), entries_item_ptr(newitems), n);
+                }
+            }
+            crate::gc_hook::try_gc_write_barrier_managed(newitems as *mut u8);
+            self.entries = newitems;
             self.generation = self.generation.wrapping_add(1);
         }
         let want = (self.num_live_items + additional) * 2;
@@ -1082,7 +1236,13 @@ fn overallocate_entries_len(baselen: usize) -> usize {
     baselen + (baselen >> 3) + 8
 }
 
-impl<K: Hash + Eq, V, S: BuildHasher + Default> FromIterator<(K, V)> for RDict<K, V, S> {
+impl<K, V, S> FromIterator<(K, V)> for RDict<K, V, S>
+where
+    K: Hash + Eq + Copy + EntryDummy,
+    V: Copy + EntryDummy,
+    S: BuildHasher + Default,
+    (K, V): GcEntriesType,
+{
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
         let mut d = Self::with_hasher(S::default());
         for (k, v) in iter {
@@ -1092,7 +1252,13 @@ impl<K: Hash + Eq, V, S: BuildHasher + Default> FromIterator<(K, V)> for RDict<K
     }
 }
 
-impl<K: Hash + Eq, V, S: BuildHasher> Extend<(K, V)> for RDict<K, V, S> {
+impl<K, V, S> Extend<(K, V)> for RDict<K, V, S>
+where
+    K: Hash + Eq + Copy + EntryDummy,
+    V: Copy + EntryDummy,
+    S: BuildHasher,
+    (K, V): GcEntriesType,
+{
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
         for (k, v) in iter {
             self.insert(k, v);
@@ -1100,16 +1266,50 @@ impl<K: Hash + Eq, V, S: BuildHasher> Extend<(K, V)> for RDict<K, V, S> {
     }
 }
 
-impl<K: Clone, V: Clone, S: Clone> Clone for RDict<K, V, S> {
+/// `ll_dict_copy`: allocate `len(d.entries)` items, copy the used prefix, barrier.
+impl<K, V, S> Clone for RDict<K, V, S>
+where
+    K: Copy,
+    V: Copy,
+    S: Clone,
+    (K, V): GcEntriesType,
+{
     fn clone(&self) -> Self {
+        let n = self.allocated_len();
+        let entries = if n == 0 {
+            std::ptr::null_mut()
+        } else {
+            let entries = alloc_entries::<K, V>(n);
+            let used = self.num_ever_used_items;
+            if used > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.entry_ptr(),
+                        entries_item_ptr(entries),
+                        used,
+                    );
+                }
+            }
+            crate::gc_hook::try_gc_write_barrier_managed(entries as *mut u8);
+            entries
+        };
         Self {
             indexes: self.indexes.clone(),
-            entries: self.entries.clone(),
+            entries,
             num_live_items: self.num_live_items,
+            num_ever_used_items: self.num_ever_used_items,
             resize_counter: self.resize_counter,
             generation: self.generation,
             hash_builder: self.hash_builder.clone(),
         }
+    }
+}
+
+impl<K, V, S> Drop for RDict<K, V, S> {
+    fn drop(&mut self) {
+        // `_ll_free_entries` does not free the array. It is GC-owned, or an
+        // immortal `malloc_typed` fallback. Only `indexes` is a Rust `Vec`.
+        self.entries = std::ptr::null_mut();
     }
 }
 
@@ -1127,19 +1327,49 @@ impl<'a, K, V, S> IntoIterator for &'a RDict<K, V, S> {
     }
 }
 
-impl<K, V, S> IntoIterator for RDict<K, V, S> {
+/// Owned walk of the live items. `K` and `V` are `Copy`; the entries array
+/// is not freed (`_ll_free_entries`).
+pub struct OwnedLiveIter<K, V> {
+    ptr: *const Entry<K, V>,
+    index: usize,
+    end: usize,
+    _mark: std::marker::PhantomData<(K, V)>,
+}
+
+unsafe impl<K: Send, V: Send> Send for OwnedLiveIter<K, V> {}
+unsafe impl<K: Sync, V: Sync> Sync for OwnedLiveIter<K, V> {}
+
+impl<K: Copy, V: Copy> Iterator for OwnedLiveIter<K, V> {
     type Item = (K, V);
-    type IntoIter =
-        std::iter::FilterMap<std::vec::IntoIter<Entry<K, V>>, fn(Entry<K, V>) -> Option<(K, V)>>;
-    fn into_iter(self) -> Self::IntoIter {
-        fn pair<K, V>(e: Entry<K, V>) -> Option<(K, V)> {
-            if e.f_valid {
-                Some((e.key, e.value))
-            } else {
-                None
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < self.end {
+            let i = self.index;
+            self.index += 1;
+            let entry = unsafe { &*self.ptr.add(i) };
+            if entry.f_valid {
+                return Some((entry.key, entry.value));
             }
         }
-        self.entries.into_iter().filter_map(pair as fn(_) -> _)
+        None
+    }
+}
+
+impl<K, V, S> IntoIterator for RDict<K, V, S>
+where
+    K: Copy,
+    V: Copy,
+{
+    type Item = (K, V);
+    type IntoIter = OwnedLiveIter<K, V>;
+    fn into_iter(self) -> Self::IntoIter {
+        let iter = OwnedLiveIter {
+            ptr: self.entry_ptr(),
+            index: 0,
+            end: self.num_ever_used_items,
+            _mark: std::marker::PhantomData,
+        };
+        // Drop nulls `entries` and drops `indexes`; it does not free the array.
+        iter
     }
 }
 
@@ -1504,12 +1734,12 @@ mod tests {
 
     #[test]
     fn borrowed_lookup_key() {
-        let mut d: RDict<String, u64> = RDict::default();
-        d.insert("alpha".to_string(), 1);
-        d.insert("beta".to_string(), 2);
-        assert_eq!(d.get("alpha"), Some(&1));
-        assert_eq!(d.remove("beta"), Some(2));
-        assert_eq!(d.get("beta"), None);
+        let mut d: RDict<u64, u64> = RDict::default();
+        d.insert(1, 1);
+        d.insert(2, 2);
+        assert_eq!(d.get(&1), Some(&1));
+        assert_eq!(d.remove(&2), Some(2));
+        assert_eq!(d.get(&2), None);
     }
 
     #[test]
@@ -1630,9 +1860,9 @@ mod tests {
         for i in 0..1000u64 {
             d.insert(i, i);
         }
-        assert!(d.entries.capacity() >= 1000);
+        assert!(d.capacity() >= 1000);
         d.clear();
-        assert_eq!(d.entries.capacity(), 0, "the entry buffer was kept");
+        assert_eq!(d.capacity(), 0, "the entry buffer was kept");
         assert_eq!(d.indexes.len(), DICT_INITSIZE);
         assert_eq!(d.resize_counter, (DICT_INITSIZE * 2) as isize);
         assert_eq!(d.len(), 0);
@@ -1652,9 +1882,9 @@ mod tests {
         let mut d: RDict<u64, u64> = RDict::new();
         let mut growths = 0;
         for i in 0..64u64 {
-            let (capacity, generation) = (d.entries.capacity(), d.generation);
+            let (capacity, generation) = (d.capacity(), d.generation);
             d.insert(i, i);
-            if d.entries.capacity() != capacity {
+            if d.capacity() != capacity {
                 growths += 1;
                 assert_ne!(d.generation, generation, "grew at insert {i}");
             }
@@ -1703,6 +1933,12 @@ mod tests {
     impl EntryDummy for Nasty {
         fn dummy() -> Self {
             Nasty(0)
+        }
+    }
+
+    impl GcEntriesType for (Nasty, u64) {
+        fn entries_gc_type_id() -> u32 {
+            0
         }
     }
 
@@ -1775,22 +2011,16 @@ mod tests {
 
     #[test]
     fn a_deleted_slot_is_invalid_and_cleared() {
-        let mut d: RDict<String, String> = RDict::new();
-        d.insert("a".to_string(), "A".to_string());
-        d.insert("b".to_string(), "B".to_string());
-        d.insert("c".to_string(), "C".to_string());
-        assert_eq!(d.remove("b"), Some("B".to_string()));
+        let mut d: RDict<u64, u64> = RDict::new();
+        d.insert(1, 10);
+        d.insert(2, 20);
+        d.insert(3, 30);
+        assert_eq!(d.remove(&2), Some(20));
         assert!(!d.entry_valid(1));
-        assert_eq!(d.entries[1].key, "");
-        assert_eq!(d.entries[1].value, "");
-        let got: Vec<(String, String)> = d.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        assert_eq!(
-            got,
-            vec![
-                ("a".to_string(), "A".to_string()),
-                ("c".to_string(), "C".to_string())
-            ]
-        );
+        assert_eq!(d.entry_at(1).key, 0);
+        assert_eq!(d.entry_at(1).value, 0);
+        let got: Vec<(u64, u64)> = d.iter().map(|(k, v)| (*k, *v)).collect();
+        assert_eq!(got, vec![(1, 10), (3, 30)]);
     }
 
     #[test]

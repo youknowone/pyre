@@ -788,12 +788,8 @@ unsafe fn object_dict_storage_custom_trace(
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
     let storage = &mut *(obj_addr as *mut pyre_object::dictmultiobject::ObjectDictStorage);
-    for (key, value) in storage.iter_mut() {
-        let key_ptr = key as *const pyre_object::dictmultiobject::ObjectKey
-            as *mut pyre_object::dictmultiobject::ObjectKey;
-        f(std::ptr::addr_of_mut!((*key_ptr).obj) as *mut majit_ir::GcRef);
-        f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    }
+    // `d.entries` is one GcRef (`DICTENTRYARRAY`). The array's type visits items.
+    f(storage.entries_slot() as *mut majit_ir::GcRef);
 }
 
 /// Module-dict `dstorage` is the same dicttable shape. `ModuleDictStrategy`
@@ -804,15 +800,8 @@ unsafe fn module_dict_storage_custom_trace(
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
     let storage = &mut *(obj_addr as *mut pyre_object::celldict::ModuleDictStorage);
-    for (key, value) in storage.entries.iter_mut() {
-        let key_ptr =
-            key as *const pyre_object::celldict::StrKey as *mut pyre_object::celldict::StrKey;
-        f(std::ptr::addr_of_mut!((*key_ptr).0) as *mut majit_ir::GcRef);
-        let mut forward = |slot: &mut pyre_object::PyObjectRef| {
-            f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-        };
-        pyre_object::celldict::walk_module_value_slot(value, &mut forward);
-    }
+    // `d.entries` is one GcRef. `walk_module_value_slot` stays on the owner walk.
+    f(storage.entries.entries_slot() as *mut majit_ir::GcRef);
 }
 
 /// `identitydict.py` traces `list[W_Root]` keys and values. The box is
@@ -822,12 +811,7 @@ unsafe fn identity_dict_storage_custom_trace(
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
     let storage = &mut *(obj_addr as *mut pyre_object::identitydict::IdentityDictStorage);
-    for (key, value) in storage.iter_mut() {
-        let key_ptr = key as *const pyre_object::identitydict::IdentityKey
-            as *mut pyre_object::identitydict::IdentityKey;
-        f(std::ptr::addr_of_mut!((*key_ptr).0) as *mut majit_ir::GcRef);
-        f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    }
+    f(storage.entries_slot() as *mut majit_ir::GcRef);
 }
 
 /// `kwargsdict.py` traces both `keys_w` and `values_w` as `list[W_Root]`.
@@ -847,9 +831,7 @@ unsafe fn kwargs_dict_storage_custom_trace(
 /// `rerased.new_erasing_pair("integer")`: only values are GC refs.
 unsafe fn int_dict_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let storage = &mut *(obj_addr as *mut pyre_object::dictmultiobject::IntDictStorage);
-    for value in storage.values_mut() {
-        f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    }
+    f(storage.entries_slot() as *mut majit_ir::GcRef);
 }
 
 /// `rerased.new_erasing_pair("bytes")`: `BytesDictStrategy` keys are the
@@ -860,12 +842,7 @@ unsafe fn bytes_dict_storage_custom_trace(
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
     let storage = &mut *(obj_addr as *mut pyre_object::dictmultiobject::BytesDictStorage);
-    for (key, value) in storage.iter_mut() {
-        let key_ptr = key as *const pyre_object::dictmultiobject::BytesKey
-            as *mut pyre_object::dictmultiobject::BytesKey;
-        f(std::ptr::addr_of_mut!((*key_ptr).0) as *mut majit_ir::GcRef);
-        f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    }
+    f(storage.entries_slot() as *mut majit_ir::GcRef);
 }
 
 /// `rordereddict.py` `GcStruct("dicttable")` for a set: every live
@@ -875,11 +852,7 @@ unsafe fn bytes_dict_storage_custom_trace(
 /// shadow stack and from the remembered set (`set_items_write_barrier`).
 unsafe fn set_items_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let storage = &mut *(obj_addr as *mut pyre_object::setobject::SetItemsStorage);
-    for (key, _) in storage.iter_mut() {
-        let key_ptr = key as *const pyre_object::dictmultiobject::ObjectKey
-            as *mut pyre_object::dictmultiobject::ObjectKey;
-        f(std::ptr::addr_of_mut!((*key_ptr).obj) as *mut majit_ir::GcRef);
-    }
+    f(storage.entries_slot() as *mut majit_ir::GcRef);
 }
 
 /// Custom trace for `W_BytesObject`. `data` points at a GC-managed leaf storage
@@ -1696,6 +1669,33 @@ fn register_traced_storage_box<T: 'static>(
         majit_gc::trace::TypeInfo::with_custom_trace(std::mem::size_of::<T>(), custom_trace)
             .with_destructor_fn(destructor),
     );
+    set_id(tid);
+}
+
+/// `DICTENTRYARRAY` (`get_ll_dict`) for one `(K, V)`. Item GC offsets are
+/// `offset_of!(Entry, key) + K::GC_REF_OFFSETS` and the value side the same way.
+fn register_dict_entries<K, V>(gc: &mut dyn majit_gc::GcAllocator, set_id: fn(u32))
+where
+    K: pyre_object::rordereddict::GcRefOffsets,
+    V: pyre_object::rordereddict::GcRefOffsets,
+{
+    use pyre_object::rordereddict::{Entry, GcEntries};
+    let mut offsets = Vec::new();
+    let key_base = std::mem::offset_of!(Entry<K, V>, key);
+    for off in K::GC_REF_OFFSETS {
+        offsets.push(key_base + off);
+    }
+    let value_base = std::mem::offset_of!(Entry<K, V>, value);
+    for off in V::GC_REF_OFFSETS {
+        offsets.push(value_base + off);
+    }
+    let tid = gc.register_type(TypeInfo::varsize_with_gc_ptr_offsets(
+        std::mem::offset_of!(GcEntries<K, V>, items),
+        std::mem::size_of::<Entry<K, V>>(),
+        std::mem::offset_of!(GcEntries<K, V>, length),
+        offsets,
+        vec![],
+    ));
     set_id(tid);
 }
 
@@ -4122,6 +4122,31 @@ fn build_gc() -> Box<MiniMarkGC> {
         module_dict_storage_custom_trace,
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::celldict::ModuleDictStorage>,
         pyre_object::celldict::set_module_dict_storage_gc_type_id,
+    );
+    // `d.entries`: `GcArray(DICTENTRY)` (`get_ll_dict`), one varsize type per pair.
+    register_dict_entries::<pyre_object::dictmultiobject::ObjectKey, pyre_object::PyObjectRef>(
+        &mut gc,
+        pyre_object::rordereddict::set_object_key_pyobject_entries_gc_type_id,
+    );
+    register_dict_entries::<i64, pyre_object::PyObjectRef>(
+        &mut gc,
+        pyre_object::rordereddict::set_i64_pyobject_entries_gc_type_id,
+    );
+    register_dict_entries::<pyre_object::dictmultiobject::BytesKey, pyre_object::PyObjectRef>(
+        &mut gc,
+        pyre_object::rordereddict::set_bytes_key_pyobject_entries_gc_type_id,
+    );
+    register_dict_entries::<pyre_object::dictmultiobject::ObjectKey, ()>(
+        &mut gc,
+        pyre_object::rordereddict::set_object_key_unit_entries_gc_type_id,
+    );
+    register_dict_entries::<pyre_object::identitydict::IdentityKey, pyre_object::PyObjectRef>(
+        &mut gc,
+        pyre_object::rordereddict::set_identity_key_pyobject_entries_gc_type_id,
+    );
+    register_dict_entries::<pyre_object::celldict::StrKey, pyre_object::PyObjectRef>(
+        &mut gc,
+        pyre_object::rordereddict::set_str_key_pyobject_entries_gc_type_id,
     );
     register_leaf_storage_box::<pyre_object::celldict::ModuleDictStrategy>(
         &mut gc,

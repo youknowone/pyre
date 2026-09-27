@@ -665,7 +665,7 @@ impl ModuleDictStorage {
     /// `&mut PyObjectRef` iterator over every stored value, for the
     /// GC custom-trace hook on W_ModuleDictObject.
     pub fn iter_values_mut(&mut self) -> impl Iterator<Item = &mut PyObjectRef> + '_ {
-        self.entries.values_mut()
+        self.entries.values_mut_for_trace()
     }
 }
 
@@ -1519,6 +1519,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// this being an infallible surface) once the key's hash started raising.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
+            // `gc_alloc_storage_box` is a stable allocation and never collects.
             let new_storage = crate::gc_storage::gc_alloc_storage_box(
                 entries.clone(),
                 crate::dictmultiobject::object_dict_storage_gc_type_id(),
