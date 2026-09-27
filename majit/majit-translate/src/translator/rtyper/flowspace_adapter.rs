@@ -2850,29 +2850,6 @@ pub fn translate_op(
                     // 3c. Unknown prefix — `TyperError` (caller must
                     //     register the path or import the prefix).
                     let callable_host = if let Some(entry) = call_registry.lookup(&key) {
-                        // Fail-closed: an entry whose pyre-side body failed to
-                        // lift (recorded by
-                        // `populate_call_registry_from_call_graphs` Pass 2 via
-                        // `record_lift_error`) is NOT a resolved callable.
-                        // Binding its `host_object` would let a graph
-                        // referencing an unbuildable foreign callee false-Match
-                        // through the dual gate and partial-codewrite with the
-                        // callee's pre-real residual kind. Treat it as
-                        // unresolved so the referencing graph deterministically
-                        // Skips to the legacy walker (unbuildable callee →
-                        // caller Skips).
-                        if let Some(lift_err) = entry.lift_error() {
-                            return Err(TyperError::message(format!(
-                                "translate_op: OpKind::Call::FunctionPath \
-                                 {{ segments: {:?} }} resolves to a \
-                                 CallRegistry entry whose source lift \
-                                 failed ({lift_err}); the referencing graph \
-                                 falls back to the legacy walker. \
-                                 Result slot = {}",
-                                segments,
-                                fmt_op_result(op),
-                            )));
-                        }
                         entry.host_object.clone()
                     } else if let Some(host) = flowspace_model::host_env_callable(segments) {
                         // Branch 3b — builtin leaf or fully-qualified inline
@@ -2897,22 +2874,6 @@ pub fn translate_op(
                         // same-leaf matches converge on a single `host_object`
                         // identity, otherwise `None` falls through to the hard
                         // error below.
-                        //
-                        // Same fail-closed rule as the exact-lookup branch: a
-                        // lift-errored entry is unresolved, so the referencing
-                        // graph Skips to the legacy walker.
-                        if let Some(lift_err) = entry.lift_error() {
-                            return Err(TyperError::message(format!(
-                                "translate_op: OpKind::Call::FunctionPath \
-                                 {{ segments: {:?} }} leaf-matches a \
-                                 CallRegistry entry whose source lift \
-                                 failed ({lift_err}); the referencing graph \
-                                 falls back to the legacy walker. \
-                                 Result slot = {}",
-                                segments,
-                                fmt_op_result(op),
-                            )));
-                        }
                         entry.host_object.clone()
                     } else {
                         return Err(TyperError::message(format!(
@@ -3624,8 +3585,8 @@ fn legacy_const_define_hlvalue(
             // lift succeeds instead of recording a lazy-failure that poisons
             // every attr-lookup caller:
             //   1. no graph is rtyped yet (every arg `concretetype` is `None`);
-            //   2. the callee is not lifted yet (registry-population order),
-            //      so its pygraph is not cached;
+            //   2. the callee's graph is still being built (a fn-const
+            //      cycle), so its pygraph is not cached;
             //   3. the callee's BODY does not lift — e.g. an unregistered
             //      iterator/container adapter, a separate front-lowering gap
             //      (#65).  The address is still valid; only JIT-compiling the
@@ -3634,8 +3595,8 @@ fn legacy_const_define_hlvalue(
             // `None`; the site then fails closed with the most specific
             // diagnosis, exactly as before.
             use crate::translator::rtyper::lltypesystem::lltype;
-            let lift_error = entry.lift_error();
             let graphs = entry.function_desc.borrow().getgraphs();
+            let lift_error = entry.lift_error();
             let maybe_graph = graphs.into_iter().next();
             // Precise fn-ptr only when the callee is lifted (cached graph, no
             // recorded lift error) AND rtyped; every other case routes to the
@@ -7790,7 +7751,7 @@ mod tests {
             body.set_return(body.startblock, Some(inputs[0].clone()));
             let mut graphs = GraphStore::default();
             graphs.insert(CallPath::from_segments(segments.clone()), body);
-            let registry = empty_call_registry();
+            let registry = std::rc::Rc::new(empty_call_registry());
             populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry)
                 .expect("register ordinary helper body");
             let entry = registry

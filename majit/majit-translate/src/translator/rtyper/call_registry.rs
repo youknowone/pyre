@@ -216,21 +216,18 @@ impl FunctionEntry {
 
     /// Record a per-entry lift failure so consumers surfacing through
     /// `cachedgraph` see the producer-side error instead of the
-    /// generic `buildflowgraph: missing code object` fallback.  Called
-    /// from `cutover::populate_call_registry_from_call_graphs`'s Pass
-    /// 2 when `lift_callee_to_pygraph` returns Err.
+    /// generic `buildflowgraph: missing code object` fallback.
     pub fn record_lift_error(&self, message: String) {
         self.function_desc.borrow().record_lift_error(message);
     }
 
     /// Read-side twin of [`record_lift_error`]: the recorded pyre-side
     /// lift failure message, or `None` when the entry's body lifted
-    /// cleanly.  `translate_op` consults this to fail-closed on a callee
-    /// whose graph could not be built (unbuildable callee → caller Skips
-    /// to the legacy walker), instead of binding a `host_object` that
-    /// would partial-codewrite with a pre-real residual kind.
+    /// cleanly. Asking builds the graph first.
     pub fn lift_error(&self) -> Option<String> {
-        self.function_desc.borrow().lift_error_message()
+        let fd = self.function_desc.borrow();
+        fd.build_source_graph();
+        fd.lift_error_message()
     }
 
     /// Store the callee's declared LLBC fn-ptr signature (see
@@ -349,6 +346,14 @@ impl CallRegistry {
             aliases: RefCell::new(HashMap::new()),
             two_phase: RefCell::new(TwoPhaseTypeCache::default()),
             session: RefCell::new(None),
+        }
+    }
+
+    /// Drop every lowered body whose graph was never asked for. The
+    /// annotator is complete; no graph is built after it.
+    pub fn release_source_graphs(&self) {
+        for entry in self.entries.borrow().values() {
+            entry.function_desc.borrow().release_source_graph();
         }
     }
 

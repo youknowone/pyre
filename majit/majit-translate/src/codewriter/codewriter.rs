@@ -276,6 +276,10 @@ impl CodeWriter {
             callcontrol.candidate_graphs(),
             callcontrol.function_graphs(),
         );
+        // The annotator is complete and no graph is built after it. The
+        // pending bodies share their graphs with `function_graphs`, which
+        // the codewriter mutates from here on.
+        registry.release_source_graphs();
     }
 
     /// Port of `CodeWriter.transform_graph_to_jitcode`.

@@ -987,8 +987,13 @@ pub(crate) struct GraphStore {
 /// signature is recovered from the startblock's `Input` ops
 /// ([`crate::model::FunctionGraph::value_name_for`]) — but once, here,
 /// while the body is in hand, rather than on every registry consumer.
+///
+/// `graph` is shared with the call registry's pending lift of this body
+/// (`FunctionDesc::source_graph`), the body a funcobj's graph is built from
+/// on demand. A write while a pending lift still holds it copies the graph,
+/// so the lift reads the body as it was registered.
 struct GraphSlot {
-    graph: FunctionGraph,
+    graph: std::rc::Rc<FunctionGraph>,
     signature: Signature,
 }
 
@@ -1033,26 +1038,32 @@ impl GraphStore {
         );
         match self.graphs.get_mut(&key) {
             Some(existing) => {
-                existing.graph.func.merge_from(&graph.func);
+                let existing = std::rc::Rc::make_mut(&mut existing.graph);
+                existing.func.merge_from(&graph.func);
                 // Monotonic, like `func`: upstream's aliases are the same
                 // Python graph object, so `graph.access_directly = True`
                 // written through one of them is visible through all. Here
                 // the aliases are separate `FunctionGraph` values folded onto
                 // one `GraphSlot`, so "any alias said true" has to survive
                 // the fold or the flag depends on registration order.
-                existing.graph.access_directly |= graph.access_directly;
-                crate::front::llbc_hints::merge_hints_into_graph(&mut existing.graph, &graph.hints);
-                if existing.graph.return_type.is_none() {
-                    existing.graph.return_type = graph.return_type;
+                existing.access_directly |= graph.access_directly;
+                crate::front::llbc_hints::merge_hints_into_graph(existing, &graph.hints);
+                if existing.return_type.is_none() {
+                    existing.return_type = graph.return_type;
                 }
-                if existing.graph.fun_decl_id.is_none() {
-                    existing.graph.fun_decl_id = graph.fun_decl_id;
+                if existing.fun_decl_id.is_none() {
+                    existing.fun_decl_id = graph.fun_decl_id;
                 }
             }
             None => {
                 let signature = Self::signature_from_graph(&graph);
-                self.graphs
-                    .insert(key.clone(), GraphSlot { graph, signature });
+                self.graphs.insert(
+                    key.clone(),
+                    GraphSlot {
+                        graph: std::rc::Rc::new(graph),
+                        signature,
+                    },
+                );
             }
         }
         self.path_to_key.insert(path, key);
@@ -1067,12 +1078,14 @@ impl GraphStore {
     pub(crate) fn get(&self, path: &CallPath) -> Option<&FunctionGraph> {
         self.graphs
             .get(self.path_to_key.get(path)?)
-            .map(|s| &s.graph)
+            .map(|s| &*s.graph)
     }
 
     pub(crate) fn get_mut(&mut self, path: &CallPath) -> Option<&mut FunctionGraph> {
         let key = self.path_to_key.get(path)?.clone();
-        self.graphs.get_mut(&key).map(|s| &mut s.graph)
+        self.graphs
+            .get_mut(&key)
+            .map(|s| std::rc::Rc::make_mut(&mut s.graph))
     }
 
     /// The formal parameter [`Signature`] of the funcobj `path` names —
@@ -1099,6 +1112,15 @@ impl GraphStore {
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&CallPath, &FunctionGraph)> {
         self.path_to_key
             .iter()
+            .filter_map(move |(p, k)| self.graphs.get(k).map(|s| (p, &*s.graph)))
+    }
+
+    /// [`Self::iter`], handing out the shared graph a pending lift keeps.
+    pub(crate) fn iter_shared(
+        &self,
+    ) -> impl Iterator<Item = (&CallPath, &std::rc::Rc<FunctionGraph>)> {
+        self.path_to_key
+            .iter()
             .filter_map(move |(p, k)| self.graphs.get(k).map(|s| (p, &s.graph)))
     }
 
@@ -1106,7 +1128,9 @@ impl GraphStore {
     /// alias paths name it.  Used by the rtyping boundary that attaches the
     /// final PBC family to deferred indirect-call operations.
     fn values_mut(&mut self) -> impl Iterator<Item = &mut FunctionGraph> {
-        self.graphs.values_mut().map(|slot| &mut slot.graph)
+        self.graphs
+            .values_mut()
+            .map(|slot| std::rc::Rc::make_mut(&mut slot.graph))
     }
 
     /// Source-funcobj identities, one per stored graph.
@@ -1117,13 +1141,21 @@ impl GraphStore {
     /// Remove one source graph so a caller can mutate it while still
     /// borrowing the rest of the store. Alias paths keep their `GraphKey`.
     fn take_graph(&mut self, key: &GraphKey) -> Option<FunctionGraph> {
-        self.graphs.remove(key).map(|slot| slot.graph)
+        self.graphs
+            .remove(key)
+            .map(|slot| std::rc::Rc::unwrap_or_clone(slot.graph))
     }
 
     /// Put back a graph taken by [`Self::take_graph`] under the same key.
     fn restore_graph(&mut self, key: GraphKey, graph: FunctionGraph) {
         let signature = Self::signature_from_graph(&graph);
-        self.graphs.insert(key, GraphSlot { graph, signature });
+        self.graphs.insert(
+            key,
+            GraphSlot {
+                graph: std::rc::Rc::new(graph),
+                signature,
+            },
+        );
     }
 
     /// Number of registered alias spellings (path count), matching the old

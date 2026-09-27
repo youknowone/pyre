@@ -2022,7 +2022,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     unsafe_fn_stubs: &[(Vec<String>, Signature, Option<String>)],
     foreign_opaque_method_externals: &[(Vec<String>, Signature, crate::model::ValueType)],
     atomic_load_decls: &[crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl],
-    registry: &CallRegistry,
+    registry: &Rc<CallRegistry>,
 ) -> Result<(), TyperError> {
     // Decline-census gate name for this function's registration skips.
     // A callable skipped here has no registry entry, so every callsite
@@ -2069,8 +2069,12 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         }
         segs
     }
-    let mut pending: Vec<(FunctionPathKey, &LegacyGraph, Rc<FunctionEntry>, &Signature)> =
-        Vec::with_capacity(function_graphs.len());
+    let mut pending: Vec<(
+        FunctionPathKey,
+        &Rc<LegacyGraph>,
+        Rc<FunctionEntry>,
+        &Signature,
+    )> = Vec::with_capacity(function_graphs.len());
     // `by_canonical_path` tracks the canonical `FunctionPathKey` of
     // the first-encountered alias for each canonical-stripped key.
     // Subsequent aliases of the same callable register an alias row
@@ -2078,7 +2082,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // gets exactly one row per distinct callable, with `aliases`
     // carrying the indirection.
     let mut by_canonical_path: HashMap<Vec<String>, FunctionPathKey> = HashMap::new();
-    for (path, graph) in function_graphs.iter() {
+    for (path, graph) in function_graphs.iter_shared() {
         let key = FunctionPathKey::from_segments(path.segments.iter().cloned());
         let canonical_strip = canonical_dedup_key(path);
         // `pyre_object::lltype::malloc[_typed/_stable]` are GC allocation intrinsics,
@@ -2214,19 +2218,10 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         }
         pending.push((key, graph, entry, signature));
     }
-    // Lift `pending` in a deterministic order.  `function_graphs.iter()`
-    // (`GraphStore` over `path_to_key: HashMap<CallPath, _>`) yields entries
-    // in `std::HashMap` order, which varies run-to-run.  Pass 2's lift order
-    // is observable: the fail-closed transitive gate (`flowspace_adapter.rs`
-    // `translate_op`) rejects a caller whose callee has ALREADY recorded a
-    // `record_lift_error`, so whether a caller inherits a callee's recorded
-    // error — and which transitive error surfaces — depends on which of the
-    // two lifted first.  Sorting by the path key makes the lift order (and
-    // thus the recorded-error attribution) reproducible, mirroring the
-    // Phase-A subject sort (`run_two_phase_prepass_inner`).  The lift itself
-    // is per-entry isolated (`Rc::as_ptr` dedup below) and aliases of one
-    // entry share the same graph, so ordering changes neither which entries
-    // fail nor what each computes — only the attribution determinism.
+    // `function_graphs.iter_shared()` (`GraphStore` over `path_to_key:
+    // HashMap<CallPath, _>`) yields entries in `std::HashMap` order, which
+    // varies run-to-run; sorting by the path key makes the passes below
+    // reproducible.
     pending.sort_by(|a, b| a.0.segments().cmp(b.0.segments()));
     // Register `unsafe fn` stubs between Pass 1 (alias explosion) and
     // Pass 2 (callee lift).  A stub carries the crate-included
@@ -2274,47 +2269,18 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // non-overwriting, between-passes seeding contract as the foreign-stdlib
     // and unsafe-fn stubs above.
     register_foreign_opaque_method_externals(registry, foreign_opaque_method_externals);
-    // Pass 2 — prefill the default-cache once per *unique* registry
-    // entry.  Aliases already point at the same `Rc<FunctionEntry>`
-    // so their `prefill_default_cache` would be redundant; identify
-    // unique entries by `Rc::as_ptr` so the dedupe survives any
-    // alternate dedup-key shape.  Each unique entry is lifted exactly
-    // once (`Rc::as_ptr` identity dedup); aliases share the same
-    // pre-filled `FunctionDesc.cache` because they hold the same
-    // `Rc<FunctionEntry>`.
+    // Pass 2 — give each *unique* registry entry the lowered body its
+    // default graph is built from. Aliases share one `Rc<FunctionEntry>`,
+    // so `Rc::as_ptr` identifies the unique entries.
     //
-    // Per-callee failure isolation matches RPython
-    // `bookkeeper.py getdesc(pyobj)` semantics: each
-    // `FunctionDesc` is built independently via `newfuncdesc`, and a
-    // failure on one callable does NOT abort the bookkeeper's `descs`
-    // population for other callables.  Upstream's per-`Constant(pyobj)`
-    // builder is invoked lazily; pyre's eager pre-pass approximates
-    // that lazy shape by isolating per-callee failures here — but
-    // unlike a previous draft that *swallowed* the error outright,
-    // the lift error is now stashed on the entry via
-    // `FunctionEntry::record_lift_error` so the next
-    // `cachedgraph` consumer surfaces the actual producer-side
-    // failure instead of falling through to `buildflowgraph`'s
-    // generic "missing code object" message
-    // (`translator/translator.rs:439`).  This keeps the lazy-failure
-    // *point of observation* aligned with upstream
-    // `description.py` while preserving pyre's eager prefill
-    // shape for the success path.  Without per-entry error capture a
-    // single bad leaf (e.g. `function_write_barrier`'s unregistered
-    // `try_gc_write_barrier` callee) would mask its own diagnosis
-    // behind every later use-site's generic fallback — a divergence
-    // from upstream's per-callable failure model where the original
-    // exception propagates.
+    // `bookkeeper.py getdesc(pyobj)` makes a `FunctionDesc` without
+    // building its graph; `description.py FunctionDesc.cachedgraph` builds
+    // it on the first miss (`buildgraph` -> `translator.buildflowgraph`), and
+    // a construction error propagates from there. The body is installed on
+    // the entry's `FunctionDesc` and lifted when the graph is first
+    // observed; a failure is recorded on the entry and surfaces at that
+    // `cachedgraph`.
     let mut lifted: HashSet<*const FunctionEntry> = HashSet::with_capacity(by_canonical_path.len());
-    // Each lift failure pushes into the translator's
-    // `_lift_errors` map keyed by the entry's `HostObject`
-    // identity, making the recorded error visible to
-    // `buildflowgraph` consumers downstream.  Resolved lazily so
-    // test fixtures whose `Bookkeeper` runs without an attached
-    // `RPythonAnnotator` (`bookkeeper.annotator()` panics with
-    // "backlink absent or dropped") only pay the lookup on the
-    // failure path; success paths remain unaffected.
-    //
     // Pre-pass — project each callee's declared LLBC fn-ptr signature onto
     // its entry BEFORE any body is lifted.  The fn-const materialisation
     // fallback (`flowspace_adapter::translate_op`) reads this to type an
@@ -2399,20 +2365,20 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             .user_function()
             .expect("registered source callable")
             .clone();
-        match lift_callee_to_pygraph_with_func(graph, (*signature).clone(), registry, func) {
-            Ok(pygraph) => entry.prefill_default_cache(pygraph),
-            Err(e) => {
-                let message = format!("{e}");
-                entry.record_lift_error(message.clone());
-                if let Some(annotator) = registry.bookkeeper().try_annotator() {
-                    annotator
-                        .translator
-                        ._lift_errors
-                        .borrow_mut()
-                        .insert(entry.host_object.clone(), message);
-                }
-            }
-        }
+        let source = Rc::clone(graph);
+        let signature = (*signature).clone();
+        // The registry is the body's global namespace; the entry it owns
+        // must not keep it alive.
+        let globals = Rc::downgrade(registry);
+        entry.function_desc.borrow().set_source_graph(
+            crate::annotator::description::SourceGraph::new(move || {
+                let registry = globals
+                    .upgrade()
+                    .ok_or_else(|| "the call registry was dropped".to_string())?;
+                lift_callee_to_pygraph_with_func(&source, signature, &registry, func)
+                    .map_err(|e| format!("{e}"))
+            }),
+        );
     }
     // Pass 3 — make impl methods visible in their owner's class dict.
     // RPython's ClassDesc reads methods straight off the class object
@@ -4851,7 +4817,7 @@ mod tests {
     #[test]
     fn registry_population_keeps_memo_source_policy_without_lifting_host_body() {
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
-        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
         let mut graph = LegacyGraph::new("memo_source");
         graph.source_identity = Some("owner::memo_source".into());
         graph.hints.push("specialize:memo".into());
@@ -4899,7 +4865,7 @@ mod tests {
         use crate::annotator::model::SomeObjectTrait;
         use crate::flowspace::model::HostCall;
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
-        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
         let mut graph = LegacyGraph::new("native_memo");
         graph.source_identity = Some("owner::native_memo".into());
         graph.hints.push("specialize:memo".into());
@@ -7319,9 +7285,9 @@ mod tests {
 
         // Without the declaration stub the caller cannot be annotated past
         // the call — the baseline this regression pins.
-        let bare = CallRegistry::new(std::rc::Rc::new(
+        let bare = std::rc::Rc::new(CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
-        ));
+        )));
         populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &bare).unwrap();
         let bare_error = bare
             .lookup(&caller_key)
@@ -7342,9 +7308,9 @@ mod tests {
             Signature::new(vec!["kind".to_string()], None, None),
             Some(OBJECTPTR_RETURN_TYPE.to_string()),
         )];
-        let registry = CallRegistry::new(std::rc::Rc::new(
+        let registry = std::rc::Rc::new(CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
-        ));
+        )));
         populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
 
         let caller = registry.lookup(&caller_key).expect("caller entry");
@@ -8136,9 +8102,9 @@ mod tests {
         // "not registered in CallRegistry, not in HOST_ENV" hard error.
         use crate::annotator::model::SomeValue;
         use crate::translator::rtyper::lltypesystem::module::ll_math::F64_METHOD_LLEXTERNALS;
-        let registry = CallRegistry::new(std::rc::Rc::new(
+        let registry = std::rc::Rc::new(CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
-        ));
+        )));
         populate_call_registry_from_call_graphs(
             &crate::codewriter::call::GraphStore::default(),
             &[],
@@ -8456,9 +8422,9 @@ mod tests {
         let decls = crate::front::mir::build_semantic_program_from_llbc(&acquire)
             .expect("acquire fixture lowers")
             .atomic_load_decls;
-        let registry = CallRegistry::new(std::rc::Rc::new(
+        let registry = std::rc::Rc::new(CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
-        ));
+        )));
         populate_call_registry_from_call_graphs(
             &crate::codewriter::call::GraphStore::default(),
             &[],
@@ -8518,9 +8484,9 @@ mod tests {
         let decls = crate::front::mir::build_semantic_program_from_llbc(&acquire)
             .expect("acquire fixture lowers")
             .atomic_load_decls;
-        let registry = CallRegistry::new(std::rc::Rc::new(
+        let registry = std::rc::Rc::new(CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
-        ));
+        )));
         populate_call_registry_from_call_graphs(
             &crate::codewriter::call::GraphStore::default(),
             &[],
@@ -8606,9 +8572,9 @@ mod tests {
                  address-preserving ordered lowering"
                 .into(),
         }];
-        let registry = CallRegistry::new(std::rc::Rc::new(
+        let registry = std::rc::Rc::new(CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
-        ));
+        )));
         populate_call_registry_from_call_graphs(
             &crate::codewriter::call::GraphStore::default(),
             &[],
