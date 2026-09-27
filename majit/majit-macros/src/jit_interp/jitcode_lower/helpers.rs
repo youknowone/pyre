@@ -533,8 +533,8 @@ pub(super) fn expr_is_literal_call(expr: &Expr) -> bool {
 /// `jtransform.py` `_rewrite_equality`'s `not arg.value` test for a
 /// pointer: the operand is still a source expression, so the null
 /// spellings RPython would have as `Constant(nullptr)` are recognised
-/// here. `ptr::null` / `ptr::null_mut` (any path prefix, optional
-/// turbofish) and `0 as *mut T` / `0 as *const T`.
+/// here. `core::ptr::null` / `std::ptr::null_mut` / `ptr::null`
+/// (optional turbofish) and `0 as *mut T` / `0 as *const T`.
 pub(super) fn expr_is_null_ptr(expr: &Expr) -> bool {
     match expr {
         Expr::Paren(paren) => expr_is_null_ptr(&paren.expr),
@@ -547,9 +547,9 @@ pub(super) fn expr_is_null_ptr(expr: &Expr) -> bool {
     }
 }
 
-/// `core::ptr::null_mut()` / `std::ptr::null()` — `jtransform.py`'s
-/// `Constant(nullptr)`, not a helper. Any path prefix, optional turbofish,
-/// no arguments. A same-named function that takes arguments stays a call.
+/// `core::ptr::null` / `null_mut`, `std::ptr::null` / `null_mut`, and
+/// `ptr::null` / `null_mut`. Any other path is an ordinary call.
+/// Optional turbofish, no arguments.
 pub(crate) fn call_is_null_ptr(call: &syn::ExprCall) -> bool {
     if !call.args.is_empty() {
         return false;
@@ -557,10 +557,22 @@ pub(crate) fn call_is_null_ptr(call: &syn::ExprCall) -> bool {
     let Expr::Path(path) = &*call.func else {
         return false;
     };
-    path.path
+    let owned: Vec<String> = path
+        .path
         .segments
-        .last()
-        .is_some_and(|seg| matches!(seg.ident.to_string().as_str(), "null" | "null_mut"))
+        .iter()
+        .map(|seg| seg.ident.to_string())
+        .collect();
+    let segments: Vec<&str> = owned.iter().map(String::as_str).collect();
+    matches!(
+        segments.as_slice(),
+        ["core", "ptr", "null"]
+            | ["core", "ptr", "null_mut"]
+            | ["std", "ptr", "null"]
+            | ["std", "ptr", "null_mut"]
+            | ["ptr", "null"]
+            | ["ptr", "null_mut"]
+    )
 }
 
 /// `x.is_null()` — the Rust spelling of RPython `ptr_iszero`.

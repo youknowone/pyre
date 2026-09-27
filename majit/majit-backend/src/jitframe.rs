@@ -337,8 +337,11 @@ pub unsafe fn off_gc_payload_size(frame: *mut JitFrame) -> usize {
 
 /// Prepare a frame [`alloc_off_gc_jitframe`] already returned for another
 /// `execute_token`. Clears the header word and the fixed `JITFRAME` fields.
-/// Spill slots stay: the entry writes them before they are read, which is
-/// the recycled-nursery contract `jitframe_allocate` has.
+///
+/// `llmodel.py` `execute_token` allocates a fresh zero-filled frame
+/// (`malloc_jitframe`) for every entry. Reusing one here leaves the previous
+/// entry's spill slots in place; they are unobservable because no collector
+/// scans an off-GC frame and compiled code writes a slot before it reads it.
 ///
 /// # Safety
 /// `frame` must come from [`alloc_off_gc_jitframe`] and must not be reachable

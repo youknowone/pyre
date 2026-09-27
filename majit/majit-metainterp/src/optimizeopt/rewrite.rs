@@ -68,6 +68,9 @@ fn check_subclass(vtable1: i64, vtable2: i64) -> Option<bool> {
     // the class constants when `cpu.subclassrange_min_offset` is set.
     // The span includes `max`; no real class is numbered with that value.
     if let Some(offset) = majit_backend::cpu_subclassrange_min_offset() {
+        // A zero vtable is a class with no vtable object, so the guard stays.
+        // `optimizer.py` `Optimizer._check_subclass` has no such class: it
+        // always reads `subclassrange_min` / `subclassrange_max` off the class.
         if vtable1 == 0 || vtable2 == 0 {
             return None;
         }

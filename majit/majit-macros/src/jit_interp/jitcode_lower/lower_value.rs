@@ -4115,6 +4115,18 @@ mod tests {
         }
 
         #[test]
+        fn foo_null_is_an_ordinary_call() {
+            let mut lowerer = Lowerer::new(None);
+            let expr: Expr = syn::parse_str("foo::null()").expect("parse");
+            let _ = lowerer.lower_value_expr(&expr);
+            let text = emitted(&lowerer);
+            assert!(
+                !text.contains("load_const_r_value"),
+                "foo::null() must stay a call, got:\n{text}"
+            );
+        }
+
+        #[test]
         fn assigning_null_mut_stores_the_null_ref() {
             let mut lowerer = Lowerer::new(None);
             lowerer.next_reg = 1;

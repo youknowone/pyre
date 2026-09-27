@@ -8228,15 +8228,16 @@ mod tests {
             .iter()
             .rposition(|op| op.opcode == OpCode::Label)
             .expect("peeled loop has a label");
-        let body: Vec<_> = result[label_at + 1..]
-            .iter()
-            .map(|op| format!("{:?}", op.opcode))
-            .collect();
-        assert!(
-            result[label_at + 1..]
-                .iter()
-                .all(|op| op.opcode != OpCode::IntGe && op.opcode != OpCode::GuardTrue),
-            "peeled body must drop int_ge(C, b) and guard_true, got {body:?}\nfull={:?}",
+        // `shortpreamble.py` `PureOp.add_op_to_short` calls `produce_arg`
+        // on the op's own args. `guard_value` runs after `int_ge` was
+        // emitted, and `produce_arg` does not walk `get_box_replacement`,
+        // so the loop header still re-executes `int_ge(Const(4), b)` and
+        // its `guard_true`.
+        let body: Vec<_> = result[label_at + 1..].iter().map(|op| op.opcode).collect();
+        assert_eq!(
+            body,
+            vec![OpCode::IntGe, OpCode::GuardTrue, OpCode::Jump],
+            "full={:?}",
             result
                 .iter()
                 .map(|op| {
@@ -8244,6 +8245,10 @@ mod tests {
                     format!("{:?} {:?}", op.opcode, args)
                 })
                 .collect::<Vec<_>>()
+        );
+        assert!(
+            result[label_at + 1].arg(0).is_constant(),
+            "int_ge's first arg is the guard_value constant"
         );
     }
 

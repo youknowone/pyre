@@ -1217,10 +1217,10 @@ fn dynasm_gc_write_barrier_managed(obj: GcRef) {
 }
 
 fn dynasm_id_or_identityhash(addr: usize) -> usize {
-    // `GcLLDescr_boehm` (`gcrootmap is None`): the collector does not move
-    // objects, so the identity is the address and the GC is not consulted.
+    // `boehm.py` `ll_identityhash`: `h = ~cast_adr_to_int(addr)`.
+    // `GcLLDescr_boehm.gcrootmap` is `None`, which is `!collector_installed`.
     if !majit_gc::collector_installed() {
-        return addr;
+        return !addr;
     }
     // A box whose borrow is already held by an in-progress alloc answers with
     // the raw `addr`, not with the singleton's id: this is a top-level op, so
@@ -4692,14 +4692,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn id_or_identityhash_without_collector_returns_addr() {
+    fn id_or_identityhash_without_collector_returns_bitwise_not() {
         std::thread::spawn(|| {
             assert!(!gc_box::present());
             let marker = 0usize;
             let addr = &marker as *const usize as usize;
             let got = dynasm_id_or_identityhash(addr);
+            // `boehm.py` `ll_identityhash`: `h = ~cast_adr_to_int(addr)`.
             if !majit_gc::gc_sync::is_initialized() {
-                assert_eq!(got, addr);
+                assert_eq!(got, !addr);
             }
         })
         .join()

@@ -2053,9 +2053,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         };
     // No flattened-array length check and the extract override ignores
     // meta, so the steady entry does not probe `compiled_loops`.
-    let fill_entry_reds_without_meta_override: TokenStream = if compat_checks.is_empty()
-        && (num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0)
-    {
+    let steady_entry_without_meta = compat_checks.is_empty()
+        && (num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0);
+    let fill_entry_reds_without_meta_override: TokenStream = if steady_entry_without_meta {
         quote! {
             fn fill_entry_reds_without_meta(
                 &self,
@@ -2134,9 +2134,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 ]);
             }
         };
-    let fill_entry_raw_reds_override: TokenStream = if compat_checks.is_empty()
-        && (num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0)
-    {
+    let fill_entry_raw_reds_override: TokenStream = if steady_entry_without_meta {
         if arrays.is_empty() {
             quote! {
                 fn fill_entry_raw_reds(&self, out: &mut ::std::vec::Vec<i64>) -> bool {

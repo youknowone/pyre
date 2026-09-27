@@ -30,18 +30,15 @@ type CallTriples = SmallVec<[(OpRef, i64, Type); CALL_INLINE]>;
 /// `GcLLDescr_boehm.malloc_fixedsize` (`llmodel_alloc`).
 ///
 /// `Some` when the host published the hook, including a null OOM result.
-/// `None` leaves the caller on its raw allocator.
+/// `None` leaves the caller on its raw allocator. `GC_malloc` is already
+/// zero-filled, and `call_malloc_fixedsize` does not clear a second time.
 fn host_malloc_fixedsize(size: usize) -> Option<*mut u8> {
     let addr = majit_gc::malloc_fixedsize_addr();
     if addr == 0 {
         return None;
     }
     let malloc: extern "C" fn(usize) -> *mut u8 = unsafe { std::mem::transmute(addr) };
-    let ptr = malloc(size);
-    if !ptr.is_null() {
-        unsafe { std::ptr::write_bytes(ptr, 0, size) };
-    }
-    Some(ptr)
+    Some(malloc(size))
 }
 
 /// Which recorded op [`JitCodeMachine::publish_last_guard_resume_snapshot`]

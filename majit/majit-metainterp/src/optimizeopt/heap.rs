@@ -2901,6 +2901,30 @@ impl OptHeap {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
+        self.optimize_getarrayitem_inner(op, op_rc, ctx, false)
+    }
+
+    /// `heap.py` `OptHeap.optimize_GETARRAYITEM_GC_PURE_I`.
+    ///
+    /// Constant-index cache lookup only. A variable index forces lazy
+    /// setarrayitems and emits. No postprocess: a miss does not
+    /// `arrayinfo_setitem` or `cache_varindex_read`.
+    fn optimize_getarrayitem_gc_pure(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        self.optimize_getarrayitem_inner(op, op_rc, ctx, true)
+    }
+
+    fn optimize_getarrayitem_inner(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+        pure: bool,
+    ) -> OptimizationResult {
         // Install ArrayPtrInfo via ensure_ptr_info_arg0 (return value
         // unused — we re-borrow further down via a fresh call so the
         // intermediate cache mutations can take &mut ctx without
@@ -2912,6 +2936,20 @@ impl OptHeap {
         if let Some(key) = Self::arrayitem_key(op, ctx) {
             let (array, descr_idx, const_index) = key;
             let descr = op.getdescr().unwrap();
+            if pure && const_index >= 0 {
+                // `optimize_GETARRAYITEM_GC_PURE_I` tightens the length
+                // before the constant-index cache lookup.
+                ctx.with_ensured_ptr_info_arg0(op, |mut arrayinfo| {
+                    if let Some(mut bound) = arrayinfo.getlenbound(None) {
+                        let _ = bound.make_gt_const(const_index);
+                        if let Some(mut handle) = arrayinfo.as_mut()
+                            && let crate::optimizeopt::info::PtrInfo::Array(a) = &mut *handle
+                        {
+                            a.lenbound = bound;
+                        }
+                    }
+                });
+            }
             // heap.py getfield_from_cache — 3-way aliasing check.
             // PyPy's shared AbstractCachedEntry method on ArrayCachedItem
             // calls possible_aliasing_two_infos which can force_lazy_set
@@ -3070,6 +3108,23 @@ impl OptHeap {
                     }
                 }
             }
+            if pure {
+                // `optimize_GETARRAYITEM_GC_PURE_I` has no postprocess.
+                if const_index >= 0 {
+                    ctx.with_ensured_ptr_info_arg0(op, |mut arrayinfo| {
+                        if let Some(mut bound) = arrayinfo.getlenbound(None) {
+                            let _ = bound.make_gt_const(const_index);
+                            if let Some(mut handle) = arrayinfo.as_mut()
+                                && let crate::optimizeopt::info::PtrInfo::Array(a) = &mut *handle
+                            {
+                                a.lenbound = bound;
+                            }
+                        }
+                    });
+                }
+                make_nonnull_box(ctx, &op.arg(0));
+                return OptimizationResult::PassOn;
+            }
             let array_box = ctx.get_box_replacement_operand(array);
             self.cache_arrayitem(&array_box, descr_idx, const_index, op.getdescr().as_ref());
             // heap.py:676-681:
@@ -3113,6 +3168,20 @@ impl OptHeap {
         //   self.force_lazy_setarrayitem(op.getdescr(), self.getintbound(op.getarg(1)))
         //   submap = self.arrayitem_submap(op.getdescr(), create_if_nonexistant=False)
         //   cached_result = submap.lookup_cached(arrayinfo, indexop)
+        //
+        // `optimize_GETARRAYITEM_GC_PURE_I` forces the lazy stores and emits.
+        // It does not `lookup_cached` or `cache_varindex_read`.
+        if pure {
+            if let Some(descr) = op.getdescr() {
+                let indexb = {
+                    let b = ctx.resolve_operand_operand(&op.arg(1));
+                    ctx.getintbound_handle(&b).borrow().clone()
+                };
+                self.force_lazy_setarrayitem(&descr, Some(&indexb), true, ctx);
+            }
+            make_nonnull_box(ctx, &op.arg(0));
+            return OptimizationResult::PassOn;
+        }
         if let Some(descr) = op.getdescr() {
             // heap.py:692-693: force lazy stores for this descr within the index bound
             let indexb = {
@@ -3370,15 +3439,13 @@ impl OptHeap {
             OpCode::SetfieldGc => self.optimize_setfield(op, op_rc, ctx),
 
             // ── Array item reads ──
-            // `GETARRAYITEM_GC_PURE_*` is `optimize_GETARRAYITEM_GC_PURE_I`:
-            // heap-cache the read, then emit on a miss. Constant folding of
-            // an all-constant pure read is `OptPure.optimize_default`.
-            OpCode::GetarrayitemGcI
-            | OpCode::GetarrayitemGcR
-            | OpCode::GetarrayitemGcF
-            | OpCode::GetarrayitemGcPureI
+            OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcF => {
+                self.optimize_getarrayitem(op, op_rc, ctx)
+            }
+            // `heap.py` `optimize_GETARRAYITEM_GC_PURE_{I,R,F}`.
+            OpCode::GetarrayitemGcPureI
             | OpCode::GetarrayitemGcPureR
-            | OpCode::GetarrayitemGcPureF => self.optimize_getarrayitem(op, op_rc, ctx),
+            | OpCode::GetarrayitemGcPureF => self.optimize_getarrayitem_gc_pure(op, op_rc, ctx),
 
             // ── Raw array item reads/writes ──
             // Same rationale as the `GetfieldRaw*` / `SetfieldRaw` arms:
@@ -5599,6 +5666,145 @@ mod tests {
         // force_all_lazy at Jump drops lazy setarrayitems. Only Jump remains.
         let opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
         assert_eq!(opcodes, vec![OpCode::Jump]);
+    }
+
+    /// `heap.py` `optimize_GETARRAYITEM_GC_PURE_I`: a constant-index miss
+    /// does not `arrayinfo_setitem`, so a second pure read is not a hit.
+    #[test]
+    fn test_getarrayitem_gc_pure_constant_miss_is_not_cached() {
+        let d = descr(0);
+        let idx = OpRef::int_op(50);
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::GetarrayitemGcPureI,
+                &[
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
+                ],
+                d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::GetarrayitemGcPureI,
+                &[
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
+                ],
+                d.clone(),
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+        let mut ctx = OptContext::new(ops.len());
+        let b = ctx.materialize_operand_at(idx);
+        ctx.make_constant_box(&b, majit_ir::Value::Int(3));
+        let mut pass = OptHeap::new();
+        pass.setup();
+        for op in &ops {
+            let mut resolved = op.clone();
+            for i in 0..resolved.num_args() {
+                let arg = resolved.arg(i);
+                let rb = match ctx.resolve_operand_operand_opt(&arg) {
+                    Some(b) => b,
+                    None => {
+                        let __ar = arg.to_opref();
+                        if __ar.is_none() {
+                            arg.clone()
+                        } else {
+                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
+                        }
+                    }
+                };
+                resolved.setarg(i, rb);
+            }
+            match pass.propagate_forward(&resolved, &OpRc::new(resolved.clone()), &mut ctx) {
+                OptimizationResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
+                    ctx.emit(replaced);
+                }
+                OptimizationResult::PassOn => {
+                    ctx.emit(resolved);
+                }
+                OptimizationResult::InvalidLoop(_) => panic!("unexpected InvalidLoop"),
+            }
+        }
+        let gets = ctx
+            .new_operations
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetarrayitemGcPureI)
+            .count();
+        assert_eq!(gets, 2, "a pure constant miss must not cache the read");
+    }
+
+    /// A variable index forces lazy setarrayitems and emits. It does not
+    /// consult `lookup_cached`, so a prior variable write does not remove
+    /// the pure read.
+    #[test]
+    fn test_getarrayitem_gc_pure_variable_index_is_not_cached() {
+        let d = descr(0);
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, 51),
+                    rooted_resop_operand(Type::Int, 101),
+                ],
+                d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::GetarrayitemGcPureI,
+                &[
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, 51),
+                ],
+                d.clone(),
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+        let mut ctx = OptContext::new(ops.len());
+        let mut pass = OptHeap::new();
+        pass.setup();
+        for op in &ops {
+            let mut resolved = op.clone();
+            for i in 0..resolved.num_args() {
+                let arg = resolved.arg(i);
+                let rb = match ctx.resolve_operand_operand_opt(&arg) {
+                    Some(b) => b,
+                    None => {
+                        let __ar = arg.to_opref();
+                        if __ar.is_none() {
+                            arg.clone()
+                        } else {
+                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
+                        }
+                    }
+                };
+                resolved.setarg(i, rb);
+            }
+            match pass.propagate_forward(&resolved, &OpRc::new(resolved.clone()), &mut ctx) {
+                OptimizationResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
+                    ctx.emit(replaced);
+                }
+                OptimizationResult::PassOn => {
+                    ctx.emit(resolved);
+                }
+                OptimizationResult::InvalidLoop(_) => panic!("unexpected InvalidLoop"),
+            }
+        }
+        assert!(
+            ctx.new_operations
+                .iter()
+                .any(|o| o.opcode == OpCode::GetarrayitemGcPureI),
+            "variable-index pure read must be emitted, not folded through the varindex cache"
+        );
     }
 
     /// #171/#11 Approach C invariant: NON-pure `getarrayitem_gc_r` is

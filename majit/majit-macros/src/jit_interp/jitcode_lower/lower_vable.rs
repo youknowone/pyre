@@ -94,6 +94,23 @@ pub(super) fn header_items_are_pointers(config: &LowererConfig, header: &syn::Pa
     saw && !primitive
 }
 
+fn header_element_path<'a>(config: &'a LowererConfig, header: &syn::Path) -> Option<&'a syn::Path> {
+    let last = header.segments.last().map(|seg| seg.ident.to_string())?;
+    for (key, header_path) in &config.array_headers {
+        let header_last = header_path
+            .segments
+            .last()
+            .map(|seg| seg.ident.to_string())
+            .unwrap_or_default();
+        if header_last == last
+            && let Some((_, _, elem)) = config.array_fields.get(key)
+        {
+            return Some(elem);
+        }
+    }
+    None
+}
+
 /// `descr.py` `get_array_descr` for a `GcArray` or an array inlined after
 /// `header`: basesize is `offset_of!(Header, items)`, lendescr offset is
 /// the length field.
@@ -102,8 +119,18 @@ pub(super) fn gc_varsize_descr_tokens(config: &LowererConfig, header: &syn::Path
         varsize_length_field_name(config, header).unwrap_or_else(|| "capacity".to_string());
     let len_ident = syn::Ident::new(&len_name, proc_macro2::Span::call_site());
     let pointers = header_items_are_pointers(config, header);
+    // `symbolic.py` `get_array_token`: `itemsize = sizeof(SUBARRAY.OF)`.
     let (itemsize, is_signed) = if pointers {
         (quote! { ::core::mem::size_of::<usize>() }, quote! { false })
+    } else if let Some(elem) = header_element_path(config, header) {
+        if path_is_f64(elem) {
+            (quote! { ::core::mem::size_of::<f64>() }, quote! { false })
+        } else {
+            (
+                quote! { ::core::mem::size_of::<#elem>() },
+                quote! { (<#elem>::MIN as i128) < 0 },
+            )
+        }
     } else {
         (quote! { ::core::mem::size_of::<i64>() }, quote! { true })
     };
@@ -115,6 +142,31 @@ pub(super) fn gc_varsize_descr_tokens(config: &LowererConfig, header: &syn::Path
             #itemsize,
             #pointers,
             #is_signed,
+            #type_id,
+        )
+    }
+}
+
+/// Descr for an `f64` array item. A header uses `offset_of!(Header, items)`
+/// as `base_size` (`symbolic.py` `get_array_token`).
+fn float_array_descr_tokens(
+    config: Option<&LowererConfig>,
+    header: &Option<syn::Path>,
+) -> TokenStream {
+    let Some(header) = header else {
+        return quote! { __builder.add_raw_float_array_descr() };
+    };
+    let Some(config) = config else {
+        return quote! { __builder.add_raw_float_array_descr() };
+    };
+    let len_name =
+        varsize_length_field_name(config, header).unwrap_or_else(|| "capacity".to_string());
+    let len_ident = syn::Ident::new(&len_name, proc_macro2::Span::call_site());
+    let type_id = struct_type_id_tokens(header, true);
+    quote! {
+        __builder.add_gc_varsize_float_array_descr(
+            ::core::mem::offset_of!(#header, items),
+            ::core::mem::offset_of!(#header, #len_ident),
             #type_id,
         )
     }
@@ -2071,8 +2123,13 @@ impl<'c> Lowerer<'c> {
         }
         let index_reg = index.reg;
         let result_reg = self.alloc_reg();
-        if element_is_float && header.is_none() {
-            // `jtransform.py` `rewrite_op_getarrayitem` for `lltype.Float`.
+        if element_is_float {
+            // `jtransform.py` `rewrite_op_getarrayitem`: `getkind(ARRAY.OF)`
+            // selects `getarrayitem_gc_f` for `lltype.Float`, including an
+            // element declared `Elem in Header`. `pure = '_pure'` when
+            // `ARRAY._immutable_field(None)`.
+            let item_pure = immutable_array_item_pure(&shape.struct_path, &shape.member);
+            let descr_tokens = float_array_descr_tokens(self.config, &header);
             self.emit_op(
                 OpMeta::linear(
                     OpKind::Vable,
@@ -2080,13 +2137,22 @@ impl<'c> Lowerer<'c> {
                     vec![Register::float(result_reg)],
                 ),
                 quote! {
-                    let __descr_idx = __builder.add_raw_float_array_descr();
-                    __builder.getarrayitem_gc_f(
-                        #result_reg as u16,
-                        #buffer_reg as u16,
-                        #index_reg as u16,
-                        __descr_idx,
-                    );
+                    let __descr_idx = #descr_tokens;
+                    if #item_pure {
+                        __builder.getarrayitem_gc_f_pure(
+                            #result_reg as u16,
+                            #buffer_reg as u16,
+                            #index_reg as u16,
+                            __descr_idx,
+                        );
+                    } else {
+                        __builder.getarrayitem_gc_f(
+                            #result_reg as u16,
+                            #buffer_reg as u16,
+                            #index_reg as u16,
+                            __descr_idx,
+                        );
+                    }
                 },
             );
             return Some(Binding {
@@ -2251,7 +2317,7 @@ impl<'c> Lowerer<'c> {
         let shape = self.match_array_field_base(field)?;
         let element_type = shape.element_type.clone();
         let header = shape.header.clone();
-        let element_is_float = path_is_f64(&element_type) && header.is_none();
+        let element_is_float = path_is_f64(&element_type);
         let element_is_int = path_is_int_elem(&element_type);
         let value = self.lower_value_expr(&assign.right)?;
         let value_is_ref = header.is_some() && !element_is_int;
@@ -2274,6 +2340,7 @@ impl<'c> Lowerer<'c> {
         let index_reg = index.reg;
         let value_reg = value.reg;
         if element_is_float {
+            let descr_tokens = float_array_descr_tokens(self.config, &header);
             self.emit_op(
                 OpMeta::linear(
                     OpKind::Vable,
@@ -2285,7 +2352,7 @@ impl<'c> Lowerer<'c> {
                     vec![],
                 ),
                 quote! {
-                    let __descr_idx = __builder.add_raw_float_array_descr();
+                    let __descr_idx = #descr_tokens;
                     __builder.setarrayitem_gc_f(
                         #buffer_reg as u16,
                         #index_reg as u16,
@@ -3147,5 +3214,128 @@ mod tests {
         assert!(emitted.contains("getfield_gc_f"), "{emitted}");
         assert!(emitted.contains("setarrayitem_gc_f"), "{emitted}");
         assert!(emitted.contains("add_raw_float_array_descr"), "{emitted}");
+    }
+
+    /// `f64` declared `Elem in Header` is `getarrayitem_gc_f`
+    /// (`rewrite_op_getarrayitem`, `getkind(ARRAY.OF)`).
+    #[test]
+    fn f64_in_header_lowers_to_getarrayitem_gc_f() {
+        let data = crate::jit_interp::ArrayFieldEntry {
+            struct_type: syn::parse_quote!(Col),
+            field: syn::parse_quote!(data),
+            element_type: syn::parse_quote!(f64),
+            header: Some(syn::parse_quote!(Words)),
+        };
+        let cap = crate::jit_interp::IntFieldEntry {
+            struct_type: syn::parse_quote!(Words),
+            field: syn::parse_quote!(capacity),
+            int_type: syn::parse_quote!(usize),
+        };
+        let config = LowererConfig::inline_helper(&[], &[data], &[cap], &[], &[], &[], &[], &[]);
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.bindings.insert(
+            "col".to_string(),
+            Binding {
+                reg: 1,
+                kind: BindingKind::Ref,
+                depends_on_stack: false,
+                struct_type: Some(syn::parse_quote!(Col)),
+            },
+        );
+        lowerer.bindings.insert(
+            "i".to_string(),
+            Binding {
+                reg: 2,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let read: syn::Expr = syn::parse_quote!(col.data[i]);
+        let got = lowerer.lower_value_expr(&read).expect("header float read");
+        assert!(matches!(got.kind, BindingKind::Float));
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("getarrayitem_gc_f"), "{emitted}");
+        assert!(emitted.contains("getarrayitem_gc_f_pure"), "{emitted}");
+        assert!(!emitted.contains("getarrayitem_gc_r"), "{emitted}");
+        assert!(
+            emitted.contains("add_gc_varsize_float_array_descr"),
+            "{emitted}"
+        );
+    }
+
+    /// Headerless immutable float item consults `immutable_array_item_pure`
+    /// and can emit `getarrayitem_gc_f_pure`.
+    #[test]
+    fn headerless_immutable_float_lowers_to_getarrayitem_gc_f_pure() {
+        let data = crate::jit_interp::ArrayFieldEntry {
+            struct_type: syn::parse_quote!(Col),
+            field: syn::parse_quote!(data),
+            element_type: syn::parse_quote!(f64),
+            header: None,
+        };
+        let config = LowererConfig::inline_helper(&[], &[data], &[], &[], &[], &[], &[], &[]);
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.bindings.insert(
+            "col".to_string(),
+            Binding {
+                reg: 1,
+                kind: BindingKind::Ref,
+                depends_on_stack: false,
+                struct_type: Some(syn::parse_quote!(Col)),
+            },
+        );
+        lowerer.bindings.insert(
+            "i".to_string(),
+            Binding {
+                reg: 2,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let read: syn::Expr = syn::parse_quote!(col.data[i]);
+        assert!(lowerer.lower_value_expr(&read).is_some());
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("getarrayitem_gc_f_pure"), "{emitted}");
+        assert!(emitted.contains("__MAJIT_IMMUTABLE_FIELDS"), "{emitted}");
+        assert!(emitted.contains("add_raw_float_array_descr"), "{emitted}");
+    }
+
+    /// `symbolic.py` `get_array_token`: a non-pointer header array's
+    /// `itemsize` is `sizeof(SUBARRAY.OF)`, and signedness follows the element.
+    #[test]
+    fn header_itemsize_follows_the_element() {
+        let data = crate::jit_interp::ArrayFieldEntry {
+            struct_type: syn::parse_quote!(Col),
+            field: syn::parse_quote!(data),
+            element_type: syn::parse_quote!(u8),
+            header: Some(syn::parse_quote!(Bytes)),
+        };
+        let cap = crate::jit_interp::IntFieldEntry {
+            struct_type: syn::parse_quote!(Bytes),
+            field: syn::parse_quote!(capacity),
+            int_type: syn::parse_quote!(usize),
+        };
+        let config = LowererConfig::inline_helper(&[], &[data], &[cap], &[], &[], &[], &[], &[]);
+        let header: syn::Path = syn::parse_quote!(Bytes);
+        let tokens = gc_varsize_descr_tokens(&config, &header).to_string();
+        assert!(
+            tokens.contains("size_of") && tokens.contains("u8"),
+            "{tokens}"
+        );
+        assert!(
+            !tokens.contains("i64"),
+            "itemsize must not be a hardcoded i64: {tokens}"
+        );
+        assert!(tokens.contains("MIN"), "{tokens}");
     }
 }

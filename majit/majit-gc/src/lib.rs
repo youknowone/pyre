@@ -2587,7 +2587,8 @@ pub extern "C" fn boehm_malloc_array(
         return core::ptr::null_mut();
     };
     let func: extern "C" fn(usize) -> *mut u8 = unsafe { core::mem::transmute(addr) };
-    let res = func(total.max(1));
+    // `gc.py` `GcLLDescr_boehm.malloc_array` calls `malloc_fn_ptr(totalsize)`.
+    let res = func(total);
     if res.is_null() {
         return core::ptr::null_mut();
     }

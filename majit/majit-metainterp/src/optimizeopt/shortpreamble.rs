@@ -391,28 +391,13 @@ impl PreambleOp {
             }
             PreambleOpKind::Pure => {
                 // shortpreamble.py PureOp.add_op_to_short:
-                //   arglist = [sb.produce_arg(arg) for arg in op.getarglist()]
-                //   if rop.is_call(op.opnum):
-                //       opnum = OpHelpers.call_pure_for_descr(op.getdescr())
-                //   else:
-                //       opnum = op.getopnum()
-                //   return ProducedShortOp(self, op.copy_and_change(opnum, args=arglist))
-                //
-                // shortpreamble.py ShortBoxes.produce_arg returns a Const only
-                // when the argument itself is a Const. guard_value forwards the
-                // original box afterwards (resoperation.py get_box_replacement);
-                // RecentPureOps.lookup2 compares that replacement at lookup
-                // time. Feed produce_arg the replacement so the exported pure
-                // op is int_ge(Const, b), not dropped because the unreplaced
-                // inputarg is no longer a label arg.
+                //   newarg = sb.produce_arg(arg)
+                // `lookup2` applies `get_box_replacement` at lookup time.
                 let args = self
                     .op
                     .getarglist()
                     .iter()
-                    .map(|arg| {
-                        let replaced = arg.get_box_replacement(false);
-                        sb.produce_arg(ctx, replaced.to_opref())
-                    })
+                    .map(|arg| sb.produce_arg(ctx, arg.to_opref()))
                     .collect::<Option<smallvec::SmallVec<[majit_ir::operand::Operand; 3]>>>()?;
                 let opnum = if self.op.opcode.is_call() {
                     match self.op.opcode {
@@ -2194,17 +2179,12 @@ impl AbstractShortPreambleBuilderState {
             {
                 continue;
             }
-            // shortpreamble.py: `arg.get_forwarded() is None` → pass;
-            // otherwise append the arg and consume the marker. The
-            // demoted CALL is `make_equal_to`-forwarded to its result;
-            // appending that producer replays a plain CALL that
-            // `optimize_call_pure` never sees. `PureOp.add_op_to_short`
-            // already recorded the same call as `CALL_PURE_*`.
+            // shortpreamble.py AbstractShortPreambleBuilder.use_box:
+            // `arg.get_forwarded() is None` → pass; otherwise append the
+            // arg and consume the marker.
             let Some(dep) = arg.bound_op() else { continue };
             let forwarded = dep.forwarded().borrow().clone();
-            if matches!(forwarded, majit_ir::forwarding::Forwarded::None)
-                || dep.opcode.is_real_call()
-            {
+            if matches!(forwarded, majit_ir::forwarding::Forwarded::None) {
                 continue;
             }
             *dep.forwarded().borrow_mut() = majit_ir::forwarding::Forwarded::None;

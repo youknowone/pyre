@@ -2153,6 +2153,28 @@ impl JitCodeBuilder {
         self.push_reg_u8(dst, "getarrayitem_gc_f dst");
     }
 
+    /// Always-pure spelling of [`Self::getarrayitem_gc_f`].
+    ///
+    /// `jtransform.py` `rewrite_op_getarrayitem` appends `_pure` when
+    /// `ARRAY._immutable_field(None)`, before choosing the kind, so an
+    /// immutable float array is `getarrayitem_gc_f_pure`.
+    pub fn getarrayitem_gc_f_pure(
+        &mut self,
+        dst: u16,
+        array_reg: u16,
+        index_reg: u16,
+        descr_idx: u16,
+    ) {
+        self.touch_ref_reg(array_reg);
+        self.touch_reg(index_reg);
+        self.touch_float_reg(dst);
+        self.write_insn("getarrayitem_gc_f_pure/rid>f");
+        self.push_reg_u8(array_reg, "getarrayitem_gc_f_pure array");
+        self.push_reg_u8(index_reg, "getarrayitem_gc_f_pure index");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "getarrayitem_gc_f_pure dst");
+    }
+
     /// Always-pure spelling of [`Self::getarrayitem_gc_r`].
     ///
     /// `jtransform.py` `rewrite_op_getarrayitem` appends `_pure` when
@@ -2478,6 +2500,34 @@ impl JitCodeBuilder {
             is_array_of_pointers,
             is_array_of_structs: false,
             is_item_signed,
+            is_gc_managed: false,
+            ei_index: u32::MAX,
+            array_type_id: None,
+            interior_fields: Vec::new(),
+        })
+    }
+
+    /// Float-item form of [`Self::add_gc_varsize_array_descr`].
+    ///
+    /// `jtransform.py` `rewrite_op_getarrayitem` / `getkind(ARRAY.OF)` selects
+    /// the float opcode for an `f64` element in a header. `itemsize` is
+    /// `sizeof(f64)` (`symbolic.py` `get_array_token`).
+    pub fn add_gc_varsize_float_array_descr(
+        &mut self,
+        base_size: usize,
+        len_offset: usize,
+        type_id: u64,
+    ) -> u16 {
+        self.add_array_descr(CanonicalBhDescr::Array {
+            base_size,
+            itemsize: std::mem::size_of::<f64>(),
+            len_offset: Some(len_offset),
+            type_id,
+            gc_type_id: 0,
+            item_type: majit_ir::value::Type::Float,
+            is_array_of_pointers: false,
+            is_array_of_structs: false,
+            is_item_signed: false,
             is_gc_managed: false,
             ei_index: u32::MAX,
             array_type_id: None,
@@ -4407,18 +4457,11 @@ impl JitCodeBuilder {
 
     /// Effect info for `residual_call_*_canonical_via_target`.
     ///
-    /// `effectinfo.py effectinfo_from_writeanalyze` turns an unknown /
-    /// `top_set` result into `EF_RANDOM_EFFECTS`
-    /// (`EffectInfo.MOST_GENERAL`). The default
-    /// [`crate::call_descr::EffectInfoSlot::CanRaise`] slot is that
-    /// unknown: a `dont_look_inside` / `residual_*` helper whose Rust body
-    /// was never write-analyzed. Promoting it here is what
-    /// `heap.py OptHeap.emitting_operation` needs in order to take the
-    /// `has_random_effects` branch (`force_all_lazy_sets` + `clean_caches`)
-    /// instead of believing the empty `can_raise_effect_info` sets.
-    ///
-    /// A precise slot (`elidable_*`, `cannot_raise`, `loopinvariant`) stays
-    /// on `effect_info_for_slot`. Callers that already pass an effect info
+    /// A macro helper has no graph. `graphanalyze.py`
+    /// `GraphAnalyzer.analyze` returns the top result when the callee has
+    /// no `graph` (`AttributeError` on `funcobj.graph`). `CanRaise` is that
+    /// top (`EffectInfo::MOST_GENERAL`). A precise slot stays on
+    /// `effect_info_for_slot`. Callers that already pass an effect info
     /// (`residual_writes`, `nursery_alloc`) use the `_with_effect_info`
     /// siblings and never reach this helper. `cond_call` keeps
     /// [`Self::effect_info_for_target`]: `MOST_GENERAL` forces virtuals,
