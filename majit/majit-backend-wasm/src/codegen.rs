@@ -6057,6 +6057,11 @@ fn build_function(
     let gcmap_frame_local = ca
         .compute_home_gcmap
         .then_some(resume_key_local + u32::from(resume_dispatch));
+    // One i32 for the `_check_frame_depth` result. That pointer must not
+    // reuse `bridge_slot_local`; the epilogue loads a table index through
+    // it, and a frame address is out of range.
+    let realloc_result_local =
+        resume_key_local + u32::from(resume_dispatch) + u32::from(gcmap_frame_local.is_some());
     debug_assert_eq!(bridge_slot_local, ovf_flag_local + 1);
     debug_assert_eq!(ca_cfp_local, bridge_slot_local + 1);
     debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
@@ -6134,7 +6139,9 @@ fn build_function(
             + extra_alloc_i32
             + u32::from(trace_entry_needs_key_local)
             + u32::from(resume_dispatch)
-            + u32::from(gcmap_frame_local.is_some()),
+            + u32::from(gcmap_frame_local.is_some())
+            // `_check_frame_depth` result; see `realloc_result_local`.
+            + 1,
         ValType::I32,
     ));
     let mut func = Function::new(locals);
@@ -6158,7 +6165,7 @@ fn build_function(
             ca.realloc_fn_ptr,
             base,
             gcmap_ptr,
-            bridge_slot_local,
+            realloc_result_local,
             ca.ca_reload_fn_ptr,
             ca.jf_top_addr,
             ca.attached.propagate_exception_descr,

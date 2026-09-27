@@ -5763,9 +5763,15 @@ impl majit_backend::Backend for WasmBackend {
                 ))
             } else {
                 wasm_guard.as_ref().map(|descr| {
+                    // Same live-position count the guard's parameter tail
+                    // call baked (`live_fail_arg_count` / `rd_locs`), as
+                    // `guard_fail_arg_counts` records for a direct guard. The
+                    // advance-flag vec has one entry per fail arg, dead
+                    // positions included, so its length is a different arity.
+                    let n = descr.fail_arg_types.len();
                     (
                         descr.fail_arg_advanced.clone(),
-                        Some(descr.fail_arg_advanced.len()),
+                        Some(codegen::live_fail_arg_count(descr.meta_descr.as_ref(), n)),
                         descr.param_dispatch,
                     )
                 })
