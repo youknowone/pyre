@@ -1176,6 +1176,11 @@ fn dynasm_gc_write_barrier_managed(obj: GcRef) {
 }
 
 fn dynasm_id_or_identityhash(addr: usize) -> usize {
+    // `GcLLDescr_boehm` (`gcrootmap is None`): the collector does not move
+    // objects, so the identity is the address and the GC is not consulted.
+    if !majit_gc::collector_installed() {
+        return addr;
+    }
     // A box whose borrow is already held by an in-progress alloc answers with
     // the raw `addr`, not with the singleton's id: this is a top-level op, so
     // the busy borrow means the box is mid-allocation, not that it is absent.

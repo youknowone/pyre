@@ -1918,6 +1918,11 @@ fn gc_write_barrier_via_active_runtime(obj: GcRef) {
 /// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
 /// fallback blocks during the L1/L2 stepping-stone window.
 fn id_or_identityhash_via_active_runtime(addr: usize) -> usize {
+    // `GcLLDescr_boehm` (`gcrootmap is None`): the collector does not move
+    // objects, so the identity is the address and the GC is not consulted.
+    if !majit_gc::collector_installed() {
+        return addr;
+    }
     // A box whose borrow is already held by an in-progress alloc answers with
     // the raw `addr`, not with the singleton's id: this is a top-level op, so
     // the busy borrow means the box is mid-allocation, not that it is absent.
