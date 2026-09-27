@@ -305,6 +305,44 @@ pub fn gc_ptr_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
     out
 }
 
+/// The type ids of `Option<PyObjectRef>` in *this* artefact.
+///
+/// A GC pointer held as `Option<PyObjectRef>` goes stale across a collecting
+/// call exactly like a bare one: the payload is the same word, and nothing
+/// publishes it.  Read off every body's locals, so the answer covers only
+/// the spellings a body actually holds.
+pub fn gc_option_type_ids(llbc: &majit_charon_reader::Llbc, gc_tys: &HashSet<u64>) -> HashSet<u64> {
+    let mut seen = HashSet::new();
+    let mut out = HashSet::new();
+    for fd in llbc.iter_local_fns() {
+        let Some(body) = fd.unstructured() else {
+            continue;
+        };
+        for l in &body.locals.locals {
+            let Some(t) = ty_id(&l.ty) else { continue };
+            if gc_tys.contains(&t) || !seen.insert(t) {
+                continue;
+            }
+            let is_option = llbc
+                .dedup_to_adt_def_id(t)
+                .and_then(|def| llbc.type_by_id(def))
+                .is_some_and(|td| td.item_meta.name_path() == "core::option::Option");
+            if !is_option {
+                continue;
+            }
+            let arg = llbc
+                .dedup_body(t)
+                .and_then(|v| v.pointer("/Adt/generics/types/0"))
+                .and_then(|v| serde_json::from_value::<TyRef>(v.clone()).ok())
+                .and_then(|r| ty_id(&r));
+            if arg.is_some_and(|a| gc_tys.contains(&a)) {
+                out.insert(t);
+            }
+        }
+    }
+    out
+}
+
 /// The type ids a `PyFrame` pointer is spelled with in *this* artefact.
 ///
 /// The frame is the second thing a minor collection can leave a body holding a

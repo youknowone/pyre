@@ -407,10 +407,18 @@ fn main() {
             movable_callees.len(),
             liveness::movable_callee_ids(&cg, liveness::MOVABLE_GC_MARKERS, movable_hops).len()
         );
-        let gc_tys = liveness::gc_ptr_type_ids(&llbc);
+        let mut gc_tys = liveness::gc_ptr_type_ids(&llbc);
         if gc_tys.is_empty() {
             println!("   (no PyObjectRef type id found — liveness scan skipped)");
             continue;
+        }
+        // `Option<PyObjectRef>` locals are the same word behind a tag.  Behind
+        // an env var because the gate parses this output and its baseline was
+        // recorded over bare `PyObjectRef` locals only.
+        if std::env::var("GC_OPTION_REFS").is_ok() {
+            let opt = liveness::gc_option_type_ids(&llbc, &gc_tys);
+            println!("   Option<PyObjectRef> type ids: {}", opt.len());
+            gc_tys.extend(opt);
         }
         let push_root_ids: std::collections::HashSet<u64> = pin_ids.iter().copied().collect();
         let (found, stats) = liveness::scan(
