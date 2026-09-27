@@ -5678,6 +5678,10 @@ mod tests {
         assign_positions(&mut ops);
         let mut ctx = OptContext::new(ops.len());
         let b = ctx.materialize_operand_at(idx);
+        // The index argument is the box the constant is attached to.
+        for op in &mut ops[..2] {
+            op.setarg(1, b.clone());
+        }
         ctx.make_constant_box(&b, majit_ir::Value::Int(3));
         let mut pass = OptHeap::new();
         pass.setup();

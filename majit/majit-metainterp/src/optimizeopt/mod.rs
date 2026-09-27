@@ -4021,9 +4021,10 @@ impl OptContext {
             }
         }
 
-        // `produced` (OpRef dual-key: source + result_opref) is internal
-        // scaffolding for `dep_or_materialize` below, which resolves a
-        // dependency arg by its replay position. `builder_entries` is the
+        // `produced` pairs each exported entry's position with the replay op
+        // minted for it, so `rebind_arg` below can rebind a dependency arg
+        // (which carries the exported entry's position) to that replay op.
+        // `builder_entries` is the
         // builder map: ONE entry per short box keyed by the Phase-1
         // carried res box (`produced_op.res`, the same Rc the produce loop
         // reads as `self.res`). The carried box is invariant to the
@@ -4088,42 +4089,23 @@ impl OptContext {
                     crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
                 })
             };
-        // shortpreamble.py produce_arg object-carry: a dependency
-        // arg is the dep's replay op OBJECT (upstream returns
-        // `produced_short_boxes[op].preamble_op`). Bind dep args to the
-        // dep entry's replay Rc (the same dual-key dict the builder will
-        // hold — last insert wins, matching IndexMap overwrite), so
-        // `use_box` reads deps off the operand binding instead of a
-        // position-keyed side map. Slot / Const args keep the positional
-        // materialization.
-        // shortpreamble.py `ShortBoxes.produce_arg`: the producer's replay
-        // `preamble_op`, or None when the operand is not a produced short
-        // box. Last insert wins, matching IndexMap overwrite. An InputArg
-        // producer is not a replay (the renamed inputarg is the operand).
-        let produce_arg = |produced: &[(OpRef, ProducedShortOp)], arg: OpRef| -> Option<Operand> {
+        // shortpreamble.py `produce_arg`: an exported replay-op arg is a
+        // Const, a renamed short inputarg, or a dependency's replay op. The
+        // first two are carried unchanged; a dependency is rebound to the
+        // replay op this builder minted for it, so `use_box` appends that op
+        // rather than the exporting phase's producer.
+        let rebind_arg = |produced: &[(OpRef, ProducedShortOp)], arg: Operand| -> Operand {
+            let r = arg.to_opref();
+            if r.is_constant() {
+                return arg;
+            }
             produced
                 .iter()
                 .rev()
-                .find(|(k, dep)| *k == arg && dep.kind != PreambleOpKind::InputArg)
+                .find(|(k, _)| *k == r)
                 .map(|(_, dep)| Operand::from_bound_op(&dep.preamble_op))
+                .unwrap_or(arg)
         };
-        let dep_or_materialize =
-            |ctx: &mut Self, produced: &[(OpRef, ProducedShortOp)], r: OpRef| {
-                // shortpreamble.py:288 Const arm: the arg is the Const box
-                // itself — a const-folded entry carries an inline-Const
-                // pos/key, which must not bind to the replay op.
-                if r.is_constant() {
-                    return ctx.materialize_operand_at(r);
-                }
-                // InputArg producers are included: their replay SameAs is the
-                // operand. `produce_arg` skips those; heap receivers use it.
-                produced
-                    .iter()
-                    .rev()
-                    .find(|(k, _)| *k == r)
-                    .map(|(_, dep)| Operand::from_bound_op(&dep.preamble_op))
-                    .unwrap_or_else(|| ctx.materialize_operand_at(r))
-            };
 
         for (source, produced_op) in short_boxes {
             // Some ProducedShortOps (PreambleOpKind::Heap with non-getfield /
@@ -4135,21 +4117,20 @@ impl OptContext {
             };
             match produced_op.kind {
                 PreambleOpKind::Pure => {
-                    let mut resolved_args = Vec::with_capacity(produced_op.preamble_op.num_args());
+                    // Every arg must still be bindable in this namespace; a
+                    // miss declines the whole short preamble.
                     for arg in produced_op.preamble_op.args_slice().iter() {
-                        let Some(resolved) = resolve_arg(
-                            arg.to_opref(),
-                            self,
-                            &produced_results,
-                            imported_constants,
-                        ) else {
+                        if resolve_arg(arg.to_opref(), self, &produced_results, imported_constants)
+                            .is_none()
+                        {
                             return false;
-                        };
-                        resolved_args.push(resolved);
+                        }
                     }
-                    let resolved_arg_boxes: Vec<Operand> = resolved_args
+                    let resolved_arg_boxes: Vec<Operand> = produced_op
+                        .preamble_op
+                        .args_slice()
                         .iter()
-                        .map(|a| dep_or_materialize(self, &produced, *a))
+                        .map(|a| rebind_arg(&produced, a.clone()))
                         .collect();
                     let mut op = Op::new(
                         pure_call_opcode(produced_op.preamble_op.opcode),
@@ -4210,21 +4191,15 @@ impl OptContext {
                                 majit_ir::Type::Float => OpCode::GetfieldGcF,
                                 majit_ir::Type::Void => return false,
                             };
-                            // shortpreamble.py HeapOp.add_op_to_short:
-                            // `preamble_arg = sb.produce_arg(sop.getarg(0))`
-                            // returns the producer's replay `preamble_op`.
-                            // A short-inputarg receiver stays the exported
-                            // operand (`source_op` keeps the original for
-                            // PtrInfo). A produced short-op receiver must be
-                            // that replay op: leaving the exporting position
-                            // (for example RefOp(72) of a CALL_PURE_R) makes
-                            // `inline_short_preamble` `_map_args` miss it,
-                            // because the replay result is registered under
-                            // the replay pos, not the exporting box. That
-                            // box can also be a loop-label `used_box`, which
-                            // is not a short inputarg.
-                            let obj_b = produce_arg(&produced, object_arg.to_opref())
-                                .unwrap_or_else(|| produced_op.preamble_op.arg(0));
+                            // shortpreamble.py:416-426 keeps the exported
+                            // `preamble_op` object on the builder. Its receiver
+                            // is the renamed short-inputarg (or replay result),
+                            // while `source_op` separately carries the original
+                            // receiver used by HeapOp.produce_op for PtrInfo.
+                            // Resolving this arg through `short_args` collapses
+                            // those identities and emits guards on an exporting-
+                            // phase box that a retrace cannot bind.
+                            let obj_b = rebind_arg(&produced, produced_op.preamble_op.arg(0));
                             let mut op = Op::new(opcode, &[obj_b]);
                             op.pos().set(produced_op.preamble_op.pos().get());
                             op.setdescr(descr);
@@ -4265,11 +4240,8 @@ impl OptContext {
                             {
                                 return false;
                             }
-                            let obj_b =
-                                produce_arg(&produced, produced_op.preamble_op.arg(0).to_opref())
-                                    .unwrap_or_else(|| produced_op.preamble_op.arg(0));
-                            let index_b = produce_arg(&produced, index_arg.to_opref())
-                                .unwrap_or_else(|| produced_op.preamble_op.arg(1));
+                            let obj_b = rebind_arg(&produced, produced_op.preamble_op.arg(0));
+                            let index_b = rebind_arg(&produced, produced_op.preamble_op.arg(1));
                             let mut op = Op::new(opcode, &[obj_b, index_b]);
                             op.pos().set(produced_op.preamble_op.pos().get());
                             op.setdescr(descr);
@@ -4312,7 +4284,7 @@ impl OptContext {
                     {
                         return false;
                     }
-                    let func_b = dep_or_materialize(self, &produced, func_opref);
+                    let func_b = rebind_arg(&produced, produced_op.preamble_op.arg(0));
                     let mut op = Op::new(loop_invariant_opcode(result_type), &[func_b]);
                     op.pos().set(produced_op.preamble_op.pos().get());
                     let res = self.materialize_operand_at(op.pos().get());

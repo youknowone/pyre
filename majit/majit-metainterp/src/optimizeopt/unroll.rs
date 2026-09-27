@@ -1724,8 +1724,7 @@ impl UnrollOptimizer {
         // Per-slot ORIGINAL box (what each renamed `short_inputargs[i]`
         // replaces), recovered from the produced `InputArg` short boxes via
         // `label_arg_idx` (shortpreamble.py:417 keys the info lookup by
-        // `produced_op.short_op.res`, the original). Shared by the two
-        // consumers below. Every label/virtual slot produces an InputArg
+        // `produced_op.short_op.res`, the original). Every label/virtual slot produces an InputArg
         // entry, except a duplicate slot (one box appears twice in
         // `label_args + virtuals`: the `potential_ops[box]` overwrite keys the
         // single entry at its LAST slot — shortpreamble.py:259, mirrored by
@@ -1768,37 +1767,6 @@ impl UnrollOptimizer {
                 infos.push(info);
             }
             initial_sp.inputarg_infos = infos;
-        }
-        // shortpreamble.py:255-259 renamed-short_inputargs: in THIS import path
-        // the short-preamble Label is the renamed `short_inputargs`, so seed
-        // `phase1_inputargs` with the per-slot ORIGINALS (paired 1:1 with the
-        // renamed Label / jump_args) as the second inline-mapping leg — see the
-        // load-bearing analysis at the consuming site in inline_short_preamble.
-        // NOTE (measured): the originals seeded here are empirically INERT — post
-        // #217 produce_arg embeds the renamed boxes into the short ops, so no short
-        // op references an original (0 of the 176 corpus consumptions of the
-        // phase1 leg were original boxes; the load-bearing consumptions all come
-        // from the build_short_preamble_struct producer, whose phase1 holds the
-        // RENAMED boxes). The field cannot be dropped on that account because the
-        // OTHER producer is load-bearing; see the convergence note at the consumer.
-        // Dead duplicate / const-folded slots (`slot_to_original == None`) fall
-        // back to the renamed Label box, leaving phase1[i] == inputargs[i] there
-        // (no insert at the consumer). No-op when the Label already IS the
-        // originals (the two box sets coincide).
-        if initial_sp.phase1_inputargs.is_none() {
-            let phase1: Vec<OpRef> = initial_sp
-                .inputargs
-                .iter()
-                .enumerate()
-                .map(|(i, label)| slot_to_original[i].unwrap_or(*label))
-                .collect();
-            let differs = phase1
-                .iter()
-                .zip(initial_sp.inputargs.iter())
-                .any(|(orig, label)| orig != label);
-            if differs {
-                initial_sp.phase1_inputargs = Some(phase1);
-            }
         }
         let opt_unroll = OptUnroll::new();
         let (target_token, short_preamble_producer) = opt_unroll.finalize_short_preamble(
@@ -2844,11 +2812,6 @@ impl ExportedState {
                 .chain(short_preamble.jump_args.iter())
             {
                 visit(*r);
-            }
-            if let Some(phase1_inputargs) = &short_preamble.phase1_inputargs {
-                for r in phase1_inputargs {
-                    visit(*r);
-                }
             }
             for short_op in &short_preamble.ops {
                 visit_op(&short_op.op, &mut visit);
@@ -4222,70 +4185,10 @@ impl OptUnroll {
             }
         }
 
-        // Map the second short-inputarg domain that the `inputargs → jump_args`
-        // seeding above does NOT cover. pyre keeps disjoint Phase-1/Phase-2 box
-        // namespaces (the export serializes boxes to integer OpRef positions), so
-        // a short preamble has two inputarg domains — the ORIGINAL Phase-1 label
-        // boxes and the RENAMED short_inputargs (shortpreamble.py:256-259) — and
-        // `short_preamble.inputargs` carries only one of them. The two producers
-        // assign OPPOSITE domains:
-        //   - the import seeding (this file, the `slot_to_original` block above):
-        //     inputargs = renamed Label, phase1_inputargs = originals;
-        //   - build_short_preamble_struct (shortpreamble.rs `if inputargs !=
-        //     &short_inputargs`): inputargs = original label_args, phase1_inputargs
-        //     = renamed short_inputargs.
-        // In the second (Extended/active-builder) case the short ops reference the
-        // RENAMED boxes — produce_arg embedded them at export (#217) — which are
-        // NOT in `inputargs` (= originals there), so THIS leg is the sole mapper
-        // that resolves them to jump_args. Measured LOAD-BEARING: 176 consumptions
-        // across the check.py corpus on both backends, all GuardNonnullClass /
-        // Immutable GetfieldGc over ref inputargs (the redundant-guard / field-read
-        // elimination on loop-carried references). Dropping this leg routes those
-        // args to the None → InvalidLoop arm below — correct, but it loses the loop
-        // inlining for those traces. (The originals-domain seeding from the import
-        // path is, by contrast, empirically inert: 0 of the 176 consumptions were
-        // original boxes, because post-#217 no short op references an original.)
-        // Upstream needs no analog: its single Box namespace is stable across the
-        // boundary, so the renamed inputarg IS the object the short ops reference
-        // and unroll.py:393-396 seeds only short_inputargs → jump_args.
-        // CONVERGENCE (issue #217 "known blocker"): make
-        // build_short_preamble_struct build the Label from the RENAMED
-        // short_inputargs (matching the import-seeding convention, #217, and
-        // upstream); then `inputargs` covers the renamed short-op args directly and
-        // this leg plus the phase1_inputargs field can be removed.
-        if let Some(ref phase1) = short_preamble.phase1_inputargs {
-            for (i, phase1_inputarg) in phase1.iter().enumerate() {
-                let phase1_inputarg = *phase1_inputarg;
-                if let Some(&jump_arg) = jump_args.get(i)
-                    && !mapping.contains_key(&phase1_inputarg)
-                {
-                    mapping.insert(phase1_inputarg, jump_arg);
-                }
-            }
-        }
-        // When setup() activates an Extended builder, replay reads its live
-        // remapped ops below rather than `short_preamble.ops`. Those operands
-        // are in the builder's current Label domain, so seed that domain from
-        // the same positional jump args. RPython needs only the primary seed:
-        // its setup stores and replays the same Box objects without pyre's
-        // serialized-OpRef remap between the stored target and live builder.
-        if let Some(builder) = ctx.active_short_preamble_producer.as_ref() {
-            // The two lists legitimately differ in length, and the `zip` is
-            // load-bearing rather than sloppy: upstream binds by Box identity
-            // and never asks how many there are, while here the builder's
-            // Label domain and the body's jump args agree only on their
-            // common prefix — the trailing jump args carry positions this
-            // Label never took. Binding that prefix is the whole point.
-            // Requiring equal arities instead was measured to take
-            // `retrace_outer_loop_type_flip` back to the failure this seed
-            // exists to fix: `loops_aborted` 0 -> 2, `retraces_compiled`
-            // 1 -> 0, `guard_failures` 201 -> 590 on both backends.
-            for (&label_arg, &jump_arg) in builder.label_args().iter().zip(jump_args.iter()) {
-                mapping.entry(label_arg).or_insert(jump_arg);
-            }
-        }
+        // unroll.py inline_short_preamble: the only seed is
+        // `mapping[short_inputargs[i]] = jump_args[i]`.
 
-        // RPython keys `mapping` by Box identity: the seeding loops above bind
+        // RPython keys `mapping` by Box identity: the seeding above binds
         // each short-preamble INPUT box to its jump arg, and the replay loop
         // below binds each short-op RESULT box (`mapping[sop] = op`). Those two
         // key spaces never intersect — a Box is either an input or a produced
@@ -6969,7 +6872,6 @@ mod tests {
             }])),
             constants,
             inputarg_infos: vec![Some(PtrInfo::Constant(old))],
-            phase1_inputargs: Some(vec![old_ref]),
         });
         state.runtime_boxes.push(old_ref);
         state.patchguardop = Some(Op::new(
@@ -7021,7 +6923,6 @@ mod tests {
         assert_eq!(short.inputargs[0], new_ref);
         assert_eq!(short.used_boxes[0], new_ref);
         assert_eq!(short.jump_args[0], new_ref);
-        assert_eq!(short.phase1_inputargs.as_ref().unwrap()[0], new_ref);
         assert_eq!(short.constants.get(&0), Some(&majit_ir::Const::Ref(new)));
     }
 
@@ -8178,12 +8079,14 @@ mod tests {
         );
         let pop = pop.unwrap();
         assert_eq!(pop.op.to_opref(), OpRef::const_int(7));
-        // The const entries never reach `used_boxes`, so no short-preamble
-        // builder holds a replay for this one and `produce_heap_field` builds
-        // it from the resolved receiver: `classify_short_arg` maps the renamed
-        // `short_inputargs[0]` back through `short_args` to the imported label
-        // arg, which is what the replay must carry.
-        assert_eq!(pop.preamble_op.arg(0).to_opref(), label_args[0]);
+        // The const entries are not builder keys, so the replay is the
+        // exported `preamble_op` itself: its receiver is the renamed
+        // `short_inputargs[0]` that `produce_arg` returned at export, the box
+        // `inline_short_preamble` maps to the jump arg.
+        assert_eq!(
+            pop.preamble_op.arg(0).to_opref(),
+            exported.short_inputargs[0]
+        );
         drop(parent);
     }
 
@@ -10343,7 +10246,7 @@ mod tests {
         ));
         let i0 = OpRef::input_arg_int(0);
         let mut sb = ShortBoxes::with_label_args(&[i0]);
-        sb.add_pure_op(&mut ctx, call);
+        sb.add_pure_op(&mut ctx, &OpRc::new(call));
         let short_boxes = sb.create_short_boxes(&mut ctx, &[i0], &[Type::Int]);
         let pure = short_boxes
             .iter()
