@@ -2031,12 +2031,12 @@ impl AbstractShortPreambleBuilderState {
             if matches!(forwarded, majit_ir::forwarding::Forwarded::None) {
                 continue;
             }
-            // shortpreamble.py:397 `arg.set_forwarded(None)` clears a replay
-            // op, which upstream never shares with the loop body. Here the arg
-            // can be the body box itself, whose `_forwarded` holds the info the
-            // body was optimized under (an array lenbound, cached fields); only
-            // the builder's `empty_info` marker is consumed, and `short_results`
-            // keeps the append single.
+            // `AbstractShortPreambleBuilder.use_box`'s `arg.set_forwarded(None)`
+            // clears a replay op, which upstream never shares with the loop
+            // body. Here the arg can be the body box itself, whose `_forwarded`
+            // holds the info the body was optimized under (an array lenbound,
+            // cached fields); only the builder's `empty_info` marker is
+            // consumed, and `short_results` keeps the append single.
             if matches!(
                 &dep.forwarded().borrow(),
                 majit_ir::forwarding::Forwarded::Info(crate::optimizeopt::info::OpInfo::EmptyInfo(
