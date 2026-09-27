@@ -3602,9 +3602,19 @@ unsafe fn follow_forwarded_vable(obj_ptr: *mut u8) -> *mut u8 {
     }
 }
 
+#[inline]
 pub(crate) unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *mut u8) -> *mut u8 {
     // virtualizable.py `clear_vable_token`: if token: force_now(); assert not token.
+    // A zero token is the steady entry. Do not build the force closure and
+    // do not walk a forwarding header that only a live token can have left.
+    if !vinfo.has_vable_token() {
+        return obj_ptr;
+    }
     unsafe {
+        let token_ptr = obj_ptr.add(vinfo.token_offset) as *const usize;
+        if *token_ptr == 0 {
+            return obj_ptr;
+        }
         vinfo.clear_vable_token(obj_ptr, |_token| {
             let Some(clear_vable_ptr) = vinfo.clear_vable_ptr else {
                 // A machine that registered no force helper has no compiled
