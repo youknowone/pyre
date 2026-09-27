@@ -20357,6 +20357,21 @@ impl<'a> Lowering<'a> {
         if rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") {
             return Some((rendered.clone(), ValueType::Ref(Some(rendered))));
         }
+        // `None` of a maybe-null `W_Root` is RPython's `None`, which unions
+        // into `SomeInstance(W_Root, can_be_none=True)` and keeps the class
+        // (`model.py` `unionof`).  The bare `null_mut()` is classdef-less, so
+        // a `return None` beside a `Some(w)` widened the whole return to the
+        // classdef-less top and carried it into every container the value
+        // reached.  Narrow the null to the `PyObject` pointee the payload
+        // (`NonNull<PyObject>`, `*mut PyObject`, `&PyObject`) names.
+        let pointee = rendered
+            .trim_end_matches('>')
+            .rsplit(['<', ' ', '&'])
+            .next()
+            .unwrap_or_default();
+        if pointee == "PyObject" || pointee.ends_with("::PyObject") {
+            return Some(("pyobject::PyObject".to_string(), ValueType::Ref(None)));
+        }
         None
     }
 
