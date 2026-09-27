@@ -51,19 +51,8 @@ pub struct W_MemoryView {
     /// an exporter (holds one `_exports` count on the backing); false for a
     /// derived view (slice, copy, cast, `toreadonly`), which `memoryobject.py`
     /// builds as `W_MemoryView(view, owns_export=False)` and which shares the
-    /// root's export.  Only an owning view releases the underlying export.
+    /// original's export.  Only an owning view releases the underlying export.
     pub owns_export: bool,
-    /// On a derived view, the owning root view whose export it shares; null on
-    /// a root.  The root stands in for the managed buffer that
-    /// `memoryobject.c mbuf_add_view` registers every view on (3.14 spec): the
-    /// export stays alive until every view registered on it is released, so
-    /// `m = memoryview(b); s = m[1:]; m.release()` still leaves `b` exported.
-    pub w_export_owner: PyObjectRef,
-    /// On a root view, the number of unreleased derived views whose
-    /// `w_export_owner` is this view.  While positive, `release()` of the root
-    /// only marks it released and defers `_release_underlying` to the last
-    /// derived view's release.
-    pub derived_views: i64,
 }
 
 /// CPython 3.14 `PyBufferWrapper` (`Objects/typeobject.c`): the owner placed
@@ -112,8 +101,6 @@ pub fn w_memoryview_alloc_header(released: bool, owns_export: bool) -> PyObjectR
         w_weakreflifeline: PY_NULL,
         restricted: false,
         owns_export,
-        w_export_owner: PY_NULL,
-        derived_views: 0,
     };
     let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         <W_MemoryView as crate::lltype::GcType>::type_id(),
@@ -370,62 +357,6 @@ pub unsafe fn w_memoryview_set_hash(obj: PyObjectRef, hash: i64) {
 #[inline]
 pub unsafe fn w_memoryview_owns_export(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const W_MemoryView)).owns_export }
-}
-
-/// The owning root view of a derived view (null on a root view).
-///
-/// # Safety
-/// `obj` must point to a valid `W_MemoryView`.
-#[inline]
-pub unsafe fn w_memoryview_export_owner(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_MemoryView)).w_export_owner }
-}
-
-/// Store the owning root view of a derived view and remember the
-/// old-to-young edge.
-///
-/// # Safety
-/// `obj` must point to a valid `W_MemoryView`, and `owner` to a valid root
-/// `W_MemoryView` (or be null).
-#[inline]
-pub unsafe fn w_memoryview_set_export_owner(obj: PyObjectRef, owner: PyObjectRef) {
-    unsafe {
-        (*(obj as *mut W_MemoryView)).w_export_owner = owner;
-    }
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
-}
-
-/// Number of unreleased derived views registered on this root view.
-///
-/// # Safety
-/// `obj` must point to a valid `W_MemoryView`.
-#[inline]
-pub unsafe fn w_memoryview_derived_views(obj: PyObjectRef) -> i64 {
-    unsafe { (*(obj as *const W_MemoryView)).derived_views }
-}
-
-/// Register one more derived view on this root view (`mbuf_add_view`).
-///
-/// # Safety
-/// `obj` must point to a valid root `W_MemoryView`.
-#[inline]
-pub unsafe fn w_memoryview_derived_views_incref(obj: PyObjectRef) {
-    unsafe { (*(obj as *mut W_MemoryView)).derived_views += 1 }
-}
-
-/// Unregister a released derived view from this root view and return the
-/// remaining count.
-///
-/// # Safety
-/// `obj` must point to a valid root `W_MemoryView` with a positive count.
-#[inline]
-pub unsafe fn w_memoryview_derived_views_decref(obj: PyObjectRef) -> i64 {
-    unsafe {
-        let mv = obj as *mut W_MemoryView;
-        debug_assert!((*mv).derived_views > 0);
-        (*mv).derived_views -= 1;
-        (*mv).derived_views
-    }
 }
 
 /// Flip `released` without touching the view box, so a re-entrant `release()`

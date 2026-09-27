@@ -180,34 +180,6 @@ unsafe fn memoryview_wrap_dims(dims: &[i64]) -> PyObjectRef {
     }
 }
 
-/// Register the derived view `mv` built from `src` on the root view that owns
-/// the shared export: `mbuf_add_view` with the root standing in for the
-/// managed buffer.  A derived view takes no `_exports` count of its own and
-/// registers no finalizer (`W_MemoryView(view, owns_export=False)`,
-/// `memoryobject.py`); it keeps the root alive through `w_export_owner`, and
-/// the root's `_release_underlying` waits until every derived view registered
-/// on it is released.  A non-owning `src` with no root (a raw window or an
-/// exporter-less copy) shares no export, so there is nothing to register on.
-///
-/// # Safety
-/// `mv` and `src` must be `W_MemoryView`s; `src` must be read from its pinned
-/// slot after `mv`'s allocation.
-unsafe fn memoryview_register_derived(mv: PyObjectRef, src: PyObjectRef) {
-    use pyre_object::memoryview::*;
-    unsafe {
-        let root = if w_memoryview_owns_export(src) {
-            src
-        } else {
-            w_memoryview_export_owner(src)
-        };
-        if root.is_null() {
-            return;
-        }
-        w_memoryview_set_export_owner(mv, root);
-        w_memoryview_derived_views_incref(root);
-    }
-}
-
 /// `W_MemoryView.copy` (`memoryobject.py`): allocate a new memoryview header
 /// and clone the source's immutable view into its owner box.
 ///
@@ -226,7 +198,6 @@ unsafe fn w_memoryview_copy_derived(mv_src: PyObjectRef) -> PyObjectRef {
         let view = pyre_object::memoryview::w_memoryview_view(r_src).clone();
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
-        memoryview_register_derived(mv, r_src);
         mv
     }
 }
@@ -250,7 +221,6 @@ unsafe fn w_memoryview_readonly_derived(mv_src: PyObjectRef) -> PyObjectRef {
         };
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
-        memoryview_register_derived(mv, r_src);
         mv
     }
 }
@@ -278,7 +248,6 @@ unsafe fn w_memoryview_cast_1d(mv_src: PyObjectRef, fmt: &str, itemsize: i64) ->
         };
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
-        memoryview_register_derived(mv, r_src);
         mv
     }
 }
@@ -336,7 +305,6 @@ unsafe fn w_memoryview_cast_nd(
         };
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
-        memoryview_register_derived(mv, r_src);
         mv
     }
 }
@@ -1256,7 +1224,6 @@ unsafe fn memoryview_slice_view(
         let r_mv = pyre_object::gc_roots::shadow_stack_get(sp);
         let snapshot = w_memoryview_view(r_mv).clone();
         w_memoryview_set_view(sliced, bufferview_alloc(snapshot));
-        memoryview_register_derived(sliced, r_mv);
         let _ = pyre_object::gc_roots::pin_root(sliced);
 
         let r_index = pyre_object::gc_roots::shadow_stack_get(sp + 1);
@@ -2341,12 +2308,6 @@ unsafe fn memoryview_release_buffer_wrapper(wrapper: PyObjectRef) {
             if let Some(descr) = memoryview_python_release_descr(r_obj) {
                 memoryview_call_python_release_unraisable(r_obj, r_mv, descr);
             }
-        } else if !w_memoryview_released(r_mv) && w_memoryview_derived_views(r_mv) > 0 {
-            // Views derived from the returned memoryview still share its
-            // export: dropping the wrapper's reference leaves the managed
-            // buffer registered, and the last derived view's release runs
-            // `_release_underlying` on it.
-            w_memoryview_mark_released(r_mv);
         } else if !w_memoryview_released(r_mv) {
             // The Python release override runs app-level code and collects,
             // and so can a C exporter's `bf_releasebuffer`: the view is a
@@ -2384,41 +2345,20 @@ pub(crate) fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
                     "memoryview: negative export count",
                 ));
             }
-            // `_release_underlying` (`memoryobject.py`) runs on the view that
-            // owns the export: this view when it is a root with no unreleased
-            // derived views, or its root when this was the last derived view
-            // released after the root.  A root with unreleased derived views
-            // only marks itself released (`mbuf_release` once the managed
-            // buffer has no registered views); a derived view shares its
-            // root's export and unregisters from the root instead.
-            let target = if pyre_object::memoryview::w_memoryview_owns_export(mv) {
-                if pyre_object::memoryview::w_memoryview_derived_views(mv) > 0 {
-                    pyre_object::memoryview::w_memoryview_mark_released(mv);
-                    return Ok(w_none());
-                }
-                mv
-            } else {
+            // `_release_underlying` (`memoryobject.py`).  A slice / copy
+            // (`owns_export == false`) shares the export and must not release it.
+            if !pyre_object::memoryview::w_memoryview_owns_export(mv) {
                 pyre_object::memoryview::w_memoryview_set_released(mv);
-                let root = pyre_object::memoryview::w_memoryview_export_owner(mv);
-                if root.is_null()
-                    || pyre_object::memoryview::w_memoryview_derived_views_decref(root) != 0
-                    || !pyre_object::memoryview::w_memoryview_released(root)
-                    || (*(root as *const pyre_object::memoryview::W_MemoryView))
-                        .view
-                        .is_null()
-                {
-                    return Ok(w_none());
-                }
-                root
-            };
+                return Ok(w_none());
+            }
             // The exporter hooks below run app-level code and collect: the
             // view, its owner and its backing are livevars across them and
             // are read back from their slots after each one.
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.pin_roots(&[
-                target,
-                pyre_object::memoryview::w_memoryview_obj(target),
-                pyre_object::memoryview::w_memoryview_backing(target),
+                mv,
+                pyre_object::memoryview::w_memoryview_obj(mv),
+                pyre_object::memoryview::w_memoryview_backing(mv),
             ]);
             let mv = || roots.get(base);
             let owner = || roots.get(base + 1);

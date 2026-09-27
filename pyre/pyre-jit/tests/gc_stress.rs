@@ -3303,8 +3303,8 @@ assert released
 /// instead of owning one, so only the root carries a finalizer.  A cycle
 /// through a bytearray reached by a dead root and a dead intermediate slice
 /// is then freed by one collection, weakrefs into it included.  Releasing the
-/// root while a slice is alive keeps the export until the slice is released
-/// too.
+/// root ends the export whatever slices remain, dead or alive, and a live
+/// slice still reads the bytearray afterwards.
 #[test]
 fn memoryview_derived_views_share_the_root_export() {
     run_on_worker(
@@ -3331,17 +3331,13 @@ assert wr() is None
 b = bytearray(b"abcdef")
 m = memoryview(b)
 s = m[1:]
+assert list(m[1:3]) == [98, 99]
 m.release()
-try:
-    b.append(1)
-except BufferError:
-    pass
-else:
-    raise AssertionError("a live slice must keep the export")
+b.append(1)
 assert s[0] == 98
 s.release()
 b.append(2)
-assert b == bytearray(b"abcdef\x02"), b
+assert b == bytearray(b"abcdef\x01\x02"), b
 "#,
         "memoryview_derived_export.py",
         "memoryview derived export",

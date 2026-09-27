@@ -1323,12 +1323,6 @@ unsafe fn memoryview_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
         unsafe { &mut (*mv).w_weakreflifeline } as *mut pyre_object::PyObjectRef
             as *mut majit_ir::GcRef,
     );
-    // A derived view keeps its owning root view alive, so the root's export
-    // (and finalizer) outlive every view registered on it.
-    f(
-        unsafe { &mut (*mv).w_export_owner } as *mut pyre_object::PyObjectRef
-            as *mut majit_ir::GcRef,
-    );
     let view_ptr = unsafe { (*mv).view } as *mut pyre_object::bufferview::BufferView;
     if view_ptr.is_null() {
         return;
