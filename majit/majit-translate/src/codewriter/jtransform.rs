@@ -1832,8 +1832,14 @@ fn wide_inline_borrow_offset(
     let row = cc
         .and_then(|cc| cc.struct_layout_for(owner))
         .and_then(|layout| layout.fields.iter().find(|row| row.name == field.name));
+    // An inline aggregate (`descr.py` `get_type_flag` → `FLAG_STRUCT`)
+    // wider than one word. A scalar is one register value at any size:
+    // an `i64` on a 32-bit target is still `FLAG_SIGNED`.
     let word = crate::layout::target_word_size();
-    let wider = field.inline_vec || row.is_some_and(|row| row.size > word);
+    let wider = field.inline_vec
+        || row.is_some_and(|row| {
+            row.flag == majit_ir::descr::ArrayFlag::Struct && row.size > word
+        });
     if !wider {
         return None;
     }
@@ -11544,6 +11550,37 @@ mod tests {
             getsubstruct_offset_for_access(&address, || Some(0)),
             Some(0)
         );
+    }
+
+    /// A scalar wider than a word (an `i64` on a 32-bit target, an `i128`
+    /// here) borrowed by address is `FLAG_SIGNED`, not an inline aggregate,
+    /// so it is not a substructure address.
+    #[test]
+    fn wide_scalar_borrow_is_not_a_substruct_address() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let owner = "holder::WideScalar";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let word = crate::layout::target_word_size();
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 2 * word,
+                align: word,
+                fields: vec![StructFieldLayout {
+                    name: "count".into(),
+                    offset: 0,
+                    size: 2 * word,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+            },
+        );
+        let field = FieldDescriptor::new("count", Some(owner.into())).with_taken_by_address(true);
+        assert_eq!(wide_inline_borrow_offset(&field, Some(&cc)), None);
     }
 
     /// `&mut s.tags` on a raw `#[repr(C)]` holder is `int_add` of the
