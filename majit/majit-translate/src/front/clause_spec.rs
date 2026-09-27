@@ -37,7 +37,7 @@ pub(crate) struct SpecRequest {
 pub(crate) struct SpecQueue {
     pending: VecDeque<SpecRequest>,
     /// First request that claimed each leaf. A later request for the same
-    /// leaf is the same instantiation; a different one is a name collision.
+    /// leaf is the same instantiation; one from another function is a clash.
     seen: HashMap<String, SpecRequest>,
     /// `def_id`s whose body contains a depth-0 `Clause`.
     clause_body: std::collections::HashMap<u64, bool>,
@@ -72,15 +72,14 @@ impl SpecQueue {
     }
 
     pub(crate) fn enqueue(&mut self, req: SpecRequest) -> bool {
+        // The leaf carries the hash of the rendered key, so a second request
+        // under it is the same instantiation even when its JSON spells a type
+        // through a different dedup id. Only a different function is a clash.
         if let Some(first) = self.seen.get(&req.leaf) {
-            if first.fn_id != req.fn_id
-                || first.trait_refs != req.trait_refs
-                || first.types != req.types
-                || first.const_generics != req.const_generics
-            {
+            if first.fn_id != req.fn_id {
                 panic!(
-                    "specialized leaf {} claimed by a different instantiation",
-                    req.leaf
+                    "specialized leaf {} claimed by two functions ({} and {})",
+                    req.leaf, first.fn_id, req.fn_id
                 );
             }
             return false;
