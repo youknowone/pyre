@@ -268,6 +268,48 @@ fn is_box_as_ref_or_mut(target: &CallTarget, receiver_path: Option<&str>) -> boo
     }
 }
 
+fn is_option_as_deref(target: &CallTarget) -> bool {
+    let leaf_matches = |name: &str| matches!(name, "as_deref" | "as_deref_mut");
+    match target {
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => leaf_matches(name) && path_leaf(receiver_root.as_deref()) == Some("Option"),
+        CallTarget::FunctionPath { segments, .. } => {
+            function_leaf(segments).is_some_and(leaf_matches)
+                && (path_has(segments, "option") || path_has(segments, "Option"))
+        }
+        _ => false,
+    }
+}
+
+/// `Option::as_deref` / `as_deref_mut` on a null-niche `Option<Box<T>>`
+/// (or `Option<&T>` / `Option<&mut T>`). The option word is the payload
+/// pointer and `None` is null, so the returned `Option<&T>` is that word.
+/// `rmodel.py` nullable pointer (`can_be_none`). A non-niche option stays
+/// a residual call: its payload is not the option word.
+pub(crate) fn lower_niche_option_deref(op_kind: OpKind, niche_option_ptr: bool) -> OpKind {
+    if !niche_option_ptr {
+        return op_kind;
+    }
+    let OpKind::Call {
+        target,
+        args,
+        result_ty,
+    } = &op_kind
+    else {
+        return op_kind;
+    };
+    if !is_option_as_deref(target) {
+        return op_kind;
+    }
+    let Some(operand) = args.first().and_then(|arg| arg.as_variable()).cloned() else {
+        return op_kind;
+    };
+    same_as(operand, result_ty.clone())
+}
+
 fn same_as(operand: Variable, result_ty: ValueType) -> OpKind {
     OpKind::UnaryOp {
         op: "same_as".to_string(),
@@ -635,6 +677,58 @@ mod tests {
             as_mut,
             OpKind::UnaryOp { ref op, .. } if op == "same_as"
         ));
+
+        let as_deref_mut = lower_niche_option_deref(
+            call(
+                path(&[
+                    "core",
+                    "option",
+                    "Option",
+                    "<impl>",
+                    "as_deref_mut",
+                ]),
+                vec![v.clone()],
+                ValueType::Ref(None),
+            ),
+            true,
+        );
+        match as_deref_mut {
+            OpKind::UnaryOp {
+                ref op,
+                ref operand,
+                ..
+            } => {
+                assert_eq!(op, "same_as");
+                assert_eq!(operand, &v);
+            }
+            other => panic!(
+                "niche Option<Box<T>>::as_deref_mut is the pointer word, got {other:?}"
+            ),
+        }
+        let as_deref = lower_niche_option_deref(
+            call(
+                CallTarget::method("as_deref", Some("Option".into())),
+                vec![v.clone()],
+                ValueType::Ref(None),
+            ),
+            true,
+        );
+        assert!(matches!(
+            as_deref,
+            OpKind::UnaryOp { ref op, .. } if op == "same_as"
+        ));
+        let tagged = lower_niche_option_deref(
+            call(
+                path(&["core", "option", "Option", "as_deref_mut"]),
+                vec![v.clone()],
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        assert!(
+            matches!(tagged, OpKind::Call { .. }),
+            "a non-niche Option::as_deref_mut stays a call"
+        );
 
         let deref = lower_std_primitive_op(
             call(

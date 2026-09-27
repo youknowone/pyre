@@ -8390,9 +8390,6 @@ impl<'a> Lowering<'a> {
                 let lhs_v = self.resolve_operand(mir_bb, lhs)?;
                 let rhs_v = self.resolve_operand(mir_bb, rhs)?;
                 let mut op_label = binop_label(&op_json)?;
-                let res = self
-                    .graph
-                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                 // Preserve the source scalar width through flow-graph
                 // construction.  PyPy's rbigint `_x_divrem` performs its
                 // intermediates in `LONG_TYPE` / `ULONG_TYPE`
@@ -8435,6 +8432,19 @@ impl<'a> Lowering<'a> {
                 if result_ty == ValueType::Float && op_label == "floordiv" {
                     op_label = "truediv".to_string();
                 }
+                // `getkind` reads the result variable, not `result_ty`.
+                // `Unknown` is kind `'r'`, so an `i64` add was emitted as
+                // `int_add/ii>r`, a key no blackhole handler has. A scalar
+                // result is Signed / Float (`history.py getkind`). A
+                // non-scalar destination keeps `Unknown`.
+                let result_concrete = match &scalar_ty {
+                    ValueType::Float => crate::model::ConcreteType::Float,
+                    ValueType::Int | ValueType::Unsigned | ValueType::Bool => {
+                        crate::model::ConcreteType::Signed
+                    }
+                    _ => crate::model::ConcreteType::Unknown,
+                };
+                let res = self.graph.alloc_value_var_with_type(result_concrete);
                 // Integer ops that have no pointer form (`rptr.py` is
                 // only eq/ne) must see Signed addresses:
                 // `cast_ptr_to_int(p) < cast_ptr_to_int(q)`, and the
@@ -17030,6 +17040,17 @@ impl<'a> Lowering<'a> {
             identity_banks_agree,
             identity_layout.as_deref(),
         );
+        // `Option::as_deref` / `as_deref_mut` on a null-niche
+        // `Option<Box<T>>` is the pointer word (`Box::as_mut` is the
+        // same identity on the box itself). `None` stays null.
+        let niche_option_ptr = first_arg_ty.as_ref().is_some_and(|ty| {
+            let peeled = self
+                .tyref_peel_ref_to_pointee(ty)
+                .unwrap_or_else(|| ty.clone());
+            self.tyref_is_niche_option_ptr(&peeled)
+        });
+        let op_kind =
+            crate::front::std_identity::lower_niche_option_deref(op_kind, niche_option_ptr);
         // Capture `i64::checked_{add,sub,mul}()` results (`Option<i64>`-
         // typed) for the checked-arith rewiring pass
         // (`front::checked_arith`), which rewrites each into the native
