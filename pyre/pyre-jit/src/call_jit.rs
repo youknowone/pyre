@@ -2296,11 +2296,13 @@ fn jit_blackhole_resume_from_guard(
 /// scalar that happened to alias a managed address must never be treated as a
 /// root.  `deadframe_types[idx]` is parallel to `deadframe[idx]` (resume.rs
 /// `decode_ref` keys the same index), so the type gate is exact.
+#[allow(dead_code)] // resume.py decode_ref deadframe roots
 struct ResumeDeadframeRoots {
     slots: Vec<*mut *mut u8>,
     frame_roots: Vec<pyre_interpreter::pyframe::FrameLocalsRoot>,
 }
 
+#[allow(dead_code)] // resume.py decode_ref deadframe roots
 impl ResumeDeadframeRoots {
     fn register_pyframe_locals_slot(
         value: i64,

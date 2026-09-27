@@ -257,7 +257,7 @@ impl<'a> MiniXmlParser<'a> {
         let roots = pyre_object::gc_roots::push_roots();
         let mut version = String::new();
         let mut encoding = w_none();
-        let mut standalone = w_int_new(-1);
+        let standalone = w_int_new(-1);
         let mut standalone = roots.pin_root(standalone);
         loop {
             self.skip_ws();
@@ -400,7 +400,7 @@ impl<'a> MiniXmlParser<'a> {
             let _ = roots.pin_root(pubid);
             self.skip_ws();
             sysid = w_str_new_managed(&self.read_quoted()?);
-            let sysid = roots.pin_root(sysid);
+            let _ = roots.pin_root(sysid);
         } else if self.starts_with("SYSTEM") {
             self.expect("SYSTEM")?;
             self.skip_ws();
@@ -515,7 +515,7 @@ impl<'a> MiniXmlParser<'a> {
                 ),
             );
             sysid = w_str_new_managed(&system);
-            let sysid = roots.pin_root(sysid);
+            let _ = roots.pin_root(sysid);
         } else if self.starts_with("SYSTEM") {
             self.expect("SYSTEM")?;
             self.skip_ws();
@@ -1834,7 +1834,7 @@ mod xmlparser_class {
                 let _ = roots.pin_root(w_none());
                 let eof_slot = self_slot + 4;
                 let _ = roots.pin_root(w_bool_from(false));
-                let mut result = w_int_new(1);
+                let mut result;
                 loop {
                     let data = pyre_interpreter::call::call_function_impl_result(
                         read,

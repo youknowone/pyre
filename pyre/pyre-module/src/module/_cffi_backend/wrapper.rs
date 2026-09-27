@@ -2,7 +2,6 @@
 
 use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
-use std::sync::OnceLock;
 
 use super::cdataobj::W_CData;
 use super::realize_c_type::W_RawFuncType;

@@ -23,7 +23,7 @@ use pyre_object::*;
 use rustpython_unicode::{self as ucd_core, NormalizeForm};
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
-use pyre_interpreter::{PyError, PyErrorKind};
+use pyre_interpreter::PyError;
 
 type PyResult = Result<PyObjectRef, PyError>;
 

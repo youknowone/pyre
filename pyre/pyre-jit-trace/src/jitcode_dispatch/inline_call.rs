@@ -7822,13 +7822,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         callee_args[vararg_index] = tuple_op;
     }
 
-    let (
-        mut callee_regs_r,
-        mut callee_regs_i,
-        mut callee_regs_f,
-        mut callee_concrete_r,
-        mut callee_concrete_i,
-    ) = allocate_callee_register_banks(&body, ctx.trace_ctx);
+    let (callee_regs_r, callee_regs_i, callee_regs_f, callee_concrete_r, mut callee_concrete_i) =
+        allocate_callee_register_banks(&body, ctx.trace_ctx);
     let callee_regs_r = RegisterBank::with_constants(callee_regs_r, body.num_regs_r);
     let _setup_bank_guard = crate::trace::InlineRegisterBankGuard::enter(&callee_regs_r);
     // MIFrame.setup_call owns the concrete halves before frame construction
@@ -7919,22 +7914,31 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // surfaces `SubLoopCalleeCallAssembler` (the callee reached its own loop
     // header).  A strict straight-line callee has no loop, so that outcome
     // never arises for it and the hoisted values are simply unused.
+    // Sentinels: every read is dominated by the seed write, but the two are
+    // correlated through `callee_frame_seeded`, which definite assignment does
+    // not track.
+    #[allow(unused_assignments)]
     let mut ca_callee_frame = OpRef::NONE;
+    #[allow(unused_assignments)]
     let mut ca_callee_ec = OpRef::NONE;
+    #[allow(unused_assignments)]
     let mut ca_nlocals = 0usize;
     // The seeded callee frame's runtime object, for the `enter`/`leave`
     // bracket below — the OpRef alone cannot carry it out of the seed block.
+    #[allow(unused_assignments)]
     let mut ca_concrete_frame = std::ptr::null_mut::<pyre_interpreter::PyFrame>();
     // A strict straight-line callee is seeded the same way, so its in-callee
     // guards route through the multi-frame snapshot. A deeper callee beyond the
     // supported resume chain was residualized before this block.
     // True once the callee frame reds are actually seeded (all preconditions
     // below met). It gates routing guards through the multi-frame snapshot.
+    #[allow(unused_assignments)]
     let mut callee_frame_seeded = false;
     // The concrete callee frame the seed block materializes, retained so the
     // sub-walk can put it on the interpreter frame chain: the walk executes
     // the callee's residuals for real, and a residual that reads the chain
     // (`sys._getframe`, a traceback) must see the callee it is running in.
+    #[allow(unused_assignments)]
     let mut concrete_callee_frame = std::ptr::null_mut::<pyre_interpreter::PyFrame>();
     // Each precondition below answers "can the multiframe seed serve this
     // callee".  A "no" declines the INLINE — `Ok(None)`, this function's own
@@ -15770,7 +15774,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     }
 
     let (
-        mut callee_regs_r,
+        callee_regs_r,
         mut callee_regs_i,
         mut callee_regs_f,
         mut callee_concrete_r,
@@ -15890,7 +15894,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         &registers_f,
         &frame_state,
     );
-    let mut frame = SubWalkFrame {
+    let frame = SubWalkFrame {
         _helper_live: HelperLiveGuard {
             session: ctx.session,
         },

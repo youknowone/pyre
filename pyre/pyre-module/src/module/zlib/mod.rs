@@ -299,7 +299,7 @@ fn init_compress_type(ns: PyObjectRef) {
                     if this.backend.is_null() {
                         return Err(zlib_error("Error -2: inconsistent stream state"));
                     }
-                    let mut c = unsafe { &*this.backend }.lock();
+                    let mut c = { &*this.backend }.lock();
                     let out = c.compress(&data).map_err(zlib_error)?;
                     Ok(bytesobject::w_bytes_from_bytes(&out))
                 },
@@ -337,16 +337,14 @@ fn init_compress_type(ns: PyObjectRef) {
                 // converter reports a value outside the C `int` range rather
                 // than truncating it into a different flush mode.
                 let mode = match args.get(1).copied() {
-                    Some(o) if !unsafe { is_none(o) } => {
-                        pyre_interpreter::baseobjspace::c_int_w(o)?
-                    }
+                    Some(o) if !{ is_none(o) } => pyre_interpreter::baseobjspace::c_int_w(o)?,
                     _ => backend::Z_FINISH,
                 };
                 let this = compressor_this(args[0])?;
                 if this.backend.is_null() {
                     return Err(zlib_error("Error -2: inconsistent stream state"));
                 }
-                let mut c = unsafe { &*this.backend }.lock();
+                let mut c = { &*this.backend }.lock();
                 let out = c.flush(mode).map_err(zlib_error)?;
                 Ok(bytesobject::w_bytes_from_bytes(&out))
             }),
@@ -453,7 +451,7 @@ fn allocate_compress(
     });
     Ok(pyre_interpreter::typedef::tag_subclass_instance(
         obj,
-        unsafe { gc_roots::shadow_stack_get(cls_slot) },
+        gc_roots::shadow_stack_get(cls_slot),
     ))
 }
 
@@ -594,7 +592,7 @@ fn init_decompress_type(ns: PyObjectRef) {
                     ));
                 }
                 let length = match args.get(1).copied() {
-                    Some(o) if !unsafe { is_none(o) } => {
+                    Some(o) if !{ is_none(o) } => {
                         let v = pyre_interpreter::baseobjspace::int_w(o)?;
                         if v <= 0 {
                             return Err(pyre_interpreter::PyError::value_error(
@@ -609,7 +607,7 @@ fn init_decompress_type(ns: PyObjectRef) {
                 if this.backend.is_null() {
                     return Err(zlib_error("Error -2: inconsistent stream state"));
                 }
-                let mut d = unsafe { &*this.backend }.lock();
+                let mut d = { &*this.backend }.lock();
                 let out = d.flush(length).map_err(zlib_error)?;
                 Ok(bytesobject::w_bytes_from_bytes(&out))
             }),
@@ -717,7 +715,7 @@ fn allocate_decompress(
     });
     Ok(pyre_interpreter::typedef::tag_subclass_instance(
         obj,
-        unsafe { gc_roots::shadow_stack_get(cls_slot) },
+        gc_roots::shadow_stack_get(cls_slot),
     ))
 }
 
@@ -796,7 +794,7 @@ fn allocate_zdecompress(
     });
     Ok(pyre_interpreter::typedef::tag_subclass_instance(
         obj,
-        unsafe { gc_roots::shadow_stack_get(cls_slot) },
+        gc_roots::shadow_stack_get(cls_slot),
     ))
 }
 

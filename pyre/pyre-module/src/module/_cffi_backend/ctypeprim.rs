@@ -91,7 +91,7 @@ pub unsafe fn convert_to_object(ct: &W_CType, cdata: usize) -> Result<PyObjectRe
                 let imag = misc::read_raw_float_data(cdata + half as usize, half)?;
                 Ok(pyre_object::complexobject::w_complex_new(real, imag))
             }
-            _ => Err(unsafe { PyError::from_exc_object(ctypeobj::cannot_return_cdata(ct)) }),
+            _ => Err(PyError::from_exc_object(ctypeobj::cannot_return_cdata(ct))),
         }
     }
 }
@@ -205,7 +205,9 @@ pub unsafe fn convert_from_object(
             ctypeobj::KIND_PRIM_LONGDOUBLE => convert_from_object_longdouble(ct, cdata, w_ob),
             // `W_CTypePrimitiveComplex.convert_from_object`.
             ctypeobj::KIND_PRIM_COMPLEX => convert_from_object_complex(ct, cdata, w_ob),
-            _ => Err(unsafe { PyError::from_exc_object(ctypeobj::cannot_initialize_cdata(ct)) }),
+            _ => Err(PyError::from_exc_object(ctypeobj::cannot_initialize_cdata(
+                ct,
+            ))),
         }
     }
 }

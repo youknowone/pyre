@@ -2119,7 +2119,6 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
     let steps = match kwargs.and_then(|kw| unsafe { pyre_object::w_dict_getitem_str(kw, "steps") })
     {
         Some(s) => {
-            use num_traits::ToPrimitive;
             let b = RBigIntGcRoot::new(get_bigint(s)?);
             if b.int_lt(0) {
                 return Err(pyre_interpreter::PyError::value_error(

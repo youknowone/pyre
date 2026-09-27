@@ -2356,6 +2356,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py perform_guard
+    #[allow(dead_code)] // x86/regalloc.py perform_guard
     fn perform_guard(
         &mut self,
         op: &Op,
@@ -3782,12 +3783,14 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py _consider_binop
+    #[allow(dead_code)] // x86/regalloc.py consider_binop
     fn consider_binop(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let (loc, argloc) = self._consider_binop_part(op, false);
         self.perform(i, [loc, argloc], Some(loc), output);
     }
 
     /// x86/regalloc.py _consider_binop_symm
+    #[allow(dead_code)] // x86/regalloc.py consider_binop_symm
     fn consider_binop_symm(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let (loc, argloc) = self._consider_binop_part(op, true);
         self.perform(i, [loc, argloc], Some(loc), output);
@@ -3806,6 +3809,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py consider_int_add — LEA when const fits 32 bits.
+    #[allow(dead_code)] // x86/regalloc.py consider_int_add
     fn consider_int_add(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let y = op.arg(1).to_opref();
         if y.is_constant() {
@@ -3818,6 +3822,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py consider_int_sub
+    #[allow(dead_code)] // x86/regalloc.py consider_int_sub
     fn consider_int_sub(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let y = op.arg(1).to_opref();
         if y.is_constant() {
@@ -3832,6 +3837,7 @@ impl<'a> RegAlloc<'a> {
     /// x86/regalloc.py consider_int_lshift (shift operations need ecx)
     /// arm/regalloc.py prepare_op_{int,uint}_rshift/int_lshift
     /// use the regular RI path with no fixed register.
+    #[allow(dead_code)] // x86/regalloc.py consider_int_lshift
     fn consider_int_lshift(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         #[cfg(target_arch = "aarch64")]
         {
@@ -3862,6 +3868,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py int_neg / int_invert / int_is_true / int_is_zero / int_signext
+    #[allow(dead_code)] // x86/regalloc.py consider_unary_int
     fn consider_unary_int(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         let loc = self.rm.force_result_in_reg(
@@ -3879,6 +3886,7 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py consider_uint_mul_high
     /// arm/regalloc.py prepare_op_uint_mul_high = prepare_op_int_mul
+    #[allow(dead_code)] // x86/regalloc.py consider_uint_mul_high
     fn consider_uint_mul_high(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         #[cfg(target_arch = "aarch64")]
         {
@@ -3926,6 +3934,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py consider_int_signext
+    #[allow(dead_code)] // x86/regalloc.py consider_int_signext
     fn consider_int_signext(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let argloc = self.loc(op.arg(0).to_opref(), Type::Int);
         let numbytesloc = self.loc(op.arg(1).to_opref(), Type::Int);
@@ -4027,6 +4036,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py _consider_compop
+    #[allow(dead_code)] // x86/regalloc.py consider_compop
     fn consider_compop(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let vx = op.arg(0).to_opref();
         let vy = op.arg(1).to_opref();
@@ -4233,6 +4243,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py _consider_guard_cc
+    #[allow(dead_code)] // x86/regalloc.py consider_guard_cc
     fn consider_guard_cc(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let arg = op.arg(0).to_opref();
         let loc = self.make_sure_var_in_reg(arg, self.tp(arg), &[], None, false);
@@ -4240,6 +4251,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py consider_guard_value
+    #[allow(dead_code)] // x86/regalloc.py consider_guard_value
     fn consider_guard_value(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let arg0 = op.arg(0).to_opref();
         let arg1 = op.arg(1).to_opref();
@@ -4249,6 +4261,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py consider_guard_class
+    #[allow(dead_code)] // x86/regalloc.py consider_guard_class
     fn consider_guard_class(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let x = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &[], None, false);
         let y = self.loc(op.arg(1).to_opref(), Type::Int);
@@ -4256,6 +4269,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py consider_guard_exception
+    #[allow(dead_code)] // x86/regalloc.py consider_guard_exception
     fn consider_guard_exception(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let loc = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &[], None, false);
         // x86/regalloc.py:470 box = TempVar()
@@ -4292,6 +4306,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py consider_restore_exception
+    #[allow(dead_code)] // x86/regalloc.py consider_restore_exception
     fn consider_restore_exception(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         let loc0 = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &args, None, false);
@@ -4311,11 +4326,13 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// Guards with no arguments (guard_no_exception, guard_not_forced, etc.)
+    #[allow(dead_code)] // x86/regalloc.py consider_guard_no_args
     fn consider_guard_no_args(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         self.perform_guard(op, i, vec![], None, output);
     }
 
     /// x86/regalloc.py `consider_guard_not_forced_2`.
+    #[allow(dead_code)] // x86/regalloc.py consider_guard_not_forced_2
     fn consider_guard_not_forced_2(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let fail_args: Vec<OpRef> = op
             .guard_fail_args()
@@ -4357,6 +4374,7 @@ impl<'a> RegAlloc<'a> {
     /// NULL into the propagate-exception path
     /// (assembler.py `genop_discard_check_memory_error` /
     /// opassembler.py:258 `emit_op_check_memory_error`).
+    #[allow(dead_code)] // x86/regalloc.py consider_check_memory_error
     fn consider_check_memory_error(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let arg0 = op.arg(0).to_opref();
         let tp = self.tp(arg0);
@@ -4379,6 +4397,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py consider_finish
+    #[allow(dead_code)] // x86/regalloc.py consider_finish
     fn consider_finish(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         if op.num_args() != 0 {
             let arg0 = op.arg(0).to_opref();
@@ -4406,6 +4425,7 @@ impl<'a> RegAlloc<'a> {
     /// RPython: argloc = convert_to_imm(arg) if imm else make_sure_var_in_reg(arg)
     ///          possibly_free_vars_for_op(op); free_temp_vars()
     ///          resloc = force_allocate_reg(op)
+    #[allow(dead_code)] // x86/regalloc.py consider_same_as
     fn consider_same_as(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let tp = op.opcode.result_type();
         let arg = op.arg(0).to_opref();
@@ -4450,6 +4470,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py _consider_float_op
+    #[allow(dead_code)] // x86/regalloc.py consider_float_op
     fn consider_float_op(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let loc1 = self.xrm.loc(
             op.arg(1).to_opref(),
@@ -4506,6 +4527,7 @@ impl<'a> RegAlloc<'a> {
     /// x86/regalloc.py `_consider_math_sqrt`:
     /// `loc0 = xrm.force_result_in_reg(op, op.getarg(1)); perform_math(op, [loc0], loc0)`.
     /// No `before_call`: `SQRTSD` does not spill caller-saved registers.
+    #[allow(dead_code)] // x86/regalloc.py consider_math_sqrt
     fn consider_math_sqrt(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let src = op.arg(1).to_opref();
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
@@ -4544,6 +4566,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py float_neg / float_abs
+    #[allow(dead_code)] // x86/regalloc.py consider_float_unary
     fn consider_float_unary(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         let loc = self.xrm.force_result_in_reg(
@@ -4581,6 +4604,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py _consider_float_cmp
+    #[allow(dead_code)] // x86/regalloc.py consider_float_cmp
     fn consider_float_cmp(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let vx = op.arg(0).to_opref();
         let vy = op.arg(1).to_opref();
@@ -4617,6 +4641,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py cast_int_to_float
+    #[allow(dead_code)] // x86/regalloc.py consider_cast_int_to_float
     fn consider_cast_int_to_float(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let loc0 = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Int, &[], None, false);
         let result_loc =
@@ -4637,6 +4662,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py cast_float_to_int
+    #[allow(dead_code)] // x86/regalloc.py consider_cast_float_to_int
     fn consider_cast_float_to_int(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let loc0 = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Float, &[], None, false);
         let result_loc =
@@ -4657,6 +4683,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// Memory load: getfield pattern (1 arg → result)
+    #[allow(dead_code)] // x86/regalloc.py consider_getfield
     fn consider_getfield(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let base_loc = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &[], None, false);
         let tp = op.opcode.result_type();
@@ -4679,6 +4706,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// Memory load: getarrayitem pattern (2 args → result)
+    #[allow(dead_code)] // x86/regalloc.py consider_getarrayitem
     fn consider_getarrayitem(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         let base_loc =
@@ -4708,6 +4736,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// Memory load: getinteriorfield (3 args → result)
+    #[allow(dead_code)] // x86/regalloc.py consider_getinteriorfield
     fn consider_getinteriorfield(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         let base_loc =
@@ -4861,6 +4890,7 @@ impl<'a> RegAlloc<'a> {
     /// x86/regalloc.py _consider_gc_load
     /// aarch64/regalloc.py _prepare_op_gc_load parity.
     /// Returns [base_loc, ofs_loc, res_loc, imm(nsize)].
+    #[allow(dead_code)] // x86/regalloc.py consider_gc_load
     fn consider_gc_load(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         // aarch64/regalloc.py:537
         let base_loc = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &[], None, false);
@@ -4904,6 +4934,7 @@ impl<'a> RegAlloc<'a> {
     /// aarch64/regalloc.py _prepare_op_gc_load_indexed parity.
     /// Returns [res_loc, base_loc, index_loc, imm(nsize), imm(ofs)].
     #[cfg(target_arch = "aarch64")]
+    #[allow(dead_code)] // x86/regalloc.py consider_gc_load_indexed
     fn consider_gc_load_indexed(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         // aarch64/regalloc.py:564
@@ -5000,6 +5031,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// Memory store: setfield pattern (2 args: base, value)
+    #[allow(dead_code)] // x86/regalloc.py consider_setfield
     fn consider_setfield(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         let base_loc =
@@ -5024,6 +5056,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// Memory store: setarrayitem pattern (3 args: base, index, value)
+    #[allow(dead_code)] // x86/regalloc.py consider_setarrayitem
     fn consider_setarrayitem(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         let base_loc =
@@ -5052,6 +5085,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// Memory store: setinteriorfield
+    #[allow(dead_code)] // x86/regalloc.py consider_setinteriorfield
     fn consider_setinteriorfield(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         self.consider_setarrayitem(op, i, output);
     }
@@ -5154,6 +5188,7 @@ impl<'a> RegAlloc<'a> {
 
     /// aarch64/regalloc.py prepare_op_gc_store parity.
     /// Returns [value_loc, base_loc, ofs_loc, imm(size)].
+    #[allow(dead_code)] // x86/regalloc.py consider_gc_store
     fn consider_gc_store(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         // aarch64/regalloc.py:522
@@ -5186,6 +5221,7 @@ impl<'a> RegAlloc<'a> {
     /// aarch64/regalloc.py prepare_op_gc_store_indexed parity.
     /// Returns [value_loc, base_loc, index_loc, imm(size), imm(ofs)].
     #[cfg(target_arch = "aarch64")]
+    #[allow(dead_code)] // x86/regalloc.py consider_gc_store_indexed
     fn consider_gc_store_indexed(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         // aarch64/regalloc.py:554
@@ -5295,6 +5331,7 @@ impl<'a> RegAlloc<'a> {
     /// contents are unrelated to the argument value. See llsupport/
     /// regalloc.py:724-734 doc: arglocs "stay valid" only if they were
     /// captured before before_call.
+    #[allow(dead_code)] // x86/regalloc.py consider_call
     fn consider_call(
         &mut self,
         op: &Op,
@@ -5502,6 +5539,7 @@ impl<'a> RegAlloc<'a> {
     /// RPython syncs only argument 1 (the virtualizable) to the frame. The
     /// callee jitframe in argument 0 stays in its current location, captured
     /// before `before_call`.
+    #[allow(dead_code)] // x86/regalloc.py consider_call_assembler
     fn consider_call_assembler(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         assert!(matches!(op.num_args(), 1 | 2));
         if op.num_args() == 2 {
@@ -5643,6 +5681,7 @@ impl<'a> RegAlloc<'a> {
         assert_eq!(calldescr.arg_types().len(), num_args - 2);
     }
 
+    #[allow(dead_code)] // x86/regalloc.py consider_raw_call_like
     fn consider_raw_call_like(
         &mut self,
         op: &Op,
@@ -5754,6 +5793,7 @@ impl<'a> RegAlloc<'a> {
     /// nursery bump registers. The AArch64 emitter uses x0/x1 plus reserved IP
     /// scratch registers; collecting slow paths save/restore the other
     /// managed registers on both native architectures.
+    #[allow(dead_code)] // x86/regalloc.py consider_call_malloc_nursery
     fn consider_call_malloc_nursery(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
@@ -5867,6 +5907,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// aarch64/regalloc.py prepare_op_call_malloc_nursery_varsize_frame parity.
+    #[allow(dead_code)] // x86/regalloc.py consider_call_malloc_nursery_varsize_frame
     fn consider_call_malloc_nursery_varsize_frame(
         &mut self,
         op: &Op,
@@ -5981,6 +6022,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// aarch64/regalloc.py prepare_op_call_malloc_nursery_varsize parity.
+    #[allow(dead_code)] // x86/regalloc.py consider_call_malloc_nursery_varsize
     fn consider_call_malloc_nursery_varsize(
         &mut self,
         op: &Op,
@@ -6107,6 +6149,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py consider_jump
+    #[allow(dead_code)] // x86/regalloc.py consider_jump
     fn consider_jump(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         // x86/regalloc.py:1306-1309: descr = op.getdescr(); self.jump_target_descr = descr
         let descr_id = op.getdescr().as_ref().map(descr_identity);
@@ -6145,6 +6188,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py consider_label
+    #[allow(dead_code)] // x86/regalloc.py consider_label
     fn consider_label(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let position = self.rm.position;
         for arg in op.getarglist().iter() {
@@ -6286,6 +6330,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// force_token: result = frame pointer (EBP)
+    #[allow(dead_code)] // x86/regalloc.py consider_force_token
     fn consider_force_token(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let result_loc =
             Loc::Reg(self.force_allocate_reg(op.pos().get(), Type::Ref, &[], None, false));
@@ -6302,6 +6347,7 @@ impl<'a> RegAlloc<'a> {
     /// Keep `p0` and `i0` in registers and forbid the result from
     /// reusing either, so LEA cannot overwrite the index while
     /// materializing a framed base.
+    #[allow(dead_code)] // x86/regalloc.py consider_load_effective_address
     fn consider_load_effective_address(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         self.consider_load_effective_address_j2(op.pos().get(), &args, i, output);
@@ -6331,6 +6377,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// No-arg result (save_exception, save_exc_class)
+    #[allow(dead_code)] // x86/regalloc.py consider_no_arg_result
     fn consider_no_arg_result(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let tp = op.opcode.result_type();
         let result_loc = Loc::Reg(self.force_allocate_reg(op.pos().get(), tp, &[], None, false));
@@ -6350,6 +6397,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// Discard op with 3 args (zero_array, strsetitem, etc.)
+    #[allow(dead_code)] // x86/regalloc.py consider_discard_3args
     fn consider_discard_3args(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         let mut locs = Vec::new();
@@ -6447,6 +6495,7 @@ impl<'a> RegAlloc<'a> {
         );
     }
 
+    #[allow(dead_code)] // x86/regalloc.py consider_zero_array
     fn consider_zero_array(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         let mut locs = Vec::with_capacity(args.len());
@@ -6492,6 +6541,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// Generic discard with N args
+    #[allow(dead_code)] // x86/regalloc.py consider_discard_nargs
     fn consider_discard_nargs(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let mut locs = Vec::new();
         for arg in op.getarglist().iter() {

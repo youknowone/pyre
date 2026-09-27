@@ -281,7 +281,7 @@ impl SocketWritableBuffer {
         let _ = pyre_object::gc_roots::pin_root(owner);
         let owner_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let owner = pyre_object::gc_roots::shadow_stack_get(owner_slot);
-        let held = pyre_interpreter::builtins::buffer_export_incref(owner);
+        let held = unsafe { pyre_interpreter::builtins::buffer_export_incref(owner) };
         Ok(Self {
             owner_slot,
             held,
@@ -291,7 +291,7 @@ impl SocketWritableBuffer {
     }
 
     unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
-        std::slice::from_raw_parts_mut(self.address, self.length)
+        unsafe { std::slice::from_raw_parts_mut(self.address, self.length) }
     }
 }
 
@@ -4084,7 +4084,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let cls = args
                 .first()
                 .copied()
-                .filter(|w_cls| unsafe { pyre_object::is_type(*w_cls) })
+                .filter(|w_cls| { pyre_object::is_type(*w_cls) })
                 .unwrap_or_else(socket_type);
             Ok(pyre_object::w_instance_new(cls))
         }),
@@ -4098,7 +4098,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 let fd = rffi::socket_from_i64(socket_get_attr_i64(obj, "_fd"));
                 if !rffi::is_invalid(fd) {
-                    if let Ok(repr) = unsafe { pyre_interpreter::display::py_repr_wtf8(obj) } {
+                    if let Ok(repr) = { pyre_interpreter::display::py_repr_wtf8(obj) } {
                         let _ = pyre_interpreter::warn::warn_category_source(
                             &format!("unclosed {}", repr.to_string_lossy()),
                             "ResourceWarning",
@@ -4106,7 +4106,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                             obj,
                         );
                     }
-                    let _ = unsafe { rffi::close(fd) };
+                    let _ = { rffi::close(fd) };
                     socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
                 }
                 Ok(pyre_object::w_none())
@@ -4169,7 +4169,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let mut ty = int_arg(type_obj)?;
             let mut proto = int_arg(proto_obj)?;
             let has_fileno = match fileno_obj {
-                Some(o) => !unsafe { pyre_object::is_none(o) },
+                Some(o) => !{ pyre_object::is_none(o) },
                 None => false,
             };
             if !has_fileno {
@@ -4184,7 +4184,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 if proto == -1 {
                     proto = 0;
                 }
-                let fd = unsafe { rffi::socket(family, ty, proto) };
+                let fd = { rffi::socket(family, ty, proto) };
                 if rffi::is_invalid(fd) {
                     return Err(socket_last_error());
                 }
@@ -4229,7 +4229,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             // `interp_socket.py:253-265` — wrap an existing fd.  A float
             // fileno is a TypeError, a negative fd a ValueError, and any
             // -1 family/type/proto is derived from the descriptor itself.
-            if unsafe { pyre_object::is_float(fileno_obj) } {
+            if pyre_object::is_float(fileno_obj) {
                 return Err(pyre_interpreter::PyError::type_error(
                     "integer argument expected, got float",
                 ));
@@ -4316,7 +4316,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     if d.is_null() {
                         return Ok(pyre_object::w_none());
                     }
-                    Ok(unsafe { pyre_object::w_dict_getitem_str(d, "_timeout") }
+                    Ok({ pyre_object::w_dict_getitem_str(d, "_timeout") }
                         .unwrap_or(pyre_object::w_none()))
                 },
                 2,
@@ -4351,7 +4351,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     // syscall and still reports its failure.  This prevents a
                     // later double close while preserving EBADF/ENOTSOCK.
                     socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
-                    if unsafe { rffi::close(fd) } != 0 {
+                    if { rffi::close(fd) } != 0 {
                         return Err(socket_last_error());
                     }
                 }
@@ -4411,7 +4411,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 if next <= 0 {
                     let fd = rffi::socket_from_i64(socket_get_attr_i64(obj, "_fd"));
                     if !rffi::is_invalid(fd) {
-                        let _ = unsafe { rffi::close(fd) };
+                        let _ = { rffi::close(fd) };
                         socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
                     }
                 }
@@ -4438,7 +4438,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
                 let (storage, slen) = pack_inet_addr("bind", family, proto, args[1])?;
                 let r =
-                    unsafe { rffi::bind(fd, &storage as *const _ as *const rffi::sockaddr, slen) };
+                    { rffi::bind(fd, &storage as *const _ as *const rffi::sockaddr, slen) };
                 if r != 0 {
                     return Err(socket_last_error());
                 }
@@ -4459,7 +4459,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             } else {
                 128
             };
-            let r = unsafe { rffi::listen(fd, backlog) };
+            let r = { rffi::listen(fd, backlog) };
             if r != 0 {
                 return Err(socket_last_error());
             }
@@ -4479,10 +4479,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
                 let ty = socket_get_attr_i64(obj, "_type") as libc::c_int;
                 let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
-                let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
+                let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
                 let cfd = loop {
-                    let (r, errno) = socket_call(|| unsafe {
+                    let (r, errno) = socket_call(|| {
                         rffi::accept(fd, &mut storage as *mut _ as *mut rffi::sockaddr, &mut slen)
                     });
                     if !rffi::is_invalid(r) {
@@ -4525,10 +4525,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 let fd = socket_fd(obj)?;
                 socket_wait_readable(obj, fd)?;
-                let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
+                let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
                 let cfd = loop {
-                    let (r, errno) = socket_call(|| unsafe {
+                    let (r, errno) = socket_call(|| {
                         rffi::accept(fd, &mut storage as *mut _ as *mut rffi::sockaddr, &mut slen)
                     });
                     if !rffi::is_invalid(r) {
@@ -4589,7 +4589,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     };
                 }
                 loop {
-                    let (r, errno) = socket_call(|| unsafe {
+                    let (r, errno) = socket_call(|| {
                         rffi::connect(fd, &storage as *const _ as *const rffi::sockaddr, slen)
                     });
                     if r == 0 {
@@ -4645,7 +4645,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 // `interp_socket.py:387-391` — retry while the call is
                 // interrupted (EINTR), otherwise return the errno.
                 let err = loop {
-                    let (r, e) = socket_call(|| unsafe {
+                    let (r, e) = socket_call(|| {
                         rffi::connect(fd, &storage as *const _ as *const rffi::sockaddr, slen)
                     });
                     if r == 0 {
@@ -4728,7 +4728,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     if let Some(deadline) = deadline {
                         socket_wait_writable_until(fd, deadline)?;
                     }
-                    let (n, errno) = socket_call(|| unsafe {
+                    let (n, errno) = socket_call(|| {
                         rffi::send(
                             fd,
                             buf[off..].as_ptr() as *const libc::c_void,
@@ -4773,10 +4773,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             if args.len() < 2 {
                 return Err(pyre_interpreter::PyError::type_error("recv() missing size"));
             }
-            if !unsafe { pyre_object::is_int(args[1]) } {
+            if !{ pyre_object::is_int(args[1]) } {
                 return Err(pyre_interpreter::PyError::type_error("recv: size must be an integer"));
             }
-            let raw = unsafe { pyre_object::w_int_get_value(args[1]) };
+            let raw = { pyre_object::w_int_get_value(args[1]) };
             if raw < 0 {
                 return Err(pyre_interpreter::PyError::value_error("negative buffersize in recv"));
             }
@@ -4784,10 +4784,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let fd = socket_fd(obj)?;
             let n = raw as usize;
             let flags = if args.len() >= 3 {
-                if !unsafe { pyre_object::is_int(args[2]) } {
+                if !{ pyre_object::is_int(args[2]) } {
                     return Err(pyre_interpreter::PyError::type_error("recv: flags must be an integer"));
                 }
-                (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
+                ({ pyre_object::w_int_get_value(args[2]) }) as libc::c_int
             } else {
                 0
             };
@@ -4847,7 +4847,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 socket_wait_writable(obj, fd)?;
                 loop {
-                    let (r, errno) = socket_call(|| unsafe {
+                    let (r, errno) = socket_call(|| {
                         rffi::sendto(
                             fd,
                             buf.as_ptr() as *const libc::c_void,
@@ -4883,12 +4883,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             if args.len() < 2 {
                 return Err(pyre_interpreter::PyError::type_error("recvfrom() missing size"));
             }
-            if !unsafe { pyre_object::is_int(args[1]) } {
+            if !{ pyre_object::is_int(args[1]) } {
                 return Err(pyre_interpreter::PyError::type_error(
                     "recvfrom: size must be an integer",
                 ));
             }
-            let raw = unsafe { pyre_object::w_int_get_value(args[1]) };
+            let raw = { pyre_object::w_int_get_value(args[1]) };
             if raw < 0 {
                 return Err(pyre_interpreter::PyError::value_error(
                     "negative buffersize in recvfrom",
@@ -4898,21 +4898,21 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let fd = socket_fd(obj)?;
             let n = raw as usize;
             let flags = if args.len() >= 3 {
-                if !unsafe { pyre_object::is_int(args[2]) } {
+                if !{ pyre_object::is_int(args[2]) } {
                     return Err(pyre_interpreter::PyError::type_error(
                         "recvfrom: flags must be an integer",
                     ));
                 }
-                (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
+                ({ pyre_object::w_int_get_value(args[2]) }) as libc::c_int
             } else {
                 0
             };
             let mut buf = pyre_interpreter::builtins::try_vec_zeroed(n)?;
-            let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
             let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
             socket_wait_readable(obj, fd)?;
             let got = loop {
-                let (r, errno) = socket_call(|| unsafe {
+                let (r, errno) = socket_call(|| {
                     rffi::recvfrom(
                         fd,
                         buf.as_mut_ptr() as *mut libc::c_void,
@@ -4956,16 +4956,16 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let obj = args[0];
             let buf_obj = args[1];
             let _roots = pyre_object::gc_roots::push_roots();
-            let mut buffer = unsafe { SocketWritableBuffer::acquire(buf_obj) }?;
-            let slot = unsafe { buffer.as_mut_slice() };
+            let mut buffer = { SocketWritableBuffer::acquire(buf_obj) }?;
+            let slot = { buffer.as_mut_slice() };
             let buf_len = slot.len();
             let nbytes = if args.len() >= 3 {
-                if !unsafe { pyre_object::is_int(args[2]) } {
+                if !{ pyre_object::is_int(args[2]) } {
                     return Err(pyre_interpreter::PyError::type_error(
                         "recv_into: nbytes must be an integer",
                     ));
                 }
-                let raw = unsafe { pyre_object::w_int_get_value(args[2]) };
+                let raw = { pyre_object::w_int_get_value(args[2]) };
                 if raw < 0 {
                     return Err(pyre_interpreter::PyError::value_error(
                         "negative buffersize in recv_into",
@@ -4982,19 +4982,19 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 ));
             }
             let flags = if args.len() >= 4 {
-                if !unsafe { pyre_object::is_int(args[3]) } {
+                if !{ pyre_object::is_int(args[3]) } {
                     return Err(pyre_interpreter::PyError::type_error(
                         "recv_into: flags must be an integer",
                     ));
                 }
-                unsafe { pyre_object::w_int_get_value(args[3]) as libc::c_int }
+                pyre_object::w_int_get_value(args[3]) as libc::c_int
             } else {
                 0
             };
             let fd = socket_fd(obj)?;
             socket_wait_readable(obj, fd)?;
             let got = loop {
-                let (r, errno) = socket_call(|| unsafe {
+                let (r, errno) = socket_call(|| {
                     rffi::recv(fd, slot.as_mut_ptr() as *mut libc::c_void, nbytes, flags)
                 });
                 if r >= 0 {
@@ -5027,16 +5027,16 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let obj = args[0];
             let buf_obj = args[1];
             let _roots = pyre_object::gc_roots::push_roots();
-            let mut buffer = unsafe { SocketWritableBuffer::acquire(buf_obj) }?;
-            let slot = unsafe { buffer.as_mut_slice() };
+            let mut buffer = { SocketWritableBuffer::acquire(buf_obj) }?;
+            let slot = { buffer.as_mut_slice() };
             let buf_len = slot.len();
             let nbytes = if args.len() >= 3 {
-                if !unsafe { pyre_object::is_int(args[2]) } {
+                if !{ pyre_object::is_int(args[2]) } {
                     return Err(pyre_interpreter::PyError::type_error(
                         "recvfrom_into: nbytes must be an integer",
                     ));
                 }
-                let raw = unsafe { pyre_object::w_int_get_value(args[2]) };
+                let raw = { pyre_object::w_int_get_value(args[2]) };
                 if raw < 0 {
                     return Err(pyre_interpreter::PyError::value_error(
                         "negative buffersize in recvfrom_into",
@@ -5053,21 +5053,21 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 ));
             }
             let flags = if args.len() >= 4 {
-                if !unsafe { pyre_object::is_int(args[3]) } {
+                if !{ pyre_object::is_int(args[3]) } {
                     return Err(pyre_interpreter::PyError::type_error(
                         "recvfrom_into: flags must be an integer",
                     ));
                 }
-                unsafe { pyre_object::w_int_get_value(args[3]) as libc::c_int }
+                pyre_object::w_int_get_value(args[3]) as libc::c_int
             } else {
                 0
             };
             let fd = socket_fd(obj)?;
-            let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
             let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
             socket_wait_readable(obj, fd)?;
             let got = loop {
-                let (r, errno) = socket_call(|| unsafe {
+                let (r, errno) = socket_call(|| {
                     rffi::recvfrom(
                         fd,
                         slot.as_mut_ptr() as *mut libc::c_void,
@@ -5112,12 +5112,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             if args.len() < 2 {
                 return Err(pyre_interpreter::PyError::type_error("recvmsg() missing buffer size"));
             }
-            if !unsafe { pyre_object::is_int(args[1]) } {
+            if !{ pyre_object::is_int(args[1]) } {
                 return Err(pyre_interpreter::PyError::type_error(
                     "recvmsg: bufsize must be an integer",
                 ));
             }
-            let bufsize_raw = unsafe { pyre_object::w_int_get_value(args[1]) };
+            let bufsize_raw = { pyre_object::w_int_get_value(args[1]) };
             if bufsize_raw < 0 {
                 return Err(pyre_interpreter::PyError::value_error(
                     "negative buffer size in recvmsg()",
@@ -5125,12 +5125,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             }
             let bufsize = bufsize_raw as usize;
             let ancbufsize = if args.len() >= 3 {
-                if !unsafe { pyre_object::is_int(args[2]) } {
+                if !{ pyre_object::is_int(args[2]) } {
                     return Err(pyre_interpreter::PyError::type_error(
                         "recvmsg: ancbufsize must be an integer",
                     ));
                 }
-                let raw = unsafe { pyre_object::w_int_get_value(args[2]) };
+                let raw = { pyre_object::w_int_get_value(args[2]) };
                 if raw < 0 {
                     return Err(pyre_interpreter::PyError::value_error(
                         "invalid ancillary data buffer length",
@@ -5141,12 +5141,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 0
             };
             let flags = if args.len() >= 4 {
-                if !unsafe { pyre_object::is_int(args[3]) } {
+                if !{ pyre_object::is_int(args[3]) } {
                     return Err(pyre_interpreter::PyError::type_error(
                         "recvmsg: flags must be an integer",
                     ));
                 }
-                unsafe { pyre_object::w_int_get_value(args[3]) as libc::c_int }
+                pyre_object::w_int_get_value(args[3]) as libc::c_int
             } else {
                 0
             };
@@ -5154,14 +5154,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
 
             let mut data = pyre_interpreter::builtins::try_vec_zeroed(bufsize)?;
             let mut control = pyre_interpreter::builtins::try_vec_zeroed(ancbufsize)?;
-            let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
             socket_wait_readable(args[0], fd)?;
             let (got, msg_flags, msg_namelen, controllen) = loop {
                 let mut iov = libc::iovec {
                     iov_base: data.as_mut_ptr() as *mut libc::c_void,
                     iov_len: bufsize,
                 };
-                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                let mut msg: libc::msghdr = { std::mem::zeroed() };
                 msg.msg_name = &mut storage as *mut _ as *mut libc::c_void;
                 msg.msg_namelen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
                 msg.msg_iov = &mut iov;
@@ -5170,7 +5170,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
                     msg.msg_controllen = ancbufsize as _;
                 }
-                let (r, errno) = socket_call(|| unsafe {
+                let (r, errno) = socket_call(|| {
                     libc::recvmsg(fd, &mut msg, flags)
                 });
                 if r >= 0 {
@@ -5206,12 +5206,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         iov_base: std::ptr::null_mut(),
                         iov_len: 0,
                     };
-                    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                    let mut msg: libc::msghdr = { std::mem::zeroed() };
                     msg.msg_iov = &mut dummy_iov;
                     msg.msg_iovlen = 1;
                     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
                     msg.msg_controllen = controllen;
-                    unsafe {
+                    {
                         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
                         while !cmsg.is_null() {
                             let header = &*cmsg;
@@ -5301,15 +5301,15 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 Vec::with_capacity(buffer_items.len());
             for i in 0..buffer_items.len() {
                 let item = pyre_object::gc_roots::shadow_stack_get(items_base + i);
-                buffers.push(unsafe { SocketWritableBuffer::acquire(item) }?);
+                buffers.push({ SocketWritableBuffer::acquire(item) }?);
             }
             let ancbufsize = if args.len() >= 3 {
-                if !unsafe { pyre_object::is_int(args[2]) } {
+                if !{ pyre_object::is_int(args[2]) } {
                     return Err(pyre_interpreter::PyError::type_error(
                         "recvmsg_into: ancbufsize must be an integer",
                     ));
                 }
-                let raw = unsafe { pyre_object::w_int_get_value(args[2]) };
+                let raw = { pyre_object::w_int_get_value(args[2]) };
                 if raw < 0 {
                     return Err(pyre_interpreter::PyError::value_error(
                         "invalid ancillary data buffer length",
@@ -5320,12 +5320,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 0
             };
             let flags = if args.len() >= 4 {
-                if !unsafe { pyre_object::is_int(args[3]) } {
+                if !{ pyre_object::is_int(args[3]) } {
                     return Err(pyre_interpreter::PyError::type_error(
                         "recvmsg_into: flags must be an integer",
                     ));
                 }
-                unsafe { pyre_object::w_int_get_value(args[3]) as libc::c_int }
+                pyre_object::w_int_get_value(args[3]) as libc::c_int
             } else {
                 0
             };
@@ -5334,7 +5334,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let mut iovs: Vec<libc::iovec> = buffers
                 .iter_mut()
                 .map(|buffer| {
-                    let slice = unsafe { buffer.as_mut_slice() };
+                    let slice = { buffer.as_mut_slice() };
                     libc::iovec {
                     iov_base: slice.as_mut_ptr() as *mut libc::c_void,
                     iov_len: slice.len(),
@@ -5342,10 +5342,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 })
                 .collect();
             let mut control = pyre_interpreter::builtins::try_vec_zeroed(ancbufsize)?;
-            let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
             socket_wait_readable(args[0], fd)?;
             let (got, msg_flags, msg_namelen, controllen) = loop {
-                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                let mut msg: libc::msghdr = { std::mem::zeroed() };
                 msg.msg_name = &mut storage as *mut _ as *mut libc::c_void;
                 msg.msg_namelen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
                 msg.msg_iov = iovs.as_mut_ptr();
@@ -5354,7 +5354,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
                     msg.msg_controllen = ancbufsize as _;
                 }
-                let (r, errno) = socket_call(|| unsafe {
+                let (r, errno) = socket_call(|| {
                     libc::recvmsg(fd, &mut msg, flags)
                 });
                 if r >= 0 {
@@ -5382,12 +5382,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         iov_base: std::ptr::null_mut(),
                         iov_len: 0,
                     };
-                    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                    let mut msg: libc::msghdr = { std::mem::zeroed() };
                     msg.msg_iov = &mut dummy_iov;
                     msg.msg_iovlen = 1;
                     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
                     msg.msg_controllen = controllen;
-                    unsafe {
+                    {
                         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
                         while !cmsg.is_null() {
                             let header = &*cmsg;
@@ -5493,7 +5493,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
 
             // Build ancillary control buffer from args[2] (optional).
             let mut cmsgs: Vec<(libc::c_int, libc::c_int, Vec<u8>)> = Vec::new();
-            if args.len() >= 3 && !unsafe { pyre_object::is_none(args[2]) } {
+            if args.len() >= 3 && !{ pyre_object::is_none(args[2]) } {
                 // PyPy `W_Socket.sendmsg_w` snapshots both iterable levels
                 // with `space.unpackiterable` before converting their fields.
                 // That order is semantic: `__index__` may mutate the original
@@ -5543,12 +5543,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 }
             }
             let flags = if args.len() >= 4 {
-                if !unsafe { pyre_object::is_int(args[3]) } {
+                if !{ pyre_object::is_int(args[3]) } {
                     return Err(pyre_interpreter::PyError::type_error(
                         "sendmsg: flags must be an integer",
                     ));
                 }
-                unsafe { pyre_object::w_int_get_value(args[3]) as libc::c_int }
+                pyre_object::w_int_get_value(args[3]) as libc::c_int
             } else {
                 0
             };
@@ -5558,7 +5558,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             // entry.  The scope opened above covers the slot.
             let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
             let (addr_storage, addr_len) =
-                if args.len() >= 5 && !unsafe { pyre_object::is_none(args[4]) } {
+                if args.len() >= 5 && !{ pyre_object::is_none(args[4]) } {
                     let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
                     let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
                     let (s, l) = pack_inet_addr("sendmsg", family, proto, args[4])?;
@@ -5625,7 +5625,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 control
             };
             let total_control = control.len();
-            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            let mut msg: libc::msghdr = { std::mem::zeroed() };
             msg.msg_iov = iovs.as_mut_ptr();
             msg.msg_iovlen = iovs.len() as _;
             if let Some(ref s) = addr_storage {
@@ -5639,7 +5639,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
 
             socket_wait_writable(obj, fd)?;
             let sent = loop {
-                let (r, errno) = socket_call(|| unsafe {
+                let (r, errno) = socket_call(|| {
                     libc::sendmsg(fd, &msg, flags)
                 });
                 if r >= 0 {
@@ -5670,7 +5670,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 }
                 let fd = socket_fd(args[0])?;
                 let how = pyre_interpreter::baseobjspace::c_int_w(args[1])?;
-                let r = unsafe { rffi::shutdown(fd, how) };
+                let r = { rffi::shutdown(fd, how) };
                 if r != 0 {
                     return Err(socket_last_error());
                 }
@@ -5687,9 +5687,9 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             "getsockname",
             |args| {
                 let fd = socket_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
-                let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
+                let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-                let r = unsafe {
+                let r = {
                     rffi::getsockname(fd, &mut storage as *mut _ as *mut rffi::sockaddr, &mut slen)
                 };
                 if r != 0 {
@@ -5708,9 +5708,9 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             "getpeername",
             |args| {
                 let fd = socket_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
-                let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
+                let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-                let r = unsafe {
+                let r = {
                     rffi::getpeername(fd, &mut storage as *mut _ as *mut rffi::sockaddr, &mut slen)
                 };
                 if r != 0 {
@@ -5750,7 +5750,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 socket_set_attr(args[0], "_quickack", pyre_object::w_int_new(flag as i64));
                 return Ok(pyre_object::w_none());
             }
-            let r = unsafe {
+            let r = {
                 if pyre_object::is_int(val) {
                     let v = pyre_object::w_int_get_value(val) as libc::c_int;
                     rffi::setsockopt(
@@ -5815,7 +5815,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 }
                 let mut v: libc::c_int = 0;
                 let mut sz = core::mem::size_of::<libc::c_int>() as rffi::SockLen;
-                let r = unsafe {
+                let r = {
                     rffi::getsockopt(
                         fd,
                         level,
@@ -5835,7 +5835,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let buflen = buflen as usize;
                 let mut buf = vec![0u8; buflen];
                 let mut sz = buflen as rffi::SockLen;
-                let r = unsafe {
+                let r = {
                     rffi::getsockopt(
                         fd,
                         level,
@@ -5992,9 +5992,9 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 // and WinSock's `FIONBIO` cannot be read back.
                 let d = pyre_interpreter::baseobjspace::getdict_native(obj);
                 let blocking = d.is_null()
-                    || unsafe { pyre_object::w_dict_getitem_str(d, "_timeout") }
-                        .filter(|t| unsafe { pyre_object::is_float(*t) })
-                        .is_none_or(|t| unsafe {
+                    || { pyre_object::w_dict_getitem_str(d, "_timeout") }
+                        .filter(|t| { pyre_object::is_float(*t) })
+                        .is_none_or(|t| {
                             pyre_object::floatobject::w_float_get_value(t) != 0.0
                         });
                 Ok(pyre_object::w_bool_from(blocking))
@@ -6019,10 +6019,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 }
                 let obj = args[0];
                 let w_t = args[1];
-                let timeout: f64 = if unsafe { pyre_object::is_none(w_t) } {
+                let timeout: f64 = if pyre_object::is_none(w_t) {
                     -1.0
                 } else {
-                    let v = unsafe {
+                    let v = {
                         if pyre_object::is_float(w_t) {
                             pyre_object::floatobject::w_float_get_value(w_t)
                         } else if pyre_object::is_int(w_t) {
@@ -6043,7 +6043,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 // `gettimeout()` reports a float, and the timeout readers below
                 // recognise only that type; storing the caller's `int` verbatim
                 // would make `settimeout(1)` silently untimed.
-                let stored = if unsafe { pyre_object::is_none(w_t) } {
+                let stored = if pyre_object::is_none(w_t) {
                     w_t
                 } else {
                     pyre_object::floatobject::w_float_new(timeout)
@@ -6066,7 +6066,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 if d.is_null() {
                     return Ok(pyre_object::w_none());
                 }
-                Ok(unsafe { pyre_object::w_dict_getitem_str(d, "_timeout") }
+                Ok({ pyre_object::w_dict_getitem_str(d, "_timeout") }
                     .unwrap_or(pyre_object::w_none()))
             },
             1,
@@ -6090,7 +6090,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             if let Some(&obj) = args.first() {
                 let fd = rffi::socket_from_i64(socket_get_attr_i64(obj, "_fd"));
                 if !rffi::is_invalid(fd) {
-                    let _ = unsafe { rffi::close(fd) };
+                    let _ = { rffi::close(fd) };
                     socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
                 }
             }
@@ -6133,7 +6133,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     ));
                 }
                 let fd = socket_fd(args[0])?;
-                let want_inheritable = unsafe {
+                let want_inheritable = {
                     if pyre_object::is_bool(args[1]) {
                         pyre_object::boolobject::w_bool_get_value(args[1])
                     } else if pyre_object::is_int(args[1]) {

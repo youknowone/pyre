@@ -5765,7 +5765,6 @@ impl Optimizer {
             if let Some(fa) = op.guard_fail_args() {
                 let fargs: smallvec::SmallVec<[OpRef; 8]> =
                     fa.iter().map(|a| a.to_opref()).collect();
-                drop(fa);
                 for farg in fargs {
                     if !farg.is_none() {
                         self.force_box(farg, ctx);
@@ -6117,7 +6116,10 @@ impl Optimizer {
     /// `enable_opts`, in `ALL_OPTS` order. `unroll` is not a pass.
     /// `OptSimplify` is appended when `rewrite`, `virtualize`, `heap`, or
     /// `pure` is absent.
-    pub fn build_opt_chain(enable_opts: &[String], vable: Option<VirtualizableConfig>) -> Self {
+    pub(crate) fn build_opt_chain(
+        enable_opts: &[String],
+        vable: Option<VirtualizableConfig>,
+    ) -> Self {
         let enabled = |name: &str| enable_opts.iter().any(|opt| opt == name);
         let mut opt = Self::new();
         if let Some(config) = vable.as_ref() {
@@ -6172,6 +6174,7 @@ impl Optimizer {
     /// `virtualizable_boxes` is `None` while the driver's `vinfo` is `Some`
     /// still slips past here and is caught only by the reader's
     /// `assert!(vable_size > 0)` in `resume.rs::consume_vable_info`.
+    #[allow(dead_code)] // optimizeopt/__init__.py build_opt_chain virtualizable
     pub(crate) fn default_pipeline_with_virtualizable(config: VirtualizableConfig) -> Self {
         Self::build_opt_chain(&default_enable_opt_names(), Some(config))
     }

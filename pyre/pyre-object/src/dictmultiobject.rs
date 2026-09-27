@@ -2011,6 +2011,11 @@ macro_rules! lock_dict_refs {
         let $guard = unsafe { DictOperationGuard::new($obj, &[$one]) };
         let $one = $guard.root(1);
     };
+    // Both words are re-read from the guard after a collecting step, so the
+    // pre-collection bindings would be unused.
+    (reroot $guard:ident, $obj:ident, $one:ident) => {
+        let $guard = unsafe { DictOperationGuard::new($obj, &[$one]) };
+    };
     ($guard:ident, $obj:ident, $one:ident, $two:ident) => {
         let $guard = unsafe { DictOperationGuard::new($obj, &[$one, $two]) };
         let $obj = $guard.root(0);
@@ -3786,7 +3791,7 @@ pub unsafe fn w_module_dict_store_object_key(
     key: *mut PyObject,
     value: *mut PyObject,
 ) -> i64 {
-    lock_dict_refs!(_leaf_guard, obj, value);
+    lock_dict_refs!(reroot _leaf_guard, obj, value);
     let object_key = match object_key_for_checked(key) {
         Ok(object_key) => object_key,
         Err(_) => return -1,

@@ -660,6 +660,8 @@ struct RewriteState<'a> {
     /// (`history.py:227`) instead of allocating pool entries, so this is
     /// initialized in `with_constants` but has no writer until a backend
     /// egress path needs pooled constants again.
+    #[allow(dead_code)]
+    // rewrite.py constant-pool cursor; history.py ConstInt is emitted inline
     next_const_idx: u32,
 
     /// rewrite.py:470-471 `_changed_op` / `_changed_op_to` parity.
@@ -894,7 +896,7 @@ impl<'a> RewriteState<'a> {
     fn emit_op(&mut self, op: &OpRc) -> Operand {
         let keep = op.opcode == OpCode::JitDebug;
         let mut replaced = false;
-        let mut out = op.clone();
+        let out = op.clone();
         for i in 0..out.num_args() {
             let orig = out.arg(i);
             let mut arg = self.resolve(orig.clone());
@@ -1054,7 +1056,7 @@ impl<'a> RewriteState<'a> {
 
     #[allow(dead_code)]
     fn rewrite_op(&self, op: &Op) -> Op {
-        let mut rewritten = op.clone();
+        let rewritten = op.clone();
         // optimizer.py force_box loop parity:
         //   for i in range(op.numargs()): op.setarg(i, ...)
         for i in 0..rewritten.num_args() {
@@ -1304,7 +1306,7 @@ impl GcRewriterImpl {
 
         // rewrite.py — rewrite failargs + stash the copy-and-changed
         // guard for the next iteration to pick up.
-        let mut new_guard = op.clone();
+        let new_guard = op.clone();
         if let Some(fa) = new_guard.fail_args_mut() {
             // `same_pos` is bound to the freshly-emitted SAME_AS producer
             // (emit_result returns `from_bound_op`), so lower it to the
@@ -3289,7 +3291,7 @@ impl GcRewriterImpl {
         } else {
             vec![frame]
         };
-        let mut call_asm = mk_op(op.opcode, &new_args);
+        let call_asm = mk_op(op.opcode, &new_args);
         if let Some(d) = op.getdescr() {
             call_asm.setdescr(d);
         }

@@ -23,8 +23,7 @@ use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use majit_backend::{AsmMemoryManager, BackendError, JitCellToken};
 use majit_ir::{
-    FailDescr, FailDescrStore, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex,
-    TargetArgLoc, Type,
+    FailDescr, FailDescrStore, InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type,
 };
 
 use crate::arch::*;
@@ -7468,6 +7467,7 @@ impl<'a> AssemblerARM64<'a> {
     /// Shared implementation for NEW_ARRAY.
     /// Allocates base_size + length * item_size bytes, zero-fills,
     /// and writes length to the header.
+    #[allow(dead_code)] // assembler.py genop_new_array / genop_alloc_varsize
     fn genop_alloc_varsize(&mut self, op: &Op, arglocs: &[Loc], base_size: i64, item_size: i64) {
         // The length comes from its regalloc location.  `consider_raw_call_like_j2`
         // plans these opcodes, and `before_call` leaves a value bound to a

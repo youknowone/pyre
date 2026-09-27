@@ -5863,6 +5863,7 @@ fn loopinvariant_now_known<Sym: WalkSym>(
         .call_loopinvariant_now_known(descr_key, arg0_int, result, 0);
 }
 
+#[allow(dead_code)] // codewriter.py exception-handler scan
 fn walk_body_has_exception_handler<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     code: &[u8],

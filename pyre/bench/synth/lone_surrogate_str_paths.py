@@ -5,7 +5,8 @@
 # They must not abort the process. Messages are printed with ascii() so a
 # surrogate in the text stays on stdout. PyPy's AttributeError text writes
 # the surrogate as the six characters \ud800; folding that back to the
-# code point makes the line match the reference.
+# code point makes the line match the reference. Other exception messages
+# already match, so the fold stays on AttributeError alone.
 
 import ast
 import codecs
@@ -20,7 +21,9 @@ def show(name, fn):
         value = fn()
         text = "OK " + ascii(value)
     except Exception as exc:
-        message = str(exc).replace("\\ud800", "\ud800")
+        message = str(exc)
+        if type(exc) is AttributeError:
+            message = message.replace("\\ud800", "\ud800")
         text = "EXC " + type(exc).__name__ + " " + ascii(message)
     print(name, text)
 

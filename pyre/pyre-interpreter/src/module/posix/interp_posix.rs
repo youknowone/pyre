@@ -138,6 +138,8 @@ static FORK_SERIALIZER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// `rpy_init_mutexes` half for the posix fork tables.  Writes only.
 /// `FORK_SERIALIZER` is not in this set: the surviving thread still holds it.
+/// Called only from the unix `pthread_atfork` child handler.
+#[cfg(unix)]
 pub(crate) unsafe fn reinit_fork_tables_after_fork() {
     unsafe {
         APPLEVEL_FORK_CALLBACKS.reinit_after_fork();

@@ -239,7 +239,7 @@ pub fn compile_object(
     opts: crate::compile::CompileOpts,
 ) -> AstResult<crate::compile::CodeObject> {
     let ast_module = crate::importing::importhook(
-        "_ast",
+        rustpython_wtf8::Wtf8::new("_ast"),
         PY_NULL,
         PY_NULL,
         0,
@@ -321,7 +321,7 @@ pub fn preprocess_object_to_object(
     syntax_check_only: bool,
 ) -> crate::PyResult {
     let ast_module = crate::importing::importhook(
-        "_ast",
+        rustpython_wtf8::Wtf8::new("_ast"),
         PY_NULL,
         PY_NULL,
         0,
@@ -2409,7 +2409,7 @@ pub fn parse_to_object_with_opts(
     preprocess_module(&mut module, mode, opts, syntax_check_only);
 
     let ast_module = crate::importing::importhook(
-        "_ast",
+        rustpython_wtf8::Wtf8::new("_ast"),
         PY_NULL,
         PY_NULL,
         0,
@@ -2717,7 +2717,7 @@ pub fn parse_func_type_to_object(source: &str, feature_version: i64) -> crate::P
         tuple.elts
     };
     let ast_module_object = crate::importing::importhook(
-        "_ast",
+        rustpython_wtf8::Wtf8::new("_ast"),
         PY_NULL,
         PY_NULL,
         0,

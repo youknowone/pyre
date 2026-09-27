@@ -593,7 +593,7 @@ fn allocate_ssl_socket(
     }
     let first = pyre_object::gc_roots::shadow_stack_len() - pinned.len();
     for slot in [SOCKET_SLOT, OWNER_SLOT] {
-        let rooted = unsafe { pyre_object::gc_roots::shadow_stack_get(first + slot) };
+        let rooted = { pyre_object::gc_roots::shadow_stack_get(first + slot) };
         if !unsafe { is_none(rooted) } {
             let weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(rooted);
             pyre_object::gc_roots::shadow_stack_set(first + slot, weak);
@@ -605,14 +605,12 @@ fn allocate_ssl_socket(
             w_class: std::ptr::null_mut(),
         },
         backend,
-        context: unsafe { pyre_object::gc_roots::shadow_stack_get(first + CONTEXT_SLOT) },
-        socket: unsafe { pyre_object::gc_roots::shadow_stack_get(first + SOCKET_SLOT) },
-        incoming: unsafe { pyre_object::gc_roots::shadow_stack_get(first + INCOMING_SLOT) },
-        outgoing: unsafe { pyre_object::gc_roots::shadow_stack_get(first + OUTGOING_SLOT) },
-        owner: unsafe { pyre_object::gc_roots::shadow_stack_get(first + OWNER_SLOT) },
-        server_hostname: unsafe {
-            pyre_object::gc_roots::shadow_stack_get(first + SERVER_HOSTNAME_SLOT)
-        },
+        context: { pyre_object::gc_roots::shadow_stack_get(first + CONTEXT_SLOT) },
+        socket: { pyre_object::gc_roots::shadow_stack_get(first + SOCKET_SLOT) },
+        incoming: { pyre_object::gc_roots::shadow_stack_get(first + INCOMING_SLOT) },
+        outgoing: { pyre_object::gc_roots::shadow_stack_get(first + OUTGOING_SLOT) },
+        owner: { pyre_object::gc_roots::shadow_stack_get(first + OWNER_SLOT) },
+        server_hostname: { pyre_object::gc_roots::shadow_stack_get(first + SERVER_HOSTNAME_SLOT) },
         server_side,
         shutdown_started: false,
         record: RecordCursor::default(),
@@ -641,7 +639,7 @@ fn allocate_certificate(der: Vec<u8>) -> PyObjectRef {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
         },
-        der: unsafe { pyre_object::gc_roots::shadow_stack_get(der_slot) },
+        der: { pyre_object::gc_roots::shadow_stack_get(der_slot) },
         hash: -1,
     })
 }
@@ -690,7 +688,7 @@ mod context_methods {
             post_handshake_auth: false,
             num_tickets: 2,
         });
-        pyre_interpreter::typedef::tag_subclass_instance(obj, unsafe {
+        pyre_interpreter::typedef::tag_subclass_instance(obj, {
             pyre_object::gc_roots::shadow_stack_get(cls_slot)
         })
     }
@@ -1671,7 +1669,7 @@ mod memory_bio_methods {
             });
             Ok(pyre_interpreter::typedef::tag_subclass_instance(
                 obj,
-                unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+                pyre_object::gc_roots::shadow_stack_get(cls_slot),
             ))
         }
 
@@ -1881,7 +1879,7 @@ mod ssl_socket_methods {
             let _roots = pyre_object::gc_roots::push_roots();
             let transport_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(transport);
-            let transport = || unsafe { pyre_object::gc_roots::shadow_stack_get(transport_slot) };
+            let transport = || pyre_object::gc_roots::shadow_stack_get(transport_slot);
             let backend = socket.backend;
             loop {
                 match pump(backend, fd, &mut [], PumpGoal::Flush, &mut socket.record) {
@@ -1908,7 +1906,7 @@ mod ssl_socket_methods {
             let _roots = pyre_object::gc_roots::push_roots();
             let transport_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(transport_socket(socket)?);
-            let transport = || unsafe { pyre_object::gc_roots::shadow_stack_get(transport_slot) };
+            let transport = || pyre_object::gc_roots::shadow_stack_get(transport_slot);
             let fd = crate::module::_socket::interp_socket::socket_fd(transport())?;
             crate::module::_socket::interp_socket::socket_wait_for_data(transport(), fd, true)?;
             let sent = match crate::module::_socket::interp_socket::socket_send_bytes(
@@ -2096,6 +2094,7 @@ mod ssl_socket_methods {
     /// reaching here.
     fn pump_error(
         transport: PyObjectRef,
+        #[cfg_attr(not(windows), allow(unused_variables))]
         backend: *const pyre_native::ssl::TlsConnection,
         exit: PumpExit,
     ) -> pyre_interpreter::PyError {
@@ -2220,7 +2219,7 @@ mod ssl_socket_methods {
         let _roots = pyre_object::gc_roots::push_roots();
         let transport_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(transport_socket(socket)?);
-        let transport = || unsafe { pyre_object::gc_roots::shadow_stack_get(transport_slot) };
+        let transport = || pyre_object::gc_roots::shadow_stack_get(transport_slot);
         let fd = crate::module::_socket::interp_socket::socket_fd(transport())?;
         crate::module::_socket::interp_socket::socket_wait_for_data(transport(), fd, false)?;
         let mut buf = vec![0u8; 32 * 1024];
@@ -2480,8 +2479,7 @@ mod ssl_socket_methods {
                     let _roots = pyre_object::gc_roots::push_roots();
                     let transport_slot = pyre_object::gc_roots::shadow_stack_len();
                     let _ = pyre_object::gc_roots::pin_root(transport);
-                    let transport =
-                        || unsafe { pyre_object::gc_roots::shadow_stack_get(transport_slot) };
+                    let transport = || pyre_object::gc_roots::shadow_stack_get(transport_slot);
                     if pump_buffer.is_empty() {
                         pump_buffer.resize(32 * 1024, 0u8);
                     }
@@ -2622,8 +2620,7 @@ mod ssl_socket_methods {
                 let _roots = pyre_object::gc_roots::push_roots();
                 let transport_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(transport);
-                let transport =
-                    || unsafe { pyre_object::gc_roots::shadow_stack_get(transport_slot) };
+                let transport = || pyre_object::gc_roots::shadow_stack_get(transport_slot);
                 let mut buf = vec![0u8; 32 * 1024];
                 let backend = self.backend;
                 loop {
@@ -2905,8 +2902,7 @@ mod ssl_socket_methods {
                 let _roots = pyre_object::gc_roots::push_roots();
                 let transport_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(transport);
-                let transport =
-                    || unsafe { pyre_object::gc_roots::shadow_stack_get(transport_slot) };
+                let transport = || pyre_object::gc_roots::shadow_stack_get(transport_slot);
                 let mut buf = vec![0u8; 32 * 1024];
                 loop {
                     match pump(

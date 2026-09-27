@@ -4,7 +4,7 @@
 //! returned by `Profiler.getstats()` but are not bound in the module namespace.
 
 use pyre_object::*;
-use rustpython_wtf8::{Wtf8, Wtf8Buf};
+use rustpython_wtf8::Wtf8Buf;
 
 use std::sync::OnceLock;
 use std::time::Instant;

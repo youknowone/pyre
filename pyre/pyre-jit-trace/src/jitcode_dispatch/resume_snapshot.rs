@@ -2835,6 +2835,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
 /// `InlineParentFrame`. `resume.py` `rebuild_from_resumedata` reads that
 /// index back out of `staticdata.jitcodes` and `MetaInterp.newframe` re-enters
 /// it; a nested helper call must not push a second copy of the same section.
+#[allow(dead_code)] // resume.py rebuild_from_resumedata helper parents
 pub(crate) fn parents_for_helper_entry<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     frame: InlineParentFrame,

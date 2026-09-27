@@ -5,9 +5,9 @@ use pyre_object::PyObjectRef;
 use std::ffi::CStr;
 use std::sync::{Condvar, Mutex, OnceLock};
 
-use super::ctypeobj::{self, W_CType};
-use super::ffi_obj::{self, W_FFIObject};
-use super::{ctypestruct, newtype, parse_c_type};
+use super::ctypeobj;
+use super::ffi_obj::W_FFIObject;
+use super::{newtype, parse_c_type};
 
 const NAMES: [Option<&str>; parse_c_type::NUM_PRIM] = [
     None,

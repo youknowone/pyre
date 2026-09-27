@@ -9,6 +9,7 @@
 
 use crate::{make_builtin_function, make_builtin_function_with_arity};
 use pyre_object::*;
+use rustpython_wtf8::Wtf8Buf;
 
 /// `_ATTR_EXCEPTIONS` (`_pypy_generic_alias.py`) — attribute names that
 /// resolve on the alias itself; every other name delegates to the
@@ -964,21 +965,31 @@ fn ga_get_typing_unpacked_tuple_args(args: &[PyObjectRef]) -> crate::PyResult {
 pub(crate) fn dir_list(ga: PyObjectRef) -> crate::PyResult {
     let origin = unsafe { w_generic_alias_get_origin(ga) };
     let dir_origin = crate::builtins::builtin_dir(&[origin])?;
-    let mut names: Vec<String> = ATTR_EXCEPTIONS.iter().map(|s| s.to_string()).collect();
+    let mut names: Vec<Wtf8Buf> = ATTR_EXCEPTIONS
+        .iter()
+        .map(|s| {
+            let mut buf = Wtf8Buf::new();
+            buf.push_str(s);
+            buf
+        })
+        .collect();
     let n = unsafe { w_list_len(dir_origin) };
     for i in 0..n {
         if let Some(item) = unsafe { w_list_getitem(dir_origin, i as i64) }
             && unsafe { is_str(item) }
         {
-            names.push(crate::baseobjspace::str_utf8_w(item)?.to_string());
+            // `dir(origin)` can name a lone surrogate. Keep the WTF-8 bytes;
+            // their order matches code-point order, so `sorted` stays exact.
+            let mut buf = Wtf8Buf::new();
+            buf.push_wtf8(unsafe { w_str_get_wtf8(item) });
+            names.push(buf);
         }
     }
-    names.sort();
+    names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     names.dedup();
-    // One `w_str_new` per name, each allocating over the names already boxed.
     let mut items = pyre_object::gc_roots::RootedItems::new();
-    for s in names.iter() {
-        items.push(w_str_new_managed(s));
+    for name in names {
+        items.push(w_str_from_wtf8_managed(name));
     }
     Ok(w_list_new(items.take()))
 }

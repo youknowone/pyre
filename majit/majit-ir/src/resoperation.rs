@@ -3170,11 +3170,6 @@ impl DescrSlot {
         }
     }
 
-    fn take_parts(&self) -> (Option<DescrRef>, Option<OpKindExtra>, u64) {
-        let (d, e, f, _stamp) = self.take_parts_full();
-        (d, e, f)
-    }
-
     fn take_parts_full(&self) -> (Option<DescrRef>, Option<OpKindExtra>, u64, u32) {
         let w = self.word();
         unsafe {
@@ -4063,7 +4058,7 @@ impl Op {
     #[inline]
     pub fn set_rd_resume_position(&self, pos: i32) {
         if pos < 0 {
-            if let Some(mut g) = self.try_guard_extra_mut() {
+            if let Some(g) = self.try_guard_extra_mut() {
                 g.rd_resume_position = -1;
             }
             return;

@@ -436,9 +436,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             })?,
                     ),
                 };
-                let mut rset = host_select::FdSet::new();
-                let mut wset = host_select::FdSet::new();
-                let mut xset = host_select::FdSet::new();
+                let mut rset;
+                let mut wset;
+                let mut xset;
                 loop {
                     rset = host_select::FdSet::new();
                     wset = host_select::FdSet::new();

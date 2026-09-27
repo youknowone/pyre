@@ -453,6 +453,7 @@ fn upa3<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, R: ResidualRet>(
 }
 
 #[inline]
+#[allow(dead_code)] // residual fnaddr registration, 3-arg form of up2
 fn up3<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, R: ResidualRet>(
     entries: &mut Vec<(&'static str, i64)>,
     full_path: &'static str,
@@ -504,6 +505,7 @@ fn upa4<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, A4: ResidualSlot, 
 }
 
 #[inline]
+#[allow(dead_code)] // residual fnaddr registration, 4-arg form of up2
 fn up4<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, A4: ResidualSlot, R: ResidualRet>(
     entries: &mut Vec<(&'static str, i64)>,
     full_path: &'static str,

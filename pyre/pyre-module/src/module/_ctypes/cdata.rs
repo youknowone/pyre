@@ -1398,8 +1398,8 @@ pub(super) fn keep_ref(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
     let _ = pyre_object::gc_roots::pin_root(obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // Walk `_b_base_` up to the owning root.
-    let mut root = anchor;
-    let mut root = pyre_object::gc_roots::pin_root(root);
+    let _ = pyre_object::gc_roots::pin_root(anchor);
+    let mut root;
     let mut root_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let mut composite_key = key.to_string();
     loop {
@@ -1499,10 +1499,10 @@ pub(super) fn objects_for_keep(value: PyObjectRef) -> PyObjectRef {
 /// root instance dict rather than in the user-visible keepalive dictionary.
 fn keep_alive(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
-    let obj = pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let mut root = anchor;
-    let mut root = pyre_object::gc_roots::pin_root(root);
+    let _ = pyre_object::gc_roots::pin_root(anchor);
+    let mut root;
     let mut root_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     loop {
         root = pyre_object::gc_roots::shadow_stack_get(root_slot);
@@ -1538,12 +1538,12 @@ pub(super) fn share_objects_for_cast(result: PyObjectRef, source: PyObjectRef) {
     // lifetime explicitly across `w_dict_new` and `w_dict_setitem` (the latter
     // allocates the integer identity key and can trigger a nursery collection).
     let _roots = pyre_object::gc_roots::push_roots();
-    let result = pyre_object::gc_roots::pin_root(result);
+    let _ = pyre_object::gc_roots::pin_root(result);
     let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let source = pyre_object::gc_roots::pin_root(source);
     let source_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let mut root = source;
-    let mut root = pyre_object::gc_roots::pin_root(root);
+    let _ = pyre_object::gc_roots::pin_root(source);
+    let mut root;
     let mut root_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     loop {
         root = pyre_object::gc_roots::shadow_stack_get(root_slot);
@@ -1575,7 +1575,7 @@ pub(super) fn share_objects_for_cast(result: PyObjectRef, source: PyObjectRef) {
         // be a `list` that moves; the lookup that follows can collect, so it is
         // pinned here and read back at the store.
         let holder_slot = pyre_object::gc_roots::shadow_stack_len();
-        let objects = pyre_object::gc_roots::pin_root(objects);
+        let _ = pyre_object::gc_roots::pin_root(objects);
         let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
         let result_dict = pyre_interpreter::baseobjspace::getdict_native(result);
         if !result_dict.is_null() {

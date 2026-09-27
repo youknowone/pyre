@@ -2339,7 +2339,6 @@ impl<'c> Lowerer<'c> {
                     // No IR ops emitted on the JIT path. The concrete
                     // RefFieldRewriter path calls the function normally.
                 }
-                _ => return None,
             },
             CallPolicySpec::Infer => {
                 let policy_path = helper_policy_path(&call.func)?;

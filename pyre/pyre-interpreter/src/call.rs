@@ -454,7 +454,7 @@ pub fn get_eval_fn() -> EvalFn {
 /// Address of `eval_frame_plain`, the evaluator "force plain eval" selects.
 #[majit_macros::dont_look_inside]
 pub fn plain_eval_fn_addr() -> usize {
-    eval_frame_plain as usize
+    eval_frame_plain as *const () as usize
 }
 
 /// Address of the process eval function (`EVAL_OVERRIDE`, else plain).

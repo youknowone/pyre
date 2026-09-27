@@ -417,6 +417,7 @@ impl RecentPureOpTable {
             .map(|(_, result)| result)
     }
 
+    #[allow(dead_code)] // pure.py OptPure.history length
     fn history_length(&self) -> usize {
         self.history_length
     }

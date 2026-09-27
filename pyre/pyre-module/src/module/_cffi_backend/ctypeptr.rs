@@ -635,7 +635,7 @@ pub unsafe fn pointer_convert_argument_from_object(
                 (buf as *mut u8).add(tail.len()).write(0);
                 cdata.cast::<usize>().write_unaligned(buf);
             }
-            set_mustfree_flag(cdata, MUSTFREE_FREE);
+            unsafe { set_mustfree_flag(cdata, MUSTFREE_FREE) };
             return Ok(true);
         }
         if ct.has(ctypeobj::CTypeFlags::ACCEPT_STR)

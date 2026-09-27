@@ -24,7 +24,6 @@
 //! ```
 
 use crate::codewriter::call::CallControl;
-use crate::flowspace::model::Variable;
 use crate::model::{FunctionGraph, OpKind, SpaceOperation, ValueType};
 use crate::parse::CallPath;
 
@@ -319,6 +318,7 @@ pub fn build_ll_int_abs_graph(name: &str) -> FunctionGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flowspace::model::Variable;
     use crate::model::CallTarget;
 
     fn call(segments: &[&str], nargs: usize) -> SpaceOperation {

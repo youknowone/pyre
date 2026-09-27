@@ -230,11 +230,13 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     rewrite_alias_args(&mut stripped);
     let inner_fn = quote! {
         #(#user_attrs)*
+        #[allow(non_snake_case)]
         #[inline]
         #stripped #user_body
     };
 
     let wrapper = quote! {
+        #[allow(non_snake_case)]
         #vis fn #user_name(
             args: &[::pyre_object::PyObjectRef],
         ) -> ::std::result::Result<::pyre_object::PyObjectRef, ::pyre_interpreter::PyError> {
@@ -304,7 +306,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         }
     };
     let sig_fn = quote! {
-        #[allow(dead_code)]
+        #[allow(dead_code, non_snake_case)]
         #vis fn #sig_fn_name() -> ::std::option::Option<::pyre_interpreter::Signature> {
             #sig_body
         }
@@ -329,7 +331,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             quote! { #n }
         };
     let arity_fn = quote! {
-        #[allow(dead_code)]
+        #[allow(dead_code, non_snake_case)]
         #vis fn #arity_fn_name() -> u16 {
             #natural_arity
         }

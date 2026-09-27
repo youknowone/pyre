@@ -1022,10 +1022,10 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
         entry_executed_effects: 0,
         live: None,
     });
-    let mut regs_r = Vec::new();
-    let mut regs_i = Vec::new();
-    let mut regs_f = Vec::new();
-    let mut concrete_r = Vec::new();
+    let regs_r = Vec::new();
+    let regs_i = Vec::new();
+    let regs_f = Vec::new();
+    let concrete_r = Vec::new();
     let mut concrete_i = Vec::new();
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -1591,8 +1591,8 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
     let forwarded_obj_ptr = 0xF0A0_0000usize;
     let stale_obj_ptr = 0xDEAD_0000usize;
     tc.set_opref_concrete(oprefs[2], Value::Ref(majit_ir::GcRef(forwarded_obj_ptr)));
-    let mut regs_r = oprefs.clone();
-    let mut concrete = vec![
+    let regs_r = oprefs.clone();
+    let concrete = vec![
         ConcreteValue::Null,
         ConcreteValue::Ref(exc_obj_ptr),
         ConcreteValue::Ref(stale_obj_ptr as pyre_object::PyObjectRef),
@@ -1873,8 +1873,8 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
 fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
     let descr_pool: Vec<DescrRef> = Vec::new();
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = vec![OpRef::NONE];
-    let mut regs_i = vec![OpRef::NONE];
+    let regs_r = vec![OpRef::NONE];
+    let regs_i = vec![OpRef::NONE];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -1937,8 +1937,8 @@ fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
 fn setfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
     let descr_pool: Vec<DescrRef> = Vec::new();
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = vec![OpRef::NONE];
-    let mut regs_i = vec![OpRef::NONE];
+    let regs_r = vec![OpRef::NONE];
+    let regs_i = vec![OpRef::NONE];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -2019,8 +2019,8 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
     ] {
         let descr_pool: Vec<DescrRef> = Vec::new();
         let mut tc = fresh_trace_ctx();
-        let mut regs_r = vec![OpRef::NONE];
-        let mut regs_i = vec![OpRef::NONE];
+        let regs_r = vec![OpRef::NONE];
+        let regs_i = vec![OpRef::NONE];
         let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -2123,8 +2123,8 @@ fn array_vable_handlers_with_unpinned_index_surface_index_not_concrete() {
         let mut tc = fresh_trace_ctx();
         // Ref reg 0 is seeded, so the `VableBoxNotSeeded` guard above lets this
         // through; int reg 1 holds an `OpRef` the walker never gave a concrete.
-        let mut regs_r = vec![OpRef::input_arg_ref(0)];
-        let mut regs_i = vec![OpRef::NONE, OpRef::NONE];
+        let regs_r = vec![OpRef::input_arg_ref(0)];
+        let regs_i = vec![OpRef::NONE, OpRef::NONE];
         let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -2261,8 +2261,8 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
             [0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00]
         };
         let stored_value = tc.const_int(7);
-        let mut regs_r = vec![vable];
-        let mut regs_i = vec![zero, index, stored_value];
+        let regs_r = vec![vable];
+        let regs_i = vec![zero, index, stored_value];
         let descr_pool: Vec<DescrRef> = Vec::new();
         let guards_before = tc.num_guards();
         let session = std::cell::RefCell::new(WalkSession::default());
@@ -2538,7 +2538,7 @@ fn drive_int_add_jump_if_ovf(
     let rhs = OpRef::input_arg_int(1);
     tc.set_opref_concrete(lhs, Value::Int(lhs_value));
     tc.set_opref_concrete(rhs, Value::Int(rhs_value));
-    let mut regs_i = vec![lhs, rhs, OpRef::NONE];
+    let regs_i = vec![lhs, rhs, OpRef::NONE];
     let mut concrete_i = vec![
         ConcreteValue::Int(lhs_value),
         ConcreteValue::Int(rhs_value),
@@ -2743,8 +2743,8 @@ fn drive_alloc_with_descr(
     let descr_pool = vec![crate::descr::w_int_size_descr()];
     let mut tc = TraceCtx::for_test_types(&[]);
     tc.set_cpu(cpu);
-    let mut regs_r = vec![OpRef::NONE];
-    let mut concrete_r = vec![ConcreteValue::Null];
+    let regs_r = vec![OpRef::NONE];
+    let concrete_r = vec![ConcreteValue::Null];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -3774,7 +3774,7 @@ fn switch_id_jumps_to_target_or_falls_through() {
     for (name, key, jump_to) in cases {
         let mut tc = fresh_trace_ctx();
         let value = tc.const_int(key);
-        let mut regs_i = vec![value];
+        let regs_i = vec![value];
         let descr_pool = switch_descr_pool(&[(5, 17), (9, 23)]);
         let _descr = done_descr_ref_for_tests();
         let session = std::cell::RefCell::new(WalkSession::default());
@@ -3840,7 +3840,7 @@ fn switch_id_requires_concrete_int_value() {
         0x00, // d descr index 0
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = vec![OpRef::input_arg_int(0)];
+    let regs_i = vec![OpRef::input_arg_int(0)];
     let descr_pool = switch_descr_pool(&[(5, 17)]);
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -3914,7 +3914,7 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
     ];
     let mut tc = fresh_trace_ctx();
     let value = tc.const_int(1);
-    let mut regs_i = vec![value];
+    let regs_i = vec![value];
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -3979,7 +3979,7 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
     ];
     let mut tc = fresh_trace_ctx();
     let value = tc.const_int(0);
-    let mut regs_i = vec![value];
+    let regs_i = vec![value];
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -4043,7 +4043,7 @@ fn goto_if_not_requires_concrete_int_value() {
         0x00, // L target = 0x0040
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = vec![OpRef::input_arg_int(0)];
+    let regs_i = vec![OpRef::input_arg_int(0)];
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -5006,7 +5006,7 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         0x05, // ref_return r5
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
     let arg_value = regs_r[2];
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
@@ -5145,7 +5145,7 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
     let root_code = [inline, 0, 0, 1, 0, 0, ret, 0];
     let mut trace_ctx = fresh_trace_ctx();
     let expected = OpRef::input_arg_typed(0, Type::Ref);
-    let mut regs_r = vec![expected];
+    let regs_r = vec![expected];
     trace_ctx
         .heap_cache_mut()
         .class_now_known(expected, 0x1234_5678);
@@ -5347,11 +5347,11 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
     //   opcode(1) + d(2) + R-len(1) + R[0](1) + dst(1) = 6 bytes
     let caller_code = [inline_ri_byte, 0x07, 0x00, 0x01, 0x02, 0x03];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_r = distinct_const_refs(&mut tc, 4);
     // Initialize registers_i[3] (dst) to a sentinel so we can
     // detect that the write happened.
     let sentinel_pre = tc.const_int(0xDEAD_BEEF);
-    let mut regs_i: Vec<OpRef> = vec![sentinel_pre; 4];
+    let regs_i: Vec<OpRef> = vec![sentinel_pre; 4];
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
@@ -5473,9 +5473,9 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
         0x05, // dst = r5
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
     let arg_ref = regs_r[2];
-    let mut regs_i: Vec<OpRef> = (0..4)
+    let regs_i: Vec<OpRef> = (0..4)
         .map(|i| tc.const_int(0xCAFE_F00D + i as i64))
         .collect();
     let descr = done_descr_ref_for_tests();
@@ -5715,15 +5715,15 @@ fn inline_call_irf_r_populates_all_three_kind_banks() {
         0x05, // dst = r5
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
     let arg_ref = regs_r[2];
-    let mut regs_i: Vec<OpRef> = (0..4).map(|i| tc.const_int(i as i64)).collect();
+    let regs_i: Vec<OpRef> = (0..4).map(|i| tc.const_int(i as i64)).collect();
     // Float bank: pyre's TraceCtx doesn't expose a const_float
     // factory in the test fixture path, but we only need *distinct*
     // OpRef values to exercise list-byte advancement; const_int +
     // type-punning into the float slot is sufficient because the
     // walker treats the bank as opaque OpRef storage.
-    let mut regs_f: Vec<OpRef> = (0..4).map(|i| tc.const_int(0xF1F1 + i as i64)).collect();
+    let regs_f: Vec<OpRef> = (0..4).map(|i| tc.const_int(0xF1F1 + i as i64)).collect();
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
@@ -5831,8 +5831,8 @@ fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
         0x05,
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
-    let mut regs_i: Vec<OpRef> = (0..4).map(|i| tc.const_int(i as i64)).collect();
+    let regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i: Vec<OpRef> = (0..4).map(|i| tc.const_int(i as i64)).collect();
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
@@ -5933,7 +5933,7 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
     // top level.)
     let caller_code = [inline_byte, 0x07, 0x00, 0x01, 0x02, 0x05];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
     let arg_value = regs_r[2];
     let descr = done_descr_ref_for_tests();
     let descr_exc = make_fail_descr(2);
@@ -6217,7 +6217,7 @@ fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
     // catch off-by-one bugs in operand decoding.
     let code = [ret_byte, 0x03];
     let mut tc = fresh_trace_ctx();
-    let mut regs = distinct_const_refs(&mut tc, 8);
+    let regs = distinct_const_refs(&mut tc, 8);
     let expected_arg = regs[3];
     let descr = done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
@@ -6357,8 +6357,8 @@ fn raise_with_unwritten_register_surfaces_register_read_unbound() {
     let code = [raise_byte, 0x01];
     let mut tc = fresh_trace_ctx();
     let session = std::cell::RefCell::new(WalkSession::default());
-    let mut registers_r = [OpRef::NONE, OpRef::NONE];
-    let mut concrete_registers_r = [ConcreteValue::Null, ConcreteValue::Null];
+    let registers_r = [OpRef::NONE, OpRef::NONE];
+    let concrete_registers_r = [ConcreteValue::Null, ConcreteValue::Null];
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: None,
@@ -6423,7 +6423,7 @@ fn step_through_int_return_records_finish_with_int_descr() {
         .expect("`int_return/i` must be in insns table");
     let code = [ret_byte, 0x02];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i: Vec<OpRef> = (0..4)
+    let regs_i: Vec<OpRef> = (0..4)
         .map(|i| tc.const_int(0xBEEF_0000 + i as i64))
         .collect();
     let expected_arg = regs_i[2];
@@ -6511,7 +6511,7 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
         .expect("`int_return/i` must be in insns table");
     let code = [ret_byte, 0x01];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i: Vec<OpRef> = (0..4)
+    let regs_i: Vec<OpRef> = (0..4)
         .map(|i| tc.const_int(0xCAFE_0000 + i as i64))
         .collect();
     let expected = regs_i[1];
@@ -6976,7 +6976,7 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
         .expect("`catch_exception/L` must be in insns table");
     let code = [catch_byte, 0x2A, 0x00];
     let mut tc = fresh_trace_ctx();
-    let mut regs = distinct_const_refs(&mut tc, 4);
+    let regs = distinct_const_refs(&mut tc, 4);
     let active_exc = regs[0];
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -7118,7 +7118,7 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
     // exc operand reads registers_r[2]
     let code = [raise_byte, 0x02];
     let mut tc = fresh_trace_ctx();
-    let mut regs = distinct_const_refs(&mut tc, 4);
+    let regs = distinct_const_refs(&mut tc, 4);
     let expected_exc = regs[2];
     let descr_done = done_descr_ref_for_tests();
     let descr_exc = make_fail_descr(99);
@@ -7207,7 +7207,7 @@ fn top_level_raise_settles_the_vable_token() {
     let mut tc = fresh_trace_ctx();
     let mut vable_buf = vec![0u8; 65536];
     bind_fake_vable(&mut tc, &mut vable_buf);
-    let mut regs = distinct_const_refs(&mut tc, 4);
+    let regs = distinct_const_refs(&mut tc, 4);
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -7328,8 +7328,8 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
     // is a no-op, so constants never round-trip through the
     // class-pinned cache.
     let exc_box = OpRef::input_arg_ref(0);
-    let mut regs: Vec<OpRef> = vec![OpRef::NONE, OpRef::NONE, exc_box, OpRef::NONE];
-    let mut concrete = vec![
+    let regs: Vec<OpRef> = vec![OpRef::NONE, OpRef::NONE, exc_box, OpRef::NONE];
+    let concrete = vec![
         ConcreteValue::Null,
         ConcreteValue::Null,
         ConcreteValue::Ref(exc_ptr),
@@ -7441,7 +7441,7 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
         .expect("`reraise/` must be in insns table");
     let code = [reraise_byte];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_r = distinct_const_refs(&mut tc, 4);
     let active_exc = regs_r[1];
     let descr_done = done_descr_ref_for_tests();
     let descr_exc = make_fail_descr(99);
@@ -7596,7 +7596,7 @@ fn raise_at_top_level_populates_last_exc_value_before_finish() {
         .expect("`raise/r` must be in insns table");
     let code = [raise_byte, 0x02];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_r = distinct_const_refs(&mut tc, 4);
     let exc = regs_r[2];
     let descr_done = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -7718,7 +7718,7 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
     ];
     assert_eq!(caller_code.len(), 14);
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
     let exc_arg = regs_r[3];
     let handler_ret = regs_r[5];
     let descr_done = done_descr_ref_for_tests();
@@ -7847,7 +7847,7 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
         0x00,
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
     let exc_arg = regs_r[2];
     let descr_done = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
@@ -7927,7 +7927,7 @@ fn step_through_int_copy_advances_past_operand_bytes() {
     // distinguish src from dst slots.
     let code = [int_copy_byte, 0x02, 0x05];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
     let descr = done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -7996,7 +7996,7 @@ fn int_copy_writes_src_value_into_dst_register() {
         .expect("`int_copy/i>i` must be in insns table");
     let code = [int_copy_byte, 0x02, 0x05]; // src=2, dst=5
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
     let src_val_pre = regs_i[2];
     let dst_val_pre = regs_i[5];
     assert_ne!(
@@ -8069,7 +8069,7 @@ fn int_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         .expect("`int_copy/i>i` must be in insns table");
     let code = [int_copy_byte, 0x00, 0x09]; // src=0 (in range), dst=9 (OOR)
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_refs(&mut tc, 4);
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -8216,7 +8216,7 @@ fn step_through_ref_copy_advances_past_operand_bytes() {
         .expect("`ref_copy/r>r` must be in insns table");
     let code = [ref_copy_byte, 0x02, 0x05]; // src=2, dst=5
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
     let descr = done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -8283,7 +8283,7 @@ fn ref_copy_writes_src_value_into_dst_register() {
         .expect("`ref_copy/r>r` must be in insns table");
     let code = [ref_copy_byte, 0x02, 0x05]; // src=2, dst=5
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
     let src_val_pre = regs_r[2];
     let dst_val_pre = regs_r[5];
     assert_ne!(
@@ -8354,7 +8354,7 @@ fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         .expect("`ref_copy/r>r` must be in insns table");
     let code = [ref_copy_byte, 0x00, 0x09]; // src=0 (in range), dst=9 (OOR)
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_r = distinct_const_refs(&mut tc, 4);
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -8485,7 +8485,7 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
     // operand decoding surfaces in the assertion.
     let code = [byte, 0x02, 0x04, 0x06];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
     let arg0 = regs_i[2];
     let arg1 = regs_i[4];
     let dst_pre = regs_i[6];
@@ -8798,7 +8798,7 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
     let code = [byte, 0x02, 0x04, 0x06];
     let mut tc = fresh_trace_ctx();
-    let mut regs_f = distinct_const_refs(&mut tc, 8);
+    let regs_f = distinct_const_refs(&mut tc, 8);
     let arg0 = regs_f[2];
     let arg1 = regs_f[4];
     let dst_pre = regs_f[6];
@@ -8899,7 +8899,7 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
     let code = [byte, 0x02, 0x05];
     let mut tc = fresh_trace_ctx();
-    let mut regs_f = distinct_const_refs(&mut tc, 8);
+    let regs_f = distinct_const_refs(&mut tc, 8);
     let arg = regs_f[2];
     let dst_pre = regs_f[5];
     let descr = done_descr_ref_for_tests();
@@ -8987,7 +8987,7 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
     let code = [byte, 0x02, 0x05]; // src=2, dst=5
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
     let arg = regs_i[2];
     let dst_pre = regs_i[5];
     let descr = done_descr_ref_for_tests();
@@ -9109,7 +9109,7 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
     // (declared by `for_test_types`) are the recordable non-const operand.
     regs_r[2] = OpRef::input_arg_ref(0);
     regs_r[4] = OpRef::input_arg_ref(1);
-    let mut regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
     let arg0 = regs_r[2];
     let arg1 = regs_r[4];
     let dst_pre = regs_i[6];
@@ -9627,7 +9627,7 @@ fn int_add_with_out_of_range_dst_register_surfaces_typed_error() {
         .expect("`int_add/ii>i` must be in insns table");
     let code = [byte, 0x00, 0x01, 0x09]; // dst=9, registers_i.len()=4 → OOR
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_refs(&mut tc, 4);
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -9770,7 +9770,7 @@ fn new_array_id_records_new_array() {
     let descr = done_descr_ref_for_tests();
     let descr_pool = vec![descr];
     let dummy = tc.record_op(majit_ir::OpCode::IntAdd, &[]);
-    let mut regs_r = [dummy];
+    let regs_r = [dummy];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -9972,8 +9972,8 @@ fn empty_str_concat_helper_aborts_before_the_unwired_op_is_dispatched() {
 
     let mut trace_ctx = fresh_trace_ctx();
     let session = std::cell::RefCell::new(WalkSession::default());
-    let mut registers_r = vec![OpRef::NONE; body.c_num_regs_r as usize];
-    let mut concrete_registers_r = vec![ConcreteValue::Null; body.c_num_regs_r as usize];
+    let registers_r = vec![OpRef::NONE; body.c_num_regs_r as usize];
+    let concrete_registers_r = vec![ConcreteValue::Null; body.c_num_regs_r as usize];
     let mut walk_ctx = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: None,
@@ -10053,8 +10053,8 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
     let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
     let descr = done_descr_ref_for_tests();
     let box_opref = OpRef::input_arg_ref(0);
-    let mut regs_r = [box_opref];
-    let mut regs_i = [OpRef::None];
+    let regs_r = [box_opref];
+    let regs_i = [OpRef::None];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -10305,9 +10305,9 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
     let concrete_ptr: usize = 0xdead_beef;
     let source = tc.const_ref(concrete_ptr as i64);
     let value_opref = tc.record_op(majit_ir::OpCode::SameAsR, &[source]);
-    let mut regs_r = [value_opref];
-    let mut regs_i = [OpRef::None];
-    let mut concrete_r = [ConcreteValue::Ref(
+    let regs_r = [value_opref];
+    let regs_i = [OpRef::None];
+    let concrete_r = [ConcreteValue::Ref(
         concrete_ptr as *mut pyre_object::pyobject::PyObject,
     )];
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -10399,8 +10399,8 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
     // Symbolic side: a recorded op OpRef (not a Const).
     let value_opref = tc.record_op(majit_ir::OpCode::IntAdd, &[]);
     let ops_before = tc.num_ops();
-    let mut regs_r = [OpRef::None];
-    let mut regs_i = [value_opref];
+    let regs_r = [OpRef::None];
+    let regs_i = [value_opref];
     let mut concrete_i = [ConcreteValue::Int(42)];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -10490,9 +10490,9 @@ fn ref_guard_value_on_const_records_nothing() {
     let descr = done_descr_ref_for_tests();
     let value_opref = tc.const_ref(0xdead_beef);
     let baseline_ops = tc.ops().len();
-    let mut regs_r = [value_opref];
-    let mut regs_i = [OpRef::None];
-    let mut concrete_r = [ConcreteValue::Ref(
+    let regs_r = [value_opref];
+    let regs_i = [OpRef::None];
+    let concrete_r = [ConcreteValue::Ref(
         0xdead_beef as *mut pyre_object::pyobject::PyObject,
     )];
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -10575,8 +10575,8 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
         0x00, // dst reg (deferred)
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 4);
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 4);
+    let regs_r = distinct_const_refs(&mut tc, 8);
     let funcptr_expected = regs_i[2];
     let arg0_expected = regs_r[4];
     let arg1_expected = regs_r[7];
@@ -10756,7 +10756,7 @@ fn run_symbolic_box_str_dispatch(
         "unicodeobject",
         "box_str_constant",
     ]);
-    let mut regs_i = vec![tc.const_int(symbolic)];
+    let regs_i = vec![tc.const_int(symbolic)];
     let (arg, expected_ptr) = match arg_kind {
         SymbolicBoxStrArg::InternedStr => {
             let obj = pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(
@@ -10770,7 +10770,7 @@ fn run_symbolic_box_str_dispatch(
         }
         SymbolicBoxStrArg::NonConstant => (OpRef::input_arg_ref(0), None),
     };
-    let mut regs_r = vec![arg, OpRef::NONE];
+    let regs_r = vec![arg, OpRef::NONE];
     let descr_pool = vec![make_call_descr(
         31,
         vec![Type::Ref],
@@ -10923,8 +10923,8 @@ fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
         .expect("`residual_call_r_r/iRd>r` must be in insns table");
     let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 1);
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_refs(&mut tc, 1);
+    let regs_r = distinct_const_refs(&mut tc, 4);
     let elidable_descr = call_descr_with_effect(7, majit_ir::ExtraEffect::ElidableCannotRaise);
     let descr_pool = vec![elidable_descr.clone()];
     let frame_done_descr = done_descr_ref_for_tests();
@@ -11018,8 +11018,8 @@ fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
         majit_ir::ExtraEffect::ElidableOrMemoryError,
     );
     let recorded = tc.record_op_with_descr(majit_ir::OpCode::CallPureI, &allboxes, descr.clone());
-    let mut regs_i: Vec<OpRef> = Vec::new();
-    let mut regs_r: Vec<OpRef> = Vec::new();
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -11098,8 +11098,8 @@ fn may_force_call_i_fixture(tc: &mut TraceCtx) -> ([OpRef; 3], DescrRef, OpRef) 
 fn authoritative_walker_executes_may_force_call_and_stamps_result() {
     let mut tc = fresh_trace_ctx();
     let (allboxes, descr, recorded) = may_force_call_i_fixture(&mut tc);
-    let mut regs_i: Vec<OpRef> = Vec::new();
-    let mut regs_r: Vec<OpRef> = Vec::new();
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
     let call_descr = descr.as_call_descr().expect("CallI descr");
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -11165,8 +11165,8 @@ fn authoritative_walker_executes_may_force_call_and_stamps_result() {
 fn non_authoritative_walker_does_not_execute_may_force_call() {
     let mut tc = fresh_trace_ctx();
     let (allboxes, descr, recorded) = may_force_call_i_fixture(&mut tc);
-    let mut regs_i: Vec<OpRef> = Vec::new();
-    let mut regs_r: Vec<OpRef> = Vec::new();
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
     let call_descr = descr.as_call_descr().expect("CallI descr");
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -11246,8 +11246,8 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
     let descr = make_call_descr(6, vec![], Type::Int, majit_ir::ExtraEffect::CanRaise);
     let recorded =
         tc.record_op_with_descr(majit_ir::OpCode::CallMayForceI, &allboxes, descr.clone());
-    let mut regs_i: Vec<OpRef> = Vec::new();
-    let mut regs_r: Vec<OpRef> = Vec::new();
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
     let call_descr = descr.as_call_descr().expect("CallI descr");
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -11358,8 +11358,8 @@ fn may_force_with_active_vable_executes_and_clears_token() {
     let mut vable_buf = vec![0u8; 65536];
     bind_fake_vable(&mut tc, &mut vable_buf);
     let (allboxes, descr, recorded) = may_force_call_i_fixture(&mut tc);
-    let mut regs_i: Vec<OpRef> = Vec::new();
-    let mut regs_r: Vec<OpRef> = Vec::new();
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
     let call_descr = descr.as_call_descr().expect("CallI descr");
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -11468,8 +11468,8 @@ fn may_force_vable_escape_surfaces_typed_abort() {
     );
     let recorded =
         tc.record_op_with_descr(majit_ir::OpCode::CallMayForceI, &allboxes, descr.clone());
-    let mut regs_i: Vec<OpRef> = Vec::new();
-    let mut regs_r: Vec<OpRef> = Vec::new();
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
     let call_descr = descr.as_call_descr().expect("CallI descr");
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -11573,8 +11573,8 @@ fn run_not_in_trace(
         majit_ir::OopSpecIndex::NotInTrace,
     );
     let call_descr = descr.as_call_descr().expect("CallDescr");
-    let mut regs_i: Vec<OpRef> = Vec::new();
-    let mut regs_r: Vec<OpRef> = Vec::new();
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
     let session = std::cell::RefCell::new(WalkSession::default());
     NOT_IN_TRACE_CALLS.with(|c| c.set(0));
     let ops_before = tc.ops().len();
@@ -11705,8 +11705,8 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
         .expect("`residual_call_r_r/iRd>r` must be in insns table");
     let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 1);
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_refs(&mut tc, 1);
+    let regs_r = distinct_const_refs(&mut tc, 4);
     let force_virtual_descr = call_descr_with_oopspec(
         42,
         majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
@@ -11773,8 +11773,8 @@ fn residual_call_r_r_with_elidable_can_raise_records_callpurer_plus_guard() {
         .expect("`residual_call_r_r/iRd>r` must be in insns table");
     let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 1);
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_refs(&mut tc, 1);
+    let regs_r = distinct_const_refs(&mut tc, 4);
     let elidable_descr = call_descr_with_effect(8, majit_ir::ExtraEffect::ElidableCanRaise);
     let descr_pool = vec![elidable_descr.clone()];
     let frame_done_descr = done_descr_ref_for_tests();
@@ -11850,8 +11850,8 @@ fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
         .expect("`residual_call_r_r/iRd>r` must be in insns table");
     let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 1);
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_refs(&mut tc, 1);
+    let regs_r = distinct_const_refs(&mut tc, 4);
     let nothrow_descr = call_descr_with_effect(9, majit_ir::ExtraEffect::CannotRaise);
     let descr_pool = vec![nothrow_descr.clone()];
     let frame_done_descr = done_descr_ref_for_tests();
@@ -11931,8 +11931,8 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
     // funcptr=regs_i[0], no R args, descr=0, dst=3.
     let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x03];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 1);
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 1);
+    let regs_r = distinct_const_refs(&mut tc, 8);
     let dst_pre = regs_r[3];
     let descr_pool = vec![make_call_descr(
         1,
@@ -12020,8 +12020,8 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
     // funcptr=i[0], 0 i-args, 0 r-args, descr=0, dst=2.
     let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 1);
-    let mut regs_r = distinct_const_refs(&mut tc, 6);
+    let regs_i = distinct_const_refs(&mut tc, 1);
+    let regs_r = distinct_const_refs(&mut tc, 6);
     let dst_pre = regs_r[2];
     let descr_pool = vec![make_call_descr(
         1,
@@ -12109,7 +12109,7 @@ fn residual_call_r_r_with_out_of_range_dst_register_surfaces_typed_error() {
         .expect("`residual_call_r_r/iRd>r` must be in insns table");
     let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x07]; // dst=7
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 1);
+    let regs_i = distinct_const_refs(&mut tc, 1);
     // CallDescr required so the walker reaches the dst writeback
     // path (RPython do_residual_call invariant).
     let descr_pool = vec![make_call_descr(
@@ -12183,7 +12183,7 @@ fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
     // descr_index=5, descr_refs.len()=2 → OOR
     let code = [residual_byte, 0x00, 0x00, 0x05, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 1);
+    let regs_i = distinct_const_refs(&mut tc, 1);
     let descr_pool = vec![make_fail_descr(1), make_fail_descr(1)];
     let frame_done_descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -12267,8 +12267,8 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
         0x03, // dst i-reg = 3
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 8);
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
     let funcptr_expected = regs_i[2];
     let arg0_expected = regs_r[4];
     let arg1_expected = regs_r[7];
@@ -12389,8 +12389,8 @@ fn residual_call_r_i_with_elidable_cannot_raise_records_callpurei_no_guard() {
         .expect("`residual_call_r_i/iRd>i` must be in insns table");
     let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 4);
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_refs(&mut tc, 4);
+    let regs_r = distinct_const_refs(&mut tc, 4);
     let elidable_descr = call_descr_with_effect(7, majit_ir::ExtraEffect::ElidableCannotRaise);
     let descr_pool = vec![elidable_descr.clone()];
     let frame_done_descr = done_descr_ref_for_tests();
@@ -12483,8 +12483,8 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
         0x00, // dst r-reg = 0
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 8);
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
     let funcptr_expected = regs_i[2];
     let iarg0_expected = regs_i[5];
     let iarg1_expected = regs_i[6];
@@ -12636,8 +12636,8 @@ fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
         0x00, // dst r-reg = 0
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 8);
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
     let funcptr = regs_i[2];
     let i0 = regs_i[5];
     let i1 = regs_i[6];
@@ -12727,8 +12727,8 @@ fn residual_call_descr_not_call_descr_surfaces_typed_error() {
         .expect("`residual_call_r_r/iRd>r` must be in insns table");
     let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 1);
-    let mut regs_r = distinct_const_refs(&mut tc, 1);
+    let regs_i = distinct_const_refs(&mut tc, 1);
+    let regs_r = distinct_const_refs(&mut tc, 1);
     let descr_pool = vec![make_fail_descr(7)];
     let frame_done_descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -12794,7 +12794,7 @@ fn residual_call_r_r_with_out_of_range_arg_register_surfaces_typed_error() {
     // varlen=1, arg=9 (registers_r is empty) → OOR
     let code = [residual_byte, 0x00, 0x01, 0x09, 0x00, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 1);
+    let regs_i = distinct_const_refs(&mut tc, 1);
     let descr_pool = vec![make_fail_descr(1)];
     let frame_done_descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -12881,8 +12881,8 @@ fn walk_return_value_helper_terminates_at_first_ref_return() {
     // from the sub-walk, not a `regs_r` constant. The assertion
     // therefore checks the recorded Finish's args against the
     // post-recursion register state, not a precomputed constant.
-    let mut regs_r = distinct_const_refs(&mut tc, 256);
-    let mut regs_i = distinct_const_refs(&mut tc, 256);
+    let regs_r = distinct_const_refs(&mut tc, 256);
+    let regs_i = distinct_const_refs(&mut tc, 256);
     let pool_len = crate::jitcode_runtime::all_descrs().len();
     let descr_pool = descr_pool_with_jitcode_adapters(pool_len);
     let ops_before = tc.num_ops();
@@ -12997,8 +12997,8 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
     // Generously sized banks so any byte the codewriter emits is
     // in-range. 256 is the maximum register index a 1-byte slot
     // can address.
-    let mut regs_r = distinct_const_refs(&mut tc, 256);
-    let mut regs_i = distinct_const_refs(&mut tc, 256);
+    let regs_r = distinct_const_refs(&mut tc, 256);
+    let regs_i = distinct_const_refs(&mut tc, 256);
     // Descr pool: slot at each `BhDescr::JitCode` index in
     // `all_descrs()` is wrapped in a `TestJitCodeDescr` adapter so
     // `inline_call_r_r/dR>r` can resolve `as_jitcode_descr()`.
@@ -13126,7 +13126,7 @@ fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
             void_ret, // caller terminates
         ];
         let mut tc = fresh_trace_ctx();
-        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        let regs_r = distinct_const_refs(&mut tc, 4);
         // One recorded op against a zero limit: the walk is over budget before
         // its first step, so whichever frame owns the check aborts immediately.
         tc.record_op(majit_ir::OpCode::PtrEq, &[]);
@@ -13237,7 +13237,7 @@ fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
     // R-list = [r0, r1] but callee has only 1 slot.
     let caller_code = [inline_byte, 0x05, 0x00, 0x02, 0x00, 0x01, 0x00];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_r = distinct_const_refs(&mut tc, 4);
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[5] = make_jitcode_descr(5);
@@ -13341,7 +13341,7 @@ fn inline_call_r_v_accepts_void_returning_callee() {
         void_ret, // caller terminates
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_r = distinct_const_refs(&mut tc, 4);
     let stale_exc = regs_r[0];
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
@@ -13440,7 +13440,7 @@ fn inline_call_r_v_rejects_non_void_returning_callee() {
         0x00, // R: len=1, arg=r0
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_r = distinct_const_refs(&mut tc, 4);
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
@@ -13531,8 +13531,8 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
         void_ret, // caller terminates
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
-    let mut regs_i = distinct_const_refs(&mut tc, 4);
+    let regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_refs(&mut tc, 4);
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
@@ -13621,8 +13621,8 @@ fn inline_call_ir_v_rejects_non_void_returning_callee() {
         0x00, // R: len=1, arg=r0
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
-    let mut regs_i = distinct_const_refs(&mut tc, 4);
+    let regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_refs(&mut tc, 4);
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
@@ -13715,9 +13715,9 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
         void_ret, // caller terminates
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
-    let mut regs_i = distinct_const_refs(&mut tc, 4);
-    let mut regs_f = distinct_const_refs(&mut tc, 4);
+    let regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_refs(&mut tc, 4);
+    let regs_f = distinct_const_refs(&mut tc, 4);
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
@@ -13808,9 +13808,9 @@ fn inline_call_irf_v_rejects_non_void_returning_callee() {
         0x00, // F
     ];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
-    let mut regs_i = distinct_const_refs(&mut tc, 4);
-    let mut regs_f = distinct_const_refs(&mut tc, 4);
+    let regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_refs(&mut tc, 4);
+    let regs_f = distinct_const_refs(&mut tc, 4);
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
@@ -13888,8 +13888,8 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
     // Operand layout `rd>i`: 1B r-reg(2) + 2B descr-index(LE 1) + 1B dst(5).
     let code = [byte, 0x02, 0x01, 0x00, 0x05];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
-    let mut regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
     let obj = regs_r[2];
     let dst_pre = regs_i[5];
     let descr = field_descr_with_index(1);
@@ -13985,8 +13985,8 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
         .expect("`getfield_gc_i/rd>i` must be in insns table");
     let code = [byte, 0x02, 0x01, 0x00, 0x05];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
-    let mut regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
     let obj = regs_r[2];
     let descr = field_descr_with_index(1);
     let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
@@ -14064,7 +14064,7 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
         .expect("`getfield_gc_r/rd>r` must be in insns table");
     let code = [byte, 0x02, 0x01, 0x00, 0x06];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
     let obj = regs_r[2];
     let dst_pre = regs_r[6];
     // Use a Ref-typed field descr — sanity-check that the walker
@@ -14222,8 +14222,8 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
     // Operand layout `rd>i`: 1B r-reg(2) + 2B descr-index(LE 1) + 1B dst(5).
     let code = [byte, 0x02, 0x01, 0x00, 0x05];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
-    let mut regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
     let obj = regs_r[2];
     let dst_pre = regs_i[5];
     let descr = field_descr_with_index(1);
@@ -14323,8 +14323,8 @@ fn setfield_vable_i_routes_through_metainterp_records_setfield_gc_fallback() {
     // Operand layout `rid`: 1B r-reg(2) + 1B i-reg(3) + 2B descr-index(LE 1).
     let code = [byte, 0x02, 0x03, 0x01, 0x00];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
-    let mut regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
     let obj = regs_r[2];
     let value = regs_i[3];
     let descr = field_descr_with_index(1);
@@ -14412,8 +14412,8 @@ fn setfield_gc_i_redundant_write_skips_recording() {
         .expect("`setfield_gc_i/rid` must be in insns table");
     let code = [byte, 0x02, 0x03, 0x01, 0x00];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
-    let mut regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
     let obj = regs_r[2];
     let valuebox = regs_i[3];
     let descr = field_descr_with_index(1);
@@ -14483,8 +14483,8 @@ fn setfield_gc_i_fresh_write_records_op_and_caches_value() {
         .expect("`setfield_gc_i/rid` must be in insns table");
     let code = [byte, 0x02, 0x03, 0x01, 0x00];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
-    let mut regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
     let obj = regs_r[2];
     let valuebox = regs_i[3];
     let descr = field_descr_with_index(1);
@@ -14573,7 +14573,7 @@ fn setfield_gc_r_records_setfieldgc_with_ref_valuebox() {
         .expect("`setfield_gc_r/rrd` must be in insns table");
     let code = [byte, 0x02, 0x05, 0x01, 0x00];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
     let obj = regs_r[2];
     let valuebox = regs_r[5];
     let descr: DescrRef = std::sync::Arc::new(majit_ir::SimpleFieldDescr::new(
@@ -14655,8 +14655,8 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
     // 2B descr(LE 1) + 1B r-dst(5).
     let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
-    let mut regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
     let array = regs_r[2];
     let index = regs_i[3];
     let dst_pre = regs_r[5];
@@ -14895,8 +14895,8 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
         .expect("`getarrayitem_gc_r/rid>r` must be in insns table");
     let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
-    let mut regs_i = distinct_const_ints(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_ints(&mut tc, 8);
     let array = regs_r[2];
     let index = regs_i[3];
     let descr = field_descr_with_index(1);
@@ -14973,8 +14973,8 @@ fn setarrayitem_gc_r_records_setarrayitemgc_with_three_args() {
     // 1B r-reg(6) + 2B descr(LE 1).
     let code = [byte, 0x02, 0x04, 0x06, 0x01, 0x00];
     let mut tc = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
-    let mut regs_i = distinct_const_ints(&mut tc, 8);
+    let regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_ints(&mut tc, 8);
     let array = regs_r[2];
     let index = regs_i[4];
     let value = regs_r[6];
@@ -15470,8 +15470,8 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     let pycode = tc.const_ref(0x1_0000); // gr[0] = PyCode ptr
     let red0 = tc.const_ref(0x2_0000); // rr[0]
     let red1 = tc.const_ref(0x3_0000); // rr[1]
-    let mut regs_i = vec![next_instr];
-    let mut regs_r = vec![pycode, red0, red1];
+    let regs_i = vec![next_instr];
+    let regs_r = vec![pycode, red0, red1];
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -15559,7 +15559,7 @@ fn loop_header_stamps_seen_flag() {
     let code = [lh_byte, 0x00]; // i: register slot 0 holds the jdindex
     let mut tc = fresh_trace_ctx();
     let jdindex = tc.const_int(0);
-    let mut regs_i = vec![jdindex];
+    let regs_i = vec![jdindex];
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -15641,8 +15641,8 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
     let unused = tc.const_int(99);
     let jdindex = tc.const_int(0);
     let pycode = tc.const_ref(pycode_ptr as i64);
-    let mut regs_i = [next_instr, unused, jdindex];
-    let mut regs_r = [pycode];
+    let regs_i = [next_instr, unused, jdindex];
+    let regs_r = [pycode];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -15723,8 +15723,8 @@ fn jit_merge_point_unresolved_green_key_fails_loud() {
     ];
     let mut tc = fresh_trace_ctx();
     // i0 is a non-constant input arg → no concrete next_instr.
-    let mut regs_i = vec![OpRef::input_arg_int(0)];
-    let mut regs_r = vec![tc.const_ref(0x1_0000)];
+    let regs_i = vec![OpRef::input_arg_int(0)];
+    let regs_r = vec![tc.const_ref(0x1_0000)];
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -16123,7 +16123,7 @@ fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
     let dst_before = OpRef::input_arg_int(1);
     tc.set_opref_concrete(src, Value::Int(7));
     tc.set_opref_concrete(dst_before, Value::Int(99));
-    let mut regs_i = vec![src, dst_before];
+    let regs_i = vec![src, dst_before];
     let mut concrete_i = vec![ConcreteValue::Int(7), ConcreteValue::Int(99)];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -16326,8 +16326,8 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
     ];
     let int_call_descr = int_descr.as_call_descr().expect("CallPureI descr");
 
-    let mut regs_i: Vec<OpRef> = Vec::new();
-    let mut regs_r: Vec<OpRef> = Vec::new();
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -16453,8 +16453,8 @@ fn mayforce_null_ref_arg_exempts_the_unread_load_global_namespace() {
     let load_global = descr_for(majit_ir::RuntimeHelperKind::LoadGlobal);
     let untagged = descr_for(majit_ir::RuntimeHelperKind::None);
 
-    let mut regs_i: Vec<OpRef> = Vec::new();
-    let mut regs_r: Vec<OpRef> = Vec::new();
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
     let session = std::cell::RefCell::new(WalkSession::default());
     let wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -16554,8 +16554,8 @@ fn mayforce_null_ref_arg_exempts_the_with_except_start_receiver() {
     let with_except_start = descr_for(majit_ir::RuntimeHelperKind::WithExceptStart);
     let untagged = descr_for(majit_ir::RuntimeHelperKind::None);
 
-    let mut regs_i: Vec<OpRef> = Vec::new();
-    let mut regs_r: Vec<OpRef> = Vec::new();
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
     let session = std::cell::RefCell::new(WalkSession::default());
     let wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
