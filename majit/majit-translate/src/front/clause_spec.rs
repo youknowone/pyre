@@ -117,7 +117,7 @@ pub(crate) fn decl_is_generic(fd: &FunDecl) -> bool {
             .and_then(Value::as_array)
             .is_some_and(|items| !items.is_empty())
     };
-    nonempty("types") || nonempty("trait_clauses")
+    nonempty("types") || nonempty("trait_clauses") || nonempty("const_generics")
 }
 
 /// `generics.trait_refs` when every ref is resolved (no `Clause`),
@@ -255,8 +255,11 @@ pub(crate) fn substituted_unstructured(
     let raw = fd.body.as_ref()?.get();
     let mut value: Value = serde_json::from_str(raw).ok()?;
     let body = value.get_mut("Unstructured")?;
-    substitute_clauses(body, llbc, trait_refs);
+    // Type variables first. `subst_vars` replaces a wrapper with a plain
+    // copy of its body; doing that after the clause pass would restore
+    // the shared dedup body and put the `Clause` back.
     substitute_type_vars(body, llbc, types, const_generics);
+    substitute_clauses(body, llbc, trait_refs);
     #[derive(Deserialize)]
     struct Proj {
         #[serde(rename = "Unstructured")]
@@ -297,8 +300,17 @@ fn impl_method_fn_id(llbc: &Llbc, impl_id: u64, decl_id: u64, method_idx: u64) -
         .get("methods")?
         .as_array()?;
     for method in methods {
-        let kind = method.get("kind")?.get("TraitMethod")?.as_array()?;
-        if kind.first()?.as_u64()? == decl_id {
+        let Some(kind) = method
+            .get("kind")
+            .and_then(|kind| kind.get("TraitMethod"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        let Some(id) = kind.first().and_then(Value::as_u64) else {
+            continue;
+        };
+        if id == decl_id {
             return method.get("skip_binder")?.get("id")?.as_u64();
         }
     }
@@ -394,12 +406,26 @@ fn clause_index(v: &Value, llbc: &Llbc) -> Option<usize> {
 }
 
 fn mentions_own_clause(v: &Value, llbc: &Llbc) -> bool {
+    mentions_own_clause_at(v, llbc, 0)
+}
+
+fn mentions_own_clause_at(v: &Value, llbc: &Llbc, depth: usize) -> bool {
+    if depth > 64 {
+        return false;
+    }
     if clause_index(v, llbc).is_some() {
         return true;
     }
+    if let Some(body) = indirect_body(v, llbc) {
+        return mentions_own_clause_at(&body, llbc, depth + 1);
+    }
     match v {
-        Value::Array(items) => items.iter().any(|item| mentions_own_clause(item, llbc)),
-        Value::Object(map) => map.values().any(|item| mentions_own_clause(item, llbc)),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| mentions_own_clause_at(item, llbc, depth + 1)),
+        Value::Object(map) => map
+            .values()
+            .any(|item| mentions_own_clause_at(item, llbc, depth + 1)),
         _ => false,
     }
 }
@@ -566,24 +592,52 @@ fn indirect_body(v: &Value, llbc: &Llbc) -> Option<Value> {
 }
 
 fn substitute_clauses(v: &mut Value, llbc: &Llbc, trait_refs: &[Value]) {
+    substitute_clauses_at(v, llbc, trait_refs, 0);
+}
+
+/// Same shape as [`subst_vars`]: a depth-0 `Clause` is replaced in place;
+/// a `Deduplicated` / `HashConsedValue` wrapper whose resolved body
+/// mentions one is replaced by a plain copy of that body (the shared
+/// dedup table is not written) and the copy is walked. Anything else is
+/// walked through its children.
+fn substitute_clauses_at(v: &mut Value, llbc: &Llbc, trait_refs: &[Value], depth: usize) {
+    if depth > 64 {
+        return;
+    }
     if let Some(index) = clause_index(v, llbc)
         && let Some(replacement) = trait_refs.get(index)
     {
         *v = replacement.clone();
         return;
     }
+    if let Some(mut plain) = indirect_body_with_clause(v, llbc) {
+        substitute_clauses_at(&mut plain, llbc, trait_refs, depth + 1);
+        *v = plain;
+        return;
+    }
     match v {
         Value::Array(items) => {
             for item in items {
-                substitute_clauses(item, llbc, trait_refs);
+                substitute_clauses_at(item, llbc, trait_refs, depth + 1);
             }
         }
         Value::Object(map) => {
             for item in map.values_mut() {
-                substitute_clauses(item, llbc, trait_refs);
+                substitute_clauses_at(item, llbc, trait_refs, depth + 1);
             }
         }
         _ => {}
+    }
+}
+
+/// Resolved body of a dedup wrapper when that body mentions a depth-0
+/// `Clause`. `None` when `v` is not a wrapper or the body has no such clause.
+fn indirect_body_with_clause(v: &Value, llbc: &Llbc) -> Option<Value> {
+    let body = indirect_body(v, llbc)?;
+    if mentions_own_clause(&body, llbc) {
+        Some(body)
+    } else {
+        None
     }
 }
 
@@ -1228,5 +1282,135 @@ mod tests {
             spec_leaf("f", 7, &bare, &llbc),
             spec_leaf("f", 7, &reference, &llbc)
         );
+    }
+
+    /// `fn f<const N: usize>()` is generic even with no type params or clauses,
+    /// so `f::<4>` and `f::<8>` are two spec copies.
+    #[test]
+    fn const_only_generic_is_specialized() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["f", 0]}],
+                        "span": span,
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {"is_unsafe": false, "inputs": [], "output": {"Literal": {"Int": "Usize"}}},
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [{"index": 0, "name": "N", "ty": {"Literal": "Usize"}}],
+                        "trait_clauses": []
+                    },
+                    "body": null
+                }],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        let fd = llbc.fn_by_id(0).expect("f");
+        assert!(decl_is_generic(fd));
+        let generics = |n: &str| json!({"regions": [], "types": [], "const_generics": [usize_const(n)], "trait_refs": []});
+        assert_ne!(
+            spec_leaf("f", 0, &generics("4"), &llbc),
+            spec_leaf("f", 0, &generics("8"), &llbc)
+        );
+    }
+
+    /// A wrapper whose shared body holds a depth-0 `TypeVar` and a depth-0
+    /// `Clause` is substituted in the copy. The dedup table stays shared.
+    #[test]
+    fn clause_subst_follows_dedup_and_hash_cons_without_writing_the_table() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let generics = json!({
+            "regions": [],
+            "types": [{"TypeVar": {"Bound": [0, 0]}}],
+            "const_generics": [],
+            "trait_refs": [{"kind": {"Clause": {"Bound": [0, 0]}}}]
+        });
+        let i64_ty = json!({"Literal": {"Int": "I64"}});
+        let impl_ref = json!({"kind": {"TraitImpl": {"id": 0, "generics": {"regions": [], "types": [i64_ty], "const_generics": [], "trait_refs": []}}}});
+        let body = json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": {"Deduplicated": 11}},
+                        {"index": 1, "name": null, "span": span, "ty": {"HashConsedValue": [11, generics]}}
+                    ]
+                },
+                "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}}]
+            }
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["f", 0]}],
+                        "span": span,
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {"is_unsafe": false, "inputs": [], "output": {"HashConsedValue": [11, generics]}},
+                    "body": body
+                }],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        let shared = llbc.dedup_body(11).expect("dedup 11").clone();
+        assert!(mentions_own_clause(&shared, &llbc));
+        assert!(contains_depth0_var(&shared, &llbc, 0));
+        let fd = llbc.fn_by_id(0).expect("f");
+        let copied =
+            substituted_unstructured(fd, &llbc, &[impl_ref.clone()], &[i64_ty.clone()], &[])
+                .expect("substituted body");
+        for local in &copied.locals.locals {
+            let majit_charon_reader::ullbc::TyRef::Other(ty) = &local.ty else {
+                panic!("wrapper survived in {:?}", local.ty);
+            };
+            assert!(
+                !value_has_depth0_type_var(ty) && !value_has_depth0_clause(ty),
+                "depth-0 var or clause survived: {ty}"
+            );
+        }
+        assert_eq!(llbc.dedup_body(11), Some(&shared));
+        assert!(value_has_depth0_type_var(&shared) && value_has_depth0_clause(&shared));
+    }
+
+    fn value_has_depth0_type_var(v: &Value) -> bool {
+        if type_var_index(v).is_some() {
+            return true;
+        }
+        match v {
+            Value::Array(items) => items.iter().any(value_has_depth0_type_var),
+            Value::Object(map) => map.values().any(value_has_depth0_type_var),
+            _ => false,
+        }
+    }
+
+    fn value_has_depth0_clause(v: &Value) -> bool {
+        if v.pointer("/kind/Clause/Bound/0").and_then(Value::as_u64) == Some(0) {
+            return true;
+        }
+        match v {
+            Value::Array(items) => items.iter().any(value_has_depth0_clause),
+            Value::Object(map) => map.values().any(value_has_depth0_clause),
+            _ => false,
+        }
     }
 }
