@@ -5813,19 +5813,19 @@ pub(crate) fn flush_known_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -
 /// Write one local when its concrete value is a real object.
 ///
 /// `Value::Void` and `Ref(NO_CONCRETE)` are skipped: boxing either would
-/// store a null or a sentinel over the slot.
-pub(crate) fn store_frame_local_value(frame: usize, abs: usize, value: &Value) -> bool {
+/// store a null or a sentinel over the slot.  Returns the frame's current
+/// address after the store (see [`store_boxed_frame_local`]); a caller that
+/// touches the frame again must use it instead of `frame`.
+pub(crate) fn store_frame_local_value(frame: usize, abs: usize, value: &Value) -> Option<usize> {
     if frame == 0 || matches!(value, Value::Void) {
-        return false;
+        return None;
     }
     if matches!(value, Value::Ref(gc) if *gc == majit_ir::GcRef::NO_CONCRETE) {
-        return false;
+        return None;
     }
-    let Some(nlocals) = concrete_nlocals(frame) else {
-        return false;
-    };
+    let nlocals = concrete_nlocals(frame)?;
     if abs >= nlocals {
-        return false;
+        return None;
     }
     let frame_ptr = frame as *const u8;
     let arr_ptr = unsafe {
@@ -5833,9 +5833,9 @@ pub(crate) fn store_frame_local_value(frame: usize, abs: usize, value: &Value) -
             as *const *mut pyre_object::FixedObjectArray)
     };
     if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() <= abs {
-        return false;
+        return None;
     }
-    store_boxed_frame_local(frame, abs, value).is_some()
+    store_boxed_frame_local(frame, abs, value)
 }
 
 /// Boxing an Int/Float local allocates. A nursery-resident frame moves in

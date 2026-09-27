@@ -1315,14 +1315,19 @@ pub(crate) fn walker_write_back_known_frame_locals<Sym: WalkSym>(
 /// `fast2locals` reads `locals_cells_stack_w[i]` for every varname. A shadow
 /// slot whose concrete half is `Void` still has a box; omitting it drops the
 /// name. Slots the shadow does not carry are read off this frame object.
+///
+/// Boxing an `Int`/`Float` slot allocates and can move a nursery frame, so
+/// each store continues from the address the previous one returned, and the
+/// frame's current address is returned to the caller.
 fn walker_publish_complete_frame_locals<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     frame_op: OpRef,
     concrete_frame: usize,
     source: &ReceiverTraceLocals,
-) {
+) -> usize {
+    let mut concrete_frame = concrete_frame;
     let Some(nlocals) = crate::state::concrete_nlocals(concrete_frame) else {
-        return;
+        return concrete_frame;
     };
     let info = ctx.trace_ctx.virtualizable_info().cloned();
     let mut unread: Vec<usize> = Vec::new();
@@ -1345,7 +1350,11 @@ fn walker_publish_complete_frame_locals<Sym: WalkSym>(
                         }
                         other => other,
                     };
-                    let _ = crate::state::store_frame_local_value(concrete_frame, slot, &concrete);
+                    if let Some(frame_now) =
+                        crate::state::store_frame_local_value(concrete_frame, slot, &concrete)
+                    {
+                        concrete_frame = frame_now;
+                    }
                     trace_slots.push((slot as i64, *opref));
                 }
                 _ => unread.push(slot),
@@ -1381,8 +1390,11 @@ fn walker_publish_complete_frame_locals<Sym: WalkSym>(
                         majit_ir::Value::Void => false,
                     };
                     if real {
-                        let _ =
-                            crate::state::store_frame_local_value(concrete_frame, slot, &concrete);
+                        if let Some(frame_now) =
+                            crate::state::store_frame_local_value(concrete_frame, slot, &concrete)
+                        {
+                            concrete_frame = frame_now;
+                        }
                         trace_slots.push((slot as i64, opref));
                     } else {
                         unread.push(slot);
@@ -1400,13 +1412,13 @@ fn walker_publish_complete_frame_locals<Sym: WalkSym>(
         unread.extend(0..nlocals);
     }
     if unread.is_empty() {
-        return;
+        return concrete_frame;
     }
     let Some(info) = info else {
-        return;
+        return concrete_frame;
     };
     if info.array_fields.is_empty() {
-        return;
+        return concrete_frame;
     }
     let field = info.array_pointer_field_descr(0);
     let adescr = info.array_item_descr(0);
@@ -1416,6 +1428,7 @@ fn walker_publish_complete_frame_locals<Sym: WalkSym>(
             .trace_ctx
             .read_gc_array_item_ref(array, slot as i64, adescr.clone());
     }
+    concrete_frame
 }
 
 /// The frame box and EXECUTING Python pc of a frame receiver the walk owns,
@@ -2397,7 +2410,8 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         let Some(source) = ctx.receiver_trace_locals(obj, concrete_addr) else {
             return Ok(None);
         };
-        walker_publish_complete_frame_locals(ctx, obj, concrete_addr, &source);
+        let concrete_obj = walker_publish_complete_frame_locals(ctx, obj, concrete_addr, &source)
+            as pyre_object::PyObjectRef;
         let concrete_proxy = pyre_interpreter::pyframe::frame_locals_proxy::new(concrete_obj);
         walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
         let proxy = ctx.trace_ctx.call_ref_typed_with_effect(
