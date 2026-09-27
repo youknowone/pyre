@@ -5266,6 +5266,62 @@ fn test_single_label_peeled_loop_validates() {
     assert!(!guards[0].is_finish);
 }
 
+/// Key 0 runs the preamble. Key `label ordinal + 1` enters that LABEL's
+/// resume loader and reads the args from `FRAME_SLOT_BASE`, skipping the
+/// preamble. `build_function`'s `br_table` and `front_target_dispatch_key`
+/// share that numbering.
+#[test]
+fn peeled_loop_dispatch_key_enters_the_label_not_the_preamble() {
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1000)],
+            OpRef::int_op(1),
+        ),
+        Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]),
+    ];
+    assert!(codegen::is_single_label_peeled(&ops));
+    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    validate_wasm(&bytes);
+
+    let frame = codegen::FrameGeometry::fixed();
+    assert_eq!(
+        execute_trace_at_key(&bytes, &[7], frame.dispatch_key_ofs, 0),
+        1007
+    );
+    assert_eq!(
+        execute_trace_at_key(&bytes, &[7], frame.dispatch_key_ofs, 1),
+        7
+    );
+}
+
+#[test]
+fn vec_guard_true_compiles() {
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let ops = vec![
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::input_arg_int(0), OpRef::const_int(10)],
+            OpRef::int_op(1),
+        ),
+        make_guard(
+            OpCode::VecGuardTrue,
+            &[OpRef::int_op(1)],
+            &[OpRef::input_arg_int(0)],
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 2);
+    assert_eq!(execute_simple_trace(&bytes, &[3]), 3);
+    assert_eq!(execute_simple_trace(&bytes, &[11]), 11);
+}
+
 /// A `LoadFromGcTable` placed inside the loop body is emitted inside the loop.
 ///
 /// `rewrite.py remove_constptr` caches one load per gc-table index,
@@ -8971,6 +9027,15 @@ fn same_as_and_load_effective_address_do_not_decline() {
 }
 
 fn execute_simple_trace(bytes: &[u8], inputs: &[i64]) -> i64 {
+    execute_trace_at_key(
+        bytes,
+        inputs,
+        codegen::FrameGeometry::fixed().dispatch_key_ofs,
+        0,
+    )
+}
+
+fn execute_trace_at_key(bytes: &[u8], inputs: &[i64], key_ofs: u64, dispatch_key: u32) -> i64 {
     let engine = Engine::default();
     let module = Module::new(&engine, bytes).expect("generated trace should compile");
     let mut store = Store::new(&engine, ());
@@ -8985,6 +9050,13 @@ fn execute_simple_trace(bytes: &[u8], inputs: &[i64]) -> i64 {
             )
             .unwrap();
     }
+    memory
+        .write(
+            &mut store,
+            key_ofs as usize,
+            &i64::from(dispatch_key).to_le_bytes(),
+        )
+        .unwrap();
     let mut linker = Linker::new(&engine);
     linker.define("env", "memory", memory).unwrap();
     let instance = linker

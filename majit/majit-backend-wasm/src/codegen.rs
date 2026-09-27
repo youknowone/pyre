@@ -6514,7 +6514,7 @@ fn build_function(
             }
 
             // ── Guards ──
-            OpCode::GuardTrue => {
+            OpCode::GuardTrue | OpCode::VecGuardTrue => {
                 emit_guard_true(
                     &mut sink,
                     constants,
@@ -6526,7 +6526,7 @@ fn build_function(
                 );
                 guard_idx += 1;
             }
-            OpCode::GuardFalse => {
+            OpCode::GuardFalse | OpCode::VecGuardFalse => {
                 emit_guard_false(
                     &mut sink,
                     constants,
@@ -10704,7 +10704,9 @@ fn next_op_can_accept_cc<'a>(
     if !matches!(
         next_op.opcode,
         OpCode::GuardTrue
+            | OpCode::VecGuardTrue
             | OpCode::GuardFalse
+            | OpCode::VecGuardFalse
             | OpCode::GuardIsnull
             | OpCode::GuardNonnull
             | OpCode::CondCallN
@@ -12221,12 +12223,18 @@ fn push_guard_failure_cond(
     kind: CondKind,
     guard_opcode: OpCode,
 ) {
-    if matches!(guard_opcode, OpCode::GuardFalse | OpCode::GuardIsnull) {
+    if matches!(
+        guard_opcode,
+        OpCode::GuardFalse | OpCode::VecGuardFalse | OpCode::GuardIsnull
+    ) {
         push_cond(sink, constants, value_types, op, kind);
         return;
     }
     debug_assert!(
-        matches!(guard_opcode, OpCode::GuardTrue | OpCode::GuardNonnull),
+        matches!(
+            guard_opcode,
+            OpCode::GuardTrue | OpCode::VecGuardTrue | OpCode::GuardNonnull
+        ),
         "fused guard must be a boolean or nullness test"
     );
     let inverse = match kind {

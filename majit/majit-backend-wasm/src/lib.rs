@@ -6542,6 +6542,25 @@ impl majit_backend::Backend for WasmBackend {
     }
 
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame {
+        // Key 0 is the peeled preamble. `execute_token_with_dispatch_key`
+        // is the same entry with a caller-supplied LABEL selector.
+        self.execute_token_with_dispatch_key(token, args, 0)
+    }
+
+    /// `Backend::execute_token_with_dispatch_key`. Key 0 runs the preamble.
+    /// Key `label_block_id + 1` is LABEL n: `stamp_and_publish_label_targets`
+    /// stores that ordinal in `LoopTargetDescr::label_block_id`, and
+    /// `build_function`'s entry `br_table` lands key `j + 1` on label j's
+    /// resume loader. The loader reads label arg i from `FRAME_SLOT_BASE + i*8`,
+    /// the same slots this entry already fills. An out-of-range key takes the
+    /// `br_table` default, which is the preamble — `compiler.rs`
+    /// `execute_with_inputs_at_dispatch_key` does the same with its jump table.
+    fn execute_token_with_dispatch_key(
+        &self,
+        token: &JitCellToken,
+        args: &[Value],
+        dispatch_key: u32,
+    ) -> DeadFrame {
         let compiled = token
             .compiled
             .get()
@@ -6559,7 +6578,7 @@ impl majit_backend::Backend for WasmBackend {
         let frame_size = (compiled.frame.frame_bytes as usize).div_ceil(8);
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = (frame_size, args);
+            let _ = (frame_size, args, dispatch_key);
             panic!("wasm backend execute_token requires a wasm host");
         }
         #[cfg(target_arch = "wasm32")]
@@ -6611,6 +6630,10 @@ impl majit_backend::Backend for WasmBackend {
                         Value::Void => 0,
                     };
                     unsafe { *((items_base + fsb + i * 8) as *mut i64) = v };
+                }
+                unsafe {
+                    *((items_base + compiled.frame.dispatch_key_ofs as usize) as *mut i64) =
+                        i64::from(dispatch_key);
                 }
 
                 let saved = majit_gc::shadow_stack::push_jf(jf_ref);
@@ -6671,6 +6694,10 @@ impl majit_backend::Backend for WasmBackend {
                 };
                 unsafe { *items.add(1 + i) = v };
             }
+            unsafe {
+                *((items as usize + compiled.frame.dispatch_key_ofs as usize) as *mut i64) =
+                    i64::from(dispatch_key);
+            }
             majit_gc::shadow_stack::register_libc_jitframe(jf as usize);
             let saved = majit_gc::shadow_stack::push_jf(GcRef(jf as usize));
             {
@@ -6705,6 +6732,10 @@ impl majit_backend::Backend for WasmBackend {
                 Some(owner),
             ))
         }
+    }
+
+    fn supports_dispatch_key_entry(&self) -> bool {
+        true
     }
 
     fn execute_token_ints(&self, token: &JitCellToken, args: &[i64]) -> DeadFrame {
