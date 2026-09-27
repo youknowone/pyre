@@ -165,8 +165,8 @@ fn weakref_obj_weak(obj: PyObjectRef) -> PyObjectRef {
 }
 
 #[inline]
-fn weakref_clear(obj: PyObjectRef) {
-    let slot = weakref_obj_weak(obj);
+fn weakref_clear(mut obj: PyObjectRef) {
+    let slot = pyre_object::with_roots!(obj => weakref_obj_weak(obj));
     if unsafe { pyre_object::weakref::is_gc_weakref_box(slot) } {
         unsafe { pyre_object::weakref::w_gc_weakref_box_clear(slot) };
     } else if unsafe { pyre_object::weakref::is_typed_weakref(obj) } {
@@ -584,7 +584,7 @@ fn enable_callbacks(self_lifeline: PyObjectRef) {
 ///     return w_ref
 /// ```
 pub fn get_or_make_weakref(
-    self_lifeline: PyObjectRef,
+    mut self_lifeline: PyObjectRef,
     w_subtype: PyObjectRef,
     w_obj: PyObjectRef,
 ) -> PyObjectRef {
@@ -599,17 +599,19 @@ pub fn get_or_make_weakref(
         if !cached.is_null() {
             return cached;
         }
-        let mut w_ref = W_Weakref_new(w_subtype, w_obj, PY_NULL);
+        let mut w_ref =
+            pyre_object::with_roots!(self_lifeline => W_Weakref_new(w_subtype, w_obj, PY_NULL));
         let _root = InstanceRoot::new(&mut w_ref);
-        let cached = pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_ref);
+        let cached = pyre_object::with_roots!(self_lifeline, w_ref => pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_ref));
         unsafe {
             pyre_object::weakref::w_weakref_lifeline_set_cached_weakref(self_lifeline, cached)
         };
         w_ref
     } else {
         // subclass: cannot cache
-        let w_ref = W_Weakref_new(w_subtype, w_obj, PY_NULL);
-        append_wref_to(self_lifeline, w_ref);
+        let mut w_ref =
+            pyre_object::with_roots!(self_lifeline => W_Weakref_new(w_subtype, w_obj, PY_NULL));
+        pyre_object::with_roots!(w_ref => append_wref_to(self_lifeline, w_ref));
         w_ref
     }
 }
@@ -631,7 +633,7 @@ pub fn get_or_make_weakref(
 ///     self.cached_proxy = weakref.ref(w_proxy)
 ///     return w_proxy
 /// ```
-pub fn get_or_make_proxy(self_lifeline: PyObjectRef, w_obj: PyObjectRef) -> PyObjectRef {
+pub fn get_or_make_proxy(mut self_lifeline: PyObjectRef, w_obj: PyObjectRef) -> PyObjectRef {
     // interp__weakref.py: cached_proxy is a weakref TO the W_Proxy /
     // W_CallableProxy; w_cached = self.cached_proxy() returns the proxy
     // or None.
@@ -641,17 +643,13 @@ pub fn get_or_make_proxy(self_lifeline: PyObjectRef, w_obj: PyObjectRef) -> PyOb
     if !cached.is_null() {
         return cached;
     }
-    let w_proxy = if is_callable(w_obj) {
-        W_CallableProxy_new(w_obj, PY_NULL)
+    let mut w_proxy = if is_callable(w_obj) {
+        pyre_object::with_roots!(self_lifeline => W_CallableProxy_new(w_obj, PY_NULL))
     } else {
-        W_Proxy_new(w_obj, PY_NULL)
+        pyre_object::with_roots!(self_lifeline => W_Proxy_new(w_obj, PY_NULL))
     };
-    unsafe {
-        pyre_object::weakref::w_weakref_lifeline_set_cached_proxy(
-            self_lifeline,
-            pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_proxy),
-        )
-    };
+    let cached = pyre_object::with_roots!(self_lifeline, w_proxy => pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_proxy));
+    unsafe { pyre_object::weakref::w_weakref_lifeline_set_cached_proxy(self_lifeline, cached) };
     w_proxy
 }
 
@@ -693,13 +691,14 @@ pub fn get_any_weakref(self_lifeline: PyObjectRef) -> PyObjectRef {
 ///     return w_ref
 /// ```
 pub fn make_weakref_with_callback(
-    self_lifeline: PyObjectRef,
+    mut self_lifeline: PyObjectRef,
     w_subtype: PyObjectRef,
     w_obj: PyObjectRef,
     w_callable: PyObjectRef,
 ) -> PyObjectRef {
-    let w_ref = W_Weakref_new(w_subtype, w_obj, w_callable);
-    append_wref_to(self_lifeline, w_ref);
+    let mut w_ref =
+        pyre_object::with_roots!(self_lifeline => W_Weakref_new(w_subtype, w_obj, w_callable));
+    pyre_object::with_roots!(self_lifeline, w_ref => append_wref_to(self_lifeline, w_ref));
     enable_callbacks(self_lifeline);
     w_ref
 }
@@ -719,16 +718,16 @@ pub fn make_weakref_with_callback(
 ///     return w_proxy
 /// ```
 pub fn make_proxy_with_callback(
-    self_lifeline: PyObjectRef,
+    mut self_lifeline: PyObjectRef,
     w_obj: PyObjectRef,
     w_callable: PyObjectRef,
 ) -> PyObjectRef {
-    let w_proxy = if is_callable(w_obj) {
-        W_CallableProxy_new(w_obj, w_callable)
+    let mut w_proxy = if is_callable(w_obj) {
+        pyre_object::with_roots!(self_lifeline => W_CallableProxy_new(w_obj, w_callable))
     } else {
-        W_Proxy_new(w_obj, w_callable)
+        pyre_object::with_roots!(self_lifeline => W_Proxy_new(w_obj, w_callable))
     };
-    append_wref_to(self_lifeline, w_proxy);
+    pyre_object::with_roots!(self_lifeline, w_proxy => append_wref_to(self_lifeline, w_proxy));
     enable_callbacks(self_lifeline);
     w_proxy
 }
@@ -793,34 +792,34 @@ pub fn W_Weakref_new(
 }
 
 #[allow(non_snake_case)]
-pub fn W_Proxy_new(w_obj: PyObjectRef, w_callable: PyObjectRef) -> PyObjectRef {
+pub fn W_Proxy_new(w_obj: PyObjectRef, mut w_callable: PyObjectRef) -> PyObjectRef {
     use pyre_object::objectobject::w_instance_new;
     let mut obj = w_instance_new(proxy_type());
     let _root = InstanceRoot::new(&mut obj);
-    let w_obj_weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_obj);
-    write_attr(obj, ATTR_W_OBJ_WEAK, w_obj_weak);
+    let w_obj_weak = pyre_object::with_roots!(obj, w_callable => pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_obj));
+    pyre_object::with_roots!(obj, w_callable => write_attr(obj, ATTR_W_OBJ_WEAK, w_obj_weak));
     let w_callable = if !w_callable.is_null() && !unsafe { pyre_object::is_none(w_callable) } {
         w_callable
     } else {
         pyre_object::w_none()
     };
-    write_attr(obj, ATTR_W_CALLABLE, w_callable);
+    pyre_object::with_roots!(obj => write_attr(obj, ATTR_W_CALLABLE, w_callable));
     obj
 }
 
 #[allow(non_snake_case)]
-pub fn W_CallableProxy_new(w_obj: PyObjectRef, w_callable: PyObjectRef) -> PyObjectRef {
+pub fn W_CallableProxy_new(w_obj: PyObjectRef, mut w_callable: PyObjectRef) -> PyObjectRef {
     use pyre_object::objectobject::w_instance_new;
     let mut obj = w_instance_new(callable_proxy_type());
     let _root = InstanceRoot::new(&mut obj);
-    let w_obj_weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_obj);
-    write_attr(obj, ATTR_W_OBJ_WEAK, w_obj_weak);
+    let w_obj_weak = pyre_object::with_roots!(obj, w_callable => pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_obj));
+    pyre_object::with_roots!(obj, w_callable => write_attr(obj, ATTR_W_OBJ_WEAK, w_obj_weak));
     let w_callable = if !w_callable.is_null() && !unsafe { pyre_object::is_none(w_callable) } {
         w_callable
     } else {
         pyre_object::w_none()
     };
-    write_attr(obj, ATTR_W_CALLABLE, w_callable);
+    pyre_object::with_roots!(obj => write_attr(obj, ATTR_W_CALLABLE, w_callable));
     obj
 }
 
@@ -1053,12 +1052,16 @@ pub fn descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 ///         w_res = space.not_(w_res)
 ///     return w_res
 /// ```
-fn compare(w_self: PyObjectRef, w_ref2: PyObjectRef, invert: bool) -> Result<PyObjectRef, PyError> {
+fn compare(
+    mut w_self: PyObjectRef,
+    mut w_ref2: PyObjectRef,
+    invert: bool,
+) -> Result<PyObjectRef, PyError> {
     if !is_w_weakref(w_ref2) {
         return Ok(pyre_object::w_not_implemented());
     }
-    let w_obj1 = dereference(w_self);
-    let w_obj2 = dereference(w_ref2);
+    let mut w_obj1 = pyre_object::with_roots!(w_ref2, w_self => dereference(w_self));
+    let w_obj2 = pyre_object::with_roots!(w_obj1, w_ref2, w_self => dereference(w_ref2));
     let w_res = if w_obj1.is_null()
         || unsafe { pyre_object::is_none(w_obj1) }
         || w_obj2.is_null()
@@ -1116,7 +1119,7 @@ pub fn remove_dead_weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError>
         .first()
         .copied()
         .ok_or_else(|| PyError::type_error("_remove_dead_weakref() missing dict argument"))?;
-    let key = args
+    let mut key = args
         .get(1)
         .copied()
         .ok_or_else(|| PyError::type_error("_remove_dead_weakref() missing key argument"))?;
@@ -1126,14 +1129,16 @@ pub fn remove_dead_weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError>
             crate::baseobjspace::object_functionstr_type_name(dict),
         )));
     }
-    let backing = crate::type_methods::resolve_dict_backing(dict);
+    let mut backing = crate::type_methods::resolve_dict_backing(dict);
     if backing.is_null() {
         return Err(PyError::type_error(format!(
             "_remove_dead_weakref() argument 1 must be dict, not {}",
             crate::baseobjspace::object_functionstr_type_name(dict),
         )));
     }
-    let Some(stored) = crate::baseobjspace::finditem(backing, key)? else {
+    let Some(stored) =
+        pyre_object::with_roots!(backing, key => crate::baseobjspace::finditem(backing, key))?
+    else {
         return Ok(pyre_object::w_none());
     };
     // app_weakref.py calls the retrieved value directly (`wr()`) rather than
@@ -1590,8 +1595,8 @@ macro_rules! proxy_unary {
 macro_rules! proxy_binary {
     ($name:ident, $space_op:path) => {
         pub fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-            let w_obj0 = force(args[0])?;
-            let w_obj1 = force(args[1])?;
+            let mut w_obj0 = force(args[0])?;
+            let w_obj1 = pyre_object::with_roots!(w_obj0 => force(args[1]))?;
             $space_op(w_obj0, w_obj1)
         }
     };
@@ -1603,8 +1608,8 @@ macro_rules! proxy_binary_reflected {
             // interp__weakref.py:382-385 — reflected wrappers swap the
             // operands before calling the space op:
             //   `code = code.replace("(w_obj0, w_obj1)", "(w_obj1, w_obj0)")`
-            let w_obj0 = force(args[0])?;
-            let w_obj1 = force(args[1])?;
+            let mut w_obj0 = force(args[0])?;
+            let w_obj1 = pyre_object::with_roots!(w_obj0 => force(args[1]))?;
             $space_op(w_obj1, w_obj0)
         }
     };
@@ -1660,9 +1665,9 @@ fn proxy_pow_modulus(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 pub fn proxy_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     proxy_pow_arity(args)?;
-    let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
-    let w_obj2 = proxy_pow_modulus(args)?;
+    let mut w_obj0 = force(args[0])?;
+    let mut w_obj1 = pyre_object::with_roots!(w_obj0 => force(args[1]))?;
+    let w_obj2 = pyre_object::with_roots!(w_obj0, w_obj1 => proxy_pow_modulus(args))?;
     let has_modulo = !w_obj2.is_null() && !unsafe { pyre_object::is_none(w_obj2) };
     if has_modulo {
         crate::baseobjspace::pow3(w_obj0, w_obj1, w_obj2)
@@ -1675,9 +1680,9 @@ pub fn proxy_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     proxy_pow_arity(args)?;
     // interp__weakref.py:382-385 — reflected wrapper swaps the first
     // two operands; the modulo argument keeps its slot.
-    let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
-    let w_obj2 = proxy_pow_modulus(args)?;
+    let mut w_obj0 = force(args[0])?;
+    let mut w_obj1 = pyre_object::with_roots!(w_obj0 => force(args[1]))?;
+    let w_obj2 = pyre_object::with_roots!(w_obj0, w_obj1 => proxy_pow_modulus(args))?;
     let has_modulo = !w_obj2.is_null() && !unsafe { pyre_object::is_none(w_obj2) };
     if has_modulo {
         crate::baseobjspace::pow3(w_obj1, w_obj0, w_obj2)
@@ -1705,8 +1710,8 @@ proxy_binary_reflected!(proxy_rmatmul, crate::baseobjspace::matmul);
 macro_rules! proxy_inplace {
     ($name:ident, $op:ident) => {
         pub fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-            let w_obj0 = force(args[0])?;
-            let w_obj1 = force(args[1])?;
+            let mut w_obj0 = force(args[0])?;
+            let w_obj1 = pyre_object::with_roots!(w_obj0 => force(args[1]))?;
             crate::opcode_ops::binary_value(w_obj0, w_obj1, crate::bytecode::BinaryOperator::$op)
         }
     };
@@ -1862,38 +1867,38 @@ pub fn proxy_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 // only one registered, and the wrapper dispatches via the matching
 // `CompareOp` variant.
 pub fn proxy_lt(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
+    let mut w_obj0 = force(args[0])?;
+    let w_obj1 = pyre_object::with_roots!(w_obj0 => force(args[1]))?;
     crate::baseobjspace::compare(w_obj0, w_obj1, crate::baseobjspace::CompareOp::Lt)
 }
 
 pub fn proxy_le(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
+    let mut w_obj0 = force(args[0])?;
+    let w_obj1 = pyre_object::with_roots!(w_obj0 => force(args[1]))?;
     crate::baseobjspace::compare(w_obj0, w_obj1, crate::baseobjspace::CompareOp::Le)
 }
 
 pub fn proxy_gt(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
+    let mut w_obj0 = force(args[0])?;
+    let w_obj1 = pyre_object::with_roots!(w_obj0 => force(args[1]))?;
     crate::baseobjspace::compare(w_obj0, w_obj1, crate::baseobjspace::CompareOp::Gt)
 }
 
 pub fn proxy_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
+    let mut w_obj0 = force(args[0])?;
+    let w_obj1 = pyre_object::with_roots!(w_obj0 => force(args[1]))?;
     crate::baseobjspace::compare(w_obj0, w_obj1, crate::baseobjspace::CompareOp::Ge)
 }
 
 pub fn proxy_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
+    let mut w_obj0 = force(args[0])?;
+    let w_obj1 = pyre_object::with_roots!(w_obj0 => force(args[1]))?;
     crate::baseobjspace::compare(w_obj0, w_obj1, crate::baseobjspace::CompareOp::Eq)
 }
 
 pub fn proxy_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
+    let mut w_obj0 = force(args[0])?;
+    let w_obj1 = pyre_object::with_roots!(w_obj0 => force(args[1]))?;
     crate::baseobjspace::compare(w_obj0, w_obj1, crate::baseobjspace::CompareOp::Ne)
 }
 
@@ -1921,15 +1926,15 @@ pub fn proxy_subclasscheck(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError>
 // (numeric fast path then forward + reverse `__divmod__`/`__rdivmod__`
 // with NotImplemented fallback).
 pub fn proxy_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
+    let mut w_obj0 = force(args[0])?;
+    let w_obj1 = pyre_object::with_roots!(w_obj0 => force(args[1]))?;
     crate::baseobjspace::divmod(w_obj0, w_obj1)
 }
 
 pub fn proxy_rdivmod(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // Reflected: swap operands per interp__weakref.py:382-385.
-    let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
+    let mut w_obj0 = force(args[0])?;
+    let w_obj1 = pyre_object::with_roots!(w_obj0 => force(args[1]))?;
     crate::baseobjspace::divmod(w_obj1, w_obj0)
 }
 

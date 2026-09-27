@@ -203,11 +203,11 @@ pub(crate) fn try_new_buffer(size: usize) -> Result<PyObjectRef, crate::PyError>
 }
 
 pub(crate) fn iobase_close(args: &[PyObjectRef]) -> crate::PyResult {
-    let self_obj = args
+    let mut self_obj = args
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("close() requires self"))?;
-    if iobase_internal_closed(self_obj) {
+    if pyre_object::with_roots!(self_obj => iobase_internal_closed(self_obj)) {
         return Ok(w_none());
     }
     let _roots = pyre_object::gc_roots::push_roots();
@@ -351,20 +351,20 @@ fn iobase_tell(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn iobase_enter(args: &[PyObjectRef]) -> crate::PyResult {
-    let self_obj = args
+    let mut self_obj = args
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("__enter__() requires self"))?;
-    iobase_check_closed(&[self_obj])?;
+    pyre_object::with_roots!(self_obj => iobase_check_closed(&[self_obj]))?;
     Ok(self_obj)
 }
 
 fn iobase_iter(args: &[PyObjectRef]) -> crate::PyResult {
-    let self_obj = args
+    let mut self_obj = args
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("__iter__() requires self"))?;
-    iobase_check_closed(&[self_obj])?;
+    pyre_object::with_roots!(self_obj => iobase_check_closed(&[self_obj]))?;
     Ok(self_obj)
 }
 
@@ -373,8 +373,8 @@ fn iobase_next(args: &[PyObjectRef]) -> crate::PyResult {
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("__next__() requires self"))?;
-    let line = call_method_result(self_obj, "readline", &[])?;
-    if crate::baseobjspace::len_w(line)? == 0 {
+    let mut line = call_method_result(self_obj, "readline", &[])?;
+    if pyre_object::with_roots!(line => crate::baseobjspace::len_w(line))? == 0 {
         Err(crate::PyError::stop_iteration())
     } else {
         Ok(line)
@@ -642,7 +642,7 @@ fn tag_io_instance_impl(
 }
 
 fn iobase_del(args: &[PyObjectRef]) -> crate::PyResult {
-    let Some(&self_obj) = args.first() else {
+    let Some(mut self_obj) = args.first().copied() else {
         return Ok(w_none());
     };
     // pypy/module/_io/interp_iobase.py `descr_del` and CPython 3.14
@@ -651,11 +651,14 @@ fn iobase_del(args: &[PyObjectRef]) -> crate::PyResult {
     // unusable and finalization stops quietly.  This check must not collapse
     // the error to `closed == false` and call close(), or tracing-GC latency
     // leaks a stale ValueError into a later `catch_unraisable_exception`.
-    let closed = match crate::baseobjspace::getattr_str(self_obj, "closed") {
-        Ok(value) => match crate::baseobjspace::is_true(value) {
-            Ok(closed) => closed,
-            Err(_) => return Ok(w_none()),
-        },
+    let closed = match pyre_object::with_roots!(self_obj => crate::baseobjspace::getattr_str(self_obj, "closed"))
+    {
+        Ok(value) => {
+            match pyre_object::with_roots!(self_obj => crate::baseobjspace::is_true(value)) {
+                Ok(closed) => closed,
+                Err(_) => return Ok(w_none()),
+            }
+        }
         Err(_) => return Ok(w_none()),
     };
     if !closed {
@@ -663,8 +666,12 @@ fn iobase_del(args: &[PyObjectRef]) -> crate::PyResult {
         // FileIO uses it to distinguish implicit-close warnings.  PyPy's
         // `_dealloc_warn_w` followed by `space.call_method(self, "close")`
         // supplies the same call order.
-        let _ = crate::baseobjspace::setattr_str(self_obj, "_finalizing", w_bool_from(true));
-        let _ = call_method_result(self_obj, "_dealloc_warn", &[self_obj]);
+        let _ = pyre_object::with_roots!(self_obj => crate::baseobjspace::setattr_str(
+            self_obj,
+            "_finalizing",
+            w_bool_from(true)
+        ));
+        let _ = pyre_object::with_roots!(self_obj => call_method_result(self_obj, "_dealloc_warn", &[self_obj]));
 
         // CPython 3.14 reports a real close failure via unraisablehook
         // (test_io.py:test_error_through_destructor).  UserDelAction owns that
@@ -701,7 +708,7 @@ fn iobase_isatty(args: &[PyObjectRef]) -> crate::PyResult {
 /// `write` method once for each line.  The iteration is deliberately lazy;
 /// no list snapshot is introduced.
 pub(crate) fn iobase_writelines(args: &[PyObjectRef]) -> crate::PyResult {
-    let self_obj = args
+    let mut self_obj = args
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("writelines() requires self"))?;
@@ -716,8 +723,8 @@ pub(crate) fn iobase_writelines(args: &[PyObjectRef]) -> crate::PyResult {
             args.len() - 1,
         )));
     }
-    let lines = args[1];
-    if io_closed(self_obj) {
+    let mut lines = args[1];
+    if pyre_object::with_roots!(lines, self_obj => io_closed(self_obj)) {
         return Err(crate::PyError::value_error("I/O operation on closed file."));
     }
 
@@ -760,7 +767,7 @@ fn iobase_convert_size(value: PyObjectRef) -> Result<i64, crate::PyError> {
 /// `interp_iobase.py:W_IOBase.readline_w` — backwards-compatible mixin over
 /// virtual `peek` and `read`, including the one-byte fallback.
 fn iobase_readline(args: &[PyObjectRef]) -> crate::PyResult {
-    let self_obj = args
+    let mut self_obj = args
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("readline() requires self"))?;
@@ -770,8 +777,9 @@ fn iobase_readline(args: &[PyObjectRef]) -> crate::PyResult {
             args.len().saturating_sub(1)
         )));
     }
-    let limit = iobase_convert_size(args.get(1).copied().unwrap_or(PY_NULL))?;
-    let peek = match crate::baseobjspace::getattr_str(self_obj, "peek") {
+    let limit = pyre_object::with_roots!(self_obj => iobase_convert_size(args.get(1).copied().unwrap_or(PY_NULL)))?;
+    let peek = match pyre_object::with_roots!(self_obj => crate::baseobjspace::getattr_str(self_obj, "peek"))
+    {
         Ok(method) => Some(method),
         Err(error) if error.kind == crate::PyErrorKind::AttributeError => None,
         Err(error) => return Err(error),
@@ -842,7 +850,7 @@ fn iobase_readline(args: &[PyObjectRef]) -> crate::PyResult {
 /// `interp_iobase.py:W_IOBase.readlines_w` — consume the stream iterator,
 /// stopping after the accumulated line lengths exceed a positive hint.
 pub(super) fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
-    let self_obj = args
+    let mut self_obj = args
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("readlines() requires self"))?;
@@ -852,7 +860,7 @@ pub(super) fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
             args.len().saturating_sub(1)
         )));
     }
-    let hint = iobase_convert_size(args.get(1).copied().unwrap_or(PY_NULL))?;
+    let hint = pyre_object::with_roots!(self_obj => iobase_convert_size(args.get(1).copied().unwrap_or(PY_NULL)))?;
     let iterator = crate::baseobjspace::iter(self_obj)?;
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
@@ -1121,7 +1129,7 @@ fn fileio_new(args: &[PyObjectRef]) -> crate::PyResult {
 /// one-shot `readinto` over a freshly allocated bytearray.  A negative or
 /// omitted size delegates to the virtual `readall` method.
 fn rawiobase_read(args: &[PyObjectRef]) -> crate::PyResult {
-    let self_obj = args
+    let mut self_obj = args
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("read() requires self"))?;
@@ -1134,7 +1142,11 @@ fn rawiobase_read(args: &[PyObjectRef]) -> crate::PyResult {
     let size = match args.get(1).copied() {
         None => -1,
         Some(value) if unsafe { pyre_object::is_none(value) } => -1,
-        Some(value) => crate::baseobjspace::int_w(crate::baseobjspace::space_index(value)?)?,
+        Some(value) => {
+            let index =
+                pyre_object::with_roots!(self_obj => crate::baseobjspace::space_index(value))?;
+            pyre_object::with_roots!(self_obj => crate::baseobjspace::int_w(index))?
+        }
     };
     if size < 0 {
         return call_method_result(self_obj, "readall", &[]);
@@ -1593,6 +1605,7 @@ crate::py_module! {
         },
     },
     extra_init: |ns| {
+        let mut ns = ns;
         // `Modules/_io/_iomodule.c`:
         //   UnsupportedOperation = class UnsupportedOperation(OSError, ValueError)
         // A real exception class so `raise`/`except` and io.py's
@@ -1605,11 +1618,11 @@ crate::py_module! {
                 Some(value_error) => &[os_error, value_error],
                 None => &[os_error],
             };
-        let unsupported = crate::builtins::make_exc_type_multi(
+        let unsupported = pyre_object::with_roots!(ns => crate::builtins::make_exc_type_multi(
             "io.UnsupportedOperation",
             crate::builtins::exc_os_error_new,
             bases,
-        );
+        ));
         UNSUPPORTED_OPERATION_TYPE.set(unsupported);
         crate::module_ns_store(ns, "UnsupportedOperation", unsupported);
 

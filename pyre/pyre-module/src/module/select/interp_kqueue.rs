@@ -92,7 +92,7 @@ impl W_Kqueue {
         &mut self,
         w_changelist: PyObjectRef,
         max_events: i64,
-        #[default(pyre_object::w_none())] w_timeout: PyObjectRef,
+        #[default(pyre_object::w_none())] mut w_timeout: PyObjectRef,
     ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         if self.kqfd < 0 {
             return Err(pyre_interpreter::PyError::value_error(
@@ -109,7 +109,7 @@ impl W_Kqueue {
         let mut changelist: Vec<host_kqueue::Event> = Vec::new();
         if !unsafe { pyre_object::is_none(w_changelist) } {
             // `interp_kqueue.py descr_control` — space.listview accepts any iterable.
-            let items = pyre_interpreter::baseobjspace::unpackiterable(w_changelist, -1)?;
+            let items = pyre_object::with_roots!(w_timeout => pyre_interpreter::baseobjspace::unpackiterable(w_changelist, -1))?;
             for item in items {
                 let ev = W_Kevent::from_obj(item).ok_or_else(|| {
                     pyre_interpreter::PyError::type_error(

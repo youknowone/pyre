@@ -1256,22 +1256,20 @@ impl<'a> MiniXmlParser<'a> {
 
     fn maybe_external_dtd(
         &self,
-        pubid: PyObjectRef,
-        sysid: PyObjectRef,
+        mut pubid: PyObjectRef,
+        mut sysid: PyObjectRef,
     ) -> Result<(), pyre_interpreter::PyError> {
-        let use_foreign =
-            pyre_interpreter::baseobjspace::getattr_str(self.parser, "_pyre_use_foreign_dtd")
-                .map(is_true_obj)
-                .unwrap_or(false);
-        let parses_external_subset =
-            get_parser_int(self.parser, "_pyre_param_entity_parsing", 0) != 0;
+        let use_foreign = pyre_object::with_roots!(pubid, sysid => pyre_interpreter::baseobjspace::getattr_str(self.parser, "_pyre_use_foreign_dtd"))
+            .map(is_true_obj)
+            .unwrap_or(false);
+        let parses_external_subset = pyre_object::with_roots!(pubid, sysid => get_parser_int(self.parser, "_pyre_param_entity_parsing", 0))
+            != 0;
         if (!use_foreign && (unsafe { is_none(sysid) } || !parses_external_subset))
             || self.suppress_current
         {
             return Ok(());
         }
-        let Ok(handler) =
-            pyre_interpreter::baseobjspace::getattr_str(self.parser, "ExternalEntityRefHandler")
+        let Ok(handler) = pyre_object::with_roots!(pubid, sysid => pyre_interpreter::baseobjspace::getattr_str(self.parser, "ExternalEntityRefHandler"))
         else {
             return Ok(());
         };
@@ -1396,8 +1394,11 @@ fn object_to_xml_string(
     }
 }
 
-fn decode_xml_bytes(parser: PyObjectRef, data: &[u8]) -> Result<String, pyre_interpreter::PyError> {
-    let enc = declared_or_forced_encoding(parser, data)?;
+fn decode_xml_bytes(
+    mut parser: PyObjectRef,
+    data: &[u8],
+) -> Result<String, pyre_interpreter::PyError> {
+    let enc = pyre_object::with_roots!(parser => declared_or_forced_encoding(parser, data))?;
     let normalized = normalize_encoding(&enc);
     pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
@@ -1689,12 +1690,11 @@ fn parse_impl(
 }
 
 fn call_foreign_dtd_handler(
-    parser: PyObjectRef,
-    pubid: PyObjectRef,
-    sysid: PyObjectRef,
+    mut parser: PyObjectRef,
+    mut pubid: PyObjectRef,
+    mut sysid: PyObjectRef,
 ) -> Result<(), pyre_interpreter::PyError> {
-    let Ok(handler) =
-        pyre_interpreter::baseobjspace::getattr_str(parser, "ExternalEntityRefHandler")
+    let Ok(handler) = pyre_object::with_roots!(parser, pubid, sysid => pyre_interpreter::baseobjspace::getattr_str(parser, "ExternalEntityRefHandler"))
     else {
         return Ok(());
     };
@@ -1724,13 +1724,13 @@ fn call_foreign_dtd_handler(
 }
 
 fn maybe_reject_amplification(
-    parser: PyObjectRef,
+    mut parser: PyObjectRef,
     input: &str,
 ) -> Result<(), pyre_interpreter::PyError> {
     if !input.contains("<!ENTITY row") {
         return Ok(());
     }
-    let threshold = get_parser_int(parser, "_pyre_billion_threshold", i64::MAX);
+    let threshold = pyre_object::with_roots!(parser => get_parser_int(parser, "_pyre_billion_threshold", i64::MAX));
     let max_one = pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_billion_max_is_one")
         .map(is_true_obj)
         .unwrap_or(false);
@@ -1779,7 +1779,7 @@ fn bool_slot_name(name: &str) -> bool {
     )
 }
 
-fn copy_parser_config(src: PyObjectRef, dst: PyObjectRef) {
+fn copy_parser_config(mut src: PyObjectRef, mut dst: PyObjectRef) {
     for name in [
         "buffer_text",
         "buffer_size",
@@ -1791,13 +1791,15 @@ fn copy_parser_config(src: PyObjectRef, dst: PyObjectRef) {
         "_pyre_forced_encoding",
         "_pyre_base",
     ] {
-        if let Ok(value) = pyre_interpreter::baseobjspace::getattr_str(src, name) {
-            pyre_interpreter::baseobjspace::setdictvalue_native(dst, name, value);
+        if let Ok(value) = pyre_object::with_roots!(dst, src => pyre_interpreter::baseobjspace::getattr_str(src, name))
+        {
+            pyre_object::with_roots!(dst, src => pyre_interpreter::baseobjspace::setdictvalue_native(dst, name, value));
         }
     }
     for h in HANDLER_NAMES {
-        if let Ok(value) = pyre_interpreter::baseobjspace::getattr_str(src, h) {
-            pyre_interpreter::baseobjspace::setdictvalue_native(dst, h, value);
+        if let Ok(value) = pyre_object::with_roots!(dst, src => pyre_interpreter::baseobjspace::getattr_str(src, h))
+        {
+            pyre_object::with_roots!(dst, src => pyre_interpreter::baseobjspace::setdictvalue_native(dst, h, value));
         }
     }
 }
@@ -1897,8 +1899,8 @@ mod xmlparser_class {
                 pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, "_pyre_reparse_deferral", w_bool_from(is_true_obj(flag)));
                 w_none()
             }
-            fn SetBillionLaughsAttackProtectionActivationThreshold(self_obj: PyObjectRef, threshold: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-                if pyre_interpreter::baseobjspace::getattr_str(self_obj, "_pyre_is_subparser").map(is_true_obj).unwrap_or(false) {
+            fn SetBillionLaughsAttackProtectionActivationThreshold(mut self_obj: PyObjectRef, mut threshold: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+                if pyre_object::with_roots!(self_obj, threshold => pyre_interpreter::baseobjspace::getattr_str(self_obj, "_pyre_is_subparser")).map(is_true_obj).unwrap_or(false) {
                     return Err(pyexpat_error("parser must be a root parser".to_string(), 0, 0, 0));
                 }
                 if unsafe { !is_int(threshold) } {
@@ -1910,8 +1912,8 @@ mod xmlparser_class {
                 pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, "_pyre_billion_threshold", threshold);
                 Ok(w_none())
             }
-            fn SetBillionLaughsAttackProtectionMaximumAmplification(self_obj: PyObjectRef, max_factor: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-                if pyre_interpreter::baseobjspace::getattr_str(self_obj, "_pyre_is_subparser").map(is_true_obj).unwrap_or(false) {
+            fn SetBillionLaughsAttackProtectionMaximumAmplification(mut self_obj: PyObjectRef, mut max_factor: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+                if pyre_object::with_roots!(max_factor, self_obj => pyre_interpreter::baseobjspace::getattr_str(self_obj, "_pyre_is_subparser")).map(is_true_obj).unwrap_or(false) {
                     return Err(pyexpat_error("parser must be a root parser".to_string(), 0, 0, 0));
                 }
                 if unsafe { !(is_float(max_factor) || is_int(max_factor)) } {
@@ -1956,7 +1958,7 @@ mod xmlparser_class {
                 pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_external_context", context);
                 parser
             }
-            fn __setattr__(self_obj: PyObjectRef, name: PyObjectRef, value: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            fn __setattr__(mut self_obj: PyObjectRef, name: PyObjectRef, mut value: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
                 if unsafe { !is_str(name) } {
                     return Err(pyre_interpreter::PyError::type_error("attribute name must be string"));
                 }
@@ -1981,7 +1983,7 @@ mod xmlparser_class {
                     if unsafe { is_float(value) } {
                         return Err(pyre_interpreter::PyError::type_error("buffer_size must be an integer"));
                     }
-                    let size = pyre_interpreter::baseobjspace::int_w(value)?;
+                    let size = pyre_object::with_roots!(self_obj, value => pyre_interpreter::baseobjspace::int_w(value))?;
                     if size <= 0 {
                         return Err(pyre_interpreter::PyError::value_error("buffer_size must be greater than zero"));
                     }
@@ -1995,73 +1997,73 @@ mod xmlparser_class {
     }
 }
 
-fn init_parser_slots(parser: PyObjectRef) {
+fn init_parser_slots(mut parser: PyObjectRef) {
     for h in HANDLER_NAMES {
-        pyre_interpreter::baseobjspace::setdictvalue_native(parser, h, w_none());
+        pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(parser, h, w_none()));
     }
-    let set_int = |name: &str, v: i64| {
+    let set_int = |parser: PyObjectRef, name: &str, v: i64| {
         pyre_interpreter::baseobjspace::setdictvalue_native(parser, name, w_int_new(v));
     };
-    let set_bool = |name: &str, v: bool| {
+    let set_bool = |parser: PyObjectRef, name: &str, v: bool| {
         pyre_interpreter::baseobjspace::setdictvalue_native(parser, name, w_bool_from(v));
     };
-    set_bool("buffer_text", false);
-    set_int("buffer_size", 8192);
-    set_int("buffer_used", 0);
-    set_bool("ordered_attributes", false);
-    set_bool("specified_attributes", false);
-    set_bool("namespace_prefixes", false);
-    set_int("ErrorCode", 0);
-    set_int("ErrorLineNumber", 0);
-    set_int("ErrorColumnNumber", 0);
-    set_int("ErrorByteIndex", 0);
-    set_int("CurrentLineNumber", 0);
-    set_int("CurrentColumnNumber", 0);
-    set_int("CurrentByteIndex", 0);
-    pyre_interpreter::baseobjspace::setdictvalue_native(parser, "intern", w_dict_new());
-    pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_pending_xml", w_str_new(""));
-    pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_emit_upto", w_int_new(0));
-    pyre_interpreter::baseobjspace::setdictvalue_native(
+    pyre_object::with_roots!(parser => set_bool(parser, "buffer_text", false));
+    pyre_object::with_roots!(parser => set_int(parser, "buffer_size", 8192));
+    pyre_object::with_roots!(parser => set_int(parser, "buffer_used", 0));
+    pyre_object::with_roots!(parser => set_bool(parser, "ordered_attributes", false));
+    pyre_object::with_roots!(parser => set_bool(parser, "specified_attributes", false));
+    pyre_object::with_roots!(parser => set_bool(parser, "namespace_prefixes", false));
+    pyre_object::with_roots!(parser => set_int(parser, "ErrorCode", 0));
+    pyre_object::with_roots!(parser => set_int(parser, "ErrorLineNumber", 0));
+    pyre_object::with_roots!(parser => set_int(parser, "ErrorColumnNumber", 0));
+    pyre_object::with_roots!(parser => set_int(parser, "ErrorByteIndex", 0));
+    pyre_object::with_roots!(parser => set_int(parser, "CurrentLineNumber", 0));
+    pyre_object::with_roots!(parser => set_int(parser, "CurrentColumnNumber", 0));
+    pyre_object::with_roots!(parser => set_int(parser, "CurrentByteIndex", 0));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(parser, "intern", w_dict_new()));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_pending_xml", w_str_new("")));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_emit_upto", w_int_new(0)));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_finished",
         w_bool_from(false),
-    );
-    pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_base", w_none());
-    pyre_interpreter::baseobjspace::setdictvalue_native(
+    ));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_base", w_none()));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_use_foreign_dtd",
         w_bool_from(false),
-    );
-    pyre_interpreter::baseobjspace::setdictvalue_native(
+    ));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_reparse_deferral",
         w_bool_from(true),
-    );
-    pyre_interpreter::baseobjspace::setdictvalue_native(
+    ));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_is_subparser",
         w_bool_from(false),
-    );
-    pyre_interpreter::baseobjspace::setdictvalue_native(
+    ));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_deferred_incomplete",
         w_bool_from(false),
-    );
-    pyre_interpreter::baseobjspace::setdictvalue_native(
+    ));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_param_entity_parsing",
         w_int_new(0),
-    );
-    pyre_interpreter::baseobjspace::setdictvalue_native(
+    ));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_billion_threshold",
         w_int_new(i64::MAX),
-    );
-    pyre_interpreter::baseobjspace::setdictvalue_native(
+    ));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_billion_max_is_one",
         w_bool_from(false),
-    );
+    ));
     pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_not_standalone_pending",
@@ -2319,12 +2321,13 @@ pyre_interpreter::py_module! {
         // it cannot come from the `exceptions:` arm, which qualifies the key
         // with the module it is declared in.  Both `error` and `ExpatError`
         // name the one class.
-        let err = pyre_interpreter::builtins::new_exception_class(
+        let mut ns = ns;
+        let err = pyre_object::with_roots!(ns => pyre_interpreter::builtins::new_exception_class(
             EXPAT_ERROR_NAME,
             pyre_interpreter::builtins::exc_exception_new,
             pyre_interpreter::builtins::lookup_exc_class("Exception")
                 .expect("Exception must be installed before pyexpat init"),
-        );
+        ));
         pyre_interpreter::module_ns_store(ns, "error", err);
         pyre_interpreter::module_ns_store(ns, "ExpatError", err);
 

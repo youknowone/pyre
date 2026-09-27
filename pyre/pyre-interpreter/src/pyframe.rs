@@ -4011,7 +4011,7 @@ impl PyFrame {
 
     /// PyPy-compatible `__init__` hook.
     #[inline]
-    pub fn __init__(&mut self, code: *const (), outer_func: PyObjectRef) {
+    pub fn __init__(&mut self, code: *const (), mut outer_func: PyObjectRef) {
         let _ = outer_func;
         let allocation = self.aux_allocation();
         self.pycode = code;
@@ -4040,9 +4040,10 @@ impl PyFrame {
             clear_block_chain(&mut self.lastblock);
         }
         // This storage-only hook carries no globals object.
-        let w_globals = PY_NULL;
-        self.w_builtin =
-            crate::baseobjspace::frame_builtin_obj(w_globals, crate::call::getexecutioncontext());
+        let mut w_globals = PY_NULL;
+        self.w_builtin = pyre_object::with_roots!(outer_func, w_globals =>
+            crate::baseobjspace::frame_builtin_obj(w_globals, crate::call::getexecutioncontext())
+        );
         // `pyframe.py PyFrame.__init__`: only a code/globals identity mismatch
         // creates a per-frame debugdata override.
         if unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) } {

@@ -3082,7 +3082,10 @@ pub fn split_code_filename_bytes(
 }
 
 /// A `tuple[str]` `co_*` field (names / varnames / freevars / cellvars).
-unsafe fn read_code_names(v: PyObjectRef, field: &str) -> Result<Box<[String]>, crate::PyError> {
+unsafe fn read_code_names(
+    mut v: PyObjectRef,
+    field: &str,
+) -> Result<Box<[String]>, crate::PyError> {
     if !unsafe { is_tuple(v) } {
         return Err(crate::PyError::type_error(format!(
             "{field} must be a tuple of strings"
@@ -3097,7 +3100,7 @@ unsafe fn read_code_names(v: PyObjectRef, field: &str) -> Result<Box<[String]>, 
                 "{field} must be a tuple of strings"
             )));
         }
-        out.push(crate::baseobjspace::str_utf8_w(e)?.to_string());
+        out.push(pyre_object::with_roots!(v => crate::baseobjspace::str_utf8_w(e))?.to_string());
     }
     Ok(out.into_boxed_slice())
 }

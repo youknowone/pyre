@@ -591,8 +591,8 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// scan of `list((i, 3, 1))` does not inherit `args.first` / `format!`
 /// from `require_list_receiver`.
 pub(crate) fn list_extend_items(
-    list: PyObjectRef,
-    other: PyObjectRef,
+    mut list: PyObjectRef,
+    mut other: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     // listobject.py extend only takes the storage-copy path when a
     // list/tuple uses its inherited iterator.  An overridden subclass
@@ -612,7 +612,7 @@ pub(crate) fn list_extend_items(
         // `keys`, and `list(f_locals)` does not re-enter the interpreter.
         // `false` means the proxy had no key list; drain it as a generic
         // iterable.
-        if !extend_from_frame_locals_proxy(list, other) {
+        if !pyre_object::with_roots!(list, other => extend_from_frame_locals_proxy(list, other)) {
             extend_from_iterable(list, other)?;
         }
     } else {
@@ -925,9 +925,11 @@ pub fn list_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "copy", true)?;
     arity_no_args(args, "copy")?;
-    let list = args[0];
+    let mut list = args[0];
     unsafe {
-        if let Some(clone) = pyre_object::listobject::w_list_clone_if_shared_strategy(list) {
+        if let Some(clone) = pyre_object::with_roots!(list =>
+            pyre_object::listobject::w_list_clone_if_shared_strategy(list)
+        ) {
             return Ok(clone);
         }
         let n = w_list_len(list);
@@ -3956,7 +3958,7 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     ))
 }
 
-fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
+fn format_with_spec(mut val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
     use rustpython_common::format::FormatSpec;
     unsafe {
         // `int` / `bool` / `long` share the integer formatter.  The `c`
@@ -4025,7 +4027,9 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
             }
             return format_finite_float(v, spec);
         }
-        if let Some((re, im)) = crate::objspace::descroperation::complex_val(val) {
+        if let Some((re, im)) =
+            pyre_object::with_roots!(val => crate::objspace::descroperation::complex_val(val))
+        {
             let p = parse_spec(spec)?;
             validate_python314_spec_shape(&p, spec, "complex", '\0')?;
             FormatSpec::parse(&p.engine_spec)
@@ -4142,7 +4146,7 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
         // Reached only for the rare builtin type whose `__format__` is the
         // inherited default yet still routes here with a non-empty spec;
         // format its `str()` through the shared string formatter.
-        let full = unsafe { crate::display::py_str_wtf8(val)? };
+        let full = pyre_object::with_roots!(val => unsafe { crate::display::py_str_wtf8(val) })?;
         if let Ok(s) = full.as_str() {
             let parsed = FormatSpec::parse(spec)
                 .map_err(|e| format_spec_err(e, spec, &arg_type_name(val), false))?;
@@ -4611,7 +4615,7 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// handlers.  The whole path reads the surrogate-aware WTF-8 view, so a
 /// lone surrogate is routed to the error handler rather than crashing.
 pub fn encode_object(
-    w_object: PyObjectRef,
+    mut w_object: PyObjectRef,
     encoding: &str,
     errors: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
@@ -4649,7 +4653,9 @@ pub fn encode_object(
                 | "utf-32-be"
         )
     {
-        crate::module::_codecs::validate_error_handler(errors)?;
+        pyre_object::with_roots!(w_object =>
+            crate::module::_codecs::validate_error_handler(errors)
+        )?;
     }
     // Name the encoder before reading the string.  `encode_text` hands
     // `w_object` to the registry untouched, so a name the built-ins do not
@@ -5062,23 +5068,27 @@ pub enum EncodeReplacement {
 pub fn call_registered_encode_error_handler(
     err_mode: &str,
     codec: &str,
-    source: PyObjectRef,
+    mut source: PyObjectRef,
     char_len: usize,
     start: usize,
     end: usize,
     reason: &str,
     owner: EncodeErrorOwner,
 ) -> Result<(EncodeReplacement, usize), crate::PyError> {
-    let w_handler = crate::module::_codecs::lookup_registered_error(err_mode).ok_or_else(|| {
+    let mut w_handler = pyre_object::with_roots!(source =>
+        crate::module::_codecs::lookup_registered_error(err_mode)
+    )
+    .ok_or_else(|| {
         crate::PyError::new(
             crate::PyErrorKind::LookupError,
             format!("unknown error handler name '{err_mode}'"),
         )
     })?;
 
-    let w_exc =
+    let mut w_err = pyre_object::with_roots!(w_handler =>
         crate::typedef::unicode_encode_error(codec, source, start as i64, end as i64, reason)
-            .to_exc_object();
+    );
+    let w_exc = pyre_object::with_roots!(w_handler => w_err.to_exc_object());
     let w_res = crate::baseobjspace::call_function(w_handler, &[w_exc]);
     if w_res.is_null() {
         return Err(crate::call::take_call_error()
@@ -6409,12 +6419,14 @@ fn dict_lookup_checked(
 
 pub(crate) fn dict_store_checked(
     dict: PyObjectRef,
-    key: PyObjectRef,
+    mut key: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     unsafe {
-        pyre_object::dictmultiobject::w_dict_store_checked(dict, key, value)
-            .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))
+        pyre_object::with_roots!(key =>
+            pyre_object::dictmultiobject::w_dict_store_checked(dict, key, value)
+        )
+        .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))
     }
 }
 
