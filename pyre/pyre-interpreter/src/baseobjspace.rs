@@ -6113,15 +6113,30 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> Resul
 /// `space.isinstance_w(w_dict, space.w_dict)` — the dict-or-dict-subclass
 /// gate every typed-field `setdict` arm shares, raising the standard
 /// `__dict__` TypeError otherwise.
-fn require_dict_for_setdict(w_dict: PyObjectRef) -> Result<(), PyError> {
+/// `subtype_setdict`'s rejection, which names the offending value's type and
+/// reads the same whichever kind of object is being assigned to.  Upstream
+/// spells it once per owner instead — `mapdict.py _obj_setdict` "setting
+/// dictionary to a non-dict", `interp_exceptions.py W_BaseException.setdict`
+/// "setting exceptions's dictionary to a non-dict", `function.py`
+/// "setting function's dictionary to a non-dict" — so every owner here routes
+/// through this one.
+pub(crate) fn require_dict_for_setdict(w_dict: PyObjectRef) -> Result<(), PyError> {
     let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
     if unsafe { isinstance_w(w_dict, w_dict_type) } {
         return Ok(());
     }
-    Err(PyError::type_error(format!(
+    Err(setdict_not_a_dict(w_dict))
+}
+
+/// The refusal itself, for the one owner whose test is not the type test:
+/// `mapdict.rs _obj_setdict` also asks the composed dict-subclass
+/// representation for its backing, and a value that cannot serve as the
+/// instance dict is the same refusal to the caller.
+pub(crate) fn setdict_not_a_dict(w_dict: PyObjectRef) -> PyError {
+    PyError::type_error(format!(
         "__dict__ must be set to a dictionary, not a '{}'",
         object_functionstr_type_name(w_dict),
-    )))
+    ))
 }
 
 /// interpreter/baseobjspace.py W_Root.setdict(space, w_dict).
@@ -6158,12 +6173,7 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
     // override — validates the value is a dict, then writes the slot.
     // `space.isinstance_w(w_dict, space.w_dict)` accepts dict subclasses.
     if unsafe { pyre_object::is_exception(obj) } {
-        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
-            return Err(PyError::type_error(
-                "setting exceptions's dictionary to a non-dict".to_string(),
-            ));
-        }
+        require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::interp_exceptions::w_exception_setdict(obj, w_dict) };
         return Ok(());
     }
