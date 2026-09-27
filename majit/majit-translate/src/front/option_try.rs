@@ -141,7 +141,7 @@ fn rewire_one_option_try_site(
     }
 
     // Block B: `cf = Try::branch(opt)`.
-    let b = graph
+    let mut b = graph
         .blocks
         .iter()
         .position(|block| {
@@ -151,11 +151,19 @@ fn rewire_one_option_try_site(
                 .any(|op| op.result.as_ref() == Some(&site.branch_result_var))
         })
         .ok_or_else(|| format!("{name}: Option branch result var has no producer block"))?;
-    let branch_idx = graph.blocks[b]
+    let mut branch_idx = graph.blocks[b]
         .operations
         .iter()
         .position(|op| op.result.as_ref() == Some(&site.branch_result_var))
         .ok_or_else(|| format!("{name}: Option branch op not found in block {b}"))?;
+    // `opt?` on a parameter branches in the startblock itself, after the
+    // parameters' `Input` ops, so no block A forwards `opt` into B.  Split
+    // the startblock before the `branch` (`unsimplify.py split_block`): the
+    // startblock becomes A and carries `opt` into the new B over one link.
+    if graph.blocks[b].id == graph.startblock {
+        b = crate::unsimplify::split_block(graph, graph.startblock, branch_idx, None).0;
+        branch_idx = 0;
+    }
     let opt_b = match &graph.blocks[b].operations[branch_idx].kind {
         OpKind::Call {
             target: CallTarget::Method { name: m, .. },

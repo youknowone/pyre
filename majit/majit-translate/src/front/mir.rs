@@ -2844,6 +2844,11 @@ fn derive_program_metadata(
                             // projection refines the same shell.
                             let (row_ty, attr_ty) = if tyref_is_bytecode_arg_marker(&f.ty, llbc) {
                                 ("u32".to_string(), ValueType::Int)
+                            } else if tyref_is_type_parameter(&f.ty, llbc) {
+                                (
+                                    tyref_to_field_layout_string(&f.ty, llbc),
+                                    ValueType::Unknown,
+                                )
                             } else {
                                 (
                                     tyref_to_field_layout_string(&f.ty, llbc),
@@ -35852,16 +35857,37 @@ fn tyref_to_attr_value_type_with(
     ValueType::Ref(None)
 }
 
+/// Whether a declared field type is one of the decl's own type parameters
+/// (`core::ops::range::Range<Idx>::start`, `Option<T>::Some.0`).
+///
+/// Such a field has no register class the decl can name: `Range<usize>`
+/// stores an int there, `Range<f64>` a float.  Its FORCE attr is `Unknown`,
+/// which `valuetype_to_someshell` does not shell, so `register_struct_fields`
+/// forces nothing for it and the attribute takes the annotation of the
+/// values written to it.  Forcing the classdef-less `Ref(None)` fallback
+/// instead made every `start = <int>` write union `Integer ∪ Instance` and
+/// fail.
+fn tyref_is_type_parameter(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .and_then(typevar_bound_index)
+        .is_some()
+}
+
 /// Register-class of a struct field, matching [`tyref_to_attr_value_type`]
 /// except for a closure-env capture whose declared type is a shared borrow
 /// of a primitive: seed that attr as the scalar so FORCE does not install
 /// a Ref class field against an Int-banked getfield.  Ordinary struct
-/// fields of reference type stay `Ref`.
+/// fields of reference type stay `Ref`; a type-parameter field is
+/// `Unknown` ([`tyref_is_type_parameter`]).
 fn tyref_to_attr_value_type_for_struct_field(
     ty: &TyRef,
     owner: &TypeDecl,
     llbc: &Llbc,
 ) -> ValueType {
+    if tyref_is_type_parameter(ty, llbc) {
+        return ValueType::Unknown;
+    }
     if type_decl_is_closure_env(owner)
         && let Some(peeled) = tyref_shared_borrow_primitive_value(ty, llbc)
     {
@@ -59626,6 +59652,66 @@ mod tests {
                         )
                 })),
             "lookup: niche `?` break arm must return a PyObject-narrowed null"
+        );
+    }
+
+    /// `builtins::kwarg_get` opens with `let dict = kwargs?;` on its
+    /// `Option<PyObjectRef>` parameter, so the `Try::branch` sits in the
+    /// startblock after the parameters' `Input` ops and no block forwards the
+    /// Option into it.  `option_try` splits the startblock before the branch
+    /// and rewrites the `?` like any other site: no residual `branch` call.
+    /// Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn option_try_on_a_parameter_real_kwarg_get() {
+        use crate::model::{CallTarget, OpKind};
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "kwarg_get").expect("lower kwarg_get");
+        let branch_calls = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, args, .. }
+                        if name == "branch" && args.len() == 1
+                )
+            })
+            .count();
+        assert_eq!(
+            branch_calls, 0,
+            "kwarg_get: residual Try::branch Method-call on the parameter `?`"
+        );
+    }
+
+    /// A field typed by its decl's own type parameter has no register class
+    /// the decl can name, so its FORCE row is `Unknown` and nothing is forced:
+    /// `Range<Idx>::start` and `Option<T>::Some.0` take the annotation of the
+    /// values written to them.  A concretely typed field keeps its class.
+    /// Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn type_parameter_fields_force_no_attribute_real() {
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let attrs = super::struct_field_attrs_of(&llbc);
+        let field = |owner: &str, name: &str| {
+            attrs
+                .get(owner)
+                .unwrap_or_else(|| panic!("{owner} registered"))
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, ty)| ty.clone())
+                .unwrap_or_else(|| panic!("{owner}.{name} registered"))
+        };
+        assert_eq!(field("ops::range::Range", "start"), ValueType::Unknown);
+        assert_eq!(field("ops::range::Range", "end"), ValueType::Unknown);
+        assert_eq!(field("option::Option::Some", "__pos_0"), ValueType::Unknown);
+        assert_eq!(
+            field("pyframe::FrameBlock", "valuestackdepth"),
+            ValueType::Unsigned
         );
     }
 
