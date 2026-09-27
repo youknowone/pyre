@@ -69,10 +69,17 @@ fn is_identity_wrapper_target(
             }
         }
         CallTarget::FunctionPath { segments, .. } => {
+            // Charon peels `alloc::` and spells `Box::as_mut` as
+            // `boxed::Box::as_mut`. That path is still the pointer cast.
+            let leaf = function_leaf(segments);
+            if matches!(leaf, Some("as_ref" | "as_mut"))
+                && (path_has(segments, "Box") || path_has(segments, "boxed"))
+            {
+                return true;
+            }
             if !is_std_fn_path(segments) {
                 return false;
             }
-            let leaf = function_leaf(segments);
             let recv = path_leaf(receiver_path);
             let dest = path_leaf(dest_path);
             match leaf {
@@ -677,6 +684,24 @@ mod tests {
             as_mut,
             OpKind::UnaryOp { ref op, .. } if op == "same_as"
         ));
+        let peeled = lower_std_primitive_op(
+            call(
+                path(&["boxed", "Box", "as_mut"]),
+                vec![v.clone()],
+                ValueType::Ref(None),
+            ),
+            Some("boxed::Box"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+        );
+        assert!(
+            matches!(peeled, OpKind::UnaryOp { ref op, .. } if op == "same_as"),
+            "boxed::Box::as_mut is the same pointer cast as alloc::boxed::Box::as_mut, got {peeled:?}"
+        );
 
         let as_deref_mut = lower_niche_option_deref(
             call(
