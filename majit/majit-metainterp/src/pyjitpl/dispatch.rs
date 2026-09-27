@@ -13714,7 +13714,9 @@ mod tests {
             majit_jitcode::insns::BC_ABORT_RESULT_R
         ));
         assert!(super::trace_abort_bytecode(majit_jitcode::insns::BC_ABORT));
-        assert!(!super::trace_abort_bytecode(majit_jitcode::insns::BC_INT_ADD));
+        assert!(!super::trace_abort_bytecode(
+            majit_jitcode::insns::BC_INT_ADD
+        ));
     }
 
     #[test]

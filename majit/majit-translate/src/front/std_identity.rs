@@ -705,13 +705,7 @@ mod tests {
 
         let as_deref_mut = lower_niche_option_deref(
             call(
-                path(&[
-                    "core",
-                    "option",
-                    "Option",
-                    "<impl>",
-                    "as_deref_mut",
-                ]),
+                path(&["core", "option", "Option", "<impl>", "as_deref_mut"]),
                 vec![v.clone()],
                 ValueType::Ref(None),
             ),
@@ -726,9 +720,9 @@ mod tests {
                 assert_eq!(op, "same_as");
                 assert_eq!(operand, &v);
             }
-            other => panic!(
-                "niche Option<Box<T>>::as_deref_mut is the pointer word, got {other:?}"
-            ),
+            other => {
+                panic!("niche Option<Box<T>>::as_deref_mut is the pointer word, got {other:?}")
+            }
         }
         let as_deref = lower_niche_option_deref(
             call(

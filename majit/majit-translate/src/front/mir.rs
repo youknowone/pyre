@@ -13164,8 +13164,8 @@ impl<'a> Lowering<'a> {
                 // word: `None` is null, `Some` is the payload. Indexing it
                 // as a residual `Vec::index_mut` hands a virtualizable array
                 // to a call, which `jtransform.py` rejects.
-                let element_is_niche_option = element_node
-                    .is_some_and(|elem| json_ty_is_niche_option_word(elem, self.llbc));
+                let element_is_niche_option =
+                    element_node.is_some_and(|elem| json_ty_is_niche_option_word(elem, self.llbc));
                 let element_is_addressable = element_spelling.is_some()
                     || element_node
                         .is_some_and(|elem| json_ty_is_thin_pointer_element(elem, self.llbc))
@@ -35950,7 +35950,10 @@ fn json_ty_is_niche_option_word(node: &serde_json::Value, llbc: &Llbc) -> bool {
     let Some(id) = adt_node_def_id(node) else {
         return false;
     };
-    if llbc.type_by_id(id).is_none_or(|td| td.item_meta.name_path() != "core::option::Option") {
+    if llbc
+        .type_by_id(id)
+        .is_none_or(|td| td.item_meta.name_path() != "core::option::Option")
+    {
         return false;
     }
     let Some(payload) = node
