@@ -1,8 +1,8 @@
 # A CALL_KW the seeded inline cannot take, so the call reaches the residual
-# executor.  `**kw` is the shape that keeps it there: the permutation that
-# seeds a keyword call's parameters (fbw_reorder_call_kw_args) has no slot for
-# a surplus mapping, so the inline declines and the call stays a residual
-# CallMayForce.
+# executor.  `*rest` next to `**kw` is the shape that keeps it there: the
+# inline seeds a `**kwargs` mapping only for a callee whose other locals are
+# its positional parameters (fbw_callee_scope_is_varkw_only), so the inline
+# declines and the call stays a residual CallMayForce.
 #
 # That residual is what the NULL-Ref-arg refusal sees, and its arg index 1 is
 # the `null_or_self` receiver slot, holding the PY_NULL sentinel (GcRef(0)) of
@@ -20,7 +20,7 @@
 N = 200000
 
 
-def g(x, **kw):
+def g(x, *rest, **kw):
     return x + kw["step"]
 
 
