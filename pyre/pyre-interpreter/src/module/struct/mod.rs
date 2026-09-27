@@ -722,10 +722,10 @@ fn pack_slow(this: &W_Struct, args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 
 /// Length / bytes-like / error residual of `descr_unpack`.
 #[majit_macros::dont_look_inside]
-fn unpack_slow(this: &W_Struct, w_str: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+fn unpack_slow(this: &W_Struct, mut w_str: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     this.ensure_ready()?;
     let format = majit_metainterp::jit::promote_string(this.format);
-    let fmt = crate::baseobjspace::str_utf8_w(format)?;
+    let fmt = pyre_object::with_roots!(w_str => crate::baseobjspace::str_utf8_w(format))?;
     let buf = unsafe { readbuf(w_str)? };
     do_unpack(fmt, buf)
 }
@@ -941,11 +941,11 @@ fn pack_values(parsed: &Parsed, values: &[PyObjectRef]) -> Result<Vec<u8>, crate
 /// resolving a negative offset against the buffer end.
 fn do_pack_into(
     format: &str,
-    buffer: PyObjectRef,
+    mut buffer: PyObjectRef,
     offset: i64,
     values: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    let parsed = parse_format(format)?;
+    let parsed = pyre_object::with_roots!(buffer => parse_format(format))?;
     let size = parsed.calcsize()?;
     // PyPy `Struct.pack_into` acquires `space.writebuf_w` once and keeps that
     // buffer object alive through `s_pack_internal`.  Reuse pyre's common
@@ -1477,17 +1477,19 @@ impl W_Struct {
     /// `offset=None` reaches `space_index_w` and raises.
     fn unpack_from(
         &self,
-        buffer: PyObjectRef,
+        mut buffer: PyObjectRef,
         offset: Option<PyObjectRef>,
     ) -> Result<PyObjectRef, crate::PyError> {
         self.ensure_ready()?;
         let format = majit_metainterp::jit::promote_string(self.format);
-        let fmt = crate::baseobjspace::str_utf8_w(format)?;
+        let fmt = pyre_object::with_roots!(buffer => crate::baseobjspace::str_utf8_w(format))?;
         // Coerce `offset` before borrowing the buffer: `space_index_w` may run
         // `__index__`, which can resize or free the backing store `readbuf`
         // hands back as a raw slice.
         let offset = match offset {
-            Some(o) => unsafe { crate::builtins::space_index_w(o)? },
+            Some(o) => {
+                pyre_object::with_roots!(buffer => unsafe { crate::builtins::space_index_w(o) })?
+            }
             None => 0,
         };
         let buf = unsafe { readbuf(buffer)? };
@@ -1853,8 +1855,8 @@ crate::py_module! {
             let fmt = format_to_string(fmt_obj)?;
             parse_format(&fmt)?.calcsize()
         }
-        fn unpack(fmt_obj: PyObjectRef, buffer: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-            let fmt = format_to_string(fmt_obj)?;
+        fn unpack(fmt_obj: PyObjectRef, mut buffer: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+            let fmt = pyre_object::with_roots!(buffer => format_to_string(fmt_obj))?;
             let buf = unsafe { readbuf(buffer)? };
             do_unpack(&fmt, buf)
         }
@@ -1866,15 +1868,15 @@ crate::py_module! {
         // TypeError.
         fn unpack_from(
             fmt_obj: PyObjectRef,
-            #[posonly] buffer: PyObjectRef,
+            #[posonly] mut buffer: PyObjectRef,
             offset: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, crate::PyError> {
-            let fmt = format_to_string(fmt_obj)?;
+            let fmt = pyre_object::with_roots!(buffer => format_to_string(fmt_obj))?;
             // Coerce `offset` before borrowing the buffer: `space_index_w` may
             // run `__index__`, which can resize or free the backing store
             // `readbuf` hands back as a raw slice.
             let offset = match offset {
-                Some(o) => unsafe { crate::builtins::space_index_w(o)? },
+                Some(o) => pyre_object::with_roots!(buffer => unsafe { crate::builtins::space_index_w(o) })?,
                 None => 0,
             };
             let buf = unsafe { readbuf(buffer)? };
@@ -1903,11 +1905,12 @@ crate::py_module! {
         // `space.new_exception_class("struct.error", space.w_Exception)`.
         let base = crate::builtins::lookup_exc_class("Exception")
             .expect("Exception must be installed before _struct init");
-        let error = crate::builtins::new_exception_class(
+        let mut ns = ns;
+        let error = pyre_object::with_roots!(ns => crate::builtins::new_exception_class(
             "struct.error",
             crate::builtins::exc_exception_new,
             base,
-        );
+        ));
         crate::module_ns_store(ns, "error", error);
         // `interp_struct.py pack(w_format, args_w)` and
         // `interp_struct.py pack_into(w_format, w_buffer, offset, args_w)`

@@ -132,7 +132,7 @@ pub(crate) fn dlsym(handle: usize, name: &str, is_function: bool) -> Option<usiz
 fn load_function(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let lib = library_arg(args[0])?;
     lib.check_closed()?;
-    let w_ctype = args[1];
+    let mut w_ctype = args[1];
     let ct = ctypeobj::ctype_arg(w_ctype)?;
     if !ct.is_ptr_or_array() {
         return Err(PyError::type_error(format!(
@@ -140,7 +140,8 @@ fn load_function(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             ct.name()
         )));
     }
-    let name = pyre_interpreter::baseobjspace::text_w(args[2])?;
+    let name =
+        pyre_object::with_roots!(w_ctype => pyre_interpreter::baseobjspace::text_w(args[2]))?;
     let Some(address) = dlsym(lib.handle as usize, name, true) else {
         return Err(PyError::attribute_error(format!(
             "function/symbol '{name}' not found in library '{}'",

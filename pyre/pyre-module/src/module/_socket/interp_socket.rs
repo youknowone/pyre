@@ -376,7 +376,7 @@ fn socket_writebuf(
     ))
 }
 
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     // `_rsocket_rffi.py:1150 rwin32.get_wsa_error`'s companion: WinSock has to
     // be started before any of its entry points answers, so the module takes
     // that cost at import rather than leaving the first call to fail with
@@ -1509,27 +1509,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     // `socket.gaierror.__module__` is `"socket"` rather than `"_socket"`.
     // `new_exception_class` leaves the base's `__new__` in place, so both
     // inherit the OSError family constructor and its errno/strerror parse.
-    let w_os_error = pyre_interpreter::builtins::lookup_exc_class("OSError")
+    let mut w_os_error = pyre_interpreter::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before _socket init");
     pyre_interpreter::module_ns_store(ns, "error", w_os_error);
-    pyre_interpreter::module_ns_store(
-        ns,
-        "herror",
-        pyre_interpreter::builtins::new_exception_class(
-            "socket.herror",
-            pyre_interpreter::builtins::exc_os_error_new,
-            w_os_error,
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "gaierror",
-        pyre_interpreter::builtins::new_exception_class(
-            "socket.gaierror",
-            pyre_interpreter::builtins::exc_os_error_new,
-            w_os_error,
-        ),
-    );
+    let w_herror = pyre_object::with_roots!(ns, w_os_error => pyre_interpreter::builtins::new_exception_class(
+        "socket.herror",
+        pyre_interpreter::builtins::exc_os_error_new,
+        w_os_error,
+    ));
+    pyre_interpreter::module_ns_store(ns, "herror", w_herror);
+    let w_gaierror = pyre_object::with_roots!(ns => pyre_interpreter::builtins::new_exception_class(
+        "socket.gaierror",
+        pyre_interpreter::builtins::exc_os_error_new,
+        w_os_error,
+    ));
+    pyre_interpreter::module_ns_store(ns, "gaierror", w_gaierror);
     let w_timeout_error = pyre_interpreter::builtins::lookup_exc_class("TimeoutError")
         .expect("TimeoutError must be installed before _socket init");
     pyre_interpreter::module_ns_store(ns, "timeout", w_timeout_error);
@@ -2462,7 +2456,7 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                     return Err(illegal_sockaddr());
                 }
                 let host_obj = item(0).ok_or_else(illegal_sockaddr)?;
-                let port_obj = item(1).ok_or_else(illegal_sockaddr)?;
+                let mut port_obj = item(1).ok_or_else(illegal_sockaddr)?;
                 if !unsafe { pyre_object::is_str(host_obj) } || !unsafe { pyre_object::is_int(port_obj) }
                 {
                     return Err(illegal_sockaddr());
@@ -2497,7 +2491,7 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 } else {
                     0
                 };
-                let host = pyre_interpreter::baseobjspace::str_utf8_w(host_obj)?.to_string();
+                let host = pyre_object::with_roots!(port_obj => pyre_interpreter::baseobjspace::str_utf8_w(host_obj))?.to_string();
                 let port_v = unsafe { pyre_object::w_int_get_value(port_obj) };
 
                 let c_host = std::ffi::CString::new(host.as_bytes())
@@ -2892,8 +2886,8 @@ fn socket_get_attr_i64(obj: pyre_object::PyObjectRef, key: &str) -> i64 {
 }
 
 #[cfg(any(unix, windows))]
-fn socket_set_attr(obj: pyre_object::PyObjectRef, key: &str, v: pyre_object::PyObjectRef) {
-    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
+fn socket_set_attr(obj: pyre_object::PyObjectRef, key: &str, mut v: pyre_object::PyObjectRef) {
+    let d = pyre_object::with_roots!(v => pyre_interpreter::baseobjspace::getdict_native(obj));
     if d.is_null() {
         return;
     }
@@ -3047,21 +3041,21 @@ fn socket_from_fd_with_class(
     // W_TypeObject when W_Socket.descr_init initialises a user subclass.
     // The stdlib relies on this for `class socket(_socket.socket)`: losing
     // `cls` here also loses its Python-level makefile() and lifecycle state.
-    let obj = pyre_object::w_instance_new(cls);
-    socket_init_state(obj, fd, family, ty, proto)?;
+    let mut obj = pyre_object::w_instance_new(cls);
+    pyre_object::with_roots!(obj => socket_init_state(obj, fd, family, ty, proto))?;
     Ok(obj)
 }
 
 #[cfg(any(unix, windows))]
 fn socket_init_state(
-    obj: pyre_object::PyObjectRef,
+    mut obj: pyre_object::PyObjectRef,
     fd: rffi::Socket,
     family: libc::c_int,
     ty: libc::c_int,
     proto: libc::c_int,
 ) -> Result<(), pyre_interpreter::PyError> {
-    socket_set_attr(obj, "_fd", pyre_object::w_int_new(rffi::socket_to_i64(fd)));
-    socket_set_attr(obj, "_family", pyre_object::w_int_new(family as i64));
+    pyre_object::with_roots!(obj => socket_set_attr(obj, "_fd", pyre_object::w_int_new(rffi::socket_to_i64(fd))));
+    pyre_object::with_roots!(obj => socket_set_attr(obj, "_family", pyre_object::w_int_new(family as i64)));
     // `rsocket.py:RSocket.__init__` clears both creation flags out of the type
     // it keeps, so that `sock.type == SOCK_STREAM` answers the same on a host
     // that accepts them inside `socket()`'s type argument as on one that does
@@ -3074,8 +3068,8 @@ fn socket_init_state(
     if stored_type & rffi::SOCK_NONBLOCK != 0 {
         stored_type -= rffi::SOCK_NONBLOCK;
     }
-    socket_set_attr(obj, "_type", pyre_object::w_int_new(stored_type as i64));
-    socket_set_attr(obj, "_proto", pyre_object::w_int_new(proto as i64));
+    pyre_object::with_roots!(obj => socket_set_attr(obj, "_type", pyre_object::w_int_new(stored_type as i64)));
+    pyre_object::with_roots!(obj => socket_set_attr(obj, "_proto", pyre_object::w_int_new(proto as i64)));
     // `rsocket.py:RSocket.__init__` calls `settimeout(defaults.timeout)` for
     // every new or wrapped descriptor, and `make_socket` copies that same
     // process-wide value.  Applying it here (not merely reporting it from
@@ -3085,7 +3079,7 @@ fn socket_init_state(
     // the descriptor was opened in, so the timeout it stands for is recorded
     // without a `settimeout` of its own.
     if ty & rffi::SOCK_NONBLOCK != 0 {
-        socket_set_attr(obj, "_timeout", pyre_object::floatobject::w_float_new(0.0));
+        pyre_object::with_roots!(obj => socket_set_attr(obj, "_timeout", pyre_object::floatobject::w_float_new(0.0)));
     } else {
         let bits = DEFAULT_SOCKET_TIMEOUT.load(std::sync::atomic::Ordering::Relaxed);
         let (native_timeout, stored_timeout) = if bits == SOCKET_TIMEOUT_NONE {
@@ -3094,7 +3088,7 @@ fn socket_init_state(
             let timeout = f64::from_bits(bits);
             (timeout, pyre_object::floatobject::w_float_new(timeout))
         };
-        socket_set_attr(obj, "_timeout", stored_timeout);
+        pyre_object::with_roots!(obj => socket_set_attr(obj, "_timeout", stored_timeout));
         socket_apply_timeout(fd, native_timeout)?;
     }
     // `sock_new` starts this at 0 on every socket object, and only
@@ -4095,16 +4089,16 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         pyre_interpreter::make_builtin_function_with_arity(
             "__del__",
             |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let fd = rffi::socket_from_i64(socket_get_attr_i64(obj, "_fd"));
+                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let fd = rffi::socket_from_i64(pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")));
                 if !rffi::is_invalid(fd) {
-                    if let Ok(repr) = { pyre_interpreter::display::py_repr_wtf8(obj) } {
-                        let _ = pyre_interpreter::warn::warn_category_source(
+                    if let Ok(repr) = pyre_object::with_roots!(obj => { pyre_interpreter::display::py_repr_wtf8(obj) }) {
+                        let _ = pyre_object::with_roots!(obj => pyre_interpreter::warn::warn_category_source(
                             &format!("unclosed {}", repr.to_string_lossy()),
                             "ResourceWarning",
                             1,
                             obj,
-                        );
+                        ));
                     }
                     let _ = { rffi::close(fd) };
                     socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
@@ -4120,7 +4114,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         pyre_interpreter::make_builtin_function("__init__", |args| {
             // `interp_socket.py descr_init(family=-1, type=-1, proto=-1,
             // w_fileno=None)`.
-            let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+            let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
             let after_self = if args.is_empty() { args } else { &args[1..] };
             let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(after_self);
             // `descr_init`'s `@unwrap_spec` signature rejects unknown
@@ -4165,9 +4159,9 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     None => Ok(-1),
                 }
             };
-            let mut family = int_arg(family_obj)?;
-            let mut ty = int_arg(type_obj)?;
-            let mut proto = int_arg(proto_obj)?;
+            let mut family = pyre_object::with_roots!(obj => int_arg(family_obj))?;
+            let mut ty = pyre_object::with_roots!(obj => int_arg(type_obj))?;
+            let mut proto = pyre_object::with_roots!(obj => int_arg(proto_obj))?;
             let has_fileno = match fileno_obj {
                 Some(o) => !{ pyre_object::is_none(o) },
                 None => false,
@@ -4236,7 +4230,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             }
             // `interp_socket.py` — `space.int_w(w_fileno)` accepts ints,
             // longs, and objects with `__int__` / `__index__`.
-            let fd = pyre_interpreter::baseobjspace::int_w(fileno_obj)?;
+            let fd = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::int_w(fileno_obj))?;
             if fd < 0 {
                 return Err(pyre_interpreter::PyError::value_error("negative file descriptor"));
             }
@@ -4248,9 +4242,9 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             // both forms.  No JIT/immutability hint covers `descr_init`, so
             // validate the descriptor once while keeping PyPy's field-owner
             // and subsequent inference order unchanged.
-            let detected_type = socket_getsockopt_int(fd, rffi::SOL_SOCKET, rffi::SO_TYPE)?;
+            let detected_type = pyre_object::with_roots!(obj => socket_getsockopt_int(fd, rffi::SOL_SOCKET, rffi::SO_TYPE))?;
             if family == -1 {
-                family = socket_detect_family(fd)?;
+                family = pyre_object::with_roots!(obj => socket_detect_family(fd))?;
             }
             if ty == -1 {
                 ty = detected_type;
@@ -4344,8 +4338,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         pyre_interpreter::make_builtin_function_with_arity(
             "close",
             |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let fd = rffi::socket_from_i64(socket_get_attr_i64(obj, "_fd"));
+                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let fd = rffi::socket_from_i64(pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")));
                 if !rffi::is_invalid(fd) {
                     // `rsocket.py:RSocket.close` drops ownership before the
                     // syscall and still reports its failure.  This prevents a
@@ -4368,8 +4362,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         pyre_interpreter::make_builtin_function_with_arity(
             "detach",
             |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let fd = socket_get_attr_i64(obj, "_fd");
+                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let fd = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd"));
                 socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
                 Ok(pyre_object::w_int_new(fd))
             },
@@ -4388,8 +4382,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         pyre_interpreter::make_builtin_function_with_arity(
             "_reuse",
             |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let n = socket_get_attr_i64(obj, "_usecount");
+                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let n = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_usecount"));
                 let n = if n < 0 { 1 } else { n };
                 socket_set_attr(obj, "_usecount", pyre_object::w_int_new(n + 1));
                 Ok(pyre_object::w_none())
@@ -4403,13 +4397,13 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         pyre_interpreter::make_builtin_function_with_arity(
             "_drop",
             |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let n = socket_get_attr_i64(obj, "_usecount");
+                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let n = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_usecount"));
                 let n = if n < 0 { 1 } else { n };
                 let next = n - 1;
-                socket_set_attr(obj, "_usecount", pyre_object::w_int_new(next));
+                pyre_object::with_roots!(obj => socket_set_attr(obj, "_usecount", pyre_object::w_int_new(next)));
                 if next <= 0 {
-                    let fd = rffi::socket_from_i64(socket_get_attr_i64(obj, "_fd"));
+                    let fd = rffi::socket_from_i64(pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")));
                     if !rffi::is_invalid(fd) {
                         let _ = { rffi::close(fd) };
                         socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
@@ -4432,9 +4426,9 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 if args.len() < 2 {
                     return Err(pyre_interpreter::PyError::type_error("bind() missing address"));
                 }
-                let obj = args[0];
-                let fd = socket_fd(obj)?;
-                let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
+                let mut obj = args[0];
+                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+                let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family")) as libc::c_int;
                 let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
                 let (storage, slen) = pack_inet_addr("bind", family, proto, args[1])?;
                 let r =
@@ -4473,12 +4467,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         pyre_interpreter::make_builtin_function_with_arity(
             "accept",
             |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let fd = socket_fd(obj)?;
-                socket_wait_readable(obj, fd)?;
-                let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-                let ty = socket_get_attr_i64(obj, "_type") as libc::c_int;
-                let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
+                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+                pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
+                let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family")) as libc::c_int;
+                let ty = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_type")) as libc::c_int;
+                let proto = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_proto")) as libc::c_int;
                 let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
                 let cfd = loop {
@@ -4522,9 +4516,9 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         pyre_interpreter::make_builtin_function_with_arity(
             "_accept",
             |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let fd = socket_fd(obj)?;
-                socket_wait_readable(obj, fd)?;
+                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+                pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
                 let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
                 let cfd = loop {
@@ -4563,10 +4557,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 if args.len() < 2 {
                     return Err(pyre_interpreter::PyError::type_error("connect() missing address"));
                 }
-                let obj = args[0];
-                let fd = socket_fd(obj)?;
-                let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-                let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
+                let mut obj = args[0];
+                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+                let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family")) as libc::c_int;
+                let proto = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_proto")) as libc::c_int;
                 // `pack_inet_addr` runs Python for a host that is not a plain
                 // ASCII `str`, so the socket is read back from its slot
                 // rather than from the native argument slice, which is
@@ -4620,10 +4614,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 if args.len() < 2 {
                     return Err(pyre_interpreter::PyError::type_error("connect_ex() missing address"));
                 }
-                let obj = args[0];
-                let fd = socket_fd(obj)?;
-                let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-                let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
+                let mut obj = args[0];
+                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+                let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family")) as libc::c_int;
+                let proto = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_proto")) as libc::c_int;
                 // `pack_inet_addr` runs Python for a host that is not a plain
                 // ASCII `str`, so the socket is read back from its slot
                 // rather than from the native argument slice, which is
@@ -4671,13 +4665,13 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             if args.len() < 2 {
                 return Err(pyre_interpreter::PyError::type_error("send() missing buffer"));
             }
-            let obj = args[0];
-            let fd = socket_fd(obj)?;
-            let buffer = pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1])?.ok_or_else(|| {
+            let mut obj = args[0];
+            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+            let buffer = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1]))?.ok_or_else(|| {
                 pyre_interpreter::PyError::type_error("send: buffer must be bytes-like")
             })?;
             let flags = if args.len() >= 3 {
-                pyre_interpreter::baseobjspace::c_int_w(args[2])?
+                pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::c_int_w(args[2]))?
             } else {
                 0
             };
@@ -4686,7 +4680,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             // argument permanently exported and unable to be resized. The
             // result is held rather than propagated so the release covers the
             // error paths too.
-            let result = socket_wait_writable(obj, fd)
+            let result = pyre_object::with_roots!(obj => socket_wait_writable(obj, fd))
                 .and_then(|()| socket_send_bytes(obj, fd, buffer.as_bytes(), flags));
             buffer.release();
             Ok(pyre_object::w_int_new(result? as i64))
@@ -4700,20 +4694,20 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             if args.len() < 2 {
                 return Err(pyre_interpreter::PyError::type_error("sendall() missing buffer"));
             }
-            let obj = args[0];
-            let fd = socket_fd(obj)?;
-            let buffer = pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1])?.ok_or_else(|| {
+            let mut obj = args[0];
+            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+            let buffer = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1]))?.ok_or_else(|| {
                 pyre_interpreter::PyError::type_error("sendall: buffer must be bytes-like")
             })?;
             let flags = if args.len() >= 3 {
-                pyre_interpreter::baseobjspace::c_int_w(args[2])?
+                pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::c_int_w(args[2]))?
             } else {
                 0
             };
             // The public 3.14 sendall timeout is one operation-wide deadline;
             // PyPy's `RSocket.wait_for_data(True)` supplies the writable wait.
             // Compute it once so handled EINTR cannot restart the full period.
-            let deadline = socket_positive_timeout(obj).map(|timeout| {
+            let deadline = pyre_object::with_roots!(obj => socket_positive_timeout(obj)).map(|timeout| {
                 std::time::Instant::now()
                     + std::time::Duration::from_secs_f64(
                         timeout.min(i32::MAX as f64 / 1000.0),
@@ -4780,8 +4774,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             if raw < 0 {
                 return Err(pyre_interpreter::PyError::value_error("negative buffersize in recv"));
             }
-            let obj = args[0];
-            let fd = socket_fd(obj)?;
+            let mut obj = args[0];
+            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
             let n = raw as usize;
             let flags = if args.len() >= 3 {
                 if !{ pyre_object::is_int(args[2]) } {
@@ -4792,7 +4786,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 0
             };
             let mut buf = pyre_interpreter::builtins::try_vec_zeroed(n)?;
-            socket_wait_readable(obj, fd)?;
+            pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
             let got = socket_recv_bytes(obj, fd, &mut buf, flags)?;
             buf.truncate(got);
             Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
@@ -4810,9 +4804,9 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     args.len().saturating_sub(1)
                 )));
             }
-            let obj = args[0];
-            let fd = socket_fd(obj)?;
-            let buffer = pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1])?.ok_or_else(|| {
+            let mut obj = args[0];
+            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+            let buffer = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1]))?.ok_or_else(|| {
                 pyre_interpreter::PyError::type_error(format!(
                     "a bytes-like object is required, not '{}'",
                     pyre_interpreter::type_methods::arg_type_name(args[1])
@@ -4824,7 +4818,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let (flags, addr_obj) = if args.len() == 3 {
                 (0, args[2])
             } else {
-                let flags = libc::c_int::try_from(pyre_interpreter::baseobjspace::int_w(args[2])?)
+                let flags = libc::c_int::try_from(pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::int_w(args[2]))?)
                     .map_err(|_| {
                         pyre_interpreter::PyError::overflow_error("Python int too large to convert to C int")
                     })?;
@@ -4894,8 +4888,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     "negative buffersize in recvfrom",
                 ));
             }
-            let obj = args[0];
-            let fd = socket_fd(obj)?;
+            let mut obj = args[0];
+            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
             let n = raw as usize;
             let flags = if args.len() >= 3 {
                 if !{ pyre_object::is_int(args[2]) } {
@@ -4910,7 +4904,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let mut buf = pyre_interpreter::builtins::try_vec_zeroed(n)?;
             let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
             let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-            socket_wait_readable(obj, fd)?;
+            pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
             let got = loop {
                 let (r, errno) = socket_call(|| {
                     rffi::recvfrom(
@@ -5455,8 +5449,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             if args.len() < 2 {
                 return Err(pyre_interpreter::PyError::type_error("sendmsg() missing data"));
             }
-            let obj = args[0];
-            let fd = socket_fd(obj)?;
+            let mut obj = args[0];
+            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
 
             // PyPy `interp_socket.py`: `space.unpackiterable(w_data)`,
             // then acquire/release one `BUF_SIMPLE` view per item and retain
@@ -5985,8 +5979,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         pyre_interpreter::make_builtin_function_with_arity(
             "getblocking",
             |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                socket_fd(obj)?;
+                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                pyre_object::with_roots!(obj => socket_fd(obj))?;
                 // `sock_getblocking` answers from the stored timeout rather
                 // than from the descriptor: `settimeout` is its only writer,
                 // and WinSock's `FIONBIO` cannot be read back.
@@ -6017,8 +6011,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 if args.len() < 2 {
                     return Err(pyre_interpreter::PyError::type_error("settimeout() missing argument"));
                 }
-                let obj = args[0];
-                let w_t = args[1];
+                let mut obj = args[0];
+                let mut w_t = args[1];
                 let timeout: f64 = if pyre_object::is_none(w_t) {
                     -1.0
                 } else {
@@ -6038,7 +6032,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     }
                     v
                 };
-                let fd = socket_fd(obj)?;
+                let fd = pyre_object::with_roots!(obj, w_t => socket_fd(obj))?;
                 socket_apply_timeout(fd, timeout)?;
                 // `gettimeout()` reports a float, and the timeout readers below
                 // recognise only that type; storing the caller's `int` verbatim
@@ -6087,8 +6081,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         ns,
         "__exit__",
         pyre_interpreter::make_builtin_function("__exit__", |args| {
-            if let Some(&obj) = args.first() {
-                let fd = rffi::socket_from_i64(socket_get_attr_i64(obj, "_fd"));
+            if let Some(&(mut obj)) = args.first() {
+                let fd = rffi::socket_from_i64(pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")));
                 if !rffi::is_invalid(fd) {
                     let _ = { rffi::close(fd) };
                     socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
@@ -6106,10 +6100,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         pyre_interpreter::make_builtin_function_with_arity(
             "__repr__",
             |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let fd = socket_get_attr_i64(obj, "_fd");
-                let family = socket_get_attr_i64(obj, "_family");
-                let ty = socket_get_attr_i64(obj, "_type");
+                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let fd = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd"));
+                let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family"));
+                let ty = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_type"));
                 let proto = socket_get_attr_i64(obj, "_proto");
                 Ok(pyre_object::w_str_new_managed(&format!(
                     "<socket object, fd={fd}, family={family}, type={ty}, proto={proto}>"

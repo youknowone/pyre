@@ -71,11 +71,11 @@ fn newlist_hint(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
 
 /// `interp_magic.py resizelist_hint`: forward to the live list strategy.
 fn resizelist_hint(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
-    let w_list = args[0];
+    let mut w_list = args[0];
     if !unsafe { pyre_object::is_list(w_list) } {
         return Err(crate::PyError::type_error("arg 1 must be a 'list'"));
     }
-    let sizehint = crate::baseobjspace::int_w(args[1])?;
+    let sizehint = pyre_object::with_roots!(w_list => crate::baseobjspace::int_w(args[1]))?;
     isize::try_from(sizehint)
         .map_err(|_| crate::PyError::overflow_error("integer does not fit in signed word"))?;
     if !unsafe { pyre_object::listobject::w_list_resize_hint(w_list, sizehint) } {
@@ -207,7 +207,7 @@ fn reversed_dict(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
 fn move_to_end(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     crate::builtins::kwarg_reject_unknown(kwargs, &["last"], "move_to_end")?;
-    let (d, key) = match positional {
+    let (mut d, mut key) = match positional {
         [d, key] | [d, key, _] => (*d, *key),
         _ => {
             return Err(crate::PyError::type_error(
@@ -217,7 +217,7 @@ fn move_to_end(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     };
     let last =
         match crate::builtins::bind_pos_or_kw(positional, kwargs, 2, "last", "move_to_end", 3)? {
-            Some(w) => crate::baseobjspace::is_true(w)?,
+            Some(w) => pyre_object::with_roots!(d, key => crate::baseobjspace::is_true(w))?,
             None => true,
         };
     let backing = dict_backing_or_type_error(d, "move_to_end")?;
@@ -322,7 +322,9 @@ crate::py_module! {
     extra_init: |ns| {
         // Mark as a package so `from __pypy__.builders import ...`
         // treats `__pypy__` as a package with submodules.
-        crate::module_ns_store(ns, "__path__", pyre_object::w_list_new(vec![]));
+        let mut ns = ns;
+        let w_path = pyre_object::with_roots!(ns => pyre_object::w_list_new(vec![]));
+        crate::module_ns_store(ns, "__path__", w_path);
         // Snapshot the canonical `identity_dict` type before any app code can
         // reassign `__pypy__.identity_dict`, keyed so attribute access cannot
         // reach it.  `objects_in_repr` builds its recursion guard from this

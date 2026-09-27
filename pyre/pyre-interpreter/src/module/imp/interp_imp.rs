@@ -1212,9 +1212,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     any(target_os = "macos", target_os = "linux")
                 )))]
                 {
-                    crate::baseobjspace::text0_wtf8_w(crate::baseobjspace::getattr_str(
-                        spec, "name",
-                    )?)?;
+                    let mut spec = spec;
+                    let w_name = pyre_object::with_roots!(spec => crate::baseobjspace::getattr_str(spec, "name"))?;
+                    crate::baseobjspace::text0_wtf8_w(w_name)?;
                     crate::baseobjspace::text0_wtf8_w(crate::baseobjspace::getattr_str(
                         spec, "origin",
                     )?)?;

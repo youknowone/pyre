@@ -1379,23 +1379,23 @@ fn sys_baserepl(_args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
-    let Some(&w_hookargs) = args.first() else {
+    let Some(&(mut w_hookargs)) = args.first() else {
         return Err(crate::PyError::type_error(
             "unraisablehook() missing 1 required positional argument",
         ));
     };
-    let w_type = crate::baseobjspace::getattr_str(w_hookargs, "exc_type")?;
-    let w_value = crate::baseobjspace::getattr_str(w_hookargs, "exc_value")?;
-    let w_tb = crate::baseobjspace::getattr_str(w_hookargs, "exc_traceback")?;
-    let w_err_msg = crate::baseobjspace::getattr_str(w_hookargs, "err_msg")?;
+    let mut w_type = pyre_object::with_roots!(w_hookargs => crate::baseobjspace::getattr_str(w_hookargs, "exc_type"))?;
+    let mut w_value = pyre_object::with_roots!(w_hookargs, w_type => crate::baseobjspace::getattr_str(w_hookargs, "exc_value"))?;
+    let mut w_tb = pyre_object::with_roots!(w_hookargs, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "exc_traceback"))?;
+    let w_err_msg = pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "err_msg"))?;
     let err_msg = if unsafe { pyre_object::is_none(w_err_msg) } {
         rustpython_wtf8::Wtf8Buf::new()
     } else if unsafe { pyre_object::is_str(w_err_msg) } {
         unsafe { pyre_object::w_str_get_wtf8(w_err_msg) }.to_wtf8_buf()
     } else {
-        unsafe { crate::display::py_str_wtf8(w_err_msg)? }
+        pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value => unsafe { crate::display::py_str_wtf8(w_err_msg) })?
     };
-    let w_object = crate::baseobjspace::getattr_str(w_hookargs, "object")?;
+    let w_object = pyre_object::with_roots!(w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "object"))?;
     crate::PyError::write_unraisable_default(
         w_none(),
         w_type,
@@ -1485,7 +1485,7 @@ fn exc_info_result_needs_traceback_at(frame: &crate::pyframe::PyFrame, call_pc: 
     else {
         return true;
     };
-    let w_first = exc_info_load_const(frame, first_instruction, first_arg);
+    let mut w_first = exc_info_load_const(frame, first_instruction, first_arg);
     if w_first.is_null() {
         return true;
     }
@@ -1502,11 +1502,11 @@ fn exc_info_result_needs_traceback_at(frame: &crate::pyframe::PyFrame, call_pc: 
         if unsafe { pyre_object::sliceobject::is_slice(w_first) } {
             let start = unsafe { pyre_object::sliceobject::w_slice_get_start(w_first) };
             let stop = unsafe { pyre_object::sliceobject::w_slice_get_stop(w_first) };
-            let step = unsafe { pyre_object::sliceobject::w_slice_get_step(w_first) };
+            let mut step = unsafe { pyre_object::sliceobject::w_slice_get_step(w_first) };
             let safe_start = unsafe { pyre_object::is_none(start) }
                 || unsafe { crate::baseobjspace::isinstance_int_w(start) };
             let safe_stop = if unsafe { crate::baseobjspace::isinstance_int_w(stop) } {
-                match crate::baseobjspace::int_w(stop) {
+                match pyre_object::with_roots!(step => crate::baseobjspace::int_w(stop)) {
                     Ok(value) => value <= 2,
                     Err(_) => false,
                 }
@@ -1523,7 +1523,8 @@ fn exc_info_result_needs_traceback_at(frame: &crate::pyframe::PyFrame, call_pc: 
         return true;
     }
 
-    let w_second = exc_info_load_const(frame, second_instruction, second_arg);
+    let w_second =
+        pyre_object::with_roots!(w_first => exc_info_load_const(frame, second_instruction, second_arg));
     if w_second.is_null()
         || !(unsafe { pyre_object::is_none(w_first) }
             || unsafe { crate::baseobjspace::isinstance_int_w(w_first) })
@@ -1690,7 +1691,7 @@ crate::builtin_wrapper_descriptor!(
     __majit_wrap_sys_exception
 );
 
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     module_ns_store(ns, "maxsize", w_int_new(i64::MAX));
     module_ns_store(ns, "maxunicode", w_int_new(0x10FFFF));
     #[cfg(all(
@@ -1699,16 +1700,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         any(target_os = "macos", target_os = "linux")
     ))]
     crate::cpyext::register_sys_dlopenflags(ns);
-    module_ns_store(
-        ns,
-        "orig_argv",
-        w_list_new(
-            crate::importing::sys_orig_argv()
-                .iter()
-                .map(|arg| crate::gateway::fsdecode_os_str(arg))
-                .collect(),
-        ),
-    );
+    let w_orig_argv = pyre_object::with_roots!(ns => w_list_new(
+        crate::importing::sys_orig_argv()
+            .iter()
+            .map(|arg| crate::gateway::fsdecode_os_str(arg))
+            .collect(),
+    ));
+    module_ns_store(ns, "orig_argv", w_orig_argv);
     // pypy/interpreter/app_main.py:785-786:
     //   sys._xoptions = dict(x.split('=', 1) if '=' in x else (x, True)
     //                        for x in options['_xoptions'])
@@ -4246,12 +4244,12 @@ fn live_stdio_encoding_errors(stream_name: &str, default_errors: &str) -> (Strin
 /// The `__std*__` aliases name the streams this built even after user code
 /// rebinds `sys.stdout`; a rebound one is not this function's to reconfigure.
 pub fn init_stream_codecs() -> Result<(), crate::PyError> {
-    let Some(sys) = crate::importing::get_interpreter_sys_module() else {
+    let Some(mut sys) = crate::importing::get_interpreter_sys_module() else {
         return Ok(());
     };
     for name in ["__stdout__", "__stderr__", "__stdin__"] {
-        if let Ok(stream) = crate::baseobjspace::getattr_str(sys, name) {
-            crate::module::_io::W_TextIOWrapper::attach_stdio_codec(stream)?;
+        if let Ok(stream) = pyre_object::with_roots!(sys => crate::baseobjspace::getattr_str(sys, name)) {
+            pyre_object::with_roots!(sys => crate::module::_io::W_TextIOWrapper::attach_stdio_codec(stream))?;
         }
     }
     Ok(())
@@ -4479,9 +4477,9 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     let write_fn = if to_stderr {
         crate::make_builtin_function("write", |args| {
             stdio_check_closed("__stderr__", CLOSED_TEXT_LAYER)?;
-            if let Some(s_obj) = pick_str(args) {
-                let (encoding, _) = live_stdio_encoding_errors("stderr", "backslashreplace");
-                let bytes = encode_stdio_text(s_obj, "stderr", &encoding, "backslashreplace")?;
+            if let Some(mut s_obj) = pick_str(args) {
+                let (encoding, _) = pyre_object::with_roots!(s_obj => live_stdio_encoding_errors("stderr", "backslashreplace"));
+                let bytes = pyre_object::with_roots!(s_obj => encode_stdio_text(s_obj, "stderr", &encoding, "backslashreplace"))?;
                 // An embedder that installed a hook takes the bytes here;
                 // otherwise fall through to the descriptor.
                 if !crate::stderr_hook_emit(&bytes) {
@@ -4509,9 +4507,9 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     } else {
         crate::make_builtin_function("write", |args| {
             stdio_check_closed("__stdout__", CLOSED_TEXT_LAYER)?;
-            if let Some(s_obj) = pick_str(args) {
-                let (encoding, errors) = live_stdio_encoding_errors("stdout", "strict");
-                let bytes = encode_stdio_text(s_obj, "stdout", &encoding, &errors)?;
+            if let Some(mut s_obj) = pick_str(args) {
+                let (encoding, errors) = pyre_object::with_roots!(s_obj => live_stdio_encoding_errors("stdout", "strict"));
+                let bytes = pyre_object::with_roots!(s_obj => encode_stdio_text(s_obj, "stdout", &encoding, &errors))?;
                 // Same seam `print` rides, so an embedder that captures stdout
                 // sees `sys.stdout.write` too and the two stay in order.
                 if !crate::print_hook_emit_bytes(&bytes) {

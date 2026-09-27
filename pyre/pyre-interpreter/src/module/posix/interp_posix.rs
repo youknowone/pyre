@@ -1732,7 +1732,7 @@ fn create_environ() -> pyre_object::PyObjectRef {
 ///
 /// Provides the minimal surface that os.py module init needs to succeed.
 /// Real posix calls are not implemented — they raise or return defaults.
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(ns, "environ", create_environ());
     crate::module_ns_store(
         ns,
@@ -1941,17 +1941,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // it keeps that position here too.
         ("MS_WINDOWS", MS_WINDOWS),
     ];
-    crate::module_ns_store(
-        ns,
-        "_have_functions",
-        pyre_object::w_list_new(
-            have_functions
-                .iter()
-                .filter(|&&(_, have)| have)
-                .map(|&(n, _)| pyre_object::w_str_new(n))
-                .collect(),
-        ),
-    );
+    let w_have_functions = pyre_object::with_roots!(ns => pyre_object::w_list_new(
+        have_functions
+            .iter()
+            .filter(|&&(_, have)| have)
+            .map(|&(n, _)| pyre_object::w_str_new(n))
+            .collect(),
+    ));
+    crate::module_ns_store(ns, "_have_functions", w_have_functions);
     // POSIX constants — real libc values (cross-platform subset).
     for (name, val) in [
         #[cfg(feature = "host_env")]
@@ -2645,11 +2642,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::make_builtin_function_with_arity(
                 "makedev",
                 |args| {
-                    let (major, minor) = match args {
+                    let (major, mut minor) = match args {
                         [major, minor, ..] => (*major, *minor),
                         _ => return Err(crate::PyError::type_error("makedev takes 2 arguments")),
                     };
-                    let major = major_minor_arg(major)?;
+                    let major = pyre_object::with_roots!(minor => major_minor_arg(major))?;
                     let minor = major_minor_arg(minor)?;
                     Ok(pyre_object::w_int_new(
                         libc::makedev(major as _, minor as _) as i64,
@@ -3025,11 +3022,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// so an `int` subclass — an `IntEnum` member, say — reaches the syscall,
     /// where an exact-type test would reject it and a raw payload read would
     /// interpret the instance's first word as the descriptor.
-    fn unwrap_fd(value: PyObjectRef, allowed_types: &str) -> Result<i32, crate::PyError> {
+    fn unwrap_fd(mut value: PyObjectRef, allowed_types: &str) -> Result<i32, crate::PyError> {
         if unsafe { pyre_object::is_bool(value) } {
-            crate::warn::warn_category("bool is used as a file descriptor", "RuntimeWarning", 1)?;
+            pyre_object::with_roots!(value => crate::warn::warn_category("bool is used as a file descriptor", "RuntimeWarning", 1))?;
         }
-        let result = crate::baseobjspace::c_int_w(value).map_err(|err| {
+        let result = pyre_object::with_roots!(value => crate::baseobjspace::c_int_w(value)).map_err(|err| {
             if err.kind == crate::PyErrorKind::OverflowError {
                 err
             } else {
@@ -4028,7 +4025,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // time is. `utime(p, (-1.5, -2.5))` is `(-2, 500000000)` and
         // `(-3, 500000000)`, which reads back as `-1_500_000_000` and
         // `-2_500_000_000` nanoseconds.
-        let time_from_secs = |v: PyObjectRef| -> Result<UTime, crate::PyError> {
+        let time_from_secs = |mut v: PyObjectRef| -> Result<UTime, crate::PyError> {
             // An integer names its second exactly, so it is read as one
             // rather than through a float that would round the seconds it is
             // too wide to hold.
@@ -4039,7 +4036,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // Everything else has to name a float. What cannot is not a time
             // at all, and is refused by type: `utime(p, ('a', 'b'))` names the
             // type it was given rather than reporting a failed float parse.
-            let f = crate::builtins::builtin_float(&[v]).map_err(|err| {
+            let f = pyre_object::with_roots!(v => crate::builtins::builtin_float(&[v])).map_err(|err| {
                 if err.kind == crate::PyErrorKind::OverflowError {
                     time_t_overflow()
                 } else {
@@ -4146,12 +4143,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 ));
             }
             (Some(t), None) => {
-                let (a, m) = unpack_two(t, "times")?;
-                (false, time_from_secs(a)?, time_from_secs(m)?)
+                let (a, mut m) = unpack_two(t, "times")?;
+                let access = pyre_object::with_roots!(m => time_from_secs(a))?;
+                (false, access, time_from_secs(m)?)
             }
             (None, Some(n)) => {
-                let (a, m) = unpack_two(n, "ns")?;
-                (false, time_from_ns(a)?, time_from_ns(m)?)
+                let (a, mut m) = unpack_two(n, "ns")?;
+                let access = pyre_object::with_roots!(m => time_from_ns(a))?;
+                (false, access, time_from_ns(m)?)
             }
             (None, None) => (true, UTime { sec: 0, nsec: 0 }, UTime { sec: 0, nsec: 0 }),
         };
@@ -6170,7 +6169,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// does.)  Only a successful fetch is cached; an error re-raises on each
     /// call.  The entry never moves (`allocate_stable`), so the raw receiver
     /// stays valid across the fetch's allocation.
-    fn dir_entry_get_lstat(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    fn dir_entry_get_lstat(mut self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         {
             let de = W_DirEntry::from_obj(self_obj)
                 .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
@@ -6198,8 +6197,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }
         }
         let dir_fd = dir_entry_dir_fd(self_obj)?;
-        let (w_path, path) = dir_entry_path(self_obj)?;
-        let result = dir_entry_fetch_stat(w_path, &path, false, dir_fd)?;
+        let (w_path, path) = pyre_object::with_roots!(self_obj => dir_entry_path(self_obj))?;
+        let result = pyre_object::with_roots!(self_obj => dir_entry_fetch_stat(w_path, &path, false, dir_fd))?;
         let de = W_DirEntry::from_obj(self_obj)
             .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
         de.w_lstat = result;
@@ -6207,8 +6206,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         Ok(result)
     }
     fn dir_entry_stat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = args[0];
-        let follow = dir_entry_follow(args)?;
+        let mut self_obj = args[0];
+        let follow = pyre_object::with_roots!(self_obj => dir_entry_follow(args))?;
         if !follow {
             return dir_entry_get_lstat(self_obj);
         }
@@ -6224,12 +6223,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // `get_stat` (interp_scandir.py) decides it the same way. An entry
         // whose walk reported the `lstat` has therefore answered both.
         let receiver = [self_obj];
-        let result = if dir_entry_is_symlink_value(&receiver)? {
+        let is_symlink = pyre_object::with_roots!(self_obj => dir_entry_is_symlink_value(&receiver))?;
+        let result = if is_symlink {
             let dir_fd = dir_entry_dir_fd(self_obj)?;
-            let (w_path, path) = dir_entry_path(self_obj)?;
-            dir_entry_fetch_stat(w_path, &path, true, dir_fd)?
+            let (w_path, path) = pyre_object::with_roots!(self_obj => dir_entry_path(self_obj))?;
+            pyre_object::with_roots!(self_obj => dir_entry_fetch_stat(w_path, &path, true, dir_fd))?
         } else {
-            dir_entry_get_lstat(self_obj)?
+            pyre_object::with_roots!(self_obj => dir_entry_get_lstat(self_obj))?
         };
         let de = W_DirEntry::from_obj(self_obj)
             .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
@@ -6499,25 +6499,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         with_scandir_iter(self_obj, |iterator| iterator.open).unwrap_or(false)
     }
     fn scandir_iter_del(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = args[0];
+        let mut self_obj = args[0];
         if !scandir_iter_is_open(self_obj) {
             return Ok(pyre_object::w_none());
         }
 
-        let message = match unsafe { crate::display::py_repr_wtf8(self_obj) } {
+        let message = match pyre_object::with_roots!(self_obj => unsafe { crate::display::py_repr_wtf8(self_obj) }) {
             Ok(repr) => format!("unclosed scandir iterator {}", repr.to_string_lossy()),
             Err(_) => "unclosed scandir iterator".to_string(),
         };
-        if let Err(mut error) =
-            crate::warn::warn_category_source(&message, "ResourceWarning", 1, self_obj)
+        if let Err(mut error) = pyre_object::with_roots!(self_obj => crate::warn::warn_category_source(&message, "ResourceWarning", 1, self_obj))
         {
             // `W_ScandirIterator._finalize_` reports a warning promoted to an
             // error as unraisable because finalization cannot propagate it.
-            error.write_unraisable(
+            pyre_object::with_roots!(self_obj => error.write_unraisable(
                 pyre_object::w_none(),
                 rustpython_wtf8::Wtf8::new(""),
                 self_obj,
-            );
+            ));
         }
         scandir_iter_mark_closed(self_obj);
         Ok(pyre_object::w_none())
@@ -8815,11 +8814,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         #[crate::pyre_function]
         fn dup2(
             fd: pyre_object::PyObjectRef,
-            fd2: pyre_object::PyObjectRef,
+            mut fd2: pyre_object::PyObjectRef,
             inheritable: Option<pyre_object::PyObjectRef>,
         ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
             // interp_posix.py `@unwrap_spec(fd=c_int, fd2=c_int, inheritable=bool)`.
-            let fd = crate::baseobjspace::c_int_w(fd)?;
+            let fd = pyre_object::with_roots!(fd2 => crate::baseobjspace::c_int_w(fd))?;
             let fd2 = crate::baseobjspace::c_int_w(fd2)?;
             let inheritable = match inheritable {
                 Some(w) => crate::baseobjspace::is_true(w)?,
@@ -9671,15 +9670,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     ))),
                 }
             };
-            let (path_obj, mode_obj) = (arg(0, "path")?, arg(1, "mode")?);
+            let (path_obj, mut mode_obj) = (arg(0, "path")?, arg(1, "mode")?);
             // interp_posix.py reads a `chmod` whose path did not
             // fsencode as a descriptor and answers it with `os.fchmod`.
             // `lchmod` names no descriptor form.
-            let path = crate::gateway::fsencode_path_or_fd_w(
+            let path = pyre_object::with_roots!(mode_obj => crate::gateway::fsencode_path_or_fd_w(
                 path_obj,
                 name,
                 default_follow && HAVE_FCHMOD,
-            )?;
+            ))?;
             // `posix.chmod` unwraps `mode` as `c_int`, so a non-integer raises
             // TypeError instead of reinterpreting its layout.
             let mode = crate::baseobjspace::c_int_w(mode_obj)? as u32;
@@ -9850,19 +9849,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     ))),
                 }
             };
-            let (path_obj, uid_obj, gid_obj) = (arg(0, "path")?, arg(1, "uid")?, arg(2, "gid")?);
+            let (path_obj, mut uid_obj, mut gid_obj) = (arg(0, "path")?, arg(1, "uid")?, arg(2, "gid")?);
             // `posixmodule.c path_converter` calls `__fspath__` and lets what it
             // raises out: a `RuntimeError` from a user `__fspath__` is that
             // object's error, not a statement that the argument was the wrong
             // type.  Rewriting every failure into a `TypeError` here would also
             // swallow the `UnicodeEncodeError` a lone surrogate produces.
-            let path = crate::gateway::fsencode_path_or_fd_w(
+            let path = pyre_object::with_roots!(gid_obj, uid_obj => crate::gateway::fsencode_path_or_fd_w(
                 path_obj,
                 name,
                 // `lchown` is `path_t(allow_fd=0)` — only `chown` reads an
                 // integer as a descriptor (`interp_posix.py`).
                 default_follow && HAVE_FCHOWN,
-            )?;
+            ))?;
             // `_Py_Uid_Converter` / `_Py_Gid_Converter`: `uid_t` is unsigned, yet
             // -1 is always accepted as the "leave unchanged" sentinel.  Only
             // that one value means unchanged; every other id is judged by
@@ -9896,7 +9895,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     Ok(Some(narrowed))
                 };
-            let (uid, gid) = (id_of(uid_obj, "uid")?, id_of(gid_obj, "gid")?);
+            let uid = pyre_object::with_roots!(gid_obj => id_of(uid_obj, "uid"))?;
+            let gid = id_of(gid_obj, "gid")?;
             // `chown` types `dir_fd` as `DirFD(rposix.HAVE_FCHOWNAT)`
             // (`interp_posix.py`); `lchown` declares no keyword at
             // all, so `allowed` above has already rejected it.

@@ -133,24 +133,26 @@ impl W_Kevent {
         #[default(pyre_object::w_int_new(
             rustpython_host_env::select::kqueue::DEFAULT_FILTER as i64
         ))]
-        w_filter: PyObjectRef,
+        mut w_filter: PyObjectRef,
         #[default(pyre_object::w_int_new(
             rustpython_host_env::select::kqueue::DEFAULT_FLAGS as i64
         ))]
-        w_flags: PyObjectRef,
-        #[default(pyre_object::w_int_new(0))] w_fflags: PyObjectRef,
-        #[default(pyre_object::w_int_new(0))] w_data: PyObjectRef,
-        #[default(pyre_object::w_int_new(0))] w_udata: PyObjectRef,
+        mut w_flags: PyObjectRef,
+        #[default(pyre_object::w_int_new(0))] mut w_fflags: PyObjectRef,
+        #[default(pyre_object::w_int_new(0))] mut w_data: PyObjectRef,
+        #[default(pyre_object::w_int_new(0))] mut w_udata: PyObjectRef,
     ) -> Result<(), pyre_interpreter::PyError> {
         let ident: u64 = if unsafe { pyre_object::is_int(w_ident) } {
             pyre_interpreter::baseobjspace::uint_w(w_ident)?
         } else {
-            filedescriptor_w(w_ident)? as u64
+            pyre_object::with_roots!(w_data, w_fflags, w_filter, w_flags, w_udata => filedescriptor_w(w_ident))?
+                as u64
         };
-        let filter = pyre_interpreter::baseobjspace::int_w(w_filter)?;
+        let filter = pyre_object::with_roots!(w_data, w_fflags, w_flags, w_udata => pyre_interpreter::baseobjspace::int_w(w_filter))?;
         let flags = pyre_interpreter::baseobjspace::c_uint_w(w_flags)?;
         let fflags = pyre_interpreter::baseobjspace::c_uint_w(w_fflags)?;
-        let data = pyre_interpreter::baseobjspace::int_w(w_data)?;
+        let data =
+            pyre_object::with_roots!(w_udata => pyre_interpreter::baseobjspace::int_w(w_data))?;
         let udata = pyre_interpreter::baseobjspace::uint_w(w_udata)?;
         self.ident = ident;
         self.filter = filter as i16;

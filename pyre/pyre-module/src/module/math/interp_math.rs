@@ -19,7 +19,7 @@ pub fn get_double(obj: PyObjectRef) -> f64 {
 /// numeric interpretation (no int/float/bool/long layout and no
 /// __float__/__index__ method). mathmodule.c's entry points use this
 /// to reject `math.exp("spam")` etc.
-pub fn try_get_double(obj: PyObjectRef) -> Result<f64, pyre_interpreter::PyError> {
+pub fn try_get_double(mut obj: PyObjectRef) -> Result<f64, pyre_interpreter::PyError> {
     unsafe {
         if is_float(obj) {
             return Ok(floatobject::w_float_get_value(obj));
@@ -31,7 +31,8 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, pyre_interpreter::PyError
         // reproduces the payload.  The `float` arm stays ungated because the
         // conversion short-circuits on the layout and ignores an override.
         if pyre_object::is_exact_builtin_instance(obj)
-            && let Some(value) = pyre_interpreter::builtins::int_payload_as_f64(obj)
+            && let Some(value) =
+                pyre_object::with_roots!(obj => pyre_interpreter::builtins::int_payload_as_f64(obj))
         {
             return value;
         }
@@ -40,9 +41,10 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, pyre_interpreter::PyError
     // instance attribute named `__float__` is not consulted. A raising
     // `__float__` (descriptor `__get__` or the call itself) propagates
     // instead of being reported as "must be real number".
-    match unsafe { pyre_interpreter::baseobjspace::lookup_special(obj, "__float__") } {
+    match pyre_object::with_roots!(obj => unsafe { pyre_interpreter::baseobjspace::lookup_special(obj, "__float__") })
+    {
         Ok(Some(method)) => {
-            let result = pyre_interpreter::builtins::call_and_check(method, &[])?;
+            let mut result = pyre_object::with_roots!(obj => pyre_interpreter::builtins::call_and_check(method, &[]))?;
             unsafe {
                 if is_float(result) {
                     // A strict `float` subclass is accepted but deprecated;
@@ -50,12 +52,12 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, pyre_interpreter::PyError
                     if !is_exact_type(result, &FLOAT_TYPE) {
                         let value_type = pyre_interpreter::type_methods::arg_type_name(obj);
                         let result_type = pyre_interpreter::type_methods::arg_type_name(result);
-                        pyre_interpreter::warn::warn_deprecation(&format!(
+                        pyre_object::with_roots!(result => pyre_interpreter::warn::warn_deprecation(&format!(
                             "{value_type}.__float__ returned non-float (type {result_type}).  \
                              The ability to return an instance of a strict subclass of \
                              float is deprecated, and may be removed in a future version \
                              of Python."
-                        ))?;
+                        )))?;
                     }
                     return Ok(floatobject::w_float_get_value(result));
                 }
@@ -72,9 +74,10 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, pyre_interpreter::PyError
         Ok(None) => {}
         Err(err) => return Err(err),
     }
-    match pyre_interpreter::baseobjspace::getattr_str(obj, "__index__") {
+    match pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::getattr_str(obj, "__index__"))
+    {
         Ok(method) => {
-            let result = pyre_interpreter::builtins::call_and_check(method, &[])?;
+            let result = pyre_object::with_roots!(obj => pyre_interpreter::builtins::call_and_check(method, &[]))?;
             unsafe {
                 if is_int(result) {
                     return Ok(w_int_get_value(result) as f64);
@@ -1111,7 +1114,7 @@ pub fn trunc(args: &[PyObjectRef]) -> PyResult {
 /// two arms also state their refusal differently — an integer can be
 /// arbitrarily large, so its message carries no value — and which spelling a
 /// program sees says which arm read the operand.
-fn loghelper(w_x: PyObjectRef, base: f64) -> Result<f64, pyre_interpreter::PyError> {
+fn loghelper(mut w_x: PyObjectRef, base: f64) -> Result<f64, pyre_interpreter::PyError> {
     unsafe {
         if pyre_object::is_bool(w_x) || pyre_object::is_int(w_x) || pyre_object::is_long(w_x) {
             let num_owned;
@@ -1124,7 +1127,7 @@ fn loghelper(w_x: PyObjectRef, base: f64) -> Result<f64, pyre_interpreter::PyErr
                 num_owned = BigInt::from(pyre_object::w_int_get_value(w_x));
                 &num_owned
             };
-            if num.int_le(0) {
+            if pyre_object::with_roots!(w_x => num.int_le(0)) {
                 return Err(pyre_interpreter::PyError::value_error(
                     "expected a positive input",
                 ));
