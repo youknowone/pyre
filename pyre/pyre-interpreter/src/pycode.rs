@@ -4066,12 +4066,18 @@ pub fn instruction_can_start_a_line(code: &crate::CodeObject, pc: usize) -> bool
 /// the JIT's `recover_inline_callee_globals` answer `PY_NULL` there and
 /// decline the inline. Keys and values are `usize` because a raw
 /// `PyObjectRef` is not `Send`, as in `interp_sre`'s pattern registry.
+///
+/// Keyed by an address, so it is hashed the way `lldict.py _hash` hashes one
+/// (`majit_gc::address_dict::AddressHasher`). Rust's default `SipHash` was 4.3%
+/// of a call-heavy interpreted loop on its own, because every frame creation
+/// refreshes its own entry.
 static LIVE_CODE_WRAPPERS: std::sync::OnceLock<
-    parking_lot::Mutex<std::collections::HashMap<usize, usize>>,
+    parking_lot::Mutex<majit_gc::address_dict::AddressMap<usize>>,
 > = std::sync::OnceLock::new();
 
-fn live_code_wrappers() -> &'static parking_lot::Mutex<std::collections::HashMap<usize, usize>> {
-    LIVE_CODE_WRAPPERS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+fn live_code_wrappers() -> &'static parking_lot::Mutex<majit_gc::address_dict::AddressMap<usize>> {
+    LIVE_CODE_WRAPPERS
+        .get_or_init(|| parking_lot::Mutex::new(majit_gc::address_dict::AddressMap::default()))
 }
 
 /// Record `wrapper` as the live wrapper for `code_ptr`. No-op on null inputs.
@@ -4083,9 +4089,19 @@ pub fn register_live_code_wrapper(code_ptr: *const (), wrapper: PyObjectRef) {
     if code_ptr.is_null() || wrapper.is_null() {
         return;
     }
-    live_code_wrappers()
-        .lock()
-        .insert(code_ptr as usize, wrapper as usize);
+    let wrapper = wrapper as usize;
+    let mut wrappers = live_code_wrappers().lock();
+    match wrappers.get_mut(&(code_ptr as usize)) {
+        // The refresh exists for a wrapper that moved, and an unmoved one is
+        // the common case: every frame this code object runs comes back here.
+        // Leaving the slot alone spares the store and, on a table at its load
+        // factor, the rehash that inserting over an existing key still risks.
+        Some(live) if *live == wrapper => {}
+        Some(live) => *live = wrapper,
+        None => {
+            wrappers.insert(code_ptr as usize, wrapper);
+        }
+    }
 }
 
 /// Recover the live wrapper previously registered for `code_ptr`, or `PY_NULL`

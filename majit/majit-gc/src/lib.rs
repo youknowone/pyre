@@ -29,7 +29,7 @@ pub struct GcVarSizeLayout {
     pub items_have_gc_ptrs: bool,
 }
 
-mod address_dict;
+pub mod address_dict;
 pub mod collector;
 pub mod gc_sync;
 pub mod gcreftracer;
