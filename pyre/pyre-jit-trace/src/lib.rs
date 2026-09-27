@@ -140,6 +140,11 @@ pub mod py_coord;
 pub mod pyjitcode;
 pub mod pyjitpl;
 pub mod pypyjit_driver_layout;
+/// `pypy/module/pypyjit/policy.py`, which the build script links for the
+/// translation (`build/prepass.rs`); compiled here for its tests only.
+#[cfg(test)]
+#[path = "../../pyre-interpreter/src/module/pypyjit/policy.rs"]
+mod pypyjit_policy;
 pub mod pyre_cpu;
 pub mod runtime_fnaddr_patch;
 pub mod state;

@@ -240,22 +240,18 @@ fn find_all_graphs_does_not_follow_close_stack_targets() {
 
 #[test]
 fn find_all_graphs_leaves_unregistered_targets_as_residual() {
-    // Phase D.2 parity contract: upstream `PyPyJitPolicy.look_inside_function`
-    // (`pypy/module/pypyjit/policy.py`) excludes per-module by name
-    // (`pypy.interpreter.astcompiler.*`, `rpython.rlib.rlocale`, …) so
-    // those functions become residual calls even when the BFS would
-    // otherwise follow them. Pyre uses a different but structurally
-    // equivalent mechanism: the `JIT_GRAPH_MODULES` whitelist plus
-    // `register_function_graph` plays the "allowed module" role, and an
-    // unregistered callee is treated as residual by construction —
-    // `find_all_graphs_bfs` at `call.rs` only pulls a callee into
-    // `candidate_graphs` when `function_graphs.get(callee_path)` succeeds.
+    // `call.py guess_call_kind`: `if getattr(funcobj, 'graph', None) is
+    // None: return 'residual'`. A callee with no graph — an external
+    // function, or in pyre a path with no lowered body (Rust stdlib, an
+    // unextracted crate) — is residual whatever the policy says, and
+    // `find_all_graphs` never makes it a candidate. This pins that contract
+    // so a change that starts synthesising graphs for unregistered callees
+    // (or otherwise short-circuits the residual fallback) surfaces loudly.
     //
-    // The two mechanisms converge on the same observable behaviour: a
-    // direct_call whose callee lies outside the JIT-analysable surface
-    // stays residual. This test pins that contract so a future change
-    // that starts synthesising graphs for unregistered callees (or
-    // otherwise short-circuits the residual fallback) surfaces loudly.
+    // It is not the module filter: `PyPyJitPolicy.look_inside_function`
+    // (`pypy/module/pypyjit/policy.py`) rejects graph-bearing functions by
+    // module, and pyre ports it as the `PyPyJitPolicy` the interpreter's
+    // translation passes in.
     let portal_path = CallPath::from_segments(["portal"]);
     let unregistered_path = CallPath::from_segments(["external_helper"]);
 
@@ -278,8 +274,7 @@ fn find_all_graphs_leaves_unregistered_targets_as_residual() {
     );
     assert!(
         !cc.is_candidate(&unregistered_path),
-        "Phase D.2: unregistered direct_call targets must stay residual — \
-         they are the pyre analogue of PyPyJitPolicy.look_inside_function=False, \
-         and BFS must not pull them into candidate_graphs"
+        "unregistered direct_call targets have no graph, so they stay \
+         residual and BFS must not pull them into candidate_graphs"
     );
 }
