@@ -420,13 +420,24 @@ CARGO_CONFIG = {
         # that module's cases, and `test_importlib.extension` skips too.
         # `pyre-module` is a pyrex default that `--no-default-features` drops;
         # without it the binary lacks the builtin modules the product ships.
-        "extra": ["--no-default-features", "--features", "dynasm,cpyext,pyre-module"],
+        # `mimalloc` is a default for the same reason and drops the same way,
+        # and it is the global allocator every frame allocation goes through
+        # (`FrameBox::new` -> `external_malloc(alloc_young=True)`): leaving it
+        # out measured a no-argument Python call at 541 ns against 381 ns with
+        # it, so a binary without it gates a slower interpreter than the one
+        # the release ships.  `scripts/build-jit-core.sh` already passes it.
+        "extra": [
+            "--no-default-features",
+            "--features",
+            "dynasm,cpyext,pyre-module,mimalloc",
+        ],
         "bin": "pyre-dynasm",
     },
     "cranelift": {
         # The core: no `pyre-module`, so its build neither compiles nor
-        # translates the builtin modules that crate owns.
-        "extra": ["--no-default-features", "--features", "cranelift"],
+        # translates the builtin modules that crate owns.  `mimalloc` for the
+        # reason the dynasm leg gives, and so both legs measure one allocator.
+        "extra": ["--no-default-features", "--features", "cranelift,mimalloc"],
         "bin": "pyre-cranelift",
     },
     # The wasm backend is not a `pyrex` binary: it is the wasm32 build of
