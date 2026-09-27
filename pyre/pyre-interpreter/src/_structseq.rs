@@ -225,16 +225,26 @@ pub(crate) fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, P
     if args.len() < 2 || args[1].is_null() {
         return Err(PyError::type_error("structseq() requires class + sequence"));
     }
-    let cls = args[0];
+    // `structseq_new(cls, sequence, dict)` keeps its three arguments live
+    // across the class reads and the iteration below, each of which can
+    // collect.
+    let roots = pyre_object::gc_roots::push_roots();
+    let arg_base = roots.pin_roots(&[
+        args[0],
+        args[1],
+        args.get(2).copied().unwrap_or(pyre_object::PY_NULL),
+    ]);
+    let cls = || roots.get(arg_base);
+    let sequence = || roots.get(arg_base + 1);
     // A type built by [`disallow_instantiation`] has no `tp_new` upstream, so
     // its `__new__` is `object.__new__`, which refuses it.  The descriptor is
     // reached directly as `type(sys.flags).__new__(...)`, past the check
     // `type.__call__` makes.
-    crate::call::check_type_instantiable(cls)?;
-    let n_seq = read_class_int(cls, "n_sequence_fields").unwrap_or(0) as usize;
-    let n_fields = read_class_int(cls, "n_fields").unwrap_or(n_seq as i64) as usize;
-    let name = class_name(cls).unwrap_or_else(|| "structseq".to_string());
-    let extra_names = extra_field_names(cls)?;
+    crate::call::check_type_instantiable(cls())?;
+    let n_seq = read_class_int(cls(), "n_sequence_fields").unwrap_or(0) as usize;
+    let n_fields = read_class_int(cls(), "n_fields").unwrap_or(n_seq as i64) as usize;
+    let name = class_name(cls()).unwrap_or_else(|| "structseq".to_string());
+    let extra_names = extra_field_names(cls())?;
 
     // `_structseq.py structseq_new` — the optional second arg is a dict supplying
     // values for the named-only extra fields.
@@ -247,8 +257,8 @@ pub(crate) fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, P
     // Signature binding leaves an omitted optional argument as PY_NULL.  An
     // explicit None is different and is rejected by both PyPy's
     // `isinstance(dict, builtin_dict)` and CPython 3.14's `PyDict_Check`.
-    let dict_arg = args.get(2).copied().filter(|d| !d.is_null());
-    if let Some(d) = dict_arg
+    let dict_arg = || Some(roots.get(arg_base + 2)).filter(|d| !d.is_null());
+    if let Some(d) = dict_arg()
         && !unsafe { pyre_object::is_dict(d) }
     {
         return Err(PyError::type_error(format!(
@@ -259,9 +269,9 @@ pub(crate) fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, P
     // `_structseq.py:102-107` — a 1-field structseq wraps its scalar arg;
     // otherwise the arg is iterated into the field values.
     let mut items = if n_seq == 1 {
-        vec![args[1]]
+        vec![sequence()]
     } else {
-        crate::builtins::collect_iterable(args[1])?
+        crate::builtins::collect_iterable(sequence())?
     };
     if items.len() < n_seq {
         return Err(PyError::type_error(format!(
@@ -299,7 +309,7 @@ pub(crate) fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, P
     // a duplicate positional value or an unknown field; both use the shared
     // structseq diagnostic.  PyPy's older app-level constructor only noticed
     // duplicates among extra fields, so the 3.14 rule wins here.
-    if let Some(d) = dict_arg {
+    if let Some(d) = dict_arg() {
         let allowed = &extra_names[surplus..];
         let has_unexpected = unsafe { pyre_object::w_dict_items(d) }
             .into_iter()
@@ -321,7 +331,7 @@ pub(crate) fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, P
 
     let mut extras: Vec<(&str, PyObjectRef)> = Vec::with_capacity(extra_names.len());
     for (i, ename) in extra_names.iter().enumerate() {
-        let in_dict = dict_arg
+        let in_dict = dict_arg()
             .is_some_and(|d| unsafe { pyre_object::w_dict_getitem_str(d, ename).is_some() });
         let value = if i < surplus {
             if in_dict {
@@ -330,7 +340,7 @@ pub(crate) fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, P
                 ));
             }
             surplus_vals[i]
-        } else if let Some(d) = dict_arg {
+        } else if let Some(d) = dict_arg() {
             unsafe { pyre_object::w_dict_getitem_str(d, ename) }.unwrap_or_else(pyre_object::w_none)
         } else {
             pyre_object::w_none()
@@ -351,7 +361,7 @@ pub(crate) fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, P
         }
     }
 
-    Ok(new_instance_with_extra(cls, body, extras))
+    Ok(new_instance_with_extra(cls(), body, extras))
 }
 
 fn read_class_int(cls: PyObjectRef, attr: &str) -> Option<i64> {
