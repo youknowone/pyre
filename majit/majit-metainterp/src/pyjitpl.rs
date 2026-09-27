@@ -6272,6 +6272,8 @@ impl<M: Clone> MetaInterp<M> {
                 })
                 .flatten()
                 .unwrap_or(green_key);
+                // warmstate.py bound_reached: jitcounter.decay_all_counters()
+                self.warm_state.decay_counters();
                 self.prepare_trace_start_runtime();
                 self.setup_tracing(
                     green_key,
@@ -29905,6 +29907,31 @@ mod tests {
         assert!(
             meta.warm_state.lookup_chain_with_key(&key).is_some(),
             "force-started cell must carry a typed comparekey"
+        );
+    }
+
+    #[test]
+    fn bound_reached_decays_every_counter_before_it_starts_tracing() {
+        // `warmstate.py bound_reached` runs `jitcounter.decay_all_counters()`
+        // before it starts the trace, so a guard that failed once before an
+        // unrelated loop began tracing needs a full `trace_eagerness` of
+        // failures again under `decay=1000`.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        meta.set_trace_eagerness(2);
+        meta.warm_state.set_param_decay(1000);
+        let guard_hash = meta.warm_state.fetch_next_hash();
+        assert!(!meta.warm_state.tick_guard_failure(guard_hash));
+
+        let code: usize = 0x5400;
+        let pc: usize = 21;
+        let green_key = crate::green_key_from_code_ptr(code, pc);
+        meta.bound_reached(green_key, (code, pc), None, None, &[Value::Int(0)]);
+        assert!(meta.tracing.is_some(), "bound_reached must start tracing");
+
+        assert!(
+            !meta.warm_state.tick_guard_failure(guard_hash),
+            "the failure counted before the trace start must have decayed away"
         );
     }
 
