@@ -49597,19 +49597,11 @@ mod tests {
             .collect();
 
         assert!(!ops.iter().any(|op| matches!(op.kind, OpKind::Call { .. })));
-        let copies: Vec<_> = ops
-            .iter()
-            .filter_map(|op| match &op.kind {
-                OpKind::UnaryOp {
-                    op,
-                    operand,
-                    result_ty,
-                } if op == "same_as" => Some((operand, result_ty)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(copies.len(), 1, "transmute must become one scalar copy");
-        assert_eq!(*copies[0].1, ValueType::Int);
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as")),
+            "same-bank transmute binds the destination to the input"
+        );
         let input = ops
             .iter()
             .find_map(|op| match (&op.result, &op.kind) {
@@ -49617,7 +49609,17 @@ mod tests {
                 _ => None,
             })
             .expect("value input");
-        assert_eq!(copies[0].0.id(), input.id());
+        let returned = graph
+            .blocks
+            .iter()
+            .find_map(|block| {
+                block.exits.iter().find_map(|link| {
+                    (link.target == graph.returnblock).then(|| link.args.first())
+                })
+            })
+            .flatten()
+            .and_then(LinkArg::as_variable);
+        assert_eq!(returned, Some(input));
     }
 
     fn scalar_method_call_fixture(
