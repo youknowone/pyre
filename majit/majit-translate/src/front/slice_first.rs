@@ -278,16 +278,14 @@ fn rewire_one_slice_first_site(
             let item_index = graph.alloc_value_var();
             if matches!(site.access, SliceAccess::Last) {
                 let len = graph.alloc_value_var();
+                let len_kind = crate::front::bool_then::slice_len_op(
+                    slice_in_then.clone(),
+                    site.array_type_id.as_deref(),
+                    site.string_byte_view,
+                );
                 graph.block_mut(then_bb).operations.push(SpaceOperation {
                     result: Some(len.clone()),
-                    kind: OpKind::Call {
-                        target: CallTarget::FunctionPath {
-                            segments: vec!["__len".to_string()],
-                            fun_decl_id: None,
-                        },
-                        args: crate::model::call_args(vec![slice_in_then.clone()]),
-                        result_ty: ValueType::Int,
-                    },
+                    kind: len_kind,
                 });
                 let one = graph.alloc_value_var();
                 graph.block_mut(then_bb).operations.push(SpaceOperation {
@@ -412,16 +410,14 @@ fn rewire_one_slice_first_site(
         graph.blocks[a].operations.remove(ci);
     }
     let len = graph.alloc_value_var();
+    let len_kind = crate::front::bool_then::slice_len_op(
+        slice.clone(),
+        site.array_type_id.as_deref(),
+        site.string_byte_view,
+    );
     graph.block_mut(a_id).operations.push(SpaceOperation {
         result: Some(len.clone()),
-        kind: OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: vec!["__len".to_string()],
-                fun_decl_id: None,
-            },
-            args: crate::model::call_args(vec![slice.clone()]),
-            result_ty: ValueType::Int,
-        },
+        kind: len_kind,
     });
     let cond = graph.alloc_value_var();
     if let SliceAccess::RangeFrom { start: index, .. } = &site.access {
@@ -556,14 +552,18 @@ mod tests {
             )),
             "residual first call removed from A"
         );
-        // A synthesizes the `__len` guard and a `gt` compare, then branches.
+        // A synthesizes the length guard and a `gt` compare, then branches.
+        // The site carries no ARRAY identity, which is length-prefixed, so the
+        // guard is the `arraylen_gc` op and not the `__len` marker.
         assert!(
             g.blocks[a.0].operations.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                    if segments.first().map(String::as_str) == Some("__len")
+                OpKind::ArrayLen {
+                    nolength: false,
+                    ..
+                }
             )),
-            "A synthesizes the __len guard"
+            "A synthesizes the arraylen_gc guard"
         );
         assert!(
             g.blocks[a.0]
@@ -694,6 +694,77 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec![Some("[u8]".into())]);
+        // `[u8]` is one of the length-prefixed synthetic spellings, so both
+        // lengths this rewrite needs -- A's guard and `Last`'s `len - 1` --
+        // read the header under the same identity the element read carries.
+        let len_ids: Vec<Option<String>> = g
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::ArrayLen { array_type_id, .. } => Some(array_type_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(len_ids, vec![Some("[u8]".into()), Some("[u8]".into())]);
+    }
+
+    /// A `Vec` indexes a headerless buffer, so its length is the third word of
+    /// the `Vec` value and not an ARRAY header.  `arraylen_gc` would want a
+    /// `lendescr` that identity has no reason to carry, so the guard keeps the
+    /// `__len` marker the rtyper answers through `ll_length`.
+    #[test]
+    fn last_on_a_headerless_buffer_keeps_the_len_marker() {
+        let mut g = FunctionGraph::new("test_slice_last_vec");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "core".into(),
+                            "slice".into(),
+                            "<Impl>".into(),
+                            "last".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![slice]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![opt.clone()]);
+        let mut site = slice_first_site(opt);
+        site.access = SliceAccess::Last;
+        site.payload_ty = ValueType::Int;
+        site.array_type_id = Some("Vec<u8>".into());
+        assert_eq!(rewire_slice_first_call_sites(&mut g, &[site]), 1);
+        assert_eq!(
+            g.blocks
+                .iter()
+                .flat_map(|blk| &blk.operations)
+                .filter(|op| matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.first().map(String::as_str) == Some("__len")
+                ))
+                .count(),
+            2,
+            "a headerless buffer keeps the __len marker"
+        );
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|blk| &blk.operations)
+                .any(|op| matches!(op.kind, OpKind::ArrayLen { .. })),
+            "no arraylen_gc on a headerless buffer"
+        );
     }
 
     #[test]
@@ -744,6 +815,29 @@ mod tests {
                 .operations
                 .iter()
                 .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+        }));
+        // The bounds guard and the `len - 1` index read the same receiver, so
+        // both take `ll_strlen` and neither reads an ARRAY header.
+        let strlens = g
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments == &["__strlen"]
+                )
+            })
+            .count();
+        assert_eq!(strlens, 2, "guard and index length both use __strlen");
+        assert!(!g.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayLen { .. }))
         }));
     }
 

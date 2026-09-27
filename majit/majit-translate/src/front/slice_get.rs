@@ -444,16 +444,16 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
         graph.blocks[a].operations.remove(ci);
     }
     let len = graph.alloc_value_var();
+    let len_kind = crate::front::bool_then::slice_len_op(
+        slice,
+        site.array_type_id.as_deref(),
+        // `get` has no string-byte-view receiver: its element read is always
+        // an `ArrayRead`, where `first`/`last` also serve `as_bytes()` views.
+        false,
+    );
     graph.block_mut(a_id).operations.push(SpaceOperation {
         result: Some(len.clone()),
-        kind: OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: vec!["__len".to_string()],
-                fun_decl_id: None,
-            },
-            args: crate::model::call_args(vec![slice]),
-            result_ty: ValueType::Int,
-        },
+        kind: len_kind,
     });
     let cond = graph.alloc_value_var();
     graph.block_mut(a_id).operations.push(SpaceOperation {
@@ -556,14 +556,18 @@ mod tests {
             !residual_get_survives(&g, a),
             "residual get call removed from A"
         );
-        // A synthesizes the `__len` guard and an `lt` compare, then branches.
+        // A synthesizes the length guard and an `lt` compare, then branches.
+        // The site carries no ARRAY identity, which is length-prefixed, so the
+        // guard is the `arraylen_gc` op and not the `__len` marker.
         assert!(
             g.blocks[a.0].operations.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                    if segments.first().map(String::as_str) == Some("__len")
+                OpKind::ArrayLen {
+                    nolength: false,
+                    ..
+                }
             )),
-            "A synthesizes the __len guard"
+            "A synthesizes the arraylen_gc guard"
         );
         assert!(
             g.blocks[a.0]

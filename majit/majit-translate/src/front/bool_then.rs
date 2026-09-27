@@ -597,6 +597,50 @@ pub(crate) fn close_goto_mixed(
     graph.set_control_flow_metadata(block, None, vec![link]);
 }
 
+/// The length read a slice bounds guard branches on.
+///
+/// The rtyper reaches `arraylen_gc` for a `SomeList` receiver
+/// (`AbstractBaseListRepr.rtype_len`), and the guarded element read already
+/// names the ARRAY it addresses, so emit that op here with the same identity
+/// instead of the `__len` marker: guard and read then carry one descr, and a
+/// graph that skips the rtyper spine gets a length operation rather than a
+/// call no codewriter arm lowers.
+///
+/// Two receivers answer with a marker instead.  A string byte view is a
+/// `StringRepr` and not a GC array, so its length is `ll_strlen` and naming
+/// the array op would address a `Wtf8` cast of a wrapper as the rstr; it takes
+/// the `__strlen` marker `is_slice_is_empty` already emits for the same
+/// receiver.  A `nolength` ARRAY stores its length in the value rather than an
+/// ARRAY header, so `ArrayDescr.lendescr` is absent and `bh_arraylen_gc` has
+/// nothing to read; it keeps `__len`, which `rtype_len` answers off the list
+/// repr.
+pub(crate) fn slice_len_op(
+    base: Variable,
+    array_type_id: Option<&str>,
+    string_byte_view: bool,
+) -> OpKind {
+    let nolength = crate::front::typestr::nolength_from_array_type_id(array_type_id);
+    let marker = if string_byte_view {
+        "__strlen"
+    } else if nolength {
+        "__len"
+    } else {
+        return OpKind::ArrayLen {
+            base,
+            array_type_id: array_type_id.map(str::to_owned),
+            nolength,
+        };
+    };
+    OpKind::Call {
+        target: CallTarget::FunctionPath {
+            segments: vec![marker.to_string()],
+            fun_decl_id: None,
+        },
+        args: crate::model::call_args(vec![base]),
+        result_ty: ValueType::Int,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
