@@ -813,4 +813,36 @@ mod tests {
             "pyre_interpreter::call::take_last_exec_ctx must be published in jit_trace_fnaddrs"
         );
     }
+
+    /// A type static a traced body compares against (`is_int` reads
+    /// `INT_USER_TYPE`) must reach the constant pool as its runtime address.
+    /// One missing from `jit_static_pytype_addrs` stays a symbolic hash, and
+    /// every descent through the body that names it is refused.
+    #[test]
+    fn no_jitcode_constant_is_an_unbound_type_static() {
+        let mut unbound = Vec::new();
+        for jc in crate::jitcode_runtime::all_jitcodes() {
+            let Some(body) = jc.try_body() else {
+                continue;
+            };
+            let constants = body
+                .constants_i
+                .iter()
+                .copied()
+                .chain(body.constants_r.iter().map(|slot| slot.get()));
+            for c in constants {
+                if let Some(path) = symbolic_fnaddr_path(c)
+                    && path.ends_with("_TYPE")
+                {
+                    unbound.push(format!("{} in {}", path, jc.name));
+                }
+            }
+        }
+        unbound.sort();
+        unbound.dedup();
+        assert!(
+            unbound.is_empty(),
+            "type statics without a runtime address: {unbound:?}"
+        );
+    }
 }

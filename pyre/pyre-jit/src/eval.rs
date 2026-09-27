@@ -3971,14 +3971,21 @@ fn build_gc() -> Box<MiniMarkGC> {
     // every target, so they close the ungated block with the range
     // iterators (185-187) instead of sitting in the target-gated tail
     // whose ids move (windows +3 vs darwin).
-    let int_user_tid = gc.register_type(
-        TypeInfo::with_custom_trace(
-            pyre_object::intobject::W_INT_USER_OBJECT_SIZE,
-            int_object_custom_trace,
-        )
-        .object_layout_without_subclass_range(),
-    );
+    let int_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::intobject::W_INT_USER_OBJECT_SIZE,
+        w_int_tid,
+        int_object_custom_trace,
+    ));
     debug_assert_eq!(int_user_tid, pyre_object::intobject::W_INT_USER_GC_TYPE_ID);
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::INT_USER_TYPE as *const _ as usize,
+        int_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::INT_USER_TYPE as *const _ as usize,
+        int_user_tid,
+    );
     let unicode_user_tid = gc.register_type(
         TypeInfo::with_custom_trace(
             pyre_object::unicodeobject::W_UNICODE_USER_OBJECT_SIZE,

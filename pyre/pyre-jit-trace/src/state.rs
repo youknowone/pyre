@@ -2846,15 +2846,9 @@ unsafe fn is_trace_plain_int(obj: PyObjectRef) -> bool {
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
         return true;
     }
-    if !unsafe { py_type_check(obj, &INT_TYPE) } {
-        return false;
-    }
-    let int_typeobj = get_instantiate(&INT_TYPE);
-    if int_typeobj.is_null() {
-        return unsafe { (*obj).w_class.is_null() };
-    }
-    let w_class = unsafe { (*obj).w_class };
-    w_class.is_null() || std::ptr::eq(w_class, int_typeobj)
+    // An int subclass instance carries `INT_USER_TYPE`, so the `INT_TYPE`
+    // typeptr alone is `type(obj) is int`.
+    unsafe { py_type_check(obj, &INT_TYPE) }
 }
 
 #[inline]
@@ -15444,11 +15438,7 @@ pub fn execute_inline_residual_call(
 ///
 /// Delegates to the single `pyre_object::is_plain_int1` helper that
 /// already implements the full upstream predicate including the
-/// `w_class != get_instantiate(&INT_TYPE)` int-subclass rejection
-/// (`listobject.rs`); a previous in-place `py_type_check` shortcut
-/// at this site was a deviation that mishandled int subclasses
-/// because pyre stores them with `ob_type == &INT_TYPE` and only
-/// distinguishes them via `w_class` (`w_int_new_unique` in `intobject.rs`).
+/// int-subclass rejection (`listobject.rs`).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.

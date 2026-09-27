@@ -4099,7 +4099,8 @@ unsafe fn needs_set_binop_dispatch_unless_exact(a: PyObjectRef, b: PyObjectRef) 
 /// `jit.promote(w_type)` as `W_TypeObject.lookup` spells it, so the trace
 /// pins `w_class` with a `guard_value` and the test against the payload's
 /// canonical class folds.  The test itself is the shared
-/// [`pyre_object::class_word_is_exact_builtin`] tail.
+/// [`pyre_object::class_word_is_exact_builtin`] tail, reached only when the
+/// typeptr alone ([`pyre_object::typeptr_is_exact_builtin`]) did not decide.
 #[inline]
 unsafe fn is_exact_builtin_instance_promoted(a: PyObjectRef) -> bool {
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(a) {
@@ -4107,6 +4108,9 @@ unsafe fn is_exact_builtin_instance_promoted(a: PyObjectRef) -> bool {
     }
     if a.is_null() {
         return false;
+    }
+    if pyre_object::typeptr_is_exact_builtin(a) {
+        return true;
     }
     let w_class = majit_metainterp::jit::promote((*a).w_class);
     pyre_object::class_word_is_exact_builtin(a, w_class)
@@ -4263,11 +4267,11 @@ unsafe fn same_rpy_type(a: PyObjectRef, b: PyObjectRef) -> bool {
 /// `_make_binop_impl` / `_make_comparison_impl` first-arm gate:
 /// `type(w1) is type(w2) and not w1.user_overridden_class`.
 ///
-/// A pyre user subclass keeps the builtin `ob_type` and only retags
-/// `w_class` (`tag_subclass_instance` / `w_int_subclass_new`), so
-/// `rpy_type_of` cannot tell `7` from `IntOperand(3)`. Checking both
-/// operands restores the observable: the shortcut fires only for a pair
-/// of exact builtins.
+/// A user subclass of a builtin without a `_getusercls` class keeps the
+/// builtin `ob_type` and only retags `w_class` (`tag_subclass_instance`), so
+/// `rpy_type_of` cannot tell the two apart; checking both operands restores
+/// the observable, and the shortcut fires only for a pair of exact builtins.
+/// An `int` subclass instance already differs by typeptr (`INT_USER_TYPE`).
 #[majit_macros::always_inline]
 unsafe fn same_unoverridden_rpy_type(a: PyObjectRef, b: PyObjectRef) -> bool {
     same_rpy_type(a, b) && !user_overridden_class(a) && !user_overridden_class(b)
@@ -8541,7 +8545,8 @@ mod tests {
             // `get_instantiate` is still null in this unit-test process;
             // retag `w_class` the way `tag_subclass_instance` would.
             (*user).w_class = &FLOAT_TYPE as *const PyType as PyObjectRef;
-            assert!(same_rpy_type(exact, user));
+            // `W_IntObjectUser` is its own interp-level class.
+            assert!(!same_rpy_type(exact, user));
             assert!(!same_unoverridden_rpy_type(exact, user));
             assert!(same_unoverridden_rpy_type(exact, w_int_new(3)));
         }

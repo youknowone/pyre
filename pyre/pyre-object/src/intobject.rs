@@ -277,7 +277,7 @@ pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
     let obj = W_IntObjectUser {
         base: W_IntObject {
             ob_header: PyObject {
-                ob_type: &INT_TYPE as *const PyType,
+                ob_type: &crate::pyobject::INT_USER_TYPE as *const PyType,
                 w_class: get_instantiate(&INT_TYPE),
             },
             intval: value,

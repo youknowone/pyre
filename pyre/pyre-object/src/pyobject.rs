@@ -36,7 +36,9 @@ use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
     "subclassrange_min",
     "subclassrange_max",
     "name",
-    "instantiate"
+    "instantiate",
+    "user_subclass",
+    "user_base"
 )]
 pub struct PyType {
     pub subclassrange_min: AtomicI64,
@@ -55,6 +57,17 @@ pub struct PyType {
     /// The bit lives on the typeptr, the RPython class, not on a
     /// caller-side type whitelist.
     pub has_mapdict_mixin: bool,
+    /// `typedef.py get_unique_interplevel_subclass(space, cls)` answered
+    /// ahead of time: the class every user subclass instance of this
+    /// builtin carries as its typeptr (`_unique_subclass_cache[cls]`).  Null
+    /// for a class whose user subclasses do not have one yet.  Since every
+    /// user subclass instance carries that typeptr, an object whose typeptr
+    /// is this class is an exact instance.
+    pub user_subclass: *const PyType,
+    /// The builtin class a `_getusercls` class was made from: its instances
+    /// share that class's typedef and payload layout.  Null for every other
+    /// class.
+    pub user_base: *const PyType,
 }
 
 /// Common header for all Python objects.
@@ -145,7 +158,39 @@ const fn new_pytype_kind(name: &'static str, has_mapdict_mixin: bool) -> PyType 
         name,
         instantiate: AtomicPtr::new(std::ptr::null_mut()),
         has_mapdict_mixin,
+        user_subclass: std::ptr::null(),
+        user_base: std::ptr::null(),
     }
+}
+
+/// [`new_pytype`] for a builtin whose user subclass instances carry
+/// `user_subclass` as their typeptr (`typedef.py _getusercls`).
+pub const fn new_pytype_with_user_subclass(
+    name: &'static str,
+    user_subclass: &'static PyType,
+) -> PyType {
+    let mut tp = new_pytype_kind(name, false);
+    tp.user_subclass = user_subclass;
+    tp
+}
+
+/// The `_getusercls` class made from `base`: it imports
+/// `MapdictStorageMixin` after `base`'s payload.
+pub const fn new_user_pytype(name: &'static str, base: &'static PyType) -> PyType {
+    let mut tp = new_pytype_kind(name, true);
+    tp.user_base = base;
+    tp
+}
+
+/// The builtin class whose typedef and payload layout `tp` uses: `tp`'s
+/// `user_base` for a `_getusercls` class, `tp` itself otherwise.
+///
+/// # Safety
+/// `tp` must point at a live `PyType`.
+#[inline]
+pub unsafe fn layout_base(tp: *const PyType) -> *const PyType {
+    let base = unsafe { (*tp).user_base };
+    if base.is_null() { tp } else { base }
 }
 
 /// rclass.py:739-743 parity — cache the W_TypeObject on the PyType
@@ -216,7 +261,22 @@ pub unsafe fn is_exact_builtin_instance(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
     }
+    if unsafe { typeptr_is_exact_builtin(obj) } {
+        return true;
+    }
     unsafe { class_word_is_exact_builtin(obj, (*obj).w_class) }
+}
+
+/// A builtin with a `_getusercls` class (`typedef.py`
+/// `get_unique_interplevel_subclass`) stamps that class as the typeptr of
+/// every user subclass instance, so its own typeptr proves exactness and
+/// the class word need not be read.  `false` means "not decided here".
+///
+/// # Safety
+/// `obj` must be a valid non-null, untagged `PyObjectRef`.
+#[inline]
+pub unsafe fn typeptr_is_exact_builtin(obj: PyObjectRef) -> bool {
+    unsafe { !(*(*obj).ob_type).user_subclass.is_null() }
 }
 
 /// The tail of [`is_exact_builtin_instance`] for a non-null `obj` whose
@@ -274,6 +334,11 @@ pub unsafe fn is_exact_type(obj: PyObjectRef, tp: &PyType) -> bool {
         return false;
     }
     unsafe {
+        // For a builtin with a `_getusercls` class, its own typeptr proves
+        // exactness: every user subclass instance carries the user class.
+        if !tp.user_subclass.is_null() && std::ptr::eq((*obj).ob_type, tp as *const PyType) {
+            return true;
+        }
         let w_class = (*obj).w_class;
         if w_class.is_null() {
             std::ptr::eq((*obj).ob_type, tp as *const PyType)
@@ -304,7 +369,9 @@ const _: () = {
     );
 };
 
-pub static INT_TYPE: PyType = new_pytype("int");
+pub static INT_TYPE: PyType = new_pytype_with_user_subclass("int", &INT_USER_TYPE);
+/// `W_IntObjectUser` (`typedef.py _getusercls(W_IntObject)`).
+pub static INT_USER_TYPE: PyType = new_user_pytype("int", &INT_TYPE);
 pub static BOOL_TYPE: PyType = new_pytype("bool");
 pub static FLOAT_TYPE: PyType = new_pytype("float");
 pub static COMPLEX_TYPE: PyType = new_pytype("complex");
@@ -709,7 +776,10 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (165, Some(0)),
     (166, Some(0)),
     // 167-169 are `typedef.py` `_getusercls` layouts (int/str/tuple user).
-    // They have no rclass vtable of their own (`object_layout_without_subclass_range`).
+    // `W_IntObjectUser` is an rclass subclass of `W_IntObject`; the str and
+    // tuple ones have no rclass vtable of their own yet
+    // (`object_layout_without_subclass_range`).
+    (167, Some(1)),
     // Native-only type IDs 170 and 171 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
@@ -1255,6 +1325,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         // every target.
         subclass_range_alias(165, typed::<crate::functional::W_IntRangeStepOneIterator>()),
         subclass_range_alias(166, typed::<crate::functional::W_IntRangeOneArgIterator>()),
+        subclass_range_alias(167, &INT_USER_TYPE),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),
@@ -1437,7 +1508,11 @@ pub unsafe fn is_int(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return true;
     }
-    unsafe { py_type_check(obj, &INT_TYPE) || py_type_check(obj, &BOOL_TYPE) }
+    unsafe {
+        py_type_check(obj, &INT_TYPE)
+            || py_type_check(obj, &BOOL_TYPE)
+            || py_type_check(obj, &INT_USER_TYPE)
+    }
 }
 
 #[inline]

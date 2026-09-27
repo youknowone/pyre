@@ -554,6 +554,7 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
     name: &str,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
     unsafe {
+        let tp = pyre_object::pyobject::layout_base(tp);
         let is_leaf = std::ptr::eq(tp, &INT_TYPE as *const PyType)
             || std::ptr::eq(tp, &LONG_TYPE as *const PyType)
             || std::ptr::eq(tp, &FLOAT_TYPE as *const PyType)
@@ -877,7 +878,9 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let mut obj = obj;
-        let tp = (*obj).ob_type;
+        // The formatting below is keyed on the payload layout, which a
+        // `_getusercls` class shares with the builtin it was made from.
+        let tp = pyre_object::pyobject::layout_base((*obj).ob_type);
         // A builtin leaf subclass keeps `ob_type` at the canonical storage
         // type but carries the Python class in `w_class`; dispatch its
         // `__repr__` override before the `ob_type`-keyed formatting below.
