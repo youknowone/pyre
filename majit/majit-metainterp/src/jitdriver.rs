@@ -107,6 +107,14 @@ fn bh_jitdrivers_sd(
     table
 }
 
+impl crate::pyjitpl::MetaInterpStaticData {
+    /// `metainterp_sd.jitdrivers_sd` in the blackhole's row type, indexed by
+    /// `jdindex` like the static data it is cast from.
+    pub fn bh_jitdrivers_sd(&self) -> &std::sync::Arc<[crate::blackhole::BhJitDriverSd]> {
+        bh_jitdrivers_sd(self)
+    }
+}
+
 /// `warmspot.py:449` `jd.result_type` projected to the blackhole dispatch char.
 fn bh_return_type(result_type: majit_ir::Type) -> crate::blackhole::BhReturnType {
     match result_type {

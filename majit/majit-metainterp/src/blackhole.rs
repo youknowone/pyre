@@ -5646,6 +5646,11 @@ mod tests {
             let caller_jitcode = caller_b.finish();
 
             let mut builder = super::build_inline_call_only_bh_builder();
+            // `jitdrivers_sd[jdindex]` for the stamped portal jitcode.
+            builder.setup_jitdrivers_sd(vec![super::BhJitDriverSd {
+                result_type: super::BhReturnType::Int,
+                ..Default::default()
+            }]);
             let mut caller = builder.acquire_interp();
             caller.setposition(std::sync::Arc::new(caller_jitcode), caller_resume);
             let mut inner = builder.acquire_interp();
@@ -5695,6 +5700,11 @@ mod tests {
             let caller_jitcode = caller_b.finish();
 
             let mut builder = super::build_inline_call_only_bh_builder();
+            // `jitdrivers_sd[jdindex]` for the stamped portal jitcode.
+            builder.setup_jitdrivers_sd(vec![super::BhJitDriverSd {
+                result_type: super::BhReturnType::Int,
+                ..Default::default()
+            }]);
             let mut caller = builder.acquire_interp();
             caller.setposition(std::sync::Arc::new(caller_jitcode), 0);
             let mut inner = builder.acquire_interp();
@@ -5773,6 +5783,11 @@ mod tests {
             let caller_jitcode = caller_b.finish();
 
             let mut builder = super::build_inline_call_only_bh_builder();
+            // `jitdrivers_sd[jdindex]` for the stamped portal jitcode.
+            builder.setup_jitdrivers_sd(vec![super::BhJitDriverSd {
+                result_type: super::BhReturnType::Int,
+                ..Default::default()
+            }]);
             let mut caller = builder.acquire_interp();
             caller.setposition(std::sync::Arc::new(caller_jitcode), caller_resume);
             caller.virtualizable_ptr = CALLER_VABLE;
@@ -7985,22 +8000,12 @@ fn portal_jd_for(bh: &BlackholeInterpreter) -> Option<usize> {
 }
 
 /// The `jd.handle_jitexc_from_bh` and the `result_kind` a recursive portal
-/// level uses, resolved together so they cannot come from different drivers.
+/// level uses, both read off `jitdrivers_sd[jdindex]`.
 ///
-/// Upstream needs no such pairing: `blackhole.py` picks one `jd` and reads both
-/// off it. pyre splits them because the hooks are registered from the consumer
-/// crate, and the split is what let a substituted runner be validated against
-/// the owning driver's declared kind.
-///
-/// ★ A miss still falls back to any registered runner so a test fixture
-/// that stamps a driver index without installing a hook keeps working.
-/// Production registers one hook per driver (`eval.rs` jd0 and jd1).
-///
-/// What is withheld instead is the *kind*: a substituted runner's outcome is
-/// not validated against the owning driver's `result_type`, because that pair
-/// describes two different drivers. `None` leaves
-/// [`handle_jitexception_dispatch`] deciding on the variant alone, which is
-/// what it did before any driver was consulted.
+/// `blackhole.py` indexes `self.builder.metainterp_sd.jitdrivers_sd[jdindex]`
+/// directly, so a stamped index outside the table is an `IndexError`, not a
+/// driverless frame. A frame whose jitcode carries no driver stamp is not a
+/// portal and gets neither.
 fn portal_dispatch_for(
     bh: &BlackholeInterpreter,
 ) -> (Option<PortalRunnerHook>, Option<BhReturnType>) {
@@ -8008,33 +8013,14 @@ fn portal_dispatch_for(
         return (None, None);
     };
     let Some(jd) = bh.jitdrivers_sd.get(jd_index) else {
-        portal_substitution_report(bh, jd_index, bh.jitdrivers_sd.len());
-        return (None, None);
+        panic!(
+            "blackhole: jitcode `{}` is stamped with jitdrivers_sd[{jd_index}] \
+             but the table has {} slot(s)",
+            bh.jitcode.name,
+            bh.jitdrivers_sd.len(),
+        );
     };
     (jd.handle_jitexc_from_bh, Some(jd.result_type))
-}
-
-/// `MAJIT_BH_PORTAL_SUBST`: name each recursive portal level that re-enters
-/// through a runner its own driver did not register.
-///
-/// `pyre_portal_runner` reads `all_r[1]` as a `PyFrame*`, so a substituted
-/// runner reached with another driver's reds is a type confusion that would
-/// surface as a bug in the substituted driver. It is not reported as a fault
-/// because pyre registers one runner for many drivers by construction (see
-/// [`portal_dispatch_for`]); this makes the substitutions countable so the
-/// set that actually re-enters a portal can be separated from the set that
-/// merely resolves a hook it never calls.
-fn portal_substitution_report(bh: &BlackholeInterpreter, jd_index: usize, registered: usize) {
-    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ARMED.get_or_init(|| std::env::var_os("MAJIT_BH_PORTAL_SUBST").is_some()) {
-        return;
-    }
-    eprintln!(
-        "[bh-portal-subst] jitdrivers_sd[{jd_index}] owns portal jitcode `{}` \
-         and registered no handle_jitexc_from_bh; {registered} slot(s) in the \
-         table",
-        bh.jitcode.name,
-    );
 }
 
 /// Handler for `live/` — `bhimpl_live` (`blackhole.py`): record the marker's

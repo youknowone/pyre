@@ -2838,8 +2838,13 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     //   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
     //   fnptr        = adr2int(jitdriver_sd.portal_runner_adr)
     //   calldescr    = jitdriver_sd.mainjitcode.calldescr
-    let jitdrivers_sd: std::sync::Arc<[majit_metainterp::blackhole::BhJitDriverSd]> =
-        std::sync::Arc::from([majit_metainterp::blackhole::BhJitDriverSd {
+    //
+    // The table keeps every driver at its own `jdindex`: a resumed jd1 or jd2
+    // jitcode still carries that index, so a one-slot table would leave its
+    // `handle_jitexc_from_bh` unreachable. Only jd0's slot is replaced.
+    let jitdrivers_sd: std::sync::Arc<[majit_metainterp::blackhole::BhJitDriverSd]> = {
+        let mut table = driver.meta_interp().staticdata.bh_jitdrivers_sd().to_vec();
+        let jd0 = majit_metainterp::blackhole::BhJitDriverSd {
             result_type: majit_metainterp::blackhole::BhReturnType::Ref,
             portal_runner_ptr: Some(bh_portal_runner_c),
             handle_jitexc_from_bh: driver
@@ -2877,7 +2882,13 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             // `portal_jd_for` from claiming a frame for a synthetic driver
             // assembled around whichever jitcode happened to be innermost when
             // the chain was built.
-        }]);
+        };
+        match table.first_mut() {
+            Some(slot) => *slot = jd0,
+            None => table.push(jd0),
+        }
+        std::sync::Arc::from(table)
+    };
     {
         let vinfo = bh.virtualizable_info;
         let mut current = Some(&mut *bh);

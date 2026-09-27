@@ -23185,6 +23185,8 @@ mod metainterp_static_data_tests {
             portal.set_index(0);
             portal.set_jitdriver_sd(0);
             let mut meta = MetaInterp::<()>::new(0);
+            // `jitdrivers_sd[0]` for the portal jitcode stamped above.
+            meta.ensure_default_driver_sd();
             meta.finish_setup_descrs_for_jitdrivers();
             meta.force_start_tracing(0, (0, 0), None, &[Value::Int(40), Value::Int(2)]);
             meta.initialize_state_from_start(

@@ -16184,15 +16184,19 @@ impl CodeWriter {
         // builds the populated `JitCode` as the final codewriter step, so
         // stamp the exact jdindex while constructing that populated object.
         // Non-portals keep the JitCode constructor default of `None`.
-        if let Some(idx) = self
+        if self
             .callcontrol()
             .jitdriver_sd_from_portal_graph(code as *const CodeObject)
+            .is_some()
         {
-            // OnceLock semantics: only the first portal grab sets the
-            // index. RPython sets it once at call.py:148 then leaves it
-            // for the lifetime of the jitcode.
+            // call.py `jd.mainjitcode.jitdriver_sd = jd`. The lookup above
+            // only answers "this graph is a portal". The stamp is the
+            // pypyjit slot in `MetaInterpStaticData.jitdrivers_sd`
+            // (`pypyjit_driver_descriptor` via `register_jitdriver_sd`),
+            // not the position in `CallControl.jitdrivers_sd`. An ordinary
+            // callee is absent from that lookup and keeps `None`.
             if jitcode.jitdriver_sd().is_none() {
-                jitcode.set_jitdriver_sd(idx);
+                jitcode.set_jitdriver_sd(super::call::PYPYJIT_DRIVER_SD_INDEX);
             }
         }
         // Per-code stack base in `locals_cells_stack_w`. RPython's JitCode
@@ -16296,10 +16300,10 @@ impl CodeWriter {
         self.callcontrol().grab_initial_jitcodes();
         // codewriter.py:79-84 drain + per-jitcode assemble.
         let all_jitcodes = self.drain_unfinished_graphs();
-        // call.py `jd.mainjitcode.jitdriver_sd = jd` — assign
-        // jdindex to each portal's populated `PyJitCode` AFTER the
-        // drain so we use the actual position in
-        // `CallControl.jitdrivers_sd` instead of a hardcoded `Some(0)`.
+        // `grab_initial_jitcodes` already stamped
+        // `PYPYJIT_DRIVER_SD_INDEX` on each portal shell. Rebind
+        // `jd.mainjitcode` to the populated Arc; do not restamp from
+        // this list's position.
         self.assign_portal_jitdriver_indices();
         // codewriter.py:86-88 final log lines — elided.
         // codewriter.py `return all_jitcodes`.
