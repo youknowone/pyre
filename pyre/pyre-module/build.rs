@@ -6,6 +6,8 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // Named by pyre-interpreter/build.rs; this crate only branches on it.
+    println!("cargo:rustc-check-cfg=cfg(pyre_ffi_type_longdouble)");
     let target = std::env::var("TARGET").unwrap_or_default();
     if target.ends_with("-pc-windows-msvc") {
         println!("cargo:rerun-if-changed=src/module/_ctypes/seh.c");

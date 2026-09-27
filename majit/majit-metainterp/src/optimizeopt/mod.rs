@@ -75,10 +75,12 @@ impl ExtraQueue {
         }
     }
 
+    #[allow(dead_code)] // optimizer.py extra-op queue front
     pub(crate) fn front(&self) -> Option<&(usize, majit_ir::OpRc)> {
         self.0.first()
     }
 
+    #[allow(dead_code)] // optimizer.py extra-op queue back
     pub(crate) fn back(&self) -> Option<&(usize, majit_ir::OpRc)> {
         self.0.last()
     }
@@ -91,6 +93,7 @@ impl ExtraQueue {
         self.0.iter()
     }
 
+    #[allow(dead_code)] // optimizer.py extra-op queue len
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
@@ -3610,6 +3613,7 @@ impl OptContext {
     /// copying `_forwarded` and linking input -> clone. One box per value, the
     /// op IS the box (resoperation.py AbstractResOpOrInputArg). Falls back to the clone path when
     /// no structurally-matching input op is live at this position.
+    #[allow(dead_code)] // resoperation.py AbstractResOp emit reuse
     pub(crate) fn emit_reusing(&mut self, op: Op) -> OpRef {
         self.emit_impl(op, true)
     }
@@ -7149,7 +7153,6 @@ impl OptContext {
             if let Some(fa) = op.guard_fail_args() {
                 let fargs: smallvec::SmallVec<[OpRef; 8]> =
                     fa.iter().map(|b| b.to_opref()).collect();
-                drop(fa);
                 for farg in fargs {
                     if !farg.is_none() {
                         // regalloc.py:1206: Const objects skip forcing.

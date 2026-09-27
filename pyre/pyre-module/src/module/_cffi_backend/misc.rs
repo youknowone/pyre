@@ -10,8 +10,8 @@ use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::ffi::{c_char, c_double, c_int};
 
-/// `misc.py`'s `long double` shims.  Every one of them is C because Rust has
-/// no `long double` type at all.
+// `misc.py`'s `long double` shims.  Every one of them is C because Rust has
+// no `long double` type at all.
 unsafe extern "C" {
     pub fn pyre_cffi_sizeof_long_double() -> usize;
     pub fn pyre_cffi_alignof_long_double() -> usize;
@@ -237,7 +237,7 @@ pub unsafe fn read_raw_long_data(target: usize, size: i64) -> Result<i64, PyErro
 /// # Safety
 /// `target` must point at `size` readable bytes.
 pub unsafe fn read_raw_signed_data(target: usize, size: i64) -> Result<i64, PyError> {
-    unsafe {
+    {
         Ok(match size {
             1 => raw_read_i8(target),
             2 => raw_read_i16(target),
@@ -253,7 +253,7 @@ pub unsafe fn read_raw_signed_data(target: usize, size: i64) -> Result<i64, PyEr
 /// # Safety
 /// `target` must point at `size` readable bytes.
 pub unsafe fn read_raw_unsigned_data(target: usize, size: i64) -> Result<u64, PyError> {
-    unsafe {
+    {
         Ok(match size {
             1 => raw_read_u8(target),
             2 => raw_read_u16(target),
@@ -279,7 +279,7 @@ pub unsafe fn read_raw_ulong_data(target: usize, size: i64) -> Result<u64, PyErr
 /// # Safety
 /// `target` must point at `size` writable bytes.
 pub unsafe fn write_raw_signed_data(target: usize, source: i64, size: i64) -> Result<(), PyError> {
-    unsafe {
+    {
         match size {
             1 => raw_write_i8(target, source),
             2 => raw_write_i16(target, source),
@@ -300,7 +300,7 @@ pub unsafe fn write_raw_unsigned_data(
     source: u64,
     size: i64,
 ) -> Result<(), PyError> {
-    unsafe {
+    {
         match size {
             1 => raw_write_u8(target, source),
             2 => raw_write_u16(target, source),
@@ -317,7 +317,7 @@ pub unsafe fn write_raw_unsigned_data(
 /// # Safety
 /// `target` must point at `size` readable bytes.
 pub unsafe fn read_raw_float_data(target: usize, size: i64) -> Result<f64, PyError> {
-    unsafe {
+    {
         Ok(match size {
             4 => raw_read_f32(target),
             8 => raw_read_f64(target),
@@ -331,7 +331,7 @@ pub unsafe fn read_raw_float_data(target: usize, size: i64) -> Result<f64, PyErr
 /// # Safety
 /// `target` must point at `size` writable bytes.
 pub unsafe fn write_raw_float_data(target: usize, source: f64, size: i64) -> Result<(), PyError> {
-    unsafe {
+    {
         match size {
             4 => raw_write_f32(target, source),
             8 => raw_write_f64(target, source),

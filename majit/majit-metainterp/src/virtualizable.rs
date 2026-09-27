@@ -1626,6 +1626,7 @@ impl VableArrayInfo {
         }
     }
 
+    #[allow(dead_code)] // virtualizable.py array data pointer
     unsafe fn data_ptr(&self, obj_ptr: *const u8) -> *const u8 {
         unsafe {
             match self.storage {
@@ -3609,17 +3610,15 @@ pub(crate) unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *m
                 // A machine that registered no force helper has no compiled
                 // activation to write back. `force_now`'s else arm must still
                 // leave TOKEN_NONE.
-                unsafe {
-                    let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut usize;
-                    *token_ptr = 0;
-                }
+                let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut usize;
+                *token_ptr = 0;
                 return;
             };
             // `make_clear_vable_descr` declares `[Ref] -> Void` and
             // `frame_layout.rs` registers a function taking that word as `i64`;
             // spelling the pointee any other way mismatches the wasm32 signature
             // and traps on call.
-            let force: unsafe extern "C" fn(i64) = unsafe { std::mem::transmute(clear_vable_ptr) };
+            let force: unsafe extern "C" fn(i64) = std::mem::transmute(clear_vable_ptr);
             force(obj_ptr as i64);
         });
     }

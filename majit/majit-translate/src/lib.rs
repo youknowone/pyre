@@ -386,6 +386,7 @@ fn build_semantic_program_via_active_frontend(
 /// is matched by its `{module_path}::{name}` path so same-named helpers
 /// in different modules cannot inherit each other's hints.
 #[cfg(feature = "mir-frontend")]
+#[allow(dead_code)] // llbc_hints harvest merged onto SemanticProgram
 fn merge_hints_from_llbcs(
     program: &mut front::SemanticProgram,
     llbcs: &[majit_charon_reader::Llbc],

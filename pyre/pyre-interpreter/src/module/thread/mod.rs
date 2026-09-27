@@ -102,6 +102,7 @@ impl<T> ForkMutex<T> {
     /// Write a fresh mutex around the live payload.  Must not lock: the
     /// inherited waiter table can hang on Linux.  Same write as
     /// `cpyext::ForkMutex::reinit_after_fork` / `ForkListLock::reinit_after_fork`.
+    #[cfg(unix)]
     pub(crate) unsafe fn reinit_after_fork(&self) {
         let value = unsafe { (*self.inner.get()).data_ptr().read() };
         unsafe { self.inner.get().write(Mutex::new(value)) };

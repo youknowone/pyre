@@ -4295,6 +4295,7 @@ impl ResumeGuardForcedDescr {
     /// `hidden_all_virtuals = cpu.get_savedata_ref(deadframe)` then
     /// `AllVirtuals.show`. An empty cache is the miss arm that still
     /// blackholes (`VirtualCache([], [])`).
+    #[allow(dead_code)] // compile.py ResumeGuardForcedDescr.handle_fail
     pub fn handle_fail_savedata(savedata: Option<majit_ir::GcRef>) -> Option<(Vec<i64>, Vec<i64>)> {
         AllVirtuals::show(savedata?)
     }

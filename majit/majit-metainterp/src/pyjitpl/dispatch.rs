@@ -13054,6 +13054,7 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
 /// `CallDescr::arg_classes` (`majit-ir/src/descr.rs`) maps `Type` onto
 /// `'i'`/`'r'`/`'f'`/`'v'` exhaustively, so a `Type::Float` slot is always
 /// class `'f'`. Teaching `Type` those classes must extend both sites.
+#[allow(dead_code)] // llmodel.py bh_call_f
 pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]) -> f64 {
     assert!(
         !func_ptr.is_null(),
@@ -13092,6 +13093,7 @@ pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]
 /// Both callers (`executor::execute_pure_call` / `execute_residual_call`) take
 /// the argument list and the type list from the same calldescr, so the two
 /// agree by construction.
+#[allow(dead_code)] // descr.py process arg classes
 fn arg_classes_from_types(
     args_len: usize,
     arg_types: &[Type],
@@ -13132,6 +13134,7 @@ fn arg_classes_from_types(
 /// [`call_int_function`] stays for the seams that genuinely hold no descr —
 /// `execute_varargs`'s portal runner and the CALL_ASSEMBLER family, whose
 /// entry wrapper is `extern "C" fn(..) -> i64` by construction.
+#[allow(dead_code)] // llmodel.py bh_call_i
 pub fn call_int_function_typed(func_ptr: *const (), args: &[i64], arg_types: &[Type]) -> i64 {
     assert!(
         !func_ptr.is_null(),
@@ -13391,6 +13394,7 @@ pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
 /// register; only `arg_types` still records which is which.  The
 /// host-trampoline path reflects the callee's real signature and coerces each
 /// argument itself, so it takes the positional list unchanged.
+#[allow(dead_code)] // llmodel.py bh_call_v
 pub fn call_void_function_typed(func_ptr: *const (), args: &[i64], arg_types: &[Type]) {
     assert!(
         !func_ptr.is_null(),

@@ -184,7 +184,7 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let cls_slot = pyre_object::gc_roots::pin_roots(args);
-    let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
+    let _ = pyre_object::gc_roots::shadow_stack_get(cls_slot);
     let rest: Vec<_> = (1..args.len())
         .map(|i| pyre_object::gc_roots::shadow_stack_get(cls_slot + i))
         .collect();

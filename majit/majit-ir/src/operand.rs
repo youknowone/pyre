@@ -24,7 +24,6 @@ use crate::forwarding::{
     Forwarded, ForwardingHost, IntBoundBorrow, IntBoundBorrowMut, PackedForwarded, PtrInfoBorrow,
     PtrInfoBorrowMut, classify_packed_forwarded,
 };
-use crate::intbound::IntBound;
 use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
 use crate::resoperation::{OpRc, OpRef};

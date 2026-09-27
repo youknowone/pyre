@@ -1844,14 +1844,12 @@ impl BlackholeInterpreter {
             while let Some(f) = frame {
                 if !f.rooted {
                     let ctx = f as *mut BlackholeInterpreter;
-                    unsafe {
-                        majit_gc::shadow_stack::push_bh_regs_with_live(
-                            &mut (*ctx).registers_r,
-                            &mut (*ctx).tmpreg_r,
-                            &mut (*ctx).exception_last_value,
-                            ctx as *const (),
-                        );
-                    }
+                    majit_gc::shadow_stack::push_bh_regs_with_live(
+                        &mut (*ctx).registers_r,
+                        &mut (*ctx).tmpreg_r,
+                        &mut (*ctx).exception_last_value,
+                        ctx as *const (),
+                    );
                 }
                 frame = f.nextblackholeinterp.as_deref_mut();
             }

@@ -9430,6 +9430,7 @@ impl<'a> Lowering<'a> {
         release_declared_vable_array_address(&mut self.graph, base)
     }
 
+    #[allow(dead_code)] // virtualizable.py declared array field
     fn var_is_declared_vable_array(&self, var: &Variable) -> bool {
         self.graph.blocks.iter().any(|block| {
             block.operations.iter().any(|op| {
@@ -32810,6 +32811,7 @@ fn tyref_to_attr_value_type_for_struct_field(
 ///   - generic ADT instantiations (`Arg<u32>`) — the registry rows for
 ///     a generic decl carry unresolved type-variable field strings, so
 ///     a seeded classdef would project bogus attr shells.
+#[allow(dead_code)] // rtyper classdef root of a pointer ADT
 fn tyref_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     tyref_class_root_with(ty, llbc, no_tombstoned_leaves())
 }
@@ -34305,6 +34307,7 @@ fn json_ty_raw_store_descr(
 /// lowered against that borrow. `tyref_to_value_type` keeps `&i64` in the
 /// Ref bank and `i64` in the int bank, so recording `T` writes `__pos_0`
 /// as `Int` while the body reads `Ref`.
+#[allow(dead_code)] // Iterator::Item payload for Map::collect
 fn map_collect_payload_value_type(item_ty: &TyRef, llbc: &Llbc, adds_reference: bool) -> ValueType {
     if !adds_reference {
         return tyref_to_value_type(item_ty, llbc);

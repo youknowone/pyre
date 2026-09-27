@@ -1655,7 +1655,7 @@ impl<'c> Lowerer<'c> {
                 };
             }
         };
-        let (struct_path, member, element_type) =
+        let (struct_path, member, _element_type) =
             (struct_path.clone(), member.clone(), element_type.clone());
         // A state scalar is read here rather than in the matcher, so nothing is
         // emitted until the caller has committed to this shape.

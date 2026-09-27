@@ -21026,43 +21026,43 @@ pub fn generatorentry_fnaddrs() -> Vec<(&'static str, i64)> {
     vec![
         (
             "pyre_object::gc_roots::push_roots",
-            pyre_object::gc_roots::push_roots as usize as i64,
+            pyre_object::gc_roots::push_roots as *const () as usize as i64,
         ),
         (
             "pyre_interpreter::baseobjspace::generator_send_ex_body",
-            generator_send_ex_body as usize as i64,
+            generator_send_ex_body as *const () as usize as i64,
         ),
         (
             "pyre_interpreter::baseobjspace::generator_invoke_execute_frame",
-            generator_invoke_execute_frame as usize as i64,
+            generator_invoke_execute_frame as *const () as usize as i64,
         ),
         (
             "pyre_interpreter::baseobjspace::generator_frame_is_finished",
-            generator_frame_is_finished as usize as i64,
+            generator_frame_is_finished as *const () as usize as i64,
         ),
         (
             "pyre_interpreter::baseobjspace::stop_iteration_with_value",
-            stop_iteration_with_value as usize as i64,
+            stop_iteration_with_value as *const () as usize as i64,
         ),
         (
             "pyre_interpreter::baseobjspace::generator_kind",
-            generator_kind as usize as i64,
+            generator_kind as *const () as usize as i64,
         ),
         (
             "pyre_interpreter::baseobjspace::genentry_stop_iteration",
-            genentry_stop_iteration as usize as i64,
+            genentry_stop_iteration as *const () as usize as i64,
         ),
         (
             "pyre_interpreter::baseobjspace::genentry_stop_async_iteration",
-            genentry_stop_async_iteration as usize as i64,
+            genentry_stop_async_iteration as *const () as usize as i64,
         ),
         (
             "pyre_interpreter::baseobjspace::genentry_runtime_error",
-            genentry_runtime_error as usize as i64,
+            genentry_runtime_error as *const () as usize as i64,
         ),
         (
             "pyre_interpreter::baseobjspace::genentry_just_started_type_error",
-            genentry_just_started_type_error as usize as i64,
+            genentry_just_started_type_error as *const () as usize as i64,
         ),
     ]
 }

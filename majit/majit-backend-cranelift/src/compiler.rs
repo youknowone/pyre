@@ -31,9 +31,11 @@ use majit_backend::{
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
 use majit_gc::{GcAllocator, GcRewriter};
+#[cfg(test)]
+use majit_ir::InputArg;
 use majit_ir::{
-    AccumInfo, CallDescr, DescrRef, EffectInfo, FailDescr, GcRef, InputArg, InputArgRc,
-    OopSpecIndex, Op, OpCode, OpRc, OpRef, OpTypeIndex, Type, Value,
+    AccumInfo, CallDescr, DescrRef, EffectInfo, FailDescr, GcRef, InputArgRc, OopSpecIndex, Op,
+    OpCode, OpRc, OpRef, OpTypeIndex, Type, Value,
 };
 
 mod slice_x2_probe {
@@ -3120,6 +3122,7 @@ fn grab_exc_value_from_jf_ptr(jf_ptr: usize) -> i64 {
 /// field is not consumed: `ResumeGuardForcedDescr.handle_fail` reveals it
 /// during the immediately following blackhole resume.
 #[inline]
+#[allow(dead_code)] // cpu.get_savedata_ref
 fn get_savedata_from_jf_ptr(jf_ptr: usize) -> usize {
     if jf_ptr == 0 {
         return 0;
@@ -3953,7 +3956,6 @@ fn call_assembler_shim_inner(
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         // resume.py blackhole_from_resumedata parity.
         let raw_num = fail_types.len();
-        let raw_outputs = fail_values.clone();
         let mut bh_outputs = fail_values;
         // Dispatch through on-demand callback.  No
         // recovery_layout walker fallback — if the descr can't be
@@ -3970,7 +3972,6 @@ fn call_assembler_shim_inner(
                 raw_num,
             );
         }
-        let num_outputs = bh_outputs.len();
         // BH recovers its descr via
         // `Backend::fail_descr_arc_from_addr` → `recover_fail_descr_cell`
         // which requires a `FailDescrCell` thin pointer.  Use the
@@ -5809,6 +5810,7 @@ fn resolve_opref_or_imm(
 /// the physical spill offset. Attached bridges instead load from rd_locs
 /// (`bridge_source_slots`); those addresses must never index fail_arg_refs,
 /// especially after GUARD_NOT_FORCED_2 moves spills past the result slot.
+#[allow(dead_code)] // compile.py ResumeGuardDescr.get_inputargs_and_holes
 fn bridge_entry_indices(fail_arg_refs: &[OpRef]) -> Vec<usize> {
     fail_arg_refs
         .iter()
@@ -28290,7 +28292,7 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
         let jf = backend.get_ref_value(&frame, 0);
-        let escaped = majit_gc::shadow_stack::OwnerRootGuard::new(jf);
+        let _escaped = majit_gc::shadow_stack::OwnerRootGuard::new(jf);
         drop(frame);
         // Nothing allocates between the release and this read, so the frame is
         // still where the root last named it.

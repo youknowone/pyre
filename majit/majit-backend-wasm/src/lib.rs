@@ -2654,6 +2654,7 @@ pub(crate) unsafe fn wasm_gc_add_root(slot: *mut GcRef) {
 ///
 /// # Safety
 /// Every slot must remain valid until removed with [`wasm_gc_remove_roots`].
+#[allow(dead_code)] // batched wasm_gc_add_root / gc.add_root
 pub(crate) unsafe fn wasm_gc_add_roots(slots: &[usize]) {
     if slots.is_empty() {
         return;
@@ -2671,6 +2672,7 @@ pub(crate) fn wasm_gc_remove_root(slot: *mut GcRef) {
 }
 
 /// Batched [`wasm_gc_remove_root`] for one stack-shaped root bracket.
+#[allow(dead_code)] // batched wasm_gc_remove_root / gc.remove_root
 pub(crate) fn wasm_gc_remove_roots(slots: impl Iterator<Item = usize>) {
     with_wasm_active_gc_mut(|gc| {
         for slot in slots {
@@ -4791,6 +4793,7 @@ pub fn mark_call_assembler_terminal_decline(compiled_ptr: usize) {
 /// `resolve_guard_value_operand` reads back through `get_value_direct` for
 /// `make_a_counter_per_value`; it is never a fail argument, so it stays out of
 /// `fail_arg_types` and out of every typed exit decode.
+#[allow(dead_code)] // codegen::counter_value_spill exit width
 pub(crate) fn exit_slot_count(fail_descr: &failguard::WasmFailDescr) -> usize {
     let fail_args = fail_descr.fail_arg_types.len();
     fail_descr
@@ -5736,7 +5739,7 @@ impl majit_backend::Backend for WasmBackend {
             let wasm_guard = by_meta.or(by_key);
             let source_used_homes = wasm_guard
                 .as_ref()
-                .filter(|descr| !is_direct)
+                .filter(|_descr| !is_direct)
                 .map(|descr| (descr.trace_ref_homes, descr.trace_label_homes))
                 .unwrap_or((
                     source_loop.num_ref_homes.get(),

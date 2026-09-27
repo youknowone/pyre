@@ -262,8 +262,8 @@ mod frame_replacement_tests {
             (suspended_regs, suspended_state),
         ] {
             let mut trace = TraceCtx::for_test_types(&[Type::Ref; 3]);
-            let mut ints = Vec::new();
-            let mut floats = Vec::new();
+            let ints = Vec::new();
+            let floats = Vec::new();
             let mut concrete_i = Vec::new();
             let mut ctx = WalkContext {
                 frame_state: state,

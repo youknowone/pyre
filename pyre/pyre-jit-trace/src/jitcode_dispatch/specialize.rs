@@ -239,6 +239,7 @@ pub(crate) fn try_walker_specialize_truth_bool<Sym: WalkSym>(
 ///
 /// # Safety
 /// `obj` must be a live concrete `W_LongObject` from the walker shadow.
+#[allow(dead_code)] // longobject.py W_LongObject.value
 unsafe fn long_payload_of(obj: pyre_object::PyObjectRef) -> i64 {
     unsafe { *((obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET) as *const i64) }
 }
@@ -247,6 +248,7 @@ unsafe fn long_payload_of(obj: pyre_object::PyObjectRef) -> i64 {
 /// the `self.num` field read.  Exact `w_class` first implies the LONG
 /// vtable, so `walker_guard_class` then skips the redundant `GuardClass`.
 /// `W_IntObject.intval` sits at the same offset as `W_LongObject.value`.
+#[allow(dead_code)] // longobject.py _make_descr_cmp
 fn walker_guard_long_and_read_payload<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -282,6 +284,7 @@ fn walker_guard_long_and_read_payload<Sym: WalkSym>(
 /// A box the same trace built with [`crate::helpers::emit_box_long_inline`]
 /// answers this out of the heap cache, so the read costs nothing and the box
 /// keeps no reason to escape.
+#[allow(dead_code)] // longobject.py getfield of value
 fn walker_read_long_payload<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     boxed: OpRef,

@@ -15461,6 +15461,7 @@ mod tests {
     /// disjointly-live slots and re-color across PCs), so there is no
     /// flat slot → color lookup; `None` when the slot carries no live
     /// restorable entry at that PC.
+    #[allow(dead_code)] // pcdep trivia color at a Python pc
     fn pcdep_color_for_slot(jitcode_index: i32, py_pc: usize, slot: usize) -> Option<u32> {
         let payload = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
         let jit_pc = payload

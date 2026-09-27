@@ -84,7 +84,7 @@ fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, pyre_interpreter::PyError> {
 /// bytes-like source only, so a str of any kind is rejected by its type.
 fn as_buffer_bytes(obj: PyObjectRef) -> Result<Vec<u8>, pyre_interpreter::PyError> {
     pyre_interpreter::typedef::require_contiguous_buffer(obj)?;
-    match unsafe { pyre_interpreter::typedef::buffer_as_bytes_like(obj) }? {
+    match { pyre_interpreter::typedef::buffer_as_bytes_like(obj) }? {
         Some(src) => Ok(unsafe { bytesobject::bytes_like_data(src) }.to_vec()),
         _ => Err(pyre_interpreter::PyError::type_error(format!(
             "a bytes-like object is required, not '{}'",

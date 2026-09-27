@@ -10195,7 +10195,6 @@ pub(crate) fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
 mod tests {
     use super::*;
     use crate::model::{ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase};
-    use majit_ir::descr::Descr;
 
     /// An earlier alias's hint set is unioned with a later one, not replaced.
     #[test]

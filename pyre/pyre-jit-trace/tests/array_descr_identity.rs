@@ -10,10 +10,10 @@
 //! is not in the pyre-jit LLBC read set — a `src/` edit would report
 //! `LLBC STALE` for a check that does not change translated bodies.
 
-use majit_ir::{Descr, Type};
+use majit_ir::Type;
 use majit_translate::codewriter::jtransform::{LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY};
 use majit_translate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID;
-use majit_translate::jitcode::{BhDescr, DescrTable};
+use majit_translate::jitcode::BhDescr;
 use pyre_jit_trace::jitcode_runtime::{
     DecodedOp, all_jitcodes, decoded_ops, descr_ref_at, descr_table,
 };

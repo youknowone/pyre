@@ -612,7 +612,7 @@ pub unsafe fn pointer_convert_argument_from_object(
     cdata: *mut u8,
     w_ob: PyObjectRef,
 ) -> Result<bool, PyError> {
-    use super::ctypefunc::{MUSTFREE_FREE, MUSTFREE_NOTHING, set_mustfree_flag};
+    use super::ctypefunc::{MUSTFREE_NOTHING, set_mustfree_flag};
 
     let mut result = MUSTFREE_NOTHING;
     if W_CData::from_obj(w_ob).is_none() {

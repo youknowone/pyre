@@ -17,7 +17,7 @@ use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
 // `gc_sync` hands out the concrete collector; the trait must be in scope for
 // its methods to resolve on that type.
 use majit_gc::GcAllocator;
-use majit_ir::{FailDescr, GcRef, InputArg, InputArgRc, OpRc, OpRef, Type, Value};
+use majit_ir::{FailDescr, GcRef, InputArgRc, OpRc, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::assembler::{AssemblerARM64 as Asm, CompiledCode};
@@ -27,7 +27,6 @@ use crate::aarch64::cpu_ext::Aarch64CpuExt as ArchCpuExt;
 use crate::arch;
 use crate::codebuf;
 use crate::jitframe::JitFrame;
-use crate::regloc::Loc;
 #[cfg(target_arch = "x86_64")]
 use crate::x86::assembler::{Assembler386 as Asm, CompiledCode};
 #[cfg(target_arch = "x86_64")]
@@ -5015,8 +5014,8 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Ref(payload)]);
-        let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
-        let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
+        let _guard_fail_index = backend.get_latest_descr(&failed).fail_index();
+        let _guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = backend.get_latest_descr_arc(&failed);
 
         let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
@@ -5112,8 +5111,8 @@ mod tests {
             &token,
             &[Value::Ref(frame_payload), Value::Ref(second_payload)],
         );
-        let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
-        let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
+        let _guard_fail_index = backend.get_latest_descr(&failed).fail_index();
+        let _guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = backend.get_latest_descr_arc(&failed);
 
         backend.set_constants(indexmap::IndexMap::new());

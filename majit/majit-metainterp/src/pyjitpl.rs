@@ -1591,6 +1591,7 @@ fn remap_prepared_arg(
     }
 }
 
+#[allow(dead_code)] // pyjitpl.py prepared-arg cache untag
 fn untag_prepared_cache(
     opref: OpRef,
     cache: &[Option<majit_ir::operand::Operand>],

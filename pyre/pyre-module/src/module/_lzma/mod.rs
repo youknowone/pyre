@@ -126,7 +126,7 @@ const BCJ_KIND: FilterKind = FilterKind {
 fn parse_filter_spec(spec: PyObjectRef) -> Result<backend::FilterSpec, pyre_interpreter::PyError> {
     let _roots = push_roots();
     let spec_slot = shadow_stack_len();
-    let spec = pin_root(spec);
+    let _ = pin_root(spec);
     let spec = || shadow_stack_get(spec_slot);
 
     if unsafe { pyre_interpreter::baseobjspace::lookup(spec(), "__getitem__") }.is_none() {
@@ -226,7 +226,7 @@ fn parse_filter_chain(
 ) -> Result<Vec<backend::FilterSpec>, pyre_interpreter::PyError> {
     let _roots = push_roots();
     let filters_slot = shadow_stack_len();
-    let filters = pin_root(filters);
+    let _ = pin_root(filters);
     let filters = || shadow_stack_get(filters_slot);
 
     let count = pyre_interpreter::runtime_ops::sequence_len(filters())?;
@@ -307,7 +307,7 @@ mod compressor_methods {
             // here on rather than in this argument.
             let _roots = push_roots();
             let filters_slot = shadow_stack_len();
-            let filters = pin_root(filters);
+            let _ = pin_root(filters);
             let filters = || shadow_stack_get(filters_slot);
 
             if format != backend::FORMAT_XZ && check != -1 && check != backend::CHECK_NONE as i32 {
@@ -408,7 +408,7 @@ mod decompressor_methods {
             // caller's own, so the chain moves to a shadow-stack slot first.
             let _roots = push_roots();
             let filters_slot = shadow_stack_len();
-            let filters = pin_root(filters);
+            let _ = pin_root(filters);
             let filters = || shadow_stack_get(filters_slot);
 
             let memlimit = if unsafe { is_none(memlimit) } {

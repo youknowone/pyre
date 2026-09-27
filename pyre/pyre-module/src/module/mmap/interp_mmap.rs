@@ -624,6 +624,7 @@ pub unsafe fn w_mmap_dealloc(obj: pyre_object::PyObjectRef) {
 
 /// True when `obj` is an `mmap` instance.
 #[cfg(any(unix, windows))]
+#[allow(dead_code)] // rmmap.MMap type test; lowered by name from LLBC
 pub(crate) fn is_mmap(obj: pyre_object::PyObjectRef) -> bool {
     match pyre_interpreter::typedef::r#type(obj) {
         Some(tp) => std::ptr::eq(tp.as_ptr(), mmap_type()),
@@ -772,7 +773,7 @@ fn init_mmap_iterator_type(ns: pyre_object::PyObjectRef) {
                     if i < 0 || i >= len as i64 {
                         return Err(pyre_interpreter::PyError::stop_iteration());
                     }
-                    let b = unsafe { *p.add(i as usize) };
+                    let b = { *p.add(i as usize) };
                     mmap_set_attr(it, "_i", pyre_object::w_int_new(i + step));
                     Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[b]))
                 },
@@ -912,19 +913,19 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 }
                 let obj = args[0];
                 let (_, len) = mmap_ptr(obj)?;
-                if !unsafe { pyre_object::is_int(args[1]) } {
+                if !{ pyre_object::is_int(args[1]) } {
                     return Err(pyre_interpreter::PyError::type_error(
                         "seek: offset must be an integer",
                     ));
                 }
-                let off = unsafe { pyre_object::w_int_get_value(args[1]) };
+                let off = { pyre_object::w_int_get_value(args[1]) };
                 let whence = if args.len() >= 3 {
-                    if !unsafe { pyre_object::is_int(args[2]) } {
+                    if !{ pyre_object::is_int(args[2]) } {
                         return Err(pyre_interpreter::PyError::type_error(
                             "seek: whence must be an integer",
                         ));
                     }
-                    unsafe { pyre_object::w_int_get_value(args[2]) }
+                    pyre_object::w_int_get_value(args[2])
                 } else {
                     0
                 };
@@ -957,7 +958,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 let obj = args[0];
                 // `interp_mmap.py read(num=-1)` — None or -1 reads to
                 // end; positive value caps at remaining bytes.
-                let requested = if args.len() >= 2 && !unsafe { pyre_object::is_none(args[1]) } {
+                let requested = if args.len() >= 2 && !{ pyre_object::is_none(args[1]) } {
                     Some(mmap_index_w(obj, args[1])?)
                 } else {
                     None
@@ -974,7 +975,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 } else {
                     remaining
                 };
-                let slice = unsafe { std::slice::from_raw_parts(p.add(pos), n) };
+                let slice = { std::slice::from_raw_parts(p.add(pos), n) };
                 let data: Vec<u8> = slice.to_vec();
                 mmap_set_attr(obj, "_pos", pyre_object::w_int_new((pos + n) as i64));
                 Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data))
@@ -997,7 +998,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                             "read byte out of range",
                         ));
                     }
-                    let b = unsafe { *p.add(pos) };
+                    let b = { *p.add(pos) };
                     mmap_set_attr(obj, "_pos", pyre_object::w_int_new((pos + 1) as i64));
                     Ok(pyre_object::w_int_new(b as i64))
                 },
@@ -1022,13 +1023,13 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     if pos >= len {
                         return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[]));
                     }
-                    let tail = unsafe { std::slice::from_raw_parts(p.add(pos), len - pos) };
+                    let tail = { std::slice::from_raw_parts(p.add(pos), len - pos) };
                     let eol = tail
                         .iter()
                         .position(|&b| b == b'\n')
                         .map_or(len, |i| pos + i + 1);
                     let data =
-                        unsafe { std::slice::from_raw_parts(p.add(pos), eol - pos) }.to_vec();
+                        { std::slice::from_raw_parts(p.add(pos), eol - pos) }.to_vec();
                     mmap_set_attr(obj, "_pos", pyre_object::w_int_new(eol as i64));
                     Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data))
                 },
@@ -1054,7 +1055,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     if access == MMAP_ACCESS_READ {
                         return Err(pyre_interpreter::PyError::type_error("mmap is read-only"));
                     }
-                    let buf = unsafe {
+                    let buf = {
                         if !pyre_object::bytesobject::is_bytes_like(args[1]) {
                             return Err(pyre_interpreter::PyError::type_error(
                                 "write: buffer must be bytes-like",
@@ -1067,7 +1068,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     if pos + buf.len() > len {
                         return Err(pyre_interpreter::PyError::value_error("data out of range"));
                     }
-                    unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), p.add(pos), buf.len()) };
+                    { std::ptr::copy_nonoverlapping(buf.as_ptr(), p.add(pos), buf.len()) };
                     mmap_set_attr(
                         obj,
                         "_pos",
@@ -1114,7 +1115,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                             "write_byte out of range",
                         ));
                     }
-                    unsafe { *p.add(pos) = raw as u8 };
+                    { *p.add(pos) = raw as u8 };
                     mmap_set_attr(obj, "_pos", pyre_object::w_int_new((pos + 1) as i64));
                     Ok(pyre_object::w_none())
                 },
@@ -1140,7 +1141,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 let obj = args[0];
                 let (p, len) = mmap_ptr(obj)?;
                 for (idx, label) in [(1usize, "offset"), (2, "size")] {
-                    if args.len() > idx && !unsafe { pyre_object::is_int(args[idx]) } {
+                    if args.len() > idx && !{ pyre_object::is_int(args[idx]) } {
                         return Err(pyre_interpreter::PyError::type_error(format!(
                             "flush: {label} must be an integer"
                         )));
@@ -1150,12 +1151,12 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 // a huge `usize` and underflow the `len - off` subtraction
                 // below (Critical: previously panicked / arbitrary length).
                 let off_raw = if args.len() >= 2 {
-                    unsafe { pyre_object::w_int_get_value(args[1]) }
+                    pyre_object::w_int_get_value(args[1])
                 } else {
                     0
                 };
                 let raw_size_raw = if args.len() >= 3 {
-                    unsafe { pyre_object::w_int_get_value(args[2]) }
+                    pyre_object::w_int_get_value(args[2])
                 } else {
                     0
                 };
@@ -1263,13 +1264,13 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     let obj = args[0];
                     let index = args[1];
                     let _ = mmap_ptr(obj)?;
-                    if unsafe { pyre_object::is_slice(index) } {
+                    if pyre_object::is_slice(index) {
                         // `mmap_subscript` runs `PySlice_Unpack` (which may call
                         // `__index__`), then `CHECK_VALID`, and only then
                         // `PySlice_AdjustIndices(self->size, ...)` — so the size
                         // the bounds are clamped against is the one the mapping
                         // has after that call, not before it.
-                        let (start_raw, stop_raw, step) = unsafe {
+                        let (start_raw, stop_raw, step) = {
                             pyre_interpreter::sliceobject::slice_unpack(
                                 pyre_object::sliceobject::w_slice_get_start(index),
                                 pyre_object::sliceobject::w_slice_get_stop(index),
@@ -1287,13 +1288,13 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                             }
                             let n = (stop - start) as usize;
                             let data =
-                                unsafe { std::slice::from_raw_parts(p.add(start as usize), n) };
+                                { std::slice::from_raw_parts(p.add(start as usize), n) };
                             return Ok(pyre_object::bytesobject::w_bytes_from_bytes(data));
                         }
                         let mut out = Vec::new();
                         let mut i = start;
                         while (step > 0 && i < stop) || (step < 0 && i > stop) {
-                            out.push(unsafe { *p.add(i as usize) });
+                            out.push(*p.add(i as usize));
                             let Some(next) = i.checked_add(step) else {
                                 break;
                             };
@@ -1315,7 +1316,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                             "mmap index out of range",
                         ));
                     }
-                    let b = unsafe { *p.add(idx as usize) };
+                    let b = { *p.add(idx as usize) };
                     Ok(pyre_object::w_int_new(b as i64))
                 },
                 2,
@@ -1346,11 +1347,11 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                         return Err(pyre_interpreter::PyError::type_error("mmap is read-only"));
                     }
                     let _ = mmap_ptr(obj)?;
-                    if unsafe { pyre_object::is_slice(index) } {
+                    if pyre_object::is_slice(index) {
                         // `mmap_ass_subscript` splits the same way `mmap_subscript`
                         // does: unpack, re-check, then adjust against the size the
                         // mapping has now.
-                        let (start_raw, stop_raw, step) = unsafe {
+                        let (start_raw, stop_raw, step) = {
                             pyre_interpreter::sliceobject::slice_unpack(
                                 pyre_object::sliceobject::w_slice_get_start(index),
                                 pyre_object::sliceobject::w_slice_get_stop(index),
@@ -1371,12 +1372,12 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                         } else {
                             0
                         };
-                        if !unsafe { pyre_object::bytesobject::is_bytes_like(value) } {
+                        if !{ pyre_object::bytesobject::is_bytes_like(value) } {
                             return Err(pyre_interpreter::PyError::type_error(
                                 "mmap slice assignment must be bytes-like",
                             ));
                         }
-                        let buf = unsafe { pyre_object::bytesobject::bytes_like_data(value) };
+                        let buf = { pyre_object::bytesobject::bytes_like_data(value) };
                         if (buf.len() as i64) != length {
                             return Err(pyre_interpreter::PyError::value_error(
                                 "mmap slice assignment is wrong size",
@@ -1384,7 +1385,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                         }
                         if step == 1 {
                             if length > 0 {
-                                unsafe {
+                                {
                                     std::ptr::copy_nonoverlapping(
                                         buf.as_ptr(),
                                         p.add(start as usize),
@@ -1396,7 +1397,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                             let mut i = start;
                             let mut k = 0usize;
                             while (step > 0 && i < stop) || (step < 0 && i > stop) {
-                                unsafe { *p.add(i as usize) = buf[k] };
+                                { *p.add(i as usize) = buf[k] };
                                 let Some(next) = i.checked_add(step) else {
                                     break;
                                 };
@@ -1417,18 +1418,18 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                             "mmap index out of range",
                         ));
                     }
-                    if !unsafe { pyre_object::is_int(value) } {
+                    if !{ pyre_object::is_int(value) } {
                         return Err(pyre_interpreter::PyError::type_error(
                             "mmap item value must be an integer",
                         ));
                     }
-                    let v = unsafe { pyre_object::w_int_get_value(value) };
+                    let v = { pyre_object::w_int_get_value(value) };
                     if !(0..256).contains(&v) {
                         return Err(pyre_interpreter::PyError::value_error(
                             "mmap item value must be in range(0, 256)",
                         ));
                     }
-                    unsafe { *p.add(idx as usize) = v as u8 };
+                    { *p.add(idx as usize) = v as u8 };
                     Ok(pyre_object::w_none())
                 },
                 3,
@@ -1566,7 +1567,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                             "source or destination out of range",
                         ));
                     }
-                    unsafe {
+                    {
                         std::ptr::copy(p.add(src), p.add(dest), count);
                     }
                     Ok(pyre_object::w_none())
@@ -1921,7 +1922,7 @@ fn mmap_new_object(
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     pyre_interpreter::typedef::tag_subclass_instance(
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
     );
     pyre_object::gc_roots::shadow_stack_get(obj_slot)
 }

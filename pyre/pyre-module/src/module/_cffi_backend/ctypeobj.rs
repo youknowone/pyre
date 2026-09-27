@@ -445,15 +445,15 @@ pub fn root_forever_slot(obj: PyObjectRef) -> *const usize {
 pub unsafe fn convert_to_object(ct: &W_CType, cdata: usize) -> Result<PyObjectRef, PyError> {
     match ct.kind {
         // `W_CTypeFunc(W_CTypePtrBase)` inherits the same conversion.
-        KIND_POINTER | KIND_FUNC => Ok(super::ctypeptr::pointer_convert_to_object(
-            ct,
-            cdata as *const u8,
-        )),
-        KIND_ARRAY => Ok(super::ctypeptr::array_convert_to_object(
-            ct,
-            cdata as *const u8,
-        )),
-        KIND_STRUCT | KIND_UNION => super::ctypestruct::convert_to_object(ct, cdata as *const u8),
+        KIND_POINTER | KIND_FUNC => {
+            Ok(unsafe { super::ctypeptr::pointer_convert_to_object(ct, cdata as *const u8) })
+        }
+        KIND_ARRAY => {
+            Ok(unsafe { super::ctypeptr::array_convert_to_object(ct, cdata as *const u8) })
+        }
+        KIND_STRUCT | KIND_UNION => unsafe {
+            super::ctypestruct::convert_to_object(ct, cdata as *const u8)
+        },
         _ if ct.is_primitive() => unsafe { super::ctypeprim::convert_to_object(ct, cdata) },
         _ => Err(unsafe { PyError::from_exc_object(cannot_return_cdata(ct)) }),
     }

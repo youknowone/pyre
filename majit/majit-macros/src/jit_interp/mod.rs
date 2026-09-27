@@ -4322,6 +4322,7 @@ mod tests {
         assert!(matches!(parsed.fields[1].kind, StateFieldKind::Str));
     }
 
+    #[test]
     fn parse_state_fields_accepts_ref_scalar() {
         let tokens: proc_macro2::TokenStream = parse_quote! {
             {

@@ -18,6 +18,7 @@ fn use_untranslated_heap_ordering() -> bool {
 }
 
 #[inline]
+#[allow(dead_code)] // heap.py descr sort before translation
 fn sort_descr_entries_untranslated<T>(entries: &mut [(u32, DescrRef, T)]) {
     if use_untranslated_heap_ordering() {
         entries.sort_by_key(|b| std::cmp::Reverse(b.1.repr()));

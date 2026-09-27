@@ -200,7 +200,7 @@ impl Op {
     /// Rewrite each live fail-arg in place. Avoids a `SmallVec` clone
     /// when the caller only remaps boxes already stored on the guard.
     pub fn map_failargs_in_place(&self, mut f: impl FnMut(&mut crate::operand::Operand)) {
-        if let Some(mut g) = self.try_guard_extra_mut()
+        if let Some(g) = self.try_guard_extra_mut()
             && let Some(fa) = g.fail_args_mut()
         {
             for arg in fa.iter_mut() {
@@ -251,7 +251,7 @@ impl Op {
     /// pyre's signature distinguishes the two paths (set vs clear) for
     /// clarity.
     pub fn clearfailargs(&self) {
-        if let Some(mut g) = self.try_guard_extra_mut() {
+        if let Some(g) = self.try_guard_extra_mut() {
             g.clear_fail_args();
         }
     }
@@ -293,7 +293,7 @@ impl Op {
 
     /// Clear the per-failarg type vector.
     pub fn clear_fail_arg_types(&self) {
-        if let Some(mut g) = self.try_guard_extra_mut() {
+        if let Some(g) = self.try_guard_extra_mut() {
             g.clear_fail_arg_types();
         }
     }
