@@ -31238,8 +31238,10 @@ fn collect_fn_stubs_from_llbc_if(
         // residual-call ABI has only a one-word return and no `sret` path,
         // so a multiword return cannot be published at all. Admit `ref` only
         // for returns that genuinely are one word.
-        if token.as_deref() == Some("ref")
-            && !ref_return_is_single_word(&tyref_to_ast_string(&fd.signature.output, llbc))
+        if matches!(
+            token.as_deref(),
+            Some("ref" | crate::translator::rtyper::cutover::STR_RETURN_TYPE)
+        ) && !ref_return_is_single_word(&tyref_to_ast_string(&fd.signature.output, llbc))
         {
             continue;
         }
@@ -33335,7 +33337,10 @@ fn dont_look_inside_return_token(
         ValueType::Ref(_) if output_type_is_objectptr(output, llbc) => {
             return Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string());
         }
-        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => "ref",
+        // An rstr `STR` result is the `SomeString` its body produces, not
+        // the classdef-less instance behind `ref`.
+        ValueType::Str => crate::translator::rtyper::cutover::STR_RETURN_TYPE,
+        ValueType::Ref(_) | ValueType::StringBuilder => "ref",
         ValueType::Void | ValueType::State | ValueType::Unknown => return None,
     };
     Some(token.to_string())
@@ -57315,6 +57320,37 @@ mod tests {
                 if op == "eq" && is_results.contains(&lhs.id())
                     && false_consts.contains(&rhs.id()))),
             "w_class != PY_NULL is eq(is_(w_class, NULL), False)"
+        );
+    }
+
+    /// `jit_ll_int2dec` (`ll_str.py` `ll_int2dec`, elidable) returns an rstr
+    /// `STR`.  Its residual FUNC.RESULT token is `str`, so the stub callers
+    /// annotate against is `SomeString` — the value `StringBuilder.build()`
+    /// passes to the same `space.newutf8` — not the classdef-less instance of
+    /// `ref`.  Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn string_residual_result_token_is_str() {
+        use crate::translator::rtyper::cutover::{STR_RETURN_TYPE, residual_return_shell};
+        let path = format!(
+            "{}/../../build/llbc/pyre-object.ullbc",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let program = super::build_semantic_program_from_llbc(&llbc)
+            .expect("build semantic pyre-object program");
+        let int2dec = program
+            .functions
+            .iter()
+            .find(|f| f.name == "jit_ll_int2dec")
+            .expect("jit_ll_int2dec is lowered");
+        assert_eq!(int2dec.return_type.as_deref(), Some(STR_RETURN_TYPE));
+        assert!(
+            matches!(
+                residual_return_shell(int2dec.return_type.as_deref()),
+                Some(crate::annotator::model::SomeValue::String(_))
+            ),
+            "the `str` residual result is SomeString"
         );
     }
 
