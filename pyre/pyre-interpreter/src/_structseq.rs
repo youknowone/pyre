@@ -150,16 +150,21 @@ fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         .map(|(key, _)| *key)
         .collect();
     if !unexpected.is_empty() {
+        // `repr` of a str subclass runs user code, which can move every key
+        // still waiting its turn; read each one back from its root slot.
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.pin_roots(&unexpected);
         let mut msg = Wtf8Buf::new();
         msg.push_str("Got unexpected field name(s): [");
-        for (index, key) in unexpected.iter().enumerate() {
+        for index in 0..unexpected.len() {
             if index > 0 {
                 msg.push_str(", ");
             }
+            let key = pyre_object::gc_roots::shadow_stack_get(base + index);
             if key.is_null() {
                 msg.push_str("'<non-string>'");
             } else {
-                msg.push_wtf8(&unsafe { crate::display::py_repr_wtf8(*key)? });
+                msg.push_wtf8(&unsafe { crate::display::py_repr_wtf8(key)? });
             }
         }
         msg.push_str("]");
