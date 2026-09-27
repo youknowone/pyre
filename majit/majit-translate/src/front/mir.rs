@@ -13991,6 +13991,16 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `Atomic*::new(v)` builds the layout-transparent wrapper over
+                // its inner scalar; the translated field is that scalar, so
+                // the constructor is the value itself.
+                if args.len() == 1 && self.is_atomic_new_identity(&reg) {
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Only the existing Relaxed scalar fold is available here.
                 // An Acquire/SeqCst (or unknown) ordering cannot be erased.
                 // Nor can it fall through to an ordinary Atomic::load call:
@@ -19371,6 +19381,20 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             fd.item_meta.name_path() == "core::sync::atomic::<Impl>::from_ptr"
+                && tyref_atomic_inner_value_type(&fd.signature.output, self.llbc).is_some()
+        })
+    }
+
+    /// `core::sync::atomic::Atomic*::new(v)` — the wrapper constructor over
+    /// the inner scalar the field translates as.  Keyed on the exact core
+    /// associated function and an atomic output wrapper, like
+    /// [`Self::is_atomic_from_ptr_identity`].
+    fn is_atomic_new_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path() == "core::sync::atomic::<Impl>::new"
                 && tyref_atomic_inner_value_type(&fd.signature.output, self.llbc).is_some()
         })
     }
@@ -57970,6 +57994,27 @@ mod tests {
                 matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "hash")
             }),
             "the identity view must retain its underlying unicode hash-field read"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn atomic_new_lowers_to_its_inner_value() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "w_specialised_tuple_ii_new")
+            .expect("lower w_specialised_tuple_ii_new");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().map(String::as_str) == Some("new")
+                        && segments.iter().any(|s| s.starts_with("Atomic")))
+            }),
+            "AtomicI64::new must not survive as a graph-less core call"
         );
     }
 
