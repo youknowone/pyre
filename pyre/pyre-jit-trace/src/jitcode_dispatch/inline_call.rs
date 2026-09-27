@@ -3924,7 +3924,8 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     let Some(kwargs) = kwargs else {
         return Some((args, concretes, star, None));
     };
-    let star_kwargs = unsafe { fbw_bind_star_kwargs(r_args[3], kwargs, w_code, args.len(), nparams) }?;
+    let star_kwargs =
+        unsafe { fbw_bind_star_kwargs(r_args[3], kwargs, w_code, args.len(), nparams) }?;
     args.resize(nparams, OpRef::NONE);
     concretes.resize(nparams, ConcreteValue::Null);
     for &(index, _, value) in &star_kwargs.bound {
@@ -3982,7 +3983,11 @@ unsafe fn fbw_bind_star_kwargs(
     }
     let posonly = unsafe { (*raw).posonlyarg_count } as usize;
     let mut bound = Vec::new();
-    for (index, name) in varnames[..nparams].iter().enumerate().skip(npos.max(posonly)) {
+    for (index, name) in varnames[..nparams]
+        .iter()
+        .enumerate()
+        .skip(npos.max(posonly))
+    {
         // The name is baked into the lookup, so it has to be the canonical
         // object a collection cannot move.  Parameter names are interned when
         // the code object is built; one that is not declines rather than
@@ -7852,9 +7857,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             kw.dict_op,
             crate::descr::dict_strategy_word_descr(),
         );
-        let strategy_const = ctx.trace_ctx.const_int(
-            &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64,
-        );
+        let strategy_const = ctx
+            .trace_ctx
+            .const_int(&pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64);
         walker_emit_guard_with_snapshot(
             ctx,
             op.pc,
