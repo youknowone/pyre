@@ -7229,7 +7229,7 @@ impl OptContext {
     /// then force virtuals to concrete. Body refs route through the preamble
     /// source directly, so the prior reverse-lookup 3rd key is no longer
     /// needed.
-    fn force_box_inline(&mut self, opref: OpRef) -> OpRef {
+    pub(crate) fn force_box_inline(&mut self, opref: OpRef) -> OpRef {
         if opref.is_constant() {
             return opref;
         }

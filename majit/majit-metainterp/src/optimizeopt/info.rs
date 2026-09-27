@@ -1153,6 +1153,18 @@ fn force_box_impl(
     // When called from _emit_operation, in_final_emission=true → direct.
     let emit_op = |ctx: &mut crate::optimizeopt::OptContext, op: Op| -> OpRef {
         if ctx.in_final_emission {
+            // optimizer.py `Optimizer.emit_extra` → `emit` →
+            // `_emit_operation`: `arg = self.force_box(op.getarg(i))`.
+            for i in 0..op.num_args() {
+                let original = op.arg(i);
+                let forced = ctx.force_box_inline(original.to_opref());
+                if forced != original.get_box_replacement(false).to_opref() {
+                    let forced_box = ctx
+                        .get_box_replacement_operand_opt(forced)
+                        .unwrap_or_else(|| ctx.materialize_operand_at(forced));
+                    op.setarg(i, forced_box);
+                }
+            }
             ctx.emit(op)
         } else {
             ctx.emit_extra(ctx.current_pass_idx, op)
