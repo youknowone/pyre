@@ -3394,10 +3394,17 @@ impl MiniMarkGC {
         // We use raw pointers to avoid borrow checker issues since
         // copy_nursery_object mutates oldgen/nursery.
         // Pinned objects are left in place (not copied to old gen).
-        let roots: Vec<*mut GcRef> = self.roots.roots.to_vec();
-        for root_ptr in roots {
+        // Read the registered roots by index, as `seed_major_roots` does and
+        // for the same reason: `drag_out_root` neither registers nor removes a
+        // root, so the list cannot move under the walk, and copying it first
+        // was one allocation and one pass over every registered root per minor
+        // collection.
+        let mut i = 0;
+        while i < self.roots.roots.len() {
+            let root_ptr = self.roots.roots[i];
             let gcref = unsafe { &mut *root_ptr };
             self.drag_out_root(gcref);
+            i += 1;
         }
 
         // Phase 1b: Process shadow stack roots.
@@ -5974,8 +5981,10 @@ impl MiniMarkGC {
         // loop above is: `seed_major_root` neither registers nor removes a
         // root, so the list cannot move under the walk.
         let mut n_roots = 0usize;
+        let mut census = RootCensus::new();
         let mut seed = |gc: &mut Self, gcref: GcRef, site: &'static str| {
             n_roots += 1;
+            census.note(site, gcref);
             gc.seed_major_root(gcref, site);
         };
         let mut i = 0;
@@ -6008,6 +6017,7 @@ impl MiniMarkGC {
             seed(self, GcRef(addr), "old_style_finalizer_death_queue");
             k += 1;
         }
+        census.report(self.major_collections, self.prebuilt_root_objects.len());
         // Monotone, as `enumerate_labeled_root_walker_values` keeps it: the
         // inspection walks size their snapshot from this hint.
         self.root_snapshot_capacity
@@ -17955,5 +17965,56 @@ cache size\t: 8192 kB\n";
             "the old object was swept out from under a live C reference \
              ({referenced} bytes held with a C reference, {unreferenced} without)"
         );
+    }
+}
+
+/// Per-walker tally of what one major cycle re-seeded, behind
+/// `MAJIT_GC_ROOT_CENSUS`.
+///
+/// `collect_roots` costs one `seed_major_root` per root, and each of those
+/// asks `is_managed_heap_object` — so the root count, not the live-object
+/// count, is what a major on a small heap spends its time on. The census
+/// names the walker responsible so a count far above the live-object count
+/// can be traced to the table that registers it.
+struct RootCensus {
+    on: bool,
+    /// Label, roots seen, and how many of them were null. Linear: there are a
+    /// handful of labels and the walk appends to none of them.
+    rows: Vec<(&'static str, usize, usize)>,
+}
+
+impl RootCensus {
+    fn new() -> Self {
+        Self {
+            on: std::env::var_os("MAJIT_GC_ROOT_CENSUS").is_some(),
+            rows: Vec::new(),
+        }
+    }
+
+    fn note(&mut self, site: &'static str, gcref: GcRef) {
+        if !self.on {
+            return;
+        }
+        let null = usize::from(gcref.is_null());
+        match self.rows.iter_mut().find(|(label, _, _)| *label == site) {
+            Some(row) => {
+                row.1 += 1;
+                row.2 += null;
+            }
+            None => self.rows.push((site, 1, null)),
+        }
+    }
+
+    fn report(&mut self, major: usize, prebuilt: usize) {
+        if !self.on {
+            return;
+        }
+        self.rows.sort_by(|a, b| b.1.cmp(&a.1));
+        let total: usize = self.rows.iter().map(|(_, seen, _)| seen).sum();
+        let mut line = format!("[jit-gc-diag] major={major} roots={total} prebuilt={prebuilt}");
+        for (label, seen, null) in &self.rows {
+            line.push_str(&format!(" {label}={seen}/{null}null"));
+        }
+        eprintln!("{line}");
     }
 }
