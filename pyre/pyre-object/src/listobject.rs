@@ -605,6 +605,11 @@ impl W_ListObject {
     /// shadow stack across the owner barrier — the barrier waits on the GC
     /// operation gate and can therefore let a collection move the block before
     /// `install` pins it.
+    ///
+    /// Not looked inside: `install` takes `&mut` of the inline
+    /// `bytes_items` of a GC object, an interior address the codewriter
+    /// refuses (`jtransform.py` `rewrite_op_getsubstruct` is raw-only).
+    #[majit_macros::dont_look_inside]
     unsafe fn install_bytes_items(obj: PyObjectRef, fresh: BytesArray) -> PyObjectRef {
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
