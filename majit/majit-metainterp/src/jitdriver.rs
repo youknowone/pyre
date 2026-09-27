@@ -1950,15 +1950,13 @@ impl EntryScratch {
     ///
     /// `execute_assembler`'s raw path writes only the unspecialized red words,
     /// so [`JitDriver::take_entry_scratch_raw`] leaves these alone. A fill of
-    /// `live_values`, `types`, `vable_static` or `vable_arrays` clears them
+    /// `live_values`, `types`, `vable_boxes` or `vable_lengths` clears them
     /// first; `raw` is not touched here.
     fn clear_typed(&mut self) {
         self.live_values.clear();
         self.types.clear();
-        self.vable_static.clear();
-        for array in &mut self.vable_arrays {
-            array.clear();
-        }
+        self.vable_boxes.clear();
+        self.vable_lengths.clear();
     }
 }
 
@@ -8122,7 +8120,7 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// `maybe_compile_and_run` unspecializes reds into one word buffer and
     /// `func_execute_token` reads that buffer. Only `raw` is cleared. A caller
-    /// that fills `live_values`, `types`, `vable_static` or `vable_arrays`
+    /// that fills `live_values`, `types`, `vable_boxes` or `vable_lengths`
     /// clears those first via [`EntryScratch::clear_typed`].
     fn take_entry_scratch_raw(&mut self) -> Box<EntryScratch> {
         let mut scratch = self.entry_scratch.take().unwrap_or_default();

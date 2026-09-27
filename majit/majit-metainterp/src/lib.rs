@@ -60,7 +60,8 @@ use majit_ir::{OpRef, Type};
 /// `use` and re-exports). Charon's module origin drops the crate segment
 /// (`front/mir.rs` `strip_crate_prefix`); hash what remains with the same
 /// function the graph codewriter uses for `BhSizeSpec.type_id`
-/// ([`majit_translate::codewriter::assembler::definition_path_type_id`]).
+/// (`definition_path_type_id` in majit-translate's codewriter assembler,
+/// which is [`majit_ir::descr::path_hash_for_gc_kind`]).
 /// GC-managed and raw layouts stay distinct, matching `GcStruct(T)` /
 /// `Struct(T)`.
 #[doc(hidden)]
@@ -70,7 +71,7 @@ pub fn __majit_struct_type_id<T: 'static>(is_gc_managed: bool) -> u64 {
         Some((_, rest)) => rest,
         None => type_name,
     };
-    majit_translate::codewriter::assembler::definition_path_type_id(definition_path, is_gc_managed)
+    majit_ir::descr::path_hash_for_gc_kind(definition_path, is_gc_managed)
 }
 
 pub mod blackhole;
