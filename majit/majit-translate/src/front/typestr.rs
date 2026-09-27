@@ -80,7 +80,21 @@ pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
     let Some(s) = array_type_id else {
         return false;
     };
-    let mut inner = s.trim();
+    let trimmed = s.trim();
+    // A pointer to a slice is a raw `{ptr, len}` view. Bare `[u8]` stays
+    // the length-prefixed bytes GcArray; the two are different identities.
+    if let Some(rest) = trimmed
+        .strip_prefix("*const ")
+        .or_else(|| trimmed.strip_prefix("*mut "))
+        .or_else(|| trimmed.strip_prefix("&mut "))
+        .or_else(|| trimmed.strip_prefix('&'))
+    {
+        let inner = rest.trim_start();
+        if inner.starts_with('[') && inner.ends_with(']') && !inner.contains(';') {
+            return true;
+        }
+    }
+    let mut inner = trimmed;
     loop {
         let stripped = inner
             .strip_prefix("*const ")
@@ -130,7 +144,6 @@ mod tests {
             "[str]",
             "[i64]",
             "[f64]",
-            "&[u8]",
             "GcArray<i64>",
             "majit::object_ref_gcarray",
         ] {
@@ -159,6 +172,8 @@ mod tests {
             "[*mut PyObject]",
             "*const i64",
             "*mut Point",
+            "*const [u8]",
+            "&[u8]",
         ] {
             assert!(
                 nolength_from_array_type_id(Some(id)),
