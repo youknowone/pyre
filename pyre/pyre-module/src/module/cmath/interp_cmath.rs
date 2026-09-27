@@ -125,15 +125,27 @@ pub fn isnan(args: &[PyObjectRef]) -> PyResult {
 /// `cmath.isclose(a, b, *, rel_tol=1e-09, abs_tol=0.0)` — complex
 /// `_Py_c_isclose` equivalent over the two operands' components.
 pub fn isclose(args: &[PyObjectRef]) -> PyResult {
-    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    let (pos, mut kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
     pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, &["rel_tol", "abs_tol"], "isclose")?;
     if pos.len() < 2 {
         return Err(pyre_interpreter::PyError::type_error(
             "isclose() missing required argument",
         ));
     }
-    let (ar, ai) = pyre_interpreter::builtins::complex_coerce(pos[0])?;
-    let (br, bi) = pyre_interpreter::builtins::complex_coerce(pos[1])?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let a = pyre_interpreter::builtins::complex_coerce(pos[0]);
+    let w = roots.get(base);
+    kwargs = if w.is_null() { None } else { Some(w) };
+    drop(roots);
+    let (ar, ai) = a?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let b = pyre_interpreter::builtins::complex_coerce(pos[1]);
+    let w = roots.get(base);
+    kwargs = if w.is_null() { None } else { Some(w) };
+    drop(roots);
+    let (br, bi) = b?;
     let tol = |name: &str, default: f64| -> Result<f64, pyre_interpreter::PyError> {
         match pyre_interpreter::builtins::kwarg_get(kwargs, name) {
             Some(v) => pyre_interpreter::baseobjspace::float_w(v),

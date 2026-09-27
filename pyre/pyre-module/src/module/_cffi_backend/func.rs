@@ -324,8 +324,8 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         )));
     }
     let roots = pyre_object::gc_roots::push_roots();
-    let object_slot = roots.base();
-    let _ = roots.pin_root(a[1]);
+    let object_slot = roots.pin_roots(&[a[1], w_ctype]);
+    let ctype_slot = object_slot + 1;
     if unsafe { pyre_object::unicodeobject::is_str(roots.get(object_slot)) } {
         return Err(PyError::type_error(
             "from_buffer() cannot return the address of a unicode object",
@@ -347,7 +347,7 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             roots.get(object_slot),
         )
     };
-    let owner_slot = object_slot + 1;
+    let owner_slot = object_slot + 2;
     let _ = roots.pin_root(owner);
     let held = unsafe { pyre_interpreter::builtins::buffer_export_incref(roots.get(owner_slot)) };
 
@@ -387,7 +387,7 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     Ok(cdataobj::new_cdata_from_buffer(
         ptr as usize,
         arraylength,
-        w_ctype,
+        roots.get(ctype_slot),
         roots.get(object_slot),
         roots.get(owner_slot),
         held,

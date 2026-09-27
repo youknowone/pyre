@@ -190,14 +190,19 @@ pub(crate) unsafe fn deque_slot_del(obj: PyObjectRef, index: usize) -> bool {
 /// with one reads endpoints belonging to two different chains and can reach a
 /// `PY_NULL` link. The stripe is reentrant, so the `store`/`append_right`
 /// nesting below costs nothing.
-/// Publish the needle and the snapshot as one livevar set, then normalize
-/// once. Sequential `pin_root` / `pin_roots` would query after the first
-/// write and leave the rest invisible to a foreign collection.
-fn publish_needle_and_snapshot(x: PyObjectRef, items: &[PyObjectRef]) -> (usize, usize) {
+/// Publish `pinned`, the needle and the snapshot as one livevar set, then
+/// normalize once. Sequential `pin_root` / `pin_roots` would query after the
+/// first write and leave the rest invisible to a foreign collection.
+fn publish_needle_and_snapshot(
+    pinned: &[PyObjectRef],
+    x: PyObjectRef,
+    items: &[PyObjectRef],
+) -> (usize, usize, usize) {
+    let pinned_base = pyre_object::gc_roots::publish_roots(pinned);
     let x_slot = pyre_object::gc_roots::publish_roots(&[x]);
     let items_base = pyre_object::gc_roots::publish_roots(items);
-    pyre_object::gc_roots::normalize_roots(x_slot, 1 + items.len());
-    (x_slot, items_base)
+    pyre_object::gc_roots::normalize_roots(pinned_base, pinned.len() + 1 + items.len());
+    (pinned_base, x_slot, items_base)
 }
 
 fn snapshot(self_obj: PyObjectRef) -> Vec<PyObjectRef> {
@@ -684,12 +689,15 @@ fn append_right(self_obj: PyObjectRef, item: PyObjectRef) {
     let _ = pyre_object::gc_roots::pin_root(item);
     let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let _deque_guard = unsafe { w_deque_lock(self_obj) };
-    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let mut self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let item = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let mut ri = W_Deque::from_obj(self_obj).expect("deque").rightindex + 1;
     if ri >= BLOCKLEN {
         let old_right = W_Deque::from_obj(self_obj).expect("deque").rightblock;
+        let _ = pyre_object::gc_roots::pin_root(old_right);
         let new_right = deque_block::new(old_right, PY_NULL);
+        self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+        let old_right = pyre_object::gc_roots::shadow_stack_get(root_base + 2);
         block(old_right).rightlink = new_right;
         W_Deque::from_obj(self_obj).expect("deque").rightblock = new_right;
         ri = 0;
@@ -699,7 +707,7 @@ fn append_right(self_obj: PyObjectRef, item: PyObjectRef) {
     block_set(
         deque.rightblock,
         ri,
-        pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1),
+        pyre_object::gc_roots::shadow_stack_get(root_base + 1),
     );
     deque.len += 1;
     if maxlen_bound(self_obj).is_some_and(|maxlen| deque.len > maxlen as i64) {
@@ -715,12 +723,15 @@ fn append_left(self_obj: PyObjectRef, item: PyObjectRef) {
     let _ = pyre_object::gc_roots::pin_root(item);
     let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let _deque_guard = unsafe { w_deque_lock(self_obj) };
-    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let mut self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let item = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let mut li = W_Deque::from_obj(self_obj).expect("deque").leftindex - 1;
     if li < 0 {
         let old_left = W_Deque::from_obj(self_obj).expect("deque").leftblock;
+        let _ = pyre_object::gc_roots::pin_root(old_left);
         let new_left = deque_block::new(PY_NULL, old_left);
+        self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+        let old_left = pyre_object::gc_roots::shadow_stack_get(root_base + 2);
         block(old_left).leftlink = new_left;
         W_Deque::from_obj(self_obj).expect("deque").leftblock = new_left;
         li = BLOCKLEN - 1;
@@ -730,7 +741,7 @@ fn append_left(self_obj: PyObjectRef, item: PyObjectRef) {
     block_set(
         deque.leftblock,
         li,
-        pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1),
+        pyre_object::gc_roots::shadow_stack_get(root_base + 1),
     );
     deque.len += 1;
     if maxlen_bound(self_obj).is_some_and(|maxlen| deque.len > maxlen as i64) {
@@ -1134,14 +1145,18 @@ impl W_Deque {
         let lock = getlock(self_obj);
         let items = snapshot(self_obj);
         let _roots = pyre_object::gc_roots::push_roots();
-        let (x_slot, items_base) = publish_needle_and_snapshot(x, &items);
+        let (own_base, x_slot, items_base) =
+            publish_needle_and_snapshot(&[self_obj, lock], x, &items);
         let mut n = 0i64;
         for i in 0..items.len() {
             let equal = crate::baseobjspace::eq_w(
                 pyre_object::gc_roots::shadow_stack_get(items_base + i),
                 pyre_object::gc_roots::shadow_stack_get(x_slot),
             )?;
-            checklock(self_obj, lock)?;
+            checklock(
+                pyre_object::gc_roots::shadow_stack_get(own_base),
+                pyre_object::gc_roots::shadow_stack_get(own_base + 1),
+            )?;
             if equal {
                 n += 1;
             }
@@ -1153,7 +1168,8 @@ impl W_Deque {
         let items = snapshot(self_obj);
         let lock = getlock(self_obj);
         let _roots = pyre_object::gc_roots::push_roots();
-        let (x_slot, items_base) = publish_needle_and_snapshot(x, &items);
+        let (own_base, x_slot, items_base) =
+            publish_needle_and_snapshot(&[self_obj, lock], x, &items);
         let mut pos = None;
         for i in 0..items.len() {
             let equal = crate::baseobjspace::eq_w(
@@ -1164,7 +1180,10 @@ impl W_Deque {
             // IndexError (PyPy's older block-list port reports RuntimeError).
             // The comparison may have cleared or otherwise resized the live
             // deque, so do not continue against the stale snapshot.
-            if !lock_valid(self_obj, lock) {
+            if !lock_valid(
+                pyre_object::gc_roots::shadow_stack_get(own_base),
+                pyre_object::gc_roots::shadow_stack_get(own_base + 1),
+            ) {
                 return Err(crate::PyError::index_error(
                     "deque mutated during iteration",
                 ));
@@ -1182,7 +1201,10 @@ impl W_Deque {
                 // does cover the write-back, and the epoch is re-read under it
                 // so a mutation that landed after the last comparison is
                 // reported rather than silently overwritten by the snapshot.
-                let _deque_guard = unsafe { w_deque_lock(self_obj) };
+                let _deque_guard =
+                    unsafe { w_deque_lock(pyre_object::gc_roots::shadow_stack_get(own_base)) };
+                let self_obj = pyre_object::gc_roots::shadow_stack_get(own_base);
+                let lock = pyre_object::gc_roots::shadow_stack_get(own_base + 1);
                 if !lock_valid(self_obj, lock) {
                     return Err(crate::PyError::index_error(
                         "deque mutated during iteration",
@@ -1205,13 +1227,17 @@ impl W_Deque {
         let lock = getlock(self_obj);
         let items = snapshot(self_obj);
         let _roots = pyre_object::gc_roots::push_roots();
-        let (x_slot, items_base) = publish_needle_and_snapshot(x, &items);
+        let (own_base, x_slot, items_base) =
+            publish_needle_and_snapshot(&[self_obj, lock], x, &items);
         for i in 0..items.len() {
             let equal = crate::baseobjspace::eq_w(
                 pyre_object::gc_roots::shadow_stack_get(items_base + i),
                 pyre_object::gc_roots::shadow_stack_get(x_slot),
             )?;
-            checklock(self_obj, lock)?;
+            checklock(
+                pyre_object::gc_roots::shadow_stack_get(own_base),
+                pyre_object::gc_roots::shadow_stack_get(own_base + 1),
+            )?;
             if equal {
                 return Ok(true);
             }
@@ -1295,12 +1321,14 @@ impl W_Deque {
         let self_obj = self as *mut W_Deque as PyObjectRef;
         let items = snapshot(self_obj);
         let _roots = pyre_object::gc_roots::push_roots();
-        let (x_slot, items_base) = publish_needle_and_snapshot(x, &items);
+        let (own_base, x_slot, items_base) =
+            publish_needle_and_snapshot(&[self_obj, PY_NULL], x, &items);
         let len = items.len() as i64;
         // `space.iter(self)` takes the lock before `unwrap_start_stop`,
         // so a `__index__` on start/stop that mutates the deque is caught
         // by the first `checklock`.
-        let lock = getlock(self_obj);
+        let lock = getlock(pyre_object::gc_roots::shadow_stack_get(own_base));
+        pyre_object::gc_roots::shadow_stack_set(own_base + 1, lock);
         let clamp = |i: i64| if i < 0 { (i + len).max(0) } else { i.min(len) };
         let start = clamp(
             start
@@ -1317,7 +1345,10 @@ impl W_Deque {
         let mut i = 0i64;
         while i < upper {
             // `space.next(w_iter)` checks the lock before each element.
-            checklock(self_obj, lock)?;
+            checklock(
+                pyre_object::gc_roots::shadow_stack_get(own_base),
+                pyre_object::gc_roots::shadow_stack_get(own_base + 1),
+            )?;
             if i >= start {
                 if crate::baseobjspace::eq_w(
                     pyre_object::gc_roots::shadow_stack_get(items_base + i as usize),
@@ -1328,12 +1359,17 @@ impl W_Deque {
                     return Ok(i);
                 }
                 // Re-check the lock after a non-match.
-                checklock(self_obj, lock)?;
+                checklock(
+                    pyre_object::gc_roots::shadow_stack_get(own_base),
+                    pyre_object::gc_roots::shadow_stack_get(own_base + 1),
+                )?;
             }
             i += 1;
         }
         Err(crate::PyError::value_error(crate::display::wtf8_format!(
-            unsafe { crate::display::py_repr_wtf8(x)? },
+            unsafe {
+                crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(x_slot))?
+            },
             " is not in deque"
         )))
     }

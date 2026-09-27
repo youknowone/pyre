@@ -251,14 +251,11 @@ impl<'a> MiniXmlParser<'a> {
         // `encoding` and `standalone` are freshly minted and reachable only
         // from these locals, while the rest of the loop, the position update
         // and the handler call all allocate and can run Python — a collection
-        // that completes in that window would reclaim them.  Each mint takes
-        // one liveness pin; neither kind moves, so the locals stay current and
-        // are never read back.  `w_none()` is a singleton and needs nothing.
+        // that completes in that window would reclaim them.
         let roots = pyre_object::gc_roots::push_roots();
         let mut version = String::new();
-        let mut encoding = w_none();
         let standalone = w_int_new(-1);
-        let mut standalone = roots.pin_root(standalone);
+        let base = roots.pin_roots(&[w_none(), standalone]);
         loop {
             self.skip_ws();
             if self.consume("?>") {
@@ -274,18 +271,13 @@ impl<'a> MiniXmlParser<'a> {
             let value = self.read_quoted()?;
             match key.as_str() {
                 "version" => version = value,
-                "encoding" => {
-                    encoding = w_str_new_managed(&value);
-                    let _ = roots.pin_root(encoding);
-                }
-                "standalone" => {
-                    standalone = w_int_new(if value == "yes" { 1 } else { 0 });
-                    let _ = roots.pin_root(standalone);
-                }
+                "encoding" => roots.set(base, w_str_new_managed(&value)),
+                "standalone" => roots.set(base + 1, w_int_new(if value == "yes" { 1 } else { 0 })),
                 _ => {}
             }
         }
         self.set_event_position(event_pos);
+        let encoding = roots.get(base);
         if let Some(enc) = unsafe {
             if is_none(encoding) {
                 None
@@ -297,9 +289,10 @@ impl<'a> MiniXmlParser<'a> {
         }
         self.handler_args("XmlDeclHandler")
             .arg(w_str_new_managed(&version))
-            .arg(encoding)
-            .arg(standalone)
+            .arg(roots.get(base))
+            .arg(roots.get(base + 1))
             .call()?;
+        let standalone = roots.get(base + 1);
         if unsafe { is_int(standalone) && w_int_get_value(standalone) == 0 } {
             pyre_interpreter::baseobjspace::setdictvalue_native(
                 self.parser,
@@ -385,27 +378,21 @@ impl<'a> MiniXmlParser<'a> {
         let name = self.read_name()?;
         // The two identifiers are minted here and used again only at the very
         // end, past the not-standalone callback, the internal subset and the
-        // start-doctype handler — all of which run Python.  Nothing else refers
-        // to them in between, so each mint takes one liveness pin; a `str` does
-        // not move, so the locals stay current.  `w_none()` needs nothing.
+        // start-doctype handler — all of which run Python.
         let roots = pyre_object::gc_roots::push_roots();
-        let mut sysid = w_none();
-        let mut pubid = w_none();
+        let base = roots.pin_roots(&[w_none(), w_none()]);
         let mut has_internal_subset = false;
         self.skip_ws();
         if self.starts_with("PUBLIC") {
             self.expect("PUBLIC")?;
             self.skip_ws();
-            pubid = w_str_new_managed(&self.read_quoted()?);
-            let _ = roots.pin_root(pubid);
+            roots.set(base + 1, w_str_new_managed(&self.read_quoted()?));
             self.skip_ws();
-            sysid = w_str_new_managed(&self.read_quoted()?);
-            let _ = roots.pin_root(sysid);
+            roots.set(base, w_str_new_managed(&self.read_quoted()?));
         } else if self.starts_with("SYSTEM") {
             self.expect("SYSTEM")?;
             self.skip_ws();
-            sysid = w_str_new_managed(&self.read_quoted()?);
-            let _ = roots.pin_root(sysid);
+            roots.set(base, w_str_new_managed(&self.read_quoted()?));
         }
         self.skip_ws();
         if pyre_interpreter::baseobjspace::getattr_str(self.parser, "_pyre_not_standalone_pending")
@@ -424,8 +411,8 @@ impl<'a> MiniXmlParser<'a> {
             self.set_event_position(event_pos);
             self.handler_args("StartDoctypeDeclHandler")
                 .arg(w_str_new_managed(&name))
-                .arg(sysid)
-                .arg(pubid)
+                .arg(roots.get(base))
+                .arg(roots.get(base + 1))
                 .arg(w_int_new(1))
                 .call()?;
             self.parse_internal_subset()?;
@@ -433,14 +420,14 @@ impl<'a> MiniXmlParser<'a> {
             self.set_event_position(event_pos);
             self.handler_args("StartDoctypeDeclHandler")
                 .arg(w_str_new_managed(&name))
-                .arg(sysid)
-                .arg(pubid)
+                .arg(roots.get(base))
+                .arg(roots.get(base + 1))
                 .arg(w_int_new(0))
                 .call()?;
         }
         self.skip_ws();
         self.expect(">")?;
-        self.maybe_external_dtd(pubid, sysid)?;
+        self.maybe_external_dtd(roots.get(base + 1), roots.get(base))?;
         let _ = has_internal_subset;
         self.call_handler("EndDoctypeDeclHandler", &[])
     }
@@ -486,73 +473,66 @@ impl<'a> MiniXmlParser<'a> {
         // Every identifier this declaration mints is reachable only from its
         // local until the handler call at the end, and the reads that follow —
         // another `read_quoted`, the position update, the handler itself — both
-        // allocate and run Python.  Each mint takes one liveness pin; strings do
-        // not move, so no local is read back.  `base` stays the `w_none()`
-        // singleton, which needs nothing.
+        // allocate and run Python.
         let roots = pyre_object::gc_roots::push_roots();
-        let mut value = w_none();
         let mut base = w_none();
-        let mut sysid = w_none();
-        let mut pubid = w_none();
-        let mut notation = w_none();
+        let slot = roots.pin_roots(&[w_none(), w_none(), w_none(), w_none()]);
         if matches!(self.peek_char(), Some('"' | '\'')) {
             let v = self.read_quoted()?;
             self.internal_entities.insert(name.clone(), v.clone());
-            value = w_str_new_managed(&v);
-            let _ = roots.pin_root(value);
+            roots.set(slot, w_str_new_managed(&v));
         } else if self.starts_with("PUBLIC") {
             self.expect("PUBLIC")?;
             self.skip_ws();
-            pubid = w_str_new_managed(&self.read_quoted()?);
-            let pubid = roots.pin_root(pubid);
+            roots.set(slot + 2, w_str_new_managed(&self.read_quoted()?));
             self.skip_ws();
             let system = self.read_quoted()?;
             self.external_entities.insert(
                 name.clone(),
                 (
                     system.clone(),
-                    Some(pyre_interpreter::baseobjspace::str_utf8_w(pubid)?.to_string()),
+                    Some(
+                        pyre_interpreter::baseobjspace::str_utf8_w(roots.get(slot + 2))?
+                            .to_string(),
+                    ),
                 ),
             );
-            sysid = w_str_new_managed(&system);
-            let _ = roots.pin_root(sysid);
+            roots.set(slot + 1, w_str_new_managed(&system));
         } else if self.starts_with("SYSTEM") {
             self.expect("SYSTEM")?;
             self.skip_ws();
             let system = self.read_quoted()?;
             self.external_entities
                 .insert(name.clone(), (system.clone(), None));
-            sysid = w_str_new_managed(&system);
-            let _ = roots.pin_root(sysid);
+            roots.set(slot + 1, w_str_new_managed(&system));
         }
         self.skip_ws();
         if self.starts_with("NDATA") {
             self.expect("NDATA")?;
             self.skip_ws();
-            notation = w_str_new_managed(&self.read_name()?);
-            let _ = roots.pin_root(notation);
+            roots.set(slot + 3, w_str_new_managed(&self.read_name()?));
         }
         self.skip_until_gt()?;
         let _ = &mut base;
         self.set_event_position(event_pos);
-        if !unsafe { is_none(notation) } {
+        if !unsafe { is_none(roots.get(slot + 3)) } {
             self.handler_args("UnparsedEntityDeclHandler")
                 .arg(w_str_new_managed(&name))
                 .arg(base)
-                .arg(sysid)
-                .arg(pubid)
-                .arg(notation)
+                .arg(roots.get(slot + 1))
+                .arg(roots.get(slot + 2))
+                .arg(roots.get(slot + 3))
                 .call()?;
             return Ok(());
         }
         self.handler_args("EntityDeclHandler")
             .arg(w_str_new_managed(&name))
             .arg(w_int_new(is_param))
-            .arg(value)
+            .arg(roots.get(slot))
             .arg(base)
-            .arg(sysid)
-            .arg(pubid)
-            .arg(notation)
+            .arg(roots.get(slot + 1))
+            .arg(roots.get(slot + 2))
+            .arg(roots.get(slot + 3))
             .call()
     }
 
@@ -654,34 +634,29 @@ impl<'a> MiniXmlParser<'a> {
         self.skip_ws();
         // Both identifiers are minted here and held across the remaining
         // `read_quoted` calls, the position update and the handler, all of which
-        // allocate or run Python.  One liveness pin per mint; a `str` does not
-        // move, so the locals stay current and `w_none()` needs nothing.
+        // allocate or run Python.
         let roots = pyre_object::gc_roots::push_roots();
-        let mut sysid = w_none();
-        let mut pubid = w_none();
+        let base = roots.pin_roots(&[w_none(), w_none()]);
         if self.starts_with("PUBLIC") {
             self.expect("PUBLIC")?;
             self.skip_ws();
-            pubid = w_str_new_managed(&self.read_quoted()?);
-            let _ = roots.pin_root(pubid);
+            roots.set(base + 1, w_str_new_managed(&self.read_quoted()?));
             self.skip_ws();
             if matches!(self.peek_char(), Some('"' | '\'')) {
-                sysid = w_str_new_managed(&self.read_quoted()?);
-                let _ = roots.pin_root(sysid);
+                roots.set(base, w_str_new_managed(&self.read_quoted()?));
             }
         } else if self.starts_with("SYSTEM") {
             self.expect("SYSTEM")?;
             self.skip_ws();
-            sysid = w_str_new_managed(&self.read_quoted()?);
-            let _ = roots.pin_root(sysid);
+            roots.set(base, w_str_new_managed(&self.read_quoted()?));
         }
         self.skip_until_gt()?;
         self.set_event_position(event_pos);
         self.handler_args("NotationDeclHandler")
             .arg(w_str_new_managed(&name))
             .arg(w_none())
-            .arg(sysid)
-            .arg(pubid)
+            .arg(roots.get(base))
+            .arg(roots.get(base + 1))
             .call()
     }
 
@@ -1607,12 +1582,10 @@ fn parse_impl(
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // `data` can be the fresh chunk a Python `read()` just returned, named
     // only by this parameter, and the pending-input lookup below runs a full
-    // `getattr` before it is decoded.  One liveness pin; a `str`/`bytes` does
-    // not move, so the parameter stays current.  `parser` is the receiver and
-    // stays reachable through the caller.
+    // `getattr` before it is decoded.
     let roots = pyre_object::gc_roots::push_roots();
-    let data = roots.pin_root(data);
-    if pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_finished")
+    let base = roots.pin_roots(&[data, parser, isfinal]);
+    if pyre_interpreter::baseobjspace::getattr_str(roots.get(base + 1), "_pyre_finished")
         .map(is_true_obj)
         .unwrap_or(false)
     {
@@ -1623,20 +1596,22 @@ fn parse_impl(
             0,
         ));
     }
-    let mut input = parser_pending(parser);
-    input.push_str(&object_to_xml_string(parser, data)?);
-    let final_flag = is_true_obj(isfinal);
-    maybe_reject_amplification(parser, &input)?;
+    let mut input = parser_pending(roots.get(base + 1));
+    input.push_str(&object_to_xml_string(roots.get(base + 1), roots.get(base))?);
+    let final_flag = is_true_obj(roots.get(base + 2));
+    maybe_reject_amplification(roots.get(base + 1), &input)?;
     let reparse_deferral =
-        pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_reparse_deferral")
+        pyre_interpreter::baseobjspace::getattr_str(roots.get(base + 1), "_pyre_reparse_deferral")
             .map(is_true_obj)
             .unwrap_or(true);
-    let deferred_incomplete =
-        pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_deferred_incomplete")
-            .map(is_true_obj)
-            .unwrap_or(false);
+    let deferred_incomplete = pyre_interpreter::baseobjspace::getattr_str(
+        roots.get(base + 1),
+        "_pyre_deferred_incomplete",
+    )
+    .map(is_true_obj)
+    .unwrap_or(false);
     if !final_flag && reparse_deferral && deferred_incomplete {
-        set_parser_pending(parser, &input);
+        set_parser_pending(roots.get(base + 1), &input);
         return Ok(w_int_new(1));
     }
     let parse_input = if final_flag {
@@ -1648,44 +1623,50 @@ fn parse_impl(
             input.clone()
         }
     } else {
-        set_parser_pending(parser, &input);
+        set_parser_pending(roots.get(base + 1), &input);
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            parser,
+            roots.get(base + 1),
             "_pyre_deferred_incomplete",
             w_bool_from(true),
         );
         return Ok(w_int_new(1));
     };
-    if pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_use_foreign_dtd")
+    if pyre_interpreter::baseobjspace::getattr_str(roots.get(base + 1), "_pyre_use_foreign_dtd")
         .map(is_true_obj)
         .unwrap_or(false)
         && !parse_input.contains("<!DOCTYPE")
     {
-        call_foreign_dtd_handler(parser, w_none(), w_none())?;
+        call_foreign_dtd_handler(roots.get(base + 1), w_none(), w_none())?;
     }
-    let suppress_until = get_emit_upto(parser);
-    let parsed = MiniXmlParser::new(parser, &parse_input, final_flag, suppress_until).parse()?;
+    let suppress_until = get_emit_upto(roots.get(base + 1));
+    let parsed = MiniXmlParser::new(
+        roots.get(base + 1),
+        &parse_input,
+        final_flag,
+        suppress_until,
+    )
+    .parse()?;
     if final_flag {
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            parser,
+            roots.get(base + 1),
             "_pyre_finished",
             w_bool_from(true),
         );
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            parser,
+            roots.get(base + 1),
             "_pyre_deferred_incomplete",
             w_bool_from(false),
         );
-        set_parser_pending(parser, "");
+        set_parser_pending(roots.get(base + 1), "");
     } else {
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            parser,
+            roots.get(base + 1),
             "_pyre_deferred_incomplete",
             w_bool_from(false),
         );
-        set_parser_pending(parser, &input);
+        set_parser_pending(roots.get(base + 1), &input);
     }
-    set_emit_upto(parser, parsed);
+    set_emit_upto(roots.get(base + 1), parsed);
     Ok(w_int_new(1))
 }
 
@@ -1944,19 +1925,19 @@ mod xmlparser_class {
             ) -> PyObjectRef {
                 // The fresh sub-parser is named only by this local while its
                 // default slots are installed and the parent's configuration is
-                // copied over, both of which allocate and read attributes; it
-                // takes one liveness pin, and an instance does not move.
+                // copied over, both of which allocate and read attributes.
                 let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.pin_roots(&[self_obj, context, encoding]);
                 let parser = w_instance_new(xmlparser_class::type_object());
-                let parser = roots.pin_root(parser);
-                init_parser_slots(parser);
-                copy_parser_config(self_obj, parser);
-                pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_is_subparser", w_bool_from(true));
-                if unsafe { is_str(encoding) } {
-                    pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_forced_encoding", encoding);
+                let _ = roots.pin_root(parser);
+                init_parser_slots(roots.get(base + 3));
+                copy_parser_config(roots.get(base), roots.get(base + 3));
+                pyre_interpreter::baseobjspace::setdictvalue_native(roots.get(base + 3), "_pyre_is_subparser", w_bool_from(true));
+                if unsafe { is_str(roots.get(base + 2)) } {
+                    pyre_interpreter::baseobjspace::setdictvalue_native(roots.get(base + 3), "_pyre_forced_encoding", roots.get(base + 2));
                 }
-                pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_external_context", context);
-                parser
+                pyre_interpreter::baseobjspace::setdictvalue_native(roots.get(base + 3), "_pyre_external_context", roots.get(base + 1));
+                roots.get(base + 3)
             }
             fn __setattr__(mut self_obj: PyObjectRef, name: PyObjectRef, mut value: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
                 if unsafe { !is_str(name) } {
@@ -2091,15 +2072,13 @@ fn parser_create3(
     // header moves; the instance and its slot defaults below allocate all the
     // way down.  Pin it on entry and read it back for the store, or the parser
     // would keep a pre-move address.  The absent marker is a null word, which a
-    // walker treats as no root.  The fresh parser is named only by its local
-    // across the same run — every default slot it is given allocates — so it
-    // takes one liveness pin; an instance does not move and is not read back.
+    // walker treats as no root.
     let roots = pyre_object::gc_roots::push_roots();
-    let intern_slot = roots.base();
-    let _ = roots.pin_root(intern);
+    let base = roots.pin_roots(&[intern, encoding, namespace_separator]);
     let parser = w_instance_new(xmlparser_class::type_object());
-    let parser = roots.pin_root(parser);
-    init_parser_slots(parser);
+    let _ = roots.pin_root(parser);
+    init_parser_slots(roots.get(base + 3));
+    let encoding = roots.get(base + 1);
     if unsafe { !is_none(encoding) } {
         if unsafe { !is_str(encoding) } {
             return Err(parser_create_not_str("encoding", encoding));
@@ -2112,11 +2091,12 @@ fn parser_create3(
         // refusal.
         pyre_interpreter::baseobjspace::str_utf8_w(encoding)?;
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            parser,
+            roots.get(base + 3),
             "_pyre_forced_encoding",
-            encoding,
+            roots.get(base + 1),
         );
     }
+    let namespace_separator = roots.get(base + 2);
     if unsafe { is_none(namespace_separator) } {
     } else if unsafe { is_str(namespace_separator) } {
         // `namespace_separator` reads this back through `w_str_get_value`, so
@@ -2129,7 +2109,7 @@ fn parser_create3(
             ));
         }
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            parser,
+            roots.get(base + 3),
             "_pyre_namespace_separator",
             w_str_new_managed(value),
         );
@@ -2144,11 +2124,11 @@ fn parser_create3(
     // `init_parser_slots` installed that new dictionary already, so an omitted
     // argument has nothing to write and the two named cases write themselves;
     // `intern_string` reads `None` back as "do not intern".
-    let intern = roots.get(intern_slot);
+    let intern = roots.get(base);
     if !intern.is_null() {
-        pyre_interpreter::baseobjspace::setdictvalue_native(parser, "intern", intern);
+        pyre_interpreter::baseobjspace::setdictvalue_native(roots.get(base + 3), "intern", intern);
     }
-    Ok(parser)
+    Ok(roots.get(base + 3))
 }
 
 /// `ErrorString(code)` — map an error code to its message via the `errors`

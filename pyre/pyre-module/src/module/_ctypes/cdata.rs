@@ -858,20 +858,23 @@ fn set_simple_value(obj: PyObjectRef, value: PyObjectRef) -> Result<(), pyre_int
     // `value` is an arbitrary object, so under `"O"` it can be a `list` or a
     // `dict`, both of which move, and `encode_value_into` can run Python: pin it
     // and read the slot back where it is stored.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let value_slot = pyre_object::gc_roots::shadow_stack_len();
-    let value = pyre_object::gc_roots::pin_root(value);
-    let mut bytes = encode_value_into(&tc, value, obj, "0")?;
-    if unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }.is_some() {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[value, obj, cls]);
+    let mut bytes = encode_value_into(&tc, roots.get(base), roots.get(base + 1), "0")?;
+    if unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(roots.get(base + 2), "_swappedbytes_")
+    }
+    .is_some()
+    {
         bytes.reverse();
     }
     // `BSTR_set` frees what the slot held only once the new string exists, so
     // a conversion that refuses its value leaves the previous one readable.
-    release_bstr_slot(&tc, cdata_addr(obj).unwrap_or(0));
-    cdata_write(obj, 0, &bytes);
+    release_bstr_slot(&tc, cdata_addr(roots.get(base + 1)).unwrap_or(0));
+    cdata_write(roots.get(base + 1), 0, &bytes);
     if matches!(tc.as_str(), "z" | "Z" | "O") {
-        let d = pyre_interpreter::baseobjspace::getdict_native(obj);
-        let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+        let d = pyre_interpreter::baseobjspace::getdict_native(roots.get(base + 1));
+        let value = roots.get(base);
         unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, value) };
     }
     Ok(())
@@ -2075,13 +2078,13 @@ pub(super) fn encode_value_into(
         // Retain the copy before reading its address, so a GC triggered while
         // inserting the keepalive cannot leave the stored pointer stale.  Until
         // `keep_alive` links it into the root, only this frame holds the copy and
-        // `keep_ref` allocates, so pin it for that window; it does not move, so
-        // the word is never re-read.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let copy = pyre_object::gc_roots::pin_root(copy);
-        keep_ref(dest, key, value);
-        keep_alive(dest, key, copy);
-        let addr = unsafe { pyre_object::bytesobject::w_bytes_data(copy).as_ptr() } as usize;
+        // `keep_ref` allocates, so pin it for that window.
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.pin_roots(&[copy, dest]);
+        keep_ref(roots.get(base + 1), key, value);
+        keep_alive(roots.get(base + 1), key, roots.get(base));
+        let addr =
+            unsafe { pyre_object::bytesobject::w_bytes_data(roots.get(base)).as_ptr() } as usize;
         return Ok(host_ctypes::simple_storage_value_to_bytes_endian(
             tc,
             host_ctypes::SimpleStorageValue::Pointer(addr),
@@ -2092,12 +2095,13 @@ pub(super) fn encode_value_into(
         let raw = unsafe { pyre_object::w_str_get_wtf8(value) };
         let copy =
             pyre_object::w_bytearray_from_bytes(&host_ctypes::clone_wchar_null_terminated(raw));
-        let _roots = pyre_object::gc_roots::push_roots();
-        let copy = pyre_object::gc_roots::pin_root(copy);
-        keep_ref(dest, key, value);
-        keep_alive(dest, key, copy);
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.pin_roots(&[copy, dest]);
+        keep_ref(roots.get(base + 1), key, value);
+        keep_alive(roots.get(base + 1), key, roots.get(base));
         let addr =
-            unsafe { pyre_object::bytearrayobject::w_bytearray_data(copy).as_ptr() } as usize;
+            unsafe { pyre_object::bytearrayobject::w_bytearray_data(roots.get(base)).as_ptr() }
+                as usize;
         return Ok(host_ctypes::simple_storage_value_to_bytes_endian(
             tc,
             host_ctypes::SimpleStorageValue::Pointer(addr),

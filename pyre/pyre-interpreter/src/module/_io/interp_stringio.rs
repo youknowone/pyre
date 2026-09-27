@@ -271,11 +271,18 @@ impl W_StringIO {
         // interp_stringio.py:177-188.
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = self.pin_self();
+        let _ = pyre_object::gc_roots::pin_root(w_initvalue);
+        let initvalue_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         Self::init_newline(slot, w_newline)?;
-        let decoded = if unsafe { pyre_object::is_none(w_initvalue) } {
+        let decoded = if unsafe {
+            pyre_object::is_none(pyre_object::gc_roots::shadow_stack_get(initvalue_slot))
+        } {
             w_str_new("")
         } else {
-            Self::decode_string(slot, w_initvalue)?
+            Self::decode_string(
+                slot,
+                pyre_object::gc_roots::shadow_stack_get(initvalue_slot),
+            )?
         };
         let _ = pyre_object::gc_roots::pin_root(decoded);
         let decoded =

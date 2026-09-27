@@ -54,7 +54,7 @@ fn has_exc(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErro
 }
 
 fn stack_effect(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    let (positional, mut kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
     pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, &["jump"], "stack_effect")?;
     if positional.len() > 2 {
         return Err(pyre_interpreter::PyError::type_error(format!(
@@ -66,13 +66,27 @@ fn stack_effect(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
         .first()
         .copied()
         .ok_or_else(|| pyre_interpreter::PyError::type_error("stack_effect() missing opcode"))?;
-    let raw = pyre_interpreter::baseobjspace::int_w(raw)?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let raw = pyre_interpreter::baseobjspace::int_w(raw);
+    let w = roots.get(base);
+    kwargs = if w.is_null() { None } else { Some(w) };
+    drop(roots);
+    let raw = raw?;
     let opcode = try_opcode(raw)
         .filter(|op| op.real().is_none_or(|real| real.deopt().is_none()))
         .ok_or_else(|| pyre_interpreter::PyError::value_error("invalid opcode or oparg"))?;
 
     let oparg = match positional.get(1).copied() {
-        Some(value) if unsafe { !is_none(value) } => pyre_interpreter::baseobjspace::int_w(value)?,
+        Some(value) if unsafe { !is_none(value) } => {
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+            let oparg = pyre_interpreter::baseobjspace::int_w(value);
+            let w = roots.get(base);
+            kwargs = if w.is_null() { None } else { Some(w) };
+            drop(roots);
+            oparg?
+        }
         _ => 0,
     };
     let oparg = u32::try_from(oparg)

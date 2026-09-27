@@ -440,7 +440,8 @@ pub(crate) fn show_warning(
     let source_line_slot = pin_root_slot(source_line);
     let source_slot = pin_root_slot(source);
     if let Some(show) = warnings_attr("_showwarnmsg") {
-        if !crate::baseobjspace::callable_w(show) {
+        let show_slot = pin_root_slot(show);
+        if !crate::baseobjspace::callable_w(pyre_object::gc_roots::shadow_stack_get(show_slot)) {
             return Err(PyError::type_error(
                 "warnings._showwarnmsg() must be set to a callable",
             ));
@@ -457,7 +458,7 @@ pub(crate) fn show_warning(
                 pyre_object::gc_roots::shadow_stack_get(lineno_slot),
                 w_none(),
                 w_none(),
-                if source.is_null() {
+                if pyre_object::gc_roots::shadow_stack_get(source_slot).is_null() {
                     w_none()
                 } else {
                     pyre_object::gc_roots::shadow_stack_get(source_slot)
@@ -466,7 +467,7 @@ pub(crate) fn show_warning(
         )?;
         let warning_message_slot = pin_root_slot(warning_message);
         crate::call::call_function_impl_result(
-            show,
+            pyre_object::gc_roots::shadow_stack_get(show_slot),
             &[pyre_object::gc_roots::shadow_stack_get(
                 warning_message_slot,
             )],
@@ -780,6 +781,7 @@ pub(crate) fn do_warn_explicit(
         lineno,
         pyre_object::gc_roots::shadow_stack_get(module_slot),
     )?;
+    let item_slot = pin_root_slot(item);
     if action == "error" {
         return Err(unsafe {
             PyError::from_exc_object(pyre_object::gc_roots::shadow_stack_get(message_slot))
@@ -819,7 +821,11 @@ pub(crate) fn do_warn_explicit(
         } else if action != "default" {
             return Err(PyError::runtime_error(format!(
                 "Unrecognized action ({action}) in warnings.filters: {}",
-                if item.is_null() { "???" } else { "filter item" }
+                if pyre_object::gc_roots::shadow_stack_get(item_slot).is_null() {
+                    "???"
+                } else {
+                    "filter item"
+                }
             )));
         }
     }
