@@ -3003,9 +3003,8 @@ mod tests {
 
     #[test]
     fn cast_instance_intrinsic_wtf8_root_projects_root_instance_to_somestring() {
-        // `w_str_get_wtf8(obj)` paints dest through this string-root
-        // marker (`front/mir.rs` `cast_instance_call_result("Wtf8", …,
-        // ValueType::Str)`).  `project_struct_field_type("Wtf8")` is
+        // The string-root marker `cast_instance_call_result("Wtf8", …,
+        // ValueType::Str)`.  `project_struct_field_type("Wtf8")` is
         // SomeString; a PyObject instance operand must narrow to that
         // shell rather than keep SomeInstance.
         let bk = bk();

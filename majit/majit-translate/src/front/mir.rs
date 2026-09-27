@@ -12707,32 +12707,19 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `w_str_get_wtf8(obj)` is `_utf8`.  The receiver is a
-                // `PyObjectRef`, so aliasing dest to args[0] would paint
-                // dest `SomeInstance(pyobject::PyObject)` and every later
-                // string op would union `String ∪ Instance` or dispatch
-                // `InstanceRepr` (no `rtype_len` / `rtype_eq`).  Project
-                // dest as `ValueType::Str` through the existing
-                // `__cast_instance_intrinsic` string-root seam
-                // (`project_struct_field_type("Wtf8")` → `SomeString`;
-                // `cast_instance_call_result` result_ty `Str`).  The
-                // marker is jitcode-identity (`cast_pointer` /
-                // `cast_opaque_ptr` → `same_as`; Skip folds it to the
-                // operand), so the machine value stays the receiver.
-                // Mark dest a byte view so `as_bytes()[i]` / `len` still
-                // plant `strgetitem` / `strlen`.
+                // `w_str_get_wtf8(obj)` is `w_obj._utf8`: a getfield of the
+                // rstr `STR` payload off the `W_UnicodeObject`
+                // (`unicodeobject.py` `_immutable_fields_ = ['_utf8', ...]`).
+                // The receiver is a `PyObjectRef`, so narrow it to
+                // `W_UnicodeObject` before reading `value`; the read is
+                // typed `ValueType::Str`, so dest is the same `SomeString`
+                // payload a `ConstStr` materializes, and `strlen` /
+                // `strgetitem` / string equality all read one
+                // representation.  Mark dest a byte view so
+                // `as_bytes()[i]` / `len` still plant `strgetitem` /
+                // `strlen`.
                 if args.len() == 1 && self.is_w_str_get_wtf8_identity(&reg) {
-                    let dest = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(dest.clone()),
-                        kind: crate::model::cast_instance_call_result(
-                            "Wtf8",
-                            args[0].clone(),
-                            ValueType::Str,
-                        ),
-                    });
+                    let dest = self.emit_w_str_utf8_read(bb_id, args[0].clone());
                     self.local_var[dest_local] = Some(dest);
                     if !self.string_byte_view_locals.contains(&dest_local) {
                         self.string_byte_view_locals.push(dest_local);
@@ -18017,6 +18004,36 @@ impl<'a> Lowering<'a> {
     /// MIR projections.  Keep the collision-free layout identity alongside
     /// the bare `Constants` annotation owner, exactly as
     /// [`Self::resolve_adt_field`] does for a source-level `.0` read.
+    /// `w_obj._utf8` — narrow the `PyObjectRef` receiver to
+    /// `W_UnicodeObject` and read its `value` field, the rstr `STR`
+    /// payload.
+    fn emit_w_str_utf8_read(&mut self, bb_id: BlockId, base: Variable) -> Variable {
+        let narrowed = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(narrowed.clone()),
+            kind: crate::model::cast_instance_call("W_UnicodeObject", base),
+        });
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::FieldRead {
+                base: narrowed,
+                field: FieldDescriptor::new("value", Some("W_UnicodeObject".to_string()))
+                    .with_owner_id(Some(majit_ir::descr::StructId::from_canonical(
+                        "unicodeobject::W_UnicodeObject",
+                    )))
+                    .with_base_is_deref(true),
+                ty: ValueType::Str,
+                pure: false,
+            },
+        });
+        result
+    }
+
     fn emit_constants_items_read(&mut self, bb_id: BlockId, base: Variable) -> Variable {
         // `CodeObject<C>` is generic, so its `constants: Constants<C>` field
         // arrives at a dependent trait-default graph as classdef-less `Ref`.
@@ -19882,9 +19899,9 @@ impl<'a> Lowering<'a> {
         tyref_strips_to_str(dest_ty, self.llbc)
     }
 
-    /// `w_str_get_wtf8(obj)` — `_utf8`.  Dest is the receiver's
-    /// machine value projected as `ValueType::Str` (`Wtf8` string-root
-    /// `__cast_instance_intrinsic`), not a residual call and not an
+    /// `w_str_get_wtf8(obj)` — `_utf8`.  Dest is the `value` getfield
+    /// of the receiver narrowed to `W_UnicodeObject`
+    /// ([`Self::emit_w_str_utf8_read`]), not a residual call and not an
     /// alias that keeps the `PyObject` instance type.
     fn is_w_str_get_wtf8_identity(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
