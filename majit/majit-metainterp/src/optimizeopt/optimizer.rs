@@ -3794,6 +3794,11 @@ impl Optimizer {
                 if building_bridge {
                     break 'export None;
                 }
+                // unroll.py `optimize_peeled_loop` exports nothing: only the
+                // preamble's `export_state` feeds the peeled loop.
+                if self.imported_loop_state.is_some() {
+                    break 'export None;
+                }
                 self.publish_preview_short_state(&mut ctx, &resolved_args)?;
                 let jump_arglist_oprefs: Vec<OpRef> =
                     jump.args_slice().iter().map(|a| a.to_opref()).collect();

@@ -850,13 +850,13 @@ impl ShortBoxes {
             return Some(majit_ir::operand::Operand::from_opref(opref));
         }
         // shortpreamble.py `if op in self.produced_short_boxes` — the
-        // dict membership is Box identity.
-        // A Phase 1 box and the Phase 2 box recorded at the same position
-        // (a virtual forced in both phases, an inputarg re-minted per phase)
-        // are distinct objects here, and `potential_ops` keys label args by
-        // their position's canonical box, so the lookup goes through that
-        // box rather than `arg` itself.
-        let okey = ctx.materialize_operand_at(opref);
+        // dict membership is Box identity; an unbound position view falls
+        // back to its canonical box.
+        let okey = if arg.is_resop() || arg.is_inputarg() {
+            arg.clone()
+        } else {
+            ctx.materialize_operand_at(opref)
+        };
         if let Some(existing) = self.produced_short_boxes.get(&okey) {
             // shortpreamble.py:285 `return ...preamble_op` — the
             // dependency's replay op object itself, so preamble-op
