@@ -2573,7 +2573,7 @@ pub(crate) fn eval_frame_plain_with_resume(
     // enter() already executed).  Python finally semantics: a finally
     // block that raises replaces the prior exception (return_trace
     // overrides eval-body, leave overrides everything).
-    let outer_result = (|| -> PyResult {
+    let mut outer_result = (|| -> PyResult {
         // `execute_frame` calls `call_trace` before `resume_execute_frame`.
         // The sent `OperationError` is a GC object there (`error.py`). Pin
         // the native carrier across the hook and write the slot back before
@@ -2590,7 +2590,7 @@ pub(crate) fn eval_frame_plain_with_resume(
             err.reload_exc_object(roots, Some(*slot));
         }
         drop(operr_pin);
-        let inner_result = (|| -> PyResult {
+        let mut inner_result = (|| -> PyResult {
             let frame = unsafe { &mut *frame_anchor.live() };
             if let Some(value) = prepare_frame_resume_for_dispatch(frame, &mut resume)? {
                 w_exitvalue = value;
@@ -2601,7 +2601,23 @@ pub(crate) fn eval_frame_plain_with_resume(
             w_exitvalue = result;
             Ok(result)
         })();
-        let return_trace_result = execution_context.return_trace(frame_anchor.live(), w_exitvalue);
+        // `return_trace` runs application Python while the exit value and
+        // the pending exception are still owed to `leave`.
+        let return_trace_result = {
+            let roots = pyre_object::gc_roots::push_roots();
+            let exit_slot = roots.base();
+            let _ = roots.pin_root(w_exitvalue);
+            let err_slot = match &inner_result {
+                Err(err) => err.pin_exc_object(&roots),
+                Ok(_) => None,
+            };
+            let result = execution_context.return_trace(frame_anchor.live(), w_exitvalue);
+            w_exitvalue = roots.get(exit_slot);
+            if let Err(err) = &mut inner_result {
+                err.reload_exc_object(&roots, err_slot);
+            }
+            result
+        };
         // Python finally: a finally-block exception replaces any
         // pending exception from the try-body. Only the all-OK path
         // advances to `got_exception = false`.
@@ -2620,7 +2636,18 @@ pub(crate) fn eval_frame_plain_with_resume(
         }
         combined
     })();
-    let leave_result = execution_context.leave(frame_anchor.live(), w_exitvalue, got_exception);
+    let leave_result = {
+        let roots = pyre_object::gc_roots::push_roots();
+        let err_slot = match &outer_result {
+            Err(err) => err.pin_exc_object(&roots),
+            Ok(_) => None,
+        };
+        let result = execution_context.leave(frame_anchor.live(), w_exitvalue, got_exception);
+        if let Err(err) = &mut outer_result {
+            err.reload_exc_object(&roots, err_slot);
+        }
+        result
+    };
     match leave_result {
         Err(leave_err) => Err(leave_err),
         Ok(live) => outer_result.map(|_| live),

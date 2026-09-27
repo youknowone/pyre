@@ -1132,6 +1132,13 @@ fn loghelper(mut w_x: PyObjectRef, base: f64) -> Result<f64, pyre_interpreter::P
                     "expected a positive input",
                 ));
             }
+            // A long's payload moves with `w_x`, which `int_le` may have
+            // collected under.
+            let num: &BigInt = if pyre_object::is_long(w_x) {
+                pyre_object::w_long_get_value(w_x)
+            } else {
+                num
+            };
             // `PyLong_AsDouble` first, so a value a `float` can hold takes the
             // logarithm of that conversion and answers as the float beside it
             // does.  Only a value that overflows falls back to the scaled
