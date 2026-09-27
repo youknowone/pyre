@@ -1837,9 +1837,7 @@ fn wide_inline_borrow_offset(
     // an `i64` on a 32-bit target is still `FLAG_SIGNED`.
     let word = crate::layout::target_word_size();
     let wider = field.inline_vec
-        || row.is_some_and(|row| {
-            row.flag == majit_ir::descr::ArrayFlag::Struct && row.size > word
-        });
+        || row.is_some_and(|row| row.flag == majit_ir::descr::ArrayFlag::Struct && row.size > word);
     if !wider {
         return None;
     }
