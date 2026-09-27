@@ -8641,12 +8641,14 @@ impl<'a> Transformer<'a> {
                 None,
             )
         };
-        // jtransform.py:1677: assert not forces_virtual_or_virtualizable
+        // jtransform.py:1677: assert not forces_virtual_or_virtualizable.
+        // The Python assert's traceback shows `op`; name the callee here.
         assert!(
             !descriptor
                 .extra_info
                 .check_forces_virtual_or_virtualizable(),
-            "conditional_call target must not force virtualizable"
+            "conditional_call target must not force virtualizable: \
+             graph={graph_name} callee={func_target} op={op:?}"
         );
         // jtransform.py: rewrite_call with force_ir=True
         let (args_i, args_r, args_f) = self.rewrite_call_three_lists(
