@@ -5575,18 +5575,30 @@ pub fn has_real_kwargs(kwargs: Option<PyObjectRef>) -> bool {
 /// marker.  The clinic-style "takes at most N arguments (M given)" builtins
 /// (`sum`, `round`, `pow`) count positionals plus this against their limit.
 ///
-/// Read through the surrogate-preserving iterator, the same one
-/// [`call_forwarding_args`] rebuilds the keywords with: `w_dict_str_entries`
-/// drops a `**{'\udc80': v}` key outright, which would make this report a
-/// keyword-free call and let the keyword be silently discarded.
+/// The marker occupies exactly one entry, so the answer is the dict's length
+/// less that entry: [`split_builtin_kwargs`] hands back a dict only when its
+/// `__pyre_kw__` slot holds the sentinel, and `call_with_kwargs` stores that
+/// key last, so a caller keyword spelled `__pyre_kw__` overwrites the marker
+/// instead of adding a second entry.  `w_dict_len` reads the count off the
+/// strategy; enumerating the entries to filter one name out would build a
+/// `Vec<(Wtf8Buf, PyObjectRef)>` per arity check.
+///
+/// The length also needs no key decode, which the entry list does: a key
+/// carrying a lone surrogate has no `&str` view, so counting through
+/// `w_dict_str_entries` would drop `**{'\udc80': v}` outright and report a
+/// keyword-free call.  A non-str key cannot reach here at all —
+/// `call_with_kwargs` raises `TypeError("keywords must be strings")` first.
+///
+/// Not building that `Vec` is also what lets a builtin body be descended.
+/// `w_dict_str_entries_wtf8` is un-lowered, and every hand-written
+/// `__majit_wrap_*` reaches it through an arity helper into
+/// `type_methods::reject_kwargs_of`, so while it was called here the descent
+/// declined for `set.add`, `list.append`, `dict.keys` and their siblings.
 pub fn real_kwarg_count(kwargs: Option<PyObjectRef>) -> usize {
     let Some(dict) = kwargs else {
         return 0;
     };
-    unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
-        .iter()
-        .filter(|(key, _)| key.as_str() != Ok("__pyre_kw__"))
-        .count()
+    unsafe { pyre_object::w_dict_len(dict) }.saturating_sub(1)
 }
 
 /// The real keyword `(name, value)` pairs in the kwargs dict from
