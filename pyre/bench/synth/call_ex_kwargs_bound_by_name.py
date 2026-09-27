@@ -45,8 +45,17 @@ def main(n):
         s += f2(*(i,), **{'b': 3})
     print(s)
     for bad in ({'a': 1}, {'a': 1, 'b': 2, 'c': 3}, {'a': 1, 'x': 2},
-                D(a=1, b=2), {1: 2}):
+                D(a=1, b=2)):
         print(attempt(n, f2, bad))
+    # The non-string-key message differs between implementations; only the
+    # exception type is pinned.
+    r = None
+    for i in range(n):
+        try:
+            r = f2(**{1: 2})
+        except TypeError as ex:
+            r = type(ex).__name__
+    print(r)
     r = None
     for i in range(n):
         try:
