@@ -73,33 +73,31 @@ pub unsafe fn is_sre_pattern(obj: PyObjectRef) -> bool {
 
 /// Match result object (interp_sre.py:675).
 ///
-/// Upstream keeps the live match context (`self.ctx`) and flattens the
-/// group marks lazily (`flatten_marks`, interp_sre.py).  Pyre's
-/// sre-engine surfaces the marks eagerly at match time, so the span
-/// table (group 0 = whole match first, `(-1, -1)` = unmatched group)
-/// is materialised once into a leaked buffer that plays both `ctx`
-/// and `flatten_cache`.
+/// `W_SRE_Match` keeps `self.ctx` and flattens marks lazily
+/// (`flatten_marks`). The engine surfaces marks eagerly, so the span
+/// table (group 0 = whole match, `(-1, -1)` = unmatched) is flattened at
+/// construction into `flatten_cache`, the `GcArray(Signed)` of unboxed
+/// RPython-level integers `do_flatten_marks` returns.
 #[pyre_class("re.Match", static_name = "SRE_MATCH")]
 pub struct W_SRE_Match {
-    /// interp_sre.py:680 `self.srepat`.
+    /// `self.srepat`.
     pub w_srepat: PyObjectRef,
-    /// interp_sre.py:682 `self.w_string`.
+    /// `self.w_string`.
     pub w_string: PyObjectRef,
     /// The buffer captured at match time for slicing — `self.ctx._buffer`
-    /// (interp_sre.py:61-64).  Upstream's match holds `self.ctx`, which keeps
-    /// the validated `BufMatchContext._buffer` so group slices never re-read
-    /// the original object.  Pyre keeps that buffer object (`memoryview`'s
-    /// backing `bytes`) here; `PY_NULL` when `w_string` is itself the subject
-    /// (a `str`/`bytes`/`bytearray`), where slicing reads `w_string` directly.
+    /// (`BufMatchContext`). The match holds that buffer so group slices
+    /// never re-read the original object. `PY_NULL` when `w_string` is
+    /// itself the subject (a `str`/`bytes`/`bytearray`).
     pub w_buffer: PyObjectRef,
-    /// `ctx.original_pos` (fget_pos, interp_sre.py).
+    /// `ctx.original_pos` (`fget_pos`).
     pub pos: i64,
-    /// `ctx.end` (fget_endpos, interp_sre.py).
+    /// `ctx.end` (`fget_endpos`).
     pub endpos: i64,
-    /// `_last_index()` (interp_sre.py); `-1` plays None.
+    /// `_last_index()`; `-1` plays None.
     pub lastindex: i64,
-    /// Flattened spans (see type doc).
-    pub spans: *const (i64, i64),
+    /// `self.flatten_cache`: a `GcArray(Signed)` (`TypedItemsBlock`) of
+    /// flat `(start, end)` pairs, two words per group, group 0 first.
+    pub flatten_cache: PyObjectRef,
     pub spans_len: usize,
 }
 
@@ -113,25 +111,44 @@ pub fn w_sre_match_new(
     pos: i64,
     endpos: i64,
     lastindex: i64,
-    spans: &'static [(i64, i64)],
+    spans: &[(i64, i64)],
 ) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
-    let w_srepat = crate::gc_roots::pin_root(w_srepat);
-    let w_string = crate::gc_roots::pin_root(w_string);
-    let w_buffer = crate::gc_roots::pin_root(w_buffer);
+    let base = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_srepat);
+    let _ = crate::gc_roots::pin_root(w_string);
+    let _ = crate::gc_roots::pin_root(w_buffer);
+    // `do_flatten_marks`: `[0] * (num_groups * 2)` of unboxed integers, one
+    // word per span edge. The block holds no GC pointer, so nothing is rooted
+    // across filling it.
+    let flatten_cache = unsafe {
+        crate::object_array::alloc_typed_items_block_nursery(
+            spans.len() * 2,
+            crate::object_array::gc_int_array_gc_type_id(),
+        )
+    };
+    unsafe {
+        let items = crate::object_array::typed_items_block_items_base(flatten_cache) as *mut i64;
+        for (group, &(start, end)) in spans.iter().enumerate() {
+            items.add(group * 2).write(start);
+            items.add(group * 2 + 1).write(end);
+        }
+    }
+    let flatten_cache_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(flatten_cache as PyObjectRef);
     W_SRE_Match::allocate_stable(W_SRE_Match {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
         },
-        w_srepat,
-        w_string,
-        w_buffer,
+        w_srepat: crate::gc_roots::shadow_stack_get(base),
+        w_string: crate::gc_roots::shadow_stack_get(base + 1),
+        w_buffer: crate::gc_roots::shadow_stack_get(base + 2),
         pos,
         endpos,
         lastindex,
-        spans: spans.as_ptr(),
+        flatten_cache: crate::gc_roots::shadow_stack_get(flatten_cache_slot),
         spans_len: spans.len(),
     })
 }
@@ -155,7 +172,10 @@ pub unsafe fn w_sre_match_get_span(obj: PyObjectRef, groupnum: usize) -> Option<
         if groupnum >= (*m).spans_len {
             return None;
         }
-        Some(*(*m).spans.add(groupnum))
+        let items = crate::object_array::typed_items_block_items_base(
+            (*m).flatten_cache as *mut crate::object_array::TypedItemsBlock,
+        ) as *const i64;
+        Some((*items.add(groupnum * 2), *items.add(groupnum * 2 + 1)))
     }
 }
 
@@ -167,10 +187,10 @@ pub unsafe fn w_sre_match_get_span(obj: PyObjectRef, groupnum: usize) -> Option<
 /// sre-engine context borrows the subject string and code, so it cannot
 /// be parked in a GC object.  Instead the resumable cursor is reduced to
 /// the character position `pos` and the `must_advance` flag — exactly
-/// the two fields `SearchIter` threads across calls (engine.rs)
+/// the two fields `SearchIter` threads across calls
 /// — and a fresh `Request`/`State` is rebuilt from the pattern + subject
-/// on each step (both are leaked `&'static`, so this is stable across
-/// callbacks).
+/// on each step. The subject is re-read from the GC string; the pattern
+/// code is immutable for the pattern's lifetime.
 /// `pos == -1` plays upstream's `self.ctx is None` exhausted state.
 #[pyre_class("_sre.SRE_Scanner", static_name = "SRE_SCANNER")]
 pub struct W_SRE_Scanner {

@@ -17026,10 +17026,17 @@ impl<M: Clone> MetaInterp<M> {
             let trace_id = descr.trace_id();
             let fail_index = descr.fail_index();
             // compile.py `force_from_resumedata(..., deadframe)`: TAGBOX
-            // reads `cpu.get_*_value` off the live jitframe. A copied
-            // `Vec` of those words is not a GC root; the jitframe slots
-            // are. Prefer `FailArgSource::from_jitframe` so a collection
-            // during materialization forwards in place.
+            // reads `cpu.get_*_value` off the live jitframe. `llmodel.py
+            // force` returns that same frame still executing: COND_CALL
+            // pushed `jf_gcmap` and `pop_gcmap` runs only after the
+            // residual returns (`assembler.py` `pop_gcmap`). Interior-trace it
+            // for this window the way `handle_fail` pins the deadframe
+            // (`JitFramePin`); `OwnerRootGuard` alone does not walk
+            // `jf_frame` slots of an old jitframe. A heap `Vec` copy of
+            // those words allocates mid-copy and is not a substitute.
+            let _jf_pin = deadframe.jitframe_ptr().map(|ptr| {
+                majit_gc::shadow_stack::JitFramePin::enter(majit_ir::GcRef(ptr as usize))
+            });
             let n_fail_args = descr.fail_arg_types().len();
             let copied_fail_args;
             let fail_values = if let Some(jf) = deadframe.as_jitframe() {

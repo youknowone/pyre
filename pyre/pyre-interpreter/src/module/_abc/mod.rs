@@ -31,18 +31,16 @@ static ROOTED_SLOTS: parking_lot::Mutex<Vec<Box<usize>>> = parking_lot::Mutex::n
 /// module attribute, or dropping the module, lets the sweep reclaim the type
 /// while the stash still names it — the collector traces neither the stash nor
 /// anything that would keep the object on its account.  Registering the address
-/// in a stable slot is what buys survival, the `_structseq.rs`
-/// `root_structseq_type` idiom.
+/// in a stable slot is what buys survival, the same `try_gc_add_root`
+/// registration `_structseq.rs` uses for each registry `cls_slot`.
 ///
 /// Used only where the object must genuinely outlive its last Python
 /// reference: the class itself, and the weak references in
 /// [`SIMPLE_WEAK_SET_CONTAINS`], which retain nothing of what they name.  The
 /// bodies those references identify are deliberately not rooted.
 ///
-/// The stashes stay plain addresses rather than reads of these slots.  Types
-/// and weak references are born outside the nursery, so no walker rewrites a
-/// slot naming one and a read back through the root would return the same bits;
-/// only list and dict headers move.
+/// The stashes stay plain addresses rather than reads of these slots: a heap
+/// type is born old-gen and does not move.
 fn root_forever(obj: PyObjectRef) {
     let mut slot = Box::new(obj as usize);
     let root_slot = (&raw mut *slot) as *mut *mut u8;
@@ -54,12 +52,13 @@ fn root_forever(obj: PyObjectRef) {
 /// the way `weakref_type` stashes its own.  The registry and both caches are
 /// instances of it, so the collection this module installs is the one
 /// `_get_dump` describes and a collected member drops itself.
-static SIMPLE_WEAK_SET_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static SIMPLE_WEAK_SET_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 fn simple_weak_set_type() -> PyObjectRef {
-    *SIMPLE_WEAK_SET_TYPE
+    SIMPLE_WEAK_SET_TYPE
         .get()
-        .expect("_abc.SimpleWeakSet must be installed at module init") as PyObjectRef
+        .expect("_abc.SimpleWeakSet must be installed at module init")
 }
 
 /// The `__contains__` `app_abc.py` defines, stashed beside its type as the four
@@ -1042,8 +1041,7 @@ pyre_interpreter::py_module! {
         )?;
         let simple_weak_set = pyre_interpreter::module_ns_get(ns, "SimpleWeakSet")
             .expect("_abc.SimpleWeakSet must be installed by appleveldefs");
-        root_forever(simple_weak_set);
-        let _ = SIMPLE_WEAK_SET_TYPE.set(simple_weak_set as usize);
+        SIMPLE_WEAK_SET_TYPE.set(simple_weak_set);
         let installed = simple_weak_set_contains_identity();
         if installed != (0, 0, 0, 0) {
             // Each word is an address the comparison keeps naming, so a match

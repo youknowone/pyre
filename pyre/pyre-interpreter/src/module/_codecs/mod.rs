@@ -847,14 +847,30 @@ pub(crate) fn lookup_codec_name(encoding: &str) -> Result<PyObjectRef, crate::Py
 
         ensure_encodings_imported(state)?;
         let w_v = w_str_new_managed(&normalized_encoding);
-        let n = unsafe { pyre_object::w_list_len(state.codec_search_path) };
+        // `codec_search_path` getitem can box, and each search function is a
+        // collecting Python call (`interp_codecs.py lookup`). Keep the
+        // encoding name and the search callable on the shadow stack.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[w_v, state.codec_search_path]);
+        let v_slot = base;
+        let path_slot = base + 1;
+        let n =
+            unsafe { pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(path_slot)) };
         for i in 0..n {
-            let Some(w_search) =
-                (unsafe { pyre_object::w_list_getitem(state.codec_search_path, i as i64) })
-            else {
+            let Some(w_search) = (unsafe {
+                pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(path_slot),
+                    i as i64,
+                )
+            }) else {
                 continue;
             };
-            let w_result = crate::call::call_function_impl_result(w_search, &[w_v])?;
+            let search_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_search);
+            let w_result = crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(search_slot),
+                &[pyre_object::gc_roots::shadow_stack_get(v_slot)],
+            )?;
             if unsafe { pyre_object::is_none(w_result) } {
                 continue;
             }
@@ -1019,10 +1035,12 @@ pub(crate) fn encode_text_codec(
     encoding: &str,
     errors: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // Rooted for the same window as `decode_text_codec`: the lookup runs
-    // Python while `w_obj` is still whatever the caller handed over.
+    // Rooted for the same window as `decode_text_codec` / `codec_encode_or_decode`:
+    // the lookup runs Python, so `w_obj` has to come back off the slot, not the
+    // pre-lookup local.
     let _roots = pyre_object::gc_roots::push_roots();
-    let w_obj = pyre_object::gc_roots::pin_root(w_obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     // The codec-info tuple relocates, and the handler check below reaches
     // the codec state's lazy construction, which allocates.  Pin it and read
     // it back rather than indexing the word the lookup answered.
@@ -1031,6 +1049,7 @@ pub(crate) fn encode_text_codec(
     if crate::importing::dev_mode_flag() {
         validate_error_handler(errors)?;
     }
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let w_codec_info = pyre_object::gc_roots::shadow_stack_get(info_slot);
     let w_encfunc = unsafe { pyre_object::w_tuple_getitem(w_codec_info, 0).unwrap_or_else(w_none) };
     let w_retval = call_codec(w_encfunc, w_obj, "encoding", encoding, Some(errors))?;
@@ -1052,14 +1071,14 @@ pub(crate) fn decode_text_codec(
     errors: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
     // The lookup runs Python: an uncached name imports its `encodings` module
-    // and calls every registered search function, and only `call_codec` below
-    // publishes `w_obj` as a root.  Callers reach here with a value that has
-    // no heap edge — `decode_bytes_to_wtf8` copies the source bytes into a
-    // fresh one — and old-gen buys immobility, not survival, so the copy is
-    // swept mid-lookup and the decoder is handed a reused box.  Bytes do not
-    // move, so the pin is for liveness alone and the value is used as it is.
+    // and calls every registered search function.  Callers reach here with a
+    // value that has no heap edge — `decode_bytes_to_wtf8` copies the source
+    // bytes into a fresh one — so the copy is swept mid-lookup unless it sits
+    // on a slot.  Reload that slot after the lookup; pinning the pre-lookup
+    // local would publish a from-space address.
     let _roots = pyre_object::gc_roots::push_roots();
-    let w_obj = pyre_object::gc_roots::pin_root(w_obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     // The codec-info tuple relocates, and the handler check below reaches
     // the codec state's lazy construction, which allocates.  Pin it and read
     // it back rather than indexing the word the lookup answered.
@@ -1068,6 +1087,7 @@ pub(crate) fn decode_text_codec(
     if crate::importing::dev_mode_flag() {
         validate_error_handler(errors)?;
     }
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let w_codec_info = pyre_object::gc_roots::shadow_stack_get(info_slot);
     let w_decfunc = unsafe { pyre_object::w_tuple_getitem(w_codec_info, 1).unwrap_or_else(w_none) };
     let w_retval = call_codec(w_decfunc, w_obj, "decoding", encoding, Some(errors))?;

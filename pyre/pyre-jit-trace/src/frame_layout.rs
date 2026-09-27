@@ -32,9 +32,8 @@ pub const PYFRAME_DEBUGDATA_OFFSET: usize = std::mem::offset_of!(PyFrame, debugd
 /// Byte offset of `lastblock` in `PyFrame`.
 pub const PYFRAME_LASTBLOCK_OFFSET: usize = std::mem::offset_of!(PyFrame, lastblock);
 
-/// Byte offset of `f_generator_nowref` in `PyFrame`.
-pub const PYFRAME_F_GENERATOR_NOWREF_OFFSET: usize =
-    std::mem::offset_of!(PyFrame, f_generator_nowref);
+/// Byte offset of `f_generator_wref` in `PyFrame`.
+pub const PYFRAME_F_GENERATOR_WREF_OFFSET: usize = std::mem::offset_of!(PyFrame, f_generator_wref);
 
 /// Byte offset of `w_yielding_from` in `PyFrame`.
 pub const PYFRAME_W_YIELDING_FROM_OFFSET: usize = std::mem::offset_of!(PyFrame, w_yielding_from);
@@ -70,8 +69,8 @@ const _: () = {
     assert!(PYFRAME_DEBUGDATA_OFFSET == pyre_interpreter::pyframe::PYFRAME_DEBUGDATA_OFFSET);
     assert!(PYFRAME_LASTBLOCK_OFFSET == pyre_interpreter::pyframe::PYFRAME_LASTBLOCK_OFFSET);
     assert!(
-        PYFRAME_F_GENERATOR_NOWREF_OFFSET
-            == pyre_interpreter::pyframe::PYFRAME_F_GENERATOR_NOWREF_OFFSET
+        PYFRAME_F_GENERATOR_WREF_OFFSET
+            == pyre_interpreter::pyframe::PYFRAME_F_GENERATOR_WREF_OFFSET
     );
     assert!(
         PYFRAME_W_YIELDING_FROM_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_YIELDING_FROM_OFFSET

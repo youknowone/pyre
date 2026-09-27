@@ -1643,7 +1643,7 @@ pub fn emit_box_float_inline(
 ///    fields (`pycode`,
 ///    `locals_cells_stack_w`, `valuestackdepth`, `last_instr=-1`) mirror
 ///    `new_for_call_with_closure`; the nullable GC fields
-///    (`f_generator_nowref`, `w_yielding_from`, `f_backref`) are written
+///    (`f_generator_wref`, `w_yielding_from`, `f_backref`) are written
 ///    explicitly to match the same constructor shape instead of relying on
 ///    an implicit backend zero-fill side effect.
 /// Build a VIRTUAL callee `PyFrame` for a multi-frame inline (#68) from
@@ -1790,8 +1790,8 @@ pub fn emit_new_pyframe_inline_with_params(
     let failed_attr_descr = pyframe_failed_attr_cleanup_descr();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, zero], failed_attr_descr);
 
-    // pyframe.py `f_generator_nowref`/`w_yielding_from`/`f_backref`
-    // are class-level defaults (None/None/vref_None), never assigned in the
+    // pyframe.py `f_generator_wref`/`w_yielding_from`/`f_backref`
+    // are class-level defaults (dead_ref/None/vref_None), never assigned in the
     // frame constructor. The trace of frame construction therefore emits no
     // setfield for them; clear_gc_fields initializes these GC-reference slots,
     // so the fields read back as PY_NULL. No explicit store here.
@@ -1934,8 +1934,8 @@ pub fn emit_new_pyframe_inline_self_recursive(
     let failed_attr_descr = pyframe_failed_attr_cleanup_descr();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, zero], failed_attr_descr);
 
-    // pyframe.py `f_generator_nowref`/`w_yielding_from`/`f_backref`
-    // are class-level defaults (None/None/vref_None), never assigned in the
+    // pyframe.py `f_generator_wref`/`w_yielding_from`/`f_backref`
+    // are class-level defaults (dead_ref/None/vref_None), never assigned in the
     // frame constructor. The trace of frame construction therefore emits no
     // setfield for them; clear_gc_fields initializes these GC-reference slots,
     // so the fields read back as PY_NULL. No explicit store here.

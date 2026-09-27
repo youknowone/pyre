@@ -6,8 +6,8 @@
 //! typed fields, `pyre_object::interp_sre`).
 
 use crate::{
-    module_ns_store, make_builtin_function, make_builtin_function_with_arity,
-    make_module_builtin_function, make_module_builtin_function_with_arity,
+    make_builtin_function, make_builtin_function_with_arity, make_module_builtin_function,
+    make_module_builtin_function_with_arity, module_ns_store,
 };
 use pyre_object::interp_sre::{
     W_SRE_Match, W_SRE_Pattern, W_SRE_Scanner, is_sre_match, is_sre_pattern, is_sre_scanner,
@@ -160,372 +160,497 @@ fn sre_match_receiver(args: &[PyObjectRef]) -> Result<*const W_SRE_Match, crate:
 /// properties (interp_sre.py).
 pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
     // interp_sre.py `__new__ = interp2app(SRE_Pattern__new__)`.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__new__",
-        pyre_object::function::w_staticmethod_new(make_builtin_function(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__new__",
-            sre_pattern_new,
-        )),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "match",
-        make_builtin_function("match", sre_pattern_match),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "fullmatch",
-        make_builtin_function("fullmatch", sre_pattern_fullmatch),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "search",
-        make_builtin_function("search", sre_pattern_search),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "findall",
-        make_builtin_function("findall", sre_pattern_findall),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "finditer",
-        make_builtin_function("finditer", sre_pattern_finditer),
-    ) };
+            pyre_object::function::w_staticmethod_new(make_builtin_function(
+                "__new__",
+                sre_pattern_new,
+            )),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "match",
+            make_builtin_function("match", sre_pattern_match),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "fullmatch",
+            make_builtin_function("fullmatch", sre_pattern_fullmatch),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "search",
+            make_builtin_function("search", sre_pattern_search),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "findall",
+            make_builtin_function("findall", sre_pattern_findall),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "finditer",
+            make_builtin_function("finditer", sre_pattern_finditer),
+        )
+    };
     // interp_sre.py `scanner = interp2app(W_SRE_Pattern.finditer_w)`
     // — CPython/PyPy expose the same iterator constructor under both names.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "scanner",
-        make_builtin_function("scanner", sre_pattern_finditer),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "sub", make_builtin_function("sub", sre_pattern_sub)) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "subn", make_builtin_function("subn", sre_pattern_subn)) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "split",
-        make_builtin_function("split", sre_pattern_split),
-    ) };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "scanner",
+            make_builtin_function("scanner", sre_pattern_finditer),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "sub",
+            make_builtin_function("sub", sre_pattern_sub),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "subn",
+            make_builtin_function("subn", sre_pattern_subn),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "split",
+            make_builtin_function("split", sre_pattern_split),
+        )
+    };
     // interp_sre.py:651-653 `__repr__`/`__copy__`/`__deepcopy__`
     // (copy_identity_w returns self — compiled patterns are immutable).
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__repr__",
-        make_builtin_function("__repr__", sre_pattern_repr),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__copy__",
-        make_builtin_function("__copy__", sre_pattern_copy),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__deepcopy__",
-        make_builtin_function("__deepcopy__", sre_pattern_copy),
-    ) };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function("__repr__", sre_pattern_repr),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__copy__",
+            make_builtin_function("__copy__", sre_pattern_copy),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__deepcopy__",
+            make_builtin_function("__deepcopy__", sre_pattern_copy),
+        )
+    };
     // interp_sre.py:655-657 value equality / hash.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__eq__",
-        make_builtin_function("__eq__", sre_pattern_eq),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__hash__",
-        make_builtin_function("__hash__", sre_pattern_hash),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__weakref__", crate::typedef::weakref_descr()) };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__eq__",
+            make_builtin_function("__eq__", sre_pattern_eq),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function("__hash__", sre_pattern_hash),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__weakref__",
+            crate::typedef::weakref_descr(),
+        )
+    };
     // interp_sre.py:667-668 `generic_alias_class_getitem` as classmethod.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__class_getitem__",
-        pyre_object::function::w_classmethod_new(make_builtin_function(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__class_getitem__",
-            crate::_pypy_generic_alias::generic_alias_class_getitem,
-        )),
-    ) };
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__class_getitem__",
+                crate::_pypy_generic_alias::generic_alias_class_getitem,
+            )),
+        )
+    };
     // interp_sre.py:662-663 `flags = interp_attrproperty('flags', ...,
     // wrapfn="newint")`.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "flags",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity(
-                "flags",
-                |args| Ok(w_int_new(unsafe { (*sre_pattern_receiver(args)?).flags })),
-                2,
-            ),
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "flags",
-        ),
-    ) };
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "flags",
+                    |args| Ok(w_int_new(unsafe { (*sre_pattern_receiver(args)?).flags })),
+                    2,
+                ),
+                "flags",
+            ),
+        )
+    };
     // interp_sre.py `groupindex = GetSetProperty(fget_groupindex)`
     // (:202-206 — a dict groupindex is exposed through a dictproxy).
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "groupindex",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity(
-                "groupindex",
-                |args| {
-                    let w_groupindex = unsafe { (*sre_pattern_receiver(args)?).w_groupindex };
-                    if unsafe { is_dict(w_groupindex) } {
-                        return Ok(pyre_object::dictproxyobject::w_dict_proxy_new(w_groupindex));
-                    }
-                    Ok(w_groupindex)
-                },
-                2,
-            ),
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "groupindex",
-        ),
-    ) };
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "groupindex",
+                    |args| {
+                        let w_groupindex = unsafe { (*sre_pattern_receiver(args)?).w_groupindex };
+                        if unsafe { is_dict(w_groupindex) } {
+                            return Ok(pyre_object::dictproxyobject::w_dict_proxy_new(
+                                w_groupindex,
+                            ));
+                        }
+                        Ok(w_groupindex)
+                    },
+                    2,
+                ),
+                "groupindex",
+            ),
+        )
+    };
     // interp_sre.py:665-666 `groups = interp_attrproperty('num_groups',
     // ..., wrapfn="newint")`.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "groups",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity(
-                "groups",
-                |args| Ok(w_int_new(unsafe { (*sre_pattern_receiver(args)?).num_groups })),
-                2,
-            ),
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "groups",
-        ),
-    ) };
-    // interp_sre.py:667 `pattern = interp_attrproperty_w('w_pattern', ...)`.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "pattern",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity(
-                "pattern",
-                |args| Ok(unsafe { (*sre_pattern_receiver(args)?).w_pattern }),
-                2,
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "groups",
+                    |args| {
+                        Ok(w_int_new(unsafe {
+                            (*sre_pattern_receiver(args)?).num_groups
+                        }))
+                    },
+                    2,
+                ),
+                "groups",
             ),
+        )
+    };
+    // interp_sre.py:667 `pattern = interp_attrproperty_w('w_pattern', ...)`.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "pattern",
-        ),
-    ) };
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "pattern",
+                    |args| Ok(unsafe { (*sre_pattern_receiver(args)?).w_pattern }),
+                    2,
+                ),
+                "pattern",
+            ),
+        )
+    };
 }
 
 /// W_SRE_Match.typedef (interp_sre.py): methods + the `re` /
 /// `string` / `pos` / `endpos` / `lastgroup` / `lastindex` attribute
 /// properties.
 pub(crate) fn init_sre_match_type(ns: PyObjectRef) {
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "group", make_builtin_function("group", sre_match_group)) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "groups",
-        make_builtin_function("groups", sre_match_groups),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "start", make_builtin_function("start", sre_match_start)) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "end", make_builtin_function("end", sre_match_end)) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "span", make_builtin_function("span", sre_match_span)) };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "group",
+            make_builtin_function("group", sre_match_group),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "groups",
+            make_builtin_function("groups", sre_match_groups),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "start",
+            make_builtin_function("start", sre_match_start),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "end",
+            make_builtin_function("end", sre_match_end),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "span",
+            make_builtin_function("span", sre_match_span),
+        )
+    };
     // interp_sre.py `groupdict = interp2app(W_SRE_Match.groupdict_w)`.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "groupdict",
-        make_builtin_function("groupdict", sre_match_groupdict),
-    ) };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "groupdict",
+            make_builtin_function("groupdict", sre_match_groupdict),
+        )
+    };
     // interp_sre.py `__getitem__ = interp2app(W_SRE_Match.descr_getitem)`.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__getitem__",
-        make_builtin_function("__getitem__", sre_match_getitem),
-    ) };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__getitem__",
+            make_builtin_function("__getitem__", sre_match_getitem),
+        )
+    };
     // interp_sre.py `expand = interp2app(W_SRE_Match.expand_w)`.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "expand",
-        make_builtin_function("expand", sre_match_expand),
-    ) };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "expand",
+            make_builtin_function("expand", sre_match_expand),
+        )
+    };
     // interp_sre.py fget_endpos `__copy__`/`__deepcopy__`/`__repr__`
     // (copy_identity_w returns self — match results are immutable).
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__repr__",
-        make_builtin_function("__repr__", sre_match_repr),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__copy__",
-        make_builtin_function("__copy__", sre_match_copy),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__deepcopy__",
-        make_builtin_function("__deepcopy__", sre_match_copy),
-    ) };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function("__repr__", sre_match_repr),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__copy__",
+            make_builtin_function("__copy__", sre_match_copy),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__deepcopy__",
+            make_builtin_function("__deepcopy__", sre_match_copy),
+        )
+    };
     // interp_sre.py:887 `re = interp_attrproperty_w('srepat', ...)`.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "re",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity(
-                "re",
-                |args| Ok(unsafe { (*sre_match_receiver(args)?).w_srepat }),
-                2,
-            ),
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "re",
-        ),
-    ) };
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "re",
+                    |args| Ok(unsafe { (*sre_match_receiver(args)?).w_srepat }),
+                    2,
+                ),
+                "re",
+            ),
+        )
+    };
     // interp_sre.py `string = GetSetProperty(fget_string)` (:866-867).
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "string",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity(
-                "string",
-                |args| Ok(unsafe { (*sre_match_receiver(args)?).w_string }),
-                2,
-            ),
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "string",
-        ),
-    ) };
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "string",
+                    |args| Ok(unsafe { (*sre_match_receiver(args)?).w_string }),
+                    2,
+                ),
+                "string",
+            ),
+        )
+    };
     // interp_sre.py `pos = GetSetProperty(fget_pos)` (:851-852).
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "pos",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity(
-                "pos",
-                |args| Ok(w_int_new(unsafe { (*sre_match_receiver(args)?).pos })),
-                2,
-            ),
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "pos",
-        ),
-    ) };
-    // interp_sre.py `endpos = GetSetProperty(fget_endpos)` (:854-855).
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "endpos",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity(
-                "endpos",
-                |args| Ok(w_int_new(unsafe { (*sre_match_receiver(args)?).endpos })),
-                2,
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "pos",
+                    |args| Ok(w_int_new(unsafe { (*sre_match_receiver(args)?).pos })),
+                    2,
+                ),
+                "pos",
             ),
+        )
+    };
+    // interp_sre.py `endpos = GetSetProperty(fget_endpos)` (:854-855).
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "endpos",
-        ),
-    ) };
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "endpos",
+                    |args| Ok(w_int_new(unsafe { (*sre_match_receiver(args)?).endpos })),
+                    2,
+                ),
+                "endpos",
+            ),
+        )
+    };
     // interp_sre.py `lastgroup = GetSetProperty(fget_lastgroup)`
     // (:831-839 — the group name from `w_indexgroup[lastindex]`).
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "lastgroup",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity(
-                "lastgroup",
-                |args| {
-                    let m = sre_match_receiver(args)?;
-                    let lastindex = unsafe { (*m).lastindex };
-                    if lastindex < 0 {
-                        return Ok(w_none());
-                    }
-                    let w_indexgroup = unsafe { (*(*m).w_srepat.cast::<W_SRE_Pattern>()).w_indexgroup };
-                    let found = unsafe {
-                        if is_list(w_indexgroup) {
-                            w_list_getitem(w_indexgroup, lastindex)
-                        } else if is_tuple(w_indexgroup) {
-                            w_tuple_getitem(w_indexgroup, lastindex)
-                        } else {
-                            None
-                        }
-                    };
-                    Ok(found.unwrap_or_else(w_none))
-                },
-                2,
-            ),
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "lastgroup",
-        ),
-    ) };
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "lastgroup",
+                    |args| {
+                        let m = sre_match_receiver(args)?;
+                        let lastindex = unsafe { (*m).lastindex };
+                        if lastindex < 0 {
+                            return Ok(w_none());
+                        }
+                        let w_indexgroup =
+                            unsafe { (*(*m).w_srepat.cast::<W_SRE_Pattern>()).w_indexgroup };
+                        let found = unsafe {
+                            if is_list(w_indexgroup) {
+                                w_list_getitem(w_indexgroup, lastindex)
+                            } else if is_tuple(w_indexgroup) {
+                                w_tuple_getitem(w_indexgroup, lastindex)
+                            } else {
+                                None
+                            }
+                        };
+                        Ok(found.unwrap_or_else(w_none))
+                    },
+                    2,
+                ),
+                "lastgroup",
+            ),
+        )
+    };
     // interp_sre.py `lastindex = GetSetProperty(fget_lastindex)`
     // (:841-845).
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "lastindex",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity(
-                "lastindex",
-                |args| {
-                    let lastindex = unsafe { (*sre_match_receiver(args)?).lastindex };
-                    if lastindex >= 0 {
-                        Ok(w_int_new(lastindex))
-                    } else {
-                        Ok(w_none())
-                    }
-                },
-                2,
-            ),
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "lastindex",
-        ),
-    ) };
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "lastindex",
+                    |args| {
+                        let lastindex = unsafe { (*sre_match_receiver(args)?).lastindex };
+                        if lastindex >= 0 {
+                            Ok(w_int_new(lastindex))
+                        } else {
+                            Ok(w_none())
+                        }
+                    },
+                    2,
+                ),
+                "lastindex",
+            ),
+        )
+    };
     // interp_sre.py `regs = GetSetProperty(W_SRE_Match.fget_regs)`.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "regs",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity("regs", sre_match_regs, 2),
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "regs",
-        ),
-    ) };
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity("regs", sre_match_regs, 2),
+                "regs",
+            ),
+        )
+    };
     // interp_sre.py:894-895 `generic_alias_class_getitem` as classmethod.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__class_getitem__",
-        pyre_object::function::w_classmethod_new(make_builtin_function(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__class_getitem__",
-            crate::_pypy_generic_alias::generic_alias_class_getitem,
-        )),
-    ) };
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__class_getitem__",
+                crate::_pypy_generic_alias::generic_alias_class_getitem,
+            )),
+        )
+    };
 }
 
 /// W_SRE_Scanner.typedef (interp_sre.py): the finditer/scanner
 /// iterator — `__iter__`/`__next__` plus the undocumented `match`/`search`
 /// methods and the `pattern` attribute property.
 pub(crate) fn init_sre_scanner_type(ns: PyObjectRef) {
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__iter__",
-        make_builtin_function("__iter__", sre_scanner_iter),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__next__",
-        make_builtin_function("__next__", sre_scanner_next_w),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "match",
-        make_builtin_function("match", sre_scanner_match),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "search",
-        make_builtin_function("search", sre_scanner_search),
-    ) };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__iter__",
+            make_builtin_function("__iter__", sre_scanner_iter),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__next__",
+            make_builtin_function("__next__", sre_scanner_next_w),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "match",
+            make_builtin_function("match", sre_scanner_match),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "search",
+            make_builtin_function("search", sre_scanner_search),
+        )
+    };
     // interp_sre.py:955 `pattern = interp_attrproperty_w('srepat', ...)`.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "pattern",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity(
-                "pattern",
-                |args| {
-                    let self_ = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                    if unsafe { is_sre_scanner(self_) } {
-                        Ok(unsafe { (*(self_ as *const W_SRE_Scanner)).w_srepat })
-                    } else {
-                        Err(crate::PyError::type_error(
-                            "descriptor is for '_sre.SRE_Scanner'",
-                        ))
-                    }
-                },
-                2,
-            ),
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "pattern",
-        ),
-    ) };
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "pattern",
+                    |args| {
+                        let self_ = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                        if unsafe { is_sre_scanner(self_) } {
+                            Ok(unsafe { (*(self_ as *const W_SRE_Scanner)).w_srepat })
+                        } else {
+                            Err(crate::PyError::type_error(
+                                "descriptor is for '_sre.SRE_Scanner'",
+                            ))
+                        }
+                    },
+                    2,
+                ),
+                "pattern",
+            ),
+        )
+    };
 }
 
 /// _sre.compile(pattern, flags, code, groups, groupindex, indexgroup)
@@ -747,16 +872,12 @@ unsafe fn str_subject(string: PyObjectRef) -> Subject {
 #[derive(Clone, Copy)]
 struct Utf8Drive {
     obj: PyObjectRef,
-    wtf8: &'static Wtf8,
 }
 
 /// # Safety
 /// `obj` must point to a valid `W_UnicodeObject`.
 unsafe fn utf8_drive(obj: PyObjectRef) -> Utf8Drive {
-    Utf8Drive {
-        obj,
-        wtf8: unsafe { w_str_get_wtf8(obj) },
-    }
+    Utf8Drive { obj }
 }
 
 impl StrDrive for Utf8Drive {
@@ -769,15 +890,18 @@ impl StrDrive for Utf8Drive {
     fn create_cursor(&self, n: usize) -> StringCursor {
         // `n == count()` is the end-of-subject cursor, which has no character
         // to index; every other caller keeps `n` inside the subject.
+        // Re-read the payload from the rooted object. Holding the `Wtf8`
+        // pointer on the drive would dangle if the string moved.
+        let wtf8 = unsafe { w_str_get_wtf8(self.obj) };
         let byte = if n >= unsafe { w_str_len(self.obj) } {
-            self.wtf8.as_bytes().len()
+            wtf8.as_bytes().len()
         } else {
             unsafe { w_str_index_to_byte(self.obj, n) }
         };
         // `StringCursor.ptr` is crate-private, so the cursor is minted at the
         // head of the suffix — an O(1) reslice — and carries the code point
         // index that the engine actually compares against.
-        let suffix: &Wtf8 = &self.wtf8[byte..];
+        let suffix: &Wtf8 = &wtf8[byte..];
         let mut cursor = suffix.create_cursor(0);
         cursor.position = n;
         cursor
@@ -1097,16 +1221,19 @@ fn collect_matches<S: StrDrive>(
     out
 }
 
-/// Drive the `SearchIter` over a subject of a concrete [`StrDrive`] type,
-/// invoking `on_match` for each non-overlapping match as it is found and
-/// stopping once `cap` matches have been processed (`cap == 0` is unlimited;
-/// a negative `cap` processes none).  This streams `search → callback →
-/// search` like `subx`/`split_w` (interp_sre.py/378-407) rather than
-/// materialising every match first, so a callable replacement's side effects
-/// interleave with the search and a `count`/`maxsplit` bound short-circuits
-/// the remaining scan.  Returns the number of matches processed.
+/// Drive one `SearchIter` for the whole scan, the way `subx` / `split_w` /
+/// `finditer_w` keep a single context from `make_ctx`. `on_match` runs for
+/// each non-overlapping match. `cap == 0` is unlimited; a negative `cap`
+/// processes none. Returns how many matches were processed.
+///
+/// `AbstractMatchContext.reset` changes only the start and the empty-match
+/// flag. The restarted `Request` keeps the scan's `end`: `pattern_subx` and
+/// `pattern_split` hold the subject's buffer export from `state_init` until
+/// `state_fini`, so the length cannot change under the scan. `drive` still
+/// re-reads the subject after the callback, because a collection can move
+/// the string object.
 fn stream_matches<S: StrDrive>(
-    drive: S,
+    drive: impl Fn() -> S,
     pos: usize,
     endpos: usize,
     code: &[u32],
@@ -1114,13 +1241,11 @@ fn stream_matches<S: StrDrive>(
     cap: i64,
     mut on_match: impl FnMut(&MatchSnapshot) -> Result<(), crate::PyError>,
 ) -> Result<i64, crate::PyError> {
-    let req = Request::new(drive, pos, endpos, code, false);
-    let mut iter = SearchIter {
-        req,
-        state: State::default(),
-    };
+    let mut req = Request::new(drive(), pos, endpos, code, false);
+    let mut state = State::default();
     let mut n: i64 = 0;
     while cap == 0 || n < cap {
+        let mut iter = SearchIter { req, state };
         if iter.next().is_none() {
             break;
         }
@@ -1131,8 +1256,45 @@ fn stream_matches<S: StrDrive>(
         };
         on_match(&snap)?;
         n += 1;
+        let SearchIter {
+            req: searched,
+            state: kept,
+        } = iter;
+        let string = drive();
+        let mut restarted = Request::new(
+            string,
+            searched.start,
+            searched.end,
+            searched.pattern_codes,
+            searched.match_all,
+        );
+        // `Request::new` clears `must_advance`. `reset` keeps the flag from
+        // the match that just finished.
+        restarted.must_advance = searched.must_advance;
+        req = restarted;
+        state = kept;
     }
     Ok(n)
+}
+
+/// The payload [`stream_matches`] drives for an ASCII `str` or a bytes-like
+/// subject. A re-read subject keeps its kind: its object is immutable, or is
+/// the buffer [`make_subject`] validated.
+fn subject_bytes(subj: Subject) -> &'static [u8] {
+    match subj {
+        Subject::AsciiStr(b) | Subject::Bytes(b) => b,
+        Subject::Str(_) => unreachable!("a non-ASCII str subject is driven by Utf8Drive"),
+    }
+}
+
+/// The `W_UnicodeObject` a non-ASCII `str` subject's [`Utf8Drive`] reads.
+fn subject_str(subj: Subject) -> PyObjectRef {
+    match subj {
+        Subject::Str(obj) => obj,
+        Subject::AsciiStr(_) | Subject::Bytes(_) => {
+            unreachable!("an ASCII str or bytes-like subject is driven as bytes")
+        }
+    }
 }
 
 /// `W_SRE_Match(self, ctx)` (e.g. interp_sre.py) from a collected
@@ -1145,8 +1307,15 @@ fn make_match_from_snapshot(
     pos: i64,
     endpos: i64,
 ) -> PyObjectRef {
-    let spans: &'static [(i64, i64)] = Box::leak(snap.spans.clone().into_boxed_slice());
-    w_sre_match_new(pat, string, w_buffer, pos, endpos, snap.lastindex, spans)
+    w_sre_match_new(
+        pat,
+        string,
+        w_buffer,
+        pos,
+        endpos,
+        snap.lastindex,
+        &snap.spans,
+    )
 }
 
 fn do_match(
@@ -1177,30 +1346,41 @@ fn do_match(
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error(format!("{name} requires self and string")))?;
-    let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
     // A buffer subject is gathered into fresh bytes nothing else holds
     // (`readbuf_obj`), and `subj` borrows that payload, so it has to survive the
     // bound conversions below — `pos` and `endpos` run `__index__`, which is
     // user code, and a sweep in there would free the gathered bytes underneath
     // both the slice and the match this returns.
+    //
+    // `args` is the gateway stack copy (`index_bounds_not_none`): the first
+    // bound's `__index__` collects, so the pattern, the subject, the second
+    // bound, and kwargs have to be shadow-stack slots rather than that copy.
     let _roots = pyre_object::gc_roots::push_roots();
-    let (subj, w_buffer) = make_subject(pat, string)?;
-    // `subx` pins the subject and reloads it at the stamp; a match writes both
-    // the subject and this gathered buffer into traced fields, so both come
-    // back off the shadow stack rather than out of the locals.
-    let base = pyre_object::gc_roots::pin_roots(&[string, w_buffer]);
-    let string = || pyre_object::gc_roots::shadow_stack_get(base);
-    let w_buffer = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let arg_base = pyre_object::gc_roots::pin_roots(args);
+    let args_len = args.len();
+    let kw_slot = kwargs.map(|k| {
+        let _ = pyre_object::gc_roots::pin_root(k);
+        pyre_object::gc_roots::shadow_stack_len() - 1
+    });
+    let string_slot = pyre_object::gc_roots::pin_roots(&[string]);
+    let pat = || pyre_object::gc_roots::shadow_stack_get(arg_base);
+    let string = || pyre_object::gc_roots::shadow_stack_get(string_slot);
+    let kwargs_now = || kw_slot.map(pyre_object::gc_roots::shadow_stack_get);
+    get_code(pat()).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
+    let (subj, w_buffer) = make_subject(pat(), string())?;
+    let buffer_slot = pyre_object::gc_roots::pin_roots(&[w_buffer]);
+    let w_buffer = || pyre_object::gc_roots::shadow_stack_get(buffer_slot);
 
     let (pos, endpos) = normalize_bounds(
         subj.len(),
-        arg_int_kw(args, 2, kwargs, "pos", 0)?,
-        arg_int_kw(args, 3, kwargs, "endpos", i64::MAX)?,
+        arg_int_kw_rooted(arg_base, args_len, 2, kwargs_now(), "pos", 0)?,
+        arg_int_kw_rooted(arg_base, args_len, 3, kwargs_now(), "endpos", i64::MAX)?,
     );
     // `pos`/`endpos` ran `__index__`. Reload the subject from the
     // rooted objects so a moving collection during that conversion
     // cannot leave `subj` pointing into a reclaimed gathered buffer.
     let subj = unsafe { subject_of(string(), w_buffer()) };
+    let code = get_code(pat()).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
 
     let (matched, state) = match subj {
         Subject::AsciiStr(b) | Subject::Bytes(b) => {
@@ -1214,7 +1394,7 @@ fn do_match(
 
     if matched {
         Ok(make_match(
-            pat,
+            pat(),
             string(),
             w_buffer(),
             &state,
@@ -1272,9 +1452,7 @@ fn make_match(
         if li >= 0 { li as i64 } else { -1 }
     };
     let spans = flatten_spans(pat, state);
-    let spans: &'static [(i64, i64)] = Box::leak(spans.into_boxed_slice());
-
-    w_sre_match_new(pat, string, w_buffer, pos, endpos, lastindex, spans)
+    w_sre_match_new(pat, string, w_buffer, pos, endpos, lastindex, &spans)
 }
 
 fn sre_pattern_match(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -1324,6 +1502,29 @@ fn arg_int_kw(
     arg_int(pos_args, idx, default)
 }
 
+/// `arg_int_kw` over a rooted gateway copy.  The first bound's `__index__`
+/// collects, so the second bound is read back from its shadow-stack slot
+/// (`index_bounds_not_none` / `slice_unpack`).
+fn arg_int_kw_rooted(
+    arg_base: usize,
+    args_len: usize,
+    idx: usize,
+    kwargs: Option<PyObjectRef>,
+    name: &str,
+    default: i64,
+) -> Result<i64, crate::PyError> {
+    if let Some(w) = crate::builtins::kwarg_get(kwargs, name) {
+        return sre_index_int(w);
+    }
+    if idx < args_len {
+        let w = pyre_object::gc_roots::shadow_stack_get(arg_base + idx);
+        if !w.is_null() {
+            return sre_index_int(w);
+        }
+    }
+    Ok(default)
+}
+
 fn required_arg_kw(
     pos_args: &[PyObjectRef],
     idx: usize,
@@ -1338,9 +1539,9 @@ fn required_arg_kw(
             "{function}() got multiple values for argument '{name}'"
         )));
     }
-    positional.or(keyword).ok_or_else(|| {
-        crate::PyError::type_error(format!("{function} requires self and {name}"))
-    })
+    positional
+        .or(keyword)
+        .ok_or_else(|| crate::PyError::type_error(format!("{function} requires self and {name}")))
 }
 
 /// `findall_w` (interp_sre.py) — non-overlapping matches.  With no
@@ -1355,18 +1556,44 @@ fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         .copied()
         .ok_or_else(|| crate::PyError::type_error("findall requires self and string"))?;
     let string = required_arg_kw(args, 1, kwargs, "string", "findall")?;
-    let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no code"))?;
-    let (subj, w_buffer) = make_subject(pat, string)?;
-    let _ = pyre_object::gc_roots::pin_root(w_buffer);
+    let arg_base = pyre_object::gc_roots::pin_roots(args);
+    let args_len = args.len();
+    let kw_slot = kwargs.map(|k| {
+        let _ = pyre_object::gc_roots::pin_root(k);
+        pyre_object::gc_roots::shadow_stack_len() - 1
+    });
+    let string_slot = pyre_object::gc_roots::pin_roots(&[string]);
+    let pat = || pyre_object::gc_roots::shadow_stack_get(arg_base);
+    let string = || pyre_object::gc_roots::shadow_stack_get(string_slot);
+    let kwargs_now = || kw_slot.map(pyre_object::gc_roots::shadow_stack_get);
+    get_code(pat()).ok_or_else(|| crate::PyError::type_error("no code"))?;
+    let (subj, w_buffer) = make_subject(pat(), string())?;
+    let buffer_slot = pyre_object::gc_roots::pin_roots(&[w_buffer]);
     let (pos, endpos) = normalize_bounds(
         subj.len(),
-        arg_int_kw(args, 2, kwargs, "pos", 0)?,
-        arg_int_kw(args, 3, kwargs, "endpos", i64::MAX)?,
+        arg_int_kw_rooted(arg_base, args_len, 2, kwargs_now(), "pos", 0)?,
+        arg_int_kw_rooted(arg_base, args_len, 3, kwargs_now(), "endpos", i64::MAX)?,
     );
+    let pat = pat();
+    let subj = unsafe {
+        subject_of(
+            string(),
+            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+        )
+    };
+    let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no code"))?;
     let num_groups = unsafe { (*(pat as *const W_SRE_Pattern)).num_groups }.max(0) as usize;
-    let w_empty = empty_subject(subj);
+    let w_empty = RootedObject::pin(empty_subject(subj));
+    // Collecting the matches allocates nothing; each slice below does, so
+    // the payload is re-read through the pinned subject objects per slice.
+    let subject_now = || unsafe {
+        subject_of(
+            string(),
+            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+        )
+    };
 
-    let matches = match subj {
+    let matches = match subject_now() {
         Subject::AsciiStr(b) | Subject::Bytes(b) => collect_matches(b, pos, endpos, code, pat),
         Subject::Str(obj) => {
             let s = unsafe { utf8_drive(obj) };
@@ -1384,12 +1611,12 @@ fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         let _match_roots = pyre_object::gc_roots::push_roots();
         let spans = &snap.spans;
         let w_item = if num_groups == 0 {
-            RootedObject::pin(slice_subject(subj, spans[0], w_empty))
+            RootedObject::pin(slice_subject(subject_now(), spans[0], w_empty.get()))
         } else if num_groups == 1 {
-            RootedObject::pin(slice_subject(subj, spans[1], w_empty))
+            RootedObject::pin(slice_subject(subject_now(), spans[1], w_empty.get()))
         } else {
             let grps: Vec<RootedObject> = (1..=num_groups)
-                .map(|g| RootedObject::pin(slice_subject(subj, spans[g], w_empty)))
+                .map(|g| RootedObject::pin(slice_subject(subject_now(), spans[g], w_empty.get())))
                 .collect();
             RootedObject::pin(w_tuple_new(grps.iter().map(|grp| grp.get()).collect()))
         };
@@ -1408,28 +1635,39 @@ fn sre_pattern_finditer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         .ok_or_else(|| crate::PyError::type_error("finditer requires self and string"))?;
     let string = required_arg_kw(args, 1, kwargs, "string", "finditer")?;
     if !unsafe { is_sre_pattern(pat) } {
-        return Err(crate::PyError::type_error("descriptor 'finditer' for 're.Pattern'"));
+        return Err(crate::PyError::type_error(
+            "descriptor 'finditer' for 're.Pattern'",
+        ));
     }
     // Validate the compiled code is present (matches do_match's guard).
     get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
     // Same window as `do_match`: the gathered bytes are held only here across
     // the `__index__` calls the bound conversions make, and the scanner keeps
-    // them as its `_buffer`.
+    // them as its `_buffer`.  The gateway `args` copy is pinned too — the
+    // first bound's `__index__` would otherwise leave the second bound as a
+    // from-space word.
     let _roots = pyre_object::gc_roots::push_roots();
-    let (subj, w_buffer) = make_subject(pat, string)?;
-    // Same pair `do_match` pins: the scanner stamps both, and the bound
-    // conversions below run `__index__` first.
-    let base = pyre_object::gc_roots::pin_roots(&[string, w_buffer]);
-    let string = || pyre_object::gc_roots::shadow_stack_get(base);
-    let w_buffer = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let arg_base = pyre_object::gc_roots::pin_roots(args);
+    let args_len = args.len();
+    let kw_slot = kwargs.map(|k| {
+        let _ = pyre_object::gc_roots::pin_root(k);
+        pyre_object::gc_roots::shadow_stack_len() - 1
+    });
+    let string_slot = pyre_object::gc_roots::pin_roots(&[string]);
+    let pat = || pyre_object::gc_roots::shadow_stack_get(arg_base);
+    let string = || pyre_object::gc_roots::shadow_stack_get(string_slot);
+    let kwargs_now = || kw_slot.map(pyre_object::gc_roots::shadow_stack_get);
+    let (subj, w_buffer) = make_subject(pat(), string())?;
+    let buffer_slot = pyre_object::gc_roots::pin_roots(&[w_buffer]);
+    let w_buffer = || pyre_object::gc_roots::shadow_stack_get(buffer_slot);
     let (pos, endpos) = normalize_bounds(
         subj.len(),
-        arg_int_kw(args, 2, kwargs, "pos", 0)?,
-        arg_int_kw(args, 3, kwargs, "endpos", i64::MAX)?,
+        arg_int_kw_rooted(arg_base, args_len, 2, kwargs_now(), "pos", 0)?,
+        arg_int_kw_rooted(arg_base, args_len, 3, kwargs_now(), "endpos", i64::MAX)?,
     );
     let export_active = unsafe { crate::builtins::buffer_export_incref(string()) };
     let scanner = w_sre_scanner_new(
-        pat,
+        pat(),
         string(),
         w_buffer(),
         pos as i64,
@@ -1457,6 +1695,44 @@ fn sre_pattern_subn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(w_tuple_new(vec![w_item.get(), w_n.get()]))
 }
 
+/// One buffer export held across a `subx` or `split_w` scan.
+///
+/// [3.14-spec] ours: the export is taken before the scan and released when
+/// `subx` / `split_w` return, as `pattern_subx` / `pattern_split` hold the
+/// buffer from `state_init` (`getstring`) to `state_fini`, including when the
+/// replacement callable raises ↔ pypy: `W_SRE_Pattern.make_ctx` acquires the
+/// buffer only to reach the live `BytearrayBuffer` and releases the export at
+/// once; only `finditer_w` keeps a `buf_view` on its scanner.
+/// Observable: a `re.sub` callback that resizes the subject bytearray raises
+/// `BufferError` instead of letting the scan read past the shrunk buffer.
+/// Evidence: `pyre/extra_tests/parity_tests/sre_sub_shrinks_bytearray.py`
+/// (the pypy3 oracle prints `b'aaYY'` there), and lib-python
+/// `test_re.test_keep_buffer`, which asserts the same held export for a
+/// scan in progress.  The negative hint search over `make_ctx` / `subx` /
+/// `split_w` in `pypy/module/_sre/interp_sre.py` finds no `@jit.*`,
+/// `_immutable_*` or `rgc.*` hint governing the export's lifetime.
+///
+/// `slot` is the shadow-stack index of the exporter: a collection can move
+/// it, so the release re-reads the slot. `bytes` and `str` acquire nothing
+/// (`active` stays false).
+struct HeldBufferExport {
+    slot: usize,
+    active: bool,
+}
+
+impl Drop for HeldBufferExport {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            unsafe {
+                crate::builtins::buffer_export_decref(pyre_object::gc_roots::shadow_stack_get(
+                    self.slot,
+                ));
+            }
+        }
+    }
+}
+
 /// `subx` (interp_sre.py) — the shared sub/subn body.  `repl` is a
 /// callable (invoked per match), a literal template string with backslash
 /// references expanded ([`parse_template`]), or a plain literal; `count`
@@ -1465,7 +1741,9 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
     if args.len() < 3 {
-        return Err(crate::PyError::type_error("sub requires self, repl, string"));
+        return Err(crate::PyError::type_error(
+            "sub requires self, repl, string",
+        ));
     }
     let pat = args[0];
     // `pat` is a non-moving old-gen `W_SRE_Pattern`. The receiver stays live
@@ -1479,13 +1757,13 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
     let w_repl = || pyre_object::gc_roots::shadow_stack_get(base);
     let string = || pyre_object::gc_roots::shadow_stack_get(base + 1);
     let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
-    // The subject borrows the string's value box, which is `try_gc_alloc_stable`
-    // and so keeps its address; the pin above is what keeps that box allocated
-    // for the length of the walk.
     let (subj, w_buffer_obj) = make_subject(pat, string())?;
     let buffer_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_buffer_obj);
     let w_buffer = || pyre_object::gc_roots::shadow_stack_get(buffer_slot);
+    // `subj` borrows the payload; the template parse and every match
+    // allocate. Re-read it through the pinned subject objects after each.
+    let subject_now = || unsafe { subject_of(string(), w_buffer()) };
     let count = arg_int_kw(args, 3, kwargs, "count", 0)?;
 
     // interp_sre.py:437-472 — a callable filter is applied per match; a
@@ -1518,10 +1796,15 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
                 )
             }
         };
-        Some(parse_replacement_template(w_repl(), repl_bytes, pat, is_bytes)?)
+        Some(parse_replacement_template(
+            w_repl(),
+            repl_bytes,
+            pat,
+            is_bytes,
+        )?)
     };
 
-    let endpos = subj.len();
+    let endpos = subject_now().len();
     let mut out: Vec<u8> = Vec::new();
     let mut last = 0i64;
     // interp_sre.py `while not count or n < count` — 0 is unlimited, a
@@ -1530,13 +1813,13 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
     let on_match = |snap: &MatchSnapshot| -> Result<(), crate::PyError> {
         let (mstart, mend) = snap.spans[0];
         // interp_sre.py:499-502 — copy the gap before this match.
-        if let Some(gap) = subject_span_bytes(subj, (last, mstart)) {
+        if let Some(gap) = subject_span_bytes(subject_now(), (last, mstart)) {
             out.extend_from_slice(gap);
         }
         last = mend;
         if let Some(items) = &template {
             let m = make_match_from_snapshot(pat, string(), w_buffer(), snap, 0, endpos as i64);
-            expand_into(&mut out, items, m as *const W_SRE_Match, subj);
+            expand_into(&mut out, items, m as *const W_SRE_Match, subject_now());
         } else {
             // interp_sre.py:505-513 — callable filter; None means "no
             // piece" (treated as empty), otherwise the returned string.
@@ -1567,14 +1850,32 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
         }
         Ok(())
     };
+    // `state_init` holds the export across the callback loop. The guard
+    // releases it on every return, including a callable that raises.
+    let export_active = unsafe { crate::builtins::buffer_export_incref(string()) };
+    let _held_export = HeldBufferExport {
+        slot: base + 1,
+        active: export_active,
+    };
     let n = match subj {
-        Subject::AsciiStr(b) | Subject::Bytes(b) => {
-            stream_matches(b, 0, endpos, code, pat, count, on_match)?
-        }
-        Subject::Str(obj) => {
-            let s = unsafe { utf8_drive(obj) };
-            stream_matches(s, 0, endpos, code, pat, count, on_match)?
-        }
+        Subject::AsciiStr(_) | Subject::Bytes(_) => stream_matches(
+            || subject_bytes(subject_now()),
+            0,
+            endpos,
+            code,
+            pat,
+            count,
+            on_match,
+        )?,
+        Subject::Str(_) => stream_matches(
+            || unsafe { utf8_drive(subject_str(subject_now())) },
+            0,
+            endpos,
+            code,
+            pat,
+            count,
+            on_match,
+        )?,
     };
     // interp_sre.py:478-484 — no substitution was made (no occurrence, or a
     // non-positive `count`): the result is the subject itself.  An exact
@@ -1585,12 +1886,14 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
         let w_result = if is_exact_str_or_bytes(string()) {
             string()
         } else {
-            slice_subject(subj, (0, endpos as i64), empty_subject(subj))
+            let w_empty = RootedObject::pin(empty_subject(subj));
+            slice_subject(subject_now(), (0, endpos as i64), w_empty.get())
         };
         return Ok((w_result, 0));
     }
-    // interp_sre.py:535-537 — append the trailing gap.
-    if let Some(tail) = subject_span_bytes(subj, (last, endpos as i64)) {
+    // `subx` appends the gap from the last match to `ctx.end`, the end
+    // fixed when the scan started. The held export keeps that length.
+    if let Some(tail) = subject_span_bytes(subject_now(), (last, endpos as i64)) {
         out.extend_from_slice(tail);
     }
     Ok((finish_output(subj, out), n))
@@ -1602,8 +1905,13 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
 fn is_exact_str_or_bytes(w: PyObjectRef) -> bool {
     match crate::typedef::r#type(w) {
         Some(t) => unsafe {
-            std::ptr::eq(t.as_ptr(), pyre_object::get_instantiate(&pyre_object::STR_TYPE))
-                || std::ptr::eq(t.as_ptr(), pyre_object::get_instantiate(&pyre_object::BYTES_TYPE))
+            std::ptr::eq(
+                t.as_ptr(),
+                pyre_object::get_instantiate(&pyre_object::STR_TYPE),
+            ) || std::ptr::eq(
+                t.as_ptr(),
+                pyre_object::get_instantiate(&pyre_object::BYTES_TYPE),
+            )
         },
         None => false,
     }
@@ -1625,20 +1933,29 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         .ok_or_else(|| crate::PyError::type_error("split requires self and string"))?;
     let string = required_arg_kw(args, 1, kwargs, "string", "split")?;
     let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
-    let (subj, w_buffer) = make_subject(pat, string)?;
-    let _ = pyre_object::gc_roots::pin_root(w_buffer);
+    let string_slot = pyre_object::gc_roots::pin_roots(&[string]);
+    let (subj, w_buffer) = make_subject(pat, pyre_object::gc_roots::shadow_stack_get(string_slot))?;
+    let buffer_slot = pyre_object::gc_roots::pin_roots(&[w_buffer]);
+    // `subj` borrows the payload, and everything below allocates. Re-read it
+    // through the pinned subject objects after each allocation.
+    let subject_now = || unsafe {
+        subject_of(
+            pyre_object::gc_roots::shadow_stack_get(string_slot),
+            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+        )
+    };
     let maxsplit = arg_int_kw(args, 2, kwargs, "maxsplit", 0)?;
     let num_groups = unsafe { (*(pat as *const W_SRE_Pattern)).num_groups }.max(0) as usize;
-    let w_empty = empty_subject(subj);
+    let w_empty = RootedObject::pin(empty_subject(subj));
 
-    let endpos = subj.len();
+    let endpos = subject_now().len();
     // `splitlist = []` in interp_sre.py is itself the long-lived root;
     // keep only the item currently being appended on the shadow stack.
     let results = RootedObject::pin(w_list_new_empty());
     let mut last = 0i64;
     let append_slice = |span, w_default| {
         let _item_roots = pyre_object::gc_roots::push_roots();
-        let w_item = RootedObject::pin(slice_subject(subj, span, w_default));
+        let w_item = RootedObject::pin(slice_subject(subject_now(), span, w_default));
         unsafe { w_list_append(results.get(), w_item.get()) };
     };
     // interp_sre.py `while not maxsplit or n < maxsplit` — 0 is unlimited,
@@ -1647,7 +1964,7 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let on_match = |snap: &MatchSnapshot| -> Result<(), crate::PyError> {
         let (mstart, mend) = snap.spans[0];
         // interp_sre.py:393 — the slice preceding this match.
-        append_slice((last, mstart), w_empty);
+        append_slice((last, mstart), w_empty.get());
         // interp_sre.py split_w — interleave each group's capture; an
         // unmatched group span `(-1, -1)` becomes None via slice_subject.
         for g in 1..=num_groups {
@@ -1656,17 +1973,38 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         last = mend;
         Ok(())
     };
-    match subj {
-        Subject::AsciiStr(b) | Subject::Bytes(b) => {
-            stream_matches(b, 0, endpos, code, pat, maxsplit, on_match)?
-        }
-        Subject::Str(obj) => {
-            let s = unsafe { utf8_drive(obj) };
-            stream_matches(s, 0, endpos, code, pat, maxsplit, on_match)?
-        }
+    let export_active = unsafe {
+        crate::builtins::buffer_export_incref(pyre_object::gc_roots::shadow_stack_get(
+            string_slot,
+        ))
     };
-    // interp_sre.py:405 — the trailing remainder after the last match.
-    append_slice((last, endpos as i64), w_empty);
+    let _held_export = HeldBufferExport {
+        slot: string_slot,
+        active: export_active,
+    };
+    match subj {
+        Subject::AsciiStr(_) | Subject::Bytes(_) => stream_matches(
+            || subject_bytes(subject_now()),
+            0,
+            endpos,
+            code,
+            pat,
+            maxsplit,
+            on_match,
+        )?,
+        Subject::Str(_) => stream_matches(
+            || unsafe { utf8_drive(subject_str(subject_now())) },
+            0,
+            endpos,
+            code,
+            pat,
+            maxsplit,
+            on_match,
+        )?,
+    };
+    // `split_w` appends `slice_w(ctx, last, ctx.end)`. `ctx.end` is the
+    // end captured for this scan; the held export keeps that length.
+    append_slice((last, endpos as i64), w_empty.get());
     Ok(results.get())
 }
 
@@ -1732,6 +2070,9 @@ fn parse_replacement_template(
     pat: PyObjectRef,
     is_bytes: bool,
 ) -> Result<Vec<TemplateItem>, crate::PyError> {
+    // The import and the `getattr`s below collect.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_template = RootedObject::pin(w_template);
     let w_parser = match crate::importing::get_sys_module("re._parser") {
         Some(w_parser) => w_parser,
         None => {
@@ -1748,10 +2089,10 @@ fn parse_replacement_template(
     let w_parse = crate::baseobjspace::getattr_str(w_parser, "parse_template")?;
     // `_parser.parse_template` indexes the source as a string; a buffer
     // template (e.g. `bytearray`) must be a real `bytes` first.
-    let w_source = if is_bytes && !unsafe { pyre_object::is_bytes(w_template) } {
+    let w_source = if is_bytes && !unsafe { pyre_object::is_bytes(w_template.get()) } {
         pyre_object::bytesobject::w_bytes_from_bytes(template_bytes)
     } else {
-        w_template
+        w_template.get()
     };
     let w_result = crate::call::call_function_impl_result(w_parse, &[w_source, pat])?;
     template_items_from_list(w_result)
@@ -1765,8 +2106,8 @@ fn expand_into(out: &mut Vec<u8>, items: &[TemplateItem], m: *const W_SRE_Match,
         match item {
             TemplateItem::Literal(lit) => out.extend_from_slice(lit),
             TemplateItem::Group(idx) => {
-                let span = unsafe { w_sre_match_get_span(m as PyObjectRef, *idx) }
-                    .unwrap_or((-1, -1));
+                let span =
+                    unsafe { w_sre_match_get_span(m as PyObjectRef, *idx) }.unwrap_or((-1, -1));
                 if let Some(piece) = subject_span_bytes(subj, span) {
                     out.extend_from_slice(piece);
                 }
@@ -1789,7 +2130,10 @@ fn sre_match_self(args: &[PyObjectRef]) -> Result<*const W_SRE_Match, crate::PyE
 /// `do_span` (interp_sre.py): resolve a group argument — an
 /// index, or a name looked up in `srepat.w_groupindex` — to its span.
 /// Unknown groups raise IndexError("no such group").
-fn do_span(m: *const W_SRE_Match, w_arg: Option<PyObjectRef>) -> Result<(i64, i64), crate::PyError> {
+fn do_span(
+    m: *const W_SRE_Match,
+    w_arg: Option<PyObjectRef>,
+) -> Result<(i64, i64), crate::PyError> {
     let groupnum: i64 = match w_arg {
         None => 0,
         Some(w_arg) => {
@@ -1804,8 +2148,7 @@ fn do_span(m: *const W_SRE_Match, w_arg: Option<PyObjectRef>) -> Result<(i64, i6
             if has_index {
                 crate::baseobjspace::getindex_w(w_arg)?
             } else {
-                let w_groupindex =
-                    unsafe { (*(*m).w_srepat.cast::<W_SRE_Pattern>()).w_groupindex };
+                let w_groupindex = unsafe { (*(*m).w_srepat.cast::<W_SRE_Pattern>()).w_groupindex };
                 let found = if unsafe { is_dict(w_groupindex) } {
                     unsafe { pyre_object::w_dict_lookup(w_groupindex, w_arg) }
                 } else {
@@ -1875,11 +2218,7 @@ fn sre_match_groups(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     for gi in 1..n {
         let span = unsafe { w_sre_match_get_span(m.get(), gi) }.unwrap_or((-1, -1));
         groups.push(RootedObject::pin(unsafe {
-            slice_w(
-                m.get() as *const W_SRE_Match,
-                span,
-                w_default.get(),
-            )
+            slice_w(m.get() as *const W_SRE_Match, span, w_default.get())
         }));
     }
     Ok(w_tuple_new(
@@ -1915,16 +2254,9 @@ fn sre_match_groupdict(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             w_groupindex.get(),
             w_key.get(),
         )?);
-        let span = do_span(
-            m.get() as *const W_SRE_Match,
-            Some(w_value.get()),
-        )?;
+        let span = do_span(m.get() as *const W_SRE_Match, Some(w_value.get()))?;
         let w_grp = RootedObject::pin(unsafe {
-            slice_w(
-                m.get() as *const W_SRE_Match,
-                span,
-                w_default.get(),
-            )
+            slice_w(m.get() as *const W_SRE_Match, span, w_default.get())
         });
         crate::baseobjspace::setitem(w_dict.get(), w_key.get(), w_grp.get())?;
     }
@@ -1947,7 +2279,8 @@ fn sre_match_regs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let n = unsafe { (*m).spans_len };
     let mut result_w = pyre_object::gc_roots::RootedItems::new();
     for gi in 0..n {
-        let (start, end) = unsafe { w_sre_match_get_span(m as PyObjectRef, gi) }.unwrap_or((-1, -1));
+        let (start, end) =
+            unsafe { w_sre_match_get_span(m as PyObjectRef, gi) }.unwrap_or((-1, -1));
         result_w.push(new_charindex_tuple(start, end));
     }
     Ok(w_tuple_new(result_w.take()))
@@ -1989,9 +2322,13 @@ fn sre_match_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// against this match.  Upstream delegates to `re._expand`; pyre expands
 /// natively since it owns the template parser.
 fn sre_match_expand(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let m = sre_match_self(args)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let m = RootedObject::pin(sre_match_self(args)? as PyObjectRef);
     let w_template = args.get(1).copied().unwrap_or_else(w_none);
-    let subj = unsafe { subject_of((*m).w_string, (*m).w_buffer) };
+    let subj = unsafe {
+        let mp = m.get() as *const W_SRE_Match;
+        subject_of((*mp).w_string, (*mp).w_buffer)
+    };
     let (template, is_bytes): (&[u8], bool) = match subj {
         Subject::AsciiStr(_) | Subject::Str(_) => {
             if !unsafe { is_str(w_template) } {
@@ -2009,10 +2346,13 @@ fn sre_match_expand(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             )
         }
     };
-    let w_pat = unsafe { (*m).w_srepat };
+    let w_pat = unsafe { (*(m.get() as *const W_SRE_Match)).w_srepat };
     let items = parse_replacement_template(w_template, template, w_pat, is_bytes)?;
+    // The parse runs Python: re-read the match and its subject.
+    let mp = m.get() as *const W_SRE_Match;
+    let subj = unsafe { subject_of((*mp).w_string, (*mp).w_buffer) };
     let mut out: Vec<u8> = Vec::new();
-    expand_into(&mut out, &items, m, subj);
+    expand_into(&mut out, &items, mp, subj);
     Ok(finish_output(subj, out))
 }
 
@@ -2053,9 +2393,9 @@ fn truncate_code_points(text: rustpython_wtf8::Wtf8Buf, limit: usize) -> rustpyt
 
 fn sre_match_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let m = sre_match_self(args)?;
-    Ok(pyre_object::w_str_from_wtf8_managed(
-        sre_match_repr_str(m as PyObjectRef)?,
-    ))
+    Ok(pyre_object::w_str_from_wtf8_managed(sre_match_repr_str(
+        m as PyObjectRef,
+    )?))
 }
 
 /// `copy_identity_w` (interp_sre.py) — match results are
@@ -2130,9 +2470,9 @@ pub(crate) fn sre_pattern_repr_str(
 
 fn sre_pattern_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let pat = sre_pattern_self(args)?;
-    Ok(pyre_object::w_str_from_wtf8_managed(
-        sre_pattern_repr_str(pat as PyObjectRef)?,
-    ))
+    Ok(pyre_object::w_str_from_wtf8_managed(sre_pattern_repr_str(
+        pat as PyObjectRef,
+    )?))
 }
 
 /// `descr_eq` (interp_sre.py): compare flags, compiled code, and

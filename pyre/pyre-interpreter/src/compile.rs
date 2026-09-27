@@ -106,8 +106,13 @@ pub fn compile_source_named_by_bytes(
     // The bytes land on the wrapper the compile produced, before anything can
     // allocate, exactly as `builtin_compile` lands them.
     let w_code = crate::w_code_new(Box::into_raw(Box::new(code)) as *const ());
-    unsafe { crate::pycode::set_compilation_unit_filename_bytes(w_code, filename_bytes) };
-    Ok(w_code)
+    let roots = pyre_object::gc_roots::push_roots();
+    let code_slot = roots.base();
+    let _ = roots.pin_root(w_code);
+    unsafe {
+        crate::pycode::set_compilation_unit_filename_bytes(roots.get(code_slot), filename_bytes)
+    };
+    Ok(roots.get(code_slot))
 }
 
 /// Compile Python source with an explicit `CompileOpts`, carrying the

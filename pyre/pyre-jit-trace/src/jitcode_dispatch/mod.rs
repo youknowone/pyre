@@ -1141,10 +1141,11 @@ fn record_inline_application_traceback<Sym: WalkSym>(
     // SIGSEGV.  Skip null / sentinel / non-code; the null + sentinel checks run
     // before `is_code`, whose `py_type_check` would deref the raw sentinel
     // (`CAN_BE_TAGGED` is off).
-    if consts.w_code == 0 || consts.w_code == usize::MAX {
+    let w_code = ctx.inline_w_code();
+    if w_code == 0 || w_code == usize::MAX {
         return;
     }
-    if !unsafe { pyre_interpreter::pycode::is_code(consts.w_code as pyre_object::PyObjectRef) } {
+    if !unsafe { pyre_interpreter::pycode::is_code(w_code as pyre_object::PyObjectRef) } {
         return;
     }
     let ConcreteValue::Ref(mut exc_ptr) = *exc_concrete else {
@@ -1484,8 +1485,9 @@ fn traceback_node_site<Sym: WalkSym>(
         };
         (session.recording_jitcode_index, w_code)
     } else {
-        ctx.inline_callee_consts
-            .map_or((-1, 0), |consts| (consts.jitcode_index, consts.w_code))
+        ctx.inline_callee_consts.map_or((-1, 0), |consts| {
+            (consts.jitcode_index, ctx.inline_w_code())
+        })
     };
     if w_code == 0 || w_code == usize::MAX {
         return None;
@@ -1739,13 +1741,12 @@ fn record_fresh_application_traceback<Sym: WalkSym>(
 }
 
 /// Compile-time-constant frame fields of an inlined callee.
+///
+/// The callee's globals and `W_Code` are GCREFs, so they live on the walked
+/// `WalkFrameStateData` (`inline_w_globals` / `inline_w_code`) and are read
+/// through [`WalkContext::inline_w_globals`] / [`WalkContext::inline_w_code`].
 #[derive(Clone, Copy)]
 pub struct InlineCalleeConsts {
-    /// The callee function's `__globals__` as a `PyObjectRef`.
-    w_globals: usize,
-    /// `frame.pycode` (`VABLE_CODE_FIELD_IDX` = 1): the callee's `W_Code`
-    /// pointer.
-    w_code: usize,
     /// Jitcode identity used to translate a callee opcode to its Python
     /// instruction coordinate when constructing `PyTraceback` metadata.
     jitcode_index: i32,
@@ -2176,6 +2177,18 @@ impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
                 jitcode_pc as i32,
             ) as u32,
         }
+    }
+
+    /// Live `Function.w_func_globals_obj` of this inlined callee, from the
+    /// walked `WalkFrameState.inline_w_globals` slot.
+    fn inline_w_globals(&self) -> usize {
+        self.frame_state.borrow().inline_w_globals
+    }
+
+    /// Live `W_Code` of this inlined callee, from the walked
+    /// `WalkFrameState.inline_w_code` slot.
+    fn inline_w_code(&self) -> usize {
+        self.frame_state.borrow().inline_w_code
     }
 }
 
@@ -3566,7 +3579,7 @@ pub fn step<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
-    inline_call::note_subwalk_driver_step::<Sym>(op.opname, ctx.trace_ctx.get_trace_position());
+    inline_call::note_subwalk_driver_step::<Sym>(op.opname, pc, ctx.trace_ctx.get_trace_position());
     // The walker mixes translated vable operations (which update the shadow)
     // with concrete interpreter steps (which update the heap PyFrame).  Pull
     // those concrete writes into `virtualizable_boxes` before any handler can
@@ -5457,8 +5470,7 @@ fn guard_current_frame_globals_identity<Sym: WalkSym>(
     op_pc: usize,
     expected_globals: pyre_object::PyObjectRef,
 ) -> Result<bool, DispatchError> {
-    if expected_globals.is_null() || majit_gc::can_move(majit_ir::GcRef(expected_globals as usize))
-    {
+    if expected_globals.is_null() {
         return Ok(false);
     }
     // `pyframe.py:LOAD_GLOBAL` reads `self.get_w_globals()` from the live
@@ -5470,8 +5482,8 @@ fn guard_current_frame_globals_identity<Sym: WalkSym>(
     // `try_resolve_inline_callee_static_field` above).  Checking that frame's
     // identity here prevents a bridge-resumed callee from emitting
     // `GUARD_VALUE(root.w_globals, callee.w_globals)`.
-    if let Some(consts) = ctx.inline_callee_consts {
-        return Ok(consts.w_globals == expected_globals as usize);
+    if ctx.inline_callee_consts.is_some() {
+        return Ok(ctx.inline_w_globals() == expected_globals as usize);
     }
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
@@ -5612,12 +5624,12 @@ fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
             // null placeholder standing declines the fold and then aborts the
             // trace on the residual's unbound callee-frame argument.
             //
-            // Immovable only, matching `guard_current_frame_globals_identity`,
-            // where both fold legs end: a movable namespace declines there
-            // anyway, so substituting one would buy nothing and bake a pointer
-            // the GC may forward into the surviving residual.
-            if consts.w_globals != 0 && !majit_gc::can_move(majit_ir::GcRef(consts.w_globals)) {
-                *ns_box = ctx.trace_ctx.const_ref(consts.w_globals as i64);
+            // Name the callee's own `__globals__` as a `ConstPtr`.  That word
+            // is forwarded in `WalkFrameState.inline_w_globals` and, once
+            // recorded, by `walk_const_ptr_refs` / the gcref table.
+            let w_globals = ctx.inline_w_globals();
+            if w_globals != 0 {
+                *ns_box = ctx.trace_ctx.const_ref(w_globals as i64);
             }
             return;
         };
@@ -5625,8 +5637,10 @@ fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
         // Recording-time residual execution needs the same concrete shadow;
         // the compiled value remains the GETFIELD_GC_R result above and is
         // therefore still sourced from the live callee frame.
-        ctx.trace_ctx
-            .try_set_opref_concrete(w_globals, Value::Ref(majit_ir::GcRef(consts.w_globals)));
+        ctx.trace_ctx.try_set_opref_concrete(
+            w_globals,
+            Value::Ref(majit_ir::GcRef(ctx.inline_w_globals())),
+        );
         *ns_box = w_globals;
         return;
     }
@@ -6448,6 +6462,17 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                                     && b.ty() == Some(majit_ir::Type::Ref)
                             });
                         if !shadow_sources_slot {
+                            // The operand-stack mirror has no box, but the
+                            // register for this live color still holds one
+                            // (the value `LOAD_FAST` left there, for
+                            // instance). `_get_list_of_active_boxes` reads
+                            // `registers_r[index]` for every live color with
+                            // no further test, so encode that register.
+                            let reg = regs_r.get_box(color).unwrap_or(OpRef::NONE);
+                            if reg != OpRef::NONE {
+                                active.push(reg);
+                                continue;
+                            }
                             if let Some(first) = unrecovered_kept.as_deref_mut() {
                                 first.get_or_insert(idx);
                             }
@@ -10496,6 +10521,10 @@ fn walker_pin_descriptor_slot<Sym: WalkSym>(
     w_descr: pyre_object::PyObjectRef,
     field: majit_ir::DescrRef,
 ) -> Result<(), DispatchError> {
+    // `rewrite.py` `_gcref_index` / `quasiimmut.py`: put the descriptor
+    // in the ConstPtr gcrefs table so a nursery move updates the constant.
+    // There is no `can_move` gate on this pin (`rpython/jit` uses
+    // `can_move` only in backend `convert_to_imm`).
     let descr_const = ctx.trace_ctx.const_ref(w_descr as i64);
     crate::state::record_quasiimmut_field(ctx.trace_ctx, descr_const, field);
     walker_flush_guard_not_invalidated(ctx, op_pc)
@@ -10962,7 +10991,7 @@ fn walker_foriter_green_key<Sym: WalkSym>(
     // callee kept the opaque `ForIterNext` residual, which runs the iterator's
     // `__next__` as a real frame in the plain interpreter.
     if let Some(consts) = ctx.inline_callee_consts {
-        let w_code = consts.w_code as *const ();
+        let w_code = ctx.inline_w_code() as *const ();
         if w_code.is_null() {
             return None;
         }

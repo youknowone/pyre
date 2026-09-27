@@ -105,22 +105,38 @@ pub fn kwargs_dict_storage_gc_type_id() -> u32 {
 /// `w_dict` must be a valid `W_DictObject` on [`KWARGS_DICT_STRATEGY`].
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_dict_switch_kwargs_to_object_strategy(w_dict: PyObjectRef) {
-    let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-    // Borrow the old typed box (its field stays live, so it is traced
-    // while the migration builds the object map); after the store the
-    // box is unreachable and the sweep reclaims it. `PyObjectRef` is a
-    // raw pointer (Copy), so iterate by reference and copy each slot.
-    let old = &*(dict.dstorage as *const KwargsDictStorage);
-    let mut new_map = crate::dictmultiobject::object_dict_storage_with_capacity(old.0.len());
-    for (k, v) in old.0.iter().zip(old.1.iter()) {
-        new_map.insert(crate::dictmultiobject::object_key_for(*k), *v);
+    // Same three hazards as `w_dict_switch_int_to_object_strategy`: the
+    // receiver moves, `object_key_for` hashes (a collection point) while
+    // the value is a bare local, and a pair copied into a stack-local map
+    // would be pre-move by the next key's hash. Accumulate in root slots
+    // and fill the box once every allocation is behind us.
+    let roots = crate::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    let w_dict = roots.pin_root(w_dict);
+    let len = kwargs_storage(w_dict).0.len();
+    let mut hashes = Vec::with_capacity(len);
+    let pairs_base = dict_slot + 1;
+    for i in 0..len {
+        let object_key =
+            crate::dictmultiobject::object_key_for(kwargs_storage(roots.get(dict_slot)).0[i]);
+        // Take the value only now: the old table is traced through the
+        // pinned dict, so re-reading the slot after this iteration's hash
+        // yields the current word.
+        let v = kwargs_storage(roots.get(dict_slot)).1[i];
+        hashes.push(object_key.hash);
+        roots.publish(&[object_key.obj, v]);
     }
-    dict.dstorage = crate::gc_storage::gc_alloc_storage_box(
-        new_map,
+    let new_storage = crate::gc_storage::gc_alloc_storage_box(
+        crate::dictmultiobject::object_dict_storage_with_capacity(len),
         crate::dictmultiobject::object_dict_storage_gc_type_id(),
-    ) as *mut u8;
-    dict.dstrategy = &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF;
-    crate::dictmultiobject::dict_write_barrier(w_dict);
+    );
+    let new_map = &mut *new_storage;
+    for (i, &hash) in hashes.iter().enumerate() {
+        let obj = roots.get(pairs_base + 2 * i);
+        let value = roots.get(pairs_base + 2 * i + 1);
+        new_map.insert(crate::dictmultiobject::ObjectKey { hash, obj }, value);
+    }
+    crate::dictmultiobject::install_object_dict_storage(roots.get(dict_slot), new_storage);
 }
 
 /// `kwargsdict.py:62` size threshold past which the strategy
@@ -160,18 +176,35 @@ impl KwargsDictStrategy {
     /// `w_dict.setitem`; pyre does the same so any non-ASCII keys
     /// further promote to ObjectDictStrategy.
     unsafe fn switch_to_unicode_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
         // Drain the parallel arrays out of the old box (leaving it holding
         // empty Vecs); after `dstorage` is overwritten the box is unreachable
         // and the sweep drops it. `std::mem::take` mirrors the old
         // `Box::from_raw` move without freeing the GC-managed box here.
-        let old = &mut *(dict.dstorage as *mut KwargsDictStorage);
+        // Each `w_dict_store` below can collect, so the drained words live
+        // in root slots rather than a bare `Vec<PyObjectRef>`.
+        let roots = crate::gc_roots::push_roots();
+        let dict_slot = roots.base();
+        let w_dict = roots.pin_root(w_dict);
+        let old = &mut *((*(w_dict as *mut crate::dictmultiobject::W_DictObject)).dstorage
+            as *mut KwargsDictStorage);
         let keys_w = std::mem::take(&mut old.0);
         let values_w = std::mem::take(&mut old.1);
+        let len = keys_w.len();
+        let pairs_base = dict_slot + 1;
+        for i in 0..len {
+            roots.publish(&[keys_w[i], values_w[i]]);
+        }
+        let w_dict = roots.get(dict_slot);
+        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
         dict.dstorage = crate::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage();
         dict.dstrategy = &crate::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
-        for (k, v) in keys_w.into_iter().zip(values_w) {
-            crate::dictmultiobject::w_dict_store(w_dict, k, v);
+        crate::dictmultiobject::dict_write_barrier(w_dict);
+        for i in 0..len {
+            crate::dictmultiobject::w_dict_store(
+                roots.get(dict_slot),
+                roots.get(pairs_base + 2 * i),
+                roots.get(pairs_base + 2 * i + 1),
+            );
         }
     }
 }
@@ -242,13 +275,14 @@ impl DictStrategy for KwargsDictStrategy {
         if Self::is_correct_type(w_key) {
             let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
             let storage = &mut *(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>));
+            crate::dictmultiobject::dict_write_barrier(w_dict);
             for i in 0..storage.0.len() {
                 if crate::dictmultiobject::dict_keys_equal(kwargs_at(&storage.0, i), w_key) {
                     // Direct element store in this body. A helper that
                     // returns `&mut items[i]` leaves an opaque `index_mut`
                     // whose destination is not a single deref here.
                     storage.1[i] = w_value;
-                    crate::dictmultiobject::dict_write_barrier(w_dict);
+
                     return;
                 }
             }
@@ -260,7 +294,7 @@ impl DictStrategy for KwargsDictStrategy {
             storage.0.push(w_key);
             storage.1.push(w_value);
             crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
-            crate::dictmultiobject::dict_write_barrier(w_dict);
+
             return;
         }
         self.switch_to_object_strategy(w_dict);

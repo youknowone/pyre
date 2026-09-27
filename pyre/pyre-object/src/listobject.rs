@@ -12,7 +12,7 @@ use crate::object_array::{
     ItemsBlock, TypedItemsBlock, alloc_list_items_block_gc, alloc_typed_items_block,
     dealloc_list_items_block, gc_float_array_gc_type_id, gc_int_array_gc_type_id,
     grow_list_items_block_gc, grow_typed_items_block, items_block_capacity, items_block_items_base,
-    typed_items_block_items_base,
+    items_block_set_ref, typed_items_block_items_base,
 };
 use crate::pyobject::*;
 use crate::{
@@ -731,14 +731,15 @@ impl W_ListObject {
         // returns it relocated. The in-place store below stays outside the
         // boundary so the spare-capacity fold still lowers it. No-op grow
         // under the std::alloc fallback.
-        let value = if list.length_relaxed() == list.object_items_capacity() {
-            w_list_grow_items_block(obj, crate::gc_roots::shadow_stack_get(root_base + 1))
-        } else {
-            crate::gc_roots::shadow_stack_get(root_base + 1)
-        };
+        if list.length_relaxed() == list.object_items_capacity() {
+            let _ = w_list_grow_items_block(obj, crate::gc_roots::shadow_stack_get(root_base + 1));
+        }
         let obj = crate::gc_roots::shadow_stack_get(root_base);
-        let value = prepare_list_ref_store(obj, value);
+        let _ = prepare_list_ref_store(obj, crate::gc_roots::shadow_stack_get(root_base + 1));
+        // `prepare_list_ref_store` does not collect; the store reads both
+        // words back from their slots, the livevar reload of `ll_append`.
         let obj = crate::gc_roots::shadow_stack_get(root_base);
+        let value = crate::gc_roots::shadow_stack_get(root_base + 1);
         let list = &mut *(obj as *mut W_ListObject);
         let base = items_block_items_base(list.items);
         *base.add(list.length_relaxed()) = value;
@@ -756,17 +757,18 @@ impl W_ListObject {
         // Same grow-then-store shape as `object_push`: at capacity, route the
         // grow through the `dont_look_inside` boundary, which roots `value`
         // across the (collecting) resize and returns it relocated.
-        let value = if list.length_relaxed() == list.object_items_capacity() {
-            w_list_grow_items_block(obj, crate::gc_roots::shadow_stack_get(root_base + 1))
-        } else {
-            crate::gc_roots::shadow_stack_get(root_base + 1)
-        };
+        if list.length_relaxed() == list.object_items_capacity() {
+            let _ = w_list_grow_items_block(obj, crate::gc_roots::shadow_stack_get(root_base + 1));
+        }
         let obj = crate::gc_roots::shadow_stack_get(root_base);
-        let value = prepare_list_ref_store(obj, value);
+        let _ = prepare_list_ref_store(obj, crate::gc_roots::shadow_stack_get(root_base + 1));
         // The shift below moves items across card pages; generalize first.
         // The barrier answers with the list's post-barrier address, so this is
-        // the reload the following store needs as well.
+        // the reload the following store needs as well.  `value` is the same
+        // livevar: `prepare_list_ref_store` and the move-barrier are both
+        // safepoints, so the store takes the slot, not the pre-barrier local.
         let obj = list_before_move_barrier(crate::gc_roots::shadow_stack_get(root_base));
+        let value = crate::gc_roots::shadow_stack_get(root_base + 1);
         let list = &mut *(obj as *mut W_ListObject);
         let base = items_block_items_base(list.items);
         let p = base.add(index);
@@ -777,8 +779,8 @@ impl W_ListObject {
 
     unsafe fn object_remove(&mut self, index: usize) -> PyObjectRef {
         assert!(index < self.length_relaxed());
-        // The barrier's ownership query is a safepoint, so `self` is reloaded
-        // through the address it answers with rather than reused.
+        // `list_before_move_barrier` returns the list it was handed; the body
+        // continues on that word.
         let obj = list_before_move_barrier(self as *mut W_ListObject as PyObjectRef);
         let this = &mut *(obj as *mut W_ListObject);
         let base = items_block_items_base(this.items);
@@ -823,8 +825,8 @@ impl W_ListObject {
         if count == 0 {
             return;
         }
-        // The barrier's ownership query is a safepoint, so `self` is reloaded
-        // through the address it answers with rather than reused.
+        // `list_before_move_barrier` returns the list it was handed; the body
+        // continues on that word.
         let obj = list_before_move_barrier(self as *mut W_ListObject as PyObjectRef);
         let this = &mut *(obj as *mut W_ListObject);
         let base = items_block_items_base(this.items);
@@ -1455,12 +1457,9 @@ pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) -> PyObjectRef 
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
     // Object strategy reads none of the typed arrays again, so drop all three
-    // to the empty form instead of installing fresh single-slot blocks.  Each
-    // `install` pins and reloads its incoming block, so it is a safepoint and
-    // the list is re-read from its slot before the next one: writing a later
-    // field through the reference the previous install left behind stores it
-    // into the moved-from copy, and the live list keeps the outgoing block —
-    // which the custom trace then forwards as a stale child.
+    // to the empty form instead of installing fresh single-slot blocks.  The
+    // list is read back from its slot before each `install`, the livevar
+    // reload of the rooted list.
     list.int_items.install(IntArray::empty());
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
@@ -1679,15 +1678,13 @@ fn list_write_barrier_impl(obj: PyObjectRef, managed: bool) {
     // would be missed. Barrier the block too so its varsize walker re-runs; the
     // collector no-ops the barrier on a still-young block (`TRACK_YOUNG_PTRS`
     // unset). Inert while the block stays std::alloc (`try_gc_owns_object` false).
+    // The block is read through the list's slot.
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = unsafe { &*(obj as *const W_ListObject) };
     if list.strategy == ListStrategy::Object
         && !list.items.is_null()
         && crate::gc_hook::try_gc_owns_object(list.items as *mut u8)
     {
-        // The ownership query is a safepoint.  Reload the field it may have
-        // forwarded instead of handing the following rooted barrier the
-        // pre-collection array address.
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let items = unsafe { (*(obj as *const W_ListObject)).items };
         crate::gc_hook::try_gc_write_barrier(items as *mut u8);
@@ -1702,10 +1699,9 @@ fn list_write_barrier_impl(obj: PyObjectRef, managed: bool) {
 /// pointer moves. A minor reaches a carded array through its dirty pages
 /// alone, so a young pointer shifted into a clean page would not be scanned.
 ///
-/// The ownership query is a safepoint and the barrier reads a header, so the
-/// block cannot be handed over unchecked and the caller cannot keep its own
-/// reference across the call — hence the root bracket here and the returned
-/// address rather than a `()`.
+/// The barrier reads the block's header, so the block is reached through the
+/// list here rather than handed over by the caller, and the caller continues on
+/// the returned list word.
 #[majit_macros::dont_look_inside]
 pub fn list_before_move_barrier(obj: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
@@ -1717,8 +1713,6 @@ pub fn list_before_move_barrier(obj: PyObjectRef) -> PyObjectRef {
         && !list.items.is_null()
         && crate::gc_hook::try_gc_owns_object(list.items as *mut u8)
     {
-        // The ownership query is a safepoint. Reload the field it may have
-        // forwarded instead of barriering the pre-collection array address.
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let items = unsafe { (*(obj as *const W_ListObject)).items };
         crate::gc_hook::try_gc_write_barrier_before_move(items as *mut u8);
@@ -1741,9 +1735,8 @@ pub fn list_before_move_barrier(obj: PyObjectRef) -> PyObjectRef {
 /// `set_len` / `setitem_fast` leaves foldable to native ops, and costs the same
 /// one residual call the barrier alone already did.
 ///
-/// Returns `value` at its post-barrier address: the ownership query inside
-/// `list_write_barrier` is a safepoint, so the caller must store the returned
-/// pointer rather than the argument it passed.
+/// Returns `value`. The barrier is not a collection point
+/// (`remember_young_pointer`), so the returned word is the one passed in.
 ///
 /// The signature spells `*mut PyObject` rather than the identical `PyObjectRef`
 /// alias so that `emit_helper_call_target_fn` recognises the parameters and the
@@ -2655,16 +2648,20 @@ pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: usize, o
 /// `cond = len(l.items) < newsize`; a constant pair inlines the realloc,
 /// otherwise `jit.conditional_call` keeps the fast path bridge-free.
 pub unsafe fn ll_list_int_resize_ge(obj: PyObjectRef, newsize: usize) {
-    let mut obj = obj;
     let list = &*(obj as *const W_ListObject);
     let allocated = ll_list_int_capacity(list);
     let cond = allocated < newsize;
+    // `l` is a livevar across `_ll_list_resize_hint_really`, which may malloc.
+    let roots = crate::gc_roots::push_roots();
+    let _ = roots.pin_root(obj);
     if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&newsize) {
         if cond {
             ll_list_int_resize_hint_really(obj, newsize, true);
-            obj = current_gc_ref(obj);
         }
     } else {
+        // No branch on `cond` after `jit.conditional_call`: rlist.py
+        // `_ll_list_resize_ge` has none, and one here records a
+        // `guard_false(cond)` that fails on every grow.
         majit_rlib::jit::conditional_call3(
             cond,
             ll_list_int_resize_hint_really,
@@ -2672,12 +2669,8 @@ pub unsafe fn ll_list_int_resize_ge(obj: PyObjectRef, newsize: usize) {
             newsize,
             true,
         );
-        // No branch on `cond` after `jit.conditional_call`: rlist.py
-        // `_ll_list_resize_ge` has none, and one here records a
-        // `guard_false(cond)` that fails on every grow.
-        obj = current_gc_ref(obj);
     }
-    let list = &mut *(obj as *mut W_ListObject);
+    let list = &mut *(roots.get(roots.base()) as *mut W_ListObject);
     ll_list_int_set_len(list, newsize);
 }
 
@@ -2780,16 +2773,20 @@ pub unsafe fn ll_list_float_resize_hint_really(
 
 /// `rlist.py _ll_list_resize_ge` for Float storage.
 pub unsafe fn ll_list_float_resize_ge(obj: PyObjectRef, newsize: usize) {
-    let mut obj = obj;
     let list = &*(obj as *const W_ListObject);
     let allocated = ll_list_float_capacity(list);
     let cond = allocated < newsize;
+    // `l` is a livevar across `_ll_list_resize_hint_really`, which may malloc.
+    let roots = crate::gc_roots::push_roots();
+    let _ = roots.pin_root(obj);
     if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&newsize) {
         if cond {
             ll_list_float_resize_hint_really(obj, newsize, true);
-            obj = current_gc_ref(obj);
         }
     } else {
+        // No branch on `cond` after `jit.conditional_call`: rlist.py
+        // `_ll_list_resize_ge` has none, and one here records a
+        // `guard_false(cond)` that fails on every grow.
         majit_rlib::jit::conditional_call3(
             cond,
             ll_list_float_resize_hint_really,
@@ -2797,12 +2794,8 @@ pub unsafe fn ll_list_float_resize_ge(obj: PyObjectRef, newsize: usize) {
             newsize,
             true,
         );
-        // No branch on `cond` after `jit.conditional_call`: rlist.py
-        // `_ll_list_resize_ge` has none, and one here records a
-        // `guard_false(cond)` that fails on every grow.
-        obj = current_gc_ref(obj);
     }
-    let list = &mut *(obj as *mut W_ListObject);
+    let list = &mut *(roots.get(roots.base()) as *mut W_ListObject);
     ll_list_float_set_len(list, newsize);
 }
 
@@ -2845,18 +2838,12 @@ pub fn ll_list_obj_getitem_fast(l: &W_ListObject, index: usize) -> PyObjectRef {
 
 /// `ll_setitem_fast` for the Object strategy: a GC-ref store at a
 /// known-in-bounds index (the spare-capacity append's element write).
-/// The element is a GC pointer, but — unlike the runtime helper that once
-/// inlined the barrier here — the list write barrier is run by the caller
-/// (`w_list_append`) as a separate `dont_look_inside` call. The orthodox
-/// fold replaces this leaf with `getfield_gc_r(items) + setarrayitem_gc_r`
-/// and would drop an inlined barrier; keeping the barrier in the caller
-/// lets the fold preserve it as a residual call.
+/// The host body is `setarrayitem_gc` (`items_block_set_ref`). The
+/// orthodox fold replaces this leaf with `getfield_gc_r(items) +
+/// setarrayitem_gc_r`, which carries its own barrier.
 #[majit_macros::oopspec("list.obj_setitem(l, index, item)")]
 pub fn ll_list_obj_setitem_fast(l: &mut W_ListObject, index: usize, item: PyObjectRef) {
-    unsafe {
-        let base = items_block_items_base(l.items);
-        *base.add(index) = item;
-    }
+    unsafe { items_block_set_ref(l.items, index, item) };
 }
 
 /// `rlist.py _ll_list_resize_hint_really` for Object storage.
@@ -2891,22 +2878,23 @@ pub unsafe fn ll_list_obj_resize_hint_really(obj: PyObjectRef, newsize: usize, o
 ///
 /// `_ll_list_resize_hint_really` may `malloc` (`rlist.py`). RPython's
 /// gctransform keeps `l` a live root across that call and reloads it
-/// before `l.length = newsize`. A Rust `PyObjectRef` is a raw word, so
-/// the grow-taken path reloads through `current_gc_ref` (the same
-/// residual the append body already uses after this function). The
-/// spare-capacity path (`cond == false`) does not allocate and keeps
-/// the original pointer, so the fast path stays residual-free.
+/// before `l.length = newsize`; here that is the explicit shadow-stack pin
+/// and slot reload.
 pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
-    let mut obj = obj;
     let list = &*(obj as *const W_ListObject);
     let allocated = ll_list_obj_capacity(list);
     let cond = allocated < newsize;
+    // `l` is a livevar across `_ll_list_resize_hint_really`, which may malloc.
+    let roots = crate::gc_roots::push_roots();
+    let _ = roots.pin_root(obj);
     if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&newsize) {
         if cond {
             ll_list_obj_resize_hint_really(obj, newsize, true);
-            obj = current_gc_ref(obj);
         }
     } else {
+        // No branch on `cond` after `jit.conditional_call`: rlist.py
+        // `_ll_list_resize_ge` has none, and one here records a
+        // `guard_false(cond)` that fails on every grow.
         majit_rlib::jit::conditional_call3(
             cond,
             ll_list_obj_resize_hint_really,
@@ -2914,12 +2902,8 @@ pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
             newsize,
             true,
         );
-        // No branch on `cond` after `jit.conditional_call`: rlist.py
-        // `_ll_list_resize_ge` has none, and one here records a
-        // `guard_false(cond)` that fails on every grow.
-        obj = current_gc_ref(obj);
     }
-    let list = &mut *(obj as *mut W_ListObject);
+    let list = &mut *(roots.get(roots.base()) as *mut W_ListObject);
     ll_list_obj_set_len(list, newsize);
 }
 
@@ -3249,8 +3233,10 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
         // listobject.py EmptyListStrategy.setitem raises IndexError.
         ListStrategy::Empty | ListStrategy::Size => false,
         ListStrategy::SimpleRange | ListStrategy::Range => {
+            let roots = crate::gc_roots::push_roots();
+            let _ = roots.pin_root(value);
             let obj = switch_range_to_integer_strategy(list);
-            w_list_setitem_inner(obj, index, current_gc_ref(value))
+            w_list_setitem_inner(obj, index, roots.get(roots.base()))
         }
         ListStrategy::Object => {
             let len = list.length_relaxed() as i64;
@@ -3259,7 +3245,6 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
                 return false;
             }
             let value = prepare_list_ref_store(obj, value);
-            let obj = current_gc_ref(obj);
             let list = &mut *(obj as *mut W_ListObject);
             ll_list_obj_setitem_fast(list, idx as usize, value);
             true
@@ -3274,11 +3259,19 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
             if is_plain_int1(value) {
                 ll_list_int_setitem_fast(list, idx as usize, plain_int_w(value));
                 true
-            } else if is_float_strategy_item(value) && integer_to_int_or_float(list) {
-                w_list_setitem_inner(current_gc_ref(obj), index, current_gc_ref(value))
             } else {
-                let obj = switch_to_object_strategy(list);
-                w_list_setitem_inner(obj, index, current_gc_ref(value))
+                // `integer_to_int_or_float` allocates the new storage, so the
+                // list and the item are livevars across it.
+                let roots = crate::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(obj);
+                let _ = roots.pin_root(value);
+                if is_float_strategy_item(value) && integer_to_int_or_float(list) {
+                    w_list_setitem_inner(roots.get(base), index, roots.get(base + 1))
+                } else {
+                    let obj = switch_to_object_strategy(list);
+                    w_list_setitem_inner(obj, index, roots.get(base + 1))
+                }
             }
         }
         ListStrategy::IntOrFloat => {
@@ -3291,8 +3284,10 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
                 ll_list_int_setitem_fast(list, idx as usize, value);
                 true
             } else {
+                let roots = crate::gc_roots::push_roots();
+                let _ = roots.pin_root(value);
                 let obj = switch_to_object_strategy(list);
-                w_list_setitem_inner(obj, index, current_gc_ref(value))
+                w_list_setitem_inner(obj, index, roots.get(roots.base()))
             }
         }
         ListStrategy::Float => {
@@ -3304,14 +3299,22 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
             if is_float_strategy_item(value) {
                 ll_list_float_setitem_fast(list, idx as usize, w_float_get_value(value));
                 true
-            } else if is_plain_int1(value)
-                && int_or_float_encode_int(plain_int_w(value)).is_some()
-                && float_to_int_or_float(list)
-            {
-                w_list_setitem_inner(current_gc_ref(obj), index, current_gc_ref(value))
             } else {
-                let obj = switch_to_object_strategy(list);
-                w_list_setitem_inner(obj, index, current_gc_ref(value))
+                // `float_to_int_or_float` allocates the new storage, so the
+                // list and the item are livevars across it.
+                let roots = crate::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(obj);
+                let _ = roots.pin_root(value);
+                if is_plain_int1(value)
+                    && int_or_float_encode_int(plain_int_w(value)).is_some()
+                    && float_to_int_or_float(list)
+                {
+                    w_list_setitem_inner(roots.get(base), index, roots.get(base + 1))
+                } else {
+                    let obj = switch_to_object_strategy(list);
+                    w_list_setitem_inner(obj, index, roots.get(base + 1))
+                }
             }
         }
         ListStrategy::Bytes => {
@@ -3321,11 +3324,15 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
                 return false;
             }
             if is_bytes_strategy_item(value) {
+                let value = prepare_list_ref_store(obj, value);
+                let list = &mut *(obj as *mut W_ListObject);
                 list.bytes_items.set(idx as usize, w_bytes_block(value));
                 true
             } else {
+                let roots = crate::gc_roots::push_roots();
+                let _ = roots.pin_root(value);
                 let obj = switch_to_object_strategy(list);
-                w_list_setitem_inner(obj, index, current_gc_ref(value))
+                w_list_setitem_inner(obj, index, roots.get(roots.base()))
             }
         }
         ListStrategy::Ascii => {
@@ -3335,12 +3342,16 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
                 return false;
             }
             if is_ascii_strategy_item(value) {
+                let value = prepare_list_ref_store(obj, value);
+                let list = &mut *(obj as *mut W_ListObject);
                 list.ascii_items
                     .set(idx as usize, w_str_storage(value) as *const _);
                 true
             } else {
+                let roots = crate::gc_roots::push_roots();
+                let _ = roots.pin_root(value);
                 let obj = switch_to_object_strategy(list);
-                w_list_setitem_inner(obj, index, current_gc_ref(value))
+                w_list_setitem_inner(obj, index, roots.get(roots.base()))
             }
         }
     }
@@ -3461,18 +3472,20 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
         // listobject.py EmptyListStrategy.append: pick the matching
         // typed strategy first, then fall through to its append.
         ListStrategy::Empty | ListStrategy::Size => {
+            let roots = crate::gc_roots::push_roots();
+            let _ = roots.pin_root(value);
             let obj = switch_to_correct_strategy(list, value);
-            let value = current_gc_ref(value);
-            w_list_append_inner(obj, value);
+            w_list_append_inner(obj, roots.get(roots.base()));
         }
         ListStrategy::SimpleRange | ListStrategy::Range => {
+            let roots = crate::gc_roots::push_roots();
+            let _ = roots.pin_root(value);
             let obj = if is_plain_int1(value) {
                 switch_range_to_integer_strategy(list)
             } else {
                 switch_to_object_strategy(list)
             };
-            let value = current_gc_ref(value);
-            w_list_append_inner(obj, value);
+            w_list_append_inner(obj, roots.get(roots.base()));
         }
         // AbstractUnwrappedStrategy.append (listobject.py):
         //   if self.is_correct_type(w_item): l.append(self.unwrap(w_item)); return
@@ -3480,12 +3493,16 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
         ListStrategy::Object => {
             // ll_append (rlist.py): length = ll_length();
             // _ll_resize_ge(length+1); ll_setitem_fast(length, item).
+            // `l` and `newitem` are livevars across `_ll_resize_ge`, which may
+            // malloc.
             let length = ll_list_obj_length(list);
+            let roots = crate::gc_roots::push_roots();
+            let base = roots.base();
+            let _ = roots.pin_root(obj);
+            let _ = roots.pin_root(value);
             ll_list_obj_resize_ge(obj, length + 1);
-            let obj = current_gc_ref(obj);
-            let value = current_gc_ref(value);
-            let value = prepare_list_ref_store(obj, value);
-            let obj = current_gc_ref(obj);
+            let obj = roots.get(base);
+            let value = prepare_list_ref_store(obj, roots.get(base + 1));
             let list = &mut *(obj as *mut W_ListObject);
             ll_list_obj_setitem_fast(list, length, value);
         }
@@ -3495,19 +3512,25 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
                 // _ll_resize_ge(length+1); ll_setitem_fast(length, item).
                 let item = plain_int_w(value);
                 let length = ll_list_int_length(list);
+                let roots = crate::gc_roots::push_roots();
+                let _ = roots.pin_root(obj);
                 ll_list_int_resize_ge(obj, length + 1);
-                let obj = current_gc_ref(obj);
-                let list = &mut *(obj as *mut W_ListObject);
+                let list = &mut *(roots.get(roots.base()) as *mut W_ListObject);
                 ll_list_int_setitem_fast(list, length, item);
-            } else if is_float_strategy_item(value) && integer_to_int_or_float(list) {
-                let obj = current_gc_ref(obj);
-                let value = current_gc_ref(value);
-                w_list_append_inner(obj, value);
             } else {
-                let obj = switch_to_object_strategy(list);
-                let value = current_gc_ref(value);
-                let list = &mut *(obj as *mut W_ListObject);
-                list.object_push(value);
+                // `integer_to_int_or_float` allocates the new storage, so the
+                // list and the item are livevars across it.
+                let roots = crate::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(obj);
+                let _ = roots.pin_root(value);
+                if is_float_strategy_item(value) && integer_to_int_or_float(list) {
+                    w_list_append_inner(roots.get(base), roots.get(base + 1));
+                } else {
+                    let obj = switch_to_object_strategy(list);
+                    let list = &mut *(obj as *mut W_ListObject);
+                    list.object_push(roots.get(base + 1));
+                }
             }
         }
         ListStrategy::Float => {
@@ -3522,30 +3545,38 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
                 // _ll_resize_ge(length+1); ll_setitem_fast(length, item).
                 let item = w_float_get_value(value);
                 let length = ll_list_float_length(list);
+                let roots = crate::gc_roots::push_roots();
+                let _ = roots.pin_root(obj);
                 ll_list_float_resize_ge(obj, length + 1);
-                let obj = current_gc_ref(obj);
-                let list = &mut *(obj as *mut W_ListObject);
+                let list = &mut *(roots.get(roots.base()) as *mut W_ListObject);
                 ll_list_float_setitem_fast(list, length, item);
-            } else if is_plain_int1(value)
-                && int_or_float_encode_int(plain_int_w(value)).is_some()
-                && float_to_int_or_float(list)
-            {
-                let obj = current_gc_ref(obj);
-                let value = current_gc_ref(value);
-                w_list_append_inner(obj, value);
             } else {
-                let obj = switch_to_object_strategy(list);
-                let value = current_gc_ref(value);
-                let list = &mut *(obj as *mut W_ListObject);
-                list.object_push(value);
+                // `float_to_int_or_float` allocates the new storage, so the
+                // list and the item are livevars across it.
+                let roots = crate::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(obj);
+                let _ = roots.pin_root(value);
+                if is_plain_int1(value)
+                    && int_or_float_encode_int(plain_int_w(value)).is_some()
+                    && float_to_int_or_float(list)
+                {
+                    w_list_append_inner(roots.get(base), roots.get(base + 1));
+                } else {
+                    let obj = switch_to_object_strategy(list);
+                    let list = &mut *(obj as *mut W_ListObject);
+                    list.object_push(roots.get(base + 1));
+                }
             }
         }
         ListStrategy::IntOrFloat => {
             if let Some(item) = int_or_float_encode_item(value) {
                 list.int_items.push(item);
             } else {
+                let roots = crate::gc_roots::push_roots();
+                let _ = roots.pin_root(value);
                 let obj = switch_to_object_strategy(list);
-                let value = current_gc_ref(value);
+                let value = roots.get(roots.base());
                 let list = &mut *(obj as *mut W_ListObject);
                 list.object_push(value);
             }
@@ -3553,22 +3584,26 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
         ListStrategy::Bytes => {
             if is_bytes_strategy_item(value) {
                 let value = prepare_list_ref_store(obj, value);
-                let obj = current_gc_ref(obj);
                 let list = &*(obj as *const W_ListObject);
                 // At capacity, route the grow through the list the way
                 // `object_push` does: the fresh block reaches `bytes_items`
                 // with the owner barrier directly in front of the store.
+                // The grow returns `value` at its current address; the list
+                // is a livevar across it.
+                let roots = crate::gc_roots::push_roots();
+                let _ = roots.pin_root(obj);
                 let value = if list.bytes_items.spare_capacity() == 0 {
                     w_list_grow_bytes_block(obj, value)
                 } else {
                     value
                 };
-                let obj = current_gc_ref(obj);
-                let list = &mut *(obj as *mut W_ListObject);
+                let list = &mut *(roots.get(roots.base()) as *mut W_ListObject);
                 list.bytes_items.push(w_bytes_block(value));
             } else {
+                let roots = crate::gc_roots::push_roots();
+                let _ = roots.pin_root(value);
                 let obj = switch_to_object_strategy(list);
-                let value = current_gc_ref(value);
+                let value = roots.get(roots.base());
                 let list = &mut *(obj as *mut W_ListObject);
                 list.object_push(value);
             }
@@ -3576,19 +3611,23 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
         ListStrategy::Ascii => {
             if is_ascii_strategy_item(value) {
                 let value = prepare_list_ref_store(obj, value);
-                let obj = current_gc_ref(obj);
                 let list = &*(obj as *const W_ListObject);
+                // The grow returns `value` at its current address; the list
+                // is a livevar across it.
+                let roots = crate::gc_roots::push_roots();
+                let _ = roots.pin_root(obj);
                 let value = if list.ascii_items.spare_capacity() == 0 {
                     w_list_grow_ascii_block(obj, value)
                 } else {
                     value
                 };
-                let obj = current_gc_ref(obj);
-                let list = &mut *(obj as *mut W_ListObject);
+                let list = &mut *(roots.get(roots.base()) as *mut W_ListObject);
                 list.ascii_items.push(w_str_storage(value) as *const _);
             } else {
+                let roots = crate::gc_roots::push_roots();
+                let _ = roots.pin_root(value);
                 let obj = switch_to_object_strategy(list);
-                let value = current_gc_ref(value);
+                let value = roots.get(roots.base());
                 let list = &mut *(obj as *mut W_ListObject);
                 list.object_push(value);
             }
@@ -4402,7 +4441,6 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
             if is_bytes_strategy_item(value) {
                 let idx = normalize_insert_index(index, list.bytes_items.len());
                 let value = prepare_list_ref_store(obj, value);
-                let obj = current_gc_ref(obj);
                 let list = &*(obj as *const W_ListObject);
                 // Same reservation the append arm makes: `insert` may not
                 // publish a fresh block itself.
@@ -4411,7 +4449,7 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
                 } else {
                     value
                 };
-                let obj = current_gc_ref(obj);
+                let obj = crate::gc_roots::shadow_stack_get(root_base);
                 let list = &mut *(obj as *mut W_ListObject);
                 list.bytes_items.insert(idx, w_bytes_block(value));
                 list.sync_allocated(old_size);
@@ -4428,14 +4466,13 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
             if is_ascii_strategy_item(value) {
                 let idx = normalize_insert_index(index, list.ascii_items.len());
                 let value = prepare_list_ref_store(obj, value);
-                let obj = current_gc_ref(obj);
                 let list = &*(obj as *const W_ListObject);
                 let value = if list.ascii_items.spare_capacity() == 0 {
                     w_list_grow_ascii_block(obj, value)
                 } else {
                     value
                 };
-                let obj = current_gc_ref(obj);
+                let obj = crate::gc_roots::shadow_stack_get(root_base);
                 let list = &mut *(obj as *mut W_ListObject);
                 list.ascii_items
                     .insert(idx, w_str_storage(value) as *const _);
@@ -4572,9 +4609,8 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
         }
     };
     if result.is_some() {
-        // The object-strategy remove runs the before-move barrier, whose
-        // entry is a safepoint.  Reload the list the outer bracket kept live
-        // before updating its accounting fields.
+        // Read the list back from the slot the outer bracket kept live before
+        // updating its accounting fields.
         let list = &mut *(crate::gc_roots::shadow_stack_get(root_base) as *mut W_ListObject);
         list.sync_allocated(old_size);
     }
@@ -4645,14 +4681,17 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> Option<PyObjectRef> {
         ListStrategy::Empty | ListStrategy::Size => PY_NULL,
         ListStrategy::SimpleRange => {
             let length = range_list_length(list);
+            // The list is a livevar across the `w_int_new` malloc.
+            let roots = crate::gc_roots::push_roots();
+            let obj_slot = roots.base();
+            let _ = roots.pin_root(obj);
             let result = w_int_new((length - 1) as i64);
             let result_slot = crate::gc_roots::shadow_stack_len();
             let _ = crate::gc_roots::pin_root(result);
+            let obj = roots.get(obj_slot);
             if length > 1 {
-                let obj = current_gc_ref(obj);
                 let _ = install_range_state(obj, ListStrategy::SimpleRange, &[(length - 1) as i64]);
             } else {
-                let obj = current_gc_ref(obj);
                 let list = &mut *(obj as *mut W_ListObject);
                 list.items = std::ptr::null_mut();
                 list.strategy = ListStrategy::Empty;
@@ -4662,10 +4701,14 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> Option<PyObjectRef> {
         ListStrategy::Range => {
             let length = range_list_length(list);
             let (start, step) = range_list_start_step(list);
+            // The list is a livevar across the `w_int_new` malloc.
+            let roots = crate::gc_roots::push_roots();
+            let obj_slot = roots.base();
+            let _ = roots.pin_root(obj);
             let result = w_int_new(start + ((length - 1) as i64) * step);
             let result_slot = crate::gc_roots::shadow_stack_len();
             let _ = crate::gc_roots::pin_root(result);
-            let obj = current_gc_ref(obj);
+            let obj = roots.get(obj_slot);
             let _ = install_range_state(
                 obj,
                 ListStrategy::Range,
@@ -4871,8 +4914,20 @@ pub unsafe fn w_list_init_items(obj: PyObjectRef, items: Vec<PyObjectRef>) {
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(obj);
-    let strategy = list_strategy_for(&items);
-    let mut storage = build_list_storage(&items, strategy);
+    // `items` is a native Vec: pin it before `list_strategy_for` /
+    // `build_list_storage`, which allocate the replacement block
+    // (`descr_sort`'s `finally` install).
+    let items_base = crate::gc_roots::pin_roots(&items);
+    let n = items.len();
+    let mut live_items = Vec::with_capacity(n);
+    for i in 0..n {
+        live_items.push(crate::gc_roots::shadow_stack_get(items_base + i));
+    }
+    let strategy = list_strategy_for(&live_items);
+    for i in 0..n {
+        live_items[i] = crate::gc_roots::shadow_stack_get(items_base + i);
+    }
+    let mut storage = build_list_storage(&live_items, strategy);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     // `w_list_clear` is the twin destructive re-installation and holds the
     // stripe lock across its `drop_object_items`; a concurrent reader must not
@@ -4898,9 +4953,8 @@ pub unsafe fn w_list_init_items(obj: PyObjectRef, items: Vec<PyObjectRef>) {
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
-    // `drop_object_items`' `try_gc_owns_object` query is a safepoint and the
-    // fresh blocks have no heap edge until the stores below, so close their pin
-    // bracket only once it is behind them (`IntArray::install`).
+    // The fresh blocks have no heap edge until the stores below, so their pin
+    // bracket closes only once those stores are behind it (`IntArray::install`).
     if list.strategy == ListStrategy::Object {
         list.drop_object_items();
     } else {

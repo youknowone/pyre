@@ -7,7 +7,6 @@ use rustpython_compiler::{ast, parser};
 use rustpython_wtf8::Wtf8Buf;
 use std::collections::HashSet;
 use std::io::Write;
-use std::sync::OnceLock;
 
 /// Short-lived normalizer for the three-argument generator `throw` surface.
 ///
@@ -28,14 +27,15 @@ pub(crate) struct ExceptionNormalization {
 /// absence forever.
 #[majit_macros::dont_look_inside]
 pub fn exception_object_matches_stop_iteration(exc_object: PyObjectRef) -> bool {
-    static STOP_ITERATION_CLASS: OnceLock<usize> = OnceLock::new();
+    static STOP_ITERATION_CLASS: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
     let stop_iteration = match STOP_ITERATION_CLASS.get() {
-        Some(&class) => class as PyObjectRef,
+        Some(class) => class,
         None => {
             let Some(class) = crate::builtins::lookup_exc_class("StopIteration") else {
                 return false;
             };
-            let _ = STOP_ITERATION_CLASS.set(class as usize);
+            STOP_ITERATION_CLASS.set(class);
             class
         }
     };
@@ -49,14 +49,15 @@ pub fn exception_object_matches_stop_iteration(exc_object: PyObjectRef) -> bool 
 /// `jit_fnaddr`, both of which a refactor would break silently.
 #[majit_macros::dont_look_inside]
 pub fn exception_object_matches_stop_async_iteration(exc_object: PyObjectRef) -> bool {
-    static STOP_ASYNC_ITERATION_CLASS: OnceLock<usize> = OnceLock::new();
+    static STOP_ASYNC_ITERATION_CLASS: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
     let stop_async_iteration = match STOP_ASYNC_ITERATION_CLASS.get() {
-        Some(&class) => class as PyObjectRef,
+        Some(class) => class,
         None => {
             let Some(class) = crate::builtins::lookup_exc_class("StopAsyncIteration") else {
                 return false;
             };
-            let _ = STOP_ASYNC_ITERATION_CLASS.set(class as usize);
+            STOP_ASYNC_ITERATION_CLASS.set(class);
             class
         }
     };
@@ -602,6 +603,47 @@ pub unsafe fn pyerror_value_error_to_exc_object(
 }
 
 impl PyError {
+    /// Pin `exc_object` on `roots` and return that slot.
+    ///
+    /// `OperationError` (`pypy/interpreter/error.py`) is a GC object, so a
+    /// collecting call updates `w_value` in place. This carrier is a native
+    /// copy of that pointer. A null `exc_object` has not been materialised
+    /// and is not pinned. [`PyError::reload_exc_object`] writes the forwarded
+    /// instance back into the copy. The caller owns the bracket: other live
+    /// pointers pinned on the same `roots` stay beside this slot.
+    pub fn pin_exc_object(&self, roots: &pyre_object::gc_roots::RootScope) -> Option<usize> {
+        if self.exc_object.is_null() {
+            None
+        } else {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(self.exc_object);
+            Some(slot)
+        }
+    }
+
+    /// Publish `exc_object` on `roots` without normalizing it and return that
+    /// slot, for a caller that publishes its whole livevar set first and
+    /// then normalizes the range once (`gc_roots::pin_roots`). A null
+    /// `exc_object` is not published.
+    pub fn publish_exc_object(&self, roots: &pyre_object::gc_roots::RootScope) -> Option<usize> {
+        if self.exc_object.is_null() {
+            None
+        } else {
+            Some(roots.publish(&[self.exc_object]))
+        }
+    }
+
+    /// Write the live `exc_object` out of `slot` into this carrier.
+    pub fn reload_exc_object(
+        &mut self,
+        roots: &pyre_object::gc_roots::RootScope,
+        slot: Option<usize>,
+    ) {
+        if let Some(slot) = slot {
+            self.exc_object = roots.get(slot);
+        }
+    }
+
     /// Forward the up-to-three GC-managed references a `PyError` holds — the
     /// cached exception object and the lazy NameError/AttributeError name/obj
     /// context — to a root-walk visitor. The precise collector does not reach
@@ -2626,8 +2668,8 @@ fn wrap_pos(num: i64) -> PyObjectRef {
 }
 
 fn unraisable_hook_args_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         crate::_structseq::make_struct_seq(
             "sys.UnraisableHookArgs",
             &[
@@ -2637,8 +2679,8 @@ fn unraisable_hook_args_type() -> PyObjectRef {
                 "err_msg",
                 "object",
             ],
-        ) as usize
-    }) as PyObjectRef
+        )
+    })
 }
 
 /// Resolve an exception instance's actual Python class name for display.

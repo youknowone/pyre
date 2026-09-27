@@ -214,6 +214,18 @@ impl Nursery {
         self.rotating.len()
     }
 
+    /// `addr` falls in a nursery arena [`Self::debug_rotate`] has retired.
+    ///
+    /// The current arena is not in `rotating`. Those arenas are protected, so
+    /// a store check must use this range and must not read the header.
+    pub fn contains_retired(&self, addr: usize) -> bool {
+        let size = self.size;
+        self.rotating.iter().any(|&arena| {
+            let start = arena as usize;
+            addr >= start && addr < start + size
+        })
+    }
+
     /// `_minor_collection` under `gc_nursery_debug` resets the recycled range
     /// in `arena_reset` mode 3, the one that fills it with garbage.
     ///

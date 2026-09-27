@@ -15,7 +15,6 @@ use super::stginfo::ParamFunc;
 use super::type_ns_store;
 use pyre_object::PyObjectRef;
 use rustpython_host_env::ctypes as host_ctypes;
-use std::sync::OnceLock;
 
 /// Reserved instance-dict key holding the backing `bytearray` (root storage,
 /// or — for a sub-view — a shared reference to the **root's** bytearray).
@@ -135,18 +134,20 @@ pub(super) fn pyobj_container_get(num: usize) -> Option<PyObjectRef> {
     (!target.is_null()).then_some(target)
 }
 
-static CDATA_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
-static SIMPLECDATA_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static CDATA_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
+static SIMPLECDATA_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// PyPy/CPython/RustPython's private `_CData` base shared by every ctypes
 /// value family.  It is discovered as `Structure.__base__` rather than
 /// exported from the module namespace.
 pub(super) fn cdata_type() -> PyObjectRef {
-    *CDATA_TYPE_OBJ.get_or_init(|| {
+    CDATA_TYPE_OBJ.get_or_init(|| {
         let tp = pyre_interpreter::typedef::make_builtin_type("_CData", init_cdata_type);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        super::finish_cpython_type(tp, "_ctypes", true) as usize
-    }) as PyObjectRef
+        super::finish_cpython_type(tp, "_ctypes", true)
+    })
 }
 
 fn init_cdata_type(ns: PyObjectRef) {
@@ -327,13 +328,14 @@ fn cdata_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter:
     Ok(pyre_object::w_none())
 }
 
-static UNPICKLE_FUNCTION: OnceLock<usize> = OnceLock::new();
+static UNPICKLE_FUNCTION: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `_ctypes._unpickle`, the callable [`cdata_reduce`] names.
 pub(super) fn unpickle_function() -> PyObjectRef {
-    *UNPICKLE_FUNCTION.get_or_init(|| {
-        pyre_interpreter::make_builtin_function_with_arity("_unpickle", unpickle, 2) as usize
-    }) as PyObjectRef
+    UNPICKLE_FUNCTION.get_or_init(|| {
+        pyre_interpreter::make_builtin_function_with_arity("_unpickle", unpickle, 2)
+    })
 }
 
 /// `_ctypes._unpickle` -- `_ctypes__unpickle_impl`.
@@ -535,7 +537,7 @@ fn cdata_from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpret
 
 /// The native `_SimpleCData` type object (cached, `hasdict=true`).
 pub(super) fn simplecdata_type() -> PyObjectRef {
-    *SIMPLECDATA_TYPE_OBJ.get_or_init(|| {
+    SIMPLECDATA_TYPE_OBJ.get_or_init(|| {
         let tp = pyre_interpreter::typedef::make_builtin_type_with_base(
             "_SimpleCData",
             init_simplecdata_type,
@@ -547,8 +549,8 @@ pub(super) fn simplecdata_type() -> PyObjectRef {
             // `CREATE_TYPE(... PyCSimpleType_Type ...)`.
             (*tp).w_class = super::metaclass::pycsimpletype_type();
         }
-        super::finish_cpython_type(tp, "_ctypes", true) as usize
-    }) as PyObjectRef
+        super::finish_cpython_type(tp, "_ctypes", true)
+    })
 }
 
 fn init_simplecdata_type(ns: PyObjectRef) {
@@ -628,7 +630,7 @@ fn simplecdata_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interprete
         let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
         return Ok(pyre_object::w_str_new_managed(&format!(
             "<{name} object at {}>",
-            pyre_interpreter::display::repr_addr(obj as usize)
+            pyre_interpreter::display::repr_gc_addr(obj)
         )));
     }
     let tc =
@@ -968,10 +970,17 @@ pub(super) fn cdata_len(obj: PyObjectRef) -> Option<usize> {
 pub fn cdata_buffer_view(
     obj: PyObjectRef,
 ) -> Option<(PyObjectRef, usize, usize, String, usize, Vec<usize>)> {
-    if !is_cdata_instance(obj) {
+    if obj.is_null() {
         return None;
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::pin_roots(&[obj]);
+    if !is_cdata_instance(pyre_object::gc_roots::shadow_stack_get(slot)) {
+        return None;
+    }
+    let obj = pyre_object::gc_roots::shadow_stack_get(slot);
     let ba = cdata_buffer(obj)?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(slot);
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let info = super::stginfo::stginfo_of(cls);
     let kind = info
@@ -979,9 +988,9 @@ pub fn cdata_buffer_view(
         .unwrap_or(ParamFunc::Other);
     let shape = ctype_shape(cls);
     let leaf = ctype_leaf(cls);
-    let is_funcptr = unsafe {
-        pyre_interpreter::baseobjspace::isinstance_w(obj, super::funcptr::cfuncptr_type())
-    };
+    let funcptr_cls = super::funcptr::cfuncptr_type();
+    let obj = pyre_object::gc_roots::shadow_stack_get(slot);
+    let is_funcptr = unsafe { pyre_interpreter::baseobjspace::isinstance_w(obj, funcptr_cls) };
     let itemsize = if is_funcptr {
         host_ctypes::pointer_size()
     } else {
@@ -1203,7 +1212,21 @@ pub(super) fn owns_buffer(obj: PyObjectRef) -> bool {
 /// Whether `obj` is an instance of the common `_CData` base, matching PyPy's
 /// CData inheritance test without a parallel per-thread type registry.
 pub(super) fn is_cdata_instance(obj: PyObjectRef) -> bool {
-    !obj.is_null() && unsafe { pyre_interpreter::baseobjspace::isinstance_w(obj, cdata_type()) }
+    if obj.is_null() {
+        return false;
+    }
+    // `cdata_type()` is a `RootedOnceRef` first-use constructor and can
+    // collect. Pin `obj` on the interpreter root stack and reload that
+    // slot; `reload_top_root` reads the JIT `majit_gc` shadow stack.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::pin_roots(&[obj]);
+    let cls = cdata_type();
+    unsafe {
+        pyre_interpreter::baseobjspace::isinstance_w(
+            pyre_object::gc_roots::shadow_stack_get(slot),
+            cls,
+        )
+    }
 }
 
 /// A field/element sub-view of `parent` at `field_offset`, aliasing its memory
@@ -1574,8 +1597,11 @@ pub(super) fn share_objects_for_cast(result: PyObjectRef, source: PyObjectRef) {
             unsafe { pyre_object::w_dict_setitem_str(source_dict, OBJECTS_KEY, objects) };
         }
     }
+    // `test_p2a_objects` keys the shared keepalive dict by `id(array)`.
+    // `ObjSpace.id` is `id_or_identityhash`, the shadow of a nursery object,
+    // not the address it currently occupies.
     let source = pyre_object::gc_roots::shadow_stack_get(source_slot);
-    let identity_key = pyre_object::w_int_new(source as usize as i64);
+    let identity_key = pyre_interpreter::baseobjspace::id(source);
     let _ = pyre_object::gc_roots::pin_root(identity_key);
     let key_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let source = pyre_object::gc_roots::shadow_stack_get(source_slot);

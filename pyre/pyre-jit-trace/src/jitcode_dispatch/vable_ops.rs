@@ -801,6 +801,42 @@ fn current_inline_vable_target<Sym: WalkSym>(
     }
 }
 
+/// The concrete frame whose `locals_cells_stack_w` a `setarrayitem_vable` on
+/// `vable` writes.  `_opimpl_setarrayitem_vable` sends a non-standard box
+/// through `_opimpl_setarrayitem_gc_any` → `execute_setarrayitem_gc`, and
+/// `execute_and_record` performs the store (`executor.py do_setarrayitem_gc`
+/// → `cpu.bh_setarrayitem_gc_r`) while recording it, so the array holds the
+/// value `heapcache.setarrayitem` publishes and a later
+/// `_do_getarrayitem_gc_any` sanity load reads it back.
+///
+/// The walk's own frame is either the forward-inline callee published by
+/// `InlineConcreteFrameGuard`, or, for a bridge-resume level, the frame
+/// `setup_reconstructed_callee_frame` built and left in `callee_shadow`
+/// without publishing it (see `drive_bridge_frame_subwalk`).  Both are
+/// allocated by the walk; the strict-fold arm above already writes the
+/// second.
+fn own_frame_array_store_target<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    vable: OpRef,
+) -> Option<usize> {
+    if let Some(frame) = current_inline_vable_target(ctx, vable) {
+        return Some(frame);
+    }
+    let frame = ctx
+        .frame_state
+        .borrow()
+        .callee_shadow
+        .as_ref()
+        .map_or(0, |shadow| shadow.concrete_frame);
+    if frame == 0 {
+        return None;
+    }
+    match ctx.trace_ctx.lookup_opref_concrete(vable) {
+        Some(Value::Ref(value)) if value.as_usize() == frame => Some(frame),
+        _ => None,
+    }
+}
+
 pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -833,7 +869,13 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
             }
             crate::state::store_live_frame_static_int(shadow.concrete_frame, field_index, value);
         }
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        let vable = read_ref_reg_raw(code, op, 0, ctx)?;
+        // Same split as `setarrayitem_vable`: only the standard virtualizable
+        // folds the write away. `_opimpl_setfield_vable` records `SETFIELD_GC`
+        // for any other box.
+        if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
     }
     let obj = read_ref_reg_raw(code, op, 0, ctx)?;
     // Same unseeded-register guard as `getfield_vable_via_metainterp`:
@@ -1408,7 +1450,15 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
                     concrete,
                 );
             }
-            return Ok((DispatchOutcome::Continue, op.next_pc));
+            let vable = read_ref_reg_raw(code, op, 0, ctx)?;
+            // `_opimpl_setarrayitem_vable` records `SETARRAYITEM_GC` for every
+            // box that is not `virtualizable_boxes[-1]`. The strict fold is
+            // that standard arm (shadow only). An inlined callee frame is the
+            // other arm: keep the live write above and fall through so the
+            // same store is recorded on the array `getfield_gc` reads.
+            if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
         }
     }
     let vable = read_ref_reg_raw(code, op, 0, ctx)?;
@@ -1496,7 +1546,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         VableArrayStore::OutOfVable => None,
     };
     if index_value >= 0
-        && let Some(frame) = current_inline_vable_target(ctx, vable)
+        && let Some(frame) = own_frame_array_store_target(ctx, vable)
     {
         if let Some(frame) = durable_resume_frame(ctx, frame) {
             fbw_arm_durable_frame_undo(frame);

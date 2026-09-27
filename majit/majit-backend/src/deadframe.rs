@@ -752,6 +752,8 @@ impl JitFrameDeadFrame {
         unsafe { *((self.jf_gcref().0 + JF_SAVEDATA_OFS as usize) as *mut usize) = data.0 };
     }
 
+    /// `cpu.grab_exc_value(deadframe)` (`llmodel.py`): return
+    /// `deadframe.jf_guard_exc` without clearing the field.
     #[inline]
     pub fn grab_exc_value(&self) -> GcRef {
         GcRef(unsafe { *((self.jf_gcref().0 + JF_GUARD_EXC_OFS as usize) as *const usize) })

@@ -147,6 +147,19 @@ impl Buffer {
         }
     }
 
+    /// `BufferView.needs_release` (`pypy/interpreter/buffer.py`): whether
+    /// [`Self::release_export`] has a side effect on the exporter.
+    /// `BytearrayBuffer.needs_release` answers true; the array and external
+    /// exporters here count their exports the same way, and `bytes` counts
+    /// nothing.  A `Sub` answers for its parent.
+    pub fn needs_release(&self) -> bool {
+        match self {
+            Buffer::Byte { .. } | Buffer::Array { .. } | Buffer::External { .. } => true,
+            Buffer::String { .. } => false,
+            Buffer::Sub { parent, .. } => parent.needs_release(),
+        }
+    }
+
     /// `SubBuffer(parent, offset, size)` (`rpython/rlib/buffer.py`).  A
     /// `Sub` over a `Sub` is collapsed to a single window over the inner
     /// buffer (`buffer.py:397` — "don't nest them"): the offsets sum and the

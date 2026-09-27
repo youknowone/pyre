@@ -57,22 +57,50 @@ mod imp {
         (unsafe { w_int_get_value(o) }) as i32
     }
 
-    fn seq_items(o: PyObjectRef, what: &str) -> Result<Vec<PyObjectRef>, PyError> {
+    fn seq_len(o: PyObjectRef, what: &str) -> Result<usize, PyError> {
         unsafe {
             if is_list(o) {
-                let n = w_list_len(o);
-                Ok((0..n).filter_map(|i| w_list_getitem(o, i as i64)).collect())
+                Ok(w_list_len(o))
             } else if is_tuple(o) {
-                let n = w_tuple_len(o);
-                Ok((0..n)
-                    .filter_map(|i| w_tuple_getitem(o, i as i64))
-                    .collect())
+                Ok(w_tuple_len(o))
             } else {
                 Err(PyError::type_error(format!(
                     "fork_exec(): {what} must be a list or tuple"
                 )))
             }
         }
+    }
+
+    fn seq_getitem(o: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+        unsafe {
+            if is_list(o) {
+                w_list_getitem(o, index as i64)
+            } else if is_tuple(o) {
+                w_tuple_getitem(o, index as i64)
+            } else {
+                None
+            }
+        }
+    }
+
+    fn seq_items(o: PyObjectRef, what: &str) -> Result<Vec<PyObjectRef>, PyError> {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let seq_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(o);
+        let n = seq_len(pyre_object::gc_roots::shadow_stack_get(seq_slot), what)?;
+        let item_base = pyre_object::gc_roots::shadow_stack_len();
+        let mut count = 0;
+        for i in 0..n {
+            let item = match seq_getitem(pyre_object::gc_roots::shadow_stack_get(seq_slot), i) {
+                Some(item) => item,
+                None => continue,
+            };
+            let _ = pyre_object::gc_roots::pin_root(item);
+            count += 1;
+        }
+        Ok((0..count)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(item_base + i))
+            .collect())
     }
 
     fn obj_to_cstring(o: PyObjectRef, what: &str) -> Result<CString, PyError> {
@@ -96,10 +124,27 @@ mod imp {
     }
 
     fn collect_cstrings(o: PyObjectRef, what: &str) -> Result<Vec<CString>, PyError> {
-        seq_items(o, what)?
-            .into_iter()
-            .map(|x| obj_to_cstring(x, what))
-            .collect()
+        // `obj_to_cstring` / `fsencode` allocate, so the sequence and the
+        // current item are re-read from the shadow stack rather than held
+        // as a `Vec` of raw pointers across that call.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let seq_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(o);
+        let n = seq_len(pyre_object::gc_roots::shadow_stack_get(seq_slot), what)?;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let item = match seq_getitem(pyre_object::gc_roots::shadow_stack_get(seq_slot), i) {
+                Some(item) => item,
+                None => continue,
+            };
+            let item_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(item);
+            out.push(obj_to_cstring(
+                pyre_object::gc_roots::shadow_stack_get(item_slot),
+                what,
+            )?);
+        }
+        Ok(out)
     }
 
     /// `interp_subprocess.py:185-187`:
@@ -112,15 +157,26 @@ mod imp {
     /// Process arguments, unlike the already-fsencoded executable/env arrays,
     /// accept `os.PathLike` entries.
     fn collect_fsencoded_cstrings(o: PyObjectRef, what: &str) -> Result<Vec<CString>, PyError> {
-        seq_items(o, what)?
-            .into_iter()
-            .map(|x| {
-                let bytes = pyre_interpreter::gateway::fsencode_bytes_w(x)?;
-                CString::new(bytes).map_err(|_| {
-                    PyError::value_error(format!("fork_exec(): embedded null in {what}"))
-                })
-            })
-            .collect()
+        let _roots = pyre_object::gc_roots::push_roots();
+        let seq_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(o);
+        let n = seq_len(pyre_object::gc_roots::shadow_stack_get(seq_slot), what)?;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let item = match seq_getitem(pyre_object::gc_roots::shadow_stack_get(seq_slot), i) {
+                Some(item) => item,
+                None => continue,
+            };
+            let item_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(item);
+            let bytes = pyre_interpreter::gateway::fsencode_bytes_w(
+                pyre_object::gc_roots::shadow_stack_get(item_slot),
+            )?;
+            out.push(CString::new(bytes).map_err(|_| {
+                PyError::value_error(format!("fork_exec(): embedded null in {what}"))
+            })?);
+        }
+        Ok(out)
     }
 
     fn opt_fsencoded_cstring(o: PyObjectRef, what: &str) -> Result<Option<CString>, PyError> {
@@ -164,8 +220,21 @@ mod imp {
         }
     }
 
+    /// `interp_subprocess.fork_exec`:
+    ///
+    /// ```python
+    /// groups_w = space.unpackiterable(w_groups_list)
+    /// for i, w_group in enumerate(groups_w):
+    ///     gid_val = space.int_w(w_group)
+    /// ```
+    ///
+    /// The sequence stays rooted and each item is fetched right before its
+    /// `int_w`, which can run `__index__` and collect.
     fn collect_gids(o: PyObjectRef) -> Result<Vec<u32>, PyError> {
-        let gids = seq_items(o, "gids")?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let seq_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(o);
+        let n = seq_len(pyre_object::gc_roots::shadow_stack_get(seq_slot), "gids")?;
         // `interp_subprocess.fork_exec` rejects the sequence before allocating
         // its raw gid_t array.  POSIX permits sysconf to be indeterminate;
         // PyPy's configure-time fallback for that case is 64.
@@ -175,29 +244,34 @@ mod imp {
         } else {
             configured_max as usize
         };
-        if gids.len() > max_groups {
+        if n > max_groups {
             return Err(PyError::value_error("too many groups"));
         }
-        gids.into_iter()
-            .map(|x| {
-                // PyPy `fork_exec` converts supplementary groups separately
-                // from the uid/gid fields: `-1` is not an unset sentinel here.
-                // CPython `_Py_Gid_Converter` likewise exposes negative and
-                // over-gid_t entries as ValueError for `extra_groups`.
-                let value = match pyre_interpreter::baseobjspace::int_w(x) {
-                    Ok(value) => value,
-                    Err(error) if error.kind == pyre_interpreter::PyErrorKind::OverflowError => {
-                        return Err(PyError::value_error("group id is greater than maximum"));
-                    }
-                    Err(error) => return Err(error),
-                };
-                if value < 0 {
-                    return Err(PyError::value_error("group id is negative"));
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let Some(x) = seq_getitem(pyre_object::gc_roots::shadow_stack_get(seq_slot), i) else {
+                continue;
+            };
+            // PyPy `fork_exec` converts supplementary groups separately
+            // from the uid/gid fields: `-1` is not an unset sentinel here.
+            // CPython `_Py_Gid_Converter` likewise exposes negative and
+            // over-gid_t entries as ValueError for `extra_groups`.
+            let value = match pyre_interpreter::baseobjspace::int_w(x) {
+                Ok(value) => value,
+                Err(error) if error.kind == pyre_interpreter::PyErrorKind::OverflowError => {
+                    return Err(PyError::value_error("group id is greater than maximum"));
                 }
+                Err(error) => return Err(error),
+            };
+            if value < 0 {
+                return Err(PyError::value_error("group id is negative"));
+            }
+            out.push(
                 u32::try_from(value)
-                    .map_err(|_| PyError::value_error("group id is greater than maximum"))
-            })
-            .collect()
+                    .map_err(|_| PyError::value_error("group id is greater than maximum"))?,
+            );
+        }
+        Ok(out)
     }
 
     /// Decoded `fork_exec` arguments, allocated before `fork()` so the

@@ -501,10 +501,9 @@ fn register_at_fork(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 
 /// `os.terminal_size` structseq — `(columns, lines)`.
 fn terminal_size_seq_type() -> PyObjectRef {
-    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *T.get_or_init(|| {
-        crate::_structseq::make_struct_seq("os.terminal_size", &["columns", "lines"]) as usize
-    }) as PyObjectRef
+    static T: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    T.get_or_init(|| crate::_structseq::make_struct_seq("os.terminal_size", &["columns", "lines"]))
 }
 
 /// `uname_result` structseq — `(sysname, nodename, release, version,
@@ -513,8 +512,9 @@ fn terminal_size_seq_type() -> PyObjectRef {
 /// this module is `posix`, `nt` on Windows, which has the type even though it
 /// has no `uname` to build one with.
 fn uname_result_seq_type() -> PyObjectRef {
-    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *T.get_or_init(|| {
+    static T: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    T.get_or_init(|| {
         crate::_structseq::make_struct_seq(
             if cfg!(windows) {
                 "nt.uname_result"
@@ -522,15 +522,16 @@ fn uname_result_seq_type() -> PyObjectRef {
                 "posix.uname_result"
             },
             &["sysname", "nodename", "release", "version", "machine"],
-        ) as usize
-    }) as PyObjectRef
+        )
+    })
 }
 
 /// `os.statvfs_result` structseq — 10 sequence slots with `f_fsid` as an
 /// extra named field (`n_sequence_fields=10`, `n_fields=11`).
 fn statvfs_result_seq_type() -> PyObjectRef {
-    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *T.get_or_init(|| {
+    static T: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    T.get_or_init(|| {
         crate::_structseq::make_struct_seq_with_extra(
             "os.statvfs_result",
             &[
@@ -546,8 +547,8 @@ fn statvfs_result_seq_type() -> PyObjectRef {
                 "f_namemax",
             ],
             &["f_fsid"],
-        ) as usize
-    }) as PyObjectRef
+        )
+    })
 }
 
 /// `posix.waitid_result` structseq — the five `siginfo_t` fields `waitid`
@@ -556,13 +557,14 @@ fn statvfs_result_seq_type() -> PyObjectRef {
 /// one CPython 3.14 publishes.
 #[cfg(all(unix, not(feature = "sandbox")))]
 fn waitid_result_seq_type() -> PyObjectRef {
-    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *T.get_or_init(|| {
+    static T: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    T.get_or_init(|| {
         crate::_structseq::make_struct_seq(
             "posix.waitid_result",
             &["si_pid", "si_uid", "si_signo", "si_status", "si_code"],
-        ) as usize
-    }) as PyObjectRef
+        )
+    })
 }
 
 /// `posix.sched_param` structseq — the single field `app_posix.py`
@@ -580,8 +582,9 @@ fn waitid_result_seq_type() -> PyObjectRef {
     )
 ))]
 fn sched_param_seq_type() -> PyObjectRef {
-    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *T.get_or_init(|| {
+    static T: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    T.get_or_init(|| {
         let _roots = pyre_object::gc_roots::push_roots();
         let ty = crate::_structseq::make_struct_seq("posix.sched_param", &["sched_priority"]);
         let _ = pyre_object::gc_roots::pin_root(ty);
@@ -616,9 +619,9 @@ fn sched_param_seq_type() -> PyObjectRef {
                 pyre_object::gc_roots::shadow_stack_get(reduce_slot),
             );
             crate::baseobjspace::mutated(pyre_object::gc_roots::shadow_stack_get(ty_slot), None);
-            pyre_object::gc_roots::shadow_stack_get(ty_slot) as usize
+            pyre_object::gc_roots::shadow_stack_get(ty_slot)
         }
-    }) as PyObjectRef
+    })
 }
 
 /// `os_sched_param_reduce` — `(type(self), (self[0],))`, the one shape this
@@ -751,8 +754,9 @@ fn host_cpu_count() -> i64 {
 /// name is the one `pickle` imports to resolve the type, so it has to be the
 /// module the host actually has.
 fn times_result_seq_type() -> PyObjectRef {
-    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *T.get_or_init(|| {
+    static T: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    T.get_or_init(|| {
         crate::_structseq::make_struct_seq(
             if cfg!(windows) {
                 "nt.times_result"
@@ -766,8 +770,8 @@ fn times_result_seq_type() -> PyObjectRef {
                 "children_system",
                 "elapsed",
             ],
-        ) as usize
-    }) as PyObjectRef
+        )
+    })
 }
 
 /// Split `path` into the root and everything after it, the way
@@ -1485,16 +1489,17 @@ mod win_nt {
     /// neither instantiable nor subclassable, so `_add_dll_directory` is the
     /// only source of one.
     fn dll_cookie_type() -> PyObjectRef {
-        static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *CELL.get_or_init(|| {
+        static CELL: pyre_object::gc_roots::RootedOnceRef =
+            pyre_object::gc_roots::RootedOnceRef::new();
+        CELL.get_or_init(|| {
             let tp = crate::typedef::make_builtin_type("nt.DLLDirectoryCookie", |_ns| {});
             unsafe {
                 pyre_object::typeobject::w_type_set_hasdict(tp, true);
                 pyre_object::typeobject::w_type_set_disallow_instantiation(tp);
                 pyre_object::typeobject::w_type_set_acceptable_as_base_class(tp, false);
             }
-            tp as usize
-        }) as PyObjectRef
+            tp
+        })
     }
 
     /// Box `cookie`.  The carrier is pinned before the value is built, and both
@@ -6269,8 +6274,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         )))
     }
     fn dir_entry_type() -> PyObjectRef {
-        static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *CELL.get_or_init(|| {
+        static CELL: pyre_object::gc_roots::RootedOnceRef =
+            pyre_object::gc_roots::RootedOnceRef::new();
+        CELL.get_or_init(|| {
             // `interp_scandir.py` names the typedef `'posix.DirEntry'`.
             // `typedef.rs`'s `new_typeobject_with_base_and_layout` turns the
             // leading component of a qualified
@@ -6356,8 +6362,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 pyre_object::typeobject::w_type_set_disallow_instantiation(tp);
                 pyre_object::typeobject::w_type_set_acceptable_as_base_class(tp, false);
             }
-            tp as usize
-        }) as PyObjectRef
+            tp
+        })
     }
 
     fn scandir_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -6515,8 +6521,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         Ok(pyre_object::w_none())
     }
     fn scandir_iter_type() -> PyObjectRef {
-        static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *CELL.get_or_init(|| {
+        static CELL: pyre_object::gc_roots::RootedOnceRef =
+            pyre_object::gc_roots::RootedOnceRef::new();
+        CELL.get_or_init(|| {
             // `interp_scandir.py` names the typedef `'posix.ScandirIterator'`.
             let tp = crate::typedef::make_builtin_type_with_layout(
                 "posix.ScandirIterator",
@@ -6568,8 +6575,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 pyre_object::typeobject::w_type_set_disallow_instantiation(tp);
                 pyre_object::typeobject::w_type_set_acceptable_as_base_class(tp, false);
             }
-            tp as usize
-        }) as PyObjectRef
+            tp
+        })
     }
 
     /// Allocate one `W_DirEntry` and append it to `list` (pinned at `list_slot`

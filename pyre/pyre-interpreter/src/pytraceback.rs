@@ -430,6 +430,16 @@ pub unsafe fn record_application_traceback(
         if !pyre_object::is_exception(w_exc_object) {
             return;
         }
+        // `PyTraceback.__init__` allocates. `OperationError.set_traceback`
+        // writes the operror, a GC object. The instance here is a native
+        // copy; pin it (and the frame the node stores) and write the
+        // forwarded address.
+        let roots = pyre_object::gc_roots::push_roots();
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(w_exc_object);
+        let frame_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(frame as PyObjectRef);
+        let frame = roots.get(frame_slot) as *mut crate::pyframe::PyFrame;
         // `tb_lasti` names an instruction, and every fixture that pins it
         // pins `f_lasti == tb_lasti`, so the two have to snap the same way:
         // a caller suspended at a `CALL` carries that call's last cache word
@@ -448,16 +458,11 @@ pub unsafe fn record_application_traceback(
         // catches it, it lives only in the in-flight Rust `PyError`, so a
         // safepoint would otherwise miss the nursery exception (and the
         // traceback chain it roots) (`tstate->current_exception` parity).
-        // The in-flight cell is a walked root. Pin as well: `w_pytraceback_new`
-        // collects, and the local below is not rewritten. Re-read the pin
-        // after that constructor — the same address the walker writes back
-        // into the in-flight cell.
+        // The in-flight cell is a walked root. The pins above cover
+        // `w_pytraceback_new`, which collects; the local is not rewritten, so
+        // re-read the pin after that constructor — the same address the
+        // walker writes back into the in-flight cell.
         crate::eval::set_in_flight_exception(w_exc_object);
-        let _exc_roots = pyre_object::gc_roots::push_roots();
-        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_exc_object);
-        let frame_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(frame as PyObjectRef);
         // `pytraceback.py record_application_traceback` builds
         // `PyTraceback(space, frame, last_instruction, tb)` and leaves
         // `lineno` at `LINENO_NOT_COMPUTED`; `get_lineno` resolves it from
@@ -497,6 +502,7 @@ pub unsafe fn record_application_traceback(
         );
         let w_exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         pyre_object::interp_exceptions::w_exception_set_traceback(w_exc_object, new_tb);
+        crate::eval::set_in_flight_exception(w_exc_object);
     }
 }
 

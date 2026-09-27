@@ -5,7 +5,7 @@
 //! through the ordinary import machinery, so whatever that source raises
 //! unwinds out of the import that asked for the module. Pyre installs those
 //! sources eagerly from the module initializer instead -- the registry stores
-//! `name -> init` and `load_builtin_module` runs it at first import -- and the
+//! `name -> init` and `new_builtin_module` runs it at first import -- and the
 //! initializer used to have no way to report a failure, so an app source that
 //! raised took the process with it.
 //!

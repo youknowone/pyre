@@ -3079,7 +3079,7 @@ impl<'a> RegAlloc<'a> {
             | OpCode::CallAssemblerN => {
                 self.consider_call_assembler_j2(dst, args, op, i, output);
             }
-            OpCode::CondCallN => self.consider_discard_nargs_j2(args, i, output),
+            OpCode::CondCallN => self.consider_cond_call_n(args, i, output),
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
                 self.consider_raw_call_like_j2(dst, args, op, i, output, SAVE_DEFAULT_REGS);
             }
@@ -3596,7 +3596,8 @@ impl<'a> RegAlloc<'a> {
                 self.consider_call_assembler(op, i, output);
             }
             OpCode::CondCallN => {
-                self.consider_discard_nargs(op, i, output);
+                let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+                self.consider_cond_call_n(&args, i, output);
             }
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
                 self.consider_raw_call_like(op, i, output, SAVE_DEFAULT_REGS);
@@ -6011,6 +6012,27 @@ impl<'a> RegAlloc<'a> {
             &mut self.longevity,
             &mut self.fm,
         );
+        // aarch64/regalloc.py `prepare_op_call_malloc_nursery_varsize`: tmp_box = TempVar();
+        //   force_allocate_reg(tmp_box, selected_reg=r.x1)
+        //   gcmap = self.get_gcmap([r.x0, r.x1])
+        //   possibly_free_var(tmp_box)
+        // The bump-pointer fast path writes the new nursery_free into x1.
+        // Without this reservation a live Ref can stay bound to x1, so a
+        // later guard's faillocs / the collecting slowpath gcmap would
+        // publish that derived address as a GCREF (`jf_frame[1]`).
+        let tmp = self.fresh_temp_var();
+        self.longevity
+            .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+        self.rm.force_allocate_reg(
+            tmp,
+            &[],
+            Some(MALLOC_NURSERY_CLOBBER[1]),
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        );
+        self.rm
+            .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
         // aarch64/regalloc.py: lengthloc = self.rm.loc(length_box)
         let lengthloc = self.loc(op.arg(2).to_opref(), Type::Int);
         // aarch64/regalloc.py:1030: itemsize = op.getarg(1).getint()
@@ -6055,6 +6077,21 @@ impl<'a> RegAlloc<'a> {
             &mut self.longevity,
             &mut self.fm,
         );
+        // aarch64/regalloc.py `prepare_op_call_malloc_nursery_varsize` TempVar in x1 — see
+        // `consider_call_malloc_nursery_varsize`.
+        let tmp = self.fresh_temp_var();
+        self.longevity
+            .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+        self.rm.force_allocate_reg(
+            tmp,
+            &[],
+            Some(MALLOC_NURSERY_CLOBBER[1]),
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        );
+        self.rm
+            .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
         let lengthloc = args
             .get(2)
             .map(|&arg| self.loc(arg, Type::Int))
@@ -6437,6 +6474,21 @@ impl<'a> RegAlloc<'a> {
             self.preserve_for_zero_array_memset();
         }
         self.perform_discard(i, locs, output);
+    }
+
+    /// `aarch64/opassembler.py _emit_op_cond_call`:
+    /// `gcmap = self._regalloc.get_gcmap([res_loc])`. CondCallN has no
+    /// result. The assembler spills every register into the jitframe on
+    /// the taken path and publishes this map so `force_now` allocations
+    /// forward those slots.
+    fn consider_cond_call_n(&mut self, args: &[OpRef], i: usize, output: &mut Vec<RegAllocOp>) {
+        let mut locs = Vec::new();
+        for &arg in args {
+            let tp = self.tp(arg);
+            locs.push(self.loc(arg, tp));
+        }
+        let gcmap = self.get_gcmap(&[], false) as usize;
+        self.perform_with_gcmap_ptr(i, locs, None, gcmap, output);
     }
 
     /// Generic discard with N args

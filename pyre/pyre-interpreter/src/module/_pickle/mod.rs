@@ -18,7 +18,7 @@
 
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntSign as Sign};
+use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntGcRoot, RBigIntSign as Sign};
 use pyre_object::PyObjectRef;
 
 use crate::PyError;
@@ -584,14 +584,17 @@ pub(crate) fn decode_long(data: &[u8]) -> PyObjectRef {
         return pyre_object::w_int_new(0);
     }
     let negative = data[data.len() - 1] & 0x80 != 0;
-    let unsigned = BigInt::from_bytes_le(Sign::Plus, data);
+    let unsigned = RBigIntGcRoot::new(BigInt::from_bytes_le(Sign::Plus, data));
     let value = if negative {
-        // subtract 2**(8*len): little-endian bytes are `len` zeros then 0x01
+        // subtract 2**(8*len): little-endian bytes are `len` zeros then 0x01.
+        // `from_bytes_le` collects, so the subtrahend is built before
+        // `unsigned` is read.
         let mut pow = vec![0u8; data.len()];
         pow.push(1);
-        unsigned - BigInt::from_bytes_le(Sign::Plus, &pow)
+        let modulus = BigInt::from_bytes_le(Sign::Plus, &pow);
+        unsigned.sub(&modulus)
     } else {
-        unsigned
+        unsigned.translated_alias()
     };
     int_from_bigint(value)
 }

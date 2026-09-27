@@ -204,7 +204,7 @@ fn every_redirected_frame_getter_carries_a_deletable_force() {
 /// `rvirtualizable.py hook_access_field` injects only under
 /// `if self.my_redirected_fields.get(cname.value)`, and `f_back`
 /// (`f_backref`), `f_builtins` (`w_builtin`) and `get_generator`
-/// (`f_generator_nowref`) read no field in that set.  `f_code` reads `pycode`,
+/// (`f_generator_wref`) read no field in that set.  `f_code` reads `pycode`,
 /// which IS in it, and is here for the second question a HAND-placed marker
 /// owes and the injection never has to ask, because it fires at every access in
 /// every graph rather than once per gateway: can the trace and the live frame

@@ -3219,8 +3219,8 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "PyFrame.f_generator_nowref",
-                crate::frame_layout::PYFRAME_F_GENERATOR_NOWREF_OFFSET,
+                "PyFrame.f_generator_wref",
+                crate::frame_layout::PYFRAME_F_GENERATOR_WREF_OFFSET,
                 WORD,
                 Type::Ref,
                 false,
@@ -6248,7 +6248,7 @@ pub fn pyframe_debugdata_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 4)
 }
 
-pub fn pyframe_f_generator_nowref_descr() -> DescrRef {
+pub fn pyframe_f_generator_wref_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 6)
 }
 

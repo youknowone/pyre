@@ -174,7 +174,7 @@ fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
         }
     };
     let raw =
-        crate::gc_hook::try_gc_alloc_stable_raw(W_OBJECT_OBJECT_GC_TYPE_ID, W_OBJECT_OBJECT_SIZE);
+        crate::gc_hook::try_gc_alloc_nursery_raw(W_OBJECT_OBJECT_GC_TYPE_ID, W_OBJECT_OBJECT_SIZE);
     let w_class = crate::gc_roots::shadow_stack_get(class_slot);
     let value = W_ObjectObject {
         ob_header: PyObject {

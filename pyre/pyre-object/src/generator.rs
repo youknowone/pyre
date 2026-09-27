@@ -122,20 +122,36 @@ fn w_generator_or_coroutine_new(
     kind: GeneratorKind,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    let pycode = crate::gc_roots::pin_root(pycode);
+    let pycode_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(pycode);
+    let frame_owned = !frame_ptr.is_null() && crate::gc_hook::try_gc_owns_object(frame_ptr);
+    let frame_slot = if frame_owned {
+        let slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(frame_ptr as PyObjectRef);
+        Some(slot)
+    } else {
+        None
+    };
+    let (ob_type, w_class) = match kind {
+        GeneratorKind::Generator => (
+            &GENERATOR_TYPE as *const PyType,
+            get_instantiate(&GENERATOR_TYPE),
+        ),
+        GeneratorKind::Coroutine => (
+            &COROUTINE_TYPE as *const PyType,
+            get_instantiate(&COROUTINE_TYPE),
+        ),
+        GeneratorKind::AsyncGenerator => (
+            &ASYNC_GENERATOR_TYPE as *const PyType,
+            get_instantiate(&ASYNC_GENERATOR_TYPE),
+        ),
+    };
+    let pycode = crate::gc_roots::shadow_stack_get(pycode_slot);
+    let frame_ptr = frame_slot
+        .map(|slot| crate::gc_roots::shadow_stack_get(slot) as *mut u8)
+        .unwrap_or(frame_ptr);
     let value = GeneratorIterator {
-        ob: PyObject {
-            ob_type: match kind {
-                GeneratorKind::Generator => &GENERATOR_TYPE as *const PyType,
-                GeneratorKind::Coroutine => &COROUTINE_TYPE as *const PyType,
-                GeneratorKind::AsyncGenerator => &ASYNC_GENERATOR_TYPE as *const PyType,
-            },
-            w_class: match kind {
-                GeneratorKind::Generator => get_instantiate(&GENERATOR_TYPE),
-                GeneratorKind::Coroutine => get_instantiate(&COROUTINE_TYPE),
-                GeneratorKind::AsyncGenerator => get_instantiate(&ASYNC_GENERATOR_TYPE),
-            },
-        },
+        ob: PyObject { ob_type, w_class },
         frame_ptr,
         pycode,
         started: false,
@@ -161,17 +177,16 @@ fn w_generator_or_coroutine_new(
     // locals/cells/valuestack via `walk_suspended_generator_frame`) would
     // never run, and a value live only across a `yield` would be reclaimed by
     // a major collection — resuming the generator then dereferences freed
-    // memory. Allocate stable (non-moving old-gen) so the many raw
-    // `*GeneratorIterator` / `frame_ptr` readers keep a fixed address, and
-    // fall back to the immortal alloc only when the GC is not installed.
+    // memory. Same `malloc_fixedsize` bump as `w_exception_new_empty_impl`.
+    // `generator_object_custom_trace` already forwards `frame_ptr` as a
+    // GCREF when the frame is GC-owned. Fall back to immortal only when
+    // the GC is not installed.
     let raw =
-        crate::gc_hook::try_gc_alloc_stable_raw(W_GENERATOR_GC_TYPE_ID, W_GENERATOR_OBJECT_SIZE);
+        crate::gc_hook::try_gc_alloc_nursery_raw(W_GENERATOR_GC_TYPE_ID, W_GENERATOR_OBJECT_SIZE);
     if !raw.is_null() {
         unsafe {
             std::ptr::write(raw as *mut GeneratorIterator, value);
         }
-        // The old-gen generator may reference young frame contents (walked via
-        // the custom trace), so remember it for the next minor's tracer.
         crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
     }

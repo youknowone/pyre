@@ -112,6 +112,12 @@ pub struct WalkFrameStateData {
     /// surface `GotoIfNotValueNotConcrete` rather than guess a
     /// direction.
     pub concrete_registers_r: Vec<ConcreteValue>,
+    /// Inlined callee's `Function.w_func_globals_obj`.  Zero outside an
+    /// inline sub-walk.  `walk_frame_state_roots` forwards it.
+    pub inline_w_globals: usize,
+    /// Inlined callee's `W_Code`.  Zero outside an inline sub-walk.  Same
+    /// forwarding contract as [`Self::inline_w_globals`].
+    pub inline_w_code: usize,
 }
 
 impl Default for WalkFrameStateData {
@@ -125,6 +131,8 @@ impl Default for WalkFrameStateData {
             current_exception_seed: None,
             current_exception_seed_concrete: pyre_object::PY_NULL,
             concrete_registers_r: Vec::new(),
+            inline_w_globals: 0,
+            inline_w_code: 0,
         }
     }
 }
@@ -291,6 +299,16 @@ unsafe fn walk_frame_state_roots(data: *const (), visitor: &mut dyn FnMut(&mut G
             *ptr = root.0 as pyre_object::PyObjectRef;
         }
     }
+    if data.inline_w_globals != 0 {
+        let mut root = GcRef(data.inline_w_globals);
+        visitor(&mut root);
+        data.inline_w_globals = root.0;
+    }
+    if data.inline_w_code != 0 && data.inline_w_code != usize::MAX {
+        let mut root = GcRef(data.inline_w_code);
+        visitor(&mut root);
+        data.inline_w_code = root.0;
+    }
 }
 
 #[cfg(test)]
@@ -320,6 +338,9 @@ mod tests {
                 ConcreteValue::Ref(word as pyre_object::PyObjectRef),
                 ConcreteValue::Int(word as i64),
             ],
+            inline_w_globals: word,
+            inline_w_code: word,
+            ..Default::default()
         })
     }
 
@@ -342,6 +363,8 @@ mod tests {
             shadow.concrete.get(&0).unwrap().value,
             Value::Ref(GcRef(word))
         );
+        assert_eq!(state.inline_w_globals, word);
+        assert_eq!(state.inline_w_code, word);
     }
 
     #[test]

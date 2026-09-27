@@ -38,7 +38,9 @@ pub const FORWARDED_MARKER: u64 = (usize::MAX - 41) as u64;
 #[repr(C)]
 pub struct GcHeader {
     /// Low native-word half: type ID. Next half: GC flags (shifted).
-    /// On wasm32 the upper 32 bits are physical ABI padding and stay zero.
+    /// On wasm32 the upper 32 bits are physical ABI padding: zero on a live
+    /// object, and `FORWARDSTUB.forw` on a forwarding stub
+    /// ([`GcHeader::set_forwarding_address`]).
     pub tid_and_flags: u64,
 }
 
@@ -115,34 +117,37 @@ impl GcHeader {
     }
 
     /// Check if this header indicates a forwarded object.
+    ///
+    /// Compare the logical native word (incminimark's one-`Signed` `tid`),
+    /// not the physical `u64`. On wasm32 the upper 32 bits of a stub hold
+    /// the forwarding address (`set_forwarding_address`), so a full `u64`
+    /// compare against `FORWARDED_MARKER` would never match there.
     #[inline]
     pub fn is_forwarded(self) -> bool {
-        self.tid_and_flags == FORWARDED_MARKER
+        (self.tid_and_flags as usize) == (FORWARDED_MARKER as usize)
     }
 
     /// Mark the header at `hdr` as forwarded and store the forwarding address
-    /// in the word immediately following the header.
+    /// in the native word immediately after the logical tid word.
     ///
-    /// Takes a raw pointer (rather than `&mut self`) because the write at
-    /// `hdr + SIZE` lies outside the single-field extent a `&mut GcHeader`
-    /// reference is allowed to touch under Rust's aliasing model.
-    ///
-    /// `hdr + SIZE` is the object's own first payload word, so a varsize type
-    /// registered with `length_offset == 0` — `ItemsBlock`, whose `capacity`
-    /// is its first field — has its length destroyed here.  Any size read of a
-    /// forwarded object of such a type returns the forwarding address in place
-    /// of the length; check `is_forwarded` and follow it first.
+    /// incminimark writes `tid = -42` into `HDR` (one `Signed`) and
+    /// `FORWARDSTUB.forw` at `obj`. The logical tid here is one `usize`;
+    /// on wasm32 that is the low half of the physical `u64` header, so
+    /// `forw` occupies the padding half rather than the first payload
+    /// word. A type-9 `ItemsBlock` keeps its `capacity` at `obj+0`.
+    /// On 64-bit the logical word fills the header and `forw` is still
+    /// the first payload word, matching a translated 64-bit PyPy.
     ///
     /// # Safety
-    /// `hdr` must point to a valid `GcHeader` followed by at least
-    /// `size_of::<usize>()` bytes of writable memory, and no other reference
-    /// into either range may be alive for the duration of the call.
+    /// `hdr` must point to a valid `GcHeader`. On 64-bit, at least
+    /// `size_of::<usize>()` bytes of payload must be writable. No other
+    /// reference into either range may be alive for the duration of the call.
     #[inline]
     pub unsafe fn set_forwarding_address(hdr: *mut GcHeader, new_addr: usize) {
         unsafe {
-            (*hdr).tid_and_flags = FORWARDED_MARKER;
-            let fwd_ptr = hdr.add(1) as *mut usize;
-            fwd_ptr.write(new_addr);
+            let words = hdr as *mut usize;
+            words.write(FORWARDED_MARKER as usize);
+            words.add(1).write(new_addr);
         }
     }
 
@@ -150,12 +155,10 @@ impl GcHeader {
     ///
     /// # Safety
     /// `hdr` must point to a valid forwarded `GcHeader`
-    /// (`(*hdr).is_forwarded()` must hold) and the word immediately
-    /// following must be readable.
+    /// (`(*hdr).is_forwarded()` must hold).
     #[inline]
     pub unsafe fn forwarding_address(hdr: *const GcHeader) -> usize {
-        let fwd_ptr = unsafe { hdr.add(1) as *const usize };
-        unsafe { fwd_ptr.read() }
+        unsafe { (hdr as *const usize).add(1).read() }
     }
 }
 
@@ -228,14 +231,16 @@ pub fn alloc_with_gc_header<T>(value: T, type_id: u32) -> *mut T {
 /// expected to clear the flag and enrol the object in `prebuilt_root_objects`.
 /// Upstream does stamp prebuilt objects that have reference fields, because
 /// those fields name other prebuilt objects and the GC transform puts a barrier
-/// on every later store. Neither condition holds for a box allocated here, so
-/// only a payload that is a leaf and stays one may use this: the `None` /
-/// `True` / `False` / `NotImplemented` / `Ellipsis` singletons, whose whole body
-/// is a `PyObject` header with a null `w_class`. An ordinary `#[pyre_class]`
-/// box does NOT qualify — its reference fields are written at construction with
-/// no write barrier, so once the first barrier on any other field opens the
-/// object, a major would follow those never-updated slots into freed memory.
-/// See [`alloc_with_gc_header`] for the measured failure that rule comes from.
+/// on every later store. Neither condition holds for a box allocated here in
+/// general, so a payload may use this only if it is a leaf and stays one (the
+/// `None` / `True` / `False` / `NotImplemented` / `Ellipsis` singletons, whose
+/// whole body is a `PyObject` header with a null `w_class`), or if its
+/// constructor barriers the whole box before anything can collect and every
+/// later reference store is barriered too. An ordinary `#[pyre_class]` box does
+/// NOT qualify — its reference fields are written at construction with no write
+/// barrier, so once the first barrier on any other field opens the object, a
+/// major would follow those never-updated slots into freed memory. See
+/// [`alloc_with_gc_header`] for the measured failure that rule comes from.
 pub fn alloc_with_gc_header_immortal<T>(value: T, type_id: u32) -> *mut T {
     alloc_with_gc_header_flags(
         value,
@@ -314,6 +319,17 @@ mod tests {
 
         hdr.tid_and_flags = FORWARDED_MARKER;
         assert!(hdr.is_forwarded());
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn forwarded_marker_ignores_physical_padding() {
+        let mut hdr = GcHeader::new(9);
+        hdr.tid_and_flags = FORWARDED_MARKER | (0x0107_83d8u64 << 32);
+        assert!(
+            hdr.is_forwarded(),
+            "wasm32 padding in the high half of the physical u64 must not hide tid=-42"
+        );
     }
 
     #[test]
@@ -407,6 +423,25 @@ mod tests {
         assert_eq!(
             unsafe { GcHeader::forwarding_address(hdr_ptr) },
             target_addr
+        );
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn forwarding_preserves_payload_length_on_32bit() {
+        let mut buf = [0u8; 16];
+        buf[8..12].copy_from_slice(&42u32.to_le_bytes());
+        let hdr_ptr = buf.as_mut_ptr() as *mut GcHeader;
+        unsafe {
+            *hdr_ptr = GcHeader::new(9);
+            GcHeader::set_forwarding_address(hdr_ptr, 0x1000);
+        }
+        assert!(unsafe { (*hdr_ptr).is_forwarded() });
+        assert_eq!(unsafe { GcHeader::forwarding_address(hdr_ptr) }, 0x1000);
+        let length = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        assert_eq!(
+            length, 42,
+            "type-9 length at obj+0 must survive a 32-bit forward"
         );
     }
 }

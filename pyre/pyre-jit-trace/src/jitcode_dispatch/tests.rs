@@ -16848,8 +16848,6 @@ fn foriter_body_identity_names_the_jitcode_its_op_pc_indexes() {
     );
 
     wc.inline_callee_consts = Some(InlineCalleeConsts {
-        w_globals: 0,
-        w_code: 0,
         jitcode_index: callee_index,
     });
     wc.fbw_mode.inline_subwalk = true;

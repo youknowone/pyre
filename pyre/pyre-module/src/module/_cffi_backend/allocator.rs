@@ -129,11 +129,12 @@ pub fn new_allocator(
     Ok(obj)
 }
 
-static ALLOCATOR_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static ALLOCATOR_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `_cffi_backend.__FFIAllocator`.
 pub fn allocator_type() -> PyObjectRef {
-    *ALLOCATOR_TYPE_OBJ.get_or_init(|| {
+    ALLOCATOR_TYPE_OBJ.get_or_init(|| {
         let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend.__FFIAllocator",
             init_allocator_type,
@@ -148,8 +149,8 @@ pub fn allocator_type() -> PyObjectRef {
             pyre_object::w_type_set_disallow_instantiation(tp);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn init_allocator_type(ns: PyObjectRef) {

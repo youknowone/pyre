@@ -141,6 +141,39 @@ fn compiler_bigint_conversion_keeps_upstream_bit_length_call() {
     );
 }
 
+/// `numdigits` reads `self._size.abs()`.  `rint.py rtype_abs` lowers the
+/// `Signed` `abs` to the `int_abs` op, not a call, so the graph carries the
+/// unary `abs` and no residual `core::num::<Impl>::abs`.
+#[test]
+fn numdigits_lowers_i64_abs_to_the_abs_op() {
+    let Some(llbcs) = load_rbigint_llbcs() else {
+        return;
+    };
+    let graph = lower_function(&llbcs[0], "rbigint::<Impl>::numdigits")
+        .or_else(|_| lower_function(&llbcs[0], "numdigits"))
+        .expect("lower RBigInt::numdigits");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::UnaryOp { op, result_ty: ValueType::Int, .. } if op == "abs"
+        )),
+        "`i64::abs` must lower to the unary `abs` op: {ops:?}",
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                if segments.last().is_some_and(|s| s == "abs")
+        )),
+        "`i64::abs` must not stay a residual call: {ops:?}",
+    );
+}
+
 fn assert_source_order(source: &str, fragments: &[&str]) {
     let mut cursor = 0;
     for fragment in fragments {
@@ -316,13 +349,13 @@ fn mapped_rbigint_methods_and_helpers_follow_upstream_source_order() {
             "fn args_from_rarith_uint1(",
             "fn args_from_rarith_uint(",
             "fn args_from_long(",
-            "fn _x_add<'a>(",
+            "fn _x_add(",
             "fn _x_int_add(",
-            "fn _x_sub<'a>(",
+            "fn _x_sub(",
             "fn _x_int_sub(",
-            "fn _x_mul<'a>(",
+            "fn _x_mul(",
             "fn _kmul_split(",
-            "fn _k_mul<'a>(",
+            "fn _k_mul(",
             "fn _inplace_divrem1(",
             "fn _divrem1(",
             "fn _int_rem_core(",
@@ -362,9 +395,9 @@ fn mapped_rbigint_methods_and_helpers_follow_upstream_source_order() {
             "fn _format_recursive_general(",
             "fn _format_lowest_level_divmod_int_results(",
             "fn _format(",
-            "fn _bitwise_and<'a>(",
-            "fn _bitwise_or<'a>(",
-            "fn _bitwise_xor<'a>(",
+            "fn _bitwise_and(",
+            "fn _bitwise_or(",
+            "fn _bitwise_xor(",
             "fn _int_bitwise_and(",
             "fn _int_bitwise_or(",
             "fn _int_bitwise_xor(",
@@ -1011,17 +1044,13 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
     }
     for name in ["_bitwise_and", "_bitwise_or", "_bitwise_xor"] {
         let types = input_types(name, None);
-        // `framework.py push_roots`: the GC-transformed native body carries
-        // an optional root span in addition to the two bigint payloads. It
-        // is a Ref, not a runtime operation discriminator; and/or/xor must
-        // remain distinct specialized graphs (`rbigint.py _bitwise`).
+        // `rbigint.py _bitwise(a, op, b)` specialized on `op`: the graph
+        // takes the two bigint payloads only. `framework.py push_roots`
+        // brackets the digit-list malloc inside the graph, so no root span
+        // is a parameter; and/or/xor must remain distinct specialized graphs.
         assert!(
-            matches!(
-                types.as_slice(),
-                [ValueType::Ref(_), ValueType::Ref(_), ValueType::Ref(_)]
-            ),
-            "specialized bigint bitwise graph must carry two payloads and the GC root span: \
-             {types:?}"
+            matches!(types.as_slice(), [ValueType::Ref(_), ValueType::Ref(_)]),
+            "specialized bigint bitwise graph must carry exactly the two payloads: {types:?}"
         );
     }
     for name in ["_int_bitwise_and", "_int_bitwise_or", "_int_bitwise_xor"] {
@@ -1268,7 +1297,9 @@ const BORROWED_PAYLOAD_CALLERS: &[(&str, &str)] = &[
     ("objspace::descroperation", "long_lshift"),
     ("objspace::descroperation", "long_rshift"),
     ("objspace::descroperation", "long_floordiv"),
+    ("objspace::descroperation", "long_int_floordiv"),
     ("objspace::descroperation", "long_mod"),
+    ("objspace::descroperation", "long_int_mod"),
     ("objspace::descroperation", "integer_divmod_pair"),
     ("objspace::descroperation", "bigint_mod_inverse"),
     ("objspace::descroperation", "complex_richcompare"),
@@ -1811,12 +1842,12 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
 
     for (caller_name, residual_name, forbidden) in [
         (
-            "long_floordiv",
+            "long_int_floordiv",
             "jit_bigint_int_div_floor",
             "bigint_int_floordiv_nonzero",
         ),
         (
-            "long_mod",
+            "long_int_mod",
             "jit_bigint_int_mod_int_result",
             "bigint_int_modulo_int_result_nonzero",
         ),
@@ -1896,7 +1927,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
 }
 
 #[test]
-fn rbigint_add_residual_calls_the_gc_transformed_payload_body_once() {
+fn rbigint_add_residual_calls_the_rbigint_add_body_once() {
     let Some(llbcs) = load_rbigint_llbcs() else {
         return;
     };
@@ -1911,33 +1942,49 @@ fn rbigint_add_residual_calls_the_gc_transformed_payload_body_once() {
         .iter()
         .find(|function| function.name == "jit_bigint_add" && function.module_path == "longobject")
         .expect("longobject::jit_bigint_add graph");
-
-    let mut transformed_body_calls = 0;
+    // `rbigint.add` is `@jit.elidable`: the front retargets the inherent
+    // call on two exact `RBigInt` operands to its pointer-ABI residual
+    // (`bigint_binop_residual_for_method`), so the wrapper enters the
+    // residual once and never the Rust by-value `impl Add` shim.
+    let add_residual = [
+        "pyre_interpreter",
+        "objspace",
+        "descroperation",
+        "jit_bigint_add",
+    ];
+    let mut add_residual_calls = 0;
     let mut calls = Vec::new();
     for block in &wrapper.graph.blocks {
         for operation in &block.operations {
-            if let OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } = &operation.kind
-            {
-                calls.push(segments.clone());
-                assert!(
-                    !matches!(segments.as_slice(), [.., owner, leaf]
-                        if owner == "<Impl>" && leaf == "add"),
-                    "the Rust by-value RBigInt trait shim must not enter the JIT graph: \
-                     {segments:?}"
-                );
-                if segments == &["majit_rlib", "rbigint", "gc", "add_payloads_collecting"] {
-                    transformed_body_calls += 1;
+            let OpKind::Call { target, .. } = &operation.kind else {
+                continue;
+            };
+            calls.push(target.clone());
+            match target {
+                CallTarget::FunctionPath { segments, .. } => {
+                    assert!(
+                        !matches!(segments.as_slice(), [.., owner, leaf]
+                            if owner == "<Impl>" && leaf == "add"),
+                        "the Rust by-value RBigInt trait shim must not enter the JIT graph: \
+                         {target:?}"
+                    );
+                    if segments == &add_residual {
+                        add_residual_calls += 1;
+                    }
                 }
+                CallTarget::Method { name, .. } => {
+                    assert!(
+                        name != "add",
+                        "rbigint.add must reach the graph as its residual: {target:?}"
+                    );
+                }
+                _ => {}
             }
         }
     }
     assert_eq!(
-        transformed_body_calls, 1,
-        "the GC-reference residual must enter exactly one GC-transformed \
-         rbigint.add body: {calls:?}"
+        add_residual_calls, 1,
+        "the GC-reference residual must enter exactly one rbigint.add: {calls:?}"
     );
 
     let constructor_caller = program

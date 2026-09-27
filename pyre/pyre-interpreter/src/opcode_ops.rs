@@ -774,17 +774,17 @@ pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError
 pub fn set_update_value(set: PyObjectRef, iterable: PyObjectRef) -> Result<(), PyError> {
     unsafe {
         if pyre_object::is_set_or_frozenset(set) {
-            // `collect_iterable` pops its own shadow-stack roots before
-            // returning, so `items` is a bare, unrooted `Vec` — each
-            // element (and `set`) needs re-pinning for the duration of
-            // this loop, since any iteration's `try_hash_value` can move
-            // both `set` and every not-yet-processed item.
-            let items = crate::builtins::collect_iterable(iterable)?;
+            // `collect_iterable` runs Python (`__iter__` / `__next__`) and
+            // pops its own roots before returning, so both `set` and the
+            // source have to sit on this frame's stack *before* that call.
+            // Pinning `set` only after the drain published the pre-move
+            // address (`gc_mapping_unpack_roots_its_source`).
             let _roots = pyre_object::gc_roots::push_roots();
-            let sp = pyre_object::gc_roots::publish_roots(&[set]);
-            let item_base = pyre_object::gc_roots::publish_roots(&items);
-            pyre_object::gc_roots::normalize_roots(sp, 1 + items.len());
-            let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+            let sp = _roots.pin_roots(&[set, iterable]);
+            let items =
+                crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(sp + 1))?;
+            let item_base = pyre_object::gc_roots::pin_roots(&items);
+            let item_len = items.len();
             for i in 0..item_len {
                 let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
                 let hash = crate::builtins::try_hash_value(item).map_err(|err| {
