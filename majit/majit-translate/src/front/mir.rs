@@ -13150,9 +13150,16 @@ impl<'a> Lowering<'a> {
                 let slice_object_element = self
                     .is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
                     && element_node.is_some_and(|elem| json_ty_is_objectptr(elem, self.llbc));
+                // `Option<Box<T>>` (and the other null niches) is one pointer
+                // word: `None` is null, `Some` is the payload. Indexing it
+                // as a residual `Vec::index_mut` hands a virtualizable array
+                // to a call, which `jtransform.py` rejects.
+                let element_is_niche_option = element_node
+                    .is_some_and(|elem| json_ty_is_niche_option_word(elem, self.llbc));
                 let element_is_addressable = element_spelling.is_some()
                     || element_node
-                        .is_some_and(|elem| json_ty_is_thin_pointer_element(elem, self.llbc));
+                        .is_some_and(|elem| json_ty_is_thin_pointer_element(elem, self.llbc))
+                    || element_is_niche_option;
                 let vable_array_var = (args.len() == 2)
                     .then(|| declared_vable_array_var(&self.graph, &args[0]))
                     .flatten();
@@ -13359,10 +13366,10 @@ impl<'a> Lowering<'a> {
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     let element_is_pointer_word = self.var_tracks_pointer_word_array(&args[0]);
-                    if element_is_pointer_word {
+                    if element_is_pointer_word || element_is_niche_option {
                         self.pointer_word_vars.insert(res.clone());
                     }
-                    let item_ty = if element_is_pointer_word {
+                    let item_ty = if element_is_pointer_word || element_is_niche_option {
                         ValueType::Ref(None)
                     } else {
                         item_ty
@@ -35912,6 +35919,31 @@ fn json_ty_scalar_element_spelling(node: &serde_json::Value, llbc: &Llbc) -> Opt
 ///
 /// A pointer is one word only while it is thin: a pointer to an unsized
 /// pointee carries a length or a vtable beside the address.
+/// `Option<Box<T>>` / `Option<&T>` / `Option<*mut T>` laid out as one
+/// nullable pointer word. `rmodel.py` represents that pointer with
+/// `can_be_none`; `None` is the null word and there is no tag field.
+fn json_ty_is_niche_option_word(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(node) = strip_ty_wrappers(node, llbc) else {
+        return false;
+    };
+    let Some(id) = adt_node_def_id(node) else {
+        return false;
+    };
+    if llbc.type_by_id(id).is_none_or(|td| td.item_meta.name_path() != "core::option::Option") {
+        return false;
+    }
+    let Some(payload) = node
+        .get("Adt")
+        .and_then(|a| a.get("generics"))
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .and_then(|t| t.first())
+    else {
+        return false;
+    };
+    type_node_is_thin_box(payload, llbc) || json_ty_is_thin_pointer_element(payload, llbc)
+}
+
 fn json_ty_is_thin_pointer_element(node: &serde_json::Value, llbc: &Llbc) -> bool {
     // `Box<T>` of a sized `T` is one pointer word, the same width as `&T`.
     if type_node_is_thin_box(node, llbc) {

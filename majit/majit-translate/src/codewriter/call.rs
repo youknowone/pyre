@@ -8253,6 +8253,46 @@ fn degraded_extraeffect(
     }
 }
 
+/// `None` descr sets are the `EF_RANDOM_EFFECTS` wildcard. A concrete
+/// effect (`CannotRaise` and the rest) has to carry the empty image
+/// `effectinfo.py` builds for a non-top analyzer result, or rehydrate
+/// refuses the embedded effect.
+fn effectinfo_without_named_descrs(
+    extraeffect: ExtraEffect,
+    oopspecindex: OopSpecIndex,
+    extradescrs: Option<Vec<majit_ir::descr::DescrRef>>,
+    can_invalidate: bool,
+    can_collect: bool,
+    call_release_gil_target: (u64, i32),
+) -> EffectInfo {
+    let concrete = extraeffect != ExtraEffect::RandomEffects;
+    let sets = concrete.then_some(Vec::new());
+    let bits = concrete.then_some(Vec::new());
+    EffectInfo {
+        extraeffect,
+        oopspecindex,
+        runtime_helper: majit_ir::RuntimeHelperKind::None,
+        _readonly_descrs_fields: sets.clone(),
+        _write_descrs_fields: sets.clone(),
+        _readonly_descrs_arrays: sets.clone(),
+        _write_descrs_arrays: sets.clone(),
+        _readonly_descrs_interiorfields: sets.clone(),
+        _write_descrs_interiorfields: sets,
+        descr_set_keys: concrete.then_some(majit_ir::effectinfo::DescrSetKeysImage::Empty),
+        readonly_descrs_fields: bits.clone(),
+        write_descrs_fields: bits.clone(),
+        readonly_descrs_arrays: bits.clone(),
+        write_descrs_arrays: bits.clone(),
+        readonly_descrs_interiorfields: bits.clone(),
+        write_descrs_interiorfields: bits,
+        single_write_descr_array: None,
+        extradescrs,
+        can_invalidate,
+        can_collect,
+        call_release_gil_target,
+    }
+}
+
 /// RPython: effectinfo_from_writeanalyze() (effectinfo.py).
 ///
 /// Scans the callee's graph for field/array read/write operations
@@ -8318,30 +8358,16 @@ pub fn effectinfo_from_writeanalyze(
         // host code).  Publishing that as `EF_RANDOM_EFFECTS` makes the
         // residual may-force, and a transparent helper walk cannot record it.
         let extraeffect = degraded_extraeffect(extraeffect, callee_path, cc);
-        // effectinfo.py:286-292: every readonly/write descr is `None` (wildcard).
-        return EffectInfo {
+        // effectinfo.py:286-292: a random effect's descr sets stay `None`.
+        // A concrete effect still needs the empty image.
+        return effectinfo_without_named_descrs(
             extraeffect,
             oopspecindex,
-            runtime_helper: majit_ir::RuntimeHelperKind::None,
-            _readonly_descrs_fields: None,
-            _write_descrs_fields: None,
-            _readonly_descrs_arrays: None,
-            _write_descrs_arrays: None,
-            _readonly_descrs_interiorfields: None,
-            _write_descrs_interiorfields: None,
-            descr_set_keys: None,
-            readonly_descrs_fields: None,
-            write_descrs_fields: None,
-            readonly_descrs_arrays: None,
-            write_descrs_arrays: None,
-            readonly_descrs_interiorfields: None,
-            write_descrs_interiorfields: None,
-            single_write_descr_array: None,
-            extradescrs: extradescrs.clone(),
+            extradescrs.clone(),
             can_invalidate,
-            can_collect: true, // effectinfo.py:364-365: forces → can_collect = True
+            true,
             call_release_gil_target,
-        };
+        );
     }
 
     // effectinfo.py:345-360: readonly = reads that have NO corresponding write.
@@ -8515,29 +8541,14 @@ pub fn effectinfo_from_writeanalyze(
                 "[s4c-degrade] {callee_path}: unrepresentable EffectInfo descr set member; using EF_RANDOM_EFFECTS"
             );
         }
-        return EffectInfo {
+        return effectinfo_without_named_descrs(
             extraeffect,
             oopspecindex,
-            runtime_helper: majit_ir::RuntimeHelperKind::None,
-            _readonly_descrs_fields: None,
-            _write_descrs_fields: None,
-            _readonly_descrs_arrays: None,
-            _write_descrs_arrays: None,
-            _readonly_descrs_interiorfields: None,
-            _write_descrs_interiorfields: None,
-            descr_set_keys: None,
-            readonly_descrs_fields: None,
-            write_descrs_fields: None,
-            readonly_descrs_arrays: None,
-            write_descrs_arrays: None,
-            readonly_descrs_interiorfields: None,
-            write_descrs_interiorfields: None,
-            single_write_descr_array: None,
-            extradescrs: extradescrs.clone(),
+            extradescrs.clone(),
             can_invalidate,
-            can_collect: true,
+            true,
             call_release_gil_target,
-        };
+        );
     };
     EffectInfo {
         extraeffect,
