@@ -5212,6 +5212,7 @@ fn scalar_replace_one_struct_aggregate(
         crate::model::LinkArg,
         ValueType,
     )> = Vec::new();
+    let mut field_alias: Vec<(Variable, Variable)> = Vec::new();
     for (i, op) in ops.into_iter().enumerate() {
         if i == op_idx {
             continue;
@@ -5232,6 +5233,18 @@ fn scalar_replace_one_struct_aggregate(
                 if let Some((_, value, _)) =
                     fields.iter().find(|(seen, _, _)| seen.name == field.name)
                 {
+                    if let (Some(dest), LinkArg::Value(src)) = (&op.result, value) {
+                        // The read is the stored SSA value. A block input
+                        // stays a `same_as`: that parameter is distinct.
+                        if !graph.blocks[block_idx]
+                            .inputargs
+                            .iter()
+                            .any(|arg| arg == dest)
+                        {
+                            field_alias.push((dest.clone(), src.clone()));
+                            continue;
+                        }
+                    }
                     if let Some(kind) = link_arg_as_alias_op(value, ty) {
                         out.push(crate::model::SpaceOperation {
                             result: op.result.clone(),
@@ -5256,8 +5269,54 @@ fn scalar_replace_one_struct_aggregate(
         }
     }
 
+    let apply_alias = |var: &Variable| -> Variable {
+        let mut current = var.clone();
+        let mut seen: Vec<Variable> = Vec::new();
+        loop {
+            if seen.iter().any(|item| item == &current) {
+                return current;
+            }
+            seen.push(current.clone());
+            let Some((_, next)) = field_alias.iter().find(|(from, _)| from == &current) else {
+                return current;
+            };
+            current = next.clone();
+        }
+    };
+    for op in &mut out {
+        let remap = |var: &Variable| apply_alias(var);
+        op.kind = crate::inline::remap_op_kind(&op.kind, &remap);
+        if let Some(result) = op.result.clone() {
+            let renamed = apply_alias(&result);
+            if renamed != result {
+                op.result = Some(renamed);
+            }
+        }
+    }
     let mut phi_copies: Vec<(BlockId, usize, Variable)> = Vec::new();
     let mut exits = std::mem::take(&mut graph.blocks[block_idx].exits);
+    for link in &mut exits {
+        for arg in &mut link.args {
+            if let Some(var) = arg.as_variable() {
+                let renamed = apply_alias(var);
+                if &renamed != var {
+                    *arg = LinkArg::Value(renamed);
+                }
+            }
+        }
+        if let Some(var) = link.last_exception.as_ref().and_then(LinkArg::as_variable) {
+            let renamed = apply_alias(var);
+            if &renamed != var {
+                link.last_exception = Some(LinkArg::Value(renamed));
+            }
+        }
+        if let Some(var) = link.last_exc_value.as_ref().and_then(LinkArg::as_variable) {
+            let renamed = apply_alias(var);
+            if &renamed != var {
+                link.last_exc_value = Some(LinkArg::Value(renamed));
+            }
+        }
+    }
     for link in &mut exits {
         for (slot, arg) in link.args.iter_mut().enumerate() {
             if arg.as_variable() != Some(&result) {
@@ -5358,6 +5417,66 @@ fn retarget_link_arg(arg: &mut LinkArg, from: &Variable, to: &Variable) {
     if arg.as_variable() == Some(from) {
         *arg = LinkArg::Value(to.clone());
     }
+}
+
+/// Replace uses of `from` with `to` and drop the op that defined `from`.
+///
+/// This is the graph `remove_same_as` builds. Returns false when `from`
+/// is a block input: that parameter is the edge's own variable, and the
+/// copy that feeds it has to stay a distinct `same_as`.
+pub(crate) fn forward_identity(
+    graph: &mut FunctionGraph,
+    from: &Variable,
+    to: &Variable,
+) -> bool {
+    if from == to {
+        return true;
+    }
+    if graph
+        .blocks
+        .iter()
+        .any(|block| block.inputargs.iter().any(|arg| arg == from))
+    {
+        return false;
+    }
+    let remap = |var: &Variable| {
+        if var == from {
+            to.clone()
+        } else {
+            var.clone()
+        }
+    };
+    for block in &mut graph.blocks {
+        block
+            .operations
+            .retain(|op| op.result.as_ref() != Some(from));
+        for op in &mut block.operations {
+            op.kind = crate::inline::remap_op_kind(&op.kind, &remap);
+        }
+        match &mut block.exitswitch {
+            Some(ExitSwitch::Value(var)) if var == from => *var = to.clone(),
+            Some(ExitSwitch::Fused { args, .. }) => {
+                for arg in args {
+                    if arg == from {
+                        *arg = to.clone();
+                    }
+                }
+            }
+            Some(ExitSwitch::LastException | ExitSwitch::Value(_)) | None => {}
+        }
+        for link in &mut block.exits {
+            for arg in &mut link.args {
+                retarget_link_arg(arg, from, to);
+            }
+            if let Some(arg) = link.last_exception.as_mut() {
+                retarget_link_arg(arg, from, to);
+            }
+            if let Some(arg) = link.last_exc_value.as_mut() {
+                retarget_link_arg(arg, from, to);
+            }
+        }
+    }
+    true
 }
 
 fn upsert_struct_field(
@@ -9986,9 +10105,10 @@ impl<'a> Lowering<'a> {
                             field: FieldDescriptor::new(field_name, Some(owner_root))
                                 .with_owner_id(owner_id)
                                 .with_base_is_deref(base_is_deref)
-                                .with_inline_vec(crate::vec_layout::field_layout_is_inline_vec(
-                                    &tyref_to_field_layout_string(&field_ty, self.llbc),
-                                )),
+                                .with_inline_vec(
+                                    field_ty_is_inline_vec(&field_ty, self.llbc)
+                                        || field_ty_is_inline_vec(&place_ty, self.llbc),
+                                ),
                             ty,
                             pure: false,
                         },
@@ -12333,18 +12453,9 @@ impl<'a> Lowering<'a> {
                     if first_arg_ty.as_ref().is_some_and(|src_ty| {
                         transmute_is_same_layout_bank(src_ty, &call.dest.ty, self.llbc)
                     }) {
-                        let res = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(res.clone()),
-                            kind: OpKind::UnaryOp {
-                                op: "same_as".to_string(),
-                                operand: args[0].clone(),
-                                result_ty: result_ty.clone(),
-                            },
-                        });
-                        self.local_var[dest_local] = Some(res);
+                        // Same bank and same size: the destination local is
+                        // the argument. `remove_same_as` deletes this copy.
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
                         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17339,6 +17450,20 @@ impl<'a> Lowering<'a> {
             self.rewrite_equal_layout_result_branch(op_kind, first_arg_ty.as_ref(), &call.dest.ty);
         let op_kind =
             self.stamp_result_branch_payloads(op_kind, first_arg_ty.as_ref(), &call.dest.ty);
+        // `lower_std_primitive_op` rewrites an identity wrapper
+        // (`Box::as_ref` / `as_mut`, `Cell::get`, scalar `clone`) to
+        // `same_as` only when the banks agree. Bind the destination
+        // local to that operand. A separate `same_as` variable hides
+        // the producer from `retarget_vec_operand`.
+        if let OpKind::UnaryOp { op, operand, .. } = &op_kind
+            && op == "same_as"
+        {
+            self.local_var[dest_local] = Some(operand.clone());
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(());
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
@@ -31410,6 +31535,52 @@ fn inline_adt_def_id(body: &serde_json::Value) -> Option<u64> {
         .as_u64()
 }
 
+/// An inline `Vec<T, A>` value, not `Box<Vec<_>>` and not `&Vec<_>`.
+///
+/// The ADT is the type decl whose name segments are `alloc::vec::Vec`
+/// (that decl's identity). The use site's type-argument count is the
+/// decl's generic arity: one (`T`) or two (`T` and the allocator).
+fn field_ty_is_inline_vec(ty: &TyRef, llbc: &Llbc) -> bool {
+    let body = match tyref_node(ty, llbc) {
+        Some(body) => body,
+        None => return false,
+    };
+    let Some(obj) = body.as_object() else {
+        return false;
+    };
+    if obj.contains_key("Ref") || obj.contains_key("RawPtr") {
+        return false;
+    }
+    let Some(id) = inline_adt_def_id(body) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(id) else {
+        return false;
+    };
+    if td.item_meta.name.len() != 3 {
+        return false;
+    }
+    let idents: Vec<&str> = td
+        .item_meta
+        .name
+        .iter()
+        .filter_map(|seg| match seg {
+            NameSeg::Ident { ident: (s, _) } => Some(s.as_str()),
+            NameSeg::Other(_) => None,
+        })
+        .collect();
+    if idents != ["alloc", "vec", "Vec"] {
+        return false;
+    }
+    let arity = obj
+        .get("Adt")
+        .and_then(|adt| adt.get("generics"))
+        .and_then(|generics| generics.get("types"))
+        .and_then(|types| types.as_array())
+        .map(|types| types.len());
+    matches!(arity, Some(1 | 2))
+}
+
 /// Clone a [`TyRef`] (no `Clone` impl on the schema enum).  Used by
 /// [`Lowering::resolve_adt_field`] when handing the resolved field's
 /// type to [`tyref_to_value_type`].
@@ -42271,16 +42442,26 @@ fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) -> usize {
         // 2. Replace the `alloc::fmt::format` op with `same_as(fmt_args)`:
         //    after the link re-thread below, `fmt_args` carries the folded
         //    String, so the format result forwards it unchanged.
-        if let Some(op) = graph
-            .block_mut(site.format_block)
+        let format_result = graph
+            .block(site.format_block)
             .operations
-            .get_mut(site.format_idx)
-        {
-            op.kind = OpKind::UnaryOp {
-                op: "same_as".to_string(),
-                operand: site.fmt_args.clone(),
-                result_ty: ValueType::Ref(None),
-            };
+            .get(site.format_idx)
+            .and_then(|op| op.result.clone());
+        if let Some(format_result) = format_result {
+            if !forward_identity(graph, &format_result, &site.fmt_args) {
+                // The format result is a block input. Keep the copy.
+                if let Some(op) = graph
+                    .block_mut(site.format_block)
+                    .operations
+                    .get_mut(site.format_idx)
+                {
+                    op.kind = OpKind::UnaryOp {
+                        op: "same_as".to_string(),
+                        operand: site.fmt_args.clone(),
+                        result_ty: ValueType::Ref(None),
+                    };
+                }
+            }
         }
         // 3. Fold the rendered values with the literal pieces at the args
         //    block (`piece0 ++ rendered0 ++ piece1 ++ … ++ pieceN`).  The
@@ -43084,12 +43265,22 @@ mod tests {
             super::rewrite_result_branch_for_layouts(kind, Some(&same), Some(&same));
         assert_eq!(count_branch_calls(&graph), 0);
         assert!(
-            graph
-                .blocks
-                .iter()
-                .flat_map(|block| block.operations.iter())
-                .any(|op| { matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as") }),
-            "equal layouts keep the bits with same_as"
+            graph.blocks.iter().all(|block| {
+                block.operations.iter().all(|op| {
+                    !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as")
+                })
+            }),
+            "equal layouts bind the ControlFlow value to the Result"
+        );
+        let operand = graph.blocks.iter().find_map(|block| {
+            block.operations.iter().find_map(|op| match &op.kind {
+                OpKind::ConstInt(1) => op.result.as_ref(),
+                _ => None,
+            })
+        });
+        assert_eq!(
+            graph.block(graph.startblock).exits[0].args[0].as_variable(),
+            operand
         );
     }
 
@@ -43974,7 +44165,18 @@ mod tests {
         assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
         assert_eq!(replace_struct_ctors(&mut graph), 1);
         assert_eq!(struct_ctor_ops(&graph), (0, 0, 0));
-        assert_eq!(same_as_count(&graph), 1);
+        assert_eq!(same_as_count(&graph), 0);
+        let payload = graph.blocks.iter().find_map(|block| {
+            block.operations.iter().find_map(|op| match &op.kind {
+                OpKind::ConstInt(1) => op.result.as_ref(),
+                _ => None,
+            })
+        });
+        assert_eq!(
+            graph.block(graph.startblock).exits[0].args[0].as_variable(),
+            payload,
+            "the field read is the stored value"
+        );
     }
 
     /// Returning the aggregate materialises one `New` at the escape. The
@@ -44292,7 +44494,7 @@ mod tests {
         assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
         simplify_lowered_graph(&mut graph, &empty_struct_attrs(), true);
         assert_eq!(struct_ctor_ops(&graph), (0, 0, 0));
-        assert_eq!(same_as_count(&graph), 1);
+        assert_eq!(same_as_count(&graph), 0);
     }
 
     /// `malloc_typed(T { .. })` is the boxing cluster. Its stack aggregate
@@ -46596,18 +46798,17 @@ mod tests {
             "B0→B1 Tuple slot rebound to y"
         );
 
-        // Bf's format op became `same_as(fmt_args_in)`, keeping `formatted`.
+        // Bf's format result is `fmt_args_in`. The copy is not a new variable.
         let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
-        let same_as = bf_block
-            .operations
-            .iter()
-            .find(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as"))
-            .expect("Bf same_as op");
-        match &same_as.kind {
-            OpKind::UnaryOp { operand, .. } => assert_eq!(operand.id(), fmt_args_in.id()),
-            _ => unreachable!(),
-        }
-        assert_eq!(same_as.result.as_ref().unwrap().id(), formatted.id());
+        assert!(
+            bf_block.operations.iter().all(|op| {
+                !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as")
+            })
+        );
+        assert_eq!(
+            bf_block.exits[0].args[0].as_variable().map(|v| v.id()),
+            Some(fmt_args_in.id())
+        );
 
         // Bp now folds the rendered values with the pieces (str_const + add)
         // and forwards the folded String where it forwarded `Arguments`.
@@ -52504,6 +52705,66 @@ mod tests {
                 (Some(VecFieldPart::Len), ValueType::Int),
                 (Some(VecFieldPart::Buf), ValueType::Ref(None)),
             ]
+        );
+    }
+
+    /// `(&mut s.v).as_mut()` binds the destination to the inline field
+    /// read, so the index operand is that read. `fielddescrof` then adds
+    /// `vec_layout::probe().ptr_offset` to the field offset. No `same_as`.
+    #[test]
+    fn inline_vec_as_mut_index_reads_buf_without_same_as() {
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType, VecFieldPart};
+
+        let mut graph = FunctionGraph::new("as_mut_index");
+        let holder = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "s".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .expect("holder");
+        let vec_field = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: holder,
+                    field: FieldDescriptor::new("v", Some("Holder".into())).with_inline_vec(true),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .expect("inline vec field");
+        let bb = graph.startblock;
+        let buf = super::retarget_vec_operand(&mut graph, bb, &vec_field, VecFieldPart::Buf);
+        assert_eq!(buf, vec_field);
+        let read = graph.blocks.iter().find_map(|block| {
+            block.operations.iter().find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } if op.result.as_ref() == Some(&vec_field) => {
+                    Some(field.clone())
+                }
+                _ => None,
+            })
+        });
+        let field = read.expect("field read");
+        assert_eq!(field.vec_part, Some(VecFieldPart::Buf));
+        assert!(
+            graph.blocks.iter().all(|block| {
+                block.operations.iter().all(|op| {
+                    !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as")
+                        && !matches!(&op.kind, OpKind::BinOp { op, .. } if op == "same_as")
+                })
+            }),
+            "identity bind leaves no same_as"
+        );
+        let layout = crate::vec_layout::probe();
+        assert_ne!(
+            layout.ptr_offset, layout.cap_offset,
+            "buf word is not the capacity word"
         );
     }
 

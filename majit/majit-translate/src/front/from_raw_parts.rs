@@ -60,10 +60,19 @@ pub(crate) fn rewire_from_raw_parts_sites(graph: &mut FunctionGraph) -> usize {
         }
     }
     let mut rewritten = 0usize;
-    for (bi, oi, canonical, result_ty) in sites {
+    for (bi, oi, canonical, result_ty) in sites.into_iter().rev() {
         let Some(live) = ensure_live_rep(graph, bi, &canonical) else {
             continue;
         };
+        let result = graph.blocks[bi].operations[oi].result.clone();
+        if let Some(result) = result
+            && crate::front::mir::forward_identity(graph, &result, &live)
+        {
+            rewritten += 1;
+            continue;
+        }
+        // `live` is this block's input. The call result is a different
+        // variable the edge already named, so the copy stays.
         let Some(live_ty) = var_value_type(graph, &live) else {
             continue;
         };
@@ -475,12 +484,16 @@ mod tests {
             !residual_from_raw_parts(&g),
             "header-view from_raw_parts must be gone"
         );
-        assert!(g.blocks[a.0].operations.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::UnaryOp { op, operand, .. } if op == "same_as" && operand == &header
-            )
-        }));
+        assert!(
+            g.blocks[a.0].operations.iter().all(|op| {
+                !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as")
+            }),
+            "the slice is the header, with no same_as copy"
+        );
+        assert_eq!(
+            g.blocks[a.0].exits[0].args[0].as_variable(),
+            Some(&header)
+        );
     }
 
     #[test]
@@ -527,12 +540,15 @@ mod tests {
 
         assert_eq!(rewire_from_raw_parts_sites(&mut g), 1);
         assert!(!residual_from_raw_parts(&g));
-        assert!(g.blocks[a.0].operations.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::UnaryOp { op, operand, .. } if op == "same_as" && operand == &header
-            )
-        }));
+        assert!(
+            g.blocks[a.0].operations.iter().all(|op| {
+                !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as")
+            })
+        );
+        assert_eq!(
+            g.blocks[a.0].exits[0].args[0].as_variable(),
+            Some(&header)
+        );
     }
 
     #[test]
@@ -712,17 +728,21 @@ mod tests {
             !residual_from_raw_parts(&g),
             "SSA+cast STR header view must be gone"
         );
+        let frp = &g.blocks[b_frp.0];
         assert!(
-            g.blocks[b_frp.0]
-                .operations
+            frp.operations
                 .iter()
-                .any(|op| { matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as") }),
-            "from_raw_parts block must alias the threaded header"
+                .all(|op| { !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as") }),
+            "the slice is the threaded header, with no same_as copy"
         );
         assert_eq!(
-            g.blocks[b_frp.0].inputargs.len(),
+            frp.inputargs.len(),
             3,
             "header must be threaded onto the unique predecessor edge"
+        );
+        assert_eq!(
+            frp.exits[0].args[0].as_variable(),
+            Some(&frp.inputargs[2])
         );
     }
 
