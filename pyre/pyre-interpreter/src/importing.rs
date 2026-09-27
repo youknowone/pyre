@@ -1935,10 +1935,10 @@ fn new_builtin_module(
 /// the handful of builtins imported before that are fixed up in bulk by
 /// `_bootstrap._setup`'s sys.modules walk, so a no-op here is correct then.
 #[cfg(feature = "host_env")]
-fn set_builtin_module_spec(name: &str, module: PyObjectRef) -> Result<(), crate::PyError> {
+fn set_builtin_module_spec(name: &str, mut module: PyObjectRef) -> Result<(), crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
-    let Some(bootstrap) = importlib_bootstrap_module() else {
+    let Some(bootstrap) = pyre_object::with_roots!(module => importlib_bootstrap_module()) else {
         return Ok(());
     };
 
@@ -2069,14 +2069,13 @@ fn extension_module_spec(name: &str, pathname: &Path) -> PyObjectRef {
 fn set_extension_module_spec(
     name: &str,
     pathname: &Path,
-    module: PyObjectRef,
+    mut module: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
-    let (Some(bootstrap), Some(ext)) = (
-        importlib_bootstrap_module(),
-        importlib_bootstrap_external_module(),
-    ) else {
+    let bootstrap = pyre_object::with_roots!(module => importlib_bootstrap_module());
+    let ext = pyre_object::with_roots!(module => importlib_bootstrap_external_module());
+    let (Some(bootstrap), Some(ext)) = (bootstrap, ext) else {
         return Ok(());
     };
 
@@ -2137,13 +2136,13 @@ fn set_extension_module_spec(
 /// `ns` (the module dict) is written in place; the caller keeps it pinned.
 #[cfg(feature = "host_env")]
 fn fix_up_source_module_spec(
-    ns: PyObjectRef,
+    mut ns: PyObjectRef,
     pathname: &rustpython_wtf8::Wtf8,
     cpathname: Option<&str>,
 ) -> Result<bool, crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
-    let Some(ext) = importlib_bootstrap_external_module() else {
+    let Some(ext) = pyre_object::with_roots!(ns => importlib_bootstrap_external_module()) else {
         return Ok(false);
     };
     let Some(w_name) = (unsafe { pyre_object::w_dict_getitem_str(ns, "__name__") }) else {
@@ -4296,7 +4295,7 @@ fn python_sys_path_dirs() -> Result<Option<Vec<PathBuf>>, crate::PyError> {
     // Copy the entries up front so no Python borrow is held across the
     // filesystem probes in `find_in_dirs` (which never invoke user code).
     let mut dirs = Vec::new();
-    if let Some(w_path) = unsafe { pyre_object::w_dict_getitem_str(w_dict, "path") }
+    if let Some(mut w_path) = unsafe { pyre_object::w_dict_getitem_str(w_dict, "path") }
         && unsafe { pyre_object::is_list(w_path) }
     {
         let n = unsafe { pyre_object::listobject::w_list_len(w_path) };
@@ -4308,7 +4307,9 @@ fn python_sys_path_dirs() -> Result<Option<Vec<PathBuf>>, crate::PyError> {
                 // native filesystem probe, and CPython also skips an entry no
                 // hook accepts.
                 if unsafe { pyre_object::is_str(item) } {
-                    dirs.push(crate::gateway::fspath_buf(item)?);
+                    dirs.push(
+                        pyre_object::with_roots!(w_path => crate::gateway::fspath_buf(item))?,
+                    );
                 }
             }
         }
@@ -4395,7 +4396,8 @@ fn parent_package_path(parent: PyObjectRef) -> Result<Option<Vec<PathBuf>>, crat
     if w_dict.is_null() || !unsafe { pyre_object::is_dict(w_dict) } {
         return Ok(None);
     }
-    let Some(path_obj) = (unsafe { pyre_object::w_dict_getitem_str(w_dict, "__path__") }) else {
+    let Some(mut path_obj) = (unsafe { pyre_object::w_dict_getitem_str(w_dict, "__path__") })
+    else {
         return Ok(None);
     };
     if path_obj.is_null() || !unsafe { pyre_object::is_list(path_obj) } {
@@ -4407,7 +4409,7 @@ fn parent_package_path(parent: PyObjectRef) -> Result<Option<Vec<PathBuf>>, crat
         if let Some(item) = unsafe { pyre_object::listobject::w_list_getitem(path_obj, i as i64) }
             && unsafe { pyre_object::is_str(item) }
         {
-            dirs.push(crate::gateway::fspath_buf(item)?);
+            dirs.push(pyre_object::with_roots!(path_obj => crate::gateway::fspath_buf(item))?);
         }
     }
     Ok(Some(dirs))
@@ -4461,8 +4463,8 @@ fn parse_source_module(
 // instead of erasing the field).
 
 fn exec_code_module(
-    w_code: PyObjectRef,
-    w_globals: pyre_object::PyObjectRef,
+    mut w_code: PyObjectRef,
+    mut w_globals: pyre_object::PyObjectRef,
     execution_context: *const PyExecutionContext,
     pathname: Option<&rustpython_wtf8::Wtf8>,
     cpathname: Option<&str>,
@@ -4509,7 +4511,8 @@ fn exec_code_module(
         // before that, seed `__loader__`/`__spec__` with `None` only when
         // missing — the `if not loader / if not spec` guards at
         // `_bootstrap_external.py:_fix_up_module`.
-        if !fix_up_source_module_spec(w_globals, p, cpathname)? {
+        if !pyre_object::with_roots!(w_code, w_globals => fix_up_source_module_spec(w_globals, p, cpathname))?
+        {
             if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__loader__") }.is_none() {
                 unsafe {
                     pyre_object::w_dict_setitem_str(w_globals, "__loader__", pyre_object::w_none());
@@ -5284,16 +5287,17 @@ fn load_part(
     if full_is_builtin {
         // `interp_imp.py create_builtin` for a name `sys.modules` does not
         // hold, then the spec `module_from_spec` stamps.
-        let m = getbuiltinmodule(modulename, true, false, execution_context)?.ok_or_else(|| {
-            crate::PyError::new(
-                crate::PyErrorKind::ImportError,
-                format!("builtin module '{modulename}' failed to initialize"),
-            )
-        })?;
-        set_builtin_module_spec(modulename, m)?;
+        let mut m =
+            getbuiltinmodule(modulename, true, false, execution_context)?.ok_or_else(|| {
+                crate::PyError::new(
+                    crate::PyErrorKind::ImportError,
+                    format!("builtin module '{modulename}' failed to initialize"),
+                )
+            })?;
+        pyre_object::with_roots!(m => set_builtin_module_spec(modulename, m))?;
         // The spec runs app-level code, which can rebind the name; re-read
         // the live entry from sys.modules.
-        let m = check_sys_modules(modulename).unwrap_or(m);
+        let m = pyre_object::with_roots!(m => check_sys_modules(modulename)).unwrap_or(m);
         return Ok(Some(m));
     }
 
@@ -5407,17 +5411,17 @@ fn load_part(
             // Same `create_builtin` as the full_is_builtin branch above; a
             // builtin is found only for a top-level name, so `partname` is
             // `modulename`.
-            let m =
+            let mut m =
                 getbuiltinmodule(partname, true, false, execution_context)?.ok_or_else(|| {
                     crate::PyError::new(
                         crate::PyErrorKind::ImportError,
                         format!("builtin module '{modulename}' failed to initialize"),
                     )
                 })?;
-            set_builtin_module_spec(partname, m)?;
+            pyre_object::with_roots!(m => set_builtin_module_spec(partname, m))?;
             // The spec runs app-level code, which can rebind the name; re-read
             // the live entry from sys.modules.
-            check_sys_modules(modulename).unwrap_or(m)
+            pyre_object::with_roots!(m => check_sys_modules(modulename)).unwrap_or(m)
         }
     };
 
@@ -5552,7 +5556,7 @@ fn join_module_name(parts: &[&Wtf8]) -> Wtf8Buf {
 
 fn absolute_import(
     modulename: &Wtf8,
-    w_fromlist: PyObjectRef,
+    mut w_fromlist: PyObjectRef,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
     // `moduledef.py Module.install` execs `importlib/_bootstrap.py` and
@@ -5572,11 +5576,13 @@ fn absolute_import(
         if sys_modules_blocks(frozen) {
             return Err(import_halted(modulename));
         }
-        if let Some(cached) = check_sys_modules(frozen) {
+        if let Some(cached) = pyre_object::with_roots!(w_fromlist => check_sys_modules(frozen)) {
             return Ok(cached);
         }
         #[cfg(feature = "host_env")]
-        if let Some(pathname) = frozen_bootstrap_source(frozen)? {
+        if let Some(pathname) =
+            pyre_object::with_roots!(w_fromlist => frozen_bootstrap_source(frozen))?
+        {
             return load_source_module(frozen, &pathname, None, execution_context);
         }
     }
@@ -5604,20 +5610,21 @@ fn absolute_import(
         // `_find_and_load_unlocked` runs, so the parent binding below is the
         // business of a load this call actually performed.  Read before
         // `load_part`, which answers the cache and cannot be asked afterwards.
-        let was_cached = modules_cached(&full_name).is_some();
+        let was_cached =
+            pyre_object::with_roots!(w_fromlist => modules_cached(&full_name)).is_some();
         let parent_dirs = match parent {
             None => None,
             Some(_) if was_cached || modules_block(&full_name) => None,
-            Some(parent_mod) => {
-                if crate::baseobjspace::findattr_result(parent_mod, "__path__")?.is_none() {
+            Some(mut parent_mod) => {
+                if pyre_object::with_roots!(parent_mod, w_fromlist => crate::baseobjspace::findattr_result(parent_mod, "__path__"))?.is_none() {
                     let parent_name = join_module_name(&parts[..level]);
                     return Err(module_not_found_parent(&full_name, &parent_name));
                 }
-                parent_package_path(parent_mod)?
+                pyre_object::with_roots!(w_fromlist => parent_package_path(parent_mod))?
             }
         };
-        let w_mod = load_part(&full_name, part, parent_dirs.as_deref(), execution_context)?;
-        let Some(module) = w_mod else {
+        let w_mod = pyre_object::with_roots!(w_fromlist => load_part(&full_name, part, parent_dirs.as_deref(), execution_context))?;
+        let Some(mut module) = w_mod else {
             // _bootstrap.py:1335 raises for the prefix that actually failed
             // (`name=name`): `import a.b.c` with `a.b` missing reports `a.b`.
             return Err(module_not_found_name(&full_name));
@@ -5631,7 +5638,7 @@ fn absolute_import(
         if !was_cached
             && let Some(parent_mod) = parent
             && let Some(part_utf8) = name_utf8(part)
-            && let Err(err) = crate::setattr_str(parent_mod, part_utf8, module)
+            && let Err(err) = pyre_object::with_roots!(module, w_fromlist => crate::setattr_str(parent_mod, part_utf8, module))
         {
             if err.kind != crate::PyErrorKind::AttributeError {
                 return Err(err);
@@ -5778,7 +5785,7 @@ fn gcd_import_cache_probe_w(w_name: PyObjectRef) -> Result<GcdCache, crate::PyEr
     gcd_import_cache_probe_after(w_module)
 }
 
-fn gcd_import_cache_probe_after(w_module: PyObjectRef) -> Result<GcdCache, crate::PyError> {
+fn gcd_import_cache_probe_after(mut w_module: PyObjectRef) -> Result<GcdCache, crate::PyError> {
     // Exact module only — the same cut `sys_module_if_initialized` already
     // applies.  A non-module is FastPathGiveUp: `findattr` would enter
     // `getattr_str_impl` (`force` + `pin_root` + `w_str_new_managed`), and
@@ -5791,7 +5798,7 @@ fn gcd_import_cache_probe_after(w_module: PyObjectRef) -> Result<GcdCache, crate
     if dict.is_null() {
         return Ok(GcdCache::Miss);
     }
-    let w_spec = module_dict_get_spec(dict);
+    let w_spec = pyre_object::with_roots!(w_module => module_dict_get_spec(dict));
     if import_lookup_is_err(w_spec) {
         return Err(take_published_residual_error());
     }
@@ -5806,8 +5813,10 @@ fn gcd_import_cache_probe_after(w_module: PyObjectRef) -> Result<GcdCache, crate
     // "initialized" (a builtin module).  The `"_initializing"` literal
     // is built at the call site; keep it inside the residual so
     // stringbuilder stays off the look-inside graph.
-    let w_initializing = module_spec_get_initializing(w_spec);
-    if !w_initializing.is_null() && is_true_import(w_initializing)? {
+    let w_initializing = pyre_object::with_roots!(w_module => module_spec_get_initializing(w_spec));
+    if !w_initializing.is_null()
+        && pyre_object::with_roots!(w_module => is_true_import(w_initializing))?
+    {
         return Ok(GcdCache::Initializing(w_module));
     }
     Ok(GcdCache::Ready(w_module))
@@ -6509,8 +6518,8 @@ pub extern "C" fn take_published_residual_error_jit_abi() -> i64 {
 pub(crate) fn dunder_import_absolute_head(
     name: &str,
     w_mod: PyObjectRef,
-    w_globals: PyObjectRef,
-    w_locals: PyObjectRef,
+    mut w_globals: PyObjectRef,
+    mut w_locals: PyObjectRef,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
     // `import a.b` answers `a`.
@@ -6519,7 +6528,7 @@ pub(crate) fn dunder_import_absolute_head(
         return Ok(w_mod);
     }
     let head = rpython_str_slice_prefix(name, dotindex);
-    if let Some(w_head) = gcd_import_fast(head)? {
+    if let Some(w_head) = pyre_object::with_roots!(w_globals, w_locals => gcd_import_fast(head))? {
         return Ok(w_head);
     }
     // An uncached head is what `_bootstrap.__import__`'s own
@@ -7630,8 +7639,8 @@ pub(crate) fn is_spec_uninitialized_submodule(
 /// Exact `importlib._bootstrap.ModuleSpec` (not a subclass).  That class's
 /// `has_location` is the `_set_fileattr` field (`_bootstrap.py has_location`);
 /// a subclass or a custom spec object must go through the public name.
-fn is_exact_stdlib_module_spec(w_spec: PyObjectRef) -> bool {
-    let Some(bootstrap) = importlib_bootstrap_module() else {
+fn is_exact_stdlib_module_spec(mut w_spec: PyObjectRef) -> bool {
+    let Some(bootstrap) = pyre_object::with_roots!(w_spec => importlib_bootstrap_module()) else {
         return false;
     };
     let dict = unsafe { pyre_object::w_module_get_w_dict(bootstrap) };
@@ -7651,7 +7660,9 @@ fn is_exact_stdlib_module_spec(w_spec: PyObjectRef) -> bool {
 /// when `has_location` is truthy and `origin` is a string, otherwise None.  A
 /// missing `has_location` / `origin`, or a falsey `has_location`, yields None;
 /// other lookup errors and the truth test propagate.
-pub(crate) fn spec_file_origin(w_spec: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
+pub(crate) fn spec_file_origin(
+    mut w_spec: PyObjectRef,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
     if unsafe { pyre_object::is_none(w_spec) } {
         return Ok(None);
     }
@@ -7663,7 +7674,7 @@ pub(crate) fn spec_file_origin(w_spec: PyObjectRef) -> Result<Option<PyObjectRef
     // map-specialized function-entry whose map guard fails across specs.
     // A custom spec or a `ModuleSpec` subclass that overrides the property
     // must still see the public name.
-    let location_attr = if is_exact_stdlib_module_spec(w_spec) {
+    let location_attr = if pyre_object::with_roots!(w_spec => is_exact_stdlib_module_spec(w_spec)) {
         "_set_fileattr"
     } else {
         "has_location"
@@ -7730,9 +7741,9 @@ pub(crate) fn is_possibly_shadowing(origin: &rustpython_wtf8::Wtf8) -> bool {
 /// `sys.stdlib_module_names`.
 pub(crate) fn module_shadow_info(
     w_spec: PyObjectRef,
-    w_name: PyObjectRef,
+    mut w_name: PyObjectRef,
 ) -> Result<(Option<Wtf8Buf>, bool, bool), crate::PyError> {
-    let origin = match spec_file_origin(w_spec)? {
+    let origin = match pyre_object::with_roots!(w_name => spec_file_origin(w_spec))? {
         // A `spec.origin` is a filename, so it can hold the surrogate escape
         // an undecodable path byte decodes to and has no `&str` spelling.
         Some(o) => unsafe { pyre_object::w_str_get_wtf8(o) }.to_wtf8_buf(),
@@ -7763,7 +7774,7 @@ pub(crate) fn module_shadow_info(
     Ok((Some(origin), true, shadowing_stdlib))
 }
 
-pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+pub fn import_from(mut module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
     // Module.descr_getattribute → object_getattribute → getdictvalue
     // (`module.py getdictvalue` is finditem_str(self.w_dict, attr)).
     // Spelled here so the walk does not enter getattr_str_impl: force()
@@ -7777,7 +7788,7 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate
         {
             let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
             if !dict.is_null()
-                && let Some(value) = crate::baseobjspace::finditem_str(dict, name)?
+                && let Some(value) = pyre_object::with_roots!(module => crate::baseobjspace::finditem_str(dict, name))?
             {
                 return Ok(value);
             }
@@ -7789,12 +7800,12 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate
 /// pyopcode.py import_from after the module-dict hit: full getattr,
 /// then the sys.modules submodule fallback and ImportError.
 #[majit_macros::dont_look_inside]
-fn import_from_slow(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+fn import_from_slow(mut module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
     // pyopcode.py import_from — first `space.getattr(w_module, w_name)`,
     // which honours the module attribute protocol (`__getattribute__` /
     // `__getattr__`).  Only an AttributeError falls through to the
     // `sys.modules` lookup below; any other error propagates.
-    match crate::baseobjspace::getattr_str(module, name) {
+    match pyre_object::with_roots!(module => crate::baseobjspace::getattr_str(module, name)) {
         Ok(value) => return Ok(value),
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {}
         Err(e) => return Err(e),
@@ -7993,44 +8004,45 @@ fn type_name_for_err(w_obj: PyObjectRef) -> String {
 ///         continue
 ///     into_locals[name] = getattr(module, name)
 /// ```
-fn import_all_from_each<F>(module: PyObjectRef, mut write: F) -> Result<(), crate::PyError>
+fn import_all_from_each<F>(mut module: PyObjectRef, mut write: F) -> Result<(), crate::PyError>
 where
     F: FnMut(&str, PyObjectRef) -> Result<(), crate::PyError>,
 {
-    let (w_iterable, skip_leading_underscores) =
-        match crate::baseobjspace::getattr_str(module, "__all__") {
-            Ok(w_all) => (w_all, false),
-            Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-                // pyopcode.py:2225-2230 — `dict = module.__dict__; all = dict.keys()`.
-                // `space.getattr(module, '__dict__')` so any object exposing
-                // `__dict__` (Module, class, instance with `__dict__`,
-                // bytes-keyed proxies, ...) participates.
-                match crate::baseobjspace::getattr_str(module, "__dict__") {
-                    Ok(w_dict) => {
-                        let w_keys_method = crate::baseobjspace::getattr_str(w_dict, "keys")?;
-                        // pyopcode.py `all = dict.keys()` — pyre's
-                        // `call_function` stashes errors as PY_NULL; use
-                        // `call_and_check` so a misbehaving `keys()` (or
-                        // `__getattr__`-installed override) raises here
-                        // rather than handing a bogus iterable to
-                        // `space.iter` below.
-                        let w_keys = crate::builtins::call_and_check(w_keys_method, &[])?;
-                        (w_keys, true)
-                    }
-                    Err(e2) if e2.kind == crate::PyErrorKind::AttributeError => {
-                        return Err(crate::PyError::new(
-                            crate::PyErrorKind::ImportError,
-                            "from-import-* object has no __dict__ and no __all__".to_string(),
-                        ));
-                    }
-                    Err(e2) => return Err(e2),
+    let (mut w_iterable, skip_leading_underscores) = match pyre_object::with_roots!(module => crate::baseobjspace::getattr_str(module, "__all__"))
+    {
+        Ok(w_all) => (w_all, false),
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+            // pyopcode.py:2225-2230 — `dict = module.__dict__; all = dict.keys()`.
+            // `space.getattr(module, '__dict__')` so any object exposing
+            // `__dict__` (Module, class, instance with `__dict__`,
+            // bytes-keyed proxies, ...) participates.
+            match pyre_object::with_roots!(module => crate::baseobjspace::getattr_str(module, "__dict__"))
+            {
+                Ok(w_dict) => {
+                    let w_keys_method = pyre_object::with_roots!(module => crate::baseobjspace::getattr_str(w_dict, "keys"))?;
+                    // pyopcode.py `all = dict.keys()` — pyre's
+                    // `call_function` stashes errors as PY_NULL; use
+                    // `call_and_check` so a misbehaving `keys()` (or
+                    // `__getattr__`-installed override) raises here
+                    // rather than handing a bogus iterable to
+                    // `space.iter` below.
+                    let w_keys = pyre_object::with_roots!(module => crate::builtins::call_and_check(w_keys_method, &[]))?;
+                    (w_keys, true)
                 }
+                Err(e2) if e2.kind == crate::PyErrorKind::AttributeError => {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::ImportError,
+                        "from-import-* object has no __dict__ and no __all__".to_string(),
+                    ));
+                }
+                Err(e2) => return Err(e2),
             }
-            Err(e) => return Err(e),
-        };
+        }
+        Err(e) => return Err(e),
+    };
 
     // pyopcode.py — `module_name = module.__name__` with str check.
-    let module_name_w = crate::baseobjspace::getattr_str(module, "__name__")?;
+    let module_name_w = pyre_object::with_roots!(module, w_iterable => crate::baseobjspace::getattr_str(module, "__name__"))?;
     if !unsafe { is_str(module_name_w) } {
         return Err(crate::PyError::type_error(format!(
             "module __name__ must be a string, not {}",
@@ -8043,9 +8055,10 @@ where
     module_name.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(module_name_w) });
 
     // pyopcode.py — `for name in all:` lazy iteration.
-    let w_iter = crate::baseobjspace::iter(w_iterable)?;
+    let mut w_iter = pyre_object::with_roots!(module => crate::baseobjspace::iter(w_iterable))?;
     loop {
-        let w_name = match crate::baseobjspace::next(w_iter) {
+        let w_name = match pyre_object::with_roots!(module, w_iter => crate::baseobjspace::next(w_iter))
+        {
             Ok(v) => v,
             Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
@@ -8067,14 +8080,16 @@ where
             msg.push_str(&type_name_for_err(w_name));
             return Err(crate::PyError::type_error(msg));
         }
-        let name = crate::baseobjspace::str_utf8_w(w_name)?.to_string();
+        let name =
+            pyre_object::with_roots!(module, w_iter => crate::baseobjspace::str_utf8_w(w_name))?
+                .to_string();
         // pyopcode.py:2256-2257 — leading-underscore filter (only for
         // the `__dict__.keys()` fallback).
         if skip_leading_underscores && name.starts_with('_') {
             continue;
         }
         // pyopcode.py — `into_locals[name] = getattr(module, name)`.
-        let value = crate::baseobjspace::getattr_str(module, &name)?;
+        let value = pyre_object::with_roots!(module, w_iter => crate::baseobjspace::getattr_str(module, &name))?;
         write(&name, value)?;
     }
     Ok(())

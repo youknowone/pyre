@@ -27,13 +27,13 @@ pub mod deque_block {
         pub data: PyObjectRef,
     }
 
-    pub fn new(leftlink: PyObjectRef, rightlink: PyObjectRef) -> PyObjectRef {
+    pub fn new(mut leftlink: PyObjectRef, mut rightlink: PyObjectRef) -> PyObjectRef {
         // `interp_deque.py Block.data = [None] * BLOCKLEN` is annotated by
         // RPython as a list of `W_Root` references.  It must therefore keep
         // ObjectListStrategy even when every live deque entry is an int or a
         // float; a typed list strategy would unbox and later rebox the entry,
         // breaking deque's shallow-copy identity semantics.
-        let data = w_list_new_object(vec![w_none(); super::BLOCKLEN as usize]);
+        let data = pyre_object::with_roots!(leftlink, rightlink => w_list_new_object(vec![w_none(); super::BLOCKLEN as usize]));
         W_DequeBlock::allocate_stable(W_DequeBlock {
             ob: PyObject {
                 ob_type: std::ptr::null(),
@@ -373,7 +373,7 @@ pub mod deque_iter {
                 positional.len()
             )));
         }
-        let deque = positional[0];
+        let mut deque = positional[0];
         if W_Deque::from_obj(deque).is_none() {
             let name = crate::error::type_name_of(deque);
             return Err(crate::PyError::type_error(format!(
@@ -381,7 +381,9 @@ pub mod deque_iter {
             )));
         }
         let index = match positional.get(1) {
-            Some(&value) => crate::builtins::space_index_w(value)?,
+            Some(&value) => {
+                pyre_object::with_roots!(deque => crate::builtins::space_index_w(value))?
+            }
             None => 0,
         };
         Ok((deque, index))
@@ -525,7 +527,7 @@ pub mod deque_rev_iter {
                     positional.len()
                 )));
             }
-            let deque = positional[0];
+            let mut deque = positional[0];
             if W_Deque::from_obj(deque).is_none() {
                 let name = crate::error::type_name_of(deque);
                 return Err(crate::PyError::type_error(format!(
@@ -533,7 +535,9 @@ pub mod deque_rev_iter {
                 )));
             }
             let requested = match positional.get(1) {
-                Some(&value) => crate::builtins::space_index_w(value)?,
+                Some(&value) => {
+                    pyre_object::with_roots!(deque => crate::builtins::space_index_w(value))?
+                }
                 None => 0,
             };
             Ok(make(deque, requested))
@@ -647,11 +651,11 @@ pub mod deque_rev_iter {
 /// append allocates the next block.  Publish the whole run up front and read
 /// the deque and each element back at the turn that consumes them.
 fn extend_from_iterable(
-    self_obj: PyObjectRef,
+    mut self_obj: PyObjectRef,
     iterable: PyObjectRef,
     is_extend_right: bool,
 ) -> Result<(), crate::PyError> {
-    let items = crate::builtins::collect_iterable(iterable)?;
+    let items = pyre_object::with_roots!(self_obj => crate::builtins::collect_iterable(iterable))?;
     let _roots = pyre_object::gc_roots::push_roots();
     let deque_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(self_obj);
@@ -801,11 +805,11 @@ fn pop_left(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
 /// `TypeError`, route any `__index__`-able object through
 /// `getindex_w`, apply the negative-index wrap and the in-range
 /// check, and return the resolved element position.
-fn deque_index(index: PyObjectRef, self_obj: PyObjectRef) -> Result<usize, crate::PyError> {
+fn deque_index(index: PyObjectRef, mut self_obj: PyObjectRef) -> Result<usize, crate::PyError> {
     if unsafe { pyre_object::is_slice(index) } {
         return Err(crate::PyError::type_error("deque[:] is not supported"));
     }
-    let mut idx = crate::builtins::getindex_w(index)?;
+    let mut idx = pyre_object::with_roots!(self_obj => crate::builtins::getindex_w(index))?;
     // PyPy `decode_index4(w_index, self)` bounds the converted index against
     // the deque as it stands *after* `__index__` ran.  Read the owner directly
     // at that point, rather than manufacturing a closure for the length read,
@@ -862,11 +866,12 @@ fn locate(self_obj: PyObjectRef, mut index: i64) -> (PyObjectRef, i64) {
 /// other operand is not a deque.  Delegates to list comparison over
 /// snapshots of both backings.
 fn deque_compare(
-    self_obj: PyObjectRef,
-    other: PyObjectRef,
+    mut self_obj: PyObjectRef,
+    mut other: PyObjectRef,
     op: crate::baseobjspace::CompareOp,
 ) -> Result<PyObjectRef, crate::PyError> {
-    if !crate::baseobjspace::isinstance(other, type_object())? {
+    if !pyre_object::with_roots!(other, self_obj => crate::baseobjspace::isinstance(other, type_object()))?
+    {
         return Ok(pyre_object::w_not_implemented());
     }
     // `compare_by_iteration` walks both deques
@@ -1079,7 +1084,7 @@ impl W_Deque {
             }
             _ => -1,
         };
-        let self_obj = self as *mut W_Deque as PyObjectRef;
+        let mut self_obj = self as *mut W_Deque as PyObjectRef;
         // Reinitialize by clearing, but only when non-empty (`init`:
         // `if self.len > 0: self.clear()`). `store` bumps the iteration lock
         // (`modified`) so an outstanding scan of an existing deque detects the
@@ -1087,7 +1092,7 @@ impl W_Deque {
         // while iterating an empty deque yields StopIteration, not a mutation
         // RuntimeError.
         if deque_len(self_obj) > 0 {
-            clear_blocks(self_obj);
+            pyre_object::with_roots!(self_obj => clear_blocks(self_obj));
         }
         if let Some(it) = iterable {
             extend_from_iterable(self_obj, it, true)?;
@@ -1230,11 +1235,11 @@ impl W_Deque {
         }
     }
     fn rotate(&mut self, n: Option<PyObjectRef>) -> Result<(), crate::PyError> {
-        let self_obj = self as *mut W_Deque as PyObjectRef;
+        let mut self_obj = self as *mut W_Deque as PyObjectRef;
         // Rotate right by n (negative rotates left).  The count goes
         // through `__index__` so non-integers raise `TypeError`.
         let n = match n {
-            Some(v) => crate::builtins::getindex_w(v)?,
+            Some(v) => pyre_object::with_roots!(self_obj => crate::builtins::getindex_w(v))?,
             None => 1,
         };
         // Read-modify-write: `snapshot` and `store` are individually atomic,
@@ -1254,12 +1259,12 @@ impl W_Deque {
         }
         Ok(())
     }
-    fn insert(&mut self, i: PyObjectRef, x: PyObjectRef) -> Result<(), crate::PyError> {
-        let self_obj = self as *mut W_Deque as PyObjectRef;
+    fn insert(&mut self, i: PyObjectRef, mut x: PyObjectRef) -> Result<(), crate::PyError> {
+        let mut self_obj = self as *mut W_Deque as PyObjectRef;
         // `W_Deque.insert(i, x)` — the index goes through `__index__` (converted
         // before the deque is inspected), then a bounded deque that is already
         // full raises before the element is placed.
-        let index = crate::builtins::getindex_w(i)?;
+        let index = pyre_object::with_roots!(self_obj, x => crate::builtins::getindex_w(i))?;
         // See `rotate`: the snapshot/store pair is the read-modify-write that
         // the stripe has to cover as one.
         let _deque_guard = unsafe { w_deque_lock(self_obj) };
@@ -1412,8 +1417,8 @@ impl W_Deque {
         deque_rev_iter::make(self_obj, 0)
     }
     fn __getitem__(&self, index: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
-        let idx = deque_index(index, self_obj)? as i64;
+        let mut self_obj = self as *const W_Deque as PyObjectRef;
+        let idx = pyre_object::with_roots!(self_obj => deque_index(index, self_obj))? as i64;
         // `locate` walks the chain and the caller then reads through the block
         // it returns, so the pair has to exclude a concurrent `store`. The
         // index conversion runs Python and stays outside.
@@ -1425,10 +1430,10 @@ impl W_Deque {
     fn __setitem__(
         &mut self,
         index: PyObjectRef,
-        value: PyObjectRef,
+        mut value: PyObjectRef,
     ) -> Result<(), crate::PyError> {
-        let self_obj = self as *mut W_Deque as PyObjectRef;
-        let idx = deque_index(index, self_obj)? as i64;
+        let mut self_obj = self as *mut W_Deque as PyObjectRef;
+        let idx = pyre_object::with_roots!(self_obj, value => deque_index(index, self_obj))? as i64;
         // interp_deque.py W_Deque.setitem replaces the block entry in place
         // and deliberately does not call `modified()`: deque iterators remain
         // valid and observe subsequently assigned elements (including after
@@ -1440,8 +1445,8 @@ impl W_Deque {
         Ok(())
     }
     fn __delitem__(&mut self, index: PyObjectRef) -> Result<(), crate::PyError> {
-        let self_obj = self as *mut W_Deque as PyObjectRef;
-        let idx = deque_index(index, self_obj)?;
+        let mut self_obj = self as *mut W_Deque as PyObjectRef;
+        let idx = pyre_object::with_roots!(self_obj => deque_index(index, self_obj))?;
         // See `rotate`: the snapshot/store pair is the read-modify-write that
         // the stripe has to cover as one.
         let _deque_guard = unsafe { w_deque_lock(self_obj) };
@@ -1475,7 +1480,7 @@ impl W_Deque {
         let self_obj = self as *mut W_Deque as PyObjectRef;
         deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Ge)
     }
-    fn __add__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    fn __add__(&self, mut other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         let self_obj = self as *const W_Deque as PyObjectRef;
         if W_Deque::from_obj(other).is_none() {
             return Err(crate::PyError::type_error(format!(
@@ -1486,7 +1491,7 @@ impl W_Deque {
 
         // CPython 3.14 deque_concat copies the left operand, preserving its
         // concrete subtype, then extends that copy with the right deque.
-        let copy = self.copy()?;
+        let copy = pyre_object::with_roots!(other => self.copy())?;
         if W_Deque::from_obj(copy).is_none() {
             return Err(crate::PyError::type_error(
                 "deque.__add__ returned a non-deque",
@@ -1502,8 +1507,8 @@ impl W_Deque {
     }
     fn __iadd__(&mut self, iterable: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         // interp_deque.py W_Deque.iadd: extend in place and return self.
-        let self_obj = self as *mut W_Deque as PyObjectRef;
-        self.extend(iterable)?;
+        let mut self_obj = self as *mut W_Deque as PyObjectRef;
+        pyre_object::with_roots!(self_obj => self.extend(iterable))?;
         Ok(self_obj)
     }
     fn __mul__(&self, n: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -1571,7 +1576,7 @@ impl W_Deque {
         Ok(self_obj)
     }
     fn __repr__(&self) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+        let mut self_obj = self as *const W_Deque as PyObjectRef;
         // `dequerepr` — a deque reachable from its own items renders
         // the inner reference as `[...]` instead of recursing.
         let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
@@ -1589,7 +1594,9 @@ impl W_Deque {
             if i != 0 {
                 out.push_str(", ");
             }
-            out.push_wtf8(&unsafe { crate::py_repr_wtf8(item)? });
+            out.push_wtf8(
+                &pyre_object::with_roots!(self_obj => unsafe { crate::py_repr_wtf8(item) })?,
+            );
         }
         match maxlen_bound(self_obj) {
             Some(m) => out.push_str(&format!("], maxlen={m})")),

@@ -591,8 +591,8 @@ pub unsafe fn w_cdata_dealloc(obj: PyObjectRef) {
 /// This runs from the interpreter finalizer queue, where calling Python is
 /// permitted.  It is separate from [`w_cdata_dealloc`], the allocation-free
 /// sweep destructor.
-pub fn finalize(w_cdata: PyObjectRef) -> Result<(), PyError> {
-    let flavor = cdata_arg(w_cdata)?.flavor;
+pub fn finalize(mut w_cdata: PyObjectRef) -> Result<(), PyError> {
+    let flavor = pyre_object::with_roots!(w_cdata => cdata_arg(w_cdata))?.flavor;
     match flavor {
         FLAVOR_FROM_BUFFER => release_buffer_export(w_cdata),
         FLAVOR_GCP | FLAVOR_NEW_NONSTD => invoke_destructor(w_cdata),
@@ -614,8 +614,8 @@ pub fn ec_finalizer_kind(obj: PyObjectRef) -> Option<bool> {
 }
 
 /// Run [`finalize`] and write an unraisable if it raises.
-pub fn run_ec_finalize(obj: PyObjectRef) {
-    if let Err(mut error) = finalize(obj) {
+pub fn run_ec_finalize(mut obj: PyObjectRef) {
+    if let Err(mut error) = pyre_object::with_roots!(obj => finalize(obj)) {
         error.write_unraisable(
             pyre_object::w_none(),
             rustpython_wtf8::Wtf8::new("Exception ignored in cffi destructor"),
@@ -649,8 +649,8 @@ fn invoke_destructor(w_cdata: PyObjectRef) -> Result<(), PyError> {
 }
 
 /// `W_CDataFromBuffer.enter_exit`'s export release.
-fn release_buffer_export(w_cdata: PyObjectRef) -> Result<(), PyError> {
-    let cdata = cdata_arg(w_cdata)?;
+fn release_buffer_export(mut w_cdata: PyObjectRef) -> Result<(), PyError> {
+    let cdata = pyre_object::with_roots!(w_cdata => cdata_arg(w_cdata))?;
     if cdata.datasize != 0 && !cdata.w_destructor.is_null() {
         unsafe { pyre_interpreter::builtins::buffer_export_decref(cdata.w_destructor) };
         cdata.datasize = 0;
@@ -857,8 +857,8 @@ fn cdata_exit(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 /// `W_CData.enter_exit` and the overrides of it.
-pub fn enter_exit(w_cdata: PyObjectRef, exit_now: bool) -> Result<(), PyError> {
-    let cdata = cdata_arg(w_cdata)?;
+pub fn enter_exit(mut w_cdata: PyObjectRef, exit_now: bool) -> Result<(), PyError> {
+    let cdata = pyre_object::with_roots!(w_cdata => cdata_arg(w_cdata))?;
     // `W_CDataPtrToStructOrUnion.enter_exit` reaches the struct it co-owns
     // through `_do_exit`, not through that object's own `enter_exit`: its
     // ctype is the struct itself, which the owning check below refuses.
@@ -870,7 +870,7 @@ pub fn enter_exit(w_cdata: PyObjectRef, exit_now: bool) -> Result<(), PyError> {
     }
     if cdata.flavor == FLAVOR_FROM_BUFFER {
         if exit_now {
-            release_buffer_export(w_cdata)?;
+            pyre_object::with_roots!(w_cdata => release_buffer_export(w_cdata))?;
             pyre_interpreter::executioncontext::may_ignore_finalizer(w_cdata);
         }
         return Ok(());
@@ -878,7 +878,7 @@ pub fn enter_exit(w_cdata: PyObjectRef, exit_now: bool) -> Result<(), PyError> {
     // `W_CDataGCP.enter_exit`, which carries no owning check of its own.
     if cdata.flavor == FLAVOR_GCP {
         if exit_now {
-            invoke_destructor(w_cdata)?;
+            pyre_object::with_roots!(w_cdata => invoke_destructor(w_cdata))?;
             pyre_interpreter::executioncontext::may_ignore_finalizer(w_cdata);
         }
         return Ok(());
@@ -898,8 +898,8 @@ pub fn enter_exit(w_cdata: PyObjectRef, exit_now: bool) -> Result<(), PyError> {
 
 /// `W_CDataNewStd._do_exit` and `W_CDataNewNonStd._do_exit`.  Any other
 /// flavor is not a `W_CDataNewOwning`, and owns nothing to release.
-fn do_exit(w_cdata: PyObjectRef) -> Result<(), PyError> {
-    let cdata = cdata_arg(w_cdata)?;
+fn do_exit(mut w_cdata: PyObjectRef) -> Result<(), PyError> {
+    let cdata = pyre_object::with_roots!(w_cdata => cdata_arg(w_cdata))?;
     match cdata.flavor {
         FLAVOR_NEW_STD => {
             if cdata.datasize >= 0 {
@@ -916,7 +916,7 @@ fn do_exit(w_cdata: PyObjectRef) -> Result<(), PyError> {
             if !cdata.w_destructor.is_null() {
                 add_memory_pressure(w_cdata, -cdata.sizeof()?);
             }
-            invoke_destructor(w_cdata)?;
+            pyre_object::with_roots!(w_cdata => invoke_destructor(w_cdata))?;
             pyre_interpreter::executioncontext::may_ignore_finalizer(w_cdata);
         }
         _ => {}
@@ -926,11 +926,11 @@ fn do_exit(w_cdata: PyObjectRef) -> Result<(), PyError> {
 
 /// `W_CData.with_gc`.
 pub fn with_gc(
-    w_cdata: PyObjectRef,
-    w_destructor: PyObjectRef,
+    mut w_cdata: PyObjectRef,
+    mut w_destructor: PyObjectRef,
     size: i64,
 ) -> Result<PyObjectRef, PyError> {
-    let cdata = cdata_arg(w_cdata)?;
+    let cdata = pyre_object::with_roots!(w_cdata, w_destructor => cdata_arg(w_cdata))?;
     if unsafe { pyre_object::pyobject::is_none(w_destructor) } {
         if cdata.flavor != FLAVOR_GCP {
             return Err(PyError::type_error(
@@ -1047,8 +1047,8 @@ enum CompareMode {
     Objects(PyObjectRef, PyObjectRef),
 }
 
-fn compare_mode(w_self: PyObjectRef, w_other: PyObjectRef) -> Result<CompareMode, PyError> {
-    let cdata = cdata_arg(w_self)?;
+fn compare_mode(w_self: PyObjectRef, mut w_other: PyObjectRef) -> Result<CompareMode, PyError> {
+    let cdata = pyre_object::with_roots!(w_other => cdata_arg(w_self))?;
     let self_is_ptr = !cdata.ctype_ref()?.is_primitive();
     let other = W_CData::from_obj(w_other);
     let other_is_ptr = other
@@ -1113,12 +1113,13 @@ comparison!(cdata_ge, GreaterOrEqual, |a, b| a >= b);
 
 /// `W_CData.getitem`.
 fn cdata_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_self = args[0];
+    let mut w_self = args[0];
     let w_index = args[1];
     if unsafe { pyre_object::sliceobject::is_slice(w_index) } {
         return do_getslice(w_self, w_index);
     }
-    let i = pyre_interpreter::baseobjspace::getindex_w(w_index)?;
+    let i =
+        pyre_object::with_roots!(w_self => pyre_interpreter::baseobjspace::getindex_w(w_index))?;
     let cdata = cdata_arg(w_self)?;
     let ct = check_subscript_index(cdata, i)?;
     // `W_CDataPtrToStructOrUnion._do_getitem` — `p[0]` is the struct itself.
@@ -1268,8 +1269,9 @@ fn getslicearg(
 }
 
 /// `W_CData._do_getslice`.
-fn do_getslice(w_self: PyObjectRef, w_slice: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    let (w_ctptr, start, length) = getslicearg(w_self, w_slice)?;
+fn do_getslice(mut w_self: PyObjectRef, w_slice: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let (w_ctptr, start, length) =
+        pyre_object::with_roots!(w_self => getslicearg(w_self, w_slice))?;
     let roots = pyre_object::gc_roots::push_roots();
     let self_slot = roots.base();
     let _ = roots.pin_root(w_self);
@@ -1432,11 +1434,12 @@ fn cdata_sub(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `W_CData._add_or_sub`.
 fn add_or_sub(
-    w_self: PyObjectRef,
+    mut w_self: PyObjectRef,
     w_other: PyObjectRef,
     sign: i64,
 ) -> Result<PyObjectRef, PyError> {
-    let i = sign * pyre_interpreter::baseobjspace::getindex_w(w_other)?;
+    let i = sign
+        * pyre_object::with_roots!(w_self => pyre_interpreter::baseobjspace::getindex_w(w_other))?;
     let cdata = cdata_arg(w_self)?;
     ctypeobj::add(cdata.ctype, cdata.ptr as *mut u8, i)
 }
@@ -1449,8 +1452,8 @@ pub fn cdata_sizeof(w_cdata: PyObjectRef) -> Result<i64, PyError> {
 }
 
 /// `W_CData.unpack`.
-pub fn unpack(w_cdata: PyObjectRef, length: i64) -> Result<PyObjectRef, PyError> {
-    let cdata = cdata_arg(w_cdata)?;
+pub fn unpack(mut w_cdata: PyObjectRef, length: i64) -> Result<PyObjectRef, PyError> {
+    let cdata = pyre_object::with_roots!(w_cdata => cdata_arg(w_cdata))?;
     let ct = cdata.ctype_ref()?;
     if !ct.has(ctypeobj::CTypeFlags::NONFUNC_POINTER_OR_ARRAY) {
         return Err(PyError::type_error(format!(

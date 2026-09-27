@@ -350,11 +350,11 @@ mod imp {
     }
 
     fn write_result(
-        obj: PyObjectRef,
-        value: PyObjectRef,
+        mut obj: PyObjectRef,
+        mut value: PyObjectRef,
         result: *mut c_void,
     ) -> Result<(), pyre_interpreter::PyError> {
-        match funcptr::resolve_restype(obj)? {
+        match pyre_object::with_roots!(obj, value => funcptr::resolve_restype(obj))? {
             funcptr::Ret::Void => Ok(()),
             funcptr::Ret::Code(c) => {
                 let bytes = cdata::encode_value_into(&c, value, obj, "result")?;

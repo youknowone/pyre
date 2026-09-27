@@ -80,7 +80,7 @@ impl Poll {
     /// `POLLIN | POLLOUT | POLLPRI`.
     fn register(
         &mut self,
-        w_fd: PyObjectRef,
+        mut w_fd: PyObjectRef,
         #[default(pyre_object::w_none())] w_events: PyObjectRef,
     ) -> Result<(), pyre_interpreter::PyError> {
         // @unwrap_spec(events="c_ushort"): reject negative / >0xffff.  The
@@ -88,7 +88,8 @@ impl Poll {
         let events = if unsafe { pyre_object::is_none(w_events) } {
             default_poll_events()
         } else {
-            pyre_interpreter::baseobjspace::c_ushort_w(w_events)? as i16
+            pyre_object::with_roots!(w_fd => pyre_interpreter::baseobjspace::c_ushort_w(w_events))?
+                as i16
         };
         let fd = filedescriptor_w(w_fd)?;
         self.fddict.insert(fd, events);
@@ -99,12 +100,13 @@ impl Poll {
     /// a descriptor that was never registered.
     fn modify(
         &mut self,
-        w_fd: PyObjectRef,
+        mut w_fd: PyObjectRef,
         w_events: PyObjectRef,
     ) -> Result<(), pyre_interpreter::PyError> {
         // @unwrap_spec(events="c_ushort"): reject negative / >0xffff.  The
         // gateway converts it before the body resolves the descriptor.
-        let events = pyre_interpreter::baseobjspace::c_ushort_w(w_events)? as i16;
+        let events = pyre_object::with_roots!(w_fd => pyre_interpreter::baseobjspace::c_ushort_w(w_events))?
+            as i16;
         let fd = filedescriptor_w(w_fd)?;
         let known = self.fddict.contains_key(&fd);
         if known {
@@ -351,7 +353,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // the caller's root bracket and named by its slot.
                 fn collect_fds(
                     seq: pyre_object::PyObjectRef,
-                ) -> Result<Vec<(usize, host_select::RawFd)>, pyre_interpreter::PyError> {
+                ) -> Result<Vec<(usize, host_select::RawFd)>, pyre_interpreter::PyError>
+                {
                     let items = pyre_interpreter::baseobjspace::unpackiterable(seq, -1)?;
                     let base = pyre_object::gc_roots::pin_roots(&items);
                     let mut out = Vec::with_capacity(items.len());

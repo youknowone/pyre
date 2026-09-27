@@ -102,9 +102,9 @@ pub fn raise_type_error(
 /// from CPython-style interned-string identity.  The typed fallback routes
 /// through `W_UnicodeObject.eq_w`; using generic `space.eq_w` here would invoke
 /// Python-level `__eq__` on hand-built Arguments and silently drift.
-pub fn contains_w_names(w_key: PyObjectRef, keys_w: &[PyObjectRef]) -> bool {
-    for &w_other in keys_w {
-        if crate::baseobjspace::is_w(w_other, w_key) {
+pub fn contains_w_names(mut w_key: PyObjectRef, keys_w: &[PyObjectRef]) -> bool {
+    for &(mut w_other) in keys_w {
+        if pyre_object::with_roots!(w_key, w_other => crate::baseobjspace::is_w(w_other, w_key)) {
             return true;
         }
         unsafe {
@@ -139,15 +139,16 @@ pub fn check_not_duplicate_kwargs(
     existingkeywords_w: &[PyObjectRef],
     keyword_names_w: &[PyObjectRef],
     _keywords_w: &[PyObjectRef],
-    w_function: PyObjectRef,
+    mut w_function: PyObjectRef,
 ) -> Result<(), crate::PyError> {
-    for &w_key in keyword_names_w {
-        if contains_w_names(w_key, existingkeywords_w) {
+    for &(mut w_key) in keyword_names_w {
+        if pyre_object::with_roots!(w_function, w_key => contains_w_names(w_key, existingkeywords_w))
+        {
             let key_repr = unsafe {
                 if pyre_object::is_str(w_key) {
                     pyre_object::w_str_get_wtf8(w_key).to_owned()
                 } else {
-                    crate::display::py_str_wtf8(w_key)?
+                    pyre_object::with_roots!(w_function => crate::display::py_str_wtf8(w_key))?
                 }
             };
             return Err(raise_type_error(

@@ -1659,8 +1659,8 @@ fn save_bool(ctx: &PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<()
     Ok(())
 }
 
-fn save_long(ctx: &PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
-    let small = crate::baseobjspace::int_w(w_obj).ok();
+fn save_long(ctx: &PickleCtx, buf: &mut Framer, mut w_obj: PyObjectRef) -> Result<(), PyError> {
+    let small = pyre_object::with_roots!(w_obj => crate::baseobjspace::int_w(w_obj)).ok();
     let to_big = |v: Option<i64>| match v {
         Some(v) => BigInt::from(v),
         None => unsafe { crate::builtins::obj_to_bigint(w_obj) },
@@ -2942,14 +2942,14 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
 fn save_global(
     ctx: &mut PickleCtx,
     buf: &mut Framer,
-    w_obj: PyObjectRef,
+    mut w_obj: PyObjectRef,
     w_name_opt: Option<PyObjectRef>,
 ) -> Result<(), PyError> {
     let w_name = match w_name_opt {
         Some(n) => n,
-        None => match crate::baseobjspace::findattr_result(w_obj, "__qualname__")? {
+        None => match pyre_object::with_roots!(w_obj => crate::baseobjspace::findattr_result(w_obj, "__qualname__"))? {
             Some(n) => n,
-            None => crate::baseobjspace::findattr_result(w_obj, "__name__")?
+            None => pyre_object::with_roots!(w_obj => crate::baseobjspace::findattr_result(w_obj, "__name__"))?
                 .ok_or_else(|| pickling_error("Can't pickle object: no __qualname__ / __name__"))?,
         },
     };

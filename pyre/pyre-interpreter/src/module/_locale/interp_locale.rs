@@ -254,7 +254,7 @@ fn c_locale_conv() -> LocaleConvData {
 /// This mirrors the `except ImportError` fallback in the stdlib's
 /// `locale` module, but routed through pyre's builtin-module registry
 /// so a single import succeeds.
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     // Locale category constants sourced from libc so the values match
     // the host (Linux: LC_CTYPE=0; macOS: LC_ALL=0, LC_CTYPE=2; ...).
     // Windows has a C runtime too, and its numbering is a third one again
@@ -404,11 +404,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `interp_locale.py W_Error = _new_exception('Error', W_Exception, 'locale error')`
     let exception_base = crate::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before _locale init");
-    let w_error = crate::builtins::new_exception_class(
+    let w_error = pyre_object::with_roots!(ns => crate::builtins::new_exception_class(
         "locale.Error",
         crate::builtins::exc_exception_new,
         exception_base,
-    );
+    ));
     crate::module_ns_store(ns, "Error", w_error);
 
     // `_localemodule.c:_locale._getdefaultlocale` — this compatibility hook
