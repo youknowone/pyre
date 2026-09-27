@@ -3140,8 +3140,8 @@ impl<S: JitState> JitDriver<S> {
                 // that lowered the source post-loop epilogue has already run it
                 // here, so the value IS the portal's result; leaving it unread
                 // makes the hook break and native Rust run that suffix a second
-                // time.  Void and Ref carry no scalar and leave the latch
-                // empty, which is the same break as before.
+                // time.  Void carries no scalar and leaves the latch empty.
+                // Ref publishes `Value::Ref`, the same latch Int and Float use.
                 match &outcome {
                     crate::jitexc::JitException::DoneWithThisFrameInt(v) => {
                         self.meta.single_pass_finish_values =
@@ -3150,6 +3150,10 @@ impl<S: JitState> JitDriver<S> {
                     crate::jitexc::JitException::DoneWithThisFrameFloat(v) => {
                         self.meta.single_pass_finish_values =
                             Some(core::iter::once(Value::Float(*v)).collect());
+                    }
+                    crate::jitexc::JitException::DoneWithThisFrameRef(v) => {
+                        self.meta.single_pass_finish_values =
+                            Some(core::iter::once(Value::Ref(*v)).collect());
                     }
                     _ => {}
                 }
@@ -3240,6 +3244,18 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
+    /// Ref FINISH result produced by a single-pass tracing walk.
+    ///
+    /// `compile.py DoneWithThisFrameDescrRef`: the address
+    /// `warmstate.py execute_assembler` returns for a REF portal.
+    pub fn take_single_pass_finish_ref(&mut self) -> Option<usize> {
+        let values = self.meta.single_pass_finish_values.take()?;
+        match values.first() {
+            Some(Value::Ref(v)) => Some(v.as_usize()),
+            _ => None,
+        }
+    }
+
     /// Float FINISH result produced by a single-pass tracing walk.
     pub fn take_single_pass_finish_float(&mut self) -> Option<f64> {
         let values = self.meta.single_pass_finish_values.take()?;
@@ -3289,6 +3305,20 @@ impl<S: JitState> JitDriver<S> {
         match values.first() {
             Some(Value::Int(v)) => Some(*v),
             Some(Value::Float(v)) => Some(v.to_bits() as i64),
+            _ => None,
+        }
+    }
+
+    /// [`Self::take_back_edge_finish`] projected onto one ref address — the
+    /// return shape of a `*mut T` / `*const T` `#[jit_interp]` portal.
+    /// `DoneWithThisFrameDescrRef.get_result` is that address.
+    pub fn take_back_edge_finish_ref(&mut self) -> Option<usize> {
+        if let Some(value) = self.meta.back_edge_finish_word.take() {
+            return Some(value as usize);
+        }
+        let values = self.meta.back_edge_finish.take()?;
+        match values.first() {
+            Some(Value::Ref(v)) => Some(v.as_usize()),
             _ => None,
         }
     }
@@ -6878,19 +6908,22 @@ impl<S: JitState> JitDriver<S> {
                 hook(green_key, target_pc);
             }
 
-            // `warmstate.py execute_assembler` tests the returned descr
-            // (`isinstance(fail_descr, DoneWithThisFrameDescrInt)`), then
-            // `get_int_value(deadframe, 0)`. Dispatch key 0 is the ordinary
-            // token entry. A direct LABEL entry keeps the general result.
-            // The driver's `result_type` field is not that test: it stays at
-            // its default unless a caller assigns it, while the trace stamps
-            // `jf_descr` from the result box.
+            // `warmstate.py execute_assembler` reads `jitdriver_sd.result_type`
+            // and returns `DoneWithThisFrameDescrInt` / `DoneWithThisFrameDescrRef`
+            // `get_result`. Dispatch key 0 is the ordinary token entry. A
+            // direct LABEL entry keeps the general result. Int (and every
+            // non-ref kind) stays on `poll_raw_int_finish`.
             let polled_raw_int = selected_dispatch_key == 0;
             if polled_raw_int {
-                if let Some(value) =
+                let finished = if self.meta.result_type == Type::Ref {
+                    self.meta
+                        .poll_raw_ref_finish(&procedure_token, green_key, live_values)
+                        .map(|addr| addr as i64)
+                } else {
                     self.meta
                         .poll_raw_int_finish(&procedure_token, green_key, live_values)
-                {
+                };
+                if let Some(value) = finished {
                     self.entry_scratch_out(scratch);
                     self.meta.back_edge_finish = None;
                     self.meta.back_edge_finish_word = Some(value);
@@ -9399,9 +9432,16 @@ impl<S: JitState> JitDriver<S> {
         if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
             hook(cell_key, target_pc);
         }
-        let finished = self
-            .meta
-            .poll_raw_int_finish_raw(&token, cell_key, &scratch.raw);
+        // `warmstate.py execute_assembler` selects the poll from
+        // `jitdriver_sd.result_type`. Int portals keep `poll_raw_int_finish_raw`.
+        let finished = if self.meta.result_type == Type::Ref {
+            self.meta
+                .poll_raw_ref_finish_raw(&token, cell_key, &scratch.raw)
+                .map(|addr| addr as i64)
+        } else {
+            self.meta
+                .poll_raw_int_finish_raw(&token, cell_key, &scratch.raw)
+        };
         if let Some(value) = finished {
             self.entry_scratch_out(scratch);
             self.meta.back_edge_finish = None;
@@ -9495,9 +9535,14 @@ impl<S: JitState> JitDriver<S> {
         if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
             hook(cell_key, target_pc);
         }
-        let finished = self
-            .meta
-            .poll_raw_int_finish(&token, cell_key, &scratch.live_values);
+        let finished = if self.meta.result_type == Type::Ref {
+            self.meta
+                .poll_raw_ref_finish(&token, cell_key, &scratch.live_values)
+                .map(|addr| addr as i64)
+        } else {
+            self.meta
+                .poll_raw_int_finish(&token, cell_key, &scratch.live_values)
+        };
         if let Some(value) = finished {
             self.entry_scratch_out(scratch);
             self.meta.back_edge_finish = None;

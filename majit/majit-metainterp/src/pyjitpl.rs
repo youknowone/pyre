@@ -13650,6 +13650,59 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// `warmstate.py execute_assembler` ref fast path.
+    ///
+    /// `Some` is `compile.py DoneWithThisFrameDescrRef.get_result`: slot 0,
+    /// frame released, no `CompileResult`. `None` means the trace already ran
+    /// and [`Self::raw_int_fallback`] holds the general-case result.
+    pub fn poll_raw_ref_finish(
+        &mut self,
+        procedure_token: &std::sync::Arc<JitCellToken>,
+        green_key: u64,
+        live_values: &[Value],
+    ) -> Option<usize> {
+        Self::prepare_compiled_run_io();
+        match self
+            .backend
+            .execute_token_done_ref(procedure_token, live_values)
+        {
+            Ok(value) => {
+                Self::finish_compiled_run_io();
+                Some(value)
+            }
+            Err(frame) => {
+                let result = self.consume_executed_frame(green_key, None, frame);
+                self.raw_int_fallback = Some(result);
+                None
+            }
+        }
+    }
+
+    /// [`Self::poll_raw_ref_finish`] for `unspecialize_value` words.
+    #[inline]
+    pub fn poll_raw_ref_finish_raw(
+        &mut self,
+        procedure_token: &std::sync::Arc<JitCellToken>,
+        green_key: u64,
+        raw_reds: &[i64],
+    ) -> Option<usize> {
+        Self::prepare_compiled_run_io();
+        match self
+            .backend
+            .execute_token_done_ref_raw(procedure_token, raw_reds)
+        {
+            Ok(value) => {
+                Self::finish_compiled_run_io();
+                Some(value)
+            }
+            Err(frame) => {
+                let result = self.consume_executed_frame(green_key, None, frame);
+                self.raw_int_fallback = Some(result);
+                None
+            }
+        }
+    }
+
     /// Attach resume data to a specific guard in a compiled loop.
     ///
     /// `resume.py rebuild_from_resumedata` consumes this storage at

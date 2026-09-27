@@ -3352,6 +3352,63 @@ pub trait Backend: Send {
         self.execute_token_done_int(token, &values)
     }
 
+    /// `warmstate.py execute_assembler` when `result_type == REF` and the
+    /// fail descr is `compile.py DoneWithThisFrameDescrRef`:
+    /// `get_ref_value(deadframe, 0)`, then the frame is released. `Err` is
+    /// every other exit and still owns the deadframe.
+    ///
+    /// With a collector installed the ref stays rooted — the frame, or an
+    /// owner root taken from it — until this function has copied the address
+    /// out. The frame is not freed first.
+    fn execute_token_done_ref(
+        &self,
+        token: &JitCellToken,
+        args: &[Value],
+    ) -> Result<usize, DeadFrame> {
+        let frame = self.execute_token(token, args);
+        let descr = self.get_latest_descr(&frame);
+        let ref_finish = descr.is_finish()
+            && !descr.is_exit_frame_with_exception()
+            && descr.fail_arg_types() == [Type::Ref];
+        if !ref_finish {
+            return Err(frame);
+        }
+        let value = self.get_ref_value(&frame, 0);
+        if majit_gc::collector_installed() {
+            let root = majit_gc::shadow_stack::OwnerRootGuard::new(value);
+            drop(frame);
+            return Ok(root.get().as_usize());
+        }
+        Ok(value.as_usize())
+    }
+
+    /// [`Backend::execute_token_done_int_raw`] for a ref portal. The words are
+    /// still `unspecialize_value` input args; the result is the address
+    /// `DoneWithThisFrameDescrRef.get_result` returns.
+    fn execute_token_done_ref_raw(
+        &self,
+        token: &JitCellToken,
+        args: &[i64],
+    ) -> Result<usize, DeadFrame> {
+        let kinds = token.inputarg_types();
+        let n = args.len();
+        let mut stack = [Value::Void; 8];
+        if n <= stack.len() {
+            for (i, slot) in stack[..n].iter_mut().enumerate() {
+                let kind = kinds.get(i).copied().unwrap_or(Type::Int);
+                *slot = value_from_unspecialized_word(args[i], kind);
+            }
+            return self.execute_token_done_ref(token, &stack[..n]);
+        }
+        let values: Vec<Value> = (0..n)
+            .map(|i| {
+                let kind = kinds.get(i).copied().unwrap_or(Type::Int);
+                value_from_unspecialized_word(args[i], kind)
+            })
+            .collect();
+        self.execute_token_done_ref(token, &values)
+    }
+
     /// Execute compiled code starting at a backend-specific dispatch key.
     ///
     /// Default backends have a single token entry and ignore `dispatch_key`.

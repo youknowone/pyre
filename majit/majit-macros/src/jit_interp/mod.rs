@@ -2855,6 +2855,9 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> T
 enum FinishReturnKind {
     Int,
     Float,
+    /// `*mut T` / `*const T`. `warmstate.py execute_assembler` returns
+    /// `DoneWithThisFrameDescrRef.get_result` for this portal.
+    Ref,
 }
 
 #[derive(Clone)]
@@ -2873,6 +2876,14 @@ fn finish_return_for(output: &syn::ReturnType) -> Option<FinishReturn> {
     let syn::ReturnType::Type(_, ty) = output else {
         return None;
     };
+    // A raw pointer is a ref finish. The portal must spell `*mut T` or
+    // `*const T`: a type alias is a path, and this macro cannot see through it.
+    if let syn::Type::Ptr(_) = ty.as_ref() {
+        return Some(FinishReturn {
+            kind: FinishReturnKind::Ref,
+            cast_to: Some(ty.as_ref().clone()),
+        });
+    }
     let syn::Type::Path(type_path) = ty.as_ref() else {
         return None;
     };
@@ -2908,6 +2919,7 @@ impl FinishReturn {
         let take = match self.kind {
             FinishReturnKind::Int => quote! { take_back_edge_finish_int },
             FinishReturnKind::Float => quote! { take_back_edge_finish_float },
+            FinishReturnKind::Ref => quote! { take_back_edge_finish_ref },
         };
         let returned = match &self.cast_to {
             Some(ty) => quote! { __finish_value as #ty },
@@ -2927,6 +2939,7 @@ impl FinishReturn {
         let take = match self.kind {
             FinishReturnKind::Int => quote! { take_single_pass_finish_int },
             FinishReturnKind::Float => quote! { take_single_pass_finish_float },
+            FinishReturnKind::Ref => quote! { take_single_pass_finish_ref },
         };
         let returned = match &self.cast_to {
             Some(ty) => quote! { __finish_value as #ty },
