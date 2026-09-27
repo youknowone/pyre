@@ -1625,6 +1625,13 @@ fn cast_instance_intrinsic(
         crate::translator::rtyper::llannotation::lltype_to_annotation(
             crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
         )
+    } else if majit_ir::descr::is_shaped_tuple_name(&root) {
+        // A Rust tuple `Tuple<A,B>` is the RPython tuple `(A,B)`.
+        let items = root
+            .strip_prefix("Tuple<")
+            .and_then(|rest| rest.strip_suffix('>'))
+            .unwrap_or_default();
+        bk.project_struct_field_type(&format!("({items})"))
     } else {
         bk.project_struct_field_type(&root)
     };
@@ -1700,6 +1707,22 @@ fn cast_instance_intrinsic(
             | SomeValue::None_(_) => Ok(projected),
             other => Err(AnnotatorError::new(format!(
                 "__cast_instance_intrinsic: non-pointer operand for list root {root:?}: {other:?}"
+            ))),
+        };
+    }
+    // A pointer reaching a Rust tuple (a residual call's tuple result, a
+    // `&(A,B)` operand) is narrowed to the `SomeTuple` of that shape; the
+    // typer routes the unrelated pointer pair through GCREF
+    // (`rgcref.py`).  An operand that already is a tuple passes through.
+    if matches!(&projected, SomeValue::Tuple(_)) {
+        return match operand {
+            SomeValue::Tuple(_) => Ok(operand.clone()),
+            SomeValue::Instance(_)
+            | SomeValue::Ptr(_)
+            | SomeValue::Address(_)
+            | SomeValue::None_(_) => Ok(projected),
+            other => Err(AnnotatorError::new(format!(
+                "__cast_instance_intrinsic: non-pointer operand for tuple root {root:?}: {other:?}"
             ))),
         };
     }
@@ -3025,6 +3048,37 @@ mod tests {
             matches!(out, SomeValue::String(_)),
             "Wtf8 root must project dest as SomeString, got {out:?}"
         );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_tuple_root_narrows_to_sometuple() {
+        // A residual call's `(A, B)` result arrives as a classdef-less
+        // pointer; the `Tuple<A,B>` root narrows it to the RPython tuple,
+        // and an operand that already is that tuple passes through.
+        let bk = bk();
+        let s_ptr = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("Tuple<i64,bool>"))
+            .expect("tuple root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_ptr), Some(s_root.clone())],
+            &no_kwds(),
+        )
+        .expect("tuple-root cast_instance_intrinsic must accept a pointer");
+        let SomeValue::Tuple(tuple) = &out else {
+            panic!("Tuple<i64,bool> root must project to SomeTuple, got {out:?}");
+        };
+        assert_eq!(tuple.items.len(), 2);
+        let again = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(out.clone()), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("a SomeTuple operand passes through");
+        assert_eq!(again, out);
     }
 
     #[test]

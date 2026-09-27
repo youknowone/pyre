@@ -2320,7 +2320,10 @@ mod tests {
         let some_id = g.blocks[some].id;
         g.set_goto(some_id, tail, vec![carrier]);
         let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Ref(None))]);
-        assert_eq!(rewritten, 1, "a dead forward of the carrier must not decline");
+        assert_eq!(
+            rewritten, 1,
+            "a dead forward of the carrier must not decline"
+        );
         assert!(
             g.block(tail).inputargs.is_empty(),
             "the dead slot is pruned from the successor"

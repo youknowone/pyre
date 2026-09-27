@@ -756,6 +756,83 @@ fn array_aggregate_elements(
     Some(by_index.into_iter().map(|(_, value)| value).collect())
 }
 
+/// A shaped Rust tuple aggregate emitted by `front::mir`: the
+/// `Tuple<A,B,..>` transparent ctor followed by its `__pos_i` writes.
+///
+/// A Rust tuple is an RPython tuple: `newtuple(items...)` builds a
+/// `SomeTuple` (`annotator/unaryop.py`), `t[i]` reads an item and the
+/// rtyper lowers both through `TupleRepr` (`rtyper/rtuple.py`).  As with
+/// [`is_array_aggregate_ctor`], only this flowspace view is rebuilt; the
+/// semantic graph keeps the ctor and writes for legacy code generation.
+fn tuple_aggregate_shape(kind: &OpKind) -> Option<&str> {
+    match kind {
+        OpKind::Call {
+            target:
+                crate::model::CallTarget::SyntheticTransparentCtor {
+                    name, owner_path, ..
+                },
+            args,
+            ..
+        } if owner_path.is_empty()
+            && args.is_empty()
+            && majit_ir::descr::is_shaped_tuple_name(name) =>
+        {
+            Some(name.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// A tuple aggregate rebuilt as `newtuple`: its items in position order,
+/// and the index of the block operation the `newtuple` replaces.
+struct TupleAggregate {
+    items: Vec<crate::model::LinkArg>,
+    at: usize,
+}
+
+/// The items of the tuple `shape` built by the ctor at `ctor_at`, whose
+/// result is `tuple`.  The front computes an item after the ctor and
+/// before its `__pos_i` write, so `newtuple` takes the place of the last
+/// write.  The front skips the write of a zero-sized `()` item, whose value
+/// is `None`; any other missing or repeated position declines.
+fn tuple_aggregate_items(
+    operations: &[SpaceOperation],
+    ctor_at: usize,
+    tuple: &Variable,
+    shape: &str,
+) -> Option<TupleAggregate> {
+    let inner = shape.strip_prefix("Tuple<")?.strip_suffix('>')?;
+    let spellings = crate::front::mir::split_top_level_type_args(inner);
+    let mut items: Vec<Option<crate::model::LinkArg>> = vec![None; spellings.len()];
+    let mut at = ctor_at;
+    for (op_index, op) in operations.iter().enumerate() {
+        if let OpKind::FieldWrite {
+            base, field, value, ..
+        } = &op.kind
+            && base.id() == tuple.id()
+        {
+            let index = field.name.strip_prefix("__pos_")?.parse::<usize>().ok()?;
+            let slot = items.get_mut(index)?;
+            if slot.is_some() {
+                return None;
+            }
+            *slot = Some(value.clone());
+            at = at.max(op_index);
+        }
+    }
+    let items = items
+        .into_iter()
+        .zip(spellings)
+        .map(|(item, spelling)| {
+            item.or_else(|| {
+                (spelling == "()")
+                    .then(|| crate::model::LinkArg::Const(Constant::new(ConstValue::None)))
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(TupleAggregate { items, at })
+}
+
 /// `true` iff `kind` is `front::mir`'s synthetic string-literal
 /// define-op (`Call(["__str_const", <text>])`, `mir.rs`).
 /// Upstream flowspace carries a string literal as a bare
@@ -1818,6 +1895,26 @@ pub fn translate_op(
                     ]);
                 }
                 return Ok(vec![FlowspaceOp::new("len", vec![base_hl], result)]);
+            }
+            // `t.N` of a Rust tuple is `getitem(t, N)` on the `SomeTuple`
+            // that `newtuple` built (`rtuple.py` `rtype_getitem`).
+            if field
+                .owner_root
+                .as_deref()
+                .is_some_and(majit_ir::descr::is_shaped_tuple_name)
+                && let Some(index) = field
+                    .name
+                    .strip_prefix("__pos_")
+                    .and_then(|n| n.parse::<i64>().ok())
+            {
+                return Ok(vec![FlowspaceOp::new(
+                    "getitem",
+                    vec![
+                        base_hl,
+                        Hlvalue::Constant(Constant::new(ConstValue::Int(index))),
+                    ],
+                    result,
+                )]);
             }
             Ok(vec![FlowspaceOp::new(
                 "getattr",
@@ -4782,6 +4879,18 @@ fn function_graph_to_flowspace_inner(
 
         // Translate operations.
         let mut translated_ops: Vec<FlowspaceOp> = Vec::new();
+        let tuple_aggregates: HashMap<Variable, TupleAggregate> = legacy_block
+            .operations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, op)| {
+                let shape = tuple_aggregate_shape(&op.kind)?;
+                let result = op.result.as_ref()?.clone();
+                let aggregate =
+                    tuple_aggregate_items(&legacy_block.operations, index, &result, shape)?;
+                Some((result, aggregate))
+            })
+            .collect();
         let array_list_elements: HashMap<Variable, Vec<Variable>> = legacy_block
             .operations
             .iter()
@@ -4794,7 +4903,7 @@ fn function_graph_to_flowspace_inner(
                 Some((result, elements))
             })
             .collect();
-        for legacy_op in &legacy_block.operations {
+        for (op_index, legacy_op) in legacy_block.operations.iter().enumerate() {
             if let Some(hlvalue) =
                 legacy_const_define_hlvalue_or_frontier(legacy_op, Some(call_registry))?
             {
@@ -4940,6 +5049,37 @@ fn function_graph_to_flowspace_inner(
             if let OpKind::FieldWrite { base, .. } = &legacy_op.kind
                 && array_list_elements.contains_key(base)
             {
+                continue;
+            }
+            // A Rust tuple aggregate is `newtuple(items...)` in this view,
+            // placed where its last item is written.
+            let tuple_var = match &legacy_op.kind {
+                OpKind::FieldWrite { base, .. } if tuple_aggregates.contains_key(base) => {
+                    Some(base)
+                }
+                _ => legacy_op
+                    .result
+                    .as_ref()
+                    .filter(|result| tuple_aggregates.contains_key(*result)),
+            };
+            if let Some(tuple_var) = tuple_var {
+                let aggregate = &tuple_aggregates[tuple_var];
+                if aggregate.at == op_index {
+                    let mut args = Vec::with_capacity(aggregate.items.len());
+                    for (index, item) in aggregate.items.iter().enumerate() {
+                        args.push(match item {
+                            crate::model::LinkArg::Value(var) => lookup_operand(
+                                &value_map,
+                                var,
+                                legacy_op,
+                                &format!("tuple_item_{index}"),
+                            )?,
+                            crate::model::LinkArg::Const(c) => Hlvalue::Constant(c.clone()),
+                        });
+                    }
+                    let result = lookup_operand(&value_map, tuple_var, legacy_op, "tuple")?;
+                    translated_ops.push(FlowspaceOp::new("newtuple", args, result));
+                }
                 continue;
             }
             if let Some(ops) =
@@ -8680,6 +8820,101 @@ mod tests {
         let op = &startblock.operations[0];
         assert_eq!(op.opname, "newlist");
         assert_eq!(op.args.len(), 2);
+    }
+
+    /// A shaped tuple ctor whose item is computed after the ctor becomes one
+    /// `newtuple` at its last item write, and a `__pos_N` read becomes
+    /// `getitem(t, N)`.
+    #[test]
+    fn function_graph_to_flowspace_rebuilds_tuple_aggregate_as_rpython_tuple() {
+        let mut graph = LegacyGraph::new("tuple_to_newtuple");
+        let vars = mint_vars(&mut graph, 7);
+        let owner = "Tuple<i64,i64>".to_string();
+        let pos = |index: usize| {
+            crate::model::FieldDescriptor::new(&format!("__pos_{index}"), Some(owner.clone()))
+        };
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![
+                SpaceOperation {
+                    result: Some(vars[2].clone()),
+                    kind: OpKind::ConstInt(10),
+                },
+                SpaceOperation {
+                    result: Some(vars[4].clone()),
+                    kind: OpKind::Call {
+                        target: crate::model::CallTarget::synthetic_transparent_ctor(&owner),
+                        args: crate::model::call_args(vec![]),
+                        result_ty: ValueType::Ref(Some(owner.clone())),
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[4].clone(),
+                        field: pos(0),
+                        value: LinkArg::Value(vars[2].clone()),
+                        ty: ValueType::Int,
+                    },
+                },
+                SpaceOperation {
+                    result: Some(vars[3].clone()),
+                    kind: OpKind::ConstInt(20),
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[4].clone(),
+                        field: pos(1),
+                        value: LinkArg::Value(vars[3].clone()),
+                        ty: ValueType::Int,
+                    },
+                },
+                SpaceOperation {
+                    result: Some(vars[5].clone()),
+                    kind: OpKind::FieldRead {
+                        base: vars[4].clone(),
+                        field: pos(1),
+                        ty: ValueType::Int,
+                        pure: false,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(vars[5].clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[6]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("tuple aggregate must adapt");
+        let graph = output.graph.borrow();
+        let startblock = graph.startblock.borrow();
+        let opnames: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(opnames, vec!["newtuple", "getitem"]);
+        assert_eq!(startblock.operations[0].args.len(), 2);
+        assert!(matches!(
+            &startblock.operations[1].args[1],
+            Hlvalue::Constant(c) if c.value == ConstValue::Int(1)
+        ));
     }
 
     #[test]

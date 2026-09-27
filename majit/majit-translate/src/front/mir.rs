@@ -2227,7 +2227,7 @@ fn sum_shell_size(field_offsets: &std::collections::HashMap<String, u64>) -> u64
 }
 
 /// Split `A,B<C,D>,[E;2]` at top-level commas only.
-fn split_top_level_type_args(input: &str) -> Vec<&str> {
+pub(crate) fn split_top_level_type_args(input: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0usize;
     let mut start = 0usize;
