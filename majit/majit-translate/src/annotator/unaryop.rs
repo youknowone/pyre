@@ -4372,11 +4372,16 @@ fn init_someinstance_overrides(
                     };
                     if let Hlvalue::Variable(recv) = &hl.args[0] {
                         let enum_root = classdef.borrow().name.clone();
-                        if let Some(ktd) = ann.bookkeeper.enum_variant_narrowing_knowntypedata(
+                        match ann.bookkeeper.enum_variant_narrowing_knowntypedata(
                             &enum_root,
                             &Rc::new(recv.clone()),
                         ) {
-                            si.set_knowntypedata(ktd);
+                            Ok(Some(ktd)) => si.set_knowntypedata(ktd),
+                            Ok(None) => {}
+                            Err(err) => panic!(
+                                "AnnotatorError: SomeInstance.getattr({attr:?}) \
+                                 enum variant knowntypedata failed: {err:?}"
+                            ),
                         }
                     }
                     return SomeValue::Integer(si);

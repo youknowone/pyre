@@ -5253,6 +5253,15 @@ impl<'a> Lowering<'a> {
         for (bb_idx, value_local) in &root_bracket.get_sites {
             extra_live[*bb_idx].push(*value_local);
         }
+        // The STR chars view aliases its slice to `base`, which the
+        // `from_raw_parts` block does not spell. Keep `base` live there so
+        // the alias names the block's own input, the same synthetic-use
+        // shape as a deferred array write.
+        for (bb_idx, base) in str_chars_view_extra_live(body, llbc) {
+            if bb_idx < extra_live.len() {
+                extra_live[bb_idx].push(base);
+            }
+        }
         let mut block_live_in = compute_mir_liveness(body, &extra_live, &glue_call_drops);
         // The erased guard, its borrows and its `base()` results bind no
         // Variable, so no block may ask a predecessor to pass one.
@@ -12515,6 +12524,33 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `from_raw_parts((base as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET),
+                // bh_lowlevel_string_len(base))` is the rstr `STR` itself
+                // (`rstr.py` `STR`): `chars` is the inline `Array(Char)`,
+                // read by `ll_strlen` (`len(s.chars)`) and `strgetitem`
+                // (`s.chars[i]`). There is no separate slice object. Bind
+                // the destination to that same `base` and record it as a
+                // string byte view so `view[i]` / `len(view)` lower to
+                // `__string_byte_getitem` / `__strlen`. A different base, a
+                // length that is not this string's own length, or a
+                // different offset falls through: an arbitrary
+                // `from_raw_parts(p, n)` cannot drop `n`. Not keyed on the
+                // enclosing function name.
+                if args.len() == 2
+                    && let (Some(ptr_local), Some(len_local)) = (
+                        arg_locals.first().copied().flatten(),
+                        arg_locals.get(1).copied().flatten(),
+                    )
+                    && let Some(base) =
+                        str_chars_view_base(self.body, self.llbc, &reg, ptr_local, len_local)
+                    && let Some(base_var) = self.local_var.get(base).and_then(|slot| slot.clone())
+                {
+                    self.alias_dest_to_arg0(dest_local, base_var, true);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `f64::abs(x)` is `float_abs` (`lloperation.py` /
                 // `rfloat.rtype_abs`).  Opaque in core, so the callsite
                 // would skip as an unregistered FunctionPath.
@@ -12851,6 +12887,43 @@ impl<'a> Lowering<'a> {
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Ref(None),
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `core::ptr::{const_ptr,mut_ptr}::<Impl>::is_null(p)` is
+                // upstream's null test `p is None` (`flowspace` `is_`,
+                // `binaryop.py` `is__default`, `rnone.py` `rtype_is_None` →
+                // `ptr_iszero` on a pointer lowleveltype).  Every receiver
+                // takes that operation: a GC string is a nullable
+                // `SomeString`, and routing the call as
+                // `getattr(p, "is_null")` dies on `String` (no such
+                // attribute).  The `None` operand is `Constant(None)`.
+                if args.len() == 1 && self.is_raw_ptr_is_null(&reg) {
+                    // `Constant(None)` is Void (`rmodel.py`
+                    // `pairtype(Repr, VoidRepr).convert_from_to`). jtransform
+                    // erases the definition and folds `is_` to `ptr_iszero`.
+                    let none = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(none.clone()),
+                        kind: OpKind::ConstNone,
+                    });
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: "is_".to_string(),
+                            lhs: args[0].clone(),
+                            rhs: none,
+                            result_ty: ValueType::Int,
                         },
                     });
                     self.local_var[dest_local] = Some(res);
@@ -16012,30 +16085,12 @@ impl<'a> Lowering<'a> {
             }
             // Non-ADT `Self` (primitive / raw pointer / slice): Charon leaves
             // the impl owner type unresolved, so the ADT table has no entry.
-            // Fall back to the module Ident immediately preceding the `Impl`
-            // NameSeg, which Charon names after the primitive's impl module
-            // (`core::ptr::mut_ptr::<Impl>::is_null` → `mut_ptr`).  Restricted
-            // to `(module, method)` pairs that have a classdef-less analyzer
-            // reachable through the `getattr` → bound-method path
-            // (`unaryop.rs::ptr_method_is_null`); analyzer-less primitive
-            // methods stay on the `FunctionPath` form so they do not surface a
-            // new panicking `SomeInstance.getattr`.
-            None => {
-                if last_idx < 2 {
-                    return None;
-                }
-                let module_leaf = match &segs[last_idx - 2] {
-                    NameSeg::Ident { ident: (s, _) } => s.as_str(),
-                    _ => return None,
-                };
-                if !NON_ADT_OWNER_METHOD_ALLOWLIST
-                    .iter()
-                    .any(|&(m, f)| m == module_leaf && f == leaf)
-                {
-                    return None;
-                }
-                module_leaf.to_string()
-            }
+            // Do not invent a `CallTarget::Method` owner from the module
+            // Ident — `core::ptr::{const_ptr,mut_ptr}::<Impl>::is_null` is
+            // lowered to `is_(p, Constant(None))` before this hint is
+            // consulted (`is_raw_ptr_is_null`), and every other primitive
+            // method stays on the `FunctionPath` form.
+            None => return None,
         };
         if owner_leaf.is_empty() {
             return None;
@@ -18486,6 +18541,40 @@ impl<'a> Lowering<'a> {
     /// (the only two callers, `IntArray`/`FloatArray::from_vec`, are host
     /// builtins residualised to their compiled bodies, so no traced consumer
     /// dereferences the folded header).
+    /// `core::ptr::{const_ptr,mut_ptr}::<Impl>::is_null` — Charon's name
+    /// for `<*const T>::is_null` / `<*mut T>::is_null`.  The impl module
+    /// leaf is `const_ptr` or `mut_ptr` and the method leaf is `is_null`;
+    /// the `Impl` segment sits between them.  Mutability does not change
+    /// the null test (`p is None`).
+    fn is_raw_ptr_is_null(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let segs = &fd.item_meta.name;
+        let Some(last_idx) = segs
+            .iter()
+            .rposition(|s| matches!(s, NameSeg::Ident { .. }))
+        else {
+            return false;
+        };
+        let leaf = match &segs[last_idx] {
+            NameSeg::Ident { ident: (s, _) } => s.as_str(),
+            _ => return false,
+        };
+        if leaf != "is_null" || last_idx < 2 {
+            return false;
+        }
+        let module_leaf = match &segs[last_idx - 2] {
+            NameSeg::Ident { ident: (s, _) } => s.as_str(),
+            _ => return false,
+        };
+        matches!(module_leaf, "const_ptr" | "mut_ptr")
+            && matches!(&segs[last_idx - 1], NameSeg::Other(v) if v.get("Impl").is_some())
+    }
+
     fn is_container_as_ptr_identity(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -24960,6 +25049,218 @@ fn is_vec_index_mut_call(reg: &RegularCall, index_ty: Option<&TyRef>, llbc: &Llb
     vec_index_regular_leaf_with_callsite(reg, index_ty, llbc) == Some("index_mut")
 }
 
+/// Blocks whose `from_raw_parts` is an rstr `STR` chars view, paired with
+/// the `base` local the slice aliases. See [`str_chars_view_base`].
+fn str_chars_view_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<(usize, usize)> {
+    let mut sites = Vec::new();
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        let Ok(TermKind::Call { call, .. }) = bb.term() else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        let (Some(ptr_local), Some(len_local)) = (
+            operand_local(call.args.first()),
+            operand_local(call.args.get(1)),
+        ) else {
+            continue;
+        };
+        if let Some(base) = str_chars_view_base(body, llbc, reg, ptr_local, len_local) {
+            sites.push((bb_idx, base));
+        }
+    }
+    sites
+}
+
+/// `from_raw_parts(ptr, len)` where `ptr` is
+/// `(base as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)` and `len` is
+/// `bh_lowlevel_string_len(base)` on that same `base`.
+///
+/// `rstr.py` `STR` stores `chars` as an inline `Array(Char)`. `ll_strlen`
+/// is `len(s.chars)` and `strgetitem` is `s.chars[i]`; the slice is the
+/// string, not a second object. Any other shape returns `None` so the
+/// caller leaves the raw slice alone. The enclosing function name is not
+/// consulted.
+fn str_chars_view_base(
+    body: &Unstructured,
+    llbc: &Llbc,
+    reg: &RegularCall,
+    ptr_local: usize,
+    len_local: usize,
+) -> Option<usize> {
+    if !regular_call_is_slice_from_raw_parts(reg, llbc) {
+        return None;
+    }
+    let add = defining_call(body, ptr_local)?;
+    let CallFunc::Regular(add_reg) = &add.func else {
+        return None;
+    };
+    if add.args.len() != 2 || !regular_call_is_ptr_add(add_reg, llbc) {
+        return None;
+    }
+    if !operand_is_lowlevel_string_chars_offset(body, llbc, &add.args[1]) {
+        return None;
+    }
+    let ptr_base = peel_copy_and_cast(body, operand_local(add.args.first())?)?;
+    let len_local = peel_copies(body, len_local)?;
+    let len_call = defining_call(body, len_local)?;
+    let CallFunc::Regular(len_reg) = &len_call.func else {
+        return None;
+    };
+    if len_call.args.len() != 1 || !regular_call_is_bh_lowlevel_string_len(len_reg, llbc) {
+        return None;
+    }
+    let len_base = peel_copy_and_cast(body, operand_local(len_call.args.first())?)?;
+    (ptr_base == len_base).then_some(ptr_base)
+}
+
+fn regular_call_is_slice_from_raw_parts(reg: &RegularCall, llbc: &Llbc) -> bool {
+    regular_call_name_path(reg, llbc).is_some_and(|path| {
+        matches!(
+            path.as_str(),
+            "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut"
+        )
+    })
+}
+
+fn regular_call_is_bh_lowlevel_string_len(reg: &RegularCall, llbc: &Llbc) -> bool {
+    regular_call_name_path(reg, llbc)
+        .is_some_and(|path| path == "pyre_object::lowlevel_string::bh_lowlevel_string_len")
+}
+
+fn operand_is_lowlevel_string_chars_offset(body: &Unstructured, llbc: &Llbc, op: &Operand) -> bool {
+    if place_is_chars_offset_global(llbc, operand_place(op)) {
+        return true;
+    }
+    let Some(local) = operand_local(Some(op)) else {
+        return false;
+    };
+    let Some(local) = peel_copies(body, local) else {
+        return false;
+    };
+    match defining_assign(body, local) {
+        Some(Rvalue::Use(inner)) => place_is_chars_offset_global(llbc, operand_place(inner)),
+        _ => false,
+    }
+}
+
+fn place_is_chars_offset_global(llbc: &Llbc, place: Option<&Place>) -> bool {
+    let Some(PlaceKind::Global { id, .. }) = place.map(|place| &place.kind) else {
+        return false;
+    };
+    llbc.global_by_id(*id).is_some_and(|global| {
+        global.item_meta.name_path() == "pyre_object::lowlevel_string::LOWLEVEL_STRING_CHARS_OFFSET"
+    })
+}
+
+fn operand_place(op: &Operand) -> Option<&Place> {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => Some(place),
+        Operand::Const(_) => None,
+    }
+}
+
+/// The single call whose destination is `local`, if that local has no
+/// other producer.
+fn defining_call(body: &Unstructured, local: usize) -> Option<CallPayload> {
+    let mut found = None;
+    let mut producers = 0usize;
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
+                && matches!(place.kind, PlaceKind::Local(i) if i as usize == local)
+            {
+                producers += 1;
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref()
+            && matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local)
+        {
+            producers += 1;
+            found = Some(call.clone());
+        }
+    }
+    (producers == 1).then_some(found).flatten()
+}
+
+fn defining_assign<'a>(body: &'a Unstructured, local: usize) -> Option<&'a Rvalue> {
+    let mut found = None;
+    let mut producers = 0usize;
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref()
+                && matches!(place.kind, PlaceKind::Local(i) if i as usize == local)
+            {
+                producers += 1;
+                found = Some(rvalue);
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref()
+            && matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local)
+        {
+            producers += 1;
+        }
+    }
+    (producers == 1).then_some(found).flatten()
+}
+
+/// Follow a single chain of `Use` copies. A second producer, or any
+/// rvalue that is not a plain local copy, stops the walk.
+fn peel_copies(body: &Unstructured, mut local: usize) -> Option<usize> {
+    for _ in 0..32 {
+        let Some(Rvalue::Use(op)) = defining_assign(body, local) else {
+            return Some(local);
+        };
+        let Some(next) = operand_local(Some(op)) else {
+            return Some(local);
+        };
+        if next == local {
+            return Some(local);
+        }
+        local = next;
+    }
+    None
+}
+
+/// Follow copies and address-preserving pointer casts (`as *const u8`,
+/// `as i64`) back to the local they all name.
+fn peel_copy_and_cast(body: &Unstructured, mut local: usize) -> Option<usize> {
+    for _ in 0..32 {
+        match defining_assign(body, local) {
+            Some(Rvalue::Use(op)) => {
+                let Some(next) = operand_local(Some(op)) else {
+                    return Some(local);
+                };
+                if next == local {
+                    return Some(local);
+                }
+                local = next;
+            }
+            Some(Rvalue::Cast(_, op, _)) => {
+                let Some(next) = operand_local(Some(op)) else {
+                    return Some(local);
+                };
+                if next == local {
+                    return Some(local);
+                }
+                local = next;
+            }
+            Some(Rvalue::UnaryOp(kind, op)) if unary_op_is_cast(kind) => {
+                let Some(next) = operand_local(Some(op)) else {
+                    return Some(local);
+                };
+                if next == local {
+                    return Some(local);
+                }
+                local = next;
+            }
+            _ => return Some(local),
+        }
+    }
+    None
+}
+
 /// Whether a statically-resolved [`RegularCall`] is `<*mut T>::add` /
 /// `<*const T>::add` (`core::ptr::{mut_ptr,const_ptr}::<Impl>::add`) —
 /// the only `.add` spellings the items-base accessor collapse
@@ -26872,29 +27173,11 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
             // `[qualified_owner, method]`.
             strip_crate_prefix(&td.item_meta.name_path())
         }
-        // Non-ADT `Self` allowlist fallback — same arm as the instance
-        // method.  An allowlisted method has no TypeDecl, so the module
-        // Ident is the only owner name available; using the same bare
-        // leaf on both sides keeps the call-target key
-        // (`CallTarget::Method { owner, .. }`) and the registration key
-        // (`self_ty_root`) identical should an allowlisted pair ever
-        // match a local fn with a body.
-        None => {
-            if last_idx < 2 {
-                return None;
-            }
-            let module_leaf = match &segs[last_idx - 2] {
-                NameSeg::Ident { ident: (s, _) } => s.as_str(),
-                _ => return None,
-            };
-            if !NON_ADT_OWNER_METHOD_ALLOWLIST
-                .iter()
-                .any(|&(m, f)| m == module_leaf && f == leaf)
-            {
-                return None;
-            }
-            module_leaf.to_string()
-        }
+        // Non-ADT `Self` has no TypeDecl and no `CallTarget::Method`
+        // owner.  `is_null` is not registered here: the front lowers
+        // `<*const T>::is_null` / `<*mut T>::is_null` to `is_`
+        // (`is_raw_ptr_is_null`) instead of a method key.
+        None => return None,
     };
     if owner_qualified.is_empty() {
         return None;
@@ -32714,19 +32997,6 @@ fn field_label_from_payload(payload: &serde_json::Value) -> String {
     }
     "field".into()
 }
-
-/// `(module_leaf, method_leaf)` pairs whose primitive/raw-pointer impl
-/// method has a classdef-less analyzer reachable through the `getattr` →
-/// bound-method path, so [`Lowering::impl_method_owner`] may route them as
-/// `CallTarget::Method` even though Charon leaves the `Self` type unresolved
-/// (non-ADT, no entry in the type table).  `*_ptr::is_null` resolves to
-/// `unaryop.rs::ptr_method_is_null` (yielding `SomeBool`), lowered to
-/// `ptr_iszero`; `const_ptr` and `mut_ptr` share the analyzer since the
-/// receiver mutability does not affect the null test.  Pairs absent here
-/// keep the `FunctionPath` form rather than surface a new panicking
-/// `SomeInstance.getattr`.
-const NON_ADT_OWNER_METHOD_ALLOWLIST: &[(&str, &str)] =
-    &[("mut_ptr", "is_null"), ("const_ptr", "is_null")];
 
 /// Return `(trait_leaf_ident, method_leaf_ident)` when the FunDecl's
 /// raw `NameSeg` vec ends in two consecutive `Ident` segments — the
@@ -46449,6 +46719,241 @@ mod tests {
         assert_eq!(
             super::tyref_to_field_layout_string(&linked_ty, &llbcs[1]),
             "i64"
+        );
+    }
+
+    fn ptr_ty() -> serde_json::Value {
+        serde_json::json!({"RawPtr": [usize_ty(), "Const"]})
+    }
+
+    fn opaque_fun(def_id: u64, path: &[&str]) -> serde_json::Value {
+        let ty = ptr_ty();
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": true, "inputs": [ty], "output": ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": ty},
+                    {"index": 1, "name": "p", "span": span_json(), "ty": ty}
+                ]},
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        })
+    }
+
+    fn chars_offset_global(def_id: u64, leaf: &str) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(
+                &["pyre_object", "lowlevel_string", leaf],
+                "",
+                true
+            ),
+            "global_kind": "NamedConst",
+            "ty": usize_ty(),
+            "init": 0
+        })
+    }
+
+    /// `from_raw_parts((base as *const u8).add(OFFSET), len(base))`.
+    /// `len_local` selects which argument the length call peels to.
+    fn str_chars_view_fun(offset_leaf: &str, len_local: u64) -> Llbc {
+        let ty = ptr_ty();
+        let usize_t = usize_ty();
+        let cast = |src: u64, dst: u64| {
+            serde_json::json!({"Assign": [
+                {"kind": {"Local": dst}, "ty": ty},
+                {"UnaryOp": [
+                    {"Cast": {"RawPtr": [ty, ty]}},
+                    {"Move": {"kind": {"Local": src}, "ty": ty}}
+                ]}
+            ]})
+        };
+        let copy = |src: u64, dst: u64, slot_ty: serde_json::Value| {
+            serde_json::json!({"Assign": [
+                {"kind": {"Local": dst}, "ty": slot_ty},
+                {"Use": {"Copy": {"kind": {"Local": src}, "ty": slot_ty}}}
+            ]})
+        };
+        let call = |fun: u64,
+                    args: serde_json::Value,
+                    dest: u64,
+                    dest_ty: serde_json::Value,
+                    target: u64| {
+            serde_json::json!({"Call": {"call": {
+                "func": {"Regular": {
+                    "kind": {"Fun": {"Regular": fun}},
+                    "generics": empty_generics()
+                }},
+                "args": args,
+                "dest": {"kind": {"Local": dest}, "ty": dest_ty}
+            }, "target": target, "on_unwind": 4}})
+        };
+        let stmt = |kind: serde_json::Value| serde_json::json!({"span": span_json(), "kind": kind});
+        let viewer = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(
+                &["fixture", "not_the_enclosing_name"],
+                "",
+                true
+            ),
+            "signature": {"is_unsafe": true, "inputs": [ty, ty], "output": ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 2, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": ty},
+                    {"index": 1, "name": "base", "span": span_json(), "ty": ty},
+                    {"index": 2, "name": "other", "span": span_json(), "ty": ty},
+                    {"index": 3, "name": null, "span": span_json(), "ty": ty},
+                    {"index": 4, "name": null, "span": span_json(), "ty": ty},
+                    {"index": 5, "name": "len", "span": span_json(), "ty": usize_t},
+                    {"index": 6, "name": null, "span": span_json(), "ty": ty},
+                    {"index": 7, "name": null, "span": span_json(), "ty": ty},
+                    {"index": 8, "name": null, "span": span_json(), "ty": ty},
+                    {"index": 9, "name": null, "span": span_json(), "ty": usize_t},
+                    {"index": 10, "name": null, "span": span_json(), "ty": ty}
+                ]},
+                "body": [
+                    {
+                        "statements": [stmt(copy(len_local, 3, ty.clone())), stmt(cast(3, 4))],
+                        "terminator": {"span": span_json(), "kind": call(
+                            1,
+                            serde_json::json!([{"Move": {"kind": {"Local": 4}, "ty": ty}}]),
+                            5,
+                            usize_t.clone(),
+                            1
+                        )}
+                    },
+                    {
+                        "statements": [stmt(copy(1, 6, ty.clone())), stmt(cast(6, 7))],
+                        "terminator": {"span": span_json(), "kind": call(
+                            2,
+                            serde_json::json!([
+                                {"Move": {"kind": {"Local": 7}, "ty": ty}},
+                                {"Copy": {"kind": {"Global": {
+                                    "generics": empty_generics(),
+                                    "id": 1
+                                }}, "ty": usize_t}}
+                            ]),
+                            8,
+                            ty.clone(),
+                            2
+                        )}
+                    },
+                    {
+                        "statements": [stmt(copy(5, 9, usize_t.clone()))],
+                        "terminator": {"span": span_json(), "kind": call(
+                            3,
+                            serde_json::json!([
+                                {"Move": {"kind": {"Local": 8}, "ty": ty}},
+                                {"Move": {"kind": {"Local": 9}, "ty": usize_t}}
+                            ]),
+                            10,
+                            ty.clone(),
+                            3
+                        )}
+                    },
+                    {
+                        "statements": [stmt(serde_json::json!({"Assign": [
+                            {"kind": {"Local": 0}, "ty": ty},
+                            {"Use": {"Move": {"kind": {"Local": 10}, "ty": ty}}}
+                        ]}))],
+                        "terminator": {"span": span_json(), "kind": "Return"}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                    }
+                ]
+            }}
+        });
+        const_artifact(
+            "fixture",
+            serde_json::json!([
+                viewer,
+                opaque_fun(
+                    1,
+                    &["pyre_object", "lowlevel_string", "bh_lowlevel_string_len"]
+                ),
+                opaque_fun(2, &["core", "ptr", "const_ptr", "<Impl>", "add"]),
+                opaque_fun(3, &["core", "slice", "raw", "from_raw_parts"])
+            ]),
+            serde_json::json!([null, chars_offset_global(1, offset_leaf)]),
+        )
+    }
+
+    fn graph_calls_leaf(graph: &crate::model::FunctionGraph, leaf: &str) -> bool {
+        graph.blocks.iter().flat_map(|block| &block.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target: crate::model::CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().is_some_and(|seg| seg == leaf)
+            )
+        })
+    }
+
+    #[test]
+    fn str_chars_view_from_raw_parts_aliases_same_base() {
+        let llbc = str_chars_view_fun("LOWLEVEL_STRING_CHARS_OFFSET", 1);
+        let graph = super::lower_function(&llbc, "fixture::not_the_enclosing_name")
+            .expect("chars view lowers");
+        assert!(
+            !graph_calls_leaf(&graph, "from_raw_parts"),
+            "same-base chars view must alias the STR, graph: {graph:#?}"
+        );
+        let returned = graph.blocks.iter().find_map(|block| {
+            block.exits.iter().find_map(|exit| {
+                (exit.target == graph.returnblock).then(|| {
+                    exit.args.iter().find_map(|arg| match arg {
+                        crate::model::LinkArg::Value(var) => Some(var.id()),
+                        _ => None,
+                    })
+                })?
+            })
+        });
+        let input_id = graph
+            .blocks
+            .first()
+            .and_then(|block| block.inputargs.first())
+            .map(|var| var.id());
+        let returned_id = returned.expect("the chars view returns a value");
+        let input_id = input_id.expect("the STR base is a block argument");
+        let threaded = graph.blocks.iter().any(|block| {
+            block.exits.iter().any(|exit| {
+                exit.args.iter().any(
+                    |arg| matches!(arg, crate::model::LinkArg::Value(var) if var.id() == input_id),
+                ) && graph.blocks.iter().any(|target| {
+                    target.id == exit.target
+                        && target.inputargs.iter().any(|arg| arg.id() == returned_id)
+                })
+            })
+        }) || returned_id == input_id;
+        assert!(
+            threaded,
+            "the slice destination must be the STR base (input {input_id}, return {returned_id})"
+        );
+    }
+
+    #[test]
+    fn str_chars_view_from_raw_parts_keeps_other_shapes() {
+        let other_offset = str_chars_view_fun("LOWLEVEL_STR_BASE_SIZE", 1);
+        let graph = super::lower_function(&other_offset, "fixture::not_the_enclosing_name")
+            .expect("other offset still lowers");
+        assert!(
+            graph_calls_leaf(&graph, "from_raw_parts"),
+            "a different offset must not drop its length"
+        );
+        let other_base = str_chars_view_fun("LOWLEVEL_STRING_CHARS_OFFSET", 2);
+        let graph = super::lower_function(&other_base, "fixture::not_the_enclosing_name")
+            .expect("different base still lowers");
+        assert!(
+            graph_calls_leaf(&graph, "from_raw_parts"),
+            "a length from a different base must not drop n"
         );
     }
 
