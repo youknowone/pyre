@@ -4452,6 +4452,34 @@ impl OptContext {
             {
                 self.setinfo_from_preamble_item_option(result, &info, None);
             }
+            // `unroll.py setinfo_from_preamble` rebuilds an imported string as
+            // `StrPtrInfo(preamble_info.mode)` with no `lgtop`, so the peeled
+            // body re-derives the length from the box it actually holds.
+            // Upstream gets that for free: the body's box is a fresh `Box` with
+            // no `_forwarded`. pyre shares the Phase-1 res across the peel
+            // boundary (`produced_short_op`), so this import lands on a box that
+            // already carries the preamble's `StrPtrInfo`, and
+            // `setinfo_from_preamble`'s `get_forwarded() is not None` early
+            // return then skips the rebuild. Drop the stale length box here:
+            // kept, the body's `string_copy_parts` reuses the preamble's STRLEN
+            // result — a value no short-preamble replay produces — and
+            // `assemble_peeled_trace_with_jump_args` carries it on the loop
+            // LABEL as a tail arg that no bridge close can reproduce, which the
+            // backend rejects (`x86/regalloc.py consider_jump`
+            // `assert len(arglocs) == jump_op.numargs()`). A constant length is
+            // phase-independent, so it stays.
+            if let Some(resolved_box) = self.get_box_replacement_operand_opt(result)
+                && self
+                    .getptrinfo(&resolved_box)
+                    .and_then(|info| info.get_cached_lgtop())
+                    .is_some_and(|lgtop| !lgtop.is_constant())
+            {
+                self.with_ptr_info_mut(&resolved_box, |info| {
+                    if let PtrInfo::Str(si) = info {
+                        si.lgtop = None;
+                    }
+                });
+            }
             // RPython PreambleOp carries Box.type intrinsically.
             // the replay `result` OpRef is typed via the upstream factory
             // (`op_typed`); priority 0 of `opref_type`
