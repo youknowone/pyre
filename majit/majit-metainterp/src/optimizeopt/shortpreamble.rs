@@ -1611,7 +1611,7 @@ impl ProducedShortOp {
         // canonical's body ref erases PyPy's invented-name Box identity
         // and corrupts the SAME_AS in `extra_same_as`.
         // Non-invented re-uses self.res directly without forwarding.
-        if self.invented_name {
+        let op_source = if self.invented_name {
             let op_source = ctx
                 .get_box_replacement_operand_opt(source)
                 .unwrap_or_else(|| ctx.materialize_operand_at(source));
@@ -1619,7 +1619,10 @@ impl ProducedShortOp {
                 .get_box_replacement_operand_opt(result_opref)
                 .unwrap_or_else(|| ctx.materialize_operand_at(result_opref));
             ctx.make_equal_to(&op_source, &op_result);
-        }
+            Some(op_source)
+        } else {
+            None
+        };
         // `result_opref` is a typed synthetic alias minted by
         // `add_op_to_short` via `ctx.alloc_op_position_typed(arg_type)`
         // — its variant carries `Box.type` from the chosen producer
@@ -1678,8 +1681,7 @@ impl ProducedShortOp {
                     result: result_opref,
                     cache_args: Vec::new(),
                     pop: crate::optimizeopt::info::PreambleOp {
-                        // shortpreamble.py `PreambleOp(self.res, preamble_op)`.
-                        op: self.res.clone(),
+                        op: op_source.clone().unwrap_or_else(|| self.res.clone()),
                         invented_name: self.invented_name,
                         preamble_op: p.preamble_op.clone(),
                         same_as_source: self.same_as_source.clone(),
@@ -1824,9 +1826,17 @@ impl ProducedShortOp {
             })
             .unwrap_or_else(|| OpRc::new(getfield_op.clone()));
         let pop = crate::optimizeopt::info::PreambleOp {
-            // shortpreamble.py `PreambleOp(self.res, preamble_op)`: `op` is
-            // the body box, `preamble_op` is the replay getfield.
-            op: self.res.clone(),
+            // shortpreamble.py `PreambleOp(self.res, preamble_op, invented_name)`:
+            // the carried Box itself. An invented alias entry
+            // (`lst[i].short_op.res = new_name`) still takes the Phase-2 box
+            // at its replay position: carrying the Phase-1 alias box here
+            // miscompiles synth/inline_subwalk_user_iterator (the peeled loop
+            // never exits).
+            op: if self.invented_name && !self.res.is_constant() {
+                ctx.materialize_operand_at(source)
+            } else {
+                self.res.clone()
+            },
             invented_name: self.invented_name,
             preamble_op: replay_rc,
             same_as_source: self.same_as_source.clone(),
@@ -1834,7 +1844,7 @@ impl ProducedShortOp {
         let parent_descr = getfield_op
             .with_field_descr(|fd| fd.get_parent_descr())
             .flatten();
-        if let Some(info) = ctx.get_const_info_mut(source_obj.to_opref(), parent_descr) {
+        if let Some(info) = ctx.get_const_info_mut_box(&source_obj, parent_descr) {
             info.set_preamble_field(descr_idx, pop.clone());
         }
         // shortpreamble.py:72-74: ensure_ptr_info_arg0 + setfield(pop)
@@ -1964,8 +1974,17 @@ impl ProducedShortOp {
             })
             .unwrap_or_else(|| OpRc::new(getarrayitem_op.clone()));
         let pop = crate::optimizeopt::info::PreambleOp {
-            // shortpreamble.py `PreambleOp(self.res, preamble_op)`.
-            op: self.res.clone(),
+            // shortpreamble.py `PreambleOp(self.res, preamble_op, invented_name)`:
+            // the carried Box itself. An invented alias entry
+            // (`lst[i].short_op.res = new_name`) still takes the Phase-2 box
+            // at its replay position: carrying the Phase-1 alias box here
+            // miscompiles synth/inline_subwalk_user_iterator (the peeled loop
+            // never exits).
+            op: if self.invented_name && !self.res.is_constant() {
+                ctx.materialize_operand_at(source)
+            } else {
+                self.res.clone()
+            },
             invented_name: self.invented_name,
             preamble_op: replay_rc,
             same_as_source: self.same_as_source.clone(),

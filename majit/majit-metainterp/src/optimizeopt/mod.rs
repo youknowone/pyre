@@ -1207,10 +1207,6 @@ pub struct OptContext {
     /// forbids hash containers, so pyre uses a Vec-backed associative
     /// container with linear-scan lookup.
     pub const_infos: crate::FxIndexMap<usize, crate::optimizeopt::info::PtrInfo>,
-    /// Dedup imported short fact uses so the builder stays in first-use
-    /// order. PyPy uses dict-as-set; pyre uses a Vec with linear-scan
-    /// dedup (small per trace).
-    imported_short_preamble_used: Vec<OpRef>,
     /// `unroll.py` `self.optunroll.potential_extra_ops[op] = preamble_op` /
     /// `optimizer.py` `preamble_op = self.optunroll.potential_extra_ops.pop(op)`.
     /// A keyed map, like the dict upstream keeps: insert, pop and `in` are
@@ -2258,7 +2254,6 @@ impl OptContext {
             imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
             const_infos: crate::FxIndexMap::default(),
-            imported_short_preamble_used: Vec::new(),
 
             potential_extra_ops: indexmap::IndexMap::new(),
             active_short_preamble_producer: None,
@@ -2936,7 +2931,6 @@ impl OptContext {
             imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
             const_infos: crate::FxIndexMap::default(),
-            imported_short_preamble_used: Vec::new(),
 
             potential_extra_ops: indexmap::IndexMap::new(),
             active_short_preamble_producer: None,
@@ -3040,7 +3034,6 @@ impl OptContext {
         self.imported_loop_invariant_results.clear();
         self.imported_short_preamble_builder = None;
         self.const_infos.clear();
-        self.imported_short_preamble_used.clear();
         self.potential_extra_ops.clear();
         self.active_short_preamble_producer = None;
         self.preview_short_state = None;
@@ -3936,7 +3929,6 @@ impl OptContext {
             short_inputargs,
         );
         self.imported_short_preamble_builder = Some(builder);
-        self.imported_short_preamble_used.clear();
     }
 
     /// shortpreamble.py ShortPreambleBuilder constructor parity.
@@ -4351,7 +4343,6 @@ impl OptContext {
             builder.note_known_constant(opref);
         }
         self.imported_short_preamble_builder = Some(builder);
-        self.imported_short_preamble_used.clear();
         true
     }
 
@@ -4372,108 +4363,101 @@ impl OptContext {
         let result = resolved.to_opref();
         let result_type = preamble_op.preamble_op.result_type();
         let is_constant = resolved.const_value().is_some();
-        let first_use = !self.imported_short_preamble_used.contains(&preamble_source);
-        if first_use {
-            self.imported_short_preamble_used.push(preamble_source);
+        // unroll.py:32: use_box(op, preamble_op.preamble_op, self).
+        // RPython passes the preamble_op directly — no lookup miss possible.
+        // majit prefers the produced_short_boxes lookup (Phase-2 remapped pos)
+        // with fallback to info::PreambleOp.preamble_op.
+        let Some((arg_guards, result_guards)) =
+            self.collect_use_box_guards(&preamble_op.preamble_op)
+        else {
+            self.signal_invalid_loop("short preamble GC layout tid is unresolved");
+            return preamble_op.op.clone();
+        };
+        // unroll.py:28: assert self.short_preamble_producer is not None
+        if let Some(mut builder) = self.active_short_preamble_producer.take() {
+            builder.use_box(
+                preamble_source,
+                &preamble_op.preamble_op,
+                &arg_guards,
+                &result_guards,
+            );
+            self.active_short_preamble_producer = Some(builder);
+        } else if let Some(mut builder) = self.imported_short_preamble_builder.take() {
+            builder.use_box(
+                preamble_source,
+                &preamble_op.preamble_op,
+                &arg_guards,
+                &result_guards,
+            );
+            self.imported_short_preamble_builder = Some(builder);
+        } else {
+            unreachable!("force_op_from_preamble_op: no short_preamble_producer");
         }
-        if first_use {
-            // unroll.py:32: use_box(op, preamble_op.preamble_op, self).
-            // RPython passes the preamble_op directly — no lookup miss possible.
-            // majit prefers the produced_short_boxes lookup (Phase-2 remapped pos)
-            // with fallback to info::PreambleOp.preamble_op.
-            let Some((arg_guards, result_guards)) =
-                self.collect_use_box_guards(&preamble_op.preamble_op)
-            else {
-                self.signal_invalid_loop("short preamble GC layout tid is unresolved");
-                return preamble_op.op.clone();
-            };
-            // unroll.py:28: assert self.short_preamble_producer is not None
-            if let Some(mut builder) = self.active_short_preamble_producer.take() {
-                builder.use_box(
-                    preamble_source,
-                    &preamble_op.preamble_op,
-                    &arg_guards,
-                    &result_guards,
-                );
-                self.active_short_preamble_producer = Some(builder);
-            } else if let Some(mut builder) = self.imported_short_preamble_builder.take() {
-                builder.use_box(
-                    preamble_source,
-                    &preamble_op.preamble_op,
-                    &arg_guards,
-                    &result_guards,
-                );
-                self.imported_short_preamble_builder = Some(builder);
-            } else {
-                unreachable!("force_op_from_preamble_op: no short_preamble_producer");
-            }
-            // shortpreamble.py:401-405: info = preamble_op.get_forwarded();
-            // preamble_op.set_forwarded(None);
-            // optimizer.setinfo_from_preamble(box, info, None)
-            //
-            // RPython reads `_forwarded` from the replay Op object
-            // (`preamble_op`), NOT from `preamble_op.op` (= self.res or
-            // the alt for invented). pyre's flat-OpRef equivalent is
-            // `pop.preamble_op.pos` — the OpRef the replay Op was
-            // constructed at by `ImportedShortPureOp::new`.
-            // For invented Pure that OpRef differs from `pop.op` (the
-            // alt) so the alt's `make_equal_to(...)` chain at
-            // `forwarded[pop.op]` does not collide with the replay's
-            // info at `forwarded[pop.preamble_op.pos]`.
-            if let Some(info) =
-                self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos().get())
-            {
-                self.setinfo_from_preamble_item_option(result, &info, None);
-            }
-            // `unroll.py setinfo_from_preamble` rebuilds an imported string as
-            // `StrPtrInfo(preamble_info.mode)` with no `lgtop`, so the peeled
-            // body re-derives the length from the box it actually holds.
-            // Upstream gets that for free: the body's box is a fresh `Box` with
-            // no `_forwarded`. pyre shares the Phase-1 res across the peel
-            // boundary (`produced_short_op`), so this import lands on a box that
-            // already carries the preamble's `StrPtrInfo`, and
-            // `setinfo_from_preamble`'s `get_forwarded() is not None` early
-            // return then skips the rebuild. Drop the stale length box here:
-            // kept, the body's `string_copy_parts` reuses the preamble's STRLEN
-            // result — a value no short-preamble replay produces — and
-            // `assemble_peeled_trace_with_jump_args` carries it on the loop
-            // LABEL as a tail arg that no bridge close can reproduce, which the
-            // backend rejects (`x86/regalloc.py consider_jump`
-            // `assert len(arglocs) == jump_op.numargs()`). A constant length is
-            // phase-independent, so it stays.
-            if let Some(resolved_box) = self.get_box_replacement_operand_opt(result)
-                && self
-                    .getptrinfo(&resolved_box)
-                    .and_then(|info| info.get_cached_lgtop())
-                    .is_some_and(|lgtop| !lgtop.is_constant())
-            {
-                self.with_ptr_info_mut(&resolved_box, |info| {
-                    if let PtrInfo::Str(si) = info {
-                        si.lgtop = None;
-                    }
-                });
-            }
-            // RPython PreambleOp carries Box.type intrinsically.
-            // the replay `result` OpRef is typed via the upstream factory
-            // (`op_typed`); priority 0 of `opref_type`
-            // resolves it from the variant tag without a side-table seed.
-            let _ = result_type;
-            // unroll.py:34-37: potential_extra_ops[op] = preamble_op
-            if !is_constant {
-                // unroll.py:29/37 keys by `preamble_op.op`, which is
-                // short_op.res: the exact Box returned to and held by the
-                // body. The replay result is deliberately a different Box.
-                let key = resolved.clone();
-                if crate::optimizeopt::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] potential_extra_ops.insert key={key:?} source={preamble_source:?} result={result:?} invented={}",
-                        preamble_op.invented_name
-                    );
+        // shortpreamble.py:401-405: info = preamble_op.get_forwarded();
+        // preamble_op.set_forwarded(None);
+        // optimizer.setinfo_from_preamble(box, info, None)
+        //
+        // RPython reads `_forwarded` from the replay Op object
+        // (`preamble_op`), NOT from `preamble_op.op` (= self.res or
+        // the alt for invented). pyre's flat-OpRef equivalent is
+        // `pop.preamble_op.pos` — the OpRef the replay Op was
+        // constructed at by `ImportedShortPureOp::new`.
+        // For invented Pure that OpRef differs from `pop.op` (the
+        // alt) so the alt's `make_equal_to(...)` chain at
+        // `forwarded[pop.op]` does not collide with the replay's
+        // info at `forwarded[pop.preamble_op.pos]`.
+        if let Some(info) = self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos().get())
+        {
+            self.setinfo_from_preamble_item_option(&resolved, &info, None);
+        }
+        // `unroll.py setinfo_from_preamble` rebuilds an imported string as
+        // `StrPtrInfo(preamble_info.mode)` with no `lgtop`, so the peeled
+        // body re-derives the length from the box it actually holds.
+        // Upstream gets that for free: the body's box is a fresh `Box` with
+        // no `_forwarded`. pyre shares the Phase-1 res across the peel
+        // boundary (`produced_short_op`), so this import lands on a box that
+        // already carries the preamble's `StrPtrInfo`, and
+        // `setinfo_from_preamble`'s `get_forwarded() is not None` early
+        // return then skips the rebuild. Drop the stale length box here:
+        // kept, the body's `string_copy_parts` reuses the preamble's STRLEN
+        // result — a value no short-preamble replay produces — and
+        // `assemble_peeled_trace_with_jump_args` carries it on the loop
+        // LABEL as a tail arg that no bridge close can reproduce, which the
+        // backend rejects (`x86/regalloc.py consider_jump`
+        // `assert len(arglocs) == jump_op.numargs()`). A constant length is
+        // phase-independent, so it stays.
+        if let Some(resolved_box) = self.get_box_replacement_operand_opt(result)
+            && self
+                .getptrinfo(&resolved_box)
+                .and_then(|info| info.get_cached_lgtop())
+                .is_some_and(|lgtop| !lgtop.is_constant())
+        {
+            self.with_ptr_info_mut(&resolved_box, |info| {
+                if let PtrInfo::Str(si) = info {
+                    si.lgtop = None;
                 }
-                // `unroll.py:37` dict-assign semantics — overwrite if the
-                // key already exists, otherwise append.
-                self.potential_extra_ops.insert(key, preamble_op.clone());
+            });
+        }
+        // RPython PreambleOp carries Box.type intrinsically.
+        // the replay `result` OpRef is typed via the upstream factory
+        // (`op_typed`); priority 0 of `opref_type`
+        // resolves it from the variant tag without a side-table seed.
+        let _ = result_type;
+        // unroll.py:34-37: potential_extra_ops[op] = preamble_op
+        if !is_constant {
+            // unroll.py:29/37 keys by `preamble_op.op`, which is
+            // short_op.res: the exact Box returned to and held by the
+            // body. The replay result is deliberately a different Box.
+            let key = resolved.clone();
+            if crate::optimizeopt::majit_log_enabled() {
+                eprintln!(
+                    "[jit] potential_extra_ops.insert key={key:?} source={preamble_source:?} result={result:?} invented={}",
+                    preamble_op.invented_name
+                );
             }
+            // `unroll.py:37` dict-assign semantics — overwrite if the
+            // key already exists, otherwise append.
+            self.potential_extra_ops.insert(key, preamble_op.clone());
         }
         // unroll.py `return preamble_op.op`. RPython's `preamble_op.op`
         // equals `self.res` (shortpreamble.py:120 `op = self.res`); pyre's
@@ -5087,42 +5071,33 @@ impl OptContext {
 
     fn setinfo_from_preamble_item_option(
         &mut self,
-        op: OpRef,
+        op: &Operand,
         preamble_info: &crate::optimizeopt::info::OpInfo,
         exported_infos: Option<
             &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::info::OpInfo>,
         >,
     ) {
         use crate::optimizeopt::info::OpInfo;
-        let target = self.get_replacement_opref(op);
-        if self
-            .get_box_replacement_operand_opt(target)
-            .and_then(|cb| cb.const_value())
-            .is_some()
-        {
-            return;
-        }
-        if let Some(b) = self.get_box_replacement_operand_opt(op)
-            && self.has_forwarding(&b)
-        {
+        // optimizer.py `setinfo_from_preamble`: `op = get_box_replacement(op)`;
+        // `if op.get_forwarded() is not None: return`; `if isinstance(op,
+        // Const): return`.
+        let target = self.resolve_operand_operand(op);
+        if target.const_value().is_some() || self.has_forwarding(&target) {
             return;
         }
         match preamble_info {
             OpInfo::Ptr(rc) => {
                 // Pass the Rc handle (unroll.py:61 identity preservation).
-                let target_box = self.materialize_operand_at(target);
-                self.setinfo_from_preamble(&target_box, rc, exported_infos);
+                self.setinfo_from_preamble(&target, rc, exported_infos);
             }
             OpInfo::IntBound(bound) => {
                 let widened = bound.borrow().widen();
-                let target_box = self.materialize_operand_at(target);
-                self.with_intbound_mut(&target_box, |bm| {
+                self.with_intbound_mut(&target, |bm| {
                     let _ = bm.intersect(&widened);
                 });
             }
             OpInfo::FloatConstInfo(f) => {
-                let b = self.materialize_operand_at(target);
-                self.make_constant_box(&b, Value::Float(f.getconst()));
+                self.make_constant_box(&target, Value::Float(f.getconst()));
             }
             OpInfo::Unknown | OpInfo::EmptyInfo(_) => {}
         }
@@ -9403,15 +9378,10 @@ impl OptContext {
     /// runs `ensure_ptr_info_arg0(op).as_mut().setfield(...)`.
     pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: &Operand) {
         let value = self.resolve_operand_operand(value);
-        let arg0 = self.resolve_operand_operand(&op.arg(0)).to_opref();
-        if arg0.is_constant()
-            || self
-                .get_box_replacement_operand_opt(arg0)
-                .and_then(|cb| cb.const_value())
-                .is_some()
-        {
+        let arg0 = self.resolve_operand_operand(&op.arg(0));
+        if arg0.const_value().is_some() {
             let parent_descr = op.with_field_descr(|fd| fd.get_parent_descr()).flatten();
-            if let Some(info) = self.get_const_info_mut(arg0, parent_descr.clone()) {
+            if let Some(info) = self.get_const_info_mut_box(&arg0, parent_descr.clone()) {
                 if let Some(parent) = parent_descr {
                     info.init_fields(parent, field_idx as usize);
                 }
