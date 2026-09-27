@@ -11164,31 +11164,6 @@ fn exception_group_get_condition_filter(
     ))
 }
 
-fn exception_group_copy_attrs(
-    mut source: PyObjectRef,
-    mut target: PyObjectRef,
-) -> Result<(), crate::PyError> {
-    if let Ok(notes) = pyre_object::with_roots!(source, target =>
-        crate::baseobjspace::getattr_str(source, "__notes__")
-    ) && let Ok(items) =
-        pyre_object::with_roots!(source, target => crate::baseobjspace::fixedview(notes, -1))
-    {
-        let notes_list = pyre_object::with_roots!(source, target => pyre_object::w_list_new(items));
-        pyre_object::with_roots!(source, target =>
-            crate::baseobjspace::setattr_str(target, "__notes__", notes_list)
-        )?;
-    }
-    for name in ["__cause__", "__context__", "__traceback__"] {
-        let value = pyre_object::with_roots!(source, target =>
-            crate::baseobjspace::getattr_str(source, name)
-        )?;
-        pyre_object::with_roots!(source, target =>
-            crate::baseobjspace::setattr_str(target, name, value)
-        )?;
-    }
-    Ok(())
-}
-
 fn exception_group_derive_and_copy_attrs(
     w_self: PyObjectRef,
     exceptions: Vec<PyObjectRef>,
@@ -11232,10 +11207,51 @@ fn exception_group_derive_and_copy_attrs(
             "derive must return an instance of BaseExceptionGroup",
         ));
     }
-    exception_group_copy_attrs(
+    // `__notes__` is supposed to be a list, and `split()` is not a good place
+    // to report earlier user errors. `findattr` (`PyObject_GetOptionalAttr`)
+    // propagates anything but a missing attribute. Present and `issequence_w`
+    // (`PySequence_Check`): copy through `fixedview` and `w_list_new`.
+    // Present and not a sequence: skip.
+    let notes = crate::baseobjspace::findattr(
         pyre_object::gc_roots::shadow_stack_get(self_slot),
-        pyre_object::gc_roots::shadow_stack_get(group_slot),
+        "__notes__",
     )?;
+    if let Some(notes) = notes {
+        let notes_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(notes);
+        if crate::baseobjspace::issequence_w(pyre_object::gc_roots::shadow_stack_get(notes_slot)) {
+            let items = crate::baseobjspace::fixedview(
+                pyre_object::gc_roots::shadow_stack_get(notes_slot),
+                -1,
+            )?;
+            // `fixedview` returns an untraced Vec and `w_list_new` allocates,
+            // so publish every element and build the list from those slots.
+            let items_base = pyre_object::gc_roots::pin_roots(&items);
+            let items: Vec<_> = (0..items.len())
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(items_base + i))
+                .collect();
+            let notes_list_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(items));
+            crate::baseobjspace::setattr_str(
+                pyre_object::gc_roots::shadow_stack_get(group_slot),
+                "__notes__",
+                pyre_object::gc_roots::shadow_stack_get(notes_list_slot),
+            )?;
+        }
+    }
+    for name in ["__cause__", "__context__", "__traceback__"] {
+        let value = crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            name,
+        )?;
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(value);
+        crate::baseobjspace::setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(group_slot),
+            name,
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        )?;
+    }
     Ok(pyre_object::gc_roots::shadow_stack_get(group_slot))
 }
 
