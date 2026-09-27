@@ -4725,19 +4725,16 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
 
 /// Gateway the tracer enters for one-argument `type(x)`.
 ///
-/// The success arm is `type_call_special_case` → `type_of_object` → `r#type`
-/// (the promoted `w_class` read). The string fallback stays out of that graph.
+/// The query stays in the `dont_look_inside` `type_query_cold`, so the call is
+/// residual. `StdObjSpace.type` promotes the RPython class (`ob_type` here),
+/// not the app-level class: promoting `w_class` instead retraced once per
+/// distinct class over a polymorphic iteration, and a prebuilt object's null
+/// `w_class` split the trace again.
 pub fn __majit_wrap_type_query(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if args.len() != 1 {
         return Err(PyError::type_error("type() takes 1 or 3 arguments"));
     }
-    let obj = args[0];
-    // `type_call_special_case` → `type_of_object` → `r#type`'s promoted
-    // class read. The fallback arms stay `dont_look_inside`.
-    if let Some(w_class) = crate::typedef::promoted_w_class(obj) {
-        return Ok(w_class);
-    }
-    type_query_cold(obj)
+    type_query_cold(args[0])
 }
 
 #[majit_macros::dont_look_inside]
