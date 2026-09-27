@@ -3864,29 +3864,6 @@ impl Optimizer {
         // RPython parity: store_final_boxes_in_guard handles virtual tagging
         // and rd_numb production inline. No post-pass rescan needed.
 
-        // Force any remaining virtual refs in output ops before forwarding resolve.
-        // RPython: virtuals are forced during preamble export or JUMP handling.
-        // In majit, skip_flush=true may leave some virtual refs un-forced in
-        // the output (e.g., linked list nodes nested in non-virtual objects).
-        {
-            let all_refs: Vec<OpRef> = ctx
-                .new_operations
-                .iter()
-                .flat_map(|op| op.getarglist_copy())
-                .filter(|r| !r.is_none())
-                .map(|r| r.to_opref())
-                .collect();
-            for opref in all_refs {
-                let resolved_is_virtual = ctx
-                    .get_box_replacement_operand_opt(opref)
-                    .as_ref()
-                    .is_some_and(|b| ctx.is_virtual(b));
-                if resolved_is_virtual {
-                    self.force_box_for_end_of_preamble(opref, &mut ctx);
-                }
-            }
-        }
-
         // Finalize cascade removed. PyPy walks args ONCE at op-emit
         // time via `_emit_operation:614-625 force_box`; never re-walks. The
         // cited `compile.py:emit_op:403-423` is a virtualizable-only patcher
@@ -5419,7 +5396,10 @@ impl Optimizer {
             // optimizer.py `orig_op in self.replaces_guard` keys by the raw
             // `orig_op` identity (before get_box_replacement), so resolve to the
             // producer box without following `_forwarded`.
+            // optimizer.py `if self.replaces_guard and orig_op in
+            // self.replaces_guard`.
             if self.can_replace_guards
+                && !self.replaces_guard.is_empty()
                 && let Some(replacement) = ctx
                     .resolve_to_operand(op.pos().get())
                     .and_then(|op_key| self.replaces_guard.swap_remove(&op_key))
