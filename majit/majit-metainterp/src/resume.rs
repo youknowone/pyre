@@ -6759,6 +6759,18 @@ pub struct LlmodelBlackholeAllocator;
 /// collector will not trace.
 fn llmodel_alloc(type_id: u32, size: usize) -> i64 {
     let size = size.max(1);
+    // `GcLLDescr_boehm.malloc_fixedsize`: a published function owns the
+    // block. The object starts at the pointer (vtable at offset 0).
+    let malloc_addr = majit_gc::malloc_fixedsize_addr();
+    if malloc_addr != 0 {
+        let malloc: extern "C" fn(usize) -> *mut u8 = unsafe { std::mem::transmute(malloc_addr) };
+        let ptr = malloc(size);
+        if ptr.is_null() {
+            return 0;
+        }
+        unsafe { std::ptr::write_bytes(ptr, 0, size) };
+        return ptr as i64;
+    }
     let gc = majit_gc::alloc_oldgen_typed(type_id, size);
     if gc.0 != 0 {
         return gc.0 as i64;

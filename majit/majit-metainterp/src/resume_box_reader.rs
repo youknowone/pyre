@@ -1475,8 +1475,9 @@ pub fn seed_bridge_virtualizable_boxes(
             RebuiltValue::Const(Const::Int(i)) => Some(Value::Int(*i)),
             RebuiltValue::Const(Const::Float(f)) => Some(Value::Float(*f)),
             RebuiltValue::Const(Const::Ref(r)) => Some(Value::Ref(*r)),
-            // A virtualized vable slot has no deadframe concrete; the shadow
-            // would be a guess, so decline the whole seed instead.
+            // Unassigned has nothing to write. A virtual is materialized
+            // below (`ResumeDataBoxReader.allocate` / `getvirtual_ptr`)
+            // and its concrete is the allocated object, not a deadframe slot.
             RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => None,
         }
     }
@@ -1530,12 +1531,6 @@ pub fn seed_bridge_virtualizable_boxes(
         return false;
     }
     let mut values = Vec::with_capacity(expected + 1);
-    for slot in slots {
-        match concrete(slot, fail_values) {
-            Some(value) => values.push(value),
-            None => return false,
-        }
-    }
     let mut boxes: Vec<OpRef> = Vec::with_capacity(expected + 1);
     // `OpRef::NONE` is how the applying reader says it met a virtual kind it
     // has no allocating twin for. Under that reader the box would name an
@@ -1544,7 +1539,27 @@ pub fn seed_bridge_virtualizable_boxes(
     // nothing — the same rule `replay_pending_fields` applies. The recording
     // reader is unaffected: a direct reader allocated for it, and an
     // unresolved slot there is the pre-existing tolerated case.
+    //
+    // resume.py `getvirtual_ptr` allocates a virtual vable slot before
+    // `write_from_resume_data_partial` stores it. The deadframe has no
+    // concrete for that slot; the allocated object is the concrete.
     for slot in slots {
+        if matches!(slot, RebuiltValue::Virtual(_)) {
+            let op = rebuilt_value_to_opref(ctx, slot, rd_virtuals, resume_data, cache);
+            if op.is_none() {
+                return false;
+            }
+            let Some(value) = ctx.concrete_of_opref(op) else {
+                return false;
+            };
+            values.push(value);
+            boxes.push(op);
+            continue;
+        }
+        match concrete(slot, fail_values) {
+            Some(value) => values.push(value),
+            None => return false,
+        }
         let op = rebuilt_value_to_opref(ctx, slot, rd_virtuals, resume_data, cache);
         if op.is_none() && cache.allocator().is_some() {
             return false;

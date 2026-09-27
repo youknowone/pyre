@@ -6999,7 +6999,10 @@ impl<'a> AssemblerARM64<'a> {
             })
             .unwrap_or((0, None));
         self.emit_mov_imm64(0, obj_size);
-        self.emit_mov_imm64(2, Self::new_alloc_fn_addr());
+        self.emit_mov_imm64(
+            2,
+            crate::runner::malloc_fixedsize_or(Self::new_alloc_fn_addr()),
+        );
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
         self.inline_memzero(obj_size);
         if vtable != 0 {

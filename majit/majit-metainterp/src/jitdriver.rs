@@ -2169,7 +2169,10 @@ impl<S: JitState> JitDriver<S> {
             bridge_attempt_declined: false,
             entry_points: Vec::new(),
             is_recursive: false,
-            blackhole_allocator: None,
+            // resume.py `allocate_with_vtable` must return an object.
+            // `NullAllocator` leaves a virtual ref as 0, so a vable slot
+            // that held one is not a live box after the guard.
+            blackhole_allocator: Some(Box::new(crate::resume::LlmodelBlackholeAllocator)),
             portal_jd_index: None,
             state_field_fvc: None,
             function_entry_suppressed: false,
@@ -9302,10 +9305,11 @@ impl<S: JitState> JitDriver<S> {
     /// compiled function-entry token.
     ///
     /// Reds are unspecialized into the driver's scratch (`:503-511`) and the
-    /// assembler runs. `execute_assembler` touches the virtualizable only
-    /// `if vinfo is not None`, so a driver with no virtualizable info does
-    /// not resolve the descriptor, reset a vable token, or walk red types.
-    /// A longer input list, a pending label, or a cross-loop cut falls
+    /// assembler runs. `execute_assembler` passes those reds straight to
+    /// `func_execute_token`. When `vinfo is not None` the only per-entry
+    /// touch is `vinfo.clear_vable_token(args[index_of_virtualizable])`;
+    /// `index_of_virtualizable` is the value `make_virtualizable_infos`
+    /// stored on the driver. A pending label or a cross-loop cut falls
     /// back to [`Self::back_edge_resolved`].
     #[inline(never)]
     fn enter_compiled_function_entry(
@@ -9321,8 +9325,7 @@ impl<S: JitState> JitDriver<S> {
         if !state.can_trace() {
             return SteadyCompiledEntry::Done(None);
         }
-        if self.meta.virtualizable_info().is_some()
-            || self.meta.single_pass_label_entry_key.is_some()
+        if self.meta.single_pass_label_entry_key.is_some()
             || !self.meta.cut_compiled_keys.is_empty()
         {
             return SteadyCompiledEntry::Done(self.back_edge_resolved(
@@ -9356,9 +9359,11 @@ impl<S: JitState> JitDriver<S> {
             self.meta.invalidate_loop(cell_key);
             return SteadyCompiledEntry::Done(None);
         }
-        // `execute_assembler` receives the unspecialized reds. More inputs
-        // than reds is the virtualizable extension, which this driver does
-        // not have (`vinfo is None` above); that case stays on
+        // `execute_assembler` receives the unspecialized reds.
+        // `patch_new_loop_to_load_virtualizable_fields` truncates the
+        // loop's inputargs to that prefix, so a patched entry's
+        // `inputarg_types` match the reds already in `live_values`. A
+        // longer list was not patched and still needs the extension in
         // `back_edge_resolved`.
         let need = token.inputarg_types().len();
         if need > scratch.live_values.len() {
@@ -9372,6 +9377,11 @@ impl<S: JitState> JitDriver<S> {
                 || {},
             ));
         }
+        // `warmstate.py execute_assembler`: `if vinfo is not None:
+        // virtualizable = args[index_of_virtualizable];
+        // vinfo.clear_vable_token(virtualizable)`. Nothing else — no
+        // descriptor walk, no field export.
+        self.clear_entry_vable_token(&scratch.live_values);
         if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
             hook(cell_key, target_pc);
         }
@@ -9406,6 +9416,34 @@ impl<S: JitState> JitDriver<S> {
             0,
             portal_rca_enabled(),
         ))
+    }
+
+    /// `execute_assembler`'s `vinfo.clear_vable_token(args[index_of_virtualizable])`.
+    ///
+    /// The index is [`JitDriverStaticData::index_of_virtualizable`], fixed
+    /// when the driver is set up (`warmspot.py make_virtualizable_infos`).
+    /// The red at that slot is the virtualizable pointer. No `Arc` clone
+    /// and no allocation: the info is the one already on the metainterp.
+    fn clear_entry_vable_token(&self, live_values: &[Value]) {
+        let Some(descriptor) = self.descriptor.as_ref() else {
+            return;
+        };
+        let index = descriptor.index_of_virtualizable;
+        if index < 0 {
+            return;
+        }
+        let Some(info) = self.meta.virtualizable_info() else {
+            return;
+        };
+        let Some(Value::Ref(majit_ir::GcRef(addr))) = live_values.get(index as usize) else {
+            return;
+        };
+        if *addr == 0 {
+            return;
+        }
+        unsafe {
+            crate::virtualizable::bh_clear_vable_token(info, *addr as *mut u8);
+        }
     }
 
     /// `warmstate.py maybe_compile_and_run` `:465-480` with
