@@ -6420,51 +6420,6 @@ fn walker_const_bool<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, observed:
     const_bool
 }
 
-/// A `w_bool_from(truth)` residual met inside a descended body, folded the
-/// way `space.newbool` traces: a guard on the truth and the prebuilt
-/// singleton as a constant, instead of the elidable call the codewriter
-/// classifies it as (`call.rs BOOL_FROM_TARGETS`), which a variable truth
-/// would keep as one call per comparison.  The callee is recognised by its
-/// published address (`runtime_fnaddr_by_path`).  A constant truth needs no
-/// guard.  Declines when the truth has no concrete value or the descr shape
-/// is not the one-int-argument, ref-result one.
-pub(crate) fn try_walker_fold_newbool_call<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    allboxes: &[OpRef],
-    i_args: &[OpRef],
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    if !ctx.fbw_mode.inline_subwalk || dst_bank != 'r' || i_args.len() != 1 {
-        return Ok(None);
-    }
-    let Some(&funcbox) = allboxes.first() else {
-        return Ok(None);
-    };
-    if !funcbox.is_constant() {
-        return Ok(None);
-    }
-    let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(funcbox) else {
-        return Ok(None);
-    };
-    if crate::runtime_fnaddr_patch::runtime_fnaddr_by_path("pyre_object::boolobject::w_bool_from")
-        != Some(addr)
-    {
-        return Ok(None);
-    }
-    let truth = i_args[0];
-    let Some(majit_ir::Value::Int(value)) = ctx.trace_ctx.box_value(truth) else {
-        return Ok(None);
-    };
-    let observed = value != 0;
-    let Some(result) = walker_newbool_guarded(ctx, op_pc, truth, observed, dst_bank)? else {
-        return Ok(None);
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-    Ok(Some(()))
-}
-
 /// Does `tp` name a layout whose class overrides `is_w` with a value
 /// comparison?  `baseobjspace::is_w` gates one branch per overriding class,
 /// each demanding both operands be that exact type: `int`

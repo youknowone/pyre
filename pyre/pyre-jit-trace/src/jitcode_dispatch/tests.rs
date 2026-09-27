@@ -4712,10 +4712,30 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
         "{isclose} must record the comparison; ops={ops:?}"
     );
     assert!(
-        !ops.iter().any(|op| op.starts_with("inline_call")),
-        "{isclose} must not inline_call; ops={ops:?}"
+        !ops.iter()
+            .any(|op| *op == "new_with_vtable" || op.starts_with("residual_call")),
+        "{isclose} must neither box nor call out for its bool; ops={ops:?}"
     );
     eprintln!("{isclose} {} ops: {ops:?}", ops.len());
+    // baseobjspace.py `newbool`: a branch on the value and one prebuilt
+    // singleton constant per arm.
+    let newbool = "pyre_object::boolobject::w_bool_from";
+    let jc = crate::jitcode_runtime::pathed_jitcode(newbool)
+        .unwrap_or_else(|| panic!("{newbool} must be a discovered jitcode"));
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        ops.iter().any(|op| *op == "ref_return"),
+        "{newbool} must return a ref; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| op.starts_with("residual_call")
+            || op.starts_with("inline_call")
+            || *op == "new_with_vtable"),
+        "{newbool} must read its singletons as constants; ops={ops:?}"
+    );
+    eprintln!("{newbool} {} ops: {ops:?}", ops.len());
 }
 
 #[test]

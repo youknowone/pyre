@@ -5987,6 +5987,11 @@ struct Lowering<'a> {
     /// Restored per block from [`Lowering::block_entry_string_byte_view_locals`],
     /// same shape as [`Lowering::positional_aggregate_locals`].
     string_byte_view_locals: Vec<usize>,
+    /// MIR locals bound by [`Lowering::is_prebuilt_once_lock_get_or_init`].
+    /// Each holds the `&usize` a `OnceLock<usize>` singleton hands back, and
+    /// its word is the registered GC object, so a later `*local as *mut T`
+    /// is that reference unchanged rather than a `cast_int_to_ptr`.
+    prebuilt_once_value_locals: Vec<usize>,
     /// MIR locals holding the `ll_items(l)` view returned by the string-list
     /// slice adapters, each paired with the list's LOGICAL length.  Rust
     /// spells the element as a concrete raw pointer, but both byte and
@@ -6479,6 +6484,7 @@ impl<'a> Lowering<'a> {
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(llbc, body),
             string_byte_view_locals: Vec::new(),
+            prebuilt_once_value_locals: Vec::new(),
             string_array_view_locals: Vec::new(),
             result_exc_call_results: Vec::new(),
             option_ok_or_else_try_sites: Vec::new(),
@@ -7474,6 +7480,17 @@ impl<'a> Lowering<'a> {
                     self.string_byte_view_locals
                         .retain(|&local| local != dest_local);
                 }
+                // `_j = copy (*_i)` reads the singleton word out of the
+                // `get_or_init` borrow; `_j` carries the same object.
+                if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
+                    && !self.multi_assigned_locals.contains(&dest_local)
+                    && self
+                        .prebuilt_once_value_locals
+                        .iter()
+                        .any(|&local| place_references_local(src, local))
+                {
+                    self.prebuilt_once_value_locals.push(dest_local);
+                }
                 let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
                 // The destination local takes on the freshly-minted
                 // result Variable. Subsequent reads of the local
@@ -8451,6 +8468,13 @@ impl<'a> Lowering<'a> {
                     } else {
                         self.operand_class_root(&operand)
                     };
+                    let src_is_prebuilt_once_value = match &operand {
+                        Operand::Copy(p) | Operand::Move(p) => self
+                            .prebuilt_once_value_locals
+                            .iter()
+                            .any(|&local| place_references_local(p, local)),
+                        Operand::Const(_) => false,
+                    };
                     let dst_kind =
                         tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves);
                     // The Rust-only current-address adapter is erased as a
@@ -8460,6 +8484,13 @@ impl<'a> Lowering<'a> {
                     // retaining either bank crossing would manufacture an
                     // address integer absent from the upstream graph.
                     if self.is_gc_current_object_address_adapter_graph() {
+                        return Ok((None, arg));
+                    }
+                    // A prebuilt singleton kept in a `OnceLock<usize>` reads
+                    // back as the registered object itself
+                    // ([`Lowering::prebuilt_once_value_locals`]); the word it
+                    // is stored as is already that GC reference.
+                    if src_is_prebuilt_once_value && matches!(dst_kind, ValueType::Ref(_)) {
                         return Ok((None, arg));
                     }
                     // Signedness-flipping int cast (`w_tuple_len(obj) as i64`)
@@ -13991,6 +14022,21 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `ONCE.get_or_init(f)` on a lazily-built prebuilt whose refs
+                // row carries the built object is `Bookkeeper.immutablevalue`
+                // of that object: the host initialized it before the row was
+                // captured, so the call is the constant and `f` never runs.
+                if args.len() == 2
+                    && !self.multi_assigned_locals.contains(&dest_local)
+                    && self.is_prebuilt_once_lock_get_or_init(&reg, &args[0])
+                {
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    self.prebuilt_once_value_locals.push(dest_local);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `Atomic*::new(v)` builds the layout-transparent wrapper over
                 // its inner scalar; the translated field is that scalar, so
                 // the constructor is the value itself.
@@ -19383,6 +19429,31 @@ impl<'a> Lowering<'a> {
             fd.item_meta.name_path() == "core::sync::atomic::<Impl>::from_ptr"
                 && tyref_atomic_inner_value_type(&fd.signature.output, self.llbc).is_some()
         })
+    }
+
+    /// `std::sync::OnceLock::get_or_init` whose receiver is a
+    /// [`OpKind::ConstRefAddr`] taken from a `refs` row. Those rows register
+    /// the initialized object, not the `OnceLock` container, so the only
+    /// receivers that qualify are statics the host already initialized.
+    fn is_prebuilt_once_lock_get_or_init(&self, reg: &RegularCall, recv: &Variable) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let is_get_or_init = self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            let name = fd.item_meta.name_path();
+            name.contains("::once_lock::") && name.rsplit("::").next() == Some("get_or_init")
+        });
+        is_get_or_init
+            && self
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    op.result.as_ref() == Some(recv)
+                        && matches!(op.kind, OpKind::ConstRefAddr(addr)
+                            if self.static_addrs.refs.iter().any(|(_, a)| *a == addr))
+                })
     }
 
     /// `core::sync::atomic::Atomic*::new(v)` — the wrapper constructor over
@@ -59870,6 +59941,47 @@ mod tests {
                 OpKind::Call { result_ty: ValueType::Ref(Some(owner)), .. }
                     if owner.contains("OnceLock")))
         );
+    }
+
+    /// `baseobjspace.py newbool` is a branch on the value and a prebuilt
+    /// constant per arm. Each arm's `get_or_init` on a registered singleton
+    /// is that constant, so no `get_or_init` call survives the lowering.
+    #[test]
+    #[ignore = "requires the extracted pyre-object LLBC"]
+    fn bool_singleton_accessor_lowers_to_prebuilt_constants() {
+        let llbc = Llbc::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        ))
+        .expect("load object LLBC");
+        let (w_true, w_false) = (0x1234_5678, 0x1234_9abc);
+        let refs = [
+            ("boolobject::TRUE_SINGLETON", w_true),
+            ("boolobject::FALSE_SINGLETON", w_false),
+        ];
+        let graph = super::lower_function_with_static_addrs(
+            &llbc,
+            "pyre_object::boolobject::w_bool_from",
+            crate::HostStaticAddrs {
+                refs: &refs,
+                ..Default::default()
+            },
+        )
+        .expect("lower w_bool_from");
+        let ops = || graph.blocks.iter().flat_map(|block| &block.operations);
+        for addr in [w_true, w_false] {
+            assert!(
+                ops().any(|op| matches!(&op.kind, OpKind::ConstRefAddr(value) if *value == addr))
+            );
+        }
+        // The `OnceLock<usize>` word is read back as the GC reference it
+        // stores, with no `cast_int_to_ptr` of the prebuilt constant.
+        assert!(!ops().any(|op| matches!(&op.kind,
+        OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+            if matches!(
+                segments.last().map(String::as_str),
+                Some("get_or_init" | "cast_int_to_ptr")
+            ))));
     }
 
     /// `policy.py look_inside_graph` reads `_jit_look_inside_` first and
