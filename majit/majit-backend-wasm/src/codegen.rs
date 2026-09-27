@@ -6804,7 +6804,17 @@ fn build_function(
             }
         } else {
             let offset = frame.spill_slot_ofs(k as u64);
-            sink.local_get(0).i64_load(mem64(offset));
+            sink.local_get(0);
+            // Value slots are 8 bytes apart (`SLOT_SIZE`), but a Ref store is
+            // narrowed to the pointer width. A full `i64.load` then keeps
+            // whatever the previous occupant left in the high half, and
+            // `PtrEq` against a zero-extended `topframeref` fails on every
+            // call-assembler entry. Load the low word the way `GcLoadR` does.
+            if ia.tp.get() == Type::Ref {
+                sink.i64_load32_u(memarg(offset, 2));
+            } else {
+                sink.i64_load(mem64(offset));
+            }
             if value_types.ty(ia.index) == ValType::F64 {
                 sink.f64_reinterpret_i64();
             }
