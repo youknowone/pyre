@@ -73,8 +73,25 @@ pub(crate) fn reg_number_3bits(reg: u8) -> u8 {
     reg & 7
 }
 
-fn rex_bit(reg: u8, bit: u8) -> u8 {
-    if reg >= 8 { bit } else { 0 }
+/// `rx86.py` `rex_register`. Factor 1 is the ModRM rm/base field (`REX_B`);
+/// factor 8 is the ModRM reg field (`REX_R`).
+fn rex_register(reg: u8, factor: u8) -> u8 {
+    if reg >= 8 {
+        if factor == 1 {
+            REX_B
+        } else if factor == 8 {
+            REX_R
+        } else {
+            panic!("rex_register: factor {factor}");
+        }
+    } else {
+        0
+    }
+}
+
+/// `rx86.py` `rex_byte_register`. Strips `BYTE_REG_FLAG`, then `rex_register`.
+fn rex_byte_register(reg: u8, factor: u8) -> u8 {
+    rex_register(reg & !BYTE_REG_FLAG, factor)
 }
 
 fn push_bytes(mc: &mut Assembler, bytes: &[u8]) {
@@ -101,13 +118,13 @@ fn writeimm64(mc: &mut Assembler, imm: i64) {
 }
 
 /// `rx86.py` `encode_rex`. `w` is `REX_W` or zero.
-fn emit_rex(mc: &mut Assembler, rexbyte: u8, w: u8) {
+fn encode_rex(mc: &mut Assembler, rexbyte: u8, w: u8) {
     assert!(rexbyte < 8);
     DynasmApi::push(mc, 0x40 | w | rexbyte);
 }
 
 /// `rx86.py` `encode_rex_opt`. A zero `rexbyte` emits nothing.
-fn emit_rex_opt(mc: &mut Assembler, rexbyte: u8) {
+fn encode_rex_opt(mc: &mut Assembler, rexbyte: u8) {
     assert!(rexbyte < 8);
     if rexbyte != 0 {
         DynasmApi::push(mc, 0x40 | rexbyte);
@@ -119,9 +136,9 @@ fn emit_prefix_rex(mc: &mut Assembler, mandatory: u8, kind: RexKind, rex: u8) {
         DynasmApi::push(mc, mandatory);
     }
     match kind {
-        RexKind::W => emit_rex(mc, rex, REX_W),
-        RexKind::Nw => emit_rex_opt(mc, rex),
-        RexKind::Fw => emit_rex(mc, rex, 0),
+        RexKind::W => encode_rex(mc, rex, REX_W),
+        RexKind::Nw => encode_rex_opt(mc, rex),
+        RexKind::Fw => encode_rex(mc, rex, 0),
     }
 }
 
@@ -252,12 +269,40 @@ pub(crate) fn encode_modrm_reg_reg(mc: &mut Assembler, reg: u8, rm: u8, orbyte: 
     );
 }
 
-fn rex_indexed(reg: u8, index: u8, base: i16) -> u8 {
-    let mut rex = rex_bit(reg, REX_R) | rex_bit(index, REX_X);
-    if base >= 8 {
+/// `rx86.py` `rex_mem_reg_plus_const`. `REX_B` when the base is `r8`–`r15`.
+fn rex_mem_reg_plus_const(mem: (u8, i32)) -> u8 {
+    let (reg, _offset) = mem;
+    if reg >= 8 { REX_B } else { 0 }
+}
+
+/// `rx86.py` `rex_mem_reg_plus_scaled_reg_plus_const`.
+/// `REX_B` from the base and `REX_X` from the index. `NO_BASE_REGISTER` sets neither.
+fn rex_mem_reg_plus_scaled_reg_plus_const(addr: (i16, u8, u8, i32)) -> u8 {
+    let (reg1, reg2, _scaleshift, _offset) = addr;
+    let mut rex = 0;
+    if reg1 >= 8 {
         rex |= REX_B;
     }
+    if reg2 >= 8 {
+        rex |= REX_X;
+    }
     rex
+}
+
+fn op_mem_rex(
+    mc: &mut Assembler,
+    kind: RexKind,
+    mandatory: u8,
+    opcode: &[u8],
+    reg_rex: u8,
+    reg: u8,
+    base: u8,
+    offset: i32,
+) {
+    let rex = reg_rex | rex_mem_reg_plus_const((base, offset));
+    emit_prefix_rex(mc, mandatory, kind, rex);
+    push_bytes(mc, opcode);
+    encode_m(mc, base, offset, reg_number_3bits(reg) << 3);
 }
 
 fn op_mem(
@@ -269,10 +314,31 @@ fn op_mem(
     base: u8,
     offset: i32,
 ) {
-    let rex = rex_bit(reg, REX_R) | rex_bit(base, REX_B);
+    op_mem_rex(
+        mc,
+        kind,
+        mandatory,
+        opcode,
+        rex_register(reg, 8),
+        reg,
+        base,
+        offset,
+    );
+}
+
+fn op_addr_rex(
+    mc: &mut Assembler,
+    kind: RexKind,
+    mandatory: u8,
+    opcode: &[u8],
+    reg_rex: u8,
+    reg: u8,
+    addr: (i16, u8, u8, i32),
+) {
+    let rex = reg_rex | rex_mem_reg_plus_scaled_reg_plus_const(addr);
     emit_prefix_rex(mc, mandatory, kind, rex);
     push_bytes(mc, opcode);
-    encode_m(mc, base, offset, reg_number_3bits(reg) << 3);
+    encode_mem_reg_plus_scaled_reg_plus_const(mc, addr, reg_number_3bits(reg) << 3);
 }
 
 fn op_addr(
@@ -283,26 +349,23 @@ fn op_addr(
     reg: u8,
     addr: (i16, u8, u8, i32),
 ) {
-    let rex = rex_indexed(reg, addr.1, addr.0);
-    emit_prefix_rex(mc, mandatory, kind, rex);
-    push_bytes(mc, opcode);
-    encode_mem_reg_plus_scaled_reg_plus_const(mc, addr, reg_number_3bits(reg) << 3);
+    op_addr_rex(mc, kind, mandatory, opcode, rex_register(reg, 8), reg, addr);
 }
 
 fn op_bp(mc: &mut Assembler, kind: RexKind, mandatory: u8, opcode: &[u8], reg: u8, offset: i32) {
-    emit_prefix_rex(mc, mandatory, kind, rex_bit(reg, REX_R));
+    emit_prefix_rex(mc, mandatory, kind, rex_register(reg, 8));
     push_bytes(mc, opcode);
     encode_stack_bp(mc, offset, false, reg_number_3bits(reg) << 3);
 }
 
 fn op_sp(mc: &mut Assembler, kind: RexKind, mandatory: u8, opcode: &[u8], reg: u8, offset: i32) {
-    emit_prefix_rex(mc, mandatory, kind, rex_bit(reg, REX_R));
+    emit_prefix_rex(mc, mandatory, kind, rex_register(reg, 8));
     push_bytes(mc, opcode);
     encode_stack_sp(mc, offset, reg_number_3bits(reg) << 3);
 }
 
 fn alu_ri(mc: &mut Assembler, ext: u8, reg: u8, immed: i32) {
-    emit_rex(mc, rex_bit(reg, REX_B), REX_W);
+    encode_rex(mc, rex_register(reg, 1), REX_W);
     let modrm = 0xC0 | (ext << 3) | reg_number_3bits(reg);
     if single_byte(i64::from(immed)) {
         DynasmApi::push(mc, 0x83);
@@ -316,7 +379,7 @@ fn alu_ri(mc: &mut Assembler, ext: u8, reg: u8, immed: i32) {
 }
 
 fn alu_mi(mc: &mut Assembler, ext: u8, mem: (u8, i32), immed: i32) {
-    emit_rex(mc, rex_bit(mem.0, REX_B), REX_W);
+    encode_rex(mc, rex_mem_reg_plus_const(mem), REX_W);
     if single_byte(i64::from(immed)) {
         DynasmApi::push(mc, 0x83);
         encode_m(mc, mem.0, mem.1, ext << 3);
@@ -329,7 +392,7 @@ fn alu_mi(mc: &mut Assembler, ext: u8, mem: (u8, i32), immed: i32) {
 }
 
 fn shift_ri(mc: &mut Assembler, ext: u8, reg: u8, immed: i32) {
-    emit_rex(mc, rex_bit(reg, REX_B), REX_W);
+    encode_rex(mc, rex_register(reg, 1), REX_W);
     let modrm = 0xC0 | (ext << 3) | reg_number_3bits(reg);
     if immed == 1 {
         DynasmApi::push(mc, 0xD1);
@@ -341,14 +404,10 @@ fn shift_ri(mc: &mut Assembler, ext: u8, reg: u8, immed: i32) {
     }
 }
 
-fn byte_reg(reg: u8) -> u8 {
-    reg & !BYTE_REG_FLAG
-}
-
 /// Reg-reg ModRM. `reg` is the ModRM.reg field, `rm` the ModRM.rm field.
 /// The mandatory prefix is emitted before the REX byte (`xmminsn`).
 fn op_rr(mc: &mut Assembler, kind: RexKind, mandatory: u8, opcode: &[u8], reg: u8, rm: u8) {
-    let rex = rex_bit(reg, REX_R) | rex_bit(rm, REX_B);
+    let rex = rex_register(reg, 8) | rex_register(rm, 1);
     emit_prefix_rex(mc, mandatory, kind, rex);
     push_bytes(mc, opcode);
     encode_modrm_reg_reg(mc, reg, rm, 0);
@@ -356,213 +415,229 @@ fn op_rr(mc: &mut Assembler, kind: RexKind, mandatory: u8, opcode: &[u8], reg: u
 
 // ---------------------------------------------------------------- MOV
 
-/// `MOV_rm`. Base `rsp` uses `MOV_rs`; base `rbp` uses `MOV_rb`.
+/// `MOV_rm` — `mov r64, [base + ofs]`.
 pub fn mov_rm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
     op_mem(mc, RexKind::W, 0, &[0x8B], dst, mem.0, mem.1);
 }
 
-/// `MOV_mr`. Base `rsp` uses `MOV_sr`; base `rbp` uses `MOV_br`.
+/// `MOV_mr` — `mov [base + ofs], r64`.
 pub fn mov_mr(mc: &mut Assembler, mem: (u8, i32), src: u8) {
     op_mem(mc, RexKind::W, 0, &[0x89], src, mem.0, mem.1);
 }
 
-/// `MOV_ra`.
+/// `MOV_ra` — `mov r64, [base + index*scale + ofs]`.
 pub fn mov_ra(mc: &mut Assembler, dst: u8, addr: (i16, u8, u8, i32)) {
     op_addr(mc, RexKind::W, 0, &[0x8B], dst, addr);
 }
 
-/// `MOV_ar`.
+/// `MOV_ar` — `mov [base + index*scale + ofs], r64`.
 pub fn mov_ar(mc: &mut Assembler, addr: (i16, u8, u8, i32), src: u8) {
     op_addr(mc, RexKind::W, 0, &[0x89], src, addr);
 }
 
-/// `MOV_rb`.
+/// `MOV_rb` — `mov r64, [rbp + ofs]`.
 pub(crate) fn mov_rb(mc: &mut Assembler, dst: u8, offset: i32) {
     op_bp(mc, RexKind::W, 0, &[0x8B], dst, offset);
 }
 
-/// `MOV_br`.
+/// `MOV_br` — `mov [rbp + ofs], r64`.
 pub(crate) fn mov_br(mc: &mut Assembler, offset: i32, src: u8) {
     op_bp(mc, RexKind::W, 0, &[0x89], src, offset);
 }
 
-/// `MOV_rs`.
+/// `MOV_rs` — `mov r64, [rsp + ofs]`.
 pub(crate) fn mov_rs(mc: &mut Assembler, dst: u8, offset: i32) {
     op_sp(mc, RexKind::W, 0, &[0x8B], dst, offset);
 }
 
-/// `MOV_sr`.
+/// `MOV_sr` — `mov [rsp + ofs], r64`.
 pub(crate) fn mov_sr(mc: &mut Assembler, offset: i32, src: u8) {
     op_sp(mc, RexKind::W, 0, &[0x89], src, offset);
 }
 
-/// `MOV32_rm`.
+/// `MOV32_rm` — `mov r32, [base + ofs]`.
 pub fn mov32_rm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
     op_mem(mc, RexKind::Nw, 0, &[0x8B], dst, mem.0, mem.1);
 }
 
-/// `MOV32_mr`.
+/// `MOV32_mr` — `mov [base + ofs], r32`.
 pub fn mov32_mr(mc: &mut Assembler, mem: (u8, i32), src: u8) {
     op_mem(mc, RexKind::Nw, 0, &[0x89], src, mem.0, mem.1);
 }
 
-/// `MOV32_ra`.
+/// `MOV32_ra` — `mov r32, [base + index*scale + ofs]`.
 pub fn mov32_ra(mc: &mut Assembler, dst: u8, addr: (i16, u8, u8, i32)) {
     op_addr(mc, RexKind::Nw, 0, &[0x8B], dst, addr);
 }
 
-/// `MOV32_ar`.
+/// `MOV32_ar` — `mov [base + index*scale + ofs], r32`.
 pub fn mov32_ar(mc: &mut Assembler, addr: (i16, u8, u8, i32), src: u8) {
     op_addr(mc, RexKind::Nw, 0, &[0x89], src, addr);
 }
 
-/// `MOV16_mr`.
+/// `MOV16_mr` — `mov [base + ofs], r16`.
 pub fn mov16_mr(mc: &mut Assembler, mem: (u8, i32), src: u8) {
     op_mem(mc, RexKind::Nw, 0x66, &[0x89], src, mem.0, mem.1);
 }
 
-/// `MOV16_ar`.
+/// `MOV16_ar` — `mov [base + index*scale + ofs], r16`.
 pub fn mov16_ar(mc: &mut Assembler, addr: (i16, u8, u8, i32), src: u8) {
     op_addr(mc, RexKind::Nw, 0x66, &[0x89], src, addr);
 }
 
-/// `MOV8_mr` (`rex_fw`, opcode `88`).
+/// `MOV8_mr` — `mov [base + ofs], r8`.
 pub fn mov8_mr(mc: &mut Assembler, mem: (u8, i32), src: u8) {
-    let src = byte_reg(src);
-    op_mem(mc, RexKind::Fw, 0, &[0x88], src, mem.0, mem.1);
+    let reg_rex = rex_byte_register(src, 8);
+    let src = src & !BYTE_REG_FLAG;
+    op_mem_rex(mc, RexKind::Fw, 0, &[0x88], reg_rex, src, mem.0, mem.1);
 }
 
-/// `MOV8_ar`.
+/// `MOV8_ar` — `mov [base + index*scale + ofs], r8`.
 pub fn mov8_ar(mc: &mut Assembler, addr: (i16, u8, u8, i32), src: u8) {
-    let src = byte_reg(src);
-    op_addr(mc, RexKind::Fw, 0, &[0x88], src, addr);
+    let reg_rex = rex_byte_register(src, 8);
+    let src = src & !BYTE_REG_FLAG;
+    op_addr_rex(mc, RexKind::Fw, 0, &[0x88], reg_rex, src, addr);
 }
 
-/// `MOV_mi`. The immediate is always imm32, sign-extended to 64 bits.
+/// `MOV_mi` — `mov [base + ofs], imm32`.
 pub fn mov_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
-    emit_rex(mc, rex_bit(mem.0, REX_B), REX_W);
+    encode_rex(mc, rex_mem_reg_plus_const(mem), REX_W);
     DynasmApi::push(mc, 0xC7);
     encode_m(mc, mem.0, mem.1, 0);
     writeimm32(mc, immed);
 }
 
-/// `MOV_ai`.
+/// `MOV_ai` — `mov [base + index*scale + ofs], imm32`.
 pub fn mov_ai(mc: &mut Assembler, addr: (i16, u8, u8, i32), immed: i32) {
-    emit_rex(mc, rex_indexed(0, addr.1, addr.0), REX_W);
+    encode_rex(
+        mc,
+        rex_register(0, 8) | rex_mem_reg_plus_scaled_reg_plus_const(addr),
+        REX_W,
+    );
     DynasmApi::push(mc, 0xC7);
     encode_mem_reg_plus_scaled_reg_plus_const(mc, addr, 0);
     writeimm32(mc, immed);
 }
 
-/// `MOV_bi`.
+/// `MOV_bi` — `mov [rbp + ofs], imm32`.
 pub(crate) fn mov_bi(mc: &mut Assembler, offset: i32, immed: i32) {
-    emit_rex(mc, 0, REX_W);
+    encode_rex(mc, 0, REX_W);
     DynasmApi::push(mc, 0xC7);
     encode_stack_bp(mc, offset, false, 0);
     writeimm32(mc, immed);
 }
 
-/// `MOV32_mi`.
+/// `MOV32_mi` — `mov dword [base + ofs], imm32`.
 pub fn mov32_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
-    emit_rex_opt(mc, rex_bit(mem.0, REX_B));
+    encode_rex_opt(mc, rex_mem_reg_plus_const(mem));
     DynasmApi::push(mc, 0xC7);
     encode_m(mc, mem.0, mem.1, 0);
     writeimm32(mc, immed);
 }
 
-/// `MOV32_ai`.
+/// `MOV32_ai` — `mov dword [base + index*scale + ofs], imm32`.
 pub fn mov32_ai(mc: &mut Assembler, addr: (i16, u8, u8, i32), immed: i32) {
-    emit_rex_opt(mc, rex_indexed(0, addr.1, addr.0));
+    encode_rex_opt(
+        mc,
+        rex_register(0, 8) | rex_mem_reg_plus_scaled_reg_plus_const(addr),
+    );
     DynasmApi::push(mc, 0xC7);
     encode_mem_reg_plus_scaled_reg_plus_const(mc, addr, 0);
     writeimm32(mc, immed);
 }
 
-/// `MOV16_mi`.
+/// `MOV16_mi` — `mov word [base + ofs], imm16`.
 pub fn mov16_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
     DynasmApi::push(mc, 0x66);
-    emit_rex_opt(mc, rex_bit(mem.0, REX_B));
+    encode_rex_opt(mc, rex_mem_reg_plus_const(mem));
     DynasmApi::push(mc, 0xC7);
     encode_m(mc, mem.0, mem.1, 0);
     writeimm16(mc, immed);
 }
 
-/// `MOV16_ai`.
+/// `MOV16_ai` — `mov word [base + index*scale + ofs], imm16`.
 pub fn mov16_ai(mc: &mut Assembler, addr: (i16, u8, u8, i32), immed: i32) {
     DynasmApi::push(mc, 0x66);
-    emit_rex_opt(mc, rex_indexed(0, addr.1, addr.0));
+    encode_rex_opt(
+        mc,
+        rex_register(0, 8) | rex_mem_reg_plus_scaled_reg_plus_const(addr),
+    );
     DynasmApi::push(mc, 0xC7);
     encode_mem_reg_plus_scaled_reg_plus_const(mc, addr, 0);
     writeimm16(mc, immed);
 }
 
-/// `MOV8_mi` (`rex_fw`, opcode `C6`, imm8).
+/// `MOV8_mi` — `mov byte [base + ofs], imm8`.
 pub fn mov8_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
-    emit_rex(mc, rex_bit(mem.0, REX_B), 0);
+    encode_rex(mc, rex_mem_reg_plus_const(mem), 0);
     DynasmApi::push(mc, 0xC6);
     encode_m(mc, mem.0, mem.1, 0);
     writeimm8(mc, immed);
 }
 
-/// `MOV8_ai`.
+/// `MOV8_ai` — `mov byte [base + index*scale + ofs], imm8`.
 pub fn mov8_ai(mc: &mut Assembler, addr: (i16, u8, u8, i32), immed: i32) {
-    emit_rex(mc, rex_indexed(0, addr.1, addr.0), 0);
+    encode_rex(
+        mc,
+        rex_register(0, 8) | rex_mem_reg_plus_scaled_reg_plus_const(addr),
+        0,
+    );
     DynasmApi::push(mc, 0xC6);
     encode_mem_reg_plus_scaled_reg_plus_const(mc, addr, 0);
     writeimm8(mc, immed);
 }
 
-/// `MOVZX8_rm`.
+/// `MOVZX8_rm` — `movzx r64, byte [base + ofs]`.
 pub fn movzx8_rm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
     op_mem(mc, RexKind::W, 0, &[0x0F, 0xB6], dst, mem.0, mem.1);
 }
 
-/// `MOVZX8_ra`.
+/// `MOVZX8_ra` — `movzx r64, byte [base + index*scale + ofs]`.
 pub fn movzx8_ra(mc: &mut Assembler, dst: u8, addr: (i16, u8, u8, i32)) {
     op_addr(mc, RexKind::W, 0, &[0x0F, 0xB6], dst, addr);
 }
 
-/// `MOVZX16_rm`.
+/// `MOVZX16_rm` — `movzx r64, word [base + ofs]`.
 pub fn movzx16_rm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
     op_mem(mc, RexKind::W, 0, &[0x0F, 0xB7], dst, mem.0, mem.1);
 }
 
-/// `MOVZX16_ra`.
+/// `MOVZX16_ra` — `movzx r64, word [base + index*scale + ofs]`.
 pub fn movzx16_ra(mc: &mut Assembler, dst: u8, addr: (i16, u8, u8, i32)) {
     op_addr(mc, RexKind::W, 0, &[0x0F, 0xB7], dst, addr);
 }
 
-/// `MOVSX8_rm`.
+/// `MOVSX8_rm` — `movsx r64, byte [base + ofs]`.
 pub fn movsx8_rm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
     op_mem(mc, RexKind::W, 0, &[0x0F, 0xBE], dst, mem.0, mem.1);
 }
 
-/// `MOVSX8_ra`.
+/// `MOVSX8_ra` — `movsx r64, byte [base + index*scale + ofs]`.
 pub fn movsx8_ra(mc: &mut Assembler, dst: u8, addr: (i16, u8, u8, i32)) {
     op_addr(mc, RexKind::W, 0, &[0x0F, 0xBE], dst, addr);
 }
 
-/// `MOVSX16_rm`.
+/// `MOVSX16_rm` — `movsx r64, word [base + ofs]`.
 pub fn movsx16_rm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
     op_mem(mc, RexKind::W, 0, &[0x0F, 0xBF], dst, mem.0, mem.1);
 }
 
-/// `MOVSX16_ra`.
+/// `MOVSX16_ra` — `movsx r64, word [base + index*scale + ofs]`.
 pub fn movsx16_ra(mc: &mut Assembler, dst: u8, addr: (i16, u8, u8, i32)) {
     op_addr(mc, RexKind::W, 0, &[0x0F, 0xBF], dst, addr);
 }
 
-/// `MOVSX32_rm` (`movsxd`).
+/// `MOVSX32_rm` — `movsxd r64, dword [base + ofs]`.
 pub fn movsx32_rm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
     op_mem(mc, RexKind::W, 0, &[0x63], dst, mem.0, mem.1);
 }
 
-/// `MOVSX32_ra`.
+/// `MOVSX32_ra` — `movsxd r64, dword [base + index*scale + ofs]`.
 pub fn movsx32_ra(mc: &mut Assembler, dst: u8, addr: (i16, u8, u8, i32)) {
     op_addr(mc, RexKind::W, 0, &[0x63], dst, addr);
 }
 
-/// `X86_64_CodeBuilder::MOV_ri`: zero-extending imm32, sign-extending imm32, or imm64.
+/// `MOV_ri` — `mov r64, imm`.
 pub(crate) fn mov_ri(mc: &mut Assembler, reg: u8, immed: i64) {
     if (0..=0xFFFF_FFFF).contains(&immed) {
         mov_riu32(mc, reg, immed as u32 as i32);
@@ -573,90 +648,90 @@ pub(crate) fn mov_ri(mc: &mut Assembler, reg: u8, immed: i64) {
     }
 }
 
-/// `MOV_riu32`.
+/// `MOV_riu32` — `mov r32, imm32`.
 pub(crate) fn mov_riu32(mc: &mut Assembler, reg: u8, immed: i32) {
-    emit_rex_opt(mc, rex_bit(reg, REX_B));
+    encode_rex_opt(mc, rex_register(reg, 1));
     DynasmApi::push(mc, 0xB8 | reg_number_3bits(reg));
     writeimm32(mc, immed);
 }
 
-/// `MOV_ri32`.
+/// `MOV_ri32` — `mov r64, imm32`.
 pub(crate) fn mov_ri32(mc: &mut Assembler, reg: u8, immed: i32) {
-    emit_rex(mc, rex_bit(reg, REX_B), REX_W);
+    encode_rex(mc, rex_register(reg, 1), REX_W);
     DynasmApi::push(mc, 0xC7);
     DynasmApi::push(mc, 0xC0 | reg_number_3bits(reg));
     writeimm32(mc, immed);
 }
 
-/// `MOV_ri64`.
+/// `MOV_ri64` — `mov r64, imm64`.
 pub(crate) fn mov_ri64(mc: &mut Assembler, reg: u8, immed: i64) {
-    emit_rex(mc, rex_bit(reg, REX_B), REX_W);
+    encode_rex(mc, rex_register(reg, 1), REX_W);
     DynasmApi::push(mc, 0xB8 | reg_number_3bits(reg));
     writeimm64(mc, immed);
 }
 
 // --------------------------------------------------------------- LEA
 
-/// `LEA_rm`.
+/// `LEA_rm` — `lea r64, [base + ofs]`.
 pub fn lea_rm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
     op_mem(mc, RexKind::W, 0, &[0x8D], dst, mem.0, mem.1);
 }
 
-/// `LEA_ra`.
+/// `LEA_ra` — `lea r64, [base + index*scale + ofs]`.
 pub fn lea_ra(mc: &mut Assembler, dst: u8, addr: (i16, u8, u8, i32)) {
     op_addr(mc, RexKind::W, 0, &[0x8D], dst, addr);
 }
 
 // --------------------------------------------------------- ALU reg, imm
 
-/// `ADD_ri` (`AD1_ri`): imm8 when `single_byte`, otherwise imm32.
+/// `ADD_ri8`/`ADD_ri32` — `add r64, imm8` / `add r64, imm32`.
 pub(crate) fn add_ri(mc: &mut Assembler, reg: u8, immed: i32) {
     alu_ri(mc, 0, reg, immed);
 }
 
-/// `OR_ri`.
+/// `OR_ri8`/`OR_ri32` — `or r64, imm8` / `or r64, imm32`.
 pub(crate) fn or_ri(mc: &mut Assembler, reg: u8, immed: i32) {
     alu_ri(mc, 1, reg, immed);
 }
 
-/// `AND_ri`.
+/// `AND_ri8`/`AND_ri32` — `and r64, imm8` / `and r64, imm32`.
 pub(crate) fn and_ri(mc: &mut Assembler, reg: u8, immed: i32) {
     alu_ri(mc, 4, reg, immed);
 }
 
-/// `SUB_ri` (`SU1_ri`).
+/// `SUB_ri8`/`SUB_ri32` — `sub r64, imm8` / `sub r64, imm32`.
 pub(crate) fn sub_ri(mc: &mut Assembler, reg: u8, immed: i32) {
     alu_ri(mc, 5, reg, immed);
 }
 
-/// `XOR_ri`.
+/// `XOR_ri8`/`XOR_ri32` — `xor r64, imm8` / `xor r64, imm32`.
 pub(crate) fn xor_ri(mc: &mut Assembler, reg: u8, immed: i32) {
     alu_ri(mc, 6, reg, immed);
 }
 
-/// `CMP_ri`.
+/// `CMP_ri8`/`CMP_ri32` — `cmp r64, imm8` / `cmp r64, imm32`.
 pub(crate) fn cmp_ri(mc: &mut Assembler, reg: u8, immed: i32) {
     alu_ri(mc, 7, reg, immed);
 }
 
-/// `SHL_ri`. An immediate of 1 uses the one-bit opcode.
+/// `SHL_ri` — `shl r64, 1` / `shl r64, imm8`.
 pub(crate) fn shl_ri(mc: &mut Assembler, reg: u8, immed: i32) {
     shift_ri(mc, 4, reg, immed);
 }
 
-/// `SHR_ri`.
+/// `SHR_ri` — `shr r64, 1` / `shr r64, imm8`.
 pub(crate) fn shr_ri(mc: &mut Assembler, reg: u8, immed: i32) {
     shift_ri(mc, 5, reg, immed);
 }
 
-/// `SAR_ri`.
+/// `SAR_ri` — `sar r64, 1` / `sar r64, imm8`.
 pub(crate) fn sar_ri(mc: &mut Assembler, reg: u8, immed: i32) {
     shift_ri(mc, 7, reg, immed);
 }
 
-/// `IMUL_rri`: imm8 (`6B`) when `single_byte`, otherwise imm32 (`69`).
+/// `IMUL_rri8`/`IMUL_rri32` — `imul r64, r64, imm8` / `imul r64, r64, imm32`.
 pub(crate) fn imul_rri(mc: &mut Assembler, dst: u8, src: u8, immed: i32) {
-    emit_rex(mc, rex_bit(dst, REX_R) | rex_bit(src, REX_B), REX_W);
+    encode_rex(mc, rex_register(dst, 8) | rex_register(src, 1), REX_W);
     DynasmApi::push(
         mc,
         if single_byte(i64::from(immed)) {
@@ -673,14 +748,18 @@ pub(crate) fn imul_rri(mc: &mut Assembler, dst: u8, src: u8, immed: i32) {
     }
 }
 
-/// `IMUL_ri`.
+/// `IMUL_ri` — `imul r64, imm`.
 pub(crate) fn imul_ri(mc: &mut Assembler, reg: u8, immed: i32) {
     imul_rri(mc, reg, reg, immed);
 }
 
-/// `IMUL_rri` with a memory source (`69` / `6B`).
+/// `IMUL_rri8`/`IMUL_rri32` — `imul r64, [base + ofs], imm8` / `imul r64, [base + ofs], imm32`.
 pub(crate) fn imul_rmi(mc: &mut Assembler, dst: u8, mem: (u8, i32), immed: i32) {
-    emit_rex(mc, rex_bit(dst, REX_R) | rex_bit(mem.0, REX_B), REX_W);
+    encode_rex(
+        mc,
+        rex_register(dst, 8) | rex_mem_reg_plus_const(mem),
+        REX_W,
+    );
     if single_byte(i64::from(immed)) {
         DynasmApi::push(mc, 0x6B);
         encode_m(mc, mem.0, mem.1, reg_number_3bits(dst) << 3);
@@ -694,106 +773,106 @@ pub(crate) fn imul_rmi(mc: &mut Assembler, dst: u8, mem: (u8, i32), immed: i32) 
 
 // -------------------------------------------------------- ALU reg, mem
 
-/// `ADD_rb`.
+/// `ADD_rb` — `add r64, [rbp + ofs]`.
 pub(crate) fn add_rb(mc: &mut Assembler, dst: u8, offset: i32) {
     op_bp(mc, RexKind::W, 0, &[0x03], dst, offset);
 }
 
-/// `OR_rb`.
+/// `OR_rb` — `or r64, [rbp + ofs]`.
 pub(crate) fn or_rb(mc: &mut Assembler, dst: u8, offset: i32) {
     op_bp(mc, RexKind::W, 0, &[0x0B], dst, offset);
 }
 
-/// `AND_rb`.
+/// `AND_rb` — `and r64, [rbp + ofs]`.
 pub(crate) fn and_rb(mc: &mut Assembler, dst: u8, offset: i32) {
     op_bp(mc, RexKind::W, 0, &[0x23], dst, offset);
 }
 
-/// `SUB_rm`.
+/// `SUB_rm` — `sub r64, [base + ofs]`.
 pub fn sub_rm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
     op_mem(mc, RexKind::W, 0, &[0x2B], dst, mem.0, mem.1);
 }
 
-/// `SUB_rb`.
+/// `SUB_rb` — `sub r64, [rbp + ofs]`.
 pub(crate) fn sub_rb(mc: &mut Assembler, dst: u8, offset: i32) {
     op_bp(mc, RexKind::W, 0, &[0x2B], dst, offset);
 }
 
-/// `XOR_rb`.
+/// `XOR_rb` — `xor r64, [rbp + ofs]`.
 pub(crate) fn xor_rb(mc: &mut Assembler, dst: u8, offset: i32) {
     op_bp(mc, RexKind::W, 0, &[0x33], dst, offset);
 }
 
-/// `CMP_rm`.
+/// `CMP_rm` — `cmp r64, [base + ofs]`.
 pub fn cmp_rm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
     op_mem(mc, RexKind::W, 0, &[0x3B], dst, mem.0, mem.1);
 }
 
-/// `CMP_rb`.
+/// `CMP_rb` — `cmp r64, [rbp + ofs]`.
 pub(crate) fn cmp_rb(mc: &mut Assembler, dst: u8, offset: i32) {
     op_bp(mc, RexKind::W, 0, &[0x3B], dst, offset);
 }
 
-/// `CMP_mr`.
+/// `CMP_mr` — `cmp [base + ofs], r64`.
 pub fn cmp_mr(mc: &mut Assembler, mem: (u8, i32), src: u8) {
     op_mem(mc, RexKind::W, 0, &[0x39], src, mem.0, mem.1);
 }
 
-/// `CMP_br`.
+/// `CMP_br` — `cmp [rbp + ofs], r64`.
 pub(crate) fn cmp_br(mc: &mut Assembler, offset: i32, src: u8) {
     op_bp(mc, RexKind::W, 0, &[0x39], src, offset);
 }
 
-/// `CMP_mi` (`CMP_mi8` when `single_byte`, else `CMP_mi32`).
+/// `CMP_mi8`/`CMP_mi32` — `cmp [base + ofs], imm8` / `cmp [base + ofs], imm32`.
 pub fn cmp_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
     alu_mi(mc, 7, mem, immed);
 }
 
-/// `CMP_bi`.
+/// `CMP_bi8`/`CMP_bi32` — `cmp [rbp + ofs], imm8` / `cmp [rbp + ofs], imm32`.
 pub(crate) fn cmp_bi(mc: &mut Assembler, offset: i32, immed: i32) {
     alu_mi(mc, 7, (EBP, offset), immed);
 }
 
-/// `SUB_mi8` / `SUB_mi` via `select_8_or_32_bit_immed` on group 5.
+/// `SUB_mi8`/`SUB_mi32` — `sub [base + ofs], imm8` / `sub [base + ofs], imm32`.
 pub fn sub_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
     alu_mi(mc, 5, mem, immed);
 }
 
-/// `TEST8_mi`.
+/// `TEST8_mi` — `test byte [base + ofs], imm8`.
 pub fn test8_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
-    emit_rex_opt(mc, rex_bit(mem.0, REX_B));
+    encode_rex_opt(mc, rex_mem_reg_plus_const(mem));
     DynasmApi::push(mc, 0xF6);
     encode_m(mc, mem.0, mem.1, 0);
     writeimm8(mc, immed);
 }
 
-/// `OR8_mi`.
+/// `OR8_mi` — `or byte [base + ofs], imm8`.
 pub fn or8_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
-    emit_rex_opt(mc, rex_bit(mem.0, REX_B));
+    encode_rex_opt(mc, rex_mem_reg_plus_const(mem));
     DynasmApi::push(mc, 0x80);
     encode_m(mc, mem.0, mem.1, 1 << 3);
     writeimm8(mc, immed);
 }
 
-/// `IMUL_rb`.
+/// `IMUL_rb` — `imul r64, [rbp + ofs]`.
 pub(crate) fn imul_rb(mc: &mut Assembler, dst: u8, offset: i32) {
     op_bp(mc, RexKind::W, 0, &[0x0F, 0xAF], dst, offset);
 }
 
-/// `MUL_b`.
+/// `MUL_b` — `mul qword [rbp + ofs]`.
 pub(crate) fn mul_b(mc: &mut Assembler, offset: i32) {
-    emit_rex(mc, 0, REX_W);
+    encode_rex(mc, 0, REX_W);
     DynasmApi::push(mc, 0xF7);
     encode_stack_bp(mc, offset, false, 4 << 3);
 }
 
-/// `PUSH_b` (`PUS1_b`).
+/// `PUS1_b` — `push qword [rbp + ofs]`.
 pub(crate) fn push_b(mc: &mut Assembler, offset: i32) {
     DynasmApi::push(mc, 0xFF);
     encode_stack_bp(mc, offset, false, 6 << 3);
 }
 
-/// `POP_b` (`PO1_b`).
+/// `PO1_b` — `pop qword [rbp + ofs]`.
 pub(crate) fn pop_b(mc: &mut Assembler, offset: i32) {
     DynasmApi::push(mc, 0x8F);
     encode_stack_bp(mc, offset, false, 0);
@@ -801,152 +880,152 @@ pub(crate) fn pop_b(mc: &mut Assembler, offset: i32) {
 
 // ---------------------------------------------------------------- SSE
 
-/// `MOVSD_xm`.
+/// `MOVSD_xm` — `movsd xmm, [base + ofs]`.
 pub fn movsd_xm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
     op_mem(mc, RexKind::Nw, 0xF2, &[0x0F, 0x10], dst, mem.0, mem.1);
 }
 
-/// `MOVSD_mx`.
+/// `MOVSD_mx` — `movsd [base + ofs], xmm`.
 pub fn movsd_mx(mc: &mut Assembler, mem: (u8, i32), src: u8) {
     op_mem(mc, RexKind::Nw, 0xF2, &[0x0F, 0x11], src, mem.0, mem.1);
 }
 
-/// `MOVSD_xa`.
+/// `MOVSD_xa` — `movsd xmm, [base + index*scale + ofs]`.
 pub fn movsd_xa(mc: &mut Assembler, dst: u8, addr: (i16, u8, u8, i32)) {
     op_addr(mc, RexKind::Nw, 0xF2, &[0x0F, 0x10], dst, addr);
 }
 
-/// `MOVSD_ax`.
+/// `MOVSD_ax` — `movsd [base + index*scale + ofs], xmm`.
 pub fn movsd_ax(mc: &mut Assembler, addr: (i16, u8, u8, i32), src: u8) {
     op_addr(mc, RexKind::Nw, 0xF2, &[0x0F, 0x11], src, addr);
 }
 
-/// `MOVSD_xb`.
+/// `MOVSD_xb` — `movsd xmm, [rbp + ofs]`.
 pub(crate) fn movsd_xb(mc: &mut Assembler, dst: u8, offset: i32) {
     op_bp(mc, RexKind::Nw, 0xF2, &[0x0F, 0x10], dst, offset);
 }
 
-/// `MOVSD_bx`.
+/// `MOVSD_bx` — `movsd [rbp + ofs], xmm`.
 pub(crate) fn movsd_bx(mc: &mut Assembler, offset: i32, src: u8) {
     op_bp(mc, RexKind::Nw, 0xF2, &[0x0F, 0x11], src, offset);
 }
 
-/// `MOVSD_sx`.
+/// `MOVSD_sx` — `movsd [rsp + ofs], xmm`.
 pub(crate) fn movsd_sx(mc: &mut Assembler, offset: i32, src: u8) {
     op_sp(mc, RexKind::Nw, 0xF2, &[0x0F, 0x11], src, offset);
 }
 
-/// `MOVSS_xm`.
+/// `MOVSS_xm` — `movss xmm, [base + ofs]`.
 pub fn movss_xm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
     op_mem(mc, RexKind::Nw, 0xF3, &[0x0F, 0x10], dst, mem.0, mem.1);
 }
 
-/// `MOVSS_mx`.
+/// `MOVSS_mx` — `movss [base + ofs], xmm`.
 pub fn movss_mx(mc: &mut Assembler, mem: (u8, i32), src: u8) {
     op_mem(mc, RexKind::Nw, 0xF3, &[0x0F, 0x11], src, mem.0, mem.1);
 }
 
-/// `MOVSS_xa`.
+/// `MOVSS_xa` — `movss xmm, [base + index*scale + ofs]`.
 pub fn movss_xa(mc: &mut Assembler, dst: u8, addr: (i16, u8, u8, i32)) {
     op_addr(mc, RexKind::Nw, 0xF3, &[0x0F, 0x10], dst, addr);
 }
 
-/// `MOVSS_ax`.
+/// `MOVSS_ax` — `movss [base + index*scale + ofs], xmm`.
 pub fn movss_ax(mc: &mut Assembler, addr: (i16, u8, u8, i32), src: u8) {
     op_addr(mc, RexKind::Nw, 0xF3, &[0x0F, 0x11], src, addr);
 }
 
-/// `MOVUPS_mx`.
+/// `MOVUPS_mx` — `movups [base + ofs], xmm`.
 pub fn movups_mx(mc: &mut Assembler, mem: (u8, i32), src: u8) {
     op_mem(mc, RexKind::Nw, 0, &[0x0F, 0x11], src, mem.0, mem.1);
 }
 
-/// `movq m64, xmm` (opcode `66 0F D6`). `MOVDQ_*` has no memory store of this form.
+/// `MOVQ_mx` — `movq [base + ofs], xmm`.
 pub(crate) fn movq_mx(mc: &mut Assembler, mem: (u8, i32), src: u8) {
     op_mem(mc, RexKind::Nw, 0x66, &[0x0F, 0xD6], src, mem.0, mem.1);
 }
 
-/// `ADDSD_xx`.
+/// `ADDSD_xx` — `addsd xmm, xmm`.
 pub(crate) fn addsd_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0xF2, &[0x0F, 0x58], dst, src);
 }
 
-/// `SUBSD_xx`.
+/// `SUBSD_xx` — `subsd xmm, xmm`.
 pub(crate) fn subsd_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0xF2, &[0x0F, 0x5C], dst, src);
 }
 
-/// `MULSD_xx`.
+/// `MULSD_xx` — `mulsd xmm, xmm`.
 pub(crate) fn mulsd_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0xF2, &[0x0F, 0x59], dst, src);
 }
 
-/// `DIVSD_xx`.
+/// `DIVSD_xx` — `divsd xmm, xmm`.
 pub(crate) fn divsd_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0xF2, &[0x0F, 0x5E], dst, src);
 }
 
-/// `UCOMISD_xx`.
+/// `UCOMISD_xx` — `ucomisd xmm, xmm`.
 pub(crate) fn ucomisd_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0x66, &[0x0F, 0x2E], dst, src);
 }
 
-/// `SQRTSD_xx`.
+/// `SQRTSD_xx` — `sqrtsd xmm, xmm`.
 pub(crate) fn sqrtsd_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0xF2, &[0x0F, 0x51], dst, src);
 }
 
-/// `MOVAPD_xx`.
+/// `MOVAPD_xx` — `movapd xmm, xmm`.
 pub(crate) fn movapd_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0x66, &[0x0F, 0x28], dst, src);
 }
 
-/// `PXOR_xx`.
+/// `PXOR_xx` — `pxor xmm, xmm`.
 pub(crate) fn pxor_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0x66, &[0x0F, 0xEF], dst, src);
 }
 
-/// `XORPD_xx`.
+/// `XORPD_xx` — `xorpd xmm, xmm`.
 pub(crate) fn xorpd_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0x66, &[0x0F, 0x57], dst, src);
 }
 
-/// `ANDPD_xx`.
+/// `ANDPD_xx` — `andpd xmm, xmm`.
 pub(crate) fn andpd_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0x66, &[0x0F, 0x54], dst, src);
 }
 
-/// `XORPS_xx`.
+/// `XORPS_xx` — `xorps xmm, xmm`.
 pub(crate) fn xorps_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0, &[0x0F, 0x57], dst, src);
 }
 
-/// `CVTSD2SS_xx`.
+/// `CVTSD2SS_xx` — `cvtsd2ss xmm, xmm`.
 pub(crate) fn cvtsd2ss_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0xF2, &[0x0F, 0x5A], dst, src);
 }
 
-/// `CVTSS2SD_xx`.
+/// `CVTSS2SD_xx` — `cvtss2sd xmm, xmm`.
 pub(crate) fn cvtss2sd_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0xF3, &[0x0F, 0x5A], dst, src);
 }
 
-/// `CVTSI2SD_xr` (`rex_w`).
+/// `CVTSI2SD_xr` — `cvtsi2sd xmm, r64`.
 pub(crate) fn cvtsi2sd_xr(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::W, 0xF2, &[0x0F, 0x2A], dst, src);
 }
 
-/// `CVTTSD2SI_rx` (`rex_w`).
+/// `CVTTSD2SI_rx` — `cvttsd2si r64, xmm`.
 pub(crate) fn cvttsd2si_rx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::W, 0xF2, &[0x0F, 0x2C], dst, src);
 }
 
-/// `MOVDQ_xr` (`rex_w`).
+/// `MOVDQ_xr` — `movq xmm, r64`.
 pub(crate) fn movdq_xr(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::W, 0x66, &[0x0F, 0x6E], dst, src);
 }
 
-/// `MOVDQ_rx` (`rex_w`).
+/// `MOVDQ_rx` — `movq r64, xmm`.
 pub(crate) fn movdq_rx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::W, 0x66, &[0x0F, 0x7E], src, dst);
 }
