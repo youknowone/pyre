@@ -2076,11 +2076,7 @@ fn err_payload_is_dead(graph: &FunctionGraph, exit: &Link, r: &Variable) -> bool
     };
     // `let _ = f()?`-less discard: the shell reaches its block and nothing
     // reads or forwards it, so neither arm's payload is ever observed.
-    let uses = count_var_uses(graph, &shell);
-    if uses.op_uses == 0
-        && uses.link_uses == 0
-        && !matches!(&graph.blocks[exit.target.0].exitswitch, Some(ExitSwitch::Value(v)) if *v == shell)
-    {
+    if !variable_is_used(graph, &shell) {
         return true;
     }
     let Ok((_, _, disc_shell)) = match_discriminant(graph, exit.target.0) else {
@@ -5344,6 +5340,65 @@ mod rebuilt_shell_collapse_tests {
             })
             .count();
         assert_eq!(rebuilds, 0, "a discarded Err payload is not rebuilt");
+    }
+
+    /// A fused guard that switches on the shell reads it, so the `Err`
+    /// payload is live and the caught word is rebuilt into the carrier.
+    #[test]
+    fn catch_and_rewrap_rebuilds_an_err_a_fused_switch_reads() {
+        let mut graph = FunctionGraph::new("rewrap_fused");
+        let a = graph.startblock;
+        let r = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+        let (tail, tail_args) = graph.create_block_with_arg_vars(1);
+        let yes = graph.create_block();
+        graph.set_return(yes, None);
+        let no = graph.create_block();
+        graph.set_return(no, None);
+        graph.block_mut(tail).exitswitch = Some(ExitSwitch::Fused {
+            opname: "ptr_nonzero".into(),
+            args: vec![tail_args[0].clone()],
+        });
+        graph.block_mut(tail).exits = vec![
+            Link::new_mixed(
+                Vec::new(),
+                yes,
+                Some(ExitCase::Const(ConstValue::Bool(true))),
+            ),
+            Link::new_mixed(
+                Vec::new(),
+                no,
+                Some(ExitCase::Const(ConstValue::Bool(false))),
+            ),
+        ];
+        graph.set_goto(a, tail, vec![r.clone()]);
+        let spec = crate::ErrorCarrierSpec {
+            carrier_path: "carrier::PyError",
+            carrier_wrappers: &[],
+            to_exc_object: None,
+            from_exc_object: Some(("PyError", "from_exc_object")),
+        };
+        catch_and_rewrap(&mut graph, a.0, &r, "<(),PyError>", &ValueType::Void, spec)
+            .expect("rewrap");
+        let rebuilds = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(&op.kind, OpKind::Call { target, .. }
+                    if format!("{target:?}").contains("from_exc_object"))
+            })
+            .count();
+        assert_eq!(rebuilds, 1, "an Err shell a fused switch reads is rebuilt");
     }
 }
 
