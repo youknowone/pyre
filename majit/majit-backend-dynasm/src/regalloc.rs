@@ -5126,7 +5126,15 @@ impl<'a> RegAlloc<'a> {
         let tp_val = self.tp(value);
         let value_loc = self.make_sure_var_in_reg(value, tp_val, &args, None, false);
         let size = size.map(|arg| self.const_value(arg)).unwrap_or(8);
-        let ofs_loc = self.gc_offset_loc(self.const_value(offset));
+        let ofs = self.const_value(offset);
+        // pyre's GC header sits at `obj - HDR_SIZE`, so `gen_initialize_tid`
+        // stores at a small negative offset. Both store emitters take it as
+        // an immediate (STUR's signed 9-bit range on aarch64, disp32 on x86).
+        let ofs_loc = if (-256..0).contains(&ofs) {
+            Loc::immed(ofs)
+        } else {
+            self.gc_offset_loc(ofs)
+        };
         self.perform_discard_gc_store(i, value_loc, base_loc, ofs_loc, size, output);
     }
 
