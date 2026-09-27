@@ -229,10 +229,14 @@ mod tests {
             .expect("default limit");
     }
 
-    /// `pos_exc_value` the registered raiser wrote. Dynasm and cranelift each
-    /// keep their own cell; `store_jit_exception` writes every backend that
-    /// this build compiled in.
+    /// `pos_exc_value` the registered raiser wrote. Each backend keeps its
+    /// own cell; `store_jit_exception` writes every backend that this build
+    /// compiled in.
     fn backend_exception_value() -> i64 {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return majit_backend_wasm::jit_exc_value_peek();
+        }
         #[cfg(feature = "dynasm")]
         {
             return majit_backend_dynasm::jit_exc_value_peek();
@@ -241,13 +245,15 @@ mod tests {
         {
             return majit_backend_cranelift::jit_exc_value_peek();
         }
-        #[cfg(not(any(feature = "dynasm", feature = "cranelift")))]
+        #[cfg(not(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift")))]
         {
             0
         }
     }
 
     fn clear_backend_exception_cells() {
+        #[cfg(target_arch = "wasm32")]
+        majit_backend_wasm::jit_exc_clear();
         #[cfg(feature = "dynasm")]
         majit_backend_dynasm::jit_exc_clear();
         #[cfg(feature = "cranelift")]
