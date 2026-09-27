@@ -1713,68 +1713,26 @@ impl<'a> Assembler386<'a> {
                 // PyPy's `arch.py:43` does not.
                 #[cfg(target_os = "windows")]
                 dynasm!(self.mc
-                ; .arch x64
-                ; mov rbx, [rsp + 0]
-                );
-                dynasm!(self.mc
-                ; .arch x64
-                ; mov rsi, [rsp + 8]
-                );
-                dynasm!(self.mc
-                ; .arch x64
-                ; mov rdi, [rsp + 16]
-                );
-                dynasm!(self.mc
-                ; .arch x64
-                ; mov r12, [rsp + 24]
-                );
-                dynasm!(self.mc
-                ; .arch x64
-                ; mov r14, [rsp + 32]
-                );
-                dynasm!(self.mc
-                ; .arch x64
-                ; mov r15, [rsp + 40]
-                );
-                dynasm!(self.mc
-                ; .arch x64
-                ; mov rbp, [rsp + 48]
-                );
-                dynasm!(self.mc
-                ; .arch x64
-                ; mov r13, [rsp + 56]
-                );
-                dynasm!(self.mc
                     ; .arch x64
+                    ; mov rbx, [rsp + 0]
+                    ; mov rsi, [rsp + 8]
+                    ; mov rdi, [rsp + 16]
+                    ; mov r12, [rsp + 24]
+                    ; mov r14, [rsp + 32]
+                    ; mov r15, [rsp + 40]
+                    ; mov rbp, [rsp + 48]
+                    ; mov r13, [rsp + 56]
                     ; add rsp, 72
                 );
                 #[cfg(not(target_os = "windows"))]
                 dynasm!(self.mc
-                ; .arch x64
-                ; mov rbx, [rsp + 0]
-                );
-                dynasm!(self.mc
-                ; .arch x64
-                ; mov r12, [rsp + 8]
-                );
-                dynasm!(self.mc
-                ; .arch x64
-                ; mov r13, [rsp + 16]
-                );
-                dynasm!(self.mc
-                ; .arch x64
-                ; mov r14, [rsp + 24]
-                );
-                dynasm!(self.mc
-                ; .arch x64
-                ; mov r15, [rsp + 32]
-                );
-                dynasm!(self.mc
-                ; .arch x64
-                ; mov rbp, [rsp + 40]
-                );
-                dynasm!(self.mc
                     ; .arch x64
+                    ; mov rbx, [rsp + 0]
+                    ; mov r12, [rsp + 8]
+                    ; mov r13, [rsp + 16]
+                    ; mov r14, [rsp + 24]
+                    ; mov r15, [rsp + 32]
+                    ; mov rbp, [rsp + 40]
                     ; add rsp, 56
                 );
                 dynasm!(self.mc
