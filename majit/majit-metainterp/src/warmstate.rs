@@ -882,16 +882,6 @@ impl WarmEnterState {
 
     /// Create a new WarmEnterState with an explicit Logger.
     pub fn with_jitlog(threshold: u32, jitlog: Option<Logger>) -> Self {
-        // warmstate.py `hash_whatever` calls `lltype.identityhash` for every
-        // non-null generic GC pointer green.  Its translated minimark owner is
-        // `MiniMarkGC.identityhash`: obtain the move-stable address first,
-        // then apply `mangle_hash`.  Register here because majit-ir cannot
-        // depend on majit-gc (the GC already depends on the IR), while every
-        // JitDriver constructs this warm state before hashing a green key.
-        majit_ir::set_ref_hash_resolver(|value| {
-            let identity = majit_gc::gc_id_or_identityhash(value as usize) as u64;
-            identity ^ (identity >> 4)
-        });
         let mut counter = JitCounter::new(DEFAULT_SIZE);
         // rlib/jit.py PARAMETERS default decay=40.
         counter.set_decay(40);

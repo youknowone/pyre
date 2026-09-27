@@ -344,6 +344,7 @@ fn done_ref_slot0(tip: *mut JitFrame) -> usize {
     unsafe { crate::llmodel::get_ref_value_direct(tip, 0) }
 }
 
+#[inline]
 fn release_done_int_frame(token: &JitCellToken, head: *mut JitFrame, tip: *mut JitFrame) {
     let single = tip == head && unsafe { (*head).jf_forward.is_null() };
     if single && token.park_entry_frame(head) {

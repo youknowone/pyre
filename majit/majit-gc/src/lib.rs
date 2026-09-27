@@ -3652,22 +3652,17 @@ pub fn set_active_gc_varsize_layout(hook: Option<GcVarSizeLayoutFn>) {
 }
 
 /// minimark.py `id_or_identityhash` hook.
-pub type GcIdOrIdentityHashFn = fn(addr: usize) -> usize;
-
-global_hook!(static ACTIVE_GC_ID_OR_IDENTITYHASH: GcIdOrIdentityHashFn);
+pub type GcIdOrIdentityHashFn = majit_ir::value::GcIdOrIdentityHashFn;
 
 pub fn set_active_gc_id_or_identityhash(hook: Option<GcIdOrIdentityHashFn>) {
-    ACTIVE_GC_ID_OR_IDENTITYHASH.set(hook);
+    majit_ir::set_gc_id_or_identityhash(hook);
 }
 
 /// Return a GC-move-stable address for identity hashing.
 /// Falls back to `addr` when no backend is installed.
 #[inline]
 pub fn gc_id_or_identityhash(addr: usize) -> usize {
-    match ACTIVE_GC_ID_OR_IDENTITYHASH.get() {
-        Some(f) => f(addr),
-        None => addr,
-    }
+    majit_ir::gc_id_or_identityhash(addr)
 }
 
 /// Whether `addr` lies inside the active backend's managed GC heap.

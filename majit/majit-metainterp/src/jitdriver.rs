@@ -9469,7 +9469,7 @@ impl<S: JitState> JitDriver<S> {
             return SteadyCompiledEntry::Miss;
         };
         if !state.can_trace() {
-            return SteadyCompiledEntry::Done(None);
+            return self.enter_compiled_cannot_trace();
         }
         if self.meta.single_pass_label_entry_key.is_some()
             || !self.meta.cut_compiled_keys.is_empty()
@@ -9502,8 +9502,8 @@ impl<S: JitState> JitDriver<S> {
         // vinfo.clear_vable_token(virtualizable)`. Nothing else — no
         // descriptor walk, no field export.
         self.clear_entry_vable_token_raw(&scratch.raw);
-        if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
-            hook(cell_key, target_pc);
+        if self.meta.hooks.on_compiled_entry.is_some() {
+            self.enter_compiled_entry_hook(cell_key, target_pc);
         }
         // `warmstate.py execute_assembler` selects the poll from
         // `jitdriver_sd.result_type`. Int portals keep `poll_raw_int_finish_raw`.
@@ -9524,6 +9524,22 @@ impl<S: JitState> JitDriver<S> {
             return SteadyCompiledEntry::Done(None);
         }
         self.enter_compiled_general_case(cell_key, target_pc, state, env, scratch)
+    }
+
+    /// `can_trace` declined the compiled entry. The interpreter continues.
+    #[cold]
+    #[inline(never)]
+    fn enter_compiled_cannot_trace(&mut self) -> SteadyCompiledEntry {
+        SteadyCompiledEntry::Done(None)
+    }
+
+    /// `hooks.on_compiled_entry`, when one is installed.
+    #[cold]
+    #[inline(never)]
+    fn enter_compiled_entry_hook(&self, cell_key: u64, target_pc: usize) {
+        if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
+            hook(cell_key, target_pc);
+        }
     }
 
     /// Pending label or cross-loop cut: `maybe_compile_and_run` cannot enter
@@ -9727,6 +9743,11 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// The word at `index_of_virtualizable` is the virtualizable address
     /// (`warmstate.py execute_assembler` `args[index_of_virtualizable]`).
+    ///
+    /// A zero `vable_token` is the steady entry (`virtualizable.py
+    /// clear_vable_token`). Forcing a live token is
+    /// [`Self::force_entry_vable_token_raw`].
+    #[inline]
     fn clear_entry_vable_token_raw(&self, raw: &[i64]) {
         let Some(descriptor) = self.descriptor.as_ref() else {
             return;
@@ -9741,11 +9762,30 @@ impl<S: JitState> JitDriver<S> {
         let Some(&word) = raw.get(index as usize) else {
             return;
         };
-        if word == 0 {
+        if word == 0 || !info.has_vable_token() {
             return;
         }
+        let token = unsafe {
+            let obj = word as usize as *mut u8;
+            *(obj.add(info.token_offset) as *const usize)
+        };
+        if token == 0 {
+            return;
+        }
+        self.force_entry_vable_token_raw(info, word as usize as *mut u8);
+    }
+
+    /// `virtualizable.py clear_vable_token` when the token is live:
+    /// `force_now`, then the token is clear.
+    #[cold]
+    #[inline(never)]
+    fn force_entry_vable_token_raw(
+        &self,
+        info: &crate::virtualizable::VirtualizableInfo,
+        obj: *mut u8,
+    ) {
         unsafe {
-            crate::virtualizable::bh_clear_vable_token(info, word as usize as *mut u8);
+            crate::virtualizable::bh_clear_vable_token(info, obj);
         }
     }
 

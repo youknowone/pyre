@@ -1625,6 +1625,7 @@ impl JitCellToken {
     /// `None` allocates. A block that is too small is released here so the
     /// next finish can park the larger one. The slot is empty after this
     /// returns until [`Self::park_entry_frame`].
+    #[inline]
     pub fn take_entry_frame(&self, size_bytes: usize) -> Option<*mut crate::jitframe::JitFrame> {
         let frame = self
             .entry_frame
@@ -1660,6 +1661,7 @@ impl JitCellToken {
     /// The parked block is idle, so the host-frame note taken by
     /// `malloc_host_jitframe` is dropped here — the same release
     /// `free_jitframe_chain` does before a block may be reused.
+    #[inline]
     pub fn park_entry_frame(&self, frame: *mut crate::jitframe::JitFrame) -> bool {
         let parked = self
             .entry_frame
@@ -1796,6 +1798,7 @@ impl JitCellToken {
     }
 
     /// Check whether this loop has been invalidated.
+    #[inline]
     pub fn is_invalidated(&self) -> bool {
         self.invalidated.load(Ordering::Acquire)
     }

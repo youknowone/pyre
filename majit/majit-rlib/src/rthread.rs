@@ -71,6 +71,7 @@ fn fetch_addr_errno(base: *mut i64) -> *mut i32 {
 }
 
 /// `llop.threadlocalref_addr` — this thread's container.
+#[inline]
 pub fn threadlocalref_addr() -> *mut i64 {
     THREADLOCALS.with(|t| {
         let base = t.0.get().cast::<i64>();
