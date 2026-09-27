@@ -1285,14 +1285,18 @@ pub fn clear_prebuilt_roots_dirty() {
 /// ```ignore
 /// let mut obj = ...;
 /// let mut key = ...;
-/// let found = with_roots!(obj, key => lookup_that_can_collect(obj, key)?);
+/// let found = with_roots!(obj, key => lookup_that_can_collect(obj, key))?;
 /// // `obj` and `key` are the forwarded words here, not the pre-call ones.
 /// ```
 ///
-/// The livevar set is published with [`pin_roots`] rather than a `pin_root`
-/// per local: that function's own docs give the reason -- the first
-/// `pin_root`'s forwarding query is a safepoint, so a per-local loop lets a
-/// foreign collection run while the later values are still invisible.
+/// The livevar set is published with [`RootScope::pin_roots`] rather than a
+/// `pin_root` per local: that function's own docs give the reason -- the
+/// first `pin_root`'s forwarding query is a safepoint, so a per-local loop
+/// lets a foreign collection run while the later values are still invisible.
+///
+/// Keep `?` outside the macro.  A guard alive across an early return puts the
+/// guard's close between the call and its `Result` switch, which the
+/// `Result`-to-exception rewrite does not see through.
 ///
 /// An early exit out of `$body` (a `?`, a `return`) skips the restore and that
 /// is correct: [`push_roots`]'s scope guard pops the slots on the way out, and
@@ -1306,19 +1310,100 @@ pub fn clear_prebuilt_roots_dirty() {
 macro_rules! with_roots {
     ($($local:ident),+ $(,)? => $body:expr) => {{
         let _scope = $crate::gc_roots::push_roots();
-        let __roots_base = $crate::gc_roots::pin_roots(&[$($local),+]);
+        let __roots_base = _scope.pin_roots(&[$($local),+]);
         let __roots_result = $body;
-        {
-            // One local means the final increment is dead; the arm is shared.
-            #[allow(unused_assignments)]
-            let mut __roots_at = __roots_base;
-            $(
-                $local = $crate::gc_roots::shadow_stack_get(__roots_at);
-                __roots_at += 1;
-            )+
-        }
+        $crate::__with_roots_restore!(_scope, __roots_base; $($local),+);
         __roots_result
     }};
+}
+
+/// The restore half of [`with_roots!`]: `$local = scope.get(base + k)` for
+/// the `k`-th local, each index spelled as a literal offset from the scope's
+/// base.  That is the read-back shape the jitcode lowering answers with the
+/// pinned value (`RootBracketPlan`), so a bracket spelled through the macro
+/// leaves the jitcode the same way a hand-written one does.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __with_roots_restore {
+    ($s:ident, $b:ident; $l0:ident) => {
+        $l0 = $s.get($b);
+    };
+    ($s:ident, $b:ident; $l0:ident, $l1:ident) => {
+        $l0 = $s.get($b);
+        $l1 = $s.get($b + 1);
+    };
+    ($s:ident, $b:ident; $l0:ident, $l1:ident, $l2:ident) => {
+        $l0 = $s.get($b);
+        $l1 = $s.get($b + 1);
+        $l2 = $s.get($b + 2);
+    };
+    ($s:ident, $b:ident; $l0:ident, $l1:ident, $l2:ident, $l3:ident) => {
+        $l0 = $s.get($b);
+        $l1 = $s.get($b + 1);
+        $l2 = $s.get($b + 2);
+        $l3 = $s.get($b + 3);
+    };
+    ($s:ident, $b:ident; $l0:ident, $l1:ident, $l2:ident, $l3:ident, $l4:ident) => {
+        $l0 = $s.get($b);
+        $l1 = $s.get($b + 1);
+        $l2 = $s.get($b + 2);
+        $l3 = $s.get($b + 3);
+        $l4 = $s.get($b + 4);
+    };
+    ($s:ident, $b:ident; $l0:ident, $l1:ident, $l2:ident, $l3:ident, $l4:ident, $l5:ident) => {
+        $l0 = $s.get($b);
+        $l1 = $s.get($b + 1);
+        $l2 = $s.get($b + 2);
+        $l3 = $s.get($b + 3);
+        $l4 = $s.get($b + 4);
+        $l5 = $s.get($b + 5);
+    };
+    ($s:ident, $b:ident; $l0:ident, $l1:ident, $l2:ident, $l3:ident, $l4:ident, $l5:ident,
+     $l6:ident) => {
+        $l0 = $s.get($b);
+        $l1 = $s.get($b + 1);
+        $l2 = $s.get($b + 2);
+        $l3 = $s.get($b + 3);
+        $l4 = $s.get($b + 4);
+        $l5 = $s.get($b + 5);
+        $l6 = $s.get($b + 6);
+    };
+    ($s:ident, $b:ident; $l0:ident, $l1:ident, $l2:ident, $l3:ident, $l4:ident, $l5:ident,
+     $l6:ident, $l7:ident) => {
+        $l0 = $s.get($b);
+        $l1 = $s.get($b + 1);
+        $l2 = $s.get($b + 2);
+        $l3 = $s.get($b + 3);
+        $l4 = $s.get($b + 4);
+        $l5 = $s.get($b + 5);
+        $l6 = $s.get($b + 6);
+        $l7 = $s.get($b + 7);
+    };
+    ($s:ident, $b:ident; $l0:ident, $l1:ident, $l2:ident, $l3:ident, $l4:ident, $l5:ident,
+     $l6:ident, $l7:ident, $l8:ident) => {
+        $l0 = $s.get($b);
+        $l1 = $s.get($b + 1);
+        $l2 = $s.get($b + 2);
+        $l3 = $s.get($b + 3);
+        $l4 = $s.get($b + 4);
+        $l5 = $s.get($b + 5);
+        $l6 = $s.get($b + 6);
+        $l7 = $s.get($b + 7);
+        $l8 = $s.get($b + 8);
+    };
+    ($s:ident, $b:ident; $l0:ident, $l1:ident, $l2:ident, $l3:ident, $l4:ident, $l5:ident,
+     $l6:ident, $l7:ident, $l8:ident, $l9:ident) => {
+        $l0 = $s.get($b);
+        $l1 = $s.get($b + 1);
+        $l2 = $s.get($b + 2);
+        $l3 = $s.get($b + 3);
+        $l4 = $s.get($b + 4);
+        $l5 = $s.get($b + 5);
+        $l6 = $s.get($b + 6);
+        $l7 = $s.get($b + 7);
+        $l8 = $s.get($b + 8);
+        $l9 = $s.get($b + 9);
+    };
 }
 
 #[cfg(test)]
