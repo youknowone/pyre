@@ -199,12 +199,14 @@ pub enum RwTag {
 }
 
 /// One effect tuple's identity. `index` is the `DescrIndexRegistry` slot
-/// of `(T, fieldname)` / `ARRAY`, so two tuples naming the same
-/// `(T, fieldname)` share it.
+/// of `(T, fieldname)` / `ARRAY`. That slot is keyed by the owner's name
+/// alone, so a struct effect also carries the owner's `StructId`: two
+/// structs spelled with one name are two `T`s.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct RwKey {
     tag: RwTag,
     index: u32,
+    owner_id: Option<majit_ir::descr::StructId>,
 }
 
 /// The rest of an effect tuple: what `add_struct` / `add_array` /
@@ -8256,7 +8258,11 @@ impl CallControl {
             .descr_indices
             .field_index(&field.owner_root, &field.name);
         ReadWriteEffects::singleton(
-            RwKey { tag, index },
+            RwKey {
+                tag,
+                index,
+                owner_id: field.owner_id,
+            },
             RwOperand::Field {
                 owner_root: field.owner_root.clone(),
                 owner_id: field.owner_id,
@@ -8292,7 +8298,11 @@ impl CallControl {
             len_offset,
         );
         ReadWriteEffects::singleton(
-            RwKey { tag, index },
+            RwKey {
+                tag,
+                index,
+                owner_id: None,
+            },
             RwOperand::Array {
                 array_type_id: resolved_id,
                 ir_type: effect_array_ir_type(item_ty),
@@ -8328,7 +8338,11 @@ impl CallControl {
             .descr_indices
             .interiorfield_index(&resolved_id, field_name);
         ReadWriteEffects::singleton(
-            RwKey { tag, index },
+            RwKey {
+                tag,
+                index,
+                owner_id: None,
+            },
             RwOperand::InteriorField {
                 array_type_id: resolved_id,
                 field_name: field_name.to_string(),
@@ -8537,7 +8551,11 @@ pub fn effectinfo_from_writeanalyze(
             array_type_id,
             *len_offset,
         );
-        let val = RwKey { tag, index };
+        let val = RwKey {
+            tag,
+            index,
+            owner_id: None,
+        };
         if !effects.contains_key(&val) {
             extraef.push((
                 val,
@@ -8582,7 +8600,7 @@ pub fn effectinfo_from_writeanalyze(
             RwTag::ReadStruct => {
                 if !in_effects(RwKey {
                     tag: RwTag::Struct,
-                    index,
+                    ..key
                 }) {
                     add_struct(
                         &mut readonly_descrs_fields,
@@ -8603,7 +8621,7 @@ pub fn effectinfo_from_writeanalyze(
             RwTag::ReadInteriorField => {
                 if !in_effects(RwKey {
                     tag: RwTag::InteriorField,
-                    index,
+                    ..key
                 }) {
                     add_interiorfield(
                         &mut readonly_descrs_interiorfields,
@@ -8624,7 +8642,7 @@ pub fn effectinfo_from_writeanalyze(
             RwTag::ReadArray => {
                 if !in_effects(RwKey {
                     tag: RwTag::Array,
-                    index,
+                    ..key
                 }) {
                     add_array(
                         &mut readonly_descrs_arrays,
@@ -8639,19 +8657,27 @@ pub fn effectinfo_from_writeanalyze(
     }
     // Sort + dedupe the index lists so the bitstrings match PyPy's
     // `frozenset[Descr]` semantics (canonical, no duplicates):
-    // `extraef` can name one array twice.
-    readonly_descrs_fields.sort_unstable();
-    readonly_descrs_fields.dedup();
-    readonly_descrs_arrays.sort_unstable();
-    readonly_descrs_arrays.dedup();
-    readonly_descrs_interiorfields.sort_unstable();
-    readonly_descrs_interiorfields.dedup();
-    write_descrs_fields.sort_unstable();
-    write_descrs_fields.dedup();
-    write_descrs_arrays.sort_unstable();
-    write_descrs_arrays.dedup();
-    write_descrs_interiorfields.sort_unstable();
-    write_descrs_interiorfields.dedup();
+    // `extraef` can name one array twice, and two struct effects that
+    // differ only in `owner_id` share a slot. A shared slot that is written
+    // is not readonly.
+    for indices in [
+        &mut readonly_descrs_fields,
+        &mut readonly_descrs_arrays,
+        &mut readonly_descrs_interiorfields,
+        &mut write_descrs_fields,
+        &mut write_descrs_arrays,
+        &mut write_descrs_interiorfields,
+    ] {
+        indices.sort_unstable();
+        indices.dedup();
+    }
+    for (readonly, write) in [
+        (&mut readonly_descrs_fields, &write_descrs_fields),
+        (&mut readonly_descrs_arrays, &write_descrs_arrays),
+        (&mut readonly_descrs_interiorfields, &write_descrs_interiorfields),
+    ] {
+        readonly.retain(|index| write.binary_search(index).is_err());
+    }
 
     // The `read \ write` exclusion sets are captured HERE, before the
     // elidable/loop-invariant write blanking below, because
@@ -14681,6 +14707,28 @@ mod tests {
         let after = majit_ir::descr::field_mint_census_snapshot();
         assert!(after.offset_template_hit > before.offset_template_hit);
         assert!(after.cache_hit_offset > before.cache_hit_offset);
+    }
+
+    /// Two structs spelled with one owner name are two `T`s: each keeps its
+    /// own `("struct", T, fieldname)` tuple though they share one index.
+    #[test]
+    fn readwrite_struct_effect_is_keyed_by_owner_id() {
+        let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
+        let write = |id: &str| {
+            let mut op = rw_write_field("Entry", "key");
+            if let OpKind::FieldWrite { field, .. } = &mut op {
+                field.owner_id = Some(majit_ir::descr::StructId::from_canonical(id));
+            }
+            op
+        };
+        rw_register(&mut cc, "two", vec![write("m1::Entry"), write("m2::Entry")]);
+        let effects = rw_of(&cc, &mut cache, "two");
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("two field writes are not top");
+        };
+        assert_eq!(set.len(), 2);
+        assert_eq!(write_fields(&effects), vec![0, 0]);
     }
 
     /// `find_all_graphs` fills a deferred indirect family before any
