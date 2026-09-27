@@ -212,7 +212,13 @@ unsafe fn faulthandler_dump_current_traceback(fd: i32) {
         let lineno = unsafe { (*frame).get_lineno_at((*frame).last_instr) }.max(0) as usize;
         faulthandler_write_decimal(fd, lineno);
         rustpython_host_env::faulthandler::write_fd(fd, b" in ");
-        rustpython_host_env::faulthandler::write_fd(fd, code.obj_name.as_bytes());
+        let cached_name = unsafe { (*pycode).w_name };
+        let name_bytes = if cached_name.is_null() {
+            code.obj_name.as_bytes()
+        } else {
+            unsafe { pyre_object::w_str_get_wtf8(cached_name) }.as_bytes()
+        };
+        rustpython_host_env::faulthandler::write_fd(fd, name_bytes);
         rustpython_host_env::faulthandler::write_fd(fd, b"\n");
         frame = unsafe { (*frame).f_backref };
         depth += 1;
