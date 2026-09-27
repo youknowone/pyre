@@ -840,18 +840,6 @@ pyre_interpreter::builtin_wrapper_descriptor!(
     __majit_wrap_math_isclose
 );
 
-/// Raw counterparts of `ll_math_floor` / `ll_math_ceil` for a guarded JIT fast
-/// path.  Both are total on finite input and cannot raise, so the walker emits
-/// them as pure elidable calls; the trace guards the rounded value into the
-/// machine range before casting.
-pub extern "C" fn jit_math_floor_raw(x: f64) -> f64 {
-    x.floor()
-}
-
-pub extern "C" fn jit_math_ceil_raw(x: f64) -> f64 {
-    x.ceil()
-}
-
 // ── raw helpers and identity table for the generic float folds ───────
 
 macro_rules! jit_raw2 {
@@ -870,60 +858,6 @@ jit_raw2!(jit_math_fmod, fmod);
 jit_raw2!(jit_math_copysign, copysign);
 jit_raw2!(jit_math_remainder, remainder);
 jit_raw2!(jit_math_atan2, atan2);
-
-/// `ll_math.py math_hypot` — the C `hypot` llexternal, not the raising
-/// `ll_math_hypot` wrapper.  Two finite arguments that overflow return
-/// +inf; the wrapper (and `complex_abs`) turn that into OverflowError.
-pub extern "C" fn jit_math_hypot(x: f64, y: f64) -> f64 {
-    x.hypot(y)
-}
-
-/// `ll_math.py` C llexternals for the Opaque `f64` inherent methods
-/// `ll_math::f64_method_llexternal` names.
-/// IEEE, no raise — the `ll_math_*` wrappers stay around them.
-macro_rules! jit_math_raw1 {
-    ($($helper:ident => $method:ident),* $(,)?) => {
-        $(
-            pub extern "C" fn $helper(x: f64) -> f64 {
-                x.$method()
-            }
-        )*
-    };
-}
-
-jit_math_raw1! {
-    jit_math_log_raw => ln,
-    jit_math_log10_raw => log10,
-    jit_math_log1p_raw => ln_1p,
-    jit_math_exp_raw => exp,
-    jit_math_exp2_raw => exp2,
-    jit_math_expm1_raw => exp_m1,
-    jit_math_sqrt_raw => sqrt,
-    jit_math_cbrt_raw => cbrt,
-    jit_math_sin_raw => sin,
-    jit_math_cos_raw => cos,
-    jit_math_tan_raw => tan,
-    jit_math_asin_raw => asin,
-    jit_math_acos_raw => acos,
-    jit_math_atan_raw => atan,
-    jit_math_sinh_raw => sinh,
-    jit_math_cosh_raw => cosh,
-    jit_math_tanh_raw => tanh,
-    jit_math_asinh_raw => asinh,
-    jit_math_acosh_raw => acosh,
-    jit_math_atanh_raw => atanh,
-}
-
-pub extern "C" fn jit_math_pow_raw(x: f64, y: f64) -> f64 {
-    x.powf(y)
-}
-
-/// The C `fmod` llexternal, which is also what `%` over two floats lowers
-/// to: `lloperation.py` has no `float_mod`, so the codewriter emits a
-/// residual call of this name instead.
-pub extern "C" fn jit_math_fmod_raw(x: f64, y: f64) -> f64 {
-    x % y
-}
 
 pub fn cbrt(args: &[PyObjectRef]) -> PyResult {
     math1_pymath("cbrt", args, pymath::math::cbrt, |_| {
