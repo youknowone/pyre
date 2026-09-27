@@ -10690,6 +10690,12 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         insns.insert(key.to_string(), byte);
     }
     insns.insert("abort/".to_string(), majit_jitcode::insns::BC_ABORT);
+    // Ref-result abort. `wire_handler` only rebinds a key already in this
+    // map, so the call below is a no-op until the byte is inserted here.
+    insns.insert(
+        "abort/>r".to_string(),
+        majit_jitcode::insns::BC_ABORT_RESULT_R,
+    );
     insns.insert(
         "abort_permanent/".to_string(),
         majit_jitcode::insns::BC_ABORT_PERMANENT,
