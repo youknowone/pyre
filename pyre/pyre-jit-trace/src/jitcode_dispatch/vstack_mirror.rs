@@ -154,7 +154,13 @@ pub(crate) fn classify_vstack_opcode(
         // super-instruction in a short-circuit / condexpr loop body.
         | Instruction::LoadFastLoadFast { .. }
         | Instruction::LoadFastBorrowLoadFastBorrow { .. }
-        | Instruction::StoreFastLoadFast { .. } => VstackOpClass::ResultToTos,
+        | Instruction::StoreFastLoadFast { .. }
+        // RETURN_GENERATOR on a resumed generator pushes the `None` the
+        // following POP_TOP drops (`return_generator`, liveness
+        // `(d + 1, d + 1)`).  It is the first opcode of every generator body,
+        // so a walk starting at the code entry lost the mirror before the
+        // first branch.
+        | Instruction::ReturnGenerator => VstackOpClass::ResultToTos,
 
         // Pop-only / side-store / control transfer: the surviving TOS box
         // is already in `vstack_boxes`, do NOT overwrite it from the last
@@ -302,6 +308,9 @@ fn loadconst_operand_ref<Sym: WalkSym>(
     instr: &pyre_interpreter::bytecode::Instruction,
     op_arg: pyre_interpreter::OpArg,
 ) -> OpRef {
+    if let pyre_interpreter::bytecode::Instruction::ReturnGenerator = instr {
+        return ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+    }
     if let pyre_interpreter::bytecode::Instruction::LoadSmallInt { i } = instr {
         let val = i.get(op_arg) as u32 as i64;
         return ctx

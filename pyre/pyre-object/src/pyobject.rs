@@ -1628,6 +1628,9 @@ fn int_operand_is_long(obj: PyObjectRef) -> bool {
 /// `W_FloatObject.is_w`, `W_AbstractTupleObject.is_w`,
 /// `W_AbstractBytesObject.is_w`, `W_UnicodeObject.is_w`, and
 /// `W_FrozensetObject.is_w`.
+///
+/// The dispatch is on `w_two`, as `w_two.is_w(space, w_one)` is: every gate
+/// reads `w_two`'s type first, so `x is CONST` never reads `x`'s class.
 pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
     if std::ptr::eq(w_one, w_two) {
         return true;
@@ -1648,8 +1651,8 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
     // `ptr::eq` above (identical bit patterns); an immediate and a boxed
     // int of the same value fall here and compare equal by value.
     unsafe {
-        if crate::pyobject::is_exact_type(w_one, &crate::pyobject::INT_TYPE)
-            && crate::pyobject::is_exact_type(w_two, &crate::pyobject::INT_TYPE)
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::INT_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::INT_TYPE)
         {
             return abstract_int_is_w(w_one, w_two);
         }
@@ -1662,8 +1665,8 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         // CPython 3.14 gives NaNs pointer identity; unlike finite floats they
         // stay boxed (`cpython_differences.rst`, "Object Identity of Primitive
         // Values, `is` and `id`").
-        if crate::pyobject::is_exact_type(w_one, &crate::pyobject::FLOAT_TYPE)
-            && crate::pyobject::is_exact_type(w_two, &crate::pyobject::FLOAT_TYPE)
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::FLOAT_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::FLOAT_TYPE)
         {
             let one = crate::floatobject::w_float_get_value(w_one);
             let two = crate::floatobject::w_float_get_value(w_two);
@@ -1680,8 +1683,8 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         // subclasses keep pointer identity through the exact-type gate. The
         // specialised arity-2 tuples carry the canonical `tuple` w_class, so
         // they pass the gate but are never empty (length 2).
-        if crate::pyobject::is_exact_type(w_one, &crate::pyobject::TUPLE_TYPE)
-            && crate::pyobject::is_exact_type(w_two, &crate::pyobject::TUPLE_TYPE)
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::TUPLE_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::TUPLE_TYPE)
         {
             return crate::tupleobject::w_tuple_len(w_one) == 0
                 && crate::tupleobject::w_tuple_len(w_two) == 0;
@@ -1692,8 +1695,8 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         // so distinct wrappers may deliberately share that backing block.
         // `len(s2) == 0` returns `len(s1) == 0`; `len(s2) == 1`
         // (unique-ified) returns `len(s1) == 1 && s1[0] == s2[0]`.
-        if crate::pyobject::is_exact_type(w_one, &crate::bytesobject::BYTES_TYPE)
-            && crate::pyobject::is_exact_type(w_two, &crate::bytesobject::BYTES_TYPE)
+        if crate::pyobject::is_exact_type(w_two, &crate::bytesobject::BYTES_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::bytesobject::BYTES_TYPE)
         {
             let len1 = crate::bytesobject::w_bytes_len(w_one);
             let len2 = crate::bytesobject::w_bytes_len(w_two);
@@ -1715,8 +1718,8 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         // `str` subclasses keep pointer identity through the exact-type gate.
         // `s1 is s2` is `ptr::eq` on the two `STR` payloads and `s1 == s2`
         // is `ll_streq` on them, as the rtyped upstream body calls it.
-        if crate::pyobject::is_exact_type(w_one, &crate::pyobject::STR_TYPE)
-            && crate::pyobject::is_exact_type(w_two, &crate::pyobject::STR_TYPE)
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::STR_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::STR_TYPE)
         {
             let s1 = crate::unicodeobject::w_str_storage(w_one);
             let s2 = crate::unicodeobject::w_str_storage(w_two);
@@ -1730,8 +1733,8 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         // unique-ified". The mutable `set` carries a distinct type tag and
         // does not override `is_w`, so the `FROZENSET_TYPE` gate excludes
         // it; `frozenset` subclasses are excluded too.
-        if crate::pyobject::is_exact_type(w_one, &crate::setobject::FROZENSET_TYPE)
-            && crate::pyobject::is_exact_type(w_two, &crate::setobject::FROZENSET_TYPE)
+        if crate::pyobject::is_exact_type(w_two, &crate::setobject::FROZENSET_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::setobject::FROZENSET_TYPE)
         {
             return crate::setobject::w_set_len(w_one) == 0
                 && crate::setobject::w_set_len(w_two) == 0;
