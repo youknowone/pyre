@@ -8316,7 +8316,7 @@ pub fn effectinfo_from_writeanalyze(
     // same `register_keyed_field` allocation. This also makes
     // `compute_bitstrings` and cross-module heap invalidation share the
     // descriptor's single effect-info index.
-    // populated bitstring 을 정상 소비한다.
+    // A populated bitstring is consumed normally.
     // PyPy `effectinfo.py` `readonly` rule:
     //   elif tup[0] == "readstruct":
     //       tupw = ("struct",) + tup[1:]

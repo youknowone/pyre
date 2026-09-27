@@ -18,7 +18,7 @@ use super::*;
 use majit_gc::GcAllocOutcome;
 use std::cell::UnsafeCell;
 
-// ---- RBigIntGcRoot ----
+// RBigIntGcRoot
 /// Host-side, by-value `RBigInt` whose `_digits` edge lives in a fixed
 /// owner-root slot for the guard's lifetime.
 ///

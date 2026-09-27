@@ -166,8 +166,8 @@ fn test_flatten_callspec() {
 #[test]
 fn signature_tuple_protocol_matches_upstream() {
     // upstream `rpython/flowspace/argument.py` — `Signature.__len__`
-    // 은 항상 3, `Signature.__getitem__` 은 argnames / varargname /
-    // kwargname 순.
+    // is always 3, and `Signature.__getitem__` is argnames / varargname /
+    // kwargname in that order.
     let sig = Signature::new(
         vec!["a".into(), "b".into()],
         Some("va".into()),

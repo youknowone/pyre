@@ -580,14 +580,14 @@ pub fn make_quasi_immutable_field_descr(
 pub struct PyreSizeDescr {
     obj_size: usize,
     type_id: u32,
-    /// `_cache_size[LLType::Struct(cache_key)]` 슬롯 키 — `path_hash`로
-    /// 만들어진 STRUCT 구조 identity (publish 슬롯과 동일).  `type_id`
-    /// 는 `gc.alloc_gc_typed`용 dense u32 GC tid 이고, `cache_key` 는
-    /// `descr.py:108-118 cache[STRUCT]`의 lltype-object identity 와 1:1
-    /// 대응한다.  `SizeDescr.cache_key()` 가 이 값을 반환해
-    /// `bh_size_spec_from_descr` 역방향 reader 가 publish 슬롯과 같은
-    /// `LLType::Struct(cache_key)` 로 round-trip 한다.  init 0 은 단발
-    /// fixture 용 fall-back (구조 identity 없는 케이스).
+    /// Slot key for `_cache_size[LLType::Struct(cache_key)]` — the STRUCT
+    /// structural identity built by `path_hash` (the same publish slot).
+    /// `type_id` is the dense u32 GC tid for `gc.alloc_gc_typed`, and
+    /// `cache_key` corresponds 1:1 to the lltype-object identity of
+    /// `descr.py` `get_size_descr` `cache[STRUCT]`. `SizeDescr.cache_key()` returns
+    /// this value so the reverse reader `bh_size_spec_from_descr` round-trips
+    /// to the same publish slot as `LLType::Struct(cache_key)`. init 0 is the
+    /// one-shot fixture fallback (no structural identity).
     cache_key: u64,
     /// descr.get_vtable() parity: ob_type pointer for NewWithVtable.
     /// optimize_new_with_vtable reads this to set VirtualInfo.known_class.
@@ -3305,16 +3305,16 @@ impl SizeDescr for PyreSizeDescr {
         self.type_id
     }
 
-    /// `descr.py get_size_descr` cache identity 와 line-by-line
-    /// 동등: `register_keyed_size` 가 publish 한 슬롯 키 (현재
+    /// Line-by-line equivalent of the `descr.py get_size_descr` cache
+    /// identity: the slot key published by `register_keyed_size` (currently
     /// `path_hash_stripped_crate(module_path!(), bare_name)` —
-    /// 즉 def-path 기반의 `path_hash("module::Bare")`).  매크로 publish
-    /// 시 `__majit_type_id()` 에서 계산되어 인스턴스 슬롯에 저장된
-    /// 값을 그대로 반환한다.  `bh_size_spec_from_descr` 역방향 reader 는
-    /// 이 값을 `BhSizeSpec.type_id` 에 넣고 `simple_descr_group_from_bh_size`
-    /// 는 `LLType::Struct(spec.type_id)` 로 publish 슬롯에 round-trip 한다.
-    /// `type_id` (dense GC tid) 와 `cache_key` (structural identity) 는
-    /// `SizeDescr::cache_key` 트레이트 doc 의 분리 contract 를 따른다.
+    /// i.e. the def-path `path_hash("module::Bare")`). Returns the value
+    /// computed by `__majit_type_id()` at macro publish time and stored in
+    /// the instance slot. The reverse reader `bh_size_spec_from_descr` puts
+    /// this value in `BhSizeSpec.type_id`, and `simple_descr_group_from_bh_size`
+    /// round-trips to the publish slot as `LLType::Struct(spec.type_id)`.
+    /// `type_id` (dense GC tid) and `cache_key` (structural identity) follow
+    /// the split contract in the `SizeDescr::cache_key` trait doc.
     fn cache_key(&self) -> u64 {
         self.cache_key
     }
@@ -3357,10 +3357,10 @@ pub fn make_size_descr_with_type_and_vtable(
     type_id: u32,
     vtable: usize,
 ) -> DescrRef {
-    // 빈 fielddescr fallback — `BhDescr::Size` 디코더가 구조 identity
-    // 캐리어 없이 호출하는 자리.  `cache_key = 0` 은 round-trip 시
-    // `simple_descr_group_from_bh_size` 의 no-identity branch 가
-    // per-call distinct 처리하므로 안전.
+    // Empty fielddescr fallback — where the `BhDescr::Size` decoder is
+    // called with no structural-identity carrier. `cache_key = 0` is safe
+    // on round-trip because the no-identity branch of
+    // `simple_descr_group_from_bh_size` treats each call as distinct.
     Arc::new(PyreSizeDescr {
         obj_size,
         type_id,

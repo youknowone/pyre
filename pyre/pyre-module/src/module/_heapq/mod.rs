@@ -209,7 +209,6 @@ fn keep_top_bit(mut n: i64) -> i64 {
 }
 
 /* Cache friendly version of heapify()
-   -----------------------------------
 
    Build-up a heap in O(n) time by performing siftup() operations
    on nodes whose children are already heaps.

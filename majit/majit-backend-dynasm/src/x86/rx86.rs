@@ -413,7 +413,7 @@ fn op_rr(mc: &mut Assembler, kind: RexKind, mandatory: u8, opcode: &[u8], reg: u
     encode_modrm_reg_reg(mc, reg, rm, 0);
 }
 
-// ---------------------------------------------------------------- MOV
+// MOV
 
 /// `MOV_rm` — `mov r64, [base + ofs]`.
 pub fn mov_rm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
@@ -670,7 +670,7 @@ pub(crate) fn mov_ri64(mc: &mut Assembler, reg: u8, immed: i64) {
     writeimm64(mc, immed);
 }
 
-// --------------------------------------------------------------- LEA
+// LEA
 
 /// `LEA_rm` — `lea r64, [base + ofs]`.
 pub fn lea_rm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
@@ -682,7 +682,7 @@ pub fn lea_ra(mc: &mut Assembler, dst: u8, addr: (i16, u8, u8, i32)) {
     op_addr(mc, RexKind::W, 0, &[0x8D], dst, addr);
 }
 
-// --------------------------------------------------------- ALU reg, imm
+// ALU reg, imm
 
 /// `ADD_ri8`/`ADD_ri32` — `add r64, imm8` / `add r64, imm32`.
 pub(crate) fn add_ri(mc: &mut Assembler, reg: u8, immed: i32) {
@@ -771,7 +771,7 @@ pub(crate) fn imul_rmi(mc: &mut Assembler, dst: u8, mem: (u8, i32), immed: i32) 
     }
 }
 
-// -------------------------------------------------------- ALU reg, mem
+// ALU reg, mem
 
 /// `ADD_rb` — `add r64, [rbp + ofs]`.
 pub(crate) fn add_rb(mc: &mut Assembler, dst: u8, offset: i32) {
@@ -878,7 +878,7 @@ pub(crate) fn pop_b(mc: &mut Assembler, offset: i32) {
     encode_stack_bp(mc, offset, false, 0);
 }
 
-// ---------------------------------------------------------------- SSE
+// SSE
 
 /// `MOVSD_xm` — `movsd xmm, [base + ofs]`.
 pub fn movsd_xm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {

@@ -215,9 +215,10 @@ impl FlowSignal {
     }
 }
 
-/// upstream `const(SomeException)` — HostObject 로 감싸진 builtin
-/// exception class 를 `Hlvalue` 로 만든다. HOST_ENV 에 있어야 하며,
-/// 없으면 panic (개발 시 bootstrap 누락을 즉시 드러내기 위함).
+/// upstream `const(SomeException)` — builds an `Hlvalue` for a builtin
+/// exception class wrapped in a HostObject. It must be in HOST_ENV;
+/// otherwise this panics (so a missing bootstrap entry shows up immediately
+/// during development).
 fn exception_class_value(name: &str) -> Hlvalue {
     let cls = HOST_ENV
         .lookup_builtin(name)
@@ -225,9 +226,9 @@ fn exception_class_value(name: &str) -> Hlvalue {
     Hlvalue::Constant(Constant::new(ConstValue::HostObject(cls)))
 }
 
-/// upstream `const(SomeException("msg"))` — instance HostObject 를
-/// 만들어 `Hlvalue` 로 감싼다. `message` 가 Some 이면
-/// `HostObject.instance_args()` 의 0번째가 byte-string message.
+/// upstream `const(SomeException("msg"))` — builds an instance HostObject
+/// and wraps it as an `Hlvalue`. When `message` is Some, element 0 of
+/// `HostObject.instance_args()` is the byte-string message.
 fn exception_instance_value(name: &str, message: Option<String>) -> Hlvalue {
     let cls = HOST_ENV
         .lookup_builtin(name)
@@ -240,9 +241,9 @@ fn exception_instance_value(name: &str, message: Option<String>) -> Hlvalue {
 }
 
 /// upstream `w_exc.w_value.value.args[0]` — `raise ValueError("msg")`
-/// 에서 message 문자열 추출. instance HostObject 의 `instance_args()`
-/// 첫 요소가 `Str` 이면 그 값, 아니면 directly-wrapped `Str` 상수인지
-/// 확인.
+/// extracts the message string. If the first `instance_args()` element of
+/// the instance HostObject is `Str`, that value is used; otherwise this
+/// checks for a directly wrapped `Str` constant.
 fn exception_message(w_exc_value: &Hlvalue) -> String {
     if let Hlvalue::Constant(Constant {
         value: ConstValue::HostObject(obj),
@@ -261,8 +262,8 @@ fn exception_message(w_exc_value: &Hlvalue) -> String {
     "<not a constant message>".to_owned()
 }
 
-/// HostObject qualname 을 돌려준다; class 이면 class 의 qualname,
-/// instance 면 그 `__class__` 의 qualname.
+/// Returns the HostObject qualname: the class qualname for a class, or
+/// the `__class__` qualname for an instance.
 fn exception_class_name(w_value: &Hlvalue) -> Option<&str> {
     let obj = match w_value {
         Hlvalue::Constant(Constant {
@@ -280,8 +281,8 @@ fn exception_class_name(w_value: &Hlvalue) -> Option<&str> {
     }
 }
 
-/// `w_value` 가 exception class/instance 를 담고 있으면 class HostObject
-/// 자체를 돌려준다 (class 이면 그 자신, instance 이면 `__class__`).
+/// If `w_value` holds an exception class or instance, returns the class
+/// HostObject itself (the value if it is a class, `__class__` if it is an instance).
 fn exception_class_from_hlvalue(w_value: &Hlvalue) -> Option<HostObject> {
     let obj = match w_value {
         Hlvalue::Constant(Constant {
@@ -1063,7 +1064,7 @@ impl FlowContext {
         self.record_maybe_raise_op("direct_call", args, Self::common_exception_cases())
     }
 
-    /// 문자열 이름으로 `__builtin__` 항목을 가져와 appcall — 편의 메서드.
+    /// Looks up a `__builtin__` entry by string name and appcalls it — convenience method.
     pub(crate) fn appcall_builtin(
         &mut self,
         name: &str,
@@ -1087,15 +1088,15 @@ impl FlowContext {
     ///     return const(mod)
     /// ```
     ///
-    /// Rust 포트는 Python `__import__` 를 직접 실행하지 않는다. 대신
-    /// `HOST_ENV.import_module(name)` 을 조회한다 — HOST_ENV 는
-    /// bootstrap 시점에 upstream 의 `specialcase.py` 가 참조하는 모듈
-    /// (os, os.path, rpython.rlib.rfile, rpython.rlib.rpath) 을
-    /// pre-populate 해둔다. 추가 모듈을 다뤄야 한다면 HOST_ENV 에 먼저
-    /// 등록해야 한다. 없는 이름은 upstream 의 `except ImportError` 경로
-    /// 와 동일하게 `Raise(const(ImportError))` 로 flowspace 를 이탈.
+    /// The Rust port does not run Python `__import__` directly. It looks up
+    /// `HOST_ENV.import_module(name)` instead — HOST_ENV pre-populates, at
+    /// bootstrap, the modules upstream `specialcase.py` refers to
+    /// (os, os.path, rpython.rlib.rfile, rpython.rlib.rpath).
+    /// A further module must be registered in HOST_ENV first.
+    /// A missing name leaves flowspace via `Raise(const(ImportError))`,
+    /// the same as upstream's `except ImportError` path.
     pub(crate) fn import_name(&mut self, args: &[ConstValue]) -> Result<Hlvalue, FlowContextError> {
-        // upstream 시그니처 `(name, glob=None, loc=None, frm=None, level=-1)`.
+        // upstream signature `(name, glob=None, loc=None, frm=None, level=-1)`.
         let name = match args.first() {
             Some(value) => value.as_text().map(str::to_owned).ok_or_else(|| {
                 FlowContextError::Flowing(FlowingError::new(
@@ -1141,10 +1142,10 @@ impl FlowContext {
     ///         raise Raise(const(exc))
     /// ```
     ///
-    /// Rust 포트는 `w_module.value` 가 `HostObject::Module` 일 때
-    /// `module_get(name)` 으로 이름을 해석한다. 못 찾으면 upstream 의
-    /// `except FlowingError → Raise(ImportError)` 경로와 동일한 형태로
-    /// `Raise(const(ImportError))` 을 일으킨다.
+    /// When `w_module.value` is `HostObject::Module`, the Rust port resolves
+    /// the name with `module_get(name)`. If it is missing, this raises
+    /// `Raise(const(ImportError))` in the same shape as upstream's
+    /// `except FlowingError → Raise(ImportError)` path.
     pub(crate) fn import_from(
         &mut self,
         w_module: Hlvalue,
@@ -1712,14 +1713,13 @@ impl FlowContext {
             ConstantData::Code { code } => {
                 Ok(ConstValue::Code(Box::new(HostCode::from_code(code))))
             }
-            // upstream `Constant.value` 는 임의의 Python object 를
-            // 담을 수 있다. Rust 포트에서 bool / int / float / None /
-            // str / tuple / code 외의 variant (bytes, frozenset,
-            // complex 등) 는 현재 구조적 변환 대상이 아니지만 값을
-            // 유지해야 하므로 `HostObject::new_opaque` 로 싸서
-            // 살린다. flowspace 의 구조 분석 경로는 opaque object 를
-            // 그대로 Constant 에 보존하고, annotator 가 필요할 때
-            // 다시 들여다볼 수 있다.
+            // upstream `Constant.value` can hold an arbitrary Python object.
+            // In the Rust port, variants other than bool / int / float / None /
+            // str / tuple / code (bytes, frozenset, complex, and so on) are
+            // not structurally converted yet, but the value must be kept, so
+            // it is wrapped with `HostObject::new_opaque`. Flowspace's
+            // structural-analysis path leaves the opaque object in the
+            // Constant, and the annotator can look at it again when needed.
             other => {
                 let qualname = format!("opaque-{other:?}");
                 Ok(ConstValue::HostObject(HostObject::new_opaque(qualname)))
@@ -2150,14 +2150,14 @@ impl FlowContext {
                 self.record_pure_op("issubtype", vec![w_exc_type.clone(), w_check_class.clone()])?;
             return self.guessbool(w_match);
         }
-        // `if not isinstance(check_class, tuple):` 가 위에서 True 이면
-        // 이미 리턴; 여기 도달했다는 건 check_class 가 tuple.
+        // If `if not isinstance(check_class, tuple):` was True above, we
+        // already returned; reaching here means check_class is a tuple.
         //
-        // upstream `if check_class == rstackovf.StackOverflow: ...` 의
-        // StackOverflow sentinel 튜플은 Rust 포트에 존재하지 않는다
-        // (HOST_ENV 는 StackOverflow 를 RuntimeError 의 subclass class
-        // 로 등록; 따라서 `except StackOverflow:` 는 위의 simple-class
-        // branch 에서 바로 처리된다). 대체 substitution 불필요.
+        // The StackOverflow sentinel tuple from upstream
+        // `if check_class == rstackovf.StackOverflow: ...` does not exist in
+        // the Rust port (HOST_ENV registers StackOverflow as a subclass of
+        // RuntimeError, so `except StackOverflow:` is handled directly by the
+        // simple-class branch above). No substitute is needed.
         if let ConstValue::Tuple(elements) = check_value {
             for klass in elements {
                 let w_klass = Hlvalue::Constant(Constant::new(klass.clone()));
@@ -3450,9 +3450,9 @@ impl FlowContext {
                 )),
                 // ──── 3.14 opcodes outside the RPython language subset ────
                 // `AnnotationsPlaceholder` / `PopBlock` / `SetupCleanup` /
-                // `SetupFinally` / `SetupWith` / `StoreFastMaybeNull` 등은
-                // `PseudoInstruction` 에만 존재하며 실제 `Instruction`
-                // enum 에 오지 않으므로 arm 불필요.
+                // `SetupFinally` / `SetupWith` / `StoreFastMaybeNull` and similar
+                // exist only on `PseudoInstruction` and never reach the real
+                // `Instruction` enum, so no arm is needed.
                 Instruction::CheckEgMatch => {
                     self.unsupported_rpython("exception groups are not RPython")
                 }
@@ -3460,16 +3460,15 @@ impl FlowContext {
                     self.unsupported_rpython("`__init__` return-None check is not RPython")
                 }
                 Instruction::GetLen => {
-                    // Upstream flowspace 에서는 Python 2.7 형태로 `len(x)`
-                    // 를 `op.len(x)` 로 기록한다. 3.14 의 `GET_LEN` 은
-                    // match statement 의 보조 opcode 이며 RPython scope
-                    // 밖이다.
+                    // Upstream flowspace records `len(x)` as `op.len(x)` in the
+                    // Python 2.7 form. 3.14 `GET_LEN` is a helper opcode for
+                    // match statements and is outside the RPython scope.
                     self.unsupported_rpython("GET_LEN is used by match statements (not RPython)")
                 }
                 Instruction::GetYieldFromIter => {
-                    // `yield from` 은 `flowcontext.py` 에서도 일반
-                    // generator 경로로 빠진다; Rust 포트는 generator
-                    // 지원을 아직 넣지 않았다.
+                    // `yield from` also falls through to the ordinary generator
+                    // path in `flowcontext.py`; the Rust port does not support
+                    // generators yet.
                     self.unsupported_rpython("`yield from` is not supported by flowspace yet")
                 }
             }
@@ -3650,10 +3649,10 @@ mod test {
         let exits = ctx.graph.startblock.borrow().exits.clone();
         assert_eq!(exits.len(), 1);
         let link = exits[0].borrow();
-        // Class HostObject 는 HOST_ENV singleton 이라 Arc::ptr_eq OK.
+        // A class HostObject is a HOST_ENV singleton, so Arc::ptr_eq is OK.
         assert_eq!(link.args[0], Some(exception_class_value("AssertionError")));
-        // Instance 는 each call 마다 fresh Arc — identity-eq 이 달라서
-        // 구조적으로 비교.
+        // An instance is a fresh Arc on each call — identity-eq differs, so
+        // compare structurally.
         match &link.args[1] {
             Some(Hlvalue::Constant(Constant {
                 value: ConstValue::HostObject(obj),

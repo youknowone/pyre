@@ -7444,8 +7444,8 @@ impl CodeWriter {
         // a caller-order Register list plus a u16 helper-table index and
         // encodes `may_force` in the target bytecode — none of which
         // fit into RPython's SSA tuple shape. Reviewer guidance:
-        //   "codewriter는 원본 RPython tuple 을 만들고, pyre 적응은
-        //    assembler 가 해야 한다."
+        //   "the codewriter builds the original RPython tuple, and the
+        //    assembler must adapt it for pyre."
         // Rather than baking the pyre shape into the SSA (which would
         // ossify a pyre-only SSA vocabulary), we keep the call handlers
         // on the direct builder path until assembler.rs grows exact

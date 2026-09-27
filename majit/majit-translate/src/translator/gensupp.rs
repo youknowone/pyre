@@ -266,8 +266,7 @@ pub(crate) struct LocalScope {
     /// "parent is the NameManager", which is already reachable via
     /// [`Self::glob`]. The field is dead upstream too (no reader
     /// outside `__init__`), but preserved for structural parity per
-    /// AGENTS.md "RPython object attribute는 Rust struct field로
-    /// 보존".
+    /// AGENTS.md: "an RPython object attribute is preserved as a Rust struct field".
     pub(crate) parent: Option<Rc<LocalScope>>,
     /// RPython `_LocalScope.glob` (`gensupp.py`). Shared
     /// `Rc<RefCell<NameManager>>` so subsequent `uniquename` /

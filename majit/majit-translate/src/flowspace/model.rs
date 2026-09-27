@@ -126,28 +126,26 @@ pub fn block_address_was_reused(block: &BlockRef) -> bool {
 ///    inference relies on.
 pub type ConcretetypePlaceholder = crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 
-/// RPython `Constant.value` 에 담기는 host-level Python object 의 일반
-/// carrier.
+/// General carrier for the host-level Python object stored in RPython
+/// `Constant.value`.
 ///
 /// Upstream `rpython/flowspace/model.py` `class Constant(Hashable)`
-/// 은 `Hashable.value` 에 임의의 Python object 를 그대로 담는다
-/// (`self.value = value`). Rust 포트는 `ConstValue` 를 닫힌 enum 으로
-/// 시작했지만 builtin function / type / exception class / exception
-/// instance / module 까지 모두 `Rc<HostObjectInner>` 한 carrier 로
-/// 모으는 편이 더 orthodox 하다.
+/// stores an arbitrary Python object in `Hashable.value`
+/// (`self.value = value`). The Rust port started `ConstValue` as a closed
+/// enum, but gathering builtin function / type / exception class / exception
+/// instance / module into one `Rc<HostObjectInner>` carrier is more orthodox.
 ///
-/// Identity 는 `Rc::ptr_eq` — upstream 의 Python object `is` 비교와
-/// 동일. `SPECIAL_CASES` 처럼 identity-keyed 테이블은 동일 instance 를
-/// 공유하는 싱글턴 (`HOST_ENV.lookup_builtin` 이 돌려주는 Rc) 으로
-/// 부트스트랩한다.
+/// Identity is `Rc::ptr_eq` — the same as upstream Python object `is`.
+/// Identity-keyed tables such as `SPECIAL_CASES` bootstrap from singletons
+/// that share one instance (the Rc returned by `HOST_ENV.lookup_builtin`).
 ///
-/// Deviation (parity rule #1): upstream 은 Python runtime 이 있기
-/// 때문에 임의의 객체를 그대로 carrier 에 담을 수 있다. Rust 포트는
-/// Python runtime 을 내장하지 않으므로 `HostObjectKind` 에 upstream
-/// 에서 관찰되는 구체 분류 (class/module/builtin callable/user
-/// function/instance) 를 열거한다. 이 enum 은 외부 공개 API 가 아니고,
-/// carrier 밖에서 관찰되는 contract 는 `Rc` identity 와 `qualname()`,
-/// `is_subclass_of(…)` 같은 introspection 메서드뿐이다.
+/// Deviation (parity rule #1): upstream can put an arbitrary object in the
+/// carrier because a Python runtime is present. The Rust port does not embed
+/// a Python runtime, so `HostObjectKind` enumerates the concrete categories
+/// observed upstream (class/module/builtin callable/user function/instance).
+/// This enum is not a public API. Outside the carrier the contract is `Rc`
+/// identity and introspection methods such as `qualname()` and
+/// `is_subclass_of(…)`.
 #[derive(Clone)]
 pub struct HostObject {
     inner: Arc<HostObjectInner>,
@@ -168,13 +166,13 @@ fn split_attr_name_module(qualname: &str) -> (String, Option<String>) {
 }
 
 enum HostObjectKind {
-    /// Python type/class object. `bases` 는 `__bases__` 튜플; 재귀적
-    /// `issubclass` 순회에 사용. `members` 는 `cls.__dict__` 대응 —
-    /// annotator ClassDesc.__init__ 이 `_mixin_`, `_immutable_fields_`,
+    /// Python type/class object. `bases` is the `__bases__` tuple, used by
+    /// the recursive `issubclass` walk. `members` corresponds to `cls.__dict__` —
+    /// annotator ClassDesc.__init__ reads `_mixin_`, `_immutable_fields_`,
     /// `__slots__`, `_attrs_`, `__NOT_RPYTHON__`,
-    /// `_annspecialcase_` 등을 읽고, `add_sources_for_class` 가 모든
-    /// 엔트리를 순회한다. 값 타입이 임의의 Python 값(bool, tuple,
-    /// function, property, …)이므로 `ConstValue` carrier 로 담는다.
+    /// `_annspecialcase_`, and so on, and `add_sources_for_class` walks every
+    /// entry. Values are arbitrary Python values (bool, tuple,
+    /// function, property, …), so they are stored in a `ConstValue` carrier.
     Class {
         bases: Vec<HostObject>,
         /// The ordered container is required because a `HashMap`'s iteration
@@ -194,20 +192,20 @@ enum HostObjectKind {
     /// `T { fields }` must not accidentally invoke a same-named Python-level
     /// `T.__init__` registered on that ClassDef.
     TransparentClassCtor { class_obj: HostObject },
-    /// Python module object. `members` 는 module dict — `getattr` 조회
-    /// 대상. `LazyLock` singleton 의 Sync 요구를 만족하려고 `Mutex`.
+    /// Python module object. `members` is the module dict — the target of
+    /// `getattr` lookup. `Mutex` satisfies the `Sync` requirement of the
+    /// `LazyLock` singleton.
     Module {
         members: Mutex<HashMap<String, HostObject>>,
     },
-    /// Python builtin callable (function, method). 이름 외 구조
-    /// 없음.
+    /// Python builtin callable (function, method). No structure beyond the name.
     BuiltinCallable,
-    /// Python function object (user-defined). `graph_func` 는 flowspace
-    /// 가 inspect 를 통해 들여다보는 code + closure 상태.
+    /// Python function object (user-defined). `graph_func` is the code + closure
+    /// state that flowspace inspects.
     UserFunction { graph_func: Box<GraphFunc> },
-    /// Python instance (raise 문에서 materialise 된 exception 인스턴스
-    /// 포함). `class_obj` 는 `__class__`; `args` 는 constructor
-    /// arguments; `instance_dict` 는 per-instance attribute dict
+    /// Python instance (including an exception instance materialised by a
+    /// raise statement). `class_obj` is `__class__`; `args` are the constructor
+    /// arguments; `instance_dict` is the per-instance attribute dict
     /// (`inst.__dict__`) — prebuilt instances attached via class
     /// annotation decorators populate this so `getattr(inst, attr)`
     /// in `FrozenDesc.default_read_attribute` can observe them.
@@ -218,19 +216,17 @@ enum HostObjectKind {
         /// order varies per process and these keys produce a work order.
         instance_dict: HostInstanceDict,
     },
-    /// `Constant.value` 에 담긴 임의의 host object — flowspace 가 구조
-    /// 를 모르지만 보존해야 하는 값(예: 포팅되지 않은 `ConstantData`
-    /// variant, pyre-level opaque object). `qualname` 에 debug-only
-    /// 식별자를 기록하고, identity 는 `Arc::ptr_eq` 로 유지한다. 이
-    /// 키는 upstream 의 `Constant.value = <anonymous object>` 경로에
-    /// 대응한다.
+    /// Arbitrary host object stored in `Constant.value` — a value whose
+    /// structure flowspace does not know but must preserve (for example an
+    /// unported `ConstantData` variant, or a pyre-level opaque object).
+    /// `qualname` records a debug-only identifier, and identity is `Arc::ptr_eq`.
+    /// This key corresponds to upstream `Constant.value = <anonymous object>`.
     Opaque,
     /// Python `property` descriptor (upstream classdesc.py:591-602). fget
-    /// / fset / fdel 은 upstream `property(fget, fset, fdel, doc)` 의
-    /// 각 슬롯에 대응하며, `Option<HostObject>` 로 담는다 (None =
-    /// 미정의). unaryop.py `_find_property_meth` 는 classdict 의
-    /// `Constant(property_value)` 에서 `getattr(obj.value, meth)` 로 이
-    /// 슬롯을 추출한다.
+    /// / fset / fdel correspond to the slots of upstream
+    /// `property(fget, fset, fdel, doc)` and are stored as `Option<HostObject>`
+    /// (None = undefined). unaryop.py `_find_property_meth` extracts the slot
+    /// from classdict `Constant(property_value)` via `getattr(obj.value, meth)`.
     Property {
         fget: Option<HostObject>,
         fset: Option<HostObject>,
@@ -405,9 +401,9 @@ impl HostObject {
         }
     }
 
-    /// Upstream `issubclass(self, other)` over `__bases__`. 재귀적
-    /// 깊이우선 탐색이며, `__mro__` C3 linearisation 과 예외 계층에서는
-    /// 동일한 결과를 준다.
+    /// Upstream `issubclass(self, other)` over `__bases__`. Recursive
+    /// depth-first search; on an exception hierarchy it matches `__mro__`
+    /// C3 linearisation.
     pub fn is_subclass_of(&self, other: &HostObject) -> bool {
         if self == other {
             return true;
@@ -418,7 +414,7 @@ impl HostObject {
         }
     }
 
-    /// Class.__bases__ — bases tuple view. Non-class 는 None.
+    /// Class.__bases__ — bases tuple view. Non-class is None.
     pub fn class_bases(&self) -> Option<&[HostObject]> {
         match &self.inner.kind {
             HostObjectKind::Class { bases, .. } => Some(bases.as_slice()),
@@ -426,7 +422,7 @@ impl HostObject {
         }
     }
 
-    /// `cls.__dict__.get(name)` — class dict lookup. Non-class 는
+    /// `cls.__dict__.get(name)` — class dict lookup. Non-class is
     /// None.
     pub fn class_get(&self, name: &str) -> Option<ConstValue> {
         match &self.inner.kind {
@@ -436,15 +432,15 @@ impl HostObject {
     }
 
     /// Class dict setter — bootstrap / ClassDesc.create_new_attribute
-    /// 경로에서 사용. Non-class 에 대해서는 no-op.
+    /// path. No-op for a non-class.
     pub fn class_set(&self, name: impl Into<String>, value: ConstValue) {
         if let HostObjectKind::Class { members, .. } = &self.inner.kind {
             members.lock().insert(name.into(), value);
         }
     }
 
-    /// `cls.__dict__.keys()` — class dict key snapshot. Non-class 는
-    /// 빈 Vec.
+    /// `cls.__dict__.keys()` — class dict key snapshot. Non-class is
+    /// an empty Vec.
     pub fn class_dict_keys(&self) -> Vec<String> {
         match &self.inner.kind {
             HostObjectKind::Class { members, .. } => members.lock().keys().cloned().collect(),
@@ -453,7 +449,7 @@ impl HostObject {
     }
 
     /// `cls.__dict__.items()` — class dict entry snapshot. Non-class
-    /// 는 빈 Vec.
+    /// is an empty Vec.
     pub fn class_dict_items(&self) -> Vec<(String, ConstValue)> {
         match &self.inner.kind {
             HostObjectKind::Class { members, .. } => members
@@ -465,8 +461,8 @@ impl HostObject {
         }
     }
 
-    /// `cls.__dict__.__contains__(name)` — class dict 키 존재 검사.
-    /// Non-class 는 false.
+    /// `cls.__dict__.__contains__(name)` — class dict key presence check.
+    /// Non-class is false.
     pub fn class_has(&self, name: &str) -> bool {
         match &self.inner.kind {
             HostObjectKind::Class { members, .. } => members.lock().contains_key(name),
@@ -475,9 +471,9 @@ impl HostObject {
     }
 
     /// RPython `rclass.InstanceRepr.get_reusable_prebuilt_instance()`
-    /// 대응 surface. 표준 예외 재전파는 같은 prebuilt instance 를
-    /// 반복 사용해야 하므로 class object 내부 OnceLock 에 singleton
-    /// 을 붙여 둔다.
+    /// corresponding surface. Re-raising a standard exception must reuse the
+    /// same prebuilt instance, so the singleton is attached to a OnceLock
+    /// inside the class object.
     pub fn reusable_prebuilt_instance(&self) -> Option<HostObject> {
         match &self.inner.kind {
             HostObjectKind::Class {
@@ -492,13 +488,13 @@ impl HostObject {
         }
     }
 
-    /// `cls.__mro__` — C3 linearisation over `__bases__`. Non-class 는
-    /// None. 상위 class 가 중복된 경우를 처리하지만, 복수 정의 충돌시
-    /// `TypeError: MRO conflict` 대신 None 을 돌려준다 (upstream
-    /// `type(...).__mro__` 은 TypeError 를 던짐). RPython annotator 는
-    /// `add_mixins` 의 `type('tmp', tuple(mixins) + (object,), {}).__mro__`
-    /// 경로에서만 이 함수를 쓰므로, mixin 계층이 C3 충돌을 일으키지 않는
-    /// 한 None 경로는 타지 않는다.
+    /// `cls.__mro__` — C3 linearisation over `__bases__`. Non-class is
+    /// None. Duplicate base classes are handled, but a conflicting definition
+    /// returns None instead of `TypeError: MRO conflict` (upstream
+    /// `type(...).__mro__` raises TypeError). The RPython annotator uses this
+    /// only on the `add_mixins` path
+    /// `type('tmp', tuple(mixins) + (object,), {}).__mro__`, so the None path
+    /// is not taken unless the mixin hierarchy has a C3 conflict.
     pub fn mro(&self) -> Option<Vec<HostObject>> {
         if !self.is_class() {
             return None;
@@ -506,7 +502,7 @@ impl HostObject {
         c3_linearise(self)
     }
 
-    /// Instance → `__class__`. None 이면 `self` 가 인스턴스가 아님.
+    /// Instance → `__class__`. None means `self` is not an instance.
     pub fn instance_class(&self) -> Option<&HostObject> {
         match &self.inner.kind {
             HostObjectKind::Instance { class_obj, .. } => Some(class_obj),
@@ -514,8 +510,8 @@ impl HostObject {
         }
     }
 
-    /// Instance → constructor args (raise-site 에서 `ValueError("msg")`
-    /// 같은 호출로 captured).
+    /// Instance → constructor args (captured from a raise-site call such as
+    /// `ValueError("msg")`).
     pub fn instance_args(&self) -> Option<&[ConstValue]> {
         match &self.inner.kind {
             HostObjectKind::Instance { args, .. } => Some(args.as_slice()),
@@ -583,7 +579,7 @@ impl HostObject {
         }
     }
 
-    /// Module member 조회 — upstream `getattr(module, name)`.
+    /// Module member lookup — upstream `getattr(module, name)`.
     pub fn module_get(&self, name: &str) -> Option<HostObject> {
         match &self.inner.kind {
             HostObjectKind::Module { members } => members.lock().get(name).cloned(),
@@ -591,7 +587,7 @@ impl HostObject {
         }
     }
 
-    /// Module setter — module object bootstrap 과정에서만 사용.
+    /// Module setter — used only while bootstrapping a module object.
     pub fn module_set(&self, name: impl Into<String>, value: HostObject) {
         if let HostObjectKind::Module { members } = &self.inner.kind {
             members.lock().insert(name.into(), value);
@@ -643,10 +639,10 @@ impl HostObject {
     }
 
     /// `new_class` + initial class dict. annotator
-    /// `ClassDesc.__init__` 가 mixin 분리 + `add_sources_for_class`
-    /// 를 돌리기 전에, bootstrap 이 미리 만들어놓은 class object 에
-    /// 필요한 멤버 (`_mixin_`, `_immutable_fields_`, …) 를 즉시 넣어
-    /// 주기 위한 편의 생성자.
+    /// Convenience constructor that installs required members
+    /// (`_mixin_`, `_immutable_fields_`, …) on a class object the bootstrap
+    /// already built, before `ClassDesc.__init__` splits mixins and runs
+    /// `add_sources_for_class`.
     pub fn new_class_with_members(
         qualname: impl Into<String>,
         bases: Vec<HostObject>,
@@ -831,8 +827,8 @@ impl HostObject {
         }
     }
 
-    /// `Constant.value` 에 담긴 임의 host object 를 carry. `qualname`
-    /// 은 debug 에 사용; identity 는 항상 새로운 Arc.
+    /// Carries an arbitrary host object stored in `Constant.value`. `qualname`
+    /// is for debug; identity is always a fresh Arc.
     pub fn new_opaque(qualname: impl Into<String>) -> Self {
         let qualname = qualname.into();
         HostObject {
@@ -1572,15 +1568,14 @@ pub(crate) fn host_getattr(pyobj: &HostObject, name: &str) -> Result<ConstValue,
     Err(HostGetAttrError::Unsupported)
 }
 
-/// C3 linearisation — CPython `type.__mro__` 알고리즘의 Rust 포트.
+/// C3 linearisation — Rust port of the `type.__mro__` algorithm.
 ///
-/// C3 규칙: `L[C] = C + merge(L[B1], L[B2], …, [B1, B2, …])` 에서
-/// `merge` 는 각 리스트의 head 를 후보로 보고, **다른 어떤 리스트의
-/// tail 에도 등장하지 않는** head 를 선택해 결과에 append 하고 모든
-/// 리스트에서 제거한다. 선택 가능한 head 가 없으면 conflict 로
-/// linearisation 실패 (Python 은 TypeError). 여기서는 None 을
-/// 돌려주고, annotator `add_mixins` 처럼 단일 상속 + mixin 인 경우에는
-/// 항상 성공한다.
+/// C3 rule: in `L[C] = C + merge(L[B1], L[B2], …, [B1, B2, …])`,
+/// `merge` takes each list's head as a candidate, picks a head that
+/// **appears in no other list's tail**, appends it to the result, and
+/// removes it from every list. If no head can be chosen, linearisation
+/// fails on conflict (Python raises TypeError). This returns None instead.
+/// Single inheritance plus mixins, as in annotator `add_mixins`, always succeeds.
 fn c3_linearise(cls: &HostObject) -> Option<Vec<HostObject>> {
     let bases = cls.class_bases()?;
     let mut lists: Vec<Vec<HostObject>> = Vec::new();
@@ -1597,7 +1592,7 @@ fn c3_linearise(cls: &HostObject) -> Option<Vec<HostObject>> {
         if lists.is_empty() {
             return Some(result);
         }
-        // 첫 번째 good head 를 찾는다.
+        // Find the first good head.
         let mut chosen: Option<HostObject> = None;
         for list in &lists {
             let head = &list[0];
@@ -1617,19 +1612,18 @@ fn c3_linearise(cls: &HostObject) -> Option<Vec<HostObject>> {
     }
 }
 
-/// Host namespace 에뮬레이션 — upstream 의 `__builtin__` / imported
-/// module table. `HOST_ENV.lookup_builtin(name)` 은
-/// `flowcontext.py` 의 `getattr(__builtin__, varname)` 에 대응하고,
-/// `HOST_ENV.import_module(name)` 은 `flowcontext.py:660` 의
-/// `__import__(name, ...)` 에 대응한다.
+/// Host namespace emulation — upstream `__builtin__` / imported
+/// module table. `HOST_ENV.lookup_builtin(name)` corresponds to
+/// `getattr(__builtin__, varname)` in `flowcontext.py`, and
+/// `HOST_ENV.import_module(name)` corresponds to `__import__(name, ...)`
+/// in `flowcontext.py` `import_name`.
 ///
-/// Deviation (parity rule #1): upstream 은 flow 시점에 실제 Python
-/// `__import__` 를 돌리므로 임의 모듈을 로딩할 수 있다. Rust 포트는
-/// Python runtime 을 품지 않기 때문에 flowspace 가 참조할 수 있는
-/// module/class/callable 을 bootstrap 시점에 pre-populate 하고,
-/// 거기에 없는 이름은 `ImportError` / `FlowingError` 로 빠진다. pyre
-/// 를 통합할 때 실제 runtime 을 `HostEnv` backend 로 꽂을 수 있도록
-/// API 는 이 접근만 노출한다.
+/// Deviation (parity rule #1): upstream runs a real Python `__import__`
+/// at flow time, so it can load any module. The Rust port does not embed
+/// a Python runtime, so module/class/callable values flowspace may refer to
+/// are pre-populated at bootstrap, and a missing name falls out as
+/// `ImportError` / `FlowingError`. The API exposes only this access so a
+/// real runtime can be plugged in as the `HostEnv` backend when pyre is integrated.
 pub struct HostEnv {
     builtins: HashMap<String, HostObject>,
     builtin_module: HostObject,
@@ -1657,18 +1651,18 @@ impl HostEnv {
     }
 
     fn bootstrap_builtin_exceptions(&mut self) {
-        // BaseException → Exception → …, rpython/rlib/rstackovf.py 의
-        // _StackOverflow 까지 upstream 이 flow 중에 참조하는 class 를
-        // 미리 materialise.
+        // Materialise, ahead of time, every class upstream refers to during
+        // flow, from BaseException → Exception → … through `_StackOverflow`
+        // in rpython/rlib/rstackovf.py.
         //
-        // rstackovf.py — `class StackOverflow(RuntimeError)` 이
-        // 진짜 class 이고, 같은 class object 가 `_StackOverflow` 라는
-        // 이름으로도 바인딩된다. 그 직후 모듈-수준 `StackOverflow` 는
-        // `((RuntimeError, RuntimeError),)` 튜플 sentinel 로 rebind
-        // 되지만, flowspace 에서 참조되는 식별자는 `_StackOverflow`
-        // 쪽이다 (annotator.exception.standard_exceptions 항목 이름과
-        // 일치). Rust 포트는 동일 class object 를 두 lookup key 에
-        // 등록해 upstream 식별자 공유를 재현한다.
+        // rstackovf.py — `class StackOverflow(RuntimeError)` is the real
+        // class, and the same class object is also bound as `_StackOverflow`.
+        // The module-level `StackOverflow` is then rebound to the tuple
+        // sentinel `((RuntimeError, RuntimeError),)`, but the identifier
+        // flowspace refers to is `_StackOverflow` (the same name as the
+        // annotator.exception.standard_exceptions entry). The Rust port
+        // registers the same class object under both lookup keys to reproduce
+        // that shared upstream identity.
         let base = HostObject::new_class("BaseException", vec![]);
         let exc = HostObject::new_class("Exception", vec![base.clone()]);
         let runtime = HostObject::new_class("RuntimeError", vec![exc.clone()]);
@@ -1698,18 +1692,18 @@ impl HostEnv {
         self.insert_builtin("Exception", exc);
         self.insert_builtin("RuntimeError", runtime);
         // upstream `_StackOverflow = StackOverflow` (rstackovf.py) —
-        // 동일 class object 를 두 키에 등록. "StackOverflow" 는 모듈
-        // 수준의 원 class 이름, "_StackOverflow" 는 flow-level 에서
-        // 쓰이는 별칭.
+        // Register the same class object under both keys. "StackOverflow" is
+        // the original module-level class name, and "_StackOverflow" is the
+        // alias used at flow level.
         self.insert_builtin("StackOverflow", stackovf.clone());
         self.insert_builtin("_StackOverflow", stackovf);
         self.insert_builtin("NotImplementedError", not_impl);
     }
 
     fn bootstrap_builtin_types(&mut self) {
-        // upstream 에서 `const(type)` 등으로 참조되는 builtin class
-        // object. 상속 관계는 아직 관심 영역이 아니므로 bases 는
-        // 비어두고 identity 만 유지한다.
+        // Builtin class objects referred to upstream via `const(type)` and
+        // similar. Inheritance is not in scope yet, so bases stay empty and
+        // only identity is preserved.
         for name in [
             "type",
             "object",
@@ -1749,10 +1743,10 @@ impl HostEnv {
     }
 
     fn bootstrap_builtin_callables(&mut self) {
-        // upstream `__builtin__` 에 존재하는 callable 중 flowspace 가
-        // `find_global` fallback 으로 실제 조회할 수 있는 것들. 기존
-        // `BuiltinFunction` enum 의 모든 이름을 그대로 옮긴다 — 추가/
-        // 삭제는 upstream 의 `__builtin__` 범위와 연동.
+        // Callables that exist on upstream `__builtin__` and that flowspace
+        // can actually look up via the `find_global` fallback. Every name from
+        // the old `BuiltinFunction` enum is carried over as-is — additions and
+        // removals stay tied to upstream's `__builtin__` set.
         for name in [
             "__import__",
             "locals",
@@ -1853,23 +1847,22 @@ impl HostEnv {
     }
 
     fn bootstrap_std_modules(&mut self) {
-        // `__import__("os", …)` 는 실제 os 모듈을 돌려주지만 Rust 포트
-        // 에서는 upstream 의 `specialcase.py:53-67` 가 참조하는 이름만
-        // 유지한다. 이 bootstrap 이 빠뜨린 dotted-path 는
-        // `import_module` 이 `None` 을 돌려주어 flowspace 단에서
-        // `ImportError` 로 번역된다.
+        // `__import__("os", …)` returns the real os module, but the Rust port
+        // keeps only the names referenced by upstream `specialcase.py` `redirect_function`.
+        // A dotted path this bootstrap omits makes `import_module` return
+        // `None`, which flowspace translates to `ImportError`.
         let os = HostObject::new_module("os");
         let os_path = HostObject::new_module("os.path");
         let rfile = HostObject::new_module("rpython.rlib.rfile");
         let rpath = HostObject::new_module("rpython.rlib.rpath");
-        // `rpython.rlib.rarithmetic` 모듈 — upstream 은 `ovfcheck` 를
-        // 이 모듈에 export 하며 `translator/simplify.py:78` 의
-        // `Constant(rarithmetic.ovfcheck)` 는 module attribute 로
-        // 접근한다. Rust 포트는 이 모듈 객체에 `ovfcheck` sentinel 을
-        // 달아 둔다 — builtin 테이블에 넣지 않음으로써
-        // `find_global("ovfcheck")` 는 upstream 처럼 실패하고,
-        // `translator::simplify::transform_ovfcheck` 만 이 sentinel 을
-        // 직접 조회한다.
+        // `rpython.rlib.rarithmetic` module — upstream exports `ovfcheck`
+        // from this module, and `Constant(rarithmetic.ovfcheck)` in
+        // `translator/simplify.py` `transform_ovfcheck` reaches it as a module attribute.
+        // The Rust port attaches an `ovfcheck` sentinel to this module object.
+        // Leaving it out of the builtin table makes `find_global("ovfcheck")`
+        // fail as upstream does, and only
+        // `translator::simplify::transform_ovfcheck` looks the sentinel up
+        // directly.
         let rarithmetic = HostObject::new_module("rpython.rlib.rarithmetic");
         rarithmetic.module_set("ovfcheck", HostObject::new_builtin_callable("ovfcheck"));
         // `rbuiltin.py @typer_for(rarithmetic.intmask)` /
@@ -2601,10 +2594,9 @@ impl HostEnv {
         self.modules.lock().get(name).cloned()
     }
 
-    /// Exception class 가 builtin 테이블에 있다면 그 HostObject 를
-    /// 돌려준다. user-defined class 를 새로 등록하는 API 는 현재
-    /// 없으며 필요할 때 flowcontext 가 직접 `HostObject::new_class` 로
-    /// 구성한다.
+    /// Returns the HostObject when the exception class is in the builtin
+    /// table. There is no API yet to register a user-defined class; when one
+    /// is needed, flowcontext builds it with `HostObject::new_class`.
     pub fn lookup_exception_class(&self, name: &str) -> Option<HostObject> {
         self.lookup_builtin(name).filter(|obj| {
             obj.is_class()
@@ -2613,16 +2605,16 @@ impl HostEnv {
     }
 
     /// RPython `exceptiondata.py:get_standard_ll_exc_instance_by_class`.
-    /// 표준 예외 class 는 reusable prebuilt instance 를 shared singleton
-    /// 으로 materialize 한다.
+    /// A standard exception class materializes its reusable prebuilt instance
+    /// as a shared singleton.
     pub fn lookup_standard_exception_instance(&self, name: &str) -> Option<HostObject> {
         self.lookup_exception_class(name)
             .and_then(|cls| cls.reusable_prebuilt_instance())
     }
 }
 
-/// 프로세스 전역 host namespace singleton. bootstrap 은 upstream
-/// `__builtin__` + 알려진 stdlib 모듈의 placeholder 로 채워진다.
+/// Process-global host namespace singleton. Bootstrap fills it with
+/// placeholders for upstream `__builtin__` plus known stdlib modules.
 pub static HOST_ENV: LazyLock<HostEnv> = LazyLock::new(HostEnv::bootstrap);
 
 /// `FunctionPath` resolution through `HOST_ENV`: one segment is
@@ -2725,8 +2717,8 @@ pub enum ConstValue {
     /// `MultipleUnrelatedFrozenPBCRepr`.
     LLAddress(crate::translator::rtyper::lltypesystem::lltype::_address),
     /// Arbitrary host-level Python object (class, module, builtin
-    /// callable, instance). upstream `Constant.value` 에 담기는 임의
-    /// object 를 흉내내는 일반 carrier — `HostObject` 참조.
+    /// callable, instance). General carrier that stands in for an arbitrary
+    /// object stored in upstream `Constant.value` — see `HostObject`.
     HostObject(HostObject),
     /// RPython `rpython/rlib/unroll.py:SpecTag` — an identity-bearing
     /// marker instance that prevents two different tags from being
@@ -3757,10 +3749,10 @@ impl ConstValue {
         }
     }
 
-    /// Exception class 이면 `qualname()` 을 돌려준다. 임의 Class 가
-    /// 예외 클래스인지 판정하려면 `HOST_ENV.lookup_builtin("BaseException")`
-    /// 과 `is_subclass_of` 로 체크한다 — 이 helper 는 편의상 class 면
-    /// 아무 qualname 이나 노출한다.
+    /// If this is an exception class, returns `qualname()`. To decide whether
+    /// an arbitrary Class is an exception class, check
+    /// `HOST_ENV.lookup_builtin("BaseException")` and `is_subclass_of` — this
+    /// helper exposes any qualname as long as the value is a class.
     pub fn host_class_name(&self) -> Option<&str> {
         match self {
             ConstValue::HostObject(obj) if obj.is_class() => Some(obj.qualname()),
@@ -3800,8 +3792,8 @@ impl ConstValue {
         }
     }
 
-    /// HostObject 인 경우 reference. 기존 ExceptionClass/Builtin/
-    /// ExceptionInstance 대체 패턴에서 공통으로 사용.
+    /// Reference when this is a HostObject. Shared by the patterns that
+    /// replaced ExceptionClass/Builtin/ExceptionInstance.
     pub fn as_host_object(&self) -> Option<&HostObject> {
         match self {
             ConstValue::HostObject(obj) => Some(obj),
@@ -3809,10 +3801,10 @@ impl ConstValue {
         }
     }
 
-    /// `__builtin__` / stdlib namespace 에서 이름으로 HostObject 를 끌어내
-    /// `ConstValue::HostObject` 로 감싼다. `HOST_ENV` 에 해당 이름이
-    /// 없으면 panic (bootstrap 누락은 개발 단계에서 즉시 드러내는 편이
-    /// 안전하다).
+    /// Pulls a HostObject out of the `__builtin__` / stdlib namespace by name
+    /// and wraps it as `ConstValue::HostObject`. Panics if `HOST_ENV` has no
+    /// such name (a missing bootstrap entry should show up immediately during
+    /// development).
     pub fn builtin(name: &str) -> Self {
         let obj = HOST_ENV
             .lookup_builtin(name)

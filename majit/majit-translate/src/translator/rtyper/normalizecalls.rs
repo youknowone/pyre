@@ -38,8 +38,8 @@
 //!
 //! Per the user's plan correction (session transcript):
 //!
-//! > `normalizecalls.py`는 graph monomorphization이 아니라
-//! > signature/annotation normalization만 한다.
+//! > `normalizecalls.py` does not monomorphize graphs; it only
+//! > normalizes signatures and annotations.
 //!
 //! The job of this module is _signature agreement_ across the families
 //! that the annotator has already built — e.g. two `__init__` methods on

@@ -398,7 +398,7 @@ pub struct HeapCache {
 
     /// Known class map: object_ref -> class pointer. The class pointer is a
     /// `ConstInt` vtable address (model.py:199-201), an integer the GC never
-    /// traces — not a ref. RPython: CacheEntry 내부. Vec indexed by OpRef.0.
+    /// traces — not a ref. RPython: inside CacheEntry. Vec indexed by OpRef.0.
     known_class: Vec<Option<i64>>,
 
     /// RPython: FrontendOp flag. BitSet indexed by OpRef.0.
