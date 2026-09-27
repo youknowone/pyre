@@ -167,7 +167,7 @@ pub(crate) fn concrete_trait_refs(generics: &Value, llbc: &Llbc) -> Option<Vec<V
 pub(crate) fn spec_leaf(leaf: &str, fn_id: u64, generics: &Value, llbc: &Llbc) -> String {
     let fn_name = llbc
         .fn_by_id(fn_id)
-        .map(|fd| fd.item_meta.name_path())
+        .map(|fd| spec_fn_name(&fd.item_meta, llbc))
         .unwrap_or_else(|| leaf.to_string());
     let trait_refs = generics
         .get("trait_refs")
@@ -666,6 +666,42 @@ fn spec_trait_ref_name(v: &Value, llbc: &Llbc) -> String {
 
 /// `impl_trait`: the trait's `name_path` and its `<types>`. Self is one of
 /// those generics.
+/// The function's name with each impl segment spelled by what it
+/// implements. `name_path` renders every impl block as `<Impl>`, so two
+/// methods of the same name in sibling impls share it.
+fn spec_fn_name(meta: &majit_charon_reader::ullbc::ItemMeta, llbc: &Llbc) -> String {
+    use majit_charon_reader::ullbc::NameSeg;
+    let segs = meta
+        .name
+        .iter()
+        .map(|seg| match seg {
+            NameSeg::Ident {
+                ident: (name, disambiguator),
+            } => {
+                if *disambiguator > 0 {
+                    format!("{name}#{disambiguator}")
+                } else {
+                    name.clone()
+                }
+            }
+            NameSeg::Other(v) => {
+                if let Some(id) = v.pointer("/Impl/Trait").and_then(Value::as_u64) {
+                    let name = render_trait_impl(llbc, id).unwrap_or_else(|| "?".to_string());
+                    return format!("<impl {name}>");
+                }
+                if let Some(ty) = v
+                    .pointer("/Impl/Ty/skip_binder")
+                    .or_else(|| v.pointer("/Impl/Ty/value"))
+                {
+                    return format!("<impl {}>", spec_type_name(ty, llbc, 0));
+                }
+                canonical_type_json(v, llbc, 0)
+            }
+        })
+        .collect::<Vec<_>>();
+    segs.join("::")
+}
+
 fn render_trait_impl(llbc: &Llbc, impl_id: u64) -> Option<String> {
     let row = llbc.trait_impls_raw().get(impl_id as usize)?;
     let impl_trait = row.get("impl_trait")?;
