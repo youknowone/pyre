@@ -647,6 +647,46 @@ impl Default for BlackholeInterpreter {
     }
 }
 
+/// `history.py` `getint` / `getref_base` / `getfloatstorage` exist only on
+/// the box class of that bank. `BlackholeInterpreter._copy_data_from_miframe`
+/// calls the matching getter; an int box in `registers_r` is a tracer bug.
+fn expect_box_bank(
+    miframe: &crate::pyjitpl::MIFrame,
+    index: usize,
+    bank: majit_ir::Type,
+    regs: &[Option<majit_ir::OpRef>],
+) {
+    let Some(box_ref) = regs.get(index).copied().flatten() else {
+        return;
+    };
+    if box_ref.ty() == Some(bank) {
+        return;
+    }
+    panic!(
+        "copy_data_from_miframe: jitcode {} pc {} bank {bank:?} register {index} box type {:?}",
+        miframe.jitcode.name,
+        miframe.pc,
+        box_ref.ty()
+    );
+}
+
+/// `jitcode.py` `enumerate_vars` walks three banks. A live index at or past
+/// `num_regs_*` of that bank is a register listed in the wrong bank.
+pub(crate) fn expect_liveness_bank(
+    jitcode_name: &str,
+    pc: usize,
+    bank: majit_ir::Type,
+    index: u32,
+    num_regs: usize,
+) {
+    if (index as usize) < num_regs {
+        return;
+    }
+    panic!(
+        "liveness: jitcode {jitcode_name} pc {pc} bank {bank:?} register {index} is outside that bank ({num_regs} registers)"
+    );
+}
+
 impl BlackholeInterpreter {
     /// This thread's [`BH_LAST_EXC_VALUE`] cell, without a TLS resolve.
     #[inline]
@@ -1055,19 +1095,26 @@ impl BlackholeInterpreter {
     /// Copy register state from a tracing MIFrame into this blackhole frame.
     ///
     /// RPython: `BlackholeInterpreter._copy_data_from_miframe(miframe)`
+    ///
+    /// `registers_r[i].getref_base()` (`history.py`) is not defined on an
+    /// int box. A box whose `AbstractValue.type` is not this bank's type
+    /// is a tracer bug; stop here with the jitcode, pc, bank and index.
     pub fn copy_data_from_miframe(&mut self, miframe: &MIFrame) {
         self.setposition(miframe.jitcode.clone(), miframe.pc);
         for i in 0..self.jitcode.num_regs_i() {
+            expect_box_bank(miframe, i, majit_ir::Type::Int, &miframe.int_regs);
             if let Some(val) = miframe.int_values.get(i).copied().flatten() {
                 self.setarg_i(i, val);
             }
         }
         for i in 0..self.jitcode.num_regs_r() {
+            expect_box_bank(miframe, i, majit_ir::Type::Ref, &miframe.ref_regs);
             if let Some(val) = miframe.ref_value_for_blackhole(i) {
                 self.setarg_r(i, val);
             }
         }
         for i in 0..self.jitcode.num_regs_f() {
+            expect_box_bank(miframe, i, majit_ir::Type::Float, &miframe.float_regs);
             if let Some(val) = miframe.float_values.get(i).copied().flatten() {
                 self.setarg_f(i, val);
             }
@@ -4661,6 +4708,29 @@ mod tests {
                 outcome,
                 crate::jitexc::JitException::DoneWithThisFrameInt(42)
             );
+        }
+
+        /// `history.py` `ConstPtr.getref_base` is not defined on an int box.
+        /// An int box in `registers_r` must stop in `_copy_data_from_miframe`
+        /// before the blackhole loads a field through that register.
+        #[test]
+        #[should_panic(expected = "jitcode bank-mismatch pc 7 bank Ref register 0")]
+        fn copy_data_from_miframe_panics_when_ref_bank_holds_an_int_box() {
+            use crate::pyjitpl::MIFrame;
+            use majit_ir::OpRef;
+
+            let mut b = JitCodeBuilder::default();
+            b.ref_return(0);
+            let mut jitcode = b.finish();
+            jitcode.name = "bank-mismatch".to_string();
+            let jitcode = std::sync::Arc::new(jitcode);
+            let mut frame = MIFrame::new(jitcode, 7);
+            frame.ref_regs[0] = Some(OpRef::const_int(0x60));
+            frame.ref_values[0] = Some(0x60);
+
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.copy_data_from_miframe(&frame);
         }
 
         /// `BlackholeInterpreter._copy_data_from_miframe` reads each
