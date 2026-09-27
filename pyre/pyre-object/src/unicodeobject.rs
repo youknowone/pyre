@@ -811,12 +811,14 @@ pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
     let value = unsafe { w_str_get_wtf8(obj) }.to_owned();
 
     let mut slot = Box::new(obj as usize);
-    let root_slot = (&mut *slot) as *mut usize as *mut *mut u8;
     // A managed dynamic string must stay live and have its address rewritten
-    // after a moving collection.  Before the GC hooks are installed, dynamic
-    // string constructors already fall back to immortal allocation.
-    unsafe {
-        crate::gc_hook::try_gc_add_root(root_slot);
+    // after a moving collection.  An immortal one (a constant, or any string
+    // built before the GC hooks are installed) is neither freed nor moved.
+    if crate::gc_hook::try_gc_owns_object(obj as *mut u8) {
+        let root_slot = (&mut *slot) as *mut usize as *mut *mut u8;
+        unsafe {
+            crate::gc_hook::try_gc_add_root(root_slot);
+        }
     }
     table.insert(value, slot);
     obj
@@ -840,16 +842,11 @@ pub fn intern_wtf8_value(value: &Wtf8) -> PyObjectRef {
         return **slot as PyObjectRef;
     }
     let value = value.to_owned();
+    // `w_str_from_wtf8` is `malloc_typed`-immortal: the collector neither
+    // frees nor moves it, so the slot needs no root (the `box_str_constant`
+    // shape). Only [`intern_exact_str`] can store a managed object.
     let obj = w_str_from_wtf8(value.clone());
-    let mut slot = Box::new(obj as usize);
-    let root_slot = (&mut *slot) as *mut usize as *mut *mut u8;
-    // `w_str_from_wtf8` is immortal, so this root only has to keep the
-    // collector from rewriting a slot it never owns; the registration matches
-    // [`intern_exact_str`] so both entry points present the table identically.
-    unsafe {
-        crate::gc_hook::try_gc_add_root(root_slot);
-    }
-    table.insert(value, slot);
+    table.insert(value, Box::new(obj as usize));
     obj
 }
 
