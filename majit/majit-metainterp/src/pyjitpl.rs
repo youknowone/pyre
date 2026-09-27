@@ -8448,13 +8448,15 @@ impl<M: Clone> MetaInterp<M> {
             &trace.inputargs,
             &trace.ops,
         );
-        if crate::debug::have_debug_prints() {
+        {
             let _s = crate::debug::scope("jit-log-noopt");
-            crate::debug::debug_print(&format!(
-                "# Traced loop or bridge with {num_ops_before} ops"
-            ));
-            for line in majit_ir::format_trace(&trace.ops, &constants).lines() {
-                crate::debug::debug_print(line);
+            if crate::debug::have_debug_prints() {
+                crate::debug::debug_print(&format!(
+                    "# Traced loop or bridge with {num_ops_before} ops"
+                ));
+                for line in majit_ir::format_trace(&trace.ops, &constants).lines() {
+                    crate::debug::debug_print(line);
+                }
             }
         }
 
@@ -9022,46 +9024,48 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        if crate::debug::have_debug_prints() {
+        {
             let _s = crate::debug::scope("jit-log-opt-loop");
-            crate::debug::debug_print(&format!(
-                "--- trace (after opt) --- [{} ops]",
-                compiled_ops.len()
-            ));
-            if compiled_ops.len() <= 10000 {
-                for line in majit_ir::format_trace(&compiled_ops, &constants).lines() {
-                    crate::debug::debug_print(line);
+            if crate::debug::have_debug_prints() {
+                crate::debug::debug_print(&format!(
+                    "--- trace (after opt) --- [{} ops]",
+                    compiled_ops.len()
+                ));
+                if compiled_ops.len() <= 10000 {
+                    for line in majit_ir::format_trace(&compiled_ops, &constants).lines() {
+                        crate::debug::debug_print(line);
+                    }
+                } else {
+                    // The pre-optimizer dump above answers the same truncation with an
+                    // op-count table. Answering it here with a bare notice instead
+                    // leaves a census over this log reading zero of every opcode it
+                    // looks for, which is indistinguishable from a trace that really
+                    // contains none.
+                    crate::debug::debug_print("[trace too large for full dump, showing op counts]");
+                    let mut counts: crate::FxIndexMap<majit_ir::OpCode, usize> =
+                        crate::FxIndexMap::default();
+                    for op in &compiled_ops {
+                        *counts.entry(op.opcode).or_insert(0) += 1;
+                    }
+                    let mut sorted: Vec<_> = counts.into_iter().collect();
+                    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                    for (opcode, count) in sorted.iter().take(15) {
+                        crate::debug::debug_print(&format!("  {opcode:?}: {count}"));
+                    }
                 }
-            } else {
-                // The pre-optimizer dump above answers the same truncation with an
-                // op-count table. Answering it here with a bare notice instead
-                // leaves a census over this log reading zero of every opcode it
-                // looks for, which is indistinguishable from a trace that really
-                // contains none.
-                crate::debug::debug_print("[trace too large for full dump, showing op counts]");
-                let mut counts: crate::FxIndexMap<majit_ir::OpCode, usize> =
-                    crate::FxIndexMap::default();
                 for op in &compiled_ops {
-                    *counts.entry(op.opcode).or_insert(0) += 1;
-                }
-                let mut sorted: Vec<_> = counts.into_iter().collect();
-                sorted.sort_by(|a, b| b.1.cmp(&a.1));
-                for (opcode, count) in sorted.iter().take(15) {
-                    crate::debug::debug_print(&format!("  {opcode:?}: {count}"));
-                }
-            }
-            for op in &compiled_ops {
-                if op.opcode == majit_ir::OpCode::GuardNotInvalidated
-                    && let Some(fa) = op.guard_fail_args()
-                {
-                    let raw: Vec<String> = fa
-                        .iter()
-                        .map(|a| format!("OpRef::from_raw({})", a.to_opref().raw()))
-                        .collect();
-                    crate::debug::debug_print(&format!(
-                        "FINAL GuardNotInv fail_args=[{}]",
-                        raw.join(", ")
-                    ));
+                    if op.opcode == majit_ir::OpCode::GuardNotInvalidated
+                        && let Some(fa) = op.guard_fail_args()
+                    {
+                        let raw: Vec<String> = fa
+                            .iter()
+                            .map(|a| format!("OpRef::from_raw({})", a.to_opref().raw()))
+                            .collect();
+                        crate::debug::debug_print(&format!(
+                            "FINAL GuardNotInv fail_args=[{}]",
+                            raw.join(", ")
+                        ));
+                    }
                 }
             }
         }
@@ -10651,11 +10655,13 @@ impl<M: Clone> MetaInterp<M> {
         let combined_ops =
             compile::normalize_closing_jump_args(combined_ops, &constants, final_num_inputs);
 
-        if crate::debug::have_debug_prints() {
+        {
             let _s = crate::debug::scope("jit-log-opt-bridge");
-            crate::debug::debug_print("--- retrace combined (after opt) ---");
-            for line in majit_ir::format_trace(&combined_ops, &constants).lines() {
-                crate::debug::debug_print(line);
+            if crate::debug::have_debug_prints() {
+                crate::debug::debug_print("--- retrace combined (after opt) ---");
+                for line in majit_ir::format_trace(&combined_ops, &constants).lines() {
+                    crate::debug::debug_print(line);
+                }
             }
         }
 
@@ -11790,15 +11796,17 @@ impl<M: Clone> MetaInterp<M> {
         );
         // compile.py send_loop_to_backend(..., "entry bridge") →
         // logger.py log_loop(..., type="entry bridge").
-        if crate::debug::have_debug_prints() {
+        {
             let _s = crate::debug::scope("jit-log-opt-loop");
-            crate::debug::debug_print(&format!(
-                "# Loop {} : entry bridge with {} ops",
-                self.jitlog_trace_id,
-                optimized_ops.len()
-            ));
-            for line in majit_ir::format_trace(&optimized_ops, &constants).lines() {
-                crate::debug::debug_print(line);
+            if crate::debug::have_debug_prints() {
+                crate::debug::debug_print(&format!(
+                    "# Loop {} : entry bridge with {} ops",
+                    self.jitlog_trace_id,
+                    optimized_ops.len()
+                ));
+                for line in majit_ir::format_trace(&optimized_ops, &constants).lines() {
+                    crate::debug::debug_print(line);
+                }
             }
         }
 
@@ -15716,15 +15724,17 @@ impl<M: Clone> MetaInterp<M> {
         }
         // compile.py send_loop_to_backend(..., "entry bridge") →
         // logger.py log_loop(..., type="entry bridge").
-        if crate::debug::have_debug_prints() {
+        {
             let _s = crate::debug::scope("jit-log-opt-loop");
-            crate::debug::debug_print(&format!(
-                "# Loop {} : entry bridge with {} ops",
-                self.jitlog_trace_id,
-                optimized_ops.len()
-            ));
-            for line in majit_ir::format_trace(&optimized_ops, &constants).lines() {
-                crate::debug::debug_print(line);
+            if crate::debug::have_debug_prints() {
+                crate::debug::debug_print(&format!(
+                    "# Loop {} : entry bridge with {} ops",
+                    self.jitlog_trace_id,
+                    optimized_ops.len()
+                ));
+                for line in majit_ir::format_trace(&optimized_ops, &constants).lines() {
+                    crate::debug::debug_print(line);
+                }
             }
         }
 

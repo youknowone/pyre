@@ -2207,16 +2207,18 @@ impl UnrollOptimizer {
                 seen.insert(op.pos().get().raw())
             });
         }
-        if crate::debug::have_debug_prints() {
+        {
             let _s = crate::debug::scope("jit-log-opt-loop");
-            crate::debug::debug_print("--- peeled trace (assembled) ---");
-            for line in majit_ir::format_trace(&combined, &consts_p2).lines() {
-                crate::debug::debug_print(line);
+            if crate::debug::have_debug_prints() {
+                crate::debug::debug_print("--- peeled trace (assembled) ---");
+                for line in majit_ir::format_trace(&combined, &consts_p2).lines() {
+                    crate::debug::debug_print(line);
+                }
+                let mut sorted_consts: Vec<_> =
+                    consts_p2.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>();
+                sorted_consts.sort_by_key(|(k, _)| *k);
+                crate::debug::debug_print(&format!("consts_p2: {sorted_consts:?}"));
             }
-            let mut sorted_consts: Vec<_> =
-                consts_p2.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>();
-            sorted_consts.sort_by_key(|(k, _)| *k);
-            crate::debug::debug_print(&format!("consts_p2: {sorted_consts:?}"));
         }
         // A LABEL arg the fallthrough scan appended is carried by the loop but
         // not by the short preamble, so `inline_short_preamble` cannot rebuild
