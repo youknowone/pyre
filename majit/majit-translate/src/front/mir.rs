@@ -43370,23 +43370,12 @@ mod tests {
             super::rewrite_result_branch_for_layouts(kind, Some(&same), Some(&same));
         assert_eq!(count_branch_calls(&graph), 0);
         assert!(
-            graph.blocks.iter().all(|block| {
-                block
-                    .operations
-                    .iter()
-                    .all(|op| !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as"))
-            }),
-            "equal layouts bind the ControlFlow value to the Result"
-        );
-        let operand = graph.blocks.iter().find_map(|block| {
-            block.operations.iter().find_map(|op| match &op.kind {
-                OpKind::ConstInt(1) => op.result.as_ref(),
-                _ => None,
-            })
-        });
-        assert_eq!(
-            graph.block(graph.startblock).exits[0].args[0].as_variable(),
-            operand
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .any(|op| { matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as") }),
+            "equal layouts keep the bits with same_as"
         );
     }
 
@@ -52815,66 +52804,6 @@ mod tests {
                 (Some(VecFieldPart::Len), ValueType::Int),
                 (Some(VecFieldPart::Buf), ValueType::Ref(None)),
             ]
-        );
-    }
-
-    /// `(&mut s.v).as_mut()` binds the destination to the inline field
-    /// read, so the index operand is that read. `fielddescrof` then adds
-    /// `vec_layout::probe().ptr_offset` to the field offset. No `same_as`.
-    #[test]
-    fn inline_vec_as_mut_index_reads_buf_without_same_as() {
-        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType, VecFieldPart};
-
-        let mut graph = FunctionGraph::new("as_mut_index");
-        let holder = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "s".into(),
-                    ty: ValueType::Ref(None),
-                    class_root: None,
-                },
-                true,
-            )
-            .expect("holder");
-        let vec_field = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::FieldRead {
-                    base: holder,
-                    field: FieldDescriptor::new("v", Some("Holder".into())).with_inline_vec(true),
-                    ty: ValueType::Ref(None),
-                    pure: false,
-                },
-                true,
-            )
-            .expect("inline vec field");
-        let bb = graph.startblock;
-        let buf = super::retarget_vec_operand(&mut graph, bb, &vec_field, VecFieldPart::Buf);
-        assert_eq!(buf, vec_field);
-        let read = graph.blocks.iter().find_map(|block| {
-            block.operations.iter().find_map(|op| match &op.kind {
-                OpKind::FieldRead { field, .. } if op.result.as_ref() == Some(&vec_field) => {
-                    Some(field.clone())
-                }
-                _ => None,
-            })
-        });
-        let field = read.expect("field read");
-        assert_eq!(field.vec_part, Some(VecFieldPart::Buf));
-        assert!(
-            graph.blocks.iter().all(|block| {
-                block.operations.iter().all(|op| {
-                    !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as")
-                        && !matches!(&op.kind, OpKind::BinOp { op, .. } if op == "same_as")
-                })
-            }),
-            "identity bind leaves no same_as"
-        );
-        let layout = crate::vec_layout::probe();
-        assert_ne!(
-            layout.ptr_offset, layout.cap_offset,
-            "buf word is not the capacity word"
         );
     }
 

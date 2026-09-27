@@ -64,6 +64,12 @@ pub(crate) fn rewire_from_raw_parts_sites(graph: &mut FunctionGraph) -> usize {
         let Some(live) = ensure_live_rep(graph, bi, &canonical) else {
             continue;
         };
+        let Some(live_ty) = var_value_type(graph, &live) else {
+            continue;
+        };
+        if value_type_bank(&live_ty) != value_type_bank(&result_ty) {
+            continue;
+        }
         let result = graph.blocks[bi].operations[oi].result.clone();
         if let Some(result) = result
             && crate::front::mir::forward_identity(graph, &result, &live)
@@ -73,12 +79,6 @@ pub(crate) fn rewire_from_raw_parts_sites(graph: &mut FunctionGraph) -> usize {
         }
         // `live` is this block's input. The call result is a different
         // variable the edge already named, so the copy stays.
-        let Some(live_ty) = var_value_type(graph, &live) else {
-            continue;
-        };
-        if value_type_bank(&live_ty) != value_type_bank(&result_ty) {
-            continue;
-        }
         graph.blocks[bi].operations[oi].kind = OpKind::UnaryOp {
             op: "same_as".to_string(),
             operand: live,

@@ -11561,6 +11561,7 @@ mod tests {
                 owner_id,
                 StructLayout {
                     size: 32,
+                    align: 8,
                     fields: vec![
                         StructFieldLayout {
                             name: "word".into(),
@@ -11748,6 +11749,7 @@ mod tests {
             owner_id,
             StructLayout {
                 size: 32,
+                align: 8,
                 fields: vec![
                     StructFieldLayout {
                         name: "word".into(),
