@@ -5424,11 +5424,7 @@ fn retarget_link_arg(arg: &mut LinkArg, from: &Variable, to: &Variable) {
 /// This is the graph `remove_same_as` builds. Returns false when `from`
 /// is a block input: that parameter is the edge's own variable, and the
 /// copy that feeds it has to stay a distinct `same_as`.
-pub(crate) fn forward_identity(
-    graph: &mut FunctionGraph,
-    from: &Variable,
-    to: &Variable,
-) -> bool {
+pub(crate) fn forward_identity(graph: &mut FunctionGraph, from: &Variable, to: &Variable) -> bool {
     if from == to {
         return true;
     }
@@ -5440,11 +5436,7 @@ pub(crate) fn forward_identity(
         return false;
     }
     let remap = |var: &Variable| {
-        if var == from {
-            to.clone()
-        } else {
-            var.clone()
-        }
+        if var == from { to.clone() } else { var.clone() }
     };
     for block in &mut graph.blocks {
         block
@@ -18856,7 +18848,45 @@ impl<'a> Lowering<'a> {
                 "bb{mir_bb}: aggregate exchange place is not a deref"
             )));
         };
+        // `&*p` aliases `p`. The borrow local is what the edge threads
+        // into the block that calls `mem::replace`; the inner local is
+        // not live there.
+        if let PlaceKind::Local(i) = &inner.kind
+            && self
+                .local_var
+                .get(*i as usize)
+                .and_then(|var| var.as_ref())
+                .is_none()
+            && let Some(address) = self.address_of_recorded_deref(*i as usize)
+        {
+            return Ok(address);
+        }
         self.resolve_place(mir_bb, (**inner).clone())
+    }
+
+    /// Variable of a borrow local whose place is `*inner_local`.
+    fn address_of_recorded_deref(&self, inner_local: usize) -> Option<Variable> {
+        for (local, place) in &self.atomic_ref_place {
+            let PlaceKind::Projection(inner, elem) = &place.kind else {
+                continue;
+            };
+            let ProjectionElem::Atom(name) = elem else {
+                continue;
+            };
+            if name != "Deref" {
+                continue;
+            }
+            let PlaceKind::Local(i) = &inner.kind else {
+                continue;
+            };
+            if *i as usize != inner_local {
+                continue;
+            }
+            if let Some(var) = self.local_var.get(*local).and_then(|var| var.clone()) {
+                return Some(var);
+            }
+        }
+        None
     }
 
     /// Charon fields of a multi-word inline value. A transparent newtype
@@ -43353,9 +43383,10 @@ mod tests {
         assert_eq!(count_branch_calls(&graph), 0);
         assert!(
             graph.blocks.iter().all(|block| {
-                block.operations.iter().all(|op| {
-                    !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as")
-                })
+                block
+                    .operations
+                    .iter()
+                    .all(|op| !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as"))
             }),
             "equal layouts bind the ControlFlow value to the Result"
         );
@@ -46888,9 +46919,10 @@ mod tests {
         // Bf's format result is `fmt_args_in`. The copy is not a new variable.
         let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
         assert!(
-            bf_block.operations.iter().all(|op| {
-                !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as")
-            })
+            bf_block
+                .operations
+                .iter()
+                .all(|op| { !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as") })
         );
         assert_eq!(
             bf_block.exits[0].args[0].as_variable().map(|v| v.id()),
@@ -49700,9 +49732,10 @@ mod tests {
             .blocks
             .iter()
             .find_map(|block| {
-                block.exits.iter().find_map(|link| {
-                    (link.target == graph.returnblock).then(|| link.args.first())
-                })
+                block
+                    .exits
+                    .iter()
+                    .find_map(|link| (link.target == graph.returnblock).then(|| link.args.first()))
             })
             .flatten()
             .and_then(LinkArg::as_variable);

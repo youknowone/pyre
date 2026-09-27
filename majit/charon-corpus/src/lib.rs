@@ -609,6 +609,55 @@ pub fn replace_held_union(slot: &mut HeldUnion, new: HeldUnion) -> HeldUnion {
     std::mem::replace(slot, new)
 }
 
+/// The enum is behind `Box`, the same inline `Dynamic` a frame stores in
+/// `operand_refs`. `*slot` is that enum; the exchange is the variant stores.
+#[inline(never)]
+pub fn replace_boxed_held(slot: &mut Box<HeldUnion>, new: HeldUnion) -> HeldUnion {
+    std::mem::replace(slot.as_mut(), new)
+}
+
+/// `operand_mut` is its own function. The caller's `mem::replace` argument
+/// is that call's `&mut HeldUnion`, not a borrow assigned in the caller.
+#[inline(never)]
+pub fn held_as_mut(slot: &mut Box<HeldUnion>) -> &mut HeldUnion {
+    slot.as_mut()
+}
+
+#[inline(never)]
+pub fn replace_boxed_held_call(slot: &mut Box<HeldUnion>, new: HeldUnion) -> HeldUnion {
+    std::mem::replace(held_as_mut(slot), new)
+}
+
+/// `truncate_cells`: `mem::replace(operand_mut(&mut self.operand_refs[slot]), unit)`.
+/// The mutable enum is an indexed `Box`, then `as_mut`.
+#[inline(never)]
+pub fn replace_indexed_box(
+    slots: &mut Vec<Box<HeldUnion>>,
+    index: usize,
+    new: HeldUnion,
+) -> HeldUnion {
+    std::mem::replace(slots[index].as_mut(), new)
+}
+
+#[inline(never)]
+pub fn replace_indexed_box_call(
+    slots: &mut Vec<Box<HeldUnion>>,
+    index: usize,
+    new: HeldUnion,
+) -> HeldUnion {
+    std::mem::replace(held_as_mut(&mut slots[index]), new)
+}
+
+/// `Dynamic` is `#[repr(transparent)]` over the payload enum. The exchange
+/// is still that enum's variant stores.
+#[repr(transparent)]
+pub struct DynLike(pub HeldUnion);
+
+#[inline(never)]
+pub fn replace_boxed_dynlike(slot: &mut Box<DynLike>, new: DynLike) -> DynLike {
+    std::mem::replace(slot.as_mut(), new)
+}
+
 /// The enum sits inline at field 0. Assigning a whole value must move the
 /// live variant's fields into that slot. A store of the temporary's address
 /// overwrites the discriminant byte.

@@ -1806,6 +1806,143 @@ fn mem_replace_of_a_multi_word_value_is_field_wise() {
     );
 }
 
+/// `mem::replace` of a `Dynamic`-like enum reached through `Box::as_mut`.
+/// The stores are the variant fields (`store_enum_variant`). The caller's
+/// write set names `__discriminant` and the payload. No `mem::replace` call
+/// remains.
+#[test]
+fn mem_replace_through_box_deref_names_enum_fields() {
+    use majit_ir::descr::OopSpecIndex;
+    use majit_ir::effectinfo::DescrSetMember;
+    use majit_ir::value::Type;
+    use majit_translate::CallPath;
+    use majit_translate::call::{AnalysisCache, CallControl};
+    use majit_translate::model::{CallTarget, OpKind, SpaceOperation, ValueType};
+
+    let llbc = load_corpus();
+    let program = build_semantic_program_from_llbc(llbc).expect("builder");
+
+    let assert_lowered = |name: &str| {
+        let func = program
+            .functions
+            .iter()
+            .find(|f| f.name == name || f.name.ends_with(&format!("::{name}")))
+            .unwrap_or_else(|| panic!("missing {name}"));
+        let mut replace_calls = 0usize;
+        let mut writes = Vec::new();
+        for block in &func.graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::FieldWrite { field, .. } => writes.push(field.name.clone()),
+                    OpKind::Call { target, .. } => {
+                        if format!("{target:?}").contains("replace") {
+                            replace_calls += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(replace_calls, 0, "{name} still calls mem::replace");
+        assert!(
+            writes.iter().any(|n| n == "__discriminant"),
+            "{name} writes no tag: {writes:?}"
+        );
+        assert!(
+            writes.iter().any(|n| n.starts_with("__pos_")),
+            "{name} writes no payload: {writes:?}"
+        );
+
+        let mut cc = CallControl::new();
+        cc.set_struct_fields(program.struct_fields.clone());
+        let path = CallPath::from_segments([name]);
+        cc.register_function_graph(path.clone(), func.graph.clone());
+        cc.add_candidate_graph(path);
+        let mut cache = AnalysisCache::default();
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path([name]),
+                args: Vec::new(),
+                result_ty: ValueType::Void,
+            },
+        };
+        let nargs = func.graph.block(func.graph.startblock).inputargs.len();
+        let descriptor = cc.getcalldescr(
+            &op,
+            vec![Type::Ref; nargs],
+            Type::Ref,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        let named: Vec<String> = descriptor
+            .extra_info
+            .descr_set_keys
+            .iter()
+            .flat_map(|keys| keys.write_fields.iter())
+            .filter_map(|member| match member {
+                DescrSetMember::Field { field_name, .. } => Some(field_name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            named.iter().any(|n| n.contains("__discriminant")),
+            "{name} write set {named:?}"
+        );
+        assert!(
+            named.iter().any(|n| n.contains("__pos_")),
+            "{name} write set {named:?}"
+        );
+    };
+
+    assert_lowered("replace_boxed_held");
+    assert_lowered("replace_boxed_held_call");
+    assert_lowered("replace_indexed_box");
+    assert_lowered("replace_indexed_box_call");
+    assert_lowered("replace_boxed_dynlike");
+}
+
+/// The rhai frame's `truncate_cells` exchanges a `Dynamic` through
+/// `operand_mut(&mut operand_refs[slot])`. That call must not survive.
+#[test]
+fn rhai_truncate_cells_replace_lowers() {
+    use majit_translate::model::OpKind;
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../rhai/build/llbc/rhai.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("rhai ullbc");
+    let graph = lower_function(&llbc, "truncate_cells").expect("truncate_cells");
+    let calls: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call { target, .. } => Some(format!("{target:?}")),
+            _ => None,
+        })
+        .filter(|target| {
+            target.contains("replace") || target.contains("swap") || target.contains("take")
+        })
+        .collect();
+    assert!(calls.is_empty(), "residual {calls:?}");
+    let writes: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, .. } => Some(field.name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        writes.iter().any(|n| n == "__discriminant"),
+        "writes {writes:?}"
+    );
+}
+
 /// `*held = i64` through `&mut HeldUnion` is `setfield` of
 /// `HeldUnion::Int.__pos_0`. The SSA dump of that graph carries no
 /// `__deref_write` symbol for the assembler to resolve.
@@ -1862,13 +1999,18 @@ fn store_inline_enum_field_moves_the_variant() {
             }
         }
     }
-    assert!(switches >= 1, "inline enum move has no discriminant switch, writes={writes:?}");
+    assert!(
+        switches >= 1,
+        "inline enum move has no discriminant switch, writes={writes:?}"
+    );
     assert!(
         writes.iter().all(|(_, owner)| !owner.contains("HeldCell")),
         "inline enum field stored as one HeldCell word: {writes:?}"
     );
     assert!(
-        writes.iter().any(|(name, owner)| name == "__discriminant" && owner.contains("HeldUnion")),
+        writes
+            .iter()
+            .any(|(name, owner)| name == "__discriminant" && owner.contains("HeldUnion")),
         "missing discriminant move, writes={writes:?}"
     );
     assert!(
@@ -1928,7 +2070,9 @@ fn whole_enum_move_switches_per_variant() {
     assert!(!ref_blocks.is_empty(), "no HeldUnion::Ref.__pos_0 read");
     assert!(!int_blocks.is_empty(), "no HeldUnion::Int.__pos_0 read");
     assert!(
-        ref_blocks.iter().all(|block| !switch_blocks.contains(block)),
+        ref_blocks
+            .iter()
+            .all(|block| !switch_blocks.contains(block)),
         "Ref payload read sits on the switch block: ref={ref_blocks:?} switch={switch_blocks:?}"
     );
     assert!(
