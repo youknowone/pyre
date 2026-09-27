@@ -2558,7 +2558,10 @@ pub unsafe extern "C" fn wasm_realloc_frame(items_base: i64, depth: i64) -> i64 
         if depth as isize > (*fi).depth() {
             (*fi).update_frame_depth(base_ofs as i64, depth);
         }
-        let alloc_bytes = (*fi).size() as usize;
+        // `jfi_frame_size` counts the GC header (`base_ofs` above, the
+        // `CallMallocNurseryVarsizeFrame` total); both allocators take the
+        // payload after it.
+        let alloc_bytes = (*fi).size() as usize - majit_gc::header::GcHeader::SIZE;
         if tid != 0 {
             wasm_malloc_jitframe_no_collect(tid, alloc_bytes)
         } else {
