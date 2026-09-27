@@ -6255,12 +6255,31 @@ impl CodeWriter {
     /// `Sync`, so a thread-local provides the RPython "one CodeWriter
     /// per warmspot" invariant without a global lock.
     pub fn instance() -> &'static CodeWriter {
-        thread_local! {
-            static INSTANCE: CodeWriter = CodeWriter::new();
-        }
-        INSTANCE.with(|cw| unsafe { &*(cw as *const CodeWriter) })
+        with_codewriter_slot(|cell| {
+            let cw = cell.get_or_init(CodeWriter::new);
+            unsafe { &*(cw as *const CodeWriter) }
+        })
     }
 
+    /// The codewriter when this thread has already built one.
+    ///
+    /// `instance` decodes the build-time liveness stream inside
+    /// `Assembler::resuming_build_time_liveness`. The frame-shape gate runs
+    /// on every Python call, including a process that never traces, so it
+    /// must not be what constructs the writer.
+    pub fn existing() -> Option<&'static CodeWriter> {
+        with_codewriter_slot(|cell| cell.get().map(|cw| unsafe { &*(cw as *const CodeWriter) }))
+    }
+}
+
+fn with_codewriter_slot<R>(f: impl FnOnce(&std::cell::OnceCell<CodeWriter>) -> R) -> R {
+    thread_local! {
+        static INSTANCE: std::cell::OnceCell<CodeWriter> = const { std::cell::OnceCell::new() };
+    }
+    INSTANCE.with(f)
+}
+
+impl CodeWriter {
     /// Transform a Python CodeObject into a JitCode.
     ///
     /// RPython: CodeWriter.transform_graph_to_jitcode(graph, jitcode, verbose, index)
