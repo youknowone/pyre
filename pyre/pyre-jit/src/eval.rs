@@ -8286,11 +8286,13 @@ pub fn init_jit_hooks() {
     // at the first `force_start_tracing` is too late: Windows
     // `frame_chain` then allocates about 2.2 TiB and exits 3221226505.
     // Publish the whole kind-0 table here, before user code. `PYRE_JIT=0`
-    // / `PYRE_NO_JIT` never trace, so they skip the bincode. The decode
-    // runs on a fresh stack; a trace that wins the race still hits the
-    // same `Once` from `publish_kind0_descrs_before_trace`.
+    // / `PYRE_NO_JIT` never trace, so they skip the bincode. This stack
+    // is still the process stack: a helper thread would only add spawn
+    // and join latency. A trace that wins the race still hits the same
+    // `Once` from `publish_kind0_descrs_before_trace`, which decodes off
+    // the recursive `CALL_ASSEMBLER` stack.
     if env_var_os("PYRE_NO_JIT").is_none() && env_var("PYRE_JIT").as_deref() != Some("0") {
-        publish_kind0_descrs_before_trace();
+        pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs_on_caller_stack();
     }
     // `warmstate.py JitCell.__init__` stores every green as an ordinary field
     // on a GC object, so a Ref green is both owned and forwarded with the
