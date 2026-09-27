@@ -1244,6 +1244,29 @@ def _jit_panic_reason(stderr):
                 pass
     return None
 
+
+BOOTSTRAP_FAILURE_MARKER = "pyre: importlib bootstrap failed:"
+
+
+def _importlib_bootstrap_failure(stderr):
+    """Return the reported reason if *stderr* says the importlib bootstrap
+    failed, else None.
+
+    `init_importlib_bootstrap` failing is non-fatal in the interpreter by
+    design: a build with no reachable stdlib keeps serving imports from the
+    native importer, the minimal-importer role. Under this script the stdlib is
+    always reachable, so the only way to reach it is a builtin module the
+    bootstrap needs and the binary does not have, and every number measured
+    afterwards describes the fallback rather than the product.
+    """
+    if not stderr:
+        return None
+    for line in stderr.splitlines():
+        if line.startswith(BOOTSTRAP_FAILURE_MARKER):
+            return line.strip()
+    return None
+
+
 # ── Helpers ──────────────────────────────────────────────────────────
 
 def _jit_stats_merged(stderr):
@@ -4302,14 +4325,35 @@ class Check:
         for backend in ALL_BACKENDS:
             if self.enabled(backend):
                 try:
-                    subprocess.run(
+                    # stderr is captured, not inherited: this is the one run per
+                    # backend that happens before any fixture, so it is where a
+                    # binary that cannot bootstrap its own import machinery has
+                    # to be caught. Nothing else reads a warmup's stderr, and it
+                    # carried the `[jit-stats]` dump into the log for no reader.
+                    warm = subprocess.run(
                         [self._pyre(backend), script],
                         stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
                         timeout=30,
                         env=pyre_env(),
                     )
                 except Exception:
-                    pass
+                    continue
+                reason = _importlib_bootstrap_failure(
+                    warm.stderr.decode("utf-8", "replace")
+                )
+                if reason:
+                    print(red("BOOTSTRAP"))
+                    print(f"  {backend}: {reason}")
+                    print("  The interpreter falls back to the native importer "
+                          "when this happens, so every fixture on this backend "
+                          "runs a different import path than the other backends "
+                          "and its jit-stats are not comparable to theirs.")
+                    print("  The missing builtin module names the defect: this "
+                          "backend's feature set has to carry whatever "
+                          "`importlib._bootstrap_external` imports on this "
+                          "platform.")
+                    sys.exit(1)
         print(dim("done"))
 
     # ── single-backend bench run ──
