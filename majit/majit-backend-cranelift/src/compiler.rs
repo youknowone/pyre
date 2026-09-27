@@ -22825,6 +22825,7 @@ mod tests {
                 jf_frame_baseitemofs: majit_backend::jitframe::FIRST_ITEM_OFFSET,
                 jf_frame_lengthofs: JF_FRAME_OFS + majit_backend::jitframe::LENGTHOFS,
                 sign_size: majit_backend::jitframe::SIGN_SIZE,
+                jf_frame_itemsize: majit_backend::jitframe::SIGN_SIZE,
             }),
         });
     }

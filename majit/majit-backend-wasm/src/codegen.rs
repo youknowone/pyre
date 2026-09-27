@@ -123,7 +123,7 @@ pub fn materialize_unbound_label_args(inputargs: &[InputArgRc], ops: &mut Vec<Op
 
 /// Frame slot byte offset: slot[i] is at frame_ptr + 8 + i * 8.
 pub const FRAME_SLOT_BASE: u64 = 8;
-const SLOT_SIZE: u64 = 8;
+pub(crate) const SLOT_SIZE: u64 = 8;
 
 /// Scratch i64 locals reserved past the value locals for `emit_umulhi`
 /// (al, ah, bl, bh, mid1).
