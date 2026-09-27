@@ -19737,10 +19737,15 @@ fn float_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let b = args[1];
     if unsafe { pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b) } {
         // The operand is coerced to a double first, so an over-range int
-        // raises OverflowError before the ternary modulus is rejected.
-        unsafe { crate::objspace::descroperation::reject_pow_operand_overflow(b)? };
+        // raises OverflowError before the ternary modulus is rejected.  The
+        // coercion of a long collects; both operands are read back after it.
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.pin_roots(&[args[0], b]);
+        unsafe {
+            crate::objspace::descroperation::reject_pow_operand_overflow(roots.get(base + 1))?
+        };
         float_pow_reject_modulus(args)?;
-        crate::objspace::descroperation::pow_builtin(args[0], b)
+        crate::objspace::descroperation::pow_builtin(roots.get(base), roots.get(base + 1))
     } else {
         Ok(pyre_object::w_not_implemented())
     }
@@ -19749,9 +19754,13 @@ fn float_dunder_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     crate::type_methods::arity_pow(args, "__rpow__")?;
     let b = args[1];
     if unsafe { pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b) } {
-        unsafe { crate::objspace::descroperation::reject_pow_operand_overflow(b)? };
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.pin_roots(&[args[0], b]);
+        unsafe {
+            crate::objspace::descroperation::reject_pow_operand_overflow(roots.get(base + 1))?
+        };
         float_pow_reject_modulus(args)?;
-        crate::objspace::descroperation::pow_builtin(b, args[0])
+        crate::objspace::descroperation::pow_builtin(roots.get(base + 1), roots.get(base))
     } else {
         Ok(pyre_object::w_not_implemented())
     }

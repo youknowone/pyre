@@ -4078,8 +4078,7 @@ fn call_with_kwargs_in_ctx_impl(
         ) || std::ptr::eq(
             current_type(),
             crate::typedef::gettypeobject(&crate::pytraceback::PYTRACEBACK_TYPE),
-        ) || type_new_accepts_keywords(current_type())
-            || crate::_structseq::is_structseq_type(current_type());
+        ) || type_new_accepts_keywords(current_type());
         if !kwargs.is_empty()
             && !accepts_keywords_despite_nonbase
             && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(current_type()) }

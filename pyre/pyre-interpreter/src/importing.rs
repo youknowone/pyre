@@ -782,6 +782,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_abc);
     pyre_install_module!(_functools);
     pyre_install_module!(_stat);
+    pyre_install_module!(_structseq);
     pyre_install_module!(_suggestions);
     pyre_install_module!(_symtable);
     pyre_install_module!(_tokenize);

@@ -19,6 +19,7 @@ pub mod _pickle;
 pub mod _random;
 pub mod _sre;
 pub mod _stat;
+pub mod _structseq;
 pub mod _suggestions;
 pub mod _symtable;
 pub mod _template;
