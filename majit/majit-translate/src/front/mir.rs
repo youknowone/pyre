@@ -29482,6 +29482,65 @@ fn root_pin_value_is_stable(llbc: &Llbc, body: &Unstructured, local: usize) -> b
     definitions == 1
 }
 
+/// Whether every read of the pinned `local` inside one bracket sees the value
+/// its pin published.  This is the SSA view gctransform has: `pop_roots`
+/// reloads a livevar into the same variable, so a `mut` local that the
+/// bracket's own `get`s write back (the `with_roots!` restore) still denotes
+/// one value across the region.  Inside the region the only definitions may
+/// be the destinations of this scope's `get`s, directly or through one plain
+/// move; outside it the local may be redefined freely, because a path from
+/// the pin to a `get` never leaves the region.  Taking the address of the
+/// local anywhere still disqualifies it.
+fn root_pin_value_is_stable_in_bracket(
+    llbc: &Llbc,
+    body: &Unstructured,
+    local: usize,
+    region: &bit_set::BitSet,
+    own_gets: &[usize],
+) -> bool {
+    if root_pin_value_is_stable(llbc, body, local) {
+        return true;
+    }
+    let watched: bit_set::BitSet = std::iter::once(local).collect();
+    let get_dest = |bb: usize| match body.body[bb].term(llbc) {
+        Ok(TermKind::Call { call, .. }) => match call.dest.kind {
+            PlaceKind::Local(dest) => Some(dest as usize),
+            _ => None,
+        },
+        _ => None,
+    };
+    let own_dests: bit_set::BitSet = own_gets.iter().filter_map(|&bb| get_dest(bb)).collect();
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        let in_region = region.contains(bb_idx);
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind() {
+                if matches!(value, Rvalue::Ref { .. } | Rvalue::RawPtr { .. })
+                    && mentions_local(&stmt.kind, &watched)
+                {
+                    return false;
+                }
+                if in_region
+                    && matches!(place.kind, PlaceKind::Local(dest) if dest as usize == local)
+                {
+                    let from_own_get = match value {
+                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) => {
+                            matches!(src.kind, PlaceKind::Local(t) if own_dests.contains(t as usize))
+                        }
+                        _ => false,
+                    };
+                    if !from_own_get {
+                        return false;
+                    }
+                }
+            }
+        }
+        if in_region && get_dest(bb_idx) == Some(local) && !own_gets.contains(&bb_idx) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Prove the whole bracket's stack effects, not just uses of its guard.
 /// `ShadowStackFrameworkGCTransformer.push_roots/pop_roots` owns every saved
 /// slot. A free `pin_root` or a callee can also change our source stack without
@@ -30120,13 +30179,14 @@ fn analyze_root_brackets_with(
                 continue;
             }
         } else {
+            let region = root_bracket_region(llbc, body, opener, scope);
+            let own_get_bbs: Vec<usize> = scope_gets.iter().map(|(get_bb, _)| *get_bb).collect();
             if scope_pins.iter().any(|&(pin_bb, value_local)| {
-                !root_pin_value_is_stable(llbc, body, value_local)
+                !root_pin_value_is_stable_in_bracket(llbc, body, value_local, &region, &own_get_bbs)
                     || !root_pin_runs_once_per_opening(llbc, body, opener, pin_bb)
             }) {
                 continue;
             }
-            let region = root_bracket_region(llbc, body, opener, scope);
             if scope_pins
                 .iter()
                 .any(|(pin_bb, _)| !region.contains(*pin_bb))
@@ -55518,6 +55578,38 @@ mod tests {
         assert!(
             !plan.scopes.contains(3),
             "a constant element keeps the bracket"
+        );
+
+        // `with_roots!` pins the `mut` locals themselves and writes each
+        // `get` back into its own local: bb3 `_1 = get(..)`, bb5 `_2 = get(..)`.
+        // The restores are the only definitions inside the bracket, so every
+        // read there still sees the pinned value.
+        let mut restored = body_of(vec![copy(1), copy(2)]);
+        restored.body[3].terminator.kind = call(4, vec![copy(11), copy(12)], 1, 4);
+        restored.body[5].terminator.kind = call(4, vec![copy(14), mv(16)], 2, 6);
+        let plan =
+            super::analyze_root_brackets_with(&fixture_llbc(), &restored, &bit_set::BitSet::new(), name_of, touches);
+        assert!(
+            plan.scopes.contains(3),
+            "a restore into the pinned local must still be erased"
+        );
+        assert_eq!(plan.pins.get(&3), Some(&vec![1, 2]));
+        assert_eq!(plan.get_sites, vec![(3usize, 1usize), (5usize, 2usize)]);
+
+        // Any other write to a pinned local inside the bracket changes what a
+        // later `get` would be answered with.
+        let mut clobbered = body_of(vec![copy(1), copy(2)]);
+        clobbered.body[2].terminator.kind = call(5, vec![copy(1)], 1, 3);
+        clobbered.body[3].terminator.kind = call(4, vec![copy(11), copy(12)], 1, 4);
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(), &clobbered,
+            &bit_set::BitSet::new(),
+            name_of,
+            touches,
+        );
+        assert!(
+            !plan.scopes.contains(3),
+            "a non-get write to a pinned local keeps the bracket"
         );
     }
 
