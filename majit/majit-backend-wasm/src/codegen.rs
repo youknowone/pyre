@@ -2505,6 +2505,10 @@ fn emit_check_frame_depth(
     realloc_fn_ptr: i64,
     residual_type_base: u32,
     gcmap_ptr: i64,
+    result_local: u32,
+    ca_reload_fn_ptr: i64,
+    jf_top_addr: Option<u32>,
+    propagate_exception_descr: usize,
 ) {
     let len_size = majit_backend::jitframe::SIZEOFSIGNED as i32;
     sink.local_get(0);
@@ -2530,6 +2534,19 @@ fn emit_check_frame_depth(
     sink.i32_const(realloc_fn_ptr as i32);
     sink.call_indirect(0, residual_type_base + 2);
     sink.i32_wrap_i64();
+    // A 0 return is MemoryError (`emit_memory_error_on_truthy`). Local 0
+    // stays the old frame; only a live items base is installed.
+    sink.local_set(result_local);
+    sink.local_get(result_local);
+    sink.i32_eqz();
+    emit_memory_error_on_truthy(
+        sink,
+        Some(residual_type_base),
+        ca_reload_fn_ptr,
+        jf_top_addr,
+        propagate_exception_descr,
+    );
+    sink.local_get(result_local);
     sink.local_set(0);
     sink.end();
 }
@@ -2616,11 +2633,9 @@ fn emit_reload_frame_if_necessary(
         sink.i32_wrap_i64();
         sink.local_set(0);
     } else {
-        // No reload: either the trampoline path, which assumes a non-moving
-        // frame because its scratch writes use local 0, or an embedder whose
-        // host entry runs traces on a frame the shadow stack does not describe
-        // — it published no reload helper, and reloading from a shadow stack
-        // that never held this frame would install an unrelated one.
+        // No shadow top and no reload helper: no active GC, or an embedder
+        // that never pushed a JitFrame. Reloading from a shadow stack that
+        // never held this frame would install an unrelated one.
     }
 }
 
@@ -5904,7 +5919,17 @@ fn build_function(
         && let Some(base) = residual_type_base
     {
         let gcmap_ptr = realloc_entry_gcmap(frame, entry_inputargs, ca.gcmap_sink);
-        emit_check_frame_depth(&mut sink, frame, ca.realloc_fn_ptr, base, gcmap_ptr);
+        emit_check_frame_depth(
+            &mut sink,
+            frame,
+            ca.realloc_fn_ptr,
+            base,
+            gcmap_ptr,
+            bridge_slot_local,
+            ca.ca_reload_fn_ptr,
+            ca.jf_top_addr,
+            ca.attached.propagate_exception_descr,
+        );
     }
 
     // Bind the folded constants the optimizer left under a plain op position

@@ -72,8 +72,9 @@ use std::sync::{Arc, Weak};
 /// did not resolve (target_ord None), 9 = target_ord Some but != last label,
 /// 10 = arity mismatch, 11 = loop-closing bridge advances no loop-carried value
 /// (guard side-trace that would livelock the chained loop), 14 = accepted
-/// CALL_ASSEMBLER trace, 15 = declined CA because a trace would use the host
-/// call trampoline on a movable CA frame.  Index 16 records the dormant
+/// CALL_ASSEMBLER trace, 15 = unused (the trampoline-decline tally nothing
+/// bumps; scratch left the frame, so a movable callee is not declined).
+/// Index 16 records the dormant
 /// forced-terminal-decline runtime regression hook. Sub-breakdown of the
 /// index-8 unresolved-target decline: 17 = the terminal JUMP carries no descr
 /// at all, 18 = the descr is present but `ll_loop_code` is 0.
@@ -196,7 +197,7 @@ pub const BRIDGE_DIAG_LABELS: &[&str] = &[
     "ca_cell_set",
     "ca_cells_zero",
     "accepted_ca",
-    "decl_ca_trampoline",
+    "unused_ca_trampoline",
     "forced_ca_terminal_decline",
     "ml_no_descr",
     "ml_unpublished",
@@ -2531,9 +2532,11 @@ pub extern "C" fn wasm_jit_ca_reload_caller_frame() -> i64 {
 /// running frame's `jf_frame` length is below this module's item count.
 ///
 /// `items_base` is wasm local 0 (the `jf_frame` items). The returned items
-/// base belongs to the new frame. `alloc` is the entry allocator: old-gen
-/// when a jitframe type id is registered (the entry frame is non-moving for
-/// the pointer held across `glue::execute`), otherwise `alloc_off_gc_jitframe`.
+/// base belongs to the new frame, or 0 when allocation fails. The guest then
+/// keeps local 0 on the old frame and takes the MemoryError exit.
+/// `malloc_jitframe_no_collect` places a registered jitframe type id
+/// (`jitframe_prefer_oldgen` is false, so the nursery, unless the request
+/// exceeds it). No type id uses `alloc_off_gc_jitframe`.
 /// `jf_frame_info` is the token's `CompiledLoopToken.frame_info` (`JitFrame::init`
 /// on the host entry, `rewrite.py` `gen_malloc_frame` on a CA callee).
 ///
@@ -2541,36 +2544,40 @@ pub extern "C" fn wasm_jit_ca_reload_caller_frame() -> i64 {
 /// `items_base` must be the items pointer of a live `JitFrame` whose
 /// `jf_frame_info` is non-null.
 pub unsafe extern "C" fn wasm_realloc_frame(items_base: i64, depth: i64) -> i64 {
-    use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JitFrame};
+    use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JitFrame, JitFrameInfo};
     if items_base == 0 || depth <= 0 {
         return items_base;
     }
     let old_jf = (items_base as usize - FIRST_ITEM_OFFSET) as *mut JitFrame;
     let base_ofs = (majit_gc::header::GcHeader::SIZE + FIRST_ITEM_OFFSET) as isize;
     let tid = wasm_jitframe_tid();
+    // `realloc_frame` initializes whatever `alloc` returns. Size the frame
+    // the same way first and refuse a null before that write.
+    let prepared = unsafe {
+        let fi = (*old_jf).jf_frame_info as *mut JitFrameInfo;
+        if depth as isize > (*fi).depth() {
+            (*fi).update_frame_depth(base_ofs as i64, depth);
+        }
+        let alloc_bytes = (*fi).size() as usize;
+        if tid != 0 {
+            wasm_malloc_jitframe_no_collect(tid, alloc_bytes)
+        } else {
+            let new_jf = majit_backend::jitframe::alloc_off_gc_jitframe(alloc_bytes);
+            if !new_jf.is_null() {
+                majit_gc::shadow_stack::register_libc_jitframe(new_jf as usize);
+            }
+            new_jf
+        }
+    };
+    if prepared.is_null() {
+        return 0;
+    }
     let new_jf = unsafe {
         majit_backend::jitframe::realloc_frame(
             old_jf,
             depth as isize,
             base_ofs,
-            |size_bytes| {
-                let alloc_bytes = size_bytes as usize;
-                if tid != 0 {
-                    let raw = wasm_alloc_oldgen_typed(tid, alloc_bytes);
-                    assert_ne!(raw.0, 0, "wasm_realloc_frame: jitframe allocation failed");
-                    let new_jf = raw.0 as *mut JitFrame;
-                    std::ptr::write_bytes(new_jf as *mut u8, 0, alloc_bytes);
-                    new_jf
-                } else {
-                    let new_jf = majit_backend::jitframe::alloc_off_gc_jitframe(alloc_bytes);
-                    assert!(
-                        !new_jf.is_null(),
-                        "wasm_realloc_frame: jitframe allocation failed"
-                    );
-                    majit_gc::shadow_stack::register_libc_jitframe(new_jf as usize);
-                    new_jf
-                }
-            },
+            |_size_bytes| prepared,
             |new_jf| {
                 if tid != 0 {
                     wasm_jit_write_barrier(new_jf as i64);
@@ -2587,6 +2594,31 @@ pub unsafe extern "C" fn wasm_realloc_frame(items_base: i64, depth: i64) -> i64 
     // `[root_stack_top - WORD]` unconditionally.
     retarget_shadow_jf(old_jf, new_jf);
     (new_jf as usize + FIRST_ITEM_OFFSET) as i64
+}
+
+/// `malloc_jitframe_no_collect` without `zeroed_gc_frame`'s assert.
+///
+/// `jitframe_prefer_oldgen` selects the generation. A null result is the
+/// guest's MemoryError (`wasm_realloc_frame` returns 0).
+fn wasm_malloc_jitframe_no_collect(
+    type_id: u32,
+    size_bytes: usize,
+) -> *mut majit_backend::jitframe::JitFrame {
+    with_wasm_active_gc_mut(|gc| {
+        let gcref = if majit_backend::jitframe::jitframe_prefer_oldgen() {
+            gc.alloc_oldgen_typed(type_id, size_bytes)
+        } else {
+            gc.alloc_nursery_no_collect_typed(type_id, size_bytes)
+        };
+        if gcref.is_null() {
+            return std::ptr::null_mut();
+        }
+        unsafe {
+            std::ptr::write_bytes(gcref.0 as *mut u8, 0, size_bytes);
+        }
+        gcref.0 as *mut majit_backend::jitframe::JitFrame
+    })
+    .unwrap_or(std::ptr::null_mut())
 }
 
 /// `assembler.py` `_build_frame_realloc_slowpath`: the top shadow slot is this
@@ -6246,8 +6278,7 @@ impl majit_backend::Backend for WasmBackend {
         let wb = wasm_write_barrier_helpers();
 
         // CALL_ASSEMBLER: the CA arm allocates a fresh callee using the target
-        // token's frozen geometry. The earlier frame-fit decline guarantees a
-        // movable callee cannot execute a trampoline-lowered op.
+        // token's frozen geometry.
         // A keyed tail-call back into the source skips that module's
         // fresh-entry publish, so this map must cover the source trace's
         // already-initialized homes (the root loop, or the parent
@@ -6255,9 +6286,6 @@ impl majit_backend::Backend for WasmBackend {
         let ca_params = if let Some(targets) = ca_targets.as_ref().filter(|_| allow_ca) {
             codegen::CaParams {
                 emit_ca: true,
-                // `compile_bridge`'s trampoline-decline floor above guarantees
-                // no trampoline-lowered op executes on this movable CA callee
-                // frame, so its tail call area is never touched.
                 targets: ca_codegen_targets(targets),
                 deopt_helper_slot: ca_deopt_helper_slot(),
                 ca_push_fn_ptr: wasm_jit_ca_push_frame as *const () as usize as i64,
@@ -6730,34 +6758,43 @@ impl majit_backend::Backend for WasmBackend {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            // Orthodox frame path (PYRE_WASM_CA): run the trace on a real
-            // GC-managed `JitFrame` so a collecting allocation forwards the live
-            // Ref-home slots through the `jf_gcmap` custom trace, discovered via
-            // the jitframe shadow stack — replacing the bespoke add_root-over-
-            // homes scheme. The frame is old-gen (non-moving), so the frame
-            // pointer held across `glue::execute` never dangles without a reload
-            // protocol. The data region (fail_index at 0, inputs/outputs at
-            // FRAME_SLOT_BASE, call area, dispatch key, Ref homes) lives in the
-            // `jf_frame` items area; passing `jf + FIRST_ITEM_OFFSET` as the wasm
-            // frame pointer keeps every local-0-relative codegen access
-            // unchanged. (See `build_home_gcmap` for the wasm32 Signed-item
-            // layout.)
+            // `malloc_entry_jitframe` (`llmodel.py` `malloc_jitframe` /
+            // `jitframe.py` `JITFRAME.allocate`). A collecting allocation
+            // forwards Ref homes through `jf_gcmap` on the jitframe shadow
+            // stack. The data region (fail_index at 0, inputs/outputs at
+            // FRAME_SLOT_BASE, call area, dispatch key, Ref homes) lives in
+            // the `jf_frame` items area; passing `jf + FIRST_ITEM_OFFSET` as
+            // the wasm frame pointer keeps every local-0-relative codegen
+            // access unchanged. (See `build_home_gcmap` for the wasm32
+            // Signed-item layout.) After `glue::execute`, resolve the shadow
+            // slot before the write barrier: the nursery frame may have moved.
             if wasm_jitframe_tid() != 0 {
                 use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JitFrame};
                 let sign = std::mem::size_of::<isize>();
                 // Data region (frame_size i64 slots) expressed in Signed items.
                 let depth = frame_size * 8 / sign;
-                let jf_ref =
-                    wasm_alloc_oldgen_typed(wasm_jitframe_tid(), JitFrame::alloc_size(depth));
-                assert!(jf_ref.0 != 0, "wasm JitFrame allocation failed");
-                let jf = jf_ref.0 as *mut JitFrame;
-                // `JitFrame::init` requires zero-filled storage, which the
-                // native `calloc` entry (`runner.rs` `execute_token`) provides
-                // but the old-gen arena does not — `ArenaCollection::malloc`
-                // deliberately returns recycled bytes. Zero the block so a
-                // home the trace has not defined yet reads as null.
+                let alloc_size = JitFrame::alloc_size(depth);
+                // `alloc_entry_jitframe` roots input refs across the nursery
+                // malloc. Rust's stack is not traced; the stores below read
+                // the forwarded values back from those roots.
+                let ref_roots: Vec<majit_gc::shadow_stack::OwnerRootGuard> = args
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        Value::Ref(value) => {
+                            Some(majit_gc::shadow_stack::OwnerRootGuard::new(*value))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let jf = with_wasm_active_gc_mut(|gc| {
+                    majit_backend::jitframe::malloc_entry_jitframe(gc, alloc_size)
+                })
+                .expect("wasm JitFrame allocation failed");
+                // Nursery and old-gen arenas both recycle bytes.
+                // `malloc_entry_jitframe` clears one header byte; a home the
+                // trace has not defined yet must still read as null.
                 unsafe {
-                    std::ptr::write_bytes(jf as *mut u8, 0, JitFrame::alloc_size(depth));
+                    std::ptr::write_bytes(jf as *mut u8, 0, alloc_size);
                     JitFrame::init(jf, frame_info_ptr(token), depth);
                 }
 
@@ -6768,37 +6805,42 @@ impl majit_backend::Backend for WasmBackend {
                 unsafe { (*jf).jf_gcmap = compiled.home_gcmap_ptr.get() as *const u8 };
 
                 let items_base = jf as usize + FIRST_ITEM_OFFSET;
+                let mut ref_index = 0usize;
                 for (i, arg) in args.iter().enumerate() {
                     let v = match arg {
                         Value::Int(v) => *v,
                         Value::Float(v) => v.to_bits() as i64,
-                        Value::Ref(r) => r.0 as i64,
+                        Value::Ref(_) => {
+                            let current = ref_roots[ref_index].get();
+                            ref_index += 1;
+                            current.0 as i64
+                        }
                         Value::Void => 0,
                     };
                     let ofs = compiled.frame.spill_slot_ofs(i as u64) as usize;
                     unsafe { *((items_base + ofs) as *mut i64) = v };
                 }
+                drop(ref_roots);
                 unsafe {
                     *((items_base + compiled.frame.dispatch_key_ofs as usize) as *mut i64) =
                         i64::from(dispatch_key);
                 }
 
-                let saved = majit_gc::shadow_stack::push_jf(jf_ref);
+                let saved = majit_gc::shadow_stack::push_jf(majit_ir::GcRef(jf as usize));
                 {
                     let _exec = ExecutingBackendGuard::enter(self);
                     glue::execute(func_handle, items_base as u32);
                 }
 
-                wasm_jit_write_barrier(jf as i64);
-                // Re-read: the barrier can collect and forward the frame.
-                // `_check_frame_depth` may also have moved execution onto
-                // `jf_forward`; the shadow slot names that frame when the
-                // helper rewrote it, and `jitframe_resolve` covers the rest.
+                // The pre-call pointer may name from-space. Resolve the
+                // shadow slot first (`_check_frame_depth` may also have
+                // stored `jf_forward`), then barrier that frame.
                 let jf = unsafe {
                     majit_backend::jitframe::JitFrame::resolve(
                         majit_gc::shadow_stack::peek_jf(saved).0 as *mut JitFrame,
                     )
                 };
+                wasm_jit_write_barrier(jf as i64);
                 let fail_descr = descr_at(unsafe { (*jf).jf_descr })
                     .expect("invalid jf_descr from compiled wasm");
                 let data = WasmFrameData::from_live_frame(jf, fail_descr, false, true, None);

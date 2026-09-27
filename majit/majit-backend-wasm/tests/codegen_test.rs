@@ -11926,3 +11926,324 @@ fn tail_fail_args_decode_through_the_deadframe() {
     assert_eq!(backend.get_int_value(&dead, 5), 55);
     unsafe { majit_backend::jitframe::free_off_gc_jitframe(jf) };
 }
+
+/// A 0 from `wasm_realloc_frame` is the MemoryError arm of
+/// `emit_memory_error_on_truthy`: local 0 is not replaced by that 0, and the
+/// arm returns through `propagate_exception_descr`.
+#[test]
+fn realloc_zero_takes_the_memory_error_exit() {
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let source = codegen::FrameGeometry::compact(2, 0, 0);
+    let frame = source.extend(4, 0);
+    assert!(frame.has_tail());
+    let mut ca = codegen::CaParams::default();
+    ca.realloc_fn_ptr = 1;
+    ca.attached.propagate_exception_descr = 0x1357;
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs,
+        ops: vec![Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))])],
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        gc_const_keys: Vec::new(),
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame,
+        ca,
+    };
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("realloc module");
+    validate_wasm(&bytes);
+
+    // Walk the zero-check `if` in one pass. `Operator` borrows the parser.
+    let mut prev_eqz = false;
+    let mut depth = 0i32;
+    let mut in_arm = false;
+    let mut returns = false;
+    let mut stores_descr = false;
+    let mut sets_local0 = false;
+    let mut arm_closed = false;
+    let mut installs_nonzero = false;
+    let mut saw_get_after_arm = false;
+    count_operators(&bytes, |op| {
+        if in_arm {
+            match op {
+                wasmparser::Operator::If { .. }
+                | wasmparser::Operator::Block { .. }
+                | wasmparser::Operator::Loop { .. } => depth += 1,
+                wasmparser::Operator::End => {
+                    depth -= 1;
+                    if depth == 0 {
+                        in_arm = false;
+                        arm_closed = true;
+                    }
+                }
+                wasmparser::Operator::Return => returns = true,
+                wasmparser::Operator::I32Const { value } if *value == 0x1357 => {
+                    stores_descr = true;
+                }
+                wasmparser::Operator::LocalSet { local_index } if *local_index == 0 => {
+                    sets_local0 = true;
+                }
+                _ => {}
+            }
+            prev_eqz = false;
+            return;
+        }
+        if arm_closed && !installs_nonzero {
+            if saw_get_after_arm {
+                installs_nonzero = matches!(op, wasmparser::Operator::LocalSet { local_index: 0 });
+                saw_get_after_arm = false;
+            } else {
+                saw_get_after_arm = matches!(op, wasmparser::Operator::LocalGet { .. });
+            }
+        }
+        let eqz = matches!(op, wasmparser::Operator::I32Eqz);
+        if prev_eqz && matches!(op, wasmparser::Operator::If { .. }) && !arm_closed {
+            in_arm = true;
+            depth = 1;
+        }
+        prev_eqz = eqz;
+    });
+    assert!(
+        arm_closed && returns && stores_descr,
+        "realloc's 0 result never reached the MemoryError arm"
+    );
+    assert!(
+        !sets_local0,
+        "a 0 realloc result must not be installed into local 0"
+    );
+    assert!(
+        installs_nonzero,
+        "only a non-zero realloc result is installed into local 0"
+    );
+}
+
+/// A Ref input lives across a collecting allocation that forwards the running
+/// frame. The guest reloads local 0 from the shadow stack, and the host
+/// decodes the int and the forwarded Ref from that frame.
+#[test]
+#[ignore = "runtime integration test: a collecting alloc moves the jitframe and the host decodes it"]
+fn nursery_entry_frame_moves_and_the_host_decodes_ref_and_int() {
+    use majit_backend::Backend;
+    use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JitFrame, alloc_off_gc_jitframe};
+    use majit_backend_wasm::failguard::{WasmFailDescr, WasmFrameData};
+
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
+    ];
+    let malloc = call_malloc_nursery(2, 32);
+    let guard = make_guard(
+        OpCode::GuardFalse,
+        &[OpRef::const_int(1)],
+        &[
+            OpRef::input_arg_int(0),
+            OpRef::const_int(99),
+            OpRef::input_arg_ref(1),
+        ],
+    );
+    guard.set_fail_arg_types(vec![Type::Int, Type::Int, Type::Ref]);
+    let mut inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.clone(),
+        ops: vec![malloc, guard],
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers {
+            new_fn_ptr: 1,
+            ..codegen::AllocHelpers::default()
+        },
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        gc_const_keys: Vec::new(),
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::compact(8, 2, 0),
+        ca: codegen::CaParams {
+            jf_top_addr: Some(0x2000),
+            ..codegen::CaParams::default()
+        },
+    };
+    inputs = rewrite_module_inputs(inputs);
+    let value_slots = codegen::frame_value_slots(&inputs.inputargs, &inputs.ops).max(8);
+    let homes = codegen::count_ref_homes(&inputs.inputargs, &inputs.ops).max(1);
+    inputs.frame = codegen::FrameGeometry::compact(value_slots, homes, 0);
+    let frame = inputs.frame;
+    let home = frame.home_ofs(0) as usize;
+    let (bytes, guards, homes, _) =
+        codegen::build_wasm_module(&inputs).expect("moving-frame trace compiles");
+    assert!(homes >= 1, "the Ref input is homed across the allocation");
+    validate_wasm(&bytes);
+    let exit = &guards[0];
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("module");
+    let mut store = Store::new(&engine, ());
+    let memory = Memory::new(&mut store, MemoryType::new(2, None)).expect("memory");
+    let old_items = 4096usize;
+    let new_obj = 64 * 1024usize;
+    let new_items = new_obj + FIRST_ITEM_OFFSET;
+    let frame_bytes = frame.frame_bytes as usize;
+    let top_addr = 0x2000usize;
+    let stack_top = 0x3000usize;
+    let old_obj = old_items - FIRST_ITEM_OFFSET;
+    memory
+        .write(&mut store, top_addr, &(stack_top as u32).to_le_bytes())
+        .unwrap();
+    memory
+        .write(&mut store, stack_top - 4, &(old_obj as u32).to_le_bytes())
+        .unwrap();
+    let int_bits = 41i64;
+    let ref_bits = 0x1111i64;
+    memory
+        .write(
+            &mut store,
+            old_items + codegen::FRAME_SLOT_BASE as usize,
+            &int_bits.to_le_bytes(),
+        )
+        .unwrap();
+    memory
+        .write(
+            &mut store,
+            old_items + codegen::FRAME_SLOT_BASE as usize + 8,
+            &ref_bits.to_le_bytes(),
+        )
+        .unwrap();
+    let alloc = wasmi::Func::wrap(
+        &mut store,
+        move |mut caller: wasmi::Caller<'_, ()>, _tid: i64, _size: i64| -> i64 {
+            let mut buf = vec![0u8; frame_bytes];
+            memory
+                .read(&caller, old_items, &mut buf)
+                .expect("copy frame");
+            memory
+                .write(&mut caller, new_items, &buf)
+                .expect("write moved frame");
+            let mut home_bits = [0u8; 8];
+            memory
+                .read(&caller, new_items + home, &mut home_bits)
+                .expect("ref home");
+            let forwarded = i64::from_le_bytes(home_bits) + 0x100;
+            memory
+                .write(&mut caller, new_items + home, &forwarded.to_le_bytes())
+                .unwrap();
+            let marker = 0xDEADi64;
+            memory
+                .write(
+                    &mut caller,
+                    old_items + codegen::FRAME_SLOT_BASE as usize,
+                    &marker.to_le_bytes(),
+                )
+                .unwrap();
+            memory
+                .write(&mut caller, stack_top - 4, &(new_obj as u32).to_le_bytes())
+                .unwrap();
+            0x4000
+        },
+    );
+    let table = Table::new(
+        &mut store,
+        TableType::new(ValType::FuncRef, 2, None),
+        Val::default(ValType::FuncRef),
+    )
+    .expect("table");
+    table.set(&mut store, 1, Val::from(alloc)).unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    linker
+        .define("env", "__indirect_function_table", table)
+        .unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("instantiate");
+    let returned = instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, old_items as i32)
+        .expect("trace") as usize;
+    assert_eq!(returned, new_items, "local 0 reloaded the moved frame");
+    let mut marker = [0u8; 8];
+    memory
+        .read(
+            &store,
+            old_items + codegen::FRAME_SLOT_BASE as usize,
+            &mut marker,
+        )
+        .unwrap();
+    assert_eq!(
+        i64::from_le_bytes(marker),
+        0xDEAD,
+        "the guard spilled onto the moved frame"
+    );
+
+    let depth = frame.signed_item_count();
+    let jf = alloc_off_gc_jitframe(JitFrame::alloc_size(depth));
+    assert!(!jf.is_null());
+    let mut buf = vec![0u8; frame_bytes];
+    memory.read(&store, new_items, &mut buf).unwrap();
+    unsafe {
+        JitFrame::init(jf, std::ptr::null(), depth);
+        let items = (jf as *mut u8).add(FIRST_ITEM_OFFSET);
+        std::ptr::copy_nonoverlapping(buf.as_ptr(), items, frame_bytes);
+    }
+    let descr = std::sync::Arc::new(WasmFailDescr {
+        fail_index: exit.fail_index,
+        trace_id: 0,
+        fail_arg_types: exit.fail_arg_types.clone(),
+        fail_locs: exit.fail_locs.clone(),
+        is_finish: false,
+        force_args_offset: frame.force_slot_base as u32,
+        force_tail_base: frame.force_tail_base() as u32,
+        force_prefix_slots: frame.prefix_value_slots as u32,
+        value_tail_index: if frame.has_tail() {
+            frame.value_tail_index() as u32
+        } else {
+            0
+        },
+        force_gcmap_ptr: exit.exit_gcmap_ptr,
+        bridge_cell: 0,
+        fail_arg_advanced: Vec::new(),
+        trace_ref_homes: 0,
+        trace_label_homes: 0,
+        param_dispatch: false,
+        bridge_slot: std::sync::atomic::AtomicU32::new(0),
+        meta_descr: None,
+    });
+    let data = WasmFrameData::from_live_frame(jf, descr, false, false, None);
+    let dead = majit_backend::DeadFrame::Boxed(data);
+    let backend = majit_backend_wasm::WasmBackend::new();
+    assert_eq!(backend.get_int_value(&dead, 0), int_bits);
+    assert_eq!(backend.get_int_value(&dead, 1), 99);
+    assert_eq!(
+        backend.get_ref_value(&dead, 2).0,
+        (ref_bits + 0x100) as usize
+    );
+    unsafe { majit_backend::jitframe::free_off_gc_jitframe(jf) };
+}
