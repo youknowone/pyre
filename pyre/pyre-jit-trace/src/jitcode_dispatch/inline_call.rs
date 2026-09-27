@@ -3191,29 +3191,63 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     target_pc: usize,
     w_code: *const (),
     is_being_profiled: bool,
+    mut pending_ec_leave: Option<PendingEcLeave>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let _ = nlocals;
-    let Some(recorded) = record_walker_loop_callee_portal_call(
-        ctx,
-        op.pc,
-        Some((dst_bank, dst)),
-        callee_frame,
-        callee_ec,
-        Some(token),
-        target_pc,
-        w_code,
-        is_being_profiled,
-    )?
-    else {
-        return resolved_inline_decline(op.pc, line!());
-    };
-    if let Some((exc, exc_concrete)) = recorded.raised {
-        return Ok(Some((
-            DispatchOutcome::SubRaise { exc, exc_concrete },
-            op.next_pc,
-        )));
+    let result = (|| {
+        let Some(recorded) = record_walker_loop_callee_portal_call(
+            ctx,
+            op.pc,
+            Some((dst_bank, dst)),
+            callee_frame,
+            callee_ec,
+            Some(token),
+            target_pc,
+            w_code,
+            is_being_profiled,
+            &mut pending_ec_leave,
+        )?
+        else {
+            return resolved_inline_decline(op.pc, line!());
+        };
+        if let Some((exc, exc_concrete)) = recorded.raised {
+            return Ok(Some((
+                DispatchOutcome::SubRaise { exc, exc_concrete },
+                op.next_pc,
+            )));
+        }
+        Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+    })();
+    // A decline or error before the call still owes the callee its
+    // `finally: ec.leave(...)`. The success path takes the leave inside
+    // `record_walker_loop_callee_portal_call`.
+    if let Some(leave) = pending_ec_leave {
+        leave.record(ctx.trace_ctx);
     }
-    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+    result
+}
+
+/// The `ec.leave` of an inlined callee whose sub-walk stopped at its own loop
+/// header, held until the `CALL_ASSEMBLER` that finishes the callee is
+/// recorded.
+pub(crate) struct PendingEcLeave {
+    callee_frame: OpRef,
+    callee_ec: OpRef,
+    concrete_frame: *mut pyre_interpreter::PyFrame,
+    concrete_ec: *mut pyre_interpreter::PyExecutionContext,
+}
+
+impl PendingEcLeave {
+    fn record(self, ctx: &mut TraceCtx) {
+        walker_ec_leave(
+            ctx,
+            self.callee_frame,
+            self.callee_ec,
+            self.concrete_frame,
+            self.concrete_ec,
+            false,
+        );
+    }
 }
 
 /// Walker mirror of `opimpl_recursive_call_assembler`
@@ -3244,6 +3278,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     target_pc: usize,
     w_code: *const (),
     is_being_profiled: bool,
+    pending_ec_leave: &mut Option<PendingEcLeave>,
 ) -> Result<Option<WalkerLoopCalleePortalRecord>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
     // `do_recursive_call`'s funcbox and ABI, resolved before the first
@@ -3345,7 +3380,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // left to unwind.
     //
     // The callee's own `OpenInlineActivation` is already closed by the time
-    // this arm emits -- the sub-walk's `walker_ec_leave` drops it -- so this
+    // this arm emits -- the sub-walk's exit drops it -- so this
     // level is the `+ 1`, exactly as in the sibling arm. The width belongs to
     // this walk's `WalkSession`; a nested residual trace on the same thread
     // owns a different session and cannot leak implementation frames into it.
@@ -3497,6 +3532,11 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
 
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    // `execute_frame`'s `finally: ec.leave(...)` for the callee this call
+    // finished, after GUARD_NOT_FORCED and before the exception guard.
+    if let Some(leave) = pending_ec_leave.take() {
+        leave.record(ctx.trace_ctx);
+    }
     // Restore before either exception arm leaves the compiled caller.  Put
     // PyPy's KEEPALIVE last in the interval so GUARD_NO_EXCEPTION still sees
     // an emitted call-adjacent operation even when the restore stores fold.
@@ -10195,19 +10235,34 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // completes, so every callee exit — return, exception, or decline —
     // arrives here before any of the early returns below.
     //
-    // A callee that stopped at its OWN loop header has not returned, so this
-    // `leave` is recorded before the `CALL_ASSEMBLER` that runs the rest of it,
-    // and a loop body reading the live frame (`sys._getframe()`, a traceback)
-    // names the caller rather than its own frame.  MEASURED 2026-08-27: moving
-    // the `leave` past that op — the obvious fix — hangs
-    // `synth/exception_traceback_frame_lineno` (dynasm, 6/6; the deferral
-    // switched off in the same binary is 3/3 clean).  The guards between the
-    // two, and `GUARD_NO_EXCEPTION` above all in a callee that raises every
-    // iteration, leave the trace before the deferred `leave` is reached, so
-    // `ec.topframeref` keeps the callee and the frame chain never unwinds.
-    // Converging needs the `leave` reachable from those guard exits — a
-    // resume-side leave, or the exception path recording its own — not a
-    // reorder.
+    // A callee that stopped at its OWN loop header has not returned: the
+    // `CALL_ASSEMBLER` that [`emit_walker_loop_callee_call_assembler`] records
+    // runs the rest of it, and upstream traces that call between
+    // `execute_frame`'s `ec.enter(self)` and its `finally: ec.leave(...)`.  Its
+    // `leave` is handed to that arm, which records it after the call's
+    // `GUARD_NOT_FORCED` and before its exception guard.  Recorded here
+    // instead, the compiled loop would run with the caller in `topframeref`,
+    // so its `sys._getframe()` and tracebacks would skip the callee's frame.
+    let defer_leave_to_call_assembler = matches!(
+        callee_outcome,
+        Ok((DispatchOutcome::SubLoopCalleeCallAssembler { .. }, _))
+    ) && constructor_result.is_none();
+    let mut pending_ec_leave = None;
+    let entered_ec = if defer_leave_to_call_assembler {
+        entered_ec.and_then(|open_activation| {
+            pending_ec_leave = Some(PendingEcLeave {
+                callee_frame: ca_callee_frame,
+                callee_ec: ca_callee_ec,
+                concrete_frame: ca_concrete_frame,
+                concrete_ec: pyre_interpreter::call::getexecutioncontext()
+                    as *mut pyre_interpreter::PyExecutionContext,
+            });
+            drop(open_activation);
+            None
+        })
+    } else {
+        entered_ec
+    };
     if let Some(open_activation) = entered_ec {
         let concrete_ec = pyre_interpreter::call::getexecutioncontext()
             as *mut pyre_interpreter::PyExecutionContext;
@@ -10622,6 +10677,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 target_pc,
                 w_code,
                 is_being_profiled,
+                pending_ec_leave,
             )
         }
         other => Ok(Some((other, op.next_pc))),
