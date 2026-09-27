@@ -2984,6 +2984,7 @@ dependencies = [
  "pyre-jit-trace",
  "pyre-module",
  "pyre-object",
+ "rustpython-wtf8",
  "wasm-bindgen",
 ]
 
