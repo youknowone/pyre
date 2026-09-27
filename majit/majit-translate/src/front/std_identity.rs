@@ -51,6 +51,7 @@ fn is_identity_wrapper_target(
     target: &CallTarget,
     receiver_path: Option<&str>,
     dest_path: Option<&str>,
+    receiver_is_charon_box: bool,
 ) -> bool {
     match target {
         CallTarget::Method {
@@ -63,21 +64,14 @@ fn is_identity_wrapper_target(
             }
             match (name.as_str(), path_leaf(receiver_root.as_deref())) {
                 ("get", Some("Cell")) => true,
-                ("as_ref" | "as_mut", Some("Box")) => true,
+                ("as_ref" | "as_mut", Some("Box")) if receiver_is_charon_box => true,
                 ("deref" | "deref_mut", Some("Ref") | Some("MutexGuard")) => true,
                 _ => false,
             }
         }
         CallTarget::FunctionPath { segments, .. } => {
-            // Charon peels `alloc::` and spells `Box::as_mut` as
-            // `boxed::Box::as_mut`. That path is still the pointer cast.
             let leaf = function_leaf(segments);
-            if matches!(leaf, Some("as_ref" | "as_mut"))
-                && (path_has(segments, "Box") || path_has(segments, "boxed"))
-            {
-                return true;
-            }
-            if !is_std_fn_path(segments) {
+            if !is_std_fn_path(segments) && !receiver_is_charon_box {
                 return false;
             }
             let recv = path_leaf(receiver_path);
@@ -91,13 +85,11 @@ fn is_identity_wrapper_target(
                 }
                 Some("new") if path_has(segments, "atomic") => true,
                 Some("get") if recv == Some("Cell") || path_has(segments, "Cell") => true,
-                Some("as_ref" | "as_mut")
-                    if recv == Some("Box")
-                        || path_has(segments, "Box")
-                        || path_has(segments, "boxed") =>
-                {
-                    true
-                }
+                // Charon peels `alloc::` (`boxed::Box::as_mut`). That spelling
+                // is the pointer cast only when the receiver type is the
+                // `alloc::boxed::Box` ADT, not because a path segment is named
+                // `Box` or `boxed`.
+                Some("as_ref" | "as_mut") if receiver_is_charon_box => true,
                 Some("deref" | "deref_mut")
                     if matches!(recv, Some("Ref") | Some("MutexGuard"))
                         || path_has(segments, "MutexGuard")
@@ -175,6 +167,7 @@ pub(crate) fn lower_std_primitive_op(
     dest_is_bool: bool,
     banks_agree: bool,
     layout: Option<&[(String, ValueType)]>,
+    receiver_is_charon_box: bool,
 ) -> OpKind {
     let OpKind::Call {
         target,
@@ -184,7 +177,9 @@ pub(crate) fn lower_std_primitive_op(
     else {
         return op_kind;
     };
-    if args.len() == 1 && is_identity_wrapper_target(target, receiver_path, dest_path) {
+    if args.len() == 1
+        && is_identity_wrapper_target(target, receiver_path, dest_path, receiver_is_charon_box)
+    {
         let Some(operand) = args[0].as_variable().cloned() else {
             return op_kind;
         };
@@ -195,7 +190,7 @@ pub(crate) fn lower_std_primitive_op(
         };
         // `Box::as_ref` / `Box::as_mut` are a pointer cast whatever the
         // layout is.
-        if banks_agree && is_box_as_ref_or_mut(target, receiver_path) {
+        if banks_agree && is_box_as_ref_or_mut(target, receiver_is_charon_box) {
             return same_as(operand, result_ty.clone());
         }
         if let Some(fields) = layout {
@@ -255,21 +250,14 @@ fn function_leaf_is(target: &CallTarget, leaf: &str) -> bool {
     }
 }
 
-fn is_box_as_ref_or_mut(target: &CallTarget, receiver_path: Option<&str>) -> bool {
+fn is_box_as_ref_or_mut(target: &CallTarget, receiver_is_charon_box: bool) -> bool {
+    if !receiver_is_charon_box {
+        return false;
+    }
     match target {
-        CallTarget::Method {
-            name,
-            receiver_root,
-            ..
-        } => {
-            matches!(name.as_str(), "as_ref" | "as_mut")
-                && path_leaf(receiver_root.as_deref()) == Some("Box")
-        }
+        CallTarget::Method { name, .. } => matches!(name.as_str(), "as_ref" | "as_mut"),
         CallTarget::FunctionPath { segments, .. } => {
             matches!(function_leaf(segments), Some("as_ref" | "as_mut"))
-                && (path_leaf(receiver_path) == Some("Box")
-                    || path_has(segments, "Box")
-                    || path_has(segments, "boxed"))
         }
         _ => false,
     }
@@ -506,6 +494,7 @@ mod tests {
             false,
             false,
             None,
+            false,
         );
         assert!(
             matches!(get, OpKind::Call { .. }),
@@ -529,6 +518,7 @@ mod tests {
             false,
             true,
             Some(&[("value".into(), ValueType::Int)]),
+            false,
         );
         match get {
             OpKind::UnaryOp { op, operand, .. } => {
@@ -551,6 +541,7 @@ mod tests {
             false,
             true,
             Some(&[("v".into(), ValueType::Unsigned)]),
+            false,
         );
         assert!(
             matches!(new, OpKind::UnaryOp { ref op, .. } if op == "same_as"),
@@ -573,6 +564,7 @@ mod tests {
                 ("value".into(), ValueType::Int),
                 ("flag".into(), ValueType::Bool),
             ]),
+            false,
         );
         assert!(
             matches!(&get, OpKind::Call { .. }),
@@ -596,6 +588,7 @@ mod tests {
             false,
             true,
             Some(&[("value".into(), ValueType::Int)]),
+            false,
         );
         assert!(matches!(
             lowered,
@@ -615,6 +608,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         );
         assert!(
             matches!(refcell, OpKind::Call { .. }),
@@ -638,6 +632,7 @@ mod tests {
             false,
             true,
             None,
+            true,
         );
         assert!(matches!(
             as_ref,
@@ -660,6 +655,7 @@ mod tests {
                 ("0".into(), ValueType::Ref(None)),
                 ("1".into(), ValueType::Ref(None)),
             ]),
+            true,
         );
         assert!(
             matches!(multi, OpKind::UnaryOp { ref op, .. } if op == "same_as"),
@@ -679,6 +675,7 @@ mod tests {
             false,
             true,
             None,
+            true,
         );
         assert!(matches!(
             as_mut,
@@ -697,10 +694,68 @@ mod tests {
             false,
             true,
             None,
+            true,
         );
         assert!(
             matches!(peeled, OpKind::UnaryOp { ref op, .. } if op == "same_as"),
             "boxed::Box::as_mut is the same pointer cast as alloc::boxed::Box::as_mut, got {peeled:?}"
+        );
+        let user_box = lower_std_primitive_op(
+            call(
+                path(&["my_crate", "Box", "as_mut"]),
+                vec![v.clone()],
+                ValueType::Ref(None),
+            ),
+            Some("my_crate::Box"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            false,
+        );
+        assert!(
+            matches!(user_box, OpKind::Call { .. }),
+            "a user type named Box::as_mut is not the alloc Box pointer cast, got {user_box:?}"
+        );
+        let my_box = lower_std_primitive_op(
+            call(
+                path(&["my_crate", "MyBox", "as_mut"]),
+                vec![v.clone()],
+                ValueType::Ref(None),
+            ),
+            Some("my_crate::MyBox"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            false,
+        );
+        assert!(
+            matches!(my_box, OpKind::Call { .. }),
+            "MyBox::as_mut is not rewritten, got {my_box:?}"
+        );
+        let peeled_without_type = lower_std_primitive_op(
+            call(
+                path(&["boxed", "Box", "as_mut"]),
+                vec![v.clone()],
+                ValueType::Ref(None),
+            ),
+            Some("boxed::Box"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            false,
+        );
+        assert!(
+            matches!(peeled_without_type, OpKind::Call { .. }),
+            "boxed:: spelling without the Box ADT stays a call, got {peeled_without_type:?}"
         );
 
         let as_deref_mut = lower_niche_option_deref(
@@ -765,6 +820,7 @@ mod tests {
                 ("data".into(), ValueType::Ref(Some("Vec".into()))),
                 ("poison".into(), ValueType::Ref(None)),
             ]),
+            false,
         );
         match deref {
             OpKind::FieldRead { field, base, .. } => {
@@ -794,6 +850,7 @@ mod tests {
                 ("value".into(), ValueType::Ref(Some("Vec".into()))),
                 ("borrow".into(), ValueType::Ref(None)),
             ]),
+            false,
         );
         match deref {
             OpKind::FieldRead { field, base, .. } => {
@@ -820,6 +877,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         );
         assert!(matches!(
             clone,
@@ -839,6 +897,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         );
         assert!(matches!(default_i, OpKind::ConstInt(0)));
 
@@ -855,6 +914,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         );
         assert!(matches!(default_u, OpKind::ConstUInt(0)));
 
@@ -871,6 +931,7 @@ mod tests {
             true,
             true,
             None,
+            false,
         );
         assert!(matches!(default_bool, OpKind::ConstBool(false)));
     }
@@ -891,6 +952,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         );
         assert!(matches!(clone_adt, OpKind::Call { .. }));
 
@@ -907,6 +969,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         );
         assert!(matches!(tuple_default, OpKind::Call { .. }));
 
@@ -915,8 +978,17 @@ mod tests {
             vec![v.clone(), dummy_var()],
             ValueType::Int,
         );
-        let replace =
-            lower_std_primitive_op(replace, None, None, Some("I64"), None, false, true, None);
+        let replace = lower_std_primitive_op(
+            replace,
+            None,
+            None,
+            Some("I64"),
+            None,
+            false,
+            true,
+            None,
+            false,
+        );
         assert!(
             matches!(replace, OpKind::Call { .. }),
             "replace cannot lower without the borrowed Place"
@@ -939,6 +1011,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         );
         assert!(
             matches!(clone, OpKind::Call { .. }),
@@ -966,6 +1039,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         );
         assert!(
             matches!(blanket, OpKind::Call { .. }),
@@ -985,6 +1059,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         );
         assert!(
             matches!(trait_item, OpKind::Call { .. }),
