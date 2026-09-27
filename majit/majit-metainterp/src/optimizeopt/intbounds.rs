@@ -828,7 +828,7 @@ impl OptIntBounds {
             return OptimizationResult::Remove;
         }
 
-        if !matches!(ctx.opref_type(cond.to_opref()), Some(majit_ir::Type::Int)) {
+        if cond.type_() != majit_ir::Type::Int {
             return OptimizationResult::PassOn;
         }
 
@@ -850,7 +850,7 @@ impl OptIntBounds {
             return OptimizationResult::Remove;
         }
 
-        if !matches!(ctx.opref_type(cond.to_opref()), Some(majit_ir::Type::Int)) {
+        if cond.type_() != majit_ir::Type::Int {
             return OptimizationResult::PassOn;
         }
 
@@ -1683,12 +1683,7 @@ impl Optimization for OptIntBounds {
             //   if op.getarg(0).type == 'i':
             //       self.propagate_bounds_backward(op.getarg(0))
             OpCode::GuardTrue | OpCode::GuardFalse | OpCode::GuardValue => {
-                let arg0 = op.arg(0).to_opref();
-                let is_int = arg0
-                    .ty()
-                    .or_else(|| ctx.opref_type(arg0))
-                    .is_none_or(|t| t == majit_ir::Type::Int);
-                if !is_int {
+                if op.arg(0).type_() != majit_ir::Type::Int {
                     return;
                 }
                 self.propagate_bounds_backward(&op.arg(0), ctx);
@@ -1875,7 +1870,7 @@ impl Optimization for OptIntBounds {
             if resolved.is_constant() {
                 continue;
             }
-            if !matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int)) {
+            if arg_box.type_() != majit_ir::Type::Int {
                 continue;
             }
             if let Some(bound) = ctx.peek_intbound_box(&arg_box) {

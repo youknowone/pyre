@@ -7984,8 +7984,11 @@ mod tests {
             preamble_op: dep_op,
             same_as_source: None,
         };
-        assert_eq!(ctx.force_op_from_preamble_op(&mask_pop), masked);
-        assert_eq!(ctx.force_op_from_preamble_op(&dep_pop), dependent);
+        assert_eq!(ctx.force_op_from_preamble_op(&mask_pop).to_opref(), masked);
+        assert_eq!(
+            ctx.force_op_from_preamble_op(&dep_pop).to_opref(),
+            dependent
+        );
 
         let target_vs = VirtualState::new(vec![VirtualStateInfo::IntBounded(IntBound::bounded(
             0, MASK,
@@ -8536,7 +8539,7 @@ mod tests {
             same_as_source: produced.same_as_source.clone(),
             preamble_op: produced.preamble_op,
         };
-        let forced = ctx.force_op_from_preamble_op(&pop);
+        let forced = ctx.force_op_from_preamble_op(&pop).to_opref();
         assert_eq!(forced, OpRef::int_op(20));
 
         // RPython `unroll.py:32` `use_box` populates `self.short`.
@@ -8627,7 +8630,7 @@ mod tests {
             same_as_source: produced.same_as_source.clone(),
             preamble_op: produced.preamble_op,
         };
-        let forced = ctx.force_op_from_preamble_op(&pop);
+        let forced = ctx.force_op_from_preamble_op(&pop).to_opref();
         // RPython `unroll.py UnrollOptimizer.force_op_from_preamble return preamble_op.op` ≡ self.res.
         // pyre's Phase 1 source IS self.res for the imported short box.
         assert_eq!(forced, OpRef::ref_op(19));
@@ -8740,9 +8743,8 @@ mod tests {
         let imported_result = ctx2.imported_short_pure_ops[0].result;
         assert_ne!(imported_result, OpRef::int_op(30));
         let pop = ctx2.imported_short_pure_ops[0].pop.clone();
-        let forced = ctx2.force_op_from_preamble_op(&pop);
+        let forced = ctx2.force_op_from_preamble_op(&pop).to_opref();
         // force_op_from_preamble may return the imported position (not necessarily 30)
-        let _ = forced;
         assert_eq!(ctx2.imported_short_pure_ops.len(), 1);
         // RPython parity: extra_same_as is populated lazily by add_preamble_op
         // (called from optimizer.force_box's potential_extra_ops.pop path).

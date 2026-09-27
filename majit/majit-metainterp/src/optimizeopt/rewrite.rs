@@ -1533,7 +1533,7 @@ impl OptRewrite {
         opcode: OpCode,
         args: [Operand; 2],
         ctx: &mut OptContext,
-    ) -> Option<OpRef> {
+    ) -> Option<Operand> {
         let synthetic = Op::new(opcode, &args);
         ctx.get_pure_result(&synthetic)
     }
@@ -1544,10 +1544,7 @@ impl OptRewrite {
         let Some(old) = self.get_pure_result(top.opcode, [top.arg(0), top.arg(1)], ctx) else {
             return false;
         };
-        let resolved = match ctx.get_box_replacement_operand_opt(old) {
-            Some(b) => b,
-            None => ctx.materialize_operand_at(old),
-        };
+        let resolved = ctx.resolve_operand_operand(&old);
         let Some(bound) = ctx.peek_intbound_box(&resolved) else {
             return false;
         };
@@ -1592,7 +1589,7 @@ impl OptRewrite {
         let top = Op::new(reflex, &[arg1.clone(), arg0.clone()]);
         if let Some(old) = self.get_pure_result(top.opcode, [top.arg(0), top.arg(1)], ctx) {
             let b_old = Operand::from_bound_op(op_rc);
-            let b_cached = ctx.get_box_replacement_operand(old);
+            let b_cached = ctx.resolve_operand_operand(&old);
             ctx.make_equal_to(&b_old, &b_cached);
             return Some(OptimizationResult::Remove);
         }
@@ -2252,7 +2249,7 @@ impl Optimization for OptRewrite {
                         let cached_result = match entry {
                             LoopInvariantEntry::Preamble(ref pop) => {
                                 // unroll.py: force_op_from_preamble(preamble_op)
-                                let forced = ctx.force_op_from_preamble_op(pop);
+                                let forced = ctx.force_op_from_preamble_op(pop).to_opref();
                                 self.loop_invariant_results
                                     .insert(func_val, LoopInvariantEntry::Direct(forced));
                                 forced

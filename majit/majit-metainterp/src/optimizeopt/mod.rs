@@ -4373,7 +4373,7 @@ impl OptContext {
     pub fn force_op_from_preamble_op(
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
-    ) -> OpRef {
+    ) -> Operand {
         let preamble_source = preamble_op.op.to_opref();
         // RPython `return preamble_op.op` returns the carried Box. In majit,
         // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()` —
@@ -4396,7 +4396,7 @@ impl OptContext {
                 self.collect_use_box_guards(&preamble_op.preamble_op)
             else {
                 self.signal_invalid_loop("short preamble GC layout tid is unresolved");
-                return preamble_source;
+                return preamble_op.op.clone();
             };
             // unroll.py:28: assert self.short_preamble_producer is not None
             if let Some(mut builder) = self.active_short_preamble_producer.take() {
@@ -4498,7 +4498,7 @@ impl OptContext {
         // `used_boxes` / `short_preamble_jump` / `extra_same_as` for the
         // imported short box.
         let _ = result;
-        preamble_source
+        preamble_op.op.clone()
     }
 
     /// shortpreamble.py:383-396,401-406: collect guards from the forwarded
@@ -5268,7 +5268,7 @@ impl OptContext {
     }
 
     /// Probe the pure-op ring for `op`. Empty until `OptPure` publishes.
-    pub fn get_pure_result(&mut self, op: &Op) -> Option<OpRef> {
+    pub fn get_pure_result(&mut self, op: &Op) -> Option<Operand> {
         let table = self.pure_ops.clone()?;
         pure::shared_get_pure_result(&table, op, self)
     }
@@ -9410,8 +9410,8 @@ impl OptContext {
     /// callers don't need to special-case the constant arg0 path. The
     /// constant case lands on `const_infos[gcref]`; the regular case
     /// runs `ensure_ptr_info_arg0(op).as_mut().setfield(...)`.
-    pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: OpRef) {
-        let value = self.materialize_operand_at(value);
+    pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: &Operand) {
+        let value = self.resolve_operand_operand(value);
         let arg0 = self.resolve_operand_operand(&op.arg(0)).to_opref();
         if arg0.is_constant()
             || self
@@ -9489,8 +9489,8 @@ impl OptContext {
     /// through `_get_array_info` (`get_const_info_array_mut`) for the
     /// constant arg0 path so the const_infos slot is created as
     /// `PtrInfo::Array` rather than `PtrInfo::Instance`.
-    pub fn arrayinfo_setitem(&mut self, op: &Op, index: usize, value: OpRef) {
-        let value = self.materialize_operand_at(value);
+    pub fn arrayinfo_setitem(&mut self, op: &Op, index: usize, value: &Operand) {
+        let value = self.resolve_operand_operand(value);
         let arg0 = self.resolve_operand_operand(&op.arg(0));
         if arg0.is_constant() || arg0.const_value().is_some() {
             if let Some(descr) = op.getdescr()
@@ -12057,7 +12057,7 @@ mod imported_short_preamble_fallback_tests {
             same_as_source: None,
         };
 
-        let forced = ctx.force_op_from_preamble_op(&pop);
+        let forced = ctx.force_op_from_preamble_op(&pop).to_opref();
         assert_eq!(forced, OpRef::int_op(41));
 
         let sp = ctx

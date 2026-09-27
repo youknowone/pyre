@@ -67,18 +67,18 @@ struct KnownResultEntry {
 /// replaces that slot in place.
 #[derive(Clone, Debug)]
 enum PureRingValue {
-    Direct(OpRef),
+    Direct(Operand),
     Preamble {
         pop: PreambleOp,
-        forced: Option<OpRef>,
+        forced: Option<Operand>,
     },
 }
 
 impl PureRingValue {
-    fn as_direct(&self) -> Option<OpRef> {
+    fn as_direct(&self) -> Option<Operand> {
         match self {
-            Self::Direct(result) => Some(*result),
-            Self::Preamble { forced, .. } => *forced,
+            Self::Direct(result) => Some(result.clone()),
+            Self::Preamble { forced, .. } => forced.clone(),
         }
     }
 }
@@ -105,7 +105,7 @@ impl RecentPureOps {
     }
 
     /// pure.py — add(op): record a pure operation result.
-    fn insert(&mut self, key: PureOpKey<Operand>, result: OpRef) {
+    fn insert(&mut self, key: PureOpKey<Operand>, result: Operand) {
         self.insert_value(key, PureRingValue::Direct(result));
     }
 
@@ -147,7 +147,7 @@ impl RecentPureOps {
         op: &Op,
         ctx: &mut OptContext,
         commutative: bool,
-    ) -> Option<(OpCode, OpRef)> {
+    ) -> Option<(OpCode, Operand)> {
         let index = self.find_index(op, ctx, commutative)?;
         self.force_at(index, ctx)
     }
@@ -212,21 +212,21 @@ impl RecentPureOps {
         })
     }
 
-    fn force_at(&mut self, index: usize, ctx: &mut OptContext) -> Option<(OpCode, OpRef)> {
+    fn force_at(&mut self, index: usize, ctx: &mut OptContext) -> Option<(OpCode, Operand)> {
         let (opcode, pop) = {
             let (key, value) = self.lst[index].as_ref()?;
             match value {
-                PureRingValue::Direct(result) => return Some((key.opcode, *result)),
+                PureRingValue::Direct(result) => return Some((key.opcode, result.clone())),
                 PureRingValue::Preamble {
                     pop,
                     forced: Some(result),
-                } => return Some((key.opcode, *result)),
+                } => return Some((key.opcode, result.clone())),
                 PureRingValue::Preamble { pop, forced: None } => (key.opcode, pop.clone()),
             }
         };
         let forced = ctx.force_op_from_preamble_op(&pop);
         if let Some((_, value)) = self.lst[index].as_mut() {
-            *value = PureRingValue::Direct(forced);
+            *value = PureRingValue::Direct(forced.clone());
         }
         Some((opcode, forced))
     }
@@ -241,7 +241,7 @@ impl RecentPureOps {
         arg0: Q,
         descr_identity: Option<usize>,
         same_box: impl Fn(Q, &Operand) -> bool,
-    ) -> Option<(OpCode, OpRef)> {
+    ) -> Option<(OpCode, Operand)> {
         for entry in &self.lst {
             let Some((k, result)) = entry else { break };
             if k.args.len() != 1 {
@@ -269,7 +269,7 @@ impl RecentPureOps {
         commutative: bool,
         resolve: impl Fn(&Operand) -> S,
         same_box: impl Fn(Q, &S) -> bool,
-    ) -> Option<(OpCode, OpRef)> {
+    ) -> Option<(OpCode, Operand)> {
         for entry in &self.lst {
             let Some((k, result)) = entry else { break };
             if k.args.len() != 2 {
@@ -304,11 +304,11 @@ pub(crate) fn shared_get_pure_result(
     table: &SharedPureOps,
     op: &Op,
     ctx: &mut OptContext,
-) -> Option<OpRef> {
+) -> Option<Operand> {
     let commutative = OptPure::is_commutative(op.opcode);
     let found = table.borrow_mut().lookup_forcing(op, ctx, commutative);
     found
-        .filter(|(_, result)| OptPure::matches_result_type(op, *result, ctx))
+        .filter(|(_, result)| OptPure::matches_result_type(op, result, ctx))
         .map(|(_, result)| result)
 }
 
@@ -359,12 +359,12 @@ impl RecentPureOpTable {
         op: &Op,
         ctx: &mut OptContext,
         commutative: bool,
-    ) -> Option<(OpCode, OpRef)> {
+    ) -> Option<(OpCode, Operand)> {
         self.bucket_mut(op.opcode)?
             .lookup_forcing(op, ctx, commutative)
     }
 
-    fn insert(&mut self, key: PureOpKey<Operand>, result: OpRef) {
+    fn insert(&mut self, key: PureOpKey<Operand>, result: Operand) {
         if let Some(bucket) = self.bucket_mut(key.opcode) {
             bucket.insert(key, result);
         }
@@ -389,7 +389,7 @@ impl RecentPureOpTable {
                     same_box(query, stored.to_opref())
                 })
             })
-            .map(|(_, result)| result)
+            .map(|(_, result)| result.to_opref())
     }
 
     fn lookup2(
@@ -412,7 +412,7 @@ impl RecentPureOpTable {
                     |query, stored| same_box(query, *stored),
                 )
             })
-            .map(|(_, result)| result)
+            .map(|(_, result)| result.to_opref())
     }
 
     #[allow(dead_code)] // pure.py OptPure.history length
@@ -535,22 +535,8 @@ impl OptPure {
 
     /// PyPy RecentPureOps stores AbstractResOp / Const boxes directly, so a
     /// reused result necessarily carries the same `box.type` as the query op.
-    /// majit's imported preamble caches store only OpRefs, so recover the
-    /// typed-constant path first (`ConstPtr(NULL)` etc.) before falling back
-    /// to opref_type metadata.
-    fn matches_result_type(op: &Op, result: OpRef, ctx: &OptContext) -> bool {
-        // Prefer the emitted producer's intrinsic type. Legacy contexts can
-        // reuse a positional index for an inputarg of a different bank.
-        if let Some(producer) = ctx.producer_in_new_operations(result) {
-            return Operand::from_bound_op(&producer)
-                .get_box_replacement(false)
-                .type_()
-                == op.result_type();
-        }
-        if let Some(result_box) = ctx.get_box_replacement_operand_opt(result) {
-            return result_box.type_() == op.result_type();
-        }
-        ctx.opref_type(result) == Some(op.result_type())
+    fn matches_result_type(op: &Op, result: &Operand, ctx: &OptContext) -> bool {
+        ctx.resolve_operand_operand(result).type_() == op.result_type()
     }
 
     /// Try to find a cached result for this operation, considering commutativity.
@@ -558,21 +544,23 @@ impl OptPure {
     /// pure.py `RecentPureOps.lookup` dispatches to `lookup1` /
     /// `lookup2` so that arg comparison goes through `box.same_box`.
     /// Resolve forwarding before comparing producer identity or constant value.
-    fn lookup_pure(&mut self, op: &Op, ctx: &mut OptContext) -> Option<(OpCode, OpRef)> {
+    fn lookup_pure(&mut self, op: &Op, ctx: &mut OptContext) -> Option<(OpCode, Operand)> {
         // pure.py — `commutative` is forwarded into `lookup2`,
         // which checks both `(arg0, arg1)` and `(arg1, arg0)` orderings.
         // A PreambleOp hit is forced and the ring slot replaced, as
         // RecentPureOps.force_preamble_op does.
         let commutative = Self::is_commutative(op.opcode);
         let found = self.cache.borrow_mut().lookup_forcing(op, ctx, commutative);
-        found.filter(|(_, result)| Self::matches_result_type(op, *result, ctx))
+        found.filter(|(_, result)| Self::matches_result_type(op, result, ctx))
     }
 
     /// Record a pure operation in the CSE cache.
     /// pure.py: pure(opnum, op)
-    pub fn pure(&mut self, op: &Op) {
+    pub fn pure(&mut self, op: &Op, op_rc: &majit_ir::OpRc) {
         let key = PureOpKey::from_operand_op(op);
-        self.cache.borrow_mut().insert(key, op.pos().get());
+        self.cache
+            .borrow_mut()
+            .insert(key, Operand::from_bound_op(op_rc));
     }
 
     /// Point `ctx` at this pass's ring. A history-length reset replaces the
@@ -590,7 +578,7 @@ impl OptPure {
     /// Record a pure operation with explicit args.
     /// `pure_from_args(opnum, args, op, descr=None)`: each key arg is
     /// `get_box_replacement(arg)`. The cache still stores the forwarded
-    /// box as an `OpRef` (`op` in the pure ring).
+    /// box (`op` in the pure ring).
     pub fn pure_from_args(
         &mut self,
         opcode: OpCode,
@@ -616,7 +604,7 @@ impl OptPure {
             descr_identity: None,
         };
         self.publish_pure_ops(ctx);
-        self.cache.borrow_mut().insert(key, result.to_opref());
+        self.cache.borrow_mut().insert(key, result.clone());
     }
 
     /// `pure_from_args1(opnum, arg0, op)`.
@@ -650,7 +638,7 @@ impl OptPure {
             descr_identity: Some(majit_ir::descr::descr_identity(&descr)),
         };
         self.publish_pure_ops(ctx);
-        self.cache.borrow_mut().insert(key, result.to_opref());
+        self.cache.borrow_mut().insert(key, result.clone());
     }
 
     /// `pure_from_args2(opnum, arg0, arg1, op)`.
@@ -667,7 +655,7 @@ impl OptPure {
 
     /// Look up a previously recorded pure operation result.
     /// pure.py: get_pure_result(op)
-    pub fn get_pure_result(&mut self, op: &Op, ctx: &mut OptContext) -> Option<OpRef> {
+    pub fn get_pure_result(&mut self, op: &Op, ctx: &mut OptContext) -> Option<Operand> {
         self.lookup_pure(op, ctx).map(|(_, result)| result)
     }
 
@@ -1059,7 +1047,7 @@ impl Optimization for OptPure {
                     && Self::_can_reuse_oldop(old_opcode, postponed.opcode, true)
                 {
                     let b_old = postponed_box.clone();
-                    let b_cached = ctx.get_box_replacement_operand(cached_ref);
+                    let b_cached = ctx.resolve_operand_operand(&cached_ref);
                     ctx.make_equal_to(&b_old, &b_cached);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
@@ -1074,8 +1062,8 @@ impl Optimization for OptPure {
                     postponed.setarg(i, ctx.materialize_operand_at(forced));
                 }
                 // Record and emit both the OVF op and the guard.
-                self.cache.borrow_mut().insert(key, postponed.pos().get());
-                // pure.py walks `_newoperations` for is_ovf followed
+                self.cache.borrow_mut().insert(key, postponed_box.clone());
+                // pure.py:321-322 walks `_newoperations` for is_ovf followed
                 // by GUARD_NO_OVERFLOW; do not keep a parallel candidate list.
                 self.emit_postponed_downstream(postponed, ctx);
                 return OptimizationResult::PassOn; // guard passes through
@@ -1160,8 +1148,7 @@ impl Optimization for OptPure {
                 // driver aborts the trace at its next barrier per
                 // `unroll.py:119-123`.
                 if let Some(folded_value) = ctx.constant_fold(op) {
-                    let b = ctx.materialize_operand_at(op.pos().get());
-                    ctx.make_constant_box(&b, folded_value);
+                    ctx.make_constant_box(&Operand::from_bound_op(op_rc), folded_value);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove;
                 }
@@ -1170,9 +1157,7 @@ impl Optimization for OptPure {
             // CSE: exact same operation already computed?
             if let Some((_, cached_ref)) = self.lookup_pure(op, ctx) {
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_cached = ctx
-                    .get_box_replacement_operand_opt(cached_ref)
-                    .unwrap_or_else(|| ctx.materialize_operand_at(cached_ref));
+                let b_cached = ctx.resolve_operand_operand(&cached_ref);
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -1257,7 +1242,7 @@ impl Optimization for OptPure {
             }
             if let Some((i, pop)) = matched {
                 let entry_result = if let Some(pop) = pop {
-                    let forced = ctx.force_op_from_preamble_op(&pop);
+                    let forced = ctx.force_op_from_preamble_op(&pop).to_opref();
                     let key = match &self.extra_call_pure[i] {
                         ExtraCallPureEntry::Preamble { key, .. } => key.clone(),
                         _ => unreachable!("matched index must still hold the Preamble entry"),
@@ -1365,12 +1350,12 @@ impl Optimization for OptPure {
     /// `_newoperations`, so `len - 1` is the call's final index — past any
     /// postponed op OptHeap flushed ahead of it. The one-shot armed in
     /// `optimize_call_pure` selects exactly the op this callback belongs to.
-    fn propagate_postprocess(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) {
+    fn propagate_postprocess(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) {
         self.publish_pure_ops(ctx);
         // pure.py DefaultOptimizationResult._callback: consumers need this
         // fact before a postponed comparison reaches Optimizer.emit.
         if op.opcode.returns_bool() {
-            let result = ctx.materialize_operand_at(op.pos().get());
+            let result = Operand::from_bound_op(op_rc);
             ctx.with_intbound_mut(&result, |bound| bound.make_bool());
         }
         // pure.py DefaultOptimizationResult._callback: `recentops.add(op)`
@@ -1378,7 +1363,7 @@ impl Optimization for OptPure {
         // missed when emit reminted the result pos, so the ring stayed empty
         // and identical IntEq never CSEd.
         if op.opcode.is_always_pure() {
-            self.pure(op);
+            self.pure(op, op_rc);
         }
         if self.pending_call_pure_position
             && (op.opcode.is_real_call() || op.opcode.is_cond_call_value())
@@ -1787,7 +1772,7 @@ mod tests {
             let mut cache = pass.cache.borrow_mut();
             let bucket = cache.buckets.iter_mut().flatten().next().unwrap();
             if let Some((_, PureRingValue::Preamble { forced, .. })) = &mut bucket.lst[0] {
-                *forced = Some(wrong.to_opref());
+                *forced = Some(wrong.clone());
             }
         }
         assert_eq!(pass.lookup_pure(&query, &mut ctx), None);
@@ -2168,9 +2153,9 @@ mod tests {
         };
         let first = make_arg();
         let different = make_arg();
-        let op = Op::new(OpCode::IntNeg, &[first]);
+        let op = OpRc::new(Op::new(OpCode::IntNeg, &[first]));
         op.pos().set(OpRef::int_op(4));
-        pass.pure(&op);
+        pass.pure(&op, &op);
         let query = Op::new(OpCode::IntNeg, &[different]);
         assert_eq!(pass.get_pure_result(&query, &mut ctx), None);
     }
@@ -2181,9 +2166,9 @@ mod tests {
         let mut pass = OptPure::new();
         let a = ctx.materialize_operand_at(OpRef::int_op(2));
         let b = ctx.materialize_operand_at(OpRef::int_op(3));
-        let op = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
+        let op = OpRc::new(Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]));
         op.pos().set(OpRef::int_op(4));
-        pass.pure(&op);
+        pass.pure(&op, &op);
         let stored = {
             let cache = pass.cache.borrow();
             cache.bucket(OpCode::IntAdd).unwrap().lst[0]
@@ -2203,7 +2188,7 @@ mod tests {
             &[Operand::const_from_value(Value::Int(7)), b],
         );
         assert_eq!(
-            pass.get_pure_result(&query, &mut ctx),
+            pass.get_pure_result(&query, &mut ctx).map(|r| r.to_opref()),
             Some(OpRef::int_op(4))
         );
     }
@@ -2220,7 +2205,14 @@ mod tests {
                 ],
                 descr_identity: None,
             },
-            OpRef::int_op(3),
+            {
+                let result = OpRc::new(Op::new(
+                    OpCode::SameAsI,
+                    &[Operand::const_from_value(Value::Int(3))],
+                ));
+                result.pos().set(OpRef::int_op(3));
+                Operand::from_bound_op(&result)
+            },
         );
         let resolved = std::cell::Cell::new(0);
         let result = recent.lookup2(
@@ -2234,7 +2226,10 @@ mod tests {
             },
             |query, stored| query == *stored,
         );
-        assert_eq!(result, Some((OpCode::IntAdd, OpRef::int_op(3))));
+        assert_eq!(
+            result.map(|(opcode, r)| (opcode, r.to_opref())),
+            Some((OpCode::IntAdd, OpRef::int_op(3)))
+        );
         assert_eq!(resolved.get(), 2);
     }
 
@@ -2782,7 +2777,7 @@ mod tests {
         );
         q.pos().set(OpRef::int_op(99));
         assert_eq!(
-            pass.get_pure_result(&q, &mut ctx),
+            pass.get_pure_result(&q, &mut ctx).map(|r| r.to_opref()),
             Some(OpRef::int_op(42)),
             "lookup_pure must use same_box for constant args (history.py:204)"
         );
@@ -2826,7 +2821,7 @@ mod tests {
         let mut q = Op::new(OpCode::IntAdd, &[b_query.clone(), b_other.clone()]);
         q.pos().set(OpRef::int_op(99));
         assert_eq!(
-            pass.get_pure_result(&q, &mut ctx),
+            pass.get_pure_result(&q, &mut ctx).map(|r| r.to_opref()),
             Some(result),
             "lookup_pure must apply get_box_replacement to query args"
         );
@@ -2845,9 +2840,9 @@ mod tests {
         let b40 = ctx.materialize_operand_at(OpRef::int_op(40));
 
         // Manually record a pure operation via the API
-        let mut op = Op::new(OpCode::IntAdd, &[b10.clone(), b20.clone()]);
+        let op = OpRc::new(Op::new(OpCode::IntAdd, &[b10.clone(), b20.clone()]));
         op.pos().set(OpRef::int_op(0));
-        pass.pure(&op);
+        pass.pure(&op, &op);
 
         // Should find it via get_pure_result
         let lookup_op = Op::new(OpCode::IntAdd, &[b10.clone(), b20.clone()]);
