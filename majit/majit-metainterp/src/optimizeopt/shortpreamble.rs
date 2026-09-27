@@ -2031,20 +2031,7 @@ impl AbstractShortPreambleBuilderState {
             if matches!(forwarded, majit_ir::forwarding::Forwarded::None) {
                 continue;
             }
-            // `AbstractShortPreambleBuilder.use_box`'s `arg.set_forwarded(None)`
-            // clears a replay op, which upstream never shares with the loop
-            // body. Here the arg can be the body box itself, whose `_forwarded`
-            // holds the info the body was optimized under (an array lenbound,
-            // cached fields); only the builder's `empty_info` marker is
-            // consumed, and `short_results` keeps the append single.
-            if matches!(
-                &dep.forwarded().borrow(),
-                majit_ir::forwarding::Forwarded::Info(crate::optimizeopt::info::OpInfo::EmptyInfo(
-                    _
-                ))
-            ) {
-                *dep.forwarded().borrow_mut() = majit_ir::forwarding::Forwarded::None;
-            }
+            *dep.forwarded().borrow_mut() = majit_ir::forwarding::Forwarded::None;
             let dep_canonical = dep.pos().get();
             if !self.short_results.contains(&dep_canonical)
                 && !already_in_short.contains(&dep_canonical)
@@ -2212,11 +2199,6 @@ impl ShortPreambleBuilder {
 
     pub fn note_known_constant(&mut self, opref: OpRef) {
         self.state.known_constants.insert(opref);
-    }
-
-    /// Whether `use_box` already appended the op at `opref` to `short`.
-    pub fn has_short_result(&self, opref: OpRef) -> bool {
-        self.state.short_results.contains(&opref)
     }
 
     fn use_box_recursive(
@@ -3455,54 +3437,6 @@ mod tests {
 
         assert_eq!(short_boxes.len(), 1);
         assert_eq!(short_boxes[0].kind, PreambleOpKind::InputArg);
-    }
-
-    /// shortpreamble.py `use_box` clears `arg`'s `_forwarded` because the arg
-    /// is a replay op the loop body never sees. When the arg is the body box
-    /// itself, its info (here the nonnull fact a later ARRAYLEN_GC bound and
-    /// loop-closing guard depend on) must survive; only the `empty_info`
-    /// marker a replay op carries is consumed. The dependency is still
-    /// appended once either way.
-    #[test]
-    fn use_box_keeps_the_body_info_of_a_dependency_arg() {
-        use crate::optimizeopt::info::{EmptyInfo, OpInfo, PtrInfo};
-        use majit_ir::forwarding::Forwarded;
-
-        let body_dep = rop(Type::Ref, 69);
-        let body_dep_op = body_dep.bound_op().expect("rooted resop");
-        *body_dep_op.forwarded().borrow_mut() = Forwarded::Info(OpInfo::ptr(PtrInfo::nonnull()));
-        let replay_dep = rop(Type::Ref, 70);
-        let replay_dep_op = replay_dep.bound_op().expect("rooted resop");
-        *replay_dep_op.forwarded().borrow_mut() = Forwarded::Info(OpInfo::EmptyInfo(EmptyInfo));
-
-        let mut consumer = Op::new(OpCode::PtrEq, &[body_dep.clone(), replay_dep.clone()]);
-        consumer.pos().set(OpRef::int_op(71));
-        let consumer = OpRc::new(consumer);
-
-        let mut state = AbstractShortPreambleBuilderState::default();
-        state.use_box(&consumer, &IndexSet::new(), &[], &[]);
-        state.use_box(&consumer, &IndexSet::new(), &[], &[]);
-
-        assert!(
-            matches!(
-                &body_dep_op.forwarded().borrow(),
-                Forwarded::Info(OpInfo::Ptr(_))
-            ),
-            "the body box keeps its optimizer info"
-        );
-        assert!(
-            matches!(&replay_dep_op.forwarded().borrow(), Forwarded::None),
-            "the replay op marker is consumed"
-        );
-        let short: Vec<OpRef> = state.short.iter().map(|op| op.pos().get()).collect();
-        assert_eq!(
-            short,
-            vec![
-                body_dep.to_opref(),
-                replay_dep.to_opref(),
-                OpRef::int_op(71)
-            ]
-        );
     }
 
     #[test]
