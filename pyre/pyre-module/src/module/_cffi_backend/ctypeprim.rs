@@ -223,7 +223,7 @@ pub fn cast(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyEr
 }
 
 /// `W_CTypePrimitive.cast` — everything that ends up in an integer slot.
-fn cast_integer(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyError> {
+fn cast_integer(mut w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(w_ctype)?;
     let value = if let Some(source) = W_CData::from_obj(w_ob)
         && ctypeobj::ctype_at(source.ctype).is_some_and(|it| it.is_ptr_or_array())
@@ -235,9 +235,9 @@ fn cast_integer(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, 
         cast_result(ct, u64::from(cast_unicode(ct, w_ob)?))
     } else if ct.kind == ctypeobj::KIND_PRIM_BOOL {
         // `W_CTypePrimitiveBool._cast_generic`.
-        u64::from(misc::object_as_bool(w_ob)?)
+        u64::from(pyre_object::with_roots!(w_ctype => misc::object_as_bool(w_ob))?)
     } else {
-        misc::as_unsigned_long_long(w_ob, false)?
+        pyre_object::with_roots!(w_ctype => misc::as_unsigned_long_long(w_ob, false))?
     };
     let w_cdata = cdataobj::new_cdata_mem(w_ctype)?;
     let cdata = W_CData::from_obj(w_cdata).expect("new_cdata_mem returns a cdata");

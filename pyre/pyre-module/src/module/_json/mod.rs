@@ -57,11 +57,13 @@ fn index_i64(obj: PyObjectRef) -> Result<i64, PyError> {
     pyre_interpreter::baseobjspace::int_w(indexed)
 }
 
-fn json_decode_error(msg: String, doc: PyObjectRef, pos: usize) -> PyError {
-    let Some(module) = pyre_interpreter::importing::get_sys_module("json.decoder") else {
+fn json_decode_error(msg: String, mut doc: PyObjectRef, pos: usize) -> PyError {
+    let Some(module) = pyre_object::with_roots!(doc => pyre_interpreter::importing::get_sys_module("json.decoder"))
+    else {
         return PyError::value_error(format!("{msg}: line 1 column 1 (char {pos})"));
     };
-    let Ok(class) = pyre_interpreter::baseobjspace::getattr_str(module, "JSONDecodeError") else {
+    let Ok(class) = pyre_object::with_roots!(doc => pyre_interpreter::baseobjspace::getattr_str(module, "JSONDecodeError"))
+    else {
         return PyError::value_error(format!("{msg}: line 1 column 1 (char {pos})"));
     };
     let args = [
@@ -82,7 +84,7 @@ fn encode_basestring_impl(obj: PyObjectRef, ascii_only: bool) -> PyResult {
     ))
 }
 
-fn scanstring_impl(doc: PyObjectRef, end: i64, strict_obj: PyObjectRef) -> PyResult {
+fn scanstring_impl(mut doc: PyObjectRef, end: i64, strict_obj: PyObjectRef) -> PyResult {
     let value = require_string(doc)?;
     // `py_scanstring` bounds `end` against the code point count before using
     // it.  `w_str_index_to_byte` takes an index in range, so the upper bound
@@ -91,7 +93,8 @@ fn scanstring_impl(doc: PyObjectRef, end: i64, strict_obj: PyObjectRef) -> PyRes
     if end < 0 || end as usize > unsafe { pyre_object::w_str_len(doc) } {
         return Err(PyError::value_error("end is out of bounds"));
     }
-    let strict = pyre_interpreter::baseobjspace::is_true(strict_obj)?;
+    let strict =
+        pyre_object::with_roots!(doc => pyre_interpreter::baseobjspace::is_true(strict_obj))?;
     let start = end as usize;
     let byte_start = unsafe { pyre_object::w_str_index_to_byte(doc, start) };
     let rest = value.get(byte_start..).ok_or_else(|| {
@@ -713,10 +716,10 @@ mod encoder_class {
     impl W_Encoder {
         fn __call__(
             &mut self,
-            obj: PyObjectRef,
+            mut obj: PyObjectRef,
             level: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
-            let level = index_i64(level)?;
+            let level = pyre_object::with_roots!(obj => index_i64(level))?;
             encoder_call_impl(self as *mut Self as PyObjectRef, obj, level)
         }
 
@@ -781,7 +784,7 @@ fn append_python_string(out: &mut rustpython_wtf8::Wtf8Buf, obj: PyObjectRef) ->
 fn encode_string_field(
     self_obj: PyObjectRef,
     out: &mut rustpython_wtf8::Wtf8Buf,
-    obj: PyObjectRef,
+    mut obj: PyObjectRef,
 ) -> PyResult {
     let mode = W_Encoder::from_obj(self_obj)
         .expect("Encoder payload")
@@ -790,21 +793,21 @@ fn encode_string_field(
         out.push_wtf8(&machinery::encode_string(require_string(obj)?, mode == 0));
         return Ok(pyre_object::w_none());
     }
-    let encoder = encoder_attr(self_obj, "encoder")?;
+    let encoder = pyre_object::with_roots!(obj => encoder_attr(self_obj, "encoder"))?;
     let encoded = pyre_interpreter::call::call_function_impl_result(encoder, &[obj])?;
     append_python_string(out, encoded)
 }
 
-fn base_repr(obj: PyObjectRef, ty: &pyre_object::PyType) -> PyResult {
+fn base_repr(mut obj: PyObjectRef, ty: &pyre_object::PyType) -> PyResult {
     let w_type = pyre_interpreter::typedef::gettypeobject(ty);
-    let repr = pyre_interpreter::baseobjspace::getattr_str(w_type, "__repr__")?;
+    let repr = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::getattr_str(w_type, "__repr__"))?;
     pyre_interpreter::call::call_function_impl_result(repr, &[obj])
 }
 
 fn encode_float(
     self_obj: PyObjectRef,
     out: &mut rustpython_wtf8::Wtf8Buf,
-    obj: PyObjectRef,
+    mut obj: PyObjectRef,
 ) -> PyResult {
     let value = unsafe { pyre_object::w_float_get_value(obj) };
     if value.is_finite() {
@@ -817,7 +820,8 @@ fn encode_float(
     } else {
         "-Infinity"
     };
-    if !pyre_interpreter::baseobjspace::is_true(encoder_attr(self_obj, "allow_nan")?)? {
+    let allow_nan = pyre_object::with_roots!(obj => encoder_attr(self_obj, "allow_nan"))?;
+    if !pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::is_true(allow_nan))? {
         let repr = base_repr(obj, &pyre_object::FLOAT_TYPE)?;
         let repr = pyre_interpreter::baseobjspace::text_w(repr)?.to_owned();
         return Err(PyError::value_error(format!(
@@ -866,7 +870,7 @@ fn short_type_name(obj: PyObjectRef) -> String {
 }
 
 fn encode_child(
-    self_obj: PyObjectRef,
+    mut self_obj: PyObjectRef,
     obj: PyObjectRef,
     level: i64,
 ) -> Result<rustpython_wtf8::Wtf8Buf, PyError> {
@@ -882,27 +886,27 @@ fn encode_child(
         ));
     }
     encoder.depth = depth + 1;
-    let result = encode_value(self_obj, obj, level);
+    let result = pyre_object::with_roots!(self_obj => encode_value(self_obj, obj, level));
     W_Encoder::from_obj(self_obj)
         .expect("Encoder payload")
         .depth = depth;
     result
 }
 
-fn marker_key(obj: PyObjectRef) -> PyObjectRef {
-    pyre_interpreter::function::immutable_unique_id(obj)
+fn marker_key(mut obj: PyObjectRef) -> PyObjectRef {
+    pyre_object::with_roots!(obj => pyre_interpreter::function::immutable_unique_id(obj))
         .unwrap_or_else(|| pyre_object::w_int_new(obj as usize as i64))
 }
 
 fn with_marker<F>(
-    self_obj: PyObjectRef,
-    obj: PyObjectRef,
+    mut self_obj: PyObjectRef,
+    mut obj: PyObjectRef,
     encode: F,
 ) -> Result<rustpython_wtf8::Wtf8Buf, PyError>
 where
     F: FnOnce(PyObjectRef, PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyError>,
 {
-    let markers = encoder_attr(self_obj, "markers")?;
+    let markers = pyre_object::with_roots!(obj, self_obj => encoder_attr(self_obj, "markers"))?;
     if unsafe { pyre_object::is_none(markers) } {
         return encode(self_obj, obj);
     }
@@ -977,17 +981,20 @@ fn encode_value(
                 encode_dict(self_obj, obj, level)
             });
         } else {
-            return with_marker(self_obj, obj, |self_obj, obj| {
-                let default = encoder_attr(self_obj, "default")?;
+            return with_marker(self_obj, obj, |mut self_obj, mut obj| {
+                let default =
+                    pyre_object::with_roots!(obj, self_obj => encoder_attr(self_obj, "default"))?;
                 // `_default` exceptions propagate bare; errors while
                 // encoding its returned object gain context for the source.
-                let converted = pyre_interpreter::call::call_function_impl_result(default, &[obj])?;
-                encode_child(self_obj, converted, level).map_err(|err| {
-                    add_json_note(
-                        err,
-                        format!("when serializing {} object", short_type_name(obj)),
-                    )
-                })
+                let converted = pyre_object::with_roots!(obj, self_obj => pyre_interpreter::call::call_function_impl_result(default, &[obj]))?;
+                pyre_object::with_roots!(obj => encode_child(self_obj, converted, level)).map_err(
+                    |err| {
+                        add_json_note(
+                            err,
+                            format!("when serializing {} object", short_type_name(obj)),
+                        )
+                    },
+                )
             });
         }
     }
@@ -1070,7 +1077,7 @@ fn encode_sequence(
     Ok(out)
 }
 
-fn coerce_key(self_obj: PyObjectRef, key: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+fn coerce_key(self_obj: PyObjectRef, mut key: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     unsafe {
         if is_instance(key, &pyre_object::STR_TYPE) {
             return Ok(Some(key));
@@ -1096,7 +1103,8 @@ fn coerce_key(self_obj: PyObjectRef, key: PyObjectRef) -> Result<Option<PyObject
             return Ok(Some(pyre_object::w_str_from_wtf8_managed(out)));
         }
     }
-    if pyre_interpreter::baseobjspace::is_true(encoder_attr(self_obj, "skipkeys")?)? {
+    let skipkeys = pyre_object::with_roots!(key => encoder_attr(self_obj, "skipkeys"))?;
+    if pyre_object::with_roots!(key => pyre_interpreter::baseobjspace::is_true(skipkeys))? {
         Ok(None)
     } else {
         Err(PyError::type_error(format!(
@@ -1236,15 +1244,15 @@ fn encoder_call_impl(self_obj: PyObjectRef, obj: PyObjectRef, level: i64) -> PyR
 
 #[allow(clippy::too_many_arguments)]
 fn make_encoder_impl(
-    markers: PyObjectRef,
-    default: PyObjectRef,
-    encoder: PyObjectRef,
-    indent: PyObjectRef,
-    key_separator: PyObjectRef,
-    item_separator: PyObjectRef,
+    mut markers: PyObjectRef,
+    mut default: PyObjectRef,
+    mut encoder: PyObjectRef,
+    mut indent: PyObjectRef,
+    mut key_separator: PyObjectRef,
+    mut item_separator: PyObjectRef,
     sort_keys: PyObjectRef,
-    skipkeys: PyObjectRef,
-    allow_nan: PyObjectRef,
+    mut skipkeys: PyObjectRef,
+    mut allow_nan: PyObjectRef,
 ) -> PyResult {
     if !unsafe { pyre_object::is_none(markers) } && !is_instance(markers, &pyre_object::DICT_TYPE) {
         return Err(PyError::type_error(format!(
@@ -1257,9 +1265,15 @@ fn make_encoder_impl(
     if !unsafe { pyre_object::is_none(indent) } {
         require_string(indent)?;
     }
-    let sort_keys = pyre_object::w_bool_from(pyre_interpreter::baseobjspace::is_true(sort_keys)?);
-    let skipkeys = pyre_object::w_bool_from(pyre_interpreter::baseobjspace::is_true(skipkeys)?);
-    let allow_nan = pyre_object::w_bool_from(pyre_interpreter::baseobjspace::is_true(allow_nan)?);
+    let mut sort_keys = pyre_object::w_bool_from(
+        pyre_object::with_roots!(allow_nan, default, encoder, indent, item_separator, key_separator, markers, skipkeys => pyre_interpreter::baseobjspace::is_true(sort_keys))?,
+    );
+    let mut skipkeys = pyre_object::w_bool_from(
+        pyre_object::with_roots!(allow_nan, default, encoder, indent, item_separator, key_separator, markers, sort_keys => pyre_interpreter::baseobjspace::is_true(skipkeys))?,
+    );
+    let allow_nan = pyre_object::w_bool_from(
+        pyre_object::with_roots!(default, encoder, indent, item_separator, key_separator, markers, skipkeys, sort_keys => pyre_interpreter::baseobjspace::is_true(allow_nan))?,
+    );
 
     let fast_mode = fast_encode_mode(encoder);
 
@@ -1389,11 +1403,11 @@ pyre_interpreter::py_module! {
         }
 
         fn scanstring(
-            string: PyObjectRef,
+            mut string: PyObjectRef,
             end: PyObjectRef,
-            #[default(pyre_object::w_bool_from(true))] strict: PyObjectRef,
+            #[default(pyre_object::w_bool_from(true))] mut strict: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
-            let end = index_i64(end)?;
+            let end = pyre_object::with_roots!(strict, string => index_i64(end))?;
             scanstring_impl(string, end, strict)
         }
 

@@ -104,8 +104,8 @@ fn semlock_set_i64(obj: PyObjectRef, key: &str, value: i64) {
 
 /// `interp_semaphore.py W_SemLock._ismine`.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
-fn semlock_ismine(obj: PyObjectRef) -> bool {
-    semlock_get_i64(obj, "count") > 0
+fn semlock_ismine(mut obj: PyObjectRef) -> bool {
+    pyre_object::with_roots!(obj => semlock_get_i64(obj, "count")) > 0
         && pyre_interpreter::module::thread::current_ident() == semlock_get_i64(obj, "last_tid")
 }
 
@@ -673,7 +673,7 @@ fn semlock_instance(
 /// its own argument.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 fn semlock_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let Some((&w_subtype, rest)) = args.split_first() else {
+    let Some((&(mut w_subtype), rest)) = args.split_first() else {
         return Err(pyre_interpreter::PyError::type_error(
             "_multiprocessing.SemLock.__new__(): not enough arguments",
         ));
@@ -684,20 +684,24 @@ fn semlock_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpret
         &[true; 5],
         "SemLock",
     )?;
-    let kind = pyre_interpreter::builtins::space_index_w(scope[0])?;
-    let value = pyre_interpreter::builtins::space_index_w(scope[1])?;
-    let maxvalue = pyre_interpreter::builtins::space_index_w(scope[2])?;
+    let kind =
+        pyre_object::with_roots!(w_subtype => pyre_interpreter::builtins::space_index_w(scope[0]))?;
+    let value =
+        pyre_object::with_roots!(w_subtype => pyre_interpreter::builtins::space_index_w(scope[1]))?;
+    let maxvalue =
+        pyre_object::with_roots!(w_subtype => pyre_interpreter::builtins::space_index_w(scope[2]))?;
     if !unsafe { is_str(scope[3]) } {
         let type_name = pyre_interpreter::type_methods::clinic_arg_type_name(scope[3]);
         return Err(pyre_interpreter::PyError::type_error(format!(
             "SemLock() argument 'name' must be str, not {type_name}"
         )));
     }
-    let name = pyre_interpreter::baseobjspace::str_utf8_w(scope[3])?.to_string();
+    let name = pyre_object::with_roots!(w_subtype => pyre_interpreter::baseobjspace::str_utf8_w(scope[3]))?.to_string();
     // `unwrap_spec(unlink=int)` (interp_semaphore.py:572) — the flag is
     // converted the same way `kind`, `value` and `maxvalue` beside it are,
     // so a type whose `__bool__` and `__index__` disagree does not decide it.
-    let unlink = pyre_interpreter::builtins::space_index_w(scope[4])? != 0;
+    let unlink = pyre_object::with_roots!(w_subtype => pyre_interpreter::builtins::space_index_w(scope[4]))?
+        != 0;
     // interp_semaphore.py:574-575.
     if kind != RECURSIVE_MUTEX && kind != SEMAPHORE {
         return Err(pyre_interpreter::PyError::value_error("unrecognized kind"));
@@ -715,21 +719,25 @@ fn semlock_rebuild(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter
             "_rebuild() takes exactly 4 arguments",
         ));
     }
-    let w_cls = args[0];
-    let kind = pyre_interpreter::baseobjspace::int_w(args[2])?;
-    let maxvalue = pyre_interpreter::baseobjspace::int_w(args[3])?;
+    let mut w_cls = args[0];
+    let kind = pyre_object::with_roots!(w_cls => pyre_interpreter::baseobjspace::int_w(args[2]))?;
+    let maxvalue =
+        pyre_object::with_roots!(w_cls => pyre_interpreter::baseobjspace::int_w(args[3]))?;
     // `unwrap_spec(name='text_or_none')` — an unlinked semaphore carries no
     // name and travels as its raw handle instead.
     let name = if unsafe { is_none(args[4]) } {
         None
     } else if unsafe { is_str(args[4]) } {
-        Some(pyre_interpreter::baseobjspace::str_utf8_w(args[4])?.to_string())
+        Some(
+            pyre_object::with_roots!(w_cls => pyre_interpreter::baseobjspace::str_utf8_w(args[4]))?
+                .to_string(),
+        )
     } else {
         return Err(pyre_interpreter::PyError::type_error(
             "_rebuild() argument 'name' must be str or None",
         ));
     };
-    let raw = semlock_rebuild_raw(args[1], name.as_deref())?;
+    let raw = pyre_object::with_roots!(w_cls => semlock_rebuild_raw(args[1], name.as_deref()))?;
     semlock_instance(w_cls, raw, kind, maxvalue, name)
 }
 
@@ -738,14 +746,14 @@ pyre_interpreter::py_class! {
     "SemLock",
     methods: {
         fn acquire(
-            self_obj: PyObjectRef,
+            mut self_obj: PyObjectRef,
             blocking: Option<i64>,
             timeout: Option<PyObjectRef>,
         ) -> Result<bool, pyre_interpreter::PyError> {
             let block = blocking.map(|v| v != 0).unwrap_or(true);
             let timeout = match timeout {
                 Some(value) if unsafe { !is_none(value) } => {
-                    Some(pyre_interpreter::baseobjspace::float_w(value)?)
+                    Some(pyre_object::with_roots!(self_obj => pyre_interpreter::baseobjspace::float_w(value))?)
                 }
                 _ => None,
             };

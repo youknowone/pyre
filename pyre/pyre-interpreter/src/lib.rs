@@ -323,7 +323,7 @@ macro_rules! py_module {
     ) => {
         #[allow(dead_code)]
         pub fn init(
-            ns: ::pyre_object::PyObjectRef,
+            mut ns: ::pyre_object::PyObjectRef,
         ) -> ::std::result::Result<(), $crate::PyError> {
             let _name = $name;
             $($(
@@ -348,14 +348,14 @@ macro_rules! py_module {
             // stored in the module dict.  The RHS is the base class
             // expression, e.g. `lookup_exc_class("OSError").unwrap()`.
             $($(
-                $crate::module_ns_store(
-                    ns, $exc_key,
-                    $crate::builtins::new_exception_class(
+                {
+                    let w_exc = ::pyre_object::with_roots!(ns => $crate::builtins::new_exception_class(
                         ::std::concat!($name, ".", $exc_key),
                         $crate::builtins::exc_exception_new,
                         $exc_base,
-                    ),
-                );
+                    ));
+                    $crate::module_ns_store(ns, $exc_key, w_exc);
+                }
             )*)?
             // appleveldefs: bundle Python source via `include_str!` at
             // compile time, then resolve each name through
@@ -364,13 +364,13 @@ macro_rules! py_module {
             // .py file is statically linked into the binary rather than
             // read off the filesystem at module-init time.
             $($(
-                $crate::importing::appleveldef_install(
+                ::pyre_object::with_roots!(ns => $crate::importing::appleveldef_install(
                     ns,
                     include_str!($appfile),
                     $appfile,
                     $name,
                     &[ $( $appname ),* ],
-                )?;
+                ))?;
             )*)?
             // inline_app: PyPy `applevel(r'''…''')` (gateway.py) —
             // embed a Python snippet inline; the runtime executes it the
@@ -379,13 +379,13 @@ macro_rules! py_module {
             // file.  Names listed in the `=> [...]` brackets get copied
             // out of the app namespace into the module dict.
             $($(
-                $crate::importing::appleveldef_install(
+                ::pyre_object::with_roots!(ns => $crate::importing::appleveldef_install(
                     ns,
                     $inline_src,
                     "<inline>",
                     $name,
                     &[ $( $inline_name ),* ],
-                )?;
+                ))?;
             )*)?
             // inline_functions: `#[pyre_function]` typed defs whose name +
             // arity are derived from the signature.  Replaces the

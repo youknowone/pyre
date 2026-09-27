@@ -453,9 +453,9 @@ fn call_method_with_raw_kwargs(
 /// boundary.  Neither bridge above broadens PyPy's ordinary Arguments path:
 /// each still proves the live AST owner descriptor before invoking a body.
 pub(crate) fn call_with_raw_kwargs(
-    callable: PyObjectRef,
+    mut callable: PyObjectRef,
     positional: &[PyObjectRef],
-    kwargs: PyObjectRef,
+    mut kwargs: PyObjectRef,
 ) -> Option<crate::PyResult> {
     if !unsafe { pyre_object::is_dict(kwargs) } {
         return None;
@@ -471,7 +471,7 @@ pub(crate) fn call_with_raw_kwargs(
     if !has_non_text_key {
         return None;
     }
-    if let Some(result) = call_type_with_raw_kwargs(callable, positional, kwargs) {
+    if let Some(result) = pyre_object::with_roots!(callable, kwargs => call_type_with_raw_kwargs(callable, positional, kwargs)) {
         return Some(result);
     }
     call_method_with_raw_kwargs(callable, positional, kwargs)
@@ -1632,8 +1632,8 @@ fn build_ast_types() -> Vec<(&'static str, PyObjectRef)> {
 /// (`class Suite(mod)`) and monkeypatch them (`Tuple.dims = property(...)`),
 /// matching CPython where `_ast` types are heap types. Compiler-native Ruff
 /// nodes are converted to instances of these public types by `convert.rs`.
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
-    let state = ast_state();
+pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+    let state = pyre_object::with_roots!(ns => ast_state());
     // `module_ns_store` allocates the key, so the entry is read back out of the
     // run on each pass rather than held as a view across the stores.
     let (entries, len) = unsafe { ((*state).entries, (*state).len) };

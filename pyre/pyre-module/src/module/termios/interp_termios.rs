@@ -42,7 +42,7 @@ fn termios_converted_error(errno: i32) -> pyre_interpreter::PyError {
 /// `cfgetospeed` calls are direct wrappers.  All constants come from
 /// `rustpython_host_env::termios::*` so the values match the platform.
 #[cfg(all(unix, feature = "host_env"))]
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     use rustpython_host_env::termios as host_termios;
 
     fn make_cc_bytes(cc: &[libc::cc_t]) -> pyre_object::PyObjectRef {
@@ -879,11 +879,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     // it as the class to raise, which is what `except termios.error` catches.
     let w_exception = pyre_interpreter::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before termios init");
-    let w_error = pyre_interpreter::builtins::new_exception_class(
+    let w_error = pyre_object::with_roots!(ns => pyre_interpreter::builtins::new_exception_class(
         "termios.error",
         pyre_interpreter::builtins::exc_exception_new,
         w_exception,
-    );
+    ));
     pyre_interpreter::module_ns_store(ns, "error", w_error);
     Ok(())
 }

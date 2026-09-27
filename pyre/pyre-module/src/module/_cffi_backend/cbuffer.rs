@@ -29,10 +29,10 @@ pub fn mini_buffer_params(w_obj: PyObjectRef) -> Option<(*mut u8, usize)> {
 
 /// `cbuffer.py MiniBuffer___new__`.
 fn mini_buffer_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_cdata = *args
+    let mut w_cdata = *args
         .get(1)
         .ok_or_else(|| PyError::type_error("buffer() missing cdata argument"))?;
-    let cdata = cdataobj::cdata_arg(w_cdata)?;
+    let cdata = pyre_object::with_roots!(w_cdata => cdataobj::cdata_arg(w_cdata))?;
     let ct = ctypeobj::ctype_at(cdata.ctype)
         .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
     // The signature binder pads an omitted optional argument with `PY_NULL`.
@@ -40,7 +40,9 @@ fn mini_buffer_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // app-level argument to `MiniBuffer___new__`.
     let explicit_size = args.get(2).is_some_and(|value| !value.is_null());
     let mut size = match args.get(2) {
-        Some(&w_size) if !w_size.is_null() => pyre_interpreter::baseobjspace::int_w(w_size)?,
+        Some(&w_size) if !w_size.is_null() => {
+            pyre_object::with_roots!(w_cdata => pyre_interpreter::baseobjspace::int_w(w_size))?
+        }
         None => -1,
         Some(_) => -1,
     };
@@ -51,7 +53,7 @@ fn mini_buffer_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
                     && ctypeobj::ctype_at(structobj.ctype)
                         .is_some_and(|item| item.is_struct_or_union())
                 {
-                    size = cdataobj::cdata_sizeof(structobj as *mut _ as PyObjectRef)?;
+                    size = pyre_object::with_roots!(w_cdata => cdataobj::cdata_sizeof(structobj as *mut _ as PyObjectRef))?;
                 }
                 if size < 0 {
                     size = super::ctypeptr::item_of(ct)?.size;
@@ -60,7 +62,7 @@ fn mini_buffer_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         }
         ctypeobj::KIND_ARRAY => {
             if size < 0 {
-                size = cdataobj::cdata_sizeof(w_cdata)?;
+                size = pyre_object::with_roots!(w_cdata => cdataobj::cdata_sizeof(w_cdata))?;
             }
         }
         _ => {
@@ -77,15 +79,15 @@ fn mini_buffer_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         )));
     }
     if explicit_size {
-        let max_size = cdataobj::maximum_buffer_size(w_cdata)?;
+        let max_size = pyre_object::with_roots!(w_cdata => cdataobj::maximum_buffer_size(w_cdata))?;
         if max_size >= 0 && size > max_size {
-            pyre_interpreter::warn::warn_category(
+            pyre_object::with_roots!(w_cdata => pyre_interpreter::warn::warn_category(
                 &format!(
                     "ffi.buffer(cdata, bytes): creating a buffer of {size} bytes over a cdata that owns only {max_size} bytes.  This will crash if you access the extra memory"
                 ),
                 "UserWarning",
                 1,
-            )?;
+            ))?;
         }
     }
     let roots = pyre_object::gc_roots::push_roots();

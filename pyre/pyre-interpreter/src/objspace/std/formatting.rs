@@ -946,7 +946,7 @@ unsafe fn arg_to_bigint(obj: PyObjectRef) -> BigInt {
 
 /// `fmt_d / fmt_i / fmt_u` argument coercion — `%d`/`%i`/`%u` accept any
 /// integer, a float (truncated), or an object with `__index__` / `__int__`.
-unsafe fn number_arg_decimal(spec: &CFormatSpec, obj: PyObjectRef) -> Result<BigInt, PyError> {
+unsafe fn number_arg_decimal(spec: &CFormatSpec, mut obj: PyObjectRef) -> Result<BigInt, PyError> {
     if is_int_like(obj) || is_long(obj) {
         return Ok(arg_to_bigint(obj));
     }
@@ -958,7 +958,7 @@ unsafe fn number_arg_decimal(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Big
         return Ok(arg_to_bigint(pyint));
     }
     if let Some(method) = crate::baseobjspace::lookup(obj, "__int__") {
-        let r = crate::builtins::call_and_check(method, &[obj])?;
+        let r = pyre_object::with_roots!(obj => crate::builtins::call_and_check(method, &[obj]))?;
         if is_int_like(r) || is_long(r) {
             return Ok(arg_to_bigint(r));
         }
@@ -967,7 +967,7 @@ unsafe fn number_arg_decimal(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Big
         // `format_num_helper`: a TypeError from the numeric decoder (a non-int
         // `__index__` return included) is reported as the operand-type error,
         // naming the original argument, not the coerced result.
-        return match crate::baseobjspace::space_index(obj) {
+        return match pyre_object::with_roots!(obj => crate::baseobjspace::space_index(obj)) {
             Ok(w) => Ok(crate::builtins::obj_to_bigint(w)),
             Err(e) if e.kind == crate::PyErrorKind::TypeError => {
                 Err(number_type_error(spec, obj, "a real number is required"))
@@ -980,14 +980,14 @@ unsafe fn number_arg_decimal(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Big
 
 /// `fmt_x / fmt_X / fmt_o` argument coercion — the radix conversions accept
 /// an integer or an `__index__` object, but not a float.
-unsafe fn number_arg_integer(spec: &CFormatSpec, obj: PyObjectRef) -> Result<BigInt, PyError> {
+unsafe fn number_arg_integer(spec: &CFormatSpec, mut obj: PyObjectRef) -> Result<BigInt, PyError> {
     if is_int_like(obj) || is_long(obj) {
         return Ok(arg_to_bigint(obj));
     }
     if has_dunder(obj, "__index__") {
         // `format_num_helper` (maybe_index): a TypeError from `space.index`
         // is reported as the operand-type error naming the original argument.
-        return match crate::baseobjspace::space_index(obj) {
+        return match pyre_object::with_roots!(obj => crate::baseobjspace::space_index(obj)) {
             Ok(w) => Ok(crate::builtins::obj_to_bigint(w)),
             Err(e) if e.kind == crate::PyErrorKind::TypeError => {
                 Err(number_type_error(spec, obj, "an integer is required"))

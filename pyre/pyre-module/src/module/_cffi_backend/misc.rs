@@ -431,8 +431,9 @@ fn is_a_float(w_ob: PyObjectRef) -> bool {
 
 /// `misc.py as_long`.  Accepts an `int`, and anything with `__index__`;
 /// refuses a float.
-pub fn as_long(w_ob: PyObjectRef) -> Result<i64, PyError> {
-    match pyre_interpreter::baseobjspace::int_w_allow_conversion(w_ob, false) {
+pub fn as_long(mut w_ob: PyObjectRef) -> Result<i64, PyError> {
+    match pyre_object::with_roots!(w_ob => pyre_interpreter::baseobjspace::int_w_allow_conversion(w_ob, false))
+    {
         Ok(value) => return Ok(value),
         Err(e) => {
             // `space.int_w(w_ob, allow_conversion=False)` runs no
@@ -457,8 +458,9 @@ pub fn as_long_long(w_ob: PyObjectRef) -> Result<i64, PyError> {
 /// `misc.py as_unsigned_long_long`.  `strict` reports an out-of-range value
 /// as `OverflowError`; otherwise the value is masked and a float rounded
 /// down, which is what an explicit `ffi.cast()` asks for.
-pub fn as_unsigned_long_long(w_ob: PyObjectRef, strict: bool) -> Result<u64, PyError> {
-    match pyre_interpreter::baseobjspace::int_w_allow_conversion(w_ob, false) {
+pub fn as_unsigned_long_long(mut w_ob: PyObjectRef, strict: bool) -> Result<u64, PyError> {
+    match pyre_object::with_roots!(w_ob => pyre_interpreter::baseobjspace::int_w_allow_conversion(w_ob, false))
+    {
         Ok(value) => {
             if strict && value < 0 {
                 return Err(PyError::overflow_error(NEG_MSG));
@@ -574,7 +576,7 @@ fn standard_object_as_bool(w_ob: PyObjectRef) -> Option<bool> {
 
 /// `misc.py dlopen_w` — the name to report the library by, the loader handle,
 /// and whether closing the library is this object's to do.
-pub fn dlopen_w(w_filename: PyObjectRef, flags: i64) -> Result<(String, usize, bool), PyError> {
+pub fn dlopen_w(mut w_filename: PyObjectRef, flags: i64) -> Result<(String, usize, bool), PyError> {
     use super::cdataobj::W_CData;
     use super::ctypeobj;
 
@@ -598,7 +600,9 @@ pub fn dlopen_w(w_filename: PyObjectRef, flags: i64) -> Result<(String, usize, b
     let fname = if is_none {
         "<None>".to_string()
     } else {
-        pyre_interpreter::gateway::fsdecode_os_str_wtf8(&filename_of(w_filename)?).to_string()
+        let filename = pyre_object::with_roots!(w_filename => filename_of(w_filename))?;
+        pyre_object::with_roots!(w_filename => pyre_interpreter::gateway::fsdecode_os_str_wtf8(&filename))
+            .to_string()
     };
     let handle = open_library(w_filename, is_none, flags, &fname)?;
     Ok((fname, handle, true))

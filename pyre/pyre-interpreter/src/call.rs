@@ -1208,19 +1208,18 @@ enum PreparedUserCall {
 #[inline(never)]
 fn prepare_user_call(
     execution_context: *const crate::PyExecutionContext,
-    callable: PyObjectRef,
+    mut callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> Result<PreparedUserCall, crate::PyError> {
-    let w_code = unsafe { crate::getcode(callable) };
-    let w_globals = unsafe { function_get_globals_obj(callable) };
-    let closure = unsafe { function_get_closure(callable) };
+    let mut w_code = unsafe { crate::getcode(callable) };
+    let mut w_globals = unsafe { function_get_globals_obj(callable) };
+    let mut closure = unsafe { function_get_closure(callable) };
     let func_code = unsafe {
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
     let code_ref = unsafe { &*func_code };
-    let final_args = fill_user_function_args(callable, code_ref, args)?;
-    let func_frame =
-        make_user_call_frame(w_code, &final_args, w_globals, execution_context, closure)?;
+    let final_args = pyre_object::with_roots!(callable, closure, w_code, w_globals => fill_user_function_args(callable, code_ref, args))?;
+    let func_frame = pyre_object::with_roots!(callable => make_user_call_frame(w_code, &final_args, w_globals, execution_context, closure))?;
 
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         return frame_into_generator_for_function(func_frame, callable)
@@ -1310,7 +1309,7 @@ pub fn call_user_function_with_ctx(
 /// mirrors PyPy's Arguments.parse_into_scope.
 pub fn call_user_function_resolved(
     execution_context: *const crate::PyExecutionContext,
-    callable: PyObjectRef,
+    mut callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
     let w_code = unsafe { crate::getcode(callable) };
@@ -1323,15 +1322,16 @@ pub fn call_user_function_resolved(
 
     // Generator function
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        let gen_frame =
-            crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        let gen_frame = crate::pyframe::FrameBox::new(
+            pyre_object::with_roots!(callable => PyFrame::try_new_for_call_with_closure_and_globals_obj(
                 w_code as *const (),
                 args,
                 w_globals,
                 execution_context,
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-            )?);
+            ))?,
+        );
         return frame_into_generator_for_function(gen_frame, callable);
     }
 
@@ -2173,10 +2173,10 @@ fn metaclass_call_override(callable: PyObjectRef) -> Option<PyObjectRef> {
     if std::ptr::eq(where_defined, crate::typedef::w_type()) {
         return None;
     }
-    let call_descr = unsafe {
+    let mut call_descr = unsafe {
         crate::baseobjspace::lookup_in_type_where_uncached(metaclass.as_ptr(), "__call__")
     }?;
-    let bound = unsafe { crate::baseobjspace::get(call_descr, callable, metaclass.as_ptr()) }
+    let bound = unsafe { pyre_object::with_roots!(call_descr => crate::baseobjspace::get(call_descr, callable, metaclass.as_ptr())) }
         .ok()
         .flatten()
         .unwrap_or(call_descr);
@@ -2194,12 +2194,12 @@ fn classmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef
     let Some(w_type) = crate::typedef::r#type(callable) else {
         return Ok(None);
     };
-    let Some(call_descr) =
+    let Some(mut call_descr) =
         (unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__call__") })
     else {
         return Ok(None);
     };
-    let bound = unsafe { crate::baseobjspace::get(call_descr, callable, w_type.as_ptr()) }?
+    let bound = unsafe { pyre_object::with_roots!(call_descr => crate::baseobjspace::get(call_descr, callable, w_type.as_ptr())) }?
         .unwrap_or(call_descr);
     Ok(Some(bound))
 }
@@ -2217,12 +2217,12 @@ fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRe
     let Some(w_type) = crate::typedef::r#type(callable) else {
         return Ok(None);
     };
-    let Some(call_descr) =
+    let Some(mut call_descr) =
         (unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__call__") })
     else {
         return Ok(None);
     };
-    let bound = unsafe { crate::baseobjspace::get(call_descr, callable, w_type.as_ptr()) }?
+    let bound = unsafe { pyre_object::with_roots!(call_descr => crate::baseobjspace::get(call_descr, callable, w_type.as_ptr())) }?
         .unwrap_or(call_descr);
     Ok(Some(bound))
 }
@@ -2237,7 +2237,8 @@ fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, 
         return Ok(None);
     };
     let w_type = w_type.as_ptr();
-    let Some(call_fn) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") }) else {
+    let Some(mut call_fn) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") })
+    else {
         return Ok(None);
     };
     // `A.__call__ = A()` makes this edge feed itself, and the callers below
@@ -2262,7 +2263,10 @@ fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, 
     if unsafe { crate::is_function(call_fn) || crate::is_slot_wrapper(call_fn) } {
         return Ok(Some((call_fn, true)));
     }
-    let bound = unsafe { crate::baseobjspace::get(call_fn, callable, w_type) }?.unwrap_or(call_fn);
+    let bound = unsafe {
+        pyre_object::with_roots!(call_fn => crate::baseobjspace::get(call_fn, callable, w_type))
+    }?
+    .unwrap_or(call_fn);
     Ok(Some((bound, false)))
 }
 
@@ -2503,28 +2507,29 @@ pub fn call_user_function_plain(
 /// still installed so its locals stay reachable during eval.
 pub fn call_user_function_plain_with_ctx(
     execution_context: *const crate::PyExecutionContext,
-    callable: PyObjectRef,
+    mut callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    let w_code = unsafe { crate::getcode(callable) };
-    let w_globals = unsafe { function_get_globals_obj(callable) };
-    let closure = unsafe { function_get_closure(callable) };
+    let mut w_code = unsafe { crate::getcode(callable) };
+    let mut w_globals = unsafe { function_get_globals_obj(callable) };
+    let mut closure = unsafe { function_get_closure(callable) };
     let func_code = unsafe {
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
     let code_ref = unsafe { &*func_code };
-    let final_args = fill_user_function_args(callable, code_ref, args)?;
+    let final_args = pyre_object::with_roots!(callable, closure, w_code, w_globals => fill_user_function_args(callable, code_ref, args))?;
 
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        let gen_frame =
-            crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        let gen_frame = crate::pyframe::FrameBox::new(
+            pyre_object::with_roots!(callable => PyFrame::try_new_for_call_with_closure_and_globals_obj(
                 w_code as *const (),
                 &final_args,
                 w_globals,
                 execution_context,
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-            )?);
+            ))?,
+        );
         return frame_into_generator_for_function(gen_frame, callable);
     }
 
@@ -4833,17 +4838,18 @@ fn issubtype_ptr(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
 }
 
 /// Helper: call a user function with arbitrary args from descriptor context.
-fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
-    let w_code = unsafe { crate::getcode(func) };
-    let w_globals = unsafe { function_get_globals_obj(func) };
-    let closure = unsafe { function_get_closure(func) };
+fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
+    let mut w_code = unsafe { crate::getcode(func) };
+    let mut w_globals = unsafe { function_get_globals_obj(func) };
+    let mut closure = unsafe { function_get_closure(func) };
     let func_code = unsafe {
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
     let exec_ctx = take_last_exec_ctx();
 
     let code_ref = unsafe { &*func_code };
-    let final_args = match fill_user_function_args(func, code_ref, args) {
+    let final_args = match pyre_object::with_roots!(closure, func, w_code, w_globals => fill_user_function_args(func, code_ref, args))
+    {
         Ok(v) => v,
         Err(e) => {
             set_call_error(e);
@@ -4854,14 +4860,14 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
     // Generator function: wrap frame in generator object
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let gen_frame = crate::pyframe::FrameBox::new(
-            match PyFrame::try_new_for_call_with_closure_and_globals_obj(
+            match pyre_object::with_roots!(func => PyFrame::try_new_for_call_with_closure_and_globals_obj(
                 w_code as *const (),
                 &final_args,
                 w_globals,
                 exec_ctx,
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-            ) {
+            )) {
                 Ok(f) => f,
                 Err(e) => {
                     set_call_error(e);
@@ -4939,7 +4945,10 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
 /// `fill_user_function_args` because `args` is the final frame-local
 /// layout produced by [`resolve_kwargs`] — re-matching it would treat the
 /// packed `*args` / `**kwargs` slots as extra positionals.
-fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
+fn call_user_function_resolved_frameless(
+    mut func: PyObjectRef,
+    args: &[PyObjectRef],
+) -> PyObjectRef {
     let w_code = unsafe { crate::getcode(func) };
     let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
@@ -4949,15 +4958,16 @@ fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]
     let exec_ctx = take_last_exec_ctx();
     let code_ref = unsafe { &*func_code };
 
-    let mut frame =
-        crate::pyframe::FrameBox::new(PyFrame::new_for_call_with_closure_and_globals_obj(
+    let mut frame = crate::pyframe::FrameBox::new(
+        pyre_object::with_roots!(func => PyFrame::new_for_call_with_closure_and_globals_obj(
             w_code as *const (),
             args,
             w_globals,
             exec_ctx,
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        ));
+        )),
+    );
     frame.fix_array_ptrs();
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         return match frame_into_generator_for_function(frame, func) {
@@ -5593,7 +5603,7 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             "__build_class__: not enough arguments",
         ));
     }
-    let body_fn = args[0];
+    let mut body_fn = args[0];
     let name_obj = args[1];
 
     // compiling.py:163-167 — the body must be a Python function carrying a
@@ -5672,7 +5682,7 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 
     // `type(name, bases, namespace)` rejects a lone surrogate. `str_utf8_w`
     // is `UnicodeEncodeError` ("surrogates not allowed").
-    let name = crate::baseobjspace::str_utf8_w(name_obj)?;
+    let name = pyre_object::with_roots!(body_fn => crate::baseobjspace::str_utf8_w(name_obj))?;
     // compiling.py:166-167 — resolve __mro_entries__ before metaclass
     // inference; record the original bases for __orig_bases__ when changed.
     //
@@ -7065,14 +7075,14 @@ unsafe fn copy_flags_from_bases(
 /// # Safety
 /// `w_type` must be a valid W_TypeObject pointer.
 pub unsafe fn create_all_slots(
-    w_type: pyre_object::PyObjectRef,
+    mut w_type: pyre_object::PyObjectRef,
     w_bases: pyre_object::PyObjectRef,
 ) -> Result<(), crate::PyError> {
     unsafe {
         use pyre_object::typeobject::{Layout, leak_layout};
 
         // typeobject.py: w_bestbase = check_and_find_best_base(space, bases_w)
-        let w_bestbase = check_and_find_best_base(w_bases)?;
+        let mut w_bestbase = check_and_find_best_base(w_bases)?;
 
         // typeobject.py:1507-1508: inherit flag_map_or_seq from bases
         pyre_object::typeobject::inherit_flag_map_or_seq(w_type, w_bases);
@@ -7102,7 +7112,8 @@ pub unsafe fn create_all_slots(
             // typeobject.py:1154-1176: has __slots__
             wantdict = false;
             wantweakref = false;
-            let all_names = collect_slot_names(w_slots)?;
+            let all_names =
+                pyre_object::with_roots!(w_bestbase, w_type => collect_slot_names(w_slots))?;
             if base_has_variable_items && !all_names.is_empty() {
                 return Err(crate::PyError::type_error(format!(
                     "nonempty __slots__ not supported for subtype of '{}'",
