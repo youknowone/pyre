@@ -1926,11 +1926,10 @@ impl std::fmt::Debug for JitCellToken {
 pub struct InvalidatePosition {
     /// The placeholder the emitter left at the guard site.
     pub addr: usize,
-    /// The word to store there: `JMP rel32` over an eight-byte `NOP` on
-    /// x86-64, a whole `B imm26` instruction (the low four bytes) on aarch64.
-    /// One naturally-aligned word, so a thread executing the loop while this
-    /// store lands fetches either the placeholder or the branch and never a
-    /// half-written instruction.
+    /// The branch that activates the site. On x86-64 the low five bytes are
+    /// `JMP rel32`, written while every other mutator is quiesced. On aarch64
+    /// the low four bytes are one `B imm26` instruction, stored as a single
+    /// aligned word.
     pub word: u64,
 }
 
@@ -2004,12 +2003,34 @@ impl LoopInvalidation {
         // that already has a bridge attached to it". Keep the lock through
         // the write: JitCellToken teardown takes it before freeing code, so
         // the registry's longer-lived projection cannot patch recycled memory.
-        {
+        //
+        // x86 writes five bytes over live instructions (`x86/runner.py
+        // invalidate_loop`). That store is only safe once every other mutator
+        // has left compiled code, so the write happens under
+        // `quiesce_mutators`, taken before `sites`: a mutator blocked on
+        // `sites` (`record_invalidate_positions`, token drop) cannot reach
+        // `safepoint_poll`, so holding `sites` across the wait would deadlock.
+        // Quiescing only when there is a site to write keeps an invalidation
+        // with nothing recorded from stopping every thread; a site recorded
+        // between the check and the lock is caught by re-checking under it.
+        // `quiesce_mutators` re-enters when this thread already owns STW.
+        // aarch64 patches one aligned instruction and does not quiesce.
+        #[cfg(target_arch = "x86_64")]
+        let mut stw = None;
+        loop {
             let mut sites = self.sites.lock();
-            if let Some(write) = sites.write {
+            let write = sites.write.filter(|_| !sites.positions.is_empty());
+            #[cfg(target_arch = "x86_64")]
+            if write.is_some() && stw.is_none() {
+                drop(sites);
+                stw = Some(majit_gc::gc_sync::quiesce_mutators());
+                continue;
+            }
+            if let Some(write) = write {
                 write(&sites.positions);
             }
             sites.positions.clear();
+            break;
         }
         // After the flags, not before: a reader that keys a cache on the
         // generation pairs the value it read with the answer it computed, so

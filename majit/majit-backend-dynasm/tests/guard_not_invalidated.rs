@@ -16,6 +16,8 @@
 //! call has nothing to write.
 
 use majit_backend::{Backend, JitCellToken, make_resume_guard_descr_typed};
+#[cfg(target_arch = "x86_64")]
+use majit_ir::make_loop_target_descr;
 use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 
 use majit_backend_dynasm::runner::DynasmBackend;
@@ -164,34 +166,96 @@ fn every_recorded_position_in_a_trace_is_written() {
     );
 }
 
-/// On x86-64 the site executes as one NOP, not a jump to the next
-/// instruction.  `genop_guard_guard_not_invalidated` emits nothing, so a
-/// `JMP rel32 0` placeholder would put a taken branch in every loop iteration
-/// that upstream does not have; the NOP keeps the site free while still
-/// reserving whole-instruction bytes for `invalidate_loop` to overwrite.
+/// `genop_guard_guard_not_invalidated` emits zero bytes. `invalidate_loop`
+/// writes `JMP rel32` over the five bytes that already followed the site.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn the_x86_site_is_a_nop_until_invalidated() {
+fn the_x86_site_emits_nothing_until_invalidated() {
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
     let token = JitCellToken::new(4);
-    compile_guarded_add(&mut backend, &token);
+    let guard_descr = compile_guarded_add(&mut backend, &token);
 
     let entry = token.ll_function_addr();
     assert_ne!(entry, 0);
-    let code = unsafe { std::slice::from_raw_parts(entry as *const u8, 256) };
-    let nop8 = [0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00];
-    let site = (0..code.len() - 8)
-        .find(|&i| (entry + i) % 8 == 0 && code[i..i + 8] == nop8)
-        .expect("the guard site is an aligned eight-byte NOP");
+    let before = unsafe { std::slice::from_raw_parts(entry as *const u8, 256).to_vec() };
     assert!(
-        !code.windows(5).any(|w| w == [0xE9, 0x00, 0x00, 0x00, 0x00]),
-        "no jump-to-next placeholder is emitted"
+        !before.windows(5).any(|w| w[0] == 0xE9),
+        "the unpatched trace has no JMP rel32 at the guard"
     );
 
     backend.invalidate_loop(&token);
+    let after = unsafe { std::slice::from_raw_parts(entry as *const u8, 256) };
+    let site = (0..before.len())
+        .find(|&i| before[i] != after[i])
+        .expect("invalidate_loop writes the branch");
+    assert!(site + 5 <= before.len());
+    assert_eq!(after[site], 0xE9, "invalidate_loop writes JMP rel32");
     assert_eq!(
-        code[site], 0xE9,
-        "invalidate_loop writes JMP rel32 over the NOP"
+        &before[site + 5..],
+        &after[site + 5..],
+        "only the five bytes at the site change"
+    );
+    let rel = i32::from_le_bytes(after[site + 1..site + 5].try_into().unwrap());
+    let target = (entry + site + 5) as i64 + rel as i64;
+    let stub = guard_descr
+        .as_fail_descr()
+        .expect("guard descr")
+        .adr_jump_offset();
+    assert_eq!(target as usize, stub, "JMP rel32 targets the recovery stub");
+}
+
+/// `consider_guard_not_invalidated` /
+/// `ensure_next_label_is_at_least_at_position(n + 5)`: a label bound on the
+/// next op is pushed at least five bytes past the guard.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_label_immediately_after_the_guard_is_at_least_five_bytes_later() {
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let token = JitCellToken::new(5);
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let loop_descr = make_loop_target_descr(token.number, false);
+
+    let guard_descr = make_resume_guard_descr_typed(vec![Type::Int]);
+    let guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
+    guard_op.pos().set(OpRef::void_op(0));
+    guard_op.set_fail_arg_types(vec![Type::Int]);
+    guard_op.setfailargs(vec![rb(i0)].into());
+    guard_op.setdescr(guard_descr.clone());
+
+    let label_op = Op::new(OpCode::Label, &[rb(i0)]);
+    label_op.pos().set(OpRef::void_op(1));
+    label_op.setdescr(loop_descr.clone());
+
+    let finish_op = Op::new(OpCode::Finish, &[rb(i0)]);
+    finish_op.pos().set(OpRef::void_op(2));
+    finish_op.set_fail_arg_types(vec![Type::Int]);
+    finish_op.setfailargs(vec![rb(i0)].into());
+
+    let ops_rc: Vec<OpRc> = vec![
+        OpRc::new(guard_op),
+        OpRc::new(label_op),
+        OpRc::new(finish_op),
+    ];
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+
+    let entry = token.ll_function_addr();
+    let before = unsafe { std::slice::from_raw_parts(entry as *const u8, 256).to_vec() };
+    backend.invalidate_loop(&token);
+    let after = unsafe { std::slice::from_raw_parts(entry as *const u8, 256) };
+    let site = (0..before.len())
+        .find(|&i| before[i] != after[i])
+        .expect("invalidate_loop writes the branch");
+    let label = loop_descr
+        .as_loop_target_descr()
+        .expect("label descr")
+        .ll_loop_code();
+    assert!(
+        label >= entry + site + 5,
+        "label {label:#x} must be at least 5 bytes after the guard at {:#x}",
+        entry + site
     );
 }
