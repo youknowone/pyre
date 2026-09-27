@@ -329,10 +329,114 @@ enum ValueProducer {
     },
 }
 
-/// `compute_graph_info(graph)` of the read/write analyzer: the per-graph
-/// facts `analyze_simple_operation` reads. `value_producers` /
-/// `phi_sources` give each array operand its ARRAY type.
+/// `FreshMallocs` (writeanalyze.py): which variables can only hold an
+/// object this graph allocated itself.
+struct FreshMallocs {
+    graph_name: String,
+    nonfresh: std::collections::HashSet<crate::flowspace::model::Variable>,
+    allvariables: std::collections::HashSet<crate::flowspace::model::Variable>,
+}
+
+impl FreshMallocs {
+    fn new(graph: &FunctionGraph) -> Self {
+        let mut this = Self {
+            graph_name: graph.name.clone(),
+            nonfresh: graph.blocks[graph.startblock.0]
+                .inputargs
+                .iter()
+                .cloned()
+                .collect(),
+            allvariables: std::collections::HashSet::new(),
+        };
+        let mut pendingblocks: Vec<crate::model::BlockId> =
+            graph.blocks.iter().map(|block| block.id).collect();
+        for block in &graph.blocks {
+            this.allvariables.extend(block.inputargs.iter().cloned());
+        }
+        pendingblocks.reverse();
+        while let Some(block_id) = pendingblocks.pop() {
+            let block = &graph.blocks[block_id.0];
+            for op in &block.operations {
+                let Some(result) = op.result.as_ref() else {
+                    continue;
+                };
+                this.allvariables.insert(result.clone());
+                match &op.kind {
+                    // `malloc` / `malloc_varsize` / `new`.
+                    OpKind::New { .. }
+                    | OpKind::NewWithVtable { .. }
+                    | OpKind::NewArray { .. }
+                    | OpKind::NewArrayClear { .. } => continue,
+                    // `cast_pointer` / `same_as`.
+                    OpKind::UnaryOp { op, operand, .. }
+                        if (op == "cast_pointer" || op == "same_as")
+                            && this.is_fresh_malloc(operand) =>
+                    {
+                        continue;
+                    }
+                    // `cast_pointer` spelled as the `cast_instance` shim.
+                    OpKind::Call { args, .. }
+                        if crate::model::cast_instance_root(&op.kind).is_some()
+                            && matches!(args.first(),
+                                Some(LinkArg::Value(operand)) if this.is_fresh_malloc(operand)) =>
+                    {
+                        continue;
+                    }
+                    _ => {}
+                }
+                this.nonfresh.insert(result.clone());
+            }
+            for link in &block.exits {
+                // `link.getextravars()`.
+                for extra in [&link.last_exception, &link.last_exc_value] {
+                    if let Some(LinkArg::Value(var)) = extra {
+                        this.nonfresh.insert(var.clone());
+                        this.allvariables.insert(var.clone());
+                    }
+                }
+                let prevlen = this.nonfresh.len();
+                let target = &graph.blocks[link.target.0];
+                for (v1, v2) in link.args.iter().zip(target.inputargs.iter()) {
+                    let fresh = match v1 {
+                        LinkArg::Value(var) => this.is_fresh_malloc(var),
+                        LinkArg::Const(_) => false,
+                    };
+                    if !fresh {
+                        this.nonfresh.insert(v2.clone());
+                    }
+                }
+                if this.nonfresh.len() > prevlen {
+                    pendingblocks.push(link.target);
+                }
+            }
+        }
+        this
+    }
+
+    fn is_fresh_malloc(&self, v: &crate::flowspace::model::Variable) -> bool {
+        // `if not isinstance(v, Variable): return False`. The flat graph
+        // leaves a Void value undefined where the rtyped graph has a Void
+        // `Constant`.
+        if v.concretetype()
+            == Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void)
+            && !self.allvariables.contains(v)
+        {
+            return false;
+        }
+        assert!(
+            self.allvariables.contains(v),
+            "{v:?} is not in the graph {}",
+            self.graph_name
+        );
+        !self.nonfresh.contains(v)
+    }
+}
+
+/// `compute_graph_info(graph)` of the read/write analyzer: `FreshMallocs(graph)`,
+/// plus the `value_producers` / `phi_sources` that give each array
+/// operand its ARRAY type.
 struct ReadWriteGraphInfo {
+    fresh_mallocs: FreshMallocs,
     value_producers: HashMap<crate::flowspace::model::Variable, ValueProducer>,
     phi_sources: HashMap<crate::flowspace::model::Variable, Option<LinkArg>>,
 }
@@ -389,6 +493,7 @@ impl ReadWriteGraphInfo {
             }
         }
         Self {
+            fresh_mallocs: FreshMallocs::new(graph),
             value_producers,
             phi_sources,
         }
@@ -8184,6 +8289,14 @@ impl CallControl {
         kind: &OpKind,
         graphinfo: &ReadWriteGraphInfo,
     ) -> ReadWriteEffects {
+        // A write into an object this graph allocated is not an effect.
+        if let OpKind::FieldWrite { base, .. }
+        | OpKind::ArrayWrite { base, .. }
+        | OpKind::InteriorFieldWrite { base, .. } = kind
+            && graphinfo.fresh_mallocs.is_fresh_malloc(base)
+        {
+            return ReadWriteEffects::bottom_result();
+        }
         match kind {
             // `getfield` / `setfield`.
             OpKind::FieldRead { field, .. } => {
@@ -11597,6 +11710,7 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("accessor");
         let base_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, base_var.clone());
         graph.push_op_var(
             graph.startblock,
             OpKind::FieldRead {
@@ -11626,7 +11740,7 @@ mod tests {
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
             &direct_call_op(target.clone()),
-            Vec::new(),
+            vec![Type::Ref],
             Type::Void,
             OopSpecIndex::None,
             None,
@@ -11655,6 +11769,7 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("opaque_writer");
         let base_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, base_var.clone());
         graph.push_op_var(
             graph.startblock,
             OpKind::FieldWrite {
@@ -11674,7 +11789,7 @@ mod tests {
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
             &direct_call_op(CallTarget::function_path(["opaque_writer"])),
-            Vec::new(),
+            vec![Type::Ref],
             Type::Void,
             OopSpecIndex::None,
             None,
@@ -11981,6 +12096,7 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("pure_writer");
         let base_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, base_var.clone());
         graph.push_op_var(
             graph.startblock,
             OpKind::FieldWrite {
@@ -12001,7 +12117,7 @@ mod tests {
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
             &direct_call_op(target.clone()),
-            Vec::new(),
+            vec![Type::Ref],
             Type::Int,
             OopSpecIndex::None,
             None,
@@ -12040,6 +12156,7 @@ mod tests {
         );
         let mut graph = FunctionGraph::new("pure_cache");
         let base_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, base_var.clone());
         graph.push_op_var(
             graph.startblock,
             OpKind::FieldRead {
@@ -12069,7 +12186,7 @@ mod tests {
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
             &direct_call_op(CallTarget::function_path(["pure_cache"])),
-            Vec::new(),
+            vec![Type::Ref],
             Type::Int,
             OopSpecIndex::None,
             None,
@@ -12438,6 +12555,7 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("rw_same_field");
         let base_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, base_var.clone());
         let field = crate::model::FieldDescriptor::new("x", Some("Point".into()));
         // Both read AND write the same field "x"
         graph.push_op_var(
@@ -12469,7 +12587,7 @@ mod tests {
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
             &direct_call_op(target.clone()),
-            Vec::new(),
+            vec![Type::Ref],
             Type::Void,
             OopSpecIndex::None,
             None,
@@ -14489,6 +14607,10 @@ mod tests {
         let mut graph = FunctionGraph::new(name);
         let entry = graph.startblock;
         for op in ops {
+            // The written object is an argument, not a `FreshMallocs` one.
+            if let OpKind::FieldWrite { base, .. } = &op {
+                graph.push_inputarg_var(entry, base.clone());
+            }
             graph.push_op_var(entry, op, false);
         }
         cc.register_function_graph(CallPath::from_segments([name]), graph);
@@ -14709,6 +14831,59 @@ mod tests {
         assert!(after.cache_hit_offset > before.cache_hit_offset);
     }
 
+    /// `FreshMallocs`: a write into an object the graph allocated, directly
+    /// or through `same_as`, is not an effect; a write into an argument is.
+    #[test]
+    fn readwrite_skips_writes_into_fresh_mallocs() {
+        let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
+        let mut graph = FunctionGraph::new("fresh");
+        let entry = graph.startblock;
+        let arg = graph.alloc_value_var();
+        graph.push_inputarg_var(entry, arg.clone());
+        let fresh = graph
+            .push_op_var(
+                entry,
+                OpKind::New {
+                    owner: "Fresh".to_string(),
+                },
+                true,
+            )
+            .unwrap();
+        let alias = graph
+            .push_op_var(
+                entry,
+                OpKind::UnaryOp {
+                    op: "same_as".to_string(),
+                    operand: fresh.clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        for (base, name) in [(&fresh, "a"), (&alias, "b"), (&arg, "c")] {
+            graph.push_op_var(
+                entry,
+                OpKind::FieldWrite {
+                    base: base.clone(),
+                    field: crate::model::FieldDescriptor::new(name, Some("Fresh".to_string())),
+                    value: LinkArg::Value(arg.clone()),
+                    ty: ValueType::Int,
+                },
+                false,
+            );
+        }
+        cc.register_function_graph(CallPath::from_segments(["fresh"]), graph);
+        let effects = rw_of(&cc, &mut cache, "fresh");
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("fresh-malloc writes are not top");
+        };
+        assert_eq!(set.len(), 1);
+        let (key, operand) = set.first().unwrap();
+        assert_eq!(key.tag, RwTag::Struct);
+        assert!(matches!(operand, RwOperand::Field { name, .. } if name == "c"));
+    }
+
     /// Two structs spelled with one owner name are two `T`s: each keeps its
     /// own `("struct", T, fieldname)` tuple though they share one index.
     #[test]
@@ -14739,7 +14914,11 @@ mod tests {
         let mut cache = AnalysisCache::default();
         let mut impl_graph = FunctionGraph::new("impl_m");
         let entry = impl_graph.startblock;
-        impl_graph.push_op_var(entry, rw_write_field("Impl", "slot"), false);
+        let write = rw_write_field("Impl", "slot");
+        if let OpKind::FieldWrite { base, .. } = &write {
+            impl_graph.push_inputarg_var(entry, base.clone());
+        }
+        impl_graph.push_op_var(entry, write, false);
         cc.register_trait_method("m", Some("Trait"), "Impl", impl_graph);
         let mut caller = FunctionGraph::new("caller");
         let entry = caller.startblock;
