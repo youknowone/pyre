@@ -51,6 +51,12 @@ pub struct FunDecl {
     /// via [`FunDecl::unstructured`]. A schema change in the unused
     /// variants still does not break load.
     pub body: Option<Box<RawValue>>,
+    /// [`FunDecl::has_unstructured_body`], decided on first query.
+    #[serde(skip)]
+    has_unstructured_body: OnceLock<bool>,
+    /// [`FunDecl::first_arg_local_name`], decided on first query.
+    #[serde(skip)]
+    first_arg_local_name: OnceLock<Option<String>>,
 }
 
 impl FunDecl {
@@ -83,6 +89,16 @@ impl FunDecl {
             .map(|p| p.unstructured)
     }
 
+    /// Whether [`Self::unstructured`] returns `Some`.
+    ///
+    /// Call lowering asks this of a callee at every call site; the answer is
+    /// a property of the declaration, so the body is parsed for it once.
+    pub fn has_unstructured_body(&self) -> bool {
+        *self
+            .has_unstructured_body
+            .get_or_init(|| self.unstructured().is_some())
+    }
+
     /// Source name of the first argument local (local index 1; index 0 is the
     /// return slot).  `None` when the body is absent, the function has no
     /// arguments, or Charon dropped the name.
@@ -95,6 +111,12 @@ impl FunDecl {
     /// monomorphised trait method), whereas `W_Range::allocate(payload: Self)`
     /// keeps its source name (`"payload"`).
     pub fn first_arg_local_name(&self) -> Option<String> {
+        self.first_arg_local_name
+            .get_or_init(|| self.project_first_arg_local_name())
+            .clone()
+    }
+
+    fn project_first_arg_local_name(&self) -> Option<String> {
         #[derive(Deserialize)]
         struct Proj {
             #[serde(rename = "Unstructured")]

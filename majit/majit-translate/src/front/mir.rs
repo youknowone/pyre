@@ -4020,36 +4020,35 @@ fn lower_unstructured_with_static_addrs_and_attrs(
 /// Restamp `ArrayWrite` / `ArrayRead` `item_ty` to `Ref` for arrays that
 /// receive a `GcRef(p as usize)` word.
 fn retarget_gcref_array_items(graph: &mut FunctionGraph) {
-    let mut pointer_words: Vec<u64> = Vec::new();
+    let mut pointer_words: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
     for block in &graph.blocks {
         for op in &block.operations {
             if crate::model::cast_instance_root(&op.kind) == Some("GCREF")
                 && let Some(result) = &op.result
             {
-                pointer_words.push(result.id());
+                pointer_words.insert(result.id());
             }
         }
+    }
+    // Each block's incoming links, counted once: the walk below reads only
+    // blocks with exactly one, and it rewrites no link.
+    let mut incoming: rustc_hash::FxHashMap<_, (usize, &crate::model::Link)> =
+        rustc_hash::FxHashMap::default();
+    for link in graph.blocks.iter().flat_map(|pred| pred.exits.iter()) {
+        incoming.entry(link.target).or_insert((0, link)).0 += 1;
     }
     let mut grew = true;
     while grew {
         grew = false;
         for block in &graph.blocks {
-            let incoming: Vec<_> = graph
-                .blocks
-                .iter()
-                .flat_map(|pred| pred.exits.iter())
-                .filter(|link| link.target == block.id)
-                .collect();
-            if incoming.len() != 1 {
+            let Some(&(1, link)) = incoming.get(&block.id) else {
                 continue;
-            }
-            let link = incoming[0];
+            };
             for (input, arg) in block.inputargs.iter().zip(link.args.iter()) {
                 let Some(src) = arg.as_variable() else {
                     continue;
                 };
-                if pointer_words.contains(&src.id()) && !pointer_words.contains(&input.id()) {
-                    pointer_words.push(input.id());
+                if pointer_words.contains(&src.id()) && pointer_words.insert(input.id()) {
                     grew = true;
                 }
             }
@@ -4067,13 +4066,13 @@ fn retarget_gcref_array_items(graph: &mut FunctionGraph) {
     }
     // A second pass marks array bases that received a pointer word, then
     // their reads. Bases are variables, not the words themselves.
-    let mut pointer_arrays: Vec<u64> = Vec::new();
+    let mut pointer_arrays: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
     for block in &graph.blocks {
         for op in &block.operations {
             if let OpKind::ArrayWrite { base, value, .. } = &op.kind
                 && value.as_variable().is_some_and(is_word)
             {
-                pointer_arrays.push(base.id());
+                pointer_arrays.insert(base.id());
             }
         }
     }
@@ -12166,7 +12165,7 @@ impl<'a> Lowering<'a> {
             return Ok(());
         };
         let path = strip_crate_prefix(&fd.item_meta.name_path());
-        let residual = fd.unstructured().is_none() || self.dont_look_inside.contains(&path);
+        let residual = !fd.has_unstructured_body() || self.dont_look_inside.contains(&path);
         if !residual {
             return Ok(());
         }
@@ -38196,7 +38195,7 @@ fn abstract_trait_call_target(reg: &RegularCall, llbc: &Llbc) -> Option<(String,
     }
     let has_body = llbc.iter_local_fns().any(|fd| {
         let path = fd.item_meta.name_path();
-        path.ends_with(&format!("::{trait_leaf}::{method_leaf}")) && fd.unstructured().is_some()
+        path.ends_with(&format!("::{trait_leaf}::{method_leaf}")) && fd.has_unstructured_body()
     });
     if has_body {
         return None;
