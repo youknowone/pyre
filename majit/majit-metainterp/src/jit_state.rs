@@ -720,6 +720,9 @@ pub trait JitState: Sized {
     /// `is_exit_frame_with_exception` → `PyError::from_exc_object`). Returns the
     /// pc to resume at (the interpreter's unwind/handler entry).
     ///
+    /// A compiled run that ends in the exit-with-exception FINISH
+    /// (`ExitFrameWithExceptionDescrRef.handle_fail`) is delivered here too.
+    ///
     /// The default returns `None`: an interpreter with no exception machinery
     /// never raises and so can never produce `ExitFrameWithExceptionRef` from a
     /// blackhole resume, leaving this unreachable for it; the caller then falls

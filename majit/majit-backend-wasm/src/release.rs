@@ -6,8 +6,19 @@
 //! (`history.py`), so this token is not freed while that caller exists.
 
 use std::any::Any;
+use std::cell::{Cell, RefCell};
 
 use majit_backend::JitCellToken;
+
+/// One deferred inline merge and the entry counter its bridge increments.
+///
+/// The box lives in [`LoopAsmResources::pending_inlines`] and is freed with
+/// that block (`free_loop_and_bridges`). The probe bakes this box's address
+/// and the address of `counter`.
+pub struct PendingInlineSlot {
+    pub(crate) entry: RefCell<Option<super::PendingInline>>,
+    pub(crate) counter: Cell<u64>,
+}
 
 /// Compile-time maps, table slots, label rows, fail indices, and bridge
 /// cells of one emission. Pushed into `asmmemmgr_blocks`; `Drop` runs when
@@ -15,14 +26,19 @@ use majit_backend::JitCellToken;
 #[derive(Default)]
 pub struct LoopAsmResources {
     pub gcmaps: Vec<Box<[usize]>>,
+    /// The cpu's exit cells this emission baked as `jf_descr` immediates.
+    /// Held so the cells outlive the `WasmBackend` while the code can still
+    /// run (dynasm keeps the same `CpuDescrHandle` clone on its compiled
+    /// loop).
+    pub exit_cells: Option<std::sync::Arc<crate::failguard::CpuExitCells>>,
     /// Real `__indirect_function_table` pair bases. `0` is not a host slot.
     pub table_slots: Vec<u32>,
-    pub label_ids: Vec<usize>,
-    pub label_handle: u32,
-    /// `JitCellToken.number` that published `label_ids`. A later compile that
-    /// overwrites the same descr updates `LabelTarget.owner_token`, and this
-    /// drop leaves that row alone.
-    pub label_owner: u64,
+    /// `LabelTarget` boxes this emission published. `ll_loop_code` is the
+    /// address of the box (`assembler.py` `fixup_target_tokens` writes
+    /// `TargetToken._ll_loop_code`). A later compile overwrites the word
+    /// with its own box; `Drop` clears the word only when it still names
+    /// this box.
+    pub label_targets: Vec<(majit_ir::DescrRef, Box<crate::failguard::LabelTarget>)>,
     /// One [`crate::failguard::FailDescrCell`] per guard exit. The address is
     /// what the exit stores in `jf_descr` (`get_latest_descr`). The cell
     /// outlives every module that can still leave through that exit because
@@ -34,7 +50,18 @@ pub struct LoopAsmResources {
     /// `[descr_cell, gcmap]` pairs the exit loads. The address is baked
     /// into the module; the allocation does not move.
     pub exit_table: Option<Box<[usize]>>,
+    /// Deferred merges whose out-of-line bridges this emission compiled.
+    /// Pushed with the bridge onto the original loop token
+    /// (`push_resources`; `assembler.py` keeps bridge blocks on
+    /// `original_loop_token.compiled_loop_token.asmmemmgr_blocks`).
+    pub pending_inlines: Vec<Box<PendingInlineSlot>>,
 }
+
+// Loop asm resources are transferred through the token's `Any + Send`
+// holder, but all access to its IR snapshot and cell arrays is confined to the
+// single wasm execution thread. The contained `RefCell`s enforce that runtime
+// ownership model; moving the holder does not permit concurrent access.
+unsafe impl Send for LoopAsmResources {}
 
 impl LoopAsmResources {
     pub fn park_gcmap(&mut self, map: Box<[usize]>) -> usize {
@@ -67,6 +94,19 @@ impl LoopAsmResources {
         ptr
     }
 
+    /// Stable address of a new pending-inline slot, and the address of its
+    /// entry counter. Both are baked into the bridge module.
+    pub(crate) fn alloc_pending_inline(&mut self, inline: super::PendingInline) -> (usize, u32) {
+        let slot = Box::new(PendingInlineSlot {
+            entry: RefCell::new(Some(inline)),
+            counter: Cell::new(0),
+        });
+        let slot_addr = &*slot as *const PendingInlineSlot as usize;
+        let counter_addr = &slot.counter as *const Cell<u64> as usize as u32;
+        self.pending_inlines.push(slot);
+        (slot_addr, counter_addr)
+    }
+
     pub fn write_exit_slot(&mut self, index: usize, descr_cell: usize, gcmap: usize) {
         let Some(table) = self.exit_table.as_mut() else {
             return;
@@ -89,17 +129,12 @@ impl Drop for LoopAsmResources {
                 let _ = slot;
             }
         }
-        if self.label_owner != 0 {
-            let mut reg = crate::failguard::LABEL_TARGETS.lock();
-            if let Some(labels) = reg.as_mut() {
-                for id in self.label_ids.drain(..) {
-                    let still_ours = labels
-                        .get(&id)
-                        .is_some_and(|target| target.owner_token == self.label_owner);
-                    if still_ours {
-                        labels.remove(&id);
-                    }
-                }
+        for (descr, boxed) in self.label_targets.drain(..) {
+            let addr = &*boxed as *const crate::failguard::LabelTarget as usize;
+            if let Some(loop_target) = descr.as_loop_target_descr()
+                && loop_target.ll_loop_code() == addr
+            {
+                loop_target.set_ll_loop_code(0);
             }
         }
     }

@@ -3820,6 +3820,10 @@ pub struct CaParams {
     /// only when the cell is strictly greater, so a module compiled ahead
     /// of an unbumped cell does not bounce back to the old slot.
     pub resume_generation: u32,
+    /// `compile_loop` / `compile_bridge` snapshot of this cpu's six exit
+    /// cells (`runner.rs` `AttachedDescrPtrs` captured at entry). `0` is
+    /// unattached: direct codegen tests leave the fields at default.
+    pub attached: majit_backend::AttachedDescrPtrs,
 }
 
 /// Per-CALL_ASSEMBLER target dispatch baked into the corresponding wasm arm.
@@ -4111,8 +4115,8 @@ pub struct InlineTripProbe {
     pub threshold: u64,
     /// `__indirect_function_table` index of the `(i64) -> i64` callback.
     pub trip_fn_ptr: i64,
-    /// The callback's only argument: which deferred merge to install.
-    pub pending_id: i64,
+    /// The callback's only argument: address of the `PendingInlineSlot`.
+    pub pending_slot: i64,
 }
 
 /// Owned inputs for one wasm module build.  A loop retains this after its
@@ -5081,7 +5085,7 @@ pub fn build_wasm_module(
         }
         next_type_idx += max as u32 + 1;
     }
-    // Deferred-merge trip callback `(i64 pending_id) -> i64`, declared before
+    // Deferred-merge trip callback `(i64 pending_slot) -> i64`, declared before
     // the bridge-parameter arities so an armed probe cannot shift their
     // indices.
     let inline_trip_type_idx = next_type_idx;
@@ -5643,6 +5647,7 @@ fn build_function(
         gc_table_slots: &gc_table_slots,
         const_tables: &const_tables,
         const_table_base: gc_table_base,
+        attached: ca.attached,
     };
     let mut locals = Vec::new();
     let mut start = 0;
@@ -6762,7 +6767,7 @@ fn build_function(
                     ref_homes,
                     frame,
                     op,
-                    exit_index(op, guard_idx),
+                    exit_index(op, guard_idx, guard_dispatch.attached),
                     None,
                     guard_dispatch.const_tables,
                     guard_dispatch.const_table_base,
@@ -7956,6 +7961,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.attached.propagate_exception_descr,
                 );
                 // rewrite.py `clear_varsize_gc_fields` FLAG_STR / FLAG_UNICODE:
                 // `emit_setfield(result, 0, descr=hash_descr)`. Both layouts
@@ -8128,6 +8134,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.attached.propagate_exception_descr,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8232,6 +8239,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.attached.propagate_exception_descr,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8419,6 +8427,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.attached.propagate_exception_descr,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8645,6 +8654,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.attached.propagate_exception_descr,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8679,6 +8689,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.attached.propagate_exception_descr,
                 );
             }
             OpCode::ZeroArray => {
@@ -8862,6 +8873,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.attached.propagate_exception_descr,
                 );
                 // Recycled nursery bytes. The entry publish unions with the
                 // live map, so a fresh frame must start with a null map or
@@ -8946,15 +8958,22 @@ fn build_function(
                 // kind (`_call_assembler_check_descr`). The result is already
                 // in F'[1]. Any other cell is a guard deopt or a raising
                 // finish; `wasm_ca_resume_deopt` blackhole-resumes it.
-                let finish_ptr = crate::failguard::finish_descr_ptr(
-                    crate::failguard::done_with_this_frame_exit_index(op.opcode.result_type()),
-                );
+                let finish_ptr = ca
+                    .attached
+                    .done_with_this_frame_descr_ptr_for_type(op.opcode.result_type());
                 sink.local_get(ca_cfp_local);
                 sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
                 sink.i32_sub();
                 sink.i32_load(memarg(majit_backend::jitframe::JF_DESCR_OFS as u64, 2));
-                sink.i32_const(finish_ptr as i32);
-                sink.i32_eq();
+                // `0` is the unattached answer (`AttachedDescrPtrs`). It must
+                // not compare equal to an unset `jf_descr`.
+                if finish_ptr == 0 {
+                    sink.drop();
+                    sink.i32_const(0);
+                } else {
+                    sink.i32_const(finish_ptr as i32);
+                    sink.i32_eq();
+                }
                 sink.if_(BlockType::Result(ValType::I64));
                 // clean finish: result Ref = F'[1] (output slot 0).
                 sink.local_get(ca_cfp_local);
@@ -9657,7 +9676,7 @@ pub fn entry_dispatch_key_count(ops: &[Op]) -> usize {
     }
 }
 
-/// `counter += 1; if counter == threshold { trip(pending_id) }`, at the entry
+/// `counter += 1; if counter == threshold { trip(pending_slot) }`, at the entry
 /// of an out-of-line bridge whose merge into its owner is waiting on this
 /// count. Equality rather than `>=` so the callback fires exactly once.
 ///
@@ -9685,7 +9704,7 @@ fn emit_inline_trip_probe(sink: &mut PeepSink<'_, '_>, probe: InlineTripProbe, t
     // Install from here. The probe runs in the bridge module; the parent
     // stays on the stack and is not re-entered. The parent's next back-edge
     // reads the resume cell and tail-calls the replacement.
-    sink.i64_const(probe.pending_id);
+    sink.i64_const(probe.pending_slot);
     sink.i32_const(probe.trip_fn_ptr as i32);
     sink.call_indirect(0, type_idx);
     sink.drop(); // returns 0; ignored
@@ -10583,6 +10602,8 @@ struct BridgeDispatch<'a> {
     /// base of the table that owns the operation currently being emitted.
     const_tables: &'a ConstPtrTables,
     const_table_base: u32,
+    /// See [`CaParams::attached`].
+    attached: majit_backend::AttachedDescrPtrs,
 }
 
 fn emit_guard_true(
@@ -11077,7 +11098,7 @@ fn emit_force_bracket_before_call(
         ref_homes,
         frame,
         next_op,
-        exit_index(next_op, guard_idx),
+        exit_index(next_op, guard_idx, dispatch.attached),
         Some(ops[op_idx].pos().get().raw()),
         dispatch.const_tables,
         dispatch.const_table_base,
@@ -11253,11 +11274,11 @@ fn emit_store_guard_exc(sink: &mut PeepSink<'_, '_>, op: &Op) {
 /// can recognise it with one compare. Guards, and the N-ary finishes pyre adds
 /// on top of the `_DoneWithThisFrameDescr` family's 0/1-result classes, have no
 /// shared identity and keep their own exit.
-fn exit_index(op: &Op, guard_idx: u32) -> u32 {
+fn exit_index(op: &Op, guard_idx: u32, attached: majit_backend::AttachedDescrPtrs) -> u32 {
     if op.opcode != OpCode::Finish {
         return guard_idx;
     }
-    crate::failguard::attached_finish_exit_index(&op.getdescr()).unwrap_or(guard_idx)
+    crate::failguard::attached_finish_exit_index(&attached, &op.getdescr()).unwrap_or(guard_idx)
 }
 
 fn emit_guard_fail_args_spill(
@@ -11409,10 +11430,17 @@ fn emit_memory_error_check(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
+    propagate_exception_descr: usize,
 ) {
     emit_resolve(sink, constants, value_types, value);
     sink.i64_eqz();
-    emit_memory_error_on_truthy(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
+    emit_memory_error_on_truthy(
+        sink,
+        residual_type_base,
+        ca_reload_fn_ptr,
+        jf_top_addr,
+        propagate_exception_descr,
+    );
 }
 
 fn emit_memory_error_if_i32_zero(
@@ -11420,9 +11448,16 @@ fn emit_memory_error_if_i32_zero(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
+    propagate_exception_descr: usize,
 ) {
     sink.i32_eqz();
-    emit_memory_error_on_truthy(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
+    emit_memory_error_on_truthy(
+        sink,
+        residual_type_base,
+        ca_reload_fn_ptr,
+        jf_top_addr,
+        propagate_exception_descr,
+    );
 }
 
 fn emit_memory_error_on_truthy(
@@ -11430,9 +11465,10 @@ fn emit_memory_error_on_truthy(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
+    propagate_exception_descr: usize,
 ) {
     sink.if_(BlockType::Empty);
-    if crate::failguard::propagate_exception_attached() {
+    if propagate_exception_descr != 0 {
         emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
         // `_store_and_reset_exception`: JIT_EXC_VALUE → jf_guard_exc, then
         // clear both globals. `grab_exc_value` reads jf_guard_exc.
@@ -11452,7 +11488,7 @@ fn emit_memory_error_on_truthy(
         emit_store_header_word(
             sink,
             majit_backend::jitframe::JF_DESCR_OFS as u64,
-            crate::failguard::propagate_exception_descr_ptr(),
+            propagate_exception_descr,
         );
         sink.local_get(0);
         sink.return_();
@@ -11551,17 +11587,18 @@ fn emit_guard_fail_index_store(
     // (`_build_failure_recovery`).
     if dispatch.exit_table_base == 0 {
         sink.local_get(0);
-        sink.i64_const(exit_index(op, guard_idx) as i64);
+        sink.i64_const(exit_index(op, guard_idx, dispatch.attached) as i64);
         sink.i64_store(mem64(0));
         return;
     }
     if op.opcode == OpCode::Finish
-        && let Some(index) = crate::failguard::attached_finish_exit_index(&op.getdescr())
+        && let Some(index) =
+            crate::failguard::attached_finish_exit_index(&dispatch.attached, &op.getdescr())
     {
         emit_store_header_word(
             sink,
             majit_backend::jitframe::JF_DESCR_OFS as u64,
-            crate::failguard::finish_descr_ptr(index),
+            crate::failguard::finish_cell_ptr(&dispatch.attached, index),
         );
     } else if dispatch.exit_table_base == 0 {
         emit_store_header_word(sink, majit_backend::jitframe::JF_DESCR_OFS as u64, 0);
@@ -12566,6 +12603,7 @@ mod tests {
             gc_table_slots: &HashMap::new(),
             const_tables: &const_tables,
             const_table_base: 0,
+            attached: majit_backend::AttachedDescrPtrs::default(),
         };
 
         assert_eq!(inline_region_br_depth(&inline, &dispatch, 0), 0);

@@ -623,67 +623,6 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     {
         arm.call(&mut store, ())?;
     }
-    if std::env::var_os("PYRE_WASM_REEMIT").is_some()
-        && let Ok(arm) = instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_reemit_enable")
-    {
-        arm.call(&mut store, ())?;
-    }
-    // Loop-closing bridge inlining is the default. The guest has no
-    // environment, so an explicit host-side opt-out must travel through this
-    // export before tracing begins.
-    if std::env::var_os("PYRE_WASM_INLINE_BRIDGE")
-        .is_some_and(|value| matches!(value.to_str().map(str::trim), Some("0" | "false" | "off")))
-        && let Ok(arm) =
-            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_inline_bridge_disable")
-    {
-        arm.call(&mut store, ())?;
-    }
-    // In-module resume at a non-header LABEL is opt-IN, not opt-out: the shape
-    // is emitted and unit-tested but miscompiles on real IR. This export exists
-    // so the arm can be A/B'd on one binary while that is chased down.
-    if std::env::var_os("PYRE_WASM_INLINE_NONHEADER")
-        .is_some_and(|value| matches!(value.to_str().map(str::trim), Some("1" | "true" | "on")))
-        && let Ok(arm) =
-            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_inline_nonheader_enable")
-    {
-        arm.call(&mut store, ())?;
-    }
-    // A deferred merge re-emits its whole owner, so what it costs cranelift
-    // scales with that module's size. `PYRE_WASM_INLINE_TRIP_BYTES=<N>` prices
-    // it at N bridge entries per byte; the guest keeps its flat entry
-    // threshold as the floor. Set so the two rates behind that conversion can
-    // be swept on one binary.
-    if let Some(entries_per_byte) = std::env::var("PYRE_WASM_INLINE_TRIP_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        && let Ok(arm) =
-            instance.get_typed_func::<u64, ()>(&mut store, "pyre_jit_inline_trip_bytes_factor")
-    {
-        arm.call(&mut store, entries_per_byte)?;
-    }
-    // The eager merge arm re-emits its owner without waiting for the entry
-    // evidence the deferred arm waits for. `PYRE_WASM_INLINE_EAGER_MAX_BYTES=<N>`
-    // stops it once that owner is larger than N bytes. Set so the ceiling can
-    // be swept on one binary.
-    if let Some(max_bytes) = std::env::var("PYRE_WASM_INLINE_EAGER_MAX_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        && let Ok(arm) =
-            instance.get_typed_func::<u32, ()>(&mut store, "pyre_jit_inline_eager_max_bytes")
-    {
-        arm.call(&mut store, max_bytes)?;
-    }
-    // Parameter bridge entries are the default. The guest has no environment,
-    // so an explicit host-side opt-out must travel through this export before
-    // tracing begins.
-    if std::env::var_os("PYRE_WASM_BRIDGE_PARAMS")
-        .is_some_and(|value| matches!(value.to_str().map(str::trim), Some("0" | "false" | "off")))
-        && let Ok(arm) =
-            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_bridge_params_disable")
-    {
-        arm.call(&mut store, ())?;
-    }
-
     let src = source.as_bytes();
     let len = src.len() as u32;
     let in_ptr = if len == 0 {

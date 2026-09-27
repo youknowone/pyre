@@ -17262,17 +17262,6 @@ impl<M: Clone> MetaInterp<M> {
             });
         }
 
-        // `PropagateExceptionDescr.handle_fail` raises
-        // `ExitFrameWithExceptionRef`. `RunResult` has no separate arm; the
-        // value is the exception ref, and this is not a back-edge JUMP.
-        if result.is_exit_frame_with_exception {
-            return Some(RunResult::Finished {
-                values,
-                meta,
-                savedata,
-            });
-        }
-
         if let Some(jump) =
             Self::run_result_for_jump_exit(fail_index, values.clone(), meta.clone(), savedata)
         {

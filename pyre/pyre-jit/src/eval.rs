@@ -7846,12 +7846,6 @@ fn drive_unpack_iterable_trace(
                 }
                 break;
             }
-            // `PropagateExceptionDescr.handle_fail` — `fail_index` is
-            // `u32::MAX`, so this has to run before the back-edge break.
-            if is_exception_exit {
-                pending_err = drain_error_from_exc_ref(values.first().copied().unwrap_or(0));
-                break;
-            }
             // A normal back-edge JUMP (`fail_index == u32::MAX`) or a guard exit
             // that carries no resume storage cannot be blackhole-resumed; hand
             // the rest to `ln` rather than panic in the resume decoder.
@@ -11083,11 +11077,17 @@ fn execute_assembler(
     // borrowed. Install them now the trace has returned — the same level a
     // guard failure reaches `compile_bridge` from.
     #[cfg(target_arch = "wasm32")]
-    for pending_id in majit_backend_wasm::take_tripped_inlines() {
-        driver
+    {
+        let tripped = driver
             .meta_interp_mut()
             .backend_mut()
-            .install_pending_inline(pending_id);
+            .take_tripped_inlines();
+        for tripped in tripped {
+            driver
+                .meta_interp_mut()
+                .backend_mut()
+                .install_pending_inline(tripped);
+        }
     }
 
     // rstack.stack_check_slowpath → _StackOverflow parity: drain the

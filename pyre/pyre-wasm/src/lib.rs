@@ -1590,58 +1590,6 @@ mod host_abi {
         majit_backend_wasm::trace_entry_census_enable();
     }
 
-    /// Arm loop-module replacement before tracing begins. The host owns the
-    /// environment; this guest export carries that choice into the backend.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn pyre_jit_reemit_enable() {
-        majit_backend_wasm::reemit_enable();
-    }
-
-    /// Disable the default loop-closing bridge inlining. The host owns the
-    /// environment, so this call carries its explicit opt-out into the guest
-    /// before tracing begins. Inlining installs an accepted region by
-    /// rebuilding its owner, so leaving it on also leaves module replacement
-    /// reachable without `pyre_jit_reemit_enable`.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn pyre_jit_inline_bridge_disable() {
-        majit_backend_wasm::inline_bridge_disable();
-    }
-
-    /// Admit an inlined region that closes at a non-header LABEL. Opt-in: the
-    /// shape is emitted and unit-tested but miscompiles on real IR, so only a
-    /// host debugging that arm turns it on.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn pyre_jit_inline_nonheader_enable() {
-        majit_backend_wasm::inline_nonheader_enable();
-    }
-
-    /// Price a deferred merge by the size of the module it re-emits: the
-    /// argument is the entries the standing bridge must be entered per byte of
-    /// that module. The host owns the environment, so a run that wants a
-    /// setting other than the built-in one carries it in here before tracing
-    /// begins.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn pyre_jit_inline_trip_bytes_factor(entries_per_byte: u64) {
-        majit_backend_wasm::set_inline_trip_bytes_factor(entries_per_byte);
-    }
-
-    /// Decline the eager merge arm once the owner module it would re-emit is
-    /// larger than the argument, in bytes. The host owns the environment, so a
-    /// run that wants a ceiling other than the built-in one carries it in here
-    /// before tracing begins.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn pyre_jit_inline_eager_max_bytes(max_bytes: u32) {
-        majit_backend_wasm::set_inline_eager_max_bytes(max_bytes);
-    }
-
-    /// Disable the default guard-to-bridge parameter entries. The host owns
-    /// the environment, so this call carries its explicit opt-out into the
-    /// guest before tracing begins.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn pyre_jit_bridge_params_disable() {
-        majit_backend_wasm::bridge_params_disable();
-    }
-
     /// The armed census as the same packed pair, for the host to print under
     /// `PYRE_WASM_GUARD_CENSUS`. Same `top` as `pyrex` prints natively, so the
     /// two lines compare directly. Reading, not draining.
