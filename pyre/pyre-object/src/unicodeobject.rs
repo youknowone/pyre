@@ -1612,7 +1612,8 @@ pub extern "C" fn jit_str_slice(s: i64, start: i64, end: i64) -> i64 {
     }
 }
 
-/// `descr_count` / `ll_count` (`rstr.py`).
+/// `descr_count` / `ll_count`. The search is `ll_search` ->
+/// `rstring._search_normal`.
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_str_count_bounds(
     s: PyObjectRef,
@@ -1635,13 +1636,13 @@ pub extern "C" fn jit_str_count_bounds(
             }
             return w_str_codepoints_in_utf8(s, lo, hi) as i64 + 1;
         }
-        let mut count = 0i64;
-        let mut pos = lo;
-        while let Some(found) = find_bytes(hay, needle, pos, hi) {
-            count += 1;
-            pos = found + needle.len();
-        }
-        count
+        crate::rstring::search_normal(
+            hay,
+            needle,
+            lo,
+            hi,
+            crate::rstring::SearchMode::Count,
+        ) as i64
     }
 }
 
@@ -1679,32 +1680,8 @@ fn str_byte_window(s: PyObjectRef, start: i64, end: i64) -> Option<(usize, usize
     }
 }
 
-fn find_bytes(hay: &[u8], needle: &[u8], lo: usize, hi: usize) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(lo.min(hi));
-    }
-    if lo > hi || hi > hay.len() {
-        return None;
-    }
-    hay[lo..hi]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|p| lo + p)
-}
-
-fn rfind_bytes(hay: &[u8], needle: &[u8], lo: usize, hi: usize) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(hi.min(hay.len()).max(lo));
-    }
-    if lo > hi || hi > hay.len() {
-        return None;
-    }
-    hay[lo..hi]
-        .windows(needle.len())
-        .rposition(|w| w == needle)
-        .map(|p| lo + p)
-}
-
+/// `ll_search` -> `rstring._search_normal`. A negative result is -1;
+/// a hit is mapped back with `w_str_byte_to_index`.
 fn jit_str_search_bounds(
     s: PyObjectRef,
     sub: PyObjectRef,
@@ -1718,14 +1695,16 @@ fn jit_str_search_bounds(
         };
         let hay = w_str_get_wtf8(s).as_bytes();
         let needle = w_str_get_wtf8(sub).as_bytes();
-        let res = if forward {
-            find_bytes(hay, needle, lo, hi)
+        let mode = if forward {
+            crate::rstring::SearchMode::Find
         } else {
-            rfind_bytes(hay, needle, lo, hi)
+            crate::rstring::SearchMode::RFind
         };
-        match res {
-            Some(ri) => w_str_byte_to_index(s, ri) as i64,
-            None => -1,
+        let res = crate::rstring::search_normal(hay, needle, lo, hi, mode);
+        if res < 0 {
+            -1
+        } else {
+            w_str_byte_to_index(s, res as usize) as i64
         }
     }
 }

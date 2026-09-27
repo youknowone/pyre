@@ -23744,36 +23744,36 @@ fn bytes_idx_window(len: usize, bounds: (Option<i64>, Option<i64>)) -> Option<(u
 
 /// First index of `needle` within `hay`; empty needle matches at 0.
 fn bytes_find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    let index = crate::type_methods::rstring_search_normal(
+    let index = pyre_object::rstring::search_normal(
         hay,
         needle,
         0,
         hay.len(),
-        crate::type_methods::SearchMode::Find,
+        pyre_object::rstring::SearchMode::Find,
     );
     (index >= 0).then_some(index as usize)
 }
 
 /// Last index of `needle` within `hay`; empty needle matches at `len`.
 fn bytes_rfind_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    let index = crate::type_methods::rstring_search_normal(
+    let index = pyre_object::rstring::search_normal(
         hay,
         needle,
         0,
         hay.len(),
-        crate::type_methods::SearchMode::RFind,
+        pyre_object::rstring::SearchMode::RFind,
     );
     (index >= 0).then_some(index as usize)
 }
 
 /// Non-overlapping occurrence count; empty needle yields `len + 1`.
 fn bytes_count_subslices(hay: &[u8], needle: &[u8]) -> usize {
-    crate::type_methods::rstring_search_normal(
+    pyre_object::rstring::search_normal(
         hay,
         needle,
         0,
         hay.len(),
-        crate::type_methods::SearchMode::Count,
+        pyre_object::rstring::SearchMode::Count,
     ) as usize
 }
 
