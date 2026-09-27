@@ -2434,7 +2434,7 @@ pub fn startup_array_module(
     execution_context: *const crate::PyExecutionContext,
 ) -> Result<(), crate::PyError> {
     let abc_module = crate::importing::importhook(
-        "_collections_abc",
+        rustpython_wtf8::Wtf8::new("_collections_abc"),
         pyre_object::PY_NULL,
         pyre_object::w_tuple_new(vec![pyre_object::w_str_new("MutableSequence")]),
         0,

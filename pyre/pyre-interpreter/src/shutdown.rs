@@ -26,9 +26,15 @@ fn run_atexit_callbacks(
     canonical: pyre_object::PyObjectRef,
     ec_ptr: *const crate::executioncontext::PyExecutionContext,
 ) {
-    let result = crate::importing::importhook("atexit", canonical, pyre_object::PY_NULL, 0, ec_ptr)
-        .and_then(|module| crate::getattr(module, pyre_object::w_str_new("_run_exitfuncs")))
-        .and_then(|callback| crate::call::call_function_impl_result(callback, &[]));
+    let result = crate::importing::importhook(
+        rustpython_wtf8::Wtf8::new("atexit"),
+        canonical,
+        pyre_object::PY_NULL,
+        0,
+        ec_ptr,
+    )
+    .and_then(|module| crate::getattr(module, pyre_object::w_str_new("_run_exitfuncs")))
+    .and_then(|callback| crate::call::call_function_impl_result(callback, &[]));
     if let Err(mut error) = result {
         error.write_unraisable(
             pyre_object::w_none(),

@@ -2077,7 +2077,7 @@ fn parse_replacement_template(
         Some(w_parser) => w_parser,
         None => {
             let w_re = crate::importing::importhook(
-                "re",
+                rustpython_wtf8::Wtf8::new("re"),
                 pyre_object::w_none(),
                 pyre_object::w_none(),
                 0,
