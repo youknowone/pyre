@@ -78,15 +78,6 @@ def _scripts(filter_substring: str | None, gated_only: bool = False) -> list[Pat
     return out
 
 
-def _expects_failure(script: Path) -> bool:
-    """An `xfail_`-prefixed snippet asserts the runner notices a failure.
-
-    The imported RustPython corpus carries these as harness self-tests; they
-    pass when the interpreter exits non-zero.
-    """
-    return script.name.startswith("xfail_")
-
-
 def _run(cmd: list[str], script: Path, timeout: int) -> tuple[bool, str, str]:
     try:
         proc = subprocess.run(
@@ -103,10 +94,6 @@ def _run(cmd: list[str], script: Path, timeout: int) -> tuple[bool, str, str]:
         if isinstance(captured, bytes):
             captured = captured.decode("utf-8", "replace")
         return False, f"timeout after {timeout}s", captured
-    if _expects_failure(script):
-        if proc.returncode != 0:
-            return True, "", ""
-        return False, "rc=0 but the snippet is expected to fail", proc.stdout
     if proc.returncode == 0:
         return True, "", ""
     err = proc.stderr.strip().splitlines()
