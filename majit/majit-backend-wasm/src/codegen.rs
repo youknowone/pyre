@@ -743,9 +743,28 @@ fn memarg(offset: u64, align: u32) -> MemArg {
 /// Every instruction method used by this emitter is spelled out below.  In
 /// particular, this type deliberately does not implement `Deref`: reaching
 /// the underlying sink without flushing would reorder pending instructions.
+/// What `end` closes. Only `if` splits the straight-line `jf_gcmap` fact:
+/// an arm may store, and the join must keep the value from before the `if`.
+enum GcmapCtrl {
+    Block,
+    /// Loop header is a back-edge target, so the body cannot inherit a
+    /// pre-loop map. The fall-through after `end` cannot either.
+    Loop,
+    /// `jf_gcmap` value known on every path that entered this `if`.
+    If(i64),
+}
+
 struct PeepSink<'sink, 'buf> {
     sink: &'sink mut InstructionSink<'buf>,
     pending: Vec<PendingInstruction>,
+    /// `local 0 - FIRST_ITEM_OFFSET`, the jitframe base. `0` means this
+    /// function has no header (`compute_home_gcmap` is off) and must not
+    /// write `jf_gcmap`.
+    gcmap_frame_local: u32,
+    /// Pointer last stored to `jf_gcmap` on the straight-line path.
+    /// `i64::MIN` means the next push must store.
+    gcmap_known: i64,
+    gcmap_ctrl: Vec<GcmapCtrl>,
 }
 
 #[derive(Clone, Copy)]
@@ -799,7 +818,26 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         Self {
             sink,
             pending: Vec::with_capacity(2),
+            gcmap_frame_local: 0,
+            gcmap_known: i64::MIN,
+            gcmap_ctrl: Vec::new(),
         }
+    }
+
+    /// Items base is in local 0. Refresh the jitframe base local from it.
+    fn sync_gcmap_frame(&mut self) {
+        let frame = self.gcmap_frame_local;
+        if frame == 0 {
+            return;
+        }
+        self.local_get(0);
+        self.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+        self.i32_sub();
+        self.local_set(frame);
+    }
+
+    fn gcmap_tracking(&self) -> bool {
+        self.gcmap_frame_local != 0
     }
 
     /// Commit every buffered instruction in program order.
@@ -1107,10 +1145,65 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         self
     }
 
+    fn else_(&mut self) -> &mut Self {
+        self.flush();
+        if self.gcmap_tracking()
+            && let Some(GcmapCtrl::If(saved)) = self.gcmap_ctrl.last()
+        {
+            self.gcmap_known = *saved;
+        }
+        self.sink.else_();
+        self
+    }
+
+    fn end(&mut self) -> &mut Self {
+        self.flush();
+        if self.gcmap_tracking() {
+            match self.gcmap_ctrl.pop() {
+                // The join runs whether or not the arm stored, so the
+                // pre-`if` fact does not survive. Arms still see it on entry.
+                Some(GcmapCtrl::If(_)) => self.gcmap_known = i64::MIN,
+                // `br` lands at the end of a block, and a loop's back edge
+                // lands at its header. Neither path has the body's stores.
+                Some(GcmapCtrl::Loop | GcmapCtrl::Block) => self.gcmap_known = i64::MIN,
+                None => {}
+            }
+        }
+        self.sink.end();
+        self
+    }
+
+    fn block(&mut self, block_type: BlockType) -> &mut Self {
+        self.flush();
+        if self.gcmap_tracking() {
+            self.gcmap_ctrl.push(GcmapCtrl::Block);
+        }
+        self.sink.block(block_type);
+        self
+    }
+
+    fn if_(&mut self, block_type: BlockType) -> &mut Self {
+        self.flush();
+        if self.gcmap_tracking() {
+            self.gcmap_ctrl.push(GcmapCtrl::If(self.gcmap_known));
+        }
+        self.sink.if_(block_type);
+        self
+    }
+
+    fn loop_(&mut self, block_type: BlockType) -> &mut Self {
+        self.flush();
+        if self.gcmap_tracking() {
+            // Back-edge target: a store before the loop does not dominate.
+            self.gcmap_known = i64::MIN;
+            self.gcmap_ctrl.push(GcmapCtrl::Loop);
+        }
+        self.sink.loop_(block_type);
+        self
+    }
+
     forward_zero!(
         drop,
-        else_,
-        end,
         f64_abs,
         f64_add,
         f64_convert_i64_s,
@@ -1158,7 +1251,6 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
     );
 
     forward_one!(
-        block(block_type: BlockType),
         br(label: u32),
         br_if(label: u32),
         call(function: u32),
@@ -1185,9 +1277,7 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         i32_store8(memarg: MemArg),
         i64_load(memarg: MemArg),
         i64_store(memarg: MemArg),
-        if_(block_type: BlockType),
         local_tee(local: u32),
-        loop_(block_type: BlockType),
         memory_fill(mem: u32),
         return_call(function: u32),
     );
@@ -1982,6 +2072,244 @@ pub fn build_home_gcmap(
     buf.into_boxed_slice()
 }
 
+/// Item index of ordinary Ref home `home`. Tail homes go through
+/// [`FrameGeometry::home_ofs`]; prefix homes stay at `home_slot_base`.
+fn home_item_index(frame: FrameGeometry, home: u32) -> u32 {
+    let sign = std::mem::size_of::<isize>();
+    (frame.home_ofs(home as u64) as usize / sign) as u32
+}
+
+/// Intern equal bitmaps so each distinct safepoint map is one parked block.
+struct ParkedGcmaps {
+    sink: usize,
+    cached: Vec<(Box<[usize]>, i64)>,
+}
+
+impl ParkedGcmaps {
+    fn intern(&mut self, mut indices: Vec<u32>) -> i64 {
+        if indices.is_empty() {
+            return 0;
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        let map = gcmap_for_item_indices(&indices);
+        for (bits, ptr) in &self.cached {
+            if bits.as_ref() == map.as_ref() {
+                return *ptr;
+            }
+        }
+        let ptr = crate::release::park_gcmap_raw(self.sink, map.clone()) as i64;
+        self.cached.push((map, ptr));
+        ptr
+    }
+}
+
+/// First op index at which each value id's home has been stored.
+///
+/// `regalloc.py` `get_gcmap` marks a slot only while a live box is bound
+/// there. Built in one pass: an input is stored before op 0, an inlined
+/// region's live-in at `region.ops_start` (`emit_guard_inline_bridge_move`),
+/// and a producer at `i` from op `i + 1`. A LABEL phi dated at the label is
+/// not a store on the key-0 path (`consider_label` spills only when the
+/// allocator wrote the slot). "Stored before `at`" is `threshold <= at`.
+struct HomeStoreAt {
+    /// `i32::MAX` — the home is never stored.
+    at: Vec<i32>,
+}
+
+impl HomeStoreAt {
+    fn build(inputargs: &[InputArgRc], ops: &[Op], regions: &[InlinedRegionSpan]) -> Self {
+        let mut at = Vec::new();
+        let note = |at: &mut Vec<i32>, id: u32, when: i32| {
+            let i = id as usize;
+            if i >= at.len() {
+                at.resize(i + 1, i32::MAX);
+            }
+            if at[i] == i32::MAX {
+                at[i] = when;
+            }
+        };
+        for ia in inputargs {
+            note(&mut at, ia.index, 0);
+        }
+        // Region live-ins override a function input: the id is not stored on
+        // the entry path, only from the region's first op.
+        for region in regions {
+            let when = i32::try_from(region.ops_start).unwrap_or(i32::MAX);
+            for &id in &region.inputarg_ids {
+                let i = id as usize;
+                if i >= at.len() {
+                    at.resize(i + 1, i32::MAX);
+                }
+                at[i] = when;
+            }
+        }
+        for (i, op) in ops.iter().enumerate() {
+            let r = op.pos().get();
+            if r == OpRef::NONE || r.is_constant() {
+                continue;
+            }
+            let when = i32::try_from(i + 1).unwrap_or(i32::MAX);
+            note(&mut at, r.raw(), when);
+        }
+        Self { at }
+    }
+
+    fn threshold(&self, raw: u32) -> i32 {
+        self.at.get(raw as usize).copied().unwrap_or(i32::MAX)
+    }
+
+    fn stored_before(&self, raw: u32, at_op: usize) -> bool {
+        self.threshold(raw) <= i32::try_from(at_op).unwrap_or(i32::MAX)
+    }
+}
+
+/// `get_gcmap` marks a frame slot only when a live Ref binding is in it.
+/// An inlined region is a separate entry: only the live-in move at
+/// `ops_start` and stores inside the region have written the slot.
+/// A LABEL does not clear homes. The key-0 path stored them before the
+/// `br` over the resume loader, and that loader (plus capture restore)
+/// rewrites the same ordinary homes on the resume path.
+fn ref_home_stored_for_site(
+    raw: u32,
+    at: usize,
+    store_at: &HomeStoreAt,
+    ops: &[Op],
+    regions: &[InlinedRegionSpan],
+) -> bool {
+    if let Some(region) = regions.iter().rev().find(|region| at >= region.ops_start) {
+        let end = regions
+            .iter()
+            .find(|later| later.ops_start > region.ops_start)
+            .map(|later| later.ops_start)
+            .unwrap_or(ops.len());
+        if at < end {
+            let t = store_at.threshold(raw);
+            return t != i32::MAX && (t as usize) >= region.ops_start && (t as usize) <= at;
+        }
+    }
+    store_at.stored_before(raw, at)
+}
+
+/// `(value id, home index)` pairs `get_gcmap` marks at `at`: Ref homes live
+/// across the op whose store dominates it. Id order matches `RefHomes::iter`.
+/// The parked bitmap and the post-call reload both use this vec, so a reload
+/// never reads a slot the map did not trace.
+fn site_live_homes(
+    ref_homes: &RefHomes,
+    liveness: &HomeLiveness,
+    store_at: &HomeStoreAt,
+    ops: &[Op],
+    regions: &[InlinedRegionSpan],
+    at: usize,
+) -> Vec<(u32, u32)> {
+    let mut homes = Vec::new();
+    for (raw, h) in ref_homes.iter() {
+        if !liveness.live_across(raw, at) {
+            continue;
+        }
+        if !ref_home_stored_for_site(raw, at, store_at, ops, regions) {
+            continue;
+        }
+        homes.push((raw, h));
+    }
+    homes
+}
+
+fn collecting_site(op: &Op) -> bool {
+    (op.opcode.is_call() && call_can_collect(op))
+        || op.opcode.is_malloc()
+        || op.opcode.is_call_assembler()
+}
+
+/// One parked pointer per op, plus the `(raw, home)` list that pointer marks.
+/// `0` is not a collecting site, or the exact `get_gcmap` set is empty.
+/// Identical bitmaps share one pointer. The home list is what
+/// [`emit_reload_refs_from_homes`] reloads.
+fn build_site_gcmaps(
+    frame: FrameGeometry,
+    ref_homes: &RefHomes,
+    liveness: &HomeLiveness,
+    store_at: &HomeStoreAt,
+    ops: &[Op],
+    regions: &[InlinedRegionSpan],
+    sink: usize,
+    park: bool,
+) -> (Vec<i64>, Vec<Vec<(u32, u32)>>) {
+    let mut parked = ParkedGcmaps {
+        sink,
+        cached: Vec::new(),
+    };
+    let mut ptrs = Vec::with_capacity(ops.len());
+    let mut homes = Vec::with_capacity(ops.len());
+    for (at, op) in ops.iter().enumerate() {
+        if !collecting_site(op) {
+            ptrs.push(0);
+            homes.push(Vec::new());
+            continue;
+        }
+        let live = site_live_homes(ref_homes, liveness, store_at, ops, regions, at);
+        let ptr = if park {
+            let indices = live
+                .iter()
+                .map(|&(_, h)| home_item_index(frame, h))
+                .collect();
+            parked.intern(indices)
+        } else {
+            0
+        };
+        ptrs.push(ptr);
+        homes.push(live);
+    }
+    (ptrs, homes)
+}
+
+/// assembler.py `push_gcmap(..., store=True)`: one `i32.store`/`i64.store`
+/// at `jf_gcmap`, addressed from the jitframe-base local. A `call` here
+/// would spill every live wasm local. A straight-line path that already
+/// holds `ptr` emits nothing; `pop_gcmap` still stores 0.
+fn emit_push_gcmap(sink: &mut PeepSink<'_, '_>, ptr: i64) {
+    if ptr == 0 || sink.gcmap_frame_local == 0 || sink.gcmap_known == ptr {
+        return;
+    }
+    emit_gcmap_store(sink, ptr);
+    sink.gcmap_known = ptr;
+}
+
+/// assembler.py `pop_gcmap`: one store of 0. Same no-call constraint as
+/// [`emit_push_gcmap`]. Not elided: the call returns with the map still
+/// installed, and the next straight-line push must see 0.
+fn emit_pop_gcmap(sink: &mut PeepSink<'_, '_>) {
+    if sink.gcmap_frame_local == 0 {
+        return;
+    }
+    emit_gcmap_store(sink, 0);
+    sink.gcmap_known = 0;
+}
+
+fn emit_gcmap_store(sink: &mut PeepSink<'_, '_>, ptr: i64) {
+    use majit_backend::jitframe::{JF_GCMAP_OFS, SIZEOFSIGNED};
+    sink.local_get(sink.gcmap_frame_local);
+    if SIZEOFSIGNED == 4 {
+        sink.i32_const(ptr as i32);
+        sink.i32_store(memarg(JF_GCMAP_OFS as u64, 2));
+    } else {
+        sink.i64_const(ptr);
+        sink.i64_store(memarg(JF_GCMAP_OFS as u64, 3));
+    }
+}
+
+fn emit_push_site(sink: &mut PeepSink<'_, '_>, site_gcmap: &[i64], op_idx: usize) {
+    let ptr = site_gcmap.get(op_idx).copied().unwrap_or(0);
+    emit_push_gcmap(sink, ptr);
+}
+
+fn emit_pop_site(sink: &mut PeepSink<'_, '_>, site_gcmap: &[i64], op_idx: usize) {
+    if site_gcmap.get(op_idx).copied().unwrap_or(0) != 0 {
+        emit_pop_gcmap(sink);
+    }
+}
+
 /// First free value position — one past the highest id any value reference in
 /// the trace occupies (input args, op results, and every op argument, including
 /// a folded value the constants pool alone binds).
@@ -2230,11 +2558,29 @@ fn emit_wb_helper_call(
     residual_type_base: u32,
     fn_ptr: i64,
     base_ref: OpRef,
+    gcmap_ptr: i64,
+    ca_reload_fn_ptr: i64,
+    jf_top_addr: Option<u32>,
 ) {
+    // assembler.py `push_gcmap` on the write-barrier slow path. The fast
+    // path does not call and does not publish a map.
+    emit_push_gcmap(sink, gcmap_ptr);
     emit_resolve(sink, constants, value_types, base_ref);
     sink.i32_const(fn_ptr as i32);
     sink.call_indirect(0, residual_type_base + 1);
     sink.drop();
+    if gcmap_ptr != 0 {
+        // The helper may move the frame. `pop_gcmap` has to clear the
+        // forwarded jitframe, the same order as `_reload_frame_if_necessary`
+        // before `pop_gcmap`.
+        emit_reload_frame_if_necessary(
+            sink,
+            Some(residual_type_base),
+            ca_reload_fn_ptr,
+            jf_top_addr,
+        );
+        emit_pop_gcmap(sink);
+    }
 }
 
 /// Emit a write-barrier check on `base_ref` for a rewriter `CondCallGcWb` /
@@ -2258,6 +2604,9 @@ fn emit_write_barrier(
     wb: &WriteBarrierHelpers,
     base_ref: OpRef,
     card_index: Option<OpRef>,
+    gcmap_ptr: i64,
+    ca_reload_fn_ptr: i64,
+    jf_top_addr: Option<u32>,
 ) -> Result<(), BackendError> {
     let Some(base) = residual_type_base else {
         return Err(BackendError::Unsupported(
@@ -2283,6 +2632,9 @@ fn emit_write_barrier(
                 base,
                 wb.array_fn_ptr,
                 base_ref,
+                gcmap_ptr,
+                ca_reload_fn_ptr,
+                jf_top_addr,
             );
             emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
             sink.i32_const(i32::from(wb.cards_set));
@@ -2293,7 +2645,17 @@ fn emit_write_barrier(
             sink.end();
         }
         None => {
-            emit_wb_helper_call(sink, constants, value_types, base, wb.fn_ptr, base_ref);
+            emit_wb_helper_call(
+                sink,
+                constants,
+                value_types,
+                base,
+                wb.fn_ptr,
+                base_ref,
+                gcmap_ptr,
+                ca_reload_fn_ptr,
+                jf_top_addr,
+            );
         }
     }
     sink.end();
@@ -2308,6 +2670,9 @@ fn emit_jitframe_write_barrier(
     sink: &mut PeepSink<'_, '_>,
     residual_type_base: Option<u32>,
     wb: &WriteBarrierHelpers,
+    gcmap_ptr: i64,
+    ca_reload_fn_ptr: i64,
+    jf_top_addr: Option<u32>,
 ) -> Result<(), BackendError> {
     let Some(base) = residual_type_base else {
         return Err(BackendError::Unsupported(
@@ -2331,9 +2696,14 @@ fn emit_jitframe_write_barrier(
     sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
     sink.i32_sub();
     sink.i64_extend_i32_u();
+    emit_push_gcmap(sink, gcmap_ptr);
     sink.i32_const(wb.fn_ptr as i32);
     sink.call_indirect(0, base + 1);
     sink.drop();
+    if gcmap_ptr != 0 {
+        emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
+        emit_pop_gcmap(sink);
+    }
     sink.end();
     Ok(())
 }
@@ -2446,6 +2816,26 @@ impl HomeLiveness {
             for &id in &region.inputarg_ids {
                 if let Some(d) = def_pos.get_mut(id as usize) {
                     *d = defined_at;
+                }
+            }
+        }
+        // `store_force_descr` keeps the GUARD_NOT_FORCED_2 gcmap as
+        // `_finish_gcmap` and `genop_finish` publishes it. Those homes have
+        // to stay traced at every later safepoint, or a collection frees the
+        // object and the retained map follows a dead nursery word.
+        let end = ops.len() as i32;
+        for op in ops.iter().filter(|op| op.opcode == OpCode::GuardNotForced2) {
+            let Some(fa) = op.getfailargs() else {
+                continue;
+            };
+            for a in fa.iter() {
+                let a = a.to_opref();
+                if a == OpRef::NONE || a.is_constant() || a.ty() != Some(Type::Ref) {
+                    continue;
+                }
+                let raw = a.raw() as usize;
+                if raw < last_use.len() {
+                    last_use[raw] = last_use[raw].max(end);
                 }
             }
         }
@@ -2601,68 +2991,32 @@ fn emit_check_frame_depth(
     );
     sink.local_get(result_local);
     sink.local_set(0);
+    sink.sync_gcmap_frame();
     sink.end();
-}
-
-fn emit_null_home_slots(
-    sink: &mut PeepSink<'_, '_>,
-    frame: FrameGeometry,
-    range: std::ops::Range<u64>,
-    mut wanted: impl FnMut(u64) -> bool,
-) {
-    /// Shortest run of adjacent slots that a `memory.fill` encodes smaller
-    /// than the individual stores it replaces.
-    const FILL_MIN_SLOTS: u64 = 3;
-
-    let mut slot = range.start;
-    while slot < range.end {
-        if !wanted(slot) {
-            slot += 1;
-            continue;
-        }
-        let start = slot;
-        while slot < range.end && wanted(slot) {
-            slot += 1;
-        }
-        let offset = frame.home_slot_base + start * SLOT_SIZE;
-        if slot - start < FILL_MIN_SLOTS {
-            for h in start..slot {
-                sink.local_get(0);
-                sink.i64_const(0);
-                sink.i64_store(mem64(frame.home_slot_base + h * SLOT_SIZE));
-            }
-            continue;
-        }
-        // `memory.fill` takes its destination as an operand, not as a memarg
-        // offset, so the frame base is added in.
-        sink.local_get(0);
-        sink.i32_const(offset as i32);
-        sink.i32_add();
-        sink.i32_const(0);
-        sink.i32_const(((slot - start) * SLOT_SIZE) as i32);
-        sink.memory_fill(0);
-    }
 }
 
 fn emit_reload_refs_from_homes(
     sink: &mut PeepSink<'_, '_>,
     value_types: &ValueLocals,
-    ref_homes: &RefHomes,
-    liveness: &HomeLiveness,
-    at_op: usize,
+    homes: &[(u32, u32)],
     skip_raw: Option<u32>,
     frame: FrameGeometry,
+    site_gcmap: &[i64],
+    at_op: usize,
 ) {
-    // `iter` yields id order, so the emitted module is reproducible without a
-    // sort; each reload is independent (home and local storage are disjoint).
-    for (raw, h) in ref_homes.iter() {
-        if Some(raw) == skip_raw || !liveness.live_across(raw, at_op) {
+    // `homes` is the set `site_live_homes` parked into `jf_gcmap` for this
+    // op. A home that no path has stored yet is absent, so the reload cannot
+    // clobber the local with nursery bytes (`arena_reset`).
+    for &(raw, h) in homes {
+        if Some(raw) == skip_raw {
             continue;
         }
         sink.local_get(0);
         sink.i64_load(mem64(frame.home_ofs(h as u64)));
         sink.local_set(value_types.local(raw));
     }
+    // assembler.py `pop_gcmap` after `_reload_frame_if_necessary`.
+    emit_pop_site(sink, site_gcmap, at_op);
 }
 
 /// RPython `_reload_frame_if_necessary` (x86 `assembler.py:1369`) for wasm
@@ -2685,6 +3039,7 @@ fn emit_reload_frame_if_necessary(
         sink.call_indirect(0, base);
         sink.i32_wrap_i64();
         sink.local_set(0);
+        sink.sync_gcmap_frame();
     } else {
         // No shadow top and no reload helper: no active GC, or an embedder
         // that never pushed a JitFrame. Reloading from a shadow stack that
@@ -2718,190 +3073,12 @@ fn emit_ca_reload_top(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
     sink.i32_const(4);
     sink.i32_sub();
     sink.i32_load(mem32(0));
+    if sink.gcmap_frame_local != 0 {
+        let frame = sink.gcmap_frame_local;
+        sink.local_tee(frame);
+    }
     sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
     sink.i32_add();
-}
-
-/// Publish `build_home_gcmap` on the live frame (`local 0` is the items
-/// base). `ptr == 0` is the test path that never installs a map.
-///
-/// assembler.py `push_gcmap` stores this site's map. Ordinary homes and
-/// LABEL captures grow independently, so two live maps can be incomparable
-/// and a later keyed resume must not drop the other region. The host
-/// `wasm_jit_union_gcmap` exists only for that case. A live map that
-/// already covers these bits — the same pointer, or a prior union — is
-/// left in place: a host call here sat on every keyed LABEL resume and
-/// every key-0 re-entry after the first, including the hot out-of-line
-/// loop-closing bridges that #1766 put over the wasm/dynasm ceiling.
-/// Without a residual type family (host tests) the store is still
-/// monotonic: publish this map only when it covers every live bit.
-fn emit_publish_home_gcmap(
-    sink: &mut PeepSink<'_, '_>,
-    ptr: i64,
-    map: &[usize],
-    old_local: u32,
-    idx_local: u32,
-    residual_type_base: Option<u32>,
-) {
-    if ptr == 0 || map.len() < 2 {
-        return;
-    }
-    use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JF_GCMAP_OFS, SIZEOFSIGNED};
-    let word = std::mem::size_of::<usize>() as u32;
-    let n_new = map[0];
-    let new_words = &map[1..];
-    let emit_hdr = |sink: &mut PeepSink<'_, '_>| {
-        sink.local_get(0);
-        sink.i32_const(FIRST_ITEM_OFFSET as i32);
-        sink.i32_sub();
-    };
-    let load_usize = |sink: &mut PeepSink<'_, '_>, offset: u64| {
-        if word == 4 {
-            sink.i32_load(memarg(offset, 2));
-        } else {
-            sink.i64_load(memarg(offset, 3));
-        }
-    };
-    let const_usize = |sink: &mut PeepSink<'_, '_>, value: usize| {
-        if word == 4 {
-            sink.i32_const(value as i32);
-        } else {
-            sink.i64_const(value as i64);
-        }
-    };
-    let publish = |sink: &mut PeepSink<'_, '_>| {
-        emit_hdr(sink);
-        sink.i64_const(ptr);
-        emit_word_store(sink, JF_GCMAP_OFS as u64);
-    };
-    emit_hdr(sink);
-    if SIZEOFSIGNED == 4 {
-        sink.i32_load(memarg(JF_GCMAP_OFS as u64, 2));
-    } else {
-        sink.i64_load(memarg(JF_GCMAP_OFS as u64, 3));
-        sink.i32_wrap_i64();
-    }
-    sink.local_tee(old_local);
-    sink.i32_eqz();
-    sink.if_(BlockType::Empty);
-    publish(sink);
-    sink.else_();
-    if let Some(base) = residual_type_base {
-        // `(i64, i64) -> i64` at `residual_type_base + 2`.
-        let union_fn = crate::wasm_jit_union_gcmap as *const () as usize as i64;
-        let ne_words = |sink: &mut PeepSink<'_, '_>| {
-            if word == 4 {
-                sink.i32_ne();
-            } else {
-                sink.i64_ne();
-            }
-        };
-        sink.block(BlockType::Empty); // $after
-        sink.local_get(old_local);
-        sink.i64_extend_i32_u();
-        sink.i64_const(ptr);
-        sink.i64_eq();
-        sink.br_if(0);
-        sink.block(BlockType::Empty); // $union
-        sink.local_get(old_local);
-        load_usize(sink, 0);
-        if word == 8 {
-            sink.i32_wrap_i64();
-        }
-        sink.i32_const(n_new as i32);
-        sink.i32_lt_u();
-        sink.br_if(0);
-        for (i, &new_word) in new_words.iter().enumerate() {
-            if new_word == 0 {
-                continue;
-            }
-            sink.local_get(old_local);
-            load_usize(sink, (1 + i as u32) as u64 * word as u64);
-            const_usize(sink, new_word);
-            if word == 4 {
-                sink.i32_and();
-            } else {
-                sink.i64_and();
-            }
-            const_usize(sink, new_word);
-            ne_words(sink);
-            sink.br_if(0);
-        }
-        sink.br(1);
-        sink.end(); // $union
-        emit_hdr(sink);
-        sink.local_get(old_local);
-        sink.i64_extend_i32_u();
-        sink.i64_const(ptr);
-        sink.i32_const(union_fn as i32);
-        sink.call_indirect(0, base + 2);
-        emit_word_store(sink, JF_GCMAP_OFS as u64);
-        sink.end(); // $after
-        sink.end();
-        return;
-    }
-    // Host-test fallback: no residual type family. Cover-check each live
-    // word against this module's map; leftover bits keep the live map.
-    sink.block(BlockType::Empty); // $keep
-    sink.block(BlockType::Empty); // $publish_ok
-    for (i, &new_word) in new_words.iter().enumerate() {
-        sink.local_get(old_local);
-        load_usize(sink, 0);
-        if word == 8 {
-            sink.i32_wrap_i64();
-        }
-        sink.i32_const(i as i32);
-        sink.i32_gt_u();
-        sink.if_(BlockType::Empty);
-        sink.local_get(old_local);
-        load_usize(sink, (1 + i as u32) as u64 * word as u64);
-        const_usize(sink, !new_word);
-        if word == 4 {
-            sink.i32_and();
-        } else {
-            sink.i64_and();
-            sink.i64_eqz();
-            sink.i32_eqz();
-        }
-        sink.br_if(2);
-        sink.end();
-    }
-    sink.i32_const(n_new as i32);
-    sink.local_set(idx_local);
-    sink.loop_(BlockType::Empty);
-    sink.local_get(idx_local);
-    sink.local_get(old_local);
-    load_usize(sink, 0);
-    if word == 8 {
-        sink.i32_wrap_i64();
-    }
-    sink.i32_lt_u();
-    sink.i32_eqz();
-    sink.br_if(1);
-    sink.local_get(old_local);
-    sink.local_get(idx_local);
-    sink.i32_const(1);
-    sink.i32_add();
-    sink.i32_const(word.trailing_zeros() as i32);
-    sink.i32_shl();
-    sink.i32_add();
-    load_usize(sink, 0);
-    if word == 8 {
-        sink.i64_eqz();
-        sink.i32_eqz();
-    }
-    sink.br_if(2);
-    sink.local_get(idx_local);
-    sink.i32_const(1);
-    sink.i32_add();
-    sink.local_set(idx_local);
-    sink.br(0);
-    sink.end();
-    sink.br(0);
-    sink.end();
-    publish(sink);
-    sink.end();
-    sink.end();
 }
 
 fn emit_word_store(sink: &mut PeepSink<'_, '_>, offset: u64) {
@@ -2994,6 +3171,10 @@ fn emit_ca_reload_caller(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
     sink.i32_const(12);
     sink.i32_sub();
     sink.i32_load(mem32(0));
+    if sink.gcmap_frame_local != 0 {
+        let frame = sink.gcmap_frame_local;
+        sink.local_tee(frame);
+    }
     sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
     sink.i32_add();
 }
@@ -5210,17 +5391,6 @@ pub fn build_wasm_module(
             scanned
         }
     };
-    // `emit_publish_home_gcmap` `call_indirect`s `wasm_jit_union_gcmap`
-    // at `residual_type_base + 2`. A reload-only census is arity 0, a
-    // write-barrier-only census arity 1; either leaves that slot missing
-    // or pointing at a later incompatible type.
-    let residual_max_arity = if (ca.compute_home_gcmap || ca.home_gcmap_ptr != 0)
-        && let Some(max) = residual_max_arity
-    {
-        Some(max.max(2))
-    } else {
-        residual_max_arity
-    };
     // `_check_frame_depth` calls `wasm_realloc_frame(items, depth) -> items`,
     // the same `(i64, i64) -> i64` family as residual arity 2.
     let emit_frame_realloc = frame.has_tail() && ca.realloc_fn_ptr != 0;
@@ -5866,7 +6036,10 @@ fn build_function(
     // runtime varsize array allocation also needs one for the computed
     // total/new-free word.
     let base_i32_locals: u32 = 1 + if ca.emit_ca { 3 } else { 0 };
-    let extra_alloc_i32 = u32::from(nursery.is_some() || ca.inline.is_some()) * 2;
+    // CALL_ASSEMBLER's push/pop footer uses the two alloc scratches even when
+    // the nursery fast path is off. Those locals used to alias the prologue
+    // gcmap pair; per-site maps do not reserve that pair.
+    let extra_alloc_i32 = u32::from(nursery.is_some() || ca.inline.is_some() || ca.emit_ca) * 2;
     let alloc_scratch_local = bridge_slot_local + base_i32_locals;
     let alloc_size_local = alloc_scratch_local + 1;
     // A keyed census must preserve the raw dispatch value until `br_table`.
@@ -5878,8 +6051,12 @@ fn build_function(
     // it and branch back into the dispatch; without it the key is consumed
     // straight off the frame load.
     let resume_key_local = trace_entry_key_local + u32::from(trace_entry_needs_key_local);
-    let gcmap_old_local = resume_key_local + u32::from(resume_dispatch);
-    let gcmap_idx_local = gcmap_old_local + 1;
+    // One i32: jitframe base (`local 0 - FIRST_ITEM_OFFSET`) so `jf_gcmap`
+    // is `i32.store`/`i64.store` at a constant offset. Header-less traces
+    // pass an items pointer of 0 and must not allocate or write it.
+    let gcmap_frame_local = ca
+        .compute_home_gcmap
+        .then_some(resume_key_local + u32::from(resume_dispatch));
     debug_assert_eq!(bridge_slot_local, ovf_flag_local + 1);
     debug_assert_eq!(ca_cfp_local, bridge_slot_local + 1);
     debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
@@ -5957,12 +6134,15 @@ fn build_function(
             + extra_alloc_i32
             + u32::from(trace_entry_needs_key_local)
             + u32::from(resume_dispatch)
-            + 2,
+            + u32::from(gcmap_frame_local.is_some()),
         ValType::I32,
     ));
     let mut func = Function::new(locals);
     let mut raw_sink = func.instructions();
     let mut sink = PeepSink::new(&mut raw_sink);
+    if let Some(frame_local) = gcmap_frame_local {
+        sink.gcmap_frame_local = frame_local;
+    }
 
     // assembler.py `_check_frame_depth` at bridge / entry-bridge entry.
     // The depth is a constant of this module; the running length is the
@@ -5996,62 +6176,6 @@ fn build_function(
         sink.local_set(value_types.local(raw));
     }
 
-    // Build the map now; publish it only after the slots it marks are
-    // null or written (`push_gcmap` at a live safepoint). Key-0 does
-    // that after the entry stores. A keyed LABEL resume branches past
-    // those stores, so it publishes in the resume loader after the
-    // grown-slot null below.
-    let used_ordinary = ref_homes.len().max(ca.home_gcmap_min_ordinary);
-    let used_labels = label_resume.ref_slots.max(ca.home_gcmap_min_labels);
-    let publish_map = build_home_gcmap(frame, used_ordinary, used_labels);
-    let publish_ptr = if ca.compute_home_gcmap {
-        // A first compile has no prior map. A re-emission or bridge may
-        // grow past a previous floor of zero, so `min > 0` is not the
-        // signal — `has_prior` is.
-        if ca.home_gcmap_has_prior && used_ordinary > ca.home_gcmap_min_ordinary {
-            let start = ca.home_gcmap_min_ordinary as u64;
-            let end = used_ordinary as u64;
-            let prefix = frame.prefix_ordinary_homes as u64;
-            if end <= prefix {
-                emit_null_home_slots(&mut sink, frame, start..end, |_| true);
-            } else {
-                if start < prefix {
-                    emit_null_home_slots(&mut sink, frame, start..prefix, |_| true);
-                }
-                for h in start.max(prefix)..end {
-                    sink.local_get(0);
-                    sink.i64_const(0);
-                    sink.i64_store(mem64(frame.home_ofs(h)));
-                }
-            }
-        }
-        // Re-emission may mark a longer LABEL tail than the previous
-        // publication. Those new slots are region-only captures the live
-        // frame never stored; null them before the widened map is
-        // published. Previously published captures stay: a bridge that
-        // grew past its source writes them on the first crossing, and a
-        // later keyed tail-call restores from those slots. Key-0 still
-        // clears the full used-label range below.
-        if ca.home_gcmap_has_prior
-            && ca.home_gcmap_null_grown_labels
-            && used_labels > ca.home_gcmap_min_labels
-        {
-            let label_base = frame.ordinary_home_slots() as u64;
-            emit_null_home_slots(
-                &mut sink,
-                frame,
-                label_base + ca.home_gcmap_min_labels as u64..label_base + used_labels as u64,
-                |_| true,
-            );
-        }
-        crate::release::park_gcmap_raw(
-            ca.gcmap_sink,
-            build_home_gcmap(frame, used_ordinary, used_labels),
-        ) as i64
-    } else {
-        ca.home_gcmap_ptr
-    };
-
     // A peeled loop arrives as `[preamble..][LABEL][body..][JUMP]`: the
     // preamble runs once on entry, the LABEL is the loop-back target, and
     // JUMP branches back to it. Emit the `loop` at the LABEL selected by the
@@ -6065,6 +6189,22 @@ fn build_function(
     // reserved and never reloaded (or the reverse).
     let region_spans = InlinedRegionSpan::collect(ops.len(), inlined_bridges);
     let liveness = HomeLiveness::collect_with_regions(inputargs, ops, &region_spans);
+    // `get_gcmap` at each collecting op. The pointer is a module constant;
+    // `push_gcmap` / `pop_gcmap` bracket the call.
+    // `compute_home_gcmap` is the production switch (`compile_loop`): only
+    // then is `local 0 - FIRST_ITEM_OFFSET` a real `jf_gcmap`.
+    let store_at = HomeStoreAt::build(inputargs, ops, &region_spans);
+    let (site_gcmap, site_homes) = build_site_gcmaps(
+        frame,
+        ref_homes,
+        &liveness,
+        &store_at,
+        ops,
+        &region_spans,
+        ca.gcmap_sink,
+        ca.compute_home_gcmap,
+    );
+    sink.sync_gcmap_frame();
 
     // Resume-at-LABEL: a peeled loop wraps its preamble in a dispatch so a
     // loop-closing bridge can re-enter AT any LABEL — key = label ordinal + 1
@@ -6166,37 +6306,8 @@ fn build_function(
         emit_trace_entry_census(&mut sink, census, bridge_slot_local, None);
     }
 
-    // Fresh entry owns key 0. `build_home_gcmap` marks the used ordinary
-    // prefix and the LABEL-capture tail, not reserved chain-padding.
-    // The nursery bump leaves `jf_gcmap` null and does not fill items, so
-    // unused marked homes still hold recycled nursery bytes; those must
-    // be null before the map is published. Unmarked reserved padding is
-    // invisible to `jitframe_trace` and must not be cleared on every
-    // CALL_ASSEMBLER — that 128-slot fill is what still bound
-    // `fib_recursive`. A resume dispatch branches past this code,
-    // preserving captures written when the source loop first crossed
-    // the LABEL, and publishes in the resume loader.
-    // Null every slot the map about to be published marks. Skipping
-    // input-filled homes left recycled nursery words in a marked slot
-    // when the later store used a different home than `home_id` named
-    // (`recursive_call_frame_relocation` then copied an invalid
-    // type_id). The extra store per input Ref is lost in the noise
-    // next to the CALL_ASSEMBLER itself.
-    let ordinary_end = used_ordinary as u64;
-    let home_prefix = frame.prefix_ordinary_homes as u64;
-    emit_null_home_slots(&mut sink, frame, 0..ordinary_end.min(home_prefix), |_| true);
-    for h in home_prefix..ordinary_end {
-        sink.local_get(0);
-        sink.i64_const(0);
-        sink.i64_store(mem64(frame.home_ofs(h)));
-    }
-    let label_base = frame.ordinary_home_slots() as u64;
-    emit_null_home_slots(
-        &mut sink,
-        frame,
-        label_base..label_base + used_labels as u64,
-        |_| true,
-    );
+    // `jf_gcmap` stays null until a safepoint (`push_gcmap`). A slot is
+    // marked only after a store dominates that safepoint (`get_gcmap`).
 
     // Load inputs from frame into locals, and store Ref inputs to their homes.
     // The input value lives at the frame slot its producer wrote it to: the
@@ -6233,16 +6344,6 @@ fn build_function(
             sink.i64_store(mem64(frame.home_ofs(h as u64)));
         }
     }
-    // assembler.py `push_gcmap`: the map goes up once the slots it marks
-    // are live or null. Keyed resume publishes in the loader instead.
-    emit_publish_home_gcmap(
-        &mut sink,
-        publish_ptr,
-        &publish_map,
-        gcmap_old_local,
-        gcmap_idx_local,
-        residual_type_base,
-    );
     // Past the entry loader, so the count is one per entry on the same path
     // the inputs are loaded on.
     if let Some((probe, type_idx)) = inline_trip {
@@ -6308,7 +6409,14 @@ fn build_function(
             continue;
         }
         if frame_can_escape && ref_homes.len() != 0 && op.opcode.can_malloc() {
-            emit_jitframe_write_barrier(&mut sink, residual_type_base, wb)?;
+            emit_jitframe_write_barrier(
+                &mut sink,
+                residual_type_base,
+                wb,
+                site_gcmap.get(op_idx).copied().unwrap_or(0),
+                ca.ca_reload_fn_ptr,
+                ca.jf_top_addr,
+            )?;
         }
         if op.opcode == OpCode::Label && key_dispatch && labels_passed < num_labels {
             // End of the segment before label j (key-0 / earlier-label path).
@@ -6329,22 +6437,6 @@ fn build_function(
             }
             sink.br(1); // segment done -> past_loader_j, over the resume loader
             sink.end(); // end C_j (the br_table lands here for key j+1)
-            // Keyed resume skipped the key-0 stores. Grown slots were
-            // nulled before `br_table`; remaining marked homes already
-            // hold the previous module's values. Publish before the
-            // loader stores so a foreign JUMP or a grown re-emission
-            // cannot leave this module's homes unmarked. assembler.py
-            // `push_gcmap` is a safepoint store, not a LABEL op: when
-            // the live map already covers these bits the publish is a
-            // guest compare, not a host union.
-            emit_publish_home_gcmap(
-                &mut sink,
-                publish_ptr,
-                &publish_map,
-                gcmap_old_local,
-                gcmap_idx_local,
-                residual_type_base,
-            );
             // Resume loader: a loop-closing bridge wrote each label arg into
             // frame slot i (positionally, matching the in-loop JUMP move);
             // load them into the label-arg locals and refresh their Ref
@@ -6617,6 +6709,7 @@ fn build_function(
                         }
                     }
                     sink.i32_const(wide_slot as i32); // wide table slot
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.return_call_indirect(0, wide_type_idx);
                 } else {
                     for (i, jump_arg) in jump_args.iter().enumerate() {
@@ -6627,6 +6720,7 @@ fn build_function(
                     store_dispatch_key(&mut sink);
                     sink.local_get(0); // frame_ptr argument to the loop
                     sink.i32_const(external_jump_slot as i32); // table slot
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.return_call_indirect(0, 0); // table 0, type 0: (i32) -> i32
                 }
             }
@@ -6668,6 +6762,7 @@ fn build_function(
                     sink.local_get(0);
                     sink.i32_const((ca.resume_entry_addr + 4) as i32);
                     sink.i32_load(mem32(0));
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.return_call_indirect(0, 0);
                     sink.end();
                 }
@@ -7289,6 +7384,7 @@ fn build_function(
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(1).to_opref());
                     sink.i32_const(alloc.fmod_fn_ptr as i32);
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, *type_idx);
                     sink.local_set(value_types.local(vi));
                 }
@@ -7811,6 +7907,9 @@ fn build_function(
                     wb,
                     op.arg(0).to_opref(),
                     None,
+                    site_gcmap.get(op_idx).copied().unwrap_or(0),
+                    ca.ca_reload_fn_ptr,
+                    ca.jf_top_addr,
                 )?;
             }
             OpCode::CondCallGcWbArray => {
@@ -7826,6 +7925,9 @@ fn build_function(
                     wb,
                     op.arg(0).to_opref(),
                     card,
+                    site_gcmap.get(op_idx).copied().unwrap_or(0),
+                    ca.ca_reload_fn_ptr,
+                    ca.jf_top_addr,
                 )?;
             }
             OpCode::CondCallN => {
@@ -7865,6 +7967,7 @@ fn build_function(
                     }
                     emit_resolve(&mut sink, constants, value_types, func);
                     sink.i32_wrap_i64();
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + nargs as u32);
                     // COND_CALL_N ignores the historical dummy word.
                     sink.drop();
@@ -7877,6 +7980,7 @@ fn build_function(
                     }
                     emit_resolve(&mut sink, constants, value_types, func);
                     sink.i32_wrap_i64();
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + nargs as u32);
                 } else {
                     return Err(BackendError::Unsupported(
@@ -7899,11 +8003,11 @@ fn build_function(
                     emit_reload_refs_from_homes(
                         &mut sink,
                         value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
+                        site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                         None,
                         frame,
+                        &site_gcmap,
+                        op_idx,
                     );
                 }
                 sink.end();
@@ -7963,6 +8067,7 @@ fn build_function(
                     }
                     emit_resolve(&mut sink, constants, value_types, func);
                     sink.i32_wrap_i64();
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + nargs as u32);
                     if has_result {
                         sink.local_set(value_types.local(vi));
@@ -7986,11 +8091,11 @@ fn build_function(
                     emit_reload_refs_from_homes(
                         &mut sink,
                         value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
+                        site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                         has_result.then_some(vi),
                         frame,
+                        &site_gcmap,
+                        op_idx,
                     );
                 }
                 sink.end();
@@ -8283,6 +8388,7 @@ fn build_function(
                 emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                 sink.i64_const(len_offset);
                 sink.i32_const(alloc.new_array_fn_ptr as i32);
+                emit_push_site(&mut sink, &site_gcmap, op_idx);
                 sink.call_indirect(0, base + 5);
                 if !OpRef::raw_is_constant(vi) {
                     sink.local_set(value_types.local(vi));
@@ -8322,11 +8428,11 @@ fn build_function(
                 emit_reload_refs_from_homes(
                     &mut sink,
                     value_types,
-                    ref_homes,
-                    &liveness,
-                    op_idx,
+                    site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                     skip,
                     frame,
+                    &site_gcmap,
+                    op_idx,
                 );
             }
             // ── Misc ops ──
@@ -8392,6 +8498,7 @@ fn build_function(
                     sink.i64_const(0);
                     sink.i64_const(payload);
                     sink.i32_const(alloc.new_fn_ptr as i32);
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + 2);
                     emit_reload_frame_if_necessary(
                         &mut sink,
@@ -8402,11 +8509,11 @@ fn build_function(
                     emit_reload_refs_from_homes(
                         &mut sink,
                         value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
+                        site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                         (!OpRef::raw_is_constant(vi)).then_some(vi),
                         frame,
+                        &site_gcmap,
+                        op_idx,
                     );
                     if let Some(tid_store) = header_tid {
                         sink.local_tee(value_types.local(vi));
@@ -8455,6 +8562,7 @@ fn build_function(
                         sink.i64_sub();
                     }
                     sink.i32_const(alloc.new_fn_ptr as i32);
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + 2);
                 }
                 if !OpRef::raw_is_constant(vi) {
@@ -8483,11 +8591,11 @@ fn build_function(
                     emit_reload_refs_from_homes(
                         &mut sink,
                         value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
+                        site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                         skip,
                         frame,
+                        &site_gcmap,
+                        op_idx,
                     );
                 }
                 // `wasm_jit_alloc` can return old-gen when the nursery cannot
@@ -8530,6 +8638,7 @@ fn build_function(
                     sink.if_(BlockType::Result(ValType::I64));
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_const(alloc.headerless_fn_ptr as i32);
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + 1);
                     emit_reload_frame_if_necessary(
                         &mut sink,
@@ -8540,11 +8649,11 @@ fn build_function(
                     emit_reload_refs_from_homes(
                         &mut sink,
                         value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
+                        site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                         (!OpRef::raw_is_constant(vi)).then_some(vi),
                         frame,
+                        &site_gcmap,
+                        op_idx,
                     );
                     sink.else_();
                     sink.i32_const(na.free_addr as i32);
@@ -8560,6 +8669,7 @@ fn build_function(
                 } else {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_const(alloc.headerless_fn_ptr as i32);
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + 1);
                 }
                 if !OpRef::raw_is_constant(vi) {
@@ -8588,11 +8698,11 @@ fn build_function(
                     emit_reload_refs_from_homes(
                         &mut sink,
                         value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
+                        site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                         skip,
                         frame,
+                        &site_gcmap,
+                        op_idx,
                     );
                 }
             }
@@ -8654,11 +8764,11 @@ fn build_function(
                     emit_reload_refs_from_homes(
                         &mut sink,
                         value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
+                        site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                         (!OpRef::raw_is_constant(vi)).then_some(vi),
                         frame,
+                        &site_gcmap,
+                        op_idx,
                     );
                     sink.else_();
                     sink.i32_const(na.free_addr as i32);
@@ -8707,11 +8817,11 @@ fn build_function(
                     emit_reload_refs_from_homes(
                         &mut sink,
                         value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
+                        site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                         (!OpRef::raw_is_constant(vi)).then_some(vi),
                         frame,
+                        &site_gcmap,
+                        op_idx,
                     );
                     sink.else_();
                     sink.i32_const(na.free_addr as i32);
@@ -8776,11 +8886,11 @@ fn build_function(
                     emit_reload_refs_from_homes(
                         &mut sink,
                         value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
+                        site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                         skip,
                         frame,
+                        &site_gcmap,
+                        op_idx,
                     );
                 }
             }
@@ -8819,6 +8929,7 @@ fn build_function(
                     sink.i64_const(0);
                     sink.i64_const(payload);
                     sink.i32_const(alloc.new_fn_ptr as i32);
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + 2);
                     emit_reload_frame_if_necessary(
                         &mut sink,
@@ -8829,11 +8940,11 @@ fn build_function(
                     emit_reload_refs_from_homes(
                         &mut sink,
                         value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
+                        site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                         (!OpRef::raw_is_constant(vi)).then_some(vi),
                         frame,
+                        &site_gcmap,
+                        op_idx,
                     );
                     sink.else_();
                     sink.i32_const(na.free_addr as i32);
@@ -8879,6 +8990,7 @@ fn build_function(
                     sink.i64_const(GcHeader::SIZE as i64);
                     sink.i64_sub();
                     sink.i32_const(alloc.new_fn_ptr as i32);
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + 2);
                     emit_reload_frame_if_necessary(
                         &mut sink,
@@ -8889,11 +9001,11 @@ fn build_function(
                     emit_reload_refs_from_homes(
                         &mut sink,
                         value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
+                        site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                         (!OpRef::raw_is_constant(vi)).then_some(vi),
                         frame,
+                        &site_gcmap,
+                        op_idx,
                     );
                     sink.else_();
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
@@ -8926,6 +9038,7 @@ fn build_function(
                     sink.i64_const(GcHeader::SIZE as i64);
                     sink.i64_sub();
                     sink.i32_const(alloc.new_fn_ptr as i32);
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + 2);
                     emit_reload_frame_if_necessary(
                         &mut sink,
@@ -8936,11 +9049,11 @@ fn build_function(
                     emit_reload_refs_from_homes(
                         &mut sink,
                         value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
+                        site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                         (!OpRef::raw_is_constant(vi)).then_some(vi),
                         frame,
+                        &site_gcmap,
+                        op_idx,
                     );
                     sink.else_();
                     sink.i32_const(na.free_addr as i32);
@@ -8975,6 +9088,7 @@ fn build_function(
                         sink.i64_sub();
                     }
                     sink.i32_const(alloc.new_fn_ptr as i32);
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + 2);
                 }
                 if !OpRef::raw_is_constant(vi) {
@@ -9003,11 +9117,11 @@ fn build_function(
                     emit_reload_refs_from_homes(
                         &mut sink,
                         value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
+                        site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                         skip,
                         frame,
+                        &site_gcmap,
+                        op_idx,
                     );
                 }
                 // `wasm_jit_alloc` can return old-gen when the nursery cannot
@@ -9110,6 +9224,7 @@ fn build_function(
                     };
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_const(alloc.threadlocal_fn_ptr as i32);
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + 1);
                     sink.local_set(value_types.local(vi));
                 }
@@ -9227,6 +9342,7 @@ fn build_function(
                     ca_target_local,
                     alloc_scratch_local,
                 );
+                emit_push_site(&mut sink, &site_gcmap, op_idx);
                 emit_ca_push_frame(
                     &mut sink,
                     ca.inline.as_ref(),
@@ -9262,6 +9378,7 @@ fn build_function(
                 sink.unreachable();
                 sink.end();
                 sink.local_get(ca_fi_local);
+                emit_push_site(&mut sink, &site_gcmap, op_idx);
                 sink.call_indirect(0, 0);
                 sink.drop();
                 // The recursive call may minor-collect and move this nursery
@@ -9273,6 +9390,7 @@ fn build_function(
                     sink.i64_extend_i32_u();
                 } else if let Some(base) = residual_type_base {
                     sink.i32_const(ca.ca_reload_fn_ptr as i32);
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base);
                 } else {
                     let jit_call =
@@ -9283,6 +9401,7 @@ fn build_function(
                     emit_call_area_addr(&mut sink);
                     sink.i64_const(0);
                     sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     emit_jit_call(&mut sink, jit_call);
                     emit_call_area_addr(&mut sink);
                     sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
@@ -9322,6 +9441,7 @@ fn build_function(
                 sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_COMPILED_PTR_OFS, 2));
                 sink.i32_const(ca.deopt_helper_slot as i32);
                 // call_indirect(table_index, type_index): the shared table is 0.
+                emit_push_site(&mut sink, &site_gcmap, op_idx);
                 sink.call_indirect(0, ca_helper_type_idx);
                 sink.end();
                 // The recursive call or deopt helper may have collected and
@@ -9335,9 +9455,11 @@ fn build_function(
                     sink.local_set(0);
                 } else if let Some(base) = residual_type_base {
                     sink.i32_const(ca.ca_reload_caller_fn_ptr as i32);
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base);
                     sink.i32_wrap_i64();
                     sink.local_set(0);
+                    sink.sync_gcmap_frame();
                 }
                 // The frame ABI carries every scalar result as i64 bits. Ref
                 // and Int use those bits directly; Float crosses the local
@@ -9374,6 +9496,7 @@ fn build_function(
                     sink.local_get(ca_cfp_local);
                     sink.i64_extend_i32_u();
                     sink.i32_const(ca.ca_pop_fn_ptr as i32);
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + 1);
                     sink.drop(); // returns 0; ignored
                 } else {
@@ -9389,6 +9512,7 @@ fn build_function(
                     sink.local_get(ca_cfp_local);
                     sink.i64_extend_i32_u();
                     sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     emit_jit_call(&mut sink, jit_call);
                 }
                 // The callee recursion minor-collected; this bridge's other live
@@ -9423,11 +9547,11 @@ fn build_function(
                 emit_reload_refs_from_homes(
                     &mut sink,
                     value_types,
-                    ref_homes,
-                    &liveness,
-                    op_idx,
+                    site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                     skip,
                     frame,
+                    &site_gcmap,
+                    op_idx,
                 );
             }
 
@@ -9554,6 +9678,7 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i32_wrap_i64();
                     // call_indirect(table_index, type_index): table 0, type for arity n.
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + nargs as u32);
                     if !OpRef::raw_is_constant(vi) {
                         sink.local_set(value_types.local(vi));
@@ -9571,11 +9696,11 @@ fn build_function(
                         emit_reload_refs_from_homes(
                             &mut sink,
                             value_types,
-                            ref_homes,
-                            &liveness,
-                            op_idx,
+                            site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                             (!OpRef::raw_is_constant(vi)).then_some(vi),
                             frame,
+                            &site_gcmap,
+                            op_idx,
                         );
                     }
                     // store-on-def (end of loop) homes a Ref result, so the
@@ -9593,6 +9718,7 @@ fn build_function(
                     }
                     emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i32_wrap_i64();
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + nargs as u32);
                     sink.drop();
                     read_real_errno(&mut sink);
@@ -9606,11 +9732,11 @@ fn build_function(
                         emit_reload_refs_from_homes(
                             &mut sink,
                             value_types,
-                            ref_homes,
-                            &liveness,
-                            op_idx,
+                            site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                             None,
                             frame,
+                            &site_gcmap,
+                            op_idx,
                         );
                     }
                 } else if let Some((sig, &type_idx)) = residual_call_typed_sig(op, constants)
@@ -9643,6 +9769,7 @@ fn build_function(
                     // func_ptr (arg 0) is the table slot — wrap to i32 index.
                     emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i32_wrap_i64();
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, type_idx);
                     let is_void_op = matches!(
                         op.opcode,
@@ -9683,11 +9810,11 @@ fn build_function(
                         emit_reload_refs_from_homes(
                             &mut sink,
                             value_types,
-                            ref_homes,
-                            &liveness,
-                            op_idx,
+                            site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                             homed,
                             frame,
+                            &site_gcmap,
+                            op_idx,
                         );
                     }
                 } else if let (Some(base), Some(nargs)) = (
@@ -9703,6 +9830,7 @@ fn build_function(
                     }
                     emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i32_wrap_i64();
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + nargs as u32);
                     read_real_errno(&mut sink);
                     if can_collect {
@@ -9715,11 +9843,11 @@ fn build_function(
                         emit_reload_refs_from_homes(
                             &mut sink,
                             value_types,
-                            ref_homes,
-                            &liveness,
-                            op_idx,
+                            site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                             None,
                             frame,
+                            &site_gcmap,
+                            op_idx,
                         );
                     }
                 } else {
@@ -9745,6 +9873,7 @@ fn build_function(
                     }
 
                     // Call trampoline
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
                     emit_jit_call(&mut sink, jit_call);
 
                     // Read result (for non-void calls)
@@ -9777,11 +9906,11 @@ fn build_function(
                         emit_reload_refs_from_homes(
                             &mut sink,
                             value_types,
-                            ref_homes,
-                            &liveness,
-                            op_idx,
+                            site_homes.get(op_idx).map(Vec::as_slice).unwrap_or(&[]),
                             (!is_void && !OpRef::raw_is_constant(vi)).then_some(vi),
                             frame,
+                            &site_gcmap,
+                            op_idx,
                         );
                     }
                 }
