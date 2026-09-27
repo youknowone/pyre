@@ -1517,6 +1517,33 @@ fn rewire_one_option_ok_or_else_try_site(
         ));
     }
 
+    // `rewire_one_call_site` ends in `remint_call_as_payload`, which renames
+    // this call's result off `site.result_var` (the Result shell) onto a
+    // fresh payload variable and rewrites the normal link to carry it.
+    // The truncation point and the carried-value filter have to follow that
+    // name: keying them on the shell leaves the payload threaded out of
+    // block A after its only definition is deleted.
+    let (call_idx, payload_var) = graph.blocks[a]
+        .operations
+        .iter()
+        .enumerate()
+        .find_map(|(i, op)| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name: method, .. },
+                args,
+                ..
+            } if method == "ok_or_else" && args.len() == 2 && args[0] == opt && args[1] == env => {
+                op.result.clone().map(|result| (i, result))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| format!("{name}: ok_or_else call vanished after the `?` diamond rewrite"))?;
+    if call_idx + 1 != graph.blocks[a].operations.len() {
+        return Err(format!(
+            "{name}: ok_or_else call is not the last operation of block {a}"
+        ));
+    }
+
     let a_id = graph.blocks[a].id;
     debug_assert!(matches!(
         graph.blocks[a].exitswitch,
@@ -1533,7 +1560,7 @@ fn rewire_one_option_ok_or_else_try_site(
     let mut carried = Vec::new();
     for arg in &normal.args {
         if let LinkArg::Value(v) = arg
-            && *v != site.result_var
+            && *v != payload_var
             && !carried.contains(v)
         {
             carried.push(v.clone());
@@ -1576,7 +1603,7 @@ fn rewire_one_option_ok_or_else_try_site(
     };
     let some_args = reproduce_exit_args(
         &normal,
-        &site.result_var,
+        &payload_var,
         &payload,
         &some_sources,
         &some_inputs,
@@ -5266,5 +5293,200 @@ mod rebuilt_shell_collapse_tests {
             shell_ctors(&graph) >= 1,
             "a non-match consumer keeps the rebuilt shells"
         );
+    }
+}
+
+#[cfg(test)]
+mod option_ok_or_else_try_tests {
+    use super::*;
+    use crate::flowspace::model::ConstValue;
+    use crate::model::{ExitCase, FieldDescriptor, SpaceOperation};
+
+    /// `opt.ok_or_else(f)?` whose continue arm reads the `Ok` payload.
+    ///
+    /// Block A calls `ok_or_else`, B is `Result::branch`, C switches the
+    /// `ControlFlow` discriminant, the continue arm reads `__pos_0`, and
+    /// the break arm is the `from_residual` reraise tail.
+    fn ok_or_else_try_diamond() -> (FunctionGraph, OptionOkOrElseTrySite) {
+        let mut graph = FunctionGraph::new("ok_or_else_try");
+        let opt = graph.alloc_value_var();
+        let env = graph.alloc_value_var();
+        let extra = graph.alloc_value_var();
+        let a = graph.startblock;
+        graph.blocks[a.0].inputargs = vec![opt.clone(), env.clone(), extra.clone()];
+        let result = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "ok_or_else",
+                        Some("core::option::Option<i64>".into()),
+                    ),
+                    args: crate::model::call_args(vec![opt.clone(), env.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("ok_or_else");
+
+        let (b, b_args) = graph.create_block_with_arg_vars(2);
+        let r_b = b_args[0].clone();
+        let cf = graph
+            .push_op_var(
+                b,
+                OpKind::Call {
+                    target: CallTarget::method("branch", Some("core::result::Result".into())),
+                    args: crate::model::call_args(vec![r_b]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("branch");
+        graph.set_goto(a, b, vec![result.clone(), extra]);
+
+        let (c, c_args) = graph.create_block_with_arg_vars(2);
+        let cf_c = c_args[0].clone();
+        let extra_c = c_args[1].clone();
+        let disc = graph
+            .push_op_var(
+                c,
+                OpKind::FieldRead {
+                    base: cf_c.clone(),
+                    field: FieldDescriptor::new(
+                        "__discriminant",
+                        Some("core::ops::control_flow::ControlFlow".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("discriminant");
+
+        let (cont, cont_args) = graph.create_block_with_arg_vars(2);
+        let payload = graph
+            .push_op_var(
+                cont,
+                OpKind::FieldRead {
+                    base: cont_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::ops::control_flow::ControlFlow::Continue".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("continue payload");
+        // The continue arm consumes the payload. An extra live value rides
+        // the same edge so the rewrite must keep threading it.
+        let carried = cont_args[1].clone();
+        graph.blocks[cont.0].operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: carried.clone(),
+                field: FieldDescriptor::new("__pos_0", Some("test::Slot".into())),
+                value: LinkArg::Value(payload),
+                ty: ValueType::Int,
+            },
+        });
+        graph.set_return(cont, Some(carried));
+
+        let (brk, brk_args) = graph.create_block_with_arg_vars(1);
+        let err_payload = graph
+            .push_op_var(
+                brk,
+                OpKind::FieldRead {
+                    base: brk_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::ops::control_flow::ControlFlow::Break".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("break payload");
+        let residual = graph
+            .push_op_var(
+                brk,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "from_residual",
+                        Some("core::ops::FromResidual".into()),
+                    ),
+                    args: crate::model::call_args(vec![err_payload]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("from_residual");
+        graph.set_return(brk, Some(residual));
+
+        graph.block_mut(c).exitswitch = Some(ExitSwitch::Value(disc));
+        graph.block_mut(c).exits = vec![
+            Link::new_mixed(
+                vec![
+                    LinkArg::Value(cf_c.clone()),
+                    LinkArg::Value(extra_c.clone()),
+                ],
+                cont,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(cf_c)],
+                brk,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+        graph.set_goto(b, c, vec![cf, b_args[1].clone()]);
+
+        let site = OptionOkOrElseTrySite {
+            result_var: result,
+            option_owner: "core::option::Option<i64>".into(),
+            some_owner: "core::option::Option<i64>::Some".into(),
+            call_once_owner: "test::Closure".into(),
+            payload_ty: ValueType::Int,
+            error_ty: ValueType::Ref(None),
+            niche: false,
+        };
+        (graph, site)
+    }
+
+    fn assert_link_args_defined(graph: &FunctionGraph) {
+        for block in &graph.blocks {
+            for (ei, link) in block.exits.iter().enumerate() {
+                for (ai, arg) in link.args.iter().enumerate() {
+                    let LinkArg::Value(value) = arg else {
+                        continue;
+                    };
+                    let defined = block.inputargs.iter().any(|input| input == value)
+                        || block
+                            .operations
+                            .iter()
+                            .any(|op| op.result.as_ref() == Some(value));
+                    assert!(
+                        defined,
+                        "block {} exit {ei} args[{ai}] -> block {} is undefined in its source block",
+                        block.id.0, link.target.0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ok_or_else_try_payload_is_defined_on_every_link() {
+        let (mut graph, site) = ok_or_else_try_diamond();
+        rewire_one_option_ok_or_else_try_site(
+            &mut graph,
+            &site,
+            false,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("ok_or_else `?` diamond rewires");
+        assert_link_args_defined(&graph);
     }
 }
