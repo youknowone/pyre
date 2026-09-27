@@ -653,6 +653,26 @@ impl FrameGeometry {
         self.ordinary_home_slots() + self.extra_ordinary_homes
     }
 
+    /// Host entry writes `nargs` values at [`Self::spill_slot_ofs`] and the
+    /// dispatch key at [`Self::dispatch_key_ofs`]. Each arg slot must end at
+    /// or before the key, and the key must end at or before the Ref homes.
+    pub fn debug_assert_dispatch_entry_slots(self, nargs: u64) {
+        let key = self.dispatch_key_ofs;
+        for i in 0..nargs {
+            let end = self.spill_slot_ofs(i) + SLOT_SIZE;
+            debug_assert!(
+                end <= key,
+                "entry arg {i} ends at {end}, past dispatch key {key}"
+            );
+        }
+        let key_end = key + SLOT_SIZE;
+        debug_assert!(
+            key_end <= self.home_slot_base,
+            "dispatch key ends at {key_end}, past homes at {}",
+            self.home_slot_base
+        );
+    }
+
     /// Low Ref homes available to the trace currently executing on this
     /// geometry.  The high `label_ref_slots` belong to the source loop's LABEL
     /// capture plan and must not be cleared or reused by a chained bridge.
@@ -1978,6 +1998,17 @@ fn normal_frame_value_slots(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
     normal_frame_value_slots_for(inputargs, ops, inputargs.len())
 }
 
+/// Widest positional transfer a LABEL resume loader or a JUMP stores through
+/// [`FrameGeometry::spill_slot_ofs`]. Entry and fail-arg spills are counted
+/// separately.
+fn positional_transfer_arity(ops: &[Op]) -> usize {
+    ops.iter()
+        .filter(|op| matches!(op.opcode, OpCode::Label | OpCode::Jump))
+        .map(|op| op.num_args())
+        .max()
+        .unwrap_or(0)
+}
+
 fn normal_frame_value_slots_for(inputargs: &[InputArgRc], ops: &[Op], entry_arity: usize) -> usize {
     let (guards, _) = collect_guards_and_vars(inputargs, ops);
     let max_fail_args = guards
@@ -1985,7 +2016,14 @@ fn normal_frame_value_slots_for(inputargs: &[InputArgRc], ops: &[Op], entry_arit
         .map(|g| live_fail_arg_count(g.meta_descr.as_ref(), g.fail_arg_refs.len()))
         .max()
         .unwrap_or(0);
-    let value_area = max_fail_args.max(entry_arity);
+    // `spill_slot_ofs(i)` is `FRAME_SLOT_BASE + i * SLOT_SIZE` in the prefix.
+    // The dispatch key starts at `value_slots * SLOT_SIZE`, so arg `i` lands
+    // on it when `i + 1 == value_slots`. Reserving the fail index, the
+    // widest transfer, and the GUARD_VALUE counter keeps every such store
+    // strictly below the key.
+    let value_area = max_fail_args
+        .max(entry_arity)
+        .max(positional_transfer_arity(ops));
     1 + value_area + 1
 }
 

@@ -6742,6 +6742,9 @@ impl majit_backend::Backend for WasmBackend {
             .expect("no compiled code")
             .downcast_ref::<CompiledWasmLoop>()
             .expect("not CompiledWasmLoop");
+        compiled
+            .frame
+            .debug_assert_dispatch_entry_slots(args.len() as u64);
         #[cfg(target_arch = "wasm32")]
         let func_handle = compiled
             .materialize_func_handle()
@@ -6936,6 +6939,35 @@ impl majit_backend::Backend for WasmBackend {
         true
     }
 
+    /// `LabelTarget::requires_own_frame` is set when that LABEL's resume
+    /// loader reads a `LabelResumeData` capture slot. A fresh host frame
+    /// never stored those slots, so the key is refused. Key 0 is the
+    /// preamble and reads no capture. A key with no LABEL loader published by
+    /// this token is refused too: `build_function`'s `br_table` default is
+    /// the preamble, which does not take compact LABEL arguments.
+    fn supports_dispatch_key_entry_for(&self, token: &JitCellToken, dispatch_key: u32) -> bool {
+        if !self.supports_dispatch_key_entry() || dispatch_key == 0 {
+            return self.supports_dispatch_key_entry();
+        }
+        let Some(compiled) = token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+        else {
+            return false;
+        };
+        for descr in &compiled.published_label_descrs {
+            let Some(target) = label_target(descr) else {
+                continue;
+            };
+            if target.owner_token != compiled.token_number || target.key != dispatch_key {
+                continue;
+            }
+            return !target.requires_own_frame;
+        }
+        false
+    }
+
     fn execute_token_ints(&self, token: &JitCellToken, args: &[i64]) -> DeadFrame {
         let values: Vec<Value> = args.iter().map(|&v| Value::Int(v)).collect();
         self.execute_token(token, &values)
@@ -7112,6 +7144,64 @@ mod tests {
         let bits = usize::BITS as usize;
         let word = 1 + index / bits;
         word < buf.len() && (buf[word] & (1usize << (index % bits))) != 0
+    }
+
+    /// Peeled loop: preamble value `kept` is used after the LABEL and is not
+    /// a LABEL argument, so the resume loader reads a capture slot.
+    fn compile_peeled_label(token_number: u64, capture: bool) -> (WasmBackend, JitCellToken) {
+        let mut backend = WasmBackend::new();
+        let token = JitCellToken::new(token_number);
+        let label = majit_ir::make_loop_target_descr(token_number, false);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let kept = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::IntAdd,
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::const_int(1)),
+            ],
+        ));
+        kept.pos().set(majit_ir::OpRef::int_op(1));
+        let carried = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::IntAdd,
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::const_int(2)),
+            ],
+        ));
+        carried.pos().set(majit_ir::OpRef::int_op(2));
+        let label_arg = if capture {
+            majit_ir::OpRef::int_op(2)
+        } else {
+            majit_ir::OpRef::int_op(1)
+        };
+        let label_op = OpRc::new(majit_ir::Op::new(majit_ir::OpCode::Label, &[rb(label_arg)]));
+        label_op.setdescr(label);
+        // `kept` (int_op 1) is a LABEL arg only when `capture` is false.
+        // The capture loop finishes that value without passing it, so the
+        // resume loader reads its capture slot.
+        let finish = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Finish,
+            &[rb(majit_ir::OpRef::int_op(1))],
+        ));
+        let jump = OpRc::new(majit_ir::Op::new(majit_ir::OpCode::Jump, &[rb(label_arg)]));
+        jump.setdescr(label_op.getdescr().expect("label descr"));
+        backend
+            .compile_loop(&inputargs, &[kept, carried, label_op, finish, jump], &token)
+            .expect("peeled loop compiles");
+        (backend, token)
+    }
+
+    #[test]
+    fn dispatch_key_entry_refuses_a_label_that_reads_captures() {
+        let _compile_guard = failguard::lock_cpu();
+        let (capture_backend, capture_token) = compile_peeled_label(9_910_301, true);
+        assert!(capture_backend.supports_dispatch_key_entry());
+        assert!(
+            !capture_backend.supports_dispatch_key_entry_for(&capture_token, 1),
+            "a LABEL resume loader that reads a capture slot cannot take a fresh host frame"
+        );
+        let (plain_backend, plain_token) = compile_peeled_label(9_910_302, false);
+        assert!(plain_backend.supports_dispatch_key_entry_for(&plain_token, 1));
     }
 
     /// A trip queued while the bridge was alive must not be dereferenced after

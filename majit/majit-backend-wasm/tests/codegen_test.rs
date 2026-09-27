@@ -5299,6 +5299,69 @@ fn peeled_loop_dispatch_key_enters_the_label_not_the_preamble() {
     );
 }
 
+/// Seventeen LABEL arguments, entered at key 1. The value area is sized from
+/// `frame_value_slots` (no frozen 64-slot floor). Every argument must come
+/// back through the checksum, which changes if the dispatch key overwrites one.
+#[test]
+fn wide_label_dispatch_key_preserves_every_argument() {
+    const N: usize = 17;
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let mut ops = Vec::new();
+    let mut label_args = vec![rb(OpRef::input_arg_int(0))];
+    for k in 1..N {
+        ops.push(make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(k as i64)],
+            OpRef::int_op(k as u32),
+        ));
+        label_args.push(rb(OpRef::int_op(k as u32)));
+    }
+    ops.push(Op::new(OpCode::Label, &label_args));
+    let mut acc = OpRef::input_arg_int(0);
+    let mut next = N as u32;
+    for k in 1..N {
+        let scaled = OpRef::int_op(next);
+        next += 1;
+        ops.push(make_op(
+            OpCode::IntMul,
+            &[acc, OpRef::const_int(100)],
+            scaled,
+        ));
+        let summed = OpRef::int_op(next);
+        next += 1;
+        ops.push(make_op(
+            OpCode::IntAdd,
+            &[scaled, OpRef::int_op(k as u32)],
+            summed,
+        ));
+        acc = summed;
+    }
+    ops.push(Op::new(OpCode::Finish, &[rb(acc)]));
+    ops.push(Op::new(OpCode::Jump, &label_args));
+
+    let slots = codegen::frame_value_slots(&inputargs, &ops);
+    let frame = codegen::FrameGeometry::compact(slots, 0, 0);
+    let (bytes, _) = build_module_with_frame(
+        &inputargs,
+        &ops,
+        &indexmap::IndexMap::new(),
+        Some(0),
+        &codegen::GuardGcTypeInfo::default(),
+        frame,
+    );
+    validate_wasm(&bytes);
+
+    let host: Vec<i64> = (10..10 + N as i64).collect();
+    let mut expected = host[0];
+    for &arg in &host[1..] {
+        expected = expected.wrapping_mul(100).wrapping_add(arg);
+    }
+    assert_eq!(
+        execute_trace_at_key(&bytes, &host, frame.dispatch_key_ofs, 1),
+        expected
+    );
+}
+
 #[test]
 fn vec_guard_true_compiles() {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
@@ -5320,6 +5383,53 @@ fn vec_guard_true_compiles() {
     assert_eq!(guards.len(), 2);
     assert_eq!(execute_simple_trace(&bytes, &[3]), 3);
     assert_eq!(execute_simple_trace(&bytes, &[11]), 11);
+}
+
+/// `VecGuardFalse` fails when its argument is nonzero. Success and failure
+/// write different words, so a flipped condition fails the assertion.
+/// The argument is an input, so `next_op_can_accept_cc` does not fuse.
+#[test]
+fn vec_guard_false_direct_polarity() {
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let ops = vec![
+        make_guard(
+            OpCode::VecGuardFalse,
+            &[OpRef::input_arg_int(0)],
+            &[OpRef::const_int(20)],
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::const_int(10))]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 2);
+    assert_eq!(execute_simple_trace(&bytes, &[0]), 10);
+    assert_eq!(execute_simple_trace(&bytes, &[1]), 20);
+}
+
+/// The comparison is the guard's only reader, so `next_op_can_accept_cc`
+/// fuses it into `push_guard_failure_cond`. `VecGuardFalse` fails when the
+/// comparison is true.
+#[test]
+fn vec_guard_false_fused_comparison_polarity() {
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let ops = vec![
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::input_arg_int(0), OpRef::const_int(10)],
+            OpRef::int_op(1),
+        ),
+        make_guard(
+            OpCode::VecGuardFalse,
+            &[OpRef::int_op(1)],
+            &[OpRef::const_int(20)],
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::const_int(10))]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 2);
+    assert_eq!(execute_simple_trace(&bytes, &[3]), 20);
+    assert_eq!(execute_simple_trace(&bytes, &[11]), 10);
 }
 
 /// A `LoadFromGcTable` placed inside the loop body is emitted inside the loop.
