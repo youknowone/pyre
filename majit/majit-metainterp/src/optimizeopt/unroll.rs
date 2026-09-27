@@ -8457,7 +8457,7 @@ mod tests {
             .produced_short_op(&src20)
             .unwrap();
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: rooted_resop_operand(Type::Int, 20),
+            op: src20.clone(),
             invented_name: produced.invented_name,
             same_as_source: produced.same_as_source.clone(),
             preamble_op: produced.preamble_op,
@@ -8471,7 +8471,7 @@ mod tests {
         // RPython `unroll.py:34-37` seeds `potential_extra_ops` so a later
         // `force_box` will run `add_preamble_op` (shortpreamble.py).
         assert!(
-            ctx.has_potential_extra_op(OpRef::int_op(20)),
+            ctx.has_potential_extra_op(&src20),
             "force_op_from_preamble_op must seed potential_extra_ops"
         );
         // RPython parity: `force_op_from_preamble` does NOT call
@@ -8489,7 +8489,7 @@ mod tests {
         assert_eq!(sp.used_boxes.clone(), vec![OpRef::int_op(20)]);
         assert_eq!(sp.jump_args.clone(), vec![OpRef::int_op(20)]);
         assert!(
-            !ctx.has_potential_extra_op(OpRef::int_op(20)),
+            !ctx.has_potential_extra_op(&src20),
             "force_box must consume the potential_extra_ops entry"
         );
     }
@@ -8567,11 +8567,12 @@ mod tests {
         // `force_op_from_preamble_op` keys potential_extra_ops by
         // preamble_op.op == short_op.res, the exact body-visible Box.
         assert!(
-            ctx.has_potential_extra_op(OpRef::ref_op(19)),
+            ctx.has_potential_extra_op(&b_src),
             "force_op_from_preamble_op must seed potential_extra_ops by the body-visible box"
         );
+        let slot14 = ctx.materialize_operand_at(OpRef::ref_op(14));
         assert!(
-            !ctx.has_potential_extra_op(OpRef::ref_op(14)),
+            !ctx.has_potential_extra_op(&slot14),
             "the unrelated replay/body slot must not carry the potential_extra_ops entry"
         );
 
@@ -8583,7 +8584,7 @@ mod tests {
         assert_eq!(sp.used_boxes.clone(), vec![OpRef::ref_op(19)]);
         assert_eq!(sp.jump_args.clone(), vec![OpRef::ref_op(19)]);
         assert!(
-            !ctx.has_potential_extra_op(OpRef::ref_op(19)),
+            !ctx.has_potential_extra_op(&b_src),
             "force_box must consume the potential_extra_ops entry"
         );
     }

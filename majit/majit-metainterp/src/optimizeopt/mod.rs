@@ -1233,7 +1233,8 @@ pub struct OptContext {
     /// `Rc::ptr_eq` key would silent-miss the pop. Re-keying to box identity
     /// is gated on the same short-preamble / InputArg identity unification
     /// that defers `resolve_operand_operand`'s InputArg arm (#9).
-    pub(crate) potential_extra_ops: indexmap::IndexMap<OpRef, crate::optimizeopt::info::PreambleOp>,
+    pub(crate) potential_extra_ops:
+        indexmap::IndexMap<Operand, crate::optimizeopt::info::PreambleOp>,
     /// RPython unroll.py: live ExtendedShortPreambleBuilder while replaying an
     /// existing target token's short preamble.
     active_short_preamble_producer:
@@ -2518,18 +2519,6 @@ impl OptContext {
     pub(crate) fn replace_new_operation(&mut self, idx: usize, op: majit_ir::OpRc) {
         self.new_operations_index.insert(op.pos().get(), op.clone());
         self.new_operations[idx] = op;
-    }
-
-    /// The producer of `opref` among the ops emitted so far by this optimizer
-    /// run, or `None` when nothing at that position has been emitted.
-    /// Unlike [`Self::find_producer_op`] this consults only `new_operations`,
-    /// which is what optimizer.py `as_operation` tests
-    /// (`op in self._emittedoperations`).
-    pub(crate) fn producer_in_new_operations(&self, opref: OpRef) -> Option<majit_ir::OpRc> {
-        if opref.is_none() || opref.is_constant() {
-            return None;
-        }
-        self.new_operations_index.get(&opref).cloned()
     }
 
     /// Rebuild `new_operations_index` from the current `new_operations`.
@@ -4474,7 +4463,7 @@ impl OptContext {
                 // unroll.py:29/37 keys by `preamble_op.op`, which is
                 // short_op.res: the exact Box returned to and held by the
                 // body. The replay result is deliberately a different Box.
-                let key = result;
+                let key = resolved.clone();
                 if crate::optimizeopt::majit_log_enabled() {
                     eprintln!(
                         "[jit] potential_extra_ops.insert key={key:?} source={preamble_source:?} result={result:?} invented={}",
@@ -5142,24 +5131,24 @@ impl OptContext {
     /// `optimizer.py` `preamble_op = self.optunroll.potential_extra_ops.pop(op)`.
     pub fn take_potential_extra_op(
         &mut self,
-        result: OpRef,
+        result: &Operand,
     ) -> Option<crate::optimizeopt::info::PreambleOp> {
-        self.potential_extra_ops.swap_remove(&result)
+        self.potential_extra_ops.swap_remove(result)
     }
 
     /// `unroll.py` `self.optunroll.potential_extra_ops[op] = preamble_op` —
     /// dict-assign semantics: overwrite if `key` exists, else append.
     pub fn set_potential_extra_op(
         &mut self,
-        key: OpRef,
+        key: Operand,
         preamble_op: crate::optimizeopt::info::PreambleOp,
     ) {
         self.potential_extra_ops.insert(key, preamble_op);
     }
 
     /// Dict-`in` parity for `potential_extra_ops`.
-    pub fn has_potential_extra_op(&self, key: OpRef) -> bool {
-        self.potential_extra_ops.contains_key(&key)
+    pub fn has_potential_extra_op(&self, key: &Operand) -> bool {
+        self.potential_extra_ops.contains_key(key)
     }
 
     pub fn activate_short_preamble_producer(
@@ -7156,15 +7145,14 @@ impl OptContext {
             // Mirrors Optimizer.force_box contract: resolve replacement,
             // handle tracked preamble ops, force virtuals.
             if let Some(fa) = op.guard_fail_args() {
-                let fargs: smallvec::SmallVec<[OpRef; 8]> =
-                    fa.iter().map(|b| b.to_opref()).collect();
-                for farg in fargs {
+                let fargs: smallvec::SmallVec<[Operand; 8]> = fa.iter().cloned().collect();
+                for farg in &fargs {
                     if !farg.is_none() {
                         // regalloc.py:1206: Const objects skip forcing.
                         // Constant OpRefs may collide with virtual positions;
                         // forcing would corrupt the virtual's PtrInfo.
                         if self
-                            .get_box_replacement_operand_opt(farg)
+                            .get_box_replacement_operand_opt(farg.to_opref())
                             .and_then(|cb| cb.const_value())
                             .is_none()
                         {
@@ -7229,7 +7217,8 @@ impl OptContext {
     /// then force virtuals to concrete. Body refs route through the preamble
     /// source directly, so the prior reverse-lookup 3rd key is no longer
     /// needed.
-    pub(crate) fn force_box_inline(&mut self, opref: OpRef) -> OpRef {
+    pub(crate) fn force_box_inline(&mut self, op: &Operand) -> OpRef {
+        let opref = op.to_opref();
         if opref.is_constant() {
             return opref;
         }
@@ -7242,9 +7231,11 @@ impl OptContext {
         // const-resolved results — otherwise the Const reaches `used_boxes`
         // and the carried label slot trips `OpRef::raw()` in unroll.rs.
         if !resolved.is_constant() {
-            let tracked = self
-                .take_potential_extra_op(resolved)
-                .or_else(|| self.take_potential_extra_op(opref));
+            let tracked = match resolved_op.clone() {
+                Some(resolved_box) => self.take_potential_extra_op(&resolved_box),
+                None => None,
+            }
+            .or_else(|| self.take_potential_extra_op(op));
             if let Some(preamble_op) = tracked {
                 // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
                 // — the resolved Box itself is handed to the builder.

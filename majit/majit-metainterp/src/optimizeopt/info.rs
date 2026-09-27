@@ -1157,7 +1157,7 @@ fn force_box_impl(
             // `_emit_operation`: `arg = self.force_box(op.getarg(i))`.
             for i in 0..op.num_args() {
                 let original = op.arg(i);
-                let forced = ctx.force_box_inline(original.to_opref());
+                let forced = ctx.force_box_inline(&original);
                 if forced != original.get_box_replacement(false).to_opref() {
                     let forced_box = ctx
                         .get_box_replacement_operand_opt(forced)

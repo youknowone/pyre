@@ -1510,13 +1510,13 @@ mod tests {
                     OpRc::new(same_as)
                 });
             let pop = crate::optimizeopt::info::PreambleOp {
-                op: ctx.materialize_operand_at(source),
+                op: source_box.clone(),
                 invented_name: false,
                 preamble_op: replay,
                 // Non-invented imported pure re-export: no SameAs alias.
                 same_as_source: None,
             };
-            ctx.set_potential_extra_op(source, pop);
+            ctx.set_potential_extra_op(source_box, pop);
         }
     }
     use crate::optimizeopt::optimizer::Optimizer;

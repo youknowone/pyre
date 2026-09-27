@@ -2277,13 +2277,16 @@ impl Optimizer {
         // results — otherwise the Const reaches `used_boxes` and the carried
         // label slot trips `OpRef::raw()` in unroll.rs.
         if !resolved.is_constant() {
-            let tracked = ctx.take_potential_extra_op(resolved).or_else(|| {
-                if opref == resolved {
-                    None
-                } else {
-                    ctx.take_potential_extra_op(opref)
-                }
-            });
+            let tracked = resolved_op
+                .as_ref()
+                .and_then(|resolved_box| ctx.take_potential_extra_op(resolved_box))
+                .or_else(|| {
+                    if opref == resolved {
+                        None
+                    } else {
+                        ctx.take_potential_extra_op(op)
+                    }
+                });
             if let Some(preamble_op) = tracked {
                 // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
                 // — the resolved Box itself is handed to the builder.
@@ -8011,10 +8014,11 @@ mod tests {
                 same_as_source: None,
             }],
         );
+        let b14 = ctx.materialize_operand_at(OpRef::int_op(14));
         ctx.set_potential_extra_op(
-            OpRef::int_op(14),
+            b14.clone(),
             crate::optimizeopt::info::PreambleOp {
-                op: rooted_resop_operand(Type::Int, 14),
+                op: b14.clone(),
                 invented_name: false,
                 preamble_op: {
                     let mut op = majit_ir::Op::new(
@@ -8028,7 +8032,7 @@ mod tests {
             },
         );
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 14)]);
+        let mut guard = Op::new(OpCode::GuardTrue, &[b14.clone()]);
         guard.pos().set(OpRef::op_typed(15, guard.result_type()));
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&guard));

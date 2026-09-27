@@ -87,7 +87,8 @@ impl Optimization for OptEarlyForce {
                 // non-virtual short-box arg is added to the preamble too.
                 // `take_potential_extra_op` is a no-op when not unrolling or
                 // when no extra op is queued for this arg.
-                if let Some(tracked) = ctx.take_potential_extra_op(arg) {
+                let arg_key = arg_opnd.clone().unwrap_or_else(|| op.arg(i).clone());
+                if let Some(tracked) = ctx.take_potential_extra_op(&arg_key) {
                     // shortpreamble.py:434: the resolved Box is handed
                     // to the builder; fall back to the operand itself.
                     let arg_b = arg_opnd
