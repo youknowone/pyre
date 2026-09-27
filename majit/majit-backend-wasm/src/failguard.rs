@@ -24,6 +24,15 @@ pub struct WasmFailDescr {
     /// disjoint area is essential because a following FINISH overwrites the
     /// ordinary exit slots and CALL_ASSEMBLER owns the dispatch-key slot.
     pub force_args_offset: u32,
+    /// `0` when every force arg is `force_args_offset + loc * 8` (no tail, or
+    /// the loc is still the prefix index). Otherwise `force_tail_base` is the
+    /// first tail force word. A physical value index at or past
+    /// `force_prefix_slots` names
+    /// `force_tail_base + (loc - value_tail_index) * 8`: tail value items are
+    /// three apart, and so are the force words beside them.
+    pub force_tail_base: u32,
+    pub force_prefix_slots: u32,
+    pub value_tail_index: u32,
     /// Compile-time guard gcmap retained for FINISH after a
     /// GUARD_NOT_FORCED_2, matching `assembler._finish_gcmap`.
     pub force_gcmap_ptr: usize,
@@ -327,6 +336,9 @@ mod tests {
             fail_locs: Vec::new(),
             is_finish: false,
             force_args_offset: 8,
+            force_tail_base: 0,
+            force_prefix_slots: 0,
+            value_tail_index: 0,
             force_gcmap_ptr: 0,
             bridge_cell: 0,
             fail_arg_advanced: Vec::new(),
@@ -757,6 +769,9 @@ fn reserved_finish_descr(exit_index: u32, meta_descr: Option<DescrRef>) -> Arc<W
         fail_locs: Vec::new(),
         is_finish: true,
         force_args_offset: 0,
+        force_tail_base: 0,
+        force_prefix_slots: 0,
+        value_tail_index: 0,
         force_gcmap_ptr: 0,
         bridge_cell: 0,
         fail_arg_advanced: Vec::new(),
@@ -821,6 +836,9 @@ pub fn alloc_exit_cell(sink: usize, fail_index: u32) -> usize {
         fail_locs: Vec::new(),
         is_finish: false,
         force_args_offset: 0,
+        force_tail_base: 0,
+        force_prefix_slots: 0,
+        value_tail_index: 0,
         force_gcmap_ptr: 0,
         bridge_cell: 0,
         fail_arg_advanced: Vec::new(),
@@ -913,6 +931,9 @@ fn propagate_wasm_descr(meta_descr: Option<DescrRef>) -> Arc<WasmFailDescr> {
         fail_locs: Vec::new(),
         is_finish: false,
         force_args_offset: 0,
+        force_tail_base: 0,
+        force_prefix_slots: 0,
+        value_tail_index: 0,
         force_gcmap_ptr: 0,
         bridge_cell: 0,
         fail_arg_advanced: Vec::new(),

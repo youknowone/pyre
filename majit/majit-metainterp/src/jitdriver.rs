@@ -3337,7 +3337,13 @@ impl<S: JitState> JitDriver<S> {
         let has_compiled = self.meta.has_compiled_loop(key);
         let loop_header_pc = self.meta.loop_header_pc_for(key);
         let dispatch_key = self.meta.front_target_dispatch_key(key);
-        let ok = has_compiled && loop_header_pc != Some(0) && dispatch_key.is_some();
+        let direct_entry = dispatch_key.is_some_and(|dispatch_key| {
+            self.meta.entry_procedure_token(key).is_some_and(|token| {
+                self.meta
+                    .backend_supports_dispatch_key_entry_for(&token, dispatch_key)
+            })
+        });
+        let ok = has_compiled && loop_header_pc != Some(0) && direct_entry;
         if crate::callee_rca_enabled() {
             eprintln!(
                 "[callee-rca][direct-entry-can-resume] key={key} has_compiled={} \
@@ -3390,10 +3396,16 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
         self.meta.single_pass_label_entry_key = self.meta.single_pass_compiled_key.filter(|&key| {
-            self.meta.backend_supports_dispatch_key_entry()
+            let Some(dispatch_key) = self.meta.front_target_dispatch_key(key) else {
+                return false;
+            };
+            let Some(token) = self.meta.entry_procedure_token(key) else {
+                return false;
+            };
+            self.meta
+                .backend_supports_dispatch_key_entry_for(&token, dispatch_key)
                 && self.meta.has_compiled_loop(key)
                 && self.meta.loop_header_pc_for(key) != Some(0)
-                && self.meta.front_target_dispatch_key(key).is_some()
         });
         if portal_rca_enabled() {
             eprintln!(
@@ -3417,7 +3429,17 @@ impl<S: JitState> JitDriver<S> {
             }
             return None;
         }
-        let dispatch_key = self.meta.front_target_dispatch_key(green_key);
+        let dispatch_key = self
+            .meta
+            .front_target_dispatch_key(green_key)
+            .filter(|&key| {
+                self.meta
+                    .entry_procedure_token(green_key)
+                    .is_some_and(|token| {
+                        self.meta
+                            .backend_supports_dispatch_key_entry_for(&token, key)
+                    })
+            });
         if portal_rca_enabled() {
             eprintln!(
                 "[portal-rca][parity-crn-consume-label-entry] green_key={green_key} \
@@ -3463,10 +3485,16 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.loop_header_pc_for(key) == Some(0) {
             return None;
         }
-        if !self.meta.backend_supports_dispatch_key_entry() {
+        let dispatch_key = self.meta.front_target_dispatch_key(key)?;
+        let Some(token) = self.meta.entry_procedure_token(key) else {
+            return None;
+        };
+        if !self
+            .meta
+            .backend_supports_dispatch_key_entry_for(&token, dispatch_key)
+        {
             return None;
         }
-        let dispatch_key = self.meta.front_target_dispatch_key(key)?;
         let full_live_values = self
             .take_continue_running_normally_payload()
             .map(|(values, _)| values);

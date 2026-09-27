@@ -778,7 +778,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "ca_cell_set",
                 "ca_cells_zero",
                 "accepted_ca",
-                "decl_ca_trampoline",
+                "unused_ca_trampoline",
                 "forced_ca_terminal_decline",
                 "ml_no_descr",
                 "ml_unpublished",

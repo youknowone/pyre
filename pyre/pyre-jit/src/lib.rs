@@ -164,23 +164,17 @@ pub fn gc_diag_counters() -> (usize, usize, usize, usize) {
 mod tests {
     use super::*;
 
-    /// rpython/rlib/rstack.py stack_check / assembler.py:1080
-    /// _call_header_with_stack_check parity contract: backend slowpath
-    /// wrappers MUST construct a fresh `RecursionError` and place it
-    /// into the current thread's pending JIT exception slot; the JIT
-    /// glue drains that slot at every backend boundary and raises the
-    /// exception in the interpreter — matches RPython
-    /// `stack_check_slowpath → _StackOverflow → pos_exception() →
-    /// propagate_exception_path`.
-    ///
-    /// The dynasm x86/aarch64 inline probes and cranelift prologue
-    /// call `pyre_stack_check_slowpath_for_backend` /
-    /// `pyre_stack_check_for_jit_prologue` directly. We exercise the
-    /// end-to-end wiring here so any future change that re-routes the
-    /// probe trips the test.
+    /// `rpython/rlib/rstack.py` `stack_check_slowpath` raises `_StackOverflow`
+    /// into `pos_exception` / `pos_exc_value` (`llmodel.py` `_store_exception`).
+    /// `pyre_stack_check_slowpath_for_backend` publishes through the raiser
+    /// `install_jit_call_bridge` registers (`register_jit_exc_raiser` →
+    /// `jit_exc_raise`). The pending slot stays empty: `park_jit_pending_error`
+    /// is its only producer.
     #[test]
-    fn stack_overflow_probe_raises_into_pending_exception_slot() {
+    #[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
+    fn stack_overflow_probe_raises_into_backend_exception_cells() {
         use pyre_interpreter::stack_check;
+        use pyre_object::interp_exceptions::{ExcKind, w_exception_kind_checked};
 
         // The slowpath is reached from generated code, which runs with the GIL
         // held; driving it directly makes this thread the mutator instead.
@@ -188,14 +182,17 @@ mod tests {
 
         // Install the same backend bridge call_jit::install_jit_call_bridge
         // wires up at runtime, so the registered slowpath addresses
-        // really are the ones the cranelift / dynasm prologues invoke.
+        // really are the ones the cranelift / dynasm prologues invoke,
+        // and `jit_publish_exception` has a raiser.
         crate::call_jit::install_jit_call_bridge();
+        clear_backend_exception_cells();
 
         stack_check::reset_stack_base();
-        let _ = stack_check::drain_jit_pending_exception();
+        assert!(
+            stack_check::drain_jit_pending_exception().is_ok(),
+            "pending slot starts empty"
+        );
 
-        // Drive the backend-callable slowpath directly and verify it
-        // constructs the exception into the pending slot.
         let sp = {
             let probe: usize = 0;
             &probe as *const usize as usize
@@ -211,16 +208,18 @@ mod tests {
             "backend slowpath must signal overflow"
         );
         assert!(
-            stack_check::is_jit_overflow_pending(),
-            "slowpath must raise into the current thread's pending slot",
-        );
-        let err = stack_check::drain_jit_pending_exception()
-            .expect_err("pending exception must surface as RecursionError");
-        assert_eq!(err.kind, pyre_interpreter::PyErrorKind::RecursionError);
-        assert!(
             !stack_check::is_jit_overflow_pending(),
-            "drain must clear the slot",
+            "slowpath must not park the overflow in the pending slot",
         );
+        assert!(
+            stack_check::drain_jit_pending_exception().is_ok(),
+            "pending slot stays empty"
+        );
+        let value = backend_exception_value();
+        assert_ne!(value, 0, "raiser must write pos_exc_value");
+        let kind = unsafe { w_exception_kind_checked(value as pyre_object::PyObjectRef) };
+        assert_eq!(kind, Some(ExcKind::RecursionError));
+        clear_backend_exception_cells();
 
         // Restore defaults so the rest of the test binary sees a sane
         // budget. The synthetic high base above would make
@@ -229,5 +228,34 @@ mod tests {
         stack_check::reset_stack_base();
         stack_check::set_recursion_limit(stack_check::DEFAULT_RECURSION_LIMIT)
             .expect("default limit");
+    }
+
+    /// `pos_exc_value` the registered raiser wrote. Each backend keeps its
+    /// own cell; `store_jit_exception` writes every backend that this build
+    /// compiled in.
+    #[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
+    fn backend_exception_value() -> i64 {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return majit_backend_wasm::jit_exc_value_peek();
+        }
+        #[cfg(feature = "dynasm")]
+        {
+            return majit_backend_dynasm::jit_exc_value_peek();
+        }
+        #[cfg(all(feature = "cranelift", not(feature = "dynasm")))]
+        {
+            return majit_backend_cranelift::jit_exc_value_peek();
+        }
+    }
+
+    #[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
+    fn clear_backend_exception_cells() {
+        #[cfg(target_arch = "wasm32")]
+        majit_backend_wasm::jit_exc_clear();
+        #[cfg(feature = "dynasm")]
+        majit_backend_dynasm::jit_exc_clear();
+        #[cfg(feature = "cranelift")]
+        majit_backend_cranelift::jit_exc_clear();
     }
 }

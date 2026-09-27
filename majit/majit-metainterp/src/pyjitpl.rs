@@ -20648,6 +20648,16 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.supports_dispatch_key_entry()
     }
 
+    /// [`Backend::supports_dispatch_key_entry_for`] for one compiled token.
+    pub fn backend_supports_dispatch_key_entry_for(
+        &self,
+        token: &JitCellToken,
+        dispatch_key: u32,
+    ) -> bool {
+        self.backend
+            .supports_dispatch_key_entry_for(token, dispatch_key)
+    }
+
     /// Register a helper that boxes a raw integer into an interpreter object.
     /// PyPy warmspot.py set_param_max_unroll_recursion().
     pub fn set_max_unroll_recursion(&mut self, value: usize) {

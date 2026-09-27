@@ -3240,6 +3240,18 @@ pub trait Backend: Send {
         false
     }
 
+    /// Whether key `dispatch_key` may enter `token` on a fresh host frame.
+    ///
+    /// [`Backend::supports_dispatch_key_entry`] is the backend-wide answer.
+    /// A LABEL whose resume loader reads capture slots
+    /// (`LabelResumeData` / `emit_label_capture_restore`) is false: the host
+    /// writes only the compact LABEL arguments, so those slots are never
+    /// stored. The default accepts every key the backend enters at all.
+    fn supports_dispatch_key_entry_for(&self, token: &JitCellToken, dispatch_key: u32) -> bool {
+        let _ = (token, dispatch_key);
+        self.supports_dispatch_key_entry()
+    }
+
     /// Execute compiled code with integer-only arguments.
     ///
     /// The integer-only signature is what a backend needs in order to hand the
