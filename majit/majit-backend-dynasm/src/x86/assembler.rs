@@ -23,6 +23,40 @@ use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use super::rx86;
 
+/// `rx86.py X86_64_CodeBuilder.MULTIBYTE_NOPs`, index == length, 1..=15.
+fn multibyte_nop(len: usize) -> &'static [u8] {
+    const NOPS: [&[u8]; 16] = [
+        &[],
+        &[0x90],
+        &[0x66, 0x90],
+        &[0x0f, 0x1f, 0x00],
+        &[0x0f, 0x1f, 0x40, 0x00],
+        &[0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[
+            0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ],
+        &[
+            0x66, 0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ],
+        &[
+            0x66, 0x66, 0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ],
+        &[
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ],
+        &[
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00,
+            0x00,
+        ],
+    ];
+    NOPS[len]
+}
+
 use majit_backend::{AsmMemoryManager, BackendError, JitCellToken};
 use majit_ir::{
     FailDescr, FailDescrStore, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex,
@@ -837,6 +871,11 @@ pub struct Assembler386<'a> {
     asm_memory_manager: Arc<AsmMemoryManager>,
     /// assembler.py:83 pending_guard_tokens — guards awaiting recovery stubs.
     pending_guard_tokens: Vec<GuardToken>,
+    /// `x86/regalloc.py` `min_bytes_before_label`. The next label
+    /// (`consider_label` / `flush_loop`) is padded out to this offset so
+    /// `redirect_call_assembler` and a `GUARD_NOT_INVALIDATED` patch cannot
+    /// overwrite it.
+    min_bytes_before_label: usize,
     /// GC bitmap to push before the current collecting call (e.g.,
     /// CallMallocNursery slow path). Set by the `RegAllocOp::Perform`
     /// emit path when `gcmap: Some(..)` is carried, cleared after.
@@ -1143,6 +1182,7 @@ impl<'a> Assembler386<'a> {
             mc: Assembler::new(0),
             asm_memory_manager,
             pending_guard_tokens: Vec::new(),
+            min_bytes_before_label: 0,
             pending_malloc_nursery_gcmap: None,
             frame_depth: JITFRAME_FIXED_SIZE,
             fail_descrs: FailDescrStore::default(),
@@ -2463,6 +2503,10 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; =>entry_label);
         self.self_entry_label = Some(entry_label);
         let entry = self.mc.offset();
+        // `regalloc.py prepare_loop`: 64-bit `redirect_call_assembler` writes
+        // at most 13 bytes at `_ll_function_addr`. The first label must sit
+        // past them.
+        self.min_bytes_before_label = entry.0 + 13;
         self._assemble(true)?;
         self.check_unrelocated_jump_target()?;
 
@@ -2600,7 +2644,8 @@ impl<'a> Assembler386<'a> {
             Some(arglocs.to_vec())
         };
 
-        // assembler.py:641 prepare_bridge
+        // `regalloc.py prepare_bridge`: `min_bytes_before_label = 0`.
+        self.min_bytes_before_label = 0;
         let entry = self.mc.offset();
         self._assemble(false)?;
         self.check_unrelocated_jump_target()?;
@@ -2951,6 +2996,10 @@ impl<'a> Assembler386<'a> {
         if crate::majit_dump_enabled() {
             eprintln!("[dynasm] @{:#06x} end of ops", self.mc.offset().0);
         }
+        // `regalloc.py` `_walk_operations` ends in `flush_loop`, so a
+        // `GUARD_NOT_INVALIDATED` with nothing after it still has five
+        // bytes before the recovery stubs.
+        self.flush_loop();
 
         // assembler.py:1003-1008 `_assemble`: grow the frame to fit a
         // cross-loop JUMP target.  The closing `JMP` jumps into the target
@@ -4350,15 +4399,11 @@ impl<'a> Assembler386<'a> {
                 let descr_arc = op.getdescr();
                 let label_descr = descr_arc.as_ref().and_then(|d| d.as_loop_target_descr());
                 if label_descr.is_some() {
-                    // Align the loop back-edge target to 16 bytes. The buffer is
-                    // page-aligned, so aligning the offset aligns the address. A
-                    // head landing in the last few bytes of a 64-byte fetch line
-                    // costs a per-iteration front-end fetch bubble on the taken
-                    // back-edge; the pad (executed only on the first fall-through
-                    // entry) removes that sensitivity to frame-layout offset.
-                    while self.mc.offset().0 % 16 != 0 {
-                        dynasm!(self.mc ; .arch x64 ; nop);
-                    }
+                    // `regalloc.py consider_label` calls `flush_loop` before
+                    // binding: 16-byte alignment, and `min_bytes_before_label`
+                    // so a `GUARD_NOT_INVALIDATED` patch or
+                    // `redirect_call_assembler` cannot land on the target.
+                    self.flush_loop();
                 }
                 if majit_ir::debug::have_debug_prints() {
                     majit_ir::debug::log_one(
@@ -5571,29 +5616,15 @@ impl<'a> Assembler386<'a> {
     }
 
     /// `assembler.py genop_guard_guard_not_invalidated` — the guard tests
-    /// nothing.  It is a position, recorded now and turned into a branch to its
-    /// recovery stub by `cpu.invalidate_loop` if the loop is ever invalidated,
-    /// so a loop that keeps its quasi-immutable assumptions pays nothing per
-    /// iteration for holding them.
+    /// nothing and emits nothing. `cpu.invalidate_loop` later writes
+    /// `JMP rel32` (five bytes) over the instructions that follow, while
+    /// every other mutator is quiesced (`LoopInvalidation::invalidate`).
     ///
-    /// Upstream x86 emits zero bytes and later writes five over whatever
-    /// follows, which is why it needs `regalloc.py consider_guard_not_invalidated`'s
-    /// `ensure_next_label_is_at_least_at_position(n + 5)` to keep a jump target
-    /// out of them.  That facility has no counterpart here: dynasm owns label
-    /// binding, and a bound label's position is not something a caller can push
-    /// forward.  So pyre reserves the bytes itself, as upstream aarch64 does —
-    /// `opassembler.py _emit_guard` emits a `NOP`,
-    /// `aarch64/assembler.py process_pending_guards` records it, and
-    /// `aarch64/runner.py invalidate_loop` writes a `B` over it.  Here the
-    /// placeholder is one eight-byte `NOP` on an eight-byte boundary, and
-    /// `write_invalidate_positions` replaces it with `JMP rel32` in a single
-    /// aligned eight-byte store.  The free-threaded build needs that: a
-    /// five-byte overwrite of live code leaves a window in which another
-    /// thread's instruction fetch sees half of each of two instructions, while
-    /// one naturally-aligned store that stays inside this guard's own
-    /// instruction cannot be observed torn.  A `NOP` rather than a live
-    /// `JMP .+0` keeps the unpatched guard free: a jump to the next
-    /// instruction is still a taken branch on every iteration.
+    /// `regalloc.py consider_guard_not_invalidated` calls
+    /// `ensure_next_label_is_at_least_at_position(n + 5)` so that patch
+    /// cannot overwrite the next label. `flush_loop` honours that floor
+    /// when the label is bound, and again at the end of the trace so five
+    /// bytes exist before the recovery stubs.
     fn implement_guard_not_invalidated_with_faillocs(
         &mut self,
         op: &Op,
@@ -5602,35 +5633,39 @@ impl<'a> Assembler386<'a> {
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
     ) {
-        // Pad to the boundary with one multi-byte NOP, so the pad costs the
-        // front end one instruction however wide it is.
-        match (8 - self.mc.offset().0 % 8) % 8 {
-            0 => {}
-            1 => dynasm!(self.mc ; .arch x64 ; nop),
-            2 => dynasm!(self.mc ; .arch x64 ; .u8 0x66u8 ; .u8 0x90u8),
-            3 => dynasm!(self.mc ; .arch x64 ; .u8 0x0Fu8 ; .u8 0x1Fu8 ; .u8 0x00u8),
-            4 => dynasm!(self.mc ; .arch x64 ; .u8 0x0Fu8 ; .u8 0x1Fu8 ; .u8 0x40u8 ; .u8 0x00u8),
-            5 => dynasm!(self.mc ; .arch x64
-                ; .u8 0x0Fu8 ; .u8 0x1Fu8 ; .u8 0x44u8 ; .u8 0x00u8 ; .u8 0x00u8),
-            6 => dynasm!(self.mc ; .arch x64
-                ; .u8 0x66u8 ; .u8 0x0Fu8 ; .u8 0x1Fu8 ; .u8 0x44u8 ; .u8 0x00u8 ; .u8 0x00u8),
-            _ => dynasm!(self.mc ; .arch x64
-                ; .u8 0x0Fu8 ; .u8 0x1Fu8 ; .u8 0x80u8 ; .u32 0u32),
-        }
+        // `genop_guard_guard_not_invalidated`: `pos` is the opcode byte of
+        // the not-yet-written `JMP`. Upstream stores `pos + 1` and
+        // `invalidate_loop` writes at `addr - 1`; recording the opcode
+        // address is the same site.
         let pos = self.mc.offset().0;
-        // `NOP DWORD [RAX+RAX*1+0]`, the eight-byte form (`0F 1F 84 00 00000000`).
-        // Its last three bytes are the tail `collect_invalidate_positions`
-        // keeps after the `JMP rel32` it writes over the first five.
-        dynasm!(self.mc ; .arch x64
-            ; .u8 0x0Fu8 ; .u8 0x1Fu8 ; .u8 0x84u8 ; .u8 0x00u8 ; .u32 0u32);
-        // The label is bound at the recovery stub like any other guard's; under
-        // an unpatched placeholder nothing jumps to it.
         self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, guard_argloc, faillocs);
-        // `genop_guard_guard_not_invalidated`'s `guard_token.pos_jump_offset = pos`.
         self.pending_guard_tokens
             .last_mut()
             .expect("guard token appended")
             .pos_jump_offset = Some(pos);
+        self.ensure_next_label_is_at_least_at_position(pos + 5);
+    }
+
+    /// `regalloc.py ensure_next_label_is_at_least_at_position`.
+    fn ensure_next_label_is_at_least_at_position(&mut self, at_least_position: usize) {
+        self.min_bytes_before_label = self.min_bytes_before_label.max(at_least_position);
+    }
+
+    /// `regalloc.py flush_loop`. Pad with one `X86_64_CodeBuilder.MULTIBYTE_NOPs`
+    /// entry so the next label is 16-byte aligned and not before
+    /// `min_bytes_before_label`.
+    fn flush_loop(&mut self) {
+        let current_pos = self.mc.offset().0;
+        let aligned = (current_pos + 15) & !15;
+        let target_pos = aligned.max(self.min_bytes_before_label);
+        let insert_nops = target_pos - current_pos;
+        assert!(
+            insert_nops <= 15,
+            "flush_loop pad {insert_nops} exceeds MULTIBYTE_NOPs"
+        );
+        if insert_nops > 0 {
+            self.mc.extend(multibyte_nop(insert_nops).iter().copied());
+        }
     }
 
     fn implement_guard_always_fails_with_faillocs(
@@ -5978,14 +6013,14 @@ impl<'a> Assembler386<'a> {
             .iter()
             .filter_map(|stub| {
                 let pos_jump_offset = stub.pos_jump_offset?;
-                // `relative_target = tok.pos_recovery_stub - (tok.pos_jump_offset + 4)`,
-                // with `pos_jump_offset` here naming the `JMP` opcode byte rather
-                // than the displacement after it.
+                // `relative_target = tok.pos_recovery_stub - (tok.pos_jump_offset + 4)`
+                // with upstream's `pos_jump_offset = pos + 1`. Here
+                // `pos_jump_offset` is the `JMP` opcode byte, so the
+                // displacement is relative to `pos + 5`.
                 let relative_target = stub.pos_recovery_stub as i64 - (pos_jump_offset as i64 + 5);
                 let relative_target = i32::try_from(relative_target)
                     .expect("guard recovery stub within JMP rel32 reach of its guard");
-                // `E9 rel32` over the placeholder's first five bytes; its last
-                // three stay the `00 00 00` it was emitted with.
+                // `JMP_l`: `E9 rel32`, five bytes, written at the guard site.
                 Some(majit_backend::InvalidatePosition {
                     addr: rawstart + pos_jump_offset,
                     word: 0xE9 | u64::from(relative_target as u32) << 8,

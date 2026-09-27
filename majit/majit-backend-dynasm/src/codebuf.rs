@@ -110,41 +110,46 @@ pub fn with_writable<F: FnOnce()>(addr: *mut u8, len: usize, f: F) {
 
 /// `x86/runner.py invalidate_loop` / `aarch64/runner.py invalidate_loop` —
 /// activate the `GUARD_NOT_INVALIDATED` sites recorded for a loop and its
-/// attached bridges by writing the branch to each guard's recovery stub over
-/// the placeholder the emitter left there.
+/// attached bridges.
 ///
-/// Upstream aarch64 brackets the same walk with `rmmap.enter_assembler_writing()`
-/// / `leave_assembler_writing()`; [`with_writable`] is that bracket.  One
-/// naturally-aligned store per site and nothing else, so a thread executing
-/// the loop reads either the placeholder or the finished branch: on x86-64 the
-/// eight bytes are the `NOP` the guard emitted and the `JMP rel32` replacing
-/// it, on aarch64 the four bytes are the whole `B imm26` instruction word, one
-/// of the encodings the architecture names as safe to modify while another PE
-/// executes it.
+/// On x86-64 the emitter left zero bytes at the site (`genop_guard_guard_not_invalidated`).
+/// `invalidate_loop` writes `JMP rel32` (five bytes) over whatever follows.
+/// `LoopInvalidation::invalidate` quiesces other mutators before this write:
+/// a torn five-byte store is not an atomic instruction update. The page being
+/// RW around the store is [`with_writable`], shared with `patch_jump_for_descr`.
 ///
-/// The store is what has to be indivisible; the page being RW around it is a
-/// property of [`with_writable`] itself, shared with the bridge attachment in
-/// `patch_jump_for_descr`, which patches live code the same way.
+/// On aarch64 the emitter left a `NOP` and this writes one aligned `B imm26`
+/// word, an encoding the architecture names as safe to modify while another
+/// PE executes it. [`with_writable`] is `rmmap.enter_assembler_writing`.
 pub fn write_invalidate_positions(positions: &[majit_backend::InvalidatePosition]) {
     #[cfg(target_arch = "x86_64")]
-    type Word = std::sync::atomic::AtomicU64;
+    {
+        for position in positions {
+            let bytes = position.word.to_le_bytes();
+            with_writable(position.addr as *mut u8, 5, || unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), position.addr as *mut u8, 5);
+            });
+        }
+    }
     #[cfg(not(target_arch = "x86_64"))]
-    type Word = std::sync::atomic::AtomicU32;
-    let width = std::mem::size_of::<Word>();
-    for position in positions {
-        debug_assert_eq!(
-            position.addr % width,
-            0,
-            "invalidate position {:#x} is not word-aligned; the store would not be atomic",
-            position.addr
-        );
-        with_writable(position.addr as *mut u8, width, || unsafe {
-            // Require one indivisible word store even when LLVM knows more
-            // about the instruction bytes than the native code reader does.
-            // The cache flush in with_writable publishes it to instruction fetch.
-            Word::from_ptr(position.addr as *mut _)
-                .store(position.word as _, std::sync::atomic::Ordering::Relaxed);
-        });
+    {
+        type Word = std::sync::atomic::AtomicU32;
+        let width = std::mem::size_of::<Word>();
+        for position in positions {
+            debug_assert_eq!(
+                position.addr % width,
+                0,
+                "invalidate position {:#x} is not word-aligned; the store would not be atomic",
+                position.addr
+            );
+            with_writable(position.addr as *mut u8, width, || unsafe {
+                // Require one indivisible word store even when LLVM knows more
+                // about the instruction bytes than the native code reader does.
+                // The cache flush in with_writable publishes it to instruction fetch.
+                Word::from_ptr(position.addr as *mut _)
+                    .store(position.word as _, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
     }
 }
 
