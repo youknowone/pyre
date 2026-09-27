@@ -661,6 +661,7 @@ impl RBigInt {
 
     /// Fallible form of [`RBigInt::new`] for upstream paths whose translated
     /// allocation has an explicit MemoryError edge.
+    #[allow(dead_code)] // rbigint.py `rbigint.__init__`
     fn try_new(digits: &[Digit], sign: i64, size: i64) -> Result<Self, RBigIntError> {
         debug_assert!(size >= 0);
         let logical_len = if size == 0 {

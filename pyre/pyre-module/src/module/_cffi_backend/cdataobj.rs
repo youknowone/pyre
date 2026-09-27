@@ -9,7 +9,6 @@
 use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use rustpython_wtf8::Wtf8Buf;
-use std::sync::OnceLock;
 
 use super::ctypeobj::{self, W_CType};
 use super::misc;

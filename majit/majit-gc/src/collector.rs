@@ -6743,6 +6743,7 @@ impl MiniMarkGC {
     /// assertions rather than `debug_assert!`s that a release build drops.
     /// `PYPY_GC_DEBUG` is the only way to arm them, and a run that sets it is
     /// asking to be aborted on a broken invariant.
+    #[allow(dead_code)] // incminimark.py `debug_check_consistency`
     fn debug_check_consistency(&self) {
         self.debug_check_consistency_at("unspecified");
     }

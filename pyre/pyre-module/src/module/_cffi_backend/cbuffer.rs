@@ -4,7 +4,6 @@
 use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::cmp::Ordering;
-use std::sync::OnceLock;
 
 use super::cdataobj;
 use super::ctypeobj;

@@ -10,7 +10,6 @@
 
 use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
-use std::sync::OnceLock;
 
 use super::cdataobj::W_CData;
 

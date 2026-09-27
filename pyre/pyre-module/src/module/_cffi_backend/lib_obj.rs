@@ -3,7 +3,6 @@
 use pyre_interpreter::{PyError, PyErrorKind};
 use pyre_object::PyObjectRef;
 use std::ffi::CStr;
-use std::sync::OnceLock;
 
 use super::ffi_obj::W_FFIObject;
 use super::{

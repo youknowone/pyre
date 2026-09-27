@@ -3,7 +3,7 @@
 use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::ffi::{CStr, CString};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use super::cdataobj::{self, W_CData};
 use super::ctypeobj::{self, W_CType};

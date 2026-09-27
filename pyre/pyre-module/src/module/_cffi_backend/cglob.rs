@@ -2,7 +2,6 @@
 
 use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
-use std::sync::OnceLock;
 
 use super::{cdataobj, ctypeobj, ffi_obj, newtype};
 
