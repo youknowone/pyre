@@ -55016,6 +55016,48 @@ mod tests {
         );
     }
 
+    /// `rbuilder.py ll_grow_by` spells its growth as three `ovfcheck`s under
+    /// one `except OverflowError: raise MemoryError`.  The port matches each
+    /// `checked_add` on the spot, so all three must lift to `add_ovf` with an
+    /// OverflowError edge and leave no residual `checked_add`.  Loads the real
+    /// pyre-object LLBC, so ignored by default.
+    #[test]
+    #[ignore]
+    fn rbuilder_ll_grow_by_ovfchecks_lift_to_add_ovf() {
+        use crate::model::{CallTarget, ExitSwitch, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph = super::lower_function(&llbc, "ll_grow_by").expect("lower ll_grow_by");
+        let residual_checked = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.last().map(String::as_str) == Some("checked_add")
+                )
+            })
+            .count();
+        assert_eq!(residual_checked, 0, "graph: {graph:#?}");
+        let ovf_blocks = graph
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.exitswitch, Some(ExitSwitch::LastException)))
+            .filter(|b| {
+                matches!(
+                    b.operations.last().map(|op| &op.kind),
+                    Some(OpKind::BinOp { op, .. }) if op == "add_ovf"
+                )
+            })
+            .count();
+        assert_eq!(ovf_blocks, 3, "graph: {graph:#?}");
+    }
+
     /// `bytes_block_chars` exposes the variable-sized `chars` array whose
     /// length is the same `BytesBlock.length` consumed by the gcarray descr.
     /// It is therefore the bytes-string twin of RPython `STR.chars`: the

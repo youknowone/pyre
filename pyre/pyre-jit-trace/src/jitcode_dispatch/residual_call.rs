@@ -7417,22 +7417,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // FORMAT_SIMPLE on an exact `int` / `str`: the empty-spec fast path
-    // `format_w` already takes, instead of the opaque MayForce residual.
-    // Keyed off the helper tag; anything else (bool, subclass, user
-    // `__format__`) falls through.  `FormatWithSpec` below inlines a
-    // Python `__format__` when a spec operand is present.
-    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::FormatSimple
-        && ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && spec_gate(SpecFold::FormatSimple, || {
-            try_walker_specialize_format_simple(ctx, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
     // BUILD_STRING of already-str fragments: left-fold `descr_add`
     // (`jit_str_concat`) off the backing-array heap-cache, the same
     // channel as `BINARY_OP ADD` of two exact `str`s.
@@ -8963,21 +8947,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         if let Some(inlined) = try_walker_inline_object_new(ctx, op, &r_args, dst_bank, dst)? {
             return Ok(inlined);
         }
-    }
-
-    // CONVERT_VALUE on an exact `int` (`!s`/`!r`/`!a`) or exact `str`
-    // `!s`: `descr_str` / `descr_repr` (intobject.py) share a body, and
-    // `descr_str` of an exact `str` is identity.  Keyed off the helper
-    // tag; a bool / subclass / Python `__str__` falls through.
-    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::ConvertValue
-        && ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && spec_gate(SpecFold::ConvertValue, || {
-            try_walker_specialize_convert_value(ctx, op, &r_args, &i_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // LoadConst fold: the LOAD_CONST helper (oopspec `LoadConst`, set

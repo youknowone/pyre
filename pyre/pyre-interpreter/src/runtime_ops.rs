@@ -599,6 +599,17 @@ pub fn compare_op_tag_is_identity(tag: i64) -> bool {
     tag == COMPARE_OP_IS || tag == COMPARE_OP_IS_NOT
 }
 
+/// `pyopcode.py IS_OP`: `space.is_w(w_1, w_2)`, inverted when `invert`
+/// is non-zero, returned as `space.w_True` / `space.w_False`.
+///
+/// IS_OP lowers to an `inline_call` of this body, so the JIT traces
+/// `is_w`'s per-type identity rather than a may-force residual.
+#[inline(never)]
+pub fn is_op(w_1: PyObjectRef, w_2: PyObjectRef, invert: i64) -> PyObjectRef {
+    let res = crate::baseobjspace::is_w(w_1, w_2);
+    pyre_object::w_bool_from(if invert != 0 { !res } else { res })
+}
+
 pub fn compare_op_tag_is_contains(tag: i64) -> bool {
     tag == COMPARE_OP_CONTAINS || tag == COMPARE_OP_NOT_CONTAINS
 }
@@ -773,14 +784,37 @@ pub fn convert_value_code(conv: ConvertValueOparg) -> i64 {
 /// WTF-8 so a lone surrogate survives (the `'%s' % x` rewrite path);
 /// `Repr` / `Ascii` go through `py_repr` / `py_ascii`.  A user
 /// `__str__` / `__repr__` may run Python → fallible.
+///
+/// CONVERT_VALUE lowers to an `inline_call` of this body, so the JIT traces
+/// the exact `str` / `int` arms and keeps every other shape behind the
+/// `dont_look_inside` [`convert_value_slow`].
 pub fn convert_value(value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate::PyError> {
+    // `descr_str` (unicodeobject.py) returns `self` for an exact `str`.
+    if (conv == 0 || conv == 3)
+        && unsafe { pyre_object::is_exact_type(value, &pyre_object::STR_TYPE) }
+    {
+        return Ok(value);
+    }
+    // `intobject.py descr_repr` is also its `descr_str`, and its digits are
+    // ASCII, so `ascii_from_object` (unicodeobject.py) returns the repr as is.
+    // Machine int is the storage `ob_type`; a subclass keeps that `ob_type`
+    // and may override `__str__` / `__repr__`.
+    if unsafe {
+        pyre_object::py_type_check(value, &pyre_object::INT_TYPE)
+            && pyre_object::is_exact_builtin_instance(value)
+    } {
+        return Ok(unsafe { pyre_object::descr_str(value) });
+    }
+    convert_value_slow(value, conv)
+}
+
+/// [`convert_value`] for every shape its exact `str` / `int` arms do not
+/// answer.
+#[majit_macros::dont_look_inside]
+fn convert_value_slow(value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate::PyError> {
     if conv == 0 || conv == 3 {
-        // `descr_str` (unicodeobject.py) returns `self` for an exact
-        // `str` and converts anything else — a subclass included — to a fresh
-        // base `str`.
-        if unsafe { pyre_object::is_exact_type(value, &pyre_object::STR_TYPE) } {
-            return Ok(value);
-        }
+        // `descr_str` (unicodeobject.py) converts anything but an exact `str`
+        // — a subclass included — to a fresh base `str`.
         let w = unsafe { crate::py_str_wtf8(value)? };
         return Ok(pyre_object::w_str_from_wtf8_managed(w));
     }

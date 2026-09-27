@@ -269,6 +269,38 @@ pub extern "C" fn jit_ll_strconcat(s1: i64, s2: i64) -> i64 {
     out
 }
 
+/// `rstr.py LLHelpers.ll_streq` — compare two rstr `STR` payloads.
+///
+/// `@jit.elidable`.  Upstream also tags it `@jit.oopspec('stroruni.equal(s1,
+/// s2)')`; the tag stays off until the `OS_STREQ_*` helpers vstring's
+/// `handle_str_equal_level1` / `handle_str_equal_level2` substitute are
+/// registered.  Answers 1 / 0 so the result fills a full word.
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_streq(
+    s1: *const crate::unicodeobject::UnicodeValueStorage,
+    s2: *const crate::unicodeobject::UnicodeValueStorage,
+) -> i64 {
+    // also if both are NULLs
+    if s1 == s2 {
+        return 1;
+    }
+    if s1.is_null() || s2.is_null() {
+        return 0;
+    }
+    let len1 = bh_lowlevel_string_len(s1 as i64);
+    let len2 = bh_lowlevel_string_len(s2 as i64);
+    if len1 != len2 {
+        return 0;
+    }
+    let (chars1, chars2) = unsafe {
+        (
+            std::slice::from_raw_parts((s1 as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET), len1),
+            std::slice::from_raw_parts((s2 as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET), len2),
+        )
+    };
+    (chars1 == chars2) as i64
+}
+
 /// `rstr.py LLHelpers.ll_str_mul` — `@jit.elidable` on the STR payload.
 ///
 /// `times < 0` clamps to 0 (`'0' * -1 == ''`).  `ovfcheck(len * times)` is
@@ -372,10 +404,11 @@ pub fn ll_stringslice_startstop(
 }
 
 /// `ll_str.py ll_int2dec` — `@jit.elidable` decimal render of a Signed
-/// into a fresh rstr `STR`.  `descr_repr` (intobject.py) wraps the
-/// result with `space.newutf8(res, len(res))`.
+/// into a fresh rstr `STR`, returned as the `Ptr(STR)` it is.
+/// `descr_repr` (intobject.py) wraps the result with
+/// `space.newutf8(res, len(res))`.
 #[majit_macros::elidable]
-pub extern "C" fn jit_ll_int2dec(val: i64) -> i64 {
+pub extern "C" fn jit_ll_int2dec(val: i64) -> *mut crate::unicodeobject::Utf8Str {
     let sign = usize::from(val < 0);
     let mut uval = if val < 0 {
         (val as u64).wrapping_neg()
@@ -415,7 +448,7 @@ pub extern "C" fn jit_ll_int2dec(val: i64) -> i64 {
             j += 1;
         }
     }
-    out
+    out as *mut crate::unicodeobject::Utf8Str
 }
 
 pub extern "C" fn jit_ll_shrink_array(buf: i64, new_len: i64) -> i64 {
@@ -498,7 +531,7 @@ mod tests {
     #[test]
     fn jit_ll_int2dec_renders_signed_decimal() {
         for val in [0i64, 1, -1, 10, -10, i64::MIN, i64::MAX] {
-            let buf = jit_ll_int2dec(val);
+            let buf = jit_ll_int2dec(val) as i64;
             assert_ne!(buf, 0);
             let expected = val.to_string();
             assert_eq!(bh_lowlevel_string_len(buf), expected.len());
@@ -513,7 +546,7 @@ mod tests {
 
     #[test]
     fn jit_ll_str_mul_repeats_and_clamps_negative() {
-        let one = jit_ll_int2dec(0);
+        let one = jit_ll_int2dec(0) as i64;
         // `0` renders as `"0"` — one char, used as the fill.
         assert_eq!(bh_lowlevel_string_len(one), 1);
         let four = jit_ll_str_mul(one, 4);
@@ -527,6 +560,26 @@ mod tests {
         bh_free_lowlevel_string(four, LOWLEVEL_STR_BASE_SIZE, 1);
         bh_free_lowlevel_string(empty, LOWLEVEL_STR_BASE_SIZE, 1);
         bh_free_lowlevel_string(also_empty, LOWLEVEL_STR_BASE_SIZE, 1);
+    }
+
+    #[test]
+    fn jit_ll_streq_compares_payload_chars() {
+        use crate::unicodeobject::UnicodeValueStorage;
+        let p = |s: i64| s as *const UnicodeValueStorage;
+        let seven = jit_ll_int2dec(7) as i64;
+        let seven_again = jit_ll_int2dec(7) as i64;
+        let eight = jit_ll_int2dec(8) as i64;
+        let seventy = jit_ll_int2dec(70) as i64;
+        assert_ne!(seven, seven_again);
+        assert_eq!(jit_ll_streq(p(seven), p(seven)), 1);
+        assert_eq!(jit_ll_streq(p(seven), p(seven_again)), 1);
+        assert_eq!(jit_ll_streq(p(seven), p(eight)), 0);
+        assert_eq!(jit_ll_streq(p(seven), p(seventy)), 0);
+        assert_eq!(jit_ll_streq(p(seven), p(0)), 0);
+        assert_eq!(jit_ll_streq(p(0), p(0)), 1);
+        for s in [seven, seven_again, eight, seventy] {
+            bh_free_lowlevel_string(s, LOWLEVEL_STR_BASE_SIZE, 1);
+        }
     }
 
     #[test]

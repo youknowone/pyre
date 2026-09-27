@@ -1707,15 +1707,17 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         // deliberately re-wraps that same storage. Zero- and one-code-point
         // strings are unique-ified and compare by value.
         // `str` subclasses keep pointer identity through the exact-type gate.
+        // `s1 is s2` is `ptr::eq` on the two `STR` payloads and `s1 == s2`
+        // is `ll_streq` on them, as the rtyped upstream body calls it.
         if crate::pyobject::is_exact_type(w_one, &crate::pyobject::STR_TYPE)
             && crate::pyobject::is_exact_type(w_two, &crate::pyobject::STR_TYPE)
         {
+            let s1 = crate::unicodeobject::w_str_storage(w_one);
+            let s2 = crate::unicodeobject::w_str_storage(w_two);
             if crate::unicodeobject::w_str_len(w_one) > 1 {
-                return crate::unicodeobject::w_str_storage(w_one)
-                    == crate::unicodeobject::w_str_storage(w_two);
+                return std::ptr::eq(s1, s2);
             }
-            return crate::unicodeobject::w_str_get_wtf8(w_one)
-                == crate::unicodeobject::w_str_get_wtf8(w_two);
+            return crate::lowlevel_string::jit_ll_streq(s1, s2) != 0;
         }
         // `W_FrozensetObject.is_w` (setobject.py): two `frozenset`s
         // are identical only when both are empty — "empty frozensets are

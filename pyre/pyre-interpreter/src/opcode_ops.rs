@@ -1212,6 +1212,11 @@ pub extern "C" fn jit_descroperation_pos(value: i64) -> i64 {
 }
 
 #[inline(never)]
+pub extern "C" fn jit_runtime_ops_is_op(w_1: i64, w_2: i64, invert: i64) -> i64 {
+    crate::runtime_ops::is_op(w_1 as PyObjectRef, w_2 as PyObjectRef, invert) as i64
+}
+
+#[inline(never)]
 pub extern "C" fn jit_baseobjspace_not_(value: i64) -> i64 {
     let _roots = pyre_object::gc_roots::push_roots();
     let value = pyre_object::gc_roots::pin_root(value as PyObjectRef);
@@ -1233,6 +1238,22 @@ pub extern "C" fn jit_baseobjspace_len(value: i64) -> i64 {
 pub extern "C" fn jit_baseobjspace_delitem(obj: i64, key: i64) -> i64 {
     match crate::baseobjspace::delitem(obj as PyObjectRef, key as PyObjectRef) {
         Ok(()) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+#[inline(never)]
+pub extern "C" fn jit_type_methods_format_simple_w(value: i64) -> i64 {
+    match crate::type_methods::format_simple_w(value as PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+#[inline(never)]
+pub extern "C" fn jit_runtime_ops_convert_value(value: i64, conv: i64) -> i64 {
+    match crate::runtime_ops::convert_value(value as PyObjectRef, conv) {
+        Ok(result) => result as i64,
         Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }
 }

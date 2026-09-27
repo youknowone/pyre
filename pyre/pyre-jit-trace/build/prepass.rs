@@ -1048,7 +1048,26 @@ fn real_main() {
             // reaches none of them in source: `call_spec.rs` classifies the
             // eval loop's `binary_value` call as a residual, and the residual
             // is lowered to `jit_binary_value_from_tag`, whose body this is.
+            // `is_op` (IS_OP), `format_simple_w` (FORMAT_SIMPLE,
+            // `space.format`) and `convert_value` (CONVERT_VALUE) are the
+            // codewriter's `inline_call` targets for those opcodes
+            // (`flatten.rs inline_call_targets`).
             helper_graphs: vec![
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "runtime_ops",
+                    "is_op",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "type_methods",
+                    "format_simple_w",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "runtime_ops",
+                    "convert_value",
+                ]),
                 majit_translate::CallPath::from_segments([
                     "pyre_interpreter",
                     "opcode_ops",

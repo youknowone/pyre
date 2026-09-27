@@ -1767,6 +1767,17 @@ pub fn translate_op(
         // (`rtyper.rs`'s `translate_operation`). InstanceRepr later lowers the
         // `getattr`/`setattr` op into a `getfield_*` / `setfield_*`
         // bytecode keyed on the field's lltype kind.
+        OpKind::FieldRead { base, field, .. }
+            if field.name == "length" && field.owner_root.as_deref() == Some("Utf8Str") =>
+        {
+            // `Utf8Str` carries the `rstr.py STR` layout, which the bookkeeper
+            // annotates as `SomeString`: its length word is `len(s)`
+            // (`LLHelpers.ll_strlen`), not a `getattr` the string repr has no
+            // attribute for.
+            let base_hl = lookup_operand(value_map, base, op, "base")?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new("len", vec![base_hl], result)])
+        }
         OpKind::FieldRead { base, field, .. } => {
             let base_hl = lookup_operand(value_map, base, op, "base")?;
             let result = resolve_result_hlvalue(op, value_map)?;
@@ -8142,6 +8153,30 @@ mod tests {
             panic!("fixture result must be a Variable");
         };
         assert_eq!(len_res.id(), expect.id());
+    }
+
+    #[test]
+    fn translate_op_str_length_read_lowers_to_len() {
+        // `LLHelpers.ll_strlen`: the length word of an rstr `STR` is `len(s)`.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("length", Some("Utf8Str".into())),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("STR length must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "len");
+        assert_eq!(translated[0].args.len(), 1);
     }
 
     #[test]

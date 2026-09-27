@@ -1411,6 +1411,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::opcode_ops::compare_value_from_tag",
         crate::opcode_ops::jit_compare_value_from_tag,
     );
+    cp3(
+        &mut entries,
+        "pyre_interpreter::runtime_ops::is_op",
+        crate::opcode_ops::jit_runtime_ops_is_op,
+    );
     cp1(
         &mut entries,
         "pyre_interpreter::baseobjspace::len",
@@ -1420,6 +1425,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::baseobjspace::delitem",
         crate::opcode_ops::jit_baseobjspace_delitem,
+    );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::type_methods::format_simple_w",
+        crate::opcode_ops::jit_type_methods_format_simple_w,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::runtime_ops::convert_value",
+        crate::opcode_ops::jit_runtime_ops_convert_value,
     );
     cpa2(
         &mut entries,
@@ -3436,6 +3451,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::lowlevel_string::jit_ll_strconcat",
         "pyre_object::jit_ll_strconcat",
         pyre_object::lowlevel_string::jit_ll_strconcat,
+    );
+    cpa2(
+        &mut entries,
+        "pyre_object::lowlevel_string::jit_ll_streq",
+        "pyre_object::jit_ll_streq",
+        pyre_object::lowlevel_string::jit_ll_streq,
     );
     cpa2(
         &mut entries,
@@ -5855,6 +5876,18 @@ mod tests {
             (
                 "pyre_interpreter::opcode_ops::compare_value_from_tag",
                 crate::opcode_ops::jit_compare_value_from_tag as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::runtime_ops::is_op",
+                crate::opcode_ops::jit_runtime_ops_is_op as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::type_methods::format_simple_w",
+                crate::opcode_ops::jit_type_methods_format_simple_w as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::runtime_ops::convert_value",
+                crate::opcode_ops::jit_runtime_ops_convert_value as *const () as usize as i64,
             ),
         ] {
             assert_eq!(bindings.get(path), Some(&expected), "missing {path}");

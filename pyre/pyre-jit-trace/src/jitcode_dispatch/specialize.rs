@@ -14059,21 +14059,11 @@ pub(crate) fn try_walker_specialize_int_call<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 3 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(arg_obj),
-    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    let Some((concrete_callable, [arg_obj, _])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 1)
     else {
         return Ok(None);
     };
-    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
-        return Ok(None);
-    }
     let int_type_obj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     if !std::ptr::eq(concrete_callable, int_type_obj) {
         return Ok(None);
@@ -14103,16 +14093,7 @@ pub(crate) fn try_walker_specialize_int_call<Sym: WalkSym>(
     }
     let result_value = unsafe { pyre_object::w_int_get_value(boxed_result) };
 
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     let arg_op = r_args[2];
     let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
     let raw_float = walker_unbox_float(ctx, op.pc, arg_op, float_type_addr)?;
@@ -14844,143 +14825,6 @@ pub(crate) fn try_walker_orthodox_newutf8<Sym: WalkSym>(
     Ok(Some(result))
 }
 
-/// FORMAT_SIMPLE (`f"{x}"` / empty-spec `format`) on an exact `int` or
-/// exact `str`: the same empty-spec fast path `format_w` takes, instead of
-/// the opaque `bh_format_simple_fn` residual.
-///
-/// `format_w` with an empty spec is identity for an exact `str` (`format(s,
-/// "") is s`) and `str(i)` for an exact `int`. The `str(i)` arm goes through
-/// [`walker_emit_jit_int_str`], the same emit [`try_walker_specialize_str_call`]
-/// uses. A bool, subclass, long, or anything with a Python `__format__`
-/// declines to the residual (SAFE); `FormatWithSpec` already inlines a
-/// Python `__format__` when a spec operand is present.
-pub(crate) fn try_walker_specialize_format_simple<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op: &DecodedOp,
-    r_args: &[OpRef],
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 1 {
-        return Ok(None);
-    }
-    let Some(concrete) = walker_concrete_ref_object(ctx, r_args[0]) else {
-        return Ok(None);
-    };
-    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(concrete) {
-        return Ok(None);
-    }
-    let value = r_args[0];
-    if unsafe { pyre_object::is_exact_type(concrete, &pyre_object::STR_TYPE) } {
-        let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
-        let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
-        walker_guard_class(ctx, op.pc, value, str_type_addr)?;
-        walker_guard_exact_w_class(ctx, op.pc, value, str_typeobj)?;
-        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', value)?;
-        return Ok(Some(()));
-    }
-    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
-    let int_value = unsafe {
-        if !std::ptr::eq((*concrete).ob_type, &pyre_object::pyobject::INT_TYPE)
-            || !std::ptr::eq((*concrete).w_class, int_typeobj)
-        {
-            return Ok(None);
-        }
-        pyre_object::w_int_get_value(concrete)
-    };
-    let boxed_result = {
-        let _plain_guard = pyre_interpreter::call::force_plain_eval();
-        pyre_interpreter::runtime_ops::format_value(concrete, pyre_object::PY_NULL)
-    };
-    let Ok(boxed_result) = boxed_result else {
-        return Ok(None);
-    };
-    let renders_the_same = unsafe {
-        pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE)
-            && pyre_object::w_str_get_value_opt(boxed_result)
-                == Some(pyre_object::unicodeobject::int_str_text(int_value).as_str())
-    };
-    if !renders_the_same {
-        return Ok(None);
-    }
-    if try_walker_orthodox_int_descr_str(ctx, op.pc, value, concrete, dst)?.is_some() {
-        return Ok(Some(()));
-    }
-    walker_emit_jit_int_str(ctx, op.pc, value, boxed_result, dst)
-}
-
-/// CONVERT_VALUE (`f"{x!s}"` / `!r` / `!a`) on an exact `int` or exact
-/// `str`.  `intobject.py` `descr_str` and `descr_repr` share a body
-/// (`ll_int2dec` + `newutf8`); `ascii(i)` is the same decimal because an
-/// int is all ASCII.  `unicodeobject.py` `descr_str` of an exact `str` is
-/// identity (`!s` / implicit).  A `!r` / `!a` of a `str` adds quotes and
-/// stays residual.  A bool, subclass, or Python `__str__` / `__repr__`
-/// declines (SAFE).
-pub(crate) fn try_walker_specialize_convert_value<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op: &DecodedOp,
-    r_args: &[OpRef],
-    i_args: &[OpRef],
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 1 || i_args.is_empty() {
-        return Ok(None);
-    }
-    let Some(majit_ir::Value::Int(conv)) = ctx.trace_ctx.box_value(i_args[0]) else {
-        return Ok(None);
-    };
-    // `runtime_ops::convert_value_code`: 0=Str, 1=Repr, 2=Ascii, 3=None.
-    if !matches!(conv, 0 | 1 | 2 | 3) {
-        return Ok(None);
-    }
-    let Some(concrete) = walker_concrete_ref_object(ctx, r_args[0]) else {
-        return Ok(None);
-    };
-    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(concrete) {
-        return Ok(None);
-    }
-    let value = r_args[0];
-    if unsafe { pyre_object::is_exact_type(concrete, &pyre_object::STR_TYPE) } {
-        // `descr_str` of an exact `str` is identity.  `!r` / `!a` quote.
-        if conv != 0 && conv != 3 {
-            return Ok(None);
-        }
-        let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
-        let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
-        walker_guard_class(ctx, op.pc, value, str_type_addr)?;
-        walker_guard_exact_w_class(ctx, op.pc, value, str_typeobj)?;
-        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', value)?;
-        return Ok(Some(()));
-    }
-    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
-    let int_value = unsafe {
-        if !std::ptr::eq((*concrete).ob_type, &pyre_object::pyobject::INT_TYPE)
-            || !std::ptr::eq((*concrete).w_class, int_typeobj)
-        {
-            return Ok(None);
-        }
-        pyre_object::w_int_get_value(concrete)
-    };
-    let boxed_result = {
-        let _plain_guard = pyre_interpreter::call::force_plain_eval();
-        pyre_interpreter::runtime_ops::convert_value(concrete, conv)
-    };
-    let Ok(boxed_result) = boxed_result else {
-        return Ok(None);
-    };
-    let renders_the_same = unsafe {
-        pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE)
-            && pyre_object::w_str_get_value_opt(boxed_result)
-                == Some(pyre_object::unicodeobject::int_str_text(int_value).as_str())
-    };
-    if !renders_the_same {
-        return Ok(None);
-    }
-    if try_walker_orthodox_int_descr_str(ctx, op.pc, value, concrete, dst)?.is_some() {
-        return Ok(Some(()));
-    }
-    walker_emit_jit_int_str(ctx, op.pc, value, boxed_result, dst)
-}
-
 /// `_parse_spec("d", ">")` (`newformat.py`) then `_type == "d"` (default
 /// included) with no thousands separator, precision, or `z`.
 ///
@@ -15110,7 +14954,7 @@ fn spec_decimal_pad_info(spec: &str) -> Option<(i64, char, bool)> {
 
 /// FORMAT_WITH_SPEC on an exact `int` plus a constant decimal spec.
 ///
-/// Empty spec is [`try_walker_specialize_format_simple`].  A field width
+/// An empty spec declines to the residual.  A field width
 /// (`:05d` / `:5d`) is `ll_int2dec` + `ll_str_mul(fill, width - strlen)` +
 /// `ll_strconcat` — `newformat.py` `format_int_or_long` / `_int_to_base` /
 /// `_calc_num_width` / `_fill_number`.  A sign-interior pad
@@ -15142,34 +14986,9 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
     };
     let value = r_args[0];
     let spec = r_args[1];
+    // An empty spec is `format_w`'s empty-spec arm; the residual serves it.
     if spec_text.is_empty() {
-        // Empty spec is FORMAT_SIMPLE, but only for this spec: `_parse_spec`
-        // reads the live one on every call, and `f"{i:{w}}"` hands in a box
-        // that is `""` on one iteration and `">5"` on the next.  The simple
-        // arm guards the value's class alone, so the spec is pinned here.
-        // The arm's cheap declines (bool / subclass / long) are answered
-        // first so the guard does not land in front of the generic residual.
-        let simple_admits = unsafe {
-            pyre_object::is_exact_type(concrete, &pyre_object::STR_TYPE)
-                || (std::ptr::eq((*concrete).ob_type, &pyre_object::pyobject::INT_TYPE)
-                    && std::ptr::eq(
-                        (*concrete).w_class,
-                        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE),
-                    ))
-        };
-        if !simple_admits {
-            return Ok(None);
-        }
-        if !spec.is_constant() {
-            let spec_const = ctx.trace_ctx.const_ref(concrete_spec as i64);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op.pc,
-                OpCode::GuardValue,
-                &[spec, spec_const],
-            )?;
-        }
-        return try_walker_specialize_format_simple(ctx, op, &r_args[..1], dst);
+        return Ok(None);
     }
     if !spec_is_decimal_int_format(spec_text) {
         return Ok(None);
