@@ -1806,13 +1806,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 "putenv",
                 |args| {
                     // interp_posix.py putenv_impl rejects the name itself...
-                    let name = env_bytes(args[0])?;
+                    let w_name = args[0];
+                    let mut w_value = args[1];
+                    let name = pyre_object::with_roots!(w_value => env_bytes(w_name))?;
                     if illegal_name(&name) {
                         return Err(crate::PyError::value_error(
                             "illegal environment variable name",
                         ));
                     }
-                    let value = env_bytes(args[1])?;
+                    let value = env_bytes(w_value)?;
                     #[cfg(windows)]
                     entry_fits(&name, &value)?;
                     if let Some(err) = refused_by_host(&name) {
@@ -2724,12 +2726,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 args.len()
             )));
         }
-        let fd = libc::c_int::try_from(crate::builtins::space_index_w(args[0])?)
+        let w_fd = args[0];
+        let mut w_blocking = args[1];
+        let fd_value =
+            pyre_object::with_roots!(w_blocking => crate::builtins::space_index_w(w_fd))?;
+        let fd = libc::c_int::try_from(fd_value)
             .map_err(|_| crate::PyError::overflow_error("fd is greater than maximum"))?;
         // CPython 3.14's Argument Clinic declares this parameter `bool`, so
         // it truth-tests arbitrary objects.  This intentionally differs from
         // PyPy's older `@unwrap_spec(blocking=int)` gateway.
-        let blocking = crate::baseobjspace::is_true(args[1])?;
+        let blocking = crate::baseobjspace::is_true(w_blocking)?;
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
             let mut flags = loop {
@@ -3361,8 +3367,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         args.len()
                     )));
                 }
-                let low = crate::baseobjspace::c_int_w(args[0])? as libc::c_int;
-                let high = crate::baseobjspace::c_int_w(args[1])? as libc::c_int;
+                let w_low = args[0];
+                let mut w_high = args[1];
+                let low = pyre_object::with_roots!(w_high => crate::baseobjspace::c_int_w(w_low))?
+                    as libc::c_int;
+                let high = crate::baseobjspace::c_int_w(w_high)? as libc::c_int;
                 for fd in low..high {
                     #[cfg(not(feature = "sandbox"))]
                     let _ = crate::builtins::crt_call!(libc::close(fd));
@@ -3409,8 +3418,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("read() requires 2 arguments"));
                 }
-                let fd = crate::baseobjspace::c_int_w(args[0])? as libc::c_int;
-                let n_signed = crate::baseobjspace::int_w(args[1])?;
+                let w_fd = args[0];
+                let mut w_n = args[1];
+                let fd = pyre_object::with_roots!(w_n => crate::baseobjspace::c_int_w(w_fd))?
+                    as libc::c_int;
+                let n_signed = crate::baseobjspace::int_w(w_n)?;
                 // A negative size would wrap to a huge `usize` (and allocation);
                 // os.read rejects it with EINVAL, matching the host read(2).
                 if n_signed < 0 {
@@ -3476,10 +3488,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         crate::make_builtin_function_with_arity(
             "readinto",
             |args| {
-                let fd_value = crate::baseobjspace::int_w(args[0])?;
+                let w_fd = args[0];
+                let mut w_buffer = args[1];
+                let fd_value =
+                    pyre_object::with_roots!(w_buffer => crate::baseobjspace::int_w(w_fd))?;
                 let fd = libc::c_int::try_from(fd_value)
                     .map_err(|_| crate::PyError::overflow_error("fd is greater than maximum"))?;
-                let mut buffer = unsafe { crate::builtins::WritableBuffer::acquire(args[1]) }?;
+                let mut buffer = unsafe { crate::builtins::WritableBuffer::acquire(w_buffer) }?;
                 let target = unsafe { buffer.as_mut_slice() };
                 #[cfg(not(feature = "sandbox"))]
                 let result = loop {
@@ -3535,10 +3550,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("write() requires 2 arguments"));
                 }
-                let fd = crate::baseobjspace::c_int_w(args[0])? as libc::c_int;
+                let w_fd = args[0];
+                let mut w_data = args[1];
+                let fd = pyre_object::with_roots!(w_data => crate::baseobjspace::c_int_w(w_fd))?
+                    as libc::c_int;
                 // CPython `os_write_impl` receives a `Py_buffer`: text is not
                 // accepted, while every contiguous readable exporter is.
-                let data = unsafe { crate::builtins::file_write_buffer_bytes(args[1]) }
+                let data = unsafe { crate::builtins::file_write_buffer_bytes(w_data) }
                     .map_err(|_| crate::PyError::type_error("write() arg 2 must be bytes-like"))?;
                 #[cfg(not(feature = "sandbox"))]
                 let ret = {
@@ -3579,9 +3597,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
                 // interp_posix.py `@unwrap_spec(fd=c_int, position=r_longlong,
                 // how=c_int)` — the position is a 64-bit offset, not a C int.
-                let fd = crate::baseobjspace::c_int_w(args[0])? as libc::c_int;
-                let offset = crate::baseobjspace::int_w(args[1])?;
-                let whence = crate::baseobjspace::c_int_w(args[2])? as libc::c_int;
+                let w_fd = args[0];
+                let mut w_offset = args[1];
+                let mut w_whence = args[2];
+                let fd = pyre_object::with_roots!(w_offset, w_whence =>
+                    crate::baseobjspace::c_int_w(w_fd))? as libc::c_int;
+                let offset =
+                    pyre_object::with_roots!(w_whence => crate::baseobjspace::int_w(w_offset))?;
+                let whence = crate::baseobjspace::c_int_w(w_whence)? as libc::c_int;
                 #[cfg(not(feature = "sandbox"))]
                 let ret = {
                     let ret = crate::builtins::crt_lseek(fd, offset, whence);
@@ -6066,11 +6089,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     /// this type" for `ENOENT` alone, on the reasoning that a vanished entry is
     /// better reported as not being of the asked-for kind than as an error.
     /// Every other failure is the caller's to see, named by the entry.
-    fn dir_entry_kind(args: &[PyObjectRef], follow: bool) -> Result<Option<u32>, crate::PyError> {
-        let (w_path, path) = dir_entry_path(args[0])?;
+    fn dir_entry_kind(
+        mut self_obj: PyObjectRef,
+        follow: bool,
+    ) -> Result<Option<u32>, crate::PyError> {
+        let (mut w_path, path) = pyre_object::with_roots!(self_obj => dir_entry_path(self_obj))?;
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            let dir_fd = dir_entry_dir_fd(args[0])?;
+            let dir_fd = pyre_object::with_roots!(w_path => dir_entry_dir_fd(self_obj))?;
             if dir_fd != -1 {
                 return match dir_entry_stat_at(&path, dir_fd, follow) {
                     Ok(st) => Ok(Some(st.st_mode as u32 & S_IFMT)),
@@ -6109,18 +6135,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         }
     }
     fn dir_entry_is_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let follow = dir_entry_follow(args)?;
-        let ans = match dir_entry_kind_from_type(dir_entry_known_type(args[0]), DT_DIR, follow) {
+        let mut w_self = args[0];
+        let follow = pyre_object::with_roots!(w_self => dir_entry_follow(args))?;
+        let ans = match dir_entry_kind_from_type(dir_entry_known_type(w_self), DT_DIR, follow) {
             Some(b) => b,
-            None => dir_entry_kind(args, follow)? == Some(S_IFDIR),
+            None => dir_entry_kind(w_self, follow)? == Some(S_IFDIR),
         };
         Ok(pyre_object::w_bool_from(ans))
     }
     fn dir_entry_is_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let follow = dir_entry_follow(args)?;
-        let ans = match dir_entry_kind_from_type(dir_entry_known_type(args[0]), DT_REG, follow) {
+        let mut w_self = args[0];
+        let follow = pyre_object::with_roots!(w_self => dir_entry_follow(args))?;
+        let ans = match dir_entry_kind_from_type(dir_entry_known_type(w_self), DT_REG, follow) {
             Some(b) => b,
-            None => dir_entry_kind(args, follow)? == Some(S_IFREG),
+            None => dir_entry_kind(w_self, follow)? == Some(S_IFREG),
         };
         Ok(pyre_object::w_bool_from(ans))
     }
@@ -6130,7 +6158,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     fn dir_entry_is_symlink_value(args: &[PyObjectRef]) -> Result<bool, crate::PyError> {
         match dir_entry_kind_from_type(dir_entry_known_type(args[0]), DT_LNK, false) {
             Some(b) => Ok(b),
-            None => Ok(dir_entry_kind(args, false)? == Some(S_IFLNK)),
+            None => Ok(dir_entry_kind(args[0], false)? == Some(S_IFLNK)),
         }
     }
     fn dir_entry_is_symlink(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -6165,10 +6193,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         {
             return Ok(pyre_object::w_int_new(de.enum_ino));
         }
-        let (w_path, path) = dir_entry_path(args[0])?;
+        let mut w_self = args[0];
+        let (mut w_path, path) = pyre_object::with_roots!(w_self => dir_entry_path(w_self))?;
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            let dir_fd = dir_entry_dir_fd(args[0])?;
+            let dir_fd = pyre_object::with_roots!(w_path => dir_entry_dir_fd(w_self))?;
             if dir_fd != -1 {
                 let st = dir_entry_stat_at(&path, dir_fd, false)
                     .map_err(|errno| errno_err_with_filename(errno, w_path))?;
@@ -7326,12 +7355,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // The path names itself; the argv entries below do not,
                     // because each of those is converted on the sequence's
                     // behalf rather than as an argument of its own.
-                    let command =
-                        crate::gateway::fsencode_path_named_w(args[0], "execv", "path")?.as_bytes;
+                    let w_path = args[0];
+                    let mut w_argv = args[1];
+                    let command = pyre_object::with_roots!(w_argv =>
+                        crate::gateway::fsencode_path_named_w(w_path, "execv", "path"))?
+                    .as_bytes;
                     let command_c = std::ffi::CString::new(command).map_err(|_| {
                         crate::PyError::value_error("execv() path contains an embedded null byte")
                     })?;
-                    let argv = exec_argv(args[1], "execv")?;
+                    let argv = exec_argv(w_argv, "execv")?;
                     let argv_ptrs = exec_pointer_array(&argv);
                     let errno =
                         host_posix::exec_replace(&[command_c], argv_ptrs.as_ptr(), None) as i32;
@@ -7351,15 +7383,19 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             crate::make_builtin_function_with_arity(
                 "execve",
                 |args| {
-                    let command =
-                        crate::gateway::fsencode_path_named_w(args[0], "execve", "path")?.as_bytes;
+                    let w_path = args[0];
+                    let mut w_argv = args[1];
+                    let mut w_env = args[2];
+                    let command = pyre_object::with_roots!(w_argv, w_env =>
+                        crate::gateway::fsencode_path_named_w(w_path, "execve", "path"))?
+                    .as_bytes;
                     let command_c = std::ffi::CString::new(command).map_err(|_| {
                         crate::PyError::value_error("execve() path contains an embedded null byte")
                     })?;
-                    let argv = exec_argv(args[1], "execve")?;
+                    let argv = pyre_object::with_roots!(w_env => exec_argv(w_argv, "execve"))?;
                     let argv_ptrs = exec_pointer_array(&argv);
 
-                    let env = collect_env_entries(args[2], "execve", false)?
+                    let env = collect_env_entries(w_env, "execve", false)?
                         .into_iter()
                         .map(|entry| {
                             std::ffi::CString::new(entry).map_err(|_| {
@@ -7487,9 +7523,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         return Err(crate::PyError::type_error("pread() requires 3 arguments"));
                     }
                     // `@unwrap_spec(fd=c_int, length=int, offset=r_longlong)`.
-                    let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    let length = crate::baseobjspace::int_w(args[1])?;
-                    let offset = crate::baseobjspace::int_w(args[2])? as libc::off_t;
+                    let w_fd = args[0];
+                    let mut w_length = args[1];
+                    let mut w_offset = args[2];
+                    let fd = pyre_object::with_roots!(w_length, w_offset =>
+                        crate::baseobjspace::c_int_w(w_fd))?;
+                    let length =
+                        pyre_object::with_roots!(w_offset => crate::baseobjspace::int_w(w_length))?;
+                    let offset = crate::baseobjspace::int_w(w_offset)? as libc::off_t;
                     if length < 0 {
                         return Err(crate::PyError::os_error_with_errno(
                             libc::EINVAL,
@@ -7538,12 +7579,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         return Err(crate::PyError::type_error("pwrite() requires 3 arguments"));
                     }
                     // `@unwrap_spec(fd=c_int, offset=r_longlong)`.
-                    let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    let data = unsafe { crate::builtins::file_write_buffer_bytes(args[1]) }
-                        .map_err(|_| {
-                            crate::PyError::type_error("pwrite() arg 2 must be bytes-like")
-                        })?;
-                    let offset = crate::baseobjspace::int_w(args[2])? as libc::off_t;
+                    let w_fd = args[0];
+                    let mut w_data = args[1];
+                    let mut w_offset = args[2];
+                    let fd = pyre_object::with_roots!(w_data, w_offset =>
+                        crate::baseobjspace::c_int_w(w_fd))?;
+                    let data = pyre_object::with_roots!(w_offset => unsafe {
+                        crate::builtins::file_write_buffer_bytes(w_data)
+                    })
+                    .map_err(|_| crate::PyError::type_error("pwrite() arg 2 must be bytes-like"))?;
+                    let offset = crate::baseobjspace::int_w(w_offset)? as libc::off_t;
                     let written = loop {
                         let result = {
                             let _blocked = crate::module::thread::before_external_block();
@@ -8431,8 +8476,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     "{name}() requires 2 arguments"
                 )));
             }
-            let first = crate::baseobjspace::c_uid_t_w(args[0])?;
-            let second = crate::baseobjspace::c_uid_t_w(args[1])?;
+            let w_first = args[0];
+            let mut w_second = args[1];
+            let first =
+                pyre_object::with_roots!(w_second => crate::baseobjspace::c_uid_t_w(w_first))?;
+            let second = crate::baseobjspace::c_uid_t_w(w_second)?;
             if setter(first, second) == -1 {
                 return Err(io_err(std::io::Error::last_os_error(), ""));
             }
@@ -8553,8 +8601,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         return Err(crate::PyError::type_error("waitpid() requires 2 arguments"));
                     }
                     // interp_posix.py `@unwrap_spec(pid=c_int, options=c_int)`.
-                    let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
-                    let options = crate::baseobjspace::c_int_w(args[1])?;
+                    let w_pid = args[0];
+                    let mut w_options = args[1];
+                    let pid = pyre_object::with_roots!(w_options =>
+                        crate::baseobjspace::c_int_w(w_pid))?
+                        as libc::pid_t;
+                    let options = crate::baseobjspace::c_int_w(w_options)?;
                     let mut status: i32 = 0;
                     // interp_posix.py `waitpid`: retry on EINTR.
                     let res = loop {
@@ -8695,8 +8747,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("wait4() requires 2 arguments"));
                     }
-                    let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
-                    let options = crate::baseobjspace::c_int_w(args[1])?;
+                    let w_pid = args[0];
+                    let mut w_options = args[1];
+                    let pid = pyre_object::with_roots!(w_options =>
+                        crate::baseobjspace::c_int_w(w_pid))?
+                        as libc::pid_t;
+                    let options = crate::baseobjspace::c_int_w(w_options)?;
                     wait_with_rusage(|| host_posix::wait4(pid, options))
                 },
                 2,
@@ -8832,14 +8888,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             args.len(),
                         )));
                     }
-                    let idtype = crate::baseobjspace::c_int_w(args[0])? as libc::idtype_t;
-                    let id = crate::baseobjspace::int_w(crate::baseobjspace::space_index(args[1])?)
-                        .map_err(|_| {
-                            crate::PyError::overflow_error(
-                                "Python int too large to convert to C long",
-                            )
-                        })? as libc::id_t;
-                    let options = crate::baseobjspace::c_int_w(args[2])?;
+                    let w_idtype = args[0];
+                    let mut w_id = args[1];
+                    let mut w_options = args[2];
+                    let idtype = pyre_object::with_roots!(w_id, w_options =>
+                        crate::baseobjspace::c_int_w(w_idtype))?
+                        as libc::idtype_t;
+                    let w_id_index = pyre_object::with_roots!(w_options =>
+                        crate::baseobjspace::space_index(w_id))?;
+                    let id = pyre_object::with_roots!(w_options =>
+                        crate::baseobjspace::int_w(w_id_index))
+                    .map_err(|_| {
+                        crate::PyError::overflow_error("Python int too large to convert to C long")
+                    })? as libc::id_t;
+                    let options = crate::baseobjspace::c_int_w(w_options)?;
                     // `si.si_pid = 0` before the call: the field is what the
                     // "nothing to report" answer is read out of, and a call
                     // that reports nothing does not write it.
@@ -9113,9 +9175,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             args.len(),
                         )));
                     }
-                    let path =
-                        crate::gateway::fsencode_path_or_fd_w(args[0], "truncate", HAVE_FTRUNCATE)?;
-                    let length = truncate_length_w(args[1])?;
+                    let w_path = args[0];
+                    let mut w_length = args[1];
+                    let path = pyre_object::with_roots!(w_length =>
+                        crate::gateway::fsencode_path_or_fd_w(w_path, "truncate", HAVE_FTRUNCATE))?;
+                    let length = truncate_length_w(w_length)?;
                     if path.is_fd {
                         ftruncate_retry(path.as_fd, length, |e| errno_err(e, ""))?;
                         return Ok(pyre_object::w_none());
@@ -9188,8 +9252,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             args.len(),
                         )));
                     }
-                    let w_fd = crate::baseobjspace::space_index(args[0])?;
-                    let fd_value = crate::baseobjspace::int_w(w_fd).map_err(|err| {
+                    let w_fd = args[0];
+                    let mut w_length = args[1];
+                    let w_fd = pyre_object::with_roots!(w_length => crate::baseobjspace::space_index(w_fd))?;
+                    let fd_value = pyre_object::with_roots!(w_length =>
+                        crate::baseobjspace::int_w(w_fd))
+                    .map_err(|err| {
                         if err.kind == crate::PyErrorKind::OverflowError {
                             crate::PyError::overflow_error(
                                 "Python int too large to convert to C int",
@@ -9201,7 +9269,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let fd = libc::c_int::try_from(fd_value).map_err(|_| {
                         crate::PyError::overflow_error("Python int too large to convert to C int")
                     })?;
-                    let length = truncate_length_w(args[1])?;
+                    let length = truncate_length_w(w_length)?;
                     ftruncate_retry(fd, length, |e| errno_err(e, ""))?;
                     Ok(pyre_object::w_none())
                 },
@@ -9232,9 +9300,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // interp_posix.py `@unwrap_spec(fd=c_int, cmd=c_int,
                     // length=r_longlong)` — the length is an offset, so it is
                     // the same conversion `ftruncate` gives one.
-                    let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    let cmd = crate::baseobjspace::c_int_w(args[1])?;
-                    let length = truncate_length_w(args[2])?;
+                    let w_fd = args[0];
+                    let mut w_cmd = args[1];
+                    let mut w_length = args[2];
+                    let fd = pyre_object::with_roots!(w_cmd, w_length =>
+                        crate::baseobjspace::c_int_w(w_fd))?;
+                    let cmd =
+                        pyre_object::with_roots!(w_length => crate::baseobjspace::c_int_w(w_cmd))?;
+                    let length = truncate_length_w(w_length)?;
                     loop {
                         let (ret, errno) =
                             crate::module::thread::call_external_function(|| unsafe {
@@ -9514,8 +9587,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // would accept any object, and `is_int` is an exact-type
                     // check, so an `int` subclass instance — `signal.SIGHUP` is
                     // an `IntEnum` member — never reaches the checked path.
-                    let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
-                    let sig = crate::baseobjspace::c_int_w(args[1])? as libc::c_int;
+                    let w_pid = args[0];
+                    let mut w_sig = args[1];
+                    let pid = pyre_object::with_roots!(w_sig => crate::baseobjspace::c_int_w(w_pid))?
+                        as libc::pid_t;
+                    let sig = crate::baseobjspace::c_int_w(w_sig)? as libc::c_int;
                     let r = unsafe { libc::kill(pid, sig) };
                     if r < 0 {
                         return Err(io_err(std::io::Error::last_os_error(), ""));
@@ -9536,8 +9612,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         return Err(crate::PyError::type_error("killpg() requires 2 arguments"));
                     }
                     // interp_posix.py `@unwrap_spec(pgid=c_int, signal=c_int)`.
-                    let pgid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
-                    let sig = crate::baseobjspace::c_int_w(args[1])? as libc::c_int;
+                    let w_pgid = args[0];
+                    let mut w_sig = args[1];
+                    let pgid = pyre_object::with_roots!(w_sig =>
+                        crate::baseobjspace::c_int_w(w_pgid))?
+                        as libc::pid_t;
+                    let sig = crate::baseobjspace::c_int_w(w_sig)? as libc::c_int;
                     host_posix::killpg(pgid, sig).map_err(|err| io_err(err, ""))?;
                     Ok(pyre_object::w_none())
                 },
@@ -9998,8 +10078,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         return Err(crate::PyError::type_error("fchmod() requires 2 arguments"));
                     }
                     // interp_posix.py `@unwrap_spec(fd=c_int, mode=c_int)`.
-                    let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
+                    let w_fd = args[0];
+                    let mut w_mode = args[1];
+                    let fd =
+                        pyre_object::with_roots!(w_mode => crate::baseobjspace::c_int_w(w_fd))?;
+                    let mode = crate::baseobjspace::c_int_w(w_mode)? as u32;
                     let bfd = fd_borrow(fd)?;
                     // interp_posix.py `fchmod`: retry on EINTR.
                     loop {
@@ -10221,9 +10304,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // into `UINT_MAX`, i.e. the `(uid_t)-1` "leave unchanged"
                     // sentinel that `host_posix::fchown` spells as `None`.
                     let unchanged = |value: u32| (value != u32::MAX).then_some(value);
-                    let uid = unchanged(crate::baseobjspace::c_uid_t_w(args[1])?);
-                    let gid = unchanged(crate::baseobjspace::c_uid_t_w(args[2])?);
-                    let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
+                    let mut w_fd = args[0];
+                    let w_uid = args[1];
+                    let mut w_gid = args[2];
+                    let uid = unchanged(pyre_object::with_roots!(w_fd, w_gid =>
+                        crate::baseobjspace::c_uid_t_w(w_uid))?);
+                    let gid = unchanged(pyre_object::with_roots!(w_fd =>
+                        crate::baseobjspace::c_uid_t_w(w_gid))?);
+                    let fd = crate::baseobjspace::c_filedescriptor_w(w_fd)?;
                     let bfd = fd_borrow(fd)?;
                     // interp_posix.py `fchown`: retry on EINTR.
                     loop {
@@ -10276,8 +10364,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         ));
                     }
                     // interp_posix.py `@unwrap_spec(fd=c_int, inheritable=int)`.
-                    let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    let inherit = crate::baseobjspace::int_w(args[1])? != 0;
+                    let w_fd = args[0];
+                    let mut w_inherit = args[1];
+                    let fd =
+                        pyre_object::with_roots!(w_inherit => crate::baseobjspace::c_int_w(w_fd))?;
+                    let inherit = crate::baseobjspace::int_w(w_inherit)? != 0;
                     let bfd = fd_borrow(fd)?;
                     host_posix::set_inheritable(bfd, inherit).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_none())
@@ -11248,8 +11339,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         return Err(crate::PyError::type_error("tcsetpgrp() requires fd, pgid"));
                     }
                     // interp_posix.py `@unwrap_spec(fd=c_int, pgid=c_gid_t)`.
-                    let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    let pgid = crate::baseobjspace::c_uid_t_w(args[1])? as libc::pid_t;
+                    let w_fd = args[0];
+                    let mut w_pgid = args[1];
+                    let fd =
+                        pyre_object::with_roots!(w_pgid => crate::baseobjspace::c_int_w(w_fd))?;
+                    let pgid = crate::baseobjspace::c_uid_t_w(w_pgid)? as libc::pid_t;
                     let bfd = fd_borrow(fd)?;
                     host_posix::tcsetpgrp(bfd, pgid).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_none())
@@ -11271,9 +11365,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         ));
                     }
                     // interp_posix.py `@unwrap_spec(which=int, who=int)`.
-                    let which =
-                        crate::baseobjspace::int_w(args[0])? as host_posix::PriorityWhichType;
-                    let who = crate::baseobjspace::int_w(args[1])? as host_posix::PriorityWhoType;
+                    let w_which = args[0];
+                    let mut w_who = args[1];
+                    let which = pyre_object::with_roots!(w_who => crate::baseobjspace::int_w(w_which))?
+                        as host_posix::PriorityWhichType;
+                    let who = crate::baseobjspace::int_w(w_who)? as host_posix::PriorityWhoType;
                     let prio = host_posix::getpriority(which, who).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_int_new(prio as i64))
                 },
@@ -11295,10 +11391,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                     // interp_posix.py:2352 `@unwrap_spec(which=int, who=int,
                     // priority=int)`.
-                    let which =
-                        crate::baseobjspace::int_w(args[0])? as host_posix::PriorityWhichType;
-                    let who = crate::baseobjspace::int_w(args[1])? as host_posix::PriorityWhoType;
-                    let prio = crate::baseobjspace::int_w(args[2])? as i32;
+                    let w_which = args[0];
+                    let mut w_who = args[1];
+                    let mut w_prio = args[2];
+                    let which = pyre_object::with_roots!(w_who, w_prio =>
+                        crate::baseobjspace::int_w(w_which))?
+                        as host_posix::PriorityWhichType;
+                    let who = pyre_object::with_roots!(w_prio => crate::baseobjspace::int_w(w_who))?
+                        as host_posix::PriorityWhoType;
+                    let prio = crate::baseobjspace::int_w(w_prio)? as i32;
                     host_posix::setpriority(which, who, prio).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_none())
                 },
@@ -11461,9 +11562,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // interp_posix.py `path_or_fd(allow_fd=hasattr(os,
                     // 'fpathconf'))`, whose body converts the name before it
                     // reads the path/fd discriminant.
-                    let path =
-                        crate::gateway::fsencode_path_or_fd_w(args[0], "pathconf", HAVE_FPATHCONF)?;
-                    let name = confname_arg(args[1], PATHCONF_NAMES)?;
+                    let w_path = args[0];
+                    let mut w_name = args[1];
+                    let path = pyre_object::with_roots!(w_name =>
+                        crate::gateway::fsencode_path_or_fd_w(w_path, "pathconf", HAVE_FPATHCONF))?;
+                    let name = confname_arg(w_name, PATHCONF_NAMES)?;
                     let limit = if path.is_fd {
                         host_posix::fpathconf(path.as_fd, name).map_err(|e| io_err(e, ""))?
                     } else {
@@ -11493,8 +11596,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // interp_posix.py:2411 descriptor argument: accept an int
                     // or a `fileno()` object through `space.c_filedescriptor_w`;
                     // that boundary also raises the bool file descriptor warning.
-                    let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
-                    let name = confname_arg(args[1], PATHCONF_NAMES)?;
+                    let w_fd = args[0];
+                    let mut w_name = args[1];
+                    let fd = pyre_object::with_roots!(w_name =>
+                        crate::baseobjspace::c_filedescriptor_w(w_fd))?;
+                    let name = confname_arg(w_name, PATHCONF_NAMES)?;
                     let limit = host_posix::fpathconf(fd, name).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_int_new(indeterminate_limit(limit)))
                 },
@@ -12488,8 +12594,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("fchmod() requires 2 arguments"));
                     }
-                    let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
+                    let w_fd = args[0];
+                    let mut w_mode = args[1];
+                    let fd =
+                        pyre_object::with_roots!(w_mode => crate::baseobjspace::c_int_w(w_fd))?;
+                    let mode = crate::baseobjspace::c_int_w(w_mode)? as u32;
                     // Every failure here is the handle call's, reported the
                     // Win32 way (`os_fchmod_impl`), which also leaves the
                     // interpreter for it.

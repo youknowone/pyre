@@ -855,7 +855,9 @@ pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // it after `__index__` has run are pre-move addresses.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
-    let index = unsafe { crate::baseobjspace::getindex_w_index(args[1])? };
+    let index = unsafe {
+        crate::baseobjspace::getindex_w_index(pyre_object::gc_roots::shadow_stack_get(base + 1))?
+    };
     unsafe {
         pyre_object::listobject::w_list_insert(
             pyre_object::gc_roots::shadow_stack_get(base),
@@ -881,7 +883,11 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
     let index = if args.len() > 1 {
-        unsafe { crate::baseobjspace::getindex_w_index(args[1])? }
+        unsafe {
+            crate::baseobjspace::getindex_w_index(pyre_object::gc_roots::shadow_stack_get(
+                base + 1,
+            ))?
+        }
     } else {
         -1
     };
@@ -4599,8 +4605,10 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             }
             Ok(p.or(kw))
         };
-    let encoding = str_arg(dual("encoding", pos.get(1).map(|_| reload(1)))?, "utf-8")?;
-    let errors = str_arg(dual("errors", pos.get(2).map(|_| reload(2)))?, "strict")?;
+    let w_encoding = if pos.len() > 1 { Some(reload(1)) } else { None };
+    let w_errors = if pos.len() > 2 { Some(reload(2)) } else { None };
+    let encoding = str_arg(dual("encoding", w_encoding)?, "utf-8")?;
+    let errors = str_arg(dual("errors", w_errors)?, "strict")?;
     Ok(pyre_object::w_bytes_from_bytes(&encode_object(
         reload(0),
         &encoding,
@@ -5449,8 +5457,12 @@ pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // `&str` views across that allocation.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
+    let mut w_args = Vec::with_capacity(args.len());
+    for i in 0..args.len() {
+        w_args.push(pyre_object::gc_roots::shadow_stack_get(base + i));
+    }
     let Some((byte_start, byte_end)) =
-        wtf8_idx_window(pyre_object::gc_roots::shadow_stack_get(base), args)?
+        wtf8_idx_window(pyre_object::gc_roots::shadow_stack_get(base), &w_args)?
     else {
         return Ok(w_int_new(0));
     };
@@ -5556,22 +5568,25 @@ fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::
     if args.len() <= 2 {
         return Ok(CodePoint::from_char(' '));
     }
+    let mut w_fill = args[2];
     let decoded;
-    let raw = if unsafe { pyre_object::is_str(args[2]) } {
-        unsafe { w_str_get_wtf8(args[2]) }
+    let raw = if unsafe { pyre_object::is_str(w_fill) } {
+        unsafe { w_str_get_wtf8(w_fill) }
     } else {
-        let type_name = arg_type_name(args[2]);
+        let type_name = arg_type_name(w_fill);
         if method == "center" {
             return Err(crate::PyError::type_error(format!(
                 "expected str, got {type_name} object"
             )));
-        } else if unsafe { pyre_object::is_bytes(args[2]) } {
+        } else if unsafe { pyre_object::is_bytes(w_fill) } {
             return Err(crate::PyError::type_error(format!(
                 "Can't convert '{type_name}' object to str implicitly"
             )));
         } else {
-            let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(args[2])? else {
-                let operand = if unsafe { pyre_object::is_none(args[2]) } {
+            let buffer = pyre_object::with_roots!(w_fill =>
+                crate::baseobjspace::simple_buffer_bytes(w_fill))?;
+            let Some(buffer) = buffer else {
+                let operand = if unsafe { pyre_object::is_none(w_fill) } {
                     "None".to_string()
                 } else {
                     format!("'{type_name}'")
