@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::model::{FunctionGraph, ImmutableRank, UnknownKind};
+use crate::model::{FunctionGraph, ImmutableRank, LazyGraph, UnknownKind};
 
 /// Options carried through the semantic-program build.  A distinct unit
 /// type so the build entry point can accept an explicit options
@@ -123,6 +123,12 @@ impl SemanticFunction {
         self.graph
             .get_mut()
             .expect("a SemanticFunction has a graph")
+    }
+
+    /// The funcobj's graph handle, shared with every holder and built on
+    /// first demand (`FunctionDesc.cachedgraph`).
+    pub fn lazy_graph(&self) -> &crate::model::LazyGraph {
+        &self.graph
     }
 }
 
@@ -637,18 +643,18 @@ pub struct MirGraphLookup<'a> {
     /// Impl methods (inherent + trait-impl): keyed by (self_ty_root, name).
     /// `Ok(&graph)` is a unique hit; `Err(())` marks the slot ambiguous
     /// (two or more graphs share the (owner-spelling, name) tuple).
-    impl_methods: HashMap<(&'a str, &'a str), Result<&'a FunctionGraph, ()>>,
+    impl_methods: HashMap<(&'a str, &'a str), Result<&'a LazyGraph, ()>>,
     /// Trait-default bodies: keyed by (trait_root, name) with self_ty_root None.
     /// `Ok(&graph)` is a unique hit; `Err(())` marks the slot ambiguous
     /// (two distinct traits share a bare leaf + default-method name), so
     /// the caller falls back rather than registering an arbitrary body.
-    trait_defaults: HashMap<(&'a str, &'a str), Result<&'a FunctionGraph, ()>>,
+    trait_defaults: HashMap<(&'a str, &'a str), Result<&'a LazyGraph, ()>>,
     /// Free functions (no impl owner, no trait root): keyed by bare name.
     /// `Ok(&graph)` is a unique hit; `Err(())` marks the slot ambiguous
     /// (two or more free functions share a bare name across modules).
     /// Lets ordinary free-function registration and graph discovery resolve
     /// a unique MIR-built graph by its unqualified name.
-    free_functions: HashMap<&'a str, Result<&'a FunctionGraph, ()>>,
+    free_functions: HashMap<&'a str, Result<&'a LazyGraph, ()>>,
 }
 
 impl<'a> MirGraphLookup<'a> {
@@ -656,18 +662,18 @@ impl<'a> MirGraphLookup<'a> {
     /// borrows are tied to `program`'s lifetime, so the caller must
     /// keep `program` alive for the duration of the lookup's use.
     pub fn from_program(program: &'a SemanticProgram) -> Self {
-        let mut impl_methods: HashMap<(&'a str, &'a str), Result<&'a FunctionGraph, ()>> =
+        let mut impl_methods: HashMap<(&'a str, &'a str), Result<&'a LazyGraph, ()>> =
             HashMap::new();
-        let mut trait_defaults: HashMap<(&'a str, &'a str), Result<&'a FunctionGraph, ()>> =
+        let mut trait_defaults: HashMap<(&'a str, &'a str), Result<&'a LazyGraph, ()>> =
             HashMap::new();
-        let mut free_functions: HashMap<&'a str, Result<&'a FunctionGraph, ()>> = HashMap::new();
+        let mut free_functions: HashMap<&'a str, Result<&'a LazyGraph, ()>> = HashMap::new();
         for f in &program.functions {
             if let Some(owner) = f.self_ty_root.as_deref() {
                 Self::insert_or_mark_ambiguous(
                     &mut impl_methods,
                     owner,
                     f.name.as_str(),
-                    f.graph(),
+                    f.lazy_graph(),
                 );
                 // Also index by the bare leaf for callers that pass an
                 // unqualified owner (e.g. top-level `impl Drop for
@@ -680,14 +686,19 @@ impl<'a> MirGraphLookup<'a> {
                         &mut impl_methods,
                         leaf,
                         f.name.as_str(),
-                        f.graph(),
+                        f.lazy_graph(),
                     );
                 }
             } else if let Some(tr) = f.trait_root.as_deref() {
                 // Mark bare-leaf trait-name collisions ambiguous, mirroring
                 // the impl_methods / free_functions tables, so two distinct
                 // traits with a same-named default method do not last-win.
-                Self::insert_or_mark_ambiguous(&mut trait_defaults, tr, f.name.as_str(), f.graph());
+                Self::insert_or_mark_ambiguous(
+                    &mut trait_defaults,
+                    tr,
+                    f.name.as_str(),
+                    f.lazy_graph(),
+                );
             } else {
                 // Free function: index by bare name so the
                 // opcode-dispatch extractor can resolve
@@ -695,7 +706,7 @@ impl<'a> MirGraphLookup<'a> {
                 Self::insert_free_or_mark_ambiguous(
                     &mut free_functions,
                     f.name.as_str(),
-                    f.graph(),
+                    f.lazy_graph(),
                 );
             }
         }
@@ -707,10 +718,10 @@ impl<'a> MirGraphLookup<'a> {
     }
 
     fn insert_or_mark_ambiguous(
-        map: &mut HashMap<(&'a str, &'a str), Result<&'a FunctionGraph, ()>>,
+        map: &mut HashMap<(&'a str, &'a str), Result<&'a LazyGraph, ()>>,
         owner: &'a str,
         name: &'a str,
-        graph: &'a FunctionGraph,
+        graph: &'a LazyGraph,
     ) {
         use std::collections::hash_map::Entry;
         match map.entry((owner, name)) {
@@ -720,10 +731,10 @@ impl<'a> MirGraphLookup<'a> {
             Entry::Occupied(mut o) => {
                 let existing = *o.get();
                 if let Ok(g0) = existing {
-                    // Same FunctionGraph reference is fine (same entry
+                    // Same funcobj handle is fine (same entry
                     // visited via dual-key insert); only mark ambiguous
                     // when the pointer differs.
-                    if !std::ptr::eq(g0, graph) {
+                    if !g0.ptr_eq(graph) {
                         let _ = o.insert(Err(()));
                     }
                 }
@@ -733,9 +744,9 @@ impl<'a> MirGraphLookup<'a> {
     }
 
     fn insert_free_or_mark_ambiguous(
-        map: &mut HashMap<&'a str, Result<&'a FunctionGraph, ()>>,
+        map: &mut HashMap<&'a str, Result<&'a LazyGraph, ()>>,
         name: &'a str,
-        graph: &'a FunctionGraph,
+        graph: &'a LazyGraph,
     ) {
         use std::collections::hash_map::Entry;
         match map.entry(name) {
@@ -744,7 +755,7 @@ impl<'a> MirGraphLookup<'a> {
             }
             Entry::Occupied(mut o) => {
                 if let Ok(g0) = *o.get()
-                    && !std::ptr::eq(g0, graph)
+                    && !g0.ptr_eq(graph)
                 {
                     let _ = o.insert(Err(()));
                 }
@@ -757,21 +768,21 @@ impl<'a> MirGraphLookup<'a> {
     /// trait root) by bare name.  Returns None when the name does not
     /// resolve to a unique graph (no entry, or two modules share the
     /// bare name).
-    pub fn lookup_free(&self, name: &str) -> Option<&'a FunctionGraph> {
+    pub fn lookup_free(&self, name: &str) -> Option<&'a LazyGraph> {
         self.free_functions.get(name).copied()?.ok()
     }
 
     /// Returns the MIR graph for an inherent or trait-impl method.
     /// Returns None when the (owner, name) tuple does not resolve to
     /// a unique graph (either no entry or ambiguous bare-leaf).
-    pub fn lookup_impl_method(&self, impl_type: &str, name: &str) -> Option<&'a FunctionGraph> {
+    pub fn lookup_impl_method(&self, impl_type: &str, name: &str) -> Option<&'a LazyGraph> {
         self.impl_methods.get(&(impl_type, name)).copied()?.ok()
     }
 
     /// Returns the MIR graph for a trait-default body.  Returns None
     /// when the (trait_root, name) tuple does not resolve to a unique
     /// graph (no entry or ambiguous bare-leaf trait name).
-    pub fn lookup_trait_default(&self, trait_root: &str, name: &str) -> Option<&'a FunctionGraph> {
+    pub fn lookup_trait_default(&self, trait_root: &str, name: &str) -> Option<&'a LazyGraph> {
         self.trait_defaults.get(&(trait_root, name)).copied()?.ok()
     }
 }

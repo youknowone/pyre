@@ -176,7 +176,7 @@ pub struct MethodInfo {
     pub name: String,
     /// Canonical semantic graph for this method when available.
     #[serde(skip, default)]
-    pub graph: Option<model::FunctionGraph>,
+    pub graph: Option<model::LazyGraph>,
     /// RPython: op.result.concretetype — return type for array identity.
     #[serde(default)]
     pub return_type: Option<String>,
@@ -692,6 +692,22 @@ pub fn analyze_multiple_pipeline_from_llbc_with_modules(
     )
 }
 
+/// A registration of the funcobj `graph` that stamps the source return type
+/// (`funcptr._obj.TO.RESULT`) and then `hints` onto its copy of the graph.
+fn lazy_graph_source(
+    graph: &model::LazyGraph,
+    return_type: &Option<String>,
+    hints: &[String],
+) -> call::GraphSource {
+    call::GraphSource::Lazy {
+        graph: graph.clone(),
+        transform: call::GraphTransform {
+            return_type: return_type.clone(),
+            hints: hints.to_vec(),
+        },
+    }
+}
+
 /// Register a free-function graph under one alias path.  Panics if the
 /// same alias is already mapped to a different `func.name` — this is
 /// the parity guard against silent cross-crate name-tail collisions.
@@ -703,14 +719,11 @@ pub fn analyze_multiple_pipeline_from_llbc_with_modules(
 /// per-alias deep copy of `FunctionGraph.blocks` multiplied the whole
 /// free-function graph set by the alias count.
 fn register_function_graph_alias(
-    graphs: &mut std::collections::HashMap<
-        crate::parse::CallPath,
-        std::rc::Rc<crate::model::FunctionGraph>,
-    >,
+    graphs: &mut std::collections::HashMap<crate::parse::CallPath, call::GraphSource>,
     sources: &mut std::collections::HashMap<crate::parse::CallPath, String>,
     path: crate::parse::CallPath,
     source_name: &str,
-    graph: &std::rc::Rc<crate::model::FunctionGraph>,
+    graph: &call::GraphSource,
 ) {
     if let Some(prev) = sources.get(&path) {
         assert!(
@@ -722,7 +735,7 @@ fn register_function_graph_alias(
         return;
     }
     sources.insert(path.clone(), source_name.to_string());
-    graphs.insert(path, std::rc::Rc::clone(graph));
+    graphs.insert(path, graph.clone());
 }
 
 /// Compute the full alias spelling set for a free function lifted
@@ -1242,9 +1255,12 @@ fn analyze_pipeline_from_module_paths(
         String,
         Option<String>,
         Vec<String>,
-        crate::model::FunctionGraph,
+        crate::model::LazyGraph,
     )> = Vec::new();
-    let mut canonical_function_graphs = std::collections::HashMap::new();
+    let mut canonical_function_graphs: std::collections::HashMap<
+        crate::parse::CallPath,
+        call::GraphSource,
+    > = std::collections::HashMap::new();
     // `bookkeeper.py getdesc` / `newfuncdesc` keys on the host
     // function-object identity, so two unrelated `crate_a::helper` and
     // `crate_b::helper` resolve to distinct `FunctionDesc` instances.
@@ -1330,7 +1346,7 @@ fn analyze_pipeline_from_module_paths(
                     owner.clone(),
                     func.return_type.clone(),
                     func.hints.clone(),
-                    func.graph().clone(),
+                    func.lazy_graph().clone(),
                 ));
                 let types = trait_concrete_impl_types
                     .entry(trait_leaf.as_str())
@@ -1346,7 +1362,7 @@ fn analyze_pipeline_from_module_paths(
                     for_type: owner.clone(),
                     self_ty_root: Some(owner.clone()),
                     name: func.name.clone(),
-                    graph: func.graph().clone(),
+                    graph: func.lazy_graph().clone(),
                     return_type: func.return_type.clone(),
                     hints: func.hints.clone(),
                 });
@@ -1362,7 +1378,7 @@ fn analyze_pipeline_from_module_paths(
                     self_ty_root: None,
                     methods: vec![MethodInfo {
                         name: func.name.clone(),
-                        graph: Some(func.graph().clone()),
+                        graph: Some(func.lazy_graph().clone()),
                         return_type: func.return_type.clone(),
                         hints: func.hints.clone(),
                     }],
@@ -1374,7 +1390,7 @@ fn analyze_pipeline_from_module_paths(
                     for_type: owner.clone(),
                     self_ty_root: Some(owner.clone()),
                     name: func.name.clone(),
-                    graph: func.graph().clone(),
+                    graph: func.lazy_graph().clone(),
                     return_type: func.return_type.clone(),
                     hints: func.hints.clone(),
                 });
@@ -1390,7 +1406,7 @@ fn analyze_pipeline_from_module_paths(
     // One graph object per free function, shared by every alias spelling
     // and by the hint registration below: upstream's aliases name the same
     // Python graph object.
-    let mut free_function_graphs: Vec<Option<std::rc::Rc<model::FunctionGraph>>> =
+    let mut free_function_graphs: Vec<Option<call::GraphSource>> =
         vec![None; program.functions.len()];
     for (index, func) in program.functions.iter().enumerate() {
         if func.self_ty_root.is_none() {
@@ -1398,12 +1414,7 @@ fn analyze_pipeline_from_module_paths(
             // codewriter signature validator reads `FUNC.RESULT`
             // directly off the callee graph (RPython
             // `funcptr._obj.TO.RESULT`).
-            let mut graph = match &func.return_type {
-                Some(rt) => func.graph().clone().with_return_type(rt),
-                None => func.graph().clone(),
-            };
-            crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &func.hints);
-            let graph = std::rc::Rc::new(graph);
+            let graph = lazy_graph_source(func.lazy_graph(), &func.return_type, &func.hints);
             free_function_graphs[index] = Some(graph.clone());
             // Free function: register under every canonical alias
             // spelling computed by `free_function_alias_paths` — bare
@@ -1710,10 +1721,7 @@ fn analyze_pipeline_from_module_paths(
             continue;
         };
         let path = crate::parse::CallPath::for_trait_impl_method(owner, impl_id, &func.name);
-        let graph = match &func.return_type {
-            Some(return_type) => func.graph().clone().with_return_type(return_type),
-            None => func.graph().clone(),
-        };
+        let graph = lazy_graph_source(func.lazy_graph(), &func.return_type, &[]);
         if func.hints.is_empty() {
             call_control.register_function_graph(path, graph);
         } else {
@@ -1853,22 +1861,18 @@ fn analyze_pipeline_from_module_paths(
             // for the handful of MIR-uncovered entries, though every
             // method registered above carries a graph so the fallback
             // is effectively unreached.
-            let mir_graph: Option<&model::FunctionGraph> = if is_default {
+            let mir_graph: Option<&model::LazyGraph> = if is_default {
                 mir_graph_lookup.lookup_trait_default(&impl_info.trait_name, &method.name)
             } else {
                 mir_graph_lookup.lookup_impl_method(impl_type, &method.name)
             };
-            let graph_source: Option<model::FunctionGraph> =
-                mir_graph.cloned().or_else(|| method.graph.clone());
+            let graph_source: Option<&model::LazyGraph> = mir_graph.or(method.graph.as_ref());
             if let Some(graph) = graph_source {
                 // Stamp the source return type onto the graph itself so
                 // the JIT codewriter signature validator reads
                 // `FUNC.RESULT` directly off the callee graph
                 // (RPython `funcptr._obj.TO.RESULT`).
-                let graph = match &method.return_type {
-                    Some(rt) => graph.with_return_type(rt),
-                    None => graph,
-                };
+                let graph = lazy_graph_source(graph, &method.return_type, &[]);
                 call_control.register_trait_method(&method.name, trait_root, impl_type, graph);
                 // Parity with upstream `rpython/annotator/classdesc.py lookup
                 // lookup` MRO walk: a trait default body is the
@@ -1898,20 +1902,13 @@ fn analyze_pipeline_from_module_paths(
                         Some((impl_type, override_info)) => (
                             mir_graph_lookup
                                 .lookup_impl_method(impl_type, &method.name)
-                                .cloned()
-                                .or_else(|| Some(override_info.graph().clone())),
-                            override_info.return_type.as_ref(),
+                                .or(Some(override_info.lazy_graph())),
+                            &override_info.return_type,
                         ),
-                        None => (
-                            mir_graph.cloned().or_else(|| method.graph.clone()),
-                            method.return_type.as_ref(),
-                        ),
+                        None => (mir_graph.or(method.graph.as_ref()), &method.return_type),
                     };
                     if let Some(g) = direct_source {
-                        let direct_graph = match direct_return_type {
-                            Some(rt) => g.with_return_type(rt),
-                            None => g,
-                        };
+                        let direct_graph = lazy_graph_source(g, direct_return_type, &[]);
                         call_control.register_function_graph(direct_path, direct_graph);
                     }
                 }
@@ -2127,10 +2124,7 @@ fn analyze_pipeline_from_module_paths(
         // peek_at`), the two collide on the `(owner, name)` key and the
         // lookup resolves to `Err(())` (ambiguous), silently dropping the
         // single-impl devirtualization.  The carried graph is unambiguous.
-        let graph = match return_type {
-            Some(rt) => graph.clone().with_return_type(rt),
-            None => graph.clone(),
-        };
+        let graph = lazy_graph_source(graph, return_type, &[]);
         let direct_path =
             crate::parse::CallPath::from_segments([trait_leaf.as_str(), method_name.as_str()]);
         call_control.register_function_graph(direct_path.clone(), graph);
@@ -2168,10 +2162,9 @@ fn analyze_pipeline_from_module_paths(
         // residual fallback for the handful of MIR-uncovered entries,
         // effectively unreached because every inherent method
         // registered above carries a graph.
-        let graph: model::FunctionGraph = mir_graph_lookup
+        let graph: &model::LazyGraph = mir_graph_lookup
             .lookup_impl_method(impl_type, &method_info.name)
-            .cloned()
-            .unwrap_or_else(|| method_info.graph.clone());
+            .unwrap_or(&method_info.graph);
         // Pair the graph with the method's hints so the BFS-driven
         // `look_inside_graph` synthesises a `SemanticFunction` whose
         // `_reject_function("elidable")` mirrors RPython's
@@ -2182,10 +2175,7 @@ fn analyze_pipeline_from_module_paths(
         // codewriter signature validator reads `FUNC.RESULT` directly off
         // the callee graph (`funcptr._obj.TO.RESULT`), matching the
         // free-function and trait-method registration paths above.
-        let graph = match &method_info.return_type {
-            Some(rt) => graph.with_return_type(rt),
-            None => graph,
-        };
+        let graph = lazy_graph_source(graph, &method_info.return_type, &[]);
         if method_info.hints.is_empty() {
             call_control.register_function_graph(path.clone(), graph);
         } else {

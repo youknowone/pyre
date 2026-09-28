@@ -940,14 +940,7 @@ pub struct JitDriverStaticData {
     pub greenfield_info: Option<std::sync::Arc<dyn GreenFieldInfoHandle>>,
 }
 
-/// Identity of a source funcobj: `(owner_root, name)`.
-///
-/// `name` is the graph's `name_path()` — Charon's fully-qualified path for
-/// a free function (unique per source), `owner_root` the impl type for a
-/// method (so two impls' same-named methods, e.g. `PyFrame::push_value` vs
-/// `MIFrame::push_value`, stay distinct).  Every alias spelling of one
-/// source funcobj resolves to the same `GraphKey`.
-type GraphKey = (Option<String>, String);
+use crate::model::GraphKey;
 
 /// Storage for registered graphs that mirrors RPython's
 /// `{name: funcobj}` indirection: many call-path spellings (aliases) name
@@ -992,7 +985,7 @@ pub(crate) struct GraphStore {
 /// ([`crate::model::FunctionGraph::value_name_for`]) once, when the graph
 /// is built, rather than on every registry consumer.
 ///
-/// `graph` is built on first demand from `build`
+/// `graph` is built on first demand from `source`
 /// (`description.py FunctionDesc.cachedgraph`); a build that produces no
 /// graph leaves the funcobj unregistered. Once built, the graph is shared
 /// with the call registry's pending lift of this body
@@ -1000,14 +993,25 @@ pub(crate) struct GraphStore {
 /// it copies the graph, so the lift reads the body as it was registered.
 struct GraphSlot {
     graph: std::cell::OnceCell<Option<BuiltGraph>>,
-    build: std::cell::Cell<Option<DeferredGraph>>,
+    /// The funcobj the graph is built from; `None` for a slot registered
+    /// with a built graph.
+    source: Option<SlotSource>,
+    /// Attributes written onto the funcobj before its graph was built.
+    /// The build stamps them onto the graph; afterwards writes go to the
+    /// graph itself.
+    attrs: FuncObjAttrs,
     /// Number of store passes that had run when the funcobj was
     /// registered: its build catches up on the ones after.
     since: usize,
-    /// Set while `build` runs, so the slot reads as absent to the store
+    /// Set while the build runs, so the slot reads as absent to the store
     /// passes the build catches up on, as it does while a whole-store pass
     /// has taken it out of the store.
     building: std::cell::Cell<bool>,
+}
+
+struct SlotSource {
+    graph: crate::model::LazyGraph,
+    transform: GraphTransform,
 }
 
 struct BuiltGraph {
@@ -1015,8 +1019,76 @@ struct BuiltGraph {
     signature: Signature,
 }
 
-/// The body of a funcobj whose graph has not been built yet.
-pub(crate) type DeferredGraph = Box<dyn FnOnce() -> Option<FunctionGraph>>;
+/// A graph handed to [`CallControl`] registration: built already, or the
+/// funcobj's [`LazyGraph`](crate::model::LazyGraph) together with the
+/// registration's own stamps, applied when the graph is built.
+#[derive(Clone)]
+pub enum GraphSource {
+    Built(std::rc::Rc<FunctionGraph>),
+    Lazy {
+        graph: crate::model::LazyGraph,
+        transform: GraphTransform,
+    },
+}
+
+impl From<FunctionGraph> for GraphSource {
+    fn from(graph: FunctionGraph) -> Self {
+        Self::Built(std::rc::Rc::new(graph))
+    }
+}
+
+impl From<std::rc::Rc<FunctionGraph>> for GraphSource {
+    fn from(graph: std::rc::Rc<FunctionGraph>) -> Self {
+        Self::Built(graph)
+    }
+}
+
+/// What a registration stamps onto its copy of the funcobj's graph: the
+/// source return type (`with_return_type`) and the hints, in that order.
+#[derive(Clone, Debug, Default)]
+pub struct GraphTransform {
+    pub return_type: Option<String>,
+    pub hints: Vec<String>,
+}
+
+impl GraphTransform {
+    fn apply(&self, graph: &mut FunctionGraph) {
+        if let Some(rt) = &self.return_type {
+            graph.return_type = Some(rt.clone());
+        }
+        crate::front::llbc_hints::merge_hints_into_graph(graph, &self.hints);
+    }
+}
+
+/// `graph.func` attributes, hints and return type written onto a funcobj
+/// whose graph is not built yet, folded onto the graph when it is.
+#[derive(Default)]
+struct FuncObjAttrs {
+    func: crate::model::FuncEffects,
+    hints: Vec<String>,
+    return_type: Option<String>,
+}
+
+impl FuncObjAttrs {
+    fn merge_hints(&mut self, hints: &[String]) {
+        for hint in hints {
+            if !self.hints.contains(hint) {
+                self.hints.push(hint.clone());
+            }
+        }
+    }
+
+    /// The fold [`GraphStore::insert`] does for another alias of the same
+    /// graph: effects accumulate, hints append, a missing return type is
+    /// adopted.
+    fn apply(&self, graph: &mut FunctionGraph) {
+        graph.func.merge_from(&self.func);
+        crate::front::llbc_hints::merge_hints_into_graph(graph, &self.hints);
+        if graph.return_type.is_none() {
+            graph.return_type = self.return_type.clone();
+        }
+    }
+}
 
 /// A whole-store rewrite [`GraphStore::run_pass`] ran, with the inputs it
 /// read at that point.
@@ -1041,19 +1113,74 @@ impl GraphSlot {
         let signature = GraphStore::signature_from_graph(&graph);
         Self {
             graph: std::cell::OnceCell::from(Some(BuiltGraph { graph, signature })),
-            build: std::cell::Cell::new(None),
+            source: None,
+            attrs: FuncObjAttrs::default(),
             since: 0,
             building: std::cell::Cell::new(false),
         }
     }
 
-    #[cfg(test)]
-    fn deferred(build: DeferredGraph, since: usize) -> Self {
+    fn lazy(graph: crate::model::LazyGraph, transform: GraphTransform, since: usize) -> Self {
         Self {
             graph: std::cell::OnceCell::new(),
-            build: std::cell::Cell::new(Some(build)),
+            source: Some(SlotSource { graph, transform }),
+            attrs: FuncObjAttrs::default(),
             since,
             building: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Whether the slot's graph comes from the funcobj `graph`.
+    fn is_source(&self, graph: &crate::model::LazyGraph) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|source| source.graph.ptr_eq(graph))
+    }
+
+    /// The funcobj attributes to write to without building the graph: the
+    /// built graph's, or the pending [`FuncObjAttrs`] of an unbuilt one.
+    /// `None` when the build produced no graph.
+    fn attrs_mut(&mut self) -> Option<AttrsMut<'_>> {
+        match self.graph.get_mut() {
+            Some(Some(built)) => Some(AttrsMut::Graph(std::rc::Rc::make_mut(&mut built.graph))),
+            Some(None) => None,
+            None => Some(AttrsMut::Pending(&mut self.attrs)),
+        }
+    }
+}
+
+enum AttrsMut<'a> {
+    Graph(&'a mut FunctionGraph),
+    Pending(&'a mut FuncObjAttrs),
+}
+
+impl<'a> AttrsMut<'a> {
+    fn func(self) -> &'a mut crate::model::FuncEffects {
+        match self {
+            AttrsMut::Graph(graph) => &mut graph.func,
+            AttrsMut::Pending(attrs) => &mut attrs.func,
+        }
+    }
+
+    fn merge_hints(self, hints: &[String]) {
+        match self {
+            AttrsMut::Graph(graph) => {
+                crate::front::llbc_hints::merge_hints_into_graph(graph, hints)
+            }
+            AttrsMut::Pending(attrs) => attrs.merge_hints(hints),
+        }
+    }
+
+    fn fold(self, other: &FuncObjAttrs) {
+        match self {
+            AttrsMut::Graph(graph) => other.apply(graph),
+            AttrsMut::Pending(attrs) => {
+                attrs.func.merge_from(&other.func);
+                attrs.merge_hints(&other.hints);
+                if attrs.return_type.is_none() {
+                    attrs.return_type = other.return_type.clone();
+                }
+            }
         }
     }
 }
@@ -1090,9 +1217,12 @@ impl GraphStore {
         }
         slot.graph
             .get_or_init(|| {
-                let build = slot.build.take()?;
+                let source = slot.source.as_ref()?;
                 slot.building.set(true);
-                let built = build().map(|mut graph| {
+                let built = source.graph.get().map(|graph| {
+                    let mut graph = FunctionGraph::clone(graph);
+                    source.transform.apply(&mut graph);
+                    slot.attrs.apply(&mut graph);
                     for pass in &self.passes[slot.since..] {
                         self.apply_pass(pass, &mut graph);
                     }
@@ -1167,13 +1297,7 @@ impl GraphStore {
     /// to anyway.
     pub(crate) fn insert(&mut self, path: CallPath, graph: impl Into<std::rc::Rc<FunctionGraph>>) {
         let graph = graph.into();
-        let key = (
-            graph
-                .source_identity
-                .clone()
-                .or_else(|| graph.owner_root.clone()),
-            graph.name.clone(),
-        );
+        let key = graph.graph_key();
         if let Some(slot) = self.graphs.get(&key) {
             self.slot_graph(slot);
         }
@@ -1210,15 +1334,98 @@ impl GraphStore {
         self.path_to_key.insert(path, key);
     }
 
+    /// Register the funcobj `graph` under `path` without building its
+    /// graph. `transform` is this registration's stamp on the graph and
+    /// `func` the effects already marked on `path`. Another alias of the
+    /// same funcobj folds them onto the stored slot the way
+    /// [`Self::insert`] folds a graph; a different funcobj under the same
+    /// key has its graph built and folded by [`Self::insert`].
+    pub(crate) fn insert_lazy(
+        &mut self,
+        path: CallPath,
+        graph: crate::model::LazyGraph,
+        transform: GraphTransform,
+        func: Option<crate::model::FuncEffects>,
+    ) {
+        let key = graph.graph_key();
+        match self.graphs.get_mut(&key) {
+            None => {
+                let mut slot = GraphSlot::lazy(graph, transform, self.passes.len());
+                if let Some(func) = func {
+                    slot.attrs.func = func;
+                }
+                self.graphs.insert(key.clone(), slot);
+            }
+            // The graph and its own attributes are already the slot's, so
+            // only this registration's stamps and marks fold.
+            Some(slot) if slot.is_source(&graph) => {
+                let attrs = FuncObjAttrs {
+                    func: func.unwrap_or_default(),
+                    hints: transform.hints,
+                    return_type: transform.return_type,
+                };
+                if let Some(target) = slot.attrs_mut() {
+                    target.fold(&attrs);
+                }
+            }
+            Some(_) => {
+                let Some(built) = graph.get() else {
+                    return;
+                };
+                let mut built = FunctionGraph::clone(built);
+                transform.apply(&mut built);
+                if let Some(func) = func {
+                    built.func.merge_from(&func);
+                }
+                self.insert(path, built);
+                return;
+            }
+        }
+        self.path_to_key.insert(path, key);
+    }
+
     /// Register a funcobj whose graph is built on first demand under `key`.
     /// A build that produces no graph leaves `path` unregistered.
     #[cfg(test)]
-    pub(crate) fn insert_deferred(&mut self, path: CallPath, key: GraphKey, build: DeferredGraph) {
-        let since = self.passes.len();
-        self.graphs
-            .entry(key.clone())
-            .or_insert_with(|| GraphSlot::deferred(build, since));
-        self.path_to_key.insert(path, key);
+    pub(crate) fn insert_deferred(
+        &mut self,
+        path: CallPath,
+        key: GraphKey,
+        build: impl FnOnce() -> Option<FunctionGraph> + 'static,
+    ) {
+        let graph = crate::model::LazyGraph::deferred(key, build);
+        self.insert_lazy(path, graph, GraphTransform::default(), None);
+    }
+
+    /// Write `graph.func` of the funcobj `path` names without building its
+    /// graph. `None` when `path` names no funcobj or its build produced no
+    /// graph.
+    pub(crate) fn func_mut(&mut self, path: &CallPath) -> Option<&mut crate::model::FuncEffects> {
+        let key = self.path_to_key.get(path)?;
+        Some(self.graphs.get_mut(key)?.attrs_mut()?.func())
+    }
+
+    /// Add `hints` to the funcobj `path` names without building its graph.
+    pub(crate) fn merge_hints(&mut self, path: &CallPath, hints: &[String]) {
+        let Some(key) = self.path_to_key.get(path) else {
+            return;
+        };
+        if let Some(target) = self.graphs.get_mut(key).and_then(GraphSlot::attrs_mut) {
+            target.merge_hints(hints);
+        }
+    }
+
+    /// The graph of `path` if it is built already; never builds it.
+    pub(crate) fn get_built(&self, path: &CallPath) -> Option<&FunctionGraph> {
+        let slot = self.graphs.get(self.path_to_key.get(path)?)?;
+        slot.graph.get()?.as_ref().map(|b| &*b.graph)
+    }
+
+    /// [`Self::get_built`] for writing.
+    pub(crate) fn get_built_mut(&mut self, path: &CallPath) -> Option<&mut FunctionGraph> {
+        let key = self.path_to_key.get(path)?;
+        let built = self.graphs.get_mut(key)?.graph.get_mut()?.as_mut()?;
+        Some(std::rc::Rc::make_mut(&mut built.graph))
     }
 
     /// `GraphKey` of the funcobj `path` names. Alias spellings of one
@@ -1296,9 +1503,7 @@ impl GraphStore {
                 // Not built: put it back untouched.
                 let slot = GraphSlot {
                     graph: other.map_or_else(std::cell::OnceCell::new, std::cell::OnceCell::from),
-                    build: slot.build,
-                    since: slot.since,
-                    building: slot.building,
+                    ..slot
                 };
                 self.graphs.insert(key.clone(), slot);
                 None
@@ -3820,21 +4025,26 @@ impl CallControl {
 
     /// Insert into `function_graphs`. All graph writes go through this
     /// helper so pending external-funcobj marks fold onto the graph.
-    fn insert_function_graph_indexed(
-        &mut self,
-        path: CallPath,
-        mut graph: std::rc::Rc<FunctionGraph>,
-    ) {
+    fn insert_function_graph_indexed(&mut self, path: CallPath, graph: GraphSource) {
         // Fold any effect marks recorded before the graph existed: a
         // `mark_*` called ahead of registration lands on the graph-less
         // external funcobj record for `path`; carry it onto `graph.func`
         // so the typed effect carrier is registration-order-insensitive
         // (RPython attaches `func` attributes regardless of when the
         // graph is discovered).
-        if let Some(pending) = self.external_funcobjs.remove(&path) {
-            std::rc::Rc::make_mut(&mut graph).func.merge_from(&pending);
+        let pending = self.external_funcobjs.remove(&path);
+        match graph {
+            GraphSource::Built(mut graph) => {
+                if let Some(pending) = pending {
+                    std::rc::Rc::make_mut(&mut graph).func.merge_from(&pending);
+                }
+                self.function_graphs.insert(path, graph);
+            }
+            GraphSource::Lazy { graph, transform } => {
+                self.function_graphs
+                    .insert_lazy(path, graph, transform, pending);
+            }
         }
-        self.function_graphs.insert(path.clone(), graph);
     }
 
     /// Read the [`FuncEffects`](crate::model::FuncEffects) for `path`:
@@ -3856,8 +4066,8 @@ impl CallControl {
     /// graph-less external funcobj record (created on demand) otherwise.
     /// The `mark_*` setters route every effect write through here.
     fn func_effects_mut(&mut self, path: &CallPath) -> &mut crate::model::FuncEffects {
-        if let Some(graph) = self.function_graphs.get_mut(path) {
-            &mut graph.func
+        if let Some(func) = self.function_graphs.func_mut(path) {
+            func
         } else {
             self.external_funcobjs.entry(path.clone()).or_default()
         }
@@ -3895,11 +4105,7 @@ impl CallControl {
 
     /// Register a free function graph.
     /// RPython: graphs are discovered via funcptr linkage.
-    pub fn register_function_graph(
-        &mut self,
-        path: CallPath,
-        graph: impl Into<std::rc::Rc<FunctionGraph>>,
-    ) {
+    pub fn register_function_graph(&mut self, path: CallPath, graph: impl Into<GraphSource>) {
         self.insert_function_graph_indexed(path.clone(), graph.into());
         // The deferred `Some([])` marker is resolvable as soon as its
         // `(trait, method)` impls are registered. Fill it on the stored
@@ -3928,8 +4134,10 @@ impl CallControl {
                     })
         };
         // Look before writing: the stored graph can be shared with its
-        // other aliases and with the pending lift.
-        let Some(graph) = function_graphs.get(path) else {
+        // other aliases and with the pending lift. A graph not built yet
+        // is left alone: `materialize_deferred_indirect_families` fills
+        // every family marker before any reader walks it.
+        let Some(graph) = function_graphs.get_built(path) else {
             return;
         };
         let any_fillable = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
@@ -3939,7 +4147,7 @@ impl CallControl {
         if !any_fillable {
             return;
         }
-        let Some(graph) = function_graphs.get_mut(path) else {
+        let Some(graph) = function_graphs.get_built_mut(path) else {
             return;
         };
         for block in &mut graph.blocks {
@@ -4007,15 +4215,26 @@ impl CallControl {
     pub fn register_function_graph_with_hints(
         &mut self,
         path: CallPath,
-        graph: impl Into<std::rc::Rc<FunctionGraph>>,
+        graph: impl Into<GraphSource>,
         hints: Vec<String>,
     ) {
         let mut graph = graph.into();
-        if hints.iter().any(|hint| !graph.hints.contains(hint)) {
-            crate::front::llbc_hints::merge_hints_into_graph(
-                std::rc::Rc::make_mut(&mut graph),
-                &hints,
-            );
+        match &mut graph {
+            GraphSource::Built(graph) => {
+                if hints.iter().any(|hint| !graph.hints.contains(hint)) {
+                    crate::front::llbc_hints::merge_hints_into_graph(
+                        std::rc::Rc::make_mut(graph),
+                        &hints,
+                    );
+                }
+            }
+            GraphSource::Lazy { transform, .. } => {
+                for hint in hints {
+                    if !transform.hints.contains(&hint) {
+                        transform.hints.push(hint);
+                    }
+                }
+            }
         }
         self.register_function_graph(path, graph);
     }
@@ -4026,10 +4245,8 @@ impl CallControl {
     /// insert) and need the graph's `_jit_*_` / `_elidable_function_` hints
     /// populated so `look_inside_graph` reads them off `graph.hints`.
     pub fn register_function_hints_for(&mut self, path: CallPath, hints: Vec<String>) {
-        if !hints.is_empty()
-            && let Some(graph) = self.function_graphs.get_mut(&path)
-        {
-            crate::front::llbc_hints::merge_hints_into_graph(graph, &hints);
+        if !hints.is_empty() {
+            self.function_graphs.merge_hints(&path, &hints);
         }
     }
 
@@ -4198,7 +4415,7 @@ impl CallControl {
         method_name: &str,
         trait_root: Option<&str>,
         impl_type: &str,
-        graph: impl Into<std::rc::Rc<FunctionGraph>>,
+        graph: impl Into<GraphSource>,
     ) {
         if let Some(trait_root) = trait_root {
             self.register_trait_family_member(method_name, trait_root, impl_type);
@@ -6651,11 +6868,7 @@ impl CallControl {
     /// Ensure the hint `tok` is present on the registered graph for `path`
     /// (idempotent; no-op when no graph is registered under `path`).
     fn stamp_graph_hint(&mut self, path: &CallPath, tok: &str) {
-        if let Some(g) = self.function_graphs.get_mut(path)
-            && !g.hints.iter().any(|h| h == tok)
-        {
-            g.hints.push(tok.to_string());
-        }
+        self.function_graphs.merge_hints(path, &[tok.to_string()]);
     }
 
     /// RPython: `getattr(func, "_elidable_function_", False)` (call.py).
@@ -13763,6 +13976,70 @@ mod tests {
         assert!(!cc.function_graphs.contains_key(&path));
         assert!(cc.function_graphs.get(&path).is_none());
         assert!(cc.function_graphs.signature(&path).is_none());
+    }
+
+    /// Effects and hints marked on a funcobj before its graph is built
+    /// are the graph's once it is.
+    #[test]
+    fn a_mark_on_an_unbuilt_funcobj_lands_on_its_graph() {
+        let path = CallPath::from_segments(["pure"]);
+        let key = (None, "pure".to_string());
+        let mut cc = CallControl::new();
+        cc.function_graphs
+            .insert_deferred(path.clone(), key.clone(), || {
+                Some(FunctionGraph::new("pure"))
+            });
+        cc.mark_elidable(path.clone());
+        cc.register_function_hints_for(path.clone(), vec!["unroll_safe".to_string()]);
+        assert!(
+            cc.function_graphs.graphs[&key].graph.get().is_none(),
+            "a mark must not build the graph"
+        );
+        let graph = cc.function_graphs.get(&path).expect("registered graph");
+        assert!(graph.func.elidable);
+        assert_eq!(graph.hints, ["elidable", "unroll_safe"]);
+    }
+
+    /// Alias registrations of one funcobj share one slot and build its
+    /// graph once, on demand, with every registration's stamps folded.
+    #[test]
+    fn aliases_of_one_funcobj_share_one_unbuilt_slot() {
+        let builds = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = builds.clone();
+        let funcobj = crate::model::LazyGraph::deferred((None, "helper".to_string()), move || {
+            counter.set(counter.get() + 1);
+            Some(FunctionGraph::new("helper"))
+        });
+        let first = CallPath::from_segments(["helper"]);
+        let second = CallPath::from_segments(["crate", "helper"]);
+        let mut cc = CallControl::new();
+        cc.register_function_graph(
+            first.clone(),
+            GraphSource::Lazy {
+                graph: funcobj.clone(),
+                transform: GraphTransform {
+                    return_type: Some("i64".to_string()),
+                    hints: Vec::new(),
+                },
+            },
+        );
+        cc.register_function_graph_with_hints(
+            second.clone(),
+            GraphSource::Lazy {
+                graph: funcobj,
+                transform: GraphTransform::default(),
+            },
+            vec!["elidable".to_string()],
+        );
+        assert_eq!(builds.get(), 0, "registration must not build the graph");
+        let graph = cc.function_graphs.get(&second).expect("registered graph");
+        assert_eq!(graph.return_type.as_deref(), Some("i64"));
+        assert_eq!(graph.hints, ["elidable"]);
+        assert!(std::ptr::eq(
+            graph,
+            cc.function_graphs.get(&first).expect("registered graph")
+        ));
+        assert_eq!(builds.get(), 1);
     }
 
     /// `graphs_from(op)` for an `OpKind::IndirectCall` must filter by

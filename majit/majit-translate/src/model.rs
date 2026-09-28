@@ -7014,6 +7014,15 @@ impl FuncEffects {
     }
 }
 
+/// Identity of a source funcobj: `(source_identity or owner_root, name)`.
+///
+/// `name` is the graph's `name_path()` — Charon's fully-qualified path for
+/// a free function (unique per source), `owner_root` the impl type for a
+/// method (so two impls' same-named methods, e.g. `PyFrame::push_value` vs
+/// `MIFrame::push_value`, stay distinct).  Every alias spelling of one
+/// source funcobj resolves to the same `GraphKey`.
+pub type GraphKey = (Option<String>, String);
+
 /// A funcobj's flow graph, built on first demand
 /// (`description.py FunctionDesc.cachedgraph`). Clones share the one graph.
 #[derive(Clone)]
@@ -7022,6 +7031,9 @@ pub struct LazyGraph(std::rc::Rc<LazyGraphCell>);
 struct LazyGraphCell {
     graph: std::cell::OnceCell<Option<std::rc::Rc<FunctionGraph>>>,
     build: std::cell::Cell<Option<Box<dyn FnOnce() -> Option<FunctionGraph>>>>,
+    /// The funcobj's [`GraphKey`] while its graph is not built; a built
+    /// graph answers from its own fields.
+    key: Option<GraphKey>,
 }
 
 impl LazyGraph {
@@ -7030,16 +7042,31 @@ impl LazyGraph {
         Self(std::rc::Rc::new(LazyGraphCell {
             graph: std::cell::OnceCell::from(Some(graph.into())),
             build: std::cell::Cell::new(None),
+            key: None,
         }))
     }
 
     /// A graph `build` produces on first demand; `None` from `build` means
-    /// the funcobj has no graph.
-    pub fn deferred(build: impl FnOnce() -> Option<FunctionGraph> + 'static) -> Self {
+    /// the funcobj has no graph. `key` is the funcobj identity the built
+    /// graph will carry.
+    pub fn deferred(
+        key: GraphKey,
+        build: impl FnOnce() -> Option<FunctionGraph> + 'static,
+    ) -> Self {
         Self(std::rc::Rc::new(LazyGraphCell {
             graph: std::cell::OnceCell::new(),
             build: std::cell::Cell::new(Some(Box::new(build))),
+            key: Some(key),
         }))
+    }
+
+    /// The funcobj identity, read without building the graph.
+    pub fn graph_key(&self) -> GraphKey {
+        match (&self.0.key, self.0.graph.get()) {
+            (_, Some(Some(graph))) => graph.graph_key(),
+            (Some(key), _) => key.clone(),
+            (None, _) => unreachable!("a built LazyGraph holds its graph"),
+        }
     }
 
     /// The graph, built on the first call.
@@ -7367,6 +7394,16 @@ impl FunctionGraph {
     pub fn with_return_type(mut self, rt: impl Into<String>) -> Self {
         self.return_type = Some(rt.into());
         self
+    }
+
+    /// The source funcobj's [`GraphKey`].
+    pub fn graph_key(&self) -> GraphKey {
+        (
+            self.source_identity
+                .clone()
+                .or_else(|| self.owner_root.clone()),
+            self.name.clone(),
+        )
     }
 
     /// Builder-style setter for `hints`. Production registration paths

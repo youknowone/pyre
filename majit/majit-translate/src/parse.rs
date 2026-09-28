@@ -8,7 +8,7 @@ pub struct InherentMethodInfo {
     pub for_type: String,
     pub self_ty_root: Option<String>,
     pub name: String,
-    pub graph: crate::model::FunctionGraph,
+    pub graph: crate::model::LazyGraph,
     /// RPython: op.result.concretetype — return type for array identity.
     pub return_type: Option<String>,
     /// RPython: function-level JIT hints (elidable, close_stack, etc.).
