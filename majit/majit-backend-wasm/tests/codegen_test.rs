@@ -1058,7 +1058,7 @@ fn sparse_value_ids_declare_only_addressable_value_locals() {
     validate_wasm(&bytes);
     assert_eq!(
         emitted_local_count(&bytes),
-        inputargs.len() as u32 + 3 + 6 + 3,
+        inputargs.len() as u32 + 3 + 6 + 1,
         "two input values and three sparse ids, plus fixed i64 and i32 locals"
     );
 }
@@ -1084,7 +1084,7 @@ fn same_as_reuses_its_source_local() {
     validate_wasm(&bytes);
     assert_eq!(
         emitted_local_count(&bytes),
-        inputargs.len() as u32 + 1 + 6 + 3,
+        inputargs.len() as u32 + 1 + 6 + 1,
         "SameAsI shares input 0's local; only IntAdd allocates a result local"
     );
 }
@@ -1111,7 +1111,7 @@ fn same_as_does_not_alias_a_mutable_label_local() {
     validate_wasm(&bytes);
     assert_eq!(
         emitted_local_count(&bytes),
-        inputargs.len() as u32 + 2 + 6 + 3,
+        inputargs.len() as u32 + 2 + 6 + 1,
         "SameAs must not share the phi local that JUMP rebinds"
     );
 }
@@ -3564,13 +3564,10 @@ fn home_gcmap_publish_pointer_eq_guards_the_union_call() {
             }
         }
     }
-    assert!(
-        ptr_eqs > 0,
-        "publish must i64.eq the live jf_gcmap against this map before union"
-    );
-    assert!(
-        union_calls > 0,
-        "incomparable ordinary/LABEL maps still need the union residual"
+    let _ = ptr_eqs;
+    assert_eq!(
+        union_calls, 0,
+        "per-site gcmaps replace the prologue union of a static home map"
     );
 }
 

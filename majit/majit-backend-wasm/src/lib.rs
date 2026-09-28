@@ -4623,10 +4623,6 @@ fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTa
             diag_bump(62);
             return None;
         }
-        if registered.callee_gcmap_ptr == 0 {
-            diag_bump(62);
-            return None;
-        }
         if registered.compiled_ptr == 0 {
             diag_bump(62);
             return None;
@@ -6813,11 +6809,10 @@ impl majit_backend::Backend for WasmBackend {
                     JitFrame::init(jf, frame_info_ptr(token), depth);
                 }
 
-                // Per-loop gcmap over the surviving Ref-home region. It is
-                // owned for the compiled loop's lifetime, because this frame
-                // may remain reachable through a virtualizable token after
-                // the immediate outputs have been read.
-                unsafe { (*jf).jf_gcmap = compiled.home_gcmap_ptr.get() as *const u8 };
+                // `jf_gcmap` stays null until the trace executes `push_gcmap`.
+                // A virtualizable token that outlives the call keeps
+                // `_finish_gcmap` via the guard's exit-table store.
+                unsafe { (*jf).jf_gcmap = std::ptr::null() };
 
                 let items_base = jf as usize + FIRST_ITEM_OFFSET;
                 let mut ref_index = 0usize;
@@ -6873,8 +6868,9 @@ impl majit_backend::Backend for WasmBackend {
             // `panic=abort`, so `glue::execute` cannot unwind past the pop.
             //
             // One root mechanism: the off-GC frame is published on the jitframe
-            // shadow stack for the span of the call, and `jf_gcmap`
-            // (`home_gcmap_ptr`) names its Ref homes. `llmodel.py`
+            // shadow stack for the span of the call. Ref homes are roots only
+            // while `push_gcmap` has published `jf_gcmap` (`assembler.py`).
+            // `llmodel.py`
             // `execute_token` allocates through `malloc_jitframe` and
             // `jitframe.py` `jitframe_trace` walks that map; dynasm `runner.rs`
             // `execute_token` runs the same off-GC frame, pushed by the
@@ -6892,7 +6888,7 @@ impl majit_backend::Backend for WasmBackend {
             let jf = majit_backend::jitframe::alloc_off_gc_jitframe(alloc_size);
             assert!(!jf.is_null(), "wasm host-buffer JitFrame allocation failed");
             unsafe { majit_backend::jitframe::JitFrame::init(jf, frame_info_ptr(token), depth) };
-            unsafe { (*jf).jf_gcmap = compiled.home_gcmap_ptr.get() as *const u8 };
+            unsafe { (*jf).jf_gcmap = std::ptr::null() };
             let items_base = jf as usize + majit_backend::jitframe::FIRST_ITEM_OFFSET;
             for (i, arg) in args.iter().enumerate() {
                 let v = match arg {
