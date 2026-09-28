@@ -9469,7 +9469,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor_with_owner(
-                        vec!["pyre_object".into(), "m".into(), "Payload".into()],
+                        vec!["pyre_object".into(), "m".into()],
                         "Payload",
                     ),
                     args: crate::model::call_args(vec![]),
