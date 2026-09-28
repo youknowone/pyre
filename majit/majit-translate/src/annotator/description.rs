@@ -1065,6 +1065,13 @@ impl FunctionDesc {
     }
 
     /// RPython `FunctionDesc.getgraphs()` (description.py).
+    ///
+    /// Upstream reads `_cache` alone: it holds exactly the graphs
+    /// annotation built. The call registry installs every callable before
+    /// annotation and its default graph stays pending in
+    /// [`Self::source_graph`], so an observer of the cache builds that
+    /// graph first ([`Self::build_source_graph`]), as the registry's former
+    /// eager prefill of the default key did.
     pub fn getgraphs(&self) -> Vec<Rc<PyGraph>> {
         self.build_source_graph();
         self.cache.borrow().values().cloned().collect()
@@ -1583,6 +1590,7 @@ impl FunctionDesc {
     /// as an optional bool mirroring the same "attribute absent"
     /// default-to-False contract.
     pub fn getuniquegraph(&self) -> Result<Rc<PyGraph>, AnnotatorError> {
+        // A pending registry graph is built first; see `getgraphs`.
         self.build_source_graph();
         let cache = self.cache.borrow();
         if cache.len() != 1 {
@@ -1623,6 +1631,7 @@ impl FunctionDesc {
     /// `(AccessDirect, key)`.
     #[allow(dead_code)] // RPython top-level port surface; called via specialize.rs wrapper.
     pub(crate) fn getuniquenondirectgraph(&self) -> Result<Rc<PyGraph>, AnnotatorError> {
+        // A pending registry graph is built first; see `getgraphs`.
         self.build_source_graph();
         let mut result = Vec::new();
         for (key, graph) in self.cache.borrow().iter() {
