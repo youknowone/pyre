@@ -17,7 +17,7 @@ use std::collections::HashSet;
 
 use majit_charon_reader::Llbc;
 
-use crate::front::mir::{self, CrateLowering, CrateLoweringState, LowerError};
+use crate::front::mir::{self, CrateLowering, CrateLoweringState, DeclBuildError, LowerError};
 use crate::front::semantic::{SemanticFunction, SemanticProgram};
 
 /// Where a funcobj's body comes from: the LLBC that carries it and the
@@ -49,11 +49,10 @@ pub(crate) struct GraphBodyProvider {
     scalar_field_stores: Vec<OwnedScalarFieldStore>,
 }
 
-/// One lowered crate: its artefact, the module filter its decls were
-/// admitted under, and the lowering state they were lowered with.
+/// One lowered crate: its artefact and the lowering state its decls were
+/// lowered with.
 struct ProvidedCrate {
     llbc: Llbc,
-    module_filter: Option<HashSet<String>>,
     state: CrateLoweringState,
 }
 
@@ -164,11 +163,7 @@ impl GraphBodyProvider {
             &mut program.enum_variant_by_discriminant,
             Some(&program.struct_ids),
         );
-        self.crates.push(ProvidedCrate {
-            llbc,
-            module_filter,
-            state,
-        });
+        self.crates.push(ProvidedCrate { llbc, state });
         program
     }
 
@@ -206,8 +201,10 @@ impl GraphBodyProvider {
         found
     }
 
-    /// Lower the funcobj `src` names with the state its crate was lowered
-    /// with, reproducing what the whole-program loop produced for it.
+    /// Build the funcobj `src` names with the state its crate was lowered
+    /// with, reproducing what the whole-program loop produced for it. Which
+    /// funcobjs exist is decided when they are registered, so no membership
+    /// gate runs here, and a body that does not lower answers its own error.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "no funcobj records its body source yet")
@@ -228,10 +225,14 @@ impl GraphBodyProvider {
                 &self.jitdriver_receiver_roots,
                 &krate.state,
             )
-            .lower_decl(fd, krate.module_filter.as_ref(), None)
+            .build_decl(fd)
         })
-        .ok_or_else(|| {
-            LowerError::Unsupported(format!("{} does not lower", fd.item_meta.name_path()))
+        .map_err(|e| match e {
+            DeclBuildError::NoBody => LowerError::Unsupported(format!(
+                "{}: no Unstructured body",
+                fd.item_meta.name_path()
+            )),
+            DeclBuildError::Lower { error, .. } => error,
         })
     }
 

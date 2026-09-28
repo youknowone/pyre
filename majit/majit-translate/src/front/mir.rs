@@ -1236,24 +1236,11 @@ impl<'l> CrateLowering<'l> {
         function_filter: Option<&std::collections::HashSet<String>>,
     ) -> Option<crate::front::semantic::SemanticFunction> {
         let CrateLoweringState {
-            known_trait_names,
-            struct_field_attrs,
-            tombstoned_leaves,
-            dont_look_inside,
-            elidable_residual,
             not_rpython,
-            spec,
             skipped,
             atomic_load_decls,
             ..
         } = self.state;
-        let Self {
-            llbc,
-            static_addrs,
-            jitdriver_receiver_roots,
-            ref root_stack,
-            ..
-        } = *self;
         // Charon emits static / const initialiser bodies (e.g. the
         // body that builds `static NONE_SINGLETON`) as ordinary
         // `FunDecl` entries whose `src` is `GlobalInitializer` of the
@@ -1268,52 +1255,84 @@ impl<'l> CrateLowering<'l> {
         if fd.is_global_initializer().is_some() {
             return None;
         }
-        // Key each SemanticFunction by bare leaf name plus a separate
-        // `module_path` so `lib.rs`'s `register_function_graph_alias`
-        // walks `{bare, crate::*, pyre_*::*}` correctly and the portal
-        // lookup in `register_configured_jitdrivers` (`["eval_loop_jit"]`)
-        // resolves.
-        let stripped = strip_crate_prefix(&fd.item_meta.name_path());
-        let (module_path, name) = match stripped.rsplit_once("::") {
-            Some((module, leaf)) => (module.to_string(), leaf.to_string()),
-            None => (String::new(), stripped),
-        };
+        let (module_path, name) = decl_module_path_and_name(fd);
         if !should_lower_module(module_filter, &module_path) {
             return None;
         }
         if !should_lower_function(function_filter, &name) {
             return None;
         }
-        let fn_path = if module_path.is_empty() {
-            name.clone()
-        } else {
-            format!("{module_path}::{name}")
-        };
+        let fn_path = decl_fn_path(&module_path, &name);
+        if not_rpython.contains(&fn_path) {
+            return None;
+        }
+        match self.build_decl(fd) {
+            Ok(function) => Some(function),
+            Err(DeclBuildError::NoBody) => {
+                // A declaration with no unstructured body never becomes a
+                // `SemanticFunction`, so it never reaches `function_graphs` and
+                // every callsite resolves it as an unregistered path.  The
+                // lowering errors below are already surfaced by `skipped`; this
+                // arm was the one membership drop that left no trace at all.
+                crate::decline::record_named(
+                    crate::decline::gate::SEMANTIC_FN_LOOP,
+                    "declaration-has-no-unstructured-body",
+                    &fn_path,
+                );
+                None
+            }
+            Err(DeclBuildError::Lower {
+                name,
+                error,
+                atomic_load_reason,
+            }) => {
+                if let Some(reason) = atomic_load_reason {
+                    atomic_load_decls
+                        .borrow_mut()
+                        .push(declined_atomic_load_fun_decl(self.llbc, fd, reason));
+                }
+                skipped.borrow_mut().push((name, error.to_string()));
+                None
+            }
+        }
+    }
+
+    /// Build the function `fd` declares: its header from the declaration,
+    /// then its body. The membership gates are [`Self::lower_decl`]'s.
+    pub(crate) fn build_decl(
+        &self,
+        fd: &'l FunDecl,
+    ) -> Result<crate::front::semantic::SemanticFunction, DeclBuildError> {
+        let CrateLoweringState {
+            known_trait_names,
+            struct_field_attrs,
+            tombstoned_leaves,
+            dont_look_inside,
+            elidable_residual,
+            spec,
+            ..
+        } = self.state;
+        let Self {
+            llbc,
+            static_addrs,
+            jitdriver_receiver_roots,
+            ref root_stack,
+            ..
+        } = *self;
+        let (module_path, name) = decl_module_path_and_name(fd);
+        let fn_path = decl_fn_path(&module_path, &name);
         // A monomorphized copy registers under its instance leaf, as a
         // clause-specialized copy does below; `fn_path` stays the template's
         // for the policy and hint lookups every instance shares.
         let name = instance_leaf(llbc, fd).unwrap_or(name);
-        if not_rpython.contains(&fn_path) {
-            return None;
-        }
         // `FunDecl::body` is raw JSON and `unstructured()` re-parses it on
-        // every call, so hold the one projection this iteration needs: it
-        // is both the "has a lowerable body" gate and the input the
-        // lowering below reads.  Every gate above reads the declaration's
-        // name path or header alone, so they run first and a filtered-out
+        // every call, so hold the one projection this build needs: it is
+        // both the "has a lowerable body" gate and the input the lowering
+        // below reads.  The membership gates read the declaration's name
+        // path or header alone, so they run first and a filtered-out
         // declaration never pays for the parse.
         let Some(mut body) = fd.unstructured() else {
-            // A declaration with no unstructured body never becomes a
-            // `SemanticFunction`, so it never reaches `function_graphs` and
-            // every callsite resolves it as an unregistered path.  The
-            // lowering errors below are already surfaced by `skipped`; this
-            // arm was the one membership drop that left no trace at all.
-            crate::decline::record_named(
-                crate::decline::gate::SEMANTIC_FN_LOOP,
-                "declaration-has-no-unstructured-body",
-                &fn_path,
-            );
-            return None;
+            return Err(DeclBuildError::NoBody);
         };
         elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
         // `return_type` stays `None` for ordinary fns: the Charon
@@ -1375,18 +1394,15 @@ impl<'l> CrateLowering<'l> {
             false,
         ) {
             Ok(g) => g,
-            Err(e) => {
-                let msg = e.to_string();
-                if let Some(reason) = atomic_reasons.first() {
-                    atomic_load_decls
-                        .borrow_mut()
-                        .push(declined_atomic_load_fun_decl(llbc, fd, reason.clone()));
-                }
-                skipped.borrow_mut().push((header.name, msg));
-                return None;
+            Err(error) => {
+                return Err(DeclBuildError::Lower {
+                    name: header.name,
+                    error,
+                    atomic_load_reason: atomic_reasons.into_iter().next(),
+                });
             }
         };
-        Some(header.into_function(graph))
+        Ok(header.into_function(graph))
     }
 
     /// Pop the next queued clause specialization.
@@ -1629,6 +1645,40 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         .lower_all(module_filter, function_filter);
     Ok(state.finish(functions))
 }
+/// Why [`CrateLowering::build_decl`] produced no function.
+pub(crate) enum DeclBuildError {
+    /// The declaration carries no `Unstructured` body.
+    NoBody,
+    /// The body did not lower. `atomic_load_reason` is the first ordered
+    /// atomic load the lowering declined, if any.
+    Lower {
+        name: String,
+        error: LowerError,
+        atomic_load_reason: Option<String>,
+    },
+}
+
+/// A declaration's crate-stripped module path and bare leaf name. Each
+/// SemanticFunction is keyed by the leaf plus a separate `module_path` so
+/// `lib.rs`'s `register_function_graph_alias` walks
+/// `{bare, crate::*, pyre_*::*}` correctly and the portal lookup in
+/// `register_configured_jitdrivers` (`["eval_loop_jit"]`) resolves.
+fn decl_module_path_and_name(fd: &FunDecl) -> (String, String) {
+    let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+    match stripped.rsplit_once("::") {
+        Some((module, leaf)) => (module.to_string(), leaf.to_string()),
+        None => (String::new(), stripped),
+    }
+}
+
+fn decl_fn_path(module_path: &str, name: &str) -> String {
+    if module_path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{module_path}::{name}")
+    }
+}
+
 /// Declaration facts of one function or clause specialization: every
 /// `SemanticFunction` field but the body, plus the `graph.func` fields
 /// [`SemanticFunctionHeader::into_function`] stamps onto the lowered graph.
