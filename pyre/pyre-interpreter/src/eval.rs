@@ -4465,6 +4465,9 @@ impl OpcodeStepExecutor for PyFrame {
             } else {
                 pyre_object::w_none()
             };
+        // `(sub_iter, last_sent_val, exc_value -- none, value)`: the `END_SEND`
+        // this jumps back to pops the pair, as it does SEND's `receiver, value`.
+        self.push(pyre_object::w_none());
         self.push(value);
         Ok(())
     }
