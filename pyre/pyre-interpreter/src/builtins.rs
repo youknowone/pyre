@@ -3104,8 +3104,10 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         make_builtin_function_with_arity(
             "__buffer__",
             |args| {
-                let flags = crate::baseobjspace::c_int_w(args[1])?;
-                w_memoryview_new_native_with_flags(args[0], flags)
+                let mut w_self = args[0];
+                let flags =
+                    pyre_object::with_roots!(w_self => crate::baseobjspace::c_int_w(args[1]))?;
+                w_memoryview_new_native_with_flags(w_self, flags)
             },
             2,
         ),
@@ -8110,7 +8112,11 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) -> Result<(), cra
     // stays in `args_w` and no slot is filled.
     // Pinned as well: on Windows the parse can mint a fresh int, and
     // `getindex_w_written` below can move either one.
-    let errno_slot = os_error_parsed_errno(args).map(|w_errno| {
+    let mut live_args = Vec::with_capacity(args.len());
+    for index in 0..args.len() {
+        live_args.push(pyre_object::gc_roots::shadow_stack_get(args_base + index));
+    }
+    let errno_slot = os_error_parsed_errno(&live_args).map(|w_errno| {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_errno);
         slot
@@ -9180,7 +9186,15 @@ fn os_error_family_new(
         slot
     });
     let cls = cls_slot.map(pyre_object::gc_roots::shadow_stack_get);
-    let exc = ctor(cls, if use_init { &[] } else { positional })?;
+    let mut live_positional = Vec::new();
+    if !use_init {
+        for index in 0..positional.len() {
+            live_positional.push(pyre_object::gc_roots::shadow_stack_get(
+                positional_base + index,
+            ));
+        }
+    }
+    let exc = ctor(cls, &live_positional)?;
     let exc = pyre_object::gc_roots::pin_root(exc);
     let positional: Vec<PyObjectRef> = (0..positional.len())
         .map(|index| pyre_object::gc_roots::shadow_stack_get(positional_base + index))
@@ -9734,14 +9748,17 @@ fn base_exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
 /// `W_BaseException.descr_str` for an arg shape it does not special-case
 /// (`KeyError('a', 'b')`, an `OSError` with neither errno nor strerror).
 fn exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
-    let obj = args[0];
-    let Some(text) = (unsafe { crate::display::exception_kind_str_wtf8(obj)? }) else {
+    let mut obj = args[0];
+    let Some(text) = pyre_object::with_roots!(obj => unsafe {
+        crate::display::exception_kind_str_wtf8(obj)
+    })?
+    else {
         // The subclass has no `descr_str` override for this argument shape,
         // so inherit `W_BaseException.descr_str` as PyPy does.  Calling the
         // object-returning path matters for one argument: `space.str(arg)`
         // preserves an exact str's identity instead of flattening it through
         // WTF-8 and allocating a replacement.
-        return base_exception_str_method(args);
+        return base_exception_str_method(&[obj]);
     };
     // A builtin override (KeyError / OSError / UnicodeError / SyntaxError)
     // constructs a fresh text result.  It is an ordinary GC object, not a
@@ -10849,17 +10866,20 @@ pub fn make_exc_type_multi(
     if let Some(cls) = lookup_exc_class(name) {
         return cls;
     }
-    let cls = crate::typedef::make_builtin_type_with_bases_and_overridetypedef(
-        name,
-        move |ns| {
-            let _roots = pyre_object::gc_roots::push_roots();
-            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(ns);
-            type_ns_store(ns_slot, "__new__", crate::typedef::make_new_descr(new_fn));
-        },
-        bases,
+    let mut w_base0 = bases[0];
+    let cls = pyre_object::with_roots!(w_base0 =>
+        crate::typedef::make_builtin_type_with_bases_and_overridetypedef(
+            name,
+            move |ns| {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(ns);
+                type_ns_store(ns_slot, "__new__", crate::typedef::make_new_descr(new_fn));
+            },
+            bases,
+        )
     );
-    add_weakref_slot(cls, bases[0]);
+    add_weakref_slot(cls, w_base0);
     register_exc_class(name, cls)
 }
 
@@ -11674,8 +11694,9 @@ fn exception_group_subgroup(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             "subgroup() takes exactly one argument",
         ));
     }
-    let condition = exception_group_condition(args[1])?;
-    exception_group_subgroup_inner(args[0], &condition)
+    let mut w_self = args[0];
+    let condition = pyre_object::with_roots!(w_self => exception_group_condition(args[1]))?;
+    exception_group_subgroup_inner(w_self, &condition)
 }
 
 fn exception_group_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -11684,8 +11705,9 @@ fn exception_group_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             "split() takes exactly one argument",
         ));
     }
-    let condition = exception_group_condition(args[1])?;
-    let (yes, no) = exception_group_split_inner(args[0], &condition)?;
+    let mut w_self = args[0];
+    let condition = pyre_object::with_roots!(w_self => exception_group_condition(args[1]))?;
+    let (yes, no) = exception_group_split_inner(w_self, &condition)?;
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[yes, no]);
     Ok(pyre_object::w_tuple_new(vec![
@@ -13087,12 +13109,14 @@ fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // `RootScope::get` are `dont_look_inside`, and the two-argument shape
         // is the one the tracer folds.
         let default_root = pyre_object::gc_roots::push_roots();
-        let default_base = default_root.base();
-        let _ = default_root.pin_root(args[2]);
-        return match crate::baseobjspace::lookup_attr(obj, args[1]) {
+        let base = default_root.pin_roots(&[obj, args[1], args[2]]);
+        return match crate::baseobjspace::lookup_attr(
+            default_root.get(base),
+            default_root.get(base + 1),
+        ) {
             Ok(val) => Ok(val),
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-                Ok(default_root.get(default_base))
+                Ok(default_root.get(base + 2))
             }
             Err(e) => Err(e),
         };
@@ -13836,11 +13860,10 @@ fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // dict default is moved -- see `builtin_getattr`.  Keep the
         // one-argument form free of the slot.
         let default_root = pyre_object::gc_roots::push_roots();
-        let default_base = default_root.base();
-        let _ = default_root.pin_root(args[1]);
-        return match crate::baseobjspace::next(args[0]) {
+        let base = default_root.pin_roots(&[args[0], args[1]]);
+        return match crate::baseobjspace::next(default_root.get(base)) {
             Ok(v) => Ok(v),
-            Err(e) if e.matches_stop_iteration() => Ok(default_root.get(default_base)),
+            Err(e) if e.matches_stop_iteration() => Ok(default_root.get(base + 1)),
             Err(e) => Err(e),
         };
     }
@@ -20827,8 +20850,9 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
         make_builtin_function_with_arity(
             "__iter__",
             |args| {
-                file_check_closed(args[0])?;
-                Ok(args[0])
+                let mut self_obj = args[0];
+                pyre_object::with_roots!(self_obj => file_check_closed(self_obj))?;
+                Ok(self_obj)
             },
             1,
         ),
@@ -20875,8 +20899,9 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
         make_builtin_function_with_arity(
             "readable",
             |args| {
-                file_check_closed(args[0])?;
-                let mode = crate::baseobjspace::getattr_str(args[0], "__file_mode__")
+                let mut self_obj = args[0];
+                pyre_object::with_roots!(self_obj => file_check_closed(self_obj))?;
+                let mode = crate::baseobjspace::getattr_str(self_obj, "__file_mode__")
                     .ok()
                     .and_then(|m| {
                         unsafe { crate::baseobjspace::str_utf8_w(m) }
@@ -20895,8 +20920,9 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
         make_builtin_function_with_arity(
             "writable",
             |args| {
-                file_check_closed(args[0])?;
-                let mode = crate::baseobjspace::getattr_str(args[0], "__file_mode__")
+                let mut self_obj = args[0];
+                pyre_object::with_roots!(self_obj => file_check_closed(self_obj))?;
+                let mode = crate::baseobjspace::getattr_str(self_obj, "__file_mode__")
                     .ok()
                     .and_then(|m| {
                         unsafe { crate::baseobjspace::str_utf8_w(m) }
@@ -20929,15 +20955,15 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                     args.len().saturating_sub(1)
                 )));
             }
-            file_check_closed(args[0])?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let file_slot = pyre_object::gc_roots::pin_roots(args);
+            file_check_closed(pyre_object::gc_roots::shadow_stack_get(file_slot))?;
             // interp_fileio.py:267-275
             // `@unwrap_spec(pos=r_longlong, whence=int)`: both operands
             // go through Python's integer/index conversion before the
             // host lseek.  Reading their object payloads unchecked made a
             // float such as 0.0 look like offset zero instead of raising
             // TypeError (test_io.IOTest.write_ops).
-            let _roots = pyre_object::gc_roots::push_roots();
-            let file_slot = pyre_object::gc_roots::pin_roots(args);
             let offset = crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(
                 file_slot + 1,
             ))?;
@@ -21015,8 +21041,9 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
         make_builtin_function_with_arity(
             "tell",
             |args| {
-                file_check_closed(args[0])?;
-                if let Some(fd) = file_get_fd(args[0]) {
+                let mut self_obj = args[0];
+                pyre_object::with_roots!(self_obj => file_check_closed(self_obj))?;
+                if let Some(fd) = pyre_object::with_roots!(self_obj => file_get_fd(self_obj)) {
                     #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
                     {
                         #[cfg(not(feature = "sandbox"))]
@@ -21043,7 +21070,7 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                         let _ = fd;
                     }
                 }
-                if let Ok(pos) = crate::baseobjspace::getattr_str(args[0], "__file_pos__") {
+                if let Ok(pos) = crate::baseobjspace::getattr_str(self_obj, "__file_pos__") {
                     Ok(pos)
                 } else {
                     Ok(w_int_new(0))
@@ -21184,12 +21211,17 @@ fn fileio_get_mode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 fn fileio_get_blksize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let self_obj = args
+    let mut self_obj = args
         .get(1)
         .copied()
         .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
-    if fileio_stat_field(self_obj, "__file_stat_blksize__").is_some() {
-        fileio_get_slot(args, "__file_blksize__")
+    let mut w_descr = args[0];
+    if pyre_object::with_roots!(w_descr, self_obj =>
+        fileio_stat_field(self_obj, "__file_stat_blksize__")
+    )
+    .is_some()
+    {
+        fileio_get_slot(&[w_descr, self_obj], "__file_blksize__")
     } else {
         Ok(w_int_new(crate::module::_io::DEFAULT_BUFFER_SIZE))
     }
@@ -21814,13 +21846,20 @@ pub unsafe fn fileio_writebuf(
 
 /// PyPy `W_FileIO.read_w` / `readall_w` / `readinto_w` / `write_w`.
 fn fileio_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mut self_obj = args
-        .first()
-        .copied()
-        .ok_or_else(|| crate::PyError::type_error("read() requires self"))?;
-    pyre_object::with_roots!(self_obj => file_check_closed(self_obj))?;
-    file_check_readable(self_obj)?;
-    file_method_read(args)
+    if args.is_empty() {
+        return Err(crate::PyError::type_error("read() requires self"));
+    }
+    // `args` is the gateway's native copy; a collection in the checks does
+    // not forward it.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(args);
+    file_check_closed(roots.get(base))?;
+    file_check_readable(roots.get(base))?;
+    let mut live_args = Vec::with_capacity(args.len());
+    for index in 0..args.len() {
+        live_args.push(roots.get(base + index));
+    }
+    file_method_read(&live_args)
 }
 
 fn fileio_method_readall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -21892,11 +21931,13 @@ fn fileio_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             args.len().saturating_sub(1)
         )));
     }
-    file_check_closed(args[0])?;
-    file_check_writable(args[0])?;
+    let mut self_obj = args[0];
+    let mut w_data = args[1];
+    pyre_object::with_roots!(self_obj, w_data => file_check_closed(self_obj))?;
+    pyre_object::with_roots!(self_obj, w_data => file_check_writable(self_obj))?;
     // `space.bufferstr_w`, unlike TextIOWrapper.write, rejects str.
-    unsafe { file_write_buffer_bytes(args[1]) }?;
-    file_method_write(args)
+    unsafe { file_write_buffer_bytes(w_data) }?;
+    file_method_write(&[self_obj, w_data])
 }
 
 fn fileio_method_truncate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -22034,17 +22075,19 @@ fn file_method_isatty(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 }
 
 fn fileio_method_isatty_open_only(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let self_obj = args
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut self_obj = args
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("_isatty_open_only() requires self"))?;
     #[cfg(unix)]
-    if let Some(mode) = fileio_stat_field(self_obj, "__file_stat_mode__")
-        && mode as u32 & libc::S_IFMT as u32 != libc::S_IFCHR as u32
+    if let Some(mode) = pyre_object::with_roots!(self_obj =>
+        fileio_stat_field(self_obj, "__file_stat_mode__")
+    ) && mode as u32 & libc::S_IFMT as u32 != libc::S_IFCHR as u32
     {
         return Ok(w_bool_from(false));
     }
-    file_method_isatty(args)
+    file_method_isatty(&[self_obj])
 }
 
 fn file_method_seekable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -22403,14 +22446,27 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     if args.is_empty() {
         return Err(crate::PyError::type_error("read() requires self"));
     }
-    file_check_closed(args[0])?;
-    file_check_readable(args[0])?;
-    if let Some(fd) = file_get_fd(args[0]) {
-        let n = match args.get(1).copied() {
+    // `args` is the gateway's native copy; a collection in the checks and
+    // lookups below does not forward it.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[
+        args[0],
+        args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+    ]);
+    file_check_closed(roots.get(base))?;
+    file_check_readable(roots.get(base))?;
+    if let Some(fd) = file_get_fd(roots.get(base)) {
+        let w_size = if args.len() >= 2 {
+            Some(roots.get(base + 1))
+        } else {
+            None
+        };
+        let n = match w_size {
             None => None,
             Some(value) if unsafe { pyre_object::is_none(value) } => None,
             Some(value) => {
-                let value = crate::baseobjspace::int_w(crate::baseobjspace::space_index(value)?)?;
+                let value = crate::baseobjspace::space_index(value)?;
+                let value = crate::baseobjspace::int_w(value)?;
                 // `_io_FileIO_read_impl` clamps the request to `_PY_READ_MAX`
                 // before it allocates, so a size past it reads that much
                 // rather than failing to reserve the whole of it.
@@ -22421,18 +22477,19 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         {
             return match n {
                 Some(n) => match fd_read(fd, n)? {
-                    Some(data) => fd_bytes_to_obj(args[0], data),
+                    Some(data) => fd_bytes_to_obj(roots.get(base), data),
                     None => Ok(w_none()),
                 },
-                None => match fileio_readall(args[0], fd)? {
-                    Some(data) => fd_bytes_to_obj(args[0], data),
+                None => match fileio_readall(roots.get(base), fd)? {
+                    Some(data) => fd_bytes_to_obj(roots.get(base), data),
                     None => Ok(w_none()),
                 },
             };
         }
         #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
         {
-            return fd_bytes_to_obj(args[0], wasm_fd::fd_take(fd, n)?);
+            let data = wasm_fd::fd_take(fd, n)?;
+            return fd_bytes_to_obj(roots.get(base), data);
         }
         #[cfg(not(feature = "host_env"))]
         {
@@ -22442,11 +22499,11 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             ));
         }
     }
-    let data = file_get_data(args[0]);
-    let pos = file_get_pos(args[0]).min(data.len());
+    let data = file_get_data(roots.get(base));
+    let pos = file_get_pos(roots.get(base)).min(data.len());
     let remaining = &data[pos..];
     let n = if args.len() >= 2 {
-        let n_val = unsafe { pyre_object::w_int_get_value(args[1]) };
+        let n_val = unsafe { pyre_object::w_int_get_value(roots.get(base + 1)) };
         if n_val < 0 {
             remaining.len()
         } else {
@@ -22458,27 +22515,40 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     // Count by bytes; binary mode hands back `bytes`, text mode `str`.
     let end = n.min(remaining.len());
     let chunk = remaining[..end].to_vec();
-    file_set_pos(args[0], pos + end);
-    fd_bytes_to_obj(args[0], chunk)
+    file_set_pos(roots.get(base), pos + end);
+    fd_bytes_to_obj(roots.get(base), chunk)
 }
 
 fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Err(crate::PyError::type_error("readline() requires self"));
     }
-    file_check_closed(args[0])?;
-    file_check_readable(args[0])?;
+    // `args` is the gateway's native copy; a collection in the checks and
+    // lookups below does not forward it.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[
+        args[0],
+        args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+    ]);
+    file_check_closed(roots.get(base))?;
+    file_check_readable(roots.get(base))?;
     // Optional size cap (`readline(size)`): stop after `size` bytes even
     // before a newline. A missing or negative size means no cap.
-    let max = match args.get(1).copied() {
+    let w_size = if args.len() >= 2 {
+        Some(roots.get(base + 1))
+    } else {
+        None
+    };
+    let max = match w_size {
         None => None,
         Some(value) if unsafe { pyre_object::is_none(value) } => None,
         Some(value) => {
-            let value = crate::baseobjspace::int_w(crate::baseobjspace::space_index(value)?)?;
+            let value = crate::baseobjspace::space_index(value)?;
+            let value = crate::baseobjspace::int_w(value)?;
             (value >= 0).then_some(value as usize)
         }
     };
-    if let Some(fd) = file_get_fd(args[0]) {
+    if let Some(fd) = file_get_fd(roots.get(base)) {
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
             // Raw fds cannot un-read, so consume one byte at a time up to
@@ -22504,7 +22574,7 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                     break;
                 }
             }
-            return fd_bytes_to_obj(args[0], out);
+            return fd_bytes_to_obj(roots.get(base), out);
         }
         #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
         {
@@ -22518,7 +22588,7 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 .map(|i| i + 1)
                 .unwrap_or(rest.len());
             wasm_fd::fd_lseek(fd, start + end as i64, 0)?;
-            return fd_bytes_to_obj(args[0], rest[..end].to_vec());
+            return fd_bytes_to_obj(roots.get(base), rest[..end].to_vec());
         }
         #[cfg(not(feature = "host_env"))]
         {
@@ -22528,10 +22598,10 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             ));
         }
     }
-    let data = file_get_data(args[0]);
-    let pos = file_get_pos(args[0]);
+    let data = file_get_data(roots.get(base));
+    let pos = file_get_pos(roots.get(base));
     if pos >= data.len() {
-        return fd_bytes_to_obj(args[0], Vec::new());
+        return fd_bytes_to_obj(roots.get(base), Vec::new());
     }
     let rest = &data[pos..];
     let mut end = rest
@@ -22543,19 +22613,25 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         end = end.min(m);
     }
     let line = rest[..end].to_vec();
-    file_set_pos(args[0], pos + end);
-    fd_bytes_to_obj(args[0], line)
+    file_set_pos(roots.get(base), pos + end);
+    fd_bytes_to_obj(roots.get(base), line)
 }
 
 fn file_method_readlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Err(crate::PyError::type_error("readlines() requires self"));
     }
+    let args_roots = pyre_object::gc_roots::push_roots();
+    let args_base = args_roots.pin_roots(args);
     // Every line is freshly allocated and the next `readline` allocates again,
     // so they are pinned as they arrive (`build_list_storage`).
     let mut lines = pyre_object::gc_roots::RootedItems::new();
     loop {
-        let line = file_method_readline(args)?;
+        let mut live_args = Vec::with_capacity(args.len());
+        for index in 0..args.len() {
+            live_args.push(args_roots.get(args_base + index));
+        }
+        let line = file_method_readline(&live_args)?;
         // readline returns `bytes` in binary mode and `str` otherwise; an
         // empty result of either kind marks EOF.
         let empty = unsafe {
@@ -22655,19 +22731,23 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     if args.len() < 2 {
         return Err(crate::PyError::type_error("write() requires (self, data)"));
     }
-    file_check_closed(args[0])?;
-    file_check_writable(args[0])?;
-    if let Some(fd) = file_get_fd(args[0]) {
+    // `args` is the gateway's native copy; a collection in the checks,
+    // lookups and encoding below does not forward it.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&args[..2]);
+    file_check_closed(roots.get(base))?;
+    file_check_writable(roots.get(base))?;
+    if let Some(fd) = file_get_fd(roots.get(base)) {
         let bytes: Vec<u8> = unsafe {
-            if pyre_object::is_str(args[1]) {
+            if pyre_object::is_str(roots.get(base + 1)) {
                 // Encode through the stream's codec + error handler; a lone
                 // surrogate is routed to the handler (`strict` →
                 // UnicodeEncodeError) rather than panicking in
                 // `w_str_get_value`.
-                let (encoding, errors) = stream_encoding_errors(args[0]);
-                crate::type_methods::encode_object(args[1], &encoding, &errors)?
+                let (encoding, errors) = stream_encoding_errors(roots.get(base));
+                crate::type_methods::encode_object(roots.get(base + 1), &encoding, &errors)?
             } else {
-                file_write_buffer_bytes(args[1])?
+                file_write_buffer_bytes(roots.get(base + 1))?
             }
         };
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
@@ -22716,38 +22796,37 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // bytes in place and produced an archive whose central directory pointed
     // at a non-`PK\x03\x04` local header.
     unsafe {
-        let mut prev = file_get_data(args[0]);
-        let (bytes, len) = if pyre_object::is_str(args[1]) {
+        let mut prev = file_get_data(roots.get(base));
+        let (bytes, len) = if pyre_object::is_str(roots.get(base + 1)) {
             // Encode through the stream's codec + error handler so a lone
             // surrogate raises (`strict`) instead of panicking in
             // `w_str_get_value`. The reported count is characters written.
-            let (encoding, errors) = stream_encoding_errors(args[0]);
-            let bytes = crate::type_methods::encode_object(args[1], &encoding, &errors)?;
-            (bytes, pyre_object::w_str_len(args[1]))
+            let (encoding, errors) = stream_encoding_errors(roots.get(base));
+            let bytes =
+                crate::type_methods::encode_object(roots.get(base + 1), &encoding, &errors)?;
+            (bytes, pyre_object::w_str_len(roots.get(base + 1)))
         } else {
-            let data = file_write_buffer_bytes(args[1])?;
+            let data = file_write_buffer_bytes(roots.get(base + 1))?;
             let len = data.len();
             (data, len)
         };
-        let append = crate::baseobjspace::getattr_str(args[0], "__file_mode__")
+        let append = crate::baseobjspace::getattr_str(roots.get(base), "__file_mode__")
             .ok()
             .map(|mode| pyre_object::w_str_get_wtf8(mode).as_bytes().contains(&b'a'))
             .unwrap_or(false);
         let pos = if append {
             prev.len()
         } else {
-            file_get_pos(args[0])
+            file_get_pos(roots.get(base))
         };
         let end = file_write_at(&mut prev, pos, &bytes)?;
-        let _ = crate::baseobjspace::setattr_str(
-            args[0],
-            "__file_data__",
-            pyre_object::bytesobject::w_bytes_from_bytes(&prev),
-        );
-        file_set_pos(args[0], end);
-        let _ = crate::baseobjspace::setattr_str(args[0], "__file_dirty__", w_bool_from(true));
+        let w_data = pyre_object::bytesobject::w_bytes_from_bytes(&prev);
+        let _ = crate::baseobjspace::setattr_str(roots.get(base), "__file_data__", w_data);
+        file_set_pos(roots.get(base), end);
+        let _ =
+            crate::baseobjspace::setattr_str(roots.get(base), "__file_dirty__", w_bool_from(true));
         if !append {
-            file_flush_dirty(args[0])?;
+            file_flush_dirty(roots.get(base))?;
         }
         Ok(w_int_new(len as i64))
     }
@@ -22781,13 +22860,13 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     if args.is_empty() {
         return Ok(w_none());
     }
-    if file_is_closed(args[0]) {
-        return Ok(w_none());
-    }
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(args[0]);
     let current = || pyre_object::gc_roots::shadow_stack_get(self_slot);
+    if file_is_closed(current()) {
+        return Ok(w_none());
+    }
     fileio_clear_stat_atopen(current());
 
     // `W_FileIO.close_w` first runs `W_RawIOBase.close_w`, whose IOBase
@@ -22906,13 +22985,14 @@ fn file_method_flush(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // states `iobase.c`'s sentence -- the one ending in a period -- rather than
     // the raw layer's.  `BufferedReader.flush` hands its call here, so it is
     // what a closed reader reports too.
-    if file_is_closed(args[0]) {
+    let mut self_obj = args[0];
+    if pyre_object::with_roots!(self_obj => file_is_closed(self_obj)) {
         return Err(crate::PyError::value_error("I/O operation on closed file."));
     }
-    if file_get_fd(args[0]).is_some() {
+    if pyre_object::with_roots!(self_obj => file_get_fd(self_obj)).is_some() {
         return Ok(w_none());
     }
-    file_flush_dirty(args[0])?;
+    file_flush_dirty(self_obj)?;
     Ok(w_none())
 }
 
@@ -25082,13 +25162,21 @@ pub(crate) fn call_forwarding_args(
 /// `app_breakpoint.py breakpoint` — forward to `sys.breakpointhook`, which
 /// must accept whatever arguments are passed.  By default that drops into pdb.
 fn builtin_breakpoint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `args` is the gateway's native copy; a collection in the hook lookup
+    // does not forward it.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(args);
     let Some(sys) = crate::importing::get_interpreter_sys_module() else {
         return Err(crate::PyError::runtime_error("lost sys.breakpointhook"));
     };
     let Ok(hook) = crate::baseobjspace::getattr_str(sys, "breakpointhook") else {
         return Err(crate::PyError::runtime_error("lost sys.breakpointhook"));
     };
-    call_forwarding_args(hook, args)
+    let mut live_args = Vec::with_capacity(args.len());
+    for index in 0..args.len() {
+        live_args.push(roots.get(base + index));
+    }
+    call_forwarding_args(hook, &live_args)
 }
 
 /// — PyPy: `_frozen_importlib/interp_import.py:interp___import__`.
