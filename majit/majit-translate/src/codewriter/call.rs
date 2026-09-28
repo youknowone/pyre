@@ -1028,7 +1028,8 @@ impl GraphStore {
     /// hint-less first insert drops metadata a later alias carried.  The
     /// signature stays that of the shared graph, which the aliases resolve
     /// to anyway.
-    pub(crate) fn insert(&mut self, path: CallPath, graph: FunctionGraph) {
+    pub(crate) fn insert(&mut self, path: CallPath, graph: impl Into<std::rc::Rc<FunctionGraph>>) {
+        let graph = graph.into();
         let key = (
             graph
                 .source_identity
@@ -1037,6 +1038,9 @@ impl GraphStore {
             graph.name.clone(),
         );
         match self.graphs.get_mut(&key) {
+            // Another alias of the very graph object already stored: the
+            // fold below would be a no-op.
+            Some(existing) if std::rc::Rc::ptr_eq(&existing.graph, &graph) => {}
             Some(existing) => {
                 let existing = std::rc::Rc::make_mut(&mut existing.graph);
                 existing.func.merge_from(&graph.func);
@@ -1049,7 +1053,7 @@ impl GraphStore {
                 existing.access_directly |= graph.access_directly;
                 crate::front::llbc_hints::merge_hints_into_graph(existing, &graph.hints);
                 if existing.return_type.is_none() {
-                    existing.return_type = graph.return_type;
+                    existing.return_type = graph.return_type.clone();
                 }
                 if existing.fun_decl_id.is_none() {
                     existing.fun_decl_id = graph.fun_decl_id;
@@ -1057,13 +1061,8 @@ impl GraphStore {
             }
             None => {
                 let signature = Self::signature_from_graph(&graph);
-                self.graphs.insert(
-                    key.clone(),
-                    GraphSlot {
-                        graph: std::rc::Rc::new(graph),
-                        signature,
-                    },
-                );
+                self.graphs
+                    .insert(key.clone(), GraphSlot { graph, signature });
             }
         }
         self.path_to_key.insert(path, key);
@@ -3634,7 +3633,11 @@ impl CallControl {
 
     /// Insert into `function_graphs`. All graph writes go through this
     /// helper so pending external-funcobj marks fold onto the graph.
-    fn insert_function_graph_indexed(&mut self, path: CallPath, mut graph: FunctionGraph) {
+    fn insert_function_graph_indexed(
+        &mut self,
+        path: CallPath,
+        mut graph: std::rc::Rc<FunctionGraph>,
+    ) {
         // Fold any effect marks recorded before the graph existed: a
         // `mark_*` called ahead of registration lands on the graph-less
         // external funcobj record for `path`; carry it onto `graph.func`
@@ -3642,7 +3645,7 @@ impl CallControl {
         // (RPython attaches `func` attributes regardless of when the
         // graph is discovered).
         if let Some(pending) = self.external_funcobjs.remove(&path) {
-            graph.func.merge_from(&pending);
+            std::rc::Rc::make_mut(&mut graph).func.merge_from(&pending);
         }
         self.function_graphs.insert(path.clone(), graph);
     }
@@ -3705,8 +3708,12 @@ impl CallControl {
 
     /// Register a free function graph.
     /// RPython: graphs are discovered via funcptr linkage.
-    pub fn register_function_graph(&mut self, path: CallPath, graph: FunctionGraph) {
-        self.insert_function_graph_indexed(path.clone(), graph);
+    pub fn register_function_graph(
+        &mut self,
+        path: CallPath,
+        graph: impl Into<std::rc::Rc<FunctionGraph>>,
+    ) {
+        self.insert_function_graph_indexed(path.clone(), graph.into());
         // The deferred `Some([])` marker is resolvable as soon as its
         // `(trait, method)` impls are registered. Fill it on the stored
         // graph so a later analyzer does not fold the empty family to
@@ -3723,6 +3730,28 @@ impl CallControl {
             function_graphs,
             ..
         } = self;
+        let fillable = |graphs: &Option<Vec<CallPath>>, family_key: &Option<(String, String)>| {
+            graphs.as_deref().is_some_and(<[_]>::is_empty)
+                && family_key
+                    .as_ref()
+                    .is_some_and(|(trait_root, method_name)| {
+                        trait_method_impls
+                            .get(&(trait_root.clone(), method_name.clone()))
+                            .is_some_and(|impls| !impls.is_empty())
+                    })
+        };
+        // Look before writing: the stored graph can be shared with its
+        // other aliases and with the pending lift.
+        let Some(graph) = function_graphs.get(path) else {
+            return;
+        };
+        let any_fillable = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(&op.kind, OpKind::IndirectCall { graphs, family_key, .. }
+                if fillable(graphs, family_key))
+        });
+        if !any_fillable {
+            return;
+        }
         let Some(graph) = function_graphs.get_mut(path) else {
             return;
         };
@@ -3792,10 +3821,16 @@ impl CallControl {
     pub fn register_function_graph_with_hints(
         &mut self,
         path: CallPath,
-        mut graph: FunctionGraph,
+        graph: impl Into<std::rc::Rc<FunctionGraph>>,
         hints: Vec<String>,
     ) {
-        crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &hints);
+        let mut graph = graph.into();
+        if hints.iter().any(|hint| !graph.hints.contains(hint)) {
+            crate::front::llbc_hints::merge_hints_into_graph(
+                std::rc::Rc::make_mut(&mut graph),
+                &hints,
+            );
+        }
         self.register_function_graph(path, graph);
     }
 
@@ -3977,7 +4012,7 @@ impl CallControl {
         method_name: &str,
         trait_root: Option<&str>,
         impl_type: &str,
-        graph: FunctionGraph,
+        graph: impl Into<std::rc::Rc<FunctionGraph>>,
     ) {
         if let Some(trait_root) = trait_root {
             self.register_trait_family_member(method_name, trait_root, impl_type);
@@ -3996,7 +4031,7 @@ impl CallControl {
             // Each impl method registers exactly once under a distinct
             // qualified path; its `owner_root = Some(impl_type)` keeps it
             // separate from other impls' same-named methods.
-            self.insert_function_graph_indexed(qualified_path, graph);
+            self.insert_function_graph_indexed(qualified_path, graph.into());
         }
     }
 

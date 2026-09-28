@@ -707,12 +707,12 @@ pub fn analyze_multiple_pipeline_from_llbc_with_modules(
 fn register_function_graph_alias(
     graphs: &mut std::collections::HashMap<
         crate::parse::CallPath,
-        std::sync::Arc<crate::model::FunctionGraph>,
+        std::rc::Rc<crate::model::FunctionGraph>,
     >,
     sources: &mut std::collections::HashMap<crate::parse::CallPath, String>,
     path: crate::parse::CallPath,
     source_name: &str,
-    graph: &std::sync::Arc<crate::model::FunctionGraph>,
+    graph: &std::rc::Rc<crate::model::FunctionGraph>,
 ) {
     if let Some(prev) = sources.get(&path) {
         assert!(
@@ -724,7 +724,7 @@ fn register_function_graph_alias(
         return;
     }
     sources.insert(path.clone(), source_name.to_string());
-    graphs.insert(path, std::sync::Arc::clone(graph));
+    graphs.insert(path, std::rc::Rc::clone(graph));
 }
 
 /// Compute the full alias spelling set for a free function lifted
@@ -1389,16 +1389,24 @@ fn analyze_pipeline_from_module_paths(
     // RPython: use the rtyped graphs (with concretetype info) for all analysis.
     // Use program.functions' graphs which were built with full struct_fields
     // context, NOT re-parsed graphs (which lose array_type_id etc.).
-    for func in &program.functions {
+    // One graph object per free function, shared by every alias spelling
+    // and by the hint registration below: upstream's aliases name the same
+    // Python graph object.
+    let mut free_function_graphs: Vec<Option<std::rc::Rc<model::FunctionGraph>>> =
+        vec![None; program.functions.len()];
+    for (index, func) in program.functions.iter().enumerate() {
         if func.self_ty_root.is_none() {
             // Stamp the source return type onto the graph so the JIT
             // codewriter signature validator reads `FUNC.RESULT`
             // directly off the callee graph (RPython
             // `funcptr._obj.TO.RESULT`).
-            let graph = std::sync::Arc::new(match &func.return_type {
+            let mut graph = match &func.return_type {
                 Some(rt) => func.graph.clone().with_return_type(rt),
                 None => func.graph.clone(),
-            });
+            };
+            crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &func.hints);
+            let graph = std::rc::Rc::new(graph);
+            free_function_graphs[index] = Some(graph.clone());
             // Free function: register under every canonical alias
             // spelling computed by `free_function_alias_paths` — bare
             // segments, `crate::` prefix, three pyre-crate prefixes,
@@ -1689,7 +1697,7 @@ fn analyze_pipeline_from_module_paths(
         // `insert_function_graph_indexed` can fold that spelling's pending
         // external-funcobj effects onto the one stored graph; `GraphStore`
         // keys on the funcobj, so the copy is transient.
-        call_control.register_function_graph(path.clone(), graph.as_ref().clone());
+        call_control.register_function_graph(path.clone(), graph.clone());
     }
     prof.mark("  register_function_graph (free fns)");
     // RPython `CallControl.graphs_from` obtains the graph from the concrete
@@ -1740,13 +1748,12 @@ fn analyze_pipeline_from_module_paths(
     // hint set.  Missing the source-module-qualified aliases silently
     // disables `_jit_look_inside_` etc. for module-qualified callers,
     // which `CallControl::find_all_graphs` looks up by callee path.
-    for func in &program.functions {
+    for (func, graph) in program.functions.iter().zip(&free_function_graphs) {
         if func.self_ty_root.is_some() || func.hints.is_empty() {
             continue;
         }
-        let graph = match &func.return_type {
-            Some(rt) => func.graph.clone().with_return_type(rt),
-            None => func.graph.clone(),
+        let Some(graph) = graph else {
+            continue;
         };
         for path in free_function_alias_paths(&func.name, &func.module_path) {
             call_control.register_function_graph_with_hints(
