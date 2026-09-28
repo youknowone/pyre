@@ -2228,7 +2228,8 @@ impl UnrollOptimizer {
         // an appended static-scalar slot is exactly `GetfieldGc*(frame, descr)`
         // — the load the preamble itself performed before the optimizer folded
         // it onto the seeded slot. Appends outside that window record nothing;
-        // the LABEL/JUMP contract is `vable_label_arg_recipes`.
+        // the LABEL/JUMP contract is `vable_label_arg_recipes`, and a token
+        // with an append left uncovered is marked `label_tail_unrebuildable`.
         //
         // The list is all-or-nothing: the recipes rebuild a contiguous LABEL
         // tail, so one append with no recipe leaves the close short anyway and
@@ -2258,6 +2259,7 @@ impl UnrollOptimizer {
                         .unwrap_or_default()
                 })
                 .unwrap_or_default();
+            target.label_tail_unrebuildable = recipes.len() != appended_label_args.len();
             if !target.vable_label_arg_recipes.is_empty() || !recipes.is_empty() {
                 target.vable_label_arg_recipes = recipes;
                 target.mark_minor_scan_pending();
@@ -3742,6 +3744,16 @@ impl OptUnroll {
                 Some(vs) => vs,
                 None => continue,
             };
+            // A LABEL arg appended without a recipe is one no close can
+            // supply: the JUMP would land short of the LABEL.
+            if target_token.label_tail_unrebuildable {
+                if crate::log_jtet_enabled() {
+                    eprintln!(
+                        "[jit][jte] target_token #{tt_idx} skipped: LABEL tail has no recipe",
+                    );
+                }
+                continue;
+            }
 
             // RPython unroll.py:333: patchguardop = self.optimizer.patchguardop
             // Ensure ctx.patchguardop is set before generate_guards so that
@@ -10062,6 +10074,41 @@ mod tests {
             vs.is_some(),
             "the only target token needed extra guards it could not stamp, so it \
              must be declined and the caller left to jump_to_preamble"
+        );
+    }
+
+    #[test]
+    fn jump_to_existing_trace_skips_a_target_whose_label_tail_has_no_recipe() {
+        use crate::history::TargetToken;
+        use crate::optimizeopt::virtualstate::{VirtualState, VirtualStateInfo};
+
+        let mut optimizer = Optimizer::new();
+        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(1, 0);
+        let arg = rooted_resop_operand(Type::Int, 11).to_opref();
+
+        // The virtual states match exactly, so the only reason to decline is
+        // the LABEL slot no close can deliver.
+        let incoming = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
+        let mut target_tokens = vec![TargetToken::new_loop(1)];
+        target_tokens[0].virtual_state = Some(VirtualState::new(vec![VirtualStateInfo::Unknown(
+            Type::Int,
+        )]));
+        target_tokens[0].label_tail_unrebuildable = true;
+
+        let vs = OptUnroll::default().jump_to_existing_trace_with_vs(
+            &[arg],
+            None,
+            &mut target_tokens,
+            &mut optimizer,
+            &mut ctx,
+            false,
+            &[OpRef::const_int(5)],
+            Some(incoming),
+        );
+        assert!(
+            vs.is_some(),
+            "a JUMP to this target would be short of its LABEL, so the caller \
+             must be left to jump_to_preamble"
         );
     }
 
