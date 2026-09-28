@@ -5130,6 +5130,22 @@ pub fn decode_box(
 
 #[cfg(test)]
 mod tests {
+    /// `resume.py` `_prepare_next_section` calls `get_live_vars_info`.
+    /// An undecodable pc raises `MissingLiveness` instead of yielding
+    /// empty banks.
+    #[test]
+    #[should_panic(expected = "missing liveness[0]")]
+    fn read_frame_liveness_reg_indices_reports_missing_liveness() {
+        let core = majit_jitcode::jitcode::JitCode::new("no-live");
+        core.set_body(majit_jitcode::jitcode::JitCodeBody {
+            code: vec![0x00],
+            startpoints: Some([0].into_iter().collect()),
+            ..majit_jitcode::jitcode::JitCodeBody::default()
+        });
+        let jitcode = crate::jitcode::JitCode::from_canonical(core);
+        let _ = super::read_frame_liveness_reg_indices(&jitcode, 0, 42, &[]);
+    }
+
     /// A collection between two guards of one optimizer moves a `ConstPtr`
     /// the memo already pooled. The walk must forward the pool entry and
     /// re-key `refs`, so the next guard's `getconst_ref` answers the moved
@@ -8042,7 +8058,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                     bh.position,
                     majit_ir::Type::Int,
                     reg_idx,
-                    bh.jitcode.num_regs_i(),
+                    bh.jitcode.num_regs_and_consts_i(),
                 );
                 bh.registers_i[reg_idx as usize] = self.next_int();
             }
@@ -8057,7 +8073,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                     bh.position,
                     majit_ir::Type::Ref,
                     reg_idx,
-                    bh.jitcode.num_regs_r(),
+                    bh.jitcode.num_regs_and_consts_r(),
                 );
                 let value = self.next_ref_for_resume_slot();
                 bh.registers_r[reg_idx as usize] = value;
@@ -8076,7 +8092,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                     bh.position,
                     majit_ir::Type::Float,
                     reg_idx,
-                    bh.jitcode.num_regs_f(),
+                    bh.jitcode.num_regs_and_consts_f(),
                 );
                 bh.registers_f[reg_idx as usize] = self.next_float();
             }
@@ -8204,9 +8220,9 @@ impl<'a> ResumeDataDirectReader<'a> {
                 &jitcode.name,
                 resolved_pc,
                 (
-                    jitcode.num_regs_i(),
-                    jitcode.num_regs_r(),
-                    jitcode.num_regs_f(),
+                    jitcode.num_regs_and_consts_i(),
+                    jitcode.num_regs_and_consts_r(),
+                    jitcode.num_regs_and_consts_f(),
                 ),
                 |_kind, _reg_idx, value| {
                     outputs.push(value);
@@ -8592,38 +8608,16 @@ impl FrameLivenessRegIndices {
 /// this; it drives `enumerate_vars` once and pairs each index with the next
 /// rebuilt value in the callback.
 ///
-/// Returns empty banks when `pc` is not a decodable liveness startpoint
-/// (`JitCode::can_decode_live_vars` is false, or the three length bytes do
-/// not fit in `all_liveness`). `JitCode::get_live_vars_info` asserts on a
-/// missing startpoint (`MissingLiveness`); a frame resuming through the
-/// Python pc legitimately has no JitCode liveness at this coordinate, so
-/// this declines instead of panicking. An empty return can mask a genuinely
-/// bad resume coordinate (the caller then seeds nothing), so each decline
-/// is logged under `MAJIT_BRIDGE_DEBUG`.
+/// `resume.py` `_prepare_next_section` calls `get_live_vars_info`, which
+/// raises `MissingLiveness` when `pc` is not a `-live-` startpoint. An
+/// undecodable pc is that failure, not an empty live set.
 pub fn read_frame_liveness_reg_indices(
     jitcode: &crate::jitcode::JitCode,
     pc: usize,
     op_live: u8,
     all_liveness: &[u8],
 ) -> FrameLivenessRegIndices {
-    if !jitcode.can_decode_live_vars(pc, op_live) {
-        if crate::bridge_debug_enabled() {
-            eprintln!(
-                "[bridgeB] read_frame_liveness_reg_indices: no liveness startpoint at pc={pc} op_live={op_live} — declining (empty banks)"
-            );
-        }
-        return FrameLivenessRegIndices::default();
-    }
     let info = jitcode.get_live_vars_info(pc, op_live);
-    if info + 2 >= all_liveness.len() {
-        if crate::bridge_debug_enabled() {
-            eprintln!(
-                "[bridgeB] read_frame_liveness_reg_indices: liveness info {info} out of range (len={}) at pc={pc} — declining (empty banks)",
-                all_liveness.len()
-            );
-        }
-        return FrameLivenessRegIndices::default();
-    }
     // `enumerate_vars` yields exactly these many indices per bank.
     let mut int = Vec::with_capacity(all_liveness[info] as usize);
     let mut ref_ = Vec::with_capacity(all_liveness[info + 1] as usize);

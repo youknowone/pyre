@@ -730,10 +730,11 @@ impl JitCode {
         // assert on `_alllabels is not None` — `pc in None` would raise
         // TypeError; the contract is that any jitcode reaching
         // `follow_jump` was assembled (so `_alllabels = Some(set)`).
-        // `debug_assert!` mirrors the non-translated guard — fires in
-        // dev/test builds, elided in release just like RPython skips
-        // the check post-translation.
-        debug_assert!(
+        // pyre is the untranslated analogue, so `assert position in
+        // self._alllabels` (`jitcode.py` `JitCode.follow_jump`) stays
+        // on in every build. `pc in None` is a TypeError upstream;
+        // a missing set panics here for the same reason.
+        assert!(
             self.alllabels
                 .as_ref()
                 .expect("follow_jump: _alllabels is None on a non-assembled jitcode")
@@ -766,36 +767,38 @@ impl JitCode {
     /// `blackhole.py`). The result is the offset into the metainterp's
     /// `all_liveness` table.
     pub fn get_live_vars_info(&self, pc: usize, op_live: u8) -> usize {
-        // RPython `jitcode.py:85-90`: `if not we_are_translated(): assert
-        // pc in self._startpoints`. Pyre is "non-translated" today so the
-        // assertion fires in both canonical and runtime jitcodes — the
-        // runtime `JitCodeBuilder` populates `startpoints` from each
-        // opcode emit position. PyPy does not gate on `_startpoints is
-        // not None` here — `pc in None` would raise TypeError; the
-        // contract is that any jitcode whose liveness map is consulted
-        // was assembled (`_startpoints = Some(set)`).
-        debug_assert!(
+        // `jitcode.py` `JitCode.get_live_vars_info`: `if not
+        // we_are_translated(): assert pc in self._startpoints`. Pyre is
+        // the untranslated analogue, so the assert stays on in every
+        // build. PyPy does not gate on `_startpoints is not None` —
+        // `pc in None` would raise TypeError; a jitcode whose liveness
+        // is consulted was assembled (`_startpoints = Some(set)`).
+        self.assert_startpoint(pc);
+        let mut pc = pc;
+        if self.code[pc] != op_live {
+            // `pc -= OFFSET_SIZE + 1`. A short pc cannot name a previous
+            // `-live-`; that is `_missing_liveness`, not a wrapped index.
+            let Some(back) = pc.checked_sub(super::liveness::OFFSET_SIZE + 1) else {
+                self.missing_liveness(pc);
+            };
+            pc = back;
+            self.assert_startpoint(pc);
+            if self.code[pc] != op_live {
+                self.missing_liveness(pc);
+            }
+        }
+        super::liveness::decode_offset(&self.code, pc + 1)
+    }
+
+    /// `jitcode.py` `JitCode.get_live_vars_info`: `assert pc in self._startpoints`.
+    fn assert_startpoint(&self, pc: usize) {
+        assert!(
             self.startpoints
                 .as_ref()
                 .expect("get_live_vars_info: _startpoints is None on a non-assembled jitcode")
                 .contains(&pc),
             "pc not in startpoints",
         );
-        let mut pc = pc;
-        if self.code[pc] != op_live {
-            pc -= super::liveness::OFFSET_SIZE + 1;
-            debug_assert!(
-                self.startpoints
-                    .as_ref()
-                    .expect("get_live_vars_info: _startpoints is None on a non-assembled jitcode")
-                    .contains(&pc),
-                "pc not in startpoints",
-            );
-            if self.code[pc] != op_live {
-                self.missing_liveness(pc);
-            }
-        }
-        super::liveness::decode_offset(&self.code, pc + 1)
     }
 
     /// `True` when `pc` is a recorded resume startpoint (`jitcode.py:85`
@@ -849,7 +852,15 @@ impl JitCode {
     ///     raise MissingLiveness(...)
     /// ```
     fn missing_liveness(&self, pc: usize) -> ! {
-        panic!("missing liveness[{pc}] in {}", self.name);
+        // `jitcode.py` `JitCode._missing_liveness`. Untranslated builds
+        // raise `MissingLiveness` with `self.dump()`; translated builds
+        // print and raise `AssertionError`. pyre takes the untranslated
+        // arm (see `get_live_vars_info`).
+        let msg = format!("missing liveness[{pc}] in {}", self.name);
+        let err = MissingLiveness {
+            message: format!("{msg}\n{}", self.dump()),
+        };
+        panic!("{}", err.message);
     }
 }
 
@@ -1058,9 +1069,11 @@ pub fn enumerate_vars_by_bank(
 
 /// RPython `jitcode.py` `class MissingLiveness(Exception): pass`.
 ///
-/// Raised by `JitCode::get_live_vars_info` when a `-live-` op is missing
-/// at the expected PC. Currently we panic instead of returning a typed
-/// error since pyre's blackhole has no exception-based error path yet.
+/// `jitcode.py` `class MissingLiveness(Exception)`.
+///
+/// `JitCode::_missing_liveness` raises this with `self.dump()` when a
+/// `-live-` op is missing. The blackhole has no exception path, so the
+/// raiser panics on `message`.
 pub struct MissingLiveness {
     pub message: String,
 }
@@ -2880,6 +2893,36 @@ mod tests {
         assert!(!jc.can_decode_live_vars(width + 1, live));
         // Even a real instruction must not backtrack into an operand byte.
         assert!(!jc.can_decode_live_vars(2 * width + 1, live));
+    }
+
+    /// `jitcode.py` `JitCode.get_live_vars_info`: a pc shorter than
+    /// `OFFSET_SIZE + 1` that is not itself `-live-` takes
+    /// `_missing_liveness`, and the message includes `dump()`.
+    #[test]
+    #[should_panic(
+        expected = "missing liveness[0] in short_pc\n<no dump available for \"short_pc\">"
+    )]
+    fn get_live_vars_info_short_pc_raises_missing_liveness_with_dump() {
+        let jc = JitCode::new("short_pc");
+        jc.set_body(JitCodeBody {
+            code: vec![0x00],
+            startpoints: Some([0].into_iter().collect()),
+            ..JitCodeBody::default()
+        });
+        jc.get_live_vars_info(0, 42);
+    }
+
+    /// `jitcode.py` `JitCode.follow_jump`: `assert position in self._alllabels`.
+    #[test]
+    #[should_panic(expected = "not in _alllabels")]
+    fn follow_jump_rejects_a_position_outside_alllabels() {
+        let jc = JitCode::new("follow");
+        jc.set_body(JitCodeBody {
+            code: vec![0, 0, 0, 0],
+            alllabels: Some(indexmap::IndexSet::new()),
+            ..JitCodeBody::default()
+        });
+        jc.follow_jump(2);
     }
 
     fn test_bh_field(name: &str) -> BhFieldSpec {

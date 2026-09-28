@@ -264,8 +264,11 @@ impl Assembler {
     /// operand reuses the same two-byte index from `_descr_dict`.
     pub fn emit_descr(&mut self, descr: AssemblerDescr) -> usize {
         let key = AssemblerDescrKey::from_descr(&descr);
-        if let Some(index) = self.descr_dict.get(&key) {
-            return *index;
+        if let Some(&index) = self.descr_dict.get(&key) {
+            // `descr.py` `get_array_descr` keeps one ArrayDescr per type.
+            // `gc_type_id` is `ArrayDescr.tid`, not part of the cache key.
+            reconcile_stored_array_header(&mut self.descrs[index], &descr);
+            return index;
         }
         let index = self.descrs.len();
         assert!(index <= 0xFFFF, "too many AbstractDescrs!");
@@ -961,6 +964,45 @@ pub enum AssemblerDescrKey {
     },
 }
 
+/// `descr.py` `get_array_descr` / `ArrayDescr.tid`: one descr per array
+/// type. A later mint may learn the dense tid. A zero stored tid is
+/// upgraded; two non-zero tids, or disagreeing `is_gc_managed`, are
+/// not the same array.
+fn reconcile_stored_array_header(stored: &mut AssemblerDescr, incoming: &AssemblerDescr) {
+    let (AssemblerDescr::Ready(stored_descr), AssemblerDescr::Ready(incoming_descr)) =
+        (stored, incoming)
+    else {
+        return;
+    };
+    let (
+        crate::jitcode::BhDescr::Array {
+            gc_type_id: stored_tid,
+            is_gc_managed: stored_gc,
+            ..
+        },
+        crate::jitcode::BhDescr::Array {
+            gc_type_id: new_tid,
+            is_gc_managed: new_gc,
+            ..
+        },
+    ) = (stored_descr.as_mut(), incoming_descr.as_ref())
+    else {
+        return;
+    };
+    if *stored_gc != *new_gc {
+        panic!(
+            "get_array_descr: is_gc_managed disagrees on one ARRAY (stored {stored_gc}, new {new_gc})"
+        );
+    }
+    if *stored_tid == 0 && *new_tid != 0 {
+        *stored_tid = *new_tid;
+    } else if *stored_tid != 0 && *new_tid != 0 && *stored_tid != *new_tid {
+        panic!(
+            "get_array_descr: gc_type_id disagrees on one ARRAY (stored {stored_tid}, new {new_tid})"
+        );
+    }
+}
+
 impl AssemblerDescrKey {
     fn from_descr(descr: &AssemblerDescr) -> Self {
         match descr {
@@ -1107,4 +1149,48 @@ impl Default for Assembler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(test)]
+fn sample_array(gc_type_id: u32, is_gc_managed: bool) -> crate::jitcode::BhDescr {
+    crate::jitcode::BhDescr::Array {
+        base_size: 8,
+        itemsize: 8,
+        len_offset: Some(0),
+        type_id: 1,
+        gc_type_id,
+        item_type: majit_ir::value::Type::Int,
+        is_array_of_pointers: false,
+        is_array_of_structs: false,
+        is_item_signed: true,
+        ei_index: u32::MAX,
+        array_type_id: Some("Arr".to_string()),
+        interior_fields: Vec::new(),
+        is_gc_managed,
+    }
+}
+
+/// `descr.py` `get_array_descr`: a zero `tid` is replaced when a later
+/// mint of the same array knows the dense id. The key does not include it.
+#[test]
+fn emit_descr_upgrades_a_zero_gc_type_id() {
+    let mut asm = Assembler::new();
+    let first = asm.emit_ready_descr(sample_array(0, true));
+    let second = asm.emit_ready_descr(sample_array(9, true));
+    assert_eq!(first, second);
+    let AssemblerDescr::Ready(stored) = &asm.descrs[first] else {
+        panic!("stored descr");
+    };
+    let crate::jitcode::BhDescr::Array { gc_type_id, .. } = stored.as_ref() else {
+        panic!("array");
+    };
+    assert_eq!(*gc_type_id, 9);
+}
+
+#[test]
+#[should_panic(expected = "gc_type_id disagrees")]
+fn emit_descr_panics_when_two_nonzero_gc_type_ids_differ() {
+    let mut asm = Assembler::new();
+    asm.emit_ready_descr(sample_array(3, true));
+    asm.emit_ready_descr(sample_array(4, true));
 }

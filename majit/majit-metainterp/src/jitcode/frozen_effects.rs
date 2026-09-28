@@ -6,7 +6,7 @@
 //! before any call or field is consumed. The recipes are setup input, not a
 //! runtime side table; only the descriptors themselves retain the stamps.
 
-use majit_ir::descr::{DescrRef, LLType, gc_cache};
+use majit_ir::descr::{DescrRef, FieldDescr, LLType, gc_cache};
 use majit_ir::effectinfo::{DescrMintEntry, DescrMintSpec, DescrSetMember};
 
 pub(super) fn publish_mints(entries: &[DescrMintEntry]) {
@@ -72,6 +72,21 @@ fn mint_field(
     // descr.py::get_field_descr: a cache hit preserves the original layout.
     // Opcode descriptors have already published their complete parent groups.
     if let Some(existing) = gc._cache_field.get(&key).and_then(|m| m.get(name)) {
+        // `descr.py` `get_field_descr` returns the cached field. A recipe
+        // that names the same `(STRUCT, name)` with a different layout
+        // must not receive `set_ei_index` on that descr.
+        assert_eq!(
+            existing.offset(),
+            *offset,
+            "mint_field: cached offset {} != recipe {offset} for {name}",
+            existing.offset()
+        );
+        assert_eq!(
+            existing.field_size(),
+            *field_size,
+            "mint_field: cached field size {} != recipe {field_size} for {name}",
+            existing.field_size()
+        );
         return Some(existing.clone());
     }
     gc.get_size_descr(key.clone(), *struct_size, 0, false);
@@ -146,14 +161,11 @@ pub(super) fn prepare(ei: &mut majit_ir::EffectInfo) {
             members.iter().map(resolve).collect(),
         ))
     };
-    // PRE-EXISTING-ADAPTATION: dispatch.rs passes an EffectInfo value to
-    // TraceCtx's typed call APIs, which re-intern it by the upstream raw-set
-    // identity. Until those APIs carry the original CallDescr (as
-    // pyjitpl.py::MetaInterp._record_helper_varargs does), retain these sets so
-    // calls with different writes cannot collapse to one cache key. The
-    // frozen partition still avoids repartitioning at runtime. Convergence:
-    // thread the embedded CallDescr itself through the typed-call APIs, then
-    // discard the raw sets as effectinfo.py::compute_bitstrings does.
+    // `effectinfo.py` `EffectInfo.__new__` stores the `_readonly_descrs_*`
+    // / `_write_descrs_*` sets, and `compute_bitstrings` writes
+    // `bitstring_*` without deleting them. dispatch.rs still re-interns
+    // an EffectInfo by those sets, so `prepare` keeps them. The frozen
+    // partition is what `check_readonly_descr_field` reads.
     if let Some(keys) = ei.descr_set_keys.take() {
         for member in keys
             .readonly_fields
@@ -188,4 +200,25 @@ pub(super) fn prepare(ei: &mut majit_ir::EffectInfo) {
             "a concrete embedded EffectInfo needs its descriptor image"
         );
     }
+}
+
+#[test]
+#[should_panic(expected = "cached offset")]
+fn mint_field_rejects_a_cached_offset_that_differs_from_the_recipe() {
+    fn spec(offset: usize) -> DescrMintSpec {
+        DescrMintSpec::Field {
+            struct_size: 16,
+            offset,
+            field_size: 8,
+            field_type: majit_ir::value::Type::Int,
+            flag: majit_ir::descr::ArrayFlag::Signed,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+        }
+    }
+    let name = "mint_field_offset_guard";
+    let struct_id = 0xD12F_1E1D;
+    assert!(mint_field(struct_id, name, &spec(0)).is_some());
+    let _ = mint_field(struct_id, name, &spec(8));
 }
