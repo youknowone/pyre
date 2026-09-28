@@ -6386,16 +6386,12 @@ impl JitCodeBuilder {
     }
 
     fn add_bh_descr(&mut self, descr: CanonicalBhDescr) -> u16 {
-        let hit = self.descrs.iter().position(|entry| {
-            matches!(
-                entry,
-                RuntimeBhDescr::Descr(existing) if canonical_bh_descr_eq(existing, &descr)
-            )
-        });
-        if let Some(idx) = hit {
-            // `descr.py` `get_array_descr`: one ArrayDescr, one `tid`.
-            reconcile_canonical_array_header(&mut self.descrs[idx], &descr);
-            return idx as u16;
+        for (idx, entry) in self.descrs.iter().enumerate() {
+            if let RuntimeBhDescr::Descr(existing) = entry
+                && canonical_bh_descr_eq(existing, &descr)
+            {
+                return idx as u16;
+            }
         }
         self.push_descr_entry(RuntimeBhDescr::Descr(Box::new(descr)))
     }
@@ -7274,42 +7270,6 @@ fn resolve_call_release_gil_target(
     effect_info
 }
 
-/// `descr.py` `get_array_descr`: a second mint of the same array may
-/// carry the dense tid the first mint did not know. Two non-zero tids,
-/// or two `is_gc_managed` flags, cannot share one descr.
-fn reconcile_canonical_array_header(stored: &mut RuntimeBhDescr, incoming: &CanonicalBhDescr) {
-    let RuntimeBhDescr::Descr(stored_descr) = stored else {
-        return;
-    };
-    let (
-        CanonicalBhDescr::Array {
-            gc_type_id: stored_tid,
-            is_gc_managed: stored_gc,
-            ..
-        },
-        CanonicalBhDescr::Array {
-            gc_type_id: new_tid,
-            is_gc_managed: new_gc,
-            ..
-        },
-    ) = (stored_descr.as_mut(), incoming)
-    else {
-        return;
-    };
-    if *stored_gc != *new_gc {
-        panic!(
-            "get_array_descr: is_gc_managed disagrees on one ARRAY (stored {stored_gc}, new {new_gc})"
-        );
-    }
-    if *stored_tid == 0 && *new_tid != 0 {
-        *stored_tid = *new_tid;
-    } else if *stored_tid != 0 && *new_tid != 0 && *stored_tid != *new_tid {
-        panic!(
-            "get_array_descr: gc_type_id disagrees on one ARRAY (stored {stored_tid}, new {new_tid})"
-        );
-    }
-}
-
 fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool {
     match (lhs, rhs) {
         (
@@ -7335,7 +7295,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 ei_index: _,
                 array_type_id: lhs_array_type_id,
                 interior_fields: lhs_interior_fields,
-                is_gc_managed: _,
+                is_gc_managed: lhs_is_gc_managed,
             },
             CanonicalBhDescr::Array {
                 base_size: rhs_base_size,
@@ -7350,7 +7310,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 ei_index: _,
                 array_type_id: rhs_array_type_id,
                 interior_fields: rhs_interior_fields,
-                is_gc_managed: _,
+                is_gc_managed: rhs_is_gc_managed,
             },
         ) => {
             // `ei_index` is intentionally NOT part of the identity
@@ -7365,9 +7325,6 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
             // that disagree on the Rust type spelling stay on distinct
             // canonical slots even when their numeric `type_id`
             // collides (default `0`).
-            // `gc_type_id` and `is_gc_managed` are header fields of that
-            // one descr (`ArrayDescr.tid`). `add_bh_descr` upgrades a
-            // zero tid and panics when the headers disagree.
             lhs_base_size == rhs_base_size
                 && lhs_itemsize == rhs_itemsize
                 && lhs_len_offset == rhs_len_offset
@@ -7378,6 +7335,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 && lhs_is_item_signed == rhs_is_item_signed
                 && lhs_array_type_id == rhs_array_type_id
                 && lhs_interior_fields == rhs_interior_fields
+                && lhs_is_gc_managed == rhs_is_gc_managed
         }
         // TODO: `Call` variant intentionally falls
         // through `_ => false`. See `add_call_descr`'s docstring — pyre's
@@ -7477,48 +7435,6 @@ pub fn live_slots_for_state_field_jit(
         .map(|i| i as u8)
         .collect();
     (live_i, live_r, live_f)
-}
-
-#[cfg(test)]
-fn canonical_array(gc_type_id: u32, is_gc_managed: bool) -> CanonicalBhDescr {
-    CanonicalBhDescr::Array {
-        base_size: 8,
-        itemsize: 8,
-        len_offset: Some(0),
-        type_id: 1,
-        gc_type_id,
-        item_type: majit_ir::value::Type::Int,
-        is_array_of_pointers: false,
-        is_array_of_structs: false,
-        is_item_signed: true,
-        ei_index: u32::MAX,
-        array_type_id: Some("Arr".to_string()),
-        interior_fields: Vec::new(),
-        is_gc_managed,
-    }
-}
-
-#[test]
-fn add_array_descr_upgrades_a_zero_gc_type_id() {
-    let mut builder = JitCodeBuilder::new();
-    let first = builder.add_array_descr(canonical_array(0, true));
-    let second = builder.add_array_descr(canonical_array(9, true));
-    assert_eq!(first, second);
-    let RuntimeBhDescr::Descr(stored) = &builder.descrs[first as usize] else {
-        panic!("stored descr");
-    };
-    let CanonicalBhDescr::Array { gc_type_id, .. } = stored.as_ref() else {
-        panic!("array");
-    };
-    assert_eq!(*gc_type_id, 9);
-}
-
-#[test]
-#[should_panic(expected = "is_gc_managed disagrees")]
-fn add_array_descr_panics_when_is_gc_managed_differs() {
-    let mut builder = JitCodeBuilder::new();
-    builder.add_array_descr(canonical_array(0, true));
-    builder.add_array_descr(canonical_array(0, false));
 }
 
 #[cfg(test)]

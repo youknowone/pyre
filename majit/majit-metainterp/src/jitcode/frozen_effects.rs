@@ -72,9 +72,11 @@ fn mint_field(
     // descr.py::get_field_descr: a cache hit preserves the original layout.
     // Opcode descriptors have already published their complete parent groups.
     if let Some(existing) = gc._cache_field.get(&key).and_then(|m| m.get(name)) {
-        // `descr.py` `get_field_descr` returns the cached field. A recipe
-        // that names the same `(STRUCT, name)` with a different layout
-        // must not receive `set_ei_index` on that descr.
+        // `descr.py` `get_field_descr` returns `cache[STRUCT][fieldname]`
+        // unchanged. Upstream keys on the STRUCT itself, so a hit always has
+        // the recipe's layout. `(struct_id, name)` stands in for that key;
+        // these asserts only check the invariant the upstream key gives by
+        // construction, so `set_ei_index` never stamps another field.
         assert_eq!(
             existing.offset(),
             *offset,
