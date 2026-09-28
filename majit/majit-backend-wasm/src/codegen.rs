@@ -2944,7 +2944,7 @@ fn collecting_call_positions(ops: &[Op], include_ca_collects: bool) -> Vec<usize
 /// before `CALL(realloc_frame)`). Zero means this entry has no Ref input.
 fn emit_check_frame_depth(
     sink: &mut PeepSink<'_, '_>,
-    frame: FrameGeometry,
+    depth_items: usize,
     realloc_fn_ptr: i64,
     residual_type_base: u32,
     gcmap_ptr: i64,
@@ -2958,7 +2958,7 @@ fn emit_check_frame_depth(
     sink.i32_const(len_size);
     sink.i32_sub();
     sink.i32_load(mem32(0));
-    sink.i32_const(frame.signed_item_count() as i32);
+    sink.i32_const(depth_items as i32);
     sink.i32_lt_u();
     sink.if_(BlockType::Empty);
     // IncreaseStackSlowPath.generate_body: push_gcmap(store=True) before
@@ -2973,7 +2973,7 @@ fn emit_check_frame_depth(
     }
     sink.local_get(0);
     sink.i64_extend_i32_u();
-    sink.i64_const(frame.signed_item_count() as i64);
+    sink.i64_const(depth_items as i64);
     sink.i32_const(realloc_fn_ptr as i32);
     sink.call_indirect(0, residual_type_base + 2);
     sink.i32_wrap_i64();
@@ -4277,6 +4277,16 @@ pub struct CaParams {
     /// `_check_frame_depth` so a frame that already fits stays byte-identical.
     /// `(i64 items, i64 depth) -> i64` at residual type base + 2.
     pub realloc_fn_ptr: i64,
+    /// Signed item count `_check_frame_depth` compares against. Zero uses
+    /// [`FrameGeometry::signed_item_count`] of this module. `assemble_bridge`
+    /// passes `max(frame_depth, jump target jfi_frame_depth)` without changing
+    /// this module's spill or home offsets.
+    pub frame_depth_items: usize,
+    /// Geometry of this module's cross-module JUMP target. `None` stores at
+    /// this module's own offsets. An inlined region carries the same geometry
+    /// on [`ExternalJump`] instead, because the owner's params describe the
+    /// owner loop.
+    pub external_jump_frame: Option<FrameGeometry>,
 }
 
 /// Per-CALL_ASSEMBLER target dispatch baked into the corresponding wasm arm.
@@ -4643,6 +4653,9 @@ pub struct ExternalJump {
     /// Resume-at-LABEL dispatch key: `target label ordinal + 1`, or `0` when
     /// the target is not peeled.
     pub key: u32,
+    /// Target loop's frame. Spill and dispatch-key stores use these offsets
+    /// (`remap_frame_layout`); the narrow shim reloads the same words.
+    pub frame: FrameGeometry,
 }
 
 pub struct InlinedBridge {
@@ -4920,6 +4933,16 @@ fn rebase_region_value_ids(
 pub fn build_wasm_module(
     inputs: &ModuleBuildInputs,
 ) -> Result<BuildWasmModuleOutput, BackendError> {
+    build_wasm_module_reporting_shortage(inputs, &mut None)
+}
+
+/// [`build_wasm_module`], also naming the frame layout shortage when the build
+/// declines because `inputs.frame` is too small. A caller that may grow the
+/// frame (`_check_frame_depth`) extends it by that shortage and builds again.
+pub(crate) fn build_wasm_module_reporting_shortage(
+    inputs: &ModuleBuildInputs,
+    shortage_out: &mut Option<super::FrameShortage>,
+) -> Result<BuildWasmModuleOutput, BackendError> {
     let ModuleBuildInputs {
         inputargs,
         ops,
@@ -5135,19 +5158,11 @@ pub fn build_wasm_module(
         } else {
             0
         };
+        // `adr_jump_offset` is stamped by the caller once the module is
+        // accepted (`patch_pending_failure_recoveries`). A build that is
+        // declined after this point drops the cell array, so a stamp written
+        // here would leave the descr naming freed memory for the next compile.
         g.bridge_cell = addr;
-        if addr != 0 && preexisting.is_none() {
-            if let Some(meta) = g.meta_descr.as_ref() {
-                if let Some(fd) = meta.as_fail_descr() {
-                    if !fd.is_finish() {
-                        let stamp = std::panic::AssertUnwindSafe(|| {
-                            fd.set_adr_jump_offset(addr as usize);
-                        });
-                        let _ = std::panic::catch_unwind(stamp);
-                    }
-                }
-            }
-        }
     }
     let cell_addrs: Vec<u32> = guards.iter().map(|g| g.bridge_cell).collect();
 
@@ -5204,6 +5219,7 @@ pub fn build_wasm_module(
         if !inlined_bridges.is_empty() {
             super::record_inline_geometry(shortage.kind, shortage.needed, shortage.available);
         }
+        *shortage_out = Some(shortage);
         return Err(BackendError::Unsupported(format!(
             "wasm backend: {} frame value slots exceed frozen frame layout ({})",
             shortage.needed, shortage.available,
@@ -5311,6 +5327,7 @@ pub fn build_wasm_module(
         if !inlined_bridges.is_empty() {
             super::record_inline_geometry(shortage.kind, shortage.needed, shortage.available);
         }
+        *shortage_out = Some(shortage);
         let reason = match shortage.kind {
             super::FrameShortageKind::OrdinaryRefHomes => format!(
                 "wasm backend: {} ordinary ref homes exceed frozen frame layout ({})",
@@ -5393,7 +5410,9 @@ pub fn build_wasm_module(
     };
     // `_check_frame_depth` calls `wasm_realloc_frame(items, depth) -> items`,
     // the same `(i64, i64) -> i64` family as residual arity 2.
-    let emit_frame_realloc = frame.has_tail() && ca.realloc_fn_ptr != 0;
+    // `_check_frame_depth` runs when the bridge must grow the live frame,
+    // including a compact bridge whose jump target is deeper (`assemble_bridge`).
+    let emit_frame_realloc = ca.realloc_fn_ptr != 0;
     let residual_max_arity = if emit_frame_realloc {
         Some(residual_max_arity.unwrap_or(0).max(2))
     } else {
@@ -6154,14 +6173,18 @@ fn build_function(
     // assembler.py `_check_frame_depth` at bridge / entry-bridge entry.
     // The depth is a constant of this module; the running length is the
     // JitFrame `jf_frame` length word immediately before local 0.
-    if frame.has_tail()
-        && ca.realloc_fn_ptr != 0
+    if ca.realloc_fn_ptr != 0
         && let Some(base) = residual_type_base
     {
         let gcmap_ptr = realloc_entry_gcmap(frame, entry_inputargs, ca.gcmap_sink);
+        let depth_items = if ca.frame_depth_items != 0 {
+            ca.frame_depth_items
+        } else {
+            frame.signed_item_count()
+        };
         emit_check_frame_depth(
             &mut sink,
-            frame,
+            depth_items,
             ca.realloc_fn_ptr,
             base,
             gcmap_ptr,
@@ -6638,23 +6661,29 @@ fn build_function(
         }
         // The whole-function target is the one a label-less bridge module
         // carries; a region brings its own.
-        let jump_external: Option<(u32, u32, Option<(u32, u32)>)> = if op.opcode == OpCode::Jump {
-            match external_jump_by_op.get(op_idx).copied().flatten() {
-                Some(ext) => Some((ext.slot, ext.key, None)),
-                None if !has_loop => {
-                    Some((external_jump_slot, external_jump_key, external_jump_wide))
+        let jump_external: Option<(u32, u32, Option<(u32, u32)>, FrameGeometry)> =
+            if op.opcode == OpCode::Jump {
+                match external_jump_by_op.get(op_idx).copied().flatten() {
+                    Some(ext) => Some((ext.slot, ext.key, None, ext.frame)),
+                    None if !has_loop => Some((
+                        external_jump_slot,
+                        external_jump_key,
+                        external_jump_wide,
+                        ca.external_jump_frame.unwrap_or(frame),
+                    )),
+                    None => None,
                 }
-                None => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         match op.opcode {
             OpCode::Label => {}
 
             OpCode::Jump if jump_external.is_some() => {
-                let (external_jump_slot, external_jump_key, external_jump_wide) = jump_external
-                    .expect("the arm guard just established this JUMP has a cross-module target");
+                let (external_jump_slot, external_jump_key, external_jump_wide, jump_frame) =
+                    jump_external.expect(
+                        "the arm guard just established this JUMP has a cross-module target",
+                    );
                 // A JUMP in a trace with no local LABEL closes back into a
                 // *separate* loop module (a loop-closing bridge). There is no
                 // enclosing `loop` to `br` to, so hand the jump args — the
@@ -6687,7 +6716,8 @@ fn build_function(
                 let store_dispatch_key = |sink: &mut PeepSink<'_, '_>| {
                     sink.local_get(0); // frame_ptr
                     sink.i64_const(external_jump_key as i64); // dispatch key
-                    sink.i64_store(mem64(frame.dispatch_key_ofs));
+                    // Target's `br_table` loads its own `dispatch_key_ofs`.
+                    sink.i64_store(mem64(jump_frame.dispatch_key_ofs));
                 };
                 if let Some((wide_slot, wide_type_idx)) = external_jump_wide
                     .filter(|_| jump_args.len() <= crate::FROZEN_LABEL_PARAM_ARITY)
@@ -6722,7 +6752,8 @@ fn build_function(
                     for (i, jump_arg) in jump_args.iter().enumerate() {
                         sink.local_get(0); // frame_ptr
                         emit_resolve(&mut sink, constants, value_types, jump_arg.to_opref());
-                        sink.i64_store(mem64(frame.spill_slot_ofs(i as u64)));
+                        // Narrow shim reloads `spill_slot_ofs` of the target.
+                        sink.i64_store(mem64(jump_frame.spill_slot_ofs(i as u64)));
                     }
                     store_dispatch_key(&mut sink);
                     sink.local_get(0); // frame_ptr argument to the loop

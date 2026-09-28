@@ -618,31 +618,20 @@ fn diag_bump(i: usize) {
     BRIDGE_DIAG[i].fetch_add(1, Ordering::Relaxed);
 }
 
-// A source token is compiled before a later guard may become a CA bridge.
-// Freeze modest room for that bridge at first compilation; a later trace that
-// exceeds either bound is declined rather than changing the live frame's
-// offsets. The recursive-unroll fib CA bridge needs more than 64 Ref homes:
-// declining it leaves the recursive return guard permanently blackholed and
-// turns every later invocation into a host round-trip. Keep enough bounded
-// per-token reserve for that bridge and the existing full-suite shapes.
-// A CALL_ASSEMBLER target must retain enough frozen spill/home geometry for a
-// later exit bridge.  nbody's callee bridge needs more Ref homes than the old
-// 16-slot floor; declining it turns every CA invocation into a blackhole.  The
-// larger fixed reserve keeps the bridge in compiled wasm and is still bounded
-// per compiled token.
-const FROZEN_CHAIN_VALUE_SLOTS: usize = 64;
-const FROZEN_CHAIN_REF_HOMES: usize = 128;
+// A fresh loop frame is that trace's own spill count. A bridge or entry
+// bridge that needs more keeps those offsets and appends a tail
+// (`FrameGeometry::extend`); its prologue grows the live frame
+// (`emit_check_frame_depth`, `wasm_realloc_frame`; upstream
+// `assembler.py` `_check_frame_depth`, `llmodel.py` `realloc_frame`).
 const FROZEN_CHAIN_LABEL_REF_SLOTS: usize = 2;
 /// Slots a frozen layout is rounded up to.
 ///
-/// A chained bridge runs in its source token's frame and reaches its target's
-/// label loader, so the two layouts have to agree offset for offset — the
-/// chain is refused outright when they do not. Above the floors the two
-/// numbers are each loop's own spill count, and sibling loops through the same
-/// interpreter differ by a slot or two, which is enough to refuse a chain that
-/// is otherwise exactly the shape the floors exist to keep compiled. Rounding
-/// lands those siblings on one layout; the cost is the rounded-away slots,
-/// bounded by this constant per compiled token.
+/// Sibling loops through the same interpreter differ by a slot or two.
+/// Rounding lands those siblings on one layout so a chained bridge and its
+/// target share spill and home offsets. A layout that still differs is
+/// entered at the target's offsets (`remap_frame_layout`) after
+/// `_check_frame_depth` grows the frame. The cost is the rounded-away
+/// slots, bounded by this constant per compiled token.
 const FROZEN_CHAIN_SLOT_GRANULARITY: usize = 16;
 
 /// `n` rounded up to a whole number of [`FROZEN_CHAIN_SLOT_GRANULARITY`] slots.
@@ -759,6 +748,26 @@ use failguard::{
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
 use majit_ir::{FailDescr, GcRef, InputArgRc, Op, OpRc, Value};
+
+/// `x86/assembler.py` `patch_pending_failure_recoveries`: once the module is
+/// accepted, each guard's `faildescr.adr_jump_offset` names the cell its exit
+/// dispatches through. Called only after the last decline, because a declined
+/// build frees the cell array the address points into.
+fn patch_pending_failure_recoveries(guard_exits: &[codegen::GuardExit]) {
+    for g in guard_exits {
+        if g.bridge_cell == 0 {
+            continue;
+        }
+        let Some(fd) = g.meta_descr.as_ref().and_then(|meta| meta.as_fail_descr()) else {
+            continue;
+        };
+        if fd.is_finish() {
+            continue;
+        }
+        let stamp = std::panic::AssertUnwindSafe(|| fd.set_adr_jump_offset(g.bridge_cell as usize));
+        let _ = std::panic::catch_unwind(stamp);
+    }
+}
 
 /// `x86/assembler.py fixup_target_tokens`, called from BOTH `assemble_loop`
 /// (:612) and `assemble_bridge` (:706) — a LABEL assembled inside a bridge is a
@@ -3957,6 +3966,21 @@ impl WasmBackend {
                     diag_bump(36);
                     continue;
                 }
+                // The out-of-line bridge grows the frame to its JUMP target's
+                // depth in its prologue (`assembler.py` `_assemble` sizes
+                // `_check_frame_depth` by the target's `jfi_frame_depth`). A
+                // merged region has no prologue of its own, and a CALL_ASSEMBLER
+                // entry gives the owner only its homes prefix (`ca_frame_bytes`),
+                // so a region storing at another layout's offsets past that
+                // prefix stays out of line.
+                let owner_live_items =
+                    candidate.frame.ca_frame_bytes as usize / std::mem::size_of::<isize>();
+                if region.external_jump.as_ref().is_some_and(|ext| {
+                    ext.frame != candidate.frame && ext.frame.signed_item_count() > owner_live_items
+                }) {
+                    still.push((region, remap));
+                    continue;
+                }
                 region.outside_loop = region.outside_loop
                     || codegen::source_guard_precedes_loop_label(&candidate.ops, source_fail_index)
                     || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
@@ -4183,8 +4207,35 @@ impl WasmBackend {
                 0u32
             }
         };
-        let (wasm_bytes, guard_exits, merged_ref_homes, merged_labels) =
-            codegen::build_wasm_module(&inputs)?;
+        // `assemble_bridge` raises the loop's `frame_info` depth to what its
+        // bridges need, and every bridge prologue grows a shorter live frame
+        // (`_check_frame_depth`). A merged region is that bridge inside the
+        // owner, so the owner takes the region's depth: extend the layout by
+        // the shortage (the prefix, and so every published offset, is kept)
+        // and grow the frame at entry.
+        let (wasm_bytes, guard_exits, merged_ref_homes, merged_labels) = loop {
+            let mut shortage = None;
+            match codegen::build_wasm_module_reporting_shortage(&inputs, &mut shortage) {
+                Ok(built) => break built,
+                Err(error) => {
+                    let frame = inputs.frame;
+                    let grown = match shortage.map(|s| (s.kind, s.needed)) {
+                        Some((FrameShortageKind::FrameValueSlots, needed)) => {
+                            frame.extend(needed, frame.addressable_ordinary_homes())
+                        }
+                        Some((FrameShortageKind::OrdinaryRefHomes, needed)) => {
+                            frame.extend(frame.value_slots, needed)
+                        }
+                        _ => frame,
+                    };
+                    if grown == frame {
+                        return Err(error);
+                    }
+                    inputs.frame = grown;
+                    inputs.ca.realloc_fn_ptr = wasm_realloc_frame as *const () as usize as i64;
+                }
+            }
+        };
         let code_size = wasm_bytes.len();
         let descrs: Vec<Arc<WasmFailDescr>> = guard_exits
             .iter()
@@ -4319,6 +4370,7 @@ impl WasmBackend {
         }
         #[cfg(not(target_arch = "wasm32"))]
         let install_handle = old_handle;
+        patch_pending_failure_recoveries(&guard_exits);
 
         // The host has accepted the replacement, so its newly encoded global
         // indices can now be made visible in the registry and local metadata.
@@ -4374,10 +4426,17 @@ impl WasmBackend {
         compiled.used_label_homes.set(widened_labels);
         compiled.home_gcmap_ptr.set(leak_home_gcmap(
             &mut asm_resources,
-            compiled.frame,
+            inputs.frame,
             widened,
             widened_labels,
         ));
+        if let Some(clt) = token.compiled_loop_token() {
+            let baseofs = (majit_gc::header::GcHeader::SIZE
+                + majit_backend::jitframe::FIRST_ITEM_OFFSET) as i64;
+            clt.frame_info
+                .lock()
+                .update_frame_depth(baseofs, inputs.frame.ca_frame_depth() as i64);
+        }
         *compiled.reemit.borrow_mut() = Some(inputs.clone());
 
         // LABEL targets bake only the stable table slot, so restamp them for
@@ -4501,14 +4560,17 @@ fn has_cross_loop_terminal_jump(ops: &[Op]) -> bool {
 /// would read a null local).
 ///
 /// `source` is the frame a chained bridge already runs on, with the table slot
-/// of the loop that owns it. `compile_bridge` supplies it: that bridge shares
-/// the source token's frozen layout, so the target's geometry must agree with
-/// it exactly, and a target whose backend capture slots were filled by its own
-/// fall-through (`requires_own_frame`) is resumable only when it IS that source
-/// loop. `compile_loop` passes `None` for an entry bridge, which owns its
-/// module and its frame: it has no source slot, so `requires_own_frame` always
-/// declines, and instead of matching a geometry it ADOPTS the target's (the
-/// caller checks its own slots fit, then compiles against `t.frame`).
+/// of the loop that owns it. `compile_bridge` supplies it. A target whose
+/// backend capture slots were filled by its own fall-through
+/// (`requires_own_frame`) is resumable only when it IS that source loop: those
+/// captures sit at the owner's offsets, and this jumper does not have the
+/// target's `LabelResumeData`. A different `FrameGeometry` is otherwise
+/// accepted; the caller writes the target's spill and dispatch-key offsets
+/// (`remap_frame_layout`) and sizes `_check_frame_depth` to the target.
+/// `compile_loop` passes `None` for an entry bridge, which owns its module and
+/// its frame: it has no source slot, so `requires_own_frame` always declines,
+/// and instead of matching a geometry it ADOPTS the target's (the caller
+/// checks its own slots fit, then compiles against `t.frame`).
 fn resolve_cross_loop_jump_target(
     ops: &[Op],
     source: Option<(u32, codegen::FrameGeometry)>,
@@ -4539,10 +4601,6 @@ fn resolve_cross_loop_jump_target(
             // The target's high capture homes were populated by its own
             // fall-through path, not by this sibling source loop.
             diag_bump(9);
-            None
-        }
-        Some(t) if source.is_some_and(|(_, frame)| t.frame != frame) => {
-            diag_bump(4); // target uses different frozen frame offsets
             None
         }
         Some(t) => Some(t),
@@ -5213,8 +5271,8 @@ impl majit_backend::Backend for WasmBackend {
                 .frame
                 .extend(raw_frame_value_slots, raw_num_ref_homes),
             None => codegen::FrameGeometry::compact(
-                frozen_slot_count(raw_frame_value_slots.max(FROZEN_CHAIN_VALUE_SLOTS)),
-                frozen_slot_count(raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES)) + label_ref_slots,
+                frozen_slot_count(raw_frame_value_slots.max(FROZEN_LABEL_PARAM_ARITY + 1)),
+                frozen_slot_count(raw_num_ref_homes) + label_ref_slots,
                 label_ref_slots,
             ),
         };
@@ -5448,6 +5506,8 @@ impl majit_backend::Backend for WasmBackend {
                     .to_string(),
             ));
         }
+
+        patch_pending_failure_recoveries(&guard_exits);
 
         // `asmmemmgr.py` counts the block a `materialize` handed out, which
         // here is the module the host has taken. Below the decline above, as
@@ -5883,6 +5943,7 @@ impl majit_backend::Backend for WasmBackend {
         let mut external_jump_slot: u32 = source_func_handle;
         let mut external_jump_wide_slot: u32 = 0;
         let mut resumes_at_loop_header = false;
+        let mut jump_target_frame: Option<codegen::FrameGeometry> = None;
         if bridge_is_loop_closing {
             let target =
                 resolve_cross_loop_jump_target(ops, Some((source_func_handle, frozen_frame)));
@@ -5891,6 +5952,7 @@ impl majit_backend::Backend for WasmBackend {
                 external_jump_slot = t.func_handle;
                 external_jump_wide_slot = t.wide_slot;
                 resumes_at_loop_header = t.is_last_label;
+                jump_target_frame = Some(t.frame);
             }
             if target.is_none() {
                 diag_bump(2); // declined: JUMP target not chainable
@@ -6039,6 +6101,7 @@ impl majit_backend::Backend for WasmBackend {
             (external_jump_slot != source_func_handle).then_some(codegen::ExternalJump {
                 slot: external_jump_slot,
                 key: external_jump_key,
+                frame: jump_target_frame.unwrap_or(source_frame),
             });
         // Set by the inline block below to the owner of a merge candidate whose
         // merge waits on `INLINE_TRIP_THRESHOLD` entries into this bridge.
@@ -6396,8 +6459,25 @@ impl majit_backend::Backend for WasmBackend {
             frame: source_frame,
             ca: ca_params,
         };
-        if source_frame.has_tail() {
+        // `assembler.py` `_assemble` takes `max(frame_depth, target jfi_frame_depth)`.
+        // `assemble_bridge` emits `_check_frame_depth` and `update_frame_depth`
+        // on the source token. The bridge keeps `frozen_frame.extend` for its
+        // own spills; the target's slot counts are not appended.
+        let mut required_items = source_frame.signed_item_count();
+        let mut live_items = frozen_frame.signed_item_count();
+        if let Some(target_frame) = jump_target_frame {
+            module_inputs.ca.external_jump_frame = Some(target_frame);
+            required_items = required_items.max(target_frame.signed_item_count());
+            // A CALL_ASSEMBLER entry allocates only the homes prefix
+            // (`callee_frame_bytes`), so a JUMP that stores at another
+            // layout's offsets cannot assume the full frozen frame is live.
+            if target_frame != frozen_frame {
+                live_items = frozen_frame.ca_frame_bytes as usize / std::mem::size_of::<isize>();
+            }
+        }
+        if required_items > live_items {
             module_inputs.ca.realloc_fn_ptr = wasm_realloc_frame as *const () as usize as i64;
+            module_inputs.ca.frame_depth_items = required_items;
         }
         module_inputs.ca.exit_table_base = asm_resources.alloc_exit_table(guard_exit_count) as u32;
         module_inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
@@ -6461,6 +6541,16 @@ impl majit_backend::Backend for WasmBackend {
                  or invalid module)"
                     .to_string(),
             ));
+        }
+        patch_pending_failure_recoveries(&guard_exits);
+        // `assemble_bridge`: `update_frame_depth` on the source token, so a
+        // later entry allocates the depth this bridge and its JUMP target need.
+        if let Some(clt) = original_token.compiled_loop_token() {
+            let baseofs = (majit_gc::header::GcHeader::SIZE
+                + majit_backend::jitframe::FIRST_ITEM_OFFSET) as i64;
+            clt.frame_info
+                .lock()
+                .update_frame_depth(baseofs, required_items as i64);
         }
         // The host accepted the bridge. Only now publish its global exit
         // descriptors and attach their resume-data tracer to the source CLT;

@@ -4470,6 +4470,90 @@ fn zero_arity_parameter_entry_is_structurally_type_zero() {
 }
 
 #[test]
+fn building_a_module_does_not_stamp_the_guard_cell_on_its_descr() {
+    // The caller can still decline after `build_wasm_module` returns (the host
+    // rejects the module), and a decline frees the cell array. The descr is
+    // shared with the next compile of the same guard, which reuses a nonzero
+    // `adr_jump_offset` as its cell, so the stamp waits for acceptance.
+    #[derive(Debug)]
+    struct CellDescr {
+        types: Vec<Type>,
+        adr: std::sync::atomic::AtomicUsize,
+    }
+    impl majit_ir::Descr for CellDescr {
+        fn as_fail_descr(&self) -> Option<&dyn majit_ir::FailDescr> {
+            Some(self)
+        }
+    }
+    impl majit_ir::FailDescr for CellDescr {
+        fn fail_index(&self) -> u32 {
+            0
+        }
+        fn fail_arg_types(&self) -> &[Type] {
+            &self.types
+        }
+        fn adr_jump_offset(&self) -> usize {
+            self.adr.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn set_adr_jump_offset(&self, offset: usize) {
+            self.adr.store(offset, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let guard = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::input_arg_int(0)],
+        &[OpRef::input_arg_int(0)],
+    );
+    let descr = std::sync::Arc::new(CellDescr {
+        types: vec![Type::Int],
+        adr: std::sync::atomic::AtomicUsize::new(0),
+    });
+    guard.setdescr(descr.clone());
+    let ops = vec![
+        guard,
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs,
+        ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        gc_const_keys: Vec::new(),
+        fail_index_base: 0,
+        bridge_cells_base: 64,
+        guard_cell_addrs: Vec::new(),
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, guards, _, _) = codegen::build_wasm_module(&inputs).unwrap();
+
+    validate_wasm(&bytes);
+    assert_eq!(guards[0].bridge_cell, 64, "the guard exit carries its cell");
+    assert_eq!(
+        descr.adr.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the descr names no cell until the caller accepts the module"
+    );
+}
+
+#[test]
 fn test_nullary_true_void_call_uses_indirect_call_without_drop() {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![
@@ -5906,6 +5990,227 @@ fn a_loop_closing_jump_passes_its_args_to_a_published_wide_entry() {
         "the call type is the target's parameter entry: frame_ptr plus the \
          fixed label parameters"
     );
+}
+
+/// A bridge on geometry GA tail-calls a LABEL of a loop on geometry GB.
+/// Args land at GB's spill slots, the dispatch key at GB's key offset, and
+/// the prologue compares `_check_frame_depth` against GB when that frame is
+/// deeper. The running frame is pre-sized here; the compare immediate is the
+/// growth the bridge would request.
+#[test]
+fn cross_geometry_jump_delivers_label_args() {
+    let ga = codegen::FrameGeometry::compact(8, 2, 0);
+    let gb = codegen::FrameGeometry::compact(40, 12, 2);
+    assert!(gb.signed_item_count() > ga.signed_item_count());
+    assert_ne!(ga.dispatch_key_ofs, gb.dispatch_key_ofs);
+    assert_ne!(ga.home_slot_base, gb.home_slot_base);
+
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let bridge_ops = vec![Op::new(OpCode::Jump, &[rb(OpRef::input_arg_int(0))])];
+    let descr = majit_ir::make_loop_target_descr(1, false);
+    let label = Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]);
+    label.setdescr(descr.clone());
+    let back = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
+    back.setdescr(descr);
+    let target_ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        label,
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]),
+        back,
+    ];
+
+    let depth = ga.signed_item_count().max(gb.signed_item_count());
+    let jump_ca = codegen::CaParams {
+        external_jump_frame: Some(gb),
+        ..codegen::CaParams::default()
+    };
+    let (bridge_bytes, _) = build_framed_module(
+        &inputargs,
+        &bridge_ops,
+        &constants,
+        ga,
+        codegen::CaParams {
+            realloc_fn_ptr: 9,
+            frame_depth_items: depth,
+            ..jump_ca.clone()
+        },
+        4,
+        1,
+        0,
+    );
+    validate_wasm(&bridge_bytes);
+    let stores = i64_store_offsets(&bridge_bytes);
+    assert!(
+        stores.contains(&gb.spill_slot_ofs(0)),
+        "narrow JUMP stores the label arg at the target spill, got {stores:?}"
+    );
+    assert!(
+        stores.contains(&gb.dispatch_key_ofs),
+        "dispatch key is stored at the target offset, got {stores:?}"
+    );
+    assert!(
+        !stores.contains(&ga.dispatch_key_ofs),
+        "the jumper's own key offset is not the target's"
+    );
+    assert!(
+        i32_consts(&bridge_bytes).contains(&(depth as i32)),
+        "prologue compares against max(bridge, target) item count"
+    );
+
+    let (target_bytes, _) = build_framed_module(
+        &inputargs,
+        &target_ops,
+        &constants,
+        gb,
+        codegen::CaParams::default(),
+        0,
+        0,
+        0,
+    );
+    validate_wasm(&target_bytes);
+
+    let (run_bytes, _) =
+        build_framed_module(&inputargs, &bridge_ops, &constants, ga, jump_ca, 4, 1, 0);
+    validate_wasm(&run_bytes);
+    let engine = Engine::default();
+    let bridge_module = Module::new(&engine, &run_bytes).unwrap();
+    let target_module = Module::new(&engine, &target_bytes).unwrap();
+    let mut store = Store::new(&engine, ());
+    let memory = Memory::new(&mut store, MemoryType::new(1, None)).unwrap();
+    let table = Table::new(
+        &mut store,
+        TableType::new(ValType::FuncRef, 8, None),
+        Val::default(ValType::FuncRef),
+    )
+    .unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    linker
+        .define("env", "__indirect_function_table", table)
+        .unwrap();
+    let target_inst = linker
+        .instantiate_and_start(&mut store, &target_module)
+        .expect("target loop instantiates");
+    let target_func = target_inst.get_func(&store, "trace").expect("trace");
+    table.set(&mut store, 4, target_func.into()).unwrap();
+    let bridge_inst = linker
+        .instantiate_and_start(&mut store, &bridge_module)
+        .expect("bridge instantiates");
+
+    // Items base sits after the jitframe header. `emit_store_header_word`
+    // subtracts `FIRST_ITEM_OFFSET` from local 0, so a zero base is out of range.
+    let frame_ptr = 4096i32;
+    let arg = 41i64;
+    memory
+        .write(
+            &mut store,
+            frame_ptr as usize + ga.spill_slot_ofs(0) as usize,
+            &arg.to_le_bytes(),
+        )
+        .unwrap();
+    bridge_inst
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, frame_ptr)
+        .expect("cross-geometry jump runs");
+
+    let mut word = [0u8; 8];
+    memory
+        .read(
+            &store,
+            frame_ptr as usize + gb.spill_slot_ofs(0) as usize,
+            &mut word,
+        )
+        .unwrap();
+    assert_eq!(
+        i64::from_le_bytes(word),
+        arg,
+        "LABEL resume returns the jump arg, not the preamble's increment"
+    );
+    memory
+        .read(
+            &store,
+            frame_ptr as usize + gb.dispatch_key_ofs as usize,
+            &mut word,
+        )
+        .unwrap();
+    assert_eq!(i64::from_le_bytes(word), 1, "target dispatch key");
+}
+
+fn build_framed_module(
+    inputargs: &[InputArgRc],
+    ops: &[Op],
+    constants: &indexmap::IndexMap<u32, i64>,
+    frame: codegen::FrameGeometry,
+    ca: codegen::CaParams,
+    external_jump_slot: u32,
+    external_jump_key: u32,
+    external_jump_wide_slot: u32,
+) -> (Vec<u8>, Vec<codegen::GuardExit>) {
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.to_vec(),
+        ops: ops.to_vec(),
+        inlined_bridges: Vec::new(),
+        constants: constants.clone(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        gc_const_keys: Vec::new(),
+        fail_index_base: 0,
+        bridge_cells_base: 1,
+        guard_cell_addrs: Vec::new(),
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot,
+        external_jump_wide_slot,
+        external_jump_key,
+        frame,
+        ca,
+    };
+    let (bytes, guards, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen");
+    (bytes, guards)
+}
+
+fn i64_store_offsets(bytes: &[u8]) -> Vec<u64> {
+    let mut offsets = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while let Ok(op) = operators.read() {
+                if let wasmparser::Operator::I64Store { memarg } = op {
+                    offsets.push(memarg.offset);
+                }
+            }
+        }
+    }
+    offsets
+}
+
+fn i32_consts(bytes: &[u8]) -> Vec<i32> {
+    let mut values = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while let Ok(op) = operators.read() {
+                if let wasmparser::Operator::I32Const { value } = op {
+                    values.push(value);
+                }
+            }
+        }
+    }
+    values
 }
 
 /// `build_module_default` for a trace that closes into another module.
