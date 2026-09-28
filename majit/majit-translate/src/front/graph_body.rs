@@ -175,9 +175,11 @@ impl GraphBodyProvider {
         let krate = Rc::new(ProvidedCrate { llbc, state });
         let mut functions = self.declare_crate(&krate, module_filter.as_ref());
         // Every declared body is built here, in declaration order and
-        // before the clause specializations those bodies queue; a body that
-        // does not lower leaves no funcobj.
-        functions.retain(|function| function.lazy_graph().get().is_some());
+        // before the clause specializations those bodies queue. A body that
+        // does not lower leaves its funcobj external.
+        for function in &functions {
+            function.lazy_graph().get();
+        }
         functions.extend(krate.lowering(&self.tables, |lowering| lowering.lower_specs()));
         let mut program = krate.state.finish(functions);
         mir::harden_duplicate_leaf_metadata(
@@ -202,6 +204,15 @@ impl GraphBodyProvider {
                 .llbc
                 .iter_local_fns()
                 .filter(|fd| lowering.admit_decl(fd, module_filter, None))
+                // A declaration with no body (a required trait method, an
+                // extern) is no function object.
+                .filter(|fd| {
+                    let has_body = fd.has_unstructured_body();
+                    if !has_body {
+                        lowering.record_decl_failure(fd, DeclBuildError::NoBody);
+                    }
+                    has_body
+                })
                 .map(|fd| {
                     let header = lowering.decl_header(fd);
                     let stamp = header.graph_stamp();
