@@ -105,6 +105,11 @@ pub(crate) struct SliceFirstSite {
     /// proven thin-pointer element.  Threaded the same way
     /// [`crate::front::slice_get::SliceGetSite::array_type_id`] is.
     pub array_type_id: Option<String>,
+    /// Object gcarray identity when the receiver is an object-pointer slice
+    /// (`*mut PyObject`). `None` for `[u8]`, `[i64]`, `[f64]`, `[str]` and
+    /// every other element. Distinct from [`Self::array_type_id`]: that one
+    /// stays the element read's identity.
+    pub object_array_type_id: Option<String>,
     /// True when the receiver is a `String|str|Wtf8::as_bytes` view.  That
     /// base is a `StringRepr`, not a GC array, so the successful arm must
     /// emit `__string_byte_getitem` rather than `ArrayRead`.
@@ -280,7 +285,7 @@ fn rewire_one_slice_first_site(
                 let len = graph.alloc_value_var();
                 let len_kind = crate::front::bool_then::slice_len_op(
                     slice_in_then.clone(),
-                    site.array_type_id.as_deref(),
+                    site.object_array_type_id.as_deref(),
                     site.string_byte_view,
                 );
                 graph.block_mut(then_bb).operations.push(SpaceOperation {
@@ -412,7 +417,7 @@ fn rewire_one_slice_first_site(
     let len = graph.alloc_value_var();
     let len_kind = crate::front::bool_then::slice_len_op(
         slice.clone(),
-        site.array_type_id.as_deref(),
+        site.object_array_type_id.as_deref(),
         site.string_byte_view,
     );
     graph.block_mut(a_id).operations.push(SpaceOperation {
@@ -501,6 +506,7 @@ mod tests {
             niche: false,
             payload_narrow_root: None,
             array_type_id: None,
+            object_array_type_id: None,
             string_byte_view: false,
         }
     }
@@ -553,17 +559,22 @@ mod tests {
             "residual first call removed from A"
         );
         // A synthesizes the length guard and a `gt` compare, then branches.
-        // The site carries no ARRAY identity, which is length-prefixed, so the
-        // guard is the `arraylen_gc` op and not the `__len` marker.
+        // No object-gcarray identity: the receiver is not an object-pointer
+        // slice, so the guard stays the `__len` marker.
         assert!(
             g.blocks[a.0].operations.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::ArrayLen {
-                    nolength: false,
-                    ..
-                }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.first().map(String::as_str) == Some("__len")
             )),
-            "A synthesizes the arraylen_gc guard"
+            "A keeps the __len marker"
+        );
+        assert!(
+            !g.blocks[a.0]
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayLen { .. })),
+            "a non-object receiver does not emit arraylen_gc"
         );
         assert!(
             g.blocks[a.0]
@@ -573,13 +584,16 @@ mod tests {
             "A compares len > 0"
         );
         assert_eq!(g.blocks[a.0].exits.len(), 2, "A branches to Some/None arms");
-        let elem_reads = g
+        let elem_reads: Vec<Option<String>> = g
             .blocks
             .iter()
             .flat_map(|blk| &blk.operations)
-            .filter(|op| matches!(&op.kind, OpKind::ArrayRead { .. }))
-            .count();
-        assert_eq!(elem_reads, 1, "the Some arm reads slice[0]");
+            .filter_map(|op| match &op.kind {
+                OpKind::ArrayRead { array_type_id, .. } => Some(array_type_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(elem_reads, vec![None], "the Some arm reads slice[0]");
         let disc_writes = g
             .blocks
             .iter()
@@ -694,19 +708,84 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec![Some("[u8]".into())]);
-        // `[u8]` is one of the length-prefixed synthetic spellings, so both
-        // lengths this rewrite needs -- A's guard and `Last`'s `len - 1` --
-        // read the header under the same identity the element read carries.
-        let len_ids: Vec<Option<String>> = g
+        // `[u8]` names the element read. The receiver is a borrowed view, not
+        // the object gcarray, so both lengths — A's guard and `Last`'s
+        // `len - 1` — stay the `__len` marker.
+        assert_eq!(
+            g.blocks
+                .iter()
+                .flat_map(|blk| &blk.operations)
+                .filter(|op| matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.first().map(String::as_str) == Some("__len")
+                ))
+                .count(),
+            2,
+            "a [u8] receiver keeps the __len marker"
+        );
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|blk| &blk.operations)
+                .any(|op| matches!(op.kind, OpKind::ArrayLen { .. })),
+            "no arraylen_gc on a [u8] view"
+        );
+    }
+
+    /// An object-pointer slice is the GC array `arraylen_gc` reads.
+    /// `slice_object_array_type_id` names that array; both length reads carry
+    /// it with `nolength: false`.
+    #[test]
+    fn last_on_an_object_pointer_slice_emits_arraylen() {
+        let mut g = FunctionGraph::new("test_slice_last_object");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "core".into(),
+                            "slice".into(),
+                            "<Impl>".into(),
+                            "last".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![slice]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![opt.clone()]);
+        let id = crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID;
+        let mut site = slice_first_site(opt);
+        site.access = SliceAccess::Last;
+        site.array_type_id = Some(id.into());
+        site.object_array_type_id = Some(id.into());
+        assert_eq!(rewire_slice_first_call_sites(&mut g, &[site]), 1);
+        let len_ids: Vec<(Option<String>, bool)> = g
             .blocks
             .iter()
             .flat_map(|blk| &blk.operations)
             .filter_map(|op| match &op.kind {
-                OpKind::ArrayLen { array_type_id, .. } => Some(array_type_id.clone()),
+                OpKind::ArrayLen {
+                    array_type_id,
+                    nolength,
+                    ..
+                } => Some((array_type_id.clone(), *nolength)),
                 _ => None,
             })
             .collect();
-        assert_eq!(len_ids, vec![Some("[u8]".into()), Some("[u8]".into())]);
+        assert_eq!(
+            len_ids,
+            vec![(Some(id.into()), false), (Some(id.into()), false)]
+        );
     }
 
     /// A `Vec` indexes a headerless buffer, so its length is the third word of

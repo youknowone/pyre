@@ -211,6 +211,11 @@ pub(crate) struct SliceGetSite {
     /// the descr, or `None` only for a proven thin-pointer element whose
     /// identity-less descr already has the correct one-word stride.
     pub array_type_id: Option<String>,
+    /// Object gcarray identity when the receiver is an object-pointer slice
+    /// (`*mut PyObject`). `None` for `[u8]`, `[i64]`, `[f64]`, `[str]` and
+    /// every other element. Distinct from [`Self::array_type_id`]: that one
+    /// stays the element read's identity.
+    pub object_array_type_id: Option<String>,
     /// True when `Option<&T>` is Rust's one-word nullable-reference niche.
     /// RPython carries this as the payload annotation with `can_be_None=True`,
     /// not as an Option object with discriminant and payload fields.
@@ -446,7 +451,7 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
     let len = graph.alloc_value_var();
     let len_kind = crate::front::bool_then::slice_len_op(
         slice,
-        site.array_type_id.as_deref(),
+        site.object_array_type_id.as_deref(),
         // A byte-view receiver never reaches here: the site capture in
         // `front::mir` declines one, because this rewriter's element read is
         // always an `ArrayRead` while `first`/`last` also serve `as_bytes()`.
@@ -481,6 +486,7 @@ mod tests {
             some_owner: "core::option::Option::Some".into(),
             payload_ty: ValueType::Ref(None),
             array_type_id: None,
+            object_array_type_id: None,
             niche: false,
             payload_narrow_root: None,
         }
@@ -558,17 +564,22 @@ mod tests {
             "residual get call removed from A"
         );
         // A synthesizes the length guard and an `lt` compare, then branches.
-        // The site carries no ARRAY identity, which is length-prefixed, so the
-        // guard is the `arraylen_gc` op and not the `__len` marker.
+        // No object-gcarray identity: the receiver is not an object-pointer
+        // slice, so the guard stays the `__len` marker.
         assert!(
             g.blocks[a.0].operations.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::ArrayLen {
-                    nolength: false,
-                    ..
-                }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.first().map(String::as_str) == Some("__len")
             )),
-            "A synthesizes the arraylen_gc guard"
+            "A keeps the __len marker"
+        );
+        assert!(
+            !g.blocks[a.0]
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayLen { .. })),
+            "a non-object receiver does not emit arraylen_gc"
         );
         assert!(
             g.blocks[a.0]

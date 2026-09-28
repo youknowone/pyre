@@ -599,37 +599,36 @@ pub(crate) fn close_goto_mixed(
 
 /// The length read a slice bounds guard branches on.
 ///
-/// The rtyper reaches `arraylen_gc` for a `SomeList` receiver
-/// (`AbstractBaseListRepr.rtype_len`), and the guarded element read already
-/// names the ARRAY it addresses, so emit that op here with the same identity
-/// instead of the `__len` marker: guard and read then carry one descr, and a
-/// graph that skips the rtyper spine gets a length operation rather than a
-/// call no codewriter arm lowers.
+/// `ArrayLen` is `arraylen_gc` (`bh_arraylen_gc`). It reads
+/// `ArrayDescr.lendescr` from a GC array object, and
+/// `AbstractBaseListRepr.rtype_len` reaches that op for a `SomeList` of
+/// objects. The only receiver with that shape is an object-pointer slice:
+/// `slice_object_array_type_id` — the same answer `is_slice_is_empty` uses —
+/// is `Some` only when the element type is `*mut PyObject`, naming the object
+/// gcarray. Pass that identity here. The element read's identity describes
+/// the array the index addresses, which for `&[u8]` is a borrowed view, and
+/// reading `arraylen_gc` from those bytes takes the length from the wrong
+/// offset.
 ///
-/// Two receivers answer with a marker instead.  A string byte view is a
-/// `StringRepr` and not a GC array, so its length is `ll_strlen` and naming
-/// the array op would address a `Wtf8` cast of a wrapper as the rstr; it takes
-/// the `__strlen` marker `is_slice_is_empty` already emits for the same
-/// receiver.  A `nolength` ARRAY stores its length in the value rather than an
-/// ARRAY header, so `ArrayDescr.lendescr` is absent and `bh_arraylen_gc` has
-/// nothing to read; it keeps `__len`, which `rtype_len` answers off the list
-/// repr.
+/// Every other receiver keeps a marker. A string byte view is a
+/// `StringRepr`, so `StringRepr.rtype_len` is `ll_strlen` and the guard emits
+/// `__strlen`. A `[u8]` / `[i64]` / `[f64]` / `[str]` view, and any slice
+/// whose element is not an object pointer, keeps `__len`.
 pub(crate) fn slice_len_op(
     base: Variable,
-    array_type_id: Option<&str>,
+    object_array_type_id: Option<&str>,
     string_byte_view: bool,
 ) -> OpKind {
-    let nolength = crate::front::typestr::nolength_from_array_type_id(array_type_id);
     let marker = if string_byte_view {
         "__strlen"
-    } else if nolength {
-        "__len"
-    } else {
+    } else if let Some(id) = object_array_type_id {
         return OpKind::ArrayLen {
             base,
-            array_type_id: array_type_id.map(str::to_owned),
-            nolength,
+            array_type_id: Some(id.to_owned()),
+            nolength: false,
         };
+    } else {
+        "__len"
     };
     OpKind::Call {
         target: CallTarget::FunctionPath {
