@@ -149,6 +149,8 @@ pub mod host_seam {
     }
 }
 pub mod app_functional;
+#[cfg(feature = "host_env")]
+pub mod app_main;
 pub mod async_operation;
 pub mod codec_engine;
 pub mod jit_builtin_folds;

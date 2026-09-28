@@ -996,6 +996,19 @@ fn run_python_impl(source: &str) -> String {
             }
         }
     }
+    // `init_sys_path` registers the builtin modules and stages the startup
+    // `sys.path[0]` -- the script's directory, or `""` for source handed over
+    // without a name -- which `import_site` prepends once `site` has run, as
+    // `pyrex` does.
+    #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+    {
+        let script_dir = SCRIPT_PATH
+            .with(|p| p.borrow().clone())
+            .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
+            .unwrap_or_default();
+        pyre_interpreter::importing::init_sys_path(&script_dir, script_dir.as_os_str());
+    }
+    #[cfg(not(all(target_arch = "wasm32", feature = "wasm-host")))]
     pyre_interpreter::importing::install_builtin_modules();
     // Give the import machinery a source of module bytes. The browser has no
     // filesystem, so the web build serves the embedded stdlib closure from an
@@ -1009,17 +1022,6 @@ fn run_python_impl(source: &str) -> String {
     }
     #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
     {
-        // `pymain_sys_path_add_path0`: the script's directory heads
-        // `sys.path`, ahead of the stdlib root `install` appends, so a module
-        // beside the script shadows one of the same name in the stdlib. `-P`
-        // (safe_path) suppresses it entirely, as it does natively.
-        if let Some(dir) = SCRIPT_PATH
-            .with(|p| p.borrow().clone())
-            .filter(|_| !pyre_interpreter::importing::safe_path_flag())
-            .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
-        {
-            pyre_interpreter::importing::add_sys_path(&dir);
-        }
         host_fs_provider::install();
         host_clock::install();
     }
@@ -1095,6 +1097,8 @@ fn run_python_impl(source: &str) -> String {
     pyre_interpreter::importing::set_sys_module("__main__", main_module);
 
     let script_path = SCRIPT_PATH.with(|p| p.borrow().clone());
+    #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+    let main_file = script_path.clone();
 
     // `__main__.__file__` — `pymain_run_file` publishes the script's own path
     // in the module it runs it as, and `unittest`'s discovery, `inspect` and
@@ -1155,6 +1159,27 @@ fn run_python_impl(source: &str) -> String {
         pyre_interpreter::host_seam::emit_stderr(
             format!("pyre: importlib bootstrap failed: {}\n", e.message_text()).as_bytes(),
         );
+    }
+
+    // `app_main.py` binds `__main__.__loader__` and then imports `site` before
+    // the program runs, as `pyrex run_source` does.
+    #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+    {
+        let ec_ptr = pyre_interpreter::call::getexecutioncontext();
+        pyre_interpreter::app_main::seed_main_loader(
+            canonical,
+            main_file.as_deref(),
+            false,
+            ec_ptr,
+        );
+        if !pyre_interpreter::app_main::import_site(
+            pyre_interpreter::importing::no_site_flag(),
+            canonical,
+            ec_ptr,
+        ) {
+            EXIT_CODE.with(|c| c.set(1));
+            return OUTPUT_BUF.with(|buf| buf.borrow().clone());
+        }
     }
 
     // catch_unwind to capture panics from JIT as error messages
