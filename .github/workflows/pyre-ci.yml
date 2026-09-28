@@ -215,15 +215,15 @@ jobs:
     # Charon's rustc is a different compiler from the stable rust-cache
     # toolchain. Its rlibs cannot live in `target/` or every extract
     # rebuilds the graph. `extract-llbc.py` writes them under
-    # `.pyre-build/charon-target` (`CHARON_TARGET_DIR`). Restore before
-    # Extract; save only when Charon actually rewrote a crate, under a
-    # lockfile key so a second extract of the same lock is an exact hit
-    # and does not clone the dir.
+    # `.pyre-build/charon-target` (`CHARON_TARGET_DIR`; the Windows job sets
+    # a shorter one). Restore before Extract; save only when Charon actually
+    # rewrote a crate, under a lockfile key so a second extract of the same
+    # lock is an exact hit and does not clone the dir.
     - name: Restore Charon cargo target
       id: charon-target-cache
       uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
-        path: .pyre-build/charon-target
+        path: ${{ env.CHARON_TARGET_DIR || '.pyre-build/charon-target' }}
         key: charon-target-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ hashFiles('Cargo.lock') }}
         restore-keys: |
           charon-target-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
@@ -485,7 +485,7 @@ jobs:
          steps.llbc-extract.outputs.pyre_jit_rewrote == '1')
       uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
-        path: .pyre-build/charon-target
+        path: ${{ env.CHARON_TARGET_DIR || '.pyre-build/charon-target' }}
         key: charon-target-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ hashFiles('Cargo.lock') }}
     - name: Upload LLBC artifact
       # Hand the ullbc set (freshly extracted, or restored from the cache
@@ -552,6 +552,16 @@ jobs:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.09.26
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      # Cargo passes one `-L dependency=<target>/<triple>/debug/build/<pkg>/<hash>/out`
+      # per dependency, and pyre-interpreter has 263 of them. Under the
+      # workspace's `.pyre-build/charon-target/<key>` the rustc line is about
+      # 43k characters, past the 32767 Windows allows, so cargo hands it to
+      # the wrapper as an `@argfile`. charon-driver looks for `--target` in
+      # its own argv before rustc expands the file, misses it, and compiles
+      # the crate as a host dependency against the normal sysroot: every
+      # `--extern` fails with E0463. A two-level target dir brings the line
+      # to about 29k.
+      CHARON_TARGET_DIR: D:\ct
     steps: *prepare-charon-llbc-steps
 
   cargo-test-linux:
