@@ -329,7 +329,6 @@ two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::binary_value
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::build_map
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::call_callable
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::compare_value
-two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::ellipsis_constant
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::iter_next
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::iter_value
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::list_append
@@ -397,10 +396,6 @@ two-phase-never-a-subject	pyre_interpreter::host_seam::real::<Impl>::getenv
 two-phase-never-a-subject	pyre_interpreter::importing::builtin_modules_get
 two-phase-never-a-subject	pyre_interpreter::importing::dev_mode_flag
 two-phase-never-a-subject	pyre_interpreter::importing::dict_getitem_str_no_callback
-two-phase-never-a-subject	pyre_interpreter::importing::dunder_import
-two-phase-never-a-subject	pyre_interpreter::importing::dunder_import_inner
-two-phase-never-a-subject	pyre_interpreter::importing::dunder_import_inner::<Impl>::call
-two-phase-never-a-subject	pyre_interpreter::importing::dunder_import_w
 two-phase-never-a-subject	pyre_interpreter::importing::get_builtin_module
 two-phase-never-a-subject	pyre_interpreter::importing::getbuiltinmodule
 two-phase-never-a-subject	pyre_interpreter::importing::is_exact_stdlib_module_spec
@@ -414,7 +409,6 @@ two-phase-never-a-subject	pyre_interpreter::importing::optional_module_hooks
 two-phase-never-a-subject	pyre_interpreter::importing::save_module_content_for_future_reload
 two-phase-never-a-subject	pyre_interpreter::importing::set_sys_module
 two-phase-never-a-subject	pyre_interpreter::importing::spec_file_origin
-two-phase-never-a-subject	pyre_interpreter::importing::startup_builtin_module_impl
 two-phase-never-a-subject	pyre_interpreter::importing::utf8_mode_flag
 two-phase-never-a-subject	pyre_interpreter::importing::warn_default_encoding_flag
 two-phase-never-a-subject	pyre_interpreter::module::__pypy__::interp_buffer::<Impl>::__buffer__
@@ -1043,7 +1037,6 @@ two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_dispat
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_inplace_special
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_lookup_unaryop
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_reflected_binary_special
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_reflected_binary_special::<Impl>::call
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::tuple_concat_type_error
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor_impl
@@ -1721,8 +1714,6 @@ two-phase-never-a-subject	pyre_object::gc_hook::gc_identity_hash
 two-phase-never-a-subject	pyre_object::gc_hook::try_gc_alloc
 two-phase-never-a-subject	pyre_object::gc_hook::try_gc_alloc_collecting_rooted
 two-phase-never-a-subject	pyre_object::gc_hook::try_gc_alloc_stable
-two-phase-never-a-subject	pyre_object::gc_hook::try_gc_register_finalizer
-two-phase-never-a-subject	pyre_object::gc_roots::<Impl>::new
 two-phase-never-a-subject	pyre_object::generator::w_async_generator_new
 two-phase-never-a-subject	pyre_object::generator::w_coroutine_new
 two-phase-never-a-subject	pyre_object::generator::w_generator_new
@@ -1828,7 +1819,6 @@ two-phase-never-a-subject	pyre_object::setobject::w_set_insert_key_into
 two-phase-never-a-subject	pyre_object::setobject::w_set_insert_key_into::<Impl>::call_once
 two-phase-never-a-subject	pyre_object::setobject::w_set_insert_key_reentrant
 two-phase-never-a-subject	pyre_object::slots::slot_get
-two-phase-never-a-subject	pyre_object::special::w_ellipsis
 two-phase-never-a-subject	pyre_object::tupleobject::w_tuple_getitem
 two-phase-never-a-subject	pyre_object::tupleobject::w_tuple_getitem_known
 two-phase-never-a-subject	pyre_object::unicode_array::<Impl>::pop
