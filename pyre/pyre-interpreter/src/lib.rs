@@ -1193,12 +1193,15 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // `gc.GcRef` keeps its raw referent as a traced wrapper field.
         // referent field is traced on the wrapper itself, as in
         // `pypy/module/gc/referents.py`.
-        subclass_range_alias(159, typed::<crate::module::gc::gcref::W_GcRef>()),
+        subclass_range_alias(159, typed::<crate::module::gc::referents::gcref::W_GcRef>()),
         // `gc.hooks` owns its three callback references directly, matching
         // W_AppLevelHooks in pypy/module/gc/hook.py.
         subclass_range_alias(160, typed::<crate::module::gc::hook::W_AppLevelHooks>()),
         // `gc._get_stats()` returns referents.py's native W_GcStats owner.
-        subclass_range_alias(161, typed::<crate::module::gc::stats::W_GcStats>()),
+        subclass_range_alias(
+            161,
+            typed::<crate::module::gc::referents::stats::W_GcStats>(),
+        ),
         // `_PyLineIterator` / `_PyPositionsIterator` / `_PyBranchesIterator` —
         // each retains the code object its suspended walk reads.  All three
         // are unconditional, so they precede the target-gated native aliases.

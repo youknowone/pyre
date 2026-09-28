@@ -56,17 +56,9 @@ impl PyPyJitPolicy {
     /// policy.py `look_inside_pypy_module(self, modname)`.
     ///
     /// `modname` is the module path below `pypy.module.`, `::`-separated.
-    ///
-    /// Upstream tests `unicodedata` / `gc` / `_minimal_curses` only when
-    /// `modname` names a submodule: a PyPy module keeps its interp-level
-    /// bodies in `interp_*.py` submodules and its package `__init__.py`
-    /// holds no function, so the submodule test already covers the whole
-    /// module.  A pyre module keeps its bodies in the package's `mod.rs`,
-    /// whose functions report the bare package path, so the test runs on
-    /// the package name whether or not a submodule follows.  Convergence
-    /// path: the module tree split into `interp_*.rs` files the way
-    /// `pypy/module/<name>/` is split, after which the bare-package case
-    /// holds no body either.
+    /// `unicodedata` / `gc` / `_minimal_curses` are rejected only below the
+    /// package: their bodies live in `interp_*` submodules, and the package
+    /// itself holds the `moduledef` table.
     pub fn look_inside_pypy_module(&self, modname: &str) -> bool {
         if modname == "__builtin__::operation"
             || modname == "__builtin__::abstractinst"
@@ -79,10 +71,15 @@ impl PyPyJitPolicy {
         {
             return true;
         }
-        let (modname, rest) = modname.split_once("::").unwrap_or((modname, ""));
-        if ["unicodedata", "gc", "_minimal_curses"].contains(&modname) {
-            return false;
-        }
+        let (modname, rest) = match modname.split_once("::") {
+            Some((modname, rest)) => {
+                if ["unicodedata", "gc", "_minimal_curses"].contains(&modname) {
+                    return false;
+                }
+                (modname, rest)
+            }
+            None => (modname, ""),
+        };
         if modname == "pypyjit" && rest.contains("interp_resop") {
             return false;
         }
@@ -240,14 +237,13 @@ mod tests {
 
     // The pyre-side mappings the upstream tests do not reach.
 
-    /// `unicodedata` / `gc` / `_minimal_curses` are rejected at the bare
-    /// package path too, where pyre's `mod.rs` bodies sit, and in both
-    /// module crates.
+    /// `unicodedata` / `gc` / `_minimal_curses` are rejected below the
+    /// package in both module crates; the package path itself is not.
     #[test]
-    fn excluded_modules_are_rejected_at_the_package_path_in_both_crates() {
+    fn excluded_modules_are_rejected_below_the_package_in_both_crates() {
         for root in PYPY_MODULE_ROOTS {
             for modname in ["unicodedata", "gc", "_minimal_curses"] {
-                assert!(!looks_inside(&format!("{root}{modname}")));
+                assert!(looks_inside(&format!("{root}{modname}")));
                 assert!(!looks_inside(&format!("{root}{modname}::interp")));
             }
         }
@@ -271,7 +267,7 @@ mod tests {
     /// asks `look_inside_function`, so the hint overrides the module.
     #[test]
     fn look_inside_hint_overrides_the_module_rejection() {
-        let mut func = func_in(Some("pyre_module::module::unicodedata"));
+        let mut func = func_in(Some("pyre_module::module::unicodedata::interp_ucd"));
         let mut policy = pypypolicy();
         assert!(!policy.look_inside_graph(&func));
         func.hints = vec!["jit_look_inside".into()];

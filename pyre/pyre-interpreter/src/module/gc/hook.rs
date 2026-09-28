@@ -1,11 +1,12 @@
 //! App-level GC hooks — PyPy: `pypy/module/gc/hook.py`.
 
-use super::{new_collect_stats, new_collect_step_stats_full, new_minor_stats};
 use crate::executioncontext::{
     ActionFlagOps, AsyncAction, AsyncActionControl, AsyncActionOps, ExecutionContext,
 };
 use crate::pyframe::PyFrame;
+use majit_gc::GcStepTransition;
 use pyre_object::*;
+use rustpython_wtf8::Wtf8;
 use std::sync::OnceLock;
 
 struct GcMinorHookAction {
@@ -155,7 +156,7 @@ impl GcCollectStepHookAction {
             duration_max,
             oldstate,
             newstate,
-            super::is_done_states(oldstate, newstate),
+            super::interp_gc::is_done_states(oldstate, newstate),
         )?;
         let _ = pyre_object::gc_roots::pin_root(stats);
         let stats_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -536,4 +537,433 @@ fn on_gc_collect(
     action.rawmalloc_bytes_after = rawmalloc_bytes_after;
     action.pinned_objects = pinned_objects;
     action.fire();
+}
+
+/// `hook.py W_GcCollectStepStats` takes the four states from `incminimark`,
+/// where they are declared and compared against it, and numbers its own one
+/// past the last.
+pub(super) const STATE_SCANNING: u8 = GcStepTransition::STATE_SCANNING;
+const STATE_MARKING: u8 = GcStepTransition::STATE_MARKING;
+const STATE_SWEEPING: u8 = GcStepTransition::STATE_SWEEPING;
+const STATE_FINALIZING: u8 = GcStepTransition::STATE_FINALIZING;
+pub(super) const STATE_USERDEL: u8 = GcStepTransition::STATE_FINALIZING + 1;
+
+fn collect_step_stat_value(
+    args: &[PyObjectRef],
+    name: &'static str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let value = unsafe {
+        crate::objspace::std::mapdict::instance_node_getdictvalue(args[1], Wtf8::new(name))
+    };
+    value.ok_or_else(|| crate::PyError::attribute_error("uninitialized GcCollectStepStats"))
+}
+
+macro_rules! collect_step_stat_getter {
+    ($function:ident, $name:literal) => {
+        fn $function(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            collect_step_stat_value(args, $name)
+        }
+    };
+}
+
+collect_step_stat_getter!(collect_step_count, "_count");
+collect_step_stat_getter!(collect_step_duration, "_duration");
+collect_step_stat_getter!(collect_step_duration_min, "_duration_min");
+collect_step_stat_getter!(collect_step_duration_max, "_duration_max");
+collect_step_stat_getter!(collect_step_oldstate, "_oldstate");
+collect_step_stat_getter!(collect_step_newstate, "_newstate");
+collect_step_stat_getter!(collect_step_major_is_done, "_major_is_done");
+
+/// Whether `name` is one of a stats object's hidden storage slots.
+///
+/// Both stats types keep their values in mapdict slots under single-underscore
+/// names, so the rule is the prefix rather than the seven names that exist
+/// today — a slot added later is hidden without a second edit. Dunders are not
+/// storage and stay reachable: upstream's `W_GcCollectStepStats` is an ordinary
+/// `TypeDef` object, so `__class__` and `__repr__` answer the way they do on
+/// any other one. `__dict__` is the exception, because these objects have none.
+fn is_hidden_stat_slot(name: &str) -> bool {
+    name == "__dict__" || (name.starts_with('_') && !name.starts_with("__"))
+}
+
+fn collect_step_stats_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name = crate::baseobjspace::text_w(args[1])?;
+    if is_hidden_stat_slot(name) {
+        return Err(crate::PyError::attribute_error(format!(
+            "'GcCollectStepStats' object has no attribute '{name}'"
+        )));
+    }
+    crate::baseobjspace::object_getattribute(args[0], name)
+}
+
+fn collect_step_stats_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name = crate::baseobjspace::text_w(args[1])?;
+    Err(crate::PyError::attribute_error(format!(
+        "readonly attribute '{name}'"
+    )))
+}
+
+pub(super) fn gc_collect_step_stats_type() -> PyObjectRef {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("GcCollectStepStats", |ns| unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "__getattribute__",
+                crate::make_builtin_function_with_arity(
+                    "__getattribute__",
+                    collect_step_stats_getattribute,
+                    2,
+                ),
+            );
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "__setattr__",
+                crate::make_builtin_function_with_arity(
+                    "__setattr__",
+                    collect_step_stats_setattr,
+                    3,
+                ),
+            );
+            for (name, value) in [
+                ("STATE_SCANNING", STATE_SCANNING),
+                ("STATE_MARKING", STATE_MARKING),
+                ("STATE_SWEEPING", STATE_SWEEPING),
+                ("STATE_FINALIZING", STATE_FINALIZING),
+                ("STATE_USERDEL", STATE_USERDEL),
+            ] {
+                pyre_object::w_dict_setitem_str_no_proxy(ns, name, w_int_new(value as i64));
+            }
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "GC_STATES",
+                w_tuple_new(
+                    ["SCANNING", "MARKING", "SWEEPING", "FINALIZING", "USERDEL"]
+                        .into_iter()
+                        .map(w_str_new)
+                        .collect(),
+                ),
+            );
+            for (name, getter) in [
+                ("count", collect_step_count as crate::gateway::BuiltinCodeFn),
+                ("duration", collect_step_duration),
+                ("duration_min", collect_step_duration_min),
+                ("duration_max", collect_step_duration_max),
+                ("oldstate", collect_step_oldstate),
+                ("newstate", collect_step_newstate),
+                ("major_is_done", collect_step_major_is_done),
+            ] {
+                pyre_object::w_dict_setitem_str_no_proxy(
+                    ns,
+                    name,
+                    crate::typedef::make_getset_descriptor_named(
+                        crate::make_builtin_function_with_arity(name, getter, 2),
+                        name,
+                    ),
+                );
+            }
+        });
+        unsafe { typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
+        tp
+    })
+}
+
+pub(super) fn new_collect_step_stats(
+    oldstate: u8,
+    newstate: u8,
+    major_is_done: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    new_collect_step_stats_full(1, -1.0, -1.0, -1.0, oldstate, newstate, major_is_done)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_collect_step_stats_full(
+    count: i64,
+    duration: f64,
+    duration_min: f64,
+    duration_max: f64,
+    oldstate: u8,
+    newstate: u8,
+    major_is_done: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    initialize_stats(
+        gc_collect_step_stats_type(),
+        &[
+            ("_count", StatValue::Int(count)),
+            ("_duration", StatValue::Float(duration)),
+            ("_duration_min", StatValue::Float(duration_min)),
+            ("_duration_max", StatValue::Float(duration_max)),
+            ("_oldstate", StatValue::Int(oldstate as i64)),
+            ("_newstate", StatValue::Int(newstate as i64)),
+            ("_major_is_done", StatValue::Bool(major_is_done)),
+        ],
+        "GcCollectStepStats",
+    )
+}
+
+fn readonly_stat_value(
+    args: &[PyObjectRef],
+    name: &'static str,
+    typename: &'static str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let value = unsafe {
+        crate::objspace::std::mapdict::instance_node_getdictvalue(args[1], Wtf8::new(name))
+    };
+    value.ok_or_else(|| crate::PyError::attribute_error(format!("uninitialized {typename}")))
+}
+
+macro_rules! readonly_stat_getter {
+    ($function:ident, $field:literal, $typename:literal) => {
+        fn $function(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            readonly_stat_value(args, $field, $typename)
+        }
+    };
+}
+
+readonly_stat_getter!(minor_count, "_count", "GcMinorStats");
+readonly_stat_getter!(minor_duration, "_duration", "GcMinorStats");
+readonly_stat_getter!(minor_duration_min, "_duration_min", "GcMinorStats");
+readonly_stat_getter!(minor_duration_max, "_duration_max", "GcMinorStats");
+readonly_stat_getter!(
+    minor_total_memory_used,
+    "_total_memory_used",
+    "GcMinorStats"
+);
+readonly_stat_getter!(minor_pinned_objects, "_pinned_objects", "GcMinorStats");
+
+readonly_stat_getter!(collect_count, "_count", "GcCollectStats");
+readonly_stat_getter!(
+    collect_num_major_collects,
+    "_num_major_collects",
+    "GcCollectStats"
+);
+readonly_stat_getter!(
+    collect_arenas_count_before,
+    "_arenas_count_before",
+    "GcCollectStats"
+);
+readonly_stat_getter!(
+    collect_arenas_count_after,
+    "_arenas_count_after",
+    "GcCollectStats"
+);
+readonly_stat_getter!(collect_arenas_bytes, "_arenas_bytes", "GcCollectStats");
+readonly_stat_getter!(
+    collect_rawmalloc_bytes_before,
+    "_rawmalloc_bytes_before",
+    "GcCollectStats"
+);
+readonly_stat_getter!(
+    collect_rawmalloc_bytes_after,
+    "_rawmalloc_bytes_after",
+    "GcCollectStats"
+);
+readonly_stat_getter!(collect_pinned_objects, "_pinned_objects", "GcCollectStats");
+
+fn stats_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name = crate::baseobjspace::text_w(args[1])?;
+    Err(crate::PyError::attribute_error(format!(
+        "readonly attribute '{name}'"
+    )))
+}
+
+fn stats_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name = crate::baseobjspace::text_w(args[1])?;
+    if is_hidden_stat_slot(name) {
+        return Err(crate::PyError::attribute_error(format!(
+            "stats object has no attribute '{name}'"
+        )));
+    }
+    crate::baseobjspace::object_getattribute(args[0], name)
+}
+
+fn make_private_stats_type(
+    name: &'static str,
+    fields: &[(&'static str, crate::gateway::BuiltinCodeFn)],
+) -> PyObjectRef {
+    let tp = crate::typedef::make_builtin_type(name, |ns| unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__getattribute__",
+            crate::make_builtin_function_with_arity("__getattribute__", stats_getattribute, 2),
+        );
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__setattr__",
+            crate::make_builtin_function_with_arity("__setattr__", stats_setattr, 3),
+        );
+        for &(field, getter) in fields {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                field,
+                crate::typedef::make_getset_descriptor_named(
+                    crate::make_builtin_function_with_arity(field, getter, 2),
+                    field,
+                ),
+            );
+        }
+    });
+    unsafe { typeobject::w_type_set_hasdict(tp, true) };
+    unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
+    tp
+}
+
+fn gc_minor_stats_type() -> PyObjectRef {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
+        make_private_stats_type(
+            "GcMinorStats",
+            &[
+                ("count", minor_count),
+                ("duration", minor_duration),
+                ("duration_min", minor_duration_min),
+                ("duration_max", minor_duration_max),
+                ("total_memory_used", minor_total_memory_used),
+                ("pinned_objects", minor_pinned_objects),
+            ],
+        )
+    })
+}
+
+fn gc_collect_stats_type() -> PyObjectRef {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
+        make_private_stats_type(
+            "GcCollectStats",
+            &[
+                ("count", collect_count),
+                ("num_major_collects", collect_num_major_collects),
+                ("arenas_count_before", collect_arenas_count_before),
+                ("arenas_count_after", collect_arenas_count_after),
+                ("arenas_bytes", collect_arenas_bytes),
+                ("rawmalloc_bytes_before", collect_rawmalloc_bytes_before),
+                ("rawmalloc_bytes_after", collect_rawmalloc_bytes_after),
+                ("pinned_objects", collect_pinned_objects),
+            ],
+        )
+    })
+}
+
+/// One private stats field, still unbuilt.
+///
+/// The point of deferring is rooting: a `Vec<(&str, PyObjectRef)>` built up
+/// front holds every value in plain Rust memory while the remaining `w_*_new`
+/// calls run, and the collector forwards shadow-stack slots, not Rust locals.
+enum StatValue {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+impl StatValue {
+    fn materialize(&self) -> PyObjectRef {
+        match *self {
+            StatValue::Int(v) => w_int_new(v),
+            StatValue::Float(v) => w_float_new(v),
+            StatValue::Bool(v) => w_bool_from(v),
+        }
+    }
+}
+
+/// Allocate a private stats instance of `stats_type` and fill it.
+///
+/// Both the field constructors and the mapdict transition inside
+/// `instance_node_setdictvalue` allocate, so either can move the instance and
+/// the value a Rust local names. Pin each on the shadow stack and read them
+/// back through their slots for every store, the way `populate_public_gc_stats`
+/// below does. The instance is created here rather than passed in so a caller
+/// cannot hand over one that was allocated before any root existed.
+fn initialize_stats(
+    stats_type: PyObjectRef,
+    fields: &[(&'static str, StatValue)],
+    typename: &'static str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let stats_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_instance_new(stats_type));
+    for (name, value) in fields {
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(value.materialize());
+        let stored = unsafe {
+            crate::objspace::std::mapdict::instance_node_setdictvalue(
+                pyre_object::gc_roots::shadow_stack_get(stats_slot),
+                Wtf8::new(name),
+                pyre_object::gc_roots::shadow_stack_get(value_slot),
+            )
+        };
+        if !stored {
+            return Err(crate::PyError::attribute_error(format!(
+                "cannot initialize {typename}"
+            )));
+        }
+    }
+    Ok(pyre_object::gc_roots::shadow_stack_get(stats_slot))
+}
+
+fn new_minor_stats(
+    count: i64,
+    duration: f64,
+    duration_min: f64,
+    duration_max: f64,
+    total_memory_used: usize,
+    pinned_objects: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    initialize_stats(
+        gc_minor_stats_type(),
+        &[
+            ("_count", StatValue::Int(count)),
+            ("_duration", StatValue::Float(duration)),
+            ("_duration_min", StatValue::Float(duration_min)),
+            ("_duration_max", StatValue::Float(duration_max)),
+            (
+                "_total_memory_used",
+                StatValue::Int(total_memory_used as i64),
+            ),
+            ("_pinned_objects", StatValue::Int(pinned_objects as i64)),
+        ],
+        "GcMinorStats",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_collect_stats(
+    count: i64,
+    num_major_collects: usize,
+    arenas_count_before: usize,
+    arenas_count_after: usize,
+    arenas_bytes: usize,
+    rawmalloc_bytes_before: usize,
+    rawmalloc_bytes_after: usize,
+    pinned_objects: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    initialize_stats(
+        gc_collect_stats_type(),
+        &[
+            ("_count", StatValue::Int(count)),
+            (
+                "_num_major_collects",
+                StatValue::Int(num_major_collects as i64),
+            ),
+            (
+                "_arenas_count_before",
+                StatValue::Int(arenas_count_before as i64),
+            ),
+            (
+                "_arenas_count_after",
+                StatValue::Int(arenas_count_after as i64),
+            ),
+            ("_arenas_bytes", StatValue::Int(arenas_bytes as i64)),
+            (
+                "_rawmalloc_bytes_before",
+                StatValue::Int(rawmalloc_bytes_before as i64),
+            ),
+            (
+                "_rawmalloc_bytes_after",
+                StatValue::Int(rawmalloc_bytes_after as i64),
+            ),
+            ("_pinned_objects", StatValue::Int(pinned_objects as i64)),
+        ],
+        "GcCollectStats",
+    )
 }
