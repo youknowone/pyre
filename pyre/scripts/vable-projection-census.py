@@ -137,15 +137,39 @@ def base_of(line: str, close: int) -> str | None:
     return None
 
 
+def projection_base(line: str, dot: int) -> tuple[str, bool] | None:
+    """The base of the projection whose `.field` starts at `dot`.
+
+    Returns `(base, parenthesised)`.  Charon prints a projection off a
+    dereference with its base in parentheses, `(*self_1).pycode`, and one off
+    a local as a bare path, `frame.pycode` (older releases parenthesised that
+    too, `(frame_1).pycode`).  A bare path may itself be a chain of field
+    projections, `frame.inner.pycode`, whose root is then the base; a chain
+    rooted at a parenthesised base, `(*self).inner.pycode`, takes that base.
+    None when the text before `dot` is neither shape.
+    """
+    i = dot
+    while i > 0 and (line[i - 1].isalnum() or line[i - 1] in "_."):
+        i -= 1
+    chain = line[i:dot]
+    if i > 0 and line[i - 1] == ")" and (chain == "" or chain.startswith(".")):
+        base = base_of(line, i - 1)
+        return None if base is None else (base, True)
+    root = chain.split(".", 1)[0]
+    if BARE_IDENT.fullmatch(root):
+        return root, False
+    return None
+
+
 def census(dump: str, fields: list[str]) -> tuple[dict[str, int], list[str]]:
     """Per-function count of projections whose base is not a deref.
 
-    `(frame_1).f` is non-deref; anything reaching through a `*` is a deref.
-    A base of neither shape is returned as unclassified rather than assumed
-    harmless — a silently miscounting tripwire is worse than none.
+    `frame_1.f` / `(frame_1).f` is non-deref; anything reaching through a `*`
+    is a deref.  A base of neither shape is returned as unclassified rather
+    than assumed harmless — a silently miscounting tripwire is worse than none.
     """
     alt = "|".join(re.escape(f) for f in fields)
-    any_proj = re.compile(r"\)\.(?:" + alt + r")\b")
+    any_proj = re.compile(r"(?<=[\w)])\.(?:" + alt + r")\b")
 
     counts: dict[str, int] = defaultdict(int)
     unclassified: list[str] = []
@@ -158,10 +182,14 @@ def census(dump: str, fields: list[str]) -> tuple[dict[str, int], list[str]]:
         if line.lstrip().startswith("//"):
             continue
         for hit in any_proj.finditer(line):
-            base = base_of(line, hit.start())
-            if base is not None and BARE_IDENT.fullmatch(base):
+            found = projection_base(line, hit.start())
+            if found is None:
+                unclassified.append(f"{fn}: {line.strip()}")
+                continue
+            base, parenthesised = found
+            if BARE_IDENT.fullmatch(base):
                 counts[fn] += 1
-            elif base is not None and "*" in base:
+            elif parenthesised and "*" in base:
                 pass
             else:
                 unclassified.append(f"{fn}: {line.strip()}")
