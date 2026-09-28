@@ -15686,6 +15686,7 @@ impl<'a> Lowering<'a> {
                     Some(payload)
                 } else {
                     self.reflexive_into_alias(
+                        &reg,
                         &segments,
                         &args,
                         first_arg_ty.as_ref(),
@@ -15699,7 +15700,7 @@ impl<'a> Lowering<'a> {
                             &call.dest.ty,
                         )
                     })
-                    .or_else(|| self.trait_into_string_alias(&segments, &args, &call.dest.ty))
+                    .or_else(|| self.trait_into_string_alias(&reg, &segments, &args, &call.dest.ty))
                     .or_else(|| self.wtf8_string_identity_alias(&segments, &args))
                     .or_else(|| {
                         self.oparg_arg_get_alias(&reg.kind, &segments, &args, &call.dest.ty)
@@ -21477,14 +21478,7 @@ impl<'a> Lowering<'a> {
     /// obligation is unresolved (`kind` is a clause/builtin rather
     /// than `TraitImpl`) or any table lookup misses.
     fn blanket_into_devirt(&self, reg: &RegularCall) -> Option<IntoDevirt> {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return None;
-        };
-        let is_blanket_into = self
-            .llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::convert::<Impl>::into");
-        if !is_blanket_into {
+        if !self.callee_is_blanket_into(reg) {
             return None;
         }
         let trait_refs = reg.generics.get("trait_refs")?.as_array()?;
@@ -25471,22 +25465,34 @@ impl<'a> Lowering<'a> {
     /// the generic `Call` form.
     fn reflexive_into_alias(
         &self,
+        reg: &RegularCall,
         segments: &[String],
         args: &[Variable],
         first_arg_ty: Option<&TyRef>,
         dest_ty: &TyRef,
     ) -> Option<Variable> {
-        let [first, .., module, impl_seg, leaf] = segments else {
-            return None;
-        };
-        if first.as_str() != "core"
-            || module.as_str() != "convert"
-            || impl_seg.as_str() != "<Impl>"
-            || leaf.as_str() != "into"
-        {
+        let spelled_blanket = matches!(
+            segments,
+            [first, .., module, impl_seg, leaf]
+                if first == "core" && module == "convert" && impl_seg == "<Impl>" && leaf == "into"
+        );
+        if !spelled_blanket && !self.callee_is_blanket_into(reg) {
             return None;
         }
         self.identity_self_call_alias(args, first_arg_ty, dest_ty)
+    }
+
+    /// The callee is the blanket `impl<T, U: From<T>> Into<U> for T`
+    /// method.  Read off the declaration, not the rendered call path: a
+    /// monomorphized instance's `Self` is a concrete type, so its path
+    /// renders under that type's name.
+    fn callee_is_blanket_into(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::convert::<Impl>::into")
     }
 
     /// Resolve the reflexive blanket `IntoIterator::into_iter`
@@ -25551,16 +25557,20 @@ impl<'a> Lowering<'a> {
     /// single string type (`rstr.py`), so the conversion is an identity
     /// at the annotation level.  Other destination types keep the
     /// generic `Call` form.
+    ///
+    /// A monomorphized caller names the selected impl instead: the
+    /// blanket `core::convert::<Impl>::into` instance, which is the same
+    /// conversion.
     fn trait_into_string_alias(
         &self,
+        reg: &RegularCall,
         segments: &[String],
         args: &[Variable],
         dest_ty: &TyRef,
     ) -> Option<Variable> {
-        let [trait_seg, leaf] = segments else {
-            return None;
-        };
-        if trait_seg.as_str() != "Into" || leaf.as_str() != "into" {
+        let spelled_trait =
+            matches!(segments, [trait_seg, leaf] if trait_seg == "Into" && leaf == "into");
+        if !spelled_trait && !self.callee_is_blanket_into(reg) {
             return None;
         }
         let [arg] = args else {
@@ -31021,7 +31031,7 @@ fn mark_local_def(local_idx: usize, defs: &mut bit_set::BitSet, n_locals: usize)
 /// `JitPolicy.look_inside_function` subclasses test the path by prefix, and
 /// a trailing segment does not move a prefix test.
 fn fundecl_module(fd: &FunDecl) -> Option<String> {
-    let name = &fd.item_meta.name;
+    let name: Vec<&NameSeg> = fd.item_meta.template_name().collect();
     let mut segs: Vec<&str> = name
         .iter()
         .map_while(|seg| match seg {
@@ -32042,13 +32052,12 @@ fn field_ty_is_inline_vec(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(td) = llbc.type_by_id(id) else {
         return false;
     };
-    if td.item_meta.name.len() != 3 {
+    if td.item_meta.template_name().count() != 3 {
         return false;
     }
     let idents: Vec<&str> = td
         .item_meta
-        .name
-        .iter()
+        .template_name()
         .filter_map(|seg| match seg {
             NameSeg::Ident { ident: (s, _) } => Some(s.as_str()),
             NameSeg::Other(_) => None,
@@ -33900,20 +33909,20 @@ fn tyref_atomic_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
 fn tyref_atomic_arg<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let id = adt_node_def_id(node)?;
-    let name = &llbc.type_by_id(id)?.item_meta.name;
+    let meta = &llbc.type_by_id(id)?.item_meta;
     // Cheap leaf check first — no path-string allocation (unlike
     // `name_path` / `adt_path_of_tyref`).  This runs on the hot
     // `tyref_to_value_type` fallback path, so it must stay
     // allocation-free: bail before the module scan unless the type's
     // last segment is `Atomic`.
-    match name.last()? {
+    match meta.template_name().next_back()? {
         NameSeg::Ident { ident: (s, _) } if s == "Atomic" => {}
         _ => return None,
     }
     // Confirm std's `core::sync::atomic` module so a user type
     // coincidentally named `Atomic` does not match.
-    let in_atomic_mod = name
-        .iter()
+    let in_atomic_mod = meta
+        .template_name()
         .any(|s| matches!(s, NameSeg::Ident { ident: (id, _) } if id == "atomic"));
     if !in_atomic_mod {
         return None;
@@ -58730,6 +58739,33 @@ mod tests {
                 .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
             "{name}: successful get arm must read the guarded item"
         );
+    }
+
+    /// A monomorphized copy's module is its generic item's: the
+    /// `Instantiated` segment after the leaf is not a path segment.
+    #[test]
+    fn fundecl_module_of_an_instance_ends_at_its_leaf() {
+        let fd: majit_charon_reader::ullbc::FunDecl = serde_json::from_value(serde_json::json!({
+            "def_id": 0,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["c", 0]},
+                    {"Ident": ["m", 0]},
+                    {"Ident": ["f", 0]},
+                    {"Instantiated": {"params": {}, "kind": "Other", "skip_binder": {
+                        "regions": [], "types": [{"Deduplicated": 0}],
+                        "const_generics": [], "trait_refs": []}}}
+                ],
+                "span": {"Deduplicated": 0},
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {"is_unsafe": false, "inputs": [], "output": {"Deduplicated": 0}},
+            "body": null
+        }))
+        .unwrap();
+        assert_eq!(super::fundecl_module(&fd).as_deref(), Some("c::m"));
     }
 
     /// `func.__module__`: a free function's module ends at its leaf, a
