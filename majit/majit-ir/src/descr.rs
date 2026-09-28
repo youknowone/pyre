@@ -7522,7 +7522,15 @@ pub fn make_vtable_field_descr() -> DescrRef {
 /// (`FLAG_SHIFT = LONG_BIT/2`), like `incminimark.HDR.tid`. The descr
 /// covers that whole native word — `offset = 0`, `field_size = WORD` —
 /// so the one store `gen_initialize_tid` emits writes the type id and
-/// clears the flags, as upstream's Signed `HDR.tid` store does. On wasm32
+/// clears the flags, as upstream's Signed `HDR.tid` store does. Its
+/// objects come from `CALL_MALLOC_NURSERY*`, whose slow path returns a young
+/// object (`collect_and_reserve`, or `external_malloc(alloc_young=True)` for a
+/// large one), so no flag is set yet. That holds because the nursery is at
+/// least `2 * large_object` (`setup`'s `minsize`, `default_nursery_size`) and
+/// `max_size_of_young_obj` is `large_object`. A test `GcConfig` whose nursery
+/// is smaller than one inline-allocatable object breaks the invariant: its
+/// slow path falls back to an old-generation object, and this store clears
+/// the `TRACK_YOUNG_PTRS` bit that birth set. On wasm32
 /// the physical header keeps four more bytes of ABI padding after the
 /// word; the store leaves them alone. The header sits *before* the
 /// object pointer; `gen_initialize_tid` translates the descr's offset by

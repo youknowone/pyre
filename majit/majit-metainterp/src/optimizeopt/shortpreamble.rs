@@ -2920,10 +2920,13 @@ impl ExtendedShortPreambleBuilder {
                 self.extra_same_as.push(same_as);
             }
             self.label_args.push(resolved_key);
-            // `used_boxes` stays the same length as `short_jump_args`: the
-            // bridge close keeps `inline_short_preamble`'s extra args only up
-            // to `used_boxes.len()`, so a missing entry drops this slot and the
-            // bridge JUMP lands one arg short of the LABEL `label_args` built.
+            // `ExtendedShortPreambleBuilder.add_preamble_op` appends to the
+            // target LABEL's own `label_args`. The flattened `ShortPreamble`
+            // carries that LABEL extra tail as `used_boxes`, so it grows with
+            // `short_jump_args`: the bridge close keeps `inline_short_preamble`'s
+            // extra args only up to `used_boxes.len()` (constants dropped, as
+            // the assembled LABEL drops them), and a missing entry leaves the
+            // bridge JUMP one arg short of the LABEL `label_args` built.
             self.used_boxes.push(resolved_key);
             // The flattened struct only needs the replay position; the replay
             // op itself is rooted by short_preamble_jump.
