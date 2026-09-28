@@ -12331,6 +12331,24 @@ where
     action
 }
 
+/// `MIFrame.pc` for `BlackholeInterpreter.setposition`.
+///
+/// `_get_opimpl_method` assigns `pc` at an instruction boundary. A cursor
+/// that sits on an operand byte is not that boundary;
+/// `last_opcode_position` is the opcode `run_one_step` saved before the
+/// decode. A cursor that is already a startpoint stays.
+pub(crate) fn snap_pc_to_instruction_start(frame: &MIFrame) -> usize {
+    let cursor = frame.code_cursor;
+    let opcode_at = frame.last_opcode_position;
+    if frame.jitcode.is_valid_startpoint(cursor) {
+        cursor
+    } else if frame.jitcode.is_valid_startpoint(opcode_at) {
+        opcode_at
+    } else {
+        cursor
+    }
+}
+
 /// Publish an aborted walk's resume handoff onto the trace ctx.
 ///
 /// The walk executes the portal JitCode forward against the real
@@ -12450,15 +12468,7 @@ pub fn publish_walk_abort_handoff(
         let abort_after_panic = std::mem::replace(&mut ctx.abort_after_panic, false);
         if !abort_after_panic && stub_resume_pc.is_none() {
             if let Some(top) = standalone.frames.frames.last_mut() {
-                let cursor = top.code_cursor;
-                let opcode_at = top.last_opcode_position;
-                top.pc = if top.jitcode.is_valid_startpoint(cursor) {
-                    cursor
-                } else if top.jitcode.is_valid_startpoint(opcode_at) {
-                    opcode_at
-                } else {
-                    cursor
-                };
+                top.pc = snap_pc_to_instruction_start(top);
             }
             ctx.aborted_framestack = Some(std::mem::take(&mut standalone.frames));
         }
