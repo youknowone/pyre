@@ -3888,46 +3888,53 @@ pub fn lower_struct_ptr_writes(
                     _ => None,
                 }
             });
-            let aggregate_owner = graph
+            let aggregate_ctor = graph
                 .blocks
                 .iter()
                 .flat_map(|block| &block.operations)
                 .find_map(|candidate| match (&candidate.result, &candidate.kind) {
                     (Some(result), OpKind::Call { target, .. }) if result == &aggregate => {
-                        synthetic_transparent_ctor_owner(target, graph.name.split("::").next())
+                        match target {
+                            CallTarget::SyntheticTransparentCtor { name, .. } => {
+                                synthetic_transparent_ctor_owner(
+                                    target,
+                                    graph.name.split("::").next(),
+                                )
+                                .map(|owner| (owner, name.as_str()))
+                            }
+                            _ => None,
+                        }
                     }
                     _ => None,
                 });
-            let same_owner = destination_owner
-                .zip(aggregate_owner.as_deref())
-                .is_some_and(|(destination, aggregate)| {
+            let aggregate_owner = aggregate_ctor.as_ref().map(|(owner, _)| owner.clone());
+            // The destination names its pointee by class root, which is the
+            // declaration's bare leaf unless that leaf was withdrawn as
+            // ambiguous (`adt_node_class_root_with`); the constructor carries
+            // the same leaf beside its module path. The name → `StructId`
+            // table is published only after the whole program is lowered
+            // (`register_struct_ids`), so it cannot identify the two here.
+            let same_owner = destination_owner.zip(aggregate_ctor.as_ref()).is_some_and(
+                |(destination, (aggregate, leaf))| {
                     destination == aggregate
+                        || destination == *leaf
                         || majit_ir::descr::struct_id_for_name(destination)
                             .zip(majit_ir::descr::struct_id_for_name(aggregate))
                             .is_some_and(|(destination_id, aggregate_id)| {
                                 destination_id == aggregate_id
                             })
-                });
+                },
+            );
             if !same_owner {
                 continue;
             }
-            // `checkgraph` (`flowspace/model.py`) permits an operation
-            // to use only constants, its block's inputargs, or variables
-            // defined earlier in that block.  A FieldWrite found on another
-            // aggregate path may carry a predecessor-local Variable; splicing
-            // that Variable verbatim here would create invalid SSI even when
-            // its producer dominates this block.  Until the pass can rethread
-            // such a value through the incoming links, decline the whole
-            // rewrite unless every stored value is already in scope here.
-            let value_is_in_scope = |value: &LinkArg| match value {
-                LinkArg::Const(_) => true,
-                LinkArg::Value(value) => {
-                    block.inputargs.contains(value)
-                        || block.operations[..oi]
-                            .iter()
-                            .any(|candidate| candidate.result.as_ref() == Some(value))
-                }
-            };
+            // A stored value may be a Variable of the store's block rather than
+            // of this one. `checkgraph` (`flowspace/model.py`) does not accept
+            // that as it stands, but the store's block dominates this one, so
+            // the value is available on every path here and
+            // `thread_undefined_op_operands` (the `SSA_to_SSI` step,
+            // `backendopt/ssa.py`) adds the inputargs and link arguments that
+            // carry it once the simplification sweeps are done.
             let stores: Vec<_> = graph
                 .blocks
                 .iter()
@@ -3955,7 +3962,7 @@ pub fn lower_struct_ptr_writes(
             // or its block dominates the call block. Cross-block dominators are
             // built on the first such store — graphs with only same-block
             // stores never build them.
-            if stores.iter().any(|(store_bi, store_oi, _, value, _)| {
+            if stores.iter().any(|(store_bi, store_oi, _, _, _)| {
                 let store_dominates_call = if *store_bi == bi {
                     *store_oi < oi
                 } else {
@@ -3963,7 +3970,7 @@ pub fn lower_struct_ptr_writes(
                         .get_or_insert_with(|| BlockDominators::compute(graph))
                         .dominates(*store_bi, bi)
                 };
-                !store_dominates_call || !value_is_in_scope(value)
+                !store_dominates_call
             }) {
                 continue;
             }
@@ -9353,12 +9360,12 @@ mod tests {
     }
 
     #[test]
-    fn lower_struct_ptr_writes_declines_predecessor_local_store_value() {
+    fn lower_struct_ptr_writes_threads_a_predecessor_local_store_value() {
         // The aggregate is constructed in `entry`, but only the aggregate
-        // itself is threaded into `write_block`.  Re-emitting its field store
-        // there with `value` would introduce a cross-block Variable use that
-        // flowspace.checkgraph rejects.  The ptr::write must remain residual
-        // until the value is explicitly threaded through an inputarg.
+        // itself is threaded into `write_block`.  The re-emitted field store
+        // reads `entry`'s `value`, which `entry` dominates, so
+        // `thread_undefined_op_operands` carries it over the link and the
+        // store reads `write_block`'s own inputarg.
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let value = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
@@ -9386,7 +9393,7 @@ mod tests {
                     inline_vec: false,
                     vec_part: None,
                 },
-                value: LinkArg::Value(value),
+                value: LinkArg::Value(value.clone()),
                 ty: ValueType::Int,
             },
             false,
@@ -9410,7 +9417,7 @@ mod tests {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
                     fun_decl_id: None,
                 },
-                args: crate::model::call_args(vec![destination, carried[0].clone()]),
+                args: crate::model::call_args(vec![destination.clone(), carried[0].clone()]),
                 result_ty: ValueType::Void,
             },
             false,
@@ -9421,12 +9428,107 @@ mod tests {
             "Payload".to_string(),
             vec![("item".to_string(), ValueType::Int)],
         )]);
-        assert_eq!(lower_struct_ptr_writes(&mut graph, &attrs), 0);
-        assert!(graph.block(write_block).operations.iter().any(|op| {
+        assert_eq!(lower_struct_ptr_writes(&mut graph, &attrs), 1);
+        thread_undefined_op_operands(&mut graph);
+        let block = graph.block(write_block);
+        assert!(!block.operations.iter().any(|op| {
             matches!(
                 &op.kind,
                 OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
+            )
+        }));
+        let stored = block
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite {
+                    base,
+                    field,
+                    value: LinkArg::Value(stored),
+                    ..
+                } if base == &destination && field.name == "item" => Some(stored.clone()),
+                _ => None,
+            })
+            .expect("the store is re-emitted at the write");
+        assert!(block.inputargs.contains(&stored));
+        let link = &graph.block(entry).exits[0];
+        assert_eq!(link.target, write_block);
+        assert!(link.args.contains(&LinkArg::Value(value)));
+    }
+
+    #[test]
+    fn lower_struct_ptr_writes_matches_a_leaf_destination_to_a_qualified_ctor() {
+        // The destination names the pointee by its bare class root while the
+        // constructor carries the declaration's module path; the name →
+        // `StructId` table is empty while the front lowers.
+        let mut graph = FunctionGraph::new("pyre_object::m::alloc");
+        let entry = graph.startblock;
+        let aggregate = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["pyre_object".into(), "m".into(), "Payload".into()],
+                        "Payload",
+                    ),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("Payload".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: aggregate.clone(),
+                field: FieldDescriptor {
+                    name: "item".into(),
+                    owner_root: Some("Payload".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                },
+                value: LinkArg::from(ConstValue::Int(7)),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let raw = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        let destination = graph
+            .push_op_var(
+                entry,
+                crate::model::cast_instance_call("Payload", raw),
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["core".into(), "ptr".into(), "write".into()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![destination.clone(), aggregate]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(entry, None);
+
+        let attrs = std::collections::HashMap::from([(
+            "m::Payload".to_string(),
+            vec![("item".to_string(), ValueType::Int)],
+        )]);
+        assert_eq!(lower_struct_ptr_writes(&mut graph, &attrs), 1);
+        assert!(graph.block(entry).operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { base, field, .. } if base == &destination && field.name == "item"
             )
         }));
     }

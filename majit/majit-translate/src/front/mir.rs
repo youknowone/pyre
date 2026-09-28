@@ -58508,7 +58508,11 @@ mod tests {
                 .expect("load pyre-interpreter LLBC"),
             Llbc::load(format!("{root}pyre-jit.ullbc")).expect("load pyre-jit LLBC"),
         ];
-        let names = ["w_cell_new", "w_long_from_raw", "w_str_from_wtf8_managed"];
+        let names = [
+            "w_cell_new",
+            "alloc_instance_object",
+            "w_str_from_wtf8_managed",
+        ];
         let program =
             super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
                 &llbcs,
@@ -58520,9 +58524,9 @@ mod tests {
         for (name, owner, expected_fields) in [
             ("w_cell_new", "Cell", &["ob", "contents", "family"][..]),
             (
-                "w_long_from_raw",
-                "W_LongObject",
-                &["ob_header", "value"][..],
+                "alloc_instance_object",
+                "W_ObjectObject",
+                &["ob_header", "map", "storage"][..],
             ),
             (
                 "w_str_from_wtf8_managed",
@@ -58551,33 +58555,46 @@ mod tests {
                 }),
                 "{name}: generic core::ptr::write must not survive as a shared callee"
             );
-            let destination = graph
+            // A graph can cast more than one raw pointer to the owner (the
+            // other arm's fallback allocation); the one the write targeted
+            // carries the stores.
+            let destinations: Vec<_> = graph
                 .blocks
                 .iter()
                 .flat_map(|b| &b.operations)
-                .find_map(|op| match (&op.result, &op.kind) {
-                    (
-                        Some(result),
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments, .. },
-                            ..
-                        },
-                    ) if crate::model::cast_instance_root(&op.kind) == Some(owner) => Some(result),
-                    _ => None,
-                })
-                .expect("typed raw allocation destination");
-            let fields: Vec<_> = graph
-                .blocks
-                .iter()
-                .flat_map(|b| &b.operations)
-                .filter_map(|op| match &op.kind {
-                    OpKind::FieldWrite { base, field, .. } if base == destination => {
-                        Some(field.name.as_str())
+                .filter_map(|op| match (&op.result, &op.kind) {
+                    (Some(result), OpKind::Call { .. })
+                        if crate::model::cast_instance_root(&op.kind) == Some(owner) =>
+                    {
+                        Some(result)
                     }
                     _ => None,
                 })
                 .collect();
-            assert_eq!(fields, expected_fields, "{name}: source field order");
+            assert!(
+                !destinations.is_empty(),
+                "{name}: typed raw allocation destination"
+            );
+            let fields: Vec<Vec<_>> = destinations
+                .iter()
+                .map(|destination| {
+                    graph
+                        .blocks
+                        .iter()
+                        .flat_map(|b| &b.operations)
+                        .filter_map(|op| match &op.kind {
+                            OpKind::FieldWrite { base, field, .. } if base == *destination => {
+                                Some(field.name.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .collect();
+            assert!(
+                fields.iter().any(|fields| fields == expected_fields),
+                "{name}: source field order, got {fields:?}"
+            );
         }
     }
 
