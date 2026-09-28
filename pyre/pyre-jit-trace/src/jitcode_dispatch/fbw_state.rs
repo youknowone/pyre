@@ -2953,13 +2953,17 @@ pub(crate) fn fbw_terminate_void_with_finish<Sym: WalkSym>(
 /// outlives it, and `tb_frame.f_lineno` resolves through `offset2lineno` on
 /// this field — the return is the last coordinate the frame ever reached.
 ///
-/// The publish is `pyopcode.py`'s per-opcode `self.last_instr = ...` on the
-/// standard virtualizable, which `_opimpl_setfield_vable` (`pyjitpl.py`)
-/// turns into an update of `virtualizable_boxes` and records nothing.  The
-/// exit's `store_token_in_vable` then snapshots those boxes into
-/// `GUARD_NOT_FORCED_2`, so a reader that forces the frame after the exit
-/// gets this coordinate from the resume data; no `SETFIELD_GC` reaches the
-/// compiled exit.
+/// Upstream never faces either shape: the portal is entered only from a
+/// backward jump (`can_enter_jit`, `interp_jit.py`), so a loop-free function
+/// is never compiled as one, and the frame's `dispatch` loop runs inside the
+/// traced portal where every opcode writes `last_instr` (`pyopcode.py`).
+/// pyre's function-entry portal reaches the field from the interpreter after
+/// the trace has finished, so the coordinate has to be published before it
+/// does.
+///
+/// The store reaches the frame on a compiled run the way
+/// `gen_store_back_in_vable`'s does; the shadow mirror keeps the walker's own
+/// virtualizable view in step with it.
 pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     opcode_position: usize,
@@ -2986,17 +2990,37 @@ pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
     else {
         return;
     };
-    if ctx.trace_ctx.standard_virtualizable_box().is_none() {
+    let Some(vbox) = ctx.trace_ctx.standard_virtualizable_box() else {
         return;
-    }
+    };
+    let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() else {
+        return;
+    };
+    let Some(field_index) = info.static_field_index_by_name("last_instr") else {
+        return;
+    };
     let value = ctx.trace_ctx.const_int(i64::from(py_pc));
+    // Record under the PARENT-STRUCT field descr, the resolution
+    // `vable_setfield` applies through `vable_static_record_descr`, not the
+    // vinfo's own `static_field_descrs[i]`.  `virtualizable.py:71` builds the
+    // vinfo descrs with `cpu.fielddescrof(VTYPE, name)`, so upstream's vinfo
+    // descr and the descr an ordinary `setfield_gc` on that field carries are
+    // the same object; pyre keeps the two numberings apart, so a store left on
+    // the vinfo descr reaches the optimizer as a location of its own.  A frame
+    // that catches gets `last_instr` written twice at one offset — the raise
+    // coordinate by the traceback node, the return coordinate here — and under
+    // two descrs neither store supersedes the other, so which one survives to
+    // the frame is decided by the order the deferred stores are flushed in
+    // rather than the order they were recorded in.
+    let descr = info.static_field_struct_descr(field_index);
+    ctx.trace_ctx.vable_setfield_descr(vbox, value, descr);
     crate::trace_opcode::mirror_vable_static_to_boxes(
         ctx.trace_ctx,
         "last_instr",
         value,
         Value::Int(i64::from(py_pc)),
     );
-    // The shadow update has to have a concrete counterpart.  Upstream's
+    // The recorded store has to have a concrete counterpart.  Upstream's
     // tracing IS the interpreter, so its per-opcode `last_instr` write
     // (`pyopcode.py`) lands in the real frame on the very iteration the trace
     // is recorded from; the walker only records ops, so without this the
@@ -3005,7 +3029,7 @@ pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
     // `recording_frame_ptr` is the LIVE frame, not `virtualizable_heap_ptr`'s
     // trace-stepping snapshot: the snapshot's storage is released when tracing
     // ends, so a store there reaches nothing the interpreter goes on to read.
-    // This store lands whether or not the walk goes on
+    // Unlike the recorded store, this one lands whether or not the walk goes on
     // to commit, so it is journaled: a declined walk resumes the frame from its
     // pre-walk state and reads this very field to find the next instruction.
     if recording_frame_ptr != 0 {
