@@ -61,7 +61,9 @@ mod ll {
         INT,
         save_err = RFFI_SAVE_ERRNO
     );
-    // `has_flock` is true wherever `flock(2)` exists. Not variadic.
+    // `interp_fcntl.py` `has_flock` creates `c_flock` only when `platform.Has('flock')`.
+    // libc 0.2.186 `unix/mod.rs` `flock` is declared on unix except `target_os = "solaris"`.
+    #[cfg(not(target_os = "solaris"))]
     external!(
         pub(super) c_flock = "flock",
         [INT, INT],
@@ -72,7 +74,8 @@ mod ll {
 
 /// `interp_fcntl.py` `_raise_error_maybe`: `wrap_oserror(..., eintr_retry=True)`.
 /// EINTR runs the pending signal handlers and returns so the caller retries.
-/// The formatter stays out of the hot jitcode (`dont_look_inside`).
+/// `#[dont_look_inside]` stays: this formats an `OSError`, and upstream error
+/// paths are residual too.
 #[cfg(all(unix, feature = "host_env"))]
 #[majit_macros::dont_look_inside]
 fn raise_error_maybe(funcname: &str) -> Result<(), pyre_interpreter::PyError> {
@@ -101,94 +104,164 @@ fn oserror_from_saved_errno() -> pyre_interpreter::PyError {
     pyre_interpreter::error::wrap_oserror(pyre_object::w_none(), &error, None, None, None)
 }
 
-/// `Ok(0)` means EINTR was handled and the caller retries. Any other
-/// outcome is the OSError. No fat-pointer argument, so the call is a
-/// concrete residual rather than a symbolic helper.
-#[cfg(all(unix, feature = "host_env"))]
-#[majit_macros::dont_look_inside]
-fn flock_after_fail() -> Result<i64, pyre_interpreter::PyError> {
-    raise_error_maybe("flock")?;
-    Ok(0)
-}
-
-/// File objects and argument errors. Not on the integer fast path.
-#[cfg(all(unix, feature = "host_env"))]
-#[majit_macros::dont_look_inside]
-fn flock_slow(
+/// interp2app wrapper for `flock`: `@unwrap_spec(op=int)` unwraps the
+/// arguments, then calls the one-body `flock`.
+pub fn __majit_wrap_fcntl_flock(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    if args.len() < 2 {
+    if args.len() != 2 {
         return Err(pyre_interpreter::PyError::type_error(
             "flock() requires 2 arguments",
         ));
     }
+    // `@unwrap_spec(op=int)`.
     if !unsafe { pyre_object::is_int(args[1]) } {
         return Err(pyre_interpreter::PyError::type_error(
             "flock() arguments must be integers",
         ));
     }
-    // `flock(space, w_fd, op)` unwraps through `space.c_filedescriptor_w`.
-    let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
-    let op = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
-    loop {
-        let rv = unsafe { ll::c_flock(fd, op) };
-        if rv < 0 {
-            raise_error_maybe("flock")?;
-        } else {
-            return Ok(pyre_object::w_none());
-        }
-    }
-}
-
-/// `flock` gateway. The `__majit_wrap_` leaf is what
-/// `builtin_wrapper_indirect_graphs` seeds, so the tracer enters this body
-/// and records `c_flock`'s aroundstate call.
-fn __majit_wrap_fcntl_flock(
-    args: &[pyre_object::PyObjectRef],
-) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    #[cfg(all(unix, feature = "host_env"))]
-    {
-        // Integer fd and op: the traced arm. A file object takes `flock_slow`
-        // before any syscall, so that arm carries no effect yet.
-        if args.len() == 2
-            && unsafe { pyre_object::is_int(args[0]) }
-            && unsafe { pyre_object::is_int(args[1]) }
-        {
-            let fd = unsafe { pyre_object::w_int_get_value(args[0]) };
-            let op = unsafe { pyre_object::w_int_get_value(args[1]) };
-            // `c_filedescriptor_w` rejects a negative descriptor with
-            // ValueError before the syscall. `c_int_w` rejects a value
-            // outside the 32-bit range with OverflowError. Both stay off
-            // this arm: the traced call is a non-negative `c_int` fd.
-            if fd < 0 || fd > i32::MAX as i64 || !(i32::MIN as i64..=i32::MAX as i64).contains(&op)
-            {
-                return flock_slow(args);
-            }
-            let fd = fd as i32;
-            let op = op as i32;
-            loop {
-                let rv = unsafe { ll::c_flock(fd, op) };
-                if rv >= 0 {
-                    return Ok(pyre_object::w_none());
-                }
-                flock_after_fail()?;
-            }
-        }
-        return flock_slow(args);
-    }
-    #[cfg(not(all(unix, feature = "host_env")))]
-    {
-        let _ = args;
-        Err(pyre_interpreter::PyError::not_implemented(
-            "fcntl.flock requires host_env feature",
-        ))
-    }
+    let op = unsafe { pyre_object::w_int_get_value(args[1]) };
+    flock(args[0], op)
 }
 
 pyre_interpreter::builtin_wrapper_descriptor!(
     __majit_builtin_wrapper_target_fcntl_flock,
     __majit_wrap_fcntl_flock
 );
+
+/// `interp_fcntl.py` `flock`: one body. `has_flock` calls `c_flock`; otherwise
+/// `lockf(space, w_fd, op)`, which builds `_flock` and calls `fcntl_flock`.
+fn flock(
+    w_fd: pyre_object::PyObjectRef,
+    op: i64,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    #[cfg(all(unix, feature = "host_env"))]
+    {
+        // `if has_flock:` — the cfg `c_flock` is declared under.
+        #[cfg(not(target_os = "solaris"))]
+        {
+            // `fd = space.c_filedescriptor_w(w_fd)`; `op = rffi.cast(rffi.INT, op)`.
+            let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)?;
+            let op = op as i32;
+            loop {
+                let rv = unsafe { ll::c_flock(fd, op) };
+                if rv < 0 {
+                    raise_error_maybe("flock")?;
+                } else {
+                    return Ok(pyre_object::w_none());
+                }
+            }
+        }
+        // `else: lockf(space, w_fd, op)` — `_flock` fields and `fcntl_flock`
+        // live in `lockf` (`F_SETLK` when `op & LOCK_NB`, else `F_SETLKW`).
+        #[cfg(target_os = "solaris")]
+        {
+            return lockf(&[w_fd, pyre_object::w_int_new(op)]);
+        }
+    }
+    #[cfg(not(all(unix, feature = "host_env")))]
+    {
+        let _ = (w_fd, op);
+        Err(pyre_interpreter::PyError::not_implemented(
+            "fcntl.flock requires host_env feature",
+        ))
+    }
+}
+
+/// `interp_fcntl.py` `lockf`. `flock`'s `else` calls this with `op` only.
+fn lockf(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    #[cfg(all(unix, feature = "host_env"))]
+    {
+        if !(2..=5).contains(&args.len()) {
+            return Err(pyre_interpreter::PyError::type_error(
+                "lockf() takes from 2 to 5 arguments",
+            ));
+        }
+        for &a in args.iter().take(5).skip(1) {
+            if !unsafe { pyre_object::is_int(a) } {
+                return Err(pyre_interpreter::PyError::type_error(
+                    "lockf() arguments must be integers",
+                ));
+            }
+        }
+        // `lockf(space, w_fd, op, length, start, whence)` unwraps its
+        // descriptor through `space.c_filedescriptor_w`.
+        let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
+        let cmd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+        let len = if args.len() >= 3 {
+            unsafe { pyre_object::w_int_get_value(args[2]) }
+        } else {
+            0
+        };
+        let start = if args.len() >= 4 {
+            unsafe { pyre_object::w_int_get_value(args[3]) }
+        } else {
+            0
+        };
+        let whence = if args.len() >= 5 {
+            unsafe { pyre_object::w_int_get_value(args[4]) as i32 }
+        } else {
+            0
+        };
+        // `_flock` fields: `l_type` from `op == LOCK_UN` / `op & LOCK_SH` /
+        // `op & LOCK_EX`, then `F_SETLK` when `op & LOCK_NB` else `F_SETLKW`.
+        let l_type = if cmd == libc::LOCK_UN {
+            libc::F_UNLCK
+        } else if cmd & libc::LOCK_SH != 0 {
+            libc::F_RDLCK
+        } else if cmd & libc::LOCK_EX != 0 {
+            libc::F_WRLCK
+        } else {
+            // [3.14-spec] "unrecognized lockf argument" ↔ interp_fcntl.py
+            // `lockf` "unrecognized lock operation" — the ValueError text;
+            // evidence: fcntlmodule.c `fcntl_lockf_impl`.
+            return Err(pyre_interpreter::PyError::value_error(
+                "unrecognized lockf argument",
+            ));
+        };
+        let l_type = libc::c_short::try_from(l_type).map_err(|err| {
+            pyre_interpreter::PyError::value_error(format!("lockf: overflow: {err}"))
+        })?;
+        let l_whence = libc::c_short::try_from(whence).map_err(|err| {
+            pyre_interpreter::PyError::value_error(format!("lockf: overflow: {err}"))
+        })?;
+        let l_start = libc::off_t::try_from(start).map_err(|err| {
+            pyre_interpreter::PyError::value_error(format!("lockf: overflow: {err}"))
+        })?;
+        let l_len = libc::off_t::try_from(len).map_err(|err| {
+            pyre_interpreter::PyError::value_error(format!("lockf: overflow: {err}"))
+        })?;
+        let mut l = libc::flock {
+            l_type,
+            l_whence,
+            l_start,
+            l_len,
+            ..unsafe { core::mem::zeroed() }
+        };
+        let op = if cmd & libc::LOCK_NB != 0 {
+            libc::F_SETLK
+        } else {
+            libc::F_SETLKW
+        };
+        loop {
+            let rv = unsafe { ll::fcntl_flock(fd, op, &mut l) };
+            if rv < 0 {
+                raise_error_maybe("fcntl")?;
+            } else {
+                return Ok(pyre_object::w_none());
+            }
+        }
+    }
+    #[cfg(not(all(unix, feature = "host_env")))]
+    {
+        let _ = args;
+        Err(pyre_interpreter::PyError::not_implemented(
+            "fcntl.lockf requires host_env feature",
+        ))
+    }
+}
 
 /// fcntl module — PyPy: pypy/module/fcntl/interp_fcntl.py.
 ///
@@ -351,94 +424,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     pyre_interpreter::module_ns_store(
         ns,
         "lockf",
-        pyre_interpreter::make_builtin_function("lockf", |args| {
-            #[cfg(all(unix, feature = "host_env"))]
-            {
-                if !(2..=5).contains(&args.len()) {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "lockf() takes from 2 to 5 arguments",
-                    ));
-                }
-                for &a in args.iter().take(5).skip(1) {
-                    if !unsafe { pyre_object::is_int(a) } {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "lockf() arguments must be integers",
-                        ));
-                    }
-                }
-                // `lockf(space, w_fd, op, length, start, whence)` unwraps its
-                // descriptor through `space.c_filedescriptor_w`.
-                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
-                let cmd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
-                let len = if args.len() >= 3 {
-                    unsafe { pyre_object::w_int_get_value(args[2]) }
-                } else {
-                    0
-                };
-                let start = if args.len() >= 4 {
-                    unsafe { pyre_object::w_int_get_value(args[3]) }
-                } else {
-                    0
-                };
-                let whence = if args.len() >= 5 {
-                    unsafe { pyre_object::w_int_get_value(args[4]) as i32 }
-                } else {
-                    0
-                };
-                // F_LOCK waits for the lock, and `lockf` reports through
-                // `_raise_error_maybe`, which is `eintr_retry=True`.
-                // `fcntl_lockf` builds a `struct flock` and calls `fcntl_flock`.
-                // The ValueError texts stay the ones this module already raised.
-                let l_type = if cmd == libc::LOCK_UN {
-                    libc::F_UNLCK
-                } else if cmd & libc::LOCK_SH != 0 {
-                    libc::F_RDLCK
-                } else if cmd & libc::LOCK_EX != 0 {
-                    libc::F_WRLCK
-                } else {
-                    return Err(pyre_interpreter::PyError::value_error("lockf: invalid cmd"));
-                };
-                let l_type = libc::c_short::try_from(l_type).map_err(|err| {
-                    pyre_interpreter::PyError::value_error(format!("lockf: overflow: {err}"))
-                })?;
-                let l_whence = libc::c_short::try_from(whence).map_err(|err| {
-                    pyre_interpreter::PyError::value_error(format!("lockf: overflow: {err}"))
-                })?;
-                let l_start = libc::off_t::try_from(start).map_err(|err| {
-                    pyre_interpreter::PyError::value_error(format!("lockf: overflow: {err}"))
-                })?;
-                let l_len = libc::off_t::try_from(len).map_err(|err| {
-                    pyre_interpreter::PyError::value_error(format!("lockf: overflow: {err}"))
-                })?;
-                let mut lock = libc::flock {
-                    l_type,
-                    l_whence,
-                    l_start,
-                    l_len,
-                    ..unsafe { core::mem::zeroed() }
-                };
-                let op = if cmd & libc::LOCK_NB != 0 {
-                    libc::F_SETLK
-                } else {
-                    libc::F_SETLKW
-                };
-                loop {
-                    let rv = unsafe { ll::fcntl_flock(fd, op, &mut lock) };
-                    if rv < 0 {
-                        raise_error_maybe("fcntl")?;
-                    } else {
-                        return Ok(pyre_object::w_none());
-                    }
-                }
-            }
-            #[cfg(not(all(unix, feature = "host_env")))]
-            {
-                let _ = args;
-                Err(pyre_interpreter::PyError::not_implemented(
-                    "fcntl.lockf requires host_env feature",
-                ))
-            }
-        }),
+        pyre_interpreter::make_builtin_function("lockf", lockf),
     );
     // `interp_fcntl.py constant_names` — POSIX subset always
     // exposed; Linux-specific block gated below.  I_* (System V
@@ -546,9 +532,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     Ok(())
 }
 
-/// `fcntl_ioctl_impl`'s `IOCTL_BUFSZ` / `fcntl_fcntl_impl`'s `FCNTL_BUFSZ` —
-/// the staging buffer a copied argument is handed to the kernel in.  Both are
-/// 1024.
+/// [3.14-spec] `ARG_BUFSZ` 1024 ↔ interp_fcntl.py `fcntl`
+/// (`scoped_str2charp`, no limit) — "fcntl argument 3 is too long" /
+/// "ioctl argument 3 is too long"; evidence: fcntlmodule.c `fcntl_fcntl_impl`
+/// `FCNTL_BUFSZ`.
 #[cfg(all(unix, feature = "host_env"))]
 const ARG_BUFSZ: usize = 1024;
 

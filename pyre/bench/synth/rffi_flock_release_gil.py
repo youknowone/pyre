@@ -3,7 +3,10 @@
 # the wasm guest has no `fcntl` either.
 # pyre-check: skip-cpython
 # pyre-check: skip-platforms=win32
-# Hot flock so the trace of `c_flock` records call_release_gil.
+# Hot flock in a compiled loop, then a failing call whose errno comes back
+# through `ccall_c_flock`'s GIL release and errno save. `flock` retries in a
+# `while True`, so the codewriter policy leaves it residual (`look_inside_graph`
+# `contains_loop`) and the trace calls it rather than `c_flock` directly.
 import errno
 import fcntl
 import os
