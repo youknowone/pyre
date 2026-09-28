@@ -2734,9 +2734,10 @@ pub struct StructLayout {
     /// layout was registered, otherwise the max of the fields' alignments.
     pub align: usize,
     /// `Struct._gckind` / `GcStruct._gckind`. `Gc` when the type implements
-    /// majit-gc `GcType`, or is field 0 of such a type (transitively).
-    /// `Raw` otherwise. Set when the layout is registered; readers must not
-    /// treat a missing layout as either kind.
+    /// majit-gc `GcType`, is field 0 of a `Gc` type, or its own field 0 is
+    /// `Gc` (`Struct._note_inlined_into`). The three clauses are a fixpoint
+    /// on the field-0 chain. `Raw` otherwise. Set when the layout is
+    /// registered; readers must not treat a missing layout as either kind.
     pub gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind,
     /// Per-field layout: (field_name, offset, size, type).
     /// RPython: `symbolic.get_field_token(STRUCT, name, tsc) → (offset, size)`.

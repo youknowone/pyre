@@ -3015,11 +3015,13 @@ fn derive_program_metadata(
 /// Seeds and field-0 edges used to derive `Struct._gckind`.
 ///
 /// A type is `Gc` when an impl of majit-gc's `GcType` names it as `Self`,
-/// or when it is field 0 (by value, transitively) of a `Gc` type. The
-/// trait is identified by the declaration's crate and name
-/// (`majit_gc` + `GcType`), not by a list of payload type names. The
-/// facts are folded into [`crate::call::StructLayout::gckind`]; they are
-/// not a lookup table.
+/// when it is field 0 (by value) of a `Gc` type, or when its own field 0
+/// is a `Gc` type. The last two clauses are a fixpoint:
+/// `Struct._note_inlined_into` allows a `GcStruct` only as the first
+/// field of another `GcStruct`. The trait is identified by the
+/// declaration's crate and name (`majit_gc` + `GcType`), not by a list
+/// of payload type names. The facts are folded into
+/// [`crate::call::StructLayout::gckind`]; they are not a lookup table.
 #[derive(Default)]
 pub(crate) struct DeclaredGcFacts {
     seeds: Vec<majit_ir::descr::StructId>,
@@ -3032,15 +3034,23 @@ impl DeclaredGcFacts {
         self.field0.extend(other.field0);
     }
 
-    /// `StructId`s whose declared kind is `Gc`. Every other analysed
-    /// struct or enum is `Raw`.
+    /// `StructId`s whose declared kind is `Gc`.
+    ///
+    /// (a) a majit-gc `GcType` impl, (b) field 0 of a `Gc` type, (c) a
+    /// type whose field 0 is `Gc`. (b) and (c) run to a fixpoint over
+    /// the field-0 edges. Every other analysed struct or enum is `Raw`.
     pub(crate) fn gc_struct_ids(&self) -> std::collections::HashSet<majit_ir::descr::StructId> {
         let mut children: std::collections::HashMap<
             majit_ir::descr::StructId,
             Vec<majit_ir::descr::StructId>,
         > = std::collections::HashMap::new();
+        let mut parents: std::collections::HashMap<
+            majit_ir::descr::StructId,
+            Vec<majit_ir::descr::StructId>,
+        > = std::collections::HashMap::new();
         for (owner, field0) in &self.field0 {
             children.entry(*owner).or_default().push(*field0);
+            parents.entry(*field0).or_default().push(*owner);
         }
         let mut gc = std::collections::HashSet::new();
         let mut work = self.seeds.clone();
@@ -3050,6 +3060,9 @@ impl DeclaredGcFacts {
             }
             if let Some(inner) = children.get(&id) {
                 work.extend(inner.iter().copied());
+            }
+            if let Some(owners) = parents.get(&id) {
+                work.extend(owners.iter().copied());
             }
         }
         gc
@@ -3136,8 +3149,8 @@ pub(crate) fn harvest_declared_gc_facts(llbc: &Llbc) -> DeclaredGcFacts {
 }
 
 /// Declared `GcKind` of every struct and enum in `llbcs`, keyed by the
-/// crate-stripped type path. `Gc` follows [`DeclaredGcFacts::gc_struct_ids`];
-/// every other analysed struct or enum is `Raw`.
+/// crate-stripped type path. `Gc` follows [`DeclaredGcFacts::gc_struct_ids`]
+/// (the field-0 fixpoint); every other analysed struct or enum is `Raw`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn declared_gckind_by_name(
     llbcs: &[Llbc],
@@ -63945,8 +63958,10 @@ mod tests {
     }
 
     /// `Gc` from a majit-gc `GcType` impl, from field 0 of that type
-    /// (and that field's own field 0), and `Raw` for a type with no impl
-    /// and for an impl of another crate's trait that is also named `GcType`.
+    /// (and that field's own field 0), from a struct whose field 0 is
+    /// already `Gc` (`Struct._note_inlined_into`), and `Raw` for a type
+    /// with no impl, for a struct headed by a raw field 0, and for an
+    /// impl of another crate's trait that is also named `GcType`.
     #[test]
     fn declared_gckind_follows_gctype_impl_and_field0_parent() {
         use crate::translator::rtyper::lltypesystem::lltype::GcKind;
@@ -63997,6 +64012,9 @@ mod tests {
                     struct_decl(2, &["fixture", "Inner"], None),
                     struct_decl(3, &["fixture", "RawOne"], None),
                     struct_decl(4, &["fixture", "Foreign"], None),
+                    struct_decl(5, &["fixture", "HeadedByImpl"], Some(0)),
+                    struct_decl(6, &["fixture", "HeadedByInner"], Some(2)),
+                    struct_decl(7, &["fixture", "HeadedByRaw"], Some(3)),
                 ],
                 "fun_decls": [],
                 "global_decls": [],
@@ -64015,5 +64033,8 @@ mod tests {
         assert_eq!(kinds.get("Inner"), Some(&GcKind::Gc));
         assert_eq!(kinds.get("RawOne"), Some(&GcKind::Raw));
         assert_eq!(kinds.get("Foreign"), Some(&GcKind::Raw));
+        assert_eq!(kinds.get("HeadedByImpl"), Some(&GcKind::Gc));
+        assert_eq!(kinds.get("HeadedByInner"), Some(&GcKind::Gc));
+        assert_eq!(kinds.get("HeadedByRaw"), Some(&GcKind::Raw));
     }
 }
