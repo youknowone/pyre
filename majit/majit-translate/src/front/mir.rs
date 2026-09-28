@@ -17057,8 +17057,25 @@ impl<'a> Lowering<'a> {
                 .unwrap_or_else(|| ty.clone());
             self.tyref_is_niche_option_ptr(&peeled)
         });
-        let op_kind =
-            crate::front::std_identity::lower_niche_option_deref(op_kind, niche_option_ptr);
+        // `CallTarget::Method` keeps the leaf. The inherent impl's owner
+        // ADT is on the FunDecl (`impl_method_owner_for_fundecl`):
+        // `option::Option::as_deref` / `as_deref_mut`.
+        let decl_is_option_deref = match &op_kind {
+            OpKind::Call { target, .. } => target
+                .fun_decl_id()
+                .and_then(|id| self.llbc.fn_by_id(id))
+                .and_then(|fd| impl_method_owner_for_fundecl(self.llbc, fd))
+                .is_some_and(|(owner, leaf)| {
+                    (owner == "option::Option" || owner == "core::option::Option")
+                        && matches!(leaf.as_str(), "as_deref" | "as_deref_mut")
+                }),
+            _ => false,
+        };
+        let op_kind = crate::front::std_identity::lower_niche_option_deref(
+            op_kind,
+            niche_option_ptr,
+            decl_is_option_deref,
+        );
         // Capture `i64::checked_{add,sub,mul}()` results (`Option<i64>`-
         // typed) for the checked-arith rewiring pass
         // (`front::checked_arith`), which rewrites each into the native
@@ -17129,11 +17146,13 @@ impl<'a> Lowering<'a> {
             && name == "ok_or_else"
             && receiver_root.as_deref() == Some("Option")
             && args.len() == 2
+            && let Some(closure_arg) = args.get(1).and_then(|arg| arg.as_variable()).cloned()
             && let Some(site) = self.recognize_checked_arith_ok_or_else_site(
                 first_arg_ty.as_ref(),
                 second_arg_ty.as_ref(),
                 &call.dest.ty,
                 &result_var,
+                closure_arg,
             )
         {
             self.checked_arith_ok_or_else_sites.push(site);
@@ -22675,6 +22694,7 @@ impl<'a> Lowering<'a> {
         env_ty: Option<&TyRef>,
         dest_ty: &TyRef,
         result_var: &Variable,
+        closure_arg: Variable,
     ) -> Option<crate::front::checked_arith::CheckedArithOkOrElseSite> {
         if !crate::front::result_exc::tyref_is_option(recv_ty?, self.llbc)
             || !crate::front::result_exc::tyref_is_result(dest_ty, self.llbc)
@@ -22690,6 +22710,7 @@ impl<'a> Lowering<'a> {
         let err_ty = self.tyref_adt_type_arg(dest_ty, 1)?;
         Some(crate::front::checked_arith::CheckedArithOkOrElseSite {
             result_var: result_var.clone(),
+            closure_arg,
             call_once_owner,
             result_suffix,
             ok_payload_ty: tyref_enum_payload_value_type(&ok_ty, self.llbc, self.tombstoned_leaves),

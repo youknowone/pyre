@@ -64,14 +64,19 @@ fn is_identity_wrapper_target(
             }
             match (name.as_str(), path_leaf(receiver_root.as_deref())) {
                 ("get", Some("Cell")) => true,
-                ("as_ref" | "as_mut", Some("Box")) if receiver_is_charon_box => true,
                 ("deref" | "deref_mut", Some("Ref") | Some("MutexGuard")) => true,
                 _ => false,
             }
         }
         CallTarget::FunctionPath { segments, .. } => {
             let leaf = function_leaf(segments);
-            if !is_std_fn_path(segments) && !receiver_is_charon_box {
+            // `boxed::Box::as_mut` is the decl path after `alloc` is peeled.
+            // It is not a std-crate prefix, so the Box-method check runs
+            // before the std-path gate.
+            if is_builtin_box_as_ref_or_mut_path(segments) {
+                return receiver_is_charon_box;
+            }
+            if !is_std_fn_path(segments) {
                 return false;
             }
             let recv = path_leaf(receiver_path);
@@ -85,11 +90,6 @@ fn is_identity_wrapper_target(
                 }
                 Some("new") if path_has(segments, "atomic") => true,
                 Some("get") if recv == Some("Cell") || path_has(segments, "Cell") => true,
-                // Charon peels `alloc::` (`boxed::Box::as_mut`). That spelling
-                // is the pointer cast only when the receiver type is the
-                // `alloc::boxed::Box` ADT, not because a path segment is named
-                // `Box` or `boxed`.
-                Some("as_ref" | "as_mut") if receiver_is_charon_box => true,
                 Some("deref" | "deref_mut")
                     if matches!(recv, Some("Ref") | Some("MutexGuard"))
                         || path_has(segments, "MutexGuard")
@@ -250,31 +250,60 @@ fn function_leaf_is(target: &CallTarget, leaf: &str) -> bool {
     }
 }
 
+/// Inherent `alloc::boxed::Box::as_ref` / `as_mut`.
+///
+/// `impl_method_owner_for_fundecl` records the owner ADT path plus the
+/// leaf (`boxed::Box::as_mut` once `alloc` is peeled, or the full
+/// `alloc::boxed::Box::as_mut`). A free function whose leaf is `as_mut`
+/// is a different decl and stays a call. The receiver still has to be
+/// the Box ADT (`receiver_is_charon_box`).
+fn is_builtin_box_as_ref_or_mut_path(segments: &[String]) -> bool {
+    let parts: Vec<&str> = segments.iter().map(String::as_str).collect();
+    matches!(
+        parts.as_slice(),
+        ["alloc", "boxed", "Box", "as_ref" | "as_mut"] | ["boxed", "Box", "as_ref" | "as_mut"]
+    )
+}
+
 fn is_box_as_ref_or_mut(target: &CallTarget, receiver_is_charon_box: bool) -> bool {
     if !receiver_is_charon_box {
         return false;
     }
     match target {
-        CallTarget::Method { name, .. } => matches!(name.as_str(), "as_ref" | "as_mut"),
-        CallTarget::FunctionPath { segments, .. } => {
-            matches!(function_leaf(segments), Some("as_ref" | "as_mut"))
-        }
+        CallTarget::FunctionPath { segments, .. } => is_builtin_box_as_ref_or_mut_path(segments),
         _ => false,
     }
 }
 
-fn is_option_as_deref(target: &CallTarget) -> bool {
-    let leaf_matches = |name: &str| matches!(name, "as_deref" | "as_deref_mut");
+/// Inherent `core::option::Option::as_deref` / `as_deref_mut`.
+///
+/// `ItemMeta::name_path` renders the inherent impl segment as `<Impl>`
+/// (`core::option::<Impl>::as_deref_mut`). `impl_method_owner_for_fundecl`
+/// resolves that impl's owner ADT and emits `option::Option::as_deref_mut`.
+/// A path that merely contains an `option` segment is not this item.
+fn is_option_as_deref_path(segments: &[String]) -> bool {
+    let parts: Vec<&str> = segments.iter().map(String::as_str).collect();
+    matches!(
+        parts.as_slice(),
+        ["core", "option", "<Impl>", "as_deref" | "as_deref_mut"]
+            | ["option", "Option", "as_deref" | "as_deref_mut"]
+            | ["core", "option", "Option", "as_deref" | "as_deref_mut"]
+            | [
+                "core",
+                "option",
+                "Option",
+                "<Impl>",
+                "as_deref" | "as_deref_mut"
+            ]
+    )
+}
+
+fn is_option_as_deref(target: &CallTarget, decl_is_option_deref: bool) -> bool {
+    if decl_is_option_deref {
+        return true;
+    }
     match target {
-        CallTarget::Method {
-            name,
-            receiver_root,
-            ..
-        } => leaf_matches(name) && path_leaf(receiver_root.as_deref()) == Some("Option"),
-        CallTarget::FunctionPath { segments, .. } => {
-            function_leaf(segments).is_some_and(leaf_matches)
-                && (path_has(segments, "option") || path_has(segments, "Option"))
-        }
+        CallTarget::FunctionPath { segments, .. } => is_option_as_deref_path(segments),
         _ => false,
     }
 }
@@ -284,7 +313,17 @@ fn is_option_as_deref(target: &CallTarget) -> bool {
 /// pointer and `None` is null, so the returned `Option<&T>` is that word.
 /// `rmodel.py` nullable pointer (`can_be_none`). A non-niche option stays
 /// a residual call: its payload is not the option word.
-pub(crate) fn lower_niche_option_deref(op_kind: OpKind, niche_option_ptr: bool) -> OpKind {
+///
+/// `decl_is_option_deref` is the call-site verdict from the callee
+/// `FunDecl`: `impl_method_owner_for_fundecl` names
+/// `option::Option::as_deref` / `as_deref_mut`. A `CallTarget::Method`
+/// keeps only the leaf, so the decl verdict is what identifies that
+/// spelling. A `FunctionPath` is identified by `is_option_as_deref_path`.
+pub(crate) fn lower_niche_option_deref(
+    op_kind: OpKind,
+    niche_option_ptr: bool,
+    decl_is_option_deref: bool,
+) -> OpKind {
     if !niche_option_ptr {
         return op_kind;
     }
@@ -296,7 +335,7 @@ pub(crate) fn lower_niche_option_deref(op_kind: OpKind, niche_option_ptr: bool) 
     else {
         return op_kind;
     };
-    if !is_option_as_deref(target) {
+    if !is_option_as_deref(target, decl_is_option_deref) {
         return op_kind;
     }
     let Some(operand) = args.first().and_then(|arg| arg.as_variable()).cloned() else {
@@ -621,7 +660,7 @@ mod tests {
         let v = dummy_var();
         let as_ref = lower_std_primitive_op(
             call(
-                CallTarget::method("as_ref", Some("Box".into())),
+                path(&["alloc", "boxed", "Box", "as_ref"]),
                 vec![v.clone()],
                 ValueType::Ref(None),
             ),
@@ -641,7 +680,7 @@ mod tests {
 
         let multi = lower_std_primitive_op(
             call(
-                CallTarget::method("as_ref", Some("Box".into())),
+                path(&["alloc", "boxed", "Box", "as_ref"]),
                 vec![v.clone()],
                 ValueType::Ref(None),
             ),
@@ -664,7 +703,7 @@ mod tests {
 
         let as_mut = lower_std_primitive_op(
             call(
-                CallTarget::method("as_mut", Some("Box".into())),
+                path(&["alloc", "boxed", "Box", "as_mut"]),
                 vec![v.clone()],
                 ValueType::Ref(None),
             ),
@@ -757,14 +796,34 @@ mod tests {
             matches!(peeled_without_type, OpKind::Call { .. }),
             "boxed:: spelling without the Box ADT stays a call, got {peeled_without_type:?}"
         );
+        let helper_as_mut = lower_std_primitive_op(
+            call(
+                path(&["helper", "as_mut"]),
+                vec![v.clone()],
+                ValueType::Ref(None),
+            ),
+            Some("alloc::boxed::Box"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            true,
+        );
+        assert!(
+            matches!(helper_as_mut, OpKind::Call { .. }),
+            "helper::as_mut on a Box stays a call, got {helper_as_mut:?}"
+        );
 
         let as_deref_mut = lower_niche_option_deref(
             call(
-                path(&["core", "option", "Option", "<impl>", "as_deref_mut"]),
+                path(&["core", "option", "<Impl>", "as_deref_mut"]),
                 vec![v.clone()],
                 ValueType::Ref(None),
             ),
             true,
+            false,
         );
         match as_deref_mut {
             OpKind::UnaryOp {
@@ -781,22 +840,65 @@ mod tests {
         }
         let as_deref = lower_niche_option_deref(
             call(
-                CallTarget::method("as_deref", Some("Option".into())),
+                path(&["option", "Option", "as_deref"]),
                 vec![v.clone()],
                 ValueType::Ref(None),
             ),
             true,
+            false,
         );
         assert!(matches!(
             as_deref,
             OpKind::UnaryOp { ref op, .. } if op == "same_as"
         ));
+        // `CallTarget::Method` keeps the leaf. The fold runs only when the
+        // callee decl is `option::Option::as_deref`.
+        let method_leaf = lower_niche_option_deref(
+            call(
+                CallTarget::method("as_deref_mut", Some("Option".into())),
+                vec![v.clone()],
+                ValueType::Ref(None),
+            ),
+            true,
+            false,
+        );
+        assert!(
+            matches!(method_leaf, OpKind::Call { .. }),
+            "an Option leaf without the decl path stays a call, got {method_leaf:?}"
+        );
+        let method_decl = lower_niche_option_deref(
+            call(
+                CallTarget::method("as_deref_mut", Some("Option".into())),
+                vec![v.clone()],
+                ValueType::Ref(None),
+            ),
+            true,
+            true,
+        );
+        assert!(
+            matches!(method_decl, OpKind::UnaryOp { ref op, .. } if op == "same_as"),
+            "the decl-identified Option::as_deref_mut is the pointer word, got {method_decl:?}"
+        );
+        let foreign_option = lower_niche_option_deref(
+            call(
+                path(&["my_crate", "option", "as_deref_mut"]),
+                vec![v.clone()],
+                ValueType::Ref(None),
+            ),
+            true,
+            false,
+        );
+        assert!(
+            matches!(foreign_option, OpKind::Call { .. }),
+            "my_crate::option::as_deref_mut stays a call, got {foreign_option:?}"
+        );
         let tagged = lower_niche_option_deref(
             call(
                 path(&["core", "option", "Option", "as_deref_mut"]),
                 vec![v.clone()],
                 ValueType::Ref(None),
             ),
+            false,
             false,
         );
         assert!(
