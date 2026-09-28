@@ -3769,6 +3769,10 @@ impl<'a> AssemblerARM64<'a> {
                 if headerless {
                     // Overflow opens a segment and returns the block base.
                     // No collection, so the headered varsize helper is not used.
+                    // The regalloc reserves only x0/x1; the arguments below
+                    // also clobber x2 and x4, so every register goes to the
+                    // jitframe first (`_push_all_regs_to_jitframe`).
+                    self.push_all_regs_to_jitframe(&[], true);
                     match arglocs.first() {
                         Some(Loc::Reg(len_r)) => {
                             dynasm!(self.mc ; .arch aarch64 ; mov x1, X(len_r.value));
@@ -3782,20 +3786,21 @@ impl<'a> AssemblerARM64<'a> {
                             "CallMallocNurseryVarsizeHeaderless length is not a value: {other:?}"
                         ),
                     }
-                    self.emit_mov_imm64(16, itemsize);
-                    dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x16);
-                    self.emit_mov_imm64(16, base_size + 7);
-                    dynasm!(self.mc ; .arch aarch64 ; add x1, x1, x16);
-                    self.emit_mov_imm64(16, -8);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; and x0, x1, x16
-                    );
+                    // x1 holds the length. The helper `ovfcheck`s
+                    // `length * itemsize + base_size`; the product is not
+                    // computed with wrapping arithmetic here.
+                    dynasm!(self.mc ; .arch aarch64 ; mov x0, x1);
+                    self.emit_mov_imm64(1, itemsize);
+                    self.emit_mov_imm64(2, base_size);
                     self.emit_mov_imm64(
-                        2,
-                        crate::runner::dynasm_nursery_slowpath_headerless as *const () as i64,
+                        4,
+                        crate::runner::dynasm_nursery_slowpath_headerless_varsize as *const ()
+                            as i64,
                     );
-                    self.emit_malloc_slowpath_helper_call(2);
+                    self.emit_malloc_slowpath_helper_call(4);
                     self.reload_frame_if_necessary();
+                    // x0 carries the allocation result.
+                    self.pop_all_regs_from_jitframe(&[crate::aarch64::registers::X0], true);
                     self.emit_propagate_memory_error_if_null(0);
                     if let Some(Loc::Reg(r)) = result_loc
                         && r.value != 0
@@ -7093,15 +7098,16 @@ impl<'a> AssemblerARM64<'a> {
             })
             .unwrap_or((0, None));
         self.emit_mov_imm64(0, obj_size);
-        self.emit_mov_imm64(
-            2,
-            crate::runner::malloc_fixedsize_or(Self::new_alloc_fn_addr()),
-        );
+        // One read of the published hook picks both the call target and
+        // whether the raw fallback still needs to be cleared.
+        let fallback = Self::new_alloc_fn_addr();
+        let malloc_ptr = crate::runner::malloc_fixedsize_or(fallback);
+        self.emit_mov_imm64(2, malloc_ptr);
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
         // `GcLLDescr_boehm.malloc_fixedsize` is `GC_malloc`
         // (`malloc_zero_filled`). A raw `malloc` is not, so only that
         // fallback is cleared here — never both.
-        if crate::runner::malloc_fixedsize_or(0) == 0 {
+        if malloc_ptr == fallback {
             self.inline_memzero(obj_size);
         }
         if vtable != 0 {
