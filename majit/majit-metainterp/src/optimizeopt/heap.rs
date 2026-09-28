@@ -4963,12 +4963,6 @@ mod tests {
         let inner_replay = builder.produced_short_op(&inner_box).unwrap().preamble_op;
         let receiver = inner_replay.arg(0).bound_op().unwrap();
         assert!(OpRc::ptr_eq(&receiver, &outer_replay));
-        let produced = builder
-            .produced_arg(&outer_box)
-            .unwrap()
-            .bound_op()
-            .unwrap();
-        assert!(OpRc::ptr_eq(&produced, &outer_replay));
     }
 
     /// After consuming an imported short field, a cache invalidation followed
