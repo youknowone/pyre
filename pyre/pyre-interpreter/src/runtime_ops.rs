@@ -1194,29 +1194,82 @@ define_flat_ref_helper!(
     arg7
 );
 
-/// Take a helper's residual-call address with its word signature spelled out.
+/// Take a helper's residual-call address with its signature checked.
 ///
 /// The arity-to-address accessors below erase the signature, so the checked
 /// publishers in `jit_fnaddr` (`ResidualSlot` / `ResidualRet`) never see it and
-/// cannot reject a helper the residual ABI is unable to describe.  Ascribing
-/// the fn item to an explicit `extern "C" fn(i64, ..) -> i64` pointer restores
-/// that check at the one point where the type still exists: a helper whose
-/// parameters or result stop being machine words fails to compile here instead
-/// of being published and then called with the wrong number of registers.
+/// cannot reject a helper the residual ABI is unable to describe.  Passing the
+/// fn item through `residual_extern_addr_N`, whose parameters and result are
+/// bounded by those same traits, restores that check at the one point where
+/// the type still exists: a helper with a parameter or result the residual ABI
+/// cannot describe fails to compile here instead of being published and then
+/// called with the wrong number of registers.
 ///
 /// The second argument is the helper's machine-argument count, which is not
 /// the Python argument count the accessor matches on: a `jit_call_callable_N`
 /// carries the frame and the callable ahead of its `N` arguments, a
 /// `jit_call_known_builtin_N` carries the callable, and a `jit_build_map_N`
 /// takes a key and a value per pair.  Getting that count wrong is the same
-/// build error as a helper drifting off the word ABI: writing `3` for
-/// `jit_call_callable_2` reports `non-primitive cast: extern "C" fn(i64, i64,
-/// i64, i64) -> i64 {jit_call_callable_2} as extern "C" fn(i64, i64, i64) ->
-/// i64`, naming the call site.  That is how the check is exercised without a
-/// helper that actually violates it.
+/// build error: writing `3` for `jit_call_callable_2` reports a mismatched
+/// fn-pointer type naming `jit_call_callable_2` at the call site.
+macro_rules! residual_extern_addr_fns {
+    ($($name:ident($($a:ident),*);)*) => {$(
+        #[inline]
+        fn $name<$($a: crate::jit_fnaddr::ResidualSlot,)* R: crate::jit_fnaddr::ResidualRet>(
+            f: extern "C" fn($($a),*) -> R,
+        ) -> *const () {
+            f as *const ()
+        }
+    )*};
+}
+
+residual_extern_addr_fns! {
+    residual_extern_addr_0();
+    residual_extern_addr_1(A1);
+    residual_extern_addr_2(A1, A2);
+    residual_extern_addr_3(A1, A2, A3);
+    residual_extern_addr_4(A1, A2, A3, A4);
+    residual_extern_addr_5(A1, A2, A3, A4, A5);
+    residual_extern_addr_6(A1, A2, A3, A4, A5, A6);
+    residual_extern_addr_7(A1, A2, A3, A4, A5, A6, A7);
+    residual_extern_addr_8(A1, A2, A3, A4, A5, A6, A7, A8);
+    residual_extern_addr_9(A1, A2, A3, A4, A5, A6, A7, A8, A9);
+    residual_extern_addr_10(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10);
+}
+
 macro_rules! word_fn_addr {
-    ($f:ident, $arity:literal) => {
-        $f as *const ()
+    ($f:ident, 0) => {
+        residual_extern_addr_0($f)
+    };
+    ($f:ident, 1) => {
+        residual_extern_addr_1($f)
+    };
+    ($f:ident, 2) => {
+        residual_extern_addr_2($f)
+    };
+    ($f:ident, 3) => {
+        residual_extern_addr_3($f)
+    };
+    ($f:ident, 4) => {
+        residual_extern_addr_4($f)
+    };
+    ($f:ident, 5) => {
+        residual_extern_addr_5($f)
+    };
+    ($f:ident, 6) => {
+        residual_extern_addr_6($f)
+    };
+    ($f:ident, 7) => {
+        residual_extern_addr_7($f)
+    };
+    ($f:ident, 8) => {
+        residual_extern_addr_8($f)
+    };
+    ($f:ident, 9) => {
+        residual_extern_addr_9($f)
+    };
+    ($f:ident, 10) => {
+        residual_extern_addr_10($f)
     };
 }
 

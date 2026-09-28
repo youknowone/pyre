@@ -672,8 +672,8 @@ fn push_raw_fnaddr(
 /// signature before returning, and by the time the address arrives here there
 /// is nothing left for [`ResidualSlot`] / [`ResidualRet`] to read. The check
 /// is not skipped, only moved: each accessor takes its address through
-/// `runtime_ops`'s `word_fn_addr!`, which ascribes the fn item to an explicit
-/// `extern "C" fn(i64, ..) -> i64` first. Publishing through this helper
+/// `runtime_ops`'s `word_fn_addr!`, which passes the fn item through an
+/// `extern "C" fn(A1, ..) -> R` bounded by the same two traits first. Publishing through this helper
 /// asserts that the address came from such an accessor; anything else uses
 /// the checked publishers above.
 fn push_word_accessor_alias_pair(
