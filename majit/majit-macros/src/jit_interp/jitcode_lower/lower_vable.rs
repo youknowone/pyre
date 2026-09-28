@@ -55,7 +55,7 @@ pub(super) fn is_varsize_length_member(
 }
 
 /// `rewrite_op_malloc_varsize`: pointer and struct elements are cleared.
-/// An integer element type (`i64`, `usize`, …) is `new_array`.
+/// An integer or `f64` element type (`i64`, `usize`, …) is `new_array`.
 pub(super) fn header_items_are_pointers(config: &LowererConfig, header: &syn::Path) -> bool {
     let last = header
         .segments
@@ -75,7 +75,7 @@ pub(super) fn header_items_are_pointers(config: &LowererConfig, header: &syn::Pa
         }
         saw = true;
         if let Some((_, _, elem)) = config.array_fields.get(key)
-            && path_is_int_elem(elem)
+            && (path_is_int_elem(elem) || path_is_f64(elem))
         {
             primitive = true;
         }
@@ -108,18 +108,19 @@ pub(super) fn gc_varsize_descr_tokens(config: &LowererConfig, header: &syn::Path
         varsize_length_field_name(config, header).unwrap_or_else(|| "capacity".to_string());
     let len_ident = syn::Ident::new(&len_name, proc_macro2::Span::call_site());
     let pointers = header_items_are_pointers(config, header);
+    // A float item is the descr `getarrayitem_gc_f` reads, so the
+    // allocation and the reads name one descriptor.
+    if !pointers && header_element_path(config, header).is_some_and(|elem| path_is_f64(elem)) {
+        return float_array_descr_tokens(Some(config), &Some(header.clone()));
+    }
     // `symbolic.py` `get_array_token`: `itemsize = sizeof(SUBARRAY.OF)`.
     let (itemsize, is_signed) = if pointers {
         (quote! { ::core::mem::size_of::<usize>() }, quote! { false })
     } else if let Some(elem) = header_element_path(config, header) {
-        if path_is_f64(elem) {
-            (quote! { ::core::mem::size_of::<f64>() }, quote! { false })
-        } else {
-            (
-                quote! { ::core::mem::size_of::<#elem>() },
-                quote! { (<#elem>::MIN as i128) < 0 },
-            )
-        }
+        (
+            quote! { ::core::mem::size_of::<#elem>() },
+            quote! { (<#elem>::MIN as i128) < 0 },
+        )
     } else {
         (quote! { ::core::mem::size_of::<i64>() }, quote! { true })
     };

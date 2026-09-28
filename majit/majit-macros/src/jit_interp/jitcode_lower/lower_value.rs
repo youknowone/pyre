@@ -762,6 +762,15 @@ impl<'c> Lowerer<'c> {
     ) -> Option<Binding> {
         let config = self.config?;
         let len_name = super::lower_vable::varsize_length_field_name(config, header)?;
+        // `rewrite_op_malloc_varsize` allocates and stamps the length only.
+        // Another initialised header field would need its own setfield;
+        // decline the literal so the helper stays a residual call.
+        if fields
+            .iter()
+            .any(|(_, member, _)| named_member(member).as_deref() != Some(len_name.as_str()))
+        {
+            return None;
+        }
         let length = fields.iter().find(|(_, member, value)| {
             named_member(member).as_deref() == Some(len_name.as_str())
                 && matches!(value.kind, BindingKind::Int)
@@ -865,6 +874,10 @@ impl<'c> Lowerer<'c> {
         }
         let fields = value_fields;
         if let Some(header) = varsize {
+            // A varsize allocation has no typeptr store to carry a vtable.
+            if vtable.is_some() {
+                return None;
+            }
             return self.emit_varsize_array(struct_path, &header, &fields, depends_on_stack);
         }
         // Same id a later `getfield` mints (`struct_gc_kind_is_managed`), so
@@ -3660,6 +3673,45 @@ mod tests {
             !emitted.contains("new_array_clear"),
             "int varsize must not clear, got {emitted}"
         );
+    }
+
+    #[test]
+    fn float_varsize_literal_lowers_to_new_array_with_the_float_descr() {
+        // An `f64` element is not a GC pointer: `new_array`, and the
+        // descr is the one `getarrayitem_gc_f` reads.
+        let config = varsize_config("f64");
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer
+            .bindings
+            .insert("n".to_string(), binding(1, BindingKind::Int));
+        let expr: Expr = syn::parse_str("Items { capacity: n, items: [] }").unwrap();
+        lowerer.lower_value_expr(&expr).expect("varsize lowers");
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(
+            !emitted.contains("new_array_clear"),
+            "float varsize must not clear, got {emitted}"
+        );
+        assert!(
+            emitted.contains("add_gc_varsize_float_array_descr"),
+            "float varsize must use the float descr, got {emitted}"
+        );
+    }
+
+    #[test]
+    fn varsize_literal_with_another_header_field_is_declined() {
+        // Only the length is stamped by the allocation, so a literal that
+        // also initialises another header field is not lowered.
+        let config = varsize_config("i64");
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer
+            .bindings
+            .insert("n".to_string(), binding(1, BindingKind::Int));
+        let expr: Expr = syn::parse_str("Items { capacity: n, flag: 1i64, items: [] }").unwrap();
+        assert!(lowerer.lower_value_expr(&expr).is_none());
     }
 
     #[test]

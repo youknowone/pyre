@@ -1662,10 +1662,10 @@ fn wasm_total_memory_pressure() -> isize {
 /// collection moves it out of the nursery. Mirrors dynasm's
 /// `dynasm_id_or_identityhash`.
 fn wasm_id_or_identityhash(addr: usize) -> usize {
-    // `GcLLDescr_boehm` (`gcrootmap is None`): the collector does not move
-    // objects, so the identity is the address and the GC is not consulted.
+    // `boehm.py` `ll_identityhash`: `h = ~cast_adr_to_int(addr)`.
+    // `GcLLDescr_boehm.gcrootmap` is `None`, which is `!collector_installed`.
     if !majit_gc::collector_installed() {
-        return addr;
+        return !addr;
     }
     with_wasm_active_gc_mut(|gc| gc.id_or_identityhash(addr)).unwrap_or(addr)
 }
