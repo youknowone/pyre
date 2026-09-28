@@ -131,6 +131,12 @@ pyre_interpreter::builtin_wrapper_descriptor!(
 
 /// `interp_fcntl.py` `flock`: one body. `has_flock` calls `c_flock`; otherwise
 /// `lockf(space, w_fd, op)`, which builds `_flock` and calls `fcntl_flock`.
+///
+/// The `while True` retry keeps the JIT out of this body
+/// (`JitPolicy.look_inside_graph` `contains_loop`), so the gateway calls it
+/// as a residual. `dont_look_inside` states that boundary and publishes the
+/// address the residual call needs.
+#[majit_macros::dont_look_inside]
 fn flock(
     w_fd: pyre_object::PyObjectRef,
     op: i64,
