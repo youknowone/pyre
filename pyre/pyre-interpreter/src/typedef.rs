@@ -6028,15 +6028,20 @@ fn set_alloc_for_class(
 ) -> Result<PyObjectRef, crate::PyError> {
     // typeobject.py allocate_instance → check_user_subclass.
     check_user_subclass(exact_type, cls)?;
-    let obj = if frozen {
-        pyre_object::w_frozenset_new()
+    // `allocate_instance` of a subclass selects `typedef.py` `_getusercls`:
+    // `W_SetObjectUser` stamped `SET_USER_TYPE` / `FROZENSET_USER_TYPE`, with
+    // `w_class` installed by the allocator. An exact `set` or `frozenset`
+    // stays on the base payload.
+    let obj = if std::ptr::eq(cls, exact_type) {
+        if frozen {
+            pyre_object::w_frozenset_new()
+        } else {
+            pyre_object::w_set_new()
+        }
     } else {
-        pyre_object::w_set_new()
+        pyre_object::w_set_user_new_empty(cls, frozen)
     };
-    if !std::ptr::eq(cls, exact_type) {
-        unsafe { store_subclass_tag(obj, cls) };
-    }
-    // objspace.py:486 `allocate_instance` registers every freshly allocated
+    // objspace.py `allocate_instance` registers every freshly allocated
     // instance whose class carries `hasuserdel`.  Set/frozenset subclasses use
     // this layout-specific allocator instead of `w_instance_new`, so perform
     // the same post-allocation step after installing the real subclass.
@@ -6135,7 +6140,7 @@ fn frozenset_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // setobject.py — reuse the argument only when the target type is
     // exactly `frozenset` and the argument's implementation class is exactly
     // `W_FrozensetObject` (`type(w_iterable) is W_FrozensetObject`); a subclass
-    // instance retags `w_class` and is rebuilt.
+    // instance carries `FROZENSET_USER_TYPE` and is rebuilt.
     if !iterable.is_null()
         && std::ptr::eq(cls, frozenset_type)
         && unsafe {

@@ -4645,6 +4645,23 @@ static W_LIST_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
     )
 });
 
+/// `W_SetObjectUser` (`typedef.py` `_getusercls`). `set` and `frozenset`
+/// share this layout and this tid. The vtable is `SET_USER_TYPE`; a
+/// `frozenset` subclass reads `map`/`storage` through the same field descrs,
+/// the same sharing [`W_SET_DESCR_GROUP`] gives the base payloads.
+static W_SET_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        pyre_object::setobject::W_SET_USER_OBJECT_SIZE,
+        pyre_object::setobject::W_SET_USER_GC_TYPE_ID,
+        &pyre_object::setobject::SET_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::setobject::W_SetObjectUser, map),
+        std::mem::offset_of!(pyre_object::setobject::W_SetObjectUser, storage),
+        "W_SetObjectUser",
+        "setobject::W_SetObjectUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x80,
+    )
+});
+
 /// `W_ObjectObject.map` (`objectobject.rs`) — the instance shape word,
 /// `self.map` of PyPy's `MapdictStorageMixin` (`mapdict.py`). Read as an
 /// `Int` word so the LOAD_ATTR fast path can `guard_value` it to a constant map
@@ -4684,6 +4701,8 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_BYTEARRAY_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::is_list(obj) } {
         field_descr_from_group(&W_LIST_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::is_set_or_frozenset(obj) } {
+        field_descr_from_group(&W_SET_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::is_complex(obj) } {
         field_descr_from_group(&W_COMPLEX_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::is_str(obj) } {
@@ -4713,6 +4732,8 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_BYTEARRAY_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::is_list(obj) } {
         field_descr_from_group(&W_LIST_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::is_set_or_frozenset(obj) } {
+        field_descr_from_group(&W_SET_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::is_complex(obj) } {
         field_descr_from_group(&W_COMPLEX_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::is_str(obj) } {
@@ -6567,6 +6588,7 @@ mod tests {
             0x6100_0061
         );
         assert_eq!(W_LIST_USER_DESCR_GROUP.field_descrs[0].index(), 0x6100_0070);
+        assert_eq!(W_SET_USER_DESCR_GROUP.field_descrs[0].index(), 0x6100_0080);
         assert_eq!(
             W_INT_USER_DESCR_GROUP.field_descrs[1].field_type(),
             Type::Ref
@@ -8248,6 +8270,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("listobject::W_ListObjectUser", || {
         LazyLock::force(&W_LIST_USER_DESCR_GROUP);
+    }),
+    ("setobject::W_SetObjectUser", || {
+        LazyLock::force(&W_SET_USER_DESCR_GROUP);
     }),
     ("tupleobject::W_TupleObject", || {
         LazyLock::force(&W_TUPLE_DESCR_GROUP);

@@ -1047,6 +1047,16 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     }
 }
 
+unsafe fn set_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { set_object_custom_trace(obj_addr, f) };
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
+}
+
 /// Custom trace for `W_TupleObject`. `wrappeditems` points at an off-GC
 /// `std::alloc`'d `ItemsBlock` (`tupleobject.rs`'s `W_TupleObject`), so the
 /// element slots are unreachable through inline `gc_ptr_offsets` — the
@@ -4051,8 +4061,35 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::pyobject::LIST_USER_TYPE as *const _ as usize,
         list_user_tid,
     );
+    // `W_SetObjectUser` (`typedef.py` `_getusercls`). `set` and `frozenset`
+    // subclass instances share this tid, a subclass-range child of the set
+    // tid, traced as a set plus its mapdict storage.
+    let set_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::setobject::W_SET_USER_OBJECT_SIZE,
+        w_set_tid,
+        set_user_object_custom_trace,
+    ));
+    debug_assert_eq!(set_user_tid, pyre_object::setobject::W_SET_USER_GC_TYPE_ID);
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::setobject::SET_USER_TYPE as *const _ as usize,
+        set_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::setobject::SET_USER_TYPE as *const _ as usize,
+        set_user_tid,
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::setobject::FROZENSET_USER_TYPE as *const _ as usize,
+        set_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::setobject::FROZENSET_USER_TYPE as *const _ as usize,
+        set_user_tid,
+    );
 
-    // `_sre.SRE_Template` — last unconditional interpreter class (tid 166),
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 167),
     // before the cfg-gated posix / console tail.
     register_pyre_class(
         &mut gc,

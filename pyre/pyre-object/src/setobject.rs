@@ -19,8 +19,15 @@ use std::cell::UnsafeCell;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub static SET_TYPE: PyType = crate::pyobject::new_pytype("set");
-pub static FROZENSET_TYPE: PyType = crate::pyobject::new_pytype("frozenset");
+pub static SET_TYPE: PyType = crate::pyobject::new_pytype_with_user_subclass("set", &SET_USER_TYPE);
+/// `W_SetObjectUser` (`typedef.py` `_getusercls(W_SetObject)`).
+pub static SET_USER_TYPE: PyType = crate::pyobject::new_user_pytype("set", &SET_TYPE);
+pub static FROZENSET_TYPE: PyType =
+    crate::pyobject::new_pytype_with_user_subclass("frozenset", &FROZENSET_USER_TYPE);
+/// `W_SetObjectUser` for `frozenset` (`typedef.py` `_getusercls`). The two
+/// user typeptrs share one payload layout and one GC tid.
+pub static FROZENSET_USER_TYPE: PyType =
+    crate::pyobject::new_user_pytype("frozenset", &FROZENSET_TYPE);
 
 /// setobject.py `W_SetIterObject`.  Unlike the old sequence-iterator
 /// adapter this keeps the live set, so a size change is observed by next().
@@ -486,6 +493,17 @@ impl W_SetObject {
         let n = self.content_gen.load(Ordering::Relaxed);
         self.content_gen.store(n.wrapping_add(1), Ordering::Relaxed);
     }
+}
+
+/// The translated user-subclass layout selected by `typedef.py` `_getusercls`.
+/// `W_SetObject` remains the base payload; `MapdictStorageMixin` contributes
+/// its fields only to the generated user class. `set` and `frozenset`
+/// subclass instances share this layout.
+#[repr(C)]
+pub struct W_SetObjectUser {
+    pub base: W_SetObject,
+    pub map: usize,
+    pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 /// GC type id assigned to `W_SetObject` at JitDriver init time.
@@ -2015,6 +2033,11 @@ pub fn ascii_set_storage_gc_type_id() -> u32 {
 
 /// Fixed payload size (`framework.py:811`).
 pub const W_SET_OBJECT_SIZE: usize = std::mem::size_of::<W_SetObject>();
+/// User-subclass set layout (`typedef.py` `_getusercls`). Unconditional,
+/// so its tid sits with the other closed ids (175) ahead of the
+/// target-gated tail. `set` and `frozenset` share it.
+pub const W_SET_USER_GC_TYPE_ID: u32 = 166;
+pub const W_SET_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_SetObjectUser>();
 
 impl crate::lltype::GcType for W_SetObject {
     fn type_id() -> u32 {
@@ -2023,12 +2046,20 @@ impl crate::lltype::GcType for W_SetObject {
     const SIZE: usize = W_SET_OBJECT_SIZE;
 }
 
+impl crate::lltype::GcType for W_SetObjectUser {
+    #[inline(always)]
+    fn type_id() -> u32 {
+        W_SET_USER_GC_TYPE_ID
+    }
+    const SIZE: usize = W_SET_USER_OBJECT_SIZE;
+}
+
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_set(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &SET_TYPE) }
+    unsafe { py_type_check(obj, &SET_TYPE) || py_type_check(obj, &SET_USER_TYPE) }
 }
 
 #[inline]
@@ -2036,7 +2067,7 @@ pub unsafe fn is_set(obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_frozenset(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &FROZENSET_TYPE) }
+    unsafe { py_type_check(obj, &FROZENSET_TYPE) || py_type_check(obj, &FROZENSET_USER_TYPE) }
 }
 
 #[inline]
@@ -2236,6 +2267,54 @@ fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
     if !raw.is_null() {
         unsafe {
             std::ptr::write(raw as *mut W_SetObject, body);
+        }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
+        raw as PyObjectRef
+    } else {
+        crate::lltype::malloc_typed(body) as PyObjectRef
+    }
+}
+
+/// `allocate_instance(W_SetObjectUser, w_class)`: empty set or frozenset,
+/// with `map`/`storage` at the `MapdictStorageMixin` initial state.
+/// `frozen` selects `FROZENSET_USER_TYPE`.
+///
+/// `#[dont_look_inside]` for the same `RDict::default` storage-box reason as
+/// [`w_set_new`]. The subclass word is pinned before that box is built: a
+/// user class is movable, and the box allocation can collect.
+#[majit_macros::dont_look_inside]
+pub fn w_set_user_new_empty(w_class: PyObjectRef, frozen: bool) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_class);
+    let items =
+        crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::default(), set_items_gc_type_id());
+    let items_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(items as PyObjectRef);
+    let user_type: &'static PyType = if frozen {
+        &FROZENSET_USER_TYPE
+    } else {
+        &SET_USER_TYPE
+    };
+    let raw =
+        crate::gc_hook::try_gc_alloc_nursery_raw(W_SET_USER_GC_TYPE_ID, W_SET_USER_OBJECT_SIZE);
+    let items = crate::gc_roots::shadow_stack_get(items_slot) as *mut SetItemsStorage;
+    let body = W_SetObjectUser {
+        base: W_SetObject {
+            ob_header: PyObject {
+                ob_type: user_type as *const PyType,
+                w_class: crate::gc_roots::shadow_stack_get(class_slot),
+            },
+            items,
+            len: crate::object_array::length_cell(0),
+            hash: -1,
+        },
+        map: 0,
+        storage: std::ptr::null_mut(),
+    };
+    if !raw.is_null() {
+        unsafe {
+            std::ptr::write(raw as *mut W_SetObjectUser, body);
         }
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
@@ -3904,6 +3983,51 @@ mod tests {
             assert!(!is_frozenset(s));
             assert!(is_frozenset(fs));
             assert!(!is_set(fs));
+        }
+    }
+
+    /// `typedef.py` `_getusercls(W_SetObject)`: a subclass instance is
+    /// `W_SetObjectUser` carrying `SET_USER_TYPE` or `FROZENSET_USER_TYPE`.
+    #[test]
+    fn set_subclass_instance_carries_user_typeptr() {
+        assert_eq!(W_SET_USER_GC_TYPE_ID, 166);
+        assert_eq!(
+            W_SET_OBJECT_SIZE,
+            std::mem::offset_of!(W_SetObject, hash) + std::mem::size_of::<i64>()
+        );
+        assert_eq!(
+            W_SET_USER_OBJECT_SIZE,
+            W_SET_OBJECT_SIZE
+                + std::mem::size_of::<usize>()
+                + std::mem::size_of::<*mut crate::object_array::ItemsBlock>()
+        );
+        let obj = w_set_new();
+        unsafe {
+            assert!(std::ptr::eq((*obj).ob_type, &SET_TYPE));
+            assert!(is_set(obj));
+            assert!(!is_frozenset(obj));
+        }
+        let obj = w_frozenset_new();
+        unsafe {
+            assert!(std::ptr::eq((*obj).ob_type, &FROZENSET_TYPE));
+            assert!(is_frozenset(obj));
+            assert!(!is_set(obj));
+        }
+        let obj = w_set_user_new_empty(get_instantiate(&SET_TYPE), false);
+        unsafe {
+            assert!(std::ptr::eq((*obj).ob_type, &SET_USER_TYPE));
+            assert!(is_set(obj));
+            assert!(!is_frozenset(obj));
+            assert!(!crate::pyobject::is_exact_type(obj, &SET_TYPE));
+            assert_eq!(w_set_len(obj), 0);
+        }
+        let obj = w_set_user_new_empty(get_instantiate(&FROZENSET_TYPE), true);
+        unsafe {
+            assert!(std::ptr::eq((*obj).ob_type, &FROZENSET_USER_TYPE));
+            assert!(is_frozenset(obj));
+            assert!(!is_set(obj));
+            assert!(!crate::pyobject::is_exact_type(obj, &FROZENSET_TYPE));
+            assert_eq!(w_set_len(obj), 0);
         }
     }
 

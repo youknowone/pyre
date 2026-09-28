@@ -15427,13 +15427,12 @@ fn pin_int_guard_value<Sym: WalkSym>(
 /// `W_IntObject`, so it takes the helper rather than the intval guard.  A
 /// concrete miss stays the MayForce substitution below.
 ///
-/// Recognition declines before emitting IR, and what it admits is deliberately
-/// the builtin's own predicate: `require_set_receiver` is `is_set`, an
-/// `ob_type == &SET_TYPE` layout test, so a `set` subclass that inherits `add`
-/// passes both it and the class guard below and is substituted — the builtin
-/// would have run this identical body.  A subclass that OVERRIDES `add` is
-/// excluded instead by the `GuardValue` pinning the bound function, and a
-/// frozenset receiver by the layout guard, which matters because
+/// Recognition declines before emitting IR. It admits an exact `set`
+/// (`ob_type == &SET_TYPE`). A subclass instance carries `SET_USER_TYPE`
+/// (`typedef.py` `_getusercls`) and does not match the `GuardClass` below.
+/// A subclass that overrides `add` is excluded by the `GuardValue` pinning
+/// the bound function, and a frozenset receiver by the layout guard, which
+/// matters because
 /// [`pyre_interpreter::opcode_ops::set_add_value`] itself accepts
 /// `is_set_or_frozenset` and would mutate one.  Anything else falls through to
 /// the generic residual, which still runs the builtin's receiver and arity
@@ -15458,18 +15457,20 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // Recognition: the callable must be the bound builtin `set.add`, over the
-    // receiver `require_set_receiver` accepts.  `is_set` is that predicate
-    // verbatim, and the class guard below is emitted in the same spelling, so
-    // recognition and guard admit the same set of receivers.  It excludes a
-    // frozenset, which `set_add_value` would otherwise mutate.
+    // Recognition: the callable must be the bound builtin `set.add`, over an
+    // exact `set`. `py_type_check(..., &SET_TYPE)` is the layout the
+    // `GuardClass` below pins, so a `SET_USER_TYPE` receiver is not
+    // substituted. It excludes a frozenset, which `set_add_value` would
+    // otherwise mutate.
     let (inner_func, inner_self) = unsafe {
         if !pyre_object::function::is_method(callable) {
             return Ok(None);
         }
         let inner_func = pyre_object::function::w_method_get_func(callable);
         let inner_self = pyre_object::function::w_method_get_self(callable);
-        if inner_func.is_null() || !pyre_object::setobject::is_set(inner_self) {
+        if inner_func.is_null()
+            || !pyre_object::py_type_check(inner_self, &pyre_object::setobject::SET_TYPE)
+        {
             return Ok(None);
         }
         let set_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
