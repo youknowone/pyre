@@ -10281,14 +10281,14 @@ pub fn text0_wtf8_w(obj: PyObjectRef) -> Result<&'static Wtf8, PyError> {
 /// consumer this way.  The acquisition already copies, so the result owns its
 /// bytes and the export is released before returning.
 pub fn charbuf_w(mut obj: PyObjectRef) -> Result<Vec<u8>, PyError> {
-    let Some(buffer) = pyre_object::with_roots!(obj => simple_buffer_bytes(obj))? else {
+    let Some(data) = pyre_object::with_roots!(obj =>
+        simple_buffer_bytes(obj).map(|buffer| buffer.map(SimpleBufferBytes::into_bytes)))?
+    else {
         return Err(PyError::type_error(format!(
             "a bytes-like object is required, not '{}'",
             object_functionstr_type_name(obj)
         )));
     };
-    let data = buffer.as_bytes().to_vec();
-    buffer.release();
     Ok(data)
 }
 
@@ -10313,6 +10313,15 @@ impl SimpleBufferBytes {
     /// from a typed exporter even though both expose the same raw byte run.
     pub(crate) fn itemsize(&self) -> i64 {
         self.itemsize
+    }
+
+    /// The copied bytes, with the export released.  The export owns a root
+    /// bracket, so a caller that only needs the bytes takes them inside the
+    /// bracket rooting its own locals, and nothing outlives that bracket.
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        let data = std::mem::take(&mut self.data);
+        self.release();
+        data
     }
 
     /// `PyBuffer_Release`: release errors are unraisable and must not replace
@@ -23061,8 +23070,14 @@ fn contains_bytes_like(
         if is_bytes(haystack) && is_bytes(needle) {
             return Ok(pyre_object::bytesobject::jit_bytes_contains(haystack, needle) != 0);
         }
-        let receiver = pyre_object::with_roots!(haystack, needle => simple_buffer_bytes(haystack))?
-            .expect("bytes/bytearray receiver always exports a buffer");
+        // The receiver's export owns a bracket of its own, above this one;
+        // this one stays open until the export is gone.
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.pin_roots(&[haystack, needle]);
+        let receiver = simple_buffer_bytes(haystack);
+        haystack = roots.get(base);
+        needle = roots.get(base + 1);
+        let receiver = receiver?.expect("bytes/bytearray receiver always exports a buffer");
         let result = if is_int(needle) || is_long(needle) {
             let v = if is_int(needle) {
                 pyre_object::w_int_get_value(needle)
@@ -23077,16 +23092,14 @@ fn contains_bytes_like(
                 Ok(receiver.as_bytes().contains(&(v as u8)))
             }
         } else {
-            match pyre_object::with_roots!(needle => simple_buffer_bytes(needle)) {
-                Ok(Some(sub)) => {
-                    let value = sub.as_bytes().is_empty()
-                        || receiver
-                            .as_bytes()
-                            .windows(sub.as_bytes().len())
-                            .any(|window| window == sub.as_bytes());
-                    sub.release();
-                    Ok(value)
-                }
+            match pyre_object::with_roots!(needle =>
+                simple_buffer_bytes(needle).map(|sub| sub.map(SimpleBufferBytes::into_bytes)))
+            {
+                Ok(Some(sub)) => Ok(sub.is_empty()
+                    || receiver
+                        .as_bytes()
+                        .windows(sub.len())
+                        .any(|window| window == sub.as_slice())),
                 Ok(None) => {
                     let tname = match crate::typedef::r#type(needle) {
                         Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),

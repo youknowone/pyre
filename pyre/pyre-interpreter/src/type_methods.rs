@@ -5583,9 +5583,21 @@ fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::
                 "Can't convert '{type_name}' object to str implicitly"
             )));
         } else {
-            let buffer = pyre_object::with_roots!(w_fill =>
-                crate::baseobjspace::simple_buffer_bytes(w_fill))?;
-            let Some(buffer) = buffer else {
+            // Decoded and released inside the bracket rooting `w_fill`, which
+            // the export's own bracket must not outlive.
+            let result = pyre_object::with_roots!(w_fill =>
+                crate::baseobjspace::simple_buffer_bytes(w_fill).map(|buffer| {
+                    buffer.map(|buffer| {
+                        let result = crate::typedef::decode_bytes_to_wtf8(
+                            buffer.as_bytes(),
+                            "utf-8",
+                            "strict",
+                        );
+                        buffer.release();
+                        result
+                    })
+                }))?;
+            let Some(result) = result else {
                 let operand = if unsafe { pyre_object::is_none(w_fill) } {
                     "None".to_string()
                 } else {
@@ -5595,8 +5607,6 @@ fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::
                     "decoding to str: a bytes-like object is required, not {operand}"
                 )));
             };
-            let result = crate::typedef::decode_bytes_to_wtf8(buffer.as_bytes(), "utf-8", "strict");
-            buffer.release();
             decoded = result?;
             decoded.as_ref()
         }

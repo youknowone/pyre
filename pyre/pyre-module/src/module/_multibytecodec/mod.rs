@@ -381,16 +381,14 @@ fn publish_codec_args(
 /// `Drop`, so the export stays active until `release`, and a `bytearray` that
 /// is decoded twice would refuse to resize.
 fn codec_input_bytes(mut w_input: PyObjectRef) -> Result<Vec<u8>, pyre_interpreter::PyError> {
-    let buffer =
-        pyre_object::with_roots!(w_input => pyre_interpreter::baseobjspace::simple_buffer_bytes(w_input))?.ok_or_else(|| {
-            pyre_interpreter::PyError::type_error(format!(
-                "a bytes-like object is required, not '{}'",
-                pyre_interpreter::type_methods::arg_type_name(w_input)
-            ))
-        })?;
-    let input = buffer.as_bytes().to_vec();
-    buffer.release();
-    Ok(input)
+    pyre_object::with_roots!(w_input => pyre_interpreter::baseobjspace::simple_buffer_bytes(w_input)
+        .map(|buffer| buffer.map(pyre_interpreter::baseobjspace::SimpleBufferBytes::into_bytes)))?
+    .ok_or_else(|| {
+        pyre_interpreter::PyError::type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            pyre_interpreter::type_methods::arg_type_name(w_input)
+        ))
+    })
 }
 
 /// `errors: str(accept={str, NoneType})` -- the conversion the two

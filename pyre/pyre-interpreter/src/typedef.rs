@@ -19910,7 +19910,13 @@ fn bytearray_compare(
     } {
         return crate::objspace::descroperation::compare_slot(a, b, op);
     }
-    let buffer = match pyre_object::with_roots!(a => crate::baseobjspace::simple_buffer_bytes(b)) {
+    // The export owns a bracket of its own, opened above this one; this one
+    // stays open until the export is gone.
+    let a_roots = pyre_object::gc_roots::push_roots();
+    let a_base = a_roots.pin_roots(&[a]);
+    let acquired = crate::baseobjspace::simple_buffer_bytes(b);
+    a = a_roots.get(a_base);
+    let buffer = match acquired {
         Ok(Some(buffer)) => buffer,
         Ok(None) => return Ok(pyre_object::w_not_implemented()),
         Err(error) if error.kind == crate::PyErrorKind::TypeError => {
@@ -23015,11 +23021,10 @@ fn bytearray_descr_init_value(
         // `__buffer__` slot, not only the native built-in exporters.  The
         // request is `BUF_FULL_RO`, so a strided source is copied out rather
         // than refused.
-        if let Some(buffer) =
-            pyre_object::with_roots!(arg, target => crate::baseobjspace::full_ro_buffer_bytes(arg))?
+        if let Some(data) = pyre_object::with_roots!(arg, target =>
+            crate::baseobjspace::full_ro_buffer_bytes(arg)
+                .map(|buffer| buffer.map(crate::baseobjspace::SimpleBufferBytes::into_bytes)))?
         {
-            let data = buffer.as_bytes().to_vec();
-            buffer.release();
             return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&data));
         }
     }
@@ -23701,22 +23706,18 @@ fn bytes_descr_repeat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// `stringmethods.py:_op_val(space, w_sub, allow_char=True)` — the
 /// `sub` argument of a bytes search/count method is either a bytes-like
 /// object or a single integer in `range(0, 256)` standing for one byte.
+/// A bytes-like `sub` is `buf.as_str()` taken inside `with space.buffer_w(..)`,
+/// so the export is already released.
 enum BytesSubArg {
-    Buffer(crate::baseobjspace::SimpleBufferBytes),
+    Buffer(Vec<u8>),
     Char([u8; 1]),
 }
 
 impl BytesSubArg {
     fn as_bytes(&self) -> &[u8] {
         match self {
-            Self::Buffer(buffer) => buffer.as_bytes(),
+            Self::Buffer(data) => data,
             Self::Char(value) => value,
-        }
-    }
-
-    fn release(self) {
-        if let Self::Buffer(buffer) = self {
-            buffer.release();
         }
     }
 }
@@ -23737,8 +23738,10 @@ fn bytes_sub_arg(mut w_sub: PyObjectRef) -> Result<BytesSubArg, crate::PyError> 
             return Ok(BytesSubArg::Char([v as u8]));
         }
     }
-    match pyre_object::with_roots!(w_sub => crate::baseobjspace::simple_buffer_bytes(w_sub))? {
-        Some(buffer) => Ok(BytesSubArg::Buffer(buffer)),
+    match pyre_object::with_roots!(w_sub => crate::baseobjspace::simple_buffer_bytes(w_sub)
+        .map(|buffer| buffer.map(crate::baseobjspace::SimpleBufferBytes::into_bytes)))?
+    {
+        Some(data) => Ok(BytesSubArg::Buffer(data)),
         None => Err(crate::PyError::type_error(format!(
             "argument should be integer or bytes-like object, not '{}'",
             type_name_of(w_sub)
@@ -23861,7 +23864,6 @@ fn bytes_search(args: &[PyObjectRef], forward: bool) -> Result<i64, crate::PyErr
         };
         Ok(pos.map(|p| (start + p) as i64).unwrap_or(-1))
     })();
-    sub.release();
     receiver.release();
     result
 }
@@ -23923,7 +23925,6 @@ fn bytes_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             bytes_count_subslices(&data[start..end], sub.as_bytes()) as i64,
         ))
     })();
-    sub.release();
     receiver.release();
     result
 }
@@ -23967,31 +23968,32 @@ fn bytes_prefix_match(
                 for i in 0..n {
                     let mut item =
                         pyre_object::w_tuple_getitem(needle, i).expect("index is in range");
-                    let Some(buffer) = pyre_object::with_roots!(item, needle => crate::baseobjspace::simple_buffer_bytes(item))?
+                    let Some(prefix) = pyre_object::with_roots!(item, needle =>
+                        crate::baseobjspace::simple_buffer_bytes(item).map(|buffer| {
+                            buffer.map(crate::baseobjspace::SimpleBufferBytes::into_bytes)
+                        }))?
                     else {
                         return Err(crate::PyError::type_error(format!(
                             "a bytes-like object is required, not '{}'",
                             type_name_of(item)
                         )));
                     };
-                    let matches = test(buffer.as_bytes());
-                    pyre_object::with_roots!(needle => buffer.release());
-                    if matches {
+                    if test(&prefix) {
                         return Ok(true);
                     }
                 }
                 return Ok(false);
             }
-            let Some(buffer) = pyre_object::with_roots!(needle => crate::baseobjspace::simple_buffer_bytes(needle))?
+            let Some(prefix) = pyre_object::with_roots!(needle =>
+                crate::baseobjspace::simple_buffer_bytes(needle)
+                    .map(|buffer| buffer.map(crate::baseobjspace::SimpleBufferBytes::into_bytes)))?
             else {
                 return Err(crate::PyError::type_error(format!(
                     "{method} first arg must be bytes or a tuple of bytes, not {}",
                     type_name_of(needle)
                 )));
             };
-            let matches = test(buffer.as_bytes());
-            buffer.release();
-            Ok(matches)
+            Ok(test(&prefix))
         }
     })();
     receiver.release();
@@ -24477,9 +24479,11 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
         if let Some(i) = sep_idx {
             let mut o = pyre_object::gc_roots::shadow_stack_get(recv_slot + i);
             if !o.is_null() && unsafe { !pyre_object::is_none(o) } {
-                sep_buffer = match pyre_object::with_roots!(o => crate::baseobjspace::simple_buffer_bytes(o))?
+                sep_buffer = match pyre_object::with_roots!(o =>
+                    crate::baseobjspace::simple_buffer_bytes(o)
+                        .map(|buffer| buffer.map(crate::baseobjspace::SimpleBufferBytes::into_bytes)))?
                 {
-                    Some(buffer) => Some(buffer),
+                    Some(sep) => Some(sep),
                     None => {
                         return Err(crate::PyError::type_error(format!(
                             "a bytes-like object is required, not '{}'",
@@ -24490,9 +24494,8 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
             }
         }
         let data = receiver.as_bytes();
-        let parts = match sep_buffer.as_ref() {
-            Some(buffer) => {
-                let sep = buffer.as_bytes();
+        let parts = match sep_buffer.as_deref() {
+            Some(sep) => {
                 if sep.is_empty() {
                     return Err(crate::PyError::value_error("empty separator"));
                 }
@@ -24528,9 +24531,6 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
                 .collect(),
         ))
     })();
-    if let Some(buffer) = sep_buffer {
-        buffer.release();
-    }
     receiver.release();
     result
 }
@@ -25470,17 +25470,23 @@ fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
         // rejected character instead of an abort.
         return parse_hex_bytes(unsafe { pyre_object::w_str_get_wtf8(a) }.as_bytes());
     }
-    let Some(buffer) = pyre_object::with_roots!(a => crate::baseobjspace::simple_buffer_bytes(a))?
+    // `_PyBytes_FromHex`'s `release_buffer` label runs on both success and
+    // every parsing/allocation error.  The export's bracket closes inside
+    // the one rooting `a`.
+    let Some(result) = pyre_object::with_roots!(a =>
+        crate::baseobjspace::simple_buffer_bytes(a).map(|buffer| {
+            buffer.map(|buffer| {
+                let result = parse_hex_bytes(buffer.as_bytes());
+                buffer.release();
+                result
+            })
+        }))?
     else {
         return Err(crate::PyError::type_error(format!(
             "fromhex() argument must be str or bytes-like, not {}",
             crate::error::type_name_of(a)
         )));
     };
-    let result = parse_hex_bytes(buffer.as_bytes());
-    // `_PyBytes_FromHex`'s `release_buffer` label runs on both success and
-    // every parsing/allocation error.
-    buffer.release();
     result
 }
 
@@ -26785,11 +26791,10 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         // `__buffer__` slot, not only the native built-in exporters.  The
         // request is `BUF_FULL_RO`, so a strided source is copied out rather
         // than refused.
-        if let Some(buffer) =
-            pyre_object::with_roots!(arg => crate::baseobjspace::full_ro_buffer_bytes(arg))?
+        if let Some(data) = pyre_object::with_roots!(arg =>
+            crate::baseobjspace::full_ro_buffer_bytes(arg)
+                .map(|buffer| buffer.map(crate::baseobjspace::SimpleBufferBytes::into_bytes)))?
         {
-            let data = buffer.as_bytes().to_vec();
-            buffer.release();
             return Ok(new_bytes_like(_cls_root.get(cls_slot), &data));
         }
     }

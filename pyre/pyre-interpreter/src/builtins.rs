@@ -23674,8 +23674,13 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
     // Keep the encoded bytes: surrogateescape code points can spell bytes
     // that are not valid UTF-8, and the OS seam must receive them verbatim.
-    let resolved_path =
-        pyre_object::with_roots!(path_obj => crate::gateway::fsencode_path_w(path_obj))?;
+    // The resolved path owns a bracket of its own, above this one; this one
+    // stays open until the resolved path is gone.
+    let path_roots = pyre_object::gc_roots::push_roots();
+    let path_base = path_roots.pin_roots(&[path_obj]);
+    let resolved_path = crate::gateway::fsencode_path_w(path_obj);
+    path_obj = path_roots.get(path_base);
+    let resolved_path = resolved_path?;
     let path_bytes = &resolved_path.as_bytes;
     // `host_env::fs` takes a `Path`; only the seam consumes the raw bytes.
     #[cfg(unix)]

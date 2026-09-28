@@ -228,16 +228,15 @@ impl W_BytesIO {
     /// `space.buffer_w(w_data, space.BUF_CONTIG_RO)` — the contiguous
     /// read-only bytes `descr_init` and `write_w` both copy from.
     fn contiguous_bytes(mut w_data: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
-        let Some(input) =
-            pyre_object::with_roots!(w_data => crate::baseobjspace::simple_buffer_bytes(w_data))?
+        let Some(data) = pyre_object::with_roots!(w_data =>
+            crate::baseobjspace::simple_buffer_bytes(w_data)
+                .map(|input| input.map(crate::baseobjspace::SimpleBufferBytes::into_bytes)))?
         else {
             return Err(crate::PyError::type_error(format!(
                 "a bytes-like object is required, not '{}'",
                 crate::type_methods::arg_type_name(w_data)
             )));
         };
-        let data = input.as_bytes().to_vec();
-        input.release();
         Ok(data)
     }
 

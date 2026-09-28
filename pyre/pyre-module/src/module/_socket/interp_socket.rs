@@ -4683,7 +4683,13 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             }
             let mut obj = args[0];
             let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-            let buffer = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1]))?.ok_or_else(|| {
+            // The export owns a bracket of its own, above this one; this one
+            // keeps `obj` rooted until the export is released.
+            let obj_roots = pyre_object::gc_roots::push_roots();
+            let obj_base = obj_roots.pin_roots(&[obj]);
+            let acquired = pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1]);
+            obj = obj_roots.get(obj_base);
+            let buffer = acquired?.ok_or_else(|| {
                 pyre_interpreter::PyError::type_error("send: buffer must be bytes-like")
             })?;
             let flags = if args.len() >= 3 {
@@ -4712,7 +4718,13 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             }
             let mut obj = args[0];
             let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-            let buffer = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1]))?.ok_or_else(|| {
+            // The export owns a bracket of its own, above this one; this one
+            // keeps `obj` rooted until the export is released.
+            let obj_roots = pyre_object::gc_roots::push_roots();
+            let obj_base = obj_roots.pin_roots(&[obj]);
+            let acquired = pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1]);
+            obj = obj_roots.get(obj_base);
+            let buffer = acquired?.ok_or_else(|| {
                 pyre_interpreter::PyError::type_error("sendall: buffer must be bytes-like")
             })?;
             let flags = if args.len() >= 3 {
@@ -4822,7 +4834,13 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             }
             let mut obj = args[0];
             let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-            let buffer = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1]))?.ok_or_else(|| {
+            // The export owns a bracket of its own, above this one; this one
+            // keeps `obj` rooted until the export is released.
+            let obj_roots = pyre_object::gc_roots::push_roots();
+            let obj_base = obj_roots.pin_roots(&[obj]);
+            let acquired = pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1]);
+            obj = obj_roots.get(obj_base);
+            let buffer = acquired?.ok_or_else(|| {
                 pyre_interpreter::PyError::type_error(format!(
                     "a bytes-like object is required, not '{}'",
                     pyre_interpreter::type_methods::arg_type_name(args[1])

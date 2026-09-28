@@ -209,7 +209,13 @@ fn comparison(args: &[PyObjectRef], mode: fn(Ordering) -> bool) -> Result<PyObje
     }
     let mut w_self = args[0];
     let w_other = args[1];
-    let Some(other) = pyre_object::with_roots!(w_self => pyre_interpreter::baseobjspace::simple_buffer_bytes(w_other))?
+    // The view owns a bracket of its own, above this one; this one stays
+    // open until the view is released.
+    let self_roots = pyre_object::gc_roots::push_roots();
+    let self_base = self_roots.pin_roots(&[w_self]);
+    let acquired = pyre_interpreter::baseobjspace::simple_buffer_bytes(w_other);
+    w_self = self_roots.get(self_base);
+    let Some(other) = acquired?
     else {
         return Ok(pyre_object::special::w_not_implemented());
     };

@@ -3222,7 +3222,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             );
             let w = roots.get(base);
             kwargs = if w.is_null() { None } else { Some(w) };
-            drop(roots);
             let path = path?;
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
@@ -3636,7 +3635,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             crate::gateway::fsencode_path_or_fd_w(bound[0].expect("path is required"), name, false);
         let w = roots.get(base);
         kwargs = if w.is_null() { None } else { Some(w) };
-        drop(roots);
         let path = path?;
         // Both take `DirFD(rposix.HAVE_UNLINKAT)` (`interp_posix.py`).
         let _dir_fd = dir_fd_kwarg(kwargs, HAVE_UNLINKAT)?;
@@ -3755,7 +3753,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             );
             let w = roots.get(base);
             kwargs = if w.is_null() { None } else { Some(w) };
-            drop(roots);
             let path = path?;
             let _mode: u32 = match bound[1] {
                 Some(value) => {
@@ -3824,7 +3821,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             );
             let w = roots.get(base);
             kwargs = if w.is_null() { None } else { Some(w) };
-            drop(roots);
             let path = path?;
             // Removing a directory is the same call as removing a file, so
             // `rmdir` reads the same bit: `DirFD(rposix.HAVE_UNLINKAT)`
@@ -3894,14 +3890,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         let src = crate::gateway::fsencode_path_named_w(pos[0], name, "src");
         let w = roots.get(base);
         kwargs = if w.is_null() { None } else { Some(w) };
-        drop(roots);
         let src = src?;
         let roots = pyre_object::gc_roots::push_roots();
         let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
         let dst = crate::gateway::fsencode_path_named_w(pos[1], name, "dst");
         let w = roots.get(base);
         kwargs = if w.is_null() { None } else { Some(w) };
-        drop(roots);
         let dst = dst?;
         let dir_fd = |name: &str| -> Result<Option<i32>, crate::PyError> {
             match crate::builtins::kwarg_get(kwargs, name) {
@@ -4055,7 +4049,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         kwargs = if w.is_null() { None } else { Some(w) };
         let w = roots.get(base + 1);
         w_times = if w.is_null() { None } else { Some(w) };
-        drop(roots);
         let path = path?;
 
         let present = |v: PyObjectRef| (!unsafe { pyre_object::is_none(v) }).then_some(v);
@@ -5462,7 +5455,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         let path = crate::gateway::fsencode_path_or_fd_w(path, name, default_follow);
         let w = roots.get(base);
         kwargs = if w.is_null() { None } else { Some(w) };
-        drop(roots);
         let path = path?;
         // `stat`/`lstat` type `dir_fd` as `DirFD(rposix.HAVE_FSTATAT)`
         // (`interp_posix.py`), whose `unwrap` is `_unwrap_dirfd`
@@ -7358,8 +7350,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let w_path = args[0];
                     let mut w_argv = args[1];
                     let command = pyre_object::with_roots!(w_argv =>
-                        crate::gateway::fsencode_path_named_w(w_path, "execv", "path"))?
-                    .as_bytes;
+                        crate::gateway::fsencode_path_named_w(w_path, "execv", "path")
+                            .map(|path| path.as_bytes))?;
                     let command_c = std::ffi::CString::new(command).map_err(|_| {
                         crate::PyError::value_error("execv() path contains an embedded null byte")
                     })?;
@@ -7387,8 +7379,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let mut w_argv = args[1];
                     let mut w_env = args[2];
                     let command = pyre_object::with_roots!(w_argv, w_env =>
-                        crate::gateway::fsencode_path_named_w(w_path, "execve", "path"))?
-                    .as_bytes;
+                        crate::gateway::fsencode_path_named_w(w_path, "execve", "path")
+                            .map(|path| path.as_bytes))?;
                     let command_c = std::ffi::CString::new(command).map_err(|_| {
                         crate::PyError::value_error("execve() path contains an embedded null byte")
                     })?;
@@ -9177,8 +9169,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                     let w_path = args[0];
                     let mut w_length = args[1];
-                    let path = pyre_object::with_roots!(w_length =>
-                        crate::gateway::fsencode_path_or_fd_w(w_path, "truncate", HAVE_FTRUNCATE))?;
+                    // The path owns a bracket of its own, above this one; this
+                    // one stays open until the path is gone.
+                    let length_roots = pyre_object::gc_roots::push_roots();
+                    let length_base = length_roots.pin_roots(&[w_length]);
+                    let path =
+                        crate::gateway::fsencode_path_or_fd_w(w_path, "truncate", HAVE_FTRUNCATE);
+                    w_length = length_roots.get(length_base);
+                    let path = path?;
                     let length = truncate_length_w(w_length)?;
                     if path.is_fd {
                         ftruncate_retry(path.as_fd, length, |e| errno_err(e, ""))?;
@@ -9347,7 +9345,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 );
                 let w = roots.get(base);
                 kwargs = if w.is_null() { None } else { Some(w) };
-                drop(roots);
                 let path = path?;
                 // interp_posix.py `@unwrap_spec(mode=c_int, ...)`.
                 let mode = match bound[1] {
@@ -9411,7 +9408,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 );
                 let w = roots.get(base);
                 kwargs = if w.is_null() { None } else { Some(w) };
-                drop(roots);
                 let path = path?;
                 // interp_posix.py `@unwrap_spec(mode=c_int, device=c_int,
                 // ...)`.
@@ -9829,14 +9825,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 let src = crate::gateway::fsencode_path_named_w(args[0], "link", "src");
                 let w = roots.get(base);
                 kwargs = if w.is_null() { None } else { Some(w) };
-                drop(roots);
                 let src = src?;
                 let roots = pyre_object::gc_roots::push_roots();
                 let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
                 let dst = crate::gateway::fsencode_path_named_w(args[1], "link", "dst");
                 let w = roots.get(base);
                 kwargs = if w.is_null() { None } else { Some(w) };
-                drop(roots);
                 let dst = dst?;
                 let c_src = std::ffi::CString::new(src.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in src"))?;
@@ -9952,7 +9946,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             mode_obj = roots.get(base);
             let w = roots.get(base + 1);
             kwargs = if w.is_null() { None } else { Some(w) };
-            drop(roots);
             let path = path?;
             // `posix.chmod` unwraps `mode` as `c_int`, so a non-integer raises
             // TypeError instead of reinterpreting its layout.
@@ -10146,13 +10139,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             // object's error, not a statement that the argument was the wrong
             // type.  Rewriting every failure into a `TypeError` here would also
             // swallow the `UnicodeEncodeError` a lone surrogate produces.
-            let path = pyre_object::with_roots!(gid_obj, uid_obj => crate::gateway::fsencode_path_or_fd_w(
+            // The path owns a bracket of its own, above this one; this one
+            // stays open until the path is gone.
+            let id_roots = pyre_object::gc_roots::push_roots();
+            let id_base = id_roots.pin_roots(&[gid_obj, uid_obj]);
+            let path = crate::gateway::fsencode_path_or_fd_w(
                 path_obj,
                 name,
                 // `lchown` is `path_t(allow_fd=0)` — only `chown` reads an
                 // integer as a descriptor (`interp_posix.py`).
                 default_follow && HAVE_FCHOWN,
-            ))?;
+            );
+            gid_obj = id_roots.get(id_base);
+            uid_obj = id_roots.get(id_base + 1);
+            let path = path?;
             // `_Py_Uid_Converter` / `_Py_Gid_Converter`: `uid_t` is unsigned, yet
             // -1 is always accepted as the "leave unchanged" sentinel.  Only
             // that one value means unchanged; every other id is judged by
@@ -10405,7 +10405,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 );
                 let w = roots.get(base);
                 kwargs = if w.is_null() { None } else { Some(w) };
-                drop(roots);
                 let path = path?.as_bytes;
                 // interp_posix.py `@unwrap_spec(mode=c_int, ...)`.
                 let roots = pyre_object::gc_roots::push_roots();
@@ -11564,8 +11563,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // reads the path/fd discriminant.
                     let w_path = args[0];
                     let mut w_name = args[1];
-                    let path = pyre_object::with_roots!(w_name =>
-                        crate::gateway::fsencode_path_or_fd_w(w_path, "pathconf", HAVE_FPATHCONF))?;
+                    // The path owns a bracket of its own, above this one; this
+                    // one stays open until the path is gone.
+                    let name_roots = pyre_object::gc_roots::push_roots();
+                    let name_base = name_roots.pin_roots(&[w_name]);
+                    let path =
+                        crate::gateway::fsencode_path_or_fd_w(w_path, "pathconf", HAVE_FPATHCONF);
+                    w_name = name_roots.get(name_base);
+                    let path = path?;
                     let name = confname_arg(w_name, PATHCONF_NAMES)?;
                     let limit = if path.is_fd {
                         host_posix::fpathconf(path.as_fd, name).map_err(|e| io_err(e, ""))?
