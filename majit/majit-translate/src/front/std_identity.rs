@@ -51,7 +51,7 @@ fn is_identity_wrapper_target(
     target: &CallTarget,
     receiver_path: Option<&str>,
     dest_path: Option<&str>,
-    receiver_is_charon_box: bool,
+    receiver_is_thin_box: bool,
 ) -> bool {
     match target {
         CallTarget::Method {
@@ -74,7 +74,7 @@ fn is_identity_wrapper_target(
             // It is not a std-crate prefix, so the Box-method check runs
             // before the std-path gate.
             if is_builtin_box_as_ref_or_mut_path(segments) {
-                return receiver_is_charon_box;
+                return receiver_is_thin_box;
             }
             if !is_std_fn_path(segments) {
                 return false;
@@ -167,7 +167,7 @@ pub(crate) fn lower_std_primitive_op(
     dest_is_bool: bool,
     banks_agree: bool,
     layout: Option<&[(String, ValueType)]>,
-    receiver_is_charon_box: bool,
+    receiver_is_thin_box: bool,
 ) -> OpKind {
     let OpKind::Call {
         target,
@@ -178,7 +178,7 @@ pub(crate) fn lower_std_primitive_op(
         return op_kind;
     };
     if args.len() == 1
-        && is_identity_wrapper_target(target, receiver_path, dest_path, receiver_is_charon_box)
+        && is_identity_wrapper_target(target, receiver_path, dest_path, receiver_is_thin_box)
     {
         let Some(operand) = args[0].as_variable().cloned() else {
             return op_kind;
@@ -190,7 +190,7 @@ pub(crate) fn lower_std_primitive_op(
         };
         // `Box::as_ref` / `Box::as_mut` are a pointer cast whatever the
         // layout is.
-        if banks_agree && is_box_as_ref_or_mut(target, receiver_is_charon_box) {
+        if banks_agree && is_box_as_ref_or_mut(target, receiver_is_thin_box) {
             return same_as(operand, result_ty.clone());
         }
         if let Some(fields) = layout {
@@ -256,7 +256,7 @@ fn function_leaf_is(target: &CallTarget, leaf: &str) -> bool {
 /// leaf (`boxed::Box::as_mut` once `alloc` is peeled, or the full
 /// `alloc::boxed::Box::as_mut`). A free function whose leaf is `as_mut`
 /// is a different decl and stays a call. The receiver still has to be
-/// the Box ADT (`receiver_is_charon_box`).
+/// a thin Box (`receiver_is_thin_box`).
 fn is_builtin_box_as_ref_or_mut_path(segments: &[String]) -> bool {
     let parts: Vec<&str> = segments.iter().map(String::as_str).collect();
     matches!(
@@ -265,8 +265,8 @@ fn is_builtin_box_as_ref_or_mut_path(segments: &[String]) -> bool {
     )
 }
 
-fn is_box_as_ref_or_mut(target: &CallTarget, receiver_is_charon_box: bool) -> bool {
-    if !receiver_is_charon_box {
+fn is_box_as_ref_or_mut(target: &CallTarget, receiver_is_thin_box: bool) -> bool {
+    if !receiver_is_thin_box {
         return false;
     }
     match target {

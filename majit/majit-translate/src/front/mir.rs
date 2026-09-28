@@ -17030,12 +17030,14 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .and_then(|ty| self.adt_struct_fields(ty))
         };
-        let receiver_is_charon_box = first_arg_ty.as_ref().is_some_and(|ty| {
+        // Only a thin `Box<T>` is one pointer word. `Box<[T]>`, `Box<str>` and
+        // `Box<dyn Trait>` carry a metadata word that a `same_as` would drop.
+        let receiver_is_thin_box = first_arg_ty.as_ref().is_some_and(|ty| {
             let peeled = self
                 .tyref_peel_ref_to_pointee(ty)
                 .unwrap_or_else(|| ty.clone());
             tyref_node(&peeled, self.llbc)
-                .is_some_and(|node| type_node_box_pointee(node, self.llbc).is_some())
+                .is_some_and(|node| type_node_is_thin_box(node, self.llbc))
         });
         let op_kind = crate::front::std_identity::lower_std_primitive_op(
             op_kind,
@@ -17046,7 +17048,7 @@ impl<'a> Lowering<'a> {
             dest_is_bool,
             identity_banks_agree,
             identity_layout.as_deref(),
-            receiver_is_charon_box,
+            receiver_is_thin_box,
         );
         // `Option::as_deref` / `as_deref_mut` on a null-niche
         // `Option<Box<T>>` is the pointer word (`Box::as_mut` is the
