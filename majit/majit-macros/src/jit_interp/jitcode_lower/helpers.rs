@@ -727,6 +727,27 @@ pub(super) fn binop_i_emit_tokens(
     }
 }
 
+/// [`binop_i_emit_tokens`] whose right operand is a `Constant`, which
+/// `assembler.py` `emit_const` encodes in the operation itself. `None` for
+/// `/` and `%`: their inlined `support.py` bodies read the divisor from a
+/// register.
+pub(super) fn binop_i_const_emit_tokens(
+    dst: u16,
+    opcode: &Ident,
+    lhs: u16,
+    rhs: &proc_macro2::TokenStream,
+) -> Option<proc_macro2::TokenStream> {
+    binop_i_accepts_constant(opcode).then(
+        || quote! { __builder.record_binop_i_const(#dst, majit_ir::OpCode::#opcode, #lhs, #rhs); },
+    )
+}
+
+/// Whether [`binop_i_const_emit_tokens`] can encode `opcode` with a
+/// `Constant` right operand.
+pub(super) fn binop_i_accepts_constant(opcode: &Ident) -> bool {
+    !matches!(opcode.to_string().as_str(), "IntFloorDiv" | "IntMod")
+}
+
 pub(super) fn binop_f_emit_tokens(
     dst: u16,
     opcode: &Ident,

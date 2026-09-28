@@ -438,31 +438,19 @@ impl<'c> Lowerer<'c> {
         miss: &Ident,
     ) {
         // `flatten.insert_exits` puts `-live-` immediately before the
-        // fused `goto_if_not_*`. The constant load is not the guard, so
-        // it must land first; otherwise `get_list_of_active_snapshot_boxes`
-        // reads `pc - SIZE_LIVE_OP` as the load opcode.
-        let const_reg = if value_tok.to_string().replace(' ', "") == "0" {
-            None
-        } else {
-            let const_reg = self.alloc_reg();
-            self.emit_op(
-                OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
-                quote! { __builder.load_const_i_value(#const_reg, #value_tok); },
-            );
-            Some(const_reg)
-        };
+        // fused `goto_if_not_*`. The constant stays in the branch
+        // (`assembler.py` `emit_const`), so nothing is loaded ahead of it.
+        let is_zero = value_tok.to_string().replace(' ', "") == "0";
         self.emit_op(
             OpMeta::live_marker(),
             quote! { let _ = __builder.live_placeholder(); },
         );
-        if let Some(const_reg) = const_reg {
+        if !is_zero {
             self.emit_op(
-                OpMeta::conditional_guard_compare(
-                    Register::int(disc_reg),
-                    Register::int(const_reg),
-                    miss.clone(),
-                ),
-                quote! { __builder.goto_if_not_int_eq(#disc_reg, #const_reg, #miss); },
+                OpMeta::conditional_guard(Register::int(disc_reg), miss.clone()),
+                quote! {
+                    __builder.goto_if_not_int_const(majit_ir::OpCode::IntEq, #disc_reg, #value_tok, #miss);
+                },
             );
         } else {
             self.emit_op(
@@ -550,6 +538,15 @@ impl<'c> Lowerer<'c> {
                 self.emit_op(
                     OpMeta::conditional_guard_compare(lhs_reg, rhs_reg, target.clone()),
                     quote! { __builder.#branch(#lhs_index, #rhs_index, #target); },
+                );
+            }
+            LoweredCondition::CompareConst { lhs, value, opcode } => {
+                let lhs_index = lhs.reg;
+                self.emit_op(
+                    OpMeta::conditional_guard(Register::int(lhs_index), target.clone()),
+                    quote! {
+                        __builder.goto_if_not_int_const(majit_ir::OpCode::#opcode, #lhs_index, #value, #target);
+                    },
                 );
             }
         }
