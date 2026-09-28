@@ -11023,12 +11023,10 @@ const STR_CONCAT_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::FunctionPath(&["jit_ll_strconcat"]),
 ];
 
-// `jit_str_compare` takes two `W_UnicodeObject` boxes and returns the
-// `ll_unicode_cmp` ordering. `stroruni.cmp` (`OopSpecIndex::StrCmp`) reads
-// rstr payloads via `getstrlen`; tagging the wrapper with it makes vstring
-// treat the box as a payload and pass a non-pointer into the callee.
+// `rstr.py ll_strcmp` over two `rstr.STR` payloads, `@jit.oopspec(
+// 'stroruni.cmp(s1, s2)')`.
 const STR_CMP_TARGETS: &[CallTargetPattern] =
-    &[CallTargetPattern::FunctionPath(&["jit_str_compare"])];
+    &[CallTargetPattern::FunctionPath(&["jit_ll_strcmp"])];
 
 // effectinfo.py: list operations (may raise IndexError)
 const LIST_GETITEM_TARGETS: &[CallTargetPattern] = &[
@@ -11128,7 +11126,7 @@ const CALL_DESCRIPTOR_TABLE: &[CallDescriptorEntry] = &[
     CallDescriptorEntry {
         targets: STR_CMP_TARGETS,
         extraeffect: ExtraEffect::ElidableCannotRaise,
-        oopspecindex: OopSpecIndex::None,
+        oopspecindex: OopSpecIndex::StrCmp,
     },
     // ── List operations (may raise, side effects) ──
     CallDescriptorEntry {

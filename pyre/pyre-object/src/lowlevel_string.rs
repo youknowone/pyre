@@ -305,6 +305,39 @@ pub extern "C" fn jit_ll_streq(
     (chars1 == chars2) as i64
 }
 
+/// `rstr.py LLHelpers.ll_strcmp` — order two rstr `STR` payloads.
+///
+/// `@jit.elidable` and `@jit.oopspec('stroruni.cmp(s1, s2)')`: the operands
+/// are `STR` payloads, which is what vstring's `opt_call_stroruni_STR_CMP`
+/// reads with `strlen` / `strgetitem`.  `rtype_lt` and its siblings compare
+/// the result against zero.
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_strcmp(
+    s1: *const crate::unicodeobject::UnicodeValueStorage,
+    s2: *const crate::unicodeobject::UnicodeValueStorage,
+) -> i64 {
+    if s1.is_null() && s2.is_null() {
+        return 1;
+    }
+    if s1.is_null() || s2.is_null() {
+        return 0;
+    }
+    let len1 = bh_lowlevel_string_len(s1 as i64);
+    let len2 = bh_lowlevel_string_len(s2 as i64);
+    let cmplen = if len1 < len2 { len1 } else { len2 };
+    let chars1 = unsafe { (s1 as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET) };
+    let chars2 = unsafe { (s2 as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET) };
+    let mut i = 0;
+    while i < cmplen {
+        let diff = unsafe { *chars1.add(i) as i64 - *chars2.add(i) as i64 };
+        if diff != 0 {
+            return diff;
+        }
+        i += 1;
+    }
+    len1 as i64 - len2 as i64
+}
+
 /// `rstr.py LLHelpers.ll_str_mul` — `@jit.elidable` on the STR payload.
 ///
 /// `times < 0` clamps to 0 (`'0' * -1 == ''`).  `ovfcheck(len * times)` is
@@ -589,6 +622,24 @@ mod tests {
         assert_eq!(jit_ll_streq(p(seven), p(seventy)), 0);
         assert_eq!(jit_ll_streq(p(seven), p(0)), 0);
         assert_eq!(jit_ll_streq(p(0), p(0)), 1);
+        for s in [seven, seven_again, eight, seventy] {
+            bh_free_lowlevel_string(s, LOWLEVEL_STR_BASE_SIZE, 1);
+        }
+    }
+
+    #[test]
+    fn jit_ll_strcmp_orders_payload_chars_then_length() {
+        use crate::unicodeobject::UnicodeValueStorage;
+        let p = |s: i64| s as *const UnicodeValueStorage;
+        let seven = jit_ll_int2dec(7) as i64;
+        let seven_again = jit_ll_int2dec(7) as i64;
+        let eight = jit_ll_int2dec(8) as i64;
+        let seventy = jit_ll_int2dec(70) as i64;
+        assert_eq!(jit_ll_strcmp(p(seven), p(seven_again)), 0);
+        assert_eq!(jit_ll_strcmp(p(seven), p(eight)), -1);
+        assert_eq!(jit_ll_strcmp(p(eight), p(seven)), 1);
+        assert_eq!(jit_ll_strcmp(p(seven), p(seventy)), -1);
+        assert_eq!(jit_ll_strcmp(p(seventy), p(eight)), -1);
         for s in [seven, seven_again, eight, seventy] {
             bh_free_lowlevel_string(s, LOWLEVEL_STR_BASE_SIZE, 1);
         }

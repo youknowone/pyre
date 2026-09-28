@@ -3389,12 +3389,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     cpa2(
         &mut entries,
-        "pyre_object::unicodeobject::jit_str_compare",
-        "pyre_object::jit_str_compare",
-        pyre_object::jit_str_compare,
-    );
-    cpa2(
-        &mut entries,
         "pyre_object::unicodeobject::jit_str_contains",
         "pyre_object::jit_str_contains",
         pyre_object::unicodeobject::jit_str_contains,
@@ -3493,6 +3487,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::lowlevel_string::jit_ll_streq",
         "pyre_object::jit_ll_streq",
         pyre_object::lowlevel_string::jit_ll_streq,
+    );
+    cpa2(
+        &mut entries,
+        "pyre_object::lowlevel_string::jit_ll_strcmp",
+        "pyre_object::jit_ll_strcmp",
+        pyre_object::lowlevel_string::jit_ll_strcmp,
     );
     cpa2(
         &mut entries,

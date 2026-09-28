@@ -9765,18 +9765,12 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     })? {
                         return Ok((outcome, op.next_pc));
                     }
-                    // Exact int and long compares are recorded by the descent
-                    // above (`compare_value_from_tag` → `compare_slot`).
-                    // Two exact strings: `_compare` (unicodeobject.py) answers
-                    // from one WTF-8 ordering.
-                    // Short exact tuples of ints or None are folded by
-                    // `try_walker_fold_small_tuple_eq`. Longer tuples and
-                    // subclasses still reach this residual.
-                    spec_gate(SpecFold::CompareOpStr, || {
-                        try_walker_specialize_compare_op_str(
-                            ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                        )
-                    })?
+                    // Exact int, long and str compares are recorded by the
+                    // descent above (`compare_value_from_tag` →
+                    // `compare_slot`). Short exact tuples of ints or None are
+                    // folded by `try_walker_fold_small_tuple_eq`. Longer
+                    // tuples and subclasses still reach this residual.
+                    None
                 };
                 if specialized.is_some() {
                     return Ok((DispatchOutcome::Continue, op.next_pc));

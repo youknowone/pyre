@@ -1361,17 +1361,6 @@ pub extern "C" fn jit_str_repeat(s: PyObjectRef, n: i64) -> PyObjectRef {
 }
 
 #[majit_macros::elidable]
-pub extern "C" fn jit_str_compare(a: PyObjectRef, b: PyObjectRef) -> i64 {
-    unsafe {
-        // WTF-8 byte order matches code point order, so the byte
-        // comparison yields the same result as comparing code points.
-        let sa = w_str_get_wtf8(a).as_bytes();
-        let sb = w_str_get_wtf8(b).as_bytes();
-        crate::object_array::ll_chars_strcmp(sa, sb) as i64
-    }
-}
-
-#[majit_macros::elidable]
 pub extern "C" fn jit_str_is_true(s: PyObjectRef) -> i64 {
     unsafe { (w_str_len(s) != 0) as i64 }
 }
@@ -2052,9 +2041,6 @@ mod tests {
         unsafe {
             assert_eq!(w_str_get_wtf8(cat), "abcd");
             assert_eq!(w_str_get_wtf8(rep), "ababab");
-            assert!(jit_str_compare(a, b) < 0);
-            assert_eq!(jit_str_compare(a, a), 0);
-            assert!(jit_str_compare(b, a) > 0);
             assert_eq!(jit_str_is_true(a), 1);
             assert_eq!(jit_str_is_true(w_str_new("")), 0);
         }
