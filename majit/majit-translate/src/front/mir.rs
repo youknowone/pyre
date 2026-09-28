@@ -999,16 +999,10 @@ impl PackedFrameState {
 /// analysis, its clause-specialization queue and the declarations that did
 /// not lower. A [`CrateLowering`] borrows it together with the artefact.
 pub(crate) struct CrateLoweringState {
-    known_struct_names: std::collections::HashSet<String>,
     known_trait_names: std::collections::HashSet<String>,
-    struct_fields: crate::front::semantic::StructFieldRegistry,
-    enum_variant_by_discriminant:
-        std::collections::HashMap<String, std::collections::HashMap<i64, String>>,
-    struct_origins: std::collections::HashMap<String, String>,
     struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>>,
-    exact_layouts:
-        std::collections::HashMap<majit_ir::descr::StructId, crate::front::semantic::ExactLayout>,
-    struct_ids: std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    /// Taken by [`Self::finish`]; no body lowering reads them.
+    exports: std::cell::RefCell<CrateExports>,
     tombstoned_leaves: std::collections::HashSet<String>,
     dont_look_inside: std::collections::HashSet<String>,
     elidable_residual: std::collections::HashSet<String>,
@@ -1030,6 +1024,20 @@ pub(crate) struct CrateLoweringState {
     /// Positional aggregate shapes the built graphs construct, recorded as
     /// each body is built ([`record_positional_shapes`]).
     positional_shapes: std::cell::RefCell<std::collections::BTreeSet<String>>,
+}
+
+/// The declaration tables [`CrateLoweringState::finish`] hands to the
+/// program.
+#[derive(Default)]
+struct CrateExports {
+    known_struct_names: std::collections::HashSet<String>,
+    struct_fields: crate::front::semantic::StructFieldRegistry,
+    enum_variant_by_discriminant:
+        std::collections::HashMap<String, std::collections::HashMap<i64, String>>,
+    struct_origins: std::collections::HashMap<String, String>,
+    exact_layouts:
+        std::collections::HashMap<majit_ir::descr::StructId, crate::front::semantic::ExactLayout>,
+    struct_ids: std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
 }
 
 /// One artefact's lowering context: the artefact, the host addresses and
@@ -1180,14 +1188,16 @@ impl CrateLoweringState {
             .map(|(path, _)| path.clone())
             .collect();
         Self {
-            known_struct_names,
             known_trait_names,
-            struct_fields,
-            enum_variant_by_discriminant,
-            struct_origins,
             struct_field_attrs,
-            exact_layouts,
-            struct_ids,
+            exports: std::cell::RefCell::new(CrateExports {
+                known_struct_names,
+                struct_fields,
+                enum_variant_by_discriminant,
+                struct_origins,
+                exact_layouts,
+                struct_ids,
+            }),
             tombstoned_leaves,
             dont_look_inside,
             elidable_residual,
@@ -1230,9 +1240,17 @@ impl<'l> CrateLowering<'l> {
             .iter_local_fns()
             .filter_map(|fd| self.lower_decl(fd, module_filter, function_filter))
             .collect();
-        // `specialize.py` `cachedgraph` keys one graph per instantiation. The
-        // walk above enqueues each concrete call; lowering a copy enqueues the
-        // callees whose clauses that copy just bound.
+        functions.extend(self.lower_specs());
+        functions
+    }
+
+    /// Lower every clause specialization queued so far.
+    ///
+    /// `specialize.py` `cachedgraph` keys one graph per instantiation. A
+    /// built body enqueues each concrete call; lowering a copy enqueues the
+    /// callees whose clauses that copy just bound.
+    pub(crate) fn lower_specs(&self) -> Vec<crate::front::semantic::SemanticFunction> {
+        let mut functions = Vec::new();
         while let Some(req) = self.pop_spec() {
             functions.extend(self.lower_spec(req));
         }
@@ -1247,12 +1265,26 @@ impl<'l> CrateLowering<'l> {
         module_filter: Option<&std::collections::HashSet<String>>,
         function_filter: Option<&std::collections::HashSet<String>>,
     ) -> Option<crate::front::semantic::SemanticFunction> {
-        let CrateLoweringState {
-            not_rpython,
-            skipped,
-            atomic_load_decls,
-            ..
-        } = self.state;
+        if !self.admit_decl(fd, module_filter, function_filter) {
+            return None;
+        }
+        match self.build_decl(fd) {
+            Ok(function) => Some(function),
+            Err(error) => {
+                self.record_decl_failure(fd, error);
+                None
+            }
+        }
+    }
+
+    /// Whether `fd` declares a funcobj of this program: the membership
+    /// gates [`Self::lower_decl`] applies before building anything.
+    pub(crate) fn admit_decl(
+        &self,
+        fd: &FunDecl,
+        module_filter: Option<&std::collections::HashSet<String>>,
+        function_filter: Option<&std::collections::HashSet<String>>,
+    ) -> bool {
         // Charon emits static / const initialiser bodies (e.g. the
         // body that builds `static NONE_SINGLETON`) as ordinary
         // `FunDecl` entries whose `src` is `GlobalInitializer` of the
@@ -1265,46 +1297,51 @@ impl<'l> CrateLowering<'l> {
         // orphan etype/evalue slots no longer reject the graph — this
         // skip is about call-target modelling, not adapter safety.)
         if fd.is_global_initializer().is_some() {
-            return None;
+            return false;
         }
         let (module_path, name) = decl_module_path_and_name(fd);
         if !should_lower_module(module_filter, &module_path) {
-            return None;
+            return false;
         }
         if !should_lower_function(function_filter, &name) {
-            return None;
+            return false;
         }
         let fn_path = decl_fn_path(&module_path, &name);
-        if not_rpython.contains(&fn_path) {
-            return None;
-        }
-        match self.build_decl(fd) {
-            Ok(function) => Some(function),
-            Err(DeclBuildError::NoBody) => {
+        !self.state.not_rpython.contains(&fn_path)
+    }
+
+    /// Record why the body of `fd` produced no graph.
+    pub(crate) fn record_decl_failure(&self, fd: &FunDecl, error: DeclBuildError) {
+        let CrateLoweringState {
+            skipped,
+            atomic_load_decls,
+            ..
+        } = self.state;
+        match error {
+            DeclBuildError::NoBody => {
                 // A declaration with no unstructured body never becomes a
                 // `SemanticFunction`, so it never reaches `function_graphs` and
                 // every callsite resolves it as an unregistered path.  The
                 // lowering errors below are already surfaced by `skipped`; this
                 // arm was the one membership drop that left no trace at all.
+                let (module_path, name) = decl_module_path_and_name(fd);
                 crate::decline::record_named(
                     crate::decline::gate::SEMANTIC_FN_LOOP,
                     "declaration-has-no-unstructured-body",
-                    &fn_path,
+                    &decl_fn_path(&module_path, &name),
                 );
-                None
             }
-            Err(DeclBuildError::Lower {
+            DeclBuildError::Lower {
                 name,
                 error,
                 atomic_load_reason,
-            }) => {
+            } => {
                 if let Some(reason) = atomic_load_reason {
                     atomic_load_decls
                         .borrow_mut()
                         .push(declined_atomic_load_fun_decl(self.llbc, fd, reason));
                 }
                 skipped.borrow_mut().push((name, error.to_string()));
-                None
             }
         }
     }
@@ -1315,40 +1352,26 @@ impl<'l> CrateLowering<'l> {
         &self,
         fd: &'l FunDecl,
     ) -> Result<crate::front::semantic::SemanticFunction, DeclBuildError> {
+        let header = self.decl_header(fd);
+        let graph = self.build_decl_body(fd)?;
+        Ok(header.into_function(graph))
+    }
+
+    /// The declaration facts of the funcobj `fd` declares.
+    pub(crate) fn decl_header(&self, fd: &FunDecl) -> SemanticFunctionHeader {
         let CrateLoweringState {
             known_trait_names,
-            struct_field_attrs,
-            tombstoned_leaves,
             dont_look_inside,
             elidable_residual,
             func_hints,
-            spec,
-            positional_shapes,
             ..
         } = self.state;
-        let Self {
-            llbc,
-            static_addrs,
-            jitdriver_receiver_roots,
-            ref root_stack,
-            ..
-        } = *self;
         let (module_path, name) = decl_module_path_and_name(fd);
         let fn_path = decl_fn_path(&module_path, &name);
         // A monomorphized copy registers under its instance leaf, as a
         // clause-specialized copy does below; `fn_path` stays the template's
         // for the policy and hint lookups every instance shares.
-        let name = instance_leaf(llbc, fd).unwrap_or(name);
-        // `FunDecl::body` is raw JSON and `unstructured()` re-parses it on
-        // every call, so hold the one projection this build needs: it is
-        // both the "has a lowerable body" gate and the input the lowering
-        // below reads.  The membership gates read the declaration's name
-        // path or header alone, so they run first and a filtered-out
-        // declaration never pays for the parse.
-        let Some(mut body) = fd.unstructured() else {
-            return Err(DeclBuildError::NoBody);
-        };
-        elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
+        let name = instance_leaf(self.llbc, fd).unwrap_or(name);
         // `return_type` stays `None` for ordinary fns: the Charon
         // dedup-table resolution cannot yet map a
         // `TyRef::Deduplicated{id}` to its primitive name, and the
@@ -1369,19 +1392,50 @@ impl<'l> CrateLowering<'l> {
         // Without this, every impl method built by the MIR driver looks
         // like a free function to the canonical registration loop and
         // the impl-key return-type / hint registrations get dropped.
-        let header = SemanticFunctionHeader::new(
-            llbc,
+        SemanticFunctionHeader::new(
+            self.llbc,
             fd,
             name,
             module_path,
             &fd.signature,
-            &known_trait_names,
-            &dont_look_inside,
-            &elidable_residual,
+            known_trait_names,
+            dont_look_inside,
+            elidable_residual,
             func_hints,
-            static_addrs.error_carrier,
+            self.static_addrs.error_carrier,
             &fn_path,
-        );
+        )
+    }
+
+    /// Lower the body of `fd`, unstamped: the funcobj's header stamps it
+    /// ([`SemanticFunctionHeader::graph_stamp`]).
+    pub(crate) fn build_decl_body(
+        &self,
+        fd: &FunDecl,
+    ) -> Result<crate::model::FunctionGraph, DeclBuildError> {
+        let CrateLoweringState {
+            struct_field_attrs,
+            tombstoned_leaves,
+            dont_look_inside,
+            spec,
+            positional_shapes,
+            ..
+        } = self.state;
+        let Self {
+            llbc,
+            static_addrs,
+            jitdriver_receiver_roots,
+            ref root_stack,
+            ..
+        } = *self;
+        // `FunDecl::body` is raw JSON and `unstructured()` re-parses it on
+        // every call, so hold the one projection this build needs: it is
+        // both the "has a lowerable body" gate and the input the lowering
+        // below reads.
+        let Some(mut body) = fd.unstructured() else {
+            return Err(DeclBuildError::NoBody);
+        };
+        elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
         // A single function whose body the driver does not yet handle
         // should not abort the whole-program build.  Capture
         // per-function errors into a side bucket and continue; they are
@@ -1398,27 +1452,28 @@ impl<'l> CrateLowering<'l> {
             &body,
             static_addrs,
             jitdriver_receiver_roots,
-            &struct_field_attrs,
-            &dont_look_inside,
-            &tombstoned_leaves,
+            struct_field_attrs,
+            dont_look_inside,
+            tombstoned_leaves,
             builder_mode,
             &accum,
             &mut atomic_reasons,
-            &root_stack,
+            root_stack,
             Some(spec),
             false,
         ) {
             Ok(g) => g,
             Err(error) => {
                 return Err(DeclBuildError::Lower {
-                    name: header.name,
+                    name: instance_leaf(llbc, fd)
+                        .unwrap_or_else(|| decl_module_path_and_name(fd).1),
                     error,
                     atomic_load_reason: atomic_reasons.into_iter().next(),
                 });
             }
         };
         record_positional_shapes(&graph, &mut positional_shapes.borrow_mut());
-        Ok(header.into_function(graph))
+        Ok(graph)
     }
 
     /// Pop the next queued clause specialization.
@@ -1552,17 +1607,19 @@ impl CrateLoweringState {
     /// `struct_field_attrs` are copied: a body lowered after this still
     /// reads them, and the positional layouts below must not reach it.
     pub(crate) fn finish(
-        &mut self,
+        &self,
         functions: Vec<crate::front::semantic::SemanticFunction>,
     ) -> crate::front::semantic::SemanticProgram {
         let known_trait_names = self.known_trait_names.clone();
         let mut struct_field_attrs = self.struct_field_attrs.clone();
-        let mut known_struct_names = std::mem::take(&mut self.known_struct_names);
-        let mut struct_fields = std::mem::take(&mut self.struct_fields);
-        let enum_variant_by_discriminant = std::mem::take(&mut self.enum_variant_by_discriminant);
-        let struct_origins = std::mem::take(&mut self.struct_origins);
-        let exact_layouts = std::mem::take(&mut self.exact_layouts);
-        let mut struct_ids = std::mem::take(&mut self.struct_ids);
+        let CrateExports {
+            mut known_struct_names,
+            mut struct_fields,
+            enum_variant_by_discriminant,
+            struct_origins,
+            exact_layouts,
+            mut struct_ids,
+        } = self.exports.take();
         let skipped = self.skipped.take();
         let atomic_load_decls = self.atomic_load_decls.take();
         register_synthetic_positional_metadata(
@@ -1651,7 +1708,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     function_filter: Option<&std::collections::HashSet<String>>,
     cross_tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
-    let mut state = CrateLoweringState::new(
+    let state = CrateLoweringState::new(
         llbc,
         cross_tombstoned_leaves,
         std::collections::HashMap::new(),
@@ -1698,7 +1755,7 @@ fn decl_fn_path(module_path: &str, name: &str) -> String {
 /// `SemanticFunction` field but the body, plus the `graph.func` fields
 /// [`SemanticFunctionHeader::into_function`] stamps onto the lowered graph.
 /// Built from the declaration alone, before the body lowers.
-struct SemanticFunctionHeader {
+pub(crate) struct SemanticFunctionHeader {
     name: String,
     return_type: Option<String>,
     self_ty_root: Option<String>,
@@ -1835,20 +1892,29 @@ impl SemanticFunctionHeader {
         self,
         graph: crate::model::FunctionGraph,
     ) -> crate::front::semantic::SemanticFunction {
-        let graph = match &self.self_ty_root {
-            Some(owner) => graph.with_owner_root(owner.clone()),
-            None => graph,
-        };
-        let mut graph = graph
-            .with_source_identity(self.source_identity)
-            .with_fun_decl_id(self.fun_decl_id);
-        graph.func.module = self.module;
-        if !self.hints.is_empty() {
-            crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &self.hints);
+        let graph = self.graph_stamp().apply(graph);
+        self.into_semantic(crate::model::LazyGraph::built(graph))
+    }
+
+    /// What the header stamps onto the funcobj's lowered body.
+    pub(crate) fn graph_stamp(&self) -> GraphStamp {
+        GraphStamp {
+            owner_root: self.self_ty_root.clone(),
+            source_identity: self.source_identity.clone(),
+            fun_decl_id: self.fun_decl_id,
+            module: self.module.clone(),
+            hints: self.hints.clone(),
         }
+    }
+
+    /// Assemble the `SemanticFunction` around the funcobj's graph handle.
+    pub(crate) fn into_semantic(
+        self,
+        graph: crate::model::LazyGraph,
+    ) -> crate::front::semantic::SemanticFunction {
         crate::front::semantic::SemanticFunction {
             name: self.name,
-            graph: crate::model::LazyGraph::built(graph),
+            graph,
             return_type: self.return_type,
             self_ty_root: self.self_ty_root,
             trait_impl_id: self.trait_impl_id,
@@ -1859,6 +1925,39 @@ impl SemanticFunctionHeader {
             trait_qualified: self.trait_qualified,
             returns_objectptr: self.returns_objectptr,
         }
+    }
+}
+
+/// The header facts a funcobj's lowered body carries: `graph.func` and the
+/// identity [`crate::model::FunctionGraph::graph_key`] reads.
+pub(crate) struct GraphStamp {
+    owner_root: Option<String>,
+    source_identity: String,
+    fun_decl_id: u64,
+    module: Option<String>,
+    hints: Vec<String>,
+}
+
+impl GraphStamp {
+    pub(crate) fn apply(&self, graph: crate::model::FunctionGraph) -> crate::model::FunctionGraph {
+        let graph = match &self.owner_root {
+            Some(owner) => graph.with_owner_root(owner.clone()),
+            None => graph,
+        };
+        let mut graph = graph
+            .with_source_identity(self.source_identity.clone())
+            .with_fun_decl_id(self.fun_decl_id);
+        graph.func.module = self.module.clone();
+        if !self.hints.is_empty() {
+            crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &self.hints);
+        }
+        graph
+    }
+
+    /// The [`crate::model::GraphKey`] of the stamped body of the declaration
+    /// `fd`, known before the body is built.
+    pub(crate) fn decl_graph_key(&self, fd: &FunDecl) -> crate::model::GraphKey {
+        (Some(self.source_identity.clone()), fd.item_meta.name_path())
     }
 }
 

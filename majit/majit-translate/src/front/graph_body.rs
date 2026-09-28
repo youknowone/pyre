@@ -14,11 +14,15 @@
 //! which is what a [`GraphBodyProvider`] owns.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use majit_charon_reader::Llbc;
 
-use crate::front::mir::{self, CrateLowering, CrateLoweringState, DeclBuildError, LowerError};
+use crate::front::mir::{
+    self, CrateLowering, CrateLoweringState, DeclBuildError, GraphStamp, LowerError,
+};
 use crate::front::semantic::{SemanticFunction, SemanticProgram};
+use crate::model::{FunctionGraph, GraphKey, LazyGraph};
 
 /// Where a funcobj's body comes from: the LLBC that carries it and the
 /// Charon `def_id` that indexes it there (`Llbc::fn_by_id`).
@@ -34,12 +38,19 @@ pub(crate) struct GraphBodySource {
 
 /// Owns the extracted LLBC set and everything else the lowering reads, so
 /// a funcobj's body can be built after the whole-program pass has run.
+/// Each funcobj's [`LazyGraph`] holds its crate and the tables, and builds
+/// its body from them on first demand.
+pub(crate) struct GraphBodyProvider {
+    crates: Vec<Rc<ProvidedCrate>>,
+    tables: Rc<ProviderTables>,
+}
+
+/// What every crate's lowering reads besides its own artefact and state.
 ///
 /// The three `HostStaticAddrs` tables and the error-carrier spec are held
 /// owned because [`crate::HostStaticAddrs`] borrows all of them from the
 /// caller's frame; the borrowed view is rebuilt per lowering call.
-pub(crate) struct GraphBodyProvider {
-    crates: Vec<ProvidedCrate>,
+struct ProviderTables {
     jitdriver_receiver_roots: Vec<String>,
     pytypes: Vec<(String, i64)>,
     pytypes_by_struct: Vec<(String, i64)>,
@@ -127,8 +138,7 @@ impl GraphBodyProvider {
         let own = |rows: &[(&str, i64)]| -> Vec<(String, i64)> {
             rows.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
         };
-        Self {
-            crates: Vec::new(),
+        let tables = ProviderTables {
             jitdriver_receiver_roots: jitdriver_receiver_roots.to_vec(),
             pytypes: own(static_addrs.pytypes),
             pytypes_by_struct: own(static_addrs.pytypes_by_struct),
@@ -141,6 +151,10 @@ impl GraphBodyProvider {
                 .map(OwnedScalarFieldStore::own)
                 .collect(),
             func_hints,
+        };
+        Self {
+            crates: Vec::new(),
+            tables: Rc::new(tables),
         }
     }
 
@@ -156,20 +170,50 @@ impl GraphBodyProvider {
     ) -> SemanticProgram {
         let module_filter = mir::normalize_module_filter(module_paths);
         let paint_tombstones = mir::prelink_crate(&llbc, cross_tombstoned_leaves);
-        let mut state = CrateLoweringState::new(&llbc, &paint_tombstones, self.func_hints.clone());
-        let functions = self.with_static_addrs(|static_addrs| {
-            CrateLowering::new(&llbc, static_addrs, &self.jitdriver_receiver_roots, &state)
-                .lower_all(module_filter.as_ref(), None)
-        });
-        let mut program = state.finish(functions);
+        let state =
+            CrateLoweringState::new(&llbc, &paint_tombstones, self.tables.func_hints.clone());
+        let krate = Rc::new(ProvidedCrate { llbc, state });
+        let mut functions = self.declare_crate(&krate, module_filter.as_ref());
+        // Every declared body is built here, in declaration order and
+        // before the clause specializations those bodies queue; a body that
+        // does not lower leaves no funcobj.
+        functions.retain(|function| function.lazy_graph().get().is_some());
+        functions.extend(krate.lowering(&self.tables, |lowering| lowering.lower_specs()));
+        let mut program = krate.state.finish(functions);
         mir::harden_duplicate_leaf_metadata(
             &mut program.struct_fields,
             &mut program.struct_origins,
             &mut program.enum_variant_by_discriminant,
             Some(&program.struct_ids),
         );
-        self.crates.push(ProvidedCrate { llbc, state });
+        self.crates.push(krate);
         program
+    }
+
+    /// A funcobj per declaration of `krate` the membership gates admit,
+    /// each holding its body unbuilt.
+    fn declare_crate(
+        &self,
+        krate: &Rc<ProvidedCrate>,
+        module_filter: Option<&HashSet<String>>,
+    ) -> Vec<SemanticFunction> {
+        krate.lowering(&self.tables, |lowering| {
+            krate
+                .llbc
+                .iter_local_fns()
+                .filter(|fd| lowering.admit_decl(fd, module_filter, None))
+                .map(|fd| {
+                    let header = lowering.decl_header(fd);
+                    let stamp = header.graph_stamp();
+                    let key = stamp.decl_graph_key(fd);
+                    let (krate, tables, def_id) = (krate.clone(), self.tables.clone(), fd.def_id);
+                    let graph = LazyGraph::deferred(key.clone(), move || {
+                        krate.build_decl_graph(&tables, def_id, &stamp, &key)
+                    });
+                    header.into_semantic(graph)
+                })
+                .collect()
+        })
     }
 
     /// Locate the funcobj whose Charon `name_path()` is `name_path`, if
@@ -223,24 +267,61 @@ impl GraphBodyProvider {
         let fd = krate.llbc.fn_by_id(src.def_id).ok_or_else(|| {
             LowerError::Unsupported(format!("no FunDecl for def_id {}", src.def_id))
         })?;
-        self.with_static_addrs(|static_addrs| {
-            CrateLowering::new(
-                &krate.llbc,
+        krate
+            .lowering(&self.tables, |lowering| lowering.build_decl(fd))
+            .map_err(|e| match e {
+                DeclBuildError::NoBody => LowerError::Unsupported(format!(
+                    "{}: no Unstructured body",
+                    fd.item_meta.name_path()
+                )),
+                DeclBuildError::Lower { error, .. } => error,
+            })
+    }
+}
+
+impl ProvidedCrate {
+    /// Run `f` over this crate's lowering context.
+    fn lowering<R>(&self, tables: &ProviderTables, f: impl FnOnce(&CrateLowering<'_>) -> R) -> R {
+        tables.with_static_addrs(|static_addrs| {
+            f(&CrateLowering::new(
+                &self.llbc,
                 static_addrs,
-                &self.jitdriver_receiver_roots,
-                &krate.state,
-            )
-            .build_decl(fd)
-        })
-        .map_err(|e| match e {
-            DeclBuildError::NoBody => LowerError::Unsupported(format!(
-                "{}: no Unstructured body",
-                fd.item_meta.name_path()
-            )),
-            DeclBuildError::Lower { error, .. } => error,
+                &tables.jitdriver_receiver_roots,
+                &self.state,
+            ))
         })
     }
 
+    /// Build the body of the declaration `def_id` and stamp its header on
+    /// it. `None`, recorded as the declaration's failure, when it does not
+    /// lower.
+    fn build_decl_graph(
+        &self,
+        tables: &ProviderTables,
+        def_id: u64,
+        stamp: &GraphStamp,
+        key: &GraphKey,
+    ) -> Option<FunctionGraph> {
+        let fd = self.llbc.fn_by_id(def_id)?;
+        self.lowering(tables, |lowering| match lowering.build_decl_body(fd) {
+            Ok(graph) => {
+                let graph = stamp.apply(graph);
+                assert_eq!(
+                    &graph.graph_key(),
+                    key,
+                    "the built body names another funcobj"
+                );
+                Some(graph)
+            }
+            Err(error) => {
+                lowering.record_decl_failure(fd, error);
+                None
+            }
+        })
+    }
+}
+
+impl ProviderTables {
     /// Run `f` with the borrowed [`crate::HostStaticAddrs`] view of the
     /// owned tables.
     fn with_static_addrs<R>(&self, f: impl FnOnce(crate::HostStaticAddrs<'_>) -> R) -> R {
