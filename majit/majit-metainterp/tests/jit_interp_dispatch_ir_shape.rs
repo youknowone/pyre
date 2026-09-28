@@ -2157,7 +2157,7 @@ mod oparg_with_body_local_method_call_green {
     #[test]
     fn dispatch_with_body_local_method_call_green_pins_canonical_call_before_merge_point() {
         use majit_metainterp::jitcode::insns::{
-            BC_INT_GUARD_VALUE, BC_INT_LE, BC_INT_LSHIFT, BC_INT_RSHIFT, BC_JIT_MERGE_POINT,
+            BC_INT_GUARD_VALUE, BC_INT_LE, BC_INT_SIGNEXT, BC_JIT_MERGE_POINT,
             BC_JIT_MERGE_POINT_C, BC_LIVE, BC_RESIDUAL_CALL_IR_I,
         };
 
@@ -2244,35 +2244,26 @@ mod oparg_with_body_local_method_call_green {
         // The fixture compares `get_req_size(pc) as i32 <= state.f1 as i32`
         // (line 1976), so BC_INT_LE's lhs is the `as i32` sign-extension of
         // the call result, not the raw call-result register. The cast lowers
-        // to `(x << 32) >> 32` — BC_INT_LSHIFT then arithmetic BC_INT_RSHIFT
-        // (lower_value.rs) — so verify BC_INT_LE's lhs chains back through
-        // that pair to the canonical call-result reg rather than asserting a
-        // direct register reuse (which the register allocator is free to
-        // forgo).
+        // to `int_signext(x, 4)` (`jtransform.py` `_int_to_int_cast`), whose
+        // byte count is a constant operand, so verify BC_INT_LE's lhs is the
+        // result of a BC_INT_SIGNEXT that reads the canonical call-result reg.
         let int_le_lhs = code[int_le_pos + 1];
         // binop_i encoding is `[opcode][lhs][rhs][dst]` (assembler.py:165-174).
-        let find_binop_dst = |op: u8, dst: u8| -> Option<usize> {
-            code[call_pos..int_le_pos]
-                .windows(4)
-                .position(|w| w[0] == op && w[3] == dst)
-                .map(|p| call_pos + p)
-        };
-        let rshift_pos = find_binop_dst(BC_INT_RSHIFT, int_le_lhs).expect(
-            "A.3.6.3: BC_INT_LE lhs must be produced by the `as i32` \
-             sign-extension (arithmetic BC_INT_RSHIFT) of the call result",
-        );
-        let lshift_dst = code[rshift_pos + 1];
-        let lshift_pos = find_binop_dst(BC_INT_LSHIFT, lshift_dst).expect(
-            "A.3.6.3: the `as i32` BC_INT_RSHIFT must consume a \
-             BC_INT_LSHIFT result",
-        );
+        let signext_pos = code[call_pos..int_le_pos]
+            .windows(4)
+            .position(|w| w[0] == BC_INT_SIGNEXT && w[3] == int_le_lhs)
+            .map(|p| call_pos + p)
+            .expect(
+                "A.3.6.3: BC_INT_LE lhs must be produced by the `as i32` \
+                 sign-extension (BC_INT_SIGNEXT) of the call result",
+            );
         assert_eq!(
-            code[lshift_pos + 1],
+            code[signext_pos + 1],
             call_result_reg_byte,
             "A.3.6.3: the `as i32` sign-extension feeding BC_INT_LE's lhs \
-             must root at the canonical call-result reg; got lshift_lhs={} \
+             must read the canonical call-result reg; got signext_lhs={} \
              call_result_reg={}",
-            code[lshift_pos + 1],
+            code[signext_pos + 1],
             call_result_reg_byte,
         );
 
