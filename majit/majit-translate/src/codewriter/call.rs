@@ -1729,6 +1729,10 @@ pub struct CallControl {
     /// STRUCT; the Rust source declaration alone cannot distinguish a host
     /// raw object from a JIT-GC object.
     struct_storage: HashMap<majit_ir::descr::StructId, (bool, bool)>,
+    /// Build-time `HostStaticAddrs.pytypes` rows. An exception-class
+    /// constant is emitted as the address of its `interp_exceptions`
+    /// `PyType` static, which the load-time patch rewrites.
+    exc_pytype_rows: Vec<(String, i64)>,
     /// RPython: `_immutable_fields_` per class. Maps struct_name →
     /// `(field_name, rank)` pairs declared immutable / quasi-immutable.
     /// Consulted by the heuristic fallback in `all_interiorfielddescrs`
@@ -2304,6 +2308,7 @@ impl CallControl {
             trait_unique_impls: HashMap::new(),
             trait_family_registrations: Vec::new(),
             struct_storage: HashMap::new(),
+            exc_pytype_rows: Vec::new(),
             // RPython: symbolic.get_array_token(GcArray(T))[0] = carray.items.offset
             // = sizeof(Signed) = WORD. Standard GcArray has a length field before items.
             //
@@ -2450,6 +2455,16 @@ impl CallControl {
 
     fn clear_fielddescrof_memo(&self) {
         self.fielddescrof_memo.borrow_mut().clear();
+    }
+
+    /// Install the host-static pytype rows the assembler uses for
+    /// exception-class constants.
+    pub fn set_exc_pytype_rows(&mut self, pytypes: Vec<(String, i64)>) {
+        self.exc_pytype_rows = pytypes;
+    }
+
+    pub(crate) fn exc_pytype_rows(&self) -> &[(String, i64)] {
+        &self.exc_pytype_rows
     }
 
     /// Install the embedding runtime's lltype storage classification.

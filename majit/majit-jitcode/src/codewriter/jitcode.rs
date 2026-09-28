@@ -95,6 +95,20 @@ pub struct UnitVariantConstDescriptor {
     pub tag: i64,
 }
 
+/// A prebuilt exception instance whose runtime object is materialized at
+/// jitcode load. The translator only has the class name and constructor
+/// arguments; the load pass allocates the immortal instance and overwrites
+/// the sentinel in `constants_r`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ExcInstanceConstDescriptor {
+    /// Position in [`JitCodeBody::constants_r`] holding the sentinel.
+    pub constants_r_index: usize,
+    /// Builtin exception class name (`AssertionError`, `OverflowError`, …).
+    pub class_name: String,
+    /// Constructor message. `None` is the empty prebuilt instance.
+    pub message: Option<Vec<u8>>,
+}
+
 /// Body of a `JitCode` — populated once by the assembler after
 /// `transform_graph_to_jitcode` runs the full codewriter pipeline.
 ///
@@ -227,6 +241,10 @@ pub struct JitCodeBody {
     /// carrying the variant's discriminant.  Default empty.
     #[serde(default)]
     pub unit_variant_consts: Vec<UnitVariantConstDescriptor>,
+    /// Prebuilt exception instances deferred to runtime materialization.
+    /// Same sentinel contract as [`Self::str_consts`].
+    #[serde(default)]
+    pub exc_instance_consts: Vec<ExcInstanceConstDescriptor>,
     /// RPython `jitcode.py` `self.c_num_regs_i = chr(num_regs_i)`.
     /// The one-byte carrier is part of the JitCode format; both
     /// `JitCode.setup` and `Assembler.check_result` reject values that do not
