@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::codewriter::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
 use crate::flowspace::argument::Signature;
-use crate::front::semantic::SemanticFunction;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation};
 use crate::parse::CallPath;
@@ -4681,8 +4680,7 @@ impl CallControl {
     ///
     /// Discovers all candidate graphs reachable from the portal entry
     /// points. RPython uses `policy.look_inside_graph` to decide whether
-    /// to follow each callee; we synthesize a `SemanticFunction` from the
-    /// callee graph's own `hints` and pass it through.
+    /// to follow each callee.
     pub fn find_all_graphs(&mut self, policy: &mut dyn JitPolicy) {
         assert!(
             !self.jitdrivers_sd.is_empty(),
@@ -5174,26 +5172,8 @@ impl CallControl {
                             }
                         };
                         // RPython call.py:84,87: callee must satisfy
-                        // policy.look_inside_graph(graph). Synthesize a
-                        // SemanticFunction from the stored graph + hints so
-                        // the policy's `_jit_*_` / `_elidable_function_`
-                        // checks fire identically to upstream.
-                        let hints = graph_ref.hints.clone();
-                        let graph = graph_ref.clone();
-                        let func = SemanticFunction {
-                            name: callee_path.last_segment().unwrap_or_default().to_string(),
-                            graph,
-                            return_type: None,
-                            self_ty_root: None,
-                            trait_impl_id: None,
-                            fun_decl_id: None,
-                            hints,
-                            module_path: String::new(),
-                            trait_root: None,
-                            trait_qualified: None,
-                            returns_objectptr: false,
-                        };
-                        if policy.look_inside_graph(&func) {
+                        // policy.look_inside_graph(graph).
+                        if policy.look_inside_graph(graph_ref) {
                             self.candidate_graphs.insert(callee_path.clone());
                             todo.push(callee_path);
                         } else {
@@ -6434,7 +6414,7 @@ impl CallControl {
     // tokens `look_inside` / `unroll_safe` / `aroundstate`).  It is
     // seeded at registration (`register_function_graph_with_hints` /
     // `register_function_hints_for`) and matched by
-    // `codewriter::policy` against the synthesized `SemanticFunction`.
+    // `codewriter::policy` against the callee graph.
     // The effect analyzers below instead read the typed carrier
     // [`crate::model::FuncEffects`] (`graph.func`) for the
     // `_elidable_function_` / `_jit_loop_invariant_` /
@@ -6464,7 +6444,7 @@ impl CallControl {
     /// Mark a target as elidable (pure function). Sets the typed
     /// `func.elidable` (read by the analyzers, order-insensitive via the
     /// external-funcobj merge) and stamps the `"elidable"` token onto
-    /// `graph.hints` for the policy `SemanticFunction` path.
+    /// `graph.hints` for `codewriter::policy`.
     pub fn mark_elidable(&mut self, path: CallPath) {
         self.func_effects_mut(&path).elidable = true;
         self.stamp_graph_hint(&path, "elidable");
@@ -10372,23 +10352,8 @@ mod tests {
             stored.hints.iter().any(|h| h == "unroll_safe"),
             "harvested unroll_safe was not merged into FunctionGraph.hints"
         );
-        let hints = stored.hints.clone();
-        let graph = stored.clone();
-        let func = SemanticFunction {
-            name: "loopy".into(),
-            graph,
-            return_type: None,
-            self_ty_root: None,
-            trait_impl_id: None,
-            fun_decl_id: None,
-            hints,
-            module_path: String::new(),
-            trait_root: None,
-            trait_qualified: None,
-            returns_objectptr: false,
-        };
         let mut policy = crate::policy::DefaultJitPolicy::new();
-        assert!(policy.look_inside_graph(&func));
+        assert!(policy.look_inside_graph(stored));
     }
 
     /// Two aliases of one source funcobj fold onto a single `GraphSlot`.

@@ -31,7 +31,7 @@
 //! optional `pyre-module/src/module/` mirror the same `pypy/module/` tree.
 
 use majit_translate::codewriter::policy::{JitPolicy, JitPolicyState};
-use majit_translate::front::semantic::SemanticFunction;
+use majit_translate::model::FunctionGraph;
 
 /// `pypy.module.` — the roots `look_inside_function` strips before calling
 /// `look_inside_pypy_module`.
@@ -97,8 +97,8 @@ impl JitPolicy for PyPyJitPolicy {
     }
 
     /// policy.py `look_inside_function(self, func)`.
-    fn look_inside_function(&self, func: &SemanticFunction) -> bool {
-        let module = func.graph.func.module.as_deref().unwrap_or("?");
+    fn look_inside_function(&self, func: &FunctionGraph) -> bool {
+        let module = func.func.module.as_deref().unwrap_or("?");
 
         if module == "majit_rlib::rlocale" || module == "majit_rlib::rsocket" {
             return false;
@@ -124,24 +124,11 @@ impl JitPolicy for PyPyJitPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_translate::model::FunctionGraph;
 
-    fn func_in(module: Option<&str>) -> SemanticFunction {
+    fn func_in(module: Option<&str>) -> FunctionGraph {
         let mut graph = FunctionGraph::new("f");
         graph.func.module = module.map(str::to_string);
-        SemanticFunction {
-            name: "f".into(),
-            graph,
-            return_type: None,
-            self_ty_root: None,
-            trait_impl_id: None,
-            fun_decl_id: None,
-            hints: vec![],
-            module_path: String::new(),
-            trait_root: None,
-            trait_qualified: None,
-            returns_objectptr: false,
-        }
+        graph
     }
 
     fn looks_inside(module: &str) -> bool {
