@@ -17,16 +17,44 @@ thread_local! {
     static NULL_MEM_ACCESS: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Walk-abort latches armed on any thread and not yet taken.
+///
+/// The latches themselves are per-thread. The tracing walker polls them
+/// once per jitcode step, and almost every poll finds nothing, so a poll
+/// reads its own thread's latch only while this count is nonzero. A latch
+/// another thread armed only costs this thread the thread-local read.
+static ARMED_WALK_LATCHES: AtomicUsize = AtomicUsize::new(0);
+
+/// Arm a per-thread walk-abort latch; see [`take_walk_latch`].
+pub fn arm_walk_latch(latch: &Cell<bool>) {
+    if !latch.replace(true) {
+        ARMED_WALK_LATCHES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Consume a per-thread walk-abort latch armed by [`arm_walk_latch`].
+#[must_use]
+pub fn take_walk_latch(latch: &'static std::thread::LocalKey<Cell<bool>>) -> bool {
+    if ARMED_WALK_LATCHES.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let armed = latch.with(|cell| cell.replace(false));
+    if armed {
+        ARMED_WALK_LATCHES.fetch_sub(1, Ordering::Relaxed);
+    }
+    armed
+}
+
 /// `llmodel.py protect_speculative_field` rejected a null gcptr.
 /// The walker aborts the trace instead of panicking the host.
 /// Per-thread: two overlapping walks must not consume each other's latch.
 pub fn note_null_mem_access() {
-    NULL_MEM_ACCESS.with(|cell| cell.set(true));
+    NULL_MEM_ACCESS.with(arm_walk_latch);
 }
 
 #[must_use]
 pub fn take_null_mem_access() -> bool {
-    NULL_MEM_ACCESS.with(|cell| cell.replace(false))
+    take_walk_latch(&NULL_MEM_ACCESS)
 }
 
 /// `rstr.STR` / `symbolic.get_field_token(..., 'hash')`: hash word at 0.
