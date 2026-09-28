@@ -4005,7 +4005,8 @@ where
     /// Two exits sit inside the loop because the checks they answer run once
     /// per instruction: the runaway backstop (`count_walk_step`) and the
     /// trace-length overflow `run_to_end` answers, which is left to that
-    /// caller.
+    /// caller. A `goto` counts toward the backstop too, so a cycle of `live`
+    /// and `goto` alone still reaches it.
     pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
         self.install_replace_frames(ctx);
         // SAFETY: the guard is a local of this call and `ctx` is borrowed for
@@ -4027,6 +4028,9 @@ where
                         .peek_u16_at(pc + 1)
                         .expect("BC_JUMP target operand is truncated")
                         as usize;
+                    if let Some(action) = self.count_walk_step(ctx) {
+                        return action;
+                    }
                     continue;
                 }
                 _ => {}
