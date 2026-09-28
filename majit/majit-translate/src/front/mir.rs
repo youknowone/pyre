@@ -15568,9 +15568,12 @@ impl<'a> Lowering<'a> {
                 // expansion emits for a Display placeholder.  Lower it to
                 // `UnaryOp("str")` instead of leaving the graph-less
                 // `to_string` extern; the rtyper routes `str` to the
-                // operand repr's `ll_str` (string = identity).
+                // operand repr's `ll_str` (string = identity).  A
+                // monomorphized instance renders under its concrete `Self`,
+                // so the blanket impl is also recognised by its declaration.
                 if args.len() == 1
-                    && fmt_path_ends_with(&segments, &["string", "<Impl>", "to_string"])
+                    && (fmt_path_ends_with(&segments, &["string", "<Impl>", "to_string"])
+                        || self.callee_template_is(&reg, "alloc::string::<Impl>::to_string"))
                 {
                     let res = self
                         .graph
@@ -25517,12 +25520,18 @@ impl<'a> Lowering<'a> {
     /// monomorphized instance's `Self` is a concrete type, so its path
     /// renders under that type's name.
     fn callee_is_blanket_into(&self, reg: &RegularCall) -> bool {
+        self.callee_template_is(reg, "core::convert::<Impl>::into")
+    }
+
+    /// The callee's declaration is named `path`, read off its template name
+    /// so a monomorphized instance matches like the generic item.
+    fn callee_template_is(&self, reg: &RegularCall, path: &str) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::convert::<Impl>::into")
+            .is_some_and(|fd| fd.item_meta.name_path() == path)
     }
 
     /// Resolve the reflexive blanket `IntoIterator::into_iter`
