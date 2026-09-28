@@ -1172,7 +1172,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // lowering below reads.  Every gate above reads the declaration's
         // name path or header alone, so they run first and a filtered-out
         // declaration never pays for the parse.
-        let Some(body) = fd.unstructured() else {
+        let Some(mut body) = fd.unstructured() else {
             // A declaration with no unstructured body never becomes a
             // `SemanticFunction`, so it never reaches `function_graphs` and
             // every callsite resolves it as an unregistered path.  The
@@ -1185,6 +1185,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             );
             continue;
         };
+        elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
         // A single function whose body the driver does not yet handle
         // should not abort the whole-program build.  Capture
         // per-function errors into a side bucket and continue; they are
@@ -1266,7 +1267,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         let Some(fd) = llbc.fn_by_id(req.fn_id) else {
             continue;
         };
-        let Some(body) = crate::front::clause_spec::substituted_unstructured(
+        let Some(mut body) = crate::front::clause_spec::substituted_unstructured(
             fd,
             llbc,
             &req.trait_refs,
@@ -1276,6 +1277,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             skipped.push((spec_name, "no substituted unstructured body".into()));
             continue;
         };
+        elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
         let signature = crate::front::clause_spec::substituted_signature(
             &fd.signature,
             llbc,
@@ -3108,12 +3110,13 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     dont_look_inside: &std::collections::HashSet<String>,
     tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Result<FunctionGraph, LowerError> {
-    let u = fd.unstructured().ok_or_else(|| {
+    let mut u = fd.unstructured().ok_or_else(|| {
         LowerError::Unsupported(format!(
             "{}: no Unstructured body (extracted with --ullbc?)",
             fd.item_meta.name_path()
         ))
     })?;
+    elaborate_explicit_root_closes(llbc, &mut u, &|reg| regular_call_name_path(reg, llbc));
     let accum = AccumulatorFacts::build(llbc, &u);
     let builder_mode = accum.has_builder;
     let mut atomic_load_reasons = Vec::new();
@@ -28998,7 +29001,12 @@ impl<'a> RootStackAnalyzer<'a> {
             return seen.get_cached_result(id, &mut self.analyzed_calls.borrow_mut());
         }
         let result = match fd.unstructured() {
-            Some(body) => self.analyze_body(&body, seen),
+            Some(mut body) => {
+                elaborate_explicit_root_closes(self.llbc, &mut body, &|reg| {
+                    regular_call_name_path(reg, self.llbc)
+                });
+                self.analyze_body(&body, seen)
+            }
             None => self.analyze_external_call(fd),
         };
         seen.leave_with(id, result, &mut self.analyzed_calls.borrow_mut());
@@ -31002,6 +31010,267 @@ fn gc_root_scope_base_path(name: &str) -> bool {
     matches!(segments.last(), Some(&"base")) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
 }
 
+/// `drop(guard)`: `_t = move _g; _ = core::mem::drop(move _t)`.
+///
+/// The guard's destructor runs inside that call, so the call is the close of
+/// the bracket `_g` opened.  Charon keeps the scope-end `Drop _g` that rustc's
+/// drop elaboration (`elaborate_drops`) removes for a local moved out on every
+/// path to it, so this performs both halves of that elaboration for a
+/// root-bracket guard: the call becomes `Drop _g` with the guard's own drop
+/// glue, and a `Drop` of the guard that only a path through such a close
+/// reaches becomes a `Goto`.  `Drop _t` is always one, as `_t` never holds the
+/// guard across a block boundary.
+///
+/// The initialisation state follows the edges the lowering keeps, which leave
+/// out `on_unwind`.  A guard moved anywhere but into such a call, closed where
+/// it may already be closed, or dropped where it may be either, is left as it
+/// is, and [`moved_out_locals`] then keeps its bracket open.
+fn elaborate_explicit_root_closes(
+    llbc: &Llbc,
+    body: &mut Unstructured,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+) {
+    struct Close {
+        bb: usize,
+        guard: usize,
+        /// `_t` and every other local the guard passed through, closest to
+        /// the call first.
+        temps: Vec<usize>,
+        /// Statement indices of the moves into `temps`.
+        moves: Vec<usize>,
+        /// The `move _g` operand's place, type and all.
+        guard_place: serde_json::Value,
+        /// The call's `()` destination.
+        dest: usize,
+    }
+    let mut closes: Vec<Close> = Vec::new();
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        if name_of(reg).as_deref() != Some("core::mem::drop") || call.args.len() != 1 {
+            continue;
+        }
+        let (Some(Operand::Move(arg)), PlaceKind::Local(dest)) =
+            (call.args.first(), &call.dest.kind)
+        else {
+            continue;
+        };
+        let PlaceKind::Local(arg_local) = arg.kind else {
+            continue;
+        };
+        let mut guard_place = bb.terminator.kind["Call"]["call"]["args"][0]["Move"].clone();
+        let mut cur = arg_local as usize;
+        let mut temps = Vec::new();
+        let mut moves = Vec::new();
+        for (i, stmt) in bb.statements.iter().enumerate().rev() {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                continue;
+            };
+            if !matches!(place.kind, PlaceKind::Local(d) if d as usize == cur) {
+                continue;
+            }
+            let Rvalue::Use(Operand::Move(src), _) = rvalue else {
+                break;
+            };
+            let PlaceKind::Local(src) = src.kind else {
+                break;
+            };
+            temps.push(cur);
+            moves.push(i);
+            guard_place = stmt.kind["Assign"][1]["Use"]["Move"].clone();
+            cur = src as usize;
+        }
+        closes.push(Close {
+            bb: bb_idx,
+            guard: cur,
+            temps,
+            moves,
+            guard_place,
+            dest: *dest as usize,
+        });
+    }
+    if closes.is_empty() {
+        return;
+    }
+    // Opener blocks per guard local.
+    let mut openers: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if let Ok(TermKind::Call { call, .. }) = bb.term(llbc)
+            && let CallFunc::Regular(reg) = &call.func
+            && name_of(reg).is_some_and(|path| gc_root_scope_open_path(&path))
+            && let PlaceKind::Local(dest) = call.dest.kind
+        {
+            openers.entry(dest as usize).or_default().push(bb_idx);
+        }
+    }
+    let move_counts = local_move_counts(body);
+    let model_successors = |bb: usize| -> Vec<usize> {
+        let targets: Vec<u64> = match body.body[bb].term(llbc) {
+            Ok(TermKind::Goto { target }) => vec![target],
+            Ok(
+                TermKind::Call { target, .. }
+                | TermKind::Assert { target, .. }
+                | TermKind::Drop { target, .. },
+            ) => vec![target],
+            Ok(TermKind::Switch { targets, .. }) => match targets {
+                SwitchTargets::If(a, b) => vec![a, b],
+                SwitchTargets::SwitchInt(_, arms, default) => arms
+                    .iter()
+                    .map(|(_, bb)| *bb)
+                    .chain(std::iter::once(default))
+                    .collect(),
+            },
+            _ => Vec::new(),
+        };
+        targets
+            .into_iter()
+            .map(|t| t as usize)
+            .filter(|&t| t < body.body.len())
+            .collect()
+    };
+    let drop_of = |bb: &majit_charon_reader::ullbc::BasicBlock| -> Option<usize> {
+        match bb.term(llbc) {
+            Ok(TermKind::Drop { place, .. }) => match place.kind {
+                PlaceKind::Local(l) => Some(l as usize),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let mut guards: Vec<usize> = closes.iter().map(|c| c.guard).collect();
+    guards.sort_unstable();
+    guards.dedup();
+    let mut rewrites: Vec<(usize, serde_json::Value)> = Vec::new();
+    let mut removed_moves: Vec<(usize, Vec<usize>)> = Vec::new();
+    for guard in guards {
+        let Some(opener_bbs) = openers.get(&guard) else {
+            continue;
+        };
+        let mine: Vec<&Close> = closes.iter().filter(|c| c.guard == guard).collect();
+        let close_bbs: bit_set::BitSet = mine.iter().map(|c| c.bb).collect();
+        // Every move of the guard and of its temporaries is a link of one of
+        // these chains.
+        if move_counts.get(&guard).copied().unwrap_or(0) != mine.len() {
+            continue;
+        }
+        let temps: bit_set::BitSet = mine.iter().flat_map(|c| c.temps.iter().copied()).collect();
+        if temps.contains(guard)
+            || temps
+                .iter()
+                .any(|t| move_counts.get(&t).copied().unwrap_or(0) != 1)
+        {
+            continue;
+        }
+        // The temporaries and the call's `()` result are named nowhere else.
+        let dests: bit_set::BitSet = mine.iter().map(|c| c.dest).collect();
+        let mut private = temps.clone();
+        private.union_with(&dests);
+        let mentioned_elsewhere = body.body.iter().enumerate().any(|(bb_idx, bb)| {
+            let chain = mine.iter().find(|c| c.bb == bb_idx);
+            let stmt_hit = bb.statements.iter().enumerate().any(|(i, stmt)| {
+                !chain.is_some_and(|c| c.moves.contains(&i))
+                    && !matches!(
+                        stmt.stmt_kind(),
+                        Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_))
+                    )
+                    && mentions_local(&stmt.kind, &private)
+            });
+            let term_hit = chain.is_none()
+                && !drop_of(bb).is_some_and(|l| temps.contains(l))
+                && mentions_local(&bb.terminator.kind, &private);
+            stmt_hit || term_hit
+        });
+        if mentioned_elsewhere {
+            continue;
+        }
+        // The guard's own drop glue, from a `Drop` Charon already wrote for it.
+        let Some(template) = body.body.iter().find_map(|bb| match bb.term(llbc) {
+            Ok(TermKind::Drop { place, fn_ptr, .. })
+                if matches!(place.kind, PlaceKind::Local(l) if l as usize == guard || temps.contains(l as usize))
+                    && name_of(&fn_ptr)
+                        .as_deref()
+                        .is_some_and(gc_root_scope_drop_glue_path) =>
+            {
+                Some(bb.terminator.kind.clone())
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        // Maybe-initialised / maybe-uninitialised at each block entry.
+        const INIT: u8 = 1;
+        const UNINIT: u8 = 2;
+        let n = body.body.len();
+        let mut state = vec![0u8; n];
+        state[0] = UNINIT;
+        let mut work = vec![0usize];
+        while let Some(bb) = work.pop() {
+            let out = if opener_bbs.contains(&bb) {
+                INIT
+            } else if close_bbs.contains(bb) || drop_of(&body.body[bb]) == Some(guard) {
+                UNINIT
+            } else {
+                state[bb]
+            };
+            for succ in model_successors(bb) {
+                if state[succ] | out != state[succ] {
+                    state[succ] |= out;
+                    work.push(succ);
+                }
+            }
+        }
+        let mut dead: Vec<usize> = Vec::new();
+        let mut sound = mine.iter().all(|c| state[c.bb] == INIT);
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if drop_of(bb) != Some(guard) {
+                continue;
+            }
+            match state[bb_idx] {
+                UNINIT => dead.push(bb_idx),
+                0 | INIT => {}
+                _ => sound = false,
+            }
+        }
+        if !sound {
+            continue;
+        }
+        for c in &mine {
+            let Ok(TermKind::Call {
+                target, on_unwind, ..
+            }) = body.body[c.bb].term(llbc)
+            else {
+                continue;
+            };
+            let mut close = template.clone();
+            close["Drop"]["place"] = c.guard_place.clone();
+            close["Drop"]["target"] = serde_json::json!(target);
+            close["Drop"]["on_unwind"] = serde_json::json!(on_unwind);
+            rewrites.push((c.bb, close));
+            removed_moves.push((c.bb, c.moves.clone()));
+        }
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            let is_dead = dead.contains(&bb_idx) || drop_of(bb).is_some_and(|l| temps.contains(l));
+            if is_dead && let Ok(TermKind::Drop { target, .. }) = bb.term(llbc) {
+                rewrites.push((bb_idx, serde_json::json!({"Goto": {"target": target}})));
+            }
+        }
+    }
+    for (bb_idx, mut moves) in removed_moves {
+        moves.sort_unstable_by(|a, b| b.cmp(a));
+        for i in moves {
+            body.body[bb_idx].statements.remove(i);
+        }
+    }
+    for (bb_idx, kind) in rewrites {
+        body.body[bb_idx].set_terminator_kind(kind);
+    }
+}
+
 /// The MIR locals this body moves out of.
 ///
 /// Charon stamps almost every `Drop` `Conditional`: the destructor runs only
@@ -31020,6 +31289,12 @@ fn gc_root_scope_base_path(name: &str) -> bool {
 /// a `usize` under the index of a local declared as a `RootScope`.
 /// Counting that as a move would retire the guard.
 fn moved_out_locals(body: &Unstructured) -> bit_set::BitSet {
+    local_move_counts(body).into_keys().collect()
+}
+
+/// How many times each MIR local is moved out of, by the rule
+/// [`moved_out_locals`] documents.
+fn local_move_counts(body: &Unstructured) -> std::collections::HashMap<usize, usize> {
     fn ty_ref_id(v: &serde_json::Value) -> Option<u64> {
         v.get("Deduplicated")
             .and_then(serde_json::Value::as_u64)
@@ -31032,7 +31307,7 @@ fn moved_out_locals(body: &Unstructured) -> bit_set::BitSet {
     fn scan(
         v: &serde_json::Value,
         declared: &std::collections::HashMap<u64, u64>,
-        out: &mut bit_set::BitSet,
+        out: &mut std::collections::HashMap<usize, usize>,
     ) {
         match v {
             serde_json::Value::Object(map) => {
@@ -31048,7 +31323,7 @@ fn moved_out_locals(body: &Unstructured) -> bit_set::BitSet {
                         (Some(a), Some(b)) if a != *b
                     );
                     if !mismatched {
-                        out.insert(local as usize);
+                        *out.entry(local as usize).or_default() += 1;
                     }
                 }
                 for nested in map.values() {
@@ -31076,7 +31351,7 @@ fn moved_out_locals(body: &Unstructured) -> bit_set::BitSet {
             Some((l.index, id))
         })
         .collect();
-    let mut out = bit_set::BitSet::new();
+    let mut out = std::collections::HashMap::new();
     for bb in &body.body {
         for stmt in &bb.statements {
             scan(&stmt.kind, &declared, &mut out);
@@ -56572,6 +56847,183 @@ mod tests {
         let analyzer = super::RootStackAnalyzer::new(&above);
         assert!(analyzer.regular_call_touches_root_stack(&direct));
         assert!(analyzer.regular_call_touches_root_stack(&method));
+    }
+
+    #[test]
+    fn an_explicit_drop_of_a_root_guard_is_its_bracket_close() {
+        use majit_charon_reader::ullbc::{PlaceKind, RegularCall, TermKind};
+        // `let g = push_roots(); pin_root(a); drop(g);` spells the close as a
+        // call Charon writes as `_4 = move _2; core::mem::drop(move _4)`,
+        // and keeps the scope-end `Drop _2` a moved-out local no longer runs.
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let move_into = |dest: u64, src: u64| {
+            stmt(serde_json::json!({"Assign": [place(dest), {"Use": {"Move": place(src)}}]}))
+        };
+        let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64, unwind: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": {"Regular": id}}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": unwind
+            }})
+        };
+        let drop_guard = |local: u64, target: u64, unwind: u64| {
+            serde_json::json!({"Drop": {
+                "kind": "Conditional",
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": {"Regular": 0}}, "generics": {}},
+                "target": target,
+                "on_unwind": unwind
+            }})
+        };
+        let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+        let body = |blocks: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "span": span(),
+                "locals": {"arg_count": 1, "locals": (0..=9).map(local).collect::<Vec<_>>()},
+                "body": blocks
+            })
+        };
+        let fun = |def_id: u64, path: &[&str], body: Option<serde_json::Value>| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": {
+                    "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                    "span": span(),
+                    "source_text": null,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": true
+                },
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [],
+                    "output": {"Tuple": []}
+                },
+                "body": match body {
+                    Some(b) => serde_json::json!({"Unstructured": b}),
+                    None => serde_json::json!("Missing"),
+                }
+            })
+        };
+        let funs = vec![
+            fun(
+                0,
+                &["pyre_object", "gc_roots", "RootScope", "drop_in_place"],
+                None,
+            ),
+            fun(1, &["pyre_object", "gc_roots", "push_roots"], None),
+            fun(2, &["pyre_object", "gc_roots", "pin_root"], None),
+            fun(3, &["core", "mem", "drop"], None),
+            //   bb0: _2 = push_roots()                      -> bb1
+            //   bb1: _3 = pin_root(_1)                      -> bb2
+            //   bb2: _4 = move _2; _5 = drop(move _4)       -> bb3, unwind bb6
+            //   bb3: drop(_2)                               -> bb7
+            //   bb4: drop(_2)                               -> bb5
+            //   bb5: resume
+            //   bb6: drop(_4)                               -> bb4
+            //   bb7: return
+            fun(
+                4,
+                &["pyre_object", "fixture", "operands"],
+                Some(body(vec![
+                    block(vec![], call(1, vec![], 2, 1, 5)),
+                    block(vec![], call(2, vec![copy(1)], 3, 2, 4)),
+                    block(
+                        vec![move_into(4, 2)],
+                        call(3, vec![serde_json::json!({"Move": place(4)})], 5, 3, 6),
+                    ),
+                    block(vec![], drop_guard(2, 7, 5)),
+                    block(vec![], drop_guard(2, 5, 5)),
+                    block(vec![], serde_json::json!("UnwindResume")),
+                    block(vec![], drop_guard(4, 4, 5)),
+                    block(vec![], serde_json::json!("Return")),
+                ])),
+            ),
+            // The same close on one arm only: the join's `Drop _2` runs on
+            // the other arm, so it is neither the close nor dead.
+            //   bb0: _2 = push_roots()                      -> bb1
+            //   bb1: if _1 { bb2 } else { bb3 }
+            //   bb2: _4 = move _2; _5 = drop(move _4)       -> bb3
+            //   bb3: drop(_2)                               -> bb4
+            //   bb4: return
+            fun(
+                5,
+                &["pyre_object", "fixture", "one_arm"],
+                Some(body(vec![
+                    block(vec![], call(1, vec![], 2, 1, 4)),
+                    block(
+                        vec![],
+                        serde_json::json!({"Switch": {"discr": copy(1), "targets": {"If": [2, 3]}}}),
+                    ),
+                    block(
+                        vec![move_into(4, 2)],
+                        call(3, vec![serde_json::json!({"Move": place(4)})], 5, 3, 4),
+                    ),
+                    block(vec![], drop_guard(2, 4, 4)),
+                    block(vec![], serde_json::json!("Return")),
+                ])),
+            ),
+        ];
+        let llbc = llbc_with_types("pyre_object", vec![], funs);
+        let name_of = |reg: &RegularCall| super::regular_call_name_path(reg, &llbc);
+        let drop_place =
+            |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body[bb].term(&fixture_llbc()) {
+                Ok(TermKind::Drop { place, target, .. }) => match place.kind {
+                    PlaceKind::Local(l) => Some((l, target)),
+                    _ => None,
+                },
+                _ => None,
+            };
+        let goto = |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body[bb].term(&fixture_llbc())
+        {
+            Ok(TermKind::Goto { target }) => Some(target),
+            _ => None,
+        };
+
+        let mut u = llbc.fn_by_id(4).unwrap().unstructured().unwrap();
+        super::elaborate_explicit_root_closes(&fixture_llbc(), &mut u, &name_of);
+        assert!(
+            u.body[2].statements.is_empty(),
+            "the move into the call goes"
+        );
+        assert_eq!(drop_place(&u, 2), Some((2, 3)), "the call closes the guard");
+        assert_eq!(goto(&u, 3), Some(7), "the scope-end drop no longer runs");
+        assert_eq!(goto(&u, 6), Some(4), "the temporary never holds the guard");
+        assert_eq!(drop_place(&u, 4), Some((2, 5)), "the unwind drop is left");
+        assert!(!super::moved_out_locals(&u).contains(2));
+
+        let mut u = llbc.fn_by_id(5).unwrap().unstructured().unwrap();
+        super::elaborate_explicit_root_closes(&fixture_llbc(), &mut u, &name_of);
+        assert_eq!(
+            u.body[2].statements.len(),
+            1,
+            "a guard closed on one arm is left"
+        );
+        assert!(matches!(u.body[2].term(&fixture_llbc()), Ok(TermKind::Call { .. })));
+        assert_eq!(drop_place(&u, 3), Some((2, 4)));
+
+        // The bracket closes every pin `operands` makes, so its caller sees
+        // no change to the root stack.
+        let analyzer = super::RootStackAnalyzer::new(&llbc);
+        let direct: RegularCall = serde_json::from_value(
+            serde_json::json!({"kind": {"Fun": {"Regular": 4}}, "generics": null}),
+        )
+        .expect("fixture call parses");
+        assert!(!analyzer.regular_call_touches_root_stack(&direct));
     }
 
     #[test]
