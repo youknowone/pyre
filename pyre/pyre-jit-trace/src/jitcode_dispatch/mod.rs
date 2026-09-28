@@ -6637,8 +6637,17 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                             // instance). `_get_list_of_active_boxes` reads
                             // `registers_r[index]` for every live color with
                             // no further test, so encode that register.
+                            //
+                            // A bridge inputarg left in the color after the
+                            // virtualizable slot moved on is not that value.
+                            // The merge point publishes the shadow box
+                            // (`reached_loop_header` `live_arg_boxes +=
+                            // virtualizable_boxes`). Naming the stale
+                            // inputarg makes the loop cut decline a box the
+                            // entry contract does not carry. Fall through
+                            // and let the shadow arm below choose.
                             let reg = regs_r.get_box(color).unwrap_or(OpRef::NONE);
-                            if reg != OpRef::NONE {
+                            if reg != OpRef::NONE && !reg.is_input_arg() {
                                 active.push(reg);
                                 continue;
                             }
@@ -6739,8 +6748,23 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                         let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
                         let walk_real =
                             walk_box.filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
+                        let shadow_real =
+                            vbox.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
                         let guard_pc_proves_slot = guard_owned_slot == Some(s_idx);
-                        if guard_pc_proves_slot {
+                        // A bridge inputarg left in the color is not the
+                        // stack temp. The merge point's loop inputargs are
+                        // the shadow boxes; naming the inputarg makes the
+                        // loop cut decline it. A NULL shadow still loses to
+                        // the register (`nested_break_not_hot`).
+                        if let (Some(w), Some(s)) = (walk_real, shadow_real) {
+                            if w != s && w.is_input_arg() {
+                                s
+                            } else if guard_pc_proves_slot {
+                                w
+                            } else {
+                                s
+                            }
+                        } else if guard_pc_proves_slot {
                             walk_real.or(vbox).unwrap_or_else(fallback)
                         } else if shadow_is_real {
                             vbox.unwrap_or_else(fallback)
@@ -6763,9 +6787,23 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                         // temp — a `raise` whose operand color doubled as
                         // `self` then resumed publishing `self` as the
                         // exception.
+                        //
+                        // A bridge inputarg left in the register after the
+                        // virtualizable slot moved on is not that temp. The
+                        // merge point publishes the shadow box
+                        // (`reached_loop_header` `live_arg_boxes +=
+                        // virtualizable_boxes`), and `CutTrace` treats that
+                        // box as a loop inputarg. Naming the stale inputarg
+                        // instead makes the loop cut decline a box the entry
+                        // contract does not carry.
                         let walk_real =
                             walk_box.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
-                        walk_real.or(vbox).unwrap_or_else(fallback)
+                        let shadow_real =
+                            vbox.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
+                        match (walk_real, shadow_real) {
+                            (Some(w), Some(s)) if w != s && w.is_input_arg() => s,
+                            _ => walk_real.or(vbox).unwrap_or_else(fallback),
+                        }
                     }
                 }
                 // `semantic_idx` is `None`: this Ref color names no live
@@ -6796,7 +6834,22 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                 // mapped arm above uses.  Under the walker (gate-off) each PC
                 // owns a depth-narrowed marker, so this arm never fires.
                 None => match regs_r.get_box(color) {
-                    Some(v) if v != OpRef::NONE => v,
+                    // A produced box is live at this marker even though the
+                    // color names no frame slot.
+                    Some(v) if v != OpRef::NONE && !v.is_input_arg() => v,
+                    // A bridge inputarg that the virtualizable shadow still
+                    // holds is one of the merge point's loop inputargs.
+                    // One the shadow has replaced is a stale color: the
+                    // decoder drops a slot-less color, and leaving the old
+                    // inputarg in the snapshot makes the loop cut decline
+                    // a box the entry contract does not carry.
+                    Some(v)
+                        if v.is_input_arg()
+                            && (0..trace_ctx.virtualizable_boxes_len().unwrap_or(0))
+                                .any(|i| trace_ctx.virtualizable_box_at(i) == Some(v)) =>
+                    {
+                        v
+                    }
                     _ => OpRef::const_ptr(majit_ir::GcRef(0)),
                 },
                 _ => fallback(),

@@ -1514,7 +1514,25 @@ impl MIFrame {
                             jit_pc, reg_idx
                         );
                     }
-                    registers_r_bank[reg_idx as usize]
+                    let raw = registers_r_bank[reg_idx as usize];
+                    let mapped = crate::state::semantic_ref_slot_for_reg_color(
+                        nlocals,
+                        valid_stack_only,
+                        pcdep_opt.unwrap_or(&[]),
+                        reg_idx as usize,
+                    )
+                    .is_some();
+                    let shadow_holds = raw.is_input_arg()
+                        && (0..ctx.virtualizable_boxes_len().unwrap_or(0))
+                            .any(|i| ctx.virtualizable_box_at(i) == Some(raw));
+                    // An unmapped bridge inputarg the shadow no longer
+                    // holds is not a merge-point loop inputarg. One the
+                    // shadow still names is.
+                    if !mapped && raw.is_input_arg() && !shadow_holds {
+                        ctx.const_ref(0)
+                    } else {
+                        raw
+                    }
                 };
                 boxes.push(opref);
             }
