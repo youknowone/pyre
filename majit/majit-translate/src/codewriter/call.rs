@@ -1464,6 +1464,13 @@ impl GraphStore {
         self.built_for(path).map(|b| &b.signature)
     }
 
+    /// Whether `path` names a registered funcobj, built or not. Never
+    /// builds: a funcobj whose build later produces no graph still answers
+    /// `true`, as the external funcobj it then is.
+    pub(crate) fn names_funcobj(&self, path: &CallPath) -> bool {
+        self.path_to_key.contains_key(path)
+    }
+
     pub(crate) fn contains_key(&self, path: &CallPath) -> bool {
         self.built_for(path).is_some()
     }
@@ -4448,7 +4455,7 @@ impl CallControl {
         // `push_value` stay separate.
         let qualified_path = CallPath::for_impl_method(impl_type, method_name);
         // Impl-method graphs carry `owner_root = Some(impl_type)`.
-        if !self.function_graphs.contains_key(&qualified_path) {
+        if !self.function_graphs.names_funcobj(&qualified_path) {
             // Each impl method registers exactly once under a distinct
             // qualified path; its `owner_root = Some(impl_type)` keeps it
             // separate from other impls' same-named methods.

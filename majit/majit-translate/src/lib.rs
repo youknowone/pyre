@@ -1133,18 +1133,20 @@ fn analyze_pipeline_from_module_paths(
     }
     mark_phase!("build_semantic_program_from_parsed_files");
     prof.note(|| {
+        // Counts the bodies built so far; the note builds none.
+        let built = || {
+            program
+                .functions
+                .iter()
+                .filter_map(|f| f.lazy_graph().get())
+        };
         format!(
-            "  program: {} functions, {} blocks, {} ops, {} struct_fields, {} type layouts",
+            "  program: {} functions ({} built: {} blocks, {} ops), {} struct_fields, {} type layouts",
             program.functions.len(),
-            program
-                .functions
-                .iter()
-                .map(|f| f.graph().blocks.len())
-                .sum::<usize>(),
-            program
-                .functions
-                .iter()
-                .flat_map(|f| f.graph().blocks.iter())
+            built().count(),
+            built().map(|g| g.blocks.len()).sum::<usize>(),
+            built()
+                .flat_map(|g| g.blocks.iter())
                 .map(|b| b.operations.len())
                 .sum::<usize>(),
             program.struct_fields.fields.len(),
