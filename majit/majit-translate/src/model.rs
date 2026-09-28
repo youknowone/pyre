@@ -7633,6 +7633,51 @@ impl FunctionGraph {
         narrowed
     }
 
+    /// The discriminant of the niche `Option` `opt` into `result` (`Some` = 1):
+    /// `not (opt is None)`, spelled `eq(is_(opt, None), False)`.  A `ne` would
+    /// be value inequality on a `StringRepr` / `ListRepr` payload
+    /// (`rstr.py` / `rlist.py` `rtype_ne`), not a null test.  `fn_ptr` selects
+    /// `null_fn` (`ll_ptrtype`); every other niche uses [`Self::push_niche_null`].
+    pub fn push_niche_is_some(
+        &mut self,
+        block: BlockId,
+        opt: crate::flowspace::model::Variable,
+        fn_ptr: bool,
+        cast: Option<&(String, ValueType)>,
+        result: crate::flowspace::model::Variable,
+    ) {
+        let nullc = if fn_ptr {
+            self.push_null_fn_ptr(block)
+        } else {
+            self.push_niche_null(block, cast)
+        };
+        let is_none = self.alloc_value_var();
+        let false_var = self.alloc_value_var();
+        let ops = &mut self.block_mut(block).operations;
+        ops.push(SpaceOperation {
+            result: Some(is_none.clone()),
+            kind: OpKind::BinOp {
+                op: "is_".to_string(),
+                lhs: opt,
+                rhs: nullc,
+                result_ty: ValueType::Int,
+            },
+        });
+        ops.push(SpaceOperation {
+            result: Some(false_var.clone()),
+            kind: OpKind::ConstBool(false),
+        });
+        ops.push(SpaceOperation {
+            result: Some(result),
+            kind: OpKind::BinOp {
+                op: "eq".to_string(),
+                lhs: is_none,
+                rhs: false_var,
+                result_ty: ValueType::Int,
+            },
+        });
+    }
+
     /// Null function pointer for `Option<fn>`'s `None` arm. Annotates as
     /// `SomePtr(FuncType)` (`fn_null_constant`), the same `ll_ptrtype` as a
     /// `fn` field read, so the two arms union. A `null_mut()` null is a

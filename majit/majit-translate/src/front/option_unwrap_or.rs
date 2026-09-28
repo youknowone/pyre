@@ -81,6 +81,9 @@ pub(crate) struct UnwrapOrSite {
     /// `tyref_is_niche_option_ptr`).  Always an `Option` (never a `Result`)
     /// when set, so `payload_on_disc_true` is `true`.
     pub niche: bool,
+    /// The niche receiver is `Option<fn>`: its null test compares against
+    /// `null_fn` (int bank).
+    pub fn_ptr: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
     pub niche_null_cast: Option<(String, ValueType)>,
     /// `None`'s scalar tag for `Option<E>` when `E` is a densely numbered
@@ -287,23 +290,17 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
     graph.blocks[a].operations.remove(call_idx);
     let disc = graph.alloc_value_var();
     if site.niche {
-        // Niche `Option<NonNull>`: the discriminant is the pointer null-test
-        // `opt != null` (`None` = null = 0, `Some` = non-null = 1) — a `ne` on
-        // two `Ref` operands lowers to `ptr_ne` with an `Int` result, matching
-        // the aggregate `__discriminant` read's value for the branch.  The null
-        // is a `null_mut()` call (repr-adaptive) rather than a `ConstRefNull`
-        // (fixed GCREF), so `ptr_ne` sees two operands of the receiver's own
-        // `InstanceRepr`.
-        let nullc = graph.push_niche_null(a_id, site.niche_null_cast.as_ref());
-        graph.block_mut(a_id).operations.push(SpaceOperation {
-            result: Some(disc.clone()),
-            kind: OpKind::BinOp {
-                op: "ne".to_string(),
-                lhs: opt.clone().into_variable(),
-                rhs: nullc,
-                result_ty: ValueType::Int,
-            },
-        });
+        // Niche `Option`: the discriminant is `not (opt is None)`
+        // (`None` = null = 0, `Some` = non-null = 1).  `ne` on a
+        // `StringRepr` / `ListRepr` payload is value inequality
+        // (`rstr.py` / `rlist.py` `rtype_ne`), not this null test.
+        graph.push_niche_is_some(
+            a_id,
+            opt.clone().into_variable(),
+            site.fn_ptr,
+            site.niche_null_cast.as_ref(),
+            disc.clone(),
+        );
     } else if let Some(none_tag) = site.fieldless_none_tag {
         let none = graph
             .push_op_var(a_id, OpKind::ConstInt(none_tag), true)
@@ -389,6 +386,7 @@ mod tests {
             payload_ty: ValueType::Int,
             payload_on_disc_true: true,
             niche: false,
+            fn_ptr: false,
             niche_null_cast: None,
             fieldless_none_tag: None,
         }
@@ -413,6 +411,7 @@ mod tests {
             // `Result::Ok = 0`, so the payload arm is the `bool(disc)`-false arm.
             payload_on_disc_true: false,
             niche: false,
+            fn_ptr: false,
             niche_null_cast: None,
             fieldless_none_tag: None,
         }
@@ -649,8 +648,8 @@ mod tests {
     }
 
     /// A niche `Option<NonNull>` receiver (`niche: true`) has no aggregate
-    /// `__discriminant` / `__pos_0`: the discriminant is the pointer null-test
-    /// `opt != null` (`ConstRefNull` + `ne` BinOp) and the `Some` payload is the
+    /// `__discriminant` / `__pos_0`: the discriminant is the null test
+    /// `not (opt is None)` and the `Some` payload is the
     /// identity on the base pointer.  The rewrite must emit neither field read —
     /// a `__pos_0` read at offset 8 of a one-word niche value would read past it.
     #[test]
@@ -692,8 +691,9 @@ mod tests {
             field_reads, 0,
             "a niche Option reads no aggregate __discriminant/__pos_0"
         );
-        // Block A discriminant = `opt != null`: a `null_mut()` call feeding a
-        // `ne` (the repr-adaptive null, not a fixed-GCREF `ConstRefNull`).
+        // Block A discriminant = `not (opt is None)`: a `null_mut()` call
+        // (the repr-adaptive null, not a fixed-GCREF `ConstRefNull`) feeding
+        // an `is_`.
         assert_eq!(
             g.blocks[a.0]
                 .operations
@@ -707,20 +707,116 @@ mod tests {
             1,
             "the niche discriminant emits a null_mut() call"
         );
-        let ne = g.blocks[a.0]
-            .operations
+        let ops = &g.blocks[a.0].operations;
+        let is_none = ops
             .iter()
-            .find(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne"))
-            .expect("the niche discriminant is a `ne` compare");
-        match &ne.kind {
-            OpKind::BinOp { lhs, result_ty, .. } => {
-                assert_eq!(lhs, &opt, "the null-test compares the receiver pointer");
-                assert_eq!(result_ty, &ValueType::Int, "ptr_ne yields an Int tag");
-            }
-            _ => unreachable!(),
-        }
+            .find(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_"))
+            .expect("the niche null test is an identity `is_`");
+        assert!(
+            matches!(&is_none.kind, OpKind::BinOp { lhs, .. } if *lhs == opt),
+            "the null test compares the receiver pointer"
+        );
+        let is_none = is_none.result.clone().expect("is_ has a result");
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, lhs, result_ty: ValueType::Int, .. }
+                    if op == "eq" && *lhs == is_none
+            )),
+            "the discriminant negates `opt is None`"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne")),
+            "no `ne`: on a string/list repr it is value inequality"
+        );
         // A still branches two ways (Some / None).
         assert_eq!(g.blocks[a.0].exits.len(), 2, "A branches to Some/None arms");
+    }
+
+    /// The null a niche `Option<&str>` is tested against is the string
+    /// `None`, so the `is_` compares two values of the receiver's repr.
+    #[test]
+    fn rewrite_niche_str_option_tests_against_a_narrowed_null() {
+        let mut g = FunctionGraph::new("test_unwrap_or_niche_str");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let default = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: unwrap_or_target(),
+                    args: crate::model::call_args(vec![opt.clone(), default.clone()]),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+
+        let mut site = option_site(result);
+        site.niche = true;
+        site.payload_ty = ValueType::Str;
+        site.niche_null_cast = Some(("str".into(), ValueType::Str));
+        assert_eq!(rewire_unwrap_or_call_sites(&mut g, &[site]), 1);
+
+        let ops = &g.blocks[a.0].operations;
+        let narrowed = ops
+            .iter()
+            .find(|op| crate::model::cast_instance_root(&op.kind) == Some("str"))
+            .and_then(|op| op.result.clone())
+            .expect("the null is narrowed to the string repr");
+        let is_none = ops
+            .iter()
+            .find(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_"))
+            .expect("the niche null test is an identity `is_`");
+        assert!(
+            matches!(&is_none.kind, OpKind::BinOp { rhs, .. } if *rhs == narrowed),
+            "the null test compares against the narrowed null"
+        );
+    }
+
+    /// An `Option<fn>` receiver is an int-bank address: its null test
+    /// compares against `null_fn`, never the ref-bank `null_mut()`.
+    #[test]
+    fn rewrite_niche_fn_option_tests_against_null_fn() {
+        let mut g = FunctionGraph::new("test_unwrap_or_niche_fn");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let default = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: unwrap_or_target(),
+                    args: crate::model::call_args(vec![opt, default]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+
+        let mut site = option_site(result);
+        site.niche = true;
+        site.fn_ptr = true;
+        site.payload_ty = ValueType::Int;
+        assert_eq!(rewire_unwrap_or_call_sites(&mut g, &[site]), 1);
+
+        let nulls: Vec<String> = g.blocks[a.0]
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, args, .. } if args.is_empty() => Some(target.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nulls, vec!["core::ptr::null_fn".to_string()]);
     }
 
     #[test]

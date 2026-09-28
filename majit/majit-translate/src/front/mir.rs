@@ -23394,6 +23394,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             payload_on_disc_true,
             niche,
+            fn_ptr: self.option_payload_is_fn_ptr(recv_ty),
             niche_null_cast: self.option_niche_null_cast(recv_ty),
             fieldless_none_tag,
         })
@@ -24581,6 +24582,7 @@ impl<'a> Lowering<'a> {
             call_result_ty,
             args_tuple_suffix,
             niche,
+            fn_ptr: self.option_payload_is_fn_ptr(&recv_ty),
             niche_null_cast,
             fieldless_none_tag,
             call_once_result_exc,
