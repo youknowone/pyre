@@ -9205,11 +9205,9 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         for value in latched.miframe.ref_values.iter_mut().flatten() {
             visitor(unsafe { &mut *(value as *mut i64).cast() });
         }
-        for slot in latched.miframe.ref_regs.iter_mut() {
-            if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
-                visitor(unsafe { &mut *(&mut gcref.0 as *mut usize).cast() });
-            }
-        }
+        // `ConstPtr` is a `const_ptr_table` index. The table walker
+        // forwards the address; this slot does not hold one.
+        let _ = latched.miframe.ref_regs;
         if latched.last_exc_value != 0 {
             visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });
         }
@@ -9232,11 +9230,7 @@ pub unsafe fn fbw_store_journal_root_walker_area(
                 visitor(unsafe { &mut *(value as *mut i64).cast() });
             }
             // Both halves, for the reason the single-frame arm gives.
-            for slot in frame.ref_regs.iter_mut() {
-                if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
-                    visitor(unsafe { &mut *(&mut gcref.0 as *mut usize).cast() });
-                }
-            }
+            let _ = frame.ref_regs;
         }
         if latched.last_exc_value != 0 {
             visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });

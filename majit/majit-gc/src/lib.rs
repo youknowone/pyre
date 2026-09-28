@@ -1,6 +1,17 @@
 pub use collector::HEAP_DUMP_EIO;
 pub use gcreftracer::{GcTable, install_gc_table_walker};
 pub use header::GcType;
+
+/// Extra root for `majit_ir::const_ptr_table` (`history.py` `ConstPtr.value`).
+/// Idempotent: `register_extra_root_walker` dedups by function address.
+pub fn install_const_ptr_table_walker() {
+    shadow_stack::register_extra_root_walker(const_ptr_table_walker, "const_ptr_table");
+}
+
+fn const_ptr_table_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    majit_ir::const_ptr_table::walk(visitor);
+}
+
 /// GC traits and interfaces for the JIT.
 ///
 /// The GC subsystem provides:

@@ -115,39 +115,10 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Forward every inline gcref this snapshot carries.
-    ///
-    /// `MIFrame.get_list_of_active_snapshot_boxes` copies a constant ref
-    /// register's already-forwarded gcref out of its `OpRef::ConstPtr` into a
-    /// raw [`SnapshotTagged::Const`] word, and `jitcode.constants_r` entries
-    /// reach the same arm. The side table these land in accumulates for the
-    /// whole trace and is only handed to the compiler at the end of it, so
-    /// without this walk a collection between capture and compile leaves the
-    /// resume data naming a pre-move address. RPython has no such copy: its
-    /// snapshot holds the `ConstPtr` box itself, whose `value` the GC traces
-    /// through the object graph.
-    pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-        let tagged = self
-            .frames
-            .iter_mut()
-            .flat_map(|f| f.boxes.iter_mut())
-            .chain(self.vable_boxes.iter_mut())
-            .chain(self.vref_boxes.iter_mut());
-        for t in tagged {
-            match t {
-                SnapshotTagged::Const(bits, Type::Ref) => {
-                    let mut gcref = majit_ir::GcRef(*bits as usize);
-                    visitor(&mut gcref);
-                    *bits = gcref.0 as i64;
-                }
-                // `build_vable_snapshot_boxes` / `build_vref_snapshot_boxes`
-                // tag their entries by `OpRef::ty()` without asking whether the
-                // operand is constant, so this arm can hold an inline gcref too.
-                SnapshotTagged::Box(OpRef::ConstPtr(gcref), _) => visitor(gcref),
-                SnapshotTagged::Const(..) | SnapshotTagged::Box(..) => {}
-            }
-        }
-    }
+    /// `Const` ref words and `OpRef::ConstPtr` are table indexes
+    /// (`history.py` `ConstPtr`). `const_ptr_table::walk` forwards the
+    /// referent; nothing in this snapshot moves.
+    pub fn walk_const_ptr_refs(&mut self, _visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
 }
 
 /// `jitcode_index` for a frame the recorder minted with no real coordinate.
@@ -233,7 +204,27 @@ pub enum SnapshotTagged {
     /// Compile-time constant value with type.
     /// RPython resume.py getconst: Const boxes carry their type (INT/REF/FLOAT)
     /// for correct TAGINT/TAGCONST encoding in rd_numb.
+    /// `Type::Ref` payload is a [`majit_ir::const_ptr_table`] index
+    /// (`history.py` `ConstPtr`), not the referent address. Index 0 is null.
     Const(i64, majit_ir::Type),
+}
+
+impl SnapshotTagged {
+    /// Intern `addr` and store the table index. Null stays 0.
+    pub fn const_ref(addr: usize) -> Self {
+        let index = majit_ir::const_ptr_table::intern(majit_ir::GcRef(addr));
+        SnapshotTagged::Const(i64::from(index), majit_ir::Type::Ref)
+    }
+
+    /// Current referent. `None` when this is not a ref constant.
+    pub fn ref_address(self) -> Option<majit_ir::GcRef> {
+        match self {
+            SnapshotTagged::Const(index, majit_ir::Type::Ref) => {
+                Some(majit_ir::const_ptr_table::resolve(index as u32))
+            }
+            _ => None,
+        }
+    }
 }
 
 pub struct Trace {
@@ -279,7 +270,7 @@ pub struct Trace {
     /// only at the legacy `Vec<Op>` boundary until that recorder is swapped
     /// out, and prevents every repeated ConstPtr operand from allocating a
     /// fresh `Rc<Cell<Value>>` in the meantime.
-    const_ptrs: crate::FxIndexMap<GcRef, Operand>,
+    const_ptrs: crate::FxIndexMap<u32, Operand>,
     /// Live JIT path: `History.trace` is `opencoder.Trace`. When present,
     /// `record_*` appends bytes and a [`FrontendSlot`] instead of a 240-byte
     /// `Op`. `into_parts` materializes through `ByteTraceIter`, the
@@ -347,7 +338,7 @@ fn untag_snapshot_pools(
             SnapshotTagged::Box(opref, opref.ty().unwrap_or(Type::Int))
         }
         TAGINT => SnapshotTagged::Const(v, Type::Int),
-        TAGCONSTPTR => SnapshotTagged::Const(trb.current_ref(v as usize) as i64, Type::Ref),
+        TAGCONSTPTR => SnapshotTagged::const_ref(trb.current_ref(v as usize) as usize),
         TAGCONSTOTHER => {
             let pool_idx = (v >> 1) as usize;
             if v & 1 != 0 {
@@ -613,7 +604,9 @@ impl Trace {
         match tagged {
             SnapshotTagged::Const(v, Type::Int) => OcBox::ConstInt(v),
             SnapshotTagged::Const(v, Type::Float) => OcBox::ConstFloat(v as u64),
-            SnapshotTagged::Const(v, Type::Ref) => OcBox::ConstPtr(v as u64),
+            SnapshotTagged::Const(v, Type::Ref) => {
+                OcBox::ConstPtr(majit_ir::const_ptr_table::resolve(v as u32).0 as u64)
+            }
             SnapshotTagged::Const(_, Type::Void) => {
                 panic!("encode snapshot: Const Void is not a tagged value")
             }
@@ -1259,15 +1252,15 @@ impl Trace {
     /// the real box object — `MIFrame.registers_r` holds these in `pyjitpl.py` —
     /// so consumers can key by box identity instead of flat `OpRef`.
     pub(crate) fn box_for_operand(&mut self, r: OpRef) -> Operand {
-        if let OpRef::ConstPtr(gcref) = r {
-            if gcref.is_null() {
+        if let OpRef::ConstPtr(index) = r {
+            if index == 0 {
                 return Operand::NullRef;
             }
-            if let Some(cached) = self.const_ptrs.get(&gcref) {
+            if let Some(cached) = self.const_ptrs.get(&index) {
                 return cached.clone();
             }
             let operand = Operand::from_opref(r);
-            self.const_ptrs.insert(gcref, operand.clone());
+            self.const_ptrs.insert(index, operand.clone());
             return operand;
         }
         if r.is_none() || r.is_constant() {
@@ -1870,35 +1863,19 @@ impl Trace {
     /// explicit adaptation. Constants inserted by test-only direct-op helpers
     /// are not in the pool and are visited from their operation instead.
     pub(crate) fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        // `history.py new_ref_dict` uses `rd_hash` / `lltype.identityhash`,
-        // which survives movement. Our address-keyed map must remove ALL old
-        // keys before inserting any new ones: a destination can equal another
-        // object's old address. Removing index zero and immediately reinserting
-        // also changes which object swap_remove brings into index zero, so a
-        // fixed-count loop can repeatedly visit the same box and skip others.
-        // Drain the identities, retaining the map's capacity, then re-key once.
-        let operands: smallvec::SmallVec<[Operand; 8]> = self
-            .const_ptrs
-            .drain(..)
-            .map(|(_, operand)| operand)
-            .collect();
-        for operand in operands {
+        // Keys are `const_ptr_table` indexes (`history.py` `ConstPtr`),
+        // stable across a move. Walk the operand cell, which still holds
+        // the address `Value::Ref`.
+        for operand in self.const_ptrs.values() {
             operand.walk_const_ptr_refs(visitor);
-            let Value::Ref(gcref) = operand
-                .const_value()
-                .expect("_refs_dict contains only ConstPtr operands")
-            else {
-                unreachable!("_refs_dict contains only ConstPtr operands")
-            };
-            self.const_ptrs.insert(gcref, operand);
         }
 
         let is_pooled_const_ptr = |arg: &Operand| {
-            let Some(Value::Ref(gcref)) = arg.const_value() else {
+            let Some(index) = arg.to_opref().const_ptr_index() else {
                 return false;
             };
             self.const_ptrs
-                .get(&gcref)
+                .get(&index)
                 .is_some_and(|cached| cached == arg)
         };
         if let Some(trb) = self.trb.as_mut() {
@@ -2174,13 +2151,18 @@ mod tests {
         let second = rec.box_for_operand(OpRef::const_ptr(old));
         assert_eq!(first, second, "same address must reuse one ConstPtr box");
 
-        rec.walk_const_ptr_refs(&mut |gcref| gcref.0 += 0x1000);
-        let moved = rec.box_for_operand(OpRef::const_ptr(GcRef(0x2000)));
-        assert_eq!(first, moved, "moved address must resolve to the same box");
-        assert_eq!(moved.const_value(), Some(Value::Ref(GcRef(0x2000))));
-
-        let stale = rec.box_for_operand(OpRef::const_ptr(old));
-        assert_ne!(stale, moved, "the pre-move key must no longer be cached");
+        majit_ir::const_ptr_table::walk(&mut |gcref| {
+            if *gcref == old {
+                *gcref = GcRef(0x2000);
+            }
+        });
+        let kept = first.to_opref();
+        assert_eq!(
+            first.const_value(),
+            Some(Value::Ref(GcRef(0x2000))),
+            "the table slot is the address the box reads"
+        );
+        assert_eq!(first.to_opref(), kept);
     }
 
     #[test]
@@ -2199,18 +2181,15 @@ mod tests {
             None,
             &constants,
         );
-        let mut visited = Vec::new();
-        rec.walk_const_ptr_refs(&mut |reference| {
-            visited.push(reference.0);
-            reference.0 += 0x1000;
+        majit_ir::const_ptr_table::walk(&mut |reference| {
+            if (1..=4).any(|i| reference.0 == i * 0x1000) {
+                reference.0 += 0x1000;
+            }
         });
-        visited.sort_unstable();
-        assert_eq!(visited, vec![0x1000, 0x2000, 0x3000, 0x4000]);
         assert_eq!(rec.const_ptrs.len(), 4);
         for (index, original) in boxes.iter().enumerate() {
             let address = GcRef((index + 2) * 0x1000);
             assert_eq!(original.const_value(), Some(Value::Ref(address)));
-            assert_eq!(*original, rec.box_for_operand(OpRef::const_ptr(address)));
         }
     }
 
@@ -2502,21 +2481,26 @@ mod tests {
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Ref);
         rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
-        let cptr = OpRef::const_ptr(GcRef(0x1000));
+        let cptr = OpRef::const_ptr(GcRef(0x91_00B1_0000));
         rec.record_op(OpCode::GetfieldGcR, &[cptr]);
         rec.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], None, &[cptr]);
-        rec.walk_const_ptr_refs(&mut |gcref| gcref.0 += 0x1000);
-        assert_eq!(
-            rec.slots[0].first_arg,
-            Some(OpRef::const_ptr(GcRef(0x2000)))
-        );
+        majit_ir::const_ptr_table::walk(&mut |gcref| {
+            if gcref.0 == 0x91_00B1_0000 {
+                gcref.0 = 0x91_00B1_2000;
+            }
+        });
+        assert_eq!(rec.slots[0].first_arg, Some(cptr));
+        assert_eq!(cptr.as_const_ptr(), Some(GcRef(0x91_00B1_2000)));
         assert_eq!(
             rec.slots[1].fail_args.as_ref().map(|a| a.as_slice()),
-            Some(&[OpRef::const_ptr(GcRef(0x2000))][..])
+            Some(&[cptr][..])
         );
         rec.materialize_into_ops();
         let fail = rec.ops()[1].guard_fail_args().expect("guard fail_args");
-        assert_eq!(fail[0].to_opref(), OpRef::const_ptr(GcRef(0x2000)));
+        assert_eq!(
+            fail[0].to_opref().as_const_ptr(),
+            Some(GcRef(0x91_00B1_2000))
+        );
     }
 
     #[test]

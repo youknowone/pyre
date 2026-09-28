@@ -60,7 +60,7 @@ fn register_to_box_ref(opref: OpRef, value: i64, unique_to_box: Option<&[u32]>) 
         // read it from `opref` rather than the unforwarded `ref_values`
         // mirror, which is stale after a moving collection.
         let bits = match opref {
-            OpRef::ConstPtr(gcref) => gcref.0 as u64,
+            OpRef::ConstPtr(index) => majit_ir::const_ptr_table::resolve(index).0 as u64,
             _ => value as u64,
         };
         OpBox::ConstPtr(bits)
@@ -242,7 +242,9 @@ impl MIFrame {
     /// Box-attached concrete value after every collection.
     pub(crate) fn ref_value_for_blackhole(&self, index: usize) -> Option<i64> {
         match self.ref_regs.get(index).copied().flatten() {
-            Some(OpRef::ConstPtr(gcref)) => Some(gcref.0 as i64),
+            Some(OpRef::ConstPtr(index)) => {
+                Some(majit_ir::const_ptr_table::resolve(index).0 as i64)
+            }
             Some(_) | None => self.ref_values.get(index).copied().flatten(),
         }
     }
@@ -255,8 +257,8 @@ impl MIFrame {
     /// and the execution mirror in lockstep.
     pub(crate) fn set_forwarded_ref_value(&mut self, index: usize, value: i64) {
         self.ref_values[index] = Some(value);
-        if let Some(OpRef::ConstPtr(gcref)) = self.ref_regs[index].as_mut() {
-            *gcref = majit_ir::GcRef(value as usize);
+        if let Some(OpRef::ConstPtr(index)) = self.ref_regs[index] {
+            majit_ir::const_ptr_table::set_slot(index, majit_ir::GcRef(value as usize));
         }
     }
 
@@ -1244,21 +1246,19 @@ impl MIFrame {
                     let value = self.ref_values[idx]
                         .expect("get_list_of_active_snapshot_boxes: ref value uninitialized");
                     if opref.is_constant() {
-                        // history.py `ConstPtr.value` — take the forwarded
-                        // gcref from the inline `OpRef::ConstPtr`, not the
-                        // unforwarded `ref_values` mirror (stale after a move).
-                        let bits = match opref {
-                            OpRef::ConstPtr(gcref) => gcref.0 as i64,
-                            _ => value,
+                        // history.py `ConstPtr` — the snapshot stores the
+                        // table index, not `ref_values` (an address mirror).
+                        let index = match opref {
+                            OpRef::ConstPtr(index) => index,
+                            _ => majit_ir::const_ptr_table::intern(majit_ir::GcRef(value as usize)),
                         };
-                        SnapshotTagged::Const(bits, Type::Ref)
+                        SnapshotTagged::Const(i64::from(index), Type::Ref)
                     } else {
                         SnapshotTagged::Box(opref, Type::Ref)
                     }
                 } else {
-                    SnapshotTagged::Const(
-                        self.jitcode.constants_r[idx - num_regs_r].get(),
-                        Type::Ref,
+                    SnapshotTagged::const_ref(
+                        self.jitcode.constants_r[idx - num_regs_r].get() as usize
                     )
                 };
                 boxes.push(tagged);
@@ -1552,11 +1552,14 @@ mod tests {
         assert_eq!(frame.ref_value_for_blackhole(0), Some(0xBEEF));
         assert_eq!(frame.ref_value_for_blackhole(1), Some(0xCAFE));
 
+        let kept = frame.ref_regs[0];
         frame.set_forwarded_ref_value(0, 0xF00D);
         assert_eq!(frame.ref_values[0], Some(0xF00D));
+        // The register keeps its table index. `set_slot` writes the address.
+        assert_eq!(frame.ref_regs[0], kept);
         assert_eq!(
-            frame.ref_regs[0],
-            Some(OpRef::const_ptr(majit_ir::GcRef(0xF00D)))
+            frame.ref_regs[0].and_then(|r| r.as_const_ptr()),
+            Some(majit_ir::GcRef(0xF00D))
         );
         assert_eq!(frame.ref_value_for_blackhole(0), Some(0xF00D));
     }

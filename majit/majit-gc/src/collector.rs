@@ -1371,6 +1371,9 @@ impl MiniMarkGC {
         // incminimark.py — allocate_nursery finalizes the first threshold.
         gc.set_major_threshold_from(0.0, 0.0);
         gc._setup_guard_is_object();
+        // `ConstPtr.value` lives in `const_ptr_table`. Register before
+        // the first minor so the table is a root on this collector.
+        crate::install_const_ptr_table_walker();
         gc
     }
 
@@ -1802,6 +1805,10 @@ impl MiniMarkGC {
         needs_write_barrier: *mut bool,
     ) -> GcRef {
         unsafe {
+            // Blackhole resume reaches `do_malloc_fixedsize_clear` through
+            // this entry (`GcLLDescr_framework._bh_malloc`). The same knob
+            // that minors before a Trace-pool bump minors here too.
+            self.stress_trace_alloc_minor(root, 1);
             self.alloc_with_type_rooted_body::<false>(
                 type_id,
                 payload_size,

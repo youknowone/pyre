@@ -125,12 +125,9 @@ impl ShortPreamble {
     }
 
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        fn visit_oprefs(refs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
-            for r in refs {
-                if let OpRef::ConstPtr(gcref) = r {
-                    visitor(gcref);
-                }
-            }
+        fn visit_oprefs(refs: &mut [OpRef], _visitor: &mut dyn FnMut(&mut GcRef)) {
+            // `ConstPtr` indexes `const_ptr_table`.
+            let _ = refs;
         }
 
         for entry in &mut self.ops {
@@ -142,11 +139,8 @@ impl ShortPreamble {
         if let Some(exported_state) = self.exported_state.as_mut() {
             exported_state.walk_const_ptr_refs_mut(visitor);
         }
-        for (_, konst) in self.constants.iter_mut() {
-            if let majit_ir::Const::Ref(gcref) = konst {
-                visitor(gcref)
-            }
-        }
+        // `Const::Ref` indexes `const_ptr_table`; that walker owns the address.
+        let _ = &self.constants;
         for info in self.inputarg_infos.iter_mut().flatten() {
             info.walk_const_ptr_refs_mut(visitor);
         }
@@ -2453,23 +2447,13 @@ pub struct ExtendedShortPreambleBuilder {
 
 impl ExtendedShortPreambleBuilder {
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        fn visit_oprefs(refs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
-            for r in refs {
-                if let OpRef::ConstPtr(gcref) = r {
-                    visitor(gcref);
-                }
-            }
+        fn visit_oprefs(refs: &mut [OpRef], _visitor: &mut dyn FnMut(&mut GcRef)) {
+            let _ = refs;
         }
 
-        fn visit_opref_set(set: &mut FxIndexSet<OpRef>, visitor: &mut dyn FnMut(&mut GcRef)) {
-            let refs: Vec<OpRef> = set.iter().copied().collect();
-            set.clear();
-            for mut r in refs {
-                if let OpRef::ConstPtr(gcref) = &mut r {
-                    visitor(gcref);
-                }
-                set.insert(r);
-            }
+        fn visit_opref_set(set: &mut FxIndexSet<OpRef>, _visitor: &mut dyn FnMut(&mut GcRef)) {
+            // Index is stable across a move, so the set does not rekey.
+            let _ = set;
         }
 
         fn visit_produced(produced: &mut ProducedShortOp, visitor: &mut dyn FnMut(&mut GcRef)) {

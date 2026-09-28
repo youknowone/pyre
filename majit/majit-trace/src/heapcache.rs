@@ -1133,9 +1133,7 @@ impl HeapCache {
     /// in-place key rewrite would break the sorted-`VecMap` ordering.
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn forward(slot: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
-            if let OpRef::ConstPtr(gcref) = slot {
-                visitor(gcref);
-            }
+            let _ = (slot, visitor);
         }
         fn forward_entry(entry: &mut CacheEntry, visitor: &mut dyn FnMut(&mut GcRef)) {
             for value in entry.cache_anything.values_mut() {

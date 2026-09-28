@@ -142,14 +142,9 @@ impl Forwarded {
                     cell.set(v);
                 }
             }
-            Forwarded::SmallWide(id) => {
-                let cell = crate::operand::wide_slot(*id as u32);
-                let mut v = cell.get();
-                if let Value::Ref(gcref) = &mut v {
-                    visitor(gcref);
-                    cell.set(v);
-                }
-            }
+            // Wide `ConstPtr` stores a table index. `const_ptr_table::walk`
+            // forwards the referent.
+            Forwarded::SmallWide(_) => {}
             _ => {}
         }
     }
@@ -161,9 +156,8 @@ impl Forwarded {
                 cell.set(Value::Ref(updated));
             }
             Forwarded::SmallWide(id) => {
-                let cell = crate::operand::wide_slot(*id as u32);
-                if matches!(cell.get(), Value::Ref(_)) {
-                    cell.set(Value::Ref(updated));
+                if let Some(index) = crate::operand::wide_ref_index(*id) {
+                    crate::const_ptr_table::set_slot(index, updated);
                 }
             }
             _ => {}

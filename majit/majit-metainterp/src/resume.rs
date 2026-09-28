@@ -1642,7 +1642,7 @@ pub fn tagged_to_source(
     }
     if tagged_eq(tagged, NULLREF) {
         // history.py CONST_NULL = ConstPtr(null). resume.py:1589 parity.
-        return ResumeValueSource::Constant(majit_ir::Const::Ref(majit_ir::GcRef::NULL));
+        return ResumeValueSource::Constant(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL));
     }
     let (num, tag_bits) = untag(tagged);
     match tag_bits {
@@ -2084,7 +2084,7 @@ impl EncodedResumeData {
                     }
                     const_pool_tag(&Const::Int(*value), rd_consts)
                 }
-                ResumeValueSource::Constant(Const::Ref(gcref)) if gcref.is_null() => Ok(NULLREF),
+                ResumeValueSource::Constant(Const::Ref(0)) => Ok(NULLREF),
                 ResumeValueSource::Constant(c) => const_pool_tag(c, rd_consts),
                 ResumeValueSource::Virtual(index) => tag(*index as i32, TAGVIRTUAL),
                 ResumeValueSource::Tagged(tagged) => Ok(*tagged),
@@ -2545,7 +2545,7 @@ impl EncodedResumeData {
                 // the free `decode_box(tagged: i16, ..)`'s NULLREF
                 // fast-path so encoder/decoder stay symmetric.
                 ENCODED_NULLREF => {
-                    ResumeValueSource::Constant(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
+                    ResumeValueSource::Constant(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL))
                 }
                 ENCODED_UNINITIALIZED => ResumeValueSource::Uninitialized,
                 ENCODED_UNAVAILABLE => ResumeValueSource::Unavailable,
@@ -3719,25 +3719,24 @@ impl ResumeDataLoopMemo {
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         // SAFETY: the stop-the-world root walker is the only code running and
         // holds exclusive access to this optimizer memo.
-        let consts = unsafe { self.consts.as_mut_vec_for_gc() };
-        for c in consts.iter_mut() {
-            if let majit_ir::Const::Ref(slot) = c {
-                visitor(slot);
-            }
-        }
+        // `Const::Ref` is a `const_ptr_table` index. The table walker
+        // forwards `ConstPtr.value`. Rebuild `refs` by identity hash so a
+        // key captured as an address still finds the pool slot.
+        let _ = visitor;
         if self.refs.is_empty() {
             return;
         }
-        // `_newconst` mints `tag(len(consts) + TAG_CONST_OFFSET, TAGCONST)`
-        // before pushing, so the tag names the pool slot that holds this
-        // entry's forwarded address. Rebuild in iteration order: `refs` is a
-        // dict upstream and the numbering reads it as one.
         let mut rebuilt: IndexMap<i64, i16> = IndexMap::with_capacity(self.refs.len());
         for (_, &tagged) in self.refs.iter() {
             let (num, _) = untag(tagged);
             let idx = (num - TAG_CONST_OFFSET) as usize;
-            if let Some(majit_ir::Const::Ref(gcref)) = self.consts.get(idx) {
-                rebuilt.insert(gcref.0 as i64, tagged);
+            if let Some(majit_ir::Const::Ref(index)) = self.consts.get(idx) {
+                let addr = majit_ir::const_ptr_table::resolve(*index);
+                if addr.is_null() {
+                    continue;
+                }
+                let key = majit_ir::gc_id_or_identityhash(addr.0) as i64;
+                rebuilt.insert(key, tagged);
             }
         }
         self.refs = rebuilt;
@@ -3773,11 +3772,13 @@ impl ResumeDataLoopMemo {
         if val == 0 {
             return Ok(NULLREF);
         }
-        if let Some(&tagged) = self.refs.get(&val) {
+        // `resume.py` `new_ref_dict`: the key hash is `identityhash`.
+        let key = majit_ir::gc_id_or_identityhash(val as usize) as i64;
+        if let Some(&tagged) = self.refs.get(&key) {
             return Ok(tagged);
         }
         let tagged = self.newconst(val, majit_ir::Type::Ref)?;
-        self.refs.insert(val, tagged);
+        self.refs.insert(key, tagged);
         Ok(tagged)
     }
 
@@ -3848,30 +3849,32 @@ impl ResumeDataLoopMemo {
                 }
                 tag_i64(encode_len(index), TAGCONST)
             }
-            majit_ir::Const::Ref(gcref) => {
+            majit_ir::Const::Ref(index) => {
                 // resume.py val = 0 → NULLREF sentinel (no pool
                 // entry allocated). `NULLREF = tag(-1, TAGCONST)` —
                 // encoder emits `tag_i64(-1, TAGCONST)` and the
                 // matching decoder in `decode_box` recognizes
                 // `ENCODED_NULLREF` before the positive-index branch.
-                let raw = gcref.as_usize() as i64;
+                let gcref = majit_ir::const_ptr_table::resolve(*index);
+                let raw = gcref.0 as i64;
                 if raw == 0 {
                     return tag_i64(ENCODED_NULLREF, TAGCONST);
                 }
-                if let Some(&tagged_i16) = self.refs.get(&raw) {
+                let key = majit_ir::gc_id_or_identityhash(gcref.0) as i64;
+                if let Some(&tagged_i16) = self.refs.get(&key) {
                     let (num, _) = untag(tagged_i16);
                     return tag_i64(encode_len((num - TAG_CONST_OFFSET) as usize), TAGCONST);
                 }
-                let index = self.consts.len();
+                let pool_index = self.consts.len();
                 unsafe {
                     self.consts
-                        .push_during_optimization(majit_ir::Const::Ref(*gcref));
+                        .push_during_optimization(majit_ir::Const::Ref(*index));
                 }
                 // See the Int arm on why an unrepresentable tag skips the cache.
-                if let Ok(tagged_i16) = tag((index as i32) + TAG_CONST_OFFSET, TAGCONST) {
-                    self.refs.insert(raw, tagged_i16);
+                if let Ok(tagged_i16) = tag((pool_index as i32) + TAG_CONST_OFFSET, TAGCONST) {
+                    self.refs.insert(key, tagged_i16);
                 }
-                tag_i64(encode_len(index), TAGCONST)
+                tag_i64(encode_len(pool_index), TAGCONST)
             }
             majit_ir::Const::Float(v) => {
                 // resume.py _newconst (no dedup for floats in RPython).
@@ -5154,7 +5157,7 @@ pub fn decode_box(
         TAGCONST => {
             if tagged_eq(tagged, NULLREF) {
                 // bridgeopt.py:51: box = CONST_NULL (history.py).
-                DecodedBox::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
+                DecodedBox::Const(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL))
             } else {
                 // bridgeopt.py:54: box = resumestorage.rd_consts[num - TAG_CONST_OFFSET]
                 // — direct list index, IndexError on out-of-range. A
@@ -5220,11 +5223,12 @@ mod tests {
             "cached before the move"
         );
 
-        memo.walk_const_ptr_refs_mut(&mut |slot: &mut majit_ir::GcRef| {
+        majit_ir::const_ptr_table::walk(&mut |slot: &mut majit_ir::GcRef| {
             if slot.0 as i64 == before {
                 *slot = majit_ir::GcRef(after as usize);
             }
         });
+        memo.walk_const_ptr_refs_mut(&mut |_| {});
 
         assert_eq!(
             memo.getconst_ref(after).unwrap(),
@@ -6410,7 +6414,7 @@ mod tests {
             offset: 0,
             fieldnums: vec![tagged],
         };
-        let mut consts = vec![majit_ir::Const::Ref(majit_ir::GcRef(0x1000))];
+        let mut consts = vec![majit_ir::Const::from_gcref(majit_ir::GcRef(0x1000))];
         let virtual_info = virtual_info_from_rd(&rd);
         let VirtualInfo::VRawSlice { parent, .. } = virtual_info else {
             panic!("expected VRawSlice");
@@ -6419,7 +6423,7 @@ mod tests {
 
         // Model the root walker forwarding rd_consts during the allocation
         // window. The later field decode must observe the new pointer.
-        consts[0] = majit_ir::Const::Ref(majit_ir::GcRef(0x2000));
+        consts[0] = majit_ir::Const::from_gcref(majit_ir::GcRef(0x2000));
         let mut reader = ResumeDataDirectReader::new(
             &[0, 0],
             &consts,
@@ -8765,8 +8769,9 @@ pub fn resume_register_box(
             Some((majit_ir::OpRef::input_arg_typed(*n as u32, *kind), bits))
         }
         RebuiltValue::Const(majit_ir::Const::Int(v)) => Some((majit_ir::OpRef::const_int(*v), *v)),
-        RebuiltValue::Const(majit_ir::Const::Ref(g)) => {
-            Some((majit_ir::OpRef::const_ptr(*g), g.0 as i64))
+        RebuiltValue::Const(majit_ir::Const::Ref(index)) => {
+            let g = majit_ir::const_ptr_table::resolve(*index);
+            Some((majit_ir::OpRef::const_ptr(g), g.0 as i64))
         }
         RebuiltValue::Const(majit_ir::Const::Float(f)) => {
             Some((majit_ir::OpRef::const_float(*f), f.to_bits() as i64))

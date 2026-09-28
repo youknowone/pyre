@@ -2716,7 +2716,9 @@ impl OptContext {
             let minted = match opref {
                 OpRef::ConstInt(v) => Some(Operand::const_from_value(Value::Int(v))),
                 OpRef::ConstFloat(v) => Some(Operand::const_from_value(Value::Float(v))),
-                OpRef::ConstPtr(v) => Some(Operand::const_from_value(Value::Ref(v))),
+                OpRef::ConstPtr(v) => Some(Operand::const_from_value(Value::Ref(
+                    majit_ir::const_ptr_table::resolve(v),
+                ))),
                 _ => None,
             };
             if let Some(ref op) = minted {
@@ -5806,8 +5808,16 @@ impl OptContext {
             return self.get_box_replacement_operand(arg.to_opref());
         }
         let resolved = arg.get_box_replacement(false);
-        let resolved = if resolved.same_box(arg) && arg.is_inputarg() {
-            self.imported_inputarg_operand(arg).unwrap_or(resolved)
+        // Self-resolved: the canonical box for this position may live in
+        // the OpRef store (`get_box_replacement_operand`), the same
+        // fallback `resolve_operand_operand_positional` takes.
+        let resolved = if resolved.same_box(arg) {
+            if let Some(imported) = self.imported_inputarg_operand(arg) {
+                imported
+            } else {
+                self.get_box_replacement_operand_opt(arg.to_opref())
+                    .unwrap_or(resolved)
+            }
         } else {
             resolved
         };
@@ -6698,7 +6708,7 @@ impl OptContext {
         match opref {
             OpRef::ConstInt(v) => return Some(Value::Int(v)),
             OpRef::ConstFloat(v) => return Some(Value::Float(v)),
-            OpRef::ConstPtr(v) => return Some(Value::Ref(v)),
+            OpRef::ConstPtr(v) => return Some(Value::Ref(majit_ir::const_ptr_table::resolve(v))),
             // Non-constant OpRefs walk the forwarding chain below to find a
             // value forwarded onto them by `make_constant`.
             _ => {}
@@ -11016,7 +11026,7 @@ mod boxref_forwarding_tests {
         let recorder = majit_ir::InputArg::from_type_rc(Type::Ref, SLOT);
         let host = majit_ir::InputArg::from_type_rc(Type::Ref, BASE + SLOT);
         let host_arg = Operand::from_bound_inputarg(&host);
-        host_arg.set_forwarded_const(majit_ir::Const::Ref(majit_ir::GcRef(0)));
+        host_arg.set_forwarded_const(majit_ir::Const::from_gcref(majit_ir::GcRef(0)));
         ctx.register_carried_host(&Operand::from_bound_inputarg(&recorder));
         ctx.register_carried_host(&host_arg);
 
@@ -11138,7 +11148,7 @@ mod boxref_forwarding_tests {
         // The position a shifted read would land on if the base were not 0.
         let decoy = majit_ir::InputArg::from_type_rc(Type::Ref, SLOT + 11);
         let decoy_arg = Operand::from_bound_inputarg(&decoy);
-        decoy_arg.set_forwarded_const(majit_ir::Const::Ref(majit_ir::GcRef(0)));
+        decoy_arg.set_forwarded_const(majit_ir::Const::from_gcref(majit_ir::GcRef(0)));
         ctx.register_carried_host(&Operand::from_bound_inputarg(&recorder));
         ctx.register_carried_host(&decoy_arg);
 

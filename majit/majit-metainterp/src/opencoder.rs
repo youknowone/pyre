@@ -1835,12 +1835,9 @@ pub struct Trace {
     /// nullptr. A minor rewrites the slots; `refresh_from_gc` rekeys
     /// `_refs_dict`, which stays a host `IndexMap` until the dict stage.
     pub _refs: trace_bufs::WordArray<usize>,
-    /// opencoder.py `Trace._refs_dict` — addr → index into `_refs`.
-    /// Cleared by `tracing_done`.
+    /// opencoder.py `Trace._refs_dict`. Key is `id_or_identityhash`,
+    /// value is the index into `_refs`. Cleared by `tracing_done`.
     pub _refs_dict: crate::FxIndexMap<u64, u32>,
-    /// Minor epoch at the last `rekey_refs`. Upstream dict keys move
-    /// with the objects; this host map is rebuilt once per minor.
-    refs_dict_epoch: u64,
     /// opencoder.py `Trace._bigints`. `GcArray` of plain words.
     pub _bigints: trace_bufs::WordArray<i64>,
     /// opencoder.py `Trace._bigints_dict`. Host until the dict stage.
@@ -1938,7 +1935,6 @@ impl Trace {
             // 32 slots so the first ConstPtrs do not reallocate.
             _refs: trace_bufs::new_refs(),
             _refs_dict: crate::FxIndexMap::with_capacity_and_hasher(32, Default::default()),
-            refs_dict_epoch: majit_gc::minor_epoch(),
             _bigints: trace_bufs::new_bigints(),
             _bigints_dict: crate::FxIndexMap::default(),
             _floats: trace_bufs::new_floats(),
@@ -2276,38 +2272,29 @@ impl Trace {
         tag(TAGCONSTOTHER, (idx << 1) | 1) as i64
     }
 
-    /// opencoder.py _cached_const_ptr + :629-632 _encode for
-    /// ConstPtr — dedup via `_refs_dict` (by address), push to `_refs`,
-    /// return `tag(TAGCONSTPTR, idx)`. Index 0 is reserved for nullptr
-    /// (seeded by the constructor).
+    /// opencoder.py `_cached_const_ptr` + `_encode` for ConstPtr.
+    /// Dedup via `_refs_dict` keyed by `id_or_identityhash`, push the
+    /// address to `_refs`, return `tag(TAGCONSTPTR, idx)`. Index 0 is
+    /// nullptr (seeded by the constructor).
     ///
-    /// The array is one rooted `GcArray` of `GCREF`. Growth may collect;
-    /// the stored address is the forwarded one, and a non-empty dict is
-    /// rekeyed from the slots (`_refs_dict` is still a host map).
+    /// The array is one rooted `GcArray` of `GCREF`. The dict key is the
+    /// identity hash, so a minor that forwards `_refs` does not move the
+    /// key. `opencoder.py` `_refs_dict` is keyed by the ref itself, whose
+    /// hash is `lltype.identityhash`.
     pub fn _encode_ptr(&mut self, addr: u64) -> i64 {
         self._consts_ptr += 1;
         if addr == 0 {
             return tag(TAGCONSTPTR, 0) as i64;
         }
-        // `history.py` `new_ref_dict` keys are the pointers themselves.
-        // A minor rewrites the `GcArray` slots; rebuild the host map
-        // once for that minor, then look the address up.
-        let epoch = majit_gc::minor_epoch();
-        if epoch != self.refs_dict_epoch {
-            self.rekey_refs();
-            self.refs_dict_epoch = epoch;
-        }
-        let v = if let Some(&idx) = self._refs_dict.get(&addr) {
+        let key = majit_ir::gc_id_or_identityhash(addr as usize) as u64;
+        let v = if let Some(&idx) = self._refs_dict.get(&key)
+            && self._refs.as_slice().get(idx as usize).copied() == Some(addr as usize)
+        {
             idx
         } else {
-            let cap = self._refs.capacity();
-            let stored = self._refs.push(addr as usize);
+            let _stored = self._refs.push(addr as usize);
             let idx = (self._refs.len() - 1) as u32;
-            if self._refs.capacity() != cap && !self._refs_dict.is_empty() {
-                self.rekey_refs();
-            } else {
-                self._refs_dict.insert(stored as u64, idx);
-            }
+            self._refs_dict.insert(key, idx);
             idx
         };
         tag(TAGCONSTPTR, v) as i64
@@ -3333,11 +3320,10 @@ impl Trace {
         self._refs.as_slice()[index] as u64
     }
 
-    /// `history.py new_ref_dict` keys are object identities. The ref
-    /// `GcArray` slots are already the forwarded addresses; this rekeys
-    /// the host `_refs_dict`. A dictionary cleared by `tracing_done`
-    /// stays cleared. Callers still invoke it at the same boundaries as
-    /// `MetaInterp::walk_active_trace_refs`.
+    /// `history.py new_ref_dict` keys are object identities
+    /// (`id_or_identityhash`). The ref `GcArray` slots are already the
+    /// forwarded addresses; this rekeys the host `_refs_dict` by that
+    /// hash. A dictionary cleared by `tracing_done` stays cleared.
     pub(crate) fn refresh_from_gc(&mut self) {
         self.rekey_refs();
     }
@@ -3348,8 +3334,12 @@ impl Trace {
         }
         self._refs_dict.clear();
         for index in 1..self._refs.len() {
-            self._refs_dict
-                .insert(self._refs[index] as u64, index as u32);
+            let addr = self._refs[index];
+            if addr == 0 {
+                continue;
+            }
+            let key = majit_ir::gc_id_or_identityhash(addr) as u64;
+            self._refs_dict.insert(key, index as u32);
         }
     }
 
