@@ -134,13 +134,13 @@ mod tests {
     }
 
     #[unsafe(no_mangle)]
-    unsafe extern "C" fn pyre_rffi_t1_gil_probe() -> i32 {
+    unsafe extern "C" fn majit_rffi_t1_gil_probe() -> i32 {
         HELD_DURING.store(majit_gc::rgil::am_i_holding_the_gil(), Ordering::SeqCst);
         7
     }
 
     #[unsafe(no_mangle)]
-    unsafe extern "C" fn pyre_rffi_t1_set_errno(value: i32) -> i32 {
+    unsafe extern "C" fn majit_rffi_t1_set_errno(value: i32) -> i32 {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
         unsafe {
             *libc::__error() = value;
@@ -174,32 +174,32 @@ mod tests {
     }
 
     llexternal!(
-        gil_probe = "pyre_rffi_t1_gil_probe",
+        gil_probe = "majit_rffi_t1_gil_probe",
         [],
         i32,
         compilation_info = EMPTY_ECI
     );
     llexternal!(
-        gil_probe_direct = "pyre_rffi_t1_gil_probe",
+        gil_probe_direct = "majit_rffi_t1_gil_probe",
         [],
         i32,
         _nowrapper = true
     );
     llexternal!(
-        gil_probe_macro = "pyre_rffi_t1_gil_probe",
+        gil_probe_macro = "majit_rffi_t1_gil_probe",
         [],
         i32,
-        macro = pyre_rffi_t1_gil_probe,
+        macro = majit_rffi_t1_gil_probe,
         sandboxsafe = true
     );
     llexternal!(
-        set_errno_ext = "pyre_rffi_t1_set_errno",
+        set_errno_ext = "majit_rffi_t1_set_errno",
         [i32],
         i32,
         save_err = RFFI_SAVE_ERRNO
     );
     llexternal!(
-        pub pub_gil_probe = "pyre_rffi_t1_gil_probe",
+        pub pub_gil_probe = "majit_rffi_t1_gil_probe",
         [],
         i32,
         sandboxsafe = true
