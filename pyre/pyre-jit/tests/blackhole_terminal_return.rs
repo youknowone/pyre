@@ -21,7 +21,7 @@ fn terminal_ref_return_finishes_the_frame_and_leaves_its_execution_scope() {
             // `init_jit_hooks` builds.
             pyre_module::register();
             pyre_jit::eval::init_jit_hooks();
-            let vinfo = pyre_jit::eval::driver_pair().1.clone();
+            let vinfo = pyre_jit::eval::ensure_pyframe_virtualizable(pyre_jit::eval::driver_pair());
             let ec = Rc::new(PyExecutionContext::default());
             let ec_ptr = Rc::as_ptr(&ec) as *mut PyExecutionContext;
             pyre_interpreter::call::set_last_exec_ctx(ec_ptr);

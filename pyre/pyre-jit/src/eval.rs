@@ -5308,7 +5308,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
 
 /// One `VirtualizableInfo` for the pypyjit portal, built on the first
 /// trace or compiled entry rather than on the cold counter tick.
-fn publish_pyframe_vinfo(
+pub(crate) fn publish_pyframe_vinfo(
     meta: &mut majit_metainterp::MetaInterp<crate::jit::state::PyreMeta>,
 ) -> std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo> {
     if let Some(info) = meta.virtualizable_info().cloned() {
@@ -5319,7 +5319,7 @@ fn publish_pyframe_vinfo(
     info
 }
 
-fn ensure_pyframe_virtualizable(
+pub fn ensure_pyframe_virtualizable(
     pair: &mut JitDriverPair,
 ) -> std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo> {
     if let Some(info) = pair.1.clone() {

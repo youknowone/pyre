@@ -2757,12 +2757,19 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // hand the metainterp's own VRefInfo through so consume_virtualref_info
     // can decode JIT_VIRTUAL_REF handles. resume.py ginfo is currently
     // unused in pyre (no greenfield_info installed on the driver).
-    let (driver, driver_vinfo) = crate::eval::driver_pair();
-    let vinfo_dyn: &dyn resume::VirtualizableInfo = driver_vinfo.as_ref();
+    let vinfo_arc = if novable {
+        None
+    } else {
+        Some(crate::eval::ensure_pyframe_virtualizable(
+            crate::eval::driver_pair(),
+        ))
+    };
+    let (driver, _) = crate::eval::driver_pair();
     // A novable driver's resume data has no vable section; pass no vinfo so the
     // decoder skips `consume_vable_info` entirely.
-    let vinfo_arg: Option<&dyn resume::VirtualizableInfo> =
-        if novable { None } else { Some(vinfo_dyn) };
+    let vinfo_arg: Option<&dyn resume::VirtualizableInfo> = vinfo_arc
+        .as_ref()
+        .map(|arc| arc.as_ref() as &dyn resume::VirtualizableInfo);
     let vrefinfo_dyn: &dyn resume::VRefInfo = driver.meta_interp().virtualref_info();
     let allocator = crate::eval::PyreBlackholeAllocator;
     // resume.py `self.metainterp_sd.liveness_info` — the one pool, for
@@ -3771,10 +3778,7 @@ pub fn trace_and_compile_from_bridge(
         return BridgeResolution::ResumeBlackhole;
     }
 
-    let info = {
-        let (_, info) = crate::eval::driver_pair();
-        info
-    };
+    let info = crate::eval::ensure_pyframe_virtualizable(crate::eval::driver_pair());
 
     // pyjitpl.py handle_guard_failure parity:
     // RPython creates a fresh MetaInterp and calls
@@ -3785,7 +3789,7 @@ pub fn trace_and_compile_from_bridge(
         let (driver, _) = crate::eval::driver_pair();
         driver.meta_interp().get_compiled_meta(green_key).cloned()
     };
-    let mut jit_state_local = build_jit_state(frame, info);
+    let mut jit_state_local = build_jit_state(frame, &info);
     // `num_resume_frames > 1` marks a multi-frame (inlined-callee) guard:
     // the guard fired inside a callee inlined into the trace, so the resume
     // pc is the INNERMOST frame's bytecode pc, which does not address the
@@ -3831,7 +3835,7 @@ pub fn trace_and_compile_from_bridge(
     }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
-    let mut jit_state = build_jit_state(frame, info);
+    let mut jit_state = build_jit_state(frame, &info);
 
     // A resume_pc on LOAD_CONST + RETURN_VALUE (or `n<=0` RETURN) is still
     // a live `handle_guard_failure` walk. RPython's `interpret()` records
@@ -7903,7 +7907,7 @@ pub fn cranelift_resumedata_deopt(
     }
 
     // 1. Recover descr Arc.
-    let (driver, driver_vinfo) = crate::eval::driver_pair();
+    let (driver, _) = crate::eval::driver_pair();
     let backend = driver.meta_interp().backend();
     let descr = backend.fail_descr_arc_from_addr(descr_addr);
 
@@ -7989,7 +7993,11 @@ pub fn cranelift_resumedata_deopt(
     //    sections.
     let _resume_roots =
         resume::prepare_resume_heap_with_roots(&mut reader, rd_virtuals_slice, rd_pendingfields);
-    let vinfo_dyn: &dyn resume::VirtualizableInfo = driver_vinfo.as_ref();
+    let vinfo_arc = if novable {
+        None
+    } else {
+        Some(crate::eval::publish_pyframe_vinfo(driver.meta_interp_mut()))
+    };
     let vrefinfo_dyn: &dyn resume::VRefInfo = driver.meta_interp().virtualref_info();
     if std::env::var_os("PYRE_DEOPT_PROBE").is_some() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -7999,8 +8007,9 @@ pub fn cranelift_resumedata_deopt(
             "[deopt-probe] cranelift vinfo hand-off #{n} descr_addr={descr_addr:#x} novable={novable}"
         );
     }
-    let vinfo_arg: Option<&dyn resume::VirtualizableInfo> =
-        if novable { None } else { Some(vinfo_dyn) };
+    let vinfo_arg: Option<&dyn resume::VirtualizableInfo> = vinfo_arc
+        .as_ref()
+        .map(|arc| arc.as_ref() as &dyn resume::VirtualizableInfo);
     reader.consume_vref_and_vable(Some(vrefinfo_dyn), vinfo_arg, None);
 
     // 7. resume.py:1339 jitcodes[jitcode_pos] lookup — same shape as
