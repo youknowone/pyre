@@ -23554,27 +23554,7 @@ impl<'a> Lowering<'a> {
     }
 
     fn type_decl_has_explicit_drop(&self, def_id: u64) -> bool {
-        self.llbc.trait_impls_raw().iter().any(|impl_row| {
-            let Some(impl_trait) = impl_row.get("impl_trait") else {
-                return false;
-            };
-            let owner = impl_trait
-                .get("generics")
-                .and_then(|generics| generics.get("types"))
-                .and_then(serde_json::Value::as_array)
-                .and_then(|types| types.first())
-                .and_then(|owner| resolve_tyexpr_to_adt_def_id_free(self.llbc, owner));
-            if owner != Some(def_id) {
-                return false;
-            }
-            // Missing trait metadata cannot prove this capture dropless.
-            // Keep the call residual until its destructor contract is known.
-            impl_trait
-                .get("id")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|trait_id| self.llbc.trait_by_id(trait_id))
-                .is_none_or(|decl| decl.item_meta.name_path() == "core::ops::drop::Drop")
-        })
+        self.llbc.has_explicit_drop_impl(def_id)
     }
 
     /// Resolve a recognized `Option::map`/`and_then`/`unwrap_or_else(opt,
