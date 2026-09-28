@@ -51,18 +51,12 @@ pub(super) fn is_varsize_length_member(
     if !struct_is_array_header(config, header) {
         return false;
     }
-    if varsize_length_field_name(config, header).as_deref() == Some(member) {
-        return true;
-    }
-    matches!(member, "capacity" | "length" | "len")
+    varsize_length_field_name(config, header).as_deref() == Some(member)
 }
 
 /// `rewrite_op_malloc_varsize`: pointer and struct elements are cleared.
 /// An integer element type (`i64`, `usize`, …) is `new_array`.
 pub(super) fn header_items_are_pointers(config: &LowererConfig, header: &syn::Path) -> bool {
-    const INTS: &[&str] = &[
-        "i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize", "bool",
-    ];
     let last = header
         .segments
         .last()
@@ -80,15 +74,10 @@ pub(super) fn header_items_are_pointers(config: &LowererConfig, header: &syn::Pa
             continue;
         }
         saw = true;
-        if let Some((_, _, elem)) = config.array_fields.get(key) {
-            let elem_last = elem
-                .segments
-                .last()
-                .map(|seg| seg.ident.to_string())
-                .unwrap_or_default();
-            if INTS.contains(&elem_last.as_str()) {
-                primitive = true;
-            }
+        if let Some((_, _, elem)) = config.array_fields.get(key)
+            && path_is_int_elem(elem)
+        {
+            primitive = true;
         }
     }
     saw && !primitive
@@ -209,10 +198,11 @@ fn path_is_f64(path: &syn::Path) -> bool {
 }
 
 /// Primitive integer element of a headered array (`CelIntWords::items`).
-/// A header does not make the element a GC pointer.
+/// A header does not make the element a GC pointer. `bool` is an int item
+/// of size 1, unsigned.
 fn path_is_int_elem(path: &syn::Path) -> bool {
     const INTS: &[&str] = &[
-        "i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize",
+        "i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize", "bool",
     ];
     path.segments
         .last()
@@ -3337,5 +3327,64 @@ mod tests {
             "itemsize must not be a hardcoded i64: {tokens}"
         );
         assert!(tokens.contains("MIN"), "{tokens}");
+    }
+
+    /// The length word is only the name `varsize_length_field_name` resolved.
+    /// A header that also has `len` keeps that field an ordinary read.
+    #[test]
+    fn length_member_is_only_the_resolved_field() {
+        let items = crate::jit_interp::ArrayFieldEntry {
+            struct_type: syn::parse_quote!(Words),
+            field: syn::parse_quote!(items),
+            element_type: syn::parse_quote!(i64),
+            header: Some(syn::parse_quote!(Words)),
+        };
+        let capacity = crate::jit_interp::IntFieldEntry {
+            struct_type: syn::parse_quote!(Words),
+            field: syn::parse_quote!(capacity),
+            int_type: syn::parse_quote!(usize),
+        };
+        let len = crate::jit_interp::IntFieldEntry {
+            struct_type: syn::parse_quote!(Words),
+            field: syn::parse_quote!(len),
+            int_type: syn::parse_quote!(usize),
+        };
+        let config =
+            LowererConfig::inline_helper(&[], &[items], &[capacity, len], &[], &[], &[], &[], &[]);
+        let header: syn::Path = syn::parse_quote!(Words);
+        let resolved = varsize_length_field_name(&config, &header);
+        assert_eq!(resolved.as_deref(), Some("capacity"));
+        assert!(is_varsize_length_member(&config, &header, "capacity"));
+        assert!(!is_varsize_length_member(&config, &header, "len"));
+    }
+
+    /// `bool` is an int item of size 1, unsigned. Pointer-vs-int uses one
+    /// classifier, so the header and the element path agree.
+    #[test]
+    fn bool_header_element_is_an_unsigned_int_item() {
+        let items = crate::jit_interp::ArrayFieldEntry {
+            struct_type: syn::parse_quote!(Flags),
+            field: syn::parse_quote!(items),
+            element_type: syn::parse_quote!(bool),
+            header: Some(syn::parse_quote!(Flags)),
+        };
+        let capacity = crate::jit_interp::IntFieldEntry {
+            struct_type: syn::parse_quote!(Flags),
+            field: syn::parse_quote!(capacity),
+            int_type: syn::parse_quote!(usize),
+        };
+        let config =
+            LowererConfig::inline_helper(&[], &[items], &[capacity], &[], &[], &[], &[], &[]);
+        let header: syn::Path = syn::parse_quote!(Flags);
+        let elem = header_element_path(&config, &header).expect("element path");
+        assert!(path_is_int_elem(elem));
+        assert!(!header_items_are_pointers(&config, &header));
+        let tokens = gc_varsize_descr_tokens(&config, &header).to_string();
+        assert!(tokens.contains("bool"), "{tokens}");
+        assert!(tokens.contains("size_of"), "{tokens}");
+        assert!(
+            tokens.contains("MIN") && tokens.contains("< 0"),
+            "signedness is the element MIN, which is false for bool: {tokens}"
+        );
     }
 }

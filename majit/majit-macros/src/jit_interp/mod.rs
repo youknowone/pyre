@@ -2930,6 +2930,12 @@ fn emit_portal_runner(
                     }
                     majit_metainterp::FunctionEntryRunner::Run => {
                         #drain
+                        // Same single-pass latch as `Resume`: a bridge that
+                        // reaches the portal return publishes there and
+                        // reports no resume pc, so this arm is `Run`.
+                        if #driver.take_single_pass_finish() {
+                            #single_pass_drain
+                        }
                         return #portal_ident(#(#run_args),*);
                     }
                 }
@@ -5260,5 +5266,15 @@ mod tests {
             .find("fn __mainloop_portal")
             .expect("portal function");
         assert_drain_before_back_edge(&runner_expanded[..portal_at], "function_entry_runner");
+        let runner_door = &runner_expanded[..portal_at];
+        let run_at = runner_door
+            .find("FunctionEntryRunner :: Run")
+            .unwrap_or_else(|| panic!("Run arm missing. Door was:\n{runner_door}"));
+        let run_arm = &runner_door[run_at..];
+        assert!(
+            run_arm.contains("take_single_pass_finish_ref"),
+            "the Run arm must drain the single-pass finish before the portal. \
+             Arm was:\n{run_arm}"
+        );
     }
 }

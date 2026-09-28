@@ -1232,6 +1232,11 @@ impl OptHeap {
         let index_val = ctx
             .resolve_operand_operand_opt(&op.arg(1))
             .and_then(|b| ctx.get_constant_int_box(&b))?;
+        // `heap.py` `arrayitem_cache` keys a constant index. A negative
+        // index is not a cache slot; the read stays on the variable-index path.
+        if index_val < 0 {
+            return None;
+        }
         let descr = op.getdescr()?;
         let array = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
         Some((array, descr_ptr(&descr), index_val))
@@ -5736,6 +5741,27 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GetarrayitemGcPureI)
             .count();
         assert_eq!(gets, 2, "a pure constant miss must not cache the read");
+    }
+
+    /// A negative constant index is not an `arrayitem_cache` key
+    /// (`arrayitem_key` returns `None`), so the read stays on the
+    /// variable-index path and is emitted.
+    #[test]
+    fn arrayitem_key_rejects_a_negative_constant_index() {
+        let d = descr(0);
+        let idx = OpRef::int_op(50);
+        let op = Op::with_descr(
+            OpCode::GetarrayitemGcPureI,
+            &[
+                rooted_resop_operand(Type::Int, 100),
+                rooted_resop_operand(Type::Int, idx.raw()),
+            ],
+            d,
+        );
+        let mut ctx = OptContext::new(1);
+        let b = ctx.materialize_operand_at(idx);
+        ctx.make_constant_box(&b, majit_ir::Value::Int(-1));
+        assert!(OptHeap::arrayitem_key(&op, &mut ctx).is_none());
     }
 
     /// A variable index forces lazy setarrayitems and emits. It does not

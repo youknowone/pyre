@@ -2458,7 +2458,7 @@ impl JitCodeBuilder {
     /// `get_field_arraylen_descr`), not a separate struct field.
     pub fn arraylen_gc(&mut self, dst: u16, array_reg: u16, descr_idx: u16) {
         self.touch_ref_reg(array_reg);
-        self.touch_int_reg_or_pool_slot(dst);
+        self.touch_reg(dst);
         self.write_insn("arraylen_gc/rd>i");
         self.push_reg_u8(array_reg, "arraylen_gc array");
         self.push_u16(descr_idx);
@@ -2932,7 +2932,9 @@ impl JitCodeBuilder {
         self.touch_reg(dst);
         // `support.py` `_ll_2_int_floordiv`: LONG_BIT - 1 on a 64-bit Signed.
         let kshift = 63i64;
-        let base = self.alloc_int_temps(6);
+        let Some(base) = self.alloc_int_temps(6) else {
+            return;
+        };
         let r = base;
         let p = base + 1;
         let xor = base + 2;
@@ -2958,7 +2960,9 @@ impl JitCodeBuilder {
         self.touch_reg(rhs);
         self.touch_reg(dst);
         let kshift = 63i64;
-        let base = self.alloc_int_temps(5);
+        let Some(base) = self.alloc_int_temps(5) else {
+            return;
+        };
         let r = base;
         let folded = base + 1;
         let xor = base + 2;
@@ -2978,12 +2982,18 @@ impl JitCodeBuilder {
     /// Fresh int registers above every register already touched, including
     /// the operands of the instruction about to expand. Dead once that
     /// instruction's result is written; later ops may reuse the numbers.
-    fn alloc_int_temps(&mut self, n: u16) -> u16 {
+    fn alloc_int_temps(&mut self, n: u16) -> Option<u16> {
         let base = self.num_regs_i;
+        // Bytecode register indices are one byte (`assembler.py` `chr`).
+        // A temp past that cannot be emitted; latch and decline the JitCode.
+        if u32::from(base) + u32::from(n) > 256 {
+            self.encoding_overflow = true;
+            return None;
+        }
         for i in 0..n {
             self.touch_reg(base.saturating_add(i));
         }
-        base
+        Some(base)
     }
 
     /// `jtransform.py` `_handle_int_special` `int.py_div` → residual
@@ -8762,5 +8772,24 @@ mod tests {
     fn try_finish_declines_descr_pool_overflow() {
         let builder = fill_descr_pool(u16::MAX as usize + 2);
         assert!(builder.try_finish().is_none());
+    }
+
+    /// Temps past the one-byte register namespace latch `encoding_overflow`
+    /// and emit nothing.
+    #[test]
+    fn alloc_int_temps_past_256_latches_overflow_and_skips_the_emit() {
+        let mut floordiv = JitCodeBuilder::new();
+        floordiv.touch_reg(251);
+        let before = floordiv.code.len();
+        floordiv.record_int_floordiv(0, 1, 2);
+        assert!(floordiv.encoding_overflow);
+        assert_eq!(floordiv.code.len(), before);
+
+        let mut modulo = JitCodeBuilder::new();
+        modulo.touch_reg(252);
+        let before = modulo.code.len();
+        modulo.record_int_mod(0, 1, 2);
+        assert!(modulo.encoding_overflow);
+        assert_eq!(modulo.code.len(), before);
     }
 }
