@@ -392,19 +392,24 @@ pub struct DeadFrameArtifacts {
 /// `compile.py` `class CompileData(object)`.
 ///
 /// `optimize_trace` is the compile.py method: write `MARK_TRACE`, run
-/// subclass `optimize()`, then `forget_optimization_info`. `logger_noopt`
-/// / `build_opt_chain` stay at the flattened call site in `pyjitpl.rs`
-/// because the optimizer borrows `MetaInterp`, backend state, constant
-/// pools, and snapshot side tables. Call sites still pass the same
-/// trace/runtime/resume/call-pure/opts state that RPython would store on
+/// `logger_noopt` when `log_noopt` is set, run subclass `optimize()`, then
+/// `forget_optimization_info`. `build_opt_chain` stays at the flattened call
+/// site in `pyjitpl.rs` because the optimizer borrows `MetaInterp`, backend
+/// state, constant pools, and snapshot side tables. Call sites still pass the
+/// same trace/runtime/resume/call-pure/opts state that RPython would store on
 /// the corresponding object.
 pub struct CompileData<'a> {
     pub trace: &'a TreeLoop,
+    /// compile.py `CompileData.log_noopt`; `UnrolledLoopData` clears it.
+    pub log_noopt: bool,
 }
 
 impl<'a> CompileData<'a> {
     pub fn new(trace: &'a TreeLoop) -> Self {
-        Self { trace }
+        Self {
+            trace,
+            log_noopt: true,
+        }
     }
 
     /// compile.py `CompileData.forget_optimization_info`:
@@ -416,11 +421,16 @@ impl<'a> CompileData<'a> {
     }
 
     /// compile.py `CompileData.optimize_trace`: `log_trace(MARK_TRACE)`,
-    /// run the subclass `optimize()` body, then `forget_optimization_info`.
-    pub fn optimize_trace<T, E>(
+    /// `logger_noopt.log_loop_from_trace` when `log_noopt` is set, run the
+    /// subclass `optimize()` body, then `forget_optimization_info`.
+    ///
+    /// `constants` is handed through to `optimize` so the noopt dump can read
+    /// it before the optimizer takes it mutably.
+    pub fn optimize_trace<V: std::fmt::Debug, C: majit_ir::resoperation::ConstLookup<V>, T, E>(
         &self,
         tid: u64,
-        optimize: impl FnOnce() -> Result<T, E>,
+        constants: &mut C,
+        optimize: impl FnOnce(&mut C) -> Result<T, E>,
     ) -> Result<T, E> {
         crate::rjitlog::write_trace(
             crate::rjitlog::MARK_TRACE,
@@ -428,7 +438,10 @@ impl<'a> CompileData<'a> {
             self.inputargs(),
             self.operations(),
         );
-        let result = optimize();
+        if self.log_noopt {
+            crate::logger::log_loop_from_trace(self.operations(), &*constants);
+        }
+        let result = optimize(constants);
         self.forget_optimization_info();
         result
     }
@@ -498,12 +511,14 @@ impl<'a> SimpleCompileData<'a> {
     }
 
     /// compile.py `CompileData.optimize_trace` + `SimpleCompileData.optimize`.
-    pub fn optimize_trace<T, E>(
+    pub fn optimize_trace<V: std::fmt::Debug, C: majit_ir::resoperation::ConstLookup<V>, T, E>(
         &self,
         tid: u64,
-        optimize: impl FnOnce(&Self) -> Result<T, E>,
+        constants: &mut C,
+        optimize: impl FnOnce(&Self, &mut C) -> Result<T, E>,
     ) -> Result<T, E> {
-        self.base.optimize_trace(tid, || optimize(self))
+        self.base
+            .optimize_trace(tid, constants, |constants| optimize(self, constants))
     }
 }
 
@@ -542,12 +557,14 @@ impl<'a> BridgeCompileData<'a> {
     }
 
     /// compile.py `CompileData.optimize_trace` + `BridgeCompileData.optimize`.
-    pub fn optimize_trace<T, E>(
+    pub fn optimize_trace<V: std::fmt::Debug, C: majit_ir::resoperation::ConstLookup<V>, T, E>(
         &self,
         tid: u64,
-        optimize: impl FnOnce(&Self) -> Result<T, E>,
+        constants: &mut C,
+        optimize: impl FnOnce(&Self, &mut C) -> Result<T, E>,
     ) -> Result<T, E> {
-        self.base.optimize_trace(tid, || optimize(self))
+        self.base
+            .optimize_trace(tid, constants, |constants| optimize(self, constants))
     }
 }
 
@@ -575,7 +592,10 @@ impl<'a> UnrolledLoopData<'a> {
         enable_opts: &'a [String],
     ) -> Self {
         Self {
-            base: CompileData::new(trace),
+            base: CompileData {
+                log_noopt: false,
+                ..CompileData::new(trace)
+            },
             celltoken,
             state,
             call_pure_results,

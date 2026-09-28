@@ -8448,17 +8448,7 @@ impl<M: Clone> MetaInterp<M> {
             &trace.inputargs,
             &trace.ops,
         );
-        {
-            let _s = crate::debug::scope("jit-log-noopt");
-            if crate::debug::have_debug_prints() {
-                crate::debug::debug_print(&format!(
-                    "# Traced loop or bridge with {num_ops_before} ops"
-                ));
-                for line in majit_ir::format_trace(&trace.ops, &constants).lines() {
-                    crate::debug::debug_print(line);
-                }
-            }
-        }
+        crate::logger::log_loop_from_trace(&trace.ops, &constants);
 
         // PyPy: pyjitpl.py:3016-3017 gates unrolling on `unroll` in
         // warmstate.enable_opts. MAJIT_NO_UNROLL remains a diagnostic override.
@@ -11701,15 +11691,16 @@ impl<M: Clone> MetaInterp<M> {
         // the process. Matches compile_loop.
         // compile.py SimpleCompileData.optimize_trace → MARK_TRACE + optimize_loop.
         let optimize_start = Instant::now();
-        let optimize_result = simple_data.optimize_trace(self.jitlog_trace_id, |_| {
-            optimizer.optimize_with_constants_and_inputs_oprc(
-                // `trace.ops` are the canonical `Rc<Op>`, so `input_ops`
-                // seeds identity directly from them.
-                &trace.ops,
-                &mut constants,
-                trace.inputargs.len(),
-            )
-        });
+        let optimize_result =
+            simple_data.optimize_trace(self.jitlog_trace_id, &mut constants, |_, constants| {
+                optimizer.optimize_with_constants_and_inputs_oprc(
+                    // `trace.ops` are the canonical `Rc<Op>`, so `input_ops`
+                    // seeds identity directly from them.
+                    &trace.ops,
+                    constants,
+                    trace.inputargs.len(),
+                )
+            });
         let optimized_ops = match optimize_result {
             Ok(ops) => ops,
             // A guard proven to always fail (deferred `InvalidLoop` signal):
@@ -12235,14 +12226,15 @@ impl<M: Clone> MetaInterp<M> {
         // compile_simple_loop / _create_segmented_trace_and_blackhole do
         // not call start_new_trace; they reuse the caller's tid (or 0).
         let optimize_start = Instant::now();
-        let optimize_result = simple_data.optimize_trace(self.jitlog_trace_id, |_| {
-            optimizer.optimize_with_constants_and_inputs_oprc(
-                // Canonical `Rc<Op>`; `input_ops` seeds identity from them.
-                &trace.ops,
-                &mut constants,
-                num_trace_inputargs,
-            )
-        });
+        let optimize_result =
+            simple_data.optimize_trace(self.jitlog_trace_id, &mut constants, |_, constants| {
+                optimizer.optimize_with_constants_and_inputs_oprc(
+                    // Canonical `Rc<Op>`; `input_ops` seeds identity from them.
+                    &trace.ops,
+                    constants,
+                    num_trace_inputargs,
+                )
+            });
         let optimized_ops = match optimize_result {
             Ok(ops) => ops,
             // A guard proven to always fail (deferred `InvalidLoop` signal):
@@ -15590,13 +15582,15 @@ impl<M: Clone> MetaInterp<M> {
         // constant pool merge. Const objects flow via rd_consts + fresh
         // decode (resume.py decode_box).
         let retrace_limit = self.warm_state.retrace_limit();
-        // compile.py compile_trace: log_trace(MARK_TRACE) before optimize_bridge.
+        // compile.py compile_trace → CompileData.optimize_trace:
+        // log_trace(MARK_TRACE) and logger_noopt before optimize_bridge.
         crate::rjitlog::write_trace(
             crate::rjitlog::MARK_TRACE,
             self.jitlog_trace_id,
             bridge_inputargs,
             bridge_ops,
         );
+        crate::logger::log_loop_from_trace(bridge_ops, &constants);
         let optimize_start = Instant::now();
         let mut retraced_count = retraced_count;
         let bridge_optimize_result = {
@@ -16464,10 +16458,10 @@ impl<M: Clone> MetaInterp<M> {
                 &enable_opts,
             );
             debug_assert_eq!(bridge_data.runtime_boxes, prepared_runtime_boxes.as_slice());
-            bridge_data.optimize_trace(self.jitlog_trace_id, |_| {
+            bridge_data.optimize_trace(self.jitlog_trace_id, &mut constants, |_, constants| {
                 optimizer.optimize_bridge(
                     bridge_ops,
-                    &mut constants,
+                    constants,
                     bridge_inputargs.len(),
                     front_target_tokens,
                     bridge_runtime_boxes,
@@ -16488,10 +16482,10 @@ impl<M: Clone> MetaInterp<M> {
             );
             // compile.py SimpleCompileData.optimize → Optimizer.optimize_loop
             simple_data
-                .optimize_trace(self.jitlog_trace_id, |_| {
+                .optimize_trace(self.jitlog_trace_id, &mut constants, |_, constants| {
                     optimizer.optimize_loop(
                         bridge_ops,
-                        &mut constants,
+                        constants,
                         bridge_inputargs.len(),
                         pending_bridge_rd,
                         bridge_inputarg_base,
