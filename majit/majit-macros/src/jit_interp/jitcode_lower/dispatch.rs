@@ -3200,13 +3200,16 @@ pub(super) fn lower_dispatch_chain(
                             }
                         }
                     };
+                    // The sub-JitCode is built in a statement of its own: its
+                    // body spells the callee's registers, which coloring this
+                    // JitCode must not touch.
+                    lowerer.emit_aux(quote::quote! {
+                        let __sub_jitcode = { #arm_body_tokens };
+                        let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
+                    });
                     lowerer.emit_op(
                         OpMeta::linear(OpKind::InlineCall, arm_inline_call_reads, vec![]),
-                        quote::quote! {
-                            let __sub_jitcode = { #arm_body_tokens };
-                            let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
-                            #arm_inline_call_emit
-                        },
+                        arm_inline_call_emit,
                     );
                     // handle_regular_call — trailing -live- after inline_call_*.
                     lowerer.emit_op(
@@ -3964,6 +3967,11 @@ pub(crate) fn lower_dispatch_body(
         .max(int_identity_end)
         .max(ref_identity_end)
         .max(config.float_identity_end());
+    let pinned_floor = super::regalloc::RegisterCounts {
+        ints: lowerer.next_reg,
+        refs: lowerer.next_reg,
+        floats: lowerer.next_reg,
+    };
 
     // A.3.6.1 (`jtransform.py` `promote_greens`): bind body-local `let` stmts that
     // appear BEFORE `jit_merge_point!()` in the dispatch while-body, so
@@ -4141,31 +4149,6 @@ pub(crate) fn lower_dispatch_body(
         lower_dispatch_chain(&mut lowerer, classified_arms, config, &loop_start_label)
     };
 
-    // Patch ensure_regs placeholder with actual register counts.
-    // The ref bank must cover the ref-scalar identity slots at
-    // `ref_regs[ref_identity_base..ref_identity_end)`, not just the
-    // r0=program / r1=vable arguments. `MIFrame.setup` sizes `registers_r`
-    // from `jitcode.num_regs_r()` (`pyjitpl.py`) and guard-failure
-    // resume reads every ref register out of that bank, so a bank capped
-    // at 2 would leave the ref scalars out of the frame and drop them from
-    // the snapshot. `ref_identity_end` is 0 when there are no ref scalars,
-    // so the no-ref-scalar case keeps the original count of 2.
-    {
-        let (portal_i_regs, portal_r_regs, portal_f_regs) = config.portal_input_kind_counts();
-        let portal_r_regs = portal_r_regs + u16::from(config.vable_var.is_some());
-        let final_i_regs = lowerer.next_reg.max(portal_i_regs);
-        let final_r_regs = 2u16.max(portal_r_regs).max(ref_identity_end);
-        let final_f_regs = lowerer
-            .next_reg
-            .max(portal_f_regs)
-            .max(config.float_identity_end());
-        lowerer.statements[ensure_regs_stmt_idx] = quote::quote! {
-            __builder.ensure_r_regs(#final_r_regs);
-            __builder.ensure_i_regs(#final_i_regs);
-            __builder.ensure_f_regs(#final_f_regs);
-        };
-    }
-
     // Task 1.7: default arm typed return.
     // Bind default_label here so the dispatch chain's fall-through GOTO lands
     // at the typed-return emission (interp_jit.py return boundary).
@@ -4250,6 +4233,45 @@ pub(crate) fn lower_dispatch_body(
         .flatten();
     let (reads, emitter) = typed_return_terminator(binding);
     lowerer.emit_op(OpMeta::terminal(reads), emitter);
+
+    // `codewriter.py CodeWriter.transform_graph_to_jitcode` runs
+    // `regalloc.perform_register_allocation` on the portal graph like on
+    // every other graph. Every register below the working-register floor is
+    // an input or an identity slot, so it keeps its number; the working
+    // registers are colored above it.
+    let mut ensure_regs_stmt_idx = ensure_regs_stmt_idx;
+    let (colored, _) = super::regalloc::compact_registers_pinned(
+        &mut lowerer,
+        pinned_floor,
+        pinned_floor,
+        None,
+        Some(&mut ensure_regs_stmt_idx),
+    );
+
+    // Patch ensure_regs placeholder with actual register counts.
+    // The ref bank must cover the ref-scalar identity slots at
+    // `ref_regs[ref_identity_base..ref_identity_end)`, not just the
+    // r0=program / r1=vable arguments. `MIFrame.setup` sizes `registers_r`
+    // from `jitcode.num_regs_r()` (`pyjitpl.py`) and guard-failure
+    // resume reads every ref register out of that bank, so a bank capped
+    // at 2 would leave the ref scalars out of the frame and drop them from
+    // the snapshot. `ref_identity_end` is 0 when there are no ref scalars,
+    // so the no-ref-scalar case keeps the original count of 2.
+    {
+        let (portal_i_regs, portal_r_regs, portal_f_regs) = config.portal_input_kind_counts();
+        let portal_r_regs = portal_r_regs + u16::from(config.vable_var.is_some());
+        let final_i_regs = colored.ints.max(portal_i_regs);
+        let final_r_regs = 2u16.max(portal_r_regs).max(ref_identity_end);
+        let final_f_regs = colored
+            .floats
+            .max(portal_f_regs)
+            .max(config.float_identity_end());
+        lowerer.statements[ensure_regs_stmt_idx] = quote::quote! {
+            __builder.ensure_r_regs(#final_r_regs);
+            __builder.ensure_i_regs(#final_i_regs);
+            __builder.ensure_f_regs(#final_f_regs);
+        };
+    }
 
     annotate_live_markers_with_liveness(&mut lowerer.op_metadata);
     remove_repeated_live(&mut lowerer.op_metadata, &mut lowerer.statements);
