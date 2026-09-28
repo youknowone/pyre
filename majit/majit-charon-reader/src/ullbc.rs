@@ -635,10 +635,17 @@ impl ItemMeta {
     /// `"<Variant>"` — a label, not an identity: the rendering is not
     /// injective, and [`Self::trait_impl_id`] is what recovers what it
     /// dropped.
+    ///
+    /// This is the template path: an `Instantiated` segment (a
+    /// monomorphized copy's generic arguments) is left out, so every
+    /// instance of one generic item spells the same path, the way every
+    /// specialization of one `FunctionDesc` answers to `desc.name`
+    /// (`rpython/annotator/description.py`).  [`Self::instantiation`]
+    /// returns the arguments that tell the instances apart.
     pub fn name_path(&self) -> String {
         let mut out = String::new();
-        for (i, seg) in self.name.iter().enumerate() {
-            if i > 0 {
+        for seg in self.template_name() {
+            if !out.is_empty() {
                 out.push_str("::");
             }
             match seg {
@@ -674,6 +681,36 @@ impl ItemMeta {
         }
         out
     }
+
+    /// The name segments of the template path: [`Self::name`] without the
+    /// `Instantiated` segment.  A leaf read takes `.last()` of this, not of
+    /// `name`, whose last segment is the instantiation on a monomorphized
+    /// item.
+    pub fn template_name(&self) -> impl DoubleEndedIterator<Item = &NameSeg> {
+        self.name
+            .iter()
+            .filter(|seg| !matches!(seg, NameSeg::Other(v) if instantiated_args(v).is_some()))
+    }
+
+    /// The generic arguments of a monomorphized item: the `skip_binder` of
+    /// its `Instantiated` name segment, spelled like any `GenericArgs`
+    /// (`regions`, `types`, `const_generics`, `trait_refs`).  `None` for an
+    /// item Charon did not instantiate.
+    ///
+    /// This is the specialization key `FunctionDesc.cachedgraph(key)`
+    /// indexes by; [`Self::name_path`] is the desc's name.
+    pub fn instantiation(&self) -> Option<&Value> {
+        self.name.iter().rev().find_map(|seg| match seg {
+            NameSeg::Other(v) => instantiated_args(v),
+            NameSeg::Ident { .. } => None,
+        })
+    }
+}
+
+/// The `skip_binder` generic arguments of a `PathElem::Instantiated`
+/// segment, spelled `{"Instantiated": {"params": .., "skip_binder": ..}}`.
+fn instantiated_args(seg: &Value) -> Option<&Value> {
+    seg.as_object()?.get("Instantiated")?.get("skip_binder")
 }
 
 /// Whether a struct-root leaf names a closure env — the bare `closure`
@@ -1294,6 +1331,47 @@ pub enum CallClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn item_meta(name: Value) -> ItemMeta {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "span": {"Deduplicated": 0},
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        }))
+        .unwrap()
+    }
+
+    /// A monomorphized copy keeps its generic item's path; its arguments
+    /// come from `instantiation`.
+    #[test]
+    fn instantiated_segment_is_left_out_of_the_template_path() {
+        let args = serde_json::json!({
+            "regions": [], "types": [{"Deduplicated": 3}],
+            "const_generics": [], "trait_refs": []
+        });
+        let mono = item_meta(serde_json::json!([
+            {"Ident": ["core", 0]},
+            {"Ident": ["ptr", 0]},
+            {"Ident": ["null", 0]},
+            {"Instantiated": {"params": {}, "skip_binder": args.clone(), "kind": "Other"}}
+        ]));
+        assert_eq!(mono.name_path(), "core::ptr::null");
+        assert_eq!(mono.instantiation(), Some(&args));
+        assert!(matches!(
+            mono.template_name().last(),
+            Some(NameSeg::Ident { ident: (leaf, _) }) if leaf == "null"
+        ));
+
+        let generic = item_meta(serde_json::json!([
+            {"Ident": ["core", 0]},
+            {"Ident": ["ptr", 0]},
+            {"Ident": ["null", 0]}
+        ]));
+        assert_eq!(generic.name_path(), "core::ptr::null");
+        assert_eq!(generic.instantiation(), None);
+    }
 
     /// A positional field loses its `_N` spelling; a named `_0` keeps it.
     #[test]

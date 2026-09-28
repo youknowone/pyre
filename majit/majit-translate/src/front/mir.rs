@@ -1159,6 +1159,10 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         } else {
             format!("{module_path}::{name}")
         };
+        // A monomorphized copy registers under its instance leaf, as a
+        // clause-specialized copy does below; `fn_path` stays the template's
+        // for the policy and hint lookups every instance shares.
+        let name = instance_leaf(llbc, fd).unwrap_or(name);
         if not_rpython.contains(&fn_path) {
             continue;
         }
@@ -3174,6 +3178,34 @@ fn graph_has_builder_accumulator(llbc: &Llbc, u: &Unstructured, builder_mode: &[
 /// body — the whole-program loop, which needs the projection to decide
 /// whether the decl has one at all — passes it in here rather than paying
 /// the parse a second time.
+/// The name of `fd`'s graph: its template path, or for a monomorphized copy
+/// the name a clause-specialized copy of the same instance gets.
+///
+/// `FunctionDesc.cachedgraph` (`rpython/annotator/description.py`) names a
+/// specialized graph `"%s__%s" % (self.name, valid_identifier(nameof(key)))`.
+/// [`crate::front::clause_spec::spec_leaf`] is that spelling for a Charon
+/// instance key, and a Charon-monomorphized copy is the same instance, so it
+/// takes the same name and the passes that see through `__spec_` see
+/// through it too.  The copy's identity is its `FunDeclId`.
+pub(crate) fn graph_name_of(llbc: &Llbc, fd: &FunDecl) -> String {
+    match instance_leaf(llbc, fd) {
+        Some(leaf) => spec_segments(llbc, fd, &leaf).join("::"),
+        None => fd.item_meta.name_path(),
+    }
+}
+
+/// The leaf a Charon-monomorphized copy registers and is called under:
+/// [`crate::front::clause_spec::spec_leaf`] of its template leaf and its
+/// instance arguments.  `None` for an item Charon did not instantiate.
+fn instance_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
+    let args = fd.item_meta.instantiation()?;
+    let name = fd.item_meta.name_path();
+    let leaf = name.rsplit("::").next().unwrap_or(&name);
+    Some(crate::front::clause_spec::spec_leaf(
+        leaf, fd.def_id, args, llbc,
+    ))
+}
+
 fn lower_unstructured_with_static_addrs_and_attrs(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -3195,7 +3227,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     spec: Option<&std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
     spec_body: bool,
 ) -> Result<FunctionGraph, LowerError> {
-    let name = fd.item_meta.name_path();
+    let name = graph_name_of(llbc, fd);
     // The Result-of-PyError exception-link lowering's callee rule
     // applies when this body is a scoped callee (see
     // `front::result_exc`); the caller rule applies to the diamond
@@ -17832,6 +17864,11 @@ impl<'a> Lowering<'a> {
                 .llbc
                 .fn_by_id(*id)
                 .map(|fd| {
+                    // A Charon-monomorphized callee is its own instance; its
+                    // generics were substituted before the call was emitted.
+                    if let Some(leaf) = instance_leaf(self.llbc, fd) {
+                        return (spec_segments(self.llbc, fd, &leaf), None);
+                    }
                     if let Some(segments) = self.specialized_fun_segments(fd, reg) {
                         return (segments, None);
                     }
@@ -28040,6 +28077,9 @@ fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str) -> Vec<String> {
 /// method (`register_trait_method` / inherent registration). A trait-impl
 /// id is local to one LLBC and is not part of this key.
 fn registered_path_for_fun_decl(llbc: &Llbc, fd: &FunDecl) -> crate::parse::CallPath {
+    if let Some(leaf) = instance_leaf(llbc, fd) {
+        return crate::parse::CallPath::from_segments(spec_segments(llbc, fd, &leaf));
+    }
     if let Some((owner, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
         crate::parse::CallPath::for_impl_method(&owner, &leaf)
     } else {
@@ -30160,7 +30200,7 @@ fn type_node_is_owner_root(node: &serde_json::Value, llbc: &Llbc) -> bool {
 fn type_id_is_owner_root(id: u64, llbc: &Llbc) -> bool {
     llbc.type_by_id(id).is_some_and(|td| {
         // The leaf compare keeps the full path off every other ADT local.
-        matches!(td.item_meta.name.last(), Some(NameSeg::Ident { ident: (leaf, _) }) if leaf == "RBigIntGcRoot")
+        matches!(td.item_meta.template_name().last(), Some(NameSeg::Ident { ident: (leaf, _) }) if leaf == "RBigIntGcRoot")
             && owner_root_type_path(&td.item_meta.name_path())
     })
 }
@@ -31030,7 +31070,7 @@ fn trait_default_call_segments(
     if owner.is_empty() {
         return None;
     }
-    let leaf = match fd.item_meta.name.last()? {
+    let leaf = match fd.item_meta.template_name().last()? {
         NameSeg::Ident { ident: (s, _) } => s.clone(),
         _ => return None,
     };
