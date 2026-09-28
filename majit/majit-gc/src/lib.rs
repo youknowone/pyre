@@ -1,4 +1,5 @@
 pub use collector::HEAP_DUMP_EIO;
+pub use header::GcType;
 pub use gcreftracer::{GcTable, install_gc_table_walker};
 /// GC traits and interfaces for the JIT.
 ///

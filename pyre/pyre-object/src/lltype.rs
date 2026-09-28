@@ -39,35 +39,7 @@
 //!
 //! [`GcHeader`]: majit_gc::header::GcHeader
 
-/// Per-type GC metadata, mirroring the compile-time constants that
-/// RPython's `gct_fv_gc_malloc` (`framework.py`) closes over:
-///
-/// ```python
-/// type_id = self.get_type_id(TYPE)
-/// c_type_id = rmodel.inputconst(TYPE_ID, type_id)
-/// info = self.layoutbuilder.get_info(type_id)
-/// c_size = rmodel.inputconst(lltype.Signed, info.fixedsize)
-/// ```
-///
-/// In RPython these are inputconsts woven into the `direct_call` to
-/// the malloc helper. In Rust they're associated constants on the
-/// payload type, surfaced through [`malloc_typed`] so the future
-/// managed allocator can read them without a runtime dispatch.
-///
-/// `TYPE_ID` must match the id returned by `gc.register_type(...)`
-/// during JitDriver init (see `pyre/pyre-jit/src/eval.rs`); a
-/// `debug_assert_eq!` there guards against drift.
-pub trait GcType {
-    /// Backend-registered GC type id, equal to `c_type_id` in
-    /// `framework.py:809`.  Read at runtime so the value can be
-    /// assigned by the JIT driver after `gc.register_type(...)`
-    /// returns — auto-id mode delivers the result through this
-    /// accessor.  Explicit `type_id = N` cells return `N` unchanged.
-    fn type_id() -> u32;
-    /// Fixed payload size in bytes, equal to `info.fixedsize` in
-    /// `framework.py:811`.
-    const SIZE: usize;
-}
+pub use majit_gc::GcType;
 
 /// Process-wide cell that the JIT driver uses to deliver the actual
 /// GC tid to a `#[pyre_class]` type after registration.  Two modes:
