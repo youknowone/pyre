@@ -5269,27 +5269,11 @@ fn build_jit_driver_pair() -> JitDriverPair {
     jd2.portal_runner_adr = ll_generatorentry_portal_runner_shim as *const () as i64;
     jd2.handle_jitexc_from_bh = Some(generatorentry_portal_runner);
     d.meta_interp_mut().register_jitdriver_sd(jd2);
-    // `finish_setup` installs opcode ids and `all_liveness` before a trace
-    // clones `staticdata`. That install waits for the first trace
+    // `finish_setup` installs opcode ids, `all_liveness`, and the
+    // `OS_STR_CONCAT` callinfo before a trace clones `staticdata`. That
+    // install waits for the first trace
     // (`install_build_time_liveness_before_trace`). Doing it here decodes
     // `liveness.bin` on the cold portal tick `python -c ''` pays.
-    // `jtransform.py` `_handle_stroruni_call` / `_handle_oopspec_call`
-    // adds `OS_STR_CONCAT` to `callinfocollection`.  The walker records
-    // `jit_ll_strconcat` itself, so seed the same row for
-    // `resume.py concat_strings`.
-    {
-        let descr = majit_metainterp::make_call_descr_with_effect(
-            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
-            majit_ir::Type::Ref,
-            pyre_jit_trace::descr::ll_strconcat_effectinfo(),
-        );
-        d.meta_interp_mut().ensure_oopspec_callinfo(
-            majit_ir::OopSpecIndex::StrConcat,
-            descr,
-            pyre_object::lowlevel_string::jit_ll_strconcat as *const () as u64,
-            "jit_ll_strconcat",
-        );
-    }
     // rlib/jit.py set_user_param — the translation-time `--jit STR`
     // option's analog. `PYRE_JIT="vec_all=1"` opts vectorization in the
     // PyPy way (parameter; the defaults stay off). `PYRE_JIT=0` keeps its
@@ -8300,6 +8284,22 @@ fn install_build_time_liveness_before_trace(
     meta.install_liveness_from_build_parts(
         pyre_jit_trace::jitcode_runtime::insns_opname_to_byte(),
         pyre_jit_trace::jitcode_runtime::all_liveness(),
+    );
+    // `jtransform.py` `_handle_stroruni_call` / `_handle_oopspec_call`
+    // adds `OS_STR_CONCAT` to `callinfocollection`. The walker records
+    // `jit_ll_strconcat` itself, so seed the same row for
+    // `resume.py concat_strings`. `ensure_oopspec_callinfo` takes
+    // `Arc::get_mut` on `staticdata`, so this stays on the first trace.
+    let descr = majit_metainterp::make_call_descr_with_effect(
+        &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+        majit_ir::Type::Ref,
+        pyre_jit_trace::descr::ll_strconcat_effectinfo(),
+    );
+    meta.ensure_oopspec_callinfo(
+        majit_ir::OopSpecIndex::StrConcat,
+        descr,
+        pyre_object::lowlevel_string::jit_ll_strconcat as *const () as u64,
+        "jit_ll_strconcat",
     );
 }
 
