@@ -357,5 +357,17 @@ incremental = true
 # runs unoptimized.
 [profile.release.build-override]
 opt-level = 1
+
+# The translator crates that analysis spends its time in are built at full
+# optimisation even as build dependencies; a named package outranks
+# `build-override`. Measured on the pinned LLBC set: 7.52e11 -> 6.34e11
+# instructions retired for one prepass run.
+[profile.release.package.majit-translate]
+opt-level = 3
+[profile.release.package.majit-charon-reader]
+opt-level = 3
+[profile.release.package.serde_json]
+opt-level = 3
+
 [profile.dev.build-override]
 opt-level = 1
