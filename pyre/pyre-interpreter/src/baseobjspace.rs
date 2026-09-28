@@ -2695,7 +2695,7 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
     let index_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(index);
+    let index = pyre_object::gc_roots::pin_root(index);
     let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let is_bytes = pyre_object::bytesobject::is_bytes(obj);
     if is_slice(index) {
@@ -6676,7 +6676,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
         if is_module(obj) {
             let w_type = crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr());
             let w_type_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_type);
+            let w_type = pyre_object::gc_roots::pin_root(w_type);
             // module.py Module.descr_getattribute is the default module slot
             // inlined below.  A retagged module may replace that slot (for
             // example importlib.util._LazyModule), in which case space.getattr
@@ -6713,8 +6713,14 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             let w_descr = if w_type.is_null() {
                 None
             } else {
-                lookup_in_type_where(w_type, name)
+                lookup_in_type_where(pyre_object::gc_roots::shadow_stack_get(w_type_slot), name)
             };
+            // The receiver, its type and the descriptor are read back from
+            // their slots after each call below: a descriptor `__get__` and
+            // the dict lookup can both run Python.
+            let live = |slot: usize| pyre_object::gc_roots::shadow_stack_get(slot);
+            let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_descr.unwrap_or(PY_NULL));
             // module.py descr_getattribute runs the normal lookup, then catches
             // an AttributeError from it (objspace.py:694-699) and routes it to
             // the PEP 562 module `__getattr__`.  This inlined default slot must
@@ -6722,40 +6728,30 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             // AttributeError; the bare `object.__getattribute__` slot
             // (`!call_getattr`) still propagates so `module_getattribute`'s own
             // `try`/`except` performs the routing.
-            if let Some(descr) = w_descr
-                && is_data_descr(descr)
-            {
-                match get(descr, obj, w_type) {
+            if w_descr.is_some() && is_data_descr(live(descr_slot)) {
+                match get(live(descr_slot), live(obj_slot), live(w_type_slot)) {
                     Ok(Some(value)) => return Ok(value),
                     Ok(None) => {}
                     Err(e) if call_getattr && e.kind == PyErrorKind::AttributeError => {
-                        return module_getattr_fallback(obj, name, e, suppress);
+                        return module_getattr_fallback(live(obj_slot), name, e, suppress);
                     }
                     Err(e) => return Err(e),
                 }
             }
-            let w_dict = pyre_object::w_module_get_w_dict(obj);
+            let w_dict = pyre_object::w_module_get_w_dict(live(obj_slot));
             if !w_dict.is_null()
                 && let Some(value) = finditem_str(w_dict, name)?
                 && !value.is_null()
             {
                 return Ok(value);
             }
-            if let Some(descr) = w_descr {
-                let descr_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(descr);
-                match get(
-                    descr,
-                    obj,
-                    pyre_object::gc_roots::shadow_stack_get(w_type_slot),
-                ) {
+            if w_descr.is_some() {
+                match get(live(descr_slot), live(obj_slot), live(w_type_slot)) {
                     Ok(value) => {
-                        return Ok(
-                            value.unwrap_or(pyre_object::gc_roots::shadow_stack_get(descr_slot))
-                        );
+                        return Ok(value.unwrap_or(live(descr_slot)));
                     }
                     Err(e) if call_getattr && e.kind == PyErrorKind::AttributeError => {
-                        return module_getattr_fallback(obj, name, e, suppress);
+                        return module_getattr_fallback(live(obj_slot), name, e, suppress);
                     }
                     Err(e) => return Err(e),
                 }
@@ -6794,7 +6790,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
         };
         if let Some(w_type) = instance_like_type {
             let w_type_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_type);
+            let w_type = pyre_object::gc_roots::pin_root(w_type);
             // `pypy/objspace/descroperation.py descr__getattribute__`
             // dispatches through the receiver type's `__getattribute__`
             // slot before running the default descriptor protocol
@@ -6883,7 +6879,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
             let w_type_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_type);
+            let w_type = pyre_object::gc_roots::pin_root(w_type);
 
             // Step 1: look up in type MRO
             let w_descr = lookup_in_type_where(w_type, name);
@@ -6933,7 +6929,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             // AttributeError falls back to `__getattr__` too.
             if let Some(descr) = w_descr {
                 let descr_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(descr);
+                let descr = pyre_object::gc_roots::pin_root(descr);
                 match get(descr, obj, w_type) {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
@@ -9242,7 +9238,7 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
             // singleton; `get` materialises `w_None` for custom `__get__`.
             if let Some(value) = lookup_in_type_where(obj, name) {
                 let value_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(value);
+                let value = pyre_object::gc_roots::pin_root(value);
                 match get(value, PY_NULL, obj) {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => return Ok(pyre_object::gc_roots::shadow_stack_get(value_slot)),
@@ -9265,7 +9261,7 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                     && let Some(value) = lookup_in_type_where(w_metaclass, name)
                 {
                     let value_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(value);
+                    let value = pyre_object::gc_roots::pin_root(value);
                     match get(value, obj, w_metaclass) {
                         Ok(Some(result)) => return Ok(result),
                         Ok(None) => return Ok(pyre_object::gc_roots::shadow_stack_get(value_slot)),
@@ -9369,7 +9365,7 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                     return Ok(pyre_object::w_method_new(descr, obj, w_type.as_ptr()));
                 }
                 let descr_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(descr);
+                let descr = pyre_object::gc_roots::pin_root(descr);
                 match get(descr, obj, w_type.as_ptr()) {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
@@ -9418,7 +9414,7 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             if let Some(method) = w_descr {
                 let method_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(method);
+                let method = pyre_object::gc_roots::pin_root(method);
                 match unsafe { get(method, obj, w_type.as_ptr()) } {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
@@ -9466,7 +9462,7 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                 return Ok(pyre_object::w_method_new(method, obj, w_type.as_ptr()));
             }
             let method_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(method);
+            let method = pyre_object::gc_roots::pin_root(method);
             match unsafe { get(method, obj, w_type.as_ptr()) } {
                 Ok(Some(result)) => return Ok(result),
                 Ok(None) => {}
@@ -9751,7 +9747,7 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
             return Ok(pyre_object::w_method_new(method, obj, w_class));
         }
         let method_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(method);
+        let method = pyre_object::gc_roots::pin_root(method);
         if let Some(result) = unsafe { get(method, obj, w_class)? } {
             return Ok(result);
         }

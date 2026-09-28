@@ -494,8 +494,9 @@ pub unsafe fn w_gc_weakref_box_clear(obj: PyObjectRef) {
 /// production paths get real weak semantics.
 ///
 /// Pair with `w_gc_weakref_box_or_strong_deref` on the reader side.
-pub fn w_gc_weakref_box_new_or_strong(target: PyObjectRef) -> PyObjectRef {
-    let wrapped = w_gc_weakref_box_new(target);
+pub fn w_gc_weakref_box_new_or_strong(mut target: PyObjectRef) -> PyObjectRef {
+    // The inner weakref may be allocated before the box allocation fails.
+    let wrapped = crate::with_roots!(target => w_gc_weakref_box_new(target));
     if wrapped.is_null() { target } else { wrapped }
 }
 

@@ -7009,7 +7009,7 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
         let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         let dict = pyre_object::interp_exceptions::w_exception_getdict(exc);
         let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = _roots.pin_root(dict);
+        let dict = _roots.pin_root(dict);
         let notes = match w_dict_getitem_str(dict, "__notes__") {
             Some(notes) if crate::baseobjspace::isinstance_list_w(notes) => notes,
             Some(_) => {
@@ -7048,10 +7048,7 @@ pub fn dict_init_or_update(
     // Keep the flat Rust ABI's equivalent slots live before inspecting the
     // trailing kwargs vehicle or passing an operand to `update1`.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::shadow_stack_len();
-    for &arg in args {
-        let _ = pyre_object::gc_roots::pin_root(arg);
-    }
+    let root_base = pyre_object::gc_roots::pin_roots(args);
     let rooted_args = (0..args.len())
         .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + i))
         .collect::<Vec<_>>();
@@ -7082,13 +7079,23 @@ pub fn dict_init_or_update(
     if kwargs_dict.is_some() {
         let kwargs = pyre_object::gc_roots::shadow_stack_get(root_base + args.len() - 1);
         unsafe {
-            for (k, v) in pyre_object::w_dict_items(kwargs) {
+            // Every pair stays rooted while an earlier store runs a key's
+            // `__hash__` / `__eq__`.
+            let items = pyre_object::w_dict_items(kwargs);
+            let flat: Vec<PyObjectRef> = items.iter().flat_map(|&(k, v)| [k, v]).collect();
+            let items_base = pyre_object::gc_roots::pin_roots(&flat);
+            for i in 0..items.len() {
+                let k = pyre_object::gc_roots::shadow_stack_get(items_base + 2 * i);
                 if pyre_object::is_str(k)
                     && pyre_object::w_str_get_wtf8(k).as_str() == Ok("__pyre_kw__")
                 {
                     continue;
                 }
-                dict_store_checked(pyre_object::gc_roots::shadow_stack_get(backing_slot), k, v)?;
+                dict_store_checked(
+                    pyre_object::gc_roots::shadow_stack_get(backing_slot),
+                    k,
+                    pyre_object::gc_roots::shadow_stack_get(items_base + 2 * i + 1),
+                )?;
             }
         }
     }

@@ -45,7 +45,9 @@ struct XmlPos {
 }
 
 struct MiniXmlParser<'a> {
-    parser: PyObjectRef,
+    /// The root-stack slot the caller pinned the parser object in: every
+    /// handler call can collect, so the object is read back from it.
+    parser_slot: usize,
     input: &'a str,
     isfinal: bool,
     suppress_until: usize,
@@ -81,9 +83,13 @@ impl<'p, 'a> HandlerArgs<'p, 'a> {
 }
 
 impl<'a> MiniXmlParser<'a> {
-    fn new(parser: PyObjectRef, input: &'a str, isfinal: bool, suppress_until: usize) -> Self {
+    fn parser(&self) -> PyObjectRef {
+        pyre_object::gc_roots::shadow_stack_get(self.parser_slot)
+    }
+
+    fn new(parser_slot: usize, input: &'a str, isfinal: bool, suppress_until: usize) -> Self {
         Self {
-            parser,
+            parser_slot,
             input,
             isfinal,
             suppress_until,
@@ -295,7 +301,7 @@ impl<'a> MiniXmlParser<'a> {
         let standalone = roots.get(base + 1);
         if unsafe { is_int(standalone) && w_int_get_value(standalone) == 0 } {
             pyre_interpreter::baseobjspace::setdictvalue_native(
-                self.parser,
+                self.parser(),
                 "_pyre_not_standalone_pending",
                 w_bool_from(true),
             );
@@ -395,13 +401,16 @@ impl<'a> MiniXmlParser<'a> {
             roots.set(base, w_str_new_managed(&self.read_quoted()?));
         }
         self.skip_ws();
-        if pyre_interpreter::baseobjspace::getattr_str(self.parser, "_pyre_not_standalone_pending")
-            .map(is_true_obj)
-            .unwrap_or(false)
+        if pyre_interpreter::baseobjspace::getattr_str(
+            self.parser(),
+            "_pyre_not_standalone_pending",
+        )
+        .map(is_true_obj)
+        .unwrap_or(false)
         {
             self.call_not_standalone()?;
             pyre_interpreter::baseobjspace::setdictvalue_native(
-                self.parser,
+                self.parser(),
                 "_pyre_not_standalone_pending",
                 w_bool_from(false),
             );
@@ -808,7 +817,7 @@ impl<'a> MiniXmlParser<'a> {
 
     fn convert_attributes(&self, attrs: &[(String, String)]) -> PyObjectRef {
         let ordered =
-            pyre_interpreter::baseobjspace::getattr_str(self.parser, "ordered_attributes")
+            pyre_interpreter::baseobjspace::getattr_str(self.parser(), "ordered_attributes")
                 .map(is_true_obj)
                 .unwrap_or(false);
         // Both arms convert one attribute at a time and hold what they have
@@ -850,11 +859,11 @@ impl<'a> MiniXmlParser<'a> {
     }
 
     fn emit_character_data(&mut self, text: &str) -> Result<(), pyre_interpreter::PyError> {
-        let buffering = pyre_interpreter::baseobjspace::getattr_str(self.parser, "buffer_text")
+        let buffering = pyre_interpreter::baseobjspace::getattr_str(self.parser(), "buffer_text")
             .map(is_true_obj)
             .unwrap_or(false);
         if buffering {
-            let size = get_parser_int(self.parser, "buffer_size", 8192).max(1) as usize;
+            let size = get_parser_int(self.parser(), "buffer_size", 8192).max(1) as usize;
             if self.char_buffer.len() + text.len() > size {
                 self.flush_character_buffer()?;
             }
@@ -863,7 +872,7 @@ impl<'a> MiniXmlParser<'a> {
             }
             self.char_buffer.push_str(text);
             pyre_interpreter::baseobjspace::setdictvalue_native(
-                self.parser,
+                self.parser(),
                 "buffer_used",
                 w_int_new(self.char_buffer.len() as i64),
             );
@@ -901,7 +910,7 @@ impl<'a> MiniXmlParser<'a> {
         }
         let text = std::mem::take(&mut self.char_buffer);
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            self.parser,
+            self.parser(),
             "buffer_used",
             w_int_new(0),
         );
@@ -956,7 +965,7 @@ impl<'a> MiniXmlParser<'a> {
         for &arg in args {
             let _ = roots.pin_root(arg);
         }
-        let Ok(handler) = pyre_interpreter::baseobjspace::getattr_str(self.parser, name) else {
+        let Ok(handler) = pyre_interpreter::baseobjspace::getattr_str(self.parser(), name) else {
             return Ok(());
         };
         if handler.is_null() || unsafe { is_none(handler) } {
@@ -972,7 +981,7 @@ impl<'a> MiniXmlParser<'a> {
             return Ok(());
         }
         let Ok(handler) =
-            pyre_interpreter::baseobjspace::getattr_str(self.parser, "NotStandaloneHandler")
+            pyre_interpreter::baseobjspace::getattr_str(self.parser(), "NotStandaloneHandler")
         else {
             return Ok(());
         };
@@ -989,7 +998,7 @@ impl<'a> MiniXmlParser<'a> {
     }
 
     fn handler_is_set(&self, name: &str) -> bool {
-        match pyre_interpreter::baseobjspace::getattr_str(self.parser, name) {
+        match pyre_interpreter::baseobjspace::getattr_str(self.parser(), name) {
             Ok(handler) => !(handler.is_null() || unsafe { is_none(handler) }),
             Err(_) => false,
         }
@@ -1002,25 +1011,27 @@ impl<'a> MiniXmlParser<'a> {
 
     fn publish_event_position(&mut self, pos: XmlPos) {
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            self.parser,
+            self.parser(),
             "CurrentLineNumber",
             w_int_new(pos.line as i64),
         );
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            self.parser,
+            self.parser(),
             "CurrentColumnNumber",
             w_int_new(pos.col as i64),
         );
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            self.parser,
+            self.parser(),
             "CurrentByteIndex",
             w_int_new(pos.index as i64),
         );
     }
 
     fn namespace_separator(&self) -> Option<String> {
-        match pyre_interpreter::baseobjspace::getattr_str(self.parser, "_pyre_namespace_separator")
-        {
+        match pyre_interpreter::baseobjspace::getattr_str(
+            self.parser(),
+            "_pyre_namespace_separator",
+        ) {
             Ok(obj) if unsafe { is_str(obj) } => pyre_interpreter::baseobjspace::str_utf8_w(obj)
                 .ok()
                 .map(str::to_string),
@@ -1029,7 +1040,7 @@ impl<'a> MiniXmlParser<'a> {
     }
 
     fn namespace_prefixes(&self) -> bool {
-        pyre_interpreter::baseobjspace::getattr_str(self.parser, "namespace_prefixes")
+        pyre_interpreter::baseobjspace::getattr_str(self.parser(), "namespace_prefixes")
             .map(is_true_obj)
             .unwrap_or(false)
     }
@@ -1198,7 +1209,7 @@ impl<'a> MiniXmlParser<'a> {
             return Ok(());
         }
         let Ok(handler) =
-            pyre_interpreter::baseobjspace::getattr_str(self.parser, "ExternalEntityRefHandler")
+            pyre_interpreter::baseobjspace::getattr_str(self.parser(), "ExternalEntityRefHandler")
         else {
             return Ok(());
         };
@@ -1212,7 +1223,7 @@ impl<'a> MiniXmlParser<'a> {
         // it is the parser's own attribute and stays reachable through it.
         let roots = pyre_object::gc_roots::push_roots();
         let handler = roots.pin_root(handler);
-        let base = pyre_interpreter::baseobjspace::getattr_str(self.parser, "_pyre_base")
+        let base = pyre_interpreter::baseobjspace::getattr_str(self.parser(), "_pyre_base")
             .unwrap_or_else(|_| w_none());
         let w_context = roots.pin_root(w_str_new_managed(context));
         let w_sysid = roots.pin_root(w_str_new_managed(sysid));
@@ -1234,17 +1245,17 @@ impl<'a> MiniXmlParser<'a> {
         mut pubid: PyObjectRef,
         mut sysid: PyObjectRef,
     ) -> Result<(), pyre_interpreter::PyError> {
-        let use_foreign = pyre_object::with_roots!(pubid, sysid => pyre_interpreter::baseobjspace::getattr_str(self.parser, "_pyre_use_foreign_dtd"))
+        let use_foreign = pyre_object::with_roots!(pubid, sysid => pyre_interpreter::baseobjspace::getattr_str(self.parser(), "_pyre_use_foreign_dtd"))
             .map(is_true_obj)
             .unwrap_or(false);
-        let parses_external_subset = pyre_object::with_roots!(pubid, sysid => get_parser_int(self.parser, "_pyre_param_entity_parsing", 0))
+        let parses_external_subset = pyre_object::with_roots!(pubid, sysid => get_parser_int(self.parser(), "_pyre_param_entity_parsing", 0))
             != 0;
         if (!use_foreign && (unsafe { is_none(sysid) } || !parses_external_subset))
             || self.suppress_current
         {
             return Ok(());
         }
-        let Ok(handler) = pyre_object::with_roots!(pubid, sysid => pyre_interpreter::baseobjspace::getattr_str(self.parser, "ExternalEntityRefHandler"))
+        let Ok(handler) = pyre_object::with_roots!(pubid, sysid => pyre_interpreter::baseobjspace::getattr_str(self.parser(), "ExternalEntityRefHandler"))
         else {
             return Ok(());
         };
@@ -1257,7 +1268,7 @@ impl<'a> MiniXmlParser<'a> {
         // there for the whole doctype.
         let roots = pyre_object::gc_roots::push_roots();
         let handler = roots.pin_root(handler);
-        let base = pyre_interpreter::baseobjspace::getattr_str(self.parser, "_pyre_base")
+        let base = pyre_interpreter::baseobjspace::getattr_str(self.parser(), "_pyre_base")
             .unwrap_or_else(|_| w_none());
         let ret = pyre_interpreter::call::call_function_impl_result(
             handler,
@@ -1275,7 +1286,8 @@ impl<'a> MiniXmlParser<'a> {
         let value_roots = pyre_object::gc_roots::push_roots();
         let value_slot = value_roots.base();
         let _ = value_roots.pin_root(w_str_new_managed(value));
-        let Ok(intern) = pyre_interpreter::baseobjspace::getattr_str(self.parser, "intern") else {
+        let Ok(intern) = pyre_interpreter::baseobjspace::getattr_str(self.parser(), "intern")
+        else {
             return value_roots.get(value_slot);
         };
         if unsafe { is_none(intern) } {
@@ -1306,22 +1318,22 @@ impl<'a> MiniXmlParser<'a> {
     fn make_error(&self, msg: &str) -> pyre_interpreter::PyError {
         let code = error_code_for_message(msg);
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            self.parser,
+            self.parser(),
             "ErrorLineNumber",
             w_int_new(self.pos.line as i64),
         );
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            self.parser,
+            self.parser(),
             "ErrorColumnNumber",
             w_int_new(self.pos.col as i64),
         );
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            self.parser,
+            self.parser(),
             "ErrorByteIndex",
             w_int_new(self.pos.index as i64),
         );
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            self.parser,
+            self.parser(),
             "ErrorCode",
             w_int_new(code),
         );
@@ -1335,17 +1347,17 @@ impl<'a> MiniXmlParser<'a> {
 
     fn update_position_slots(&self) {
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            self.parser,
+            self.parser(),
             "CurrentLineNumber",
             w_int_new(self.pos.line as i64),
         );
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            self.parser,
+            self.parser(),
             "CurrentColumnNumber",
             w_int_new(self.pos.col as i64),
         );
         pyre_interpreter::baseobjspace::setdictvalue_native(
-            self.parser,
+            self.parser(),
             "CurrentByteIndex",
             w_int_new(self.pos.index as i64),
         );
@@ -1639,13 +1651,7 @@ fn parse_impl(
         call_foreign_dtd_handler(roots.get(base + 1), w_none(), w_none())?;
     }
     let suppress_until = get_emit_upto(roots.get(base + 1));
-    let parsed = MiniXmlParser::new(
-        roots.get(base + 1),
-        &parse_input,
-        final_flag,
-        suppress_until,
-    )
-    .parse()?;
+    let parsed = MiniXmlParser::new(base + 1, &parse_input, final_flag, suppress_until).parse()?;
     if final_flag {
         pyre_interpreter::baseobjspace::setdictvalue_native(
             roots.get(base + 1),

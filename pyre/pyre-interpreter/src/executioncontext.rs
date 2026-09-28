@@ -1795,7 +1795,7 @@ impl ExecutionContext {
             let w_arg_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_arg);
             let space_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(space);
+            space = pyre_object::gc_roots::pin_root(space);
             // `executioncontext.py _trace` exception-event branch:
             //   if operr is not None:
             //       w_value = operr.normalize_exception(space)

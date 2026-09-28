@@ -1247,7 +1247,7 @@ impl PyError {
         // allocates.
         let _roots = pyre_object::gc_roots::push_roots();
         let key_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(key);
+        let key = pyre_object::gc_roots::pin_root(key);
         let message = if key.is_null() {
             Wtf8Buf::from_string("<null>".to_string())
         } else {

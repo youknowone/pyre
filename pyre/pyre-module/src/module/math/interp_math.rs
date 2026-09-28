@@ -1337,28 +1337,40 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
     // arrives upstream as an already-wrapped float, so converting it can
     // neither raise nor reach `__float__`; `None` stands in for that here and
     // `pymath` supplies the same defaults.
+    // `b` and the keywords are read back after `a`'s `__float__` ran.
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-    let a = try_get_double(pos[0]);
-    let w = roots.get(base);
+    let base = roots.pin_roots(&[pos[0], pos[1], kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let a = try_get_double(roots.get(base));
+    let w_b = roots.get(base + 1);
+    let w = roots.get(base + 2);
     let kwargs = if w.is_null() { None } else { Some(w) };
     drop(roots);
     let a = a?;
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-    let b = try_get_double(pos[1]);
-    let w = roots.get(base);
+    let base = roots.pin_roots(&[w_b, kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let b = try_get_double(roots.get(base));
+    let w = roots.get(base + 1);
     let kwargs = if w.is_null() { None } else { Some(w) };
     drop(roots);
     let b = b?;
-    let read = |name: &str| -> Result<Option<f64>, pyre_interpreter::PyError> {
+    let read = |kwargs: Option<PyObjectRef>,
+                name: &str|
+     -> Result<Option<f64>, pyre_interpreter::PyError> {
         match pyre_interpreter::builtins::kwarg_get(kwargs, name) {
             Some(v) => Ok(Some(try_get_double(v)?)),
             None => Ok(None),
         }
     };
-    let rel_tol = read("rel_tol")?;
-    let abs_tol = read("abs_tol")?;
+    // `abs_tol` is looked up after `rel_tol`'s `__float__` ran.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let w = roots.get(base);
+    let rel_tol = read(if w.is_null() { None } else { Some(w) }, "rel_tol");
+    let w = roots.get(base);
+    let kwargs = if w.is_null() { None } else { Some(w) };
+    drop(roots);
+    let rel_tol = rel_tol?;
+    let abs_tol = read(kwargs, "abs_tol")?;
     // `isclose` — the sanity check on the tolerances runs
     // after those conversions and before the comparison, and names them.
     // `pymath` reports the same rejection as EDOM, which `map_int_err`

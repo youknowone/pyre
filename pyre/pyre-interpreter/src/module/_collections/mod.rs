@@ -694,7 +694,7 @@ fn append_right(self_obj: PyObjectRef, item: PyObjectRef) {
     let mut ri = W_Deque::from_obj(self_obj).expect("deque").rightindex + 1;
     if ri >= BLOCKLEN {
         let old_right = W_Deque::from_obj(self_obj).expect("deque").rightblock;
-        let _ = pyre_object::gc_roots::pin_root(old_right);
+        let old_right = pyre_object::gc_roots::pin_root(old_right);
         let new_right = deque_block::new(old_right, PY_NULL);
         self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
         let old_right = pyre_object::gc_roots::shadow_stack_get(root_base + 2);
@@ -728,7 +728,7 @@ fn append_left(self_obj: PyObjectRef, item: PyObjectRef) {
     let mut li = W_Deque::from_obj(self_obj).expect("deque").leftindex - 1;
     if li < 0 {
         let old_left = W_Deque::from_obj(self_obj).expect("deque").leftblock;
-        let _ = pyre_object::gc_roots::pin_root(old_left);
+        let old_left = pyre_object::gc_roots::pin_root(old_left);
         let new_left = deque_block::new(PY_NULL, old_left);
         self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
         let old_left = pyre_object::gc_roots::shadow_stack_get(root_base + 2);
@@ -1319,10 +1319,19 @@ impl W_Deque {
         stop: Option<PyObjectRef>,
     ) -> Result<i64, crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
-        let items = snapshot(self_obj);
+        // Everything live is published before `snapshot`: taking the deque
+        // lock may block, and a blocked thread is a safepoint.
         let _roots = pyre_object::gc_roots::push_roots();
-        let (own_base, x_slot, items_base) =
-            publish_needle_and_snapshot(&[self_obj, PY_NULL], x, &items);
+        let own_base = pyre_object::gc_roots::pin_roots(&[
+            self_obj,
+            PY_NULL,
+            start.unwrap_or(PY_NULL),
+            stop.unwrap_or(PY_NULL),
+            x,
+        ]);
+        let x_slot = own_base + 4;
+        let items = snapshot(pyre_object::gc_roots::shadow_stack_get(own_base));
+        let items_base = pyre_object::gc_roots::pin_roots(&items);
         let len = items.len() as i64;
         // `space.iter(self)` takes the lock before `unwrap_start_stop`,
         // so a `__index__` on start/stop that mutates the deque is caught
@@ -1330,17 +1339,20 @@ impl W_Deque {
         let lock = getlock(pyre_object::gc_roots::shadow_stack_get(own_base));
         pyre_object::gc_roots::shadow_stack_set(own_base + 1, lock);
         let clamp = |i: i64| if i < 0 { (i + len).max(0) } else { i.min(len) };
-        let start = clamp(
-            start
-                .map(crate::builtins::getindex_w)
-                .transpose()?
-                .unwrap_or(0),
-        );
-        let stop = clamp(
-            stop.map(crate::builtins::getindex_w)
-                .transpose()?
-                .unwrap_or(len),
-        );
+        // `start` and `stop` are read back from their slots: `getindex_w`
+        // on the first may run `__index__` and collect.
+        let start = clamp(match start {
+            Some(_) => {
+                crate::builtins::getindex_w(pyre_object::gc_roots::shadow_stack_get(own_base + 2))?
+            }
+            None => 0,
+        });
+        let stop = clamp(match stop {
+            Some(_) => {
+                crate::builtins::getindex_w(pyre_object::gc_roots::shadow_stack_get(own_base + 3))?
+            }
+            None => len,
+        });
         let upper = stop.min(len);
         let mut i = 0i64;
         while i < upper {

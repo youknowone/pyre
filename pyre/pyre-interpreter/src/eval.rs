@@ -2606,12 +2606,12 @@ pub(crate) fn eval_frame_plain_with_resume(
         let return_trace_result = {
             let roots = pyre_object::gc_roots::push_roots();
             let exit_slot = roots.base();
-            let _ = roots.pin_root(w_exitvalue);
+            let exit = roots.pin_root(w_exitvalue);
             let err_slot = match &inner_result {
                 Err(err) => err.pin_exc_object(&roots),
                 Ok(_) => None,
             };
-            let result = execution_context.return_trace(frame_anchor.live(), w_exitvalue);
+            let result = execution_context.return_trace(frame_anchor.live(), exit);
             w_exitvalue = roots.get(exit_slot);
             if let Err(err) = &mut inner_result {
                 err.reload_exc_object(&roots, err_slot);

@@ -448,9 +448,10 @@ pub(crate) fn show_warning(
         }
         let cls = warnings_attr("WarningMessage")
             .ok_or_else(|| PyError::runtime_error("unable to get warnings.WarningMessage"))?;
+        let cls_slot = pin_root_slot(cls);
         let lineno_slot = pin_root_slot(w_int_new(lineno));
         let warning_message = crate::call::call_function_impl_result(
-            cls,
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
             &[
                 pyre_object::gc_roots::shadow_stack_get(message_slot),
                 pyre_object::gc_roots::shadow_stack_get(category_slot),
