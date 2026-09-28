@@ -749,7 +749,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
             })
             .unwrap_or_else(|| panic!("missing typed rbigint graph {owner:?}::{name}"));
         function
-            .graph
+            .graph()
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
@@ -813,7 +813,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
         })
         .expect("rbigint::RBigInt::digit graph");
     assert!(
-        digit_graph.graph.blocks.iter().any(|block| {
+        digit_graph.graph().blocks.iter().any(|block| {
             block.operations.iter().any(|operation| {
                 matches!(
                     &operation.kind,
@@ -824,7 +824,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
         "RBigInt::digit must project the upstream _digits field directly"
     );
     assert!(
-        !digit_graph.graph.blocks.iter().any(|block| {
+        !digit_graph.graph().blocks.iter().any(|block| {
             block
                 .operations
                 .iter()
@@ -876,7 +876,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
             .unwrap_or_else(|| panic!("missing rbigint::RBigInt::{name} graph"));
         assert!(
             !function
-                .graph
+                .graph()
                 .blocks
                 .iter()
                 .flat_map(|block| &block.operations)
@@ -913,7 +913,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
         assert!(
             candidates.iter().all(|function| {
                 function
-                    .graph
+                    .graph()
                     .blocks
                     .iter()
                     .flat_map(|block| &block.operations)
@@ -943,7 +943,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
         .copied()
         .find(|function| {
             function
-                .graph
+                .graph()
                 .blocks
                 .iter()
                 .flat_map(|block| &block.operations)
@@ -959,7 +959,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
         })
         .expect("inherent rbigint::RBigInt::neg graph, distinct from the Neg trait adapter");
     let neg_calls: Vec<Vec<String>> = neg
-        .graph
+        .graph()
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
@@ -985,7 +985,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
         })
         .expect("functional::range_obj_to_bigint graph");
     let range_bigint_calls: Vec<_> = range_obj_to_bigint
-        .graph
+        .graph()
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
@@ -1011,7 +1011,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
     for function in &program.functions {
         assert!(
             !function
-                .graph
+                .graph()
                 .blocks
                 .iter()
                 .flat_map(|block| &block.operations)
@@ -1112,7 +1112,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
         .find(|function| function.name == "_x_divrem" && function.module_path == "rbigint")
         .expect("rbigint::_x_divrem wide-digit graph");
     let x_divrem_ops = x_divrem
-        .graph
+        .graph()
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
@@ -1154,7 +1154,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
         })
         .expect("fromint graph");
     let mut saw_mask = false;
-    for block in &fromint.graph.blocks {
+    for block in &fromint.graph().blocks {
         for operation in &block.operations {
             match &operation.kind {
                 OpKind::ConstInt(value) if *value == i64::MAX => {
@@ -1186,7 +1186,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
             function.name == "new" && function.self_ty_root.as_deref() == Some("rbigint::RBigInt")
         })
         .expect("new graph");
-    for block in &constructor.graph.blocks {
+    for block in &constructor.graph().blocks {
         for operation in &block.operations {
             if let OpKind::Call { target, .. } = &operation.kind {
                 assert_ne!(
@@ -1209,7 +1209,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
         })
         .expect("RBigInt::gt graph");
     assert!(
-        gt.graph
+        gt.graph()
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
@@ -1234,7 +1234,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
         .expect("RBigInt::is_zero graph");
     assert!(
         is_zero
-            .graph
+            .graph()
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
@@ -1259,7 +1259,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
             })
             .unwrap_or_else(|| panic!("missing rbigint::RBigInt::{name} graph"));
         for operation in function
-            .graph
+            .graph()
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
@@ -1457,7 +1457,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         .expect("descroperation::bigint_and graph");
 
     let calls: Vec<Vec<String>> = helper
-        .graph
+        .graph()
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
@@ -1474,7 +1474,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         })
         .collect();
     let call_targets: Vec<String> = helper
-        .graph
+        .graph()
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
@@ -1514,7 +1514,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
             })
             .unwrap_or_else(|| panic!("descroperation::{caller_name} graph"));
         let calls: Vec<Vec<String>> = caller
-            .graph
+            .graph()
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
@@ -1563,7 +1563,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         })
         .expect("descroperation::long_int_compare graph");
     let mixed_compare_calls: Vec<Vec<String>> = mixed_compare
-        .graph
+        .graph()
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
@@ -1612,7 +1612,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         })
         .expect("descroperation::long_pow graph");
     let pow_calls: Vec<Vec<String>> = long_pow
-        .graph
+        .graph()
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
@@ -1674,7 +1674,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         })
         .expect("descroperation::long_add graph");
     let add_calls: Vec<Vec<String>> = long_add
-        .graph
+        .graph()
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
@@ -1717,7 +1717,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
             .unwrap_or_else(|| panic!("{module_suffix}::{caller_name} graph"));
         assert!(
             !caller
-                .graph
+                .graph()
                 .blocks
                 .iter()
                 .flat_map(|block| &block.operations)
@@ -1742,7 +1742,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         })
         .expect("descroperation::long_lshift graph");
     let lshift_calls: Vec<Vec<String>> = long_lshift
-        .graph
+        .graph()
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
@@ -1780,7 +1780,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         })
         .expect("descroperation::int_lshift graph");
     let int_lshift_calls: Vec<Vec<String>> = int_lshift
-        .graph
+        .graph()
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
@@ -1820,7 +1820,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
             })
             .unwrap_or_else(|| panic!("descroperation::{caller_name} graph"));
         let calls: Vec<Vec<String>> = caller
-            .graph
+            .graph()
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
@@ -1863,7 +1863,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
             })
             .unwrap_or_else(|| panic!("descroperation::{caller_name} graph"));
         let calls: Vec<Vec<String>> = caller
-            .graph
+            .graph()
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
@@ -1899,7 +1899,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
             })
             .unwrap_or_else(|| panic!("descroperation::{caller_name} graph"));
         let calls: Vec<Vec<String>> = caller
-            .graph
+            .graph()
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
@@ -1954,7 +1954,7 @@ fn rbigint_add_residual_calls_the_rbigint_add_body_once() {
     ];
     let mut add_residual_calls = 0;
     let mut calls = Vec::new();
-    for block in &wrapper.graph.blocks {
+    for block in &wrapper.graph().blocks {
         for operation in &block.operations {
             let OpKind::Call { target, .. } = &operation.kind else {
                 continue;
@@ -1993,7 +1993,7 @@ fn rbigint_add_residual_calls_the_rbigint_add_body_once() {
         .find(|function| function.name == "w_long_from_i64" && function.module_path == "longobject")
         .expect("longobject::w_long_from_i64 graph");
     let constructor_residuals = constructor_caller
-        .graph
+        .graph()
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
@@ -2062,7 +2062,7 @@ fn rbigint_add_residual_calls_the_rbigint_add_body_once() {
         .expect("longobject::box_bigint_constant graph");
     assert!(
         clone_caller
-            .graph
+            .graph()
             .blocks
             .iter()
             .flat_map(|block| &block.operations)

@@ -46,7 +46,7 @@ pub type LoweringAbort = FlowingError;
 #[derive(Debug, Clone)]
 pub struct SemanticFunction {
     pub name: String,
-    pub graph: FunctionGraph,
+    pub(in crate::front) graph: FunctionGraph,
     /// RPython: `op.result.concretetype` — full return type string.
     /// Used for array identity resolution on Call result values.
     pub return_type: Option<String>,
@@ -111,6 +111,17 @@ pub struct SemanticFunction {
     /// `return_type` marker so the residual prefill projects a `Ref`
     /// result.
     pub returns_objectptr: bool,
+}
+
+impl SemanticFunction {
+    /// The function's flow graph (`description.py FunctionDesc.getuniquegraph`).
+    pub fn graph(&self) -> &FunctionGraph {
+        &self.graph
+    }
+
+    pub fn graph_mut(&mut self) -> &mut FunctionGraph {
+        &mut self.graph
+    }
 }
 
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.

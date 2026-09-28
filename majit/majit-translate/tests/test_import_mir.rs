@@ -43,7 +43,7 @@ fn dunder_import_lowers_rust_string_find_and_slices_to_rpython_ops() {
     );
 
     let ops = function
-        .graph
+        .graph()
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
@@ -91,7 +91,7 @@ fn tuple_len_reads_the_fixed_list_not_the_items_block() {
         .find(|f| f.name == "w_tuple_len")
         .expect("w_tuple_len graph");
     let ops = function
-        .graph
+        .graph()
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
@@ -138,7 +138,7 @@ fn list_items_capacity_stays_on_the_items_block() {
         .find(|f| f.name == "ll_list_obj_capacity")
         .expect("ll_list_obj_capacity graph");
     let ops = function
-        .graph
+        .graph()
         .blocks
         .iter()
         .flat_map(|block| &block.operations)

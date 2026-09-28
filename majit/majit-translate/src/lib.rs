@@ -419,7 +419,7 @@ fn merge_hints_from_map(
             // BFS reads `_jit_*_` off `FunctionGraph.hints`. Stamping
             // the harvested bag here means the first
             // `register_function_graph` already carries `unroll_safe`.
-            front::llbc_hints::merge_hints_into_graph(&mut f.graph, h);
+            front::llbc_hints::merge_hints_into_graph(f.graph_mut(), h);
             // A `dont_look_inside` callee returning `*mut PyObject`
             // (`SemanticFunction::returns_objectptr`, set structurally by
             // `front::mir::output_type_is_objectptr`) residualizes as an
@@ -1184,12 +1184,12 @@ fn analyze_pipeline_from_module_paths(
             program
                 .functions
                 .iter()
-                .map(|f| f.graph.blocks.len())
+                .map(|f| f.graph().blocks.len())
                 .sum::<usize>(),
             program
                 .functions
                 .iter()
-                .flat_map(|f| f.graph.blocks.iter())
+                .flat_map(|f| f.graph().blocks.iter())
                 .map(|b| b.operations.len())
                 .sum::<usize>(),
             program.struct_fields.fields.len(),
@@ -1330,7 +1330,7 @@ fn analyze_pipeline_from_module_paths(
                     owner.clone(),
                     func.return_type.clone(),
                     func.hints.clone(),
-                    func.graph.clone(),
+                    func.graph().clone(),
                 ));
                 let types = trait_concrete_impl_types
                     .entry(trait_leaf.as_str())
@@ -1346,7 +1346,7 @@ fn analyze_pipeline_from_module_paths(
                     for_type: owner.clone(),
                     self_ty_root: Some(owner.clone()),
                     name: func.name.clone(),
-                    graph: func.graph.clone(),
+                    graph: func.graph().clone(),
                     return_type: func.return_type.clone(),
                     hints: func.hints.clone(),
                 });
@@ -1362,7 +1362,7 @@ fn analyze_pipeline_from_module_paths(
                     self_ty_root: None,
                     methods: vec![MethodInfo {
                         name: func.name.clone(),
-                        graph: Some(func.graph.clone()),
+                        graph: Some(func.graph().clone()),
                         return_type: func.return_type.clone(),
                         hints: func.hints.clone(),
                     }],
@@ -1374,7 +1374,7 @@ fn analyze_pipeline_from_module_paths(
                     for_type: owner.clone(),
                     self_ty_root: Some(owner.clone()),
                     name: func.name.clone(),
-                    graph: func.graph.clone(),
+                    graph: func.graph().clone(),
                     return_type: func.return_type.clone(),
                     hints: func.hints.clone(),
                 });
@@ -1399,8 +1399,8 @@ fn analyze_pipeline_from_module_paths(
             // directly off the callee graph (RPython
             // `funcptr._obj.TO.RESULT`).
             let mut graph = match &func.return_type {
-                Some(rt) => func.graph.clone().with_return_type(rt),
-                None => func.graph.clone(),
+                Some(rt) => func.graph().clone().with_return_type(rt),
+                None => func.graph().clone(),
             };
             crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &func.hints);
             let graph = std::rc::Rc::new(graph);
@@ -1711,8 +1711,8 @@ fn analyze_pipeline_from_module_paths(
         };
         let path = crate::parse::CallPath::for_trait_impl_method(owner, impl_id, &func.name);
         let graph = match &func.return_type {
-            Some(return_type) => func.graph.clone().with_return_type(return_type),
-            None => func.graph.clone(),
+            Some(return_type) => func.graph().clone().with_return_type(return_type),
+            None => func.graph().clone(),
         };
         if func.hints.is_empty() {
             call_control.register_function_graph(path, graph);
@@ -1899,7 +1899,7 @@ fn analyze_pipeline_from_module_paths(
                             mir_graph_lookup
                                 .lookup_impl_method(impl_type, &method.name)
                                 .cloned()
-                                .or_else(|| Some(override_info.graph.clone())),
+                                .or_else(|| Some(override_info.graph().clone())),
                             override_info.return_type.as_ref(),
                         ),
                         None => (

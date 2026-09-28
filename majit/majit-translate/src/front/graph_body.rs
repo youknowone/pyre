@@ -379,7 +379,7 @@ mod tests {
             if got.name != f.name {
                 continue;
             }
-            assert_eq!(shape(&got.graph), shape(&f.graph), "{name_path}");
+            assert_eq!(shape(got.graph()), shape(f.graph()), "{name_path}");
             compared += 1;
         }
         assert!(compared > 0, "corpus fixture lowered no bodies at all");

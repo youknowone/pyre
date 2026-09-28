@@ -1882,7 +1882,7 @@ fn register_synthetic_positional_metadata(
     let mut shapes = std::collections::BTreeSet::new();
     for function in functions {
         for op in function
-            .graph
+            .graph()
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
@@ -60646,7 +60646,7 @@ mod tests {
                 .iter()
                 .find(|function| function.name == name)
                 .unwrap_or_else(|| panic!("missing semantic function {name}"))
-                .graph;
+                .graph();
             assert!(
                 !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
                     matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
@@ -62126,7 +62126,7 @@ mod tests {
         let tuple_owner = program
             .functions
             .iter()
-            .flat_map(|function| &function.graph.blocks)
+            .flat_map(|function| &function.graph().blocks)
             .flat_map(|block| &block.operations)
             .find_map(|op| match &op.kind {
                 OpKind::Call {

@@ -4989,7 +4989,7 @@ mod tests {
             .find(|function| function.name == "memoryview_is_native_release_descr")
             .expect("memoryview caller graph");
         let written = target
-            .graph
+            .graph()
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
@@ -5004,7 +5004,7 @@ mod tests {
             .expect("memoryview closure Args tuple payload write");
         assert!(
             target
-                .graph
+                .graph()
                 .blocks
                 .iter()
                 .flat_map(|block| &block.operations)
