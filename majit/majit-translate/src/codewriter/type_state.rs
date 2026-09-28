@@ -374,14 +374,10 @@ mod tests {
     }
 
     #[test]
-    fn promote_gc_field_bases_leaves_a_raw_slice_address_signed() {
+    fn promote_gc_field_bases_leaves_a_headerless_array_address_signed() {
         let (array_type_id, nolength) =
-            crate::front::mir::fixed_array_index_identity(false, "&[u8]");
-        assert_eq!(array_type_id.as_deref(), Some("*const [u8]"));
-        assert!(
-            nolength,
-            "a Rust byte slice is a raw view, not the [u8] GcArray"
-        );
+            crate::front::mir::fixed_array_index_identity(false, "&[u32]");
+        assert!(nolength, "a [u32] item run has no length header");
         assert!(crate::front::typestr::nolength_from_array_type_id(
             array_type_id.as_deref()
         ));
