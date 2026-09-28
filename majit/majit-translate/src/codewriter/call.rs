@@ -1054,8 +1054,12 @@ impl FuncObjDeclarations {
         self.0.borrow_mut().push(declared);
     }
 
-    fn get(&self, index: usize) -> Option<DeclaredFuncObj> {
+    pub(crate) fn get(&self, index: usize) -> Option<DeclaredFuncObj> {
         self.0.borrow().get(index).cloned()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.borrow().len()
     }
 }
 

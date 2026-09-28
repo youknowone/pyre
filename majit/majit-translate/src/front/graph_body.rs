@@ -44,9 +44,6 @@ pub(crate) struct GraphBodySource {
 pub(crate) struct GraphBodyProvider {
     crates: Vec<Rc<ProvidedCrate>>,
     tables: Rc<ProviderTables>,
-    /// Where the funcobjs declared apart from a crate's program go: the
-    /// clause specializations.
-    declarations: FuncObjDeclarations,
 }
 
 /// What every crate's lowering reads besides its own artefact and state.
@@ -65,6 +62,11 @@ struct ProviderTables {
     /// The funcobj hint attributes harvested across the whole input; every
     /// crate's headers read them ([`CrateLoweringState`]).
     func_hints: HashMap<String, Vec<String>>,
+    /// Where the funcobjs declared apart from a crate's program go: the
+    /// clause specializations, each declared when the body whose call names
+    /// it is built (`specialize.py default_specialize` runs as the annotator
+    /// reaches the call).
+    declarations: FuncObjDeclarations,
 }
 
 /// One lowered crate: its artefact and the lowering state its decls were
@@ -156,11 +158,11 @@ impl GraphBodyProvider {
                 .map(OwnedScalarFieldStore::own)
                 .collect(),
             func_hints,
+            declarations,
         };
         Self {
             crates: Vec::new(),
             tables: Rc::new(tables),
-            declarations,
         }
     }
 
@@ -180,20 +182,20 @@ impl GraphBodyProvider {
             CrateLoweringState::new(&llbc, &paint_tombstones, self.tables.func_hints.clone());
         let krate = Rc::new(ProvidedCrate { llbc, state });
         let functions = self.declare_crate(&krate, module_filter.as_ref());
+        let first_spec = self.tables.declarations.len();
         // Every declared body is built here, in declaration order and
-        // before the clause specializations those bodies queue. A body that
-        // does not lower leaves its funcobj external.
+        // before the clause specializations those bodies declare. A body
+        // that does not lower leaves its funcobj external.
         for function in &functions {
             function.lazy_graph().get();
         }
-        // Then every clause specialization those bodies queue, in queue
-        // order; building one queues the specializations its copy binds.
-        while let Some(req) = krate.lowering(&self.tables, |lowering| lowering.pop_spec()) {
-            let Some(spec) = self.declare_spec(&krate, req) else {
-                continue;
-            };
+        // Then every clause specialization those bodies declared, in
+        // declaration order; building one declares the specializations its
+        // copy binds.
+        let mut next = first_spec;
+        while let Some(spec) = self.tables.declarations.get(next) {
             spec.graph.get();
-            self.declarations.push(spec);
+            next += 1;
         }
         let mut program = krate.state.finish(functions);
         mir::harden_duplicate_leaf_metadata(
@@ -204,26 +206,6 @@ impl GraphBodyProvider {
         );
         self.crates.push(krate);
         program
-    }
-
-    /// The funcobj of the clause specialization `req`, its graph unbuilt.
-    /// `None`, recorded, when its body does not substitute.
-    fn declare_spec(
-        &self,
-        krate: &Rc<ProvidedCrate>,
-        req: crate::front::clause_spec::SpecRequest,
-    ) -> Option<DeclaredFuncObj> {
-        krate.lowering(&self.tables, |lowering| {
-            let spec = lowering.declare_spec(req)?;
-            let stamp = spec.header.graph_stamp();
-            let declared = Rc::new(lowering.spec_header_graph(&spec));
-            let (krate, tables, body) = (krate.clone(), self.tables.clone(), spec.body.clone());
-            let graph = LazyGraph::deferred(declared.clone(), move || {
-                let graph = krate.lowering(&tables, |lowering| lowering.build_spec_body(&body))?;
-                Some(stamp_declared(&stamp, graph, &declared))
-            });
-            Some(spec.into_declared(graph))
-        })
     }
 
     /// A funcobj per declaration of `krate` the membership gates admit,
@@ -250,7 +232,9 @@ impl GraphBodyProvider {
                     let declared = Rc::new(declared);
                     let (krate, tables, def_id) = (krate.clone(), self.tables.clone(), fd.def_id);
                     let graph = LazyGraph::deferred(declared.clone(), move || {
-                        krate.build_decl_graph(&tables, def_id, &stamp, &declared)
+                        let graph = krate.build_decl_graph(&tables, def_id, &stamp, &declared);
+                        krate.declare_queued_specs(&tables);
+                        graph
                     });
                     Some(header.into_semantic(graph))
                 })
@@ -322,6 +306,37 @@ impl GraphBodyProvider {
 }
 
 impl ProvidedCrate {
+    /// Declare the clause specializations the bodies built so far queued,
+    /// in queue order.
+    fn declare_queued_specs(self: &Rc<Self>, tables: &Rc<ProviderTables>) {
+        while let Some(req) = self.lowering(tables, |lowering| lowering.pop_spec()) {
+            if let Some(spec) = self.declare_spec(tables, req) {
+                tables.declarations.push(spec);
+            }
+        }
+    }
+
+    /// The funcobj of the clause specialization `req`, its graph unbuilt.
+    /// `None`, recorded, when its body does not substitute.
+    fn declare_spec(
+        self: &Rc<Self>,
+        tables: &Rc<ProviderTables>,
+        req: crate::front::clause_spec::SpecRequest,
+    ) -> Option<DeclaredFuncObj> {
+        self.lowering(tables, |lowering| {
+            let spec = lowering.declare_spec(req)?;
+            let stamp = spec.header.graph_stamp();
+            let declared = Rc::new(lowering.spec_header_graph(&spec));
+            let (krate, tables, body) = (self.clone(), tables.clone(), spec.body.clone());
+            let graph = LazyGraph::deferred(declared.clone(), move || {
+                let graph = krate.lowering(&tables, |lowering| lowering.build_spec_body(&body));
+                krate.declare_queued_specs(&tables);
+                Some(stamp_declared(&stamp, graph?, &declared))
+            });
+            Some(spec.into_declared(graph))
+        })
+    }
+
     /// Run `f` over this crate's lowering context.
     fn lowering<R>(&self, tables: &ProviderTables, f: impl FnOnce(&CrateLowering<'_>) -> R) -> R {
         tables.with_static_addrs(|static_addrs| {
