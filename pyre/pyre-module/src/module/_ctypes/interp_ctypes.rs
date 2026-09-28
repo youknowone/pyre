@@ -93,11 +93,13 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
                     "dlopen() missing library name",
                 ));
             }
+            let w_name = args[0];
+            let mut w_mode = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
             let name = unsafe {
-                if pyre_object::is_none(args[0]) {
+                if pyre_object::is_none(w_name) {
                     // dlopen(None) → process handle
                     let load_flags = if args.len() >= 2 {
-                        Some(pyre_interpreter::baseobjspace::int_w(args[1])? as libc::c_int)
+                        Some(pyre_interpreter::baseobjspace::int_w(w_mode)? as libc::c_int)
                     } else {
                         None
                     };
@@ -111,14 +113,14 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
                 // A library name is a path, so it reaches `dlopen` in the
                 // filesystem's own units: a byte with no UTF-8 spelling names
                 // a real file and must not be replaced with U+FFFD.
-                if pyre_object::is_bytes(args[0]) {
+                if pyre_object::is_bytes(w_name) {
                     pyre_interpreter::gateway::os_string_from_fs_bytes(
-                        pyre_object::bytesobject::w_bytes_data(args[0]),
+                        pyre_object::bytesobject::w_bytes_data(w_name),
                     )
-                } else if pyre_object::is_str(args[0]) {
-                    pyre_interpreter::gateway::os_string_from_fs_bytes(
-                        &pyre_interpreter::gateway::fsencode(args[0])?,
-                    )
+                } else if pyre_object::is_str(w_name) {
+                    pyre_interpreter::gateway::os_string_from_fs_bytes(&pyre_object::with_roots!(
+                        w_mode => pyre_interpreter::gateway::fsencode(w_name)
+                    )?)
                 } else {
                     return Err(pyre_interpreter::PyError::type_error(
                         "dlopen: name must be a string, bytes or None",
@@ -126,7 +128,7 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
                 }
             };
             let load_flags = if args.len() >= 2 {
-                Some(pyre_interpreter::baseobjspace::int_w(args[1])? as i32)
+                Some(pyre_interpreter::baseobjspace::int_w(w_mode)? as i32)
             } else {
                 None
             };
@@ -155,14 +157,18 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
                         "dlsym() needs 2 arguments",
                     ));
                 }
-                let h = pyre_interpreter::baseobjspace::int_w(args[0])? as usize;
+                let w_handle = args[0];
+                let mut w_name = args[1];
+                let h = pyre_object::with_roots!(w_name =>
+                    pyre_interpreter::baseobjspace::int_w(w_handle)
+                )? as usize;
                 let name = unsafe {
-                    if !pyre_object::is_str(args[1]) {
+                    if !pyre_object::is_str(w_name) {
                         return Err(pyre_interpreter::PyError::type_error(
                             "dlsym: name must be a string",
                         ));
                     }
-                    pyre_interpreter::baseobjspace::str_utf8_w(args[1])?.to_string()
+                    pyre_interpreter::baseobjspace::str_utf8_w(w_name)?.to_string()
                 };
                 let addr = lookup_symbol(h, name.as_bytes()).map_err(|e| {
                     use rustpython_host_env::ctypes::LookupSymbolError as L;
@@ -289,9 +295,13 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
                     "string_at() needs ptr",
                 ));
             }
-            let ptr = pyre_interpreter::baseobjspace::int_w(args[0])? as usize;
+            let w_ptr = args[0];
+            let mut w_size = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            let ptr = pyre_object::with_roots!(w_size =>
+                pyre_interpreter::baseobjspace::int_w(w_ptr)
+            )? as usize;
             let size = if args.len() >= 2 {
-                pyre_interpreter::baseobjspace::int_w(args[1])?
+                pyre_interpreter::baseobjspace::int_w(w_size)?
             } else {
                 -1
             };

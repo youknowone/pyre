@@ -287,28 +287,34 @@ fn cdata_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
 /// attributes rather than replacing them.
 fn cdata_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let mut obj = args[0];
-    if !unsafe { pyre_object::is_dict(args[1]) } {
+    let mut w_state = args[1];
+    let mut w_data = args[2];
+    if !unsafe { pyre_object::is_dict(w_state) } {
         return Err(pyre_interpreter::PyError::type_error(format!(
             "argument 1 must be dict, not {}",
-            pyre_interpreter::gateway::short_type_name(args[1])
+            pyre_interpreter::gateway::short_type_name(w_state)
         )));
     }
-    let source = pyre_interpreter::typedef::buffer_as_bytes_like(args[2])?.ok_or_else(|| {
+    let source = pyre_object::with_roots!(obj, w_state, w_data =>
+        pyre_interpreter::typedef::buffer_as_bytes_like(w_data)
+    )?
+    .ok_or_else(|| {
         pyre_interpreter::PyError::type_error(format!(
             "argument 2 must be str, not {}",
-            pyre_interpreter::gateway::short_type_name(args[2])
+            pyre_interpreter::gateway::short_type_name(w_data)
         ))
     })?;
-    pyre_object::with_roots!(obj => cdata_write(obj, 0, unsafe {
+    pyre_object::with_roots!(obj, w_state => cdata_write(obj, 0, unsafe {
         pyre_object::bytesobject::bytes_like_data(source)
     }));
-    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
+    let d =
+        pyre_object::with_roots!(w_state => pyre_interpreter::baseobjspace::getdict_native(obj));
     if d.is_null() {
         return Err(pyre_interpreter::PyError::type_error(
             "ctypes instance has no instance dict",
         ));
     }
-    let items = unsafe { pyre_object::dictmultiobject::w_dict_items(args[1]) };
+    let items = unsafe { pyre_object::dictmultiobject::w_dict_items(w_state) };
     let roots = pyre_object::gc_roots::push_roots();
     let mut live = Vec::with_capacity(1 + items.len() * 2);
     live.push(d);

@@ -1455,6 +1455,10 @@ fn call_settled(
             kinds.len()
         )));
     }
+    // `inargs` is the caller's native copy; resolving the argtypes and
+    // marshalling an argument can collect, so each is read from its slot.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let inargs_base = _roots.pin_roots(inargs);
     // Only a pointer argtype is still wanted as an object; a simple one is
     // fully described by the code the plan carries.
     let argtypes = if kinds.iter().any(|kind| *kind == ArgKind::Pointer) {
@@ -1468,7 +1472,8 @@ fn call_settled(
     };
     let mut owned: Vec<OwnedArg> = Vec::with_capacity(inargs.len());
     let mut keepalive: Vec<Vec<u8>> = Vec::new();
-    for (i, &arg) in inargs.iter().enumerate() {
+    for i in 0..inargs.len() {
+        let arg = _roots.get(inargs_base + i);
         owned.push(match kinds.get(i) {
             Some(ArgKind::Simple(tc)) => marshal_simple_arg(arg, *tc)?,
             Some(_) => {
@@ -2000,25 +2005,28 @@ fn internal_memoryview_at(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_inte
             "memoryview_at() needs address and size",
         ));
     }
-    let address = argument_address(args[0])?;
-    if !unsafe { pyre_object::is_int(args[1]) || pyre_object::is_long(args[1]) } {
+    let w_address = args[0];
+    let mut w_size = args[1];
+    let mut w_readonly = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+    let address = pyre_object::with_roots!(w_size, w_readonly => argument_address(w_address))?;
+    if !unsafe { pyre_object::is_int(w_size) || pyre_object::is_long(w_size) } {
         return Err(pyre_interpreter::PyError::type_error(
             "size must be an integer",
         ));
     }
-    let size = pyre_interpreter::baseobjspace::int_w(args[1])
-        .map_err(|_| pyre_interpreter::PyError::value_error("size is too large"))?;
+    let size =
+        pyre_object::with_roots!(w_readonly => pyre_interpreter::baseobjspace::int_w(w_size))
+            .map_err(|_| pyre_interpreter::PyError::value_error("size is too large"))?;
     if size < 0 {
         return Err(pyre_interpreter::PyError::value_error(
             "size must not be negative",
         ));
     }
-    let readonly = args
-        .get(2)
-        .copied()
-        .map(pyre_interpreter::baseobjspace::is_true)
-        .transpose()?
-        .unwrap_or(false);
+    let readonly = if w_readonly.is_null() {
+        false
+    } else {
+        pyre_interpreter::baseobjspace::is_true(w_readonly)?
+    };
     let roots = pyre_object::gc_roots::push_roots();
     let fmt_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(pyre_object::w_str_new_managed("B"));
@@ -2144,16 +2152,25 @@ fn internal_pyos_snprintf(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_inte
             "PyOS_snprintf needs buffer, size and format",
         ));
     }
-    let capacity = pyre_interpreter::baseobjspace::int_w(args[1])?.max(0) as usize;
-    let format = unsafe { pyre_object::bytesobject::w_bytes_data(args[2]) };
+    // `args` is the gateway's native copy; `int_w` and `cdata_write` can
+    // collect, so every argument is read from its slot.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = _roots.pin_roots(args);
+    let capacity =
+        pyre_interpreter::baseobjspace::int_w(_roots.get(args_base + 1))?.max(0) as usize;
+    let format =
+        unsafe { pyre_object::bytesobject::w_bytes_data(_roots.get(args_base + 2)) }.to_vec();
     let mut rendered = Vec::new();
     let mut arg = 3usize;
     let mut i = 0usize;
     while i < format.len() {
         if format[i] == b'%' && i + 1 < format.len() && matches!(format[i + 1], b's' | b'd') {
-            let value = *args.get(arg).ok_or_else(|| {
-                pyre_interpreter::PyError::type_error("not enough arguments for format string")
-            })?;
+            if arg >= args.len() {
+                return Err(pyre_interpreter::PyError::type_error(
+                    "not enough arguments for format string",
+                ));
+            }
+            let value = _roots.get(args_base + arg);
             arg += 1;
             if format[i + 1] == b's' {
                 if !unsafe { pyre_object::is_bytes(value) } {
@@ -2175,9 +2192,9 @@ fn internal_pyos_snprintf(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_inte
         }
     }
     let write_len = rendered.len().min(capacity.saturating_sub(1));
-    cdata::cdata_write(args[0], 0, &rendered[..write_len]);
+    cdata::cdata_write(_roots.get(args_base), 0, &rendered[..write_len]);
     if capacity > 0 {
-        cdata::cdata_write(args[0], write_len, &[0]);
+        cdata::cdata_write(_roots.get(args_base), write_len, &[0]);
     }
     Ok(pyre_object::w_int_new(rendered.len() as i64))
 }
