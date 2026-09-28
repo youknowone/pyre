@@ -448,8 +448,14 @@ fn bare_local(p: &Place) -> Option<u64> {
     }
 }
 
+/// `x.PtrMetadata` -- a fat pointer's length, not the words behind it.
+fn is_metadata_place(p: &Place) -> bool {
+    matches!(&p.kind, PlaceKind::Projection(_, ProjectionElem::Atom(e)) if e == "PtrMetadata")
+}
+
 fn use_operand(o: &Operand, out: &mut HashSet<u64>) {
     match o {
+        Operand::Copy(p) | Operand::Move(p) if is_metadata_place(p) => {}
         Operand::Copy(p) | Operand::Move(p) => {
             if let Some(l) = place_local(p) {
                 out.insert(l);
@@ -461,6 +467,9 @@ fn use_operand(o: &Operand, out: &mut HashSet<u64>) {
 
 fn use_rvalue(r: &Rvalue, out: &mut HashSet<u64>) {
     match r {
+        // A slice's length lives in the fat pointer, not in the elements the
+        // collector would have to forward.
+        Rvalue::Len(_) => {}
         Rvalue::Use(o, _) | Rvalue::UnaryOp(_, o) => use_operand(o, out),
         Rvalue::BinaryOp(_, a, b) => {
             use_operand(a, out);
@@ -476,7 +485,7 @@ fn use_rvalue(r: &Rvalue, out: &mut HashSet<u64>) {
                 use_operand(o, out);
             }
         }
-        Rvalue::Discriminant(p) | Rvalue::Len(p) => {
+        Rvalue::Discriminant(p) => {
             if let Some(l) = place_local(p) {
                 out.insert(l);
             }
@@ -631,6 +640,22 @@ pub fn scan(
 ) -> (Vec<Finding>, ScanStats) {
     let mut findings = Vec::new();
     let mut stats = ScanStats::default();
+    // Calls that read a slice's length or test a word against null.  A moved
+    // object's stale address is still non-null, so neither answer changes.
+    let metadata_fns: HashSet<u64> = cg
+        .names
+        .iter()
+        .filter(|(_, n)| {
+            matches!(
+                n.as_str(),
+                "core::slice::<Impl>::len"
+                    | "core::slice::<Impl>::is_empty"
+                    | "core::ptr::mut_ptr::<Impl>::is_null"
+                    | "core::ptr::const_ptr::<Impl>::is_null"
+            )
+        })
+        .map(|(id, _)| *id)
+        .collect();
     for fd in llbc.iter_local_fns() {
         let id = fd.def_id;
         if !reach.contains(&id) {
@@ -1233,10 +1258,10 @@ pub fn scan(
                         live.extend(sl.iter().copied());
                     }
                 }
-                transfer_term(t, &mut live);
+                transfer_term(t, &mut live, &metadata_fns);
                 for st in body.body[b].statements.iter().rev() {
                     if let Ok(k) = st.stmt_kind() {
-                        transfer_stmt(&k, &mut live);
+                        transfer_stmt(&k, &mut live, &gc_locals);
                     }
                 }
                 live.retain(|l| gc_locals.contains_key(l));
@@ -1524,11 +1549,20 @@ pub fn scan(
     (findings, stats)
 }
 
-fn transfer_stmt(k: &StmtKind, live: &mut HashSet<u64>) {
+fn transfer_stmt(k: &StmtKind, live: &mut HashSet<u64>, tracked: &HashMap<u64, String>) {
     match k {
         StmtKind::Assign(p, r) => {
             if let Some(d) = bare_local(p) {
-                live.remove(&d);
+                // `_t = &*args` / `_t = copy x` into a tracked local reads `x`
+                // only if `_t` is read later: the reborrow a `args.len()` call
+                // takes is dead once the length is out.  Only for a tracked
+                // destination -- an untracked one is never in `live`, so its
+                // later reads are invisible here.
+                let pure = matches!(r, Rvalue::Use(..) | Rvalue::Ref { .. } | Rvalue::Cast(..));
+                let was_live = live.remove(&d);
+                if pure && tracked.contains_key(&d) && !was_live {
+                    return;
+                }
             } else if let Some(l) = place_local(p) {
                 live.insert(l);
             }
@@ -1560,13 +1594,21 @@ fn term_span<'a>(
         .expect("span id is not in the artefact span table")
 }
 
-fn transfer_term(t: &TermKind, live: &mut HashSet<u64>) {
+fn transfer_term(t: &TermKind, live: &mut HashSet<u64>, metadata_fns: &HashSet<u64>) {
     match t {
         TermKind::Call { call, .. } => {
             if let Some(d) = bare_local(&call.dest) {
                 live.remove(&d);
             } else if let Some(l) = place_local(&call.dest) {
                 live.insert(l);
+            }
+            let metadata_only = matches!(
+                &call.func,
+                CallFunc::Regular(reg)
+                    if matches!(&reg.kind, CallKind::Fun(FunId::Regular { id }) if metadata_fns.contains(id))
+            );
+            if metadata_only {
+                return;
             }
             for a in &call.args {
                 use_operand(a, live);
