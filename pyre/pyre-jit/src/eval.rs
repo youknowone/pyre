@@ -5308,23 +5308,24 @@ fn build_jit_driver_pair() -> JitDriverPair {
 
 /// One `VirtualizableInfo` for the pypyjit portal, built on the first
 /// trace or compiled entry rather than on the cold counter tick.
+fn publish_pyframe_vinfo(
+    meta: &mut majit_metainterp::MetaInterp<crate::jit::state::PyreMeta>,
+) -> std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo> {
+    if let Some(info) = meta.virtualizable_info().cloned() {
+        return info;
+    }
+    let info = build_pyframe_virtualizable_info();
+    meta.jitdriver_sd_mut(0).expect("jd0").virtualizable_info = Some(info.clone());
+    info
+}
+
 fn ensure_pyframe_virtualizable(
     pair: &mut JitDriverPair,
 ) -> std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo> {
     if let Some(info) = pair.1.clone() {
         return info;
     }
-    let installed = pair.0.meta_interp().virtualizable_info().cloned();
-    if let Some(info) = installed {
-        pair.1 = Some(info.clone());
-        return info;
-    }
-    let info = build_pyframe_virtualizable_info();
-    pair.0
-        .meta_interp_mut()
-        .jitdriver_sd_mut(0)
-        .expect("jd0")
-        .virtualizable_info = Some(info.clone());
+    let info = publish_pyframe_vinfo(pair.0.meta_interp_mut());
     pair.1 = Some(info.clone());
     info
 }
@@ -5977,10 +5978,7 @@ impl PyPyJitDriver {
             return false;
         }
         let env = PyreEnv;
-        let pair = driver_pair();
-        let info_arc = ensure_pyframe_virtualizable(pair);
-        let info = info_arc.as_ref();
-        let driver = &mut pair.0;
+        let driver = &mut driver_pair().0;
         let loop_pycode = pycode as *const ();
         let green_key_hash = make_green_key(loop_pycode, next_instr, is_being_profiled);
         let green_key = driver.resolve_cell_key(green_key_hash, || {
@@ -5995,9 +5993,10 @@ impl PyPyJitDriver {
                 >= portal_metatrace_skip()
             && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
+            let info = publish_pyframe_vinfo(driver.meta_interp_mut());
             if let Some(result) = drive_portal_metatrace(
                 driver,
-                info,
+                &info,
                 &env,
                 green_key,
                 next_instr,
@@ -6011,14 +6010,9 @@ impl PyPyJitDriver {
         // Admission and portal setup may collect; reload the caller-owned
         // root before the legacy compile path reads the frame.
         let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
-        let Some(loop_result) = maybe_compile_and_run(
-            unsafe { &mut *f },
-            green_key,
-            next_instr,
-            driver,
-            info,
-            &env,
-        ) else {
+        let Some(loop_result) =
+            maybe_compile_and_run(unsafe { &mut *f }, green_key, next_instr, driver, &env)
+        else {
             return false;
         };
         set_pending_loop_exit(ec, loop_result);
@@ -8274,10 +8268,7 @@ fn publish_kind0_descrs_before_trace() {
 fn install_build_time_liveness_before_trace(
     meta: &mut majit_metainterp::MetaInterp<crate::jit::state::PyreMeta>,
 ) {
-    if meta.virtualizable_info().is_none() {
-        let info = build_pyframe_virtualizable_info();
-        meta.jitdriver_sd_mut(0).expect("jd0").virtualizable_info = Some(info);
-    }
+    let _vinfo = publish_pyframe_vinfo(meta);
     if meta.staticdata.op_live >= 0 {
         return;
     }
@@ -10367,7 +10358,6 @@ fn maybe_compile_and_run(
     green_key: u64,
     loop_header_pc: usize,
     driver: &mut JitDriver<PyreJitState>,
-    info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
     // pyre-local extension: PYRE_NO_JIT disables JIT entirely.
@@ -10483,10 +10473,12 @@ fn maybe_compile_and_run(
             {
                 return None;
             }
-            bound_reached(frame, green_key, loop_header_pc, driver, info, env)
+            let info = publish_pyframe_vinfo(driver.meta_interp_mut());
+            bound_reached(frame, green_key, loop_header_pc, driver, &info, env)
         }
         (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key) => {
-            execute_assembler(frame, compiled_key, loop_header_pc, driver, info, env)
+            let info = publish_pyframe_vinfo(driver.meta_interp_mut());
+            execute_assembler(frame, compiled_key, loop_header_pc, driver, &info, env)
         }
         (majit_metainterp::warmstate::HotResult::NotHot, _) => {
             if driver
