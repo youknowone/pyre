@@ -7920,7 +7920,7 @@ impl CallControl {
         }
         let extraeffect = extraeffect.unwrap_or(ExtraEffect::CanRaise);
 
-        // call.py:283-284: a true `RandomEffectsAnalyzer` answer is
+        // `call.py` `getcalldescr`: a true `RandomEffectsAnalyzer` answer is
         // `EF_RANDOM_EFFECTS` and is not rewritten. A cannot-raise mark
         // applies only when `extraeffect is None` (the arm above).
         // `effectinfo_from_writeanalyze` then keeps `None` descr lists.
@@ -8277,9 +8277,9 @@ pub fn effectinfo_from_writeanalyze(
     _cc: &CallControl,
     call_release_gil_target: (u64, i32),
 ) -> EffectInfo {
-    // effectinfo.py:285-292: top_set or EF_RANDOM_EFFECTS ⇒ every descr
-    // list is None and extraeffect is EF_RANDOM_EFFECTS. can_collect is
-    // True (effectinfo.py:364-365, forces ⇒ can_collect, and random
+    // `effectinfo_from_writeanalyze`: top_set or EF_RANDOM_EFFECTS ⇒ every
+    // descr list is None and extraeffect is EF_RANDOM_EFFECTS. can_collect
+    // is True (the same function: forces ⇒ can_collect, and random
     // effects are above that threshold).
     if effects.is_top || extraeffect == ExtraEffect::RandomEffects {
         return effectinfo_random_effects(
