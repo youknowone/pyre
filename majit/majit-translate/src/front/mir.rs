@@ -11984,7 +11984,8 @@ impl<'a> Lowering<'a> {
         }
         let leaf = path.rsplit("::").next().unwrap_or("");
         let receiver_scope = operand_local(call.args.first())
-            .and_then(|local| self.root_bracket.scope_of_receiver(local));
+            .and_then(|local| self.root_bracket.scope_of_receiver(local))
+            .or_else(|| self.root_bracket.free_site_scope(mir_bb));
         let bound = match leaf {
             _ if gc_root_scope_open_path(&path) => {
                 if !self.root_bracket.is_erased_scope(dest_local) {
@@ -12005,7 +12006,7 @@ impl<'a> Lowering<'a> {
                     ))
                 })?)
             }
-            "get" => {
+            "get" | "shadow_stack_get" => {
                 let Some(scope) = receiver_scope else {
                     return Ok(false);
                 };
@@ -28817,6 +28818,11 @@ struct RootBracketPlan {
     /// the array, its borrows and the unsizing cast -- mapped to their guard.
     /// They only ever fed the erased pin, so they bind nothing.
     pin_temps: std::collections::HashMap<usize, usize>,
+    /// Blocks whose free `gc_roots::pin_roots(&[..])` or
+    /// `gc_roots::shadow_stack_get(index)` call is a pin or read-back of the
+    /// guard mapped to: the free call names no guard, and acts on the
+    /// innermost bracket open where it runs.
+    free_sites: std::collections::HashMap<usize, usize>,
 }
 
 impl RootBracketPlan {
@@ -28830,6 +28836,15 @@ impl RootBracketPlan {
             .iter()
             .find(|(bb, _)| *bb == mir_bb)
             .map(|(_, value)| *value)
+    }
+
+    /// The erased guard a free pin or read-back in `mir_bb` acts on.
+    fn free_site_scope(&self, mir_bb: usize) -> Option<usize> {
+        if !self.enabled {
+            return None;
+        }
+        let scope = self.free_sites.get(&mir_bb).copied()?;
+        self.scopes.contains(scope).then_some(scope)
     }
 
     /// The guard an erased-bracket call's receiver operand names.
@@ -29790,6 +29805,7 @@ fn root_bracket_stack_effects_are_known(
     opener: usize,
     scope: usize,
     aliases: &std::collections::HashMap<usize, usize>,
+    free_sites: &std::collections::HashMap<usize, usize>,
     name_of: &impl Fn(&RegularCall) -> Option<String>,
     touches: &impl Fn(&RegularCall) -> bool,
 ) -> bool {
@@ -29850,7 +29866,8 @@ fn root_bracket_stack_effects_are_known(
                         Some("base" | "pin_root" | "pin_roots" | "get")
                     ) && operand_local(call.args.first())
                         .and_then(|receiver| aliases.get(&receiver).copied())
-                        == Some(scope);
+                        == Some(scope)
+                        || free_sites.get(&bb) == Some(&scope);
                     if !own_leaf {
                         return false;
                     }
@@ -30098,6 +30115,29 @@ fn analyze_root_brackets_with(
             }
         }
     }
+    // The innermost candidate bracket open at a block: the one whose region
+    // holds the block and whose opener every other such region holds.
+    let regions: std::collections::HashMap<usize, bit_set::BitSet> = candidates
+        .iter()
+        .map(|scope| {
+            (
+                scope,
+                root_bracket_region(llbc, body, opener_block[&scope], scope),
+            )
+        })
+        .collect();
+    let open_scope_at = |bb: usize| -> Option<usize> {
+        let open: Vec<usize> = regions
+            .iter()
+            .filter(|(_, region)| region.contains(bb))
+            .map(|(scope, _)| *scope)
+            .collect();
+        open.iter().copied().find(|scope| {
+            open.iter()
+                .all(|other| other == scope || regions[other].contains(opener_block[scope]))
+        })
+    };
+    let mut free_sites: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let mut bases: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     // Block of each `pin_roots` call -> (guard, published locals, argument
     // temporaries).
@@ -30113,6 +30153,28 @@ fn analyze_root_brackets_with(
         let Some(path) = name_of(reg) else {
             continue;
         };
+        // `gc_roots::pin_roots(&[..])` pins onto the bracket open where it
+        // runs, and answers with the slot its first value took.
+        if path.rsplit("::").next() == Some("pin_roots")
+            && call.args.len() == 1
+            && path.split("::").any(|s| s == ROOT_SCOPE_MODULE)
+        {
+            let (Some(slice), PlaceKind::Local(dest)) =
+                (operand_local(call.args.first()), call.dest.kind)
+            else {
+                continue;
+            };
+            let Some(scope) = open_scope_at(bb_idx) else {
+                continue;
+            };
+            let Some(run) = pin_roots_slice_values(body, slice, &assigned) else {
+                continue;
+            };
+            pin_runs.insert(bb_idx, (scope, run.0, run.1));
+            free_sites.insert(bb_idx, scope);
+            bases.insert(dest as usize, scope);
+            continue;
+        }
         let pins_many = path.rsplit("::").next() == Some("pin_roots") && call.args.len() == 2;
         if !(gc_root_scope_base_path(&path) && call.args.len() == 1) && !pins_many {
             continue;
@@ -30328,6 +30390,44 @@ fn analyze_root_brackets_with(
                 if opens_candidate {
                     continue;
                 }
+                // The free pin (2.5) recorded, and a free read-back of a slot
+                // one of the guard's own bases names.
+                let free_leaf = match &call.func {
+                    CallFunc::Regular(reg) => name_of(reg)
+                        .filter(|path| path.split("::").any(|s| s == ROOT_SCOPE_MODULE))
+                        .map(|path| path.rsplit("::").next().unwrap_or("").to_string()),
+                    _ => None,
+                };
+                let dest_is_guard =
+                    matches!(call.dest.kind, PlaceKind::Local(d) if guards.contains(d as usize));
+                if call.args.len() == 1 && !dest_is_guard {
+                    match free_leaf.as_deref() {
+                        Some("pin_roots") => {
+                            if let Some((scope, values, _)) = pin_runs.get(&bb_idx)
+                                && free_sites.get(&bb_idx) == Some(scope)
+                                && candidates.contains(*scope)
+                            {
+                                let entry = pins.entry(*scope).or_default();
+                                entry.extend(values.iter().map(|v| (bb_idx, *v)));
+                                continue;
+                            }
+                        }
+                        Some("shadow_stack_get") => {
+                            if let Some(index) = operand_local(call.args.first())
+                                && let Some(scope) = bases
+                                    .get(&index)
+                                    .copied()
+                                    .or_else(|| offsets.get(&index).map(|(scope, _)| *scope))
+                                && candidates.contains(scope)
+                            {
+                                gets.push((bb_idx, scope, index));
+                                free_sites.insert(bb_idx, scope);
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 let leaf_scope = match &call.func {
                     CallFunc::Regular(reg) => name_of(reg)
                         .filter(|path| path.split("::").any(|s| s == "gc_roots"))
@@ -30414,7 +30514,14 @@ fn analyze_root_brackets_with(
     for scope in surviving {
         let opener = opener_block[&scope];
         if !root_bracket_stack_effects_are_known(
-            llbc, body, opener, scope, &aliases, &name_of, &touches,
+            llbc,
+            body,
+            opener,
+            scope,
+            &aliases,
+            &free_sites,
+            &name_of,
+            &touches,
         ) {
             continue;
         }
@@ -30457,6 +30564,14 @@ fn analyze_root_brackets_with(
                     .filter(|(other, _)| dom[pin_bb].contains(*other))
                     .count()
             });
+            // A `pin_roots` run answers with the slot its first value took,
+            // which the gets below read as the guard's base: only the run
+            // that makes the bracket's first pin says so.
+            if pin_runs.iter().any(|(run_bb, (run_scope, _, _))| {
+                *run_scope == scope && ordered.first().map(|(pin_bb, _)| *pin_bb) != Some(*run_bb)
+            }) {
+                continue;
+            }
             // One `pin_roots` block publishes its whole run in array order,
             // so consecutive pins may share it; two separate pins may not.
             if ordered.windows(2).any(|w| {
@@ -30524,6 +30639,10 @@ fn analyze_root_brackets_with(
     plan.pins = pinned;
     plan.get_sites = get_sites;
     plan.pin_temps = pin_temps;
+    plan.free_sites = free_sites
+        .into_iter()
+        .filter(|(_, scope)| plan.scopes.contains(*scope))
+        .collect();
     plan
 }
 
@@ -56097,6 +56216,8 @@ mod tests {
                     1 => "pyre_object::gc_roots::push_roots",
                     3 => "pyre_object::gc_roots::{impl RootScope}::pin_roots",
                     4 => "pyre_object::gc_roots::{impl RootScope}::get",
+                    6 => "pyre_object::gc_roots::pin_roots",
+                    7 => "pyre_object::gc_roots::shadow_stack_get",
                     _ => "pyre_object::listobject::ll_list_obj_resize_ge",
                 }
                 .to_string(),
@@ -56156,6 +56277,7 @@ mod tests {
         let plan =
             super::analyze_root_brackets_with(&fixture_llbc(), &run, &bit_set::BitSet::new(), name_of, touches);
         assert!(plan.scopes.contains(3), "a pin_roots run must be erased");
+
         assert_eq!(plan.pins.get(&3), Some(&vec![19, 20]));
         assert_eq!(plan.get_sites, vec![(3usize, 19usize), (5usize, 20usize)]);
         for temp in [6, 7, 8, 9] {
@@ -56204,6 +56326,38 @@ mod tests {
         assert!(
             !plan.scopes.contains(3),
             "a non-get write to a pinned local keeps the bracket"
+        );
+
+        // The free spelling: `let _r = push_roots(); let b = pin_roots(&[..]);
+        // shadow_stack_get(b + k)` pins onto and reads from the one bracket
+        // open around it.
+        let mut free = body_of(vec![mv(19), mv(20)]);
+        free.body[1].statements.pop();
+        free.body[1].terminator.kind = call(6, vec![mv(9)], 5, 2);
+        free.body[3].statements.remove(0);
+        free.body[3].terminator.kind = call(7, vec![copy(12)], 13, 4);
+        free.body[4].statements.remove(0);
+        free.body[5].terminator.kind = call(7, vec![mv(16)], 17, 6);
+        let plan =
+            super::analyze_root_brackets_with(&fixture_llbc(), &free, &bit_set::BitSet::new(), name_of, touches);
+        assert!(
+            plan.scopes.contains(3),
+            "a free pin_roots run must be erased"
+        );
+        assert_eq!(plan.pins.get(&3), Some(&vec![19, 20]));
+        assert_eq!(plan.get_sites, vec![(3usize, 19usize), (5usize, 20usize)]);
+        for bb in [1, 3, 5] {
+            assert_eq!(plan.free_sites.get(&bb), Some(&3), "free call in bb{bb}");
+        }
+
+        // A read of a slot some other guard's pin filled is not this one's.
+        let mut stray = body_of(vec![mv(19), mv(20)]);
+        stray.body[3].terminator.kind = call(7, vec![copy(13)], 18, 4);
+        let plan =
+            super::analyze_root_brackets_with(&fixture_llbc(), &stray, &bit_set::BitSet::new(), name_of, touches);
+        assert!(
+            !plan.scopes.contains(3),
+            "a free read at a slot this pass cannot name keeps the bracket"
         );
     }
 
