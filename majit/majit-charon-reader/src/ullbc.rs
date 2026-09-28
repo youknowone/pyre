@@ -656,6 +656,9 @@ pub struct ItemMeta {
     pub attr_info: AttrInfo,
     #[serde(default)]
     pub is_local: bool,
+    /// [`ItemMeta::name_path`], rendered on first query.
+    #[serde(skip)]
+    name_path: OnceLock<String>,
 }
 
 impl ItemMeta {
@@ -696,6 +699,15 @@ impl ItemMeta {
     /// (`rpython/annotator/description.py`).  [`Self::instantiation`]
     /// returns the arguments that tell the instances apart.
     pub fn name_path(&self) -> String {
+        self.name_path_str().to_string()
+    }
+
+    /// [`Self::name_path`] without the copy.
+    pub fn name_path_str(&self) -> &str {
+        self.name_path.get_or_init(|| self.render_name_path())
+    }
+
+    fn render_name_path(&self) -> String {
         let mut out = String::new();
         for seg in self.template_name() {
             if !out.is_empty() {
