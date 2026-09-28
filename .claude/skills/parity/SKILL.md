@@ -82,11 +82,11 @@ Run the follow-up task with these constraints:
 
 ### Step 4: Verify
 
-After making changes, run the checks that would catch regressions:
+After making changes, run the checks that would catch regressions. Scale them per AGENTS.md "How much to verify":
 
-- `cargo test --all --no-default-features --features dynasm` — parity regressions in the metainterp layer often surface as unrelated test failures.
-- `cargo test --all --no-default-features --features cranelift` if cranelift paths are touched.
-- `python3 pyre/check.py` for end-to-end correctness.
+- Start with the touched crate's tests and the `check.py` fixtures that exercise the changed path.
+- A metainterp or optimizer parity change is cross-cutting: its regressions often surface as unrelated test failures. Run `cargo test --all --no-default-features --features dynasm,pyre-module`, and add the `cranelift` variant if cranelift paths are touched.
+- Run the full `python3 pyre/check.py` when the change is cross-cutting, and before opening a PR.
 
 Accept temporary performance regressions. Do NOT re-introduce shortcuts to recover perf. Record the regression in MEMORY and move on.
 

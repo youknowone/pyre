@@ -149,12 +149,14 @@ git rebase --abort     # returns to pre-rebase state; no work lost
 After the rebase completes:
 
 1. `git log upstream/main..HEAD --oneline` — confirm the commit list is what was expected, and that the history is linear on top of `upstream/main`.
-2. `python ./pyre/check.py` — end-to-end verification. A clean compile does not prove the resolutions were correct; runtime tests do.
-3. `cargo test --all` on touched crates if the rebase was large.
+2. Verify that the rebase kept the work. Commits that did not conflict must keep their patch-id (`git show <sha> | git patch-id --stable`, old against new). No commit may be emptied.
+3. Test only as much as the rebase changed, following AGENTS.md "How much to verify":
+   - **The pre-rebase tip was green (locally or on CI):** run `cargo check` on the crates whose conflicts you resolved by hand. If a resolution blended logic from both sides, also run the tests that exercise that region. Do **not** rerun the full `cargo test --all` or `pyre/check.py` just because the base moved; CI does that.
+   - **The pre-rebase tip was never verified, or its last CI run was red:** the rebase does not change that. Run the gate that the red, or the unverified change, calls for before the next push.
 4. Report to the user:
    - Number of conflicts resolved.
    - For each non-trivial resolution: file:line on our side, file:line upstream consulted, one-sentence justification.
-   - Whether `pyre/check.py` is green.
+   - What was verified (check, targeted tests, or full gate), and why that much.
 
 Do **not** push, merge, or force-push unless the user explicitly asks.
 
