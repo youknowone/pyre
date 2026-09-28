@@ -4550,13 +4550,27 @@ impl<'a> Assembler386<'a> {
                         "CallMallocNurseryVarsizeFrame result_loc must be Loc::Reg, got {other:?}",
                     ),
                 };
-                let sv = sizeloc.value;
+                let mut sv = sizeloc.value;
                 let rv = result_reg.value;
-                // `MALLOC_NURSERY_CLOBBER` spills any live variable
-                // out of RCX/RDX before this op, so `sizeloc` is
-                // never in those registers and is disjoint from the
-                // ECX/EDX probe pair.  R11 (X86_64_SCRATCH_REG) loads
-                // the absolute nursery_free/nursery_top addresses.
+                // assembler.py malloc_cond_varsize_frame opens with
+                // `if sizeloc is ecx: MOV(edx, sizeloc); sizeloc = edx`,
+                // because ECX is about to take nursery_free (and is
+                // zeroed outright on the descriptor-less path below).
+                // The size really can arrive in ECX even though
+                // `MALLOC_NURSERY_CLOBBER` names it: llsupport/regalloc.py
+                // `spill_or_move_registers_before_call` drops a variable
+                // whose last use is the current operation out of the
+                // binding and frees its register *without moving the
+                // value*, and this operation is the size box's last use.
+                // A size already in EDX needs no move, since the `LEA`
+                // below reads EDX as its index before writing it — which
+                // is why upstream's EDX arm is a plain `ADD_rr`.
+                // R11 (X86_64_SCRATCH_REG) loads the absolute
+                // nursery_free/nursery_top addresses.
+                if sv == rx86::ECX {
+                    dynasm!(self.mc ; .arch x64 ; mov rdx, rcx);
+                    sv = rx86::EDX;
+                }
                 let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
                 let slow_path = self.mc.new_dynamic_label();
                 let done = self.mc.new_dynamic_label();
